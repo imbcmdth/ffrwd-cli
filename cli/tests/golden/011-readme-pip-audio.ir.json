@@ -1,0 +1,116 @@
+{
+  "inputs": [
+    "game.mp4",
+    "game.mp4"
+  ],
+  "sources": {
+    "b": 0,
+    "a": 1
+  },
+  "nodes": [
+    {
+      "id": "n1",
+      "filter": "crop",
+      "args": {
+        "out_w": 1200,
+        "out_h": 50,
+        "x": 600,
+        "y": 200
+      },
+      "inputs": [
+        "src:b:v:0"
+      ],
+      "outputs": [
+        "video"
+      ]
+    },
+    {
+      "id": "n2",
+      "filter": "scale",
+      "args": {
+        "width": "iw/2"
+      },
+      "inputs": [
+        "n1"
+      ],
+      "outputs": [
+        "video"
+      ]
+    },
+    {
+      "id": "n3",
+      "filter": "overlay",
+      "args": {
+        "x": 20,
+        "y": 20
+      },
+      "inputs": [
+        "src:a:v:0",
+        "n2"
+      ],
+      "outputs": [
+        "video"
+      ]
+    },
+    {
+      "id": "n4",
+      "filter": "volume",
+      "args": {
+        "volume": 0.65
+      },
+      "inputs": [
+        "src:a:a:0"
+      ],
+      "outputs": [
+        "audio"
+      ]
+    },
+    {
+      "id": "n5",
+      "filter": "volume",
+      "args": {
+        "volume": 0.35
+      },
+      "inputs": [
+        "src:b:a:0"
+      ],
+      "outputs": [
+        "audio"
+      ]
+    },
+    {
+      "id": "n6",
+      "filter": "amix",
+      "args": {
+        "inputs": 2
+      },
+      "inputs": [
+        "n4",
+        "n5"
+      ],
+      "outputs": [
+        "audio"
+      ]
+    }
+  ],
+  "sinks": [
+    {
+      "outputs": [
+        {
+          "ref": "n3",
+          "type": "video",
+          "name": null,
+          "metadata": {}
+        },
+        {
+          "ref": "n6",
+          "type": "audio",
+          "name": null,
+          "metadata": {}
+        }
+      ],
+      "path": null,
+      "options": {}
+    }
+  ]
+}

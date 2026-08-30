@@ -1,0 +1,4 @@
+# The YOLOv8n-seg graph fetch-model.ps1 downloads: 14 MB. Not in git, so the
+# module builds without it and the host refuses to bind a model that is not
+# there.
+*.onnx

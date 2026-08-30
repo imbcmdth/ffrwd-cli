@@ -1,0 +1,129 @@
+{
+  "inputs": [
+    "film.mp4",
+    "ad.mp4"
+  ],
+  "sources": {
+    "f": 0,
+    "a": 1
+  },
+  "nodes": [
+    {
+      "id": "n1",
+      "filter": "scale",
+      "args": {
+        "width": "iw*0.33",
+        "height": "ih*0.33"
+      },
+      "inputs": [
+        "src:a:v:0"
+      ],
+      "outputs": [
+        "video"
+      ]
+    },
+    {
+      "id": "n2",
+      "filter": "format",
+      "args": {
+        "pix_fmts": "yuva420p"
+      },
+      "inputs": [
+        "n1"
+      ],
+      "outputs": [
+        "video"
+      ]
+    },
+    {
+      "id": "n3",
+      "filter": "tpad",
+      "args": {
+        "start_duration": 1,
+        "stop": 1,
+        "color": "black@0"
+      },
+      "inputs": [
+        "n2"
+      ],
+      "outputs": [
+        "video"
+      ]
+    },
+    {
+      "id": "n4",
+      "filter": "overlay",
+      "args": {
+        "x": 20,
+        "y": 20
+      },
+      "inputs": [
+        "src:f:v:0",
+        "n3"
+      ],
+      "outputs": [
+        "video"
+      ]
+    },
+    {
+      "id": "n5",
+      "filter": "adelay",
+      "args": {
+        "delays": 1000
+      },
+      "inputs": [
+        "src:a:a:0"
+      ],
+      "outputs": [
+        "audio"
+      ]
+    },
+    {
+      "id": "n6",
+      "filter": "volume",
+      "args": {
+        "volume": 0.5
+      },
+      "inputs": [
+        "n5"
+      ],
+      "outputs": [
+        "audio"
+      ]
+    },
+    {
+      "id": "n7",
+      "filter": "amix",
+      "args": {
+        "inputs": 2
+      },
+      "inputs": [
+        "src:f:a:0",
+        "n6"
+      ],
+      "outputs": [
+        "audio"
+      ]
+    }
+  ],
+  "sinks": [
+    {
+      "outputs": [
+        {
+          "ref": "n4",
+          "type": "video",
+          "name": "frame",
+          "metadata": {}
+        },
+        {
+          "ref": "n7",
+          "type": "audio",
+          "name": "sound",
+          "metadata": {}
+        }
+      ],
+      "path": null,
+      "options": {}
+    }
+  ]
+}

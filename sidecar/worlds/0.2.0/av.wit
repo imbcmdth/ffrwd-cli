@@ -1,0 +1,104 @@
+package ffrwd:av@0.2.0;
+
+interface types {
+  /// Static description of a module, available without running anything.
+  record meta {
+    name: string,
+    version: string,
+    /// JSON Schema for the `params` string.
+    params-schema: string,
+    /// JSON Schema for one row object; empty when the module emits none.
+    rows-schema: string,
+    /// Pixel formats accepted, most preferred first. Never empty.
+    pixel-formats: list<string>,
+  }
+
+  /// The stream an instance is attached to, told once at init.
+  record stream-info {
+    index: u32,
+    kind: string,
+    codec: string,
+    /// Seconds; absent when unknown.
+    duration: option<f64>,
+    tags: list<tuple<string, string>>,
+  }
+}
+
+interface filter {
+  use types.{meta, stream-info};
+
+  record frame-info {
+    width: u32,
+    height: u32,
+    /// Seconds since the start of the stream.
+    time: f64,
+  }
+
+  variant output {
+    /// A new frame, same byte length as the input.
+    frame(list<u8>),
+    /// The input frame is the output; the host copies nothing.
+    passthrough,
+  }
+
+  /// What one frame produced.
+  record outcome {
+    output: output,
+    /// JSON objects matching `meta.rows-schema`, zero or more per frame.
+    rows: list<string>,
+  }
+
+  describe: func() -> meta;
+
+  /// Called once per instance. `pix-fmt` is one of `meta.pixel-formats`,
+  /// chosen by whatever drives the host. The frame size is fixed for the
+  /// life of the instance.
+  init: func(width: u32, height: u32, pix-fmt: string, stream-info: stream-info,
+             params: string) -> result<_, string>;
+
+  /// Replaces the parameters between frames. The module keeps the state
+  /// it built in `init`; rejecting the new parameters must leave the
+  /// previous ones in force.
+  set-params: func(params: string) -> result<_, string>;
+
+  /// Whether `process` depends only on the current frame. False makes
+  /// frame-parallel hosting unsound and a host must refuse it. Callable
+  /// after `init`; the answer may depend on the parameters.
+  frame-independent: func() -> bool;
+
+  process: func(info: frame-info, frame: list<u8>) -> outcome;
+}
+
+interface audio-filter {
+  use types.{meta, stream-info};
+
+  record audio-info {
+    rate: u32,
+    channels: u32,
+    /// Seconds since the start of the stream.
+    time: f64,
+  }
+
+  variant audio-output {
+    /// Interleaved samples, same count as came in.
+    samples(list<f32>),
+    /// The input samples are the output.
+    passthrough,
+  }
+
+  record audio-outcome {
+    output: audio-output,
+    rows: list<string>,
+  }
+
+  describe: func() -> meta;
+  init: func(rate: u32, channels: u32, stream-info: stream-info,
+             params: string) -> result<_, string>;
+  set-params: func(params: string) -> result<_, string>;
+  frame-independent: func() -> bool;
+  process: func(info: audio-info, samples: list<f32>) -> audio-outcome;
+}
+
+world video-module { export filter; }
+world audio-module { export audio-filter; }
+world av-module    { export filter; export audio-filter; }

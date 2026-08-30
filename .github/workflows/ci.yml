@@ -1,0 +1,105 @@
+name: CI
+
+# Triggers on cli/**, docs/** and workflow-file changes -- the
+# compiler, the cookbook it ships with, and the modules the cookbook's wasm
+# recipes name.
+#
+# On pull_request, actions/checkout checks out refs/pull/N/merge -- the
+# MERGE RESULT of the PR into main, not the PR branch tip -- so PR runs
+# test what main would become. Keep it that way.
+on:
+  push:
+    branches: [main]
+    paths: [cli/**, docs/**, .github/workflows/**]
+  pull_request:
+    paths: [cli/**, docs/**, .github/workflows/**]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # The Python project lives in cli/; every path below is relative to it.
+    defaults:
+      run:
+        working-directory: cli
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.14"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install ffrwd with dev extras
+        run: pip install -e .[dev]
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Type-check (mypy, strict on ffrwd/)
+        run: mypy ffrwd/
+
+      # No ffmpeg installed yet, on purpose: the default suite must be
+      # deterministic on a bare machine, compiling against
+      # tests/data/reference_registry.json wherever a test needs a filter
+      # surface -- the snapshot exists for offline CI.
+      - name: Test (pytest, exec tests excluded by default)
+        run: python -m pytest tests/
+
+      # The provisioner ffrwd ships, not apt: same path a bare user machine
+      # takes, and GitHub-hosted downloads instead of apt mirrors (which have
+      # hung and failed runs here before).
+      - name: Provision ffmpeg (static-ffmpeg)
+        timeout-minutes: 8
+        run: |
+          python -c "import os; from static_ffmpeg import run; print(os.path.dirname(run.get_or_fetch_platform_executables_else_raise()[0]))" >> "$GITHUB_PATH"
+
+      # Builds the sidecar so the exec tier's wasm recipes and tests run
+      # instead of skipping. Working directories are set explicitly below --
+      # this job's default is cli/.
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+
+      - name: Cache sidecar build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            sidecar
+            sidecar/modules
+
+      - name: Build the sidecar binary
+        working-directory: sidecar
+        run: cargo build --release
+
+      - name: Build the wasm modules
+        working-directory: sidecar/modules
+        run: cargo build --target wasm32-wasip2 --release
+
+      # The env override is first in the discovery chain, so this points
+      # the exec tier at the binary just built instead of a stale wheel.
+      - name: Point discovery at the freshly built sidecar
+        run: echo "FFRWD_WASM=$GITHUB_WORKSPACE/sidecar/target/release/ffrwd-wasm" >> "$GITHUB_ENV"
+
+      # The two inference modules bind a model file beside their wasm; the
+      # compiler checks it exists, so the cookbook's inference recipes need
+      # the pinned files even where no inference runs.
+      - name: Fetch module models (pinned)
+        run: |
+          M="$GITHUB_WORKSPACE/sidecar/modules/target/wasm32-wasip2/release"
+          curl -sSfL -o "$M/depth.onnx" "https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/4472b7362082ad9968fee890ca0f1e5aca36b93d/onnx/model.onnx"
+          echo "afb6a5c28f3b6bf1618c6e43f02073ef9dfdc70e937502d51603e57b0a1df10c  $M/depth.onnx" | sha256sum -c
+          curl -sSfL -o "$M/segment.onnx" "https://huggingface.co/mobilint/YOLOv8n-seg/resolve/7b775a2526a57688597b2abe50dae6ec6567d4cf/yolov8n-seg.onnx"
+          echo "cb1e689c548b3fa019691c9c1762f38a76276981ce75d31f6c5aae396dbff78b  $M/segment.onnx" | sha256sum -c
+
+      - name: Generate synthetic media fixtures
+        run: python scripts/gen_fixtures.py
+
+      - name: Exec tests (real ffmpeg)
+        run: python -m pytest -m exec tests/

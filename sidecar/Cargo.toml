@@ -1,0 +1,16 @@
+[workspace]
+members = ["runtime", "ffrwd-wasm"]
+exclude = ["modules", "vendor"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+# wasmtime-wasi-nn's ONNX backend reads ExecutionTarget::Gpu as CUDA and
+# nothing else. The vendored copy resolves it through a provider list the host
+# supplies, which is what lets -nn-target directml reach DirectML; the version
+# is the one the lock already resolved, and the diff is one file.
+[patch.crates-io]
+wasmtime-wasi-nn = { path = "vendor/wasmtime-wasi-nn" }

@@ -1,0 +1,14 @@
+package ffrwd:nn-probe;
+
+/// A module that does inference and nothing else. It exports the value
+/// interface, so a caller reaches it without a stream, and imports `wasi:nn`
+/// - the standard interface, not anything of ours. It imports no filesystem:
+/// the model file is the host's, and this module only knows its name.
+world nn-probe {
+  export ffrwd:av/values@0.10.0;
+
+  import wasi:nn/tensor@0.2.0-rc-2024-10-28;
+  import wasi:nn/graph@0.2.0-rc-2024-10-28;
+  import wasi:nn/inference@0.2.0-rc-2024-10-28;
+  import wasi:nn/errors@0.2.0-rc-2024-10-28;
+}

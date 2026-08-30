@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ffrwd.io/schemas/error.json",
+  "title": "ffrwd error object",
+  "description": "The JSON object printed by `ffrwd validate --json` on rejection, and returned by FfrwdError.to_dict(). See docs/errors.md for the meaning of each `code` value.",
+  "type": "object",
+  "properties": {
+    "line": {
+      "description": "1-based line number the error is anchored to, or null if no position is available.",
+      "type": ["integer", "null"]
+    },
+    "col": {
+      "description": "1-based column number the error is anchored to, or null if no position is available.",
+      "type": ["integer", "null"]
+    },
+    "code": {
+      "description": "The ErrorCode enum value (ffrwd/errors.py).",
+      "type": "string",
+      "enum": [
+        "PARSE_ERROR",
+        "UNKNOWN_FUNCTION",
+        "UNKNOWN_ALIAS",
+        "UDF_ARG_TYPE",
+        "SINGLE_OUTPUT_ONLY",
+        "NO_STREAMING_EQUIVALENT",
+        "CONCAT_MISMATCH",
+        "UNSUPPORTED_SQL",
+        "STREAM_NOT_FOUND",
+        "INPUT_NOT_FOUND",
+        "BROADCAST_MISMATCH",
+        "ROW_COUNT_MISMATCH",
+        "UNKNOWN_SINK_OPTION",
+        "SINK_OPTION_TYPE",
+        "UNKNOWN_FILTER_OPTION",
+        "FILTER_OPTION_TYPE",
+        "UNKNOWN_INPUT_OPTION",
+        "INPUT_OPTION_TYPE",
+        "NOTHING_TO_SHOW",
+        "PLAYER_NOT_FOUND",
+        "UNBOUNDED_LIVE_INPUT",
+        "BUFFER_OVERFLOW",
+        "INTERNAL"
+      ]
+    },
+    "message": {
+      "description": "Human-readable description of the rejection.",
+      "type": "string"
+    },
+    "hint": {
+      "description": "Optional suggestion for how to fix the query, or null.",
+      "type": ["string", "null"]
+    }
+  },
+  "required": ["line", "col", "code", "message", "hint"],
+  "additionalProperties": false
+}

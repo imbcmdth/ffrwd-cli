@@ -1,0 +1,66 @@
+{
+  "inputs": [
+    "clip.mp4"
+  ],
+  "sources": {
+    "a": 0
+  },
+  "nodes": [
+    {
+      "id": "n1",
+      "filter": "scale",
+      "args": {
+        "width": "iw/2"
+      },
+      "inputs": [
+        "src:a:v:0"
+      ],
+      "outputs": [
+        "video"
+      ]
+    },
+    {
+      "id": "n1_split",
+      "filter": "split",
+      "args": {
+        "n": 2
+      },
+      "inputs": [
+        "n1"
+      ],
+      "outputs": [
+        "video",
+        "video"
+      ]
+    },
+    {
+      "id": "n2",
+      "filter": "overlay",
+      "args": {
+        "x": 10,
+        "y": 10
+      },
+      "inputs": [
+        "n1_split:0",
+        "n1_split:1"
+      ],
+      "outputs": [
+        "video"
+      ]
+    }
+  ],
+  "sinks": [
+    {
+      "outputs": [
+        {
+          "ref": "n2",
+          "type": "video",
+          "name": null,
+          "metadata": {}
+        }
+      ],
+      "path": null,
+      "options": {}
+    }
+  ]
+}

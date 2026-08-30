@@ -1,0 +1,39 @@
+{
+  "inputs": [
+    "film.mp4",
+    "subs.en.vtt"
+  ],
+  "sources": {
+    "f": 0,
+    "s": 1
+  },
+  "nodes": [],
+  "sinks": [
+    {
+      "outputs": [
+        {
+          "ref": "src:f:v:0",
+          "type": "video",
+          "name": null,
+          "metadata": {}
+        },
+        {
+          "ref": "src:f:a:0",
+          "type": "audio",
+          "name": null,
+          "metadata": {}
+        },
+        {
+          "ref": "src:s:s:0",
+          "type": "subtitle",
+          "name": null,
+          "metadata": {}
+        }
+      ],
+      "path": "out.mp4",
+      "options": {
+        "subtitle_codec": "mov_text"
+      }
+    }
+  ]
+}

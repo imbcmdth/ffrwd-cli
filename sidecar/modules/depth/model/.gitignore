@@ -1,0 +1,4 @@
+# The Depth Anything V2 graph fetch-model.ps1 downloads: 94 MB. Too big for
+# git, so the module builds without it and the host refuses to bind a model
+# that is not there.
+model.onnx

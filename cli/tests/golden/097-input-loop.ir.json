@@ -1,0 +1,47 @@
+{
+  "inputs": [
+    "film.mp4",
+    "logo.png"
+  ],
+  "sources": {
+    "f": 0,
+    "logo": 1
+  },
+  "nodes": [
+    {
+      "id": "n1",
+      "filter": "overlay",
+      "args": {
+        "x": 20,
+        "y": 20
+      },
+      "inputs": [
+        "src:f:v:0",
+        "src:logo:v:0"
+      ],
+      "outputs": [
+        "video"
+      ]
+    }
+  ],
+  "sinks": [
+    {
+      "outputs": [
+        {
+          "ref": "n1",
+          "type": "video",
+          "name": null,
+          "metadata": {}
+        }
+      ],
+      "path": null,
+      "options": {}
+    }
+  ],
+  "input_options": {
+    "logo": {
+      "loop": true,
+      "framerate": 15
+    }
+  }
+}

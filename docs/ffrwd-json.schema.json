@@ -1,0 +1,112 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ffrwd.video/ffrwd-json.schema.json",
+  "title": "ffrwd.json",
+  "description": "An ffrwd package manifest. name and version are required; a key outside this schema is rejected, not ignored.",
+  "type": "object",
+  "required": ["name", "version"],
+  "additionalProperties": false,
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "<namespace>/<package>, each half a lowercase plain identifier. The namespace may not be ffmpeg or wasm.",
+      "pattern": "^[a-z_][a-z0-9_]*/[a-z_][a-z0-9_]*$"
+    },
+    "version": {
+      "type": "string",
+      "description": "The version this directory publishes as. Published versions are immutable.",
+      "minLength": 1
+    },
+    "description": {
+      "type": "string",
+      "description": "One line about the package, shown in search results and on the package page."
+    },
+    "lib": {
+      "description": "The exports. A string names one file whose export is named for the package segment; a map names several, one file per key.",
+      "oneOf": [
+        { "type": "string", "minLength": 1 },
+        {
+          "type": "object",
+          "propertyNames": { "pattern": "^[a-z_][a-z0-9_]*$" },
+          "additionalProperties": { "type": "string", "minLength": 1 }
+        }
+      ]
+    },
+    "bin": {
+      "description": "The recipes. A map key is a command word, its value one query file; a string names one file, its recipe named for the package segment.",
+      "oneOf": [
+        { "type": "string", "minLength": 1 },
+        {
+          "type": "object",
+          "propertyNames": { "pattern": "^[a-z][a-z0-9_-]*$" },
+          "additionalProperties": { "type": "string", "minLength": 1 }
+        }
+      ]
+    },
+    "dependencies": {
+      "type": "object",
+      "description": "Package name to the version range as written. Recorded and shown, never solved; installs pin exact versions in ffrwd.lock.",
+      "propertyNames": { "pattern": "^[a-z_][a-z0-9_]*/[a-z_][a-z0-9_]*$" },
+      "additionalProperties": { "type": "string", "minLength": 1 }
+    },
+    "keywords": {
+      "type": "array",
+      "description": "Labels the registry indexes and ranks over. The compiler never reads them.",
+      "maxItems": 16,
+      "items": { "type": "string", "minLength": 1, "maxLength": 32 }
+    },
+    "license": {
+      "type": "string",
+      "description": "What the package is published under: an SPDX identifier or an expression over them. Shape only; no list is consulted.",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "capabilities": {
+      "type": "array",
+      "description": "What the host must grant this package's modules. Declared here and derived at publish from what each module says it does; a disagreement in either direction is a refusal.",
+      "items": { "enum": ["http", "nn", "udp"] }
+    },
+    "ffrwd": {
+      "type": "string",
+      "description": "The range of ffrwd versions the package declares it runs on. Checked for shape, recorded and shown, never a reason to refuse an install.",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "models": {
+      "type": "object",
+      "description": "The model file each exported wasm function loads, keyed by the export's name. install fetches each from Hugging Face and verifies it against the pin; the model is never in the archive.",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["repo", "revision", "file", "sha256"],
+        "additionalProperties": false,
+        "properties": {
+          "repo": {
+            "type": "string",
+            "description": "<owner>/<name> on Hugging Face.",
+            "pattern": "^[^/\\s]+/[^/\\s]+$"
+          },
+          "revision": {
+            "type": "string",
+            "description": "One branch, tag or commit.",
+            "minLength": 1
+          },
+          "file": {
+            "type": "string",
+            "description": "One path inside that revision.",
+            "minLength": 1
+          },
+          "sha256": {
+            "type": "string",
+            "description": "What the file's bytes must hash to.",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        }
+      }
+    },
+    "private": {
+      "type": "boolean",
+      "description": "true publishes each version private: installable with a token from the namespace, off the public index. A version's visibility never changes after publish.",
+      "default": false
+    }
+  }
+}

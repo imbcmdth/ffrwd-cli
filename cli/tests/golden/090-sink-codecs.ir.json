@@ -1,0 +1,36 @@
+{
+  "inputs": [
+    "foo.mp4"
+  ],
+  "sources": {
+    "a": 0
+  },
+  "nodes": [],
+  "sinks": [
+    {
+      "outputs": [
+        {
+          "ref": "src:a:v:0",
+          "type": "video",
+          "name": null,
+          "metadata": {}
+        },
+        {
+          "ref": "src:a:a:0",
+          "type": "audio",
+          "name": null,
+          "metadata": {}
+        }
+      ],
+      "path": "out.mkv",
+      "options": {
+        "video_codec": "libx264",
+        "crf": 20,
+        "preset": "slow",
+        "audio_codec": "aac",
+        "audio_bitrate": "192k",
+        "faststart": true
+      }
+    }
+  ]
+}

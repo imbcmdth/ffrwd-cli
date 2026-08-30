@@ -1,0 +1,54 @@
+{
+  "inputs": [
+    "clip.mp4"
+  ],
+  "sources": {
+    "a": 0
+  },
+  "nodes": [
+    {
+      "id": "n1",
+      "filter": "crop",
+      "args": {
+        "out_w": 10,
+        "out_h": 20,
+        "x": 300,
+        "y": 400
+      },
+      "inputs": [
+        "src:a:v:0"
+      ],
+      "outputs": [
+        "video"
+      ]
+    },
+    {
+      "id": "n2",
+      "filter": "scale",
+      "args": {
+        "width": 640,
+        "height": 480
+      },
+      "inputs": [
+        "n1"
+      ],
+      "outputs": [
+        "video"
+      ]
+    }
+  ],
+  "sinks": [
+    {
+      "outputs": [
+        {
+          "ref": "n2",
+          "type": "video",
+          "name": null,
+          "metadata": {}
+        }
+      ],
+      "path": null,
+      "options": {}
+    }
+  ]
+}

@@ -1,0 +1,312 @@
+name: Release
+
+# One workflow, one tag, both packages -- the cli and the sidecar wheel are
+# version-locked, so they release as one unit. The publish waits on the full
+# cli suite AND the seven-wheel matrix (Linux glibc and musl, Windows, each
+# on x64 and aarch64; macOS on Apple silicon), so nothing ships unless
+# everything is green -- an atomic release, no ordering between siblings.
+# workflow_dispatch proves the suite and the matrix without publishing.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  # The cli gauntlet: the full suite on a bare machine, then with real
+  # ffmpeg and the freshly built sidecar. Publishes nothing itself.
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # The Python project lives in cli/; every path below is relative to it.
+    defaults:
+      run:
+        working-directory: cli
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify the tag is on main
+        run: |
+          git fetch origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || {
+            echo "tag ${GITHUB_REF_NAME} points at a commit not on main; refusing to release"
+            exit 1
+          }
+
+      - name: Verify the lockstep versions match the tag
+        working-directory: .
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          cli=$(grep -m1 '^version' cli/pyproject.toml | cut -d'"' -f2)
+          wheel=$(grep -m1 '^version' sidecar/ffrwd-wasm/pyproject.toml | cut -d'"' -f2)
+          [ "$tag" = "$cli" ] && [ "$tag" = "$wheel" ] || {
+            echo "tag v$tag, cli $cli, sidecar wheel $wheel: the lockstep versions disagree"
+            exit 1
+          }
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      # The platform-marked ffrwd-wasm dependency must resolve, and this tag's
+      # wheels may still be building in the other workflow -- so the release
+      # satisfies it from its own workspace: build the sidecar wheel locally
+      # and install it first, and pip finds the dependency already met.
+      - name: Set up Rust (early, for the sidecar wheel)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+      - name: Cache sidecar build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            sidecar
+            sidecar/modules
+      - name: Build and install the workspace sidecar wheel
+        working-directory: sidecar/ffrwd-wasm
+        run: |
+          pip install maturin
+          maturin build --release --out dist
+          pip install dist/*.whl
+
+      - name: Install ffrwd with dev extras
+        run: pip install -e .[dev]
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Type-check (mypy, strict on ffrwd/)
+        run: mypy ffrwd/
+
+      # No ffmpeg yet, on purpose: the default suite must pass on a bare
+      # machine, compiling against tests/data/reference_registry.json.
+      - name: Test (pytest, exec tests excluded by default)
+        run: python -m pytest tests/
+
+      # The provisioner ffrwd ships, not apt: same path a bare user
+      # machine takes.
+      # Retried: the provisioner pulls ~140 MB, and a dropped connection at
+      # megabyte 139 has already cost one release run.
+      - name: Provision ffmpeg (static-ffmpeg)
+        timeout-minutes: 15
+        run: |
+          for attempt in 1 2 3; do
+            python -c "import os; from static_ffmpeg import run; print(os.path.dirname(run.get_or_fetch_platform_executables_else_raise()[0]))" >> "$GITHUB_PATH" && break
+            echo "provisioner attempt $attempt failed; retrying"
+            sleep 15
+            [ "$attempt" = 3 ] && exit 1
+          done
+
+      # Builds the sidecar so the exec tier's wasm recipes and tests run
+      # instead of skipping -- a release must not skip what CI runs.
+      # Working directories are set explicitly below -- this job's default
+      # is cli/.
+      - name: Build the sidecar binary
+        working-directory: sidecar
+        run: cargo build --release
+
+      - name: Build the wasm modules
+        working-directory: sidecar/modules
+        run: cargo build --target wasm32-wasip2 --release
+
+      # The env override is first in the discovery chain, so this points
+      # the exec tier at the binary just built instead of a stale wheel.
+      - name: Point discovery at the freshly built sidecar
+        run: echo "FFRWD_WASM=$GITHUB_WORKSPACE/sidecar/target/release/ffrwd-wasm" >> "$GITHUB_ENV"
+
+      # The two inference modules bind a model file beside their wasm; the
+      # compiler checks it exists, so the cookbook's inference recipes need
+      # the pinned files even where no inference runs. Same step as CI's.
+      - name: Fetch module models (pinned)
+        run: |
+          M="$GITHUB_WORKSPACE/sidecar/modules/target/wasm32-wasip2/release"
+          curl -sSfL -o "$M/depth.onnx" "https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/4472b7362082ad9968fee890ca0f1e5aca36b93d/onnx/model.onnx"
+          echo "afb6a5c28f3b6bf1618c6e43f02073ef9dfdc70e937502d51603e57b0a1df10c  $M/depth.onnx" | sha256sum -c
+          curl -sSfL -o "$M/segment.onnx" "https://huggingface.co/mobilint/YOLOv8n-seg/resolve/7b775a2526a57688597b2abe50dae6ec6567d4cf/yolov8n-seg.onnx"
+          echo "cb1e689c548b3fa019691c9c1762f38a76276981ce75d31f6c5aae396dbff78b  $M/segment.onnx" | sha256sum -c
+
+      - name: Generate synthetic media fixtures
+        run: python scripts/gen_fixtures.py
+
+      - name: Exec tests (real ffmpeg)
+        run: python -m pytest -m exec tests/
+
+      # `ffrwd/wasm` carries the `ffrwd:av` wit world and versions WITH THE
+      # WORLD, not with these two, so most tags do not move it and the ones
+      # that do need a second publish -- to the package registry, not PyPI.
+      # No token for that registry exists here, so this reports and ships
+      # nothing. continue-on-error because it is a notice: a release must not
+      # turn on whether the package registry answered.
+      - name: Report whether the wit world's package needs publishing
+        if: startsWith(github.ref, 'refs/tags/v')
+        continue-on-error: true
+        working-directory: ${{ github.workspace }}
+        run: |
+          python3 - <<'EOF'
+          import hashlib
+          import pathlib
+          import shutil
+
+          from ffrwd import packages, store
+          from ffrwd.errors import FfrwdError
+          from ffrwd.wasm import WIT_PACKAGE, WORLD_VERSION
+
+          ROOT = pathlib.Path("sidecar/wasm")
+
+          # The archive an install reads holds `wit/av.wit`; the tree holds one
+          # av.wit, in sidecar/wit. The copy is made at pack time, here and in
+          # the publish invocation printed below, and never checked in.
+          staged = ROOT / "wit"
+          staged.mkdir(exist_ok=True)
+          shutil.copyfile("sidecar/wit/av.wit", staged / "av.wit")
+
+          archive = store.pack(ROOT)
+          digest = hashlib.sha256(archive).hexdigest()
+          request = f"{WIT_PACKAGE}@{WORLD_VERSION}"
+          print(f"{ROOT} packs to sha256 {digest} ({len(archive)} bytes)")
+
+          try:
+              release = packages.resolve(request)
+          except FfrwdError as err:
+              print(f"{request} did not resolve: {err}")
+              print("if that is because the world moved, its package has to follow.")
+              print("From a checkout of this tag:")
+              print()
+              print("    cp sidecar/wit/av.wit sidecar/wasm/wit/av.wit")
+              print("    cd sidecar/wasm && ffrwd publish")
+              print()
+              print(f"which ships the {len(archive)} bytes hashing to {digest}.")
+              # Publishing from here is the line below, once CI can. It needs
+              # FFRWD_TOKEN in the environment, from a repository secret
+              # holding a publish token for the ffrwd namespace -- the same
+              # token `ffrwd login` saves on a machine.
+              # subprocess.run(["ffrwd", "publish"], cwd=ROOT, check=True)
+          else:
+              print(
+                  f"{request} is published already: sha256 {release.sha256} "
+                  f"({release.size} bytes). A version publishes once, and the "
+                  "world has not moved, so there is nothing to do."
+              )
+              if release.sha256 != digest:
+                  print(
+                      "The digests differ. The archive is over BYTES and sidecar/ is "
+                      "checked out with the platform's line endings, so that is what "
+                      "this is unless the wit itself changed."
+                  )
+          EOF
+
+
+  wheels:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64
+            manylinux: auto
+          # Cross-compiled in maturin's manylinux container via its own
+          # toolchain; no aarch64 runner needed.
+          - os: ubuntu-latest
+            target: aarch64
+            manylinux: auto
+          # The musl pair, so pip finds a wheel on Alpine-class machines --
+          # environment markers cannot see libc, so without these the
+          # dependency marker matches and then finds nothing to install.
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            manylinux: musllinux_1_2
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            manylinux: musllinux_1_2
+          # Apple silicon only: Intel Macs are old enough now, and they never
+          # had usable inference acceleration to lose.
+          - os: macos-latest
+            target: aarch64
+          - os: windows-latest
+            target: x86_64
+          # Cross-compiled on the x64 runner; the msvc aarch64 target links
+          # with the same toolchain the runner carries.
+          - os: windows-latest
+            target: aarch64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: sidecar/ffrwd-wasm
+          command: build
+          args: --release --out dist
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux || 'auto' }}
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.os }}-${{ matrix.target }}
+          path: sidecar/ffrwd-wasm/dist/*.whl
+
+  publish:
+    # Tags only: a dispatch run proves everything and ships nothing.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test, wheels]
+    runs-on: ubuntu-latest
+    # PyPI trusted publishing: the id-token is the credential, minted per
+    # run; PyPI is configured to trust this repo's release.yml in the
+    # `pypi` environment for both projects.
+    environment: pypi
+    permissions:
+      id-token: write
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify the tag is on main
+        run: |
+          git fetch origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || {
+            echo "tag ${GITHUB_REF_NAME} points at a commit not on main; refusing to release"
+            exit 1
+          }
+
+      - name: Verify the lockstep versions match the tag
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          cli=$(grep -m1 '^version' cli/pyproject.toml | cut -d'"' -f2)
+          wheel=$(grep -m1 '^version' sidecar/ffrwd-wasm/pyproject.toml | cut -d'"' -f2)
+          [ "$tag" = "$cli" ] && [ "$tag" = "$wheel" ] || {
+            echo "tag v$tag, cli $cli, sidecar wheel $wheel: the lockstep versions disagree"
+            exit 1
+          }
+
+      - name: Collect the sidecar wheels
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          merge-multiple: true
+          path: dist
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Build the cli distribution
+        working-directory: cli
+        run: uv build --out-dir ../dist
+
+      # --check-url makes a republish idempotent: files already on the index
+      # are skipped rather than refused, so a partially shipped tag can be
+      # fired again and only the missing half uploads.
+      - name: Publish both packages to PyPI
+        run: uv publish --check-url https://pypi.org/simple/ dist/*

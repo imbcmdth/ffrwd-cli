@@ -1,0 +1,8 @@
+# Docs are written with LF by generators/tests that assert byte-identity or
+# LF-only content: never CRLF-smudge them on checkout.
+docs/** text eol=lf
+*.bin binary
+*.nut binary
+# The wit is packed into the ffrwd/wasm archive: its bytes must not
+# depend on which platform packs it.
+sidecar/wit/av.wit text eol=lf

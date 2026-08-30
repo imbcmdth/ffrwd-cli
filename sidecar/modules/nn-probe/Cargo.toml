@@ -1,0 +1,13 @@
+[package]
+name = "nn-probe"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "nn_probe"
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.57.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

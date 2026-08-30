@@ -1,0 +1,11 @@
+# A runtime directory for hand runs: point -nn-runtime or FFRWD_NN_RUNTIME
+# here and the sidecar loads what is in it. Nothing fills it on its own -
+# `ffrwd setup nn`, and a query that reaches a model, provision under
+# ~/.cache/ffrwd/nn-runtime/<ort-version>/<platform>/ instead. The libraries
+# run to hundreds of megabytes and are not needed to build, so none of them
+# reach git; this file is what keeps the directory itself here.
+*.dll
+*.so
+*.dylib
+archives/
+directml/

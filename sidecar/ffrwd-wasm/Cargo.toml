@@ -1,0 +1,24 @@
+[package]
+name = "ffrwd-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ffmpeg-shaped sidecar: hosts one ffrwd:av filter between two NUT frame edges"
+
+[lib]
+name = "ffrwd_wasm"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ffrwd-wasm"
+path = "src/main.rs"
+
+[dependencies]
+ffrwd-wasm-runtime = { path = "../runtime" }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+
+[dev-dependencies]
+# Pins the face detection model facebox compiles in.
+sha2 = "0.10"

@@ -1,0 +1,68 @@
+name: Sidecar
+
+# Triggers on the Rust in the repo: the wasm host and every module
+# workspace, including the ones the packages ship. All of it builds and
+# tests independently of the Python compiler.
+on:
+  push:
+    branches: [main]
+    paths: [sidecar/**]
+  pull_request:
+    paths: [sidecar/**]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # The Rust workspace lives in sidecar/; every path below is relative to it.
+    defaults:
+      run:
+        working-directory: sidecar
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Format (rustfmt)
+        run: cargo fmt --check
+
+      - name: Lint (clippy)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # modules/ is its own cargo workspace (excluded from the one above), so
+      # the two steps above never see it.
+      - name: Format (rustfmt) - modules
+        working-directory: sidecar/modules
+        run: cargo fmt --check
+
+      - name: Lint (clippy) - modules
+        working-directory: sidecar/modules
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build --workspace
+
+      # tests/ under each crate builds modules/ for wasm32-wasip2, and the
+      # ffmpeg-driving cases need ffmpeg on PATH; this job has neither the
+      # target nor ffmpeg, so --lib --bins keeps it to the module-free tests.
+      - name: Test (module-free only)
+        run: cargo test --workspace --lib --bins
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      # Smoke test: the ffrwd-wasm crate packages as a maturin bin-bindings
+      # wheel. No publish step exists anywhere in this workflow.
+      - name: Build wheel
+        working-directory: sidecar/ffrwd-wasm
+        run: uvx maturin build --release
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffrwd-wasm-wheel
+          path: sidecar/target/wheels/*.whl

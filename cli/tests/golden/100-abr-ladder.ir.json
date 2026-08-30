@@ -1,0 +1,155 @@
+{
+  "inputs": [
+    "film.mkv"
+  ],
+  "sources": {
+    "f": 0
+  },
+  "nodes": [
+    {
+      "id": "n1",
+      "filter": "scale",
+      "args": {
+        "width": 1920,
+        "height": -2
+      },
+      "inputs": [
+        "src:f:v:0"
+      ],
+      "outputs": [
+        "video"
+      ]
+    },
+    {
+      "id": "n2",
+      "filter": "volume",
+      "args": {
+        "volume": 0.9
+      },
+      "inputs": [
+        "src:f:a:0"
+      ],
+      "outputs": [
+        "audio"
+      ]
+    },
+    {
+      "id": "n1_split",
+      "filter": "split",
+      "args": {
+        "n": 2
+      },
+      "inputs": [
+        "n1"
+      ],
+      "outputs": [
+        "video",
+        "video"
+      ]
+    },
+    {
+      "id": "n3",
+      "filter": "scale",
+      "args": {
+        "width": 1280,
+        "height": -2
+      },
+      "inputs": [
+        "n1_split:0"
+      ],
+      "outputs": [
+        "video"
+      ]
+    },
+    {
+      "id": "n4",
+      "filter": "scale",
+      "args": {
+        "width": 640,
+        "height": -2
+      },
+      "inputs": [
+        "n1_split:1"
+      ],
+      "outputs": [
+        "video"
+      ]
+    },
+    {
+      "id": "n2_split",
+      "filter": "asplit",
+      "args": {
+        "n": 3
+      },
+      "inputs": [
+        "n2"
+      ],
+      "outputs": [
+        "audio",
+        "audio",
+        "audio"
+      ]
+    }
+  ],
+  "sinks": [
+    {
+      "outputs": [
+        {
+          "ref": "n3",
+          "type": "video",
+          "name": "v",
+          "metadata": {}
+        },
+        {
+          "ref": "n2_split:0",
+          "type": "audio",
+          "name": null,
+          "metadata": {}
+        }
+      ],
+      "path": "720.mp4",
+      "options": {
+        "video_codec": "libx264",
+        "crf": 21,
+        "audio_codec": "aac"
+      }
+    },
+    {
+      "outputs": [
+        {
+          "ref": "n4",
+          "type": "video",
+          "name": "v",
+          "metadata": {}
+        },
+        {
+          "ref": "n2_split:1",
+          "type": "audio",
+          "name": null,
+          "metadata": {}
+        }
+      ],
+      "path": "360.mp4",
+      "options": {
+        "video_codec": "libx264",
+        "crf": 26,
+        "audio_codec": "aac"
+      }
+    },
+    {
+      "outputs": [
+        {
+          "ref": "n2_split:2",
+          "type": "audio",
+          "name": null,
+          "metadata": {}
+        }
+      ],
+      "path": "audio.m4a",
+      "options": {
+        "audio_codec": "aac",
+        "audio_bitrate": "128k"
+      }
+    }
+  ]
+}

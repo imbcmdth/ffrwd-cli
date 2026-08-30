@@ -1,0 +1,41 @@
+{
+  "inputs": [
+    "film.mp4",
+    "logo.png"
+  ],
+  "sources": {
+    "f": 0,
+    "p": 1
+  },
+  "nodes": [
+    {
+      "id": "n1",
+      "filter": "overlay",
+      "args": {
+        "x": "(W-w)/2",
+        "y": "(H-h)/2"
+      },
+      "inputs": [
+        "src:f:v:0",
+        "src:p:v:0"
+      ],
+      "outputs": [
+        "video"
+      ]
+    }
+  ],
+  "sinks": [
+    {
+      "outputs": [
+        {
+          "ref": "n1",
+          "type": "video",
+          "name": null,
+          "metadata": {}
+        }
+      ],
+      "path": null,
+      "options": {}
+    }
+  ]
+}

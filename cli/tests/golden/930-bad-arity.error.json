@@ -1,0 +1,7 @@
+{
+  "line": 1,
+  "col": 38,
+  "code": "UDF_ARG_TYPE",
+  "message": "gblur() got 5 positional options, but the 'gblur' filter has 4",
+  "hint": "its options, in the order they bind: sigma, steps, planes, sigmaV"
+}

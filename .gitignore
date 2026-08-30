@@ -1,0 +1,12 @@
+target/
+.venv/
+__pycache__/
+*.pyc
+.claude/
+
+# The archive of the ffrwd/wasm package carries the world at wit/av.wit; the
+# copy is made from sidecar/wit/av.wit when the package is packed, so the tree
+# holds one av.wit and the packer still sees the layout an install expects.
+# Deliberately here and not in sidecar/wasm/.gitignore: the packer reads the
+# package root's .gitignore, and a rule there would drop the wit instead.
+/sidecar/wasm/wit/

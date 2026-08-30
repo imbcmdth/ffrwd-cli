@@ -1,0 +1,12 @@
+# wasm32-wasip2 leaves SIMD off by default; enable it so a module can use it.
+[target.wasm32-wasip2]
+rustflags = ["-C", "target-feature=+simd128"]
+
+# The model transcribe compiles in. `relative = true` resolves it against this
+# directory, so a plain `cargo build` here needs nothing set in the
+# environment. The whisper weights are not in git, and transcribe builds
+# without them - see its build script.
+[env]
+TRANSCRIBE_MODEL_DIR = { value = "transcribe/model", relative = true }
+# The detector facebox compiles in. In git, so always present.
+FACEBOX_MODEL = { value = "facebox/model/seeta_fd_frontal_v1.0.bin", relative = true }

@@ -1,0 +1,7 @@
+{
+  "line": 1,
+  "col": 8,
+  "code": "UNKNOWN_FUNCTION",
+  "message": "unknown function xyzzyplugh()",
+  "hint": "every function is a filter of your installed ffmpeg, and this is not one of them; filters with a variable pad count, more than one output, or no input at all are not callable"
+}

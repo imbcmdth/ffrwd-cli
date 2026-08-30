@@ -1,0 +1,44 @@
+[workspace]
+# The modules the compiler wires into command graphs, then one fixture per
+# world older than the current one - each built against that world, so the
+# adapter carrying it is tested against a module actually shaped that way -
+# and one that breaks the rules an audio module is held to, so the refusals
+# are tested the same way.
+members = [
+    "framestats",
+    "blur-mask",
+    "invert",
+    "brand",
+    "facebox",
+    "blur-boxes",
+    "double",
+    "tail3",
+    "shots",
+    "again",
+    "rms",
+    "captions",
+    "transcribe",
+    "nn-probe",
+    "depth",
+    "segment",
+    "mask_select",
+    "pick-first",
+    "frame-stats",
+    "packet-stats",
+    "post-rows",
+    "broken-audio",
+    "adapted-020",
+    "adapted-030",
+    "adapted-040",
+    "adapted-050",
+    "adapted-060",
+    "adapted-070",
+    "adapted-080",
+    "adapted-090",
+]
+resolver = "2"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true

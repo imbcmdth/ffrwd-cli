@@ -1,0 +1,217 @@
+package ffrwd:av@0.5.0;
+
+interface types {
+  /// Static description of a module, available without running anything.
+  record meta {
+    name: string,
+    version: string,
+    /// JSON Schema for the `params` string.
+    params-schema: string,
+    /// JSON Schema for one row object; empty when the module emits none.
+    rows-schema: string,
+    /// Pixel formats accepted, most preferred first. Never empty.
+    pixel-formats: list<string>,
+  }
+
+  /// The stream an instance is attached to, told once at init.
+  record stream-info {
+    index: u32,
+    kind: string,
+    codec: string,
+    /// Seconds; absent when unknown.
+    duration: option<f64>,
+    /// The stream's own tags, plus `time-base` - spelled `num/den` - which the
+    /// host always supplies. A windowed module is handed timestamps rather
+    /// than seconds, so that tag is how one whose parameters are in seconds
+    /// converts them.
+    tags: list<tuple<string, string>>,
+  }
+}
+
+interface filter {
+  use types.{meta, stream-info};
+
+  record frame-info {
+    width: u32,
+    height: u32,
+    /// Seconds since the start of the stream.
+    time: f64,
+  }
+
+  variant output {
+    /// A new frame, same byte length as the input.
+    frame(list<u8>),
+    /// The input frame is the output; the host copies nothing.
+    passthrough,
+  }
+
+  /// What one frame produced.
+  record outcome {
+    output: output,
+    /// JSON objects matching `meta.rows-schema`, zero or more per frame.
+    rows: list<string>,
+  }
+
+  describe: func() -> meta;
+
+  /// Called once per instance. `pix-fmt` is one of `meta.pixel-formats`,
+  /// chosen by whatever drives the host. The frame size is fixed for the
+  /// life of the instance.
+  init: func(width: u32, height: u32, pix-fmt: string, stream-info: stream-info,
+             params: string) -> result<_, string>;
+
+  /// Replaces the parameters between frames. The module keeps the state
+  /// it built in `init`; rejecting the new parameters must leave the
+  /// previous ones in force.
+  set-params: func(params: string) -> result<_, string>;
+
+  /// Whether `process` depends only on the current frame. False makes
+  /// frame-parallel hosting unsound and a host must refuse it. Callable
+  /// after `init`; the answer may depend on the parameters.
+  frame-independent: func() -> bool;
+
+  process: func(info: frame-info, frame: list<u8>) -> outcome;
+}
+
+/// Optional beside `filter`, the way `values` is optional: a module that also
+/// exports this one reads the rows an upstream module emitted for the same
+/// frame. Everything else - `describe`, `init`, `set-params`,
+/// `frame-independent` - still comes from `filter`, so a module exporting
+/// this exports both. A host that finds this export calls `process-meta`
+/// instead of `process`; one that does not calls `process` as before.
+interface meta-filter {
+  use filter.{frame-info, outcome};
+
+  /// One frame plus the rows that arrived with it, each an NDJSON line an
+  /// upstream module produced. Empty when the frame carries none.
+  process-meta: func(info: frame-info, frame: list<u8>, rows-in: list<string>) -> outcome;
+}
+
+/// Frames a window at a time, superseding `filter`'s per-frame `process` and
+/// `meta-filter`'s `process-meta`. A module exports this one *or* those; a
+/// host adapts a module that exports the older pair as window 1, stride 1,
+/// one-to-one. `describe`, `init` and `set-params` mean here what they mean
+/// there, so the two differ only in how frames arrive and leave.
+interface window-filter {
+  use types.{meta, stream-info};
+
+  /// One input frame: its timestamp, its pixels, and the rows that arrived
+  /// with it - each an NDJSON line an upstream module produced, empty when
+  /// the frame carries none.
+  record in-frame {
+    pts: s64,
+    frame: list<u8>,
+    rows: list<string>,
+  }
+
+  /// Where an output frame's pixels come from.
+  variant frame-payload {
+    /// New pixels, one frame's worth in the instance's pixel format.
+    new(list<u8>),
+    /// An input frame's pixels, which the module never copied out: the frame
+    /// this call received at the same pts, or - when the call received
+    /// exactly one frame - that frame, whatever pts the output carries.
+    same,
+  }
+
+  /// One output frame. Its pts is the module's to choose: a module may move a
+  /// frame in time, drop it, or emit several from one.
+  record out-frame {
+    pts: s64,
+    frame: frame-payload,
+    rows: list<string>,
+  }
+
+  /// `meta`, plus how the host must drive this module.
+  record window-meta {
+    meta: meta,
+    /// Frames one `process` call receives. 1 is plain streaming.
+    window: u32,
+    /// Frames consumed per call, never more than `window`. 1 slides the
+    /// window by a frame; `window` makes the windows disjoint.
+    stride: u32,
+    /// Whether a call depends only on the frames it was handed. False makes
+    /// frame-parallel hosting unsound and a host must refuse it.
+    pure: bool,
+    /// Whether every call returns exactly one output per input frame it
+    /// consumed, each at that frame's own pts. Neither window nor stride
+    /// settles this - a window-1 module that drops frames has the same pair -
+    /// so it is declared.
+    one-to-one: bool,
+    /// Whether this module ACTS on the rows arriving with its frames. Every
+    /// windowed call receives them whatever this says, so availability is no
+    /// answer: a module that only carries rows through declares false, and one
+    /// that reads what an upstream module detected declares true.
+    reads-rows: bool,
+  }
+
+  describe: func() -> window-meta;
+
+  /// Called once per instance, as `filter`'s is.
+  init: func(width: u32, height: u32, pix-fmt: string, stream-info: stream-info,
+             params: string) -> result<_, string>;
+
+  /// Replaces the parameters between windows, as `filter`'s does.
+  set-params: func(params: string) -> result<_, string>;
+
+  /// One window. `last` marks the final call of the instance's life: it
+  /// carries whatever frames the last stride left over, which may be none,
+  /// and happens exactly once. There is no separate flush.
+  ///
+  /// Output timestamps never decrease, within a call or between calls.
+  process: func(frames: list<in-frame>, last: bool) -> list<out-frame>;
+}
+
+interface audio-filter {
+  use types.{meta, stream-info};
+
+  record audio-info {
+    rate: u32,
+    channels: u32,
+    /// Seconds since the start of the stream.
+    time: f64,
+  }
+
+  variant audio-output {
+    /// Interleaved samples, same count as came in.
+    samples(list<f32>),
+    /// The input samples are the output.
+    passthrough,
+  }
+
+  record audio-outcome {
+    output: audio-output,
+    rows: list<string>,
+  }
+
+  describe: func() -> meta;
+  init: func(rate: u32, channels: u32, stream-info: stream-info,
+             params: string) -> result<_, string>;
+  set-params: func(params: string) -> result<_, string>;
+  frame-independent: func() -> bool;
+  process: func(info: audio-info, samples: list<f32>) -> audio-outcome;
+}
+
+interface values {
+  /// Static description of one value function, available without calling it.
+  record function-meta {
+    name: string,
+    /// JSON Schema for `invoke`'s `args` object.
+    params-schema: string,
+    /// JSON Schema for the value `invoke` returns.
+    result-schema: string,
+  }
+
+  list-functions: func() -> list<function-meta>;
+
+  /// `args` is one JSON object keyed by parameter name. The ok string is one
+  /// JSON value; the err string is the module's own message.
+  invoke: func(name: string, args: string) -> result<string, string>;
+}
+
+world video-module  { export filter; }
+world meta-module   { export filter; export meta-filter; }
+world window-module { export window-filter; }
+world audio-module  { export audio-filter; }
+world av-module     { export filter; export audio-filter; }
+world values-module { export values; }

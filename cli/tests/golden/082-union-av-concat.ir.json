@@ -1,0 +1,51 @@
+{
+  "inputs": [
+    "intro.mp4",
+    "main.mp4"
+  ],
+  "sources": {
+    "a": 0,
+    "b": 1
+  },
+  "nodes": [
+    {
+      "id": "n1",
+      "filter": "concat",
+      "args": {
+        "n": 2,
+        "v": 1,
+        "a": 1
+      },
+      "inputs": [
+        "src:a:v:0",
+        "src:a:a:0",
+        "src:b:v:0",
+        "src:b:a:0"
+      ],
+      "outputs": [
+        "video",
+        "audio"
+      ]
+    }
+  ],
+  "sinks": [
+    {
+      "outputs": [
+        {
+          "ref": "n1:0",
+          "type": "video",
+          "name": null,
+          "metadata": {}
+        },
+        {
+          "ref": "n1:1",
+          "type": "audio",
+          "name": null,
+          "metadata": {}
+        }
+      ],
+      "path": null,
+      "options": {}
+    }
+  ]
+}

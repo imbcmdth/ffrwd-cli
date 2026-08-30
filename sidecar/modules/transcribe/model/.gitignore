@@ -1,0 +1,7 @@
+# The whisper files fetch-model.ps1 downloads: 151 MB of weights and the
+# tokenizer and config that go with them. Too big for git, so the module builds
+# without them and refuses at init instead. melfilters.bytes is not one of
+# them - it is a small constant table and it is in git.
+model.safetensors
+tokenizer.json
+config.json

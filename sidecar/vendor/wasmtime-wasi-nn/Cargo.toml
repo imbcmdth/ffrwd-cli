@@ -1,0 +1,162 @@
+# A vendored copy of wasmtime-wasi-nn 48.0.1, patched into the workspace so
+# the ONNX backend can put a `gpu` session on a provider other than CUDA. See
+# the note at the top of src/backend/onnx.rs.
+#
+# Taken from the published crate. Upstream's `tests/` and `examples/` are not
+# here - they carry a megabyte of binary fixtures and test nothing this build
+# uses - so the `[[test]]` target and the dev-dependencies behind it are gone
+# with them. Everything else is upstream's, including the lint configuration.
+
+[package]
+edition = "2024"
+rust-version = "1.95.0"
+name = "wasmtime-wasi-nn"
+version = "48.0.1"
+authors = ["The Wasmtime Project Developers"]
+build = "build.rs"
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "Wasmtime implementation of the wasi-nn API"
+documentation = "https://docs.rs/wasmtime-wasi-nn"
+readme = "README.md"
+keywords = [
+    "webassembly",
+    "wasm",
+    "neural-network",
+]
+categories = [
+    "wasm",
+    "computer-vision",
+]
+license = "Apache-2.0 WITH LLVM-exception"
+repository = "https://github.com/bytecodealliance/wasmtime"
+
+[features]
+default = [
+    "openvino",
+    "winml",
+]
+onnx = ["dep:ort"]
+onnx-cuda = [
+    "onnx",
+    "ort/cuda",
+]
+# DirectML on Windows and CoreML on Apple platforms, the way onnx-cuda turns
+# on CUDA. Each one only tells `ort` the provider is wanted; which provider a
+# `gpu` session actually asks for is the host's list.
+onnx-directml = [
+    "onnx",
+    "ort/directml",
+]
+onnx-coreml = [
+    "onnx",
+    "ort/coreml",
+]
+onnx-download = [
+    "onnx",
+    "ort/download-binaries",
+]
+openvino = ["dep:openvino"]
+ort-tracing = [
+    "onnx",
+    "ort/tracing",
+]
+pytorch = ["dep:tch"]
+winml = ["dep:windows"]
+
+[lib]
+name = "wasmtime_wasi_nn"
+path = "src/lib.rs"
+
+[dependencies.ort]
+version = "2.0.0-rc.10"
+features = ["copy-dylibs"]
+optional = true
+default-features = false
+
+[dependencies.tch]
+version = "0.17.0"
+optional = true
+default-features = false
+
+[dependencies.thiserror]
+version = "2.0.17"
+
+[dependencies.tracing]
+version = "0.1.41"
+default-features = false
+
+[dependencies.wasmtime]
+version = "48.0.1"
+features = [
+    "component-model",
+    "runtime",
+    "std",
+]
+default-features = false
+
+[dependencies.wiggle]
+version = "=48.0.1"
+features = ["wasmtime"]
+default-features = false
+
+[build-dependencies.walkdir]
+version = "2.5.0"
+
+[target.'cfg(target_pointer_width = "64")'.dependencies.openvino]
+version = "0.11.0"
+features = ["runtime-linking"]
+optional = true
+
+[target."cfg(windows)".dependencies.windows]
+version = "0.52"
+features = [
+    "AI_MachineLearning",
+    "Storage_Streams",
+    "Foundation_Collections",
+    "implement",
+]
+optional = true
+
+[lints.clippy]
+allow_attributes_without_reason = "warn"
+clone_on_copy = "warn"
+extra_unused_type_parameters = "warn"
+from_over_into = "warn"
+manual_strip = "warn"
+map_clone = "warn"
+multiple_bound_locations = "warn"
+redundant_field_names = "warn"
+uninlined_format_args = "warn"
+unnecessary_cast = "warn"
+unnecessary_fallible_conversions = "warn"
+unnecessary_mut_passed = "warn"
+unnecessary_to_owned = "warn"
+useless_conversion = "warn"
+
+[lints.clippy.all]
+level = "allow"
+priority = -1
+
+[lints.rust]
+trivial_numeric_casts = "warn"
+unstable_features = "warn"
+unused-lifetimes = "warn"
+unused-macro-rules = "warn"
+unused_extern_crates = "warn"
+unused_import_braces = "warn"
+
+[lints.rust.unexpected_cfgs]
+level = "warn"
+priority = 0
+check-cfg = [
+    "cfg(pulley_tail_calls)",
+    "cfg(pulley_assume_llvm_makes_tail_calls)",
+    "cfg(pulley_disable_interp_simd)",
+    "cfg(arc_try_new)",
+    "cfg(fuzzing)",
+    "cfg(gc_zeal)",
+]

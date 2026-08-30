@@ -1,0 +1,59 @@
+[package]
+name = "ffrwd-wasm-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Run WASM component video filters inside any frei0r-enabled ffmpeg"
+
+[lib]
+name = "ffrwd_wasm_runtime"
+crate-type = ["rlib"]
+
+[dependencies]
+wasmtime = { version = "48", default-features = false, features = ["component-model", "cranelift", "runtime", "std", "parallel-compilation"] }
+wasmtime-wasi = { version = "48", default-features = false, features = ["p2"] }
+# Linked only for a module granted `-http`: the outgoing-handler half of
+# wasi:http, so a granted module can make requests and none can serve.
+wasmtime-wasi-http = { version = "48.0.1", default-features = false, features = ["p2", "default-send-request"] }
+anyhow = "1"
+
+# default-features=false drops the openvino and winml backends; only ONNX is
+# wanted, and only ONNX has a dynamically loaded runtime. Which providers come
+# with it is per platform, below.
+wasmtime-wasi-nn = { version = "48.0.1", default-features = false, features = ["onnx"] }
+
+# Declared here so cargo's feature unification turns on `load-dynamic` for the
+# copy wasmtime-wasi-nn builds against. Without it that crate links
+# onnxruntime at build time, and the sidecar would not build on a machine
+# without one. The version is exact: 48.0.1's backend is written against
+# rc.10's API and does not compile against rc.13, which a caret would select.
+ort = { version = "=2.0.0-rc.10", default-features = false, features = ["std", "load-dynamic"] }
+
+# Loads the pinned onnxruntime once before ort touches it, so an absent
+# runtime is an error rather than a panic from inside ort. Also how D3D12 is
+# asked whether DirectML has a device, without making d3d12.dll an import of
+# the binary.
+libloading = "0.8"
+
+[target.'cfg(windows)'.dependencies]
+# CUDA and DirectML are the two a Windows gpu target chooses between.
+wasmtime-wasi-nn = { version = "48.0.1", default-features = false, features = ["onnx-cuda", "onnx-directml"] }
+ort = { version = "=2.0.0-rc.10", default-features = false, features = ["cuda", "directml"] }
+
+# Enumerating the process's loaded modules is how the engaged execution
+# provider is established; ONNX Runtime falls back to CPU in silence.
+windows-sys = { version = "0.59", features = ["Win32_System_ProcessStatus", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_Foundation"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# CUDA is the only GPU provider the Linux artifacts carry.
+wasmtime-wasi-nn = { version = "48.0.1", default-features = false, features = ["onnx-cuda"] }
+ort = { version = "=2.0.0-rc.10", default-features = false, features = ["cuda"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# CoreML is Apple's, and the only GPU provider there.
+wasmtime-wasi-nn = { version = "48.0.1", default-features = false, features = ["onnx-coreml"] }
+ort = { version = "=2.0.0-rc.10", default-features = false, features = ["coreml"] }
+
+# The integration tests read the rows a module emits, which are JSON.
+[dev-dependencies]
+serde_json = "1"

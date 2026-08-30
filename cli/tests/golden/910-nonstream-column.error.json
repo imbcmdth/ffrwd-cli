@@ -1,0 +1,7 @@
+{
+  "line": 1,
+  "col": 20,
+  "code": "UNSUPPORTED_SQL",
+  "message": "every SELECT column must be a stream expression, got a numeric literal",
+  "hint": "a SELECT column must be a stream, e.g. a.video[1] or scale(a.video[1], 640, -2)"
+}

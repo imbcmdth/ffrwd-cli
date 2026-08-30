@@ -1,0 +1,7 @@
+{
+  "line": 3,
+  "col": 10,
+  "code": "NO_STREAMING_EQUIVALENT",
+  "message": "GROUP BY has no streaming equivalent",
+  "hint": "remove the GROUP BY clause"
+}

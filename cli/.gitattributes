@@ -1,0 +1,5 @@
+# The reference registry snapshot is a generated, committed TEST FIXTURE
+# whose regeneration test asserts byte-identity -- same LF-only contract the
+# repo root's .gitattributes gives docs/**. It is not shipped in the wheel:
+# nothing in the installed package reads it, only the test suite does.
+tests/data/*.json text eol=lf

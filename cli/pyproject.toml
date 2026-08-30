@@ -1,0 +1,106 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ffrwd"
+version = "0.1.0"
+description = "SQL frontend for FFmpeg filtergraphs"
+readme = "README.md"
+keywords = ["ffmpeg", "sql", "filter", "filtergraphs"]
+requires-python = ">=3.10"
+dependencies = [
+    # A package's README.md, rendered to HTML at publish for the registry to show.
+    "markdown-it-py",
+    "sqlglot",
+    "static-ffmpeg",
+    # The sidecar, version-locked and included by default wherever its wheel
+    # matrix reaches (Linux and Windows on x64 and aarch64, macOS on Apple
+    # silicon). Elsewhere the marker is false and the compiler installs
+    # alone, wasm calls degrading to the FFRWD_WASM / PATH hint. The wheel
+    # matrix covers glibc and musl both, so the linux marker is honest on
+    # Alpine-class machines too.
+    'ffrwd-wasm==0.1.0; sys_platform == "linux" and platform_machine in "x86_64 aarch64"',
+    'ffrwd-wasm==0.1.0; sys_platform == "win32" and platform_machine in "AMD64 ARM64"',
+    'ffrwd-wasm==0.1.0; sys_platform == "darwin" and platform_machine == "arm64"',
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Video :: Conversion",
+    "Programming Language :: SQL",
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+]
+authors = [
+  { name="Jon-Carlos Rivera", email="jon.carlos.rivera@gmail.com" },
+]
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+
+[project.urls]
+Homepage = "https://github.com/imbcmdth/ffrwd"
+
+# Found, not listed: a subpackage added under ffrwd/ ships in the wheel
+# without a pyproject edit. An explicit list omits it silently -- an editable
+# install keeps working while the wheel is missing the code.
+[tool.setuptools.packages.find]
+include = ["ffrwd*"]
+
+[project.optional-dependencies]
+# `ffrwd mcp` only; the compiler and the CLI never import it. Kept optional
+# because it drags in a web stack (pydantic, starlette, uvicorn) that a user
+# who only compiles SQL has no use for.
+mcp = [
+    "mcp>=2.0",
+]
+# `ffrwd explain --diagram` only: mermaid box art in the terminal. The
+# `--mermaid` text needs nothing.
+diagram = [
+    "termaid>=0.8",
+]
+dev = [
+    "pytest",
+    "ruff",
+    "mypy",
+    "hypothesis",
+    "imagehash",
+    # So CI type-checks and exercises the MCP server; the suite skips those
+    # tests rather than failing when it is absent.
+    "ffrwd[mcp]",
+]
+
+[project.scripts]
+ffrwd = "ffrwd.cli:main"
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.mypy]
+strict = true
+python_version = "3.10"
+
+# numpy 2.5 stubs use PEP 695 syntax that mypy rejects under a 3.10 target;
+# numpy is only a transitive test dep (pytest -> TYPE_CHECKING, imagehash).
+[[tool.mypy.overrides]]
+module = ["numpy", "numpy.*"]
+follow_imports = "skip"
+follow_imports_for_stubs = true
+
+# static-ffmpeg ships no py.typed marker; mypy --strict refuses to import it
+# at all (even lazily, inside a try/except) without this.
+[[tool.mypy.overrides]]
+module = ["static_ffmpeg", "static_ffmpeg.*"]
+ignore_missing_imports = true
+
+# termaid is the optional `diagram` extra, imported lazily; a machine without
+# it must still type-check.
+[[tool.mypy.overrides]]
+module = ["termaid", "termaid.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+markers = ["exec: end-to-end tests that execute ffmpeg"]
+addopts = "-m \"not exec\""

@@ -1,0 +1,12 @@
+package ffrwd:av-go@0.1.0;
+
+/// What a TinyGo module targets. It exports the same interface the Rust
+/// modules export and means exactly what `ffrwd:av`'s own `window-module`
+/// means; the wasi imports are the difference. TinyGo's runtime reaches for
+/// the environment, the clock and stdio whatever the module itself does, and
+/// a world declaring no imports cannot be encoded around a core module that
+/// has them.
+world window-module-go {
+  include wasi:cli/imports@0.2.0;
+  export ffrwd:av/window-filter@0.10.0;
+}

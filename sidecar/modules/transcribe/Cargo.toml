@@ -1,0 +1,20 @@
+[package]
+name = "transcribe"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+# Pinned exactly, and the pin is load-bearing: from 0.9.2 candle-core requires
+# zip 7.2, which requires typed-path, which reaches for `std::os::wasi` on
+# wasm32-wasip2 - a nightly-only feature. 0.9.1 takes zip 1.1 and needs none of
+# it. Moving off this pin means finding a candle whose zip is typed-path-free.
+[dependencies]
+candle-core = { version = "=0.9.1", default-features = false }
+candle-nn = { version = "=0.9.1", default-features = false }
+candle-transformers = { version = "=0.9.1", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokenizers = { version = "0.23", default-features = false, features = ["unstable_wasm"] }
+wit-bindgen = "0.57.1"

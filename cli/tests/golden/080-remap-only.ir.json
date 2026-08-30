@@ -1,0 +1,29 @@
+{
+  "inputs": [
+    "foo.mp4"
+  ],
+  "sources": {
+    "a": 0
+  },
+  "nodes": [],
+  "sinks": [
+    {
+      "outputs": [
+        {
+          "ref": "src:a:v:0",
+          "type": "video",
+          "name": null,
+          "metadata": {}
+        },
+        {
+          "ref": "src:a:a:1",
+          "type": "audio",
+          "name": null,
+          "metadata": {}
+        }
+      ],
+      "path": null,
+      "options": {}
+    }
+  ]
+}
