@@ -3562,8 +3562,8 @@ fn stream_invert_endurance(
 
     let stdout = child.stdout.take().expect("child stdout");
     let mut seen = 0usize;
-    match Demuxer::open(stdout) {
-        Ok(mut demuxer) => {
+    if let Ok(mut demuxer) = Demuxer::open(stdout) {
+        {
             let mut buf = Vec::new();
             let mut last_pts = i64::MIN;
             'read: while seen < total {
@@ -3590,7 +3590,6 @@ fn stream_invert_endurance(
                 }
             }
         }
-        Err(_) => {}
     }
 
     let _ = writer.join();
