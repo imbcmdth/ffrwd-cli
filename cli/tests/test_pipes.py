@@ -63,3 +63,65 @@ def test_a_client_that_came_and_went_still_hands_over_its_bytes(tmp_path: Path) 
     reader.join(10)
     pipe.close()
     assert result == {"bytes": 1000}
+
+
+def _first_read(pipe: pipes.NamedPipe, into: dict[str, object]) -> None:
+    try:
+        into["chunk"] = pipe.wait(time.monotonic() + 10).read(1 << 16)
+    except Exception as err:  # noqa: BLE001 -- the assertion reports it whole
+        into["error"] = repr(err)
+
+
+def test_a_read_hands_back_what_has_arrived_rather_than_a_full_chunk(
+    tmp_path: Path,
+) -> None:
+    """A reading end holds nothing back.
+
+    The client writes far less than the size the read asks for and then stops,
+    the pipe still open. Waiting for the rest would wedge a plan whose writer
+    is itself waiting on the frame those bytes finish, so they come back as
+    they are.
+    """
+    pipe = pipes.create(tmp_path, "partial", writing=False)
+    result: dict[str, object] = {}
+    reader = threading.Thread(target=_first_read, args=(pipe, result), daemon=True)
+    reader.start()
+    with open(pipe.path, "wb", buffering=0) as client:
+        client.write(b"c" * 300)
+        reader.join(10)
+        assert result == {"chunk": b"c" * 300}
+    pipe.close()
+
+
+def test_a_writing_end_hands_its_bytes_over_without_being_flushed(
+    tmp_path: Path,
+) -> None:
+    """The mirror: what this process writes reaches the client at once, rather
+    than waiting in a buffer for enough more to be worth sending."""
+    pipe = pipes.create(tmp_path, "unflushed", writing=True)
+    result: dict[str, object] = {}
+
+    def serve() -> None:
+        try:
+            pipe.wait(time.monotonic() + 10).write(b"d" * 300)
+        except Exception as err:  # noqa: BLE001 -- the assertion reports it whole
+            result["error"] = repr(err)
+
+    def receive() -> None:
+        try:
+            with open(pipe.path, "rb", buffering=0) as client:
+                result["chunk"] = client.read(1 << 16)
+        except Exception as err:  # noqa: BLE001 -- the assertion reports it whole
+            result["error"] = repr(err)
+
+    server = threading.Thread(target=serve, daemon=True)
+    client = threading.Thread(target=receive, daemon=True)
+    server.start()
+    client.start()
+    server.join(10)
+    client.join(10)
+    # Read before closing: closing flushes, and a flush would hide the very
+    # buffer this is about.
+    handed = dict(result)
+    pipe.close()
+    assert handed == {"chunk": b"d" * 300}

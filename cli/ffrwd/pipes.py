@@ -19,6 +19,14 @@ takes it afterwards with ``F_SETPIPE_SZ`` and caps it at its own maximum; the
 rest take what they are given. Best effort everywhere -- a pipe that ends up
 smaller than asked still carries the stream, and what a too-small one costs is
 the run-time overflow :mod:`ffrwd.execute` reports.
+
+The streams :meth:`NamedPipe.wait` hands back are UNBUFFERED, and that is a
+correctness rule rather than a preference. Python's buffered reader returns
+only when it has the whole size asked for, so it would sit on bytes that have
+already crossed the pipe until more arrive -- and in a plan where one process
+feeds two paths that meet again, the process that would send those extra bytes
+is waiting on the very frame the withheld tail completes. Nothing here may hold
+a byte it has been given.
 """
 
 from __future__ import annotations
@@ -67,6 +75,9 @@ class NamedPipe:
 
     def wait(self, deadline: float) -> BinaryIO:
         """Block until the client opens `path`; the stream to copy through.
+
+        The stream is unbuffered: a read hands back whatever has arrived, and a
+        write may take only part of what it is given.
 
         Raises :class:`TimeoutError` at `deadline` and :class:`BrokenPipeError`
         if :meth:`close` ran first.
@@ -173,7 +184,9 @@ if sys.platform == "win32":
                     raise ctypes.WinError(ctypes.get_last_error())
                 flags = 0 if self.writing else os.O_RDONLY
                 stream = os.fdopen(
-                    msvcrt.open_osfhandle(handle, flags), "wb" if self.writing else "rb"
+                    msvcrt.open_osfhandle(handle, flags),
+                    "wb" if self.writing else "rb",
+                    buffering=0,
                 )
                 # The file object owns the handle from here on.
                 self._owned = False
@@ -247,7 +260,7 @@ else:
                 if self._stop.is_set():
                     os.close(fd)
                     raise self._closed()
-                stream = os.fdopen(fd, "wb" if self.writing else "rb")
+                stream = os.fdopen(fd, "wb" if self.writing else "rb", buffering=0)
                 self._stream = stream
                 return stream
 

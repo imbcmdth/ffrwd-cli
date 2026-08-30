@@ -45,7 +45,10 @@ one stream from writes it on its own stdout; a chain of those needs nothing
 but :class:`subprocess.Popen`. Fan-in is what stdio cannot spell -- one stdin,
 two producers -- and there the consumer reads named pipes instead
 (:mod:`ffrwd.pipes`), with this process copying between each pipe and the
-producer that feeds it.
+producer that feeds it. Every stream such a copy runs through is unbuffered,
+and the copy hands on whatever has arrived rather than waiting to fill a
+chunk: where one process feeds two paths that meet again, the process that
+would round the chunk up is waiting for the frame the held-back bytes finish.
 
 Members are judged by EXIT CODE only. A raw demuxer logs an error at the
 pipe's EOF and exits 0 anyway, so stderr says nothing about whether a member
@@ -326,8 +329,8 @@ def _run_with_player(
 ) -> tuple[int, str]:
     """One ffmpeg command whose stdout an ffplay window is reading."""
     stderr = subprocess.PIPE if capture else None
-    watching = subprocess.Popen(player, stdin=subprocess.PIPE)
-    ffmpeg = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=stderr)
+    watching = subprocess.Popen(player, stdin=subprocess.PIPE, bufsize=0)
+    ffmpeg = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=stderr, bufsize=0)
     # Not communicate(): it would close the stdout this thread is reading.
     forward = threading.Thread(
         target=_forward, args=(ffmpeg.stdout, watching.stdin), daemon=True
@@ -410,7 +413,7 @@ def _forward(source: IO[bytes] | None, target: IO[bytes] | None) -> None:
             if target is None:
                 continue
             try:
-                target.write(chunk)
+                _write_all(target, chunk)
             except OSError:
                 target = None  # window gone; keep draining so ffmpeg runs on
     except OSError:
@@ -1084,7 +1087,9 @@ def _run_stage(
             if echo is not None:
                 echo(pid, command)
             if player is not None:
-                watching[pid] = subprocess.Popen(player, stdin=subprocess.PIPE)
+                watching[pid] = subprocess.Popen(
+                    player, stdin=subprocess.PIPE, bufsize=0
+                )
             members[pid] = _Member(
                 id=pid, argv=command, proc=_spawn(command, stdin, stdout)
             )
@@ -1251,16 +1256,23 @@ def _writes_rows_to_stdout(process: Process) -> bool:
 def _spawn(
     command: list[str], stdin: int | IO[bytes], stdout: int | None
 ) -> subprocess.Popen[bytes]:
-    """Spawn one member, in a process group of its own where there are any."""
+    """Spawn one member, in a process group of its own where there are any.
+
+    ``bufsize=0`` for the same reason :mod:`ffrwd.pipes` opens its streams
+    unbuffered: a stdio end a copy runs through must hand on what it has,
+    since the process that would fill a buffer up to its size is waiting on
+    what the buffer holds.
+    """
     if sys.platform == "win32":
         return subprocess.Popen(
-            command, stdin=stdin, stdout=stdout, stderr=subprocess.PIPE
+            command, stdin=stdin, stdout=stdout, stderr=subprocess.PIPE, bufsize=0
         )
     return subprocess.Popen(
         command,
         stdin=stdin,
         stdout=stdout,
         stderr=subprocess.PIPE,
+        bufsize=0,
         start_new_session=True,
     )
 
@@ -1334,6 +1346,12 @@ def _start(target: Callable[..., None], *args: object) -> threading.Thread:
 def _pump(source: _End, dest: _End, deadline: float, flow: Flow | None = None) -> None:
     """Copy one stream edge's bytes end to end until the producer stops.
 
+    `_CHUNK` is a ceiling and not a quantum: both ends are unbuffered, so a
+    read hands back whatever has arrived and the copy passes exactly that on.
+    Waiting for a full chunk would be a deadlock in a plan where one process
+    feeds two paths that meet again -- the process that would round the chunk
+    up is itself waiting for the frame the held-back tail completes.
+
     `flow` is where the copy records what it has moved and when, and marks
     itself as waiting on the consuming end -- which is what makes a full
     buffer visible to :func:`overflowed` rather than a stage that simply hangs.
@@ -1347,7 +1365,7 @@ def _pump(source: _End, dest: _End, deadline: float, flow: Flow | None = None) -
                 break
             if flow is not None:
                 flow.writing = True
-            writer.write(chunk)
+            _write_all(writer, chunk)
             if flow is not None:
                 flow.writing = False
                 flow.moved += len(chunk)
@@ -1360,6 +1378,13 @@ def _pump(source: _End, dest: _End, deadline: float, flow: Flow | None = None) -
             flow.writing = False
         dest.close()
         source.close()
+
+
+def _write_all(writer: IO[bytes], chunk: bytes) -> None:
+    """Hand the whole chunk over. An unbuffered write takes what it takes."""
+    sent = writer.write(chunk)
+    while sent < len(chunk):
+        sent += writer.write(chunk[sent:])
 
 
 def overflowed(flows: Sequence[Flow], now: float, stall: float) -> Flow | None:

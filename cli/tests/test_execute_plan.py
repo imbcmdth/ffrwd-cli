@@ -7,6 +7,8 @@ pipe are decided before any process exists, so both are testable without one.
 
 from __future__ import annotations
 
+import math
+
 import pytest
 
 from ffrwd import pipes
@@ -15,7 +17,9 @@ from ffrwd.execute import (
     STDIN,
     STDOUT,
     Flow,
+    _End,
     _pipe_buffer,
+    _pump,
     overflow_error,
     overflowed,
     plan_argv,
@@ -448,3 +452,70 @@ def test_a_full_buffer_names_the_edge_and_the_depth_it_was_given() -> None:
     assert "sized for the 2 frames the compiler bounded it at" in error.message
     assert "30s" in error.message
     assert error.hint is not None
+
+
+# ---------------------------------------------------------------- the copy
+
+
+class _Pieces:
+    """A stream handing back one queued piece per read, EOF once it is empty."""
+
+    def __init__(self, pieces: list[bytes]) -> None:
+        self.pieces = list(pieces)
+
+    def read(self, size: int) -> bytes:
+        return self.pieces.pop(0) if self.pieces else b""
+
+
+class _Trickle:
+    """A stream taking at most `most` bytes per write, the way a pipe does."""
+
+    def __init__(self, most: int) -> None:
+        self.most = most
+        self.writes: list[bytes] = []
+
+    def write(self, data: bytes) -> int:
+        self.writes.append(data[: self.most])
+        return len(self.writes[-1])
+
+    def flush(self) -> None:
+        pass
+
+
+class _Held(_End):
+    """An end already open, so a copy can be driven without a process."""
+
+    def __init__(self, stream: object) -> None:
+        self.stream = stream
+
+    def open(self, deadline: float) -> object:  # type: ignore[override]
+        return self.stream
+
+    def close(self) -> None:
+        pass
+
+
+def test_the_copy_writes_each_read_on_as_it_comes() -> None:
+    """Every read goes on as its own write, whatever its size.
+
+    Accumulating two of them into a bigger write would wedge a stage where one
+    process feeds two paths that meet again: the process that would supply the
+    rest is waiting for the frame the held-back bytes finish.
+    """
+    dest = _Trickle(1 << 16)
+    flow = _flow("ffmpeg0", at=0.0, moved=0)
+
+    _pump(_Held(_Pieces([b"one", b"two"])), _Held(dest), math.inf, flow)
+
+    assert dest.writes == [b"one", b"two"]
+    assert flow.moved == 6
+    assert not flow.writing
+
+
+def test_the_copy_finishes_a_write_the_other_end_only_partly_took() -> None:
+    """An unbuffered write takes what it takes; the rest is written again."""
+    dest = _Trickle(2)
+
+    _pump(_Held(_Pieces([b"abcde"])), _Held(dest), math.inf)
+
+    assert dest.writes == [b"ab", b"cd", b"e"]
