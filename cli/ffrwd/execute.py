@@ -49,6 +49,9 @@ producer that feeds it. Every stream such a copy runs through is unbuffered,
 and the copy hands on whatever has arrived rather than waiting to fill a
 chunk: where one process feeds two paths that meet again, the process that
 would round the chunk up is waiting for the frame the held-back bytes finish.
+On an edge the compiler gave a depth, that copy is also where the depth is
+actually held -- it reads on while the consumer is behind, so a producer with
+frames still to hand over can always finish and close its outputs.
 
 Members are judged by EXIT CODE only. A raw demuxer logs an error at the
 pipe's EOF and exits 0 anyway, so stderr says nothing about whether a member
@@ -95,6 +98,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections import deque
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -169,6 +173,10 @@ _GRACE = 5.0
 _JOIN = 5.0
 # Bytes moved per copy between a named pipe and a process's stdio.
 _CHUNK = 1 << 16
+# How far ahead of the consumer a copy reads, on an edge the compiler gave a
+# depth. Generous enough for several frames of the largest one a plan carries,
+# and bounded, so a run whose paths really have drifted apart still stops.
+_READ_AHEAD = 1 << 25
 # What `ProcessResult.summary` and `.stderr_tail` keep.
 _SUMMARY_CHARS = 160
 _TAIL_LINES = 20
@@ -1343,6 +1351,78 @@ def _start(target: Callable[..., None], *args: object) -> threading.Thread:
     return thread
 
 
+class _Ahead:
+    """Bytes a copy has taken from the producer and not yet handed on.
+
+    Bounded by `limit`: once that much is held the reading side waits, so a
+    run whose paths really have drifted apart still stops rather than growing
+    without end -- what is held here is the depth, not a reservoir.
+    """
+
+    def __init__(self, limit: int) -> None:
+        self._limit = limit
+        self._held: deque[bytes] = deque()
+        self._size = 0
+        self._ended = False
+        self._change = threading.Condition()
+
+    def put(self, chunk: bytes) -> bool:
+        """Hold `chunk`, waiting for room. False once the copy has finished."""
+        with self._change:
+            while self._size >= self._limit and not self._ended:
+                self._change.wait()
+            if self._ended:
+                return False
+            self._held.append(chunk)
+            self._size += len(chunk)
+            self._change.notify_all()
+            return True
+
+    def take(self) -> bytes | None:
+        """The next bytes to write; None once nothing more will arrive."""
+        with self._change:
+            while not self._held and not self._ended:
+                self._change.wait()
+            if not self._held:
+                return None
+            chunk = self._held.popleft()
+            self._size -= len(chunk)
+            self._change.notify_all()
+            return chunk
+
+    def finish(self) -> None:
+        """Nothing more will be read. Releases whichever side is waiting."""
+        with self._change:
+            self._ended = True
+            self._change.notify_all()
+
+
+def _fill(reader: IO[bytes], ahead: _Ahead) -> None:
+    """Take from the producer as fast as it writes, up to `ahead`'s limit."""
+    try:
+        while (chunk := reader.read(_CHUNK)) and ahead.put(chunk):
+            continue
+    except (OSError, ValueError):
+        pass
+    finally:
+        ahead.finish()
+
+
+def _read_ahead(flow: Flow | None) -> int:
+    """How far ahead of the consumer this copy reads.
+
+    An edge the compiler gave a depth is read ahead in earnest. It has to be:
+    the depth exists because one process feeds two paths that meet again, and
+    the only place it does any good is HERE. Held in the producing ffmpeg --
+    its fifo queue, or the pipe it writes -- it sits behind the write that
+    blocks, so a producer with frames still to hand over cannot finish and
+    close its outputs, the process on the slower path never sees the end of
+    its input, and the frames it holds for its own pipeline never come out.
+    Every other edge hands each read straight on.
+    """
+    return _CHUNK if flow is None or not flow.held else _READ_AHEAD
+
+
 def _pump(source: _End, dest: _End, deadline: float, flow: Flow | None = None) -> None:
     """Copy one stream edge's bytes end to end until the producer stops.
 
@@ -1352,17 +1432,20 @@ def _pump(source: _End, dest: _End, deadline: float, flow: Flow | None = None) -
     feeds two paths that meet again -- the process that would round the chunk
     up is itself waiting for the frame the held-back tail completes.
 
+    Reading runs in a thread of its own so the producer is never held up by a
+    consumer that is momentarily behind (:func:`_read_ahead`).
+
     `flow` is where the copy records what it has moved and when, and marks
     itself as waiting on the consuming end -- which is what makes a full
     buffer visible to :func:`overflowed` rather than a stage that simply hangs.
     """
+    ahead = _Ahead(_read_ahead(flow))
+    reading: threading.Thread | None = None
     try:
         reader = source.open(deadline)
         writer = dest.open(deadline)
-        while True:
-            chunk = reader.read(_CHUNK)
-            if not chunk:
-                break
+        reading = _start(_fill, reader, ahead)
+        while (chunk := ahead.take()) is not None:
             if flow is not None:
                 flow.writing = True
             _write_all(writer, chunk)
@@ -1374,10 +1457,13 @@ def _pump(source: _End, dest: _End, deadline: float, flow: Flow | None = None) -
     except (OSError, ValueError):
         pass  # the other end went away; exit codes are what judge that
     finally:
+        ahead.finish()
         if flow is not None:
             flow.writing = False
         dest.close()
         source.close()
+        if reading is not None:
+            reading.join(_JOIN)
 
 
 def _write_all(writer: IO[bytes], chunk: bytes) -> None:

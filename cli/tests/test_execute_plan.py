@@ -8,18 +8,21 @@ pipe are decided before any process exists, so both are testable without one.
 from __future__ import annotations
 
 import math
+import threading
 
 import pytest
 
 from ffrwd import pipes
 from ffrwd.errors import ErrorCode, FfrwdError
 from ffrwd.execute import (
+    _CHUNK,
     STDIN,
     STDOUT,
     Flow,
     _End,
     _pipe_buffer,
     _pump,
+    _read_ahead,
     overflow_error,
     overflowed,
     plan_argv,
@@ -462,9 +465,13 @@ class _Pieces:
 
     def __init__(self, pieces: list[bytes]) -> None:
         self.pieces = list(pieces)
+        self.drained = threading.Event()
 
     def read(self, size: int) -> bytes:
-        return self.pieces.pop(0) if self.pieces else b""
+        if self.pieces:
+            return self.pieces.pop(0)
+        self.drained.set()
+        return b""
 
 
 class _Trickle:
@@ -519,3 +526,52 @@ def test_the_copy_finishes_a_write_the_other_end_only_partly_took() -> None:
     _pump(_Held(_Pieces([b"abcde"])), _Held(dest), math.inf)
 
     assert dest.writes == [b"ab", b"cd", b"e"]
+
+
+class _Unhurried:
+    """A stream whose writes wait until it is let go."""
+
+    def __init__(self) -> None:
+        self.taking = threading.Event()
+        self.writes: list[bytes] = []
+
+    def write(self, data: bytes) -> int:
+        assert self.taking.wait(10), "the copy was never let go"
+        self.writes.append(data)
+        return len(data)
+
+    def flush(self) -> None:
+        pass
+
+
+def test_a_bounded_edge_is_read_on_while_the_consumer_is_not_taking() -> None:
+    """The producer on such an edge is never the one waiting.
+
+    An edge the compiler gave a depth is the direct leg of a live source split
+    two ways. The producer has to be able to run to the end of its stream and
+    close, whatever the consumer is doing: the process on the SLOWER leg only
+    hands on the frames its own pipeline holds when it sees the end of its
+    input, and the consumer is waiting for exactly those.
+    """
+    source = _Pieces([b"one", b"two", b"three"])
+    dest = _Unhurried()
+    flow = _flow("ffmpeg0", at=0.0, moved=0, bound=1)
+    copy = threading.Thread(
+        target=_pump, args=(_Held(source), _Held(dest), math.inf, flow), daemon=True
+    )
+
+    copy.start()
+    read_on = source.drained.wait(10)
+    dest.taking.set()
+    copy.join(10)
+
+    assert read_on, "the copy stopped reading while the consumer was not taking"
+    assert dest.writes == [b"one", b"two", b"three"]
+    assert flow.moved == 11
+
+
+def test_an_edge_with_no_depth_hands_each_read_straight_on() -> None:
+    """Only an edge the compiler bounded reads ahead; the rest cost nothing."""
+    assert _read_ahead(None) == _CHUNK
+    assert _read_ahead(_flow("ffmpeg0", at=0.0)) == _CHUNK
+    assert _read_ahead(_flow("ffmpeg0", at=0.0, bound=1)) > _CHUNK
