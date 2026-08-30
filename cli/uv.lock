@@ -512,7 +512,7 @@ wheels = [
 
 [[package]]
 name = "ffrwd"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "ffrwd-wasm", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine in 'x86_64 aarch64' and sys_platform == 'linux') or (platform_machine in 'AMD64 ARM64' and sys_platform == 'win32')" },
