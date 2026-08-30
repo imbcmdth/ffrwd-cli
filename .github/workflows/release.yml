@@ -214,10 +214,12 @@ jobs:
             target: x86_64
             manylinux: auto
           # Cross-compiled in maturin's manylinux container via its own
-          # toolchain; no aarch64 runner needed.
+          # toolchain; no aarch64 runner needed. 2_28 rather than auto:
+          # ring's ARM assembly needs a newer cross toolchain than
+          # manylinux2014 carries.
           - os: ubuntu-latest
             target: aarch64
-            manylinux: auto
+            manylinux: 2_28
           # The musl pair, so pip finds a wheel on Alpine-class machines --
           # environment markers cannot see libc, so without these the
           # dependency marker matches and then finds nothing to install.
