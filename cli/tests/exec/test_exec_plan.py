@@ -380,7 +380,12 @@ def test_a_buffer_that_fills_ends_the_stage_naming_the_edge(tmp_path: Path) -> N
 
 
 def test_a_stage_that_keeps_moving_is_never_called_full(tmp_path: Path) -> None:
-    """The same shape with a consumer that reads: the stall window never fires."""
+    """The same shape with a consumer that reads: no false positive.
+
+    The DEFAULT stall window, not the wedge test's tightened one: a loaded
+    machine may legitimately move nothing for a few seconds, and the claim
+    here is that a healthy run is never flagged under the window users get.
+    """
     out_path = tmp_path / "merged.mp4"
     plan = _live_merge(out_path, duration=1)
     result = execute_plan(
@@ -388,7 +393,6 @@ def test_a_stage_that_keeps_moving_is_never_called_full(tmp_path: Path) -> None:
         sidecar_argv=_negate,
         timeout=_STAGE_TIMEOUT,
         overwrite=True,
-        stall=_STALL,
     )
 
     assert result.overflow is None, str(result.overflow)
