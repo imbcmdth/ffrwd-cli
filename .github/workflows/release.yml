@@ -313,3 +313,15 @@ jobs:
       # fired again and only the missing half uploads.
       - name: Publish both packages to PyPI
         run: uv publish --check-url https://pypi.org/simple/ dist/*
+
+      # The hosted side follows the release: ffrwd-site bumps its
+      # runner's ffrwd pin and redeploys. Needs SITE_DISPATCH_TOKEN, a
+      # fine-grained PAT with contents write on ffrwd-site; without it
+      # this step fails without failing the release.
+      - name: Tell ffrwd-site a release shipped
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.SITE_DISPATCH_TOKEN }}
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          gh api repos/imbcmdth/ffrwd-site/dispatches             -f event_type=ffrwd-release             -F "client_payload[version]=$v"
