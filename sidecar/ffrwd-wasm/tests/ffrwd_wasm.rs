@@ -3364,7 +3364,9 @@ fn go_big_modules_built() -> bool {
                 false
             }
             Err(e) => {
-                eprintln!("skipping the componentize-go modules: nothing to run build-big.sh with: {e}");
+                eprintln!(
+                    "skipping the componentize-go modules: nothing to run build-big.sh with: {e}"
+                );
                 false
             }
         }
@@ -3443,12 +3445,11 @@ fn a_componentize_go_modules_window_survives_the_same_road() {
     // the two the strides left.
     for count in [6usize, 2] {
         let frames: Vec<Vec<u8>> = (0..count).map(|i| synthetic_frame(i as u8)).collect();
-        let run = run_go_big_filter(
-            "window3_go",
-            &["-annotations", "out"],
-            &nut_stream(&frames),
+        let run = run_go_big_filter("window3_go", &["-annotations", "out"], &nut_stream(&frames));
+        assert_run_ok(
+            &run,
+            &format!("window3-go/componentize-go over {count} frames"),
         );
-        assert_run_ok(&run, &format!("window3-go/componentize-go over {count} frames"));
 
         let got = annotated_frames(&run.stdout);
         assert_eq!(got.len(), count, "every frame passes through, once");
@@ -3654,7 +3655,14 @@ fn tinygo_road_endurance_ceiling() {
     eprintln!(
         "TinyGo road (-gc=leaking): {seen}/{TOTAL} frames of 640x480 verified correct, \
          ok={ok}\nstderr tail:\n{}",
-        stderr.chars().rev().take(2000).collect::<String>().chars().rev().collect::<String>()
+        stderr
+            .chars()
+            .rev()
+            .take(2000)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect::<String>()
     );
 }
 
@@ -3678,7 +3686,14 @@ fn componentize_go_road_endurance_ceiling() {
     eprintln!(
         "componentize-go road (collector off): {seen}/{TOTAL} frames of 640x480 verified correct, \
          ok={ok}\nstderr tail:\n{}",
-        stderr.chars().rev().take(2000).collect::<String>().chars().rev().collect::<String>()
+        stderr
+            .chars()
+            .rev()
+            .take(2000)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect::<String>()
     );
 }
 
