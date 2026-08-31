@@ -512,7 +512,7 @@ wheels = [
 
 [[package]]
 name = "ffrwd"
-version = "0.2.2"
+version = "0.2.3"
 source = { editable = "." }
 dependencies = [
     { name = "ffrwd-wasm", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine in 'x86_64 aarch64' and sys_platform == 'linux') or (platform_machine in 'AMD64 ARM64' and sys_platform == 'win32')" },
@@ -540,9 +540,9 @@ mcp = [
 [package.metadata]
 requires-dist = [
     { name = "ffrwd", extras = ["mcp"], marker = "extra == 'dev'" },
-    { name = "ffrwd-wasm", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", specifier = "==0.2.2" },
-    { name = "ffrwd-wasm", marker = "platform_machine in 'x86_64 aarch64' and sys_platform == 'linux'", specifier = "==0.2.2" },
-    { name = "ffrwd-wasm", marker = "platform_machine in 'AMD64 ARM64' and sys_platform == 'win32'", specifier = "==0.2.2" },
+    { name = "ffrwd-wasm", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", specifier = "==0.2.3" },
+    { name = "ffrwd-wasm", marker = "platform_machine in 'x86_64 aarch64' and sys_platform == 'linux'", specifier = "==0.2.3" },
+    { name = "ffrwd-wasm", marker = "platform_machine in 'AMD64 ARM64' and sys_platform == 'win32'", specifier = "==0.2.3" },
     { name = "hypothesis", marker = "extra == 'dev'" },
     { name = "imagehash", marker = "extra == 'dev'" },
     { name = "markdown-it-py" },
@@ -558,7 +558,7 @@ provides-extras = ["mcp", "diagram", "dev"]
 
 [[package]]
 name = "ffrwd-wasm"
-version = "0.2.2"
+version = "0.2.3"
 source = { registry = "https://pypi.org/simple" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/1b/cd/8c8cec59b2fa9cad16ca874be2651e283c751c3cfb819ff2d5fe972869f5/ffrwd_wasm-0.2.2-py3-none-macosx_11_0_arm64.whl", hash = "sha256:ac8d0a57acce3b28d109bd1b1487695a9ace55c97e8974d053c405ae721d68b2", size = 7457941, upload-time = "2026-08-31T16:30:33.568Z" },
