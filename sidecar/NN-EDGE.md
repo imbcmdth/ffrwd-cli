@@ -116,6 +116,15 @@ the way ONNX Runtime names its own release archives.
 It is answered before any argv is read and with no runtime on the machine,
 which is what lets a caller ask what to fetch before it has anything.
 
+### A silent fall back to CPU
+
+cuDNN's version matters more than the CUDA provider admits. A model whose
+encoder opens with a convolution -- whisper's does -- fails to build that
+node's graph on cuDNN 9.25, and ONNX Runtime does not refuse the session: it
+falls back to the CPU provider and runs. The only symptom is the speed, which
+is why it survives a smoke test. cuDNN 9.8 builds it. When a `gpu` target
+performs like `cpu`, check the cuDNN version before anything else.
+
 ## Where the runtime comes from
 
 `-nn-runtime <dir>`, else `FFRWD_NN_RUNTIME`. Absent, a run binding a model is
