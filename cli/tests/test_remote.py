@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import io
 import json
+import tarfile
 import urllib.error
 from collections.abc import Iterator
 from datetime import datetime, timezone
@@ -23,7 +24,7 @@ import ffrwd
 from ffrwd import cli, credentials, packages, parser, remote, store
 from ffrwd.errors import FfrwdError
 from ffrwd.probe import is_url
-from ffrwd.project import Package, PackageSet, RegistryEntry, write_lockfile
+from ffrwd.project import LinkEntry, RegistryEntry, write_lockfile
 from ffrwd.table import TableResult, render_table
 
 API = "https://api.example"
@@ -228,26 +229,6 @@ def test_show_and_remote_conflict(
     assert served.asked == []
 
 
-def test_a_linked_package_is_refused(
-    served: _Served, logged_in: None, tmp_path: Path
-) -> None:
-    linked = Package(
-        name="broadcast/tools",
-        version="0.0.0",
-        root=tmp_path,
-        manifest=tmp_path / "ffrwd.json",
-        linked=True,
-    )
-    packages_set = PackageSet(root=tmp_path, packages={"broadcast/tools": linked})
-    with pytest.raises(FfrwdError) as caught:
-        remote.submit_run(_query(MEDIA_QUERY), packages_set, _run_args())
-    assert caught.value.message == (
-        f"package 'broadcast/tools' is linked to {tmp_path}, and no digest "
-        "reproduces a linked directory remotely"
-    )
-    assert served.asked == []
-
-
 def test_a_computed_destination_is_refused(served: _Served, logged_in: None) -> None:
     text = (
         "COPY (SELECT c.index FROM input('f.mkv') f, unnest(f.chapters) c)"
@@ -322,6 +303,7 @@ def test_submit_posts_the_spec_uploads_the_file_and_starts(
         "recipe": None,
         "owner": None,
         "lock": None,
+        "packages": [],
         "inputs": [
             {"path": "in.mp4", "kind": "file", "sha256": digest, "bytes": 11},
             {"path": "https://cdn.example/x.mp4", "kind": "url"},
@@ -489,6 +471,256 @@ def test_no_lockfile_anywhere_submits_none(
     _submit_accepted(served)
     remote.submit_run(_query(STREAM_QUERY), None, _run_args())
     assert _submitted_lock(served) is None
+
+
+# ---------------------------------------------------------------------------
+# a linked package travels as bytes
+# ---------------------------------------------------------------------------
+
+
+def _linked_package(
+    root: Path, *, name: str = "broadcast/tools", version: str = "1.0.0", factor: str = "0.5"
+) -> Path:
+    """A package directory: a manifest, and one lib file defining ``quieter``."""
+    (root / "src").mkdir(parents=True, exist_ok=True)
+    (root / "src" / "lib.sql").write_text(
+        "CREATE FUNCTION quieter(track audio_stream) RETURNS audio_stream AS $$\n"
+        f"  SELECT volume(track, {factor})\n"
+        "$$ LANGUAGE sql;\n",
+        encoding="utf-8",
+    )
+    (root / "ffrwd.json").write_text(
+        json.dumps({"name": name, "version": version, "lib": {"quieter": "src/lib.sql"}}),
+        encoding="utf-8",
+    )
+    return root
+
+
+def _submitted_packages(served: _Served) -> list[str]:
+    _headers, body = served.sent_to(JOBS_URL)
+    assert body is not None
+    digests = json.loads(body)["packages"]
+    assert isinstance(digests, list)
+    return [str(one) for one in digests]
+
+
+def _uploaded(served: _Served) -> dict[str, bytes]:
+    """Every content-addressed POST this submit made, keyed by its digest."""
+    sent: dict[str, bytes] = {}
+    for url, _headers, body in served.asked:
+        if url.startswith(f"{UPLOAD_URL}?sha256=") and body is not None:
+            sent[url.rpartition("=")[2]] = body
+    return sent
+
+
+def _packed(root: Path) -> tuple[bytes, str]:
+    archive = store.pack(root)
+    return archive, hashlib.sha256(archive).hexdigest()
+
+
+def test_a_linked_package_packs_and_its_digest_pins_the_submitted_lock(
+    served: _Served, logged_in: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    linked = _linked_package(tmp_path / "tools")
+    write_lockfile(tmp_path / "ffrwd.lock", [LinkEntry(path="tools")])
+    archive, digest = _packed(linked)
+    _submit_accepted(served)
+    served.answers[f"{UPLOAD_URL}?sha256={digest}"] = json.dumps(
+        {"already": False, "bytes": len(archive)}
+    ).encode("utf-8")
+
+    remote.submit_run(_query(STREAM_QUERY), None, _run_args())
+
+    # The spec names the digest as one this submit uploads, not one the
+    # registry publishes.
+    assert _submitted_packages(served) == [digest]
+    # The lock the runner reads holds a registry pin, not a link.
+    lock = _submitted_lock(served)
+    assert lock is not None
+    document = json.loads(lock)
+    assert document["reproducible"] is True
+    assert document["packages"] == [
+        {
+            "kind": "registry",
+            "name": "broadcast/tools",
+            "version": "1.0.0",
+            "sha256": digest,
+            "store": store.entry_path(digest),
+        }
+    ]
+    # And the bytes went to the same content-addressed endpoint an input uses.
+    assert _uploaded(served) == {digest: archive}
+
+
+def test_the_packed_archive_holds_the_manifests_closure(
+    served: _Served, logged_in: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """What travels is what `publish` would ship: the closure, and no more."""
+    monkeypatch.chdir(tmp_path)
+    linked = _linked_package(tmp_path / "tools")
+    (linked / "build").mkdir()
+    (linked / "build" / "module.wasm").write_bytes(b"x" * 4096)
+    (linked / ".ffrwdignore").write_text("build/\n", encoding="utf-8")
+    write_lockfile(tmp_path / "ffrwd.lock", [LinkEntry(path="tools")])
+    _submit_accepted(served)
+    _archive, digest = _packed(linked)
+    served.answers[f"{UPLOAD_URL}?sha256={digest}"] = json.dumps({"already": False}).encode(
+        "utf-8"
+    )
+
+    remote.submit_run(_query(STREAM_QUERY), None, _run_args())
+
+    with tarfile.open(fileobj=io.BytesIO(_uploaded(served)[digest]), mode="r:gz") as opened:
+        held = sorted(member.name for member in opened.getmembers() if member.isreg())
+    assert held == ["ffrwd.json", "src/lib.sql"]
+
+
+def test_an_unchanged_link_hits_the_endpoints_dedup_on_a_second_submit(
+    served: _Served, logged_in: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The digest is over the packed bytes, so an unedited link keeps it.
+
+    The endpoint answers ``already`` for content it holds, so a second submit
+    stores nothing new; an edit changes the digest and pays again.
+    """
+    monkeypatch.chdir(tmp_path)
+    linked = _linked_package(tmp_path / "tools")
+    write_lockfile(tmp_path / "ffrwd.lock", [LinkEntry(path="tools")])
+    _archive, digest = _packed(linked)
+    _submit_accepted(served)
+    served.answers[f"{UPLOAD_URL}?sha256={digest}"] = json.dumps(
+        {"already": False, "bytes": 1}
+    ).encode("utf-8")
+    remote.submit_run(_query(STREAM_QUERY), None, _run_args())
+    assert _submitted_packages(served) == [digest]
+
+    # Same tree, same digest -- and the endpoint says it already holds it.
+    again = _Served()
+    monkeypatch.setattr(packages, "_urlopen", again)
+    _submit_accepted(again)
+    again.answers[f"{UPLOAD_URL}?sha256={digest}"] = json.dumps(
+        {"already": True, "bytes": 1}
+    ).encode("utf-8")
+    remote.submit_run(_query(STREAM_QUERY), None, _run_args())
+    assert _submitted_packages(again) == [digest]
+
+    # An edit is what pays again.
+    edited = _Served()
+    monkeypatch.setattr(packages, "_urlopen", edited)
+    _linked_package(tmp_path / "tools", factor="0.9")
+    _archive, changed = _packed(linked)
+    _submit_accepted(edited)
+    edited.answers[f"{UPLOAD_URL}?sha256={changed}"] = json.dumps({"already": False}).encode(
+        "utf-8"
+    )
+    remote.submit_run(_query(STREAM_QUERY), None, _run_args())
+    assert _submitted_packages(edited) == [changed]
+    assert changed != digest
+
+
+def test_a_link_inside_a_linked_package_travels_too(
+    served: _Served, logged_in: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The closure is transitive: a linked package may link others."""
+    monkeypatch.chdir(tmp_path)
+    tools = _linked_package(tmp_path / "tools")
+    helper = _linked_package(tmp_path / "helper", name="broadcast/helper", version="2.1.0")
+    # The linked package's OWN lockfile links a second directory.
+    write_lockfile(tools / "ffrwd.lock", [LinkEntry(path="../helper")])
+    write_lockfile(tmp_path / "ffrwd.lock", [LinkEntry(path="tools")])
+    _tools_archive, tools_digest = _packed(tools)
+    _helper_archive, helper_digest = _packed(helper)
+    _submit_accepted(served)
+    for one in (tools_digest, helper_digest):
+        served.answers[f"{UPLOAD_URL}?sha256={one}"] = json.dumps({"already": False}).encode(
+            "utf-8"
+        )
+
+    remote.submit_run(_query(STREAM_QUERY), None, _run_args())
+
+    # Depth first: the package a link names is packed before the link itself.
+    assert _submitted_packages(served) == [helper_digest, tools_digest]
+    assert sorted(_uploaded(served)) == sorted([helper_digest, tools_digest])
+    lock = _submitted_lock(served)
+    assert lock is not None
+    pinned = [(one["name"], one["version"]) for one in json.loads(lock)["packages"]]
+    # The top-level lock pins what it links; the nested one rode along as bytes.
+    assert pinned == [("broadcast/tools", "1.0.0")]
+
+
+def test_a_link_cycle_is_refused_naming_the_loop(
+    served: _Served, logged_in: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    tools = _linked_package(tmp_path / "tools")
+    helper = _linked_package(tmp_path / "helper", name="broadcast/helper")
+    write_lockfile(tools / "ffrwd.lock", [LinkEntry(path="../helper")])
+    write_lockfile(helper / "ffrwd.lock", [LinkEntry(path="../tools")])
+    write_lockfile(tmp_path / "ffrwd.lock", [LinkEntry(path="tools")])
+    _submit_accepted(served)
+
+    with pytest.raises(FfrwdError) as caught:
+        remote.submit_run(_query(STREAM_QUERY), None, _run_args())
+    assert caught.value.message == (
+        "link cycle: broadcast/tools -> broadcast/helper -> broadcast/tools"
+    )
+    assert "stop linking another in the loop" in (caught.value.hint or "")
+    assert served.asked == []
+
+
+def test_an_oversize_package_is_refused_naming_the_ignore_file(
+    served: _Served, logged_in: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    linked = _linked_package(tmp_path / "tools")
+    (linked / "media.mkv").write_bytes(b"take one" * 512)
+    write_lockfile(tmp_path / "ffrwd.lock", [LinkEntry(path="tools")])
+    # The real cap is megabytes; what this pins is the refusal, not the number.
+    monkeypatch.setattr(remote, "MAX_PACKAGE_BYTES", 64)
+    _submit_accepted(served)
+
+    with pytest.raises(FfrwdError) as caught:
+        remote.submit_run(_query(STREAM_QUERY), None, _run_args())
+    assert caught.value.message.startswith("package 'broadcast/tools' packs to ")
+    assert "a submit carries at most 64 bytes per package" in caught.value.message
+    assert ".ffrwdignore" in (caught.value.hint or "")
+    assert served.asked == []
+
+
+def test_an_unreadable_link_is_refused(
+    served: _Served, logged_in: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    write_lockfile(tmp_path / "ffrwd.lock", [LinkEntry(path="gone")])
+    _submit_accepted(served)
+
+    with pytest.raises(FfrwdError) as caught:
+        remote.submit_run(_query(STREAM_QUERY), None, _run_args())
+    assert caught.value.message.startswith("the link to gone could not be read:")
+    assert "run without --remote" in (caught.value.hint or "")
+    assert served.asked == []
+
+
+def test_a_submit_leaves_the_lockfile_on_disk_alone(
+    served: _Served, logged_in: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A link stays a link locally; the rewrite exists only on the wire."""
+    monkeypatch.chdir(tmp_path)
+    linked = _linked_package(tmp_path / "tools")
+    lock_path = tmp_path / "ffrwd.lock"
+    write_lockfile(lock_path, [LinkEntry(path="tools")])
+    before = lock_path.read_text(encoding="utf-8")
+    _archive, digest = _packed(linked)
+    _submit_accepted(served)
+    served.answers[f"{UPLOAD_URL}?sha256={digest}"] = json.dumps({"already": False}).encode(
+        "utf-8"
+    )
+
+    remote.submit_run(_query(STREAM_QUERY), None, _run_args())
+
+    assert lock_path.read_text(encoding="utf-8") == before
+    assert json.loads(before)["packages"] == [{"kind": "link", "path": "tools"}]
 
 
 def test_a_quiet_submit_prints_only_the_result(

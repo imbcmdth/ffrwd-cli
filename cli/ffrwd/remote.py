@@ -7,7 +7,8 @@ name and owning package when one was run by name, the effective lock (the
 project's entries over the machine-wide lockfile's, one document), every
 ``input()`` path (local files hashed and uploaded; any "://" spec passed
 through untouched, the runner's to open), every ``COPY ... TO`` destination,
-and ``--timeout`` -- posts it, uploads the file inputs, and starts the job.
+and ``--timeout`` -- posts it, uploads the file inputs and the packed linked
+packages, and starts the job.
 :func:`jobs_command` is the other half: list, watch, cancel, fetch a
 succeeded job's outputs, or show one job's own detail -- the fields a
 listing row omits, its log tail included. A failed or cancelled job's tail
@@ -20,6 +21,14 @@ hint; the server's own refusals (``{error, hint}`` bodies with honest
 statuses) pass through as themselves. All HTTP goes through
 ``ffrwd.packages``' seams, so the unit tier fakes the server the way
 ``test_publish`` does.
+
+A LINKED package does ride along. It has no published digest, so it is packed
+at submit time -- the same :func:`ffrwd.store.pack` ``publish`` uses, so what
+travels is the manifest's closure and what the ignore files allow, models
+excluded -- uploaded to the content-addressed endpoint the file inputs use, and
+spelled in the submitted lock as a pin against that archive's digest. The
+lockfile ON DISK is untouched: a link stays a link for local development, and
+the rewrite exists only on the wire.
 
 What does NOT ride along: the project's own source files. A query resolving a
 call through the project's OWN manifest package compiles here and fails
@@ -37,7 +46,7 @@ import os
 import sys
 import time
 import urllib.error
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -52,14 +61,19 @@ from ffrwd.errors import ErrorCode, FfrwdError
 from ffrwd.parser import copy_destinations, input_specs, parse
 from ffrwd.probe import is_url
 from ffrwd.project import (
+    LOCKFILE_NAME,
+    MANIFEST_NAME,
+    LinkEntry,
     LockEntry,
     Lockfile,
     Package,
     PackageSet,
     RegistryEntry,
+    entry_root,
     find_lockfile,
     lockfile_text,
     read_lockfile,
+    read_manifest,
 )
 from ffrwd.table import CellValue, TableResult, render_table
 
@@ -79,6 +93,14 @@ JOB_FORMAT_VERSION = 1
 # What one API answer may weigh. Job listings and signed-URL lists are small
 # JSON; output DOWNLOADS are unbounded and streamed, not read through this.
 _MAX_RESPONSE_BYTES = 4 * 1024 * 1024
+
+# What one packed linked package may weigh on the wire. A package is SQL plus
+# at most a few wasm modules -- the largest real one packs to a few hundred
+# kilobytes, and its models are excluded and fetched by the runner -- so this
+# sits a hundredfold above anything legitimate. It is also under the store's
+# own unpacked cap, so an archive that passes here is one the runner can still
+# unpack.
+MAX_PACKAGE_BYTES = 32 * 1024 * 1024
 
 # How often --watch redraws.
 WATCH_SECONDS = 3.0
@@ -299,10 +321,10 @@ def submit_run(
             "drop --show/--show-only, or run without --remote",
         )
     token = _token()
-    _refuse_linked(packages)
     text = query.text
     _refuse_computed_destinations(text)
     inputs, uploads = _inputs(text)
+    lock, archives = _lock(packages)
 
     spec: dict[str, object] = {
         "format_version": JOB_FORMAT_VERSION,
@@ -313,7 +335,10 @@ def submit_run(
         "variables": dict(query.variables),
         "recipe": query.recipe,
         "owner": list(query.owner) if query.owner is not None else None,
-        "lock": _lock_text(packages),
+        "lock": lock,
+        # The digests this submit uploads rather than the registry publishes:
+        # what the lock pins for a package that was linked here.
+        "packages": [archive.entry.sha256 for archive in archives],
         "inputs": inputs,
         "outputs": copy_destinations(text),
         "timeout_s": args.timeout,
@@ -336,6 +361,13 @@ def submit_run(
     ):
         raise _malformed(where)
 
+    for archive in archives:
+        if announce is not None:
+            announce(
+                f"uploading package {archive.entry.name} "
+                f"({written_size(len(archive.content))})"
+            )
+        _upload_bytes(upload_url, job_token, archive.content, archive.entry.sha256)
     for path, digest in uploads:
         _upload(upload_url, job_token, path, digest, announce)
     if announce is not None:
@@ -347,26 +379,6 @@ def submit_run(
         timeout=_DATA_PLANE_TIMEOUT,
     )
     return Submitted(job_id=job_id, remaining=_remaining(answer))
-
-
-def _refuse_linked(packages: PackageSet | None) -> None:
-    """A linked directory has no digest, so no lockfile reproduces it remotely."""
-    for package in _every_package(packages):
-        if package.linked:
-            raise _reject(
-                f"package '{package.name}' is linked to {package.root}, and no "
-                "digest reproduces a linked directory remotely",
-                "install a published version of it, or run locally",
-            )
-
-
-def _every_package(packages: PackageSet | None) -> list[Package]:
-    if packages is None:
-        return []
-    found = list(packages.packages.values())
-    for versions in packages.versions.values():
-        found.extend(versions.values())
-    return found
 
 
 def _refuse_computed_destinations(text: str) -> None:
@@ -440,40 +452,191 @@ def _digest(path: str, *, line: int, col: int) -> tuple[str, int]:
     return hasher.hexdigest(), size
 
 
-def _lock_text(packages: PackageSet | None) -> str | None:
-    """The effective lock: the project's entries over the machine-wide lockfile's.
+@dataclass(frozen=True)
+class _Archive:
+    """One linked package packed for the wire: the pin it becomes, and the bytes."""
 
-    Local resolution layers the global lockfile under the project's, so a
-    query compiling here against globally installed packages must submit a
-    lock the runner can honor too. One document is synthesized -- the project
-    lockfile's entries, then every global entry whose name the project does
-    not pin -- in the same format the runner reads. With nothing installed
-    globally the project's file travels verbatim, as it always did; with no
-    lockfile anywhere there is nothing to send.
+    entry: RegistryEntry
+    content: bytes
+
+
+def _lock(packages: PackageSet | None) -> tuple[str | None, tuple[_Archive, ...]]:
+    """The submitted lock, and the packed archives its pins name.
+
+    The effective lock is the project's entries over the machine-wide
+    lockfile's: local resolution layers the global lockfile under the
+    project's, so a query compiling here against globally installed packages
+    must submit a lock the runner can honor too. One document is synthesized
+    -- the project lockfile's entries, then every global entry whose name the
+    project does not pin -- in the same format the runner reads.
+
+    Every link in that document is then packed and replaced by a pin against
+    its archive's digest, transitively: a linked package's own lockfile may
+    link others, and those travel too. The document on the wire therefore
+    holds registry pins only. Nothing is written to either lockfile on disk.
+
+    With nothing installed globally and nothing linked, the project's file
+    travels verbatim, as it always did; with no lockfile anywhere there is
+    nothing to send.
     """
     start = packages.root if packages is not None else Path.cwd()
     found = find_lockfile(start)
     machine_wide = _global_lock(found)
-    if machine_wide is None:
-        if found is None:
-            return None
+    local = read_lockfile(found) if found is not None else None
+    if local is None and machine_wide is None:
+        return None, ()
+
+    # Each entry with the lockfile it came from: a link's path is written
+    # relative to the file holding it, and the merge below loses that.
+    sourced: list[tuple[LockEntry, Path]] = []
+    if local is not None:
+        sourced = [(entry, local.path) for entry in local.entries]
+    pinned = {
+        entry.name for entry, _ in sourced if isinstance(entry, RegistryEntry)
+    }
+    if machine_wide is not None:
+        for entry in machine_wide.entries:
+            if isinstance(entry, RegistryEntry) and entry.name in pinned:
+                continue
+            sourced.append((entry, machine_wide.path))
+
+    linked = any(isinstance(entry, LinkEntry) for entry, _ in sourced)
+    if machine_wide is None and not linked and found is not None:
         try:
-            return found.read_text(encoding="utf-8")
+            return found.read_text(encoding="utf-8"), ()
         except OSError as err:
             raise _reject(
                 f"{found} could not be read: {err.strerror or err}",
                 "the lockfile rides along verbatim so the runner installs what "
                 "this project pins",
             ) from err
-    local = read_lockfile(found) if found is not None else None
-    entries: list[LockEntry] = list(local.entries) if local is not None else []
-    pinned = {entry.name for entry in entries if isinstance(entry, RegistryEntry)}
-    for entry in machine_wide.entries:
-        if isinstance(entry, RegistryEntry) and entry.name in pinned:
-            continue
-        entries.append(entry)
+
+    packed: dict[Path, RegistryEntry] = {}
+    archives: list[_Archive] = []
+    entries = _resolved(sourced, [], packed, archives)
     held = local if local is not None else machine_wide
-    return lockfile_text(entries, dependencies=held.dependencies)
+    assert held is not None  # both None returned above
+    return lockfile_text(entries, dependencies=held.dependencies), tuple(archives)
+
+
+def _resolved(
+    sourced: Sequence[tuple[LockEntry, Path]],
+    chain: list[tuple[Path, str]],
+    packed: dict[Path, RegistryEntry],
+    archives: list[_Archive],
+) -> list[LockEntry]:
+    """`sourced`'s entries with every link replaced by the pin its archive earns.
+
+    Depth first, so a linked package's own links are packed before the pin
+    that names it. `packed` is what has already been packed, keyed by the
+    directory -- one link, one archive, however many lockfiles name it.
+    `chain` is the links currently being walked, so a loop is caught rather
+    than followed.
+    """
+    entries: list[LockEntry] = []
+    for entry, lock_path in sourced:
+        if not isinstance(entry, LinkEntry):
+            entries.append(entry)
+            continue
+        root = _link_root(entry, lock_path)
+        held = packed.get(root)
+        if held is None:
+            held = _pack_link(entry, root, chain, packed, archives)
+        if not any(
+            isinstance(one, RegistryEntry)
+            and one.name == held.name
+            and one.version == held.version
+            for one in entries
+        ):
+            entries.append(held)
+    return entries
+
+
+def _link_root(entry: LinkEntry, lock_path: Path) -> Path:
+    """The directory `entry` links, or a refusal naming the link."""
+    try:
+        return entry_root(entry, lock_path)
+    except FfrwdError as err:
+        raise _reject(
+            f"the link to {entry.path} could not be read: {err.message}",
+            "a linked package travels as bytes, so its directory has to be "
+            "readable; unlink it, or run without --remote",
+        ) from err
+
+
+def _pack_link(
+    entry: LinkEntry,
+    root: Path,
+    chain: list[tuple[Path, str]],
+    packed: dict[Path, RegistryEntry],
+    archives: list[_Archive],
+) -> RegistryEntry:
+    """Pack the package at `root` -- and everything it links -- into `archives`.
+
+    Returns the pin the submitted lock records for it: the manifest's own name
+    and version, the archive's digest, and the store path that digest lives at
+    on the runner.
+    """
+    package = _link_manifest(entry, root)
+    for at, (walked, _named) in enumerate(chain):
+        if walked == root:
+            loop = " -> ".join([*(name for _, name in chain[at:]), package.name])
+            raise _reject(
+                f"link cycle: {loop}",
+                "there is no resolver here to break it; one of these packages has "
+                "to stop linking another in the loop",
+            )
+    chain.append((root, package.name))
+    nested = root / LOCKFILE_NAME
+    if nested.is_file():
+        held = read_lockfile(nested)
+        _resolved([(one, nested) for one in held.entries], chain, packed, archives)
+    chain.pop()
+
+    content = _pack(package.name, root)
+    if len(content) > MAX_PACKAGE_BYTES:
+        raise _reject(
+            f"package '{package.name}' packs to {written_size(len(content))}, and a "
+            f"submit carries at most {written_size(MAX_PACKAGE_BYTES)} per package",
+            f"exclude what the run does not need in {store.IGNORE_NAME}; a build "
+            "directory or test media in the package tree is the usual cause",
+        )
+    digest = hashlib.sha256(content).hexdigest()
+    pin = RegistryEntry(
+        name=package.name,
+        version=package.version,
+        sha256=digest,
+        store=store.entry_path(digest),
+    )
+    packed[root] = pin
+    archives.append(_Archive(entry=pin, content=content))
+    return pin
+
+
+def _link_manifest(entry: LinkEntry, root: Path) -> Package:
+    try:
+        return read_manifest(root / MANIFEST_NAME)
+    except FfrwdError as err:
+        raise _reject(
+            f"the link to {entry.path} could not be read: {err.message}",
+            "a linked package travels as bytes, so its manifest has to be "
+            "readable; unlink it, or run without --remote",
+        ) from err
+
+
+def _pack(name: str, root: Path) -> bytes:
+    try:
+        return store.pack(root)
+    except FfrwdError as err:
+        raise _reject(
+            f"package '{name}' could not be packed: {err.message}",
+            err.hint or "fix the package directory, or run without --remote",
+        ) from err
+    except OSError as err:
+        raise _reject(
+            f"package '{name}' at {root} could not be read: {err.strerror or err}",
+            "a linked package travels as bytes, so its directory has to be readable",
+        ) from err
 
 
 def _global_lock(local: Path | None) -> Lockfile | None:
@@ -505,6 +668,16 @@ def _upload(
         ) from err
     if announce is not None:
         announce(f"uploading {path} ({written_size(len(content))})")
+    _upload_bytes(upload_url, job_token, content, digest)
+
+
+def _upload_bytes(upload_url: str, job_token: str, content: bytes, digest: str) -> None:
+    """POST `content` to the content-addressed endpoint under its digest.
+
+    Shared by the file inputs and the packed linked packages: both are bytes
+    the runner reads back by digest, and the endpoint answers ``already: true``
+    for content it already holds.
+    """
     _call(
         f"{upload_url}?sha256={digest}",
         headers={"x-job-token": job_token, "Content-Type": "application/octet-stream"},
