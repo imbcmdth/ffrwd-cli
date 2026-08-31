@@ -80,39 +80,51 @@
     },
     "models": {
       "type": "object",
-      "description": "The model file each exported wasm function loads, keyed by the export's name. install fetches each from Hugging Face and verifies it against the pin; the model is never in the archive.",
+      "description": "The model each exported wasm function loads, keyed by the export's name: one pinned file, or a list of them whose first is the graph itself and whose rest land under their own file names beside it. install fetches each from Hugging Face and verifies it against the pin; the model is never in the archive.",
       "additionalProperties": {
-        "type": "object",
-        "required": ["repo", "revision", "file", "sha256"],
-        "additionalProperties": false,
-        "properties": {
-          "repo": {
-            "type": "string",
-            "description": "<owner>/<name> on Hugging Face.",
-            "pattern": "^[^/\\s]+/[^/\\s]+$"
-          },
-          "revision": {
-            "type": "string",
-            "description": "One branch, tag or commit.",
-            "minLength": 1
-          },
-          "file": {
-            "type": "string",
-            "description": "One path inside that revision.",
-            "minLength": 1
-          },
-          "sha256": {
-            "type": "string",
-            "description": "What the file's bytes must hash to.",
-            "pattern": "^[0-9a-f]{64}$"
+        "anyOf": [
+          { "$ref": "#/$defs/modelPin" },
+          {
+            "type": "array",
+            "minItems": 1,
+            "items": { "$ref": "#/$defs/modelPin" }
           }
-        }
+        ]
       }
     },
     "private": {
       "type": "boolean",
       "description": "true publishes each version private: installable with a token from the namespace, off the public index. A version's visibility never changes after publish.",
       "default": false
+    }
+  },
+  "$defs": {
+    "modelPin": {
+      "type": "object",
+      "required": ["repo", "revision", "file", "sha256"],
+      "additionalProperties": false,
+      "properties": {
+        "repo": {
+          "type": "string",
+          "description": "<owner>/<name> on Hugging Face.",
+          "pattern": "^[^/\\s]+/[^/\\s]+$"
+        },
+        "revision": {
+          "type": "string",
+          "description": "One branch, tag or commit.",
+          "minLength": 1
+        },
+        "file": {
+          "type": "string",
+          "description": "One path inside that revision.",
+          "minLength": 1
+        },
+        "sha256": {
+          "type": "string",
+          "description": "What the file's bytes must hash to.",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
     }
   }
 }

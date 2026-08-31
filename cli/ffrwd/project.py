@@ -84,6 +84,7 @@ from . import store
 from .errors import ErrorCode, FfrwdError
 from .macros import macro_names
 from .parser import FILTER_NAMESPACE, MACRO_NAMESPACE
+from .wasm import MODEL_SUFFIX
 
 __all__ = [
     "CAPABILITIES",
@@ -278,7 +279,8 @@ _PRIVATE_HINT = '"private" is true or false; true publishes each version private
 _MODELS_HINT = (
     '"models" maps an exported name to the model file it loads: '
     '{"depth": {"repo": "<owner>/<name>", "revision": "<branch, tag or commit>", '
-    '"file": "model.onnx", "sha256": "<64 hex>"}}'
+    '"file": "model.onnx", "sha256": "<64 hex>"}}; a model of several files is a '
+    "list of those, the graph first"
 )
 
 
@@ -348,6 +350,14 @@ class ModelPin:
     file: str
     sha256: str
 
+    @property
+    def filename(self) -> str:
+        """The last segment of `file`: the name a fetch of it lands under.
+
+        A path inside a revision is written POSIX-style, so only "/" divides it.
+        """
+        return self.file.rpartition("/")[2]
+
 
 @dataclass(frozen=True)
 class Package:
@@ -367,10 +377,11 @@ class Package:
     project page for it (None the same way), `capabilities` what the manifest
     declares its modules need the host to grant, `engines` the range of ffrwd
     versions the manifest's ``ffrwd`` key declares (None when it declares
-    none), `models` the model file each named export loads, keyed by export
-    name, and `private` whether a publish stamps the version private. All
-    seven are the registry's business rather than a compile's: they are read,
-    validated and carried, and nothing here acts on them.
+    none), `models` the files each named export's model is, keyed by export
+    name and led by the graph itself, and `private` whether a publish stamps
+    the version private. All seven are the registry's business rather than a
+    compile's: they are read, validated and carried, and nothing here acts on
+    them.
 
     `linked` marks a package read straight out of a working directory rather
     than out of the store. Its files are whatever they are right now, so no
@@ -389,7 +400,7 @@ class Package:
     homepage: str | None = None
     capabilities: tuple[str, ...] = ()
     engines: str | None = None
-    models: Mapping[str, ModelPin] = field(default_factory=dict)
+    models: Mapping[str, tuple[ModelPin, ...]] = field(default_factory=dict)
     private: bool = False
     # Set only where the manifest wrote a plain string: the one member that
     # answers to the package's own name.
@@ -913,9 +924,8 @@ def _engines(data: dict[str, object], path: Path, text: str) -> str | None:
     return written
 
 
-def _model(written: object, export: str, path: Path, line: int | None) -> ModelPin:
-    """One ``models`` entry, every field checked before it is part of a URL."""
-    named = f"model '{export}'"
+def _model(written: object, named: str, path: Path, line: int | None) -> ModelPin:
+    """One pin, every field checked before it is part of a URL."""
     if not isinstance(written, dict):
         raise _reject(path, f"{named} must be a JSON object", line=line, hint=_MODELS_HINT)
     for key in sorted(written):
@@ -970,17 +980,78 @@ def _model(written: object, export: str, path: Path, line: int | None) -> ModelP
     return ModelPin(repo=repo, revision=revision, file=file, sha256=sha256)
 
 
-def _models(data: dict[str, object], path: Path, text: str) -> dict[str, ModelPin]:
-    """The model each named export loads, empty when the manifest names none.
+def _landings(
+    pins: tuple[ModelPin, ...], export: str, named: str, path: Path, line: int | None
+) -> None:
+    """Check where the pins after the first land: install writes each under its own
+    file name, beside the graph the first one becomes."""
+    graph = f"{export}{MODEL_SUFFIX}"
+    seen: dict[str, int] = {}
+    for number, pin in enumerate(pins[1:], start=2):
+        landing = pin.filename
+        if not landing or landing in (".", "..") or "\\" in landing:
+            raise _reject(
+                path,
+                f"{named} entry {number} names {pin.file!r}, which ends in no plain "
+                "filename",
+                line=line,
+                hint="every entry after the first lands under the last segment of what "
+                "it names, so that segment is a plain filename",
+            )
+        if landing == graph:
+            raise _reject(
+                path,
+                f"{named} entry {number} would land under {graph!r}, where the first "
+                "entry lands",
+                line=line,
+                hint=f"install writes the first entry as {graph!r} and every later one "
+                "under its own name; rename it, or put it first",
+            )
+        if landing in seen:
+            raise _reject(
+                path,
+                f"{named} entries {seen[landing]} and {number} would both land under "
+                f"{landing!r}",
+                line=line,
+                hint="each entry after the first lands under its own file name, so two "
+                "of a name would overwrite each other",
+            )
+        seen[landing] = number
+
+
+def _model_pins(
+    written: object, export: str, path: Path, line: int | None
+) -> tuple[ModelPin, ...]:
+    """The pins one ``models`` entry holds: one file, or a list of them.
+
+    The first is the graph the export loads, whatever it is named on the hub;
+    every later one is a file that graph refers to by name, so it lands under
+    its own.
+    """
+    named = f"model '{export}'"
+    if not isinstance(written, list):
+        return (_model(written, named, path, line),)
+    if not written:
+        raise _reject(path, f"{named} lists no file", line=line, hint=_MODELS_HINT)
+    pins = tuple(
+        _model(entry, f"{named} entry {number}", path, line)
+        for number, entry in enumerate(written, start=1)
+    )
+    _landings(pins, export, named, path, line)
+    return pins
+
+
+def _models(data: dict[str, object], path: Path, text: str) -> dict[str, tuple[ModelPin, ...]]:
+    """The files each named export loads, empty when the manifest names none.
 
     The key is the export name the module's file is named for, which is what
-    install writes it as beside the module. Whether the package actually
-    declares that export is checked where its lib files are read.
+    install writes the first of them as beside the module. Whether the package
+    actually declares that export is checked where its lib files are read.
     """
     if "models" not in data:
         return {}
     at = _key_line(text, "models")
-    models: dict[str, ModelPin] = {}
+    models: dict[str, tuple[ModelPin, ...]] = {}
     for export, written in _map_of(data, "models", path, text, _MODELS_HINT).items():
         line = _key_line(text, export) or at
         if _IDENTIFIER_RE.fullmatch(export) is None:
@@ -990,7 +1061,7 @@ def _models(data: dict[str, object], path: Path, text: str) -> dict[str, ModelPi
                 line=line,
                 hint="a model is keyed by the exported function name that loads it",
             )
-        models[export] = _model(written, export, path, line)
+        models[export] = _model_pins(written, export, path, line)
     return models
 
 

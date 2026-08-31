@@ -141,9 +141,12 @@ _MAX_DETAIL_BYTES = 16 * 1024 * 1024
 _MAX_ARCHIVE_BYTES = 64 * 1024 * 1024
 # What the search function may answer with.
 _MAX_SEARCH_BYTES = 4 * 1024 * 1024
-# A model is a different order of thing from an archive: generous, and still a
-# bound on what a hostile answer costs.
-_MAX_MODEL_BYTES = 2 * 1024 * 1024 * 1024
+# A backstop on what one pinned file may weigh, not a judgment about model
+# sizes: no honest export comes near it, and a stream that runs past it is a
+# hostile answer rather than a large model.
+_MAX_MODEL_BYTES = 256 * 1024 * 1024 * 1024
+# What the hub's listing of pinned paths may answer with.
+_MAX_PATHS_INFO_BYTES = 4 * 1024 * 1024
 
 # Where Hugging Face serves a pinned file from.
 HUGGINGFACE = "https://huggingface.co"
@@ -931,10 +934,14 @@ def _download_model(
         ) from err
     try:
         with os.fdopen(handle, "wb") as file:
-            found, oversized = _stream(url, file, package, export, pin, announce)
-        if oversized:
+            found, arrived = _stream(url, file, package, export, pin, announce)
+        if arrived > _MAX_MODEL_BYTES:
             raise _model_refusal(
-                package, export, pin, f"is larger than {_MAX_MODEL_BYTES} bytes"
+                package,
+                export,
+                pin,
+                f"ran past the {written_size(_MAX_MODEL_BYTES)} one file may weigh, "
+                f"and was abandoned at {written_size(arrived)}",
             )
         if found != pin.sha256:
             raise _model_refusal(
@@ -977,11 +984,12 @@ def _stream(
     export: str,
     pin: ModelPin,
     announce: Announce | None = None,
-) -> tuple[str, bool]:
-    """Copy `url` into `file`, hashing it: the digest, and whether it ran past the cap.
+) -> tuple[str, int]:
+    """Copy `url` into `file`, hashing it: the digest, and how many bytes arrived.
 
-    Abandoned at the block that crosses the cap rather than after the whole
-    thing has been written, so a hostile answer costs one block over the bound.
+    Abandoned at the block that crosses the backstop rather than after the
+    whole thing has been written, so a hostile answer costs one block over the
+    bound -- and a count past the backstop is what says it was abandoned.
     `announce` hears the one line naming the model, once the answer is open
     and its size is known.
     """
@@ -994,10 +1002,10 @@ def _stream(
             while True:
                 block = response.read(1024 * 1024)
                 if not block:
-                    return digest.hexdigest(), False
+                    return digest.hexdigest(), written
                 written += len(block)
                 if written > _MAX_MODEL_BYTES:
-                    return digest.hexdigest(), True
+                    return digest.hexdigest(), written
                 digest.update(block)
                 file.write(block)
     except urllib.error.HTTPError as err:
@@ -1010,26 +1018,76 @@ def _stream(
 
 
 def _install_models(package: Package, announce: Announce | None = None) -> None:
-    """Put every model `package` pins beside the module whose export loads it.
+    """Put every file `package` pins beside the module whose export loads it.
 
     The compiler looks for ``<export>.onnx`` beside the module's wasm file, so
-    that is where each one lands. A model already there and hashing to the pin
-    is left alone; one that fails to arrive fails the install, naming the
-    model and the pin.
+    that is where each export's FIRST pin lands. A model of several files
+    lands the rest beside it under their own names, which is what the graph
+    refers to them by. A file already there and hashing to its pin is left
+    alone; one that fails to arrive fails the install, naming the model and
+    the pin.
     """
     if not package.models:
         return
     modules = {declared.export: declared.module for declared in package_modules(package)}
-    for export, pin in package.models.items():
+    for export, pins in package.models.items():
         module = modules.get(export)
         if module is None:
             raise _model_refusal(
-                package.name, export, pin, "names an export no module in it declares"
+                package.name, export, pins[0], "names an export no module in it declares"
             )
-        destination = Path(wasm.model_path(module, export))
-        if _digest_of(destination) == pin.sha256:
+        graph = Path(wasm.model_path(module, export))
+        for number, pin in enumerate(pins):
+            destination = graph if number == 0 else graph.parent / pin.filename
+            if _digest_of(destination) == pin.sha256:
+                continue
+            _download_model(package.name, export, pin, destination, announce)
+
+
+def model_sizes(pins: Sequence[ModelPin]) -> dict[ModelPin, int]:
+    """What each pinned file weighs on the hub, for the pins the hub answers for.
+
+    One request per repository and revision, asking about only the files
+    pinned there. A pin the hub says nothing about is simply absent from the
+    answer: a size is a courtesy, never a reason to refuse anything.
+    """
+    by_revision: dict[tuple[str, str], list[ModelPin]] = {}
+    for pin in pins:
+        by_revision.setdefault((pin.repo, pin.revision), []).append(pin)
+    found: dict[ModelPin, int] = {}
+    for (repo, revision), pinned in by_revision.items():
+        weighed = _hub_sizes(repo, revision, [pin.file for pin in pinned])
+        for pin in pinned:
+            size = weighed.get(pin.file)
+            if size is not None:
+                found[pin] = size
+    return found
+
+
+def _hub_sizes(repo: str, revision: str, files: Sequence[str]) -> dict[str, int]:
+    """What the hub says each of `files` weighs in one revision, keyed by path.
+
+    Empty when the answer does not arrive or cannot be read. An LFS file's
+    real size is the one under "lfs"; the entry's own is the pointer's.
+    """
+    url = f"{HUGGINGFACE}/api/models/{repo}/paths-info/{revision}"
+    body = json.dumps({"paths": list(files)}).encode("utf-8")
+    try:
+        answered = json.loads(_read(url, _MAX_PATHS_INFO_BYTES, _request(url, data=body)))
+    except (_Status, FfrwdError, OSError, ValueError):
+        return {}
+    if not isinstance(answered, list):
+        return {}
+    sizes: dict[str, int] = {}
+    for entry in answered:
+        if not isinstance(entry, dict):
             continue
-        _download_model(package.name, export, pin, destination, announce)
+        lfs = entry.get("lfs")
+        size = lfs.get("size") if isinstance(lfs, dict) else entry.get("size")
+        written = entry.get("path")
+        if isinstance(written, str) and isinstance(size, int) and not isinstance(size, bool):
+            sizes[written] = size
+    return sizes
 
 
 def module_capabilities(package: Package) -> dict[str, tuple[str, ...]]:

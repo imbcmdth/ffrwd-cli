@@ -1487,6 +1487,10 @@ def test_a_signing_answer_that_names_no_url_is_refused(
 MODEL = b"not really an onnx graph, but it hashes to something"
 MODEL_DIGEST = hashlib.sha256(MODEL).hexdigest()
 MODEL_URL = "https://huggingface.co/depth-anything/small/resolve/v1/model.onnx"
+# The file a graph too large to hold its own weights refers to by name.
+DATA = b"nor really the weights that graph would refer to"
+DATA_DIGEST = hashlib.sha256(DATA).hexdigest()
+DATA_URL = "https://huggingface.co/depth-anything/small/resolve/v1/onnx/model.onnx.data"
 
 
 def _model_package(root: Path, *, models: dict[str, object] | None = None) -> Path:
@@ -1559,6 +1563,51 @@ def test_a_pinned_model_lands_beside_the_module_hash_verified(
     # The fetch narrates the model; the fake answer names no Content-Length,
     # so the line carries no size.
     assert "model model.onnx from depth-anything/small\n" in err
+
+
+def test_a_model_of_several_files_lands_the_graph_named_and_the_rest_as_written(
+    store_home: Path,
+    registry: Path,
+    served: _Served,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The first pin becomes `<export>.onnx`; a later one keeps its own name,
+    which is what the graph refers to it by."""
+    monkeypatch.setenv(packages.REGISTRY_ENV, str(registry))
+    sha256 = _publish(
+        registry,
+        _model_package(
+            tmp_path / "built",
+            models={
+                "depth": [
+                    {
+                        "repo": "depth-anything/small",
+                        "revision": "v1",
+                        "file": "model.onnx",
+                        "sha256": MODEL_DIGEST,
+                    },
+                    {
+                        "repo": "depth-anything/small",
+                        "revision": "v1",
+                        "file": "onnx/model.onnx.data",
+                        "sha256": DATA_DIGEST,
+                    },
+                ]
+            },
+        ),
+        functions=("depth",),
+    )
+    _serves(served, **{MODEL_URL: MODEL, DATA_URL: DATA})
+    project = _project(tmp_path / "work", monkeypatch, capsys)
+
+    code, _out, err = _run(project, monkeypatch, capsys, "install", "broadcast/depth")
+    assert code == 0, err
+    landed = store.store_dir() / store.entry_path(sha256)
+    assert (landed / "depth.onnx").read_bytes() == MODEL
+    assert (landed / "model.onnx.data").read_bytes() == DATA
+    assert served.urls() == [MODEL_URL, DATA_URL]
 
 
 def test_a_model_already_there_and_matching_is_not_fetched_again(

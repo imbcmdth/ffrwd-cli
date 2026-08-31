@@ -34,7 +34,7 @@ import os
 import re
 import shlex
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -48,6 +48,7 @@ from .functions import package_modules, package_signatures
 from .probe import ChapterMeta, ProbeResult, StreamMeta
 from .project import (
     README_NAME,
+    ModelPin,
     Package,
     PackageSet,
     is_package_name,
@@ -442,6 +443,39 @@ def _checked_models(package: Package) -> None:
             )
 
 
+def _model_sizes(package: Package) -> dict[str, tuple[int | None, ...]]:
+    """What each pinned file weighs on the hub, in the order its export pins them.
+
+    One request per repository and revision. A size the hub does not answer
+    for is None and the publish carries on without it.
+    """
+    if not package.models:
+        return {}
+    weighed = packages_module.model_sizes(
+        [pin for pins in package.models.values() for pin in pins]
+    )
+    return {
+        export: tuple(weighed.get(pin) for pin in pins)
+        for export, pins in package.models.items()
+    }
+
+
+def _pin_document(pin: ModelPin, size: int | None) -> Document:
+    """One pin as the registry stores it: what it names, and what it weighs.
+
+    A size the hub did not answer for is left out rather than written null.
+    """
+    written: Document = {
+        "repo": pin.repo,
+        "revision": pin.revision,
+        "file": pin.file,
+        "sha256": pin.sha256,
+    }
+    if size is not None:
+        written["size"] = size
+    return written
+
+
 def _compiled_recipes(package: Package, packages: PackageSet) -> None:
     """Every recipe compiles, with its own package and its dependencies resolvable."""
     for name, path in package.recipes.items():
@@ -589,6 +623,7 @@ class Prepared:
     sources: dict[str, str]
     capabilities: tuple[str, ...]
     visibility: str = PUBLIC
+    model_sizes: Mapping[str, tuple[int | None, ...]] = field(default_factory=dict)
 
     @property
     def size(self) -> int:
@@ -609,15 +644,19 @@ class Prepared:
             "license": self.package.license,
             "homepage": self.package.homepage,
             "models": {
-                export: {
-                    "repo": pin.repo,
-                    "revision": pin.revision,
-                    "file": pin.file,
-                    "sha256": pin.sha256,
-                }
-                for export, pin in self.package.models.items()
+                export: self._pinned(export, pins)
+                for export, pins in self.package.models.items()
             },
         }
+
+    def _pinned(self, export: str, pins: tuple[ModelPin, ...]) -> Document | list[Document]:
+        """One export's pins, array-shaped when it names more than one file."""
+        sizes = self.model_sizes.get(export, ())
+        written = [
+            _pin_document(pin, sizes[number] if number < len(sizes) else None)
+            for number, pin in enumerate(pins)
+        ]
+        return written[0] if len(written) == 1 else written
 
 
 def prepare(
@@ -628,14 +667,17 @@ def prepare(
     announce: Announce | None = None,
 ) -> Prepared:
     """Validate the package `manifest` declares, and pack it. Reaches the registry
-    only to resolve what the package depends on.
+    to resolve what the package depends on, and the hub for what each pinned
+    model file weighs.
 
     In order: the manifest reads and its name is one a package may have; every
     dependency resolves; every export parses and defines what the manifest
     says; every module describes, and every pinned model names one of their
-    exports; every recipe compiles against the synthetic file. Then the
-    directory is packed, and the documents the registry stores are built out
-    of the same package the checks just ran over.
+    exports; every recipe compiles against the synthetic file. The hub is
+    asked what each pinned file weighs, and a size that does not arrive is
+    left out rather than refused over. Then the directory is packed, and the
+    documents the registry stores are built out of the same package the checks
+    just ran over.
 
     `packages` is what a recipe's calls resolve against -- the project's own
     installed set. Defaults to the package alone, which is enough for one that
@@ -657,6 +699,7 @@ def prepare(
         package_signatures(package)
         capabilities = _capabilities(package)
         _checked_models(package)
+        sizes = _model_sizes(package)
         _compiled_recipes(package, resolvable)
 
         readme_html = _readme_html(package)
@@ -709,6 +752,7 @@ def prepare(
         sources=sources,
         capabilities=capabilities,
         visibility=PRIVATE if package.private else PUBLIC,
+        model_sizes=sizes,
     )
 
 

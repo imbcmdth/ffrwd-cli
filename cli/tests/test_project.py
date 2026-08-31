@@ -3259,13 +3259,59 @@ def test_the_registry_keys_are_read_and_carried(tmp_path: Path) -> None:
     assert package.license == "MIT OR Apache-2.0"
     assert package.homepage == "https://example.com/tracks"
     assert dict(package.models) == {
-        "quieter": ModelPin(
-            repo="depth-anything/small",
-            revision="v1",
-            file="onnx/model.onnx",
-            sha256="a" * 64,
+        "quieter": (
+            ModelPin(
+                repo="depth-anything/small",
+                revision="v1",
+                file="onnx/model.onnx",
+                sha256="a" * 64,
+            ),
         )
     }
+
+
+def test_a_model_of_several_files_is_read_in_the_order_it_is_written(
+    tmp_path: Path,
+) -> None:
+    """The first pin is the graph; the rest are the files it refers to by name."""
+    manifest = _project(
+        tmp_path,
+        files={"src/tracks.sql": QUIETER},
+        manifest={
+            "models": {
+                "quieter": [
+                    {**_MODEL, "file": "onnx/model.onnx"},
+                    {**_MODEL, "file": "onnx/model.onnx.data", "sha256": "b" * 64},
+                ]
+            }
+        },
+    )
+    pins = read_manifest(manifest).models["quieter"]
+    assert [(pin.file, pin.filename, pin.sha256) for pin in pins] == [
+        ("onnx/model.onnx", "model.onnx", "a" * 64),
+        ("onnx/model.onnx.data", "model.onnx.data", "b" * 64),
+    ]
+
+
+def test_a_model_written_as_one_file_and_as_a_list_of_one_read_the_same(
+    tmp_path: Path,
+) -> None:
+    """The two spellings are the same pin: a list is how a second file is added."""
+    one = read_manifest(
+        _project(
+            tmp_path / "one",
+            files={"src/tracks.sql": QUIETER},
+            manifest={"models": {"quieter": dict(_MODEL)}},
+        )
+    )
+    listed = read_manifest(
+        _project(
+            tmp_path / "listed",
+            files={"src/tracks.sql": QUIETER},
+            manifest={"models": {"quieter": [dict(_MODEL)]}},
+        )
+    )
+    assert dict(one.models) == dict(listed.models)
 
 
 def test_a_manifest_declaring_none_of_them_carries_none(tmp_path: Path) -> None:
@@ -3355,6 +3401,41 @@ def test_a_blank_homepage_is_the_same_as_absent(tmp_path: Path) -> None:
         (
             {"models": {"quieter": {**_MODEL, "url": "https://example/model"}}},
             "unknown key 'url' in model 'quieter'",
+        ),
+        ({"models": {"quieter": []}}, "model 'quieter' lists no file"),
+        (
+            {"models": {"quieter": [dict(_MODEL), {**_MODEL, "repo": "small"}]}},
+            "model 'quieter' entry 2 names the repository 'small'",
+        ),
+        (
+            {"models": {"quieter": [dict(_MODEL), {**_MODEL, "file": "onnx/"}]}},
+            "model 'quieter' entry 2 names 'onnx/', which ends in no plain filename",
+        ),
+        (
+            {"models": {"quieter": [dict(_MODEL), {**_MODEL, "file": "sub\\a.onnx"}]}},
+            "model 'quieter' entry 2 names 'sub\\\\a.onnx', which ends in "
+            "no plain filename",
+        ),
+        (
+            {"models": {"quieter": [dict(_MODEL), {**_MODEL, "file": "a/."}]}},
+            "model 'quieter' entry 2 names 'a/.', which ends in no plain filename",
+        ),
+        (
+            {"models": {"quieter": [dict(_MODEL), {**_MODEL, "file": "b/quieter.onnx"}]}},
+            "model 'quieter' entry 2 would land under 'quieter.onnx', where the first "
+            "entry lands",
+        ),
+        (
+            {
+                "models": {
+                    "quieter": [
+                        dict(_MODEL),
+                        {**_MODEL, "file": "a/weights.bin"},
+                        {**_MODEL, "file": "b/weights.bin"},
+                    ]
+                }
+            },
+            "model 'quieter' entries 2 and 3 would both land under 'weights.bin'",
         ),
     ],
 )

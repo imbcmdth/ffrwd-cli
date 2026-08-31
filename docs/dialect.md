@@ -225,14 +225,36 @@ is stamped with; every already-public version stays installable exactly
 as it was. One rule follows: a version published public must have every
 dependency resolvable among public versions.
 
-`models` pins the model file each exported wasm function loads, keyed
-by the EXPORT name. `repo` is `<owner>/<name>` on Hugging Face,
-`revision` one branch, tag or commit, `file` one path inside that
-revision, and `sha256` what its bytes must hash to. `install` fetches
-each into the store beside the module's wasm file, named
-`<export>.onnx`, which is where the compiler already looks for it (see
+`models` pins the model each exported wasm function loads, keyed by the
+EXPORT name. `repo` is `<owner>/<name>` on Hugging Face, `revision` one
+branch, tag or commit, `file` one path inside that revision, and
+`sha256` what its bytes must hash to. `install` fetches it into the
+store beside the module's wasm file, named `<export>.onnx`, which is
+where the compiler already looks for it (see
 [Installing](#installing)). A model is therefore not in the archive: a
 package that runs one is still kilobytes.
+
+A model of several files is written as a LIST of pins, and the entries
+may name different repositories:
+
+```json
+{ "models": { "transcribe": [
+    { "repo": "<owner>/<name>", "revision": "<rev>",
+      "file": "whisper-medium_beamsearch.onnx", "sha256": "<64 hex>" },
+    { "repo": "<owner>/<name>", "revision": "<rev>",
+      "file": "whisper-medium_beamsearch.onnx.data", "sha256": "<64 hex>" } ] } }
+```
+
+The FIRST entry is the graph, and lands as `<export>.onnx` like any
+other. Every later entry lands beside it under its own file NAME -
+`whisper-medium_beamsearch.onnx.data` above - because that is the name
+the graph refers to it by. A later entry whose name would be
+`<export>.onnx`, one whose path ends in no plain filename, one whose
+name another entry already lands under, and an empty list are each
+refused. `publish` asks the hub what every pinned file weighs and
+records it beside the pin, so a package's page can say what installing
+will download; a size that does not arrive is left out and the publish
+carries on.
 
 A query calls into an installed package one of two ways, always
 written in full:
@@ -603,7 +625,7 @@ Then the directory is packed - the same deterministic archive
 `install` verifies - and one request carries the bytes and the JSON the
 registry stores: the version's detail document, the recipe sources, the
 capabilities, and the manifest's `ffrwd`, `keywords`, `license` and
-`models`.
+`models`, each pin carrying what the hub says the file weighs.
 
 What the archive holds is the manifest's closure plus whatever is left.
 The closure is the manifest, every `lib` and `bin` file it names, every

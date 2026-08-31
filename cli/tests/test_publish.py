@@ -436,6 +436,89 @@ def test_a_model_naming_no_export_of_this_package_is_refused(
     assert "this package declares depth" in (caught.value.hint or "")
 
 
+PATHS_INFO = "https://huggingface.co/api/models/depth-anything/small/paths-info/v1"
+
+
+def _pin(file: str, digest: str = "e" * 64) -> dict[str, object]:
+    return {
+        "repo": "depth-anything/small",
+        "revision": "v1",
+        "file": file,
+        "sha256": digest,
+    }
+
+
+def _weighs(served: _Served, sizes: Mapping[str, int]) -> None:
+    """The hub's answer for a listing of pinned paths: an entry per file it has."""
+    served.answers[PATHS_INFO] = json.dumps(
+        [
+            {"type": "file", "path": file, "size": size, "lfs": {"size": size}}
+            for file, size in sizes.items()
+        ]
+    ).encode("utf-8")
+
+
+def test_the_pinned_files_are_weighed_and_published_in_the_order_pinned(
+    monkeypatch: pytest.MonkeyPatch, served: _Served, tmp_path: Path
+) -> None:
+    """An export pinning several files publishes a list, each pin with what it weighs."""
+    root = _module_package(
+        tmp_path / "built",
+        capabilities=["nn"],
+        models={
+            "depth": [
+                _pin("model.onnx", "a" * 64),
+                _pin("onnx/model.onnx.data", "b" * 64),
+                _pin("onnx/vocab.bin", "c" * 64),
+            ]
+        },
+    )
+    _describing(monkeypatch, nn=True)
+    # The hub answers for two of the three: a size is a courtesy, per file.
+    _weighs(served, {"model.onnx": 1_753_381, "onnx/model.onnx.data": 3_267_870_720})
+
+    prepared = publish.prepare(root / "ffrwd.json")
+    assert prepared.metadata()["models"] == {
+        "depth": [
+            {**_pin("model.onnx", "a" * 64), "size": 1_753_381},
+            {**_pin("onnx/model.onnx.data", "b" * 64), "size": 3_267_870_720},
+            _pin("onnx/vocab.bin", "c" * 64),
+        ]
+    }
+    _headers, body = served.sent_to(PATHS_INFO)
+    assert json.loads(body) == {
+        "paths": ["model.onnx", "onnx/model.onnx.data", "onnx/vocab.bin"]
+    }
+
+
+def test_one_pinned_file_publishes_the_shape_it_always_did_plus_its_size(
+    monkeypatch: pytest.MonkeyPatch, served: _Served, tmp_path: Path
+) -> None:
+    root = _module_package(
+        tmp_path / "built", capabilities=["nn"], models={"depth": _pin("model.onnx")}
+    )
+    _describing(monkeypatch, nn=True)
+    _weighs(served, {"model.onnx": 86_000_000})
+
+    prepared = publish.prepare(root / "ffrwd.json")
+    assert prepared.metadata()["models"] == {
+        "depth": {**_pin("model.onnx"), "size": 86_000_000}
+    }
+
+
+def test_a_hub_that_answers_no_size_publishes_the_pins_without_one(
+    monkeypatch: pytest.MonkeyPatch, served: _Served, tmp_path: Path
+) -> None:
+    """A size is a courtesy, not a correctness property: nothing is refused over it."""
+    root = _module_package(
+        tmp_path / "built", capabilities=["nn"], models={"depth": _pin("model.onnx")}
+    )
+    _describing(monkeypatch, nn=True)  # served answers 404 for the listing
+
+    prepared = publish.prepare(root / "ffrwd.json")
+    assert prepared.metadata()["models"] == {"depth": _pin("model.onnx")}
+
+
 def test_an_archive_over_the_cap_says_where_a_model_belongs(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
