@@ -585,9 +585,9 @@ class SidecarProcess:
 
     `impure` names the modules of this region that declared they carry state
     between calls, in region order. It is empty for a region every module of
-    which is pure, and a region with anything in it is hosted by ONE worker
-    however many the run asked for: frame-parallel hosting reorders the calls,
-    which is only safe where a call depends on nothing but its own frames.
+    which is pure. The sidecar's own scheduler is what acts on purity: an
+    impure module's calls run one at a time in order, and a pure one spreads
+    across the worker pool, whatever this plan says.
     """
 
     id: str
@@ -631,17 +631,6 @@ class SidecarProcess:
         return len(self.graph.nodes) > 1 or any(
             len(node.inputs) > 1 for node in self.graph.nodes.values()
         )
-
-    @property
-    def parallel(self) -> bool:
-        """True when several instances of this region may host frames at once.
-
-        One pure module over frames, and nothing else: a region of several is
-        wired node to node and hands frames on in order, a packet sink reads
-        its packets in decode order, and an impure module's calls depend on
-        more than the frames they were handed.
-        """
-        return not self.impure and not self.network and not self.packet_sink
 
     def to_dict(self) -> dict[str, object]:
         written: dict[str, object] = {

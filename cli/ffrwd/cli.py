@@ -165,7 +165,6 @@ import shlex
 import shutil
 import subprocess
 import sys
-from collections.abc import Mapping
 from dataclasses import dataclass, field
 from importlib import metadata
 from pathlib import Path
@@ -321,75 +320,30 @@ def _add_quiet_argument(subparser: argparse.ArgumentParser) -> None:
 
 
 _JOBS_HELP = (
-    "host this many instances of each wasm module at once (default: 1); a "
-    "module that carries state between calls keeps one"
+    "cap the sidecar's worker threads at N (default: the machine's core "
+    "count); --jobs 1 hosts everything serially"
 )
 
 
 def _add_jobs_argument(subparser: argparse.ArgumentParser) -> None:
-    subparser.add_argument("--jobs", type=int, default=1, metavar="N", help=_JOBS_HELP)
+    subparser.add_argument("--jobs", type=int, default=None, metavar="N", help=_JOBS_HELP)
 
 
 def _check_jobs(args: argparse.Namespace) -> int:
     """0 for a usable ``--jobs``, or 2 with the usage error printed."""
-    jobs = int(getattr(args, "jobs", 1))
-    if jobs >= 1:
+    jobs: int | None = getattr(args, "jobs", None)
+    if jobs is None or jobs >= 1:
         return 0
     print(
         f"error: {args.command}: --jobs must be 1 or more, got {jobs}",
         file=sys.stderr,
     )
     print(
-        "hint: --jobs 1 hosts one instance of each module, which is what a "
-        "run with no --jobs does",
+        "hint: --jobs caps the sidecar's worker threads; leave it off to "
+        "use every core",
         file=sys.stderr,
     )
     return 2
-
-
-# Why a region keeps one worker, by the property that decided it.
-_SERIAL_REASONS: Mapping[str, str] = {
-    "state": "a module that carries state between calls is hosted by one instance",
-    "network": "modules wired to each other hand frames on in order",
-    "packets": "a module reading encoded packets takes them in decode order",
-}
-
-
-def _serial_modules(plan: ProcessPlan) -> tuple[tuple[str, tuple[str, ...]], ...]:
-    """What `plan` hosts serially, as ``(reason, modules)``.
-
-    A region keeps one worker for exactly one of three reasons, and which one
-    is what the run is owed: an impure module is the module author's to
-    change, a network of them is the query's, and a packet sink is neither.
-    """
-    found: dict[str, list[str]] = {name: [] for name in _SERIAL_REASONS}
-    for process in plan.processes:
-        if not isinstance(process, SidecarProcess) or process.parallel:
-            continue
-        if process.impure:
-            reason, modules = "state", list(process.impure)
-        else:
-            reason = "packets" if process.packet_sink else "network"
-            modules = [process.module]
-        found[reason] += [one for one in modules if one not in found[reason]]
-    return tuple((reason, tuple(named)) for reason, named in found.items() if named)
-
-
-def _print_jobs_notice(plan: ProcessPlan | None, jobs: int) -> None:
-    """Name what a ``--jobs`` above 1 did not reach, once per reason, on stderr.
-
-    A run that asked for parallel hosting and got none of it somewhere is
-    owed the reason; a run that got all of it, and a run at the default, are
-    told nothing.
-    """
-    if plan is None or jobs <= 1:
-        return
-    for reason, modules in _serial_modules(plan):
-        named = ", ".join(f"'{module}'" for module in modules)
-        print(
-            f"warning: --jobs {jobs} does not reach {named}: {_SERIAL_REASONS[reason]}",
-            file=sys.stderr,
-        )
 
 
 def _console(args: argparse.Namespace) -> Console:
@@ -1108,7 +1062,6 @@ def _cmd_compile(args: argparse.Namespace, on_warning: OnWarning) -> int:
             _print_error(err, source=args.query, packages=packages, query=query)
             return 1
         print(rendered)
-        _print_jobs_notice(compiled.plan, args.jobs)
         return 0
     print(_CHAIN.join(_shell_commands(emitted)))
     return 0
@@ -1472,13 +1425,11 @@ def _run_plan(
 
     `players` is the ffplay each shown process's stdout feeds, empty for a run
     that asked for no window. `timeout` is per stage, None for a run nothing
-    bounds. ``--jobs`` reaches each sidecar through the renderer, and the
-    modules it could not reach are named before anything is spawned.
+    bounds. ``--jobs`` reaches each sidecar through the renderer.
     """
     code = _provision_nn(plan, console)
     if code != 0:
         return code
-    _print_jobs_notice(plan, args.jobs)
     result = execute_plan(
         plan,
         sidecar_argv=functools.partial(wasm.sidecar_argv, jobs=args.jobs),

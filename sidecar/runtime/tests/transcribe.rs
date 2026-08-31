@@ -158,7 +158,7 @@ fn decode(module: &str, pcm: &[f32], params: &str) -> Vec<Said> {
     let bytes: Vec<u8> = pcm.iter().flat_map(|s| s.to_le_bytes()).collect();
     let window = [Frame {
         pts: 0,
-        data: bytes.clone(),
+        data: bytes.clone().into(),
         rows: Vec::new(),
     }];
 
@@ -174,7 +174,7 @@ fn decode(module: &str, pcm: &[f32], params: &str) -> Vec<Said> {
 
     assert_eq!(out.frames.len(), 1, "one window in, one window out");
     assert_eq!(
-        out.frames[0].data, bytes,
+        *out.frames[0].data, bytes,
         "a one-to-one module returns the samples it was handed"
     );
     assert!(
@@ -286,7 +286,7 @@ fn real_speech_comes_back_as_timed_rows_and_one_transcript() {
         let pts = (index * WINDOW) as i64;
         let window = [Frame {
             pts,
-            data: bytes.clone(),
+            data: bytes.clone().into(),
             rows: Vec::new(),
         }];
 
@@ -306,7 +306,7 @@ fn real_speech_comes_back_as_timed_rows_and_one_transcript() {
         let produced = &out.frames[0];
         assert_eq!(produced.pts, pts, "the audio keeps its timestamp");
         assert_eq!(
-            produced.data, bytes,
+            *produced.data, bytes,
             "a one-to-one module returns the samples it was handed"
         );
         assert!(
@@ -479,7 +479,7 @@ fn a_window_of_silence_says_nothing() {
     let bytes = vec![0u8; WINDOW * 4];
     let window = [Frame {
         pts: 0,
-        data: bytes.clone(),
+        data: bytes.clone().into(),
         rows: Vec::new(),
     }];
     let out = filter
@@ -487,7 +487,7 @@ fn a_window_of_silence_says_nothing() {
         .expect("transcribing silence");
 
     assert_eq!(out.frames.len(), 1, "the silence still passes through");
-    assert_eq!(out.frames[0].data, bytes, "and passes through unchanged");
+    assert_eq!(*out.frames[0].data, bytes, "and passes through unchanged");
     assert!(
         out.frames[0].rows.is_empty(),
         "silence decodes to no rows, got {:?}",

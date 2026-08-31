@@ -1,69 +1,22 @@
 //! A network of modules in one process: the DAG the `-filter_complex` string
-//! describes, opened and driven.
+//! describes, checked and opened.
 //!
-//! Every node buffers the window its module asked for and is walked in
-//! topological order once per batch of arriving frames. One module's output
-//! frames are handed to every reader in memory - rows riding inside the frame,
-//! so a reader that acts on them gets them without a wire. The final call
-//! cascades the same way: a node's last window is made, and whatever it
-//! produced flows on through the nodes after it.
+//! Opening settles everything static - every module name bound, every label
+//! written once and read, kinds and pad counts matched, every module
+//! instantiated - and hands the scheduler one lane seed per node in
+//! topological order. The scheduler is what drives them.
 //!
 //! A chain of one module is a network of one, which is how the single-module
 //! spelling stays the same code.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 
 use anyhow::{anyhow, bail, Context, Result};
-use ffrwd_wasm_runtime::runtime::{
-    self, Described, Filter, Format, Frame, Kind, Media, Processed, Shape, StreamInfo,
-};
+use ffrwd_wasm_runtime::runtime::{self, Described, Filter, Format, Kind, Media, StreamInfo};
 
 use crate::graph::{EdgeKind, Pad, ParsedNode};
 use crate::rowfilter::{self, RowFilter};
-use crate::windows::Windows;
-
-/// What drives one node: a module, or the one node the host answers for
-/// itself.
-enum Unit {
-    // Boxed because a module instance carries a whole wasm store, and every
-    // node would otherwise be that size.
-    Module(Box<Filter>),
-    Rows(RowFilter),
-}
-
-impl Unit {
-    fn name(&self) -> &str {
-        match self {
-            Unit::Module(filter) => filter.name(),
-            Unit::Rows(_) => rowfilter::NODE,
-        }
-    }
-
-    fn shape(&self) -> Shape {
-        match self {
-            Unit::Module(filter) => filter.shape(),
-            Unit::Rows(_) => rowfilter::SHAPE,
-        }
-    }
-
-    /// Whether upstream rows may leave on this node's own output frames. The
-    /// rows node passes on the ones it kept, so they may.
-    fn forwards_rows(&self) -> bool {
-        match self {
-            Unit::Module(filter) => filter.forwards_rows(),
-            Unit::Rows(_) => true,
-        }
-    }
-
-    /// Whether this node acts on the rows arriving with its frames. Acting on
-    /// them is all the rows node does.
-    fn reads_rows(&self) -> bool {
-        match self {
-            Unit::Module(filter) => filter.reads_rows(),
-            Unit::Rows(_) => true,
-        }
-    }
-}
+use crate::scheduler::{LaneSeed, Reopen, Runner};
 
 /// Where one of a node's streams comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -74,145 +27,6 @@ pub enum Source {
     Node(usize),
 }
 
-/// One module in the network: its instance, the window it is buffering
-/// toward, and one queue per stream it reads.
-struct Node {
-    unit: Unit,
-    /// The node's own name, for a message a borrow of `unit` cannot reach.
-    name: String,
-    /// Whether a frame's incoming rows can leave this module still attached,
-    /// as the module itself declares.
-    forwards_rows: bool,
-    /// Whether the module acts on the rows arriving with its frames.
-    reads_rows: bool,
-    /// The window this node buffers toward. A module reading several streams
-    /// is window 1, stride 1, so its pads go straight to it and this is never
-    /// fed.
-    windows: Windows,
-    sources: Vec<Source>,
-    /// One buffer per pad, in pad order. A pad's frames wait here until every
-    /// other pad has one at the same timestamp.
-    queues: Vec<VecDeque<Frame>>,
-    /// Rows the modules feeding this one had no frame to put them on, for
-    /// this one's final call.
-    trailing: Vec<String>,
-}
-
-impl Node {
-    fn new(unit: Unit, sources: Vec<Source>, format: &Format) -> Node {
-        let windows = Windows::new(unit.shape(), format);
-        let queues = sources.iter().map(|_| VecDeque::new()).collect();
-        let name = unit.name().to_string();
-        let forwards_rows = unit.forwards_rows();
-        let reads_rows = unit.reads_rows();
-        Node {
-            unit,
-            name,
-            forwards_rows,
-            reads_rows,
-            windows,
-            sources,
-            queues,
-            trailing: Vec::new(),
-        }
-    }
-
-    /// Queues what each pad received, then runs everything those frames
-    /// completed.
-    fn feed(&mut self, arrived: Vec<Vec<Frame>>) -> Result<Vec<Frame>> {
-        for (queue, frames) in self.queues.iter_mut().zip(arrived) {
-            queue.extend(frames);
-        }
-        let mut out = Vec::new();
-        while self.queues.iter().all(|q| !q.is_empty()) {
-            let pads = self.take()?;
-            out.extend(self.run(pads)?);
-        }
-        Ok(out)
-    }
-
-    /// One frame off every pad, at one timestamp. The pads are read in
-    /// lockstep: every head must carry the timestamp pad 0's head carries, and
-    /// a pad that skipped it is a refusal rather than a frame quietly dropped.
-    ///
-    /// Rows ride pad 0. What arrived on any other pad is dropped here, so a
-    /// module is handed rows on its first pad and nowhere else.
-    fn take(&mut self) -> Result<Vec<Frame>> {
-        let head = self.queues[0]
-            .front()
-            .map(|f| f.pts)
-            .ok_or_else(|| anyhow!("{}: a queue emptied mid-window", self.name))?;
-        for (pad, queue) in self.queues.iter().enumerate().skip(1) {
-            let other = queue.front().map(|f| f.pts).unwrap_or(head);
-            if other != head {
-                bail!(
-                    "{}: pad 0 is at pts {head} and pad {pad} at pts {other}; a module reading \
-                     several streams reads them in lockstep, one frame per pad at one timestamp",
-                    self.name
-                );
-            }
-        }
-        let mut pads = Vec::with_capacity(self.queues.len());
-        for (pad, queue) in self.queues.iter_mut().enumerate() {
-            let mut frame = queue.pop_front().expect("every head matched pts");
-            if pad > 0 {
-                frame.rows.clear();
-            }
-            pads.push(frame);
-        }
-        Ok(pads)
-    }
-
-    /// One timestamp's pads through the module. A module reading one stream
-    /// buffers toward the window it asked for; one reading several is window
-    /// 1, stride 1, so the pads are the call.
-    fn run(&mut self, mut pads: Vec<Frame>) -> Result<Vec<Frame>> {
-        // The rows node reads one stream at window 1, stride 1, and never
-        // looks at the pixels, so the frame moves straight through rather
-        // than being buffered and copied.
-        if let Unit::Rows(rows) = &mut self.unit {
-            return Ok(pads.into_iter().map(|frame| rows.pass(frame)).collect());
-        }
-        let Unit::Module(filter) = &mut self.unit else {
-            unreachable!("the rows node was taken above")
-        };
-        if pads.len() > 1 {
-            return Ok(filter.process_window(&pads, &[], false)?.frames);
-        }
-        let frame = pads.pop().expect("a node reads at least one stream");
-        let mut out = Vec::new();
-        for window in self.windows.push(frame, &self.name)? {
-            out.extend(filter.process_window(&window, &[], false)?.frames);
-        }
-        Ok(out)
-    }
-
-    /// The final call, carrying whatever the last stride left over and
-    /// whatever rows reached this module with no frame to ride.
-    fn finish(&mut self) -> Result<Processed> {
-        for (pad, queue) in self.queues.iter().enumerate() {
-            if !queue.is_empty() {
-                bail!(
-                    "{}: pad {pad} ends with {} frame(s) that never paired with the other pads; \
-                     a module reading several streams reads them in lockstep",
-                    self.name,
-                    queue.len()
-                );
-            }
-        }
-        let tail = self.windows.tail();
-        let trailing = std::mem::take(&mut self.trailing);
-        match &mut self.unit {
-            // The same predicate judges the rows that never found a frame.
-            Unit::Rows(rows) => Ok(Processed {
-                frames: Vec::new(),
-                trailing: rows.keep(trailing),
-            }),
-            Unit::Module(filter) => filter.process_window(&tail, &trailing, true),
-        }
-    }
-}
-
 /// One module bound to a name by `-m name=path`.
 #[derive(Debug, Clone)]
 pub struct Binding {
@@ -220,22 +34,16 @@ pub struct Binding {
     pub path: String,
 }
 
-/// What the final call over the whole network produced, per node.
-pub struct Drained {
-    pub frames: Vec<Vec<Frame>>,
-    pub trailing: Vec<Vec<String>>,
-}
-
-/// The opened network: nodes in topological order, the label each one writes,
-/// and which input each descends from.
+/// The opened network: one lane seed per node in topological order, the label
+/// each one writes, and which input each descends from.
 pub struct Network {
-    nodes: Vec<Node>,
+    seeds: Vec<LaneSeed>,
+    /// Whether each node acts on the rows arriving with its frames.
+    reads_rows: Vec<bool>,
+    /// Whether upstream rows may leave on each node's own output frames.
+    forwards_rows: Vec<bool>,
     labels: HashMap<String, usize>,
     roots: Vec<usize>,
-    /// The last node to read each stream, which is the one that may take the
-    /// frames rather than copy them. A node an output is mapped to is never in
-    /// here: its frames are still wanted after the walk.
-    last_reader: HashMap<Source, usize>,
 }
 
 impl Network {
@@ -273,7 +81,9 @@ impl Network {
         check_input_kinds(parsed, formats)?;
 
         let mut schemas: HashMap<String, serde_json::Value> = HashMap::new();
-        let mut nodes = Vec::with_capacity(order.len());
+        let mut seeds = Vec::with_capacity(order.len());
+        let mut reads_rows = Vec::with_capacity(order.len());
+        let mut forwards_rows = Vec::with_capacity(order.len());
         let mut roots = Vec::with_capacity(order.len());
         let mut labels = HashMap::new();
 
@@ -290,13 +100,23 @@ impl Network {
                 .collect();
             let root = root_input(&placed, &roots);
             check_one_format(&node.module, &placed, &roots, formats)?;
+            let format = formats[root];
 
             // The rows node is the host's own: nothing is compiled, and it
             // carries whichever kind reaches it, so neither the module kind
             // nor a params schema applies.
-            let unit = if node.module == rowfilter::NODE {
+            let seed = if node.module == rowfilter::NODE {
                 check_pad_count(&node.module, 1, placed.len())?;
-                Unit::Rows(RowFilter::open(&node.options)?)
+                reads_rows.push(true);
+                forwards_rows.push(true);
+                LaneSeed {
+                    name: rowfilter::NODE.to_string(),
+                    runners: vec![Runner::Rows(RowFilter::open(&node.options)?)],
+                    shape: rowfilter::SHAPE,
+                    sources: placed,
+                    format,
+                    reopen: None,
+                }
             } else {
                 let path = paths.get(node.module.as_str()).ok_or_else(|| {
                     anyhow!(
@@ -307,7 +127,7 @@ impl Network {
                 })?;
                 let described = runtime::describe(path)
                     .with_context(|| format!("describing module '{}'", node.module))?;
-                check_module_kind(node, &described, formats[root].kind())?;
+                check_module_kind(node, &described, format.kind())?;
                 check_pad_count(&node.module, described.inputs as usize, placed.len())?;
 
                 let schema = match schemas.get(path.as_str()) {
@@ -319,44 +139,55 @@ impl Network {
                     }
                 };
                 let params = params_json(&node.module, &schema, &node.options)?;
-                let filter = Filter::open(path, &formats[root], &streams[root], &params)
+                let filter = Filter::open(path, &format, &streams[root], &params)
                     .with_context(|| format!("opening module '{}' from {path}", node.module))?;
-                Unit::Module(Box::new(filter))
+                reads_rows.push(filter.reads_rows());
+                forwards_rows.push(filter.forwards_rows());
+                let reopen = reopen_for(&filter, path, &params, &format, &streams[root]);
+                LaneSeed {
+                    name: filter.name().to_string(),
+                    shape: filter.shape(),
+                    runners: vec![Runner::Module(Box::new(filter))],
+                    sources: placed,
+                    format,
+                    reopen,
+                }
             };
 
             for label in &node.outputs {
-                labels.insert(label.clone(), nodes.len());
+                labels.insert(label.clone(), seeds.len());
             }
             roots.push(root);
-            nodes.push(Node::new(unit, placed, &formats[root]));
+            seeds.push(seed);
         }
 
-        let sunk: Vec<usize> = mapped
-            .iter()
-            .filter_map(|t| labels.get(t).copied())
-            .collect();
-        let last_reader = last_readers(&nodes, &sunk);
-
         Ok(Network {
-            nodes,
+            seeds,
+            reads_rows,
+            forwards_rows,
             labels,
             roots,
-            last_reader,
         })
     }
 
     /// A network of one module, wired from one input to one node - the shape
     /// the single-module spelling runs as.
-    pub fn single(filter: Filter, format: &Format) -> Network {
+    pub fn single(filter: Filter, format: &Format, reopen: Option<Reopen>) -> Network {
+        let reads = filter.reads_rows();
+        let forwards = filter.forwards_rows();
         Network {
-            nodes: vec![Node::new(
-                Unit::Module(Box::new(filter)),
-                vec![Source::Input(0)],
-                format,
-            )],
+            seeds: vec![LaneSeed {
+                name: filter.name().to_string(),
+                shape: filter.shape(),
+                runners: vec![Runner::Module(Box::new(filter))],
+                sources: vec![Source::Input(0)],
+                format: *format,
+                reopen,
+            }],
+            reads_rows: vec![reads],
+            forwards_rows: vec![forwards],
             labels: HashMap::new(),
             roots: vec![0],
-            last_reader: HashMap::from([(Source::Input(0), 0)]),
         }
     }
 
@@ -371,15 +202,15 @@ impl Network {
         self.roots[node]
     }
 
-    /// A node's name, for a message.
-    pub fn name(&self, node: usize) -> &str {
-        &self.nodes[node].name
+    /// The lanes this network opened, in topological order, for the scheduler.
+    pub fn into_seeds(self) -> Vec<LaneSeed> {
+        self.seeds
     }
 
     /// Whether any module of this network acts on the rows arriving with its
     /// frames.
     pub fn any_module_reads_rows(&self) -> bool {
-        self.nodes.iter().any(|node| node.reads_rows)
+        self.reads_rows.iter().any(|reads| *reads)
     }
 
     /// A module that reads rows the arriving annotations cannot reach, and the
@@ -391,33 +222,33 @@ impl Network {
     /// in topological order, so one pass settles which of them see the
     /// arriving rows.
     pub fn reader_the_rows_cannot_reach(&self) -> Option<(&str, &str)> {
-        let mut sees = vec![false; self.nodes.len()];
-        for (index, node) in self.nodes.iter().enumerate() {
-            sees[index] = node.sources.iter().any(|source| match source {
+        let mut sees = vec![false; self.seeds.len()];
+        for (index, seed) in self.seeds.iter().enumerate() {
+            sees[index] = seed.sources.iter().any(|source| match source {
                 Source::Input(_) => true,
-                Source::Node(upstream) => sees[*upstream] && self.nodes[*upstream].forwards_rows,
+                Source::Node(upstream) => sees[*upstream] && self.forwards_rows[*upstream],
             });
         }
         let reader =
-            (0..self.nodes.len()).find(|index| self.nodes[*index].reads_rows && !sees[*index])?;
+            (0..self.seeds.len()).find(|index| self.reads_rows[*index] && !sees[*index])?;
         let blocker = self.stops_the_rows(reader, &sees)?;
         Some((
-            self.nodes[reader].name.as_str(),
-            self.nodes[blocker].name.as_str(),
+            self.seeds[reader].name.as_str(),
+            self.seeds[blocker].name.as_str(),
         ))
     }
 
     /// The nearest module upstream of `reader` that sees the arriving rows and
     /// does not pass them on. A reader the rows cannot reach always has one.
     fn stops_the_rows(&self, reader: usize, sees: &[bool]) -> Option<usize> {
-        let mut walked = vec![false; self.nodes.len()];
+        let mut walked = vec![false; self.seeds.len()];
         let mut stack = vec![reader];
         while let Some(index) = stack.pop() {
-            for source in &self.nodes[index].sources {
+            for source in &self.seeds[index].sources {
                 let Source::Node(upstream) = source else {
                     continue;
                 };
-                if sees[*upstream] && !self.nodes[*upstream].forwards_rows {
+                if sees[*upstream] && !self.forwards_rows[*upstream] {
                     return Some(*upstream);
                 }
                 if !walked[*upstream] {
@@ -431,116 +262,32 @@ impl Network {
 
     /// Every module in the network, named.
     pub fn modules(&self) -> String {
-        self.nodes
+        self.seeds
             .iter()
-            .map(|node| node.name.as_str())
+            .map(|seed| seed.name.as_str())
             .collect::<Vec<_>>()
             .join(", ")
     }
-
-    /// Feeds one batch - `arriving[i]` the frames read off input i - through
-    /// the whole network, returning what each node produced.
-    pub fn advance(&mut self, arriving: Vec<Vec<Frame>>) -> Result<Vec<Vec<Frame>>> {
-        let produced = vec![Vec::new(); self.nodes.len()];
-        self.propagate(arriving, produced, 0)
-    }
-
-    /// Every node's final call in turn, whatever it produces flowing on
-    /// through the nodes after it. `arriving_trailing[i]` is the rows that
-    /// came in on input i with no frame to ride; they reach every module
-    /// reading that input, on its final call, and one module's trailing rows
-    /// become the final call's for every module reading it.
-    pub fn drain(&mut self, arriving_trailing: &[Vec<String>]) -> Result<Drained> {
-        for node in self.nodes.iter_mut() {
-            for source in &node.sources {
-                if let Source::Input(input) = source {
-                    if let Some(rows) = arriving_trailing.get(*input) {
-                        node.trailing.extend(rows.iter().cloned());
-                    }
-                }
-            }
-        }
-
-        let mut frames: Vec<Vec<Frame>> = vec![Vec::new(); self.nodes.len()];
-        let mut trailing: Vec<Vec<String>> = vec![Vec::new(); self.nodes.len()];
-        for index in 0..self.nodes.len() {
-            let finished = self.nodes[index].finish();
-            let processed = finished
-                .with_context(|| format!("{}: the final window", self.nodes[index].name))?;
-
-            for later in index + 1..self.nodes.len() {
-                if self.nodes[later].sources.contains(&Source::Node(index)) {
-                    let rows = processed.trailing.clone();
-                    self.nodes[later].trailing.extend(rows);
-                }
-            }
-            trailing[index] = processed.trailing;
-
-            let mut produced = vec![Vec::new(); self.nodes.len()];
-            produced[index] = processed.frames;
-            let pass = self.propagate(Vec::new(), produced, index + 1)?;
-            for (accumulated, frames) in frames.iter_mut().zip(pass) {
-                accumulated.extend(frames);
-            }
-        }
-        Ok(Drained { frames, trailing })
-    }
-
-    /// One walk over the nodes from `start` on. `produced[k]` is what node k
-    /// has already put out in this pass; a node before `start` has been
-    /// drained already and hands on nothing.
-    ///
-    /// A stream's last reader takes its frames; every reader before it copies
-    /// them, which is what handing one module's output to two readers costs.
-    fn propagate(
-        &mut self,
-        mut arriving: Vec<Vec<Frame>>,
-        mut produced: Vec<Vec<Frame>>,
-        start: usize,
-    ) -> Result<Vec<Vec<Frame>>> {
-        for index in start..self.nodes.len() {
-            let sources = self.nodes[index].sources.clone();
-            let mut arrived: Vec<Vec<Frame>> = Vec::with_capacity(sources.len());
-            for (pad, source) in sources.iter().enumerate() {
-                // One source may feed several of this node's own pads - the
-                // shape a module reading one stream twice takes - so only the
-                // last pad reading it may take rather than copy.
-                let last = self.last_reader.get(source) == Some(&index)
-                    && !sources[pad + 1..].contains(source);
-                arrived.push(match *source {
-                    Source::Input(input) => match arriving.get_mut(input) {
-                        Some(frames) if last => std::mem::take(frames),
-                        Some(frames) => frames.clone(),
-                        None => Vec::new(),
-                    },
-                    Source::Node(node) if last => std::mem::take(&mut produced[node]),
-                    Source::Node(node) => produced[node].clone(),
-                });
-            }
-            // No context here: everything `feed` can fail on already names the
-            // module it failed in.
-            let out = self.nodes[index].feed(arrived)?;
-            produced[index].extend(out);
-        }
-        Ok(produced)
-    }
 }
 
-/// The last node reading each stream, in topological order. A node whose
-/// frames an output is mapped to is left out: the walk must not take those.
-fn last_readers(nodes: &[Node], sunk: &[usize]) -> HashMap<Source, usize> {
-    let mut last = HashMap::new();
-    for (index, node) in nodes.iter().enumerate() {
-        for source in &node.sources {
-            if let Source::Node(upstream) = source {
-                if sunk.contains(upstream) {
-                    continue;
-                }
-            }
-            last.insert(*source, index);
-        }
+/// How a pure video module's lane grows more instances: reopened from the
+/// same path with the same parameters. Everything else keeps its one.
+pub fn reopen_for(
+    filter: &Filter,
+    path: &str,
+    params: &str,
+    format: &Format,
+    info: &StreamInfo,
+) -> Option<Reopen> {
+    if !filter.shape().pure || format.video().is_none() {
+        return None;
     }
-    last
+    Some(Reopen {
+        path: path.to_string(),
+        params: params.to_string(),
+        format: *format,
+        info: info.clone(),
+    })
 }
 
 /// The path each bound name loads, refusing a name bound twice.

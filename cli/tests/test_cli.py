@@ -1476,7 +1476,7 @@ def test_show_refuses_a_plan_that_writes_no_video(
     assert "NOTHING_TO_SHOW" in captured.err
 
 
-# --- --jobs, the parallel hosting count -------------------------------------
+# --- --jobs, the worker-thread cap ------------------------------------------
 
 
 @pytest.mark.parametrize("command", ["compile", "run"])
@@ -1543,12 +1543,14 @@ def test_the_default_leaves_the_sidecar_argv_as_it_was(
     assert "-jobs" not in _sidecar_argv(_ready_to_run[0])
 
 
-def test_an_impure_module_is_named_and_left_serial(
+def test_jobs_reaches_the_sidecar_of_an_impure_module(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     _ready_to_run: list[dict[str, object]],
     _installed_sidecar: None,
 ) -> None:
+    """The cap rides through; the sidecar's own scheduler is what keeps an
+    impure module's lane serial."""
     monkeypatch.setattr(
         cli,
         "compile_all",
@@ -1558,10 +1560,25 @@ def test_an_impure_module_is_named_and_left_serial(
     )
 
     assert cli.main(["run", SINKED_QUERY, "--jobs", "4"]) == 0
-    assert "-jobs" not in _sidecar_argv(_ready_to_run[0])
-    err = capsys.readouterr().err
-    assert "warning: --jobs 4 does not reach 'm0.wasm'" in err
-    assert "carries state between calls" in err
+    argv = _sidecar_argv(_ready_to_run[0])
+    assert argv[argv.index("-jobs") + 1] == "4"
+    assert "warning:" not in capsys.readouterr().err
+
+
+def test_jobs_one_is_passed_through_as_the_serial_escape_hatch(
+    monkeypatch: pytest.MonkeyPatch,
+    _ready_to_run: list[dict[str, object]],
+    _installed_sidecar: None,
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        "compile_all",
+        lambda text, **kw: Compiled([_sinked_graph("sink.mkv")], plan=_module_plan()),
+    )
+
+    assert cli.main(["run", SINKED_QUERY, "--jobs", "1"]) == 0
+    argv = _sidecar_argv(_ready_to_run[0])
+    assert argv[argv.index("-jobs") + 1] == "1"
 
 
 def _network_plan() -> ProcessPlan:
@@ -1586,13 +1603,14 @@ def _network_plan() -> ProcessPlan:
     )
 
 
-def test_a_network_of_modules_says_why_it_stays_serial(
+def test_jobs_reaches_the_sidecar_of_a_network(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     _ready_to_run: list[dict[str, object]],
     _installed_sidecar: None,
 ) -> None:
-    """Every module is pure; the wiring between them is what keeps one worker."""
+    """The cap reaches a region of several modules like any other; each
+    node's lane decides its own admission inside the sidecar."""
     monkeypatch.setattr(
         cli,
         "compile_all",
@@ -1600,28 +1618,8 @@ def test_a_network_of_modules_says_why_it_stays_serial(
     )
 
     assert cli.main(["run", SINKED_QUERY, "--jobs", "4"]) == 0
-    assert "-jobs" not in _sidecar_argv(_ready_to_run[0])
-    err = capsys.readouterr().err
-    assert "warning: --jobs 4 does not reach" in err
-    assert "hand frames on in order" in err
-
-
-def test_the_default_says_nothing_about_an_impure_module(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    _ready_to_run: list[dict[str, object]],
-    _installed_sidecar: None,
-) -> None:
-    """Nobody asked for parallel hosting, so nobody is owed the reason."""
-    monkeypatch.setattr(
-        cli,
-        "compile_all",
-        lambda text, **kw: Compiled(
-            [_sinked_graph("sink.mkv")], plan=_module_plan(pure=False)
-        ),
-    )
-
-    assert cli.main(["run", SINKED_QUERY]) == 0
+    argv = _sidecar_argv(_ready_to_run[0])
+    assert argv[argv.index("-jobs") + 1] == "4"
     assert "warning:" not in capsys.readouterr().err
 
 

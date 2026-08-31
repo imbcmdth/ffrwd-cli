@@ -64,14 +64,14 @@ fn ensure_modules_built() {
 fn one_frame(filter: &mut Filter, pts: i64, frame: &[u8]) -> Vec<u8> {
     let window = [Frame {
         pts,
-        data: frame.to_vec(),
+        data: frame.to_vec().into(),
         rows: Vec::new(),
     }];
     let out = filter
         .process_window(&window, &[], false)
         .unwrap_or_else(|e| panic!("processing the frame at pts {pts}: {e}"));
     assert_eq!(out.frames.len(), 1, "a one-to-one module returns one frame");
-    out.frames[0].data.clone()
+    out.frames[0].data.as_ref().clone()
 }
 
 #[test]

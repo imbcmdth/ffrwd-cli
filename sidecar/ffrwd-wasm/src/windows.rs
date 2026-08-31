@@ -13,6 +13,8 @@
 //! window whose span covers that timestamp is cut, and ride that window.
 //! Whatever is still held when the stream ends rides the final call.
 
+use std::sync::Arc;
+
 use anyhow::{bail, Result};
 use ffrwd_wasm_runtime::runtime::{AudioFormat, Format, Frame, Media, Shape, TimeBase};
 
@@ -139,7 +141,7 @@ impl SampleWindows {
     /// One window off the front, advancing by the stride.
     fn cut(&mut self, module: &str) -> Result<Frame> {
         let pts = self.pts.expect("a window is only cut once samples arrived");
-        let data = self.buffered[..self.window * self.sample_len].to_vec();
+        let data = Arc::new(self.buffered[..self.window * self.sample_len].to_vec());
         let ends = pts + self.ticks(self.window, module)?;
         let rows = self.claim(pts, ends);
         self.buffered.drain(..self.stride * self.sample_len);
@@ -160,7 +162,7 @@ impl SampleWindows {
         }
         vec![Frame {
             pts: self.pts.unwrap_or(0),
-            data,
+            data: Arc::new(data),
             rows,
         }]
     }
@@ -256,7 +258,11 @@ mod tests {
         for offset in 0..samples {
             data.extend_from_slice(&((pts as usize + offset) as f32).to_le_bytes());
         }
-        Frame { pts, data, rows }
+        Frame {
+            pts,
+            data: data.into(),
+            rows,
+        }
     }
 
     /// The sample values a window carries.
@@ -383,7 +389,7 @@ mod tests {
             .push(
                 Frame {
                     pts: 0,
-                    data: vec![0u8; 7],
+                    data: vec![0u8; 7].into(),
                     rows: Vec::new(),
                 },
                 "again",
@@ -399,7 +405,7 @@ mod tests {
         let mut windows = Windows::new(shape(2, 2), &video_format());
         let frame = |pts: i64| Frame {
             pts,
-            data: vec![0u8; 16],
+            data: vec![0u8; 16].into(),
             rows: Vec::new(),
         };
         assert!(windows

@@ -4233,7 +4233,7 @@ def test_a_packet_sink_stays_out_of_select_position() -> None:
     _packet_rejects(sql, "not a COPY destination")
 
 
-# -- -jobs, the parallel hosting count -------------------------------------
+# -- -jobs, the worker-thread cap ------------------------------------------
 
 
 def _impure() -> Described:
@@ -4242,13 +4242,20 @@ def _impure() -> Described:
 
 
 def test_the_default_leaves_the_sidecar_argv_as_it_was() -> None:
-    """One worker is the sidecar's own default, so nothing is written for it."""
+    """The sidecar sizes its own pool, so no cap is written for the default."""
     plan = _compiled(QUERY).plan
     assert plan is not None
     assert wasm.shown_argv(plan.sidecars[0]) == [
         "ffrwd-wasm", "-f", "nut", "-i", "pipe:0", "-m", MODULE, "-f", "nut", "pipe:1",
     ]
-    assert "-jobs" not in wasm.shown_argv(plan.sidecars[0], jobs=1)
+    assert "-jobs" not in wasm.shown_argv(plan.sidecars[0], jobs=None)
+
+
+def test_jobs_one_is_written_as_the_serial_escape_hatch() -> None:
+    plan = _compiled(QUERY).plan
+    assert plan is not None
+    argv = wasm.shown_argv(plan.sidecars[0], jobs=1)
+    assert argv[argv.index("-jobs") + 1] == "1"
 
 
 def test_a_pure_module_carries_the_jobs_it_was_asked_for() -> None:
@@ -4260,32 +4267,39 @@ def test_a_pure_module_carries_the_jobs_it_was_asked_for() -> None:
     ]
 
 
-def test_an_impure_module_is_hosted_by_one_instance_however_many_were_asked() -> None:
+def test_an_impure_module_still_carries_the_cap() -> None:
+    """The sidecar's scheduler is what keeps an impure module's lane serial;
+    the cap rides through untouched."""
     plan = _compiled(QUERY, _impure()).plan
     assert plan is not None
     assert plan.sidecars[0].impure == (MODULE,)
-    assert "-jobs" not in wasm.shown_argv(plan.sidecars[0], jobs=4)
+    argv = wasm.shown_argv(plan.sidecars[0], jobs=4)
+    assert argv[argv.index("-jobs") + 1] == "4"
 
 
-def test_a_region_of_two_modules_takes_no_jobs() -> None:
-    """Its nodes hand frames to each other in order, pure or not."""
+def test_a_region_of_two_modules_carries_the_cap() -> None:
+    """Each node is its own lane inside the sidecar, so the cap applies."""
     plan = _annotated_plan(_pair()).plan
     assert plan is not None
-    assert "-jobs" not in wasm.shown_argv(plan.sidecars[0], jobs=4)
+    argv = wasm.shown_argv(plan.sidecars[0], jobs=4)
+    assert argv[argv.index("-jobs") + 1] == "4"
 
 
-def test_one_impure_module_of_a_region_names_itself_and_serializes_it() -> None:
+def test_one_impure_module_of_a_region_still_names_itself() -> None:
     plan = _annotated_plan(_pair(), blurrer=replace(_consuming(), pure=False)).plan
     assert plan is not None
     assert plan.sidecars[0].impure == (BLURRER,)
-    assert "-jobs" not in wasm.shown_argv(plan.sidecars[0], jobs=4)
+    argv = wasm.shown_argv(plan.sidecars[0], jobs=4)
+    assert argv[argv.index("-jobs") + 1] == "4"
 
 
-def test_a_packet_sink_takes_no_jobs() -> None:
-    """Packets reach it in decode order, so one instance reads them."""
+def test_a_packet_sink_carries_the_cap() -> None:
+    """Its packets still reach one instance in decode order; the flag is a
+    cap on the pool, not a promise of parallel decode."""
     plan = compile_all(
         PACKET_QUERY, describe=lambda path: _packet_described()
     ).plan
     assert plan is not None
     assert plan.sidecars[0].packet_sink
-    assert "-jobs" not in wasm.shown_argv(plan.sidecars[0], jobs=4)
+    argv = wasm.shown_argv(plan.sidecars[0], jobs=4)
+    assert argv[argv.index("-jobs") + 1] == "4"

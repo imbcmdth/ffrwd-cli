@@ -78,7 +78,7 @@ fn stream() -> StreamInfo {
 fn frame(pts: i64, fill: u8, rows: Vec<String>) -> Frame {
     Frame {
         pts,
-        data: vec![fill; FRAME_LEN],
+        data: vec![fill; FRAME_LEN].into(),
         rows,
     }
 }
@@ -100,7 +100,7 @@ fn a_call_carries_one_frame_per_pad_in_pad_order() {
 
     assert_eq!(out.frames.len(), 1, "one frame back per call");
     assert_eq!(
-        out.frames[0].data,
+        *out.frames[0].data,
         vec![11u8; FRAME_LEN],
         "pad 0 is the one the module kept, so pad order is what it says it is"
     );

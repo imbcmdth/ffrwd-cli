@@ -14,14 +14,14 @@
 mod graph;
 mod network;
 mod rowfilter;
+mod scheduler;
 mod subtitles;
 mod windows;
 
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
-use std::thread;
+use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
 use ffrwd_wasm::nut;
@@ -32,7 +32,6 @@ use ffrwd_wasm_runtime::runtime::{
 use serde::{Deserialize, Serialize};
 
 use network::{Binding, Network};
-use windows::Windows;
 
 const EDGE_FORMAT: &str = "nut";
 const ROWS_FORMAT: &str = "ndjson";
@@ -250,7 +249,10 @@ struct Args {
     stream_info: Option<StreamInfo>,
     outputs: Vec<OutputSpec>,
     annotations: Annotations,
-    jobs: usize,
+    /// The `-jobs` cap on worker threads, if one was given. The pool is the
+    /// machine's effective core count either way; the cap only lowers it,
+    /// and `-jobs 1` is the serial escape hatch.
+    jobs: Option<usize>,
 }
 
 enum InputPath {
@@ -419,7 +421,7 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
     let mut outputs: Vec<OutputSpec> = Vec::new();
     let mut stream_info_path: Option<String> = None;
     let mut annotations = Annotations::default();
-    let mut jobs: usize = 1;
+    let mut jobs: Option<usize> = None;
 
     while let Some(arg) = it.next() {
         let mut next = |name: &str| -> Result<String> {
@@ -477,7 +479,7 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
                 if parsed < 1 {
                     bail!("-jobs must be >= 1, got {raw}");
                 }
-                jobs = parsed;
+                jobs = Some(parsed);
             }
             "-y" => {}
             // "-" alone is the stdin/stdout shorthand, not a flag.
@@ -523,7 +525,7 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
         );
     }
 
-    let modules = build_modules(modules, params, wiring, &inputs, &outputs, jobs)?;
+    let modules = build_modules(modules, params, wiring, &inputs, &outputs)?;
 
     let stream_info = match stream_info_path {
         Some(path) => Some(load_stream_info(&path)?),
@@ -550,7 +552,6 @@ fn build_modules(
     wiring: Option<String>,
     inputs: &[InputPath],
     outputs: &[OutputSpec],
-    jobs: usize,
 ) -> Result<Modules> {
     // A network may be built entirely of nodes the host answers for, and
     // binds nothing; the wiring is then what says there is anything to run.
@@ -584,9 +585,6 @@ fn build_modules(
             "-params names the parameters of one module; a network writes each node's \
              parameters into -filter_complex"
         );
-    }
-    if jobs > 1 {
-        bail!("-jobs {jobs}: a module network runs as one job, since its nodes hand frames to each other in order");
     }
     if let Some(output) = outputs.iter().find(|o| o.target.is_none()) {
         bail!(
@@ -886,288 +884,69 @@ fn open_sinks(args: &Args, nodes: &[usize], streams: &[nut::Stream]) -> Result<V
         .collect()
 }
 
-/// Hands each sink whatever its own node produced in this pass.
-fn write_sinks(sinks: &mut [Sink], names: &[String], produced: &[Vec<Frame>]) -> Result<()> {
-    for sink in sinks.iter_mut() {
-        sink.write(&names[sink.node], &produced[sink.node])?;
-    }
-    Ok(())
-}
-
-/// Hands each sink the trailing rows its own node ended with.
-fn write_sink_trailing(sinks: &mut [Sink], trailing: &[Vec<String>]) -> Result<()> {
-    for sink in sinks.iter_mut() {
-        sink.write_trailing(&trailing[sink.node])?;
-    }
-    Ok(())
-}
-
-/// Reads every input a frame at a time, feeds the network, and writes what
-/// each output's node produced. An input that has ended is left alone; the
-/// loop stops when they all have.
-fn run_network(
-    mut net: Network,
+/// Reads every input a frame at a time into the scheduler, then waits for
+/// every lane to drain. An input that has ended hands over its trailing rows
+/// and is left alone; the workers do everything else.
+fn run_lanes(
+    net: Network,
     mut readers: Vec<Input>,
     formats: &[Format],
-    mut sinks: Vec<Sink>,
-    names: Vec<String>,
+    sinks: Vec<Sink>,
+    jobs: Option<usize>,
 ) -> Result<()> {
-    let mut buf: Vec<u8> = Vec::new();
-    let mut open = vec![true; readers.len()];
-    let mut index = vec![0u64; readers.len()];
+    let workers = scheduler::worker_count(jobs);
+    let sched = scheduler::Scheduler::start(net.into_seeds(), sinks, readers.len(), workers);
 
-    loop {
-        let mut arriving: Vec<Vec<Frame>> = (0..readers.len()).map(|_| Vec::new()).collect();
-        let mut any = false;
-        for (input, reader) in readers.iter_mut().enumerate() {
-            if !open[input] {
-                continue;
-            }
-            let read = reader
-                .read_frame(&mut buf)
-                .with_context(|| format!("reading frame {} of input {input}", index[input]))?;
-            match read {
-                Some(pts) => {
-                    check_frame(&formats[input], &buf, index[input])?;
-                    arriving[input].push(Frame {
-                        pts,
-                        data: std::mem::take(&mut buf),
-                        rows: reader.take_rows(pts),
-                    });
-                    index[input] += 1;
-                    any = true;
-                }
-                None => open[input] = false,
-            }
-        }
-        if !any {
-            break;
-        }
-        let produced = net.advance(arriving)?;
-        write_sinks(&mut sinks, &names, &produced)?;
-    }
-
-    // The trailing record sits past the last frame, so it is in hand only now
-    // that every input has been read to its end.
-    let arriving_trailing: Vec<Vec<String>> =
-        readers.iter_mut().map(|r| r.take_trailing()).collect();
-    let drained = net.drain(&arriving_trailing)?;
-    write_sinks(&mut sinks, &names, &drained.frames)?;
-    write_sink_trailing(&mut sinks, &drained.trailing)?;
-    for sink in sinks.iter_mut() {
-        sink.finish()?;
-    }
-    Ok(())
-}
-
-/// One window on its way to a worker. `last` marks the final one, which
-/// carries the tail the strides left over.
-struct Job {
-    index: u64,
-    frames: Vec<Frame>,
-    /// Rows that arrived with no frame to ride, which only the final window
-    /// carries.
-    trailing: Vec<String>,
-    last: bool,
-}
-
-/// One window's output, on its way back to the writer.
-struct Done {
-    index: u64,
-    frames: Vec<Frame>,
-    trailing: Vec<String>,
-}
-
-/// `-jobs` > 1, which only the single-module spelling offers: one instance per
-/// worker, windows dealt round-robin and reordered on the way out.
-fn run_parallel(
-    args: &Args,
-    module: &str,
-    params: &str,
-    format: &Format,
-    info: &StreamInfo,
-    input: Input,
-) -> Result<()> {
-    let jobs = args.jobs;
-    let stream = input.stream().clone();
-
-    // Frame-parallel hosting corrupts output unless a call depends only on
-    // the frames it was handed; check once, on a throwaway instance, before
-    // any worker starts.
-    let (shape, name) = {
-        let probe = open_filter(module, params, format, info)?;
-        check_reads_rows(args, &probe)?;
-        if !probe.shape().pure {
-            bail!(
-                "{}: not pure with these parameters, -jobs {jobs} would corrupt output",
-                probe.name()
-            );
-        }
-        (probe.shape(), probe.name().to_string())
-    };
-
-    // Each worker owns one Filter instance (its own wasmtime Store) and one
-    // input queue; a shared bounded queue carries results back for
-    // reordering. Bounded channels give backpressure so a fast reader can't
-    // outrun a slow filter and blow up memory.
-    let (out_tx, out_rx): (SyncSender<Result<Done>>, Receiver<Result<Done>>) =
-        sync_channel(jobs * 4);
-
-    let mut worker_txs = Vec::with_capacity(jobs);
-    let mut worker_handles = Vec::with_capacity(jobs);
-
-    for worker_id in 0..jobs {
-        let (in_tx, in_rx): (SyncSender<Job>, Receiver<Job>) = sync_channel(4);
-        worker_txs.push(in_tx);
-
-        let module = module.to_string();
-        let params = params.to_string();
-        let format = *format;
-        let stream_info = info.clone();
-        let out_tx = out_tx.clone();
-
-        let handle = thread::spawn(move || -> Result<()> {
-            let mut filter = Filter::open(&module, &format, &stream_info, &params)
-                .with_context(|| format!("worker {worker_id}: opening module {module}"))?;
-            for job in in_rx {
-                let result = filter
-                    .process_window(&job.frames, &job.trailing, job.last)
-                    .map(|processed| Done {
-                        index: job.index,
-                        frames: processed.frames,
-                        trailing: processed.trailing,
-                    })
-                    .with_context(|| format!("{}: processing window {}", filter.name(), job.index));
-                if out_tx.send(result).is_err() {
-                    break;
-                }
-            }
-            Ok(())
-        });
-        worker_handles.push(handle);
-    }
-    drop(out_tx);
-
-    // Reader/dispatcher runs on a separate thread so filtering and writing
-    // overlap with reading the input. It cuts the windows; a worker only ever
-    // sees one, which is why a pure module may be spread across instances.
-    let reader_module = module.to_string();
-    let reader_name = name.clone();
-    let reader_format = *format;
-    // Moves the only copy of the per-worker senders into the reader thread.
-    // When the reader finishes (EOF or error) these drop, which is what
-    // lets each worker's `for job in in_rx` loop end.
-    let dispatch_txs = worker_txs;
-    let reader_handle: thread::JoinHandle<Result<()>> = thread::spawn(move || {
-        let mut input = input;
-        let mut windows = Windows::new(shape, &reader_format);
-        let mut frame_index: u64 = 0;
-        let mut window_index: u64 = 0;
+    let mut feed = || -> Result<bool> {
         let mut buf: Vec<u8> = Vec::new();
+        let mut open = vec![true; readers.len()];
+        let mut index = vec![0u64; readers.len()];
         loop {
-            let Some(pts) = input
-                .read_frame(&mut buf)
-                .with_context(|| format!("reading frame {frame_index} for {reader_module}"))?
-            else {
-                break;
-            };
-            check_frame(&reader_format, &buf, frame_index)?;
-            let frame = Frame {
-                pts,
-                data: std::mem::take(&mut buf),
-                rows: input.take_rows(pts),
-            };
-            frame_index += 1;
-            for window in windows.push(frame, &reader_name)? {
-                let job = Job {
-                    index: window_index,
-                    frames: window,
-                    trailing: Vec::new(),
-                    last: false,
-                };
-                window_index += 1;
-                if dispatch_txs[(job.index as usize) % dispatch_txs.len()]
-                    .send(job)
-                    .is_err()
-                {
-                    return Ok(());
+            let mut any = false;
+            for (input, reader) in readers.iter_mut().enumerate() {
+                if !open[input] {
+                    continue;
+                }
+                let read = reader
+                    .read_frame(&mut buf)
+                    .with_context(|| format!("reading frame {} of input {input}", index[input]))?;
+                match read {
+                    Some(pts) => {
+                        check_frame(&formats[input], &buf, index[input])?;
+                        let frame = Frame {
+                            pts,
+                            data: Arc::new(std::mem::take(&mut buf)),
+                            rows: reader.take_rows(pts),
+                        };
+                        index[input] += 1;
+                        any = true;
+                        if !sched.push_input(input, frame) {
+                            return Ok(false);
+                        }
+                    }
+                    None => {
+                        open[input] = false;
+                        // The trailing record sits past the last frame, so it
+                        // is in hand exactly now.
+                        let trailing = reader.take_trailing();
+                        if !sched.input_eof(input, &trailing) {
+                            return Ok(false);
+                        }
+                    }
                 }
             }
-        }
-        // The final call, carrying whatever the strides left over. It reaches
-        // one instance, which is what "exactly once" means for a module split
-        // across workers.
-        let job = Job {
-            index: window_index,
-            frames: windows.tail(),
-            trailing: input.take_trailing(),
-            last: true,
-        };
-        let _ = dispatch_txs[(job.index as usize) % dispatch_txs.len()].send(job);
-        Ok(())
-    });
-
-    // Writer/reorder loop runs on the main thread: buffer out-of-order
-    // results, flush in strict window order. Each frame's rows travel with it
-    // through `pending` and are written at the same flush point, so rows from
-    // window i land before rows from window i+1.
-    let nodes = vec![0usize; args.outputs.len()];
-    let streams = vec![stream; args.outputs.len()];
-    let mut sinks = open_sinks(args, &nodes, &streams)?;
-    let names = vec![name];
-    let mut pending: HashMap<u64, Done> = HashMap::new();
-    let mut next_index: u64 = 0;
-    let mut worker_err: Option<anyhow::Error> = None;
-
-    for result in out_rx {
-        match result {
-            Ok(done) => {
-                pending.insert(done.index, done);
-            }
-            Err(e) => {
-                if worker_err.is_none() {
-                    worker_err = Some(e);
-                }
-                continue;
+            if !any {
+                return Ok(true);
             }
         }
-        while let Some(done) = pending.remove(&next_index) {
-            write_sinks(&mut sinks, &names, &[done.frames])?;
-            write_sink_trailing(&mut sinks, &[done.trailing])?;
-            next_index += 1;
-        }
+    };
+    match feed() {
+        Ok(_) => sched.finish(),
+        Err(e) => sched.abort(e),
     }
-    for sink in sinks.iter_mut() {
-        sink.finish()?;
-    }
-
-    let reader_result = reader_handle
-        .join()
-        .map_err(|_| anyhow!("reader thread panicked"))?;
-    for handle in worker_handles {
-        handle
-            .join()
-            .map_err(|_| anyhow!("worker thread panicked"))??;
-    }
-
-    if let Some(e) = worker_err {
-        return Err(e);
-    }
-    reader_result?;
-
-    if !pending.is_empty() {
-        bail!(
-            "{} window(s) never reached in-order output (highest missing index {})",
-            pending.len(),
-            next_index
-        );
-    }
-    Ok(())
 }
 
-/// Opens the module once. Callers that need `-jobs` > 1 use this only to
-/// probe the module's shape before spinning up workers; each worker then
-/// opens its own instance, since a `Filter` is single-threaded by contract.
+/// Opens the module once for the stream it will read.
 fn open_filter(module: &str, params: &str, format: &Format, info: &StreamInfo) -> Result<Filter> {
     Filter::open(module, format, info, params).with_context(|| format!("opening module {module}"))
 }
@@ -1232,18 +1011,14 @@ fn run(args: &Args) -> Result<()> {
 
     match &args.modules {
         Modules::Single { path, params } => {
-            if args.jobs > 1 {
-                let input = readers.pop().expect("one input was required");
-                return run_parallel(args, path, params, &formats[0], &infos[0], input);
-            }
             let filter = open_filter(path, params, &formats[0], &infos[0])?;
             check_reads_rows(args, &filter)?;
-            let names = vec![filter.name().to_string()];
-            let net = Network::single(filter, &formats[0]);
+            let reopen = network::reopen_for(&filter, path, params, &formats[0], &infos[0]);
+            let net = Network::single(filter, &formats[0], reopen);
             let nodes = vec![0usize; args.outputs.len()];
             let sink_streams = vec![streams[0].clone(); args.outputs.len()];
             let sinks = open_sinks(args, &nodes, &sink_streams)?;
-            run_network(net, readers, &formats, sinks, names)
+            run_lanes(net, readers, &formats, sinks, args.jobs)
         }
         Modules::Network { bindings, wiring } => {
             let parsed = graph::parse_network(wiring)?;
@@ -1268,11 +1043,8 @@ fn run(args: &Args) -> Result<()> {
                 sink_streams.push(streams[net.root(node)].clone());
                 nodes.push(node);
             }
-            let names = (0..parsed.len())
-                .map(|node| net.name(node).to_string())
-                .collect();
             let sinks = open_sinks(args, &nodes, &sink_streams)?;
-            run_network(net, readers, &formats, sinks, names)
+            run_lanes(net, readers, &formats, sinks, args.jobs)
         }
     }
 }
@@ -1281,12 +1053,8 @@ fn run(args: &Args) -> Result<()> {
 /// in decode order, rows to the row outputs. No frames leave, so the only
 /// outputs are rows and null.
 fn run_packet_sink(args: &Args, module: &str, params: &str, mut input: Input) -> Result<()> {
-    if args.jobs > 1 {
-        bail!(
-            "-jobs {}: a packet sink runs as one instance, since packets reach it in decode order",
-            args.jobs
-        );
-    }
+    // A packet sink is an exclusive lane by nature: packets reach it in
+    // decode order, so one instance reads them and `-jobs` caps nothing.
     if args.annotations.input {
         bail!(
             "a packet sink reads encoded packets and no rows arrive with them, so -annotations \

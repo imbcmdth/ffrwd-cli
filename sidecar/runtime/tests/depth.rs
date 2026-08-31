@@ -195,7 +195,7 @@ fn a_real_frame_comes_back_as_a_depth_map_with_range_in_it() {
 
     let frame = Frame {
         pts: 0,
-        data: a_scene(),
+        data: a_scene().into(),
         rows: Vec::new(),
     };
     let started = Instant::now();
@@ -249,14 +249,14 @@ fn the_map_moves_when_the_scene_does() {
 
     let scene = Frame {
         pts: 0,
-        data: a_scene(),
+        data: a_scene().into(),
         rows: Vec::new(),
     };
     // The same geometry with nothing in it: one flat wall, which cannot read
     // as the same depth map as a disc in front of a gradient.
     let flat = Frame {
         pts: 1,
-        data: vec![128u8; (WIDTH * HEIGHT * 4) as usize],
+        data: vec![128u8; (WIDTH * HEIGHT * 4) as usize].into(),
         rows: Vec::new(),
     };
 

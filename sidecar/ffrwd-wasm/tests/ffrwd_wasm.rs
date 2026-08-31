@@ -1274,21 +1274,20 @@ fn the_final_call_carries_whatever_the_stride_left_over() {
 }
 
 #[test]
-fn jobs_are_refused_for_a_module_that_is_not_pure() {
-    let frames: Vec<Vec<u8>> = (0..2u8).map(synthetic_frame).collect();
-    let run = run_filter(
-        &module_path("double"),
-        &["-jobs", "2"],
-        &nut_stream(&frames),
-    );
-    assert!(
-        !run.success(),
-        "double carries a frame between calls, so -jobs would corrupt its output"
-    );
-    assert!(
-        run.stderr.contains("double") && run.stderr.contains("not pure"),
-        "expected the refusal to name the module, got:\n{}",
-        run.stderr
+fn an_impure_module_runs_under_jobs_and_matches_serial() {
+    // double carries a frame between calls, so its lane admits one task at a
+    // time whatever -jobs says; the flag caps the pool and refuses nothing.
+    let frames: Vec<Vec<u8>> = (0..6u8).map(synthetic_frame).collect();
+    let wire = nut_stream(&frames);
+
+    let baseline = run_filter(&module_path("double"), &["-jobs", "1"], &wire);
+    assert_run_ok(&baseline, "double jobs=1");
+
+    let run = run_filter(&module_path("double"), &["-jobs", "2"], &wire);
+    assert_run_ok(&run, "double jobs=2");
+    assert_eq!(
+        run.stdout, baseline.stdout,
+        "an impure module's output must be byte-identical at any -jobs"
     );
 }
 
@@ -1553,20 +1552,114 @@ fn a_map_naming_a_label_the_network_does_not_write_is_refused() {
 }
 
 #[test]
-fn jobs_are_refused_for_a_network() {
+fn a_network_runs_under_jobs_and_matches_serial() {
+    let frames: Vec<Vec<u8>> = (0..8u8).map(synthetic_frame).collect();
+    let wire = nut_stream(&frames);
+
+    let baseline = run_network(
+        &[("invert", "invert")],
+        "[0:v]invert[out0]",
+        &["-jobs", "1"],
+        ONE_OUTPUT,
+        &wire,
+    );
+    assert_run_ok(&baseline, "network jobs=1");
+
     let run = run_network(
         &[("invert", "invert")],
         "[0:v]invert[out0]",
         &["-jobs", "4"],
         ONE_OUTPUT,
-        &nut_stream(&[synthetic_frame(0)]),
+        &wire,
     );
-    assert!(!run.success(), "a network runs as one job");
-    assert!(
-        run.stderr.contains("-jobs"),
-        "expected the flag named in the refusal, got:\n{}",
-        run.stderr
+    assert_run_ok(&run, "network jobs=4");
+    assert_eq!(
+        run.stdout, baseline.stdout,
+        "a network's output must be byte-identical at any -jobs"
     );
+}
+
+// Determinism across thread counts: composed graphs at 1, 2 and 8 workers
+// produce the same bytes and the same row order, which is the contract that
+// lets the pool default on.
+
+/// One network run per `-jobs` in `counts`, each asserted byte-identical to
+/// the first.
+fn assert_jobs_match(
+    modules: &[(&str, &str)],
+    wiring: &str,
+    extra: &[&str],
+    outputs: &[&str],
+    wire: &[u8],
+    what: &str,
+) -> Vec<u8> {
+    let mut baseline: Option<Vec<u8>> = None;
+    for jobs in ["1", "2", "8"] {
+        let mut with_jobs: Vec<&str> = vec!["-jobs", jobs];
+        with_jobs.extend_from_slice(extra);
+        let run = run_network(modules, wiring, &with_jobs, outputs, wire);
+        assert_run_ok(&run, &format!("{what} jobs={jobs}"));
+        match &baseline {
+            None => baseline = Some(run.stdout),
+            Some(expected) => assert_eq!(
+                &run.stdout, expected,
+                "{what} jobs={jobs} output must be byte-identical to jobs=1"
+            ),
+        }
+    }
+    baseline.expect("at least one count ran")
+}
+
+#[test]
+fn a_pure_into_pure_graph_is_identical_at_every_thread_count() {
+    // tail3 is windowed (three frames a call) and pure, so both lanes may
+    // spread across workers; the reassembly is what keeps the bytes equal.
+    let frames: Vec<Vec<u8>> = (0..20u8).map(synthetic_frame).collect();
+    assert_jobs_match(
+        &[("invert", "invert"), ("tail3", "tail3")],
+        "[0:v]invert[a];[a]tail3[out0]",
+        &["-annotations", "out"],
+        ONE_OUTPUT,
+        &nut_stream(&frames),
+        "invert into tail3",
+    );
+}
+
+#[test]
+fn a_pure_into_impure_graph_keeps_frame_and_row_order() {
+    // framestats is impure and writes one row per frame, each stamped with
+    // that frame's time, plus a trailing count; any frame reaching it out of
+    // order reorders the file, so identical ndjson at every thread count is
+    // frame-order and row-order proof at once.
+    let frames: Vec<Vec<u8>> = (0..20u8).map(synthetic_frame).collect();
+    let wire = nut_stream(&frames);
+
+    let mut baseline: Option<Vec<u8>> = None;
+    for jobs in ["1", "2", "8"] {
+        let rows_file = TempFile::new(&format!("determinism-{jobs}.ndjson"));
+        let rows_path = rows_file
+            .path()
+            .to_str()
+            .expect("temp path is valid UTF-8")
+            .to_string();
+        let run = run_network(
+            &[("invert", "invert"), ("framestats", "framestats")],
+            "[0:v]invert[a];[a]framestats[b]",
+            &["-jobs", jobs],
+            &["-map", "[b]", "-f", "ndjson", &rows_path],
+            &wire,
+        );
+        assert_run_ok(&run, &format!("invert into framestats jobs={jobs}"));
+        let rows = std::fs::read(rows_file.path()).expect("read the ndjson output");
+        assert!(!rows.is_empty(), "framestats writes a row per frame");
+        match &baseline {
+            None => baseline = Some(rows),
+            Some(expected) => assert_eq!(
+                &rows, expected,
+                "jobs={jobs} rows must be identical to jobs=1, order included"
+            ),
+        }
+    }
 }
 
 // Rows with no frame to ride: what a module says after its last frame, and

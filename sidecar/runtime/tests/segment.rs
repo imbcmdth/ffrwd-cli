@@ -237,7 +237,7 @@ fn an_index_map_paints_only_the_ids_its_rows_declare() {
         &mut filter,
         Frame {
             pts: 0,
-            data: scene,
+            data: scene.into(),
             rows: Vec::new(),
         },
     );
@@ -309,7 +309,7 @@ fn a_mask_is_exactly_the_ids_the_rows_that_reached_it_name() {
         &mut filter,
         Frame {
             pts: 0,
-            data: scene,
+            data: scene.into(),
             rows: Vec::new(),
         },
     );

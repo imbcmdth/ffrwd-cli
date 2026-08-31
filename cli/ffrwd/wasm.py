@@ -221,7 +221,7 @@ _ANNOTATIONS_FLAG = "-annotations"
 # file is called: the export's own name, beside the module.
 _NN_FLAG = "-nn"
 
-# How many instances of one module host frames at once. Unwritten means one.
+# The sidecar's worker-thread cap. Unwritten, the sidecar sizes its own pool.
 _JOBS_FLAG = "-jobs"
 
 # The sidecar flag that grants each effect to one module, per capability name.
@@ -621,7 +621,10 @@ def _first_line(text: str) -> str:
 
 
 def _argv(
-    binary: str, process: SidecarProcess, runtime: Sequence[str] = (), jobs: int = 1
+    binary: str,
+    process: SidecarProcess,
+    runtime: Sequence[str] = (),
+    jobs: int | None = None,
 ) -> list[str]:
     """One sidecar process as argv, run by `binary`.
 
@@ -652,13 +655,13 @@ def _argv(
     module table: the sidecar denies both to any module the argv never
     names.
 
-    ``-jobs`` is how many instances of the module host frames at once, and is
-    written only for a region that can take it (`jobs` above 1 and
-    :attr:`~ffrwd.processes.SidecarProcess.parallel`). One worker is the
-    sidecar's own default, so a serial region carries no ``-jobs`` at all.
+    ``-jobs`` caps the sidecar's worker threads, and is written on every
+    sidecar process whenever the run gave one -- the sidecar itself decides
+    what each module's lane admits. Absent, the sidecar sizes its pool to
+    the machine, so a run at the default carries no ``-jobs`` at all.
     """
     argv = [binary, "-f", EDGE_FORMAT, "-i", STDIN]
-    if jobs > 1 and process.parallel:
+    if jobs is not None:
         argv += [_JOBS_FLAG, str(jobs)]
     if process.reads_rows:
         argv += [_ANNOTATIONS_FLAG, ANNOTATIONS_IN]
@@ -737,7 +740,7 @@ def _network_args(process: SidecarProcess) -> list[str]:
     return argv
 
 
-def sidecar_argv(process: SidecarProcess, jobs: int = 1) -> list[str]:
+def sidecar_argv(process: SidecarProcess, jobs: int | None = None) -> list[str]:
     """The argv that RUNS one sidecar process, with the binary located.
 
     A wheel installs the sidecar into the environment's scripts directory,
@@ -748,8 +751,8 @@ def sidecar_argv(process: SidecarProcess, jobs: int = 1) -> list[str]:
     and what to run it on, which a printed command has no business spelling:
     the directory is under THIS machine's cache.
 
-    `jobs` is how many instances of the module the run asked to host at once;
-    a region that cannot take it keeps one whatever was asked.
+    `jobs` is the worker-thread cap the run asked for, passed to every
+    sidecar; None is the default, the sidecar sizing itself to the machine.
 
     Raises ``FfrwdError`` when the sidecar is not installed -- the same
     rejection, and the same hint, a describe gives.
@@ -764,7 +767,7 @@ def sidecar_argv(process: SidecarProcess, jobs: int = 1) -> list[str]:
     return _argv(binary, process, nn.spawn_args() if process.models else (), jobs)
 
 
-def shown_argv(process: SidecarProcess, jobs: int = 1) -> list[str]:
+def shown_argv(process: SidecarProcess, jobs: int | None = None) -> list[str]:
     """The argv a PRINTED command line shows, naming the sidecar by program name.
 
     The same convention a printed ffmpeg command follows: what is shown is

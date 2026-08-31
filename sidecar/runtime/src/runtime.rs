@@ -21,7 +21,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{anyhow, bail, Context, Result};
 use wasmtime::component::{Component, Linker, ResourceTable};
@@ -674,10 +674,14 @@ pub struct FunctionMeta {
 
 /// One frame on the wire between the host and a module, or between two
 /// modules: its timestamp, its pixels, and the rows travelling with it.
+///
+/// The pixels are behind an `Arc`: overlapping windows and concurrent
+/// consumers borrow one buffer instead of each copying it. The only copy
+/// left is the one into guest memory at the call boundary.
 #[derive(Debug, Clone)]
 pub struct Frame {
     pub pts: i64,
-    pub data: Vec<u8>,
+    pub data: Arc<Vec<u8>>,
     pub rows: Vec<String>,
 }
 
@@ -1083,7 +1087,7 @@ pub fn exports(module_path: &str) -> Result<Vec<String>> {
 
 /// One instantiated module, whatever world it was built against, answering
 /// the questions the current world asks.
-trait Adapter {
+trait Adapter: Send {
     fn described(&self, store: &mut Store<Host>) -> Result<Described>;
 
     fn init(
@@ -1203,7 +1207,7 @@ macro_rules! video_adapter {
                         .call_process(&mut *store, info, &frame.data)
                         .map_err(wasm_err)?;
                     let data = match outcome.output {
-                        Output::Frame(produced) => produced,
+                        Output::Frame(produced) => Arc::new(produced),
                         Output::Passthrough => frame.data.clone(),
                     };
                     out.push(Frame {
@@ -1303,7 +1307,7 @@ macro_rules! meta_adapter {
                         .call_process_meta(&mut *store, info, &frame.data, &frame.rows)
                         .map_err(wasm_err)?;
                     let data = match outcome.output {
-                        Output::Frame(produced) => produced,
+                        Output::Frame(produced) => Arc::new(produced),
                         Output::Passthrough => frame.data.clone(),
                     };
                     out.push(Frame {
@@ -1449,7 +1453,8 @@ macro_rules! kind_bearing_window_adapter {
                     .iter()
                     .map(|f| InFrame {
                         pts: f.pts,
-                        frame: f.data.clone(),
+                        // The one copy left: into the guest-call payload.
+                        frame: f.data.as_ref().clone(),
                         rows: f.rows.clone(),
                     })
                     .collect();
@@ -1571,7 +1576,8 @@ impl Adapter for Window060 {
             .iter()
             .map(|f| InFrame {
                 pts: f.pts,
-                frame: f.data.clone(),
+                // The one copy left: into the guest-call payload.
+                frame: f.data.as_ref().clone(),
                 rows: f.rows.clone(),
             })
             .collect();
@@ -1664,7 +1670,8 @@ impl Adapter for Window050 {
             .iter()
             .map(|f| InFrame {
                 pts: f.pts,
-                frame: f.data.clone(),
+                // The one copy left: into the guest-call payload.
+                frame: f.data.as_ref().clone(),
                 rows: f.rows.clone(),
             })
             .collect();
@@ -1694,7 +1701,7 @@ macro_rules! resolve_frames {
                 .into_iter()
                 .map(|frame| {
                     let data = match frame.frame {
-                        FramePayload::New(data) => data,
+                        FramePayload::New(data) => Arc::new(data),
                         FramePayload::Same => unchanged(frames, frame.pts, same)?,
                     };
                     Ok(Frame {
@@ -2774,7 +2781,7 @@ fn numbers(values: &[u32]) -> String {
 /// The bytes behind a `same` payload: the input this call received at the
 /// same timestamp, or - when the call received exactly one - that one,
 /// whatever timestamp the output carries.
-fn unchanged(frames: &[Frame], pts: i64, same: SameRule<'_>) -> Result<Vec<u8>> {
+fn unchanged(frames: &[Frame], pts: i64, same: SameRule<'_>) -> Result<Arc<Vec<u8>>> {
     if let SameRule::RefusedForOverlap(name) = same {
         bail!(
             "{name} passed its window through unchanged, and its windows overlap; every sample \

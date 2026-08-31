@@ -453,12 +453,12 @@ mod tests {
         let mut filter = open(r#"{"eq":[{"field":"a"},{"lit":1}]}"#);
         let frame = Frame {
             pts: 7,
-            data: vec![1, 2, 3, 4],
+            data: vec![1, 2, 3, 4].into(),
             rows: rows(&[r#"{"a":1}"#, r#"{"a":2}"#]),
         };
         let out = filter.pass(frame);
         assert_eq!(out.pts, 7);
-        assert_eq!(out.data, vec![1, 2, 3, 4], "the pixels are untouched");
+        assert_eq!(*out.data, vec![1, 2, 3, 4], "the pixels are untouched");
         assert_eq!(out.rows, rows(&[r#"{"a":1}"#]));
     }
 
