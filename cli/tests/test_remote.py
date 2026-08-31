@@ -734,6 +734,100 @@ def test_a_prefix_matching_nothing_says_so(
     assert "'zzzz' matches none of your jobs" in err
 
 
+# ---------------------------------------------------------------------------
+# jobs <id>
+# ---------------------------------------------------------------------------
+
+
+def _detail_url(job_id: str) -> str:
+    return f"{JOBS_URL}/{job_id}"
+
+
+def test_jobs_id_shows_one_jobs_detail_including_the_tail(
+    served: _Served, logged_in: None, fixed_clock: None, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _listing(served, ROW_DONE, ROW_OLD)
+    detail = dict(
+        ROW_DONE,
+        log_tail="frame=1\nframe=2\nframe=3",
+        outputs=[{"path": "clips/out.mp4", "bytes": 123, "sha256": "a" * 64}],
+    )
+    served.answers[_detail_url(str(ROW_DONE["id"]))] = json.dumps(detail).encode("utf-8")
+    code = cli.main(["jobs", "aaaa"])
+    out = capsys.readouterr().out
+    assert code == 0
+    # The listing's own row rendering, plus what a listing never carries.
+    assert "aaaa1111" in out and "succeeded" in out
+    assert "output: clips/out.mp4" in out
+    assert "log tail:" in out
+    assert "frame=1" in out and "frame=3" in out
+
+
+def test_jobs_id_resolves_a_unique_prefix(
+    served: _Served, logged_in: None, fixed_clock: None, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _listing(served, ROW_DONE, ROW_OLD)
+    served.answers[_detail_url(str(ROW_OLD["id"]))] = json.dumps(
+        dict(ROW_OLD, error="ffmpeg exited 1", hint="check the filter chain")
+    ).encode("utf-8")
+    code = cli.main(["jobs", "bbbb"])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "bbbb2222" in out and "failed" in out
+    assert "error: ffmpeg exited 1" in out
+    assert "hint: check the filter chain" in out
+
+
+def test_jobs_id_with_a_null_tail_prints_nothing_extra(
+    served: _Served, logged_in: None, fixed_clock: None, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _listing(served, ROW_DONE)
+    detail = dict(ROW_DONE, log_tail=None, outputs=None)
+    served.answers[_detail_url(str(ROW_DONE["id"]))] = json.dumps(detail).encode("utf-8")
+    code = cli.main(["jobs", "aaaa"])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "log tail" not in out
+    assert "output:" not in out
+
+
+def test_jobs_id_truncates_a_long_tail_and_says_so(
+    served: _Served, logged_in: None, fixed_clock: None, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _listing(served, ROW_DONE)
+    lines = [f"L{n:02d}" for n in range(1, 26)]  # 25 lines; the cap is 20
+    detail = dict(ROW_DONE, log_tail="\n".join(lines), outputs=None)
+    served.answers[_detail_url(str(ROW_DONE["id"]))] = json.dumps(detail).encode("utf-8")
+    code = cli.main(["jobs", "aaaa"])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "log tail (last 20 of 25 lines, 5 cut):" in out
+    assert "L01" not in out and "L05" not in out  # the earliest 5 are cut
+    assert "L06" in out and "L25" in out  # the last 20 remain
+
+
+def test_jobs_id_json_carries_the_log_tail_verbatim(
+    served: _Served, logged_in: None, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _listing(served, ROW_DONE)
+    detail = dict(ROW_DONE, log_tail="line one\nline two", outputs=None)
+    served.answers[_detail_url(str(ROW_DONE["id"]))] = json.dumps(detail).encode("utf-8")
+    code = cli.main(["jobs", "aaaa", "--json"])
+    captured = capsys.readouterr()
+    assert code == 0
+    assert json.loads(captured.out) == detail
+    assert captured.err == ""
+
+
+def test_jobs_id_does_not_mix_with_watch_cancel_or_fetch(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    code = cli.main(["jobs", "aaaa", "--watch"])
+    err = capsys.readouterr().err
+    assert code == 2
+    assert "an ID does not mix with --watch/--cancel/--fetch" in err
+
+
 def _fetchable(served: _Served, content: bytes, path: str = "clips/out.mp4") -> str:
     download_url = "https://runner.example/download/aaaa/0?token=t"
     fetch_url = f"{JOBS_URL}/{ROW_DONE['id']}/fetch"
@@ -970,6 +1064,98 @@ def test_wait_on_cancelled_prints_the_rows_error_and_exits_1(
     err = capsys.readouterr().err
     assert code == 1
     assert "cancelled by another session" in err
+
+
+def test_wait_on_failure_also_prints_the_tail_beneath_the_error(
+    served: _Served,
+    logged_in: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _submit_accepted(served)
+    monkeypatch.setattr(remote, "_sleep", lambda seconds: None)
+    failed = dict(_wait_row("failed"), error="ffmpeg exited 1: no such filter 'zscale'")
+    monkeypatch.setattr(
+        packages, "_urlopen", _wait_polling(served, JOBS_URL, [_listing_body(failed)])
+    )
+    served.answers[_detail_url(JOB_ID)] = json.dumps(
+        dict(failed, log_tail="frame=100\nerror applying filter\nfailed")
+    ).encode("utf-8")
+    code = cli.main(["run", "--remote", "--wait", WAIT_QUERY])
+    err = capsys.readouterr().err
+    assert code == 1
+    error_at = err.index("ffmpeg exited 1: no such filter 'zscale'")
+    tail_at = err.index("log tail:")
+    assert tail_at > error_at  # the tail prints after the error, not before
+    assert "frame=100" in err and "error applying filter" in err
+
+
+def test_wait_json_on_failure_carries_the_log_tail(
+    served: _Served,
+    logged_in: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _submit_accepted(served)
+    monkeypatch.setattr(remote, "_sleep", lambda seconds: None)
+    failed = dict(_wait_row("failed"), error="ffmpeg exited 1")
+    monkeypatch.setattr(
+        packages, "_urlopen", _wait_polling(served, JOBS_URL, [_listing_body(failed)])
+    )
+    served.answers[_detail_url(JOB_ID)] = json.dumps(dict(failed, log_tail="boom")).encode(
+        "utf-8"
+    )
+    code = cli.main(["run", "--remote", "--wait", "--json", WAIT_QUERY])
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 1
+    assert payload["job"]["log_tail"] == "boom"
+
+
+def test_wait_on_failure_with_no_tail_stored_prints_nothing_extra(
+    served: _Served,
+    logged_in: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _submit_accepted(served)
+    monkeypatch.setattr(remote, "_sleep", lambda seconds: None)
+    failed = dict(_wait_row("failed"), error="ffmpeg exited 1")
+    monkeypatch.setattr(
+        packages, "_urlopen", _wait_polling(served, JOBS_URL, [_listing_body(failed)])
+    )
+    served.answers[_detail_url(JOB_ID)] = json.dumps(dict(failed, log_tail=None)).encode(
+        "utf-8"
+    )
+    code = cli.main(["run", "--remote", "--wait", WAIT_QUERY])
+    err = capsys.readouterr().err
+    assert code == 1
+    assert "ffmpeg exited 1" in err
+    assert "log tail" not in err
+
+
+def test_watch_prints_a_failed_jobs_error_and_tail_once_it_stops(
+    served: _Served,
+    logged_in: None,
+    fixed_clock: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    running = dict(ROW_OLD, state="running")
+    _listing(served, running)
+    failed_row = dict(ROW_OLD, error="ffmpeg exited 1")
+
+    def _finish(seconds: float) -> None:
+        _listing(served, failed_row)
+
+    monkeypatch.setattr(remote, "_sleep", _finish)
+    served.answers[_detail_url(str(ROW_OLD["id"]))] = json.dumps(
+        dict(failed_row, log_tail="oops")
+    ).encode("utf-8")
+    code = cli.main(["jobs", "--watch"])
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "ffmpeg exited 1" in captured.err
+    assert "log tail:" in captured.err and "oops" in captured.err
 
 
 def test_wait_on_budget_exhausted_fetches_and_notes_the_reset(

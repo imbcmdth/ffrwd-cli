@@ -45,11 +45,15 @@ Subcommands:
   instead (``ffrwd.remote``): file inputs are hashed and uploaded, "://"
   inputs pass through for the runner to open, and no local ffmpeg is needed
   -- ``ffrwd jobs`` follows the job from there.
-* ``jobs [--json | --watch | --cancel ID | --fetch ID [-y]]`` -- the runs
-  submitted with ``--remote``: list them (with this month's usage), watch
-  the listing until nothing is running, ask for a cancellation, or download
-  a succeeded job's outputs to their as-written paths. An ID may be any
-  unique prefix of the id ``submit`` printed.
+* ``jobs [ID] [--json | --watch | --cancel ID | --fetch ID [-y]]`` -- the
+  runs submitted with ``--remote``: list them (with this month's usage),
+  show one job's own detail including its log tail, watch the listing until
+  nothing is running, ask for a cancellation, or download a succeeded job's
+  outputs to their as-written paths. A failed or cancelled job's log tail
+  also prints on its own -- from ``--watch`` once it stops, and from
+  ``run --remote --wait`` when the job it followed lands there -- right
+  under the error, bounded to the last few lines. An ID may be any unique
+  prefix of the id ``submit`` printed.
 * ``list [--json]`` -- print what the project at the working directory and its
   dependencies provide: one table of packages, one of the functions they
   export, one of the recipes they ship with the variables each declares, and
@@ -355,6 +359,25 @@ def _check_wait(args: argparse.Namespace) -> int:
     return 2
 
 
+def _check_jobs_id(args: argparse.Namespace) -> int:
+    """0 when a positional job ID does not collide with --watch/--cancel/
+    --fetch -- each of those already names its own ID -- or 2 with the usage
+    error printed."""
+    job_id = getattr(args, "id", None)
+    if job_id is None or not (args.watch or args.cancel is not None or args.fetch is not None):
+        return 0
+    print(
+        f"error: {args.command}: an ID does not mix with --watch/--cancel/--fetch",
+        file=sys.stderr,
+    )
+    print(
+        "hint: give the ID alone to see its detail, or pass it to "
+        "--cancel/--fetch instead",
+        file=sys.stderr,
+    )
+    return 2
+
+
 def _console(args: argparse.Namespace) -> Console:
     """The narration this invocation speaks with: stderr, muted by -q/--quiet."""
     return Console(quiet=bool(getattr(args, "quiet", False)))
@@ -460,7 +483,14 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     jobs_p = subparsers.add_parser(
-        "jobs", help="list, watch, cancel or fetch your remote runs"
+        "jobs", help="list, show, watch, cancel or fetch your remote runs"
+    )
+    jobs_p.add_argument(
+        "id",
+        nargs="?",
+        default=None,
+        metavar="ID",
+        help="show one job's detail, including its log tail (a unique id prefix works)",
     )
     jobs_mode = jobs_p.add_mutually_exclusive_group()
     jobs_mode.add_argument(
@@ -2667,7 +2697,10 @@ def _cmd_mcp(args: argparse.Namespace, on_warning: OnWarning) -> int:
 
 
 def _cmd_jobs(args: argparse.Namespace, on_warning: OnWarning) -> int:
-    """List, watch, cancel or fetch remote runs. `ffrwd.remote` owns the work."""
+    """List, show, watch, cancel or fetch remote runs. `ffrwd.remote` owns the work."""
+    code = _check_jobs_id(args)
+    if code != 0:
+        return code
     console = _console(args)
     try:
         return remote.jobs_command(args, announce=console.say)

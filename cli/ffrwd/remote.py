@@ -8,8 +8,11 @@ project's entries over the machine-wide lockfile's, one document), every
 ``input()`` path (local files hashed and uploaded; any "://" spec passed
 through untouched, the runner's to open), every ``COPY ... TO`` destination,
 and ``--timeout`` -- posts it, uploads the file inputs, and starts the job.
-:func:`jobs_command` is the other half: list, watch, cancel, and fetch a
-succeeded job's outputs.
+:func:`jobs_command` is the other half: list, watch, cancel, fetch a
+succeeded job's outputs, or show one job's own detail -- the fields a
+listing row omits, its log tail included. A failed or cancelled job's tail
+also prints on its own, right under the error: from ``--wait`` when the job
+it is following lands there, and from ``--watch`` once its loop stops.
 
 Every refusal this module makes is decided BEFORE anything reaches the
 network, and every one is a typed :class:`~ffrwd.errors.FfrwdError` with a
@@ -516,7 +519,7 @@ def _upload(
 
 
 def jobs_command(args: argparse.Namespace, *, announce: Announce | None = None) -> int:
-    """``ffrwd jobs``: list (the default), --json, --watch, --cancel, --fetch.
+    """``ffrwd jobs``: list (the default), an ID, --json, --watch, --cancel, --fetch.
 
     `announce` hears one line per output ``--fetch`` downloads; the other
     modes print their answer and narrate nothing.
@@ -527,6 +530,9 @@ def jobs_command(args: argparse.Namespace, *, announce: Announce | None = None) 
     if args.fetch is not None:
         _fetch(token, str(args.fetch), overwrite=bool(args.overwrite), announce=announce)
         return 0
+    written_id = getattr(args, "id", None)
+    if written_id is not None:
+        return _show_job(token, str(written_id), as_json=bool(args.as_json))
     if args.watch:
         return _watch(token)
     rows, remaining = _listing(token)
@@ -550,6 +556,27 @@ def _rows(token: str) -> list[dict[str, object]]:
     """The listing's rows alone, for the callers that never render a footer."""
     rows, _ = _listing(token)
     return rows
+
+
+def _job_detail(token: str, job_id: str) -> dict[str, object]:
+    """GET /jobs/<uuid>: the one row this caller owns, ``log_tail`` and
+    ``outputs`` included -- the fields the listing route omits."""
+    where = f"{_jobs_url()}/{job_id}"
+    return _json_object(_call(where, headers=_bearer(token)), where)
+
+
+def _try_job_detail(token: str, job_id: str) -> dict[str, object] | None:
+    """`_job_detail`, best-effort: None on any failure, never raises.
+
+    Used where the detail only feeds a log tail printed alongside a row
+    error that already came from the listing -- a secondary failure here
+    (a network hiccup, a token that expired between polls) must never mask
+    that error, so this swallows it and shows nothing more.
+    """
+    try:
+        return _job_detail(token, job_id)
+    except FfrwdError:
+        return None
 
 
 def _text(row: dict[str, object], key: str) -> str:
@@ -665,8 +692,79 @@ def _print_listing(
         print(free_footer(remaining))
 
 
+# How many of the log tail's own lines print. The server already bounds what
+# `log_tail` stores; this bounds what a terminal shows of it.
+_LOG_TAIL_LINES = 20
+
+
+def _tail_block(detail: dict[str, object]) -> str | None:
+    """The bounded ``log tail:`` block for one job's detail, or None when
+    the job carries nothing stored to show (a null or empty ``log_tail``)."""
+    tail = detail.get("log_tail")
+    if not isinstance(tail, str):
+        return None
+    lines = tail.splitlines()
+    if not lines:
+        return None
+    shown = lines[-_LOG_TAIL_LINES:]
+    cut = len(lines) - len(shown)
+    header = (
+        "log tail:"
+        if cut == 0
+        else f"log tail (last {_LOG_TAIL_LINES} of {len(lines)} lines, {cut} cut):"
+    )
+    return "\n".join([header, *(f"  {line}" for line in shown)])
+
+
+def _show_job(token: str, written: str, *, as_json: bool) -> int:
+    """``ffrwd jobs <id>``: one job's detail, the log tail included."""
+    job_id = _resolve_id(token, written)
+    detail = _job_detail(token, job_id)
+    if as_json:
+        print(json.dumps(detail, indent=2))
+        return 0
+    _print_job_detail(detail, _utcnow())
+    return 0
+
+
+def _print_job_detail(detail: dict[str, object], now: datetime) -> None:
+    """The listing's own row rendering for one job, plus what a listing
+    never carries: its error/hint pair, its outputs, and its log tail."""
+    print(render_table(_listing_table([detail], now)))
+    if _text(detail, "state") in ("failed", "cancelled"):
+        error = _text(detail, "error")
+        hint = _text(detail, "hint")
+        if error:
+            print(f"error: {error}")
+        if hint:
+            print(f"hint: {hint}")
+    outputs = detail.get("outputs")
+    if isinstance(outputs, list):
+        for one in outputs:
+            if isinstance(one, dict) and isinstance(one.get("path"), str):
+                print(f"output: {one['path']}")
+    block = _tail_block(detail)
+    if block is not None:
+        print(block)
+
+
+def _print_row_failure(row: dict[str, object], detail: dict[str, object] | None) -> None:
+    """A terminal failed/cancelled row's error, and its tail beneath it --
+    shared by ``--wait`` and ``--watch`` so both read the same way."""
+    print(f"error: {_row_error(row)}", file=sys.stderr)
+    if detail is not None:
+        block = _tail_block(detail)
+        if block is not None:
+            print(block, file=sys.stderr)
+
+
 def _watch(token: str) -> int:
-    """Redraw the listing until nothing is submitted, queued or running."""
+    """Redraw the listing until nothing is submitted, queued or running.
+
+    The final redraw, the one that ends the loop, also prints any failed or
+    cancelled row's error and log tail -- the same shape ``--wait`` prints
+    for the one job it follows.
+    """
     try:
         while True:
             rows, remaining = _listing(token)
@@ -674,6 +772,10 @@ def _watch(token: str) -> int:
                 print("\x1b[2J\x1b[H", end="")
             _print_listing(rows, _utcnow(), remaining)
             if not any(_text(row, "state") in _ACTIVE_STATES for row in rows):
+                for row in rows:
+                    if _text(row, "state") in ("failed", "cancelled"):
+                        job_id = _text(row, "id")
+                        _print_row_failure(row, _try_job_detail(token, job_id))
                 return 0
             _sleep(WATCH_SECONDS)
     except KeyboardInterrupt:
@@ -870,7 +972,9 @@ def _poll_to_terminal(
 
 def _row_error(row: dict[str, object]) -> FfrwdError:
     """A failed or cancelled row's own report, rendered the way every other
-    refusal from this module is -- through `_print_error`, at the caller."""
+    rejection from this module is -- str()'d for `_print_row_failure`, never
+    raised: --wait and --watch are its only callers, and both print their own
+    output rather than unwind to the CLI's generic error handler."""
     message = _text(row, "error") or f"the job {_text(row, 'state')}"
     hint = _text(row, "hint") or "run `ffrwd jobs` to see the full listing"
     return _reject(message, hint)
@@ -904,7 +1008,10 @@ def wait_for_run(job_id: str, args: argparse.Namespace, *, console: Console) -> 
     `_fetch` (--fetch's own machinery) for the download. A Ctrl-C during the
     wait never cancels the job -- it prints where to pick it back up and
     exits 130. `args.as_json` drops the bar and emits the terminal row (plus
-    any written paths) as one JSON object instead of the plain narration.
+    any written paths) as one JSON object instead of the plain narration. A
+    failed or cancelled job also fetches its own detail here, to print (or,
+    under --json, to carry) its log tail -- the thing the row's own error
+    tells you to look at.
     """
     token = _token()
     draw = None if args.as_json else console.transient
@@ -918,10 +1025,14 @@ def wait_for_run(job_id: str, args: argparse.Namespace, *, console: Console) -> 
     state = _text(row, "state")
 
     if state in ("failed", "cancelled"):
+        detail = _try_job_detail(token, job_id)
         if args.as_json:
-            print(json.dumps({"job": row}, indent=2))
+            payload = dict(row)
+            payload["log_tail"] = detail.get("log_tail") if detail is not None else None
+            print(json.dumps({"job": payload}, indent=2))
             return 1
-        raise _row_error(row)
+        _print_row_failure(row, detail)
+        return 1
 
     # succeeded, budget-stopped or not: fetched exactly as `jobs --fetch` does.
     announce = None if args.as_json else console.say
