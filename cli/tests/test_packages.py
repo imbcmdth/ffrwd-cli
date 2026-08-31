@@ -40,7 +40,14 @@ import pytest
 from ffrwd import cli, credentials, packages, store
 from ffrwd.errors import FfrwdError
 from ffrwd.mcp import tools as mcp_tools
-from ffrwd.project import ModelPin, RegistryEntry, read_lockfile, read_manifest
+from ffrwd.project import (
+    LinkEntry,
+    ModelPin,
+    RegistryEntry,
+    read_lockfile,
+    read_manifest,
+    write_lockfile,
+)
 
 QUERY = "COPY (SELECT {call}(f.audio[1]) FROM input('film.mkv') f) TO 'out.mkv'"
 
@@ -837,6 +844,38 @@ def test_bare_install_fetches_the_manifests_dependencies_at_their_written_versio
     code, out, _err = _run(project, monkeypatch, capsys, "install")
     assert code == 0
     assert "all dependencies were already pinned" in out
+
+
+def test_bare_install_leaves_a_dependency_that_is_linked_to_a_directory(
+    store_home: Path,
+    registry: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A link is how a dependency nobody has published yet is worked against."""
+    monkeypatch.setenv(packages.REGISTRY_ENV, str(registry))
+    _package(tmp_path / "dev")  # the dependency, in a working tree and nowhere else
+    project = _package(
+        tmp_path / "work",
+        name="consumer/mine",
+        dependencies={"broadcast/tracks": "1.0.0"},
+    )
+    write_lockfile(project / "ffrwd.lock", [])
+    assert _run(project, monkeypatch, capsys, "link", "../dev")[0] == 0
+
+    code, out, err = _run(project, monkeypatch, capsys, "install")
+    assert code == 0, err
+    assert "broadcast/tracks is linked to a working directory" in err
+    assert "installed what consumer/mine 1.0.0 needs in" in out
+    held = read_lockfile(project / "ffrwd.lock")
+    assert held.entries == (LinkEntry(path="../dev"),), "the link survived the install"
+    assert held.dependencies == {}, "nothing was pinned to a published version"
+
+    code, out, _err = _run(
+        project, monkeypatch, capsys, "compile", QUERY.format(call="broadcast.tracks.quieter")
+    )
+    assert code == 0 and "volume=volume=0.5" in out
 
 
 def test_bare_install_fetches_the_projects_own_pinned_models(

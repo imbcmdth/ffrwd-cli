@@ -75,11 +75,13 @@ from .errors import ErrorCode, FfrwdError
 from .functions import package_modules
 from .project import (
     MANIFEST_NAME,
+    LinkEntry,
     LockEntry,
     ModelPin,
     Package,
     RegistryEntry,
     add_dependency,
+    held_entry,
     is_package_name,
     name_refusal,
     read_lockfile,
@@ -1257,6 +1259,11 @@ def install_project(
     after this. Dependencies resolve at the manifest's written version --
     the manifest of the tree standing here is the pin, not a request for
     the highest.
+
+    A dependency the lockfile already reads out of a working directory is
+    left as it is: that is what a link is for, and fetching the registry's
+    copy over it would undo the link and refuse the whole install for a
+    package that is not published yet.
     """
     package = read_manifest(manifest)
     current = read_lockfile(lock) if lock.is_file() else None
@@ -1265,6 +1272,10 @@ def install_project(
 
     brought: list[Release] = []
     for name, version in package.dependencies.items():
+        if isinstance(held_entry(entries, name, lock), LinkEntry):
+            if announce is not None:
+                announce(f"{name} is linked to a working directory")
+            continue
         if announce is not None:
             announce(f"resolving {name} {version}")
         release = resolve(f"{name}@{version}")
