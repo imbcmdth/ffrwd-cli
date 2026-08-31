@@ -13,7 +13,6 @@ use crate::wit::types::{ExecutionTarget, GraphEncoding, Tensor, TensorType};
 use crate::{ExecutionContext, Graph};
 use ort::{
     execution_providers::{CPUExecutionProvider, ExecutionProviderDispatch},
-    inputs,
     session::{Input, Output},
     session::{Session, SessionInputValue, builder::GraphOptimizationLevel},
     tensor::TensorElementType,
@@ -297,13 +296,6 @@ impl BackendExecutionContext for OnnxExecutionContext {
         &mut self,
         inputs: Option<Vec<NamedTensor>>,
     ) -> Result<Option<Vec<NamedTensor>>, BackendError> {
-        fn dimensions_as_u32(shape: &ort::tensor::Shape) -> Result<Vec<u32>, BackendError> {
-            (*shape)
-                .iter()
-                .map(|d| if *d == -1 { Ok(1) } else { convert_i64(d) })
-                .collect()
-        }
-
         match inputs {
             // WIT
             Some(inputs) => {
@@ -352,16 +344,13 @@ impl BackendExecutionContext for OnnxExecutionContext {
 
                 let mut output_tensors = Vec::new();
                 for i in 0..self.outputs.len() {
-                    // TODO: fix preexisting gap--this only handles f32 tensors.
-                    let (shape, data): (&ort::tensor::Shape, &[f32]) =
-                        session_outputs[i].try_extract_tensor()?;
-                    let f32s = data.to_vec();
                     let output = &mut self.outputs[i];
-                    let dimensions: Vec<u32> = dimensions_as_u32(shape)?;
+                    let (dimensions, data) =
+                        from_output_value(&session_outputs[i], output.shape.ty)?;
                     let tensor = Tensor {
                         dimensions,
                         ty: output.shape.ty,
-                        data: f32_vec_to_bytes(f32s),
+                        data,
                     };
                     output.tensor.replace(tensor.clone());
                     output_tensors.push(NamedTensor {
@@ -381,16 +370,13 @@ impl BackendExecutionContext for OnnxExecutionContext {
                 let mut session = self.session.lock().unwrap();
                 let session_outputs = session.run(session_inputs.as_slice())?;
                 for i in 0..self.outputs.len() {
-                    // TODO: fix preexisting gap--this only handles f32 tensors.
-                    let (shape, data): (&ort::tensor::Shape, &[f32]) =
-                        session_outputs[i].try_extract_tensor()?;
-                    let f32s = data.to_vec();
                     let output = &mut self.outputs[i];
-                    let dimensions: Vec<u32> = dimensions_as_u32(shape)?;
+                    let (dimensions, data) =
+                        from_output_value(&session_outputs[i], output.shape.ty)?;
                     output.tensor.replace(Tensor {
                         dimensions,
                         ty: output.shape.ty,
-                        data: f32_vec_to_bytes(f32s),
+                        data,
                     });
                 }
                 Ok(None)
@@ -522,25 +508,41 @@ impl TryFrom<TensorElementType> for TensorType {
 
 fn to_input_value(slot: &TensorSlot) -> Result<[SessionInputValue<'_>; 1], BackendError> {
     match &slot.tensor {
-        Some(tensor) => match tensor.ty {
-            TensorType::Fp32 => {
-                let data = bytes_to_f32_vec(tensor.data.to_vec());
-                let dimensions: Vec<i64> = tensor
-                    .dimensions
-                    .iter()
-                    .map(|d| *d as i64) // TODO: fewer conversions
-                    .collect();
-                let ort_tensor = OrtTensor::<f32>::from_array((dimensions, data)).map_err(|e| {
-                    BackendError::BackendAccess(wasmtime::format_err!(
-                        "failed to create ONNX session input: {e}"
-                    ))
-                })?;
-                Ok(inputs![ort_tensor])
+        Some(tensor) => {
+            let dimensions: Vec<i64> = tensor
+                .dimensions
+                .iter()
+                .map(|d| *d as i64) // TODO: fewer conversions
+                .collect();
+            // An integer input is as ordinary as a float one: a model reading
+            // a sample rate or a token id takes i64, and refusing it refuses
+            // the model.
+            let ort_tensor = match tensor.ty {
+                TensorType::Fp32 => {
+                    OrtTensor::from_array((dimensions, bytes_to_f32_vec(tensor.data.to_vec())))
+                        .map(SessionInputValue::from)
+                }
+                TensorType::I64 => {
+                    OrtTensor::from_array((dimensions, bytes_to_i64_vec(tensor.data.to_vec())))
+                        .map(SessionInputValue::from)
+                }
+                TensorType::I32 => {
+                    OrtTensor::from_array((dimensions, bytes_to_i32_vec(tensor.data.to_vec())))
+                        .map(SessionInputValue::from)
+                }
+                other => {
+                    return Err(BackendError::BackendAccess(wasmtime::format_err!(
+                        "ONNX inputs of type {other:?} are not supported"
+                    )));
+                }
             }
-            _ => {
-                unimplemented!("{:?} not supported by ONNX", tensor.ty);
-            }
-        },
+            .map_err(|e| {
+                BackendError::BackendAccess(wasmtime::format_err!(
+                    "failed to create ONNX session input: {e}"
+                ))
+            })?;
+            Ok([ort_tensor])
+        }
         None => {
             return Err(BackendError::BackendAccess(wasmtime::format_err!(
                 "missing input tensor: {}",
@@ -558,6 +560,58 @@ pub fn bytes_to_f32_vec(data: Vec<u8>) -> Vec<f32> {
     data.chunks(4)
         .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
         .collect()
+}
+
+pub fn i64_vec_to_bytes(data: Vec<i64>) -> Vec<u8> {
+    data.into_iter().flat_map(i64::to_le_bytes).collect()
+}
+
+pub fn bytes_to_i64_vec(data: Vec<u8>) -> Vec<i64> {
+    data.chunks(8)
+        .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+        .collect()
+}
+
+pub fn i32_vec_to_bytes(data: Vec<i32>) -> Vec<u8> {
+    data.into_iter().flat_map(i32::to_le_bytes).collect()
+}
+
+pub fn bytes_to_i32_vec(data: Vec<u8>) -> Vec<i32> {
+    data.chunks(4)
+        .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+        .collect()
+}
+
+fn dimensions_as_u32(shape: &ort::tensor::Shape) -> Result<Vec<u32>, BackendError> {
+    (*shape)
+        .iter()
+        .map(|d| if *d == -1 { Ok(1) } else { convert_i64(d) })
+        .collect()
+}
+
+/// One session output read back as the shape and little-endian bytes the
+/// guest's own tensor type asks for.
+fn from_output_value(
+    value: &ort::value::Value,
+    ty: TensorType,
+) -> Result<(Vec<u32>, Vec<u8>), BackendError> {
+    match ty {
+        TensorType::Fp32 => {
+            let (shape, data): (&ort::tensor::Shape, &[f32]) = value.try_extract_tensor()?;
+            Ok((dimensions_as_u32(shape)?, f32_vec_to_bytes(data.to_vec())))
+        }
+        TensorType::I64 => {
+            let (shape, data): (&ort::tensor::Shape, &[i64]) = value.try_extract_tensor()?;
+            Ok((dimensions_as_u32(shape)?, i64_vec_to_bytes(data.to_vec())))
+        }
+        TensorType::I32 => {
+            let (shape, data): (&ort::tensor::Shape, &[i32]) = value.try_extract_tensor()?;
+            Ok((dimensions_as_u32(shape)?, i32_vec_to_bytes(data.to_vec())))
+        }
+        other => Err(BackendError::BackendAccess(wasmtime::format_err!(
+            "ONNX outputs of type {other:?} are not supported"
+        ))),
+    }
 }
 
 /// Returns whether the dimension is dynamic.
