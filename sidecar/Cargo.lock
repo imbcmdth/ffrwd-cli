@@ -449,7 +449,7 @@ dependencies = [
 
 [[package]]
 name = "ffrwd-wasm"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "ffrwd-wasm-runtime",
@@ -460,7 +460,7 @@ dependencies = [
 
 [[package]]
 name = "ffrwd-wasm-runtime"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "http",
