@@ -232,6 +232,20 @@ class Installed:
     downloaded: bool
 
 
+@dataclass(frozen=True)
+class ProjectInstalled:
+    """What a bare install did for the package standing in the working tree.
+
+    `brought` is every package fetched into the lockfile, in the order it
+    was resolved -- empty when everything the manifest pins was already
+    pinned and stored.
+    """
+
+    package: Package
+    brought: tuple[Release, ...]
+    lock: Path
+
+
 # --------------------------------------------------------------------------
 # where to read
 # --------------------------------------------------------------------------
@@ -1226,3 +1240,38 @@ def install(
         manifest=manifest,
         downloaded=not was_stored,
     )
+
+
+def install_project(
+    manifest: Path,
+    *,
+    lock: Path,
+    announce: Announce | None = None,
+) -> ProjectInstalled:
+    """Install what the package at `manifest` needs to build and publish.
+
+    Everything installing this package FROM the registry would have
+    fetched, done for the working tree itself: each dependency the
+    manifest pins, recursively; the models it pins, placed beside its own
+    modules; and the runtime those modules load. A fresh clone is ready
+    after this. Dependencies resolve at the manifest's written version --
+    the manifest of the tree standing here is the pin, not a request for
+    the highest.
+    """
+    package = read_manifest(manifest)
+    current = read_lockfile(lock) if lock.is_file() else None
+    entries: list[LockEntry] = list(current.entries) if current is not None else []
+    wanted: dict[str, str] = dict(current.dependencies) if current is not None else {}
+
+    brought: list[Release] = []
+    for name, version in package.dependencies.items():
+        if announce is not None:
+            announce(f"resolving {name} {version}")
+        release = resolve(f"{name}@{version}")
+        _ensure(release, entries, [], brought, announce)
+        wanted[name] = release.version
+    write_lockfile(lock, entries, dependencies=wanted)
+
+    _install_models(package, announce)
+    _install_runtime(package, announce)
+    return ProjectInstalled(package=package, brought=tuple(brought), lock=lock)

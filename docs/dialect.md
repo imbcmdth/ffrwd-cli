@@ -496,6 +496,14 @@ case something else installed still depends on it.
 
 `-g` and the project rule are `link`'s, below.
 
+`ffrwd install` with no package installs the project standing here:
+every dependency its own manifest pins, at the written version, plus
+its pinned models and the runtime its modules load - everything
+installing this package from the registry would have fetched. A fresh
+clone of a package's repository builds and publishes after one bare
+install. `-g` without a package is an error; machine-wide installs
+name what to fetch.
+
 ### Where a package is
 
 `ffrwd path broadcast/tracks` prints the directory an installed

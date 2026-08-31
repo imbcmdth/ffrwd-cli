@@ -761,8 +761,8 @@ def model_binding(described: Described, module: str) -> ModelBinding:
         raise _reject(
             f"the module '{module}' runs a model, and '{path}' is not there",
             hint=f"a module that runs one expects '{described.name}{MODEL_SUFFIX}' "
-            "beside its wasm file; run the module's own fetch script to "
-            "download it",
+            "beside its wasm file; `ffrwd install` in the package fetches "
+            "what its manifest pins",
         )
     return ModelBinding(name=described.name, path=path)
 

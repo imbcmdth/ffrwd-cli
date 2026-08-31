@@ -801,6 +801,93 @@ def test_install_writes_the_machine_wide_lockfile(
     assert isinstance(entry, RegistryEntry) and entry.name == "broadcast/tracks"
 
 
+def test_bare_install_fetches_the_manifests_dependencies_at_their_written_versions(
+    store_home: Path,
+    registry: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """No package named: the manifest standing here is the request, pins and all."""
+    monkeypatch.setenv(packages.REGISTRY_ENV, str(registry))
+    _publish(registry, _package(tmp_path / "v1", version="1.0.0", factor="0.5"))
+    _publish(registry, _package(tmp_path / "v2", version="2.0.0", factor="0.25"))
+    project = _package(
+        tmp_path / "work",
+        name="consumer/mine",
+        dependencies={"broadcast/tracks": "1.0.0"},
+    )
+
+    code, out, err = _run(project, monkeypatch, capsys, "install")
+    assert code == 0, err
+    assert "installed what consumer/mine 1.0.0 needs in" in out
+    assert "fetched: broadcast/tracks 1.0.0" in out
+    held = read_lockfile(project / "ffrwd.lock")
+    assert held.dependencies == {"broadcast/tracks": "1.0.0"}
+    versions = [
+        entry.version for entry in held.entries if isinstance(entry, RegistryEntry)
+    ]
+    assert versions == ["1.0.0"]  # the written pin, not the highest published
+
+    code, out, _err = _run(
+        project, monkeypatch, capsys, "compile", QUERY.format(call="broadcast.tracks.quieter")
+    )
+    assert code == 0 and "volume=volume=0.5" in out
+
+    code, out, _err = _run(project, monkeypatch, capsys, "install")
+    assert code == 0
+    assert "all dependencies were already pinned" in out
+
+
+def test_bare_install_fetches_the_projects_own_pinned_models(
+    store_home: Path,
+    served: _Served,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The models a working tree pins land beside its own modules, once."""
+    _serves(served, **{MODEL_URL: MODEL})
+    project = _model_package(tmp_path / "work")
+
+    code, _out, err = _run(project, monkeypatch, capsys, "install")
+    assert code == 0, err
+    assert (project / "depth.onnx").read_bytes() == MODEL
+    assert served.urls() == [MODEL_URL]
+
+    code, out, _err = _run(project, monkeypatch, capsys, "install")
+    assert code == 0
+    assert served.urls() == [MODEL_URL]  # already there and matching; not refetched
+    assert "all dependencies were already pinned" in out
+
+
+def test_bare_install_outside_a_manifest_names_both_ways_forward(
+    store_home: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    bare = tmp_path / "elsewhere"
+    bare.mkdir()
+    code, _out, err = _run(bare, monkeypatch, capsys, "install")
+    assert code == 2
+    assert "no ffrwd.json" in err and "ffrwd init" in err
+    assert not (bare / "ffrwd.lock").exists()
+
+
+def test_bare_install_with_g_needs_a_package_name(
+    store_home: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    bare = tmp_path / "elsewhere"
+    bare.mkdir()
+    code, _out, err = _run(bare, monkeypatch, capsys, "install", "-g")
+    assert code == 2
+    assert "-g needs a package name" in err
+
+
 def test_installing_another_version_changes_the_want_but_keeps_the_old_entry(
     store_home: Path,
     registry: Path,

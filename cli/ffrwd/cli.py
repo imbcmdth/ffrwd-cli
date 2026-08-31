@@ -76,6 +76,10 @@ Subcommands:
   published version -- only the package named on the command line is
   recorded in the manifest, what came along is the lockfile's own. Same
   project rule as ``link``: outside a project and without ``-g``, exit 2.
+  With no package at all, installs the project standing here: the
+  dependencies its own manifest pins, at their written versions, plus its
+  pinned models and the runtime its modules load -- a fresh clone builds
+  and publishes after this.
 * ``path PKG [-g]`` -- print where an installed package's content is on this
   machine, resolved through the same lockfile ``install`` writes: the store
   directory for an installed package, the linked directory for a link. One
@@ -478,7 +482,11 @@ def _build_parser() -> argparse.ArgumentParser:
     install_p = subparsers.add_parser("install", help="install a package from the registry")
     install_p.add_argument(
         "package",
-        help="<namespace>/<package>, or <namespace>/<package>@<version> for an exact version",
+        nargs="?",
+        default=None,
+        help="<namespace>/<package>, or <namespace>/<package>@<version> for an exact "
+        "version; omitted, installs the project standing here -- its manifest's "
+        "dependencies and the models it pins",
     )
     _add_global_argument(install_p)
     _add_quiet_argument(install_p)
@@ -2174,12 +2182,64 @@ def _cmd_search(args: argparse.Namespace, on_warning: OnWarning) -> int:
     return 0
 
 
+def _install_here(args: argparse.Namespace) -> int:
+    """Bare ``ffrwd install``: make the project standing here whole.
+
+    Fetches the dependencies its manifest pins, at their written versions,
+    the models it pins beside its own modules, and the runtime those modules
+    load -- everything installing this package from the registry would have
+    fetched, so a fresh clone builds and publishes after this.
+    """
+    console = _console(args)
+    if args.global_lock:
+        print("error: install: -g needs a package name", file=sys.stderr)
+        print(
+            "hint: bare `ffrwd install` installs the project standing here; a "
+            "machine-wide install names what to fetch",
+            file=sys.stderr,
+        )
+        return 2
+    manifest = find_manifest(Path.cwd())
+    if manifest is None:
+        print(
+            f"error: install: no {MANIFEST_NAME} in {Path.cwd()} or above it",
+            file=sys.stderr,
+        )
+        print(
+            "hint: name a package to install one from the registry, or run "
+            "`ffrwd init` to start a project here",
+            file=sys.stderr,
+        )
+        return 2
+    lock = manifest.parent / LOCKFILE_NAME
+    try:
+        with console.status("installing"):
+            installed = packages_module.install_project(
+                manifest, lock=lock, announce=console.say
+            )
+    except FfrwdError as err:
+        _print_error(err)
+        return 1
+
+    package = installed.package
+    print(f"installed what {package.name} {package.version} needs in {lock}")
+    if installed.brought:
+        brought = ", ".join(f"{one.name} {one.version}" for one in installed.brought)
+        print(f"  fetched: {brought}")
+    else:
+        print("  all dependencies were already pinned")
+    return 0
+
+
 def _cmd_install(args: argparse.Namespace, on_warning: OnWarning) -> int:
     """Install a package into this project's lockfile, or -g's, and record it.
 
     Fetches what it depends on too, recursively -- each at its highest
     published version, unless the lockfile already pins that exact version.
+    With no package named, installs the project standing here instead.
     """
+    if args.package is None:
+        return _install_here(args)
     console = _console(args)
     lock, code = _lock_to_write(args)
     if lock is None:
