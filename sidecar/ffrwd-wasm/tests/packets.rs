@@ -343,7 +343,7 @@ fn describe_reports_the_packet_sink() {
     );
     let description: serde_json::Value =
         serde_json::from_str(run.stdout.trim()).expect("describe prints one JSON object");
-    assert_eq!(description["world"], "ffrwd:av@0.10.0");
+    assert_eq!(description["world"], "ffrwd:av@0.11.0");
     assert_eq!(description["name"], "packet_stats");
     // The codecs list is what reports the packet-sink export; empty accepts
     // every codec.

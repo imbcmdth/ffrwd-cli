@@ -19,7 +19,7 @@
 //! Nothing wires this into a pipeline; it exists for the host's tests.
 
 wit_bindgen::generate!({
-    path: "../../wit",
+    path: "../../worlds/0.10.0",
     world: "window-module",
 });
 

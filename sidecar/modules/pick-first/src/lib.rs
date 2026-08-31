@@ -8,7 +8,7 @@
 //! how a test reads the pairing rather than infers it.
 
 wit_bindgen::generate!({
-    path: "../../wit",
+    path: "../../worlds/0.10.0",
     world: "window-module",
 });
 

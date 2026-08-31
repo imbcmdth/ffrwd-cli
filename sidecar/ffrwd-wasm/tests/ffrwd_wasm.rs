@@ -703,7 +703,7 @@ fn describe(module: &std::path::Path) -> Description {
 #[test]
 fn describe_prints_one_json_object() {
     let parsed = describe(&module_path("invert"));
-    assert_eq!(parsed.world, "ffrwd:av@0.10.0");
+    assert_eq!(parsed.world, "ffrwd:av@0.11.0");
     assert_eq!(parsed.name, Some("invert".to_string()));
     assert_eq!(parsed.pixel_formats, Some(vec!["rgba".to_string()]));
     assert_eq!(parsed.inputs, 1, "invert reads one stream");
@@ -716,7 +716,7 @@ fn describe_prints_one_json_object() {
 #[test]
 fn describe_on_a_values_only_module_has_no_filter_fields() {
     let parsed = describe(&module_path("brand"));
-    assert_eq!(parsed.world, "ffrwd:av@0.10.0");
+    assert_eq!(parsed.world, "ffrwd:av@0.11.0");
     assert_eq!(parsed.name, None, "brand exports no filter, so no name");
     assert_eq!(
         parsed.pixel_formats, None,
@@ -3293,7 +3293,7 @@ fn describe_reads_a_go_module_like_any_other() {
         return;
     }
     let parsed = describe(&go_module_path("invert_go"));
-    assert_eq!(parsed.world, "ffrwd:av@0.10.0");
+    assert_eq!(parsed.world, "ffrwd:av@0.11.0");
     assert_eq!(
         parsed.name,
         Some("invert-go".to_string()),
@@ -3518,7 +3518,7 @@ fn describe_reads_a_componentize_go_module_like_any_other() {
         return;
     }
     let parsed = describe(&go_big_module_path("invert_go"));
-    assert_eq!(parsed.world, "ffrwd:av@0.10.0");
+    assert_eq!(parsed.world, "ffrwd:av@0.11.0");
     assert_eq!(parsed.name, Some("invert-go".to_string()));
     assert_eq!(parsed.pixel_formats, Some(vec!["rgba".to_string()]));
     assert_eq!(parsed.window, Some(1));

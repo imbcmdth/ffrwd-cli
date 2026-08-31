@@ -544,6 +544,12 @@ depends on a wit the way it depends on anything else - a manifest
 `dependencies` entry, a lockfile pin - and its `build.rs` asks
 `ffrwd path ffrwd/wasm` where the file landed.
 
+From `ffrwd:av@0.11.0` a windowed module's `process` borrows its
+window instead of receiving it as a list: `len`, `pts` and `rows` are
+cheap, and `fetch` copies one payload's bytes in on demand, so a
+module reading one frame of a wide window never pays for the rest.
+Modules built against earlier worlds load and run unchanged.
+
 ### Linking
 
 `ffrwd link ../my-lib` writes a link entry naming that directory; the

@@ -1,4 +1,4 @@
-package ffrwd:av@0.11.0;
+package ffrwd:av@0.10.0;
 
 interface types {
   /// Static description of a module, available without running anything.
@@ -133,43 +133,6 @@ interface meta-filter {
   process-meta: func(info: frame-info, frame: list<u8>, rows-in: list<string>) -> outcome;
 }
 
-/// The window `window-filter`'s `process` borrows, held by the host for
-/// exactly that call. Earlier worlds copied every payload of the window into
-/// the call; here the metadata is cheap and bytes move only on `fetch`, so a
-/// module that reads one payload of a wide window never pays for the rest.
-interface window-source {
-  /// One call's input payloads. Indices run oldest first, 0 to `len() - 1` -
-  /// or pad order, for a module reading several streams - and an index at or
-  /// past `len()` is a fault that stops the run.
-  ///
-  /// The handle is the call's alone: it cannot be kept past the return, and
-  /// bytes a module means to keep are its own copy the moment `fetch` hands
-  /// them over.
-  resource in-window {
-    /// How many payloads this call carries.
-    len: func() -> u32;
-
-    /// Payload `i`'s timestamp. For an audio instance it is the first
-    /// sample's tick.
-    pts: func(i: u32) -> s64;
-
-    /// The rows that arrived with payload `i` - each an NDJSON line an
-    /// upstream module produced, empty when nothing came with it. Rows ride
-    /// pad 0: a module reading several streams is handed whatever arrived on
-    /// pad 0, and the rows that arrived on any other pad are dropped before
-    /// the call - so this is empty on every pad past the first.
-    rows: func(i: u32) -> list<string>;
-
-    /// Payload `i`'s bytes, copied on demand: the only per-payload copy.
-    ///
-    /// For a video instance the bytes are one frame's pixels. For an audio
-    /// instance they are interleaved samples in the instance's sample
-    /// format, the whole window in one contiguous piece: the host re-cuts
-    /// whatever packets arrived, so a module never sees a packet boundary.
-    fetch: func(i: u32) -> list<u8>;
-  }
-}
-
 /// A window at a time, superseding `filter`'s per-frame `process` and
 /// `meta-filter`'s `process-meta`. A module exports this one *or* those; a
 /// host adapts a module that exports the older pair as window 1, stride 1,
@@ -180,7 +143,26 @@ interface window-source {
 /// which arm it carries is the instance's kind for the rest of its life.
 interface window-filter {
   use types.{format, meta, stream-info};
-  use window-source.{in-window};
+
+  /// One input payload: its timestamp, its bytes, and the rows that arrived
+  /// with it - each an NDJSON line an upstream module produced, empty when
+  /// nothing came with it.
+  ///
+  /// For a video instance the bytes are one frame's pixels. For an audio
+  /// instance they are interleaved samples in the instance's sample format,
+  /// the whole window in one contiguous piece: the host re-cuts whatever
+  /// packets arrived, so a module never sees a packet boundary. `pts` is the
+  /// first sample's tick.
+  ///
+  /// Rows ride pad 0. A module reading several streams is handed whatever
+  /// arrived on pad 0 here, and the rows that arrived on any other pad are
+  /// dropped before the call - so `rows` is empty on every pad past the
+  /// first.
+  record in-frame {
+    pts: s64,
+    frame: list<u8>,
+    rows: list<string>,
+  }
 
   /// Where an output payload's bytes come from.
   variant frame-payload {
@@ -263,17 +245,16 @@ interface window-filter {
   /// carries whatever the last stride left over, which may be nothing, and
   /// happens exactly once. There is no separate flush.
   ///
-  /// `window` holds the call's payloads, borrowed for the call: the window
-  /// for a module reading one stream. For a module reading several it is one
-  /// frame per pad, in pad order, every one of them at the same pts - which
-  /// is why such a module is window 1, stride 1.
+  /// `frames` is the window for a module reading one stream. For a module
+  /// reading several it is one frame per pad, in pad order, every one of them
+  /// at the same pts - which is why such a module is window 1, stride 1.
   ///
   /// `trailing` is the rows an upstream module had nothing to put them on;
-  /// only the last call carries any. Like `in-window`'s rows, it follows pad
-  /// 0: what reached the other pads with nothing to ride never arrives here.
+  /// only the last call carries any. Like `rows`, it follows pad 0: what
+  /// reached the other pads with nothing to ride never arrives here.
   ///
   /// Output timestamps never decrease, within a call or between calls.
-  process: func(window: borrow<in-window>, trailing: list<string>, last: bool) -> processed;
+  process: func(frames: list<in-frame>, trailing: list<string>, last: bool) -> processed;
 }
 
 /// A sink for encoded packets. Where `window-filter` is handed decoded
@@ -371,6 +352,6 @@ interface values {
 
 world video-module  { export filter; }
 world meta-module   { export filter; export meta-filter; }
-world window-module { import window-source; export window-filter; }
+world window-module { export window-filter; }
 world packet-module { export packet-sink; }
 world values-module { export values; }

@@ -9,7 +9,7 @@
 //! leaves a frame is this module's rectangles and nothing else.
 
 wit_bindgen::generate!({
-    path: "../../wit",
+    path: "../../worlds/0.10.0",
     world: "window-module",
 });
 

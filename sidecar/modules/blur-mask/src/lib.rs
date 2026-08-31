@@ -18,7 +18,7 @@
 //! on the picture in either plane.
 
 wit_bindgen::generate!({
-    path: "../../wit",
+    path: "../../worlds/0.10.0",
     world: "window-module",
 });
 

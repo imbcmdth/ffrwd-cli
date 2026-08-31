@@ -12,7 +12,7 @@
 // ffrwd:av and wasi:nn - and without it bindgen expects them to have been
 // generated somewhere else.
 wit_bindgen::generate!({
-    path: ["../../wit", "wit"],
+    path: ["../../worlds/0.10.0", "wit"],
     // Fully qualified: three packages are in scope, and each has worlds.
     world: "ffrwd:nn-probe/nn-probe",
     generate_all,

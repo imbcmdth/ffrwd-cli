@@ -3,9 +3,13 @@
 # world older than the current one - each built against that world, so the
 # adapter carrying it is tested against a module actually shaped that way -
 # and one that breaks the rules an audio module is held to, so the refusals
-# are tested the same way.
+# are tested the same way. newest-list and newest-borrow are one filter twice
+# - against the list-shaped windowed world and the current borrowed one - so
+# the two arrivals are proven to land on identical output.
 members = [
     "framestats",
+    "newest-list",
+    "newest-borrow",
     "blur-mask",
     "invert",
     "brand",

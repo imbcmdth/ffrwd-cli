@@ -3,7 +3,7 @@
 //! its output pad carries a null output. The lines are its whole product.
 
 wit_bindgen::generate!({
-    path: "../../wit",
+    path: "../../worlds/0.10.0",
     world: "window-module",
 });
 

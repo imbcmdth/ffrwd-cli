@@ -41,7 +41,7 @@
 #![cfg_attr(not(have_model), allow(dead_code))]
 
 wit_bindgen::generate!({
-    path: "../../wit",
+    path: "../../worlds/0.10.0",
     world: "window-module",
 });
 

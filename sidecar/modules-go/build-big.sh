@@ -44,7 +44,7 @@
 # wasi_snapshot_preview1 adapter. No TinyGo anywhere in the chain.
 #
 # build-big/wit/ is assembled the same way build.sh assembles build/wit/, from
-# the same source: wit/world.wit, ../wit/av.wit, and the wasi imports from
+# the same source: wit/world.wit, ../worlds/0.10.0/av.wit, and the wasi imports from
 # wherever a wasi:cli/imports@0.2.0 wit tree is found (TinyGo's copy, since one
 # is a build.sh prerequisite already, and the wit text itself is the standard
 # unversioned-content wasi:cli@0.2.0 interfaces - nothing TinyGo-specific rides
@@ -55,7 +55,7 @@
 # generated straight into that directory (`componentize-go bindings
 # --generate-stubs`), so the two modules do not share one build the way the
 # TinyGo road's single go.mod does. The generated `export_ffrwd_av_window_filter`
-# package is what a change to ../wit/av.wit regenerates; the hand-written
+# package is what a change to ../worlds/0.10.0/av.wit regenerates; the hand-written
 # bodies inside it (same behaviour as the sibling TinyGo module) are what
 # survives that regeneration only if copied back in - componentize-go
 # overwrites the whole file, unlike wit-bindgen-go's split between generated
@@ -83,7 +83,7 @@ wasi_wit=$tinygo_root/lib/wasi-cli/wit
 rm -rf "$wit"
 mkdir -p "$wit/deps/ffrwd-av" "$wit/deps/cli"
 cp wit/world.wit "$wit/world.wit"
-cp ../wit/av.wit "$wit/deps/ffrwd-av/av.wit"
+cp ../worlds/0.10.0/av.wit "$wit/deps/ffrwd-av/av.wit"
 cp "$wasi_wit"/*.wit "$wit/deps/cli/"
 cp -R "$wasi_wit"/deps/* "$wit/deps/"
 

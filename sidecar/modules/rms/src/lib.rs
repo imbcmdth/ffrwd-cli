@@ -23,7 +23,7 @@
 //! Rows arriving with the audio stop here; what leaves is this module's own.
 
 wit_bindgen::generate!({
-    path: "../../wit",
+    path: "../../worlds/0.10.0",
     world: "window-module",
 });
 

@@ -5,7 +5,7 @@
 //! last one has gone by, so it leaves as a trailing row instead.
 
 wit_bindgen::generate!({
-    path: "../../wit",
+    path: "../../worlds/0.10.0",
     world: "window-module",
 });
 

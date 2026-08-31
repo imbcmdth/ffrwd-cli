@@ -9,7 +9,7 @@
 //! nowhere to put a row and emits none.
 
 wit_bindgen::generate!({
-    path: "../../wit",
+    path: "../../worlds/0.10.0",
     world: "window-module",
 });
 
