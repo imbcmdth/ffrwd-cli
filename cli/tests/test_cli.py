@@ -24,7 +24,14 @@ from ffrwd import cli, show
 from ffrwd.compiler import Compiled
 from ffrwd.execute import PlanResult
 from ffrwd.ir import Graph, Node, Output, RowsSink, SinkUnit
-from ffrwd.processes import FfmpegProcess, ProcessPlan, external_ids, partition
+from ffrwd.processes import (
+    FfmpegProcess,
+    ModuleShape,
+    ProcessPlan,
+    SidecarProcess,
+    external_ids,
+    partition,
+)
 
 VALID_QUERY = "SELECT scale(a.video[1], 640, 480) FROM input('x.mp4') a"
 BAD_QUERY = "SELECT nope(a.video[1]) FROM input('x.mp4') a"
@@ -1356,7 +1363,7 @@ def test_show_and_show_only_are_mutually_exclusive(
 # --- a query that calls a module -------------------------------------------
 
 
-def _module_plan(path: str = "sink.mkv") -> ProcessPlan:
+def _module_plan(path: str = "sink.mkv", *, pure: bool = True) -> ProcessPlan:
     """decode -> module -> encode, the shape a wasm query partitions into."""
     g = Graph(input_paths=["x.mp4"], sources={"a": 0})
     g.nodes["m0"] = Node(
@@ -1367,7 +1374,9 @@ def _module_plan(path: str = "sink.mkv") -> ProcessPlan:
             outputs=[Output(ref="m0", type="video", name=None, metadata={})], path=path
         )
     ]
-    return partition(g, external=external_ids("m0"))
+    return partition(
+        g, external=external_ids("m0"), shapes={"m0.wasm": ModuleShape(pure=pure)}
+    )
 
 
 @pytest.fixture
@@ -1465,3 +1474,165 @@ def test_show_refuses_a_plan_that_writes_no_video(
     captured = capsys.readouterr()
     assert code == 1
     assert "NOTHING_TO_SHOW" in captured.err
+
+
+# --- --jobs, the parallel hosting count -------------------------------------
+
+
+@pytest.mark.parametrize("command", ["compile", "run"])
+@pytest.mark.parametrize("count", ["0", "-1"])
+def test_jobs_below_one_is_a_usage_error(
+    command: str, count: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code = cli.main([command, MEDIA_QUERY, "--jobs", count])
+    captured = capsys.readouterr()
+    assert code == 2
+    assert captured.out == ""
+    assert "--jobs must be 1 or more" in captured.err
+
+
+def _sidecar_argv(caught: dict[str, object]) -> list[str]:
+    """The argv the caught run would have spawned its sidecar with."""
+    plan = caught["plan"]
+    assert isinstance(plan, ProcessPlan)
+    process = plan.process("sidecar0")
+    assert isinstance(process, SidecarProcess)
+    render = caught["sidecar_argv"]
+    assert callable(render)
+    rendered = render(process)
+    assert isinstance(rendered, list)
+    return rendered
+
+
+@pytest.fixture
+def _installed_sidecar(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A located sidecar binary, so an argv renders without one on PATH."""
+    monkeypatch.setattr(cli.binaries, "ffrwd_wasm_path", lambda: "/usr/bin/ffrwd-wasm")
+
+
+def test_jobs_reaches_the_sidecar_of_a_pure_module(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    _ready_to_run: list[dict[str, object]],
+    _installed_sidecar: None,
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        "compile_all",
+        lambda text, **kw: Compiled([_sinked_graph("sink.mkv")], plan=_module_plan()),
+    )
+
+    assert cli.main(["run", SINKED_QUERY, "--jobs", "4"]) == 0
+    argv = _sidecar_argv(_ready_to_run[0])
+    assert argv[argv.index("-jobs") + 1] == "4"
+    assert "warning:" not in capsys.readouterr().err
+
+
+def test_the_default_leaves_the_sidecar_argv_as_it_was(
+    monkeypatch: pytest.MonkeyPatch,
+    _ready_to_run: list[dict[str, object]],
+    _installed_sidecar: None,
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        "compile_all",
+        lambda text, **kw: Compiled([_sinked_graph("sink.mkv")], plan=_module_plan()),
+    )
+
+    assert cli.main(["run", SINKED_QUERY]) == 0
+    assert "-jobs" not in _sidecar_argv(_ready_to_run[0])
+
+
+def test_an_impure_module_is_named_and_left_serial(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    _ready_to_run: list[dict[str, object]],
+    _installed_sidecar: None,
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        "compile_all",
+        lambda text, **kw: Compiled(
+            [_sinked_graph("sink.mkv")], plan=_module_plan(pure=False)
+        ),
+    )
+
+    assert cli.main(["run", SINKED_QUERY, "--jobs", "4"]) == 0
+    assert "-jobs" not in _sidecar_argv(_ready_to_run[0])
+    err = capsys.readouterr().err
+    assert "warning: --jobs 4 does not reach 'm0.wasm'" in err
+    assert "carries state between calls" in err
+
+
+def _network_plan() -> ProcessPlan:
+    """Two modules wired to each other: one region, hands frames on in order."""
+    g = Graph(input_paths=["x.mp4"], sources={"a": 0})
+    g.nodes["m0"] = Node(
+        id="m0", filter="m0.wasm", args={}, inputs=["src:a:v:0"], outputs=["video"]
+    )
+    g.nodes["m1"] = Node(
+        id="m1", filter="m1.wasm", args={}, inputs=["m0"], outputs=["video"]
+    )
+    g.sinks = [
+        SinkUnit(
+            outputs=[Output(ref="m1", type="video", name=None, metadata={})],
+            path="sink.mkv",
+        )
+    ]
+    return partition(
+        g,
+        external=external_ids("m0", "m1"),
+        shapes={"m0.wasm": ModuleShape(), "m1.wasm": ModuleShape()},
+    )
+
+
+def test_a_network_of_modules_says_why_it_stays_serial(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    _ready_to_run: list[dict[str, object]],
+    _installed_sidecar: None,
+) -> None:
+    """Every module is pure; the wiring between them is what keeps one worker."""
+    monkeypatch.setattr(
+        cli,
+        "compile_all",
+        lambda text, **kw: Compiled([_sinked_graph("sink.mkv")], plan=_network_plan()),
+    )
+
+    assert cli.main(["run", SINKED_QUERY, "--jobs", "4"]) == 0
+    assert "-jobs" not in _sidecar_argv(_ready_to_run[0])
+    err = capsys.readouterr().err
+    assert "warning: --jobs 4 does not reach" in err
+    assert "hand frames on in order" in err
+
+
+def test_the_default_says_nothing_about_an_impure_module(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    _ready_to_run: list[dict[str, object]],
+    _installed_sidecar: None,
+) -> None:
+    """Nobody asked for parallel hosting, so nobody is owed the reason."""
+    monkeypatch.setattr(
+        cli,
+        "compile_all",
+        lambda text, **kw: Compiled(
+            [_sinked_graph("sink.mkv")], plan=_module_plan(pure=False)
+        ),
+    )
+
+    assert cli.main(["run", SINKED_QUERY]) == 0
+    assert "warning:" not in capsys.readouterr().err
+
+
+def test_compile_prints_the_jobs_it_would_run_with(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        "compile_all",
+        lambda text, **kw: Compiled([_sinked_graph("sink.mkv")], plan=_module_plan()),
+    )
+
+    assert cli.main(["compile", SINKED_QUERY, "--jobs", "4"]) == 0
+    assert "-jobs 4" in capsys.readouterr().out

@@ -66,6 +66,13 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   reaching one compiles to several processes joined by pipes rather
   than to one ffmpeg command, and `run` executes them together. Recipe
   [87](examples.md#87-run-a-wasm-module-over-the-picture).
+- **`--jobs N`**, on `compile` and `run`, hosts N instances of a module
+  at once and deals frames between them. It reaches a module that
+  describes itself as pure; one that carries state between calls keeps
+  a single instance whatever N is, as do a process hosting several
+  modules and one reading encoded packets. Each module the count did
+  not reach is named on stderr. The default is 1, and the output is the
+  same at any N.
 - A **sink `LANGUAGE wasm` function** (`RETURNS sink`) is a COPY
   destination: `COPY (SELECT <streams>) TO name(<values>)`. The SELECT
   list carries the streams it reads - and the annotation rows riding

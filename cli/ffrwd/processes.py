@@ -498,15 +498,18 @@ class ModuleShape:
     """What one module declares about its own frame timing.
 
     `window` is how many frames the export reads to produce one, `stride` how
-    far it advances between them, and `one_to_one` whether it emits exactly
-    one frame per frame it is handed -- the property a multi-input module's
-    inputs need in common to run in lockstep. A module that declares none of
-    them takes these defaults, which is what a plain filter module does.
+    far it advances between them, `one_to_one` whether it emits exactly one
+    frame per frame it is handed -- the property a multi-input module's inputs
+    need in common to run in lockstep -- and `pure` whether a call depends only
+    on the frames it was handed, which is what lets several instances of it run
+    at once. A module that declares none of them takes these defaults, which is
+    what a plain filter module does.
     """
 
     window: int = 1
     stride: int = 1
     one_to_one: bool = True
+    pure: bool = True
 
     @property
     def lookahead(self) -> int:
@@ -579,6 +582,12 @@ class SidecarProcess:
     `rows` is the region's ROWS output, for a query that selects a module's
     annotation column: the rows leave as a document of their own rather than
     riding frames, and the region's frames end at the module that read them.
+
+    `impure` names the modules of this region that declared they carry state
+    between calls, in region order. It is empty for a region every module of
+    which is pure, and a region with anything in it is hosted by ONE worker
+    however many the run asked for: frame-parallel hosting reorders the calls,
+    which is only safe where a call depends on nothing but its own frames.
     """
 
     id: str
@@ -595,10 +604,14 @@ class SidecarProcess:
     grants: tuple[EffectGrant, ...] = ()
     lookahead: int = 0
     rows: RowsSink | None = None
+    impure: tuple[str, ...] = ()
     # True for a region holding a SINK MODULE: the region consumes its pipes
     # and writes nothing back into the pipeline -- its stream output is a
     # null output, and the module's own effects are the product.
     sink: bool = False
+    # True for a region whose module consumes ENCODED PACKETS rather than
+    # frames.
+    packet_sink: bool = False
 
     @property
     def nodes(self) -> tuple[str, ...]:
@@ -618,6 +631,17 @@ class SidecarProcess:
         return len(self.graph.nodes) > 1 or any(
             len(node.inputs) > 1 for node in self.graph.nodes.values()
         )
+
+    @property
+    def parallel(self) -> bool:
+        """True when several instances of this region may host frames at once.
+
+        One pure module over frames, and nothing else: a region of several is
+        wired node to node and hands frames on in order, a packet sink reads
+        its packets in decode order, and an impure module's calls depend on
+        more than the frames they were handed.
+        """
+        return not self.impure and not self.network and not self.packet_sink
 
     def to_dict(self) -> dict[str, object]:
         written: dict[str, object] = {
@@ -1706,7 +1730,9 @@ class _Partitioner:
                 grants=self._region_grants(members),
                 lookahead=self._lookahead(members),
                 rows=self._region_rows(members),
+                impure=self._region_impure(members),
                 sink=any(name in self.g.module_sinks for name in members),
+                packet_sink=any(name in self.g.packet_sinks for name in members),
             )
             self.sidecars.append(sidecar)
             self.members[sidecar.id] = list(members)
@@ -1795,6 +1821,21 @@ class _Partitioner:
                 if key not in found:
                     found[key] = EffectGrant(effect=effect, module=path)
         return tuple(found.values())
+
+    def _region_impure(self, members: Sequence[str]) -> tuple[str, ...]:
+        """The modules of this region that carry state, in graph order.
+
+        A module that declared nothing about its shape is pure, which is what
+        a plain filter module is.
+        """
+        found: list[str] = []
+        for name in members:
+            if not self.external[name]:
+                continue
+            path = self.g.nodes[name].filter
+            if not self._shape(name).pure and path not in found:
+                found.append(path)
+        return tuple(found)
 
     def _region_rows(self, members: Sequence[str]) -> RowsSink | None:
         """Where this region's rows go, for a region that writes any.

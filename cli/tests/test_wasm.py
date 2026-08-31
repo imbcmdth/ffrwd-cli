@@ -4231,3 +4231,61 @@ def test_a_packet_sink_stays_out_of_select_position() -> None:
         + "COPY (SELECT packet_stats(f.video[1]) FROM input('a.mp4') f) TO 'out.mp4'"
     )
     _packet_rejects(sql, "not a COPY destination")
+
+
+# -- -jobs, the parallel hosting count -------------------------------------
+
+
+def _impure() -> Described:
+    """A module that declared it carries state between calls."""
+    return replace(_described(), pure=False, windowed=True)
+
+
+def test_the_default_leaves_the_sidecar_argv_as_it_was() -> None:
+    """One worker is the sidecar's own default, so nothing is written for it."""
+    plan = _compiled(QUERY).plan
+    assert plan is not None
+    assert wasm.shown_argv(plan.sidecars[0]) == [
+        "ffrwd-wasm", "-f", "nut", "-i", "pipe:0", "-m", MODULE, "-f", "nut", "pipe:1",
+    ]
+    assert "-jobs" not in wasm.shown_argv(plan.sidecars[0], jobs=1)
+
+
+def test_a_pure_module_carries_the_jobs_it_was_asked_for() -> None:
+    plan = _compiled(QUERY).plan
+    assert plan is not None
+    assert wasm.shown_argv(plan.sidecars[0], jobs=4) == [
+        "ffrwd-wasm", "-f", "nut", "-i", "pipe:0", "-jobs", "4",
+        "-m", MODULE, "-f", "nut", "pipe:1",
+    ]
+
+
+def test_an_impure_module_is_hosted_by_one_instance_however_many_were_asked() -> None:
+    plan = _compiled(QUERY, _impure()).plan
+    assert plan is not None
+    assert plan.sidecars[0].impure == (MODULE,)
+    assert "-jobs" not in wasm.shown_argv(plan.sidecars[0], jobs=4)
+
+
+def test_a_region_of_two_modules_takes_no_jobs() -> None:
+    """Its nodes hand frames to each other in order, pure or not."""
+    plan = _annotated_plan(_pair()).plan
+    assert plan is not None
+    assert "-jobs" not in wasm.shown_argv(plan.sidecars[0], jobs=4)
+
+
+def test_one_impure_module_of_a_region_names_itself_and_serializes_it() -> None:
+    plan = _annotated_plan(_pair(), blurrer=replace(_consuming(), pure=False)).plan
+    assert plan is not None
+    assert plan.sidecars[0].impure == (BLURRER,)
+    assert "-jobs" not in wasm.shown_argv(plan.sidecars[0], jobs=4)
+
+
+def test_a_packet_sink_takes_no_jobs() -> None:
+    """Packets reach it in decode order, so one instance reads them."""
+    plan = compile_all(
+        PACKET_QUERY, describe=lambda path: _packet_described()
+    ).plan
+    assert plan is not None
+    assert plan.sidecars[0].packet_sink
+    assert "-jobs" not in wasm.shown_argv(plan.sidecars[0], jobs=4)

@@ -221,6 +221,9 @@ _ANNOTATIONS_FLAG = "-annotations"
 # file is called: the export's own name, beside the module.
 _NN_FLAG = "-nn"
 
+# How many instances of one module host frames at once. Unwritten means one.
+_JOBS_FLAG = "-jobs"
+
 # The sidecar flag that grants each effect to one module, per capability name.
 _GRANT_FLAGS: Mapping[str, str] = {"http": "-http", "udp": "-net"}
 MODEL_SUFFIX = ".onnx"
@@ -345,7 +348,10 @@ class Described:
     def shape(self) -> ModuleShape:
         """This export's frame timing, as partitioning reads it."""
         return ModuleShape(
-            window=self.window, stride=self.stride, one_to_one=self.one_to_one
+            window=self.window,
+            stride=self.stride,
+            one_to_one=self.one_to_one,
+            pure=self.pure,
         )
 
     @property
@@ -615,7 +621,7 @@ def _first_line(text: str) -> str:
 
 
 def _argv(
-    binary: str, process: SidecarProcess, runtime: Sequence[str] = ()
+    binary: str, process: SidecarProcess, runtime: Sequence[str] = (), jobs: int = 1
 ) -> list[str]:
     """One sidecar process as argv, run by `binary`.
 
@@ -645,8 +651,15 @@ def _argv(
     ``-http`` and ``-net`` grant one module its effects, also ahead of the
     module table: the sidecar denies both to any module the argv never
     names.
+
+    ``-jobs`` is how many instances of the module host frames at once, and is
+    written only for a region that can take it (`jobs` above 1 and
+    :attr:`~ffrwd.processes.SidecarProcess.parallel`). One worker is the
+    sidecar's own default, so a serial region carries no ``-jobs`` at all.
     """
     argv = [binary, "-f", EDGE_FORMAT, "-i", STDIN]
+    if jobs > 1 and process.parallel:
+        argv += [_JOBS_FLAG, str(jobs)]
     if process.reads_rows:
         argv += [_ANNOTATIONS_FLAG, ANNOTATIONS_IN]
     if process.models:
@@ -724,7 +737,7 @@ def _network_args(process: SidecarProcess) -> list[str]:
     return argv
 
 
-def sidecar_argv(process: SidecarProcess) -> list[str]:
+def sidecar_argv(process: SidecarProcess, jobs: int = 1) -> list[str]:
     """The argv that RUNS one sidecar process, with the binary located.
 
     A wheel installs the sidecar into the environment's scripts directory,
@@ -734,6 +747,9 @@ def sidecar_argv(process: SidecarProcess) -> list[str]:
     A process binding a model is also told where the fetched ONNX Runtime is
     and what to run it on, which a printed command has no business spelling:
     the directory is under THIS machine's cache.
+
+    `jobs` is how many instances of the module the run asked to host at once;
+    a region that cannot take it keeps one whatever was asked.
 
     Raises ``FfrwdError`` when the sidecar is not installed -- the same
     rejection, and the same hint, a describe gives.
@@ -745,17 +761,17 @@ def sidecar_argv(process: SidecarProcess) -> list[str]:
             "needs it to run",
             hint=INSTALL_HINT,
         )
-    return _argv(binary, process, nn.spawn_args() if process.models else ())
+    return _argv(binary, process, nn.spawn_args() if process.models else (), jobs)
 
 
-def shown_argv(process: SidecarProcess) -> list[str]:
+def shown_argv(process: SidecarProcess, jobs: int = 1) -> list[str]:
     """The argv a PRINTED command line shows, naming the sidecar by program name.
 
     The same convention a printed ffmpeg command follows: what is shown is
     what a reader would type, resolved by PATH, not the absolute path this
     machine happens to have found -- and so with no runtime directory either.
     """
-    return _argv(binaries.SIDECAR_EXECUTABLE, process)
+    return _argv(binaries.SIDECAR_EXECUTABLE, process, (), jobs)
 
 
 def model_path(module: str, export: str) -> str:
