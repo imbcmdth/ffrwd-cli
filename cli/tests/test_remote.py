@@ -36,6 +36,16 @@ JOB_TOKEN = "payload.signature"
 
 MEDIA_QUERY = "COPY (SELECT a.video[1] FROM input('in.mp4') a) TO 'out.mp4'"
 
+REMAINING = {
+    "period": "2026-08-01",
+    "resets_on": "2026-09-01",
+    "cpu_seconds": 2820,
+    "gpu_seconds": 900,
+    "cpu_cents": 188,
+    "gpu_cents": 150,
+    "cents": 338,
+}
+
 
 class _Fake:
     def __init__(self, status: int, body: bytes) -> None:
@@ -93,16 +103,17 @@ def logged_in(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(credentials.TOKEN_ENV, TOKEN)
 
 
-def _submit_accepted(served: _Served) -> None:
-    served.answers[JOBS_URL] = json.dumps(
-        {
-            "job_id": JOB_ID,
-            "job_token": JOB_TOKEN,
-            "upload_url": UPLOAD_URL,
-            "start_url": START_URL,
-            "outputs_expire_days": 7,
-        }
-    ).encode("utf-8")
+def _submit_accepted(served: _Served, *, remaining: dict[str, object] | None = REMAINING) -> None:
+    answer: dict[str, object] = {
+        "job_id": JOB_ID,
+        "job_token": JOB_TOKEN,
+        "upload_url": UPLOAD_URL,
+        "start_url": START_URL,
+        "outputs_expire_days": 7,
+    }
+    if remaining is not None:
+        answer["remaining"] = remaining
+    served.answers[JOBS_URL] = json.dumps(answer).encode("utf-8")
     served.answers[START_URL] = (202, json.dumps({"state": "queued"}).encode("utf-8"))
 
 
@@ -289,10 +300,12 @@ def test_submit_posts_the_spec_uploads_the_file_and_starts(
     code = cli.main(["run", "--remote", "--timeout", "120", query])
     captured = capsys.readouterr()
     assert code == 0
-    assert f"submitted {JOB_ID}" in captured.out
-    assert (
-        f"follow: ffrwd jobs --watch    fetch: ffrwd jobs --fetch {JOB_ID[:8]}"
-        in captured.out
+    # The free line sits between the job id and the follow line, on stdout
+    # like the rest of the result.
+    assert captured.out == (
+        f"submitted {JOB_ID}\n"
+        "free this month: 47m CPU + 15m GPU remaining\n"
+        f"follow: ffrwd jobs --watch    fetch: ffrwd jobs --fetch {JOB_ID[:8]}\n"
     )
     # Each step narrates on stderr, sizes and all; stdout stays the result.
     assert "submitting the job\n" in captured.err
@@ -535,14 +548,17 @@ def test_the_servers_refusal_passes_through_as_itself(
     served.answers[JOBS_URL] = (
         402,
         json.dumps(
-            {"error": "this month's minutes are spent", "hint": "add a payment method"}
+            {
+                "error": "the free allotment is spent: 0m cpu and 0m gpu left this month",
+                "hint": "it resets on 2026-09-01; until then, run without --remote",
+            }
         ).encode("utf-8"),
     )
     code = cli.main(["run", "--remote", MEDIA_QUERY])
     err = capsys.readouterr().err
     assert code == 1
-    assert "this month's minutes are spent" in err
-    assert "add a payment method" in err
+    assert "the free allotment is spent: 0m cpu and 0m gpu left this month" in err
+    assert "it resets on 2026-09-01; until then, run without --remote" in err
 
 
 # ---------------------------------------------------------------------------
@@ -571,8 +587,15 @@ ROW_OLD = {
 }
 
 
-def _listing(served: _Served, *rows: dict[str, object]) -> None:
-    served.answers[JOBS_URL] = json.dumps({"jobs": list(rows)}).encode("utf-8")
+def _listing(
+    served: _Served,
+    *rows: dict[str, object],
+    remaining: dict[str, object] | None = REMAINING,
+) -> None:
+    body: dict[str, object] = {"jobs": list(rows)}
+    if remaining is not None:
+        body["remaining"] = remaining
+    served.answers[JOBS_URL] = json.dumps(body).encode("utf-8")
 
 
 @pytest.fixture
@@ -597,18 +620,53 @@ def test_jobs_lists_a_table_with_the_month_footer(
             ["bbbb2222", "failed", "sql", False, "1m30s", "50d ago"],
         ],
     )
-    assert out == render_table(expected) + "\nthis month: 5 min cpu · 1 min gpu · 1 jobs\n"
+    assert out == render_table(expected) + (
+        "\nthis month: 5 min cpu · 1 min gpu · 1 jobs\n"
+        "free this month: 47m CPU + 15m GPU remaining\n"
+    )
 
 
-def test_jobs_json_prints_the_raw_rows(
+def test_a_listing_with_no_remaining_prints_only_the_month_footer(
+    served: _Served, logged_in: None, fixed_clock: None, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # An older server sends no `remaining` at all -- nothing about it prints.
+    _listing(served, ROW_DONE, remaining=None)
+    code = cli.main(["jobs"])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "this month:" in out
+    assert "free this month:" not in out
+
+
+def test_the_free_line_floors_minutes_and_never_goes_negative(
+    served: _Served, logged_in: None, fixed_clock: None, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _listing(served, ROW_DONE, remaining={"cpu_seconds": 119, "gpu_seconds": 59})
+    code = cli.main(["jobs"])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "free this month: 1m CPU + 0m GPU remaining" in out
+
+
+def test_jobs_json_prints_the_rows_and_remaining_verbatim(
     served: _Served, logged_in: None, capsys: pytest.CaptureFixture[str]
 ) -> None:
     _listing(served, ROW_DONE, ROW_OLD)
     code = cli.main(["jobs", "--json"])
     captured = capsys.readouterr()
     assert code == 0
-    assert json.loads(captured.out) == [ROW_DONE, ROW_OLD]
+    assert json.loads(captured.out) == {"jobs": [ROW_DONE, ROW_OLD], "remaining": REMAINING}
     assert captured.err == ""  # nothing narrates over a machine-read listing
+
+
+def test_jobs_json_carries_a_null_remaining_when_the_server_sends_none(
+    served: _Served, logged_in: None, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _listing(served, ROW_DONE, remaining=None)
+    code = cli.main(["jobs", "--json"])
+    captured = capsys.readouterr()
+    assert code == 0
+    assert json.loads(captured.out) == {"jobs": [ROW_DONE], "remaining": None}
 
 
 def test_watch_redraws_until_nothing_is_running(
@@ -631,7 +689,8 @@ def test_watch_redraws_until_nothing_is_running(
     out = capsys.readouterr().out
     assert code == 0
     assert slept == [remote.WATCH_SECONDS]
-    assert out.count("this month:") == 2
+    assert out.count("\nthis month:") == 2
+    assert out.count("free this month:") == 2  # both footer lines redraw
     assert "running" in out and "succeeded" in out
 
 

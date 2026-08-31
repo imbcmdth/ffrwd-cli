@@ -60,7 +60,7 @@ from ffrwd.project import (
 )
 from ffrwd.table import CellValue, TableResult, render_table
 
-__all__ = ["RunQuery", "jobs_command", "submit_run"]
+__all__ = ["RunQuery", "Submitted", "free_footer", "jobs_command", "submit_run"]
 
 # The submit payload format this client writes. The endpoint refuses any
 # other with a 426 naming the upgrade.
@@ -230,9 +230,35 @@ def _json_object(body: bytes, where: str) -> dict[str, object]:
     return {str(key): value for key, value in data.items()}
 
 
+def _remaining(data: dict[str, object]) -> dict[str, object] | None:
+    """The optional ``remaining`` object a submit or a listing may carry.
+
+    None on a server that predates the free allotment, or that sent
+    something other than an object under the key -- either way there is
+    nothing to render.
+    """
+    value = data.get("remaining")
+    if not isinstance(value, dict):
+        return None
+    return {str(key): item for key, item in value.items()}
+
+
 # --------------------------------------------------------------------------
 # submit
 # --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Submitted:
+    """What a submit hands back: the job id, and the account's free balance.
+
+    `remaining` is the server's own object, verbatim -- None on a server that
+    predates the free allotment, in which case the caller prints nothing
+    about it.
+    """
+
+    job_id: str
+    remaining: dict[str, object] | None
 
 
 def submit_run(
@@ -241,14 +267,15 @@ def submit_run(
     args: argparse.Namespace,
     *,
     announce: Announce | None = None,
-) -> str:
+) -> Submitted:
     """Submit `query` as a hosted job: post the spec, upload the inputs, start it.
 
     Called from ``run``'s fork after the query classified as a media one.
     Raises :class:`FfrwdError` for every refusal -- this machine's own all
     before the first request, the server's passed through -- and returns the
-    job id the caller reports. `announce` hears one line per step: the
-    submit, each upload with its size, and the start.
+    job id the caller reports, alongside what the account has left this
+    month. `announce` hears one line per step: the submit, each upload with
+    its size, and the start.
     """
     if args.show or args.show_only:
         raise _reject(
@@ -303,7 +330,7 @@ def submit_run(
         data=b"{}",
         timeout=_DATA_PLANE_TIMEOUT,
     )
-    return job_id
+    return Submitted(job_id=job_id, remaining=_remaining(answer))
 
 
 def _refuse_linked(packages: PackageSet | None) -> None:
@@ -490,21 +517,27 @@ def jobs_command(args: argparse.Namespace, *, announce: Announce | None = None) 
         )
     if args.watch:
         return _watch(token)
-    rows = _rows(token)
+    rows, remaining = _listing(token)
     if args.as_json:
-        print(json.dumps(rows, indent=2))
+        print(json.dumps({"jobs": rows, "remaining": remaining}, indent=2))
         return 0
-    _print_listing(rows, _utcnow())
+    _print_listing(rows, _utcnow(), remaining)
     return 0
 
 
-def _rows(token: str) -> list[dict[str, object]]:
+def _listing(token: str) -> tuple[list[dict[str, object]], dict[str, object] | None]:
     where = _jobs_url()
     data = _json_object(_call(where, headers=_bearer(token)), where)
     rows = data.get("jobs")
     if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
         raise _malformed(where)
-    return [{str(key): value for key, value in row.items()} for row in rows]
+    return [{str(key): value for key, value in row.items()} for row in rows], _remaining(data)
+
+
+def _rows(token: str) -> list[dict[str, object]]:
+    """The listing's rows alone, for the callers that never render a footer."""
+    rows, _ = _listing(token)
+    return rows
 
 
 def _text(row: dict[str, object], key: str) -> str:
@@ -599,19 +632,35 @@ def _month_footer(rows: list[dict[str, object]], now: datetime) -> str:
     )
 
 
-def _print_listing(rows: list[dict[str, object]], now: datetime) -> None:
+def free_footer(remaining: dict[str, object]) -> str:
+    """The free allotment left this month, over one `remaining` object.
+
+    Sibling of `_month_footer`: minutes are whole, floored from the seconds
+    the server holds authoritative, never below zero. Shared with `submit_run`'s
+    caller, which prints the same line right after a submit.
+    """
+    cpu = max(0, int(_seconds(remaining, "cpu_seconds") // 60))
+    gpu = max(0, int(_seconds(remaining, "gpu_seconds") // 60))
+    return f"free this month: {cpu}m CPU + {gpu}m GPU remaining"
+
+
+def _print_listing(
+    rows: list[dict[str, object]], now: datetime, remaining: dict[str, object] | None
+) -> None:
     print(render_table(_listing_table(rows, now)))
     print(_month_footer(rows, now))
+    if remaining is not None:
+        print(free_footer(remaining))
 
 
 def _watch(token: str) -> int:
     """Redraw the listing until nothing is submitted, queued or running."""
     try:
         while True:
-            rows = _rows(token)
+            rows, remaining = _listing(token)
             if sys.stdout.isatty():
                 print("\x1b[2J\x1b[H", end="")
-            _print_listing(rows, _utcnow())
+            _print_listing(rows, _utcnow(), remaining)
             if not any(_text(row, "state") in _ACTIVE_STATES for row in rows):
                 return 0
             _sleep(WATCH_SECONDS)

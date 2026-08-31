@@ -1222,12 +1222,14 @@ def _cmd_run(args: argparse.Namespace, on_warning: OnWarning) -> int:
                     "set prints right here",
                 )
             with console.status("submitting"):
-                job_id = remote.submit_run(query, packages, args, announce=console.say)
+                submitted = remote.submit_run(query, packages, args, announce=console.say)
         except FfrwdError as err:
             _print_error(err, source=args.query, packages=packages, query=query)
             return 1
-        print(f"submitted {job_id}")
-        print(f"follow: ffrwd jobs --watch    fetch: ffrwd jobs --fetch {job_id[:8]}")
+        print(f"submitted {submitted.job_id}")
+        if submitted.remaining is not None:
+            print(remote.free_footer(submitted.remaining))
+        print(f"follow: ffrwd jobs --watch    fetch: ffrwd jobs --fetch {submitted.job_id[:8]}")
         return 0
 
     showing = args.show or args.show_only
