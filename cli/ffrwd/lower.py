@@ -7025,7 +7025,8 @@ class _Lowerer:
                 "is no language a container can be tagged with",
                 written,
                 fallback=node,
-                hint="name the language as its two-letter code, e.g. 'es' or 'en'",
+                hint="name the language as its two-letter code, e.g. 'es' or "
+                "'en'; rows that are no language at all are 'zxx'",
             )
         return None
 

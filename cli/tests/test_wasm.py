@@ -2518,6 +2518,25 @@ def test_an_unknown_code_has_no_tag() -> None:
     assert wasm.language_tag("zz") is None
 
 
+def test_a_track_that_is_no_language_tags_as_one_anyway() -> None:
+    # A module's machine-readable rows -- decoded barcodes, telemetry -- are
+    # `zxx`; speech nobody identified is `und`; several at once is `mul`.
+    assert wasm.language_tag("zxx") == "zxx"
+    assert wasm.language_tag("und") == "und"
+    assert wasm.language_tag("mul") == "mul"
+
+
+def test_the_local_use_range_is_a_modules_own_to_pick_from() -> None:
+    # 639-2 promises nothing will ever be assigned in qaa-qtz.
+    assert wasm.language_tag("qaa") == "qaa"
+    assert wasm.language_tag("qtz") == "qtz"
+    assert wasm.language_tag("QRR") == "qrr"
+    # Its edges, and the two-letter spelling nobody may use, stay refused.
+    assert wasm.language_tag("qua") is None
+    assert wasm.language_tag("q9a") is None
+    assert wasm.language_tag("qr") is None
+
+
 # the container the track is written for
 
 

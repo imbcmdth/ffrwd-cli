@@ -189,7 +189,26 @@ LANGUAGE_TAGS: Mapping[str, str] = {
     "zh": "chi",
 }
 
-_LANGUAGE_TAG_VALUES = frozenset(LANGUAGE_TAGS.values())
+# 639-2 codes for what is not a language: `zxx` for content with none at all
+# (a module's machine-readable payloads -- decoded barcodes, telemetry), `und`
+# for speech whose language nobody determined, `mul` for several at once.
+_NON_LANGUAGE_TAGS = frozenset({"zxx", "und", "mul"})
+
+_LANGUAGE_TAG_VALUES = frozenset(LANGUAGE_TAGS.values()) | _NON_LANGUAGE_TAGS
+
+
+def _local_use_tag(written: str) -> bool:
+    """Whether `written` is in 639-2's `qaa`-`qtz` range, reserved for local use.
+
+    A container may carry one, and the standard promises no code will ever be
+    assigned there, so a module tagging its own kind of track picks from here.
+    """
+    return (
+        len(written) == 3
+        and written[0] == "q"
+        and "a" <= written[1] <= "t"
+        and "a" <= written[2] <= "z"
+    )
 
 _DESCRIBE_FLAG = "--describe"
 _INVOKE_FLAG = "--invoke"
@@ -815,10 +834,12 @@ def language_tag(code: str) -> str | None:
     """The container tag for a language `code`, or None for one not known.
 
     A written 639-1 code maps to the 639-2/B tag a container records; a code
-    already spelled as that tag is itself.
+    already spelled as that tag is itself. `zxx`, `und` and `mul` pass for the
+    tracks that are not one language, and so does the `qaa`-`qtz` range the
+    standard reserves for local use.
     """
     written = code.strip().lower()
-    if written in _LANGUAGE_TAG_VALUES:
+    if written in _LANGUAGE_TAG_VALUES or _local_use_tag(written):
         return written
     return LANGUAGE_TAGS.get(written)
 
