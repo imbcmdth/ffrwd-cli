@@ -346,6 +346,15 @@ def _check_jobs(args: argparse.Namespace) -> int:
     return 2
 
 
+def _check_wait(args: argparse.Namespace) -> int:
+    """0 for a usable ``--wait``, or 2 with the usage error printed."""
+    if not getattr(args, "wait", False) or args.remote:
+        return 0
+    print(f"error: {args.command}: --wait needs --remote", file=sys.stderr)
+    print("hint: pass --remote too, or drop --wait", file=sys.stderr)
+    return 2
+
+
 def _console(args: argparse.Namespace) -> Console:
     """The narration this invocation speaks with: stderr, muted by -q/--quiet."""
     return Console(quiet=bool(getattr(args, "quiet", False)))
@@ -436,6 +445,18 @@ def _build_parser() -> argparse.ArgumentParser:
         "--remote",
         action="store_true",
         help="submit the run to the hosted runner instead of executing ffmpeg here",
+    )
+    run_p.add_argument(
+        "--wait",
+        action="store_true",
+        help="with --remote, block until the job finishes, drawing its progress, "
+        "and fetch its outputs",
+    )
+    run_p.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="with --remote --wait, emit the finished job as JSON instead of a bar",
     )
 
     jobs_p = subparsers.add_parser(
@@ -1242,6 +1263,9 @@ def _cmd_run(args: argparse.Namespace, on_warning: OnWarning) -> int:
     code = _check_jobs(args)
     if code != 0:
         return code
+    code = _check_wait(args)
+    if code != 0:
+        return code
     try:
         query, packages, code = _resolve_query(args)
         if query is None:
@@ -1271,13 +1295,21 @@ def _cmd_run(args: argparse.Namespace, on_warning: OnWarning) -> int:
                 )
             with console.status("submitting"):
                 submitted = remote.submit_run(query, packages, args, announce=console.say)
+            # --wait --json speaks JSON alone on stdout; the plain submit
+            # lines are the narration --json replaces, not adds to.
+            if not (args.wait and args.as_json):
+                print(f"submitted {submitted.job_id}")
+                if submitted.remaining is not None:
+                    print(remote.free_footer(submitted.remaining))
+                print(
+                    "follow: ffrwd jobs --watch    "
+                    f"fetch: ffrwd jobs --fetch {submitted.job_id[:8]}"
+                )
+            if args.wait:
+                return remote.wait_for_run(submitted.job_id, args, console=console)
         except FfrwdError as err:
             _print_error(err, source=args.query, packages=packages, query=query)
             return 1
-        print(f"submitted {submitted.job_id}")
-        if submitted.remaining is not None:
-            print(remote.free_footer(submitted.remaining))
-        print(f"follow: ffrwd jobs --watch    fetch: ffrwd jobs --fetch {submitted.job_id[:8]}")
         return 0
 
     showing = args.show or args.show_only

@@ -170,6 +170,7 @@ _KNOWN = frozenset(
         "dependencies",
         "keywords",
         "license",
+        "homepage",
         "ffrwd",
         "models",
         "capabilities",
@@ -202,6 +203,11 @@ _MAX_ENGINES_LENGTH = 64
 # no allowlist behind it.
 _LICENSE_RE = re.compile(r"[^\x00-\x1f\x7f]+")
 _MAX_LICENSE_LENGTH = 64
+
+# "homepage" is a project page for the package, shown on its listing. http(s)
+# only; trimmed, and an empty result is the same as the key never having been
+# written at all.
+_MAX_HOMEPAGE_LENGTH = 300
 
 # One model file on the hub: a `<owner>/<name>` repository, one revision --
 # a branch, a tag or a commit -- and one file inside it, each half checked
@@ -259,6 +265,10 @@ _ENGINES_HINT = (
 _LICENSE_HINT = (
     '"license" is what this package is published under, written as an SPDX '
     'identifier or an expression over them, e.g. "MIT" or "MIT OR Apache-2.0"'
+)
+_HOMEPAGE_HINT = (
+    f'"homepage" is a project page, an http:// or https:// URL of at most '
+    f"{_MAX_HOMEPAGE_LENGTH} characters"
 )
 _CAPABILITIES_HINT = (
     '"capabilities" is a list of what the host must grant this package\'s '
@@ -353,13 +363,14 @@ class Package:
     solved.
 
     `keywords` are the labels the registry indexes it under, `license` what
-    the package is published under (None when it says nothing), `capabilities`
-    what the manifest declares its modules need the host to grant, `engines`
-    the range of ffrwd versions the manifest's ``ffrwd`` key declares (None
-    when it declares none), `models` the model file each named export loads,
-    keyed by export name, and `private` whether a publish stamps the version
-    private. All six are the registry's business rather than a compile's:
-    they are read, validated and carried, and nothing here acts on them.
+    the package is published under (None when it says nothing), `homepage` a
+    project page for it (None the same way), `capabilities` what the manifest
+    declares its modules need the host to grant, `engines` the range of ffrwd
+    versions the manifest's ``ffrwd`` key declares (None when it declares
+    none), `models` the model file each named export loads, keyed by export
+    name, and `private` whether a publish stamps the version private. All
+    seven are the registry's business rather than a compile's: they are read,
+    validated and carried, and nothing here acts on them.
 
     `linked` marks a package read straight out of a working directory rather
     than out of the store. Its files are whatever they are right now, so no
@@ -375,6 +386,7 @@ class Package:
     dependencies: Mapping[str, str] = field(default_factory=dict)
     keywords: tuple[str, ...] = ()
     license: str | None = None
+    homepage: str | None = None
     capabilities: tuple[str, ...] = ()
     engines: str | None = None
     models: Mapping[str, ModelPin] = field(default_factory=dict)
@@ -850,6 +862,35 @@ def _license(data: dict[str, object], path: Path, text: str) -> str | None:
     return written
 
 
+def _homepage(data: dict[str, object], path: Path, text: str) -> str | None:
+    """The project page ``homepage`` names. Trimmed; empty after trimming
+    reads as though the key were never written."""
+    if "homepage" not in data:
+        return None
+    at = _key_line(text, "homepage")
+    written = data["homepage"]
+    if not isinstance(written, str):
+        raise _reject(path, '"homepage" must be a string', line=at, hint=_HOMEPAGE_HINT)
+    trimmed = written.strip()
+    if not trimmed:
+        return None
+    if len(trimmed) > _MAX_HOMEPAGE_LENGTH:
+        raise _reject(
+            path,
+            f'"homepage" is longer than {_MAX_HOMEPAGE_LENGTH} characters',
+            line=at,
+            hint=_HOMEPAGE_HINT,
+        )
+    if not trimmed.startswith(("http://", "https://")):
+        raise _reject(
+            path,
+            f'"homepage" {trimmed!r} must start with http:// or https://',
+            line=at,
+            hint=_HOMEPAGE_HINT,
+        )
+    return trimmed
+
+
 def _engines(data: dict[str, object], path: Path, text: str) -> str | None:
     """The ffrwd version range ``ffrwd`` declares. Shape only; nothing solves it."""
     if "ffrwd" not in data:
@@ -1008,6 +1049,7 @@ def read_manifest(path: Path) -> Package:
         dependencies=_dependencies(data, path, text),
         keywords=_keywords(data, path, text),
         license=_license(data, path, text),
+        homepage=_homepage(data, path, text),
         capabilities=_capabilities(data, path, text),
         engines=_engines(data, path, text),
         models=_models(data, path, text),

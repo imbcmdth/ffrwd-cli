@@ -96,6 +96,7 @@ class Console:
         self.quiet = quiet
         self._lock = threading.Lock()
         self._spinner: _Spinner | None = None
+        self._transient_width = 0
 
     @property
     def stream(self) -> TextIO:
@@ -131,6 +132,32 @@ class Console:
         finally:
             self._spinner = None
             spinner.stop()
+
+    def transient(self, line: str) -> None:
+        """Redraw one line in place over ``\\r`` -- a poll's progress line.
+
+        Silent when quiet or off a TTY, the same as the spinner: a pipe or a
+        CI log gets nothing until the final result prints.
+        """
+        if self.quiet or not self._is_tty():
+            return
+        with self._lock:
+            if self._spinner is not None:
+                self._spinner.clear()
+            pad = max(0, self._transient_width - len(line))
+            self.stream.write("\r" + line + " " * pad)
+            self.stream.flush()
+            self._transient_width = len(line)
+
+    def end_transient(self) -> None:
+        """Blank the last `transient` line so whatever prints next starts clean."""
+        if self.quiet or not self._is_tty():
+            return
+        with self._lock:
+            if self._transient_width:
+                self.stream.write("\r" + " " * self._transient_width + "\r")
+                self.stream.flush()
+                self._transient_width = 0
 
     def _is_tty(self) -> bool:
         try:

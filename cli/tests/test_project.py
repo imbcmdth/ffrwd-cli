@@ -3248,6 +3248,7 @@ def test_the_registry_keys_are_read_and_carried(tmp_path: Path) -> None:
             "ffrwd": ">=0.9",
             # An expression, not just an identifier: both are one line of text.
             "license": "MIT OR Apache-2.0",
+            "homepage": "https://example.com/tracks",
             "models": {"quieter": dict(_MODEL)},
         },
     )
@@ -3256,6 +3257,7 @@ def test_the_registry_keys_are_read_and_carried(tmp_path: Path) -> None:
     assert package.capabilities == ("http", "nn")
     assert package.engines == ">=0.9"
     assert package.license == "MIT OR Apache-2.0"
+    assert package.homepage == "https://example.com/tracks"
     assert dict(package.models) == {
         "quieter": ModelPin(
             repo="depth-anything/small",
@@ -3271,10 +3273,29 @@ def test_a_manifest_declaring_none_of_them_carries_none(tmp_path: Path) -> None:
     assert (
         package.keywords,
         package.license,
+        package.homepage,
         package.capabilities,
         package.engines,
         dict(package.models),
-    ) == ((), None, (), None, {})
+    ) == ((), None, None, (), None, {})
+
+
+@pytest.mark.parametrize("scheme", ["http", "https"])
+def test_homepage_accepts_http_and_https(tmp_path: Path, scheme: str) -> None:
+    manifest = _project(
+        tmp_path,
+        files={"src/tracks.sql": QUIETER},
+        manifest={"homepage": f"{scheme}://example.com/tracks"},
+    )
+    package = read_manifest(manifest)
+    assert package.homepage == f"{scheme}://example.com/tracks"
+
+
+def test_a_blank_homepage_is_the_same_as_absent(tmp_path: Path) -> None:
+    manifest = _project(
+        tmp_path, files={"src/tracks.sql": QUIETER}, manifest={"homepage": "   "}
+    )
+    assert read_manifest(manifest).homepage is None
 
 
 @pytest.mark.parametrize(
@@ -3292,6 +3313,20 @@ def test_a_manifest_declaring_none_of_them_carries_none(tmp_path: Path) -> None:
         ({"license": ["MIT"]}, '"license" must be a non-empty string'),
         ({"license": "M" * 65}, '"license" is longer than 64 characters'),
         ({"license": "MIT\nApache-2.0"}, "is not one line of text"),
+        ({"homepage": 1}, '"homepage" must be a string'),
+        (
+            {"homepage": "ftp://example.com/tracks"},
+            '"homepage" \'ftp://example.com/tracks\' must start with http:// or https://',
+        ),
+        (
+            {"homepage": "javascript:alert(1)"},
+            '"homepage" \'javascript:alert(1)\' must start with http:// or https://',
+        ),
+        (
+            # Exactly 301 characters: one past the cap.
+            {"homepage": "https://" + "a" * 293},
+            '"homepage" is longer than 300 characters',
+        ),
         ({"ffrwd": ""}, '"ffrwd" must be a non-empty string'),
         ({"ffrwd": ">=0.9 or whatever you like"}, "is not a version range"),
         ({"ffrwd": ">" * 65}, '"ffrwd" is longer than 64 characters'),

@@ -73,3 +73,43 @@ def test_a_line_said_while_spinning_lands_on_its_own_clean_line() -> None:
     assert clear + line in written
     # And nothing of the spinner rides on the narration line itself.
     assert written.split(line)[0].endswith(clear)
+
+
+def test_transient_redraws_in_place_and_end_transient_clears_it() -> None:
+    stream = _Tty()
+    console = Console(stream)
+    console.transient("[####--------------------]  10% running")
+    console.transient("[########----------------]  30% running")
+    console.end_transient()
+    written = stream.getvalue()
+    assert written.startswith("\r[####--------------------]  10% running")
+    assert "\r[########----------------]  30% running" in written
+    last_line = "[########----------------]  30% running"
+    assert written.endswith("\r" + " " * len(last_line) + "\r")
+
+
+def test_transient_pads_over_a_shorter_previous_line() -> None:
+    stream = _Tty()
+    console = Console(stream)
+    console.transient("[####--------------------]  10% running")
+    console.transient("done")
+    written = stream.getvalue()
+    assert written.split("\r")[-1] == "done" + " " * (
+        len("[####--------------------]  10% running") - len("done")
+    )
+
+
+def test_transient_never_writes_off_a_tty() -> None:
+    stream = io.StringIO()
+    console = Console(stream)
+    console.transient("[####--------------------]  10% running")
+    console.end_transient()
+    assert stream.getvalue() == ""
+
+
+def test_transient_is_silenced_by_quiet() -> None:
+    stream = _Tty()
+    console = Console(stream, quiet=True)
+    console.transient("[####--------------------]  10% running")
+    console.end_transient()
+    assert stream.getvalue() == ""

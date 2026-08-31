@@ -286,6 +286,22 @@ def test_a_package_declaring_no_license_is_warned_about_rather_than_refused(
     assert warned.hint is not None and "license" in warned.hint
 
 
+def test_the_homepage_a_manifest_declares_reaches_the_publish_metadata(
+    tmp_path: Path,
+) -> None:
+    root = _package(tmp_path / "built", extra={"homepage": "https://example.com/tracks"})
+    prepared = publish.prepare(root / "ffrwd.json")
+    assert prepared.package.homepage == "https://example.com/tracks"
+    assert prepared.metadata()["homepage"] == "https://example.com/tracks"
+
+
+def test_a_package_declaring_no_homepage_sends_none_in_the_metadata(tmp_path: Path) -> None:
+    root = _package(tmp_path / "built")
+    prepared = publish.prepare(root / "ffrwd.json")
+    assert prepared.package.homepage is None
+    assert prepared.metadata()["homepage"] is None
+
+
 def test_a_recipe_that_does_not_compile_is_refused_naming_it(tmp_path: Path) -> None:
     root = _package(
         tmp_path / "built",
@@ -490,6 +506,7 @@ def test_the_upload_carries_the_archive_and_the_metadata_in_one_request(
         "engines",
         "keywords",
         "license",
+        "homepage",
         "models",
     }
     assert metadata["name"] == "broadcast/tracks"

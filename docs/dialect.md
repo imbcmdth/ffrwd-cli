@@ -166,13 +166,14 @@ like any script
 the values are the version range for each, recorded and shown, never
 solved.
 
-Six more keys exist for the registry's sake; no compile reads any of
+Seven more keys exist for the registry's sake; no compile reads any of
 them. The whole manifest's shape is pinned by
 [ffrwd-json.schema.json](ffrwd-json.schema.json).
 
 ```json
 { "keywords": ["depth", "nn"],
   "license": "MIT OR Apache-2.0",
+  "homepage": "https://example.com/depth",
   "capabilities": ["nn"],
   "ffrwd": ">=0.9",
   "private": false,
@@ -192,6 +193,10 @@ identifier (`MIT`) and an expression over them (`MIT OR Apache-2.0`)
 are the same thing here, and no list of licenses is consulted. Like the
 description, it belongs to the version: changing it means publishing a
 new one. A publish with no `license` warns and continues.
+
+`homepage` is a project page for the package, shown on its registry
+listing: an `http://` or `https://` URL, at most 300 characters,
+trimmed - empty after trimming is the same as omitting the key.
 
 `capabilities` is what the host must grant this package's modules:
 `nn` to run a model, `http` to make HTTP requests, `udp` to open UDP

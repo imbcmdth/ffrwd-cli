@@ -61,6 +61,12 @@
       "minLength": 1,
       "maxLength": 64
     },
+    "homepage": {
+      "type": "string",
+      "description": "A project page for the package, shown on the package page.",
+      "pattern": "^https?://",
+      "maxLength": 300
+    },
     "capabilities": {
       "type": "array",
       "description": "What the host must grant this package's modules. Declared here and derived at publish from what each module says it does; a disagreement in either direction is a refusal.",

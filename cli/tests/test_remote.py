@@ -823,3 +823,260 @@ def test_jobs_without_a_token_is_refused(
     assert code == 1
     assert "running remotely needs an ffrwd token" in err
     assert served.asked == []
+
+
+# ---------------------------------------------------------------------------
+# run --remote --wait
+# ---------------------------------------------------------------------------
+
+# No local file, so submit needs no upload: --wait's own tests are about the
+# poll and the fetch, not the submit machinery `test_submit_...` already covers.
+WAIT_QUERY = "COPY (SELECT a.video[1] FROM input('https://cdn.example/x.mp4') a) TO 'out.mp4'"
+
+DOWNLOAD_URL = "https://runner.example/download/aaaa/0?token=t"
+
+
+def _wait_row(state: str, *, progress_pct: float = 0) -> dict[str, object]:
+    return {
+        "id": JOB_ID,
+        "state": state,
+        "progress_pct": progress_pct,
+        "recipe": None,
+        "gpu": False,
+        "duration_cpu_s": 0,
+        "duration_gpu_s": None,
+        "created_at": "2026-08-29T11:00:00+00:00",
+    }
+
+
+def _listing_body(
+    *rows: dict[str, object], remaining: dict[str, object] | None = REMAINING
+) -> dict[str, object]:
+    body: dict[str, object] = {"jobs": list(rows)}
+    if remaining is not None:
+        body["remaining"] = remaining
+    return body
+
+
+def _wait_polling(served: _Served, url: str, bodies: list[dict[str, object]]) -> object:
+    """A GET-`url` sequence for --wait's poll: each of `bodies` in turn, the
+    last one repeating past the end. Submit's own POST to the same URL still
+    answers from `served.answers`, exactly as every other test's does --
+    this only stands in for the listing GETs the poll loop makes."""
+    calls = {"n": 0}
+    base = served.__call__
+
+    def wrapped(request: object, timeout: float | None = None) -> _Fake:
+        full = str(request.full_url)  # type: ignore[attr-defined]
+        data = request.data  # type: ignore[attr-defined]
+        if full == url and data is None:
+            index = min(calls["n"], len(bodies) - 1)
+            calls["n"] += 1
+            return _Fake(200, json.dumps(bodies[index]).encode("utf-8"))
+        return base(request, timeout=timeout)
+
+    return wrapped
+
+
+def _wait_fetchable(served: _Served, content: bytes, path: str = "out.mp4") -> None:
+    fetch_url = f"{JOBS_URL}/{JOB_ID}/fetch"
+    served.answers[fetch_url] = json.dumps(
+        {
+            "job_id": JOB_ID,
+            "outputs": [
+                {
+                    "path": path,
+                    "bytes": len(content),
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                    "url": DOWNLOAD_URL,
+                }
+            ],
+        }
+    ).encode("utf-8")
+    served.answers[DOWNLOAD_URL] = content
+
+
+def test_bar_line_renders_the_fill_and_the_state() -> None:
+    line = remote._bar_line({"progress_pct": 42, "state": "running"})
+    assert line.startswith("[") and line.endswith("42% running")
+    assert line.count("#") == 10  # round(24 * 42 / 100)
+    assert line.count("-") == 14
+
+
+def test_wait_polls_to_success_and_fetches_the_output(
+    served: _Served,
+    logged_in: None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _submit_accepted(served)
+    slept: list[float] = []
+    monkeypatch.setattr(remote, "_sleep", lambda seconds: slept.append(seconds))
+    monkeypatch.setattr(
+        packages,
+        "_urlopen",
+        _wait_polling(
+            served,
+            JOBS_URL,
+            [
+                _listing_body(_wait_row("running", progress_pct=40)),
+                _listing_body(_wait_row("succeeded", progress_pct=100)),
+            ],
+        ),
+    )
+    _wait_fetchable(served, b"the output bytes")
+
+    code = cli.main(["run", "--remote", "--wait", WAIT_QUERY])
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "wrote out.mp4" in captured.out
+    assert (tmp_path / "out.mp4").read_bytes() == b"the output bytes"
+    assert slept == [remote.WATCH_SECONDS]
+
+
+def test_wait_on_failure_prints_the_rows_error_and_exits_1(
+    served: _Served,
+    logged_in: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _submit_accepted(served)
+    monkeypatch.setattr(remote, "_sleep", lambda seconds: None)
+    failed = dict(_wait_row("failed"), error="ffmpeg exited 1: no such filter 'zscale'")
+    monkeypatch.setattr(
+        packages, "_urlopen", _wait_polling(served, JOBS_URL, [_listing_body(failed)])
+    )
+    code = cli.main(["run", "--remote", "--wait", WAIT_QUERY])
+    err = capsys.readouterr().err
+    assert code == 1
+    assert "ffmpeg exited 1: no such filter 'zscale'" in err
+
+
+def test_wait_on_cancelled_prints_the_rows_error_and_exits_1(
+    served: _Served,
+    logged_in: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _submit_accepted(served)
+    monkeypatch.setattr(remote, "_sleep", lambda seconds: None)
+    cancelled = dict(_wait_row("cancelled"), error="cancelled by another session")
+    monkeypatch.setattr(
+        packages, "_urlopen", _wait_polling(served, JOBS_URL, [_listing_body(cancelled)])
+    )
+    code = cli.main(["run", "--remote", "--wait", WAIT_QUERY])
+    err = capsys.readouterr().err
+    assert code == 1
+    assert "cancelled by another session" in err
+
+
+def test_wait_on_budget_exhausted_fetches_and_notes_the_reset(
+    served: _Served,
+    logged_in: None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _submit_accepted(served)
+    monkeypatch.setattr(remote, "_sleep", lambda seconds: None)
+    # A budget stop is a SUCCESS: state succeeded, budget_exhausted marking it.
+    stopped = _wait_row("succeeded", progress_pct=100)
+    stopped["budget_exhausted"] = True
+    monkeypatch.setattr(
+        packages,
+        "_urlopen",
+        _wait_polling(served, JOBS_URL, [_listing_body(stopped)]),
+    )
+    _wait_fetchable(served, b"partial output")
+
+    code = cli.main(["run", "--remote", "--wait", WAIT_QUERY])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "wrote out.mp4" in out
+    assert "the free allotment stopped this job early" in out
+    assert REMAINING["resets_on"] in out  # type: ignore[operator]
+
+
+def test_wait_interrupted_detaches_without_cancelling(
+    served: _Served,
+    logged_in: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _submit_accepted(served)
+
+    def _interrupt(seconds: float) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(remote, "_sleep", _interrupt)
+    monkeypatch.setattr(
+        packages,
+        "_urlopen",
+        _wait_polling(served, JOBS_URL, [_listing_body(_wait_row("running", progress_pct=10))]),
+    )
+    code = cli.main(["run", "--remote", "--wait", WAIT_QUERY])
+    err = capsys.readouterr().err
+    assert code == 130
+    assert f"ffrwd jobs --watch {JOB_ID[:8]}" in err
+    assert f"ffrwd jobs --fetch {JOB_ID[:8]}" in err
+    assert "keeps running" in err
+    assert all(f"/{JOB_ID}/cancel" not in asked for asked, _headers, _body in served.asked)
+
+
+def test_wait_without_remote_is_a_usage_error(capsys: pytest.CaptureFixture[str]) -> None:
+    code = cli.main(["run", "--wait", WAIT_QUERY])
+    err = capsys.readouterr().err
+    assert code == 2
+    assert "error: run: --wait needs --remote" in err
+
+
+def test_json_with_wait_emits_the_row_and_written_paths(
+    served: _Served,
+    logged_in: None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _submit_accepted(served)
+    monkeypatch.setattr(remote, "_sleep", lambda seconds: None)
+    monkeypatch.setattr(
+        packages,
+        "_urlopen",
+        _wait_polling(
+            served, JOBS_URL, [_listing_body(_wait_row("succeeded", progress_pct=100))]
+        ),
+    )
+    _wait_fetchable(served, b"json path bytes")
+
+    code = cli.main(["run", "--remote", "--wait", "--json", WAIT_QUERY])
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "submitted" not in captured.out  # --json speaks JSON alone on stdout
+    payload = json.loads(captured.out)
+    assert payload["job"]["id"] == JOB_ID
+    assert payload["job"]["state"] == "succeeded"
+    assert payload["written"] == ["out.mp4"]
+
+
+def test_json_with_wait_on_failure_emits_the_row_and_exits_1(
+    served: _Served,
+    logged_in: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _submit_accepted(served)
+    monkeypatch.setattr(remote, "_sleep", lambda seconds: None)
+    failed = dict(_wait_row("failed"), error="ffmpeg exited 1")
+    monkeypatch.setattr(
+        packages, "_urlopen", _wait_polling(served, JOBS_URL, [_listing_body(failed)])
+    )
+    code = cli.main(["run", "--remote", "--wait", "--json", WAIT_QUERY])
+    captured = capsys.readouterr()
+    assert code == 1
+    payload = json.loads(captured.out)
+    assert payload["job"]["state"] == "failed"
+    assert payload["job"]["error"] == "ffmpeg exited 1"

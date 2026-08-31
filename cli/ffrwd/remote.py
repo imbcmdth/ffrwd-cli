@@ -34,7 +34,7 @@ import os
 import sys
 import time
 import urllib.error
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -44,7 +44,7 @@ from sqlglot import exp
 
 from ffrwd import __version__, credentials, store
 from ffrwd import packages as packages_module
-from ffrwd.console import Announce, written_size
+from ffrwd.console import Announce, Console, written_size
 from ffrwd.errors import ErrorCode, FfrwdError
 from ffrwd.parser import copy_destinations, input_specs, parse
 from ffrwd.probe import is_url
@@ -60,7 +60,14 @@ from ffrwd.project import (
 )
 from ffrwd.table import CellValue, TableResult, render_table
 
-__all__ = ["RunQuery", "Submitted", "free_footer", "jobs_command", "submit_run"]
+__all__ = [
+    "RunQuery",
+    "Submitted",
+    "free_footer",
+    "jobs_command",
+    "submit_run",
+    "wait_for_run",
+]
 
 # The submit payload format this client writes. The endpoint refuses any
 # other with a 426 naming the upgrade.
@@ -76,6 +83,12 @@ WATCH_SECONDS = 3.0
 _CHUNK_BYTES = 1 << 20
 
 _ACTIVE_STATES = frozenset({"submitted", "queued", "running"})
+
+# --wait's terminal states: whatever a job lands on once it stops polling.
+_WAIT_TERMINAL_STATES = frozenset({"succeeded", "failed", "cancelled"})
+
+# --wait's bar: a fixed character count, filled by the row's progress_pct.
+_BAR_WIDTH = 24
 
 _TOKEN_HINT = (
     "mint a token with the run scope and save it with `ffrwd login --token <token>`"
@@ -512,9 +525,8 @@ def jobs_command(args: argparse.Namespace, *, announce: Announce | None = None) 
     if args.cancel is not None:
         return _cancel(token, str(args.cancel))
     if args.fetch is not None:
-        return _fetch(
-            token, str(args.fetch), overwrite=bool(args.overwrite), announce=announce
-        )
+        _fetch(token, str(args.fetch), overwrite=bool(args.overwrite), announce=announce)
+        return 0
     if args.watch:
         return _watch(token)
     rows, remaining = _listing(token)
@@ -717,8 +729,19 @@ class _Output:
 
 
 def _fetch(
-    token: str, written: str, *, overwrite: bool, announce: Announce | None = None
-) -> int:
+    token: str,
+    written: str,
+    *,
+    overwrite: bool,
+    announce: Announce | None = None,
+    quiet: bool = False,
+) -> list[str]:
+    """Download a job's outputs to their as-written paths. Returns what it wrote.
+
+    Shared by ``jobs --fetch`` (which only cares that this returns at all --
+    a raise is the failure) and ``--wait`` (which reports the paths itself,
+    as JSON, when `quiet` drops the plain ``wrote <path>`` lines).
+    """
     job_id = _resolve_id(token, written)
     where = f"{_jobs_url()}/{job_id}/fetch"
     answer = _json_object(_call(where, headers=_bearer(token), data=b"{}"), where)
@@ -735,8 +758,9 @@ def _fetch(
             )
             announce(f"downloading {output.path}{written_bytes}")
         _download(output.url, Path(output.path), output.sha256)
-        print(f"wrote {output.path}")
-    return 0
+        if not quiet:
+            print(f"wrote {output.path}")
+    return [output.path for output in outputs]
 
 
 def _outputs(answer: dict[str, object], where: str) -> list[_Output]:
@@ -803,3 +827,114 @@ def _download(url: str, path: Path, sha256: str) -> None:
             "try the fetch again",
         )
     os.replace(part, path)
+
+
+# --------------------------------------------------------------------------
+# --wait
+# --------------------------------------------------------------------------
+
+
+def _percent(row: dict[str, object]) -> float:
+    value = row.get("progress_pct")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0.0
+    return max(0.0, min(100.0, float(value)))
+
+
+def _bar_line(row: dict[str, object]) -> str:
+    """--wait's one redrawn line: a bar from `progress_pct`, then the state."""
+    pct = _percent(row)
+    filled = int(round(_BAR_WIDTH * pct / 100))
+    bar = "#" * filled + "-" * (_BAR_WIDTH - filled)
+    return f"[{bar}] {int(pct):3d}% {_text(row, 'state')}"
+
+
+def _poll_to_terminal(
+    token: str, job_id: str, *, draw: Callable[[str], None] | None
+) -> tuple[dict[str, object], dict[str, object] | None]:
+    """Redraw the bar off the same listing --watch reads, until `job_id` lands.
+
+    `draw` is None under --json, which draws nothing. Returns the terminal
+    row alongside that poll's `remaining`, for the budget note.
+    """
+    while True:
+        rows, remaining = _listing(token)
+        row = next((one for one in rows if _text(one, "id") == job_id), None)
+        if row is not None:
+            if draw is not None:
+                draw(_bar_line(row))
+            if _text(row, "state") in _WAIT_TERMINAL_STATES:
+                return row, remaining
+        _sleep(WATCH_SECONDS)
+
+
+def _row_error(row: dict[str, object]) -> FfrwdError:
+    """A failed or cancelled row's own report, rendered the way every other
+    refusal from this module is -- through `_print_error`, at the caller."""
+    message = _text(row, "error") or f"the job {_text(row, 'state')}"
+    hint = _text(row, "hint") or "run `ffrwd jobs` to see the full listing"
+    return _reject(message, hint)
+
+
+def _budget_note(remaining: dict[str, object] | None) -> str:
+    """The one line after a budget-stopped fetch: the stop, and the reset.
+
+    A budget stop is a SUCCESS whose outputs are whole up to where it
+    stopped -- the row's state is succeeded and `budget_exhausted` marks it.
+    """
+    reset = _text(remaining, "resets_on") if remaining is not None else ""
+    if reset:
+        return f"the free allotment stopped this job early; it resets on {reset}"
+    return "the free allotment stopped this job early"
+
+
+def _detach_message(job_id: str) -> str:
+    short = job_id[:8]
+    return (
+        f"detached: {job_id} keeps running -- "
+        f"`ffrwd jobs --watch {short}` to follow it, "
+        f"`ffrwd jobs --fetch {short}` to take its outputs later"
+    )
+
+
+def wait_for_run(job_id: str, args: argparse.Namespace, *, console: Console) -> int:
+    """``run --remote --wait``: poll `job_id` to a terminal state, then fetch.
+
+    Shares `_listing` (--watch's own endpoint and interval) for the poll, and
+    `_fetch` (--fetch's own machinery) for the download. A Ctrl-C during the
+    wait never cancels the job -- it prints where to pick it back up and
+    exits 130. `args.as_json` drops the bar and emits the terminal row (plus
+    any written paths) as one JSON object instead of the plain narration.
+    """
+    token = _token()
+    draw = None if args.as_json else console.transient
+    try:
+        row, remaining = _poll_to_terminal(token, job_id, draw=draw)
+    except KeyboardInterrupt:
+        console.end_transient()
+        print(_detach_message(job_id), file=sys.stderr)
+        return 130
+    console.end_transient()
+    state = _text(row, "state")
+
+    if state in ("failed", "cancelled"):
+        if args.as_json:
+            print(json.dumps({"job": row}, indent=2))
+            return 1
+        raise _row_error(row)
+
+    # succeeded, budget-stopped or not: fetched exactly as `jobs --fetch` does.
+    announce = None if args.as_json else console.say
+    paths = _fetch(
+        token,
+        job_id,
+        overwrite=bool(args.overwrite),
+        announce=announce,
+        quiet=bool(args.as_json),
+    )
+    if args.as_json:
+        print(json.dumps({"job": row, "written": paths}, indent=2))
+        return 0
+    if row.get("budget_exhausted"):
+        print(_budget_note(remaining))
+    return 0

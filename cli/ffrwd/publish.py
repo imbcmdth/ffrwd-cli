@@ -607,6 +607,7 @@ class Prepared:
             "engines": self.package.engines,
             "keywords": list(self.package.keywords),
             "license": self.package.license,
+            "homepage": self.package.homepage,
             "models": {
                 export: {
                     "repo": pin.repo,
