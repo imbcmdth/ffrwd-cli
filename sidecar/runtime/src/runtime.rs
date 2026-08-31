@@ -30,6 +30,7 @@ use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpView};
 use wasmtime_wasi_nn::wit::{WasiNnCtx, WasiNnView};
 
+use crate::egress::{self, NetPolicy};
 use crate::nn;
 
 /// The wit package versions this host loads, newest first. A component is
@@ -759,6 +760,7 @@ struct Host {
     table: ResourceTable,
     nn: WasiNnCtx,
     http: WasiHttpCtx,
+    hooks: egress::Hooks,
 }
 
 impl WasiView for Host {
@@ -773,7 +775,7 @@ impl WasiView for Host {
 impl WasiHttpView for Host {
     fn http(&mut self) -> WasiHttpCtxView<'_> {
         WasiHttpCtxView {
-            hooks: wasmtime_wasi_http::default_hooks(),
+            hooks: &mut self.hooks,
             table: &mut self.table,
             ctx: &mut self.http,
         }
@@ -849,12 +851,22 @@ pub fn grant_net(path: &str) -> Result<()> {
 /// The store's WASI context: no preopens, no env, no args; stderr passes
 /// through. The network is reachable only for a module granted `-net`, and
 /// UDP only: inherit_network opens only the address check, and each protocol
-/// stays refused until allowed.
-fn wasi_ctx(effects: Grants) -> WasiCtx {
+/// stays refused until allowed. Under the public policy the address check
+/// refuses non-public destinations; binds stay open.
+fn wasi_ctx(effects: Grants, policy: NetPolicy) -> WasiCtx {
     let mut builder = WasiCtx::builder();
     builder.inherit_stderr();
     if effects.net {
-        builder.inherit_network();
+        match policy {
+            NetPolicy::Unrestricted => {
+                builder.inherit_network();
+            }
+            NetPolicy::Public => {
+                builder.socket_addr_check(|addr, reason| {
+                    Box::pin(async move { egress::check_socket_addr(addr, reason) })
+                });
+            }
+        }
         builder.allow_udp(true);
     }
     builder.build()
@@ -1746,7 +1758,8 @@ fn instantiate(module_path: &str, purpose: Purpose) -> Result<Opened> {
 
     let (linker, nn) = link(&component, module_path, purpose)?;
 
-    let wasi = wasi_ctx(granted(module_path)?);
+    let policy = egress::net_policy()?;
+    let wasi = wasi_ctx(granted(module_path)?, policy);
     let mut store = Store::new(
         engine(),
         Host {
@@ -1754,6 +1767,7 @@ fn instantiate(module_path: &str, purpose: Purpose) -> Result<Opened> {
             table: ResourceTable::new(),
             nn,
             http: WasiHttpCtx::new(),
+            hooks: egress::Hooks::new(policy),
         },
     );
 
@@ -2020,7 +2034,8 @@ fn instantiate_values(
 
     let (linker, nn) = link(&component, module_path, purpose)?;
 
-    let wasi = wasi_ctx(granted(module_path)?);
+    let policy = egress::net_policy()?;
+    let wasi = wasi_ctx(granted(module_path)?, policy);
     let mut store = Store::new(
         engine(),
         Host {
@@ -2028,6 +2043,7 @@ fn instantiate_values(
             table: ResourceTable::new(),
             nn,
             http: WasiHttpCtx::new(),
+            hooks: egress::Hooks::new(policy),
         },
     );
 
@@ -2142,7 +2158,8 @@ fn instantiate_packet(
 
     let (linker, nn) = link(&component, module_path, purpose)?;
 
-    let wasi = wasi_ctx(granted(module_path)?);
+    let policy = egress::net_policy()?;
+    let wasi = wasi_ctx(granted(module_path)?, policy);
     let mut store = Store::new(
         engine(),
         Host {
@@ -2150,6 +2167,7 @@ fn instantiate_packet(
             table: ResourceTable::new(),
             nn,
             http: WasiHttpCtx::new(),
+            hooks: egress::Hooks::new(policy),
         },
     );
     let module = world_0100::packet::PacketModule::instantiate(&mut store, &component, &linker)
@@ -3016,18 +3034,20 @@ mod net_grant_test {
     }
 
     /// Instantiates the component with the grants its path currently holds
-    /// and calls its `wasi:cli/run` export.
-    fn run_component(path: &Path) -> Result<()> {
+    /// and calls its `wasi:cli/run` export. The policy is a parameter so the
+    /// test never touches the process environment.
+    fn run_component(path: &Path, policy: NetPolicy) -> Result<()> {
         let module_path = path.display().to_string();
         let component = Component::from_file(engine(), path).map_err(wasm_err)?;
         let (linker, nn) = link(&component, &module_path, Purpose::Describe)?;
         let mut store = Store::new(
             engine(),
             Host {
-                wasi: wasi_ctx(granted(&module_path)?),
+                wasi: wasi_ctx(granted(&module_path)?, policy),
                 table: ResourceTable::new(),
                 nn,
                 http: WasiHttpCtx::new(),
+                hooks: egress::Hooks::new(policy),
             },
         );
         let instance = linker
@@ -3071,7 +3091,7 @@ mod net_grant_test {
         // Without any grant: sockets are linked, but creation is refused with
         // access-denied, on which the module aborts. Order matters — grants
         // accumulate for the run, so deny must be proven first.
-        let denied = run_component(&path);
+        let denied = run_component(&path, NetPolicy::Unrestricted);
         assert!(
             denied.is_err(),
             "module reached wasi:sockets without a grant"
@@ -3079,7 +3099,7 @@ mod net_grant_test {
 
         // A grant naming a DIFFERENT module leaves this one refused.
         grant_net("some/other/module.wasm").expect("record the other grant");
-        let still_denied = run_component(&path);
+        let still_denied = run_component(&path, NetPolicy::Unrestricted);
         assert!(
             still_denied.is_err(),
             "a grant is per module, and this one names a different module"
@@ -3087,11 +3107,19 @@ mod net_grant_test {
 
         // With its own grant: the same module round-trips its datagram.
         grant_net(&path.display().to_string()).expect("record the grant");
-        run_component(&path).expect("granted run");
+        run_component(&path, NetPolicy::Unrestricted).expect("granted run");
         assert_eq!(
             peer.join().expect("echo peer"),
             Some(16),
             "echo peer saw the module's datagram"
+        );
+
+        // Same module, same grant, public policy: 127.0.0.1 is not a public
+        // destination, so the send is refused and the run fails.
+        let refused = run_component(&path, NetPolicy::Public);
+        assert!(
+            refused.is_err(),
+            "the public policy let a datagram go to 127.0.0.1"
         );
     }
 }

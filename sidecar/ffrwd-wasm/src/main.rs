@@ -1697,6 +1697,13 @@ fn main() {
         std::process::exit(0);
     }
 
+    // The egress policy is read before anything runs: a bad value is a
+    // configuration error even for a run granting no network.
+    if let Err(e) = ffrwd_wasm_runtime::egress::net_policy() {
+        eprintln!("ffrwd-wasm: {e:#}");
+        std::process::exit(2);
+    }
+
     let (nn_config, raw_args) = match take_nn_args(argv) {
         Ok(split) => split,
         Err(e) => {

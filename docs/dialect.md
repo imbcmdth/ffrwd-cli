@@ -195,6 +195,16 @@ each module says it does and refuses any disagreement in either
 direction: a module needing a capability the manifest omits, and a
 capability the manifest declares that no module needs.
 
+`FFRWD_NET_POLICY=public` in the environment restricts both network
+grants to public destinations: connects and sends to private
+(RFC 1918), loopback, link-local, carrier-NAT, multicast and broadcast
+addresses are refused, and an HTTP request's hostname is judged by the
+addresses it resolves to, not by its spelling. Local binds are
+untouched. Unset leaves the network unrestricted - local test relays
+on loopback keep working. Any other value is an error at startup. The
+hosted runner sets it; a module never resolves or reaches anything
+internal to the machine it runs on.
+
 `private` is a boolean, false when absent: true publishes each version
 private -- installable with a token from the namespace, off the public
 index. A version's visibility is stamped when it is published and never

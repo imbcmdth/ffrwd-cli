@@ -463,13 +463,21 @@ name = "ffrwd-wasm-runtime"
 version = "0.2.1"
 dependencies = [
  "anyhow",
+ "http",
+ "http-body",
+ "http-body-util",
+ "hyper",
  "libloading",
  "ort",
+ "rustls",
  "serde_json",
+ "tokio",
+ "tokio-rustls",
  "wasmtime",
  "wasmtime-wasi",
  "wasmtime-wasi-http",
  "wasmtime-wasi-nn",
+ "webpki-roots",
  "windows-sys 0.59.0",
 ]
 
