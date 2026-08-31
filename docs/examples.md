@@ -2654,3 +2654,38 @@ between them that hands on a different number of frames than it reads
 - `fps`, `select`, a module that does not declare one frame out per
 frame in - has no such count at all, and is refused at compile time
 with `UNBOUNDED_LIVE_INPUT`.
+
+## 103. Give each rung of the ladder its own encode
+
+Recipe 97 varies the picture and the filename per rung and leaves every
+rung encoded the same. A `WITH` option takes a subscripted list variable
+too, so the encoder settings ride the command line with the rest of the
+ladder - one bitrate per rung, read off the pinned row the same way the
+`TO` expression is:
+
+```pgsql
+COPY (
+  SELECT scale(f.video[1], :widths[i.i], -2) AS v, f.audio
+  FROM input('tests/fixtures/av.mp4') f, generate_series(1, 3) i
+) TO (:'names'[i.i] || '.mp4')
+  WITH (video_codec 'libx264', video_bitrate :'rates'[i.i],
+        audio_codec 'aac')
+```
+
+```
+$ ffrwd compile -f query.sql -v widths=1920,1280,640 -v names=1080p,720p,360p -v rates=6000k,3000k,1000k
+ffmpeg -i tests/fixtures/av.mp4 -filter_complex \
+  '[0:v:0]split=3[src_f_v_0_split0][src_f_v_0_split1][src_f_v_0_split2];'\
+'[src_f_v_0_split0]scale=width=1920:height=-2[out0];'\
+'[src_f_v_0_split1]scale=width=1280:height=-2[out2];'\
+'[src_f_v_0_split2]scale=width=640:height=-2[out4]' -map '[out0]' -map 0:a:0 -c:0 \
+  libx264 -b:0 6000k -c:1 aac 1080p.mp4 -map '[out2]' -map 0:a:0 -c:0 libx264 -b:0 3000k \
+  -c:1 aac 720p.mp4 -map '[out4]' -map 0:a:0 -c:0 libx264 -b:0 1000k -c:1 aac 360p.mp4
+```
+
+An option value is settled before ffmpeg runs, so what may stand there
+is a literal or a subscripted list variable and nothing else: a column
+off the media itself is a rejection naming the option. A subscript past
+the end of the list is the same rejection it is anywhere else, naming
+the list's length - so a `rates` list shorter than the series says so
+rather than writing a file at the wrong bitrate.

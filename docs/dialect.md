@@ -859,6 +859,15 @@ two-pass - the full table is generated into the prompt (`ffrwd
 prompt`) and validated per option with typed errors; a sink function
 destination takes none.
 
+An option value is a literal or `ARRAY[literal, ...][k]` - what
+`:'var'[k]` substitutes to - and nothing else: it is settled before
+ffmpeg runs, so a column off the media is a rejection naming the
+option. A subscript reading a row column picks per file, so a fan-out
+`TO` may vary its encode per rung ([recipe
+103](examples.md#103-give-each-rung-of-the-ladder-its-own-encode));
+under a quoted `TO` there is no row to read, and that is a rejection
+too.
+
 ## Variables
 
 `:'name'` (string literal), `:"name"` (identifier) and bare `:name`

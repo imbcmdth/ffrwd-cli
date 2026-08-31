@@ -320,6 +320,7 @@ from ffrwd.parser import (
     RawInputOption,
     RawRowJoin,
     RawSink,
+    RawSinkOption,
     RawSource,
     RawTrackRows,
     RawValuesTable,
@@ -2888,9 +2889,12 @@ class _Lowerer:
                 # muxer's own default applies, and the option table never
                 # sees the value.
                 continue
+            written = self._sink_option_value(option, raw)
+            if written is None:
+                continue  # a NULL element, absence like any other NULL
             line, col = _pos(option.name_node, option.value, raw.path_node)
             options[option.name] = validate_sink_option(
-                option.name, _sink_value(option.value), line=line, col=col
+                option.name, written, line=line, col=col
             )
             option_nodes[option.name] = option.value
         _check_sink_option_conflicts(options, option_nodes, raw.path_node)
@@ -3129,6 +3133,48 @@ class _Lowerer:
             self.fanout_window_conflict = True
             return None
         return windows.pop()
+
+    def _sink_option_value(self, option: RawSinkOption, raw: RawSink) -> object:
+        """One ``WITH (name value)`` value as a python scalar.
+
+        ``ARRAY[<literals>][<subscript>]`` -- what a subscripted list variable
+        substitutes to -- is read here, so each file a fan-out COPY writes
+        carries its own element of the list. A subscript that reads a track
+        row picks off the pinned row, exactly as the ``TO`` expression does.
+
+        An option is settled before ffmpeg runs, so those two shapes and the
+        constants :func:`_sink_value` reads are all that may stand here; a
+        subscript over anything else is refused by name rather than left to
+        the option table's type message, which would say only "a BRACKET
+        expression".
+        """
+        node = _unwrap(option.value)
+        if not isinstance(node, exp.Bracket):
+            return _sink_value(option.value)
+        if not isinstance(node.this, exp.Array):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"sink option '{option.name}' takes a literal or a subscripted "
+                f"list variable, got {_describe(node)}",
+                node,
+                fallback=raw.path_node,
+                hint="an option is settled before ffmpeg runs; write the value "
+                "out, or pass a list on the command line and subscript it, "
+                "e.g. video_bitrate :'rates'[i.i]",
+            )
+        if references_row_alias(node, set(self.res.row_aliases)) and self.fanout_expr is None:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"sink option '{option.name}' reads a track row, and this COPY "
+                "writes one file",
+                node,
+                fallback=raw.path_node,
+                hint="a per-row option value needs a TO expression naming one "
+                "file per row, e.g. TO (:'names'[i.i] || '.mp4')",
+            )
+        env = self.fanout_env if self.fanout_env is not None else _Env()
+        anchor = raw.branches[0] if raw.branches else exp.Select()
+        return self._eval_list_element(node, env, self.fanout_row, anchor)
 
     def _check_fanout_options(self, options: dict[str, object], raw: RawSink) -> None:
         """The sink options a fan-out COPY does not take, v1.

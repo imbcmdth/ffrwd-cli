@@ -1270,6 +1270,13 @@ class _FfrwdPostgres(Postgres):
     words: sqlglot reads the first as a user-defined type, the second is left
     over, and ``STRUCT(v video_stream)`` fails to parse.
     :meth:`Parser._parse_struct_types` is the one place a struct body is read.
+
+    sqlglot reads a COPY option value as one field and stops before a
+    subscript or a dot, so the ``[i.i]`` of ``WITH (video_bitrate
+    ARRAY[...][i.i])`` is left over, the next option parses as a nameless
+    one, and the whole statement fails on a ``CopyParameter`` with no name --
+    a parse error where a rejection naming the option belongs.
+    :meth:`Parser._parse_unquoted_field` is where sqlglot reads such a value.
     """
 
     class Parser(Postgres.Parser):  # type: ignore[misc, valid-type]
@@ -1305,6 +1312,24 @@ class _FfrwdPostgres(Postgres):
             read: exp.Expr = self.expression(
                 ModuleExport(this=module, expression=export), token
             )
+            return read
+
+        def _parse_unquoted_field(self) -> exp.Expr | None:
+            """A COPY option value, which may carry subscripts and dots.
+
+            Everything up to the first ``[`` or ``.`` is sqlglot's own
+            reading, untouched; a value with neither after it comes back
+            exactly as it did. sqlglot's other caller reads a DDL property
+            value, a shape this dialect's grammar never reaches.
+
+            Reading the whole of what was written is what lets a value this
+            dialect does not accept be REJECTED -- by name, with a hint --
+            rather than leave tokens over for the next option to trip on.
+            """
+            field: exp.Expr | None = super()._parse_unquoted_field()
+            if field is None or self._curr is None:
+                return field
+            read: exp.Expr | None = self._parse_column_ops(field)
             return read
 
         def _parse_file_location(self) -> exp.Expr | None:

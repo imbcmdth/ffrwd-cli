@@ -501,8 +501,96 @@ def test_a_cross_product_of_two_row_tables_fans_out_over_every_pair() -> None:
 
 
 # ---------------------------------------------------------------------------
+# a WITH option value read per file
+# ---------------------------------------------------------------------------
+
+
+_PER_RUNG = (
+    f"COPY (SELECT f.video[1], f.audio[1] FROM input('{SRC}') f, "
+    "generate_series(1, 3) i) TO ('r' || i.i::text || '.mp4') "
+    "WITH (video_codec 'libx264', video_bitrate ARRAY['6000k', '3000k', '1000k'][i.i])"
+)
+
+
+def test_a_subscripted_list_option_gives_each_file_its_own_value() -> None:
+    """The shape a subscripted list variable substitutes to, in a WITH option."""
+    units = _units(_PER_RUNG)
+    assert [unit.path for unit in units] == ["r1.mp4", "r2.mp4", "r3.mp4"]
+    assert [unit.options["video_bitrate"] for unit in units] == [
+        "6000k",
+        "3000k",
+        "1000k",
+    ]
+
+
+def test_a_literal_option_is_written_to_every_file_unchanged() -> None:
+    for unit in _units(_PER_RUNG):
+        assert unit.options["video_codec"] == "libx264"
+
+
+def test_a_literal_subscript_needs_no_row_at_all() -> None:
+    """A constant element is a constant option, fan-out or not."""
+    sql = (
+        f"COPY (SELECT f.video[1] FROM input('{SRC}') f) TO 'one.mp4' "
+        "WITH (video_codec 'libx264', video_bitrate ARRAY['6000k', '3000k'][2])"
+    )
+    assert _units(sql)[0].options["video_bitrate"] == "3000k"
+
+
+# ---------------------------------------------------------------------------
 # rejections
 # ---------------------------------------------------------------------------
+
+
+def test_a_subscript_past_the_end_of_an_option_list_names_the_length() -> None:
+    sql = (
+        f"COPY (SELECT f.video[1] FROM input('{SRC}') f, generate_series(1, 3) i) "
+        "TO ('r' || i.i::text || '.mp4') "
+        "WITH (video_codec 'libx264', video_bitrate ARRAY['6000k', '3000k'][i.i])"
+    )
+    err = _rejects(sql)
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "subscript 3 is past the end: the list has 2 elements" in err.message
+
+
+def test_a_row_reading_option_under_a_quoted_to_names_the_fix() -> None:
+    """One row survives, so no ROW_COUNT_MISMATCH stands in the way -- but
+    nothing pinned a row for the option to read, and the hint says so."""
+    sql = (
+        f"COPY (SELECT f.video[1] FROM input('{SRC}') f, generate_series(1, 1) i) "
+        "TO 'one.mp4' WITH (video_bitrate ARRAY['6000k'][i.i])"
+    )
+    err = _rejects(sql)
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "reads a track row, and this COPY writes one file" in err.message
+
+
+def test_a_stream_column_in_an_option_is_rejected_by_name() -> None:
+    """Not a parse error: an option value ffrwd does not accept is refused
+    here, naming the option, with the two shapes that stand there."""
+    sql = (
+        f"COPY (SELECT f.video[1] FROM input('{SRC}') f, generate_series(1, 2) i) "
+        "TO ('r' || i.i::text || '.mp4') "
+        "WITH (video_codec 'libx264', video_bitrate f.video[1])"
+    )
+    err = _rejects(sql)
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert (
+        "sink option 'video_bitrate' takes a literal or a subscripted list variable"
+        in err.message
+    )
+    assert err.hint is not None and ":'rates'[i.i]" in err.hint
+
+
+def test_a_row_column_in_an_option_is_a_typed_option_rejection() -> None:
+    sql = (
+        f"COPY (SELECT f.video[1] FROM input('{SRC}') f, generate_series(1, 2) i) "
+        "TO ('r' || i.i::text || '.mp4') "
+        "WITH (video_codec 'libx264', video_bitrate i.i)"
+    )
+    err = _rejects(sql)
+    assert err.code is ErrorCode.SINK_OPTION_TYPE
+    assert "option 'video_bitrate' expects a str" in err.message
 
 
 def test_two_pass_and_a_fan_out_to_are_rejected() -> None:
@@ -693,6 +781,13 @@ def test_compile_prints_one_command_for_the_whole_fan_out() -> None:
     line = _compile_line(_PER_LANGUAGE)
     assert " && " not in line
     assert line.count("ffmpeg ") == 1
+
+
+def test_a_per_file_option_value_reaches_each_output_in_the_argv() -> None:
+    line = _compile_line(_PER_RUNG)
+    assert "-b:0 6000k" in line
+    assert "-b:0 3000k" in line
+    assert "-b:0 1000k" in line
 
 
 def test_dash_o_against_a_fan_out_query_is_an_unrecognized_argument(
