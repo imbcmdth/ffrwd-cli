@@ -136,5 +136,8 @@ def insert_pts_resets(g: Graph) -> Graph:
         input_options={alias: dict(options) for alias, options in g.input_options.items()},
         rows_sinks=dict(g.rows_sinks),
         module_sinks=list(g.module_sinks),
-        packet_sinks={name: dict(options) for name, options in g.packet_sinks.items()},
+        packet_sinks={
+            name: [dict(pad) for pad in pads]
+            for name, pads in g.packet_sinks.items()
+        },
     )

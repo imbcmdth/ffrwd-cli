@@ -424,11 +424,12 @@ class Graph:
     # consumes its streams and writes nothing back -- its own effects are the
     # output, so its pad reaches no file and no other node.
     module_sinks: list[str] = field(default_factory=list)
-    # Node id -> the validated encoder options shaping the stream a PACKET
-    # SINK consumes: the module reads the encoder's own output, so the
-    # feeding ffmpeg encodes onto the edge. `video_codec` is always present.
-    # Every key here is also in `module_sinks`.
-    packet_sinks: dict[str, dict[str, object]] = field(default_factory=dict)
+    # Node id -> the validated encoder options shaping each stream a PACKET
+    # SINK consumes, one dict per PAD in pad order: the module reads the
+    # encoder's own output, so the feeding ffmpeg encodes onto every edge, and
+    # a rendition ladder shapes each of them differently. `video_codec` is
+    # always present in each. Every key here is also in `module_sinks`.
+    packet_sinks: dict[str, list[dict[str, object]]] = field(default_factory=dict)
 
     @property
     def outputs(self) -> list[Output]:
@@ -468,7 +469,8 @@ class Graph:
             d["module_sinks"] = list(self.module_sinks)
         if self.packet_sinks:
             d["packet_sinks"] = {
-                name: dict(options) for name, options in self.packet_sinks.items()
+                name: [dict(pad) for pad in pads]
+                for name, pads in self.packet_sinks.items()
             }
         return d
 
@@ -529,12 +531,12 @@ class Graph:
             module_sinks = [str(name) for name in raw_module_sinks]
 
         raw_packet_sinks = d.get("packet_sinks")
-        packet_sinks: dict[str, dict[str, object]] = {}
+        packet_sinks: dict[str, list[dict[str, object]]] = {}
         if raw_packet_sinks is not None:
             assert isinstance(raw_packet_sinks, dict)
-            for name, options in raw_packet_sinks.items():
-                assert isinstance(options, dict)
-                packet_sinks[str(name)] = dict(options)
+            for name, pads in raw_packet_sinks.items():
+                assert isinstance(pads, list)
+                packet_sinks[str(name)] = [dict(pad) for pad in pads]
 
         return cls(
             input_paths=[str(p) for p in raw_inputs],

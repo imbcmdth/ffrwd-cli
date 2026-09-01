@@ -1,6 +1,6 @@
 {
   "name": "ffrwd/wasm",
-  "version": "0.11.0",
+  "version": "0.12.0",
   "description": "The ffrwd:av wit world a wasm module is built against, carried as a package: this version's number is the world's. Assets only - no exports, no recipes, no module.",
   "license": "MIT",
   "keywords": [

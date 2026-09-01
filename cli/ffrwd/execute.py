@@ -459,7 +459,7 @@ PipeNamer = Callable[[PipeEdge, Side], str]
 
 # Renders one sidecar process as the argv that runs it. The real one lands
 # with the sidecar itself; until then a caller supplies it.
-SidecarArgv = Callable[[SidecarProcess], list[str]]
+SidecarArgv = Callable[[SidecarProcess, Sequence[str]], list[str]]
 
 
 @dataclass(frozen=True)
@@ -673,7 +673,10 @@ def plan_argv(
         rows_out = [e for e in plan.rows_edges if e.source == process.id]
         if isinstance(process, SidecarProcess):
             argv[process.id] = _sidecar_args(
-                process, sidecar_argv, len(incoming), len(outgoing) + len(rows_out)
+                process,
+                sidecar_argv,
+                [read[edge] for edge in incoming],
+                len(outgoing) + len(rows_out),
             )
             continue
         rows_in = _rows_inputs(process, plan)
@@ -946,9 +949,17 @@ def _once_per_ref(edges: Sequence[StreamEdge]) -> list[StreamEdge]:
 def _sidecar_args(
     process: SidecarProcess,
     hook: SidecarArgv | None,
-    reads: int,
+    reads: Sequence[str],
     writes: int,
 ) -> list[str]:
+    """One sidecar process as argv, its inputs spelled as `reads` names them.
+
+    `reads` is one path per incoming edge, in the order the module's own pads
+    take them: stdin where the plan hands this process one thing, a named pipe
+    per edge where it fans in. Only a SINK reads several -- everything else
+    takes its pads out of one input -- and one stdout is all any of them
+    writes.
+    """
     if hook is None:
         raise FfrwdError(
             ErrorCode.INTERNAL,
@@ -956,15 +967,23 @@ def _sidecar_args(
             "nothing was given to spawn it",
             hint="pass sidecar_argv, which renders one sidecar process as argv",
         )
-    if reads > 1 or writes > 1:
+    if writes > 1:
         raise FfrwdError(
             ErrorCode.INTERNAL,
-            f"process {process.id!r} reads {reads} streams and writes {writes}, "
-            "but only its own stdin and stdout are wired",
-            hint="a sidecar reading or writing more than one stream needs argv "
-            "that can spell a named pipe path",
+            f"process {process.id!r} writes {writes} streams, but only its own "
+            "stdout is wired",
+            hint="a sidecar writing more than one stream needs argv that can "
+            "spell a named pipe path",
         )
-    return list(hook(process))
+    if len(reads) > 1 and not process.packet_sink:
+        raise FfrwdError(
+            ErrorCode.INTERNAL,
+            f"process {process.id!r} reads {len(reads)} streams and hosts no "
+            "packet sink",
+            hint="a frame module takes its pads out of one input, wired by the "
+            "network string",
+        )
+    return list(hook(process, reads))
 
 
 def _spawn_argv(

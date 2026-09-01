@@ -99,6 +99,7 @@ from .parser import (
     _ARITHMETIC,
     FILTER_NAMESPACE,
     MACRO_NAMESPACE,
+    SINK_STREAMS,
     ModuleExport,
     _check_query_args,
     _error,
@@ -128,6 +129,7 @@ from .warnings import FfrwdWarning, OnWarning, WarningCode
 
 __all__ = [
     "NAMEABLE_TYPES",
+    "SINK_STREAMS",
     "WASM_STREAM_NAMES",
     "WASM_STREAM_TYPES",
     "Annotation",
@@ -352,6 +354,37 @@ class Parameter:
         return None if self.default is None else _written(self.default)
 
 
+def _check_sink_streams(
+    name: str,
+    streams: tuple[Parameter, ...],
+    identifier: exp.Identifier,
+    create: exp.Create,
+) -> None:
+    """A sink's stream parameters: either kind, and an array of either.
+
+    A sink is a filter with no output pads and reads streams the way one
+    does, except that its count comes from the query rather than from its own
+    declaration. An ARRAY parameter takes every stream of its kind the SELECT
+    carries, so it is the last of that kind a signature can name -- anything
+    after it would always be handed nothing.
+    """
+    seen: dict[str, Parameter] = {}
+    for param in streams:
+        kind = element_type(param.type)
+        taken = seen.get(kind)
+        if taken is not None and is_array(taken.type):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"wasm function '{name}' takes '{param.name}' after "
+                f"'{taken.name}', which is {taken.type}",
+                identifier,
+                fallback=create,
+                hint=f"an array parameter takes every {kind} the SELECT "
+                f"carries, so nothing of that kind can follow it",
+            )
+        seen[kind] = param
+
+
 def _leading_streams(params: tuple[Parameter, ...]) -> tuple[Parameter, ...]:
     """The run of stream parameters a signature opens with.
 
@@ -426,12 +459,30 @@ class WasmFunction:
         A sink names no return stream, so its kind is its first parameter's.
         Only a STREAM function or a sink has one; a value function is folded
         at compile time and filters nothing, so asking is a caller's mistake.
+        A sink reading both kinds has no single one, and callers that care
+        read :attr:`stream_params` instead.
         """
         written = self.params[0].type if self.is_sink and self.params else self.returns
-        kind = WASM_STREAM_TYPES.get(written)
+        kind = WASM_STREAM_TYPES.get(element_type(written))
         if kind is None:
             raise ValueError(f"'{self.name}' returns {self.returns}, not a stream")
         return kind
+
+    @property
+    def stream_kinds(self) -> tuple[StreamType, ...]:
+        """The kind each stream parameter reads, in declaration order."""
+        return tuple(
+            WASM_STREAM_TYPES[element_type(param.type)] for param in self.stream_params
+        )
+
+    @property
+    def reads_many(self) -> bool:
+        """Whether any stream parameter is an ARRAY, and so reads several.
+
+        Only a sink may declare one: a filter's pad count is the module's own,
+        and an array has no number until the query is lowered.
+        """
+        return any(is_array(param.type) for param in self.stream_params)
 
     @property
     def called(self) -> str:
@@ -1348,7 +1399,7 @@ def _define_wasm(
             fallback=create,
             hint=_WASM_HINT,
         )
-    if params[0].type not in WASM_STREAM_TYPES:
+    if element_type(params[0].type) not in WASM_STREAM_TYPES:
         raise _error(
             ErrorCode.UNSUPPORTED_SQL,
             f"wasm function '{name}' takes {params[0].type} as its first "
@@ -1369,17 +1420,24 @@ def _define_wasm(
             "it returns",
         )
     streams = _leading_streams(params)
-    mixed = next((p for p in streams if p.type != params[0].type), None)
-    if mixed is not None:
-        raise _error(
-            ErrorCode.UNSUPPORTED_SQL,
-            f"wasm function '{name}' takes '{mixed.name}' as {mixed.type} "
-            f"beside {params[0].type}",
-            identifier,
-            fallback=create,
-            hint="a module reads one kind of stream: every stream parameter "
-            "is the type it returns",
-        )
+    if returns == WASM_SINK:
+        _check_sink_streams(name, streams, identifier, create)
+    else:
+        # An ARRAY of streams reaches here only as a first parameter that
+        # does not match the return, which the check above already refused:
+        # a stream function's pads are its own declaration, so there is
+        # nothing for an array to mean.
+        mixed = next((p for p in streams if p.type != params[0].type), None)
+        if mixed is not None:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"wasm function '{name}' takes '{mixed.name}' as {mixed.type} "
+                f"beside {params[0].type}",
+                identifier,
+                fallback=create,
+                hint="a module reads one kind of stream: every stream parameter "
+                "is the type it returns",
+            )
     for extra in params[len(streams) :]:
         if extra.annotation is not None or _declared_kind(extra.type) != "stream":
             continue
@@ -1391,7 +1449,7 @@ def _define_wasm(
             hint="a module's streams come first; the parameters after them "
             "are values it is configured with",
         )
-    if len(streams) > 1:
+    if len(streams) > 1 or any(is_array(p.type) for p in streams):
         _reject_annotation_column(name, params, identifier, create)
     for position, extra in enumerate(params[len(streams) + 1 :], start=len(streams) + 2):
         if extra.annotation is None:
@@ -2843,7 +2901,17 @@ class _Expander:
             expressions=[*items, *[value.copy() for value in target.expressions]],
         )
         call.meta.update(
-            {"line": line, "col": col, "start": 0, "end": 0, "sink_destination": True}
+            {
+                "line": line,
+                "col": col,
+                "start": 0,
+                "end": 0,
+                "sink_destination": True,
+                # Where the SELECT's columns end and the TO call's values
+                # begin. A sink reading an ARRAY of streams has no fixed
+                # argument count, so this is what tells the two apart.
+                SINK_STREAMS: len(items),
+            }
         )
         select.set("expressions", [call])
 
@@ -2905,6 +2973,75 @@ class _Expander:
             hint="define every function before the statements that call it",
         )
 
+    def _check_sink_arguments(
+        self,
+        declared: WasmFunction,
+        call: exp.Anonymous,
+        arguments: list[exp.Expr],
+        streams: int,
+    ) -> None:
+        """A sink call's arguments, split where the rewrite says they split.
+
+        The leading `streams` arguments came out of the SELECT list and are
+        checked for being streams at all; which parameter each fills is a
+        question of KIND, and kinds are settled in lowering. The rest are the
+        module's own values, held to the same rules any call's are.
+        """
+        for argument in arguments[:streams]:
+            written = _argument_kind(argument, self.wasm)
+            if written is None or written == "stream":
+                continue
+            raise _error(
+                ErrorCode.UDF_ARG_TYPE,
+                f"{declared.name}() is a sink destination, and its SELECT list "
+                f"carries {_KIND_NAMES.get(written, written)}",
+                argument,
+                fallback=call,
+                hint=f"a sink reads the streams its SELECT list names: "
+                f"COPY (SELECT <stream>, ...) TO {declared.name}(<values>)",
+            )
+        values = arguments[streams:]
+        positions = declared.value_params
+        plural = "" if len(values) == 1 else "s"
+        if len(values) > len(positions):
+            raise _error(
+                ErrorCode.UDF_ARG_TYPE,
+                f"{declared.name}() got {len(values)} value argument{plural}, "
+                f"but it declares {len(positions)}",
+                call,
+                hint=declared.signature,
+            )
+        unfilled = next((p for p in positions[len(values) :] if p.default is None), None)
+        if unfilled is not None:
+            raise _error(
+                ErrorCode.UDF_ARG_TYPE,
+                f"{declared.name}() got {len(values)} value argument{plural}, but "
+                f"its parameter '{unfilled.name}' has no DEFAULT",
+                call,
+                hint=declared.signature,
+            )
+        for param, argument in zip(positions, values):
+            if _call_name(argument) == _INPUT:
+                raise _error(
+                    ErrorCode.UDF_ARG_TYPE,
+                    f"{declared.name}() cannot take input() as its '{param.name}' "
+                    "argument: input() mints a FROM item, not a value",
+                    argument,
+                    fallback=call,
+                    hint=_ARG_HINT,
+                )
+            written = _argument_kind(argument, self.wasm)
+            if written is None or written == _declared_kind(param.type):
+                continue
+            raise _error(
+                ErrorCode.UDF_ARG_TYPE,
+                f"{declared.name}() takes {param.type} as its '{param.name}' "
+                f"argument, got {_KIND_NAMES.get(written, written)}",
+                argument,
+                fallback=call,
+                hint=declared.signature,
+            )
+
     def _check_wasm_arguments(
         self, declared: WasmFunction, call: exp.Anonymous, arguments: list[exp.Expr]
     ) -> None:
@@ -2917,6 +3054,10 @@ class _Expander:
         leading one -- but a call may write one, and does when the rows are
         not the ones its stream argument arrived with.
         """
+        streams = call.meta.get(SINK_STREAMS)
+        if declared.is_sink and isinstance(streams, int):
+            self._check_sink_arguments(declared, call, arguments, streams)
+            return
         positions = declared.written_params
         if _writes_annotation(declared, arguments, self.wasm):
             positions = declared.annotation_written_params

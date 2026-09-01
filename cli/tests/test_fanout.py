@@ -28,6 +28,7 @@ import pytest
 
 from ffrwd import cli, compiler
 from ffrwd.compiler import compile_commands, compile_sql
+from ffrwd.emit import build_ffmpeg_args, emit
 from ffrwd.errors import ErrorCode, FfrwdError
 from ffrwd.ir import Graph, SinkUnit, StreamType
 from ffrwd.probe import ChapterMeta, ProbeResult, StreamMeta
@@ -553,16 +554,68 @@ def test_a_subscript_past_the_end_of_an_option_list_names_the_length() -> None:
     assert "subscript 3 is past the end: the list has 2 elements" in err.message
 
 
-def test_a_row_reading_option_under_a_quoted_to_names_the_fix() -> None:
-    """One row survives, so no ROW_COUNT_MISMATCH stands in the way -- but
-    nothing pinned a row for the option to read, and the hint says so."""
+def test_a_row_reading_option_under_a_quoted_to_binds_the_track() -> None:
+    """A quoted TO gathers the rows into one file, one track apiece, so the
+    option binds per TRACK in row order -- here one row, one track, one
+    value."""
     sql = (
         f"COPY (SELECT f.video[1] FROM input('{SRC}') f, generate_series(1, 1) i) "
         "TO 'one.mp4' WITH (video_bitrate ARRAY['6000k'][i.i])"
     )
+    assert _units(sql)[0].options["video_bitrate"] == ["6000k"]
+
+
+def test_a_gathered_ladder_takes_a_bitrate_per_rung() -> None:
+    """Renditions differ by bitrate first: one value per rung, in the order
+    array_agg gathered them."""
+    sql = (
+        "COPY (SELECT array_agg(scale(f.video[1], ARRAY[640, 1280, 1920][i.i], -2)) "
+        f"FROM input('{SRC}') f, generate_series(1, 3) i) TO 'ladder.mp4' "
+        "WITH (video_codec 'libx264', "
+        "video_bitrate ARRAY['800k', '2000k', '5000k'][i.i])"
+    )
+    unit = _units(sql)[0]
+    assert len(unit.outputs) == 3
+    assert unit.options["video_bitrate"] == ["800k", "2000k", "5000k"]
+
+
+def test_a_per_rung_bitrate_reaches_ffmpeg_indexed_by_track() -> None:
+    """ffmpeg already spells it: -b:<index> once per track of the scope."""
+    sql = (
+        "COPY (SELECT array_agg(scale(f.video[1], ARRAY[640, 1280][i.i], -2)) "
+        f"FROM input('{SRC}') f, generate_series(1, 2) i) TO 'ladder.mp4' "
+        "WITH (video_bitrate ARRAY['800k', '2000k'][i.i])"
+    )
+    argv = build_ffmpeg_args(emit(_graphs(sql)[0]), "ladder.mp4")
+    assert argv[argv.index("-b:0") + 1] == "800k"
+    assert argv[argv.index("-b:1") + 1] == "2000k"
+
+
+def test_a_per_row_option_over_more_rows_than_tracks_is_refused() -> None:
+    """The rows and the tracks are two accounts of the same ladder; when they
+    disagree the query is saying two different things."""
+    sql = (
+        f"COPY (SELECT array_agg(f.video[1]) FROM input('{SRC}') f, "
+        "generate_series(1, 3) i) TO 'one.mp4' "
+        "WITH (video_bitrate ARRAY['1k', '2k', '3k'][i.i])"
+    )
     err = _rejects(sql)
-    assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "reads a track row, and this COPY writes one file" in err.message
+    assert err.code is ErrorCode.ROW_COUNT_MISMATCH
+    assert "read once per row over 3 rows" in err.message
+    assert "1 video track" in err.message
+
+
+def test_a_fanned_out_ladder_still_takes_one_bitrate_per_file() -> None:
+    """The other half of the duality, unchanged: a TO expression gives each
+    row a file, and the option binds that file's one track."""
+    sql = (
+        "COPY (SELECT scale(f.video[1], ARRAY[640, 1280][i.i], -2) "
+        f"FROM input('{SRC}') f, generate_series(1, 2) i) "
+        "TO ('r' || i.i::text || '.mp4') "
+        "WITH (video_bitrate ARRAY['800k', '2000k'][i.i])"
+    )
+    units = _units(sql)
+    assert [unit.options["video_bitrate"] for unit in units] == ["800k", "2000k"]
 
 
 def test_a_stream_column_in_an_option_is_rejected_by_name() -> None:

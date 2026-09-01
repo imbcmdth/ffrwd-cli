@@ -977,10 +977,13 @@ def _render_sink_options(group: OutputGroup, pass_: _Pass | None = None) -> list
             if value is True:
                 args.append(spec.flag)
             continue
+        flag = _codec_params_flag(group.options) if name == "codec_params" else spec.flag
+        if isinstance(value, list):
+            args += _render_per_track(group, spec, flag, value)
+            continue
         rendered = _render_option_value(spec, value)
         if rendered is None:
             continue
-        flag = _codec_params_flag(group.options) if name == "codec_params" else spec.flag
         if spec.per_stream:
             # Per-FILE stream indices, same as the -c/-metadata block above.
             for index, mapping in enumerate(group.maps):
@@ -988,6 +991,27 @@ def _render_sink_options(group: OutputGroup, pass_: _Pass | None = None) -> list
                     args += [f"{flag}:{index}", rendered]
         else:
             args += [flag, rendered]
+    return args
+
+
+def _render_per_track(
+    group: OutputGroup, spec: SinkOptionSpec, flag: str, values: Sequence[object]
+) -> list[str]:
+    """One value per track of the spec's scope, in map order.
+
+    What a WITH option read once per row becomes: the rows were gathered into
+    this file one track apiece, so the k-th track takes the k-th row's value.
+    Lowering has already checked that the two counts agree.
+    """
+    args: list[str] = []
+    taken = 0
+    for index, mapping in enumerate(group.maps):
+        if mapping.type != spec.scope:
+            continue
+        rendered = _render_option_value(spec, values[taken])
+        taken += 1
+        if rendered is not None:
+            args += [f"{flag}:{index}", rendered]
     return args
 
 

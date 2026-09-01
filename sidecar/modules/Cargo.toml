@@ -29,6 +29,7 @@ members = [
     "pick-first",
     "frame-stats",
     "packet-stats",
+    "packet-tally",
     "post-rows",
     "broken-audio",
     "adapted-020",
@@ -39,6 +40,7 @@ members = [
     "adapted-070",
     "adapted-080",
     "adapted-090",
+    "adapted-0110",
 ]
 resolver = "2"
 

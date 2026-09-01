@@ -232,6 +232,7 @@ __all__ = [
     "MACRO_NAMESPACE",
     "MAP_COLUMNS",
     "ROW_SCHEMAS",
+    "SINK_STREAMS",
     "ROW_STREAM",
     "TAGS_COLUMN",
     "RawInputOption",
@@ -2454,6 +2455,31 @@ def _has_row_source(select: exp.Select, visible: set[str]) -> bool:
     return False
 
 
+# Meta key on a rewritten sink call: how many of its leading arguments came
+# out of the COPY's SELECT list. Lowering reads it to tell the streams from
+# the values, which a sink reading an ARRAY of streams cannot do by counting.
+SINK_STREAMS = "sink_streams"
+
+
+def _aggregated_columns(projection: exp.Expr | None) -> list[exp.Expr]:
+    """The nodes an aggregate may stand at in this projection.
+
+    The projection itself, and -- where it is the call a sink destination was
+    rewritten into -- each of the SELECT columns that call now carries.
+    """
+    if projection is None:
+        return []
+    if not isinstance(projection, exp.Anonymous):
+        return [projection]
+    columns = projection.meta.get(SINK_STREAMS)
+    if not isinstance(columns, int):
+        return [projection]
+    return [
+        projection,
+        *[a for a in projection.expressions[:columns] if isinstance(a, exp.Expr)],
+    ]
+
+
 def _projection_expr(projection: exp.Expr) -> exp.Expr:
     """A SELECT column with its ``AS`` alias and parentheses peeled off."""
     inner = projection.this if isinstance(projection, exp.Alias) else projection
@@ -3834,10 +3860,17 @@ class _Resolver:
         an array exactly one other place to go, and lower's own relation check
         is what decides whether this branch actually has rows to aggregate.
         Every other array_agg written anywhere else still has no equivalent.
+
+        A SINK destination's call is exempt in the same way: the columns
+        inside it ARE the SELECT list, moved there by the rewrite that made
+        the call, so an aggregate among them is as whole as it ever was.
         """
+        exempt = _aggregated_columns(array_agg)
         for sub in node.walk():
             if isinstance(sub, exp.ArrayAgg):
-                if sub is not array_agg and not isinstance(sub.parent, exp.Variadic):
+                if not any(sub is one for one in exempt) and not isinstance(
+                    sub.parent, exp.Variadic
+                ):
                     raise _error(
                         ErrorCode.UNSUPPORTED_SQL,
                         "array_agg() is only supported as a whole SELECT column",

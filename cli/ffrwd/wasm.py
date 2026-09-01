@@ -40,6 +40,7 @@ import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal, cast
 
 from . import binaries, nn
 from .emit import build_network_graph
@@ -70,6 +71,7 @@ __all__ = [
     "WIT_PACKAGE",
     "WORLDS",
     "WORLD_VERSION",
+    "SinkArity",
     "Describe",
     "Described",
     "DescribedFunction",
@@ -100,6 +102,10 @@ _NULL_FORMAT = "null"
 # The wit worlds this compiler knows how to wire. More than one, because a
 # module built against an earlier one still describes and runs the same: the
 # worlds have only ever added to what a module may export. A bump is one entry.
+# How many streams of one kind a packet sink reads.
+SinkArity = Literal["none", "one", "many"]
+_SINK_ARITIES = ("none", "one", "many")
+
 WORLDS: tuple[str, ...] = (
     "ffrwd:av@0.2.0",
     "ffrwd:av@0.3.0",
@@ -111,6 +117,7 @@ WORLDS: tuple[str, ...] = (
     "ffrwd:av@0.9.0",
     "ffrwd:av@0.10.0",
     "ffrwd:av@0.11.0",
+    "ffrwd:av@0.12.0",
 )
 
 # The world a module scaffolded today is built against: the newest of those,
@@ -284,9 +291,15 @@ class Described:
 
     `codecs` is present exactly for a PACKET SINK -- a sink module that
     consumes the encoder's own output rather than decoded frames -- and
-    lists the ffmpeg codec names it accepts, most preferred first, empty for
-    every codec. A packet sink fills neither format list, so its `kind` is
-    None; what it consumes is said by the COPY that encodes for it.
+    lists the ffmpeg VIDEO codec names it accepts, most preferred first,
+    empty for every codec; `audio_codecs` says the same of audio. A packet
+    sink fills neither format list, so its `kind` is None; what it consumes
+    is said by the COPY that encodes for it.
+
+    `video_streams` and `audio_streams` say how many streams of each kind the
+    sink reads -- ``"none"``, ``"one"`` or ``"many"``. A sink built against a
+    world before 0.12.0 read exactly one video stream, which is what a
+    description with neither key means.
     """
 
     world: str
@@ -320,11 +333,22 @@ class Described:
     http: bool = False
     udp: bool = False
     codecs: tuple[str, ...] | None = None
+    audio_codecs: tuple[str, ...] = ()
+    video_streams: SinkArity = "one"
+    audio_streams: SinkArity = "none"
 
     @property
     def packet_sink(self) -> bool:
         """True for a module whose export consumes encoded packets."""
         return self.codecs is not None
+
+    def sink_streams(self, kind: StreamType) -> SinkArity:
+        """How many streams of `kind` this sink reads."""
+        return self.audio_streams if kind == "audio" else self.video_streams
+
+    def sink_codecs(self, kind: StreamType) -> tuple[str, ...]:
+        """The codecs this sink accepts for `kind`; empty is every codec."""
+        return self.audio_codecs if kind == "audio" else (self.codecs or ())
 
     @property
     def kind(self) -> StreamType | None:
@@ -485,7 +509,18 @@ def _described(path: str, payload: object) -> Described:
         codecs=_strings(payload["codecs"])
         if isinstance(payload.get("codecs"), list)
         else None,
+        audio_codecs=_strings(payload.get("audio_codecs")),
+        # A sink built before the counts existed read one video stream.
+        video_streams=_sink_arity(payload.get("video_streams"), "one"),
+        audio_streams=_sink_arity(payload.get("audio_streams"), "none"),
     )
+
+
+def _sink_arity(value: object, absent: SinkArity) -> SinkArity:
+    """A sink's declared stream count for one kind, or what an older one meant."""
+    if value in _SINK_ARITIES:
+        return cast(SinkArity, value)
+    return absent
 
 
 # The keys a windowed export's description carries, and no other export's.
@@ -624,6 +659,7 @@ def _first_line(text: str) -> str:
 def _argv(
     binary: str,
     process: SidecarProcess,
+    reads: Sequence[str] = (),
     runtime: Sequence[str] = (),
     jobs: int | None = None,
 ) -> list[str]:
@@ -656,12 +692,19 @@ def _argv(
     module table: the sidecar denies both to any module the argv never
     names.
 
+    `reads` is one path per stream the process is handed, each written as its
+    own ``-f nut -i <path>``: stdin for the ordinary one-input process, and a
+    named pipe apiece where a SINK reads several. Empty means stdin, which is
+    what a caller with no plan in hand (a describe, a test) gets.
+
     ``-jobs`` caps the sidecar's worker threads, and is written on every
     sidecar process whenever the run gave one -- the sidecar itself decides
     what each module's lane admits. Absent, the sidecar sizes its pool to
     the machine, so a run at the default carries no ``-jobs`` at all.
     """
-    argv = [binary, "-f", EDGE_FORMAT, "-i", STDIN]
+    argv = [binary]
+    for path in reads or (STDIN,):
+        argv += ["-f", EDGE_FORMAT, "-i", path]
     if jobs is not None:
         argv += [_JOBS_FLAG, str(jobs)]
     if process.reads_rows:
@@ -741,7 +784,9 @@ def _network_args(process: SidecarProcess) -> list[str]:
     return argv
 
 
-def sidecar_argv(process: SidecarProcess, jobs: int | None = None) -> list[str]:
+def sidecar_argv(
+    process: SidecarProcess, reads: Sequence[str] = (), jobs: int | None = None
+) -> list[str]:
     """The argv that RUNS one sidecar process, with the binary located.
 
     A wheel installs the sidecar into the environment's scripts directory,
@@ -765,17 +810,21 @@ def sidecar_argv(process: SidecarProcess, jobs: int | None = None) -> list[str]:
             "needs it to run",
             hint=INSTALL_HINT,
         )
-    return _argv(binary, process, nn.spawn_args() if process.models else (), jobs)
+    return _argv(
+        binary, process, reads, nn.spawn_args() if process.models else (), jobs
+    )
 
 
-def shown_argv(process: SidecarProcess, jobs: int | None = None) -> list[str]:
+def shown_argv(
+    process: SidecarProcess, reads: Sequence[str] = (), jobs: int | None = None
+) -> list[str]:
     """The argv a PRINTED command line shows, naming the sidecar by program name.
 
     The same convention a printed ffmpeg command follows: what is shown is
     what a reader would type, resolved by PATH, not the absolute path this
     machine happens to have found -- and so with no runtime directory either.
     """
-    return _argv(binaries.SIDECAR_EXECUTABLE, process, (), jobs)
+    return _argv(binaries.SIDECAR_EXECUTABLE, process, reads, (), jobs)
 
 
 def model_path(module: str, export: str) -> str:

@@ -11686,3 +11686,67 @@ def test_coalesce_prefers_the_set_variable() -> None:
         {"title": "Named"},
     )
     assert g.sinks[0].tags == {"title": "Named"}
+
+
+# -- a filter option read off a row: one node per row --
+
+
+def test_a_filter_option_read_off_a_row_makes_one_node_per_row() -> None:
+    """The gathered ladder. Rung 2 and rung 3 used to be dropped silently:
+    the call expanded over its ARRAY arguments alone, and a single stream
+    through an option that differs per row is not one."""
+    g = _lower(
+        "COPY (SELECT array_agg(scale(f.video[1], ARRAY[640, 1280, 1920][i.i], -2)) "
+        "FROM input('a.mkv') f, generate_series(1, 3) i) TO 'ladder.mkv'"
+    )
+    scales = [node for node in g.nodes.values() if node.filter == "scale"]
+    assert [node.args["width"] for node in scales] == [640, 1280, 1920]
+    assert [o.type for o in g.outputs] == ["video", "video", "video"]
+
+
+def test_the_rungs_of_a_gathered_ladder_are_distinct_nodes_in_a_table() -> None:
+    """The same collapse, shown before any aggregate: three rows, three
+    nodes."""
+    sinks = lower_table(
+        resolve(
+            parse(
+                "SELECT scale(f.video[1], ARRAY[640, 1280, 1920][i.i], -2) "
+                "FROM input('a.mkv') f, generate_series(1, 3) i"
+            )
+        ),
+        {},
+        registry=_snapshot_registry(),
+    )
+    specs = [row[0].spec for row in sinks[0].result.rows]
+    assert len(specs) == 3
+    assert len(set(specs)) == 3, specs
+
+
+def test_a_filter_option_reading_no_row_still_makes_one_node() -> None:
+    """Only reading a row expands: rows that ask for the same thing share the
+    one node they always shared."""
+    g = _lower(
+        "COPY (SELECT array_agg(scale(f.video[1], 640, -2)) "
+        "FROM input('a.mkv') f, generate_series(1, 3) i) TO 'one.mkv'"
+    )
+    assert _filters(g).count("scale") == 1
+
+
+def test_an_input_column_is_not_a_row_column() -> None:
+    """``f.duration`` is the same for every row, so it expands nothing."""
+    g = _lower(
+        "COPY (SELECT array_agg(ffmpeg.trim(f.video[1], starti => f.duration / 2)) "
+        "FROM input('a.mkv') f, generate_series(1, 3) i) TO 'one.mkv'",
+        {"f": ProbeResult(streams=list(_probe_result().streams), duration=10.0)},
+    )
+    assert _filters(g).count("trim") == 1
+
+
+def test_a_stream_array_and_a_per_row_option_of_different_lengths_are_refused() -> None:
+    err = _reject_lower(
+        "COPY (SELECT array_agg(scale(f.video, ARRAY[640, 1280, 1920][i.i], -2)) "
+        "FROM input('a.mkv') f, generate_series(1, 3) i) TO 'o.mkv'",
+        {"f": _probe_result(videos=2)},
+    )
+    assert err.code is ErrorCode.BROADCAST_MISMATCH
+    assert "read once per row over" in err.message

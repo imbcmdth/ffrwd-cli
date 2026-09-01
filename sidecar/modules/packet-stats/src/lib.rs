@@ -12,7 +12,7 @@ wit_bindgen::generate!({
 use std::cell::RefCell;
 
 use exports::ffrwd::av::packet_sink::{
-    CodedStream, Guest, Meta, Packet, PacketSinkMeta, Processed, StreamInfo,
+    Arity, Guest, InputStream, Meta, PacketSinkMeta, PadPackets, Packet, Processed,
 };
 use serde::Serialize;
 
@@ -140,14 +140,14 @@ impl Guest for PacketStats {
             },
             // Counting needs no codec knowledge, so every codec is accepted.
             codecs: vec![],
+            audio_codecs: vec![],
+            // One video stream: this module counts a stream, not a ladder.
+            video: Arity::One,
+            audio: Arity::Zero,
         }
     }
 
-    fn init(
-        _coded_stream: CodedStream,
-        _stream_info: StreamInfo,
-        params: String,
-    ) -> Result<(), String> {
+    fn init(_streams: Vec<InputStream>, params: String) -> Result<(), String> {
         validate_params(&params)?;
         STATE.with(|s| {
             *s.borrow_mut() = Some(State {
@@ -167,13 +167,13 @@ impl Guest for PacketStats {
         validate_params(&params)
     }
 
-    fn process(packets: Vec<Packet>, last: bool) -> Processed {
+    fn process(pads: Vec<PadPackets>, last: bool) -> Processed {
         STATE.with(|s| {
             let mut state_ref = s.borrow_mut();
             let state = state_ref.as_mut().expect("process called before init");
 
             let mut rows = Vec::new();
-            for packet in &packets {
+            for packet in pads.first().map(|p| p.packets.as_slice()).unwrap_or(&[]) {
                 state.count(packet, &mut rows);
             }
 

@@ -34,6 +34,7 @@ from ffrwd.parser import ModuleExport, Resolved, parse, resolve
 from ffrwd.processes import (
     PIPE,
     AudioFormat,
+    FfmpegProcess,
     ModuleShape,
     SidecarProcess,
     StreamEdge,
@@ -42,7 +43,7 @@ from ffrwd.processes import (
 from ffrwd.project import PackageSet, discover
 from ffrwd.registry import Registry, load_reference
 from ffrwd.split import insert_splits
-from ffrwd.wasm import Described, DescribedFunction
+from ffrwd.wasm import WORLDS, Described, DescribedFunction
 
 SNAPSHOT_PATH = Path(__file__).resolve().parent / "data" / "reference_registry.json"
 
@@ -4188,12 +4189,16 @@ def test_an_option_that_shapes_no_encoder_is_refused() -> None:
 
 
 def test_an_audio_declaration_over_a_packet_sink_is_refused() -> None:
+    """Not the module's doing: the sidecar's stream edge carries encoded
+    video and nothing else, so an audio pad has no wire to arrive on."""
     sql = (
         "CREATE FUNCTION packet_stats(a audio_stream) RETURNS sink\n"
         f"  AS '{PACKET_MODULE}', 'packet_stats' LANGUAGE wasm;\n"
         "COPY (SELECT f.audio[1] FROM input('a.mp4') f) TO packet_stats()"
     )
-    _packet_rejects(sql, "consumes encoded video packets")
+    error = _packet_rejects(sql, "reads an audio stream")
+    assert "h264, hevc or av1" in error.message
+    assert "video_stream[]" in (error.hint or "")
 
 
 def test_a_packet_module_declared_as_a_frame_filter_is_refused() -> None:
@@ -4303,3 +4308,223 @@ def test_a_packet_sink_carries_the_cap() -> None:
     assert plan.sidecars[0].packet_sink
     argv = wasm.shown_argv(plan.sidecars[0], jobs=4)
     assert argv[argv.index("-jobs") + 1] == "4"
+
+
+# -- a module parameter read off a row: one instance per row --
+
+
+def test_a_module_parameter_read_off_a_row_makes_one_instance_per_row() -> None:
+    """The same collapse a filter option had: three rows asking for three
+    different parameter values are three instances, not one."""
+    sql = (
+        "CREATE FUNCTION blur(v video_stream, radius number DEFAULT 1) "
+        f"RETURNS video_stream AS '{MODULE}', 'invert' LANGUAGE wasm;\n"
+        "COPY (SELECT array_agg(blur(f.video[1], ARRAY[2, 4, 8][i.i])) "
+        "FROM input('a.mp4') f, generate_series(1, 3) i) TO 'o.mkv'"
+    )
+    described = _described(params={"radius": {"type": "number"}})
+    graph = lower(
+        _resolved(sql), {}, registry=_snapshot_registry(), describes={MODULE: described}
+    )
+    instances = [node for node in graph.nodes.values() if node.filter == MODULE]
+    assert [node.args["radius"] for node in instances] == [2, 4, 8]
+
+
+def test_a_module_parameter_reading_no_row_still_makes_one_instance() -> None:
+    sql = (
+        "CREATE FUNCTION blur(v video_stream, radius number DEFAULT 1) "
+        f"RETURNS video_stream AS '{MODULE}', 'invert' LANGUAGE wasm;\n"
+        "COPY (SELECT array_agg(blur(f.video[1], 4)) "
+        "FROM input('a.mp4') f, generate_series(1, 3) i) TO 'o.mkv'"
+    )
+    described = _described(params={"radius": {"type": "number"}})
+    graph = lower(
+        _resolved(sql), {}, registry=_snapshot_registry(), describes={MODULE: described}
+    )
+    assert len([n for n in graph.nodes.values() if n.filter == MODULE]) == 1
+
+
+# -- a sink that reads SEVERAL streams --------------------------------------
+
+LADDER_MODULE = "modules/packet_tally.wasm"
+
+LADDER_DECLARE = (
+    "CREATE FUNCTION tally(v video_stream[]) RETURNS sink\n"
+    f"  AS '{LADDER_MODULE}', 'packet_tally' LANGUAGE wasm;\n"
+)
+LADDER_QUERY = LADDER_DECLARE + (
+    "COPY (SELECT array_agg(scale(f.video[1], ARRAY[640, 1280, 1920][i.i], -2)) "
+    "FROM input('a.mp4') f, generate_series(1, 3) i) TO tally()"
+)
+
+
+def _ladder_described(
+    *,
+    name: str = "packet_tally",
+    video: str = "many",
+    audio: str = "none",
+) -> Described:
+    return Described(
+        world=WORLDS[-1],
+        name=name,
+        version="0.1.0",
+        params_schema={"type": "object", "additionalProperties": False, "properties": {}},
+        rows_schema=None,
+        codecs=(),
+        video_streams=video,  # type: ignore[arg-type]
+        audio_streams=audio,  # type: ignore[arg-type]
+    )
+
+
+def _ladder_graph(sql: str, sink: Described | None = None) -> Graph:
+    return lower(
+        _resolved(sql),
+        {},
+        registry=_snapshot_registry(),
+        describes={LADDER_MODULE: sink or _ladder_described()},
+    )
+
+
+def _ladder_rejects(
+    sql: str, needle: str, sink: Described | None = None
+) -> FfrwdError:
+    with pytest.raises(FfrwdError) as caught:
+        _ladder_graph(sql, sink)
+    error = caught.value
+    assert needle in error.message, error.message
+    assert error.line is not None
+    assert error.hint
+    return error
+
+
+def test_a_gathered_ladder_reaches_one_sink_instance() -> None:
+    """The whole point: N renditions, ONE node. N instances would be N
+    publishers with nothing shared between them."""
+    graph = _ladder_graph(LADDER_QUERY)
+    sinks = [node for node in graph.nodes.values() if node.filter == LADDER_MODULE]
+    assert len(sinks) == 1
+    assert len(sinks[0].inputs) == 3
+    assert graph.module_sinks == [sinks[0].id]
+
+
+def test_every_rendition_is_a_pad_of_that_one_instance() -> None:
+    """In SELECT order: the pads are the streams the columns carried,
+    flattened, and each is its own scale."""
+    graph = _ladder_graph(LADDER_QUERY)
+    sink = next(node for node in graph.nodes.values() if node.filter == LADDER_MODULE)
+    widths = [graph.nodes[ref].args["width"] for ref in sink.inputs]
+    assert widths == [640, 1280, 1920]
+
+
+def test_a_sink_reading_one_stream_refuses_a_ladder() -> None:
+    sql = LADDER_DECLARE.replace("video_stream[]", "video_stream") + (
+        "COPY (SELECT array_agg(scale(f.video[1], ARRAY[640, 1280][i.i], -2)) "
+        "FROM input('a.mp4') f, generate_series(1, 2) i) TO tally()"
+    )
+    error = _ladder_rejects(
+        sql, "SELECT list carries 2 streams", _ladder_described(video="one")
+    )
+    assert error.code is ErrorCode.UDF_ARG_TYPE
+    assert "reads 1 stream" in error.message
+    assert "video_stream[]" in (error.hint or "")
+
+
+def test_an_array_declaration_over_a_module_reading_one_is_refused() -> None:
+    """The declaration can hand over several and the module reads one, so
+    the mismatch is caught at the call rather than at run time."""
+    error = _ladder_rejects(
+        LADDER_QUERY, "reads one video stream", _ladder_described(video="one")
+    )
+    assert error.code is ErrorCode.UNSUPPORTED_SQL
+
+
+def test_a_module_reading_no_video_refuses_a_video_declaration() -> None:
+    error = _ladder_rejects(
+        LADDER_QUERY, "reads none video stream", _ladder_described(video="none")
+    )
+    assert error.code is ErrorCode.UNSUPPORTED_SQL
+
+
+def test_an_arrayed_parameter_is_refused_on_a_filter() -> None:
+    """Only a sink's count comes from the query; a filter's pads are its
+    own declaration, so an array has nothing to mean there."""
+    sql = (
+        "CREATE FUNCTION blur(v video_stream[]) RETURNS video_stream\n"
+        f"  AS '{MODULE}', 'invert' LANGUAGE wasm;\n"
+        "COPY (SELECT blur(f.video[1]) FROM input('a.mp4') f) TO 'o.mp4'"
+    )
+    with pytest.raises(FfrwdError) as caught:
+        _lowered(sql)
+    assert "takes video_stream[] and returns video_stream" in caught.value.message
+
+
+def test_a_second_parameter_of_a_kind_cannot_follow_its_array() -> None:
+    sql = (
+        "CREATE FUNCTION tally(v video_stream[], w video_stream) RETURNS sink\n"
+        f"  AS '{LADDER_MODULE}', 'packet_tally' LANGUAGE wasm;\n"
+        "COPY (SELECT f.video[1], f.video[2] FROM input('a.mp4') f) TO tally()"
+    )
+    error = _ladder_rejects(sql, "takes 'w' after 'v'")
+    assert "nothing of that kind can follow it" in (error.hint or "")
+
+
+def test_each_pad_of_a_ladder_carries_its_own_encoder_options() -> None:
+    """A rendition ladder differs by bitrate first: one value per pad, in
+    the order the rows were gathered."""
+    sql = LADDER_DECLARE + (
+        "COPY (SELECT array_agg(scale(f.video[1], ARRAY[640, 1280, 1920][i.i], -2)) "
+        "FROM input('a.mp4') f, generate_series(1, 3) i) TO tally() "
+        "WITH (video_codec 'libx264', "
+        "video_bitrate ARRAY['800k', '2000k', '5000k'][i.i])"
+    )
+    graph = _ladder_graph(sql)
+    node = next(name for name in graph.packet_sinks)
+    pads = graph.packet_sinks[node]
+    assert [pad["video_bitrate"] for pad in pads] == ["800k", "2000k", "5000k"]
+    assert {pad["video_codec"] for pad in pads} == {"libx264"}
+
+
+def test_a_per_pad_option_over_more_rows_than_pads_is_refused() -> None:
+    sql = LADDER_DECLARE + (
+        "COPY (SELECT array_agg(f.video[1]) "
+        "FROM input('a.mp4') f, generate_series(1, 3) i) TO tally() "
+        "WITH (video_bitrate ARRAY['1k', '2k', '3k'][i.i])"
+    )
+    error = _ladder_rejects(sql, "read once per row over 3 rows")
+    assert error.code is ErrorCode.ROW_COUNT_MISMATCH
+    assert "reads 1 stream" in error.message
+
+
+def test_the_ladder_reaches_one_sidecar_reading_every_rendition() -> None:
+    """One process hosting one instance, its pads arriving on pipes of
+    their own -- which is what a shared catalog and a common timeline
+    need."""
+    compiled = compile_all(
+        LADDER_QUERY,
+        describe=lambda path: _ladder_described(),
+    )
+    plan = compiled.plan
+    assert plan is not None
+    assert len(plan.sidecars) == 1
+    sidecar = plan.sidecars[0]
+    assert sidecar.packet_sink
+    assert len(sidecar.inputs) == 3
+    reads = [f"pipe{index}" for index in range(3)]
+    argv = wasm.shown_argv(sidecar, reads)
+    assert [argv[i + 1] for i, a in enumerate(argv) if a == "-i"] == reads
+    assert argv.count("-m") == 1
+
+
+def test_the_ladder_decodes_its_source_once() -> None:
+    """One decode, N encodes: the three rungs leave ONE ffmpeg through a
+    split, each on a pipe of its own. Three feeders would open the input
+    three times and decode it three times over."""
+    compiled = compile_all(LADDER_QUERY, describe=lambda path: _ladder_described())
+    plan = compiled.plan
+    assert plan is not None
+    feeders = [p for p in plan.processes if isinstance(p, FfmpegProcess)]
+    assert len(feeders) == 1
+    assert len(feeders[0].graph.input_paths) == 1
+    edges = [e for e in plan.stream_edges if e.target == plan.sidecars[0].id]
+    assert len(edges) == 3
+    assert {e.source for e in edges} == {feeders[0].id}

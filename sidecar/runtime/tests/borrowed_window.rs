@@ -152,7 +152,7 @@ fn the_pair_describes_the_same_shape_in_two_worlds() {
         describe(&built("newest_borrow").display().to_string()).expect("describe newest-borrow");
 
     assert_eq!(list.world, "0.10.0");
-    assert_eq!(borrow.world, "0.11.0");
+    assert_eq!(borrow.world, "0.12.0");
     assert_eq!(list.shape, borrow.shape);
     assert_eq!(list.inputs, borrow.inputs);
     assert_eq!(list.meta.pixel_formats, borrow.meta.pixel_formats);

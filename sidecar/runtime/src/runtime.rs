@@ -23,6 +23,11 @@
 //! it: the host holds the call's frames behind [`BorrowedWindow`] and the
 //! guest fetches only the payloads it reads. Every older windowed world is
 //! still handed the whole window as a list.
+//!
+//! From 0.12.0 a packet sink reads SEVERAL streams: `init` is handed one
+//! entry per pad and `process` one packet list per pad. An older sink read
+//! exactly one video stream, so it is opened for the single pad it can carry
+//! and refused anything else.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -43,15 +48,16 @@ use crate::nn;
 /// world is recognised without consulting the older ones. The current world is
 /// `wit/`; each older one is kept whole under `worlds/<version>/`.
 pub const WORLDS: &[&str] = &[
-    "0.11.0", "0.10.0", "0.9.0", "0.8.0", "0.7.0", "0.6.0", "0.5.0", "0.4.0", "0.3.0", "0.2.0",
+    "0.12.0", "0.11.0", "0.10.0", "0.9.0", "0.8.0", "0.7.0", "0.6.0", "0.5.0", "0.4.0", "0.3.0",
+    "0.2.0",
 ];
 
 /// The world new modules target, and the one every older world is adapted to.
-pub const WORLD: &str = "0.11.0";
+pub const WORLD: &str = "0.12.0";
 
 /// The wit package a module targets, spelled as it appears in a module
 /// description.
-pub const WORLD_PACKAGE: &str = "ffrwd:av@0.11.0";
+pub const WORLD_PACKAGE: &str = "ffrwd:av@0.12.0";
 
 /// The component export name an interface carries in a given world.
 fn interface(name: &str, world: &str) -> String {
@@ -145,7 +151,7 @@ macro_rules! meta_with_rows_language {
     };
 }
 
-mod world_0110 {
+mod world_0120 {
     stream_info_with_time_base!();
     kind_bearing_format!();
     meta_with_rows_language!();
@@ -158,6 +164,47 @@ mod world_0110 {
             path: "../wit",
             world: "meta-module",
             with: {
+                "ffrwd:av/types": crate::runtime::world_0120::video::ffrwd::av::types,
+                "ffrwd:av/filter": crate::runtime::world_0120::video::exports::ffrwd::av::filter,
+            },
+        });
+    }
+    pub mod window {
+        wasmtime::component::bindgen!({
+            path: "../wit",
+            world: "window-module",
+            with: {
+                "ffrwd:av/types": crate::runtime::world_0120::video::ffrwd::av::types,
+                "ffrwd:av/window-source.in-window": crate::runtime::BorrowedWindow,
+            },
+            imports: { default: trappable },
+        });
+    }
+    pub mod packet {
+        wasmtime::component::bindgen!({
+            path: "../wit",
+            world: "packet-module",
+            with: { "ffrwd:av/types": crate::runtime::world_0120::video::ffrwd::av::types },
+        });
+    }
+    pub mod values {
+        wasmtime::component::bindgen!({ path: "../wit", world: "values-module" });
+    }
+}
+
+mod world_0110 {
+    stream_info_with_time_base!();
+    kind_bearing_format!();
+    meta_with_rows_language!();
+
+    pub mod video {
+        wasmtime::component::bindgen!({ path: "../worlds/0.11.0", world: "video-module" });
+    }
+    pub mod meta {
+        wasmtime::component::bindgen!({
+            path: "../worlds/0.11.0",
+            world: "meta-module",
+            with: {
                 "ffrwd:av/types": crate::runtime::world_0110::video::ffrwd::av::types,
                 "ffrwd:av/filter": crate::runtime::world_0110::video::exports::ffrwd::av::filter,
             },
@@ -165,7 +212,7 @@ mod world_0110 {
     }
     pub mod window {
         wasmtime::component::bindgen!({
-            path: "../wit",
+            path: "../worlds/0.11.0",
             world: "window-module",
             with: {
                 "ffrwd:av/types": crate::runtime::world_0110::video::ffrwd::av::types,
@@ -176,13 +223,13 @@ mod world_0110 {
     }
     pub mod packet {
         wasmtime::component::bindgen!({
-            path: "../wit",
+            path: "../worlds/0.11.0",
             world: "packet-module",
             with: { "ffrwd:av/types": crate::runtime::world_0110::video::ffrwd::av::types },
         });
     }
     pub mod values {
-        wasmtime::component::bindgen!({ path: "../wit", world: "values-module" });
+        wasmtime::component::bindgen!({ path: "../worlds/0.11.0", world: "values-module" });
     }
 }
 
@@ -760,16 +807,71 @@ impl BorrowedWindow {
     }
 }
 
-/// The encoded stream a packet sink is opened for, fixed for its life.
+/// What a coded stream carries, which is what tells its kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodedFormat {
+    Video { width: u32, height: u32 },
+    Audio { sample_rate: u32, channels: u32 },
+}
+
+impl CodedFormat {
+    /// `video` or `audio`, for a message.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            CodedFormat::Video { .. } => "video",
+            CodedFormat::Audio { .. } => "audio",
+        }
+    }
+}
+
+/// One encoded stream a packet sink is opened for, fixed for its life.
 #[derive(Debug, Clone)]
 pub struct CodedStream {
     /// ffmpeg's name for the codec, e.g. `h264`.
     pub codec: String,
     pub time_base: TimeBase,
-    pub width: u32,
-    pub height: u32,
+    pub format: CodedFormat,
     /// The codec's out-of-band header, as the container carried it.
     pub extradata: Vec<u8>,
+}
+
+/// One pad a packet sink is opened for: the encoding the wire declared, and
+/// what the process driving the host said about the stream.
+#[derive(Debug, Clone)]
+pub struct SinkInput {
+    pub stream: CodedStream,
+    pub info: StreamInfo,
+}
+
+/// How many streams of one kind a sink reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Arity {
+    /// None of this kind reaches the sink.
+    Zero,
+    /// Exactly one, which is what every sink before 0.12.0 read.
+    One,
+    /// One or more, as many as the query hands over.
+    Many,
+}
+
+impl Arity {
+    /// Whether `count` streams of this kind is a shape the sink accepts.
+    pub fn accepts(self, count: usize) -> bool {
+        match self {
+            Arity::Zero => count == 0,
+            Arity::One => count == 1,
+            Arity::Many => count >= 1,
+        }
+    }
+
+    /// How the shape reads in a message, over a kind's own noun.
+    pub fn wanted(self, kind: &str) -> String {
+        match self {
+            Arity::Zero => format!("no {kind} stream"),
+            Arity::One => format!("one {kind} stream"),
+            Arity::Many => format!("one or more {kind} streams"),
+        }
+    }
 }
 
 /// One encoded packet, exactly as the encoder emitted it.
@@ -796,9 +898,16 @@ pub struct Emitted {
 #[derive(Debug, Clone)]
 pub struct DescribedPacketSink {
     pub meta: Meta,
-    /// ffmpeg codec names accepted, most preferred first; empty is every
-    /// codec.
+    /// ffmpeg names for the VIDEO codecs accepted, most preferred first;
+    /// empty is every codec.
     pub codecs: Vec<String>,
+    /// The same for AUDIO. A world before 0.12.0 named no audio codec and
+    /// read no audio stream, so this is empty for one.
+    pub audio_codecs: Vec<String>,
+    /// How many video streams the sink reads.
+    pub video: Arity,
+    /// How many audio streams the sink reads.
+    pub audio: Arity,
     /// The wit package version the module was built against.
     pub world: &'static str,
 }
@@ -858,39 +967,55 @@ fn nn_view(host: &mut Host) -> WasiNnView<'_> {
     WasiNnView::new(&mut host.table, &mut host.nn)
 }
 
-// The borrowed window a current-world `process` call reads through. Only the
-// windowed adapter ever pushes one, but the store hosts every shape, so the
-// answers live here.
-impl world_0110::window::ffrwd::av::window_source::Host for Host {}
+// The borrowed window a `process` call of 0.11.0 or later reads through. Only
+// a windowed adapter of such a world ever pushes one, but the store hosts
+// every shape, so the answers live here - once per world, since each spells
+// the resource separately.
+macro_rules! window_source_host {
+    ($world:ident) => {
+        impl $world::window::ffrwd::av::window_source::Host for Host {}
 
-impl world_0110::window::ffrwd::av::window_source::HostInWindow for Host {
-    fn len(&mut self, window: Resource<BorrowedWindow>) -> wasmtime::Result<u32> {
-        Ok(self.table.get(&window)?.frames.len() as u32)
-    }
+        impl $world::window::ffrwd::av::window_source::HostInWindow for Host {
+            fn len(&mut self, window: Resource<BorrowedWindow>) -> wasmtime::Result<u32> {
+                Ok(self.table.get(&window)?.frames.len() as u32)
+            }
 
-    fn pts(&mut self, window: Resource<BorrowedWindow>, i: u32) -> wasmtime::Result<i64> {
-        Ok(self.table.get(&window)?.payload(i)?.pts)
-    }
+            fn pts(&mut self, window: Resource<BorrowedWindow>, i: u32) -> wasmtime::Result<i64> {
+                Ok(self.table.get(&window)?.payload(i)?.pts)
+            }
 
-    fn rows(&mut self, window: Resource<BorrowedWindow>, i: u32) -> wasmtime::Result<Vec<String>> {
-        Ok(self.table.get(&window)?.payload(i)?.rows.clone())
-    }
+            fn rows(
+                &mut self,
+                window: Resource<BorrowedWindow>,
+                i: u32,
+            ) -> wasmtime::Result<Vec<String>> {
+                Ok(self.table.get(&window)?.payload(i)?.rows.clone())
+            }
 
-    fn fetch(&mut self, window: Resource<BorrowedWindow>, i: u32) -> wasmtime::Result<Vec<u8>> {
-        // The one per-payload copy, made only when asked for.
-        Ok(self.table.get(&window)?.payload(i)?.data.as_ref().clone())
-    }
+            fn fetch(
+                &mut self,
+                window: Resource<BorrowedWindow>,
+                i: u32,
+            ) -> wasmtime::Result<Vec<u8>> {
+                // The one per-payload copy, made only when asked for.
+                Ok(self.table.get(&window)?.payload(i)?.data.as_ref().clone())
+            }
 
-    fn drop(&mut self, window: Resource<BorrowedWindow>) -> wasmtime::Result<()> {
-        // A guest only ever borrows one, so drops arrive for the host's own
-        // entry; the adapter deletes it after the call either way.
-        if !window.owned() {
-            return Ok(());
+            fn drop(&mut self, window: Resource<BorrowedWindow>) -> wasmtime::Result<()> {
+                // A guest only ever borrows one, so drops arrive for the host's
+                // own entry; the adapter deletes it after the call either way.
+                if !window.owned() {
+                    return Ok(());
+                }
+                self.table.delete(window)?;
+                Ok(())
+            }
         }
-        self.table.delete(window)?;
-        Ok(())
-    }
+    };
 }
+
+window_source_host!(world_0120);
+window_source_host!(world_0110);
 
 /// Whether the component asks the host for inference. Read off the component
 /// type, so nothing is instantiated to find out.
@@ -1015,8 +1140,14 @@ fn link(
 
     let mut linker = Linker::new(engine());
     wasmtime_wasi::p2::add_to_linker_sync(&mut linker).map_err(wasm_err)?;
-    // The borrowed window the current world's `process` reads through. Only a
-    // module of that world imports it; the definition sits unused otherwise.
+    // The borrowed window a windowed `process` reads through, one entry per
+    // world that has one: a module imports the version it was built against,
+    // and the others sit unused.
+    world_0120::window::ffrwd::av::window_source::add_to_linker::<_, HasSelf<_>>(
+        &mut linker,
+        |host: &mut Host| host,
+    )
+    .map_err(wasm_err)?;
     world_0110::window::ffrwd::av::window_source::add_to_linker::<_, HasSelf<_>>(
         &mut linker,
         |host: &mut Host| host,
@@ -1434,6 +1565,7 @@ macro_rules! meta_adapter {
     };
 }
 
+video_adapter!(Video0120, world_0120, "0.12.0");
 video_adapter!(Video0110, world_0110, "0.11.0");
 video_adapter!(Video0100, world_0100, "0.10.0");
 video_adapter!(Video090, world_090, "0.9.0");
@@ -1445,6 +1577,7 @@ video_adapter!(Video040, world_040, "0.4.0");
 video_adapter!(Video030, world_030, "0.3.0");
 video_adapter!(Video020, world_020, "0.2.0");
 
+meta_adapter!(Meta0120, world_0120, "0.12.0");
 meta_adapter!(Meta0110, world_0110, "0.11.0");
 meta_adapter!(Meta0100, world_0100, "0.10.0");
 meta_adapter!(Meta090, world_090, "0.9.0");
@@ -1583,98 +1716,109 @@ macro_rules! kind_bearing_window_adapter {
     };
 }
 
-/// A windowed module of the current world, whose `process` borrows the window
-/// instead of receiving it: the host enters the call's frames into the
-/// store's resource table, hands the guest a borrow, and deletes the entry
-/// the moment the call is over. Nothing is copied in unless the guest
-/// fetches; everything else is what `Window0100` does.
-struct Window0110(world_0110::window::WindowModule);
+/// A windowed module of a world whose `process` BORROWS the window instead of
+/// receiving it: the host enters the call's frames into the store's resource
+/// table, hands the guest a borrow, and deletes the entry the moment the call
+/// is over. Nothing is copied in unless the guest fetches; everything else is
+/// what `kind_bearing_window_adapter!` does.
+macro_rules! borrowed_window_adapter {
+    ($name:ident, $world:ident, $resolve:ident, $version:literal) => {
+        struct $name($world::window::WindowModule);
 
-impl Adapter for Window0110 {
-    fn described(&self, store: &mut Store<Host>) -> Result<Described> {
-        let d = self
-            .0
-            .ffrwd_av_window_filter()
-            .call_describe(store)
-            .map_err(wasm_err)?;
-        Ok(Described {
-            meta: world_0110::meta(d.meta),
-            shape: Some(Shape {
-                window: d.window,
-                stride: d.stride,
-                pure: d.pure,
-                one_to_one: d.one_to_one,
-            }),
-            reads_rows: d.reads_rows,
-            forwards_rows: d.forwards_rows,
-            world: "0.11.0",
-            audio_capable: true,
-            inputs: d.inputs,
-        })
-    }
+        impl Adapter for $name {
+            fn described(&self, store: &mut Store<Host>) -> Result<Described> {
+                let d = self
+                    .0
+                    .ffrwd_av_window_filter()
+                    .call_describe(store)
+                    .map_err(wasm_err)?;
+                Ok(Described {
+                    meta: $world::meta(d.meta),
+                    shape: Some(Shape {
+                        window: d.window,
+                        stride: d.stride,
+                        pure: d.pure,
+                        one_to_one: d.one_to_one,
+                    }),
+                    reads_rows: d.reads_rows,
+                    forwards_rows: d.forwards_rows,
+                    world: $version,
+                    audio_capable: true,
+                    inputs: d.inputs,
+                })
+            }
 
-    fn init(
-        &self,
-        store: &mut Store<Host>,
-        format: &Format,
-        stream: &StreamInfo,
-        name: &str,
-        params: &str,
-    ) -> Result<Result<(), String>> {
-        let wit = world_0110::stream_info(stream, format.time_base, name)?;
-        self.0
-            .ffrwd_av_window_filter()
-            .call_init(store, &world_0110::format(format), &wit, params)
-            .map_err(wasm_err)
-    }
+            fn init(
+                &self,
+                store: &mut Store<Host>,
+                format: &Format,
+                stream: &StreamInfo,
+                name: &str,
+                params: &str,
+            ) -> Result<Result<(), String>> {
+                let wit = $world::stream_info(stream, format.time_base, name)?;
+                self.0
+                    .ffrwd_av_window_filter()
+                    .call_init(store, &$world::format(format), &wit, params)
+                    .map_err(wasm_err)
+            }
 
-    fn set_params(&self, store: &mut Store<Host>, params: &str) -> Result<Result<(), String>> {
-        self.0
-            .ffrwd_av_window_filter()
-            .call_set_params(store, params)
-            .map_err(wasm_err)
-    }
+            fn set_params(
+                &self,
+                store: &mut Store<Host>,
+                params: &str,
+            ) -> Result<Result<(), String>> {
+                self.0
+                    .ffrwd_av_window_filter()
+                    .call_set_params(store, params)
+                    .map_err(wasm_err)
+            }
 
-    fn frame_independent(&self, _store: &mut Store<Host>) -> Result<Option<bool>> {
-        Ok(None)
-    }
+            fn frame_independent(&self, _store: &mut Store<Host>) -> Result<Option<bool>> {
+                Ok(None)
+            }
 
-    fn process(
-        &self,
-        store: &mut Store<Host>,
-        _format: &Format,
-        frames: &[Frame],
-        trailing: &[String],
-        last: bool,
-        same: SameRule<'_>,
-    ) -> Result<Processed> {
-        // Cloning a Frame clones the Arc around its pixels, not the pixels.
-        let entry = store
-            .data_mut()
-            .table
-            .push(BorrowedWindow {
-                frames: frames.to_vec(),
-            })
-            .map_err(|e| anyhow!("entering a window into the resource table: {e}"))?;
-        let handle = Resource::new_borrow(entry.rep());
-        let produced = self
-            .0
-            .ffrwd_av_window_filter()
-            .call_process(&mut *store, handle, trailing, last)
-            .map_err(wasm_err);
-        // Reclaimed whatever the call did, so the window's life is the call's.
-        store
-            .data_mut()
-            .table
-            .delete(entry)
-            .map_err(|e| anyhow!("reclaiming a window from the resource table: {e}"))?;
-        let produced = produced?;
-        Ok(Processed {
-            frames: resolve_0110(produced.frames, frames, same)?,
-            trailing: produced.trailing,
-        })
-    }
+            fn process(
+                &self,
+                store: &mut Store<Host>,
+                _format: &Format,
+                frames: &[Frame],
+                trailing: &[String],
+                last: bool,
+                same: SameRule<'_>,
+            ) -> Result<Processed> {
+                // Cloning a Frame clones the Arc around its pixels, not the pixels.
+                let entry = store
+                    .data_mut()
+                    .table
+                    .push(BorrowedWindow {
+                        frames: frames.to_vec(),
+                    })
+                    .map_err(|e| anyhow!("entering a window into the resource table: {e}"))?;
+                let handle = Resource::new_borrow(entry.rep());
+                let produced = self
+                    .0
+                    .ffrwd_av_window_filter()
+                    .call_process(&mut *store, handle, trailing, last)
+                    .map_err(wasm_err);
+                // Reclaimed whatever the call did, so the window's life is the call's.
+                store
+                    .data_mut()
+                    .table
+                    .delete(entry)
+                    .map_err(|e| anyhow!("reclaiming a window from the resource table: {e}"))?;
+                let produced = produced?;
+                Ok(Processed {
+                    frames: $resolve(produced.frames, frames, same)?,
+                    trailing: produced.trailing,
+                })
+            }
+        }
+    };
 }
+
+borrowed_window_adapter!(Window0120, world_0120, resolve_0120, "0.12.0");
+borrowed_window_adapter!(Window0110, world_0110, resolve_0110, "0.11.0");
 
 kind_bearing_window_adapter!(
     Window0100,
@@ -1919,6 +2063,7 @@ macro_rules! resolve_frames {
     };
 }
 
+resolve_frames!(resolve_0120, world_0120);
 resolve_frames!(resolve_0110, world_0110);
 resolve_frames!(resolve_0100, world_0100);
 resolve_frames!(resolve_090, world_090);
@@ -1988,7 +2133,13 @@ fn instantiate(module_path: &str, purpose: Purpose) -> Result<Opened> {
     // current one never goes through an adapter.
     let context = || format!("instantiating {module_path}");
     let instance: Box<dyn Adapter> =
-        if has_export(&component, &interface("window-filter", "0.11.0")) {
+        if has_export(&component, &interface("window-filter", "0.12.0")) {
+            Box::new(Window0120(
+                world_0120::window::WindowModule::instantiate(&mut store, &component, &linker)
+                    .map_err(wasm_err)
+                    .with_context(context)?,
+            ))
+        } else if has_export(&component, &interface("window-filter", "0.11.0")) {
             Box::new(Window0110(
                 world_0110::window::WindowModule::instantiate(&mut store, &component, &linker)
                     .map_err(wasm_err)
@@ -2027,6 +2178,12 @@ fn instantiate(module_path: &str, purpose: Purpose) -> Result<Opened> {
         } else if has_export(&component, &interface("window-filter", "0.5.0")) {
             Box::new(Window050(
                 world_050::window::WindowModule::instantiate(&mut store, &component, &linker)
+                    .map_err(wasm_err)
+                    .with_context(context)?,
+            ))
+        } else if has_export(&component, &interface("meta-filter", "0.12.0")) {
+            Box::new(Meta0120(
+                world_0120::meta::MetaModule::instantiate(&mut store, &component, &linker)
                     .map_err(wasm_err)
                     .with_context(context)?,
             ))
@@ -2075,6 +2232,12 @@ fn instantiate(module_path: &str, purpose: Purpose) -> Result<Opened> {
         } else if has_export(&component, &interface("meta-filter", "0.4.0")) {
             Box::new(Meta040(
                 world_040::meta::MetaModule::instantiate(&mut store, &component, &linker)
+                    .map_err(wasm_err)
+                    .with_context(context)?,
+            ))
+        } else if has_export(&component, &interface("filter", "0.12.0")) {
+            Box::new(Video0120(
+                world_0120::video::VideoModule::instantiate(&mut store, &component, &linker)
                     .map_err(wasm_err)
                     .with_context(context)?,
             ))
@@ -2193,6 +2356,7 @@ pub fn describe(module_path: &str) -> Result<Described> {
 
 /// One instantiated values module, in whichever world it was built against.
 enum ValuesInstance {
+    W0120(world_0120::values::ValuesModule),
     W0110(world_0110::values::ValuesModule),
     W0100(world_0100::values::ValuesModule),
     W090(world_090::values::ValuesModule),
@@ -2223,6 +2387,7 @@ impl ValuesInstance {
             };
         }
         Ok(match self {
+            ValuesInstance::W0120(b) => listed!(b),
             ValuesInstance::W0110(b) => listed!(b),
             ValuesInstance::W0100(b) => listed!(b),
             ValuesInstance::W090(b) => listed!(b),
@@ -2242,6 +2407,7 @@ impl ValuesInstance {
         args: &str,
     ) -> Result<Result<String, String>> {
         match self {
+            ValuesInstance::W0120(b) => b.ffrwd_av_values().call_invoke(store, name, args),
             ValuesInstance::W0110(b) => b.ffrwd_av_values().call_invoke(store, name, args),
             ValuesInstance::W0100(b) => b.ffrwd_av_values().call_invoke(store, name, args),
             ValuesInstance::W090(b) => b.ffrwd_av_values().call_invoke(store, name, args),
@@ -2281,7 +2447,13 @@ fn instantiate_values(
     );
 
     let context = || format!("instantiating {module_path}");
-    let instance = if has_export(&component, &interface("values", "0.11.0")) {
+    let instance = if has_export(&component, &interface("values", "0.12.0")) {
+        ValuesInstance::W0120(
+            world_0120::values::ValuesModule::instantiate(&mut store, &component, &linker)
+                .map_err(wasm_err)
+                .with_context(context)?,
+        )
+    } else if has_export(&component, &interface("values", "0.11.0")) {
         ValuesInstance::W0110(
             world_0110::values::ValuesModule::instantiate(&mut store, &component, &linker)
                 .map_err(wasm_err)
@@ -2382,81 +2554,144 @@ fn check_packet_export(component: &Component, module_path: &str) -> Result<()> {
 }
 
 /// One instantiated packet sink, in whichever world it was built against.
-/// The interface's wit is the same in both; only the generated types differ.
+/// From 0.12.0 the interface carries a list of streams and a packet list per
+/// pad; before it, exactly one video stream and one packet list.
 enum PacketInstance {
+    W0120(world_0120::packet::PacketModule),
     W0110(world_0110::packet::PacketModule),
     W0100(world_0100::packet::PacketModule),
 }
 
 impl PacketInstance {
-    /// The wit package version the module was built against.
-    fn world(&self) -> &'static str {
-        match self {
-            PacketInstance::W0110(_) => "0.11.0",
-            PacketInstance::W0100(_) => "0.10.0",
-        }
-    }
-
-    fn describe(&self, store: &mut Store<Host>) -> Result<(Meta, Vec<String>)> {
-        // Each world spells the description separately, so each arm carries
-        // its own into the host's.
-        macro_rules! described {
-            ($b:expr, $world:ident) => {{
+    fn describe(&self, store: &mut Store<Host>) -> Result<DescribedPacketSink> {
+        // A world before 0.12.0 reads one video stream and names no audio
+        // codec, so its description carries that shape into the host's.
+        macro_rules! one_video_stream {
+            ($b:expr, $world:ident, $version:literal) => {{
                 let d = $b
                     .ffrwd_av_packet_sink()
                     .call_describe(&mut *store)
                     .map_err(wasm_err)?;
-                ($world::meta(d.meta), d.codecs)
+                DescribedPacketSink {
+                    meta: $world::meta(d.meta),
+                    codecs: d.codecs,
+                    audio_codecs: Vec::new(),
+                    video: Arity::One,
+                    audio: Arity::Zero,
+                    world: $version,
+                }
             }};
         }
         Ok(match self {
-            PacketInstance::W0110(b) => described!(b, world_0110),
-            PacketInstance::W0100(b) => described!(b, world_0100),
+            PacketInstance::W0120(b) => {
+                use world_0120::packet::exports::ffrwd::av::packet_sink::Arity as Wit;
+                let arity = |a: Wit| match a {
+                    Wit::Zero => Arity::Zero,
+                    Wit::One => Arity::One,
+                    Wit::Many => Arity::Many,
+                };
+                let d = b
+                    .ffrwd_av_packet_sink()
+                    .call_describe(&mut *store)
+                    .map_err(wasm_err)?;
+                DescribedPacketSink {
+                    meta: world_0120::meta(d.meta),
+                    codecs: d.codecs,
+                    audio_codecs: d.audio_codecs,
+                    video: arity(d.video),
+                    audio: arity(d.audio),
+                    world: "0.12.0",
+                }
+            }
+            PacketInstance::W0110(b) => one_video_stream!(b, world_0110, "0.11.0"),
+            PacketInstance::W0100(b) => one_video_stream!(b, world_0100, "0.10.0"),
         })
     }
 
     fn init(
         &self,
         store: &mut Store<Host>,
-        stream: &CodedStream,
-        info: &StreamInfo,
+        inputs: &[SinkInput],
         name: &str,
         params: &str,
     ) -> Result<Result<(), String>> {
-        macro_rules! opened {
+        // A world before 0.12.0 opens for one video stream, which is all its
+        // `coded-stream` can say; the shape is refused before it gets here.
+        macro_rules! one_video_stream {
             ($b:expr, $world:ident) => {{
-                let (num, den) = stream.time_base.rational(name)?;
-                let wit_stream = $world::packet::exports::ffrwd::av::packet_sink::CodedStream {
-                    codec: stream.codec.clone(),
-                    time_base: $world::video::ffrwd::av::types::Rational { num, den },
-                    width: stream.width,
-                    height: stream.height,
-                    extradata: stream.extradata.clone(),
+                let input = &inputs[0];
+                let (num, den) = input.stream.time_base.rational(name)?;
+                let CodedFormat::Video { width, height } = input.stream.format else {
+                    bail!("{name} reads one video stream, and pad 0 carries audio");
                 };
-                let wit_info = $world::stream_info(info, stream.time_base, name)?;
+                let wit_stream = $world::packet::exports::ffrwd::av::packet_sink::CodedStream {
+                    codec: input.stream.codec.clone(),
+                    time_base: $world::video::ffrwd::av::types::Rational { num, den },
+                    width,
+                    height,
+                    extradata: input.stream.extradata.clone(),
+                };
+                let wit_info = $world::stream_info(&input.info, input.stream.time_base, name)?;
                 $b.ffrwd_av_packet_sink()
                     .call_init(&mut *store, &wit_stream, &wit_info, params)
                     .map_err(wasm_err)
             }};
         }
         match self {
-            PacketInstance::W0110(b) => opened!(b, world_0110),
-            PacketInstance::W0100(b) => opened!(b, world_0100),
+            PacketInstance::W0120(b) => {
+                use world_0120::packet::exports::ffrwd::av::packet_sink as wit;
+                let mut streams = Vec::with_capacity(inputs.len());
+                for input in inputs {
+                    let (num, den) = input.stream.time_base.rational(name)?;
+                    let format = match input.stream.format {
+                        CodedFormat::Video { width, height } => {
+                            wit::CodedFormat::Video(wit::CodedVideo { width, height })
+                        }
+                        CodedFormat::Audio {
+                            sample_rate,
+                            channels,
+                        } => wit::CodedFormat::Audio(wit::CodedAudio {
+                            sample_rate,
+                            channels,
+                        }),
+                    };
+                    streams.push(wit::InputStream {
+                        coded: wit::CodedStream {
+                            codec: input.stream.codec.clone(),
+                            time_base: world_0120::video::ffrwd::av::types::Rational { num, den },
+                            format,
+                            extradata: input.stream.extradata.clone(),
+                        },
+                        info: world_0120::stream_info(&input.info, input.stream.time_base, name)?,
+                    });
+                }
+                b.ffrwd_av_packet_sink()
+                    .call_init(&mut *store, &streams, params)
+                    .map_err(wasm_err)
+            }
+            PacketInstance::W0110(b) => one_video_stream!(b, world_0110),
+            PacketInstance::W0100(b) => one_video_stream!(b, world_0100),
         }
     }
 
     fn set_params(&self, store: &mut Store<Host>, params: &str) -> Result<Result<(), String>> {
         match self {
+            PacketInstance::W0120(b) => b.ffrwd_av_packet_sink().call_set_params(store, params),
             PacketInstance::W0110(b) => b.ffrwd_av_packet_sink().call_set_params(store, params),
             PacketInstance::W0100(b) => b.ffrwd_av_packet_sink().call_set_params(store, params),
         }
         .map_err(wasm_err)
     }
 
-    fn process(&self, store: &mut Store<Host>, packets: &[Packet], last: bool) -> Result<Emitted> {
-        macro_rules! driven {
+    fn process(
+        &self,
+        store: &mut Store<Host>,
+        pads: &[Vec<Packet>],
+        last: bool,
+    ) -> Result<Emitted> {
+        macro_rules! one_pad {
             ($b:expr, $world:ident) => {{
-                let wit: Vec<$world::packet::exports::ffrwd::av::packet_sink::Packet> = packets
+                let wit: Vec<$world::packet::exports::ffrwd::av::packet_sink::Packet> = pads[0]
                     .iter()
                     .map(
                         |p| $world::packet::exports::ffrwd::av::packet_sink::Packet {
@@ -2478,8 +2713,33 @@ impl PacketInstance {
             }};
         }
         Ok(match self {
-            PacketInstance::W0110(b) => driven!(b, world_0110),
-            PacketInstance::W0100(b) => driven!(b, world_0100),
+            PacketInstance::W0120(b) => {
+                use world_0120::packet::exports::ffrwd::av::packet_sink as wit;
+                let carried: Vec<wit::PadPackets> = pads
+                    .iter()
+                    .map(|packets| wit::PadPackets {
+                        packets: packets
+                            .iter()
+                            .map(|p| wit::Packet {
+                                pts: p.pts,
+                                dts: p.dts,
+                                keyframe: p.keyframe,
+                                data: p.data.clone(),
+                            })
+                            .collect(),
+                    })
+                    .collect();
+                let produced = b
+                    .ffrwd_av_packet_sink()
+                    .call_process(&mut *store, &carried, last)
+                    .map_err(wasm_err)?;
+                Emitted {
+                    rows: produced.rows,
+                    trailing: produced.trailing,
+                }
+            }
+            PacketInstance::W0110(b) => one_pad!(b, world_0110),
+            PacketInstance::W0100(b) => one_pad!(b, world_0100),
         })
     }
 }
@@ -2509,7 +2769,13 @@ fn instantiate_packet(
         },
     );
     let context = || format!("instantiating {module_path}");
-    let instance = if has_export(&component, &interface("packet-sink", "0.11.0")) {
+    let instance = if has_export(&component, &interface("packet-sink", "0.12.0")) {
+        PacketInstance::W0120(
+            world_0120::packet::PacketModule::instantiate(&mut store, &component, &linker)
+                .map_err(wasm_err)
+                .with_context(context)?,
+        )
+    } else if has_export(&component, &interface("packet-sink", "0.11.0")) {
         PacketInstance::W0110(
             world_0110::packet::PacketModule::instantiate(&mut store, &component, &linker)
                 .map_err(wasm_err)
@@ -2529,12 +2795,7 @@ fn instantiate_packet(
 /// call the packet sink's `describe()`, without opening it for any stream.
 pub fn describe_packet_sink(module_path: &str) -> Result<DescribedPacketSink> {
     let (mut store, instance) = instantiate_packet(module_path, Purpose::Describe)?;
-    let (meta, codecs) = instance.describe(&mut store)?;
-    Ok(DescribedPacketSink {
-        meta,
-        codecs,
-        world: instance.world(),
-    })
+    instance.describe(&mut store)
 }
 
 /// One instantiated packet sink: encoded packets in, rows out, nothing else
@@ -2543,41 +2804,76 @@ pub struct PacketSink {
     store: Store<Host>,
     instance: PacketInstance,
     meta: Meta,
+    /// How many pads the sink was opened for; every call carries that many
+    /// packet lists.
+    pads: usize,
     /// Whether the final call has been made, which may happen once.
     finished: bool,
 }
 
-impl PacketSink {
-    /// Compiles (cached process-wide by path) and instantiates the component
-    /// at `module_path`, then calls the sink's `init`. The stream's codec
-    /// must be one the sink accepts.
-    pub fn open(
-        module_path: &str,
-        stream: &CodedStream,
-        info: &StreamInfo,
-        params: &str,
-    ) -> Result<PacketSink> {
-        let (mut store, instance) = instantiate_packet(module_path, Purpose::Run)?;
-        let (meta, codecs) = instance.describe(&mut store)?;
-        if !codecs.is_empty() && !codecs.iter().any(|c| c == &stream.codec) {
+/// The streams a sink was handed against the shape it declared: how many of
+/// each kind, and a codec per stream from the list for that kind.
+fn check_sink_inputs(described: &DescribedPacketSink, inputs: &[SinkInput]) -> Result<()> {
+    let name = &described.meta.name;
+    for (kind, arity, accepted) in [
+        ("video", described.video, &described.codecs),
+        ("audio", described.audio, &described.audio_codecs),
+    ] {
+        let of_kind: Vec<&SinkInput> = inputs
+            .iter()
+            .filter(|i| i.stream.format.kind() == kind)
+            .collect();
+        if !arity.accepts(of_kind.len()) {
+            let handed = match of_kind.len() {
+                0 => "none".to_string(),
+                n => n.to_string(),
+            };
             bail!(
-                "{} does not accept {}; it publishes {}",
-                meta.name,
-                stream.codec,
-                codecs.join(", ")
+                "{name} reads {}, and this query hands it {handed}",
+                arity.wanted(kind)
             );
         }
+        for input in of_kind {
+            if !accepted.is_empty() && !accepted.iter().any(|c| c == &input.stream.codec) {
+                bail!(
+                    "{name} does not accept {}; it publishes {}",
+                    input.stream.codec,
+                    accepted.join(", ")
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+impl PacketSink {
+    /// Compiles (cached process-wide by path) and instantiates the component
+    /// at `module_path`, then calls the sink's `init` with every pad it
+    /// reads: video pads first, then audio, each group in query order. The
+    /// count of each kind must be a shape the sink declared, and every
+    /// stream's codec one it accepts.
+    pub fn open(module_path: &str, inputs: &[SinkInput], params: &str) -> Result<PacketSink> {
+        let (mut store, instance) = instantiate_packet(module_path, Purpose::Run)?;
+        let described = instance.describe(&mut store)?;
+        let meta = described.meta.clone();
+        check_sink_inputs(&described, inputs)?;
 
         instance
-            .init(&mut store, stream, info, &meta.name, params)?
+            .init(&mut store, inputs, &meta.name, params)?
             .map_err(|e| anyhow!("{} rejected params: {e}", meta.name))?;
 
         Ok(PacketSink {
             store,
             instance,
             meta,
+            pads: inputs.len(),
             finished: false,
         })
+    }
+
+    /// How many pads this sink was opened for.
+    pub fn pads(&self) -> usize {
+        self.pads
     }
 
     /// The sink's `describe()`, read once at open.
@@ -2598,19 +2894,28 @@ impl PacketSink {
         Ok(())
     }
 
-    /// Packets through the sink, in decode order. `last` marks the final
-    /// call, which may carry no packets at all and happens once. Only the
-    /// final call may return trailing rows.
-    pub fn process(&mut self, packets: &[Packet], last: bool) -> Result<Emitted> {
+    /// Packets through the sink, one list per pad in the order `open` was
+    /// given them, each in decode order. `last` marks the final call, which
+    /// may carry no packets at all and happens once. Only the final call may
+    /// return trailing rows.
+    pub fn process(&mut self, pads: &[Vec<Packet>], last: bool) -> Result<Emitted> {
         if self.finished {
             bail!(
                 "{}: called again after the final call, which happens once",
                 self.meta.name
             );
         }
+        if pads.len() != self.pads {
+            bail!(
+                "{}: opened for {} pad(s) and handed {}",
+                self.meta.name,
+                self.pads,
+                pads.len()
+            );
+        }
         self.finished = last;
 
-        let produced = self.instance.process(&mut self.store, packets, last)?;
+        let produced = self.instance.process(&mut self.store, pads, last)?;
         if !last && !produced.trailing.is_empty() {
             bail!(
                 "{} returned {} trailing row(s) from a call that is not its final one; only the \

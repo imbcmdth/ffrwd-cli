@@ -8,6 +8,8 @@ Expected argv is always read off the rendered command rather than typed out.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import pytest
 
 from ffrwd import show
@@ -134,9 +136,10 @@ def test_the_player_reads_nut_off_its_stdin(title: str) -> None:
 # --- a process plan ---------------------------------------------------------
 
 
-def _stand_in(process: SidecarProcess) -> list[str]:
+def _stand_in(process: SidecarProcess, reads: Sequence[str] = ()) -> list[str]:
     """The argv a sidecar is spawned with, standing in for the real one."""
-    return ["ffrwd-wasm", "-m", process.module, "-f", "nut", "pipe:0", "pipe:1"]
+    read = reads[0] if reads else "pipe:0"
+    return ["ffrwd-wasm", "-m", process.module, "-f", "nut", read, "pipe:1"]
 
 
 def _module(id_: str, ref: str, type_: StreamType = "video") -> Node:

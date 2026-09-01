@@ -525,7 +525,7 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
         );
     }
 
-    let modules = build_modules(modules, params, wiring, &inputs, &outputs)?;
+    let modules = build_modules(modules, params, wiring, &outputs)?;
 
     let stream_info = match stream_info_path {
         Some(path) => Some(load_stream_info(&path)?),
@@ -550,7 +550,6 @@ fn build_modules(
     modules: Vec<String>,
     params: Option<String>,
     wiring: Option<String>,
-    inputs: &[InputPath],
     outputs: &[OutputSpec],
 ) -> Result<Modules> {
     // A network may be built entirely of nodes the host answers for, and
@@ -565,9 +564,6 @@ fn build_modules(
                 "{} modules were given with -m and no -filter_complex wires them",
                 modules.len()
             );
-        }
-        if inputs.len() > 1 {
-            bail!("a single module reads one stream; a second -i needs a -filter_complex");
         }
         if let Some(output) = outputs.iter().find(|o| o.target.is_some()) {
             let target = output.target.as_deref().unwrap_or_default();
@@ -617,11 +613,33 @@ enum InputReader {
     File(File),
 }
 
+/// Windows named-pipe codes for "the other end is gone": ERROR_BROKEN_PIPE,
+/// ERROR_NO_DATA and ERROR_PIPE_NOT_CONNECTED. A pipe reports its writer's
+/// exit this way rather than with the empty read a file or a stdin closes
+/// with, and not all of them carry an `ErrorKind` of their own.
+const PIPE_CLOSED: &[i32] = &[109, 232, 233];
+
+/// Whether this read error means the stream ended rather than broke.
+fn is_pipe_eof(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::BrokenPipe | io::ErrorKind::NotConnected
+    ) || e
+        .raw_os_error()
+        .is_some_and(|code| PIPE_CLOSED.contains(&code))
+}
+
 impl Read for InputReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
             InputReader::Stdin(r) => r.read(buf),
-            InputReader::File(r) => r.read(buf),
+            InputReader::File(r) => match r.read(buf) {
+                // The end of a pipe is the end of the input; a producer that
+                // died before it is the plan runner's to notice, by its exit
+                // code, exactly as a closed stdin already is.
+                Err(e) if is_pipe_eof(&e) => Ok(0),
+                other => other,
+            },
         }
     }
 }
@@ -980,8 +998,12 @@ fn run(args: &Args) -> Result<()> {
         let is_packet_sink = ffrwd_wasm_runtime::runtime::exports_packet_sink(path)
             .with_context(|| format!("opening module {path}"))?;
         if is_packet_sink {
-            let input = readers.pop().expect("one input was required");
-            return run_packet_sink(args, path, params, input);
+            return run_packet_sink(args, path, params, readers);
+        }
+        // A sink is what reads several streams off several -i; a frame module
+        // reads its pads out of ONE input, wired by -filter_complex.
+        if readers.len() > 1 {
+            bail!("a single frame module reads one stream; a second -i needs a -filter_complex");
         }
     }
     if let Modules::Network { bindings, .. } = &args.modules {
@@ -1049,10 +1071,16 @@ fn run(args: &Args) -> Result<()> {
     }
 }
 
-/// One encoded input through a packet sink: packets handed through untouched,
-/// in decode order, rows to the row outputs. No frames leave, so the only
-/// outputs are rows and null.
-fn run_packet_sink(args: &Args, module: &str, params: &str, mut input: Input) -> Result<()> {
+/// The encoded inputs of a packet sink through ONE instance: packets handed
+/// through untouched, in decode order per pad, rows to the row outputs. No
+/// frames leave, so the only outputs are rows and null.
+///
+/// Pads run independently. Packets are not frames: nothing pairs a pad's
+/// packet with another pad's, so there is no lockstep to hold and a call may
+/// carry packets on some pads and none on others. Each round takes one packet
+/// off every pad still open, which is what keeps a fast encoder from running
+/// away while a slow one is still working.
+fn run_packet_sink(args: &Args, module: &str, params: &str, inputs: Vec<Input>) -> Result<()> {
     // A packet sink is an exclusive lane by nature: packets reach it in
     // decode order, so one instance reads them and `-jobs` caps nothing.
     if args.annotations.input {
@@ -1076,7 +1104,74 @@ fn run_packet_sink(args: &Args, module: &str, params: &str, mut input: Input) ->
         }
     }
 
-    let stream = input.stream().clone();
+    let mut inputs = inputs;
+    let mut opened = Vec::with_capacity(inputs.len());
+    for (pad, input) in inputs.iter().enumerate() {
+        opened.push(coded_pad(args, module, pad, input.stream())?);
+    }
+    let pads = opened.len();
+    let mut sink = runtime::PacketSink::open(module, &opened, params)
+        .with_context(|| format!("opening module {module}"))?;
+
+    let mut buf: Vec<u8> = Vec::new();
+    let mut open = vec![true; pads];
+    let mut index = vec![0u64; pads];
+    loop {
+        let mut carried: Vec<Vec<runtime::Packet>> = vec![Vec::new(); pads];
+        let mut any = false;
+        for (pad, input) in inputs.iter_mut().enumerate() {
+            if !open[pad] {
+                continue;
+            }
+            let read = input
+                .read_packet(&mut buf)
+                .with_context(|| format!("reading packet {} of pad {pad}", index[pad]))?;
+            let Some(packet) = read else {
+                open[pad] = false;
+                continue;
+            };
+            carried[pad].push(runtime::Packet {
+                pts: packet.pts,
+                dts: packet.dts,
+                keyframe: packet.keyframe,
+                data: std::mem::take(&mut buf),
+            });
+            index[pad] += 1;
+            any = true;
+        }
+        if !any {
+            break;
+        }
+        let emitted = sink
+            .process(&carried, false)
+            .with_context(|| format!("{}: processing packets", sink.name()))?;
+        for writer in &mut row_outputs {
+            write_rows(writer, &emitted.rows)?;
+        }
+    }
+
+    // The final call, carrying no packets: whatever the sink held back
+    // arrives as rows, and the trailing rows follow them.
+    let emitted = sink
+        .process(&vec![Vec::new(); pads], true)
+        .with_context(|| format!("{}: the final call", sink.name()))?;
+    for writer in &mut row_outputs {
+        write_rows(writer, &emitted.rows)?;
+        write_rows(writer, &emitted.trailing)?;
+        writer.flush()?;
+    }
+    Ok(())
+}
+
+/// One pad of a packet sink, from the NUT header the input opened with. A
+/// stream this wire carries decoded never reaches a sink: the encoder lives
+/// in the ffmpeg on the other side of the pipe.
+fn coded_pad(
+    args: &Args,
+    module: &str,
+    pad: usize,
+    stream: &nut::Stream,
+) -> Result<runtime::SinkInput> {
     let Some(codec) = stream.codec_name() else {
         let carried = if let Some(pix_fmt) = stream.pix_fmt() {
             format!("decoded {pix_fmt} video")
@@ -1086,7 +1181,7 @@ fn run_packet_sink(args: &Args, module: &str, params: &str, mut input: Input) ->
             format!("codec tag {}", stream.fourcc_name())
         };
         bail!(
-            "{module} consumes encoded packets, and this input carries {carried}; \
+            "{module} consumes encoded packets, and input {pad} carries {carried}; \
              put it after the encoder (ffmpeg ... -c:v <codec> -f nut)"
         );
     };
@@ -1099,55 +1194,20 @@ fn run_packet_sink(args: &Args, module: &str, params: &str, mut input: Input) ->
             num: stream.time_base.num,
             den: stream.time_base.den,
         },
-        width,
-        height,
+        format: runtime::CodedFormat::Video { width, height },
         extradata: stream.extradata.clone(),
     };
     let info = args.stream_info.clone().unwrap_or_else(|| StreamInfo {
-        index: 0,
+        index: pad as u32,
         kind: "video".to_string(),
         codec: codec.to_string(),
         duration: None,
         tags: Vec::new(),
     });
-    let mut sink = runtime::PacketSink::open(module, &coded, &info, params)
-        .with_context(|| format!("opening module {module}"))?;
-
-    let mut buf: Vec<u8> = Vec::new();
-    let mut index: u64 = 0;
-    loop {
-        let read = input
-            .read_packet(&mut buf)
-            .with_context(|| format!("reading packet {index}"))?;
-        let Some(packet) = read else { break };
-        let emitted = sink
-            .process(
-                &[runtime::Packet {
-                    pts: packet.pts,
-                    dts: packet.dts,
-                    keyframe: packet.keyframe,
-                    data: std::mem::take(&mut buf),
-                }],
-                false,
-            )
-            .with_context(|| format!("{}: processing packet {index}", sink.name()))?;
-        for writer in &mut row_outputs {
-            write_rows(writer, &emitted.rows)?;
-        }
-        index += 1;
-    }
-
-    // The final call, carrying no packets: whatever the sink held back
-    // arrives as rows, and the trailing rows follow them.
-    let emitted = sink
-        .process(&[], true)
-        .with_context(|| format!("{}: the final call", sink.name()))?;
-    for writer in &mut row_outputs {
-        write_rows(writer, &emitted.rows)?;
-        write_rows(writer, &emitted.trailing)?;
-        writer.flush()?;
-    }
-    Ok(())
+    Ok(runtime::SinkInput {
+        stream: coded,
+        info,
+    })
 }
 
 /// `-annotations in` on a module that neither reads the rows nor passes them
@@ -1242,12 +1302,22 @@ struct Description {
     /// Whether upstream rows may leave on the module's own output frames.
     /// `null` for a module with no frame interface at all.
     forwards_rows: Option<bool>,
-    /// The ffmpeg codec names a packet sink accepts, most preferred first,
-    /// and empty for every codec. Present only for a module exporting the
-    /// packet sink, which is how that export is reported - the way `window`
-    /// marks a windowed module.
+    /// The ffmpeg codec names a packet sink accepts for VIDEO, most preferred
+    /// first, and empty for every codec. Present only for a module exporting
+    /// the packet sink, which is how that export is reported - the way
+    /// `window` marks a windowed module.
     #[serde(skip_serializing_if = "Option::is_none")]
     codecs: Option<Vec<String>>,
+    /// The same for AUDIO. Empty for a sink built against a world before
+    /// 0.12.0, which read no audio stream.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    audio_codecs: Option<Vec<String>>,
+    /// How many streams of each kind a packet sink reads: "none", "one" or
+    /// "many". Present only for a module exporting the packet sink.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    video_streams: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    audio_streams: Option<&'static str>,
     /// How many streams the module reads at once: frames arrive one per pad,
     /// in pad order, at the same timestamp. Always present, and 1 for a module
     /// of a world before 0.9.0, for a per-frame one, and for one with no frame
@@ -1274,6 +1344,16 @@ struct Description {
 /// should be absent rather than `false` in the common case.
 fn is_false(b: &bool) -> bool {
     !*b
+}
+
+/// How a sink's per-kind stream count reads in a description.
+fn streams_read(arity: ffrwd_wasm_runtime::runtime::Arity) -> &'static str {
+    use ffrwd_wasm_runtime::runtime::Arity;
+    match arity {
+        Arity::Zero => "none",
+        Arity::One => "one",
+        Arity::Many => "many",
+    }
 }
 
 /// Parses a `meta.*_schema` string as JSON; empty means "no rows" and
@@ -1336,6 +1416,9 @@ fn describe_module(module_path: &str) -> Result<String> {
         reads_rows: None,
         forwards_rows: None,
         codecs: None,
+        audio_codecs: None,
+        video_streams: None,
+        audio_streams: None,
         inputs: 1,
         nn: ffrwd_wasm_runtime::runtime::imports_wasi_nn(module_path)
             .with_context(|| format!("describing {module_path}"))?,
@@ -1394,6 +1477,9 @@ fn describe_module(module_path: &str) -> Result<String> {
         description.version = Some(meta.version);
         description.name = Some(meta.name);
         description.codecs = Some(described.codecs);
+        description.audio_codecs = Some(described.audio_codecs);
+        description.video_streams = Some(streams_read(described.video));
+        description.audio_streams = Some(streams_read(described.audio));
     }
 
     if has_values {

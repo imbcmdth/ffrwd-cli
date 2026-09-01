@@ -26,6 +26,7 @@ from ffrwd.processes import (
     SidecarProcess,
     StreamEdge,
     VideoFormat,
+    check_spellable,
     external_ids,
     from_commands,
     is_live,
@@ -740,6 +741,21 @@ def test_a_regions_fan_out_carries_no_split_node() -> None:
     assert list(region.graph.nodes) == ["e0", "e1", "e2"]
     assert region.graph.nodes["e1"].inputs == ["e0"]
     assert region.graph.nodes["e2"].inputs == ["e0"]
+
+
+def test_a_region_leaving_on_two_edges_is_not_spellable() -> None:
+    """Partitioning says what the region's shape is; a module process
+    writes one stream, so this plan is one nothing can spawn."""
+    plan = partition(_region_fanout_graph(), external=external_ids("e0", "e1", "e2"))
+    with pytest.raises(FfrwdError) as caught:
+        check_spellable(plan)
+    assert caught.value.code is ErrorCode.UNSUPPORTED_SQL
+    assert "2 streams leaving it" in caught.value.message
+    assert "one COPY per stream" in (caught.value.hint or "")
+
+
+def test_a_region_leaving_on_one_edge_is_spellable() -> None:
+    check_spellable(partition(_series_graph(), external=external_ids("e0", "e1")))
 
 
 def test_a_regions_fan_out_leaves_the_region_on_two_edges() -> None:

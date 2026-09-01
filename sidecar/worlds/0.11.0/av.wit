@@ -1,4 +1,4 @@
-package ffrwd:av@0.12.0;
+package ffrwd:av@0.11.0;
 
 interface types {
   /// Static description of a module, available without running anything.
@@ -279,83 +279,35 @@ interface window-filter {
 /// A sink for encoded packets. Where `window-filter` is handed decoded
 /// payloads, this interface is handed the encoder's own output - compressed
 /// bytes with their timestamps and keyframe flags - and hands back rows
-/// alone. A packet sink consumes the streams: no frames leave, so a module
+/// alone. A packet sink consumes the stream: no frames leave, so a module
 /// exports this one instead of the frame interfaces, and what it emits goes
 /// to a rows output or nowhere.
-///
-/// A sink is a filter with no output pads, and reads streams the way one
-/// does: several at once, of either kind. Earlier worlds carried exactly one
-/// coded stream and one packet list; here `init` is handed every stream the
-/// query named, in that order, and `process` is handed one packet list per
-/// pad in the same order.
 interface packet-sink {
   use types.{meta, rational, stream-info};
-
-  /// How many streams of one kind a sink reads.
-  enum arity {
-    /// None of this kind reaches the sink.
-    zero,
-    /// Exactly one, which is what every sink before 0.12.0 read.
-    one,
-    /// One or more, as many as the query hands over.
-    many,
-  }
 
   /// `meta`, plus what this sink accepts. A packet sink names codecs the way
   /// a frame module names pixel formats; `meta`'s own format lists stay
   /// empty, since no decoded payload ever reaches it.
   record packet-sink-meta {
     meta: meta,
-    /// ffmpeg's names for the VIDEO codecs accepted, most preferred first.
-    /// Empty is every codec.
+    /// ffmpeg's names for the codecs accepted, most preferred first. Empty
+    /// is every codec.
     codecs: list<string>,
-    /// ffmpeg's names for the AUDIO codecs accepted, most preferred first.
-    /// Empty is every codec.
-    audio-codecs: list<string>,
-    /// How many video streams this sink reads.
-    video: arity,
-    /// How many audio streams this sink reads.
-    audio: arity,
   }
 
-  /// The frames a coded video stream declares.
-  record coded-video {
-    width: u32,
-    height: u32,
-  }
-
-  /// The samples a coded audio stream declares.
-  record coded-audio {
-    sample-rate: u32,
-    channels: u32,
-  }
-
-  /// What a coded stream carries, which is what tells its kind.
-  variant coded-format {
-    video(coded-video),
-    audio(coded-audio),
-  }
-
-  /// One encoded stream an instance is opened for, fixed for its life.
+  /// The encoded stream an instance is opened for, fixed for its life.
   record coded-stream {
     /// ffmpeg's name for the codec, e.g. "h264".
     codec: string,
     /// The unit `pts` and `dts` are counted in, as a fraction of a second.
     time-base: rational,
-    /// The geometry the stream declares, and its kind.
-    format: coded-format,
+    /// The frame size the stream declares.
+    width: u32,
+    height: u32,
     /// The codec's out-of-band header, exactly as the stream header carried
     /// it: for h264, the SPS and PPS a downstream packager needs before the
     /// first packet.
     extradata: list<u8>,
-  }
-
-  /// One pad's stream, told once at init: what the wire's own header said
-  /// about the encoding, and what the process driving the host said about
-  /// the stream.
-  record input-stream {
-    coded: coded-stream,
-    info: stream-info,
   }
 
   /// One encoded packet, exactly as the encoder emitted it.
@@ -373,13 +325,6 @@ interface packet-sink {
     data: list<u8>,
   }
 
-  /// One pad's packets from one call, in decode order. Empty when nothing
-  /// arrived on that pad; the list of these is as long as `init`'s streams
-  /// and in the same order, so the index is the pad.
-  record pad-packets {
-    packets: list<packet>,
-  }
-
   /// What one call produced. Rows only: a packet sink's rows are its whole
   /// product.
   record processed {
@@ -392,22 +337,19 @@ interface packet-sink {
 
   describe: func() -> packet-sink-meta;
 
-  /// Called once per instance, with every stream the sink reads: video pads
-  /// first, then audio, each group in the order the query named them. A sink
-  /// declaring `one` of a kind is opened with exactly one of it, and one
-  /// declaring `zero` with none.
-  init: func(streams: list<input-stream>, params: string) -> result<_, string>;
+  /// Called once per instance. `coded-stream` is what the wire's own header
+  /// said about the encoded stream; `stream-info` is what the process
+  /// driving the host said, as everywhere else.
+  init: func(coded-stream: coded-stream, stream-info: stream-info,
+             params: string) -> result<_, string>;
 
   /// Replaces the parameters between calls, as the other interfaces do.
   set-params: func(params: string) -> result<_, string>;
 
-  /// Packets in decode order, one list per pad in `init`'s order. Pads run
-  /// independently: packets are not frames, so nothing pairs a pad's packet
-  /// with another pad's, and a call may carry packets on some pads and none
-  /// on others. `last` marks the final call of the instance's life: it
-  /// carries whatever is left, which may be no packets at all, and happens
-  /// exactly once.
-  process: func(pads: list<pad-packets>, last: bool) -> processed;
+  /// Packets in decode order. `last` marks the final call of the instance's
+  /// life: it carries whatever is left, which may be no packets at all, and
+  /// happens exactly once.
+  process: func(packets: list<packet>, last: bool) -> processed;
 }
 
 interface values {

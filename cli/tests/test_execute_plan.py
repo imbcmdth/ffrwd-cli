@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import threading
+from collections.abc import Sequence
 
 import pytest
 
@@ -48,14 +49,12 @@ def _out(ref: str, type_: StreamType = "video") -> Output:
     return Output(ref=ref, type=type_, name=None, metadata={})
 
 
-def _stand_in(process: SidecarProcess) -> list[str]:
-    """An ffmpeg standing in for a sidecar, wired to its own stdin and stdout."""
-    return [
-        "ffmpeg",
-        "-f", "nut", "-i", "pipe:0",
-        "-vf", process.module,
-        "-c:v", "rawvideo", "-f", "nut", "pipe:1",
-    ]  # fmt: skip
+def _stand_in(process: SidecarProcess, reads: Sequence[str] = ()) -> list[str]:
+    """An ffmpeg standing in for a sidecar, reading the paths it was given."""
+    argv = ["ffmpeg"]
+    for path in reads or ("pipe:0",):
+        argv += ["-f", "nut", "-i", path]
+    return [*argv, "-vf", process.module, "-c:v", "rawvideo", "-f", "nut", "pipe:1"]
 
 
 def _named(edge: StreamEdge, side: str) -> str:

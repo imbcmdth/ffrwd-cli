@@ -9,6 +9,7 @@ by hand, so a test cannot drift from the renderer it is checking.
 from __future__ import annotations
 
 import shlex
+from collections.abc import Sequence
 
 from ffrwd.execute import CHAIN, PIPELINE, plan_argv, render_plan
 from ffrwd.ir import Graph, Node, Output, SinkUnit, StreamType
@@ -25,14 +26,12 @@ def _out(ref: str, type_: StreamType = "video") -> Output:
     return Output(ref=ref, type=type_, name=None, metadata={})
 
 
-def _stand_in(process: SidecarProcess) -> list[str]:
-    """An ffmpeg standing in for a sidecar, wired to its own stdin and stdout."""
-    return [
-        "ffmpeg",
-        "-f", "nut", "-i", "pipe:0",
-        "-vf", process.module,
-        "-c:v", "rawvideo", "-f", "nut", "pipe:1",
-    ]  # fmt: skip
+def _stand_in(process: SidecarProcess, reads: Sequence[str] = ()) -> list[str]:
+    """An ffmpeg standing in for a sidecar, reading the paths it was given."""
+    argv = ["ffmpeg"]
+    for path in reads or ("pipe:0",):
+        argv += ["-f", "nut", "-i", path]
+    return [*argv, "-vf", process.module, "-c:v", "rawvideo", "-f", "nut", "pipe:1"]
 
 
 def _chain_plan() -> ProcessPlan:

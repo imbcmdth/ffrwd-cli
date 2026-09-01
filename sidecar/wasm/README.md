@@ -1,7 +1,7 @@
 # ffrwd/wasm
 
 The `ffrwd:av` wit world, versioned as this package is versioned:
-`ffrwd/wasm@0.11.0` carries `ffrwd:av@0.11.0`, immutable, resolvable
+`ffrwd/wasm@0.12.0` carries `ffrwd:av@0.12.0`, immutable, resolvable
 forever. Depend on it and your build has the interface a module
 targets — no vendored copy to drift, no path into anyone's checkout.
 
@@ -10,7 +10,7 @@ targets — no vendored copy to drift, no path into anyone's checkout.
 Declare the dependency and install it:
 
 ```
-"dependencies": { "ffrwd/wasm": "0.11.0" }
+"dependencies": { "ffrwd/wasm": "0.12.0" }
 ```
 
 ```

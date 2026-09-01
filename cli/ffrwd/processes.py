@@ -146,6 +146,7 @@ __all__ = [
     "from_commands",
     "is_live",
     "nothing_external",
+    "check_spellable",
     "partition",
 ]
 
@@ -622,11 +623,17 @@ class SidecarProcess:
     def network(self) -> bool:
         """True when this process needs the filtergraph spelling.
 
-        More than one module node, or one reading more than one stream: the
-        short ``-m <path>`` form says one module over one input and has no way
-        to spell either.
+        More than one module node, or one FRAME module reading more than one
+        stream: the short ``-m <path>`` form says one module, and its pads
+        come out of one input wired by the network string.
+
+        A packet sink is the exception, and never a network: its pads are
+        whole encoded streams rather than pads cut out of one, so the short
+        form spells them as the inputs they are, one ``-i`` apiece.
         """
         if self.graph is None:
+            return False
+        if self.packet_sink:
             return False
         return len(self.graph.nodes) > 1 or any(
             len(node.inputs) > 1 for node in self.graph.nodes.values()
@@ -1048,16 +1055,18 @@ class _Partitioner:
     ) -> _Pending | None:
         """The feeder this leg joins instead of becoming a process of its own.
 
-        Raw streams ONE ffmpeg process reads may leave one producer: that
-        consumer takes them at its own interleaving, so neither branch can
-        outrun the other and the fan is deadlock-free. The legs must read
-        exactly alike -- one consumer, one depth, the same input aliases and
-        the same refs handed over -- so joining them changes nothing about
-        what is opened or consumed, and the join adds no demand of its own.
-        A sidecar consumer never joins legs: it reads one pipe.
+        Raw streams ONE consumer reads may leave one producer: that consumer
+        takes them at its own interleaving, so neither branch can outrun the
+        other and the fan is deadlock-free. The legs must read exactly alike
+        -- one consumer, one depth, the same input aliases and the same refs
+        handed over -- so joining them changes nothing about what is opened
+        or consumed, and the join adds no demand of its own.
+
+        A SIDECAR consumer joins them like any other: a sink reads a pipe per
+        pad and takes one packet off each in turn, so the same interleaving
+        argument holds. Joining is what makes a rendition ladder one decode
+        feeding N encodes rather than N decodes of the same input.
         """
-        if not any(process.id == target for process in self.pending):
-            return None
         leg = self._feeder_reads(nodes)
         for process in self.pending:
             if self.consumer_of.get(process.id) != target or process.depth != depth:
@@ -1675,9 +1684,13 @@ class _Partitioner:
         Legal only when every input traces back to ONE point through nodes
         that emit a frame per frame; anything else hands the module streams
         whose PTS drift apart, and it has no way to say which frames pair up.
+
+        A PACKET SINK is exempt: packets are not frames, nothing pairs one
+        pad's packet with another's, and its pads are separate encodes of the
+        same source by construction.
         """
         for name in self.order:
-            if not self.external[name]:
+            if not self.external[name] or name in self.g.packet_sinks:
                 continue
             node = self.g.nodes[name]
             if len(node.inputs) < 2:
@@ -1965,11 +1978,13 @@ class _Partitioner:
                 rate=meta.sample_rate if meta else None,
                 channels=meta.channels if meta else None,
             )
-        encoder = self.g.packet_sinks.get(target) if target is not None else None
-        if encoder is not None:
+        pads = self.g.packet_sinks.get(target) if target is not None else None
+        if pads is not None:
             # The consumer is a packet sink: the edge carries the encoder's
-            # output, shaped by the COPY's own options.
-            rest = dict(encoder)
+            # output, shaped by the COPY's own options -- this PAD's, since a
+            # ladder shapes every rendition differently.
+            assert target is not None  # `pads` came from it
+            rest = dict(pads[self.g.nodes[target].inputs.index(ref)])
             codec = str(rest.pop("video_codec"))
             pix_fmt = rest.pop("pix_fmt", DEFAULT_PIX_FMT)
             return VideoFormat(
@@ -2358,6 +2373,33 @@ def _rewrite_unit(unit: SinkUnit, rewrite: Callable[[FrameRef], FrameRef]) -> Si
         metadata=unit.metadata,
         attachments=list(unit.attachments),
     )
+
+
+def check_spellable(plan: ProcessPlan) -> None:
+    """Refuse a plan whose sidecar frames have no wire to leave on.
+
+    A module process writes its own stdout and nothing else, so a region
+    whose frames leave on more than one pad is a plan nothing can spawn.
+    That happens when a query builds an INSTANCE PER ROW -- gathered into one
+    destination or fanned out to several, the instances still share the
+    process -- and when one module's frames reach two others that each leave
+    the region.
+
+    Checked on the finished plan rather than while it is being built, so
+    partitioning stays free to say what the region's shape actually is.
+    Unanchored, for the caller to re-anchor on the declaration.
+    """
+    for sidecar in plan.sidecars:
+        if len(sidecar.outputs) <= 1:
+            continue
+        raise FfrwdError(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"the module '{sidecar.module}' has {len(sidecar.outputs)} streams "
+            "leaving it, and a module process writes one",
+            hint="write one COPY per stream the module produces, each naming "
+            "its own destination; a module running once per row is one COPY "
+            "per row",
+        )
 
 
 def partition(

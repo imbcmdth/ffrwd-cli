@@ -61,6 +61,7 @@ from .processes import (
     ModelBinding,
     ModuleShape,
     ProcessPlan,
+    check_spellable,
     external_filters,
     partition,
 )
@@ -491,6 +492,7 @@ def compile_all(
                 effects=_effect_grants(stream_wasm, describes),
                 anchors=res.input_anchors,
             )
+            check_spellable(plan)
         except FfrwdError as err:
             raise _anchored(err, stream_wasm) from err
         return Compiled(graphs=ready, plan=plan, default_timeout=budget)

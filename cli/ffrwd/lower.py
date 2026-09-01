@@ -317,6 +317,7 @@ from ffrwd.parser import (
     MAP_COLUMNS,
     ROW_PREDICATE,
     ROW_STREAM,
+    SINK_STREAMS,
     RawInputOption,
     RawRowJoin,
     RawSink,
@@ -398,6 +399,7 @@ from ffrwd.types import (
     TIME_COLUMN,
     Field,
     RowColumnType,
+    is_array,
 )
 from ffrwd.vars import unset_error
 from ffrwd.warnings import FfrwdWarning, OnWarning, WarningCode
@@ -535,6 +537,12 @@ _CTE_ROW_FILE_HINT = (
     "gather the rows into that one file with array_agg(...), or give each row a "
     "file of its own with a TO expression over a value the CTE body selected, "
     "e.g. SELECT ..., i.i AS n in the body and TO ('clip' || x.n::text || '.mp4')"
+)
+_PER_TRACK_OPTION_HINT = (
+    "a per-row option binds one TRACK per row: gather the rows into this "
+    "destination with array_agg(...) so it has a track for each; or give each "
+    "row a file of its own with a TO expression, e.g. TO (:'names'[i.i] || "
+    "'.mp4')"
 )
 _ONE_FILE_PER_GROUP_HINT = (
     "one group is one file, so the destination has to name the group, e.g. "
@@ -1376,6 +1384,39 @@ def _sink_describe(node: exp.Expr) -> str:
     if isinstance(node, exp.Identifier):
         return f'the identifier "{node.name}"'
     return _describe(node)
+
+
+def _each(value: object) -> list[object]:
+    """One option's values: every element of a per-pad list, or the one value.
+
+    Empty for an option that is not written at all, so a caller loops over
+    nothing rather than checking first.
+    """
+    if value is None:
+        return []
+    return list(value) if isinstance(value, list) else [value]
+
+
+def _sink_stream_count(node: exp.Expr, arguments: int) -> int:
+    """How many of a sink call's leading arguments came out of the SELECT list.
+
+    Recorded by the rewrite that made the call, which is the only place the
+    split is known: a sink reading an ARRAY of streams has no fixed argument
+    count to work it out from.
+    """
+    written = node.meta.get(SINK_STREAMS)
+    return written if isinstance(written, int) else arguments
+
+
+def _validated_option(name: str, written: object, *, line: int, col: int) -> object:
+    """One option value through the option table -- element by element when it
+    is a per-TRACK list, so a bad element is refused where a bad scalar is."""
+    if isinstance(written, list):
+        return [
+            validate_sink_option(name, element, line=line, col=col)
+            for element in written
+        ]
+    return validate_sink_option(name, written, line=line, col=col)
 
 
 def _sink_value(node: exp.Expr) -> object:
@@ -2684,6 +2725,11 @@ class _Lowerer:
         self.fanout_seen = False
         self.fanout_row: _RowTuple = {}
         self.fanout_env: _Env | None = None
+        # The branch relation a WITH option read once per row runs over, and
+        # the env it is evaluated against. Both are the LAST branch lowered,
+        # which is the one this COPY's options belong to.
+        self.sink_rows: list[_RowTuple] = []
+        self.sink_env: _Env | None = None
         self.fanout_count: int | None = None
         # True when the pin partitioned by a GROUP BY key rather than by row,
         # so a collision message names groups.
@@ -2893,7 +2939,7 @@ class _Lowerer:
             if written is None:
                 continue  # a NULL element, absence like any other NULL
             line, col = _pos(option.name_node, option.value, raw.path_node)
-            options[option.name] = validate_sink_option(
+            options[option.name] = _validated_option(
                 option.name, written, line=line, col=col
             )
             option_nodes[option.name] = option.value
@@ -2911,6 +2957,7 @@ class _Lowerer:
                 "input, or select * to take whatever it holds",
             )
         _check_two_pass_outputs(options, outputs, raw.path_node)
+        self._check_per_track_options(options, option_nodes, outputs, raw)
         path = raw.path
         if raw.path_expr is not None:
             self._check_fanout_options(options, raw)
@@ -2983,11 +3030,40 @@ class _Lowerer:
         self._check_packet_sink_feed(declared, raw, sink_nodes)
         options = self._packet_sink_options(declared, raw)
         for node in sink_nodes:
-            self.graph.packet_sinks[node] = dict(options)
+            self.graph.packet_sinks[node] = self._packet_sink_pads(node, options, raw)
             if described.rows_schema is not None:
                 # The rows are the sink's product, and no path names a home
                 # for them: they ride the hosting process's own stdout.
                 self.graph.rows_sinks[node] = RowsSink(container=_ROWS_CONTAINER)
+
+    def _packet_sink_pads(
+        self, node: str, options: dict[str, object], raw: RawSink
+    ) -> list[dict[str, object]]:
+        """The sink's encoder options resolved PAD BY PAD.
+
+        A value read once per row is a list, one element per rendition in the
+        order the rows were gathered; every other value shapes every pad the
+        same way. The counts have to line up, for the same reason a file's do:
+        the rows and the pads are two accounts of one ladder.
+        """
+        pads = len(self.graph.nodes[node].inputs)
+        for name, value in options.items():
+            if isinstance(value, list) and len(value) != pads:
+                raise _error(
+                    ErrorCode.ROW_COUNT_MISMATCH,
+                    f"sink option {name!r} is read once per row over "
+                    f"{len(value)} rows, and this sink reads "
+                    f"{_stream_count(pads)}",
+                    raw.path_node,
+                    hint=_PER_TRACK_OPTION_HINT,
+                )
+        return [
+            {
+                name: value[pad] if isinstance(value, list) else value
+                for name, value in options.items()
+            }
+            for pad in range(pads)
+        ]
 
     def _check_packet_sink_feed(
         self, declared: WasmFunction, raw: RawSink, sink_nodes: list[str]
@@ -3035,8 +3111,8 @@ class _Lowerer:
             if isinstance(_unwrap(option.value), exp.Null):
                 continue  # absence: the encoder's own default applies
             line, col = _pos(option.name_node, option.value, raw.path_node)
-            value = validate_sink_option(
-                option.name, _sink_value(option.value), line=line, col=col
+            value = _validated_option(
+                option.name, self._sink_option_value(option, raw), line=line, col=col
             )
             if SINK_OPTIONS[option.name].scope != "video":
                 raise FfrwdError(
@@ -3052,8 +3128,7 @@ class _Lowerer:
             option_nodes[option.name] = option.value
         _check_sink_option_conflicts(options, option_nodes, raw.path_node)
         accepted = described.codecs or ()
-        written = options.get("video_codec")
-        if written is not None:
+        for written in _each(options.get("video_codec")):
             assert isinstance(written, str)  # validated as a str above
             codec = encoder_codec(written)
             line, col = _pos(option_nodes["video_codec"], raw.path_node)
@@ -3078,7 +3153,7 @@ class _Lowerer:
                     hint=f"name an encoder for {_join_codecs(accepted)}, or "
                     "drop video_codec to take the module's preference",
                 )
-        else:
+        if "video_codec" not in options:
             codec = next(
                 (c for c in accepted if c in WIRE_VIDEO_CODECS),
                 WIRE_VIDEO_CODECS[0] if not accepted else None,
@@ -3135,12 +3210,17 @@ class _Lowerer:
         return windows.pop()
 
     def _sink_option_value(self, option: RawSinkOption, raw: RawSink) -> object:
-        """One ``WITH (name value)`` value as a python scalar.
+        """One ``WITH (name value)`` value as a python scalar, or a LIST of them.
 
         ``ARRAY[<literals>][<subscript>]`` -- what a subscripted list variable
         substitutes to -- is read here, so each file a fan-out COPY writes
         carries its own element of the list. A subscript that reads a track
         row picks off the pinned row, exactly as the ``TO`` expression does.
+
+        With no fan-out the rows are gathered into one destination, one track
+        apiece, and the option is read once per row: the value is then a LIST,
+        one element per track of the option's own scope, in row order.
+        ffmpeg spells that ``-b:v:0``, ``-b:v:1``, and so on.
 
         An option is settled before ffmpeg runs, so those two shapes and the
         constants :func:`_sink_value` reads are all that may stand here; a
@@ -3162,19 +3242,59 @@ class _Lowerer:
                 "out, or pass a list on the command line and subscript it, "
                 "e.g. video_bitrate :'rates'[i.i]",
             )
-        if references_row_alias(node, set(self.res.row_aliases)) and self.fanout_expr is None:
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL,
-                f"sink option '{option.name}' reads a track row, and this COPY "
-                "writes one file",
-                node,
-                fallback=raw.path_node,
-                hint="a per-row option value needs a TO expression naming one "
-                "file per row, e.g. TO (:'names'[i.i] || '.mp4')",
-            )
-        env = self.fanout_env if self.fanout_env is not None else _Env()
         anchor = raw.branches[0] if raw.branches else exp.Select()
+        if references_row_alias(node, set(self.res.row_aliases)) and self.fanout_expr is None:
+            # A gathered destination holds one track per row, so the option
+            # binds per TRACK, in the order the rows were gathered.
+            if not self.sink_rows:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"sink option '{option.name}' reads a track row, and this "
+                    "COPY has no rows to read",
+                    node,
+                    fallback=raw.path_node,
+                    hint=_PER_TRACK_OPTION_HINT,
+                )
+            env = self.sink_env if self.sink_env is not None else _Env()
+            return [
+                self._eval_list_element(node, env, row, anchor)
+                for row in self.sink_rows
+            ]
+        env = self.fanout_env if self.fanout_env is not None else _Env()
         return self._eval_list_element(node, env, self.fanout_row, anchor)
+
+    def _check_per_track_options(
+        self,
+        options: dict[str, object],
+        option_nodes: dict[str, exp.Expr],
+        outputs: list[Output],
+        raw: RawSink,
+    ) -> None:
+        """A per-row option against the tracks it binds to, one apiece.
+
+        The rows were gathered into this destination, so it holds one track
+        per row of the option's own scope -- and a count that does not line up
+        is a query saying two different things about how many renditions it
+        writes.
+        """
+        for name, value in options.items():
+            if not isinstance(value, list):
+                continue
+            scope = SINK_OPTIONS[name].scope
+            tracks = sum(1 for output in outputs if output.type == scope)
+            if tracks == len(value):
+                continue
+            anchor = option_nodes.get(name)
+            line, col = _pos(anchor, raw.path_node) if anchor else _pos(raw.path_node)
+            raise FfrwdError(
+                ErrorCode.ROW_COUNT_MISMATCH,
+                f"sink option {name!r} is read once per row over "
+                f"{len(value)} rows, and this destination has "
+                f"{tracks} {scope} track{'' if tracks == 1 else 's'}",
+                line=line,
+                col=col,
+                hint=_PER_TRACK_OPTION_HINT,
+            )
 
     def _check_fanout_options(self, options: dict[str, object], raw: RawSink) -> None:
         """The sink options a fan-out COPY does not take, v1.
@@ -3813,6 +3933,10 @@ class _Lowerer:
         self._order_rows(select, env)
         self._limit_rows(select, env)
         self._pin_fanout_row(env, select)
+        # What a WITH option read once per row runs over. The pin has already
+        # cut a fan-out to its one row, so this is the gathered case alone.
+        self.sink_env = env
+        self.sink_rows = list(env.relation.tuples) if env.relation is not None else []
         if fanout or per_row:
             self._collect_trims(select, env, time_conjuncts)
 
@@ -8339,16 +8463,77 @@ class _Lowerer:
                 hint=f"declare '{declared.name}' as RETURNS sink and write it "
                 "as a COPY destination",
             )
-        if declared.stream_kind != "video":
+        # The sidecar's stream edge carries encoded VIDEO and nothing else, so
+        # an audio pad has no wire to arrive on however the module and the
+        # declaration are shaped.
+        if "audio" in declared.stream_kinds:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
-                f"function '{declared.name}' takes an audio stream, and the "
-                f"module '{declared.module}' consumes encoded video packets",
+                f"function '{declared.name}' reads an audio stream, and the "
+                f"stream edge into a packet sink carries "
+                f"{_join_codecs(WIRE_VIDEO_CODECS)}",
                 node,
                 fallback=select,
-                hint="declare its stream parameter as video_stream, and feed "
-                "it a video column",
+                hint="declare its stream parameters as video_stream (or "
+                "video_stream[]), and feed it video columns",
             )
+        self._check_sink_shape(declared, described, node, select)
+
+    def _check_sink_shape(
+        self,
+        declared: WasmFunction,
+        described: Described,
+        node: exp.Expr,
+        select: exp.Select,
+    ) -> None:
+        """What the signature says it reads against what the module declares.
+
+        Per kind, since a sink reads each independently. A declaration naming
+        one stream of a kind always hands over one, so a module reading one or
+        many accepts it; anything that can hand over SEVERAL -- an array, or
+        several parameters of one kind -- needs a module that reads many. The
+        refusal lands here, at the call, where the run-time one it forestalls
+        can be said before anything runs.
+        """
+        for kind in WASM_STREAM_NAMES:
+            params = [
+                param
+                for param, declared_kind in zip(
+                    declared.stream_params, declared.stream_kinds, strict=True
+                )
+                if declared_kind == kind
+            ]
+            reads = described.sink_streams(kind)
+            if not params:
+                if reads != "none":
+                    raise _error(
+                        ErrorCode.UNSUPPORTED_SQL,
+                        f"the module '{declared.module}' reads {reads} "
+                        f"{kind} stream(s), and '{declared.name}' declares no "
+                        f"{WASM_STREAM_NAMES[kind]} parameter",
+                        node,
+                        fallback=select,
+                        hint=f"declare a {WASM_STREAM_NAMES[kind]} parameter "
+                        f"before the module's value parameters",
+                    )
+                continue
+            several = len(params) > 1 or any(is_array(p.type) for p in params)
+            if reads == "none" or (several and reads != "many"):
+                written = ", ".join(f"{p.name} {p.type}" for p in params)
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"function '{declared.name}' declares ({written}), and the "
+                    f"module '{declared.module}' reads {reads} {kind} stream"
+                    f"{'' if reads == 'one' else 's'}",
+                    node,
+                    fallback=select,
+                    hint="declare what the module reads: "
+                    + (
+                        f"no {WASM_STREAM_NAMES[kind]} parameter"
+                        if reads == "none"
+                        else f"one {WASM_STREAM_NAMES[kind]} parameter"
+                    ),
+                )
 
     def _check_stream_arity(
         self,
@@ -8903,6 +9088,8 @@ class _Lowerer:
                 hint=f"a wasm function's parameters are positional: "
                 f"{declared.signature}",
             )
+        if declared.is_sink:
+            return self._lower_sink_call(node, declared, described, call, env, select)
         kind = declared.stream_kind
         arity = declared.stream_arity
         expected: list[StreamType] = [kind] * arity
@@ -8921,6 +9108,10 @@ class _Lowerer:
             for position in positions
         }
         tuples = env.relation.tuples if env.relation is not None else []
+        first = arity + (1 if wired is not None else 0)
+        # A module parameter read off a row is one instance per row, the way a
+        # filter option read off one is one node per row.
+        per_row = any(_reads_row_column(arg, env) for arg in call.args[first:])
 
         def build(values: list[object], element: int) -> FrameRef:
             row = tuples[element] if element < len(tuples) else {}
@@ -8932,7 +9123,7 @@ class _Lowerer:
                 select,
                 env,
                 row,
-                first=arity + (1 if wired is not None else 0),
+                first=first,
             )
             ref = self.ctx.node(
                 declared.module,
@@ -8941,10 +9132,6 @@ class _Lowerer:
                 [kind],
                 reads_annotations=declared.reads is not None,
             )
-            if declared.is_sink:
-                # The module is the destination: its pad reaches no file and
-                # no other node, and the record here is what says so.
-                self.graph.module_sinks.append(ref)
             return ref
 
         lowered = self._expand_call(
@@ -8958,12 +9145,119 @@ class _Lowerer:
             positions=positions,
             returns=kind,
             build=build,
+            rows=self._row_elements(per_row, env),
         )
-        if declared.is_sink:
-            # Nothing downstream reads a sink: the value carries no streams,
-            # the way a rows projection's does not.
-            return _Value(type=kind, streams=(), is_array=False)
         return lowered
+
+    def _lower_sink_call(
+        self,
+        node: exp.Expr,
+        declared: WasmFunction,
+        described: Described,
+        call: _Call,
+        env: _Env,
+        select: exp.Select,
+    ) -> _Value:
+        """A ``RETURNS sink`` call: every stream the SELECT list carries, into
+        ONE instance.
+
+        A sink is a filter with no output pads and reads streams the way one
+        does -- except that how MANY is the query's to say, not the
+        declaration's. The COPY's SELECT list is rewritten into the leading
+        arguments of this call (:meth:`_rewrite_sink_copy`), each of which may
+        itself carry a whole array of streams, so the pads are the FLATTENED
+        run of them in SELECT order, bound to the declared parameters by KIND.
+
+        One node, always: N calls would be N instances with nothing shared
+        between them, which for a sink over a rendition ladder is the whole
+        difference.
+        """
+        at = _sink_stream_count(node, len(call.args))
+        gathered: list[tuple[_Stream, exp.Expr]] = []
+        for argument in call.args[:at]:
+            value = self._lower_expr(argument, env, select)
+            gathered += [(stream, argument) for stream in value.streams]
+        pads = self._bind_sink_streams(declared, gathered, node, select)
+        # One instance, so its parameters are read once. A row-varying value
+        # argument has no one row to read here; the FIRST is what a call over
+        # a gathered relation means everywhere else.
+        tuples = env.relation.tuples if env.relation is not None else []
+        params = self._wasm_params(
+            declared,
+            described,
+            call,
+            node,
+            select,
+            env,
+            tuples[0] if tuples else {},
+            first=at,
+        )
+        ref = self.ctx.node(
+            declared.module,
+            params,
+            [stream.ref for stream in pads],
+            [pads[0].type],
+        )
+        # The module is the destination: its pad reaches no file and no other
+        # node, and the record here is what says so.
+        self.graph.module_sinks.append(ref)
+        # Nothing downstream reads a sink: the value carries no streams, the
+        # way a rows projection's does not.
+        return _Value(type=pads[0].type, streams=(), is_array=False)
+
+    def _bind_sink_streams(
+        self,
+        declared: WasmFunction,
+        gathered: list[tuple[_Stream, exp.Expr]],
+        node: exp.Expr,
+        select: exp.Select,
+    ) -> list[_Stream]:
+        """The SELECT's streams against the sink's parameters, matched by kind.
+
+        Each parameter takes streams of its own kind in SELECT order: a bare
+        one exactly one, an ARRAY one every remaining stream of that kind. The
+        pads come back in DECLARATION order, which is the order `init` names
+        them, so a module reading video and audio knows which is which without
+        being told.
+        """
+        remaining: dict[StreamType, list[tuple[_Stream, exp.Expr]]] = {}
+        for entry in gathered:
+            remaining.setdefault(entry[0].type, []).append(entry)
+        pads: list[_Stream] = []
+        for param, kind in zip(
+            declared.stream_params, declared.stream_kinds, strict=True
+        ):
+            waiting = remaining.get(kind, [])
+            wanted = len(waiting) if is_array(param.type) else 1
+            if len(waiting) < max(wanted, 1):
+                raise _error(
+                    ErrorCode.UDF_ARG_TYPE,
+                    f"{declared.name}() takes '{param.name}' as {param.type}, "
+                    f"and this query's SELECT list carries "
+                    f"{_stream_count(len(waiting))} of that kind",
+                    node,
+                    fallback=select,
+                    hint=f"a sink reads the streams its SELECT list names: "
+                    f"COPY (SELECT <{kind} stream>, ...) TO {declared.called}"
+                    f"(<values>)",
+                )
+            pads += [stream for stream, _ in waiting[:wanted]]
+            remaining[kind] = waiting[wanted:]
+        left = [entry for entries in remaining.values() for entry in entries]
+        if left:
+            stream, anchor = left[0]
+            raise _error(
+                ErrorCode.UDF_ARG_TYPE,
+                f"{declared.name}() reads {_stream_count(len(pads))}, and this "
+                f"query's SELECT list carries "
+                f"{_stream_count(len(pads) + len(left))}",
+                anchor,
+                fallback=node,
+                hint=f"declare the parameter as {WASM_STREAM_NAMES[stream.type]}[] "
+                "to read every stream of its kind the SELECT carries, or drop "
+                "the extra columns",
+            )
+        return pads
 
     def _lower_variadic_call(
         self, node: exp.Expr, name: str, call: _Call, env: _Env, select: exp.Select
@@ -9238,7 +9532,7 @@ class _Lowerer:
         kinds = self._stream_kinds(call, env, select, len(expected))
         if kinds != expected:
             raise self._bad_streams(call, node, select, expected, kinds)
-        args_at = self._option_binder(
+        args_at, per_row = self._option_binder(
             name,
             call,
             node,
@@ -9270,7 +9564,19 @@ class _Lowerer:
             positions=list(range(len(expected))),
             returns=output,
             build=build,
+            rows=self._row_elements(per_row, env),
         )
+
+    def _row_elements(self, per_row: bool, env: _Env) -> int | None:
+        """How many rows a per-row call runs over, or None when it reads none.
+
+        The relation as this branch left it: a grouped branch has already been
+        cut to the group being gathered, and a fan-out to the one row this
+        command writes -- so both keep making the one node they always made.
+        """
+        if not per_row or env.relation is None:
+            return None
+        return len(env.relation.tuples)
 
     # -- N-input filters ----------------------------
 
@@ -9857,8 +10163,9 @@ class _Lowerer:
         options: dict[str, FilterOption],
         extras: list[exp.Expr],
         timeline: bool,
-    ) -> Callable[[int], dict[str, object]]:
-        """This call's option dict, as a function of the broadcast element.
+    ) -> tuple[Callable[[int], dict[str, object]], bool]:
+        """This call's option dict as a function of the element, and whether
+        that function actually reads the row.
 
         An option written as a compile-time expression
         (``scale(t, t.width / 2, -2)``) is evaluated against the row that
@@ -9901,7 +10208,15 @@ class _Lowerer:
                 filter_name, call, node, select, env,
                 options=options, extras=extras, timeline=timeline,
             )
-            return lambda _element: args
+            return (lambda _element: args), False
+        per_row = any(
+            _reads_row_column(arg, env)
+            for arg, countable_here in [
+                *zip(extras, extras_countable, strict=True),
+                *[(a.value, c) for a, c in zip(call.named, named_countable, strict=True)],
+            ]
+            if countable_here
+        )
         tuples = env.relation.tuples if env.relation is not None else []
         cache: dict[int, dict[str, object]] = {}
 
@@ -9932,7 +10247,7 @@ class _Lowerer:
                 )
             return cache[element]
 
-        return bound
+        return bound, per_row
 
     def _computed_arg(
         self,
@@ -10031,6 +10346,7 @@ class _Lowerer:
         positions: list[int],
         returns: StreamType,
         build: Callable[[list[object], int], FrameRef],
+        rows: int | None = None,
     ) -> _Value:
         """Broadcast `build` over the array arguments, if there are any.
 
@@ -10040,8 +10356,12 @@ class _Lowerer:
         element's argument values into a subgraph. `build` also gets the
         ELEMENT INDEX, which is what lets a filter option computed per row
         pick out the row that element came from.
+
+        `rows` broadcasts over the RELATION rather than over an array: a call
+        whose options are read per row is one node per row, even where every
+        stream argument it takes is a single stream.
         """
-        length = self._zip_length(name, node, arg_nodes, streams, select)
+        length = self._zip_length(name, node, arg_nodes, streams, select, rows)
         expanded: list[_Stream] = []
         for element in range(1 if length is None else length):
             values: list[object] = [
@@ -10326,11 +10646,18 @@ class _Lowerer:
         arg_nodes: list[exp.Expr],
         streams: dict[int, _Value],
         select: exp.Select,
+        rows: int | None = None,
     ) -> int | None:
-        """The element count this call expands to, or None if nothing is an array.
+        """The element count this call expands to, or None if it expands to one.
 
         Arrays zip (no cross products): they must all have the same length, and
         scalar arguments repeat into every element.
+
+        `rows` is how many rows an argument that READS one runs over -- a
+        filter option computed per row makes one node per row, the way an
+        array argument makes one per element. An array and a per-row option in
+        the same call zip too: both count the same relation, so a disagreement
+        is the same mismatch a pair of arrays of different lengths is.
         """
         first: tuple[int, int] | None = None  # (argument position, length)
         for position, value in sorted(streams.items()):
@@ -10351,7 +10678,20 @@ class _Lowerer:
                 fallback=select,
                 hint=_ZIP_HINT,
             )
-        return None if first is None else first[1]
+        if first is None:
+            return rows
+        if rows is not None and rows != first[1]:
+            raise _error(
+                ErrorCode.BROADCAST_MISMATCH,
+                f"{name}() cannot broadcast over arrays of different lengths: "
+                f"{_sql_text(arg_nodes[first[0]])} has "
+                f"{_stream_count(first[1])}, and its options are read once per "
+                f"row over {rows} rows",
+                node,
+                fallback=select,
+                hint=_ZIP_HINT,
+            )
+        return first[1]
 
     def _classify(self, node: exp.Expr, env: _Env, select: exp.Select) -> str:
         """Kind label for one call argument: a stream type, ``num``/``str``, or
@@ -11135,6 +11475,19 @@ def _row_metadata_column(node: exp.Expr, env: _Env) -> str | None:
         return None
     name = _fold(node.this)
     return None if name == ROW_STREAM else name
+
+
+def _reads_row_column(node: exp.Expr, env: _Env) -> bool:
+    """True when `node` reads a metadata column off a row alias.
+
+    What makes an option's value differ from row to row: ``t.width``,
+    ``:'widths'[i.i]``, anything arithmetic over one. An input alias's probed
+    column (``f.duration``) is the same for every row and is not one.
+    """
+    for sub in _unwrap(node).walk():
+        if isinstance(sub, exp.Expr) and _row_metadata_column(sub, env) is not None:
+            return True
+    return False
 
 
 def _is_row_scalar(node: exp.Expr, env: _Env) -> bool:
