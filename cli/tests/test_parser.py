@@ -1998,7 +1998,7 @@ def test_join_is_still_rejected_between_stream_level_sources() -> None:
         "SELECT f.video[1] FROM input('a.mkv') f JOIN input('b.mkv') g ON f.t = g.t"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "between unnest(...) track-row tables only" in err.message
+    assert "between row tables only" in err.message
 
 
 def test_join_is_rejected_when_its_left_side_is_not_a_row_table() -> None:
@@ -2007,7 +2007,7 @@ def test_join_is_rejected_when_its_left_side_is_not_a_row_table() -> None:
         "JOIN unnest(g.audio) a ON a.tags.language = 'eng'"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "between unnest(...) track-row tables only" in err.message
+    assert "between row tables only" in err.message
 
 
 # -- row columns ------------------------------------------------------------
@@ -2828,13 +2828,12 @@ def test_struct_row_table_requires_an_alias() -> None:
     assert "requires an alias" in err.message
 
 
-def test_struct_row_table_is_not_joinable_with_explicit_join() -> None:
-    err = _reject(
-        "SELECT 1 FROM input('f.mkv') f, unnest(f.audio) t "
+def test_struct_row_table_joins_like_any_other_row_table() -> None:
+    resolved = _resolve(
+        "SELECT t FROM input('f.mkv') f, unnest(f.audio) t "
         "JOIN unnest(ARRAY[STRUCT(1 AS w)]) r ON t.index = r.w"
     )
-    assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "track-row tables only" in err.message
+    assert "r" in resolved.struct_rows
 
 
 # ---------------------------------------------------------------------------

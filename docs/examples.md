@@ -2725,3 +2725,50 @@ off the media itself is a rejection naming the option. A subscript past
 the end of the list is the same rejection it is anywhere else, naming
 the list's length - so a `rates` list shorter than the series says so
 rather than writing a file at the wrong bitrate.
+
+## 104. Publish the ladder as HLS
+
+The same rows, one written name: `format 'hls'` makes the destination a
+manifest, so the multi-row relation is accepted - each row is one entry
+of the variant map. A video row is a rung, an audio row a rendition,
+and a row carrying both is a muxed variant; a `FULL JOIN` with disjoint
+keys is how the demuxed shape spells its rows. The compiler derives the
+keyframe discipline from `hls_time` and the frame rate, lays variant
+playlists and segments out beside the master, and writes
+`var_stream_map` by transcribing the rows - a hand-written one is
+refused, naming what the compiler would write:
+
+```pgsql
+COPY (
+  WITH vid AS (
+    SELECT scale(fps(f.video[1], 15), ARRAY[320, 160][i.i], -2) AS v, i.i AS rung
+    FROM input('tests/fixtures/av.mp4') f, generate_series(1, 2) i
+  ),
+  aud AS (
+    SELECT a AS t, 2 + a.index AS rung
+    FROM input('tests/fixtures/av.mp4') g, unnest(g.audio) a
+  )
+  SELECT vid.v, aud.t
+  FROM vid FULL JOIN aud ON vid.rung = aud.rung
+) TO 'out/master.m3u8'
+  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod',
+        video_codec 'libx264', video_bitrate ARRAY['800k', '300k'][vid.rung],
+        audio_codec 'aac')
+```
+
+```
+$ ffrwd compile -f query.sql
+ffmpeg -i tests/fixtures/av.mp4 -filter_complex \
+  '[0:v:0]fps=fps=15,split=2[n1_split0][n1_split1];'\
+'[n1_split0]scale=width=320:height=-2[out0];[n1_split1]scale=width=160:height=-2[out1]' \
+  -map '[out0]' -map '[out1]' -map 0:a:0 -f hls -hls_time 2 -hls_playlist_type vod -c:0 \
+  libx264 -c:1 libx264 -b:0 800k -b:1 300k -c:2 aac -g:0 30 -g:1 30 -keyint_min:0 30 \
+  -keyint_min:1 30 -sc_threshold:0 0 -sc_threshold:1 0 -var_stream_map \
+  'v:0,agroup:aud,name:240p v:1,agroup:aud,name:120p a:0,agroup:aud,name:a0,default:yes' \
+  -master_pl_name master.m3u8 -hls_segment_filename out/v%v/segment_%d.ts \
+  out/v%v/index.m3u8
+```
+
+`format 'dash'` is the same plan wearing different words: `seg_duration`
+for `hls_time`, adaptation sets for the variant map, and the `.mpd` as
+the written name.

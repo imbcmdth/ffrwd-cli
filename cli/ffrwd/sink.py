@@ -35,6 +35,9 @@ class SinkOptionSpec:
     # only when the value is True, omitted entirely when False. Mutually
     # exclusive with per_stream (no bare option in the table is per-stream).
     bare: bool = False
+    # What a False bool renders as ("0" for -use_template 0). "" keeps the
+    # default: a False bool is omitted and the muxer's own default applies.
+    false_template: str = ""
 
 
 # `codec_params`'s flag is the one derived-at-render-time exception to "flag
@@ -264,7 +267,155 @@ SINK_OPTIONS: dict[str, SinkOptionSpec] = {
         flag="-movflags",
         per_stream=False,
     ),
+    "hls_time": SinkOptionSpec(
+        name="hls_time",
+        scope="container",
+        type="num",
+        doc="HLS segment length in seconds (format 'hls' only; default 2).",
+        flag="-hls_time",
+        per_stream=False,
+    ),
+    "hls_playlist_type": SinkOptionSpec(
+        name="hls_playlist_type",
+        scope="container",
+        type="str",
+        doc="HLS playlist type: 'vod' or 'event' (format 'hls' only).",
+        flag="-hls_playlist_type",
+        per_stream=False,
+    ),
+    "hls_flags": SinkOptionSpec(
+        name="hls_flags",
+        scope="container",
+        type="str",
+        doc="Raw -hls_flags value, e.g. 'independent_segments' (format 'hls' only).",
+        flag="-hls_flags",
+        per_stream=False,
+    ),
+    "hls_segment_type": SinkOptionSpec(
+        name="hls_segment_type",
+        scope="container",
+        type="str",
+        doc="HLS segment container: 'mpegts' or 'fmp4' (format 'hls' only).",
+        flag="-hls_segment_type",
+        per_stream=False,
+    ),
+    "hls_segment_filename": SinkOptionSpec(
+        name="hls_segment_filename",
+        scope="container",
+        type="str",
+        doc="HLS segment path pattern; derived from the destination when unset "
+        "(format 'hls' only).",
+        flag="-hls_segment_filename",
+        per_stream=False,
+    ),
+    "hls_fmp4_init_filename": SinkOptionSpec(
+        name="hls_fmp4_init_filename",
+        scope="container",
+        type="str",
+        doc="HLS fmp4 init segment name; derived when unset (format 'hls' only).",
+        flag="-hls_fmp4_init_filename",
+        per_stream=False,
+    ),
+    "master_pl_name": SinkOptionSpec(
+        name="master_pl_name",
+        scope="container",
+        type="str",
+        doc="HLS master playlist name; derived from the destination when unset "
+        "(format 'hls' only).",
+        flag="-master_pl_name",
+        per_stream=False,
+    ),
+    "seg_duration": SinkOptionSpec(
+        name="seg_duration",
+        scope="container",
+        type="num",
+        doc="DASH segment length in seconds (format 'dash' only; default 5).",
+        flag="-seg_duration",
+        per_stream=False,
+    ),
+    "use_template": SinkOptionSpec(
+        name="use_template",
+        scope="container",
+        type="bool",
+        doc="DASH SegmentTemplate instead of a per-segment list (format 'dash' only).",
+        flag="-use_template",
+        per_stream=False,
+        value_template="1",
+        false_template="0",
+    ),
+    "use_timeline": SinkOptionSpec(
+        name="use_timeline",
+        scope="container",
+        type="bool",
+        doc="DASH SegmentTimeline inside the template (format 'dash' only).",
+        flag="-use_timeline",
+        per_stream=False,
+        value_template="1",
+        false_template="0",
+    ),
+    "init_seg_name": SinkOptionSpec(
+        name="init_seg_name",
+        scope="container",
+        type="str",
+        doc="DASH init segment name pattern (format 'dash' only).",
+        flag="-init_seg_name",
+        per_stream=False,
+    ),
+    "media_seg_name": SinkOptionSpec(
+        name="media_seg_name",
+        scope="container",
+        type="str",
+        doc="DASH media segment name pattern (format 'dash' only).",
+        flag="-media_seg_name",
+        per_stream=False,
+    ),
+    "single_file": SinkOptionSpec(
+        name="single_file",
+        scope="container",
+        type="bool",
+        doc="DASH single file per representation instead of one per segment "
+        "(format 'dash' only).",
+        flag="-single_file",
+        per_stream=False,
+        value_template="1",
+        false_template="0",
+    ),
 }
+
+# The two formats whose destination is a MANIFEST: the one written path binds
+# many outputs (variant playlists, segments), so a multi-row relation is
+# accepted there, one variant map entry per row.
+MANIFEST_FORMATS: frozenset[str] = frozenset({"hls", "dash"})
+
+# Which manifest format each format-specific option belongs to. Any of these
+# set under the other format -- or under no manifest format at all -- is
+# refused by lowering.
+MANIFEST_OPTION_FORMATS: dict[str, str] = {
+    "hls_time": "hls",
+    "hls_playlist_type": "hls",
+    "hls_flags": "hls",
+    "hls_segment_type": "hls",
+    "hls_segment_filename": "hls",
+    "hls_fmp4_init_filename": "hls",
+    "master_pl_name": "hls",
+    "seg_duration": "dash",
+    "use_template": "dash",
+    "use_timeline": "dash",
+    "init_seg_name": "dash",
+    "media_seg_name": "dash",
+    "single_file": "dash",
+}
+
+# The muxer's own default segment length, per manifest format: what the
+# keyframe-alignment derivation reads when the query leaves the length unset.
+MANIFEST_DEFAULT_SEGMENT: dict[str, float] = {"hls": 2.0, "dash": 5.0}
+
+# The segment-length option each manifest format takes.
+MANIFEST_SEGMENT_OPTION: dict[str, str] = {"hls": "hls_time", "dash": "seg_duration"}
+
+# The variant-map option each manifest format takes: a TRANSCRIPTION of the
+# COPY's rows, written by the compiler and refused when hand-written.
+MANIFEST_MAP_OPTION: dict[str, str] = {"hls": "var_stream_map", "dash": "adaptation_sets"}
 
 # Options that were sink options and are SELECT columns now, with the spelling
 # that replaced each. Named separately so the rejection can say where to go.
@@ -321,6 +472,42 @@ _INTERNAL_SINK_OPTIONS: dict[str, SinkOptionSpec] = {
         doc="Packets the fifo muxer queues before the writer waits.",
         flag="-queue_size",
         per_stream=False,
+    ),
+    # The manifest destination's derived surface: the variant map is a
+    # transcription of the COPY's rows, and the keyframe discipline is
+    # computed from the segment length and the frame rate. None is writable
+    # by user SQL -- a hand-written map is refused by name.
+    "var_stream_map": SinkOptionSpec(
+        name="var_stream_map",
+        scope="container",
+        type="str",
+        doc="The HLS variant map, transcribed from the COPY's rows.",
+        flag="-var_stream_map",
+        per_stream=False,
+    ),
+    "adaptation_sets": SinkOptionSpec(
+        name="adaptation_sets",
+        scope="container",
+        type="str",
+        doc="The DASH adaptation sets, transcribed from the COPY's rows.",
+        flag="-adaptation_sets",
+        per_stream=False,
+    ),
+    "keyint_min": SinkOptionSpec(
+        name="keyint_min",
+        scope="video",
+        type="int",
+        doc="Minimum keyframe distance, pinned to the derived gop.",
+        flag="-keyint_min",
+        per_stream=True,
+    ),
+    "sc_threshold": SinkOptionSpec(
+        name="sc_threshold",
+        scope="video",
+        type="int",
+        doc="libx264's scene-cut threshold; 0 disables scene cuts.",
+        flag="-sc_threshold",
+        per_stream=True,
     ),
 }
 

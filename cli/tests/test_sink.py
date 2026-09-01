@@ -46,11 +46,24 @@ _EXPECTED: dict[str, tuple[str, str]] = {
     "codec_params": ("video", "str"),
     "two_pass": ("container", "bool"),
     "movflags": ("container", "str"),
+    "hls_time": ("container", "num"),
+    "hls_playlist_type": ("container", "str"),
+    "hls_flags": ("container", "str"),
+    "hls_segment_type": ("container", "str"),
+    "hls_segment_filename": ("container", "str"),
+    "hls_fmp4_init_filename": ("container", "str"),
+    "master_pl_name": ("container", "str"),
+    "seg_duration": ("container", "num"),
+    "use_template": ("container", "bool"),
+    "use_timeline": ("container", "bool"),
+    "init_seg_name": ("container", "str"),
+    "media_seg_name": ("container", "str"),
+    "single_file": ("container", "bool"),
 }
 
 
 def test_the_table_is_the_documented_options_with_their_scope_and_type() -> None:
-    assert len(SINK_OPTIONS) == 24
+    assert len(SINK_OPTIONS) == 37
     assert {name: (spec.scope, spec.type) for name, spec in SINK_OPTIONS.items()} == _EXPECTED
     assert [name for name, spec in SINK_OPTIONS.items() if spec.name != name] == []
 

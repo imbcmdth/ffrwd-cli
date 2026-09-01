@@ -362,6 +362,11 @@ from ffrwd.processes import ref_type
 from ffrwd.registry import DynamicFilter, FilterOption, Registry, SourceFilter
 from ffrwd.sink import (
     CODEC_PARAMS_FLAGS,
+    MANIFEST_DEFAULT_SEGMENT,
+    MANIFEST_FORMATS,
+    MANIFEST_MAP_OPTION,
+    MANIFEST_OPTION_FORMATS,
+    MANIFEST_SEGMENT_OPTION,
     SINK_OPTIONS,
     TWO_PASS_CODECS,
     copy_suppressed_scopes,
@@ -1414,13 +1419,165 @@ def _sink_stream_count(node: exp.Expr, arguments: int) -> int:
 
 def _validated_option(name: str, written: object, *, line: int, col: int) -> object:
     """One option value through the option table -- element by element when it
-    is a per-TRACK list, so a bad element is refused where a bad scalar is."""
+    is a per-TRACK list, so a bad element is refused where a bad scalar is.
+    A None element is that row's NULL read: absence, never a type error."""
     if isinstance(written, list):
         return [
-            validate_sink_option(name, element, line=line, col=col)
+            element
+            if element is None
+            else validate_sink_option(name, element, line=line, col=col)
             for element in written
         ]
     return validate_sink_option(name, written, line=line, col=col)
+
+
+def _manifest_format(raw: RawSink) -> str | None:
+    """The manifest format ('hls'/'dash') a COPY's WITH block names, else None.
+
+    Read off the raw option shape, like ``RawSink.is_csv``, because it changes
+    how the wrapped query is allowed to lower -- a manifest destination takes
+    a multi-row relation -- and that is decided before option values are
+    otherwise interpreted.
+    """
+    if raw.is_csv:
+        return None
+    for option in raw.options:
+        if option.name != "format":
+            continue
+        value = _sink_value(_unwrap(option.value))
+        if isinstance(value, str) and value in MANIFEST_FORMATS:
+            return value
+    return None
+
+
+@dataclass(frozen=True)
+class _VariantRow:
+    """One row of a manifest destination: the streams its cells hold.
+
+    A NULL cell is None -- that kind absent from this variant. A video-only
+    row is a variant drawing from the audio group, an audio-only row a
+    rendition in it, a both-cells row a muxed variant.
+    """
+
+    video: _Stream | None
+    audio: _Stream | None
+
+
+def _compress_manifest_lists(
+    options: dict[str, object], variant_rows: list[_VariantRow]
+) -> None:
+    """Per-row option lists, cut to the rows that hold the option's kind.
+
+    A per-row option was read once per ROW; at a manifest destination the
+    rows of the option's scope are the ones that carry a stream of that kind
+    (a video option read over an audio-only row read NULL through its NULL
+    subscript anyway). After the cut the list is one element per track, the
+    shape the per-track check and emit already speak.
+    """
+    for name, value in options.items():
+        if not isinstance(value, list) or len(value) != len(variant_rows):
+            continue
+        scope = SINK_OPTIONS[name].scope
+        if scope == "video":
+            options[name] = [
+                element
+                for element, row in zip(value, variant_rows)
+                if row.video is not None
+            ]
+        elif scope == "audio":
+            options[name] = [
+                element
+                for element, row in zip(value, variant_rows)
+                if row.audio is not None
+            ]
+
+
+def _fallback_names(candidates: list[str | None], prefix: str) -> list[str]:
+    """Each candidate name, or its positional fallback where it fails.
+
+    A name fails when it is missing, ``und``, or shared with another of its
+    kind -- the colliding ones ALL fall back, since neither owns the name.
+    """
+    counts: dict[str, int] = {}
+    for name in candidates:
+        if name is not None:
+            counts[name] = counts.get(name, 0) + 1
+    return [
+        name
+        if name is not None and name != _UNDEFINED_LANGUAGE and counts[name] == 1
+        else f"{prefix}{position}"
+        for position, name in enumerate(candidates)
+    ]
+
+
+def _stream_language(stream: _Stream) -> str | None:
+    """The probed language tag a stream carries, None for none or ``und``."""
+    source = stream.source
+    if source is None:
+        return None
+    language = source.metadata.get("language")
+    if language is None or language == _UNDEFINED_LANGUAGE:
+        return None
+    return str(language)
+
+
+# The rate-setting args a chain walk reads: the fps filter's own, and a
+# generated source's.
+_RATE_ARGS = ("fps", "rate", "r", "framerate")
+
+
+def _node_rate(node: Node) -> float | None:
+    """The frame rate `node` imposes on what flows through it, if any."""
+    if node.filter not in ("fps", "framerate") and node.inputs:
+        return None
+    for key in _RATE_ARGS:
+        rate = _parse_rate(node.args.get(key))
+        if rate is not None:
+            return rate
+    return None
+
+
+def _parse_rate(value: object) -> float | None:
+    """A frame rate as a float: ``30``, ``29.97``, or ffprobe's ``30000/1001``."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int | float):
+        return float(value) if value > 0 else None
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    numerator, slash, denominator = text.partition("/")
+    try:
+        if slash:
+            top, bottom = float(numerator), float(denominator)
+            return top / bottom if top > 0 and bottom > 0 else None
+        rate = float(text)
+        return rate if rate > 0 else None
+    except ValueError:
+        return None
+
+
+def _int_arg(node: Node, *keys: str) -> int | None:
+    """A node arg as an int, under whichever of `keys` it sits; None otherwise."""
+    for key in keys:
+        value = node.args.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str):
+            try:
+                return int(value)
+            except ValueError:
+                continue
+    return None
+
+
+def _text_number(value: int | float) -> str:
+    """A number the way a message spells it: ``6``, not ``6.0``."""
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
 
 
 def _sink_value(node: exp.Expr) -> object:
@@ -2763,6 +2920,11 @@ class _Lowerer:
         # otherwise reuses verbatim: an outer join's NULL row is an empty cell
         # rather than a rejection (see `_row_stream`).
         self.table_mode = False
+        # The manifest format ('hls'/'dash') of the COPY currently lowering,
+        # or None for every other destination. Under it a multi-row relation
+        # is accepted -- each row one variant map entry -- and an outer
+        # join's NULL row is that entry's absent stream kind.
+        self.manifest: str | None = None
 
     # -- entry point ------------------------------------------------------
 
@@ -2924,6 +3086,8 @@ class _Lowerer:
         self.metadata = None
         self.attachments = []
         self.rows_file = self._rows_file(raw)
+        self.manifest = _manifest_format(raw)
+        self._check_manifest_target(raw)
         first_sink = len(self.graph.module_sinks)
         columns = self._lower_query(list(raw.branches), raw.query, tags="sink")
         if self.rows_file:
@@ -2931,9 +3095,14 @@ class _Lowerer:
         if raw.module_sink:
             self._lower_module_sink(raw, self.graph.module_sinks[first_sink:])
             return None
+        variant_rows: list[_VariantRow] | None = None
+        if self.manifest is not None:
+            variant_rows, columns = self._manifest_rows(columns, raw)
         options: dict[str, object] = {}
         option_nodes: dict[str, exp.Expr] = {}
         for option in raw.options:
+            if variant_rows is not None and option.name in MANIFEST_MAP_OPTION.values():
+                raise self._hand_written_map_error(option, columns, variant_rows, raw)
             if isinstance(_unwrap(option.value), exp.Null):
                 # NULL is absence: the option is not written, the encoder's /
                 # muxer's own default applies, and the option table never
@@ -2948,6 +3117,7 @@ class _Lowerer:
             )
             option_nodes[option.name] = option.value
         _check_sink_option_conflicts(options, option_nodes, raw.path_node)
+        self._check_manifest_options(options, option_nodes, columns, variant_rows, raw)
         outputs = _outputs(columns, self._layered_tags(), self._layered_dispositions())
         if not outputs:
             # An empty column contributes nothing and only warns, but a sink
@@ -2961,11 +3131,17 @@ class _Lowerer:
                 "input, or select * to take whatever it holds",
             )
         _check_two_pass_outputs(options, outputs, raw.path_node)
+        if variant_rows is not None:
+            _compress_manifest_lists(options, variant_rows)
         self._check_per_track_options(options, option_nodes, outputs, raw)
         path = raw.path
         if raw.path_expr is not None:
             self._check_fanout_options(options, raw)
             path = self._sink_path(raw)
+        if variant_rows is not None and path is not None:
+            path = self._derive_manifest(
+                options, option_nodes, columns, variant_rows, outputs, path, raw
+            )
         self._codec_for_rows_track(options, outputs, path)
         return SinkUnit(
             outputs=outputs,
@@ -3371,6 +3547,537 @@ class _Lowerer:
                 hint=f"a TO expression writes one file per row; drop {name}, or "
                 "write a quoted TO path",
             )
+
+    # -- the manifest destination ------------------------------------------
+
+    def _check_manifest_target(self, raw: RawSink) -> None:
+        """The two destination shapes a manifest format cannot take.
+
+        A fan-out ``TO (<expression>)`` writes one file per row, and a
+        manifest binds many outputs under ONE written name -- the two answers
+        to a multi-row relation cannot both hold. ``UNION ALL`` concatenates
+        branches in time, so it carries no rows for the variant map to
+        transcribe.
+        """
+        if self.manifest is None:
+            return
+        if self.fanout_expr is not None:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"format '{self.manifest}' binds every output under one "
+                "written name, and a TO expression writes one file per row",
+                raw.path_expr,
+                fallback=raw.path_node,
+                hint="name the manifest with a quoted TO path; its rows "
+                "become the variant map",
+            )
+        if len(raw.branches) > 1:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"UNION ALL concatenates branches in time, and a "
+                f"format '{self.manifest}' destination transcribes one "
+                "relation's rows",
+                raw.path_node,
+                hint="concatenate in a CTE and select its columns, or write "
+                "the variants as rows of one SELECT",
+            )
+
+    def _manifest_rows(
+        self, columns: list[_Column], raw: RawSink
+    ) -> tuple[list[_VariantRow], list[_Column]]:
+        """The variant map's rows, transcribed off this COPY's relation.
+
+        Each SELECT column must carry one stream (or NULL) per row -- at most
+        one video column and one audio column, since a var_stream_map entry
+        holds one stream of each kind. Returns the rows plus the columns with
+        every NULL cell dropped, which is what the output list is built from:
+        an absent cell maps nothing, it only shapes the transcription.
+        """
+        anchor = raw.path_node
+        cardinality = max(len(self.sink_rows), 1)
+        cells: dict[StreamType, list[_Stream | None]] = {}
+        stripped: list[_Column] = []
+        for column in columns:
+            value = column.value
+            streams = list(value.streams)
+            if not streams:
+                stripped.append(column)  # empty column: contributes nothing
+                continue
+            label = column.name or value.type
+            if value.type not in ("video", "audio"):
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"a format '{self.manifest}' destination takes video and "
+                    f"audio columns, and '{label}' is {value.type}",
+                    anchor,
+                    hint="write subtitle and data tracks to a file of their own",
+                )
+            if value.type in cells:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"two {value.type} columns at a format '{self.manifest}' "
+                    "destination",
+                    anchor,
+                    hint="each row is one variant map entry, so it holds at "
+                    "most one video and one audio cell; put the second "
+                    f"{value.type} in a row of its own",
+                )
+            row_set = value.is_array and column.splat and len(streams) == cardinality
+            if cardinality > 1 and not row_set:
+                raise _error(
+                    ErrorCode.ROW_COUNT_MISMATCH,
+                    f"'{label}' does not carry one stream per row, and each "
+                    f"row of a format '{self.manifest}' destination is one "
+                    "variant map entry",
+                    anchor,
+                    hint="select a row column (a joined CTE's, an unnest "
+                    "table's); a gathered array belongs to a single file",
+                )
+            if cardinality == 1 and len(streams) > 1:
+                raise _error(
+                    ErrorCode.ROW_COUNT_MISMATCH,
+                    f"'{label}' is {len(streams)} streams in one row, and "
+                    f"each row of a format '{self.manifest}' destination is "
+                    "one variant map entry",
+                    anchor,
+                    hint="one variant per row: unnest or join the tracks "
+                    "into rows instead of selecting an array",
+                )
+            cells[value.type] = [
+                None if stream.ref == _NULL_STREAM_REF else stream
+                for stream in streams
+            ]
+            kept = [s for s in streams if s.ref != _NULL_STREAM_REF]
+            if len(kept) != len(streams):
+                stripped.append(replace(column, value=_array(value.type, kept)))
+            else:
+                stripped.append(column)
+        rows: list[_VariantRow] = []
+        empty: list[_Stream | None] = [None] * cardinality
+        for position in range(cardinality):
+            video = cells.get("video", empty)[position]
+            audio = cells.get("audio", empty)[position]
+            if video is None and audio is None:
+                raise _error(
+                    ErrorCode.STREAM_NOT_FOUND,
+                    f"row {position + 1} of this manifest has no stream in "
+                    "any column",
+                    anchor,
+                    hint="every row is one variant map entry; drop the empty "
+                    "row with a WHERE, or use a join that leaves no all-NULL "
+                    "row",
+                )
+            rows.append(_VariantRow(video=video, audio=audio))
+        self._check_no_null_stream_feeds_a_filter(raw)
+        return rows, stripped
+
+    def _check_no_null_stream_feeds_a_filter(self, raw: RawSink) -> None:
+        """A NULL cell can be SELECTED at a manifest destination, not filtered.
+
+        A call over a nullable column would hand a filter a stream that is
+        not there; the sentinel ref would reach the graph as a dangling
+        input. Caught here, by scanning what this COPY's lowering minted.
+        """
+        for node in self.graph.nodes.values():
+            if any(ref == _NULL_STREAM_REF for ref in node.inputs):
+                raise _error(
+                    ErrorCode.STREAM_NOT_FOUND,
+                    f"a NULL stream feeds {node.filter}(): an outer join's "
+                    "gap can be selected at a manifest destination, not "
+                    "filtered",
+                    raw.path_node,
+                    hint="apply the filter inside the CTE, where the row "
+                    "exists, and select the joined column bare",
+                )
+
+    def _hand_written_map_error(
+        self,
+        option: RawSinkOption,
+        columns: list[_Column],
+        variant_rows: list[_VariantRow],
+        raw: RawSink,
+    ) -> FfrwdError:
+        """The refusal for a hand-written variant map, naming the compiler's own."""
+        name = MANIFEST_MAP_OPTION[self.manifest or "hls"]
+        derived = self._manifest_map(columns, variant_rows, self.manifest or "hls")
+        line, col = _pos(option.name_node, option.value, raw.path_node)
+        return FfrwdError(
+            ErrorCode.UNKNOWN_SINK_OPTION,
+            f"'{option.name}' is the compiler's to write: it is a "
+            "transcription of this COPY's rows",
+            line=line,
+            col=col,
+            hint=f"drop it; the compiler writes {name} '{derived}'",
+        )
+
+    def _check_manifest_options(
+        self,
+        options: dict[str, object],
+        option_nodes: dict[str, exp.Expr],
+        columns: list[_Column],
+        variant_rows: list[_VariantRow] | None,
+        raw: RawSink,
+    ) -> None:
+        """The format each manifest option belongs to, and the map smuggle.
+
+        A manifest option under the other format -- or under no manifest
+        format at all -- is refused by name. ``codec_params`` carrying a
+        hand-written map spelling is refused the way the option itself is.
+        """
+        for name in options:
+            wanted = MANIFEST_OPTION_FORMATS.get(name)
+            if wanted is None or wanted == self.manifest:
+                continue
+            have = (
+                f"format '{self.manifest}'"
+                if self.manifest is not None
+                else "no manifest format"
+            )
+            raise _error(
+                ErrorCode.SINK_OPTION_TYPE,
+                f"option '{name}' belongs to format '{wanted}', and this "
+                f"COPY has {have}",
+                option_nodes.get(name),
+                fallback=raw.path_node,
+                hint=f"set format '{wanted}', or drop {name}",
+            )
+        if variant_rows is None or self.manifest is None:
+            return
+        for element in _each(options.get("codec_params")):
+            if not isinstance(element, str):
+                continue
+            for smuggled in MANIFEST_MAP_OPTION.values():
+                if smuggled in element:
+                    derived = self._manifest_map(columns, variant_rows, self.manifest)
+                    name = MANIFEST_MAP_OPTION[self.manifest]
+                    raise _error(
+                        ErrorCode.SINK_OPTION_TYPE,
+                        f"'{smuggled}' inside codec_params: the variant map "
+                        "is the compiler's to write",
+                        option_nodes.get("codec_params"),
+                        fallback=raw.path_node,
+                        hint=f"drop it; the compiler writes {name} '{derived}'",
+                    )
+
+    def _manifest_map(
+        self, columns: list[_Column], variant_rows: list[_VariantRow], format_name: str
+    ) -> str:
+        """The variant map, transcribed: each row one entry, in row order.
+
+        HLS spells it ``var_stream_map`` -- ``v:N``/``a:N`` per-kind indices
+        in output order, an ``agroup`` binding the demuxed shape together,
+        names from the streams, ``default:yes`` on one rendition. DASH spells
+        the same analysis ``adaptation_sets``: video and audio each one set,
+        one representation per rung, by flat output stream index.
+        """
+        if format_name == "dash":
+            sets: list[str] = []
+            offset = 0
+            by_type: dict[StreamType, list[int]] = {}
+            for column in columns:
+                for stream in column.value.streams:
+                    by_type.setdefault(column.value.type, []).append(offset)
+                    offset += 1
+            for set_id, stream_type in enumerate(
+                t for t in ("video", "audio") if t in by_type
+            ):
+                indices = ",".join(str(i) for i in by_type[stream_type])
+                sets.append(f"id={set_id},streams={indices}")
+            return " ".join(sets)
+
+        video_names, audio_names = self._variant_names(variant_rows)
+        demuxed = any(row.audio is not None and row.video is None for row in variant_rows)
+        default_row = self._default_audio_row(variant_rows)
+        entries: list[str] = []
+        video_seen = 0
+        audio_seen = 0
+        for position, row in enumerate(variant_rows):
+            parts: list[str] = []
+            if row.video is not None:
+                parts.append(f"v:{video_seen}")
+            if row.audio is not None:
+                parts.append(f"a:{audio_seen}")
+            if demuxed:
+                parts.append("agroup:aud")
+            if row.video is not None:
+                parts.append(f"name:{video_names[video_seen]}")
+                video_seen += 1
+            elif row.audio is not None:
+                parts.append(f"name:{audio_names[audio_seen]}")
+                language = _stream_language(row.audio)
+                if language is not None:
+                    parts.append(f"language:{language}")
+                if position == default_row:
+                    parts.append("default:yes")
+            if row.audio is not None:
+                audio_seen += 1
+            entries.append(",".join(parts))
+        return " ".join(entries)
+
+    def _default_audio_row(self, variant_rows: list[_VariantRow]) -> int | None:
+        """Which rendition row gets ``default:yes``.
+
+        The probed disposition wins when a track carries one; otherwise the
+        first audio-only row. A muxed row is a variant, not a rendition, and
+        never takes the flag.
+        """
+        renditions = [
+            position
+            for position, row in enumerate(variant_rows)
+            if row.audio is not None and row.video is None
+        ]
+        for position in renditions:
+            audio = variant_rows[position].audio
+            source = audio.source if audio is not None else None
+            if source is not None and source.disposition.get("default"):
+                return position
+        return renditions[0] if renditions else None
+
+    def _variant_names(
+        self, variant_rows: list[_VariantRow]
+    ) -> tuple[list[str], list[str]]:
+        """Names for the map's entries, per kind, in output order.
+
+        Video takes its height (``1080p``); audio its language tag. A name
+        that cannot be computed, or that collides with another of its kind,
+        falls back to its position (``v0``, ``a1``) -- files carry ``und``
+        more often than not, and ``%v`` becomes a directory name, so names
+        must exist and must not collide.
+        """
+        video_streams = [row.video for row in variant_rows if row.video is not None]
+        audio_streams = [
+            row.audio for row in variant_rows if row.audio is not None and row.video is None
+        ]
+        # A muxed row's audio never names anything, but it still numbers.
+        heights = [self._output_height(stream.ref) for stream in video_streams]
+        video = _fallback_names(
+            [None if h is None else f"{h}p" for h in heights], "v"
+        )
+        languages = [_stream_language(stream) for stream in audio_streams]
+        named = _fallback_names(languages, "a")
+        # Audio names index by RENDITION order among audio cells; muxed rows
+        # consume an audio index without a name of their own.
+        audio: list[str] = []
+        taken = 0
+        for row in variant_rows:
+            if row.audio is None:
+                continue
+            if row.video is None:
+                audio.append(named[taken])
+                taken += 1
+            else:
+                audio.append("")  # a muxed row's audio: numbered, never named
+        return video, audio
+
+    def _derive_manifest(
+        self,
+        options: dict[str, object],
+        option_nodes: dict[str, exp.Expr],
+        columns: list[_Column],
+        variant_rows: list[_VariantRow],
+        outputs: list[Output],
+        path: str,
+        raw: RawSink,
+    ) -> str:
+        """Everything ``format 'hls'``/``'dash'`` owns: the keyframe
+        discipline, the variant map, and (for hls) the whole layout.
+
+        Returns the positional output path -- the variant playlist pattern
+        for hls, where the written destination names the MASTER playlist and
+        ffmpeg's positional output is the variant pattern; the ``.mpd``
+        itself for dash, whose muxer already writes everything beside it.
+        Every derived option lands in `options` under its ordinary name, so
+        writing any of them by hand simply pre-empts the derivation.
+        """
+        format_name = self.manifest or "hls"
+        self._derive_keyframes(options, option_nodes, outputs, raw, format_name)
+        options[MANIFEST_MAP_OPTION[format_name]] = self._manifest_map(
+            columns, variant_rows, format_name
+        )
+        if format_name != "hls":
+            return path
+        normalized = path.replace("\\", "/")
+        directory, _, filename = normalized.rpartition("/")
+        prefix = f"{directory}/" if directory else ""
+        options.setdefault("master_pl_name", filename)
+        extension = "m4s" if options.get("hls_segment_type") == "fmp4" else "ts"
+        options.setdefault(
+            "hls_segment_filename", f"{prefix}v%v/segment_%d.{extension}"
+        )
+        if options.get("hls_segment_type") == "fmp4":
+            options.setdefault("hls_fmp4_init_filename", "init.mp4")
+        return f"{prefix}v%v/index.m3u8"
+
+    def _derive_keyframes(
+        self,
+        options: dict[str, object],
+        option_nodes: dict[str, exp.Expr],
+        outputs: list[Output],
+        raw: RawSink,
+        format_name: str,
+    ) -> None:
+        """The keyframe discipline a manifest's segments need.
+
+        A segment boundary must be a keyframe in every rung, so the gop is
+        the segment length times the frame rate (written by the query's
+        ``fps()``, probed otherwise), ``keyint_min`` is pinned to it, and
+        scene cuts are disabled in the encoder's own spelling. An explicit
+        gop that does not divide the segment is refused, naming the nearest
+        ones that would.
+        """
+        video_maps = [output for output in outputs if output.type == "video"]
+        if not video_maps:
+            return
+        encoded = "video" in copy_suppressed_scopes(options) or any(
+            not is_src(output.ref) for output in video_maps
+        )
+        if not encoded:
+            return
+        segment_name = MANIFEST_SEGMENT_OPTION[format_name]
+        segment = options.get(segment_name)
+        if not isinstance(segment, int | float):
+            segment = MANIFEST_DEFAULT_SEGMENT[format_name]
+        rates = [
+            self._output_rate(output.ref, raw, format_name) for output in video_maps
+        ]
+        targets = [max(1, round(segment * rate)) for rate in rates]
+        written = options.get("gop")
+        if written is not None:
+            gops = written if isinstance(written, list) else [written] * len(targets)
+            for gop, target, rate in zip(gops, targets, rates):
+                if not isinstance(gop, int) or target % gop == 0:
+                    continue
+                divisors = [d for d in range(1, target + 1) if target % d == 0]
+                nearest = sorted(
+                    {
+                        max((d for d in divisors if d <= gop), default=1),
+                        min((d for d in divisors if d >= gop), default=target),
+                    }
+                )
+                line, col = _pos(option_nodes.get("gop"), raw.path_node)
+                raise FfrwdError(
+                    ErrorCode.SINK_OPTION_TYPE,
+                    f"gop {gop} does not divide the {target}-frame segment "
+                    f"({segment_name} {_text_number(segment)} x "
+                    f"{_text_number(rate)} fps)",
+                    line=line,
+                    col=col,
+                    hint="the nearest that would: "
+                    + ", ".join(str(d) for d in nearest),
+                )
+        else:
+            options["gop"] = targets[0] if len(set(targets)) == 1 else list(targets)
+        keyint = options["gop"]
+        options["keyint_min"] = list(keyint) if isinstance(keyint, list) else keyint
+        self._disable_scene_cuts(options)
+
+    def _disable_scene_cuts(self, options: dict[str, object]) -> None:
+        """Scene cuts off, in the encoder's own spelling.
+
+        libx264 reads ``-sc_threshold 0``; libx265 and libsvtav1 read a
+        private param, carried on the codec_params road the table already
+        renders. Any other encoder is left alone: a knob it does not have
+        would be a silent no-op.
+        """
+        codec = options.get("video_codec")
+        if codec == "libx264":
+            options["sc_threshold"] = 0
+            return
+        param = {"libx265": "scenecut=0", "libsvtav1": "scd=0"}.get(
+            codec if isinstance(codec, str) else ""
+        )
+        if param is None:
+            return
+        key = param.partition("=")[0]
+        written = options.get("codec_params")
+        if written is None:
+            options["codec_params"] = param
+        elif isinstance(written, str):
+            if key not in written:
+                options["codec_params"] = f"{written}:{param}"
+        elif isinstance(written, list):
+            options["codec_params"] = [
+                element
+                if not isinstance(element, str) or key in element
+                else f"{element}:{param}"
+                for element in written
+            ]
+
+    def _output_rate(self, ref: FrameRef, raw: RawSink, format_name: str) -> float:
+        """One video output's frame rate, walked back through its chain.
+
+        The nearest ``fps()`` on the way to the source wins -- it is what
+        the stream actually plays at; failing one, the probed rate of the
+        source stream the chain reads. A rate the compiler cannot know is a
+        refusal: the keyframe discipline is derived from it.
+        """
+        current = ref
+        while current and not is_src(current):
+            node = self.graph.nodes.get(current.partition(":")[0])
+            if node is None:
+                break
+            rate = _node_rate(node)
+            if rate is not None:
+                return rate
+            if not node.inputs:
+                break
+            current = node.inputs[0]
+        if current and is_src(current):
+            alias, stream_type, index = src_parts(current)
+            result = self.probes.get(alias)
+            if result is not None:
+                streams = result.by_type(stream_type)
+                if 0 <= index < len(streams):
+                    rate = _parse_rate(streams[index].fps)
+                    if rate is not None:
+                        return rate
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"format '{format_name}' derives the keyframe interval from the "
+            "frame rate, and this video stream's rate is unknown",
+            raw.path_node,
+            hint="pin the rate in the query, e.g. fps(<stream>, 30)",
+        )
+
+    def _output_height(self, ref: FrameRef) -> int | None:
+        """One video output's height, walked back through its chain.
+
+        The nearest size-setting filter wins; a proportional height (``-2``/
+        ``-1``/``0``) is computed from its width and the source's probed
+        dimensions. None when nothing on the way says -- the variant name
+        then falls back to its position.
+        """
+        current = ref
+        width: int | None = None  # a pending proportional scale's width
+        while current and not is_src(current):
+            node = self.graph.nodes.get(current.partition(":")[0])
+            if node is None:
+                return None
+            height = _int_arg(node, "h", "height")
+            if height is not None and height > 0:
+                return height
+            if height is not None:  # proportional: need the source's aspect
+                width = _int_arg(node, "w", "width")
+                if width is None or width <= 0:
+                    return None
+            if not node.inputs:
+                return None
+            current = node.inputs[0]
+        if not current or not is_src(current):
+            return None
+        alias, stream_type, index = src_parts(current)
+        result = self.probes.get(alias)
+        if result is None:
+            return None
+        streams = result.by_type(stream_type)
+        if not 0 <= index < len(streams):
+            return None
+        meta = streams[index]
+        if width is None:
+            return meta.height
+        if not meta.width or not meta.height:
+            return None
+        return round(width * meta.height / meta.width / 2) * 2
 
     def _sink_path(self, raw: RawSink) -> str:
         """``TO (<expression>)`` evaluated: this command's destination.
@@ -4085,9 +4792,11 @@ class _Lowerer:
         ``TO (<expression>)`` that gives each row a destination of its own.
 
         A fan-out has already been pinned to the one group this command
-        writes, so it never reaches the count.
+        writes, so it never reaches the count. A manifest destination is the
+        third answer: its one written name binds many outputs, so the rows
+        stand -- each becomes a variant map entry.
         """
-        if self.fanout_expr is not None:
+        if self.fanout_expr is not None or self.manifest is not None:
             return
         if env.grouped:
             count = len(self._grouped_partitions(env, select))
@@ -5036,11 +5745,11 @@ class _Lowerer:
                 )
                 struct_values = self.res.struct_rows.get(alias)
                 if struct_values is not None:
-                    self._add_values_rows(alias, struct_values, env, select)
+                    self._add_values_rows(alias, struct_values, env, select, join)
                 else:
                     self._add_track_rows(item, join, env, select)
             else:
-                self._add_table(item, env, select)
+                self._add_table(item, join, env, select)
         return env
 
     # -- FROM unnest(<input>.<type>) alias -------------
@@ -5286,7 +5995,13 @@ class _Lowerer:
             )
         return result
 
-    def _add_table(self, table: exp.Expr | None, env: _Env, select: exp.Select) -> None:
+    def _add_table(
+        self,
+        table: exp.Expr | None,
+        join: RawRowJoin | None,
+        env: _Env,
+        select: exp.Select,
+    ) -> None:
         if not isinstance(table, exp.Table):
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
@@ -5320,7 +6035,7 @@ class _Lowerer:
                     fallback=table,
                     hint=self._known_hint(),
                 )
-            self._add_series_rows(alias, series_values, inner, env, select)
+            self._add_series_rows(alias, series_values, inner, env, select, join)
             return
         if isinstance(inner, exp.Anonymous):
             if not isinstance(alias_node, exp.TableAlias) or alias_node.this is None:
@@ -5359,7 +6074,7 @@ class _Lowerer:
             local = name
             if isinstance(alias_node, exp.TableAlias) and alias_node.this is not None:
                 local = _fold(alias_node.this)
-            self._add_cte_rows(local, columns, body_values, env, select)
+            self._add_cte_rows(local, columns, body_values, env, select, join)
             return
         raise _error(
             ErrorCode.UNSUPPORTED_SQL,
@@ -5369,13 +6084,19 @@ class _Lowerer:
         )
 
     def _add_values_rows(
-        self, local: str, values: RawValuesTable, env: _Env, select: exp.Select
+        self,
+        local: str,
+        values: RawValuesTable,
+        env: _Env,
+        select: exp.Select,
+        join: RawRowJoin | None = None,
     ) -> None:
         """Bind one written row table: its rows join the branch's relation.
 
         The same join :meth:`_add_track_rows` builds, with the rows read off
         the query instead of a probe -- so a comma between a written row
-        table and anything else is the ordinary cross join, and
+        table and anything else is the ordinary cross join, an explicit
+        `join` matches rows the same way it does between unnest tables, and
         ``array_agg`` over it aggregates the same way. No stream and no
         ``-i``: the rows are values. Each cell takes the ordinary
         compile-time value grammar (:meth:`_eval_value`), evaluated once
@@ -5404,7 +6125,7 @@ class _Lowerer:
             relation=env.relation,
             values=values,
         )
-        self._join_rows(env.relation, local, rows, None, env, select)
+        self._join_rows(env.relation, local, rows, join, env, select)
 
     def _add_series_rows(
         self,
@@ -5413,6 +6134,7 @@ class _Lowerer:
         node: exp.Expr,
         env: _Env,
         select: exp.Select,
+        join: RawRowJoin | None = None,
     ) -> None:
         """Bind one ``generate_series`` table: its computed rows join the
         branch's relation exactly like a struct row table's written ones.
@@ -5435,7 +6157,7 @@ class _Lowerer:
                 alias=local, columns=(local,), rows=(), node=node, types=("number",)
             ),
         )
-        self._join_rows(env.relation, local, rows, None, env, select)
+        self._join_rows(env.relation, local, rows, join, env, select)
 
     def _add_cte_rows(
         self,
@@ -5444,14 +6166,16 @@ class _Lowerer:
         values: dict[str, tuple[RowValue, ...]],
         env: _Env,
         select: exp.Select,
+        join: RawRowJoin | None = None,
     ) -> None:
         """Bind one CTE reference: its body's rows join the branch's relation.
 
         One body row is one outer row, so a comma between two CTEs (or between
         a CTE and an unnest table) is the ordinary cross join
-        :meth:`_join_rows` already builds, multiplicity and all. A single-row
-        body is a shape no-op, which is what keeps the one-input CTE shapes
-        compiling exactly as they did.
+        :meth:`_join_rows` already builds, multiplicity and all -- and an
+        explicit `join` matches, keeps and gaps rows exactly as it does
+        between unnest tables. A single-row body is a shape no-op, which is
+        what keeps the one-input CTE shapes compiling exactly as they did.
         """
         if env.relation is None:
             env.relation = _RowRelation()
@@ -5467,7 +6191,7 @@ class _Lowerer:
             env.relation,
             local,
             [_CteRow(position=position) for position in range(rows)],
-            None,
+            join,
             env,
             select,
         )
@@ -5997,6 +6721,8 @@ class _Lowerer:
                 fallback=select,
                 hint=self._cte_columns_hint(binding),
             )
+        if binding.name in rows and rows[binding.name] is None:
+            return None  # an outer join's gap reads NULL in every column
         entry = rows.get(binding.name)
         position = entry.position if isinstance(entry, _CteRow) else 0
         return values[position] if position < len(values) else None
@@ -6286,7 +7012,10 @@ class _Lowerer:
                 fallback=select,
                 hint=f"subscript from 1 to {len(elements)}",
             )
-        return self._literal_of(elements[index - 1], select)
+        element = elements[index - 1]
+        if isinstance(_unwrap(element), exp.Null):
+            return None  # a NULL element is absence, like a NULL subscript
+        return self._literal_of(element, select)
 
     def _eval_concat(
         self,
@@ -7490,7 +8219,7 @@ class _Lowerer:
                 select,
             )
             return row.stream
-        if self.table_mode:
+        if self.table_mode or self.manifest is not None:
             return _Stream(ref=_NULL_STREAM_REF, type=binding.type, source=None)
         fill = _FILL_SPELLINGS.get(binding.type)
         hint = (
@@ -8225,12 +8954,33 @@ class _Lowerer:
             or len(column.value.streams) != binding.rows
         ):
             return column.value
-        streams = [
-            column.value.streams[row.position]
-            for row in (tuple_.get(binding.name) for tuple_ in relation.tuples)
-            if isinstance(row, _CteRow)
-        ]
-        if not streams:
+        streams: list[_Stream] = []
+        for position, entry in enumerate(
+            tuple_.get(binding.name) for tuple_ in relation.tuples
+        ):
+            if isinstance(entry, _CteRow):
+                streams.append(column.value.streams[entry.position])
+                continue
+            # An outer join's gap: a NULL cell, sentinel where a NULL is
+            # allowed to stand (a table's empty cell, a manifest row's
+            # absent stream kind), a rejection everywhere else.
+            if self.table_mode or self.manifest is not None:
+                streams.append(
+                    _Stream(ref=_NULL_STREAM_REF, type=column.value.type, source=None)
+                )
+                continue
+            raise _error(
+                ErrorCode.STREAM_NOT_FOUND,
+                f"'{binding.name}.{column.name}' is NULL in row "
+                f"{position + 1}: no '{binding.name}' row matched here",
+                anchor,
+                fallback=select,
+                hint="an outer join leaves gaps, and only a manifest "
+                "destination (WITH (format 'hls'), format 'dash') takes them "
+                "as absent variants; use an INNER or LEFT join so every "
+                "selected row has one",
+            )
+        if not any(stream.ref != _NULL_STREAM_REF for stream in streams):
             raise _error(
                 ErrorCode.STREAM_NOT_FOUND,
                 f"'{binding.name}.{column.name}' selects nothing: no row of "

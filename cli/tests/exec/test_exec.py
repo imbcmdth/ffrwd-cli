@@ -2427,3 +2427,114 @@ def test_init_writes_a_project_whose_starter_recipe_runs(
     )
     assert code == 0
     assert out_path.exists() and out_path.stat().st_size > 0
+
+
+# ---------------------------------------------------------------------------
+# manifest destinations: the hls/dash ladder end to end
+# ---------------------------------------------------------------------------
+
+
+def _manifest_ladder_query(dest: Path, with_block: str) -> str:
+    """The demuxed ladder over av.mp4: two rungs, its one audio a rendition."""
+    src = _sql_path(_AV)
+    return (
+        "COPY (WITH vid AS ("
+        "  SELECT scale(fps(f.video[1], 15), ARRAY[320, 160][i.i], -2) AS v, i.i AS rung"
+        f"  FROM input('{src}') f, generate_series(1, 2) i"
+        "), aud AS ("
+        "  SELECT a AS t, 2 + a.index AS rung"
+        f"  FROM input('{src}') g, unnest(g.audio) a"
+        ") SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) "
+        f"TO '{_sql_path(dest)}' WITH ({with_block})"
+    )
+
+
+def _run_manifest(query: str) -> None:
+    args = build_ffmpeg_args(emit(compile_sql(query)))
+    args.insert(1, "-y")
+    result = subprocess.run(
+        args, capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def _keyframe_times(playlist: Path) -> list[float]:
+    args = [
+        "ffprobe", "-v", "error", "-skip_frame", "nokey", "-select_streams", "v:0",
+        "-show_entries", "frame=pts_time", "-of", "json", str(playlist),
+    ]
+    result = subprocess.run(
+        args, capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT
+    )
+    assert result.returncode == 0, result.stderr
+    frames = json.loads(result.stdout)["frames"]
+    return [float(frame["pts_time"]) for frame in frames]
+
+
+def test_the_hls_ladder_writes_an_accepted_master_and_aligned_segments(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The whole manifest story against real ffmpeg: the master lists the
+    variants and the audio group, the derived layout exists, a variant
+    playlist plays end to end, and every segment boundary is a keyframe.
+
+    Runs from `tmp_path` with a relative destination: ffmpeg's hls muxer
+    cannot create `%v` directories on a drive other than the working one
+    (Windows), and a relative layout is how the recipe is run anyway.
+    """
+    _require_fixture(_AV)
+    monkeypatch.chdir(tmp_path)
+    dest = tmp_path / "out" / "master.m3u8"
+    dest.parent.mkdir()
+    query = _manifest_ladder_query(
+        Path("out/master.m3u8"),
+        "format 'hls', hls_time 2, hls_playlist_type 'vod', "
+        "hls_segment_type 'fmp4', video_codec 'libx264', preset 'ultrafast', "
+        "video_bitrate ARRAY['500k', '250k'][vid.rung], audio_codec 'aac'",
+    )
+    _run_manifest(query)
+
+    master = dest.read_text(encoding="utf-8")
+    assert master.count("#EXT-X-STREAM-INF") == 2
+    assert "#EXT-X-MEDIA:TYPE=AUDIO" in master and 'GROUP-ID="group_aud"' in master
+
+    for variant in ("v240p", "v120p", "va0"):
+        playlist = dest.parent / variant / "index.m3u8"
+        assert playlist.exists(), f"missing {playlist}"
+        assert (dest.parent / variant / "segment_0.m4s").exists()
+
+    video_stream = _ffprobe_video_stream(dest.parent / "v240p" / "index.m3u8")
+    assert video_stream["width"] == 320
+
+    times = _keyframe_times(dest.parent / "v240p" / "index.m3u8")
+    assert len(times) >= 2
+    gaps = [round(b - a, 3) for a, b in zip(times, times[1:])]
+    assert all(gap == 2.0 for gap in gaps), gaps
+
+
+def test_the_dash_ladder_writes_an_mpd_ffprobe_accepts(tmp_path: Path) -> None:
+    """The dash twin: the format block reworded, the same rows, and the
+    written .mpd accepted end to end."""
+    _require_fixture(_AV)
+    dest = tmp_path / "out" / "master.mpd"
+    dest.parent.mkdir()
+    query = _manifest_ladder_query(
+        dest,
+        "format 'dash', seg_duration 2, use_template true, use_timeline true, "
+        "video_codec 'libx264', preset 'ultrafast', "
+        "video_bitrate ARRAY['500k', '250k'][vid.rung], audio_codec 'aac'",
+    )
+    _run_manifest(query)
+
+    assert dest.exists()
+    assert (dest.parent / "init-stream0.m4s").exists()
+    args = [
+        "ffprobe", "-v", "error", "-show_entries", "stream=codec_type",
+        "-of", "json", str(dest),
+    ]
+    result = subprocess.run(
+        args, capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT
+    )
+    assert result.returncode == 0, result.stderr
+    kinds = [s["codec_type"] for s in json.loads(result.stdout)["streams"]]
+    assert kinds.count("video") == 2 and kinds.count("audio") == 1

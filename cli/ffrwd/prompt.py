@@ -339,13 +339,14 @@ _DIALECT_TAIL = """\
   f.video)`) is also a rejection: only a filter whose pad count follows
   its argument count takes it.
 - `unnest(...) a JOIN unnest(...) b ON <predicate>` matches ROWS between two
-  unnest tables: `INNER JOIN`, `LEFT [OUTER] JOIN`, `FULL OUTER JOIN` (a
+  row tables -- unnest tables, CTEs and views, struct row tables,
+  `generate_series`: `INNER JOIN`, `LEFT [OUTER] JOIN`, `FULL OUTER JOIN` (a
   bare `FULL JOIN` means the same thing), each requiring its own `ON`.
   `RIGHT [OUTER] JOIN`, `CROSS JOIN`, `NATURAL JOIN`, and `USING` are
   rejected -- swap the tables and write `LEFT` instead of a right join, and
-  a comma between two unnest tables IS the (bounded) cross join:
+  a comma between two row tables IS the (bounded) cross join:
   `FROM ..., unnest(f.audio) a, unnest(g.audio) b`. `JOIN ... ON` is legal
-  ONLY between unnest tables -- `input()` aliases stay a comma cross-join,
+  ONLY between row tables -- `input()` aliases stay a comma cross-join,
   same as always. Result row order is the LEFT side's track order, then
   (`FULL OUTER` only) unmatched right rows in their own order. A row that
   matches two rows on the other side pairs with both -- real join
@@ -1042,6 +1043,23 @@ surviving rows; a NULL name; and, in this version, fan-out with `two_pass`,
 a `chapters` column, `FORMAT csv`, `UNION ALL`, or another
 `COPY` in the same script.
 
+### One manifest, many outputs
+
+`WITH (format 'hls')` / `format 'dash'` makes the destination a MANIFEST:
+the written path names the master playlist / `.mpd`, and a multi-row
+relation is accepted -- each row one variant map entry, in row order. A
+NULL stream cell (an outer join's gap) means that kind is absent from
+the variant: a video-only row is a variant drawing from the audio
+group, an audio-only row a rendition, a both-cells row a muxed variant.
+The compiler derives the keyframe discipline (gop from segment length x
+frame rate, `keyint_min` pinned, scene cuts off), the hls layout (`%v`
+directories beside the master), and the variant map (`var_stream_map` /
+`adaptation_sets`) by transcribing the rows -- never write one by hand,
+it is refused naming what the compiler would write. Format-specific
+options (`hls_*`, `master_pl_name`; `seg_duration`, `use_template`,
+`use_timeline`, `init_seg_name`, `media_seg_name`, `single_file`) are
+refused outside their format.
+
 ### Options
 
 An option applies to every output stream in its scope: a `video` option to
@@ -1077,7 +1095,7 @@ These are typed errors, never a best-effort graph. Do not reach for them.
   `QUALIFY`, `WINDOW`, window functions (`OVER`), subquery predicates
   (`IN (SELECT ...)`, `EXISTS`), `UNION` without `ALL`.
 - Outside the dialect: subqueries anywhere (use a CTE), explicit `JOIN ...
-  ON` / `USING` anywhere but between two `unnest(...)` tables (see Track
+  ON` / `USING` anywhere but between two row tables (see Track
   rows), `RIGHT [OUTER] JOIN` / `CROSS JOIN` / `NATURAL JOIN` even there,
   casts (`::` or `CAST`), arithmetic or any non-literal in an argument,
   unqualified columns, schema-qualified tables, an alias that shadows

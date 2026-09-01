@@ -1259,6 +1259,15 @@ def test_a_protocol_url_destination_skips_the_directory_check() -> None:
     assert cli._check_output_dir("no-such-dir/out.mp4") is not None
 
 
+def test_a_muxer_name_pattern_checks_its_literal_ancestor(tmp_path: Path) -> None:
+    """A manifest's `%v` directories are the muxer's to create, so the
+    pre-flight checks the deepest literal ancestor, not the pattern."""
+    dest = tmp_path / "v%v" / "index.m3u8"
+    assert cli._check_output_dir(str(dest)) is None
+    missing = tmp_path / "no-such-dir" / "v%v" / "index.m3u8"
+    assert cli._check_output_dir(str(missing)) is not None
+
+
 def test_version_flag_prints_the_tool_version(capsys: pytest.CaptureFixture[str]) -> None:
     """Both psql spellings; checked before the run dispatch would eat the flag."""
     from importlib import metadata

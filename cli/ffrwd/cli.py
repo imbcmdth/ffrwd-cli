@@ -1029,6 +1029,10 @@ def _check_output_dir(out_path: str) -> str | None:
     if is_url(out_path):
         return None
     parent = Path(out_path).parent
+    # A `%v`/`%d` component is a muxer name pattern -- the muxer creates
+    # those directories itself, so check the deepest literal ancestor.
+    while "%" in parent.name:
+        parent = parent.parent
     if str(parent) and not parent.exists():
         return f"error: output directory does not exist: {parent}"
     return None

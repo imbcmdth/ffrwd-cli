@@ -160,11 +160,12 @@ Notes for downstream passes (lower):
   ``side`` and no ``on``; ``NATURAL JOIN`` -> ``method='NATURAL'``;
   ``USING (col)`` -> ``using=[Identifier]``. A comma source carries none.
 
-* ``JOIN`` between two ``unnest`` tables is admitted — INNER (``JOIN`` /
-  ``INNER JOIN``), ``LEFT [OUTER]`` and ``FULL [OUTER]``, each with a mandatory
-  ``ON`` — and nowhere else: a join whose right side is not an ``unnest``, or
-  that stands before any row table is bound, is rejected, as are ``RIGHT``,
-  ``CROSS``, ``NATURAL`` and ``USING``. :func:`from_entries` pairs each FROM
+* ``JOIN`` between two row tables — ``unnest``, a CTE or view, a struct row
+  table, ``generate_series`` — is admitted: INNER (``JOIN`` / ``INNER JOIN``),
+  ``LEFT [OUTER]`` and ``FULL [OUTER]``, each with a mandatory ``ON``, and
+  nowhere else. A join whose right side is not a row table, or that stands
+  before any row table is bound, is rejected, as are ``RIGHT``, ``CROSS``,
+  ``NATURAL`` and ``USING``. :func:`from_entries` pairs each FROM
   item with the :class:`RawRowJoin` describing how it attaches (``"cross"`` for
   a comma source), which is what lower evaluates the join from. The ``ON``
   predicate is the row grammar plus one addition: both operands may be row
@@ -451,8 +452,9 @@ _ROW_WHERE_HINT = (
     "=, !=, <, <=, >, >=, BETWEEN, IS [NOT] NULL, joined with AND/OR/NOT"
 )
 _JOIN_HINT = (
-    "JOIN matches the ROWS of two unnest tables: FROM input('a.mkv') f, "
-    "input('b.mkv') g, unnest(f.audio) a JOIN unnest(g.audio) b ON "
+    "JOIN matches the ROWS of two row tables (unnest, a CTE, a struct row "
+    "table, generate_series): FROM input('a.mkv') f, input('b.mkv') g, "
+    "unnest(f.audio) a JOIN unnest(g.audio) b ON "
     "a.tags.language = b.tags.language (INNER, LEFT [OUTER] and FULL [OUTER] only); "
     "at input level, FROM stays a comma cross-join"
 )
@@ -4218,9 +4220,10 @@ class _Resolver:
                 join.args.get(key)
                 for key in ("on", "using", "side", "kind", "method", "match_condition")
             )
-            if explicit:
-                self._check_join(join, spec, scope, select)
+            before = dict(scope) if explicit else scope
             self._add_from_item(join.this, scope, visible)
+            if explicit:
+                self._check_join(join, spec, before, scope, select)
             if spec.on is not None:
                 # AFTER the right side is bound: an ON names both operands.
                 self._check_join_predicate(spec.on, scope, join)
@@ -4232,15 +4235,19 @@ class _Resolver:
         self,
         join: exp.Join,
         spec: RawRowJoin,
+        before: dict[str, str],
         scope: dict[str, str],
         select: exp.Select,
     ) -> None:
-        """Admit one explicit JOIN, which only track-row tables may use.
+        """Admit one explicit JOIN, which only row tables may use.
 
-        JOIN syntax is admitted between unnest tables ONLY; input-level FROM
-        stays comma-cross-join. Everything a track-row join cannot be (a
-        stream-level operand, RIGHT, CROSS, NATURAL, USING) is rejected, with
-        the hint saying which spelling to reach for instead.
+        JOIN syntax is admitted between row relations -- unnest tables, CTEs
+        and views, struct row tables, generate_series; input-level FROM stays
+        comma-cross-join. Everything a row join cannot be (a stream-level
+        operand, RIGHT, CROSS, NATURAL, USING) is rejected, with the hint
+        saying which spelling to reach for instead. `before` is the scope as
+        it stood ahead of this join's own item, so the check can tell the
+        joined item's bindings from what the left side already held.
         """
         for key in ("using", "method", "match_condition"):
             value = join.args.get(key)
@@ -4253,15 +4260,14 @@ class _Resolver:
                     fallback=join,
                     hint=_JOIN_HINT,
                 )
-        if (
-            not isinstance(join.this, exp.Unnest)
-            or _row_struct_array(join.this) is not None
-            or "row" not in scope.values()
+        row_kinds = ("row", "cte")
+        joined = [kind for name, kind in scope.items() if name not in before]
+        if any(kind not in row_kinds for kind in joined) or not any(
+            kind in row_kinds for kind in before.values()
         ):
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
-                "explicit JOIN syntax is supported between unnest(...) track-row "
-                "tables only",
+                "explicit JOIN syntax is supported between row tables only",
                 _first_expression(
                     join.args.get("on")
                     or join.args.get("side")

@@ -699,10 +699,13 @@ Every FROM item is a compile-time table; the column model per shape is
 | `function_name(args) alias` | its body's rows | a table-returning function, expanded at compile time |
 
 Comma between items is a cross join with real multiplicity.
-`JOIN ... ON` exists ONLY between two `unnest` tables (chapter rows included): `INNER`,
-`LEFT [OUTER]`, `FULL [OUTER]`, each with its own `ON`. An outer
-join's gap side has NULL streams; fill with `COALESCE` and a generated
-source ([rows.md](rows.md#joins)).
+`JOIN ... ON` exists between two row tables - `unnest` tables (chapter
+rows included), CTEs and views, struct row tables, `generate_series` -
+and nowhere else: `INNER`, `LEFT [OUTER]`, `FULL [OUTER]`, each with
+its own `ON`. An outer join's gap side has NULL streams; fill with
+`COALESCE` and a generated source ([rows.md](rows.md#joins)), or
+select the gaps at a manifest destination, where they mean absence
+(see Destinations and options).
 
 ### input() options
 
@@ -895,7 +898,49 @@ and so is an OFFSET that skips every row.
 `TO 'path'` writes one file; `TO STDOUT WITH (format 'csv')` prints;
 `TO (value-expression over row columns)` writes one file per row or
 group; `TO <sink>(<values>)` hands the streams to a `RETURNS sink`
-wasm function, which writes no file at all. Sink options (`WITH
+wasm function, which writes no file at all.
+
+`WITH (format 'hls')` and `format 'dash'` make the destination a
+**manifest** - the third answer to a multi-row relation, beside the
+one-row path and the fan-out. The written name is the master playlist
+(`.m3u8`) or the `.mpd`; the outputs it binds are variant playlists
+and segments, so the relation stays rows, each row one entry of the
+variant map, in row order. A NULL stream cell (an outer join's gap)
+means that kind is absent from the variant: a video-only row is a
+variant drawing from the audio group, an audio-only row a rendition in
+it, a both-cells row a muxed variant. Per-row `WITH` options bind per
+row as they do under a fan-out, a NULL read meaning the encoder's own
+default. The same rows into `TO (expression)` are N files; into a
+manifest they are one ladder ([recipe
+104](examples.md#104-publish-the-ladder-as-hls)).
+
+Under a manifest format the compiler owns what the format needs:
+
+- **Alignment.** The keyframe interval is derived from the segment
+  length (`hls_time` / `seg_duration`, the muxer's default when unset)
+  and the frame rate (`fps()` when the query writes one, probed
+  otherwise): gop, `keyint_min` pinned to it, scene cuts disabled in
+  the encoder's own spelling. An explicit `gop` that does not divide
+  the segment is refused, naming the nearest ones that would.
+- **Layout** (hls). The destination names the master; variant
+  playlists and segments are laid out under `%v` directories beside
+  it, the init segment named - every path consistent, each overridable
+  through `master_pl_name` / `hls_segment_filename` /
+  `hls_fmp4_init_filename`, none required. dash's muxer already writes
+  everything beside the `.mpd`.
+- **The variant map.** `var_stream_map` / `adaptation_sets` is a
+  transcription of the rows - `v:N`/`a:N` in output order, an `agroup`
+  binding the demuxed shape, names from the streams (height for video,
+  language tag for audio, positional `a0` when `und` or colliding),
+  `default:yes` on the first rendition unless a probed default
+  disposition says otherwise. A hand-written map is refused, naming
+  what the compiler would write.
+
+The format-specific options (`hls_time`, `hls_playlist_type`,
+`hls_flags`, `hls_segment_type`, `hls_segment_filename`,
+`hls_fmp4_init_filename`, `master_pl_name`; `seg_duration`,
+`use_template`, `use_timeline`, `init_seg_name`, `media_seg_name`,
+`single_file`) are refused outside their format. Sink options (`WITH
 (...)`) cover codecs, quality, bitrate control, metadata copying,
 two-pass - the full table is generated into the prompt (`ffrwd
 prompt`) and validated per option with typed errors; a sink function
@@ -1000,7 +1045,7 @@ Every one of these is a typed rejection, never a silent reinterpretation:
   ...)`, `EXISTS`, derived tables in FROM.
 - **Joins**: `RIGHT [OUTER] JOIN`, `CROSS JOIN` (spell it with a
   comma), `NATURAL JOIN`, `USING`, and any `JOIN ... ON` not between
-  two unnest tables.
+  two row tables.
 - **No streaming equivalent**: `HAVING`, `DISTINCT`, `UNION` without
   `ALL`, window functions, `QUALIFY`, aggregates other than `array_agg`
   (`count`, `sum`, ...), `ORDER BY` inside `array_agg`; `LIMIT` and

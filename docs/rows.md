@@ -128,12 +128,12 @@ FROM input('film.mkv') f, input('commentary.mkv') g,
      unnest(f.audio) a JOIN unnest(g.audio) b ON a.tags.language = b.tags.language
 ```
 
-- `INNER`, `LEFT`, `FULL OUTER` between unnest tables; comma between them is a cross join. Joins anywhere else stay rejected.
+- `INNER`, `LEFT`, `FULL OUTER` between row tables - unnest tables, CTEs and views, struct row tables, `generate_series`; comma between them is a cross join. Joins at input level stay rejected.
 - Result order: the left side's track order; a FULL join appends unmatched right rows after, in their order.
 - Real join multiplicity: one row matching two pairs with both. To pair a 5.1 and a stereo English track separately, widen the key: `ON a.tags.language = b.tags.language AND a.channel_layout = b.channel_layout`.
 - `ON` takes the same grammar as `WHERE`, column vs column or literal. A bare row alias is a stream, not a value to compare, so it is not usable inside `ON`.
 
-An outer join's gap side is a NULL row. Selecting it bare is a typed rejection; fill it with `COALESCE`, by stream type: **audio** `ffmpeg.anullsrc(...)` (silence; `duration` inherits from the paired track when omitted, and no duration anywhere is a rejection), **video** `ffmpeg.color(...)` (black by default; `size`/`rate`/`duration` inherit), **captions** `ffrwd.empty_captions()` (a zero-cue subtitle track as one extra `data:`-URI input). Fills carry the paired row's tags, so a silence-filled French slot still emits `-metadata:s:N language=fra`. The pattern is [recipe 27](examples.md#27-concatenate-files-with-different-track-counts).
+An outer join's gap side is a NULL row. Selecting it bare is a typed rejection - except at a manifest destination (`WITH (format 'hls')` / `'dash'`), where the gap is the variant map's own vocabulary for "this kind absent" ([dialect.md](dialect.md#destinations-and-options)). Elsewhere, fill it with `COALESCE`, by stream type: **audio** `ffmpeg.anullsrc(...)` (silence; `duration` inherits from the paired track when omitted, and no duration anywhere is a rejection), **video** `ffmpeg.color(...)` (black by default; `size`/`rate`/`duration` inherit), **captions** `ffrwd.empty_captions()` (a zero-cue subtitle track as one extra `data:`-URI input). Fills carry the paired row's tags, so a silence-filled French slot still emits `-metadata:s:N language=fra`. The pattern is [recipe 27](examples.md#27-concatenate-files-with-different-track-counts).
 
 ## Tags
 

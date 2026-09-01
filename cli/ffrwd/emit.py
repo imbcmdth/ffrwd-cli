@@ -928,11 +928,16 @@ def _render_container_tags(tags: dict[str, str | None]) -> list[str]:
 def _render_option_value(spec: SinkOptionSpec, value: object) -> str | None:
     """Render one option's value per its spec, or None to omit it entirely.
 
-    A bool value of False is always omitted (e.g. plain ``faststart false``);
-    every other value renders via ``spec.value_template.format(v=value)``.
+    A None value is a NULL element of a per-track list -- absence, so the
+    track keeps the encoder's own default. A False bool renders its spec's
+    ``false_template`` (``-use_template 0``) and is otherwise omitted (plain
+    ``faststart false``); every other value renders via
+    ``spec.value_template.format(v=value)``.
     """
-    if spec.type == "bool" and value is not True:
+    if value is None:
         return None
+    if spec.type == "bool" and value is not True:
+        return spec.false_template or None
     return spec.value_template.format(v=value)
 
 
