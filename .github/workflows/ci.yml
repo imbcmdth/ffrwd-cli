@@ -35,6 +35,21 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      # The platform-marked ffrwd-wasm pin names this release's version,
+      # whose wheels publish only when the tag lands -- so CI satisfies it
+      # from the workspace, the same way the release workflow does.
+      - name: Set up Rust (early, for the sidecar wheel)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+
+      - name: Build and install the workspace sidecar wheel
+        working-directory: sidecar/ffrwd-wasm
+        run: |
+          pip install maturin
+          maturin build --release --out dist
+          pip install dist/*.whl
+
       - name: Install ffrwd with dev extras
         run: pip install -e .[dev]
 
