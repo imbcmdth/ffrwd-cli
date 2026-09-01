@@ -20,7 +20,7 @@ const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{},"additionalPrope
 const ROWS_SCHEMA: &str = r#"{"type":"object","properties":{"codec":{"type":"string"},"packets":{"type":"integer"}},"additionalProperties":false}"#;
 
 thread_local! {
-    static STATE: RefCell<(String, u64)> = RefCell::new((String::new(), 0));
+    static STATE: RefCell<(String, u64)> = const { RefCell::new((String::new(), 0)) };
 }
 
 struct Adapted0110;
@@ -62,9 +62,8 @@ impl Guest for Adapted0110 {
             state.1 += packets.len() as u64;
             let mut trailing = Vec::new();
             if last {
-                trailing.push(
-                    serde_json::json!({ "codec": state.0, "packets": state.1 }).to_string(),
-                );
+                trailing
+                    .push(serde_json::json!({ "codec": state.0, "packets": state.1 }).to_string());
             }
             Processed {
                 rows: vec![],

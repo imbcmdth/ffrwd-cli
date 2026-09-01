@@ -12,7 +12,7 @@ wit_bindgen::generate!({
 use std::cell::RefCell;
 
 use exports::ffrwd::av::packet_sink::{
-    Arity, Guest, InputStream, Meta, PacketSinkMeta, PadPackets, Packet, Processed,
+    Arity, Guest, InputStream, Meta, Packet, PacketSinkMeta, PadPackets, Processed,
 };
 use serde::Serialize;
 
@@ -203,6 +203,7 @@ mod tests {
         Packet {
             pts,
             dts: Some(pts),
+            duration: None,
             keyframe,
             data: vec![0; len],
         }
