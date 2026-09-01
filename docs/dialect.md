@@ -77,22 +77,21 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   destination: `COPY (SELECT <streams>) TO name(<values>)`. The SELECT
   list carries the streams it reads - and the annotation rows riding
   them - the way any consumer's arguments do; the call after `TO`
-  carries its value parameters. A sink reads SEVERAL streams where its
-  signature says so: an arrayed parameter (`video_stream[]`,
-  `audio_stream[]`) takes every stream of its kind the SELECT carries,
-  in SELECT order, and a bare one takes exactly one - so a query
-  gathering N renditions with `array_agg` hands all N to ONE instance
-  rather than opening N of them. A sink may declare a parameter of each
-  kind; how many of each it reads is the module's own declaration, and a
-  count that disagrees with it is refused at the call. It writes nothing
-  back: the module's own effects - an HTTP POST, a live broadcast, a
-  line on stderr - are the output, so such a COPY names no file, and the
-  run ends when the input drains. A sink reading DECODED frames takes no
-  `WITH` options, its value arguments being what configures it; one
-  reading ENCODED packets takes the video encoder options, which shape
-  what the feeding ffmpeg puts on the wire - and a value read once per
-  row shapes each stream separately, the way it does for a file. A sink
-  call anywhere else is refused. A
+  carries its value parameters. An arrayed parameter
+  (`video_stream[]`, `audio_stream[]`) takes every stream of its kind
+  the SELECT carries, in SELECT order; a bare one takes exactly one. A
+  ladder gathered with `array_agg` is one instance reading every rung,
+  where a fan-out `TO` is one instance per file. How many streams of
+  each kind a module reads is its own declaration, and a call whose
+  count disagrees is refused. A sink writes nothing back: the module's
+  own effects - an HTTP POST, a live broadcast, a line on stderr - are
+  the output, so such a COPY names no file, and the run ends when the
+  input drains. A sink reading decoded frames takes no `WITH` options;
+  its value arguments configure it. One reading encoded packets sits
+  behind an encoder the compiler places, whatever feeds it, and the
+  COPY's `WITH` options shape that encoder the way they shape a
+  file's - a value read once per row shapes each stream separately. A
+  sink call anywhere else is refused. A
   module importing `wasi:http` or `wasi:sockets` runs only under the
   sidecar's matching per-module grant (`-http <module>`,
   `-net <module>`), which the compiler emits from the module's own

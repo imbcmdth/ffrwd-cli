@@ -2546,9 +2546,36 @@ ffmpeg -i tests/fixtures/av.mp4 -map 0:v:0 -c:0 libx265 -pix_fmt:0 yuv420p -crf:
 
 The encode happens on the feeder's way out, after its filtergraph:
 `scale` the stream in the SELECT and the resize runs on decoded
-frames, with only the sink's own edge carrying the encode. The rows
-ride the sidecar's stdout, one JSON object per line - redirect them
-to keep them.
+frames, with only the sink's own edge carrying the encode. That holds
+whatever feeds the sink - a module's output gets an encoding stage of
+its own on the way in. A sink declaring an audio parameter takes the
+audio options too. The rows ride the sidecar's stdout, one JSON
+object per line - redirect them to keep them.
+
+An arrayed parameter reads every stream of its kind the SELECT
+carries: gather a ladder and one instance reads every rung, each pad
+behind its own encoder, and a `WITH` value read once per row shapes
+each rung separately:
+
+```pgsql
+CREATE FUNCTION packet_tally(v video_stream[]) RETURNS sink
+  AS '../sidecar/modules/target/wasm32-wasip2/release/packet_tally.wasm', 'packet_tally'
+  LANGUAGE wasm;
+
+COPY (
+  SELECT array_agg(scale(s.video[1], ARRAY[640, 320][i.i], -2))
+  FROM input('tests/fixtures/av.mp4') s, generate_series(1, 2) i
+) TO packet_tally() WITH (video_bitrate ARRAY['1200k', '400k'][i.i])
+```
+
+```
+$ ffrwd compile -f query.sql
+# named pipes: sidecar0 reads ffmpeg0, ffmpeg0; ffmpeg0 feeds sidecar0, sidecar0
+1. ffmpeg: ffmpeg -i tests/fixtures/av.mp4 -filter_complex   '[0:v:0]split=2[src_s_v_0_split0][src_s_v_0_split1];[src_s_v_0_split0]scale=width=640:height=-2[out0];[src_s_v_0_split1]scale=width=320:height=-2[out1]'   -map '[out0]' -c:0 libx264 -pix_fmt:0 yuv420p -b:0 1200k -f nut '<named pipe ffmpeg0-sidecar0 n1 write>'   -map '[out1]' -c:0 libx264 -pix_fmt:0 yuv420p -b:0 400k -f nut '<named pipe ffmpeg0-sidecar0 n2 write>'
+2. sidecar: ffrwd-wasm -f nut -i '<named pipe ffmpeg0-sidecar0 n1 read>' -f nut -i '<named pipe ffmpeg0-sidecar0 n2 read>'   -m ../sidecar/modules/target/wasm32-wasip2/release/packet_tally.wasm -f ndjson pipe:1
+```
+
+One decode, one encoder per rung, one instance reading every pad.
 
 ## 101. Read a live source once, however many ways the query uses it
 
