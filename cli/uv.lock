@@ -512,7 +512,7 @@ wheels = [
 
 [[package]]
 name = "ffrwd"
-version = "0.3.0"
+version = "0.4.0"
 source = { editable = "." }
 dependencies = [
     { name = "ffrwd-wasm", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine in 'x86_64 aarch64' and sys_platform == 'linux') or (platform_machine in 'AMD64 ARM64' and sys_platform == 'win32')" },
@@ -540,9 +540,9 @@ mcp = [
 [package.metadata]
 requires-dist = [
     { name = "ffrwd", extras = ["mcp"], marker = "extra == 'dev'" },
-    { name = "ffrwd-wasm", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", specifier = "==0.3.0" },
-    { name = "ffrwd-wasm", marker = "platform_machine in 'x86_64 aarch64' and sys_platform == 'linux'", specifier = "==0.3.0" },
-    { name = "ffrwd-wasm", marker = "platform_machine in 'AMD64 ARM64' and sys_platform == 'win32'", specifier = "==0.3.0" },
+    { name = "ffrwd-wasm", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", directory = "../sidecar/ffrwd-wasm" },
+    { name = "ffrwd-wasm", marker = "platform_machine in 'x86_64 aarch64' and sys_platform == 'linux'", directory = "../sidecar/ffrwd-wasm" },
+    { name = "ffrwd-wasm", marker = "platform_machine in 'AMD64 ARM64' and sys_platform == 'win32'", directory = "../sidecar/ffrwd-wasm" },
     { name = "hypothesis", marker = "extra == 'dev'" },
     { name = "imagehash", marker = "extra == 'dev'" },
     { name = "markdown-it-py" },
@@ -558,17 +558,8 @@ provides-extras = ["mcp", "diagram", "dev"]
 
 [[package]]
 name = "ffrwd-wasm"
-version = "0.3.0"
-source = { registry = "https://pypi.org/simple" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/07/49/4ab5fd35383ff7720ab8076fbf9e0f6c0eb599924a9349571add8ff5edec/ffrwd_wasm-0.2.3-py3-none-macosx_11_0_arm64.whl", hash = "sha256:00a3226ed4345e2967fd7036a0411ce8f1f8cb9661cf59677020f63aafc9d615", size = 7457704, upload-time = "2026-08-31T17:50:04.096Z" },
-    { url = "https://files.pythonhosted.org/packages/9f/e1/c8de2dadc3dadbd1e8bfcf0f2d2333c5a82caba8bf3a42e5151671c4f55b/ffrwd_wasm-0.2.3-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:0d6aa5ed8a74cf544f5c2a33d48beccdffd40bf1a73dc568369b577be79dab7e", size = 8562042, upload-time = "2026-08-31T17:50:05.827Z" },
-    { url = "https://files.pythonhosted.org/packages/4b/25/2866bc79a9f344654b8e541c7f221f4bb685985fc9a331e864fbd9707ba9/ffrwd_wasm-0.2.3-py3-none-manylinux_2_28_aarch64.whl", hash = "sha256:8670c2db4ea717195d12970fb6a674bca3faca42f06bfb04fa794b9a345677ff", size = 8434069, upload-time = "2026-08-31T17:50:07.657Z" },
-    { url = "https://files.pythonhosted.org/packages/4c/a2/e0646c80fe9ead9fbcbe032f353733d4c37e1e9e31caec091ee1a602be61/ffrwd_wasm-0.2.3-py3-none-musllinux_1_2_aarch64.whl", hash = "sha256:b53f30d80b7c6491f43d82662146eea63814a371e3c00a544e1a234fa5e837b2", size = 8528082, upload-time = "2026-08-31T17:50:09.707Z" },
-    { url = "https://files.pythonhosted.org/packages/04/4d/75c1a229f391c31b28fc53c892d19cf9187769fd5d643405abe1428b41c4/ffrwd_wasm-0.2.3-py3-none-musllinux_1_2_x86_64.whl", hash = "sha256:07293a393824726a3c58dd48fcc06b3d60e94d6fc2040eaa8c0e0b503b4bc0e0", size = 9338456, upload-time = "2026-08-31T17:50:11.73Z" },
-    { url = "https://files.pythonhosted.org/packages/76/00/e09d2de50776b2b3a9fb843698921354517a6672fe79dce61050e1cbbd95/ffrwd_wasm-0.2.3-py3-none-win_amd64.whl", hash = "sha256:6865cace20f3e0a03b8de1e044211acc00e4cc6a79064603cab9db57d6f82ceb", size = 7462451, upload-time = "2026-08-31T17:50:13.607Z" },
-    { url = "https://files.pythonhosted.org/packages/02/0b/9458bc0605dcbc8d8d461b31ae12c2ecedf4623fc4a3da8f5bdc10edc427/ffrwd_wasm-0.2.3-py3-none-win_arm64.whl", hash = "sha256:bcd013a82fa3de8d4a4a27ca10ad74074694dcb4a48eec5f3bec1fcf8a661e72", size = 6384597, upload-time = "2026-08-31T17:50:15.316Z" },
-]
+version = "0.4.0"
+source = { directory = "../sidecar/ffrwd-wasm" }
 
 [[package]]
 name = "filelock"
