@@ -1545,6 +1545,15 @@ _REPAIR: dict[ErrorCode, str] = {
         "two paths meet -- apply it after they meet, or drop it -- or record "
         "the input to a file first and write the query over the file."
     ),
+    ErrorCode.STARTUP_DEADLOCK: (
+        "The query splits one input's streams apart and brings them back "
+        "together in a way whose processes would each be waiting on the next "
+        "before any of them could read or write; `message` names them in the "
+        "order they wait. Rewrite the query with one fewer place where the "
+        "streams off a single input split and rejoin -- most often by taking "
+        "a module out of the middle of one leg -- or write it over a recorded "
+        "file rather than the live input."
+    ),
     ErrorCode.INTERNAL: (
         "A compiler bug, not your SQL. Re-emit the simplest query that still "
         "expresses the request and report the original as a bug."

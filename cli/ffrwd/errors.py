@@ -33,6 +33,7 @@ class ErrorCode(str, Enum):
     PLAYER_NOT_FOUND = "PLAYER_NOT_FOUND"  # --show asked for, ffplay not on PATH
     UNBOUNDED_LIVE_INPUT = "UNBOUNDED_LIVE_INPUT"  # one-open input, uncountable paths
     BUFFER_OVERFLOW = "BUFFER_OVERFLOW"  # a run-time edge outgrew its computed bound
+    STARTUP_DEADLOCK = "STARTUP_DEADLOCK"  # no pipe order lets every process start
     INTERNAL = "INTERNAL"  # bug backstop; fuzz asserts this never fires
 
 

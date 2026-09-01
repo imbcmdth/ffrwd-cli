@@ -39,6 +39,7 @@
         "PLAYER_NOT_FOUND",
         "UNBOUNDED_LIVE_INPUT",
         "BUFFER_OVERFLOW",
+        "STARTUP_DEADLOCK",
         "INTERNAL"
       ]
     },

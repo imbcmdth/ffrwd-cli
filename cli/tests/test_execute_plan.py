@@ -356,20 +356,25 @@ def _live_merge(width: int = 640, height: int = 360) -> ProcessPlan:
 
 
 def test_the_one_reader_of_a_live_input_writes_a_pipe_per_consumer() -> None:
-    """The whole argv: one -i over the socket, its split, and two outputs."""
+    """The whole argv: one -i over the socket, its split, and two outputs.
+
+    The module's pipe is the FIRST output: the sidecar drains it from the
+    moment it exists, where the merge drains nothing until the module has
+    spoken -- so the module's feed cannot sit behind the merge's.
+    """
     plan = _live_merge()
     argv = plan_argv(plan, sidecar_argv=_stand_in, pipe_path=_named)
 
     assert argv["ffmpeg1"] == [
         "ffmpeg",
         "-i", LIVE,
-        "-filter_complex", "[0:v:0]split=2[out1][out0]",
+        "-filter_complex", "[0:v:0]split=2[out0][out1]",
         "-map", "[out0]",
-        "-c:0", "rawvideo", "-pix_fmt:0", "yuv420p", "-f", "nut",
-        "/pipes/ffmpeg1-ffmpeg0-write",
-        "-map", "[out1]",
         "-c:0", "rawvideo", "-pix_fmt:0", "rgba", "-f", "nut",
         "/pipes/ffmpeg1-sidecar0-write",
+        "-map", "[out1]",
+        "-c:0", "rawvideo", "-pix_fmt:0", "yuv420p", "-f", "nut",
+        "/pipes/ffmpeg1-ffmpeg0-write",
     ]  # fmt: skip
     assert argv["ffmpeg0"] == [
         "ffmpeg",
@@ -392,7 +397,8 @@ def test_a_depth_too_deep_for_a_pipe_puts_the_fifo_muxer_on_the_edge() -> None:
         "-fifo_format", "nut", "-queue_size", "2", "-f", "fifo",
     ]  # fmt: skip
     # The other edge holds nothing, so it is a plain pipe as it always was.
-    assert words[-3:] == ["-f", "nut", "/pipes/ffmpeg1-sidecar0-write"]
+    sidecar = words.index("/pipes/ffmpeg1-sidecar0-write")
+    assert words[sidecar - 2 : sidecar] == ["-f", "nut"]
 
 
 def test_a_bounded_edge_asks_for_a_pipe_sized_from_its_bound() -> None:

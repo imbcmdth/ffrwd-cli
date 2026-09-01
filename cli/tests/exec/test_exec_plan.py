@@ -319,12 +319,18 @@ def _sleeper(process: SidecarProcess, reads: Sequence[str]) -> list[str]:
     return [sys.executable, "-c", "import time; time.sleep(30)"]
 
 
-def _live_merge(out_path: Path, duration: int) -> ProcessPlan:
+def _live_merge(
+    out_path: Path, duration: int, *, module_first: bool = False
+) -> ProcessPlan:
     """A one-open source split two ways, both legs merged back together.
 
     A lavfi graph is one-open the way a camera is, so ONE process reads it and
     hands each leg a pipe -- and the buffers on those pipes are sized from the
     bound the compiler computed for them.
+
+    `module_first` writes the merge's two arguments the other way round, which
+    is the only difference between the shape that used to stream and the one
+    that used to wedge before a frame moved.
     """
     g = Graph(
         input_paths=[f"testsrc2=size=1920x1080:rate=25:duration={duration}"],
@@ -342,7 +348,11 @@ def _live_merge(out_path: Path, duration: int) -> ProcessPlan:
         id="e0", filter="negate", args={}, inputs=["sp:0"], outputs=["video"]
     )
     g.nodes["n0"] = Node(
-        id="n0", filter="hstack", args={}, inputs=["sp:1", "e0"], outputs=["video"]
+        id="n0",
+        filter="hstack",
+        args={},
+        inputs=["e0", "sp:1"] if module_first else ["sp:1", "e0"],
+        outputs=["video"],
     )
     g.sinks = [
         SinkUnit(
@@ -403,3 +413,30 @@ def test_a_stage_that_keeps_moving_is_never_called_full(tmp_path: Path) -> None:
         for m in stage.members
     )
     assert out_path.exists()
+
+
+@pytest.mark.parametrize("module_first", [False, True], ids=["direct", "module"])
+def test_either_way_round_the_merge_is_written_the_run_starts(
+    tmp_path: Path, module_first: bool
+) -> None:
+    """The two spellings of one merge, and both run to the same file.
+
+    Which argument of the merge is written first decides nothing about the
+    plan: the compiler puts the pipes in the order it has worked out either
+    way, and this is that claim against a real ffmpeg rather than an argv.
+    """
+    out_path = tmp_path / f"merged-{int(module_first)}.mp4"
+    result = execute_plan(
+        _live_merge(out_path, duration=1, module_first=module_first),
+        sidecar_argv=_negate,
+        timeout=_STAGE_TIMEOUT,
+        overwrite=True,
+    )
+
+    assert result.overflow is None, str(result.overflow)
+    assert result.exit_code == 0, "\n".join(
+        f"{m.id} exited {m.exit_code}: {m.stderr_tail}"
+        for stage in result.stages
+        for m in stage.members
+    )
+    assert out_path.stat().st_size > 0

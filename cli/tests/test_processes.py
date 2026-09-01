@@ -969,10 +969,13 @@ def test_one_process_reads_a_live_input_however_the_graph_splits() -> None:
     # The split moved into the reader, and each of its pads leaves on a pipe.
     assert list(reader.graph.nodes) == ["sp"]
     assert [unit.path for unit in reader.graph.sinks] == [PIPE, PIPE]
+    # In the order the plan starts them: the module's feed first, since the
+    # sidecar is the one consumer draining from the moment it exists; then
+    # the merge's, and the module's own output after the frames it is made of.
     assert [(e.source, e.target) for e in plan.stream_edges] == [
+        ("ffmpeg1", "sidecar0"),
         ("ffmpeg1", "ffmpeg0"),
         ("sidecar0", "ffmpeg0"),
-        ("ffmpeg1", "sidecar0"),
     ]
 
 

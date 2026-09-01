@@ -1451,8 +1451,12 @@ def _pump(source: _End, dest: _End, deadline: float, flow: Flow | None = None) -
     feeds two paths that meet again -- the process that would round the chunk
     up is itself waiting for the frame the held-back tail completes.
 
-    Reading runs in a thread of its own so the producer is never held up by a
-    consumer that is momentarily behind (:func:`_read_ahead`).
+    Reading runs in a thread of its own, and starts as soon as the PRODUCING
+    end is open rather than once both are: the consumer may still be opening
+    an earlier input of its own, and a producer left unread until then fills
+    its pipe and stops before it writes the output that earlier input is
+    waiting for. How far it reads ahead of the consumer is the depth the
+    compiler counted (:func:`_read_ahead`).
 
     `flow` is where the copy records what it has moved and when, and marks
     itself as waiting on the consuming end -- which is what makes a full
@@ -1462,8 +1466,12 @@ def _pump(source: _End, dest: _End, deadline: float, flow: Flow | None = None) -
     reading: threading.Thread | None = None
     try:
         reader = source.open(deadline)
-        writer = dest.open(deadline)
+        # Reading starts before the consuming end is even open: ffmpeg opens
+        # its inputs one at a time, so a producer whose first output nobody is
+        # taking yet stops before it reaches the output the consumer is
+        # actually waiting on.
         reading = _start(_fill, reader, ahead)
+        writer = dest.open(deadline)
         while (chunk := ahead.take()) is not None:
             if flow is not None:
                 flow.writing = True

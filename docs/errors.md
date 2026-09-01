@@ -539,6 +539,20 @@ Like `NOTHING_TO_SHOW` and `PLAYER_NOT_FOUND` this is no compile's, so `ffrwd pr
 error: BUFFER_OVERFLOW: the pipe buffer carrying 'src_a_v_0_split:1' from ffmpeg1 to ffmpeg0 overflowed: it was sized for the 2 frames the compiler bounded it at, and with every process still running nothing has crossed any pipe of this stage for 30s (hint: the paths out of the one process reading the input drifted further apart than the compiler counted them: record the input to a file and run this query over the file, or take the slower path's work out of the pipeline)
 ```
 
+## STARTUP_DEADLOCK
+
+**Meaning:** The plan's processes would each wait on the next before any of them could read or write, so the run could never reach its first frame. ffmpeg opens its inputs one at a time and writes its outputs interleaved, so a process blocked opening its first pipe is not draining the pipes it already opened - and the producer filling one of those stops before it reaches the output the blocked open is waiting for. The compiler chooses the order of every pipe to avoid that; this is the plan no order avoids it for.
+
+**Fires when:** the compiler could find no order of a plan's pipes that starts. It is the check on the pass that picks that order, not a rejection any query is known to reach: for every plan shape ffrwd builds today an order exists and is found. What it guards against is a plan whose order is not the compiler's to pick - a track pinned to the head of an `-i` list, a module process whose own pipes are spelled for it - ending up in a cycle nothing would otherwise report until the run had stood still for thirty seconds.
+
+**Error JSON:**
+
+```json
+{"line": 1, "col": 17, "code": "STARTUP_DEADLOCK", "message": "these processes cannot start, each waiting on the next: ffmpeg1 waits to write output 1, ffmpeg2 waits for every input it reads, ffmpeg2 waits to open input 1, and ffmpeg1 again", "hint": "each of those processes is waiting for the one after it before it can read or write anything: give the query one fewer place where the streams off a single input split apart and come back together, or record the input to a file and run the query over the file"}
+```
+
+The message walks the cycle in the order the processes wait, so the way out is visible from it: break the query where two of the named processes meet. The anchor is the module declaration that put a second process in the plan.
+
 ## INTERNAL
 
 **Bug backstop, not a user-input error.** Every compiler pass (`parse`, `lower`, `insert_splits`, via `compile_sql`) wraps its body in a catch-all that converts any unexpected exception (a sqlglot internal, a `RecursionError` on a pathologically nested query, or an actual bug in ffrwd) into `ErrorCode.INTERNAL` rather than letting a raw traceback escape (guardrail #7: no panics on user input, ever). The fuzz corpus in `tests/test_fuzz.py` asserts this code never fires across its mutated queries. If you see `INTERNAL` in the wild, ffrwd has a bug, and we would genuinely like the query that triggered it. No example JSON here, because no known SQL input reaches this path, and we intend to keep it that way.

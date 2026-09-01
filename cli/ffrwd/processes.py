@@ -2507,11 +2507,22 @@ def partition(
     ``UNBOUNDED_LIVE_INPUT`` -- already anchored, from `anchors` -- for a live
     input feeding two paths whose difference has no compile-time size.
 
+    The finished plan's pipes are then put in an order every process can
+    start from (:func:`ffrwd.startup.arrange`), and a plan no order starts is
+    refused there.
+
     Pure: returns a new plan and never mutates `g`.
     """
-    return _Partitioner(
+    # Imported here: startup reads a finished plan, so it is built on top of
+    # this module rather than beside it.
+    from . import startup
+
+    plan = _Partitioner(
         g, external, probes, pix_fmts, shapes, audio_wires, models, effects, anchors
     ).run()
+    plan = startup.arrange(plan)
+    startup.check(plan)
+    return plan
 
 
 def from_commands(graphs: Sequence[Graph]) -> ProcessPlan:

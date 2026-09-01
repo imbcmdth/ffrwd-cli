@@ -2611,15 +2611,15 @@ COPY (
 
 ```
 $ ffrwd compile -f query.sql
-# named pipes: ffmpeg0 reads ffmpeg1, sidecar0; ffmpeg1 feeds ffmpeg0, sidecar0
+# named pipes: ffmpeg0 reads ffmpeg1, sidecar0; ffmpeg1 feeds sidecar0, ffmpeg0
 1. ffmpeg: ffmpeg -f nut -i '<named pipe ffmpeg1-ffmpeg0 src_a_v_0_split:1 read>' -f nut \
   -i '<named pipe sidecar0-ffmpeg0 n1 read>' -filter_complex \
   '[0:v:0][1:v:0]hstack=inputs=2[out0]' -map '[out0]' -c:0 libx264 -crf:0 22 live.mp4
 2. ffmpeg: ffmpeg -f lavfi -re -i testsrc2=size=640x360:rate=30:duration=5 \
-  -filter_complex '[0:v:0]split=2[out1][out0]' -map '[out0]' -c:0 rawvideo -pix_fmt:0 \
-  yuv420p -f nut '<named pipe ffmpeg1-ffmpeg0 src_a_v_0_split:1 write>' -map '[out1]' \
-  -c:0 rawvideo -pix_fmt:0 rgba -f nut \
-  '<named pipe ffmpeg1-sidecar0 src_a_v_0_split:0 write>'
+  -filter_complex '[0:v:0]split=2[out0][out1]' -map '[out0]' -c:0 rawvideo -pix_fmt:0 \
+  rgba -f nut '<named pipe ffmpeg1-sidecar0 src_a_v_0_split:0 write>' -map '[out1]' -c:0 \
+  rawvideo -pix_fmt:0 yuv420p -f nut \
+  '<named pipe ffmpeg1-ffmpeg0 src_a_v_0_split:1 write>'
 3. sidecar: ffrwd-wasm -f nut -i pipe:0 -m \
   ../sidecar/modules/target/wasm32-wasip2/release/invert.wasm -f nut pipe:1
 # this listing is not a shell command -- run the plan with `ffrwd run`
@@ -2663,15 +2663,15 @@ COPY (
 
 ```
 $ ffrwd compile -f query.sql
-# named pipes: ffmpeg0 reads ffmpeg1, sidecar0; ffmpeg1 feeds ffmpeg0, sidecar0
+# named pipes: ffmpeg0 reads ffmpeg1, sidecar0; ffmpeg1 feeds sidecar0, ffmpeg0
 1. ffmpeg: ffmpeg -f nut -i '<named pipe ffmpeg1-ffmpeg0 src_a_v_0_split:1 read>' -f nut \
   -i '<named pipe sidecar0-ffmpeg0 n1 read>' -filter_complex \
   '[0:v:0][1:v:0]hstack=inputs=2[out0]' -map '[out0]' -c:0 libx264 -crf:0 22 live.mp4
 2. ffmpeg: ffmpeg -f lavfi -re -i testsrc2=size=1920x1080:rate=30:duration=5 \
-  -filter_complex '[0:v:0]split=2[out1][out0]' -map '[out0]' -c:0 rawvideo -pix_fmt:0 \
-  yuv420p -fifo_format nut -queue_size 2 -f fifo \
-  '<named pipe ffmpeg1-ffmpeg0 src_a_v_0_split:1 write>' -map '[out1]' -c:0 rawvideo \
-  -pix_fmt:0 rgba -f nut '<named pipe ffmpeg1-sidecar0 src_a_v_0_split:0 write>'
+  -filter_complex '[0:v:0]split=2[out0][out1]' -map '[out0]' -c:0 rawvideo -pix_fmt:0 \
+  rgba -f nut '<named pipe ffmpeg1-sidecar0 src_a_v_0_split:0 write>' -map '[out1]' -c:0 \
+  rawvideo -pix_fmt:0 yuv420p -fifo_format nut -queue_size 2 -f fifo \
+  '<named pipe ffmpeg1-ffmpeg0 src_a_v_0_split:1 write>'
 3. sidecar: ffrwd-wasm -f nut -i pipe:0 -m \
   ../sidecar/modules/target/wasm32-wasip2/release/invert.wasm -f nut pipe:1
 # this listing is not a shell command -- run the plan with `ffrwd run`
