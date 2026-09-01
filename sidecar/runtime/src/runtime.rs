@@ -852,6 +852,9 @@ pub enum Arity {
     One,
     /// One or more, as many as the query hands over.
     Many,
+    /// As many as the query hands over, none included: the sink reads
+    /// them when they are there and works when they are not.
+    Any,
 }
 
 impl Arity {
@@ -861,6 +864,7 @@ impl Arity {
             Arity::Zero => count == 0,
             Arity::One => count == 1,
             Arity::Many => count >= 1,
+            Arity::Any => true,
         }
     }
 
@@ -870,6 +874,7 @@ impl Arity {
             Arity::Zero => format!("no {kind} stream"),
             Arity::One => format!("one {kind} stream"),
             Arity::Many => format!("one or more {kind} streams"),
+            Arity::Any => format!("any number of {kind} streams"),
         }
     }
 }
@@ -2589,6 +2594,7 @@ impl PacketInstance {
                     Wit::Zero => Arity::Zero,
                     Wit::One => Arity::One,
                     Wit::Many => Arity::Many,
+                    Wit::Any => Arity::Any,
                 };
                 let d = b
                     .ffrwd_av_packet_sink()

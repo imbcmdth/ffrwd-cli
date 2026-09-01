@@ -789,7 +789,7 @@ def _wire_options(wire: StreamFormat, buffer: EdgeBuffer | None = None) -> dict[
     renders nothing here.
     """
     if isinstance(wire, AudioFormat):
-        written: dict[str, object] = {"audio_codec": wire.codec}
+        written: dict[str, object] = {"audio_codec": wire.codec, **dict(wire.options)}
     elif wire.codec == COPY_CODEC:
         # A copied stream keeps the pixel format it was encoded with; naming
         # one would be an instruction to a decoder that never runs.

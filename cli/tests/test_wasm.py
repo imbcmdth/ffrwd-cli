@@ -3964,6 +3964,9 @@ def _packet_described(
     name: str = "packet_stats",
     world: str = "ffrwd:av@0.10.0",
     codecs: tuple[str, ...] = (),
+    audio_codecs: tuple[str, ...] = (),
+    video_streams: wasm.SinkArity = "one",
+    audio_streams: wasm.SinkArity = "none",
     rows: bool = True,
 ) -> Described:
     return Described(
@@ -3973,6 +3976,9 @@ def _packet_described(
         params_schema={"type": "object", "additionalProperties": False, "properties": {}},
         rows_schema=PACKET_ROWS_SCHEMA if rows else None,
         codecs=codecs,
+        audio_codecs=audio_codecs,
+        video_streams=video_streams,
+        audio_streams=audio_streams,
     )
 
 
@@ -4188,17 +4194,101 @@ def test_an_option_that_shapes_no_encoder_is_refused() -> None:
     assert "video encoder options" in (error.hint or "")
 
 
-def test_an_audio_declaration_over_a_packet_sink_is_refused() -> None:
-    """Not the module's doing: the sidecar's stream edge carries encoded
-    video and nothing else, so an audio pad has no wire to arrive on."""
+AUDIO_SINK_SQL = (
+    "CREATE FUNCTION packet_stats(v video_stream, a audio_stream) RETURNS sink\n"
+    f"  AS '{PACKET_MODULE}', 'packet_stats' LANGUAGE wasm;\n"
+    "COPY (SELECT f.video[1], f.audio[1] FROM input('a.mp4') f) TO packet_stats()"
+)
+
+
+def test_an_audio_stream_reaches_a_packet_sink_that_reads_one() -> None:
+    """The stream edge carries encoded audio, so an audio pad has a wire to
+    arrive on: the feeding ffmpeg encodes it rather than writing pcm."""
+    plan = _packet_plan(
+        AUDIO_SINK_SQL,
+        _packet_described(audio_codecs=("aac",), audio_streams="one"),
+    ).plan
+    assert plan is not None
+    argv = plan_argv(
+        plan,
+        sidecar_argv=wasm.shown_argv,
+        pipe_path=lambda edge, side: f"pipes/{edge.ref}-{side}",
+    )[plan.ffmpeg[0].id]
+    assert "aac" in argv, argv
+    assert not any(a.startswith("pcm_") for a in argv), argv
+
+
+def test_a_sink_reading_any_audio_takes_a_declaration_with_none() -> None:
+    """`any` is the arity that says "and works without": a query naming only
+    video reaches the same module a query naming both does."""
+    plan = _packet_plan(
+        PACKET_QUERY,
+        _packet_described(audio_codecs=("aac",), audio_streams="any"),
+    ).plan
+    assert plan is not None
+    assert len(plan.sidecars) == 1
+
+
+def test_a_sink_reading_any_audio_takes_several_of_it() -> None:
+    """`any` accepts what `many` does as well: a declaration that can hand
+    over SEVERAL streams of the kind."""
     sql = (
-        "CREATE FUNCTION packet_stats(a audio_stream) RETURNS sink\n"
+        "CREATE FUNCTION packet_stats(v video_stream, a audio_stream, b audio_stream)\n"
+        "  RETURNS sink\n"
         f"  AS '{PACKET_MODULE}', 'packet_stats' LANGUAGE wasm;\n"
-        "COPY (SELECT f.audio[1] FROM input('a.mp4') f) TO packet_stats()"
+        "COPY (SELECT s.video[1], s.audio[1], s.audio[2] "
+        "FROM input('a.mp4') s) TO packet_stats()"
     )
-    error = _packet_rejects(sql, "reads an audio stream")
-    assert "h264, hevc or av1" in error.message
-    assert "video_stream[]" in (error.hint or "")
+    plan = _packet_plan(
+        sql, _packet_described(audio_codecs=("aac",), audio_streams="any")
+    ).plan
+    assert plan is not None
+
+
+def test_a_sink_reading_one_audio_refuses_several_of_it() -> None:
+    sql = (
+        "CREATE FUNCTION packet_stats(v video_stream, a audio_stream, b audio_stream)\n"
+        "  RETURNS sink\n"
+        f"  AS '{PACKET_MODULE}', 'packet_stats' LANGUAGE wasm;\n"
+        "COPY (SELECT s.video[1], s.audio[1], s.audio[2] "
+        "FROM input('a.mp4') s) TO packet_stats()"
+    )
+    _packet_rejects(
+        sql,
+        "reads one audio stream",
+        _packet_described(audio_codecs=("aac",), audio_streams="one"),
+    )
+
+
+def test_a_sink_reading_one_audio_refuses_a_declaration_with_none() -> None:
+    """`one` and `many` still mean what they said: the kind must arrive."""
+    _packet_rejects(
+        PACKET_QUERY,
+        "declares no audio_stream parameter",
+        _packet_described(audio_codecs=("aac",), audio_streams="one"),
+    )
+
+
+def test_an_audio_codec_the_edge_cannot_carry_is_refused() -> None:
+    """The refusal that remains: the edge hands through the codecs the
+    sidecar's NUT reader names, and nothing else."""
+    error = _packet_rejects(
+        AUDIO_SINK_SQL,
+        "consumes opus audio",
+        _packet_described(audio_codecs=("opus",), audio_streams="one"),
+    )
+    assert "aac" in error.message
+
+
+def test_an_audio_encoder_writing_what_the_edge_cannot_carry_is_refused() -> None:
+    error = _packet_rejects(
+        AUDIO_SINK_SQL.replace(
+            "TO packet_stats()", "TO packet_stats() WITH (audio_codec 'libmp3lame')"
+        ),
+        "encodes none of them",
+        _packet_described(audio_codecs=("aac",), audio_streams="one"),
+    )
+    assert "aac" in error.message
 
 
 def test_a_packet_module_declared_as_a_frame_filter_is_refused() -> None:
@@ -4492,7 +4582,8 @@ def test_a_per_pad_option_over_more_rows_than_pads_is_refused() -> None:
     )
     error = _ladder_rejects(sql, "read once per row over 3 rows")
     assert error.code is ErrorCode.ROW_COUNT_MISMATCH
-    assert "reads 1 stream" in error.message
+    # The count is of the option's own kind: a video option binds video pads.
+    assert "reads 1 video stream" in error.message
 
 
 def test_the_ladder_reaches_one_sidecar_reading_every_rendition() -> None:

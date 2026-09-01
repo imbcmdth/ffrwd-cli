@@ -310,6 +310,10 @@ class AudioFormat:
     `required_rate` and `required_channels` are what the MODULE on this edge
     accepts, and are what the producing ffmpeg is told to write; None where
     nothing on the edge names one, and the stream then travels as it is.
+
+    The edge into a PACKET SINK carries the encoder's output instead: `codec`
+    is then the audio encoder, and `options` the validated sink options
+    shaping it, the way :attr:`VideoFormat.options` are.
     """
 
     rate: int | None = None
@@ -318,6 +322,7 @@ class AudioFormat:
     codec: str = PCM_F32LE
     required_rate: int | None = None
     required_channels: int | None = None
+    options: tuple[tuple[str, object], ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         written: dict[str, object] = {
@@ -326,6 +331,8 @@ class AudioFormat:
             "rate": self.rate,
             "channels": self.channels,
         }
+        if self.options:
+            written["options"] = dict(self.options)
         if self.required_rate is not None:
             written["required_rate"] = self.required_rate
         if self.required_channels is not None:
@@ -779,7 +786,7 @@ def _ref_pad(ref: FrameRef) -> int:
     return int(pad) if pad.isdigit() else 0
 
 
-def _ref_type(g: Graph, ref: FrameRef) -> StreamType:
+def ref_type(g: Graph, ref: FrameRef) -> StreamType:
     """The stream type `ref` carries in `g`."""
     if is_src(ref):
         return src_parts(ref)[1]
@@ -1132,7 +1139,7 @@ class _Partitioner:
             refs.extend(o.ref for o in unit.outputs)
         refs.extend(process.pipes)
         for ref in refs:
-            if not is_src(ref) or _ref_type(self.g, ref) not in _PIPED_TYPES:
+            if not is_src(ref) or ref_type(self.g, ref) not in _PIPED_TYPES:
                 continue
             alias = src_parts(ref)[0]
             if ref not in found.setdefault(alias, []):
@@ -1158,7 +1165,7 @@ class _Partitioner:
             (
                 ref
                 for ref in self._reads(process, alias)
-                if _ref_type(self.g, ref) not in _PIPED_TYPES
+                if ref_type(self.g, ref) not in _PIPED_TYPES
             ),
             None,
         )
@@ -1943,7 +1950,7 @@ class _Partitioner:
         Follows the input carrying the same stream type at each node, which is
         the one whose parameters survive the filter.
         """
-        wanted = _ref_type(self.g, ref)
+        wanted = ref_type(self.g, ref)
         seen: set[str] = set()
         current = ref
         while True:
@@ -1957,7 +1964,7 @@ class _Partitioner:
             if not inputs:
                 return None
             current = next(
-                (r for r in inputs if _ref_type(self.g, r) == wanted), inputs[0]
+                (r for r in inputs if ref_type(self.g, r) == wanted), inputs[0]
             )
 
     def _origin_meta(self, ref: FrameRef) -> StreamMeta | None:
@@ -1972,13 +1979,24 @@ class _Partitioner:
 
     def _format(self, ref: FrameRef, target: str | None = None) -> StreamFormat:
         meta = self._origin_meta(ref)
-        if _ref_type(self.g, ref) == "audio":
+        pads = self.g.packet_sinks.get(target) if target is not None else None
+        if ref_type(self.g, ref) == "audio":
+            if pads is not None:
+                # The consumer is a packet sink: this edge carries the audio
+                # encoder's output, not the pcm every other audio edge does.
+                assert target is not None  # `pads` came from it
+                rest = dict(pads[self.g.nodes[target].inputs.index(ref)])
+                return AudioFormat(
+                    rate=meta.sample_rate if meta else None,
+                    channels=meta.channels if meta else None,
+                    codec=str(rest.pop("audio_codec")),
+                    options=tuple(sorted(rest.items())),
+                )
             return replace(
                 self._audio_wire(ref, target),
                 rate=meta.sample_rate if meta else None,
                 channels=meta.channels if meta else None,
             )
-        pads = self.g.packet_sinks.get(target) if target is not None else None
         if pads is not None:
             # The consumer is a packet sink: the edge carries the encoder's
             # output, shaped by the COPY's own options -- this PAD's, since a
@@ -2154,7 +2172,7 @@ class _Partitioner:
                 outputs=[
                     Output(
                         ref=rewrite(ref),
-                        type=_ref_type(self.g, ref),
+                        type=ref_type(self.g, ref),
                         name=None,
                         metadata={},
                     )
@@ -2244,7 +2262,7 @@ class _Partitioner:
                 outputs=[
                     Output(
                         ref=edge.ref,
-                        type=_ref_type(self.g, edge.ref),
+                        type=ref_type(self.g, edge.ref),
                         name=None,
                         metadata={},
                     )
@@ -2263,7 +2281,7 @@ class _Partitioner:
                     outputs=[
                         Output(
                             ref=rows_node,
-                            type=_ref_type(self.g, rows_node),
+                            type=ref_type(self.g, rows_node),
                             name=None,
                             metadata={},
                         )
@@ -2281,7 +2299,7 @@ class _Partitioner:
                     outputs=[
                         Output(
                             ref=name,
-                            type=_ref_type(self.g, name),
+                            type=ref_type(self.g, name),
                             name=None,
                             metadata={},
                         )

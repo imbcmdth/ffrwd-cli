@@ -713,7 +713,7 @@ fn parse_stream(body: &[u8], main: &MainHeader, annotations: bool) -> Result<Str
     };
     if decode_delay != 0 && stream.codec_name().is_none() {
         bail!(
-            "NUT stream of {} declares decode delay {decode_delay}; only an encoded video \
+            "NUT stream of {} declares decode delay {decode_delay}; only an encoded \
              stream reorders frames",
             stream.fourcc_name()
         );

@@ -61,10 +61,12 @@ __all__ = [
     "ANNOTATION_TYPES",
     "ANNOTATIONS_IN",
     "ANNOTATIONS_OUT",
+    "AUDIO_CODEC_ENCODERS",
     "CODEC_ENCODERS",
     "LANGUAGE_TAGS",
     "MODEL_SUFFIX",
     "SAMPLE_FMT_CODECS",
+    "WIRE_AUDIO_CODECS",
     "WIRE_PIX_FMTS",
     "WIRE_SAMPLE_FMTS",
     "WIRE_VIDEO_CODECS",
@@ -76,6 +78,7 @@ __all__ = [
     "Described",
     "DescribedFunction",
     "Invoke",
+    "audio_encoder_codec",
     "describe",
     "encoder_codec",
     "hosts_packet_sink",
@@ -103,8 +106,8 @@ _NULL_FORMAT = "null"
 # module built against an earlier one still describes and runs the same: the
 # worlds have only ever added to what a module may export. A bump is one entry.
 # How many streams of one kind a packet sink reads.
-SinkArity = Literal["none", "one", "many"]
-_SINK_ARITIES = ("none", "one", "many")
+SinkArity = Literal["none", "one", "many", "any"]
+_SINK_ARITIES = ("none", "one", "many", "any")
 
 WORLDS: tuple[str, ...] = (
     "ffrwd:av@0.2.0",
@@ -134,12 +137,19 @@ WIRE_PIX_FMTS: tuple[str, ...] = ("rgba", "yuv420p")
 # the sidecar's NUT reader hands through untouched.
 WIRE_VIDEO_CODECS: tuple[str, ...] = ("h264", "hevc", "av1")
 
+# The coded audio streams the same edge carries, whose codec tag and
+# out-of-band header the sidecar's NUT reader hands through untouched.
+WIRE_AUDIO_CODECS: tuple[str, ...] = ("aac",)
+
 # The encoder each of those codecs is reached by when the COPY names none.
 CODEC_ENCODERS: Mapping[str, str] = {
     "h264": "libx264",
     "hevc": "libx265",
     "av1": "libsvtav1",
 }
+
+# The same, for the audio the edge carries.
+AUDIO_CODEC_ENCODERS: Mapping[str, str] = {"aac": "aac"}
 
 # The codec each software encoder writes, for the names that do not carry it
 # themselves the way a hardware encoder's `<codec>_<vendor>` spelling does.
@@ -151,6 +161,12 @@ _ENCODER_CODECS: Mapping[str, str] = {
     "libsvtav1": "av1",
     "libaom-av1": "av1",
     "librav1e": "av1",
+}
+
+# The codec each audio encoder writes, the same way.
+_AUDIO_ENCODER_CODECS: Mapping[str, str] = {
+    "aac": "aac",
+    "libfdk_aac": "aac",
 }
 
 # The first world whose sidecar hosts a packet sink.
@@ -979,6 +995,18 @@ def encoder_codec(encoder: str) -> str | None:
     if sep and head in WIRE_VIDEO_CODECS:
         return head
     return _ENCODER_CODECS.get(encoder)
+
+
+def audio_encoder_codec(encoder: str) -> str | None:
+    """The audio codec `encoder` writes, or None for one this cannot name.
+
+    The audio half of :func:`encoder_codec`. A hardware encoder spells its
+    codec itself (``aac_mf``); the rest are table entries.
+    """
+    head, sep, _ = encoder.partition("_")
+    if sep and head in WIRE_AUDIO_CODECS:
+        return head
+    return _AUDIO_ENCODER_CODECS.get(encoder)
 
 
 def hosts_packet_sink(world: str) -> bool:

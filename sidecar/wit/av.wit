@@ -299,6 +299,9 @@ interface packet-sink {
     one,
     /// One or more, as many as the query hands over.
     many,
+    /// As many as the query hands over, none included: the sink reads
+    /// them when they are there and works when they are not.
+    any,
   }
 
   /// `meta`, plus what this sink accepts. A packet sink names codecs the way

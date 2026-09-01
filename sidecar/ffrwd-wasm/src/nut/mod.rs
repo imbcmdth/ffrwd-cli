@@ -4,8 +4,8 @@
 //! natively on a pipe, and it costs a few dozen bytes per frame. Only the
 //! subset the compiler puts on those pipes is implemented: one stream, in NUT
 //! version 3, carrying uncompressed video frames, interleaved pcm, or the
-//! encoded video packets of [`CODED_VIDEO_FOURCCS`]. Anything else is refused
-//! by name rather than guessed at.
+//! encoded packets of [`CODED_VIDEO_FOURCCS`] and [`CODED_AUDIO_FOURCCS`].
+//! Anything else is refused by name rather than guessed at.
 //!
 //! What is read: the main header (version, stream count, time bases, the
 //! framecode table, elision headers), the stream header (fourcc, the geometry
@@ -150,8 +150,9 @@ pub enum Media {
 /// consumer needs survives the hop.
 #[derive(Debug, Clone)]
 pub struct Stream {
-    /// The codec tag. `RGBA`, `I420`, the two pcm tags and the coded video
-    /// tags of [`CODED_VIDEO_FOURCCS`] are what this subset knows.
+    /// The codec tag. `RGBA`, `I420`, the two pcm tags and the coded tags of
+    /// [`CODED_VIDEO_FOURCCS`] and [`CODED_AUDIO_FOURCCS`] are what this
+    /// subset knows.
     pub fourcc: Vec<u8>,
     pub time_base: TimeBase,
     /// How many low bits of a PTS a frame may code, instead of all of it.
@@ -183,6 +184,13 @@ pub const CODED_VIDEO_FOURCCS: &[(&str, &[&[u8; 4]])] = &[
     ("hevc", &[b"HEVC", b"hevc", b"hev1", b"hvc1"]),
     ("av1", &[b"AV01", b"av01"]),
 ];
+
+/// The coded audio streams this wire carries, and the tags ffmpeg gives each
+/// in NUT. Its muxer writes `ff 00 00 00` for AAC, and puts the codec's
+/// AudioSpecificConfig in the stream header's extradata; `mp4a` is the tag
+/// the same codec takes in mp4, accepted here as an alias.
+pub const CODED_AUDIO_FOURCCS: &[(&str, &[&[u8; 4]])] =
+    &[("aac", &[b"\xff\x00\x00\x00", b"mp4a", b"MP4A"])];
 
 impl Stream {
     /// A video stream of `pix_fmt` frames, for building a header from nothing
@@ -234,13 +242,15 @@ impl Stream {
             .flatten()
     }
 
-    /// ffmpeg's name for the coded video codec the tag names, or None for a
-    /// raw stream and for any codec this wire does not carry.
+    /// ffmpeg's name for the coded codec the tag names, from the table for
+    /// this stream's own kind. None for a raw stream and for any codec this
+    /// wire does not carry.
     pub fn codec_name(&self) -> Option<&'static str> {
-        if !matches!(self.media, Media::Video { .. }) {
-            return None;
-        }
-        CODED_VIDEO_FOURCCS
+        let table = match self.media {
+            Media::Video { .. } => CODED_VIDEO_FOURCCS,
+            Media::Audio { .. } => CODED_AUDIO_FOURCCS,
+        };
+        table
             .iter()
             .find(|(_, tags)| tags.iter().any(|tag| self.fourcc == tag.as_slice()))
             .map(|(name, _)| *name)
@@ -532,6 +542,74 @@ mod tests {
         stream.fourcc = b"XYZW".to_vec();
         assert_eq!(stream.pix_fmt(), None);
         assert_eq!(stream.fourcc_name(), "XYZW");
+    }
+
+    /// An encoded AAC stream header, as ffmpeg's NUT muxer writes one: the
+    /// codec tag `ff 00 00 00`, and the AudioSpecificConfig as extradata.
+    fn an_aac_stream() -> Stream {
+        Stream {
+            fourcc: b"\xff\x00\x00\x00".to_vec(),
+            time_base: TimeBase { num: 1, den: 48000 },
+            msb_pts_shift: 14,
+            max_pts_distance: 48000,
+            decode_delay: 0,
+            // 48 kHz mono AAC-LC, as ffprobe reported it.
+            extradata: vec![0x11, 0x88, 0x56, 0xe5, 0x00],
+            media: Media::Audio {
+                sample_rate: 48000,
+                channels: 1,
+            },
+        }
+    }
+
+    #[test]
+    fn an_encoded_audio_stream_is_named_by_its_tag() {
+        let stream = an_aac_stream();
+        assert_eq!(stream.codec_name(), Some("aac"));
+        assert_eq!(stream.sample_fmt(), None);
+        assert_eq!(stream.audio_geometry(), Some((48000, 1)));
+    }
+
+    #[test]
+    fn an_audio_tag_this_wire_does_not_carry_names_no_codec() {
+        let mut stream = an_aac_stream();
+        stream.fourcc = b"OPUS".to_vec();
+        assert_eq!(stream.codec_name(), None);
+        assert_eq!(stream.fourcc_name(), "OPUS");
+    }
+
+    #[test]
+    fn a_video_tag_never_names_an_audio_codec() {
+        let mut stream = an_aac_stream();
+        stream.fourcc = b"H264".to_vec();
+        assert_eq!(stream.codec_name(), None);
+    }
+
+    #[test]
+    fn encoded_audio_packets_and_their_extradata_survive_a_round_trip() {
+        let stream = an_aac_stream();
+        // Each packet is one AAC frame of 1024 samples, so the timestamps
+        // step by 1024 in the stream's own ticks.
+        let frames: Vec<(i64, Vec<u8>)> = (0..4i64)
+            .map(|i| (i * 1024, vec![0x21, i as u8, 0x10, 0x04]))
+            .collect();
+        let mut wire = Vec::new();
+        {
+            let mut muxer = Muxer::new(&mut wire, &stream).expect("write headers");
+            for (pts, data) in &frames {
+                muxer.write_frame(*pts, data).expect("write packet");
+            }
+            muxer.finish().expect("finish");
+        }
+        let mut demuxer = Demuxer::open(Cursor::new(wire)).expect("read headers");
+        assert_eq!(demuxer.stream().codec_name(), Some("aac"));
+        assert_eq!(demuxer.stream().extradata, stream.extradata);
+        let mut out = Vec::new();
+        let mut buf = Vec::new();
+        while let Some(pts) = demuxer.read_frame(&mut buf).expect("read packet") {
+            out.push((pts, buf.clone()));
+        }
+        assert_eq!(out, frames);
     }
 
     #[test]

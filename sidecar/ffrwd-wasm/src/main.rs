@@ -21,7 +21,7 @@ mod windows;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 
 use anyhow::{anyhow, bail, Context, Result};
 use ffrwd_wasm::nut;
@@ -139,13 +139,20 @@ fn format_from_stream(stream: &nut::Stream) -> Result<Format> {
             sample_rate,
             channels,
         } => {
-            let sample_fmt = stream.sample_fmt().ok_or_else(|| {
-                anyhow!(
-                    "input carries codec tag {}; only {} are supported",
-                    stream.fourcc_name(),
-                    nut::supported_sample_fmts().join(", ")
-                )
-            })?;
+            let sample_fmt = stream
+                .sample_fmt()
+                .ok_or_else(|| match stream.codec_name() {
+                    Some(codec) => anyhow!(
+                        "input carries encoded {codec}; a frame module reads decoded audio \
+                         ({}), and only a packet sink consumes an encoded stream",
+                        nut::supported_sample_fmts().join(", ")
+                    ),
+                    None => anyhow!(
+                        "input carries codec tag {}; only {} are supported",
+                        stream.fourcc_name(),
+                        nut::supported_sample_fmts().join(", ")
+                    ),
+                })?;
             Media::Audio(AudioFormat {
                 sample_rate,
                 channels,
@@ -1077,9 +1084,15 @@ fn run(args: &Args) -> Result<()> {
 ///
 /// Pads run independently. Packets are not frames: nothing pairs a pad's
 /// packet with another pad's, so there is no lockstep to hold and a call may
-/// carry packets on some pads and none on others. Each round takes one packet
-/// off every pad still open, which is what keeps a fast encoder from running
-/// away while a slow one is still working.
+/// carry packets on some pads and none on others. One reader thread per pad
+/// takes blocking reads off its pipe into a byte-bounded queue, and the
+/// drive loop hands the module whatever has arrived: ONE producer feeding
+/// pads at unequal packet rates interleaves its writes by dts, so a loop
+/// that waited on a specific pad would deadlock against the producer's own
+/// blocking write once the other pads' pipes filled. The queue bound is the
+/// flow control: a stalled consumer stops the producer instead of buffering
+/// it without limit. The wasm instance is called from this thread alone;
+/// only the I/O grows threads.
 fn run_packet_sink(args: &Args, module: &str, params: &str, inputs: Vec<Input>) -> Result<()> {
     // A packet sink is an exclusive lane by nature: packets reach it in
     // decode order, so one instance reads them and `-jobs` caps nothing.
@@ -1104,7 +1117,6 @@ fn run_packet_sink(args: &Args, module: &str, params: &str, inputs: Vec<Input>) 
         }
     }
 
-    let mut inputs = inputs;
     let mut opened = Vec::with_capacity(inputs.len());
     for (pad, input) in inputs.iter().enumerate() {
         opened.push(coded_pad(args, module, pad, input.stream())?);
@@ -1113,42 +1125,31 @@ fn run_packet_sink(args: &Args, module: &str, params: &str, inputs: Vec<Input>) 
     let mut sink = runtime::PacketSink::open(module, &opened, params)
         .with_context(|| format!("opening module {module}"))?;
 
-    let mut buf: Vec<u8> = Vec::new();
-    let mut open = vec![true; pads];
-    let mut index = vec![0u64; pads];
-    loop {
-        let mut carried: Vec<Vec<runtime::Packet>> = vec![Vec::new(); pads];
-        let mut any = false;
-        for (pad, input) in inputs.iter_mut().enumerate() {
-            if !open[pad] {
-                continue;
+    let queues = PadQueues::new(pads);
+    std::thread::scope(|scope| -> Result<()> {
+        for (pad, input) in inputs.into_iter().enumerate() {
+            let queues = &queues;
+            scope.spawn(move || read_pad(input, pad, queues));
+        }
+        let outcome = (|| -> Result<()> {
+            loop {
+                let (carried, done) = queues.take()?;
+                if done {
+                    return Ok(());
+                }
+                let emitted = sink
+                    .process(&carried, false)
+                    .with_context(|| format!("{}: processing packets", sink.name()))?;
+                for writer in &mut row_outputs {
+                    write_rows(writer, &emitted.rows)?;
+                }
             }
-            let read = input
-                .read_packet(&mut buf)
-                .with_context(|| format!("reading packet {} of pad {pad}", index[pad]))?;
-            let Some(packet) = read else {
-                open[pad] = false;
-                continue;
-            };
-            carried[pad].push(runtime::Packet {
-                pts: packet.pts,
-                dts: packet.dts,
-                keyframe: packet.keyframe,
-                data: std::mem::take(&mut buf),
-            });
-            index[pad] += 1;
-            any = true;
-        }
-        if !any {
-            break;
-        }
-        let emitted = sink
-            .process(&carried, false)
-            .with_context(|| format!("{}: processing packets", sink.name()))?;
-        for writer in &mut row_outputs {
-            write_rows(writer, &emitted.rows)?;
-        }
-    }
+        })();
+        // Whatever happened, a reader still waiting for queue space must
+        // wake and stop, or the join below never returns.
+        queues.close();
+        outcome
+    })?;
 
     // The final call, carrying no packets: whatever the sink held back
     // arrives as rows, and the trailing rows follow them.
@@ -1161,6 +1162,151 @@ fn run_packet_sink(args: &Args, module: &str, params: &str, inputs: Vec<Input>) 
         writer.flush()?;
     }
     Ok(())
+}
+
+/// How many buffered bytes one pad's reader may hold before it waits for
+/// the drive loop to drain. The one producer interleaves its pads by dts,
+/// so while it writes a slow pad's next packet the fast pads' packets keep
+/// arriving and must land somewhere; 8 MB holds a couple of seconds of a
+/// high-bitrate rung, which covers that skew, and is small enough that a
+/// stalled consumer stops the producer instead of buffering it without
+/// limit. A packet larger than the whole bound still crosses once its queue
+/// is empty, so no single packet can wedge a pad.
+const PAD_BUFFER_BYTES: usize = 8 << 20;
+
+/// One pad's queue between its reader thread and the drive loop.
+#[derive(Default)]
+struct PadQueue {
+    packets: Vec<runtime::Packet>,
+    bytes: usize,
+    /// The pad's input ended; set after its last packet is queued.
+    closed: bool,
+    /// The pad's read failed; the drive loop raises it.
+    failed: Option<anyhow::Error>,
+}
+
+/// What the reader threads and the drive loop share: the per-pad queues
+/// under one lock, and a condvar for each direction of waiting.
+struct PadQueues {
+    state: Mutex<PadState>,
+    /// A pad gained a packet, closed, or failed.
+    filled: Condvar,
+    /// The drive loop drained, freeing space - or is gone for good.
+    drained: Condvar,
+}
+
+struct PadState {
+    pads: Vec<PadQueue>,
+    /// The drive loop has stopped consuming; readers stop instead of
+    /// waiting for space that will never come.
+    dead: bool,
+}
+
+impl PadQueues {
+    fn new(pads: usize) -> Self {
+        PadQueues {
+            state: Mutex::new(PadState {
+                pads: (0..pads).map(|_| PadQueue::default()).collect(),
+                dead: false,
+            }),
+            filled: Condvar::new(),
+            drained: Condvar::new(),
+        }
+    }
+
+    /// Everything queued so far, per pad, waiting until at least one pad
+    /// has packets. `(_, true)` once every pad is closed and drained; a
+    /// pad's stored read error is raised here, on the drive loop's thread.
+    fn take(&self) -> Result<(Vec<Vec<runtime::Packet>>, bool)> {
+        let mut state = self.state.lock().expect("a reader panicked with the lock");
+        loop {
+            if let Some(queue) = state.pads.iter_mut().find(|q| q.failed.is_some()) {
+                return Err(queue.failed.take().expect("found by is_some"));
+            }
+            if state.pads.iter().any(|q| !q.packets.is_empty()) {
+                break;
+            }
+            if state.pads.iter().all(|q| q.closed) {
+                return Ok((Vec::new(), true));
+            }
+            state = self
+                .filled
+                .wait(state)
+                .expect("a reader panicked with the lock");
+        }
+        let carried = state
+            .pads
+            .iter_mut()
+            .map(|queue| {
+                queue.bytes = 0;
+                std::mem::take(&mut queue.packets)
+            })
+            .collect();
+        self.drained.notify_all();
+        Ok((carried, false))
+    }
+
+    /// The drive loop is done, normally or not: wake every waiting reader
+    /// so it can stop.
+    fn close(&self) {
+        self.state
+            .lock()
+            .expect("a reader panicked with the lock")
+            .dead = true;
+        self.drained.notify_all();
+    }
+}
+
+/// One pad's reader: blocking reads off its own input, each packet into the
+/// pad's queue, waiting whenever the queue is over its byte bound. Decode
+/// order per pad is preserved by construction - one thread, one queue.
+fn read_pad(mut input: Input, pad: usize, queues: &PadQueues) {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut index = 0u64;
+    loop {
+        let read = input
+            .read_packet(&mut buf)
+            .with_context(|| format!("reading packet {index} of pad {pad}"));
+        let mut state = queues.state.lock().expect("the drive loop holds no panic");
+        match read {
+            Ok(Some(packet)) => {
+                while !state.dead
+                    && state.pads[pad].bytes >= PAD_BUFFER_BYTES
+                    && !state.pads[pad].packets.is_empty()
+                {
+                    state = queues
+                        .drained
+                        .wait(state)
+                        .expect("the drive loop holds no panic");
+                }
+                if state.dead {
+                    return;
+                }
+                let data = std::mem::take(&mut buf);
+                state.pads[pad].bytes += data.len();
+                state.pads[pad].packets.push(runtime::Packet {
+                    pts: packet.pts,
+                    dts: packet.dts,
+                    keyframe: packet.keyframe,
+                    data,
+                });
+                index += 1;
+                // One consumer waits on `filled`, so one wake reaches it.
+                queues.filled.notify_one();
+            }
+            Ok(None) => {
+                state.pads[pad].closed = true;
+                queues.filled.notify_one();
+                return;
+            }
+            Err(error) => {
+                state.pads[pad].failed = Some(error);
+                state.pads[pad].closed = true;
+                queues.filled.notify_one();
+                return;
+            }
+        }
+    }
 }
 
 /// One pad of a packet sink, from the NUT header the input opened with. A
@@ -1182,24 +1328,31 @@ fn coded_pad(
         };
         bail!(
             "{module} consumes encoded packets, and input {pad} carries {carried}; \
-             put it after the encoder (ffmpeg ... -c:v <codec> -f nut)"
+             put it after the encoder (ffmpeg ... -c:v <codec> -c:a <codec> -f nut)"
         );
     };
-    let (width, height) = stream
-        .video_geometry()
-        .expect("an encoded stream this wire carries is video");
+    let format = match stream.media {
+        nut::Media::Video { width, height, .. } => runtime::CodedFormat::Video { width, height },
+        nut::Media::Audio {
+            sample_rate,
+            channels,
+        } => runtime::CodedFormat::Audio {
+            sample_rate,
+            channels,
+        },
+    };
     let coded = runtime::CodedStream {
         codec: codec.to_string(),
         time_base: TimeBase {
             num: stream.time_base.num,
             den: stream.time_base.den,
         },
-        format: runtime::CodedFormat::Video { width, height },
+        format,
         extradata: stream.extradata.clone(),
     };
     let info = args.stream_info.clone().unwrap_or_else(|| StreamInfo {
         index: pad as u32,
-        kind: "video".to_string(),
+        kind: stream.kind().to_string(),
         codec: codec.to_string(),
         duration: None,
         tags: Vec::new(),
@@ -1353,6 +1506,7 @@ fn streams_read(arity: ffrwd_wasm_runtime::runtime::Arity) -> &'static str {
         Arity::Zero => "none",
         Arity::One => "one",
         Arity::Many => "many",
+        Arity::Any => "any",
     }
 }
 

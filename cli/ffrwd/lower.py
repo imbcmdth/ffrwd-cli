@@ -358,6 +358,7 @@ from ffrwd.parser import (
 )
 from ffrwd.parser import _ident_name as _fold
 from ffrwd.probe import WEBVTT_FORMAT, ProbeFailure, ProbeResult, StreamMeta
+from ffrwd.processes import ref_type
 from ffrwd.registry import DynamicFilter, FilterOption, Registry, SourceFilter
 from ffrwd.sink import (
     CODEC_PARAMS_FLAGS,
@@ -405,12 +406,15 @@ from ffrwd.vars import unset_error
 from ffrwd.warnings import FfrwdWarning, OnWarning, WarningCode
 from ffrwd.wasm import (
     ANNOTATION_TYPES,
+    AUDIO_CODEC_ENCODERS,
     CODEC_ENCODERS,
+    WIRE_AUDIO_CODECS,
     WIRE_VIDEO_CODECS,
     WORLDS,
     Described,
     DescribedFunction,
     Invoke,
+    audio_encoder_codec,
     encoder_codec,
     hosts_packet_sink,
     language_tag,
@@ -3044,26 +3048,42 @@ class _Lowerer:
         A value read once per row is a list, one element per rendition in the
         order the rows were gathered; every other value shapes every pad the
         same way. The counts have to line up, for the same reason a file's do:
-        the rows and the pads are two accounts of one ladder.
+        the rows and the pads are two accounts of one ladder -- counted over
+        the pads of the option's OWN kind, since a video option says nothing
+        about an audio pad standing beside them.
         """
-        pads = len(self.graph.nodes[node].inputs)
+        kinds = [ref_type(self.graph, ref) for ref in self.graph.nodes[node].inputs]
         for name, value in options.items():
-            if isinstance(value, list) and len(value) != pads:
+            if not isinstance(value, list):
+                continue
+            scope = SINK_OPTIONS[name].scope
+            of_kind = sum(1 for kind in kinds if kind == scope)
+            if len(value) != of_kind:
                 raise _error(
                     ErrorCode.ROW_COUNT_MISMATCH,
                     f"sink option {name!r} is read once per row over "
                     f"{len(value)} rows, and this sink reads "
-                    f"{_stream_count(pads)}",
+                    f"{of_kind} {scope} "
+                    f"{'stream' if of_kind == 1 else 'streams'}",
                     raw.path_node,
                     hint=_PER_TRACK_OPTION_HINT,
                 )
-        return [
-            {
-                name: value[pad] if isinstance(value, list) else value
-                for name, value in options.items()
-            }
-            for pad in range(pads)
-        ]
+        # Each pad takes the options shaping ITS OWN encoder, a per-row value
+        # indexed by the pad's position among the pads of that kind -- which
+        # is the order the rows were gathered in.
+        seen: dict[str, int] = {}
+        pads: list[dict[str, object]] = []
+        for kind in kinds:
+            index = seen.get(kind, 0)
+            seen[kind] = index + 1
+            pads.append(
+                {
+                    name: value[index] if isinstance(value, list) else value
+                    for name, value in options.items()
+                    if SINK_OPTIONS[name].scope == kind
+                }
+            )
+        return pads
 
     def _check_packet_sink_feed(
         self, declared: WasmFunction, raw: RawSink, sink_nodes: list[str]
@@ -3098,13 +3118,16 @@ class _Lowerer:
     ) -> dict[str, object]:
         """The COPY's WITH options as the encoder a packet sink reads.
 
-        The video half of the file-output vocabulary, validated against the
-        same table; anything else has no encoder to shape and is refused by
-        name. `video_codec` is always present on the way out: written, or
-        filled from the module's declared preference, h264 when it names
-        none -- and checked against that list either way.
+        The video half of the file-output vocabulary -- and the audio half
+        too, for a sink that reads audio streams -- validated against the same
+        table; anything else has no encoder to shape and is refused by name.
+        `video_codec` is always present on the way out: written, or filled
+        from the module's declared preference, h264 when it names none -- and
+        checked against that list either way. `audio_codec` is filled the same
+        way, and only where an audio stream reaches the sink.
         """
         described = self.describes[declared.module]
+        scopes = ("video", "audio") if "audio" in declared.stream_kinds else ("video",)
         options: dict[str, object] = {}
         option_nodes: dict[str, exp.Expr] = {}
         for option in raw.options:
@@ -3114,15 +3137,20 @@ class _Lowerer:
             value = _validated_option(
                 option.name, self._sink_option_value(option, raw), line=line, col=col
             )
-            if SINK_OPTIONS[option.name].scope != "video":
+            if SINK_OPTIONS[option.name].scope not in scopes:
+                allowed = sorted(
+                    name
+                    for name, spec in SINK_OPTIONS.items()
+                    if spec.scope in scopes
+                )
                 raise FfrwdError(
                     ErrorCode.UNKNOWN_SINK_OPTION,
                     f"option {option.name!r} does not shape the encoder "
                     f"'{declared.name}' reads",
                     line=line,
                     col=col,
-                    hint="a packet sink takes the video encoder options: "
-                    + ", ".join(sorted(_PACKET_SINK_OPTIONS)),
+                    hint=f"a packet sink takes the {' and '.join(scopes)} "
+                    "encoder options: " + ", ".join(allowed),
                 )
             options[option.name] = value
             option_nodes[option.name] = option.value
@@ -3169,7 +3197,63 @@ class _Lowerer:
                     "sidecar's packets travel in",
                 )
             options["video_codec"] = CODEC_ENCODERS[codec]
+        if "audio" in scopes:
+            self._packet_sink_audio_codec(declared, described, options, option_nodes, raw)
         return options
+
+    def _packet_sink_audio_codec(
+        self,
+        declared: WasmFunction,
+        described: Described,
+        options: dict[str, object],
+        option_nodes: dict[str, exp.Expr],
+        raw: RawSink,
+    ) -> None:
+        """`audio_codec` settled the way `video_codec` is, against the audio
+        the stream edge carries and the codecs the module accepts."""
+        accepted = described.sink_codecs("audio")
+        for written in _each(options.get("audio_codec")):
+            assert isinstance(written, str)  # validated as a str above
+            codec = audio_encoder_codec(written)
+            line, col = _pos(option_nodes["audio_codec"], raw.path_node)
+            if codec is None:
+                raise FfrwdError(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"the audio stream into a packet sink travels as "
+                    f"{_join_codecs(WIRE_AUDIO_CODECS)}, and '{written}' "
+                    "encodes none of them",
+                    line=line,
+                    col=col,
+                    hint="name an encoder for one of them, e.g. "
+                    + ", ".join(AUDIO_CODEC_ENCODERS.values()),
+                )
+            if accepted and codec not in accepted:
+                raise FfrwdError(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"'{written}' writes {codec}, and the module "
+                    f"'{declared.module}' consumes {_join_codecs(accepted)} "
+                    "audio",
+                    line=line,
+                    col=col,
+                    hint=f"name an encoder for {_join_codecs(accepted)}, or "
+                    "drop audio_codec to take the module's preference",
+                )
+        if "audio_codec" not in options:
+            codec = next(
+                (c for c in accepted if c in WIRE_AUDIO_CODECS),
+                WIRE_AUDIO_CODECS[0] if not accepted else None,
+            )
+            if codec is None:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"the module '{declared.module}' consumes "
+                    f"{_join_codecs(accepted)} audio, and the stream edge "
+                    f"carries {_join_codecs(WIRE_AUDIO_CODECS)}",
+                    raw.path_node,
+                    hint="the module has to accept one of the codecs the "
+                    "sidecar's packets travel in",
+                )
+            options["audio_codec"] = AUDIO_CODEC_ENCODERS[codec]
 
     def _codec_for_rows_track(
         self, options: dict[str, object], outputs: list[Output], path: str | None
@@ -8376,7 +8460,11 @@ class _Lowerer:
                 f"{WASM_STREAM_NAMES[described.kind]}, or name a module that "
                 f"filters {declared.stream_kind}",
             )
-        self._check_stream_arity(declared, described, node, select)
+        # A packet sink has no frame interface to read a window over: how many
+        # streams of each kind it takes is what it declares, and that is
+        # checked against the signature in `_check_sink_shape`.
+        if not described.packet_sink:
+            self._check_stream_arity(declared, described, node, select)
         if declared.emits is not None:
             self._check_annotation_schema(declared, declared.emits, described, node, select)
         # A windowed module is handed each frame's rows either way and reads
@@ -8463,20 +8551,22 @@ class _Lowerer:
                 hint=f"declare '{declared.name}' as RETURNS sink and write it "
                 "as a COPY destination",
             )
-        # The sidecar's stream edge carries encoded VIDEO and nothing else, so
-        # an audio pad has no wire to arrive on however the module and the
-        # declaration are shaped.
+        # An audio pad reaches a sink only where the module accepts a codec
+        # the stream edge can carry: the edge is what the sidecar's NUT reader
+        # hands through, and it hands through nothing else.
         if "audio" in declared.stream_kinds:
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL,
-                f"function '{declared.name}' reads an audio stream, and the "
-                f"stream edge into a packet sink carries "
-                f"{_join_codecs(WIRE_VIDEO_CODECS)}",
-                node,
-                fallback=select,
-                hint="declare its stream parameters as video_stream (or "
-                "video_stream[]), and feed it video columns",
-            )
+            accepted = described.sink_codecs("audio")
+            if accepted and not any(c in WIRE_AUDIO_CODECS for c in accepted):
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"the module '{declared.module}' consumes "
+                    f"{_join_codecs(accepted)} audio, and the stream edge into "
+                    f"a packet sink carries {_join_codecs(WIRE_AUDIO_CODECS)}",
+                    node,
+                    fallback=select,
+                    hint="the module has to accept one of the codecs the "
+                    "sidecar's packets travel in",
+                )
         self._check_sink_shape(declared, described, node, select)
 
     def _check_sink_shape(
@@ -8489,11 +8579,13 @@ class _Lowerer:
         """What the signature says it reads against what the module declares.
 
         Per kind, since a sink reads each independently. A declaration naming
-        one stream of a kind always hands over one, so a module reading one or
-        many accepts it; anything that can hand over SEVERAL -- an array, or
-        several parameters of one kind -- needs a module that reads many. The
-        refusal lands here, at the call, where the run-time one it forestalls
-        can be said before anything runs.
+        one stream of a kind always hands over one, so a module reading one,
+        many or any accepts it; anything that can hand over SEVERAL -- an
+        array, or several parameters of one kind -- needs a module that reads
+        many or any. A module reading ANY works without the kind entirely, so
+        a declaration naming none of it is a shape it accepts too. The refusal
+        lands here, at the call, where the run-time one it forestalls can be
+        said before anything runs.
         """
         for kind in WASM_STREAM_NAMES:
             params = [
@@ -8505,7 +8597,7 @@ class _Lowerer:
             ]
             reads = described.sink_streams(kind)
             if not params:
-                if reads != "none":
+                if reads not in ("none", "any"):
                     raise _error(
                         ErrorCode.UNSUPPORTED_SQL,
                         f"the module '{declared.module}' reads {reads} "
@@ -8518,7 +8610,7 @@ class _Lowerer:
                     )
                 continue
             several = len(params) > 1 or any(is_array(p.type) for p in params)
-            if reads == "none" or (several and reads != "many"):
+            if reads == "none" or (several and reads not in ("many", "any")):
                 written = ", ".join(f"{p.name} {p.type}" for p in params)
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,
