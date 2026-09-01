@@ -25,6 +25,7 @@
         "NO_STREAMING_EQUIVALENT",
         "CONCAT_MISMATCH",
         "UNSUPPORTED_SQL",
+        "UNKNOWN_RECIPE",
         "STREAM_NOT_FOUND",
         "INPUT_NOT_FOUND",
         "BROADCAST_MISMATCH",

@@ -39,7 +39,7 @@ PUBLISH_URL = f"{API}/functions/v1/publish"
 RECIPE = (
     "-- Halve a file's audio and write it out.\n"
     "-- variables: source (input media path), dest (output path)\n"
-    "-- example: ffrwd run broadcast.tracks.duck -v source=in.mkv -v dest=out.mkv\n"
+    "-- example: ffrwd run broadcast/tracks:duck -v source=in.mkv -v dest=out.mkv\n"
     "COPY (SELECT broadcast.tracks.quieter(f.audio[1]) FROM input(:'source') f)"
     " TO :'dest';\n"
 )
@@ -220,7 +220,7 @@ def test_the_preflight_describes_the_version_it_packed(tmp_path: Path) -> None:
                 "name": "duck",
                 "file": "recipes/duck.sql",
                 "description": "Halve a file's audio and write it out.",
-                "usage": "ffrwd run broadcast.tracks.duck -v source=in.mkv -v dest=out.mkv",
+                "usage": "ffrwd run broadcast/tracks:duck -v source=in.mkv -v dest=out.mkv",
                 "required": [
                     {"name": "source", "description": "input media path"},
                     {"name": "dest", "description": "output path"},

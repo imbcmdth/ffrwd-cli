@@ -1934,7 +1934,7 @@ def test_a_recipe_reaches_the_version_its_own_package_declares(
     _lock(project, [d_low, d_high, tool], dependencies={"shared/d": "2.0.0"})
 
     code, out, err = _run(
-        project, monkeypatch, capsys, "compile", "me.tool.go", "-v", "dest=o.mkv"
+        project, monkeypatch, capsys, "compile", "me/tool:go", "-v", "dest=o.mkv"
     )
     assert code == 0, err
     assert "volume=volume=0.1" in out, out
@@ -2935,7 +2935,7 @@ def test_every_subcommand_taking_a_query_takes_a_recipe_name(
         assert code == 0, err
 
 
-def test_the_default_recipe_is_reached_as_the_package_segment(
+def test_the_default_recipe_is_reached_as_the_package_name(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     _project(
@@ -2948,7 +2948,7 @@ def test_the_default_recipe_is_reached_as_the_package_segment(
         monkeypatch,
         capsys,
         "validate",
-        "me.edits",
+        "me/edits",
         "-v",
         "source=in.mkv",
         "-v",
@@ -2960,7 +2960,7 @@ def test_the_default_recipe_is_reached_as_the_package_segment(
 def test_a_qualified_recipe_name_runs_one_packages_bin_entry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """`me.edits.split-chapters` names one entry of a map `bin`, for `compile` and `run` alike."""
+    """`me/edits:split-chapters` names one entry of a map `bin`, for `compile` and `run` alike."""
     _project(
         tmp_path,
         files={"queries/split.sql": RECIPE},
@@ -2971,7 +2971,7 @@ def test_a_qualified_recipe_name_runs_one_packages_bin_entry(
         monkeypatch,
         capsys,
         "compile",
-        "me.edits.split-chapters",
+        "me/edits:split-chapters",
         "-v",
         "source=in.mkv",
         "-v",
@@ -2985,13 +2985,83 @@ def test_a_qualified_recipe_name_runs_one_packages_bin_entry(
         monkeypatch,
         capsys,
         "run",
-        "me.edits.split-chapters",
+        "me/edits:split-chapters",
         "-v",
         "source=in.mkv",
         "-v",
         "dest=out.mkv",
     )
     assert code == 1 and "ffmpeg not found" in err
+
+
+def test_the_dotted_spelling_is_refused_naming_the_new_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The one place the old command-line spelling survives: as the refusal's input."""
+    _project(
+        tmp_path,
+        files={"queries/split.sql": RECIPE},
+        manifest=_BIN,
+    )
+    code, _out, err = _run(tmp_path, monkeypatch, capsys, "validate", "me.edits.split-chapters")
+    assert code == 1
+    assert (
+        "UNKNOWN_RECIPE: 'me.edits.split-chapters' names a recipe the way "
+        "SQL names a function"
+    ) in err
+    assert (
+        "on the command line a package is 'me/edits' and a recipe in it "
+        "'me/edits:split-chapters'"
+    ) in err
+
+    code, out, _err = _run(
+        tmp_path, monkeypatch, capsys, "validate", "--json", "me.edits.split-chapters"
+    )
+    assert code == 1
+    assert json.loads(out)["code"] == "UNKNOWN_RECIPE"
+
+
+def test_the_dotted_spelling_of_a_default_recipe_is_refused_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _project(
+        tmp_path,
+        files={"queries/split.sql": RECIPE},
+        manifest={"bin": "queries/split.sql"},
+    )
+    code, _out, err = _run(tmp_path, monkeypatch, capsys, "validate", "me.edits")
+    assert code == 1
+    assert "UNKNOWN_RECIPE: 'me.edits' names a recipe the way SQL names a function" in err
+    assert "on the command line a package is 'me/edits' and its recipe runs as 'me/edits'" in err
+
+
+def test_a_colon_with_a_bad_package_half_matches_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`me:split-chapters` has no ns/pkg half, so it falls through to SQL."""
+    _project(
+        tmp_path,
+        files={"queries/split.sql": RECIPE},
+        manifest=_BIN,
+    )
+    code, _out, err = _run(tmp_path, monkeypatch, capsys, "validate", "me:split-chapters")
+    assert code == 1
+    assert "UNKNOWN_RECIPE" not in err
+    assert "hint: installed recipes: me/edits:split-chapters" in err
+
+
+def test_a_name_that_is_neither_spelling_fails_as_sql(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _project(
+        tmp_path,
+        files={"queries/split.sql": RECIPE},
+        manifest=_BIN,
+    )
+    code, _out, err = _run(tmp_path, monkeypatch, capsys, "validate", "me/edits/extra:thing")
+    assert code == 1
+    assert "UNKNOWN_RECIPE" not in err
+    assert "hint: installed recipes: me/edits:split-chapters" in err
 
 
 def test_a_recipe_name_is_not_looked_up_when_the_text_is_sql(
@@ -3045,14 +3115,14 @@ def test_a_bare_name_two_packages_ship_is_refused(
     code, _out, err = _run(project, monkeypatch, capsys, "validate", "split-chapters")
     assert code == 1
     assert "more than one package ships a recipe named 'split-chapters'" in err
-    assert "me.edits.split-chapters, tracks.lib.split-chapters" in err
+    assert "me/edits:split-chapters, tracks/lib:split-chapters" in err
 
     code, _out, err = _run(
         project,
         monkeypatch,
         capsys,
         "validate",
-        "tracks.lib.split-chapters",
+        "tracks/lib:split-chapters",
         "-v",
         "source=in.mkv",
         "-v",
@@ -3087,7 +3157,7 @@ def test_a_name_matching_nothing_fails_as_sql_and_names_the_recipes(
     )
     code, _out, err = _run(tmp_path, monkeypatch, capsys, "compile", "split-chapter")
     assert code == 1
-    assert "hint: installed recipes: me.edits.split-chapters" in err
+    assert "hint: installed recipes: me/edits:split-chapters" in err
 
 
 def test_a_failing_query_is_not_offered_a_recipe(

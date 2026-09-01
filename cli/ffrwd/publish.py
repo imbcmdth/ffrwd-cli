@@ -236,11 +236,11 @@ def _recipe_description(text: str) -> str:
 
 
 def _qualified_recipe(package: Package, name: str) -> str:
-    """`name` addressed the way ``ffrwd run`` reaches it: two segments for the
-    package's default recipe, three for any other."""
+    """`name` addressed the way ``ffrwd run`` reaches it: the package name
+    alone for its default recipe, ``:<name>`` appended for any other."""
     if name == package.package:
-        return f"{package.namespace}.{package.package}"
-    return f"{package.namespace}.{package.package}.{name}"
+        return package.name
+    return f"{package.name}:{name}"
 
 
 def _usage(package: Package, name: str, text: str) -> str:

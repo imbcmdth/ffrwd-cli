@@ -1561,14 +1561,15 @@ _REPAIR: dict[ErrorCode, str] = {
 }
 
 
-# Codes no compile can raise: they refuse a `run` flag, or say how a run
-# ended, rather than refusing a query -- so no rewriting of the SQL answers
-# one and the repair loop never sees it.
+# Codes no compile can raise: they refuse a `run` flag or a command-line
+# name, or say how a run ended, rather than refusing a query -- so no
+# rewriting of the SQL answers one and the repair loop never sees it.
 NOT_REPAIRABLE: frozenset[ErrorCode] = frozenset(
     {
         ErrorCode.BUFFER_OVERFLOW,
         ErrorCode.NOTHING_TO_SHOW,
         ErrorCode.PLAYER_NOT_FOUND,
+        ErrorCode.UNKNOWN_RECIPE,
     }
 )
 

@@ -375,15 +375,24 @@ Which the positional is, in order:
 
 A manifest declaring a recipe named for one of those four words is
 rejected where it is written: rule 1 would never let it be reached.
-A recipe name may also be qualified: `<namespace>.<package>.<name>`
-names one entry of a map `bin`, `<namespace>.<package>` a string
-`bin`'s recipe. Either says which package when a bare name matches
-recipes in more than one; a bare name that does is rejected naming each
-`<namespace>.<package>.<name>` it could mean. Variables still come
+A recipe name may also be qualified: `<namespace>/<package>:<name>`
+names one entry of a map `bin`, `<namespace>/<package>` a string
+`bin`'s recipe - the package spelled exactly as `install` takes it.
+Either says which package when a bare name matches recipes in more
+than one; a bare name that does is rejected naming each
+`<namespace>/<package>:<name>` it could mean. Variables still come
 from `-v name=value`; an unset one substitutes to `NULL` (see
 [Variables](#variables)), and a rejection at
 its point of use names what the recipe's `-- variables:` header
 declares.
+
+Dots stay SQL's: `ffrwd.examples.abr_ladder()` in a query is
+unchanged, and the dotted form on the command line
+(`ffrwd run ffrwd.examples.abr-ladder`) is refused with the
+`/`-and-`:` spelling named. The two halves of a package name are SQL
+identifiers - lowercase, digits, `_`, no hyphens - because queries
+qualify calls with them; a recipe name is a command word, never
+written in SQL, and may carry hyphens (`split-chapters`).
 
 ### Installed packages
 

@@ -132,9 +132,10 @@ split-chapters -v source=film.mkv``). One rule decides which it is, in
 ``_resolve_query`` so every one of the four subcommands reads it the same
 way: text beginning with ``SELECT``, ``COPY``, ``CREATE`` or ``WITH`` is SQL,
 always; anything else that matches a recipe's name is that recipe's file;
-anything else is SQL and fails as it always did. ``ns.pkg.recipe`` names one
-of a map ``bin``'s entries, ``ns.pkg`` a string ``bin``'s recipe; either says
-which package when a bare name matches more than one.
+anything else is SQL and fails as it always did. ``ns/pkg:recipe`` names one
+of a map ``bin``'s entries, ``ns/pkg`` a string ``bin``'s recipe; either says
+which package when a bare name matches more than one. The SQL-side spelling
+(``ns.pkg.recipe``) is refused with the command-line one named.
 
 A compile can also have something to say short of refusing: a call that
 resolved to a machine-wide package rather than to one this project installed,
@@ -295,7 +296,11 @@ def main(argv: list[str] | None = None) -> int:
         _print_warnings(warnings)
 
 
-_QUERY_HELP = "SQL query text (exactly one of this or -f/--file is required)"
+_QUERY_HELP = (
+    "SQL query text, or the name of a recipe a package ships -- bare, "
+    "ns/pkg for a package's own recipe, or ns/pkg:recipe (exactly one of "
+    "this or -f/--file is required)"
+)
 _FILE_HELP = "read the query from a file instead of the command line ('-' for stdin)"
 _SET_HELP = "define a variable for :name/:'name'/:\"name\" substitution (repeatable)"
 
@@ -712,10 +717,11 @@ def _starts_a_statement(text: str) -> bool:
 
 
 def _qualified_recipe(package: Package, recipe: str) -> str:
-    """`recipe` written the way `run` reaches it: two segments for the default, three otherwise."""
+    """`recipe` written the way `run` reaches it: the package name alone for
+    the default recipe, ``:<name>`` appended for any other."""
     if recipe == package.package:
-        return f"{package.namespace}.{package.package}"
-    return f"{package.namespace}.{package.package}.{recipe}"
+        return package.name
+    return f"{package.name}:{recipe}"
 
 
 def _recipe_names(packages: PackageSet | None) -> list[str]:
@@ -739,27 +745,58 @@ def _package(packages: PackageSet, name: str) -> Package:
 def _matching_recipes(name: str, packages: PackageSet | None) -> list[tuple[Package, str]]:
     """The (package, recipe name) pairs `name` names, qualified or bare.
 
-    Three segments (``ns.pkg.recipe``) name one entry of a map `bin`; two
-    (``ns.pkg``) name a string `bin`'s recipe. A bare name is looked up
-    across every installed package, which may match more than one.
+    ``ns/pkg:recipe`` names one entry of a map `bin`; ``ns/pkg`` names a
+    string `bin`'s recipe. A bare name is looked up across every installed
+    package, which may match more than one.
     """
     if packages is None:
         return []
-    parts = name.split(".")
-    if len(parts) in (2, 3):
-        namespace, package_name = parts[0], parts[1]
-        package = packages.find(namespace, package_name)
+    package_half, colon, member = name.partition(":")
+    if colon or "/" in name:
+        halves = package_half.split("/")
+        if len(halves) != 2:
+            return []
+        package = packages.find(halves[0], halves[1])
         if package is None:
             return []
-        member = parts[2] if len(parts) == 3 else None
-        recipe = package.recipe(member)
-        return [] if recipe is None else [(package, package.package if member is None else member)]
+        recipe = package.recipe(member if colon else None)
+        return [] if recipe is None else [(package, member if colon else package.package)]
     found: list[tuple[Package, str]] = []
     for claimed in packages.names():
         package = _package(packages, claimed)
         if package.recipe(name) is not None:
             found.append((package, name))
     return found
+
+
+def _dotted_spelling(name: str, packages: PackageSet | None) -> FfrwdError | None:
+    """The refusal for a recipe named ``ns.pkg[.recipe]``, when the dots name one.
+
+    The old command-line spelling, recognized as itself rather than falling
+    through to a SQL failure. Fires only when the dotted parts resolve to an
+    installed recipe: anything else was never a recipe under either spelling.
+    """
+    if packages is None:
+        return None
+    parts = name.split(".")
+    if len(parts) not in (2, 3):
+        return None
+    package = packages.find(parts[0], parts[1])
+    if package is None:
+        return None
+    member = parts[2] if len(parts) == 3 else None
+    if package.recipe(member) is None:
+        return None
+    inside = (
+        f"its recipe runs as '{package.name}'"
+        if member is None
+        else f"a recipe in it '{package.name}:{member}'"
+    )
+    return FfrwdError(
+        ErrorCode.UNKNOWN_RECIPE,
+        f"'{name}' names a recipe the way SQL names a function",
+        hint=f"on the command line a package is '{package.name}' and {inside}",
+    )
 
 
 def _recipe_text(
@@ -770,6 +807,9 @@ def _recipe_text(
     Two packages shipping one name is a rejection rather than a pick: the
     qualified form says which, and guessing would run the wrong recipe.
     """
+    refused = _dotted_spelling(name, packages)
+    if refused is not None:
+        raise refused
     found = _matching_recipes(name, packages)
     if not found:
         return None

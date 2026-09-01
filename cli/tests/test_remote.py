@@ -802,7 +802,7 @@ NOW = datetime(2026, 8, 29, 12, 0, 0, tzinfo=timezone.utc)
 ROW_DONE = {
     "id": "aaaa1111-0000-0000-0000-000000000000",
     "state": "succeeded",
-    "recipe": "broadcast.tracks.duck",
+    "recipe": "broadcast/tracks:duck",
     "gpu": True,
     "duration_cpu_s": 300,
     "duration_gpu_s": 60,
@@ -848,7 +848,7 @@ def test_jobs_lists_a_table_with_the_month_footer(
     expected = TableResult(
         columns=["id", "state", "recipe", "gpu", "runtime", "created"],
         rows=[
-            ["aaaa1111", "succeeded", "broadcast.tracks.duck", True, "5m00s+1m00s gpu", "1h ago"],
+            ["aaaa1111", "succeeded", "broadcast/tracks:duck", True, "5m00s+1m00s gpu", "1h ago"],
             ["bbbb2222", "failed", "sql", False, "1m30s", "50d ago"],
         ],
     )

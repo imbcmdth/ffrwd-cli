@@ -19,6 +19,7 @@ class ErrorCode(str, Enum):
     NO_STREAMING_EQUIVALENT = "NO_STREAMING_EQUIVALENT"
     CONCAT_MISMATCH = "CONCAT_MISMATCH"  # reserved; never raised
     UNSUPPORTED_SQL = "UNSUPPORTED_SQL"  # catch-all for constructs outside dialect
+    UNKNOWN_RECIPE = "UNKNOWN_RECIPE"  # a recipe named on the command line the dotted way
     STREAM_NOT_FOUND = "STREAM_NOT_FOUND"  # probed subscript out of range
     INPUT_NOT_FOUND = "INPUT_NOT_FOUND"  # */splat/broadcast with no readable input
     BROADCAST_MISMATCH = "BROADCAST_MISMATCH"  # zip length mismatch across arrays

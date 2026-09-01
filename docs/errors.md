@@ -225,6 +225,24 @@ COPY (SELECT b.video[1] FROM input('x.mp4') b) TO 'out.mp4';
 {"line": 1, "col": 13, "code": "UNSUPPORTED_SQL", "message": "view 'unused' is never used", "hint": "every view must be read by a later view or COPY; check the spelling of the name in its FROM clauses"}
 ```
 
+## UNKNOWN_RECIPE
+
+**Meaning:** A recipe was named on the command line the way SQL names a function. On the command line a package is spelled the way `install` takes it - `<namespace>/<package>` - and a recipe in it `<namespace>/<package>:<name>`; dots stay inside queries, where `ffrwd.examples.abr_ladder()` is unchanged. Fires only when the dotted parts resolve to an installed recipe: a dotted name resolving to nothing was never a recipe under either spelling and fails as the SQL it isn't.
+
+**Fires when:** the positional of `run`/`compile`/`explain`/`validate` is `<ns>.<pkg>` or `<ns>.<pkg>.<name>` and those parts name a recipe a discovered package ships. `line`/`col` are null: the rejected text is a command-line argument, not a query.
+
+**Example** (a project with `ffrwd/examples` installed, shipping `abr-ladder`):
+
+```
+ffrwd validate --json ffrwd.examples.abr-ladder
+```
+
+**Error JSON:**
+
+```json
+{"line": null, "col": null, "code": "UNKNOWN_RECIPE", "message": "'ffrwd.examples.abr-ladder' names a recipe the way SQL names a function", "hint": "on the command line a package is 'ffrwd/examples' and a recipe in it 'ffrwd/examples:abr-ladder'"}
+```
+
 ## STREAM_NOT_FOUND
 
 **Meaning:** A subscript (`<alias>.video[k]` / `<alias>.audio[k]`, or the recorded bound of a CTE array column) is out of range for the streams actually present. Only reachable against a probed input (local, readable) or against a CTE array column whose length was recorded when it lowered. An explicit subscript against an unprobed input compiles unchecked and lets ffmpeg deliver the bad news at run time instead.
@@ -480,7 +498,7 @@ SELECT p.video[1] FROM input('logo.png', framerate => 'fast') p
 
 **Fires when:** the flag is given for a table query; or for a media query whose every output file is audio-only, subtitles or rows.
 
-This code and `PLAYER_NOT_FOUND` are the two no compile can raise -- they refuse a `run` flag, not a query -- so `ffrwd prompt` lists neither and the repair loop never sees one.
+This code, `PLAYER_NOT_FOUND` and `UNKNOWN_RECIPE` refuse a `run` flag or a command-line name, not a query, so `ffrwd prompt` lists none of them and the repair loop never sees one.
 
 **Error JSON:**
 
