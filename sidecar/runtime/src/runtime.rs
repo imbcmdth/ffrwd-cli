@@ -213,7 +213,7 @@ mod world_0120 {
     pub mod packet {
         wasmtime::component::bindgen!({
             path: "../wit",
-            world: "packet-module",
+            world: "packet-sink-module",
             with: { "ffrwd:av/types": crate::runtime::world_0120::video::ffrwd::av::types },
         });
     }
@@ -2632,7 +2632,7 @@ fn check_packet_export(component: &Component, module_path: &str) -> Result<()> {
 /// From 0.12.0 the interface carries a list of streams and a packet list per
 /// pad; before it, exactly one video stream and one packet list.
 enum PacketInstance {
-    W0120(world_0120::packet::PacketModule),
+    W0120(world_0120::packet::PacketSinkModule),
     W0110(world_0110::packet::PacketModule),
     W0100(world_0100::packet::PacketModule),
 }
@@ -2865,7 +2865,7 @@ fn instantiate_packet(
     let context = || format!("instantiating {module_path}");
     let instance = if has_export(&component, &interface("packet-sink", "0.12.0")) {
         PacketInstance::W0120(
-            world_0120::packet::PacketModule::instantiate(&mut store, &component, &linker)
+            world_0120::packet::PacketSinkModule::instantiate(&mut store, &component, &linker)
                 .map_err(wasm_err)
                 .with_context(context)?,
         )

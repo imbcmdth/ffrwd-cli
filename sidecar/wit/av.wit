@@ -468,5 +468,5 @@ interface values {
 world video-module  { export filter; }
 world meta-module   { export filter; export meta-filter; }
 world window-module { import window-source; export window-filter; }
-world packet-module { export packet-sink; }
+world packet-sink-module { export packet-sink; }
 world values-module { export values; }
