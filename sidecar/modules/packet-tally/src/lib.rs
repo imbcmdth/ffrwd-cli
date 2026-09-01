@@ -87,7 +87,7 @@ impl Guest for PacketTally {
         }
         let mut pads = Vec::with_capacity(streams.len());
         for stream in &streams {
-            let (width, height) = match stream.coded.format {
+            let (width, height) = match &stream.coded.format {
                 CodedFormat::Video(video) => (video.width, video.height),
                 CodedFormat::Audio(_) => return Err("packet_tally reads video".into()),
             };

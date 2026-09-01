@@ -25,6 +25,7 @@ const FORMAT: Format = Format {
         sample_rate: SAMPLE_RATE,
         channels: 1,
         sample_fmt: "f32",
+        channel_layout: None,
     }),
     time_base: TimeBase {
         num: 1,

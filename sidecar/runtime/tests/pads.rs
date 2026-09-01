@@ -59,6 +59,7 @@ fn format() -> Format {
             height: HEIGHT,
             pix_fmt: "rgba",
             frame_len: FRAME_LEN,
+            color: None,
         }),
         time_base: TimeBase { num: 1, den: 25 },
     }

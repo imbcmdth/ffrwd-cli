@@ -21,6 +21,7 @@ const FORMAT: Format = Format {
         height: HEIGHT,
         pix_fmt: PIX_FMT,
         frame_len: FRAME_LEN,
+        color: None,
     }),
     time_base: TimeBase { num: 1, den: 25 },
 };

@@ -133,6 +133,7 @@ fn format_from_stream(stream: &nut::Stream) -> Result<Format> {
                 height,
                 pix_fmt,
                 frame_len: frame_len_for(pix_fmt, width, height)?,
+                color: color_from(&stream.media),
             })
         }
         nut::Media::Audio {
@@ -157,10 +158,81 @@ fn format_from_stream(stream: &nut::Stream) -> Result<Format> {
                 sample_rate,
                 channels,
                 sample_fmt,
+                // The NUT audio header carries a rate and a count and no
+                // layout, so there is none to hand on.
+                channel_layout: None,
             })
         }
     };
     Ok(Format { media, time_base })
+}
+
+/// The colorimetry a NUT video header declares, in ffmpeg's own names. The
+/// wire codes the range and the matrix together (1 and 2 are Rec 601 and
+/// Rec 709 in the tv range; 16 on top of either is the pc range) and says
+/// nothing of primaries or transfer, which stay "unknown". Rec 601 names
+/// its matrix without choosing 525 or 625 lines - the coefficients are the
+/// same - and bt470bg is the name used here.
+fn color_from(media: &nut::Media) -> Option<runtime::ColorInfo> {
+    let nut::Media::Video {
+        colorspace_type, ..
+    } = media
+    else {
+        return None;
+    };
+    let space = match colorspace_type & !16 {
+        1 => "bt470bg",
+        2 => "bt709",
+        _ => return None,
+    };
+    Some(runtime::ColorInfo {
+        range: if colorspace_type & 16 != 0 {
+            "pc"
+        } else {
+            "tv"
+        },
+        primaries: "unknown",
+        trc: "unknown",
+        space,
+    })
+}
+
+/// The pixel aspect ratio a NUT video header declares. The wire spells
+/// unknown as 0/0, and this wire's own headers write 1/1.
+fn aspect_from(sample_width: u64, sample_height: u64) -> Option<(i32, i32)> {
+    let num = i32::try_from(sample_width).ok()?;
+    let den = i32::try_from(sample_height).ok()?;
+    (num > 0 && den > 0).then_some((num, den))
+}
+
+/// The h264 profile and level: bytes 1 and 3 of the SPS payload, the same
+/// two an avcC copies into its own header. The NUT wire carries Annex-B
+/// extradata, so the SPS is found behind its start code; extradata already
+/// shaped as an avcC (first byte 1, a version no Annex-B stream starts
+/// with) reads the same bytes off its header instead.
+fn h264_profile_level(extradata: &[u8]) -> Option<(i32, i32)> {
+    if extradata.first() == Some(&1) {
+        return match extradata {
+            [_, profile, _, level, ..] => Some((i32::from(*profile), i32::from(*level))),
+            _ => None,
+        };
+    }
+    let mut at = 0usize;
+    while at + 4 < extradata.len() {
+        if extradata[at..at + 3] != [0, 0, 1] {
+            at += 1;
+            continue;
+        }
+        let nal = &extradata[at + 3..];
+        if nal[0] & 0x1f == 7 {
+            return match nal {
+                [_, profile, _, level, ..] => Some((i32::from(*profile), i32::from(*level))),
+                _ => None,
+            };
+        }
+        at += 3;
+    }
+    None
 }
 
 /// What arrives on the wire must be what the header said: a whole frame, or a
@@ -262,6 +334,7 @@ struct Args {
     jobs: Option<usize>,
 }
 
+#[derive(Clone)]
 enum InputPath {
     Stdin,
     File(String),
@@ -987,26 +1060,48 @@ fn stream_info(args: &Args, stream: &nut::Stream) -> StreamInfo {
 /// Reads every input's headers, then runs whatever this process hosts over
 /// their frames.
 fn run(args: &Args) -> Result<()> {
-    let mut readers: Vec<Input> = Vec::new();
-    for path in &args.inputs {
-        let reader = io::BufReader::with_capacity(1 << 20, open_input(path)?);
-        let demuxer = if args.annotations.input {
-            nut::Demuxer::open_annotated(reader)
-        } else {
-            nut::Demuxer::open(reader)
-        }
-        .context("reading the NUT input")?;
-        readers.push(demuxer);
-    }
-
-    // A packet sink takes the encoded stream itself, so it is dispatched
-    // before anything asks the input for decoded frames.
+    // A packet sink is dispatched before any header is read here: its
+    // reader threads open the inputs themselves and drain them from the
+    // first byte, so no producer ever waits on another producer's warmup
+    // or on the module's own connect.
     if let Modules::Single { path, params } = &args.modules {
         let is_packet_sink = ffrwd_wasm_runtime::runtime::exports_packet_sink(path)
             .with_context(|| format!("opening module {path}"))?;
         if is_packet_sink {
-            return run_packet_sink(args, path, params, readers);
+            return run_packet_sink(args, path, params);
         }
+    }
+
+    // Headers are read concurrently: one producer's first bytes can wait on
+    // another producer's whole chain starting up, and a fast input left
+    // unread meanwhile fills its pipe and blocks the producer they share.
+    let mut readers: Vec<Input> = Vec::new();
+    std::thread::scope(|scope| -> Result<()> {
+        let handles: Vec<_> = args
+            .inputs
+            .iter()
+            .map(|path| {
+                scope.spawn(move || -> Result<Input> {
+                    let reader = io::BufReader::with_capacity(1 << 20, open_input(path)?);
+                    if args.annotations.input {
+                        nut::Demuxer::open_annotated(reader)
+                    } else {
+                        nut::Demuxer::open(reader)
+                    }
+                    .context("reading the NUT input")
+                })
+            })
+            .collect();
+        for handle in handles {
+            let demuxer = handle
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))?;
+            readers.push(demuxer);
+        }
+        Ok(())
+    })?;
+
+    if let Modules::Single { .. } = &args.modules {
         // A sink is what reads several streams off several -i; a frame module
         // reads its pads out of ONE input, wired by -filter_complex.
         if readers.len() > 1 {
@@ -1093,7 +1188,7 @@ fn run(args: &Args) -> Result<()> {
 /// flow control: a stalled consumer stops the producer instead of buffering
 /// it without limit. The wasm instance is called from this thread alone;
 /// only the I/O grows threads.
-fn run_packet_sink(args: &Args, module: &str, params: &str, inputs: Vec<Input>) -> Result<()> {
+fn run_packet_sink(args: &Args, module: &str, params: &str) -> Result<()> {
     // A packet sink is an exclusive lane by nature: packets reach it in
     // decode order, so one instance reads them and `-jobs` caps nothing.
     if args.annotations.input {
@@ -1117,39 +1212,71 @@ fn run_packet_sink(args: &Args, module: &str, params: &str, inputs: Vec<Input>) 
         }
     }
 
-    let mut opened = Vec::with_capacity(inputs.len());
-    for (pad, input) in inputs.iter().enumerate() {
-        opened.push(coded_pad(args, module, pad, input.stream())?);
+    // The readers start before anything else: each opens its own input and
+    // pumps packets into its bounded queue from the first byte, so a fast
+    // producer (a live microphone, say) is drained while a slow one's
+    // whole chain still warms up, and while the module's own open - which
+    // may dial a relay - takes its time. The threads are not joined: on an
+    // error the process exits and takes a reader blocked in a pipe read
+    // with it, which a join would wait on forever.
+    let pads = args.inputs.len();
+    let queues = Arc::new(PadQueues::new(pads));
+    let (told, headers) = std::sync::mpsc::channel();
+    for (pad, path) in args.inputs.iter().enumerate() {
+        let queues = Arc::clone(&queues);
+        let told = told.clone();
+        let path = path.clone();
+        std::thread::spawn(move || {
+            let opened = (|| {
+                let reader = io::BufReader::with_capacity(1 << 20, open_input(&path)?);
+                // -annotations input is refused above, so the packets are bare.
+                nut::Demuxer::open(reader).context("reading the NUT input")
+            })();
+            match opened {
+                Ok(input) => {
+                    let _ = told.send((pad, Ok(input.stream().clone())));
+                    read_pad(input, pad, &queues);
+                }
+                Err(err) => {
+                    let _ = told.send((pad, Err(err)));
+                }
+            }
+        });
     }
-    let pads = opened.len();
+    drop(told);
+
+    // The headers arrive in whatever order the producers start; the module
+    // is opened once every pad has reported its stream.
+    let mut streams: Vec<Option<nut::Stream>> = (0..pads).map(|_| None).collect();
+    for _ in 0..pads {
+        let (pad, stream) = headers.recv().expect("every reader reports its header");
+        streams[pad] = Some(stream.with_context(|| format!("input {pad}"))?);
+    }
+    let mut opened = Vec::with_capacity(pads);
+    for (pad, stream) in streams.iter().enumerate() {
+        let stream = stream.as_ref().expect("every pad reported");
+        opened.push(coded_pad(args, module, pad, stream)?);
+    }
     let mut sink = runtime::PacketSink::open(module, &opened, params)
         .with_context(|| format!("opening module {module}"))?;
 
-    let queues = PadQueues::new(pads);
-    std::thread::scope(|scope| -> Result<()> {
-        for (pad, input) in inputs.into_iter().enumerate() {
-            let queues = &queues;
-            scope.spawn(move || read_pad(input, pad, queues));
-        }
-        let outcome = (|| -> Result<()> {
-            loop {
-                let (carried, done) = queues.take()?;
-                if done {
-                    return Ok(());
-                }
-                let emitted = sink
-                    .process(&carried, false)
-                    .with_context(|| format!("{}: processing packets", sink.name()))?;
-                for writer in &mut row_outputs {
-                    write_rows(writer, &emitted.rows)?;
-                }
+    let outcome = (|| -> Result<()> {
+        loop {
+            let (carried, done) = queues.take()?;
+            if done {
+                return Ok(());
             }
-        })();
-        // Whatever happened, a reader still waiting for queue space must
-        // wake and stop, or the join below never returns.
-        queues.close();
-        outcome
-    })?;
+            let emitted = sink
+                .process(&carried, false)
+                .with_context(|| format!("{}: processing packets", sink.name()))?;
+            for writer in &mut row_outputs {
+                write_rows(writer, &emitted.rows)?;
+            }
+        }
+    })();
+    // A reader still waiting for queue space must wake and stop.
+    queues.close();
+    outcome?;
 
     // The final call, carrying no packets: whatever the sink held back
     // arrives as rows, and the trailing rows follow them.
@@ -1257,49 +1384,91 @@ impl PadQueues {
     }
 }
 
+/// Settles packet durations for one pad. NUT frames carry no duration
+/// field, so the wire never says it directly; where the stream does not
+/// reorder (decode delay 0) decode order is presentation order, and the
+/// next packet's pts settles the previous one's duration exactly. A
+/// reordering stream's presentation successor is not the next packet read,
+/// and the final packet has no successor at all: both stay None.
+struct Durations {
+    /// Whether successive pts settle durations at all.
+    settled: bool,
+    /// The packet the next one's pts will settle.
+    pending: Option<runtime::Packet>,
+}
+
+impl Durations {
+    fn new(decode_delay: u64) -> Durations {
+        Durations {
+            settled: decode_delay == 0,
+            pending: None,
+        }
+    }
+
+    /// Takes one packet in and returns the packet now ready to queue: the
+    /// previous one with its duration settled, or - for a stream whose
+    /// durations stay unknown - this one straight through.
+    fn push(&mut self, packet: runtime::Packet) -> Option<runtime::Packet> {
+        if !self.settled {
+            return Some(packet);
+        }
+        let mut ready = self.pending.replace(packet);
+        if let Some(prev) = ready.as_mut() {
+            let next_pts = self.pending.as_ref().expect("just replaced").pts;
+            // Unknown is spelled None, never 0, so a step that is not
+            // forward settles nothing.
+            prev.duration = Some(next_pts - prev.pts).filter(|d| *d > 0);
+        }
+        ready
+    }
+
+    /// The held packet at the end of the input, its duration unknown: no
+    /// successor settles it.
+    fn finish(&mut self) -> Option<runtime::Packet> {
+        self.pending.take()
+    }
+}
+
 /// One pad's reader: blocking reads off its own input, each packet into the
 /// pad's queue, waiting whenever the queue is over its byte bound. Decode
 /// order per pad is preserved by construction - one thread, one queue.
 fn read_pad(mut input: Input, pad: usize, queues: &PadQueues) {
+    let mut durations = Durations::new(input.stream().decode_delay);
     let mut buf: Vec<u8> = Vec::new();
     let mut index = 0u64;
     loop {
         let read = input
             .read_packet(&mut buf)
             .with_context(|| format!("reading packet {index} of pad {pad}"));
-        let mut state = queues.state.lock().expect("the drive loop holds no panic");
         match read {
             Ok(Some(packet)) => {
-                while !state.dead
-                    && state.pads[pad].bytes >= PAD_BUFFER_BYTES
-                    && !state.pads[pad].packets.is_empty()
-                {
-                    state = queues
-                        .drained
-                        .wait(state)
-                        .expect("the drive loop holds no panic");
-                }
-                if state.dead {
-                    return;
-                }
-                let data = std::mem::take(&mut buf);
-                state.pads[pad].bytes += data.len();
-                state.pads[pad].packets.push(runtime::Packet {
+                let ready = durations.push(runtime::Packet {
                     pts: packet.pts,
                     dts: packet.dts,
+                    duration: None,
                     keyframe: packet.keyframe,
-                    data,
+                    data: std::mem::take(&mut buf),
                 });
                 index += 1;
-                // One consumer waits on `filled`, so one wake reaches it.
-                queues.filled.notify_one();
+                if let Some(packet) = ready {
+                    if !queue_packet(queues, pad, packet) {
+                        return;
+                    }
+                }
             }
             Ok(None) => {
+                if let Some(packet) = durations.finish() {
+                    if !queue_packet(queues, pad, packet) {
+                        return;
+                    }
+                }
+                let mut state = queues.state.lock().expect("the drive loop holds no panic");
                 state.pads[pad].closed = true;
                 queues.filled.notify_one();
                 return;
             }
             Err(error) => {
+                let mut state = queues.state.lock().expect("the drive loop holds no panic");
                 state.pads[pad].failed = Some(error);
                 state.pads[pad].closed = true;
                 queues.filled.notify_one();
@@ -1307,6 +1476,29 @@ fn read_pad(mut input: Input, pad: usize, queues: &PadQueues) {
             }
         }
     }
+}
+
+/// One packet into its pad's queue, waiting whenever the queue is over its
+/// byte bound. False when the drive loop is gone and the reader must stop.
+fn queue_packet(queues: &PadQueues, pad: usize, packet: runtime::Packet) -> bool {
+    let mut state = queues.state.lock().expect("the drive loop holds no panic");
+    while !state.dead
+        && state.pads[pad].bytes >= PAD_BUFFER_BYTES
+        && !state.pads[pad].packets.is_empty()
+    {
+        state = queues
+            .drained
+            .wait(state)
+            .expect("the drive loop holds no panic");
+    }
+    if state.dead {
+        return false;
+    }
+    state.pads[pad].bytes += packet.data.len();
+    state.pads[pad].packets.push(packet);
+    // One consumer waits on `filled`, so one wake reaches it.
+    queues.filled.notify_one();
+    true
 }
 
 /// One pad of a packet sink, from the NUT header the input opened with. A
@@ -1332,14 +1524,38 @@ fn coded_pad(
         );
     };
     let format = match stream.media {
-        nut::Media::Video { width, height, .. } => runtime::CodedFormat::Video { width, height },
+        nut::Media::Video {
+            width,
+            height,
+            sample_width,
+            sample_height,
+            ..
+        } => runtime::CodedFormat::Video {
+            width,
+            height,
+            sample_aspect_ratio: aspect_from(sample_width, sample_height),
+            color: color_from(&stream.media),
+        },
         nut::Media::Audio {
             sample_rate,
             channels,
         } => runtime::CodedFormat::Audio {
             sample_rate,
             channels,
+            // The NUT audio header carries no layout; see `format_from_stream`.
+            channel_layout: None,
         },
+    };
+    // Profile and level: the NUT stream header has no field for either, so
+    // h264's are read off the SPS the extradata carries. The other codecs
+    // this wire names keep theirs elsewhere (hevc and av1 inside their own
+    // headers, aac nowhere), and stay None rather than guessed.
+    let (profile, level) = match codec {
+        "h264" => match h264_profile_level(&stream.extradata) {
+            Some((profile, level)) => (Some(profile), Some(level)),
+            None => (None, None),
+        },
+        _ => (None, None),
     };
     let coded = runtime::CodedStream {
         codec: codec.to_string(),
@@ -1349,6 +1565,8 @@ fn coded_pad(
         },
         format,
         extradata: stream.extradata.clone(),
+        profile,
+        level,
     };
     let info = args.stream_info.clone().unwrap_or_else(|| StreamInfo {
         index: pad as u32,
@@ -1788,6 +2006,132 @@ fn main() {
     if let Err(e) = run(&args) {
         eprintln!("ffrwd-wasm: {e:#}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod stream_field_tests {
+    use super::{aspect_from, color_from, h264_profile_level, Durations};
+    use ffrwd_wasm::nut;
+    use ffrwd_wasm_runtime::runtime;
+
+    fn video_media(colorspace_type: u64) -> nut::Media {
+        nut::Media::Video {
+            width: 16,
+            height: 16,
+            sample_width: 1,
+            sample_height: 1,
+            colorspace_type,
+        }
+    }
+
+    #[test]
+    fn the_nut_colorspace_codes_read_as_ffmpeg_names() {
+        for (coded, range, space) in [
+            (1u64, "tv", "bt470bg"),
+            (2, "tv", "bt709"),
+            (17, "pc", "bt470bg"),
+            (18, "pc", "bt709"),
+        ] {
+            let color = color_from(&video_media(coded)).expect("a named colorspace");
+            assert_eq!((color.range, color.space), (range, space), "code {coded}");
+            assert_eq!(color.primaries, "unknown", "the wire does not say");
+            assert_eq!(color.trc, "unknown", "the wire does not say");
+        }
+    }
+
+    #[test]
+    fn an_unknown_or_unnamed_colorspace_carries_nothing() {
+        for coded in [0u64, 3, 16, 40] {
+            assert_eq!(color_from(&video_media(coded)), None, "code {coded}");
+        }
+        let audio = nut::Media::Audio {
+            sample_rate: 48000,
+            channels: 2,
+        };
+        assert_eq!(color_from(&audio), None);
+    }
+
+    #[test]
+    fn the_aspect_ratio_is_the_headers_or_nothing() {
+        assert_eq!(aspect_from(4, 3), Some((4, 3)));
+        assert_eq!(aspect_from(1, 1), Some((1, 1)));
+        // 0/0 is the wire's unknown, and a half-zero pair is no ratio.
+        assert_eq!(aspect_from(0, 0), None);
+        assert_eq!(aspect_from(4, 0), None);
+        assert_eq!(aspect_from(u64::MAX, 1), None);
+    }
+
+    #[test]
+    fn the_h264_profile_and_level_come_off_the_annex_b_sps() {
+        // SPS behind a 4-byte start code: profile 0x64 (High), level 0x1f,
+        // then the PPS the extradata also carries.
+        let extradata = [
+            0u8, 0, 0, 1, 0x67, 0x64, 0x00, 0x1f, 0xab, // SPS
+            0, 0, 0, 1, 0x68, 0xee, // PPS
+        ];
+        assert_eq!(h264_profile_level(&extradata), Some((0x64, 0x1f)));
+        // A PPS first does not confuse the scan.
+        let pps_first = [0u8, 0, 0, 1, 0x68, 0xee, 0, 0, 1, 0x67, 0x42, 0xc0, 0x1e];
+        assert_eq!(h264_profile_level(&pps_first), Some((0x42, 0x1e)));
+    }
+
+    #[test]
+    fn avcc_shaped_extradata_reads_the_same_bytes_off_its_header() {
+        assert_eq!(
+            h264_profile_level(&[1, 0x64, 0x00, 0x1f, 0xff, 0xe1]),
+            Some((0x64, 0x1f))
+        );
+    }
+
+    #[test]
+    fn extradata_without_a_readable_sps_names_no_profile() {
+        assert_eq!(h264_profile_level(&[]), None);
+        assert_eq!(h264_profile_level(&[0, 0, 0, 1, 0x68, 0xee]), None);
+        assert_eq!(h264_profile_level(&[0xab, 0xcd, 0xef]), None);
+    }
+
+    fn packet(pts: i64) -> runtime::Packet {
+        runtime::Packet {
+            pts,
+            dts: Some(pts),
+            duration: None,
+            keyframe: true,
+            data: vec![0u8; 4],
+        }
+    }
+
+    #[test]
+    fn the_next_pts_settles_the_previous_packets_duration() {
+        let mut durations = Durations::new(0);
+        assert!(
+            durations.push(packet(0)).is_none(),
+            "held for its successor"
+        );
+        let first = durations.push(packet(1024)).expect("settled");
+        assert_eq!((first.pts, first.duration), (0, Some(1024)));
+        let second = durations.push(packet(2048)).expect("settled");
+        assert_eq!((second.pts, second.duration), (1024, Some(1024)));
+        // The final packet has no successor, so its duration stays unknown.
+        let last = durations.finish().expect("the held tail");
+        assert_eq!((last.pts, last.duration), (2048, None));
+        assert!(durations.finish().is_none());
+    }
+
+    #[test]
+    fn a_reordering_stream_settles_no_durations_and_holds_nothing() {
+        let mut durations = Durations::new(2);
+        let through = durations.push(packet(7)).expect("straight through");
+        assert_eq!((through.pts, through.duration), (7, None));
+        assert!(durations.finish().is_none(), "nothing was held");
+    }
+
+    #[test]
+    fn a_step_that_is_not_forward_settles_nothing() {
+        let mut durations = Durations::new(0);
+        assert!(durations.push(packet(5)).is_none());
+        let first = durations.push(packet(5)).expect("released");
+        assert_eq!(first.duration, None, "unknown is never 0");
     }
 }
 

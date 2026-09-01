@@ -32,11 +32,25 @@ interface types {
     den: s32,
   }
 
+  /// A stream's colorimetry, in ffmpeg's own names: "tv" or "pc" for the
+  /// range, "bt709" and the like for the rest. A field the wire does not
+  /// settle is "unknown", ffmpeg's own spelling for it.
+  record color-info {
+    range: string,
+    primaries: string,
+    trc: string,
+    space: string,
+  }
+
   /// The frames of a video instance, fixed for the life of the instance.
+  /// Frames cross this boundary square-pixel: the host rescales anamorphic
+  /// input before it arrives, so no aspect ratio is carried here.
   record video-format {
     width: u32,
     height: u32,
     pix-fmt: string,
+    /// The colorimetry the stream header declared; none where it did not.
+    color: option<color-info>,
   }
 
   /// The samples of an audio instance, fixed for the life of the instance.
@@ -45,6 +59,9 @@ interface types {
     channels: u32,
     /// "f32" or "s16", interleaved.
     sample-fmt: string,
+    /// ffmpeg's name for the channel layout ("stereo", "5.1"), which a
+    /// count alone cannot say; none where the wire does not carry one.
+    channel-layout: option<string>,
   }
 
   /// What an instance is opened for, which is what tells its kind. A module
@@ -289,7 +306,7 @@ interface window-filter {
 /// query named, in that order, and `process` is handed one packet list per
 /// pad in the same order.
 interface packet-sink {
-  use types.{meta, rational, stream-info};
+  use types.{color-info, meta, rational, stream-info};
 
   /// How many streams of one kind a sink reads.
   enum arity {
@@ -325,12 +342,21 @@ interface packet-sink {
   record coded-video {
     width: u32,
     height: u32,
+    /// The pixel aspect ratio the stream declares. Packets cannot be
+    /// host-rescaled, so a packager writes it through (mp4's `pasp`);
+    /// none where the wire does not say.
+    sample-aspect-ratio: option<rational>,
+    /// The colorimetry the stream header declared; none where it did not.
+    color: option<color-info>,
   }
 
   /// The samples a coded audio stream declares.
   record coded-audio {
     sample-rate: u32,
     channels: u32,
+    /// ffmpeg's name for the channel layout ("stereo", "5.1"), which a
+    /// count alone cannot say; none where the wire does not carry one.
+    channel-layout: option<string>,
   }
 
   /// What a coded stream carries, which is what tells its kind.
@@ -351,6 +377,11 @@ interface packet-sink {
     /// it: for h264, the SPS and PPS a downstream packager needs before the
     /// first packet.
     extradata: list<u8>,
+    /// The codec's profile, in the codec's own numbering - what ffmpeg's
+    /// codec parameters carry; none where the wire does not say.
+    profile: option<s32>,
+    /// The codec's level, likewise.
+    level: option<s32>,
   }
 
   /// One pad's stream, told once at init: what the wire's own header said
@@ -370,6 +401,10 @@ interface packet-sink {
     /// When the packet is decoded; never decreasing. Absent for the first
     /// packets of a reordering stream, where the wire does not settle it.
     dts: option<s64>,
+    /// How long the packet is presented, in the stream's time base: the
+    /// next packet's pts minus this one's, in presentation order. None
+    /// where the wire does not settle it - unknown is never spelled 0.
+    duration: option<s64>,
     /// Whether decoding can start at this packet.
     keyframe: bool,
     /// The encoded bytes, untouched.

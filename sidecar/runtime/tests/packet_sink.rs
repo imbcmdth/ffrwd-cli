@@ -61,8 +61,15 @@ fn pad(width: u32, height: u32) -> SinkInput {
         stream: CodedStream {
             codec: "h264".to_string(),
             time_base: TimeBase { num: 1, den: 25 },
-            format: CodedFormat::Video { width, height },
+            format: CodedFormat::Video {
+                width,
+                height,
+                sample_aspect_ratio: None,
+                color: None,
+            },
             extradata: vec![0, 0, 0, 1, 0x67],
+            profile: None,
+            level: None,
         },
         info: StreamInfo::default(),
     }
@@ -72,6 +79,7 @@ fn packet(pts: i64, keyframe: bool, len: usize) -> Packet {
     Packet {
         pts,
         dts: Some(pts),
+        duration: None,
         keyframe,
         data: vec![0xAB; len],
     }

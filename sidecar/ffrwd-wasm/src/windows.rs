@@ -222,6 +222,7 @@ mod tests {
                 sample_rate: 48_000,
                 channels: 1,
                 sample_fmt: "f32",
+                channel_layout: None,
             }),
             time_base: TimeBase {
                 num: 1,
@@ -237,6 +238,7 @@ mod tests {
                 height: 2,
                 pix_fmt: "rgba",
                 frame_len: 16,
+                color: None,
             }),
             time_base: TimeBase { num: 1, den: 25 },
         }
@@ -424,6 +426,7 @@ mod tests {
             sample_rate: 48_000,
             channels: 2,
             sample_fmt: "s16",
+            channel_layout: None,
         };
         assert_eq!(
             ticks_per_sample(

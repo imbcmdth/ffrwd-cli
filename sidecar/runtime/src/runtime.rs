@@ -153,8 +153,38 @@ macro_rules! meta_with_rows_language {
 
 mod world_0120 {
     stream_info_with_time_base!();
-    kind_bearing_format!();
     meta_with_rows_language!();
+
+    /// What this world's `init` is handed, from the host's own format. The
+    /// only world whose records carry colorimetry and channel layout, so it
+    /// converts by hand where the older ones share a macro.
+    pub fn format(format: &crate::runtime::Format) -> video::ffrwd::av::types::Format {
+        use video::ffrwd::av::types::{AudioFormat, Format, VideoFormat};
+        match format.media {
+            crate::runtime::Media::Video(video) => Format::Video(VideoFormat {
+                width: video.width,
+                height: video.height,
+                pix_fmt: video.pix_fmt.to_string(),
+                color: video.color.map(color_info),
+            }),
+            crate::runtime::Media::Audio(audio) => Format::Audio(AudioFormat {
+                sample_rate: audio.sample_rate,
+                channels: audio.channels,
+                sample_fmt: audio.sample_fmt.to_string(),
+                channel_layout: audio.channel_layout.map(str::to_string),
+            }),
+        }
+    }
+
+    /// The host's colorimetry in this world's spelling.
+    pub fn color_info(color: crate::runtime::ColorInfo) -> video::ffrwd::av::types::ColorInfo {
+        video::ffrwd::av::types::ColorInfo {
+            range: color.range.to_string(),
+            primaries: color.primaries.to_string(),
+            trc: color.trc.to_string(),
+            space: color.space.to_string(),
+        }
+    }
 
     pub mod video {
         wasmtime::component::bindgen!({ path: "../wit", world: "video-module" });
@@ -600,7 +630,19 @@ fn tags_with_time_base(stream: &StreamInfo, time_base: TimeBase) -> Vec<(String,
     tags
 }
 
-/// The frames a video instance is opened for.
+/// A stream's colorimetry, in ffmpeg's own names: `tv`/`pc` for the range,
+/// `bt709` and the like for the rest. A field the wire does not settle is
+/// `unknown`, ffmpeg's own spelling for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColorInfo {
+    pub range: &'static str,
+    pub primaries: &'static str,
+    pub trc: &'static str,
+    pub space: &'static str,
+}
+
+/// The frames a video instance is opened for. Frames cross the module
+/// boundary square-pixel, so no aspect ratio travels here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VideoFormat {
     pub width: u32,
@@ -609,6 +651,8 @@ pub struct VideoFormat {
     /// Byte size of one frame in `pix_fmt`, which only the caller can work
     /// out.
     pub frame_len: usize,
+    /// The colorimetry the stream header declared; None where it did not.
+    pub color: Option<ColorInfo>,
 }
 
 /// The samples an audio instance is opened for. One sample is one instant
@@ -619,6 +663,9 @@ pub struct AudioFormat {
     pub channels: u32,
     /// `f32` or `s16`, interleaved.
     pub sample_fmt: &'static str,
+    /// ffmpeg's name for the channel layout (`stereo`, `5.1`); None where
+    /// the wire does not carry one.
+    pub channel_layout: Option<&'static str>,
 }
 
 impl AudioFormat {
@@ -810,8 +857,23 @@ impl BorrowedWindow {
 /// What a coded stream carries, which is what tells its kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodedFormat {
-    Video { width: u32, height: u32 },
-    Audio { sample_rate: u32, channels: u32 },
+    Video {
+        width: u32,
+        height: u32,
+        /// The pixel aspect ratio the stream declares, as num/den; None
+        /// where the wire does not say.
+        sample_aspect_ratio: Option<(i32, i32)>,
+        /// The colorimetry the stream header declared; None where it did
+        /// not.
+        color: Option<ColorInfo>,
+    },
+    Audio {
+        sample_rate: u32,
+        channels: u32,
+        /// ffmpeg's name for the channel layout; None where the wire does
+        /// not carry one.
+        channel_layout: Option<&'static str>,
+    },
 }
 
 impl CodedFormat {
@@ -833,6 +895,11 @@ pub struct CodedStream {
     pub format: CodedFormat,
     /// The codec's out-of-band header, as the container carried it.
     pub extradata: Vec<u8>,
+    /// The codec's profile, in the codec's own numbering; None where the
+    /// wire does not say.
+    pub profile: Option<i32>,
+    /// The codec's level, likewise.
+    pub level: Option<i32>,
 }
 
 /// One pad a packet sink is opened for: the encoding the wire declared, and
@@ -886,6 +953,9 @@ pub struct Packet {
     /// Absent for the first packets of a reordering stream, where the wire
     /// does not settle it.
     pub dts: Option<i64>,
+    /// The next packet's pts minus this one's, in presentation order, in
+    /// the stream's time base; None where the wire does not settle it.
+    pub duration: Option<i64>,
     pub keyframe: bool,
     pub data: Vec<u8>,
 }
@@ -2625,11 +2695,12 @@ impl PacketInstance {
     ) -> Result<Result<(), String>> {
         // A world before 0.12.0 opens for one video stream, which is all its
         // `coded-stream` can say; the shape is refused before it gets here.
+        // The fields those frozen worlds never carried are dropped here.
         macro_rules! one_video_stream {
             ($b:expr, $world:ident) => {{
                 let input = &inputs[0];
                 let (num, den) = input.stream.time_base.rational(name)?;
-                let CodedFormat::Video { width, height } = input.stream.format else {
+                let CodedFormat::Video { width, height, .. } = input.stream.format else {
                     bail!("{name} reads one video stream, and pad 0 carries audio");
                 };
                 let wit_stream = $world::packet::exports::ffrwd::av::packet_sink::CodedStream {
@@ -2652,15 +2723,27 @@ impl PacketInstance {
                 for input in inputs {
                     let (num, den) = input.stream.time_base.rational(name)?;
                     let format = match input.stream.format {
-                        CodedFormat::Video { width, height } => {
-                            wit::CodedFormat::Video(wit::CodedVideo { width, height })
-                        }
+                        CodedFormat::Video {
+                            width,
+                            height,
+                            sample_aspect_ratio,
+                            color,
+                        } => wit::CodedFormat::Video(wit::CodedVideo {
+                            width,
+                            height,
+                            sample_aspect_ratio: sample_aspect_ratio.map(|(num, den)| {
+                                world_0120::video::ffrwd::av::types::Rational { num, den }
+                            }),
+                            color: color.map(world_0120::color_info),
+                        }),
                         CodedFormat::Audio {
                             sample_rate,
                             channels,
+                            channel_layout,
                         } => wit::CodedFormat::Audio(wit::CodedAudio {
                             sample_rate,
                             channels,
+                            channel_layout: channel_layout.map(str::to_string),
                         }),
                     };
                     streams.push(wit::InputStream {
@@ -2669,6 +2752,8 @@ impl PacketInstance {
                             time_base: world_0120::video::ffrwd::av::types::Rational { num, den },
                             format,
                             extradata: input.stream.extradata.clone(),
+                            profile: input.stream.profile,
+                            level: input.stream.level,
                         },
                         info: world_0120::stream_info(&input.info, input.stream.time_base, name)?,
                     });
@@ -2731,6 +2816,7 @@ impl PacketInstance {
                             .map(|p| wit::Packet {
                                 pts: p.pts,
                                 dts: p.dts,
+                                duration: p.duration,
                                 keyframe: p.keyframe,
                                 data: p.data.clone(),
                             })
@@ -3512,6 +3598,7 @@ mod tests {
             sample_rate: 48_000,
             channels: 2,
             sample_fmt: "f32",
+            channel_layout: None,
         };
         assert_eq!(stereo_f32.sample_len(), 8);
         assert_eq!(

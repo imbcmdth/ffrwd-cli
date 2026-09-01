@@ -382,6 +382,26 @@ mod tests {
     }
 
     #[test]
+    fn colorspace_and_aspect_ratio_survive_a_round_trip() {
+        // What an upstream sidecar's header declared: Rec 709 full range,
+        // anamorphic 4:3 samples. The output header is built from the
+        // input's, so both must come back exactly - `round_trip` compares
+        // the whole `media`.
+        let mut stream = a_stream();
+        stream.media = Media::Video {
+            width: 8,
+            height: 8,
+            sample_width: 4,
+            sample_height: 3,
+            colorspace_type: 18,
+        };
+        let frames: Vec<(i64, Vec<u8>)> = (0..2i64)
+            .map(|i| (i * 65536, vec![i as u8; 8 * 8 * 4]))
+            .collect();
+        assert_eq!(round_trip(&stream, &frames), frames);
+    }
+
+    #[test]
     fn timestamps_need_not_be_evenly_spaced() {
         let stream = a_stream();
         let frames: Vec<(i64, Vec<u8>)> = [0i64, 7, 1_000_000, 1_000_001]

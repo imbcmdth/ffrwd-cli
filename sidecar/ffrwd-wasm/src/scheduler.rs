@@ -659,6 +659,7 @@ mod tests {
                 height: 2,
                 pix_fmt: "rgba",
                 frame_len: 16,
+                color: None,
             }),
             time_base: TimeBase { num: 1, den: 25 },
         }

@@ -184,6 +184,7 @@ fn format() -> Format {
             height: HEIGHT,
             pix_fmt: "yuv420p",
             frame_len: (WIDTH * HEIGHT) as usize * 3 / 2,
+            color: None,
         }),
         time_base: TimeBase { num: 1, den: 25 },
     }
