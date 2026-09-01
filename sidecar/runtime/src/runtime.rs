@@ -905,7 +905,7 @@ pub struct DescribedPacketSink {
     pub meta: Meta,
     /// ffmpeg names for the VIDEO codecs accepted, most preferred first;
     /// empty is every codec.
-    pub codecs: Vec<String>,
+    pub video_codecs: Vec<String>,
     /// The same for AUDIO. A world before 0.12.0 named no audio codec and
     /// read no audio stream, so this is empty for one.
     pub audio_codecs: Vec<String>,
@@ -2579,7 +2579,9 @@ impl PacketInstance {
                     .map_err(wasm_err)?;
                 DescribedPacketSink {
                     meta: $world::meta(d.meta),
-                    codecs: d.codecs,
+                    // The frozen worlds spell the field `codecs`; the name
+                    // grew a kind when audio arrived.
+                    video_codecs: d.codecs,
                     audio_codecs: Vec::new(),
                     video: Arity::One,
                     audio: Arity::Zero,
@@ -2602,7 +2604,7 @@ impl PacketInstance {
                     .map_err(wasm_err)?;
                 DescribedPacketSink {
                     meta: world_0120::meta(d.meta),
-                    codecs: d.codecs,
+                    video_codecs: d.video_codecs,
                     audio_codecs: d.audio_codecs,
                     video: arity(d.video),
                     audio: arity(d.audio),
@@ -2822,7 +2824,7 @@ pub struct PacketSink {
 fn check_sink_inputs(described: &DescribedPacketSink, inputs: &[SinkInput]) -> Result<()> {
     let name = &described.meta.name;
     for (kind, arity, accepted) in [
-        ("video", described.video, &described.codecs),
+        ("video", described.video, &described.video_codecs),
         ("audio", described.audio, &described.audio_codecs),
     ] {
         let of_kind: Vec<&SinkInput> = inputs

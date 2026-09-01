@@ -305,10 +305,10 @@ class Described:
     `udp` are the effects the module imports, each of which puts the
     matching grant -- ``-http``, ``-net`` -- on that command line.
 
-    `codecs` is present exactly for a PACKET SINK -- a sink module that
-    consumes the encoder's own output rather than decoded frames -- and
-    lists the ffmpeg VIDEO codec names it accepts, most preferred first,
-    empty for every codec; `audio_codecs` says the same of audio. A packet
+    `video_codecs` is present exactly for a PACKET SINK -- a sink module
+    that consumes the encoder's own output rather than decoded frames --
+    and lists the ffmpeg VIDEO codec names it accepts, most preferred
+    first, empty for every codec; `audio_codecs` says the same of audio. A packet
     sink fills neither format list, so its `kind` is None; what it consumes
     is said by the COPY that encodes for it.
 
@@ -348,7 +348,7 @@ class Described:
     # under the sidecar's matching ``-http`` / ``-net`` grant.
     http: bool = False
     udp: bool = False
-    codecs: tuple[str, ...] | None = None
+    video_codecs: tuple[str, ...] | None = None
     audio_codecs: tuple[str, ...] = ()
     video_streams: SinkArity = "one"
     audio_streams: SinkArity = "none"
@@ -356,7 +356,7 @@ class Described:
     @property
     def packet_sink(self) -> bool:
         """True for a module whose export consumes encoded packets."""
-        return self.codecs is not None
+        return self.video_codecs is not None
 
     def sink_streams(self, kind: StreamType) -> SinkArity:
         """How many streams of `kind` this sink reads."""
@@ -364,7 +364,7 @@ class Described:
 
     def sink_codecs(self, kind: StreamType) -> tuple[str, ...]:
         """The codecs this sink accepts for `kind`; empty is every codec."""
-        return self.audio_codecs if kind == "audio" else (self.codecs or ())
+        return self.audio_codecs if kind == "audio" else (self.video_codecs or ())
 
     @property
     def kind(self) -> StreamType | None:
@@ -522,8 +522,8 @@ def _described(path: str, payload: object) -> Described:
         udp=payload.get("udp") is True,
         # Present only for a packet sink; its ABSENCE is what marks every
         # other module, so an absent key stays None rather than ().
-        codecs=_strings(payload["codecs"])
-        if isinstance(payload.get("codecs"), list)
+        video_codecs=_strings(payload["video_codecs"])
+        if isinstance(payload.get("video_codecs"), list)
         else None,
         audio_codecs=_strings(payload.get("audio_codecs")),
         # A sink built before the counts existed read one video stream.

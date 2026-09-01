@@ -3031,7 +3031,6 @@ class _Lowerer:
                     f"{declared.name}(<values>)",
                 )
             return
-        self._check_packet_sink_feed(declared, raw, sink_nodes)
         options = self._packet_sink_options(declared, raw)
         for node in sink_nodes:
             self.graph.packet_sinks[node] = self._packet_sink_pads(node, options, raw)
@@ -3085,34 +3084,6 @@ class _Lowerer:
             )
         return pads
 
-    def _check_packet_sink_feed(
-        self, declared: WasmFunction, raw: RawSink, sink_nodes: list[str]
-    ) -> None:
-        """Refuse a module's frames reaching a packet sink directly.
-
-        The encoder lives in the feeding ffmpeg, and two adjacent modules
-        share one sidecar with no ffmpeg between them -- so a module's output
-        can never be encoded on its way in. The run-time refusal this
-        forestalls is the sidecar's; here it lands on the COPY.
-        """
-        modules = {
-            fn.module: fn.name for fn in self.res.wasm.values() if not fn.is_value
-        }
-        for name in sink_nodes:
-            for ref in self.graph.nodes[name].inputs:
-                producer = ref.rpartition(":")[0] if ":" in ref else ref
-                node = self.graph.nodes.get(producer) or self.graph.nodes.get(ref)
-                if node is None or node.filter not in modules:
-                    continue
-                raise _error(
-                    ErrorCode.UNSUPPORTED_SQL,
-                    f"'{declared.name}' consumes encoded packets, and "
-                    f"{modules[node.filter]}() hands it decoded frames",
-                    raw.path_node,
-                    hint="a packet sink reads what the feeding ffmpeg encodes; "
-                    "give it a stream no module produced",
-                )
-
     def _packet_sink_options(
         self, declared: WasmFunction, raw: RawSink
     ) -> dict[str, object]:
@@ -3155,7 +3126,7 @@ class _Lowerer:
             options[option.name] = value
             option_nodes[option.name] = option.value
         _check_sink_option_conflicts(options, option_nodes, raw.path_node)
-        accepted = described.codecs or ()
+        accepted = described.video_codecs or ()
         for written in _each(options.get("video_codec")):
             assert isinstance(written, str)  # validated as a str above
             codec = encoder_codec(written)

@@ -33,6 +33,7 @@ from ffrwd.lower import lower
 from ffrwd.parser import ModuleExport, Resolved, parse, resolve
 from ffrwd.processes import (
     PIPE,
+    RAWVIDEO,
     AudioFormat,
     FfmpegProcess,
     ModuleShape,
@@ -3695,6 +3696,7 @@ def _sink_plan(sql: str, sink: Described | None = None) -> Compiled:
     modules = {
         SINK_MODULE: sink or _sink_described(),
         STATS_MODULE: _stats_described(),
+        MODULE: _described(),
     }
     return compile_all(sql, describe=lambda path: modules[path])
 
@@ -3839,6 +3841,30 @@ def test_a_sink_copy_compiles_to_a_feeder_and_a_sink_process() -> None:
     assert process.rows is None
 
 
+def test_a_frame_sink_composes_with_the_module_feeding_it() -> None:
+    """The always-cut rule keys on what a sink CONSUMES, not on it being a
+    sink: a frame sink reads decoded payloads, so a module feeding it glues
+    into the same sidecar - no encoder, no pipe between them."""
+    sql = (
+        DECLARE
+        + PLAIN_SINK_DECLARE
+        + "COPY (SELECT invert(f.video[1]) FROM input('a.mp4') f) TO drain()"
+    )
+    plan = _sink_plan(
+        sql, _sink_described(name="drain", params={}, reads_rows=False)
+    ).plan
+    assert plan is not None
+    assert len(plan.sidecars) == 1, "one region hosts the filter and the sink"
+    region = plan.sidecars[0]
+    assert [b.name for b in region.modules] == ["invert", "post_rows"]
+    assert region.sink is True
+    # The one stream edge is the region's boundary: decoded frames in,
+    # nothing between the two modules, and no encoder anywhere.
+    incoming = [e for e in plan.stream_edges if e.target == region.id]
+    assert [e.ref for e in incoming] == ["src:f:v:0"]
+    assert incoming[0].format.codec == RAWVIDEO
+
+
 def test_a_sink_process_maps_a_null_output() -> None:
     plan = _sink_plan(
         PLAIN_SINK_QUERY, _sink_described(name="drain", params={}, reads_rows=False)
@@ -3963,7 +3989,7 @@ def _packet_described(
     *,
     name: str = "packet_stats",
     world: str = "ffrwd:av@0.10.0",
-    codecs: tuple[str, ...] = (),
+    video_codecs: tuple[str, ...] = (),
     audio_codecs: tuple[str, ...] = (),
     video_streams: wasm.SinkArity = "one",
     audio_streams: wasm.SinkArity = "none",
@@ -3975,7 +4001,7 @@ def _packet_described(
         version="0.1.0",
         params_schema={"type": "object", "additionalProperties": False, "properties": {}},
         rows_schema=PACKET_ROWS_SCHEMA if rows else None,
-        codecs=codecs,
+        video_codecs=video_codecs,
         audio_codecs=audio_codecs,
         video_streams=video_streams,
         audio_streams=audio_streams,
@@ -4008,9 +4034,9 @@ def _packet_rejects(
 
 
 def test_the_codecs_list_is_read_off_the_describe_payload() -> None:
-    payload = {"world": "ffrwd:av@0.10.0", "name": "p", "codecs": ["hevc", "h264"]}
+    payload = {"world": "ffrwd:av@0.10.0", "name": "p", "video_codecs": ["hevc", "h264"]}
     described = wasm._described(PACKET_MODULE, payload)
-    assert described.codecs == ("hevc", "h264")
+    assert described.video_codecs == ("hevc", "h264")
     assert described.packet_sink is True
     assert described.kind is None
 
@@ -4019,15 +4045,15 @@ def test_an_absent_codecs_key_is_no_packet_sink() -> None:
     described = wasm._described(
         PACKET_MODULE, {"world": "ffrwd:av@0.10.0", "name": "p"}
     )
-    assert described.codecs is None
+    assert described.video_codecs is None
     assert described.packet_sink is False
 
 
 def test_an_empty_codecs_list_still_marks_the_packet_sink() -> None:
     described = wasm._described(
-        PACKET_MODULE, {"world": "ffrwd:av@0.10.0", "name": "p", "codecs": []}
+        PACKET_MODULE, {"world": "ffrwd:av@0.10.0", "name": "p", "video_codecs": []}
     )
-    assert described.codecs == ()
+    assert described.video_codecs == ()
     assert described.packet_sink is True
 
 
@@ -4085,7 +4111,7 @@ def test_the_copys_encoder_options_shape_the_edge() -> None:
 
 
 def test_the_modules_first_codec_is_the_preference() -> None:
-    plan = _packet_plan(PACKET_QUERY, _packet_described(codecs=("hevc", "h264"))).plan
+    plan = _packet_plan(PACKET_QUERY, _packet_described(video_codecs=("hevc", "h264"))).plan
     assert plan is not None
     argv = plan_argv(plan, sidecar_argv=wasm.shown_argv)[plan.ffmpeg[0].id]
     assert argv[argv.index("-c:0") + 1] == "libx265"
@@ -4097,7 +4123,7 @@ def test_a_hardware_encoder_spelling_satisfies_the_codec_list() -> None:
         + "COPY (SELECT f.video[1] FROM input('a.mp4') f) TO packet_stats() "
         "WITH (video_codec 'h264_nvenc')"
     )
-    plan = _packet_plan(sql, _packet_described(codecs=("h264",))).plan
+    plan = _packet_plan(sql, _packet_described(video_codecs=("h264",))).plan
     assert plan is not None
     argv = plan_argv(plan, sidecar_argv=wasm.shown_argv)[plan.ffmpeg[0].id]
     assert argv[argv.index("-c:0") + 1] == "h264_nvenc"
@@ -4155,7 +4181,7 @@ def test_a_codec_outside_the_declared_list_is_refused() -> None:
         "WITH (video_codec 'libx264')"
     )
     error = _packet_rejects(
-        sql, "'libx264' writes h264", _packet_described(codecs=("av1",))
+        sql, "'libx264' writes h264", _packet_described(video_codecs=("av1",))
     )
     assert "consumes av1" in error.message
     assert "av1" in (error.hint or "")
@@ -4175,7 +4201,7 @@ def test_a_preference_the_wire_cannot_carry_is_refused() -> None:
     error = _packet_rejects(
         PACKET_QUERY,
         "consumes vp9, and the stream edge carries h264, hevc or av1",
-        _packet_described(codecs=("vp9",)),
+        _packet_described(video_codecs=("vp9",)),
     )
     assert PACKET_MODULE in error.message
 
@@ -4310,14 +4336,88 @@ def test_a_sidecar_predating_the_encoded_edge_is_refused() -> None:
     assert "0.10.0" in (error.hint or "")
 
 
-def test_a_modules_frames_cannot_reach_a_packet_sink() -> None:
+MODULE_FED_SINK_SQL = (
+    DECLARE
+    + PACKET_DECLARE
+    + "COPY (SELECT invert(f.video[1]) FROM input('a.mp4') f) TO packet_stats()"
+)
+
+
+def _stage_argv(sql: str, sink: Described | None = None) -> tuple[list[str], object]:
+    """The interposed encoding stage's argv, and the plan it sits in."""
+    plan = _packet_plan(sql, sink).plan
+    assert plan is not None
+    argv = plan_argv(
+        plan,
+        sidecar_argv=wasm.shown_argv,
+        pipe_path=lambda edge, side: f"pipes/{edge.source}-{edge.target}-{side}",
+    )
+    sink_region = next(s for s in plan.sidecars if s.packet_sink)
+    stage_id = next(
+        e.source
+        for e in plan.stream_edges
+        if e.target == sink_region.id and e.source.startswith("ffmpeg")
+    )
+    return argv[stage_id], plan
+
+
+def test_a_module_fed_packet_sink_gets_an_encoding_stage() -> None:
+    """A packet sink consumes the encoder's output; a module region emits
+    decoded frames. The plan stands an encoding ffmpeg between them - the
+    same fronting encoder the sink gets when its feed is an ffmpeg filter."""
+    plan = _packet_plan(MODULE_FED_SINK_SQL).plan
+    assert plan is not None
+    assert len(plan.sidecars) == 2 and len(plan.ffmpeg) == 2
+    module_region = next(s for s in plan.sidecars if not s.packet_sink)
+    sink_region = next(s for s in plan.sidecars if s.packet_sink)
+    into_stage = next(e for e in plan.stream_edges if e.source == module_region.id)
+    into_sink = next(e for e in plan.stream_edges if e.target == sink_region.id)
+    stage = plan.process(into_sink.source)
+    assert isinstance(stage, FfmpegProcess)
+    # module sidecar -> decoded NUT -> encoding ffmpeg -> encoded NUT -> sink.
+    assert into_stage.target == into_sink.source
+    assert into_stage.format.codec == RAWVIDEO
+    assert into_sink.format.codec == "libx264"
+    # The stage filters nothing: it reads the region's pipe and encodes.
+    assert stage.graph.nodes == {}
+
+
+def test_the_interposed_stage_takes_the_sinks_encoder_options() -> None:
+    """The COPY's WITH options shape the interposed encoder exactly as they
+    shape a direct feeder's."""
+    argv, _ = _stage_argv(
+        MODULE_FED_SINK_SQL.replace(
+            "TO packet_stats()",
+            "TO packet_stats() WITH (video_bitrate '2M', crf 23)",
+        )
+    )
+    joined = " ".join(argv)
+    assert "-c:0 libx264" in joined, joined
+    assert "-b:0 2M" in joined, joined
+    assert "-crf:0 23" in joined, joined
+
+
+def test_a_module_fed_ladder_keeps_its_four_process_plan() -> None:
+    """Module, then a filter fan-out into the sink: decode ffmpeg, module
+    sidecar, one scale-and-encode ffmpeg, sink sidecar."""
     sql = (
         DECLARE
-        + PACKET_DECLARE
-        + "COPY (SELECT invert(f.video[1]) FROM input('a.mp4') f) TO packet_stats()"
+        + PACKET_DECLARE.replace("v video_stream", "v video_stream[]")
+        + "COPY (SELECT array_agg(scale(invert(f.video[1]), ARRAY[640, 1280][i.i], -2)) "
+        "FROM input('a.mp4') f, generate_series(1, 2) i) TO packet_stats()"
     )
-    error = _packet_rejects(sql, "invert() hands it decoded frames")
-    assert "encodes" in (error.hint or "")
+    plan = _packet_plan(sql, _packet_described(video_streams="many")).plan
+    assert plan is not None
+    assert len(plan.sidecars) == 2 and len(plan.ffmpeg) == 2
+    sink_region = next(s for s in plan.sidecars if s.packet_sink)
+    into_sink = [e for e in plan.stream_edges if e.target == sink_region.id]
+    assert len(into_sink) == 2
+    # Both pads leave ONE encoding ffmpeg, already encoded.
+    assert len({e.source for e in into_sink}) == 1
+    assert all(e.format.codec == "libx264" for e in into_sink)
+    encoder = plan.process(into_sink[0].source)
+    assert isinstance(encoder, FfmpegProcess)
+    assert any(n.filter == "scale" for n in encoder.graph.nodes.values())
 
 
 def test_a_packet_sink_stays_out_of_select_position() -> None:
@@ -4460,7 +4560,7 @@ def _ladder_described(
         version="0.1.0",
         params_schema={"type": "object", "additionalProperties": False, "properties": {}},
         rows_schema=None,
-        codecs=(),
+        video_codecs=(),
         video_streams=video,  # type: ignore[arg-type]
         audio_streams=audio,  # type: ignore[arg-type]
     )

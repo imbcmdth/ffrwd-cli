@@ -1069,26 +1069,32 @@ class _Partitioner:
         handed over -- so joining them changes nothing about what is opened
         or consumed, and the join adds no demand of its own.
 
-        A SIDECAR consumer joins them like any other: a sink reads a pipe per
-        pad and takes one packet off each in turn, so the same interleaving
-        argument holds. Joining is what makes a rendition ladder one decode
-        feeding N encodes rather than N decodes of the same input.
+        A SIDECAR consumer joins them like any other: a sink reads each pad
+        on a reader of its own, so no pad's pace holds another's back and the
+        fan is deadlock-free. Joining is what makes a rendition ladder one
+        decode feeding N encodes rather than N decodes of the same input.
         """
-        leg = self._feeder_reads(nodes)
+        leg = self._feeder_reads(nodes, [ref])
         for process in self.pending:
             if self.consumer_of.get(process.id) != target or process.depth != depth:
                 continue
-            if self._feeder_reads(process.nodes) == leg:
+            if self._feeder_reads(process.nodes, process.pipes) == leg:
                 return process
         return None
 
     def _feeder_reads(
-        self, nodes: Iterable[str]
+        self, nodes: Iterable[str], pipes: Iterable[FrameRef]
     ) -> tuple[frozenset[str], frozenset[FrameRef]]:
         """What one feeder reads: its input aliases, and the refs handed to it.
 
         The alias, not the path: one alias is one ``-i``, carrying its own
         seek window and input options, so equal aliases are equal opens.
+
+        `pipes` are the refs the feeder hands over. One a node inside
+        produced adds nothing the nodes did not already say; a BARE source
+        ref has no producing node, and its alias is a read all the same --
+        an audio track mapped straight off the input reads the input exactly
+        as a scaled video leg does.
         """
         inside = set(nodes)
         aliases: set[str] = set()
@@ -1100,11 +1106,19 @@ class _Partitioner:
                     aliases.add(src_parts(ref)[0])
                 elif producer not in inside:
                     outside.add(ref)
+        for ref in pipes:
+            producer = _ref_node(ref)
+            if producer is None:
+                aliases.add(src_parts(ref)[0])
+            elif producer not in inside:
+                outside.add(ref)
         return frozenset(aliases), frozenset(outside)
 
     # -- one reader per live input
 
-    def _live_reader(self, depth: int, nodes: Sequence[str]) -> _Pending | None:
+    def _live_reader(
+        self, depth: int, nodes: Sequence[str], ref: FrameRef
+    ) -> _Pending | None:
         """The reader this leg joins because both read one live input.
 
         A live input is opened by exactly ONE process, so a second leg over it
@@ -1113,14 +1127,14 @@ class _Partitioner:
         nothing but inputs: a process that reads a pipe may sit downstream of
         the one it would join, and the join would make the process DAG a cycle.
         """
-        aliases, outside = self._feeder_reads(nodes)
+        aliases, outside = self._feeder_reads(nodes, [ref])
         wanted = aliases & self.live
         if not wanted or outside:
             return None
         for process in self.pending:
             if process.depth != depth:
                 continue
-            theirs, others = self._feeder_reads(process.nodes)
+            theirs, others = self._feeder_reads(process.nodes, process.pipes)
             if others or not theirs & wanted:
                 continue
             return process
@@ -1776,13 +1790,33 @@ class _Partitioner:
             target, ref, depth = demands.pop(0)
             producer = _ref_node(ref)
             if producer is not None and self.external.get(producer, False):
+                consumer = self._reader(target, ref)
+                if consumer is not None and consumer in self.g.packet_sinks:
+                    # A packet sink consumes the encoder's output, and a
+                    # module region emits decoded frames: an encoding ffmpeg
+                    # stands between them, reading the region's pipe and
+                    # writing the encoded stream the sink's edge names --
+                    # the same fronting encoder the sink gets when its feed
+                    # is an ffmpeg filter, shaped by the same options.
+                    stage = _Pending(
+                        id=self._ffmpeg_id(),
+                        depth=depth,
+                        nodes=[],
+                        sinks=[],
+                        pipes=[ref],
+                    )
+                    self.pending.append(stage)
+                    self.consumer_of[stage.id] = target
+                    self._add_edge(stage.id, target, ref)
+                    self._add_edge(self.sidecar_of[producer], stage.id, ref)
+                    continue
                 self._add_edge(self.sidecar_of[producer], target, ref)
                 continue
             at = self.depth[producer] if producer in self.depth else depth
             nodes = self._ancestors([ref], at)
             sibling = self._sibling_feeder(target, at, nodes, ref)
             if sibling is None:
-                sibling = self._live_reader(at, nodes)
+                sibling = self._live_reader(at, nodes, ref)
             if sibling is not None:
                 wanted = set(sibling.nodes) | set(nodes)
                 sibling.nodes = [name for name in self.order if name in wanted]

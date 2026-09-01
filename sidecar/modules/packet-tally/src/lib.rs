@@ -73,7 +73,7 @@ impl Guest for PacketTally {
                 rows_language: vec![],
             },
             // Counting needs no codec knowledge, so every codec is accepted.
-            codecs: vec![],
+            video_codecs: vec![],
             audio_codecs: vec![],
             video: Arity::Many,
             audio: Arity::Zero,

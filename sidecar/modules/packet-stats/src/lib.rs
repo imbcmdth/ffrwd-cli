@@ -139,7 +139,7 @@ impl Guest for PacketStats {
                 rows_language: vec![],
             },
             // Counting needs no codec knowledge, so every codec is accepted.
-            codecs: vec![],
+            video_codecs: vec![],
             audio_codecs: vec![],
             // One video stream: this module counts a stream, not a ladder.
             video: Arity::One,

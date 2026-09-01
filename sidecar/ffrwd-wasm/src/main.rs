@@ -1460,7 +1460,7 @@ struct Description {
     /// the packet sink, which is how that export is reported - the way
     /// `window` marks a windowed module.
     #[serde(skip_serializing_if = "Option::is_none")]
-    codecs: Option<Vec<String>>,
+    video_codecs: Option<Vec<String>>,
     /// The same for AUDIO. Empty for a sink built against a world before
     /// 0.12.0, which read no audio stream.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1569,7 +1569,7 @@ fn describe_module(module_path: &str) -> Result<String> {
         one_to_one: None,
         reads_rows: None,
         forwards_rows: None,
-        codecs: None,
+        video_codecs: None,
         audio_codecs: None,
         video_streams: None,
         audio_streams: None,
@@ -1630,7 +1630,7 @@ fn describe_module(module_path: &str) -> Result<String> {
         description.rows_language = meta.rows_language;
         description.version = Some(meta.version);
         description.name = Some(meta.name);
-        description.codecs = Some(described.codecs);
+        description.video_codecs = Some(described.video_codecs);
         description.audio_codecs = Some(described.audio_codecs);
         description.video_streams = Some(streams_read(described.video));
         description.audio_streams = Some(streams_read(described.audio));

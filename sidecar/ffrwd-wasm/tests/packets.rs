@@ -347,7 +347,7 @@ fn describe_reports_the_packet_sink() {
     assert_eq!(description["name"], "packet_stats");
     // The codecs list is what reports the packet-sink export; empty accepts
     // every codec.
-    assert_eq!(description["codecs"], serde_json::json!([]));
+    assert_eq!(description["video_codecs"], serde_json::json!([]));
     // No frame interface: none of the windowed fields appear.
     assert!(description.get("window").is_none());
     assert_eq!(description["reads_rows"], serde_json::Value::Null);

@@ -311,7 +311,7 @@ interface packet-sink {
     meta: meta,
     /// ffmpeg's names for the VIDEO codecs accepted, most preferred first.
     /// Empty is every codec.
-    codecs: list<string>,
+    video-codecs: list<string>,
     /// ffmpeg's names for the AUDIO codecs accepted, most preferred first.
     /// Empty is every codec.
     audio-codecs: list<string>,

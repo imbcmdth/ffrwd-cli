@@ -1188,3 +1188,59 @@ def test_a_reader_is_made_where_no_process_could_be_the_one() -> None:
         for e in plan.stream_edges
         if e.source == reader.id
     )
+
+
+def _packet_ladder_graph(audio_source: str = "a") -> Graph:
+    """A packet sink reading one scaled video leg and one BARE audio leg.
+
+    The video travels through a filter node; the audio is mapped straight
+    off the input, produced by no node at all. Both legs feed the one
+    sidecar, so they read alike exactly when they read the same input.
+    """
+    g = Graph(
+        input_paths=["a.mp4", "b.mp4"],
+        sources={"a": 0, "b": 1},
+    )
+    g.nodes["n0"] = Node(
+        id="n0", filter="scale", args={}, inputs=["src:a:v:0"], outputs=["video"]
+    )
+    g.nodes["e0"] = Node(
+        id="e0",
+        filter="mod.wasm",
+        args={},
+        inputs=["n0", f"src:{audio_source}:a:0"],
+        outputs=[],
+    )
+    g.packet_sinks["e0"] = [
+        {"video_codec": "libx264"},
+        {"audio_codec": "aac"},
+    ]
+    return g
+
+
+def test_a_bare_leg_joins_the_filtered_leg_over_one_input() -> None:
+    """The audio mapped straight off the input reads the input exactly as
+    the scaled video leg does, so the two are one process: a source that
+    can only be opened once is opened once."""
+    plan = partition(_packet_ladder_graph(), external=external_ids("e0"))
+
+    assert len(plan.ffmpeg) == 1
+    feeder = plan.ffmpeg[0]
+    assert feeder.graph.input_paths == ["a.mp4"]
+    outgoing = [e for e in plan.stream_edges if e.source == feeder.id]
+    assert sorted(e.ref for e in outgoing) == ["n0", "src:a:a:0"]
+    assert {e.target for e in outgoing} == {plan.sidecars[0].id}
+
+
+def test_legs_over_different_inputs_stay_two_processes() -> None:
+    """The same shape over TWO inputs: the audio reads b.mp4, the video
+    reads a.mp4, and joining them would fuse reads nothing shares."""
+    plan = partition(_packet_ladder_graph(audio_source="b"), external=external_ids("e0"))
+
+    assert len(plan.ffmpeg) == 2
+    opened = sorted(p.graph.input_paths[0] for p in plan.ffmpeg)
+    assert opened == ["a.mp4", "b.mp4"]
+    assert all(
+        len([e for e in plan.stream_edges if e.source == p.id]) == 1
+        for p in plan.ffmpeg
+    )
