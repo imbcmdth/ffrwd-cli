@@ -558,7 +558,7 @@ provides-extras = ["mcp", "diagram", "dev"]
 
 [[package]]
 name = "ffrwd-wasm"
-version = "0.5.1"
+version = "0.5.2"
 source = { directory = "../sidecar/ffrwd-wasm" }
 
 [[package]]
