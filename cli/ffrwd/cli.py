@@ -211,10 +211,12 @@ from .project import (
     held_entry,
     is_namespace,
     is_package_name,
+    is_recipe_name,
     name_refusal,
     read_lockfile,
     read_manifest,
     stored_name,
+    stored_version,
     with_entry,
     without_entry,
     write_lockfile,
@@ -298,8 +300,9 @@ def main(argv: list[str] | None = None) -> int:
 
 _QUERY_HELP = (
     "SQL query text, or the name of a recipe a package ships -- bare, "
-    "ns/pkg for a package's own recipe, or ns/pkg:recipe (exactly one of "
-    "this or -f/--file is required)"
+    "ns/pkg for a package's own recipe, or ns/pkg:recipe, either with "
+    "@version to pick an installed version (exactly one of this or "
+    "-f/--file is required)"
 )
 _FILE_HELP = "read the query from a file instead of the command line ('-' for stdin)"
 _SET_HELP = "define a variable for :name/:'name'/:\"name\" substitution (repeatable)"
@@ -580,7 +583,7 @@ def _build_parser() -> argparse.ArgumentParser:
     path_p = subparsers.add_parser(
         "path", help="print where an installed package's content is on this machine"
     )
-    path_p.add_argument("package", help="<namespace>/<package>")
+    path_p.add_argument("package", help="<namespace>/<package>[@version]")
     _add_global_argument(path_p, "read the machine-wide lockfile instead of this project's")
 
     link_p = subparsers.add_parser("link", help="read a package live out of a directory")
@@ -769,6 +772,63 @@ def _matching_recipes(name: str, packages: PackageSet | None) -> list[tuple[Pack
     return found
 
 
+def _split_spec(text: str) -> tuple[str, str | None, str | None] | None:
+    """`text` split as ``ns/pkg[:recipe][@version]``, or None when it is not one.
+
+    Nothing of that shape is SQL, so a positional matching it always resolves
+    as a package spec -- installed, or refused as one that is not.
+    """
+    rest, at, version = text.partition("@")
+    package, colon, recipe = rest.partition(":")
+    if not is_package_name(package):
+        return None
+    if colon and not is_recipe_name(recipe):
+        return None
+    if at and not packages_module.is_version(version):
+        return None
+    return package, (recipe if colon else None), (version if at else None)
+
+
+def _installed_package(
+    name: str, version: str | None, spec: str, packages: PackageSet | None
+) -> Package:
+    """The installed package `spec` names, at the version the spec or the layers pick.
+
+    ``@version`` is exact among the installed versions. Without one, a version
+    a project layer claims -- its own manifest, or its lockfile -- wins, and a
+    name only the machine-wide layer holds resolves at its highest installed
+    version.
+    """
+    installed = packages.versions.get(name, {}) if packages is not None else {}
+    if not installed:
+        request = name if version is None else f"{name}@{version}"
+        named = "a recipe in a package" if ":" in spec else "a package"
+        raise FfrwdError(
+            ErrorCode.UNKNOWN_RECIPE,
+            f"'{spec}' names {named} that is not installed",
+            hint=f"run `ffrwd install {request}` to install it",
+        )
+    if version is not None:
+        found = installed.get(version)
+        if found is None:
+            listed = ", ".join(sorted(installed, key=packages_module.version_key))
+            raise FfrwdError(
+                ErrorCode.UNKNOWN_RECIPE,
+                f"version {version} of '{name}' is not installed",
+                hint=f"installed: {listed}; run `ffrwd install {name}@{version}` to fetch it",
+            )
+        return found
+    assert packages is not None  # `installed` came out of it
+    pinned = packages.resolve(None, name)
+    wants = packages.wants.get(packages.project, {}) if packages.project is not None else {}
+    if pinned is not None and (pinned.layer != "global" or pinned.version == wants.get(name)):
+        return pinned
+    return max(
+        installed.values(),
+        key=lambda package: packages_module.version_key(package.version),
+    )
+
+
 def _dotted_spelling(name: str, packages: PackageSet | None) -> FfrwdError | None:
     """The refusal for a recipe named ``ns.pkg[.recipe]``, when the dots name one.
 
@@ -804,9 +864,31 @@ def _recipe_text(
 ) -> tuple[str, tuple[str, str]] | None:
     """The query text of the recipe `name` names, or None when it names none.
 
-    Two packages shipping one name is a rejection rather than a pick: the
-    qualified form says which, and guessing would run the wrong recipe.
+    A `name` spelled as a package spec resolves as one -- a package that is
+    not installed is a refusal there, never a SQL failure. Two packages
+    shipping one bare name is a rejection rather than a pick: the qualified
+    form says which, and guessing would run the wrong recipe.
     """
+    spec = _split_spec(name)
+    if spec is not None:
+        package_name, member, version = spec
+        package = _installed_package(package_name, version, name, packages)
+        file = package.recipe(member)
+        if file is None:
+            shipped = ", ".join(
+                _qualified_recipe(package, recipe) for recipe in sorted(package.recipes)
+            )
+            raise FfrwdError(
+                ErrorCode.UNKNOWN_RECIPE,
+                f"'{name}' names a recipe '{package.name}' does not ship"
+                if member is not None
+                else f"'{name}' names a package with no default recipe",
+                hint=f"it ships: {shipped}"
+                if shipped
+                else f"'{package.name}' ships no recipes -- `ffrwd list` shows "
+                "what it provides",
+            )
+        return _read_recipe(package, member if member is not None else package.package, file)
     refused = _dotted_spelling(name, packages)
     if refused is not None:
         raise refused
@@ -823,6 +905,11 @@ def _recipe_text(
     package, recipe = found[0]
     file = package.recipe(recipe)
     assert file is not None  # _matching_recipes only keeps shipped recipes
+    return _read_recipe(package, recipe, file)
+
+
+def _read_recipe(package: Package, recipe: str, file: Path) -> tuple[str, tuple[str, str]]:
+    """The recipe file's text, with the (name, version) of the package it belongs to."""
     try:
         return file.read_text(encoding="utf-8"), (package.name, package.version)
     except OSError as err:
@@ -985,7 +1072,12 @@ def _maybe_print_file_hint(
             f"hint: '{source}' looks like a file; did you mean -f '{source}'?",
             file=sys.stderr,
         )
-    if _starts_a_statement(source) or _matching_recipes(source, packages):
+    name = source
+    spec = _split_spec(source)
+    if spec is not None and spec[2] is not None:  # the hint reads the spec versionless
+        package_name, member, _version = spec
+        name = package_name if member is None else f"{package_name}:{member}"
+    if _starts_a_statement(source) or _matching_recipes(name, packages):
         return
     shipped = _recipe_names(packages)
     if shipped:
@@ -2442,20 +2534,61 @@ def _lock_to_read(args: argparse.Namespace) -> tuple[Path | None, int]:
     return found, 0
 
 
+def _pinned_entry(lock: Path, name: str, version: str | None) -> LockEntry:
+    """The lockfile entry a package spec resolves to, or a raised refusal.
+
+    ``@version`` is exact among the entries pinning `name`; without one the
+    lockfile's own dependency pin wins, then the highest pinned version.
+    """
+    entries = [entry for entry in _held_entries(lock) if stored_name(entry, lock) == name]
+    if not entries:
+        request = name if version is None else f"{name}@{version}"
+        raise FfrwdError(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"path: {lock} pins no package '{name}'",
+            hint=f"run `ffrwd install {request}` to put its content in the store",
+        )
+    versions = [(entry, stored_version(entry, lock)) for entry in entries]
+    if version is not None:
+        for entry, pinned in versions:
+            if pinned == version:
+                return entry
+        listed = ", ".join(
+            sorted(
+                {pinned for _, pinned in versions if pinned is not None},
+                key=packages_module.version_key,
+            )
+        )
+        raise FfrwdError(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"version {version} of '{name}' is not installed",
+            hint=f"installed: {listed}; run `ffrwd install {name}@{version}` to fetch it",
+        )
+    wanted = _held_dependencies(lock).get(name)
+    for entry, pinned in versions:
+        if pinned is not None and pinned == wanted:
+            return entry
+    picked, _highest = max(
+        versions, key=lambda held: packages_module.version_key(held[1] or "")
+    )
+    return picked
+
+
 def _cmd_path(args: argparse.Namespace, on_warning: OnWarning) -> int:
     """Print where an installed package's content is, one line and nothing else.
 
     A build script reads it -- `ffrwd path ffrwd/wasm` is how a module's
     ``build.rs`` finds the wit -- so the line is the path alone.
     """
-    name = str(args.package)
-    if not is_package_name(name):
+    spec = str(args.package)
+    name, at, version = spec.partition("@")
+    if not is_package_name(name) or (at and not packages_module.is_version(version)):
         _print_error(
             FfrwdError(
                 ErrorCode.UNSUPPORTED_SQL,
-                f"path: {name!r} is not a package name",
+                f"path: {spec!r} is not a package name",
                 hint="a package is named <namespace>/<package>, each half a lowercase "
-                "plain identifier",
+                "plain identifier; an installed version is picked with @<version>",
             )
         )
         return 1
@@ -2463,16 +2596,7 @@ def _cmd_path(args: argparse.Namespace, on_warning: OnWarning) -> int:
     if lock is None:
         return code
     try:
-        entry = held_entry(_held_entries(lock), name, lock)
-        if entry is None:
-            _print_error(
-                FfrwdError(
-                    ErrorCode.UNSUPPORTED_SQL,
-                    f"path: {lock} pins no package '{name}'",
-                    hint=f"run `ffrwd install {name}` to put its content in the store",
-                )
-            )
-            return 1
+        entry = _pinned_entry(lock, name, version if at else None)
         root = entry_root(entry, lock)
     except FfrwdError as err:
         _print_error(err)

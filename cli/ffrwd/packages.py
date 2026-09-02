@@ -102,8 +102,10 @@ __all__ = [
     "base_url",
     "exchange",
     "install",
+    "is_version",
     "resolve",
     "search",
+    "version_key",
 ]
 
 # The hosted registry's project. The storage base serves the detail
@@ -645,7 +647,7 @@ def _latest_listing(data: Mapping[str, object], where: str) -> Listing | None:
     versions = _objects(data, "versions", where)
     if not versions:
         return None
-    latest = max(versions, key=lambda raw: _version_key(_text(raw, "version", where)))
+    latest = max(versions, key=lambda raw: version_key(_text(raw, "version", where)))
     return _listing({**latest, "name": _text(data, "name", where)}, where)
 
 
@@ -661,7 +663,7 @@ def _matches(listing: Listing, needle: str) -> bool:
 # --------------------------------------------------------------------------
 
 
-def _version_key(version: str) -> tuple[tuple[int, int, str], ...]:
+def version_key(version: str) -> tuple[tuple[int, int, str], ...]:
     """Sort key for a version: dot-separated parts, numeric ones compared as numbers.
 
     Enough for the exact-pin world v0 lives in -- it orders 1.10.0 above 1.9.0,
@@ -675,6 +677,11 @@ def _version_key(version: str) -> tuple[tuple[int, int, str], ...]:
         else:
             parts.append((1, 0, piece))
     return tuple(parts)
+
+
+def is_version(text: str) -> bool:
+    """True when `text` is spelled like a version -- what may follow '@' in a spec."""
+    return _VERSION_RE.fullmatch(text) is not None
 
 
 def _requested(request: str) -> tuple[str, str | None]:
@@ -781,13 +788,13 @@ def resolve(request: str) -> Release:
     if not releases:
         raise _reject(f"the registry publishes no version of '{name}'", _PUBLISHED_HINT)
     if wanted is None:
-        return max(releases, key=lambda release: _version_key(release.version))
+        return max(releases, key=lambda release: version_key(release.version))
     for release in releases:
         if release.version == wanted:
             return release
     published = ", ".join(
         release.version
-        for release in sorted(releases, key=lambda release: _version_key(release.version))
+        for release in sorted(releases, key=lambda release: version_key(release.version))
     )
     raise _reject(
         f"the registry has no version {wanted} of '{name}'", f"published: {published}"

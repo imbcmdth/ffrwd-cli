@@ -3382,6 +3382,197 @@ def test_a_recipe_named_for_a_statement_word_is_refused(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# package specs: ns/pkg[:recipe][@version]
+# ---------------------------------------------------------------------------
+
+
+def _recipe_package(root: Path, version: str, dest: str) -> Path:
+    """A ``broadcast/tracks`` at `version` whose ``thumb`` recipe writes `dest`."""
+    (root / "queries").mkdir(parents=True, exist_ok=True)
+    (root / "queries" / "thumb.sql").write_text(
+        "-- variables: source (input media path)\n"
+        f"COPY (SELECT f.video[1] FROM input(:'source') f) TO '{dest}';\n",
+        encoding="utf-8",
+    )
+    declared = {
+        "name": "broadcast/tracks",
+        "version": version,
+        "bin": {"thumb": "queries/thumb.sql"},
+    }
+    (root / "ffrwd.json").write_text(json.dumps(declared) + "\n", encoding="utf-8")
+    return root
+
+
+def test_a_spec_naming_an_uninstalled_package_is_refused_not_parsed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The spec shape can never be SQL, so it never reaches the -v check."""
+    _project(
+        tmp_path,
+        files={"queries/split.sql": RECIPE},
+        manifest=_BIN,
+    )
+    code, _out, err = _run(
+        tmp_path,
+        monkeypatch,
+        capsys,
+        "run",
+        "ffrwd/examples:motion-thumbnail-gif",
+        "-v",
+        "source=a.mp4",
+        "-v",
+        "count=5",
+        "-v",
+        "dest=preview.gif",
+    )
+    assert code == 1
+    assert (
+        "UNKNOWN_RECIPE: 'ffrwd/examples:motion-thumbnail-gif' names a recipe "
+        "in a package that is not installed"
+    ) in err
+    assert "run `ffrwd install ffrwd/examples` to install it" in err
+    assert "name variables" not in err
+
+
+def test_a_spec_with_no_project_at_all_is_refused_the_same_way(
+    store_home: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    code, _out, err = _run(elsewhere, monkeypatch, capsys, "validate", "ffrwd/examples")
+    assert code == 1
+    assert "'ffrwd/examples' names a package that is not installed" in err
+    assert "run `ffrwd install ffrwd/examples` to install it" in err
+
+
+def test_a_version_pin_selects_among_installed_versions(
+    store_home: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    older = _installed(_recipe_package(tmp_path / "v19", "1.9.0", "v19.mkv"))
+    newer = _installed(_recipe_package(tmp_path / "v110", "1.10.0", "v110.mkv"))
+    _lock(store.global_lock_path().parent, [older, newer])
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    code, out, err = _run(
+        elsewhere,
+        monkeypatch,
+        capsys,
+        "compile",
+        "broadcast/tracks:thumb@1.9.0",
+        "-v",
+        "source=in.mkv",
+    )
+    assert code == 0, err
+    assert "v19.mkv" in out
+
+
+def test_a_versionless_spec_resolves_at_the_highest_installed_version(
+    store_home: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """1.10.0 beats 1.9.0 numerically, and beats the older entry's first claim."""
+    older = _installed(_recipe_package(tmp_path / "v19", "1.9.0", "v19.mkv"))
+    newer = _installed(_recipe_package(tmp_path / "v110", "1.10.0", "v110.mkv"))
+    _lock(store.global_lock_path().parent, [older, newer])
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    code, out, err = _run(
+        elsewhere,
+        monkeypatch,
+        capsys,
+        "compile",
+        "broadcast/tracks:thumb",
+        "-v",
+        "source=in.mkv",
+    )
+    assert code == 0, err
+    assert "v110.mkv" in out
+
+
+def test_a_project_pin_wins_over_a_higher_global_version(
+    store_home: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    older = _installed(_recipe_package(tmp_path / "v19", "1.9.0", "v19.mkv"))
+    newer = _installed(_recipe_package(tmp_path / "v110", "1.10.0", "v110.mkv"))
+    _lock(store.global_lock_path().parent, [newer])
+    project = tmp_path / "work"
+    _project(project, files={"src/own.sql": NORMALIZE})
+    _lock(project, [older], dependencies={"broadcast/tracks": "1.9.0"})
+    code, out, err = _run(
+        project,
+        monkeypatch,
+        capsys,
+        "compile",
+        "broadcast/tracks:thumb",
+        "-v",
+        "source=in.mkv",
+    )
+    assert code == 0, err
+    assert "v19.mkv" in out
+
+
+def test_a_version_nothing_installed_refuses_naming_what_is(
+    store_home: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    older = _installed(_recipe_package(tmp_path / "v19", "1.9.0", "v19.mkv"))
+    newer = _installed(_recipe_package(tmp_path / "v110", "1.10.0", "v110.mkv"))
+    _lock(store.global_lock_path().parent, [older, newer])
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    code, _out, err = _run(
+        elsewhere, monkeypatch, capsys, "validate", "broadcast/tracks:thumb@2.0.0"
+    )
+    assert code == 1
+    assert "version 2.0.0 of 'broadcast/tracks' is not installed" in err
+    assert "installed: 1.9.0, 1.10.0" in err
+    assert "run `ffrwd install broadcast/tracks@2.0.0` to fetch it" in err
+
+
+def test_an_unknown_recipe_in_an_installed_package_is_refused_not_parsed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _project(
+        tmp_path,
+        files={"queries/split.sql": RECIPE},
+        manifest=_BIN,
+    )
+    code, _out, err = _run(tmp_path, monkeypatch, capsys, "validate", "me/edits:nosuch")
+    assert code == 1
+    assert "UNKNOWN_RECIPE" in err
+    assert "'me/edits:nosuch' names a recipe 'me/edits' does not ship" in err
+    assert "it ships: me/edits:split-chapters" in err
+
+
+def test_a_package_with_no_default_recipe_is_refused_not_parsed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _project(
+        tmp_path,
+        files={"queries/split.sql": RECIPE},
+        manifest=_BIN,
+    )
+    code, _out, err = _run(tmp_path, monkeypatch, capsys, "validate", "me/edits")
+    assert code == 1
+    assert "UNKNOWN_RECIPE" in err
+    assert "'me/edits' names a package with no default recipe" in err
+    assert "it ships: me/edits:split-chapters" in err
+
+
+# ---------------------------------------------------------------------------
 # `ffrwd path`
 # ---------------------------------------------------------------------------
 
@@ -3458,6 +3649,63 @@ def test_path_refuses_something_that_is_not_a_package_name(
     code, _out, err = _run(tmp_path, monkeypatch, capsys, "path", "tracks")
     assert code == 1
     assert "is not a package name" in err
+
+
+def test_path_at_version_picks_that_installed_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    older = _installed(
+        _library(tmp_path / "v19", "broadcast", "0.5", package="tracks", version="1.9.0")
+    )
+    newer = _installed(
+        _library(tmp_path / "v110", "broadcast", "0.5", package="tracks", version="1.10.0")
+    )
+    project = tmp_path / "work"
+    _project(project, files={"src/own.sql": NORMALIZE})
+    _lock(project, [older, newer])
+
+    code, out, err = _run(project, monkeypatch, capsys, "path", "broadcast/tracks@1.9.0")
+    assert code == 0, err
+    assert Path(out.rstrip("\n")) == store.store_dir() / str(older["store"])
+
+
+def test_path_without_a_version_picks_the_highest(
+    store_home: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Two versions installed machine-wide: the older one's first claim does not win."""
+    older = _installed(
+        _library(tmp_path / "v19", "broadcast", "0.5", package="tracks", version="1.9.0")
+    )
+    newer = _installed(
+        _library(tmp_path / "v110", "broadcast", "0.5", package="tracks", version="1.10.0")
+    )
+    _lock(store.global_lock_path().parent, [older, newer])
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+
+    code, out, err = _run(elsewhere, monkeypatch, capsys, "path", "broadcast/tracks", "-g")
+    assert code == 0, err
+    assert Path(out.rstrip("\n")) == store.store_dir() / str(newer["store"])
+
+
+def test_path_refuses_a_version_that_is_not_installed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    older = _installed(
+        _library(tmp_path / "v19", "broadcast", "0.5", package="tracks", version="1.9.0")
+    )
+    project = tmp_path / "work"
+    _project(project, files={"src/own.sql": NORMALIZE})
+    _lock(project, [older])
+
+    code, _out, err = _run(project, monkeypatch, capsys, "path", "broadcast/tracks@2.0.0")
+    assert code == 1
+    assert "version 2.0.0 of 'broadcast/tracks' is not installed" in err
+    assert "installed: 1.9.0" in err
+    assert "run `ffrwd install broadcast/tracks@2.0.0` to fetch it" in err
 
 
 # ---------------------------------------------------------------------------

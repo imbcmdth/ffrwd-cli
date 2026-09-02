@@ -108,12 +108,14 @@ __all__ = [
     "held_entry",
     "is_namespace",
     "is_package_name",
+    "is_recipe_name",
     "leaves_package",
     "lockfile_text",
     "name_refusal",
     "read_lockfile",
     "read_manifest",
     "stored_name",
+    "stored_version",
     "under_package",
     "with_entry",
     "without_entry",
@@ -301,6 +303,11 @@ def is_package_name(text: str) -> bool:
     for itself is :func:`name_refusal`'s question, with its own message.
     """
     return _NAME_RE.fullmatch(text) is not None
+
+
+def is_recipe_name(text: str) -> bool:
+    """True when `text` is spelled like a recipe name -- a command word."""
+    return _RECIPE_NAME_RE.fullmatch(text) is not None
 
 
 def name_refusal(name: str) -> tuple[str, str] | None:
@@ -1604,6 +1611,16 @@ def stored_name(entry: LockEntry, lock_path: Path) -> str | None:
         return entry.name
     try:
         return read_manifest(_linked_root(entry, lock_path) / MANIFEST_NAME).name
+    except FfrwdError:
+        return None
+
+
+def stored_version(entry: LockEntry, lock_path: Path) -> str | None:
+    """The version `entry` pins, read the same way :func:`stored_name` reads the name."""
+    if isinstance(entry, RegistryEntry):
+        return entry.version
+    try:
+        return read_manifest(_linked_root(entry, lock_path) / MANIFEST_NAME).version
     except FfrwdError:
         return None
 
