@@ -1939,6 +1939,187 @@ def test_a_recipe_reaches_the_version_its_own_package_declares(
     assert code == 0, err
     assert "volume=volume=0.1" in out, out
 
+
+def test_a_recipe_calls_the_function_it_defines_itself(
+    store_home: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A recipe's own CREATE FUNCTION is callable from its own query, CTEs included,
+    and compiling it by name prints the same command as -f on its file."""
+    recipe = (
+        "-- variables: dest (output path)\n"
+        "CREATE FUNCTION half(track audio_stream) RETURNS audio_stream AS $$\n"
+        "  SELECT volume(track, 0.5)\n"
+        "$$ LANGUAGE sql;\n"
+        "COPY (\n"
+        "  WITH tracks AS (SELECT half(f.audio[1]) AS track FROM input('film.mkv') f)\n"
+        "  SELECT tracks.track FROM tracks\n"
+        ") TO :'dest'\n"
+    )
+    source = tmp_path / "tool"
+    _write(source / "queries" / "go.sql", recipe)
+    _write(
+        source / "ffrwd.json",
+        json.dumps(
+            {"name": "me/tool", "version": "1.0.0", "bin": {"go": "queries/go.sql"}},
+            indent=2,
+        )
+        + "\n",
+    )
+    entry = _installed(source)
+    project = tmp_path / "work"
+    _project(project, files={}, manifest={"name": "other/edits"})
+    _lock(project, [entry], dependencies={"me/tool": "1.0.0"})
+
+    code, named, err = _run(
+        project, monkeypatch, capsys, "compile", "me/tool:go", "-v", "dest=out.mkv"
+    )
+    assert code == 0, err
+    assert "volume=volume=0.5" in named, named
+    code, direct, err = _run(
+        project,
+        monkeypatch,
+        capsys,
+        "compile",
+        "-f",
+        str(source / "queries" / "go.sql"),
+        "-v",
+        "dest=out.mkv",
+    )
+    assert code == 0, err
+    assert named == direct
+
+
+def test_a_recipe_local_name_shadows_its_packages_export(
+    store_home: Path, tmp_path: Path
+) -> None:
+    """The nearest scope wins for a bare call; the export stays reachable qualified."""
+    entry = _installed(_library(tmp_path / "built", "me", "0.9", package="tool"))
+    project = tmp_path / "work"
+    _project(project, files={}, manifest={"name": "other/edits"})
+    _lock(project, [entry])
+    recipe = (
+        "CREATE FUNCTION quieter(track audio_stream) RETURNS audio_stream AS $$\n"
+        "  SELECT volume(track, 0.5)\n"
+        "$$ LANGUAGE sql;\n"
+        "COPY (SELECT quieter(me.tool.quieter(f.audio[1])) "
+        "FROM input('film.mkv') f) TO 'out.mkv'"
+    )
+    argv = build_ffmpeg_args(
+        emit(
+            compile_sql(
+                recipe, packages=_packages(project), owner=("me/tool", "1.0.0")
+            )
+        )
+    )
+    graph = " ".join(argv)
+    assert "volume=volume=0.5" in graph
+    assert "volume=volume=0.9" in graph
+
+
+def test_a_recipes_unused_function_is_still_rejected(
+    store_home: Path, tmp_path: Path
+) -> None:
+    entry = _installed(_library(tmp_path / "built", "me", "0.9", package="tool"))
+    project = tmp_path / "work"
+    _project(project, files={}, manifest={"name": "other/edits"})
+    _lock(project, [entry])
+    recipe = (
+        "CREATE FUNCTION unused(track audio_stream) RETURNS audio_stream AS $$\n"
+        "  SELECT volume(track, 0.5)\n"
+        "$$ LANGUAGE sql;\n"
+        "COPY (SELECT f.audio[1] FROM input('film.mkv') f) TO 'out.mkv'"
+    )
+    with pytest.raises(FfrwdError) as caught:
+        compile_sql(recipe, packages=_packages(project), owner=("me/tool", "1.0.0"))
+    assert caught.value.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'unused' is never called" in caught.value.message
+
+
+def test_the_owning_packages_lib_body_calls_its_sibling_not_the_recipe(
+    store_home: Path, tmp_path: Path
+) -> None:
+    """A bare name in a lib body stays the package's own even when the running
+    script is that package's recipe defining the same name."""
+    library = (
+        "CREATE FUNCTION helper(track audio_stream) RETURNS audio_stream AS $$\n"
+        "  SELECT volume(track, 0.25)\n"
+        "$$ LANGUAGE sql;\n"
+        "CREATE FUNCTION quieter(track audio_stream) RETURNS audio_stream AS $$\n"
+        "  SELECT helper(track)\n"
+        "$$ LANGUAGE sql;\n"
+    )
+    entry = _installed(
+        _library(tmp_path / "built", "me", "", package="tool", src=library)
+    )
+    project = tmp_path / "work"
+    _project(project, files={}, manifest={"name": "other/edits"})
+    _lock(project, [entry])
+    recipe = (
+        "CREATE FUNCTION helper(track audio_stream) RETURNS audio_stream AS $$\n"
+        "  SELECT volume(track, 8)\n"
+        "$$ LANGUAGE sql;\n"
+        "COPY (SELECT me.tool.quieter(f.audio[1]), helper(f.audio[2]) "
+        "FROM input('film.mkv') f) TO 'out.mkv'"
+    )
+    argv = build_ffmpeg_args(
+        emit(
+            compile_sql(
+                recipe, packages=_packages(project), owner=("me/tool", "1.0.0")
+            )
+        )
+    )
+    graph = " ".join(argv)
+    assert "volume=volume=0.25" in graph
+    assert "volume=volume=8" in graph
+
+
+def test_a_recipes_own_function_resolves_at_its_packages_versions(
+    store_home: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A qualified call inside a recipe's own function body still resolves at
+    the versions the recipe's package declares, not the project's."""
+    d_low = _installed(_library(tmp_path / "d1", "shared", "0.1", package="d", version="1.0.0"))
+    d_high = _installed(_library(tmp_path / "d2", "shared", "0.2", package="d", version="2.0.0"))
+    recipe = (
+        "-- variables: dest (output path)\n"
+        "CREATE FUNCTION go(track audio_stream) RETURNS audio_stream AS $$\n"
+        "  SELECT shared.d.quieter(track)\n"
+        "$$ LANGUAGE sql;\n"
+        "COPY (SELECT go(f.audio[1]) FROM input('film.mkv') f) TO :'dest'\n"
+    )
+    source = tmp_path / "tool"
+    _write(source / "queries" / "go.sql", recipe)
+    _write(
+        source / "ffrwd.json",
+        json.dumps(
+            {
+                "name": "me/tool",
+                "version": "1.0.0",
+                "bin": {"go": "queries/go.sql"},
+                "dependencies": {"shared/d": "1.0.0"},
+            },
+            indent=2,
+        )
+        + "\n",
+    )
+    tool = _installed(source, dependencies={"shared/d": "1.0.0"})
+    project = tmp_path / "work"
+    _project(project, files={}, manifest={"name": "other/edits"})
+    _lock(project, [d_low, d_high, tool], dependencies={"shared/d": "2.0.0"})
+
+    code, out, err = _run(
+        project, monkeypatch, capsys, "compile", "me/tool:go", "-v", "dest=o.mkv"
+    )
+    assert code == 0, err
+    assert "volume=volume=0.1" in out, out
+
+
 def test_two_dependents_resolve_a_shared_name_at_their_own_version(
     store_home: Path, tmp_path: Path
 ) -> None:

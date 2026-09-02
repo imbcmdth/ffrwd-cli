@@ -689,6 +689,10 @@ def expanded(
     no project, and a qualified call is then whatever it always was.
     `on_warning` hears what a resolution cost -- a global package, a linked one
     -- once per package; None is silence.
+    `owner` is the (name, version) of the package the script itself ships in
+    -- a recipe compiled by name -- so its qualified calls resolve at the
+    versions that package declares. The script's own definitions stay its own
+    either way; None for inline SQL and ``-f``.
 
     A rejection raised while the block runs is re-anchored: one landing inside
     an expanded body comes back pointing at the call site, saying which body
@@ -703,7 +707,7 @@ def expanded(
     lifted out like any other and comes back on :attr:`Script.wasm`, and its
     calls are left where they were written for lowering to resolve.
     """
-    expander = _Expander(packages=packages, on_warning=on_warning, scope=owner)
+    expander = _Expander(packages=packages, on_warning=on_warning, owner=owner)
     try:
         # Expansion's own rejections need translating too: a call written
         # inside a body was already stamped by the expansion around it.
@@ -2373,6 +2377,10 @@ class _Expander:
     # Whose definitions a BARE call name sees: the (name, version) of the
     # package whose body is expanding, or None for the script's own.
     scope: tuple[str, str] | None = None
+    # The (name, version) of the package the script ships in -- a recipe
+    # compiled by name -- or None for inline SQL and -f. Only qualified
+    # calls read it: they resolve at the versions this package declares.
+    owner: tuple[str, str] | None = None
 
     # -- entry point ------------------------------------------------------
 
@@ -2556,7 +2564,9 @@ class _Expander:
         """
         packages = self.packages
         assert packages is not None
-        dependent = self.scope[0] if self.scope is not None else None
+        # A recipe's own statements resolve at its package's versions too.
+        holder = self.scope if self.scope is not None else self.owner
+        dependent = holder[0] if holder is not None else None
         found = packages.resolve(dependent, f"{namespace}/{package_name}")
         if found is not None:
             return found

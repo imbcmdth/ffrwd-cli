@@ -408,7 +408,9 @@ def compile_sql(
 
     Raises ``FfrwdError`` — and nothing else — on every rejection.
     """
-    return compile_commands(text, packages=packages, on_warning=on_warning, unset=unset)[0]
+    return compile_commands(
+        text, packages=packages, on_warning=on_warning, owner=owner, unset=unset
+    )[0]
 
 
 def compile_commands(
