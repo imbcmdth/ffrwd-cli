@@ -1188,7 +1188,9 @@ def _ensure(
     complete the moment it is written. `chain` is the names currently being
     walked -- an ancestor reappearing is a cycle, checked before anything
     else, since it is what stops an infinite walk. An exact (name, version)
-    already in `entries` is left alone: not refetched, not walked again. A
+    already in `entries` is left alone -- not walked again, and not refetched
+    unless its content has gone missing from the store, in which case the
+    content is brought back and the entry stands as written. A
     different version of the same name is not a conflict -- it is simply
     added beside the one already there; nothing here picks between them.
     """
@@ -1199,9 +1201,10 @@ def _ensure(
             "there is no resolver here to break it; one of these packages has to stop "
             "depending on another in the loop",
         )
-    if _entry_for(release.name, release.version, entries) is not None:
-        return
+    pinned = _entry_for(release.name, release.version, entries)
     already = stored(release)
+    if pinned is not None and already is not None:
+        return
     if already is None and announce is not None:
         announce(
             f"fetching {release.name} {release.version} ({written_size(release.size)})"
@@ -1211,6 +1214,19 @@ def _ensure(
     package = read_manifest(root / MANIFEST_NAME)
     _install_models(package, announce)
     _install_runtime(package, announce)
+
+    if pinned is not None:
+        # The entry already says what this version resolved each dependency
+        # to; bring back any of that content the store lost, at those exact
+        # versions, and leave the lockfile as it was.
+        chain.append(release.name)
+        for name, version in pinned.dependencies.items():
+            if announce is not None:
+                announce(f"resolving {name}")
+            _ensure(resolve(f"{name}@{version}"), entries, chain, brought, announce)
+        chain.pop()
+        brought.append(release)
+        return
 
     chain.append(release.name)
     resolved: dict[str, str] = {}
@@ -1290,7 +1306,13 @@ def install(
         add_dependency(manifest, release.name, release.version)
 
     root = stored(release)
-    assert root is not None  # `_ensure` just verified or fetched it
+    if root is None:  # `_ensure` verified or fetched it, so something removed it since
+        raise _reject(
+            f"package '{release.name}' {release.version} was fetched but its "
+            "content is not in the store",
+            "something is removing store entries while install runs; "
+            "try the install again",
+        )
     return Installed(
         release=release,
         brought=tuple(brought),

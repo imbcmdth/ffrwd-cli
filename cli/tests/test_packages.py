@@ -30,6 +30,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import shutil
 import urllib.error
 from collections.abc import Iterator, Mapping
 from pathlib import Path
@@ -38,7 +39,7 @@ from types import SimpleNamespace
 import pytest
 
 from ffrwd import cli, credentials, packages, store
-from ffrwd.errors import FfrwdError
+from ffrwd.errors import ErrorCode, FfrwdError
 from ffrwd.mcp import tools as mcp_tools
 from ffrwd.project import (
     LinkEntry,
@@ -768,6 +769,82 @@ def test_content_already_in_the_store_is_not_downloaded_again(
     assert code == 0
     assert "already in the store" in out
     assert read_lockfile(second / "ffrwd.lock").entries[0].sha256 == sha256
+
+
+def test_a_lock_entry_whose_store_content_is_gone_is_refetched(
+    store_home: Path,
+    registry: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The state the loader's own hint sends the user into: install again."""
+    sha256 = _publish(registry, _package(tmp_path / "built"))
+    project = _project(tmp_path / "work", monkeypatch, capsys)
+    assert _run(project, monkeypatch, capsys, "install", "broadcast/tracks")[0] == 0
+    before = (project / "ffrwd.lock").read_text(encoding="utf-8")
+
+    shutil.rmtree(store.store_dir() / store.entry_path(sha256))
+    code, _out, err = _run(project, monkeypatch, capsys, "install", "broadcast/tracks")
+    assert code == 0, err
+    assert "fetching broadcast/tracks 1.0.0 (" in err
+    assert (store.store_dir() / store.entry_path(sha256)).is_dir()
+    assert (project / "ffrwd.lock").read_text(encoding="utf-8") == before
+
+
+def test_a_refetch_brings_back_a_dependencys_lost_content_at_its_pinned_version(
+    store_home: Path,
+    registry: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    dep_sha = _publish(registry, _package(tmp_path / "video", name="broadcast/video"))
+    top_sha = _publish(
+        registry,
+        _dependent(
+            tmp_path / "images",
+            name="broadcast/images",
+            dep_name="broadcast/video",
+            dep_range="^1.0.0",
+        ),
+        functions=(),
+        recipes=("thumb",),
+    )
+    project = _project(tmp_path / "work", monkeypatch, capsys)
+    assert _run(project, monkeypatch, capsys, "install", "broadcast/images")[0] == 0
+    before = (project / "ffrwd.lock").read_text(encoding="utf-8")
+    # A newer dependency version publishes; the pin must not move to it.
+    _publish(registry, _package(tmp_path / "video2", name="broadcast/video", version="2.0.0"))
+
+    shutil.rmtree(store.store_dir() / store.entry_path(top_sha))
+    shutil.rmtree(store.store_dir() / store.entry_path(dep_sha))
+    code, _out, _err = _run(project, monkeypatch, capsys, "install", "broadcast/images")
+    assert code == 0
+    assert (store.store_dir() / store.entry_path(top_sha)).is_dir()
+    assert (store.store_dir() / store.entry_path(dep_sha)).is_dir()
+    assert (project / "ffrwd.lock").read_text(encoding="utf-8") == before
+
+
+def test_content_that_vanishes_during_install_is_a_typed_refusal(
+    store_home: Path,
+    registry: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _publish(registry, _package(tmp_path / "built"))
+    project = _project(tmp_path / "work", monkeypatch, capsys)
+    monkeypatch.setattr(packages, "stored", lambda release: None)
+    with pytest.raises(FfrwdError) as caught:
+        packages.install(
+            "broadcast/tracks",
+            lock=project / "ffrwd.lock",
+            manifest=project / "ffrwd.json",
+        )
+    assert caught.value.code is ErrorCode.UNSUPPORTED_SQL
+    assert "is not in the store" in caught.value.message
+    assert caught.value.hint is not None
 
 
 # ---------------------------------------------------------------------------
