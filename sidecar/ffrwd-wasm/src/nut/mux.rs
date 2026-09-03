@@ -528,15 +528,8 @@ mod tests {
         // Worked out by hand from `decode_dts`'s reorder buffer of
         // `decode_delay + 1` entries: None until the buffer fills, then the
         // smallest pts seen so far that has not already come out.
-        let expected_dts: [Option<i64>; 7] = [
-            None,
-            None,
-            Some(0),
-            Some(1),
-            Some(2),
-            Some(3),
-            Some(4),
-        ];
+        let expected_dts: [Option<i64>; 7] =
+            [None, None, Some(0), Some(1), Some(2), Some(3), Some(4)];
 
         let mut wire = Vec::new();
         {

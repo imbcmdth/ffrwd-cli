@@ -124,6 +124,23 @@ fn run_ffrwd_wasm(args: &[&str], stdin_bytes: &[u8]) -> Run {
     }
 }
 
+/// Whether ffmpeg is on PATH, so the one test here that shells out to real
+/// ffmpeg can skip rather than fail where it is not installed.
+fn ffmpeg_on_path() -> bool {
+    Command::new("ffmpeg")
+        .arg("-version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// Says why a test did nothing, since a skip is otherwise silent.
+fn announce_skip(what: &str) {
+    eprintln!("SKIPPED: {what}. Install ffmpeg and put it on PATH to run this test.");
+}
+
 /// Every packet of the fixture, as the reader hands them out.
 fn read_fixture() -> Vec<(Packet, Vec<u8>)> {
     let mut demuxer = Demuxer::open(FIXTURE).expect("read the fixture's NUT headers");
@@ -325,6 +342,71 @@ fn a_packet_sink_joins_no_network() {
         run.stderr.contains("joins no network"),
         "stderr does not refuse the network:\n{}",
         run.stderr
+    );
+}
+
+#[test]
+fn real_ffmpeg_accepts_a_stream_write_coded_wrote() {
+    // The other tests here prove this crate's own Demuxer reads back what
+    // write_coded writes; this one proves real ffmpeg's NUT demuxer does
+    // too, over packets ffmpeg itself encoded and this reader parsed off the
+    // fixture - not synthetic bytes.
+    if !ffmpeg_on_path() {
+        announce_skip("real ffmpeg cannot demux a write_coded stream");
+        return;
+    }
+
+    // Read order off a NUT stream is decode order, which is exactly the
+    // order write_coded wants them handed back in. A prefix that spans both
+    // keyframes carries the mid-GOP B-frame reordering as well as the cut
+    // from one GOP to the next.
+    let packets: Vec<(Packet, Vec<u8>)> = read_fixture().into_iter().take(35).collect();
+    let stream = Demuxer::open(FIXTURE)
+        .expect("read the fixture's NUT headers")
+        .stream()
+        .clone();
+
+    let mut wire = Vec::new();
+    {
+        let mut muxer = Muxer::new(&mut wire, &stream).expect("write headers");
+        for (packet, data) in &packets {
+            muxer.write_coded(packet, data).expect("write coded packet");
+        }
+        muxer.finish().expect("finish");
+    }
+
+    let mut child = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "nut",
+            "-i",
+            "-",
+            "-c",
+            "copy",
+            "-f",
+            "null",
+            "-",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ffmpeg");
+    child
+        .stdin
+        .take()
+        .expect("ffmpeg stdin")
+        .write_all(&wire)
+        .expect("write the NUT stream to ffmpeg's stdin");
+    let output = child.wait_with_output().expect("wait for ffmpeg");
+    assert!(
+        output.status.success(),
+        "ffmpeg exited with {:?}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 
