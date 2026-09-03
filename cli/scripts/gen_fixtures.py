@@ -13,7 +13,9 @@ tests expand over. av2 and av3 differ only in their sine frequencies, so a
 sources whose language tags agree track for track. ``stereo.mp4`` adds the
 one thing none of those have: a genuinely 2-CHANNEL audio track (plan 047).
 ``font.ttf`` is a stub TrueType file and ``attached.mkv`` is a container
-carrying it, for reading attachments back.
+carrying it, for reading attachments back. ``ladder/master.m3u8`` is a real
+two-rendition HLS ladder, the one fixture built by running the compiler
+itself rather than a raw ffmpeg call.
 
 Idempotent: a fixture whose output file already exists is skipped, so this
 is safe to run repeatedly, including once per CI job right before the exec
@@ -60,6 +62,32 @@ _TAGGED_NAME = "tagged.mp4"
 _AV_2ENG_NAME = "av-2eng.mp4"
 _FONT_TTF_NAME = "font.ttf"
 _ATTACHED_NAME = "attached.mkv"
+_LADDER_MASTER_NAME = "ladder/master.m3u8"
+
+# Two muxed renditions, 1080p and 720p, built by RUNNING THE COMPILER against
+# av.mp4 (never hand-typed) -- read back by `input()` on a manifest path. The
+# rung/rung join is what recipe 104 uses to make each row carry both a video
+# and an audio stream (a muxed variant); duplicating the one physical audio
+# track across both rungs, rather than an `agroup`, keeps the fixture's shape
+# the one recipes 105-107 read: `r.video[1]` and `r.audio[1]` both present on
+# every rendition row, no demuxed audio group to look past.
+_LADDER_SQL = """\
+COPY (
+  WITH vid AS (
+    SELECT scale(f.video[1], ARRAY[1440, 960][i.i], -2) AS v, i.i AS rung
+    FROM input('av.mp4') f, generate_series(1, 2) i
+  ),
+  aud AS (
+    SELECT a AS t, j.j AS rung
+    FROM input('av.mp4') g, unnest(g.audio) a, generate_series(1, 2) j
+  )
+  SELECT vid.v, aud.t
+  FROM vid FULL JOIN aud ON vid.rung = aud.rung
+) TO 'ladder/master.m3u8'
+  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod',
+        video_codec 'libx264', video_bitrate ARRAY['2000k', '800k'][vid.rung],
+        audio_codec 'aac')
+"""
 
 # The mimetype ffmpeg itself reports for a TrueType attachment.
 _FONT_MIMETYPE = "application/x-truetype-font"
@@ -374,6 +402,32 @@ def _generate_attached(font_path: Path) -> None:
     )
 
 
+def _generate_ladder() -> None:
+    """A real two-rendition HLS ladder, run through `ffrwd run` itself
+    (`python -m ffrwd`, the console entry point) rather than a hand-typed
+    ffmpeg call -- this is the one fixture that IS the compiler's own
+    output, since recipes 105-107 read `input()` on a manifest path and
+    need `-show_programs` to report real renditions. Must run after
+    av.mp4 exists.
+    """
+    master = FIXTURES_DIR / _LADDER_MASTER_NAME
+    if master.exists():
+        print(f"skip (already exists): {master}")
+        return
+    master.parent.mkdir(parents=True, exist_ok=True)
+    print(f"generating: {master}")
+    result = subprocess.run(
+        [sys.executable, "-m", "ffrwd", "run", _LADDER_SQL, "-y"],
+        cwd=FIXTURES_DIR,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        print(result.stdout, file=sys.stderr)
+        print(result.stderr, file=sys.stderr)
+        raise SystemExit(f"ffrwd run failed generating {master}")
+
+
 def main() -> int:
     if not _ffmpeg_available():
         print("error: ffmpeg not found on PATH", file=sys.stderr)
@@ -392,6 +446,7 @@ def main() -> int:
     _generate_tagged()
     _generate_frame_png()
     _generate_attached(_generate_font_ttf())
+    _generate_ladder()
     return 0
 
 

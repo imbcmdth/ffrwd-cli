@@ -24,6 +24,21 @@ Only an input-side read has facts to report. A field read off a FILTER OUTPUT - 
 
 `SELECT *` over an input alias is its ARRAY columns, never the scalars. In a media query that is the four stream arrays in `video`, `audio`, `subtitle`, `data` order, each a passthrough - the remux shape; chapters ride through as ffmpeg's own default. In a table/CSV query it is every writable array column - the four stream arrays plus `chapters` and `attachments` - one cell each; `cues` is read-only and stays out. `f.*` does one alias, a bare `*` every alias in `FROM` order.
 
+## Rendition rows - `input('ladder.m3u8') r`
+
+`input()` on an HLS master playlist or a DASH MPD reads one row per ABR rendition instead of one row for the file - a manifest input IS a row table, the way `unnest()` makes one.
+
+| column | type | notes |
+| --- | --- | --- |
+| `video`, `audio` | stream array | this rendition's own streams; subscript (`r.video[1]`) or unnest, same as an input row's |
+| `bandwidth` | number | HLS BANDWIDTH / MPD @bandwidth |
+| `width`, `height` | number | from the rendition's video stream |
+| `codecs` | text | HLS CODECS / MPD @codecs, verbatim |
+| `name` | text | HLS NAME, else NULL |
+| `language` | text | HLS LANGUAGE / MPD @lang, else NULL |
+
+`WHERE`, `ORDER BY` and `LIMIT` over these columns filter and rank renditions the same as track rows do below ([recipes 105-106](examples.md#105-pick-a-rung-from-an-abr-ladder)); a `format 'hls'`/`format 'dash'` destination fed every surviving rendition writes a new ladder, rung for rung ([recipe 107](examples.md#107-re-encode-an-abr-ladder-through-to-another-abr-ladder)).
+
 ## Track rows - `unnest(f.audio) t`
 
 One row per track. The argument is an array column of an input declared earlier in the same FROM list; alias mandatory. All seven array columns unnest - the four stream arrays here, and `chapters`, `cues` and `attachments` below. The schema varies by stream type:
