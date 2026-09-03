@@ -189,6 +189,26 @@ FrameRef, node or label changes. The pre-dedup graph (``ffrwd explain``)
 still shows one input slot per alias; only the rendered ``-i`` list and the
 indices baked into the filtergraph are deduped.
 
+Unused URL-source inputs
+-------------------------
+``FROM files(...) s`` (see :attr:`Graph.url_sources`) mints one hidden ``-i``
+per row it names, before WHERE/ORDER BY/LIMIT choose which of those rows the
+query keeps: a filtered-out row's input is otherwise still opened by ffmpeg
+even though nothing maps it. :func:`_drop_unused_url_inputs` runs right after
+:func:`~ffrwd.ir.dedup_inputs` in :func:`emit` and removes exactly such a
+slot -- an input that belongs to a URL source AND that no node, no output, no
+``-map_chapters``/``-map_metadata`` and no trimmed/optioned alias still
+names. An ordinary ``input()`` alias the query names but never maps is left
+alone; only a URL source's own row inputs are candidates. The renumbering is
+the same shape :func:`~ffrwd.ir.dedup_inputs` already does for
+``input_paths``/``sources`` (first-occurrence order, later indices shift
+down to fill the gap), extended to the two other places a raw input index is
+stored: a sink's ``chapters``/``metadata`` and a surviving
+:class:`~ffrwd.ir.UrlSourceRow`'s own ``input``. A dropped row is removed
+from its :class:`~ffrwd.ir.UrlSource`'s ``rows`` -- it no longer names a live
+``-i``. A URL source cannot lose every row this way: WHERE keeping zero rows
+is refused before emit ever runs.
+
 Zero-input nodes
 ----------------
 A generated source (``FROM ffmpeg.testsrc(duration => 2) t``) lowers to a node
@@ -234,6 +254,7 @@ from .ir import (
     Output,
     SinkUnit,
     StreamType,
+    UrlSource,
     dedup_inputs,
     is_src,
     src_parts,
@@ -408,10 +429,11 @@ def emit(g: Graph, *, network: bool = False) -> Emitted:
     consume-once rule does not apply. Labels are allocated and values escaped
     identically either way.
 
-    Runs :func:`~ffrwd.ir.dedup_inputs` first, before anything below reads
-    ``g.sources``/``g.input_paths``.
+    Runs :func:`~ffrwd.ir.dedup_inputs`, then :func:`_drop_unused_url_inputs`,
+    before anything below reads ``g.sources``/``g.input_paths``.
     """
     g = dedup_inputs(g)
+    g = _drop_unused_url_inputs(g)
     _verify_topological(g)
 
     nodes = list(g.nodes.values())
@@ -511,6 +533,112 @@ def _input_option_list(g: Graph) -> list[dict[str, object]]:
         options[index] = candidate
         seen[index] = True
     return options
+
+
+def _referenced_input_indices(g: Graph) -> set[int]:
+    """Every ffmpeg input index something in `g` still points at.
+
+    A node's or an output's source ref, a file's ``-map_chapters``/
+    ``-map_metadata`` source, and an alias carrying a trim window or input
+    options each pin their input's slot. :func:`_drop_unused_url_inputs`
+    drops a URL-source row's input only when it names none of these.
+    """
+    indices: set[int] = set()
+    for node in g.nodes.values():
+        for ref in node.inputs:
+            if is_src(ref):
+                index = g.sources.get(src_parts(ref)[0])
+                if index is not None:
+                    indices.add(index)
+    for output in g.outputs:
+        if is_src(output.ref):
+            index = g.sources.get(src_parts(output.ref)[0])
+            if index is not None:
+                indices.add(index)
+    for unit in g.sinks:
+        if unit.chapters is not None and unit.chapters >= 0:
+            indices.add(unit.chapters)
+        if unit.metadata is not None and unit.metadata >= 0:
+            indices.add(unit.metadata)
+    for alias in (*g.input_trims, *g.input_options):
+        index = g.sources.get(alias)
+        if index is not None:
+            indices.add(index)
+    return indices
+
+
+def _remap_index(index: int | None, old_to_new: dict[int, int]) -> int | None:
+    """`index` under the renumbering :func:`_drop_unused_url_inputs` applies.
+
+    `None` (ffmpeg's own default) and a negative sentinel (``NO_CHAPTERS``/
+    ``NO_METADATA``) name no slot at all and pass through unchanged.
+    """
+    if index is None or index < 0:
+        return index
+    return old_to_new[index]
+
+
+def _drop_unused_url_inputs(g: Graph) -> Graph:
+    """Remove a URL-source row's ``-i`` when nothing in `g` reads it.
+
+    See the module docstring's "Unused URL-source inputs" section. Only an
+    input that is some :class:`UrlSource`'s row (an entry of
+    ``g.url_sources[*].rows``) is ever a candidate; an ordinary ``input()``
+    alias the query names but never maps keeps its slot, whatever
+    :func:`_referenced_input_indices` says about it.
+    """
+    url_indices = {row.input for source in g.url_sources.values() for row in source.rows}
+    if not url_indices:
+        return g
+    drop = url_indices - _referenced_input_indices(g)
+    if not drop:
+        return g
+
+    old_to_new: dict[int, int] = {}
+    new_input_paths: list[str] = []
+    for index, path in enumerate(g.input_paths):
+        if index in drop:
+            continue
+        old_to_new[index] = len(new_input_paths)
+        new_input_paths.append(path)
+
+    new_sources = {
+        alias: old_to_new[index] for alias, index in g.sources.items() if index not in drop
+    }
+    new_url_sources: dict[str, UrlSource] = {
+        alias: replace(
+            source,
+            rows=tuple(
+                replace(row, input=old_to_new[row.input])
+                for row in source.rows
+                if row.input not in drop
+            ),
+        )
+        for alias, source in g.url_sources.items()
+    }
+    new_sinks = [
+        replace(
+            unit,
+            chapters=_remap_index(unit.chapters, old_to_new),
+            metadata=_remap_index(unit.metadata, old_to_new),
+        )
+        for unit in g.sinks
+    ]
+    return replace(
+        g,
+        input_paths=new_input_paths,
+        sources=new_sources,
+        input_trims={
+            alias: window for alias, window in g.input_trims.items() if alias in new_sources
+        },
+        input_options={
+            alias: dict(options)
+            for alias, options in g.input_options.items()
+            if alias in new_sources
+        },
+        url_sources=new_url_sources,
+        sinks=new_sinks,
+    )
 
 
 @dataclass(frozen=True)

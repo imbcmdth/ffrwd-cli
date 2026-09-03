@@ -275,15 +275,16 @@ def test_a_url_sources_rows_carry_the_modules_column_beside_the_probed_one() -> 
 
 def test_a_where_on_the_modules_column_maps_that_rows_own_input() -> None:
     """`WHERE s.sequence = 2` leaves one row, so the one-row rule is
-    satisfied and `s.video[1]` is the SECOND minted input's video -- both
-    `-i` entries stay, since dropping the unmapped one is a later pass."""
+    satisfied and `s.video[1]` is the SECOND minted input's video -- but
+    ffmpeg only ever opens the row that survived: emit drops the unmapped
+    first `-i` and renumbers the map onto the one that is left."""
     g = _url_lowered(
         "COPY (SELECT s.video[1] FROM files('a.mp4,b.mp4') s WHERE s.sequence = 2)\n"
         "TO 'o.mp4'"
     )
     assert build_ffmpeg_args(emit(insert_splits(g))) == [
-        "ffmpeg", "-i", "a.mp4", "-i", "b.mp4",
-        "-map", "1:v:0", "-c:0", "copy", "o.mp4",
+        "ffmpeg", "-i", "b.mp4",
+        "-map", "0:v:0", "-c:0", "copy", "o.mp4",
     ]
 
 

@@ -21,6 +21,7 @@ from ffrwd.emit import (
     Emitted,
     OutputGroup,
     OutputMap,
+    _drop_unused_url_inputs,
     _escape_value,
     _render_command,
     build_ffmpeg_args,
@@ -37,6 +38,8 @@ from ffrwd.ir import (
     Output,
     SinkUnit,
     StreamType,
+    UrlSource,
+    UrlSourceRow,
 )
 
 
@@ -98,6 +101,7 @@ def _graph(
     sinks: list[SinkUnit] | None = None,
     input_trims: dict[str, tuple[float | None, float | None]] | None = None,
     input_options: dict[str, dict[str, object]] | None = None,
+    url_sources: dict[str, UrlSource] | None = None,
 ) -> Graph:
     """A ONE-sink graph carrying `outputs` (`sink` names its destination).
 
@@ -128,6 +132,7 @@ def _graph(
         sinks=units,
         input_trims=dict(input_trims or {}),
         input_options={k: dict(v) for k, v in (input_options or {}).items()},
+        url_sources=dict(url_sources or {}),
     )
 
 
@@ -2328,6 +2333,105 @@ def test_dedup_renumbers_source_specs_onto_the_shared_slot() -> None:
     e = emit(g)
     assert e.filter_complex == "[0:v:0]hflip[out0]"
     assert e.maps[1].target == "0:v:0"  # y's passthrough map, same merged index
+
+
+# ---------------------------------------------------------------------------
+# unused URL-source inputs: a `FROM files(...) s` row WHERE/LIMIT filtered
+# out still mints an `-i` today; emit drops it and renumbers everything else
+# that names an input index.
+# ---------------------------------------------------------------------------
+
+
+def _url_source(alias: str, rows: list[tuple[str, int]]) -> UrlSource:
+    """A `UrlSource` with one row per `(url, input)` pair, no module columns."""
+    return UrlSource(
+        alias=alias,
+        module="modules/files.wasm",
+        params="{}",
+        document=None,
+        rows=tuple(UrlSourceRow(url=url, input=index) for url, index in rows),
+    )
+
+
+def test_dropping_an_unused_url_input_renumbers_maps_and_pad_labels() -> None:
+    """Three URL-source inputs (a, b, c); only a and c are ever read (a's and
+    c's AUDIO feed a concat, c's VIDEO is a bare passthrough map). b's `-i`
+    is dropped and c's index shifts from 2 to 1 everywhere it appears: the
+    concat chain's pad labels and the passthrough `-map` alike."""
+    g = _graph(
+        [
+            _node(
+                "cc", "concat", {"n": 2, "v": 0, "a": 1},
+                ["src:x0:a:0", "src:x2:a:0"], ["audio"],
+            ),
+        ],
+        [_out("cc", "audio"), _out("src:x2:v:0")],
+        input_paths=["a.mp4", "b.mp4", "c.mp4"],
+        sources={"x0": 0, "x1": 1, "x2": 2},
+        url_sources={"s": _url_source("s", [("a.mp4", 0), ("b.mp4", 1), ("c.mp4", 2)])},
+    )
+    e = emit(g)
+    assert e.inputs == ["a.mp4", "c.mp4"]
+    assert e.filter_complex == "[0:a:0][1:a:0]concat=n=2:v=0:a=1[out0]"
+    assert e.maps[1].target == "1:v:0"
+    args = build_ffmpeg_args(e, "out.mkv")
+    assert args[:5] == ["ffmpeg", "-i", "a.mp4", "-i", "c.mp4"]
+
+
+def test_an_unmapped_ordinary_input_is_not_dropped() -> None:
+    """Only a URL-source row's own input is ever a drop candidate: a plain
+    `input()` alias the query names but never maps keeps its slot exactly as
+    it does today -- that pin is unrelated and lives elsewhere."""
+    g = _graph(
+        [],
+        [_out("src:x0:v:0")],
+        input_paths=["a.mp4", "b.mp4"],
+        sources={"x0": 0, "plain": 1},
+        url_sources={"s": _url_source("s", [("a.mp4", 0)])},
+    )
+    e = emit(g)
+    assert e.inputs == ["a.mp4", "b.mp4"]
+
+
+def test_dropping_an_unused_url_input_shifts_windows_and_options_with_it() -> None:
+    """c's trim window and input options are alias-keyed, so they follow c's
+    alias to its new (shifted) input position without being told to."""
+    g = _graph(
+        [],
+        [_out("src:x0:v:0"), _out("src:x2:v:0")],
+        input_paths=["a.mp4", "b.mp4", "c.mp4"],
+        sources={"x0": 0, "x1": 1, "x2": 2},
+        input_trims={"x2": (0.0, 5.0)},
+        input_options={"x2": {"loop": True}},
+        url_sources={"s": _url_source("s", [("a.mp4", 0), ("b.mp4", 1), ("c.mp4", 2)])},
+    )
+    e = emit(g)
+    assert e.inputs == ["a.mp4", "c.mp4"]
+    assert e.input_trims == [None, (0.0, 5.0)]
+    assert e.input_options == [{}, {"loop": True}]
+
+
+def test_dropping_an_unused_url_input_updates_everything_else_that_names_it() -> None:
+    """The renumbering reaches every OTHER place a raw input index lives, not
+    just `Graph.sources`: a sink's `-map_chapters` source (here the only
+    thing keeping c's `-i` alive at all -- nothing maps it) and the
+    surviving row's own `UrlSourceRow.input`. b's row, backing nothing at
+    all, is dropped outright rather than left pointing at a removed slot."""
+    g = _graph(
+        [],
+        [_out("src:x0:v:0")],
+        sink=_sink("o.mp4", chapters=2),
+        input_paths=["a.mp4", "b.mp4", "c.mp4"],
+        sources={"x0": 0, "x1": 1, "x2": 2},
+        url_sources={"s": _url_source("s", [("a.mp4", 0), ("b.mp4", 1), ("c.mp4", 2)])},
+    )
+    dropped = _drop_unused_url_inputs(g)
+    assert dropped.input_paths == ["a.mp4", "c.mp4"]
+    assert dropped.sources == {"x0": 0, "x2": 1}
+    assert dropped.sinks[0].chapters == 1
+    assert [(row.url, row.input) for row in dropped.url_sources["s"].rows] == [
+        ("a.mp4", 0), ("c.mp4", 1),
+    ]
 
 
 # ---------------------------------------------------------------------------
