@@ -12801,6 +12801,41 @@ def test_an_unaccepted_codec_still_encodes_onto_the_sink() -> None:
     assert pads[1]["audio_codec"] == "copy"
 
 
+def test_a_copied_aac_pad_carries_the_adts_bsf() -> None:
+    """A copied AAC stream carries no AudioSpecificConfig once it reaches
+    the sidecar's NUT muxer, so a copied audio pad picks up
+    ``aac_adtstoasc`` beside its ``audio_codec: copy`` -- the same filter
+    ffmpeg's own mp4 muxer inserts itself. The copied VIDEO pad beside it
+    gets no bitstream filter at all: h264 needs none here."""
+    g = _row_sink_graph(
+        "COPY (SELECT r.video[1], r.audio[1] FROM input('ladder.m3u8') r "
+        "WHERE r.height = 720) TO publish('relay', 'live')",
+        _rendition_probes(),
+    )
+    node_id = next(iter(g.packet_sinks))
+    pads = g.packet_sinks[node_id]
+    assert pads[0]["video_codec"] == "copy"
+    assert "audio_bsf" not in pads[0]
+    assert pads[1]["audio_codec"] == "copy"
+    assert pads[1]["audio_bsf"] == "aac_adtstoasc"
+
+
+def test_a_reencoded_audio_pad_carries_no_bsf() -> None:
+    """The ADTS filter is a COPY-only concern: naming ``audio_codec``
+    explicitly always encodes, and an encoded pad carries no bitstream
+    filter at all."""
+    g = _row_sink_graph(
+        "COPY (SELECT r.video[1], r.audio[1] FROM input('ladder.m3u8') r "
+        "WHERE r.height = 720) TO publish('relay', 'live') "
+        "WITH (audio_codec 'aac')",
+        _rendition_probes(),
+    )
+    node_id = next(iter(g.packet_sinks))
+    pads = g.packet_sinks[node_id]
+    assert pads[1]["audio_codec"] == "aac"
+    assert "audio_bsf" not in pads[1]
+
+
 def test_a_value_column_into_a_row_reading_sink_names_its_type() -> None:
     """A column that is not a video or audio stream -- a plain subtitle
     track here, a rows projection reads back the same way -- is refused
@@ -12886,3 +12921,34 @@ def test_the_old_sink_form_is_unaffected() -> None:
     err = _anchored(excinfo.value)
     assert err.code is ErrorCode.UDF_ARG_TYPE
     assert "reads 1 stream" in err.message
+
+
+OLD_FORM_AV_SINK_MODULE = "modules/tally2.wasm"
+
+OLD_FORM_AV_SINK_DECLARE = (
+    "CREATE FUNCTION tally2(v video_stream, a audio_stream) RETURNS sink\n"
+    f"  AS '{OLD_FORM_AV_SINK_MODULE}', 'tally2' LANGUAGE wasm;\n"
+)
+
+
+def test_the_old_sink_forms_copied_aac_pad_carries_the_bsf_too() -> None:
+    """The stream-parameter sink form funnels through the same pad-building
+    code the row-reading form does, so a copied AAC pad picks up the ADTS
+    bitstream filter there too."""
+    g = lower(
+        resolve(parse(
+            OLD_FORM_AV_SINK_DECLARE
+            + "COPY (SELECT f.video[1], f.audio[1] FROM input('a.mp4') f) TO tally2()"
+        )),
+        _row_probes(_track("video", 0), _track("audio", 0, codec="aac")),
+        registry=_snapshot_registry(),
+        describes={
+            OLD_FORM_AV_SINK_MODULE: _row_sink_described(name="tally2", video="one", audio="one")
+        },
+    )
+    node_id = next(iter(g.packet_sinks))
+    pads = g.packet_sinks[node_id]
+    assert pads[0]["video_codec"] == "copy"
+    assert "audio_bsf" not in pads[0]
+    assert pads[1]["audio_codec"] == "copy"
+    assert pads[1]["audio_bsf"] == "aac_adtstoasc"

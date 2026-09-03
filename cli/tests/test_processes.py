@@ -8,12 +8,14 @@ split-complete, topologically ordered.
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import replace
 
 import pytest
 
 from ffrwd import wasm
 from ffrwd.errors import ErrorCode, FfrwdError
+from ffrwd.execute import PipeEdge, Side, plan_argv
 from ffrwd.ir import Graph, ModuleSource, Node, Output, SinkUnit, SourceTrack, StreamType
 from ffrwd.probe import ProbeResult, StreamMeta
 from ffrwd.processes import (
@@ -1376,6 +1378,36 @@ def test_the_old_sink_forms_pads_show_no_pad_flag() -> None:
     assert all(pad is None for pad in sidecar.pads)
     argv = wasm.shown_argv(sidecar, ["pipe0", "pipe1"])
     assert "-pad" not in argv
+
+
+def _numbered_pipes() -> Callable[[PipeEdge, Side], str]:
+    counter = [0]
+
+    def name(edge: PipeEdge, side: Side) -> str:
+        counter[0] += 1
+        return f"pipe{counter[0]}"
+
+    return name
+
+
+def test_a_copied_aac_pads_bsf_reaches_the_feeding_argv() -> None:
+    """The `audio_bsf` key lower.py writes on a copied AAC pad rides the
+    edge's wire options exactly as `audio_codec` does, reaching the feeding
+    ffmpeg's own argv right after that pad's `-c:<i> copy`. Every pipe
+    output is its own ffmpeg output FILE, so stream numbering restarts at
+    0 for each one -- the copied pad here is the fourth of four, and its
+    flags still read ``-c:0 copy -bsf:0 aac_adtstoasc``."""
+    g = _row_reading_packet_sink_graph()
+    g.packet_sinks["e0"][3]["audio_bsf"] = "aac_adtstoasc"
+    plan = partition(g, external=external_ids("e0"))
+    argv = plan_argv(
+        plan,
+        sidecar_argv=lambda process, reads: ["ffrwd-wasm", *reads],
+        pipe_path=_numbered_pipes(),
+    )
+    feeder = argv[plan.ffmpeg[0].id]
+    index = feeder.index("-bsf:0")
+    assert feeder[index - 2 : index + 2] == ["-c:0", "copy", "-bsf:0", "aac_adtstoasc"]
 
 
 # ---------------------------------------------------------------- module sources

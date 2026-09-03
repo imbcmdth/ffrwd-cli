@@ -509,6 +509,16 @@ _INTERNAL_SINK_OPTIONS: dict[str, SinkOptionSpec] = {
         flag="-sc_threshold",
         per_stream=True,
     ),
+    # A copied AAC stream onto a packet sink keeps its ADTS headers; the mp4
+    # muxer strips them itself via this same filter, the NUT muxer does not.
+    "audio_bsf": SinkOptionSpec(
+        name="audio_bsf",
+        scope="audio",
+        type="str",
+        doc="Bitstream filter applied to a copied packet-sink audio stream.",
+        flag="-bsf",
+        per_stream=True,
+    ),
 }
 
 

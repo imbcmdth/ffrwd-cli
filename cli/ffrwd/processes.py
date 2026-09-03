@@ -116,6 +116,7 @@ from .ir import (
 from .probe import ProbeResult, StreamMeta, is_url
 
 __all__ = [
+    "AAC_ADTSTOASC",
     "COPY_CODEC",
     "FIFO",
     "NUT",
@@ -165,6 +166,12 @@ PCM_S16LE = "pcm_s16le"
 # ffmpeg's own spelling for a stream handed on untouched: what an edge carries
 # when nothing on the far side filters it, so the packets cross as they came.
 COPY_CODEC = "copy"
+
+# ffmpeg's own bitstream filter for a copied AAC stream reaching a packet
+# sink: the mp4 muxer inserts it itself, the NUT muxer feeding the sidecar
+# does not, and an ADTS source (e.g. HLS) has no AudioSpecificConfig without
+# it. Passes non-ADTS packets through untouched, so it is safe unconditionally.
+AAC_ADTSTOASC = "aac_adtstoasc"
 
 # ffprobe reports no pixel format, so the wire format is one the compiler
 # picks and the producing ffmpeg is told to write.

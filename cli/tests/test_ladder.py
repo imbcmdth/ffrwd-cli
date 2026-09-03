@@ -21,7 +21,13 @@ from pathlib import Path
 import pytest
 
 from ffrwd import cli
+from ffrwd.execute import plan_argv
+from ffrwd.lower import lower
+from ffrwd.parser import parse, resolve
 from ffrwd.probe import ProbeResult, clear_cache, probe
+from ffrwd.processes import external_ids, partition
+from ffrwd.registry import load_reference
+from ffrwd.wasm import WORLDS, Described
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 FIXTURES_DIR = PROJECT_ROOT / "tests" / "fixtures"
@@ -286,3 +292,79 @@ def test_a_demuxed_hls_ladder_probes_video_only_and_audio_only_rows(
     assert len(audio_only) >= 1
     for rendition in audio_only:
         assert [s.type for s in rendition.streams] == ["audio"]
+
+
+@pytest.mark.exec
+def test_a_copied_hls_aac_pad_into_a_packet_sink_carries_the_adts_bsf(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _fixtures: None
+) -> None:
+    """A stream COPIED out of HLS carries ADTS headers and no
+    AudioSpecificConfig; ffmpeg's mp4 muxer inserts `aac_adtstoasc` itself,
+    the NUT muxer feeding the sidecar does not, so a copied AAC pad onto a
+    packet sink needs the filter added explicitly.
+
+    Neither fleet packet sink this repo vendors reads audio at all --
+    `packet_tally` and `packet_stats` both describe `audio: Arity::Zero` --
+    so there is no real module to run this through end to end. This proves
+    the fix at the compile layer instead: a real HLS ladder, built with the
+    compiler itself, probed for real, lowered against a synthetic packet
+    sink that DOES accept audio, and partitioned into a real process plan.
+    The feeding ffmpeg's own printed argv is what a real run would spawn.
+    """
+    monkeypatch.chdir(tmp_path)
+    av = (FIXTURES_DIR / "av.mp4").as_posix()
+    (tmp_path / "ladder").mkdir()
+    assert cli.main(["run", _LADDER_SQL.format(av=av), "-y"]) == 0
+    master = tmp_path / "ladder" / "master.m3u8"
+    assert master.exists()
+
+    clear_cache()
+    ladder_probe = probe(str(master))
+    audio_codecs = {s.codec for s in ladder_probe.streams if s.type == "audio"}
+    assert audio_codecs == {"aac"}  # the real HLS audio really is AAC
+
+    module = "modules/publish.wasm"
+    described = Described(
+        world=WORLDS[-1],
+        name="publish",
+        version="0.1.0",
+        params_schema={
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {"relay": {"type": "string"}, "broadcast": {"type": "string"}},
+        },
+        rows_schema=None,
+        video_codecs=("h264",),
+        audio_codecs=("aac",),
+        video_streams="many",
+        audio_streams="many",
+    )
+    sql = (
+        "CREATE FUNCTION publish(relay text, broadcast text) RETURNS sink\n"
+        f"  AS '{module}', 'publish' LANGUAGE wasm;\n"
+        f"COPY (SELECT r.audio[1] FROM input('{master.as_posix()}') r "
+        "WHERE r.height = 720) TO publish('relay', 'live')"
+    )
+    registry = load_reference(PROJECT_ROOT / "tests" / "data" / "reference_registry.json")
+    g = lower(
+        resolve(parse(sql)),
+        {"r": ladder_probe},
+        registry=registry,
+        describes={module: described},
+    )
+    node_id = next(iter(g.packet_sinks))
+    pads = g.packet_sinks[node_id]
+    assert pads[0]["audio_codec"] == "copy"
+    assert pads[0]["audio_bsf"] == "aac_adtstoasc"
+
+    plan = partition(
+        g, external=external_ids(node_id), probes={"r": ladder_probe}
+    )
+    assert len(plan.ffmpeg) == 1
+    argv = plan_argv(
+        plan,
+        sidecar_argv=lambda process, reads: ["ffrwd-wasm", "-m", process.module, *reads],
+    )
+    feeder = argv[plan.ffmpeg[0].id]
+    index = feeder.index("-c:0")
+    assert feeder[index : index + 4] == ["-c:0", "copy", "-bsf:0", "aac_adtstoasc"]
