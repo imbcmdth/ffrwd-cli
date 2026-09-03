@@ -186,9 +186,9 @@ fn each_pad_keeps_its_own_stream() {
     assert_eq!(
         last.trailing,
         vec![
-            r#"{"pad":0,"row":0,"rendition":null,"codec":"h264","width":320,"height":240,"packets":1,"keyframes":1,"bytes":10}"#,
-            r#"{"pad":1,"row":0,"rendition":null,"codec":"h264","width":160,"height":120,"packets":1,"keyframes":1,"bytes":7}"#,
-            r#"{"pad":2,"row":0,"rendition":null,"codec":"h264","width":64,"height":48,"packets":2,"keyframes":1,"bytes":6}"#,
+            r#"{"pad":0,"row":0,"rendition":null,"codec":"h264","width":320,"height":240,"extradata":5,"packets":1,"keyframes":1,"bytes":10}"#,
+            r#"{"pad":1,"row":0,"rendition":null,"codec":"h264","width":160,"height":120,"extradata":5,"packets":1,"keyframes":1,"bytes":7}"#,
+            r#"{"pad":2,"row":0,"rendition":null,"codec":"h264","width":64,"height":48,"extradata":5,"packets":2,"keyframes":1,"bytes":6}"#,
         ]
     );
 }
@@ -220,8 +220,8 @@ fn a_pads_row_and_rendition_reach_the_module() {
     assert_eq!(
         last.trailing,
         vec![
-            r#"{"pad":0,"row":3,"rendition":"720p","codec":"h264","width":320,"height":240,"packets":1,"keyframes":1,"bytes":10}"#,
-            r#"{"pad":1,"row":0,"rendition":null,"codec":"h264","width":160,"height":120,"packets":1,"keyframes":1,"bytes":4}"#,
+            r#"{"pad":0,"row":3,"rendition":"720p","codec":"h264","width":320,"height":240,"extradata":5,"packets":1,"keyframes":1,"bytes":10}"#,
+            r#"{"pad":1,"row":0,"rendition":null,"codec":"h264","width":160,"height":120,"extradata":5,"packets":1,"keyframes":1,"bytes":4}"#,
         ]
     );
 }

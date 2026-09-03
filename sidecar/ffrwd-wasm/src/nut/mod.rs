@@ -44,6 +44,7 @@
 //! ffmpeg-facing edge stays the single-stream subset above, and a second
 //! stream arriving there is still refused by name.
 
+mod adts;
 mod bytes;
 mod demux;
 mod mux;
@@ -191,7 +192,10 @@ pub const CODED_VIDEO_FOURCCS: &[(&str, &[&[u8; 4]])] = &[
 /// The coded audio streams this wire carries, and the tags ffmpeg gives each
 /// in NUT. Its muxer writes `ff 00 00 00` for AAC, and puts the codec's
 /// AudioSpecificConfig in the stream header's extradata; `mp4a` is the tag
-/// the same codec takes in mp4, accepted here as an alias.
+/// the same codec takes in mp4, accepted here as an alias. An aac stream
+/// remuxed `-c copy` off ADTS (HLS, mpegts) carries no extradata at all - the
+/// demuxer derives it from the first packet's ADTS header instead, and
+/// strips that header from every packet; see [`adts`].
 pub const CODED_AUDIO_FOURCCS: &[(&str, &[&[u8; 4]])] =
     &[("aac", &[b"\xff\x00\x00\x00", b"mp4a", b"MP4A"])];
 

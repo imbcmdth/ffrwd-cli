@@ -1,13 +1,14 @@
 //! A packet sink reading SEVERAL encoded streams at once: one instance, one
 //! pad per stream, and a tally per pad.
 //!
-//! Each pad's coded stream is named at init - its codec, its frame size, and
-//! the relation row and rendition name `-pad` set on it - and every call
-//! adds that pad's packets to its own counts. The final call emits one row
-//! per pad: how many packets and bytes crossed, how many were keyframes,
-//! the geometry the pad opened with, and its row and rendition. Nothing
-//! pairs one pad's packet with another's, which is what a sink over a
-//! rendition ladder needs.
+//! Each pad's coded stream is named at init - its codec, its frame size (0
+//! for an audio pad), its extradata length, and the relation row and
+//! rendition name `-pad` set on it - and every call adds that pad's packets
+//! to its own counts. The final call emits one row per pad: how many packets
+//! and bytes crossed, how many were keyframes, the geometry and extradata
+//! length the pad opened with, and its row and rendition. Nothing pairs one
+//! pad's packet with another's, which is what a sink over a rendition ladder
+//! needs.
 
 wit_bindgen::generate!({
     path: "../../wit",
@@ -23,7 +24,7 @@ use exports::ffrwd::av::packet_sink::{
 use serde::Serialize;
 
 const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{},"additionalProperties":false}"#;
-const ROWS_SCHEMA: &str = r#"{"type":"object","properties":{"pad":{"type":"integer"},"row":{"type":"integer"},"rendition":{"type":"string"},"codec":{"type":"string"},"width":{"type":"integer"},"height":{"type":"integer"},"packets":{"type":"integer"},"keyframes":{"type":"integer"},"bytes":{"type":"integer"}},"additionalProperties":false}"#;
+const ROWS_SCHEMA: &str = r#"{"type":"object","properties":{"pad":{"type":"integer"},"row":{"type":"integer"},"rendition":{"type":"string"},"codec":{"type":"string"},"width":{"type":"integer"},"height":{"type":"integer"},"extradata":{"type":"integer"},"packets":{"type":"integer"},"keyframes":{"type":"integer"},"bytes":{"type":"integer"}},"additionalProperties":false}"#;
 
 /// One pad's tally, emitted once at the end.
 #[derive(Serialize)]
@@ -36,6 +37,9 @@ struct PadRow {
     codec: String,
     width: u32,
     height: u32,
+    /// Byte length of the codec's out-of-band header, e.g. h264's SPS/PPS or
+    /// aac's AudioSpecificConfig. 0 where the stream carries none.
+    extradata: u32,
     packets: u64,
     keyframes: u64,
     bytes: u64,
@@ -47,6 +51,7 @@ struct Pad {
     codec: String,
     width: u32,
     height: u32,
+    extradata: u32,
     packets: u64,
     keyframes: u64,
     bytes: u64,
@@ -84,8 +89,8 @@ impl Guest for PacketTally {
             // Counting needs no codec knowledge, so every codec is accepted.
             video_codecs: vec![],
             audio_codecs: vec![],
-            video: Arity::Many,
-            audio: Arity::Zero,
+            video: Arity::Any,
+            audio: Arity::Any,
         }
     }
 
@@ -98,7 +103,9 @@ impl Guest for PacketTally {
         for stream in &streams {
             let (width, height) = match &stream.coded.format {
                 CodedFormat::Video(video) => (video.width, video.height),
-                CodedFormat::Audio(_) => return Err("packet_tally reads video".into()),
+                // Audio carries no frame geometry; the row's width and
+                // height stay 0 rather than a video pad's borrowed value.
+                CodedFormat::Audio(_) => (0, 0),
             };
             pads.push(Pad {
                 row: stream.row,
@@ -106,6 +113,7 @@ impl Guest for PacketTally {
                 codec: stream.coded.codec.clone(),
                 width,
                 height,
+                extradata: stream.coded.extradata.len() as u32,
                 packets: 0,
                 keyframes: 0,
                 bytes: 0,
@@ -144,6 +152,7 @@ impl Guest for PacketTally {
                         codec: pad.codec.clone(),
                         width: pad.width,
                         height: pad.height,
+                        extradata: pad.extradata,
                         packets: pad.packets,
                         keyframes: pad.keyframes,
                         bytes: pad.bytes,

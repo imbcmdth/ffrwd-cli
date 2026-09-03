@@ -6,6 +6,7 @@ use std::io::Read;
 
 use anyhow::{anyhow, bail, Result};
 
+use super::adts;
 use super::bytes::{crc32, ByteReader};
 use super::{
     flags, Media, Packet, Stream, TimeBase, ANNOTATION_CLASS, ANNOTATION_FOURCC,
@@ -95,6 +96,15 @@ pub struct Demuxer<R> {
     unclaimed_rows: HashMap<i64, Vec<String>>,
     /// Rows the trailing record carried, which belong to no frame.
     trailing: Vec<String>,
+    /// The first packet, held while `detect_adts` decided whether this
+    /// stream needs ADTS stripped, and handed back by the next call to
+    /// `read_packet`.
+    first_packet: Option<(Packet, Vec<u8>)>,
+    /// Whether every packet (the buffered first one included) has its ADTS
+    /// header stripped before it reaches a caller. Set only for an aac
+    /// stream that opened with no extradata of its own, whose first packet
+    /// turned out to carry one.
+    strip_adts: bool,
 }
 
 impl<R: Read> Demuxer<R> {
@@ -177,7 +187,7 @@ impl<R: Read> Demuxer<R> {
         let main = main.expect("the loop runs until the main header is read");
         let stream = stream.expect("the loop runs until the stream header is read");
         let pts_buffer = vec![None; stream.decode_delay as usize + 1];
-        Ok(Demuxer {
+        let mut demuxer = Demuxer {
             reader,
             stream,
             annotations: annotation_stream,
@@ -188,7 +198,37 @@ impl<R: Read> Demuxer<R> {
             pts_buffer,
             unclaimed_rows: HashMap::new(),
             trailing: Vec::new(),
-        })
+            first_packet: None,
+            strip_adts: false,
+        };
+        demuxer.detect_adts()?;
+        Ok(demuxer)
+    }
+
+    /// Primes ADTS handling for a stream that opened with no extradata of
+    /// its own: reads the first packet, and - only when it starts with the
+    /// ADTS syncword - lifts an AudioSpecificConfig out of its header into
+    /// the stream's extradata before anything downstream sees it, and marks
+    /// every packet (this one included) to have its header stripped the way
+    /// `aac_adtstoasc` would. A stream that already carries extradata, or
+    /// whose first packet does not start with the syncword, is untouched.
+    fn detect_adts(&mut self) -> Result<()> {
+        if self.stream.codec_name() != Some("aac") || !self.stream.extradata.is_empty() {
+            return Ok(());
+        }
+        let mut buf = Vec::new();
+        let Some(packet) = self.read_packet(&mut buf)? else {
+            return Ok(());
+        };
+        if adts::Header::parse(&buf).is_none() {
+            self.first_packet = Some((packet, buf));
+            return Ok(());
+        }
+        let header = adts::strip(&mut buf)?;
+        self.stream.extradata = header.audio_specific_config().to_vec();
+        self.strip_adts = true;
+        self.first_packet = Some((packet, buf));
+        Ok(())
     }
 
     /// What the stream header said. An output header is built from this, so
@@ -226,7 +266,25 @@ impl<R: Read> Demuxer<R> {
     /// `read_frame`, keeping everything the frame's own header said: the PTS,
     /// the DTS the reorder buffer settles, and the keyframe flag. For an
     /// encoded stream this is the read that loses nothing.
+    ///
+    /// An aac stream `detect_adts` primed has its ADTS header stripped here,
+    /// the buffered first packet included, so a caller sees exactly what an
+    /// `aac_adtstoasc`'d wire would have carried.
     pub fn read_packet(&mut self, data: &mut Vec<u8>) -> Result<Option<Packet>> {
+        if let Some((packet, buffered)) = self.first_packet.take() {
+            *data = buffered;
+            return Ok(Some(packet));
+        }
+        let packet = self.read_packet_inner(data)?;
+        if packet.is_some() && self.strip_adts {
+            adts::strip(data)?;
+        }
+        Ok(packet)
+    }
+
+    /// The read `read_packet` wraps: past the headers, off the wire,
+    /// unaware of ADTS.
+    fn read_packet_inner(&mut self, data: &mut Vec<u8>) -> Result<Option<Packet>> {
         loop {
             let Some(first) = self.reader.read_u8_or_eof()? else {
                 return Ok(None);
@@ -863,5 +921,116 @@ mod tests {
         assert_eq!(demuxer.stream().pix_fmt(), Some("yuv420p"));
         assert_eq!(demuxer.stream().video_geometry(), Some((4, 4)));
         assert_eq!(demuxer.stream().time_base, TimeBase { num: 1, den: 30 });
+    }
+
+    /// An aac stream header with `extradata`, the shape ffmpeg's NUT muxer
+    /// writes off a plain `-c copy`: empty when the source was ADTS, filled
+    /// when it was already mp4 or another container with a real esds.
+    fn a_coded_aac_stream(extradata: Vec<u8>) -> Stream {
+        Stream {
+            fourcc: b"\xff\x00\x00\x00".to_vec(),
+            time_base: TimeBase { num: 1, den: 48000 },
+            msb_pts_shift: 14,
+            max_pts_distance: 48000,
+            decode_delay: 0,
+            extradata,
+            media: Media::Audio {
+                sample_rate: 48000,
+                channels: 2,
+            },
+        }
+    }
+
+    /// Writes `packets` as coded aac frames onto `stream` and reads them back.
+    fn round_trip_coded(stream: &Stream, packets: &[Vec<u8>]) -> Result<(Stream, Vec<Vec<u8>>)> {
+        let mut wire = Vec::new();
+        {
+            let mut muxer = Muxer::new(&mut wire, stream).expect("write headers");
+            for (index, data) in packets.iter().enumerate() {
+                let packet = Packet {
+                    pts: index as i64 * 1024,
+                    dts: None,
+                    keyframe: true,
+                };
+                muxer
+                    .write_coded(&packet, data)
+                    .expect("write coded packet");
+            }
+            muxer.finish().expect("finish");
+        }
+        let mut demuxer = Demuxer::open(&wire[..])?;
+        let opened_stream = demuxer.stream().clone();
+        let mut buf = Vec::new();
+        let mut out = Vec::new();
+        while demuxer.read_packet(&mut buf)?.is_some() {
+            out.push(buf.clone());
+        }
+        Ok((opened_stream, out))
+    }
+
+    #[test]
+    fn adts_derives_extradata_and_is_stripped_from_every_packet() {
+        let stream = a_coded_aac_stream(Vec::new());
+        // LC 48000 stereo, the `11 90` case: two packets, so the fix is
+        // proven on the buffered first packet and on one read normally.
+        let packets = vec![
+            adts::test_packet(1, 3, 2, false, 4),
+            adts::test_packet(1, 3, 2, false, 6),
+        ];
+
+        let (opened, got) = round_trip_coded(&stream, &packets).expect("adts primes cleanly");
+        assert_eq!(
+            opened.extradata,
+            vec![0x11, 0x90],
+            "the AudioSpecificConfig this ADTS header codes"
+        );
+        assert_eq!(
+            got,
+            vec![vec![0xEE; 4], vec![0xEE; 6]],
+            "the ADTS header is gone, the payload is not"
+        );
+        for (index, data) in got.iter().enumerate() {
+            assert!(
+                !(data.first() == Some(&0xFF) && data.get(1).is_some_and(|b| b & 0xF0 == 0xF0)),
+                "packet {index} still starts with the ADTS syncword"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stream_that_already_has_extradata_is_left_alone_even_over_adts_bytes() {
+        let stream = a_coded_aac_stream(vec![0x11, 0x88, 0x56, 0xe5, 0x00]);
+        let packet = adts::test_packet(1, 3, 2, false, 4);
+
+        let (opened, got) = round_trip_coded(&stream, std::slice::from_ref(&packet))
+            .expect("a stream with extradata already opens");
+        assert_eq!(opened.extradata, stream.extradata, "not overwritten");
+        assert_eq!(got, vec![packet], "the packet is handed through untouched");
+    }
+
+    #[test]
+    fn packets_that_do_not_start_with_the_syncword_are_untouched() {
+        let stream = a_coded_aac_stream(Vec::new());
+        let packet = vec![0x21, 0x00, 0x10, 0x04];
+
+        let (opened, got) = round_trip_coded(&stream, std::slice::from_ref(&packet))
+            .expect("a non-ADTS first packet is not an error");
+        assert!(opened.extradata.is_empty(), "nothing to derive it from");
+        assert_eq!(got, vec![packet]);
+    }
+
+    #[test]
+    fn a_packet_carrying_two_adts_frames_is_refused_not_split() {
+        let stream = a_coded_aac_stream(Vec::new());
+        let mut two_frames = adts::test_packet(1, 3, 2, false, 4);
+        two_frames.extend(adts::test_packet(1, 3, 2, false, 4));
+        let packets = vec![adts::test_packet(1, 3, 2, false, 4), two_frames];
+
+        let err = round_trip_coded(&stream, &packets)
+            .expect_err("a packet with two ADTS frames must be refused");
+        assert!(
+            err.to_string().contains("more than one ADTS frame"),
+            "{err}"
+        );
     }
 }

@@ -56,6 +56,14 @@ fn sidecar_root() -> PathBuf {
         .to_path_buf()
 }
 
+/// The repo root, the parent of `sidecar/` - where `cli/`'s fixtures live.
+fn repo_root() -> PathBuf {
+    sidecar_root()
+        .parent()
+        .expect("sidecar/ has a parent directory")
+        .to_path_buf()
+}
+
 fn fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/h264.nut")
 }
@@ -76,6 +84,8 @@ fn module_path(name: &str) -> PathBuf {
                 "wasm32-wasip2",
                 "-p",
                 "packet-stats",
+                "-p",
+                "packet-tally",
                 "-p",
                 "invert",
             ])
@@ -518,4 +528,118 @@ fn describe_reports_the_packet_sink() {
     // No frame interface: none of the windowed fields appear.
     assert!(description.get("window").is_none());
     assert_eq!(description["reads_rows"], serde_json::Value::Null);
+}
+
+#[test]
+fn an_hls_aac_stream_gets_its_asc_derived_and_its_adts_stripped() {
+    // The field case this test proves against real ffmpeg output rather than
+    // synthetic bytes: an HLS ladder's AAC, `-c copy`'d into NUT the way the
+    // compiler does. mpegts carries AAC as ADTS, so the copied stream has no
+    // extradata and every packet still wears its own ADTS header - the
+    // Demuxer must derive the AudioSpecificConfig from that header and strip
+    // it, or a downstream module never sees a usable stream.
+    if !ffmpeg_on_path() {
+        announce_skip("real ffmpeg cannot remux the HLS ladder to NUT");
+        return;
+    }
+
+    let ladder = repo_root().join("cli/tests/fixtures/ladder/master.m3u8");
+    let generated = std::env::temp_dir().join(format!(
+        "ffrwd_wasm_hls_aac_adts_{}.nut",
+        std::process::id()
+    ));
+    let output = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            ladder.to_str().expect("ladder fixture path is UTF-8"),
+            "-map",
+            "0:a:0",
+            "-c",
+            "copy",
+            "-f",
+            "nut",
+            generated.to_str().expect("generated path is UTF-8"),
+        ])
+        .output()
+        .expect("spawn ffmpeg to remux the ladder's audio");
+    assert!(
+        output.status.success(),
+        "ffmpeg exited with {:?}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The Demuxer sees exactly what a packet sink's reader thread would: no
+    // extradata, and packets starting with the ADTS syncword, before either
+    // fix runs.
+    let generated_bytes = std::fs::read(&generated).expect("read the generated NUT");
+    std::fs::remove_file(&generated).ok();
+    let mut demuxer = Demuxer::open(&generated_bytes[..]).expect("read the generated NUT headers");
+    assert_eq!(demuxer.stream().codec_name(), Some("aac"));
+    // ffprobe: this rendition's audio is LC 44100 mono - the `12 08` case.
+    assert_eq!(
+        demuxer.stream().extradata,
+        vec![0x12, 0x08],
+        "the AudioSpecificConfig derived from the first packet's ADTS header"
+    );
+    let mut buf = Vec::new();
+    let mut packets = 0;
+    while demuxer
+        .read_packet(&mut buf)
+        .expect("read a packet")
+        .is_some()
+    {
+        packets += 1;
+        assert!(
+            !(buf.first() == Some(&0xFF) && buf.get(1).is_some_and(|b| b & 0xF0 == 0xF0)),
+            "packet {packets} still starts with the ADTS syncword"
+        );
+    }
+    assert!(
+        packets > 0,
+        "the ladder's audio has packets to prove this on"
+    );
+
+    // The same fix, end to end through the runtime and into a module: the
+    // stream it opened packet_tally with, and the row it reported.
+    let module = module_path("packet_tally");
+    let run = run_ffrwd_wasm(
+        &[
+            "-f",
+            "nut",
+            "-i",
+            "-",
+            "-m",
+            module.to_str().expect("module path is UTF-8"),
+            "-f",
+            "ndjson",
+            "-",
+        ],
+        &generated_bytes,
+    );
+    assert!(
+        run.output.status.success(),
+        "packet_tally exited with {:?}\nstderr:\n{}",
+        run.output.status.code(),
+        run.stderr
+    );
+    let rows: Vec<serde_json::Value> = run
+        .stdout
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("packet_tally emits one JSON row"))
+        .collect();
+    assert_eq!(rows.len(), 1, "one pad, one trailing row");
+    assert_eq!(rows[0]["codec"], "aac");
+    assert_eq!(
+        rows[0]["extradata"], 2,
+        "the module saw the derived 2-byte AudioSpecificConfig"
+    );
+    assert_eq!(
+        rows[0]["packets"].as_u64().expect("a packet count"),
+        packets
+    );
 }
