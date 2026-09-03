@@ -7108,6 +7108,62 @@ def test_array_agg_of_a_rendition_audio_column_gathers_every_row() -> None:
     ]
 
 
+# -- array_agg(<expression over r.video[1] / r.audio[1]>): the same
+#    per-surviving-row broadcast a track row's array_agg(volume(a, 0.5))
+#    already gets (cookbook 115), reached by having the subscript read as
+#    the array `array_agg(r.video[1])` above already gets, rather than
+#    picking one rendition out of it. --------------------------------------
+
+
+def test_array_agg_of_a_call_over_a_rendition_column_broadcasts_per_row() -> None:
+    """``WHERE r.height >= 720`` narrows the 3-rung ladder to the two muxed
+    rungs, same as `test_array_agg_of_a_rendition_column_gathers_the_surviving_
+    rows`; wrapping each row's ``video[1]`` in ``scale(...)`` now lowers to
+    ONE scale node per surviving row, in row order, instead of a single node
+    over one picked rendition."""
+    g = _lower(
+        "COPY (SELECT array_agg(scale(r.video[1], 320, -2)) "
+        "FROM input('ladder.m3u8') r WHERE r.height >= 720) TO 'all-rungs.mkv'",
+        _rendition_probes(),
+    )
+    scales = [node for node in g.nodes.values() if node.filter == "scale"]
+    assert len(scales) == 2
+    assert [node.inputs for node in scales] == [["src:r:v:0"], ["src:r:v:1"]]
+    assert all(node.args == {"width": 320, "height": -2} for node in scales)
+    assert [o.ref for o in g.outputs] == [node.id for node in scales]
+
+
+def test_a_where_narrows_the_broadcast_to_one_row() -> None:
+    """``WHERE r.height = 720`` narrows the ladder to one row before the
+    aggregate runs, so ``array_agg(scale(r.video[1], 320, -2))`` lowers to
+    exactly one `scale` node -- the row model's own narrow-then-aggregate
+    order, unchanged by wrapping the subscript in a call."""
+    g = _lower(
+        "COPY (SELECT array_agg(scale(r.video[1], 320, -2)) "
+        "FROM input('ladder.m3u8') r WHERE r.height = 720) TO 'one.mkv'",
+        _rendition_probes(),
+    )
+    (node,) = g.nodes.values()
+    assert node.filter == "scale"
+    assert node.inputs == ["src:r:v:0"]
+
+
+def test_a_bare_subscript_under_variadic_still_gathers_the_array() -> None:
+    """cookbook 114's shape (``concat(VARIADIC array_agg(s.video[1]))``) is
+    reached here through `amix`, since only a live ffmpeg reports `concat`'s
+    own options (see `test_the_motion_thumbnail_gather_matches_its_hand_
+    written_form`): a bare ``r.audio[1]`` spread with `VARIADIC` still names
+    every surviving row's own stream, all 3 rows here, unaffected by the new
+    broadcast a call around the subscript now gets."""
+    g = _lower(
+        "SELECT amix(VARIADIC array_agg(r.audio[1])) FROM input('ladder.m3u8') r",
+        _rendition_probes(),
+    )
+    (node,) = g.nodes.values()
+    assert node.filter == "amix"
+    assert node.inputs == ["src:r:a:0", "src:r:a:1", "src:r:a:2"]
+
+
 def test_array_agg_of_a_rendition_column_reaches_a_two_track_destination() -> None:
     """The emitted command for the maintainer's use case: an HLS ladder
     written as one file holding every surviving rung as its own video

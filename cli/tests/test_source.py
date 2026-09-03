@@ -317,6 +317,30 @@ def test_an_aggregate_over_a_url_sources_rows_gathers_in_row_order() -> None:
     ]
 
 
+def test_a_call_over_a_url_sources_rendition_column_broadcasts_per_row() -> None:
+    """cookbook 115's ``scale(s.video[1], 320, -2)`` wrapped in `array_agg`
+    lowers to one `scale` node PER ROW, each reading its own row's own
+    minted input, not one node reading a single picked rendition -- the
+    same per-row broadcast `test_an_aggregate_over_a_url_sources_rows_
+    gathers_in_row_order` proves for the bare column."""
+    g = _url_lowered(
+        "COPY (SELECT array_agg(scale(s.video[1], 320, -2)) "
+        "FROM files('a.mp4,b.mp4') s) TO 'o.mkv'"
+    )
+    scales = [node for node in g.nodes.values() if node.filter == "scale"]
+    assert len(scales) == 2
+    assert [node.inputs for node in scales] == [
+        ["src:ffrwd.s#1:v:0"],
+        ["src:ffrwd.s#2:v:0"],
+    ]
+    assert build_ffmpeg_args(emit(insert_splits(g))) == [
+        "ffmpeg", "-i", "a.mp4", "-i", "b.mp4",
+        "-filter_complex",
+        "[0:v:0]scale=width=320:height=-2[out0];[1:v:0]scale=width=320:height=-2[out1]",
+        "-map", "[out0]", "-map", "[out1]", "o.mkv",
+    ]
+
+
 def test_the_graph_records_the_url_source_and_it_survives_a_round_trip() -> None:
     """`Graph.url_sources` is the record of what the module answered: the
     folded params, the document it wrote beside its rows, and one row per url

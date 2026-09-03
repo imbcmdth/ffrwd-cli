@@ -2968,6 +2968,12 @@ class _Env:
     # own `-ss`/`-to`, and every stream column of the alias reads one stream
     # per row.
     row_inputs: dict[str, list[str]] = field(default_factory=dict)
+    # The rendition row alias `array_agg(<expression over its [1] columns>)`
+    # is currently lowering, if any (:meth:`_lower_rendition_agg_expr`). While
+    # set, that alias's `.video[1]` / `.audio[1]` reads the array every
+    # surviving row contributes instead of picking one row out of it -- the
+    # same reading a bare `array_agg(r.video[1])` already gets.
+    rendition_agg: str | None = None
 
 
 # ExpandCtx
@@ -8885,7 +8891,9 @@ class _Lowerer:
         rendition never carries more than one stream of a kind, so ``[1]``
         is the only index that can ever name one -- :meth:`_rendition_array_agg`
         reads it straight off `kinds`, the way :meth:`_row_value` reads an
-        unnest row's own stream.
+        unnest row's own stream. A ``[1]`` buried inside a larger expression
+        (``scale(r.video[1], 320, -2)``) gets the same reading one layer
+        down, in :meth:`_lower_rendition_agg_expr`.
         """
         inner = node.this
         if not isinstance(inner, exp.Expr):
@@ -8907,7 +8915,44 @@ class _Lowerer:
         rendition = self._rendition_array_agg(inner, env, select)
         if rendition is not None:
             return rendition
-        return self._lower_expr(inner, env, select)
+        return self._lower_rendition_agg_expr(inner, env, select)
+
+    def _lower_rendition_agg_expr(
+        self, inner: exp.Expr, env: _Env, select: exp.Select
+    ) -> _Value:
+        """``array_agg(<expression over r.video[1] / r.audio[1]>)``: the
+        expression evaluated once per surviving row, the same broadcast a
+        track row's bare ``array_agg(volume(a, 0.5))`` already gets.
+
+        Outside an aggregate, ``r.video[1]`` picks ONE rendition out of the
+        surviving set (:meth:`_rendition_kind_value`) -- the right reading
+        for a bare column. Under `array_agg`, the sole rendition row alias in
+        scope (if there is exactly one) is marked in `env` for the length of
+        this lowering, so that reading flips to the array `array_agg(r.video[1])`
+        already gets: every surviving row's own stream, in row order. From
+        there the ordinary broadcast machinery (:meth:`_expand_call`) is what
+        turns ``scale(r.video[1], 320, -2)`` into one `scale` node per
+        element, exactly as it already does for any other array argument --
+        no new mechanism, just the same subscript reading a bare
+        ``array_agg(r.video[1])`` uses.
+
+        More than one rendition row alias in scope is ambiguous (which one is
+        `array_agg` naming?), so it is left alone -- the expression lowers
+        exactly as it would outside the aggregate.
+        """
+        aliases = [
+            alias
+            for alias, binding in env.bindings.items()
+            if isinstance(binding, _RowBinding) and binding.column == RENDITION_COLUMN
+        ]
+        if len(aliases) != 1:
+            return self._lower_expr(inner, env, select)
+        previous = env.rendition_agg
+        env.rendition_agg = aliases[0]
+        try:
+            return self._lower_expr(inner, env, select)
+        finally:
+            env.rendition_agg = previous
 
     def _rendition_array_agg(
         self, inner: exp.Expr, env: _Env, select: exp.Select
@@ -9478,9 +9523,13 @@ class _Lowerer:
             if binding.column == RENDITION_COLUMN and name in _ARRAY_COLUMNS:
                 # A rendition row's own track-kind columns: one stream per
                 # SURVIVING row that carries the kind, not one per row -- see
-                # `_rendition_kind_value`.
+                # `_rendition_kind_value`. Under `array_agg` over this same
+                # alias (`env.rendition_agg`), a `[1]` subscript reads that
+                # same array instead of picking one row out of it -- see
+                # `_lower_rendition_agg_expr`.
+                agg_index = None if index == 1 and env.rendition_agg == alias else index
                 return binding.source, self._rendition_kind_value(
-                    binding, name, index, anchor, select
+                    binding, name, agg_index, anchor, select
                 )
             # Under the INPUT alias, not the row one: a row table has no window
             # of its own, and every rule about the streams (`-i`, `-ss`, the
