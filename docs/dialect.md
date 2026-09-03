@@ -31,6 +31,8 @@ function := CREATE FUNCTION name(param type [DEFAULT literal], ...) RETURNS rtyp
             RETURNS wrtype AS 'module', 'export' LANGUAGE wasm
           | CREATE FUNCTION name(param vtype, ...) RETURNS vtype
             AS 'module', 'export' LANGUAGE wasm
+          | CREATE FUNCTION name(rows annotation) RETURNS annotation
+            AS 'module', 'export' LANGUAGE wasm
 rtype   := text | number | boolean | <kind>_stream | chapter | cue
          | attachment | any of those with [] | TABLE(col type, ...)
 wstype  := video_stream | audio_stream | either of those with []
@@ -104,7 +106,24 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   the module's own function declares, and RETURNS against what that
   function returns. It runs once per call, at compile time - like
   ffprobe, not like a filter. Recipe
-  [89](examples.md#89-compute-a-tag-with-a-wasm-module).
+  [89](examples.md#89-compute-a-tag-with-a-wasm-module). Over a row
+  column it runs once per row, memoized on its arguments - the same
+  per-row footing the built-in text and number functions have
+  ([recipe 112](examples.md#112-a-function-over-a-caption-files-cues)).
+- A **rows `LANGUAGE wasm` function** (one annotation parameter,
+  `RETURNS` an annotation) reads rows and writes rows with no stream
+  at all. Its argument is the annotation column a run-time module
+  produced - `fauxlate(captions(f.video[1]).cues)` - and its result
+  is a row column of the declared type, standing wherever the
+  producer's did: projected, it is a subtitle track; at a `.ndjson`
+  destination it is the rows. It runs in the producer's own sidecar
+  process, fed by the rows as they are written; the declared
+  parameter is checked against what the module reads and the return
+  against what it writes, and the producer's record has to be the one
+  the function reads. Rows that exist before the run - a file's cues -
+  are not its business: rewrite those one row at a time with the value
+  form. Recipe
+  [113](examples.md#113-translate-captions-as-they-are-produced).
 - **`cue[]`** is shorthand for the cue record's own shape,
   `STRUCT(text text, start_t number, end_t number)[]`, wherever an
   annotation column is declared - a `RETURNS STRUCT`'s second field, or
@@ -885,6 +904,9 @@ value := literal | NULL | row-column | input-scalar
        | CASE WHEN pred THEN value [ELSE value] END
        | COALESCE(value, ...)      -- first argument a value, never a stream;
                                    -- arguments agree on one type
+       | function(value, ...)      -- upper, lower, length, round, replace,
+                                   -- substring, or a value wasm function;
+                                   -- over a row column, once per row
 
        | :'var' | :"var" | :var    -- CLI -v substitution, psql's forms
        | :var[k] | :'var'[k]        -- one element of a comma-split -v list
@@ -1144,8 +1166,12 @@ Every one of these is a typed rejection, never a silent reinterpretation:
   `FROM` unless it returns source, a `RETURNS source` call anywhere
   but `FROM` or one handed a stream; a `RETURNS sink` call anywhere
   but the `TO` position, a non-sink function written there, `WITH`
-  options or a star SELECT list on a sink destination; and a module
-  path in a package's lib file that leaves the package directory.
+  options or a star SELECT list on a sink destination; a rows function
+  with more than one parameter, a value parameter, or a `DEFAULT`, one
+  over a module that reads no rows, one handed a stream or a
+  compile-time row array, or a stream function handed rows; and a
+  module path in a package's lib file that leaves the package
+  directory.
 - **Annotations**: a `RETURNS STRUCT` that is not one stream field
   followed by one annotation array; an annotation field typed anything
   but `text`, `number` or `boolean`; a record the producing module's
