@@ -247,6 +247,7 @@ __all__ = [
     "RawSourceOption",
     "RawTrackRows",
     "RawValuesTable",
+    "RawWasmSource",
     "Resolved",
     "column_label",
     "copy_destinations",
@@ -816,6 +817,29 @@ def is_value_expr(node: exp.Expr | None) -> bool:
         # column, never an array literal, so the two never collide.
         return isinstance(node.this, exp.Array)
     return isinstance(node, exp.Case | exp.DPipe | exp.Cast | _ARITHMETIC)
+
+
+def _is_wasm_source_argument(node: exp.Expr | None) -> bool:
+    """True for a shape a ``RETURNS source`` wasm function's argument list may take.
+
+    A source reads no streams -- it MINTS the rows a query reads, so nothing
+    in its own argument list can be one: a literal, a substituted variable
+    (a literal once set, ``NULL`` stamped with the name while unset), or a
+    ``COALESCE`` of those, and nothing else. Unlike :func:`is_value_expr`'s
+    ``COALESCE`` (a join-gap fill, where only the first argument has to be a
+    value), every branch here has to be, since there is no stream column for
+    a later branch to fall back on.
+    """
+    node = _unwrap_paren(node) if isinstance(node, exp.Expr) else node
+    if isinstance(node, exp.Null | exp.Literal):
+        return True
+    if isinstance(node, exp.Coalesce):
+        branches = [node.this, *node.expressions]
+        return all(
+            isinstance(branch, exp.Expr) and _is_wasm_source_argument(branch)
+            for branch in branches
+        )
+    return False
 
 
 def record_cast_type(node: exp.Expr | None) -> str | None:
@@ -1761,6 +1785,24 @@ class RawSource:
 
 
 @dataclass(frozen=True)
+class RawWasmSource:
+    """``FROM <name>(<values>) alias`` where ``<name>`` is a ``RETURNS source``
+    wasm function, bare or adopted from a package.
+
+    Disjoint from ``sources``/``input_paths`` (no ffmpeg ``-i``) and from
+    ``source_filters`` (not an ffmpeg filter): its rows come from the
+    module's own catalog, which lower asks the sidecar for, not ffprobe.
+    `name` is the declared function's name -- the key into ``Resolved.wasm``
+    -- and `call_node` is the ``exp.Anonymous`` call, the anchor for anything
+    lower rejects about the source rather than about one of its arguments.
+    """
+
+    alias: str
+    name: str
+    call_node: exp.Expr
+
+
+@dataclass(frozen=True)
 class RawRowJoin:
     """How one FROM item attaches to the ones before it.
 
@@ -1888,6 +1930,13 @@ class Resolved:
     """``FROM ffmpeg.<source>(...) alias`` records, keyed by alias, in FROM
     order across the whole query. Disjoint from ``sources``: a
     generated source has no ``-i`` and therefore no input index."""
+
+    wasm_sources: dict[str, RawWasmSource] = field(default_factory=dict)
+    """``FROM <wasm source>(...) alias`` records, keyed by alias, in FROM
+    order across the whole script. Bound as an INPUT-kind alias in the
+    resolve scope, so the rendition-column admissions apply to it exactly as
+    they do to ``input(...)``; its rows are the module's own catalog
+    (``Resolved.wasm[name]``), not a probe."""
 
     track_rows: dict[str, RawTrackRows] = field(default_factory=dict)
     """``unnest(<input>.<type>) alias`` records, keyed by ROW alias, in FROM
@@ -2533,20 +2582,24 @@ def _has_row_source(select: exp.Select, visible: set[str]) -> bool:
     return False
 
 
-def _has_input_alias(select: exp.Select) -> bool:
-    """True if this branch's FROM clause holds a plain ``input(...)`` alias.
+def _has_input_alias(select: exp.Select, wasm: Mapping[str, WasmFunction]) -> bool:
+    """True if this branch's FROM clause holds a plain ``input(...)`` alias,
+    or a ``RETURNS source`` wasm function's -- bare or adopted from a package.
 
-    A probe run after resolve may turn such an alias into a rendition row
-    table (one row per ABR ladder entry); resolve cannot ask ffprobe, so it
-    admits the ORDER BY/LIMIT/OFFSET carve-out here too, syntactically, and
-    lower refuses them at bind time when the probe finds no renditions.
+    A probe run after resolve may turn a plain input into a rendition row
+    table (one row per ABR ladder entry), and a wasm source's rows are never
+    probed at all; resolve cannot ask either, so it admits the ORDER
+    BY/LIMIT/OFFSET carve-out here too, syntactically, and lower refuses them
+    at bind time when there turn out to be no rows.
     """
     for item in from_items(select):
-        if (
-            isinstance(item, exp.Table)
-            and isinstance(item.this, exp.Anonymous)
-            and str(item.this.this).lower() == "input"
-        ):
+        if not isinstance(item, exp.Table) or not isinstance(item.this, exp.Anonymous):
+            continue
+        name = str(item.this.this).lower()
+        if name == "input":
+            return True
+        declared = wasm.get(name)
+        if declared is not None and declared.is_source:
             return True
     return False
 
@@ -3075,6 +3128,7 @@ class _Resolver:
         self.input_options: dict[str, tuple[RawInputOption, ...]] = {}
         self.input_anchors: dict[str, tuple[int, int]] = {}
         self.source_filters: dict[str, RawSource] = {}
+        self.wasm_sources: dict[str, RawWasmSource] = {}
         self.track_rows: dict[str, RawTrackRows] = {}
         self.struct_rows: dict[str, RawValuesTable] = {}
         # The struct row tables THIS branch's FROM clause binds, by the local
@@ -3195,6 +3249,7 @@ class _Resolver:
             input_options=self.input_options,
             input_anchors=self.input_anchors,
             source_filters=self.source_filters,
+            wasm_sources=self.wasm_sources,
             track_rows=self.track_rows,
             struct_rows=self.struct_rows,
             series=self.series,
@@ -3552,6 +3607,7 @@ class _Resolver:
             name in self.ctes
             or name in self.sources
             or name in self.source_filters
+            or name in self.wasm_sources
             or name in self.track_rows
             or name in self.struct_rows
             or name in self.series
@@ -3592,13 +3648,13 @@ class _Resolver:
         _normalize_map_paths(select, path_expr)
         _normalize_row_aliases(select, path_expr)
         rows = _has_row_source(select, visible)
-        may_aggregate = rows or _has_input_alias(select)
+        may_aggregate = rows or _has_input_alias(select, self.wasm)
         if rows:
             self._check_aggregate_context(select, no_aggregate)
         allowed = _SELECT_ALLOWED
         if rows:
             allowed = allowed | {"order", "group", "limit", "offset"}
-        elif _has_input_alias(select):
+        elif _has_input_alias(select, self.wasm):
             allowed = allowed | {"order", "limit", "offset"}
         _check_query_args(select, allowed, "SELECT")
 
@@ -5006,6 +5062,10 @@ class _Resolver:
             self._add_series(table, inner, alias_node, scope)
             return
         if isinstance(inner, exp.Anonymous):
+            declared = self.wasm.get(str(inner.this).lower())
+            if declared is not None and declared.is_source:
+                self._add_wasm_source(table, inner, declared, alias_node, scope)
+                return
             self._add_input(table, inner, alias_node, scope)
             return
         if isinstance(inner, exp.Identifier):
@@ -5433,6 +5493,64 @@ class _Resolver:
         self.input_anchors[alias] = _pos(path_node, table)
         if options:
             self.input_options[alias] = options
+        scope[alias] = "input"
+
+    def _add_wasm_source(
+        self,
+        table: exp.Table,
+        call: exp.Anonymous,
+        declared: WasmFunction,
+        alias_node: exp.Expr | None,
+        scope: dict[str, str],
+    ) -> None:
+        """``FROM <name>(<values>) alias`` where ``<name>`` is a ``RETURNS
+        source`` wasm function -- bare, or adopted from a package under its
+        qualified call path (:func:`ffrwd.functions.expanded` already
+        rewrote ``ns.pkg.fn(...)`` to a bare call by the time resolve runs).
+
+        A source is exactly a row table, the same shape ``input(...)`` is, so
+        its alias is bound the same INPUT kind: the rendition-column
+        admissions (``s.height``, ``ORDER BY``/``LIMIT``, ``array_agg``) hold
+        of it exactly as they do of a plain input, and lower confirms what
+        the module's catalog actually has, once it can ask.
+
+        A source reads no streams, so every argument has to be a value --
+        literal, substituted variable, or a ``COALESCE`` of those -- never a
+        column read off another FROM item.
+        """
+        for argument in call.expressions:
+            if not isinstance(argument, exp.Expr):
+                continue
+            if isinstance(argument, exp.Kwarg):
+                value = argument.args.get("expression")
+                anchor = value if isinstance(value, exp.Expr) else argument
+            else:
+                value = argument
+                anchor = argument
+            if not isinstance(value, exp.Expr) or not _is_wasm_source_argument(value):
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    "a source reads no streams; its arguments are values",
+                    anchor,
+                    fallback=table,
+                    hint=f"{declared.name}(...) takes literals and substituted "
+                    "variables, not a stream read off a FROM item",
+                )
+        if not isinstance(alias_node, exp.TableAlias) or alias_node.this is None:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"{declared.name}() requires an alias",
+                call,
+                fallback=table,
+                hint=f"add an alias, e.g. FROM {declared.name}(...) s",
+            )
+        alias = _ident_name(alias_node.this)
+        self._reserve(alias, alias_node.this)
+        if alias in scope:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL, f"duplicate name '{alias}'", alias_node.this
+            )
+        self.wasm_sources[alias] = RawWasmSource(alias=alias, name=declared.name, call_node=call)
         scope[alias] = "input"
 
     def _add_source(

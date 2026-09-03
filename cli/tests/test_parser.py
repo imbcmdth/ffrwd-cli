@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
 from sqlglot import exp
 
@@ -16,6 +19,7 @@ from ffrwd.parser import (
     subscript_index,
     union_branches,
 )
+from ffrwd.project import discover
 from ffrwd.types import DISPOSITION_KEYS
 from ffrwd.vars import substitute
 
@@ -1093,6 +1097,88 @@ def test_a_source_column_is_not_whitelisted_by_the_parser() -> None:
 def test_a_source_rejection_is_line_anchored() -> None:
     err = _reject("SELECT t.video[1]\nFROM ffmpeg.testsrc(2) t")
     assert err.line == 2
+
+
+# -- FROM <name>(...) alias, where <name> is a RETURNS source wasm function -
+
+
+SOURCE_DECLARE = (
+    "CREATE FUNCTION subscribe(relay text, broadcast text) RETURNS source\n"
+    "  AS 'moq.wasm', 'subscribe' LANGUAGE wasm;\n"
+)
+
+
+def test_a_declared_source_resolves_in_from() -> None:
+    res = _resolve(SOURCE_DECLARE + "SELECT s.height FROM subscribe('r', 'b') s")
+    assert list(res.wasm_sources) == ["s"]
+    assert res.wasm_sources["s"].name == "subscribe"
+
+
+def test_a_qualified_source_resolves_in_from(tmp_path: Path) -> None:
+    """A package's own source is called the same way its own filters are."""
+    (tmp_path / "src").mkdir(parents=True)
+    (tmp_path / "src" / "moq.sql").write_text(
+        "CREATE FUNCTION subscribe(relay text, broadcast text) RETURNS source\n"
+        "  AS 'moq.wasm', 'subscribe' LANGUAGE wasm;\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "ffrwd.json").write_text(
+        json.dumps(
+            {"name": "ffrwd/moq", "version": "1.0.0", "lib": {"subscribe": "src/moq.sql"}}
+        ),
+        encoding="utf-8",
+    )
+    packages = discover(tmp_path)
+    assert packages is not None
+    res = resolve(
+        parse("SELECT s.height FROM ffrwd.moq.subscribe('r', 'b') s"), packages=packages
+    )
+    assert list(res.wasm_sources) == ["s"]
+
+
+def test_a_sources_rendition_columns_resolve_in_where_order_by_and_limit() -> None:
+    res = _resolve(
+        SOURCE_DECLARE + "SELECT s.height FROM subscribe('r', 'b') s "
+        "WHERE s.height > 100 ORDER BY s.bandwidth DESC LIMIT 1"
+    )
+    assert list(res.wasm_sources) == ["s"]
+
+
+def test_array_agg_over_a_source_alias_is_admitted() -> None:
+    res = _resolve(SOURCE_DECLARE + "SELECT array_agg(s.video[1]) FROM subscribe('r', 'b') s")
+    assert list(res.wasm_sources) == ["s"]
+
+
+def test_a_coalesced_literal_argument_to_a_source_is_admitted() -> None:
+    res = _resolve(
+        SOURCE_DECLARE + "SELECT s.height FROM subscribe(COALESCE('r', 'x'), 'b') s"
+    )
+    assert list(res.wasm_sources) == ["s"]
+
+
+def test_a_stream_argument_to_a_source_is_refused() -> None:
+    err = _reject(
+        "CREATE FUNCTION subscribe(relay text) RETURNS source AS 'm.wasm', 'x' LANGUAGE wasm;\n"
+        "SELECT s.height FROM input('a.mp4') f, subscribe(f.tags.title) s"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "a source reads no streams; its arguments are values" in err.message
+
+
+def test_a_non_source_wasm_function_in_from_still_refuses() -> None:
+    err = _reject(
+        "CREATE FUNCTION invert(v video_stream) RETURNS video_stream AS 'm.wasm', 'x' "
+        "LANGUAGE wasm;\n"
+        "SELECT t.x FROM invert('a') t"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "wasm function 'invert' returns a stream, not a table" in err.message
+
+
+def test_an_unknown_table_function_in_from_still_refuses() -> None:
+    err = _reject("SELECT t.x FROM nope('a') t")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "unsupported table function nope()" in err.message
 
 
 def test_unsupported_where_forms() -> None:
