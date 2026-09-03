@@ -182,7 +182,10 @@ mod tests {
             assert_eq!(bytes.len(), PACKET_LENS[index]);
             let starts_with_code = bytes.starts_with(&[0x00, 0x00, 0x01])
                 || bytes.starts_with(&[0x00, 0x00, 0x00, 0x01]);
-            assert!(starts_with_code, "packet {index} does not start with a start code");
+            assert!(
+                starts_with_code,
+                "packet {index} does not start with a start code"
+            );
         }
     }
 }
