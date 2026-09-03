@@ -43,22 +43,23 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 import sys
+import tarfile
+import tempfile
 import time
 import urllib.error
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Protocol
-
-from sqlglot import exp
 
 from ffrwd import __version__, credentials, store
 from ffrwd import packages as packages_module
 from ffrwd.console import Announce, Console, written_size
 from ffrwd.errors import ErrorCode, FfrwdError
-from ffrwd.parser import copy_destinations, input_specs, parse
+from ffrwd.parser import copy_destinations, input_specs
 from ffrwd.probe import is_url
 from ffrwd.project import (
     LOCKFILE_NAME,
@@ -88,7 +89,7 @@ __all__ = [
 
 # The submit payload format this client writes. The endpoint refuses any
 # other with a 426 naming the upgrade.
-JOB_FORMAT_VERSION = 1
+JOB_FORMAT_VERSION = 2
 
 # What one API answer may weigh. Job listings and signed-URL lists are small
 # JSON; output DOWNLOADS are unbounded and streamed, not read through this.
@@ -322,7 +323,6 @@ def submit_run(
         )
     token = _token()
     text = query.text
-    _refuse_computed_destinations(text)
     inputs, uploads = _inputs(text)
     lock, archives = _lock(packages)
 
@@ -340,6 +340,9 @@ def submit_run(
         # what the lock pins for a package that was linked here.
         "packages": [archive.entry.sha256 for archive in archives],
         "inputs": inputs,
+        # The syntactic view alone: a TO (<expression>) destination is the
+        # runner's to discover from the compiled graph, and the completed
+        # job's manifest is what fetch reads back.
         "outputs": copy_destinations(text),
         "timeout_s": args.timeout,
         "client_version": __version__,
@@ -379,20 +382,6 @@ def submit_run(
         timeout=_DATA_PLANE_TIMEOUT,
     )
     return Submitted(job_id=job_id, remaining=_remaining(answer))
-
-
-def _refuse_computed_destinations(text: str) -> None:
-    """A ``TO (<expression>)`` computes its paths, so a submit cannot declare them."""
-    for node in parse(text).walk():
-        if not isinstance(node, exp.Copy) or node.args.get("kind"):
-            continue
-        for target in node.args.get("files") or []:
-            if isinstance(target, exp.Paren):
-                raise _reject(
-                    "a TO (<expression>) destination computes its paths per row, "
-                    "so a submit cannot declare them",
-                    "name the outputs with quoted paths, or run locally",
-                )
 
 
 def _inputs(text: str) -> tuple[list[dict[str, object]], list[tuple[str, str]]]:
@@ -915,7 +904,15 @@ def _print_job_detail(detail: dict[str, object], now: datetime) -> None:
     if isinstance(outputs, list):
         for one in outputs:
             if isinstance(one, dict) and isinstance(one.get("path"), str):
-                print(f"output: {one['path']}")
+                count = one.get("files")
+                if (
+                    one.get("kind") == "tree"
+                    and isinstance(count, int)
+                    and not isinstance(count, bool)
+                ):
+                    print(f"output: {one['path']} ({count} files)")
+                else:
+                    print(f"output: {one['path']}")
     block = _tail_block(detail)
     if block is not None:
         print(block)
@@ -994,13 +991,18 @@ class _Output:
     """One fetchable output: where it goes, what it must hash to, where it is.
 
     `size` is the byte count the job recorded, None when the answer omits it
-    -- it only feeds the narration line.
+    -- it only feeds the narration line. `kind` is ``"file"`` (the url serves
+    the file itself; also what an entry with no kind means) or ``"tree"``
+    (the url serves one tar of the destination's whole directory), and
+    `files` is a tree's member count, for listings.
     """
 
     path: str
     sha256: str
     url: str
     size: int | None = None
+    kind: str = "file"
+    files: int | None = None
 
 
 def _fetch(
@@ -1013,26 +1015,45 @@ def _fetch(
 ) -> list[str]:
     """Download a job's outputs to their as-written paths. Returns what it wrote.
 
-    Shared by ``jobs --fetch`` (which only cares that this returns at all --
-    a raise is the failure) and ``--wait`` (which reports the paths itself,
-    as JSON, when `quiet` drops the plain ``wrote <path>`` lines).
+    A ``kind:"file"`` output streams to its path; a ``kind:"tree"`` output is
+    one archive of the destination's whole directory, unpacked so the named
+    file lands at its as-written path with its siblings beside it. Shared by
+    ``jobs --fetch`` (which only cares that this returns at all -- a raise is
+    the failure) and ``--wait`` (which reports the paths itself, as JSON,
+    when `quiet` drops the plain ``wrote <path>`` lines).
     """
     job_id = _resolve_id(token, written)
     where = f"{_jobs_url()}/{job_id}/fetch"
     answer = _json_object(_call(where, headers=_bearer(token), data=b"{}"), where)
     outputs = _outputs(answer, where)
     # Refusing before the first byte: a partial fetch over one collision
-    # helps nobody.
+    # helps nobody. A manifest path is the server's word, not this machine's,
+    # so every one is checked to stay under the working directory.
+    planned: list[tuple[_Output, Path]] = []
     for output in outputs:
-        if Path(output.path).exists() and not overwrite:
+        target = _fetch_target(output.path)
+        planned.append((output, target))
+        if target.exists() and not overwrite:
             raise _reject(f"'{output.path}' already exists", "pass -y to overwrite it")
-    for output in outputs:
+        if output.kind == "tree" and not overwrite:
+            parent = target.parent
+            if parent.is_dir() and any(parent.iterdir()):
+                into = f"'{parent}'" if str(parent) != "." else "the working directory"
+                raise _reject(
+                    f"'{output.path}' unpacks a tree into {into}, which is not empty",
+                    "pass -y to overwrite the files the tree carries; files it "
+                    "does not carry are left alone",
+                )
+    for output, target in planned:
         if announce is not None:
             written_bytes = (
                 f" ({written_size(output.size)})" if output.size is not None else ""
             )
             announce(f"downloading {output.path}{written_bytes}")
-        _download(output.url, Path(output.path), output.sha256)
+        if output.kind == "tree":
+            _fetch_tree(output, target)
+        else:
+            _download(output.url, target, output.sha256)
         if not quiet:
             print(f"wrote {output.path}")
     return [output.path for output in outputs]
@@ -1049,25 +1070,166 @@ def _outputs(answer: dict[str, object], where: str) -> list[_Output]:
         path, sha256, url = one.get("path"), one.get("sha256"), one.get("url")
         if not (isinstance(path, str) and isinstance(sha256, str) and isinstance(url, str)):
             raise _malformed(where)
+        kind = one.get("kind", "file")
+        if not isinstance(kind, str) or kind not in ("file", "tree"):
+            raise _malformed(where)
         count = one.get("bytes")
         size = count if isinstance(count, int) and not isinstance(count, bool) else None
-        outputs.append(_Output(path=path, sha256=sha256, url=url, size=size))
+        held = one.get("files")
+        files = held if isinstance(held, int) and not isinstance(held, bool) else None
+        outputs.append(
+            _Output(path=path, sha256=sha256, url=url, size=size, kind=kind, files=files)
+        )
     return outputs
 
 
-def _download(url: str, path: Path, sha256: str) -> None:
+def _stays_under(name: str, directory: Path) -> bool:
+    """True when the relative posix path `name` resolves inside `directory`.
+
+    Shape first -- empty, absolute, ``..``, separators a relative posix path
+    has no business holding -- then where it actually resolves.
+    """
+    parts = PurePosixPath(name).parts
+    if not name or name.startswith("/") or "\\" in name or ":" in name or ".." in parts:
+        return False
+    if not parts:
+        return False
+    root = Path(os.path.realpath(directory))
+    resolved = Path(os.path.realpath(directory.joinpath(*parts)))
+    return root in resolved.parents
+
+
+def _fetch_target(written: str) -> Path:
+    """The path the manifest entry `written` lands at, or a refusal."""
+    if _stays_under(written, Path.cwd()):
+        return Path(written)
+    raise _reject(
+        f"the job recorded output '{written}', which does not stay under the "
+        "working directory",
+        "a fetch writes outputs beneath the directory it runs in; declare a "
+        "destination inside the project, or run the query locally",
+    )
+
+
+_TREE_ARCHIVE_HINT = "the archive is not one this ffrwd will unpack; nothing was written"
+
+
+def _fetch_tree(output: _Output, target: Path) -> None:
+    """Download `output`'s archive and unpack it around `target`.
+
+    The archive holds the destination's whole directory, members relative to
+    it. It lands in a staging directory inside the destination's own, is
+    verified and unpacked there, and the files move onto their places one
+    rename at a time -- a refused or broken archive leaves nothing behind.
+    """
+    parent = target.parent
+    existed = parent.is_dir()
+    try:
+        parent.mkdir(parents=True, exist_ok=True)
+        staging = Path(tempfile.mkdtemp(dir=parent, prefix=".fetch-"))
+    except OSError as err:
+        raise _reject(
+            f"'{output.path}' could not be written: {err.strerror or err}",
+            "check that the destination is writable",
+        ) from err
+    try:
+        archive = staging / "tree.tar"
+        _download(output.url, archive, output.sha256, shown=output.path)
+        unpacked = staging / "tree"
+        unpacked.mkdir()
+        _extract_tree(output.path, archive, unpacked)
+        _place_tree(output.path, unpacked, parent)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        if not existed:
+            try:
+                parent.rmdir()
+            except OSError:
+                pass
+        raise
+    shutil.rmtree(staging, ignore_errors=True)
+
+
+def _extract_tree(written: str, archive: Path, destination: Path) -> None:
+    """Write the members of `archive` under `destination`, refusing every other kind.
+
+    The archive crossed a network, so the packer's own rules are enforced
+    again here: plain files and directories only, every member name checked
+    to stay under `destination`.
+    """
+    try:
+        with tarfile.open(archive, mode="r:") as opened:
+            for member in opened:
+                if not (member.isreg() or member.isdir()):
+                    raise _reject(
+                        f"the archive for '{written}' holds {member.name!r}, "
+                        "which is neither a plain file nor a directory",
+                        _TREE_ARCHIVE_HINT,
+                    )
+                if not _stays_under(member.name, destination):
+                    raise _reject(
+                        f"the archive for '{written}' holds the member "
+                        f"{member.name!r}, which leaves the directory it "
+                        "unpacks into",
+                        _TREE_ARCHIVE_HINT,
+                    )
+                target = destination.joinpath(*PurePosixPath(member.name).parts)
+                if member.isdir():
+                    target.mkdir(parents=True, exist_ok=True)
+                    continue
+                content = opened.extractfile(member)
+                if content is None:  # pragma: no cover -- isreg() already ruled this out
+                    raise _reject(
+                        f"the archive for '{written}' holds {member.name!r} "
+                        "with no content",
+                        _TREE_ARCHIVE_HINT,
+                    )
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with open(target, "wb") as handle:
+                    shutil.copyfileobj(content, handle)
+    except (EOFError, OSError, tarfile.TarError) as err:
+        raise _reject(
+            f"the archive for '{written}' could not be unpacked: {err}",
+            _TREE_ARCHIVE_HINT,
+        ) from err
+
+
+def _place_tree(written: str, unpacked: Path, destination: Path) -> None:
+    """Move the extracted tree's members onto their places under `destination`.
+
+    One rename per file, parents first: what the archive carries overwrites,
+    and nothing else is touched.
+    """
+    try:
+        for path in sorted(unpacked.rglob("*")):
+            target = destination / path.relative_to(unpacked)
+            if path.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(path, target)
+    except OSError as err:
+        raise _reject(
+            f"'{written}' could not be written: {err.strerror or err}",
+            "check that the destination is writable",
+        ) from err
+
+
+def _download(url: str, path: Path, sha256: str, *, shown: str | None = None) -> None:
     """Stream `url` to `path`, verifying the digest before the file lands.
 
     Written beside the destination and moved onto it, so an interrupted or
-    corrupt download never leaves a half-file under the real name.
+    corrupt download never leaves a half-file under the real name. `shown`
+    names the output in refusals when `path` is a staging file.
     """
+    named = shown if shown is not None else str(path)
     parent = path.parent
     try:
         if str(parent):
             parent.mkdir(parents=True, exist_ok=True)
     except OSError as err:
         raise _reject(
-            f"'{path}' could not be written: {err.strerror or err}",
+            f"'{named}' could not be written: {err.strerror or err}",
             "check that the destination is writable",
         ) from err
     part = path.with_name(f"{path.name}.part")
@@ -1092,12 +1254,12 @@ def _download(url: str, path: Path, sha256: str) -> None:
     except (OSError, ValueError, urllib.error.URLError) as err:
         part.unlink(missing_ok=True)
         raise _reject(
-            f"'{path}' could not be downloaded: {err}", "try the fetch again"
+            f"'{named}' could not be downloaded: {err}", "try the fetch again"
         ) from err
     if hasher.hexdigest() != sha256.lower():
         part.unlink(missing_ok=True)
         raise _reject(
-            f"'{path}' downloaded as {hasher.hexdigest()}, not the {sha256} the "
+            f"'{named}' downloaded as {hasher.hexdigest()}, not the {sha256} the "
             "job recorded",
             "try the fetch again",
         )

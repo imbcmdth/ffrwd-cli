@@ -229,18 +229,23 @@ def test_show_and_remote_conflict(
     assert served.asked == []
 
 
-def test_a_computed_destination_is_refused(served: _Served, logged_in: None) -> None:
+def test_a_computed_destination_submits(
+    served: _Served, logged_in: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _submit_accepted(served)
     text = (
-        "COPY (SELECT c.index FROM input('f.mkv') f, unnest(f.chapters) c)"
+        "COPY (SELECT c.index FROM input('rtmp://live/key') f, unnest(f.chapters) c)"
         " TO (c.index::text || '.mkv')"
     )
-    with pytest.raises(FfrwdError) as caught:
-        remote.submit_run(_query(text), None, _run_args())
-    assert caught.value.message == (
-        "a TO (<expression>) destination computes its paths per row, so a "
-        "submit cannot declare them"
-    )
-    assert served.asked == []
+    remote.submit_run(_query(text), None, _run_args())
+    _headers, body = served.sent_to(JOBS_URL)
+    assert body is not None
+    payload = json.loads(body)
+    # The runner discovers the real paths from the compiled graph; the
+    # syntactic view declares none for a computed destination.
+    assert payload["outputs"] == []
+    assert payload["format_version"] == 2
 
 
 def test_a_missing_file_input_is_refused_with_its_anchor(
@@ -297,7 +302,7 @@ def test_submit_posts_the_spec_uploads_the_file_and_starts(
     assert headers["authorization"] == f"Bearer {TOKEN}"
     assert body is not None
     assert json.loads(body) == {
-        "format_version": 1,
+        "format_version": 2,
         "query": query,
         "variables": {},
         "recipe": None,
@@ -982,7 +987,16 @@ def test_jobs_id_shows_one_jobs_detail_including_the_tail(
     detail = dict(
         ROW_DONE,
         log_tail="frame=1\nframe=2\nframe=3",
-        outputs=[{"path": "clips/out.mp4", "bytes": 123, "sha256": "a" * 64}],
+        outputs=[
+            {"path": "clips/out.mp4", "bytes": 123, "sha256": "a" * 64},
+            {
+                "path": "ladder/master.m3u8",
+                "bytes": 456,
+                "sha256": "b" * 64,
+                "kind": "tree",
+                "files": 42,
+            },
+        ],
     )
     served.answers[_detail_url(str(ROW_DONE["id"]))] = json.dumps(detail).encode("utf-8")
     code = cli.main(["jobs", "aaaa"])
@@ -991,6 +1005,7 @@ def test_jobs_id_shows_one_jobs_detail_including_the_tail(
     # The listing's own row rendering, plus what a listing never carries.
     assert "aaaa1111" in out and "succeeded" in out
     assert "output: clips/out.mp4" in out
+    assert "output: ladder/master.m3u8 (42 files)" in out
     assert "log tail:" in out
     assert "frame=1" in out and "frame=3" in out
 
@@ -1060,24 +1075,59 @@ def test_jobs_id_does_not_mix_with_watch_cancel_or_fetch(
     assert "an ID does not mix with --watch/--cancel/--fetch" in err
 
 
-def _fetchable(served: _Served, content: bytes, path: str = "clips/out.mp4") -> str:
+def _fetchable(
+    served: _Served,
+    content: bytes,
+    path: str = "clips/out.mp4",
+    *,
+    kind: str | None = None,
+    files: int | None = None,
+) -> str:
+    """One fetchable output over `content`'s digest. No `kind` key unless
+    given: an older row's entry, which fetch treats as a file."""
     download_url = "https://runner.example/download/aaaa/0?token=t"
     fetch_url = f"{JOBS_URL}/{ROW_DONE['id']}/fetch"
     _listing(served, ROW_DONE)
+    entry: dict[str, object] = {
+        "path": path,
+        "bytes": len(content),
+        "sha256": hashlib.sha256(content).hexdigest(),
+        "url": download_url,
+    }
+    if kind is not None:
+        entry["kind"] = kind
+    if files is not None:
+        entry["files"] = files
     served.answers[fetch_url] = json.dumps(
-        {
-            "job_id": ROW_DONE["id"],
-            "outputs": [
-                {
-                    "path": path,
-                    "bytes": len(content),
-                    "sha256": hashlib.sha256(content).hexdigest(),
-                    "url": download_url,
-                }
-            ],
-        }
+        {"job_id": ROW_DONE["id"], "outputs": [entry]}
     ).encode("utf-8")
     return download_url
+
+
+def _tree_tar(members: dict[str, bytes | None]) -> bytes:
+    """An uncompressed tar of `members`: bytes for a file, None for a directory."""
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w") as archive:
+        for name, content in members.items():
+            info = tarfile.TarInfo(name)
+            if content is None:
+                info.type = tarfile.DIRTYPE
+                archive.addfile(info)
+                continue
+            info.size = len(content)
+            archive.addfile(info, io.BytesIO(content))
+    return raw.getvalue()
+
+
+def _symlink_tar() -> bytes:
+    """An archive whose one member is a symlink, which no runner packs."""
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w") as archive:
+        info = tarfile.TarInfo("master.m3u8")
+        info.type = tarfile.SYMTYPE
+        info.linkname = "../outside"
+        archive.addfile(info)
+    return raw.getvalue()
 
 
 def test_fetch_streams_each_output_to_its_as_written_path(
@@ -1139,6 +1189,169 @@ def test_fetch_verifies_the_digest_and_leaves_no_file(
     assert "downloaded as" in err and "the job recorded" in err
     assert not (tmp_path / "clips" / "out.mp4").exists()
     assert list((tmp_path / "clips").glob("*.part")) == []
+
+
+def test_fetch_streams_an_explicit_file_kind_to_its_path(
+    served: _Served,
+    logged_in: None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    download_url = _fetchable(served, b"the output bytes", kind="file")
+    served.answers[download_url] = b"the output bytes"
+    code = cli.main(["jobs", "--fetch", "aaaa"])
+    assert code == 0
+    assert (tmp_path / "clips" / "out.mp4").read_bytes() == b"the output bytes"
+
+
+TREE_PATH = "ladder/master.m3u8"
+
+
+def test_fetch_unpacks_a_tree_at_its_as_written_path(
+    served: _Served,
+    logged_in: None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    tar = _tree_tar(
+        {
+            "master.m3u8": b"#EXTM3U master",
+            "v0": None,
+            "v0/rung.m3u8": b"#EXTM3U rung",
+            "v0/seg_000.ts": b"segment bytes",
+        }
+    )
+    download_url = _fetchable(served, tar, TREE_PATH, kind="tree", files=3)
+    served.answers[download_url] = tar
+    code = cli.main(["jobs", "--fetch", "aaaa"])
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "wrote ladder/master.m3u8" in captured.out
+    assert (tmp_path / "ladder" / "master.m3u8").read_bytes() == b"#EXTM3U master"
+    assert (tmp_path / "ladder" / "v0" / "rung.m3u8").read_bytes() == b"#EXTM3U rung"
+    assert (tmp_path / "ladder" / "v0" / "seg_000.ts").read_bytes() == b"segment bytes"
+    # The archive is wire format: neither it nor any staging survives.
+    landed = sorted(one.relative_to(tmp_path).as_posix() for one in tmp_path.rglob("*"))
+    assert landed == [
+        "ladder",
+        "ladder/master.m3u8",
+        "ladder/v0",
+        "ladder/v0/rung.m3u8",
+        "ladder/v0/seg_000.ts",
+    ]
+
+
+def test_fetch_verifies_a_tree_archives_digest_and_leaves_nothing(
+    served: _Served,
+    logged_in: None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    tar = _tree_tar({"master.m3u8": b"#EXTM3U"})
+    download_url = _fetchable(served, tar, TREE_PATH, kind="tree", files=1)
+    served.answers[download_url] = b"not the archive the job recorded"
+    code = cli.main(["jobs", "--fetch", "aaaa"])
+    err = capsys.readouterr().err
+    assert code == 1
+    assert "'ladder/master.m3u8' downloaded as" in err
+    assert list(tmp_path.rglob("*")) == []
+
+
+@pytest.mark.parametrize(
+    ("archive", "said"),
+    [
+        pytest.param(
+            _tree_tar({"../escape.ts": b"x"}),
+            "leaves the directory it unpacks into",
+            id="dotdot",
+        ),
+        pytest.param(
+            _tree_tar({"/escape.ts": b"x"}),
+            "leaves the directory it unpacks into",
+            id="absolute",
+        ),
+        pytest.param(
+            _symlink_tar(), "neither a plain file nor a directory", id="symlink"
+        ),
+    ],
+)
+def test_fetch_refuses_a_hostile_tree_member_and_leaves_nothing(
+    served: _Served,
+    logged_in: None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    archive: bytes,
+    said: str,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    download_url = _fetchable(served, archive, TREE_PATH, kind="tree", files=1)
+    served.answers[download_url] = archive
+    code = cli.main(["jobs", "--fetch", "aaaa"])
+    err = capsys.readouterr().err
+    assert code == 1
+    assert said in err
+    assert "nothing was written" in err
+    assert list(tmp_path.rglob("*")) == []
+
+
+def test_fetch_refuses_a_tree_into_a_nonempty_directory_without_dash_y(
+    served: _Served,
+    logged_in: None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    tar = _tree_tar({"master.m3u8": b"new master", "seg_000.ts": b"new segment"})
+    download_url = _fetchable(served, tar, TREE_PATH, kind="tree", files=2)
+    served.answers[download_url] = tar
+    (tmp_path / "ladder").mkdir()
+    (tmp_path / "ladder" / "unrelated.txt").write_bytes(b"kept")
+
+    code = cli.main(["jobs", "--fetch", "aaaa"])
+    err = capsys.readouterr().err
+    assert code == 1
+    assert "'ladder/master.m3u8' unpacks a tree into 'ladder', which is not empty" in err
+    assert "pass -y to overwrite the files the tree carries" in err
+    assert not (tmp_path / "ladder" / "master.m3u8").exists()
+
+    # -y overwrites what the tree carries and leaves the rest alone.
+    (tmp_path / "ladder" / "master.m3u8").write_bytes(b"old master")
+    code = cli.main(["jobs", "--fetch", "aaaa", "-y"])
+    assert code == 0
+    assert (tmp_path / "ladder" / "master.m3u8").read_bytes() == b"new master"
+    assert (tmp_path / "ladder" / "seg_000.ts").read_bytes() == b"new segment"
+    assert (tmp_path / "ladder" / "unrelated.txt").read_bytes() == b"kept"
+
+
+def test_fetch_refuses_a_manifest_path_leaving_the_working_directory(
+    served: _Served,
+    logged_in: None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    for path in ("/etc/evil.mp4", "../evil.mp4", "C:\\evil.mp4"):
+        download_url = _fetchable(served, b"payload", path)
+        served.answers[download_url] = b"payload"
+        code = cli.main(["jobs", "--fetch", "aaaa"])
+        err = capsys.readouterr().err
+        assert code == 1
+        assert (
+            f"the job recorded output '{path}', which does not stay under the "
+            "working directory" in err
+        )
+        assert list(tmp_path.rglob("*")) == []
+        # Refused before the first byte: the download URL was never asked for.
+        assert download_url not in [asked for asked, _headers, _body in served.asked]
 
 
 def test_jobs_without_a_token_is_refused(
