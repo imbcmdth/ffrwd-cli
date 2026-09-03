@@ -1,4 +1,4 @@
-package ffrwd:av@0.13.0;
+package ffrwd:av@0.12.0;
 
 interface types {
   /// Static description of a module, available without running anything.
@@ -87,90 +87,6 @@ interface types {
     /// parameters are in seconds converts them. For audio it is what turns a
     /// sample position into a timestamp: at 1/48000 one tick is one sample.
     time-base: rational,
-  }
-
-  /// The frames a coded video stream declares. Shared between `packet-sink`
-  /// and `packet-source`.
-  record coded-video {
-    width: u32,
-    height: u32,
-    /// The pixel aspect ratio the stream declares. Packets cannot be
-    /// host-rescaled, so a packager writes it through (mp4's `pasp`);
-    /// none where the wire does not say.
-    sample-aspect-ratio: option<rational>,
-    /// The colorimetry the stream header declared; none where it did not.
-    color: option<color-info>,
-  }
-
-  /// The samples a coded audio stream declares.
-  record coded-audio {
-    sample-rate: u32,
-    channels: u32,
-    /// ffmpeg's name for the channel layout ("stereo", "5.1"), which a
-    /// count alone cannot say; none where the wire does not carry one.
-    channel-layout: option<string>,
-  }
-
-  /// What a coded stream carries, which is what tells its kind.
-  variant coded-format {
-    video(coded-video),
-    audio(coded-audio),
-  }
-
-  /// One encoded stream an instance is opened for, fixed for its life.
-  record coded-stream {
-    /// ffmpeg's name for the codec, e.g. "h264".
-    codec: string,
-    /// The unit `pts` and `dts` are counted in, as a fraction of a second.
-    time-base: rational,
-    /// The geometry the stream declares, and its kind.
-    format: coded-format,
-    /// The codec's out-of-band header, exactly as the stream header carried
-    /// it: for h264, the SPS and PPS a downstream packager needs before the
-    /// first packet.
-    extradata: list<u8>,
-    /// The codec's profile, in the codec's own numbering - what ffmpeg's
-    /// codec parameters carry; none where the wire does not say.
-    profile: option<s32>,
-    /// The codec's level, likewise.
-    level: option<s32>,
-  }
-
-  /// One encoded packet, exactly as the encoder emitted it.
-  record packet {
-    /// When the picture is presented, in the stream's time base. Packets
-    /// arrive in decode order, so where the stream reorders frames this is
-    /// not monotonic.
-    pts: s64,
-    /// When the packet is decoded; never decreasing. Absent for the first
-    /// packets of a reordering stream, where the wire does not settle it.
-    dts: option<s64>,
-    /// How long the packet is presented, in the stream's time base: the
-    /// next packet's pts minus this one's, in presentation order. None
-    /// where the wire does not settle it - unknown is never spelled 0.
-    duration: option<s64>,
-    /// Whether decoding can start at this packet.
-    keyframe: bool,
-    /// The encoded bytes, untouched.
-    data: list<u8>,
-  }
-
-  /// One pad's packets from one call, in decode order. Empty when nothing
-  /// arrived on that pad; a packet sink's list of these is as long as its
-  /// `init`'s streams and in the same order, so the index is the pad.
-  record pad-packets {
-    packets: list<packet>,
-  }
-
-  /// What the source read of one relation row: a rendition's name, bitrate
-  /// and codec string, exactly as the manifest or catalog said them. None
-  /// where nothing said so. Shared between `packet-sink` and
-  /// `packet-source`.
-  record rendition-meta {
-    name: option<string>,
-    bandwidth: option<u64>,
-    codecs: option<string>,
-    language: option<string>,
   }
 }
 
@@ -390,7 +306,7 @@ interface window-filter {
 /// query named, in that order, and `process` is handed one packet list per
 /// pad in the same order.
 interface packet-sink {
-  use types.{coded-stream, meta, pad-packets, rendition-meta, stream-info};
+  use types.{color-info, meta, rational, stream-info};
 
   /// How many streams of one kind a sink reads.
   enum arity {
@@ -422,17 +338,84 @@ interface packet-sink {
     audio: arity,
   }
 
+  /// The frames a coded video stream declares.
+  record coded-video {
+    width: u32,
+    height: u32,
+    /// The pixel aspect ratio the stream declares. Packets cannot be
+    /// host-rescaled, so a packager writes it through (mp4's `pasp`);
+    /// none where the wire does not say.
+    sample-aspect-ratio: option<rational>,
+    /// The colorimetry the stream header declared; none where it did not.
+    color: option<color-info>,
+  }
+
+  /// The samples a coded audio stream declares.
+  record coded-audio {
+    sample-rate: u32,
+    channels: u32,
+    /// ffmpeg's name for the channel layout ("stereo", "5.1"), which a
+    /// count alone cannot say; none where the wire does not carry one.
+    channel-layout: option<string>,
+  }
+
+  /// What a coded stream carries, which is what tells its kind.
+  variant coded-format {
+    video(coded-video),
+    audio(coded-audio),
+  }
+
+  /// One encoded stream an instance is opened for, fixed for its life.
+  record coded-stream {
+    /// ffmpeg's name for the codec, e.g. "h264".
+    codec: string,
+    /// The unit `pts` and `dts` are counted in, as a fraction of a second.
+    time-base: rational,
+    /// The geometry the stream declares, and its kind.
+    format: coded-format,
+    /// The codec's out-of-band header, exactly as the stream header carried
+    /// it: for h264, the SPS and PPS a downstream packager needs before the
+    /// first packet.
+    extradata: list<u8>,
+    /// The codec's profile, in the codec's own numbering - what ffmpeg's
+    /// codec parameters carry; none where the wire does not say.
+    profile: option<s32>,
+    /// The codec's level, likewise.
+    level: option<s32>,
+  }
+
   /// One pad's stream, told once at init: what the wire's own header said
   /// about the encoding, and what the process driving the host said about
   /// the stream.
   record input-stream {
     coded: coded-stream,
     info: stream-info,
-    /// Which relation row this pad belongs to - the moq sink learns
-    /// renditions from the rows instead of from argument names.
-    row: u32,
-    /// What the source read of that row.
-    rendition: rendition-meta,
+  }
+
+  /// One encoded packet, exactly as the encoder emitted it.
+  record packet {
+    /// When the picture is presented, in the stream's time base. Packets
+    /// arrive in decode order, so where the stream reorders frames this is
+    /// not monotonic.
+    pts: s64,
+    /// When the packet is decoded; never decreasing. Absent for the first
+    /// packets of a reordering stream, where the wire does not settle it.
+    dts: option<s64>,
+    /// How long the packet is presented, in the stream's time base: the
+    /// next packet's pts minus this one's, in presentation order. None
+    /// where the wire does not settle it - unknown is never spelled 0.
+    duration: option<s64>,
+    /// Whether decoding can start at this packet.
+    keyframe: bool,
+    /// The encoded bytes, untouched.
+    data: list<u8>,
+  }
+
+  /// One pad's packets from one call, in decode order. Empty when nothing
+  /// arrived on that pad; the list of these is as long as `init`'s streams
+  /// and in the same order, so the index is the pad.
+  record pad-packets {
+    packets: list<packet>,
   }
 
   /// What one call produced. Rows only: a packet sink's rows are its whole
@@ -465,48 +448,6 @@ interface packet-sink {
   process: func(pads: list<pad-packets>, last: bool) -> processed;
 }
 
-/// A source of encoded packets, the mirror of `packet-sink`: no input pads,
-/// one or more output tracks. Nothing arrives to push a source, so the host
-/// pulls: `next` is called once per batch until it answers none.
-///
-/// `probe` and `open` both read the same catalog - the tracks the source
-/// publishes and whether it ever ends - the first at compile time, the
-/// second at the start of a run. A module whose two catalogs disagree is
-/// refused at run: the source changed shape between compile and run.
-interface packet-source {
-  use types.{coded-stream, meta, pad-packets, rendition-meta, stream-info};
-
-  /// One track the source publishes, fixed for the life of the instance.
-  record source-track {
-    coded: coded-stream,
-    info: stream-info,
-    /// Which relation row this track belongs to.
-    row: u32,
-    /// What the source read of that row.
-    rendition: rendition-meta,
-  }
-
-  /// Every track a source publishes, and whether it ever ends.
-  record catalog {
-    tracks: list<source-track>,
-    bounded: bool,
-  }
-
-  describe: func() -> meta;
-
-  /// Reads the catalog at compile time: the source connects or opens its
-  /// file and reports what it would publish, without producing packets.
-  probe: func(params: string) -> result<catalog, string>;
-
-  /// Opens the source for a run, returning the same catalog shape `probe`
-  /// read.
-  open: func(params: string) -> result<catalog, string>;
-
-  /// One pull: a packet list per track in catalog order, or none once the
-  /// source has nothing left.
-  next: func() -> result<option<list<pad-packets>>, string>;
-}
-
 interface values {
   /// Static description of one value function, available without calling it.
   record function-meta {
@@ -528,5 +469,4 @@ world video-module  { export filter; }
 world meta-module   { export filter; export meta-filter; }
 world window-module { import window-source; export window-filter; }
 world packet-sink-module { export packet-sink; }
-world packet-source-module { export packet-source; }
 world values-module { export values; }

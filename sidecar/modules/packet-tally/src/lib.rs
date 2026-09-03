@@ -14,8 +14,9 @@ wit_bindgen::generate!({
 
 use std::cell::RefCell;
 
+use crate::ffrwd::av::types::CodedFormat;
 use exports::ffrwd::av::packet_sink::{
-    Arity, CodedFormat, Guest, InputStream, Meta, PacketSinkMeta, PadPackets, Processed,
+    Arity, Guest, InputStream, Meta, PacketSinkMeta, PadPackets, Processed,
 };
 use serde::Serialize;
 
