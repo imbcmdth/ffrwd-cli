@@ -578,6 +578,22 @@ _GROUPED_CTE_HINT = (
     "a CTE with several rows varies inside the group: wrap the column in "
     "array_agg(...), or add it to the GROUP BY to make it the group's key"
 )
+# The parser admits ORDER BY/LIMIT/OFFSET over any `input(...)` alias, since
+# whether it turns out to be an ABR ladder is a probed fact, not a syntactic
+# one -- so a renditionless input reaches here needing the same rejection
+# the parser used to raise for it, word for word.
+_RENDITIONLESS_ROW_CLAUSE_HINT = (
+    "it is legal only over a compile-time row table -- a branch whose FROM "
+    "has unnest(...), generate_series(...), or a CTE or view name -- where "
+    "it narrows the resolved rows, exactly like ORDER BY"
+)
+# The hint a "too many rows/streams for one slot" refusal takes when the
+# offending relation is a ladder: the fix is narrowing it to one rendition,
+# not restructuring the query into rows.
+_RENDITION_PICK_HINT = (
+    "pick a rendition: WHERE on height, bandwidth or name, or ORDER BY "
+    "bandwidth DESC LIMIT 1"
+)
 _CHAPTER_LITERAL = f"STRUCT(... AS title, ... AS start_t, ... AS end_t)::{CHAPTER_TYPE}"
 _CHAPTER_EXAMPLE = f"STRUCT('Intro' AS title, 0 AS start_t, 60 AS end_t)::{CHAPTER_TYPE}"
 _CHAPTERS_COLUMN_HINT = (
@@ -3668,7 +3684,9 @@ class _Lowerer:
                     f"each row of a format '{self.manifest}' destination is "
                     "one variant map entry",
                     anchor,
-                    hint="one variant per row: unnest or join the tracks "
+                    hint=_RENDITION_PICK_HINT
+                    if self._from_rendition_table(self.sink_env)
+                    else "one variant per row: unnest or join the tracks "
                     "into rows instead of selecting an array",
                 )
             cells[value.type] = [
@@ -4809,6 +4827,20 @@ class _Lowerer:
 
     # -- one row, one file -------------------------------------------------
 
+    def _from_rendition_table(self, env: _Env | None) -> bool:
+        """True when `env` binds a rendition ladder's row table.
+
+        The fix for "too many rows/streams for one slot" is different for a
+        ladder than for a joined CTE or an unnest table: narrow it to one
+        rendition (WHERE, or ORDER BY ... LIMIT 1), not restructure the query.
+        """
+        if env is None:
+            return False
+        return any(
+            isinstance(binding, _RowBinding) and binding.column == RENDITION_COLUMN
+            for binding in env.bindings.values()
+        )
+
     def _check_one_row_per_file(self, select: exp.Select, env: _Env) -> None:
         """One row is one file, so a single destination needs a single row.
 
@@ -4826,14 +4858,17 @@ class _Lowerer:
         """
         if self.fanout_expr is not None or self.manifest is not None:
             return
+        rendition_rows = self._from_rendition_table(env)
         if env.grouped:
             count = len(self._grouped_partitions(env, select))
             what = "group" if count == 1 else "groups"
-            hint = _ONE_FILE_PER_GROUP_HINT
+            hint = _RENDITION_PICK_HINT if rendition_rows else _ONE_FILE_PER_GROUP_HINT
         else:
             count = len(env.relation.tuples) if env.relation is not None else 1
             what = "row" if count == 1 else "rows"
-            if any(isinstance(b, _CteBinding) for b in env.bindings.values()):
+            if rendition_rows:
+                hint = _RENDITION_PICK_HINT
+            elif any(isinstance(b, _CteBinding) for b in env.bindings.values()):
                 hint = _CTE_ROW_FILE_HINT
             elif self.row_window_seen:
                 hint = _ROW_WINDOW_FILE_HINT
@@ -7361,6 +7396,17 @@ class _Lowerer:
         order = select.args.get("order")
         if not isinstance(order, exp.Order):
             return
+        if env.relation is None:
+            # The parser admitted ORDER BY on the strength of an `input(...)`
+            # alias that MIGHT have been a ladder; the probe just settled it
+            # wasn't, so this branch has no row table after all.
+            raise _error(
+                ErrorCode.NO_STREAMING_EQUIVALENT,
+                "ORDER BY has no streaming equivalent",
+                order,
+                fallback=select,
+                hint="remove the ORDER BY clause",
+            )
         for ordered in reversed(order.expressions):
             if not isinstance(ordered, exp.Ordered):
                 raise _error(
@@ -7409,6 +7455,26 @@ class _Lowerer:
         """
         limit = select.args.get("limit")
         offset = select.args.get("offset")
+        if env.relation is None:
+            # Same story as `_order_rows`: the parser could not yet tell a
+            # renditionless input from a ladder, so this rejection waited for
+            # the probe instead of firing at parse time.
+            if isinstance(limit, exp.Limit):
+                raise _error(
+                    ErrorCode.NO_STREAMING_EQUIVALENT,
+                    "LIMIT has no streaming equivalent",
+                    limit,
+                    fallback=select,
+                    hint=_RENDITIONLESS_ROW_CLAUSE_HINT,
+                )
+            if isinstance(offset, exp.Offset):
+                raise _error(
+                    ErrorCode.NO_STREAMING_EQUIVALENT,
+                    "OFFSET has no streaming equivalent",
+                    offset,
+                    fallback=select,
+                    hint=_RENDITIONLESS_ROW_CLAUSE_HINT,
+                )
         take = (
             self._row_bound(limit.args.get("expression"), "LIMIT", select)
             if isinstance(limit, exp.Limit)
@@ -8186,8 +8252,15 @@ class _Lowerer:
         ladder mixes muxed and audio-only rungs. Same array/subscript surface
         as every other stream column: bare ``r.video`` is the whole array,
         ``r.video[k]`` names one element of it.
+
+        A manifest destination reads this differently (:meth:`_rendition_row_cells`):
+        each ladder rung is its own variant map entry, so the column has to
+        stay one cell PER ROW -- an audio-only rung's video cell is NULL,
+        not absent, the same gap a FULL JOIN's unmatched row leaves.
         """
         kind = _ARRAY_COLUMNS[name]
+        if self.manifest is not None:
+            return self._rendition_row_cells(binding, kind, index)
         streams = [
             row.kinds[kind] for row in binding.rows if row is not None and kind in row.kinds
         ]
@@ -8204,6 +8277,27 @@ class _Lowerer:
                 hint=_SUBSCRIPT_HINT,
             )
         return _scalar(streams[index - 1])
+
+    def _rendition_row_cells(
+        self, binding: _RowBinding, kind: StreamType, index: int | None
+    ) -> _Value:
+        """``<alias>.video``/``.audio`` at a manifest destination: one cell
+        per ladder rung, in row order -- a bare column and its ``[1]``
+        subscript read the same thing, since a rung carries at most one
+        stream of a kind. A rung without that kind (an audio-only rendition's
+        ``.video``) contributes the NULL sentinel a manifest's variant map
+        already knows how to read as an absent cell, exactly like an
+        unmatched FULL JOIN row.
+        """
+        return _array(
+            kind,
+            (
+                row.kinds[kind]
+                if row is not None and kind in row.kinds and index in (None, 1)
+                else _Stream(ref=_NULL_STREAM_REF, type=kind, source=None)
+                for row in binding.rows
+            ),
+        )
 
     def _row_value(
         self,
@@ -8842,6 +8936,20 @@ class _Lowerer:
                 anchor,
                 fallback=select,
                 hint=record_unnest_hint(alias, name),
+            )
+        if name in _RENDITION_SCHEMA:
+            # A rendition column is real SQL, just not over THIS input: its
+            # probe never turned up an ABR ladder, so `_bind_renditions` left
+            # `alias` a plain `_InputBinding` rather than replacing it with a
+            # rendition row table.
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"'{alias}' is a single file, not a ladder: "
+                f"input('{self._path_of(alias)}') has no renditions",
+                anchor,
+                fallback=select,
+                hint="rendition columns (bandwidth, width, height, codecs, "
+                "name, language) read from an HLS master or DASH manifest",
             )
         array_type = _ARRAY_COLUMNS.get(name)
         if array_type is None:

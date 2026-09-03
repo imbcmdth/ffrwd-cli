@@ -538,9 +538,12 @@ def test_time_column_outside_where_is_rejected() -> None:
 
 
 def test_unknown_column_is_rejected() -> None:
-    err = _reject("SELECT hflip(a.width) FROM input('x.mp4') a")
+    # `width` is a real column name now (a rendition one), refused by its own
+    # more specific message -- see `test_a_rendition_column_on_a_renditionless_
+    # input_is_refused` -- so this wants a name that is unknown outright.
+    err = _reject("SELECT hflip(a.frobnicate) FROM input('x.mp4') a")
     assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "a.width" in err.message
+    assert "a.frobnicate" in err.message
 
 
 def test_literal_projection_is_rejected() -> None:
@@ -6908,6 +6911,148 @@ def test_a_where_between_seek_still_works_on_a_renditionless_input() -> None:
     assert g.to_dict()["nodes"] == []
     assert g.input_trims == {"r": (1, 2)}
     assert _outputs(g) == [("src:r:v:0", "video", None)]
+
+
+def test_a_rendition_column_on_a_renditionless_input_is_refused() -> None:
+    """``r.bandwidth`` (etc.) parses over ANY input alias -- resolve cannot
+    know whether it will turn out to be a ladder -- so a plain file's probe
+    is what actually refuses it, at bind time in lower."""
+    plain = ProbeResult(streams=[_track("video", 0), _track("audio", 0)])
+    err = _reject_lower("SELECT r.bandwidth FROM input('x.mp4') r", {"r": plain})
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert err.message == (
+        "'r' is a single file, not a ladder: input('x.mp4') has no renditions"
+    )
+    assert err.hint == (
+        "rendition columns (bandwidth, width, height, codecs, name, "
+        "language) read from an HLS master or DASH manifest"
+    )
+
+
+def test_order_by_on_a_renditionless_input_keeps_the_parsers_old_refusal() -> None:
+    """The parser admits ORDER BY over any `input(...)` alias now, on spec --
+    only the probe can confirm there is no row table to sort. Lower raises
+    the exact rejection the parser used to raise here, unchanged for a plain
+    file's user experience."""
+    plain = ProbeResult(streams=[_track("video", 0), _track("audio", 0)])
+    err = _reject_lower(
+        "SELECT r.video[1] FROM input('x.mp4') r ORDER BY r.height", {"r": plain}
+    )
+    assert err.code is ErrorCode.NO_STREAMING_EQUIVALENT
+    assert err.message == "ORDER BY has no streaming equivalent"
+    assert err.hint == "remove the ORDER BY clause"
+
+
+def test_limit_and_offset_on_a_renditionless_input_keep_the_parsers_old_refusal() -> None:
+    plain = ProbeResult(streams=[_track("video", 0), _track("audio", 0)])
+    limit_err = _reject_lower("SELECT r.video[1] FROM input('x.mp4') r LIMIT 1", {"r": plain})
+    assert limit_err.code is ErrorCode.NO_STREAMING_EQUIVALENT
+    assert limit_err.message == "LIMIT has no streaming equivalent"
+    offset_err = _reject_lower(
+        "SELECT r.video[1] FROM input('x.mp4') r OFFSET 1", {"r": plain}
+    )
+    assert offset_err.code is ErrorCode.NO_STREAMING_EQUIVALENT
+    assert offset_err.message == "OFFSET has no streaming equivalent"
+    row_table_hint = (
+        "it is legal only over a compile-time row table -- a branch whose FROM "
+        "has unnest(...), generate_series(...), or a CTE or view name -- where "
+        "it narrows the resolved rows, exactly like ORDER BY"
+    )
+    assert limit_err.hint == row_table_hint
+    assert offset_err.hint == row_table_hint
+
+
+def test_the_multi_row_refusal_picks_up_the_rendition_hint() -> None:
+    """A ladder reaching a plain (non-manifest) one-row destination hits the
+    same ROW_COUNT_MISMATCH every other multi-row relation does, but the fix
+    is narrowing to one rendition, not restructuring the query into rows --
+    so the hint says that instead of the generic array_agg/TO advice."""
+    err = _reject_lower(
+        "COPY (SELECT r.video[1] FROM input('x.m3u8') r) TO 'out.mp4'",
+        _rendition_probes(),
+    )
+    assert err.code is ErrorCode.ROW_COUNT_MISMATCH
+    assert err.message == "this query has 3 rows, and 'out.mp4' is one file"
+    assert err.hint == (
+        "pick a rendition: WHERE on height, bandwidth or name, or ORDER BY "
+        "bandwidth DESC LIMIT 1"
+    )
+
+
+def test_the_one_row_manifest_refusal_picks_up_the_rendition_hint() -> None:
+    """The manifest destination's OWN "too many streams for one variant"
+    refusal, reached here by mixing a WHERE-narrowed ladder (cardinality 1)
+    with an ordinary multi-track file's bare array column -- still picks up
+    the rendition hint, because the offending relation is still `r`'s ladder,
+    message body unchanged."""
+    plain = ProbeResult(streams=[_track("audio", 0), _track("audio", 1)])
+    err = _reject_lower(
+        "COPY (SELECT r.video[1], f.audio FROM input('r.m3u8') r, "
+        "input('f.mkv') f WHERE r.height = 1080) "
+        "TO 'out/master.m3u8' WITH (format 'hls', video_codec 'libx264', "
+        "audio_codec 'aac')",
+        {**_rendition_probes(), "f": plain},
+    )
+    assert err.code is ErrorCode.ROW_COUNT_MISMATCH
+    assert err.message == (
+        "'audio' is 2 streams in one row, and each row of a format 'hls' "
+        "destination is one variant map entry"
+    )
+    assert err.hint == (
+        "pick a rendition: WHERE on height, bandwidth or name, or ORDER BY "
+        "bandwidth DESC LIMIT 1"
+    )
+
+
+def test_a_ladder_reaches_a_manifest_destination_as_n_variants() -> None:
+    """``COPY (SELECT r.video[1], r.audio[1] FROM input(<manifest>) r) TO
+    ... WITH (format 'hls', ...)`` over a 3-rung ladder (two muxed rungs, one
+    audio-only) lowers to 3 variant map entries: each row's own video[1]/
+    audio[1] are that variant's cells, and the audio-only rung's video cell
+    is NULL rather than absent -- the same gap shape a FULL JOIN leaves.
+    """
+    lo_v = _track("video", 0, width=1280, height=720, fps="30/1")
+    lo_a = _track("audio", 0, channels=2)
+    hi_v = _track("video", 1, width=1920, height=1080, fps="30/1")
+    hi_a = _track("audio", 1, channels=2)
+    solo_a = _track("audio", 2, channels=2, language="en")
+    renditions = [
+        RenditionMeta(
+            streams=[lo_v, lo_a], bandwidth=800_000, width=1280, height=720,
+            codecs="avc1.640020,mp4a.40.2", name="Low", language=None, program_id=1,
+        ),
+        RenditionMeta(
+            streams=[hi_v, hi_a], bandwidth=3_000_000, width=1920, height=1080,
+            codecs="avc1.64002a,mp4a.40.2", name="High", language=None, program_id=2,
+        ),
+        RenditionMeta(
+            streams=[solo_a], bandwidth=128_000, width=None, height=None,
+            codecs="mp4a.40.2", name="Audio", language="en", program_id=3,
+        ),
+    ]
+    probe = ProbeResult(streams=[lo_v, lo_a, hi_v, hi_a, solo_a], renditions=renditions)
+    g = _lower(
+        "COPY (SELECT r.video[1], r.audio[1] FROM input('ladder.m3u8') r) "
+        "TO 'out/master.m3u8' WITH (format 'hls', video_codec 'libx264', "
+        "audio_codec 'aac')",
+        {"r": probe},
+    )
+    unit = g.sinks[0]
+    assert [o.type for o in unit.outputs] == ["video", "video", "audio", "audio", "audio"]
+    assert [o.ref for o in unit.outputs] == [
+        "src:r:v:0", "src:r:v:1", "src:r:a:0", "src:r:a:1", "src:r:a:2",
+    ]
+    var_stream_map = unit.options["var_stream_map"]
+    assert isinstance(var_stream_map, str)
+    variants = var_stream_map.split(" ")
+    assert len(variants) == 3
+    assert variants[0].startswith("v:0,a:0,")
+    assert variants[1].startswith("v:1,a:1,")
+    assert variants[2].startswith("a:2,")
+    assert not variants[2].startswith("v:")  # the audio-only rung: NULL video
+    args = build_ffmpeg_args(emit(g), None)
+    maps = [args[i + 1] for i, arg in enumerate(args) if arg == "-map"]
+    assert maps == ["0:v:0", "0:v:1", "0:a:0", "0:a:1", "0:a:2"]
 
 
 def test_a_codecless_stream_is_rejected_before_ffmpeg_can_die_on_it() -> None:
