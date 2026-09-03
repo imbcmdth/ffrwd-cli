@@ -20,7 +20,7 @@ mod windows;
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::sync::{Arc, Condvar, Mutex};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -331,6 +331,9 @@ struct Args {
     stream_info: Option<StreamInfo>,
     outputs: Vec<OutputSpec>,
     annotations: Annotations,
+    /// `-rows-in`: where a rows module's input rows come from. A rows
+    /// module reads no `-i` stream at all, so this is its only input.
+    rows_in: Option<InputPath>,
     /// The `-jobs` cap on worker threads, if one was given. The pool is the
     /// machine's effective core count either way; the cap only lowers it,
     /// and `-jobs 1` is the serial escape hatch.
@@ -528,6 +531,7 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
     let mut outputs: Vec<OutputSpec> = Vec::new();
     let mut stream_info_path: Option<String> = None;
     let mut annotations = Annotations::default();
+    let mut rows_in: Option<InputPath> = None;
     let mut jobs: Option<usize> = None;
 
     while let Some(arg) = it.next() {
@@ -589,6 +593,12 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
                 }
             }
             "-stream_info" => stream_info_path = Some(next("-stream_info")?),
+            "-rows-in" => {
+                if rows_in.is_some() {
+                    bail!("second -rows-in specified");
+                }
+                rows_in = Some(resolve_input_path(&next("-rows-in")?)?);
+            }
             "-jobs" => {
                 let raw = next("-jobs")?;
                 let parsed: usize = raw
@@ -657,6 +667,7 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
         stream_info,
         outputs,
         annotations,
+        rows_in,
         jobs,
     })
 }
@@ -1125,6 +1136,40 @@ fn run(args: &Args) -> Result<()> {
         }
     }
 
+    // A rows module rides alone too: no stream feeds it, so it takes no -i
+    // either, and its rows arrive through -rows-in instead.
+    if let Modules::Single { path, params } = &args.modules {
+        let is_rows_module = ffrwd_wasm_runtime::runtime::exports_rows_module(path)
+            .with_context(|| format!("opening module {path}"))?;
+        if is_rows_module {
+            if !args.inputs.is_empty() {
+                bail!(
+                    "{path} is a rows module: it reads no stream, and this command gives it {} \
+                     -i input(s); rows arrive through -rows-in instead",
+                    args.inputs.len()
+                );
+            }
+            let rows_in = args.rows_in.as_ref().ok_or_else(|| {
+                anyhow!("{path} is a rows module: it reads rows through -rows-in, which this command does not give it")
+            })?;
+            return run_rows_module(args, path, params, rows_in);
+        }
+    }
+    // -rows-in names a rows module's input; every other shape reads neither
+    // a rows module's -i (none) nor -rows-in (nothing) - so a -rows-in this
+    // far along names something that is not one.
+    if args.rows_in.is_some() {
+        match &args.modules {
+            Modules::Single { path, .. } => {
+                bail!("-rows-in follows a rows module's -m; {path} is not one")
+            }
+            Modules::Network { .. } => bail!(
+                "-rows-in names a rows module's input; a network wires modules together and \
+                 reads none itself"
+            ),
+        }
+    }
+
     if args.inputs.is_empty() {
         bail!("no input specified (-i)");
     }
@@ -1362,6 +1407,67 @@ fn run_packet_sink(args: &Args, module: &str, params: &str) -> Result<()> {
     for writer in &mut row_outputs {
         write_rows(writer, &emitted.rows)?;
         write_rows(writer, &emitted.trailing)?;
+        writer.flush()?;
+    }
+    Ok(())
+}
+
+/// `-rows-in`: one JSON object per line, blank lines skipped. No stream
+/// carries these, so nothing paces them the way a producer paces a NUT
+/// input - the whole file is read before the module sees any of it.
+fn read_ndjson_rows(reader: InputReader) -> Result<Vec<String>> {
+    io::BufReader::new(reader)
+        .lines()
+        .filter(|line| !matches!(line, Ok(l) if l.trim().is_empty()))
+        .collect::<io::Result<Vec<String>>>()
+        .context("reading -rows-in")
+}
+
+/// A rows module through ONE instance: no stream at all, so nothing paces
+/// it the way a frame or a packet does. `-rows-in`'s whole file is read
+/// first, then `process` is called once with every row, then `finish` -
+/// there is no batching to choose, since a rows module is handed no
+/// producer to batch against.
+fn run_rows_module(
+    args: &Args,
+    module_path: &str,
+    params: &str,
+    rows_in: &InputPath,
+) -> Result<()> {
+    if args.annotations.input || args.annotations.output {
+        bail!(
+            "{module_path}: a rows module reads no stream and writes none, so -annotations has \
+             nothing to carry rows on"
+        );
+    }
+
+    let mut row_outputs: Vec<RowOutput> = Vec::new();
+    for output in &args.outputs {
+        match output.kind {
+            OutputKind::Rows => row_outputs.push(open_row_output(&output.path)?),
+            OutputKind::Null => {}
+            _ => bail!(
+                "{}: a rows module emits rows alone; its outputs are -f {ROWS_FORMAT} and -f null",
+                output.spelling
+            ),
+        }
+    }
+
+    let rows = read_ndjson_rows(open_input(rows_in)?)?;
+
+    let mut module = runtime::RowsModule::open(module_path, params)
+        .with_context(|| format!("opening module {module_path}"))?;
+    let mut emitted = module
+        .process(&rows)
+        .with_context(|| format!("{}: processing rows", module.name()))?;
+    emitted.extend(
+        module
+            .finish()
+            .with_context(|| format!("{}: finish", module.name()))?,
+    );
+
+    for writer in &mut row_outputs {
+        write_rows(writer, &emitted)?;
         writer.flush()?;
     }
     Ok(())
@@ -2002,6 +2108,14 @@ struct Description {
     /// convention `nn`/`http`/`udp` use, false for every module built before
     /// 0.13.0.
     source: bool,
+    /// Whether the module exports a rows module: no stream at all, rows in
+    /// and out of one call. False for every module built before 0.14.0.
+    rows_module: bool,
+    /// The schema of the row a rows module reads on `process`. `null` for a
+    /// module that is not one; present and possibly empty for one that is -
+    /// `rows_schema` above is what it emits, this is what it reads.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_rows_schema: Option<serde_json::Value>,
     /// How many streams the module reads at once: frames arrive one per pad,
     /// in pad order, at the same timestamp. Always present, and 1 for a module
     /// of a world before 0.9.0, for a per-frame one, and for one with no frame
@@ -2065,16 +2179,18 @@ fn describe_module(module_path: &str) -> Result<String> {
         .with_context(|| format!("describing {module_path}"))?;
     let has_source = ffrwd_wasm_runtime::runtime::exports_packet_source(module_path)
         .with_context(|| format!("describing {module_path}"))?;
+    let has_rows_module = ffrwd_wasm_runtime::runtime::exports_rows_module(module_path)
+        .with_context(|| format!("describing {module_path}"))?;
 
     let has_frames = has_filter || has_window;
-    if !has_frames && !has_values && !has_packet && !has_source {
+    if !has_frames && !has_values && !has_packet && !has_source && !has_rows_module {
         let exports = ffrwd_wasm_runtime::runtime::exports(module_path)?;
         if exports.is_empty() {
             bail!("{module_path} exports nothing, so no describe is possible");
         }
         bail!(
-            "{module_path} exports neither a filter, a packet sink, a packet source, nor value \
-             functions; it exports {}",
+            "{module_path} exports neither a filter, a packet sink, a packet source, a rows \
+             module, nor value functions; it exports {}",
             exports.join(", ")
         );
     }
@@ -2091,6 +2207,22 @@ fn describe_module(module_path: &str) -> Result<String> {
                 "a frame interface"
             } else {
                 "a packet sink"
+            }
+        );
+    }
+    // A rows module carries no stream at all - `values` is the one interface
+    // every other kind may also export, so it is the one thing a rows module
+    // may share, the way `fauxlate` does.
+    if has_rows_module && (has_frames || has_packet || has_source) {
+        bail!(
+            "{module_path} exports a rows module alongside {}; a module reading a stream and \
+             a module reading none are one or the other",
+            if has_frames {
+                "a frame interface"
+            } else if has_packet {
+                "a packet sink"
+            } else {
+                "a packet source"
             }
         );
     }
@@ -2117,6 +2249,8 @@ fn describe_module(module_path: &str) -> Result<String> {
         video_streams: None,
         audio_streams: None,
         source: false,
+        rows_module: false,
+        input_rows_schema: None,
         inputs: 1,
         nn: ffrwd_wasm_runtime::runtime::imports_wasi_nn(module_path)
             .with_context(|| format!("describing {module_path}"))?,
@@ -2198,6 +2332,27 @@ fn describe_module(module_path: &str) -> Result<String> {
         description.version = Some(meta.version);
         description.name = Some(meta.name);
         description.source = true;
+    }
+
+    if has_rows_module {
+        let described = ffrwd_wasm_runtime::runtime::describe_rows_module(module_path)
+            .with_context(|| format!("describing {module_path}"))?;
+        let meta = described.meta;
+        description.params_schema = Some(parse_schema(
+            &meta.params_schema,
+            &meta.name,
+            "params_schema",
+        )?);
+        description.rows_schema = Some(parse_schema(&meta.rows_schema, &meta.name, "rows_schema")?);
+        description.input_rows_schema = Some(parse_schema(
+            &described.input_rows_schema,
+            &meta.name,
+            "input_rows_schema",
+        )?);
+        description.rows_language = meta.rows_language;
+        description.version = Some(meta.version);
+        description.name = Some(meta.name);
+        description.rows_module = true;
     }
 
     if has_values {

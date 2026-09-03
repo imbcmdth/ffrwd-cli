@@ -308,7 +308,7 @@ fn describe_reports_the_packet_source() {
     let stdout = String::from_utf8(run.stdout).expect("describe prints UTF-8");
     let description: serde_json::Value =
         serde_json::from_str(stdout.trim()).expect("describe prints one JSON object");
-    assert_eq!(description["world"], "ffrwd:av@0.13.0");
+    assert_eq!(description["world"], "ffrwd:av@0.14.0");
     assert_eq!(description["name"], "source_replay");
     assert_eq!(description["source"], true);
     // No frame interface and no packet-sink export alongside it.

@@ -36,6 +36,10 @@
 //! same 0.13.0 world adds `packet-source`, the mirror of a packet sink with
 //! no input pads: no frame or packet pushes it, so it is driven by a pull
 //! loop instead. It is hosted by [`PacketSource`], beside [`PacketSink`].
+//!
+//! 0.14.0 adds `rows-module`: no stream at all, JSON rows in and out of one
+//! call. It shares nothing with the windowed or packet interfaces, so it is
+//! hosted by [`RowsModule`] on its own, the way [`PacketSource`] is.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -56,16 +60,16 @@ use crate::nn;
 /// world is recognised without consulting the older ones. The current world is
 /// `wit/`; each older one is kept whole under `worlds/<version>/`.
 pub const WORLDS: &[&str] = &[
-    "0.13.0", "0.12.0", "0.11.0", "0.10.0", "0.9.0", "0.8.0", "0.7.0", "0.6.0", "0.5.0", "0.4.0",
-    "0.3.0", "0.2.0",
+    "0.14.0", "0.13.0", "0.12.0", "0.11.0", "0.10.0", "0.9.0", "0.8.0", "0.7.0", "0.6.0", "0.5.0",
+    "0.4.0", "0.3.0", "0.2.0",
 ];
 
 /// The world new modules target, and the one every older world is adapted to.
-pub const WORLD: &str = "0.13.0";
+pub const WORLD: &str = "0.14.0";
 
 /// The wit package a module targets, spelled as it appears in a module
 /// description.
-pub const WORLD_PACKAGE: &str = "ffrwd:av@0.13.0";
+pub const WORLD_PACKAGE: &str = "ffrwd:av@0.14.0";
 
 /// The component export name an interface carries in a given world.
 fn interface(name: &str, world: &str) -> String {
@@ -230,7 +234,7 @@ mod world_0120 {
     }
 }
 
-mod world_0130 {
+mod world_0140 {
     stream_info_with_time_base!();
     meta_with_rows_language!();
 
@@ -285,6 +289,103 @@ mod world_0130 {
             path: "../wit",
             world: "meta-module",
             with: {
+                "ffrwd:av/types": crate::runtime::world_0140::video::ffrwd::av::types,
+                "ffrwd:av/filter": crate::runtime::world_0140::video::exports::ffrwd::av::filter,
+            },
+        });
+    }
+    pub mod window {
+        wasmtime::component::bindgen!({
+            path: "../wit",
+            world: "window-module",
+            with: {
+                "ffrwd:av/types": crate::runtime::world_0140::video::ffrwd::av::types,
+                "ffrwd:av/window-source.in-window": crate::runtime::BorrowedWindow,
+            },
+            imports: { default: trappable },
+        });
+    }
+    pub mod packet {
+        wasmtime::component::bindgen!({
+            path: "../wit",
+            world: "packet-sink-module",
+            with: { "ffrwd:av/types": crate::runtime::world_0140::video::ffrwd::av::types },
+        });
+    }
+    pub mod packet_source {
+        wasmtime::component::bindgen!({
+            path: "../wit",
+            world: "packet-source-module",
+            with: { "ffrwd:av/types": crate::runtime::world_0140::video::ffrwd::av::types },
+        });
+    }
+    pub mod values {
+        wasmtime::component::bindgen!({ path: "../wit", world: "values-module" });
+    }
+    pub mod rows {
+        wasmtime::component::bindgen!({
+            path: "../wit",
+            world: "rows-module-host",
+            with: { "ffrwd:av/types": crate::runtime::world_0140::video::ffrwd::av::types },
+        });
+    }
+}
+
+mod world_0130 {
+    stream_info_with_time_base!();
+    meta_with_rows_language!();
+
+    /// What this world's `init` is handed, from the host's own format. The
+    /// only world whose records carry colorimetry and channel layout, so it
+    /// converts by hand where the older ones share a macro.
+    pub fn format(format: &crate::runtime::Format) -> video::ffrwd::av::types::Format {
+        use video::ffrwd::av::types::{AudioFormat, Format, VideoFormat};
+        match format.media {
+            crate::runtime::Media::Video(video) => Format::Video(VideoFormat {
+                width: video.width,
+                height: video.height,
+                pix_fmt: video.pix_fmt.to_string(),
+                color: video.color.map(color_info),
+            }),
+            crate::runtime::Media::Audio(audio) => Format::Audio(AudioFormat {
+                sample_rate: audio.sample_rate,
+                channels: audio.channels,
+                sample_fmt: audio.sample_fmt.to_string(),
+                channel_layout: audio.channel_layout.map(str::to_string),
+            }),
+        }
+    }
+
+    /// The host's colorimetry in this world's spelling.
+    pub fn color_info(color: crate::runtime::ColorInfo) -> video::ffrwd::av::types::ColorInfo {
+        video::ffrwd::av::types::ColorInfo {
+            range: color.range.to_string(),
+            primaries: color.primaries.to_string(),
+            trc: color.trc.to_string(),
+            space: color.space.to_string(),
+        }
+    }
+
+    /// The host's rendition metadata in this world's spelling.
+    pub fn rendition_meta(
+        rendition: crate::runtime::RenditionMeta,
+    ) -> video::ffrwd::av::types::RenditionMeta {
+        video::ffrwd::av::types::RenditionMeta {
+            name: rendition.name,
+            bandwidth: rendition.bandwidth,
+            codecs: rendition.codecs,
+            language: rendition.language,
+        }
+    }
+
+    pub mod video {
+        wasmtime::component::bindgen!({ path: "../worlds/0.13.0", world: "video-module" });
+    }
+    pub mod meta {
+        wasmtime::component::bindgen!({
+            path: "../worlds/0.13.0",
+            world: "meta-module",
+            with: {
                 "ffrwd:av/types": crate::runtime::world_0130::video::ffrwd::av::types,
                 "ffrwd:av/filter": crate::runtime::world_0130::video::exports::ffrwd::av::filter,
             },
@@ -292,7 +393,7 @@ mod world_0130 {
     }
     pub mod window {
         wasmtime::component::bindgen!({
-            path: "../wit",
+            path: "../worlds/0.13.0",
             world: "window-module",
             with: {
                 "ffrwd:av/types": crate::runtime::world_0130::video::ffrwd::av::types,
@@ -303,20 +404,20 @@ mod world_0130 {
     }
     pub mod packet {
         wasmtime::component::bindgen!({
-            path: "../wit",
+            path: "../worlds/0.13.0",
             world: "packet-sink-module",
             with: { "ffrwd:av/types": crate::runtime::world_0130::video::ffrwd::av::types },
         });
     }
     pub mod packet_source {
         wasmtime::component::bindgen!({
-            path: "../wit",
+            path: "../worlds/0.13.0",
             world: "packet-source-module",
             with: { "ffrwd:av/types": crate::runtime::world_0130::video::ffrwd::av::types },
         });
     }
     pub mod values {
-        wasmtime::component::bindgen!({ path: "../wit", world: "values-module" });
+        wasmtime::component::bindgen!({ path: "../worlds/0.13.0", world: "values-module" });
     }
 }
 
@@ -1190,6 +1291,7 @@ macro_rules! window_source_host {
     };
 }
 
+window_source_host!(world_0140);
 window_source_host!(world_0130);
 window_source_host!(world_0120);
 window_source_host!(world_0110);
@@ -1320,6 +1422,11 @@ fn link(
     // The borrowed window a windowed `process` reads through, one entry per
     // world that has one: a module imports the version it was built against,
     // and the others sit unused.
+    world_0140::window::ffrwd::av::window_source::add_to_linker::<_, HasSelf<_>>(
+        &mut linker,
+        |host: &mut Host| host,
+    )
+    .map_err(wasm_err)?;
     world_0130::window::ffrwd::av::window_source::add_to_linker::<_, HasSelf<_>>(
         &mut linker,
         |host: &mut Host| host,
@@ -1747,6 +1854,7 @@ macro_rules! meta_adapter {
     };
 }
 
+video_adapter!(Video0140, world_0140, "0.14.0");
 video_adapter!(Video0130, world_0130, "0.13.0");
 video_adapter!(Video0120, world_0120, "0.12.0");
 video_adapter!(Video0110, world_0110, "0.11.0");
@@ -1760,6 +1868,7 @@ video_adapter!(Video040, world_040, "0.4.0");
 video_adapter!(Video030, world_030, "0.3.0");
 video_adapter!(Video020, world_020, "0.2.0");
 
+meta_adapter!(Meta0140, world_0140, "0.14.0");
 meta_adapter!(Meta0130, world_0130, "0.13.0");
 meta_adapter!(Meta0120, world_0120, "0.12.0");
 meta_adapter!(Meta0110, world_0110, "0.11.0");
@@ -2001,6 +2110,7 @@ macro_rules! borrowed_window_adapter {
     };
 }
 
+borrowed_window_adapter!(Window0140, world_0140, resolve_0140, "0.14.0");
 borrowed_window_adapter!(Window0130, world_0130, resolve_0130, "0.13.0");
 borrowed_window_adapter!(Window0120, world_0120, resolve_0120, "0.12.0");
 borrowed_window_adapter!(Window0110, world_0110, resolve_0110, "0.11.0");
@@ -2248,6 +2358,7 @@ macro_rules! resolve_frames {
     };
 }
 
+resolve_frames!(resolve_0140, world_0140);
 resolve_frames!(resolve_0130, world_0130);
 resolve_frames!(resolve_0120, world_0120);
 resolve_frames!(resolve_0110, world_0110);
@@ -2319,7 +2430,13 @@ fn instantiate(module_path: &str, purpose: Purpose) -> Result<Opened> {
     // current one never goes through an adapter.
     let context = || format!("instantiating {module_path}");
     let instance: Box<dyn Adapter> =
-        if has_export(&component, &interface("window-filter", "0.13.0")) {
+        if has_export(&component, &interface("window-filter", "0.14.0")) {
+            Box::new(Window0140(
+                world_0140::window::WindowModule::instantiate(&mut store, &component, &linker)
+                    .map_err(wasm_err)
+                    .with_context(context)?,
+            ))
+        } else if has_export(&component, &interface("window-filter", "0.13.0")) {
             Box::new(Window0130(
                 world_0130::window::WindowModule::instantiate(&mut store, &component, &linker)
                     .map_err(wasm_err)
@@ -2370,6 +2487,12 @@ fn instantiate(module_path: &str, purpose: Purpose) -> Result<Opened> {
         } else if has_export(&component, &interface("window-filter", "0.5.0")) {
             Box::new(Window050(
                 world_050::window::WindowModule::instantiate(&mut store, &component, &linker)
+                    .map_err(wasm_err)
+                    .with_context(context)?,
+            ))
+        } else if has_export(&component, &interface("meta-filter", "0.14.0")) {
+            Box::new(Meta0140(
+                world_0140::meta::MetaModule::instantiate(&mut store, &component, &linker)
                     .map_err(wasm_err)
                     .with_context(context)?,
             ))
@@ -2430,6 +2553,12 @@ fn instantiate(module_path: &str, purpose: Purpose) -> Result<Opened> {
         } else if has_export(&component, &interface("meta-filter", "0.4.0")) {
             Box::new(Meta040(
                 world_040::meta::MetaModule::instantiate(&mut store, &component, &linker)
+                    .map_err(wasm_err)
+                    .with_context(context)?,
+            ))
+        } else if has_export(&component, &interface("filter", "0.14.0")) {
+            Box::new(Video0140(
+                world_0140::video::VideoModule::instantiate(&mut store, &component, &linker)
                     .map_err(wasm_err)
                     .with_context(context)?,
             ))
@@ -2560,6 +2689,7 @@ pub fn describe(module_path: &str) -> Result<Described> {
 
 /// One instantiated values module, in whichever world it was built against.
 enum ValuesInstance {
+    W0140(world_0140::values::ValuesModule),
     W0130(world_0130::values::ValuesModule),
     W0120(world_0120::values::ValuesModule),
     W0110(world_0110::values::ValuesModule),
@@ -2592,6 +2722,7 @@ impl ValuesInstance {
             };
         }
         Ok(match self {
+            ValuesInstance::W0140(b) => listed!(b),
             ValuesInstance::W0130(b) => listed!(b),
             ValuesInstance::W0120(b) => listed!(b),
             ValuesInstance::W0110(b) => listed!(b),
@@ -2613,6 +2744,7 @@ impl ValuesInstance {
         args: &str,
     ) -> Result<Result<String, String>> {
         match self {
+            ValuesInstance::W0140(b) => b.ffrwd_av_values().call_invoke(store, name, args),
             ValuesInstance::W0130(b) => b.ffrwd_av_values().call_invoke(store, name, args),
             ValuesInstance::W0120(b) => b.ffrwd_av_values().call_invoke(store, name, args),
             ValuesInstance::W0110(b) => b.ffrwd_av_values().call_invoke(store, name, args),
@@ -2654,7 +2786,13 @@ fn instantiate_values(
     );
 
     let context = || format!("instantiating {module_path}");
-    let instance = if has_export(&component, &interface("values", "0.13.0")) {
+    let instance = if has_export(&component, &interface("values", "0.14.0")) {
+        ValuesInstance::W0140(
+            world_0140::values::ValuesModule::instantiate(&mut store, &component, &linker)
+                .map_err(wasm_err)
+                .with_context(context)?,
+        )
+    } else if has_export(&component, &interface("values", "0.13.0")) {
         ValuesInstance::W0130(
             world_0130::values::ValuesModule::instantiate(&mut store, &component, &linker)
                 .map_err(wasm_err)
@@ -2772,6 +2910,7 @@ fn check_packet_export(component: &Component, module_path: &str) -> Result<()> {
 /// 0.13.0 each pad's `input-stream` also carries its relation row and
 /// rendition.
 enum PacketInstance {
+    W0140(world_0140::packet::PacketSinkModule),
     W0130(world_0130::packet::PacketSinkModule),
     W0120(world_0120::packet::PacketSinkModule),
     W0110(world_0110::packet::PacketModule),
@@ -2827,6 +2966,7 @@ impl PacketInstance {
             }};
         }
         Ok(match self {
+            PacketInstance::W0140(b) => several_streams!(b, world_0140, "0.14.0"),
             PacketInstance::W0130(b) => several_streams!(b, world_0130, "0.13.0"),
             PacketInstance::W0120(b) => several_streams!(b, world_0120, "0.12.0"),
             PacketInstance::W0110(b) => one_video_stream!(b, world_0110, "0.11.0"),
@@ -2923,6 +3063,19 @@ impl PacketInstance {
             }};
         }
         match self {
+            PacketInstance::W0140(b) => several_streams!(
+                b,
+                world_0140,
+                world_0140::video::ffrwd::av::types,
+                |coded, info, row, rendition| {
+                    world_0140::packet::exports::ffrwd::av::packet_sink::InputStream {
+                        coded,
+                        info,
+                        row,
+                        rendition: world_0140::rendition_meta(rendition),
+                    }
+                }
+            ),
             PacketInstance::W0130(b) => several_streams!(
                 b,
                 world_0130,
@@ -2954,6 +3107,7 @@ impl PacketInstance {
 
     fn set_params(&self, store: &mut Store<Host>, params: &str) -> Result<Result<(), String>> {
         match self {
+            PacketInstance::W0140(b) => b.ffrwd_av_packet_sink().call_set_params(store, params),
             PacketInstance::W0130(b) => b.ffrwd_av_packet_sink().call_set_params(store, params),
             PacketInstance::W0120(b) => b.ffrwd_av_packet_sink().call_set_params(store, params),
             PacketInstance::W0110(b) => b.ffrwd_av_packet_sink().call_set_params(store, params),
@@ -3022,6 +3176,9 @@ impl PacketInstance {
             }};
         }
         Ok(match self {
+            PacketInstance::W0140(b) => {
+                several_pads!(b, world_0140, world_0140::video::ffrwd::av::types)
+            }
             PacketInstance::W0130(b) => {
                 several_pads!(b, world_0130, world_0130::video::ffrwd::av::types)
             }
@@ -3063,7 +3220,13 @@ fn instantiate_packet(
         },
     );
     let context = || format!("instantiating {module_path}");
-    let instance = if has_export(&component, &interface("packet-sink", "0.13.0")) {
+    let instance = if has_export(&component, &interface("packet-sink", "0.14.0")) {
+        PacketInstance::W0140(
+            world_0140::packet::PacketSinkModule::instantiate(&mut store, &component, &linker)
+                .map_err(wasm_err)
+                .with_context(context)?,
+        )
+    } else if has_export(&component, &interface("packet-sink", "0.13.0")) {
         PacketInstance::W0130(
             world_0130::packet::PacketSinkModule::instantiate(&mut store, &component, &linker)
                 .map_err(wasm_err)
@@ -3276,7 +3439,7 @@ pub struct DescribedPacketSource {
 /// A wit `rational` read back off a module's own output, where the host's
 /// `TimeBase` is what everything downstream of a source expects.
 fn time_base_from_rational(
-    r: world_0130::video::ffrwd::av::types::Rational,
+    r: world_0140::video::ffrwd::av::types::Rational,
     name: &str,
 ) -> Result<TimeBase> {
     let num = u64::try_from(r.num).ok();
@@ -3349,7 +3512,7 @@ const COLOR_SPACES: &[&str] = &[
     "ictcp",
 ];
 
-fn color_info_from_wit(c: world_0130::video::ffrwd::av::types::ColorInfo) -> ColorInfo {
+fn color_info_from_wit(c: world_0140::video::ffrwd::av::types::ColorInfo) -> ColorInfo {
     ColorInfo {
         range: intern_known(&c.range, COLOR_RANGES),
         primaries: intern_known(&c.primaries, COLOR_PRIMARIES),
@@ -3358,8 +3521,8 @@ fn color_info_from_wit(c: world_0130::video::ffrwd::av::types::ColorInfo) -> Col
     }
 }
 
-fn coded_format_from_wit(f: world_0130::video::ffrwd::av::types::CodedFormat) -> CodedFormat {
-    use world_0130::video::ffrwd::av::types::CodedFormat as Wit;
+fn coded_format_from_wit(f: world_0140::video::ffrwd::av::types::CodedFormat) -> CodedFormat {
+    use world_0140::video::ffrwd::av::types::CodedFormat as Wit;
     match f {
         Wit::Video(v) => CodedFormat::Video {
             width: v.width,
@@ -3379,7 +3542,7 @@ fn coded_format_from_wit(f: world_0130::video::ffrwd::av::types::CodedFormat) ->
 }
 
 fn coded_stream_from_wit(
-    coded: world_0130::video::ffrwd::av::types::CodedStream,
+    coded: world_0140::video::ffrwd::av::types::CodedStream,
     name: &str,
 ) -> Result<CodedStream> {
     Ok(CodedStream {
@@ -3392,7 +3555,7 @@ fn coded_stream_from_wit(
     })
 }
 
-fn stream_info_from_wit(info: world_0130::video::ffrwd::av::types::StreamInfo) -> StreamInfo {
+fn stream_info_from_wit(info: world_0140::video::ffrwd::av::types::StreamInfo) -> StreamInfo {
     StreamInfo {
         index: info.index,
         kind: info.kind,
@@ -3402,7 +3565,7 @@ fn stream_info_from_wit(info: world_0130::video::ffrwd::av::types::StreamInfo) -
     }
 }
 
-fn rendition_from_wit(r: world_0130::video::ffrwd::av::types::RenditionMeta) -> RenditionMeta {
+fn rendition_from_wit(r: world_0140::video::ffrwd::av::types::RenditionMeta) -> RenditionMeta {
     RenditionMeta {
         name: r.name,
         bandwidth: r.bandwidth,
@@ -3412,7 +3575,7 @@ fn rendition_from_wit(r: world_0130::video::ffrwd::av::types::RenditionMeta) -> 
 }
 
 fn source_track_from_wit(
-    t: world_0130::packet_source::exports::ffrwd::av::packet_source::SourceTrack,
+    t: world_0140::packet_source::exports::ffrwd::av::packet_source::SourceTrack,
     name: &str,
 ) -> Result<SourceTrack> {
     Ok(SourceTrack {
@@ -3424,7 +3587,7 @@ fn source_track_from_wit(
 }
 
 fn catalog_from_wit(
-    c: world_0130::packet_source::exports::ffrwd::av::packet_source::Catalog,
+    c: world_0140::packet_source::exports::ffrwd::av::packet_source::Catalog,
     name: &str,
 ) -> Result<Catalog> {
     Ok(Catalog {
@@ -3468,7 +3631,7 @@ fn check_packet_source_export(component: &Component, module_path: &str) -> Resul
 fn instantiate_packet_source(
     module_path: &str,
     purpose: Purpose,
-) -> Result<(Store<Host>, world_0130::packet_source::PacketSourceModule)> {
+) -> Result<(Store<Host>, world_0140::packet_source::PacketSourceModule)> {
     let component = compile(module_path)?;
     check_packet_source_export(&component, module_path)?;
 
@@ -3488,7 +3651,7 @@ fn instantiate_packet_source(
     );
     let context = || format!("instantiating {module_path}");
     let instance =
-        world_0130::packet_source::PacketSourceModule::instantiate(&mut store, &component, &linker)
+        world_0140::packet_source::PacketSourceModule::instantiate(&mut store, &component, &linker)
             .map_err(wasm_err)
             .with_context(context)?;
     Ok((store, instance))
@@ -3503,8 +3666,8 @@ pub fn describe_packet_source(module_path: &str) -> Result<DescribedPacketSource
         .call_describe(&mut store)
         .map_err(wasm_err)?;
     Ok(DescribedPacketSource {
-        meta: world_0130::meta(meta),
-        world: "0.13.0",
+        meta: world_0140::meta(meta),
+        world: "0.14.0",
     })
 }
 
@@ -3513,7 +3676,7 @@ pub fn describe_packet_source(module_path: &str) -> Result<DescribedPacketSource
 /// `PacketSink`'s push. Single-threaded by contract, like [`PacketSink`].
 pub struct PacketSource {
     store: Store<Host>,
-    instance: world_0130::packet_source::PacketSourceModule,
+    instance: world_0140::packet_source::PacketSourceModule,
     meta: Meta,
     /// How many tracks this source was opened with; every `next` answers
     /// that many pads or none.
@@ -3561,7 +3724,7 @@ impl PacketSource {
         let source = PacketSource {
             store,
             instance,
-            meta: world_0130::meta(meta),
+            meta: world_0140::meta(meta),
             tracks: catalog.tracks.len(),
             finished: false,
         };
@@ -3631,6 +3794,161 @@ impl PacketSource {
                 })
                 .collect(),
         ))
+    }
+}
+
+/// What a rows module publishes: `meta`, plus the schema of the row it reads
+/// on `process`. `meta`'s own `rows-schema` is what it emits.
+#[derive(Debug, Clone)]
+pub struct DescribedRowsModule {
+    pub meta: Meta,
+    pub input_rows_schema: String,
+}
+
+/// Whether the component at `module_path` exports the rows-module interface:
+/// no stream at all, JSON rows in and out of one call. The interface arrived
+/// in 0.14.0, so no earlier world answers.
+pub fn exports_rows_module(module_path: &str) -> Result<bool> {
+    let component = compile(module_path)?;
+    Ok(world_exporting(&component, "rows-module").is_some())
+}
+
+/// Errors naming the component's actual exports when the rows-module
+/// interface is missing from every world.
+fn check_rows_module_export(component: &Component, module_path: &str) -> Result<()> {
+    if world_exporting(component, "rows-module").is_some() {
+        return Ok(());
+    }
+    let wanted = interface("rows-module", WORLD);
+    let exports = component_exports(component);
+    if exports.is_empty() {
+        bail!("{module_path} exports nothing, so not {wanted}");
+    }
+    bail!(
+        "{module_path} does not export {wanted}; it exports {}",
+        exports.join(", ")
+    );
+}
+
+/// Compiles and instantiates the component at `module_path` against the
+/// rows-module world. Shared by `describe_rows_module` and `RowsModule::open`.
+fn instantiate_rows_module(
+    module_path: &str,
+    purpose: Purpose,
+) -> Result<(Store<Host>, world_0140::rows::RowsModuleHost)> {
+    let component = compile(module_path)?;
+    check_rows_module_export(&component, module_path)?;
+
+    let (linker, nn) = link(&component, module_path, purpose)?;
+
+    let policy = egress::net_policy()?;
+    let wasi = wasi_ctx(granted(module_path)?, policy);
+    let mut store = Store::new(
+        engine(),
+        Host {
+            wasi,
+            table: ResourceTable::new(),
+            nn,
+            http: WasiHttpCtx::new(),
+            hooks: egress::Hooks::new(policy),
+        },
+    );
+    let context = || format!("instantiating {module_path}");
+    let instance = world_0140::rows::RowsModuleHost::instantiate(&mut store, &component, &linker)
+        .map_err(wasm_err)
+        .with_context(context)?;
+    Ok((store, instance))
+}
+
+/// Compiles and instantiates the component at `module_path` far enough to
+/// call the rows module's `describe()`, without `init`-ing it.
+pub fn describe_rows_module(module_path: &str) -> Result<DescribedRowsModule> {
+    let (mut store, instance) = instantiate_rows_module(module_path, Purpose::Describe)?;
+    let d = instance
+        .ffrwd_av_rows_module()
+        .call_describe(&mut store)
+        .map_err(wasm_err)?;
+    Ok(DescribedRowsModule {
+        meta: world_0140::meta(d.meta),
+        input_rows_schema: d.input_rows_schema,
+    })
+}
+
+/// One instantiated rows module: no stream at all, JSON rows in and out of
+/// one call. Single-threaded by contract, like [`PacketSink`].
+pub struct RowsModule {
+    store: Store<Host>,
+    instance: world_0140::rows::RowsModuleHost,
+    meta: Meta,
+    /// Whether `finish` has been called, which may happen once and only
+    /// after the last `process`.
+    finished: bool,
+}
+
+impl RowsModule {
+    /// Compiles (cached process-wide by path), instantiates and `init`s the
+    /// component at `module_path`.
+    pub fn open(module_path: &str, params: &str) -> Result<RowsModule> {
+        let (mut store, instance) = instantiate_rows_module(module_path, Purpose::Run)?;
+        let d = instance
+            .ffrwd_av_rows_module()
+            .call_describe(&mut store)
+            .map_err(wasm_err)?;
+        let meta = world_0140::meta(d.meta);
+        instance
+            .ffrwd_av_rows_module()
+            .call_init(&mut store, params)
+            .map_err(wasm_err)?
+            .map_err(|e| anyhow!("{} rejected params: {e}", meta.name))?;
+        Ok(RowsModule {
+            store,
+            instance,
+            meta,
+            finished: false,
+        })
+    }
+
+    /// The module's `describe()`, read once at open.
+    pub fn meta(&self) -> &Meta {
+        &self.meta
+    }
+
+    /// Module name from `describe()`, for error messages.
+    pub fn name(&self) -> &str {
+        &self.meta.name
+    }
+
+    /// JSON rows in, JSON rows out. May be called any number of times before
+    /// `finish`.
+    pub fn process(&mut self, rows: &[String]) -> Result<Vec<String>> {
+        if self.finished {
+            bail!(
+                "{}: process called after finish, which is the last call",
+                self.meta.name
+            );
+        }
+        self.instance
+            .ffrwd_av_rows_module()
+            .call_process(&mut self.store, rows)
+            .map_err(wasm_err)?
+            .map_err(|e| anyhow!("{}: {e}", self.meta.name))
+    }
+
+    /// Whatever the module held back across every `process` call. Called
+    /// once, after the last `process`.
+    pub fn finish(&mut self) -> Result<Vec<String>> {
+        if self.finished {
+            bail!(
+                "{}: finish called again, which happens once",
+                self.meta.name
+            );
+        }
+        self.finished = true;
+        self.instance
+            .ffrwd_av_rows_module()
+            .call_finish(&mut self.store)
+            .map_err(wasm_err)?
+            .map_err(|e| anyhow!("{}: {e}", self.meta.name))
     }
 }
 

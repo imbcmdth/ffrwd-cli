@@ -1,4 +1,4 @@
-package ffrwd:av@0.14.0;
+package ffrwd:av@0.13.0;
 
 interface types {
   /// Static description of a module, available without running anything.
@@ -524,44 +524,9 @@ interface values {
   invoke: func(name: string, args: string) -> result<string, string>;
 }
 
-/// Rows in, rows out, with no stream at all: every other module either reads
-/// or writes frames or packets and carries rows beside them, but a module
-/// exporting this interface has nothing beside - JSON objects are its whole
-/// input and its whole output.
-interface rows-module {
-  use types.{meta};
-
-  /// `meta`, plus the schema of the row this module reads. `meta`'s own
-  /// `rows-schema` already means "what this module emits" for every other
-  /// interface, so the schema it consumes belongs beside `meta` rather than
-  /// inside it - the way `packet-sink-meta` adds sink-only fields beside the
-  /// shared record instead of widening it for every module.
-  record rows-module-meta {
-    meta: meta,
-    /// JSON Schema for one row object `process` reads. Empty when the module
-    /// reads no shape in particular.
-    input-rows-schema: string,
-  }
-
-  describe: func() -> rows-module-meta;
-
-  init: func(params: string) -> result<_, string>;
-
-  /// JSON rows in, JSON rows out, in one call: no stream carries them, so
-  /// nothing else drives this module. A call may answer zero rows for an
-  /// input row, or several - a filter that drops some, or a module that
-  /// splits one row into several.
-  process: func(rows: list<string>) -> result<list<string>, string>;
-
-  /// Whatever the module held back across every `process` call. Called once,
-  /// after the last `process`.
-  finish: func() -> result<list<string>, string>;
-}
-
 world video-module  { export filter; }
 world meta-module   { export filter; export meta-filter; }
 world window-module { import window-source; export window-filter; }
 world packet-sink-module { export packet-sink; }
 world packet-source-module { export packet-source; }
 world values-module { export values; }
-world rows-module-host { export rows-module; }
