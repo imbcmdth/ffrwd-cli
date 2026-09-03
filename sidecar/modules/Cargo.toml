@@ -30,6 +30,7 @@ members = [
     "frame-stats",
     "packet-stats",
     "packet-tally",
+    "source-replay",
     "post-rows",
     "broken-audio",
     "adapted-020",

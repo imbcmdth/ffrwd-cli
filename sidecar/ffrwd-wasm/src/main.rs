@@ -322,6 +322,9 @@ struct Annotations {
 
 struct Args {
     inputs: Vec<InputPath>,
+    /// One slot per input, in the same order: what the `-pad` that followed
+    /// its `-i` said, or None where there was no `-pad`.
+    pads: Vec<Option<PadSpec>>,
     modules: Modules,
     /// What `-stream_info` said, if it was given. Without it each input's own
     /// NUT header is what a module is told.
@@ -332,6 +335,29 @@ struct Args {
     /// machine's effective core count either way; the cap only lowers it,
     /// and `-jobs 1` is the serial escape hatch.
     jobs: Option<usize>,
+}
+
+/// `-pad`'s JSON, following one packet sink `-i`: which relation row this
+/// pad belongs to, and what the source read of it. Absent fields stay
+/// None - the same "nothing said" a pad with no `-pad` at all gets: row is
+/// its own index among the sink's inputs, and every rendition field is
+/// None.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+struct PadSpec {
+    row: Option<u32>,
+    #[serde(default)]
+    rendition: PadRendition,
+}
+
+/// `-pad`'s `rendition` object: a row's name, bitrate and codec string,
+/// exactly as the manifest or catalog said them. Mirrors
+/// `runtime::RenditionMeta`.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+struct PadRendition {
+    name: Option<String>,
+    bandwidth: Option<u64>,
+    codecs: Option<String>,
+    language: Option<String>,
 }
 
 #[derive(Clone)]
@@ -494,6 +520,7 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
 
     let mut format: Option<String> = None;
     let mut inputs: Vec<InputPath> = Vec::new();
+    let mut pads: Vec<Option<PadSpec>> = Vec::new();
     let mut modules: Vec<String> = Vec::new();
     let mut params: Option<String> = None;
     let mut wiring: Option<String> = None;
@@ -517,6 +544,17 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
                 let raw = next("-i")?;
                 require_edge_format(format.take(), "input")?;
                 inputs.push(resolve_input_path(&raw)?);
+                pads.push(None);
+            }
+            "-pad" => {
+                let raw = next("-pad")?;
+                let spec: PadSpec =
+                    serde_json::from_str(&raw).map_err(|e| anyhow!("-pad {raw}: {e}"))?;
+                match pads.last_mut() {
+                    Some(slot @ None) => *slot = Some(spec),
+                    Some(Some(_)) => bail!("second -pad for the same -i"),
+                    None => bail!("-pad with no -i before it: -pad follows the -i it names"),
+                }
             }
             "-m" => modules.push(next("-m")?),
             "-filter_complex" => {
@@ -592,9 +630,9 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
     if let Some(target) = pending_map {
         bail!("-map [{target}] names no output: an output path must follow it");
     }
-    if inputs.is_empty() {
-        bail!("no input specified (-i)");
-    }
+    // A packet source takes no -i input at all, so the ordinary "no input
+    // specified" refusal cannot be decided here - it needs to know whether
+    // the module is one, which means opening it; `run` decides it instead.
     if outputs.is_empty() {
         bail!("no output specified");
     }
@@ -614,6 +652,7 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
 
     Ok(Args {
         inputs,
+        pads,
         modules,
         stream_info,
         outputs,
@@ -649,9 +688,17 @@ fn build_modules(
             let target = output.target.as_deref().unwrap_or_default();
             bail!("-map [{target}] names a label of a network, and no -filter_complex wires one");
         }
-        check_one_output_per_format(outputs)?;
+        let path = modules.into_iter().next().expect("one module");
+        // A packet source writes one output per catalog track, so the
+        // one-output-per-format rule below - built for a filter's single
+        // stream - does not hold for it; every other module still gets it.
+        let is_source = ffrwd_wasm_runtime::runtime::exports_packet_source(&path)
+            .with_context(|| format!("opening module {path}"))?;
+        if !is_source {
+            check_one_output_per_format(outputs)?;
+        }
         return Ok(Modules::Single {
-            path: modules.into_iter().next().expect("one module"),
+            path,
             params: params.unwrap_or_default(),
         });
     };
@@ -1060,6 +1107,28 @@ fn stream_info(args: &Args, stream: &nut::Stream) -> StreamInfo {
 /// Reads every input's headers, then runs whatever this process hosts over
 /// their frames.
 fn run(args: &Args) -> Result<()> {
+    // A packet source rides alone, ahead of every other check: it produces
+    // its own packets and takes no -i input, so the "no input specified"
+    // refusal just below does not apply to it.
+    if let Modules::Single { path, params } = &args.modules {
+        let is_packet_source = ffrwd_wasm_runtime::runtime::exports_packet_source(path)
+            .with_context(|| format!("opening module {path}"))?;
+        if is_packet_source {
+            if !args.inputs.is_empty() {
+                bail!(
+                    "{path} is a packet source: it produces its own packets and reads no -i \
+                     input; this command gives it {}",
+                    args.inputs.len()
+                );
+            }
+            return run_packet_source(args, path, params);
+        }
+    }
+
+    if args.inputs.is_empty() {
+        bail!("no input specified (-i)");
+    }
+
     // A packet sink is dispatched before any header is read here: its
     // reader threads open the inputs themselves and drain them from the
     // first byte, so no producer ever waits on another producer's warmup
@@ -1070,6 +1139,12 @@ fn run(args: &Args) -> Result<()> {
         if is_packet_sink {
             return run_packet_sink(args, path, params);
         }
+    }
+
+    // -pad names a packet sink's row and rendition for one of its -i; every
+    // other module has neither to carry.
+    if args.pads.iter().any(Option::is_some) {
+        bail!("-pad follows a packet sink's -i; this module is not a packet sink");
     }
 
     // Headers are read concurrently: one producer's first bytes can wait on
@@ -1255,9 +1330,16 @@ fn run_packet_sink(args: &Args, module: &str, params: &str) -> Result<()> {
     let mut opened = Vec::with_capacity(pads);
     for (pad, stream) in streams.iter().enumerate() {
         let stream = stream.as_ref().expect("every pad reported");
-        opened.push(coded_pad(args, module, pad, stream)?);
+        let input = coded_pad(args, module, pad, stream)?;
+        let (row, rendition) = resolve_pad(&args.pads, pad);
+        opened.push(OpenedPad {
+            input,
+            row,
+            rendition,
+        });
     }
-    let mut sink = runtime::PacketSink::open(module, &opened, params)
+    let sink_inputs: Vec<runtime::SinkInput> = opened.iter().map(|o| o.input.clone()).collect();
+    let mut sink = runtime::PacketSink::open(module, &sink_inputs, params)
         .with_context(|| format!("opening module {module}"))?;
 
     let outcome = (|| -> Result<()> {
@@ -1581,6 +1663,242 @@ fn coded_pad(
     })
 }
 
+/// This pad's row and rendition, as `-pad` said them, or the defaults a pad
+/// with none gets: its own index among the sink's inputs, and a rendition
+/// with every field None.
+fn resolve_pad(pads: &[Option<PadSpec>], pad: usize) -> (u32, PadRendition) {
+    match pads.get(pad).and_then(Option::as_ref) {
+        Some(spec) => (spec.row.unwrap_or(pad as u32), spec.rendition.clone()),
+        None => (pad as u32, PadRendition::default()),
+    }
+}
+
+/// One pad opened for a packet sink: the `runtime::SinkInput` the current
+/// runtime crate accepts, plus the row and rendition `-pad` resolved for it.
+///
+/// `runtime::SinkInput` carries neither field yet, so they ride here unused
+/// for now rather than reaching the module: threading them into
+/// `input-stream.row`/`rendition` needs `SinkInput` to gain a `row: u32` and
+/// a `rendition: RenditionMeta` field, and `PacketInstance::init`'s
+/// `several_streams!` macro (runtime.rs, the `PacketInstance::W0130` arm) to
+/// read them instead of synthesizing `idx as u32` and an all-None
+/// `RenditionMeta` the way it does today. That is a runtime crate change
+/// this task's scope stops short of making.
+#[allow(dead_code)]
+struct OpenedPad {
+    input: runtime::SinkInput,
+    row: u32,
+    rendition: PadRendition,
+}
+
+/// The nut::Stream header for one packet-source track: the coded fourcc this
+/// wire has a tag for, the codec's own time base and extradata, and
+/// `decode_delay` as `run_packet_source`'s pull loop settled it.
+fn coded_stream_for(coded: &runtime::CodedStream, decode_delay: u64) -> Result<nut::Stream> {
+    let kind = coded.format.kind();
+    let fourcc = nut::fourcc_for_coded(kind, &coded.codec).ok_or_else(|| {
+        let names: Vec<&str> = match kind {
+            "video" => nut::CODED_VIDEO_FOURCCS
+                .iter()
+                .map(|(name, _)| *name)
+                .collect(),
+            _ => nut::CODED_AUDIO_FOURCCS
+                .iter()
+                .map(|(name, _)| *name)
+                .collect(),
+        };
+        anyhow!(
+            "{} is not a {kind} codec this wire carries; only {} are",
+            coded.codec,
+            names.join(", ")
+        )
+    })?;
+    let time_base = nut::TimeBase {
+        num: coded.time_base.num,
+        den: coded.time_base.den,
+    };
+    let max_pts_distance = time_base.den.div_ceil(time_base.num.max(1));
+    let media = match &coded.format {
+        runtime::CodedFormat::Video {
+            width,
+            height,
+            sample_aspect_ratio,
+            color,
+        } => {
+            let (sample_width, sample_height) = sample_aspect_ratio
+                .and_then(|(num, den)| (num > 0 && den > 0).then_some((num as u64, den as u64)))
+                .unwrap_or((1, 1));
+            nut::Media::Video {
+                width: *width,
+                height: *height,
+                sample_width,
+                sample_height,
+                colorspace_type: colorspace_type_for(color.as_ref()),
+            }
+        }
+        runtime::CodedFormat::Audio {
+            sample_rate,
+            channels,
+            ..
+        } => nut::Media::Audio {
+            sample_rate: *sample_rate,
+            channels: *channels,
+        },
+    };
+    Ok(nut::Stream {
+        fourcc: fourcc.to_vec(),
+        time_base,
+        msb_pts_shift: 14,
+        max_pts_distance,
+        decode_delay,
+        extradata: coded.extradata.clone(),
+        media,
+    })
+}
+
+/// The wire's colorspace code for `color`, or 0 (unknown) where there is
+/// none, or the wire has no matrix for it - the reverse of `color_from`.
+fn colorspace_type_for(color: Option<&runtime::ColorInfo>) -> u64 {
+    let Some(color) = color else { return 0 };
+    let space = match color.space {
+        "bt470bg" => 1,
+        "bt709" => 2,
+        _ => return 0,
+    };
+    space | if color.range == "pc" { 16 } else { 0 }
+}
+
+/// One packet through an already-open track output. `nut::Packet.dts` is not
+/// read by `write_coded`; the field only matters for `run_packet_source`'s
+/// own decode_delay bookkeeping before the output is open.
+fn write_coded_packet(muxer: &mut FrameOutput, packet: &runtime::Packet) -> Result<()> {
+    let framed = nut::Packet {
+        pts: packet.pts,
+        dts: packet.dts,
+        keyframe: packet.keyframe,
+    };
+    muxer.write_coded(&framed, &packet.data)
+}
+
+/// Opens one track's output now that its `decode_delay` has settled - see
+/// `run_packet_source` - and drains whatever was buffered waiting for it.
+fn settle_track(
+    decode_delay: u64,
+    track: &runtime::SourceTrack,
+    output: &OutputSpec,
+    pending: &mut Vec<runtime::Packet>,
+    slot: &mut Option<FrameOutput>,
+) -> Result<()> {
+    let stream = coded_stream_for(&track.stream, decode_delay)?;
+    let mut muxer = open_frame_output(&output.path, &stream, false)
+        .with_context(|| format!("opening output {}", output.spelling))?;
+    for packet in pending.drain(..) {
+        write_coded_packet(&mut muxer, &packet)?;
+    }
+    *slot = Some(muxer);
+    Ok(())
+}
+
+/// A packet source rides alone: no `-i`, one `-f nut` output per catalog
+/// track, in catalog order. Packets arrive in decode order already -
+/// `PacketSource::next`'s own contract - so nothing here reorders them; the
+/// only work is settling each track's `decode_delay` before its output's
+/// header is written, since the wit `coded-stream` a source publishes
+/// carries no such field.
+///
+/// `packet.dts` is `None` until the wire settles it, exactly the convention
+/// `nut::Packet.dts` uses for a stream this host demuxes (nut/mod.rs): so
+/// the count of a track's leading `None` packets IS its decode_delay. This
+/// buffers a track's packets until the first settled `dts` arrives, opens
+/// that track's output with the count it took, and flushes what was held.
+/// A track that never settles - every packet arrives `None` - opens once
+/// the source is done, declaring a reorder as deep as every packet it saw.
+///
+/// Rows are a sink's alone; a source emits none in this wave.
+fn run_packet_source(args: &Args, module: &str, params: &str) -> Result<()> {
+    if !args.inputs.is_empty() {
+        bail!(
+            "{module} is a packet source: it produces its own packets and reads no -i input; \
+             this command gives it {}",
+            args.inputs.len()
+        );
+    }
+    if args.annotations.input || args.annotations.output {
+        bail!(
+            "a packet source's outputs carry encoded packets, not frames, so -annotations has \
+             nothing to give or take here"
+        );
+    }
+    for output in &args.outputs {
+        if output.kind != OutputKind::Frames {
+            bail!(
+                "{}: a packet source writes every track as -f {EDGE_FORMAT}; -f {} is not that",
+                output.spelling,
+                output.kind.format()
+            );
+        }
+    }
+
+    let (mut source, catalog) = runtime::PacketSource::open(module, params)
+        .with_context(|| format!("opening module {module}"))?;
+
+    if args.outputs.len() != catalog.tracks.len() {
+        bail!(
+            "{module}'s catalog names {} track(s) and this command was given {} output(s)",
+            catalog.tracks.len(),
+            args.outputs.len()
+        );
+    }
+
+    let tracks = catalog.tracks.len();
+    let mut pending: Vec<Vec<runtime::Packet>> = (0..tracks).map(|_| Vec::new()).collect();
+    let mut muxers: Vec<Option<FrameOutput>> = (0..tracks).map(|_| None).collect();
+
+    while let Some(pads) = source
+        .next()
+        .with_context(|| format!("{}: pulling packets", source.name()))?
+    {
+        for (index, pad) in pads.into_iter().enumerate() {
+            for packet in pad.packets {
+                if let Some(muxer) = muxers[index].as_mut() {
+                    write_coded_packet(muxer, &packet)?;
+                    continue;
+                }
+                let settled = packet.dts.is_some();
+                pending[index].push(packet);
+                if settled {
+                    let decode_delay = (pending[index].len() - 1) as u64;
+                    settle_track(
+                        decode_delay,
+                        &catalog.tracks[index],
+                        &args.outputs[index],
+                        &mut pending[index],
+                        &mut muxers[index],
+                    )?;
+                }
+            }
+        }
+    }
+
+    for index in 0..tracks {
+        if muxers[index].is_none() {
+            let decode_delay = pending[index].len() as u64;
+            settle_track(
+                decode_delay,
+                &catalog.tracks[index],
+                &args.outputs[index],
+                &mut pending[index],
+                &mut muxers[index],
+            )?;
+        }
+    }
+
+    for muxer in muxers.iter_mut().flatten() {
+        muxer.finish()?;
+    }
+    Ok(())
+}
+
 /// `-annotations in` on a module that neither reads the rows nor passes them
 /// on would drop every one of them silently, so it is refused instead. A
 /// module that only carries them through is doing something with them, and is
@@ -1689,6 +2007,10 @@ struct Description {
     video_streams: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     audio_streams: Option<&'static str>,
+    /// Whether the module exports a packet source: the same boolean-flag
+    /// convention `nn`/`http`/`udp` use, false for every module built before
+    /// 0.13.0.
+    source: bool,
     /// How many streams the module reads at once: frames arrive one per pad,
     /// in pad order, at the same timestamp. Always present, and 1 for a module
     /// of a world before 0.9.0, for a per-frame one, and for one with no frame
@@ -1750,16 +2072,18 @@ fn describe_module(module_path: &str) -> Result<String> {
         .with_context(|| format!("describing {module_path}"))?;
     let has_packet = ffrwd_wasm_runtime::runtime::exports_packet_sink(module_path)
         .with_context(|| format!("describing {module_path}"))?;
+    let has_source = ffrwd_wasm_runtime::runtime::exports_packet_source(module_path)
+        .with_context(|| format!("describing {module_path}"))?;
 
     let has_frames = has_filter || has_window;
-    if !has_frames && !has_values && !has_packet {
+    if !has_frames && !has_values && !has_packet && !has_source {
         let exports = ffrwd_wasm_runtime::runtime::exports(module_path)?;
         if exports.is_empty() {
             bail!("{module_path} exports nothing, so no describe is possible");
         }
         bail!(
-            "{module_path} exports neither a filter, a packet sink, nor value functions; \
-             it exports {}",
+            "{module_path} exports neither a filter, a packet sink, a packet source, nor value \
+             functions; it exports {}",
             exports.join(", ")
         );
     }
@@ -1767,6 +2091,16 @@ fn describe_module(module_path: &str) -> Result<String> {
         bail!(
             "{module_path} exports both a packet sink and a frame interface; \
              a module is one or the other"
+        );
+    }
+    if has_source && (has_frames || has_packet) {
+        bail!(
+            "{module_path} exports a packet source alongside {}; a module is one or the other",
+            if has_frames {
+                "a frame interface"
+            } else {
+                "a packet sink"
+            }
         );
     }
 
@@ -1791,6 +2125,7 @@ fn describe_module(module_path: &str) -> Result<String> {
         audio_codecs: None,
         video_streams: None,
         audio_streams: None,
+        source: false,
         inputs: 1,
         nn: ffrwd_wasm_runtime::runtime::imports_wasi_nn(module_path)
             .with_context(|| format!("describing {module_path}"))?,
@@ -1854,6 +2189,26 @@ fn describe_module(module_path: &str) -> Result<String> {
         description.audio_streams = Some(streams_read(described.audio));
     }
 
+    if has_source {
+        let described = ffrwd_wasm_runtime::runtime::describe_packet_source(module_path)
+            .with_context(|| format!("describing {module_path}"))?;
+        let meta = described.meta;
+        description.params_schema = Some(parse_schema(
+            &meta.params_schema,
+            &meta.name,
+            "params_schema",
+        )?);
+        description.rows_schema = Some(parse_schema(&meta.rows_schema, &meta.name, "rows_schema")?);
+        description.pixel_formats = Some(meta.pixel_formats);
+        description.sample_formats = Some(meta.sample_formats);
+        description.sample_rates = Some(meta.sample_rates);
+        description.channel_counts = Some(meta.channel_counts);
+        description.rows_language = meta.rows_language;
+        description.version = Some(meta.version);
+        description.name = Some(meta.name);
+        description.source = true;
+    }
+
     if has_values {
         let functions = ffrwd_wasm_runtime::runtime::list_functions(module_path)
             .with_context(|| format!("listing functions in {module_path}"))?;
@@ -1872,6 +2227,130 @@ fn describe_module(module_path: &str) -> Result<String> {
     }
 
     serde_json::to_string(&description).context("serializing module description")
+}
+
+/// One byte of `bytes` as two lowercase hex digits, concatenated.
+fn to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A catalog track's geometry, tagged by kind - `probe`'s JSON names the
+/// variant `video` or `audio` and nests only the fields that kind declares.
+#[derive(Serialize)]
+#[serde(rename_all = "lowercase")]
+enum CatalogFormatJson {
+    Video { width: u32, height: u32 },
+    Audio { sample_rate: u32, channels: u32 },
+}
+
+#[derive(Serialize)]
+struct CatalogRenditionJson {
+    name: Option<String>,
+    bandwidth: Option<u64>,
+    codecs: Option<String>,
+    language: Option<String>,
+}
+
+#[derive(Serialize)]
+struct CatalogTrackJson {
+    codec: String,
+    time_base: [u64; 2],
+    format: CatalogFormatJson,
+    extradata: String,
+    profile: Option<i32>,
+    level: Option<i32>,
+    row: u32,
+    rendition: CatalogRenditionJson,
+}
+
+#[derive(Serialize)]
+struct CatalogJson {
+    tracks: Vec<CatalogTrackJson>,
+    bounded: bool,
+}
+
+/// `catalog` as `--probe` prints it: one line, tracks in catalog order.
+fn catalog_json(catalog: &runtime::Catalog) -> CatalogJson {
+    CatalogJson {
+        bounded: catalog.bounded,
+        tracks: catalog
+            .tracks
+            .iter()
+            .map(|t| CatalogTrackJson {
+                codec: t.stream.codec.clone(),
+                time_base: [t.stream.time_base.num, t.stream.time_base.den],
+                format: match &t.stream.format {
+                    runtime::CodedFormat::Video { width, height, .. } => CatalogFormatJson::Video {
+                        width: *width,
+                        height: *height,
+                    },
+                    runtime::CodedFormat::Audio {
+                        sample_rate,
+                        channels,
+                        ..
+                    } => CatalogFormatJson::Audio {
+                        sample_rate: *sample_rate,
+                        channels: *channels,
+                    },
+                },
+                extradata: to_hex(&t.stream.extradata),
+                profile: t.stream.profile,
+                level: t.stream.level,
+                row: t.row,
+                rendition: CatalogRenditionJson {
+                    name: t.rendition.name.clone(),
+                    bandwidth: t.rendition.bandwidth,
+                    codecs: t.rendition.codecs.clone(),
+                    language: t.rendition.language.clone(),
+                },
+            })
+            .collect(),
+    }
+}
+
+/// The `-params` value out of `--probe`'s trailing argv; every other flag is
+/// refused by name.
+fn parse_probe_args(rest: &[String]) -> Result<String> {
+    let mut it = rest.iter();
+    let mut params: Option<String> = None;
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "-params" => {
+                if params.is_some() {
+                    bail!("second -params specified");
+                }
+                params = Some(
+                    it.next()
+                        .cloned()
+                        .ok_or_else(|| anyhow!("-params requires a value"))?,
+                );
+            }
+            other => bail!("--probe: unknown flag {other}"),
+        }
+    }
+    Ok(params.unwrap_or_default())
+}
+
+/// Compiles and instantiates `module_path` as a packet source and calls its
+/// `probe` - the compile-time twin of `run_packet_source`'s `open`, reading
+/// the catalog without opening the source for a run. One JSON line out.
+fn probe_module(module_path: &str, params: &str) -> Result<String> {
+    let has_source = ffrwd_wasm_runtime::runtime::exports_packet_source(module_path)
+        .with_context(|| format!("probing {module_path}"))?;
+    if !has_source {
+        let exports = ffrwd_wasm_runtime::runtime::exports(module_path)?;
+        bail!(
+            "{module_path} does not export a packet source, so it cannot be probed; it exports {}",
+            if exports.is_empty() {
+                "nothing".to_string()
+            } else {
+                exports.join(", ")
+            }
+        );
+    }
+    let catalog = runtime::PacketSource::probe(module_path, params)
+        .with_context(|| format!("probing {module_path}"))?;
+    serde_json::to_string(&catalog_json(&catalog)).context("serializing the catalog")
 }
 
 /// Calls one value function at compile time: checks the module exports the
@@ -1969,6 +2448,34 @@ fn main() {
                     std::process::exit(1);
                 }
             },
+        }
+    }
+
+    if raw_args.first().map(String::as_str) == Some("--probe") {
+        match raw_args.get(1) {
+            None => {
+                eprintln!("ffrwd-wasm: --probe requires a module path");
+                std::process::exit(2);
+            }
+            Some(module_path) => {
+                let params = match parse_probe_args(&raw_args[2..]) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("ffrwd-wasm: {e:#}");
+                        std::process::exit(2);
+                    }
+                };
+                match probe_module(module_path, &params) {
+                    Ok(json) => {
+                        println!("{json}");
+                        std::process::exit(0);
+                    }
+                    Err(e) => {
+                        eprintln!("ffrwd-wasm: {e:#}");
+                        std::process::exit(1);
+                    }
+                }
+            }
         }
     }
 
@@ -2195,5 +2702,311 @@ mod stamp_row_tests {
     fn a_row_that_is_not_a_json_object_is_returned_unchanged() {
         assert_eq!(stamp_row("not json", 50, TB), "not json");
         assert_eq!(stamp_row("[1,2,3]", 50, TB), "[1,2,3]");
+    }
+}
+
+#[cfg(test)]
+mod pad_spec_tests {
+    use super::{resolve_pad, PadRendition, PadSpec};
+
+    #[test]
+    fn a_pad_with_no_spec_is_its_own_index_and_no_rendition() {
+        let pads: Vec<Option<PadSpec>> = vec![None, None];
+        assert_eq!(resolve_pad(&pads, 0), (0, PadRendition::default()));
+        assert_eq!(resolve_pad(&pads, 1), (1, PadRendition::default()));
+    }
+
+    #[test]
+    fn a_pad_past_the_end_of_the_list_is_its_own_index_too() {
+        let pads: Vec<Option<PadSpec>> = vec![None];
+        assert_eq!(resolve_pad(&pads, 5), (5, PadRendition::default()));
+    }
+
+    #[test]
+    fn an_empty_pad_object_still_defaults_to_its_own_index() {
+        let spec: PadSpec = serde_json::from_str("{}").expect("valid, if empty");
+        let pads = vec![Some(spec)];
+        assert_eq!(resolve_pad(&pads, 3), (3, PadRendition::default()));
+    }
+
+    #[test]
+    fn a_row_overrides_the_index_and_leaves_rendition_default() {
+        let spec: PadSpec = serde_json::from_str(r#"{"row":7}"#).expect("valid");
+        let pads = vec![Some(spec)];
+        assert_eq!(resolve_pad(&pads, 0), (7, PadRendition::default()));
+    }
+
+    #[test]
+    fn a_rendition_with_some_fields_leaves_the_rest_none() {
+        let spec: PadSpec =
+            serde_json::from_str(r#"{"row":2,"rendition":{"name":"720p","bandwidth":2500000}}"#)
+                .expect("valid");
+        let pads = vec![Some(spec)];
+        let (row, rendition) = resolve_pad(&pads, 0);
+        assert_eq!(row, 2);
+        assert_eq!(rendition.name.as_deref(), Some("720p"));
+        assert_eq!(rendition.bandwidth, Some(2_500_000));
+        assert_eq!(rendition.codecs, None);
+        assert_eq!(rendition.language, None);
+    }
+
+    #[test]
+    fn every_rendition_field_round_trips() {
+        let spec: PadSpec = serde_json::from_str(
+            r#"{"row":1,"rendition":{"name":"720p","bandwidth":1,"codecs":"avc1.640028","language":"en"}}"#,
+        )
+        .expect("valid");
+        assert_eq!(
+            spec,
+            PadSpec {
+                row: Some(1),
+                rendition: PadRendition {
+                    name: Some("720p".to_string()),
+                    bandwidth: Some(1),
+                    codecs: Some("avc1.640028".to_string()),
+                    language: Some("en".to_string()),
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn malformed_pad_json_is_rejected() {
+        let err = serde_json::from_str::<PadSpec>("not json").unwrap_err();
+        assert!(!err.to_string().is_empty(), "serde names the parse failure");
+    }
+}
+
+#[cfg(test)]
+mod coded_stream_for_tests {
+    use super::{coded_stream_for, colorspace_type_for};
+    use ffrwd_wasm_runtime::runtime::{CodedFormat, CodedStream, ColorInfo, TimeBase};
+
+    fn h264() -> CodedStream {
+        CodedStream {
+            codec: "h264".to_string(),
+            time_base: TimeBase { num: 1, den: 25 },
+            format: CodedFormat::Video {
+                width: 64,
+                height: 48,
+                sample_aspect_ratio: None,
+                color: None,
+            },
+            extradata: vec![0x67, 0x42, 0x00, 0x1e],
+            profile: Some(0x42),
+            level: Some(0x1e),
+        }
+    }
+
+    #[test]
+    fn a_video_codec_gets_the_muxers_own_fourcc_and_the_settled_decode_delay() {
+        let stream = coded_stream_for(&h264(), 2).expect("h264 is carried");
+        assert_eq!(stream.fourcc, b"H264");
+        assert_eq!(stream.decode_delay, 2);
+        assert_eq!(stream.extradata, h264().extradata);
+        assert_eq!(
+            stream.time_base,
+            ffrwd_wasm::nut::TimeBase { num: 1, den: 25 }
+        );
+        assert_eq!(
+            stream.media,
+            ffrwd_wasm::nut::Media::Video {
+                width: 64,
+                height: 48,
+                // No sample_aspect_ratio: the unset default matches
+                // `Stream::video`'s own.
+                sample_width: 1,
+                sample_height: 1,
+                colorspace_type: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn an_audio_codec_carries_its_rate_and_channel_count() {
+        let coded = CodedStream {
+            codec: "aac".to_string(),
+            time_base: TimeBase { num: 1, den: 48000 },
+            format: CodedFormat::Audio {
+                sample_rate: 48000,
+                channels: 2,
+                channel_layout: Some("stereo"),
+            },
+            extradata: vec![0x11, 0x90],
+            profile: None,
+            level: None,
+        };
+        let stream = coded_stream_for(&coded, 0).expect("aac is carried");
+        assert_eq!(stream.fourcc, b"\xff\x00\x00\x00");
+        assert_eq!(stream.decode_delay, 0);
+        assert_eq!(
+            stream.media,
+            ffrwd_wasm::nut::Media::Audio {
+                sample_rate: 48000,
+                channels: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn a_codec_this_wire_does_not_carry_is_named_in_the_error() {
+        let mut coded = h264();
+        coded.codec = "vp9".to_string();
+        let err = coded_stream_for(&coded, 0).unwrap_err().to_string();
+        assert!(err.contains("vp9"), "{err}");
+        assert!(err.contains("h264"), "{err} should list what IS carried");
+    }
+
+    #[test]
+    fn the_pixel_aspect_ratio_survives_when_the_source_declares_one() {
+        let mut coded = h264();
+        let CodedFormat::Video {
+            sample_aspect_ratio,
+            ..
+        } = &mut coded.format
+        else {
+            unreachable!()
+        };
+        *sample_aspect_ratio = Some((4, 3));
+        let stream = coded_stream_for(&coded, 0).expect("h264 is carried");
+        let ffrwd_wasm::nut::Media::Video {
+            sample_width,
+            sample_height,
+            ..
+        } = stream.media
+        else {
+            unreachable!()
+        };
+        assert_eq!((sample_width, sample_height), (4, 3));
+    }
+
+    #[test]
+    fn colorspace_type_for_is_color_froms_inverse_on_what_it_can_carry() {
+        // The wire only ever writes these four combinations (nut::mod.rs
+        // tests pin the same pairs the other way).
+        for (code, range, space) in [
+            (1u64, "tv", "bt470bg"),
+            (2, "tv", "bt709"),
+            (17, "pc", "bt470bg"),
+            (18, "pc", "bt709"),
+        ] {
+            let color = ColorInfo {
+                range,
+                primaries: "unknown",
+                trc: "unknown",
+                space,
+            };
+            assert_eq!(colorspace_type_for(Some(&color)), code, "{range} {space}");
+        }
+    }
+
+    #[test]
+    fn no_color_and_an_unnamed_matrix_both_carry_nothing() {
+        assert_eq!(colorspace_type_for(None), 0);
+        let color = ColorInfo {
+            range: "tv",
+            primaries: "unknown",
+            trc: "unknown",
+            space: "ycgco",
+        };
+        assert_eq!(
+            colorspace_type_for(Some(&color)),
+            0,
+            "no code for this matrix"
+        );
+    }
+}
+
+#[cfg(test)]
+mod catalog_json_tests {
+    use super::catalog_json;
+    use ffrwd_wasm_runtime::runtime::{
+        Catalog, CodedFormat, CodedStream, RenditionMeta, SourceTrack, StreamInfo, TimeBase,
+    };
+
+    fn track(row: u32) -> SourceTrack {
+        SourceTrack {
+            stream: CodedStream {
+                codec: "h264".to_string(),
+                time_base: TimeBase { num: 1, den: 25 },
+                format: CodedFormat::Video {
+                    width: 64,
+                    height: 48,
+                    sample_aspect_ratio: None,
+                    color: None,
+                },
+                extradata: vec![0xde, 0xad, 0xbe, 0xef],
+                profile: Some(66),
+                level: Some(30),
+            },
+            info: StreamInfo {
+                index: row,
+                kind: "video".to_string(),
+                codec: "h264".to_string(),
+                duration: None,
+                tags: Vec::new(),
+            },
+            row,
+            rendition: RenditionMeta::default(),
+        }
+    }
+
+    #[test]
+    fn a_bounded_single_track_catalog_prints_the_documented_shape() {
+        let catalog = Catalog {
+            tracks: vec![track(0)],
+            bounded: true,
+        };
+        let json = serde_json::to_value(catalog_json(&catalog)).expect("serializes");
+        assert_eq!(json["bounded"], true);
+        let track = &json["tracks"][0];
+        assert_eq!(track["codec"], "h264");
+        assert_eq!(track["time_base"], serde_json::json!([1, 25]));
+        assert_eq!(
+            track["format"],
+            serde_json::json!({"video": {"width": 64, "height": 48}})
+        );
+        assert_eq!(track["extradata"], "deadbeef");
+        assert_eq!(track["profile"], 66);
+        assert_eq!(track["level"], 30);
+        assert_eq!(track["row"], 0);
+        assert_eq!(
+            track["rendition"],
+            serde_json::json!({"name": null, "bandwidth": null, "codecs": null, "language": null})
+        );
+    }
+
+    #[test]
+    fn an_audio_track_nests_rate_and_channels_instead_of_geometry() {
+        let mut audio = track(1);
+        audio.stream.format = CodedFormat::Audio {
+            sample_rate: 48000,
+            channels: 2,
+            channel_layout: None,
+        };
+        audio.stream.codec = "aac".to_string();
+        audio.rendition = RenditionMeta {
+            name: Some("audio".to_string()),
+            bandwidth: Some(128_000),
+            codecs: Some("mp4a.40.2".to_string()),
+            language: Some("en".to_string()),
+        };
+        let catalog = Catalog {
+            tracks: vec![audio],
+            bounded: false,
+        };
+        let json = serde_json::to_value(catalog_json(&catalog)).expect("serializes");
+        assert_eq!(json["bounded"], false);
+        let track = &json["tracks"][0];
+        assert_eq!(
+            track["format"],
+            serde_json::json!({"audio": {"sample_rate": 48000, "channels": 2}})
+        );
+        assert_eq!(
+            track["rendition"],
+            serde_json::json!({
+                "name": "audio", "bandwidth": 128000, "codecs": "mp4a.40.2", "language": "en"
+            })
+        );
     }
 }

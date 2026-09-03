@@ -316,6 +316,90 @@ fn a_packet_sink_refuses_a_frame_output() {
 }
 
 #[test]
+fn a_pad_is_accepted_on_a_packet_sinks_input() {
+    // The row/rendition it carries has nowhere to go yet inside the module
+    // (see the report on this task's `-pad` item), but the flag itself
+    // parses and the run still succeeds.
+    let module = module_path("packet_stats");
+    let run = run_ffrwd_wasm(
+        &[
+            "-f",
+            "nut",
+            "-i",
+            "-",
+            "-pad",
+            r#"{"row":3,"rendition":{"name":"720p"}}"#,
+            "-m",
+            module.to_str().expect("module path is UTF-8"),
+            "-f",
+            "ndjson",
+            "-",
+        ],
+        FIXTURE,
+    );
+    assert!(
+        run.output.status.success(),
+        "run exited with {:?}\nstderr:\n{}",
+        run.output.status.code(),
+        run.stderr
+    );
+}
+
+#[test]
+fn a_pad_on_a_non_sink_module_is_refused() {
+    let module = module_path("invert");
+    let run = run_ffrwd_wasm(
+        &[
+            "-f",
+            "nut",
+            "-i",
+            "-",
+            "-pad",
+            "{}",
+            "-m",
+            module.to_str().expect("module path is UTF-8"),
+            "-f",
+            "nut",
+            "-",
+        ],
+        FIXTURE,
+    );
+    assert!(!run.output.status.success());
+    assert!(
+        run.stderr.contains("-pad") && run.stderr.contains("not a packet sink"),
+        "stderr does not refuse -pad:\n{}",
+        run.stderr
+    );
+}
+
+#[test]
+fn malformed_pad_json_is_refused_at_parse() {
+    let module = module_path("packet_stats");
+    let run = run_ffrwd_wasm(
+        &[
+            "-f",
+            "nut",
+            "-i",
+            "-",
+            "-pad",
+            "not json",
+            "-m",
+            module.to_str().expect("module path is UTF-8"),
+            "-f",
+            "ndjson",
+            "-",
+        ],
+        FIXTURE,
+    );
+    assert!(!run.output.status.success());
+    assert!(
+        run.stderr.contains("-pad"),
+        "stderr does not name the bad -pad:\n{}",
+        run.stderr
+    );
+}
+
+#[test]
 fn a_packet_sink_joins_no_network() {
     let module = module_path("packet_stats");
     let binding = format!("stats={}", module.to_str().expect("module path is UTF-8"));
