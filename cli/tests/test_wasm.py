@@ -27,7 +27,7 @@ from ffrwd import wasm
 from ffrwd.compiler import Compiled, compile_all
 from ffrwd.errors import ErrorCode, FfrwdError
 from ffrwd.execute import CHAIN, PIPELINE, plan_argv, render_plan
-from ffrwd.functions import WasmFunction
+from ffrwd.functions import WasmFunction, package_modules
 from ffrwd.ir import Graph
 from ffrwd.lower import lower
 from ffrwd.parser import ModuleExport, Resolved, parse, resolve
@@ -3731,22 +3731,33 @@ def test_a_sink_takes_the_annotation_column_like_any_consumer() -> None:
     assert declared.signature.endswith("RETURNS sink")
 
 
-def test_a_sink_with_no_stream_is_refused() -> None:
+def test_a_sink_declaring_no_parameters_reads_every_row_off_the_select_list() -> None:
+    """No leading stream and no value either: the COPY's SELECT list is all
+    there is, and the destination call itself stays empty."""
     sql = (
         "CREATE FUNCTION drain() RETURNS sink\n"
         f"  AS '{SINK_MODULE}', 'drain' LANGUAGE wasm;\n"
         + "COPY (SELECT f.video[1] FROM input('a.mp4') f) TO drain()"
     )
-    _sink_rejects(sql, ErrorCode.UNSUPPORTED_SQL, "takes no stream")
+    declared = _resolved(sql).wasm["drain"]
+    assert declared.stream_params == ()
+    assert declared.reads_rows_from_select is True
 
 
-def test_a_sink_whose_first_parameter_is_a_value_is_refused() -> None:
+def test_a_sink_opening_with_a_value_parameter_reads_rows_from_the_select_list() -> None:
+    """The new form: a value parameter first means no stream parameter at
+    all, so the rows come from the SELECT list rather than named arguments."""
     sql = (
         "CREATE FUNCTION drain(url text) RETURNS sink\n"
         f"  AS '{SINK_MODULE}', 'drain' LANGUAGE wasm;\n"
         + "COPY (SELECT f.video[1] FROM input('a.mp4') f) TO drain('http://x/')"
     )
-    _sink_rejects(sql, ErrorCode.UNSUPPORTED_SQL, "takes text as its first parameter")
+    declared = _resolved(sql).wasm["drain"]
+    assert declared.stream_params == ()
+    assert declared.reads_rows_from_select is True
+    assert [p.name for p in declared.value_params] == ["url"]
+    with pytest.raises(ValueError, match="kinds come from the rows"):
+        declared.stream_kind
 
 
 def test_an_audio_sink_reads_audio() -> None:
@@ -3964,6 +3975,68 @@ def test_a_packages_sink_is_called_in_to_position(tmp_path: Path) -> None:
     assert list(resolved.wasm) == ["ffrwd.tools.drain"]
     assert resolved.sinks[0].module_sink == "ffrwd.tools.drain"
     assert resolved.sinks[0].path is None
+
+
+# -- source modules: RETURNS source, the mirror of RETURNS sink -----------
+
+
+def test_a_returns_source_declaration_is_readable_without_a_query(tmp_path: Path) -> None:
+    """A source's own declaration checks the same way a sink's does: reading
+    it needs no call, so `package_modules` is what proves the signature alone,
+    with none of the "used"/FROM-binding questions a script would raise."""
+    (tmp_path / "src").mkdir(parents=True)
+    (tmp_path / "src" / "sources.sql").write_text(
+        "CREATE FUNCTION subscribe(relay text, broadcast text) RETURNS source\n"
+        "  AS 'modules/subscribe.wasm', 'subscribe' LANGUAGE wasm;\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "ffrwd.json").write_text(
+        json.dumps(
+            {
+                "name": "ffrwd/moq",
+                "version": "1.0.0",
+                "lib": {"subscribe": "src/sources.sql"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    packages = discover(tmp_path)
+    assert packages is not None
+    package = packages.packages["ffrwd/moq"]
+    modules = package_modules(package)
+    assert len(modules) == 1
+    declared = modules[0]
+    assert declared.is_source
+    assert not declared.is_value and not declared.is_sink
+    assert declared.stream_params == ()
+    assert [p.name for p in declared.value_params] == ["relay", "broadcast"]
+    with pytest.raises(ValueError, match="kinds come from its catalog"):
+        declared.stream_kind
+
+
+def test_a_stream_parameter_on_a_source_is_refused_at_the_declaration() -> None:
+    sql = (
+        "CREATE FUNCTION subscribe(v video_stream) RETURNS source\n"
+        f"  AS '{MODULE}', 'subscribe' LANGUAGE wasm;\n"
+        "COPY (SELECT f.video[1] FROM input('a.mp4') f) TO 'out.mp4'"
+    )
+    error = _rejects(
+        sql, ErrorCode.UNSUPPORTED_SQL, "declares the stream parameter 'v'"
+    )
+    assert error.hint is not None and "produces streams and reads none" in error.hint
+
+
+def test_a_source_called_in_select_is_refused() -> None:
+    """A source is a row source, not a stream function: it belongs in FROM."""
+    sql = (
+        "CREATE FUNCTION subscribe(relay text) RETURNS source\n"
+        f"  AS '{MODULE}', 'subscribe' LANGUAGE wasm;\n"
+        "COPY (SELECT subscribe('r') FROM input('a.mp4') f) TO 'out.mp4'"
+    )
+    error = _rejects(
+        sql, ErrorCode.UNSUPPORTED_SQL, "returns source, and this call is not in FROM"
+    )
+    assert error.hint is not None and "FROM" in error.hint
 
 
 # -- packet sinks: the encoded edge ----------------------------------------

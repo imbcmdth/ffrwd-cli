@@ -197,6 +197,14 @@ _WASM_SINK_HINT = (
     "a sink function is a COPY destination: COPY (SELECT <streams>) TO "
     "<name>(<values>)"
 )
+# The return type of a module that is a FROM-position row source: the mirror
+# of a sink -- it produces streams and reads none.
+WASM_SOURCE = "source"
+_WASM_SOURCE_HINT = (
+    "a source produces streams and reads none: its parameters are text, "
+    "number or boolean, the values it is configured with"
+)
+_WASM_SOURCE_CALL_HINT = "a source is called in FROM: FROM <name>(<values>) <alias>"
 # What a module filters, keyed by the type its signature names. A module takes
 # one kind of stream and returns the same kind.
 WASM_STREAM_TYPES: Mapping[str, StreamType] = {
@@ -441,7 +449,9 @@ class WasmFunction:
     @property
     def is_value(self) -> bool:
         """True for a function returning a compile-time value, not a stream."""
-        return self.returns not in WASM_STREAM_TYPES and not self.is_sink
+        return (
+            self.returns not in WASM_STREAM_TYPES and not self.is_sink and not self.is_source
+        )
 
     @property
     def is_sink(self) -> bool:
@@ -453,20 +463,53 @@ class WasmFunction:
         return self.returns == WASM_SINK
 
     @property
+    def is_source(self) -> bool:
+        """True for a ``RETURNS source`` function: a FROM-position row source.
+
+        The mirror of a sink: it produces streams and reads none, so it takes
+        only value parameters and is legal only in FROM.
+        """
+        return self.returns == WASM_SOURCE
+
+    @property
     def stream_kind(self) -> StreamType:
         """The kind of stream this function filters.
 
         A sink names no return stream, so its kind is its first parameter's.
-        Only a STREAM function or a sink has one; a value function is folded
-        at compile time and filters nothing, so asking is a caller's mistake.
-        A sink reading both kinds has no single one, and callers that care
-        read :attr:`stream_params` instead.
+        Only a STREAM function or a sink reading named stream parameters has
+        one; a value function is folded at compile time and filters nothing,
+        so asking is a caller's mistake. A sink reading both kinds has no
+        single one, and callers that care read :attr:`stream_params` instead.
+        A sink declaring no stream parameters reads its rows straight off the
+        SELECT list, and a source's kinds come from its own catalog, not its
+        signature -- neither has one to give here.
         """
+        if self.is_source:
+            raise ValueError(
+                f"'{self.name}' returns source; its kinds come from its "
+                "catalog, not its signature"
+            )
+        if self.is_sink and not self.stream_params:
+            raise ValueError(
+                f"'{self.name}' reads rows from the SELECT list; its kinds "
+                "come from the rows, not its signature"
+            )
         written = self.params[0].type if self.is_sink and self.params else self.returns
         kind = WASM_STREAM_TYPES.get(element_type(written))
         if kind is None:
             raise ValueError(f"'{self.name}' returns {self.returns}, not a stream")
         return kind
+
+    @property
+    def reads_rows_from_select(self) -> bool:
+        """True for a sink whose SELECT list supplies the row cells directly.
+
+        A ``RETURNS sink`` declaring no stream parameters names only the
+        values it is configured with; the COPY's SELECT list is read as the
+        rows themselves, one cell per column, rather than as named stream
+        arguments.
+        """
+        return self.is_sink and not self.stream_params
 
     @property
     def stream_kinds(self) -> tuple[StreamType, ...]:
@@ -1279,6 +1322,44 @@ def _module_export(
     return path, str(export.this), module
 
 
+def _define_wasm_source(
+    name: str,
+    module: str,
+    export: str,
+    params: tuple[Parameter, ...],
+    identifier: exp.Identifier,
+    create: exp.Create,
+) -> WasmFunction:
+    """One validated ``RETURNS source`` declaration: a FROM-position row source.
+
+    The mirror of a sink: a source produces streams and reads none, so every
+    parameter is a value the module is configured with -- the same domain a
+    sink's own value parameters draw from -- and a stream-typed parameter is
+    refused outright, since a source has nothing for it to mean.
+    """
+    stream = next(
+        (p for p in params if element_type(p.type) in WASM_STREAM_TYPES), None
+    )
+    if stream is not None:
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"wasm function '{name}' declares the stream parameter '{stream.name}'",
+            identifier,
+            fallback=create,
+            hint=_WASM_SOURCE_HINT,
+        )
+    line, col = _pos(identifier, create)
+    return WasmFunction(
+        name=name,
+        module=module,
+        export=export,
+        params=params,
+        returns=WASM_SOURCE,
+        line=line,
+        col=col,
+    )
+
+
 def _define_wasm_value(
     name: str,
     module: str,
@@ -1379,6 +1460,8 @@ def _define_wasm(
     if emits is None:
         if _type_name(node) == WASM_SINK:
             returns = WASM_SINK
+        elif _type_name(node) == WASM_SOURCE:
+            return _define_wasm_source(name, module, export, params, identifier, create)
         else:
             returns = _checked_type(node, name, identifier)
             if returns in _ANNOTATION_FIELD_TYPES:
@@ -1395,24 +1478,31 @@ def _define_wasm(
                 )
     else:
         returns = struct_stream
-    if not params:
-        raise _error(
-            ErrorCode.UNSUPPORTED_SQL,
-            f"wasm function '{name}' takes no stream",
-            identifier,
-            fallback=create,
-            hint=_WASM_HINT,
-        )
-    if element_type(params[0].type) not in WASM_STREAM_TYPES:
-        raise _error(
-            ErrorCode.UNSUPPORTED_SQL,
-            f"wasm function '{name}' takes {params[0].type} as its first "
-            f"parameter '{params[0].name}'",
-            identifier,
-            fallback=create,
-            hint=f"the stream a module filters is its first parameter, and is "
-            f"{_WASM_STREAM_HINT}",
-        )
+    # A sink alone may open with a value instead of a stream: its rows then
+    # come straight off the COPY's SELECT list rather than named arguments,
+    # so the leading-stream requirement below does not apply to it.
+    reads_rows_from_select = returns == WASM_SINK and (
+        not params or element_type(params[0].type) not in WASM_STREAM_TYPES
+    )
+    if not reads_rows_from_select:
+        if not params:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"wasm function '{name}' takes no stream",
+                identifier,
+                fallback=create,
+                hint=_WASM_HINT,
+            )
+        if element_type(params[0].type) not in WASM_STREAM_TYPES:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"wasm function '{name}' takes {params[0].type} as its first "
+                f"parameter '{params[0].name}'",
+                identifier,
+                fallback=create,
+                hint=f"the stream a module filters is its first parameter, and is "
+                f"{_WASM_STREAM_HINT}",
+            )
     if returns != WASM_SINK and params[0].type != returns:
         raise _error(
             ErrorCode.UNSUPPORTED_SQL,
@@ -1678,9 +1768,18 @@ def _in_lib(
     )
 
 
-def _not_a_table(declared: WasmFunction, item: exp.Table) -> FfrwdError:
-    """A wasm function written in FROM: it returns a stream or a value, never a table."""
+def _not_a_table(declared: WasmFunction, item: exp.Table) -> FfrwdError | None:
+    """A wasm function written in FROM: it returns a stream or a value, never a table.
+
+    A source is the one exception: it IS exactly a table in FROM, so it earns
+    no refusal here, and None means "let it through". Binding the FROM item
+    to what the source produces is the lowering half's seam
+    (:mod:`ffrwd.lower`), not this module's -- past this point the call may
+    still be refused downstream until that half lands.
+    """
     written = declared.called
+    if declared.is_source:
+        return None
     if declared.is_sink:
         return _error(
             ErrorCode.UNSUPPORTED_SQL,
@@ -2821,7 +2920,9 @@ class _Expander:
             return None
         if isinstance(function, WasmFunction):
             if isinstance(node, exp.Table):
-                raise _not_a_table(function, node)
+                error = _not_a_table(function, node)
+                if error is not None:
+                    raise error
             return _WasmSite(function, call, node)
         return _CallSite(function, call, node)
 
@@ -2954,6 +3055,17 @@ class _Expander:
                     node,
                     hint=_WASM_SINK_HINT,
                 )
+            if declared.is_source:
+                # A Table-position call never reaches here: its parent branch
+                # above continues past it. Anything that does is a source
+                # called as a stream function instead of a row source.
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"function '{declared.name}' returns source, and this "
+                    "call is not in FROM",
+                    node,
+                    hint=_WASM_SOURCE_CALL_HINT,
+                )
             self._check_wasm_position(declared, node, position)
             arguments = [
                 argument for argument in node.expressions if isinstance(argument, exp.Expr)
@@ -2962,13 +3074,22 @@ class _Expander:
             self.wasm_used.add(declared.name)
 
     def _reject_wasm_row_source(self, item: exp.Table) -> None:
-        """A wasm function in FROM: it returns a stream or a value, never a table."""
+        """A wasm function in FROM: refused unless it is a source, which is exactly a table.
+
+        A source is the only wasm return that belongs here, so a legal one is
+        marked used like any other call -- this branch is the only place a
+        Table-position wasm call is ever seen, so nothing else would.
+        """
         call = item.this
         if not isinstance(call, exp.Anonymous):
             return
         declared = self.wasm.get(_call_name(call))
-        if declared is not None:
-            raise _not_a_table(declared, item)
+        if declared is None:
+            return
+        error = _not_a_table(declared, item)
+        if error is not None:
+            raise error
+        self.wasm_used.add(declared.name)
 
     def _check_wasm_position(
         self, declared: WasmFunction, call: exp.Expr, position: int
