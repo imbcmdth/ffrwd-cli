@@ -8,6 +8,7 @@ that shell out to a real ffprobe against generated fixtures are marked
 
 from __future__ import annotations
 
+import importlib
 import json
 import subprocess
 import sys
@@ -31,6 +32,11 @@ from ffrwd.probe import (
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 FIXTURES_DIR = REPO_ROOT / "tests" / "fixtures"
+# `ffrwd/__init__.py` does `from .probe import probe`, which overwrites the
+# `probe` attribute on the `ffrwd` package with the FUNCTION -- so the
+# submodule must come from `sys.modules` (via `importlib`), not attribute
+# access, to reach its private `_read_remote` seam below.
+probe_module = importlib.import_module("ffrwd.probe")
 
 FAKE_JSON = json.dumps(
     {
@@ -1601,6 +1607,182 @@ def test_dash_mpd_yields_one_rendition_per_representation(
     assert audio.width is None
     assert audio.height is None
     assert audio.language == "und"
+
+
+# --- HLS #EXT-X-STREAM-INF: codecs/name/language, local masters only -------
+
+
+def test_stream_inf_attributes_are_parsed_onto_matching_renditions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Quoted CODECS may contain a comma; NAME is read; RESOLUTION is
+    present in the playlist but unused -- width/height already come from
+    ffprobe's own stream columns, not the playlist's markup."""
+    master = tmp_path / "master.m3u8"
+    master.write_text(
+        "#EXTM3U\n"
+        '#EXT-X-STREAM-INF:BANDWIDTH=861791,RESOLUTION=640x360,'
+        'CODECS="avc1.640020,mp4a.40.2",NAME="High"\n'
+        "hi.m3u8\n"
+        '#EXT-X-STREAM-INF:BANDWIDTH=344917,RESOLUTION=320x180,'
+        'CODECS="avc1.42001f,mp4a.40.2",NAME="Low"\n'
+        "lo.m3u8\n",
+        encoding="utf-8",
+    )
+    _fake_ffprobe_present(monkeypatch)
+    _fake_run(
+        monkeypatch,
+        stdout=_hls_master_json(
+            [_hls_program(0, [0, 1], "861791"), _hls_program(1, [2, 3], "344917")]
+        ),
+    )
+    result = probe(str(master))
+    assert result is not None
+    hi, lo = result.renditions
+    assert hi.codecs == "avc1.640020,mp4a.40.2"
+    assert hi.name == "High"
+    assert lo.codecs == "avc1.42001f,mp4a.40.2"
+    assert lo.name == "Low"
+
+
+def test_stream_inf_matches_by_bandwidth_when_position_would_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The playlist lists the low-bitrate variant first; ffprobe's own
+    program order is the reverse -- proves the bandwidth cross-check, not
+    just the common case where position already agrees."""
+    master = tmp_path / "master.m3u8"
+    master.write_text(
+        "#EXTM3U\n"
+        '#EXT-X-STREAM-INF:BANDWIDTH=344917,CODECS="avc1.42001f,mp4a.40.2"\n'
+        "lo.m3u8\n"
+        '#EXT-X-STREAM-INF:BANDWIDTH=861791,CODECS="avc1.640020,mp4a.40.2"\n'
+        "hi.m3u8\n",
+        encoding="utf-8",
+    )
+    _fake_ffprobe_present(monkeypatch)
+    _fake_run(
+        monkeypatch,
+        stdout=_hls_master_json(
+            [_hls_program(0, [0, 1], "861791"), _hls_program(1, [2, 3], "344917")]
+        ),
+    )
+    result = probe(str(master))
+    assert result is not None
+    hi, lo = result.renditions
+    assert hi.bandwidth == 861791
+    assert hi.codecs == "avc1.640020,mp4a.40.2"
+    assert lo.bandwidth == 344917
+    assert lo.codecs == "avc1.42001f,mp4a.40.2"
+
+
+def test_stream_inf_audio_group_resolves_to_a_language(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    master = tmp_path / "master.m3u8"
+    master.write_text(
+        "#EXTM3U\n"
+        '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud1",NAME="English",LANGUAGE="en",'
+        'DEFAULT=YES,URI="audio-en.m3u8"\n'
+        '#EXT-X-STREAM-INF:BANDWIDTH=861791,CODECS="avc1.640020,mp4a.40.2",'
+        'AUDIO="aud1"\n'
+        "hi.m3u8\n",
+        encoding="utf-8",
+    )
+    _fake_ffprobe_present(monkeypatch)
+    _fake_run(
+        monkeypatch,
+        stdout=_hls_master_json([_hls_program(0, [0, 1], "861791")]),
+    )
+    result = probe(str(master))
+    assert result is not None
+    assert result.renditions[0].language == "en"
+
+
+def test_stream_inf_with_no_codecs_leaves_it_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    master = tmp_path / "master.m3u8"
+    master.write_text(
+        "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=861791\nhi.m3u8\n", encoding="utf-8"
+    )
+    _fake_ffprobe_present(monkeypatch)
+    _fake_run(
+        monkeypatch,
+        stdout=_hls_master_json([_hls_program(0, [0, 1], "861791")]),
+    )
+    result = probe(str(master))
+    assert result is not None
+    assert result.renditions[0].codecs is None
+    assert result.renditions[0].name is None
+
+
+# --- remote manifests: one extra fetch through the patched `_read_remote`
+# seam, never a real network call --------------------------------------------
+
+
+def test_remote_hls_master_live_detection_via_patched_fetch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A '://' HLS master's live/static marker comes from a second, small
+    fetch of the manifest text, resolved through `urljoin` to the first
+    variant and fetched again -- both routed through `_read_remote`."""
+    master_text = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=800000\nhi.m3u8\n"
+    variant_text = "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2.0,\nseg0.ts\n"
+
+    def fake_read_remote(url: str) -> str | None:
+        return {
+            "https://example.com/master.m3u8": master_text,
+            "https://example.com/hi.m3u8": variant_text,
+        }.get(url)
+
+    monkeypatch.setattr(probe_module, "_read_remote", fake_read_remote)
+    _fake_ffprobe_present(monkeypatch)
+    _fake_run(
+        monkeypatch,
+        stdout=_hls_master_json([_hls_program(0, [0, 1], "800000")]),
+    )
+    result = probe("https://example.com/master.m3u8")
+    assert result is not None
+    assert result.live is True
+    # codecs/name enrichment stays local-only: no fetch of this remote
+    # master's own STREAM-INF text was made for that purpose.
+    assert result.renditions[0].codecs is None
+
+
+def test_remote_mpd_yields_renditions_via_patched_fetch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_read_remote(url: str) -> str | None:
+        assert url == "https://example.com/out.mpd"
+        return _MPD_STATIC
+
+    monkeypatch.setattr(probe_module, "_read_remote", fake_read_remote)
+    _fake_ffprobe_present(monkeypatch)
+    _fake_run(monkeypatch, stdout=_DASH_EMPTY_JSON)
+    result = probe("https://example.com/out.mpd")
+    assert result is not None
+    assert len(result.renditions) == 1
+    assert result.renditions[0].bandwidth == 800000
+    assert result.live is False
+
+
+def test_remote_fetch_failure_leaves_the_probe_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`_read_remote` returning None (network error, timeout, bad status,
+    an unsupported scheme) must not raise -- the probe just keeps its
+    ffprobe-derived defaults, same as before this input was ever reread."""
+    monkeypatch.setattr(probe_module, "_read_remote", lambda url: None)
+    _fake_ffprobe_present(monkeypatch)
+    _fake_run(
+        monkeypatch,
+        stdout=_hls_master_json([_hls_program(0, [0, 1], "800000")]),
+    )
+    result = probe("https://example.com/master.m3u8")
+    assert result is not None
+    assert result.live is False
+    assert len(result.renditions) == 1
 
 
 # --- WebVTT cues, which ffprobe never enumerates ---------------------------

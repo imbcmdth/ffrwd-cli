@@ -28,6 +28,8 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import urllib.parse
+import urllib.request
 import xml.etree.ElementTree as ET
 from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
@@ -50,10 +52,18 @@ _NOT_CUE_BLOCKS = ("NOTE", "STYLE", "REGION", _WEBVTT_MAGIC)
 # LAST so that an escaped ampersand does not turn a following name into one.
 _WEBVTT_UNESCAPES = (("&lt;", "<"), ("&gt;", ">"), ("&amp;", "&"))
 
-# A rendition's own tag, an HLS master's marker, and how HLS spells "no more
-# segments are coming" -- read from manifest text, never from ffprobe's JSON.
+# A rendition's own tag, an HLS master's marker, how HLS spells "no more
+# segments are coming", and an alternate-rendition tag (read for its AUDIO
+# groups) -- read from manifest text, never from ffprobe's JSON.
 _STREAM_INF_TAG = "#EXT-X-STREAM-INF"
 _ENDLIST_TAG = "#EXT-X-ENDLIST"
+_MEDIA_TAG = "#EXT-X-MEDIA"
+
+# A second, small manifest fetch for a remote spec -- bounded well below
+# ffprobe's own network timeout, since this is markup ffprobe's JSON never
+# surfaces, not the primary probe.
+_REMOTE_MANIFEST_TIMEOUT_SECONDS = 5.0
+_REMOTE_MANIFEST_MAX_BYTES = 2 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -408,24 +418,66 @@ def _read_local(path: str) -> str | None:
         return None
 
 
-def _with_hls_live(parsed: ProbeResult, spec: str) -> ProbeResult:
-    """`parsed.live` from the manifest text, for a local HLS input only.
+def _read_remote(url: str) -> str | None:
+    """`url`'s response body as text, or None on any failure.
 
-    A media playlist is read directly: `live` is the absence of
-    #EXT-X-ENDLIST. A master carries no segments of its own, so its FIRST
-    variant is read instead -- the URI on the line right after the first
-    #EXT-X-STREAM-INF, resolved against the master's own directory, the
-    same rule a real HLS client follows. A remote manifest, or a master
-    whose first variant cannot be resolved locally, is left `live=False`:
-    CI probes no network, and `probe()` already paid for one ffprobe fetch
-    of this spec -- a second, manual one here is not this plan's to make.
+    A second, bounded fetch of a manifest's own markup -- CODECS=/NAME=,
+    an AUDIO group's LANGUAGE=, the live/static marker -- none of which
+    ffprobe's JSON surfaces. `probe()` already paid for one network round
+    trip (ffprobe itself) on a `://` spec, so this small extra GET is
+    within budget. Bounded by `_REMOTE_MANIFEST_TIMEOUT_SECONDS` and read
+    up to `_REMOTE_MANIFEST_MAX_BYTES` -- an oversized response is
+    rejected outright, never truncated and parsed as if it were the whole
+    manifest -- then decoded as UTF-8 with `errors="replace"` since a
+    manifest's charset is never verified ahead of time. Network failure,
+    a non-2xx status, an unsupported scheme, and an oversized body all
+    collapse to None, the same as every other failure mode in this module.
     """
-    if parsed.format_name is None or "hls" not in parsed.format_name or is_url(spec):
+    try:
+        with urllib.request.urlopen(url, timeout=_REMOTE_MANIFEST_TIMEOUT_SECONDS) as response:
+            body: bytes = response.read(_REMOTE_MANIFEST_MAX_BYTES + 1)
+    except (OSError, ValueError):
+        return None
+    if len(body) > _REMOTE_MANIFEST_MAX_BYTES:
+        return None
+    return body.decode("utf-8", errors="replace")
+
+
+def _read_manifest_text(spec: str) -> str | None:
+    """`spec`'s manifest text: a local path reread directly, or -- for a
+    `://` spec -- fetched once more via `_read_remote`.
+    """
+    if is_url(spec):
+        return _read_remote(spec)
+    return _read_local(spec)
+
+
+def _with_hls_live(parsed: ProbeResult, spec: str) -> ProbeResult:
+    """`parsed.live`, plus -- for a LOCAL master only -- `renditions[]`
+    filled in with `codecs`/`name`/`language` read from the manifest text.
+
+    `live` is the absence of #EXT-X-ENDLIST: read straight off a media
+    playlist, or, for a master (which carries no segments of its own),
+    off its FIRST variant -- the URI on the line right after the first
+    #EXT-X-STREAM-INF, resolved against the master's own location (see
+    `_first_variant_text`) and read the same way the master itself was:
+    `_read_manifest_text` rereads a local spec from disk and fetches a
+    `://` one with `_read_remote`, one bounded extra GET beyond the
+    ffprobe probe already paid for. A variant this process cannot resolve
+    or fetch leaves `live=False`, same as before this input was read.
+
+    ffprobe's JSON never surfaces CODECS=/NAME=/an AUDIO group's
+    LANGUAGE=, so those are read from the SAME master text too, but only
+    when `spec` is local -- see `_with_hls_stream_inf`.
+    """
+    if parsed.format_name is None or "hls" not in parsed.format_name:
         return parsed
-    text = _read_local(spec)
+    text = _read_manifest_text(spec)
     if text is None:
         return parsed
     if _STREAM_INF_TAG in text:
+        if not is_url(spec):
+            parsed = _with_hls_stream_inf(parsed, text)
         media_text = _first_variant_text(text, spec)
         if media_text is None:
             return parsed
@@ -434,11 +486,17 @@ def _with_hls_live(parsed: ProbeResult, spec: str) -> ProbeResult:
 
 
 def _first_variant_text(master_text: str, master_path: str) -> str | None:
-    """The text of a master playlist's first variant, or None if it names
-    no local file this process can read.
+    """The text of a master playlist's first variant, or None if it
+    cannot be read.
 
     The variant URI is the next non-comment line after the first
-    #EXT-X-STREAM-INF tag, resolved relative to the master's own directory.
+    #EXT-X-STREAM-INF tag, resolved relative to the master's own
+    location. A LOCAL master resolves it against its own directory and
+    rereads the result as a local file -- a remote URI listed under a
+    local master is not fetched, since CI probes no network for a local
+    input. A REMOTE master resolves it with `urllib.parse.urljoin`
+    (handling both a relative URI and an already-absolute one) and fetches
+    the result with `_read_remote`.
     """
     lines = master_text.splitlines()
     for i, line in enumerate(lines):
@@ -448,26 +506,177 @@ def _first_variant_text(master_text: str, master_path: str) -> str | None:
             uri = uri.strip()
             if not uri or uri.startswith("#"):
                 continue
+            if is_url(master_path):
+                variant_url = uri if is_url(uri) else urllib.parse.urljoin(master_path, uri)
+                return _read_remote(variant_url)
             if is_url(uri):
                 return None
             return _read_local(os.path.join(os.path.dirname(master_path), uri))
     return None
 
 
+def _parse_attribute_list(text: str) -> dict[str, str]:
+    """An HLS attribute-list (``NAME=VALUE,NAME=VALUE,...``) as a dict.
+
+    Covers the attribute-value grammar HLS's tags use: a double-quoted
+    string (``CODECS="avc1.640020,mp4a.40.2"``, comma and all -- the
+    quotes are what say a comma there does not end the attribute) and any
+    other, unquoted value (decimal-integer, hexadecimal-sequence,
+    decimal-floating-point, enumerated-string, decimal-resolution alike),
+    which simply runs to the next comma. A malformed remainder (no ``=``
+    left to find) stops the scan rather than raising -- the attributes
+    already read are still returned.
+    """
+    attrs: dict[str, str] = {}
+    i = 0
+    n = len(text)
+    while i < n:
+        while i < n and text[i] in ", ":
+            i += 1
+        if i >= n:
+            break
+        eq = text.find("=", i)
+        if eq == -1:
+            break
+        name = text[i:eq].strip()
+        i = eq + 1
+        if i < n and text[i] == '"':
+            end = text.find('"', i + 1)
+            if end == -1:
+                attrs[name] = text[i + 1 :]
+                break
+            attrs[name] = text[i + 1 : end]
+            i = end + 1
+        else:
+            end = text.find(",", i)
+            if end == -1:
+                attrs[name] = text[i:].strip()
+                break
+            attrs[name] = text[i:end].strip()
+            i = end
+    return attrs
+
+
+def _stream_inf_entries(text: str) -> list[dict[str, str]]:
+    """Every #EXT-X-STREAM-INF line's attributes, in playlist order."""
+    entries: list[dict[str, str]] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith(_STREAM_INF_TAG):
+            _, _, rest = line.partition(":")
+            entries.append(_parse_attribute_list(rest))
+    return entries
+
+
+def _audio_group_languages(text: str) -> dict[str, str]:
+    """AUDIO group id -> LANGUAGE, from every TYPE=AUDIO #EXT-X-MEDIA line.
+
+    The first LANGUAGE seen for a given GROUP-ID wins -- its members are
+    alternate renditions of the same track, so they agree on it anyway.
+    """
+    groups: dict[str, str] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith(_MEDIA_TAG + ":"):
+            continue
+        _, _, rest = line.partition(":")
+        attrs = _parse_attribute_list(rest)
+        if attrs.get("TYPE") != "AUDIO":
+            continue
+        group_id = attrs.get("GROUP-ID")
+        language = attrs.get("LANGUAGE")
+        if group_id is not None and language is not None:
+            groups.setdefault(group_id, language)
+    return groups
+
+
+def _attr_int(attrs: dict[str, str], key: str) -> int | None:
+    """An attribute-list value as int, or None if absent or unparseable."""
+    value = attrs.get(key)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def _fill(current: str | None, discovered: str | None) -> str | None:
+    """`current` if it is already set, else `discovered`."""
+    return current if current is not None else discovered
+
+
+def _with_hls_stream_inf(parsed: ProbeResult, text: str) -> ProbeResult:
+    """`parsed.renditions` with `codecs`/`name`/`language` read from the
+    master's own #EXT-X-STREAM-INF and #EXT-X-MEDIA lines.
+
+    ffprobe's own JSON never surfaces these -- CODECS=/NAME= live only in
+    the playlist's markup, not in anything ``-show_programs`` reports --
+    so they are read here instead. A #EXT-X-STREAM-INF entry is matched to
+    a rendition in `parsed.renditions` BY ORDER: the hls demuxer creates
+    one ffprobe program per variant in the playlist's own listing order
+    (checked against a real ffprobe run), and `_hls_renditions` built
+    `parsed.renditions` by iterating those programs in that same order.
+    Where a BANDWIDTH attribute and a rendition's own, ffprobe-reported
+    bandwidth are both known, that match is preferred over position --
+    it survives the two lists drifting out of step, which position alone
+    cannot detect. Every other field of a matched rendition is kept
+    exactly as `_hls_renditions` found it; codecs/name/language are only
+    FILLED IN where not already set, never overwritten.
+    """
+    if not parsed.renditions:
+        return parsed
+    entries = _stream_inf_entries(text)
+    if not entries:
+        return parsed
+    audio_languages = _audio_group_languages(text)
+
+    by_bandwidth: dict[int, dict[str, str]] = {}
+    for candidate in entries:
+        bandwidth = _attr_int(candidate, "BANDWIDTH")
+        if bandwidth is not None:
+            by_bandwidth.setdefault(bandwidth, candidate)
+
+    renditions: list[RenditionMeta] = []
+    for position, rendition in enumerate(parsed.renditions):
+        entry: dict[str, str] | None = None
+        if rendition.bandwidth is not None:
+            entry = by_bandwidth.get(rendition.bandwidth)
+        if entry is None and position < len(entries):
+            entry = entries[position]
+        if entry is None:
+            renditions.append(rendition)
+            continue
+        audio_group = entry.get("AUDIO")
+        language = audio_languages.get(audio_group) if audio_group is not None else None
+        renditions.append(
+            replace(
+                rendition,
+                codecs=_fill(rendition.codecs, entry.get("CODECS")),
+                name=_fill(rendition.name, entry.get("NAME")),
+                language=_fill(rendition.language, language),
+            )
+        )
+    return replace(parsed, renditions=renditions)
+
+
 def _with_dash(parsed: ProbeResult, spec: str) -> ProbeResult:
-    """`parsed.renditions`/`parsed.live` from the MPD itself, for a local
-    DASH input only.
+    """`parsed.renditions`/`parsed.live` from the MPD itself, local or
+    remote.
 
     ffprobe's dash demuxer groups every Representation into ONE program --
     confirmed against a real two-video-rendition MPD, ``-show_programs``
     prints a single program holding all three streams, unlike HLS's one
     program per variant -- so the HLS path above cannot serve DASH. The
-    MPD is read directly instead: no network re-fetch for a remote one,
-    same rule as the HLS branch.
+    MPD is read directly instead, via `_read_manifest_text`: a local spec
+    is reread from disk, and a `://` one gets one bounded extra fetch --
+    `probe()` already paid for the network round trip ffprobe itself made
+    on it, so this second, small GET of the MPD's own markup is within
+    budget, the same trade `_with_hls_live` makes for a remote master.
     """
-    if parsed.format_name != "dash" or is_url(spec):
+    if parsed.format_name != "dash":
         return parsed
-    text = _read_local(spec)
+    text = _read_manifest_text(spec)
     if text is None:
         return parsed
     renditions, live = _parse_mpd(text, parsed.streams)
