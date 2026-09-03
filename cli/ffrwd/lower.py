@@ -6435,7 +6435,9 @@ class _Lowerer:
             declared, described, call, inner, select, env, {},
             first=0, params_schema=found.params_schema,
         )
-        answered = self._url_source_answer(alias, declared, params, inner, select)
+        answered = self._url_source_answer(
+            alias, declared, described, params, inner, select
+        )
         payload = self._url_source_payload(alias, declared, params, answered, inner, select)
         minted: list[str] = []
         renditions: list[RenditionMeta] = []
@@ -6495,6 +6497,7 @@ class _Lowerer:
         self,
         alias: str,
         declared: WasmFunction,
+        described: Described,
         params: Mapping[str, object],
         node: exp.Expr,
         select: exp.Select,
@@ -6502,14 +6505,17 @@ class _Lowerer:
         """Run the module for this call's arguments, once per compile.
 
         The same cache a value call uses, keyed the same way, so two reads of
-        one call -- two branches, two COPYs -- cost one run.
+        one call -- two branches, two COPYs -- cost one run. `described` is
+        what grants the module its network for the run, when it imports one.
         """
         key = (declared.module, declared.export, tuple(sorted(params.items())))
         cached = self._invoke_cache.get(key, _UNCACHED)
         if cached is not _UNCACHED:
             return cached
         try:
-            answered = self.invoke(declared.module, declared.export, dict(params))
+            answered = self.invoke(
+                declared.module, declared.export, dict(params), described=described
+            )
         except FfrwdError as err:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
@@ -11169,7 +11175,12 @@ class _Lowerer:
         cached = self._invoke_cache.get(key, _UNCACHED)
         if cached is _UNCACHED:
             try:
-                result = self.invoke(declared.module, declared.export, args)
+                result = self.invoke(
+                    declared.module,
+                    declared.export,
+                    args,
+                    described=self.describes.get(declared.module),
+                )
             except FfrwdError as err:
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,

@@ -3326,3 +3326,51 @@ mod catalog_json_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod grant_args_tests {
+    use super::take_grant_args;
+
+    fn strings(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `-http` ahead of `--invoke` is taken out before dispatch, the same
+    /// way it is ahead of a run, so a compile-time invoke of an
+    /// http-importing module can be granted.
+    #[test]
+    fn a_leading_http_grant_is_taken_out_ahead_of_invoke() {
+        let argv = strings(&[
+            "-http",
+            "module.wasm",
+            "--invoke",
+            "module.wasm",
+            "fn",
+            "{}",
+        ]);
+        let rest = take_grant_args(argv).expect("parses");
+        assert_eq!(rest, strings(&["--invoke", "module.wasm", "fn", "{}"]));
+    }
+
+    /// `-net` is taken out the same way, for the udp grant's symmetry with
+    /// the http one.
+    #[test]
+    fn a_net_grant_is_taken_out_the_same_way() {
+        let argv = strings(&["-net", "module.wasm", "--invoke", "module.wasm", "fn", "{}"]);
+        let rest = take_grant_args(argv).expect("parses");
+        assert_eq!(rest, strings(&["--invoke", "module.wasm", "fn", "{}"]));
+    }
+
+    #[test]
+    fn a_grant_with_no_value_is_refused() {
+        let err = take_grant_args(strings(&["-http"])).unwrap_err();
+        assert_eq!(err.to_string(), "-http requires a value");
+    }
+
+    #[test]
+    fn argv_carrying_no_grant_passes_through_unchanged() {
+        let argv = strings(&["--invoke", "module.wasm", "fn", "{}"]);
+        let rest = take_grant_args(argv.clone()).expect("parses");
+        assert_eq!(rest, argv);
+    }
+}

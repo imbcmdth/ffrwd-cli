@@ -229,9 +229,17 @@ class _Calls:
     def __init__(self, answer: object) -> None:
         self.answer = answer
         self.count = 0
+        self.described: Described | None = None
 
-    def __call__(self, module: str, export: str, args: dict[str, object]) -> object:
+    def __call__(
+        self,
+        module: str,
+        export: str,
+        args: dict[str, object],
+        described: Described | None = None,
+    ) -> object:
         self.count += 1
+        self.described = described
         return self.answer
 
 
@@ -347,6 +355,9 @@ def test_two_reads_of_one_call_run_the_module_once() -> None:
         probe_path=_URL_PROBES.get,
     )
     assert invoke.count == 1
+    # The module's own description rides along: it is what grants the
+    # module its network for the run.
+    assert invoke.described == _url_described()
 
 
 def test_a_url_source_row_that_cannot_be_probed_is_refused() -> None:

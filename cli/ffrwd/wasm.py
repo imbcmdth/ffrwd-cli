@@ -40,7 +40,7 @@ import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal, cast
+from typing import Literal, Protocol, cast
 
 from . import binaries, nn
 from .emit import build_network_graph
@@ -450,7 +450,20 @@ Describe = Callable[[str], Described]
 # Runs one module's function with a JSON-object argument and returns its
 # parsed JSON result, or raises FfrwdError. :func:`invoke` is the real one; a
 # lowering test passes its own, so folding a value needs no sidecar.
-Invoke = Callable[[str, str, Mapping[str, object]], object]
+#
+# `described` is optional and defaults to None (no grant) so a caller that
+# has not read the module's description yet -- or a lowering test's own
+# fake -- need not pass one; the real `invoke` reads `described.http` and
+# `described.udp` off it to grant the run the effects the module imports.
+class Invoke(Protocol):
+    def __call__(
+        self,
+        path: str,
+        function: str,
+        args: Mapping[str, object],
+        *,
+        described: Described | None = None,
+    ) -> object: ...
 
 
 def _reject(message: str, hint: str) -> FfrwdError:
@@ -647,13 +660,28 @@ def describe(path: str) -> Described:
     return _described(path, payload)
 
 
-def invoke(path: str, function: str, args: Mapping[str, object]) -> object:
+def invoke(
+    path: str,
+    function: str,
+    args: Mapping[str, object],
+    *,
+    described: Described | None = None,
+) -> object:
     """Run `function` inside the module at `path` on `args`, and return its result.
 
     ``ffrwd-wasm --invoke <module> <function> '<args-json>'`` prints one JSON
     value on stdout and exits 0, or writes a message to stderr and exits
     nonzero. `args` is marshalled to one JSON object keyed by the module's own
     parameter names.
+
+    `described` is the module's own declared interface, when the caller has
+    already read one -- the same :class:`Described` :func:`describe` returns.
+    A module that imports `wasi:http` or `wasi:sockets` needs its effect
+    granted the same way a run grants it: ``-http``/``-net <path>`` ahead of
+    ``--invoke``, the sidecar's own argv order. `described` left at its
+    default of None grants neither, which is what a caller with no
+    description in hand -- one invoking a module it knows imports nothing --
+    gets.
 
     Raises ``FfrwdError`` -- and nothing else -- when the sidecar is not
     installed, the module rejects the call, or the answer is not JSON. The
@@ -667,9 +695,16 @@ def invoke(path: str, function: str, args: Mapping[str, object]) -> object:
             hint=INSTALL_HINT,
         )
     payload = json.dumps(args, sort_keys=True)
+    argv = [sidecar]
+    if described is not None:
+        if described.http:
+            argv += [_GRANT_FLAGS["http"], path]
+        if described.udp:
+            argv += [_GRANT_FLAGS["udp"], path]
+    argv += [_INVOKE_FLAG, path, function, payload]
     try:
         done = subprocess.run(
-            [sidecar, _INVOKE_FLAG, path, function, payload],
+            argv,
             capture_output=True,
             encoding="utf-8",  # what the sidecar writes; see describe()
             errors="replace",

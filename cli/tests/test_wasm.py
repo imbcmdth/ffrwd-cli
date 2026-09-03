@@ -631,6 +631,32 @@ def test_a_missing_sidecar_refuses_the_describe(monkeypatch: pytest.MonkeyPatch)
     assert caught.value.hint is not None and "reinstall ffrwd" in caught.value.hint
 
 
+def test_invoke_grants_http_ahead_of_the_flag_only_when_described_asks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An http-importing module's compile-time run gets ``-http <path>``
+    ahead of ``--invoke``, the same order a run's own argv grants it in; a
+    module that imports neither effect -- or a caller with no description in
+    hand -- gets neither flag."""
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout="42", stderr="")
+
+    monkeypatch.setattr(wasm.subprocess, "run", fake_run)
+    monkeypatch.setattr(wasm.binaries, "ffrwd_wasm_path", lambda: "ffrwd-wasm")
+
+    wasm.invoke(MODULE, "fn", {}, described=Described(world="ffrwd:av@0.4.0", http=True))
+    wasm.invoke(MODULE, "fn", {}, described=Described(world="ffrwd:av@0.4.0"))
+    wasm.invoke(MODULE, "fn", {})
+    assert calls == [
+        ["ffrwd-wasm", "-http", MODULE, "--invoke", MODULE, "fn", "{}"],
+        ["ffrwd-wasm", "--invoke", MODULE, "fn", "{}"],
+        ["ffrwd-wasm", "--invoke", MODULE, "fn", "{}"],
+    ]
+
+
 def test_the_plan_renders_as_one_shell_pipeline() -> None:
     plan = _compiled(QUERY).plan
     assert plan is not None
@@ -1726,7 +1752,13 @@ def _folded(
 ) -> Graph:
     calls: list[tuple[str, str, dict[str, object]]] = []
 
-    def default_invoke(module: str, function: str, args: Mapping[str, object]) -> object:
+    def default_invoke(
+        module: str,
+        function: str,
+        args: Mapping[str, object],
+        *,
+        described: Described | None = None,
+    ) -> object:
         calls.append((module, function, dict(args)))
         return f"{args.get('title')}{args.get('suffix')}"
 
@@ -1838,7 +1870,7 @@ def test_a_wrong_typed_module_result_is_refused_per_call() -> None:
         "FROM input('a.mp4') f) TO 'out.mp4'"
     )
     with pytest.raises(FfrwdError) as caught:
-        _folded(sql, invoke=lambda module, function, args: 42)
+        _folded(sql, invoke=lambda module, function, args, **_: 42)
     error = caught.value
     assert error.code is ErrorCode.UDF_ARG_TYPE
     assert "returned 42" in error.message
@@ -1874,7 +1906,13 @@ def test_an_argument_typed_wrong_against_the_modules_schema_is_refused() -> None
 
 
 def test_invoke_failure_is_a_typed_error_naming_the_module() -> None:
-    def failing_invoke(module: str, function: str, args: Mapping[str, object]) -> object:
+    def failing_invoke(
+        module: str,
+        function: str,
+        args: Mapping[str, object],
+        *,
+        described: Described | None = None,
+    ) -> object:
         raise FfrwdError(
             ErrorCode.UNSUPPORTED_SQL,
             f"the module '{module}' rejected the call to {function}(): boom",
@@ -1973,7 +2011,13 @@ def test_a_value_functions_call_fills_a_stream_functions_value_parameter() -> No
     )
     calls: list[tuple[str, str, dict[str, object]]] = []
 
-    def invoke(module: str, function: str, args: Mapping[str, object]) -> object:
+    def invoke(
+        module: str,
+        function: str,
+        args: Mapping[str, object],
+        *,
+        described: Described | None = None,
+    ) -> object:
         calls.append((module, function, dict(args)))
         return f"{args.get('title')}{args.get('suffix')}"
 
@@ -2091,7 +2135,13 @@ def test_a_value_functions_call_over_row_columns_runs_once_per_distinct_argument
     )
     calls: list[tuple[str, str, dict[str, object]]] = []
 
-    def invoke(module: str, function: str, args: Mapping[str, object]) -> object:
+    def invoke(
+        module: str,
+        function: str,
+        args: Mapping[str, object],
+        *,
+        described: Described | None = None,
+    ) -> object:
         calls.append((module, function, dict(args)))
         return f"{args.get('title')}{args.get('suffix')}"
 
@@ -2120,7 +2170,7 @@ def test_a_value_functions_call_over_a_row_column_folds_in_where() -> None:
         _CUE_ROW_PROBES,
         registry=_snapshot_registry(),
         describes={BRAND: _brand_described()},
-        invoke=lambda module, function, args: f"{args.get('title')}{args.get('suffix')}",
+        invoke=lambda module, function, args, **_: f"{args.get('title')}{args.get('suffix')}",
     )
     assert sinks[0].result.rows == [["Cue two."]]
 
@@ -2310,7 +2360,13 @@ def test_a_packages_value_function_folds_against_the_packages_module(
     assert packages is not None
     ran: list[str] = []
 
-    def invoke(module: str, function: str, args: Mapping[str, object]) -> object:
+    def invoke(
+        module: str,
+        function: str,
+        args: Mapping[str, object],
+        *,
+        described: Described | None = None,
+    ) -> object:
         ran.append(module)
         return f"{args['title']}{args['suffix']}"
 
