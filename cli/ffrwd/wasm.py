@@ -47,6 +47,7 @@ from .emit import build_network_graph
 from .errors import ErrorCode, FfrwdError
 from .execute import STDIN, STDOUT
 from .ir import StreamType
+from .probe import ProbeResult, RenditionMeta, StreamMeta
 from .processes import (
     NUT,
     PCM_F32LE,
@@ -78,14 +79,20 @@ __all__ = [
     "Described",
     "DescribedFunction",
     "Invoke",
+    "SourceCatalog",
+    "SourceRendition",
+    "SourceTrack",
     "audio_encoder_codec",
+    "catalog_as_probe",
     "describe",
     "encoder_codec",
     "hosts_packet_sink",
+    "hosts_packet_source",
     "invoke",
     "language_tag",
     "model_binding",
     "model_path",
+    "probe_source",
     "rows_arms",
     "rows_fields",
     "shown_argv",
@@ -172,6 +179,9 @@ _AUDIO_ENCODER_CODECS: Mapping[str, str] = {
 
 # The first world whose sidecar hosts a packet sink.
 _PACKET_SINK_WORLD = "ffrwd:av@0.10.0"
+
+# The first world whose sidecar hosts a packet source.
+_PACKET_SOURCE_WORLD = "ffrwd:av@0.13.0"
 
 # The sample formats one can carry, and the pcm each of them travels as.
 WIRE_SAMPLE_FMTS: tuple[str, ...] = ("f32", "s16")
@@ -317,6 +327,11 @@ class Described:
     sink reads -- ``"none"``, ``"one"`` or ``"many"``. A sink built against a
     world before 0.12.0 read exactly one video stream, which is what a
     description with neither key means.
+
+    `source` marks a PACKET SOURCE -- a module that PRODUCES coded packets
+    rather than consuming or filtering them -- the same boolean-flag
+    convention `nn`/`http`/`udp` already use, false for every module built
+    before 0.13.0.
     """
 
     world: str
@@ -353,6 +368,7 @@ class Described:
     audio_codecs: tuple[str, ...] = ()
     video_streams: SinkArity = "one"
     audio_streams: SinkArity = "none"
+    source: bool = False
 
     @property
     def packet_sink(self) -> bool:
@@ -530,6 +546,7 @@ def _described(path: str, payload: object) -> Described:
         # A sink built before the counts existed read one video stream.
         video_streams=_sink_arity(payload.get("video_streams"), "one"),
         audio_streams=_sink_arity(payload.get("audio_streams"), "none"),
+        source=payload.get("source") is True,
     )
 
 
@@ -662,6 +679,341 @@ def invoke(path: str, function: str, args: Mapping[str, object]) -> object:
             f"the ffrwd-wasm sidecar's result from {function}() is not JSON",
             hint="the sidecar on PATH may be a different version than this ffrwd",
         ) from err
+
+
+# -- what a packet source publishes ----------------------------------------
+#
+# A packet source is a module that PRODUCES coded packets: `probe_source`
+# reads its compile-time catalog, `catalog_as_probe` bridges that catalog
+# into the shape everything downstream already reads a probed FILE as.
+
+_PROBE_SUBCOMMAND = "probe"
+_PARAMS_FLAG = "-params"
+
+
+@dataclass(frozen=True)
+class SourceRendition:
+    """One track's ABR row, as a packet source's ``probe`` reports it.
+
+    The wire's own ``rendition`` object -- name, bandwidth and codecs string
+    exactly as the manifest or catalog said them, None where nothing did --
+    not the fuller :class:`ffrwd.probe.RenditionMeta`, whose `streams`,
+    `width`, `height` and `program_id` a packet source never reports per
+    track.
+    """
+
+    name: str | None
+    bandwidth: int | None
+    codecs: str | None
+    language: str | None
+
+
+@dataclass(frozen=True)
+class SourceTrack:
+    """One coded track a packet source's ``probe`` reports.
+
+    `kind` is read off which arm -- ``video`` or ``audio`` -- the wire's
+    ``format`` filled; `width`/`height` come from the video arm,
+    `sample_rate`/`channels` from the audio one, and the pair for the other
+    kind stays None. `extradata` is the codec's out-of-band header, decoded
+    from the wire's hex. `row` is which relation row this track belongs to;
+    `rendition` is what the source read of that row.
+    """
+
+    codec: str
+    time_base: tuple[int, int]
+    kind: StreamType
+    width: int | None
+    height: int | None
+    sample_rate: int | None
+    channels: int | None
+    extradata: bytes
+    profile: int | None
+    level: int | None
+    row: int
+    rendition: SourceRendition
+
+
+@dataclass(frozen=True)
+class SourceCatalog:
+    """What a packet source module's ``probe(params)`` answers.
+
+    `tracks` is every coded track it publishes, in the source's own order;
+    `bounded` is whether it ever ends -- False is what :func:`catalog_as_probe`
+    reads as `live`.
+    """
+
+    tracks: tuple[SourceTrack, ...]
+    bounded: bool
+
+
+def _int_or_none(value: object) -> int | None:
+    """An optional declared int off a probe payload, treating a bool as absent."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def _source_rendition(value: object) -> SourceRendition:
+    """A track's ``rendition`` object, or one naming nothing when it is absent."""
+    if not isinstance(value, dict):
+        return SourceRendition(name=None, bandwidth=None, codecs=None, language=None)
+    name = value.get("name")
+    codecs = value.get("codecs")
+    language = value.get("language")
+    return SourceRendition(
+        name=name if isinstance(name, str) else None,
+        bandwidth=_int_or_none(value.get("bandwidth")),
+        codecs=codecs if isinstance(codecs, str) else None,
+        language=language if isinstance(language, str) else None,
+    )
+
+
+def _source_format(
+    module: str, index: int, value: object
+) -> tuple[StreamType, int | None, int | None, int | None, int | None]:
+    """A track's ``format`` arm as ``(kind, width, height, sample_rate, channels)``.
+
+    Exactly one of the video pair and the audio pair is filled; the other
+    stays ``(None, None)``. Neither arm present, or the named arm not an
+    object, is a rejection naming the module and the track.
+    """
+    if isinstance(value, dict) and isinstance(value.get("video"), dict):
+        video = value["video"]
+        return (
+            "video",
+            _int_or_none(video.get("width")),
+            _int_or_none(video.get("height")),
+            None,
+            None,
+        )
+    if isinstance(value, dict) and isinstance(value.get("audio"), dict):
+        audio = value["audio"]
+        return (
+            "audio",
+            None,
+            None,
+            _int_or_none(audio.get("sample_rate")),
+            _int_or_none(audio.get("channels")),
+        )
+    raise _reject(
+        f"track {index} of the sidecar's probe of {module} names a format "
+        "that is neither video nor audio",
+        hint="the module may be built against a sidecar this ffrwd does not know",
+    )
+
+
+def _extradata(module: str, index: int, value: object) -> bytes:
+    """A track's ``extradata`` hex string as bytes, or a rejection naming it."""
+    if isinstance(value, str):
+        try:
+            return bytes.fromhex(value)
+        except ValueError:
+            pass
+    raise _reject(
+        f"track {index} of the sidecar's probe of {module} names extradata "
+        "that is not hex",
+        hint="the module may be built against a sidecar this ffrwd does not know",
+    )
+
+
+def _time_base(module: str, index: int, value: object) -> tuple[int, int]:
+    """A track's ``time_base`` pair, or a rejection naming the module and track."""
+    if (
+        isinstance(value, list)
+        and len(value) == 2
+        and all(isinstance(n, int) and not isinstance(n, bool) for n in value)
+    ):
+        return (value[0], value[1])
+    raise _reject(
+        f"track {index} of the sidecar's probe of {module} names no time_base",
+        hint="the module may be built against a sidecar this ffrwd does not know",
+    )
+
+
+def _source_track(module: str, index: int, raw: object) -> SourceTrack:
+    """One entry of the probe payload's ``tracks`` list as a :class:`SourceTrack`."""
+    if not isinstance(raw, dict):
+        raise _reject(
+            f"track {index} of the sidecar's probe of {module} is not an object",
+            hint="the module may be built against a sidecar this ffrwd does not know",
+        )
+    codec = raw.get("codec")
+    if not isinstance(codec, str):
+        raise _reject(
+            f"track {index} of the sidecar's probe of {module} names no codec",
+            hint="the module may be built against a sidecar this ffrwd does not know",
+        )
+    row = raw.get("row")
+    if not isinstance(row, int) or isinstance(row, bool):
+        raise _reject(
+            f"track {index} of the sidecar's probe of {module} names no row",
+            hint="the module may be built against a sidecar this ffrwd does not know",
+        )
+    kind, width, height, sample_rate, channels = _source_format(
+        module, index, raw.get("format")
+    )
+    return SourceTrack(
+        codec=codec,
+        time_base=_time_base(module, index, raw.get("time_base")),
+        kind=kind,
+        width=width,
+        height=height,
+        sample_rate=sample_rate,
+        channels=channels,
+        extradata=_extradata(module, index, raw.get("extradata")),
+        profile=_int_or_none(raw.get("profile")),
+        level=_int_or_none(raw.get("level")),
+        row=row,
+        rendition=_source_rendition(raw.get("rendition")),
+    )
+
+
+def _source_catalog(module: str, payload: object) -> SourceCatalog:
+    """One ``probe`` document as a :class:`SourceCatalog`."""
+    if not isinstance(payload, dict):
+        raise _reject(
+            f"the sidecar probed {module} with something that is not an object",
+            hint="the module may be built against a sidecar this ffrwd does not know",
+        )
+    raw_tracks = payload.get("tracks")
+    if not isinstance(raw_tracks, list):
+        raise _reject(
+            f"the sidecar's probe of {module} names no tracks",
+            hint="the module may be built against a sidecar this ffrwd does not know",
+        )
+    tracks = tuple(_source_track(module, i, raw) for i, raw in enumerate(raw_tracks))
+    return SourceCatalog(tracks=tracks, bounded=payload.get("bounded") is True)
+
+
+def probe_source(module: str, params: str) -> SourceCatalog:
+    """Ask the sidecar what the packet-source module at `module` publishes for `params`.
+
+    ``ffrwd-wasm probe <module> -params '<json>'`` prints one JSON line naming
+    every coded track the module would produce and whether the source ever
+    ends. `params` travels verbatim -- already marshalled JSON, the same
+    convention :func:`invoke` follows for its own argument.
+
+    Raises ``FfrwdError`` -- and nothing else -- when the sidecar is not
+    installed, cannot probe the module, or answers with something that is not
+    the documented shape. The rejection carries no position; the caller
+    anchors it on the call that named the module.
+    """
+    sidecar = binaries.ffrwd_wasm_path()
+    if sidecar is None:
+        raise _reject(
+            f"the ffrwd-wasm sidecar is not installed, and probing '{module}' "
+            "needs it to read the module",
+            hint=INSTALL_HINT,
+        )
+    try:
+        done = subprocess.run(
+            [sidecar, _PROBE_SUBCOMMAND, module, _PARAMS_FLAG, params],
+            capture_output=True,
+            encoding="utf-8",  # what the sidecar writes; see describe()
+            errors="replace",
+            timeout=_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, ValueError) as err:
+        raise _reject(
+            f"could not run the ffrwd-wasm sidecar at {sidecar}: "
+            f"{getattr(err, 'strerror', None) or err}",
+            hint=INSTALL_HINT,
+        ) from err
+    except subprocess.TimeoutExpired as err:
+        raise _reject(
+            f"the ffrwd-wasm sidecar did not probe {module} within "
+            f"{_TIMEOUT_SECONDS:.0f}s",
+            hint="check the module is a wasm component and not something much larger",
+        ) from err
+    if done.returncode != 0:
+        raise _reject(
+            f"the ffrwd-wasm sidecar could not probe {module}: "
+            f"{_first_line(done.stderr)}",
+            hint="check the path names a wasm component built for the ffrwd world",
+        )
+    try:
+        payload = json.loads(done.stdout)
+    except ValueError as err:
+        raise _reject(
+            f"the ffrwd-wasm sidecar's probe of {module} is not JSON",
+            hint="the sidecar on PATH may be a different version than this ffrwd",
+        ) from err
+    return _source_catalog(module, payload)
+
+
+def catalog_as_probe(alias: str, catalog: SourceCatalog) -> ProbeResult:
+    """A packet source's catalog as a :class:`~ffrwd.probe.ProbeResult`.
+
+    The bridge from a compile-time SOURCE probe to everything downstream
+    that already reads a :class:`ProbeResult` the way ffprobe hands one
+    over. One `StreamMeta` per track, catalog order, its per-type `index`
+    counted the way ffprobe counts one -- 0-based, video and audio counted
+    separately. One `RenditionMeta` per distinct `row`, first-seen order,
+    holding that row's own streams plus the attributes its FIRST track's
+    `rendition` named -- muxed tracks of one row agree on them in practice.
+
+    `live` is the negation of `bounded`: an unbounded source reads exactly
+    like a live manifest to everything that reads `ProbeResult.live`.
+    `format_name` names the packet-source kind, the same way `format_name`
+    already says a probed file is a webvtt document. `alias` is accepted for
+    symmetry with a call site that keys its inputs by alias; nothing here
+    reads its value.
+    """
+    video_index = 0
+    audio_index = 0
+    streams: list[StreamMeta] = []
+    row_order: list[int] = []
+    streams_by_row: dict[int, list[StreamMeta]] = {}
+    rendition_by_row: dict[int, SourceRendition] = {}
+    for track in catalog.tracks:
+        if track.kind == "video":
+            index, video_index = video_index, video_index + 1
+        else:
+            index, audio_index = audio_index, audio_index + 1
+        stream = StreamMeta(
+            type=track.kind,
+            index=index,
+            metadata={},
+            width=track.width,
+            height=track.height,
+            fps=None,
+            sample_rate=track.sample_rate,
+            codec=track.codec,
+            channels=track.channels,
+        )
+        streams.append(stream)
+        if track.row not in streams_by_row:
+            row_order.append(track.row)
+            streams_by_row[track.row] = []
+            rendition_by_row[track.row] = track.rendition
+        streams_by_row[track.row].append(stream)
+
+    renditions: list[RenditionMeta] = []
+    for row in row_order:
+        row_streams = streams_by_row[row]
+        video = next((s for s in row_streams if s.type == "video"), None)
+        rendition = rendition_by_row[row]
+        renditions.append(
+            RenditionMeta(
+                streams=row_streams,
+                bandwidth=rendition.bandwidth,
+                width=video.width if video is not None else None,
+                height=video.height if video is not None else None,
+                codecs=rendition.codecs,
+                name=rendition.name,
+                language=rendition.language,
+                program_id=None,
+            )
+        )
+
+    return ProbeResult(
+        streams=streams,
+        format_name="packet-source",
+        renditions=renditions,
+        live=not catalog.bounded,
+    )
 
 
 def _first_line(text: str) -> str:
@@ -1013,6 +1365,11 @@ def audio_encoder_codec(encoder: str) -> str | None:
 def hosts_packet_sink(world: str) -> bool:
     """True when `world`'s sidecar can host a packet sink."""
     return world in WORLDS and WORLDS.index(world) >= WORLDS.index(_PACKET_SINK_WORLD)
+
+
+def hosts_packet_source(world: str) -> bool:
+    """True when `world`'s sidecar can host a packet source."""
+    return world in WORLDS and WORLDS.index(world) >= WORLDS.index(_PACKET_SOURCE_WORLD)
 
 
 def _listed(names: Sequence[str], empty: str) -> str:

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import functools
 import json
+import subprocess
 from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
@@ -4135,6 +4136,240 @@ def test_the_worlds_hosting_packet_sinks_start_at_the_encoded_edge() -> None:
     assert wasm.hosts_packet_sink("ffrwd:av@0.10.0")
     assert not wasm.hosts_packet_sink("ffrwd:av@0.9.0")
     assert not wasm.hosts_packet_sink("ffrwd:av@9.9.9")
+
+
+# ---------------------------------------------------------------------------
+# packet sources
+# ---------------------------------------------------------------------------
+#
+# The mirror of a packet sink: a module that PRODUCES coded packets rather
+# than consuming them. `probe_source` reads its compile-time catalog off a
+# faked sidecar subprocess, the way tests/test_probe.py fakes ffprobe's;
+# `catalog_as_probe` bridges that catalog into the shape everything
+# downstream already reads a probed FILE as.
+
+PACKET_SOURCE_MODULE = "modules/hls_source.wasm"
+
+# Two tracks muxed into one rendition (row 0), and a second, audio-only
+# rendition (row 1) -- rows read back as [0, 0, 1].
+_SOURCE_CATALOG_JSON: dict[str, object] = {
+    "tracks": [
+        {
+            "codec": "h264",
+            "time_base": [1, 90000],
+            "format": {"video": {"width": 1280, "height": 720}},
+            "extradata": "0102ff",
+            "profile": 100,
+            "level": 31,
+            "row": 0,
+            "rendition": {
+                "name": "720p",
+                "bandwidth": 2500000,
+                "codecs": None,
+                "language": None,
+            },
+        },
+        {
+            "codec": "aac",
+            "time_base": [1, 48000],
+            "format": {"audio": {"sample_rate": 48000, "channels": 2}},
+            "extradata": "",
+            "profile": None,
+            "level": None,
+            "row": 0,
+            "rendition": {
+                "name": "720p",
+                "bandwidth": 2500000,
+                "codecs": None,
+                "language": None,
+            },
+        },
+        {
+            "codec": "aac",
+            "time_base": [1, 44100],
+            "format": {"audio": {"sample_rate": 44100, "channels": 2}},
+            "extradata": "",
+            "profile": None,
+            "level": None,
+            "row": 1,
+            "rendition": {
+                "name": "audio-only",
+                "bandwidth": 128000,
+                "codecs": None,
+                "language": "en",
+            },
+        },
+    ],
+    "bounded": False,
+}
+
+
+def _fake_wasm_run(
+    monkeypatch: pytest.MonkeyPatch, stdout: str, returncode: int = 0
+) -> list[list[str]]:
+    """Fakes the sidecar subprocess `probe_source` spawns, the way
+    tests/test_probe.py's `_fake_run` fakes ffprobe's."""
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, returncode, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(wasm.subprocess, "run", fake_run)
+    monkeypatch.setattr(wasm.binaries, "ffrwd_wasm_path", lambda: "ffrwd-wasm")
+    return calls
+
+
+def test_probe_source_spawns_the_documented_argv(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = _fake_wasm_run(monkeypatch, json.dumps(_SOURCE_CATALOG_JSON))
+    wasm.probe_source(PACKET_SOURCE_MODULE, '{"url": "x"}')
+    assert calls == [
+        ["ffrwd-wasm", "probe", PACKET_SOURCE_MODULE, "-params", '{"url": "x"}']
+    ]
+
+
+def test_probe_source_parses_a_muxed_rendition_and_an_audio_only_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _fake_wasm_run(monkeypatch, json.dumps(_SOURCE_CATALOG_JSON))
+    catalog = wasm.probe_source(PACKET_SOURCE_MODULE, "{}")
+    assert catalog.bounded is False
+    assert [t.row for t in catalog.tracks] == [0, 0, 1]
+    video, audio0, audio1 = catalog.tracks
+    assert (video.kind, video.codec, video.time_base) == ("video", "h264", (1, 90000))
+    assert (video.width, video.height) == (1280, 720)
+    assert (video.sample_rate, video.channels) == (None, None)
+    assert (video.profile, video.level) == (100, 31)
+    assert (audio0.kind, audio0.codec) == ("audio", "aac")
+    assert (audio0.width, audio0.height) == (None, None)
+    assert (audio0.sample_rate, audio0.channels) == (48000, 2)
+    assert audio1.rendition == wasm.SourceRendition(
+        name="audio-only", bandwidth=128000, codecs=None, language="en"
+    )
+
+
+def test_extradata_hex_is_decoded_to_bytes(monkeypatch: pytest.MonkeyPatch) -> None:
+    _fake_wasm_run(monkeypatch, json.dumps(_SOURCE_CATALOG_JSON))
+    catalog = wasm.probe_source(PACKET_SOURCE_MODULE, "{}")
+    assert catalog.tracks[0].extradata == bytes.fromhex("0102ff")
+    assert catalog.tracks[1].extradata == b""
+
+
+def test_a_malformed_probe_line_is_refused_naming_the_module(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _fake_wasm_run(monkeypatch, "not json")
+    with pytest.raises(FfrwdError) as caught:
+        wasm.probe_source(PACKET_SOURCE_MODULE, "{}")
+    assert PACKET_SOURCE_MODULE in caught.value.message
+
+
+def test_a_probe_track_missing_its_codec_is_refused_naming_the_module(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _fake_wasm_run(
+        monkeypatch,
+        json.dumps({"tracks": [{"time_base": [1, 90000], "row": 0}], "bounded": True}),
+    )
+    with pytest.raises(FfrwdError) as caught:
+        wasm.probe_source(PACKET_SOURCE_MODULE, "{}")
+    assert PACKET_SOURCE_MODULE in caught.value.message
+    assert "track 0" in caught.value.message
+
+
+def test_a_probe_track_with_an_unknown_format_arm_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _fake_wasm_run(
+        monkeypatch,
+        json.dumps(
+            {
+                "tracks": [
+                    {
+                        "codec": "h264",
+                        "time_base": [1, 90000],
+                        "format": {"subtitle": {}},
+                        "extradata": "",
+                        "profile": None,
+                        "level": None,
+                        "row": 0,
+                        "rendition": {},
+                    }
+                ],
+                "bounded": True,
+            }
+        ),
+    )
+    with pytest.raises(FfrwdError) as caught:
+        wasm.probe_source(PACKET_SOURCE_MODULE, "{}")
+    assert "neither video nor audio" in caught.value.message
+
+
+def test_a_probe_with_tracks_not_a_list_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    _fake_wasm_run(monkeypatch, json.dumps({"tracks": "nope", "bounded": True}))
+    with pytest.raises(FfrwdError) as caught:
+        wasm.probe_source(PACKET_SOURCE_MODULE, "{}")
+    assert PACKET_SOURCE_MODULE in caught.value.message
+
+
+def test_a_missing_sidecar_refuses_the_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(wasm.binaries, "ffrwd_wasm_path", lambda: None)
+    with pytest.raises(FfrwdError) as caught:
+        wasm.probe_source(PACKET_SOURCE_MODULE, "{}")
+    assert caught.value.hint is not None
+    assert "reinstall ffrwd" in caught.value.hint
+    assert "FFRWD_WASM" in caught.value.hint
+
+
+def test_catalog_as_probe_builds_two_renditions_with_counted_indexes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _fake_wasm_run(monkeypatch, json.dumps(_SOURCE_CATALOG_JSON))
+    catalog = wasm.probe_source(PACKET_SOURCE_MODULE, "{}")
+    probed = wasm.catalog_as_probe("src", catalog)
+    assert probed.format_name == "packet-source"
+    assert probed.live is True
+    assert [(s.type, s.index) for s in probed.streams] == [
+        ("video", 0),
+        ("audio", 0),
+        ("audio", 1),
+    ]
+    assert len(probed.renditions) == 2
+    muxed, audio_only = probed.renditions
+    assert [s.type for s in muxed.streams] == ["video", "audio"]
+    assert (muxed.width, muxed.height) == (1280, 720)
+    assert muxed.bandwidth == 2500000
+    assert [s.type for s in audio_only.streams] == ["audio"]
+    assert (audio_only.width, audio_only.height) == (None, None)
+    assert (audio_only.name, audio_only.language) == ("audio-only", "en")
+
+
+def test_a_bounded_catalog_is_not_live(monkeypatch: pytest.MonkeyPatch) -> None:
+    bounded = {**_SOURCE_CATALOG_JSON, "bounded": True}
+    _fake_wasm_run(monkeypatch, json.dumps(bounded))
+    catalog = wasm.probe_source(PACKET_SOURCE_MODULE, "{}")
+    assert wasm.catalog_as_probe("src", catalog).live is False
+
+
+def test_the_worlds_hosting_packet_sources_start_at_0_13_0() -> None:
+    assert "ffrwd:av@0.13.0" in wasm.WORLDS
+    assert wasm.hosts_packet_source("ffrwd:av@0.13.0")
+    assert not wasm.hosts_packet_source("ffrwd:av@0.12.0")
+    assert not wasm.hosts_packet_source("ffrwd:av@9.9.9")
+
+
+def test_the_source_marker_reads_off_the_describe_payload() -> None:
+    described = wasm._described(
+        PACKET_SOURCE_MODULE, {"world": "ffrwd:av@0.13.0", "name": "s", "source": True}
+    )
+    assert described.source is True
+
+
+def test_an_absent_source_key_is_not_a_source() -> None:
+    described = wasm._described(
+        PACKET_SOURCE_MODULE, {"world": "ffrwd:av@0.13.0", "name": "s"}
+    )
+    assert described.source is False
 
 
 def test_the_encoder_names_map_to_the_codecs_they_write() -> None:
