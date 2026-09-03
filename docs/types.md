@@ -18,6 +18,14 @@ column tables are in [rows.md](rows.md).
 `input('film.mkv') f` is a table of ONE `container` row.
 `unnest(f.audio) a` is rows of `audio_stream`.
 
+`vector` is not a kind of its own: it is a JSON array of numbers, and joins
+`text`/`number`/`boolean` as a `LANGUAGE wasm` value function's own domain
+(a parameter, a `RETURNS`, an annotation field) - never a scalar a table
+row or a tag may otherwise carry. A vector row column reads and prints
+(capped, as a cell), but does not compare, concatenate, or cast to text;
+`cos_similarity(vector, vector)` and `vector_length(vector)` are the two
+functions that read one, each returning `number`.
+
 ## The record is the stream
 
 A stream record is what filters take and return, what `-map` maps, and

@@ -38,7 +38,7 @@ rtype   := text | number | boolean | <kind>_stream | chapter | cue
 wstype  := video_stream | audio_stream | either of those with []
 wrtype  := wstype | sink | STRUCT(name wstype, name annotation)
 annotation := STRUCT(field vtype, ...)[] | cue[]
-vtype   := text | number | boolean
+vtype   := text | number | boolean | vector
 select  := [WITH cte (, cte)*] SELECT columns FROM from [WHERE pred]
            [GROUP BY exprs] [ORDER BY exprs] [LIMIT count] [OFFSET count]
            (UNION ALL select)*
@@ -101,15 +101,24 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   [98](examples.md#98-post-what-a-module-found-as-it-is-found),
   [99](examples.md#99-watch-the-frames-go-by).
 - A **value-returning `LANGUAGE wasm` function** (`RETURNS text`,
-  `number` or `boolean`) takes no stream at all: every parameter is one
-  of those same three types, matched name-for-name against the schema
-  the module's own function declares, and RETURNS against what that
-  function returns. It runs once per call, at compile time - like
-  ffprobe, not like a filter. Recipe
+  `number`, `boolean` or `vector`) takes no stream at all: every
+  parameter is one of those same `vtype`s, matched name-for-name against
+  the schema the module's own function declares, and RETURNS against
+  what that function returns. It runs once per call, at compile time -
+  like ffprobe, not like a filter. Recipe
   [89](examples.md#89-compute-a-tag-with-a-wasm-module). Over a row
   column it runs once per row, memoized on its arguments - the same
   per-row footing the built-in text and number functions have
   ([recipe 112](examples.md#112-a-function-over-a-caption-files-cues)).
+  A `vector` is a JSON array of numbers - the wire shape of an
+  embedding - and joins `vtype` for exactly this: a value function's
+  own parameters and RETURNS, and an annotation field. It is not a
+  scalar column type otherwise: it prints (capped, as a cell) but
+  cannot be compared, concatenated, cast to text, or written as a tag.
+  `cos_similarity(vector, vector) -> number` and `vector_length(vector)
+  -> number` are the two built-ins over it, evaluated at compile time
+  and, over a row column, once per row like any other. Recipe
+  [114](examples.md#114-rank-rows-by-a-vector).
 - A **rows `LANGUAGE wasm` function** (one annotation parameter,
   `RETURNS` an annotation) reads rows and writes rows with no stream
   at all. Its argument is the annotation column a run-time module
@@ -1118,7 +1127,12 @@ Every one of these is a typed rejection, never a silent reinterpretation:
   grouped query (tag inside a CTE, aggregate outside).
 - **Values**: casts other than to text; computed input paths;
   computed subscripts; `0` or negative subscripts; `||` over numbers
-  without `::text`; division by a known zero.
+  without `::text`; division by a known zero; a vector compared,
+  concatenated, cast to text, or written as a tag; `cos_similarity`/
+  `vector_length` called with the wrong argument count, or over
+  anything but a vector - a length mismatch between the two
+  `cos_similarity` arguments is refused too, but only once the vectors
+  themselves are known, naming both lengths.
 - **`generate_series`**: a bound or step that is not an integer literal
   after substitution (a column reference included); a `0` step; a
   descending or empty range; an unaliased call.
@@ -1153,8 +1167,8 @@ Every one of these is a typed rejection, never a silent reinterpretation:
   window or stride other than 1; two streams into one module that do
   not run in lockstep; a
   declared kind the module does not filter; a value signature with a
-  parameter or a `RETURNS` outside
-  `text`/`number`/`boolean`, or a `DEFAULT` on one of its parameters; an
+  parameter or a `RETURNS` outside `vtype`, or a `DEFAULT` on one of its
+  parameters; an
   export name the module does not have, or - for a value function - not
   in the module's own function list; a wit world this ffrwd does not
   host; a module declaring both pixel formats and sample formats, or
@@ -1176,7 +1190,7 @@ Every one of these is a typed rejection, never a silent reinterpretation:
   package's lib file that leaves the package directory.
 - **Annotations**: a `RETURNS STRUCT` that is not one stream field
   followed by one annotation array; an annotation field typed anything
-  but `text`, `number` or `boolean`; a record the producing module's
+  but `vtype`; a record the producing module's
   row schema does not match; an annotation return over a module that
   emits no rows; an annotation column anywhere but right after the
   stream, beside several streams, given a `DEFAULT` other than `NULL`,

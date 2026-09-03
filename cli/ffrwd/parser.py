@@ -805,6 +805,24 @@ _BUILTIN_VALUE_FUNCS = (
     exp.Substring,
 )
 
+# The dialect's built-in VECTOR functions, by name and arity -- sqlglot has no
+# native node for either, so both parse as a bare call (`exp.Anonymous`) and
+# are found by name, the same way a declared wasm value function is. Every
+# argument is a vector, and the result is always a number.
+_VECTOR_BUILTIN_ARITY: dict[str, int] = {
+    "cos_similarity": 2,
+    "vector_length": 1,
+}
+
+
+def _is_vector_builtin(node: exp.Expr) -> bool:
+    """True for a bare call naming one of :data:`_VECTOR_BUILTIN_ARITY`."""
+    return (
+        isinstance(node, exp.Anonymous)
+        and not isinstance(node.parent, exp.Dot)
+        and str(node.name).lower() in _VECTOR_BUILTIN_ARITY
+    )
+
 
 def is_value_expr(node: exp.Expr | None) -> bool:
     """True for a shape that is a compile-time VALUE and can never be a stream.
@@ -4023,7 +4041,7 @@ class _Resolver:
             return
         inner = projection.this if isinstance(projection, exp.Alias) else projection
         value = _unwrap_paren(inner) if isinstance(inner, exp.Expr) else None
-        if is_value_expr(value):
+        if is_value_expr(value) or (isinstance(value, exp.Expr) and _is_vector_builtin(value)):
             self._check_value_expr(value, scope, select)
 
     def _check_tags_fields(
@@ -4032,16 +4050,30 @@ class _Resolver:
         """Type-check every field of a ``tags`` column's struct literals.
 
         The fields are ordinary compile-time values; the map operands around
-        them are not, and lower reads those.
+        them are not, and lower reads those. A vector is not one of them --
+        a tag is text ffmpeg writes as metadata, and a vector has no text form.
         """
         for node in projection.walk():
             if not isinstance(node, exp.Struct):
                 continue
             for entry in node.expressions:
-                if isinstance(entry, exp.PropertyEQ) and isinstance(
-                    entry.expression, exp.Expr
+                if not (
+                    isinstance(entry, exp.PropertyEQ)
+                    and isinstance(entry.expression, exp.Expr)
                 ):
-                    self._check_value_expr(entry.expression, scope, select)
+                    continue
+                field_type = self._check_value_expr(entry.expression, scope, select)
+                if field_type != "vector":
+                    continue
+                written = _ident_name(entry.this) if isinstance(entry.this, exp.Expr) else "?"
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"tag '{written}' is a vector",
+                    entry.expression,
+                    fallback=select,
+                    hint="a tag is text; read vector_length(...) or "
+                    "cos_similarity(...) instead",
+                )
 
     def _check_expression(
         self, node: exp.Expr, select: exp.Select, *, array_agg: exp.Expr | None = None
@@ -6572,6 +6604,8 @@ class _Resolver:
             return True
         if isinstance(node, _BUILTIN_VALUE_FUNCS):
             return True
+        if isinstance(node, exp.Expr) and _is_vector_builtin(node):
+            return True
         if isinstance(node, exp.Anonymous) and not isinstance(node.parent, exp.Dot):
             declared = self.wasm.get(str(node.name).lower())
             return declared is not None and declared.is_value
@@ -6907,6 +6941,9 @@ class _Resolver:
                         "same type",
                     )
             return found
+        vector_type = self._check_vector_builtin_call(value, scope, fallback)
+        if vector_type is not None:
+            return vector_type
         wasm_type = self._wasm_value_type(value, scope, fallback)
         if wasm_type is not None:
             return wasm_type
@@ -6917,6 +6954,52 @@ class _Resolver:
             fallback=fallback,
             hint=_VALUE_HINT,
         )
+
+    def _check_vector_builtin_call(
+        self, node: exp.Expr, scope: dict[str, str], fallback: exp.Expr
+    ) -> str | None:
+        """``cos_similarity``/``vector_length``: fixed-arity, every argument a vector.
+
+        None for anything else. The result is always a number. A length
+        mismatch between two vectors is not caught here -- lengths are data,
+        knowable only once the vectors themselves are evaluated -- so lower
+        is where that one is refused.
+        """
+        if not _is_vector_builtin(node):
+            return None
+        assert isinstance(node, exp.Anonymous)
+        name = str(node.name).lower()
+        arity = _VECTOR_BUILTIN_ARITY[name]
+        args = [a for a in node.expressions if isinstance(a, exp.Expr)]
+        if any(isinstance(a, exp.Kwarg) for a in node.expressions):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"{name}() does not take named arguments",
+                node,
+                fallback=fallback,
+                hint=f"{name}()'s arguments are positional vectors",
+            )
+        if len(args) != arity:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"{name}() takes {arity} argument{'' if arity == 1 else 's'}, got "
+                f"{len(args)}",
+                node,
+                fallback=fallback,
+                hint=f"{name}({', '.join(['a vector'] * arity)})",
+            )
+        for arg in args:
+            arg_type = self._check_value_expr(arg, scope, fallback)
+            if arg_type is not None and arg_type != "vector":
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"{name}() takes a vector, got {arg_type}",
+                    arg,
+                    fallback=fallback,
+                    hint=f"{name}() reads a row column or a value function's "
+                    "result, either typed vector",
+                )
+        return "number"
 
     def _wasm_value_type(
         self, node: exp.Expr, scope: dict[str, str], fallback: exp.Expr
@@ -7101,6 +7184,15 @@ class _Resolver:
                     f"CASE WHEN t.{DISPOSITION_COLUMN}.{DISPOSITION_KEYS[0]} "
                     "THEN 'main' ELSE 'alt' END",
                 )
+            if side_type == "vector":
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    "'||' joins text, but one side is a vector",
+                    side if isinstance(side, exp.Expr) else None,
+                    fallback=fallback,
+                    hint="a vector has no text form; read vector_length(...) "
+                    "or compare it with cos_similarity(...)",
+                )
         return "text"
 
     def _check_arithmetic(
@@ -7181,6 +7273,15 @@ class _Resolver:
                 "for '||', e.g. 'w=' || t.width::text",
             )
         value_type = self._check_value_expr(node.this, scope, fallback)
+        if value_type == "vector":
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "a vector cannot be cast to text",
+                node,
+                fallback=fallback,
+                hint="read vector_length(...) instead, or compare it with "
+                "cos_similarity(...)",
+            )
         return None if value_type is None else "text"
 
     def _check_value_pair(
@@ -7194,6 +7295,15 @@ class _Resolver:
         """Two compile-time operands of one comparison: their types must match."""
         left_type = self._check_value_expr(left, scope, fallback)
         right_type = self._check_value_expr(right, scope, fallback)
+        if left_type == "vector" or right_type == "vector":
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "a vector cannot be compared",
+                right if isinstance(right, exp.Expr) else None,
+                fallback=fallback,
+                hint="a vector has no order; compare it with "
+                "cos_similarity(...) instead",
+            )
         if left_type is None or right_type is None or left_type == right_type:
             return
         raise _error(
@@ -7265,8 +7375,9 @@ class _Resolver:
     def _check_order(
         self, order: exp.Order, scope: dict[str, str], select: exp.Select
     ) -> None:
-        """Every sort key is a track-row metadata column, or a rendition
-        column of a plain input alias, and nothing else.
+        """Every sort key is a track-row metadata column, a rendition column
+        of a plain input alias, or a compile-time value computed over one --
+        the same domain a WHERE operand admits -- and nothing else.
 
         Reaching here at all means the branch has a row source or an
         `input(...)` alias (:func:`_has_row_source` and
@@ -7277,7 +7388,7 @@ class _Resolver:
         input alias syntactically -- only a probe says whether that input
         actually has renditions, and lower is what refuses it when it does
         not. Sorting frames, a CTE's streams, or a time column is still
-        NO_STREAMING_EQUIVALENT.
+        NO_STREAMING_EQUIVALENT, and so is a vector -- it has no order.
         """
         _check_query_args(order, frozenset({"expressions"}), "ORDER BY")
         expressions = order.expressions
@@ -7302,49 +7413,62 @@ class _Resolver:
             )
             key = ordered.this
             key = _unwrap_paren(key) if isinstance(key, exp.Expr) else None
-            if not isinstance(key, exp.Column) or isinstance(key.this, exp.Star):
-                raise _error(
-                    ErrorCode.NO_STREAMING_EQUIVALENT,
-                    "ORDER BY has no streaming equivalent",
-                    ordered,
-                    fallback=order,
-                    hint="only track-row metadata columns can be sorted; "
-                    + _ROW_ORDER_HINT,
-                )
-            table_node = key.args.get("table")
-            alias = _ident_name(table_node) if table_node is not None else ""
-            kind = scope.get(alias)
-            if kind == "input" and (
-                _ident_name(key.this) in RENDITION_COLUMNS
-                or (
-                    alias in self.wasm_sources
-                    and _is_module_source_column(_ident_name(key.this))
-                )
-            ):
-                # A rendition column of a plain input alias: admitted on
-                # spec, since only lower's probe can say whether this input
-                # actually resolved to a rendition row table. A `RETURNS
-                # source` alias's own value columns ride the same admission,
-                # named by the module rather than by the manifest.
+            if isinstance(key, exp.Column) and not isinstance(key.this, exp.Star):
+                table_node = key.args.get("table")
+                alias = _ident_name(table_node) if table_node is not None else ""
+                kind = scope.get(alias)
+                if kind == "input" and (
+                    _ident_name(key.this) in RENDITION_COLUMNS
+                    or (
+                        alias in self.wasm_sources
+                        and _is_module_source_column(_ident_name(key.this))
+                    )
+                ):
+                    # A rendition column of a plain input alias: admitted on
+                    # spec, since only lower's probe can say whether this input
+                    # actually resolved to a rendition row table. A `RETURNS
+                    # source` alias's own value columns ride the same admission,
+                    # named by the module rather than by the manifest.
+                    continue
+                if kind != "row":
+                    raise _error(
+                        ErrorCode.NO_STREAMING_EQUIVALENT,
+                        "ORDER BY has no streaming equivalent",
+                        key,
+                        fallback=order,
+                        hint="only track-row metadata columns can be sorted; "
+                        + _ROW_ORDER_HINT,
+                    )
+                if self._check_row_column(key, alias, order) == "stream":
+                    raise _error(
+                        ErrorCode.UNSUPPORTED_SQL,
+                        f"'{alias}' is a stream, and streams have no order to "
+                        "sort by",
+                        key,
+                        fallback=order,
+                        hint=_ROW_ORDER_HINT,
+                    )
                 continue
-            if kind != "row":
-                raise _error(
-                    ErrorCode.NO_STREAMING_EQUIVALENT,
-                    "ORDER BY has no streaming equivalent",
-                    key,
-                    fallback=order,
-                    hint="only track-row metadata columns can be sorted; "
-                    + _ROW_ORDER_HINT,
-                )
-            if self._check_row_column(key, alias, order) == "stream":
-                raise _error(
-                    ErrorCode.UNSUPPORTED_SQL,
-                    f"'{alias}' is a stream, and streams have no order to "
-                    "sort by",
-                    key,
-                    fallback=order,
-                    hint=_ROW_ORDER_HINT,
-                )
+            if key is not None and self._is_row_predicate_value(key):
+                sort_type = self._check_value_expr(key, scope, order)
+                if sort_type == "vector":
+                    raise _error(
+                        ErrorCode.UNSUPPORTED_SQL,
+                        "a vector has no order to sort by",
+                        key,
+                        fallback=order,
+                        hint="sort by a function over it instead, e.g. "
+                        "ORDER BY cos_similarity(...)",
+                    )
+                continue
+            raise _error(
+                ErrorCode.NO_STREAMING_EQUIVALENT,
+                "ORDER BY has no streaming equivalent",
+                ordered,
+                fallback=order,
+                hint="only track-row metadata columns can be sorted; "
+                + _ROW_ORDER_HINT,
+            )
 
     # -- LIMIT / OFFSET over track rows --------------------------
 

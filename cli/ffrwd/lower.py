@@ -279,6 +279,7 @@ from __future__ import annotations
 import base64
 import difflib
 import json
+import math
 import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -321,6 +322,7 @@ from ffrwd.parser import (
     _ARITHMETIC_NAMES,
     _BUILTIN_VALUE_FUNCS,
     _REMOVED_FRAME,
+    _VECTOR_BUILTIN_ARITY,
     FILTER_NAMESPACE,
     MACRO_NAMESPACE,
     MAP_COLUMNS,
@@ -397,6 +399,7 @@ from ffrwd.table import (
     StreamCell,
     TableResult,
     TableSink,
+    VectorCell,
 )
 from ffrwd.types import (
     ATTACHMENT_TYPE,
@@ -467,12 +470,14 @@ ProbePath = Callable[[str], ProbeResult | None]
 # The python types each JSON Schema type a module parameter may declare
 # accepts. A schema naming anything else is left alone: what the module
 # takes is the module's business, and only the shapes named here are ones a
-# written argument can be judged against.
+# written argument can be judged against. `array` is a vector's own wire
+# type -- the tuple `RowValue` already folds it to.
 _JSON_TYPES: dict[str, tuple[type, ...]] = {
     "string": (str,),
     "number": (int, float),
     "integer": (int, float),
     "boolean": (bool,),
+    "array": (tuple,),
 }
 
 # A miss in `_Lowerer._invoke_cache`: distinct from every JSON value a module
@@ -2373,9 +2378,12 @@ class _SourceBinding:
 
 
 # A track-row metadata value: NULL (unprobed input, or a field this file does
-# not carry) or the probed scalar. A disposition flag is the boolean case.
-# Never a stream — the row IS that.
-RowValue = str | int | float | bool | None
+# not carry) or the probed scalar. A disposition flag is the boolean case. A
+# vector row column (an annotation field, or a value function's result) is a
+# tuple of floats -- immutable and hashable, unlike a list, which is what
+# lets one memoize a wasm value call and key a GROUP BY on its result. Never
+# a stream — the row IS that.
+RowValue = str | int | float | bool | tuple[float, ...] | None
 
 # `_TrackRow.stream` for a row that carries no track -- a chapter row, or a
 # written row. Never a real stream (neither exposes a stream column at
@@ -2714,6 +2722,18 @@ def _disposition_cell(row: _TrackRow | None) -> CellValue:
     return _flags_to_cell(row.stream.source.disposition)
 
 
+def _row_value_as_cell(value: RowValue) -> CellValue:
+    """A row value as a printable cell: a vector wraps, everything else already is one."""
+    return VectorCell(values=value) if isinstance(value, tuple) else value
+
+
+def _is_number_list(result: object) -> bool:
+    """True for a JSON array of numbers -- a vector-returning module's answer."""
+    return isinstance(result, list) and all(
+        isinstance(v, int | float) and not isinstance(v, bool) for v in result
+    )
+
+
 def _row_star_error(
     binding: _RowBinding, anchor: exp.Expr, select: exp.Select
 ) -> FfrwdError:
@@ -2909,6 +2929,8 @@ def _sort_key(value: RowValue) -> tuple[int, str, float]:
     """
     if isinstance(value, str):
         return (0, value, 0.0)
+    if isinstance(value, tuple):  # defensive: resolve never admits a vector sort key
+        return (2, "", 0.0)
     return (1, "", float(value if value is not None else 0))
 
 
@@ -7793,10 +7815,82 @@ class _Lowerer:
         if isinstance(value, exp.Expr):
             call = _call_parts(value)
             if call is not None and not call.namespaced and not call.is_macro:
-                declared = self.res.wasm.get(call.name.lower())
+                name = call.name.lower()
+                if name in _VECTOR_BUILTIN_ARITY:
+                    return self._eval_vector_builtin(name, call, value, env, rows, select)
+                declared = self.res.wasm.get(name)
                 if declared is not None and declared.is_value:
                     return self._eval_wasm_value(declared, call, value, env, rows, select)
         return self._literal_of(value, select)
+
+    def _eval_vector(
+        self,
+        node: exp.Expr,
+        name: str,
+        env: _Env,
+        rows: _RowTuple,
+        select: exp.Select,
+    ) -> tuple[float, ...] | None:
+        """One vector-builtin argument's value; anything else is a typed rejection.
+
+        Resolve already checked the STATIC type of every argument
+        (:meth:`ffrwd.parser._Resolver._check_vector_builtin_call`); this is
+        the runtime mirror for a value resolve could not see through -- a
+        CTE's own value column, whose type only lowering knows.
+        """
+        value = self._eval_value(node, env, rows, select)
+        if value is None or isinstance(value, tuple):
+            return value
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"{name}() needs a vector",
+            node,
+            fallback=select,
+            hint=f"{name}() takes a row column or a value function's result, "
+            "either typed vector",
+        )
+
+    def _eval_vector_builtin(
+        self,
+        name: str,
+        call: _Call,
+        node: exp.Expr,
+        env: _Env,
+        rows: _RowTuple,
+        select: exp.Select,
+    ) -> RowValue:
+        """``cos_similarity``/``vector_length``, evaluated once per row.
+
+        Every argument folds through the same value grammar every other
+        builtin call does, memoized wasm calls included. A length mismatch
+        between two vectors is the one thing resolve could not already
+        reject -- lengths are data, knowable only against the actual
+        vectors -- so it is refused here, by name, with both lengths.
+        """
+        vectors: list[tuple[float, ...]] = []
+        for argument in call.args:
+            vector = self._eval_vector(argument, name, env, rows, select)
+            if vector is None:
+                return None
+            vectors.append(vector)
+        if name == "vector_length":
+            return len(vectors[0])
+        left, right = vectors
+        if len(left) != len(right):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"cos_similarity() compares vectors of length {len(left)} and "
+                f"{len(right)}",
+                node,
+                fallback=select,
+                hint="cos_similarity() needs two vectors of the same length",
+            )
+        dot = sum(a * b for a, b in zip(left, right))
+        left_mag = math.sqrt(sum(a * a for a in left))
+        right_mag = math.sqrt(sum(a * a for a in right))
+        if left_mag == 0 or right_mag == 0:
+            return 0.0
+        return dot / (left_mag * right_mag)
 
     def _eval_arithmetic(
         self,
@@ -8332,23 +8426,26 @@ class _Lowerer:
                 )
             binding = self._row_binding_of(ordered, env, select)
             key = _unwrap(ordered.this)
-            if not isinstance(key, exp.Column):  # defensive: resolve checked it
-                raise _error(
-                    ErrorCode.NO_STREAMING_EQUIVALENT,
-                    "ORDER BY has no streaming equivalent",
-                    ordered,
-                    fallback=order,
-                )
-            name = _fold(key.this)
             relation = binding.relation
 
-            def value_of(
-                row: _RowTuple,
-                alias: str = binding.alias,
-                name: str = name,
-            ) -> RowValue:
-                track = _track_of(row, alias)
-                return None if track is None else track.columns.get(name)
+            value_of: Callable[[_RowTuple], RowValue]
+            if isinstance(key, exp.Column):
+                name = _fold(key.this)
+
+                def value_of(
+                    row: _RowTuple,
+                    alias: str = binding.alias,
+                    name: str = name,
+                ) -> RowValue:
+                    track = _track_of(row, alias)
+                    return None if track is None else track.columns.get(name)
+            else:
+                # A computed sort key -- a built-in text/number function, or a
+                # value wasm function's result -- over the same row columns a
+                # bare one reads; resolve checked its shape and type
+                # (:meth:`ffrwd.parser._Resolver._check_order`).
+                def value_of(row: _RowTuple, key: exp.Expr = key) -> RowValue:
+                    return self._eval_value(key, env, row, select)
 
             nulls = [row for row in relation.tuples if value_of(row) is None]
             rest = [row for row in relation.tuples if value_of(row) is not None]
@@ -11261,6 +11358,9 @@ class _Lowerer:
                 return result
             if declared.returns == "number" and isinstance(result, int | float):
                 return result
+            if declared.returns == "vector" and _is_number_list(result):
+                assert isinstance(result, list)
+                return tuple(float(v) for v in result)
         raise _error(
             ErrorCode.UDF_ARG_TYPE,
             f"function '{declared.name}' declares RETURNS {declared.returns}, and "
@@ -13597,12 +13697,19 @@ class _Lowerer:
                     # array, re-exposed through the CTE) stays ONE cell.
                     if column is not None and column.value.is_array and not column.splat:
                         return self._array_cell_broadcast(expr, env, select, cardinality)
-        if is_value_expr(expr) or _is_input_value_column(expr, env):
+        if (
+            is_value_expr(expr)
+            or _is_input_value_column(expr, env)
+            or (
+                isinstance(expr, exp.Anonymous)
+                and str(expr.name).lower() in _VECTOR_BUILTIN_ARITY
+            )
+        ):
             return self._value_cells(expr, env, select, cardinality)
         shape = subscript_metadata_shape(expr)
         if shape is not None:
             metadata_value = self._accessor_value(expr, select)
-            return [metadata_value] * cardinality
+            return [_row_value_as_cell(metadata_value)] * cardinality
         stream_value = self._lower_expr(projection, env, select)
         splat = self._is_splat_projection(projection, env)
         return self._value_to_cells(stream_value, cardinality, splat=splat)
@@ -13618,8 +13725,11 @@ class _Lowerer:
         """
         relation = env.relation
         if relation is None:
-            return [self._eval_value(node, env, {}, select)] * cardinality
-        return [self._eval_value(node, env, row, select) for row in relation.tuples]
+            return [_row_value_as_cell(self._eval_value(node, env, {}, select))] * cardinality
+        return [
+            _row_value_as_cell(self._eval_value(node, env, row, select))
+            for row in relation.tuples
+        ]
 
     def _row_metadata_cells(
         self, binding: _RowBinding, name: str, anchor: exp.Expr, select: exp.Select
@@ -13638,7 +13748,10 @@ class _Lowerer:
                 fallback=select,
                 hint=binding.exposes,
             )
-        return [None if row is None else row.columns.get(name) for row in binding.rows]
+        return [
+            None if row is None else _row_value_as_cell(row.columns.get(name))
+            for row in binding.rows
+        ]
 
     def _container_tag_cells(
         self, alias: str, anchor: exp.Expr, select: exp.Select, cardinality: int
@@ -13687,7 +13800,9 @@ class _Lowerer:
         names = ROW_STAR_COLUMNS[column]
         cell = ArrayCell(
             elements=tuple(
-                RecordCell(fields=tuple(row[name] for name in names))
+                RecordCell(
+                    fields=tuple(_row_value_as_cell(row[name]) for name in names)
+                )
                 for row in _record_columns(result, column)
             )
         )
@@ -13924,10 +14039,18 @@ def _tags_map_alias(node: exp.Expr) -> str | None:
     return _fold(table_node) if _fold(node.this) == TAGS_COLUMN else None
 
 
-def _tag_text(value: str | int | float | bool) -> str:
-    """A tag value as the text ffmpeg receives; a boolean spells itself out."""
+def _tag_text(value: str | int | float | bool | tuple[float, ...]) -> str:
+    """A tag value as the text ffmpeg receives; a boolean spells itself out.
+
+    A vector never reaches here in practice -- resolve refuses one at every
+    call site (a tag, a ``::text`` cast, a fan-out path) -- but the
+    signature is total, not partial, so a defensive caller gets a message
+    instead of a crash.
+    """
     if isinstance(value, bool):
         return "true" if value else "false"
+    if isinstance(value, tuple):
+        return f"a vector of {len(value)} values"
     return value if isinstance(value, str) else str(value)
 
 
@@ -14192,6 +14315,13 @@ def _literal_node(value: RowValue, source: exp.Expr) -> exp.Expr:
     The synthesized node inherits `source`'s position, so an option that
     rejects what a row computed still points at the expression that wrote it.
     """
+    if isinstance(value, tuple):  # defensive: resolve never admits a vector option
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            "a vector cannot be an option value",
+            source,
+            hint="read vector_length(...) or cos_similarity(...) instead",
+        )
     node: exp.Expr
     if value is None:
         node = exp.Null()

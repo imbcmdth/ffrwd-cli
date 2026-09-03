@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import functools
 import json
+import math
 import subprocess
 from collections.abc import Mapping
 from dataclasses import replace
@@ -47,6 +48,7 @@ from ffrwd.processes import (
 from ffrwd.project import PackageSet, discover
 from ffrwd.registry import Registry, load_reference
 from ffrwd.split import insert_splits
+from ffrwd.table import render_table
 from ffrwd.wasm import WORLDS, Described, DescribedFunction
 
 SNAPSHOT_PATH = Path(__file__).resolve().parent / "data" / "reference_registry.json"
@@ -200,7 +202,7 @@ def test_a_stream_parameter_on_a_value_returning_wasm_function_is_refused() -> N
         "COPY (SELECT m(f.video[1]) FROM input('a.mp4') f) TO 'out.mp4'"
     )
     error = _rejects(sql, ErrorCode.UNSUPPORTED_SQL, "declares the parameter 'v' as video_stream")
-    assert error.hint is not None and "text, number or boolean" in error.hint
+    assert error.hint is not None and "text, number, boolean or vector" in error.hint
 
 
 def test_a_table_returning_wasm_function_is_refused() -> None:
@@ -5593,3 +5595,306 @@ def test_a_second_rows_module_names_the_first_by_its_own_m_slot() -> None:
     argv = plan_argv(plan, sidecar_argv=wasm.shown_argv)["sidecar0"]
     assert argv.count("-rows-from") == 2
     assert [argv[i + 1] for i, a in enumerate(argv) if a == "-rows-from"] == ["0", "1"]
+
+
+# ---------------------------------------------------------------------------
+# vector: an annotation field, a value function's domain, cos_similarity() /
+# vector_length(), and the four refusals a vector earns everywhere else.
+# ---------------------------------------------------------------------------
+
+EMBEDDER = "modules/embed.wasm"
+
+VECTOR_DECLARE = (
+    "CREATE FUNCTION embed(text text) RETURNS vector\n"
+    f"  AS '{EMBEDDER}', 'embed' LANGUAGE wasm;\n"
+)
+
+# The three rows the cookbook recipe ranks, plus the query text they are
+# ranked against -- small, hand-picked vectors so the ranking is obvious and
+# the cosine similarity is easy to check independently in Python.
+_EMBEDDINGS: dict[str, tuple[float, ...]] = {
+    "a cat sat on the mat": (0.9, 0.1, 0.2),
+    "a dog ran in the yard": (0.85, 0.15, 0.3),
+    "a car drove down the road": (0.1, 0.95, 0.6),
+    "a small pet": (0.8, 0.05, 0.25),
+}
+
+
+def _embed_described(*, result_type: str = "array") -> Described:
+    return Described(
+        world="ffrwd:av@0.4.0",
+        functions=(
+            DescribedFunction(
+                name="embed",
+                params_schema={
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {"text": {"type": "string"}},
+                    "required": ["text"],
+                },
+                result_schema={"type": result_type},
+            ),
+        ),
+    )
+
+
+def _embed_invoke(module: str, function: str, args: Mapping[str, object]) -> object:
+    return list(_EMBEDDINGS[str(args["text"])])
+
+
+def _cosine(a: tuple[float, ...], b: tuple[float, ...]) -> float:
+    dot = sum(x * y for x, y in zip(a, b, strict=True))
+    return dot / (math.sqrt(sum(x * x for x in a)) * math.sqrt(sum(y * y for y in b)))
+
+
+RANK_SQL = (
+    VECTOR_DECLARE
+    + "SELECT r.label, cos_similarity(embed(r.text), embed('a small pet')) AS score\n"
+    "FROM unnest(ARRAY[\n"
+    "  STRUCT('cat' AS label, 'a cat sat on the mat' AS text),\n"
+    "  STRUCT('dog' AS label, 'a dog ran in the yard' AS text),\n"
+    "  STRUCT('car' AS label, 'a car drove down the road' AS text)\n"
+    "]) r\n"
+    "ORDER BY cos_similarity(embed(r.text), embed('a small pet')) DESC\n"
+    "LIMIT 2"
+)
+
+
+def _ranked(sql: str = RANK_SQL, invoke: object = None) -> list[list[object]]:
+    sinks = lower_table(
+        _resolved(sql),
+        {},
+        registry=_snapshot_registry(),
+        describes={EMBEDDER: _embed_described()},
+        invoke=invoke if invoke is not None else _embed_invoke,
+    )
+    return sinks[0].result.rows
+
+
+# the declaration
+
+
+def test_a_value_function_may_return_vector() -> None:
+    declared = _resolved(RANK_SQL).wasm["embed"]
+    assert declared.is_value
+    assert declared.returns == "vector"
+    assert [(p.name, p.type) for p in declared.params] == [("text", "text")]
+
+
+def test_a_value_function_may_take_a_vector_parameter() -> None:
+    sql = (
+        "CREATE FUNCTION similar(a vector, b vector) RETURNS number\n"
+        "  AS 'modules/similar.wasm', 'similar' LANGUAGE wasm;\n"
+        + VECTOR_DECLARE
+        + "SELECT similar(embed('x'), embed('y')) AS n FROM generate_series(1, 1) i"
+    )
+    declared = _resolved(sql).wasm["similar"]
+    assert declared.is_value
+    assert [p.type for p in declared.params] == ["vector", "vector"]
+
+
+def test_the_result_type_is_checked_against_the_modules_own() -> None:
+    sql = (
+        VECTOR_DECLARE
+        + "SELECT vector_length(embed('a cat sat on the mat')) AS n "
+        "FROM generate_series(1, 1) i"
+    )
+    with pytest.raises(FfrwdError) as caught:
+        lower_table(
+            _resolved(sql),
+            {},
+            registry=_snapshot_registry(),
+            describes={EMBEDDER: _embed_described(result_type="string")},
+            invoke=_embed_invoke,
+        )
+    error = caught.value
+    assert error.code is ErrorCode.UDF_ARG_TYPE
+    assert "declares RETURNS vector" in error.message
+    assert "returns string" in error.message
+
+
+# the value flows into cos_similarity() / vector_length()
+
+
+def test_cos_similarity_ranks_rows_by_a_vector() -> None:
+    rows = _ranked()
+    assert [label for label, _ in rows] == ["cat", "dog"]
+    expected = {
+        "cat": _cosine(_EMBEDDINGS["a cat sat on the mat"], _EMBEDDINGS["a small pet"]),
+        "dog": _cosine(_EMBEDDINGS["a dog ran in the yard"], _EMBEDDINGS["a small pet"]),
+    }
+    for label, score in rows:
+        assert score == pytest.approx(expected[label])
+
+
+def test_cos_similarity_per_row_in_where() -> None:
+    sql = (
+        VECTOR_DECLARE
+        + "SELECT r.label FROM unnest(ARRAY[\n"
+        "  STRUCT('cat' AS label, 'a cat sat on the mat' AS text),\n"
+        "  STRUCT('car' AS label, 'a car drove down the road' AS text)\n"
+        "]) r\n"
+        "WHERE cos_similarity(embed(r.text), embed('a small pet')) > 0.5"
+    )
+    assert _ranked(sql) == [["cat"]]
+
+
+def test_vector_length_of_a_value_functions_result() -> None:
+    sql = (
+        VECTOR_DECLARE
+        + "SELECT vector_length(embed('a cat sat on the mat')) AS n "
+        "FROM generate_series(1, 1) i"
+    )
+    assert _ranked(sql) == [[3]]
+
+
+def test_cos_similarity_takes_two_arguments() -> None:
+    sql = (
+        VECTOR_DECLARE
+        + "SELECT cos_similarity(embed('a cat sat on the mat')) AS v "
+        "FROM generate_series(1, 1) i"
+    )
+    error = _rejects_resolve(
+        sql, ErrorCode.UNSUPPORTED_SQL, "cos_similarity() takes 2 arguments, got 1"
+    )
+    assert error.hint is not None and "a vector, a vector" in error.hint
+
+
+def test_vector_length_rejects_a_non_vector_argument() -> None:
+    sql = "SELECT vector_length('x') AS v FROM generate_series(1, 1) i"
+    error = _rejects_resolve(
+        sql, ErrorCode.UNSUPPORTED_SQL, "vector_length() takes a vector, got text"
+    )
+    assert error.hint is not None
+
+
+def test_cos_similarity_refuses_mismatched_lengths() -> None:
+    sql = (
+        VECTOR_DECLARE
+        + "SELECT cos_similarity(embed('a cat sat on the mat'), "
+        "embed('a small pet')) AS v FROM generate_series(1, 1) i"
+    )
+    with pytest.raises(FfrwdError) as caught:
+        _ranked(
+            sql,
+            invoke=lambda module, function, args: (
+                [1.0, 2.0] if args["text"] == "a cat sat on the mat" else [1.0, 2.0, 3.0]
+            ),
+        )
+    error = caught.value
+    assert error.code is ErrorCode.UNSUPPORTED_SQL
+    assert "length 2 and 3" in error.message
+
+
+def test_a_vector_cell_prints_capped() -> None:
+    """A vector row column -- here a struct row table's own field -- prints
+    capped, Postgres array-literal style is not it: the first four values,
+    then the vector's own length."""
+    sql = (
+        VECTOR_DECLARE
+        + "SELECT r.v FROM unnest(ARRAY[\n"
+        "  STRUCT(embed('a cat sat on the mat') AS v)\n"
+        "]) r"
+    )
+    sinks = lower_table(
+        _resolved(sql),
+        {},
+        registry=_snapshot_registry(),
+        describes={EMBEDDER: _embed_described()},
+        invoke=lambda module, function, args: [0.0, 1.0, 2.0, 3.0, 4.0],
+    )
+    text = render_table(sinks[0].result)
+    assert "[0.0, 1.0, 2.0, 3.0, ... (5)]" in text
+
+
+def test_a_short_vector_prints_with_no_ellipsis() -> None:
+    sql = (
+        VECTOR_DECLARE
+        + "SELECT r.v FROM unnest(ARRAY[\n"
+        "  STRUCT(embed('a cat sat on the mat') AS v)\n"
+        "]) r"
+    )
+    sinks = lower_table(
+        _resolved(sql),
+        {},
+        registry=_snapshot_registry(),
+        describes={EMBEDDER: _embed_described()},
+        invoke=lambda module, function, args: [0.1, 0.2],
+    )
+    text = render_table(sinks[0].result)
+    assert "[0.1, 0.2]" in text
+
+
+# the four refusals
+
+
+def test_a_vector_cannot_be_compared() -> None:
+    sql = (
+        VECTOR_DECLARE
+        + "SELECT r.label FROM unnest(ARRAY[STRUCT('cat' AS label, "
+        "'a cat sat on the mat' AS text)]) r "
+        "WHERE embed(r.text) = embed('a small pet')"
+    )
+    error = _rejects_resolve(sql, ErrorCode.UNSUPPORTED_SQL, "a vector cannot be compared")
+    assert error.hint is not None and "cos_similarity" in error.hint
+
+
+def test_a_vector_cannot_be_concatenated() -> None:
+    sql = (
+        VECTOR_DECLARE
+        + "SELECT embed('a cat sat on the mat') || 'x' AS v FROM generate_series(1, 1) i"
+    )
+    error = _rejects_resolve(sql, ErrorCode.UNSUPPORTED_SQL, "one side is a vector")
+    assert error.hint is not None and "vector_length" in error.hint
+
+
+def test_a_vector_cannot_be_cast_to_text() -> None:
+    sql = (
+        VECTOR_DECLARE
+        + "SELECT embed('a cat sat on the mat')::text AS v FROM generate_series(1, 1) i"
+    )
+    error = _rejects_resolve(sql, ErrorCode.UNSUPPORTED_SQL, "cannot be cast to text")
+    assert error.hint is not None and "vector_length" in error.hint
+
+
+def test_a_vector_cannot_be_written_as_a_tag() -> None:
+    sql = (
+        VECTOR_DECLARE
+        + "COPY (SELECT f.video[1], STRUCT(embed('a cat sat on the mat') AS custom) "
+        "AS tags FROM input('a.mp4') f) TO 'out.mp4'"
+    )
+    error = _rejects_resolve(sql, ErrorCode.UNSUPPORTED_SQL, "tag 'custom' is a vector")
+    assert error.hint is not None
+
+
+# an annotation field may be a vector, matched against the module's own rows
+
+
+def test_an_annotation_field_may_be_a_vector() -> None:
+    rows: dict[str, object] = {
+        "type": "object",
+        "properties": {"e": {"type": "array", "items": {"type": "number"}}},
+    }
+    sql = _pair(
+        detect_returns="STRUCT(v video_stream, hits STRUCT(e vector)[])",
+        blur_takes="STRUCT(e vector)[]",
+    )
+    declared = _resolved(sql).wasm["detect_faces"]
+    assert declared.emits is not None
+    assert [(f.name, f.type) for f in declared.emits.fields] == [("e", "vector")]
+    assert _annotated_plan(sql, detector=_annotating(rows)).plan is not None
+
+
+def test_a_vector_annotation_field_of_the_wrong_json_type_is_refused() -> None:
+    rows: dict[str, object] = {
+        "type": "object",
+        "properties": {"e": {"type": "number"}},
+    }
+    sql = _pair(
+        detect_returns="STRUCT(v video_stream, hits STRUCT(e vector)[])",
+        blur_takes="STRUCT(e vector)[]",
+    )
+    error = _annotation_rejects(
+        sql, ErrorCode.UDF_ARG_TYPE, "declares 'hits' as", detector=_annotating(rows)
+    )
+    assert "e (number)" in error.message

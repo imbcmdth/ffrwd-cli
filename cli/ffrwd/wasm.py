@@ -197,10 +197,15 @@ SAMPLE_FMT_CODECS: Mapping[str, str] = {"f32": PCM_F32LE, "s16": PCM_S16LE}
 # The JSON Schema types each declared annotation field type covers. `number`
 # covers integer as well: the dialect has one numeric type, and a module
 # counting pixels declares the same column a module measuring them does.
+# `vector` is a plain JSON array of numbers -- no base64: rows already travel
+# as JSON text, which the sidecar stamps and filters as JSON, and a number
+# array is exactly what a module's own `{"type": "array", "items": {"type":
+# "number"}}` rows_schema entry already says.
 ANNOTATION_TYPES: Mapping[str, tuple[str, ...]] = {
     "boolean": ("boolean",),
     "number": ("number", "integer"),
     "text": ("string",),
+    "vector": ("array",),
 }
 
 # The container tag each language code a transcribing module names stands for:

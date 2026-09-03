@@ -97,6 +97,7 @@ from .errors import ErrorCode, FfrwdError
 from .ir import StreamType
 from .parser import (
     _ARITHMETIC,
+    _VECTOR_BUILTIN_ARITY,
     FILTER_NAMESPACE,
     MACRO_NAMESPACE,
     SINK_STREAMS,
@@ -148,10 +149,13 @@ __all__ = [
 _INPUT = "input"
 
 # Names a definition may not claim: the dialect's own FROM item, the two
-# reserved namespaces, and every name sqlglot parses as a builtin (a call to
-# one comes back as its own node type, never as the anonymous call expansion
-# looks for, so redefining it would silently do nothing).
-_RESERVED = frozenset({_INPUT, FILTER_NAMESPACE, MACRO_NAMESPACE})
+# reserved namespaces, the built-in vector functions, and every name sqlglot
+# parses as a builtin (a call to one comes back as its own node type, never
+# as the anonymous call expansion looks for, so redefining it would silently
+# do nothing).
+_RESERVED = frozenset(
+    {_INPUT, FILTER_NAMESPACE, MACRO_NAMESPACE, *_VECTOR_BUILTIN_ARITY}
+)
 
 # The types a signature may name: the scalars, the four stream records, and
 # the non-stream records the compiler surfaces. Handles, maps and `container`
@@ -205,6 +209,11 @@ _WASM_SOURCE_HINT = (
     "number or boolean, the values it is configured with"
 )
 _WASM_SOURCE_CALL_HINT = "a source is called in FROM: FROM <name>(<values>) <alias>"
+# The type name `vector` spells: sqlglot parses it as its own DataType (it
+# knows pgvector's), so it reads back through `_type_name` like any other
+# scalar, but it is never a NAMEABLE type -- only a value function's own
+# RETURNS or parameter domain, alongside text/number/boolean.
+_VECTOR_TYPE = "vector"
 # A ROWS function: an array of annotation records in, one out, no stream. The
 # name a message gives its RETURNS, which has no column name of its own.
 _ROWS_RETURN = "the rows it returns"
@@ -228,23 +237,25 @@ WASM_STREAM_NAMES: Mapping[StreamType, str] = {
 }
 _WASM_STREAM_HINT = " or ".join(WASM_STREAM_TYPES)
 # What a table-returning wasm function is told; a value return is now wired
-# (text, number or boolean), so only TABLE is left unguessed at.
+# (text, number, boolean or vector), so only TABLE is left unguessed at.
 _WASM_VALUE_HINT = (
     f"a wasm function returns one {_WASM_STREAM_HINT}, a STRUCT of that same "
     "stream and one array of annotation records, sink as a COPY destination, "
-    "or text, number or boolean as a compile-time value"
+    "or text, number, boolean or vector as a compile-time value"
 )
-# A value-returning wasm function's parameters: the same scalar domain an
-# annotation field draws from, since both are values a JSON Schema can hold.
+# A value-returning wasm function's parameters: the same domain an annotation
+# field draws from, since both are values a JSON Schema can hold.
 _WASM_VALUE_PARAM_HINT = (
-    "a value-returning wasm function's parameters are text, number or boolean"
+    "a value-returning wasm function's parameters are text, number, boolean or vector"
 )
 _WASM_VALUE_DEFAULT_HINT = (
     "a value-returning wasm function runs at every call site; there is no "
     "default to fall back to when the caller omits an argument"
 )
-# The types an annotation record's fields may be: values, never streams.
-_ANNOTATION_FIELD_TYPES = ("boolean", "number", "text")
+# The types an annotation record's fields, and a value function's own
+# parameters and RETURNS, may be. `vector` is a JSON number array -- never a
+# scalar column a table row or a tag may otherwise carry.
+_ANNOTATION_FIELD_TYPES = ("boolean", "number", "text", "vector")
 _ANNOTATION_FIELD_HINT = (
     "an annotation record's fields are values: " + ", ".join(_ANNOTATION_FIELD_TYPES)
 )
@@ -264,13 +275,16 @@ _BODY_SCOPE_HINT = (
     "needs as an argument"
 )
 
-# The sqlglot data types the three scalars land as. Everything else is an
-# unknown type name -- including the other spellings of these (`varchar`,
-# `int`), which the dialect does not have.
+# The sqlglot data types the three scalars land as, plus `vector` -- sqlglot
+# parses it as its own DataType (pgvector's), never USERDEFINED, so it needs
+# the same table entry. Everything else is an unknown type name -- including
+# the other spellings of these (`varchar`, `int`), which the dialect does not
+# have.
 _SCALAR_TYPES = {
     exp.DataType.Type.TEXT: "text",
     exp.DataType.Type.DECIMAL: "number",
     exp.DataType.Type.BOOLEAN: "boolean",
+    exp.DataType.Type.VECTOR: "vector",
 }
 
 _ArgumentShape = type[exp.Expr] | tuple[type[exp.Expr], ...] | UnionType
@@ -1162,6 +1176,7 @@ class _Declared:
     once: str
     allow_default: bool = False
     allow_annotation: bool = False
+    allow_vector: bool = False
 
 
 _PARAMETER = _Declared(
@@ -1173,8 +1188,11 @@ _PARAMETER = _Declared(
     allow_default=True,
 )
 # A wasm signature reads the same way, plus the annotation column a module
-# that consumes rows takes.
-_WASM_PARAMETER = replace(_PARAMETER, shape=_WASM_HINT, allow_annotation=True)
+# that consumes rows takes, and `vector` -- legal only where a value
+# function's own domain applies (`_define_wasm_value` narrows further).
+_WASM_PARAMETER = replace(
+    _PARAMETER, shape=_WASM_HINT, allow_annotation=True, allow_vector=True
+)
 _TABLE_COLUMN = _Declared(
     noun="RETURNS TABLE column",
     shape=_TABLE_HINT,
@@ -1276,7 +1294,12 @@ def _column_defs(
                 )
             declared.append(Parameter(written, annotation.written, default, annotation))
             continue
-        declared_type = _checked_type(node.args.get("kind"), name, anchor)
+        kind_node = node.args.get("kind")
+        declared_type = (
+            _VECTOR_TYPE
+            if kind.allow_vector and _type_name(kind_node) == _VECTOR_TYPE
+            else _checked_type(kind_node, name, anchor)
+        )
         if default is not None:
             default = _checked_default(default, declared_type, name, written, anchor)
             seen_default = True
@@ -1487,7 +1510,7 @@ def _define_wasm_value(
 ) -> WasmFunction:
     """One validated value-returning ``LANGUAGE wasm`` declaration.
 
-    Every parameter is text, number or boolean -- the scalar domain a JSON
+    Every parameter is text, number, boolean or vector -- the domain a JSON
     Schema can hold, the same one an annotation field draws from. There is no
     stream to filter and no DEFAULT: the module runs at every call site, so
     an omitted argument has nothing compile-time to fall back to.
@@ -1544,8 +1567,8 @@ def _define_wasm(
     and every other struct is refused by name. A signature reading several
     streams may not also CONSUME annotations; returning them is unaffected.
 
-    A VALUE function returns text, number or boolean and takes only
-    parameters of those same three types -- the domain a JSON Schema can
+    A VALUE function returns text, number, boolean or vector and takes only
+    parameters of those same types -- the domain a JSON Schema can
     hold. It filters no stream: the module runs once per call, at compile
     time, on the folded arguments (:mod:`ffrwd.lower`). A wasm function
     returning a table is refused outright rather than guessed at.
@@ -1578,6 +1601,13 @@ def _define_wasm(
             returns = WASM_SINK
         elif _type_name(node) == WASM_SOURCE:
             return _define_wasm_source(name, module, export, params, identifier, create)
+        elif _type_name(node) == _VECTOR_TYPE:
+            # Checked ahead of `_checked_type`, the same way sink/source are:
+            # `vector` is not a NAMEABLE type (no SQL RETURNS, no RETURNS
+            # TABLE column may be one), only a value function's own domain.
+            return _define_wasm_value(
+                name, module, export, params, _VECTOR_TYPE, identifier, create
+            )
         else:
             # An array of annotation records as the RETURNS is a ROWS
             # function; checked before the type itself, since a bare
@@ -2512,7 +2542,14 @@ def _argument_kind(
 
 
 def _wasm_argument_kind(call: exp.Anonymous, wasm: Mapping[str, WasmFunction] | None) -> str:
-    """A call's kind, by the RETURNS of the wasm function it names, else a stream."""
+    """A call's kind, by the RETURNS of the wasm function it names, else a stream.
+
+    ``cos_similarity``/``vector_length`` are never in `wasm` -- they are
+    built in, not declared -- so they are checked by name first; both always
+    return a number.
+    """
+    if _call_name(call) in _VECTOR_BUILTIN_ARITY:
+        return "number"
     declared = wasm.get(_call_name(call)) if wasm is not None else None
     return _declared_kind(declared.returns) if declared is not None else "stream"
 
@@ -2560,8 +2597,16 @@ def _annotation_param_hint(stream: str) -> str:
 
 
 def _declared_kind(declared: str) -> str:
-    """What an argument of the declared type has to look like."""
-    return "stream" if TYPES[element_type(declared)].kind != "scalar" else declared
+    """What an argument of the declared type has to look like.
+
+    `vector` is not in :data:`TYPES` at all -- it is never a NAMEABLE type,
+    only a value function's own domain -- so it is its own bucket here
+    rather than a lookup that would raise.
+    """
+    element = element_type(declared)
+    if element == _VECTOR_TYPE:
+        return _VECTOR_TYPE
+    return "stream" if TYPES[element].kind != "scalar" else declared
 
 
 def _is_null(node: exp.Expr) -> bool:

@@ -23,9 +23,11 @@ from dataclasses import dataclass
 from .ir import StreamType
 
 __all__ = [
+    "VECTOR_CELL_CAP",
     "StreamCell",
     "ArrayCell",
     "RecordCell",
+    "VectorCell",
     "CellValue",
     "TableResult",
     "TableSink",
@@ -71,10 +73,30 @@ class ArrayCell:
     elements: tuple[CellValue, ...]
 
 
+# The most values a vector cell prints before summarizing the rest -- a
+# vector column exists to be compared, not read, and a full embedding would
+# blow out every column's width.
+VECTOR_CELL_CAP = 4
+
+
+@dataclass(frozen=True)
+class VectorCell:
+    """A vector row column's value, one table cell.
+
+    Printed capped, never in full: the first :data:`VECTOR_CELL_CAP` values,
+    then the vector's own length in place of the rest -- ``[0.12, -0.03, 0.5,
+    0.77, ... (384)]``. A vector no longer than the cap prints whole, with no
+    ellipsis. Not Postgres array-literal style (no braces) -- a vector is
+    read, never re-parsed, so the numeric-array spelling is the plainer one.
+    """
+
+    values: tuple[float, ...]
+
+
 # One table cell: NULL (empty, psql-style), a probed scalar, a stream
-# placeholder, a record, or an array of cells. Never a raw FrameRef -- that
-# would leak IR shape into printable data.
-CellValue = str | int | float | bool | None | StreamCell | RecordCell | ArrayCell
+# placeholder, a record, an array of cells, or a vector. Never a raw
+# FrameRef -- that would leak IR shape into printable data.
+CellValue = str | int | float | bool | None | StreamCell | RecordCell | ArrayCell | VectorCell
 
 
 @dataclass(frozen=True)
@@ -114,6 +136,11 @@ def _cell_text(cell: CellValue) -> str:
         return "{" + ",".join(_cell_text(element) for element in cell.elements) + "}"
     if isinstance(cell, RecordCell):
         return "(" + ",".join(_cell_text(field) for field in cell.fields) + ")"
+    if isinstance(cell, VectorCell):
+        shown = ", ".join(str(v) for v in cell.values[:VECTOR_CELL_CAP])
+        if len(cell.values) > VECTOR_CELL_CAP:
+            return f"[{shown}, ... ({len(cell.values)})]"
+        return f"[{shown}]"
     return str(cell)
 
 

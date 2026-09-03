@@ -3128,3 +3128,32 @@ $ ffrwd -f query.sql
  2        | 320   | 240
 (2 rows)
 ```
+## 117. Rank rows by a vector
+
+`vector` is a value function's fourth type, alongside `text`, `number` and `boolean`: `embed_text` runs once per row, at compile time, and its result is a row column like any other - printed capped as `[0.12, -0.03, ...]`, but not compared, concatenated or cast to text, since a vector has no order or text form of its own. `cos_similarity(vector, vector) -> number` is the one thing it is for, and its result sorts like any other computed value:
+
+```pgsql
+CREATE FUNCTION embed_text(prompt text) RETURNS vector
+  AS '../sidecar/modules/target/wasm32-wasip2/release/embed_text.wasm', 'embed_text'
+  LANGUAGE wasm;
+
+SELECT r.label, cos_similarity(embed_text(r.blurb), embed_text('a small pet')) AS score
+FROM unnest(ARRAY[
+  STRUCT('cat' AS label, 'a cat sat on the mat' AS blurb),
+  STRUCT('dog' AS label, 'a dog ran in the yard' AS blurb),
+  STRUCT('car' AS label, 'a car drove down the road' AS blurb)
+]) r
+ORDER BY cos_similarity(embed_text(r.blurb), embed_text('a small pet')) DESC
+LIMIT 2
+```
+
+```
+$ ffrwd -f query.sql
+ label | score
+-------+--------------------
+ cat   | 0.9953089707326302
+ dog   | 0.9938070008129037
+(2 rows)
+```
+
+There is no vector literal - `ARRAY[0.1, 0.2]` names an array of numbers, not the dialect's `vector`, so the only way to a vector value is a value function's own RETURNS, over a row column or a literal alike, the same per-row footing every value function stands on. `r.blurb` feeds `embed_text` once per row, memoized on its argument the way any other value call is; `embed_text('a small pet')` runs once, since its argument is a literal. The two calls in `ORDER BY` and `SELECT` name the same row and the same literal, so they cost one call each, not two.
