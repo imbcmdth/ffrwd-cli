@@ -5241,3 +5241,299 @@ def test_the_ladder_decodes_its_source_once() -> None:
     edges = [e for e in plan.stream_edges if e.target == plan.sidecars[0].id]
     assert len(edges) == 3
     assert {e.source for e in edges} == {feeders[0].id}
+
+
+# ---------------------------------------------------------------------------
+# rows modules: rows in, rows out, no stream
+# ---------------------------------------------------------------------------
+#
+# A ROWS module reads the rows another module produced and writes rows back.
+# It carries no stream at all, so it is in no filtergraph: it rides in the
+# producer's own sidecar as an `-m` of its own, with a `-rows-from` naming
+# whose rows arrive.
+
+ROWS_MODULE = "modules/fauxlate.wasm"
+CAPTIONER = "modules/captions.wasm"
+
+
+def _rows_module_described(
+    *,
+    name: str = "fauxlate",
+    rows_module: bool = True,
+    reads: dict[str, object] | None = None,
+    writes: dict[str, object] | None = None,
+) -> Described:
+    """A module that reads cue rows and writes cue rows, as --describe says it."""
+    return Described(
+        world="ffrwd:av@0.14.0",
+        name=name,
+        version="0.1.0",
+        params_schema={"type": "object", "properties": {}},
+        rows_schema=writes or _CUE_ROWS,
+        input_rows_schema=reads or _CUE_ROWS,
+        rows_module=rows_module,
+    )
+
+
+def _captioner() -> Described:
+    """A window module that reads video and hands each frame a cue row."""
+    return Described(
+        world="ffrwd:av@0.14.0",
+        name="captions",
+        version="0.1.0",
+        params_schema={"type": "object", "properties": {}},
+        rows_schema=_CUE_ROWS,
+        pixel_formats=("rgba",),
+        windowed=True,
+    )
+
+
+_CAPTIONS_DECLARE = (
+    "CREATE FUNCTION captions(v video_stream)\n"
+    "RETURNS STRUCT(v video_stream, cues cue[])\n"
+    f"  AS '{CAPTIONER}', 'captions' LANGUAGE wasm;\n"
+)
+
+
+def _fauxlate_declare(
+    params: str = "cues cue[]", returns: str = "cue[]", export: str = "fauxlate"
+) -> str:
+    return (
+        f"CREATE FUNCTION fauxlate({params}) RETURNS {returns}\n"
+        f"  AS '{ROWS_MODULE}', '{export}' LANGUAGE wasm;\n"
+    )
+
+
+ROWS_RECIPE = _CAPTIONS_DECLARE + _fauxlate_declare() + _copy(
+    "s.video[1], s.audio[1], fauxlate(captions(s.video[1]).cues)", path="out.mkv"
+)
+
+
+def _rows_module_plan(sql: str, described: Described | None = None) -> Compiled:
+    modules = {
+        ROWS_MODULE: described or _rows_module_described(),
+        CAPTIONER: _captioner(),
+        TRANSCRIBER: _transcriber(),
+    }
+    return compile_all(sql, describe=lambda path: modules[path])
+
+
+def _rows_module_rejects(
+    sql: str, code: ErrorCode, needle: str, described: Described | None = None
+) -> FfrwdError:
+    with pytest.raises(FfrwdError) as caught:
+        _rows_module_plan(sql, described)
+    error = caught.value
+    assert error.code is code, f"{error.code} != {code}: {error}"
+    assert needle in error.message, error.message
+    assert error.line is not None and error.hint
+    return error
+
+
+# the declaration
+
+
+def test_a_rows_function_reads_back_as_rows_in_rows_out() -> None:
+    fauxlate = _resolved(ROWS_RECIPE).wasm["fauxlate"]
+    assert fauxlate.is_rows and not fauxlate.is_value
+    assert fauxlate.stream_params == () and fauxlate.value_params == ()
+    assert fauxlate.reads is None and fauxlate.rows_param.name == "cues"
+    assert fauxlate.signature == f"fauxlate(cues {CUE_RECORD}) RETURNS cue[]"
+
+
+@pytest.mark.parametrize(
+    ("params", "needle", "hint"),
+    [
+        ("v video_stream, cues cue[]", "takes 2 parameters", "one array"),
+        ("cues text", "takes 'cues' as text", "one array"),
+        ("", "returns rows and reads none", "one array"),
+        (
+            "cues cue[] DEFAULT NULL",
+            "gives the row column 'cues' a DEFAULT",
+            "nothing to fall back to",
+        ),
+    ],
+)
+def test_a_signature_that_is_not_rows_in_rows_out_is_refused(
+    params: str, needle: str, hint: str
+) -> None:
+    sql = _CAPTIONS_DECLARE + _fauxlate_declare(params=params) + _copy(
+        "fauxlate(captions(s.video[1]).cues)", path="cues.ndjson"
+    )
+    error = _rows_module_rejects(sql, ErrorCode.UNSUPPORTED_SQL, needle)
+    assert error.hint is not None and hint in error.hint
+
+
+def test_the_declared_column_is_checked_against_the_rows_the_module_reads() -> None:
+    described = _rows_module_described(
+        reads={"type": "object", "properties": {"shot": {"type": "integer"}}}
+    )
+    error = _rows_module_rejects(
+        ROWS_RECIPE, ErrorCode.UDF_ARG_TYPE, "the rows it reads", described
+    )
+    assert "shot" in error.message
+
+
+def test_the_declared_return_is_checked_against_the_rows_the_module_writes() -> None:
+    described = _rows_module_described(
+        writes={"type": "object", "properties": {"shot": {"type": "integer"}}}
+    )
+    error = _rows_module_rejects(
+        ROWS_RECIPE, ErrorCode.UDF_ARG_TYPE, "the rows it writes", described
+    )
+    assert "shot" in error.message
+
+
+def test_a_module_that_is_not_a_rows_module_is_refused() -> None:
+    error = _rows_module_rejects(
+        ROWS_RECIPE,
+        ErrorCode.UNSUPPORTED_SQL,
+        "reads no rows",
+        _rows_module_described(rows_module=False),
+    )
+    assert error.hint is not None and "reads rows and writes rows" in error.hint
+
+
+def test_a_rows_export_the_module_does_not_publish_is_refused() -> None:
+    sql = _CAPTIONS_DECLARE + _fauxlate_declare(export="translate-rows") + _copy(
+        "fauxlate(captions(s.video[1]).cues)", path="cues.ndjson"
+    )
+    error = _rows_module_rejects(
+        sql, ErrorCode.UNSUPPORTED_SQL, "names the export 'translate-rows'"
+    )
+    assert "exports 'fauxlate'" in error.message
+
+
+# the call
+
+
+def test_a_rows_function_over_a_stream_is_refused() -> None:
+    sql = _fauxlate_declare() + _copy("fauxlate(s.video[1])", path="cues.ndjson")
+    error = _rows_module_rejects(
+        sql,
+        ErrorCode.UDF_ARG_TYPE,
+        "fauxlate() reads rows, and its argument is a stream",
+    )
+    assert error.hint is not None and "annotation column a module produces" in error.hint
+
+
+def test_a_stream_function_handed_rows_is_refused() -> None:
+    sql = _CAPTIONS_DECLARE + _transcribe_declare() + _copy(
+        "transcribe(captions(s.video[1]).cues, 'es').words"
+    )
+    error = _rows_module_rejects(
+        sql,
+        ErrorCode.UDF_ARG_TYPE,
+        "transcribe() takes audio_stream, and its argument is rows",
+    )
+    assert error.hint is not None and "give it a stream" in error.hint
+
+
+def test_a_rows_function_over_compile_time_cues_is_refused() -> None:
+    sql = _fauxlate_declare() + _copy(
+        "fauxlate(ARRAY[STRUCT('Cue one.' AS text, 0 AS start_t, 1 AS end_t)::cue])",
+        path="cues.ndjson",
+    )
+    error = _rows_module_rejects(
+        sql, ErrorCode.UDF_ARG_TYPE, "its argument is a compile-time cue array"
+    )
+    assert error.hint is not None and "fauxlate(<row>.text)" in error.hint
+
+
+def test_the_producers_record_has_to_be_the_one_the_function_reads() -> None:
+    """Both ends are typed, the way a per-frame consumer's are."""
+    sql = _CAPTIONS_DECLARE + _fauxlate_declare(
+        params="boxes STRUCT(x number)[]", returns="STRUCT(x number)[]"
+    ) + _copy("fauxlate(captions(s.video[1]).cues)", path="cues.ndjson")
+    described = _rows_module_described(
+        reads={"type": "object", "properties": {"x": {"type": "number"}}},
+        writes={"type": "object", "properties": {"x": {"type": "number"}}},
+    )
+    error = _rows_module_rejects(
+        sql, ErrorCode.UDF_ARG_TYPE, "and its argument carries 'cues'", described
+    )
+    assert "fauxlate() reads 'boxes'" in error.message
+
+
+# the graph, the plan and the argv
+
+
+def test_the_rows_edge_is_recorded_on_the_consuming_node() -> None:
+    """A rows node has no pad at either end: what wires it is `rows_inputs`."""
+    graph = _rows_module_plan(ROWS_RECIPE).graphs[0]
+    producer = next(n for n in graph.nodes.values() if n.filter == CAPTIONER)
+    consumer = next(n for n in graph.nodes.values() if n.filter == ROWS_MODULE)
+    assert consumer.rows_inputs == [producer.id]
+    assert consumer.inputs == [] and consumer.outputs == []
+    assert consumer.rows_only and not producer.rows_only
+
+
+def test_the_rows_leave_the_consumer_not_the_producer() -> None:
+    """The document is the LAST node's rows, so the minted track holds what
+    the rows module wrote rather than what its producer did."""
+    graph = _rows_module_plan(ROWS_RECIPE).graphs[0]
+    consumer = next(n for n in graph.nodes.values() if n.filter == ROWS_MODULE)
+    assert list(graph.rows_sinks) == [consumer.id]
+    assert graph.rows_sinks[consumer.id].container == "webvtt"
+
+
+def test_one_sidecar_hosts_the_producer_and_the_rows_module() -> None:
+    plan = _rows_module_plan(ROWS_RECIPE).plan
+    assert plan is not None
+    (sidecar,) = plan.sidecars
+    assert sidecar.module == CAPTIONER
+    assert [b.path for b in sidecar.modules] == [CAPTIONER]
+    assert [(m.path, m.source) for m in sidecar.rows_modules] == [(ROWS_MODULE, 0)]
+
+
+def test_the_rows_module_recipe_renders_every_argv() -> None:
+    plan = _rows_module_plan(ROWS_RECIPE).plan
+    assert plan is not None
+    assert plan_argv(plan, sidecar_argv=wasm.shown_argv) == {
+        "ffmpeg0": [
+            "ffmpeg", "-i", "angel-one.mp4", "-f", "webvtt", "-i", "pipe:0",
+            "-map", "0:v:0", "-c:0", "copy",
+            "-map", "0:a:0", "-c:1", "copy",
+            "-map", "1:s:0", "-c:2", "copy", "out.mkv",
+        ],
+        "ffmpeg1": [
+            "ffmpeg", "-i", "angel-one.mp4",
+            "-map", "0:v:0", "-c:0", "rawvideo", "-pix_fmt:0", "rgba",
+            "-f", "nut", "pipe:1",
+        ],
+        "sidecar0": [
+            "ffrwd-wasm", "-f", "nut", "-i", "pipe:0",
+            "-m", CAPTIONER,
+            "-m", ROWS_MODULE, "-rows-from", "0",
+            "-f", "webvtt", "pipe:1",
+        ],
+    }
+
+
+def test_a_rows_file_destination_takes_the_rows_module_s_own_rows() -> None:
+    sql = _CAPTIONS_DECLARE + _fauxlate_declare() + _copy(
+        "fauxlate(captions(s.video[1]).cues)", path="cues.ndjson"
+    )
+    plan = _rows_module_plan(sql).plan
+    assert plan is not None
+    assert plan_argv(plan, sidecar_argv=wasm.shown_argv)["sidecar0"] == [
+        "ffrwd-wasm", "-f", "nut", "-i", "pipe:0",
+        "-m", CAPTIONER,
+        "-m", ROWS_MODULE, "-rows-from", "0",
+        "-f", "ndjson", "cues.ndjson",
+    ]
+
+
+def test_a_second_rows_module_names_the_first_by_its_own_m_slot() -> None:
+    """The `-m` table is the stream modules then the rows ones, so a rows
+    module reading another's output counts past the whole table."""
+    sql = _CAPTIONS_DECLARE + _fauxlate_declare() + _copy(
+        "fauxlate(fauxlate(captions(s.video[1]).cues))", path="cues.ndjson"
+    )
+    plan = _rows_module_plan(sql).plan
+    assert plan is not None
+    (sidecar,) = plan.sidecars
+    assert [m.source for m in sidecar.rows_modules] == [0, 1]
+    argv = plan_argv(plan, sidecar_argv=wasm.shown_argv)["sidecar0"]
+    assert argv.count("-rows-from") == 2
+    assert [argv[i + 1] for i, a in enumerate(argv) if a == "-rows-from"] == ["0", "1"]

@@ -141,6 +141,7 @@ __all__ = [
     "Process",
     "ProcessPlan",
     "RowsEdge",
+    "RowsModule",
     "SidecarProcess",
     "Stage",
     "StreamEdge",
@@ -543,6 +544,24 @@ class ModuleBinding:
 
 
 @dataclass(frozen=True)
+class RowsModule:
+    """One ROWS module riding in a process, and where its rows come from.
+
+    `source` is the 0-based position, among every ``-m`` this process's argv
+    writes, of the module whose rows this one reads -- what ``-rows-from``
+    names. Rows modules are written after the stream modules, in region
+    order, so one reading another's rows can name it too. A rows function
+    declares no value parameter, so there is nothing to configure it with.
+    """
+
+    path: str
+    source: int
+
+    def to_dict(self) -> dict[str, object]:
+        return {"path": self.path, "source": self.source}
+
+
+@dataclass(frozen=True)
 class ModelBinding:
     """One ``-nn <name>=<path>``: the name a module loads a model by, and the file."""
 
@@ -689,6 +708,11 @@ class SidecarProcess:
     # and its `outputs` -- more than one, ordinarily illegal -- are each their
     # own NUT pipe rather than pads cut from one stdout.
     packet_source: bool = False
+    # The ROWS modules this region hosts, in region order. They carry no
+    # stream, so they are not in `graph` and not in the ``-m`` table a
+    # network's filtergraph names -- each is its own ``-m`` after those,
+    # with a ``-rows-from`` saying whose rows it reads.
+    rows_modules: tuple[RowsModule, ...] = ()
 
     @property
     def nodes(self) -> tuple[str, ...]:
@@ -741,6 +765,8 @@ class SidecarProcess:
             written["sink"] = True
         if self.packet_source:
             written["packet_source"] = True
+        if self.rows_modules:
+            written["rows_modules"] = [one.to_dict() for one in self.rows_modules]
         if self.pads:
             written["pads"] = [None if p is None else p.to_dict() for p in self.pads]
         if self.network and self.graph is not None:
@@ -996,7 +1022,8 @@ def _topological(g: Graph) -> list[str]:
     pending = dict.fromkeys(names, 0)
     consumers: dict[str, list[str]] = {}
     for name, node in g.nodes.items():
-        for ref in node.inputs:
+        # A rows edge orders its two nodes the same way a stream edge does.
+        for ref in (*node.inputs, *node.rows_inputs):
             producer = _ref_node(ref)
             if producer is None or producer not in g.nodes or producer == name:
                 continue
@@ -1100,8 +1127,13 @@ class _Partitioner:
         """Fill :attr:`depth` in dependency order; each node reads its inputs'."""
         for name in self.order:
             node = self.g.nodes[name]
+            # A rows edge stays inside one process, so it adds no depth the
+            # way a stream leaving a sidecar does.
             self.depth[name] = max(
-                (self._ref_depth(ref) for ref in node.inputs),
+                (
+                    *(self._ref_depth(ref) for ref in node.inputs),
+                    *(self.depth.get(ref, 0) for ref in node.rows_inputs),
+                ),
                 default=0,
             )
 
@@ -1496,11 +1528,13 @@ class _Partitioner:
         # A packet sink joins no region but its own: it reads the encoder's
         # output, and only an ffmpeg on its own side of the pipe encodes.
         alone = set(self.g.packet_sinks)
+        # A ROWS edge joins its two nodes too: the consumer runs where the
+        # rows already are, in the producer's own sidecar.
         links = [
             (producer, name)
             for name in self.order
             if self.external[name] and name not in alone
-            for ref in self.g.nodes[name].inputs
+            for ref in (*self.g.nodes[name].inputs, *self.g.nodes[name].rows_inputs)
             if (producer := _ref_node(ref)) is not None
             and self.external.get(producer, False)
             and producer not in alone
@@ -1896,7 +1930,13 @@ class _Partitioner:
     def run(self) -> ProcessPlan:
         self._check_lockstep()
         for members in self._regions():
-            first = next(name for name in members if self.external[name])
+            # The ENTRY is the first node reading a stream: a rows module
+            # reads none, so it is never one however early it sits.
+            first = next(
+                name
+                for name in members
+                if self.external[name] and not self.g.nodes[name].rows_only
+            )
             entry = self.g.nodes[first]
             sidecar = SidecarProcess(
                 id=f"sidecar{len(self.sidecars)}",
@@ -1909,6 +1949,7 @@ class _Partitioner:
                     self.g.nodes[name].filter
                     for name in members
                     if self.external[name]
+                    and not self.g.nodes[name].rows_only
                     and self.g.nodes[name].filter not in HOSTED_FILTERS
                 ),
                 models=self._region_models(members),
@@ -2462,6 +2503,10 @@ class _Partitioner:
         nodes: dict[str, Node] = {}
         for name in members:  # topological: a split precedes its readers
             node = self.g.nodes[name]
+            if node.rows_only:
+                # No pad, so nothing for the filtergraph to wire: a rows
+                # module is named by its own ``-m`` and its ``-rows-from``.
+                continue
             if not self.external[name]:
                 # An absorbed split: its readers take its own input instead.
                 source = rewrite(node.inputs[0])
@@ -2493,8 +2538,10 @@ class _Partitioner:
         ]
         # The module whose rows leave is a sink of the region too: the network
         # string has to name the pad they were read off, even though its
-        # frames go no further than the rows document.
-        rows_node = next((name for name in members if name in self.g.rows_sinks), None)
+        # frames go no further than the rows document. Where a rows module
+        # ends the rows, that pad is the last STREAM node above it.
+        written_rows = next((name for name in members if name in self.g.rows_sinks), None)
+        rows_node = None if written_rows is None else self._rows_pad(written_rows)
         if rows_node is not None:
             sinks.append(
                 SinkUnit(
@@ -2531,6 +2578,7 @@ class _Partitioner:
             sidecar,
             reads_rows=any(e.annotations for e in self.edges if e.target == sidecar.id),
             writes_rows=any(e.annotations for e in self.edges if e.source == sidecar.id),
+            rows_modules=self._rows_modules(sidecar, members),
             graph=Graph(
                 input_paths=[PIPE] * len(incoming),
                 sources={alias_of[e.ref]: index for index, e in enumerate(incoming)},
@@ -2538,6 +2586,51 @@ class _Partitioner:
                 sinks=sinks,
             ),
         )
+
+    def _rows_pad(self, name: str) -> str:
+        """The node whose PAD the rows `name` writes were read off.
+
+        Itself for a module that read them off its own frames; the stream
+        node above it for a rows module, whose rows came in over a rows edge
+        and whose own output is not a pad at all.
+        """
+        seen: set[str] = set()
+        while self.g.nodes[name].rows_only and name not in seen:
+            seen.add(name)
+            name = self.g.nodes[name].rows_inputs[0]
+        return name
+
+    def _rows_modules(
+        self, sidecar: SidecarProcess, members: Sequence[str]
+    ) -> tuple[RowsModule, ...]:
+        """This region's rows modules, each naming its producer's ``-m`` slot.
+
+        The ``-m`` table is the stream modules first, in `sidecar.modules`
+        order, then one per rows module in region order -- which is what the
+        index each `RowsModule` carries counts against.
+        """
+        rows_nodes = [name for name in members if self.g.nodes[name].rows_only]
+        if not rows_nodes:
+            return ()
+        by_path = {binding.path: index for index, binding in enumerate(sidecar.modules)}
+        by_node = {
+            name: len(sidecar.modules) + offset
+            for offset, name in enumerate(rows_nodes)
+        }
+        found: list[RowsModule] = []
+        for name in rows_nodes:
+            node = self.g.nodes[name]
+            producer = node.rows_inputs[0]
+            source = by_node.get(producer, by_path.get(self.g.nodes[producer].filter))
+            if source is None:
+                raise FfrwdError(
+                    ErrorCode.INTERNAL,
+                    f"the rows '{node.filter}' reads come from '{producer}', "
+                    "which this process does not load",
+                    hint="please report this query as a bug",
+                )
+            found.append(RowsModule(path=node.filter, source=source))
+        return tuple(found)
 
     def _inputs(
         self, nodes: Mapping[str, Node], sinks: Sequence[SinkUnit]

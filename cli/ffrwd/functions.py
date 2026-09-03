@@ -205,6 +205,17 @@ _WASM_SOURCE_HINT = (
     "number or boolean, the values it is configured with"
 )
 _WASM_SOURCE_CALL_HINT = "a source is called in FROM: FROM <name>(<values>) <alias>"
+# A ROWS function: an array of annotation records in, one out, no stream. The
+# name a message gives its RETURNS, which has no column name of its own.
+_ROWS_RETURN = "the rows it returns"
+_WASM_ROWS_HINT = (
+    "a rows function reads one array of annotation records and returns one: "
+    "<name>(<column> cue[]) RETURNS cue[]"
+)
+_WASM_ROWS_CALL_HINT = (
+    "call a rows function over the annotation column a module produces, e.g. "
+    "<name>(<producer>(<stream>).<column>)"
+)
 # What a module filters, keyed by the type its signature names. A module takes
 # one kind of stream and returns the same kind.
 WASM_STREAM_TYPES: Mapping[str, StreamType] = {
@@ -443,6 +454,9 @@ class WasmFunction:
     # What the stream field of an annotating RETURNS was named. Unused at run
     # time, like the annotation's own name, and kept so the signature reads back.
     stream_field: str = ""
+    # The record the RETURNS declares for a ROWS function -- one that reads
+    # rows and writes rows, with no stream anywhere. None for every other kind.
+    returns_rows: Annotation | None = None
     # Which statement of the script declared this, the same counter a sql
     # function's carries: what "used before it is defined" compares against.
     position: int = 0
@@ -456,8 +470,29 @@ class WasmFunction:
     def is_value(self) -> bool:
         """True for a function returning a compile-time value, not a stream."""
         return (
-            self.returns not in WASM_STREAM_TYPES and not self.is_sink and not self.is_source
+            self.returns not in WASM_STREAM_TYPES
+            and not self.is_sink
+            and not self.is_source
+            and not self.is_rows
         )
+
+    @property
+    def is_rows(self) -> bool:
+        """True for a ROWS function: rows in, rows out, no stream anywhere.
+
+        It is neither a filter nor a compile-time value: the module runs
+        beside the one producing its rows, in that sidecar, and its result is
+        a row column of the declared record.
+        """
+        return self.returns_rows is not None
+
+    @property
+    def rows_param(self) -> Annotation:
+        """The row column a ROWS function reads. Asking of any other is a bug."""
+        annotation = self.params[0].annotation if self.params else None
+        if not self.is_rows or annotation is None:
+            raise ValueError(f"'{self.name}' does not read rows")
+        return annotation
 
     @property
     def is_sink(self) -> bool:
@@ -553,7 +588,9 @@ class WasmFunction:
         for one the sidecar hands more than one stream at a time; a value
         function filters none.
         """
-        return () if self.is_value else _leading_streams(self.params)
+        if self.is_value or self.is_rows:
+            return ()
+        return _leading_streams(self.params)
 
     @property
     def stream_arity(self) -> int:
@@ -562,8 +599,12 @@ class WasmFunction:
 
     @property
     def reads(self) -> Annotation | None:
-        """The annotation column this function takes, or None if it takes none."""
-        if self.is_value:
+        """The annotation column this function takes BESIDE a stream.
+
+        None for a ROWS function, whose rows are the whole argument rather
+        than a column riding one: :attr:`rows_param` is that one.
+        """
+        if self.is_value or self.is_rows:
             return None
         after = self.stream_arity
         return self.params[after].annotation if len(self.params) > after else None
@@ -575,7 +616,7 @@ class WasmFunction:
         An optional column lets one declaration serve both call shapes: over
         a producer the rows are wired in, over a plain stream nothing is.
         """
-        if self.is_value:
+        if self.is_value or self.is_rows:
             return False
         after = self.stream_arity
         if len(self.params) <= after:
@@ -590,8 +631,11 @@ class WasmFunction:
         A value function has no stream to skip: every parameter is its own.
         A stream function's leading streams, and its annotation column where
         one is declared, are neither -- they are not a value the module is
-        configured with.
+        configured with. A rows function's one parameter is its rows, so it
+        has none either.
         """
+        if self.is_rows:
+            return ()
         if self.is_value:
             return self.params
         skip = self.stream_arity + (1 if self.reads is not None else 0)
@@ -601,11 +645,11 @@ class WasmFunction:
     def written_params(self) -> tuple[Parameter, ...]:
         """The parameters a CALL writes an argument for.
 
-        A value function's are all of them. A stream function's annotation
-        column is not one: the call producing it produces the stream beside
-        it, so a single written argument covers both.
+        A value function's are all of them, and so are a rows function's. A
+        stream function's annotation column is not one: the call producing it
+        produces the stream beside it, so a single written argument covers both.
         """
-        if self.is_value:
+        if self.is_value or self.is_rows:
             return self.params
         return (*self.stream_params, *self.value_params)
 
@@ -1366,6 +1410,72 @@ def _define_wasm_source(
     )
 
 
+def _define_wasm_rows(
+    name: str,
+    module: str,
+    export: str,
+    params: tuple[Parameter, ...],
+    returns: str,
+    returns_rows: Annotation,
+    identifier: exp.Identifier,
+    create: exp.Create,
+) -> WasmFunction:
+    """One validated ROWS declaration: rows in, rows out, no stream anywhere.
+
+    The one parameter is the rows the module reads and the RETURNS is the
+    rows it writes, each an array of annotation records. There is no stream
+    to filter and no value to configure it with, so anything else in the
+    signature is refused by name; a DEFAULT has nothing to mean either,
+    since a rows function exists to read the rows it is handed.
+    """
+    if not params:
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"wasm function '{name}' returns rows and reads none",
+            identifier,
+            fallback=create,
+            hint=_WASM_ROWS_HINT,
+        )
+    if len(params) > 1:
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"wasm function '{name}' returns rows and takes {len(params)} parameters",
+            identifier,
+            fallback=create,
+            hint=_WASM_ROWS_HINT,
+        )
+    column = params[0]
+    if column.annotation is None:
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"wasm function '{name}' returns rows and takes '{column.name}' as "
+            f"{column.type}",
+            identifier,
+            fallback=create,
+            hint=_WASM_ROWS_HINT,
+        )
+    if column.default is not None:
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"wasm function '{name}' gives the row column '{column.name}' a DEFAULT",
+            identifier,
+            fallback=create,
+            hint="a rows function exists to read the rows it is handed; there "
+            "is nothing to fall back to",
+        )
+    line, col = _pos(identifier, create)
+    return WasmFunction(
+        name=name,
+        module=module,
+        export=export,
+        params=params,
+        returns=returns,
+        returns_rows=returns_rows,
+        line=line,
+        col=col,
+    )
+
+
 def _define_wasm_value(
     name: str,
     module: str,
@@ -1469,6 +1579,21 @@ def _define_wasm(
         elif _type_name(node) == WASM_SOURCE:
             return _define_wasm_source(name, module, export, params, identifier, create)
         else:
+            # An array of annotation records as the RETURNS is a ROWS
+            # function; checked before the type itself, since a bare
+            # STRUCT(...)[] has no name in the type vocabulary.
+            returns_rows = _annotation(node, _ROWS_RETURN, name, identifier)
+            if returns_rows is not None:
+                return _define_wasm_rows(
+                    name,
+                    module,
+                    export,
+                    params,
+                    _type_name(node) or returns_rows.written,
+                    returns_rows,
+                    identifier,
+                    create,
+                )
             returns = _checked_type(node, name, identifier)
             if returns in _ANNOTATION_FIELD_TYPES:
                 return _define_wasm_value(
@@ -3235,6 +3360,11 @@ class _Expander:
                     fallback=call,
                     hint=_ARG_HINT,
                 )
+            if param.annotation is not None:
+                # An annotation column's shape is not a kind: what it has to
+                # be is the record the producing module publishes, which
+                # lowering matches against the module's own rows.
+                continue
             written = _argument_kind(argument, self.wasm)
             if written is None or written == _declared_kind(param.type):
                 continue

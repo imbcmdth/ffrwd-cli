@@ -2993,3 +2993,37 @@ ffmpeg -i tests/fixtures/av.mp4 -i tests/fixtures/subs.en.vtt -f webvtt -i \
 ```
 
 Any of the dialect's built-in text or number functions - `upper`, `lower`, `length`, `round`, `replace`, `substring` - or a declared wasm value function fold the same way, over a literal or a row column alike; the same grammar reaches `WHERE` too, e.g. `WHERE upper(c.text) = 'CUE ONE.'`.
+
+## 113. Translate captions as they are produced
+
+A rows function reads rows and writes rows, with no stream anywhere: `RETURNS cue[]` over one `cue[]` parameter says so, and the module it names has to be one the sidecar runs on rows alone. Written over the annotation column another module produces, it becomes a second node beside that module, fed by a rows edge rather than by frames - so the cues never leave the sidecar between the two:
+
+```pgsql
+CREATE FUNCTION captions(v video_stream)
+RETURNS STRUCT(v video_stream, cues cue[])
+  AS '../sidecar/modules/target/wasm32-wasip2/release/captions.wasm', 'captions'
+  LANGUAGE wasm;
+
+CREATE FUNCTION fauxlate(cues cue[]) RETURNS cue[]
+  AS '../sidecar/modules/target/wasm32-wasip2/release/fauxlate.wasm', 'fauxlate'
+  LANGUAGE wasm;
+
+COPY (
+  SELECT f.video[1], f.audio[1], fauxlate(captions(f.video[1]).cues)
+  FROM input('tests/fixtures/av.mp4') f
+) TO 'fauxlated.mkv'
+```
+
+```
+$ ffrwd compile -f query.sql
+ffmpeg -i tests/fixtures/av.mp4 -map 0:v:0 -c:0 rawvideo -pix_fmt:0 rgba -f nut pipe:1 | \
+  ffrwd-wasm -f nut -i pipe:0 -m \
+  ../sidecar/modules/target/wasm32-wasip2/release/captions.wasm -m \
+  ../sidecar/modules/target/wasm32-wasip2/release/fauxlate.wasm -rows-from 0 -f webvtt \
+  pipe:1 | ffmpeg -i tests/fixtures/av.mp4 -f webvtt -i pipe:0 -map 0:v:0 -c:0 copy -map \
+  0:a:0 -c:1 copy -map 1:s:0 -c:2 copy fauxlated.mkv
+```
+
+`-rows-from 0` is the edge: it names the module whose rows arrive here by its position in the `-m` table, and nothing about it is a pad, so the filtergraph never mentions it. `fauxlate` is a stand-in for a real translator - every word gains `-a` and `-o` in turn, so `Cue one.` comes back `Cue-a one-o.` - and the result is the producer's column read one module later: selected here it is a subtitle track, and at a `.ndjson` destination it is the rows themselves.
+
+One module, two forms: `fauxlate.wasm` also exports the value function `translate`, declared `RETURNS text` and run once per call at compile time, which is how the same word rule reaches a caption FILE's cues - the shape [recipe 112](#112-a-function-over-a-caption-files-cues) writes with `upper`. Rows a module produces at run time are this recipe's; rows the compiler already holds are that one's, and a rows function over them is refused by name.

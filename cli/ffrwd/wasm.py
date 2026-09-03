@@ -89,6 +89,8 @@ __all__ = [
     "encoder_codec",
     "hosts_packet_sink",
     "hosts_packet_source",
+    "hosts_rows_module",
+    "input_rows_arms",
     "invoke",
     "language_tag",
     "model_binding",
@@ -185,6 +187,9 @@ _PACKET_SINK_WORLD = "ffrwd:av@0.10.0"
 # The first world whose sidecar hosts a packet source.
 _PACKET_SOURCE_WORLD = "ffrwd:av@0.13.0"
 
+# The first world whose sidecar hosts a rows module.
+_ROWS_MODULE_WORLD = "ffrwd:av@0.14.0"
+
 # The sample formats one can carry, and the pcm each of them travels as.
 WIRE_SAMPLE_FMTS: tuple[str, ...] = ("f32", "s16")
 SAMPLE_FMT_CODECS: Mapping[str, str] = {"f32": PCM_F32LE, "s16": PCM_S16LE}
@@ -253,6 +258,10 @@ _TIMEOUT_SECONDS = 20.0
 
 # How the sidecar is told a side carries annotations beside the frames.
 _ANNOTATIONS_FLAG = "-annotations"
+
+# How a rows module is told whose rows it reads: the position, among this
+# command line's ``-m`` flags, of the module producing them.
+_ROWS_FROM_FLAG = "-rows-from"
 
 # How a model file is bound to the name the module loads it by, and what the
 # file is called: the export's own name, beside the module.
@@ -334,6 +343,11 @@ class Described:
     rather than consuming or filtering them -- the same boolean-flag
     convention `nn`/`http`/`udp` already use, false for every module built
     before 0.13.0.
+
+    `rows_module` marks a ROWS MODULE -- one that reads JSON rows and writes
+    JSON rows with no stream anywhere -- and `input_rows_schema` is the shape
+    it READS, beside `rows_schema`'s shape it writes. False and None for
+    every other kind.
     """
 
     world: str
@@ -371,6 +385,8 @@ class Described:
     video_streams: SinkArity = "one"
     audio_streams: SinkArity = "none"
     source: bool = False
+    rows_module: bool = False
+    input_rows_schema: Mapping[str, object] | None = None
 
     @property
     def packet_sink(self) -> bool:
@@ -549,6 +565,10 @@ def _described(path: str, payload: object) -> Described:
         video_streams=_sink_arity(payload.get("video_streams"), "one"),
         audio_streams=_sink_arity(payload.get("audio_streams"), "none"),
         source=payload.get("source") is True,
+        rows_module=payload.get("rows_module") is True,
+        input_rows_schema=payload["input_rows_schema"]
+        if isinstance(payload.get("input_rows_schema"), dict)
+        else None,
     )
 
 
@@ -1047,6 +1067,13 @@ def _argv(
     wiring the names together, each node's parameters written into it as
     ``k=v:k2=v2``.
 
+    A ROWS module is neither: it carries no stream, so no filtergraph names
+    it. It comes after the module table as an ``-m <path>`` of its own,
+    followed by ``-rows-from <index>`` -- the 0-based position, among every
+    ``-m`` this command line writes, of the module whose rows it reads. The
+    stream modules are written first, so a rows module reading another rows
+    module's output names it the same way.
+
     ``-annotations`` says which sides carry the rows a module read off its
     frames -- ``in`` beside the input it reads them from, ``out`` beside the
     output it writes them to. A process with ffmpeg on both sides gets
@@ -1110,9 +1137,24 @@ def _argv(
         argv += ["-m", process.module]
         if process.args:
             argv += ["-params", json.dumps(process.args, sort_keys=True)]
+        argv += _rows_module_args(process)
         argv += rows_args(process) or _stream_output(process, reads)
     if process.writes_rows:
         argv += [_ANNOTATIONS_FLAG, ANNOTATIONS_OUT]
+    return argv
+
+
+def _rows_module_args(process: SidecarProcess) -> list[str]:
+    """The ``-m``/``-rows-from`` pair each rows module of this region takes.
+
+    A rows module is in no filtergraph -- it reads rows and writes rows, and
+    nothing about it is a pad -- so the edge is a flag instead: ``-rows-from``
+    counts ``-m`` flags from the start of this command line, the stream
+    modules first, and names the one whose rows arrive here.
+    """
+    argv: list[str] = []
+    for module in process.rows_modules:
+        argv += ["-m", module.path, _ROWS_FROM_FLAG, str(module.source)]
     return argv
 
 
@@ -1177,6 +1219,9 @@ def _network_args(process: SidecarProcess) -> list[str]:
     argv: list[str] = []
     for binding in process.modules:
         argv += ["-m", f"{binding.name}={binding.path}"]
+    # After the table the network names, so a rows module's ``-rows-from``
+    # index counts the same ``-m`` flags in both spellings.
+    argv += _rows_module_args(process)
     argv += ["-filter_complex", network]
     for target in targets:
         argv += ["-map", target, *(rows or _stream_output(process))]
@@ -1275,7 +1320,25 @@ def rows_arms(described: Described) -> tuple[tuple[tuple[str, str], ...], ...] |
     a declaration matching ANY of them is a declaration the module can fill.
     None when the module declares no rows at all.
     """
-    schema = described.rows_schema
+    return _arms(described.rows_schema)
+
+
+def input_rows_arms(
+    described: Described,
+) -> tuple[tuple[tuple[str, str], ...], ...] | None:
+    """Every shape the rows a ROWS MODULE reads may take, as :func:`rows_arms`.
+
+    The mirror of `rows_schema` for the other end of a rows module: what it
+    consumes rather than what it emits. None when the module names no shape
+    in particular.
+    """
+    return _arms(described.input_rows_schema)
+
+
+def _arms(
+    schema: Mapping[str, object] | None,
+) -> tuple[tuple[tuple[str, str], ...], ...] | None:
+    """One row schema read as its arms: `oneOf`'s branches, else itself."""
     if schema is None:
         return None
     branches = schema.get("oneOf")
@@ -1400,6 +1463,11 @@ def hosts_packet_sink(world: str) -> bool:
 def hosts_packet_source(world: str) -> bool:
     """True when `world`'s sidecar can host a packet source."""
     return world in WORLDS and WORLDS.index(world) >= WORLDS.index(_PACKET_SOURCE_WORLD)
+
+
+def hosts_rows_module(world: str) -> bool:
+    """True when `world`'s sidecar can host a rows module."""
+    return world in WORLDS and WORLDS.index(world) >= WORLDS.index(_ROWS_MODULE_WORLD)
 
 
 def _listed(names: Sequence[str], empty: str) -> str:

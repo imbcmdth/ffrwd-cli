@@ -131,6 +131,15 @@ class Node:
     # True for a node that reads the annotations its first input carries.
     # Only a hosted module ever does; an ffmpeg filter cannot.
     reads_annotations: bool = False
+    # The nodes whose ROWS this one reads, in argument order -- an edge that
+    # carries rows and no frames. Only a ROWS MODULE has any: it reads rows
+    # and writes rows, so it has no `inputs` and no `outputs` at all.
+    rows_inputs: list[str] = field(default_factory=list)
+
+    @property
+    def rows_only(self) -> bool:
+        """True for a node carrying rows and no stream: a rows module."""
+        return bool(self.rows_inputs) and not self.inputs and not self.outputs
 
     def to_dict(self) -> dict[str, object]:
         written: dict[str, object] = {
@@ -142,6 +151,8 @@ class Node:
         }
         if self.reads_annotations:
             written["reads_annotations"] = True
+        if self.rows_inputs:
+            written["rows_inputs"] = list(self.rows_inputs)
         return written
 
     @classmethod
@@ -154,8 +165,10 @@ class Node:
         assert isinstance(node_id, str)
         assert isinstance(node_filter, str)
         assert isinstance(node_args, dict)
+        raw_rows_inputs = d.get("rows_inputs") or []
         assert isinstance(node_inputs, list)
         assert isinstance(node_outputs, list)
+        assert isinstance(raw_rows_inputs, list)
         return cls(
             id=node_id,
             filter=node_filter,
@@ -163,6 +176,7 @@ class Node:
             inputs=[str(x) for x in node_inputs],
             outputs=[_parse_stream_type(x) for x in node_outputs],
             reads_annotations=bool(d.get("reads_annotations", False)),
+            rows_inputs=[str(x) for x in raw_rows_inputs],
         )
 
 

@@ -438,6 +438,8 @@ from ffrwd.wasm import (
     encoder_codec,
     hosts_packet_sink,
     hosts_packet_source,
+    hosts_rows_module,
+    input_rows_arms,
     language_tag,
     rows_arms,
 )
@@ -1115,6 +1117,21 @@ def _stream_projection(
 def _annotation_fields(annotation: Annotation) -> tuple[tuple[str, str], ...]:
     """One annotation record's fields, name-ordered, for comparing two of them."""
     return tuple(sorted((f.name, f.type) for f in annotation.fields))
+
+
+def _is_cue_array(node: exp.Expr) -> bool:
+    """True for the two spellings of a compile-time cue list.
+
+    The SHAPE only -- nothing is evaluated here, since this answers a
+    rejection's question rather than building a track.
+    """
+    if isinstance(node, exp.ArrayAgg):
+        inner = node.this
+        return isinstance(inner, exp.Expr) and record_cast_type(_unwrap(inner)) == CUE_TYPE
+    if isinstance(node, exp.Array):
+        elements = [item for item in node.expressions if isinstance(item, exp.Expr)]
+        return bool(elements) and record_cast_type(_unwrap(elements[0])) == CUE_TYPE
+    return False
 
 
 def _annotation_matches(
@@ -2852,6 +2869,7 @@ class _NodeFactory:
         outputs: list[StreamType],
         *,
         reads_annotations: bool = False,
+        rows_inputs: Sequence[str] = (),
     ) -> FrameRef:
         self._counter += 1
         node_id = f"n{self._counter}"
@@ -2862,6 +2880,7 @@ class _NodeFactory:
             inputs=list(inputs),
             outputs=list(outputs),
             reads_annotations=reads_annotations,
+            rows_inputs=list(rows_inputs),
         )
         return node_id
 
@@ -3260,7 +3279,9 @@ class _Lowerer:
             if isinstance(column, exp.Expr)
         ]
         sole = _unwrap(written[0]) if len(written) == 1 else None
-        if sole is not None and self._rows_projection(sole) is not None:
+        if sole is not None and (
+            self._rows_projection(sole) is not None or self._rows_call(sole) is not None
+        ):
             return path
         raise _error(
             ErrorCode.UNSUPPORTED_SQL,
@@ -8347,6 +8368,10 @@ class _Lowerer:
         rows = self._lower_rows_projection(node, env, select)
         if rows is not None:
             return rows
+        # A rows function's result is that same column, one module later.
+        rewritten = self._lower_rows_call(node, env, select)
+        if rewritten is not None:
+            return rewritten
         if isinstance(node, exp.Struct):
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
@@ -8589,12 +8614,31 @@ class _Lowerer:
             return None
         call, declared = found
         module = self._row_filtered(self._lower_expr(call, env, select), node)
-        producer = module.streams[0].ref
+        return self._rows_output(
+            module.streams[0].ref, module.type, declared, call, node, env, select
+        )
+
+    def _rows_output(
+        self,
+        producer: FrameRef,
+        kind: StreamType,
+        declared: WasmFunction,
+        call: exp.Anonymous,
+        node: exp.Expr,
+        env: _Env,
+        select: exp.Select,
+    ) -> _Value:
+        """Where the rows `producer` writes go: a rows file, or a minted track.
+
+        The one place a row column becomes an output, whichever node ends the
+        rows -- the module that read them off its frames, or the rows module
+        that ran over them afterwards.
+        """
         if self.rows_file:
             self.graph.rows_sinks[producer] = RowsSink(
                 container=_ROWS_CONTAINER, path=self.rows_file
             )
-            return _Value(type=module.type, streams=(), is_array=False)
+            return _Value(type=kind, streams=(), is_array=False)
         tag = self._rows_language(declared, call, node, env, select)
         ref = self._mint_stream_input(
             CUES_COLUMN, PIPE, WEBVTT_FORMAT, "subtitle"
@@ -8604,6 +8648,272 @@ class _Lowerer:
         )
         self.rows_tracks.append(ref)
         return _scalar(_Stream(ref=ref, type="subtitle", source=_rows_meta(tag)))
+
+    # -- a rows function: rows in, rows out ---------------------------------
+
+    def _rows_call(self, node: exp.Expr) -> tuple[exp.Anonymous, WasmFunction] | None:
+        """``<rows function>(<rows>)``, as the call and what declares it."""
+        if not isinstance(node, exp.Anonymous):
+            return None
+        declared = self.res.wasm.get(str(node.name).lower())
+        return (node, declared) if declared is not None and declared.is_rows else None
+
+    def _lower_rows_call(
+        self, node: exp.Expr, env: _Env, select: exp.Select
+    ) -> _Value | None:
+        """A rows function over a module's annotation column.
+
+        The producer lowers exactly as it would on its own; the rows function
+        becomes a node of its own beside it, fed by a ROWS edge naming that
+        producer and carrying no frames. Its value is a row column of the
+        declared return type, which is the producer's own value read one
+        module later: a track where the query projects it, the rows
+        themselves at a rows-file destination.
+        """
+        found = self._rows_call(node)
+        if found is None:
+            return None
+        call, declared = found
+        ref, kind, _ = self._rows_node(node, env, select)
+        return self._rows_output(ref, kind, declared, call, node, env, select)
+
+    def _rows_node(
+        self, node: exp.Expr, env: _Env, select: exp.Select
+    ) -> tuple[FrameRef, StreamType, Annotation]:
+        """One rows-function call as its node: the rows edge, wired and typed.
+
+        `node` names a rows function, which the caller has already checked.
+        Its argument's own node comes back from :meth:`_rows_source`, and the
+        record that node emits is matched against what this declaration says
+        it reads before the edge is drawn.
+        """
+        found = self._rows_call(node)
+        assert found is not None  # the caller selected on it
+        call, declared = found
+        self._described_rows(declared, node, select)
+        arguments = [a for a in call.expressions if isinstance(a, exp.Expr)]
+        if len(arguments) != 1:
+            raise _error(
+                ErrorCode.UDF_ARG_TYPE,
+                f"{declared.name}() takes 1 argument, got {len(arguments)}",
+                node,
+                fallback=select,
+                hint=f"a rows function reads one row column: {declared.signature}",
+            )
+        written = _unwrap(arguments[0])
+        source = self._rows_source(written, env, select)
+        if source is None:
+            raise self._not_rows(declared, written, node)
+        producer, kind, emitted = source
+        self._check_rows_argument(declared, emitted, written, node, select)
+        assert declared.returns_rows is not None  # what is_rows selected on
+        ref = self.ctx.node(declared.module, {}, [], [], rows_inputs=[producer])
+        return ref, kind, declared.returns_rows
+
+    def _rows_source(
+        self, written: exp.Expr, env: _Env, select: exp.Select
+    ) -> tuple[FrameRef, StreamType, Annotation] | None:
+        """The node whose rows `written` names, and the record they carry.
+
+        Either half of the dialect's two row producers: the annotation column
+        a stream module reads off its frames, or another rows function's
+        result. None for everything else.
+        """
+        produced = self._rows_projection(written)
+        if produced is not None:
+            producer_call, producer = produced
+            if written.meta.get(ROW_PREDICATE) is not None:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"'{producer.name}' rows are narrowed before a rows function "
+                    "reads them",
+                    written,
+                    fallback=select,
+                    hint="a rows function reads every row the module produced; "
+                    "drop the WHERE, or narrow the rows the function returns",
+                )
+            module = self._lower_expr(producer_call, env, select)
+            assert producer.emits is not None  # what _rows_projection selected on
+            return module.streams[0].ref, module.type, producer.emits
+        if self._rows_call(written) is not None:
+            return self._rows_node(written, env, select)
+        return None
+
+    def _not_rows(
+        self, declared: WasmFunction, written: exp.Expr, node: exp.Expr
+    ) -> FfrwdError:
+        """Why this argument is not the rows a rows function reads.
+
+        Compile-time rows are their own answer: a caption file's cues are
+        known before anything runs, so a module hosted beside a producer has
+        nothing to run against, and the value grammar is where that work
+        already happens.
+        """
+        if _is_cue_array(written):
+            return _error(
+                ErrorCode.UDF_ARG_TYPE,
+                f"{declared.name}() reads a module's rows, and its argument is "
+                "a compile-time cue array",
+                written,
+                fallback=node,
+                hint=f"cues the compiler already holds are rewritten one row at "
+                f"a time by the value form, e.g. {declared.name}(<row>.text) "
+                "inside a STRUCT(...)::cue",
+            )
+        said = (
+            "a stream"
+            if isinstance(written, exp.Column | exp.Bracket | exp.Anonymous | exp.Dot)
+            else _describe(written)
+        )
+        return _error(
+            ErrorCode.UDF_ARG_TYPE,
+            f"{declared.name}() reads rows, and its argument is {said}",
+            written,
+            fallback=node,
+            hint=f"call it over the annotation column a module produces, e.g. "
+            f"{declared.name}(<producer>(<stream>).<column>)",
+        )
+
+    def _described_rows(
+        self, declared: WasmFunction, node: exp.Expr, select: exp.Select
+    ) -> Described:
+        """What a ROWS function's module turned out to declare, checked.
+
+        The rows mirror of :meth:`_described`: the world has to host a rows
+        module, the module has to BE one, and both ends of the declaration --
+        the column it reads and the record it returns -- are matched against
+        the two schemas the module publishes.
+        """
+        described = self.describes.get(declared.module)
+        if described is None:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"the module '{declared.module}' was never described",
+                node,
+                fallback=select,
+                hint="this is a compiler bug; please report the query that "
+                "produced it",
+            )
+        if described.world not in WORLDS:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"the module '{declared.module}' targets {described.world}, and "
+                f"this ffrwd hosts {' or '.join(WORLDS)}",
+                node,
+                fallback=select,
+                hint="rebuild the module against a world this ffrwd hosts, or "
+                "upgrade ffrwd",
+            )
+        if not described.rows_module:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"function '{declared.name}' returns {declared.returns}, and the "
+                f"module '{declared.module}' reads no rows",
+                node,
+                fallback=select,
+                hint="a rows function needs a module that reads rows and writes "
+                "rows; declare a stream and a return to filter a stream instead",
+            )
+        if not hosts_rows_module(described.world):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"the module '{declared.module}' is a rows module, and the "
+                f"sidecar's {described.world} cannot host one",
+                node,
+                fallback=select,
+                hint="rebuild the module against a world whose sidecar runs "
+                "rows modules, or upgrade ffrwd",
+            )
+        if described.name != declared.export:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"function '{declared.name}' names the export '{declared.export}', "
+                f"and '{declared.module}' exports '{described.name}'",
+                node,
+                fallback=select,
+                hint=f"a module carries one rows export; write '{described.name}' "
+                "as the export",
+            )
+        self._check_rows_schema(
+            declared,
+            declared.rows_param,
+            input_rows_arms(described),
+            reads=True,
+            node=node,
+            select=select,
+        )
+        assert declared.returns_rows is not None  # what is_rows selected on
+        self._check_rows_schema(
+            declared,
+            declared.returns_rows,
+            rows_arms(described),
+            reads=False,
+            node=node,
+            select=select,
+        )
+        return described
+
+    def _check_rows_schema(
+        self,
+        declared: WasmFunction,
+        annotation: Annotation,
+        arms: tuple[tuple[tuple[str, str], ...], ...] | None,
+        *,
+        reads: bool,
+        node: exp.Expr,
+        select: exp.Select,
+    ) -> None:
+        """One end of a rows declaration against the schema the module publishes.
+
+        The same field-for-field match a per-frame annotation gets, run twice:
+        once for the rows the module reads, once for the rows it writes.
+        """
+        side = "reads" if reads else "writes"
+        if arms is None:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"the module '{declared.module}' names no shape for the rows "
+                f"it {side}",
+                node,
+                fallback=select,
+                hint="a rows function needs a module that publishes both row "
+                "schemas; rebuild it declaring them",
+            )
+        fields = _annotation_fields(annotation)
+        if any(_annotation_matches(fields, arm) for arm in arms):
+            return
+        raise _error(
+            ErrorCode.UDF_ARG_TYPE,
+            f"function '{declared.name}' declares the rows it {side} as "
+            f"{annotation.written}, and the module '{declared.module}' {side} "
+            f"{' or '.join(_written_json_fields(arm) for arm in arms)}",
+            node,
+            fallback=select,
+            hint="a rows record names the module's own row columns, with a "
+            "type each value fits",
+        )
+
+    def _check_rows_argument(
+        self,
+        declared: WasmFunction,
+        emitted: Annotation,
+        written: exp.Expr,
+        node: exp.Expr,
+        select: exp.Select,
+    ) -> None:
+        """That the rows arriving are the rows this function declares reading."""
+        if _annotation_fields(declared.rows_param) == _annotation_fields(emitted):
+            return
+        raise _error(
+            ErrorCode.UDF_ARG_TYPE,
+            f"{declared.name}() reads '{declared.rows_param.name}' as "
+            f"{declared.rows_param.written}, and its argument carries "
+            f"'{emitted.name}' as {emitted.written}",
+            written,
+            fallback=node,
+            hint="the two annotation records have to name the same fields, "
+            "with the same types",
+        )
 
     def _rows_language(
         self,
@@ -10670,6 +10980,29 @@ class _Lowerer:
             return self._lower_sink_call(node, declared, described, call, env, select)
         kind = declared.stream_kind
         arity = declared.stream_arity
+        # A stream position holding a row column: the rows travel beside the
+        # frames a module filters, and there are none here to travel beside.
+        rows_written = next(
+            (
+                argument
+                for argument in call.args[:arity]
+                if self._rows_projection(_unwrap(argument)) is not None
+                or self._rows_call(_unwrap(argument)) is not None
+            ),
+            None,
+        )
+        if rows_written is not None:
+            raise _error(
+                ErrorCode.UDF_ARG_TYPE,
+                f"{declared.name}() takes {declared.params[0].type}, and its "
+                "argument is rows",
+                rows_written,
+                fallback=node,
+                hint=f"give it the stream those rows came off, and its rows "
+                f"beside it: {declared.name}(<producer>(<stream>)...)"
+                if declared.reads is not None
+                else f"give it a stream: {declared.signature}",
+            )
         expected: list[StreamType] = [kind] * arity
         kinds = self._stream_kinds(call, env, select, arity)
         if kinds != expected:

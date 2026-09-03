@@ -95,6 +95,9 @@ def insert_pts_resets(g: Graph) -> Graph:
             inputs=new_inputs,
             outputs=list(node.outputs),
             reads_annotations=node.reads_annotations,
+            # Rows carry no timestamps a reset could touch; the edge rides
+            # through naming the same producer.
+            rows_inputs=list(node.rows_inputs),
         )
 
     # A trim/atrim mapped straight to an output file, with no filter in

@@ -164,6 +164,9 @@ def insert_splits(g: Graph) -> Graph:
             inputs=new_inputs,
             outputs=list(node.outputs),
             reads_annotations=node.reads_annotations,
+            # A rows edge is not a pad and never fans out: nothing to split,
+            # so it rides through naming the same producer it always did.
+            rows_inputs=list(node.rows_inputs),
         )
 
     # Units in order, each unit's outputs in list order: pad assignment is

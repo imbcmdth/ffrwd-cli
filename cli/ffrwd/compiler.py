@@ -195,7 +195,23 @@ def _stream_wasm(res: Resolved) -> dict[str, WasmFunction]:
     sidecar process, so it takes no part in partitioning: not the process
     plan, not the pixel-format negotiation, not the external filter list. A
     source is also excluded -- it reads no stream and has no `stream_kind` to
-    negotiate; it is wired into the process plan through `module_sources`.
+    negotiate; it is wired into the process plan through `module_sources`. A
+    ROWS function is excluded for the same reason: rows in, rows out, and no
+    stream edge to negotiate a format on.
+    """
+    return {
+        name: declared
+        for name, declared in res.wasm.items()
+        if not declared.is_value and not declared.is_source and not declared.is_rows
+    }
+
+
+def _hosted_wasm(res: Resolved) -> dict[str, WasmFunction]:
+    """Every declaration the SIDECAR runs, keyed by name.
+
+    The stream ones plus the rows ones: a rows module is a node of the module
+    network like any other, and the partitioner has to know its filter is one
+    ffmpeg cannot run, even though nothing about it is a stream.
     """
     return {
         name: declared
@@ -486,14 +502,13 @@ def compile_all(
         ready = [insert_splits(insert_pts_resets(graph)) for graph in graphs]
         budget = _default_timeout(probes)
         stream_wasm = _stream_wasm(res)
-        if not stream_wasm and not ready[0].module_sources:
+        hosted = _hosted_wasm(res)
+        if not hosted and not ready[0].module_sources:
             return Compiled(graphs=ready, default_timeout=budget)
         try:
             plan = partition(
                 ready[0],
-                external=external_filters(
-                    *sorted({d.module for d in stream_wasm.values()})
-                ),
+                external=external_filters(*sorted({d.module for d in hosted.values()})),
                 probes=probes,
                 pix_fmts=_wire_formats(stream_wasm, describes),
                 shapes=_module_shapes(stream_wasm, describes),

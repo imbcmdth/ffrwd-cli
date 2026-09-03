@@ -260,3 +260,16 @@ def test_module_source_survives_the_pass() -> None:
     )
     out = insert_pts_resets(g)
     assert out.module_sources == g.module_sources
+
+
+def test_a_rows_edge_survives_the_pass() -> None:
+    """Rows carry no timestamps to reset, but the pass rebuilds every node,
+    so a rows module's edge has to ride through naming the same producer."""
+    g = _no_trim_graph()
+    g.nodes["rows"] = Node(
+        id="rows", filter="fauxlate.wasm", args={}, inputs=[], outputs=[],
+        rows_inputs=["n0"],
+    )
+    out = insert_pts_resets(g)
+    assert out.nodes["rows"].rows_inputs == ["n0"]
+    assert out.nodes["rows"].inputs == [] and out.nodes["rows"].outputs == []
