@@ -250,7 +250,9 @@ def _negotiable(
     for declared in declared_stream.values():
         if declared.module in done or declared.module in seen:
             continue
-        if declared.module not in describes or declared.stream_kind != kind:
+        if declared.module not in describes or declared.reads_rows_from_select:
+            continue  # a row-reading sink has no single kind; its pads are the rows'
+        if declared.stream_kind != kind:
             continue
         if describes[declared.module].packet_sink:
             continue  # its edge carries encoded packets, not frames

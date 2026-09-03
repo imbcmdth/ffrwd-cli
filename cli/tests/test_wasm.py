@@ -4108,6 +4108,39 @@ def _packet_rejects(
 # the describe payload
 
 
+def test_a_row_reading_sink_needs_no_wire_negotiation() -> None:
+    """A sink reading rows off the SELECT list has no single stream kind for
+    the wire negotiation to key on; through the compiler it steps aside like
+    any packet sink, and the plan places its pads."""
+    sql = (
+        "CREATE FUNCTION drain(url text) RETURNS sink\n"
+        f"  AS '{PACKET_MODULE}', 'drain' LANGUAGE wasm;\n"
+        + "COPY (SELECT f.video[1], f.audio[1] FROM input('a.mp4') f) TO drain('http://x/')"
+    )
+    from dataclasses import replace
+
+    described = _packet_described(
+        name="drain",
+        world=WORLDS[-1],
+        video_codecs=("h264",),
+        audio_codecs=("aac",),
+        video_streams="many",
+        audio_streams="many",
+    )
+    described = replace(
+        described,
+        params_schema={
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {"url": {"type": "string"}},
+        },
+    )
+    plan = _packet_plan(sql, described).plan
+    assert plan is not None
+    assert len(plan.sidecars) == 1
+    assert len(plan.sidecars[0].pads) == 2
+
+
 def test_the_codecs_list_is_read_off_the_describe_payload() -> None:
     payload = {"world": "ffrwd:av@0.10.0", "name": "p", "video_codecs": ["hevc", "h264"]}
     described = wasm._described(PACKET_MODULE, payload)
