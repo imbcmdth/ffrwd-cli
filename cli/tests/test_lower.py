@@ -48,9 +48,10 @@ from ffrwd import registry as registry_module
 from ffrwd.compiler import compile_sql
 from ffrwd.emit import build_ffmpeg_args, emit
 from ffrwd.errors import ErrorCode, FfrwdError
+from ffrwd.functions import WASM_SOURCE, Parameter, WasmFunction
 from ffrwd.ir import NO_CHAPTERS, NO_METADATA, Attachment, Graph, StreamType
 from ffrwd.lower import lower, lower_table
-from ffrwd.parser import parse, resolve
+from ffrwd.parser import Resolved, parse, resolve
 from ffrwd.probe import (
     AttachmentMeta,
     ChapterMeta,
@@ -67,6 +68,8 @@ from ffrwd.split import insert_splits
 from ffrwd.table import ArrayCell, RecordCell, StreamCell, render_csv, render_table
 from ffrwd.types import DISPOSITION_KEYS
 from ffrwd.warnings import FfrwdWarning, OnWarning, WarningCode
+from ffrwd.wasm import WORLDS, Described, SourceCatalog, SourceRendition
+from ffrwd.wasm import SourceTrack as WasmSourceTrack
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 REPO_ROOT = PROJECT_ROOT.parent
@@ -12315,3 +12318,328 @@ def test_a_stream_array_and_a_per_row_option_of_different_lengths_are_refused() 
     )
     assert err.code is ErrorCode.BROADCAST_MISMATCH
     assert "read once per row over" in err.message
+
+
+# ---------------------------------------------------------------------------
+# module sources: `FROM <source>(<values>) alias` -- a `RETURNS source`
+# call, the mirror of a sink, bound through the same row machinery a
+# manifest's renditions already use.
+#
+# resolve()'s FROM-item gate (parser.py's `_add_input`, around line 5350)
+# still answers ANY function name but `input` with "unsupported table
+# function <name>()" -- the chunk that widens it to admit a `RETURNS
+# source` call, the way it already admits `input`, is not this one's. So
+# these tests bypass `resolve()` for the FROM item and hand `lower()` the
+# `Resolved` it would build once that gate opens: `parse()` alone (no
+# semantic checks) for the tree, and a hand-filled `wasm` table -- exactly
+# the way a `ProbeResult` stands in for `probe()` elsewhere in this file.
+# ---------------------------------------------------------------------------
+
+
+def _source_function(
+    name: str = "subscribe",
+    module: str = "modules/subscribe.wasm",
+    export: str = "subscribe",
+) -> WasmFunction:
+    """One ``RETURNS source`` declaration: two text value parameters, the
+    shape a subscription's relay/broadcast names would take."""
+    return WasmFunction(
+        name=name,
+        module=module,
+        export=export,
+        params=(Parameter("relay", "text"), Parameter("broadcast", "text")),
+        returns=WASM_SOURCE,
+        line=1,
+        col=1,
+    )
+
+
+def _source_described(
+    declared: WasmFunction, *, source: bool = True, world: str = WORLDS[-1]
+) -> Described:
+    return Described(
+        world=world,
+        name=declared.export,
+        params_schema={
+            "properties": {
+                "relay": {"type": "string"},
+                "broadcast": {"type": "string"},
+            }
+        },
+        source=source,
+    )
+
+
+def _subscribe_catalog(*, bounded: bool = False) -> SourceCatalog:
+    """A muxed 720p rendition (row 0, h264+aac) beside an audio-only one
+    (row 1, language 'en') -- the shape a catalog's own tracks take, mirrored
+    into rendition rows exactly as :func:`ffrwd.wasm.catalog_as_probe` reads
+    a manifest's `RenditionMeta` list.
+    """
+    rung = SourceRendition(name="720p", bandwidth=2_000_000, codecs=None, language=None)
+    solo = SourceRendition(name=None, bandwidth=128_000, codecs=None, language="en")
+    return SourceCatalog(
+        tracks=(
+            WasmSourceTrack(
+                codec="h264", time_base=(1, 90000), kind="video",
+                width=1280, height=720, sample_rate=None, channels=None,
+                extradata=b"", profile=None, level=None, row=0, rendition=rung,
+            ),
+            WasmSourceTrack(
+                codec="aac", time_base=(1, 48000), kind="audio",
+                width=None, height=None, sample_rate=48000, channels=2,
+                extradata=b"", profile=None, level=None, row=0, rendition=rung,
+            ),
+            WasmSourceTrack(
+                codec="aac", time_base=(1, 48000), kind="audio",
+                width=None, height=None, sample_rate=48000, channels=2,
+                extradata=b"", profile=None, level=None, row=1, rendition=solo,
+            ),
+        ),
+        bounded=bounded,
+    )
+
+
+def _module_source_resolved(sql: str, declared: WasmFunction) -> Resolved:
+    """The `Resolved` `lower()` would be handed once resolve()'s FROM-item
+    gate admits a `RETURNS source` call: `sql`'s tree, parsed but never
+    resolved, its alias assigned no `-i` slot (`sources`/`input_paths` stay
+    empty -- a module source's bytes never come from one), and `wasm`
+    carrying the one declaration the call names.
+    """
+    tree = parse(sql)
+    assert isinstance(tree, sqlglot.exp.Select)
+    return Resolved(
+        select=tree,
+        input_paths=[],
+        sources={},
+        branches=[tree],
+        wasm={declared.name: declared},
+    )
+
+
+def _lower_source(
+    sql: str,
+    declared: WasmFunction,
+    described: Described,
+    fake_probe_source: object,
+) -> Graph:
+    return lower(
+        _module_source_resolved(sql, declared),
+        {},
+        registry=_snapshot_registry(),
+        describes={declared.module: described},
+        probe_source=fake_probe_source,  # type: ignore[arg-type]
+    )
+
+
+def _reject_source(
+    sql: str, declared: WasmFunction, described: Described, fake_probe_source: object
+) -> FfrwdError:
+    with pytest.raises(FfrwdError) as excinfo:
+        _lower_source(sql, declared, described, fake_probe_source)
+    return _anchored(excinfo.value)
+
+
+def test_a_module_source_alias_binds_two_rendition_rows() -> None:
+    """`FROM subscribe(...) s` binds `s` as a row table with no `unnest`,
+    same as a probed manifest: one row per catalog `row`, so `amix` over
+    every row's audio reads exactly 2 inputs even though the catalog carries
+    3 tracks (the muxed row's video contributes nothing to `.audio`)."""
+    declared = _source_function()
+    described = _source_described(declared)
+    catalog = _subscribe_catalog()
+    g = _lower_source(
+        "SELECT amix(VARIADIC array_agg(s.audio)) FROM subscribe('relay', 'live') s",
+        declared, described, lambda module, params: catalog,
+    )
+    (node,) = g.nodes.values()
+    assert node.filter == "amix"
+    assert node.inputs == ["src:s:a:0", "src:s:a:1"]
+
+
+def test_module_source_rendition_columns_resolve() -> None:
+    """`s.height` and `s.language` read back exactly as a manifest's own
+    rendition columns do, narrowing the catalog's two rows to one apiece."""
+    declared = _source_function()
+    described = _source_described(declared)
+    catalog = _subscribe_catalog()
+    by_height = _lower_source(
+        "SELECT s.video[1] FROM subscribe('relay', 'live') s WHERE s.height = 720",
+        declared, described, lambda module, params: catalog,
+    )
+    assert _outputs(by_height) == [("src:s:v:0", "video", None)]
+    by_language = _lower_source(
+        "SELECT s.audio[1] FROM subscribe('relay', 'live') s WHERE s.language = 'en'",
+        declared, described, lambda module, params: catalog,
+    )
+    # the audio-only row's own audio track: the second one the catalog counts
+    assert _outputs(by_language) == [("src:s:a:1", "audio", None)]
+
+
+def test_a_where_on_module_source_height_keeps_one_row() -> None:
+    """`WHERE s.height = 720` narrows the two-row catalog to the muxed row
+    alone, so both its video and audio reach the SELECT list."""
+    declared = _source_function()
+    described = _source_described(declared)
+    catalog = _subscribe_catalog()
+    g = _lower_source(
+        "SELECT s.video[1], s.audio[1] FROM subscribe('relay', 'live') s "
+        "WHERE s.height = 720",
+        declared, described, lambda module, params: catalog,
+    )
+    assert _outputs(g) == [
+        ("src:s:v:0", "video", None),
+        ("src:s:a:0", "audio", None),
+    ]
+
+
+def test_array_agg_of_a_module_source_video_column_gathers() -> None:
+    """`array_agg(s.video[1])` gathers every surviving row's own video
+    stream, in row order -- here just the one row that carries video,
+    exactly as a manifest's audio-only rendition contributes nothing."""
+    declared = _source_function()
+    described = _source_described(declared)
+    catalog = _subscribe_catalog()
+    g = _lower_source(
+        "SELECT array_agg(s.video[1]) FROM subscribe('relay', 'live') s",
+        declared, described, lambda module, params: catalog,
+    )
+    assert _outputs(g) == [("src:s:v:0", "video", None)]
+
+
+def test_the_graph_carries_the_module_source_and_its_tracks() -> None:
+    """`Graph.module_sources` records the same catalog as IR: the module
+    path, the folded params JSON, one `SourceTrack` per catalog track with
+    its ref/row/rendition, and `bounded` off the catalog -- the mirror of
+    `Graph.packet_sinks`."""
+    declared = _source_function()
+    described = _source_described(declared)
+    catalog = _subscribe_catalog()
+    # narrowed to the muxed row, so the bare SELECT still writes one file --
+    # `Graph.module_sources` records the WHOLE catalog regardless, unaffected
+    # by which rows a WHERE leaves standing.
+    g = _lower_source(
+        "SELECT s.video[1] FROM subscribe('relay', 'live') s WHERE s.height = 720",
+        declared, described, lambda module, params: catalog,
+    )
+    source = g.module_sources["s"]
+    assert source.alias == "s"
+    assert source.module == declared.module
+    # value args fold into the module's own params the way a sink's do,
+    # JSON-serialized the same way `-params` is (sorted keys).
+    assert source.params == '{"broadcast": "live", "relay": "relay"}'
+    assert [t.ref for t in source.tracks] == ["src:s:v:0", "src:s:a:0", "src:s:a:1"]
+    assert [t.row for t in source.tracks] == [0, 0, 1]
+    assert [t.kind for t in source.tracks] == ["video", "audio", "audio"]
+    assert source.tracks[2].language == "en"
+    assert source.tracks[0].codec == "h264"
+    assert source.bounded is False
+
+
+def test_a_bounded_module_source_reads_back_on_the_graph() -> None:
+    """`bounded` on the catalog reaches `ModuleSource.bounded` unchanged --
+    the processes pass (not this one's) is what turns `False` into joining
+    the live set."""
+    declared = _source_function()
+    described = _source_described(declared)
+    catalog = _subscribe_catalog(bounded=True)
+    g = _lower_source(
+        "SELECT s.video[1] FROM subscribe('relay', 'live') s WHERE s.height = 720",
+        declared, described, lambda module, params: catalog,
+    )
+    assert g.module_sources["s"].bounded is True
+
+
+def test_a_plain_input_alias_is_unaffected_by_the_source_binding_path() -> None:
+    """`_add_table`'s Anonymous branch now checks `res.wasm` for a source
+    declaration before falling back to `input()`'s own handling; a script
+    naming no wasm source at all must resolve exactly as it always has."""
+    g = _lower("SELECT f.video[1] FROM input('f.mp4') f", _row_probes())
+    assert _outputs(g) == [("src:f:v:0", "video", None)]
+
+
+def test_a_module_source_probe_failure_is_a_typed_refusal() -> None:
+    """The sidecar's own probe error surfaces at the FROM item, re-anchored
+    the same way an invoke() failure is (`_lower_wasm_call`)."""
+    declared = _source_function()
+    described = _source_described(declared)
+
+    def failing_probe(module: str, params: str) -> SourceCatalog:
+        raise FfrwdError(
+            ErrorCode.UNSUPPORTED_SQL,
+            "the relay refused the subscription: 403",
+            hint="check the token",
+        )
+
+    err = _reject_source(
+        "SELECT s.video[1] FROM subscribe('relay', 'live') s",
+        declared, described, failing_probe,
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "cannot read 's'" in err.message
+    assert "the relay refused the subscription: 403" in err.message
+    assert err.hint == "check the token"
+
+
+def test_a_where_time_window_on_a_module_source_row_is_not_a_column() -> None:
+    """A module source binds through the SAME rendition-row table a
+    manifest does (:meth:`_bind_renditions`), so ``s.t`` is refused the
+    exact way a ladder's own rendition alias refuses it: a rendition row
+    exposes its metadata columns, never a time column to seek by -- there is
+    no file offset behind it either way."""
+    declared = _source_function()
+    described = _source_described(declared)
+    catalog = _subscribe_catalog()
+    err = _reject_source(
+        "SELECT s.video[1] FROM subscribe('relay', 'live') s "
+        "WHERE s.height = 720 AND s.t <= 1",
+        declared, described, lambda module, params: catalog,
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "unknown column 's.t'" in err.message
+
+
+def test_a_where_time_window_on_an_empty_module_source_is_refused() -> None:
+    """The degenerate catalog with no tracks at all -- never the contracted
+    shape (a real source always reports at least one row), but the one case
+    where the alias stays bound as a plain input rather than a rendition row
+    table, so a WHERE window would otherwise reach `Graph.input_trims` for
+    an alias with no `-i` to seek. Refused by name instead of crashing."""
+    declared = _source_function()
+    described = _source_described(declared)
+    empty_catalog = SourceCatalog(tracks=(), bounded=False)
+    err = _reject_source(
+        "SELECT s.video[1] FROM subscribe('relay', 'live') s WHERE s.t <= 1",
+        declared, described, lambda module, params: empty_catalog,
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'s' is a module source" in err.message
+    assert "nothing to seek" in err.message
+    assert err.hint is not None and "paces itself" in err.hint
+
+
+def test_a_non_packet_source_module_named_in_from_is_refused() -> None:
+    """The module's own describe says it is not a packet source: refused by
+    name rather than left to fail at run time."""
+    declared = _source_function()
+    described = _source_described(declared, source=False)
+    err = _reject_source(
+        "SELECT s.video[1] FROM subscribe('relay', 'live') s",
+        declared, described, lambda module, params: _subscribe_catalog(),
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "is not a packet source" in err.message
+
+
+def test_a_module_source_on_a_pre_packet_source_world_is_refused() -> None:
+    """A module built against a world before packet sources arrived (0.13.0)
+    cannot be hosted as one, named by the world it targets."""
+    declared = _source_function()
+    described = _source_described(declared, world="ffrwd:av@0.9.0")
+    err = _reject_source(
+        "SELECT s.video[1] FROM subscribe('relay', 'live') s",
+        declared, described, lambda module, params: _subscribe_catalog(),
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "cannot host one" in err.message

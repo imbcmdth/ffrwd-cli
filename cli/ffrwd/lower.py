@@ -278,6 +278,7 @@ from __future__ import annotations
 
 import base64
 import difflib
+import json
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Literal
@@ -297,6 +298,7 @@ from ffrwd.ir import (
     Attachment,
     FrameRef,
     Graph,
+    ModuleSource,
     Node,
     Output,
     RowsSink,
@@ -306,6 +308,9 @@ from ffrwd.ir import (
     is_src,
     src_alias,
     src_parts,
+)
+from ffrwd.ir import (
+    SourceTrack as IrSourceTrack,
 )
 from ffrwd.macros import INPUT_MACROS, MACROS, InputMacro, Macro, macro_names
 from ffrwd.parser import (
@@ -426,15 +431,25 @@ from ffrwd.wasm import (
     Described,
     DescribedFunction,
     Invoke,
+    SourceCatalog,
     audio_encoder_codec,
+    catalog_as_probe,
     encoder_codec,
     hosts_packet_sink,
+    hosts_packet_source,
     language_tag,
     rows_arms,
 )
 from ffrwd.wasm import invoke as wasm_invoke
+from ffrwd.wasm import probe_source as wasm_probe_source
 
 __all__ = ["lower", "lower_table"]
+
+# Runs one packet-source module's `probe` and returns its compile-time
+# catalog, or raises FfrwdError. :func:`ffrwd.wasm.probe_source` is the real
+# one; a lowering test passes its own, so binding a `RETURNS source` call
+# needs no sidecar.
+ProbeSource = Callable[[str, str], SourceCatalog]
 
 # The python types each JSON Schema type a module parameter may declare
 # accepts. A schema naming anything else is left alone: what the module
@@ -542,6 +557,10 @@ _PASSTHROUGH_HINT = (
 _SOURCE_DURATION_HINT = (
     "a generated source has no timeline to seek into; give it a length with "
     "its own option instead, e.g. ffmpeg.anullsrc(duration => 30) s"
+)
+_MODULE_SOURCE_SEEK_HINT = (
+    "a module source paces itself -- there is no file offset to seek into; "
+    "drop the WHERE window on it"
 )
 _ROW_METADATA_HINT = (
     "a track row's metadata columns are what you FILTER, JOIN and SORT rows by; "
@@ -2862,6 +2881,7 @@ class _Lowerer:
         describes: dict[str, Described] | None = None,
         invoke: Invoke = wasm_invoke,
         probe_failures: Mapping[str, ProbeFailure | None] | None = None,
+        probe_source: ProbeSource = wasm_probe_source,
     ) -> None:
         self.res = res
         self.probes = probes
@@ -2872,6 +2892,7 @@ class _Lowerer:
         self.registry = registry
         self.describes = describes or {}
         self.invoke = invoke
+        self.probe_source = probe_source
         # (module, function, sorted args) -> result, so two calls with the
         # same arguments run the module once per compile.
         self._invoke_cache: dict[tuple[str, str, tuple[tuple[str, object], ...]], object] = {}
@@ -6022,6 +6043,149 @@ class _Lowerer:
             kinds=kinds,
         )
 
+    # -- FROM <source>(<values>) alias: a RETURNS source call --------------
+
+    def _add_module_source(
+        self,
+        alias: str,
+        inner: exp.Anonymous,
+        declared: WasmFunction,
+        join: RawRowJoin | None,
+        env: _Env,
+        select: exp.Select,
+    ) -> None:
+        """``FROM <source>(<values>) alias`` -- the mirror of a sink call,
+        bound exactly as ``input()`` binds.
+
+        The call's value arguments fold into the module's own parameters the
+        same way a sink's do (:meth:`_wasm_params`), and the sidecar is asked
+        ONCE, at compile time, for the catalog those parameters describe
+        (:func:`~ffrwd.wasm.probe_source`). The catalog becomes this alias's
+        :class:`~ffrwd.probe.ProbeResult`
+        (:func:`~ffrwd.wasm.catalog_as_probe`) -- one row per rendition,
+        never zero -- so it binds through :meth:`_bind_renditions` exactly as
+        a probed manifest does: no new relation kind, ``s.video``,
+        ``s.bandwidth``, WHERE/ORDER BY/LIMIT and the one-row rule all read
+        it the same way. :attr:`Graph.module_sources` records the same
+        catalog as IR, the mirror of :attr:`Graph.packet_sinks`.
+        """
+        call = _call_parts(inner)
+        assert call is not None  # inner is exp.Anonymous; _call_parts always answers
+        if call.named:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"{declared.name}() does not take named arguments",
+                call.named[0].value,
+                fallback=inner,
+                hint=f"a wasm function's parameters are positional: "
+                f"{declared.signature}",
+            )
+        described = self._described_source(declared, inner, select)
+        params = self._wasm_params(
+            declared, described, call, inner, select, env, {}, first=0
+        )
+        params_json = json.dumps(params, sort_keys=True)
+        try:
+            catalog = self.probe_source(declared.module, params_json)
+        except FfrwdError as err:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"cannot read '{alias}': {err.message}",
+                inner,
+                fallback=select,
+                hint=err.hint,
+            ) from err
+        result = catalog_as_probe(alias, catalog)
+        self.probes[alias] = result
+        env.bindings[alias] = _InputBinding(alias=alias)
+        self._bind_renditions(alias, join, env, select)
+        self.graph.module_sources[alias] = ModuleSource(
+            alias=alias,
+            module=declared.module,
+            params=params_json,
+            tracks=tuple(
+                IrSourceTrack(
+                    ref=f"src:{alias}:{_TYPE_MARKERS[stream.type]}:{stream.index}",
+                    kind=track.kind,
+                    codec=track.codec,
+                    time_base=track.time_base,
+                    row=track.row,
+                    name=track.rendition.name,
+                    bandwidth=track.rendition.bandwidth,
+                    codecs=track.rendition.codecs,
+                    language=track.rendition.language,
+                )
+                for track, stream in zip(catalog.tracks, result.streams, strict=True)
+            ),
+            bounded=catalog.bounded,
+        )
+
+    def _described_source(
+        self, declared: WasmFunction, node: exp.Expr, select: exp.Select
+    ) -> Described:
+        """What a ``RETURNS source`` call's module declares, checked.
+
+        The source mirror of :meth:`_described`, checked against its OWN
+        rules rather than reused whole: a source reads no streams and emits
+        no per-frame annotations, so the filter-shaped checks
+        :meth:`_described` runs after the world/export match --
+        :meth:`_check_stream_arity` chief among them, which would read
+        ``described.inputs`` as if it were a filter's pad count -- have
+        nothing to check here and would misjudge a module that correctly
+        reads none at all.
+        """
+        described = self.describes.get(declared.module)
+        if described is None:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"the module '{declared.module}' was never described",
+                node,
+                fallback=select,
+                hint="this is a compiler bug; please report the query that "
+                "produced it",
+            )
+        if described.world not in WORLDS:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"the module '{declared.module}' targets {described.world}, and "
+                f"this ffrwd hosts {' or '.join(WORLDS)}",
+                node,
+                fallback=select,
+                hint="rebuild the module against a world this ffrwd hosts, or "
+                "upgrade ffrwd",
+            )
+        if described.name != declared.export:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"function '{declared.name}' names the export '{declared.export}', "
+                f"and '{declared.module}' exports '{described.name}'",
+                node,
+                fallback=select,
+                hint=f"a module carries one filter; write '{described.name}' as "
+                "the export",
+            )
+        if not hosts_packet_source(described.world):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"the module '{declared.module}' produces packets, and the "
+                f"sidecar's {described.world} cannot host one",
+                node,
+                fallback=select,
+                hint="packet sources arrived with ffrwd:av@0.13.0; upgrade "
+                "ffrwd, or point at a newer ffrwd-wasm",
+            )
+        if not described.source:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"function '{declared.name}' declares RETURNS source, and the "
+                f"module '{declared.module}' is not a packet source",
+                node,
+                fallback=select,
+                hint=f"'{declared.module}' has to export a packet source built "
+                "RETURNS source; check the module and the export named",
+            )
+        return described
+
     # -- joining two row tables ------------------------
 
     def _join_rows(
@@ -6234,6 +6398,19 @@ class _Lowerer:
             self._add_series_rows(alias, series_values, inner, env, select, join)
             return
         if isinstance(inner, exp.Anonymous):
+            declared = self.res.wasm.get(str(inner.this).lower())
+            if declared is not None and declared.is_source:
+                if not isinstance(alias_node, exp.TableAlias) or alias_node.this is None:
+                    raise _error(
+                        ErrorCode.UNSUPPORTED_SQL,
+                        f"{declared.name}() requires an alias",
+                        table,
+                        fallback=select,
+                        hint=f"add an alias, e.g. FROM {declared.name}(...) s",
+                    )
+                alias = _fold(alias_node.this)
+                self._add_module_source(alias, inner, declared, join, env, select)
+                return
             if not isinstance(alias_node, exp.TableAlias) or alias_node.this is None:
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,
@@ -7700,6 +7877,18 @@ class _Lowerer:
                     conjunct,
                     fallback=where,
                     hint=_SOURCE_DURATION_HINT,
+                )
+            if isinstance(binding, _InputBinding) and alias in self.graph.module_sources:
+                # A module source is a pull loop the sidecar paces itself,
+                # not a file with an offset: there is nothing for -ss/-to to
+                # seek, unlike a probed input's own -i.
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"'{alias}' is a module source, so 'WHERE {alias}.t' has "
+                    "nothing to seek",
+                    conjunct,
+                    fallback=where,
+                    hint=_MODULE_SOURCE_SEEK_HINT,
                 )
             low_node, high_node = bounds.get(alias, (None, None))
             bounds[alias] = (
@@ -13003,6 +13192,7 @@ def lower(
     describes: dict[str, Described] | None = None,
     invoke: Invoke = wasm_invoke,
     probe_failures: Mapping[str, ProbeFailure | None] | None = None,
+    probe_source: ProbeSource = wasm_probe_source,
 ) -> Graph:
     """Lower a resolved query into an IR graph -- its FIRST command's.
 
@@ -13025,13 +13215,15 @@ def lower(
     `probes` is: a lowering test hands over a synthetic one and spawns
     nothing. `invoke` runs one VALUE function's module, once per distinct
     call site's arguments, to fold its result -- a parameter for the same
-    reason.
+    reason. `probe_source` runs one ``RETURNS source`` module's ``probe``,
+    once per FROM alias that calls one, to bind its catalog -- a parameter
+    for the same reason.
 
     Raises ``FfrwdError`` — and nothing else — on every rejection.
     """
     return lower_commands(
         res, probes, registry=registry, on_warning=on_warning, describes=describes,
-        invoke=invoke, probe_failures=probe_failures,
+        invoke=invoke, probe_failures=probe_failures, probe_source=probe_source,
     )[0]
 
 
@@ -13044,6 +13236,7 @@ def lower_commands(
     describes: dict[str, Described] | None = None,
     invoke: Invoke = wasm_invoke,
     probe_failures: Mapping[str, ProbeFailure | None] | None = None,
+    probe_source: ProbeSource = wasm_probe_source,
 ) -> list[Graph]:
     """Lower a resolved query into one IR graph per ffmpeg COMMAND.
 
@@ -13064,6 +13257,7 @@ def lower_commands(
         shared = _Lowerer(
             res, probes, registry, fanout_sinks=True, on_warning=on_warning,
             describes=describes, invoke=invoke, probe_failures=probe_failures,
+            probe_source=probe_source,
         )
         graph = shared.run()
         count = shared.fanout_count
@@ -13078,6 +13272,7 @@ def lower_commands(
             _Lowerer(
                 res, probes, registry, fanout_index=index, on_warning=on_warning,
                 describes=describes, invoke=invoke, probe_failures=probe_failures,
+                probe_source=probe_source,
             ).run()
             for index in range(count)
         ]
@@ -13158,6 +13353,7 @@ def lower_table(
     describes: dict[str, Described] | None = None,
     invoke: Invoke = wasm_invoke,
     probe_failures: Mapping[str, ProbeFailure | None] | None = None,
+    probe_source: ProbeSource = wasm_probe_source,
 ) -> list[TableSink]:
     """Lower a resolved TABLE query into its printable result set(s).
 
@@ -13171,7 +13367,7 @@ def lower_table(
     try:
         return _Lowerer(
         res, probes, registry, on_warning=on_warning, describes=describes, invoke=invoke,
-        probe_failures=probe_failures,
+        probe_failures=probe_failures, probe_source=probe_source,
     ).run_table()
     except FfrwdError:
         raise

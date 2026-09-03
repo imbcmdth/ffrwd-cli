@@ -2951,6 +2951,13 @@ class _Expander:
         line, col = _pos(site.node)
         adopted = exp.Anonymous(this=name, expressions=list(site.call.expressions))
         adopted.meta.update({"line": line, "col": col, "start": 0, "end": 0})
+        if isinstance(site.node, exp.Table):
+            # A FROM-position call's `node` is the whole Table, alias
+            # included (`_row_source_site`) -- replacing it with the bare
+            # call would discard the alias the query bound it under, the
+            # same fix `_expand_row_source` already makes for a RETURNS
+            # TABLE function's FROM item.
+            return exp.Table(this=adopted, alias=site.node.args.get("alias"))
         return adopted
 
     # -- wasm calls -------------------------------------------------------

@@ -13,6 +13,7 @@ with no ffmpeg.
 from __future__ import annotations
 
 import functools
+import json
 import re
 from pathlib import Path
 
@@ -23,8 +24,11 @@ from ffrwd.errors import ErrorCode, FfrwdError
 from ffrwd.lower import lower, lower_table
 from ffrwd.parser import Resolved, parse, resolve
 from ffrwd.probe import ProbeResult, StreamMeta
+from ffrwd.project import discover
 from ffrwd.registry import Registry, load_reference
 from ffrwd.split import insert_splits
+from ffrwd.wasm import Described, SourceCatalog, SourceRendition
+from ffrwd.wasm import SourceTrack as WasmSourceTrack
 
 SNAPSHOT_PATH = Path(__file__).resolve().parent / "data" / "reference_registry.json"
 
@@ -943,6 +947,78 @@ def test_a_table_function_is_a_row_source_inside_a_cte() -> None:
     assert _argv(sql) == [
         "ffmpeg", "-i", "a.mka", "-map", "0:a:0", "-c:0", "copy", "out.mka",
     ]
+
+
+def test_a_package_qualified_source_call_keeps_its_alias_after_adoption(
+    tmp_path: Path,
+) -> None:
+    """A ``RETURNS source`` call adopted from a package -- ``ffrwd.moq.subscribe(...)
+    s`` -- must reach lowering with its alias intact.
+
+    Regression for `_Expander._adopt`: a FROM-position `_WasmSite`'s `node`
+    is the whole `exp.Table` (alias included, `_row_source_site`), and
+    `_adopt` used to hand back a bare `exp.Anonymous`, so `site.node.replace
+    (replacement)` in `_expand_within` discarded the Table wrapper and the
+    alias with it -- the adopted call landed bare in the FROM list, and
+    `_check_wasm_calls` rejected it as "not in FROM" even though it plainly
+    was. `_adopt` now rebuilds the `exp.Table` around the adopted call the
+    same way `_expand_row_source` already does for a `RETURNS TABLE`
+    function's FROM item, so the alias survives and lowering binds the
+    catalog under it.
+    """
+    (tmp_path / "src").mkdir(parents=True)
+    (tmp_path / "src" / "moq.sql").write_text(
+        "CREATE FUNCTION subscribe(relay text, broadcast text) RETURNS source\n"
+        "  AS 'moq.wasm', 'subscribe' LANGUAGE wasm;\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "ffrwd.json").write_text(
+        json.dumps(
+            {"name": "ffrwd/moq", "version": "1.0.0", "lib": {"subscribe": "src/moq.sql"}}
+        ),
+        encoding="utf-8",
+    )
+    packages = discover(tmp_path)
+    assert packages is not None
+    res = resolve(
+        parse(
+            "SELECT s.video[1] FROM ffrwd.moq.subscribe('relay-host', 'live') s "
+            "WHERE s.height = 720"
+        ),
+        packages=packages,
+    )
+    assert list(res.wasm_sources) == ["s"]
+    declared = next(iter(res.wasm.values()))
+
+    rung = SourceRendition(name="720p", bandwidth=2_000_000, codecs=None, language=None)
+    catalog = SourceCatalog(
+        tracks=(
+            WasmSourceTrack(
+                codec="h264", time_base=(1, 90000), kind="video",
+                width=1280, height=720, sample_rate=None, channels=None,
+                extradata=b"", profile=None, level=None, row=0, rendition=rung,
+            ),
+        ),
+        bounded=False,
+    )
+    described = Described(
+        world="ffrwd:av@0.13.0",
+        name="subscribe",
+        params_schema={
+            "properties": {
+                "relay": {"type": "string"},
+                "broadcast": {"type": "string"},
+            }
+        },
+        source=True,
+    )
+    g = lower(
+        res, {}, registry=_snapshot_registry(),
+        describes={declared.module: described},
+        probe_source=lambda module, params: catalog,
+    )
+    assert [(o.ref, o.type) for o in g.outputs] == [("src:s:v:0", "video")]
+    assert g.module_sources["s"].alias == "s"
 
 
 def test_a_call_joins_a_cte_the_query_already_wrote() -> None:
