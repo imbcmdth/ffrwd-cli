@@ -747,7 +747,7 @@ Every FROM item is a compile-time table; the column model per shape is
 | --- | --- | --- |
 | `input('path', name => value, ...) alias` | 1, or one per rendition of an HLS/DASH manifest | alias mandatory; path is a literal, never computed; trailing named options are ffmpeg's per-input flags; a manifest is a row table ([rows.md](rows.md#rendition-rows---inputladderm3u8-r)) |
 | `ffmpeg.<source>(name => value, ...) alias` | 1 | generated stream (testsrc2, sine, color, anullsrc, ...), no `-i`; options named-only |
-| `<pkg>.<source>(<values>) alias` | one per rendition of its catalog | a `RETURNS source` wasm function, probed at compile time; arguments are values only; reads like a manifest input, and a source reporting itself unbounded is live |
+| `<pkg>.<source>(<values>) alias` | one per rendition of its catalog | a `RETURNS source` wasm function, probed at compile time; arguments are values only; reads like a manifest input, and a source reporting itself unbounded is live. Over a values-world export it is invoked at compile time instead: each row it answers names a `url` ffmpeg opens with its own `-i`, and the alias still reads as rendition rows |
 | `unnest(alias.<array>) alias` | one per element | the four stream arrays, or `chapters` / `cues` / `attachments`, of an input declared earlier in the same FROM |
 | `unnest(ARRAY[STRUCT(v AS c, ...), ...]) alias` | one per array element | a written row table; columns are the STRUCT field names, every element declaring the same set |
 | `generate_series(start, stop[, step]) alias` | `stop - start` over `step`, inclusive | alias mandatory, names both the row table and its one column (`i.i`); bounds and step are integer literals after substitution |
@@ -1169,9 +1169,11 @@ Every one of these is a typed rejection, never a silent reinterpretation:
   options or a star SELECT list on a sink destination; a rows function
   with more than one parameter, a value parameter, or a `DEFAULT`, one
   over a module that reads no rows, one handed a stream or a
-  compile-time row array, or a stream function handed rows; and a
-  module path in a package's lib file that leaves the package
-  directory.
+  compile-time row array, or a stream function handed rows; a URL
+  source (a `RETURNS source` over a values-world export) answering no
+  rows, a row naming no `url`, a row naming `width` or `height`, or
+  rows that disagree on their own columns; and a module path in a
+  package's lib file that leaves the package directory.
 - **Annotations**: a `RETURNS STRUCT` that is not one stream field
   followed by one annotation array; an annotation field typed anything
   but `text`, `number` or `boolean`; a record the producing module's

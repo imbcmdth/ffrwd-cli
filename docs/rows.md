@@ -53,6 +53,11 @@ time rather than probed, each row it returns names an input ffmpeg
 opens with `-i` itself, and the alias reads as rendition rows with
 the module's own columns beside them ([recipe
 114](examples.md#114-a-source-whose-rows-are-files-ffmpeg-opens-itself)).
+Each row names a `url` ffmpeg opens and may carry `bandwidth`,
+`codecs`, `name` or `language`; any other key is a value column typed
+by its JSON value, while `width`/`height` still come from probing the
+named url, same as any other rendition row. A row the query drops
+leaves the command entirely.
 
 ## Track rows - `unnest(f.audio) t`
 

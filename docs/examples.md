@@ -3044,8 +3044,15 @@ COPY (
 ```
 
 ```
-<pinned when the binding lands>
+$ ffrwd compile -f query.sql -v dest=joined.mp4
+ffmpeg -i tests/fixtures/av.mp4 -i tests/fixtures/av2.mp4 -filter_complex \
+  '[0:v:0][1:v:0]concat=n=2:v=1:a=0[out0];[0:a:0][1:a:0]concat=n=2:v=0:a=1[out1]' -map \
+  '[out0]' -map '[out1]' joined.mp4
 ```
+
+Reach for this to treat a list of files as one relation - stitched in
+row order into one output - without hand-writing a `concat` filter or a
+demuxer list file.
 
 ## 115. Stitch the rows you keep, then re-encode them to a ladder
 
@@ -3080,5 +3087,22 @@ COPY (
 ```
 
 ```
-<pinned when the binding lands>
+$ ffrwd compile -f query.sql
+ffmpeg -i tests/fixtures/av.mp4 -i tests/fixtures/av2.mp4 -filter_complex \
+  '[0:v:0]scale=width=320:height=-2[n1];[1:v:0]scale=width=320:height=-2[n2];'\
+'[n1][n2]concat=n=2:v=1:a=0[n3];[0:a:0][1:a:0]concat=n=2:v=0:a=1[out2];'\
+'[n3]split=2[n3_split0][n3_split1];[n3_split0]scale=width=320:height=-2[out0];'\
+'[n3_split1]scale=width=160:height=-2[out1]' -map '[out0]' -map '[out1]' -map '[out2]' \
+  -f hls -hls_time 2 -hls_playlist_type vod -c:0 libx264 -c:1 libx264 -b:0 800k -b:1 \
+  300k -c:2 aac -g:0 30 -g:1 30 -keyint_min:0 30 -keyint_min:1 30 -sc_threshold:0 0 \
+  -sc_threshold:1 0 -var_stream_map \
+  'v:0,agroup:aud,name:v0 v:1,agroup:aud,name:v1 a:0,agroup:aud,name:a0,default:yes' \
+  -master_pl_name master.m3u8 -hls_segment_filename out/v%v/segment_%d.ts \
+  out/v%v/index.m3u8
 ```
+
+Reach for this when each segment of a sequence needs its own best-fit
+file stitched in, then the whole result re-encoded to a fixed ladder,
+all in one query. `testsrc.mp4` never reaches the printed command: it
+is row 2, the `WHERE` drops it before the `concat`, and a row a query
+drops leaves the command entirely rather than showing up as a gap.
