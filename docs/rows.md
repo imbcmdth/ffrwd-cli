@@ -39,6 +39,15 @@ Only an input-side read has facts to report. A field read off a FILTER OUTPUT - 
 
 `WHERE`, `ORDER BY` and `LIMIT` over these columns filter and rank renditions the same as track rows do below ([recipes 105-106](examples.md#105-pick-a-rung-from-an-abr-ladder)); a `format 'hls'`/`format 'dash'` destination fed every surviving rendition writes a new ladder, rung for rung ([recipe 107](examples.md#107-re-encode-an-abr-ladder-through-to-another-abr-ladder)).
 
+## Source rows - `ffrwd.moq.subscribe(:'relay', :'broadcast') s`
+
+A `RETURNS source` wasm function in FROM is probed at compile time for
+its catalog and reads exactly like a manifest input: one row per
+rendition, the same columns as rendition rows above, `WHERE`, `ORDER
+BY` and `LIMIT` over them. A source that reports itself unbounded is
+a live input. Its arguments are values only - a source reads no
+streams.
+
 ## Track rows - `unnest(f.audio) t`
 
 One row per track. The argument is an array column of an input declared earlier in the same FROM list; alias mandatory. All seven array columns unnest - the four stream arrays here, and `chapters`, `cues` and `attachments` below. The schema varies by stream type:

@@ -74,14 +74,13 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   `--jobs 1` hosts everything serially. The output is byte-identical at
   any N.
 - A **sink `LANGUAGE wasm` function** (`RETURNS sink`) is a COPY
-  destination: `COPY (SELECT <streams>) TO name(<values>)`. The SELECT
-  list carries the streams it reads - and the annotation rows riding
-  them - the way any consumer's arguments do; the call after `TO`
-  carries its value parameters. An arrayed parameter
-  (`video_stream[]`, `audio_stream[]`) takes every stream of its kind
-  the SELECT carries, in SELECT order; a bare one takes exactly one. A
-  ladder gathered with `array_agg` is one instance reading every rung,
-  where a fan-out `TO` is one instance per file. How many streams of
+  destination: `COPY (SELECT <cells>) TO name(<values>)`. It declares
+  value parameters only; the SELECT list supplies the ROWS it reads,
+  each row a video cell, an audio cell, either NULL - the relation a
+  manifest destination reads, so one row is a file-shaped sink and N
+  rows are a ladder, every row one rendition. A sink that still
+  declares stream parameters (`video_stream[]`, `audio_stream`) reads
+  the SELECT's streams into them as before. How many streams of
   each kind a module reads is its own declaration, and a call whose
   count disagrees is refused. A sink writes nothing back: the module's
   own effects - an HTTP POST, a live broadcast, a line on stderr - are
@@ -727,8 +726,9 @@ Every FROM item is a compile-time table; the column model per shape is
 
 | form | rows | notes |
 | --- | --- | --- |
-| `input('path', name => value, ...) alias` | 1 | alias mandatory; path is a literal, never computed; trailing named options are ffmpeg's per-input flags |
+| `input('path', name => value, ...) alias` | 1, or one per rendition of an HLS/DASH manifest | alias mandatory; path is a literal, never computed; trailing named options are ffmpeg's per-input flags; a manifest is a row table ([rows.md](rows.md#rendition-rows---inputladderm3u8-r)) |
 | `ffmpeg.<source>(name => value, ...) alias` | 1 | generated stream (testsrc2, sine, color, anullsrc, ...), no `-i`; options named-only |
+| `<pkg>.<source>(<values>) alias` | one per rendition of its catalog | a `RETURNS source` wasm function, probed at compile time; arguments are values only; reads like a manifest input, and a source reporting itself unbounded is live |
 | `unnest(alias.<array>) alias` | one per element | the four stream arrays, or `chapters` / `cues` / `attachments`, of an input declared earlier in the same FROM |
 | `unnest(ARRAY[STRUCT(v AS c, ...), ...]) alias` | one per array element | a written row table; columns are the STRUCT field names, every element declaring the same set |
 | `generate_series(start, stop[, step]) alias` | `stop - start` over `step`, inclusive | alias mandatory, names both the row table and its one column (`i.i`); bounds and step are integer literals after substitution |
@@ -934,8 +934,12 @@ and so is an OFFSET that skips every row.
 
 `TO 'path'` writes one file; `TO STDOUT WITH (format 'csv')` prints;
 `TO (value-expression over row columns)` writes one file per row or
-group; `TO <sink>(<values>)` hands the streams to a `RETURNS sink`
-wasm function, which writes no file at all.
+group; `TO <sink>(<values>)` hands the relation's ROWS to a
+`RETURNS sink` wasm function, which writes no file at all: one row is
+a file-shaped sink, N rows a ladder, a NULL cell that kind absent
+from the rendition - the manifest destination's reading, so a ladder
+read from one manifest republishes through a sink with no
+aggregation.
 
 `WITH (format 'hls')` and `format 'dash'` make the destination a
 **manifest** - the third answer to a multi-row relation, beside the
@@ -1137,10 +1141,11 @@ Every one of these is a typed rejection, never a silent reinterpretation:
   wrong type for one, on either side of the call; a value function's
   `RETURNS` that does not match the module's result type, or a module
   answering with the wrong JSON type; a named argument; a call in
-  `FROM`; a `RETURNS sink` call anywhere but the `TO` position, a
-  non-sink function written there, `WITH` options or a star SELECT
-  list on a sink destination; and a module path in a package's lib
-  file that leaves the package directory.
+  `FROM` unless it returns source, a `RETURNS source` call anywhere
+  but `FROM` or one handed a stream; a `RETURNS sink` call anywhere
+  but the `TO` position, a non-sink function written there, `WITH`
+  options or a star SELECT list on a sink destination; and a module
+  path in a package's lib file that leaves the package directory.
 - **Annotations**: a `RETURNS STRUCT` that is not one stream field
   followed by one annotation array; an annotation field typed anything
   but `text`, `number` or `boolean`; a record the producing module's
