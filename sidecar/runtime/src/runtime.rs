@@ -3436,24 +3436,6 @@ pub struct DescribedPacketSource {
     pub world: &'static str,
 }
 
-/// A wit `rational` read back off a module's own output, where the host's
-/// `TimeBase` is what everything downstream of a source expects.
-fn time_base_from_rational(
-    r: world_0140::video::ffrwd::av::types::Rational,
-    name: &str,
-) -> Result<TimeBase> {
-    let num = u64::try_from(r.num).ok();
-    let den = u64::try_from(r.den).ok().filter(|d| *d > 0);
-    match (num, den) {
-        (Some(num), Some(den)) => Ok(TimeBase { num, den }),
-        _ => bail!(
-            "{name}: time base {}/{} is not one this host can carry",
-            r.num,
-            r.den
-        ),
-    }
-}
-
 /// Interns a wit-reported colorimetry string against the values ffmpeg
 /// itself names; anything this host does not recognize reads as "unknown",
 /// the wire's own spelling for unset.
@@ -3512,93 +3494,158 @@ const COLOR_SPACES: &[&str] = &[
     "ictcp",
 ];
 
-fn color_info_from_wit(c: world_0140::video::ffrwd::av::types::ColorInfo) -> ColorInfo {
-    ColorInfo {
-        range: intern_known(&c.range, COLOR_RANGES),
-        primaries: intern_known(&c.primaries, COLOR_PRIMARIES),
-        trc: intern_known(&c.trc, COLOR_TRCS),
-        space: intern_known(&c.space, COLOR_SPACES),
-    }
+// A packet source's wit shapes have not changed since the interface arrived
+// in 0.13.0 - see the diff between `worlds/0.13.0/av.wit` and `wit/av.wit`,
+// which touches nothing packet-source reads - so one macro generates both
+// worlds' conversions from the host's own format into the wire's, and back.
+// Each world's bindgen expansion is still its own nominal type, which is why
+// a shared function cannot do this instead.
+macro_rules! packet_source_conversions {
+    ($module:ident, $world:ident) => {
+        mod $module {
+            use super::*;
+
+            /// A wit `rational` read back off a module's own output, where
+            /// the host's `TimeBase` is what everything downstream of a
+            /// source expects.
+            pub fn time_base_from_rational(
+                r: $world::video::ffrwd::av::types::Rational,
+                name: &str,
+            ) -> Result<TimeBase> {
+                let num = u64::try_from(r.num).ok();
+                let den = u64::try_from(r.den).ok().filter(|d| *d > 0);
+                match (num, den) {
+                    (Some(num), Some(den)) => Ok(TimeBase { num, den }),
+                    _ => bail!(
+                        "{name}: time base {}/{} is not one this host can carry",
+                        r.num,
+                        r.den
+                    ),
+                }
+            }
+
+            pub fn color_info_from_wit(c: $world::video::ffrwd::av::types::ColorInfo) -> ColorInfo {
+                ColorInfo {
+                    range: intern_known(&c.range, COLOR_RANGES),
+                    primaries: intern_known(&c.primaries, COLOR_PRIMARIES),
+                    trc: intern_known(&c.trc, COLOR_TRCS),
+                    space: intern_known(&c.space, COLOR_SPACES),
+                }
+            }
+
+            pub fn coded_format_from_wit(
+                f: $world::video::ffrwd::av::types::CodedFormat,
+            ) -> CodedFormat {
+                use $world::video::ffrwd::av::types::CodedFormat as Wit;
+                match f {
+                    Wit::Video(v) => CodedFormat::Video {
+                        width: v.width,
+                        height: v.height,
+                        sample_aspect_ratio: v.sample_aspect_ratio.map(|r| (r.num, r.den)),
+                        color: v.color.map(color_info_from_wit),
+                    },
+                    // No module has reported a channel layout yet to carry
+                    // through this path; a name this host does not
+                    // recognize is dropped rather than guessed, the same as
+                    // an unset one.
+                    Wit::Audio(a) => CodedFormat::Audio {
+                        sample_rate: a.sample_rate,
+                        channels: a.channels,
+                        channel_layout: None,
+                    },
+                }
+            }
+
+            pub fn coded_stream_from_wit(
+                coded: $world::video::ffrwd::av::types::CodedStream,
+                name: &str,
+            ) -> Result<CodedStream> {
+                Ok(CodedStream {
+                    codec: coded.codec,
+                    time_base: time_base_from_rational(coded.time_base, name)?,
+                    format: coded_format_from_wit(coded.format),
+                    extradata: coded.extradata,
+                    profile: coded.profile,
+                    level: coded.level,
+                })
+            }
+
+            pub fn stream_info_from_wit(
+                info: $world::video::ffrwd::av::types::StreamInfo,
+            ) -> StreamInfo {
+                StreamInfo {
+                    index: info.index,
+                    kind: info.kind,
+                    codec: info.codec,
+                    duration: info.duration,
+                    tags: info.tags,
+                }
+            }
+
+            pub fn rendition_from_wit(
+                r: $world::video::ffrwd::av::types::RenditionMeta,
+            ) -> RenditionMeta {
+                RenditionMeta {
+                    name: r.name,
+                    bandwidth: r.bandwidth,
+                    codecs: r.codecs,
+                    language: r.language,
+                }
+            }
+
+            pub fn source_track_from_wit(
+                t: $world::packet_source::exports::ffrwd::av::packet_source::SourceTrack,
+                name: &str,
+            ) -> Result<SourceTrack> {
+                Ok(SourceTrack {
+                    stream: coded_stream_from_wit(t.coded, name)?,
+                    info: stream_info_from_wit(t.info),
+                    row: t.row,
+                    rendition: rendition_from_wit(t.rendition),
+                })
+            }
+
+            pub fn catalog_from_wit(
+                c: $world::packet_source::exports::ffrwd::av::packet_source::Catalog,
+                name: &str,
+            ) -> Result<Catalog> {
+                Ok(Catalog {
+                    tracks: c
+                        .tracks
+                        .into_iter()
+                        .map(|t| source_track_from_wit(t, name))
+                        .collect::<Result<Vec<_>>>()?,
+                    bounded: c.bounded,
+                })
+            }
+
+            /// One `next()` call's own `pad-packets` list, in the host's own
+            /// shape.
+            pub fn pad_packets_from_wit(
+                pads: Vec<$world::packet_source::exports::ffrwd::av::packet_source::PadPackets>,
+            ) -> Vec<PadPackets> {
+                pads.into_iter()
+                    .map(|p| PadPackets {
+                        packets: p
+                            .packets
+                            .into_iter()
+                            .map(|pkt| Packet {
+                                pts: pkt.pts,
+                                dts: pkt.dts,
+                                duration: pkt.duration,
+                                keyframe: pkt.keyframe,
+                                data: pkt.data,
+                            })
+                            .collect(),
+                    })
+                    .collect()
+            }
+        }
+    };
 }
 
-fn coded_format_from_wit(f: world_0140::video::ffrwd::av::types::CodedFormat) -> CodedFormat {
-    use world_0140::video::ffrwd::av::types::CodedFormat as Wit;
-    match f {
-        Wit::Video(v) => CodedFormat::Video {
-            width: v.width,
-            height: v.height,
-            sample_aspect_ratio: v.sample_aspect_ratio.map(|r| (r.num, r.den)),
-            color: v.color.map(color_info_from_wit),
-        },
-        // No module has reported a channel layout yet to carry through this
-        // path; a name this host does not recognize is dropped rather than
-        // guessed, the same as an unset one.
-        Wit::Audio(a) => CodedFormat::Audio {
-            sample_rate: a.sample_rate,
-            channels: a.channels,
-            channel_layout: None,
-        },
-    }
-}
-
-fn coded_stream_from_wit(
-    coded: world_0140::video::ffrwd::av::types::CodedStream,
-    name: &str,
-) -> Result<CodedStream> {
-    Ok(CodedStream {
-        codec: coded.codec,
-        time_base: time_base_from_rational(coded.time_base, name)?,
-        format: coded_format_from_wit(coded.format),
-        extradata: coded.extradata,
-        profile: coded.profile,
-        level: coded.level,
-    })
-}
-
-fn stream_info_from_wit(info: world_0140::video::ffrwd::av::types::StreamInfo) -> StreamInfo {
-    StreamInfo {
-        index: info.index,
-        kind: info.kind,
-        codec: info.codec,
-        duration: info.duration,
-        tags: info.tags,
-    }
-}
-
-fn rendition_from_wit(r: world_0140::video::ffrwd::av::types::RenditionMeta) -> RenditionMeta {
-    RenditionMeta {
-        name: r.name,
-        bandwidth: r.bandwidth,
-        codecs: r.codecs,
-        language: r.language,
-    }
-}
-
-fn source_track_from_wit(
-    t: world_0140::packet_source::exports::ffrwd::av::packet_source::SourceTrack,
-    name: &str,
-) -> Result<SourceTrack> {
-    Ok(SourceTrack {
-        stream: coded_stream_from_wit(t.coded, name)?,
-        info: stream_info_from_wit(t.info),
-        row: t.row,
-        rendition: rendition_from_wit(t.rendition),
-    })
-}
-
-fn catalog_from_wit(
-    c: world_0140::packet_source::exports::ffrwd::av::packet_source::Catalog,
-    name: &str,
-) -> Result<Catalog> {
-    Ok(Catalog {
-        tracks: c
-            .tracks
-            .into_iter()
-            .map(|t| source_track_from_wit(t, name))
-            .collect::<Result<Vec<_>>>()?,
-        bounded: c.bounded,
-    })
-}
+packet_source_conversions!(conv_0140, world_0140);
+packet_source_conversions!(conv_0130, world_0130);
 
 /// Whether the component at `module_path` exports the packet-source
 /// interface, and so publishes encoded packets with nothing to push it. The
@@ -3625,13 +3672,106 @@ fn check_packet_source_export(component: &Component, module_path: &str) -> Resul
     );
 }
 
+/// One instantiated packet source, in whichever world it was built against.
+/// The interface arrived in 0.13.0 and has not changed shape since, so
+/// 0.14.0 shares its conversions with 0.13.0 the way `PacketInstance`'s
+/// several-streams arms share theirs across 0.12.0 and 0.13.0.
+enum PacketSourceInstance {
+    W0140(world_0140::packet_source::PacketSourceModule),
+    W0130(world_0130::packet_source::PacketSourceModule),
+}
+
+impl PacketSourceInstance {
+    fn describe(&self, store: &mut Store<Host>) -> Result<(Meta, &'static str)> {
+        Ok(match self {
+            PacketSourceInstance::W0140(b) => {
+                let m = b
+                    .ffrwd_av_packet_source()
+                    .call_describe(&mut *store)
+                    .map_err(wasm_err)?;
+                (world_0140::meta(m), "0.14.0")
+            }
+            PacketSourceInstance::W0130(b) => {
+                let m = b
+                    .ffrwd_av_packet_source()
+                    .call_describe(&mut *store)
+                    .map_err(wasm_err)?;
+                (world_0130::meta(m), "0.13.0")
+            }
+        })
+    }
+
+    fn probe(&self, store: &mut Store<Host>, params: &str, name: &str) -> Result<Catalog> {
+        match self {
+            PacketSourceInstance::W0140(b) => {
+                let c = b
+                    .ffrwd_av_packet_source()
+                    .call_probe(&mut *store, params)
+                    .map_err(wasm_err)?
+                    .map_err(|e| anyhow!("{name} rejected params: {e}"))?;
+                conv_0140::catalog_from_wit(c, name)
+            }
+            PacketSourceInstance::W0130(b) => {
+                let c = b
+                    .ffrwd_av_packet_source()
+                    .call_probe(&mut *store, params)
+                    .map_err(wasm_err)?
+                    .map_err(|e| anyhow!("{name} rejected params: {e}"))?;
+                conv_0130::catalog_from_wit(c, name)
+            }
+        }
+    }
+
+    fn open(&self, store: &mut Store<Host>, params: &str, name: &str) -> Result<Catalog> {
+        match self {
+            PacketSourceInstance::W0140(b) => {
+                let c = b
+                    .ffrwd_av_packet_source()
+                    .call_open(&mut *store, params)
+                    .map_err(wasm_err)?
+                    .map_err(|e| anyhow!("{name} rejected params: {e}"))?;
+                conv_0140::catalog_from_wit(c, name)
+            }
+            PacketSourceInstance::W0130(b) => {
+                let c = b
+                    .ffrwd_av_packet_source()
+                    .call_open(&mut *store, params)
+                    .map_err(wasm_err)?
+                    .map_err(|e| anyhow!("{name} rejected params: {e}"))?;
+                conv_0130::catalog_from_wit(c, name)
+            }
+        }
+    }
+
+    fn next(&self, store: &mut Store<Host>, name: &str) -> Result<Option<Vec<PadPackets>>> {
+        match self {
+            PacketSourceInstance::W0140(b) => {
+                let produced = b
+                    .ffrwd_av_packet_source()
+                    .call_next(&mut *store)
+                    .map_err(wasm_err)?
+                    .map_err(|e| anyhow!("{name}: {e}"))?;
+                Ok(produced.map(conv_0140::pad_packets_from_wit))
+            }
+            PacketSourceInstance::W0130(b) => {
+                let produced = b
+                    .ffrwd_av_packet_source()
+                    .call_next(&mut *store)
+                    .map_err(wasm_err)?
+                    .map_err(|e| anyhow!("{name}: {e}"))?;
+                Ok(produced.map(conv_0130::pad_packets_from_wit))
+            }
+        }
+    }
+}
+
 /// Compiles and instantiates the component at `module_path` against the
-/// packet-source world. Shared by `describe_packet_source` and
-/// `PacketSource::probe`/`open`.
+/// packet-source world it was built for. Shared by `describe_packet_source`
+/// and `PacketSource::probe`/`open`.
 fn instantiate_packet_source(
     module_path: &str,
     purpose: Purpose,
-) -> Result<(Store<Host>, world_0140::packet_source::PacketSourceModule)> {
+) -> Result<(Store<Host>, PacketSourceInstance)> {
     let component = compile(module_path)?;
     check_packet_source_export(&component, module_path)?;
 
@@ -3650,10 +3790,23 @@ fn instantiate_packet_source(
         },
     );
     let context = || format!("instantiating {module_path}");
-    let instance =
-        world_0140::packet_source::PacketSourceModule::instantiate(&mut store, &component, &linker)
+    let instance = if has_export(&component, &interface("packet-source", "0.14.0")) {
+        PacketSourceInstance::W0140(
+            world_0140::packet_source::PacketSourceModule::instantiate(
+                &mut store, &component, &linker,
+            )
             .map_err(wasm_err)
-            .with_context(context)?;
+            .with_context(context)?,
+        )
+    } else {
+        PacketSourceInstance::W0130(
+            world_0130::packet_source::PacketSourceModule::instantiate(
+                &mut store, &component, &linker,
+            )
+            .map_err(wasm_err)
+            .with_context(context)?,
+        )
+    };
     Ok((store, instance))
 }
 
@@ -3661,14 +3814,8 @@ fn instantiate_packet_source(
 /// call the source's `describe()`, without opening it for a run.
 pub fn describe_packet_source(module_path: &str) -> Result<DescribedPacketSource> {
     let (mut store, instance) = instantiate_packet_source(module_path, Purpose::Describe)?;
-    let meta = instance
-        .ffrwd_av_packet_source()
-        .call_describe(&mut store)
-        .map_err(wasm_err)?;
-    Ok(DescribedPacketSource {
-        meta: world_0140::meta(meta),
-        world: "0.14.0",
-    })
+    let (meta, world) = instance.describe(&mut store)?;
+    Ok(DescribedPacketSource { meta, world })
 }
 
 /// One instantiated packet source: no input pads, encoded packets out,
@@ -3676,7 +3823,7 @@ pub fn describe_packet_source(module_path: &str) -> Result<DescribedPacketSource
 /// `PacketSink`'s push. Single-threaded by contract, like [`PacketSink`].
 pub struct PacketSource {
     store: Store<Host>,
-    instance: world_0140::packet_source::PacketSourceModule,
+    instance: PacketSourceInstance,
     meta: Meta,
     /// How many tracks this source was opened with; every `next` answers
     /// that many pads or none.
@@ -3690,17 +3837,8 @@ impl PacketSource {
     /// `probe`, without opening the source for a run.
     pub fn probe(module_path: &str, params: &str) -> Result<Catalog> {
         let (mut store, instance) = instantiate_packet_source(module_path, Purpose::Describe)?;
-        let meta = instance
-            .ffrwd_av_packet_source()
-            .call_describe(&mut store)
-            .map_err(wasm_err)?;
-        let name = meta.name.clone();
-        let catalog = instance
-            .ffrwd_av_packet_source()
-            .call_probe(&mut store, params)
-            .map_err(wasm_err)?
-            .map_err(|e| anyhow!("{name} rejected params: {e}"))?;
-        catalog_from_wit(catalog, &name)
+        let (meta, _world) = instance.describe(&mut store)?;
+        instance.probe(&mut store, params, &meta.name)
     }
 
     /// Compiles, instantiates and opens the component at `module_path` for a
@@ -3710,21 +3848,12 @@ impl PacketSource {
     /// compile and run.
     pub fn open(module_path: &str, params: &str) -> Result<(PacketSource, Catalog)> {
         let (mut store, instance) = instantiate_packet_source(module_path, Purpose::Run)?;
-        let meta = instance
-            .ffrwd_av_packet_source()
-            .call_describe(&mut store)
-            .map_err(wasm_err)?;
-        let name = meta.name.clone();
-        let wit_catalog = instance
-            .ffrwd_av_packet_source()
-            .call_open(&mut store, params)
-            .map_err(wasm_err)?
-            .map_err(|e| anyhow!("{name} rejected params: {e}"))?;
-        let catalog = catalog_from_wit(wit_catalog, &name)?;
+        let (meta, _world) = instance.describe(&mut store)?;
+        let catalog = instance.open(&mut store, params, &meta.name)?;
         let source = PacketSource {
             store,
             instance,
-            meta: world_0140::meta(meta),
+            meta,
             tracks: catalog.tracks.len(),
             finished: false,
         };
@@ -3759,13 +3888,7 @@ impl PacketSource {
                 self.meta.name
             );
         }
-        let produced = self
-            .instance
-            .ffrwd_av_packet_source()
-            .call_next(&mut self.store)
-            .map_err(wasm_err)?
-            .map_err(|e| anyhow!("{}: {e}", self.meta.name))?;
-        let Some(pads) = produced else {
+        let Some(pads) = self.instance.next(&mut self.store, &self.meta.name)? else {
             self.finished = true;
             return Ok(None);
         };
@@ -3777,23 +3900,7 @@ impl PacketSource {
                 pads.len()
             );
         }
-        Ok(Some(
-            pads.into_iter()
-                .map(|p| PadPackets {
-                    packets: p
-                        .packets
-                        .into_iter()
-                        .map(|pkt| Packet {
-                            pts: pkt.pts,
-                            dts: pkt.dts,
-                            duration: pkt.duration,
-                            keyframe: pkt.keyframe,
-                            data: pkt.data,
-                        })
-                        .collect(),
-                })
-                .collect(),
-        ))
+        Ok(Some(pads))
     }
 }
 
