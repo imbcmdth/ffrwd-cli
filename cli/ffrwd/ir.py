@@ -44,6 +44,7 @@ uphold and split/emit check.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from typing import Literal
 
@@ -538,6 +539,93 @@ class ModuleSource:
         )
 
 
+@dataclass(frozen=True)
+class UrlSourceRow:
+    """One row a URL source produced: the input it opened, and its columns.
+
+    `url` is what the module named and `input` the ffmpeg input index that
+    url was minted at, so the row's streams are ordinary ``-i`` streams --
+    a URL source takes no sidecar and no pipe. `columns` is the row's own
+    value columns, the ones beside the rendition attributes: whatever keys
+    the module wrote, each a JSON scalar.
+    """
+
+    url: str
+    input: int
+    columns: Mapping[str, str | int | float | bool | None] = field(
+        default_factory=dict
+    )
+
+    def to_dict(self) -> dict[str, object]:
+        return {"url": self.url, "input": self.input, "columns": dict(self.columns)}
+
+    @classmethod
+    def from_dict(cls, d: dict[str, object]) -> UrlSourceRow:
+        raw_url = d["url"]
+        raw_input = d["input"]
+        raw_columns = d.get("columns", {})
+        assert isinstance(raw_url, str)
+        assert isinstance(raw_input, int)
+        assert isinstance(raw_columns, dict)
+        return cls(
+            url=raw_url,
+            input=int(raw_input),
+            columns={str(k): v for k, v in raw_columns.items()},
+        )
+
+
+@dataclass(frozen=True)
+class UrlSource:
+    """One VALUES-world module bound in FROM: a table of urls, not packets.
+
+    The mirror of :class:`ModuleSource` for a module that names inputs
+    instead of producing them. `module`/`params` are what was run at compile
+    time, `document` the text the module handed back beside its rows (None
+    where it wrote none), and `rows` the rows themselves, in the order the
+    module wrote them. Nothing here reaches the ffmpeg command: the rows'
+    urls are already ``-i`` entries of :attr:`Graph.input_paths`.
+    """
+
+    alias: str
+    module: str
+    params: str
+    document: str | None
+    rows: tuple[UrlSourceRow, ...]
+
+    def to_dict(self) -> dict[str, object]:
+        d: dict[str, object] = {
+            "alias": self.alias,
+            "module": self.module,
+            "params": self.params,
+            "rows": [row.to_dict() for row in self.rows],
+        }
+        if self.document is not None:
+            d["document"] = self.document
+        return d
+
+    @classmethod
+    def from_dict(cls, d: dict[str, object]) -> UrlSource:
+        raw_alias = d["alias"]
+        raw_module = d["module"]
+        raw_params = d["params"]
+        raw_rows = d["rows"]
+        raw_document = d.get("document")
+        assert isinstance(raw_alias, str)
+        assert isinstance(raw_module, str)
+        assert isinstance(raw_params, str)
+        assert isinstance(raw_rows, list)
+        assert raw_document is None or isinstance(raw_document, str)
+        return cls(
+            alias=raw_alias,
+            module=raw_module,
+            params=raw_params,
+            document=raw_document,
+            rows=tuple(
+                UrlSourceRow.from_dict(row) for row in raw_rows if isinstance(row, dict)
+            ),
+        )
+
+
 @dataclass
 class Graph:
     input_paths: list[str]  # -i order; index is the ffmpeg input index
@@ -575,6 +663,10 @@ class Graph:
     # its bytes never come from a real `-i`, so the partitioner gives it a
     # sidecar of its own rather than an input slot.
     module_sources: dict[str, ModuleSource] = field(default_factory=dict)
+    # Alias -> the URL source module bound to it. Unlike `module_sources`,
+    # every row IS a key of `sources`: the module named files, and ffmpeg
+    # opens them itself. Kept as the record of what the module answered.
+    url_sources: dict[str, UrlSource] = field(default_factory=dict)
 
     @property
     def outputs(self) -> list[Output]:
@@ -620,6 +712,10 @@ class Graph:
         if self.module_sources:
             d["module_sources"] = {
                 alias: source.to_dict() for alias, source in self.module_sources.items()
+            }
+        if self.url_sources:
+            d["url_sources"] = {
+                alias: source.to_dict() for alias, source in self.url_sources.items()
             }
         return d
 
@@ -695,6 +791,14 @@ class Graph:
                 assert isinstance(written, dict)
                 module_sources[str(alias)] = ModuleSource.from_dict(written)
 
+        raw_url_sources = d.get("url_sources")
+        url_sources: dict[str, UrlSource] = {}
+        if raw_url_sources is not None:
+            assert isinstance(raw_url_sources, dict)
+            for alias, written in raw_url_sources.items():
+                assert isinstance(written, dict)
+                url_sources[str(alias)] = UrlSource.from_dict(written)
+
         return cls(
             input_paths=[str(p) for p in raw_inputs],
             sources={str(k): int(v) for k, v in raw_sources.items()},
@@ -706,6 +810,7 @@ class Graph:
             module_sinks=module_sinks,
             packet_sinks=packet_sinks,
             module_sources=module_sources,
+            url_sources=url_sources,
         )
 
 

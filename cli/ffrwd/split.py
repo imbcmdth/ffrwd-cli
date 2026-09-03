@@ -211,4 +211,5 @@ def insert_splits(g: Graph) -> Graph:
             for name, pads in g.packet_sinks.items()
         },
         module_sources=dict(g.module_sources),
+        url_sources=dict(g.url_sources),
     )

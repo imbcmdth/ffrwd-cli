@@ -917,7 +917,20 @@ def _input_rendition_operand(column: exp.Column, scope: dict[str, str]) -> str |
     return None
 
 
-def _is_rendition_conjunct(conjunct: exp.Expr, alias: str) -> bool:
+def _is_module_source_column(name: str) -> bool:
+    """True for a name a ``RETURNS source`` alias's MODULE may have named.
+
+    A source alias is a ROW table whose columns the module decides, so
+    resolve admits anything an input does not already expose -- plus
+    ``duration``, which a row column of that name shadows -- and lowering,
+    which has asked the module, is what refuses an unknown one.
+    """
+    return name == INPUT_DURATION_COLUMN or not _is_input_column(name)
+
+
+def _is_rendition_conjunct(
+    conjunct: exp.Expr, alias: str, *, module_columns: bool = False
+) -> bool:
     """True if every column `conjunct` reads off `alias` is a rendition column.
 
     A rendition column is admitted into the row-predicate grammar only when
@@ -925,6 +938,12 @@ def _is_rendition_conjunct(conjunct: exp.Expr, alias: str) -> bool:
     that also reads the alias's other columns (``f.t <= f.width - 1``) stays
     on the time-window path unchanged, since only lower's probe can confirm
     the alias is even a rendition table, and this is a syntactic admission.
+
+    `module_columns` widens that to every name
+    :func:`_is_module_source_column` admits, for a ``RETURNS source`` alias
+    whose module names value columns of its own: which ones it named is the
+    module's answer, read at lowering, so resolve admits the name here and
+    lowering is what refuses an unknown one.
     """
     found = False
     for sub_node in conjunct.walk():
@@ -933,9 +952,13 @@ def _is_rendition_conjunct(conjunct: exp.Expr, alias: str) -> bool:
         table_node = sub_node.args.get("table")
         if table_node is None or _ident_name(table_node) != alias:
             continue
-        if _ident_name(sub_node.this) not in RENDITION_COLUMNS:
-            return False
-        found = True
+        name = _ident_name(sub_node.this)
+        if name in RENDITION_COLUMNS or (
+            module_columns and _is_module_source_column(name)
+        ):
+            found = True
+            continue
+        return False
     return found
 
 
@@ -5815,7 +5838,17 @@ class _Resolver:
                 raise _removed_tag_error(name, _ident_name(sub.this), sub, select)
             if kind == "input" and _is_input_disposition(_ident_name(sub.this)):
                 raise _input_disposition_error(name, sub, select)
-            if kind == "input" and not _is_input_column(_ident_name(sub.this)):
+            # A `RETURNS source` alias exposes whatever columns its module
+            # names beside the rendition ones, and only lowering has asked
+            # it -- so an unknown name defers there, as a CTE's does.
+            if (
+                kind == "input"
+                and not _is_input_column(_ident_name(sub.this))
+                and not (
+                    name in self.wasm_sources
+                    and _is_module_source_column(_ident_name(sub.this))
+                )
+            ):
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,
                     f"unknown column '{name}.{sub.name}'",
@@ -6489,7 +6522,12 @@ class _Resolver:
             for alias in aliases
             if scope.get(alias) == "row"
             or (scope.get(alias) == "cte" and _reads_non_time_column(conjunct, alias))
-            or (scope.get(alias) == "input" and _is_rendition_conjunct(conjunct, alias))
+            or (
+                scope.get(alias) == "input"
+                and _is_rendition_conjunct(
+                    conjunct, alias, module_columns=alias in self.wasm_sources
+                )
+            )
         }
         if not rows:
             return False
@@ -6725,6 +6763,14 @@ class _Resolver:
             # `<input>.duration` is the one non-row column the value grammar
             # reads: a probed container scalar, so it types as a number here
             # and lower rejects it on an input it could not probe.
+            # A `RETURNS source` alias's own value column: the module names
+            # them, so its type is OPEN here (the posture a CTE value column
+            # takes) and lowering names an unknown one. Before `duration`,
+            # which a row column of that name shadows.
+            if alias in self.wasm_sources and _is_module_source_column(
+                _ident_name(column.this)
+            ):
+                return None
             if _is_input_duration(column, scope):
                 return "number"
             # A container tag reads off the same probe, one line down: text,
@@ -7268,10 +7314,18 @@ class _Resolver:
             table_node = key.args.get("table")
             alias = _ident_name(table_node) if table_node is not None else ""
             kind = scope.get(alias)
-            if kind == "input" and _ident_name(key.this) in RENDITION_COLUMNS:
+            if kind == "input" and (
+                _ident_name(key.this) in RENDITION_COLUMNS
+                or (
+                    alias in self.wasm_sources
+                    and _is_module_source_column(_ident_name(key.this))
+                )
+            ):
                 # A rendition column of a plain input alias: admitted on
                 # spec, since only lower's probe can say whether this input
-                # actually resolved to a rendition row table.
+                # actually resolved to a rendition row table. A `RETURNS
+                # source` alias's own value columns ride the same admission,
+                # named by the module rather than by the manifest.
                 continue
             if kind != "row":
                 raise _error(

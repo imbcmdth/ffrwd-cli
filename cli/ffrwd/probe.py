@@ -31,7 +31,7 @@ import subprocess
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 
 from ffrwd import binaries
@@ -168,6 +168,10 @@ class RenditionMeta:
     name: str | None  # HLS NAME, else None
     language: str | None  # HLS LANGUAGE / MPD @lang, else None
     program_id: int | None  # ffprobe's program id when one exists
+    # Value columns riding beside the six above, for a rendition a MODULE
+    # wrote rather than a manifest declared. Nothing in this module fills it:
+    # ffprobe reports the six and no more.
+    extra: Mapping[str, str | int | float | bool | None] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

@@ -279,6 +279,7 @@ from __future__ import annotations
 import base64
 import difflib
 import json
+import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Literal
@@ -304,6 +305,8 @@ from ffrwd.ir import (
     RowsSink,
     SinkUnit,
     StreamType,
+    UrlSource,
+    UrlSourceRow,
     dedup_inputs,
     is_src,
     src_alias,
@@ -371,6 +374,7 @@ from ffrwd.probe import (
     StreamMeta,
     is_url,
 )
+from ffrwd.probe import probe as probe_one_path
 from ffrwd.processes import COPY_CODEC, ref_type
 from ffrwd.registry import DynamicFilter, FilterOption, Registry, SourceFilter
 from ffrwd.sink import (
@@ -453,6 +457,12 @@ __all__ = ["lower", "lower_table"]
 # one; a lowering test passes its own, so binding a `RETURNS source` call
 # needs no sidecar.
 ProbeSource = Callable[[str, str], SourceCatalog]
+
+# Probes ONE path a URL source's row named, the way the pre-lowering pass
+# probes an `input()` path -- which one is only known once the module has
+# answered, so it happens here instead. :func:`ffrwd.probe.probe` is the real
+# one; a lowering test passes its own, so binding a URL source needs no file.
+ProbePath = Callable[[str], ProbeResult | None]
 
 # The python types each JSON Schema type a module parameter may declare
 # accepts. A schema naming anything else is left alone: what the module
@@ -2395,6 +2405,109 @@ class _TrackRow:
     kinds: dict[StreamType, _Stream] = field(default_factory=dict)
 
 
+# What a URL source's row names its input with, the attributes a row MAY
+# carry beside it, and the ones it may not: width, height and the stream
+# arrays are what the probe of that url reports, so a row naming one would
+# be overruled by the file itself.
+_URL_SOURCE_URL = "url"
+_URL_SOURCE_TEXT = ("codecs", "name", "language")
+_URL_SOURCE_PROBED = frozenset({"width", "height"}) | frozenset(_ARRAY_COLUMNS)
+# A value column's name: a plain lowercase identifier, so every column a
+# module names is one a query can spell.
+_URL_SOURCE_NAME = re.compile(r"[a-z][a-z0-9_]*")
+_URL_SOURCE_SHAPE_HINT = (
+    'a source answers with {"rows": [{"url": "clip.mp4", ...}, ...]}, one '
+    "object per row"
+)
+
+
+@dataclass(frozen=True)
+class _UrlRow:
+    """One checked row of a URL source's answer.
+
+    The four rendition attributes a row may declare (a probe cannot report
+    them: they describe the ladder, not the file), and `columns` -- every
+    other key it named, which is a value column of the alias.
+    """
+
+    url: str
+    bandwidth: int | None
+    codecs: str | None
+    name: str | None
+    language: str | None
+    columns: dict[str, RowValue]
+
+
+@dataclass(frozen=True)
+class _UrlPayload:
+    """A URL source's whole answer, checked: its rows and what came beside."""
+
+    document: str | None
+    bounded: bool
+    rows: list[_UrlRow]
+    types: dict[str, RowColumnType]
+
+
+def _written_params(params: Mapping[str, object]) -> str:
+    """A call's folded arguments, as a message names them."""
+    written = ", ".join(f"{name} = {value!r}" for name, value in sorted(params.items()))
+    return written or "no arguments"
+
+
+def _url_column_type(value: str | int | float | bool) -> RowColumnType:
+    """The row-column type one JSON scalar reads as."""
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int | float):
+        return "number"
+    return "text"
+
+
+def _url_source_types(
+    alias: str,
+    rows: Sequence[_UrlRow],
+    refuse: Callable[[str, str], FfrwdError],
+) -> dict[str, RowColumnType]:
+    """The value columns a URL source's rows expose, and the type of each.
+
+    A written row table's own two rules: every row names the same columns,
+    and every row of a column carries the same type, with null fitting any
+    of them and an all-null column reading as text the way Postgres types
+    one.
+    """
+    columns = tuple(rows[0].columns)
+    known = set(columns)
+    for position, row in enumerate(rows[1:], start=2):
+        missing = known - set(row.columns)
+        unexpected = set(row.columns) - known
+        if missing or unexpected:
+            odd = sorted(missing | unexpected)[0]
+            raise refuse(
+                f"row {position} of '{alias}' does not name the same columns "
+                f"row 1 does ({', '.join(columns) or 'none'}): '{odd}' "
+                f"{'is missing' if odd in missing else 'is unexpected'}",
+                "every row a source produces names the same columns",
+            )
+    types: dict[str, RowColumnType] = {}
+    for column in columns:
+        settled: RowColumnType | None = None
+        for row in rows:
+            value = row.columns[column]
+            if value is None:
+                continue
+            written = _url_column_type(value)
+            if settled is not None and written != settled:
+                raise refuse(
+                    f"column '{alias}.{column}' holds both {settled} and "
+                    f"{written}",
+                    "every row of a column carries the same type; null fits "
+                    "any of them",
+                )
+            settled = written
+        types[column] = settled or "text"
+    return types
+
+
 @dataclass(frozen=True)
 class _CteRow:
     """One row of a CTE source: which row of the body's row set it is.
@@ -2454,6 +2567,11 @@ class _RowBinding:
     for a WRITTEN row source (a struct row table in FROM), whose rows come
     from the query rather than from a probe; it has no input alias and no
     streams.
+
+    `extra` is set for a RENDITION table whose rows a module wrote: the value
+    columns it named beside the six rendition ones, each with the type its
+    values settled on. Empty for a manifest's own rows, which carry the six
+    and no more.
     """
 
     alias: str
@@ -2462,6 +2580,7 @@ class _RowBinding:
     type: StreamType
     relation: _RowRelation
     values: RawValuesTable | None = None
+    extra: Mapping[str, RowColumnType] = field(default_factory=dict)
 
     @property
     def rows(self) -> tuple[_TrackRow | None, ...]:
@@ -2481,7 +2600,7 @@ class _RowBinding:
     def schema(self) -> dict[str, RowColumnType]:
         """The columns these rows expose, in declaration (or written) order."""
         if self.column == RENDITION_COLUMN:
-            return _RENDITION_SCHEMA
+            return {**_RENDITION_SCHEMA, **self.extra}
         return (
             self.values.schema() if self.values is not None else ROW_SCHEMAS[self.column]
         )
@@ -2490,7 +2609,7 @@ class _RowBinding:
     def star(self) -> tuple[str, ...]:
         """What ``<alias>.*`` expands to: the scalar columns, in order."""
         if self.column == RENDITION_COLUMN:
-            return tuple(_RENDITION_SCHEMA)
+            return (*_RENDITION_SCHEMA, *self.extra)
         if self.values is not None:
             return self.values.columns
         return ROW_STAR_COLUMNS[self.column]
@@ -2499,7 +2618,7 @@ class _RowBinding:
     def readonly(self) -> frozenset[str]:
         """The columns a query may not assert. A written row has none."""
         if self.column == RENDITION_COLUMN:
-            return _RENDITION_READONLY
+            return _RENDITION_READONLY | frozenset(self.extra)
         if self.values is not None:
             return frozenset()
         return ROW_READONLY_FIELDS[self.column]
@@ -2508,7 +2627,7 @@ class _RowBinding:
     def exposes(self) -> str:
         """How a rejection names this row source's column list."""
         listed = ", ".join(sorted(self.schema))
-        if self.values is not None:
+        if self.values is not None or self.extra:
             return f"'{self.alias}' exposes {listed}"
         return f"{self.column} track rows expose {listed}"
 
@@ -2902,6 +3021,7 @@ class _Lowerer:
         invoke: Invoke = wasm_invoke,
         probe_failures: Mapping[str, ProbeFailure | None] | None = None,
         probe_source: ProbeSource = wasm_probe_source,
+        probe_path: ProbePath = probe_one_path,
     ) -> None:
         self.res = res
         self.probes = probes
@@ -2913,6 +3033,7 @@ class _Lowerer:
         self.describes = describes or {}
         self.invoke = invoke
         self.probe_source = probe_source
+        self.probe_path = probe_path
         # (module, function, sorted args) -> result, so two calls with the
         # same arguments run the module once per compile.
         self._invoke_cache: dict[tuple[str, str, tuple[tuple[str, object], ...]], object] = {}
@@ -6115,6 +6236,9 @@ class _Lowerer:
         join: RawRowJoin | None,
         env: _Env,
         select: exp.Select,
+        *,
+        stream_aliases: Sequence[str] | None = None,
+        extra: Mapping[str, RowColumnType] | None = None,
     ) -> None:
         """An input alias whose probe found renditions is ALSO a track-row
         table: one row per ``RenditionMeta``, no ``unnest`` needed to ask for
@@ -6127,11 +6251,23 @@ class _Lowerer:
         its WHERE window and its provenance stay keyed off the same alias a
         plain input would use. An input with no renditions leaves the plain
         binding untouched.
+
+        `stream_aliases` names the input alias each ROW's streams belong to,
+        for a URL source whose rows are each their own ``-i``; None means
+        every row's streams are this alias's own, which is what a manifest's
+        renditions are. `extra` is the value columns a module named beside
+        the six.
         """
         result = self.probes.get(alias)
         if result is None or not result.renditions:
             return
-        rows = [self._rendition_row(alias, rendition) for rendition in result.renditions]
+        rows = [
+            self._rendition_row(
+                alias if stream_aliases is None else stream_aliases[position],
+                rendition,
+            )
+            for position, rendition in enumerate(result.renditions)
+        ]
         if env.relation is None:
             env.relation = _RowRelation()
         env.bindings[alias] = _RowBinding(
@@ -6140,6 +6276,7 @@ class _Lowerer:
             column=RENDITION_COLUMN,
             type=rows[0].stream.type,
             relation=env.relation,
+            extra=dict(extra or {}),
         )
         self._join_rows(env.relation, alias, rows, join, env, select)
 
@@ -6152,6 +6289,10 @@ class _Lowerer:
         as an unnest row's does. Every stream is built the same way the
         unnest path builds one (:meth:`_source_stream`, keyed by the
         `StreamMeta`'s own per-type `index`), so emission maps it identically.
+
+        `alias` is the input the row's STREAMS belong to, which is the row
+        table's own alias for a manifest and the row's own minted ``-i`` for
+        a URL source -- the rows of one table may come from several inputs.
         """
         kinds: dict[StreamType, _Stream] = {}
         for meta in rendition.streams:
@@ -6166,6 +6307,7 @@ class _Lowerer:
                 "codecs": rendition.codecs,
                 "name": rendition.name,
                 "language": rendition.language,
+                **rendition.extra,
             },
             kinds=kinds,
         )
@@ -6195,6 +6337,11 @@ class _Lowerer:
         ``s.bandwidth``, WHERE/ORDER BY/LIMIT and the one-row rule all read
         it the same way. :attr:`Graph.module_sources` records the same
         catalog as IR, the mirror of :attr:`Graph.packet_sinks`.
+
+        A module that is not a packet source at all but offers the export
+        among its own ``functions`` is a URL SOURCE
+        (:meth:`_add_url_source`): it names files rather than producing
+        packets, and binds through the same rendition rows.
         """
         call = _call_parts(inner)
         assert call is not None  # inner is exp.Anonymous; _call_parts always answers
@@ -6208,6 +6355,11 @@ class _Lowerer:
                 f"{declared.signature}",
             )
         described = self._described_source(declared, inner, select)
+        if not described.source:
+            self._add_url_source(
+                alias, inner, declared, described, call, join, env, select
+            )
+            return
         params = self._wasm_params(
             declared, described, call, inner, select, env, {}, first=0
         )
@@ -6247,6 +6399,266 @@ class _Lowerer:
             bounded=catalog.bounded,
         )
 
+    # -- FROM <source>(<values>) alias over a VALUES module: a URL table ----
+
+    def _add_url_source(
+        self,
+        alias: str,
+        inner: exp.Anonymous,
+        declared: WasmFunction,
+        described: Described,
+        call: _Call,
+        join: RawRowJoin | None,
+        env: _Env,
+        select: exp.Select,
+    ) -> None:
+        """``FROM <source>(<values>) alias`` over a module that names FILES.
+
+        The other half of ``RETURNS source``: the module produces no packets
+        and takes no sidecar, it answers with a list of urls, and ffmpeg
+        opens each of them itself. The call's value arguments fold and
+        type-check exactly as a value call's do, the module runs ONCE per
+        distinct arguments (:attr:`_invoke_cache`), and every row of its
+        answer mints one hidden ``-i`` which is then PROBED the way an
+        ``input()`` path is.
+
+        The rows bind through :meth:`_bind_renditions`, so ``s.video[1]``,
+        ``s.height``, WHERE/ORDER BY/LIMIT and the one-row rule read them
+        like a manifest's -- except that each row's streams belong to its own
+        minted alias rather than to `alias`, which is what makes N rows N
+        inputs. The alias's own :class:`~ffrwd.probe.ProbeResult` carries the
+        rendition list every one of those rules reads, its streams the union
+        of the rows' in row order.
+        """
+        found = next(fn for fn in described.functions if fn.name == declared.export)
+        params = self._wasm_params(
+            declared, described, call, inner, select, env, {},
+            first=0, params_schema=found.params_schema,
+        )
+        answered = self._url_source_answer(alias, declared, params, inner, select)
+        payload = self._url_source_payload(alias, declared, params, answered, inner, select)
+        minted: list[str] = []
+        renditions: list[RenditionMeta] = []
+        streams: list[StreamMeta] = []
+        rows: list[UrlSourceRow] = []
+        for position, row in enumerate(payload.rows, start=1):
+            probed = self.probe_path(row.url)
+            if probed is None:
+                raise _error(
+                    ErrorCode.INPUT_NOT_FOUND,
+                    f"cannot read row {position} of '{alias}': '{row.url}' "
+                    "could not be probed",
+                    inner,
+                    fallback=select,
+                    hint=f"'{declared.name}()' names inputs, read exactly as "
+                    "input('<path>') reads one; check the url it produced",
+                )
+            minted_alias, index = self._mint_input_slot(alias, row.url)
+            self.probes[minted_alias] = (
+                probed if payload.bounded else replace(probed, live=True)
+            )
+            minted.append(minted_alias)
+            video = next((s for s in probed.streams if s.type == "video"), None)
+            renditions.append(
+                RenditionMeta(
+                    streams=list(probed.streams),
+                    bandwidth=row.bandwidth,
+                    width=video.width if video is not None else None,
+                    height=video.height if video is not None else None,
+                    codecs=row.codecs,
+                    name=row.name,
+                    language=row.language,
+                    program_id=None,
+                    extra=row.columns,
+                )
+            )
+            streams.extend(probed.streams)
+            rows.append(
+                UrlSourceRow(url=row.url, input=index, columns=dict(row.columns))
+            )
+        self.probes[alias] = ProbeResult(
+            streams=streams, renditions=renditions, live=not payload.bounded
+        )
+        env.bindings[alias] = _InputBinding(alias=alias)
+        self._bind_renditions(
+            alias, join, env, select, stream_aliases=minted, extra=payload.types
+        )
+        self.graph.url_sources[alias] = UrlSource(
+            alias=alias,
+            module=declared.module,
+            params=json.dumps(params, sort_keys=True),
+            document=payload.document,
+            rows=tuple(rows),
+        )
+
+    def _url_source_answer(
+        self,
+        alias: str,
+        declared: WasmFunction,
+        params: Mapping[str, object],
+        node: exp.Expr,
+        select: exp.Select,
+    ) -> object:
+        """Run the module for this call's arguments, once per compile.
+
+        The same cache a value call uses, keyed the same way, so two reads of
+        one call -- two branches, two COPYs -- cost one run.
+        """
+        key = (declared.module, declared.export, tuple(sorted(params.items())))
+        cached = self._invoke_cache.get(key, _UNCACHED)
+        if cached is not _UNCACHED:
+            return cached
+        try:
+            answered = self.invoke(declared.module, declared.export, dict(params))
+        except FfrwdError as err:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"cannot read '{alias}': {err.message}",
+                node,
+                fallback=select,
+                hint=err.hint,
+            ) from err
+        self._invoke_cache[key] = answered
+        return answered
+
+    def _url_source_payload(
+        self,
+        alias: str,
+        declared: WasmFunction,
+        params: Mapping[str, object],
+        answered: object,
+        node: exp.Expr,
+        select: exp.Select,
+    ) -> _UrlPayload:
+        """The module's JSON answer as this alias's rows, checked.
+
+        One object: ``rows`` (required, at least one), ``document`` and
+        ``bounded`` beside it. Each row names a ``url`` and may name the
+        rendition attributes a probe cannot report -- everything else it
+        names is a value column of the alias, which is why the rows all have
+        to name the same ones.
+        """
+
+        def refuse(message: str, hint: str) -> FfrwdError:
+            return _error(
+                ErrorCode.UNSUPPORTED_SQL, message, node, fallback=select, hint=hint
+            )
+
+        if not isinstance(answered, dict):
+            raise refuse(
+                f"'{declared.name}()' returned {answered!r}, and a source "
+                "returns an object of rows",
+                _URL_SOURCE_SHAPE_HINT,
+            )
+        written = answered.get("rows")
+        if not isinstance(written, list):
+            raise refuse(
+                f"'{declared.name}()' returned no 'rows' list",
+                _URL_SOURCE_SHAPE_HINT,
+            )
+        if not written:
+            raise refuse(
+                f"'{alias}' produced no rows",
+                f"'{declared.name}()' answered nothing for "
+                f"{_written_params(params)}; a source that produces no rows "
+                "selects nothing",
+            )
+        document = answered.get("document")
+        if document is not None and not isinstance(document, str):
+            raise refuse(
+                f"'{declared.name}()' returned a 'document' that is "
+                f"{document!r}",
+                "a source's 'document' is the text it wrote beside its rows",
+            )
+        bounded = answered.get("bounded", True)
+        if not isinstance(bounded, bool):
+            raise refuse(
+                f"'{declared.name}()' returned a 'bounded' that is {bounded!r}",
+                "a source's 'bounded' says whether its rows end; it is true "
+                "or false, and defaults to true",
+            )
+        rows = [
+            self._url_source_row(alias, position, entry, refuse)
+            for position, entry in enumerate(written, start=1)
+        ]
+        return _UrlPayload(
+            document=document,
+            bounded=bounded,
+            rows=rows,
+            types=_url_source_types(alias, rows, refuse),
+        )
+
+    def _url_source_row(
+        self,
+        alias: str,
+        position: int,
+        entry: object,
+        refuse: Callable[[str, str], FfrwdError],
+    ) -> _UrlRow:
+        """One row of a URL source's answer: its url, attributes and columns."""
+        if not isinstance(entry, dict):
+            raise refuse(
+                f"row {position} of '{alias}' is {entry!r}",
+                _URL_SOURCE_SHAPE_HINT,
+            )
+        url = entry.get("url")
+        if not isinstance(url, str) or not url:
+            raise refuse(
+                f"row {position} of '{alias}' names no url",
+                "every row a source produces names the url to open, e.g. "
+                '{"url": "clip.mp4"}',
+            )
+        bandwidth: int | None = None
+        text: dict[str, str | None] = dict.fromkeys(_URL_SOURCE_TEXT)
+        columns: dict[str, RowValue] = {}
+        for key, value in entry.items():
+            if key == _URL_SOURCE_URL:
+                continue
+            if key in _URL_SOURCE_PROBED:
+                raise refuse(
+                    f"row {position} of '{alias}' names '{key}'",
+                    f"'{key}' is what the probe reports; drop it from the row",
+                )
+            if key == "bandwidth":
+                if value is None or (
+                    isinstance(value, int) and not isinstance(value, bool)
+                ):
+                    bandwidth = value
+                    continue
+                raise refuse(
+                    f"row {position} of '{alias}' gives 'bandwidth' {value!r}",
+                    "'bandwidth' is a whole number of bits per second, or null",
+                )
+            if key in _URL_SOURCE_TEXT:
+                if value is None or isinstance(value, str):
+                    text[key] = value
+                    continue
+                raise refuse(
+                    f"row {position} of '{alias}' gives '{key}' {value!r}",
+                    f"'{key}' is a string, or null",
+                )
+            if _URL_SOURCE_NAME.fullmatch(key) is None:
+                raise refuse(
+                    f"row {position} of '{alias}' names the column '{key}'",
+                    "a source's column names are lowercase identifiers, e.g. "
+                    "sequence",
+                )
+            if value is not None and not isinstance(value, str | int | float | bool):
+                raise refuse(
+                    f"row {position} of '{alias}' gives '{key}' {value!r}",
+                    "a source's column value is a string, a number, a boolean "
+                    "or null",
+                )
+            columns[key] = value
+        return _UrlRow(
+            url=url,
+            bandwidth=bandwidth,
+            codecs=text["codecs"],
+            name=text["name"],
+            language=text["language"],
+            columns=columns,
+        )
+
     def _described_source(
         self, declared: WasmFunction, node: exp.Expr, select: exp.Select
     ) -> Described:
@@ -6260,6 +6672,12 @@ class _Lowerer:
         ``described.inputs`` as if it were a filter's pad count -- have
         nothing to check here and would misjudge a module that correctly
         reads none at all.
+
+        Two module shapes answer a ``RETURNS source`` call. A PACKET source
+        names the export as its own single export and reports ``source``; a
+        URL source is a values module that offers the export in its
+        ``functions`` list and names files instead of producing packets.
+        Anything else is refused.
         """
         described = self.describes.get(declared.module)
         if described is None:
@@ -6281,7 +6699,10 @@ class _Lowerer:
                 hint="rebuild the module against a world this ffrwd hosts, or "
                 "upgrade ffrwd",
             )
-        if described.name != declared.export:
+        # A values module names no single export, so there is nothing to
+        # match; the export it has to offer is checked against `functions`
+        # below instead.
+        if described.name and described.name != declared.export:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
                 f"function '{declared.name}' names the export '{declared.export}', "
@@ -6291,27 +6712,30 @@ class _Lowerer:
                 hint=f"a module carries one filter; write '{described.name}' as "
                 "the export",
             )
-        if not hosts_packet_source(described.world):
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL,
-                f"the module '{declared.module}' produces packets, and the "
-                f"sidecar's {described.world} cannot host one",
-                node,
-                fallback=select,
-                hint="packet sources arrived with ffrwd:av@0.13.0; upgrade "
-                "ffrwd, or point at a newer ffrwd-wasm",
-            )
-        if not described.source:
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL,
-                f"function '{declared.name}' declares RETURNS source, and the "
-                f"module '{declared.module}' is not a packet source",
-                node,
-                fallback=select,
-                hint=f"'{declared.module}' has to export a packet source built "
-                "RETURNS source; check the module and the export named",
-            )
-        return described
+        if described.source:
+            if not hosts_packet_source(described.world):
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"the module '{declared.module}' produces packets, and the "
+                    f"sidecar's {described.world} cannot host one",
+                    node,
+                    fallback=select,
+                    hint="packet sources arrived with ffrwd:av@0.13.0; upgrade "
+                    "ffrwd, or point at a newer ffrwd-wasm",
+                )
+            return described
+        if any(fn.name == declared.export for fn in described.functions):
+            return described
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"function '{declared.name}' declares RETURNS source, and the "
+            f"module '{declared.module}' is not a packet source",
+            node,
+            fallback=select,
+            hint=f"'{declared.module}' has to export a packet source built "
+            f"RETURNS source, or offer '{declared.export}' among its own "
+            "functions; check the module and the export named",
+        )
 
     # -- joining two row tables ------------------------
 
@@ -9607,12 +10031,22 @@ class _Lowerer:
         internal ``format`` option is what puts ``-f webvtt`` before the
         ``data:`` URI; see ``ffrwd.inputs.option_spec``.
         """
+        alias, _ = self._mint_input_slot(name, path)
+        self.minted_input_options[alias] = {"format": format_}
+        return f"src:{alias}:{_TYPE_MARKERS[output]}:0"
+
+    def _mint_input_slot(self, name: str, path: str) -> tuple[str, int]:
+        """One compiler-minted ``-i``: its alias and its ffmpeg input index.
+
+        The slot alone, with no options on it -- the input is opened exactly
+        as ``input(path)`` opens one. See :meth:`_mint_stream_input` for why
+        the alias is spelled the way it is.
+        """
         index = len(self.graph.input_paths)
         alias = f"{MACRO_NAMESPACE}.{name}#{index + 1}"
         self.graph.input_paths.append(path)
         self.graph.sources[alias] = index
-        self.minted_input_options[alias] = {"format": format_}
-        return f"src:{alias}:{_TYPE_MARKERS[output]}:0"
+        return alias, index
 
     def _source_value(
         self,
@@ -10522,6 +10956,7 @@ class _Lowerer:
         row: _RowTuple,
         *,
         first: int,
+        params_schema: Mapping[str, object] | None = None,
     ) -> dict[str, object]:
         """The value arguments as the module's own parameters, schema-checked.
 
@@ -10531,8 +10966,15 @@ class _Lowerer:
         everywhere else in the dialect -- the module then sees its own
         default. What is written is checked against the schema the module
         declares, by name and by type.
+
+        `params_schema` overrides where that schema is read from, for a call
+        whose parameters belong to one FUNCTION of the module rather than to
+        the module's single export.
         """
-        properties = described.params_schema.get("properties")
+        schema_source = (
+            described.params_schema if params_schema is None else params_schema
+        )
+        properties = schema_source.get("properties")
         known = properties if isinstance(properties, dict) else {}
         params: dict[str, object] = {}
         for index, param in enumerate(declared.value_params, start=first):
@@ -13887,6 +14329,7 @@ def lower(
     invoke: Invoke = wasm_invoke,
     probe_failures: Mapping[str, ProbeFailure | None] | None = None,
     probe_source: ProbeSource = wasm_probe_source,
+    probe_path: ProbePath = probe_one_path,
 ) -> Graph:
     """Lower a resolved query into an IR graph -- its FIRST command's.
 
@@ -13918,6 +14361,7 @@ def lower(
     return lower_commands(
         res, probes, registry=registry, on_warning=on_warning, describes=describes,
         invoke=invoke, probe_failures=probe_failures, probe_source=probe_source,
+        probe_path=probe_path,
     )[0]
 
 
@@ -13931,6 +14375,7 @@ def lower_commands(
     invoke: Invoke = wasm_invoke,
     probe_failures: Mapping[str, ProbeFailure | None] | None = None,
     probe_source: ProbeSource = wasm_probe_source,
+    probe_path: ProbePath = probe_one_path,
 ) -> list[Graph]:
     """Lower a resolved query into one IR graph per ffmpeg COMMAND.
 
@@ -13951,7 +14396,7 @@ def lower_commands(
         shared = _Lowerer(
             res, probes, registry, fanout_sinks=True, on_warning=on_warning,
             describes=describes, invoke=invoke, probe_failures=probe_failures,
-            probe_source=probe_source,
+            probe_source=probe_source, probe_path=probe_path,
         )
         graph = shared.run()
         count = shared.fanout_count
@@ -13966,7 +14411,7 @@ def lower_commands(
             _Lowerer(
                 res, probes, registry, fanout_index=index, on_warning=on_warning,
                 describes=describes, invoke=invoke, probe_failures=probe_failures,
-                probe_source=probe_source,
+                probe_source=probe_source, probe_path=probe_path,
             ).run()
             for index in range(count)
         ]
@@ -14048,6 +14493,7 @@ def lower_table(
     invoke: Invoke = wasm_invoke,
     probe_failures: Mapping[str, ProbeFailure | None] | None = None,
     probe_source: ProbeSource = wasm_probe_source,
+    probe_path: ProbePath = probe_one_path,
 ) -> list[TableSink]:
     """Lower a resolved TABLE query into its printable result set(s).
 
@@ -14061,7 +14507,7 @@ def lower_table(
     try:
         return _Lowerer(
         res, probes, registry, on_warning=on_warning, describes=describes, invoke=invoke,
-        probe_failures=probe_failures, probe_source=probe_source,
+        probe_failures=probe_failures, probe_source=probe_source, probe_path=probe_path,
     ).run_table()
     except FfrwdError:
         raise
