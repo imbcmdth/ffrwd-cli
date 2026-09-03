@@ -1606,7 +1606,7 @@ def test_dash_mpd_yields_one_rendition_per_representation(
     assert audio.bandwidth == 128000
     assert audio.width is None
     assert audio.height is None
-    assert audio.language == "und"
+    assert audio.language is None  # AdaptationSet's lang="und" is no information
 
 
 # --- HLS #EXT-X-STREAM-INF: codecs/name/language, local masters only -------
@@ -1697,6 +1697,181 @@ def test_stream_inf_audio_group_resolves_to_a_language(
     result = probe(str(master))
     assert result is not None
     assert result.renditions[0].language == "en"
+
+
+# --- HLS demuxed AUDIO groups: video-only variants, and each TYPE=AUDIO
+# #EXT-X-MEDIA entry as its own rendition -- shapes checked against a real
+# ffprobe run over a compiler-built demuxed HLS ladder (see test_ladder.py):
+# every variant naming AUDIO=<group> gets EVERY member of that group
+# attached to its program (not just the default one), and a demuxed audio
+# stream's `comment` tag equals its own #EXT-X-MEDIA NAME=.
+
+
+def test_demuxed_master_splits_audio_group_into_its_own_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    master = tmp_path / "master.m3u8"
+    master.write_text(
+        "#EXTM3U\n"
+        '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud1",NAME="eng",LANGUAGE="en",'
+        'DEFAULT=YES,URI="audio/index.m3u8"\n'
+        '#EXT-X-STREAM-INF:BANDWIDTH=861791,RESOLUTION=1440x1080,'
+        'CODECS="avc1.640028,mp4a.40.2",AUDIO="aud1"\n'
+        "v1080p/index.m3u8\n"
+        '#EXT-X-STREAM-INF:BANDWIDTH=344917,RESOLUTION=960x720,'
+        'CODECS="avc1.64001f,mp4a.40.2",AUDIO="aud1"\n'
+        "v720p/index.m3u8\n",
+        encoding="utf-8",
+    )
+    _fake_ffprobe_present(monkeypatch)
+    _fake_run(
+        monkeypatch,
+        stdout=json.dumps(
+            {
+                "streams": [
+                    {
+                        "index": 0,
+                        "codec_type": "audio",
+                        "tags": {"language": "en", "comment": "eng"},
+                    },
+                    {
+                        "index": 1,
+                        "codec_type": "video",
+                        "width": 1440,
+                        "height": 1080,
+                    },
+                    {
+                        "index": 2,
+                        "codec_type": "video",
+                        "width": 960,
+                        "height": 720,
+                    },
+                ],
+                "programs": [
+                    _hls_program(0, [0, 1], "861791"),
+                    _hls_program(1, [0, 2], "344917"),
+                ],
+                "format": {"format_name": "hls"},
+            }
+        ),
+    )
+    result = probe(str(master))
+    assert result is not None
+    assert len(result.renditions) == 3
+
+    hi, lo, audio = result.renditions
+    assert [s.type for s in hi.streams] == ["video"]
+    assert hi.height == 1080
+    assert hi.language == "en"  # backfilled from the group, as before this fix
+    assert [s.type for s in lo.streams] == ["video"]
+    assert lo.height == 720
+
+    assert [s.type for s in audio.streams] == ["audio"]
+    assert audio.language == "en"
+    assert audio.name == "eng"
+    assert audio.width is None
+    assert audio.height is None
+    assert audio.bandwidth is None
+    assert audio.program_id is None
+
+
+def test_muxed_master_with_no_audio_group_is_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No AUDIO= on either variant, no #EXT-X-MEDIA line: each rendition
+    keeps its own muxed video AND audio, one row per variant -- the shape
+    recipes 104-109 read."""
+    master = tmp_path / "master.m3u8"
+    master.write_text(
+        "#EXTM3U\n"
+        '#EXT-X-STREAM-INF:BANDWIDTH=861791,RESOLUTION=1440x1080,'
+        'CODECS="avc1.640028,mp4a.40.2"\n'
+        "v1080p/index.m3u8\n"
+        '#EXT-X-STREAM-INF:BANDWIDTH=344917,RESOLUTION=960x720,'
+        'CODECS="avc1.64001f,mp4a.40.2"\n'
+        "v720p/index.m3u8\n",
+        encoding="utf-8",
+    )
+    _fake_ffprobe_present(monkeypatch)
+    _fake_run(
+        monkeypatch,
+        stdout=_hls_master_json(
+            [_hls_program(0, [0, 1], "861791"), _hls_program(1, [2, 3], "344917")]
+        ),
+    )
+    result = probe(str(master))
+    assert result is not None
+    assert len(result.renditions) == 2
+    for rendition in result.renditions:
+        assert sorted(s.type for s in rendition.streams) == ["audio", "video"]
+
+
+def test_demuxed_master_with_two_languages_matches_each_row_by_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two TYPE=AUDIO entries in one group -> two audio rows, each matched
+    to its OWN stream by the `comment` tag ffprobe stamps with the
+    #EXT-X-MEDIA NAME= -- not by position: the program's own stream order
+    below lists the French track before the English one, the reverse of
+    the playlist's #EXT-X-MEDIA order, and `channels` tells the two audio
+    streams apart so a positional match would be caught picking the wrong
+    one."""
+    master = tmp_path / "master.m3u8"
+    master.write_text(
+        "#EXTM3U\n"
+        '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud1",NAME="English",LANGUAGE="en",'
+        'DEFAULT=YES,URI="en/index.m3u8"\n'
+        '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud1",NAME="French",LANGUAGE="fr",'
+        'URI="fr/index.m3u8"\n'
+        '#EXT-X-STREAM-INF:BANDWIDTH=861791,RESOLUTION=1440x1080,'
+        'CODECS="avc1.640028,mp4a.40.2",AUDIO="aud1"\n'
+        "v1080p/index.m3u8\n",
+        encoding="utf-8",
+    )
+    _fake_ffprobe_present(monkeypatch)
+    _fake_run(
+        monkeypatch,
+        stdout=json.dumps(
+            {
+                "streams": [
+                    {
+                        "index": 0,
+                        "codec_type": "audio",
+                        "channels": 1,
+                        "tags": {"language": "fr", "comment": "French"},
+                    },
+                    {
+                        "index": 1,
+                        "codec_type": "audio",
+                        "channels": 2,
+                        "tags": {"language": "en", "comment": "English"},
+                    },
+                    {
+                        "index": 2,
+                        "codec_type": "video",
+                        "width": 1440,
+                        "height": 1080,
+                    },
+                ],
+                "programs": [_hls_program(0, [0, 1, 2], "861791")],
+                "format": {"format_name": "hls"},
+            }
+        ),
+    )
+    result = probe(str(master))
+    assert result is not None
+    assert len(result.renditions) == 3
+
+    video, english, french = result.renditions
+    assert [s.type for s in video.streams] == ["video"]
+
+    assert english.name == "English"
+    assert english.language == "en"
+    assert [s.channels for s in english.streams] == [2]
+
+    assert french.name == "French"
+    assert french.language == "fr"
+    assert [s.channels for s in french.streams] == [1]
 
 
 def test_stream_inf_with_no_codecs_leaves_it_none(

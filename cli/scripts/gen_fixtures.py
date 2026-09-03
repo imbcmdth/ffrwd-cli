@@ -18,11 +18,11 @@ carrying it, for reading attachments back. ``ladder/master.m3u8`` (HLS) and
 running the compiler itself rather than a raw ffmpeg call. The first muxes
 every rung (a video and audio row share each rendition). The second keeps
 video and audio apart -- an audio-only rendition alongside two video-only
-rungs -- and that needs DASH: an HLS master reads back one row per
-``#EXT-X-STREAM-INF`` variant, with any bound audio group folded into that
-row rather than surfacing as a row of its own, so an HLS master never has an
-audio-only row for a query to find. A DASH MPD's ``<Representation>``s stay
-one row apiece regardless of type, so its audio-only row reads back as one.
+rungs. A DASH MPD's ``<Representation>``s stay one row apiece regardless of
+type, so its audio-only row reads back as one by construction.
+``ladder-demuxed-hls/master.m3u8`` is the same demuxed shape again, but HLS:
+a variant naming an AUDIO group is read back video-only, and the group's own
+``#EXT-X-MEDIA`` entry reads back as its own audio-only row.
 
 Idempotent: a fixture whose output file already exists is skipped, so this
 is safe to run repeatedly, including once per CI job right before the exec
@@ -71,6 +71,7 @@ _FONT_TTF_NAME = "font.ttf"
 _ATTACHED_NAME = "attached.mkv"
 _LADDER_MASTER_NAME = "ladder/master.m3u8"
 _LADDER_DEMUXED_MASTER_NAME = "ladder-demuxed/master.mpd"
+_LADDER_DEMUXED_HLS_MASTER_NAME = "ladder-demuxed-hls/master.m3u8"
 
 # Two muxed renditions, 1080p and 720p, built by RUNNING THE COMPILER against
 # av.mp4 (never hand-typed) -- read back by `input()` on a manifest path. The
@@ -125,6 +126,30 @@ COPY (
   FROM vid FULL JOIN aud ON vid.rung = aud.rung
 ) TO 'ladder-demuxed/master.mpd'
   WITH (format 'dash', seg_duration 2,
+        video_codec 'libx264', video_bitrate ARRAY['2000k', '800k'][vid.rung],
+        audio_codec 'aac')
+"""
+
+# Same demuxed shape as `_LADDER_DEMUXED_SQL`, `format 'hls'` instead of
+# `'dash'`: a variant naming an AUDIO group reads back video-only, and the
+# group's own #EXT-X-MEDIA entry reads back as its own audio-only row (see
+# `probe._with_hls_stream_inf`) -- confirmed against a real ffprobe run of
+# this exact shape, ffprobe's hls demuxer attaches every member of a
+# referenced AUDIO group to every variant naming it.
+_LADDER_DEMUXED_HLS_SQL = """\
+COPY (
+  WITH vid AS (
+    SELECT scale(f.video[1], ARRAY[1440, 960][i.i], -2) AS v, i.i AS rung
+    FROM input('av.mp4') f, generate_series(1, 2) i
+  ),
+  aud AS (
+    SELECT a AS t, 2 + a.index AS rung
+    FROM input('av.mp4') g, unnest(g.audio) a
+  )
+  SELECT vid.v, aud.t
+  FROM vid FULL JOIN aud ON vid.rung = aud.rung
+) TO 'ladder-demuxed-hls/master.m3u8'
+  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod',
         video_codec 'libx264', video_bitrate ARRAY['2000k', '800k'][vid.rung],
         audio_codec 'aac')
 """
@@ -496,6 +521,31 @@ def _generate_ladder_demuxed() -> None:
         raise SystemExit(f"ffrwd run failed generating {master}")
 
 
+def _generate_ladder_demuxed_hls() -> None:
+    """A real DEMUXED HLS ladder -- two video-only variants naming one
+    AUDIO group, whose one member is the audio-only rendition. Same
+    video/audio split as `_generate_ladder_demuxed`'s DASH one, proving
+    `input()` on an HLS master reads a demuxed AUDIO group back as its own
+    row too. Must run after av.mp4 exists.
+    """
+    master = FIXTURES_DIR / _LADDER_DEMUXED_HLS_MASTER_NAME
+    if master.exists():
+        print(f"skip (already exists): {master}")
+        return
+    master.parent.mkdir(parents=True, exist_ok=True)
+    print(f"generating: {master}")
+    result = subprocess.run(
+        [sys.executable, "-m", "ffrwd", "run", _LADDER_DEMUXED_HLS_SQL, "-y"],
+        cwd=FIXTURES_DIR,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        print(result.stdout, file=sys.stderr)
+        print(result.stderr, file=sys.stderr)
+        raise SystemExit(f"ffrwd run failed generating {master}")
+
+
 def main() -> int:
     if not _ffmpeg_available():
         print("error: ffmpeg not found on PATH", file=sys.stderr)
@@ -516,6 +566,7 @@ def main() -> int:
     _generate_attached(_generate_font_ttf())
     _generate_ladder()
     _generate_ladder_demuxed()
+    _generate_ladder_demuxed_hls()
     return 0
 
 

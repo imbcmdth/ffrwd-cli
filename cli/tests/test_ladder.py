@@ -4,9 +4,11 @@ Builds one real HLS ladder with the compiler (the same shape recipe 104's
 own query produces, run for real rather than only compiled), then executes
 recipe 105's rung-picking query and recipe 107's ladder-to-ladder query
 against it, reading every result back with ffprobe. A second, DEMUXED
-ladder (recipe 110 needs an audio-only row to self-join against, which an
-HLS master never surfaces -- see the DASH note below) proves 109 and 110.
-One fixture (av.mp4), single-digit seconds.
+ladder (recipe 110 needs an audio-only row to self-join against) proves 109
+and 110 over DASH; a third, DEMUXED HLS ladder proves the same audio-only
+row reads back from an HLS master too, video-only variants and all -- see
+the notes on `_LADDER_DEMUXED_SQL` and `_LADDER_DEMUXED_HLS_SQL`. One
+fixture (av.mp4), single-digit seconds.
 """
 
 from __future__ import annotations
@@ -73,12 +75,9 @@ COPY (
 
 # Same rung/rung shape as `_LADDER_SQL`, but keyed so the FULL JOIN never
 # matches (`2 + a.index` is disjoint from the video rungs `{1, 2}`) -- every
-# row comes out demuxed, video-only or audio-only. `format 'dash'`, not
-# `'hls'`: an HLS master reads back one row per #EXT-X-STREAM-INF variant,
-# with any bound audio group folded into that row rather than surfacing on
-# its own, so it never has an audio-only row for recipe 110's self-join to
-# find. A DASH MPD's `<Representation>`s stay one row apiece by
-# construction, so its audio-only row reads back as one.
+# row comes out demuxed, video-only or audio-only. `format 'dash'`: a DASH
+# MPD's `<Representation>`s stay one row apiece by construction, so its
+# audio-only row reads back as one.
 _LADDER_DEMUXED_SQL = """\
 COPY (
   WITH vid AS (
@@ -93,6 +92,29 @@ COPY (
   FROM vid FULL JOIN aud ON vid.rung = aud.rung
 ) TO 'ladder-demuxed/master.mpd'
   WITH (format 'dash', seg_duration 2,
+        video_codec 'libx264', video_bitrate ARRAY['2000k', '800k'][vid.rung],
+        audio_codec 'aac')
+"""
+
+# Same demuxed shape again, `format 'hls'`: a variant naming an AUDIO group
+# reads back video-only, and the group's own #EXT-X-MEDIA entry reads back
+# as its own audio-only row -- ffprobe's hls demuxer attaches every member
+# of a referenced AUDIO group to every variant naming it, confirmed against
+# a real probe of this exact query's output.
+_LADDER_DEMUXED_HLS_SQL = """\
+COPY (
+  WITH vid AS (
+    SELECT scale(f.video[1], ARRAY[1440, 960][i.i], -2) AS v, i.i AS rung
+    FROM input('{av}') f, generate_series(1, 2) i
+  ),
+  aud AS (
+    SELECT a AS t, 2 + a.index AS rung
+    FROM input('{av}') g, unnest(g.audio) a
+  )
+  SELECT vid.v, aud.t
+  FROM vid FULL JOIN aud ON vid.rung = aud.rung
+) TO 'ladder-demuxed-hls/master.m3u8'
+  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod',
         video_codec 'libx264', video_bitrate ARRAY['2000k', '800k'][vid.rung],
         audio_codec 'aac')
 """
@@ -232,3 +254,35 @@ def test_a_demuxed_ladder_muxes_every_rung_with_every_rendition(
         assert isinstance(streams, list)
         assert len([s for s in streams if s["codec_type"] == "video"]) == 1
         assert len([s for s in streams if s["codec_type"] == "audio"]) == 1
+
+
+@pytest.mark.exec
+def test_a_demuxed_hls_ladder_probes_video_only_and_audio_only_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _fixtures: None
+) -> None:
+    """The gap this closes: an HLS master's variant that names an AUDIO
+    group used to read back MUXED (ffprobe folds every member of a
+    referenced group into each variant naming it, video included) --
+    `input()` on a real demuxed HLS master now sees the two video rungs
+    video-only and the one audio track as its own row, the same shape
+    `test_a_demuxed_ladder_muxes_every_rung_with_every_rendition` already
+    gets from the DASH fixture."""
+    monkeypatch.chdir(tmp_path)
+    av = (FIXTURES_DIR / "av.mp4").as_posix()
+    (tmp_path / "ladder-demuxed-hls").mkdir()
+
+    assert cli.main(["run", _LADDER_DEMUXED_HLS_SQL.format(av=av), "-y"]) == 0
+    master = tmp_path / "ladder-demuxed-hls" / "master.m3u8"
+    assert master.exists()
+
+    clear_cache()
+    ladder_probe = probe(str(master))
+    assert isinstance(ladder_probe, ProbeResult)
+    assert ladder_probe.live is False
+
+    video_only = [r for r in ladder_probe.renditions if r.height is not None]
+    audio_only = [r for r in ladder_probe.renditions if r.height is None]
+    assert sorted(r.height for r in video_only if r.height is not None) == [720, 1080]
+    assert len(audio_only) >= 1
+    for rendition in audio_only:
+        assert [s.type for s in rendition.streams] == ["audio"]

@@ -31,7 +31,7 @@ import subprocess
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 
 from ffrwd import binaries
@@ -54,10 +54,16 @@ _WEBVTT_UNESCAPES = (("&lt;", "<"), ("&gt;", ">"), ("&amp;", "&"))
 
 # A rendition's own tag, an HLS master's marker, how HLS spells "no more
 # segments are coming", and an alternate-rendition tag (read for its AUDIO
-# groups) -- read from manifest text, never from ffprobe's JSON.
+# groups, and for each TYPE=AUDIO entry's own rendition) -- read from
+# manifest text, never from ffprobe's JSON.
 _STREAM_INF_TAG = "#EXT-X-STREAM-INF"
 _ENDLIST_TAG = "#EXT-X-ENDLIST"
 _MEDIA_TAG = "#EXT-X-MEDIA"
+
+# HLS/DASH's own spelling for "no language specified" -- kept as a local
+# constant rather than imported from `ffrwd.lower`, since this module may
+# depend on nothing else in the package.
+_UNDEFINED_LANGUAGE = "und"
 
 # A second, small manifest fetch for a remote spec -- bounded well below
 # ffprobe's own network timeout, since this is markup ffprobe's JSON never
@@ -568,6 +574,20 @@ def _stream_inf_entries(text: str) -> list[dict[str, str]]:
     return entries
 
 
+def _hls_media_audio_entries(text: str) -> list[dict[str, str]]:
+    """Every TYPE=AUDIO #EXT-X-MEDIA line's attributes, in playlist order."""
+    entries: list[dict[str, str]] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith(_MEDIA_TAG + ":"):
+            continue
+        _, _, rest = line.partition(":")
+        attrs = _parse_attribute_list(rest)
+        if attrs.get("TYPE") == "AUDIO":
+            entries.append(attrs)
+    return entries
+
+
 def _audio_group_languages(text: str) -> dict[str, str]:
     """AUDIO group id -> LANGUAGE, from every TYPE=AUDIO #EXT-X-MEDIA line.
 
@@ -575,14 +595,7 @@ def _audio_group_languages(text: str) -> dict[str, str]:
     alternate renditions of the same track, so they agree on it anyway.
     """
     groups: dict[str, str] = {}
-    for line in text.splitlines():
-        line = line.strip()
-        if not line.startswith(_MEDIA_TAG + ":"):
-            continue
-        _, _, rest = line.partition(":")
-        attrs = _parse_attribute_list(rest)
-        if attrs.get("TYPE") != "AUDIO":
-            continue
+    for attrs in _hls_media_audio_entries(text):
         group_id = attrs.get("GROUP-ID")
         language = attrs.get("LANGUAGE")
         if group_id is not None and language is not None:
@@ -608,9 +621,11 @@ def _fill(current: str | None, discovered: str | None) -> str | None:
 
 def _with_hls_stream_inf(parsed: ProbeResult, text: str) -> ProbeResult:
     """`parsed.renditions` with `codecs`/`name`/`language` read from the
-    master's own #EXT-X-STREAM-INF and #EXT-X-MEDIA lines.
+    master's own #EXT-X-STREAM-INF and #EXT-X-MEDIA lines, and -- for a
+    DEMUXED master -- a variant's bound audio group split back into its own
+    rendition rows.
 
-    ffprobe's own JSON never surfaces these -- CODECS=/NAME= live only in
+    ffprobe's own JSON never surfaces CODECS=/NAME= -- they live only in
     the playlist's markup, not in anything ``-show_programs`` reports --
     so they are read here instead. A #EXT-X-STREAM-INF entry is matched to
     a rendition in `parsed.renditions` BY ORDER: the hls demuxer creates
@@ -623,6 +638,16 @@ def _with_hls_stream_inf(parsed: ProbeResult, text: str) -> ProbeResult:
     cannot detect. Every other field of a matched rendition is kept
     exactly as `_hls_renditions` found it; codecs/name/language are only
     FILLED IN where not already set, never overwritten.
+
+    A variant naming ``AUDIO=<group>`` is video-only: confirmed against a
+    real demuxed ladder (two video-only variants, one AUDIO group with one
+    or two members) that ffprobe's hls demuxer attaches EVERY member of a
+    referenced group to EVERY variant's program that names it, not just its
+    default track -- so a rendition's own audio streams are dropped
+    entirely there (its video, and anything else genuinely muxed in it,
+    stay), and one new RenditionMeta is appended per TYPE=AUDIO
+    #EXT-X-MEDIA entry instead -- see `_hls_media_renditions`. A master
+    with no AUDIO reference is untouched by any of this.
     """
     if not parsed.renditions:
         return parsed
@@ -630,6 +655,7 @@ def _with_hls_stream_inf(parsed: ProbeResult, text: str) -> ProbeResult:
     if not entries:
         return parsed
     audio_languages = _audio_group_languages(text)
+    media_entries = _hls_media_audio_entries(text)
 
     by_bandwidth: dict[int, dict[str, str]] = {}
     for candidate in entries:
@@ -637,27 +663,113 @@ def _with_hls_stream_inf(parsed: ProbeResult, text: str) -> ProbeResult:
         if bandwidth is not None:
             by_bandwidth.setdefault(bandwidth, candidate)
 
-    renditions: list[RenditionMeta] = []
+    matched: list[tuple[RenditionMeta, dict[str, str] | None]] = []
     for position, rendition in enumerate(parsed.renditions):
         entry: dict[str, str] | None = None
         if rendition.bandwidth is not None:
             entry = by_bandwidth.get(rendition.bandwidth)
         if entry is None and position < len(entries):
             entry = entries[position]
+        matched.append((rendition, entry))
+
+    # The pool of audio streams each AUDIO group's members draw from: the
+    # FIRST matched rendition naming that group, before its own audio is
+    # dropped -- every other rendition naming the same group carries the
+    # identical stream objects (ffprobe's `by_global_index` lookup shares
+    # them), so one pool per group is enough.
+    pools: dict[str, list[StreamMeta]] = {}
+    for rendition, entry in matched:
+        if entry is None:
+            continue
+        group = entry.get("AUDIO")
+        if group is not None and group not in pools:
+            pools[group] = [s for s in rendition.streams if s.type == "audio"]
+
+    renditions: list[RenditionMeta] = []
+    for rendition, entry in matched:
         if entry is None:
             renditions.append(rendition)
             continue
         audio_group = entry.get("AUDIO")
         language = audio_languages.get(audio_group) if audio_group is not None else None
+        streams = rendition.streams
+        if audio_group is not None:
+            streams = [s for s in streams if s.type != "audio"]
         renditions.append(
             replace(
                 rendition,
+                streams=streams,
                 codecs=_fill(rendition.codecs, entry.get("CODECS")),
                 name=_fill(rendition.name, entry.get("NAME")),
                 language=_fill(rendition.language, language),
             )
         )
+    renditions.extend(_hls_media_renditions(media_entries, pools))
     return replace(parsed, renditions=renditions)
+
+
+def _hls_media_renditions(
+    media_entries: list[dict[str, str]], pools: dict[str, list[StreamMeta]]
+) -> list[RenditionMeta]:
+    """One RenditionMeta per TYPE=AUDIO #EXT-X-MEDIA entry, in playlist order.
+
+    `streams` is claimed from the entry's own GROUP-ID pool -- see
+    `_claim_media_stream` for the match order. `width`/`height`/`bandwidth`/
+    `codecs`/`program_id` are all None: HLS states none of them for a media
+    rendition (BANDWIDTH/RESOLUTION/CODECS belong to #EXT-X-STREAM-INF, and
+    ffprobe never assigns a media-only entry its own program).
+    """
+    claimed: dict[str, set[int]] = {}
+    renditions: list[RenditionMeta] = []
+    for entry in media_entries:
+        group = entry.get("GROUP-ID")
+        pool = pools.get(group, []) if group is not None else []
+        taken = claimed.setdefault(group or "", set())
+        renditions.append(
+            RenditionMeta(
+                streams=_claim_media_stream(pool, taken, entry),
+                bandwidth=None,
+                width=None,
+                height=None,
+                codecs=None,
+                name=entry.get("NAME"),
+                language=entry.get("LANGUAGE"),
+                program_id=None,
+            )
+        )
+    return renditions
+
+
+def _claim_media_stream(
+    pool: list[StreamMeta], taken: set[int], entry: dict[str, str]
+) -> list[StreamMeta]:
+    """The one stream of `pool` (identified by `id()`, so `taken` can mark
+    it used) this #EXT-X-MEDIA `entry` corresponds to, or an empty list if
+    none is left to claim.
+
+    Three rules, tried in order, each preferring a stream `taken` has not
+    already claimed for an earlier entry of the same group: NAME against
+    the stream's `comment` tag (confirmed against a real ffprobe run --
+    ffmpeg's hls muxer stamps a demuxed audio track's own generated NAME
+    there), then LANGUAGE against the stream's `language` tag, then
+    whichever pool entry is left -- the common case of one member per
+    group, where position is unambiguous.
+    """
+    name = entry.get("NAME")
+    language = entry.get("LANGUAGE")
+    rules: tuple[Callable[[StreamMeta], bool], ...] = (
+        lambda s: name is not None and s.metadata.get("comment") == name,
+        lambda s: language is not None and s.metadata.get("language") == language,
+        lambda s: True,
+    )
+    for rule in rules:
+        for stream in pool:
+            if id(stream) in taken:
+                continue
+            if rule(stream):
+                taken.add(id(stream))
+                return [stream]
+    return []
 
 
 def _with_dash(parsed: ProbeResult, spec: str) -> ProbeResult:
@@ -709,7 +821,9 @@ def _parse_mpd(text: str, streams: list[StreamMeta]) -> tuple[list[RenditionMeta
     two-rendition MPD. Width/height/codecs prefer the matched stream (what
     ffprobe itself measured) and fall back to the Representation's own
     attributes, and then its AdaptationSet's, when nothing matched or the
-    stream did not carry them.
+    stream did not carry them. ``lang="und"`` reads as no language, the same
+    way :func:`_hls_media_renditions`'s LANGUAGE would if HLS ever wrote it
+    -- undetermined is no information.
     """
     try:
         root = ET.fromstring(text)
@@ -741,6 +855,9 @@ def _parse_mpd(text: str, streams: list[StreamMeta]) -> tuple[list[RenditionMeta
                     width = _int_attr(representation, "width")
                 if height is None:
                     height = _int_attr(representation, "height")
+                lang = adaptation_set.get("lang")
+                if lang == _UNDEFINED_LANGUAGE:
+                    lang = None
                 renditions.append(
                     RenditionMeta(
                         streams=[matched] if matched is not None else [],
@@ -749,7 +866,7 @@ def _parse_mpd(text: str, streams: list[StreamMeta]) -> tuple[list[RenditionMeta
                         height=height,
                         codecs=representation.get("codecs") or adaptation_set.get("codecs"),
                         name=None,
-                        language=adaptation_set.get("lang"),
+                        language=lang,
                         program_id=None,
                     )
                 )
