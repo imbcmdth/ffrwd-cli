@@ -316,6 +316,7 @@ from ffrwd.macros import INPUT_MACROS, MACROS, InputMacro, Macro, macro_names
 from ffrwd.parser import (
     _ARITHMETIC,
     _ARITHMETIC_NAMES,
+    _BUILTIN_VALUE_FUNCS,
     _REMOVED_FRAME,
     FILTER_NAMESPACE,
     MACRO_NAMESPACE,
@@ -7327,6 +7328,8 @@ class _Lowerer:
             return self._eval_arithmetic(value, env, rows, select)
         if isinstance(value, exp.Cast):
             return self._eval_cast(value, env, rows, select)
+        if isinstance(value, _BUILTIN_VALUE_FUNCS):
+            return self._eval_builtin_call(value, env, rows, select)
         if isinstance(value, exp.Neg) and not isinstance(_unwrap(value.this), exp.Literal):
             operand = self._eval_number(value.this, "'-'", value, env, rows, select)
             return None if operand is None else -operand
@@ -7411,6 +7414,96 @@ class _Lowerer:
         """
         value = self._eval_value(node.this, env, rows, select)
         return None if value is None else _tag_text(value)
+
+    def _eval_builtin_call(
+        self,
+        node: exp.Expr,
+        env: _Env,
+        rows: _RowTuple,
+        select: exp.Select,
+    ) -> RowValue:
+        """``upper``/``lower``/``length``/``round``/``replace``/``substring``,
+        over a literal or a row column alike -- the same value grammar every
+        other operator here uses, so a row column reads exactly as a literal
+        would. NULL propagates from any argument, as it does through ``||``
+        and arithmetic; :meth:`ffrwd.parser._Resolver._check_builtin_call`
+        already typed every argument, so this only evaluates.
+        """
+        name = node.__class__.__name__.lower()
+        if isinstance(node, exp.Upper | exp.Lower):
+            text = self._eval_text(node.this, name, env, rows, select)
+            if text is None:
+                return None
+            return text.upper() if isinstance(node, exp.Upper) else text.lower()
+        if isinstance(node, exp.Length):
+            text = self._eval_text(node.this, name, env, rows, select)
+            return None if text is None else len(text)
+        if isinstance(node, exp.Round):
+            number = self._eval_number(node.this, f"{name}()", node, env, rows, select)
+            if number is None:
+                return None
+            decimals_node = node.args.get("decimals")
+            places = 0
+            if decimals_node is not None:
+                decimals = self._eval_number(
+                    decimals_node, f"{name}()", node, env, rows, select
+                )
+                if decimals is None:
+                    return None
+                places = int(decimals)
+            rounded = round(number, places)
+            return int(rounded) if places <= 0 else rounded
+        if isinstance(node, exp.Replace):
+            text = self._eval_text(node.this, name, env, rows, select)
+            target = self._eval_text(node.args.get("expression"), name, env, rows, select)
+            replacement_node = node.args.get("replacement")
+            replacement = (
+                self._eval_text(replacement_node, name, env, rows, select)
+                if replacement_node is not None
+                else ""
+            )
+            if text is None or target is None or replacement is None:
+                return None
+            return text.replace(target, replacement)
+        # exp.Substring: the string, then a 1-based start and an optional length.
+        text = self._eval_text(node.this, name, env, rows, select)
+        if text is None:
+            return None
+        start_node = node.args.get("start")
+        start = 1
+        if start_node is not None:
+            value = self._eval_number(start_node, f"{name}()", node, env, rows, select)
+            if value is None:
+                return None
+            start = int(value)
+        length_node = node.args.get("length")
+        if length_node is None:
+            return text[max(start - 1, 0) :]
+        value = self._eval_number(length_node, f"{name}()", node, env, rows, select)
+        if value is None:
+            return None
+        end = start - 1 + int(value)
+        return text[max(start - 1, 0) : max(end, 0)]
+
+    def _eval_text(
+        self,
+        node: exp.Expr | None,
+        name: str,
+        env: _Env,
+        rows: _RowTuple,
+        select: exp.Select,
+    ) -> str | None:
+        """One text-function operand's value; a number or boolean is a typed rejection."""
+        value = self._eval_value(node, env, rows, select)
+        if value is None or isinstance(value, str):
+            return value
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"{name}() needs text, but the argument is "
+            + ("boolean" if isinstance(value, bool) else "number"),
+            node if isinstance(node, exp.Expr) else select,
+            fallback=select,
+        )
 
     def _eval_case(
         self,

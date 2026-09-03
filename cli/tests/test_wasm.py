@@ -30,8 +30,9 @@ from ffrwd.errors import ErrorCode, FfrwdError
 from ffrwd.execute import CHAIN, PIPELINE, plan_argv, render_plan
 from ffrwd.functions import WasmFunction, package_modules
 from ffrwd.ir import Graph
-from ffrwd.lower import lower
+from ffrwd.lower import lower, lower_table
 from ffrwd.parser import ModuleExport, Resolved, parse, resolve
+from ffrwd.probe import CueMeta, ProbeResult, StreamMeta
 from ffrwd.processes import (
     PIPE,
     RAWVIDEO,
@@ -2043,6 +2044,85 @@ def test_a_wasm_value_call_folds_before_a_sql_call_wrapping_it() -> None:
     )
     graph = _folded(sql)
     assert graph.sinks[0].tags["title"] == "Main - x!"
+
+
+# -- a value function's call, over track-row columns -----------------------
+#
+# Every earlier test threads `f.video[1]` through unprobed -- a subscripted
+# stream lowers symbolically -- but a cue row (`unnest(v.cues) c`) is a real
+# row source, so this needs an actual `ProbeResult` to iterate, the same
+# fixture tests/test_lower.py builds for the cue-rows recipes.
+
+_CUE_ROW_PROBES: dict[str, ProbeResult | None] = {
+    "v": ProbeResult(
+        streams=[
+            StreamMeta(
+                type="subtitle",
+                index=0,
+                metadata={},
+                width=None,
+                height=None,
+                fps=None,
+                sample_rate=None,
+            )
+        ],
+        format_name="webvtt",
+        cues=[
+            CueMeta(index=1, text="Cue one.", start_t=0.0, end_t=0.6),
+            CueMeta(index=2, text="Cue two.", start_t=0.7, end_t=1.3),
+            CueMeta(index=3, text="Cue one.", start_t=1.4, end_t=2.0),
+        ],
+    )
+}
+
+
+def test_a_value_functions_call_over_row_columns_runs_once_per_distinct_argument() -> None:
+    """``array_agg(STRUCT(brand(c.text, '!') AS text, ...)::cue)``: one call per row,
+    the value host memoizing on the arguments the way it always has -- two of
+    the three cues share a text, so the module runs twice, not three times.
+    """
+    sql = (
+        BRAND_DECLARE
+        + "COPY (SELECT f.video[1], "
+        "array_agg(STRUCT(brand(c.text, '!') AS text, c.start_t AS start_t, "
+        "c.end_t AS end_t)::cue) "
+        "FROM input('a.mp4') f, input('v.vtt') v, unnest(v.cues) c "
+        "GROUP BY f.video[1]) TO 'out.mkv'"
+    )
+    calls: list[tuple[str, str, dict[str, object]]] = []
+
+    def invoke(module: str, function: str, args: Mapping[str, object]) -> object:
+        calls.append((module, function, dict(args)))
+        return f"{args.get('title')}{args.get('suffix')}"
+
+    lower(
+        _resolved(sql),
+        _CUE_ROW_PROBES,
+        registry=_snapshot_registry(),
+        describes={BRAND: _brand_described()},
+        invoke=invoke,
+    )
+    assert calls == [
+        (BRAND, "append-brand", {"title": "Cue one.", "suffix": "!"}),
+        (BRAND, "append-brand", {"title": "Cue two.", "suffix": "!"}),
+    ]
+
+
+def test_a_value_functions_call_over_a_row_column_folds_in_where() -> None:
+    """The same call reaches ``WHERE``: one row, matched against the folded text."""
+    sql = (
+        BRAND_DECLARE
+        + "SELECT c.text FROM input('a.mp4') f, input('v.vtt') v, unnest(v.cues) c "
+        "WHERE brand(c.text, '!') = 'Cue two.!'"
+    )
+    sinks = lower_table(
+        _resolved(sql),
+        _CUE_ROW_PROBES,
+        registry=_snapshot_registry(),
+        describes={BRAND: _brand_described()},
+        invoke=lambda module, function, args: f"{args.get('title')}{args.get('suffix')}",
+    )
+    assert sinks[0].result.rows == [["Cue two."]]
 
 
 # -- a declaration inside a package ---------------------------------------

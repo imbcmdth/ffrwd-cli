@@ -793,6 +793,18 @@ _ARITHMETIC_NAMES: dict[type[exp.Expr], str] = {
     exp.Div: "'/'",
 }
 
+# The dialect's built-in text/number functions, folded by the same
+# compile-time value grammar arithmetic and `::text` are -- over a literal or
+# a row column alike. `||` (exp.DPipe) already covers concat.
+_BUILTIN_VALUE_FUNCS = (
+    exp.Upper,
+    exp.Lower,
+    exp.Length,
+    exp.Round,
+    exp.Replace,
+    exp.Substring,
+)
+
 
 def is_value_expr(node: exp.Expr | None) -> bool:
     """True for a shape that is a compile-time VALUE and can never be a stream.
@@ -6508,6 +6520,25 @@ class _Resolver:
         self._check_row_predicate(conjunct, scope, where)
         return True
 
+    def _is_row_predicate_value(self, node: exp.Expr | None) -> bool:
+        """True for a shape the row-predicate grammar admits as a VALUE operand.
+
+        :func:`is_value_expr`'s structural shapes, plus a function call this
+        dialect folds: a built-in text/number function -- unambiguous by node
+        type, sqlglot never parses a filter name into one of these classes --
+        or a declared wasm VALUE function, found by name in the registry.
+        A call naming no such function is never a legal WHERE operand anyway,
+        so nothing here could misclassify an ordinary stream filter call.
+        """
+        if is_value_expr(node):
+            return True
+        if isinstance(node, _BUILTIN_VALUE_FUNCS):
+            return True
+        if isinstance(node, exp.Anonymous) and not isinstance(node.parent, exp.Dot):
+            declared = self.wasm.get(str(node.name).lower())
+            return declared is not None and declared.is_value
+        return False
+
     def _check_row_predicate(
         self, node: exp.Expr, scope: dict[str, str], where: exp.Expr
     ) -> None:
@@ -6576,7 +6607,7 @@ class _Resolver:
                     hint=_ROW_WHERE_HINT,
                 )
             column = _unwrap_paren(node.this) if isinstance(node.this, exp.Expr) else None
-            if is_value_expr(column):
+            if self._is_row_predicate_value(column):
                 # A computed subject types against each bound the way any
                 # comparison's two sides do; there is no COLUMN to name.
                 for bound in (node.args.get("low"), node.args.get("high")):
@@ -6592,7 +6623,8 @@ class _Resolver:
                 )
             column_type = self._row_predicate_operand(column, scope, where)
             for bound in (node.args.get("low"), node.args.get("high")):
-                if is_value_expr(_unwrap_paren(bound) if isinstance(bound, exp.Expr) else None):
+                unwrapped = _unwrap_paren(bound) if isinstance(bound, exp.Expr) else None
+                if self._is_row_predicate_value(unwrapped):
                     self._check_value_pair(column, bound, scope, where, _ROW_WHERE_HINT)
                     continue
                 self._check_row_literal(bound, column, column_type, where)
@@ -6601,7 +6633,7 @@ class _Resolver:
             left = _unwrap_paren(node.this) if isinstance(node.this, exp.Expr) else None
             right = node.args.get("expression")
             right = _unwrap_paren(right) if isinstance(right, exp.Expr) else None
-            if is_value_expr(left) or is_value_expr(right):
+            if self._is_row_predicate_value(left) or self._is_row_predicate_value(right):
                 self._check_value_pair(left, right, scope, where, _ROW_WHERE_HINT)
                 return
             column, literal = (left, right) if isinstance(left, exp.Column) else (right, left)
@@ -6807,6 +6839,8 @@ class _Resolver:
             return self._check_arithmetic(value, scope, fallback)
         if isinstance(value, exp.Cast):
             return self._check_cast(value, scope, fallback)
+        if isinstance(value, _BUILTIN_VALUE_FUNCS):
+            return self._check_builtin_call(value, scope, fallback)
         if isinstance(value, exp.Coalesce) and is_value_expr(value):
             # A value COALESCE: its arguments must agree on one type, NULL
             # fitting any of them -- the same agreement rule CASE results use.
@@ -6860,6 +6894,62 @@ class _Resolver:
             if isinstance(argument, exp.Expr) and not isinstance(argument, exp.Kwarg):
                 self._check_value_expr(argument, scope, fallback)
         return declared.returns
+
+    def _check_builtin_call(
+        self, node: exp.Expr, scope: dict[str, str], fallback: exp.Expr
+    ) -> str:
+        """``upper``/``lower``/``length``/``round``/``replace``/``substring``.
+
+        Each of the dialect's built-in text/number functions has a fixed
+        result type -- the argument's OWN type is what varies, over a literal
+        or a row column alike, so checking it is what this recurses for.
+        """
+        name = node.__class__.__name__.lower()
+        if isinstance(node, exp.Upper | exp.Lower):
+            self._check_text_arg(node.this, name, scope, fallback)
+            return "text"
+        if isinstance(node, exp.Length):
+            self._check_text_arg(node.this, name, scope, fallback)
+            return "number"
+        if isinstance(node, exp.Round):
+            self._check_numeric(node.this, f"{name}()", node, scope, fallback)
+            decimals = node.args.get("decimals")
+            if decimals is not None:
+                self._check_numeric(decimals, f"{name}()", node, scope, fallback)
+            return "number"
+        if isinstance(node, exp.Replace):
+            self._check_text_arg(node.this, name, scope, fallback)
+            self._check_text_arg(node.args.get("expression"), name, scope, fallback)
+            replacement = node.args.get("replacement")
+            if replacement is not None:
+                self._check_text_arg(replacement, name, scope, fallback)
+            return "text"
+        # exp.Substring: the string, and start/length if the query wrote them.
+        self._check_text_arg(node.this, name, scope, fallback)
+        for key in ("start", "length"):
+            bound = node.args.get(key)
+            if bound is not None:
+                self._check_numeric(bound, f"{name}()", node, scope, fallback)
+        return "text"
+
+    def _check_text_arg(
+        self,
+        operand: exp.Expr | None,
+        name: str,
+        scope: dict[str, str],
+        fallback: exp.Expr,
+    ) -> None:
+        """One text-function operand: text, or NULL (which keeps it open)."""
+        operand_type = self._check_value_expr(operand, scope, fallback)
+        if operand_type is None or operand_type == "text":
+            return
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"{name}() needs text, but the argument is {operand_type}",
+            operand if isinstance(operand, exp.Expr) else None,
+            fallback=fallback,
+            hint=_VALUE_HINT,
+        )
 
     def _check_list_element(
         self, node: exp.Bracket, scope: dict[str, str], fallback: exp.Expr

@@ -2967,3 +2967,29 @@ ffrwd-wasm -m ../sidecar/modules/target/wasm32-wasip2/release/source_replay.wasm
 ```
 
 Reach for this for a module that manufactures a stream rather than filtering one - a synthetic test pattern, a packet source pulled off a socket - anywhere a query wants to name it as an input alongside, or instead of, a probed file.
+
+## 112. A function over a caption file's cues
+
+The compile-time value grammar admits a function call anywhere it reaches - a `STRUCT(...)::cue` field among them - so a caption file's own cues become a second track beside another file's streams, each cue's text run through `upper`:
+
+```pgsql
+COPY (
+  SELECT f.video[1], f.audio[1],
+         array_agg(STRUCT(upper(c.text) AS text, c.start_t AS start_t,
+                          c.end_t AS end_t)::cue)
+  FROM input('tests/fixtures/av.mp4') f,
+       input('tests/fixtures/subs.en.vtt') v, unnest(v.cues) c
+  GROUP BY f.video[1], f.audio[1]
+) TO 'shouted.mkv'
+```
+
+```
+$ ffrwd compile -f query.sql
+ffmpeg -i tests/fixtures/av.mp4 -i tests/fixtures/subs.en.vtt -f webvtt -i \
+  'data:text/vtt;'\
+'base64,'\
+'V0VCVlRUCgowMDowMDowMC4wMDAgLS0+IDAwOjAwOjAwLjYwMApDVUUgT05FLgoKMDA6MDA6MDAuNzAwIC0tPiAwMDowMDowMS4zMDAKQ1VFIFRXTy4KCjAwOjAwOjAxLjQwMCAtLT4gMDA6MDA6MDIuMDAwCkNVRSBUSFJFRS4K' \
+  -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -map 2:s:0 -c:2 copy shouted.mkv
+```
+
+Any of the dialect's built-in text or number functions - `upper`, `lower`, `length`, `round`, `replace`, `substring` - or a declared wasm value function fold the same way, over a literal or a row column alike; the same grammar reaches `WHERE` too, e.g. `WHERE upper(c.text) = 'CUE ONE.'`.

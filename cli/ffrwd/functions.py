@@ -274,6 +274,12 @@ _ARGUMENT_KINDS: list[tuple[_ArgumentShape, str]] = [
     (exp.Cast, "text"),
     (_ARITHMETIC, "number"),
     (exp.Neg, "number"),
+    (exp.Upper, "text"),
+    (exp.Lower, "text"),
+    (exp.Length, "number"),
+    (exp.Round, "number"),
+    (exp.Replace, "text"),
+    (exp.Substring, "text"),
     (
         (exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE, exp.Between, exp.In,
          exp.Is, exp.And, exp.Or, exp.Not),

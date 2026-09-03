@@ -8603,6 +8603,67 @@ def test_a_bare_cues_column_in_a_media_copy_is_a_typed_rejection() -> None:
 
 
 # ---------------------------------------------------------------------------
+# a built-in function call over a row column: a STRUCT field, and WHERE
+# ---------------------------------------------------------------------------
+
+
+def test_a_builtin_call_over_a_row_column_folds_in_a_struct_field() -> None:
+    """The reproduction: upper(c.text) inside array_agg(STRUCT(...)::cue)."""
+    g = _lower(
+        "COPY (SELECT f.video[1], "
+        "array_agg(STRUCT(upper(c.text) AS text, c.start_t AS start_t, "
+        "c.end_t AS end_t)::cue) " + _FROM_VTT + " GROUP BY f.video[1]) TO 'out.mkv'",
+        _cue_probes(),
+    )
+    assert _vtt_payload(g, 2) == (
+        "WEBVTT\n\n"
+        "00:00:00.000 --> 00:00:00.600\nCUE ONE.\n\n"
+        "00:00:00.700 --> 00:00:01.300\nCUE TWO.\n\n"
+        "00:00:01.400 --> 00:00:02.000\nCUE THREE.\n"
+    )
+
+
+def test_a_builtin_call_over_a_row_column_folds_in_where() -> None:
+    sinks = lower_table(
+        resolve(parse("SELECT c.text " + _FROM_VTT + " WHERE upper(c.text) = 'CUE TWO.'")),
+        _cue_probes(),
+    )
+    assert sinks[0].result.rows == [["Cue two."]]
+
+
+def test_a_builtin_call_over_a_column_the_row_does_not_carry_is_rejected() -> None:
+    err = _reject_lower(
+        "COPY (SELECT f.video[1], "
+        "array_agg(STRUCT(upper(c.nope) AS text, c.start_t AS start_t, "
+        "c.end_t AS end_t)::cue) " + _FROM_VTT + " GROUP BY f.video[1]) TO 'out.mkv'",
+        _cue_probes(),
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "unknown column 'c.nope'" in err.message
+
+
+def test_a_builtin_call_over_the_wrong_type_refuses_by_name() -> None:
+    err = _reject_lower(
+        "COPY (SELECT f.video[1], "
+        "array_agg(STRUCT(upper(c.start_t) AS text, c.start_t AS start_t, "
+        "c.end_t AS end_t)::cue) " + _FROM_VTT + " GROUP BY f.video[1]) TO 'out.mkv'",
+        _cue_probes(),
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "upper() needs text, but the argument is number" in err.message
+
+
+def test_a_builtin_call_over_a_non_row_value_still_folds_once() -> None:
+    """A call whose argument is a literal, not a row column, works as before."""
+    g = _lower(
+        "COPY (SELECT f.video[1], ARRAY[STRUCT(upper('hello') AS text, 0 AS start_t, "
+        "1 AS end_t)::cue] FROM input('f.mkv') f) TO 'out.mkv'",
+        _cue_probes(),
+    )
+    assert "HELLO" in _vtt_payload(g, 1)
+
+
+# ---------------------------------------------------------------------------
 # attachments: a file riding inside the container
 # ---------------------------------------------------------------------------
 
