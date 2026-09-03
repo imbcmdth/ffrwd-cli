@@ -357,7 +357,14 @@ from ffrwd.parser import (
     union_branches,
 )
 from ffrwd.parser import _ident_name as _fold
-from ffrwd.probe import WEBVTT_FORMAT, ProbeFailure, ProbeResult, RenditionMeta, StreamMeta
+from ffrwd.probe import (
+    WEBVTT_FORMAT,
+    ProbeFailure,
+    ProbeResult,
+    RenditionMeta,
+    StreamMeta,
+    is_url,
+)
 from ffrwd.processes import ref_type
 from ffrwd.registry import DynamicFilter, FilterOption, Registry, SourceFilter
 from ffrwd.sink import (
@@ -4564,6 +4571,41 @@ class _Lowerer:
 
     # -- input() named options ---------------------
 
+    def _check_realtime_option(
+        self,
+        alias: str,
+        options: dict[str, object],
+        raw_options: Sequence[RawInputOption],
+    ) -> None:
+        """Refuse `realtime => true` on a socket: it is already paced by reality.
+
+        `ffrwd.processes.is_live` also calls a `format =>`-forced input live
+        (a capture device cannot be opened twice, same as a socket), but that
+        rule conflates a device with a SYNTHETIC one -- `format => 'lavfi'`
+        generates frames as fast as it is asked to, and pacing it with
+        `realtime => true` is exactly the documented idiom (recipe 101, 102 in
+        `../docs/examples.md`). Telling a capture device from a generator by
+        its `format` value needs a name list this table does not carry, so
+        that half stays unrefused -- only a URL (`is_url`: udp, srt, rtmp,
+        rtsp, http(s), ...) is unambiguous enough to reject here.
+        """
+        if options.get("realtime") is not True:
+            return
+        index = self.res.sources.get(alias)
+        path = self.res.input_paths[index] if index is not None else ""
+        if not is_url(path):
+            return
+        value_node = next((o.value for o in raw_options if o.name == "realtime"), None)
+        path_node = raw_options[0].path_node if raw_options else None
+        line, col = _pos(value_node, path_node)
+        raise FfrwdError(
+            ErrorCode.INPUT_OPTION_TYPE,
+            f"'{alias}' is already live -- realtime => true would pace it a second time",
+            line=line,
+            col=col,
+            hint="drop realtime; a socket is already paced by its own clock",
+        )
+
     def _lower_input_options(self) -> dict[str, dict[str, object]]:
         """Validate every `input('path', name => value, ...)`'s trailing options.
 
@@ -4576,6 +4618,7 @@ class _Lowerer:
         for alias, raw_options in self.res.input_options.items():
             options = input_option_values(raw_options)
             if options:
+                self._check_realtime_option(alias, options, raw_options)
                 result[alias] = options
         # A per-row `-i` repeats its origin's options: same file, same demuxer,
         # only the seek differs.
@@ -7946,6 +7989,18 @@ class _Lowerer:
         already broadcasts elementwise -- so the aggregate is the identity on
         the value, and the sugar and the spelled-out form emit the same bytes
         by construction rather than by agreement.
+
+        A rendition row's own kind columns (``r.video``, ``r.audio``) are the
+        one exception: bare, they already read that way, one stream per
+        surviving row that carries the kind (:meth:`_rendition_kind_value`),
+        but subscripted -- ``r.video[1]`` -- the same column instead picks a
+        SINGLE rendition out of the ones carrying the kind, the right
+        reading for a bare, non-aggregated column. `array_agg` names every
+        surviving row's own kind, not one row picked out of them, and a
+        rendition never carries more than one stream of a kind, so ``[1]``
+        is the only index that can ever name one -- :meth:`_rendition_array_agg`
+        reads it straight off `kinds`, the way :meth:`_row_value` reads an
+        unnest row's own stream.
         """
         inner = node.this
         if not isinstance(inner, exp.Expr):
@@ -7964,7 +8019,38 @@ class _Lowerer:
                 fallback=select,
                 hint=_ARRAY_AGG_HINT,
             )
+        rendition = self._rendition_array_agg(inner, env, select)
+        if rendition is not None:
+            return rendition
         return self._lower_expr(inner, env, select)
+
+    def _rendition_array_agg(
+        self, inner: exp.Expr, env: _Env, select: exp.Select
+    ) -> _Value | None:
+        """``array_agg(<row>.video[1])`` / ``.audio[1]``: every surviving
+        row's own stream of the kind, gathered in row order.
+
+        None for anything else -- a plain container column, an unnest row, a
+        bare (unsubscripted) rendition column, or a subscript other than
+        ``[1]`` -- so :meth:`_lower_array_agg` falls back to lowering the
+        argument exactly as it would outside the aggregate.
+        """
+        bracket = _unwrap(inner)
+        if not isinstance(bracket, exp.Bracket):
+            return None
+        column = bracket.this
+        if not isinstance(column, exp.Column):
+            return None
+        table_node = column.args.get("table")
+        if table_node is None:
+            return None
+        binding = env.bindings.get(_fold(table_node))
+        if not isinstance(binding, _RowBinding) or binding.column != RENDITION_COLUMN:
+            return None
+        name = _fold(column.this)
+        if name not in _ARRAY_COLUMNS or subscript_index(bracket) != 1:
+            return None
+        return self._rendition_kind_value(binding, name, None, bracket, select)
 
     # -- a cue array as a subtitle track -----------------------------------
 

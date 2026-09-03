@@ -3148,6 +3148,52 @@ def test_realtime_false_emits_no_flag_at_all() -> None:
     assert "-re" not in args
 
 
+def test_realtime_is_absent_by_default() -> None:
+    graph = compile_sql("SELECT a.video[1] FROM input('x.mp4') a")
+    assert graph.input_options == {}
+    args = build_ffmpeg_args(emit(graph), "out.mp4")
+    assert "-re" not in args
+
+
+def test_realtime_emits_re_before_the_right_input_on_a_two_input_query() -> None:
+    """`-re` sits on its OWN alias's `-i`, not the other input's."""
+    graph = _lower(
+        "SELECT a.video[1], b.video[1] "
+        "FROM input('x.mp4') a, input('y.mp4', realtime => true) b"
+    )
+    args = build_ffmpeg_args(emit(graph), "out.mp4")
+    b_index = args.index("y.mp4")
+    assert args[b_index - 2 : b_index] == ["-re", "-i"]
+    a_index = args.index("x.mp4")
+    assert args[a_index - 1] == "-i"
+    assert args[a_index - 2] != "-re"
+
+
+def test_realtime_refuses_a_socket_input() -> None:
+    """A socket already delivers at its own pace; `-re` on it is refused rather
+    than silently pacing it a second time."""
+    err = _reject_lower(
+        "SELECT a.video[1] FROM input('srt://host/stream', realtime => true) a", {}
+    )
+    assert err.code is ErrorCode.INPUT_OPTION_TYPE
+    assert "already live" in err.message
+    assert err.hint is not None and "drop realtime" in err.hint
+
+
+def test_realtime_is_not_refused_on_a_format_forced_synthetic_source() -> None:
+    """`format => 'lavfi'` makes an input single-open too, but it names a
+    generator, not a device -- telling the two apart needs a name list this
+    table does not carry, so only a socket (`is_url`) is refused. This is the
+    documented residual, and the exact combination recipe 101 in
+    docs/examples.md relies on."""
+    graph = compile_sql(
+        "SELECT a.video[1] FROM input('testsrc2=size=8x8', "
+        "format => 'lavfi', realtime => true) a"
+    )
+    args = build_ffmpeg_args(emit(graph), "out.mp4")
+    assert args[:5] == ["ffmpeg", "-f", "lavfi", "-re", "-i"]
+
+
 def test_seek_end_together_with_a_where_window_is_rejected() -> None:
     err = _reject(
         "SELECT a.video[1] FROM input('x.mp4', seek_end => 60) a WHERE a.t >= 1"
@@ -7002,6 +7048,80 @@ def test_the_one_row_manifest_refusal_picks_up_the_rendition_hint() -> None:
         "pick a rendition: WHERE on height, bandwidth or name, or ORDER BY "
         "bandwidth DESC LIMIT 1"
     )
+
+
+# -- array_agg(r.video[1]) / array_agg(r.audio[1]): every surviving row's
+#    own stream, gathered into one file -- the whole-ladder-into-one-file
+#    use case a manifest destination is not, unlike `test_a_ladder_reaches_
+#    a_manifest_destination_as_n_variants` just below. --------------------
+
+
+def test_array_agg_of_a_rendition_column_gathers_the_surviving_rows() -> None:
+    """``WHERE r.height >= 720`` narrows the 3-rung ladder to the two muxed
+    rungs; ``array_agg(r.video[1])`` gathers their own video streams, one
+    per row, into one file -- both reach ``-map``, in row order."""
+    g = _lower(
+        "COPY (SELECT array_agg(r.video[1]) FROM input('ladder.m3u8') r "
+        "WHERE r.height >= 720) TO 'all-rungs.mkv'",
+        _rendition_probes(),
+    )
+    unit = g.sinks[0]
+    assert [o.ref for o in unit.outputs] == ["src:r:v:0", "src:r:v:1"]
+    args = build_ffmpeg_args(emit(g), None)
+    assert [args[i + 1] for i, arg in enumerate(args) if arg == "-map"] == [
+        "0:v:0",
+        "0:v:1",
+    ]
+
+
+def test_array_agg_of_a_rendition_column_with_no_where_skips_the_audio_only_row() -> None:
+    """No WHERE at all: the ladder's 2 video-carrying rows gather, and the
+    third, audio-only rendition contributes nothing to ``.video`` -- the
+    same kind-filtering `_rendition_kind_value` already does for a bare
+    column, unchanged by going through `array_agg`."""
+    g = _lower(
+        "SELECT array_agg(r.video[1]) FROM input('ladder.m3u8') r",
+        _rendition_probes(),
+    )
+    assert _outputs(g) == [
+        ("src:r:v:0", "video", None),
+        ("src:r:v:1", "video", None),
+    ]
+
+
+def test_array_agg_of_a_rendition_audio_column_gathers_every_row() -> None:
+    """All 3 rows carry audio, the audio-only one included, in row order --
+    the same set `test_an_audio_only_rendition_still_counts_for_audio`
+    reaches through `VARIADIC`, reached here through the ordinary
+    `array_agg(...)` whole-column form instead."""
+    g = _lower(
+        "SELECT array_agg(r.audio[1]) FROM input('ladder.m3u8') r",
+        _rendition_probes(),
+    )
+    assert _outputs(g) == [
+        ("src:r:a:0", "audio", None),
+        ("src:r:a:1", "audio", None),
+        ("src:r:a:2", "audio", None),
+    ]
+
+
+def test_array_agg_of_a_rendition_column_reaches_a_two_track_destination() -> None:
+    """The emitted command for the maintainer's use case: an HLS ladder
+    written as one file holding every surviving rung as its own video
+    track -- both rungs mapped, in row order, no fan-out and no manifest."""
+    g = _lower(
+        "COPY (SELECT array_agg(r.video[1]) FROM input('ladder.m3u8') r "
+        "WHERE r.height >= 720) TO 'all-rungs.mkv'",
+        _rendition_probes(),
+    )
+    args = build_ffmpeg_args(emit(g), None)
+    assert args == [
+        "ffmpeg",
+        "-i", "ladder.m3u8",
+        "-map", "0:v:0", "-c:0", "copy",
+        "-map", "0:v:1", "-c:1", "copy",
+        "all-rungs.mkv",
+    ]
 
 
 def test_a_ladder_reaches_a_manifest_destination_as_n_variants() -> None:
