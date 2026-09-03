@@ -13,9 +13,16 @@ tests expand over. av2 and av3 differ only in their sine frequencies, so a
 sources whose language tags agree track for track. ``stereo.mp4`` adds the
 one thing none of those have: a genuinely 2-CHANNEL audio track (plan 047).
 ``font.ttf`` is a stub TrueType file and ``attached.mkv`` is a container
-carrying it, for reading attachments back. ``ladder/master.m3u8`` is a real
-two-rendition HLS ladder, the one fixture built by running the compiler
-itself rather than a raw ffmpeg call.
+carrying it, for reading attachments back. ``ladder/master.m3u8`` (HLS) and
+``ladder-demuxed/master.mpd`` (DASH) are two real ABR ladders, both built by
+running the compiler itself rather than a raw ffmpeg call. The first muxes
+every rung (a video and audio row share each rendition). The second keeps
+video and audio apart -- an audio-only rendition alongside two video-only
+rungs -- and that needs DASH: an HLS master reads back one row per
+``#EXT-X-STREAM-INF`` variant, with any bound audio group folded into that
+row rather than surfacing as a row of its own, so an HLS master never has an
+audio-only row for a query to find. A DASH MPD's ``<Representation>``s stay
+one row apiece regardless of type, so its audio-only row reads back as one.
 
 Idempotent: a fixture whose output file already exists is skipped, so this
 is safe to run repeatedly, including once per CI job right before the exec
@@ -63,6 +70,7 @@ _AV_2ENG_NAME = "av-2eng.mp4"
 _FONT_TTF_NAME = "font.ttf"
 _ATTACHED_NAME = "attached.mkv"
 _LADDER_MASTER_NAME = "ladder/master.m3u8"
+_LADDER_DEMUXED_MASTER_NAME = "ladder-demuxed/master.mpd"
 
 # Two muxed renditions, 1080p and 720p, built by RUNNING THE COMPILER against
 # av.mp4 (never hand-typed) -- read back by `input()` on a manifest path. The
@@ -85,6 +93,38 @@ COPY (
   FROM vid FULL JOIN aud ON vid.rung = aud.rung
 ) TO 'ladder/master.m3u8'
   WITH (format 'hls', hls_time 2, hls_playlist_type 'vod',
+        video_codec 'libx264', video_bitrate ARRAY['2000k', '800k'][vid.rung],
+        audio_codec 'aac')
+"""
+
+# Two video-only rungs plus one audio-only rendition, keyed the same way
+# `_LADDER_SQL` is but so the FULL JOIN never matches: video rungs are 1
+# and 2, the one audio track's rung is `2 + a.index` -- for av.mp4's single
+# track that is `2 + 1 = 3` (`.index` is the file's own stream index, and the
+# video stream takes 0), disjoint from `{1, 2}` -- the same audio-rung
+# expression recipe 104 uses. `format 'dash'` rather than `'hls'`: an HLS
+# master reads back one row per `#EXT-X-STREAM-INF` variant only, with any
+# bound audio group folded into that row rather than surfacing on its own
+# (confirmed against a real probe: every variant's program carries the
+# default audio track alongside its video, HLS or not), so it never has an
+# audio-only row for recipe 110's self-join to find. A DASH MPD's
+# `<Representation>`s stay one row apiece by construction -- video and audio
+# each get their own `AdaptationSet` regardless of how the rows that named
+# them were shaped -- so this is the ladder with a genuine audio-only row.
+_LADDER_DEMUXED_SQL = """\
+COPY (
+  WITH vid AS (
+    SELECT scale(f.video[1], ARRAY[1440, 960][i.i], -2) AS v, i.i AS rung
+    FROM input('av.mp4') f, generate_series(1, 2) i
+  ),
+  aud AS (
+    SELECT a AS t, 2 + a.index AS rung
+    FROM input('av.mp4') g, unnest(g.audio) a
+  )
+  SELECT vid.v, aud.t
+  FROM vid FULL JOIN aud ON vid.rung = aud.rung
+) TO 'ladder-demuxed/master.mpd'
+  WITH (format 'dash', seg_duration 2,
         video_codec 'libx264', video_bitrate ARRAY['2000k', '800k'][vid.rung],
         audio_codec 'aac')
 """
@@ -428,6 +468,34 @@ def _generate_ladder() -> None:
         raise SystemExit(f"ffrwd run failed generating {master}")
 
 
+def _generate_ladder_demuxed() -> None:
+    """A real DEMUXED DASH ladder -- two video-only rungs, one audio-only
+    rendition -- again run through `ffrwd run` rather than hand-typed.
+    Recipe 110 self-joins a ladder against itself to pick video rows from
+    one side and audio rows from the other; `ladder/master.m3u8` has no
+    audio-only row to find (its FULL JOIN key is chosen to mux every rung),
+    and neither would an HLS reading of THIS query's demuxed rows -- see
+    `_LADDER_DEMUXED_SQL`'s comment for why DASH is what makes the
+    audio-only row read back as its own. Must run after av.mp4 exists.
+    """
+    master = FIXTURES_DIR / _LADDER_DEMUXED_MASTER_NAME
+    if master.exists():
+        print(f"skip (already exists): {master}")
+        return
+    master.parent.mkdir(parents=True, exist_ok=True)
+    print(f"generating: {master}")
+    result = subprocess.run(
+        [sys.executable, "-m", "ffrwd", "run", _LADDER_DEMUXED_SQL, "-y"],
+        cwd=FIXTURES_DIR,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        print(result.stdout, file=sys.stderr)
+        print(result.stderr, file=sys.stderr)
+        raise SystemExit(f"ffrwd run failed generating {master}")
+
+
 def main() -> int:
     if not _ffmpeg_available():
         print("error: ffmpeg not found on PATH", file=sys.stderr)
@@ -447,6 +515,7 @@ def main() -> int:
     _generate_frame_png()
     _generate_attached(_generate_font_ttf())
     _generate_ladder()
+    _generate_ladder_demuxed()
     return 0
 
 
