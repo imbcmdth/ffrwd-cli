@@ -1,11 +1,16 @@
 //! Integration tests for a rows module through `ffrwd-wasm`'s own argv:
-//! `-rows-in` in, `-f ndjson` out, no `-i` at all. `fauxlate` is the fixture
-//! - see `modules/fauxlate/src/lib.rs`.
+//! `-rows-in` in, `-f ndjson` out, no `-i` at all - and, further down, a
+//! rows module chained onto a stream module in one process with
+//! `-m <path> -rows-from <index>`. `fauxlate` is the fixture for both - see
+//! `modules/fauxlate/src/lib.rs` - and `captions` (`modules/captions/src/lib.rs`)
+//! is the stream module the chained tests read rows from.
 
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::sync::OnceLock;
+
+use ffrwd_wasm::nut::{Muxer, Stream, TimeBase};
 
 /// Sidecar root, the parent of `ffrwd-wasm/`.
 fn sidecar_root() -> PathBuf {
@@ -33,6 +38,8 @@ fn module_path(name: &str) -> PathBuf {
                 "fauxlate",
                 "-p",
                 "invert",
+                "-p",
+                "captions",
             ])
             .current_dir(&workspace)
             .output()
@@ -72,6 +79,67 @@ fn run_ffrwd_wasm(args: &[&str]) -> Run {
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         output,
     }
+}
+
+/// Runs `ffrwd-wasm` with the given argv, feeding `stdin_bytes` - for a
+/// stream module chained to a rows module, which reads its stream off
+/// stdin the ordinary way.
+fn run_ffrwd_wasm_stdin(args: &[&str], stdin_bytes: &[u8]) -> Run {
+    let exe = env!("CARGO_BIN_EXE_ffrwd-wasm");
+    let mut child = Command::new(exe)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ffrwd-wasm");
+    let mut stdin = child.stdin.take().expect("child stdin");
+    // A refusal can close stdin before it is all written, which is a broken
+    // pipe rather than a test failure.
+    let _ = stdin.write_all(stdin_bytes);
+    drop(stdin);
+    let output = child.wait_with_output().expect("wait for ffrwd-wasm");
+    Run {
+        stdout: output.stdout.clone(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        output,
+    }
+}
+
+/// The time base ffmpeg gives a NUT stream by default, and the step one
+/// frame takes at 25fps in it - matching `ffrwd_wasm.rs`'s own fixture.
+const TIME_BASE: TimeBase = TimeBase { num: 1, den: 65536 };
+const PTS_STEP: i64 = 65536 / 25;
+const WIDTH: u32 = 8;
+const HEIGHT: u32 = 8;
+const FRAME_LEN: usize = (WIDTH * HEIGHT * 4) as usize;
+
+fn a_stream() -> Stream {
+    Stream::video("rgba", WIDTH, HEIGHT, TIME_BASE).expect("rgba is carried")
+}
+
+/// Frame `index` filled with a byte pattern distinct per position and per
+/// frame - captions never reads the pixels, only the frame count, so the
+/// pattern itself does not matter here.
+fn synthetic_frame(index: u8) -> Vec<u8> {
+    (0..FRAME_LEN)
+        .map(|offset| index.wrapping_mul(41).wrapping_add(offset as u8))
+        .collect()
+}
+
+/// A NUT stream carrying `frames`, one every `PTS_STEP` from zero.
+fn nut_stream(frames: &[Vec<u8>]) -> Vec<u8> {
+    let mut wire = Vec::new();
+    {
+        let mut muxer = Muxer::new(&mut wire, &a_stream()).expect("write NUT headers");
+        for (i, frame) in frames.iter().enumerate() {
+            muxer
+                .write_frame(i as i64 * PTS_STEP, frame)
+                .expect("write NUT frame");
+        }
+        muxer.finish().expect("finish the NUT stream");
+    }
+    wire
 }
 
 /// A fresh temp directory this test owns, cleaned up on drop by the OS's own
@@ -234,4 +302,138 @@ fn describe_reports_the_rows_kind_and_both_schemas() {
         .expect("a functions array");
     assert_eq!(functions.len(), 1);
     assert_eq!(functions[0]["name"], "translate");
+}
+
+// A rows module chained onto a stream module in one process:
+// `-m <stream> -m <rows> -rows-from <index>`, the module-network form
+// `docs/examples.md`'s "Translate captions as they are produced" pins.
+
+#[test]
+fn a_stream_module_chained_into_a_rows_module_translates_every_cue() {
+    let captions = module_path("captions");
+    let fauxlate = module_path("fauxlate");
+    let dir = tempdir();
+    let out = dir.join("translated.webvtt");
+
+    let frames: Vec<Vec<u8>> = (0..3u8).map(synthetic_frame).collect();
+    let wire = nut_stream(&frames);
+
+    let run = run_ffrwd_wasm_stdin(
+        &[
+            "-f",
+            "nut",
+            "-i",
+            "-",
+            "-m",
+            captions.to_str().expect("module path is UTF-8"),
+            "-m",
+            fauxlate.to_str().expect("module path is UTF-8"),
+            "-rows-from",
+            "0",
+            "-f",
+            "webvtt",
+            out.to_str().expect("temp path is UTF-8"),
+        ],
+        &wire,
+    );
+    assert!(
+        run.output.status.success(),
+        "run exited with {:?}\nstderr:\n{}",
+        run.output.status.code(),
+        run.stderr
+    );
+
+    let document = std::fs::read_to_string(&out).expect("read the webvtt document");
+    let cue_count = document.matches(" --> ").count();
+    assert_eq!(
+        cue_count, 3,
+        "captions writes one cue per frame, and none should be dropped or added, got:\n{document}"
+    );
+    for index in 0..3 {
+        // captions writes "cue {index}"; fauxlate's word rule turns that
+        // into "cue-a {index}-o".
+        assert!(
+            document.contains(&format!("cue-a {index}-o")),
+            "cue {index} was not translated, got:\n{document}"
+        );
+    }
+}
+
+#[test]
+fn a_rows_module_on_the_line_without_rows_from_is_refused_by_name() {
+    let captions = module_path("captions");
+    let fauxlate = module_path("fauxlate");
+    let run = run_ffrwd_wasm(&[
+        "-f",
+        "nut",
+        "-i",
+        "-",
+        "-m",
+        captions.to_str().expect("module path is UTF-8"),
+        "-m",
+        fauxlate.to_str().expect("module path is UTF-8"),
+        "-f",
+        "webvtt",
+        "-",
+    ]);
+    assert!(!run.output.status.success());
+    assert!(
+        run.stderr.contains("-rows-from") && run.stderr.contains("fauxlate"),
+        "stderr does not name the module needing -rows-from:\n{}",
+        run.stderr
+    );
+}
+
+#[test]
+fn a_rows_from_naming_no_m_on_the_line_is_refused_by_name() {
+    let captions = module_path("captions");
+    let fauxlate = module_path("fauxlate");
+    let run = run_ffrwd_wasm(&[
+        "-f",
+        "nut",
+        "-i",
+        "-",
+        "-m",
+        captions.to_str().expect("module path is UTF-8"),
+        "-m",
+        fauxlate.to_str().expect("module path is UTF-8"),
+        "-rows-from",
+        "5",
+        "-f",
+        "webvtt",
+        "-",
+    ]);
+    assert!(!run.output.status.success());
+    assert!(
+        run.stderr.contains("-rows-from 5") && run.stderr.contains("fauxlate"),
+        "stderr does not name the module and the index, got:\n{}",
+        run.stderr
+    );
+}
+
+#[test]
+fn a_rows_from_naming_its_own_slot_is_refused_by_name() {
+    let captions = module_path("captions");
+    let fauxlate = module_path("fauxlate");
+    let run = run_ffrwd_wasm(&[
+        "-f",
+        "nut",
+        "-i",
+        "-",
+        "-m",
+        captions.to_str().expect("module path is UTF-8"),
+        "-m",
+        fauxlate.to_str().expect("module path is UTF-8"),
+        "-rows-from",
+        "1",
+        "-f",
+        "webvtt",
+        "-",
+    ]);
+    assert!(!run.output.status.success());
+    assert!(
+        run.stderr.contains("-rows-from 1") && run.stderr.contains("fauxlate"),
+        "stderr does not name the module and the index, got:\n{}",
+        run.stderr
+    );
 }

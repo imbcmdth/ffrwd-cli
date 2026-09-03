@@ -14,6 +14,7 @@
 mod graph;
 mod network;
 mod rowfilter;
+mod rows_chain;
 mod scheduler;
 mod subtitles;
 mod windows;
@@ -278,6 +279,15 @@ enum Modules {
     },
 }
 
+/// One `-m <path> -rows-from <index>` pair: a rows module hosted in this
+/// process, carrying no stream of its own. `-rows-from` is checked as the
+/// line is parsed - it names an earlier `-m` on the same line - and nothing
+/// downstream needs the index again: the chain it built is already in the
+/// right order.
+struct RowsModuleSpec {
+    path: String,
+}
+
 /// What one output writes: the frames, the rows as they arrive, the cue
 /// rows gathered into a subtitle document, or nothing at all — the output a
 /// sink module's pad takes, where the module's own effects are the product.
@@ -334,6 +344,10 @@ struct Args {
     /// `-rows-in`: where a rows module's input rows come from. A rows
     /// module reads no `-i` stream at all, so this is its only input.
     rows_in: Option<InputPath>,
+    /// Every `-m <path> -rows-from <index>` on the line, in the order they
+    /// were given - the chain a rows-bearing output's rows flow through
+    /// before they are written.
+    rows_chain: Vec<RowsModuleSpec>,
     /// The `-jobs` cap on worker threads, if one was given. The pool is the
     /// machine's effective core count either way; the cap only lowers it,
     /// and `-jobs 1` is the serial escape hatch.
@@ -525,6 +539,9 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
     let mut inputs: Vec<InputPath> = Vec::new();
     let mut pads: Vec<Option<PadSpec>> = Vec::new();
     let mut modules: Vec<String> = Vec::new();
+    // One slot per `-m`, in the same order: what its own `-rows-from` said,
+    // or None where there was none.
+    let mut rows_from: Vec<Option<usize>> = Vec::new();
     let mut params: Option<String> = None;
     let mut wiring: Option<String> = None;
     let mut pending_map: Option<String> = None;
@@ -560,7 +577,23 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
                     None => bail!("-pad with no -i before it: -pad follows the -i it names"),
                 }
             }
-            "-m" => modules.push(next("-m")?),
+            "-m" => {
+                modules.push(next("-m")?);
+                rows_from.push(None);
+            }
+            "-rows-from" => {
+                let raw = next("-rows-from")?;
+                let index: usize = raw
+                    .parse()
+                    .map_err(|_| anyhow!("-rows-from expects a 0-based index, got {raw}"))?;
+                match rows_from.last_mut() {
+                    Some(slot @ None) => *slot = Some(index),
+                    Some(Some(_)) => bail!("second -rows-from for the same -m"),
+                    None => {
+                        bail!("-rows-from with no -m before it: -rows-from follows the -m it names")
+                    }
+                }
+            }
             "-filter_complex" => {
                 if wiring.is_some() {
                     bail!("second -filter_complex specified: one string wires the whole network");
@@ -653,7 +686,7 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
         );
     }
 
-    let modules = build_modules(modules, params, wiring, &outputs)?;
+    let (modules, rows_chain) = build_modules(modules, rows_from, params, wiring, &outputs)?;
 
     let stream_info = match stream_info_path {
         Some(path) => Some(load_stream_info(&path)?),
@@ -668,38 +701,85 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
         outputs,
         annotations,
         rows_in,
+        rows_chain,
         jobs,
     })
 }
 
 /// The `-m` table and its wiring, checked against the rest of the command
-/// line. A `-filter_complex` is what makes this a network; without one the
-/// single-module spelling holds and every option that only a network can use
-/// is refused by name.
+/// line, and the rows-module chain riding alongside it. A `-filter_complex`
+/// is what makes this a network; without one the single-module spelling
+/// holds and every option that only a network can use is refused by name.
 fn build_modules(
     modules: Vec<String>,
+    rows_from: Vec<Option<usize>>,
     params: Option<String>,
     wiring: Option<String>,
     outputs: &[OutputSpec],
-) -> Result<Modules> {
+) -> Result<(Modules, Vec<RowsModuleSpec>)> {
     // A network may be built entirely of nodes the host answers for, and
     // binds nothing; the wiring is then what says there is anything to run.
     if modules.is_empty() && wiring.is_none() {
         bail!("no module specified (-m)");
     }
 
+    // The pre-existing standalone rows module: one bare -m, no
+    // -filter_complex and no -rows-from at all, its rows read through
+    // -rows-in rather than a stream. It is untouched by anything below.
+    let standalone = modules.len() == 1 && wiring.is_none() && rows_from[0].is_none();
+
+    // Every -m on the line splits into the stream modules - the short
+    // form's own, or a network's name=path table - and the rows modules
+    // chained after them, each an -m <path> naming, by position, which
+    // earlier -m's rows it reads.
+    let total = modules.len();
+    let mut stream_raws: Vec<String> = Vec::new();
+    let mut rows_chain: Vec<RowsModuleSpec> = Vec::new();
+    for (position, (raw, source)) in modules.into_iter().zip(rows_from).enumerate() {
+        match source {
+            None => {
+                // A bare path (no name=path table entry) that turns out to
+                // be a rows module has nothing to read a stream from, and
+                // needs a -rows-from to say whose rows it reads instead.
+                if !standalone
+                    && !raw.contains('=')
+                    && ffrwd_wasm_runtime::runtime::exports_rows_module(&raw)
+                        .with_context(|| format!("opening module {raw}"))?
+                {
+                    bail!(
+                        "{raw}: a rows module on this line needs -rows-from <index>, naming \
+                         which earlier -m's rows it reads"
+                    );
+                }
+                stream_raws.push(raw);
+            }
+            Some(source) => {
+                if source >= total {
+                    bail!("{raw}: -rows-from {source} names no -m on this line; {total} are given");
+                }
+                if source >= position {
+                    bail!(
+                        "{raw}: -rows-from {source} names its own slot or a later one; a rows \
+                         module reads an earlier -m's rows"
+                    );
+                }
+                rows_chain.push(RowsModuleSpec { path: raw });
+            }
+        }
+    }
+
     let Some(wiring) = wiring else {
-        if modules.len() > 1 {
+        if stream_raws.len() > 1 {
             bail!(
                 "{} modules were given with -m and no -filter_complex wires them",
-                modules.len()
+                stream_raws.len()
             );
         }
         if let Some(output) = outputs.iter().find(|o| o.target.is_some()) {
             let target = output.target.as_deref().unwrap_or_default();
             bail!("-map [{target}] names a label of a network, and no -filter_complex wires one");
         }
-        let path = modules.into_iter().next().expect("one module");
+        let path = stream_raws.into_iter().next().expect("one module");
         // A packet source writes one output per catalog track, so the
         // one-output-per-format rule below - built for a filter's single
         // stream - does not hold for it; every other module still gets it.
@@ -708,10 +788,13 @@ fn build_modules(
         if !is_source {
             check_one_output_per_format(outputs)?;
         }
-        return Ok(Modules::Single {
-            path,
-            params: params.unwrap_or_default(),
-        });
+        return Ok((
+            Modules::Single {
+                path,
+                params: params.unwrap_or_default(),
+            },
+            rows_chain,
+        ));
     };
 
     if params.is_some() {
@@ -726,11 +809,11 @@ fn build_modules(
             output.kind.format()
         );
     }
-    let bindings = modules
+    let bindings = stream_raws
         .iter()
         .map(|raw| resolve_binding(raw))
         .collect::<Result<Vec<_>>>()?;
-    Ok(Modules::Network { bindings, wiring })
+    Ok((Modules::Network { bindings, wiring }, rows_chain))
 }
 
 /// A single module writes one stream, so it fills one output of each format.
@@ -918,6 +1001,11 @@ struct Sink {
     /// The stream's time base, for stamping `time` onto the rows this sink
     /// writes.
     time_base: nut::TimeBase,
+    /// The rows module chain this sink's rows flow through before they are
+    /// written, when one is riding this process - a `-f ndjson`, `-f srt`
+    /// or `-f webvtt` output only, and never the edge (`self.frames`)
+    /// output's own annotation stream.
+    rows_chain: Option<rows_chain::RowsChain>,
 }
 
 impl Sink {
@@ -926,6 +1014,7 @@ impl Sink {
         node: usize,
         stream: &nut::Stream,
         annotations: bool,
+        rows_chain: Option<rows_chain::RowsChain>,
     ) -> Result<Sink> {
         let mut sink = Sink {
             node,
@@ -935,6 +1024,7 @@ impl Sink {
             annotations: annotations && output.kind == OutputKind::Frames,
             last_pts: None,
             time_base: stream.time_base,
+            rows_chain,
         };
         match output.kind {
             OutputKind::Frames => {
@@ -955,6 +1045,10 @@ impl Sink {
     }
 
     fn write(&mut self, module: &str, frames: &[Frame]) -> Result<()> {
+        // The rows a rows/subtitle output would write, gathered across this
+        // whole call so a rows-module chain sees them as one batch rather
+        // than one row at a time.
+        let mut batch: Vec<String> = Vec::new();
         for frame in frames {
             if let Some(previous) = self.last_pts {
                 if frame.pts < previous {
@@ -983,11 +1077,20 @@ impl Sink {
                 }
                 w.write_frame(frame.pts, &frame.data)?;
             }
+            if self.rows.is_some() || self.subtitles.is_some() {
+                batch.extend(stamped);
+            }
+        }
+        if self.rows.is_some() || self.subtitles.is_some() {
+            let routed = match &mut self.rows_chain {
+                Some(chain) => chain.process(batch)?,
+                None => batch,
+            };
             if let Some(w) = self.rows.as_mut() {
-                write_rows(w, &stamped)?;
+                write_rows(w, &routed)?;
             }
             if let Some(w) = self.subtitles.as_mut() {
-                w.push(&stamped)?;
+                w.push(&routed)?;
             }
         }
         Ok(())
@@ -996,7 +1099,9 @@ impl Sink {
     /// The rows the module had no frame to put them on. On the annotation
     /// stream they are one record after every frame's; in an ndjson output
     /// they are ordinary lines at the end. They carry no `pts` or `time`
-    /// stamp: there is no frame here to take one from.
+    /// stamp: there is no frame here to take one from. A rows-module chain
+    /// reads them the same as any other batch, matching rows routed to
+    /// `process` and the rest passed through.
     fn write_trailing(&mut self, rows: &[String]) -> Result<()> {
         if rows.is_empty() {
             return Ok(());
@@ -1006,11 +1111,19 @@ impl Sink {
                 w.write_trailing(self.last_pts.unwrap_or(0), rows)?;
             }
         }
+        let owned;
+        let routed: &[String] = match &mut self.rows_chain {
+            Some(chain) => {
+                owned = chain.process(rows.to_vec())?;
+                &owned
+            }
+            None => rows,
+        };
         if let Some(w) = self.rows.as_mut() {
-            write_rows(w, rows)?;
+            write_rows(w, routed)?;
         }
         if let Some(w) = self.subtitles.as_mut() {
-            w.push(rows)?;
+            w.push(routed)?;
         }
         Ok(())
     }
@@ -1018,6 +1131,19 @@ impl Sink {
     fn finish(&mut self) -> Result<()> {
         if let Some(w) = self.frames.as_mut() {
             w.finish()?;
+        }
+        // Whatever a rows-module chain held back across every `process`
+        // call, appended once here, after every other row this sink wrote.
+        if let Some(chain) = self.rows_chain.as_mut() {
+            let trailing = chain.finish()?;
+            if !trailing.is_empty() {
+                if let Some(w) = self.rows.as_mut() {
+                    write_rows(w, &trailing)?;
+                }
+                if let Some(w) = self.subtitles.as_mut() {
+                    w.push(&trailing)?;
+                }
+            }
         }
         if let Some(w) = self.rows.as_mut() {
             w.flush()?;
@@ -1029,15 +1155,57 @@ impl Sink {
     }
 }
 
+/// Opens the chain every `-m <path> -rows-from <index>` on the line named,
+/// in the order they were given. None when the line named none.
+fn open_rows_chain(specs: &[RowsModuleSpec]) -> Result<Option<rows_chain::RowsChain>> {
+    if specs.is_empty() {
+        return Ok(None);
+    }
+    let paths: Vec<String> = specs.iter().map(|spec| spec.path.clone()).collect();
+    Ok(Some(rows_chain::RowsChain::open(&paths)?))
+}
+
 /// One sink per output, each bound to the node it writes and opened against
-/// that node's stream header.
-fn open_sinks(args: &Args, nodes: &[usize], streams: &[nut::Stream]) -> Result<Vec<Sink>> {
-    args.outputs
+/// that node's stream header. `rows_chain` goes to the one rows-bearing
+/// output (`-f ndjson`, `-f srt` or `-f webvtt`) this line writes; more than
+/// one such output with a chain to feed, or none at all, is refused.
+fn open_sinks(
+    args: &Args,
+    nodes: &[usize],
+    streams: &[nut::Stream],
+    mut rows_chain: Option<rows_chain::RowsChain>,
+) -> Result<Vec<Sink>> {
+    let rows_bearing = args
+        .outputs
         .iter()
-        .zip(nodes)
-        .zip(streams)
-        .map(|((output, node), stream)| Sink::open(output, *node, stream, args.annotations.output))
-        .collect()
+        .filter(|o| matches!(o.kind, OutputKind::Rows | OutputKind::Subtitles(_)))
+        .count();
+    if rows_chain.is_some() && rows_bearing > 1 {
+        bail!(
+            "a rows module's output feeds one rows document, and this line writes {rows_bearing}"
+        );
+    }
+    let mut sinks = Vec::with_capacity(args.outputs.len());
+    for ((output, node), stream) in args.outputs.iter().zip(nodes).zip(streams) {
+        let chain = match output.kind {
+            OutputKind::Rows | OutputKind::Subtitles(_) => rows_chain.take(),
+            _ => None,
+        };
+        sinks.push(Sink::open(
+            output,
+            *node,
+            stream,
+            args.annotations.output,
+            chain,
+        )?);
+    }
+    if rows_chain.is_some() {
+        bail!(
+            "a rows module chains onto -f ndjson, srt or webvtt, and this line writes none of \
+             those"
+        );
+    }
+    Ok(sinks)
 }
 
 /// Reads every input a frame at a time into the scheduler, then waits for
@@ -1261,7 +1429,8 @@ fn run(args: &Args) -> Result<()> {
             let net = Network::single(filter, &formats[0], reopen);
             let nodes = vec![0usize; args.outputs.len()];
             let sink_streams = vec![streams[0].clone(); args.outputs.len()];
-            let sinks = open_sinks(args, &nodes, &sink_streams)?;
+            let rows_chain = open_rows_chain(&args.rows_chain)?;
+            let sinks = open_sinks(args, &nodes, &sink_streams, rows_chain)?;
             run_lanes(net, readers, &formats, sinks, args.jobs)
         }
         Modules::Network { bindings, wiring } => {
@@ -1287,7 +1456,8 @@ fn run(args: &Args) -> Result<()> {
                 sink_streams.push(streams[net.root(node)].clone());
                 nodes.push(node);
             }
-            let sinks = open_sinks(args, &nodes, &sink_streams)?;
+            let rows_chain = open_rows_chain(&args.rows_chain)?;
+            let sinks = open_sinks(args, &nodes, &sink_streams, rows_chain)?;
             run_lanes(net, readers, &formats, sinks, args.jobs)
         }
     }
