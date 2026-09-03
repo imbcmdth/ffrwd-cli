@@ -2514,17 +2514,19 @@ COPY (
 
 ```
 $ ffrwd compile -f query.sql
-ffmpeg -i tests/fixtures/av.mp4 -map 0:v:0 -c:0 libx264 -pix_fmt:0 yuv420p -f nut pipe:1 \
-  | ffrwd-wasm -f nut -i pipe:0 -m \
-  ../sidecar/modules/target/wasm32-wasip2/release/packet_stats.wasm -f ndjson pipe:1
+ffmpeg -i tests/fixtures/av.mp4 -map 0:v:0 -c:0 copy -f nut pipe:1 | ffrwd-wasm -f nut \
+  -i pipe:0 -m ../sidecar/modules/target/wasm32-wasip2/release/packet_stats.wasm -f \
+  ndjson pipe:1
 ```
 
-No codec was named, so the compiler takes the module's preference -
-`packet_stats` accepts every codec, and the default is h264 by
-libx264. The encoder is shaped by the same WITH options a file sink
-takes, the video ones: `video_codec`, `crf`, `preset` and kin. A codec
-the module's describe does not accept is refused at compile time,
-naming the ones it does:
+No codec was named and the stream reaches the sink untouched, so it
+copies - the file's own h264 packets, the same default a file
+destination has. A filtered stream, or a source codec the module does
+not accept, encodes instead, with the module's preference as the
+default codec. Name one to read what an encoder produces; the encoder
+is shaped by the same WITH options a file sink takes, the video ones:
+`video_codec`, `crf`, `preset` and kin. A codec the module's describe
+does not accept is refused at compile time, naming the ones it does:
 
 ```pgsql
 CREATE FUNCTION packet_stats(v video_stream) RETURNS sink
