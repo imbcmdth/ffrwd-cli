@@ -2854,3 +2854,30 @@ ffmpeg -i tests/fixtures/ladder/master.m3u8 -map 0:v:0 -map 0:v:1 -map 0:a:0 -ma
 
 Reach for this to repackage or re-encode someone else's ladder into
 your own, rung for rung, without re-deriving the variant map by hand.
+
+## 108. Stream a file as if it were live
+
+Nothing paces a plain file input: ffmpeg reads it as fast as it can, so
+pointing one at a live-shaped destination finishes in a fraction of the
+file's own duration instead of running for it. `realtime => true` adds
+`-re` ahead of that input's `-i`, reading it at its own frame rate
+instead - the same flag a real live source would need none of:
+
+```pgsql
+COPY (SELECT f.video[1], f.audio[1] FROM input(:'source', realtime => true) f)
+TO :'dest' WITH (format 'flv', video_codec 'libx264', audio_codec 'aac')
+```
+
+```
+$ ffrwd compile -f query.sql -v source=film.mkv -v dest=rtmp://live.example.com/app/streamkey
+ffmpeg -re -i film.mkv -map 0:v:0 -map 0:a:0 -f flv -c:0 libx264 -c:1 aac \
+  rtmp://live.example.com/app/streamkey
+```
+
+Reach for this to publish a VOD file to a live-shaped destination -
+an ad break spliced into a stream, or a rung of an encode ladder sent
+to a relay expecting a live push. `realtime` refuses on an input
+already named by a socket (`srt://`, `udp://`, `rtmp://`, ...): it is
+already paced by whatever is sending it, and pacing it a second time
+is refused with a hint to drop the option - see `INPUT_OPTION_TYPE` in
+[docs/errors.md](errors.md).

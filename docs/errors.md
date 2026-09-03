@@ -492,6 +492,20 @@ SELECT p.video[1] FROM input('logo.png', framerate => 'fast') p
 {"line": 1, "col": 55, "code": "INPUT_OPTION_TYPE", "message": "option 'framerate' expects a number, got 'fast'", "hint": "framerate takes a bare numeric literal, e.g. framerate => 15"}
 ```
 
+**Also fires for `realtime => true` on a socket** (`srt://`, `udp://`, `rtmp://`, `rtsp://`, `http(s)://`, ...): a socket already delivers at its own pace, so pacing it a second time with `-re` is refused rather than silently doubled up. This does NOT cover a `format =>`-forced capture device — telling one apart from a synthetic source like `format => 'lavfi'` (recipe 101 in [docs/examples.md](examples.md), which legitimately pairs `format => 'lavfi'` with `realtime => true`) needs a device-name list this table does not carry, so that case still compiles.
+
+**Example query:**
+
+```sql
+SELECT p.video[1] FROM input('srt://host/stream', realtime => true) p
+```
+
+**Error JSON:**
+
+```json
+{"line": 1, "col": 30, "code": "INPUT_OPTION_TYPE", "message": "'p' is already live -- realtime => true would pace it a second time", "hint": "drop realtime; a socket is already paced by its own clock"}
+```
+
 ## NOTHING_TO_SHOW
 
 **Meaning:** `ffrwd run --show` or `--show-only` was asked for and the query has no video output file to play. A window shows a `COPY` that writes video; a bare `SELECT`, a `FORMAT csv` COPY, an audio-only output, a subtitle document and a module's rows have nothing to put in one. A query calling a `LANGUAGE wasm` module shows like any other: it runs as several processes, and the one writing the video file is the one the window reads.
