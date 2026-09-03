@@ -688,7 +688,7 @@ def invoke(path: str, function: str, args: Mapping[str, object]) -> object:
 # reads its compile-time catalog, `catalog_as_probe` bridges that catalog
 # into the shape everything downstream already reads a probed FILE as.
 
-_PROBE_SUBCOMMAND = "probe"
+_PROBE_FLAG = "--probe"
 _PARAMS_FLAG = "-params"
 
 
@@ -890,7 +890,7 @@ def _source_catalog(module: str, payload: object) -> SourceCatalog:
 def probe_source(module: str, params: str) -> SourceCatalog:
     """Ask the sidecar what the packet-source module at `module` publishes for `params`.
 
-    ``ffrwd-wasm probe <module> -params '<json>'`` prints one JSON line naming
+    ``ffrwd-wasm --probe <module> -params '<json>'`` prints one JSON line naming
     every coded track the module would produce and whether the source ever
     ends. `params` travels verbatim -- already marshalled JSON, the same
     convention :func:`invoke` follows for its own argument.
@@ -909,7 +909,7 @@ def probe_source(module: str, params: str) -> SourceCatalog:
         )
     try:
         done = subprocess.run(
-            [sidecar, _PROBE_SUBCOMMAND, module, _PARAMS_FLAG, params],
+            [sidecar, _PROBE_FLAG, module, _PARAMS_FLAG, params],
             capture_output=True,
             encoding="utf-8",  # what the sidecar writes; see describe()
             errors="replace",

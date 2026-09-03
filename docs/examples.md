@@ -2942,3 +2942,25 @@ muxed into each video variant. An HLS master reads back one row per
 folds into that row rather than surfacing as a row of its own - so a
 ladder with an audio-only row for `a` to pick up needs a DASH MPD,
 whose `<Representation>`s stay one row apiece regardless of type.
+
+## 111. A source module in FROM
+
+`RETURNS source` is the mirror of `RETURNS sink`: a module that reads no stream and produces one, legal only in `FROM`. It is probed at compile time exactly like a manifest - `replay`'s one compiled-in track reads as a rendition row, `s.video[1]` and the one-row rule work the same as any other input - but it has no file behind it, so at run time the sidecar rides alone at the head of the pipe with no `-i` feeding it:
+
+```pgsql
+CREATE FUNCTION replay() RETURNS source
+  AS '../sidecar/modules/target/wasm32-wasip2/release/source_replay.wasm', 'source_replay'
+  LANGUAGE wasm;
+
+COPY (
+  SELECT s.video[1]
+  FROM replay() s
+) TO :'dest' WITH (video_codec 'libx264', crf 20)
+```
+
+```
+$ ffrwd compile -f query.sql -v dest=source.mp4
+ffrwd-wasm -m ../sidecar/modules/target/wasm32-wasip2/release/source_replay.wasm -f nut pipe:1 | ffmpeg -f nut -i pipe:0 -map 0:v:0 -c:0 libx264 -crf:0 20 source.mp4
+```
+
+Reach for this for a module that manufactures a stream rather than filtering one - a synthetic test pattern, a packet source pulled off a socket - anywhere a query wants to name it as an input alongside, or instead of, a probed file.

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from ffrwd.ir import Graph, Node, Output, SinkUnit, StreamType
+from ffrwd.ir import Graph, ModuleSource, Node, Output, SinkUnit, SourceTrack, StreamType
 from ffrwd.split import insert_splits
 
 
@@ -492,3 +492,22 @@ def test_a_zero_input_node_fans_out_through_an_ordinary_split() -> None:
     assert out.nodes["n1_split"].outputs == ["video", "video"]
     assert out.nodes["n2"].inputs == ["n1_split:0"]
     assert [o.ref for o in out.outputs] == ["n2", "n1_split:1"]
+
+
+def test_module_source_survives_the_pass() -> None:
+    """A ``RETURNS source`` binding has no pad of its own to fan out, but the
+    pass must not drop it while rebuilding the graph."""
+    g = _no_fanout_graph()
+    g.module_sources["s"] = ModuleSource(
+        alias="s",
+        module="replay.wasm",
+        params="{}",
+        tracks=(
+            SourceTrack(
+                ref="src:s:v:0", kind="video", codec="h264", time_base=(1, 90000), row=0
+            ),
+        ),
+        bounded=True,
+    )
+    out = insert_splits(g)
+    assert out.module_sources == g.module_sources

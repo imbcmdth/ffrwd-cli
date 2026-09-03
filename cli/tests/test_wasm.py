@@ -4225,7 +4225,7 @@ def test_probe_source_spawns_the_documented_argv(monkeypatch: pytest.MonkeyPatch
     calls = _fake_wasm_run(monkeypatch, json.dumps(_SOURCE_CATALOG_JSON))
     wasm.probe_source(PACKET_SOURCE_MODULE, '{"url": "x"}')
     assert calls == [
-        ["ffrwd-wasm", "probe", PACKET_SOURCE_MODULE, "-params", '{"url": "x"}']
+        ["ffrwd-wasm", "--probe", PACKET_SOURCE_MODULE, "-params", '{"url": "x"}']
     ]
 
 

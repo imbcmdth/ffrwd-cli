@@ -1231,7 +1231,14 @@ def _cmd_compile(args: argparse.Namespace, on_warning: OnWarning) -> int:
                 owner=query.owner,
             )
             graphs = compiled.graphs
-            emitted = emitted_commands(graphs)
+            # `emitted` is read only by the graph-only branch and the
+            # single-command fallback below; a plan-based query with no
+            # `--graph-only` never reads it, which matters for a module
+            # SOURCE -- its alias has no `-i` in the unpartitioned graph, so
+            # emitting it is only valid once a plan exists to skip.
+            emitted = (
+                emitted_commands(graphs) if args.graph_only or compiled.plan is None else []
+            )
     except FfrwdError as err:
         # A query with no streaming representation at all (metadata
         # columns, an un-COALESCEd join gap) fails HERE, so table mode is the
@@ -1538,7 +1545,11 @@ def _cmd_run(args: argparse.Namespace, on_warning: OnWarning) -> int:
             graphs, plan, windows = _with_plan_windows(graphs, plan, only=args.show_only)
         elif showing:
             graphs, players = _with_windows(graphs, only=args.show_only)
-        emitted: list[Emitted] = emitted_commands(graphs)
+        # A plan-based query never reaches the `execute(emitted, ...)` call
+        # below (`_run_plan` runs it instead); skipping this for one avoids
+        # emitting a module SOURCE's alias, which has no `-i` to name in the
+        # unpartitioned graph.
+        emitted: list[Emitted] = emitted_commands(graphs) if plan is None else []
     except FfrwdError as err:
         _print_error(err, source=args.query, packages=packages, query=query)
         return 1

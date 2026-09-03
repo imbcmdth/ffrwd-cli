@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from ffrwd.ir import Graph, Node, Output, SinkUnit, StreamType
+from ffrwd.ir import Graph, ModuleSource, Node, Output, SinkUnit, SourceTrack, StreamType
 from ffrwd.pts import insert_pts_resets
 
 
@@ -241,3 +241,22 @@ def test_insert_pts_resets_is_idempotent() -> None:
     once = insert_pts_resets(g)
     twice = insert_pts_resets(once)
     assert once.to_dict() == twice.to_dict()
+
+
+def test_module_source_survives_the_pass() -> None:
+    """A ``RETURNS source`` binding carries no trim/atrim of its own, but the
+    pass must not drop it while rebuilding the graph."""
+    g = _no_trim_graph()
+    g.module_sources["s"] = ModuleSource(
+        alias="s",
+        module="replay.wasm",
+        params="{}",
+        tracks=(
+            SourceTrack(
+                ref="src:s:v:0", kind="video", codec="h264", time_base=(1, 90000), row=0
+            ),
+        ),
+        bounded=True,
+    )
+    out = insert_pts_resets(g)
+    assert out.module_sources == g.module_sources

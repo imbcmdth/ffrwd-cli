@@ -140,4 +140,5 @@ def insert_pts_resets(g: Graph) -> Graph:
             name: [dict(pad) for pad in pads]
             for name, pads in g.packet_sinks.items()
         },
+        module_sources=dict(g.module_sources),
     )

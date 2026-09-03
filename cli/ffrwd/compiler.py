@@ -193,9 +193,15 @@ def _stream_wasm(res: Resolved) -> dict[str, WasmFunction]:
 
     A value-returning one is folded at compile time and never becomes a
     sidecar process, so it takes no part in partitioning: not the process
-    plan, not the pixel-format negotiation, not the external filter list.
+    plan, not the pixel-format negotiation, not the external filter list. A
+    source is also excluded -- it reads no stream and has no `stream_kind` to
+    negotiate; it is wired into the process plan through `module_sources`.
     """
-    return {name: declared for name, declared in res.wasm.items() if not declared.is_value}
+    return {
+        name: declared
+        for name, declared in res.wasm.items()
+        if not declared.is_value and not declared.is_source
+    }
 
 
 def _wire_formats(
@@ -478,7 +484,7 @@ def compile_all(
         ready = [insert_splits(insert_pts_resets(graph)) for graph in graphs]
         budget = _default_timeout(probes)
         stream_wasm = _stream_wasm(res)
-        if not stream_wasm:
+        if not stream_wasm and not ready[0].module_sources:
             return Compiled(graphs=ready, default_timeout=budget)
         try:
             plan = partition(
