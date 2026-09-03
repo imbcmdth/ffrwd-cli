@@ -3029,10 +3029,18 @@ def test_a_row_column_the_schema_never_had_is_still_unknown() -> None:
     assert "unknown column 't.nope'" in err.message
 
 
-def test_only_duration_is_readable_off_an_input_alias() -> None:
-    err = _reject("SELECT f.video[1] FROM input('x.mp4') f WHERE f.t <= f.width - 1")
+def test_a_rendition_column_is_readable_in_a_trim_bound() -> None:
+    """``f.width`` is a rendition column, admitted into the same value
+    grammar a trim bound reads its arithmetic from -- resolve cannot yet say
+    whether ``f`` is a ladder, so it is syntactic here too, same as it is in
+    WHERE and TO; lower's probe is what actually judges it."""
+    _resolve("SELECT f.video[1] FROM input('x.mp4') f WHERE f.t <= f.width - 1")
+
+
+def test_a_non_rendition_column_is_still_unknown_in_a_trim_bound() -> None:
+    err = _reject("SELECT f.video[1] FROM input('x.mp4') f WHERE f.t <= f.bogus - 1")
     assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "unknown column 'f.width'" in err.message
+    assert "unknown column 'f.bogus'" in err.message
 
 
 def test_a_container_tag_types_as_text_in_the_value_grammar() -> None:
@@ -3167,6 +3175,38 @@ def test_array_agg_over_an_unnest_row_is_unchanged() -> None:
         "SELECT array_agg(t) FROM input('f.mkv') f, unnest(f.audio) t"
     )
     assert isinstance(res.branches[0].expressions[0], exp.ArrayAgg)
+
+
+# -- rendition columns in a computed TO destination: the same value grammar
+#    WHERE already admits them into, since a fan-out TO reads a row column
+#    exactly as a WHERE predicate does -------------------------------------
+
+
+def test_a_computed_to_reads_rendition_columns_off_two_input_aliases() -> None:
+    """Recipe 110: a self-join of the rendition table into a computed TO,
+    each alias contributing its own rendition column -- 'v' and 'a' are two
+    input() aliases over the same manifest, and the destination expression
+    reads both."""
+    res = _resolve(
+        "COPY (SELECT v.video[1], a.audio[1] "
+        "FROM input('ladder.m3u8') v, input('ladder.m3u8') a "
+        "WHERE v.height >= 480 AND a.language IS NOT NULL) "
+        "TO ('out-' || v.height::text || 'p-' || a.language || '.mp4')"
+    )
+    assert res.sinks[0].path_expr is not None
+
+
+def test_an_unknown_column_in_to_is_still_refused_the_same_way() -> None:
+    """Widening the value grammar for rendition columns must not widen the
+    rejection for a name that is neither structural nor a rendition one --
+    same message, same hint, as any other unknown column read off an input
+    alias."""
+    err = _reject(
+        "COPY (SELECT v.video[1] FROM input('ladder.m3u8') v) TO (v.mood || '.mp4')"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "unknown column 'v.mood'" in err.message
+    assert "not a track-row table" in (err.hint or "")
 
 
 def test_a_query_nested_too_deeply_is_a_plain_rejection() -> None:

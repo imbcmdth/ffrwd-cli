@@ -861,6 +861,26 @@ def _is_input_column(name: str) -> bool:
     return name in INPUT_COLUMNS or name in RENDITION_COLUMNS or tag_key(name) is not None
 
 
+def _input_rendition_operand(column: exp.Column, scope: dict[str, str]) -> str | None:
+    """A rendition column read off a plain input alias: its static type, or
+    None if `column` is not one.
+
+    Only ffprobe can confirm the alias actually resolved to a rendition
+    table, and that runs after resolve -- so this is a syntactic admission,
+    shared by the WHERE-predicate grammar and the value-expression grammar
+    (CASE, ``||``, a computed ``TO (...)`` destination); a file reading a
+    rendition column is lower's rejection to make, not resolve's.
+    """
+    table_node = column.args.get("table")
+    if table_node is None:
+        return None
+    alias = _ident_name(table_node)
+    name = _ident_name(column.this)
+    if scope.get(alias) == "input" and name in RENDITION_COLUMNS:
+        return _RENDITION_COLUMN_TYPES[name]
+    return None
+
+
 def _is_rendition_conjunct(conjunct: exp.Expr, alias: str) -> bool:
     """True if every column `conjunct` reads off `alias` is a rendition column.
 
@@ -932,16 +952,25 @@ def _is_row_column(node: exp.Expr | None, scope: dict[str, str]) -> bool:
 
 
 def references_row_alias(node: exp.Expr, row_aliases: set[str]) -> bool:
-    """True if `node` reads any column of a track-row table in `row_aliases`.
+    """True if `node` reads any column of a track-row table in `row_aliases`,
+    or a rendition column of a plain input alias.
 
     The fan-out dispatch: a ``TO`` expression that reads one is one file per
-    row, and one that reads none is an ordinary constant path.
+    row, and one that reads none is an ordinary constant path. A rendition
+    column name is admitted, on spec, only on an input alias resolve cannot
+    yet classify as a ladder or a plain file (:data:`RENDITION_COLUMNS`), so
+    its mere presence marks a fan-out here without knowing which one the
+    alias turns out to be -- lower's probe is what actually decides.
     """
     for sub in node.walk():
         if not isinstance(sub, exp.Column):
             continue
         table_node = sub.args.get("table")
-        if table_node is not None and _ident_name(table_node) in row_aliases:
+        if table_node is None:
+            continue
+        if _ident_name(table_node) in row_aliases:
+            return True
+        if _ident_name(sub.this) in RENDITION_COLUMNS:
             return True
     return False
 
@@ -6508,18 +6537,14 @@ class _Resolver:
         """A row-predicate operand's type: a track-row column, or a rendition
         column of a plain input alias.
 
-        Only :meth:`_check_row_predicate` calls this -- the rendition branch
-        is admitted here, and nowhere else :meth:`_row_operand` is called
-        from, because only lower's probe can confirm the alias actually
-        resolved to a rendition table; a file reading a rendition column is
-        lower's rejection to make, not resolve's.
+        The rendition branch is :func:`_input_rendition_operand`, shared with
+        the value-expression grammar (:meth:`_check_value_expr`) so a
+        computed ``TO (...)`` destination admits the same columns a WHERE
+        predicate does.
         """
-        table_node = column.args.get("table")
-        if table_node is not None:
-            alias = _ident_name(table_node)
-            name = _ident_name(column.this)
-            if scope.get(alias) == "input" and name in RENDITION_COLUMNS:
-                return _RENDITION_COLUMN_TYPES[name]
+        rendition_type = _input_rendition_operand(column, scope)
+        if rendition_type is not None:
+            return rendition_type
         return self._row_operand(column, scope, where)
 
     def _row_operand(
@@ -6645,6 +6670,9 @@ class _Resolver:
         if isinstance(value, exp.Null):
             return None
         if isinstance(value, exp.Column):
+            rendition_type = _input_rendition_operand(value, scope)
+            if rendition_type is not None:
+                return rendition_type
             return self._row_operand(value, scope, fallback)
         if isinstance(value, exp.Neg):
             return self._check_numeric(value.this, "negation", value, scope, fallback)

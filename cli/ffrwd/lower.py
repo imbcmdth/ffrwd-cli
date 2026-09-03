@@ -4149,15 +4149,26 @@ class _Lowerer:
         # typed for.
         anchor = raw.branches[0] if raw.branches else exp.Select()
         if self.fanout_expr is not None and self.fanout_env is None:
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL,
-                "a TO expression reads a track-row table this COPY's FROM does "
-                "not bind",
-                expression,
-                fallback=raw.path_node,
-                hint="unnest the rows in the COPY's own FROM, e.g. FROM "
-                "input(:'src') f, unnest(f.audio) t",
-            )
+            # No row relation ever formed for this branch -- ordinarily a
+            # foreign row alias this COPY's own FROM does not bind, but a
+            # rendition column read off a plain (non-ladder) input alias
+            # lands here too, since `_bind_renditions` leaves that alias an
+            # `_InputBinding` with no relation at all. That one has its own,
+            # more specific rejection (the file's own, from `_row_value_of`),
+            # so it is evaluated against the branch's real bindings instead
+            # of raising the generic message below.
+            bound_env = self.sink_env if self.sink_env is not None else _Env()
+            if not self._reads_unbound_rendition_column(expression, bound_env):
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    "a TO expression reads a track-row table this COPY's FROM "
+                    "does not bind",
+                    expression,
+                    fallback=raw.path_node,
+                    hint="unnest the rows in the COPY's own FROM, e.g. FROM "
+                    "input(:'src') f, unnest(f.audio) t",
+                )
+            env = bound_env
         for segment in _computed_segments(expression, set(self.res.row_aliases)):
             self._check_path_segment(segment, env, raw, anchor)
         value = self._eval_value(expression, env, self.fanout_row, anchor)
@@ -4171,6 +4182,22 @@ class _Lowerer:
                 hint="COALESCE the column, or filter the rows that lack it",
             )
         return _tag_text(value)
+
+    def _reads_unbound_rendition_column(self, expression: exp.Expr, env: _Env) -> bool:
+        """True if `expression` reads a rendition column off an input alias
+        `env` binds, but only as a plain `_InputBinding` -- a ladder column
+        resolve admitted on spec, that this alias's own probe turned up no
+        renditions for."""
+        for sub in expression.walk():
+            if not isinstance(sub, exp.Column):
+                continue
+            table_node = sub.args.get("table")
+            if table_node is None:
+                continue
+            binding = env.bindings.get(_fold(table_node))
+            if isinstance(binding, _InputBinding) and _fold(sub.this) in _RENDITION_SCHEMA:
+                return True
+        return False
 
     def _check_path_segment(
         self, segment: exp.Expr, env: _Env, raw: RawSink, anchor: exp.Select
@@ -6931,6 +6958,22 @@ class _Lowerer:
             key = tag_key(name)
             if key is not None:
                 return self._input_tag(binding.alias, key, column, select)
+            if name in _RENDITION_SCHEMA:
+                # Resolve admitted this name on spec (`RENDITION_COLUMNS`),
+                # since only a probe can say whether `alias` is a ladder --
+                # this alias's probe found none, so `_bind_renditions` left
+                # it a plain `_InputBinding` rather than a rendition row
+                # table, and this is that file's own rejection.
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"'{binding.alias}' is a single file, not a ladder: "
+                    f"input('{self._path_of(binding.alias)}') has no renditions",
+                    column,
+                    fallback=select,
+                    hint="rendition columns (bandwidth, width, height, "
+                    "codecs, name, language) read from an HLS master or "
+                    "DASH manifest",
+                )
         if isinstance(binding, _CteBinding):
             return self._cte_value_of(binding, column, rows, select)
         if not isinstance(binding, _RowBinding):  # defensive: resolve checked it

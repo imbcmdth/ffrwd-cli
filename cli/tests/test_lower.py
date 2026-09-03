@@ -7175,6 +7175,136 @@ def test_a_ladder_reaches_a_manifest_destination_as_n_variants() -> None:
     assert maps == ["0:v:0", "0:v:1", "0:a:0", "0:a:1", "0:a:2"]
 
 
+# -- a computed TO reading rendition columns off TWO input aliases: recipe
+#    110's self-join, one video-carrying ladder crossed with one audio-only
+#    ladder, each alias probed separately even though the query names the
+#    same literal path for both (`probes` is keyed by ALIAS, not path) ------
+
+
+def _video_rung_probes() -> dict[str, ProbeResult | None]:
+    lo_v = _track("video", 0, width=1280, height=720)
+    hi_v = _track("video", 1, width=1920, height=1080)
+    return {
+        "v": ProbeResult(
+            streams=[lo_v, hi_v],
+            renditions=[
+                RenditionMeta(
+                    streams=[lo_v], bandwidth=800_000, width=1280, height=720,
+                    codecs="avc1.640020", name="Low", language=None, program_id=1,
+                ),
+                RenditionMeta(
+                    streams=[hi_v], bandwidth=3_000_000, width=1920, height=1080,
+                    codecs="avc1.64002a", name="High", language=None, program_id=2,
+                ),
+            ],
+        )
+    }
+
+
+def _audio_rendition_probes(*, second_language: str | None) -> dict[str, ProbeResult | None]:
+    """Two audio-only renditions -- one language-tagged, one whose
+    ``language`` is `second_language` (a real tag, or NULL to test the
+    NULL-in-a-destination refusal)."""
+    en_a = _track("audio", 0, channels=2, language="en")
+    other_a = _track("audio", 1, channels=2, language=second_language)
+    return {
+        "a": ProbeResult(
+            streams=[en_a, other_a],
+            renditions=[
+                RenditionMeta(
+                    streams=[en_a], bandwidth=128_000, width=None, height=None,
+                    codecs="mp4a.40.2", name="English", language="en", program_id=3,
+                ),
+                RenditionMeta(
+                    streams=[other_a], bandwidth=96_000, width=None, height=None,
+                    codecs="mp4a.40.2", name="Other", language=second_language,
+                    program_id=4,
+                ),
+            ],
+        )
+    }
+
+
+_PAIRING_SQL = (
+    "COPY (SELECT v.video[1], a.audio[1] FROM input('ladder.m3u8') v, "
+    "input('ladder.m3u8') a{where}) "
+    "TO ('out-' || v.height::text || 'p-' || a.language || '.mp4') "
+    "WITH (video_codec 'libx264', audio_codec 'aac')"
+)
+
+
+def test_a_computed_to_pairs_one_video_rung_with_one_audio_rendition() -> None:
+    """WHERE narrows each side to its own single row; the computed TO reads
+    both aliases' rendition columns, evaluated per row exactly as a
+    track-row column already is in a fan-out destination."""
+    probes = {**_video_rung_probes(), **_audio_rendition_probes(second_language="es")}
+    g = _lower(
+        _PAIRING_SQL.format(where=" WHERE v.height = 720 AND a.language = 'en'"),
+        probes,
+    )
+    assert [unit.path for unit in g.sinks] == ["out-720p-en.mp4"]
+    args = build_ffmpeg_args(emit(g), None)
+    maps = [args[i + 1] for i, arg in enumerate(args) if arg == "-map"]
+    assert maps == ["0:v:0", "0:a:0"]
+
+
+def test_a_two_by_two_rendition_self_join_fans_out_four_destinations() -> None:
+    """No WHERE at all: 2 video rungs x 2 audio renditions is 4 pairings, one
+    file each, named per pairing with its own ``-map`` pair."""
+    probes = {**_video_rung_probes(), **_audio_rendition_probes(second_language="es")}
+    g = _lower(_PAIRING_SQL.format(where=""), probes)
+    assert [unit.path for unit in g.sinks] == [
+        "out-720p-en.mp4",
+        "out-720p-es.mp4",
+        "out-1080p-en.mp4",
+        "out-1080p-es.mp4",
+    ]
+    args = build_ffmpeg_args(emit(g), None)
+    maps = [args[i + 1] for i, arg in enumerate(args) if arg == "-map"]
+    assert maps == [
+        "0:v:0", "0:a:0",  # 720p-en
+        "0:v:0", "0:a:1",  # 720p-es
+        "0:v:1", "0:a:0",  # 1080p-en
+        "0:v:1", "0:a:1",  # 1080p-es
+    ]
+
+
+def test_a_null_rendition_column_in_a_destination_refuses_naming_the_row() -> None:
+    """The second audio rendition carries no ``language`` at all: the NULL
+    reaches the destination for its row, and is refused by name rather than
+    written as the literal string 'None'."""
+    probes = {**_video_rung_probes(), **_audio_rendition_probes(second_language=None)}
+    err = _reject_lower(
+        _PAIRING_SQL.format(where=" WHERE v.height = 720 AND a.name = 'Other'"),
+        probes,
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert err.message == (
+        "the TO expression is NULL for this row: 'a.language' was never probed"
+    )
+    assert err.hint == "COALESCE the column, or filter the rows that lack it"
+
+
+def test_a_plain_file_reading_a_rendition_column_in_to_is_refused_the_same_way() -> None:
+    """A computed TO reading a rendition column off a plain (non-ladder)
+    input alias gets the exact same refusal a SELECT column reading one
+    does -- the file's own rejection, not a generic 'does not bind'."""
+    plain = ProbeResult(streams=[_track("video", 0), _track("audio", 0)])
+    err = _reject_lower(
+        "COPY (SELECT v.video[1] FROM input('x.mp4') v) "
+        "TO ('out-' || v.height::text || '.mp4')",
+        {"v": plain},
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert err.message == (
+        "'v' is a single file, not a ladder: input('x.mp4') has no renditions"
+    )
+    assert err.hint == (
+        "rendition columns (bandwidth, width, height, codecs, name, "
+        "language) read from an HLS master or DASH manifest"
+    )
+
+
 def test_a_codecless_stream_is_rejected_before_ffmpeg_can_die_on_it() -> None:
     """A probed stream ffprobe reports NO codec for (a DASH manifest's WebVTT
     AdaptationSets, measured 2026-08-18 on ffmpeg 7.1 through 9.0) cannot be
