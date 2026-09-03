@@ -333,6 +333,22 @@ pub fn fourcc_for_sample_fmt(sample_fmt: &str) -> Option<&'static [u8; 4]> {
         .map(|(_, tag)| *tag)
 }
 
+/// The codec tag ffmpeg gives `codec` in NUT, from the table for `kind`
+/// (`"video"` or `"audio"`) - the muxer's own tag, the first of the aliases
+/// a demuxer also accepts. None for a codec this wire does not carry, or a
+/// `kind` that names neither.
+pub fn fourcc_for_coded(kind: &str, codec: &str) -> Option<&'static [u8; 4]> {
+    let table = match kind {
+        "video" => CODED_VIDEO_FOURCCS,
+        "audio" => CODED_AUDIO_FOURCCS,
+        _ => return None,
+    };
+    table
+        .iter()
+        .find(|(name, _)| *name == codec)
+        .map(|(_, tags)| tags[0])
+}
+
 /// The pixel formats this wire carries, most common first.
 pub fn supported_pix_fmts() -> Vec<&'static str> {
     PIX_FMT_FOURCCS.iter().map(|(name, _)| *name).collect()
@@ -645,5 +661,16 @@ mod tests {
         assert_eq!(fourcc_for_pix_fmt("yuv420p"), Some(b"I420"));
         assert_eq!(fourcc_for_pix_fmt("rgba"), Some(b"RGBA"));
         assert_eq!(fourcc_for_pix_fmt("gray"), None);
+    }
+
+    #[test]
+    fn fourcc_for_coded_reads_the_muxers_own_tag() {
+        assert_eq!(fourcc_for_coded("video", "h264"), Some(b"H264"));
+        assert_eq!(fourcc_for_coded("video", "hevc"), Some(b"HEVC"));
+        assert_eq!(fourcc_for_coded("video", "av1"), Some(b"AV01"));
+        assert_eq!(fourcc_for_coded("audio", "aac"), Some(b"\xff\x00\x00\x00"));
+        assert_eq!(fourcc_for_coded("video", "aac"), None, "wrong kind");
+        assert_eq!(fourcc_for_coded("video", "vp9"), None, "not carried");
+        assert_eq!(fourcc_for_coded("subtitle", "h264"), None, "not a kind");
     }
 }
