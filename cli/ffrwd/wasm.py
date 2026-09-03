@@ -55,6 +55,7 @@ from .processes import (
     AudioFormat,
     ModelBinding,
     ModuleShape,
+    PadMeta,
     SidecarProcess,
 )
 
@@ -1064,16 +1065,34 @@ def _argv(
     `reads` is one path per stream the process is handed, each written as its
     own ``-f nut -i <path>``: stdin for the ordinary one-input process, and a
     named pipe apiece where a SINK reads several. Empty means stdin, which is
-    what a caller with no plan in hand (a describe, a test) gets.
+    what a caller with no plan in hand (a describe, a test) gets. A packet
+    SINK pad carrying rendition metadata (:attr:`SidecarProcess.pads`) gets a
+    ``-pad '<json>'`` right after its own ``-i``, ``{"row": ..., "rendition":
+    {...}}`` with absent attributes omitted -- a pad with none gets no flag.
+
+    A packet SOURCE takes no ``-i`` at all -- `reads` are instead the paths it
+    WRITES, one ``-f nut <pipe>`` per track in catalog order, the mirror of a
+    packet sink's several reads. A source declaring no track is refused: it
+    would have nothing to write.
 
     ``-jobs`` caps the sidecar's worker threads, and is written on every
     sidecar process whenever the run gave one -- the sidecar itself decides
     what each module's lane admits. Absent, the sidecar sizes its pool to
     the machine, so a run at the default carries no ``-jobs`` at all.
     """
+    if process.packet_source and not process.outputs:
+        raise _reject(
+            f"the module '{process.module}' produces no track to write",
+            hint="a source with nothing to write is not one; give it at "
+            "least one track, or drop it from the query",
+        )
     argv = [binary]
-    for path in reads or (STDIN,):
-        argv += ["-f", EDGE_FORMAT, "-i", path]
+    if not process.packet_source:
+        for index, path in enumerate(reads or (STDIN,)):
+            argv += ["-f", EDGE_FORMAT, "-i", path]
+            meta: PadMeta | None = process.pads[index] if index < len(process.pads) else None
+            if meta is not None:
+                argv += ["-pad", json.dumps(meta.to_dict())]
     if jobs is not None:
         argv += [_JOBS_FLAG, str(jobs)]
     if process.reads_rows:
@@ -1090,21 +1109,31 @@ def _argv(
         argv += ["-m", process.module]
         if process.args:
             argv += ["-params", json.dumps(process.args, sort_keys=True)]
-        argv += rows_args(process) or _stream_output(process)
+        argv += rows_args(process) or _stream_output(process, reads)
     if process.writes_rows:
         argv += [_ANNOTATIONS_FLAG, ANNOTATIONS_OUT]
     return argv
 
 
-def _stream_output(process: SidecarProcess) -> list[str]:
+def _stream_output(process: SidecarProcess, writes: Sequence[str] = ()) -> list[str]:
     """The argv tail one mapped stream output takes.
 
     NUT to stdout for a region whose frames feed the next process; a null
     output for a SINK region, whose module consumes its frames and whose
-    effects are the product -- nothing rides its stdout.
+    effects are the product -- nothing rides its stdout. A packet SOURCE
+    writes one ``-f nut <pipe>`` per track instead of the single stdout every
+    other region gets, `writes` naming each in catalog order -- a printed
+    command with none given still numbers them the way a single output's own
+    ``pipe:1`` already does.
     """
     if process.sink:
         return ["-f", _NULL_FORMAT, "-"]
+    if process.packet_source:
+        paths = writes or tuple(f"pipe:{i + 1}" for i in range(len(process.outputs)))
+        argv: list[str] = []
+        for path in paths:
+            argv += ["-f", EDGE_FORMAT, path]
+        return argv
     return ["-f", EDGE_FORMAT, STDOUT]
 
 

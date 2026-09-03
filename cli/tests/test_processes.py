@@ -7,6 +7,8 @@ split-complete, topologically ordered.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from ffrwd.errors import ErrorCode, FfrwdError
@@ -22,6 +24,7 @@ from ffrwd.processes import (
     FfmpegProcess,
     FileEdge,
     ModuleShape,
+    PadMeta,
     ProcessPlan,
     SidecarProcess,
     StreamEdge,
@@ -1467,3 +1470,53 @@ def test_an_unbounded_module_source_joins_the_live_set() -> None:
     """
     assert _quick_leg_bound(bounded=False) > 0
     assert _quick_leg_bound(bounded=True) == 0
+
+
+# ---------------------------------------------------------------- pad metadata
+
+
+def test_pad_meta_round_trips_through_to_dict() -> None:
+    """Every rendition attribute present survives a `to_dict`/`from_dict` trip."""
+    meta = PadMeta(row=1, name="720p", bandwidth=2_500_000, codecs="avc1.64001f", language="en")
+    assert PadMeta.from_dict(meta.to_dict()) == meta
+
+
+def test_pad_meta_with_no_rendition_still_carries_its_row() -> None:
+    """`row` is the only thing a pad must say; the rest is omitted, not null."""
+    meta = PadMeta(row=0)
+    assert meta.to_dict() == {"row": 0, "rendition": {}}
+    assert PadMeta.from_dict(meta.to_dict()) == meta
+
+
+def test_pad_meta_omits_absent_attributes() -> None:
+    """Only the rendition attributes actually named appear in the dict."""
+    meta = PadMeta(row=2, name="1080p")
+    assert meta.to_dict() == {"row": 2, "rendition": {"name": "1080p"}}
+
+
+def test_a_sidecars_pads_are_absent_from_to_dict_by_default() -> None:
+    """Empty `pads` is the ordinary case: no key at all, not an empty list."""
+    sidecar = SidecarProcess(id="sidecar0", module="m.wasm", node="n0", outputs=("video",))
+    assert "pads" not in sidecar.to_dict()
+
+
+def test_a_sidecars_pads_serialize_one_entry_per_pad() -> None:
+    """`None` pads (a plain pad, or a 0.12 module) round-trip as JSON null."""
+    sidecar = SidecarProcess(
+        id="sidecar0",
+        module="m.wasm",
+        node="n0",
+        outputs=("video",),
+        pads=(None, PadMeta(row=1, bandwidth=1_000_000)),
+    )
+    assert sidecar.to_dict()["pads"] == [None, {"row": 1, "rendition": {"bandwidth": 1_000_000}}]
+
+
+def test_pads_play_no_part_in_spellability() -> None:
+    """check_spellable reads `packet_source` and the outputs count only."""
+    plan = partition(_series_graph(), external=external_ids("e0", "e1"))
+    region = plan.sidecars[0]
+    padded = replace(region, pads=(PadMeta(row=0),))
+    check_spellable(
+        replace(plan, processes=tuple(padded if p is region else p for p in plan.processes))
+    )

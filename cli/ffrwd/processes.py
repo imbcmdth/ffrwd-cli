@@ -137,6 +137,7 @@ __all__ = [
     "ModelBinding",
     "ModuleBinding",
     "ModuleShape",
+    "PadMeta",
     "Process",
     "ProcessPlan",
     "RowsEdge",
@@ -569,6 +570,59 @@ class EffectGrant:
 
 
 @dataclass(frozen=True)
+class PadMeta:
+    """What one packet SINK input pad carries about the relation row behind it.
+
+    `row` is which row of the COPY's SELECT this pad's stream came from; the
+    rendition attributes mirror a manifest's own (`RenditionMeta`,
+    `SourceTrack`) -- all optional, absent where nothing named them. This is
+    the shape a ``-pad`` argv flag is JSON for: :meth:`to_dict` and
+    :meth:`from_dict` are that wire format, nested under ``"rendition"`` the
+    way the sidecar reads it, not the flat form `SourceTrack` uses.
+    """
+
+    row: int
+    name: str | None = None
+    bandwidth: int | None = None
+    codecs: str | None = None
+    language: str | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        rendition: dict[str, object] = {}
+        if self.name is not None:
+            rendition["name"] = self.name
+        if self.bandwidth is not None:
+            rendition["bandwidth"] = self.bandwidth
+        if self.codecs is not None:
+            rendition["codecs"] = self.codecs
+        if self.language is not None:
+            rendition["language"] = self.language
+        return {"row": self.row, "rendition": rendition}
+
+    @classmethod
+    def from_dict(cls, d: dict[str, object]) -> PadMeta:
+        raw_row = d["row"]
+        raw_rendition = d.get("rendition")
+        assert isinstance(raw_row, int)
+        rendition = raw_rendition if isinstance(raw_rendition, dict) else {}
+        raw_name = rendition.get("name")
+        raw_bandwidth = rendition.get("bandwidth")
+        raw_codecs = rendition.get("codecs")
+        raw_language = rendition.get("language")
+        assert raw_name is None or isinstance(raw_name, str)
+        assert raw_bandwidth is None or isinstance(raw_bandwidth, int)
+        assert raw_codecs is None or isinstance(raw_codecs, str)
+        assert raw_language is None or isinstance(raw_language, str)
+        return cls(
+            row=int(raw_row),
+            name=raw_name,
+            bandwidth=raw_bandwidth,
+            codecs=raw_codecs,
+            language=raw_language,
+        )
+
+
+@dataclass(frozen=True)
 class SidecarProcess:
     """One REGION of wasm modules the sidecar hosts, reading and writing pipes.
 
@@ -601,6 +655,11 @@ class SidecarProcess:
     which is pure. The sidecar's own scheduler is what acts on purity: an
     impure module's calls run one at a time in order, and a pure one spreads
     across the worker pool, whatever this plan says.
+
+    `pads` is per-input rendition metadata for a packet SINK's several
+    ``-i`` reads, one entry per read in the same order, `None` where a pad
+    carries none. Empty is the ordinary case -- no ``-pad`` flag anywhere,
+    the same argv a 0.12 sink or a single-pad sink already renders.
     """
 
     id: str
@@ -618,6 +677,7 @@ class SidecarProcess:
     lookahead: int = 0
     rows: RowsSink | None = None
     impure: tuple[str, ...] = ()
+    pads: tuple[PadMeta | None, ...] = ()
     # True for a region holding a SINK MODULE: the region consumes its pipes
     # and writes nothing back into the pipeline -- its stream output is a
     # null output, and the module's own effects are the product.
@@ -681,6 +741,8 @@ class SidecarProcess:
             written["sink"] = True
         if self.packet_source:
             written["packet_source"] = True
+        if self.pads:
+            written["pads"] = [None if p is None else p.to_dict() for p in self.pads]
         if self.network and self.graph is not None:
             written["graph"] = self.graph.to_dict()
         return written

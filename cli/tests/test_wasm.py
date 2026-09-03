@@ -38,6 +38,7 @@ from ffrwd.processes import (
     AudioFormat,
     FfmpegProcess,
     ModuleShape,
+    PadMeta,
     SidecarProcess,
     StreamEdge,
     VideoFormat,
@@ -4370,6 +4371,106 @@ def test_an_absent_source_key_is_not_a_source() -> None:
         PACKET_SOURCE_MODULE, {"world": "ffrwd:av@0.13.0", "name": "s"}
     )
     assert described.source is False
+
+
+# -- packet source argv, and per-pad metadata on a packet sink's reads -----
+
+
+def _packet_source(outputs: tuple[str, ...] = ("video", "audio")) -> SidecarProcess:
+    return SidecarProcess(
+        id="sidecar0",
+        module=PACKET_SOURCE_MODULE,
+        node="s",
+        outputs=outputs,
+        packet_source=True,
+    )
+
+
+def test_a_packet_source_writes_one_nut_pipe_per_track_and_no_input() -> None:
+    argv = wasm.shown_argv(_packet_source(), ["p0", "p1"])
+    assert argv == [
+        "ffrwd-wasm",
+        "-m",
+        PACKET_SOURCE_MODULE,
+        "-f",
+        "nut",
+        "p0",
+        "-f",
+        "nut",
+        "p1",
+    ]
+    assert "-i" not in argv
+
+
+def test_a_packet_source_with_no_tracks_is_refused() -> None:
+    with pytest.raises(FfrwdError) as caught:
+        wasm.shown_argv(_packet_source(outputs=()), [])
+    assert PACKET_SOURCE_MODULE in caught.value.message
+    assert "no track to write" in caught.value.message
+
+
+def _packet_sink(reads: int, pads: tuple[PadMeta | None, ...] = ()) -> SidecarProcess:
+    return SidecarProcess(
+        id="sidecar0",
+        module=PACKET_SOURCE_MODULE,
+        node="n0",
+        outputs=("video",),
+        inputs=tuple(f"src:a:v:{i}" for i in range(reads)),
+        sink=True,
+        packet_sink=True,
+        pads=pads,
+    )
+
+
+def test_a_packet_sinks_pads_ride_right_after_their_own_input() -> None:
+    metas = (
+        PadMeta(row=0, name="720p", bandwidth=2_500_000),
+        PadMeta(row=1, name="1080p", bandwidth=5_000_000),
+    )
+    argv = wasm.shown_argv(_packet_sink(2, metas), ["p0", "p1"])
+    assert argv == [
+        "ffrwd-wasm",
+        "-f",
+        "nut",
+        "-i",
+        "p0",
+        "-pad",
+        '{"row": 0, "rendition": {"name": "720p", "bandwidth": 2500000}}',
+        "-f",
+        "nut",
+        "-i",
+        "p1",
+        "-pad",
+        '{"row": 1, "rendition": {"name": "1080p", "bandwidth": 5000000}}',
+        "-m",
+        PACKET_SOURCE_MODULE,
+        "-f",
+        "null",
+        "-",
+    ]
+
+
+def test_a_packet_sinks_reads_with_no_pads_render_todays_argv() -> None:
+    """No `pads` at all -- the shape every sink built before this landed still
+    renders, byte for byte: no `-pad` flag anywhere."""
+    argv = wasm.shown_argv(_packet_sink(2), ["p0", "p1"])
+    assert argv == [
+        "ffrwd-wasm",
+        "-f",
+        "nut",
+        "-i",
+        "p0",
+        "-f",
+        "nut",
+        "-i",
+        "p1",
+        "-m",
+        PACKET_SOURCE_MODULE,
+        "-f",
+        "null",
+        "-",
+    ]
+    assert "-pad" not in argv
 
 
 def test_the_encoder_names_map_to_the_codecs_they_write() -> None:
