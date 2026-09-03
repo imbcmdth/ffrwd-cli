@@ -3555,10 +3555,15 @@ class _Resolver:
         # byte. `ORDER BY`/`LIMIT`/`OFFSET` get one further carve-out GROUP BY
         # does not: a plain `input(...)` alias, since a probe may resolve it
         # to a rendition row table and only lower can tell -- resolve admits
-        # the clauses on spec here, syntactically.
+        # the clauses on spec here, syntactically. `array_agg` takes the same
+        # carve-out, on the same reasoning: a plain `input(...)` alias may
+        # turn out to be a ladder's row table, so its `array_agg(...)` is
+        # admitted as a whole SELECT column here and lower refuses it, with
+        # the file's own rejection, when the probe finds no renditions.
         _normalize_map_paths(select, path_expr)
         _normalize_row_aliases(select, path_expr)
         rows = _has_row_source(select, visible)
+        may_aggregate = rows or _has_input_alias(select)
         if rows:
             self._check_aggregate_context(select, no_aggregate)
         allowed = _SELECT_ALLOWED
@@ -3575,7 +3580,7 @@ class _Resolver:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL, "SELECT has no output column", fallback=select
             )
-        aggregating = rows and no_aggregate is None
+        aggregating = may_aggregate and no_aggregate is None
         for projection in projections:
             # A star projection carries nothing but the star and its qualifier,
             # so there is no expression to check inside it -- and running the

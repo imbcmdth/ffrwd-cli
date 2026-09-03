@@ -3131,6 +3131,44 @@ def test_a_non_rendition_column_in_where_is_still_refused_the_same_way() -> None
     assert "unsupported WHERE predicate" in err.message
 
 
+# -- array_agg over a plain input() alias: the same syntactic carve-out
+#    the rendition columns and ORDER BY/LIMIT/OFFSET get, since only a probe
+#    (after resolve) can say whether the alias is a rendition row table -----
+
+
+def test_array_agg_of_a_rendition_column_resolves_on_a_plain_input_alias() -> None:
+    res = _resolve(
+        "SELECT array_agg(r.video[1]) FROM input('ladder.m3u8') r "
+        "WHERE r.height >= 684"
+    )
+    assert isinstance(res.branches[0].expressions[0], exp.ArrayAgg)
+
+
+def test_array_agg_in_a_non_whole_column_position_is_still_rejected() -> None:
+    """The carve-out is only for `array_agg` AS the SELECT column -- wrapped
+    in another call, over a plain input() alias, it hits the exact same
+    placement rejection an unnest row's `array_agg` does."""
+    err = _reject(
+        "SELECT volume(array_agg(r.video[1]), 0.5) FROM input('ladder.m3u8') r"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert err.message == "array_agg() is only supported as a whole SELECT column"
+    assert err.hint == (
+        "array_agg(...) is a whole SELECT column, or a VARIADIC argument: write "
+        "array_agg(volume(t, 0.5)) or concat(VARIADIC array_agg(t)), not "
+        "volume(array_agg(t), 0.5)"
+    )
+
+
+def test_array_agg_over_an_unnest_row_is_unchanged() -> None:
+    """The pre-existing row source still resolves its whole-column
+    `array_agg` exactly as before the input-alias carve-out."""
+    res = _resolve(
+        "SELECT array_agg(t) FROM input('f.mkv') f, unnest(f.audio) t"
+    )
+    assert isinstance(res.branches[0].expressions[0], exp.ArrayAgg)
+
+
 def test_a_query_nested_too_deeply_is_a_plain_rejection() -> None:
     """Deep nesting is user input, not a bug: a typed, non-internal error
     with a plain message, at whichever layer the recursion limit bites."""
