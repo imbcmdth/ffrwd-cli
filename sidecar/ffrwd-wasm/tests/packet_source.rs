@@ -90,9 +90,28 @@ const EXPECTED: &[(i64, Option<i64>, bool)] = &[
 ];
 
 const EXPECTED_EXTRADATA: &[u8] = &[
-    0x00, 0x00, 0x00, 0x01, 0x67, 0x64, 0x00, 0x0a, 0xac, 0xd9, 0x44, 0x7b, 0x01, 0x10, 0x00, 0x00,
-    0x00, 0x01, 0x68, 0xeb, 0xe3, 0xcb, 0x22, 0xc0,
+    0x00, 0x00, 0x00, 0x01, 0x67, 0x64, 0x00, 0x0a, 0xac, 0xd9, 0x49, 0x7e, 0x5c, 0x04, 0x40, 0x00,
+    0x00, 0x03, 0x00, 0x40, 0x00, 0x00, 0x0c, 0x83, 0xc4, 0x89, 0x65, 0x80, 0x00, 0x00, 0x00, 0x01,
+    0x68, 0xef, 0x8f, 0x2c, 0x8b,
 ];
+
+/// `RAW` is the module's own checked-in fixture, `sidecar/modules/source-
+/// replay/src/generated/packets.bin` (built by `cli/scripts/
+/// gen_replay_packets.py`) - extradata followed by the seven packets' coded
+/// bytes, back to back. Reading the exact same file the module `include!`s
+/// keeps this test from re-typing over a kilobyte of coded video by hand;
+/// `EXTRADATA_LEN` and `PACKET_LENS` are the small facts that describe how
+/// to slice it, pinned the same way `EXPECTED` and `EXPECTED_EXTRADATA` are.
+const RAW: &[u8] = include_bytes!("../../modules/source-replay/src/generated/packets.bin");
+const EXTRADATA_LEN: usize = 37;
+const PACKET_LENS: &[usize] = &[1077, 12, 12, 12, 13, 14, 12];
+
+/// The real coded bytes for packet `index`, decode order, sliced out of
+/// `RAW` the same way the module itself slices it.
+fn expected_packet_bytes(index: usize) -> &'static [u8] {
+    let start = EXTRADATA_LEN + PACKET_LENS[..index].iter().sum::<usize>();
+    &RAW[start..start + PACKET_LENS[index]]
+}
 
 #[test]
 fn a_packet_source_refuses_an_input() {
@@ -249,8 +268,8 @@ fn a_run_writes_back_exactly_the_packets_the_module_published() {
         assert_eq!(dts, want_dts, "packet {index} dts");
         assert_eq!(keyframe, want_keyframe, "packet {index} keyframe");
         assert_eq!(
-            data,
-            &vec![0x10u8.wrapping_add(index as u8); 24],
+            data.as_slice(),
+            expected_packet_bytes(index),
             "packet {index} data"
         );
     }
