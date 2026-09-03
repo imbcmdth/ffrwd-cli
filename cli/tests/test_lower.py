@@ -12755,6 +12755,38 @@ def test_a_computed_ladder_names_its_rows_by_height() -> None:
     assert names == ["360p", "720p"]
 
 
+_DEMUXED_INTO_SINK = (
+    "COPY (WITH vid AS (SELECT scale(f.video[1], ARRAY[1280, 640][i.i], -2) AS v, "
+    "i.i AS rung FROM input('a.mp4') f, generate_series(1, 2) i), "
+    "aud AS (SELECT a AS t, 2 + a.index AS rung FROM input('a.mp4') g, unnest(g.audio) a) "
+    "SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) "
+    "TO publish('relay', 'live') WITH (video_bitrate {rates}[vid.rung], audio_bitrate '128k')"
+)
+
+
+def _two_alias_probes() -> dict[str, ProbeResult | None]:
+    """One file with a video and an audio track, read under two aliases."""
+    probe = ProbeResult(
+        streams=[_track("video", 0, width=1920, height=1080), _track("audio", 0)]
+    )
+    return {"f": probe, "g": probe}
+
+
+def test_a_per_row_option_binds_to_the_rows_that_carry_its_kind() -> None:
+    """The demuxed relation is three rows -- two video rungs and one audio
+    row -- and a per-row video option read over all three binds to the two
+    video pads, as it does at a manifest destination."""
+    g = _row_sink_graph(
+        _DEMUXED_INTO_SINK.format(rates="ARRAY['800k', '300k']"),
+        _two_alias_probes(),
+    )
+    node_id = next(iter(g.packet_sinks))
+    pads = g.packet_sinks[node_id]
+    assert [pad["row"] for pad in pads] == [0, 1, 2]
+    assert [pad.get("video_bitrate") for pad in pads] == ["800k", "300k", None]
+    assert pads[2]["audio_bitrate"] == "128k"
+
+
 def test_an_unmodified_source_stream_copies_onto_the_sink() -> None:
     """A ``src:`` cell in a codec the sink already accepts (h264/aac) copies
     instead of paying for an encode nothing asked for."""

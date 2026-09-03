@@ -3006,6 +3006,9 @@ class _Lowerer:
         # sink's pads in. Read there to fold `row`/`rendition` into each
         # pad's dict; empty for the old, stream-parameter sink form.
         self.row_reading_sink_pads: dict[str, list[dict[str, object]]] = {}
+        # The same sinks' rows, for cutting a per-row option list to the rows
+        # that carry the option's kind.
+        self.row_reading_sink_rows: dict[str, list[_VariantRow]] = {}
 
     # -- entry point ------------------------------------------------------
 
@@ -3302,8 +3305,14 @@ class _Lowerer:
             scopes = ("video", "audio") if "audio" in declared.stream_kinds else ("video",)
         options = self._packet_sink_options(declared, raw, scopes)
         for node in sink_nodes:
+            per_node = dict(options)
+            rows = self.row_reading_sink_rows.get(node)
+            if rows is not None:
+                # A per-row value was read over every row; the pads of its
+                # kind are the rows that carry one, as at a manifest.
+                _compress_manifest_lists(per_node, rows)
             self.graph.packet_sinks[node] = self._packet_sink_pads(
-                node, options, raw, declared, described
+                node, per_node, raw, declared, described
             )
             if described.rows_schema is not None:
                 # The rows are the sink's product, and no path names a home
@@ -3327,9 +3336,10 @@ class _Lowerer:
         the pads of the option's OWN kind, since a video option says nothing
         about an audio pad standing beside them.
 
-        A pad whose option was left at its default AND whose stream is an
-        unmodified probed one the sink already accepts copies instead of
-        re-encoding (:meth:`_copies_onto_sink`); a row-reading sink's pads
+        A pad of a kind the WITH wrote no option for, whose stream is an
+        unmodified probed one the sink already accepts, copies instead of
+        re-encoding (:meth:`_copies_onto_sink`) -- a written encoder option
+        of that kind is a request to encode; a row-reading sink's pads
         also carry `row` and `rendition` (:attr:`row_reading_sink_pads`),
         empty for the old, stream-parameter form.
         """
@@ -3365,11 +3375,9 @@ class _Lowerer:
                 for name, value in options.items()
                 if SINK_OPTIONS[name].scope == kind
             }
-            codec_option = f"{kind}_codec"
-            if codec_option not in written and self._copies_onto_sink(
-                inputs[position], kind, described
-            ):
-                pad = {codec_option: COPY_CODEC}
+            asked = any(SINK_OPTIONS[name].scope == kind for name in written)
+            if not asked and self._copies_onto_sink(inputs[position], kind, described):
+                pad = {f"{kind}_codec": COPY_CODEC}
             if row_meta is not None:
                 meta = row_meta[position]
                 pad["row"] = meta["row"]
@@ -10755,6 +10763,7 @@ class _Lowerer:
             [pads[0].type],
         )
         self.row_reading_sink_pads[ref] = meta
+        self.row_reading_sink_rows[ref] = rows
         self.graph.module_sinks.append(ref)
         return _Value(type=pads[0].type, streams=(), is_array=False)
 
