@@ -84,6 +84,7 @@ from .project import (
     held_links,
     is_package_name,
     link_target,
+    link_written,
     links_path,
     name_refusal,
     read_linksfile,
@@ -1275,9 +1276,9 @@ def _write_lockfile_migrating(
     if carried:
         beside = links_path(lock)
         held = list(read_linksfile(beside))
-        known = {link_target(entry, beside) or entry.path for entry in held}
+        known = {link_target(entry, beside) or link_written(entry) for entry in held}
         for entry in carried:
-            if (link_target(entry, lock) or entry.path) not in known:
+            if (link_target(entry, lock) or link_written(entry)) not in known:
                 held.append(entry)
         write_linksfile(beside, held)
     write_lockfile(

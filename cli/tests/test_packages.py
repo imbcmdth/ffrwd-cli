@@ -934,14 +934,15 @@ def test_bare_install_leaves_a_dependency_that_is_linked_to_a_directory(
 ) -> None:
     """A link is how a dependency nobody has published yet is worked against."""
     monkeypatch.setenv(packages.REGISTRY_ENV, str(registry))
-    _package(tmp_path / "dev")  # the dependency, in a working tree and nowhere else
+    dev = _package(tmp_path / "dev")  # the dependency, in a working tree and nowhere else
     project = _package(
         tmp_path / "work",
         name="consumer/mine",
         dependencies={"broadcast/tracks": "1.0.0"},
     )
     write_lockfile(project / "ffrwd.lock", [])
-    assert _run(project, monkeypatch, capsys, "link", "../dev")[0] == 0
+    assert _run(dev, monkeypatch, capsys, "link")[0] == 0
+    assert _run(project, monkeypatch, capsys, "link", "broadcast/tracks")[0] == 0
 
     code, out, err = _run(project, monkeypatch, capsys, "install")
     assert code == 0, err
@@ -951,7 +952,7 @@ def test_bare_install_leaves_a_dependency_that_is_linked_to_a_directory(
     assert held.entries == (), "nothing was fetched over the link"
     assert held.dependencies == {}, "nothing was pinned to a published version"
     assert read_linksfile(links_path(project / "ffrwd.lock")) == (
-        LinkEntry(path="../dev"),
+        LinkEntry(name="broadcast/tracks"),
     ), "the link survived the install"
 
     code, out, _err = _run(

@@ -26,7 +26,7 @@ from pathlib import Path
 
 import pytest
 
-from ffrwd import cli, store, wasm
+from ffrwd import cli, packages, store, wasm
 from ffrwd.compiler import compile_commands, compile_sql, compile_table_sql
 from ffrwd.emit import build_ffmpeg_args, emit
 from ffrwd.errors import ErrorCode, FfrwdError
@@ -52,6 +52,8 @@ from ffrwd.project import (
     write_manifest,
 )
 from ffrwd.warnings import FfrwdWarning, WarningCode
+
+from .test_packages import _publish
 
 QUIETER = (
     "CREATE FUNCTION quieter(track audio_stream, factor number) RETURNS audio_stream AS $$\n"
@@ -1239,6 +1241,19 @@ def _link(directory: Path) -> dict[str, object]:
     return {"kind": "link", "path": str(directory)}
 
 
+def _registered(directory: Path) -> Path:
+    """Record `directory`'s package in the machine-wide links file, and return that file.
+
+    The state bare `ffrwd link` run in `directory` leaves behind, minus the
+    install -- for tests that exercise reading the record, not writing it.
+    """
+    machine = links_path(store.global_lock_path())
+    name = read_manifest(directory / "ffrwd.json").name
+    held = read_linksfile(machine)
+    write_linksfile(machine, [*held, LinkEntry(path=str(directory.resolve()), name=name)])
+    return machine
+
+
 def _lock(
     directory: Path,
     entries: list[dict[str, object]],
@@ -1838,7 +1853,7 @@ def test_a_linked_tree_that_drifts_uninstalled_refuses_at_resolution(
     store_home: Path, tmp_path: Path
 ) -> None:
     """A dependency added to the linked manifest after linking, never installed
-    there: the next resolution refuses, naming the install to run."""
+    there: the next resolution refuses, naming the re-link that installs it."""
     linked = _library(tmp_path / "dev", "studio", "0.5", package="pipe")
     project = tmp_path / "work"
     _linked_consumer(project, linked)
@@ -1848,7 +1863,7 @@ def test_a_linked_tree_that_drifts_uninstalled_refuses_at_resolution(
     drifted["dependencies"] = {"shared/d": "1.0.0"}
     (linked / "ffrwd.json").write_text(json.dumps(drifted) + "\n", encoding="utf-8")
     refused = _refuses(project, "depends on 'shared/d@1.0.0'")
-    assert refused.hint is not None and "ffrwd install" in refused.hint
+    assert refused.hint is not None and "run `ffrwd link` in its directory again" in refused.hint
 
 
 def test_a_linked_package_may_rename_itself_without_a_re_link(tmp_path: Path) -> None:
@@ -3039,30 +3054,38 @@ def test_init_rust_refuses_to_overwrite_any_file_it_would_write(
 # ---------------------------------------------------------------------------
 
 
-def test_link_records_the_directory_and_leaves_the_lockfile_byte_identical(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+def test_link_by_name_records_it_and_leaves_the_lockfile_byte_identical(
+    store_home: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    _library(tmp_path / "dev", "tracks", "0.5")
+    linked = _library(tmp_path / "dev", "tracks", "0.5")
+    _registered(linked)
     project = tmp_path / "work"
     _project(project, files={"src/own.sql": NORMALIZE})
     lock = _lock(project, [])
     before = lock.read_text(encoding="utf-8")
-    code, out, _err = _run(project, monkeypatch, capsys, "link", "../dev")
+    code, out, _err = _run(project, monkeypatch, capsys, "link", "tracks/lib")
     assert code == 0
-    assert "linked tracks/lib -> ../dev" in out
+    assert "linked tracks/lib -> " in out
     assert "ffrwd.links" in out
     assert lock.read_text(encoding="utf-8") == before, "the lockfile is everyone's"
-    assert read_linksfile(links_path(lock)) == (LinkEntry(path="../dev"),)
+    assert read_linksfile(links_path(lock)) == (LinkEntry(name="tracks/lib"),)
 
 
-def test_a_linked_package_is_callable_right_after_linking(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+def test_a_linked_package_is_callable_right_after_the_two_link_commands(
+    store_home: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    _library(tmp_path / "dev", "tracks", "0.5")
+    dev = _library(tmp_path / "dev", "tracks", "0.5")
+    assert _run(dev, monkeypatch, capsys, "link")[0] == 0
     project = tmp_path / "work"
     _project(project, files={"src/own.sql": NORMALIZE})
     _lock(project, [])
-    assert _run(project, monkeypatch, capsys, "link", "../dev")[0] == 0
+    assert _run(project, monkeypatch, capsys, "link", "tracks/lib")[0] == 0
     code, out, err = _run(
         project, monkeypatch, capsys, "compile", QUERY.format(call="tracks.lib.quieter")
     )
@@ -3087,12 +3110,12 @@ def test_link_answers_over_an_installed_package_and_the_pin_stays(
     entry = _installed(_library(tmp_path / "far", "tracks", "0.5", version="2.0.0"))
     lock = _lock(project, [entry], dependencies={"tracks/lib": "2.0.0"})
     before = lock.read_text(encoding="utf-8")
-    _library(tmp_path / "dev", "tracks", "0.9")
-    code, out, _err = _run(project, monkeypatch, capsys, "link", "../dev")
+    _registered(_library(tmp_path / "dev", "tracks", "0.9"))
+    code, out, _err = _run(project, monkeypatch, capsys, "link", "tracks/lib")
     assert code == 0
     assert "over the installed tracks/lib 2.0.0, which stays pinned" in out
     assert lock.read_text(encoding="utf-8") == before
-    assert read_linksfile(links_path(lock)) == (LinkEntry(path="../dev"),)
+    assert read_linksfile(links_path(lock)) == (LinkEntry(name="tracks/lib"),)
 
     code, out, _err = _run(
         project, monkeypatch, capsys, "compile", QUERY.format(call="tracks.lib.quieter")
@@ -3134,10 +3157,11 @@ def test_a_linked_recipe_resolves_through_the_linked_trees_own_lockfile(
         + "\n",
     )
     _lock(linked, [dep], dependencies={"shared/d": "1.0.0"})
+    _registered(linked)
     project = tmp_path / "work"
     _project(project, files={"src/own.sql": NORMALIZE})
     lock = _lock(project, [])
-    assert _run(project, monkeypatch, capsys, "link", "../dev")[0] == 0
+    assert _run(project, monkeypatch, capsys, "link", "studio/pipe")[0] == 0
     before = lock.read_text(encoding="utf-8")
 
     code, out, err = _run(
@@ -3148,47 +3172,169 @@ def test_a_linked_recipe_resolves_through_the_linked_trees_own_lockfile(
     assert lock.read_text(encoding="utf-8") == before, "nothing was installed here"
 
 
-def test_link_outside_a_project_names_both_ways_forward(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    _library(tmp_path / "dev", "tracks", "0.5")
-    bare = tmp_path / "elsewhere"
-    bare.mkdir()
-    code, _out, err = _run(bare, monkeypatch, capsys, "link", "../dev")
-    assert code == 2
-    assert "ffrwd init" in err and "link -g" in err
-    assert not (bare / "ffrwd.lock").exists()
-
-
-def test_link_writes_the_machine_wide_links_file(
+def test_link_by_name_outside_a_project_is_a_usage_error(
     store_home: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    linked = _library(tmp_path / "dev", "tracks", "0.5")
+    _registered(_library(tmp_path / "dev", "tracks", "0.5"))
     bare = tmp_path / "elsewhere"
     bare.mkdir()
-    code, _out, _err = _run(bare, monkeypatch, capsys, "link", "-g", str(linked))
-    assert code == 0
-    held = read_linksfile(links_path(store.global_lock_path()))
-    # Absolute, since the machine-wide links file lives under the cache directory.
-    assert held == (LinkEntry(path=str(linked.resolve())),)
-    # No lockfile is invented beside it.
+    code, _out, err = _run(bare, monkeypatch, capsys, "link", "tracks/lib")
+    assert code == 2
+    assert "ffrwd init" in err
+    assert not (bare / "ffrwd.lock").exists()
+
+
+def test_link_in_the_package_directory_installs_and_records_it_machine_wide(
+    store_home: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Bare `ffrwd link`, npm's first phase: the package's own install runs
+    here -- its lockfile, the shared store -- and the machine-wide links file
+    gains name -> directory. No consumer is involved anywhere."""
+    registry = tmp_path / "registry"
+    registry.mkdir()
+    monkeypatch.setenv(packages.REGISTRY_ENV, str(registry))
+    _publish(registry, _library(tmp_path / "pub", "shared", "0.25", package="d"))
+    dev = _library(
+        tmp_path / "dev", "studio", "0.5", package="pipe", dependencies={"shared/d": "1.0.0"}
+    )
+
+    code, out, err = _run(dev, monkeypatch, capsys, "link")
+    assert code == 0, err
+    assert "installed what studio/pipe 1.0.0 needs in" in out
+    assert "fetched: shared/d 1.0.0" in out
+    assert "linked studio/pipe -> " in out and "ffrwd.links" in out
+    own = read_lockfile(dev / "ffrwd.lock")
+    assert own.dependencies == {"shared/d": "1.0.0"}
+    assert [
+        (entry.name, entry.version)
+        for entry in own.entries
+        if isinstance(entry, RegistryEntry)
+    ] == [("shared/d", "1.0.0")]
+    machine = links_path(store.global_lock_path())
+    held = read_linksfile(machine)
+    assert [(entry.name, entry.path) for entry in held] == [
+        ("studio/pipe", str(dev.resolve()))
+    ]
+    # No machine-wide lockfile is invented beside the record.
     assert not store.global_lock_path().exists()
 
+    # Run again: the install answers cheaply, the record replaces, never stacks.
+    code, out, _err = _run(dev, monkeypatch, capsys, "link")
+    assert code == 0
+    assert "all dependencies were already pinned" in out
+    assert read_linksfile(machine) == held
 
-def test_link_refuses_a_directory_holding_no_manifest(
+
+def test_a_failed_link_records_nothing_machine_wide(
+    store_home: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The package's own install cannot reach the registry: install's typed
+    error, and neither its lockfile nor the machine-wide record appears."""
+    dev = _library(
+        tmp_path / "dev", "studio", "0.5", package="pipe", dependencies={"shared/d": "1.0.0"}
+    )
+    code, _out, err = _run(dev, monkeypatch, capsys, "link")
+    assert code == 1
+    assert "there is no such directory" in err  # conftest points the registry nowhere
+    assert not (dev / "ffrwd.lock").exists()
+    assert not links_path(store.global_lock_path()).exists()
+
+
+def test_bare_link_outside_a_package_is_a_usage_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    (tmp_path / "dev").mkdir()
+    bare = tmp_path / "elsewhere"
+    bare.mkdir()
+    code, _out, err = _run(bare, monkeypatch, capsys, "link")
+    assert code == 2
+    assert "no ffrwd.json" in err
+    assert "in the package's directory" in err
+
+
+def test_link_refuses_a_directory_path(
+    store_home: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The consumer names packages, never directories: the 0.6.1 spelling is
+    refused with the two commands that replace it."""
+    _library(tmp_path / "dev", "tracks", "0.5")
     project = tmp_path / "work"
     _project(project, files={"src/own.sql": NORMALIZE})
-    _lock(project, [])
+    lock = _lock(project, [])
     code, _out, err = _run(project, monkeypatch, capsys, "link", "../dev")
     assert code == 1
-    assert "holds no ffrwd.json" in err
-    assert read_lockfile(project / "ffrwd.lock").entries == ()
+    assert "'../dev' is not a package name" in err
+    assert "linking is two commands" in err
+    assert not links_path(lock).exists()
+
+
+def test_link_refuses_a_name_nothing_on_this_machine_links(
+    store_home: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project = tmp_path / "work"
+    _project(project, files={"src/own.sql": NORMALIZE})
+    lock = _lock(project, [])
+    code, _out, err = _run(project, monkeypatch, capsys, "link", "tracks/lib")
+    assert code == 1
+    assert "nothing on this machine links 'tracks/lib'" in err
+    assert "run `ffrwd link` in the package's directory first" in err
+    assert not links_path(lock).exists()
+
+
+def test_link_g_is_refused_with_the_two_phase_hint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    linked = _library(tmp_path / "dev", "tracks", "0.5")
+    code, _out, err = _run(tmp_path, monkeypatch, capsys, "link", "-g", str(linked))
+    assert code == 2
+    assert "-g is retired" in err
+    assert "linking is two commands" in err
+
+
+def test_relinking_from_a_new_directory_repoints_every_consumer(
+    store_home: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """npm's indirection: consumers record the name, the machine-wide file
+    records the directory, so phase 1 run somewhere new re-points them all."""
+    first = _library(tmp_path / "one", "tracks", "0.5")
+    assert _run(first, monkeypatch, capsys, "link")[0] == 0
+    consumers = (tmp_path / "a", tmp_path / "b")
+    for consumer in consumers:
+        _project(consumer, files={"src/own.sql": NORMALIZE})
+        _lock(consumer, [])
+        assert _run(consumer, monkeypatch, capsys, "link", "tracks/lib")[0] == 0
+        code, out, _err = _run(
+            consumer, monkeypatch, capsys, "compile", QUERY.format(call="tracks.lib.quieter")
+        )
+        assert code == 0 and "volume=volume=0.5" in out
+
+    moved = _library(tmp_path / "two", "tracks", "0.9")
+    assert _run(moved, monkeypatch, capsys, "link")[0] == 0
+    for consumer in consumers:
+        code, out, _err = _run(
+            consumer, monkeypatch, capsys, "compile", QUERY.format(call="tracks.lib.quieter")
+        )
+        assert code == 0 and "volume=volume=0.9" in out, "the record re-pointed this consumer"
+        assert read_linksfile(links_path(consumer / "ffrwd.lock")) == (
+            LinkEntry(name="tracks/lib"),
+        )
 
 
 def test_unlink_removes_the_entry_by_package_name(
@@ -3266,10 +3412,11 @@ def test_unlink_removes_only_the_record(
 ) -> None:
     """The links file loses the record; the lockfile and the linked tree do not move."""
     linked = _library(tmp_path / "dev", "tracks", "0.5")
+    _registered(linked)
     project = tmp_path / "work"
     _project(project, files={"src/own.sql": NORMALIZE})
     lock = _lock(project, [_installed(_library(tmp_path / "far", "other", "0.5"))])
-    assert _run(project, monkeypatch, capsys, "link", "../dev")[0] == 0
+    assert _run(project, monkeypatch, capsys, "link", "tracks/lib")[0] == 0
     before = lock.read_text(encoding="utf-8")
 
     code, out, _err = _run(project, monkeypatch, capsys, "unlink", "tracks/lib")
@@ -3278,57 +3425,150 @@ def test_unlink_removes_only_the_record(
     assert lock.read_text(encoding="utf-8") == before
     assert not links_path(lock).exists(), "the last link removes the file itself"
     assert (linked / MANIFEST_NAME).is_file(), "the linked tree is not touched"
+    held = read_linksfile(links_path(store.global_lock_path()))
+    assert [entry.name for entry in held] == ["tracks/lib"], "the machine-wide record stays"
 
 
-def test_link_refuses_a_package_that_has_not_installed_its_dependencies(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+def test_bare_unlink_in_the_package_directory_removes_the_machine_record(
+    store_home: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """No auto-install: the linked tree must have run `ffrwd install` itself.
+    dev = _library(tmp_path / "dev", "tracks", "0.5")
+    assert _run(dev, monkeypatch, capsys, "link")[0] == 0
+    code, out, _err = _run(dev, monkeypatch, capsys, "unlink")
+    assert code == 0
+    assert "unlinked 'tracks/lib'" in out
+    assert not links_path(store.global_lock_path()).exists()
 
-    Two refusals, one per state of the linked tree: no lockfile at all, and a
-    lockfile that does not pin what the manifest asks. Both leave the
-    consumer's files untouched.
-    """
-    linked = _library(
-        tmp_path / "dev", "studio", "0.5", package="pipe", dependencies={"shared/d": "1.0.0"}
+    code, _out, err = _run(dev, monkeypatch, capsys, "unlink")
+    assert code == 1
+    assert "nothing on this machine links 'tracks/lib'" in err
+
+
+def test_unlink_g_removes_the_machine_record_by_name_from_anywhere(
+    store_home: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The phase-one inverse addressable by name -- how a record whose
+    directory is already gone gets cleaned up."""
+    dev = _library(tmp_path / "dev", "tracks", "0.5")
+    _registered(dev)
+    shutil.rmtree(dev)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+
+    code, _out, err = _run(elsewhere, monkeypatch, capsys, "unlink", "-g")
+    assert code == 2
+    assert "-g needs a package name" in err
+
+    code, out, _err = _run(elsewhere, monkeypatch, capsys, "unlink", "-g", "tracks/lib")
+    assert code == 0
+    assert "unlinked 'tracks/lib'" in out
+    assert not links_path(store.global_lock_path()).exists()
+
+
+def test_a_consumer_record_whose_machine_link_is_gone_refuses(
+    store_home: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Bare unlink in the package directory, then a compile in a consumer that
+    recorded the name: typed, naming the way back."""
+    dev = _library(tmp_path / "dev", "tracks", "0.5")
+    assert _run(dev, monkeypatch, capsys, "link")[0] == 0
+    project = tmp_path / "work"
+    _project(project, files={"src/own.sql": NORMALIZE})
+    _lock(project, [])
+    assert _run(project, monkeypatch, capsys, "link", "tracks/lib")[0] == 0
+    assert _run(dev, monkeypatch, capsys, "unlink")[0] == 0
+
+    code, _out, err = _run(
+        project, monkeypatch, capsys, "compile", QUERY.format(call="tracks.lib.quieter")
     )
+    assert code == 1
+    assert "link 'tracks/lib': nothing on this machine links it" in err
+    assert "run `ffrwd link` in the package's directory again" in err
+
+
+def test_a_registration_whose_directory_is_gone_refuses_naming_it(
+    store_home: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    dev = _library(tmp_path / "dev", "tracks", "0.5")
+    _registered(dev)
+    project = tmp_path / "work"
+    _project(project, files={"src/own.sql": NORMALIZE})
+    _lock(project, [])
+    assert _run(project, monkeypatch, capsys, "link", "tracks/lib")[0] == 0
+    shutil.rmtree(dev)
+
+    code, _out, err = _run(
+        project, monkeypatch, capsys, "compile", QUERY.format(call="tracks.lib.quieter")
+    )
+    assert code == 1
+    assert "link 'tracks/lib'" in err and "holds no ffrwd.json" in err
+    assert str(dev.resolve()) in err
+
+
+def test_a_write_migrates_a_path_record_whose_package_is_linked_machine_wide(
+    store_home: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A 0.6.1 consumer entry named a directory. It keeps resolving as
+    written, and the next write of the file re-records it by name once the
+    machine-wide file links the package."""
+    dev = _library(tmp_path / "dev", "tracks", "0.5")
     project = tmp_path / "work"
     _project(project, files={"src/own.sql": NORMALIZE})
     lock = _lock(project, [])
-    before = lock.read_text(encoding="utf-8")
+    write_linksfile(links_path(lock), [LinkEntry(path=str(dev))])
+    assert read_linksfile(links_path(lock)) == (LinkEntry(path=str(dev)),), (
+        "unregistered, the path entry stays a path entry"
+    )
+    code, out, _err = _run(
+        project, monkeypatch, capsys, "compile", QUERY.format(call="tracks.lib.quieter")
+    )
+    assert code == 0 and "volume=volume=0.5" in out, "the 0.6.1 record still resolves"
 
-    code, _out, err = _run(project, monkeypatch, capsys, "link", "../dev")
-    assert code == 1
-    assert "depends on 'shared/d@1.0.0' and it has no ffrwd.lock" in err
-    assert "run `ffrwd install`" in err
-
-    _lock(linked, [])
-    code, _out, err = _run(project, monkeypatch, capsys, "link", "../dev")
-    assert code == 1
-    assert "its own ffrwd.lock does not pin it" in err
-    assert "run `ffrwd install`" in err
-
-    assert lock.read_text(encoding="utf-8") == before
-    assert not links_path(lock).exists()
+    _registered(dev)
+    _registered(_library(tmp_path / "other", "broadcast", "0.25"))
+    assert _run(project, monkeypatch, capsys, "link", "broadcast/lib")[0] == 0
+    assert read_linksfile(links_path(lock)) == (
+        LinkEntry(name="tracks/lib"),
+        LinkEntry(name="broadcast/lib"),
+    )
 
 
 def test_link_and_unlink_migrate_old_lockfile_entries_into_the_links_file(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    store_home: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """A link an older ffrwd wrote into the lockfile moves over on the next write."""
+    """A link an older ffrwd wrote into the lockfile moves over on the next
+    write -- staying a path, its package being linked nowhere machine-wide."""
     old = _library(tmp_path / "old", "tracks", "0.5")
-    _library(tmp_path / "new", "broadcast", "0.25")
+    _registered(_library(tmp_path / "new", "broadcast", "0.25"))
     project = tmp_path / "work"
     _project(project, files={"src/own.sql": NORMALIZE})
     lock = _lock(project, [_link(old)])
 
-    code, _out, _err = _run(project, monkeypatch, capsys, "link", "../new")
+    code, _out, _err = _run(project, monkeypatch, capsys, "link", "broadcast/lib")
     assert code == 0
     held = read_lockfile(lock)
     assert held.entries == () and held.reproducible is True
     assert read_linksfile(links_path(lock)) == (
         LinkEntry(path=str(old)),
-        LinkEntry(path="../new"),
+        LinkEntry(name="broadcast/lib"),
     )
 
     # Both still resolve, and unlinking the migrated one leaves the other.
@@ -3337,7 +3577,7 @@ def test_link_and_unlink_migrate_old_lockfile_entries_into_the_links_file(
     )
     assert code == 0 and "volume=volume=0.5" in out
     assert _run(project, monkeypatch, capsys, "unlink", "tracks/lib")[0] == 0
-    assert read_linksfile(links_path(lock)) == (LinkEntry(path="../new"),)
+    assert read_linksfile(links_path(lock)) == (LinkEntry(name="broadcast/lib"),)
 
 
 # ---------------------------------------------------------------------------

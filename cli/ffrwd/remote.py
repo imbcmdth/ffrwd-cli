@@ -73,6 +73,7 @@ from ffrwd.project import (
     entry_root,
     find_lockfile,
     held_links,
+    link_written,
     lockfile_text,
     read_lockfile,
     read_manifest,
@@ -559,7 +560,7 @@ def _link_root(entry: LinkEntry, lock_path: Path) -> Path:
         return entry_root(entry, lock_path)
     except FfrwdError as err:
         raise _reject(
-            f"the link to {entry.path} could not be read: {err.message}",
+            f"the link to {link_written(entry)} could not be read: {err.message}",
             "a linked package travels as bytes, so its directory has to be "
             "readable; unlink it, or run without --remote",
         ) from err
@@ -625,7 +626,7 @@ def _link_manifest(entry: LinkEntry, root: Path) -> Package:
         return read_manifest(root / MANIFEST_NAME)
     except FfrwdError as err:
         raise _reject(
-            f"the link to {entry.path} could not be read: {err.message}",
+            f"the link to {link_written(entry)} could not be read: {err.message}",
             "a linked package travels as bytes, so its manifest has to be "
             "readable; unlink it, or run without --remote",
         ) from err

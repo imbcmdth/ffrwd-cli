@@ -100,11 +100,14 @@ def _isolated_store(
     monkeypatch.setattr(nn, "_INFO", None)
     yield
     # The directory is shared for speed - a per-test one costs four times the
-    # suite's runtime. Only the machine-wide lockfile leaks between tests, so
-    # only it is cleared: what a project can SEE is what several tests assert.
-    lock = store.global_lock_path()
-    if lock.exists():
-        lock.unlink()
+    # suite's runtime. Only the machine-wide lockfile and links file leak
+    # between tests, so only those are cleared: what a project can SEE is
+    # what several tests assert.
+    from ffrwd.project import links_path
+
+    for leaked in (store.global_lock_path(), links_path(store.global_lock_path())):
+        if leaked.exists():
+            leaked.unlink()
 
 
 @pytest.fixture(autouse=True)

@@ -460,8 +460,8 @@ moves them into `ffrwd.links` and out of the lockfile.
 
 A package resolves through three layers, the first claim on its name
 winning: the project's own manifest, then its links file and lockfile,
-then the machine-wide pair a global install and `link -g` write. A
-link claims its name over anything installed under it. Two of those
+then the machine-wide pair a global install and a bare `ffrwd link`
+write. A link claims its name over anything installed under it. Two of those
 layers are worth saying out loud, so a compile reports them without
 refusing: resolving inside a project but landing on the machine-wide
 layer, and compiling against a link. Each is reported once per package
@@ -605,27 +605,41 @@ Modules built against earlier worlds load and run unchanged.
 
 ### Linking
 
-`ffrwd link ../my-lib` records that directory in `ffrwd.links` beside
-the lockfile; the lockfile itself is untouched, and the package's name
-comes from its manifest. The linked package resolves its own calls
-through its OWN lockfile against the shared store, so `ffrwd install`
-run in that directory comes first - a linked tree whose lockfile does
-not cover its manifest's dependencies is refused, at link time or at
-the first compile after it drifts. The consuming project's own queries
-never see the linked package's dependencies. Linking a package
-something else already pins leaves the pin in place; the link answers
-while it stands.
+Linking is npm's two commands, each with its effects in one place.
+`ffrwd link`, bare, run in the package's directory: installs what its
+manifest pins - its own lockfile, the shared store - and records
+name -> directory in the machine-wide `ffrwd.links` under the cache
+directory. `ffrwd link <namespace>/<package>`, run in a consuming
+project: records the name in the project's `ffrwd.links` beside its
+lockfile, which itself is untouched. A name nothing on this machine
+links is refused, hint naming the first command; so is a directory
+path - the consumer names packages, never directories.
 
-`ffrwd unlink <name>` (the package's name, or the directory for a link
-whose manifest is gone) removes the record and nothing else. A link
-entry found in a lockfile an older ffrwd wrote still resolves; the
-next `link`, `unlink` or `install` moves it into `ffrwd.links`.
+The name resolves through the machine-wide record, so re-running the
+bare form from a new directory re-points every consumer at once. The
+linked package resolves its own calls through its OWN lockfile against
+the shared store; a tree whose manifest drifts past that lockfile
+after linking is refused at the next compile, hint naming the re-link.
+The consuming project's own queries never see the linked package's
+dependencies. Linking a package something else already pins leaves the
+pin in place; the link answers while it stands.
 
-`-g` writes the machine-wide links file, beside the machine-wide
-lockfile under the cache directory. Without it, no lockfile at or
-above the working directory is a usage error (exit 2) naming both ways
-forward - `install -g` / `link -g`, or `init` first. No command ever
-creates a lockfile as a side effect.
+`ffrwd unlink`, bare in the package's directory, removes the
+machine-wide record - consumers refuse at their next compile, naming
+the way back. `ffrwd unlink <name>` in a project removes that
+project's record (a directory works too, for an old record whose
+manifest is gone). `ffrwd unlink -g <name>` removes the machine-wide
+record from anywhere, which is how one whose directory is gone gets
+cleaned up; `link -g` is retired, the bare form being machine-wide
+already.
+
+A record an older ffrwd wrote - a directory path in a project's
+`ffrwd.links`, or a link entry in the lockfile itself - still
+resolves. The next `link`, `unlink` or `install` migrates it into
+`ffrwd.links`: by name when the machine-wide file links its package, a
+path otherwise. Naming a package to link outside a project is a usage
+error (exit 2) pointing at `init`; no command creates a lockfile
+anywhere but the linked package's own directory.
 
 Every write to these files replaces it in one step and pins LF endings,
 and each is written in insertion order with no timestamp, so writing
@@ -1171,10 +1185,11 @@ Every one of these is a typed rejection, never a silent reinterpretation:
   no known kind, missing a key, or holding an unknown one; two entries
   pinning one package at one version; a lockfile claiming to be
   reproducible while linking a directory; a links file that is not one
-  JSON object of its known keys, or a link record naming no directory;
+  JSON object of its known keys, or a link record naming neither a
+  package nor a directory; a linked name nothing on this machine links;
   a linked directory with no manifest; a linked package whose own
   lockfile does not cover its manifest's dependencies (the hint names
-  `ffrwd install` run there); stored content that is missing or was written by another
+  `ffrwd link` run there again); stored content that is missing or was written by another
   store layout; a downloaded archive that does not hash to what the
   entry pins, or that holds a member outside the package root, a link,
   a device, or more members or bytes than the caps allow; an entry the

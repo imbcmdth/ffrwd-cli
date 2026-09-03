@@ -218,12 +218,14 @@ from .project import (
     is_namespace,
     is_package_name,
     is_recipe_name,
-    link_refusal,
     link_target,
+    link_written,
     links_path,
     name_refusal,
+    read_linksfile,
     read_lockfile,
     read_manifest,
+    registered_root,
     stored_name,
     stored_version,
     write_linksfile,
@@ -594,14 +596,26 @@ def _build_parser() -> argparse.ArgumentParser:
     path_p.add_argument("package", help="<namespace>/<package>[@version]")
     _add_global_argument(path_p, "read the machine-wide lockfile instead of this project's")
 
-    link_p = subparsers.add_parser("link", help="read a package live out of a directory")
-    link_p.add_argument("path", help="the directory holding the package's ffrwd.json")
-    _add_global_argument(link_p)
+    link_p = subparsers.add_parser(
+        "link", help="make the package here linkable, or read a linked package live"
+    )
+    link_p.add_argument(
+        "package",
+        nargs="?",
+        help="a linked package's name to read live in this project; none links "
+        "the package standing here, machine-wide",
+    )
+    link_p.add_argument(
+        "-g", "--global", action="store_true", dest="global_lock", help=argparse.SUPPRESS
+    )
     unlink_p = subparsers.add_parser("unlink", help="drop a linked package")
     unlink_p.add_argument(
-        "name", help="the linked package's name (or its directory) to stop reading live"
+        "name",
+        nargs="?",
+        help="the linked package (or a directory an old link recorded) to stop "
+        "reading in this project; none unlinks the package standing here, machine-wide",
     )
-    _add_global_argument(unlink_p)
+    _add_global_argument(unlink_p, "drop the machine-wide record by name, from anywhere")
     login_p = subparsers.add_parser("login", help="save the token this machine publishes with")
     login_p.add_argument(
         "--token",
@@ -2357,14 +2371,15 @@ def _cmd_init(args: argparse.Namespace, on_warning: OnWarning) -> int:
     return 0
 
 
-def _lock_to_write(args: argparse.Namespace) -> tuple[Path | None, int]:
-    """The lockfile `link`/`unlink` works beside, or None with the usage error printed.
+def _lock_to_write(args: argparse.Namespace, hint: str | None = None) -> tuple[Path | None, int]:
+    """The lockfile `install`/`link`/`unlink` works beside, or None with the usage error printed.
 
     The links file lives next to it; the lockfile itself is only rewritten to
-    shed link entries an older ffrwd put there. Never creates one as a side
-    effect: outside a project there is nothing to record a package in, and
-    inventing a lockfile in whatever directory they happen to stand in is not
-    a project.
+    record an install or to shed link entries an older ffrwd put there. Never
+    creates one as a side effect: outside a project there is nothing to
+    record a package in, and inventing a lockfile in whatever directory they
+    happen to stand in is not a project. `hint` replaces the default way
+    forward for a command whose ``-g`` is not one.
     """
     if args.global_lock:
         return store.global_lock_path(), 0
@@ -2375,8 +2390,10 @@ def _lock_to_write(args: argparse.Namespace) -> tuple[Path | None, int]:
             file=sys.stderr,
         )
         print(
-            f"hint: `ffrwd {args.command} -g ...` works machine-wide, usable from any "
-            f"directory; `ffrwd init` starts a project here that pins its own",
+            f"hint: {hint}"
+            if hint is not None
+            else f"hint: `ffrwd {args.command} -g ...` works machine-wide, usable from "
+            f"any directory; `ffrwd init` starts a project here that pins its own",
             file=sys.stderr,
         )
         return None, 2
@@ -2396,7 +2413,7 @@ def _held_dependencies(path: Path) -> dict[str, str]:
 def _described(entry: LockEntry) -> str:
     """What an entry being replaced was, for the line that says it is going."""
     if isinstance(entry, LinkEntry):
-        return f"the link to {entry.path}"
+        return f"the link to {link_written(entry)}"
     return f"the installed {entry.name} {entry.version}"
 
 
@@ -2469,14 +2486,19 @@ def _install_here(args: argparse.Namespace) -> int:
         _print_error(err)
         return 1
 
+    _print_project_install(installed)
+    return 0
+
+
+def _print_project_install(installed: packages_module.ProjectInstalled) -> None:
+    """The bare-install summary: what was made whole, and what arrived for it."""
     package = installed.package
-    print(f"installed what {package.name} {package.version} needs in {lock}")
+    print(f"installed what {package.name} {package.version} needs in {installed.lock}")
     if installed.brought:
         brought = ", ".join(f"{one.name} {one.version}" for one in installed.brought)
         print(f"  fetched: {brought}")
     else:
         print("  all dependencies were already pinned")
-    return 0
 
 
 def _cmd_install(args: argparse.Namespace, on_warning: OnWarning) -> int:
@@ -2620,23 +2642,6 @@ def _cmd_path(args: argparse.Namespace, on_warning: OnWarning) -> int:
     return 0
 
 
-def _written_link_path(target: Path, lock: Path, *, relative: bool) -> str:
-    """How the links file writes the linked directory.
-
-    Relative to the file for a project's own, which keeps it readable beside
-    the tree it points into; absolute for the machine-wide one, which sits
-    under the cache directory where relative would only be a climb. A path on
-    another drive has no relative form and stays absolute.
-    """
-    resolved = target.resolve()
-    if not relative:
-        return str(resolved)
-    try:
-        return Path(os.path.relpath(resolved, lock.parent)).as_posix()
-    except ValueError:
-        return str(resolved)
-
-
 def _shed_lock_links(lock: Path) -> tuple[LockEntry, ...]:
     """Rewrite `lock` without the link entries an older ffrwd left in it.
 
@@ -2651,47 +2656,121 @@ def _shed_lock_links(lock: Path) -> tuple[LockEntry, ...]:
     return kept
 
 
-def _cmd_link(args: argparse.Namespace, on_warning: OnWarning) -> int:
-    """Record a package read live out of `path`, beside this project's lockfile or -g's.
+_LINK_IS_TWO_COMMANDS = (
+    "linking is two commands: `ffrwd link` in the package's directory makes it "
+    "linkable, then `ffrwd link <namespace>/<package>` in the project that reads it"
+)
 
-    The record goes in the links file, never the lockfile: a link is this
-    machine's, and the lockfile is everyone's. The linked package resolves
-    through its own lockfile, so it must have installed its own dependencies
-    first.
+
+def _cmd_link(args: argparse.Namespace, on_warning: OnWarning) -> int:
+    """Make the package standing here linkable, or record a linked package by name.
+
+    Two commands in one word, npm's shape, each with its effects in one
+    place. Bare, in the package's directory: install what its manifest pins
+    -- its lockfile, the shared store -- and record name -> directory in the
+    machine-wide links file. With a name, in a consumer: record the name in
+    this project's links file, never the lockfile -- a link is this
+    machine's, and the lockfile is everyone's. The name resolves through the
+    machine-wide record, so re-linking from a new directory re-points every
+    project at once.
     """
-    target = Path(args.path)
-    manifest = target / MANIFEST_NAME
-    if not manifest.is_file():
-        print(f"error: link: {target} holds no {MANIFEST_NAME}", file=sys.stderr)
-        print("hint: link the directory a package's manifest sits in", file=sys.stderr)
+    if args.global_lock:
+        print("error: link: -g is retired -- a link is machine-wide already", file=sys.stderr)
+        print(f"hint: {_LINK_IS_TWO_COMMANDS}", file=sys.stderr)
+        return 2
+    if args.package is None:
+        return _link_here(args)
+
+    name = str(args.package)
+    if not is_package_name(name):
+        _print_error(
+            FfrwdError(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"link: {name!r} is not a package name",
+                hint=_LINK_IS_TWO_COMMANDS,
+            )
+        )
         return 1
-    lock, code = _lock_to_write(args)
+    lock, code = _lock_to_write(
+        args, hint="a link is recorded in the project that reads it; run `ffrwd init` "
+        "to start one here"
+    )
     if lock is None:
         return code
 
     links_file = links_path(lock)
     try:
-        package = read_manifest(manifest)
-        refused = link_refusal(package, target)
-        if refused is not None:
-            raise FfrwdError(ErrorCode.UNSUPPORTED_SQL, refused[0], hint=refused[1])
+        root = registered_root(name)
+        if root is None:
+            raise FfrwdError(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"nothing on this machine links '{name}'",
+                hint="run `ffrwd link` in the package's directory first",
+            )
         held = held_links(lock)
-        replaced = _replaced_link(held, package.name, target)
-        entry = LinkEntry(
-            path=_written_link_path(target, lock, relative=not args.global_lock),
-        )
+        replaced = _replaced_link(held, name, root)
+        entry = LinkEntry(name=name)
         kept = [one for one, _source in held if one is not replaced]
         write_linksfile(links_file, [*kept, entry])
-        pinned = held_entry(_shed_lock_links(lock), package.name, lock)
+        pinned = held_entry(_shed_lock_links(lock), name, lock)
     except FfrwdError as err:
         _print_error(err)
         return 1
 
-    print(f"linked {package.name} -> {entry.path} in {links_file}")
-    if replaced is not None:
+    print(f"linked {name} -> {root} in {links_file}")
+    if replaced is not None and replaced.path is not None:
         print(f"  replacing the link to {replaced.path}")
     if pinned is not None:
         print(f"  over {_described(pinned)}, which stays pinned")
+    return 0
+
+
+def _link_here(args: argparse.Namespace) -> int:
+    """Bare ``ffrwd link``: the package standing here becomes linkable machine-wide.
+
+    Both acts land where the command runs: the package's own install -- its
+    lockfile, the shared store -- so its calls resolve wherever it is linked,
+    and its record in the machine-wide links file, name -> directory. Run
+    from a new directory it re-points every project reading the name.
+    """
+    console = _console(args)
+    manifest = find_manifest(Path.cwd())
+    if manifest is None:
+        print(f"error: link: no {MANIFEST_NAME} in {Path.cwd()} or above it", file=sys.stderr)
+        print(
+            "hint: run `ffrwd link` in the package's directory to make it linkable, "
+            "or name a linked package to read it in this project",
+            file=sys.stderr,
+        )
+        return 2
+    machine = links_path(store.global_lock_path())
+    try:
+        package = read_manifest(manifest)
+        with console.status("linking"):
+            installed = packages_module.install_project(
+                manifest, lock=manifest.parent / LOCKFILE_NAME, announce=console.say
+            )
+        _print_project_install(installed)
+        root = manifest.parent.resolve()
+        held = read_linksfile(machine)
+        replaced = next(
+            (
+                one
+                for one in held
+                if one.name == package.name or link_target(one, machine) == root
+            ),
+            None,
+        )
+        entry = LinkEntry(path=str(root), name=package.name)
+        write_linksfile(machine, [*(one for one in held if one is not replaced), entry])
+    except FfrwdError as err:
+        _print_error(err)
+        return 1
+
+    print(f"linked {package.name} -> {root} in {machine}")
+    if replaced is not None and replaced.path not in (None, entry.path):
+        print(f"  replacing the link to {replaced.path}")
+    print(f"a project reads it live after `ffrwd link {package.name}` there")
     return 0
 
 
@@ -2700,25 +2779,21 @@ def _replaced_link(
 ) -> LinkEntry | None:
     """The link a new one for `name` at `target` takes over, or None.
 
-    By package name when a held link's manifest still reads -- one name, one
-    link -- and by directory otherwise, so re-linking a moved or emptied
-    directory replaces its old record rather than stacking a second.
+    By recorded or manifest name -- one name, one link -- and by directory
+    otherwise, so re-linking what an old record points at replaces that
+    record rather than stacking a second.
     """
-    try:
-        wanted: Path | None = target.resolve()
-    except (OSError, ValueError):
-        wanted = None
     for entry, source in held:
-        if stored_name(entry, source) == name:
+        if entry.name == name or stored_name(entry, source) == name:
             return entry
-        if wanted is not None and link_target(entry, source) == wanted:
+        if link_target(entry, source) == target:
             return entry
     return None
 
 
 def _linked_as(entry: LinkEntry, source: Path) -> str:
     """How one link is named to the user: the package's name, or its bare path."""
-    name = stored_name(entry, source)
+    name = stored_name(entry, source) or entry.name
     return name if name is not None else f"the unreadable link {entry.path!r}"
 
 
@@ -2727,7 +2802,8 @@ def _matching_link(
 ) -> tuple[LinkEntry, Path] | None:
     """The link `written` names -- by package name, or by directory."""
     for entry, source in held:
-        if stored_name(entry, source) == written or entry.path == written:
+        named = entry.name == written or stored_name(entry, source) == written
+        if named or entry.path == written:
             return entry, source
         # A dead link is still removable by the directory it points at.
         try:
@@ -2739,13 +2815,22 @@ def _matching_link(
 
 
 def _cmd_unlink(args: argparse.Namespace, on_warning: OnWarning) -> int:
-    """Drop the link `name` names from the links file. Nothing else changes.
+    """Drop one link record. Nothing else changes anywhere.
 
-    What the linked package resolved through its own lockfile was never
-    recorded here, so there is nothing to clean up: the record goes, the
-    lockfile stays as it was.
+    Bare, in the package's directory: the machine-wide record goes, and the
+    projects reading the name refuse at their next resolution, each naming
+    the way back. With a name: this project's record goes -- or the
+    machine-wide one with ``-g``, from anywhere, which is how a record whose
+    directory is gone is cleaned up. What the linked package resolved through
+    its own lockfile was never recorded here, so there is nothing else to
+    clean.
     """
-    lock, code = _lock_to_write(args)
+    if args.name is None:
+        return _unlink_here(args)
+    lock, code = _lock_to_write(
+        args, hint="`ffrwd unlink -g <name>` drops the machine-wide record from "
+        "anywhere; `ffrwd init` starts a project here"
+    )
     if lock is None:
         return code
     try:
@@ -2780,6 +2865,50 @@ def _cmd_unlink(args: argparse.Namespace, on_warning: OnWarning) -> int:
         _print_error(err)
         return 1
     print(f"unlinked '{args.name}' from {source}")
+    return 0
+
+
+def _unlink_here(args: argparse.Namespace) -> int:
+    """Bare ``ffrwd unlink``: the package standing here stops being linkable."""
+    if args.global_lock:
+        print("error: unlink: -g needs a package name", file=sys.stderr)
+        print(
+            "hint: bare `ffrwd unlink` run in the package's directory drops its "
+            "machine-wide record; `-g <name>` does the same by name from anywhere",
+            file=sys.stderr,
+        )
+        return 2
+    manifest = find_manifest(Path.cwd())
+    if manifest is None:
+        print(f"error: unlink: no {MANIFEST_NAME} in {Path.cwd()} or above it", file=sys.stderr)
+        print(
+            "hint: run `ffrwd unlink` in the package's directory, or name a linked "
+            "package to stop reading it in this project",
+            file=sys.stderr,
+        )
+        return 2
+    machine = links_path(store.global_lock_path())
+    try:
+        package = read_manifest(manifest)
+        held = read_linksfile(machine)
+        root = manifest.parent.resolve()
+        matched = [
+            one
+            for one in held
+            if one.name == package.name or link_target(one, machine) == root
+        ]
+        if not matched:
+            print(
+                f"error: unlink: nothing on this machine links '{package.name}'",
+                file=sys.stderr,
+            )
+            print("hint: `ffrwd link` run here makes it linkable", file=sys.stderr)
+            return 1
+        write_linksfile(machine, [one for one in held if one not in matched])
+    except FfrwdError as err:
+        _print_error(err)
+        return 1
+    print(f"unlinked '{package.name}' from {machine}")
     return 0
 
 

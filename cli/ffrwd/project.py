@@ -39,12 +39,14 @@ lockfile's own top-level ``dependencies`` is the same shape, one level up:
 what the project itself directly installed. It is machine-owned -- installing
 writes it, nobody hand-edits it.
 
-Third, ``ffrwd.links`` beside the lockfile records the directories this
-MACHINE reads packages out of, live -- machine-local, never committed. A
-linked package resolves its own calls through its own lockfile, and the
-project around it never sees those pins. Older ffrwds wrote link entries into
-the lockfile itself; those are still read, and the next write moves them
-over.
+Third, ``ffrwd.links`` -- machine-local, never committed. The machine-wide
+one, beside the machine-wide lockfile, is where `ffrwd link` run in a
+package's directory records name -> directory; the one beside a project's
+lockfile records the names that project reads live, each resolved through
+the machine-wide file. A linked package resolves its own calls through its
+own lockfile, and the project around it never sees those pins. Older ffrwds
+wrote directory paths -- into the lockfile itself, or into a project's links
+file; those are still read, and the next write migrates them.
 
 :func:`discover` builds the set a compile resolves in, from three layers, the
 first claim on a name winning:
@@ -121,12 +123,14 @@ __all__ = [
     "leaves_package",
     "link_refusal",
     "link_target",
+    "link_written",
     "links_path",
     "lockfile_text",
     "name_refusal",
     "read_linksfile",
     "read_lockfile",
     "read_manifest",
+    "registered_root",
     "stored_name",
     "stored_version",
     "under_package",
@@ -139,8 +143,9 @@ __all__ = [
 
 MANIFEST_NAME = "ffrwd.json"
 LOCKFILE_NAME = "ffrwd.lock"
-# Beside the lockfile, machine-local: where `ffrwd link` records the
-# directories this machine reads live. Paths on one machine mean nothing on
+# Beside the lockfile, machine-local: where `ffrwd link` records what this
+# machine reads live -- name -> directory beside the machine-wide lockfile,
+# names alone beside a project's. Local state on one machine means nothing on
 # another, so it is a separate file, not for version control.
 LINKSFILE_NAME = "ffrwd.links"
 
@@ -1196,19 +1201,22 @@ class RegistryEntry:
 
 @dataclass(frozen=True)
 class LinkEntry:
-    """A package read live out of a directory: no version, no digest.
+    """A package read live out of a working directory: no version, no digest.
 
     That is not an omission. A link exists so edits to that directory land in
-    the next compile, which is exactly what a digest cannot survive. The
-    package's name is not recorded either -- it comes from the manifest in the
-    directory, so renaming the package there needs no re-link.
+    the next compile, which is exactly what a digest cannot survive.
 
-    Recorded in the links file beside the lockfile. Older ffrwds wrote these
-    into the lockfile itself; such entries are still read, and the next write
-    moves them over.
+    One of the two fields is set, sometimes both. The machine-wide links file
+    records both: `ffrwd link` run in the package's directory wrote name ->
+    directory there. A project's links file records the `name` alone, and the
+    machine-wide file says where it lives -- re-linking from a new directory
+    re-points every project at once. A bare `path` is what older ffrwds
+    wrote, into a project's links file or the lockfile itself; still read,
+    and migrated by the next write.
     """
 
-    path: str
+    path: str | None = None
+    name: str | None = None
 
 
 LockEntry = RegistryEntry | LinkEntry
@@ -1348,14 +1356,15 @@ def _entries(data: dict[str, object], path: Path, text: str) -> tuple[LockEntry,
                 )
             named.add(identity)
         else:
-            if entry.path in linked:
+            written = entry.path or ""
+            if written in linked:
                 raise _reject(
                     path,
                     f"two entries link {entry.path!r}",
                     line=_value_line(text, entry.path),
                     hint="one directory, one link",
                 )
-            linked.add(entry.path)
+            linked.add(written)
         entries.append(entry)
     return tuple(entries)
 
@@ -1687,23 +1696,33 @@ def without_entry(entries: Sequence[LockEntry], entry: LockEntry) -> tuple[LockE
 
 # -- the links file --------------------------------------------------------
 
-LINKS_FORMAT_VERSION = 1
+LINKS_FORMAT_VERSION = 2
+
+# Version 1 held directory paths only; its files still read.
+_LINKS_READABLE = frozenset({1, LINKS_FORMAT_VERSION})
 
 # The sentence the file carries about itself, under "machine_local".
 _LINKS_PURPOSE = (
-    "the directories this machine reads packages out of, live; not for version control"
+    "the packages this machine reads live out of working directories; not for version control"
 )
 
 _LINKS_HINT = (
-    f"`ffrwd link <directory>` writes {LINKSFILE_NAME}; `ffrwd unlink <name>` removes one"
+    "`ffrwd link` run in a package's directory records it for this machine; "
+    "`ffrwd link <name>` records it in a project; `ffrwd unlink <name>` removes one"
 )
 
 _LINKS_KNOWN = frozenset({"format_version", "machine_local", "links"})
 
-_INSTALL_LINKEE_HINT = (
-    "a linked package resolves through its own lockfile; run `ffrwd install` "
-    "in that directory first"
+_LINK_SHAPE_HINT = (
+    'each link is {"name": "<namespace>/<package>"}, {"path": "<directory>"}, or both'
 )
+
+_RELINK_HINT = (
+    "a linked package resolves through its own lockfile; run `ffrwd link` "
+    "in its directory again"
+)
+
+_GONE_HINT = "the link is gone; run `ffrwd link` in the package's directory again"
 
 
 def links_path(lock: Path) -> Path:
@@ -1742,13 +1761,13 @@ def read_linksfile(path: Path) -> tuple[LinkEntry, ...]:
             or f"known keys: {', '.join(sorted(_LINKS_KNOWN))}"
         )
         raise _reject(path, f"unknown key {key!r}", line=_key_line(text, key), hint=hint)
-    if data.get("format_version") != LINKS_FORMAT_VERSION:
+    if data.get("format_version") not in _LINKS_READABLE:
         raise _reject(
             path,
             f"was written in links format {data.get('format_version')!r}, and this "
             f"ffrwd reads {LINKS_FORMAT_VERSION}",
             line=_key_line(text, "format_version"),
-            hint="link the directories again to rewrite it",
+            hint="link the packages again to rewrite it",
         )
     note = data.get("machine_local")
     if note is not None and not isinstance(note, str):
@@ -1765,21 +1784,38 @@ def read_linksfile(path: Path) -> tuple[LinkEntry, ...]:
         )
     links: list[LinkEntry] = []
     for index, raw in enumerate(written):
-        named = raw.get("path") if isinstance(raw, dict) else None
-        if not isinstance(named, str) or not named:
+        record = raw if isinstance(raw, dict) else {}
+        named = record.get("name")
+        directory = record.get("path")
+        if named is not None and (not isinstance(named, str) or not is_package_name(named)):
+            raise _reject(
+                path,
+                f"link {index + 1} does not name a package",
+                line=_key_line(text, "links"),
+                hint=_LINK_SHAPE_HINT,
+            )
+        if directory is not None and (not isinstance(directory, str) or not directory):
             raise _reject(
                 path,
                 f"link {index + 1} does not name a directory",
                 line=_key_line(text, "links"),
-                hint='each link is {"path": "<directory>"}',
+                hint=_LINK_SHAPE_HINT,
             )
-        links.append(LinkEntry(path=named))
+        if named is None and directory is None:
+            raise _reject(
+                path,
+                f"link {index + 1} names neither a package nor a directory",
+                line=_key_line(text, "links"),
+                hint=_LINK_SHAPE_HINT,
+            )
+        links.append(LinkEntry(path=directory, name=named))
     return tuple(links)
 
 
 def write_linksfile(path: Path, links: Sequence[LinkEntry]) -> None:
     """Write the links file naming `links`, in the order given; none removes the file.
 
+    Every write migrates what an older ffrwd recorded (:func:`_migrated`).
     The sentence under ``machine_local`` is for whoever finds the file: it
     says why this one is not committed the way the lockfile is.
     """
@@ -1789,20 +1825,126 @@ def write_linksfile(path: Path, links: Sequence[LinkEntry]) -> None:
         except OSError as err:
             raise _unwritable(path, err) from err
         return
+    written: list[dict[str, str]] = []
+    for entry in _migrated(path, links):
+        record: dict[str, str] = {}
+        if entry.name is not None:
+            record["name"] = entry.name
+        if entry.path is not None:
+            record["path"] = entry.path
+        written.append(record)
     payload: dict[str, object] = {
         "format_version": LINKS_FORMAT_VERSION,
         "machine_local": _LINKS_PURPOSE,
-        "links": [{"path": entry.path} for entry in links],
+        "links": written,
     }
     _write_atomically(path, _rendered(payload))
 
 
+def _migrated(path: Path, links: Sequence[LinkEntry]) -> tuple[LinkEntry, ...]:
+    """`links` with each bare directory path re-recorded the current way.
+
+    In the machine-wide file a path gains the name its manifest declares. In
+    a project's file a path whose package the machine-wide file links becomes
+    the name alone; one it does not links stays a path, resolving as it
+    always did. A path whose manifest cannot be read stays as written --
+    migration never invents or drops a record.
+    """
+    machine = links_path(store.global_lock_path())
+    registered: tuple[LinkEntry, ...] = ()
+    if path != machine:
+        try:
+            registered = read_linksfile(machine)
+        except FfrwdError:
+            registered = ()
+    migrated: list[LinkEntry] = []
+    seen: set[tuple[str | None, str | None]] = set()
+    for entry in links:
+        moved = entry
+        if entry.path is not None and entry.name is None:
+            try:
+                named = read_manifest(
+                    (path.parent / Path(entry.path)).resolve() / MANIFEST_NAME
+                ).name
+            except (FfrwdError, OSError, ValueError):
+                named = None
+            if named is not None and path == machine:
+                moved = LinkEntry(path=entry.path, name=named)
+            elif named is not None and any(
+                one.name == named and one.path is not None for one in registered
+            ):
+                moved = LinkEntry(name=named)
+        key = (moved.name, moved.path)
+        if key in seen:
+            continue
+        seen.add(key)
+        migrated.append(moved)
+    return tuple(migrated)
+
+
 def link_target(entry: LinkEntry, source: Path) -> Path | None:
-    """The directory `entry` names, resolved against the file recording it, or None."""
-    try:
-        return (source.parent / Path(entry.path)).resolve()
-    except (OSError, ValueError):
+    """The directory `entry` reads from, or None.
+
+    A recorded path resolves against the file recording it; a name resolves
+    through the machine-wide links file, or nowhere when this machine no
+    longer links it.
+    """
+    if entry.path is not None:
+        try:
+            return (source.parent / Path(entry.path)).resolve()
+        except (OSError, ValueError):
+            return None
+    if entry.name is None:
         return None
+    return registered_root(entry.name)
+
+
+def link_written(entry: LinkEntry) -> str:
+    """The identifier a link was recorded as: its package name, or its path."""
+    if entry.name is not None:
+        return entry.name
+    return entry.path or ""
+
+
+def _link_label(entry: LinkEntry) -> str:
+    """How a message points at one link record."""
+    if entry.name is not None:
+        return f"link '{entry.name}'"
+    return f"link {entry.path!r}"
+
+
+def registered_root(name: str) -> Path | None:
+    """The directory the machine-wide links file records for package `name`, or None.
+
+    Where a project's name-only link entry points: `ffrwd link` run in the
+    package's directory wrote the record, and run from somewhere new it
+    re-points every project reading the name.
+    """
+    try:
+        return _registered_root(name, links_path(store.global_lock_path()))
+    except FfrwdError:
+        return None
+
+
+def _registered_root(name: str, at: Path) -> Path:
+    """:func:`registered_root`, or the rejection a resolving reader raises.
+
+    `at` is the file whose record names the package, so the rejection lands
+    on something the reader has open.
+    """
+    machine = links_path(store.global_lock_path())
+    for entry in read_linksfile(machine):
+        if entry.name != name or entry.path is None:
+            continue
+        try:
+            return (machine.parent / Path(entry.path)).resolve()
+        except (OSError, ValueError) as err:
+            raise _reject(
+                machine,
+                f"link '{name}': {entry.path!r} is not a directory path",
+                hint="a link names the directory the package is developed in",
+            ) from err
+    raise _reject(at, f"link '{name}': nothing on this machine links it", hint=_GONE_HINT)
 
 
 def held_links(lock: Path) -> tuple[tuple[LinkEntry, Path], ...]:
@@ -1829,7 +1971,7 @@ def held_links(lock: Path) -> tuple[tuple[LinkEntry, Path], ...]:
     kept: list[tuple[LinkEntry, Path]] = []
     for entry, source in pairs:
         root = link_target(entry, source)
-        key: Path | str = root if root is not None else entry.path
+        key: Path | str = root if root is not None else link_written(entry)
         if key in seen:
             continue
         seen.add(key)
@@ -1838,13 +1980,14 @@ def held_links(lock: Path) -> tuple[tuple[LinkEntry, Path], ...]:
 
 
 def link_refusal(package: Package, root: Path) -> tuple[str, str] | None:
-    """Why the package at `root` cannot be linked yet -- message and hint -- or None.
+    """Why the linked package at `root` cannot resolve -- message and hint -- or None.
 
     A linked package resolves its calls through its OWN lockfile: every
     dependency its manifest pins must be pinned there at the written version,
     or itself linked in that directory. A package with no dependencies needs
-    neither. Raised by the caller: at link time, or at the first resolution
-    after the linked tree drifted.
+    neither. `ffrwd link` run in the directory installs exactly this, so a
+    refusal means the tree drifted since -- raised at the first resolution
+    that reads it.
     """
     if not package.dependencies:
         return None
@@ -1870,7 +2013,7 @@ def link_refusal(package: Package, root: Path) -> tuple[str, str] | None:
         )
         return (
             f"package '{package.name}' at {root} depends on '{name}@{version}' and {where}",
-            _INSTALL_LINKEE_HINT,
+            _RELINK_HINT,
         )
     return None
 
@@ -1932,7 +2075,19 @@ def find_lockfile(start: Path) -> Path | None:
 
 
 def _linked_root(entry: LinkEntry, lock_path: Path) -> Path:
-    """The directory a link entry names, relative to the lockfile holding it."""
+    """The directory a link entry reads from: its own path, or its name's record.
+
+    A path resolves against the file holding the entry; a name resolves
+    through the machine-wide links file, with the record gone a rejection.
+    """
+    if entry.path is None:
+        if entry.name is None:
+            raise _reject(
+                lock_path,
+                "a link names neither a package nor a directory",
+                hint=_LINK_SHAPE_HINT,
+            )
+        return _registered_root(entry.name, lock_path)
     try:
         return (lock_path.parent / Path(entry.path)).resolve()
     except (OSError, ValueError) as err:
@@ -1985,7 +2140,10 @@ def _linked_package(entry: LinkEntry, lock: Lockfile, layer: Layer) -> Package:
     """
     root = _linked_root(entry, lock.path)
     manifest = _manifest_of(
-        root, f"link {entry.path!r}", lock.path, "link the directory again, or restore its manifest"
+        root,
+        _link_label(entry),
+        lock.path,
+        "run `ffrwd link` in that directory again, or restore its manifest",
     )
     package = read_manifest(manifest)
     return replace(package, layer=layer, linked=True)
@@ -2092,7 +2250,10 @@ def _add_link(
     """
     root = _linked_root(entry, source)
     manifest = _manifest_of(
-        root, f"link {entry.path!r}", source, "link the directory again, or restore its manifest"
+        root,
+        _link_label(entry),
+        source,
+        "run `ffrwd link` in that directory again, or restore its manifest",
     )
     package = replace(read_manifest(manifest), layer=layer, linked=True)
     for at, (walked, _named) in enumerate(chain):
