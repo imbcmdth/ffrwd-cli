@@ -317,9 +317,10 @@ fn a_packet_sink_refuses_a_frame_output() {
 
 #[test]
 fn a_pad_is_accepted_on_a_packet_sinks_input() {
-    // The row/rendition it carries has nowhere to go yet inside the module
-    // (see the report on this task's `-pad` item), but the flag itself
-    // parses and the run still succeeds.
+    // packet_stats reads its stream alone and never looks at row or
+    // rendition, so this only proves the flag parses and the run succeeds;
+    // packet_tally is what proves the values themselves reach a module (see
+    // runtime/tests/packet_sink.rs).
     let module = module_path("packet_stats");
     let run = run_ffrwd_wasm(
         &[

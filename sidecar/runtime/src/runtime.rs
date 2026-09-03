@@ -265,6 +265,18 @@ mod world_0130 {
         }
     }
 
+    /// The host's rendition metadata in this world's spelling.
+    pub fn rendition_meta(
+        rendition: crate::runtime::RenditionMeta,
+    ) -> video::ffrwd::av::types::RenditionMeta {
+        video::ffrwd::av::types::RenditionMeta {
+            name: rendition.name,
+            bandwidth: rendition.bandwidth,
+            codecs: rendition.codecs,
+            language: rendition.language,
+        }
+    }
+
     pub mod video {
         wasmtime::component::bindgen!({ path: "../wit", world: "video-module" });
     }
@@ -988,12 +1000,15 @@ pub struct CodedStream {
     pub level: Option<i32>,
 }
 
-/// One pad a packet sink is opened for: the encoding the wire declared, and
-/// what the process driving the host said about the stream.
+/// One pad a packet sink is opened for: the encoding the wire declared, what
+/// the process driving the host said about the stream, and which relation
+/// row it belongs to.
 #[derive(Debug, Clone)]
 pub struct SinkInput {
     pub stream: CodedStream,
     pub info: StreamInfo,
+    pub row: u32,
+    pub rendition: RenditionMeta,
 }
 
 /// How many streams of one kind a sink reads.
@@ -2851,11 +2866,13 @@ impl PacketInstance {
         }
         // 0.12.0 and 0.13.0 share the same multi-stream shape; the streams
         // this macro builds are 0.13.0's own, plus `push_extra` for the
-        // fields only its `input-stream` carries. `$coded` is the module
-        // `CodedFormat`/`CodedVideo`/`CodedAudio` live in: 0.13.0 moved them
-        // (with `coded-stream`, `packet` and `pad-packets`) into the shared
-        // `types` interface so `packet-source` could reuse them by `use`;
-        // 0.12.0's frozen wit still carries them on `packet-sink` itself.
+        // fields only its `input-stream` carries: the pad's row and
+        // rendition, read straight off the `SinkInput` the caller opened
+        // with. `$coded` is the module `CodedFormat`/`CodedVideo`/
+        // `CodedAudio` live in: 0.13.0 moved them (with `coded-stream`,
+        // `packet` and `pad-packets`) into the shared `types` interface so
+        // `packet-source` could reuse them by `use`; 0.12.0's frozen wit
+        // still carries them on `packet-sink` itself.
         macro_rules! several_streams {
             ($b:expr, $world:ident, $($coded:tt)::+, $push_extra:expr) => {{
                 use $world::packet::exports::ffrwd::av::packet_sink as wit;
@@ -2863,7 +2880,7 @@ impl PacketInstance {
                 use $($coded)::+::CodedFormat as WitCodedFormat;
                 use $($coded)::+::CodedVideo as WitCodedVideo;
                 let mut streams = Vec::with_capacity(inputs.len());
-                for (idx, input) in inputs.iter().enumerate() {
+                for input in inputs.iter() {
                     let (num, den) = input.stream.time_base.rational(name)?;
                     let format = match input.stream.format {
                         CodedFormat::Video {
@@ -2898,7 +2915,7 @@ impl PacketInstance {
                         level: input.stream.level,
                     };
                     let info = $world::stream_info(&input.info, input.stream.time_base, name)?;
-                    streams.push($push_extra(coded, info, idx as u32));
+                    streams.push($push_extra(coded, info, input.row, input.rendition.clone()));
                 }
                 $b.ffrwd_av_packet_sink()
                     .call_init(&mut *store, &streams, params)
@@ -2906,34 +2923,27 @@ impl PacketInstance {
             }};
         }
         match self {
-            // Nothing upstream of this host threads real row/rendition data
-            // through yet, so every pad is handed row = its position among
-            // `inputs` and a rendition with every field none - the same
-            // "nothing said" a 0.12.0 sink implicitly gets, since its
-            // `input-stream` has no field to carry either one.
             PacketInstance::W0130(b) => several_streams!(
                 b,
                 world_0130,
                 world_0130::video::ffrwd::av::types,
-                |coded, info, row| {
+                |coded, info, row, rendition| {
                     world_0130::packet::exports::ffrwd::av::packet_sink::InputStream {
                         coded,
                         info,
                         row,
-                        rendition: world_0130::video::ffrwd::av::types::RenditionMeta {
-                            name: None,
-                            bandwidth: None,
-                            codecs: None,
-                            language: None,
-                        },
+                        rendition: world_0130::rendition_meta(rendition),
                     }
                 }
             ),
+            // 0.12.0's `input-stream` has no field for either, so both are
+            // dropped here - the same "nothing said" a pad with no `-pad`
+            // gets.
             PacketInstance::W0120(b) => several_streams!(
                 b,
                 world_0120,
                 world_0120::packet::exports::ffrwd::av::packet_sink,
-                |coded, info, _row| {
+                |coded, info, _row, _rendition| {
                     world_0120::packet::exports::ffrwd::av::packet_sink::InputStream { coded, info }
                 }
             ),

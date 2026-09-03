@@ -7,7 +7,7 @@ use std::process::Command;
 use std::sync::OnceLock;
 
 use ffrwd_wasm_runtime::runtime::{
-    CodedFormat, CodedStream, Packet, PacketSink, SinkInput, StreamInfo, TimeBase,
+    CodedFormat, CodedStream, Packet, PacketSink, RenditionMeta, SinkInput, StreamInfo, TimeBase,
 };
 
 /// Repo root, the parent of `runtime/`.
@@ -56,7 +56,15 @@ fn module_path(name: &str) -> PathBuf {
 }
 
 /// One pad's synthetic encoded stream: the sink never looks inside the bytes.
+/// Its row defaults to 0 and its rendition to none, the same as a pad opened
+/// with no `-pad` at all; `pad_with_meta` sets them where a test cares.
 fn pad(width: u32, height: u32) -> SinkInput {
+    pad_with_meta(width, height, 0, RenditionMeta::default())
+}
+
+/// One pad's synthetic encoded stream, with its row and rendition set as
+/// `-pad` would have resolved them.
+fn pad_with_meta(width: u32, height: u32, row: u32, rendition: RenditionMeta) -> SinkInput {
     SinkInput {
         stream: CodedStream {
             codec: "h264".to_string(),
@@ -72,6 +80,8 @@ fn pad(width: u32, height: u32) -> SinkInput {
             level: None,
         },
         info: StreamInfo::default(),
+        row,
+        rendition,
     }
 }
 
@@ -176,9 +186,42 @@ fn each_pad_keeps_its_own_stream() {
     assert_eq!(
         last.trailing,
         vec![
-            r#"{"pad":0,"codec":"h264","width":320,"height":240,"packets":1,"keyframes":1,"bytes":10}"#,
-            r#"{"pad":1,"codec":"h264","width":160,"height":120,"packets":1,"keyframes":1,"bytes":7}"#,
-            r#"{"pad":2,"codec":"h264","width":64,"height":48,"packets":2,"keyframes":1,"bytes":6}"#,
+            r#"{"pad":0,"row":0,"rendition":null,"codec":"h264","width":320,"height":240,"packets":1,"keyframes":1,"bytes":10}"#,
+            r#"{"pad":1,"row":0,"rendition":null,"codec":"h264","width":160,"height":120,"packets":1,"keyframes":1,"bytes":7}"#,
+            r#"{"pad":2,"row":0,"rendition":null,"codec":"h264","width":64,"height":48,"packets":2,"keyframes":1,"bytes":6}"#,
+        ]
+    );
+}
+
+#[test]
+fn a_pads_row_and_rendition_reach_the_module() {
+    let pads = [
+        pad_with_meta(
+            320,
+            240,
+            3,
+            RenditionMeta {
+                name: Some("720p".to_string()),
+                ..RenditionMeta::default()
+            },
+        ),
+        pad(160, 120),
+    ];
+    let mut sink = open("packet_tally", &pads).expect("opening packet_tally");
+    sink.process(
+        &[vec![packet(0, true, 10)], vec![packet(0, true, 4)]],
+        false,
+    )
+    .expect("the first call");
+
+    let last = sink
+        .process(&[vec![], vec![]], true)
+        .expect("the final call");
+    assert_eq!(
+        last.trailing,
+        vec![
+            r#"{"pad":0,"row":3,"rendition":"720p","codec":"h264","width":320,"height":240,"packets":1,"keyframes":1,"bytes":10}"#,
+            r#"{"pad":1,"row":0,"rendition":null,"codec":"h264","width":160,"height":120,"packets":1,"keyframes":1,"bytes":4}"#,
         ]
     );
 }

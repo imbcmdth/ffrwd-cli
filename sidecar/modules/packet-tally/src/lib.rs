@@ -1,11 +1,13 @@
 //! A packet sink reading SEVERAL encoded streams at once: one instance, one
 //! pad per stream, and a tally per pad.
 //!
-//! Each pad's coded stream is named at init - its codec and its frame size -
-//! and every call adds that pad's packets to its own counts. The final call
-//! emits one row per pad: how many packets and bytes crossed, how many were
-//! keyframes, and the geometry the pad opened with. Nothing pairs one pad's
-//! packet with another's, which is what a sink over a rendition ladder needs.
+//! Each pad's coded stream is named at init - its codec, its frame size, and
+//! the relation row and rendition name `-pad` set on it - and every call
+//! adds that pad's packets to its own counts. The final call emits one row
+//! per pad: how many packets and bytes crossed, how many were keyframes,
+//! the geometry the pad opened with, and its row and rendition. Nothing
+//! pairs one pad's packet with another's, which is what a sink over a
+//! rendition ladder needs.
 
 wit_bindgen::generate!({
     path: "../../wit",
@@ -21,12 +23,16 @@ use exports::ffrwd::av::packet_sink::{
 use serde::Serialize;
 
 const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{},"additionalProperties":false}"#;
-const ROWS_SCHEMA: &str = r#"{"type":"object","properties":{"pad":{"type":"integer"},"codec":{"type":"string"},"width":{"type":"integer"},"height":{"type":"integer"},"packets":{"type":"integer"},"keyframes":{"type":"integer"},"bytes":{"type":"integer"}},"additionalProperties":false}"#;
+const ROWS_SCHEMA: &str = r#"{"type":"object","properties":{"pad":{"type":"integer"},"row":{"type":"integer"},"rendition":{"type":"string"},"codec":{"type":"string"},"width":{"type":"integer"},"height":{"type":"integer"},"packets":{"type":"integer"},"keyframes":{"type":"integer"},"bytes":{"type":"integer"}},"additionalProperties":false}"#;
 
 /// One pad's tally, emitted once at the end.
 #[derive(Serialize)]
 struct PadRow {
     pad: u32,
+    /// The relation row this pad opened for, and the rendition name it was
+    /// told, exactly as `-pad` set them on `input-stream`.
+    row: u32,
+    rendition: Option<String>,
     codec: String,
     width: u32,
     height: u32,
@@ -36,6 +42,8 @@ struct PadRow {
 }
 
 struct Pad {
+    row: u32,
+    rendition: Option<String>,
     codec: String,
     width: u32,
     height: u32,
@@ -93,6 +101,8 @@ impl Guest for PacketTally {
                 CodedFormat::Audio(_) => return Err("packet_tally reads video".into()),
             };
             pads.push(Pad {
+                row: stream.row,
+                rendition: stream.rendition.name.clone(),
                 codec: stream.coded.codec.clone(),
                 width,
                 height,
@@ -129,6 +139,8 @@ impl Guest for PacketTally {
                 for (index, pad) in state.iter().enumerate() {
                     let row = PadRow {
                         pad: index as u32,
+                        row: pad.row,
+                        rendition: pad.rendition.clone(),
                         codec: pad.codec.clone(),
                         width: pad.width,
                         height: pad.height,

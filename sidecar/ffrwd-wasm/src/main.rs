@@ -1327,18 +1327,12 @@ fn run_packet_sink(args: &Args, module: &str, params: &str) -> Result<()> {
         let (pad, stream) = headers.recv().expect("every reader reports its header");
         streams[pad] = Some(stream.with_context(|| format!("input {pad}"))?);
     }
-    let mut opened = Vec::with_capacity(pads);
+    let mut sink_inputs = Vec::with_capacity(pads);
     for (pad, stream) in streams.iter().enumerate() {
         let stream = stream.as_ref().expect("every pad reported");
-        let input = coded_pad(args, module, pad, stream)?;
         let (row, rendition) = resolve_pad(&args.pads, pad);
-        opened.push(OpenedPad {
-            input,
-            row,
-            rendition,
-        });
+        sink_inputs.push(coded_pad(args, module, pad, stream, row, rendition.into())?);
     }
-    let sink_inputs: Vec<runtime::SinkInput> = opened.iter().map(|o| o.input.clone()).collect();
     let mut sink = runtime::PacketSink::open(module, &sink_inputs, params)
         .with_context(|| format!("opening module {module}"))?;
 
@@ -1591,6 +1585,8 @@ fn coded_pad(
     module: &str,
     pad: usize,
     stream: &nut::Stream,
+    row: u32,
+    rendition: runtime::RenditionMeta,
 ) -> Result<runtime::SinkInput> {
     let Some(codec) = stream.codec_name() else {
         let carried = if let Some(pix_fmt) = stream.pix_fmt() {
@@ -1660,6 +1656,8 @@ fn coded_pad(
     Ok(runtime::SinkInput {
         stream: coded,
         info,
+        row,
+        rendition,
     })
 }
 
@@ -1673,22 +1671,15 @@ fn resolve_pad(pads: &[Option<PadSpec>], pad: usize) -> (u32, PadRendition) {
     }
 }
 
-/// One pad opened for a packet sink: the `runtime::SinkInput` the current
-/// runtime crate accepts, plus the row and rendition `-pad` resolved for it.
-///
-/// `runtime::SinkInput` carries neither field yet, so they ride here unused
-/// for now rather than reaching the module: threading them into
-/// `input-stream.row`/`rendition` needs `SinkInput` to gain a `row: u32` and
-/// a `rendition: RenditionMeta` field, and `PacketInstance::init`'s
-/// `several_streams!` macro (runtime.rs, the `PacketInstance::W0130` arm) to
-/// read them instead of synthesizing `idx as u32` and an all-None
-/// `RenditionMeta` the way it does today. That is a runtime crate change
-/// this task's scope stops short of making.
-#[allow(dead_code)]
-struct OpenedPad {
-    input: runtime::SinkInput,
-    row: u32,
-    rendition: PadRendition,
+impl From<PadRendition> for runtime::RenditionMeta {
+    fn from(r: PadRendition) -> Self {
+        runtime::RenditionMeta {
+            name: r.name,
+            bandwidth: r.bandwidth,
+            codecs: r.codecs,
+            language: r.language,
+        }
+    }
 }
 
 /// The nut::Stream header for one packet-source track: the coded fourcc this
