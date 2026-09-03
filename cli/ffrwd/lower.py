@@ -370,7 +370,7 @@ from ffrwd.probe import (
     StreamMeta,
     is_url,
 )
-from ffrwd.processes import AAC_ADTSTOASC, COPY_CODEC, ref_type
+from ffrwd.processes import COPY_CODEC, ref_type
 from ffrwd.registry import DynamicFilter, FilterOption, Registry, SourceFilter
 from ffrwd.sink import (
     CODEC_PARAMS_FLAGS,
@@ -3370,11 +3370,6 @@ class _Lowerer:
                 inputs[position], kind, described
             ):
                 pad = {codec_option: COPY_CODEC}
-                # ADTS AAC (e.g. out of HLS) carries no AudioSpecificConfig;
-                # ffmpeg's mp4 muxer inserts this filter itself, the NUT
-                # muxer feeding the sidecar does not.
-                if kind == "audio" and self._probed_codec(inputs[position], kind) == "aac":
-                    pad["audio_bsf"] = AAC_ADTSTOASC
             if row_meta is not None:
                 meta = row_meta[position]
                 pad["row"] = meta["row"]
@@ -3391,27 +3386,22 @@ class _Lowerer:
         sink already accepts, and so may travel onto the edge as a stream
         copy instead of paying for an encode nothing asked for.
         """
-        codec = self._probed_codec(ref, kind)
+        if not is_src(ref):
+            return False
+        alias, stream_type, index = src_parts(ref)
+        if stream_type != kind:
+            return False
+        result = self.probes.get(alias)
+        if result is None:
+            return False
+        streams = result.by_type(stream_type)
+        if not 0 <= index < len(streams):
+            return False
+        codec = streams[index].codec
         if codec is None:
             return False
         accepted = described.sink_codecs(kind)
         return not accepted or codec in accepted
-
-    def _probed_codec(self, ref: FrameRef, kind: StreamType) -> str | None:
-        """The codec ffprobe reported for `ref`, or None if `ref` is not an
-        unmodified probed stream of type `kind`."""
-        if not is_src(ref):
-            return None
-        alias, stream_type, index = src_parts(ref)
-        if stream_type != kind:
-            return None
-        result = self.probes.get(alias)
-        if result is None:
-            return None
-        streams = result.by_type(stream_type)
-        if not 0 <= index < len(streams):
-            return None
-        return streams[index].codec
 
     def _packet_sink_options(
         self, declared: WasmFunction, raw: RawSink, scopes: tuple[str, ...]
