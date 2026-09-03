@@ -107,6 +107,108 @@ fn run(args: &str) -> Result<String, String> {
     Ok(json!({ "dimensions": out.dimensions(), "output": values }).to_string())
 }
 
+const RUN_NAMED_PARAMS: &str = r#"{"type":"object","properties":{"graph":{"type":"string"},"inputs":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"dims":{"type":"array","items":{"type":"integer"}},"dtype":{"type":"string","enum":["f32","i64"]}},"required":["name","dims","dtype"],"additionalProperties":false}},"iterations":{"type":"integer","default":1}},"required":["graph","inputs"],"additionalProperties":false}"#;
+const RUN_NAMED_RESULT: &str = r#"{"type":"object","properties":{"outputs":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"dims":{"type":"array","items":{"type":"integer"}}},"required":["name","dims"]}},"per_call_ms":{"type":"array","items":{"type":"number"}}},"required":["outputs","per_call_ms"]}"#;
+
+#[derive(Deserialize)]
+struct RunNamedInput {
+    name: String,
+    dims: Vec<u32>,
+    dtype: String,
+}
+
+#[derive(Deserialize)]
+struct RunNamedArgs {
+    graph: String,
+    inputs: Vec<RunNamedInput>,
+    #[serde(default = "one")]
+    iterations: usize,
+}
+
+/// The tensor type and per-element byte width a spec's `dtype` names.
+fn dtype(name: &str) -> Result<(TensorType, usize), String> {
+    match name {
+        "f32" => Ok((TensorType::Fp32, 4)),
+        "i64" => Ok((TensorType::I64, 8)),
+        other => Err(format!("unsupported dtype {other:?}: f32 or i64")),
+    }
+}
+
+/// Zero-filled bytes for a tensor of the given dimensions and element width.
+fn zeros(dims: &[u32], width: usize) -> Vec<u8> {
+    let elements: usize = dims.iter().map(|&d| d as usize).product();
+    vec![0u8; elements * width]
+}
+
+/// Runs any graph the host bound, by name, with inputs built from a spec
+/// rather than hardcoded tensor names - the fixture `run` and `detect` know
+/// their one graph's shape; this knows none of them. Every input is
+/// zero-filled, which is enough to measure a call: a session's kernels and
+/// their cost do not depend on the values passing through them, only their
+/// shape and dtype.
+fn run_named(args: &str) -> Result<String, String> {
+    let args: RunNamedArgs =
+        serde_json::from_str(args).map_err(|e| format!("invalid args: {e}"))?;
+    if args.iterations == 0 {
+        return Err("iterations must be at least 1".to_string());
+    }
+
+    let graph = load_by_name(&args.graph)
+        .map_err(|e| failed(&format!("load-by-name({:?})", args.graph), &e))?;
+    let context = graph
+        .init_execution_context()
+        .map_err(|e| failed("init-execution-context", &e))?;
+
+    let mut prepared = Vec::with_capacity(args.inputs.len());
+    for input in &args.inputs {
+        let (ty, width) = dtype(&input.dtype)?;
+        prepared.push((
+            input.name.clone(),
+            input.dims.clone(),
+            ty,
+            zeros(&input.dims, width),
+        ));
+    }
+    let build_inputs = || -> Vec<(String, Tensor)> {
+        prepared
+            .iter()
+            .map(|(name, dims, ty, data)| (name.clone(), Tensor::new(dims, *ty, data)))
+            .collect()
+    };
+
+    // One warm-up call, excluded from `per_call_ms`: a GPU provider builds
+    // kernels and engines on its first compute, seconds where the calls
+    // after it are milliseconds. Its own time is kept apart, under
+    // `warmup_ms`, rather than dropped - it is most of what a session
+    // pays once, up front.
+    let warm_started = std::time::Instant::now();
+    context
+        .compute(build_inputs())
+        .map_err(|e| failed("compute", &e))?;
+    let warmup_ms = warm_started.elapsed().as_secs_f64() * 1000.0;
+
+    let mut per_call_ms = Vec::with_capacity(args.iterations);
+    let mut last = Vec::new();
+    for _ in 0..args.iterations {
+        let started = std::time::Instant::now();
+        let outputs = context
+            .compute(build_inputs())
+            .map_err(|e| failed("compute", &e))?;
+        per_call_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+        last = outputs;
+    }
+
+    let outputs: Vec<_> = last
+        .iter()
+        .map(|(name, tensor)| json!({ "name": name, "dims": tensor.dimensions() }))
+        .collect();
+
+    Ok(
+        json!({ "outputs": outputs, "per_call_ms": per_call_ms, "warmup_ms": warmup_ms })
+            .to_string(),
+    )
+}
+
 /// The side a detection graph's square input takes.
 const SIDE: usize = 640;
 /// What ultralytics calls a detector's input.
@@ -433,6 +535,11 @@ impl Guest for NnProbe {
                 params_schema: DETECT_PARAMS.to_string(),
                 result_schema: DETECT_RESULT.to_string(),
             },
+            FunctionMeta {
+                name: "run_named".to_string(),
+                params_schema: RUN_NAMED_PARAMS.to_string(),
+                result_schema: RUN_NAMED_RESULT.to_string(),
+            },
         ]
     }
 
@@ -441,6 +548,7 @@ impl Guest for NnProbe {
             "run" => run(&args),
             "sandbox" => Ok(sandbox()),
             "detect" => detect(&args),
+            "run_named" => run_named(&args),
             other => Err(format!("nn-probe has no function {other:?}")),
         }
     }
