@@ -397,6 +397,133 @@ class RowsSink:
         return cls(container=raw_container, alias=raw_alias, path=raw_path)
 
 
+@dataclass(frozen=True)
+class SourceTrack:
+    """One track a ``RETURNS source`` module hands over: a probed stream that
+    never came from a file.
+
+    `ref` is the ``src:<alias>:<kind>:<index>`` ref the rest of the graph
+    already uses for a probed input's stream -- what a consumer's
+    ``s.video[1]`` binds to, unchanged by where the alias's bytes actually
+    come from. `row` is which relation row this track belongs to, the way a
+    manifest's rendition groups its own streams. The rendition attributes
+    mirror a manifest's own (``RenditionMeta``): all optional, absent where
+    the module's catalog said nothing.
+    """
+
+    ref: FrameRef
+    kind: StreamType
+    codec: str
+    time_base: tuple[int, int]
+    row: int
+    name: str | None = None
+    bandwidth: int | None = None
+    codecs: str | None = None
+    language: str | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        d: dict[str, object] = {
+            "ref": self.ref,
+            "kind": self.kind,
+            "codec": self.codec,
+            "time_base": [self.time_base[0], self.time_base[1]],
+            "row": self.row,
+        }
+        if self.name is not None:
+            d["name"] = self.name
+        if self.bandwidth is not None:
+            d["bandwidth"] = self.bandwidth
+        if self.codecs is not None:
+            d["codecs"] = self.codecs
+        if self.language is not None:
+            d["language"] = self.language
+        return d
+
+    @classmethod
+    def from_dict(cls, d: dict[str, object]) -> SourceTrack:
+        raw_ref = d["ref"]
+        raw_kind = d["kind"]
+        raw_codec = d["codec"]
+        raw_time_base = d["time_base"]
+        raw_row = d["row"]
+        raw_name = d.get("name")
+        raw_bandwidth = d.get("bandwidth")
+        raw_codecs = d.get("codecs")
+        raw_language = d.get("language")
+        assert isinstance(raw_ref, str)
+        assert isinstance(raw_codec, str)
+        assert isinstance(raw_time_base, list) and len(raw_time_base) == 2
+        assert isinstance(raw_row, int)
+        assert raw_name is None or isinstance(raw_name, str)
+        assert raw_bandwidth is None or isinstance(raw_bandwidth, int)
+        assert raw_codecs is None or isinstance(raw_codecs, str)
+        assert raw_language is None or isinstance(raw_language, str)
+        return cls(
+            ref=raw_ref,
+            kind=_parse_stream_type(raw_kind),
+            codec=raw_codec,
+            time_base=(int(raw_time_base[0]), int(raw_time_base[1])),
+            row=int(raw_row),
+            name=raw_name,
+            bandwidth=raw_bandwidth,
+            codecs=raw_codecs,
+            language=raw_language,
+        )
+
+
+@dataclass(frozen=True)
+class ModuleSource:
+    """One ``RETURNS source`` module bound in FROM: the mirror of a sink.
+
+    `alias` is the SQL alias its tracks' refs are named with -- ``s`` for
+    ``FROM ffrwd.moq.subscribe(...) s`` -- and `module`/`params` are what the
+    sidecar is told to load and run, the mirror of a node's `filter`/`args`;
+    `params` is already the JSON string the module's own ``probe``/``open``
+    take. `tracks` is the module's own catalog, in the order its sidecar
+    process renders them: one NUT pipe per track. `bounded` is what the
+    catalog reported at compile time -- False joins the alias to the
+    partitioner's live set the way an unbounded input does, since a sidecar's
+    pipe cannot be reopened either way, bounded or not.
+    """
+
+    alias: str
+    module: str
+    params: str
+    tracks: tuple[SourceTrack, ...]
+    bounded: bool
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "alias": self.alias,
+            "module": self.module,
+            "params": self.params,
+            "tracks": [track.to_dict() for track in self.tracks],
+            "bounded": self.bounded,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, object]) -> ModuleSource:
+        raw_alias = d["alias"]
+        raw_module = d["module"]
+        raw_params = d["params"]
+        raw_tracks = d["tracks"]
+        raw_bounded = d["bounded"]
+        assert isinstance(raw_alias, str)
+        assert isinstance(raw_module, str)
+        assert isinstance(raw_params, str)
+        assert isinstance(raw_tracks, list)
+        assert isinstance(raw_bounded, bool)
+        return cls(
+            alias=raw_alias,
+            module=raw_module,
+            params=raw_params,
+            tracks=tuple(
+                SourceTrack.from_dict(t) for t in raw_tracks if isinstance(t, dict)
+            ),
+            bounded=raw_bounded,
+        )
+
+
 @dataclass
 class Graph:
     input_paths: list[str]  # -i order; index is the ffmpeg input index
@@ -430,6 +557,10 @@ class Graph:
     # a rendition ladder shapes each of them differently. `video_codec` is
     # always present in each. Every key here is also in `module_sinks`.
     packet_sinks: dict[str, list[dict[str, object]]] = field(default_factory=dict)
+    # Alias -> the RETURNS source module bound to it. Not a key of `sources`:
+    # its bytes never come from a real `-i`, so the partitioner gives it a
+    # sidecar of its own rather than an input slot.
+    module_sources: dict[str, ModuleSource] = field(default_factory=dict)
 
     @property
     def outputs(self) -> list[Output]:
@@ -471,6 +602,10 @@ class Graph:
             d["packet_sinks"] = {
                 name: [dict(pad) for pad in pads]
                 for name, pads in self.packet_sinks.items()
+            }
+        if self.module_sources:
+            d["module_sources"] = {
+                alias: source.to_dict() for alias, source in self.module_sources.items()
             }
         return d
 
@@ -538,6 +673,14 @@ class Graph:
                 assert isinstance(pads, list)
                 packet_sinks[str(name)] = [dict(pad) for pad in pads]
 
+        raw_module_sources = d.get("module_sources")
+        module_sources: dict[str, ModuleSource] = {}
+        if raw_module_sources is not None:
+            assert isinstance(raw_module_sources, dict)
+            for alias, written in raw_module_sources.items():
+                assert isinstance(written, dict)
+                module_sources[str(alias)] = ModuleSource.from_dict(written)
+
         return cls(
             input_paths=[str(p) for p in raw_inputs],
             sources={str(k): int(v) for k, v in raw_sources.items()},
@@ -548,6 +691,7 @@ class Graph:
             rows_sinks=rows_sinks,
             module_sinks=module_sinks,
             packet_sinks=packet_sinks,
+            module_sources=module_sources,
         )
 
 

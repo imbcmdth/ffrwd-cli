@@ -24,7 +24,7 @@ import pytest
 from ffrwd.compiler import compile_all
 from ffrwd.errors import ErrorCode, FfrwdError
 from ffrwd.execute import plan_argv
-from ffrwd.ir import Graph, Node, Output, SinkUnit, StreamType
+from ffrwd.ir import Graph, ModuleSource, Node, Output, SinkUnit, SourceTrack, StreamType
 from ffrwd.probe import ProbeResult, StreamMeta
 from ffrwd.processes import (
     ModuleShape,
@@ -424,3 +424,46 @@ def test_a_plan_that_starts_is_not_refused() -> None:
 @pytest.mark.parametrize("body", SHAPES.values(), ids=list(SHAPES))
 def test_no_camera_shape_is_refused(body: str) -> None:
     check(_planned(body))
+
+
+# ---------------------------------------------------------------- module sources
+
+
+def _source_chain_graph() -> Graph:
+    """A module source, a decoding filter, and a sink: source speaks first."""
+    g = Graph(input_paths=[], sources={})
+    g.module_sources["s"] = ModuleSource(
+        alias="s",
+        module="ffrwd.moq.subscribe",
+        params="{}",
+        tracks=(
+            SourceTrack(
+                ref="src:s:v:0", kind="video", codec="h264", time_base=(1, 90000), row=0
+            ),
+            SourceTrack(
+                ref="src:s:a:0", kind="audio", codec="aac", time_base=(1, 48000), row=0
+            ),
+        ),
+        bounded=True,
+    )
+    g.nodes["e0"] = Node(
+        id="e0", filter="invert", args={}, inputs=["src:s:v:0"], outputs=["video"]
+    )
+    g.sinks = [SinkUnit(outputs=[_out("e0"), _out("src:s:a:0", "audio")], path="out.mp4")]
+    return g
+
+
+def test_a_source_decoder_sink_chain_orders_the_source_first() -> None:
+    """The source writes its NUT headers before any packet: nothing it needs
+    to start ever comes from downstream of it."""
+    plan = partition(
+        _source_chain_graph(),
+        external=external_ids("e0"),
+        pix_fmts={"invert": "rgba"},
+        shapes={"invert": ModuleShape()},
+    )
+    source = next(p for p in plan.sidecars if p.packet_source)
+
+    waits = relation(plan)
+    assert waits[("run", source.id, 0)] == ()
+    assert stalled(plan) is None

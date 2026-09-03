@@ -92,6 +92,7 @@ start with an unconnected filter output, so the pads have to go with the nodes.
 from __future__ import annotations
 
 import heapq
+import json
 import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -103,6 +104,7 @@ from .ir import (
     ROWFILTER,
     FrameRef,
     Graph,
+    ModuleSource,
     Node,
     Output,
     RowsSink,
@@ -623,6 +625,10 @@ class SidecarProcess:
     # True for a region whose module consumes ENCODED PACKETS rather than
     # frames.
     packet_sink: bool = False
+    # True for a region holding a SOURCE MODULE: it rides alone, no inputs,
+    # and its `outputs` -- more than one, ordinarily illegal -- are each their
+    # own NUT pipe rather than pads cut from one stdout.
+    packet_source: bool = False
 
     @property
     def nodes(self) -> tuple[str, ...]:
@@ -643,7 +649,7 @@ class SidecarProcess:
         """
         if self.graph is None:
             return False
-        if self.packet_sink:
+        if self.packet_sink or self.packet_source:
             return False
         return len(self.graph.nodes) > 1 or any(
             len(node.inputs) > 1 for node in self.graph.nodes.values()
@@ -673,6 +679,8 @@ class SidecarProcess:
             written["rows"] = self.rows.to_dict()
         if self.sink:
             written["sink"] = True
+        if self.packet_source:
+            written["packet_source"] = True
         if self.network and self.graph is not None:
             written["graph"] = self.graph.to_dict()
         return written
@@ -995,6 +1003,8 @@ class _Partitioner:
                 is_live(g.input_paths[index], g.input_options.get(alias))
                 or is_live_probe(self.probes.get(alias))
             )
+        ) | frozenset(
+            alias for alias, source in g.module_sources.items() if not source.bounded
         )
         self.order = _topological(g)
         # A hosted node is external whoever asked: only the sidecar runs it.
@@ -1200,6 +1210,73 @@ class _Partitioner:
             None,
         )
 
+    def _place_module_sources(self) -> None:
+        """Give each module source its own sidecar, ridden alone.
+
+        The mirror of a sink module: no inputs, one NUT pipe per track, in
+        catalog order. Every process that reads `src:<alias>:...` directly is
+        found here -- the same `_reads`/`_opened` scan
+        :meth:`_redirect_live_reads` uses -- and folded onto ONE reader,
+        because a sidecar's own pipe cannot be reopened whether or not the
+        source declared itself unbounded: unlike a live URL, there is no real
+        path underneath for a second process to legally open, so this always
+        consolidates, even down to a single direct reader.
+
+        That reader then gets the source's own pipes as INCOMING edges from a
+        freshly placed :class:`SidecarProcess`, one per track -- what stands
+        where the alias's own ``-i`` would have stood, and what
+        :meth:`_materialize` turns into that reader's own ``-f nut -i pipe:``
+        inputs, one per track, addressed under fresh aliases the way any
+        other piped edge already is. Every existing `src:<alias>:...` ref
+        elsewhere in the graph is untouched.
+        """
+        source: ModuleSource
+        for alias, source in sorted(self.g.module_sources.items()):
+            readers = [p for p in self.pending if self._reads(p, alias)]
+            if not readers:
+                continue  # nothing downstream ever reads this source
+            reader = next((p for p in readers if not self._consumed(p)), None)
+            if reader is None:
+                reader = _Pending(
+                    id=self._ffmpeg_id(), depth=0, nodes=[], sinks=[], pipes=[]
+                )
+                self.pending.append(reader)
+            for process in readers:
+                if process is reader:
+                    continue
+                stranded = self._unpiped(process, alias)
+                if stranded is not None:
+                    raise self._live_refusal(
+                        alias,
+                        "so one process reads it and hands every other one a "
+                        f"pipe -- and {_named_ref(stranded)} is read by one of "
+                        "those others, where a subtitle or data track cannot "
+                        "follow",
+                        hint="a pipe between two processes carries pictures and "
+                        "sound and nothing else: map that track from a separate "
+                        "input() over a recording, or drop it from the SELECT",
+                    )
+                for ref in self._opened(process).get(alias, []):
+                    if ref not in reader.pipes:
+                        reader.pipes.append(ref)
+                    self._add_edge(
+                        reader.id, process.id, ref, copy=not self._filters(process, ref)
+                    )
+            sidecar = SidecarProcess(
+                id=f"sidecar{len(self.sidecars)}",
+                module=source.module,
+                node=alias,  # no graph node backs a module source; the alias stands in
+                args=json.loads(source.params) if source.params else {},
+                inputs=(),
+                outputs=tuple(track.kind for track in source.tracks),
+                modules=_bindings((source.module,)),
+                packet_source=True,
+            )
+            self.sidecars.append(sidecar)
+            self.members[sidecar.id] = []
+            for track in source.tracks:
+                self._add_edge(sidecar.id, reader.id, track.ref)
+
     def _redirect_live_reads(self) -> None:
         """Leave one process opening each live input; the rest read its pipes.
 
@@ -1208,8 +1285,15 @@ class _Partitioner:
         the input on its own -- every one of them also reads a pipe, so none
         may be joined without risking a cycle -- a reader of nothing else is
         made for it.
+
+        A module source's alias is skipped here even when it joined the live
+        set unbounded: :meth:`_place_module_sources` already gave it its one
+        reader, wired to the sidecar rather than to a real path this method
+        could open.
         """
         for alias in sorted(self.live):
+            if alias in self.g.module_sources:
+                continue
             readers = [p for p in self.pending if self._reads(p, alias)]
             if len(readers) < 2:
                 continue
@@ -1851,6 +1935,7 @@ class _Partitioner:
             self._add_edge(process.id, target, ref)
             demands.extend((process.id, r, at) for r in self._consumed(process))
 
+        self._place_module_sources()
         self._redirect_live_reads()
         self._add_rows_edges()
         self._bound_edges()
@@ -2456,9 +2541,12 @@ def check_spellable(plan: ProcessPlan) -> None:
     Checked on the finished plan rather than while it is being built, so
     partitioning stays free to say what the region's shape actually is.
     Unanchored, for the caller to re-anchor on the declaration.
+
+    A SOURCE MODULE is exempt: its several pads are each their own named
+    pipe by construction, the same way a packet sink's several inputs are.
     """
     for sidecar in plan.sidecars:
-        if len(sidecar.outputs) <= 1:
+        if sidecar.packet_source or len(sidecar.outputs) <= 1:
             continue
         raise FfrwdError(
             ErrorCode.UNSUPPORTED_SQL,

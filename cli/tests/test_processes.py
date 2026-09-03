@@ -10,7 +10,7 @@ from __future__ import annotations
 import pytest
 
 from ffrwd.errors import ErrorCode, FfrwdError
-from ffrwd.ir import Graph, Node, Output, SinkUnit, StreamType
+from ffrwd.ir import Graph, ModuleSource, Node, Output, SinkUnit, SourceTrack, StreamType
 from ffrwd.probe import ProbeResult, StreamMeta
 from ffrwd.processes import (
     COPY_CODEC,
@@ -1298,3 +1298,172 @@ def test_legs_over_different_inputs_stay_two_processes() -> None:
         len([e for e in plan.stream_edges if e.source == p.id]) == 1
         for p in plan.ffmpeg
     )
+
+
+# ---------------------------------------------------------------- module sources
+
+
+def _module_source(
+    *, alias: str = "s", bounded: bool = True, rows: tuple[int, int] = (0, 0)
+) -> ModuleSource:
+    """A two-track source: h264 video and aac audio, in catalog order."""
+    return ModuleSource(
+        alias=alias,
+        module="ffrwd.moq.subscribe",
+        params='{"relay": "https://relay.example"}',
+        tracks=(
+            SourceTrack(
+                ref=f"src:{alias}:v:0",
+                kind="video",
+                codec="h264",
+                time_base=(1, 90000),
+                row=rows[0],
+            ),
+            SourceTrack(
+                ref=f"src:{alias}:a:0",
+                kind="audio",
+                codec="aac",
+                time_base=(1, 48000),
+                row=rows[1],
+            ),
+        ),
+        bounded=bounded,
+    )
+
+
+def _source_sink_graph(*, bounded: bool = True) -> Graph:
+    """A module source's two tracks, mapped straight into one file."""
+    g = Graph(input_paths=[], sources={})
+    g.module_sources["s"] = _module_source(bounded=bounded)
+    g.sinks = [
+        SinkUnit(outputs=[_out("src:s:v:0"), _out("src:s:a:0", "audio")], path="out.mp4")
+    ]
+    return g
+
+
+def _alias_of(ref: str) -> str:
+    return ref.split(":")[1]
+
+
+def test_a_module_source_rides_alone() -> None:
+    """No inputs, one pipe per track -- the mirror of a sink module."""
+    plan = partition(_source_sink_graph())
+
+    assert len(plan.sidecars) == 1
+    source = plan.sidecars[0]
+    assert source.packet_source is True
+    assert source.module == "ffrwd.moq.subscribe"
+    assert source.inputs == ()
+    assert source.outputs == ("video", "audio")
+    assert source.graph is not None
+    assert source.graph.input_paths == []
+    assert [unit.path for unit in source.graph.sinks] == [PIPE, PIPE]
+
+
+def test_one_ffmpeg_reads_both_of_a_module_sources_pipes() -> None:
+    plan = partition(_source_sink_graph())
+
+    assert len(plan.ffmpeg) == 1
+    reader = plan.ffmpeg[0]
+    assert reader.graph.input_paths == [PIPE, PIPE]
+    assert [(e.source, e.target) for e in plan.stream_edges] == [
+        (plan.sidecars[0].id, reader.id),
+        (plan.sidecars[0].id, reader.id),
+    ]
+
+    # The src refs the query wrote resolve to that ffmpeg's inputs 0 and 1,
+    # in the catalog's own track order: video, then audio.
+    unit = reader.graph.sinks[0]
+    assert unit.path == "out.mp4"
+    resolved = [reader.graph.sources[_alias_of(o.ref)] for o in unit.outputs]
+    assert resolved == [0, 1]
+
+
+def test_a_module_source_with_two_outputs_is_still_spellable() -> None:
+    """The exemption a packet sink's several inputs get, mirrored for outputs."""
+    check_spellable(partition(_source_sink_graph()))
+
+
+def _module_source_round_trip() -> Graph:
+    g = Graph(input_paths=[], sources={})
+    g.module_sources["s"] = _module_source(rows=(0, 1))
+    g.sinks = [
+        SinkUnit(outputs=[_out("src:s:v:0"), _out("src:s:a:0", "audio")], path="out.mp4")
+    ]
+    return g
+
+
+def test_a_module_source_round_trips_through_to_dict() -> None:
+    g = _module_source_round_trip()
+    restored = Graph.from_dict(g.to_dict())
+    assert restored.module_sources == g.module_sources
+    assert restored.module_sources["s"].tracks[0].row == 0
+    assert restored.module_sources["s"].tracks[1].row == 1
+
+
+def _source_passthrough_graph(*, bounded: bool) -> Graph:
+    """The video visits an external module; the audio maps straight through.
+
+    Both tracks come off the same module source alias, so the shape is
+    :func:`_passthrough_audio_graph` with a source in place of a file.
+    """
+    g = Graph(input_paths=[], sources={})
+    g.module_sources["s"] = _module_source(bounded=bounded)
+    g.nodes["e0"] = Node(
+        id="e0", filter="denoise", args={}, inputs=["src:s:v:0"], outputs=["video"]
+    )
+    g.sinks = [SinkUnit(outputs=[_out("e0"), _out("src:s:a:0", "audio")], path="out.mp4")]
+    return g
+
+
+def test_an_unbounded_module_source_reads_once_however_the_graph_splits() -> None:
+    """Its pipe cannot be reopened, so it joins the live set and reads once."""
+    plan = partition(
+        _source_passthrough_graph(bounded=False), external=external_ids("e0")
+    )
+
+    source = next(p for p in plan.sidecars if p.packet_source)
+    outgoing = [e for e in plan.stream_edges if e.source == source.id]
+    assert len(outgoing) == 2  # the source itself never opens twice
+
+    readers = {
+        e.target for e in plan.stream_edges if e.source == source.id
+    }
+    assert len(readers) == 1  # exactly one process takes the source's pipes
+    (reader_id,) = readers
+    onward = [e for e in plan.stream_edges if e.source == reader_id]
+    # the reader relays the audio leg straight through, unfiltered.
+    audio = next(e for e in onward if e.ref == "src:s:a:0")
+    assert audio.format.codec == COPY_CODEC
+
+
+def test_a_bounded_module_source_still_reads_once() -> None:
+    """A sidecar pipe cannot be reopened even when the catalog is bounded."""
+    plan = partition(
+        _source_passthrough_graph(bounded=True), external=external_ids("e0")
+    )
+
+    source = next(p for p in plan.sidecars if p.packet_source)
+    readers = {e.target for e in plan.stream_edges if e.source == source.id}
+    assert len(readers) == 1
+
+
+def _quick_leg_bound(*, bounded: bool) -> int:
+    plan = partition(_source_passthrough_graph(bounded=bounded), external=external_ids("e0"))
+    source = next(p for p in plan.sidecars if p.packet_source)
+    reader = next(e.target for e in plan.stream_edges if e.source == source.id)
+    audio = next(
+        e for e in plan.stream_edges if e.source == reader and e.ref == "src:s:a:0"
+    )
+    return audio.bound
+
+
+def test_an_unbounded_module_source_joins_the_live_set() -> None:
+    """Only the unbounded catalog earns a fan-out buffer off the reader.
+
+    Single-reader holds regardless (the tests above), but the buffering
+    :meth:`_bound_edges` gives a live fan-out is for the unbounded case only:
+    a bounded catalog is compile-time countable and does not need it.
+    """
+    assert _quick_leg_bound(bounded=False) > 0
+    assert _quick_leg_bound(bounded=True) == 0
