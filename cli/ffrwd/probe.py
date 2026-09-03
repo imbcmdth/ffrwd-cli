@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import xml.etree.ElementTree as ET
 from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 
@@ -48,6 +49,11 @@ _NOT_CUE_BLOCKS = ("NOTE", "STYLE", "REGION", _WEBVTT_MAGIC)
 # WebVTT writes its payload with HTML's character references. `&amp;` is read
 # LAST so that an escaped ampersand does not turn a following name into one.
 _WEBVTT_UNESCAPES = (("&lt;", "<"), ("&gt;", ">"), ("&amp;", "&"))
+
+# A rendition's own tag, an HLS master's marker, and how HLS spells "no more
+# segments are coming" -- read from manifest text, never from ffprobe's JSON.
+_STREAM_INF_TAG = "#EXT-X-STREAM-INF"
+_ENDLIST_TAG = "#EXT-X-ENDLIST"
 
 
 @dataclass(frozen=True)
@@ -129,6 +135,26 @@ class CueMeta:
 
 
 @dataclass(frozen=True)
+class RenditionMeta:
+    """One row of an ABR source -- an HLS master's variant or a DASH
+    Representation, read from ffprobe's ``-show_programs`` (HLS) or the
+    manifest itself (DASH; ffprobe groups a DASH file's representations
+    into one program, not one per rendition, so that path reads the MPD
+    directly). Every field but `streams` is opportunistic, like
+    :class:`StreamMeta`.
+    """
+
+    streams: list[StreamMeta]  # this rendition's streams, file order
+    bandwidth: int | None  # HLS BANDWIDTH / MPD @bandwidth
+    width: int | None  # from its video stream, else None
+    height: int | None
+    codecs: str | None  # HLS CODECS / MPD @codecs, verbatim
+    name: str | None  # HLS NAME, else None
+    language: str | None  # HLS LANGUAGE / MPD @lang, else None
+    program_id: int | None  # ffprobe's program id when one exists
+
+
+@dataclass(frozen=True)
 class ProbeResult:
     streams: list[StreamMeta]  # file order
     duration: float | None = None  # container-level, from -show_format
@@ -146,6 +172,13 @@ class ProbeResult:
     # The WHOLE tag dict, not a whitelist: which keys a query may read is
     # decided where they resolve, not here.
     tags: dict[str, str] = field(default_factory=dict)
+    # One row per ABR rendition (HLS variant / DASH Representation). Empty
+    # for a plain file or a media-only playlist -- the one-row shape stays
+    # implicit there.
+    renditions: list[RenditionMeta] = field(default_factory=list)
+    # No #EXT-X-ENDLIST (HLS) or type="dynamic" (MPD). False for anything
+    # that is not a manifest, and for a remote one this process never reread.
+    live: bool = False
 
     def by_type(self, t: StreamType) -> list[StreamMeta]:
         return [s for s in self.streams if s.type == t]
@@ -267,6 +300,7 @@ def _cached_ffprobe(
         "-show_streams",
         "-show_format",
         "-show_chapters",
+        "-show_programs",
         *flags,
         spec,
     ]
@@ -297,6 +331,8 @@ def _cached_ffprobe(
         return None
 
     parsed = _with_cues(parsed, spec)
+    parsed = _with_hls_live(parsed, spec)
+    parsed = _with_dash(parsed, spec)
     _cache[cache_key] = parsed
     return parsed
 
@@ -352,12 +388,234 @@ def _with_cues(parsed: ProbeResult, spec: str) -> ProbeResult:
     """
     if parsed.format_name != WEBVTT_FORMAT or is_url(spec):
         return parsed
-    try:
-        with open(spec, encoding="utf-8-sig") as handle:
-            text = handle.read()
-    except (OSError, UnicodeDecodeError):
+    text = _read_local(spec)
+    if text is None:
         return parsed
     return replace(parsed, cues=parse_webvtt(text))
+
+
+def _read_local(path: str) -> str | None:
+    """`path`'s full text, or None if it cannot be read as one.
+
+    Shared by every branch here that rereads a manifest ffprobe already
+    fetched -- WebVTT cues, an HLS playlist, a DASH MPD -- as text, one
+    more time. Always a LOCAL path; a URL is never fetched a second time.
+    """
+    try:
+        with open(path, encoding="utf-8-sig") as handle:
+            return handle.read()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _with_hls_live(parsed: ProbeResult, spec: str) -> ProbeResult:
+    """`parsed.live` from the manifest text, for a local HLS input only.
+
+    A media playlist is read directly: `live` is the absence of
+    #EXT-X-ENDLIST. A master carries no segments of its own, so its FIRST
+    variant is read instead -- the URI on the line right after the first
+    #EXT-X-STREAM-INF, resolved against the master's own directory, the
+    same rule a real HLS client follows. A remote manifest, or a master
+    whose first variant cannot be resolved locally, is left `live=False`:
+    CI probes no network, and `probe()` already paid for one ffprobe fetch
+    of this spec -- a second, manual one here is not this plan's to make.
+    """
+    if parsed.format_name is None or "hls" not in parsed.format_name or is_url(spec):
+        return parsed
+    text = _read_local(spec)
+    if text is None:
+        return parsed
+    if _STREAM_INF_TAG in text:
+        media_text = _first_variant_text(text, spec)
+        if media_text is None:
+            return parsed
+        return replace(parsed, live=_ENDLIST_TAG not in media_text)
+    return replace(parsed, live=_ENDLIST_TAG not in text)
+
+
+def _first_variant_text(master_text: str, master_path: str) -> str | None:
+    """The text of a master playlist's first variant, or None if it names
+    no local file this process can read.
+
+    The variant URI is the next non-comment line after the first
+    #EXT-X-STREAM-INF tag, resolved relative to the master's own directory.
+    """
+    lines = master_text.splitlines()
+    for i, line in enumerate(lines):
+        if not line.startswith(_STREAM_INF_TAG):
+            continue
+        for uri in lines[i + 1 :]:
+            uri = uri.strip()
+            if not uri or uri.startswith("#"):
+                continue
+            if is_url(uri):
+                return None
+            return _read_local(os.path.join(os.path.dirname(master_path), uri))
+    return None
+
+
+def _with_dash(parsed: ProbeResult, spec: str) -> ProbeResult:
+    """`parsed.renditions`/`parsed.live` from the MPD itself, for a local
+    DASH input only.
+
+    ffprobe's dash demuxer groups every Representation into ONE program --
+    confirmed against a real two-video-rendition MPD, ``-show_programs``
+    prints a single program holding all three streams, unlike HLS's one
+    program per variant -- so the HLS path above cannot serve DASH. The
+    MPD is read directly instead: no network re-fetch for a remote one,
+    same rule as the HLS branch.
+    """
+    if parsed.format_name != "dash" or is_url(spec):
+        return parsed
+    text = _read_local(spec)
+    if text is None:
+        return parsed
+    renditions, live = _parse_mpd(text, parsed.streams)
+    return replace(parsed, renditions=renditions, live=live)
+
+
+def _local_name(tag: str) -> str:
+    """An XML element's tag with its namespace URI stripped."""
+    return tag.rsplit("}", 1)[-1]
+
+
+def _int_attr(elem: ET.Element, key: str) -> int | None:
+    """An XML attribute as int, or None if absent or unparseable."""
+    value = elem.get(key)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def _parse_mpd(text: str, streams: list[StreamMeta]) -> tuple[list[RenditionMeta], bool]:
+    """One RenditionMeta per ``<Representation>``, and whether the MPD is
+    live (``type="dynamic"`` on the root element).
+
+    A Representation is matched to its StreamMeta by the `id` tag ffprobe
+    stamps on every DASH stream -- equal to the Representation's own
+    ``@id``, confirmed against a real probe of a compiler-generated
+    two-rendition MPD. Width/height/codecs prefer the matched stream (what
+    ffprobe itself measured) and fall back to the Representation's own
+    attributes, and then its AdaptationSet's, when nothing matched or the
+    stream did not carry them.
+    """
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError:
+        return [], False
+    live = root.get("type") == "dynamic"
+
+    by_id: dict[str, StreamMeta] = {}
+    for stream in streams:
+        stream_id = stream.metadata.get("id")
+        if stream_id is not None:
+            by_id[stream_id] = stream
+
+    renditions: list[RenditionMeta] = []
+    for period in root:
+        if _local_name(period.tag) != "Period":
+            continue
+        for adaptation_set in period:
+            if _local_name(adaptation_set.tag) != "AdaptationSet":
+                continue
+            for representation in adaptation_set:
+                if _local_name(representation.tag) != "Representation":
+                    continue
+                rep_id = representation.get("id")
+                matched = by_id.get(rep_id) if rep_id is not None else None
+                width = matched.width if matched is not None else None
+                height = matched.height if matched is not None else None
+                if width is None:
+                    width = _int_attr(representation, "width")
+                if height is None:
+                    height = _int_attr(representation, "height")
+                renditions.append(
+                    RenditionMeta(
+                        streams=[matched] if matched is not None else [],
+                        bandwidth=_int_attr(representation, "bandwidth"),
+                        width=width,
+                        height=height,
+                        codecs=representation.get("codecs") or adaptation_set.get("codecs"),
+                        name=None,
+                        language=adaptation_set.get("lang"),
+                        program_id=None,
+                    )
+                )
+    return renditions, live
+
+
+def _tag_int(tags: dict[str, str], key: str) -> int | None:
+    """A string-valued tag as int, or None if absent or unparseable."""
+    value = tags.get(key)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def _hls_renditions(
+    raw_programs: object, by_global_index: dict[int, StreamMeta]
+) -> list[RenditionMeta]:
+    """One RenditionMeta per ffprobe program (``-show_programs``) -- the hls
+    demuxer's own grouping of a master playlist's variants.
+
+    A bare media playlist, probed with no master above it, gets ONE
+    phantom program too, but ffprobe always stamps its `variant_bitrate`
+    tag `0` there (a real variant's BANDWIDTH is positive, per the HLS
+    spec) -- verified against a real ffprobe run, so that program is
+    skipped rather than reported as a one-rendition source. A program
+    missing the tag entirely (`bandwidth=None`, not `0`) is kept: nothing
+    here says its bitrate, but the program itself is real.
+    """
+    if not isinstance(raw_programs, list):
+        return []
+    renditions: list[RenditionMeta] = []
+    for raw in raw_programs:
+        if not isinstance(raw, dict):
+            continue
+        raw_streams = raw.get("streams")
+        if not isinstance(raw_streams, list):
+            continue
+
+        rendition_streams: list[StreamMeta] = []
+        for raw_stream in raw_streams:
+            if not isinstance(raw_stream, dict):
+                continue
+            index = _int_opt(raw_stream, "index")
+            stream = by_global_index.get(index) if index is not None else None
+            if stream is not None:
+                rendition_streams.append(stream)
+
+        program_tags = _tags(raw)
+        bandwidth = _tag_int(program_tags, "variant_bitrate")
+        if bandwidth is None:
+            for raw_stream in raw_streams:
+                if isinstance(raw_stream, dict):
+                    bandwidth = _tag_int(_tags(raw_stream), "variant_bitrate")
+                    if bandwidth is not None:
+                        break
+        if bandwidth == 0:
+            continue
+
+        video = next((s for s in rendition_streams if s.type == "video"), None)
+        renditions.append(
+            RenditionMeta(
+                streams=rendition_streams,
+                bandwidth=bandwidth,
+                width=video.width if video is not None else None,
+                height=video.height if video is not None else None,
+                codecs=program_tags.get("codecs"),
+                name=program_tags.get("name"),
+                language=program_tags.get("language"),
+                program_id=_int_opt(raw, "program_id"),
+            )
+        )
+    return renditions
 
 
 def _parse_streams(data: object) -> ProbeResult | None:
@@ -370,6 +628,9 @@ def _parse_streams(data: object) -> ProbeResult | None:
 
         streams: list[StreamMeta] = []
         attachments: list[AttachmentMeta] = []
+        # ffprobe's own, container-level stream index -- what `-show_programs`
+        # names a rendition's streams by, unlike StreamMeta's per-type one.
+        by_global_index: dict[int, StreamMeta] = {}
         video_idx = 0
         audio_idx = 0
         subtitle_idx = 0
@@ -478,6 +739,10 @@ def _parse_streams(data: object) -> ProbeResult | None:
                     )
                 )
             # other codec_type values are ignored.
+            if codec_type in ("video", "audio", "subtitle", "data"):
+                global_index = _int_opt(raw, "index")
+                if global_index is not None:
+                    by_global_index[global_index] = streams[-1]
 
         container_duration = None
         container_tags: dict[str, str] = {}
@@ -488,6 +753,10 @@ def _parse_streams(data: object) -> ProbeResult | None:
             container_tags = _tags(raw_format)
             format_name = _str_opt(raw_format, "format_name")
 
+        renditions: list[RenditionMeta] = []
+        if format_name is not None and "hls" in format_name:
+            renditions = _hls_renditions(data.get("programs"), by_global_index)
+
         chapters = _parse_chapters(data.get("chapters"))
 
         return ProbeResult(
@@ -497,6 +766,7 @@ def _parse_streams(data: object) -> ProbeResult | None:
             format_name=format_name,
             tags=container_tags,
             attachments=attachments,
+            renditions=renditions,
         )
     except (KeyError, TypeError, ValueError):
         return None

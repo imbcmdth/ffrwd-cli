@@ -21,6 +21,7 @@ from ffrwd.probe import (
     AttachmentMeta,
     ProbeFailure,
     ProbeResult,
+    RenditionMeta,
     StreamMeta,
     clear_cache,
     parse_webvtt,
@@ -1184,6 +1185,422 @@ def test_probe_result_dataclass_shape() -> None:
     assert r.by_type("audio") == []
     with pytest.raises(Exception):
         r.streams = []  # type: ignore[misc]
+
+
+# --- ABR renditions (HLS -show_programs, DASH's MPD) and live detection ----
+#
+# Every shape asserted here was checked against a REAL ffprobe run during
+# development (an ffmpeg-encoded two-rung HLS ladder and DASH MPD, both
+# -show_programs -show_streams -of json), not guessed:
+#   - an HLS master: one ffprobe program per variant, `tags.variant_bitrate`
+#     on both the program and each of its streams, `streams[].index` the
+#     container-level index.
+#   - a BARE media playlist, probed with no master above it, still gets one
+#     ffprobe program, but `variant_bitrate` is always "0" there -- a real
+#     variant's BANDWIDTH is positive per the HLS spec, so that is the
+#     signal a phantom program is filtered on.
+#   - a DASH MPD: ffprobe's dash demuxer groups EVERY Representation into
+#     ONE program, not one per rendition, so renditions come from the MPD
+#     itself; each stream carries an `id` tag equal to its Representation's
+#     own `@id`.
+
+
+def _hls_program(
+    program_id: int, indices: list[int], bandwidth: str | None
+) -> dict[str, object]:
+    """One ffprobe `-show_programs` program entry, shaped like real output."""
+    tags: dict[str, str] = {}
+    if bandwidth is not None:
+        tags["variant_bitrate"] = bandwidth
+    return {
+        "program_id": program_id,
+        "tags": tags,
+        "streams": [{"index": i} for i in indices],
+    }
+
+
+def _hls_master_json(programs: list[dict[str, object]]) -> str:
+    return json.dumps(
+        {
+            "streams": [
+                {"index": 0, "codec_type": "video", "width": 640, "height": 360},
+                {"index": 1, "codec_type": "audio", "tags": {"language": "und"}},
+                {"index": 2, "codec_type": "video", "width": 320, "height": 180},
+                {"index": 3, "codec_type": "audio", "tags": {"language": "und"}},
+            ],
+            "programs": programs,
+            "format": {"format_name": "hls"},
+        }
+    )
+
+
+def test_hls_master_yields_one_rendition_per_program(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    f = tmp_path / "master.m3u8"
+    f.write_bytes(b"data")
+    _fake_ffprobe_present(monkeypatch)
+    _fake_run(
+        monkeypatch,
+        stdout=_hls_master_json(
+            [_hls_program(0, [0, 1], "861791"), _hls_program(1, [2, 3], "344917")]
+        ),
+    )
+    result = probe(str(f))
+    assert result is not None
+    assert len(result.renditions) == 2
+    assert isinstance(result.renditions[0], RenditionMeta)
+
+    hi, lo = result.renditions
+    assert hi.bandwidth == 861791
+    assert hi.width == 640
+    assert hi.height == 360
+    assert hi.program_id == 0
+    assert [s.type for s in hi.streams] == ["video", "audio"]
+
+    assert lo.bandwidth == 344917
+    assert lo.width == 320
+    assert lo.height == 180
+    assert lo.program_id == 1
+
+
+def test_hls_program_with_no_tags_at_all_still_appears_with_none_fields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`bandwidth=None` (a real column value) reads differently from the
+    `0` a bare media playlist's phantom program gets -- this program is
+    kept, that one is not (see test below)."""
+    f = tmp_path / "master.m3u8"
+    f.write_bytes(b"data")
+    _fake_ffprobe_present(monkeypatch)
+    _fake_run(
+        monkeypatch,
+        stdout=_hls_master_json(
+            [
+                _hls_program(0, [0, 1], "861791"),
+                {"program_id": 1, "streams": [{"index": 2}, {"index": 3}]},
+            ]
+        ),
+    )
+    result = probe(str(f))
+    assert result is not None
+    assert len(result.renditions) == 2
+    untagged = result.renditions[1]
+    assert untagged.bandwidth is None
+    assert untagged.codecs is None
+    assert untagged.name is None
+    assert untagged.language is None
+    assert untagged.program_id == 1
+
+
+def test_bandwidth_falls_back_to_a_streams_own_tag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ffprobe duplicates `variant_bitrate` onto every stream in a program;
+    a program missing its OWN tag reads that instead."""
+    f = tmp_path / "master.m3u8"
+    f.write_bytes(b"data")
+    _fake_ffprobe_present(monkeypatch)
+    _fake_run(
+        monkeypatch,
+        stdout=json.dumps(
+            {
+                "streams": [
+                    {"index": 0, "codec_type": "video", "width": 640, "height": 360}
+                ],
+                "programs": [
+                    {
+                        "program_id": 0,
+                        "streams": [{"index": 0, "tags": {"variant_bitrate": "500000"}}],
+                    }
+                ],
+                "format": {"format_name": "hls"},
+            }
+        ),
+    )
+    result = probe(str(f))
+    assert result is not None
+    assert result.renditions[0].bandwidth == 500000
+
+
+def test_a_bare_media_playlist_reports_no_renditions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    f = tmp_path / "playlist.m3u8"
+    f.write_bytes(b"data")
+    _fake_ffprobe_present(monkeypatch)
+    _fake_run(
+        monkeypatch,
+        stdout=json.dumps(
+            {
+                "streams": [
+                    {"index": 0, "codec_type": "video", "width": 640, "height": 360},
+                    {"index": 1, "codec_type": "audio"},
+                ],
+                "programs": [_hls_program(0, [0, 1], "0")],
+                "format": {"format_name": "hls"},
+            }
+        ),
+    )
+    result = probe(str(f))
+    assert result is not None
+    assert result.renditions == []
+
+
+def test_a_plain_container_reports_no_renditions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`-show_programs` runs unconditionally now; a plain file's is empty."""
+    f = tmp_path / "x.mp4"
+    f.write_bytes(b"data")
+    _fake_ffprobe_present(monkeypatch)
+    _fake_run(
+        monkeypatch,
+        stdout=json.dumps(
+            {
+                "streams": [
+                    {"index": 0, "codec_type": "video", "width": 320, "height": 240}
+                ],
+                "programs": [],
+                "format": {"format_name": "mov,mp4,m4a,3gp,3g2,mj2"},
+            }
+        ),
+    )
+    result = probe(str(f))
+    assert result is not None
+    assert result.renditions == []
+
+
+def test_an_audio_only_program_has_no_video_stream(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    f = tmp_path / "master.m3u8"
+    f.write_bytes(b"data")
+    _fake_ffprobe_present(monkeypatch)
+    _fake_run(
+        monkeypatch,
+        stdout=json.dumps(
+            {
+                "streams": [{"index": 0, "codec_type": "audio", "sample_rate": "44100"}],
+                "programs": [_hls_program(0, [0], "128000")],
+                "format": {"format_name": "hls"},
+            }
+        ),
+    )
+    result = probe(str(f))
+    assert result is not None
+    assert len(result.renditions) == 1
+    rendition = result.renditions[0]
+    assert [s.type for s in rendition.streams] == ["audio"]
+    assert rendition.width is None
+    assert rendition.height is None
+    assert rendition.bandwidth == 128000
+
+
+# --- live: #EXT-X-ENDLIST / MPD type="dynamic" ------------------------------
+
+_HLS_MEDIA_JSON = json.dumps({"streams": [], "programs": [], "format": {"format_name": "hls"}})
+
+
+def test_live_is_true_when_a_media_playlist_has_no_endlist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    f = tmp_path / "playlist.m3u8"
+    f.write_text("#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2.0,\nseg0.ts\n", encoding="utf-8")
+    _fake_ffprobe_present(monkeypatch)
+    _fake_run(monkeypatch, stdout=_HLS_MEDIA_JSON)
+    result = probe(str(f))
+    assert result is not None
+    assert result.live is True
+
+
+def test_live_is_false_when_a_media_playlist_has_endlist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    f = tmp_path / "playlist.m3u8"
+    f.write_text(
+        "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2.0,\nseg0.ts\n#EXT-X-ENDLIST\n",
+        encoding="utf-8",
+    )
+    _fake_ffprobe_present(monkeypatch)
+    _fake_run(monkeypatch, stdout=_HLS_MEDIA_JSON)
+    result = probe(str(f))
+    assert result is not None
+    assert result.live is False
+
+
+def test_live_resolves_a_master_to_its_first_variant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A master carries no ENDLIST of its own -- its first variant does."""
+    (tmp_path / "hi.m3u8").write_text(
+        "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2.0,\nseg0.ts\n#EXT-X-ENDLIST\n",
+        encoding="utf-8",
+    )
+    master = tmp_path / "master.m3u8"
+    master.write_text(
+        "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=800000\nhi.m3u8\n", encoding="utf-8"
+    )
+    _fake_ffprobe_present(monkeypatch)
+    _fake_run(
+        monkeypatch,
+        stdout=_hls_master_json([_hls_program(0, [0, 1], "800000")]),
+    )
+    result = probe(str(master))
+    assert result is not None
+    assert result.live is False
+
+
+def test_live_master_is_true_when_its_first_variant_has_no_endlist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "hi.m3u8").write_text(
+        "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2.0,\nseg0.ts\n", encoding="utf-8"
+    )
+    master = tmp_path / "master.m3u8"
+    master.write_text(
+        "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=800000\nhi.m3u8\n", encoding="utf-8"
+    )
+    _fake_ffprobe_present(monkeypatch)
+    _fake_run(
+        monkeypatch,
+        stdout=_hls_master_json([_hls_program(0, [0, 1], "800000")]),
+    )
+    result = probe(str(master))
+    assert result is not None
+    assert result.live is True
+
+
+def test_a_url_spec_leaves_live_false(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No second, manual fetch for `live` over a URL -- CI probes no
+    network, and `probe()` already paid for one ffprobe fetch of this spec."""
+    _fake_ffprobe_present(monkeypatch)
+    _fake_run(monkeypatch, stdout=_HLS_MEDIA_JSON)
+    result = probe("https://example.com/master.m3u8")
+    assert result is not None
+    assert result.live is False
+
+
+_MPD_STATIC = """<?xml version="1.0"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static">
+  <Period>
+    <AdaptationSet contentType="video">
+      <Representation id="0" bandwidth="800000" width="640" height="360" \
+codecs="avc1.640016" />
+    </AdaptationSet>
+  </Period>
+</MPD>
+"""
+_MPD_DYNAMIC = _MPD_STATIC.replace('type="static"', 'type="dynamic"')
+_DASH_EMPTY_JSON = json.dumps({"streams": [], "programs": [], "format": {"format_name": "dash"}})
+
+
+def test_mpd_static_is_not_live(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    f = tmp_path / "out.mpd"
+    f.write_text(_MPD_STATIC, encoding="utf-8")
+    _fake_ffprobe_present(monkeypatch)
+    _fake_run(monkeypatch, stdout=_DASH_EMPTY_JSON)
+    result = probe(str(f))
+    assert result is not None
+    assert result.live is False
+
+
+def test_mpd_dynamic_is_live(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    f = tmp_path / "out.mpd"
+    f.write_text(_MPD_DYNAMIC, encoding="utf-8")
+    _fake_ffprobe_present(monkeypatch)
+    _fake_run(monkeypatch, stdout=_DASH_EMPTY_JSON)
+    result = probe(str(f))
+    assert result is not None
+    assert result.live is True
+
+
+# --- DASH renditions, read from the MPD (ffprobe lumps them into one program)
+
+
+_MPD_LADDER = """<?xml version="1.0" encoding="utf-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static" \
+mediaPresentationDuration="PT3.0S">
+  <Period id="0" start="PT0.0S">
+    <AdaptationSet id="0" contentType="video" lang="und">
+      <Representation id="0" mimeType="video/mp4" codecs="avc1.640016" \
+bandwidth="800000" width="640" height="360" />
+      <Representation id="1" mimeType="video/mp4" codecs="avc1.64000d" \
+bandwidth="300000" width="320" height="180" />
+    </AdaptationSet>
+    <AdaptationSet id="1" contentType="audio" lang="und">
+      <Representation id="2" mimeType="audio/mp4" codecs="mp4a.40.2" \
+bandwidth="128000" />
+    </AdaptationSet>
+  </Period>
+</MPD>
+"""
+
+
+def test_dash_mpd_yields_one_rendition_per_representation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    f = tmp_path / "out.mpd"
+    f.write_text(_MPD_LADDER, encoding="utf-8")
+    _fake_ffprobe_present(monkeypatch)
+    _fake_run(
+        monkeypatch,
+        stdout=json.dumps(
+            {
+                "streams": [
+                    {
+                        "index": 0,
+                        "codec_type": "video",
+                        "width": 640,
+                        "height": 360,
+                        "tags": {"variant_bitrate": "800000", "id": "0"},
+                    },
+                    {
+                        "index": 1,
+                        "codec_type": "video",
+                        "width": 320,
+                        "height": 180,
+                        "tags": {"variant_bitrate": "300000", "id": "1"},
+                    },
+                    {
+                        "index": 2,
+                        "codec_type": "audio",
+                        "tags": {
+                            "variant_bitrate": "128000",
+                            "id": "2",
+                            "language": "und",
+                        },
+                    },
+                ],
+                "programs": [
+                    {
+                        "program_id": 0,
+                        "streams": [{"index": 0}, {"index": 1}, {"index": 2}],
+                    }
+                ],
+                "format": {"format_name": "dash"},
+            }
+        ),
+    )
+    result = probe(str(f))
+    assert result is not None
+    assert len(result.renditions) == 3
+
+    hi, lo, audio = result.renditions
+    assert hi.bandwidth == 800000
+    assert hi.width == 640
+    assert hi.height == 360
+    assert hi.codecs == "avc1.640016"
+    assert [s.type for s in hi.streams] == ["video"]
+
+    assert lo.bandwidth == 300000
+    assert lo.width == 320
+    assert lo.height == 180
+
+    assert audio.bandwidth == 128000
+    assert audio.width is None
+    assert audio.height is None
+    assert audio.language == "und"
 
 
 # --- WebVTT cues, which ffprobe never enumerates ---------------------------
