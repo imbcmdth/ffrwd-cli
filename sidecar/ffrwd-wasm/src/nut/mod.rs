@@ -19,7 +19,10 @@
 //!
 //! What is written: the same headers, one framecode that codes every field
 //! explicitly, a syncpoint whenever the last one is further back than
-//! `max_distance`, and frames carrying their PTS and a header checksum.
+//! `max_distance`, and frames carrying their PTS and a header checksum. A
+//! raw stream's frames are always keyframes; an encoded stream's packets
+//! state their own keyframe flag and must be handed over in decode order, so
+//! a reader can work their dts back out the way it works a demuxed input's.
 //!
 //! # The annotation stream
 //!
@@ -617,7 +620,12 @@ mod tests {
         {
             let mut muxer = Muxer::new(&mut wire, &stream).expect("write headers");
             for (pts, data) in &frames {
-                muxer.write_frame(*pts, data).expect("write packet");
+                let packet = Packet {
+                    pts: *pts,
+                    dts: None,
+                    keyframe: true,
+                };
+                muxer.write_coded(&packet, data).expect("write packet");
             }
             muxer.finish().expect("finish");
         }

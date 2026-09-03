@@ -7,20 +7,27 @@ use anyhow::{anyhow, bail, Result};
 
 use super::bytes::{crc32, put_s, put_u32, put_u64, put_v, put_vb};
 use super::{
-    flags, Media, Stream, ANNOTATION_CLASS, ANNOTATION_FOURCC, ANNOTATION_STREAM_ID, AUDIO_CLASS,
-    FILE_ID, MAIN_STARTCODE, MAX_DISTANCE, STREAM_STARTCODE, SYNCPOINT_STARTCODE, TRAILING_KEY,
-    VERSION, VIDEO_CLASS,
+    flags, Media, Packet, Stream, ANNOTATION_CLASS, ANNOTATION_FOURCC, ANNOTATION_STREAM_ID,
+    AUDIO_CLASS, FILE_ID, MAIN_STARTCODE, MAX_DISTANCE, STREAM_STARTCODE, SYNCPOINT_STARTCODE,
+    TRAILING_KEY, VERSION, VIDEO_CLASS,
 };
 
 /// The framecode every frame uses. It sets only `CODED`, so each frame states
 /// the rest of its flags itself: one table entry serves every frame, and the
-/// table needs no tuning to the stream.
+/// table needs no tuning to the stream - a raw frame's fixed flags and a
+/// coded packet's per-packet flags both ride through it unchanged.
 const EXPLICIT_FRAME_CODE: u8 = 1;
 
-/// What each frame states. Uncompressed frames are all keyframes; the PTS and
-/// the size are always coded, and the header checksum keeps the frame
+/// What each raw frame states. Uncompressed frames are all keyframes; the PTS
+/// and the size are always coded, and the header checksum keeps the frame
 /// readable however far it sits from a syncpoint.
 const FRAME_FLAGS: u64 = flags::KEY | flags::CODED_PTS | flags::SIZE_MSB | flags::CHECKSUM;
+
+/// What an encoded packet states, past its own keyframe flag: the PTS and the
+/// size are always coded, and the header checksum keeps the frame readable
+/// however far it sits from a syncpoint. `write_coded` adds `flags::KEY`
+/// itself, per packet, since only the packet knows.
+const CODED_FRAME_FLAGS: u64 = flags::CODED_PTS | flags::SIZE_MSB | flags::CHECKSUM;
 
 /// The framecode table's size multiplier. With it at 1 a frame's coded size
 /// is its byte count.
@@ -80,9 +87,41 @@ impl<W: Write> Muxer<W> {
         Ok(muxer)
     }
 
-    /// One frame, at `pts` in the stream's time base.
+    /// One frame, at `pts` in the stream's time base. Refused on an encoded
+    /// stream: an encoded packet states its own keyframe flag, which
+    /// `write_coded` carries and this fixed-flags path does not.
     pub fn write_frame(&mut self, pts: i64, data: &[u8]) -> Result<()> {
-        self.write_packet_for(0, pts, data)
+        if self.stream.codec_name().is_some() {
+            bail!(
+                "write_frame on an encoded {} stream; use write_coded",
+                self.stream.fourcc_name()
+            );
+        }
+        self.write_packet_for(0, pts, FRAME_FLAGS, data)
+    }
+
+    /// One encoded packet, in the decode order it must be handed to this
+    /// method in. Refused on a raw stream: use `write_frame` there instead.
+    ///
+    /// `packet.pts` is written as `write_frame` writes a raw frame's; NUT
+    /// carries no dts field at all, so `packet.dts` is not written, and a
+    /// reader - this crate's own `Demuxer` included - works dts back out of
+    /// the pts values it receives, in the order it receives them, through a
+    /// reorder buffer of `decode_delay + 1` entries. That is also why the
+    /// packets must arrive here in decode order: the buffer that recovers
+    /// dts on the way out depends on it. `packet.keyframe` sets `flags::KEY`
+    /// on this packet alone, which is what lets key and non-key packets share
+    /// the wire. Nothing here carries a duration: what NUT implies from the
+    /// next packet's pts is all a reader gets back.
+    pub fn write_coded(&mut self, packet: &Packet, data: &[u8]) -> Result<()> {
+        if self.stream.codec_name().is_none() {
+            bail!(
+                "write_coded on a raw {} stream; use write_frame",
+                self.stream.fourcc_name()
+            );
+        }
+        let frame_flags = CODED_FRAME_FLAGS | if packet.keyframe { flags::KEY } else { 0 };
+        self.write_packet_for(0, packet.pts, frame_flags, data)
     }
 
     /// The rows a module produced for the frame at `pts`, as NDJSON, on the
@@ -96,7 +135,12 @@ impl<W: Write> Muxer<W> {
         if rows.is_empty() {
             return Ok(());
         }
-        self.write_packet_for(ANNOTATION_STREAM_ID, pts, rows.join("\n").as_bytes())
+        self.write_packet_for(
+            ANNOTATION_STREAM_ID,
+            pts,
+            FRAME_FLAGS,
+            rows.join("\n").as_bytes(),
+        )
     }
 
     /// The rows a module had no frame to put them on, as one record after
@@ -110,11 +154,21 @@ impl<W: Write> Muxer<W> {
             return Ok(());
         }
         let record = trailing_record(rows)?;
-        self.write_packet_for(ANNOTATION_STREAM_ID, pts, record.as_bytes())
+        self.write_packet_for(ANNOTATION_STREAM_ID, pts, FRAME_FLAGS, record.as_bytes())
     }
 
-    /// One frame on `stream_id`, at `pts` in the stream's time base.
-    fn write_packet_for(&mut self, stream_id: u64, pts: i64, data: &[u8]) -> Result<()> {
+    /// One frame on `stream_id`, at `pts` in the stream's time base, stating
+    /// `frame_flags` - the fixed flags of a raw frame, or the per-packet
+    /// flags `write_coded` works out from the packet's own keyframe bit. The
+    /// framecode table's one entry states `CODED` for every frame, so
+    /// whichever flags are passed in are what a reader gets back out.
+    fn write_packet_for(
+        &mut self,
+        stream_id: u64,
+        pts: i64,
+        frame_flags: u64,
+        data: &[u8],
+    ) -> Result<()> {
         if pts < 0 {
             bail!("NUT output cannot carry the negative PTS {pts}");
         }
@@ -133,9 +187,9 @@ impl<W: Write> Muxer<W> {
         // The framecode table's entry names stream 0, so only the annotation
         // stream states an id of its own.
         let frame_flags = if stream_id == 0 {
-            FRAME_FLAGS
+            frame_flags
         } else {
-            FRAME_FLAGS | flags::STREAM_ID
+            frame_flags | flags::STREAM_ID
         };
 
         let mut header = Vec::with_capacity(16);
@@ -162,8 +216,10 @@ impl<W: Write> Muxer<W> {
     }
 
     /// A syncpoint states where the stream has got to, and how far back the
-    /// previous one was. Every frame here is a keyframe, so the last one
-    /// before the last keyframe is this syncpoint itself.
+    /// previous one was. For a raw stream every frame is a keyframe, so the
+    /// last one before it is this syncpoint itself; an encoded stream places
+    /// one wherever `MAX_DISTANCE` is crossed regardless of which packet that
+    /// lands on, since nothing on this wire ever demuxes by seeking to one.
     fn write_syncpoint(&mut self, pts: i64) -> Result<()> {
         let here = self.pos;
         let back_ptr = self.last_syncpoint.map_or(0, |prev| (here - prev) / 16);
@@ -320,10 +376,48 @@ fn annotation_stream_header(stream: &Stream) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nut::{TimeBase, FILE_ID};
+    use crate::nut::{Demuxer, TimeBase, FILE_ID};
 
     fn a_stream() -> Stream {
         Stream::video("rgba", 2, 2, TimeBase { num: 1, den: 25 }).expect("rgba is carried")
+    }
+
+    /// An h264 stream header shaped like a real encoded one: SPS/PPS as
+    /// extradata, and a decode delay of two - a reorder buffer of three pts -
+    /// which is what a B-frame GOP needs.
+    fn a_coded_h264_stream() -> Stream {
+        Stream {
+            fourcc: b"H264".to_vec(),
+            time_base: TimeBase { num: 1, den: 25 },
+            msb_pts_shift: 14,
+            max_pts_distance: 25,
+            decode_delay: 2,
+            extradata: vec![0x67, 0x42, 0x00, 0x1e],
+            media: Media::Video {
+                width: 16,
+                height: 16,
+                sample_width: 1,
+                sample_height: 1,
+                colorspace_type: 0,
+            },
+        }
+    }
+
+    /// An AAC stream header: ffmpeg's own codec tag for it, and no
+    /// reordering.
+    fn a_coded_aac_stream() -> Stream {
+        Stream {
+            fourcc: b"\xff\x00\x00\x00".to_vec(),
+            time_base: TimeBase { num: 1, den: 48000 },
+            msb_pts_shift: 14,
+            max_pts_distance: 48000,
+            decode_delay: 0,
+            extradata: vec![0x11, 0x88, 0x56, 0xe5, 0x00],
+            media: Media::Audio {
+                sample_rate: 48000,
+                channels: 1,
+            },
+        }
     }
 
     fn wire_with(frames: &[(i64, Vec<u8>)]) -> Vec<u8> {
@@ -388,5 +482,160 @@ mod tests {
         let mut muxer = Muxer::new(&mut wire, &a_stream()).expect("write headers");
         let err = muxer.write_frame(-1, &[0u8; 16]).unwrap_err().to_string();
         assert!(err.contains("negative PTS"), "{err}");
+    }
+
+    #[test]
+    fn write_coded_is_refused_on_a_raw_stream() {
+        let mut wire = Vec::new();
+        let mut muxer = Muxer::new(&mut wire, &a_stream()).expect("write headers");
+        let packet = Packet {
+            pts: 0,
+            dts: None,
+            keyframe: true,
+        };
+        let err = muxer
+            .write_coded(&packet, &[0u8; 4])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("raw") && err.contains("write_frame"), "{err}");
+    }
+
+    #[test]
+    fn write_frame_is_refused_on_a_coded_stream() {
+        let mut wire = Vec::new();
+        let mut muxer = Muxer::new(&mut wire, &a_coded_h264_stream()).expect("write headers");
+        let err = muxer.write_frame(0, &[0u8; 4]).unwrap_err().to_string();
+        assert!(
+            err.contains("encoded") && err.contains("write_coded"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn coded_packets_round_trip_through_the_decode_order_reorder_buffer() {
+        let stream = a_coded_h264_stream();
+        // Decode order: I0 P3 B1 B2 P6 B4 B5, the shape one B-frame GOP
+        // takes. Only the leading I frame is a keyframe.
+        let packets: Vec<(i64, bool)> = vec![
+            (0, true),
+            (3, false),
+            (1, false),
+            (2, false),
+            (6, false),
+            (4, false),
+            (5, false),
+        ];
+        // Worked out by hand from `decode_dts`'s reorder buffer of
+        // `decode_delay + 1` entries: None until the buffer fills, then the
+        // smallest pts seen so far that has not already come out.
+        let expected_dts: [Option<i64>; 7] = [
+            None,
+            None,
+            Some(0),
+            Some(1),
+            Some(2),
+            Some(3),
+            Some(4),
+        ];
+
+        let mut wire = Vec::new();
+        {
+            let mut muxer = Muxer::new(&mut wire, &stream).expect("write headers");
+            for (index, (pts, keyframe)) in packets.iter().enumerate() {
+                let packet = Packet {
+                    pts: *pts,
+                    dts: None,
+                    keyframe: *keyframe,
+                };
+                muxer
+                    .write_coded(&packet, &[index as u8; 4])
+                    .expect("write coded packet");
+            }
+            muxer.finish().expect("finish");
+        }
+
+        let mut demuxer = Demuxer::open(&wire[..]).expect("read headers");
+        assert_eq!(demuxer.stream().decode_delay, 2);
+        assert_eq!(demuxer.stream().extradata, stream.extradata);
+        assert_eq!(demuxer.stream().codec_name(), Some("h264"));
+
+        let mut buf = Vec::new();
+        let mut got = Vec::new();
+        while let Some(packet) = demuxer.read_packet(&mut buf).expect("read coded packet") {
+            got.push((packet, buf.clone()));
+        }
+        assert_eq!(got.len(), packets.len());
+        for (index, ((packet, data), (pts, keyframe))) in got.iter().zip(&packets).enumerate() {
+            assert_eq!(packet.pts, *pts, "packet {index} pts");
+            assert_eq!(packet.keyframe, *keyframe, "packet {index} keyframe");
+            assert_eq!(packet.dts, expected_dts[index], "packet {index} dts");
+            assert_eq!(data, &vec![index as u8; 4], "packet {index} data");
+        }
+    }
+
+    #[test]
+    fn coded_aac_packets_round_trip_with_no_reordering() {
+        let stream = a_coded_aac_stream();
+        // Each packet is one AAC frame of 1024 samples; audio has no B-frames
+        // so every packet is a keyframe and dts is pts.
+        let packets: Vec<(i64, bool)> = (0..4i64).map(|i| (i * 1024, true)).collect();
+
+        let mut wire = Vec::new();
+        {
+            let mut muxer = Muxer::new(&mut wire, &stream).expect("write headers");
+            for (index, (pts, keyframe)) in packets.iter().enumerate() {
+                let packet = Packet {
+                    pts: *pts,
+                    dts: None,
+                    keyframe: *keyframe,
+                };
+                muxer
+                    .write_coded(&packet, &[0x21, index as u8, 0x10, 0x04])
+                    .expect("write coded packet");
+            }
+            muxer.finish().expect("finish");
+        }
+
+        let mut demuxer = Demuxer::open(&wire[..]).expect("read headers");
+        assert_eq!(demuxer.stream().decode_delay, 0);
+        assert_eq!(demuxer.stream().codec_name(), Some("aac"));
+
+        let mut buf = Vec::new();
+        let mut got = Vec::new();
+        while let Some(packet) = demuxer.read_packet(&mut buf).expect("read coded packet") {
+            got.push((packet, buf.clone()));
+        }
+        assert_eq!(got.len(), packets.len());
+        for (index, ((packet, data), (pts, keyframe))) in got.iter().zip(&packets).enumerate() {
+            assert_eq!(packet.pts, *pts, "packet {index} pts");
+            assert_eq!(packet.dts, Some(*pts), "packet {index} dts: no reordering");
+            assert_eq!(packet.keyframe, *keyframe, "packet {index} keyframe");
+            assert_eq!(
+                data,
+                &vec![0x21, index as u8, 0x10, 0x04],
+                "packet {index} data"
+            );
+        }
+    }
+
+    #[test]
+    fn the_raw_path_writes_the_same_bytes_it_always_did() {
+        // A pin over `write_frame`'s exact output, so a refactor that shares
+        // machinery with `write_coded` cannot silently change it.
+        let frames: Vec<(i64, Vec<u8>)> = (0..3i64).map(|i| (i, vec![i as u8; 16])).collect();
+        let wire = wire_with(&frames);
+        assert_eq!(
+            Demuxer::open(&wire[..])
+                .and_then(|mut d| {
+                    let mut buf = Vec::new();
+                    let mut out = Vec::new();
+                    while let Some(pts) = d.read_frame(&mut buf)? {
+                        out.push((pts, buf.clone()));
+                    }
+                    Ok(out)
+                })
+                .expect("round trip the raw wire"),
+            frames
+        );
     }
 }
