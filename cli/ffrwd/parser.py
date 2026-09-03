@@ -843,11 +843,44 @@ def record_cast_type(node: exp.Expr | None) -> str | None:
 # that refuses them at bind time when the probe finds none.
 RENDITION_COLUMNS = frozenset({"bandwidth", "width", "height", "codecs", "name", "language"})
 
+# Static type of each rendition column, for the WHERE-predicate value
+# grammar: the shape only, mirroring what lower's probed schema will confirm.
+_RENDITION_COLUMN_TYPES: dict[str, str] = {
+    "bandwidth": "number",
+    "width": "number",
+    "height": "number",
+    "codecs": "text",
+    "name": "text",
+    "language": "text",
+}
+
 
 def _is_input_column(name: str) -> bool:
     """True for a column name an INPUT alias exposes: structural, tag path,
     or a rendition column resolve admits on spec and lower confirms by probe."""
     return name in INPUT_COLUMNS or name in RENDITION_COLUMNS or tag_key(name) is not None
+
+
+def _is_rendition_conjunct(conjunct: exp.Expr, alias: str) -> bool:
+    """True if every column `conjunct` reads off `alias` is a rendition column.
+
+    A rendition column is admitted into the row-predicate grammar only when
+    the WHOLE conjunct is about rendition columns of this alias -- a bound
+    that also reads the alias's other columns (``f.t <= f.width - 1``) stays
+    on the time-window path unchanged, since only lower's probe can confirm
+    the alias is even a rendition table, and this is a syntactic admission.
+    """
+    found = False
+    for sub_node in conjunct.walk():
+        if not isinstance(sub_node, exp.Column):
+            continue
+        table_node = sub_node.args.get("table")
+        if table_node is None or _ident_name(table_node) != alias:
+            continue
+        if _ident_name(sub_node.this) not in RENDITION_COLUMNS:
+            return False
+        found = True
+    return found
 
 
 def _input_disposition_error(
@@ -6276,6 +6309,12 @@ class _Resolver:
 
         Returns True when the conjunct was a row predicate (and is now
         validated), False when it belongs to the time-window path.
+
+        A plain ``input(...)`` alias joins this grammar too, for its six
+        rendition columns only: a probe run after resolve may turn such an
+        alias into a rendition row table, which only lower can confirm, so
+        resolve admits ``r.height = 720`` here on spec and lower is what
+        refuses it against a file.
         """
         aliases = _referenced_aliases(conjunct)
         # A CTE contributes rows too, and its value columns filter them the
@@ -6286,6 +6325,7 @@ class _Resolver:
             for alias in aliases
             if scope.get(alias) == "row"
             or (scope.get(alias) == "cte" and _reads_non_time_column(conjunct, alias))
+            or (scope.get(alias) == "input" and _is_rendition_conjunct(conjunct, alias))
         }
         if not rows:
             return False
@@ -6372,7 +6412,7 @@ class _Resolver:
                     fallback=where,
                     hint=_ROW_WHERE_HINT,
                 )
-            self._row_operand(column, scope, where)
+            self._row_predicate_operand(column, scope, where)
             return
         if isinstance(node, exp.Between):
             if node.args.get("symmetric"):
@@ -6398,7 +6438,7 @@ class _Resolver:
                     fallback=where,
                     hint=_ROW_WHERE_HINT,
                 )
-            column_type = self._row_operand(column, scope, where)
+            column_type = self._row_predicate_operand(column, scope, where)
             for bound in (node.args.get("low"), node.args.get("high")):
                 if is_value_expr(_unwrap_paren(bound) if isinstance(bound, exp.Expr) else None):
                     self._check_value_pair(column, bound, scope, where, _ROW_WHERE_HINT)
@@ -6429,7 +6469,7 @@ class _Resolver:
                     fallback=where,
                     hint="matching two columns against each other is a JOIN",
                 )
-            column_type = self._row_operand(column, scope, where)
+            column_type = self._row_predicate_operand(column, scope, where)
             self._check_row_literal(literal, column, column_type, where)
             return
         if isinstance(node, exp.Boolean):
@@ -6437,7 +6477,7 @@ class _Resolver:
         if isinstance(node, exp.Column):
             # A boolean column stands alone, as it does in Postgres; anything
             # else needs an operator to become a condition.
-            column_type = self._row_operand(node, scope, where)
+            column_type = self._row_predicate_operand(node, scope, where)
             if column_type == "boolean":
                 return
             alias = _ident_name(node.args.get("table"))
@@ -6456,6 +6496,26 @@ class _Resolver:
             fallback=where,
             hint=_ROW_WHERE_HINT,
         )
+
+    def _row_predicate_operand(
+        self, column: exp.Column, scope: dict[str, str], where: exp.Expr
+    ) -> str | None:
+        """A row-predicate operand's type: a track-row column, or a rendition
+        column of a plain input alias.
+
+        Only :meth:`_check_row_predicate` calls this -- the rendition branch
+        is admitted here, and nowhere else :meth:`_row_operand` is called
+        from, because only lower's probe can confirm the alias actually
+        resolved to a rendition table; a file reading a rendition column is
+        lower's rejection to make, not resolve's.
+        """
+        table_node = column.args.get("table")
+        if table_node is not None:
+            alias = _ident_name(table_node)
+            name = _ident_name(column.this)
+            if scope.get(alias) == "input" and name in RENDITION_COLUMNS:
+                return _RENDITION_COLUMN_TYPES[name]
+        return self._row_operand(column, scope, where)
 
     def _row_operand(
         self, column: exp.Column, scope: dict[str, str], where: exp.Expr

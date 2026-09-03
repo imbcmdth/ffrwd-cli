@@ -3090,6 +3090,47 @@ def test_an_unknown_column_on_an_input_alias_is_still_unknown_the_same_way() -> 
         "duration, subtitle, t, tags, video" in (err.hint or "")
 
 
+# -- rendition columns in WHERE: the same row-predicate grammar an unnest
+#    row alias gets, admitted on a plain input() alias for the same reason
+#    ORDER BY/LIMIT/OFFSET are: only a probe (after resolve) can say whether
+#    the alias is a rendition table -------------------------------------
+
+
+def test_a_rendition_predicate_resolves_on_a_plain_input_alias() -> None:
+    res = _resolve(
+        "SELECT r.video[1] FROM input('ladder.m3u8') r WHERE r.height = 720"
+    )
+    assert isinstance(res.branches[0].args["where"], exp.Where)
+
+
+def test_rendition_predicates_compose_with_and() -> None:
+    _resolve(
+        "SELECT r.video[1] FROM input('ladder.m3u8') r "
+        "WHERE r.bandwidth > 1000000 AND r.language = 'en'"
+    )
+
+
+def test_a_rendition_predicate_and_a_time_window_are_separate_conjuncts() -> None:
+    """`r.height = 720` and `r.t BETWEEN 0 AND 10` name the same alias, but
+    `_flatten_and` splits the WHERE into two conjuncts before either grammar
+    ever sees it -- the rendition column goes down the row-predicate path
+    (this test's whole point) and the time window goes down its own,
+    untouched path, with nothing to reconcile between the two."""
+    res = _resolve(
+        "SELECT r.video[1] FROM input('ladder.m3u8') r "
+        "WHERE r.height = 720 AND r.t BETWEEN 0 AND 10"
+    )
+    assert isinstance(res.branches[0].args["where"], exp.Where)
+
+
+def test_a_non_rendition_column_in_where_is_still_refused_the_same_way() -> None:
+    err = _reject(
+        "SELECT r.video[1] FROM input('ladder.m3u8') r WHERE r.nonsense = 1"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "unsupported WHERE predicate" in err.message
+
+
 def test_a_query_nested_too_deeply_is_a_plain_rejection() -> None:
     """Deep nesting is user input, not a bug: a typed, non-internal error
     with a plain message, at whichever layer the recursion limit bites."""
