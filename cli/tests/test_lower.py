@@ -57,6 +57,7 @@ from ffrwd.probe import (
     CueMeta,
     ProbeFailure,
     ProbeResult,
+    RenditionMeta,
     StreamMeta,
     parse_webvtt,
     probe,
@@ -6738,6 +6739,175 @@ def _row_query(where: str = "", order: str = "", column: str = "audio") -> str:
         + (f" WHERE {where}" if where else "")
         + (f" ORDER BY {order}" if order else "")
     )
+
+
+# ---------------------------------------------------------------------------
+# renditions: an ABR ladder's own row table, no unnest to ask for it
+# ---------------------------------------------------------------------------
+#
+# `_rendition_probe` is one ladder: two muxed AV rungs (720p/1080p, distinct
+# bandwidths) plus a third, audio-only rendition -- the shape that proves an
+# audio-only row contributes nothing to `.video` while still counting for
+# `.audio`. `RenditionMeta.streams` holds the SAME StreamMeta objects
+# `ProbeResult.streams` does, exactly as probe.py's own `by_global_index`
+# wires them, so a rendition's stream and the plain container's agree on
+# `index` -- the fact `_bind_renditions` relies on to reuse `_source_stream`
+# unchanged.
+
+
+def _rendition_probe() -> ProbeResult:
+    lo_v = _track("video", 0, width=1280, height=720)
+    lo_a = _track("audio", 0, channels=2, codec="aac")
+    hi_v = _track("video", 1, width=1920, height=1080)
+    hi_a = _track("audio", 1, channels=2, codec="aac")
+    solo_a = _track("audio", 2, channels=2, codec="aac", language="en")
+    renditions = [
+        RenditionMeta(
+            streams=[lo_v, lo_a],
+            bandwidth=800_000,
+            width=1280,
+            height=720,
+            codecs="avc1.640020,mp4a.40.2",
+            name="Low",
+            language=None,
+            program_id=1,
+        ),
+        RenditionMeta(
+            streams=[hi_v, hi_a],
+            bandwidth=3_000_000,
+            width=1920,
+            height=1080,
+            codecs="avc1.64002a,mp4a.40.2",
+            name="High",
+            language=None,
+            program_id=2,
+        ),
+        RenditionMeta(
+            streams=[solo_a],
+            bandwidth=128_000,
+            width=None,
+            height=None,
+            codecs="mp4a.40.2",
+            name="Audio",
+            language="en",
+            program_id=3,
+        ),
+    ]
+    return ProbeResult(streams=[lo_v, lo_a, hi_v, hi_a, solo_a], renditions=renditions)
+
+
+def _rendition_probes() -> dict[str, ProbeResult | None]:
+    return {"r": _rendition_probe()}
+
+
+def test_a_manifests_renditions_bind_as_rows_with_no_unnest() -> None:
+    """``FROM input(<manifest>) r`` alone is a track-row table: one row per
+    RenditionMeta, in manifest order, reached with no ``unnest`` at all.
+
+    3 rows, but only 2 carry video and all 3 carry audio, so the ladder's
+    array columns are row-FILTERED by kind, not row-COUNTED: an audio-only
+    rendition is simply absent from ``.video`` while still counting for
+    ``.audio``. ``array_agg`` gathers the whole row set into one file (an
+    n-input filter's own job here, not `_bind_renditions`'s), which is what
+    lets a 3-row ladder compile at all without a WHERE to narrow it.
+    """
+    g = _lower(
+        "SELECT vstack(VARIADIC array_agg(r.video)) FROM input('x.m3u8') r",
+        _rendition_probes(),
+    )
+    (node,) = g.nodes.values()
+    assert node.filter == "vstack"
+    assert node.inputs == ["src:r:v:0", "src:r:v:1"]  # the audio-only row: absent
+
+
+def test_an_audio_only_rendition_still_counts_for_audio() -> None:
+    """All 3 rows carry audio, the audio-only one included, in row order --
+    its own track lands last, after the two muxed renditions'."""
+    g = _lower(
+        "SELECT amix(VARIADIC array_agg(r.audio)) FROM input('x.m3u8') r",
+        _rendition_probes(),
+    )
+    (node,) = g.nodes.values()
+    assert node.filter == "amix"
+    assert node.inputs == ["src:r:a:0", "src:r:a:1", "src:r:a:2"]
+
+
+def test_a_video_subscript_past_the_video_carrying_rows_is_rejected() -> None:
+    """Only 2 rows carry video, so ``r.video[3]`` (the third ladder rung, the
+    audio-only one) is out of bounds for `.video` specifically -- the bounds
+    check fires before the row-count-per-file one, so no ``array_agg`` is
+    needed to reach it."""
+    err = _reject_lower("SELECT r.video[3] FROM input('x.m3u8') r", _rendition_probes())
+    assert err.code is ErrorCode.STREAM_NOT_FOUND
+    assert "r.video[3]" in err.message
+    assert "2 rows carry a video track" in err.message
+
+
+def test_rendition_stream_indexes_reach_the_map_flags() -> None:
+    """One ladder rung, its video and audio at DELIBERATELY non-contiguous
+    per-type indexes (2 other audio tracks precede this rendition's own) --
+    they reach ``-map`` verbatim, proof a row's streams are the SAME
+    `-map`-able refs a plain probe's `f.video[1]` would produce, not a copy
+    with new indexes of their own."""
+    video = _track("video", 0)
+    other_a0 = _track("audio", 0)
+    other_a1 = _track("audio", 1)
+    own_audio = _track("audio", 2)
+    probe = ProbeResult(
+        streams=[video, other_a0, other_a1, own_audio],
+        renditions=[
+            RenditionMeta(
+                streams=[video, own_audio],
+                bandwidth=800_000,
+                width=320,
+                height=240,
+                codecs=None,
+                name=None,
+                language=None,
+                program_id=1,
+            )
+        ],
+    )
+    g = _lower(
+        "SELECT r.video[1], r.audio[1] FROM input('x.m3u8') r", {"r": probe}
+    )
+    assert _outputs(g) == [
+        ("src:r:v:0", "video", None),
+        ("src:r:a:2", "audio", None),
+    ]
+    args = build_ffmpeg_args(emit(g), "out.mp4")
+    maps = [args[i + 1] for i, arg in enumerate(args) if arg == "-map"]
+    assert maps == ["0:v:0", "0:a:2"]
+
+
+def test_an_input_with_no_renditions_is_untouched() -> None:
+    """The whole point of the early return in `_bind_renditions`: a plain
+    file (empty `renditions`) keeps meaning exactly what it always has --
+    `r` stays a container alias, never a row table."""
+    plain = ProbeResult(streams=[_track("video", 0), _track("audio", 0)])
+    g = _lower("SELECT r.video[1], r.audio[1] FROM input('x.mp4') r", {"r": plain})
+    assert _outputs(g) == [
+        ("src:r:v:0", "video", None),
+        ("src:r:a:0", "audio", None),
+    ]
+    args = build_ffmpeg_args(emit(g), "out.mp4")
+    assert [args[i + 1] for i, arg in enumerate(args) if arg == "-map"] == [
+        "0:v:0",
+        "0:a:0",
+    ]
+
+
+def test_a_where_between_seek_still_works_on_a_renditionless_input() -> None:
+    """A second, differently-shaped cookbook query against an empty-rendition
+    probe: the WHERE trim window is untouched by `_bind_renditions`, which
+    never runs for it."""
+    plain = ProbeResult(streams=[_track("video", 0), _track("audio", 0)])
+    g = _lower(
+        "SELECT r.video[1] FROM input('x.mp4') r WHERE r.t BETWEEN 1 AND 2", {"r": plain}
+    )
+    assert g.to_dict()["nodes"] == []
+    assert g.input_trims == {"r": (1, 2)}
+    assert _outputs(g) == [("src:r:v:0", "video", None)]
 
 
 def test_a_codecless_stream_is_rejected_before_ffmpeg_can_die_on_it() -> None:

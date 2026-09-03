@@ -357,7 +357,7 @@ from ffrwd.parser import (
     union_branches,
 )
 from ffrwd.parser import _ident_name as _fold
-from ffrwd.probe import WEBVTT_FORMAT, ProbeFailure, ProbeResult, StreamMeta
+from ffrwd.probe import WEBVTT_FORMAT, ProbeFailure, ProbeResult, RenditionMeta, StreamMeta
 from ffrwd.processes import ref_type
 from ffrwd.registry import DynamicFilter, FilterOption, Registry, SourceFilter
 from ffrwd.sink import (
@@ -460,6 +460,22 @@ _ARRAY_COLUMNS: dict[str, StreamType] = {
     "subtitle": "subtitle",
     "data": "data",
 }
+
+# The pseudo `_RowBinding.column` a manifest's ABR ladder binds under: one row
+# per `RenditionMeta`, read straight off an `input()` alias with no `unnest`
+# to ask for it. Its schema is not a view over `container` like ROW_SCHEMAS is
+# -- a rendition is not a container array field, only ever a probed fact.
+RENDITION_COLUMN = "rendition"
+_RENDITION_SCHEMA: dict[str, RowColumnType] = {
+    "bandwidth": "number",
+    "width": "number",
+    "height": "number",
+    "codecs": "text",
+    "name": "text",
+    "language": "text",
+}
+# Every rendition column is a probed fact, never an assertion a query can make.
+_RENDITION_READONLY: frozenset[str] = frozenset(_RENDITION_SCHEMA)
 
 # The container array columns a MEDIA query's `SELECT *` expands: the stream
 # ones, in declaration order. `chapters` is an array column too, but a chapter
@@ -2307,10 +2323,16 @@ class _TrackRow:
     `stream` IS the row's stream, and its ``_Stream.source`` is the very
     ``StreamMeta`` `columns` was read from — a row's provenance and its columns
     are the same probed fact, seen twice.
+
+    `kinds` holds every stream of a RENDITION row, by type — a manifest's
+    variant may carry video and audio together — with `stream` staying the
+    row's primary one (its first video stream, else its first audio one).
+    Empty for every other row kind, unnest rows included.
     """
 
     stream: _Stream
     columns: dict[str, RowValue]
+    kinds: dict[StreamType, _Stream] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -2398,6 +2420,8 @@ class _RowBinding:
     @property
     def schema(self) -> dict[str, RowColumnType]:
         """The columns these rows expose, in declaration (or written) order."""
+        if self.column == RENDITION_COLUMN:
+            return _RENDITION_SCHEMA
         return (
             self.values.schema() if self.values is not None else ROW_SCHEMAS[self.column]
         )
@@ -2405,6 +2429,8 @@ class _RowBinding:
     @property
     def star(self) -> tuple[str, ...]:
         """What ``<alias>.*`` expands to: the scalar columns, in order."""
+        if self.column == RENDITION_COLUMN:
+            return tuple(_RENDITION_SCHEMA)
         if self.values is not None:
             return self.values.columns
         return ROW_STAR_COLUMNS[self.column]
@@ -2412,6 +2438,8 @@ class _RowBinding:
     @property
     def readonly(self) -> frozenset[str]:
         """The columns a query may not assert. A written row has none."""
+        if self.column == RENDITION_COLUMN:
+            return _RENDITION_READONLY
         if self.values is not None:
             return frozenset()
         return ROW_READONLY_FIELDS[self.column]
@@ -5826,6 +5854,69 @@ class _Lowerer:
         )
         self._join_rows(env.relation, alias, rows, join, env, select)
 
+    # -- FROM input(<manifest>) alias, over an ABR ladder ------------------
+
+    def _bind_renditions(
+        self,
+        alias: str,
+        join: RawRowJoin | None,
+        env: _Env,
+        select: exp.Select,
+    ) -> None:
+        """An input alias whose probe found renditions is ALSO a track-row
+        table: one row per ``RenditionMeta``, no ``unnest`` needed to ask for
+        it -- an ABR ladder's variants are rows the same way a plain file's
+        tracks are once ``unnest(<input>.<type>)`` names them.
+
+        Replaces the plain ``_InputBinding`` bound just above: once an alias
+        has rendition rows, the row table IS what ``alias.<column>`` means,
+        not a second thing beside it. `source` names itself, so the ``-i``,
+        its WHERE window and its provenance stay keyed off the same alias a
+        plain input would use. An input with no renditions leaves the plain
+        binding untouched.
+        """
+        result = self.probes.get(alias)
+        if result is None or not result.renditions:
+            return
+        rows = [self._rendition_row(alias, rendition) for rendition in result.renditions]
+        if env.relation is None:
+            env.relation = _RowRelation()
+        env.bindings[alias] = _RowBinding(
+            alias=alias,
+            source=alias,
+            column=RENDITION_COLUMN,
+            type=rows[0].stream.type,
+            relation=env.relation,
+        )
+        self._join_rows(env.relation, alias, rows, join, env, select)
+
+    def _rendition_row(self, alias: str, rendition: RenditionMeta) -> _TrackRow:
+        """One ladder rung as a track row: its streams by kind, plus the
+        ABR metadata ``RenditionMeta`` itself carries.
+
+        `stream` is the row's primary track -- its first video stream, else
+        its first audio one -- so a bare row still means one thing, exactly
+        as an unnest row's does. Every stream is built the same way the
+        unnest path builds one (:meth:`_source_stream`, keyed by the
+        `StreamMeta`'s own per-type `index`), so emission maps it identically.
+        """
+        kinds: dict[StreamType, _Stream] = {}
+        for meta in rendition.streams:
+            kinds.setdefault(meta.type, self._source_stream(alias, meta.type, meta.index))
+        primary = kinds.get("video") or kinds.get("audio") or next(iter(kinds.values()), None)
+        return _TrackRow(
+            stream=primary if primary is not None else _STREAMLESS_ROW,
+            columns={
+                "bandwidth": rendition.bandwidth,
+                "width": rendition.width,
+                "height": rendition.height,
+                "codecs": rendition.codecs,
+                "name": rendition.name,
+                "language": rendition.language,
+            },
+            kinds=kinds,
+        )
+
     # -- joining two row tables ------------------------
 
     def _join_rows(
@@ -6052,6 +6143,7 @@ class _Lowerer:
                     ErrorCode.UNKNOWN_ALIAS, f"unknown alias '{alias}'", alias_node, fallback=table
                 )
             env.bindings[alias] = _InputBinding(alias=alias)
+            self._bind_renditions(alias, join, env, select)
             return
         if isinstance(inner, exp.Identifier):
             name = _fold(inner)
@@ -8061,6 +8153,13 @@ class _Lowerer:
         if isinstance(binding, _SourceBinding):
             return alias, self._source_value(binding, name, index, anchor, select)
         if isinstance(binding, _RowBinding):
+            if binding.column == RENDITION_COLUMN and name in _ARRAY_COLUMNS:
+                # A rendition row's own track-kind columns: one stream per
+                # SURVIVING row that carries the kind, not one per row -- see
+                # `_rendition_kind_value`.
+                return binding.source, self._rendition_kind_value(
+                    binding, name, index, anchor, select
+                )
             # Under the INPUT alias, not the row one: a row table has no window
             # of its own, and every rule about the streams (`-i`, `-ss`, the
             # caption-seek rejection) is a property of the file they came from.
@@ -8068,6 +8167,43 @@ class _Lowerer:
                 binding, name, index, env, anchor, select
             )
         return alias, self._cte_value(binding, name, index, anchor, select)
+
+    def _rendition_kind_value(
+        self,
+        binding: _RowBinding,
+        name: str,
+        index: int | None,
+        anchor: exp.Expr,
+        select: exp.Select,
+    ) -> _Value:
+        """One track-kind column of a rendition row table (``r.video``,
+        ``r.audio``, ...): one stream per surviving row that carries the
+        kind, in row order.
+
+        Unlike the row's own stream (``r``, one per surviving row
+        unconditionally), an audio-only rendition contributes NOTHING to
+        ``r.video`` -- the array is shorter than the row count whenever the
+        ladder mixes muxed and audio-only rungs. Same array/subscript surface
+        as every other stream column: bare ``r.video`` is the whole array,
+        ``r.video[k]`` names one element of it.
+        """
+        kind = _ARRAY_COLUMNS[name]
+        streams = [
+            row.kinds[kind] for row in binding.rows if row is not None and kind in row.kinds
+        ]
+        if index is None:
+            return _array(kind, streams)
+        if not 1 <= index <= len(streams):
+            have = f"{len(streams)} row" + ("" if len(streams) == 1 else "s")
+            raise _error(
+                ErrorCode.STREAM_NOT_FOUND,
+                f"'{binding.alias}.{name}[{index}]' does not exist: "
+                f"{have} carry a {kind} track",
+                anchor,
+                fallback=select,
+                hint=_SUBSCRIPT_HINT,
+            )
+        return _scalar(streams[index - 1])
 
     def _row_value(
         self,
