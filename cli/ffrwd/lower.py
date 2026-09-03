@@ -370,7 +370,7 @@ from ffrwd.probe import (
     StreamMeta,
     is_url,
 )
-from ffrwd.processes import ref_type
+from ffrwd.processes import COPY_CODEC, ref_type
 from ffrwd.registry import DynamicFilter, FilterOption, Registry, SourceFilter
 from ffrwd.sink import (
     CODEC_PARAMS_FLAGS,
@@ -2997,6 +2997,15 @@ class _Lowerer:
         # is accepted -- each row one variant map entry -- and an outer
         # join's NULL row is that entry's absent stream kind.
         self.manifest: str | None = None
+        # True while the COPY currently lowering targets a sink that reads
+        # rows off the SELECT list rather than named stream parameters: a
+        # multi-row relation is accepted here too, the way a manifest's is.
+        self.row_reading_sink = False
+        # Node id -> one {"row": int, "rendition": {...}} per pad, in the
+        # same row-major order `_packet_sink_pads` builds a row-reading
+        # sink's pads in. Read there to fold `row`/`rendition` into each
+        # pad's dict; empty for the old, stream-parameter sink form.
+        self.row_reading_sink_pads: dict[str, list[dict[str, object]]] = {}
 
     # -- entry point ------------------------------------------------------
 
@@ -3160,6 +3169,9 @@ class _Lowerer:
         self.rows_file = self._rows_file(raw)
         self.manifest = _manifest_format(raw)
         self._check_manifest_target(raw)
+        self.row_reading_sink = bool(raw.module_sink) and self.res.wasm[
+            raw.module_sink
+        ].reads_rows_from_select
         first_sink = len(self.graph.module_sinks)
         columns = self._lower_query(list(raw.branches), raw.query, tags="sink")
         if self.rows_file:
@@ -3279,16 +3291,32 @@ class _Lowerer:
                     f"{declared.name}(<values>)",
                 )
             return
-        options = self._packet_sink_options(declared, raw)
+        if declared.reads_rows_from_select:
+            present = {
+                ref_type(self.graph, ref)
+                for node in sink_nodes
+                for ref in self.graph.nodes[node].inputs
+            }
+            scopes = tuple(kind for kind in ("video", "audio") if kind in present)
+        else:
+            scopes = ("video", "audio") if "audio" in declared.stream_kinds else ("video",)
+        options = self._packet_sink_options(declared, raw, scopes)
         for node in sink_nodes:
-            self.graph.packet_sinks[node] = self._packet_sink_pads(node, options, raw)
+            self.graph.packet_sinks[node] = self._packet_sink_pads(
+                node, options, raw, declared, described
+            )
             if described.rows_schema is not None:
                 # The rows are the sink's product, and no path names a home
                 # for them: they ride the hosting process's own stdout.
                 self.graph.rows_sinks[node] = RowsSink(container=_ROWS_CONTAINER)
 
     def _packet_sink_pads(
-        self, node: str, options: dict[str, object], raw: RawSink
+        self,
+        node: str,
+        options: dict[str, object],
+        raw: RawSink,
+        declared: WasmFunction,
+        described: Described,
     ) -> list[dict[str, object]]:
         """The sink's encoder options resolved PAD BY PAD.
 
@@ -3298,8 +3326,15 @@ class _Lowerer:
         the rows and the pads are two accounts of one ladder -- counted over
         the pads of the option's OWN kind, since a video option says nothing
         about an audio pad standing beside them.
+
+        A pad whose option was left at its default AND whose stream is an
+        unmodified probed one the sink already accepts copies instead of
+        re-encoding (:meth:`_copies_onto_sink`); a row-reading sink's pads
+        also carry `row` and `rendition` (:attr:`row_reading_sink_pads`),
+        empty for the old, stream-parameter form.
         """
-        kinds = [ref_type(self.graph, ref) for ref in self.graph.nodes[node].inputs]
+        inputs = self.graph.nodes[node].inputs
+        kinds = [ref_type(self.graph, ref) for ref in inputs]
         for name, value in options.items():
             if not isinstance(value, list):
                 continue
@@ -3315,38 +3350,75 @@ class _Lowerer:
                     raw.path_node,
                     hint=_PER_TRACK_OPTION_HINT,
                 )
+        written = {option.name for option in raw.options}
+        row_meta = self.row_reading_sink_pads.get(node)
         # Each pad takes the options shaping ITS OWN encoder, a per-row value
         # indexed by the pad's position among the pads of that kind -- which
         # is the order the rows were gathered in.
         seen: dict[str, int] = {}
         pads: list[dict[str, object]] = []
-        for kind in kinds:
+        for position, kind in enumerate(kinds):
             index = seen.get(kind, 0)
             seen[kind] = index + 1
-            pads.append(
-                {
-                    name: value[index] if isinstance(value, list) else value
-                    for name, value in options.items()
-                    if SINK_OPTIONS[name].scope == kind
-                }
-            )
+            pad: dict[str, object] = {
+                name: value[index] if isinstance(value, list) else value
+                for name, value in options.items()
+                if SINK_OPTIONS[name].scope == kind
+            }
+            codec_option = f"{kind}_codec"
+            if codec_option not in written and self._copies_onto_sink(
+                inputs[position], kind, described
+            ):
+                pad = {codec_option: COPY_CODEC}
+            if row_meta is not None:
+                meta = row_meta[position]
+                pad["row"] = meta["row"]
+                rendition = meta.get("rendition")
+                if rendition:
+                    pad["rendition"] = rendition
+            pads.append(pad)
         return pads
 
+    def _copies_onto_sink(
+        self, ref: FrameRef, kind: StreamType, described: Described
+    ) -> bool:
+        """True when `ref` is an unmodified probed stream in a codec the
+        sink already accepts, and so may travel onto the edge as a stream
+        copy instead of paying for an encode nothing asked for.
+        """
+        if not is_src(ref):
+            return False
+        alias, stream_type, index = src_parts(ref)
+        if stream_type != kind:
+            return False
+        result = self.probes.get(alias)
+        if result is None:
+            return False
+        streams = result.by_type(stream_type)
+        if not 0 <= index < len(streams):
+            return False
+        codec = streams[index].codec
+        if codec is None:
+            return False
+        accepted = described.sink_codecs(kind)
+        return not accepted or codec in accepted
+
     def _packet_sink_options(
-        self, declared: WasmFunction, raw: RawSink
+        self, declared: WasmFunction, raw: RawSink, scopes: tuple[str, ...]
     ) -> dict[str, object]:
         """The COPY's WITH options as the encoder a packet sink reads.
 
         The video half of the file-output vocabulary -- and the audio half
-        too, for a sink that reads audio streams -- validated against the same
-        table; anything else has no encoder to shape and is refused by name.
-        `video_codec` is always present on the way out: written, or filled
-        from the module's declared preference, h264 when it names none -- and
-        checked against that list either way. `audio_codec` is filled the same
-        way, and only where an audio stream reaches the sink.
+        too, for a sink that reads audio streams (`scopes`, the caller's:
+        the declared stream parameters for the old sink form, the SELECT
+        list's actual cells for a row-reading one) -- validated against the
+        same table; anything else has no encoder to shape and is refused by
+        name. `video_codec` is always present on the way out: written, or
+        filled from the module's declared preference, h264 when it names
+        none -- and checked against that list either way. `audio_codec` is
+        filled the same way, and only where an audio stream reaches the sink.
         """
         described = self.describes[declared.module]
-        scopes = ("video", "audio") if "audio" in declared.stream_kinds else ("video",)
         options: dict[str, object] = {}
         option_nodes: dict[str, exp.Expr] = {}
         for option in raw.options:
@@ -3665,8 +3737,31 @@ class _Lowerer:
         every NULL cell dropped, which is what the output list is built from:
         an absent cell maps nothing, it only shapes the transcription.
         """
-        anchor = raw.path_node
         cardinality = max(len(self.sink_rows), 1)
+        rows, stripped = self._row_cells(
+            columns,
+            cardinality,
+            raw.path_node,
+            f"a format '{self.manifest}' destination",
+        )
+        self._check_no_null_stream_feeds_a_filter(raw.path_node)
+        return rows, stripped
+
+    def _row_cells(
+        self,
+        columns: list[_Column],
+        cardinality: int,
+        anchor: exp.Expr,
+        subject: str,
+    ) -> tuple[list[_VariantRow], list[_Column]]:
+        """Every column's cells, read into rows of at most a video and an
+        audio one -- the shape a manifest destination and a row-reading
+        sink share, `subject` naming which one a rejection is about.
+
+        Returns the rows plus the columns with every NULL cell dropped,
+        which is what the caller's output list is built from: an absent
+        cell maps nothing, it only shapes the transcription.
+        """
         cells: dict[StreamType, list[_Stream | None]] = {}
         stripped: list[_Column] = []
         for column in columns:
@@ -3679,16 +3774,15 @@ class _Lowerer:
             if value.type not in ("video", "audio"):
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,
-                    f"a format '{self.manifest}' destination takes video and "
-                    f"audio columns, and '{label}' is {value.type}",
+                    f"{subject} takes video and audio columns, and '{label}' "
+                    f"is {value.type}",
                     anchor,
                     hint="write subtitle and data tracks to a file of their own",
                 )
             if value.type in cells:
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,
-                    f"two {value.type} columns at a format '{self.manifest}' "
-                    "destination",
+                    f"two {value.type} columns at {subject}",
                     anchor,
                     hint="each row is one variant map entry, so it holds at "
                     "most one video and one audio cell; put the second "
@@ -3699,8 +3793,7 @@ class _Lowerer:
                 raise _error(
                     ErrorCode.ROW_COUNT_MISMATCH,
                     f"'{label}' does not carry one stream per row, and each "
-                    f"row of a format '{self.manifest}' destination is one "
-                    "variant map entry",
+                    f"row of {subject} is one variant map entry",
                     anchor,
                     hint="select a row column (a joined CTE's, an unnest "
                     "table's); a gathered array belongs to a single file",
@@ -3709,8 +3802,7 @@ class _Lowerer:
                 raise _error(
                     ErrorCode.ROW_COUNT_MISMATCH,
                     f"'{label}' is {len(streams)} streams in one row, and "
-                    f"each row of a format '{self.manifest}' destination is "
-                    "one variant map entry",
+                    f"each row of {subject} is one variant map entry",
                     anchor,
                     hint=_RENDITION_PICK_HINT
                     if self._from_rendition_table(self.sink_env)
@@ -3734,7 +3826,7 @@ class _Lowerer:
             if video is None and audio is None:
                 raise _error(
                     ErrorCode.STREAM_NOT_FOUND,
-                    f"row {position + 1} of this manifest has no stream in "
+                    f"row {position + 1} of {subject} has no stream in "
                     "any column",
                     anchor,
                     hint="every row is one variant map entry; drop the empty "
@@ -3742,10 +3834,9 @@ class _Lowerer:
                     "row",
                 )
             rows.append(_VariantRow(video=video, audio=audio))
-        self._check_no_null_stream_feeds_a_filter(raw)
         return rows, stripped
 
-    def _check_no_null_stream_feeds_a_filter(self, raw: RawSink) -> None:
+    def _check_no_null_stream_feeds_a_filter(self, anchor: exp.Expr) -> None:
         """A NULL cell can be SELECTED at a manifest destination, not filtered.
 
         A call over a nullable column would hand a filter a stream that is
@@ -3759,7 +3850,7 @@ class _Lowerer:
                     f"a NULL stream feeds {node.filter}(): an outer join's "
                     "gap can be selected at a manifest destination, not "
                     "filtered",
-                    raw.path_node,
+                    anchor,
                     hint="apply the filter inside the CTE, where the row "
                     "exists, and select the joined column bare",
                 )
@@ -4945,9 +5036,15 @@ class _Lowerer:
         A fan-out has already been pinned to the one group this command
         writes, so it never reaches the count. A manifest destination is the
         third answer: its one written name binds many outputs, so the rows
-        stand -- each becomes a variant map entry.
+        stand -- each becomes a variant map entry. A row-reading sink is a
+        fourth: its own arity, not this rule, says how many rows it takes
+        (:meth:`_check_row_sink_arity`).
         """
-        if self.fanout_expr is not None or self.manifest is not None:
+        if (
+            self.fanout_expr is not None
+            or self.manifest is not None
+            or self.row_reading_sink
+        ):
             return
         rendition_rows = self._from_rendition_table(env)
         if env.grouped:
@@ -8577,7 +8674,7 @@ class _Lowerer:
         not absent, the same gap a FULL JOIN's unmatched row leaves.
         """
         kind = _ARRAY_COLUMNS[name]
-        if self.manifest is not None:
+        if self.manifest is not None or self.row_reading_sink:
             return self._rendition_row_cells(binding, kind, index)
         streams = [
             row.kinds[kind] for row in binding.rows if row is not None and kind in row.kinds
@@ -8767,7 +8864,7 @@ class _Lowerer:
                 select,
             )
             return row.stream
-        if self.table_mode or self.manifest is not None:
+        if self.table_mode or self.manifest is not None or self.row_reading_sink:
             return _Stream(ref=_NULL_STREAM_REF, type=binding.type, source=None)
         fill = _FILL_SPELLINGS.get(binding.type)
         hint = (
@@ -9526,7 +9623,7 @@ class _Lowerer:
             # An outer join's gap: a NULL cell, sentinel where a NULL is
             # allowed to stand (a table's empty cell, a manifest row's
             # absent stream kind), a rejection everywhere else.
-            if self.table_mode or self.manifest is not None:
+            if self.table_mode or self.manifest is not None or self.row_reading_sink:
                 streams.append(
                     _Stream(ref=_NULL_STREAM_REF, type=column.value.type, source=None)
                 )
@@ -9850,7 +9947,12 @@ class _Lowerer:
                     hint="the module has to accept one of the codecs the "
                     "sidecar's packets travel in",
                 )
-        self._check_sink_shape(declared, described, node, select)
+        # A row-reading sink declares no stream parameters at all -- its
+        # shape is judged against the SELECT list's actual rows instead,
+        # once they are known (:meth:`_check_row_sink_arity`), not here
+        # against a signature that names none.
+        if not declared.reads_rows_from_select:
+            self._check_sink_shape(declared, described, node, select)
 
     def _check_sink_shape(
         self,
@@ -10546,7 +10648,17 @@ class _Lowerer:
         One node, always: N calls would be N instances with nothing shared
         between them, which for a sink over a rendition ladder is the whole
         difference.
+
+        A sink declaring no stream parameters (:attr:`WasmFunction.
+        reads_rows_from_select`) reads the SELECT list's cells instead --
+        dispatched to :meth:`_lower_row_reading_sink_call`, which is the
+        manifest destination's own reading of a relation, applied to a
+        module instead of a written map.
         """
+        if declared.reads_rows_from_select:
+            return self._lower_row_reading_sink_call(
+                node, declared, described, call, env, select
+            )
         at = _sink_stream_count(node, len(call.args))
         gathered: list[tuple[_Stream, exp.Expr]] = []
         for argument in call.args[:at]:
@@ -10579,6 +10691,153 @@ class _Lowerer:
         # Nothing downstream reads a sink: the value carries no streams, the
         # way a rows projection's does not.
         return _Value(type=pads[0].type, streams=(), is_array=False)
+
+    def _lower_row_reading_sink_call(
+        self,
+        node: exp.Expr,
+        declared: WasmFunction,
+        described: Described,
+        call: _Call,
+        env: _Env,
+        select: exp.Select,
+    ) -> _Value:
+        """A sink declaring no stream parameters: the SELECT list's cells,
+        read the way a manifest destination reads its rows.
+
+        N rows, each a video cell and an audio cell, either NULL
+        (:meth:`_row_cells`, the same cardinality and shape logic a
+        manifest destination runs); flattened here into the sink's pads in
+        ROW-MAJOR order -- row 0's video, row 0's audio, row 1's video, ...
+        -- skipping NULL cells, each pad remembering the row it came from
+        and what the relation said of that row (:meth:`_row_renditions`).
+        """
+        at = _sink_stream_count(node, len(call.args))
+        columns = [
+            _Column(
+                name=None,
+                value=self._lower_expr(argument, env, select),
+                splat=self._is_splat_projection(argument, env),
+            )
+            for argument in call.args[:at]
+        ]
+        cardinality = max(len(self.sink_rows), 1)
+        rows, _ = self._row_cells(columns, cardinality, node, f"'{declared.name}'")
+        self._check_no_null_stream_feeds_a_filter(node)
+        self._check_row_sink_arity(declared, described, rows, node, select)
+        renditions = self._row_renditions(rows, env)
+        pads: list[_Stream] = []
+        meta: list[dict[str, object]] = []
+        for position, row in enumerate(rows):
+            for stream in (row.video, row.audio):
+                if stream is None:
+                    continue
+                pads.append(stream)
+                entry: dict[str, object] = {"row": position}
+                rendition = renditions[position]
+                if rendition:
+                    entry["rendition"] = rendition
+                meta.append(entry)
+        tuples = env.relation.tuples if env.relation is not None else []
+        params = self._wasm_params(
+            declared,
+            described,
+            call,
+            node,
+            select,
+            env,
+            tuples[0] if tuples else {},
+            first=at,
+        )
+        ref = self.ctx.node(
+            declared.module,
+            params,
+            [stream.ref for stream in pads],
+            [pads[0].type],
+        )
+        self.row_reading_sink_pads[ref] = meta
+        self.graph.module_sinks.append(ref)
+        return _Value(type=pads[0].type, streams=(), is_array=False)
+
+    def _check_row_sink_arity(
+        self,
+        declared: WasmFunction,
+        described: Described,
+        rows: list[_VariantRow],
+        node: exp.Expr,
+        select: exp.Select,
+    ) -> None:
+        """A sink whose arity holds one row at a time, handed several.
+
+        `video_streams`/`audio_streams` say how many pads of each kind a
+        sink reads; neither declaring "many" or "any" means it is
+        file-shaped, and a multi-row relation reaching it is the one-row
+        rule again (:meth:`_check_one_row_per_file`, which a row-reading
+        sink skips), this time naming the sink instead of a path.
+        """
+        if len(rows) <= 1:
+            return
+        if described.video_streams in ("many", "any") or described.audio_streams in (
+            "many",
+            "any",
+        ):
+            return
+        raise _error(
+            ErrorCode.ROW_COUNT_MISMATCH,
+            f"this query has {len(rows)} rows, and '{declared.name}()' reads one",
+            node,
+            fallback=select,
+            hint="narrow to one row with WHERE or ORDER BY ... LIMIT, or use "
+            "a sink whose module reads many",
+        )
+
+    def _row_renditions(
+        self, rows: list[_VariantRow], env: _Env
+    ) -> list[dict[str, object]]:
+        """Rendition attributes per row, aligned with `rows`.
+
+        Read straight off the rendition table's own columns when the
+        relation came from one (a manifest or a module source alias);
+        otherwise derived exactly as ``var_stream_map`` names rows today
+        (:meth:`_variant_names`) -- height for a video row, nothing else.
+        """
+        alias = next(
+            (
+                a
+                for a, binding in env.bindings.items()
+                if isinstance(binding, _RowBinding) and binding.column == RENDITION_COLUMN
+            ),
+            None,
+        )
+        if alias is not None:
+            out: list[dict[str, object]] = []
+            for position in range(len(rows)):
+                track = (
+                    self.sink_rows[position].get(alias)
+                    if position < len(self.sink_rows)
+                    else None
+                )
+                columns = track.columns if isinstance(track, _TrackRow) else {}
+                out.append(
+                    {
+                        name: columns[name]
+                        for name in ("name", "bandwidth", "codecs", "language")
+                        if columns.get(name) is not None
+                    }
+                )
+            return out
+        video_names, audio_names = self._variant_names(rows)
+        out = []
+        video_seen = audio_seen = 0
+        for row in rows:
+            if row.video is not None:
+                out.append({"name": video_names[video_seen]})
+                video_seen += 1
+            elif row.audio is not None:
+                out.append({"name": audio_names[audio_seen]})
+                audio_seen += 1
+            else:
+                out.append({})
+        return out
 
     def _bind_sink_streams(
         self,

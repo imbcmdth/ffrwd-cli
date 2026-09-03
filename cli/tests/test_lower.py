@@ -12643,3 +12643,246 @@ def test_a_module_source_on_a_pre_packet_source_world_is_refused() -> None:
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "cannot host one" in err.message
+
+
+# ---------------------------------------------------------------------------
+# A sink declaring no stream parameters reads the COPY's rows straight off
+# the SELECT list -- the manifest destination's own reading, applied to a
+# module (``ffrwd.moq.publish`` in the real package): N rows, each a video
+# cell and an audio cell, either NULL, flattened into the sink's pads in
+# ROW-MAJOR order. `_row_sink_graph`/`_row_sink_rejects` go through the real
+# parser and resolver, the way `_lower_source` does for a module source --
+# only `describes` is synthetic, exactly as `_ladder_graph` hands a packet
+# sink's own describe in tests/test_wasm.py.
+# ---------------------------------------------------------------------------
+
+ROW_SINK_MODULE = "modules/publish.wasm"
+
+ROW_SINK_DECLARE = (
+    "CREATE FUNCTION publish(relay text, broadcast text) RETURNS sink\n"
+    f"  AS '{ROW_SINK_MODULE}', 'publish' LANGUAGE wasm;\n"
+)
+
+
+def _row_sink_described(
+    *,
+    name: str = "publish",
+    video: str = "many",
+    audio: str = "many",
+    video_codecs: tuple[str, ...] = ("h264",),
+    audio_codecs: tuple[str, ...] = ("aac",),
+) -> Described:
+    return Described(
+        world=WORLDS[-1],
+        name=name,
+        version="0.1.0",
+        params_schema={
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "relay": {"type": "string"},
+                "broadcast": {"type": "string"},
+            },
+        },
+        rows_schema=None,
+        video_codecs=video_codecs,
+        audio_codecs=audio_codecs,
+        video_streams=video,  # type: ignore[arg-type]
+        audio_streams=audio,  # type: ignore[arg-type]
+    )
+
+
+def _row_sink_graph(
+    sql: str,
+    probes: dict[str, ProbeResult | None],
+    described: Described | None = None,
+) -> Graph:
+    return lower(
+        resolve(parse(ROW_SINK_DECLARE + sql)),
+        probes,
+        registry=_snapshot_registry(),
+        describes={ROW_SINK_MODULE: described or _row_sink_described()},
+    )
+
+
+def _row_sink_rejects(
+    sql: str,
+    probes: dict[str, ProbeResult | None],
+    described: Described | None = None,
+) -> FfrwdError:
+    with pytest.raises(FfrwdError) as excinfo:
+        _row_sink_graph(sql, probes, described)
+    return _anchored(excinfo.value)
+
+
+def test_a_ladder_republished_through_a_row_reading_sink_is_five_pads() -> None:
+    """2 muxed rungs (row 0, row 1) beside one audio-only rendition (row 2)
+    -- 5 pads, row-major: row 0's video, row 0's audio, row 1's video, row
+    1's audio, row 2's audio, each remembering its own row and the
+    manifest's name for it."""
+    g = _row_sink_graph(
+        "COPY (SELECT r.video[1], r.audio[1] FROM input('ladder.m3u8') r) "
+        "TO publish('relay', 'live')",
+        _rendition_probes(),
+    )
+    node_id = next(iter(g.packet_sinks))
+    node = g.nodes[node_id]
+    assert node.inputs == [
+        "src:r:v:0", "src:r:a:0", "src:r:v:1", "src:r:a:1", "src:r:a:2",
+    ]
+    pads = g.packet_sinks[node_id]
+    assert [pad["row"] for pad in pads] == [0, 0, 1, 1, 2]
+    names = [pad["rendition"]["name"] for pad in pads]  # type: ignore[index]
+    assert names == ["Low", "Low", "High", "High", "Audio"]
+    assert pads[4]["rendition"]["language"] == "en"  # type: ignore[index]
+    assert "language" not in pads[0]["rendition"]  # type: ignore[operator]
+
+
+def test_a_computed_ladder_names_its_rows_by_height() -> None:
+    """No rendition table behind these rows -- ``scale`` over
+    ``generate_series`` -- so each pad's rendition is derived exactly as
+    ``var_stream_map`` names one: height for a video row, nothing else."""
+    g = _row_sink_graph(
+        "COPY (SELECT scale(f.video[1], ARRAY[640, 1280][i.i], -2) "
+        "FROM input('a.mp4') f, generate_series(1, 2) i) "
+        "TO publish('relay', 'live')",
+        _row_probes(_track("video", 0, width=1920, height=1080)),
+    )
+    node_id = next(iter(g.packet_sinks))
+    pads = g.packet_sinks[node_id]
+    assert [pad["row"] for pad in pads] == [0, 1]
+    names = [pad["rendition"]["name"] for pad in pads]  # type: ignore[index]
+    assert names == ["360p", "720p"]
+
+
+def test_an_unmodified_source_stream_copies_onto_the_sink() -> None:
+    """A ``src:`` cell in a codec the sink already accepts (h264/aac) copies
+    instead of paying for an encode nothing asked for."""
+    g = _row_sink_graph(
+        "COPY (SELECT r.video[1], r.audio[1] FROM input('ladder.m3u8') r "
+        "WHERE r.height = 720) TO publish('relay', 'live')",
+        _rendition_probes(),
+    )
+    node_id = next(iter(g.packet_sinks))
+    pads = g.packet_sinks[node_id]
+    assert pads[0]["video_codec"] == "copy"
+    assert pads[1]["audio_codec"] == "copy"
+
+
+def test_a_filtered_cell_still_encodes_onto_the_sink() -> None:
+    """A cell reached through a filter -- ``scale`` here -- is never a bare
+    ``src:`` ref, so it always encodes; the untouched audio beside it still
+    copies."""
+    g = _row_sink_graph(
+        "COPY (SELECT scale(r.video[1], 640, -2), r.audio[1] "
+        "FROM input('ladder.m3u8') r WHERE r.height = 720) "
+        "TO publish('relay', 'live')",
+        _rendition_probes(),
+    )
+    node_id = next(iter(g.packet_sinks))
+    pads = g.packet_sinks[node_id]
+    assert pads[0]["video_codec"] == "libx264"
+    assert pads[1]["audio_codec"] == "copy"
+
+
+def test_an_unaccepted_codec_still_encodes_onto_the_sink() -> None:
+    """The sink's own describe names what it accepts; a source in a codec
+    outside that list still pays for the encode even though the cell is
+    unmodified."""
+    g = _row_sink_graph(
+        "COPY (SELECT r.video[1], r.audio[1] FROM input('ladder.m3u8') r "
+        "WHERE r.height = 720) TO publish('relay', 'live')",
+        _rendition_probes(),
+        _row_sink_described(video_codecs=("hevc",)),
+    )
+    node_id = next(iter(g.packet_sinks))
+    pads = g.packet_sinks[node_id]
+    assert pads[0]["video_codec"] == "libx265"
+    assert pads[1]["audio_codec"] == "copy"
+
+
+def test_a_value_column_into_a_row_reading_sink_names_its_type() -> None:
+    """A column that is not a video or audio stream -- a plain subtitle
+    track here, a rows projection reads back the same way -- is refused
+    naming what it actually is, the way a manifest destination refuses
+    one."""
+    err = _row_sink_rejects(
+        "COPY (SELECT f.video[1], f.subtitle[1] FROM input('f.mp4') f) "
+        "TO publish('relay', 'live')",
+        _row_probes(_track("video", 0), _track("subtitle", 0)),
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "takes video and audio columns" in err.message
+    assert "is subtitle" in err.message
+    assert "'publish'" in err.message
+
+
+def test_a_one_row_sink_refuses_a_multi_row_relation() -> None:
+    """`video_streams`/`audio_streams` neither declaring "many" means the
+    sink is file-shaped -- the one-row rule again, naming the sink instead
+    of a path."""
+    err = _row_sink_rejects(
+        "COPY (SELECT r.video[1], r.audio[1] FROM input('ladder.m3u8') r) "
+        "TO publish('relay', 'live')",
+        _rendition_probes(),
+        _row_sink_described(video="one", audio="one"),
+    )
+    assert err.code is ErrorCode.ROW_COUNT_MISMATCH
+    assert err.message == "this query has 3 rows, and 'publish()' reads one"
+
+
+def test_a_many_video_one_audio_sink_still_refuses_three_audio_rows() -> None:
+    """Either kind declaring "many" is enough to admit several rows -- the
+    check is a single arity for the whole sink, not per kind."""
+    g = _row_sink_graph(
+        "COPY (SELECT r.video[1], r.audio[1] FROM input('ladder.m3u8') r) "
+        "TO publish('relay', 'live')",
+        _rendition_probes(),
+        _row_sink_described(video="many", audio="one"),
+    )
+    node_id = next(iter(g.packet_sinks))
+    assert len(g.packet_sinks[node_id]) == 5
+
+
+OLD_FORM_SINK_MODULE = "modules/tally.wasm"
+
+OLD_FORM_SINK_DECLARE = (
+    "CREATE FUNCTION tally(v video_stream) RETURNS sink\n"
+    f"  AS '{OLD_FORM_SINK_MODULE}', 'tally' LANGUAGE wasm;\n"
+)
+
+
+def test_the_old_sink_form_is_unaffected() -> None:
+    """A ``RETURNS sink`` declaring a stream parameter keeps reading its pad
+    from the SELECT's own arguments, not the relation's rows: no `row` or
+    `rendition` key reaches its pad dict, and a multi-row relation still
+    hits the ORDINARY one-row-per-file rule rather than the sink's own
+    arity check, exactly as before this change."""
+    g = lower(
+        resolve(parse(
+            OLD_FORM_SINK_DECLARE
+            + "COPY (SELECT f.video[1] FROM input('a.mp4') f) TO tally()"
+        )),
+        _row_probes(),
+        registry=_snapshot_registry(),
+        describes={OLD_FORM_SINK_MODULE: _row_sink_described(name="tally", video="one", audio="none")},
+    )
+    node_id = next(iter(g.packet_sinks))
+    (pad,) = g.packet_sinks[node_id]
+    assert "row" not in pad
+    assert "rendition" not in pad
+    two_videos = _row_probes(_track("video", 0), _track("video", 1))
+    with pytest.raises(FfrwdError) as excinfo:
+        lower(
+            resolve(parse(
+                OLD_FORM_SINK_DECLARE
+                + "COPY (SELECT array_agg(t) FROM input('f.mkv') f, unnest(f.video) t) "
+                "TO tally()"
+            )),
+            two_videos,
+            registry=_snapshot_registry(),
+            describes={OLD_FORM_SINK_MODULE: _row_sink_described(name="tally", video="one", audio="none")},
+        )
+    err = _anchored(excinfo.value)
+    assert err.code is ErrorCode.UDF_ARG_TYPE
+    assert "reads 1 stream" in err.message

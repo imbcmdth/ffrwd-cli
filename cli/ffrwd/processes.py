@@ -1918,6 +1918,7 @@ class _Partitioner:
                 impure=self._region_impure(members),
                 sink=any(name in self.g.module_sinks for name in members),
                 packet_sink=any(name in self.g.packet_sinks for name in members),
+                pads=self._region_pad_meta(members),
             )
             self.sidecars.append(sidecar)
             self.members[sidecar.id] = list(members)
@@ -2042,6 +2043,24 @@ class _Partitioner:
             if not self._shape(name).pure and path not in found:
                 found.append(path)
         return tuple(found)
+
+    def _region_pad_meta(self, members: Sequence[str]) -> tuple[PadMeta | None, ...]:
+        """This region's packet-sink pad metadata, one per ``-i`` read, in
+        the same order the reads themselves are rendered.
+
+        Empty for a region holding no packet sink -- the ordinary case, so
+        the argv renders no ``-pad`` flag anywhere. A pad `lower` never
+        marked with a row -- the old, stream-parameter sink form -- carries
+        `None`, the same as a pad the 0.12 sink default fills in at the
+        sidecar's own door.
+        """
+        name = next((n for n in members if n in self.g.packet_sinks), None)
+        if name is None:
+            return ()
+        return tuple(
+            PadMeta.from_dict(pad) if "row" in pad else None
+            for pad in self.g.packet_sinks[name]
+        )
 
     def _region_rows(self, members: Sequence[str]) -> RowsSink | None:
         """Where this region's rows go, for a region that writes any.
@@ -2183,6 +2202,8 @@ class _Partitioner:
                 # encoder's output, not the pcm every other audio edge does.
                 assert target is not None  # `pads` came from it
                 rest = dict(pads[self.g.nodes[target].inputs.index(ref)])
+                rest.pop("row", None)
+                rest.pop("rendition", None)
                 return AudioFormat(
                     rate=meta.sample_rate if meta else None,
                     channels=meta.channels if meta else None,
@@ -2200,6 +2221,8 @@ class _Partitioner:
             # ladder shapes every rendition differently.
             assert target is not None  # `pads` came from it
             rest = dict(pads[self.g.nodes[target].inputs.index(ref)])
+            rest.pop("row", None)
+            rest.pop("rendition", None)
             codec = str(rest.pop("video_codec"))
             pix_fmt = rest.pop("pix_fmt", DEFAULT_PIX_FMT)
             return VideoFormat(

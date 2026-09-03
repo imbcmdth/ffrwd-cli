@@ -7,10 +7,12 @@ split-complete, topologically ordered.
 
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 
 import pytest
 
+from ffrwd import wasm
 from ffrwd.errors import ErrorCode, FfrwdError
 from ffrwd.ir import Graph, ModuleSource, Node, Output, SinkUnit, SourceTrack, StreamType
 from ffrwd.probe import ProbeResult, StreamMeta
@@ -1301,6 +1303,79 @@ def test_legs_over_different_inputs_stay_two_processes() -> None:
         len([e for e in plan.stream_edges if e.source == p.id]) == 1
         for p in plan.ffmpeg
     )
+
+
+def _row_reading_packet_sink_graph() -> Graph:
+    """A row-reading sink's pads, hand-built the shape lower.py now writes:
+    two rows, each a video and an audio cell, `row`/`rendition` on every pad
+    dict beside the encoder options -- what :meth:`_Partitioner.
+    _region_pad_meta` reads to build `SidecarProcess.pads`.
+    """
+    g = Graph(input_paths=["ladder.m3u8"], sources={"r": 0})
+    g.nodes["e0"] = Node(
+        id="e0",
+        filter="mod.wasm",
+        args={},
+        inputs=["src:r:v:0", "src:r:a:0", "src:r:v:1", "src:r:a:1"],
+        outputs=[],
+    )
+    g.packet_sinks["e0"] = [
+        {
+            "video_codec": "libx264",
+            "row": 0,
+            "rendition": {"name": "Low", "bandwidth": 800_000},
+        },
+        {"audio_codec": "aac", "row": 0, "rendition": {"name": "Low", "bandwidth": 800_000}},
+        {
+            "video_codec": "copy",
+            "row": 1,
+            "rendition": {"name": "High", "bandwidth": 3_000_000},
+        },
+        {"audio_codec": "copy", "row": 1, "rendition": {"name": "High", "bandwidth": 3_000_000}},
+    ]
+    return g
+
+
+def test_a_row_reading_sinks_pads_carry_their_row_and_rendition() -> None:
+    """One `PadMeta` per `-i` read, in read order, `row`/`rendition` read
+    straight off the graph's own pad dicts."""
+    plan = partition(_row_reading_packet_sink_graph(), external=external_ids("e0"))
+    sidecar = plan.sidecars[0]
+    assert sidecar.pads == (
+        PadMeta(row=0, name="Low", bandwidth=800_000),
+        PadMeta(row=0, name="Low", bandwidth=800_000),
+        PadMeta(row=1, name="High", bandwidth=3_000_000),
+        PadMeta(row=1, name="High", bandwidth=3_000_000),
+    )
+
+
+def test_a_row_reading_sinks_argv_shows_pad_after_every_input() -> None:
+    """`wasm._argv` (via `wasm.shown_argv`) renders one `-pad '<json>'` right
+    after each pad's own `-i`, the row-reading sink's pads reaching the
+    printed command exactly as :attr:`SidecarProcess.pads` carries them."""
+    plan = partition(_row_reading_packet_sink_graph(), external=external_ids("e0"))
+    sidecar = plan.sidecars[0]
+    reads = ["pipe0", "pipe1", "pipe2", "pipe3"]
+    argv = wasm.shown_argv(sidecar, reads)
+    i_positions = [index for index, arg in enumerate(argv) if arg == "-i"]
+    assert len(i_positions) == 4
+    for pad_index, position in enumerate(i_positions):
+        assert argv[position + 1] == reads[pad_index]
+        assert argv[position + 2] == "-pad"
+        meta = json.loads(argv[position + 3])
+        expected = sidecar.pads[pad_index]
+        assert expected is not None
+        assert meta == expected.to_dict()
+
+
+def test_the_old_sink_forms_pads_show_no_pad_flag() -> None:
+    """A pad dict with no `row` key -- the old, stream-parameter sink form
+    -- carries no `PadMeta` at all, so the argv it renders is unchanged."""
+    plan = partition(_packet_ladder_graph(), external=external_ids("e0"))
+    sidecar = plan.sidecars[0]
+    assert all(pad is None for pad in sidecar.pads)
+    argv = wasm.shown_argv(sidecar, ["pipe0", "pipe1"])
+    assert "-pad" not in argv
 
 
 # ---------------------------------------------------------------- module sources
