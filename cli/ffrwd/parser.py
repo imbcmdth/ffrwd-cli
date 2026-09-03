@@ -172,9 +172,11 @@ Notes for downstream passes (lower):
   COLUMNS of any row table in scope — ``a.tags.language = b.tags.language``.
 
 * ``ORDER BY`` over track-row columns is the ONE carve-out in the
-  ``NO_STREAMING_EQUIVALENT`` rejection: ``Select.args["order"]`` is admitted only
-  when the branch's FROM clause holds at least one ``unnest`` (frames still
-  never sort). VERIFIED: an ``exp.Ordered`` carries ``desc`` and
+  ``NO_STREAMING_EQUIVALENT`` rejection: ``Select.args["order"]`` is admitted
+  when the branch's FROM clause holds at least one ``unnest``, or a plain
+  ``input(...)`` alias -- a probe may turn the latter into a rendition row
+  table, which only lower can confirm, so resolve admits it on spec (frames
+  still never sort). VERIFIED: an ``exp.Ordered`` carries ``desc`` and
   ``nulls_first`` as plain bools and sqlglot fills BOTH from the Postgres
   defaults — ``ASC`` gives ``nulls_first=False`` (NULLS LAST), ``DESC`` gives
   ``nulls_first=True`` (NULLS FIRST) — so honoring the flags verbatim IS
@@ -232,6 +234,7 @@ __all__ = [
     "InputSpec",
     "MACRO_NAMESPACE",
     "MAP_COLUMNS",
+    "RENDITION_COLUMNS",
     "ROW_SCHEMAS",
     "SINK_STREAMS",
     "ROW_STREAM",
@@ -359,8 +362,9 @@ _STREAMING_CLAUSES: dict[str, str] = {
 # carve-out: the compile-time row table.
 _ROW_TABLE_CLAUSE_HINT = (
     "it is legal only over a compile-time row table -- a branch whose FROM "
-    "has unnest(...), generate_series(...), or a CTE or view name -- where "
-    "it narrows the resolved rows, exactly like ORDER BY"
+    "has unnest(...), generate_series(...), a CTE or view name, or a plain "
+    "input(...) alias -- where it narrows the resolved rows, exactly like "
+    "ORDER BY"
 )
 _STREAMING_HINTS: dict[str, str] = {
     "limit": _ROW_TABLE_CLAUSE_HINT,
@@ -831,9 +835,19 @@ def record_cast_type(node: exp.Expr | None) -> str | None:
     return name if name in RECORD_FIELDS else None
 
 
+# The six rendition-ladder scalar columns a probed input MAY turn out to
+# carry (one row per ABR variant: ``bandwidth``, ``width``, ``height``,
+# ``codecs``, ``name``, ``language``). Only ffprobe can say whether a given
+# input actually has renditions, and that runs after resolve, so resolve
+# admits these names on every INPUT alias syntactically; lower is the one
+# that refuses them at bind time when the probe finds none.
+RENDITION_COLUMNS = frozenset({"bandwidth", "width", "height", "codecs", "name", "language"})
+
+
 def _is_input_column(name: str) -> bool:
-    """True for a column name an INPUT alias exposes, structural or tag path."""
-    return name in INPUT_COLUMNS or tag_key(name) is not None
+    """True for a column name an INPUT alias exposes: structural, tag path,
+    or a rendition column resolve admits on spec and lower confirms by probe."""
+    return name in INPUT_COLUMNS or name in RENDITION_COLUMNS or tag_key(name) is not None
 
 
 def _input_disposition_error(
@@ -2457,6 +2471,24 @@ def _has_row_source(select: exp.Select, visible: set[str]) -> bool:
     return False
 
 
+def _has_input_alias(select: exp.Select) -> bool:
+    """True if this branch's FROM clause holds a plain ``input(...)`` alias.
+
+    A probe run after resolve may turn such an alias into a rendition row
+    table (one row per ABR ladder entry); resolve cannot ask ffprobe, so it
+    admits the ORDER BY/LIMIT/OFFSET carve-out here too, syntactically, and
+    lower refuses them at bind time when the probe finds no renditions.
+    """
+    for item in from_items(select):
+        if (
+            isinstance(item, exp.Table)
+            and isinstance(item.this, exp.Anonymous)
+            and str(item.this.this).lower() == "input"
+        ):
+            return True
+    return False
+
+
 # Meta key on a rewritten sink call: how many of its leading arguments came
 # out of the COPY's SELECT list. Lowering reads it to tell the streams from
 # the values, which a sink reading an ARRAY of streams cannot do by counting.
@@ -3487,17 +3519,20 @@ class _Resolver:
         # ROW-SOURCE queries and nowhere else. The carve-out is decided from
         # the FROM clause alone, before any of it is validated, so a branch
         # with no rows keeps the NO_STREAMING_EQUIVALENT rejection byte for
-        # byte.
+        # byte. `ORDER BY`/`LIMIT`/`OFFSET` get one further carve-out GROUP BY
+        # does not: a plain `input(...)` alias, since a probe may resolve it
+        # to a rendition row table and only lower can tell -- resolve admits
+        # the clauses on spec here, syntactically.
         _normalize_map_paths(select, path_expr)
         _normalize_row_aliases(select, path_expr)
         rows = _has_row_source(select, visible)
         if rows:
             self._check_aggregate_context(select, no_aggregate)
-        allowed = (
-            _SELECT_ALLOWED | {"order", "group", "limit", "offset"}
-            if rows
-            else _SELECT_ALLOWED
-        )
+        allowed = _SELECT_ALLOWED
+        if rows:
+            allowed = allowed | {"order", "group", "limit", "offset"}
+        elif _has_input_alias(select):
+            allowed = allowed | {"order", "limit", "offset"}
         _check_query_args(select, allowed, "SELECT")
 
         # The SELECT list IS the output stream list, so any number of
@@ -6883,13 +6918,18 @@ class _Resolver:
     def _check_order(
         self, order: exp.Order, scope: dict[str, str], select: exp.Select
     ) -> None:
-        """Every sort key is a track-row metadata column, and nothing else.
+        """Every sort key is a track-row metadata column, or a rendition
+        column of a plain input alias, and nothing else.
 
-        Reaching here at all means the branch has a row source
-        (:func:`_has_row_source` decides the arg whitelist), so this is the
-        second half of the carve-out: the carve-out is for track-row METADATA
-        columns, not for the query that happens to contain them. Sorting
-        frames, a CTE's streams, or a time column is still
+        Reaching here at all means the branch has a row source or an
+        `input(...)` alias (:func:`_has_row_source` and
+        :func:`_has_input_alias` decide the arg whitelist between them), so
+        this is the second half of the carve-out: the carve-out is for
+        track-row METADATA columns and rendition columns, not for the query
+        that happens to contain them. A rendition column is admitted on an
+        input alias syntactically -- only a probe says whether that input
+        actually has renditions, and lower is what refuses it when it does
+        not. Sorting frames, a CTE's streams, or a time column is still
         NO_STREAMING_EQUIVALENT.
         """
         _check_query_args(order, frozenset({"expressions"}), "ORDER BY")
@@ -6926,7 +6966,13 @@ class _Resolver:
                 )
             table_node = key.args.get("table")
             alias = _ident_name(table_node) if table_node is not None else ""
-            if scope.get(alias) != "row":
+            kind = scope.get(alias)
+            if kind == "input" and _ident_name(key.this) in RENDITION_COLUMNS:
+                # A rendition column of a plain input alias: admitted on
+                # spec, since only lower's probe can say whether this input
+                # actually resolved to a rendition row table.
+                continue
+            if kind != "row":
                 raise _error(
                     ErrorCode.NO_STREAMING_EQUIVALENT,
                     "ORDER BY has no streaming equivalent",
@@ -6951,12 +6997,16 @@ class _Resolver:
         """LIMIT and OFFSET counts are integers known at resolve time.
 
         Reaching here with either clause present means the branch has a row
-        source (:func:`_has_row_source` decides the arg whitelist, the same
-        admission ORDER BY gets). LIMIT's count must be positive -- a query
-        that selects no rows is a mistake worth naming, not a valid empty
-        relation -- while ``OFFSET 0`` skips nothing and is the identity
-        Postgres says it is. Whether an OFFSET skips EVERY row is lowering's
-        to judge, since only the resolved relation knows its own size.
+        source or an `input(...)` alias (:func:`_has_row_source` and
+        :func:`_has_input_alias` decide the arg whitelist between them, the
+        same admission ORDER BY gets). The count itself needs no alias to
+        check: it is just a literal. LIMIT's count must be positive -- a
+        query that selects no rows is a mistake worth naming, not a valid
+        empty relation -- while ``OFFSET 0`` skips nothing and is the
+        identity Postgres says it is. Whether an OFFSET skips EVERY row --
+        or a LIMIT/ORDER BY names an input alias with no renditions -- is
+        lowering's to judge, since only the resolved relation knows its own
+        size and shape.
         """
         limit = select.args.get("limit")
         if isinstance(limit, exp.Limit):

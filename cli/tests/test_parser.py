@@ -321,12 +321,14 @@ def test_union_branches_helper_on_plain_select() -> None:
 
 
 def test_no_streaming_equivalent() -> None:
+    # LIMIT/OFFSET alone over a plain input() alias are NOT in this list: a
+    # probe may resolve that alias to a rendition row table, which only
+    # lower can tell, so resolve admits them on spec
+    # (test_limit_and_offset_over_a_plain_input_alias_now_resolve).
     for sql in (
         "SELECT a.video[1] FROM input('x') a GROUP BY a.video[1]",
         "SELECT a.video[1] FROM input('x') a HAVING count(*) > 1",
         "SELECT a.video[1] FROM input('x') a ORDER BY a.t",
-        "SELECT a.video[1] FROM input('x') a LIMIT 1",
-        "SELECT a.video[1] FROM input('x') a OFFSET 1",
         "SELECT DISTINCT a.video[1] FROM input('x') a",
         "SELECT row_number() OVER (ORDER BY a.t) FROM input('x') a",
         "SELECT count(a.video[1]) FROM input('x') a",
@@ -1333,7 +1335,9 @@ def test_copy_keeps_no_streaming_equivalent_of_the_inner_query() -> None:
         "COPY (SELECT frame FROM input('x.mp4') a) TO 'out.mkv'",
         "COPY (SELECT a.video[1] FROM input('x.mp4')) TO 'out.mkv'",
         "COPY (SELECT scale(a.*, 0.5) FROM input('x.mp4') a) TO 'out.mkv'",
-        "COPY (SELECT a.video[1] FROM input('x.mp4') a LIMIT 1) TO 'out.mkv'",
+        # A plain input() alias's ORDER BY key is still checked column by
+        # column: `a.t` is not a rendition column, so this keeps rejecting.
+        "COPY (SELECT a.video[1] FROM input('x.mp4') a ORDER BY a.t LIMIT 1) TO 'out.mkv'",
     ],
 )
 def test_copy_does_not_relax_inner_validation(sql: str) -> None:
@@ -1341,6 +1345,14 @@ def test_copy_does_not_relax_inner_validation(sql: str) -> None:
         ErrorCode.UNSUPPORTED_SQL,
         ErrorCode.NO_STREAMING_EQUIVALENT,
     )
+
+
+def test_copy_admits_limit_over_a_plain_input_alias_too() -> None:
+    """A COPY wrapper carries the same widened admission as a bare SELECT:
+    LIMIT alone over an input() alias resolves, deferring to lower whether
+    the probed input actually has renditions to limit."""
+    res = _resolve("COPY (SELECT a.video[1] FROM input('x.mp4') a LIMIT 1) TO 'out.mkv'")
+    assert isinstance(res.branches[0].args["limit"], exp.Limit)
 
 
 def test_bad_copy_is_rejected() -> None:
@@ -2252,8 +2264,32 @@ def test_order_by_is_admitted_over_track_row_columns() -> None:
     assert [bool(o.args.get("nulls_first")) for o in order.expressions] == [False, True]
 
 
-def test_order_by_without_any_unnest_is_still_rejected() -> None:
+def test_order_by_and_limit_resolve_over_a_plain_input_alias() -> None:
+    """FROM holds only an input() alias, no unnest -- a probe may turn it
+    into a rendition row table, which only lower can confirm, so resolve
+    admits ORDER BY over its rendition columns plus LIMIT on spec."""
+    res = _resolve(
+        "SELECT r.video[1] FROM input('ladder.m3u8') r "
+        "ORDER BY r.bandwidth DESC LIMIT 3"
+    )
+    order = res.branches[0].args["order"]
+    assert isinstance(order, exp.Order)
+    assert isinstance(res.branches[0].args["limit"], exp.Limit)
+
+
+def test_order_by_a_non_rendition_column_without_unnest_is_still_rejected() -> None:
+    """A plain input() alias admits the ORDER BY clause itself (a probe may
+    turn it into a rendition row table), but `f.t` is not one of the six
+    rendition columns, so the per-key check still refuses it."""
     err = _reject("SELECT f.audio[1] FROM input('f.mkv') f ORDER BY f.t")
+    assert err.code is ErrorCode.NO_STREAMING_EQUIVALENT
+    assert "only track-row metadata columns can be sorted" in (err.hint or "")
+
+
+def test_order_by_without_any_row_or_input_source_is_still_rejected() -> None:
+    """Neither an unnest(...) nor an input() alias in FROM: the ORDER BY
+    clause itself is rejected before any sort key is even inspected."""
+    err = _reject("SELECT f.video FROM ffmpeg.testsrc() f ORDER BY f.video")
     assert err.code is ErrorCode.NO_STREAMING_EQUIVALENT
     assert err.hint == "remove the ORDER BY clause"
 
@@ -2293,8 +2329,16 @@ def test_limit_is_admitted_in_a_cte_body() -> None:
     )
 
 
-def test_limit_without_a_row_table_keeps_the_streaming_rejection() -> None:
-    err = _reject("SELECT f.audio[1] FROM input('f.mkv') f LIMIT 1")
+def test_limit_over_a_plain_input_alias_now_resolves() -> None:
+    """A probe may turn a plain input() alias into a rendition row table --
+    only lower can tell -- so resolve admits LIMIT here on spec; a
+    renditionless input is lower's rejection to make, not resolve's."""
+    res = _resolve("SELECT f.audio[1] FROM input('f.mkv') f LIMIT 1")
+    assert isinstance(res.branches[0].args["limit"], exp.Limit)
+
+
+def test_limit_without_a_row_or_input_source_keeps_the_streaming_rejection() -> None:
+    err = _reject("SELECT f.video[1] FROM ffmpeg.testsrc() f LIMIT 1")
     assert err.code is ErrorCode.NO_STREAMING_EQUIVALENT
     assert err.message == "LIMIT has no streaming equivalent"
     assert "row table" in (err.hint or "")
@@ -3015,6 +3059,35 @@ def test_an_input_column_that_is_not_a_tag_path_is_still_unknown() -> None:
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "unknown column 'f.mood'" in err.message
     assert "container tags" in (err.hint or "")
+
+
+# -- rendition columns: admitted on an input alias syntactically, since only
+#    a probe (which runs after resolve) can say whether one applies --------
+
+
+@pytest.mark.parametrize("column", ["height", "bandwidth", "name"])
+def test_a_rendition_column_resolves_on_a_plain_input_alias(column: str) -> None:
+    res = _resolve(f"SELECT r.{column} AS x FROM input('ladder.m3u8') r")
+    assert res.branches[0].expressions[0].alias == "x"
+
+
+def test_all_six_rendition_columns_resolve_on_a_plain_input_alias() -> None:
+    columns = ", ".join(
+        f"r.{name}" for name in ("bandwidth", "width", "height", "codecs", "name", "language")
+    )
+    _resolve(f"SELECT {columns} FROM input('ladder.m3u8') r")
+
+
+def test_an_unknown_column_on_an_input_alias_is_still_unknown_the_same_way() -> None:
+    """Widening resolve() to admit rendition columns must not widen the
+    rejection's own wording for a column that is neither structural nor a
+    rendition name -- the hint still lists only INPUT_COLUMNS, because
+    resolve has not probed yet and cannot say a rendition table applies."""
+    err = _reject("SELECT r.mood FROM input('ladder.m3u8') r")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "unknown column 'r.mood'" in err.message
+    assert "an input exposes attachments, audio, chapters, cues, data, " \
+        "duration, subtitle, t, tags, video" in (err.hint or "")
 
 
 def test_a_query_nested_too_deeply_is_a_plain_rejection() -> None:
