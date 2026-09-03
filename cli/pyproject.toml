@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ffrwd"
-version = "0.8.0"
+version = "0.9.0"
 description = "SQL frontend for FFmpeg filtergraphs"
 readme = "README.md"
 keywords = ["ffmpeg", "sql", "filter", "filtergraphs"]
@@ -20,9 +20,9 @@ dependencies = [
     # alone, wasm calls degrading to the FFRWD_WASM / PATH hint. The wheel
     # matrix covers glibc and musl both, so the linux marker is honest on
     # Alpine-class machines too.
-    'ffrwd-wasm==0.8.0; sys_platform == "linux" and platform_machine in "x86_64 aarch64"',
-    'ffrwd-wasm==0.8.0; sys_platform == "win32" and platform_machine in "AMD64 ARM64"',
-    'ffrwd-wasm==0.8.0; sys_platform == "darwin" and platform_machine == "arm64"',
+    'ffrwd-wasm==0.9.0; sys_platform == "linux" and platform_machine in "x86_64 aarch64"',
+    'ffrwd-wasm==0.9.0; sys_platform == "win32" and platform_machine in "AMD64 ARM64"',
+    'ffrwd-wasm==0.9.0; sys_platform == "darwin" and platform_machine == "arm64"',
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
