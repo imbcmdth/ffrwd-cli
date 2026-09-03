@@ -30,6 +30,7 @@ from ffrwd.processes import (
     external_ids,
     from_commands,
     is_live,
+    is_live_probe,
     partition,
 )
 
@@ -1143,6 +1144,56 @@ def test_which_inputs_can_only_be_opened_once() -> None:
         True,
         False,
     ]
+
+
+# ---------------------------------------------------------------- live manifests
+
+
+MANIFEST = "playlist.m3u8"  # a plain path: is_live(MANIFEST, {}) is False
+
+
+def _manifest_probe(*, live: bool) -> ProbeResult:
+    """A probed HLS/DASH rendition on a plain-file path, live or ended."""
+    probe = _live_probe()
+    return ProbeResult(streams=probe.streams, duration=probe.duration, live=live)
+
+
+def test_is_live_probe_reads_the_probes_own_flag() -> None:
+    assert is_live_probe(_manifest_probe(live=True)) is True
+    assert is_live_probe(_manifest_probe(live=False)) is False
+    assert is_live_probe(None) is False
+
+
+def test_one_process_reads_a_live_manifest_however_the_graph_splits() -> None:
+    """A still-live manifest reads once, exactly as an ``srt://`` input does."""
+    plan = partition(
+        _merge_graph(MANIFEST),
+        external=external_ids("e0"),
+        probes={"a": _manifest_probe(live=True)},
+        pix_fmts={"invert": "rgba"},
+        shapes={"invert": ModuleShape()},
+        anchors={"a": (7, 14)},
+    )
+
+    assert _opens(plan, MANIFEST) == ["ffmpeg1"]
+    reader = plan.process("ffmpeg1")
+    assert isinstance(reader, FfmpegProcess)
+    assert list(reader.graph.nodes) == ["sp"]
+    assert [unit.path for unit in reader.graph.sinks] == [PIPE, PIPE]
+
+
+def test_an_ended_manifest_still_decodes_once_per_leg() -> None:
+    """``#EXT-X-ENDLIST`` reached: the plain-file rule applies, not the live one."""
+    plan = partition(
+        _merge_graph(MANIFEST),
+        external=external_ids("e0"),
+        probes={"a": _manifest_probe(live=False)},
+        pix_fmts={"invert": "rgba"},
+        shapes={"invert": ModuleShape()},
+        anchors={"a": (7, 14)},
+    )
+
+    assert _opens(plan, MANIFEST) == ["ffmpeg1", "ffmpeg2"]
 
 
 def _no_pure_reader_graph() -> Graph:

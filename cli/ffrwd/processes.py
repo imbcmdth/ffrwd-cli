@@ -59,9 +59,11 @@ Live inputs
 -----------
 Duplicating the producer is only available to an input that can be opened
 twice. A protocol -- srt, udp, rtmp -- and a capture device cannot: the second
-open takes a socket already bound, or a camera already held. Such an input
-(:func:`is_live`) is therefore read by exactly ONE process whatever the graph
-shape. Every leg over it joins that reader instead of opening the input again,
+open takes a socket already bound, or a camera already held. Neither can a
+still-live HLS or DASH manifest, whose second read would resume mid-stream
+rather than start over. Such an input (:func:`is_live`, :func:`is_live_probe`)
+is therefore read by exactly ONE process whatever the graph shape. Every leg
+over it joins that reader instead of opening the input again,
 and the reader writes each consumer's stream to a pipe of its own -- one
 ffmpeg with several outputs. A process that would have opened the input
 directly reads one of those pipes instead.
@@ -145,6 +147,7 @@ __all__ = [
     "external_ids",
     "from_commands",
     "is_live",
+    "is_live_probe",
     "nothing_external",
     "check_spellable",
     "partition",
@@ -821,6 +824,16 @@ def is_live(path: str, options: Mapping[str, object] | None = None) -> bool:
     return is_url(path) or "format" in (options or {})
 
 
+def is_live_probe(result: ProbeResult | None) -> bool:
+    """True when a probed manifest is still live: no end, no second read.
+
+    :func:`is_live` answers from a path and options alone, which a plain HLS
+    or DASH URL cannot settle -- only ffprobe knows whether the manifest it
+    read carries ``#EXT-X-ENDLIST`` or ``type="dynamic"``.
+    """
+    return result is not None and result.live
+
+
 def _named_ref(ref: FrameRef) -> str:
     """A stream ref as a message names it: its input, or the node it comes from."""
     if is_src(ref):
@@ -978,7 +991,10 @@ class _Partitioner:
             alias
             for alias, index in g.sources.items()
             if index < len(g.input_paths)
-            and is_live(g.input_paths[index], g.input_options.get(alias))
+            and (
+                is_live(g.input_paths[index], g.input_options.get(alias))
+                or is_live_probe(self.probes.get(alias))
+            )
         )
         self.order = _topological(g)
         # A hosted node is external whoever asked: only the sidecar runs it.
