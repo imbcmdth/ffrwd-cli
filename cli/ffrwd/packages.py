@@ -81,11 +81,16 @@ from .project import (
     Package,
     RegistryEntry,
     add_dependency,
-    held_entry,
+    held_links,
     is_package_name,
+    link_target,
+    links_path,
     name_refusal,
+    read_linksfile,
     read_lockfile,
     read_manifest,
+    stored_name,
+    write_linksfile,
     write_lockfile,
 )
 
@@ -1257,6 +1262,31 @@ def _ensure(
     brought.append(release)
 
 
+def _write_lockfile_migrating(
+    lock: Path, entries: Sequence[LockEntry], wanted: Mapping[str, str]
+) -> None:
+    """Write `lock`, moving any link entry an older ffrwd left in it to the links file.
+
+    The links file is written first: a failure between the two writes leaves a
+    link recorded in both places, which reads as one link and is cleaned by
+    the next write, rather than in neither.
+    """
+    carried = [entry for entry in entries if isinstance(entry, LinkEntry)]
+    if carried:
+        beside = links_path(lock)
+        held = list(read_linksfile(beside))
+        known = {link_target(entry, beside) or entry.path for entry in held}
+        for entry in carried:
+            if (link_target(entry, lock) or entry.path) not in known:
+                held.append(entry)
+        write_linksfile(beside, held)
+    write_lockfile(
+        lock,
+        [entry for entry in entries if not isinstance(entry, LinkEntry)],
+        dependencies=wanted,
+    )
+
+
 def install(
     request: str,
     *,
@@ -1308,7 +1338,7 @@ def install(
     ]
 
     wanted[release.name] = release.version
-    write_lockfile(lock, entries, dependencies=wanted)
+    _write_lockfile_migrating(lock, entries, wanted)
     if manifest is not None:
         add_dependency(manifest, release.name, release.version)
 
@@ -1347,19 +1377,20 @@ def install_project(
     the manifest of the tree standing here is the pin, not a request for
     the highest.
 
-    A dependency the lockfile already reads out of a working directory is
-    left as it is: that is what a link is for, and fetching the registry's
-    copy over it would undo the link and refuse the whole install for a
+    A dependency this project links to a working directory is left as the
+    link it is: that is what a link is for, and fetching the registry's copy
+    beside it would shadow the link and refuse the whole install for a
     package that is not published yet.
     """
     package = read_manifest(manifest)
     current = read_lockfile(lock) if lock.is_file() else None
     entries: list[LockEntry] = list(current.entries) if current is not None else []
     wanted: dict[str, str] = dict(current.dependencies) if current is not None else {}
+    linked = {stored_name(entry, source) for entry, source in held_links(lock)}
 
     brought: list[Release] = []
     for name, version in package.dependencies.items():
-        if isinstance(held_entry(entries, name, lock), LinkEntry):
+        if name in linked:
             if announce is not None:
                 announce(f"{name} is linked to a working directory")
             continue
@@ -1368,7 +1399,7 @@ def install_project(
         release = resolve(f"{name}@{version}")
         _ensure(release, entries, [], brought, announce)
         wanted[name] = release.version
-    write_lockfile(lock, entries, dependencies=wanted)
+    _write_lockfile_migrating(lock, entries, wanted)
 
     _install_models(package, announce)
     _install_runtime(package, announce)

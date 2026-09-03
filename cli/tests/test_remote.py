@@ -24,7 +24,7 @@ import ffrwd
 from ffrwd import cli, credentials, packages, parser, remote, store
 from ffrwd.errors import FfrwdError
 from ffrwd.probe import is_url
-from ffrwd.project import LinkEntry, RegistryEntry, write_lockfile
+from ffrwd.project import LinkEntry, RegistryEntry, links_path, write_linksfile, write_lockfile
 from ffrwd.table import TableResult, render_table
 
 API = "https://api.example"
@@ -556,6 +556,30 @@ def test_a_linked_package_packs_and_its_digest_pins_the_submitted_lock(
     ]
     # And the bytes went to the same content-addressed endpoint an input uses.
     assert _uploaded(served) == {digest: archive}
+
+
+def test_a_link_recorded_in_the_links_file_packs_the_same_way(
+    served: _Served, logged_in: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Where the link is recorded does not change what travels."""
+    monkeypatch.chdir(tmp_path)
+    linked = _linked_package(tmp_path / "tools")
+    write_lockfile(tmp_path / "ffrwd.lock", [])
+    write_linksfile(links_path(tmp_path / "ffrwd.lock"), [LinkEntry(path="tools")])
+    archive, digest = _packed(linked)
+    _submit_accepted(served)
+    served.answers[f"{UPLOAD_URL}?sha256={digest}"] = json.dumps(
+        {"already": False, "bytes": len(archive)}
+    ).encode("utf-8")
+
+    remote.submit_run(_query(STREAM_QUERY), None, _run_args())
+
+    assert _submitted_packages(served) == [digest]
+    lock = _submitted_lock(served)
+    assert lock is not None
+    document = json.loads(lock)
+    assert document["reproducible"] is True
+    assert [entry["sha256"] for entry in document["packages"]] == [digest]
 
 
 def test_the_packed_archive_holds_the_manifests_closure(

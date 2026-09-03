@@ -85,16 +85,20 @@ Subcommands:
   pinned models and the runtime its modules load -- a fresh clone builds
   and publishes after this.
 * ``path PKG [-g]`` -- print where an installed package's content is on this
-  machine, resolved through the same lockfile ``install`` writes: the store
-  directory for an installed package, the linked directory for a link. One
+  machine, resolved through the lockfile ``install`` writes and the links
+  file beside it: the store directory for an installed package, the linked
+  directory for a link. One
   line, the path alone, because a build script reads it -- a module's
   ``build.rs`` asks ``ffrwd path ffrwd/wasm`` for the wit. A package the
   lockfile does not pin is a typed error naming ``ffrwd install``.
 * ``link PATH [-g]`` / ``unlink NAME [-g]`` -- record (or drop) a package
-  read live out of a directory, in this project's lockfile or, with ``-g``,
-  the machine-wide one. The entry records only the directory; the package's
-  name comes from the manifest there. Outside a project and without ``-g``
-  there is no lockfile to write and none is invented: usage error, exit 2.
+  read live out of a directory, in the machine-local ``ffrwd.links`` beside
+  this project's lockfile or, with ``-g``, the machine-wide one. The
+  lockfile itself is untouched. The record names only the directory; the
+  package's name comes from the manifest there, and its calls resolve
+  through its OWN lockfile -- ``ffrwd install`` run there first is the
+  prerequisite, refused otherwise. Outside a project and without ``-g``
+  there is nothing to record in and nothing is invented: usage error, exit 2.
 * ``login --token TOKEN`` / ``logout`` -- save (or remove) the token this
   machine publishes with. ``login`` checks the token's shape and touches no
   network; whether it is live is the registry's answer at the first command
@@ -170,6 +174,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from importlib import metadata
 from pathlib import Path
@@ -209,16 +214,19 @@ from .project import (
     find_lockfile,
     find_manifest,
     held_entry,
+    held_links,
     is_namespace,
     is_package_name,
     is_recipe_name,
+    link_refusal,
+    link_target,
+    links_path,
     name_refusal,
     read_lockfile,
     read_manifest,
     stored_name,
     stored_version,
-    with_entry,
-    without_entry,
+    write_linksfile,
     write_lockfile,
     write_manifest,
 )
@@ -2350,11 +2358,13 @@ def _cmd_init(args: argparse.Namespace, on_warning: OnWarning) -> int:
 
 
 def _lock_to_write(args: argparse.Namespace) -> tuple[Path | None, int]:
-    """The lockfile `link`/`unlink` writes, or None with the usage error printed.
+    """The lockfile `link`/`unlink` works beside, or None with the usage error printed.
 
-    Never creates one as a side effect: outside a project there is nothing to
-    record a package in, and inventing a lockfile in whatever directory they
-    happen to stand in is not a project.
+    The links file lives next to it; the lockfile itself is only rewritten to
+    shed link entries an older ffrwd put there. Never creates one as a side
+    effect: outside a project there is nothing to record a package in, and
+    inventing a lockfile in whatever directory they happen to stand in is not
+    a project.
     """
     if args.global_lock:
         return store.global_lock_path(), 0
@@ -2539,8 +2549,13 @@ def _pinned_entry(lock: Path, name: str, version: str | None) -> LockEntry:
 
     ``@version`` is exact among the entries pinning `name`; without one the
     lockfile's own dependency pin wins, then the highest pinned version.
+    Links count: a linked package resolves to its directory.
     """
-    entries = [entry for entry in _held_entries(lock) if stored_name(entry, lock) == name]
+    held: list[LockEntry] = [
+        entry for entry in _held_entries(lock) if not isinstance(entry, LinkEntry)
+    ]
+    held.extend(entry for entry, _source in held_links(lock))
+    entries = [entry for entry in held if stored_name(entry, lock) == name]
     if not entries:
         request = name if version is None else f"{name}@{version}"
         raise FfrwdError(
@@ -2606,12 +2621,12 @@ def _cmd_path(args: argparse.Namespace, on_warning: OnWarning) -> int:
 
 
 def _written_link_path(target: Path, lock: Path, *, relative: bool) -> str:
-    """How the lockfile writes the linked directory.
+    """How the links file writes the linked directory.
 
-    Relative to the lockfile for a project's own, which keeps the file
-    readable beside the tree it points into; absolute for the machine-wide
-    one, which sits under the cache directory where relative would only be a
-    climb. A path on another drive has no relative form and stays absolute.
+    Relative to the file for a project's own, which keeps it readable beside
+    the tree it points into; absolute for the machine-wide one, which sits
+    under the cache directory where relative would only be a climb. A path on
+    another drive has no relative form and stays absolute.
     """
     resolved = target.resolve()
     if not relative:
@@ -2622,8 +2637,28 @@ def _written_link_path(target: Path, lock: Path, *, relative: bool) -> str:
         return str(resolved)
 
 
+def _shed_lock_links(lock: Path) -> tuple[LockEntry, ...]:
+    """Rewrite `lock` without the link entries an older ffrwd left in it.
+
+    Returns what the lockfile pins afterwards. The links themselves are the
+    caller's: it holds them through :func:`held_links`, which reads both
+    homes, and decides what the links file ends up saying.
+    """
+    entries = _held_entries(lock)
+    kept = tuple(entry for entry in entries if not isinstance(entry, LinkEntry))
+    if len(kept) != len(entries):
+        write_lockfile(lock, kept, dependencies=_held_dependencies(lock))
+    return kept
+
+
 def _cmd_link(args: argparse.Namespace, on_warning: OnWarning) -> int:
-    """Record a package read live out of `path`, in this project's lockfile or -g's."""
+    """Record a package read live out of `path`, beside this project's lockfile or -g's.
+
+    The record goes in the links file, never the lockfile: a link is this
+    machine's, and the lockfile is everyone's. The linked package resolves
+    through its own lockfile, so it must have installed its own dependencies
+    first.
+    """
     target = Path(args.path)
     manifest = target / MANIFEST_NAME
     if not manifest.is_file():
@@ -2634,79 +2669,117 @@ def _cmd_link(args: argparse.Namespace, on_warning: OnWarning) -> int:
     if lock is None:
         return code
 
+    links_file = links_path(lock)
     try:
         package = read_manifest(manifest)
-        entries = _held_entries(lock)
-        replaced = held_entry(entries, package.name, lock)
+        refused = link_refusal(package, target)
+        if refused is not None:
+            raise FfrwdError(ErrorCode.UNSUPPORTED_SQL, refused[0], hint=refused[1])
+        held = held_links(lock)
+        replaced = _replaced_link(held, package.name, target)
         entry = LinkEntry(
             path=_written_link_path(target, lock, relative=not args.global_lock),
         )
-        write_lockfile(
-            lock, with_entry(entries, entry, replaced), dependencies=_held_dependencies(lock)
-        )
+        kept = [one for one, _source in held if one is not replaced]
+        write_linksfile(links_file, [*kept, entry])
+        pinned = held_entry(_shed_lock_links(lock), package.name, lock)
     except FfrwdError as err:
         _print_error(err)
         return 1
 
-    print(f"linked {package.name} -> {entry.path} in {lock}")
+    print(f"linked {package.name} -> {entry.path} in {links_file}")
     if replaced is not None:
-        print(f"  replacing {_described(replaced)}")
+        print(f"  replacing the link to {replaced.path}")
+    if pinned is not None:
+        print(f"  over {_described(pinned)}, which stays pinned")
     return 0
 
 
-def _linked_as(entry: LinkEntry, lock: Path) -> str:
+def _replaced_link(
+    held: Sequence[tuple[LinkEntry, Path]], name: str, target: Path
+) -> LinkEntry | None:
+    """The link a new one for `name` at `target` takes over, or None.
+
+    By package name when a held link's manifest still reads -- one name, one
+    link -- and by directory otherwise, so re-linking a moved or emptied
+    directory replaces its old record rather than stacking a second.
+    """
+    try:
+        wanted: Path | None = target.resolve()
+    except (OSError, ValueError):
+        wanted = None
+    for entry, source in held:
+        if stored_name(entry, source) == name:
+            return entry
+        if wanted is not None and link_target(entry, source) == wanted:
+            return entry
+    return None
+
+
+def _linked_as(entry: LinkEntry, source: Path) -> str:
     """How one link is named to the user: the package's name, or its bare path."""
-    name = stored_name(entry, lock)
+    name = stored_name(entry, source)
     return name if name is not None else f"the unreadable link {entry.path!r}"
 
 
-def _matching_link(entries: tuple[LockEntry, ...], written: str, lock: Path) -> LinkEntry | None:
-    """The link entry `written` names -- by package name, or by directory."""
-    for entry in entries:
-        if not isinstance(entry, LinkEntry):
-            continue
-        if stored_name(entry, lock) == written or entry.path == written:
-            return entry
+def _matching_link(
+    held: Sequence[tuple[LinkEntry, Path]], written: str
+) -> tuple[LinkEntry, Path] | None:
+    """The link `written` names -- by package name, or by directory."""
+    for entry, source in held:
+        if stored_name(entry, source) == written or entry.path == written:
+            return entry, source
         # A dead link is still removable by the directory it points at.
         try:
-            if (lock.parent / Path(entry.path)).resolve() == Path(written).resolve():
-                return entry
+            if link_target(entry, source) == Path(written).resolve():
+                return entry, source
         except (OSError, ValueError):
             continue
     return None
 
 
 def _cmd_unlink(args: argparse.Namespace, on_warning: OnWarning) -> int:
-    """Drop the link `name` names and rewrite the lockfile."""
+    """Drop the link `name` names from the links file. Nothing else changes.
+
+    What the linked package resolved through its own lockfile was never
+    recorded here, so there is nothing to clean up: the record goes, the
+    lockfile stays as it was.
+    """
     lock, code = _lock_to_write(args)
     if lock is None:
         return code
     try:
-        entries = _held_entries(lock)
+        held = held_links(lock)
     except FfrwdError as err:
         _print_error(err)
         return 1
 
-    held = _matching_link(entries, args.name, lock)
-    if held is None:
-        installed = held_entry(entries, args.name, lock)
+    matched = _matching_link(held, args.name)
+    if matched is None:
+        try:
+            installed = held_entry(_held_entries(lock), args.name, lock)
+        except FfrwdError:
+            installed = None
         why = "" if installed is None else " -- it is installed, not linked"
-        print(f"error: unlink: nothing links '{args.name}' in {lock}{why}", file=sys.stderr)
-        linked = [
-            _linked_as(entry, lock) for entry in entries if isinstance(entry, LinkEntry)
-        ]
+        print(
+            f"error: unlink: nothing links '{args.name}' in {links_path(lock)}{why}",
+            file=sys.stderr,
+        )
+        linked = [_linked_as(entry, source) for entry, source in held]
         print(
             f"hint: linked: {', '.join(linked)}" if linked else "hint: nothing here is linked",
             file=sys.stderr,
         )
         return 1
 
+    entry, source = matched
     try:
-        write_lockfile(lock, without_entry(entries, held), dependencies=_held_dependencies(lock))
+        write_linksfile(links_path(lock), [one for one, _source in held if one is not entry])
+        _shed_lock_links(lock)
     except FfrwdError as err:
         _print_error(err)
         return 1
-    print(f"unlinked '{args.name}' from {lock}")
+    print(f"unlinked '{args.name}' from {source}")
     return 0
 
 

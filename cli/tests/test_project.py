@@ -41,10 +41,13 @@ from ffrwd.project import (
     RegistryEntry,
     discover,
     find_manifest,
+    links_path,
+    read_linksfile,
     read_lockfile,
     read_manifest,
     with_entry,
     without_entry,
+    write_linksfile,
     write_lockfile,
     write_manifest,
 )
@@ -1733,6 +1736,121 @@ def test_a_linked_directory_with_no_manifest_is_refused(tmp_path: Path) -> None:
     _refuses(project, "holds no ffrwd.json")
 
 
+_REACH = (
+    "CREATE FUNCTION use(track audio_stream) RETURNS audio_stream AS $$\n"
+    "  SELECT shared.d.quieter(track)\n"
+    "$$ LANGUAGE sql;\n"
+)
+
+
+def _linked_consumer(project: Path, linked: Path) -> Path:
+    """A project whose links file reads `linked`, its lockfile empty."""
+    _project(project, files={"src/own.sql": NORMALIZE})
+    lock = _lock(project, [])
+    write_linksfile(links_path(lock), [LinkEntry(path=str(linked))])
+    return lock
+
+
+def test_a_linked_package_resolves_through_its_own_lockfile(
+    store_home: Path, tmp_path: Path
+) -> None:
+    """The consuming project installs nothing: the linked tree's own lockfile
+    pins its dependency, the store holds it, and the call resolves there."""
+    dep = _installed(_library(tmp_path / "d", "shared", "0.25", package="d"))
+    linked = _library(
+        tmp_path / "dev",
+        "studio",
+        "",
+        package="pipe",
+        member="use",
+        src=_REACH,
+        dependencies={"shared/d": "1.0.0"},
+    )
+    _lock(linked, [dep], dependencies={"shared/d": "1.0.0"})
+    project = tmp_path / "work"
+    lock = _linked_consumer(project, linked)
+    before = lock.read_text(encoding="utf-8")
+
+    argv, said = _heard(QUERY.format(call="studio.pipe.use"), _packages(project))
+    assert "volume=volume=0.25" in " ".join(argv)
+    assert WarningCode.LINKED_PACKAGE in _codes(said)
+    assert lock.read_text(encoding="utf-8") == before, "resolution wrote nothing"
+
+
+def test_the_project_around_a_link_does_not_see_its_dependencies(
+    store_home: Path, tmp_path: Path
+) -> None:
+    """The linked tree's pins are its own: the consumer's query is refused
+    exactly as it would be with nothing linked at all."""
+    dep = _installed(_library(tmp_path / "d", "shared", "0.25", package="d"))
+    linked = _library(
+        tmp_path / "dev",
+        "studio",
+        "",
+        package="pipe",
+        member="use",
+        src=_REACH,
+        dependencies={"shared/d": "1.0.0"},
+    )
+    _lock(linked, [dep], dependencies={"shared/d": "1.0.0"})
+    project = tmp_path / "work"
+    _linked_consumer(project, linked)
+
+    _rejects(
+        QUERY.format(call="shared.d.quieter"),
+        _packages(project),
+        ErrorCode.UNKNOWN_FUNCTION,
+        "unknown namespace 'shared'",
+    )
+
+
+def test_a_link_inside_a_linked_package_resolves_for_its_holder(
+    store_home: Path, tmp_path: Path
+) -> None:
+    """The linked tree links its own dependency; the walk crosses both, and
+    the inner one stays as invisible to the consumer as any other pin."""
+    helper = _library(tmp_path / "helper", "shared", "0.75", package="d")
+    linked = _library(
+        tmp_path / "dev",
+        "studio",
+        "",
+        package="pipe",
+        member="use",
+        src=_REACH,
+        dependencies={"shared/d": "1.0.0"},
+    )
+    write_linksfile(links_path(linked / "ffrwd.lock"), [LinkEntry(path="../helper")])
+    project = tmp_path / "work"
+    _linked_consumer(project, linked)
+
+    argv, _said = _heard(QUERY.format(call="studio.pipe.use"), _packages(project))
+    assert "volume=volume=0.75" in " ".join(argv)
+    _rejects(
+        QUERY.format(call="shared.d.quieter"),
+        _packages(project),
+        ErrorCode.UNKNOWN_FUNCTION,
+        "unknown namespace 'shared'",
+    )
+    assert (helper / MANIFEST_NAME).is_file()
+
+
+def test_a_linked_tree_that_drifts_uninstalled_refuses_at_resolution(
+    store_home: Path, tmp_path: Path
+) -> None:
+    """A dependency added to the linked manifest after linking, never installed
+    there: the next resolution refuses, naming the install to run."""
+    linked = _library(tmp_path / "dev", "studio", "0.5", package="pipe")
+    project = tmp_path / "work"
+    _linked_consumer(project, linked)
+    assert "studio/pipe" in _packages(project).names()
+
+    drifted = json.loads((linked / "ffrwd.json").read_text(encoding="utf-8"))
+    drifted["dependencies"] = {"shared/d": "1.0.0"}
+    (linked / "ffrwd.json").write_text(json.dumps(drifted) + "\n", encoding="utf-8")
+    refused = _refuses(project, "depends on 'shared/d@1.0.0'")
+    assert refused.hint is not None and "ffrwd install" in refused.hint
+
+
 def test_a_linked_package_may_rename_itself_without_a_re_link(tmp_path: Path) -> None:
     """The entry records only the directory; the name is the manifest's."""
     linked = _library(tmp_path / "dev", "tracks", "0.5")
@@ -2921,19 +3039,20 @@ def test_init_rust_refuses_to_overwrite_any_file_it_would_write(
 # ---------------------------------------------------------------------------
 
 
-def test_link_records_the_directory_and_names_the_package(
+def test_link_records_the_directory_and_leaves_the_lockfile_byte_identical(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     _library(tmp_path / "dev", "tracks", "0.5")
     project = tmp_path / "work"
     _project(project, files={"src/own.sql": NORMALIZE})
-    _lock(project, [])
+    lock = _lock(project, [])
+    before = lock.read_text(encoding="utf-8")
     code, out, _err = _run(project, monkeypatch, capsys, "link", "../dev")
     assert code == 0
     assert "linked tracks/lib -> ../dev" in out
-    lock = read_lockfile(project / "ffrwd.lock")
-    assert lock.entries == (LinkEntry(path="../dev"),)
-    assert lock.reproducible is False
+    assert "ffrwd.links" in out
+    assert lock.read_text(encoding="utf-8") == before, "the lockfile is everyone's"
+    assert read_linksfile(links_path(lock)) == (LinkEntry(path="../dev"),)
 
 
 def test_a_linked_package_is_callable_right_after_linking(
@@ -2952,20 +3071,81 @@ def test_a_linked_package_is_callable_right_after_linking(
     assert "warning: package 'tracks/lib' is linked to" in err
 
 
-def test_link_replaces_what_pinned_the_package(
+def test_link_answers_over_an_installed_package_and_the_pin_stays(
     store_home: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    """Linking a name something already pins: the pin stays, the link answers.
+
+    Even the project's own recorded want -- here 2.0.0 -- yields to the link:
+    that is what linking is for.
+    """
     project = tmp_path / "work"
     _project(project, files={"src/own.sql": NORMALIZE})
-    _lock(project, [_installed(_library(tmp_path / "far", "tracks", "0.5"))])
+    entry = _installed(_library(tmp_path / "far", "tracks", "0.5", version="2.0.0"))
+    lock = _lock(project, [entry], dependencies={"tracks/lib": "2.0.0"})
+    before = lock.read_text(encoding="utf-8")
     _library(tmp_path / "dev", "tracks", "0.9")
     code, out, _err = _run(project, monkeypatch, capsys, "link", "../dev")
     assert code == 0
-    assert "replacing the installed tracks/lib 1.0.0" in out
-    assert read_lockfile(project / "ffrwd.lock").entries == (LinkEntry(path="../dev"),)
+    assert "over the installed tracks/lib 2.0.0, which stays pinned" in out
+    assert lock.read_text(encoding="utf-8") == before
+    assert read_linksfile(links_path(lock)) == (LinkEntry(path="../dev"),)
+
+    code, out, _err = _run(
+        project, monkeypatch, capsys, "compile", QUERY.format(call="tracks.lib.quieter")
+    )
+    assert code == 0
+    assert "volume=volume=0.9" in out, "the linked directory answered, not the store"
+
+
+def test_a_linked_recipe_resolves_through_the_linked_trees_own_lockfile(
+    store_home: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The reproduced refusal: a linked package's recipe calls its dependency.
+
+    Nothing is installed in the consuming project -- the dependency is pinned
+    in the linked tree's own lockfile and sits in the shared store, so the
+    call resolves there.
+    """
+    dep = _installed(_library(tmp_path / "d", "shared", "0.25", package="d"))
+    linked = tmp_path / "dev"
+    _write(
+        linked / "queries" / "go.sql",
+        "-- variables: dest (output path)\n"
+        "COPY (SELECT shared.d.quieter(f.audio[1]) FROM input('film.mkv') f) TO :'dest'\n",
+    )
+    _write(
+        linked / "ffrwd.json",
+        json.dumps(
+            {
+                "name": "studio/pipe",
+                "version": "1.0.0",
+                "bin": {"go": "queries/go.sql"},
+                "dependencies": {"shared/d": "1.0.0"},
+            },
+            indent=2,
+        )
+        + "\n",
+    )
+    _lock(linked, [dep], dependencies={"shared/d": "1.0.0"})
+    project = tmp_path / "work"
+    _project(project, files={"src/own.sql": NORMALIZE})
+    lock = _lock(project, [])
+    assert _run(project, monkeypatch, capsys, "link", "../dev")[0] == 0
+    before = lock.read_text(encoding="utf-8")
+
+    code, out, err = _run(
+        project, monkeypatch, capsys, "compile", "studio/pipe:go", "-v", "dest=o.mkv"
+    )
+    assert code == 0, err
+    assert "volume=volume=0.25" in out, out
+    assert lock.read_text(encoding="utf-8") == before, "nothing was installed here"
 
 
 def test_link_outside_a_project_names_both_ways_forward(
@@ -2980,7 +3160,7 @@ def test_link_outside_a_project_names_both_ways_forward(
     assert not (bare / "ffrwd.lock").exists()
 
 
-def test_link_writes_the_machine_wide_lockfile(
+def test_link_writes_the_machine_wide_links_file(
     store_home: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2991,9 +3171,11 @@ def test_link_writes_the_machine_wide_lockfile(
     bare.mkdir()
     code, _out, _err = _run(bare, monkeypatch, capsys, "link", "-g", str(linked))
     assert code == 0
-    lock = read_lockfile(store.global_lock_path())
-    # Absolute, since the machine-wide lockfile lives under the cache directory.
-    assert lock.entries == (LinkEntry(path=str(linked.resolve())),)
+    held = read_linksfile(links_path(store.global_lock_path()))
+    # Absolute, since the machine-wide links file lives under the cache directory.
+    assert held == (LinkEntry(path=str(linked.resolve())),)
+    # No lockfile is invented beside it.
+    assert not store.global_lock_path().exists()
 
 
 def test_link_refuses_a_directory_holding_no_manifest(
@@ -3074,6 +3256,88 @@ def test_unlink_outside_a_project_is_a_usage_error(
     assert code == 2
     assert "unlink -g" in err
     assert not (bare / "ffrwd.lock").exists()
+
+
+def test_unlink_removes_only_the_record(
+    store_home: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The links file loses the record; the lockfile and the linked tree do not move."""
+    linked = _library(tmp_path / "dev", "tracks", "0.5")
+    project = tmp_path / "work"
+    _project(project, files={"src/own.sql": NORMALIZE})
+    lock = _lock(project, [_installed(_library(tmp_path / "far", "other", "0.5"))])
+    assert _run(project, monkeypatch, capsys, "link", "../dev")[0] == 0
+    before = lock.read_text(encoding="utf-8")
+
+    code, out, _err = _run(project, monkeypatch, capsys, "unlink", "tracks/lib")
+    assert code == 0
+    assert "unlinked 'tracks/lib'" in out
+    assert lock.read_text(encoding="utf-8") == before
+    assert not links_path(lock).exists(), "the last link removes the file itself"
+    assert (linked / MANIFEST_NAME).is_file(), "the linked tree is not touched"
+
+
+def test_link_refuses_a_package_that_has_not_installed_its_dependencies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """No auto-install: the linked tree must have run `ffrwd install` itself.
+
+    Two refusals, one per state of the linked tree: no lockfile at all, and a
+    lockfile that does not pin what the manifest asks. Both leave the
+    consumer's files untouched.
+    """
+    linked = _library(
+        tmp_path / "dev", "studio", "0.5", package="pipe", dependencies={"shared/d": "1.0.0"}
+    )
+    project = tmp_path / "work"
+    _project(project, files={"src/own.sql": NORMALIZE})
+    lock = _lock(project, [])
+    before = lock.read_text(encoding="utf-8")
+
+    code, _out, err = _run(project, monkeypatch, capsys, "link", "../dev")
+    assert code == 1
+    assert "depends on 'shared/d@1.0.0' and it has no ffrwd.lock" in err
+    assert "run `ffrwd install`" in err
+
+    _lock(linked, [])
+    code, _out, err = _run(project, monkeypatch, capsys, "link", "../dev")
+    assert code == 1
+    assert "its own ffrwd.lock does not pin it" in err
+    assert "run `ffrwd install`" in err
+
+    assert lock.read_text(encoding="utf-8") == before
+    assert not links_path(lock).exists()
+
+
+def test_link_and_unlink_migrate_old_lockfile_entries_into_the_links_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A link an older ffrwd wrote into the lockfile moves over on the next write."""
+    old = _library(tmp_path / "old", "tracks", "0.5")
+    _library(tmp_path / "new", "broadcast", "0.25")
+    project = tmp_path / "work"
+    _project(project, files={"src/own.sql": NORMALIZE})
+    lock = _lock(project, [_link(old)])
+
+    code, _out, _err = _run(project, monkeypatch, capsys, "link", "../new")
+    assert code == 0
+    held = read_lockfile(lock)
+    assert held.entries == () and held.reproducible is True
+    assert read_linksfile(links_path(lock)) == (
+        LinkEntry(path=str(old)),
+        LinkEntry(path="../new"),
+    )
+
+    # Both still resolve, and unlinking the migrated one leaves the other.
+    code, out, _err = _run(
+        project, monkeypatch, capsys, "compile", QUERY.format(call="tracks.lib.quieter")
+    )
+    assert code == 0 and "volume=volume=0.5" in out
+    assert _run(project, monkeypatch, capsys, "unlink", "tracks/lib")[0] == 0
+    assert read_linksfile(links_path(lock)) == (LinkEntry(path="../new"),)
 
 
 # ---------------------------------------------------------------------------

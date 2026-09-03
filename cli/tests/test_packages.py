@@ -45,6 +45,8 @@ from ffrwd.project import (
     LinkEntry,
     ModelPin,
     RegistryEntry,
+    links_path,
+    read_linksfile,
     read_lockfile,
     read_manifest,
     write_lockfile,
@@ -946,8 +948,36 @@ def test_bare_install_leaves_a_dependency_that_is_linked_to_a_directory(
     assert "broadcast/tracks is linked to a working directory" in err
     assert "installed what consumer/mine 1.0.0 needs in" in out
     held = read_lockfile(project / "ffrwd.lock")
-    assert held.entries == (LinkEntry(path="../dev"),), "the link survived the install"
+    assert held.entries == (), "nothing was fetched over the link"
     assert held.dependencies == {}, "nothing was pinned to a published version"
+    assert read_linksfile(links_path(project / "ffrwd.lock")) == (
+        LinkEntry(path="../dev"),
+    ), "the link survived the install"
+
+    code, out, _err = _run(
+        project, monkeypatch, capsys, "compile", QUERY.format(call="broadcast.tracks.quieter")
+    )
+    assert code == 0 and "volume=volume=0.5" in out
+
+
+def test_bare_install_moves_an_old_lockfile_link_into_the_links_file(
+    store_home: Path,
+    registry: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A link an older ffrwd wrote into the lockfile migrates on the next install."""
+    monkeypatch.setenv(packages.REGISTRY_ENV, str(registry))
+    _package(tmp_path / "dev")
+    project = _package(tmp_path / "work", name="consumer/mine")
+    write_lockfile(project / "ffrwd.lock", [LinkEntry(path="../dev")])
+
+    code, _out, err = _run(project, monkeypatch, capsys, "install")
+    assert code == 0, err
+    held = read_lockfile(project / "ffrwd.lock")
+    assert held.entries == () and held.reproducible is True
+    assert read_linksfile(links_path(project / "ffrwd.lock")) == (LinkEntry(path="../dev"),)
 
     code, out, _err = _run(
         project, monkeypatch, capsys, "compile", QUERY.format(call="broadcast.tracks.quieter")

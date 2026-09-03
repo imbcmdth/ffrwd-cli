@@ -30,22 +30,29 @@ alias to bind.
 
 Beside it, ``ffrwd.lock`` records what the project INSTALLED: one entry per
 package VERSION -- several may share a name, since installing never removes
-one version to make room for another -- either a registry entry pinning a
-version and the sha256 of the archive its content was installed from, or a
-link entry naming a directory to read live. A registry entry also carries its
-own ``dependencies``, package name to the exact version ITS OWN install
-resolved, so a call written inside that package binds to what it depends on,
-not what the project directly does. The lockfile's own top-level
-``dependencies`` is the same shape, one level up: what the project itself
-directly installed. It is machine-owned -- installing writes it, nobody
-hand-edits it.
+one version to make room for another -- each a registry entry pinning a
+version and the sha256 of the archive its content was installed from. A
+registry entry also carries its own ``dependencies``, package name to the
+exact version ITS OWN install resolved, so a call written inside that package
+binds to what it depends on, not what the project directly does. The
+lockfile's own top-level ``dependencies`` is the same shape, one level up:
+what the project itself directly installed. It is machine-owned -- installing
+writes it, nobody hand-edits it.
+
+Third, ``ffrwd.links`` beside the lockfile records the directories this
+MACHINE reads packages out of, live -- machine-local, never committed. A
+linked package resolves its own calls through its own lockfile, and the
+project around it never sees those pins. Older ffrwds wrote link entries into
+the lockfile itself; those are still read, and the next write moves them
+over.
 
 :func:`discover` builds the set a compile resolves in, from three layers, the
 first claim on a name winning:
 
 1. the local manifest's own package -- the project is a package,
-2. the local lockfile -- what this project installed,
-3. the global lockfile -- what a global install put on this machine.
+2. the local links file, then the local lockfile -- what this project reads
+   live, over what it installed,
+3. the global links file, then the global lockfile -- the machine-wide pair.
 
 All of it is OPTIONAL: none of the three found means no packages, and a query
 compiles exactly as it did before this file existed.
@@ -88,6 +95,7 @@ from .wasm import MODEL_SUFFIX
 
 __all__ = [
     "CAPABILITIES",
+    "LINKSFILE_NAME",
     "LOCKFILE_NAME",
     "MANIFEST_NAME",
     "OFFICIAL_NAMESPACE",
@@ -106,12 +114,17 @@ __all__ = [
     "find_lockfile",
     "find_manifest",
     "held_entry",
+    "held_links",
     "is_namespace",
     "is_package_name",
     "is_recipe_name",
     "leaves_package",
+    "link_refusal",
+    "link_target",
+    "links_path",
     "lockfile_text",
     "name_refusal",
+    "read_linksfile",
     "read_lockfile",
     "read_manifest",
     "stored_name",
@@ -119,12 +132,17 @@ __all__ = [
     "under_package",
     "with_entry",
     "without_entry",
+    "write_linksfile",
     "write_lockfile",
     "write_manifest",
 ]
 
 MANIFEST_NAME = "ffrwd.json"
 LOCKFILE_NAME = "ffrwd.lock"
+# Beside the lockfile, machine-local: where `ffrwd link` records the
+# directories this machine reads live. Paths on one machine mean nothing on
+# another, so it is a separate file, not for version control.
+LINKSFILE_NAME = "ffrwd.links"
 
 # A package's own prose, beside its manifest. It ships in the archive and is
 # what the registry shows on the version's page.
@@ -1184,6 +1202,10 @@ class LinkEntry:
     the next compile, which is exactly what a digest cannot survive. The
     package's name is not recorded either -- it comes from the manifest in the
     directory, so renaming the package there needs no re-link.
+
+    Recorded in the links file beside the lockfile. Older ffrwds wrote these
+    into the lockfile itself; such entries are still read, and the next write
+    moves them over.
     """
 
     path: str
@@ -1663,6 +1685,196 @@ def without_entry(entries: Sequence[LockEntry], entry: LockEntry) -> tuple[LockE
     return tuple(held for held in entries if held != entry)
 
 
+# -- the links file --------------------------------------------------------
+
+LINKS_FORMAT_VERSION = 1
+
+# The sentence the file carries about itself, under "machine_local".
+_LINKS_PURPOSE = (
+    "the directories this machine reads packages out of, live; not for version control"
+)
+
+_LINKS_HINT = (
+    f"`ffrwd link <directory>` writes {LINKSFILE_NAME}; `ffrwd unlink <name>` removes one"
+)
+
+_LINKS_KNOWN = frozenset({"format_version", "machine_local", "links"})
+
+_INSTALL_LINKEE_HINT = (
+    "a linked package resolves through its own lockfile; run `ffrwd install` "
+    "in that directory first"
+)
+
+
+def links_path(lock: Path) -> Path:
+    """The links file that accompanies the lockfile at `lock`, present or not."""
+    return lock.with_name(LINKSFILE_NAME)
+
+
+def read_linksfile(path: Path) -> tuple[LinkEntry, ...]:
+    """Parse the links file at `path`; no file is simply no links.
+
+    Raises ``FfrwdError`` -- and nothing else -- for a file that is there and
+    wrong: unreadable, not JSON, another format version, a record that names
+    no directory.
+    """
+    try:
+        if not path.is_file():
+            return ()
+        text = path.read_text(encoding="utf-8")
+    except OSError as err:
+        raise _reject(path, f"could not be read: {err.strerror or err}") from err
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as err:
+        raise _reject(
+            path, f"is not valid JSON: {err.msg}", line=err.lineno, col=err.colno, hint=_LINKS_HINT
+        ) from err
+    except (ValueError, RecursionError) as err:  # backstop: never a traceback
+        raise _reject(path, "is not valid JSON", line=1, col=1, hint=_LINKS_HINT) from err
+    if not isinstance(data, dict):
+        raise _reject(path, "is not a JSON object", line=1, col=1, hint=_LINKS_HINT)
+    for key in sorted(data):
+        if key in _LINKS_KNOWN:
+            continue
+        hint = (
+            _did_you_mean(key, sorted(_LINKS_KNOWN))
+            or f"known keys: {', '.join(sorted(_LINKS_KNOWN))}"
+        )
+        raise _reject(path, f"unknown key {key!r}", line=_key_line(text, key), hint=hint)
+    if data.get("format_version") != LINKS_FORMAT_VERSION:
+        raise _reject(
+            path,
+            f"was written in links format {data.get('format_version')!r}, and this "
+            f"ffrwd reads {LINKS_FORMAT_VERSION}",
+            line=_key_line(text, "format_version"),
+            hint="link the directories again to rewrite it",
+        )
+    note = data.get("machine_local")
+    if note is not None and not isinstance(note, str):
+        raise _reject(
+            path,
+            '"machine_local" must be a string',
+            line=_key_line(text, "machine_local"),
+            hint=_LINKS_HINT,
+        )
+    written = data.get("links", [])
+    if not isinstance(written, list):
+        raise _reject(
+            path, '"links" must be a list', line=_key_line(text, "links"), hint=_LINKS_HINT
+        )
+    links: list[LinkEntry] = []
+    for index, raw in enumerate(written):
+        named = raw.get("path") if isinstance(raw, dict) else None
+        if not isinstance(named, str) or not named:
+            raise _reject(
+                path,
+                f"link {index + 1} does not name a directory",
+                line=_key_line(text, "links"),
+                hint='each link is {"path": "<directory>"}',
+            )
+        links.append(LinkEntry(path=named))
+    return tuple(links)
+
+
+def write_linksfile(path: Path, links: Sequence[LinkEntry]) -> None:
+    """Write the links file naming `links`, in the order given; none removes the file.
+
+    The sentence under ``machine_local`` is for whoever finds the file: it
+    says why this one is not committed the way the lockfile is.
+    """
+    if not links:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as err:
+            raise _unwritable(path, err) from err
+        return
+    payload: dict[str, object] = {
+        "format_version": LINKS_FORMAT_VERSION,
+        "machine_local": _LINKS_PURPOSE,
+        "links": [{"path": entry.path} for entry in links],
+    }
+    _write_atomically(path, _rendered(payload))
+
+
+def link_target(entry: LinkEntry, source: Path) -> Path | None:
+    """The directory `entry` names, resolved against the file recording it, or None."""
+    try:
+        return (source.parent / Path(entry.path)).resolve()
+    except (OSError, ValueError):
+        return None
+
+
+def held_links(lock: Path) -> tuple[tuple[LinkEntry, Path], ...]:
+    """Every link the project at `lock` holds, each with the file recording it.
+
+    The links file first, then any link entry still sitting in the lockfile
+    itself -- older ffrwds recorded them there, and they keep working until a
+    write moves them over. Two records naming one directory are one link.
+    """
+    pairs: list[tuple[LinkEntry, Path]] = [
+        (entry, links_path(lock)) for entry in read_linksfile(links_path(lock))
+    ]
+    try:
+        present = lock.is_file()
+    except (OSError, ValueError):
+        present = False
+    if present:
+        pairs.extend(
+            (entry, lock)
+            for entry in read_lockfile(lock).entries
+            if isinstance(entry, LinkEntry)
+        )
+    seen: set[Path | str] = set()
+    kept: list[tuple[LinkEntry, Path]] = []
+    for entry, source in pairs:
+        root = link_target(entry, source)
+        key: Path | str = root if root is not None else entry.path
+        if key in seen:
+            continue
+        seen.add(key)
+        kept.append((entry, source))
+    return tuple(kept)
+
+
+def link_refusal(package: Package, root: Path) -> tuple[str, str] | None:
+    """Why the package at `root` cannot be linked yet -- message and hint -- or None.
+
+    A linked package resolves its calls through its OWN lockfile: every
+    dependency its manifest pins must be pinned there at the written version,
+    or itself linked in that directory. A package with no dependencies needs
+    neither. Raised by the caller: at link time, or at the first resolution
+    after the linked tree drifted.
+    """
+    if not package.dependencies:
+        return None
+    lock = root / LOCKFILE_NAME
+    try:
+        present = lock.is_file()
+    except (OSError, ValueError):
+        present = False
+    entries = read_lockfile(lock).entries if present else ()
+    linked = {stored_name(entry, source) for entry, source in held_links(lock)}
+    for name, version in package.dependencies.items():
+        if name in linked:
+            continue
+        if any(
+            isinstance(entry, RegistryEntry) and entry.name == name and entry.version == version
+            for entry in entries
+        ):
+            continue
+        where = (
+            f"its own {LOCKFILE_NAME} does not pin it"
+            if present
+            else f"it has no {LOCKFILE_NAME}"
+        )
+        return (
+            f"package '{package.name}' at {root} depends on '{name}@{version}' and {where}",
+            _INSTALL_LINKEE_HINT,
+        )
+    return None
+
+
 # -- discovery -------------------------------------------------------------
 
 
@@ -1731,8 +1943,12 @@ def _linked_root(entry: LinkEntry, lock_path: Path) -> Path:
         ) from err
 
 
-def _manifest_of(root: Path, named: str, lock: Lockfile, missing: str) -> Path:
-    """The manifest a locked package is read through, or a rejection naming `missing`."""
+def _manifest_of(root: Path, named: str, at: Path, missing: str) -> Path:
+    """The manifest a recorded package is read through, or a rejection naming `missing`.
+
+    `at` is the file whose record sent the reader here -- a lockfile, or the
+    links file -- so the rejection lands on something the reader has open.
+    """
     manifest = root / MANIFEST_NAME
     try:
         present = manifest.is_file()
@@ -1740,7 +1956,7 @@ def _manifest_of(root: Path, named: str, lock: Lockfile, missing: str) -> Path:
         present = False
     if not present:
         raise _reject(
-            lock.path,
+            at,
             f"{named}: {root} holds no {MANIFEST_NAME}",
             hint=missing,
         )
@@ -1769,7 +1985,7 @@ def _linked_package(entry: LinkEntry, lock: Lockfile, layer: Layer) -> Package:
     """
     root = _linked_root(entry, lock.path)
     manifest = _manifest_of(
-        root, f"link {entry.path!r}", lock, "link the directory again, or restore its manifest"
+        root, f"link {entry.path!r}", lock.path, "link the directory again, or restore its manifest"
     )
     package = read_manifest(manifest)
     return replace(package, layer=layer, linked=True)
@@ -1786,7 +2002,7 @@ def _stored_package(entry: RegistryEntry, lock: Lockfile, layer: Layer) -> Packa
     manifest = _manifest_of(
         root,
         f"package '{entry.name}'",
-        lock,
+        lock.path,
         "the stored content is not a package; install it again",
     )
     package = read_manifest(manifest)
@@ -1831,6 +2047,93 @@ def _add_layer(
         packages[package.name] = package
 
 
+def _add_links(
+    packages: dict[str, Package],
+    versions: dict[str, dict[str, Package]],
+    wants: dict[str, dict[str, str]],
+    links: Sequence[tuple[LinkEntry, Path]],
+    layer: Layer,
+) -> dict[str, str]:
+    """Add the linked directories under the names no earlier claim took.
+
+    Returns what was claimed -- linked package name to its manifest's version
+    -- for the caller to bind the project's own calls to: a link answers its
+    name over anything installed under it.
+    """
+    claimed: dict[str, str] = {}
+    chain: list[tuple[Path, str]] = []
+    for entry, source in links:
+        package = _add_link(packages, versions, wants, entry, source, layer, chain, claims=True)
+        if packages.get(package.name) is package:
+            claimed[package.name] = package.version
+    return claimed
+
+
+def _add_link(
+    packages: dict[str, Package],
+    versions: dict[str, dict[str, Package]],
+    wants: dict[str, dict[str, str]],
+    entry: LinkEntry,
+    source: Path,
+    layer: Layer,
+    chain: list[tuple[Path, str]],
+    *,
+    claims: bool,
+) -> Package:
+    """One linked directory: the live package, resolving through its own lockfile.
+
+    The linked tree's lockfile is where ITS calls bind: its pins load into
+    `versions` and `wants` for the calls it owns, and nowhere else -- the
+    project around the link never sees them. `claims` is True for a link this
+    layer's own project made, which answers the package's name everywhere; a
+    link found inside another linked package claims no name. `chain` is the
+    directories the walk is inside, so a link leading back into one is refused
+    as the cycle it is.
+    """
+    root = _linked_root(entry, source)
+    manifest = _manifest_of(
+        root, f"link {entry.path!r}", source, "link the directory again, or restore its manifest"
+    )
+    package = replace(read_manifest(manifest), layer=layer, linked=True)
+    for at, (walked, _named) in enumerate(chain):
+        if walked == root:
+            loop = " -> ".join([*(name for _, name in chain[at:]), package.name])
+            raise _reject(
+                source,
+                f"link cycle: {loop}",
+                hint="one of these packages has to stop linking another in the loop",
+            )
+    refused = link_refusal(package, root)
+    if refused is not None:
+        raise _reject(source, refused[0], hint=refused[1])
+    versions.setdefault(package.name, {}).setdefault(package.version, package)
+    if claims:
+        packages.setdefault(package.name, package)
+
+    own_path = root / LOCKFILE_NAME
+    try:
+        own = read_lockfile(own_path) if own_path.is_file() else None
+    except (OSError, ValueError):
+        own = None
+    binding: dict[str, str] = dict(own.dependencies) if own is not None else {}
+    chain.append((root, package.name))
+    for nested_entry, nested_source in held_links(own_path):
+        nested = _add_link(
+            packages, versions, wants, nested_entry, nested_source, layer, chain, claims=False
+        )
+        binding[nested.name] = nested.version
+    chain.pop()
+    wants.setdefault(package.name, binding)
+    if own is not None:
+        for held in own.entries:
+            if isinstance(held, LinkEntry):
+                continue
+            stored = _stored_package(held, own, layer)
+            versions.setdefault(stored.name, {}).setdefault(stored.version, stored)
+            wants.setdefault(stored.name, dict(held.dependencies))
+    return package
+
+
 def _global_lockfile(local: Path | None) -> Lockfile | None:
     """The machine-wide lockfile, or None when nothing was installed globally."""
     path = store.global_lock_path()
@@ -1850,14 +2153,17 @@ def discover(start: Path | str | None = None) -> PackageSet | None:
     line.
 
     Three layers, the first claim on a name winning: the project's own
-    manifest, then its lockfile, then the machine-wide one. The layering lives
-    here and nowhere else -- what the compiler gets is one name to one
-    canonical package per layer, plus every version install ever pinned, with
-    no idea which layer answered.
+    manifest, then its lockfile, then the machine-wide one -- each lockfile
+    preceded by the links file beside it, so a linked directory answers its
+    name over anything installed under it. The layering lives here and
+    nowhere else -- what the compiler gets is one name to one canonical
+    package per layer, plus every version install ever pinned, with no idea
+    which layer answered.
 
-    Raises ``FfrwdError`` for a manifest or lockfile that is found but
-    malformed, or for a locked package the store or the linked directory
-    cannot produce.
+    Raises ``FfrwdError`` for a manifest, lockfile or links file that is
+    found but malformed, for a recorded package the store or the linked
+    directory cannot produce, or for a linked package whose own lockfile does
+    not cover its manifest's dependencies.
     """
     base = Path(start) if start is not None else Path.cwd()
     manifest = find_manifest(base)
@@ -1871,12 +2177,25 @@ def discover(start: Path | str | None = None) -> PackageSet | None:
         packages[project.name] = project
         versions.setdefault(project.name, {})[project.version] = project
 
+    # Links before pins, layer by layer: a linked directory answers its name
+    # over anything installed under it.
+    claimed: dict[str, str] = {}
     local_lock = read_lockfile(local) if local is not None else None
+    if local is not None:
+        pairs = [(entry, links_path(local)) for entry in read_linksfile(links_path(local))]
+        claimed.update(_add_links(packages, versions, wants, pairs, "local"))
     _add_layer(packages, versions, wants, local_lock, "local")
+    global_lock = store.global_lock_path()
+    if local is None or global_lock != local:
+        pairs = [
+            (entry, links_path(global_lock)) for entry in read_linksfile(links_path(global_lock))
+        ]
+        claimed.update(_add_links(packages, versions, wants, pairs, "global"))
     _add_layer(packages, versions, wants, _global_lockfile(local), "global")
 
     if project is not None:
         wants[project.name] = dict(local_lock.dependencies) if local_lock is not None else {}
+        wants[project.name].update(claimed)
 
     in_project = manifest is not None or local is not None
     if not in_project and not packages:

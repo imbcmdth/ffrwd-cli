@@ -72,6 +72,7 @@ from ffrwd.project import (
     RegistryEntry,
     entry_root,
     find_lockfile,
+    held_links,
     lockfile_text,
     read_lockfile,
     read_manifest,
@@ -459,10 +460,11 @@ def _lock(packages: PackageSet | None) -> tuple[str | None, tuple[_Archive, ...]
     -- the project lockfile's entries, then every global entry whose name the
     project does not pin -- in the same format the runner reads.
 
-    Every link in that document is then packed and replaced by a pin against
-    its archive's digest, transitively: a linked package's own lockfile may
-    link others, and those travel too. The document on the wire therefore
-    holds registry pins only. Nothing is written to either lockfile on disk.
+    Every link -- from the links file beside each lockfile, or left in an
+    older lockfile itself -- is then packed and replaced by a pin against its
+    archive's digest, transitively: a linked package may link others, and
+    those travel too. The document on the wire therefore holds registry pins
+    only. Nothing is written to any of the files on disk.
 
     With nothing installed globally and nothing linked, the project's file
     travels verbatim, as it always did; with no lockfile anywhere there is
@@ -472,22 +474,32 @@ def _lock(packages: PackageSet | None) -> tuple[str | None, tuple[_Archive, ...]
     found = find_lockfile(start)
     machine_wide = _global_lock(found)
     local = read_lockfile(found) if found is not None else None
-    if local is None and machine_wide is None:
+    global_lock = store.global_lock_path()
+    global_links = (
+        list(held_links(global_lock)) if found is None or global_lock != found else []
+    )
+    if local is None and machine_wide is None and not global_links:
         return None, ()
 
-    # Each entry with the lockfile it came from: a link's path is written
-    # relative to the file holding it, and the merge below loses that.
+    # Each entry with the file it came from: a link's path is written
+    # relative to the file holding it, and the merge below loses that. Links
+    # come through `held_links` -- the links file, plus any entry an older
+    # ffrwd left in the lockfile itself.
     sourced: list[tuple[LockEntry, Path]] = []
     if local is not None:
-        sourced = [(entry, local.path) for entry in local.entries]
+        sourced = [
+            (entry, local.path) for entry in local.entries if not isinstance(entry, LinkEntry)
+        ]
+        sourced += list(held_links(local.path))
     pinned = {
         entry.name for entry, _ in sourced if isinstance(entry, RegistryEntry)
     }
     if machine_wide is not None:
         for entry in machine_wide.entries:
-            if isinstance(entry, RegistryEntry) and entry.name in pinned:
+            if isinstance(entry, LinkEntry) or entry.name in pinned:
                 continue
             sourced.append((entry, machine_wide.path))
+    sourced += global_links
 
     linked = any(isinstance(entry, LinkEntry) for entry, _ in sourced)
     if machine_wide is None and not linked and found is not None:
@@ -504,8 +516,8 @@ def _lock(packages: PackageSet | None) -> tuple[str | None, tuple[_Archive, ...]
     archives: list[_Archive] = []
     entries = _resolved(sourced, [], packed, archives)
     held = local if local is not None else machine_wide
-    assert held is not None  # both None returned above
-    return lockfile_text(entries, dependencies=held.dependencies), tuple(archives)
+    dependencies = held.dependencies if held is not None else {}
+    return lockfile_text(entries, dependencies=dependencies), tuple(archives)
 
 
 def _resolved(
@@ -577,9 +589,15 @@ def _pack_link(
             )
     chain.append((root, package.name))
     nested = root / LOCKFILE_NAME
+    nested_sourced: list[tuple[LockEntry, Path]] = []
     if nested.is_file():
         held = read_lockfile(nested)
-        _resolved([(one, nested) for one in held.entries], chain, packed, archives)
+        nested_sourced = [
+            (one, nested) for one in held.entries if not isinstance(one, LinkEntry)
+        ]
+    nested_sourced += list(held_links(nested))
+    if nested_sourced:
+        _resolved(nested_sourced, chain, packed, archives)
     chain.pop()
 
     content = _pack(package.name, root)

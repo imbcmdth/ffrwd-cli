@@ -404,14 +404,12 @@ version to make room for another.
 
 ```json
 { "format_version": 3,
-  "reproducible": false,
-  "not_reproducible_because": "a package is linked to a working directory, so its files are not pinned here",
+  "reproducible": true,
   "dependencies": { "broadcast/tracks": "1.2.0" },
   "packages": [
     { "kind": "registry", "name": "broadcast/tracks", "version": "1.2.0",
       "sha256": "<64 hex>", "store": "v1/ab/<64 hex>",
-      "dependencies": { "imbcmdth/audio": "2.1.0" } },
-    { "kind": "link", "path": "../my-lib" }
+      "dependencies": { "imbcmdth/audio": "2.1.0" } }
   ] }
 ```
 
@@ -433,14 +431,9 @@ a call written inside that package resolve at the right version even
 when another installed package depends on a different one of the same
 name.
 
-A **link** entry names a directory and nothing else - the package's
-name comes from the manifest there, so renaming the package needs no
-re-link. Its `ffrwd.json` is read like any other manifest, so an
-edit lands in the next compile - which is the point, and which no
-digest could survive. A lockfile holding a link is therefore not
-reproducible, and says so in its own text. Two entries pinning one
-package at one version are rejected; two different versions are not -
-that is the whole point of carrying several.
+Two entries pinning one package at one version are rejected; two
+different versions are not - that is the whole point of carrying
+several.
 
 The lockfile's own top-level `dependencies` is the same shape, one
 level up: what THIS project directly installed, package name to the
@@ -448,15 +441,33 @@ exact version - what a call written in the project's own query
 resolves against. It is separate from the manifest's `dependencies`,
 which records the range as written and is never solved.
 
+**Links** live in `ffrwd.links` beside the lockfile, machine-local and
+not for version control:
+
+```json
+{ "format_version": 1,
+  "machine_local": "the directories this machine reads packages out of, live; not for version control",
+  "links": [ { "path": "../my-lib" } ] }
+```
+
+A link names a directory and nothing else - the package's name comes
+from the manifest there, so renaming the package needs no re-link. Its
+`ffrwd.json` is read like any other manifest, so an edit lands in the
+next compile - which is the point, and which no digest could survive.
+A lockfile written by an older ffrwd may still hold `"kind": "link"`
+entries; they are read, and the next `link`, `unlink` or `install`
+moves them into `ffrwd.links` and out of the lockfile.
+
 A package resolves through three layers, the first claim on its name
-winning: the project's own manifest, then its lockfile, then the
-machine-wide lockfile a global install writes. Two of those are worth
-saying out loud, so a compile reports them without refusing: resolving
-inside a project but landing on the machine-wide layer, and compiling
-against a link. Each is reported once per package - as a `warning:`
-line on stderr from the CLI, in the `warnings` array of an MCP tool
-result, and through `compile_sql`'s optional `on_warning` callback for
-a library caller.
+winning: the project's own manifest, then its links file and lockfile,
+then the machine-wide pair a global install and `link -g` write. A
+link claims its name over anything installed under it. Two of those
+layers are worth saying out loud, so a compile reports them without
+refusing: resolving inside a project but landing on the machine-wide
+layer, and compiling against a link. Each is reported once per package
+- as a `warning:` line on stderr from the CLI, in the `warnings` array
+of an MCP tool result, and through `compile_sql`'s optional
+`on_warning` callback for a library caller.
 
 A third travels the same channel and is not about packages at all. A
 stream array a file has no tracks for - `f.subtitle` where the file
@@ -573,10 +584,10 @@ name what to fetch.
 `ffrwd path broadcast/tracks` prints the directory an installed
 package is read out of: the store directory for an installed one, the
 linked directory for a link. It resolves through the lockfile
-`install` writes, or the machine-wide one with `-g`, and prints one
-line - the path and no decoration, because a build script reads it. A
-package that lockfile does not pin is a rejection naming
-`ffrwd install`.
+`install` writes and the links file beside it, or the machine-wide
+pair with `-g`, and prints one line - the path and no decoration,
+because a build script reads it. A package neither file records is a
+rejection naming `ffrwd install`.
 
 `ffrwd/wasm` is the package that makes it worth having. It ships no
 exports and no recipes, only `wit/av.wit`, and its VERSION IS the
@@ -594,20 +605,32 @@ Modules built against earlier worlds load and run unchanged.
 
 ### Linking
 
-`ffrwd link ../my-lib` writes a link entry naming that directory; the
-package's name comes from its manifest. `ffrwd unlink <name>` (the
-package's name, or the directory for a link whose manifest is gone)
-removes it and rewrites the file. Linking a package something else
-already pins replaces that entry and says what it replaced.
+`ffrwd link ../my-lib` records that directory in `ffrwd.links` beside
+the lockfile; the lockfile itself is untouched, and the package's name
+comes from its manifest. The linked package resolves its own calls
+through its OWN lockfile against the shared store, so `ffrwd install`
+run in that directory comes first - a linked tree whose lockfile does
+not cover its manifest's dependencies is refused, at link time or at
+the first compile after it drifts. The consuming project's own queries
+never see the linked package's dependencies. Linking a package
+something else already pins leaves the pin in place; the link answers
+while it stands.
 
-`-g` writes the machine-wide lockfile instead of the project's. Without
-it, no lockfile at or above the working directory is a usage error
-(exit 2) naming both ways forward - `install -g` / `link -g`, or `init`
-first. No command ever creates a lockfile as a side effect.
+`ffrwd unlink <name>` (the package's name, or the directory for a link
+whose manifest is gone) removes the record and nothing else. A link
+entry found in a lockfile an older ffrwd wrote still resolves; the
+next `link`, `unlink` or `install` moves it into `ffrwd.links`.
 
-Every write to either file replaces it in one step and pins LF endings,
-and the lockfile is written in insertion order with no timestamp, so
-writing the same set of packages twice produces the same bytes.
+`-g` writes the machine-wide links file, beside the machine-wide
+lockfile under the cache directory. Without it, no lockfile at or
+above the working directory is a usage error (exit 2) naming both ways
+forward - `install -g` / `link -g`, or `init` first. No command ever
+creates a lockfile as a side effect.
+
+Every write to these files replaces it in one step and pins LF endings,
+and each is written in insertion order with no timestamp, so writing
+the same set of packages twice produces the same bytes. Writing the
+last link away removes `ffrwd.links` itself.
 
 ### Publishing
 
@@ -1147,8 +1170,11 @@ Every one of these is a typed rejection, never a silent reinterpretation:
   required keys, or is written in another format version; an entry of
   no known kind, missing a key, or holding an unknown one; two entries
   pinning one package at one version; a lockfile claiming to be
-  reproducible while linking a directory; a linked directory with no
-  manifest; stored content that is missing or was written by another
+  reproducible while linking a directory; a links file that is not one
+  JSON object of its known keys, or a link record naming no directory;
+  a linked directory with no manifest; a linked package whose own
+  lockfile does not cover its manifest's dependencies (the hint names
+  `ffrwd install` run there); stored content that is missing or was written by another
   store layout; a downloaded archive that does not hash to what the
   entry pins, or that holds a member outside the package root, a link,
   a device, or more members or bytes than the caps allow; an entry the
