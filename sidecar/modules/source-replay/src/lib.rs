@@ -177,9 +177,9 @@ mod tests {
     fn every_packets_bytes_start_with_its_own_annex_b_start_code() {
         // libx264 writes a 3-byte start code (00 00 01) or a 4-byte one (00
         // 00 00 01) depending on the NAL - both are legal Annex-B.
-        for index in 0..PACKET_LENS.len() {
+        for (index, expected_len) in PACKET_LENS.iter().enumerate() {
             let bytes = packet_bytes(index);
-            assert_eq!(bytes.len(), PACKET_LENS[index]);
+            assert_eq!(bytes.len(), *expected_len);
             let starts_with_code = bytes.starts_with(&[0x00, 0x00, 0x01])
                 || bytes.starts_with(&[0x00, 0x00, 0x00, 0x01]);
             assert!(
