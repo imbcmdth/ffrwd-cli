@@ -32,6 +32,7 @@ members = [
     "packet-tally",
     "source-replay",
     "source-replay-0130",
+    "source-files",
     "fauxlate",
     "post-rows",
     "broken-audio",

@@ -3027,3 +3027,58 @@ ffmpeg -i tests/fixtures/av.mp4 -map 0:v:0 -c:0 rawvideo -pix_fmt:0 rgba -f nut 
 `-rows-from 0` is the edge: it names the module whose rows arrive here by its position in the `-m` table, and nothing about it is a pad, so the filtergraph never mentions it. `fauxlate` is a stand-in for a real translator - every word gains `-a` and `-o` in turn, so `Cue one.` comes back `Cue-a one-o.` - and the result is the producer's column read one module later: selected here it is a subtitle track, and at a `.ndjson` destination it is the rows themselves.
 
 One module, two forms: `fauxlate.wasm` also exports the value function `translate`, declared `RETURNS text` and run once per call at compile time, which is how the same word rule reaches a caption FILE's cues - the shape [recipe 112](#112-a-function-over-a-caption-files-cues) writes with `upper`. Rows a module produces at run time are this recipe's; rows the compiler already holds are that one's, and a rows function over them is refused by name.
+
+## 114. A source whose rows are files ffmpeg opens itself
+
+A `RETURNS source` need not name a packet-source module: pointed at a values-world module instead - `list-functions`/`invoke`, the shape a value function's own module takes - it is invoked once at compile time rather than probed like a manifest. Each row it returns names an input ffmpeg opens with `-i`, and the alias reads as rendition rows, the module's own columns (`sequence` here) sitting beside `video`/`audio`. `concat(VARIADIC array_agg(...))` in row order is the stitched file:
+
+```pgsql
+CREATE FUNCTION files(paths text) RETURNS source
+  AS '../sidecar/modules/target/wasm32-wasip2/release/source_files.wasm', 'files'
+  LANGUAGE wasm;
+
+COPY (
+  SELECT concat(VARIADIC array_agg(s.video[1])), concat(VARIADIC array_agg(s.audio[1]))
+  FROM files('tests/fixtures/av.mp4,tests/fixtures/av2.mp4') s
+) TO :'dest'
+```
+
+```
+<pinned when the binding lands>
+```
+
+## 115. Stitch the rows you keep, then re-encode them to a ladder
+
+`WHERE` over the module's own column keeps rows the same way it keeps rendition rows from a manifest; a CTE holds the concat, two more CTEs read it apart, and a series cross join makes the rungs. `format 'hls'` accepts the result the same as any other row source. `testsrc.mp4` has no audio; it is row 2 and the `WHERE` drops it, so both kept rows carry audio:
+
+```pgsql
+CREATE FUNCTION files(paths text) RETURNS source
+  AS '../sidecar/modules/target/wasm32-wasip2/release/source_files.wasm', 'files'
+  LANGUAGE wasm;
+
+COPY (
+  WITH pod AS (
+    SELECT concat(VARIADIC array_agg(scale(s.video[1], 320, -2))) AS v,
+           concat(VARIADIC array_agg(s.audio[1])) AS a
+    FROM files('tests/fixtures/av.mp4,tests/fixtures/testsrc.mp4,tests/fixtures/av2.mp4') s
+    WHERE s.sequence != 2
+  ),
+  vid AS (
+    SELECT scale(pod.v, ARRAY[320, 160][i.i], -2) AS v, i.i AS rung
+    FROM pod, generate_series(1, 2) i
+  ),
+  aud AS (
+    SELECT pod.a AS t, 3 AS rung
+    FROM pod
+  )
+  SELECT vid.v, aud.t
+  FROM vid FULL JOIN aud ON vid.rung = aud.rung
+) TO 'out/master.m3u8'
+  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod',
+        video_codec 'libx264', video_bitrate ARRAY['800k', '300k'][vid.rung],
+        audio_codec 'aac')
+```
+
+```
+<pinned when the binding lands>
+```

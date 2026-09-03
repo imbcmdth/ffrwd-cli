@@ -1658,6 +1658,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
 
 [[package]]
+name = "source-files"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "wit-bindgen 0.57.1",
+]
+
+[[package]]
 name = "source-replay"
 version = "0.1.0"
 dependencies = [

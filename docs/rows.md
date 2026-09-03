@@ -48,6 +48,12 @@ BY` and `LIMIT` over them. A source that reports itself unbounded is
 a live input. Its arguments are values only - a source reads no
 streams.
 
+A source may also be a values-world module: invoked once at compile
+time rather than probed, each row it returns names an input ffmpeg
+opens with `-i` itself, and the alias reads as rendition rows with
+the module's own columns beside them ([recipe
+114](examples.md#114-a-source-whose-rows-are-files-ffmpeg-opens-itself)).
+
 ## Track rows - `unnest(f.audio) t`
 
 One row per track. The argument is an array column of an input declared earlier in the same FROM list; alias mandatory. All seven array columns unnest - the four stream arrays here, and `chapters`, `cues` and `attachments` below. The schema varies by stream type:
