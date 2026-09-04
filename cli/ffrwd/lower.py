@@ -13382,7 +13382,20 @@ class _Lowerer:
         Against ``ffrwd.sink.CSV_OPTIONS``, a separate table from
         ``SINK_OPTIONS``, so a media option like ``video_codec`` here is
         UNKNOWN rather than silently accepted.
+
+        A sink call has no table to print: the module is the destination and
+        writes nothing back, so it is refused here rather than lowered as a
+        csv COPY whose cells the sink already consumed.
         """
+        if raw.module_sink:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"{raw.module_sink}() is a sink and prints no table",
+                raw.path_node,
+                fallback=raw.query,
+                hint="drop the TO to print the relation, or run it as a media "
+                "COPY with `ffrwd compile`",
+            )
         result = self._lower_table_query(list(raw.branches), raw.query)
         header = False
         for option in raw.options:

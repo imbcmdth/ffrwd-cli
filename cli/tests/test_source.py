@@ -496,3 +496,20 @@ def test_bounded_says_whether_a_url_sources_inputs_read_live(bounded: bool) -> N
     )
     assert sorted(probes) == ["ffrwd.s#1", "s"]
     assert [is_live_probe(result) for result in probes.values()] == [not bounded] * 2
+
+
+def test_a_sink_destination_prints_no_table() -> None:
+    """A COPY into a sink call has nothing to print: the table path refuses
+    it by name instead of handing the sink streams it never renders."""
+    sql = (
+        "CREATE FUNCTION tally(v video_stream[]) RETURNS sink "
+        "AS 'modules/tally.wasm', 'tally' LANGUAGE wasm;\n"
+        "COPY (SELECT s.video[1] FROM input('a.mp4') s) TO tally()"
+    )
+    described = Described(
+        world=WORLDS[-1], name="tally", pixel_formats=("rgb24",), video_codecs=()
+    )
+    with pytest.raises(FfrwdError) as caught:
+        compile_table_sql(sql, describe=lambda path: described)
+    assert caught.value.code is ErrorCode.UNSUPPORTED_SQL
+    assert "tally() is a sink and prints no table" in caught.value.message
