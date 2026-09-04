@@ -268,6 +268,10 @@ _ANNOTATIONS_FLAG = "-annotations"
 # command line's ``-m`` flags, of the module producing them.
 _ROWS_FROM_FLAG = "-rows-from"
 
+# How a rows DOCUMENT is told whose rows it holds, counted the same way. One
+# document on the line needs no such flag: it is the only one there is.
+_ROWS_FLAG = "-rows"
+
 # How a model file is bound to the name the module loads it by, and what the
 # file is called: the export's own name, beside the module.
 _NN_FLAG = "-nn"
@@ -1091,6 +1095,7 @@ def _argv(
     binary: str,
     process: SidecarProcess,
     reads: Sequence[str] = (),
+    writes: Sequence[str] = (),
     runtime: Sequence[str] = (),
     jobs: int | None = None,
 ) -> list[str]:
@@ -1113,6 +1118,10 @@ def _argv(
     ``-m`` this command line writes, of the module whose rows it reads. The
     stream modules are written first, so a rows module reading another rows
     module's output names it the same way.
+
+    A rows DOCUMENT is written per rows-bearing node the region holds, and
+    where there are several each says whose rows it holds with ``-rows
+    <index>``, counting the same ``-m`` flags (:func:`rows_args`).
 
     ``-annotations`` says which sides carry the rows a module read off its
     frames -- ``in`` beside the input it reads them from, ``out`` beside the
@@ -1137,6 +1146,10 @@ def _argv(
     SINK pad carrying rendition metadata (:attr:`SidecarProcess.pads`) gets a
     ``-pad '<json>'`` right after its own ``-i``, ``{"row": ..., "rendition":
     {...}}`` with absent attributes omitted -- a pad with none gets no flag.
+
+    `writes` is the mirror on the other side: one path per rows document the
+    process writes, in document order, since a process writing several of
+    them has only one stdout to put the first on.
 
     A packet SOURCE takes no ``-i`` at all -- `reads` are instead the paths it
     WRITES, one ``-f nut <pipe>`` per track in catalog order, the mirror of a
@@ -1172,13 +1185,13 @@ def _argv(
     for grant in process.grants:
         argv += [_GRANT_FLAGS[grant.effect], grant.module]
     if process.network:
-        argv += _network_args(process)
+        argv += _network_args(process, writes)
     else:
         argv += ["-m", process.module]
         if process.args:
             argv += ["-params", json.dumps(process.args, sort_keys=True)]
         argv += _rows_module_args(process)
-        argv += rows_args(process) or _stream_output(process, reads)
+        argv += rows_args(process, writes) or _stream_output(process, reads)
     if process.writes_rows:
         argv += [_ANNOTATIONS_FLAG, ANNOTATIONS_OUT]
     return argv
@@ -1220,7 +1233,7 @@ def _stream_output(process: SidecarProcess, writes: Sequence[str] = ()) -> list[
     return ["-f", EDGE_FORMAT, STDOUT]
 
 
-def rows_args(process: SidecarProcess) -> list[str]:
+def rows_args(process: SidecarProcess, writes: Sequence[str] = ()) -> list[str]:
     """The argv tail that writes this region's rows, or ``[]`` for one with none.
 
     A region whose rows the query selects writes them as a DOCUMENT rather
@@ -1228,34 +1241,65 @@ def rows_args(process: SidecarProcess) -> list[str]:
     gathers the rows and writes a finished subtitle file. Its stream output
     is what the rows were read off, and nothing downstream maps it.
 
-    ``-f <format> <path>``, the spelling an ``-f nut`` output already takes,
-    with the network form's ``-map`` supplied by the caller. The document
-    goes to the region's own stdout when an ffmpeg process reads it as a
-    track, and to the named file when the query wrote the rows themselves.
+    ``-f <format> <path>`` per document, the spelling an ``-f nut`` output
+    already takes, with the network form's ``-map`` supplied by the caller.
+    A document goes to the named file when the query wrote the rows
+    themselves, and otherwise to what `writes` names for it -- the region's
+    own stdout for the one document a process ordinarily writes, a named
+    pipe apiece where it writes several. A printed command with none given
+    numbers them the way a single output's own ``pipe:1`` already does.
+
+    Several documents each carry ``-rows <index>``, saying which module's
+    rows this one holds by its position among the line's ``-m`` flags: a
+    module's own rows, or a rows module's output. ONE document needs no
+    such flag -- it is the only rows the line writes -- which is the
+    spelling a region with one has always taken.
     """
-    rows = process.rows
-    if rows is None:
-        return []
-    return ["-f", rows.container, rows.path or STDOUT]
+    return [token for tail in _rows_tails(process, writes) for token in tail]
 
 
-def _network_args(process: SidecarProcess) -> list[str]:
-    """The ``-m`` table, the network string and the maps of a module region."""
+def _rows_tails(process: SidecarProcess, writes: Sequence[str] = ()) -> list[list[str]]:
+    """:func:`rows_args`, one tail per document rather than one flat list."""
+    tails: list[list[str]] = []
+    several = len(process.rows) > 1
+    for index, document in enumerate(process.rows):
+        given = writes[index] if index < len(writes) else ""
+        tail = (
+            [_ROWS_FLAG, str(document.source)]
+            if several and document.source is not None
+            else []
+        )
+        path = document.sink.path or given or f"pipe:{index + 1}"
+        tails.append([*tail, "-f", document.sink.container, path])
+    return tails
+
+
+def _network_args(process: SidecarProcess, writes: Sequence[str] = ()) -> list[str]:
+    """The ``-m`` table, the network string and the maps of a module region.
+
+    One output per sink, in the region's own sink order: its stream outputs
+    first, then a rows document apiece. A rows document names a path of its
+    own, so several of them are spellable; a stream leaves over stdout, and
+    only one of those is.
+    """
     graph = process.graph
     if graph is None:  # `network` is False without one
         raise _reject(
             f"process '{process.id}' hosts several modules and carries no graph",
             hint="the plan was built without partitioning; recompile the query",
         )
-    if len(graph.input_paths) != 1 or len(graph.sinks) != 1:
+    streams = len(graph.sinks) - len(process.rows)
+    if len(graph.input_paths) != 1 or streams > 1:
         raise _reject(
             f"process '{process.id}' reads {len(graph.input_paths)} streams and "
-            f"writes {len(graph.sinks)}, and only its own stdin and stdout are wired",
+            f"writes {streams}, and only its own stdin and stdout are wired",
             hint="a module network on more than one stream in or out needs argv "
             "that can spell a named pipe path",
         )
     network, targets = build_network_graph(graph, pipe_inputs=[STDIN])
-    rows = rows_args(process)
+    rows = _rows_tails(process, writes)
+    # The region's stream sinks come first, its rows documents after them.
+    tails = [_stream_output(process)] * (len(targets) - len(rows)) + rows
     argv: list[str] = []
     for binding in process.modules:
         argv += ["-m", f"{binding.name}={binding.path}"]
@@ -1263,13 +1307,16 @@ def _network_args(process: SidecarProcess) -> list[str]:
     # index counts the same ``-m`` flags in both spellings.
     argv += _rows_module_args(process)
     argv += ["-filter_complex", network]
-    for target in targets:
-        argv += ["-map", target, *(rows or _stream_output(process))]
+    for target, tail in zip(targets, tails):
+        argv += ["-map", target, *tail]
     return argv
 
 
 def sidecar_argv(
-    process: SidecarProcess, reads: Sequence[str] = (), jobs: int | None = None
+    process: SidecarProcess,
+    reads: Sequence[str] = (),
+    writes: Sequence[str] = (),
+    jobs: int | None = None,
 ) -> list[str]:
     """The argv that RUNS one sidecar process, with the binary located.
 
@@ -1295,12 +1342,15 @@ def sidecar_argv(
             hint=INSTALL_HINT,
         )
     return _argv(
-        binary, process, reads, nn.spawn_args() if process.models else (), jobs
+        binary, process, reads, writes, nn.spawn_args() if process.models else (), jobs
     )
 
 
 def shown_argv(
-    process: SidecarProcess, reads: Sequence[str] = (), jobs: int | None = None
+    process: SidecarProcess,
+    reads: Sequence[str] = (),
+    writes: Sequence[str] = (),
+    jobs: int | None = None,
 ) -> list[str]:
     """The argv a PRINTED command line shows, naming the sidecar by program name.
 
@@ -1308,7 +1358,7 @@ def shown_argv(
     what a reader would type, resolved by PATH, not the absolute path this
     machine happens to have found -- and so with no runtime directory either.
     """
-    return _argv(binaries.SIDECAR_EXECUTABLE, process, reads, (), jobs)
+    return _argv(binaries.SIDECAR_EXECUTABLE, process, reads, writes, (), jobs)
 
 
 def model_path(module: str, export: str) -> str:

@@ -1,8 +1,10 @@
 //! A chain of rows modules riding alongside a producer, each one `-m <path>
 //! -rows-from <index>` on the argv named. The rows a rows-bearing output
 //! would have written - `-f ndjson`, `-f srt` or `-f webvtt` - flow through
-//! every hop first, in argv order, and what the last hop returns is what the
-//! output actually gets.
+//! the hops between that output's own rows and the frames they were read
+//! off, producer first, and what the last hop returns is what the output
+//! actually gets. One line may write several such outputs, each with its own
+//! chain of the hops its `-rows` walks back through.
 //!
 //! Each hop only reads the rows shaped like the ones its own module declared
 //! (`input_rows_schema`); a row of another shape - a trailing summary riding

@@ -108,15 +108,18 @@ def _plan_lines(plan: ProcessPlan) -> list[str]:
 
 
 def _rows_file_lines(process: SidecarProcess) -> list[str]:
-    """The rows file a sidecar writes itself, which no plan edge carries."""
-    rows = process.rows
-    if rows is None or not rows.path:
-        return []
-    rows_id = f"{process.id}_rows"
-    return [
-        f'  {rows_id}(["{_escape(rows.path)}"])',
-        f"  {process.id} -->|{_escape(rows.container)} rows| {rows_id}",
-    ]
+    """The rows files a sidecar writes itself, which no plan edge carries."""
+    lines: list[str] = []
+    for index, document in enumerate(process.rows):
+        rows = document.sink
+        if not rows.path:
+            continue
+        rows_id = f"{process.id}_rows{index}" if index else f"{process.id}_rows"
+        lines += [
+            f'  {rows_id}(["{_escape(rows.path)}"])',
+            f"  {process.id} -->|{_escape(rows.container)} rows| {rows_id}",
+        ]
+    return lines
 
 
 def _edge_label(edge: Edge) -> str:

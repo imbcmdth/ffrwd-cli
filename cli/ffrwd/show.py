@@ -175,7 +175,7 @@ def _writes(process: Process) -> bool:
     if isinstance(process, SidecarProcess):
         if process.sink:  # a sink module's effects are its destination
             return True
-        return process.rows is not None and bool(process.rows.path)
+        return any(document.sink.path for document in process.rows)
     return any(_is_file(unit) for unit in process.graph.sinks)
 
 

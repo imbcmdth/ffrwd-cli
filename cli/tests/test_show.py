@@ -136,7 +136,9 @@ def test_the_player_reads_nut_off_its_stdin(title: str) -> None:
 # --- a process plan ---------------------------------------------------------
 
 
-def _stand_in(process: SidecarProcess, reads: Sequence[str] = ()) -> list[str]:
+def _stand_in(
+    process: SidecarProcess, reads: Sequence[str] = (), writes: Sequence[str] = ()
+) -> list[str]:
     """The argv a sidecar is spawned with, standing in for the real one."""
     read = reads[0] if reads else "pipe:0"
     return ["ffrwd-wasm", "-m", process.module, "-f", "nut", read, "pipe:1"]
@@ -262,7 +264,7 @@ def test_show_only_leaves_a_rows_document_alone() -> None:
     """Rows are a document the sidecar writes itself, not a file the flag
     suppresses."""
     shown = show.with_plan_display(_with_rows(), only=True)
-    assert [s.rows for s in shown.sidecars] == [
+    assert [document.sink for s in shown.sidecars for document in s.rows] == [
         RowsSink(container="ndjson", path="rows.ndjson")
     ]
 

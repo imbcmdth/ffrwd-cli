@@ -40,6 +40,21 @@ an `-f nut` output names, so the frames and the subtitles come off one run:
       -map [out0] -f nut - \
       -map [out0] -f srt subs.srt
 
+Rows are the exception to that one-per-format rule: a line writes one
+document per set of rows it has, and `-rows <index>` says whose rows each
+holds - the 0-based position, among the line's `-m` flags, of the module
+that produced them, whether it read them off frames or is a rows module
+chained after one. It precedes the output it names, the way `-map` does,
+and an output carrying frames is refused one.
+
+    ffrwd-wasm -f nut -i - \
+      -m captions.wasm -m fauxlate.wasm -rows-from 0 \
+      -rows 0 -f webvtt cues.vtt \
+      -rows 1 -f webvtt translated.vtt
+
+A line writing ONE rows document needs no `-rows`: it is the only rows there
+are, and it takes whatever chain of rows modules the line carries.
+
 ## The rows a subtitle output reads
 
 A cue row is a JSON object with all three of:

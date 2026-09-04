@@ -441,3 +441,156 @@ fn a_rows_from_naming_its_own_slot_is_refused_by_name() {
         run.stderr
     );
 }
+
+// Two rows documents off one line: `-rows <index>` per output says whose
+// rows each holds, the way `-rows-from` says whose rows a module reads.
+
+#[test]
+fn two_rows_outputs_hold_the_modules_their_rows_flags_name() {
+    let captions = module_path("captions");
+    let fauxlate = module_path("fauxlate");
+    let dir = tempdir();
+    let written = dir.join("written.webvtt");
+    let translated = dir.join("translated.webvtt");
+
+    let frames: Vec<Vec<u8>> = (0..3u8).map(synthetic_frame).collect();
+    let wire = nut_stream(&frames);
+
+    let run = run_ffrwd_wasm_stdin(
+        &[
+            "-f",
+            "nut",
+            "-i",
+            "-",
+            "-m",
+            captions.to_str().expect("module path is UTF-8"),
+            "-m",
+            fauxlate.to_str().expect("module path is UTF-8"),
+            "-rows-from",
+            "0",
+            "-rows",
+            "0",
+            "-f",
+            "webvtt",
+            written.to_str().expect("temp path is UTF-8"),
+            "-rows",
+            "1",
+            "-f",
+            "webvtt",
+            translated.to_str().expect("temp path is UTF-8"),
+        ],
+        &wire,
+    );
+    assert!(
+        run.output.status.success(),
+        "run exited with {:?}\nstderr:\n{}",
+        run.output.status.code(),
+        run.stderr
+    );
+
+    let first = std::fs::read_to_string(&written).expect("read the producer's document");
+    let second = std::fs::read_to_string(&translated).expect("read the chained document");
+    assert_eq!(
+        first.matches(" --> ").count(),
+        second.matches(" --> ").count(),
+        "the two documents hold the same cues, got:\n{first}\nand:\n{second}"
+    );
+    for index in 0..3 {
+        assert!(
+            first.contains(&format!("cue {index}")),
+            "cue {index} is not in the producer's own document, got:\n{first}"
+        );
+        assert!(
+            second.contains(&format!("cue-a {index}-o")),
+            "cue {index} was not translated in the chained document, got:\n{second}"
+        );
+    }
+    assert!(
+        !first.contains("cue-a"),
+        "the producer's document went through the rows module, got:\n{first}"
+    );
+}
+
+#[test]
+fn a_rows_naming_no_m_on_the_line_is_refused_by_name() {
+    let captions = module_path("captions");
+    let run = run_ffrwd_wasm(&[
+        "-f",
+        "nut",
+        "-i",
+        "-",
+        "-m",
+        captions.to_str().expect("module path is UTF-8"),
+        "-rows",
+        "3",
+        "-f",
+        "webvtt",
+        "-",
+    ]);
+    assert!(!run.output.status.success());
+    assert!(
+        run.stderr.contains("-rows 3"),
+        "stderr does not name the index, got:\n{}",
+        run.stderr
+    );
+}
+
+#[test]
+fn a_rows_on_a_frame_output_is_refused_by_name() {
+    let captions = module_path("captions");
+    let run = run_ffrwd_wasm(&[
+        "-f",
+        "nut",
+        "-i",
+        "-",
+        "-m",
+        captions.to_str().expect("module path is UTF-8"),
+        "-rows",
+        "0",
+        "-f",
+        "nut",
+        "-",
+    ]);
+    assert!(!run.output.status.success());
+    assert!(
+        run.stderr.contains("-rows") && run.stderr.contains("writes none"),
+        "stderr does not say the output carries no rows, got:\n{}",
+        run.stderr
+    );
+}
+
+#[test]
+fn a_rows_module_no_output_names_is_refused_by_name() {
+    let captions = module_path("captions");
+    let fauxlate = module_path("fauxlate");
+    let dir = tempdir();
+    let out = dir.join("plain.webvtt");
+    let run = run_ffrwd_wasm(&[
+        "-f",
+        "nut",
+        "-i",
+        "-",
+        "-m",
+        captions.to_str().expect("module path is UTF-8"),
+        "-m",
+        fauxlate.to_str().expect("module path is UTF-8"),
+        "-rows-from",
+        "0",
+        "-rows",
+        "0",
+        "-f",
+        "webvtt",
+        out.to_str().expect("temp path is UTF-8"),
+        "-rows",
+        "0",
+        "-f",
+        "srt",
+        "-",
+    ]);
+    assert!(!run.output.status.success());
+    assert!(
+        run.stderr.contains("fauxlate") && run.stderr.contains("reach no output"),
+        "stderr does not name the module nothing reads, got:\n{}",
+        run.stderr
+    );
+}

@@ -28,7 +28,7 @@ from sqlglot import exp
 from ffrwd import wasm
 from ffrwd.compiler import Compiled, compile_all
 from ffrwd.errors import ErrorCode, FfrwdError
-from ffrwd.execute import CHAIN, PIPELINE, plan_argv, render_plan
+from ffrwd.execute import CHAIN, PIPELINE, PipeEdge, plan_argv, render_plan
 from ffrwd.functions import WasmFunction, package_modules
 from ffrwd.ir import Graph
 from ffrwd.lower import lower, lower_table
@@ -41,6 +41,7 @@ from ffrwd.processes import (
     FfmpegProcess,
     ModuleShape,
     PadMeta,
+    ProcessPlan,
     SidecarProcess,
     StreamEdge,
     VideoFormat,
@@ -2551,8 +2552,8 @@ def test_the_minted_track_is_an_edge_from_the_sidecar() -> None:
     assert (edge.source, edge.target, edge.container) == (
         "sidecar0", "ffmpeg0", "webvtt",
     )
-    rows = plan.sidecars[0].rows
-    assert rows is not None and rows.alias == edge.alias
+    (document,) = plan.sidecars[0].rows
+    assert document.sink.alias == edge.alias
 
 
 def test_the_rows_edge_puts_every_process_in_one_stage() -> None:
@@ -3989,7 +3990,7 @@ def test_a_sink_copy_compiles_to_a_feeder_and_a_sink_process() -> None:
     process = plan.sidecars[0]
     assert process.sink is True
     assert process.outputs == ()
-    assert process.rows is None
+    assert process.rows == ()
 
 
 def test_a_frame_sink_composes_with_the_module_feeding_it() -> None:
@@ -4722,9 +4723,9 @@ def test_the_sink_process_is_a_sink_with_rows_on_stdout() -> None:
     process = plan.sidecars[0]
     assert process.sink is True
     assert process.outputs == ()
-    assert process.rows is not None
-    assert process.rows.container == "ndjson"
-    assert process.rows.alias == "" and process.rows.path == ""
+    (document,) = process.rows
+    assert document.sink.container == "ndjson"
+    assert document.sink.alias == "" and document.sink.path == ""
 
 
 def test_each_consumers_edge_keeps_its_own_format() -> None:
@@ -5376,14 +5377,24 @@ def _rows_module_plan(sql: str, described: Described | None = None) -> Compiled:
     return compile_all(sql, describe=lambda path: modules[path])
 
 
+def _plan_of(sql: str, described: Described | None = None) -> ProcessPlan:
+    """`sql` planned, for a test that reads the processes rather than the IR."""
+    plan = _rows_module_plan(sql, described).plan
+    assert plan is not None
+    return plan
+
+
+def _pipe_name(edge: PipeEdge, side: str) -> str:
+    """A named pipe path spelled by the ends it joins, not by a temp path."""
+    return f"pipe<{edge.source}-{edge.target} {side}>"
+
+
 def _rows_module_graph(sql: str, described: Described | None = None) -> Graph:
     """Lower `sql` to its IR graph, without partitioning it into processes.
 
-    A region whose rows a producer's own annotation column AND a rows
-    function both need lands two rows documents in one sidecar process --
-    unsupported today past the graph this pass builds, so a shape check
-    that only cares whether the GRAPH wires one producer to both uses stops
-    here rather than going through `compile_all`'s partition step.
+    For a shape check that only cares whether the GRAPH wires one producer
+    to both uses: the nodes and the rows edge between them, before anything
+    is grouped into processes.
     """
     modules = {
         ROWS_MODULE: described or _rows_module_described(),
@@ -5719,6 +5730,56 @@ def test_a_second_rows_module_names_the_first_by_its_own_m_slot() -> None:
     argv = plan_argv(plan, sidecar_argv=wasm.shown_argv)["sidecar0"]
     assert argv.count("-rows-from") == 2
     assert [argv[i + 1] for i, a in enumerate(argv) if a == "-rows-from"] == ["0", "1"]
+
+
+# several documents off one region
+
+
+def test_one_document_carries_no_rows_flag() -> None:
+    """The only rows the line writes need not say they are the ones: the
+    spelling a region with one document has always taken."""
+    argv = plan_argv(
+        _plan_of(ROWS_RECIPE), sidecar_argv=wasm.shown_argv
+    )["sidecar0"]
+    assert "-rows" not in argv
+
+
+def test_a_producer_and_a_rows_function_over_it_are_two_documents() -> None:
+    """The CTE recipe: `c` is the producer's own rows and `translated` those
+    rows one module later, so one region writes a document apiece, each
+    naming the ``-m`` whose rows it holds."""
+    plan = _plan_of(CTE_ROWS_RECIPE)
+    (sidecar,) = plan.sidecars
+    assert [document.source for document in sidecar.rows] == [0, 1]
+    assert [e.container for e in plan.rows_edges] == ["webvtt", "webvtt"]
+
+
+def test_two_documents_leave_over_two_pipes_of_their_own() -> None:
+    argv = plan_argv(
+        _plan_of(CTE_ROWS_RECIPE), sidecar_argv=wasm.shown_argv, pipe_path=_pipe_name
+    )["sidecar0"]
+    assert argv == [
+        "ffrwd-wasm", "-f", "nut", "-i", "pipe:0",
+        "-m", CAPTIONER,
+        "-m", ROWS_MODULE, "-rows-from", "0",
+        "-rows", "0", "-f", "webvtt", "pipe<sidecar0-ffmpeg0 write>",
+        "-rows", "1", "-f", "webvtt", "pipe<sidecar0-ffmpeg0 write>",
+    ]  # fmt: skip
+
+
+def test_a_chain_of_rows_modules_is_still_one_document_per_column() -> None:
+    """Two hops between the rows and the document do not make two documents:
+    what a column selected is one document, and it names the last hop."""
+    sql = _CAPTIONS_DECLARE + _fauxlate_declare() + (
+        "COPY (WITH d AS (\n"
+        "  SELECT s.video[1] AS v, captions(s.video[1]).cues AS c\n"
+        "  FROM input('angel-one.mp4') s\n"
+        ")\n"
+        "SELECT d.v, d.c, fauxlate(fauxlate(d.c)) AS translated FROM d) TO 'out.mkv'"
+    )
+    (sidecar,) = _plan_of(sql).sidecars
+    assert [m.source for m in sidecar.rows_modules] == [0, 1]
+    assert [document.source for document in sidecar.rows] == [0, 2]
 
 
 # ---------------------------------------------------------------------------

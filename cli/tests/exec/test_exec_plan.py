@@ -91,7 +91,9 @@ def _live_pipes() -> list[str]:
     return [name for name in os.listdir("\\\\.\\pipe\\") if name.startswith(prefix)]
 
 
-def _negate(process: SidecarProcess, reads: Sequence[str]) -> list[str]:
+def _negate(
+    process: SidecarProcess, reads: Sequence[str], writes: Sequence[str] = ()
+) -> list[str]:
     return [
         "ffmpeg", "-hide_banner",
         "-f", "nut", "-i", "pipe:0",
@@ -100,7 +102,9 @@ def _negate(process: SidecarProcess, reads: Sequence[str]) -> list[str]:
     ]  # fmt: skip
 
 
-def _broken(process: SidecarProcess, reads: Sequence[str]) -> list[str]:
+def _broken(
+    process: SidecarProcess, reads: Sequence[str], writes: Sequence[str] = ()
+) -> list[str]:
     """An ffmpeg whose filtergraph names a filter that does not exist."""
     return [
         "ffmpeg", "-hide_banner",
@@ -314,7 +318,9 @@ def test_a_stage_that_cannot_finish_hits_its_timeout(tmp_path: Path) -> None:
 _STALL = 2.0
 
 
-def _sleeper(process: SidecarProcess, reads: Sequence[str]) -> list[str]:
+def _sleeper(
+    process: SidecarProcess, reads: Sequence[str], writes: Sequence[str] = ()
+) -> list[str]:
     """A stand-in that never reads its pipe: whatever is written to it stays."""
     return [sys.executable, "-c", "import time; time.sleep(30)"]
 

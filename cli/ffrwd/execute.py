@@ -457,9 +457,11 @@ PipeEdge = StreamEdge | RowsEdge
 # cannot carry.
 PipeNamer = Callable[[PipeEdge, Side], str]
 
-# Renders one sidecar process as the argv that runs it. The real one lands
-# with the sidecar itself; until then a caller supplies it.
-SidecarArgv = Callable[[SidecarProcess, Sequence[str]], list[str]]
+# Renders one sidecar process as the argv that runs it, given the path each
+# stream it reads arrives on and the path each rows document it writes goes
+# to. The real one lands with the sidecar itself; until then a caller
+# supplies it.
+SidecarArgv = Callable[[SidecarProcess, Sequence[str], Sequence[str]], list[str]]
 
 
 @dataclass(frozen=True)
@@ -670,13 +672,13 @@ def plan_argv(
             [e for e in plan.stream_edges if e.target == process.id]
         )
         outgoing = [e for e in plan.stream_edges if e.source == process.id]
-        rows_out = [e for e in plan.rows_edges if e.source == process.id]
         if isinstance(process, SidecarProcess):
             argv[process.id] = _sidecar_args(
                 process,
                 sidecar_argv,
                 [read[edge] for edge in incoming],
-                len(outgoing) + len(rows_out),
+                _rows_writes(process, plan, write),
+                len(outgoing),
             )
             continue
         rows_in = _rows_inputs(process, plan)
@@ -688,6 +690,22 @@ def plan_argv(
             pipe_buffers=[edge.buffer for edge in outgoing],
         )
     return argv
+
+
+def _rows_writes(
+    process: SidecarProcess, plan: ProcessPlan, write: Mapping[PipeEdge, str]
+) -> list[str]:
+    """Where each rows document `process` writes goes, in document order.
+
+    A document another process reads as a track goes to that edge's own
+    path -- stdout where the plan takes one thing from this process, a named
+    pipe where it takes several. A document the query sent to a file names
+    its own destination and takes no edge, so it takes no path here either.
+    """
+    fed = iter(e for e in plan.rows_edges if e.source == process.id)
+    return [
+        write[next(fed)] if document.sink.alias else "" for document in process.rows
+    ]
 
 
 def _rows_inputs(process: FfmpegProcess, plan: ProcessPlan) -> list[RowsEdge]:
@@ -950,15 +968,18 @@ def _sidecar_args(
     process: SidecarProcess,
     hook: SidecarArgv | None,
     reads: Sequence[str],
-    writes: int,
+    writes: Sequence[str],
+    streams: int,
 ) -> list[str]:
-    """One sidecar process as argv, its inputs spelled as `reads` names them.
+    """One sidecar process as argv, its ends spelled as the plan names them.
 
     `reads` is one path per incoming edge, in the order the module's own pads
     take them: stdin where the plan hands this process one thing, a named pipe
     per edge where it fans in. Only a SINK reads several -- everything else
-    takes its pads out of one input -- and one stdout is all any of them
-    writes.
+    takes its pads out of one input. `writes` is one path per rows document,
+    which a process may write several of, each to a path of its own;
+    `streams` is how many streams of frames it hands on, and one stdout is
+    all there is to carry those.
     """
     if hook is None:
         raise FfrwdError(
@@ -967,10 +988,10 @@ def _sidecar_args(
             "nothing was given to spawn it",
             hint="pass sidecar_argv, which renders one sidecar process as argv",
         )
-    if writes > 1:
+    if streams > 1:
         raise FfrwdError(
             ErrorCode.INTERNAL,
-            f"process {process.id!r} writes {writes} streams, but only its own "
+            f"process {process.id!r} writes {streams} streams, but only its own "
             "stdout is wired",
             hint="a sidecar writing more than one stream needs argv that can "
             "spell a named pipe path",
@@ -983,7 +1004,7 @@ def _sidecar_args(
             hint="a frame module takes its pads out of one input, wired by the "
             "network string",
         )
-    return list(hook(process, reads))
+    return list(hook(process, reads, writes))
 
 
 def _spawn_argv(
@@ -1274,9 +1295,10 @@ def _writes_rows_to_stdout(process: Process) -> bool:
     return (
         isinstance(process, SidecarProcess)
         and process.sink
-        and process.rows is not None
-        and not process.rows.alias
-        and not process.rows.path
+        and any(
+            not document.sink.alias and not document.sink.path
+            for document in process.rows
+        )
     )
 
 

@@ -280,12 +280,14 @@ enum Modules {
 }
 
 /// One `-m <path> -rows-from <index>` pair: a rows module hosted in this
-/// process, carrying no stream of its own. `-rows-from` is checked as the
-/// line is parsed - it names an earlier `-m` on the same line - and nothing
-/// downstream needs the index again: the chain it built is already in the
-/// right order.
+/// process, carrying no stream of its own. `slot` is its own position among
+/// the line's `-m` flags and `source` what its `-rows-from` named, checked as
+/// the line is parsed to be an earlier `-m`: the two are what an output's
+/// `-rows` walks back through to the chain its rows flow along.
 struct RowsModuleSpec {
     path: String,
+    slot: usize,
+    source: usize,
 }
 
 /// What one output writes: the frames, the rows as they arrive, the cue
@@ -318,8 +320,20 @@ struct OutputSpec {
     target: Option<String>,
     kind: OutputKind,
     path: OutputPath,
+    /// `-rows`: whose rows this document holds, as a position among the
+    /// line's `-m` flags - a module's own rows, or a rows module's output.
+    /// Absent for an output that carries frames, and for the one rows
+    /// document a line ordinarily writes.
+    rows: Option<usize>,
     /// The output as it was spelled, for a refusal that names it.
     spelling: String,
+}
+
+impl OutputSpec {
+    /// Whether this output writes rows rather than frames.
+    fn rows_bearing(&self) -> bool {
+        matches!(self.kind, OutputKind::Rows | OutputKind::Subtitles(_))
+    }
 }
 
 /// Which sides of this process carry the annotation stream. Both are off for
@@ -345,7 +359,7 @@ struct Args {
     /// module reads no `-i` stream at all, so this is its only input.
     rows_in: Option<InputPath>,
     /// Every `-m <path> -rows-from <index>` on the line, in the order they
-    /// were given - the chain a rows-bearing output's rows flow through
+    /// were given - the hops a rows-bearing output's rows may flow through
     /// before they are written.
     rows_chain: Vec<RowsModuleSpec>,
     /// The `-jobs` cap on worker threads, if one was given. The pool is the
@@ -550,6 +564,8 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
     let mut annotations = Annotations::default();
     let mut rows_in: Option<InputPath> = None;
     let mut jobs: Option<usize> = None;
+    // What the `-rows` before the next output said, if one was given.
+    let mut pending_rows: Option<usize> = None;
 
     while let Some(arg) = it.next() {
         let mut next = |name: &str| -> Result<String> {
@@ -593,6 +609,21 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
                         bail!("-rows-from with no -m before it: -rows-from follows the -m it names")
                     }
                 }
+            }
+            // `-rows <index> -f <container> <path>`: whose rows the output
+            // that follows holds, by position among the line's `-m` flags -
+            // a module's own rows, or a rows module's output. It precedes
+            // its output the way `-map` does, and one document a line needs
+            // none: it is the only rows there are to write.
+            "-rows" => {
+                let raw = next("-rows")?;
+                let index: usize = raw
+                    .parse()
+                    .map_err(|_| anyhow!("-rows expects a 0-based index, got {raw}"))?;
+                if pending_rows.is_some() {
+                    bail!("two -rows options in a row: each names the output that follows it");
+                }
+                pending_rows = Some(index);
             }
             "-filter_complex" => {
                 if wiring.is_some() {
@@ -660,18 +691,31 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
                         OUTPUT_FORMATS.join(", ")
                     ),
                 };
-                outputs.push(OutputSpec {
+                let rows = pending_rows.take();
+                let output = OutputSpec {
                     target: pending_map.take(),
                     kind,
                     path: resolve_output_path(other)?,
+                    rows,
                     spelling: format!("-f {taken} {other}"),
-                });
+                };
+                if rows.is_some() && !output.rows_bearing() {
+                    bail!(
+                        "{}: -rows names whose rows a document holds, and this output \
+                         writes none",
+                        output.spelling
+                    );
+                }
+                outputs.push(output);
             }
         }
     }
 
     if let Some(target) = pending_map {
         bail!("-map [{target}] names no output: an output path must follow it");
+    }
+    if let Some(index) = pending_rows {
+        bail!("-rows {index} names no output: an output path must follow it");
     }
     // A packet source takes no -i input at all, so the ordinary "no input
     // specified" refusal cannot be decided here - it needs to know whether
@@ -763,10 +807,26 @@ fn build_modules(
                          module reads an earlier -m's rows"
                     );
                 }
-                rows_chain.push(RowsModuleSpec { path: raw });
+                rows_chain.push(RowsModuleSpec {
+                    path: raw,
+                    slot: position,
+                    source,
+                });
             }
         }
     }
+
+    for output in outputs {
+        if let Some(source) = output.rows {
+            if source >= total {
+                bail!(
+                    "{}: -rows {source} names no -m on this line; {total} are given",
+                    output.spelling
+                );
+            }
+        }
+    }
+    check_every_rows_module_is_read(&rows_chain, outputs)?;
 
     let Some(wiring) = wiring else {
         if stream_raws.len() > 1 {
@@ -816,13 +876,47 @@ fn build_modules(
     Ok((Modules::Network { bindings, wiring }, rows_chain))
 }
 
+/// Every rows module on the line has to reach an output: one whose `-rows`
+/// names it, or a hop feeding one. A line writing ONE rows document and
+/// naming none takes the whole chain, so nothing is left over there; a line
+/// naming any is checked hop by hop.
+fn check_every_rows_module_is_read(specs: &[RowsModuleSpec], outputs: &[OutputSpec]) -> Result<()> {
+    let documents: Vec<&OutputSpec> = outputs.iter().filter(|o| o.rows_bearing()).collect();
+    if specs.is_empty() || documents.is_empty() {
+        return Ok(());
+    }
+    if documents.len() == 1 && documents[0].rows.is_none() {
+        return Ok(());
+    }
+    let mut read: Vec<String> = Vec::new();
+    for document in &documents {
+        if let Some(source) = document.rows {
+            read.extend(rows_hops(source, specs));
+        }
+    }
+    match specs.iter().find(|spec| !read.contains(&spec.path)) {
+        Some(spec) => bail!(
+            "{}: this rows module's rows reach no output; -rows names which document holds them",
+            spec.path
+        ),
+        None => Ok(()),
+    }
+}
+
 /// A single module writes one stream, so it fills one output of each format.
 /// A network names a label per output and may write several of the same
 /// format, one per label.
+///
+/// Rows are the exception either way: a line writes as many rows documents as
+/// it has rows to write, so two of them share a format as long as `-rows`
+/// says whose rows each holds.
 fn check_one_output_per_format(outputs: &[OutputSpec]) -> Result<()> {
     for (index, output) in outputs.iter().enumerate() {
         let format = output.kind.format();
-        if outputs[..index].iter().any(|o| o.kind == output.kind) {
+        let clash = outputs[..index]
+            .iter()
+            .any(|o| o.kind == output.kind && (!output.rows_bearing() || o.rows == output.rows));
+        if clash {
             bail!("second -f {format} output specified: at most one is allowed");
         }
     }
@@ -899,11 +993,24 @@ fn open_input(path: &InputPath) -> Result<InputReader> {
     }
 }
 
+/// Whether `path` names a Windows named pipe: one already made by whoever
+/// reads it, so it is opened rather than created. A POSIX fifo is an
+/// ordinary path and needs no such spelling.
+fn is_named_pipe(path: &str) -> bool {
+    cfg!(windows) && (path.starts_with(r"\\.\pipe\") || path.starts_with(r"\\?\pipe\"))
+}
+
 /// Outputs always create/truncate; `-y` is accepted for compatibility but
-/// changes nothing.
+/// changes nothing. A named pipe is opened for writing instead: creating one
+/// is not a thing to do to a pipe that is already there.
 fn open_output(path: &OutputPath) -> Result<OutputWriter> {
     match path {
         OutputPath::Stdout => Ok(OutputWriter::Stdout(io::stdout())),
+        OutputPath::File(p) if is_named_pipe(p) => std::fs::OpenOptions::new()
+            .write(true)
+            .open(p)
+            .map(OutputWriter::File)
+            .with_context(|| format!("opening output {p}")),
         OutputPath::File(p) => File::create(p)
             .map(OutputWriter::File)
             .with_context(|| format!("opening output {p}")),
@@ -1155,41 +1262,54 @@ impl Sink {
     }
 }
 
-/// Opens the chain every `-m <path> -rows-from <index>` on the line named,
-/// in the order they were given. None when the line named none.
-fn open_rows_chain(specs: &[RowsModuleSpec]) -> Result<Option<rows_chain::RowsChain>> {
-    if specs.is_empty() {
-        return Ok(None);
+/// The hops one output's rows flow through, in the order they run: the rows
+/// module `source` names, behind every hop feeding it, walked back through
+/// each one's own `-rows-from`. Empty where `source` names a module that
+/// reads its rows off frames - the rows are that module's own, untouched.
+fn rows_hops(source: usize, specs: &[RowsModuleSpec]) -> Vec<String> {
+    let mut hops: Vec<String> = Vec::new();
+    let mut at = source;
+    while let Some(spec) = specs.iter().find(|spec| spec.slot == at) {
+        hops.push(spec.path.clone());
+        at = spec.source;
     }
-    let paths: Vec<String> = specs.iter().map(|spec| spec.path.clone()).collect();
-    Ok(Some(rows_chain::RowsChain::open(&paths)?))
+    hops.reverse();
+    hops
 }
 
 /// One sink per output, each bound to the node it writes and opened against
-/// that node's stream header. `rows_chain` goes to the one rows-bearing
-/// output (`-f ndjson`, `-f srt` or `-f webvtt`) this line writes; more than
-/// one such output with a chain to feed, or none at all, is refused.
-fn open_sinks(
-    args: &Args,
-    nodes: &[usize],
-    streams: &[nut::Stream],
-    mut rows_chain: Option<rows_chain::RowsChain>,
-) -> Result<Vec<Sink>> {
-    let rows_bearing = args
-        .outputs
-        .iter()
-        .filter(|o| matches!(o.kind, OutputKind::Rows | OutputKind::Subtitles(_)))
-        .count();
-    if rows_chain.is_some() && rows_bearing > 1 {
+/// that node's stream header.
+///
+/// A rows-bearing output (`-f ndjson`, `-f srt` or `-f webvtt`) holds the
+/// rows its own `-rows` names, flowing through the hops between that module
+/// and the frames they were read off. Without a `-rows` it holds the rows of
+/// the node it maps -- except on a line writing ONE rows document, where it
+/// takes the whole chain, which is the spelling from before `-rows` existed.
+/// Each output opens its own instances of the hops its rows flow through.
+fn open_sinks(args: &Args, nodes: &[usize], streams: &[nut::Stream]) -> Result<Vec<Sink>> {
+    let rows_bearing = args.outputs.iter().filter(|o| o.rows_bearing()).count();
+    if !args.rows_chain.is_empty() && rows_bearing == 0 {
         bail!(
-            "a rows module's output feeds one rows document, and this line writes {rows_bearing}"
+            "a rows module chains onto -f ndjson, srt or webvtt, and this line writes none of \
+             those"
         );
     }
+    let whole: Vec<String> = args
+        .rows_chain
+        .iter()
+        .map(|spec| spec.path.clone())
+        .collect();
     let mut sinks = Vec::with_capacity(args.outputs.len());
     for ((output, node), stream) in args.outputs.iter().zip(nodes).zip(streams) {
-        let chain = match output.kind {
-            OutputKind::Rows | OutputKind::Subtitles(_) => rows_chain.take(),
-            _ => None,
+        let hops = match (output.rows_bearing(), output.rows) {
+            (true, Some(source)) => rows_hops(source, &args.rows_chain),
+            (true, None) if rows_bearing == 1 => whole.clone(),
+            _ => Vec::new(),
+        };
+        let chain = if hops.is_empty() {
+            None
+        } else {
+            Some(rows_chain::RowsChain::open(&hops)?)
         };
         sinks.push(Sink::open(
             output,
@@ -1198,12 +1318,6 @@ fn open_sinks(
             args.annotations.output,
             chain,
         )?);
-    }
-    if rows_chain.is_some() {
-        bail!(
-            "a rows module chains onto -f ndjson, srt or webvtt, and this line writes none of \
-             those"
-        );
     }
     Ok(sinks)
 }
@@ -1429,8 +1543,7 @@ fn run(args: &Args) -> Result<()> {
             let net = Network::single(filter, &formats[0], reopen);
             let nodes = vec![0usize; args.outputs.len()];
             let sink_streams = vec![streams[0].clone(); args.outputs.len()];
-            let rows_chain = open_rows_chain(&args.rows_chain)?;
-            let sinks = open_sinks(args, &nodes, &sink_streams, rows_chain)?;
+            let sinks = open_sinks(args, &nodes, &sink_streams)?;
             run_lanes(net, readers, &formats, sinks, args.jobs)
         }
         Modules::Network { bindings, wiring } => {
@@ -1456,8 +1569,7 @@ fn run(args: &Args) -> Result<()> {
                 sink_streams.push(streams[net.root(node)].clone());
                 nodes.push(node);
             }
-            let rows_chain = open_rows_chain(&args.rows_chain)?;
-            let sinks = open_sinks(args, &nodes, &sink_streams, rows_chain)?;
+            let sinks = open_sinks(args, &nodes, &sink_streams)?;
             run_lanes(net, readers, &formats, sinks, args.jobs)
         }
     }

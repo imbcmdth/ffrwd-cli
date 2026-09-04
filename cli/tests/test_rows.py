@@ -26,6 +26,7 @@ from pathlib import Path
 import pytest
 
 from ffrwd import binaries, cli
+from ffrwd.compiler import compile_table_sql
 
 _CLI_ROOT = Path(__file__).resolve().parent.parent
 _REPO_ROOT = _CLI_ROOT.parent
@@ -81,6 +82,36 @@ def _query(out_path: Path, *, rows: str, translating: bool) -> str:
         f"  FROM input('{_FIXTURE.as_posix()}') f\n"
         f") TO '{out_path.as_posix()}'"
     )
+
+
+def _two_document_query(out_path: Path) -> str:
+    """The cookbook's own two-track query: the rows written, and translated.
+
+    One `captions` node produces both columns -- the CTE is what lets the
+    second read what the first named -- so one sidecar writes two documents.
+    """
+    return f"""CREATE FUNCTION captions(v video_stream)
+RETURNS STRUCT(v video_stream, cues cue[])
+  AS '{_CAPTIONS.as_posix()}', 'captions' LANGUAGE wasm;
+CREATE FUNCTION fauxlate(cues cue[]) RETURNS cue[]
+  AS '{_FAUXLATE.as_posix()}', 'fauxlate' LANGUAGE wasm;
+COPY (
+  WITH d AS (
+    SELECT f.video[1] AS v, captions(f.video[1]).cues AS speech
+    FROM input('{_FIXTURE.as_posix()}') f
+  )
+  SELECT d.v, d.speech, fauxlate(d.speech) AS translated
+  FROM d
+) TO '{out_path.as_posix()}'"""
+
+
+def _track_texts(path: Path, title: str) -> list[str]:
+    """Every cue of the track `title` names, read back by the compiler's probe."""
+    sinks = compile_table_sql(
+        f"SELECT c.text FROM input('{path.as_posix()}') f, "
+        f"unnest(f.cues['{title}']) c"
+    )
+    return [str(row[0]) for row in sinks[0].result.rows]
 
 
 def _cue_texts(path: Path) -> list[str]:
@@ -152,3 +183,21 @@ def test_a_rows_module_translates_every_cue_its_producer_wrote(tmp_path: Path) -
     assert len(translated) == len(written)
     untouched = [text for text in translated if _TRANSLATED.search(text) is None]
     assert untouched == []
+
+
+@pytest.mark.exec
+def test_one_producers_rows_are_written_twice_once_translated(tmp_path: Path) -> None:
+    """Two rows documents off ONE region, muxed as two subtitle tracks: the
+    `speech` track is what `captions` wrote and `translated` the same cues a
+    module later, cue for cue, with neither document holding the other's
+    rows."""
+    out = tmp_path / "spoken.mkv"
+    assert cli.main(["run", _two_document_query(out), "-y"]) == 0
+    assert len(_subtitle_streams(out)) == 2
+
+    speech = _track_texts(out, "speech")
+    translated = _track_texts(out, "translated")
+    assert speech, "the captions module wrote no cues"
+    assert len(translated) == len(speech)
+    assert [text for text in translated if _TRANSLATED.search(text) is None] == []
+    assert [text for text in speech if _TRANSLATED.search(text) is not None] == []

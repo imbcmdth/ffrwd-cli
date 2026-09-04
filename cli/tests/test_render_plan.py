@@ -26,7 +26,9 @@ def _out(ref: str, type_: StreamType = "video") -> Output:
     return Output(ref=ref, type=type_, name=None, metadata={})
 
 
-def _stand_in(process: SidecarProcess, reads: Sequence[str] = ()) -> list[str]:
+def _stand_in(
+    process: SidecarProcess, reads: Sequence[str] = (), writes: Sequence[str] = ()
+) -> list[str]:
     """An ffmpeg standing in for a sidecar, reading the paths it was given."""
     argv = ["ffmpeg"]
     for path in reads or ("pipe:0",):

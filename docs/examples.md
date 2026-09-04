@@ -3272,3 +3272,49 @@ ffmpeg -i tests/fixtures/av-chapters.mkv -filter_complex \
   '[0:a:0][0:a:1]concat=n=2:v=0:a=1,arealtime[out0]' -map '[out0]' -f mpegts -c:0 aac \
   udp://127.0.0.1:5004
 ```
+
+## 122. Rows written twice, once translated
+
+[Recipe 120](#120-rows-named-once-used-twice) reads one producer's rows twice as a table; written to a file they are two subtitle tracks of one mkv. One `captions` node writes both - `speech` is the rows it read off the frames, `translated` is those same rows one module later - so the sidecar hosting it writes two documents, one per rows-bearing node it holds:
+
+```pgsql
+CREATE FUNCTION captions(v video_stream)
+RETURNS STRUCT(v video_stream, cues cue[])
+  AS '../sidecar/modules/target/wasm32-wasip2/release/captions.wasm', 'captions'
+  LANGUAGE wasm;
+
+CREATE FUNCTION fauxlate(cues cue[]) RETURNS cue[]
+  AS '../sidecar/modules/target/wasm32-wasip2/release/fauxlate.wasm', 'fauxlate'
+  LANGUAGE wasm;
+
+COPY (
+  WITH d AS (
+    SELECT f.video[1] AS v, captions(f.video[1]).cues AS speech
+    FROM input('tests/fixtures/av.mp4') f
+  )
+  SELECT d.v, d.speech, fauxlate(d.speech) AS translated
+  FROM d
+) TO 'spoken.mkv'
+```
+
+```
+$ ffrwd compile -f query.sql
+# named pipes: ffmpeg0 reads sidecar0, sidecar0; sidecar0 feeds ffmpeg0, ffmpeg0
+1. ffmpeg: ffmpeg -i tests/fixtures/av.mp4 -f webvtt -i \
+  '<named pipe sidecar0-ffmpeg0 ffrwd.cues#2 read>' -f webvtt -i \
+  '<named pipe sidecar0-ffmpeg0 ffrwd.cues#3 read>' -map 0:v:0 -c:0 copy -map 1:s:0 -c:1 \
+  copy -metadata:s:1 title=speech -map 2:s:0 -c:2 copy -metadata:s:2 title=translated \
+  spoken.mkv
+2. ffmpeg: ffmpeg -i tests/fixtures/av.mp4 -map 0:v:0 -c:0 rawvideo -pix_fmt:0 rgba -f \
+  nut pipe:1
+3. sidecar: ffrwd-wasm -f nut -i pipe:0 -m \
+  ../sidecar/modules/target/wasm32-wasip2/release/captions.wasm -m \
+  ../sidecar/modules/target/wasm32-wasip2/release/fauxlate.wasm -rows-from 0 -rows 0 -f \
+  webvtt '<named pipe sidecar0-ffmpeg0 ffrwd.cues#2 write>' -rows 1 -f webvtt \
+  '<named pipe sidecar0-ffmpeg0 ffrwd.cues#3 write>'
+# this listing is not a shell command -- run the plan with `ffrwd run`
+```
+
+`-rows 0` and `-rows 1` say whose rows each document holds, counted the way `-rows-from` counts: slot 0 is `captions`, slot 1 the `fauxlate` reading its rows. A region writing ONE document needs no such flag - it is the only rows the line writes - which is the spelling [recipe 113](#113-translate-captions-as-they-are-produced) shows. The two documents leave over two named pipes into the one ffmpeg that muxes them, which is why this prints as a listing rather than a pipeline; `ffrwd run` executes it.
+
+The tracks come back as the titles name them: `unnest(f.cues['speech'])` is what `captions` wrote and `unnest(f.cues['translated'])` the same cues with the word rule applied ([recipe 118](#118-write-rows-as-titled-tracks)). Three describers and three rows functions over them are six documents off one region, written the same way.

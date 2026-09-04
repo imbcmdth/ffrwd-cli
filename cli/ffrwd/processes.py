@@ -562,6 +562,27 @@ class RowsModule:
 
 
 @dataclass(frozen=True)
+class RowsDocument:
+    """One rows document a region writes, and whose rows it holds.
+
+    `node` is the region node the document reads its rows off. `source` is
+    that node's position, among every ``-m`` this process's argv writes --
+    what ``-rows`` names, the mirror of a rows module's ``-rows-from`` --
+    or None for a node the host answers for, which no ``-m`` loads.
+    """
+
+    sink: RowsSink
+    node: str
+    source: int | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        written: dict[str, object] = {"sink": self.sink.to_dict(), "node": self.node}
+        if self.source is not None:
+            written["source"] = self.source
+        return written
+
+
+@dataclass(frozen=True)
 class ModelBinding:
     """One ``-nn <name>=<path>``: the name a module loads a model by, and the file."""
 
@@ -665,9 +686,12 @@ class SidecarProcess:
     between two modules of ONE region never appear here -- they never leave
     the process.
 
-    `rows` is the region's ROWS output, for a query that selects a module's
+    `rows` is the region's ROWS outputs, for a query that selects a module's
     annotation column: the rows leave as a document of their own rather than
     riding frames, and the region's frames end at the module that read them.
+    One per rows-bearing node the region holds -- a module's own rows and a
+    rows function over them are two documents off one region -- each naming
+    the node whose rows it carries.
 
     `impure` names the modules of this region that declared they carry state
     between calls, in region order. It is empty for a region every module of
@@ -694,7 +718,7 @@ class SidecarProcess:
     models: tuple[ModelBinding, ...] = ()
     grants: tuple[EffectGrant, ...] = ()
     lookahead: int = 0
-    rows: RowsSink | None = None
+    rows: tuple[RowsDocument, ...] = ()
     impure: tuple[str, ...] = ()
     pads: tuple[PadMeta | None, ...] = ()
     # True for a region holding a SINK MODULE: the region consumes its pipes
@@ -759,8 +783,8 @@ class SidecarProcess:
             written["reads_rows"] = True
         if self.writes_rows:
             written["writes_rows"] = True
-        if self.rows is not None:
-            written["rows"] = self.rows.to_dict()
+        if self.rows:
+            written["rows"] = [document.to_dict() for document in self.rows]
         if self.sink:
             written["sink"] = True
         if self.packet_source:
@@ -1938,6 +1962,13 @@ class _Partitioner:
                 if self.external[name] and not self.g.nodes[name].rows_only
             )
             entry = self.g.nodes[first]
+            bindings = _bindings(
+                self.g.nodes[name].filter
+                for name in members
+                if self.external[name]
+                and not self.g.nodes[name].rows_only
+                and self.g.nodes[name].filter not in HOSTED_FILTERS
+            )
             sidecar = SidecarProcess(
                 id=f"sidecar{len(self.sidecars)}",
                 module=entry.filter,
@@ -1945,17 +1976,11 @@ class _Partitioner:
                 args=dict(entry.args),
                 inputs=tuple(ref for ref, _ in self._region_reads(members)),
                 outputs=tuple(kind for _, kind in self._region_writes(members)),
-                modules=_bindings(
-                    self.g.nodes[name].filter
-                    for name in members
-                    if self.external[name]
-                    and not self.g.nodes[name].rows_only
-                    and self.g.nodes[name].filter not in HOSTED_FILTERS
-                ),
+                modules=bindings,
                 models=self._region_models(members),
                 grants=self._region_grants(members),
                 lookahead=self._lookahead(members),
-                rows=self._region_rows(members),
+                rows=self._region_rows(members, bindings),
                 impure=self._region_impure(members),
                 sink=any(name in self.g.module_sinks for name in members),
                 packet_sink=any(name in self.g.packet_sinks for name in members),
@@ -2103,49 +2128,72 @@ class _Partitioner:
             for pad in self.g.packet_sinks[name]
         )
 
-    def _region_rows(self, members: Sequence[str]) -> RowsSink | None:
-        """Where this region's rows go, for a region that writes any.
+    def _region_rows(
+        self, members: Sequence[str], bindings: Sequence[ModuleBinding]
+    ) -> tuple[RowsDocument, ...]:
+        """Every rows document this region writes, in region order.
 
-        One region writes at most one rows document: a module whose rows are
-        selected reads no rows itself, so no two members can both have one.
+        A module's own rows and a rows function over them are two nodes of one
+        region, and each rows-bearing node is a document of its own.
         """
-        found = [self.g.rows_sinks[name] for name in members if name in self.g.rows_sinks]
-        if not found:
-            return None
-        if len(found) > 1:
-            raise FfrwdError(
-                ErrorCode.INTERNAL,
-                f"a region of {len(found)} modules writes rows, and a process "
-                "writes one rows document",
-                hint="please report this query as a bug",
-            )
-        return found[0]
+        slots = self._module_slots(members, bindings)
+        return tuple(
+            RowsDocument(sink=self.g.rows_sinks[name], node=name, source=slots.get(name))
+            for name in members
+            if name in self.g.rows_sinks
+        )
+
+    def _module_slots(
+        self, members: Sequence[str], bindings: Sequence[ModuleBinding]
+    ) -> dict[str, int]:
+        """The ``-m`` slot each module node of this region takes.
+
+        The stream modules first, one slot per distinct path in `bindings`
+        order, then one per rows module in region order -- the table both
+        ``-rows-from`` and ``-rows`` count against. A node the host answers
+        for gets none: no ``-m`` loads it.
+        """
+        by_path = {binding.path: index for index, binding in enumerate(bindings)}
+        slots: dict[str, int] = {}
+        rows_nodes: list[str] = []
+        for name in members:
+            node = self.g.nodes[name]
+            if node.rows_only:
+                rows_nodes.append(name)
+                continue
+            slot = by_path.get(node.filter)
+            if slot is not None:
+                slots[name] = slot
+        for offset, name in enumerate(rows_nodes):
+            slots[name] = len(bindings) + offset
+        return slots
 
     def _add_rows_edges(self) -> None:
-        """One edge per region whose rows an ffmpeg process reads as a track.
+        """One edge per rows document an ffmpeg process reads as a track.
 
-        A region writing rows to a FILE writes it itself and reaches no other
+        A document written to a FILE the region writes itself reaches no other
         process, so it earns no edge and orders nothing.
         """
         for sidecar in self.sidecars:
-            rows = sidecar.rows
-            if rows is None or not rows.alias:
-                continue
-            target = self._rows_reader(rows.alias)
-            if target is None:
-                raise FfrwdError(
-                    ErrorCode.INTERNAL,
-                    f"the rows '{sidecar.module}' writes reach no output",
-                    hint="please report this query as a bug",
+            for document in sidecar.rows:
+                rows = document.sink
+                if not rows.alias:
+                    continue
+                target = self._rows_reader(rows.alias)
+                if target is None:
+                    raise FfrwdError(
+                        ErrorCode.INTERNAL,
+                        f"the rows '{sidecar.module}' writes reach no output",
+                        hint="please report this query as a bug",
+                    )
+                self.rows.append(
+                    RowsEdge(
+                        source=sidecar.id,
+                        target=target,
+                        alias=rows.alias,
+                        container=rows.container,
+                    )
                 )
-            self.rows.append(
-                RowsEdge(
-                    source=sidecar.id,
-                    target=target,
-                    alias=rows.alias,
-                    container=rows.container,
-                )
-            )
 
     def _rows_reader(self, alias: str) -> str | None:
         """The pending ffmpeg process that maps the minted input `alias`."""
@@ -2539,10 +2587,10 @@ class _Partitioner:
         # The module whose rows leave is a sink of the region too: the network
         # string has to name the pad they were read off, even though its
         # frames go no further than the rows document. Where a rows module
-        # ends the rows, that pad is the last STREAM node above it.
-        written_rows = next((name for name in members if name in self.g.rows_sinks), None)
-        rows_node = None if written_rows is None else self._rows_pad(written_rows)
-        if rows_node is not None:
+        # ends the rows, that pad is the last STREAM node above it. One sink
+        # per document, in the order the documents are written.
+        for document in sidecar.rows:
+            rows_node = self._rows_pad(document.node)
             sinks.append(
                 SinkUnit(
                     outputs=[
@@ -2612,16 +2660,12 @@ class _Partitioner:
         rows_nodes = [name for name in members if self.g.nodes[name].rows_only]
         if not rows_nodes:
             return ()
-        by_path = {binding.path: index for index, binding in enumerate(sidecar.modules)}
-        by_node = {
-            name: len(sidecar.modules) + offset
-            for offset, name in enumerate(rows_nodes)
-        }
+        slots = self._module_slots(members, sidecar.modules)
         found: list[RowsModule] = []
         for name in rows_nodes:
             node = self.g.nodes[name]
             producer = node.rows_inputs[0]
-            source = by_node.get(producer, by_path.get(self.g.nodes[producer].filter))
+            source = slots.get(producer)
             if source is None:
                 raise FfrwdError(
                     ErrorCode.INTERNAL,

@@ -14,7 +14,16 @@ import pytest
 
 from ffrwd import wasm
 from ffrwd.errors import ErrorCode, FfrwdError
-from ffrwd.ir import Graph, ModuleSource, Node, Output, SinkUnit, SourceTrack, StreamType
+from ffrwd.ir import (
+    Graph,
+    ModuleSource,
+    Node,
+    Output,
+    RowsSink,
+    SinkUnit,
+    SourceTrack,
+    StreamType,
+)
 from ffrwd.probe import ProbeResult, StreamMeta
 from ffrwd.processes import (
     COPY_CODEC,
@@ -1595,3 +1604,93 @@ def test_pads_play_no_part_in_spellability() -> None:
     check_spellable(
         replace(plan, processes=tuple(padded if p is region else p for p in plan.processes))
     )
+
+
+# ---------------------------------------------------------------------------
+# a region writing several rows documents
+# ---------------------------------------------------------------------------
+
+
+def _two_document_graph() -> Graph:
+    """One module's rows selected twice: its own, and a rows function's.
+
+    The shape lowering builds for a CTE that names a producer's annotation
+    column once and feeds it to a rows function as well -- two rows-bearing
+    nodes in one region, each writing a document onto a minted subtitle
+    input the muxing ffmpeg reads.
+    """
+    g = Graph(
+        input_paths=["a.mp4", PIPE, PIPE],
+        sources={"a": 0, "cues": 1, "translated": 2},
+    )
+    g.nodes["e0"] = Node(
+        id="e0", filter="captions.wasm", args={}, inputs=["src:a:v:0"], outputs=["video"]
+    )
+    g.nodes["r0"] = Node(
+        id="r0", filter="fauxlate.wasm", args={}, inputs=[], outputs=[], rows_inputs=["e0"]
+    )
+    g.rows_sinks = {
+        "e0": RowsSink(container="webvtt", alias="cues"),
+        "r0": RowsSink(container="webvtt", alias="translated"),
+    }
+    g.sinks = [
+        SinkUnit(
+            outputs=[
+                _out("src:a:v:0"),
+                _out("src:cues:s:0", "subtitle"),
+                _out("src:translated:s:0", "subtitle"),
+            ],
+            path="out.mkv",
+        )
+    ]
+    return g
+
+
+def _two_document_plan() -> ProcessPlan:
+    return partition(
+        _two_document_graph(),
+        external=external_ids("e0", "r0"),
+        probes={"a": _video_probe()},
+    )
+
+
+def test_a_region_writes_one_document_per_rows_bearing_node() -> None:
+    """Both nodes' rows leave, in region order, each naming the ``-m`` slot
+    whose rows it holds: the producer is slot 0 and the rows module after it
+    slot 1."""
+    region = _two_document_plan().sidecars[0]
+    assert [document.node for document in region.rows] == ["e0", "r0"]
+    assert [document.source for document in region.rows] == [0, 1]
+    assert [document.sink.alias for document in region.rows] == ["cues", "translated"]
+
+
+def test_each_document_is_an_edge_of_its_own_to_the_muxing_process() -> None:
+    plan = _two_document_plan()
+    assert [(e.source, e.target, e.alias) for e in plan.rows_edges] == [
+        ("sidecar0", "ffmpeg0", "cues"),
+        ("sidecar0", "ffmpeg0", "translated"),
+    ]
+
+
+def test_each_document_maps_the_pad_its_rows_were_read_off() -> None:
+    """The rows module carries no pad, so its document names the stream node
+    above it -- the same pad the producer's own document names."""
+    region = _two_document_plan().sidecars[0]
+    assert region.graph is not None
+    assert [unit.outputs[0].ref for unit in region.graph.sinks] == ["e0", "e0"]
+
+
+def test_the_documents_a_region_writes_are_written_out() -> None:
+    written = _two_document_plan().sidecars[0].to_dict()["rows"]
+    assert written == [
+        {
+            "sink": {"container": "webvtt", "alias": "cues", "path": ""},
+            "node": "e0",
+            "source": 0,
+        },
+        {
+            "sink": {"container": "webvtt", "alias": "translated", "path": ""},
+            "node": "r0",
+            "source": 1,
+        },
+    ]

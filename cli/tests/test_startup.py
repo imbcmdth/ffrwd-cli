@@ -16,6 +16,7 @@ can run.
 from __future__ import annotations
 
 import functools
+from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
 
@@ -118,7 +119,9 @@ def _planned(body: str) -> ProcessPlan:
 # -- reading the argv -----------------------------------------------------
 
 
-def _stand_in(process: SidecarProcess, reads: list[str]) -> list[str]:
+def _stand_in(
+    process: SidecarProcess, reads: list[str], writes: Sequence[str] = ()
+) -> list[str]:
     """An argv standing in for the sidecar, naming every pipe it is given."""
     argv = ["ffrwd-wasm"]
     for path in reads or ["pipe:0"]:
