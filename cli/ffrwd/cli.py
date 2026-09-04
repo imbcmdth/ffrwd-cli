@@ -1661,15 +1661,21 @@ def _run_plan(
     code = _provision_nn(plan, console)
     if code != 0:
         return code
-    result = execute_plan(
-        plan,
-        sidecar_argv=functools.partial(wasm.sidecar_argv, jobs=args.jobs),
-        timeout=timeout,
-        overwrite=args.overwrite,
-        echo=_echo_member,
-        players=players,
-        show_only=args.show_only,
-    )
+    try:
+        result = execute_plan(
+            plan,
+            sidecar_argv=functools.partial(wasm.sidecar_argv, jobs=args.jobs),
+            timeout=timeout,
+            overwrite=args.overwrite,
+            echo=_echo_member,
+            players=players,
+            show_only=args.show_only,
+        )
+    except FfrwdError as err:
+        # Rendering the argv or spawning a stage, not the query text:
+        # `compile` prints the same refusal through `render_plan`.
+        _print_error(err, source=args.query, packages=packages, query=query)
+        return 1
     _debug_dump_stderr(result)
     if result.overflow is not None:
         print(f"error: {result.overflow}", file=sys.stderr)

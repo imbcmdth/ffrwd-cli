@@ -25,10 +25,13 @@ from ffrwd.compiler import Compiled
 from ffrwd.execute import PlanResult
 from ffrwd.ir import Graph, Node, Output, RowsSink, SinkUnit
 from ffrwd.processes import (
+    PIPE,
     FfmpegProcess,
     ModuleShape,
     ProcessPlan,
     SidecarProcess,
+    StreamEdge,
+    VideoFormat,
     external_ids,
     partition,
 )
@@ -1483,6 +1486,64 @@ def test_show_refuses_a_plan_that_writes_no_video(
     captured = capsys.readouterr()
     assert code == 1
     assert "NOTHING_TO_SHOW" in captured.err
+
+
+def _fanning_sidecar_plan() -> ProcessPlan:
+    """A sidecar handing two stream edges off the one stdout it has.
+
+    Ordinary partitioning never produces this -- a stream with more than one
+    consumer gets a `split` node first -- but a sidecar reaching a second
+    consumer some other way (a live relay, say) still reduces to this same
+    shape: `plan_argv` refuses it, since a module's frames leave through its
+    one stdout and stdout has only one handle to give.
+    """
+    def _video(ref: str) -> Output:
+        return Output(ref=ref, type="video", name=None, metadata={})
+
+    decode = Graph(input_paths=["a.mp4"], sources={"a": 0})
+    decode.sinks = [SinkUnit(outputs=[_video("src:a:v:0")], path=PIPE)]
+    sink1 = Graph(input_paths=[PIPE], sources={"s": 0})
+    sink1.sinks = [SinkUnit(outputs=[_video("src:s:v:0")], path="one.mp4")]
+    sink2 = Graph(input_paths=[PIPE], sources={"s": 0})
+    sink2.sinks = [SinkUnit(outputs=[_video("src:s:v:0")], path="two.mp4")]
+    return ProcessPlan(
+        processes=(
+            FfmpegProcess(id="decode", graph=decode),
+            SidecarProcess(id="sidecar0", module="m0.wasm", node="m0"),
+            FfmpegProcess(id="sink1", graph=sink1),
+            FfmpegProcess(id="sink2", graph=sink2),
+        ),
+        edges=(
+            StreamEdge(source="decode", target="sidecar0", ref="src:a:v:0", format=VideoFormat()),
+            StreamEdge(source="sidecar0", target="sink1", ref="m0", format=VideoFormat()),
+            StreamEdge(source="sidecar0", target="sink2", ref="m0", format=VideoFormat()),
+        ),
+    )
+
+
+def test_run_prints_a_plan_refusal_instead_of_a_traceback(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A refusal raised while rendering a plan's argv reaches `run` from
+    inside `execute_plan` (`plan_argv`, unmocked, does the actual raising
+    here), same as it reaches `compile` from inside `render_plan` -- and
+    must print the same typed `error:` line at the same exit code, not an
+    uncaught traceback."""
+    monkeypatch.setattr(cli.binaries, "ffmpeg_path", lambda: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(
+        cli,
+        "compile_all",
+        lambda text, **kw: Compiled([_sinked_graph("sink.mkv")], plan=_fanning_sidecar_plan()),
+    )
+
+    code = cli.main(["run", SINKED_QUERY])
+    captured = capsys.readouterr()
+    assert code == 1
+    assert captured.err.strip() == (
+        "error: INTERNAL: process 'sidecar0' writes 2 streams, but only its "
+        "own stdout is wired (hint: a sidecar writing more than one stream "
+        "needs argv that can spell a named pipe path)"
+    )
 
 
 # --- --jobs, the worker-thread cap ------------------------------------------
