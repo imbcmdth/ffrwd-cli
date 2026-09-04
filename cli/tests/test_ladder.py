@@ -1,4 +1,5 @@
-"""End-to-end proof for the ABR-ladder recipes (docs/examples.md 104-110).
+"""End-to-end proof for the ABR-ladder recipes (docs/examples.md 104-110,
+123-125).
 
 Builds one real HLS ladder with the compiler (the same shape recipe 104's
 own query produces, run for real rather than only compiled), then executes
@@ -10,8 +11,11 @@ row reads back from an HLS master too, video-only variants and all -- see
 the notes on `_LADDER_DEMUXED_SQL` and `_LADDER_DEMUXED_HLS_SQL`. Two more,
 already built by `scripts/gen_fixtures.py` rather than by this module,
 prove the read side of an audio-only master and a HYBRID one (a variant
-that both muxes its own audio and names an AUDIO group). One fixture
-(av.mp4), single-digit seconds.
+that both muxes its own audio and names an AUDIO group). Recipes 123-125
+run the three shapes a stream column's cardinality decides -- a ladder's
+rows carried through a CTE, one audio repeated over two rungs, and a
+COALESCE over two nullable cells -- and read every master back with the
+compiler's own probe. One fixture (av.mp4), single-digit seconds.
 """
 
 from __future__ import annotations
@@ -129,6 +133,63 @@ COPY (
   WHERE v.height >= 480 AND a.height IS NULL
 ) TO ('out-' || v.height::text || 'p-' || a.bandwidth::text || '.mp4')
   WITH (video_codec 'libx264', crf 20, audio_codec 'aac')
+"""
+
+
+# Recipe 123: the muxed ladder's own rows, carried through two CTEs and
+# joined on keys that never meet, so what was two muxed variants comes out as
+# two video-only ones plus the audio rendition of the 720 rung.
+_RE_LAY_DEMUXED_SQL = """\
+COPY (
+  WITH vid AS (
+    SELECT r.video[1] AS v, r.height AS rung
+    FROM input('{ladder}') r
+  ),
+  aud AS (
+    SELECT s.audio[1] AS t, 1000 + s.bandwidth AS rung
+    FROM input('{ladder}') s
+    WHERE s.height = 720
+  )
+  SELECT vid.v, aud.t
+  FROM vid FULL JOIN aud ON vid.rung = aud.rung
+) TO 'out/master.m3u8' WITH (
+  format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4',
+  video_codec 'libx264', audio_codec 'aac'
+)
+"""
+
+# Recipe 124: two rungs from a series, and one audio column that does not
+# vary per row -- the same stream on both variants, split once.
+_MUXED_FROM_ONE_FILE_SQL = """\
+COPY (
+  SELECT scale(f.video[1], ARRAY[320, 160][i.i], -2), f.audio[1]
+  FROM input('{av}') f, generate_series(1, 2) i
+) TO 'out/master.m3u8'
+  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod',
+        video_codec 'libx264', audio_codec 'aac')
+"""
+
+# Recipe 125: a hybrid master off the demuxed DASH ladder -- muxed variants
+# whose audio COALESCE took from the audio-only rendition, plus that
+# rendition as its own row.
+_HYBRID_SQL = """\
+COPY (
+  WITH vid AS (
+    SELECT v.video[1] AS v, a.audio[1] AS a, v.height AS rung
+    FROM input('{ladder}') v, input('{ladder}') a
+    WHERE v.height IS NOT NULL AND a.height IS NULL
+  ),
+  aud AS (
+    SELECT b.audio[1] AS t, 1000 + b.bandwidth AS rung
+    FROM input('{ladder}') b
+    WHERE b.height IS NULL
+  )
+  SELECT vid.v, COALESCE(vid.a, aud.t)
+  FROM vid FULL JOIN aud ON vid.rung = aud.rung
+) TO 'out/master.m3u8' WITH (
+  format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4',
+  video_codec 'libx264', audio_codec 'aac'
+)
 """
 
 
@@ -336,3 +397,67 @@ def test_a_hybrid_hls_master_keeps_its_own_audio_beside_the_group(
     assert len(audio_only) == 1
     assert [s.type for s in audio_only[0].streams] == ["audio"]
     assert audio_only[0].name == "audio_2"
+
+
+def _rows(master: Path) -> list[tuple[int | None, list[str]]]:
+    """One master read back the way a query reads it: each rendition row's
+    height and the kinds it carries, in manifest order."""
+    clear_cache()
+    result = probe(str(master))
+    assert isinstance(result, ProbeResult)
+    return [(r.height, [s.type for s in r.streams]) for r in result.renditions]
+
+
+@pytest.mark.exec
+def test_a_muxed_ladder_re_lays_as_a_demuxed_master(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _fixtures: None
+) -> None:
+    """Recipe 123: a rendition table read through a CTE is one row per rung,
+    so the muxed ladder's two rungs become two video-only variants and the
+    720 rung's audio becomes the group's own row."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "out").mkdir()
+    ladder = (FIXTURES_DIR / "ladder" / "master.m3u8").as_posix()
+
+    assert cli.main(["run", _RE_LAY_DEMUXED_SQL.format(ladder=ladder), "-y"]) == 0
+    master = tmp_path / "out" / "master.m3u8"
+    assert master.exists()
+    assert _rows(master) == [(1080, ["video"]), (720, ["video"]), (None, ["audio"])]
+
+
+@pytest.mark.exec
+def test_one_file_becomes_a_muxed_ladder_sharing_one_audio(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _fixtures: None
+) -> None:
+    """Recipe 124: the file's one audio track is a single stream over a
+    two-row relation, so both variants carry it -- muxed, not a group."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "out").mkdir()
+    av = (FIXTURES_DIR / "av.mp4").as_posix()
+
+    assert cli.main(["run", _MUXED_FROM_ONE_FILE_SQL.format(av=av), "-y"]) == 0
+    master = tmp_path / "out" / "master.m3u8"
+    assert master.exists()
+    assert _rows(master) == [(240, ["video", "audio"]), (120, ["video", "audio"])]
+
+
+@pytest.mark.exec
+def test_a_hybrid_master_muxes_its_variants_and_names_a_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _fixtures: None
+) -> None:
+    """Recipe 125: COALESCE over two nullable stream cells gives every
+    variant an audio cell, and the audio-only row keeps a row of its own --
+    the hybrid shape `test_a_hybrid_hls_master_keeps_its_own_audio_beside_
+    the_group` reads back from a fixture, here WRITTEN by a query."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "out").mkdir()
+    ladder = (FIXTURES_DIR / "ladder-demuxed" / "master.mpd").as_posix()
+
+    assert cli.main(["run", _HYBRID_SQL.format(ladder=ladder), "-y"]) == 0
+    master = tmp_path / "out" / "master.m3u8"
+    assert master.exists()
+    assert _rows(master) == [
+        (1080, ["video", "audio"]),
+        (720, ["video", "audio"]),
+        (None, ["audio"]),
+    ]

@@ -793,9 +793,9 @@ Comma between items is a cross join with real multiplicity.
 rows included), CTEs and views, struct row tables, `generate_series` -
 and nowhere else: `INNER`, `LEFT [OUTER]`, `FULL [OUTER]`, each with
 its own `ON`. An outer join's gap side has NULL streams; fill with
-`COALESCE` and a generated source ([rows.md](rows.md#joins)), or
-select the gaps at a manifest destination, where they mean absence
-(see Destinations and options).
+`COALESCE` and another stream or a generated source
+([rows.md](rows.md#joins)), or select the gaps at a manifest
+destination, where they mean absence (see Destinations and options).
 
 ### input() options
 

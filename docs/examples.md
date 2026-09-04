@@ -3318,3 +3318,128 @@ $ ffrwd compile -f query.sql
 `-rows 0` and `-rows 1` say whose rows each document holds, counted the way `-rows-from` counts: slot 0 is `captions`, slot 1 the `fauxlate` reading its rows. A region writing ONE document needs no such flag - it is the only rows the line writes - which is the spelling [recipe 113](#113-translate-captions-as-they-are-produced) shows. The two documents leave over two named pipes into the one ffmpeg that muxes them, which is why this prints as a listing rather than a pipeline; `ffrwd run` executes it.
 
 The tracks come back as the titles name them: `unnest(f.cues['speech'])` is what `captions` wrote and `unnest(f.cues['translated'])` the same cues with the word rule applied ([recipe 118](#118-write-rows-as-titled-tracks)). Three describers and three rows functions over them are six documents off one region, written the same way.
+
+## 123. Re-lay a muxed ladder as a demuxed one
+
+A muxed rendition carries its own audio; a demuxed master names the audio
+once and points every video variant at it. Two CTEs say that - one row per
+video rung, one row for the audio - joined on rung keys that never meet, so
+the result is the rows of both sides and nothing paired. A CTE's stream
+column is a row column like any other, one cell per row of its own relation,
+and the join's unmatched rows are the NULLs the variant map reads as an
+absent kind:
+
+```pgsql
+COPY (
+  WITH vid AS (
+    SELECT r.video[1] AS v, r.height AS rung
+    FROM input(:'ladder') r
+  ),
+  aud AS (
+    SELECT s.audio[1] AS t, 1000 + s.bandwidth AS rung
+    FROM input(:'ladder') s
+    WHERE s.height = 720
+  )
+  SELECT vid.v, aud.t
+  FROM vid FULL JOIN aud ON vid.rung = aud.rung
+) TO :'dest' WITH (
+  format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4',
+  video_codec 'libx264', audio_codec 'aac'
+)
+```
+
+```
+$ ffrwd compile -f query.sql -v ladder=tests/fixtures/ladder/master.m3u8 -v dest=out/master.m3u8
+ffmpeg -i tests/fixtures/ladder/master.m3u8 -map 0:v:0 -map 0:v:1 -map 0:a:1 -f hls \
+  -hls_time 2 -hls_playlist_type vod -hls_segment_type fmp4 -c:0 libx264 -c:1 libx264 \
+  -c:2 aac -g:0 30 -g:1 30 -keyint_min:0 30 -keyint_min:1 30 -sc_threshold:0 0 \
+  -sc_threshold:1 0 -var_stream_map \
+  'v:0,agroup:aud,name:1080p v:1,agroup:aud,name:720p a:0,agroup:aud,name:a0,'\
+'default:yes' -master_pl_name master.m3u8 -hls_segment_filename out/v%v/segment_%d.m4s \
+  -hls_fmp4_init_filename init.mp4 out/v%v/index.m3u8
+```
+
+Reach for this to publish someone else's muxed ladder as a demuxed one -
+one audio rendition instead of a copy per rung - without writing the
+variant map by hand. `WHERE s.height = 720` is which rung's audio the
+group takes; drop it and the ladder's every rung would contribute one.
+
+## 124. A muxed ladder from one file
+
+The ordinary HLS job: two rungs off one file, each variant carrying the same
+audio. `generate_series` is the two rows, `ARRAY[...][i.i]` the width each
+takes, and `f.audio[1]` is a single stream over a two-row relation - one
+value on every row, the same reading a scalar gets beside any other join.
+Two rows name it, so the split pass hands each variant its own pad:
+
+```pgsql
+COPY (
+  SELECT scale(f.video[1], ARRAY[320, 160][i.i], -2), f.audio[1]
+  FROM input('tests/fixtures/av.mp4') f, generate_series(1, 2) i
+) TO 'out/master.m3u8'
+  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod',
+        video_codec 'libx264', audio_codec 'aac')
+```
+
+```
+$ ffrwd compile -f query.sql
+ffmpeg -i tests/fixtures/av.mp4 -filter_complex \
+  '[0:v:0]split=2[src_f_v_0_split0][src_f_v_0_split1];'\
+'[src_f_v_0_split0]scale=width=320:height=-2[out0];'\
+'[src_f_v_0_split1]scale=width=160:height=-2[out1];[0:a:0]asplit=2[out2][out3]' -map \
+  '[out0]' -map '[out1]' -map '[out2]' -map '[out3]' -f hls -hls_time 2 \
+  -hls_playlist_type vod -c:0 libx264 -c:1 libx264 -c:2 aac -c:3 aac -g:0 30 -g:1 30 \
+  -keyint_min:0 30 -keyint_min:1 30 -sc_threshold:0 0 -sc_threshold:1 0 -var_stream_map \
+  'v:0,a:0,name:240p v:1,a:1,name:120p' -master_pl_name master.m3u8 \
+  -hls_segment_filename out/v%v/segment_%d.ts out/v%v/index.m3u8
+```
+
+Reach for this for the plain ABR ladder, where the audio is encoded once and
+muxed into every rung. One `asplit` feeds both variants; a rung that wants
+its own audio treatment selects that instead, and the same rule applies to
+it.
+
+## 125. A hybrid master: muxed variants and an audio group
+
+A hybrid master is both shapes at once: variants that mux their own audio,
+plus an audio rendition a player can switch to. `COALESCE` over two stream
+columns takes the first non-NULL per row - the muxed rows keep their own
+audio, and the audio-only row, which has none, takes the group's:
+
+```pgsql
+COPY (
+  WITH vid AS (
+    SELECT v.video[1] AS v, a.audio[1] AS a, v.height AS rung
+    FROM input(:'ladder') v, input(:'ladder') a
+    WHERE v.height IS NOT NULL AND a.height IS NULL
+  ),
+  aud AS (
+    SELECT b.audio[1] AS t, 1000 + b.bandwidth AS rung
+    FROM input(:'ladder') b
+    WHERE b.height IS NULL
+  )
+  SELECT vid.v, COALESCE(vid.a, aud.t)
+  FROM vid FULL JOIN aud ON vid.rung = aud.rung
+) TO :'dest' WITH (
+  format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4',
+  video_codec 'libx264', audio_codec 'aac'
+)
+```
+
+```
+$ ffrwd compile -f query.sql -v ladder=tests/fixtures/ladder-demuxed/master.mpd -v dest=out/master.m3u8
+ffmpeg -i tests/fixtures/ladder-demuxed/master.mpd -filter_complex \
+  '[0:a:0]asplit=2[out2][out3]' -map 0:v:0 -map 0:v:1 -map '[out2]' -map '[out3]' -map \
+  0:a:0 -f hls -hls_time 2 -hls_playlist_type vod -hls_segment_type fmp4 -c:0 libx264 \
+  -c:1 libx264 -c:2 aac -c:3 aac -c:4 aac -g:0 30 -g:1 30 -keyint_min:0 30 -keyint_min:1 \
+  30 -sc_threshold:0 0 -sc_threshold:1 0 -var_stream_map \
+  'v:0,a:0,agroup:aud,name:1080p v:1,a:1,agroup:aud,name:720p a:2,agroup:aud,name:a0,'\
+'default:yes' -master_pl_name master.m3u8 -hls_segment_filename out/v%v/segment_%d.m4s \
+  -hls_fmp4_init_filename init.mp4 out/v%v/index.m3u8
+```
+
+Reach for this when a player has to be given both - a variant it can play
+alone and an audio rendition it can switch to. Every COALESCE argument is
+one kind of track, and a row where all of them are NULL is a row with no
+stream of that kind, which the variant map writes as an absent one rather
+than a rejection.

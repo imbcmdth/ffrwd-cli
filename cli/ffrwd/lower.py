@@ -1202,6 +1202,25 @@ def _written_json_fields(fields: Sequence[tuple[str, str]]) -> str:
     return "rows of " + ", ".join(f"{name} ({kind or 'no type'})" for name, kind in fields)
 
 
+def _fill_call(node: exp.Expr) -> _Call | None:
+    """The generated stand-in `node` spells -- ``ffmpeg.<source>()``,
+    ``ffrwd.empty_captions()`` -- or None, which makes it a stream
+    expression like any other. A source takes no stream, so a call with a
+    positional argument is a filter over one, not a stand-in."""
+    call = _call_parts(node)
+    if call is None or call.args or not (call.namespaced or call.is_macro):
+        return None
+    return call
+
+
+def _coalesce_label(node: exp.Expr) -> str:
+    """How a rejection names a COALESCE argument: as it was written."""
+    written = _unwrap(node)
+    if isinstance(written, exp.Column | exp.Bracket):
+        return written.sql()
+    return _describe(written)
+
+
 def _describe(node: exp.Expr) -> str:
     """Short human name for an expression that cannot produce a stream."""
     if isinstance(node, exp.Literal):
@@ -3401,6 +3420,12 @@ class _Lowerer:
         # rows off the SELECT list rather than named stream parameters: a
         # multi-row relation is accepted here too, the way a manifest's is.
         self.row_reading_sink = False
+        # True while a CTE body lowers. The bodies are lowered once, before
+        # any COPY, so the reader is not known here: a stream column records
+        # one cell per row of the body's relation -- NULL where the row
+        # carries no track of the kind -- and each sink decides what a NULL
+        # cell means (an absent variant, an empty table cell, a rejection).
+        self.cte_body = False
         # Node id -> one {"row": int, "rendition": {...}} per pad, in the
         # same row-major order `_packet_sink_pads` builds a row-reading
         # sink's pads in. Read there to fold `row`/`rendition` into each
@@ -3412,36 +3437,49 @@ class _Lowerer:
 
     # -- entry point ------------------------------------------------------
 
-    def run(self) -> Graph:
-        """Lower every CTE/view once, then one :class:`SinkUnit` per COPY.
+    def _lower_ctes(self) -> None:
+        """Lower every CTE body once, recording what each one exposes.
 
         The bindings come first and are shared: ``res.ctes`` holds a script's
-        views AND every COPY's own ``WITH``, in written order, and
-        each is lowered into THIS graph exactly once. A view read by three
-        COPYs therefore mints its nodes once and hands the same refs to all
-        three — the fan-out is the split pass's ordinary business, which is
-        the whole point of the ABR ladder compiling to one ffmpeg command.
+        views AND every COPY's own ``WITH``, in written order, and each is
+        lowered into THIS graph exactly once. A view read by three COPYs
+        therefore mints its nodes once and hands the same refs to all three --
+        the fan-out is the split pass's ordinary business, which is the whole
+        point of the ABR ladder compiling to one ffmpeg command.
+
+        `cte_body` is set for the duration: lowered once, before any COPY, a
+        body has no reader to ask, so its stream columns record one cell per
+        row of its own relation.
+        """
+        self.cte_body = True
+        try:
+            for name, body in self.res.ctes.items():
+                self.branch_values = {}
+                self.branch_rows_columns = {}
+                self.branch_cue_columns = set()
+                self.cte_columns[name] = tuple(
+                    self._lower_query(union_branches(body), body, tags="rows")
+                )
+                self.cte_values[name] = self.branch_values
+                self.cte_rows_columns[name] = self.branch_rows_columns
+                self.cte_cue_columns[name] = frozenset(self.branch_cue_columns)
+                self.branch_values = {}
+                self.branch_rows_columns = {}
+                self.branch_cue_columns = set()
+                self._harvest_cte_tags(body)
+                self._harvest_cte_dispositions(body)
+        finally:
+            self.cte_body = False
+
+    def run(self) -> Graph:
+        """Lower every CTE/view once, then one :class:`SinkUnit` per COPY.
 
         ``res.select`` / ``res.branches`` are read for the BARE-SELECT case
         only (a query with no COPY at all, which is the one unit whose path
         is None). When there are sinks they are just a mirror of ``sinks[0]``
         and walking them again would lower the first group twice.
         """
-        for name, body in self.res.ctes.items():
-            self.branch_values = {}
-            self.branch_rows_columns = {}
-            self.branch_cue_columns = set()
-            self.cte_columns[name] = tuple(
-                self._lower_query(union_branches(body), body, tags="rows")
-            )
-            self.cte_values[name] = self.branch_values
-            self.cte_rows_columns[name] = self.branch_rows_columns
-            self.cte_cue_columns[name] = frozenset(self.branch_cue_columns)
-            self.branch_values = {}
-            self.branch_rows_columns = {}
-            self.branch_cue_columns = set()
-            self._harvest_cte_tags(body)
-            self._harvest_cte_dispositions(body)
+        self._lower_ctes()
         if self.res.sinks:
             self.graph.sinks = self._lower_sinks()
             if self.fanout_count is None:
@@ -4263,14 +4301,20 @@ class _Lowerer:
                 )
             row_set = value.is_array and column.splat and len(streams) == cardinality
             if cardinality > 1 and not row_set:
-                raise _error(
-                    ErrorCode.ROW_COUNT_MISMATCH,
-                    f"'{label}' does not carry one stream per row, and each "
-                    f"row of {subject} is one variant map entry",
-                    anchor,
-                    hint="select a row column (a joined CTE's, an unnest "
-                    "table's); a gathered array belongs to a single file",
-                )
+                if value.is_array or len(streams) != 1:
+                    raise _error(
+                        ErrorCode.ROW_COUNT_MISMATCH,
+                        f"'{label}' does not carry one stream per row, and each "
+                        f"row of {subject} is one variant map entry",
+                        anchor,
+                        hint="select a row column (a joined CTE's, an unnest "
+                        "table's), or a single stream, which every row "
+                        "repeats; a gathered array belongs to a single file",
+                    )
+                # One value over N rows is that value on every row, which is
+                # what puts the same audio under every video rung.
+                streams = streams * cardinality
+                column = replace(column, value=_array(value.type, streams), splat=True)
             if cardinality == 1 and len(streams) > 1:
                 raise _error(
                     ErrorCode.ROW_COUNT_MISMATCH,
@@ -5708,7 +5752,7 @@ class _Lowerer:
                 return True
             if isinstance(binding, _CteBinding):
                 column = self._cte_column(binding, _fold(sub.this))
-                if column is not None and column.splat and column.value.is_array:
+                if column is not None and self._cte_cell_column(binding, column):
                     return True
         return False
 
@@ -6420,7 +6464,7 @@ class _Lowerer:
                             select,
                         ),
                         cardinality,
-                        splat=column.splat,
+                        splat=self._cte_cell_column(binding, column),
                     )
                     for column in binding.columns
                 ]
@@ -10384,14 +10428,21 @@ class _Lowerer:
         as every other stream column: bare ``r.video`` is the whole array,
         ``r.video[k]`` names one element of it.
 
-        A manifest destination reads this differently (:meth:`_rendition_row_cells`):
-        each ladder rung is its own variant map entry, so the column has to
-        stay one cell PER ROW -- an audio-only rung's video cell is NULL,
-        not absent, the same gap a FULL JOIN's unmatched row leaves.
+        A reader that counts rows reads it per ROW instead
+        (:meth:`_rendition_row_cells`): a manifest destination, whose every
+        row is one variant map entry; a row-reading sink; and a CTE body,
+        which carries its rows to whichever of those reads it later. An
+        audio-only rung's video cell is NULL there, not absent -- the same
+        gap a FULL JOIN's unmatched row leaves.
+
+        A rendition carries at most one stream of a kind, so only ``[1]``
+        can name one per row; every other subscript keeps the reading above,
+        which is where its bounds check lives.
         """
         kind = _ARRAY_COLUMNS[name]
-        if self.manifest is not None or self.row_reading_sink:
-            return self._rendition_row_cells(binding, kind, index)
+        per_row = self.manifest is not None or self.row_reading_sink or self.cte_body
+        if per_row and index in (None, 1):
+            return self._rendition_row_cells(binding, kind)
         streams = [
             row.kinds[kind] for row in binding.rows if row is not None and kind in row.kinds
         ]
@@ -10409,22 +10460,19 @@ class _Lowerer:
             )
         return _scalar(streams[index - 1])
 
-    def _rendition_row_cells(
-        self, binding: _RowBinding, kind: StreamType, index: int | None
-    ) -> _Value:
-        """``<alias>.video``/``.audio`` at a manifest destination: one cell
-        per ladder rung, in row order -- a bare column and its ``[1]``
-        subscript read the same thing, since a rung carries at most one
-        stream of a kind. A rung without that kind (an audio-only rendition's
-        ``.video``) contributes the NULL sentinel a manifest's variant map
-        already knows how to read as an absent cell, exactly like an
-        unmatched FULL JOIN row.
+    def _rendition_row_cells(self, binding: _RowBinding, kind: StreamType) -> _Value:
+        """``<alias>.video``/``.audio`` as one cell per ladder rung, in row
+        order -- a bare column and its ``[1]`` subscript read the same thing,
+        since a rung carries at most one stream of a kind. A rung without
+        that kind (an audio-only rendition's ``.video``) contributes the NULL
+        sentinel a manifest's variant map already knows how to read as an
+        absent cell, exactly like an unmatched FULL JOIN row.
         """
         return _array(
             kind,
             (
                 row.kinds[kind]
-                if row is not None and kind in row.kinds and index in (None, 1)
+                if row is not None and kind in row.kinds
                 else _Stream(ref=_NULL_STREAM_REF, type=kind, source=None)
                 for row in binding.rows
             ),
@@ -10637,18 +10685,42 @@ class _Lowerer:
                 return other, track
         return None, None
 
-    # -- COALESCE(<row>, <fill>) -----------------
+    # -- COALESCE(<nullable cell>, <stand-in>) -----------------
 
     def _lower_coalesce(self, node: exp.Expr, env: _Env, select: exp.Select) -> _Value:
-        """The accepted spelling for a nullable track column: fill its gaps.
+        """The accepted spelling for a nullable stream cell: fill its gaps.
+
+        Two readings of one rule, the first non-NULL per row. A track-row
+        alias knows its own relation, so its gaps are filled row by row
+        against the row that DID match (:meth:`_lower_row_coalesce`). Every
+        other nullable cell -- a CTE's or subquery's stream column, a
+        rendition array subscript -- carries its gaps in the value itself
+        (:meth:`_lower_cell_coalesce`), which is where a second nullable
+        column can stand in for the first.
+        """
+        arguments = self._coalesce_arguments(node, select)
+        binding = self._coalesce_binding(arguments[0], env)
+        if binding is None:
+            return self._lower_cell_coalesce(arguments, env, node, select)
+        return self._lower_row_coalesce(binding, arguments[1], env, node, select)
+
+    def _lower_row_coalesce(
+        self,
+        binding: _RowBinding,
+        fill: exp.Expr,
+        env: _Env,
+        node: exp.Expr,
+        select: exp.Select,
+    ) -> _Value:
+        """A track-row alias's gaps, filled row by row.
 
         The result is the same N-element array ``<alias>`` is, in the
-        same row order — every gap replaced by a generated stand-in. Only the
-        gaps mint anything: a join with no unmatched rows compiles to exactly
-        the command the bare column would -- consume-once here means "generate
+        same row order — every gap replaced by what stands in for it: a cell
+        of another stream column, or a generated stand-in. Only the gaps mint
+        anything: a join with no unmatched rows compiles to exactly the
+        command the bare column would -- consume-once here means "generate
         nothing nobody needed".
         """
-        binding, fill = self._coalesce_parts(node, env, select)
         relation = binding.relation
         if not relation.tuples:
             raise _error(
@@ -10661,34 +10733,166 @@ class _Lowerer:
                 hint="an empty row set would select no streams; widen the WHERE, "
                 "or check that the file has the tracks you expect",
             )
-        streams: list[_Stream] = []
-        for row in relation.tuples:
-            track = _track_of(row, binding.alias)
-            if track is not None:
-                # The real track goes through `_access` exactly as a bare
-                # a bare `<alias>` would, so the input's WHERE window (and the
-                # caption-seek rejection) still applies to it.
-                streams.append(
-                    self._access(
-                        env, binding.source, _scalar(track.stream), node, select
-                    ).streams[0]
+        cardinality = len(relation.tuples)
+        matched = [
+            self._matched_stream(binding, row, env, node, select)
+            for row in relation.tuples
+        ]
+        fill_call = _fill_call(fill)
+        if fill_call is None:
+            stand_in = self._lower_expr(fill, env, select)
+            self._check_coalesce_fill(
+                binding.type, stand_in, binding.alias, fill, select
+            )
+            self._check_coalesce_width(stand_in, cardinality, fill, select)
+            streams = [
+                stream
+                if stream is not None
+                else stand_in.at(min(position, len(stand_in.streams) - 1))
+                for position, stream in enumerate(matched)
+            ]
+        else:
+            streams = [
+                stream
+                if stream is not None
+                else self._lower_fill(
+                    fill,
+                    fill_call,
+                    binding.type,
+                    binding.alias,
+                    self._paired_row(relation, row, binding.alias)[1],
+                    node,
+                    select,
                 )
-                continue
-            _, paired = self._paired_row(relation, row, binding.alias)
-            streams.append(self._lower_fill(fill, binding, paired, node, select))
+                for row, stream in zip(relation.tuples, matched, strict=True)
+            ]
         return _array(binding.type, streams)
 
-    def _coalesce_parts(
-        self, node: exp.Expr, env: _Env, select: exp.Select
-    ) -> tuple[_RowBinding, exp.Expr]:
-        """``(the track column's row table, the fill expression)``, or a rejection.
+    def _matched_stream(
+        self,
+        binding: _RowBinding,
+        row: _RowTuple,
+        env: _Env,
+        node: exp.Expr,
+        select: exp.Select,
+    ) -> _Stream | None:
+        """One row's own track, or None where the join left a gap.
 
-        Deliberately narrow: COALESCE exists in this dialect for exactly one
-        job — standing something in for an outer join's missing track — so it
-        takes a track-row stream column and one fill, and nothing else. It
-        creates no nodes, which is what lets :meth:`_classify` call it on an
-        argument before deciding whether to lower it.
+        The real track goes through `_access` exactly as a bare ``<alias>``
+        would, so the input's WHERE window (and the caption-seek rejection)
+        still applies to it.
         """
+        track = _track_of(row, binding.alias)
+        if track is None:
+            return None
+        return self._access(
+            env, binding.source, _scalar(track.stream), node, select
+        ).streams[0]
+
+    def _lower_cell_coalesce(
+        self,
+        arguments: list[exp.Expr],
+        env: _Env,
+        node: exp.Expr,
+        select: exp.Select,
+    ) -> _Value:
+        """Any other nullable stream cell's gaps: the first non-NULL per row.
+
+        Both arguments lower as they stand, so each is already one cell per
+        row (or one value the rows repeat), and the result is the first
+        column with every gap taken from the second. An all-NULL row stays
+        NULL -- a manifest reads it as an absent stream kind, the same as any
+        other gap. A generated stand-in is still a legal second argument, and
+        then only the gaps mint one.
+        """
+        first = self._lower_expr(arguments[0], env, select)
+        label = _coalesce_label(arguments[0])
+        if not first.streams:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "COALESCE's first argument is a nullable stream cell, got "
+                f"{_describe(arguments[0])}",
+                arguments[0],
+                fallback=select,
+                hint=_COALESCE_HINT,
+            )
+        second = arguments[1]
+        fill_call = _fill_call(second)
+        cardinality = len(first.streams)
+        filled: list[_Stream] = []
+        if fill_call is not None:
+            filled = [
+                cell
+                if cell.ref != _NULL_STREAM_REF
+                else self._lower_fill(
+                    second, fill_call, first.type, label, None, node, select
+                )
+                for cell in first.streams
+            ]
+        else:
+            other = self._lower_expr(second, env, select)
+            self._check_coalesce_fill(first.type, other, label, second, select)
+            cardinality = max(cardinality, len(other.streams))
+            self._check_coalesce_width(first, cardinality, arguments[0], select)
+            self._check_coalesce_width(other, cardinality, second, select)
+            for position in range(cardinality):
+                cell = first.at(min(position, len(first.streams) - 1))
+                if cell.ref == _NULL_STREAM_REF:
+                    cell = other.at(min(position, len(other.streams) - 1))
+                filled.append(cell)
+        if cardinality == 1 and not first.is_array:
+            return _scalar(filled[0])
+        return _array(first.type, filled)
+
+    def _check_coalesce_fill(
+        self,
+        kind: StreamType,
+        other: _Value,
+        label: str,
+        node: exp.Expr,
+        select: exp.Select,
+    ) -> None:
+        """What stands in for a gap is a stream of the SAME kind as the cell
+        it fills: another column's, or a generated one."""
+        if not other.streams:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"a COALESCE fill is a stream or a generated stand-in, and "
+                f"'{_coalesce_label(node)}' produces neither",
+                node,
+                fallback=select,
+                hint=self._fill_hint(kind, label),
+            )
+        if other.type != kind:
+            raise _error(
+                ErrorCode.UDF_ARG_TYPE,
+                f"COALESCE stands in for one track: '{label}' is {kind}, "
+                f"and '{_coalesce_label(node)}' is {other.type}",
+                node,
+                fallback=select,
+                hint=self._fill_hint(kind, label),
+            )
+
+    def _check_coalesce_width(
+        self, value: _Value, cardinality: int, node: exp.Expr, select: exp.Select
+    ) -> None:
+        """A COALESCE argument is one cell per row, or one stream every row
+        repeats -- nothing in between."""
+        if len(value.streams) in (1, cardinality):
+            return
+        raise _error(
+            ErrorCode.ROW_COUNT_MISMATCH,
+            f"'{_coalesce_label(node)}' carries {len(value.streams)} streams, "
+            f"and COALESCE is over {cardinality} rows",
+            node,
+            fallback=select,
+            hint="every argument is one cell per row, or one stream the rows "
+            "repeat",
+        )
+
+    def _coalesce_arguments(self, node: exp.Expr, select: exp.Select) -> list[exp.Expr]:
+        """COALESCE's two arguments, or a rejection. Creates no nodes, which
+        is what lets :meth:`_classify` read the type without lowering it."""
         arguments = [
             argument
             for argument in [node.this, *node.expressions]
@@ -10703,27 +10907,27 @@ class _Lowerer:
                 fallback=select,
                 hint=_COALESCE_HINT,
             )
-        column = _unwrap(arguments[0])
-        binding: _Binding | None = None
-        if isinstance(column, exp.Column):
-            table_node = column.args.get("table")
-            if table_node is not None:
-                binding = env.bindings.get(_fold(table_node))
+        return arguments
+
+    def _coalesce_binding(self, argument: exp.Expr, env: _Env) -> _RowBinding | None:
+        """The track-row table a bare ``<alias>`` first argument names, whose
+        own relation says which rows are gaps. None for every other nullable
+        cell, which carries its gaps in the value itself."""
+        column = _unwrap(argument)
+        if not isinstance(column, exp.Column):
+            return None
+        table_node = column.args.get("table")
+        binding = env.bindings.get(_fold(table_node)) if table_node is not None else None
         if not isinstance(binding, _RowBinding) or _fold(column.this) != ROW_STREAM:
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL,
-                "COALESCE's first argument is a track-row stream column, got "
-                f"{_describe(arguments[0])}",
-                arguments[0],
-                fallback=select,
-                hint=_COALESCE_HINT,
-            )
-        return binding, arguments[1]
+            return None
+        return binding
 
     def _lower_fill(
         self,
         node: exp.Expr,
-        binding: _RowBinding,
+        call: _Call,
+        kind: StreamType,
+        label: str,
         paired: _TrackRow | None,
         anchor: exp.Expr,
         select: exp.Select,
@@ -10739,23 +10943,16 @@ class _Lowerer:
         (:meth:`_inherited_fill_options`) and its provenance, so a
         silence-filled French mix is still tagged French.
         """
-        call = _call_parts(node) if isinstance(node, exp.Expr) else None
-        if call is None or call.args or not (call.namespaced or call.is_macro):
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL,
-                f"a COALESCE fill is a generated stand-in, got {_describe(node)}",
-                node,
-                fallback=select,
-                hint=self._fill_hint(binding),
-            )
         source_meta = paired.stream.source if paired is not None else None
         name = call.name.lower()
         if call.is_macro:
-            return self._lower_macro_fill(node, name, call, binding, source_meta, select)
+            return self._lower_macro_fill(
+                node, name, call, kind, label, source_meta, select
+            )
         source = self._source_filter(
             RawSource(alias="", name=name, options=(), call_node=node), select
         )
-        self._check_fill_type(source.output, call.display, binding, node, select)
+        self._check_fill_type(source.output, call.display, kind, label, node, select)
         options = self._filter_options(name, node, select)
         dropped: dict[str, exp.Expr] = {}
         args = self._check_named_args(
@@ -10768,7 +10965,7 @@ class _Lowerer:
             dropped=dropped,
         )
         self._check_required_options(name, args, dropped, node, select)
-        for option, value in self._inherited_fill_options(binding.type, paired).items():
+        for option, value in self._inherited_fill_options(kind, paired).items():
             if value is None or option in args or option not in options:
                 continue
             args[option] = value
@@ -10796,7 +10993,8 @@ class _Lowerer:
         node: exp.Expr,
         name: str,
         call: _Call,
-        binding: _RowBinding,
+        kind: StreamType,
+        label: str,
         source_meta: StreamMeta | None,
         select: exp.Select,
     ) -> _Stream:
@@ -10812,7 +11010,7 @@ class _Lowerer:
                 else f"unknown function {call.display}()",
                 node,
                 fallback=select,
-                hint=self._fill_hint(binding),
+                hint=self._fill_hint(kind, label),
             )
         if call.named:
             raise _error(
@@ -10823,7 +11021,7 @@ class _Lowerer:
                 fallback=node,
                 hint=f"write {call.display}()",
             )
-        self._check_fill_type(macro.output, call.display, binding, node, select)
+        self._check_fill_type(macro.output, call.display, kind, label, node, select)
         return _Stream(
             ref=self._mint_input(macro), type=macro.output, source=source_meta
         )
@@ -10832,32 +11030,33 @@ class _Lowerer:
         self,
         output: StreamType,
         display: str,
-        binding: _RowBinding,
+        kind: StreamType,
+        label: str,
         node: exp.Expr,
         select: exp.Select,
     ) -> None:
         """A fill stands in for a track, so it has to BE one of the same type."""
-        if output == binding.type:
+        if output == kind:
             return
         raise _error(
             ErrorCode.UDF_ARG_TYPE,
             f"{display}() generates a {output} stream, but "
-            f"'{binding.alias}' is {binding.type}",
+            f"'{label}' is {kind}",
             node,
             fallback=select,
-            hint=self._fill_hint(binding),
+            hint=self._fill_hint(kind, label),
         )
 
-    def _fill_hint(self, binding: _RowBinding) -> str:
-        spelling = _FILL_SPELLINGS.get(binding.type)
+    def _fill_hint(self, kind: StreamType, label: str) -> str:
+        spelling = _FILL_SPELLINGS.get(kind)
         if spelling is None:
             return (
-                f"nothing generates a {binding.type} track, so there is no fill "
-                f"for '{binding.alias}'; select it from a "
+                f"nothing generates a {kind} track, so there is no fill "
+                f"for '{label}'; select it from a "
                 "join that always matches"
             )
         return (
-            f"the fill for a {binding.type} track is {spelling}; its options "
+            f"the fill for a {kind} track is {spelling}; its options "
             "inherit from the paired row unless you give them"
         )
 
@@ -11326,43 +11525,52 @@ class _Lowerer:
     ) -> _Value:
         """One CTE column as this branch's relation reads it.
 
-        A row-set column carries one stream per body row, so the value is that
-        column re-read through the result tuples: a cross join repeats the
-        stream once per partner row, and a filtered relation drops the rows it
-        dropped. Everything else -- a scalar, an ``array_agg``, a bare input
-        array re-exposed -- is one unit that broadcasts, exactly as before.
+        A stream column's cardinality follows the relation, so the value is
+        the column re-read through the result tuples: a cross join repeats a
+        stream once per partner row, a filtered relation drops the rows it
+        dropped, and an outer join's gap is a NULL cell. A row-set column
+        carries one stream per body row to read by position; a single value
+        is that value on every row, so a one-row body joined into several
+        rows is present where its row matched and NULL where it did not. A
+        gathered array (an ``array_agg``, a bare input array re-exposed) is
+        one unit and reads as itself.
         """
         relation = binding.relation
-        if (
-            relation is None
-            or not (column.splat and column.value.is_array)
-            or len(column.value.streams) != binding.rows
-        ):
+        if relation is None or not self._cte_cell_column(binding, column):
             return column.value
+        cells = (
+            column.value.streams
+            if column.value.is_array
+            else column.value.streams * binding.rows
+        )
         streams: list[_Stream] = []
         for position, entry in enumerate(
             tuple_.get(binding.name) for tuple_ in relation.tuples
         ):
-            if isinstance(entry, _CteRow):
-                streams.append(column.value.streams[entry.position])
+            cell = (
+                cells[entry.position]
+                if isinstance(entry, _CteRow)
+                # An outer join's gap reads as the same NULL a row carrying
+                # no track of the kind leaves.
+                else _Stream(ref=_NULL_STREAM_REF, type=column.value.type, source=None)
+            )
+            if cell.ref != _NULL_STREAM_REF or self._null_cells_are_read:
+                streams.append(cell)
                 continue
-            # An outer join's gap: a NULL cell, sentinel where a NULL is
-            # allowed to stand (a table's empty cell, a manifest row's
-            # absent stream kind), a rejection everywhere else.
-            if self.table_mode or self.manifest is not None or self.row_reading_sink:
-                streams.append(
-                    _Stream(ref=_NULL_STREAM_REF, type=column.value.type, source=None)
-                )
-                continue
+            missed = (
+                f"no '{binding.name}' row matched here"
+                if not isinstance(entry, _CteRow)
+                else f"that row carries no {column.value.type} track"
+            )
             raise _error(
                 ErrorCode.STREAM_NOT_FOUND,
                 f"'{binding.name}.{column.name}' is NULL in row "
-                f"{position + 1}: no '{binding.name}' row matched here",
+                f"{position + 1}: {missed}",
                 anchor,
                 fallback=select,
-                hint="an outer join leaves gaps, and only a manifest "
-                "destination (WITH (format 'hls'), format 'dash') takes them "
-                "as absent variants; use an INNER or LEFT join so every "
+                hint="only a manifest destination (WITH (format 'hls'), "
+                "format 'dash') reads a NULL cell, as an absent variant; "
+                "elsewhere narrow the rows with a WHERE, or join so every "
                 "selected row has one",
             )
         if not any(stream.ref != _NULL_STREAM_REF for stream in streams):
@@ -11374,7 +11582,31 @@ class _Lowerer:
                 fallback=select,
                 hint="an empty row set would select no streams; widen the WHERE",
             )
+        if not column.value.is_array and len(streams) == 1:
+            return _scalar(streams[0])  # one row in, one row out: still scalar
         return _array(column.value.type, streams)
+
+    @property
+    def _null_cells_are_read(self) -> bool:
+        """True where a NULL stream cell is something the reader understands:
+        a table's empty cell, a manifest row's absent stream kind, a
+        row-reading sink's, and a CTE body, which records its rows for one of
+        those to read later."""
+        return (
+            self.table_mode
+            or self.manifest is not None
+            or self.row_reading_sink
+            or self.cte_body
+        )
+
+    def _cte_cell_column(self, binding: _CteBinding, column: _Column) -> bool:
+        """True when a CTE's stream column reads one cell per row of the
+        branch's relation: a row set, one stream per body row, or a single
+        value every row repeats. A gathered array is one unit instead."""
+        value = column.value
+        if column.splat and value.is_array:
+            return len(value.streams) == binding.rows
+        return not value.is_array and len(value.streams) == 1
 
     def _cte_column(self, binding: _CteBinding, name: str) -> _Column | None:
         for column in binding.columns:
@@ -14209,9 +14441,13 @@ class _Lowerer:
         if isinstance(node, exp.Cast):
             return _UNSUPPORTED_KIND
         if isinstance(node, exp.Coalesce):
-            # A filled track column is a stream of the row table's own type,
+            # A filled track column is a stream of its first argument's type,
             # which is knowable without lowering anything (no fill is minted).
-            return self._coalesce_parts(node, env, select)[0].type
+            first = self._coalesce_arguments(node, select)[0]
+            binding = self._coalesce_binding(first, env)
+            return binding.type if binding is not None else self._classify(
+                first, env, select
+            )
         call = _call_parts(node)
         if call is not None:
             name = call.name.lower()
@@ -14283,21 +14519,7 @@ class _Lowerer:
 
     def run_table(self) -> list[TableSink]:
         """One :class:`~ffrwd.table.TableSink` per COPY, or one bare-select."""
-        for name, body in self.res.ctes.items():
-            self.branch_values = {}
-            self.branch_rows_columns = {}
-            self.branch_cue_columns = set()
-            self.cte_columns[name] = tuple(
-                self._lower_query(union_branches(body), body, tags="rows")
-            )
-            self.cte_values[name] = self.branch_values
-            self.cte_rows_columns[name] = self.branch_rows_columns
-            self.cte_cue_columns[name] = frozenset(self.branch_cue_columns)
-            self.branch_values = {}
-            self.branch_rows_columns = {}
-            self.branch_cue_columns = set()
-            self._harvest_cte_tags(body)
-            self._harvest_cte_dispositions(body)
+        self._lower_ctes()
         self.table_mode = True
         sinks: list[TableSink] = []
         if self.res.sinks:

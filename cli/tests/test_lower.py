@@ -6905,10 +6905,10 @@ def _row_query(where: str = "", order: str = "", column: str = "audio") -> str:
 # unchanged.
 
 
-def _rendition_probe() -> ProbeResult:
-    lo_v = _track("video", 0, width=1280, height=720)
+def _rendition_probe(fps: str | None = None) -> ProbeResult:
+    lo_v = _track("video", 0, width=1280, height=720, fps=fps)
     lo_a = _track("audio", 0, channels=2, codec="aac")
-    hi_v = _track("video", 1, width=1920, height=1080)
+    hi_v = _track("video", 1, width=1920, height=1080, fps=fps)
     hi_a = _track("audio", 1, channels=2, codec="aac")
     solo_a = _track("audio", 2, channels=2, codec="aac", language="en")
     renditions = [
@@ -7330,6 +7330,184 @@ def test_a_ladder_reaches_a_manifest_destination_as_n_variants() -> None:
     args = build_ffmpeg_args(emit(g), None)
     maps = [args[i + 1] for i, arg in enumerate(args) if arg == "-map"]
     assert maps == ["0:v:0", "0:v:1", "0:a:0", "0:a:1", "0:a:2"]
+
+
+# -- a stream column's cardinality follows its relation: one cell per
+#    surviving row, NULL where the row carries no track of the kind, and a
+#    single value on every row of the relation it is read beside --------------
+
+
+# A manifest destination derives its keyframe interval from the frame rate,
+# so a ladder read into one carries a rate on its video rungs.
+_LADDER_FPS = "30/1"
+
+
+def _two_ladder_probes() -> dict[str, ProbeResult | None]:
+    """The same three-rung ladder under two aliases, for a self-join."""
+    return {"r": _rendition_probe(_LADDER_FPS), "s": _rendition_probe(_LADDER_FPS)}
+
+
+def _variants(g: Graph) -> list[str]:
+    var_stream_map = g.sinks[0].options["var_stream_map"]
+    assert isinstance(var_stream_map, str)
+    return var_stream_map.split(" ")
+
+
+def _variant_cells(g: Graph) -> list[str]:
+    """Each variant map entry's stream cells alone, without the group and
+    name the manifest writer adds beside them."""
+    return [
+        ",".join(part for part in variant.split(",") if part[:2] in ("v:", "a:"))
+        for variant in _variants(g)
+    ]
+
+
+def test_a_rendition_column_read_through_a_cte_is_one_cell_per_row() -> None:
+    """A CTE body's ``r.video[1]`` is that ROW's video, not one rendition
+    picked out of the row set: two rungs survive the WHERE, so the column the
+    CTE exposes is two cells wide and reaches the manifest as two variants.
+    """
+    g = _lower(
+        "COPY (WITH vid AS (SELECT r.video[1] AS v, r.height AS rung "
+        "FROM input('ladder.m3u8') r WHERE r.height IS NOT NULL) "
+        "SELECT vid.v FROM vid) TO 'out/master.m3u8' WITH (format 'hls')",
+        {"r": _rendition_probe(_LADDER_FPS)},
+    )
+    assert [o.ref for o in g.sinks[0].outputs] == ["src:r:v:0", "src:r:v:1"]
+    assert _variant_cells(g) == ["v:0", "v:1"]
+
+
+def test_two_ctes_joined_on_disjoint_keys_are_rows_built_from_parts() -> None:
+    """The demuxed spelling over a ladder: video rungs from one CTE, the
+    audio rendition from another, joined on keys that never meet. Three rows
+    come out -- two carrying only video, one only audio -- because each CTE's
+    stream column is present where its own row matched and NULL where it did
+    not.
+    """
+    g = _lower(
+        "COPY (WITH vid AS (SELECT r.video[1] AS v, r.height AS rung "
+        "FROM input('ladder.m3u8') r WHERE r.height IS NOT NULL), "
+        "aud AS (SELECT s.audio[1] AS t, 1000 + s.bandwidth AS rung "
+        "FROM input('ladder.m3u8') s WHERE s.height IS NULL) "
+        "SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) "
+        "TO 'out/master.m3u8' WITH (format 'hls')",
+        _two_ladder_probes(),
+    )
+    assert [o.ref for o in g.sinks[0].outputs] == [
+        "src:r:v:0",
+        "src:r:v:1",
+        "src:s:a:2",
+    ]
+    assert _variant_cells(g) == ["v:0", "v:1", "a:0"]
+
+
+def test_a_one_row_cte_joined_into_two_rows_is_a_row_set_of_one() -> None:
+    """A CTE body with one row still reads per ROW of the branch's relation:
+    the video CTE's stream is on the row it matched and NULL on the audio
+    CTE's, and the other way round -- one variant of each kind, neither
+    repeated onto the other's row."""
+    g = _lower(
+        "COPY (WITH vid AS (SELECT f.video[1] AS v, 1 AS rung FROM input('a.mp4') f), "
+        "aud AS (SELECT g.audio[1] AS t, 1000 AS rung FROM input('a.mp4') g) "
+        "SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) "
+        "TO 'out/master.m3u8' WITH (format 'hls')",
+        {"f": _probe_result(), "g": _probe_result()},
+    )
+    assert [o.ref for o in g.sinks[0].outputs] == ["src:f:v:0", "src:g:a:0"]
+    assert _variant_cells(g) == ["v:0", "a:0"]
+
+
+def test_one_audio_over_two_rungs_is_that_audio_on_every_variant() -> None:
+    """The plain muxed ladder: two rows from a series, and an audio column
+    that does not vary per row is that stream on both of them. Two rows name
+    one pad, so the split pass gives it one ``asplit`` with a leg per
+    variant."""
+    g = insert_splits(
+        _lower(
+            "COPY (SELECT scale(f.video[1], ARRAY[320, 160][i.i], -2), f.audio[1] "
+            "FROM input('a.mp4') f, generate_series(1, 2) i) "
+            "TO 'out/master.m3u8' WITH (format 'hls')",
+            {"f": _probe_result()},
+        )
+    )
+    asplits = [node for node in g.nodes.values() if node.filter == "asplit"]
+    assert len(asplits) == 1
+    assert asplits[0].args == {"n": 2}
+    assert asplits[0].inputs == ["src:f:a:0"]
+    assert _variant_cells(g) == ["v:0,a:0", "v:1,a:1"]
+
+
+def test_a_gathered_array_of_the_wrong_length_still_refuses() -> None:
+    """The refusal the row count was written for: an ``array_agg`` is one
+    unit, not a row set, so a two-element one over a three-row relation says
+    so -- a single stream would have repeated, two do not."""
+    err = _reject_lower(
+        "COPY (SELECT array_agg(r.video[1]) FROM input('ladder.m3u8') r) "
+        "TO 'out/master.m3u8' WITH (format 'hls')",
+        {"r": _rendition_probe(_LADDER_FPS)},
+    )
+    assert err.code is ErrorCode.ROW_COUNT_MISMATCH
+    assert "does not carry one stream per row" in err.message
+    assert "which every row repeats" in (err.hint or "")
+
+
+def test_a_null_cell_outside_a_manifest_is_a_typed_rejection() -> None:
+    """Only a manifest reads a NULL cell. A fan-out writes one file per row,
+    so the one-row rule never fires and this is where the audio-only rung's
+    missing video has to be named -- as the absence it is, not as an empty
+    row set."""
+    err = _reject_lower(
+        "COPY (WITH x AS (SELECT r.video[1] AS v, r.bandwidth AS n "
+        "FROM input('ladder.m3u8') r) SELECT x.v FROM x) "
+        "TO ('clip' || x.n::text || '.mkv')",
+        _rendition_probes(),
+    )
+    assert err.code is ErrorCode.STREAM_NOT_FOUND
+    assert "'x.v' is NULL" in err.message
+    assert "carries no video track" in err.message
+    assert "format 'hls'" in (err.hint or "")
+
+
+def test_the_direct_read_of_a_ladder_at_a_manifest_is_unchanged() -> None:
+    """The shortcut every ladder recipe takes: bare ``r.video``/``r.audio``
+    read straight off the rows at a manifest destination, one variant per
+    rung. Pinned as the whole command, and identical to the ``[1]``
+    spelling's -- a rung carries at most one stream of a kind."""
+    bare = (
+        "COPY (SELECT r.video, r.audio FROM input('ladder.m3u8') r "
+        "WHERE r.height IS NOT NULL) TO 'out/master.m3u8' "
+        "WITH (format 'hls', video_codec 'libx264', audio_codec 'aac')"
+    )
+    probes: dict[str, ProbeResult | None] = {"r": _rendition_probe(_LADDER_FPS)}
+    args = build_ffmpeg_args(emit(_lower(bare, probes)), None)
+    assert args == [
+        "ffmpeg",
+        "-i", "ladder.m3u8",
+        "-map", "0:v:0",
+        "-map", "0:v:1",
+        "-map", "0:a:0",
+        "-map", "0:a:1",
+        "-f", "hls",
+        "-c:0", "libx264",
+        "-c:1", "libx264",
+        "-c:2", "aac",
+        "-c:3", "aac",
+        "-g:0", "60",
+        "-g:1", "60",
+        "-keyint_min:0", "60",
+        "-keyint_min:1", "60",
+        "-sc_threshold:0", "0",
+        "-sc_threshold:1", "0",
+        "-var_stream_map", "v:0,a:0,name:720p v:1,a:1,name:1080p",
+        "-master_pl_name", "master.m3u8",
+        "-hls_segment_filename", "out/v%v/segment_%d.ts",
+        "out/v%v/index.m3u8",
+    ]
+    subscripted = build_ffmpeg_args(
+        emit(_lower(bare.replace("r.video, r.audio", "r.video[1], r.audio[1]"), probes)),
+        None,
+    )
+    assert subscripted == args
 
 
 # -- a computed TO reading rendition columns off TWO input aliases: recipe
@@ -9739,6 +9917,77 @@ def test_a_full_join_appends_unmatched_right_rows_in_their_own_order() -> None:
     assert _refs(filled) == ["src:g:a:1", fills[0], "src:g:a:0"]
 
 
+def test_coalesce_fills_a_cte_stream_columns_gaps() -> None:
+    """A CTE's stream column is nullable the same way a track-row alias is --
+    the audio-only rung carries no video -- so COALESCE fills it, once, for
+    the one row that needs it."""
+    g = _lower(
+        "COPY (WITH vid AS (SELECT r.video[1] AS v FROM input('ladder.m3u8') r) "
+        "SELECT COALESCE(vid.v, ffmpeg.color(size => '1280x720', rate => 30, "
+        "duration => 2)) FROM vid) TO 'out/master.m3u8' WITH (format 'hls')",
+        {"r": _rendition_probe(_LADDER_FPS)},
+    )
+    (fill,) = g.nodes.values()
+    assert fill.filter == "color"
+    assert [o.ref for o in g.sinks[0].outputs] == ["src:r:v:0", "src:r:v:1", fill.id]
+
+
+def test_coalesce_takes_the_first_non_null_of_two_cte_columns() -> None:
+    """The hybrid master: muxed rows carry their own audio, and the row that
+    carries none takes the audio rendition's. Three variants, every one of
+    them with an audio cell."""
+    g = _lower(
+        "COPY (WITH vid AS (SELECT r.video[1] AS v, r.audio[1] AS a, r.height AS rung "
+        "FROM input('ladder.m3u8') r WHERE r.height IS NOT NULL), "
+        "aud AS (SELECT s.audio[1] AS t, 1000 AS rung "
+        "FROM input('ladder.m3u8') s WHERE s.height IS NULL) "
+        "SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud "
+        "ON vid.rung = aud.rung) TO 'out/master.m3u8' WITH (format 'hls')",
+        _two_ladder_probes(),
+    )
+    assert not g.nodes  # nothing generated: every gap had a stream to take
+    assert [o.ref for o in g.sinks[0].outputs] == [
+        "src:r:v:0",
+        "src:r:v:1",
+        "src:r:a:0",
+        "src:r:a:1",
+        "src:s:a:2",
+    ]
+    assert _variant_cells(g) == ["v:0,a:0", "v:1,a:1", "a:2"]
+
+
+def test_a_row_where_every_coalesce_argument_is_null_carries_no_such_cell() -> None:
+    """An all-NULL row is NULL, not a rejection and not a fill: the audio-only
+    rung has no video of its own and matched no other row, so its variant is
+    the audio one -- absent, the way any other gap reads at a manifest."""
+    g = _lower(
+        "COPY (WITH vid AS (SELECT r.video[1] AS v, r.audio[1] AS a, r.height AS rung "
+        "FROM input('ladder.m3u8') r), "
+        "alt AS (SELECT s.video[1] AS w, s.height AS rung "
+        "FROM input('ladder.m3u8') s WHERE s.height = 720) "
+        "SELECT COALESCE(vid.v, alt.w), vid.a FROM vid LEFT JOIN alt "
+        "ON vid.rung = alt.rung) TO 'out/master.m3u8' WITH (format 'hls')",
+        _two_ladder_probes(),
+    )
+    assert _variant_cells(g) == ["v:0,a:0", "v:1,a:1", "a:2"]
+
+
+def test_every_coalesce_argument_is_one_kind_of_track() -> None:
+    err = _reject_lower(
+        "COPY (WITH vid AS (SELECT r.video[1] AS v, r.height AS rung "
+        "FROM input('ladder.m3u8') r WHERE r.height IS NOT NULL), "
+        "aud AS (SELECT s.audio[1] AS t, 1000 AS rung "
+        "FROM input('ladder.m3u8') s WHERE s.height IS NULL) "
+        "SELECT COALESCE(vid.v, aud.t) FROM vid FULL JOIN aud "
+        "ON vid.rung = aud.rung) TO 'out/master.m3u8' WITH (format 'hls')",
+        _two_ladder_probes(),
+    )
+    assert err.code is ErrorCode.UDF_ARG_TYPE
+    assert err.message == (
+        "COALESCE stands in for one track: 'vid.v' is video, and 'aud.t' is audio"
+    )
+
+
 def test_full_join_with_and_without_the_outer_keyword_are_one_join() -> None:
     probes = _pair_probes()
     with_kind = _lower(
@@ -9961,22 +10210,33 @@ def test_the_empty_captions_input_renders_its_format_flag_before_the_i() -> None
     assert args[args.index("-f") + 3] == "data:text/vtt;base64,V0VCVlRUCgo="
 
 
-def test_a_coalesce_fill_must_be_a_generated_stand_in() -> None:
-    err = _reject_lower(_fill_query("f.audio[1]"), _pair_probes())
+def test_a_coalesce_fill_is_a_stream_or_a_generated_stand_in() -> None:
+    """A gap takes another stream or a generator, and a literal is neither --
+    refused as the column it is, not as a fill."""
+    err = _reject_lower(_fill_query("'silence'"), _pair_probes())
     assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "a COALESCE fill is a generated stand-in" in err.message
+    assert "must be a stream expression" in err.message
 
 
-def test_coalesces_first_argument_is_a_row_stream() -> None:
-    err = _reject_lower(
-        _join_query(
-            projection="COALESCE(f.audio[1], ffmpeg.anullsrc())",
-            join="FULL OUTER JOIN",
-        ),
+def test_a_stream_stands_in_for_a_track_rows_gaps() -> None:
+    """The second argument is any stream of the same kind: this one has no
+    gaps of its own, so it is the same value on every row and the unmatched
+    row -- `f`'s fra track, which `g` has no counterpart for -- takes it.
+    Nothing is minted: a stand-in that already exists needs no generator."""
+    g = _lower(_fill_query("f.audio[1]"), _pair_probes())
+    assert not g.nodes
+    assert _refs(g) == ["src:g:a:0", "src:f:a:0"]
+
+
+def test_a_coalesce_over_a_cell_that_is_never_null_mints_no_fill() -> None:
+    """COALESCE is the first non-NULL per row, so over a column with no gaps
+    it is that column -- the generator is dead and never reaches the graph."""
+    g = _lower(
+        _fill_query("ffmpeg.anullsrc()", projection="COALESCE(f.audio[1], {fill})"),
         _pair_probes(),
     )
-    assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "first argument is a track-row stream column" in err.message
+    assert not g.nodes
+    assert _refs(g) == ["src:f:a:0"]
 
 
 def test_coalesce_takes_exactly_two_arguments() -> None:
