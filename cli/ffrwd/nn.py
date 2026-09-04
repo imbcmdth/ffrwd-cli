@@ -395,8 +395,8 @@ _PINS: Mapping[tuple[str, str], Mapping[str, tuple[Artifact, ...]]] = {
                 ),
             ),
             # cudnn64_9 loads the rest itself, by name, out of this directory.
-            # The graph, ops and engine libraries are what an ONNX session
-            # reaches; the convolution and attention ones it does not.
+            # The graph, ops, adv (recurrent ops) and engine libraries are
+            # what an ONNX session reaches; the convolution one it does not.
             Artifact(
                 url=f"{_NVIDIA}/cudnn/redist/cudnn/windows-x86_64"
                 "/cudnn-windows-x86_64-9.10.2.21_cuda12-archive.zip",
@@ -409,6 +409,7 @@ _PINS: Mapping[tuple[str, str], Mapping[str, tuple[Artifact, ...]]] = {
                     )
                     for lib in (
                         "cudnn64_9.dll",
+                        "cudnn_adv64_9.dll",
                         "cudnn_graph64_9.dll",
                         "cudnn_ops64_9.dll",
                         "cudnn_heuristic64_9.dll",

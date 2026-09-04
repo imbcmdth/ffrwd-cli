@@ -465,6 +465,26 @@ def test_the_pinned_windows_layout_is_the_one_the_host_resolves() -> None:
     assert ("", "onnxruntime_providers_shared.dll") in placed
 
 
+# The sublibraries cudnn64_9.dll loads by bare name from its own directory:
+# the sidecar's CUDNN_SUBLIBS Windows list, pinned here rather than read
+# across the repo.
+_CUDNN_SUBLIBS_WINDOWS = (
+    "cudnn_adv64_9.dll",
+    "cudnn_graph64_9.dll",
+    "cudnn_ops64_9.dll",
+    "cudnn_heuristic64_9.dll",
+    "cudnn_engines_precompiled64_9.dll",
+    "cudnn_engines_runtime_compiled64_9.dll",
+)
+
+
+def test_the_full_tier_carries_every_cudnn_sublibrary_the_sidecar_loads() -> None:
+    full = nn._PINS[("1.22.0", "win-x64")]["full"]
+    names = {member.name for artifact in full for member in artifact.members}
+    for lib in _CUDNN_SUBLIBS_WINDOWS:
+        assert lib in names, f"{lib} is missing from the full tier's cudnn artifact"
+
+
 # --------------------------------------------------------------------------
 # what a spawned sidecar is told
 # --------------------------------------------------------------------------
