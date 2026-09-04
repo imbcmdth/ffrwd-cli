@@ -1,10 +1,11 @@
 """Tests for `ffrwd publish`: the local preflight, and the one request it makes.
 
 The preflight is the whole validation, so most of what is checked here never
-reaches the network at all: a manifest, its exports, its modules, its models
-and every recipe compiled against the synthetic file. What does reach it goes
-through ``packages._urlopen``, the same seam ``test_packages`` replaces --
-here to resolve the dependencies the manifest names, and to make the upload.
+reaches the network at all: a manifest, its exports, its modules, its models,
+and the package's own ``test`` command, when it declares one. What does reach
+it goes through ``packages._urlopen``, the same seam ``test_packages``
+replaces -- here to resolve the dependencies the manifest names, and to make
+the upload.
 
 No test invokes the sidecar: what a module declares comes from a
 :class:`~ffrwd.wasm.Described` handed to the seam ``wasm.describe`` is, which
@@ -17,6 +18,8 @@ import gzip
 import hashlib
 import io
 import json
+import subprocess
+import sys
 import tarfile
 import urllib.error
 from collections.abc import Iterator, Mapping
@@ -43,6 +46,17 @@ RECIPE = (
     "COPY (SELECT broadcast.tracks.quieter(f.audio[1]) FROM input(:'source') f)"
     " TO :'dest';\n"
 )
+
+
+def _test_command(code: str) -> str:
+    """A manifest "test" command that runs `code` under this same interpreter.
+
+    ``shell=True`` hands the string to cmd.exe on Windows and to ``/bin/sh``
+    on the CI runners this repo uses (ubuntu-latest); both run
+    ``"<python>" -c "<code>"`` the same way, so this is portable across both
+    without depending on anything installed beyond Python itself.
+    """
+    return f'"{sys.executable}" -c "{code}"'
 
 
 def _package(
@@ -302,16 +316,84 @@ def test_a_package_declaring_no_homepage_sends_none_in_the_metadata(tmp_path: Pa
     assert prepared.metadata()["homepage"] is None
 
 
-def test_a_recipe_that_does_not_compile_is_refused_naming_it(tmp_path: Path) -> None:
+def test_a_manifest_with_no_test_command_publishes_without_compiling_recipes(
+    tmp_path: Path,
+) -> None:
+    """No "test" key: nothing is checked, and no recipe is compiled to make up for it.
+
+    A recipe that would not even compile is what pins the ruling: a package
+    still publishes with it, because ``ffrwd publish`` no longer compiles
+    recipes as a check of its own.
+    """
     root = _package(
         tmp_path / "built",
         recipe="-- variables: source (input media path)\n"
         "COPY (SELECT nosuchfilter(f.audio[1]) FROM input(:'source') f) TO 'out.mkv';\n",
     )
+    prepared = publish.prepare(root / "ffrwd.json")
+    assert prepared.package.test == ""
+
+
+def test_a_manifest_whose_test_command_exits_0_publishes(tmp_path: Path) -> None:
+    root = _package(
+        tmp_path / "built", extra={"test": _test_command("import sys; sys.exit(0)")}
+    )
+    prepared = publish.prepare(root / "ffrwd.json")
+    assert prepared.package.test == _test_command("import sys; sys.exit(0)")
+
+
+def test_a_test_command_that_exits_nonzero_is_refused_naming_it_and_the_status(
+    tmp_path: Path,
+) -> None:
+    command = _test_command("import sys; sys.exit(3)")
+    root = _package(tmp_path / "built", extra={"test": command})
     with pytest.raises(FfrwdError) as caught:
         publish.prepare(root / "ffrwd.json")
-    assert "recipe 'duck' does not compile" in caught.value.message
-    assert "publish again" in (caught.value.hint or "")
+    assert "its test command" in caught.value.message
+    assert repr(command) in caught.value.message
+    assert "exited 3" in caught.value.message
+    assert "package's own check" in (caught.value.hint or "")
+    assert "publish stops until it passes" in (caught.value.hint or "")
+
+
+def test_the_test_command_runs_with_the_package_root_as_its_working_directory(
+    tmp_path: Path,
+) -> None:
+    root = _package(
+        tmp_path / "built",
+        extra={
+            "test": _test_command(
+                "import pathlib; pathlib.Path('ran-here.txt').write_text('x')"
+            )
+        },
+    )
+    publish.prepare(root / "ffrwd.json")
+    assert (root / "ran-here.txt").is_file()
+    assert not (tmp_path / "ran-here.txt").is_file()
+
+
+def test_running_the_test_command_is_announced(tmp_path: Path) -> None:
+    command = _test_command("import sys; sys.exit(0)")
+    root = _package(tmp_path / "built", extra={"test": command})
+    said: list[str] = []
+    publish.prepare(root / "ffrwd.json", announce=said.append)
+    assert f"running {command}" in said
+
+
+def test_a_test_command_that_cannot_even_start_is_refused_not_a_traceback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A shell that fails to spawn at all is still a rejection, not an OSError."""
+    root = _package(tmp_path / "built", extra={"test": "does-not-matter"})
+
+    def _blows_up(*_args: object, **_named: object) -> None:
+        raise OSError("no such shell")
+
+    monkeypatch.setattr(subprocess, "run", _blows_up)
+    with pytest.raises(FfrwdError) as caught:
+        publish.prepare(root / "ffrwd.json")
+    assert "its test command" in caught.value.message
+    assert "could not be run" in caught.value.message
 
 
 def test_an_export_the_lib_file_does_not_define_is_refused(tmp_path: Path) -> None:
@@ -737,12 +819,11 @@ def test_publish_refuses_before_uploading_anything(
     credentials.save(TOKEN, api=API)
     _accepts(served)
     root = _package(
-        tmp_path / "built",
-        recipe="-- variables: source (input media path)\n"
-        "COPY (SELECT nosuchfilter(f.audio[1]) FROM input(:'source') f) TO 'out.mkv';\n",
+        tmp_path / "built", extra={"test": _test_command("import sys; sys.exit(1)")}
     )
     code, out, err = _run(root, monkeypatch, capsys, "publish")
     assert code == 1
     assert out == ""
-    assert "recipe 'duck' does not compile" in err
+    assert "its test command" in err
+    assert "exited 1" in err
     assert served.asked == []

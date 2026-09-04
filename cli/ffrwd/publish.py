@@ -2,18 +2,20 @@
 
 The publisher has the whole toolchain -- the compiler, ffmpeg and the sidecar
 are what a package is built with -- so the validation lives on this side.
-``ffrwd publish`` reads the manifest, parses every export, compiles every
-recipe, resolves every dependency against the registry, asks the sidecar what
-each module declares, packs the directory and writes the documents the
-registry stores. Only then does anything leave the machine, and what leaves is
-one request.
+``ffrwd publish`` reads the manifest, parses every export, resolves every
+dependency against the registry, asks the sidecar what each module declares,
+runs the package's own test command when its manifest declares one, packs the
+directory and writes the documents the registry stores. Only then does
+anything leave the machine, and what leaves is one request.
 
 A package ships queries, not media, so there is no file to probe: every
-recipe is compiled against :data:`SYNTHETIC_PROBE`, one synthetic file with a
-video, an audio and a subtitle stream plus chapters, with the values the
-recipe's own ``-- example:`` line names substituted in. A recipe with no
-example line compiles with its variables unset, which is what running it that
-way would do.
+recipe is still compiled against :data:`SYNTHETIC_PROBE`, one synthetic file
+with a video, an audio and a subtitle stream plus chapters, with the values
+the recipe's own ``-- example:`` line names substituted in -- not to validate
+the recipe, which is the package's own ``test`` command's job, but to read
+off each variable's required or optional list for the version document. A
+recipe with no example line compiles with its variables unset, which is what
+running it that way would do.
 
 What the registry then checks is only what it alone can: the token and its
 scope, that the namespace is the publisher's, that a version already
@@ -33,6 +35,7 @@ import json
 import os
 import re
 import shlex
+import subprocess
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -476,36 +479,39 @@ def _pin_document(pin: ModelPin, size: int | None) -> Document:
     return written
 
 
-def _compiled_recipes(package: Package, packages: PackageSet) -> None:
-    """Every recipe compiles, with its own package and its dependencies resolvable."""
-    for name, path in package.recipes.items():
-        try:
-            text = path.read_text(encoding="utf-8")
-        except OSError as err:
-            raise _reject(
-                f"package '{package.name}': recipe '{name}' could not be read: "
-                f"{err.strerror or err}",
-                f"its file is {path}",
-            ) from err
-        try:
-            substituted = substitute(text, _placeholders(text))
-        except FfrwdError as err:
-            raise _reject(
-                f"package '{package.name}': recipe '{name}': {err.message}",
-                "its '-- example:' line is where a publish takes values from",
-            ) from err
-        try:
-            compiler.compile_commands(
-                substituted.text, packages=packages, unset=substituted.unset
-            )
-        except FfrwdError as err:
-            if _compiles_as_table(substituted.text, packages, substituted.unset):
-                continue
-            raise _reject(
-                f"package '{package.name}': recipe '{name}' does not compile: "
-                f"{err.message}",
-                "every recipe is compiled before it is published; fix it and publish again",
-            ) from err
+def _tested(package: Package, announce: Announce | None) -> None:
+    """Run the manifest's own ``test`` command in place of compiling recipes as a check.
+
+    Runs through the platform's own shell (``&&`` and a pipe mean what the
+    author typed), inheriting the environment, with the package's root as its
+    working directory. Its own stdout and stderr are left alone -- an
+    author's test suite writes to the terminal a publish is run from, not
+    somewhere this captures. Exit 0 continues; anything else is a rejection,
+    and so is a shell that cannot even start.
+
+    A manifest declaring no ``test`` is not checked, and nothing is compiled
+    in its place.
+    """
+    if not package.test:
+        return
+    if announce is not None:
+        announce(f"running {package.test}")
+    try:
+        result = subprocess.run(package.test, shell=True, cwd=package.root)
+    except OSError as err:
+        raise _reject(
+            f"package '{package.name}': its test command {package.test!r} could not "
+            f"be run: {err.strerror or err}",
+            "\"test\" is the package's own check, declared in its manifest; fix the "
+            "command and publish again",
+        ) from err
+    if result.returncode != 0:
+        raise _reject(
+            f"package '{package.name}': its test command {package.test!r} exited "
+            f"{result.returncode}",
+            "\"test\" is the package's own check, declared in its manifest; the "
+            "publish stops until it passes",
+        )
 
 
 # --------------------------------------------------------------------------
@@ -673,11 +679,11 @@ def prepare(
     In order: the manifest reads and its name is one a package may have; every
     dependency resolves; every export parses and defines what the manifest
     says; every module describes, and every pinned model names one of their
-    exports; every recipe compiles against the synthetic file. The hub is
-    asked what each pinned file weighs, and a size that does not arrive is
-    left out rather than refused over. Then the directory is packed, and the
-    documents the registry stores are built out of the same package the checks
-    just ran over.
+    exports; the package's own test command runs, when its manifest declares
+    one. The hub is asked what each pinned file weighs, and a size that does
+    not arrive is left out rather than refused over. Then the directory is
+    packed, and the documents the registry stores are built out of the same
+    package the checks just ran over.
 
     `packages` is what a recipe's calls resolve against -- the project's own
     installed set. Defaults to the package alone, which is enough for one that
@@ -700,7 +706,7 @@ def prepare(
         capabilities = _capabilities(package)
         _checked_models(package)
         sizes = _model_sizes(package)
-        _compiled_recipes(package, resolvable)
+        _tested(package, announce)
 
         readme_html = _readme_html(package)
         if readme_html is None and on_warning is not None:
