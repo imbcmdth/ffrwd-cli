@@ -6,9 +6,10 @@
 //! read from a file: the wasm sandbox these modules run in has no
 //! filesystem).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use ffrwd_wasm::nut::Demuxer;
 
@@ -37,6 +38,8 @@ fn built_module(name: &str) -> PathBuf {
                 "-p",
                 "source-replay",
                 "-p",
+                "source-replay-pair",
+                "-p",
                 "source-replay-0130",
             ])
             .current_dir(&workspace)
@@ -57,6 +60,12 @@ fn built_module(name: &str) -> PathBuf {
 
 fn module_path() -> PathBuf {
     built_module("source_replay")
+}
+
+/// The two-track fixture, whose track 0 pours out more than a buffered writer
+/// holds before track 1 says anything at all.
+fn pair_module_path() -> PathBuf {
+    built_module("source_replay_pair")
 }
 
 /// The same fixture built against the vendored `worlds/0.13.0`, whose `open`
@@ -373,4 +382,172 @@ fn describe_reports_the_packet_source() {
     // No frame interface and no packet-sink export alongside it.
     assert!(description.get("window").is_none());
     assert!(description.get("video_codecs").is_none());
+}
+
+/// A path in the temp directory nothing else in this run uses.
+fn scratch(name: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("ffrwd-wasm-{}-{name}", std::process::id()))
+}
+
+/// What has reached `path` so far: its NUT headers, and how many packets
+/// follow. None while the headers are not there yet.
+fn arrived(path: &Path) -> Option<(ffrwd_wasm::nut::Stream, usize)> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut demuxer = Demuxer::open(std::io::BufReader::new(file)).ok()?;
+    let stream = demuxer.stream().clone();
+    let mut buf = Vec::new();
+    let mut packets = 0;
+    while let Ok(Some(_)) = demuxer.read_packet(&mut buf) {
+        packets += 1;
+    }
+    Some((stream, packets))
+}
+
+/// The two-track fixture with track 0 writing to a pipe nobody reads, so it
+/// fills and stays full, and track 1 writing to a file. Answers what reached
+/// track 1's output once `enough` is true of it, or None by `deadline`; the
+/// child is killed either way.
+fn while_the_first_output_stands_full(
+    late: &Path,
+    deadline: Duration,
+    enough: impl Fn(&(ffrwd_wasm::nut::Stream, usize)) -> bool,
+) -> Option<(ffrwd_wasm::nut::Stream, usize)> {
+    let module = pair_module_path();
+    let _ = std::fs::remove_file(late);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ffrwd-wasm"))
+        .args([
+            "-m",
+            module.to_str().expect("module path is UTF-8"),
+            "-track",
+            "0",
+            "-f",
+            "nut",
+            "-",
+            "-track",
+            "1",
+            "-f",
+            "nut",
+            late.to_str().expect("scratch path is UTF-8"),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ffrwd-wasm");
+
+    let start = Instant::now();
+    let mut reached = None;
+    while start.elapsed() < deadline {
+        if let Some(state) = arrived(late) {
+            if enough(&state) {
+                reached = Some(state);
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_file(late);
+    reached
+}
+
+#[test]
+fn a_two_output_source_writes_both_headers_before_it_writes_a_packet() {
+    // A host that wrote track 0's packets before track 1's header would block
+    // on track 0's full pipe with track 1's header never written - which is a
+    // reader that can never open its second input.
+    let (stream, _) = while_the_first_output_stands_full(
+        &scratch("headers-late.nut"),
+        Duration::from_secs(30),
+        |_| true,
+    )
+    .expect("track 1's NUT header never reached its output while track 0's pipe stood full");
+    assert_eq!(stream.codec_name(), Some("h264"));
+    assert_eq!(stream.video_geometry(), Some((32, 24)));
+    // Track 1's one packet settles its dts at once, so it reorders nothing.
+    assert_eq!(stream.decode_delay, 0);
+}
+
+#[test]
+fn a_full_output_does_not_hold_up_another_outputs_packets() {
+    // The reader reads packets off its second input to finish opening it, so
+    // the header alone is not enough: track 1's packet has to get out while
+    // track 0's pipe stands full, which one loop writing both outputs cannot
+    // do. Track 1 speaks only after track 0 has published everything, so this
+    // is reached only by a loop that never blocked on track 0.
+    let (_, packets) = while_the_first_output_stands_full(
+        &scratch("packets-late.nut"),
+        Duration::from_secs(30),
+        |(_, packets)| *packets > 0,
+    )
+    .expect("track 1's packet never reached its output while track 0's pipe stood full");
+    assert_eq!(packets, 1, "track 1 publishes one packet");
+}
+
+#[test]
+fn a_two_output_source_writes_each_track_to_its_own_output() {
+    let module = pair_module_path();
+    let wide = scratch("wide.nut");
+    let late = scratch("pair-late.nut");
+
+    let run = run_ffrwd_wasm(&[
+        "-m",
+        module.to_str().expect("module path is UTF-8"),
+        "-track",
+        "0",
+        "-f",
+        "nut",
+        wide.to_str().expect("scratch path is UTF-8"),
+        "-track",
+        "1",
+        "-f",
+        "nut",
+        late.to_str().expect("scratch path is UTF-8"),
+    ]);
+    assert!(
+        run.output.status.success(),
+        "run exited with {:?}\nstderr:\n{}",
+        run.output.status.code(),
+        run.stderr
+    );
+
+    let mut wide_demuxer = Demuxer::open(std::io::BufReader::new(
+        std::fs::File::open(&wide).expect("track 0's output"),
+    ))
+    .expect("read track 0's NUT headers");
+    // Two leading packets leave their dts unsettled, exactly as on the
+    // one-track fixture this one replays.
+    assert_eq!(wide_demuxer.stream().decode_delay, 2);
+    let mut buf = Vec::new();
+    let mut wide_packets = 0usize;
+    while wide_demuxer
+        .read_packet(&mut buf)
+        .expect("read a NUT packet")
+        .is_some()
+    {
+        wide_packets += 1;
+    }
+
+    let mut late_demuxer = Demuxer::open(std::io::BufReader::new(
+        std::fs::File::open(&late).expect("track 1's output"),
+    ))
+    .expect("read track 1's NUT headers");
+    assert_eq!(late_demuxer.stream().decode_delay, 0);
+    let mut late_packets = 0usize;
+    while late_demuxer
+        .read_packet(&mut buf)
+        .expect("read a NUT packet")
+        .is_some()
+    {
+        late_packets += 1;
+    }
+
+    let _ = std::fs::remove_file(&wide);
+    let _ = std::fs::remove_file(&late);
+
+    // 1200 replays of the seven-packet table on track 0, one packet on
+    // track 1 - the fixture's own description.
+    assert_eq!(wide_packets, 1200 * 7);
+    assert_eq!(late_packets, 1);
 }

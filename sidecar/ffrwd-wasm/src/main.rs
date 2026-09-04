@@ -22,7 +22,9 @@ mod windows;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufRead, Read, Write};
-use std::sync::{Arc, Condvar, Mutex};
+use std::panic::resume_unwind;
+use std::sync::{mpsc, Arc, Condvar, Mutex};
+use std::thread;
 
 use anyhow::{anyhow, bail, Context, Result};
 use ffrwd_wasm::nut;
@@ -2204,23 +2206,17 @@ fn write_coded_packet(muxer: &mut FrameOutput, packet: &runtime::Packet) -> Resu
     muxer.write_coded(&framed, &packet.data)
 }
 
-/// Opens one track's output now that its `decode_delay` has settled - see
-/// `run_packet_source` - and drains whatever was buffered waiting for it.
-fn settle_track(
+/// Writes one track's NUT header, now that its `decode_delay` has settled -
+/// see `run_packet_source`. No packet goes with it: the header is on the wire
+/// as soon as this returns.
+fn open_track(
     decode_delay: u64,
     track: &runtime::SourceTrack,
     output: &OutputSpec,
-    pending: &mut Vec<runtime::Packet>,
-    slot: &mut Option<FrameOutput>,
-) -> Result<()> {
+) -> Result<FrameOutput> {
     let stream = coded_stream_for(&track.stream, decode_delay)?;
-    let mut muxer = open_frame_output(&output.path, &stream, false)
-        .with_context(|| format!("opening output {}", output.spelling))?;
-    for packet in pending.drain(..) {
-        write_coded_packet(&mut muxer, &packet)?;
-    }
-    *slot = Some(muxer);
-    Ok(())
+    open_frame_output(&output.path, &stream, false)
+        .with_context(|| format!("opening output {}", output.spelling))
 }
 
 /// Which catalog track each output carries, in output order: what `open` is
@@ -2258,19 +2254,33 @@ fn source_tracks(outputs: &[OutputSpec], module: &str) -> Result<Vec<u32>> {
 /// command asked for, each naming its track with `-track`. Those indices are
 /// what `open` subscribes to, so output i carries the opened catalog's track
 /// i and nothing arrives that nobody reads. Packets arrive in decode order
-/// already -
-/// `PacketSource::next`'s own contract - so nothing here reorders them; the
-/// only work is settling each track's `decode_delay` before its output's
-/// header is written, since the wit `coded-stream` a source publishes
-/// carries no such field.
+/// already - `PacketSource::next`'s own contract - so nothing here reorders
+/// them; the only work is settling each track's `decode_delay` before its
+/// output's header is written, since the wit `coded-stream` a source
+/// publishes carries no such field.
 ///
 /// `packet.dts` is `None` until the wire settles it, exactly the convention
 /// `nut::Packet.dts` uses for a stream this host demuxes (nut/mod.rs): so
-/// the count of a track's leading `None` packets IS its decode_delay. This
-/// buffers a track's packets until the first settled `dts` arrives, opens
-/// that track's output with the count it took, and flushes what was held.
-/// A track that never settles - every packet arrives `None` - opens once
-/// the source is done, declaring a reorder as deep as every packet it saw.
+/// the count of a track's leading `None` packets IS its decode_delay. That
+/// count is the one thing an output's header waits on, and it takes packets
+/// to learn.
+///
+/// So the pull holds EVERY track's packets until every track's decode_delay
+/// has settled, and only then writes the headers - all of them, before a
+/// packet goes anywhere. A track that never settles - every packet arrives
+/// `None` - declares a reorder as deep as every packet it saw, which is
+/// known only once the source is done.
+///
+/// Past the headers each output gets its own writer, because a reader opens
+/// its inputs one at a time and reads packets off each to finish opening it.
+/// Output 0's pipe fills long before the reader is done with output 1, so one
+/// loop writing both stops there with output 1's packets never sent, and the
+/// reader never finishes opening the input that would have drained output 0.
+/// A writer per output takes that arc out: output 0's writer blocks alone.
+///
+/// Each pull's packets are flushed as they are written: a track as thin as an
+/// audio one takes minutes to push a buffer's worth on its own, and the
+/// reader waits all of it.
 ///
 /// Rows are a sink's alone; a source emits none in this wave.
 fn run_packet_source(args: &Args, module: &str, params: &str) -> Result<()> {
@@ -2302,51 +2312,95 @@ fn run_packet_source(args: &Args, module: &str, params: &str) -> Result<()> {
         .with_context(|| format!("opening module {module}"))?;
 
     let mut pending: Vec<Vec<runtime::Packet>> = selected.iter().map(|_| Vec::new()).collect();
-    let mut muxers: Vec<Option<FrameOutput>> = selected.iter().map(|_| None).collect();
+    // The count of leading `dts: None` packets, once the track has settled.
+    let mut delays: Vec<Option<u64>> = selected.iter().map(|_| None).collect();
 
-    while let Some(pads) = source
-        .next()
-        .with_context(|| format!("{}: pulling packets", source.name()))?
-    {
+    // Hold everything until every track's decode_delay is known.
+    let mut ended = false;
+    while delays.iter().any(Option::is_none) {
+        let Some(pads) = source
+            .next()
+            .with_context(|| format!("{}: pulling packets", source.name()))?
+        else {
+            ended = true;
+            break;
+        };
         for (slot, pad) in pads.into_iter().enumerate() {
             for packet in pad.packets {
-                if let Some(muxer) = muxers[slot].as_mut() {
-                    write_coded_packet(muxer, &packet)?;
-                    continue;
+                if delays[slot].is_none() && packet.dts.is_some() {
+                    delays[slot] = Some(pending[slot].len() as u64);
                 }
-                let settled = packet.dts.is_some();
                 pending[slot].push(packet);
-                if settled {
-                    let decode_delay = (pending[slot].len() - 1) as u64;
-                    settle_track(
-                        decode_delay,
-                        &catalog.tracks[slot],
-                        &args.outputs[slot],
-                        &mut pending[slot],
-                        &mut muxers[slot],
-                    )?;
-                }
             }
         }
     }
 
+    // Every header, each on its own pipe as it is written, before a packet
+    // goes anywhere.
+    let mut muxers: Vec<FrameOutput> = Vec::with_capacity(selected.len());
     for slot in 0..selected.len() {
-        if muxers[slot].is_none() {
-            let decode_delay = pending[slot].len() as u64;
-            settle_track(
-                decode_delay,
-                &catalog.tracks[slot],
-                &args.outputs[slot],
-                &mut pending[slot],
-                &mut muxers[slot],
-            )?;
-        }
+        let decode_delay = delays[slot].unwrap_or(pending[slot].len() as u64);
+        muxers.push(open_track(
+            decode_delay,
+            &catalog.tracks[slot],
+            &args.outputs[slot],
+        )?);
     }
 
-    for muxer in muxers.iter_mut().flatten() {
+    let mut senders = Vec::with_capacity(muxers.len());
+    let mut writers = Vec::with_capacity(muxers.len());
+    for (slot, muxer) in muxers.into_iter().enumerate() {
+        let (sender, batches) = mpsc::channel::<Vec<runtime::Packet>>();
+        let spelling = args.outputs[slot].spelling.clone();
+        senders.push(sender);
+        writers.push(thread::spawn(move || {
+            write_track(muxer, &batches).with_context(|| format!("writing output {spelling}"))
+        }));
+    }
+
+    // What the headers were holding back, then the pulls that follow. A send
+    // fails only once that output's writer has stopped, and its failure is
+    // what `join` below hands back.
+    let mut sending = true;
+    for (slot, sender) in senders.iter().enumerate() {
+        sending &= sender.send(std::mem::take(&mut pending[slot])).is_ok();
+    }
+    while sending && !ended {
+        let Some(pads) = source
+            .next()
+            .with_context(|| format!("{}: pulling packets", source.name()))?
+        else {
+            break;
+        };
+        for (slot, pad) in pads.into_iter().enumerate() {
+            sending &= senders[slot].send(pad.packets).is_ok();
+        }
+    }
+    drop(senders);
+
+    let mut wrote = Ok(());
+    for writer in writers {
+        let written = writer.join().unwrap_or_else(|panic| resume_unwind(panic));
+        if wrote.is_ok() {
+            wrote = written;
+        }
+    }
+    wrote
+}
+
+/// One output's packets, each batch flushed as it is written, until the pull
+/// loop has no more to send.
+fn write_track(
+    mut muxer: FrameOutput,
+    batches: &mpsc::Receiver<Vec<runtime::Packet>>,
+) -> Result<()> {
+    for batch in batches {
+        for packet in &batch {
+            write_coded_packet(&mut muxer, packet)?;
+        }
         muxer.finish()?;
     }
-    Ok(())
+    muxer.finish()
 }
 
 /// `-annotations in` on a module that neither reads the rows nor passes them

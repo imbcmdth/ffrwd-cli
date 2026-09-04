@@ -49,8 +49,8 @@ pub struct Muxer<W> {
 }
 
 impl<W: Write> Muxer<W> {
-    /// Writes the identifier and both headers, so the reader on the far side
-    /// knows the geometry before the first frame arrives.
+    /// Writes the identifier and both headers and flushes them, so the reader
+    /// on the far side knows the geometry before the first frame arrives.
     pub fn new(out: W, stream: &Stream) -> Result<Muxer<W>> {
         Muxer::open(out, stream, false)
     }
@@ -84,6 +84,10 @@ impl<W: Write> Muxer<W> {
             let header = annotation_stream_header(&muxer.stream);
             muxer.write_packet(STREAM_STARTCODE, &header)?;
         }
+        // A buffered writer would otherwise hold the headers until a
+        // megabyte of frames pushed them out, and a reader waiting on them
+        // waits that long.
+        muxer.out.flush()?;
         Ok(muxer)
     }
 
