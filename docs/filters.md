@@ -9,6 +9,7 @@ One calling convention:
 ```
 
 - **Stream inputs first.** Count and types come from the pad signature (`unsharp` is `V->V`: one video in; `xfade` is `VV->V`: two). Mismatch: `UDF_ARG_TYPE`.
+- **One name for both kinds.** A video filter whose audio twin ffmpeg also ships (`realtime`/`arealtime`, `setpts`/`asetpts`, `settb`/`asettb`, ...) is called by the bare video name over either column; the compiler picks the twin from the column's type. Only a true pair qualifies - a video-only filter and an audio-only `a<name>` - so `mix`/`amix` and `interleave`/`ainterleave`, which merely share a stem, stay two names. `ffmpeg.<name>(...)` is exact and never switches.
 - **Positional options bind in declared order** - the order `ffmpeg -help filter=<name>` prints, identical to how `gblur=5:1` binds in a filtergraph. `gblur(a.video[1], 5, 1)` is `sigma=5:steps=1`; `crop(a.video[1], 640, 360, 0, 0)` is `out_w=640:out_h=360:x=0:y=0`.
 - **Named options follow**, Postgres `name => value`: `unsharp(a.video[1], luma_amount => 1.5)`, or mixed after positionals. A positional after a named argument is rejected; a named argument naming an option already bound positionally is `FILTER_OPTION_TYPE` ("already set"), never a silent override.
 
