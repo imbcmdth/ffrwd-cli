@@ -5638,7 +5638,9 @@ def _embed_described(*, result_type: str = "array") -> Described:
     )
 
 
-def _embed_invoke(module: str, function: str, args: Mapping[str, object]) -> object:
+def _embed_invoke(
+    module: str, function: str, args: Mapping[str, object], **_: object
+) -> object:
     return list(_EMBEDDINGS[str(args["text"])])
 
 
@@ -5777,7 +5779,7 @@ def test_cos_similarity_refuses_mismatched_lengths() -> None:
     with pytest.raises(FfrwdError) as caught:
         _ranked(
             sql,
-            invoke=lambda module, function, args: (
+            invoke=lambda module, function, args, **_: (
                 [1.0, 2.0] if args["text"] == "a cat sat on the mat" else [1.0, 2.0, 3.0]
             ),
         )
@@ -5801,7 +5803,7 @@ def test_a_vector_cell_prints_capped() -> None:
         {},
         registry=_snapshot_registry(),
         describes={EMBEDDER: _embed_described()},
-        invoke=lambda module, function, args: [0.0, 1.0, 2.0, 3.0, 4.0],
+        invoke=lambda module, function, args, **_: [0.0, 1.0, 2.0, 3.0, 4.0],
     )
     text = render_table(sinks[0].result)
     assert "[0.0, 1.0, 2.0, 3.0, ... (5)]" in text
@@ -5819,7 +5821,7 @@ def test_a_short_vector_prints_with_no_ellipsis() -> None:
         {},
         registry=_snapshot_registry(),
         describes={EMBEDDER: _embed_described()},
-        invoke=lambda module, function, args: [0.1, 0.2],
+        invoke=lambda module, function, args, **_: [0.1, 0.2],
     )
     text = render_table(sinks[0].result)
     assert "[0.1, 0.2]" in text

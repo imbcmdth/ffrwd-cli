@@ -13104,7 +13104,7 @@ def test_a_sink_call_has_no_cell_for_a_table_query_to_print() -> None:
         )
     err = _anchored(excinfo.value)
     assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "carries no streams, so there is nothing to print" in err.message
+    assert "is a sink and prints no table" in err.message
 
 
 def test_a_ladder_republished_through_a_row_reading_sink_is_five_pads() -> None:

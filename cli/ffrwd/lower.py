@@ -2615,6 +2615,20 @@ def _written_params(params: Mapping[str, object]) -> str:
     return written or "no arguments"
 
 
+def _scalar_columns(
+    columns: Mapping[str, RowValue],
+) -> dict[str, str | int | float | bool | None]:
+    """A URL source row's columns as the scalars they are.
+
+    A source's catalog carries no vector - `_url_source_types` refused one
+    before this is reached - so the narrowing only tells the type checker
+    what the rows already guarantee.
+    """
+    return {
+        name: value for name, value in columns.items() if not isinstance(value, tuple)
+    }
+
+
 def _url_column_type(value: str | int | float | bool) -> RowColumnType:
     """The row-column type one JSON scalar reads as."""
     if isinstance(value, bool):
@@ -2656,6 +2670,12 @@ def _url_source_types(
             value = row.columns[column]
             if value is None:
                 continue
+            if isinstance(value, tuple):
+                raise refuse(
+                    f"column '{alias}.{column}' is a vector",
+                    "a source's columns are text, number or boolean; a vector "
+                    "rides in a row a module writes, not in a source's catalog",
+                )
             written = _url_column_type(value)
             if settled is not None and written != settled:
                 raise refuse(
@@ -6729,12 +6749,12 @@ class _Lowerer:
                     name=row.name,
                     language=row.language,
                     program_id=None,
-                    extra=row.columns,
+                    extra=_scalar_columns(row.columns),
                 )
             )
             streams.extend(probed.streams)
             rows.append(
-                UrlSourceRow(url=row.url, input=index, columns=dict(row.columns))
+                UrlSourceRow(url=row.url, input=index, columns=_scalar_columns(row.columns))
             )
         self.probes[alias] = ProbeResult(
             streams=streams, renditions=renditions, live=not payload.bounded
