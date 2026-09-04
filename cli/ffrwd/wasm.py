@@ -98,6 +98,7 @@ __all__ = [
     "probe_source",
     "rows_arms",
     "rows_fields",
+    "rows_vector_dims",
     "shown_argv",
     "sidecar_argv",
     "wire_audio",
@@ -1449,6 +1450,43 @@ def _arm(schema: Mapping[str, object]) -> tuple[tuple[str, str], ...]:
         kind = member.get("type") if isinstance(member, dict) else None
         found.append((str(name), kind if isinstance(kind, str) else ""))
     return tuple(sorted(found))
+
+
+def rows_vector_dims(described: Described, field: str) -> int | None:
+    """The fixed length `field` takes in the module's own rows schema.
+
+    A vector track's ``vector_dims`` tag comes from here: the module cannot
+    be asked how many rows it will write, but its schema can fix how many
+    numbers each one's vector carries -- ``{"type": "array", "items":
+    {"type": "number"}, "minItems": N, "maxItems": N}`` with the two bounds
+    equal. Read across every arm a ``oneOf`` publishes; fixed only when
+    every arm naming `field` agrees. None when the module names no rows
+    schema, when no arm carries `field`, or when its length is not fixed.
+    """
+    schema = described.rows_schema
+    if schema is None:
+        return None
+    branches = schema.get("oneOf")
+    arms: list[Mapping[str, object]] = (
+        [branch for branch in branches if isinstance(branch, dict)]
+        if isinstance(branches, list) and branches
+        else [schema]
+    )
+    dims: int | None = None
+    for arm in arms:
+        properties = arm.get("properties")
+        if not isinstance(properties, dict):
+            continue
+        member = properties.get(field)
+        if not isinstance(member, dict):
+            continue
+        lo, hi = member.get("minItems"), member.get("maxItems")
+        if not (isinstance(lo, int) and isinstance(hi, int) and lo == hi):
+            return None
+        if dims is not None and dims != lo:
+            return None
+        dims = lo
+    return dims
 
 
 def language_tag(code: str) -> str | None:

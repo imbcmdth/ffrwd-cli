@@ -5673,6 +5673,68 @@ def test_the_rows_leave_the_consumer_not_the_producer() -> None:
     assert graph.rows_sinks[consumer.id].container == "webvtt"
 
 
+_VECTOR_ROWS_FIXED: dict[str, object] = {
+    "type": "object",
+    "properties": {
+        "start_t": {"type": "number"},
+        "end_t": {"type": "number"},
+        "vec": {
+            "type": "array",
+            "items": {"type": "number"},
+            "minItems": 2,
+            "maxItems": 2,
+        },
+    },
+    "required": ["start_t", "end_t", "vec"],
+    "additionalProperties": False,
+}
+
+_VECTOR_ROWS_UNFIXED: dict[str, object] = {
+    "type": "object",
+    "properties": {
+        "start_t": {"type": "number"},
+        "end_t": {"type": "number"},
+        "vec": {"type": "array", "items": {"type": "number"}},
+    },
+    "required": ["start_t", "end_t", "vec"],
+    "additionalProperties": False,
+}
+
+_VECTOR_ROWS_RETURNS = "STRUCT(start_t number, end_t number, vec vector)[]"
+
+
+def test_a_rows_modules_vector_output_tags_the_track_it_mints() -> None:
+    """The module's own schema fixes `vector_dims` -- the compiler cannot
+    count a run-time module's rows itself, the way it counts a compile-time
+    ``ARRAY[...]::embedding``."""
+    sql = _CAPTIONS_DECLARE + _fauxlate_declare(returns=_VECTOR_ROWS_RETURNS) + _copy(
+        "s.video[1], fauxlate(captions(s.video[1]).cues) AS clip_vectors",
+        path="out.mkv",
+    )
+    described = _rows_module_described(writes=_VECTOR_ROWS_FIXED)
+    graph = _rows_module_plan(sql, described).graphs[0]
+    assert graph.outputs[1].metadata == {"title": "clip_vectors", "vector_dims": "2"}
+
+
+def test_a_rows_modules_unfixed_vector_length_is_refused_at_the_track() -> None:
+    """A vector passed module to module names no length at all (see
+    `test_an_annotation_field_may_be_a_vector`); one reaching a track needs
+    one fixed, and is refused here rather than minting an untagged track."""
+    sql = _CAPTIONS_DECLARE + _fauxlate_declare(returns=_VECTOR_ROWS_RETURNS) + _copy(
+        "s.video[1], fauxlate(captions(s.video[1]).cues) AS clip_vectors",
+        path="out.mkv",
+    )
+    described = _rows_module_described(writes=_VECTOR_ROWS_UNFIXED)
+    error = _rows_module_rejects(
+        sql,
+        ErrorCode.UNSUPPORTED_SQL,
+        f"declares 'vec' as vector, and the module '{ROWS_MODULE}' does not "
+        "fix its length",
+        described,
+    )
+    assert error.hint is not None and "minItems" in error.hint
+
+
 def test_one_sidecar_hosts_the_producer_and_the_rows_module() -> None:
     plan = _rows_module_plan(ROWS_RECIPE).plan
     assert plan is not None

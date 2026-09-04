@@ -457,6 +457,7 @@ from ffrwd.wasm import (
     input_rows_arms,
     language_tag,
     rows_arms,
+    rows_vector_dims,
 )
 from ffrwd.wasm import invoke as wasm_invoke
 from ffrwd.wasm import probe_source as wasm_probe_source
@@ -1152,6 +1153,14 @@ def _stream_projection(
 def _annotation_fields(annotation: Annotation) -> tuple[tuple[str, str], ...]:
     """One annotation record's fields, name-ordered, for comparing two of them."""
     return tuple(sorted((f.name, f.type) for f in annotation.fields))
+
+
+def _vector_field(annotation: Annotation) -> str | None:
+    """The name of `annotation`'s vector-typed field, or None if it has none."""
+    for f in annotation.fields:
+        if f.type == "vector":
+            return f.name
+    return None
 
 
 def _is_cue_array(node: exp.Expr) -> bool:
@@ -9794,7 +9803,14 @@ class _Lowerer:
         assert declared.emits is not None  # what `_rows_projection` selected on
         self.rows_producers[id(node)] = (module.streams[0].ref, module.type, declared.emits)
         return self._rows_output(
-            module.streams[0].ref, module.type, declared, call, node, env, select
+            module.streams[0].ref,
+            module.type,
+            declared,
+            declared.emits,
+            call,
+            node,
+            env,
+            select,
         )
 
     def _rows_output(
@@ -9802,6 +9818,7 @@ class _Lowerer:
         producer: FrameRef,
         kind: StreamType,
         declared: WasmFunction,
+        annotation: Annotation,
         call: exp.Anonymous,
         node: exp.Expr,
         env: _Env,
@@ -9811,18 +9828,33 @@ class _Lowerer:
 
         The one place a row column becomes an output, whichever node ends the
         rows -- the module that read them off its frames, or the rows module
-        that ran over them afterwards.
+        that ran over them afterwards. `annotation` is that end's own record
+        -- `declared.emits` or `declared.returns_rows`. A vector field passed
+        module to module, never written to a track, names no length at all;
+        one reaching a track here needs one fixed, which is what
+        :meth:`_check_vector_dims` checks -- only at this, its one path to an
+        output, and not at every call a vector annotation happens to pass
+        through.
         """
         if self.rows_file:
             self.graph.rows_sinks[producer] = RowsSink(
                 container=_ROWS_CONTAINER, path=self.rows_file
             )
             return _Value(type=kind, streams=(), is_array=False)
+        described = self.describes.get(declared.module)
+        assert described is not None  # the caller already described it
+        self._check_vector_dims(declared, annotation, described, node, select)
         tag = self._rows_language(declared, call, node, env, select)
         ref = self._mint_stream_input(
             CUES_COLUMN, PIPE, WEBVTT_FORMAT, "subtitle"
         )
-        self.minted_track_meta[ref] = {}
+        meta: dict[str, str] = {}
+        field = _vector_field(annotation)
+        if field is not None:
+            dims = rows_vector_dims(described, field)
+            assert dims is not None  # _check_vector_dims just fixed one
+            meta[VECTOR_DIMS_TAG] = str(dims)
+        self.minted_track_meta[ref] = meta
         self.graph.rows_sinks[producer] = RowsSink(
             container=WEBVTT_FORMAT, alias=src_alias(ref)
         )
@@ -9856,7 +9888,7 @@ class _Lowerer:
         call, declared = found
         ref, kind, emitted = self._rows_node(node, env, select)
         self.rows_producers[id(node)] = (ref, kind, emitted)
-        return self._rows_output(ref, kind, declared, call, node, env, select)
+        return self._rows_output(ref, kind, declared, emitted, call, node, env, select)
 
     def _rows_node(
         self, node: exp.Expr, env: _Env, select: exp.Select
@@ -11784,6 +11816,36 @@ class _Lowerer:
             hint="an annotation record names the module's own row columns, "
             "with a type each value fits",
         )
+
+    def _check_vector_dims(
+        self,
+        declared: WasmFunction,
+        annotation: Annotation,
+        described: Described,
+        node: exp.Expr,
+        select: exp.Select,
+    ) -> None:
+        """A vector-typed annotation field's length, fixed by the module's schema.
+
+        The declaration says a field is a vector; only the module's own
+        schema says how many numbers one carries, and that is what tags the
+        track the field becomes (:meth:`_rows_output`). A field the schema
+        does not fix a length for is refused here, rather than minting a
+        track later with nothing to tag it.
+        """
+        field = _vector_field(annotation)
+        if field is None:
+            return
+        if rows_vector_dims(described, field) is None:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"function '{declared.name}' declares '{field}' as vector, and "
+                f"the module '{declared.module}' does not fix its length",
+                node,
+                fallback=select,
+                hint="a vector track needs its dimension: declare minItems and "
+                "maxItems on the field",
+            )
 
     def _wasm_params(
         self,
