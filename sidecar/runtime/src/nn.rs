@@ -700,13 +700,17 @@ mod tests {
 
     #[test]
     fn the_gpu_walk_skips_an_excluded_candidate_before_its_preflight() {
+        // The platform's own first candidate: DirectML on Windows, CUDA on
+        // Linux, CoreML on macOS.
+        let first = GPU_PRIORITY[0];
         let dir = empty_dir("exclude-one");
-        let (provider, notes) = resolve(Target::Gpu, &dir, &[Provider::DirectMl]);
+        let (provider, notes) = resolve(Target::Gpu, &dir, &[first]);
         assert_eq!(provider, Provider::Cpu);
+        let named = format!("not {}", format!("{first:?}").to_uppercase());
         assert!(
             notes
                 .iter()
-                .any(|n| n.contains("not DIRECTML") && n.contains("excluded by -nn-exclude")),
+                .any(|n| n.contains(&named) && n.contains("excluded by -nn-exclude")),
             "{notes:?}"
         );
     }

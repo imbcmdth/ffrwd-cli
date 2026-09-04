@@ -116,6 +116,10 @@ def test_a_windows_pipe_starts_connecting_as_soon_as_it_is_made(tmp_path: Path) 
         pipe.close()
 
 
+@pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="the Windows connect has a deadline; a POSIX FIFO open blocks for its peer",
+)
 def test_a_wait_with_no_client_times_out_at_its_deadline(tmp_path: Path) -> None:
     """Nobody ever opens the path: `wait` gives up at `deadline` rather than
     hanging on a connect that has nothing to wait for."""
@@ -127,6 +131,10 @@ def test_a_wait_with_no_client_times_out_at_its_deadline(tmp_path: Path) -> None
         pipe.close()
 
 
+@pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="the Windows connect is cancelled by close; a POSIX FIFO open blocks for its peer",
+)
 def test_a_close_unblocks_a_wait_that_has_no_client_coming(tmp_path: Path) -> None:
     """A stage tears down mid-run: `close`, called from another thread, ends
     a `wait` still parked for a client that was never going to arrive."""
