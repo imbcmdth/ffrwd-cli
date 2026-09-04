@@ -34,9 +34,11 @@ import base64
 import functools
 import re
 import shlex
+import struct
 import subprocess
 import sys
 from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -6730,6 +6732,7 @@ def _track(
     *,
     language: str | None = None,
     title: str | None = None,
+    tags: dict[str, str] | None = None,
     **fields: object,
 ) -> StreamMeta:
     """One synthetic probed stream, every unset field NULL except `codec`.
@@ -6741,7 +6744,7 @@ def _track(
     the ffmpeg-cannot-carry-it case, rejected for media queries, and a test
     wanting that case says ``codec=None`` explicitly.
     """
-    metadata: dict[str, str] = {}
+    metadata: dict[str, str] = dict(tags or {})
     if language is not None:
         metadata["language"] = language
     if title is not None:
@@ -8436,7 +8439,8 @@ def test_a_bare_cues_column_prints_as_one_array_cell() -> None:
     )
     cell = sinks[0].result.rows[0][0]
     assert isinstance(cell, ArrayCell)
-    assert cell.elements[0] == RecordCell(fields=(1, "Cue one.", 0.0, 0.6))
+    # A document is its own track and has no title, so `track` reads NULL.
+    assert cell.elements[0] == RecordCell(fields=(1, None, "Cue one.", 0.0, 0.6))
 
 
 def test_cues_stay_out_of_a_container_star() -> None:
@@ -8452,19 +8456,13 @@ def test_cues_stay_out_of_a_container_star() -> None:
     ]
 
 
-def test_reading_cues_of_a_file_that_is_not_webvtt_is_a_typed_rejection() -> None:
-    err = _reject_lower_table(
-        "SELECT c.text FROM input('f.mkv') f, unnest(f.cues) c", _cue_probes()
+def test_a_container_with_no_caption_track_reads_no_cues() -> None:
+    """A file that carries none has none to show -- zero rows, not a rejection."""
+    sinks = lower_table(
+        resolve(parse("SELECT c.text FROM input('f.mkv') f, unnest(f.cues) c")),
+        _cue_probes(),
     )
-    assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "'f.mkv' is matroska,webm, not WebVTT" in err.message
-    assert "a webvtt track inside a container is not read" in (err.hint or "")
-
-
-def test_a_bare_cues_column_rejects_a_file_that_is_not_webvtt_too() -> None:
-    err = _reject_lower_table("SELECT f.cues FROM input('f.mkv') f", _cue_probes())
-    assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "not WebVTT" in err.message
+    assert sinks[0].result.rows == []
 
 
 def test_an_unreadable_input_rejects_cues_like_any_other_unnest() -> None:
@@ -8656,6 +8654,262 @@ def test_a_bare_cues_column_in_a_media_copy_is_a_typed_rejection() -> None:
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "'v.cues' carries no streams" in err.message
     assert "unnest(v.cues) c" in (err.hint or "")
+
+
+# ---------------------------------------------------------------------------
+# titled metadata tracks: a container's own cue and vector tracks, read and
+# written
+# ---------------------------------------------------------------------------
+
+# One vector per row of a 2-number track, as `_vector_payload` writes them:
+# little-endian f32, base64.
+_TWO_VECTORS = ((0.5, -0.25), (1.0, 0.0))
+
+
+def _payload(values: tuple[float, ...]) -> str:
+    return base64.b64encode(struct.pack(f"<{len(values)}f", *values)).decode()
+
+
+def _described_probes() -> dict[str, ProbeResult | None]:
+    """A container carrying video, a titled caption track, and a vector track."""
+    return {
+        "f": ProbeResult(
+            streams=[
+                _track("video", 0),
+                _track("subtitle", 0, title="speech", codec="webvtt"),
+                _track(
+                    "subtitle",
+                    1,
+                    title="clip_vectors",
+                    codec="webvtt",
+                    tags={"vector_dims": "2"},
+                ),
+            ],
+            format_name="matroska,webm",
+        ),
+        "g": ProbeResult(streams=[_track("video", 0)], format_name="matroska,webm"),
+    }
+
+
+def _extracted(
+    monkeypatch: pytest.MonkeyPatch, tracks: dict[int, list[CueMeta]]
+) -> None:
+    """Stand in for demuxing a caption track: `tracks` maps s:<index> to cues."""
+    monkeypatch.setattr(
+        lower_module,
+        "track_cues",
+        lambda spec, index, args=(): tracks.get(index, []),
+    )
+
+
+def _described_tracks() -> dict[int, list[CueMeta]]:
+    return {
+        0: [CueMeta(index=1, text="Hello", start_t=0.0, end_t=1.5)],
+        1: [
+            CueMeta(index=1, text=_payload(_TWO_VECTORS[0]), start_t=0.0, end_t=1.5),
+            CueMeta(index=2, text=_payload(_TWO_VECTORS[1]), start_t=1.5, end_t=3.0),
+        ],
+    }
+
+
+def test_cue_rows_read_a_containers_own_caption_tracks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The vector track is not among them: its blocks are payloads, not text."""
+    _extracted(monkeypatch, _described_tracks())
+    sinks = lower_table(
+        resolve(parse("SELECT c.track, c.index, c.text FROM input('d.mkv') f, unnest(f.cues) c")),
+        _described_probes(),
+    )
+    assert sinks[0].result.rows == [["speech", 1, "Hello"]]
+
+
+def test_vector_rows_read_the_numbers_their_tracks_dims_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _extracted(monkeypatch, _described_tracks())
+    sinks = lower_table(
+        resolve(
+            parse(
+                "SELECT v.track, v.start_t, v.end_t, vector_length(v.vector) "
+                "FROM input('d.mkv') f, unnest(f.embeddings) v"
+            )
+        ),
+        _described_probes(),
+    )
+    assert sinks[0].result.rows == [
+        ["clip_vectors", 0.0, 1.5, 2],
+        ["clip_vectors", 1.5, 3.0, 2],
+    ]
+
+
+def test_a_title_subscript_reads_one_track(monkeypatch: pytest.MonkeyPatch) -> None:
+    probes = _described_probes()
+    result = probes["f"]
+    assert result is not None
+    probes["f"] = replace(
+        result,
+        streams=[*result.streams, _track("subtitle", 2, title="notes", codec="webvtt")],
+    )
+    _extracted(
+        monkeypatch,
+        {**_described_tracks(), 2: [CueMeta(index=1, text="Aside", start_t=0.0, end_t=1.0)]},
+    )
+    sinks = lower_table(
+        resolve(parse("SELECT c.text FROM input('d.mkv') f, unnest(f.cues['notes']) c")),
+        probes,
+    )
+    assert sinks[0].result.rows == [["Aside"]]
+
+
+def test_a_title_no_track_carries_is_a_typed_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _extracted(monkeypatch, _described_tracks())
+    err = _reject_lower_table(
+        "SELECT c.text FROM input('d.mkv') f, unnest(f.cues['nope']) c",
+        _described_probes(),
+    )
+    assert err.code is ErrorCode.STREAM_NOT_FOUND
+    assert "carries no cues track titled 'nope'" in err.message
+    assert "the cues tracks it carries are titled 'speech'" in (err.hint or "")
+
+
+def test_a_vector_row_that_is_not_the_tracks_dims_is_a_typed_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _extracted(
+        monkeypatch,
+        {1: [CueMeta(index=1, text=_payload((1.0, 2.0, 3.0)), start_t=0.0, end_t=1.0)]},
+    )
+    err = _reject_lower_table(
+        "SELECT v.track FROM input('d.mkv') f, unnest(f.embeddings) v",
+        _described_probes(),
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "track 'clip_vectors' row 1 does not hold 2 numbers" in err.message
+
+
+def test_a_vector_track_whose_dims_tag_is_not_a_count_is_a_typed_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _extracted(monkeypatch, _described_tracks())
+    probes: dict[str, ProbeResult | None] = {
+        "f": ProbeResult(
+            streams=[
+                _track("subtitle", 0, title="clip_vectors", tags={"vector_dims": "many"})
+            ],
+            format_name="matroska,webm",
+        )
+    }
+    err = _reject_lower_table(
+        "SELECT v.track FROM input('d.mkv') f, unnest(f.embeddings) v", probes
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "track 'clip_vectors' says vector_dims='many'" in err.message
+
+
+def test_an_aliased_cue_array_titles_the_track_it_mints() -> None:
+    g = _lower(
+        "COPY (SELECT f.video[1], "
+        "ARRAY[STRUCT('Hello' AS text, 0 AS start_t, 1 AS end_t)::cue] AS speech "
+        "FROM input('f.mkv') f) TO 'out.mkv'",
+        _cue_probes(),
+    )
+    assert g.outputs[1].metadata == {"title": "speech"}
+
+
+def test_a_vector_track_is_written_back_from_the_rows_it_was_read_as(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The round trip: a file's own vector rows, written into a new one."""
+    _extracted(monkeypatch, _described_tracks())
+    g = _lower(
+        "COPY (SELECT g.video[1], array_agg(STRUCT(v.start_t AS start_t, "
+        "v.end_t AS end_t, v.vector AS vector)::embedding) AS clip_vectors "
+        "FROM input('o.mkv') g, input('d.mkv') f, unnest(f.embeddings) v "
+        "GROUP BY g.video[1]) TO 'out.mkv'",
+        _described_probes(),
+    )
+    assert g.outputs[1].metadata == {"title": "clip_vectors", "vector_dims": "2"}
+    assert _vtt_payload(g, 2) == (
+        "WEBVTT\n\n"
+        f"00:00:00.000 --> 00:00:01.500\n{_payload(_TWO_VECTORS[0])}\n\n"
+        f"00:00:01.500 --> 00:00:03.000\n{_payload(_TWO_VECTORS[1])}\n"
+    )
+
+
+def test_two_vector_lengths_in_one_track_are_refused_by_both_counts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _extracted(
+        monkeypatch,
+        {
+            1: [
+                CueMeta(index=1, text=_payload((1.0, 2.0)), start_t=0.0, end_t=1.0),
+                CueMeta(index=2, text=_payload((1.0, 2.0)), start_t=1.0, end_t=2.0),
+            ],
+            2: [CueMeta(index=1, text=_payload((1.0, 2.0, 3.0)), start_t=2.0, end_t=3.0)],
+        },
+    )
+    probes = _described_probes()
+    result = probes["f"]
+    assert result is not None
+    probes["f"] = replace(
+        result,
+        streams=[
+            *result.streams,
+            _track("subtitle", 2, title="other", tags={"vector_dims": "3"}),
+        ],
+    )
+    err = _reject_lower(
+        "COPY (SELECT g.video[1], array_agg(STRUCT(v.start_t AS start_t, "
+        "v.end_t AS end_t, v.vector AS vector)::embedding) AS all_vectors "
+        "FROM input('o.mkv') g, input('d.mkv') f, unnest(f.embeddings) v "
+        "GROUP BY g.video[1]) TO 'out.mkv'",
+        probes,
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "embedding 3 carries 3 numbers, and embedding 1 carries 2" in err.message
+
+
+def test_a_titled_track_into_a_container_that_is_not_matroska_is_refused() -> None:
+    err = _reject_lower(
+        "COPY (SELECT f.video[1], "
+        "ARRAY[STRUCT('Hello' AS text, 0 AS start_t, 1 AS end_t)::cue] AS speech "
+        "FROM input('f.mkv') f) TO 'out.mp4'",
+        _cue_probes(),
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'out.mp4' is mp4, and a titled track is Matroska's" in err.message
+    assert "write the file as .mkv" in (err.hint or "")
+
+
+def test_a_vector_track_into_a_container_that_is_not_matroska_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _extracted(monkeypatch, _described_tracks())
+    err = _reject_lower(
+        "COPY (SELECT g.video[1], array_agg(STRUCT(v.start_t AS start_t, "
+        "v.end_t AS end_t, v.vector AS vector)::embedding) AS clip_vectors "
+        "FROM input('o.mkv') g, input('d.mkv') f, unnest(f.embeddings) v "
+        "GROUP BY g.video[1]) TO 'out.mp4'",
+        _described_probes(),
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'out.mp4' is mp4, and a vector track is Matroska's" in err.message
+    assert "no other container keeps its vector_dims tag" in err.message
+
+
+def test_an_untitled_caption_track_still_writes_to_any_container() -> None:
+    """The refusal is about what a container LOSES, not about the track."""
+    g = _lower(
+        "COPY (SELECT f.video[1], "
+        "ARRAY[STRUCT('Hello' AS text, 0 AS start_t, 1 AS end_t)::cue] "
+        "FROM input('f.mkv') f) TO 'out.mp4'",
+        _cue_probes(),
+    )
+    assert [output.metadata for output in g.outputs] == [{}, {}]
 
 
 # ---------------------------------------------------------------------------
@@ -12830,6 +13084,27 @@ def _row_sink_rejects(
     with pytest.raises(FfrwdError) as excinfo:
         _row_sink_graph(sql, probes, described)
     return _anchored(excinfo.value)
+
+
+def test_a_sink_call_has_no_cell_for_a_table_query_to_print() -> None:
+    """A sink CONSUMES the streams its column named, so the column carries
+    none -- and a table query prints cells, not destinations."""
+    with pytest.raises(FfrwdError) as excinfo:
+        lower_table(
+            resolve(
+                parse(
+                    ROW_SINK_DECLARE
+                    + "COPY (SELECT r.video[1] FROM input('f.mkv') r) "
+                    "TO publish('relay', 'live')"
+                )
+            ),
+            {"r": ProbeResult(streams=[_track("video", 0)])},
+            registry=_snapshot_registry(),
+            describes={ROW_SINK_MODULE: _row_sink_described()},
+        )
+    err = _anchored(excinfo.value)
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "carries no streams, so there is nothing to print" in err.message
 
 
 def test_a_ladder_republished_through_a_row_reading_sink_is_five_pads() -> None:

@@ -3159,3 +3159,67 @@ $ ffrwd -f query.sql
 There is no vector literal - `ARRAY[0.1, 0.2]` names an array of numbers, not the dialect's `vector`, so the only way to a vector value is a value function's own RETURNS, over a row column or a literal alike, the same per-row footing every value function stands on. `r.blurb` feeds `embed_text` once per row, memoized on its argument the way any other value call is; `embed_text('a small pet')` runs once, since its argument is a literal. The two calls in `ORDER BY` and `SELECT` name the same row and the same literal, so they cost one call each, not two.
 
 `embed_text` here is `fauxlate.wasm`'s third export - a stand-in for a real embedder, same as `translate` stands in for a real translator ([recipe 113](#113-translate-captions-as-they-are-produced)). It counts each blurb's letters into eight buckets and L2-normalizes, so a blurb closer in cosine to `'a small pet'` is one that shares more letters with it, not one that means anything like it - which is why `car` and `dog` outrank `cat` above.
+
+## 118. Write rows as titled tracks
+
+A cue array in a stream position is a subtitle track; an ALIAS on it is that track's title, and several such columns are several tracks. An `embedding` array is the same shape over vectors instead of text - one row per span, its `vector` field a number list a `RETURNS vector` function produced - and it writes a track whose blocks hold those numbers as little-endian f32 in base64, tagged with how many each carries:
+
+```pgsql
+CREATE FUNCTION embed_text(prompt text) RETURNS vector
+  AS '../sidecar/modules/target/wasm32-wasip2/release/fauxlate.wasm', 'embed_text'
+  LANGUAGE wasm;
+
+COPY (
+  SELECT f.video[1], f.audio[1],
+         array_agg(STRUCT(r.line AS text, r.start_t AS start_t,
+                          r.end_t AS end_t)::cue) AS speech,
+         array_agg(STRUCT(r.start_t AS start_t, r.end_t AS end_t,
+                          embed_text(r.line) AS vector)::embedding) AS clip_vectors
+  FROM input('tests/fixtures/av.mp4') f,
+       unnest(ARRAY[
+         STRUCT('a cat sat on the mat' AS line, 0 AS start_t, 1.5 AS end_t),
+         STRUCT('a dog ran in the yard' AS line, 1.5 AS start_t, 3 AS end_t)
+       ]) r
+  GROUP BY f.video[1], f.audio[1]
+) TO 'described.mkv'
+```
+
+```
+$ ffrwd compile -f query.sql
+ffmpeg -i tests/fixtures/av.mp4 -f webvtt -i \
+  'data:text/vtt;'\
+'base64,'\
+'V0VCVlRUCgowMDowMDowMC4wMDAgLS0+IDAwOjAwOjAxLjUwMAphIGNhdCBzYXQgb24gdGhlIG1hdAoKMDA6MDA6MDEuNTAwIC0tPiAwMDowMDowMy4wMDAKYSBkb2cgcmFuIGluIHRoZSB5YXJkCg==' \
+  -f webvtt -i \
+  'data:text/vtt;'\
+'base64,'\
+'V0VCVlRUCgowMDowMDowMC4wMDAgLS0+IDAwOjAwOjAxLjUwMAorNlk3UC9reitqMEFBQUFBZkdBY1Ava3plajRBQUFBQUFBQUFBUGt6K2owPQoKMDA6MDA6MDEuNTAwIC0tPiAwMDowMDowMy4wMDAKOHdRMVB3QUFBQUFBQUFBQWRka1dQd0FBQUFEdlcvRTk4d1MxUHU5YjhUMD0K' \
+  -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -map 1:s:0 -c:2 copy -metadata:s:2 \
+  title=speech -map 2:s:0 -c:3 copy -metadata:s:3 title=clip_vectors -metadata:s:3 \
+  vector_dims=8 described.mkv
+```
+
+`-metadata:s:2 title=speech` and `-metadata:s:3 title=clip_vectors` are the aliases, and `vector_dims=8` is the width `embed_text` returned - the tag that says a track holds vectors rather than captions, and how to read them. The row's other fields are not in the payload: a block's bounds are its span, and the title is the column's.
+
+Matroska only. A titled track written anywhere else comes back under a different name or under none, and no other container keeps `vector_dims` at all, so a `.mp4` destination is refused by name and the hint says `.mkv`. An UNTITLED cue array still writes wherever captions do ([recipe 65](#65-turn-chapters-into-a-subtitle-track-and-back)).
+
+## 119. Read a described file's rows back
+
+The mirror: `embeddings` is the rows of every vector track a file carries, read at compile time by extracting each track once, and `track` names the title it came from.
+
+```pgsql
+SELECT v.track, v.start_t, v.end_t, vector_length(v.vector) AS dims
+FROM input('tests/fixtures/described.mkv') f, unnest(f.embeddings) v
+```
+
+```
+$ ffrwd -f query.sql
+ track        | start_t | end_t | dims
+--------------+---------+-------+------
+ clip_vectors | 0.0     | 1.5   | 8
+ clip_vectors | 1.5     | 3.0   | 8
+ clip_vectors | 3.0     | 4.0   | 8
+(3 rows)
+```
+
+`cues` reads back the same way over the caption tracks - `unnest(f.cues) c` is every one of them, with `c.track`, `c.text` and the bounds - and a title names one track: `unnest(f.embeddings['clip_vectors']) v`, `unnest(f.cues['speech']) c`. A title the file does not carry is a rejection listing the ones it does. The rows are compile-time rows like any other, so `WHERE`, `ORDER BY` and `cos_similarity(v.vector, embed_text('a small pet'))` narrow and rank them ([recipe 114](#114-rank-rows-by-a-vector)) before anything runs.

@@ -12,9 +12,11 @@ field's ``type`` is another type's name, ``[]``-suffixed for an array.
 
 Kinds:
 
-    scalar     ``text``, ``number``, ``boolean`` — Postgres typing; boolean
-               is what a `flag` entry holds and what a predicate answers,
-               never a column of its own.
+    scalar     ``text``, ``number``, ``boolean``, ``vector`` — Postgres
+               typing; boolean is what a `flag` entry holds and what a
+               predicate answers, never a column of its own. A vector is a
+               list of numbers read by `cos_similarity`/`vector_length` and
+               by nothing else.
     handle     internal, with no name in the language: ``stream`` is the
                graph node behind a stream record — no field carries it,
                since the record IS the stream — and ``seek`` is
@@ -23,7 +25,8 @@ Kinds:
                ``subtitle_stream``, ``data_stream``. The record IS the
                stream; identity is nominal, never field-by-field.
     record     a record that is not a stream and is a set of rows:
-               ``chapter``, ``attachment``, ``cue``. An array of one unnests.
+               ``chapter``, ``attachment``, ``cue``, ``embedding``. An array
+               of one unnests.
     map        a key/value record read by path off the column that holds it:
                ``tag``, ``flag``. ``f.tags.title`` names one entry; the array
                is never a set of rows, so it never unnests.
@@ -63,6 +66,8 @@ __all__ = [
     "CUE_TYPE",
     "DISPOSITION_COLUMN",
     "DISPOSITION_KEYS",
+    "EMBEDDINGS_COLUMN",
+    "EMBEDDING_TYPE",
     "INPUT_COLUMNS",
     "INPUT_DURATION_COLUMN",
     "MAP_ELEMENTS",
@@ -79,6 +84,7 @@ __all__ = [
     "STREAM_TAG_COLUMNS",
     "TAGS_COLUMN",
     "TIME_COLUMN",
+    "TRACK_RECORD_COLUMNS",
     "TYPES",
     "UNNEST_COLUMNS",
     "Field",
@@ -95,11 +101,13 @@ TypeKind = Literal["scalar", "handle", "stream", "record", "map", "container"]
 # The compile-time type of a row column. `text` and `number` are probed
 # metadata, comparable against literals of the matching kind and nothing else;
 # `stream` is what a bare row alias types as — the row itself, the only thing
-# that can BE an output; `tag[]` and `flag[]` are map columns, read one key at
-# a time by path and never comparable whole.
-RowColumnType = str  # "stream" | "text" | "number" | "tag[]" | "flag[]"
+# that can BE an output; `vector` is a list of numbers that compares with
+# nothing and reads through `cos_similarity`/`vector_length`; `tag[]` and
+# `flag[]` are map columns, read one key at a time by path and never
+# comparable whole.
+RowColumnType = str  # "stream" | "text" | "number" | "vector" | "tag[]" | "flag[]"
 
-COLUMN_TYPES = frozenset({"stream", "text", "number"})
+COLUMN_TYPES = frozenset({"stream", "text", "number", "vector"})
 
 _ARRAY_SUFFIX = "[]"
 
@@ -231,6 +239,9 @@ _DECLARED: tuple[Type, ...] = (
     Type("text", "scalar"),
     Type("number", "scalar"),
     Type("boolean", "scalar"),
+    # A list of numbers — an embedding. Read by `cos_similarity` and
+    # `vector_length`; it has no order, no text form, and no literal.
+    Type("vector", "scalar"),
     # Internal, unnameable in the language: the graph node a stream record
     # stands for, and the seek handle `<alias>.t`.
     Type("stream", "handle"),
@@ -293,15 +304,32 @@ _DECLARED: tuple[Type, ...] = (
     ),
     # A cue is a chapter's twin: a caption over a time span. Same field order,
     # so the two convert into each other by swapping the cast. `index` is the
-    # cue's place in the WebVTT document, 1-based.
+    # cue's place in the WebVTT document, 1-based; `track` is the title of the
+    # subtitle track it was read out of, and a written cue takes its title
+    # from the column's own alias instead.
     Type(
         "cue",
         "record",
         (
             _ro("index", "number"),
+            _ro("track", "text"),
             _w("text", "text"),
             _w("start_t", "number"),  # seconds
             _w("end_t", "number"),  # seconds
+        ),
+    ),
+    # A vector over a time span: what an embedder wrote about that stretch of
+    # the file. `index` and `track` read like a cue's; `vector` is the
+    # embedding itself.
+    Type(
+        "embedding",
+        "record",
+        (
+            _ro("index", "number"),
+            _ro("track", "text"),
+            _w("start_t", "number"),  # seconds
+            _w("end_t", "number"),  # seconds
+            _w("vector", "vector"),
         ),
     ),
     Type(
@@ -315,10 +343,14 @@ _DECLARED: tuple[Type, ...] = (
             _w("subtitle", "subtitle_stream[]"),
             _w("data", "data_stream[]"),
             _w("chapters", "chapter[]"),
-            # Read-only: a WebVTT document's cues, parsed by ffrwd itself.
-            # A cue array is WRITTEN in a stream position (it IS a subtitle
-            # track), never as a column named `cues`.
+            # Read-only: the cues of a WebVTT document, or of every caption
+            # track a container carries. A cue array is WRITTEN in a stream
+            # position (it IS a subtitle track), never as a column named
+            # `cues`.
             _ro("cues", "cue[]"),
+            # Read-only, the same way: the rows of every vector track the
+            # container carries. Written in a stream position too.
+            _ro("embeddings", "embedding[]"),
             _w("attachments", "attachment[]"),
             # The seek handle: legal only in a WHERE trim window, never a
             # value and never part of SELECT *.
@@ -406,6 +438,18 @@ CUES_COLUMN = _sole(
     "the cue array column",
 )
 CUE_TYPE = RECORD_ELEMENTS[CUES_COLUMN]
+
+# The container column an input's vector tracks are read as, and the record
+# each row holds.
+EMBEDDINGS_COLUMN = _sole(
+    tuple(name for name, record in RECORD_ELEMENTS.items() if record == "embedding"),
+    "the embedding array column",
+)
+EMBEDDING_TYPE = RECORD_ELEMENTS[EMBEDDINGS_COLUMN]
+
+# The record columns read out of a container's TRACKS rather than off the
+# probe: their rows come from the caption documents ffrwd extracts.
+TRACK_RECORD_COLUMNS = frozenset({CUES_COLUMN, EMBEDDINGS_COLUMN})
 
 # The container column an input's attachment list lives in, and the record it
 # holds.

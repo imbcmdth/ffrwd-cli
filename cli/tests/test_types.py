@@ -28,6 +28,7 @@ EXPECTED_FIELDS: dict[str, dict[str, tuple[str, str]]] = {
     "text": {},
     "number": {},
     "boolean": {},
+    "vector": {},
     "stream": {},
     "seek": {},
     "tag": {"key": ("text", "W"), "value": ("text", "W")},
@@ -81,9 +82,17 @@ EXPECTED_FIELDS: dict[str, dict[str, tuple[str, str]]] = {
     },
     "cue": {
         "index": ("number", "RO"),
+        "track": ("text", "RO"),
         "text": ("text", "W"),
         "start_t": ("number", "W"),
         "end_t": ("number", "W"),
+    },
+    "embedding": {
+        "index": ("number", "RO"),
+        "track": ("text", "RO"),
+        "start_t": ("number", "W"),
+        "end_t": ("number", "W"),
+        "vector": ("vector", "W"),
     },
     "container": {
         "video": ("video_stream[]", "W"),
@@ -92,6 +101,7 @@ EXPECTED_FIELDS: dict[str, dict[str, tuple[str, str]]] = {
         "data": ("data_stream[]", "W"),
         "chapters": ("chapter[]", "W"),
         "cues": ("cue[]", "RO"),
+        "embeddings": ("embedding[]", "RO"),
         "attachments": ("attachment[]", "W"),
         "t": ("seek", "RO"),
         "duration": ("number", "RO"),
@@ -112,6 +122,7 @@ EXPECTED_KINDS = {
     "text": "scalar",
     "number": "scalar",
     "boolean": "scalar",
+    "vector": "scalar",
     "stream": "handle",
     "seek": "handle",
     "tag": "map",
@@ -123,6 +134,7 @@ EXPECTED_KINDS = {
     "chapter": "record",
     "attachment": "record",
     "cue": "record",
+    "embedding": "record",
     "container": "container",
 }
 
@@ -163,9 +175,17 @@ EXPECTED_ROW_SCHEMAS = {
     },
     "cues": {
         "index": "number",
+        "track": "text",
         "text": "text",
         "start_t": "number",
         "end_t": "number",
+    },
+    "embeddings": {
+        "index": "number",
+        "track": "text",
+        "start_t": "number",
+        "end_t": "number",
+        "vector": "vector",
     },
     "attachments": {
         "index": "number",
@@ -184,6 +204,7 @@ EXPECTED_INPUT_COLUMNS = frozenset(
         "duration",
         "chapters",
         "cues",
+        "embeddings",
         "attachments",
         "tags",
     }
@@ -194,6 +215,7 @@ EXPECTED_STREAM_ARRAY_COLUMNS = frozenset({"video", "audio", "subtitle", "data"}
 EXPECTED_UNNEST_COLUMNS = EXPECTED_STREAM_ARRAY_COLUMNS | {
     "chapters",
     "cues",
+    "embeddings",
     "attachments",
 }
 
@@ -214,7 +236,8 @@ EXPECTED_ROW_STAR_COLUMNS = {
     "subtitle": ("index", "codec"),
     "data": ("index", "codec"),
     "chapters": ("index", "title", "start_t", "end_t"),
-    "cues": ("index", "text", "start_t", "end_t"),
+    "cues": ("index", "track", "text", "start_t", "end_t"),
+    "embeddings": ("index", "track", "start_t", "end_t", "vector"),
     "attachments": ("index", "filename", "mimetype"),
 }
 
@@ -226,7 +249,8 @@ EXPECTED_ROW_READONLY_FIELDS = {
     "subtitle": frozenset({"index", "codec"}),
     "data": frozenset({"index", "codec"}),
     "chapters": frozenset({"index"}),
-    "cues": frozenset({"index"}),
+    "cues": frozenset({"index", "track"}),
+    "embeddings": frozenset({"index", "track"}),
     "attachments": frozenset({"index"}),
 }
 
@@ -396,7 +420,9 @@ def test_star_column_views() -> None:
 
 def test_read_only_field_views() -> None:
     assert types.ROW_READONLY_FIELDS == EXPECTED_ROW_READONLY_FIELDS
-    assert types.CONTAINER_READONLY_FIELDS == frozenset({"t", "duration", "cues"})
+    assert types.CONTAINER_READONLY_FIELDS == frozenset(
+        {"t", "duration", "cues", "embeddings"}
+    )
     # On a STREAM row the writable half is exactly the maps, which have
     # spellings of their own; a chapter's title and bounds are writable too.
     for column in types.STREAM_ARRAY_COLUMNS:
@@ -410,6 +436,9 @@ def test_named_column_views() -> None:
     assert types.CHAPTERS_COLUMN == "chapters"
     assert types.ATTACHMENTS_COLUMN == "attachments"
     assert types.ATTACHMENT_TYPE == "attachment"
+    assert types.EMBEDDINGS_COLUMN == "embeddings"
+    assert types.EMBEDDING_TYPE == "embedding"
+    assert types.TRACK_RECORD_COLUMNS == frozenset({"cues", "embeddings"})
     assert types.INPUT_DURATION_COLUMN == "duration"
     assert types.TIME_COLUMN == "t"
 

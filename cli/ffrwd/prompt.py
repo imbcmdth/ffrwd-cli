@@ -643,15 +643,19 @@ _DIALECT_TAIL = """\
 
 ### Cues
 - `cues` is a second record array of the input alias, the cues of a WebVTT
-  document: `FROM input('subs.en.vtt') v, unnest(v.cues) c`. ffprobe does
-  not list cues, so ffrwd reads the `.vtt` file itself -- only a WebVTT
-  input has any, and unnesting the cues of anything else is a typed
-  rejection naming what the file is. A webvtt track inside a container is
-  not read. `cues` is read-only, so it is not part of `SELECT *` and
+  document -- `FROM input('subs.en.vtt') v, unnest(v.cues) c` -- or of every
+  caption track a container carries: `FROM input('film.mkv') f,
+  unnest(f.cues) c`. ffprobe does not list cues, so ffrwd reads the document
+  itself, extracting an embedded track once. A file with no caption track
+  reads zero rows. `cues` is read-only, so it is not part of `SELECT *` and
   `... AS cues` is a rejection.
-- Every row carries `index` (1-based, the document's own order), `text`,
-  `start_t`, `end_t` (seconds). A cue is not a stream, so the rows read
-  exactly like chapter rows.
+- Every row carries `index` (1-based, its own track's order), `track` (the
+  title of the track it came from, `NULL` for a `.vtt` document and for an
+  untitled track), `text`, `start_t`, `end_t` (seconds). A cue is not a
+  stream, so the rows read exactly like chapter rows.
+- `unnest(f.cues['speech']) c` reads ONE track, the one titled `speech`; a
+  title the file does not carry is a typed rejection listing the ones it
+  does.
 - To WRITE cues, put an array of `cue` records in a STREAM position -- it IS
   a WebVTT subtitle track, not a column: `SELECT f.video[1], f.audio[1],
   ARRAY[STRUCT('Hello' AS text, 0 AS start_t, 2.5 AS end_t)::cue] FROM
@@ -667,6 +671,25 @@ _DIALECT_TAIL = """\
   `array_agg(STRUCT(c.text AS title, c.start_t AS start_t, c.end_t AS
   end_t)::chapter) AS chapters` over
   `unnest(v.cues) c` imports a `.vtt` file as a chapter list.
+- An ALIAS on a written cue array titles the track it becomes:
+  `ARRAY[...] AS speech` emits `-metadata:s:<n> title=speech`, which is the
+  name `f.cues['speech']` finds it again by. A titled track is written to
+  Matroska only -- another container rewrites or drops the title -- so the
+  destination is a `.mkv`.
+
+### Embeddings
+- `embeddings` is a fourth record array of the input alias, the rows of
+  every VECTOR track the container carries: `FROM input('film.mkv') f,
+  unnest(f.embeddings) v`, or `unnest(f.embeddings['clip_vectors']) v` for
+  one track by title. Every row carries `index`, `track`, `start_t`, `end_t`
+  and `vector`. Read-only, like `cues`.
+- To WRITE one, put an array of `embedding` records in a STREAM position --
+  it IS a vector track: `array_agg(STRUCT(r.at AS start_t, r.at + 1 AS
+  end_t, embed_text(r.line) AS vector)::embedding) AS clip_vectors`. There
+  is no vector literal, so the `vector` field comes from a `RETURNS vector`
+  wasm function or from another file's own vector rows. The alias titles the
+  track; every row of one track carries the same number of values, which the
+  track's `vector_dims` tag records. Matroska only, for the same reason.
 
 ### Attachments
 - `attachments` is a third record array of the input alias, the files riding

@@ -216,6 +216,7 @@ from ffrwd.types import (
     STREAM_TAG_COLUMNS,
     TAGS_COLUMN,
     TIME_COLUMN,
+    TRACK_RECORD_COLUMNS,
     UNNEST_COLUMNS,
     is_array,
 )
@@ -273,6 +274,7 @@ __all__ = [
     "star_qualifier",
     "star_replace_entries",
     "subscript_index",
+    "subscript_title",
     "subscript_metadata_shape",
     "tag_key",
     "tag_path",
@@ -1093,6 +1095,23 @@ def subscript_index(bracket: exp.Bracket) -> int | None:
     return int(text) + _INDEX_OFFSET
 
 
+def subscript_title(bracket: exp.Bracket) -> str | None:
+    """The track TITLE a string subscript names, or None if it is not one.
+
+    ``f.cues['speech']`` reads the cues of the track titled ``speech``. The
+    string is taken verbatim -- a title is metadata the file carries, not an
+    identifier -- and an empty one is no title at all.
+    """
+    expressions = bracket.expressions
+    if len(expressions) != 1:
+        return None
+    written = expressions[0]
+    if not isinstance(written, exp.Literal) or not written.is_string:
+        return None
+    title = str(written.this)
+    return title or None
+
+
 # subscript metadata accessors: <alias>.<type>[k].<column>
 def subscript_metadata_shape(node: exp.Expr) -> tuple[exp.Bracket, str] | None:
     """Recognize ``<alias>.<type>[k].<column>``; return ``(bracket, name)``.
@@ -1890,12 +1909,17 @@ class RawTrackRows:
 
     ``chapters`` is the one non-stream array: its rows are not streams, so
     they carry chapter metadata and nothing selectable.
+
+    `title` is the track a subscript named — ``unnest(f.cues['speech'])`` —
+    and None where the column was unnested whole. Only the columns read out
+    of a file's TRACKS take one; lower is what checks the file carries it.
     """
 
     alias: str
     source: str
     column: str
     node: exp.Expr
+    title: str | None = None
 
 
 @dataclass(frozen=True)
@@ -2376,6 +2400,20 @@ def is_annotation_argument(node: object, wasm: Mapping[str, WasmFunction]) -> bo
         return False
     inner = _unwrap_paren(node)
     return isinstance(inner, exp.Array) and _array_gather_select(inner) is not None
+
+
+def _unnest_argument(node: object) -> tuple[object, str | None]:
+    """One ``unnest(...)`` argument split into its column and a track title.
+
+    ``unnest(f.cues['speech'])`` names one track by the title it carries;
+    every other spelling comes back as it was written, with no title. A
+    subscript that is not a string stays a Bracket here and is refused as
+    the subscripted stream it looks like.
+    """
+    if not isinstance(node, exp.Bracket):
+        return node, None
+    title = subscript_title(node)
+    return (node.this, title) if title is not None else (node, None)
 
 
 def _describe_unnest_arg(node: object) -> str:
@@ -5359,13 +5397,13 @@ class _Resolver:
                 fallback=unnest,
                 hint=_UNNEST_HINT,
             )
-        argument = arguments[0]
+        argument, title = _unnest_argument(arguments[0])
         if not isinstance(argument, exp.Column) or isinstance(argument.this, exp.Star):
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
                 "unnest takes a bare array column, not "
-                f"{_describe_unnest_arg(argument)}",
-                argument if isinstance(argument, exp.Expr) else unnest,
+                f"{_describe_unnest_arg(arguments[0])}",
+                arguments[0] if isinstance(arguments[0], exp.Expr) else unnest,
                 fallback=unnest,
                 hint=_UNNEST_HINT,
             )
@@ -5416,6 +5454,16 @@ class _Resolver:
                 hint=f"unnest one of {_listed_columns(UNNEST_COLUMNS)}, "
                 f"e.g. unnest({source}.audio) t",
             )
+        if title is not None and column not in TRACK_RECORD_COLUMNS:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"'{source}.{column}' is not read by track title",
+                arguments[0] if isinstance(arguments[0], exp.Expr) else unnest,
+                fallback=unnest,
+                hint=f"a title names one track of "
+                f"{_listed_columns(TRACK_RECORD_COLUMNS)}; unnest "
+                f"{source}.{column} whole, and narrow it in WHERE",
+            )
 
         alias_node = unnest.args.get("alias")
         if not isinstance(alias_node, exp.TableAlias) or alias_node.this is None:
@@ -5442,7 +5490,7 @@ class _Resolver:
             )
         self.row_aliases.add(alias)
         self.track_rows[alias] = RawTrackRows(
-            alias=alias, source=source, column=column, node=unnest
+            alias=alias, source=source, column=column, node=unnest, title=title
         )
         scope[alias] = "row"
 
@@ -7350,6 +7398,15 @@ class _Resolver:
         node = _unwrap_paren(node) if isinstance(node, exp.Expr) else None
         if isinstance(node, exp.Neg) and isinstance(node.this, exp.Expr):
             node = _unwrap_paren(node.this)
+        if column_type == "vector":
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"'{label}' is a vector, and a vector cannot be compared",
+                node,
+                fallback=where,
+                hint="a vector has no order; compare it with "
+                "cos_similarity(...) instead",
+            )
         got = _literal_type(node)
         if got is None:
             raise _error(
@@ -7439,7 +7496,8 @@ class _Resolver:
                         hint="only track-row metadata columns can be sorted; "
                         + _ROW_ORDER_HINT,
                     )
-                if self._check_row_column(key, alias, order) == "stream":
+                key_type = self._check_row_column(key, alias, order)
+                if key_type == "stream":
                     raise _error(
                         ErrorCode.UNSUPPORTED_SQL,
                         f"'{alias}' is a stream, and streams have no order to "
@@ -7447,6 +7505,15 @@ class _Resolver:
                         key,
                         fallback=order,
                         hint=_ROW_ORDER_HINT,
+                    )
+                if key_type == "vector":
+                    raise _error(
+                        ErrorCode.UNSUPPORTED_SQL,
+                        "a vector has no order to sort by",
+                        key,
+                        fallback=order,
+                        hint="sort by a function over it instead, e.g. "
+                        "ORDER BY cos_similarity(...)",
                     )
                 continue
             if key is not None and self._is_row_predicate_value(key):

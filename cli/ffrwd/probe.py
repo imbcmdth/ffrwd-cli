@@ -14,6 +14,11 @@ a ~95MB download -- paying that once per compile for an input that does not
 even exist would be its own footgun. An input whose options force the demuxer
 skips that check -- its spec names a device or a graph, not a file.
 
+`track_cues()` is the one call that runs ffmpeg rather than ffprobe: a
+container's caption track is demuxed to WebVTT text so its cues can be read
+the way a `.vtt` input's are. It is as permissive as `probe()` -- every
+failure is an empty cue list -- and memoized the same way.
+
 Results are memoized per `(realpath, mtime_ns, size, input flags)` so a
 compile that probes the same input multiple times only shells out once, while
 one path read two ways -- different `input()` options -- stays two probes;
@@ -38,6 +43,8 @@ from ffrwd import binaries
 from ffrwd.ir import StreamType
 
 _TIMEOUT_SECONDS = 5.0
+# Demuxing one caption track reads the whole file, not just its header.
+_EXTRACT_TIMEOUT_SECONDS = 20.0
 # Remote specs fetch a manifest and often an init segment per stream before
 # ffprobe can report anything; 5s flakes on real networks, so they get more.
 _REMOTE_TIMEOUT_SECONDS = 15.0
@@ -224,12 +231,16 @@ class ProbeFailure:
 _CacheKey = tuple[str, int, int, tuple[str, ...]]
 _cache: dict[_CacheKey, ProbeResult] = {}
 _failure_cache: dict[_CacheKey, ProbeFailure] = {}
+# (spec, input flags, subtitle track index) -> that track's cues
+_CueCacheKey = tuple[str, tuple[str, ...], int]
+_cue_cache: dict[_CueCacheKey, list[CueMeta]] = {}
 
 
 def clear_cache() -> None:
     """Clear the probe() memoization cache. For tests."""
     _cache.clear()
     _failure_cache.clear()
+    _cue_cache.clear()
 
 
 def is_url(spec: str) -> bool:
@@ -412,6 +423,51 @@ def _with_cues(parsed: ProbeResult, spec: str) -> ProbeResult:
     if text is None:
         return parsed
     return replace(parsed, cues=parse_webvtt(text))
+
+
+def track_cues(spec: str, index: int, args: Sequence[str] = ()) -> list[CueMeta]:
+    """The cues of the container's `index`th subtitle track, 0-based.
+
+    ffprobe reports that a container CARRIES a caption track and stops there,
+    so the track itself is demuxed once with ffmpeg, written to stdout as
+    WebVTT, and parsed by :func:`parse_webvtt` -- the same text a ``.vtt``
+    input is read from. Permissive like everything else here: ffmpeg absent,
+    a nonzero exit, a timeout or undecodable output all read as no cues.
+
+    Memoized per ``(spec, input flags, index)`` so a query naming several
+    row columns of one track extracts it once.
+    """
+    key = (spec, tuple(args), index)
+    cached = _cue_cache.get(key)
+    if cached is not None:
+        return cached
+    ffmpeg = binaries.ffmpeg_path()
+    if ffmpeg is None:
+        return []
+    argv = [
+        ffmpeg,
+        "-v",
+        "error",
+        *args,
+        "-i",
+        spec,
+        "-map",
+        f"0:s:{index}",
+        "-f",
+        WEBVTT_FORMAT,
+        "-",
+    ]
+    try:
+        result = subprocess.run(
+            argv, capture_output=True, text=True, timeout=_EXTRACT_TIMEOUT_SECONDS
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if result.returncode != 0:
+        return []
+    cues = parse_webvtt(result.stdout)
+    _cue_cache[key] = cues
+    return cues
 
 
 def _read_local(path: str) -> str | None:

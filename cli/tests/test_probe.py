@@ -28,6 +28,7 @@ from ffrwd.probe import (
     parse_webvtt,
     probe,
     probe_failure,
+    track_cues,
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -2010,6 +2011,50 @@ def test_parse_webvtt_reads_the_character_references_back() -> None:
 def test_parse_webvtt_drops_a_block_whose_timing_does_not_parse() -> None:
     text = "WEBVTT\n\nnot a cue at all\n\n00:00.000 --> 00:01.000\nreal\n"
     assert [c.text for c in parse_webvtt(text)] == ["real"]
+
+
+# --- a container's own caption tracks, demuxed one at a time ---------------
+
+
+def _fake_ffmpeg_present(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(binaries, "ffmpeg_path", lambda: "/usr/bin/ffmpeg")
+
+
+def test_track_cues_demuxes_one_track_as_webvtt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ffmpeg writes the track to stdout, and the cues come off that text."""
+    _fake_ffmpeg_present(monkeypatch)
+    calls = _fake_run(monkeypatch, stdout=_VTT)
+    cues = track_cues("film.mkv", 1, ["-f", "matroska"])
+    assert [(c.index, c.start_t, c.text) for c in cues] == [
+        (1, 0.0, "Cue one."),
+        (2, 1.4, "Cue three."),
+    ]
+    assert calls[0][1:] == [
+        "-v", "error", "-f", "matroska", "-i", "film.mkv",
+        "-map", "0:s:1", "-f", "webvtt", "-",
+    ]
+
+
+def test_track_cues_are_memoized_per_track(monkeypatch: pytest.MonkeyPatch) -> None:
+    _fake_ffmpeg_present(monkeypatch)
+    calls = _fake_run(monkeypatch, stdout=_VTT)
+    track_cues("film.mkv", 0)
+    track_cues("film.mkv", 0)
+    track_cues("film.mkv", 1)
+    assert len(calls) == 2
+
+
+def test_track_cues_reads_no_cues_when_ffmpeg_fails_or_is_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """As permissive as every other read here: a failure is an empty list."""
+    _fake_ffmpeg_present(monkeypatch)
+    _fake_run(monkeypatch, stdout=_VTT, returncode=1)
+    assert track_cues("film.mkv", 0) == []
+    monkeypatch.setattr(binaries, "ffmpeg_path", lambda: None)
+    assert track_cues("other.mkv", 0) == []
 
 
 def test_parse_webvtt_of_a_document_with_no_cues_is_empty() -> None:

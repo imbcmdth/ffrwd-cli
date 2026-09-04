@@ -13,7 +13,9 @@ tests expand over. av2 and av3 differ only in their sine frequencies, so a
 sources whose language tags agree track for track. ``stereo.mp4`` adds the
 one thing none of those have: a genuinely 2-CHANNEL audio track (plan 047).
 ``font.ttf`` is a stub TrueType file and ``attached.mkv`` is a container
-carrying it, for reading attachments back. ``ladder/master.m3u8`` (HLS) and
+carrying it, for reading attachments back. ``described.mkv`` carries two
+TITLED metadata tracks beside its video and audio -- captions and vectors --
+for reading a self-describing file back. ``ladder/master.m3u8`` (HLS) and
 ``ladder-demuxed/master.mpd`` (DASH) are two real ABR ladders, both built by
 running the compiler itself rather than a raw ffmpeg call. The first muxes
 every rung (a video and audio row share each rendition). The second keeps
@@ -40,6 +42,7 @@ from __future__ import annotations
 
 import base64
 import shutil
+import struct
 import subprocess
 import sys
 from pathlib import Path
@@ -65,6 +68,9 @@ _SUBS_NAME = "subs.en.vtt"
 _AVS_NAME = "avs.mkv"
 _FRAME_PNG_NAME = "frame.png"
 _AV_CHAPTERS_NAME = "av-chapters.mkv"
+_DESCRIBED_NAME = "described.mkv"
+_DESCRIBED_SPEECH_NAME = "described.speech.vtt"
+_DESCRIBED_VECTORS_NAME = "described.vectors.vtt"
 _TAGGED_NAME = "tagged.mp4"
 _AV_2ENG_NAME = "av-2eng.mp4"
 _FONT_TTF_NAME = "font.ttf"
@@ -354,6 +360,90 @@ def _generate_avs(subs_path: Path) -> None:
     )
 
 
+# The file that describes itself: three spans, each with a line of speech
+# and a vector over the same seconds. The vectors are eight numbers apiece --
+# the width a small embedder writes -- chosen so no two rows are alike and
+# every value survives f32 exactly.
+_DESCRIBED_ROWS: tuple[tuple[float, float, str, tuple[float, ...]], ...] = (
+    (0.0, 1.5, "a cat sat on the mat",
+     (0.5, 0.25, 0.125, 0.0, -0.125, -0.25, -0.5, 1.0)),
+    (1.5, 3.0, "a dog ran in the yard",
+     (0.25, 0.5, 0.75, 0.125, 0.0, -0.75, 0.5, -1.0)),
+    (3.0, 4.0, "a car drove down the road",
+     (-0.5, 0.0, 0.25, 1.0, 0.75, 0.125, -0.25, 0.5)),
+)
+_DESCRIBED_DIMS = len(_DESCRIBED_ROWS[0][3])
+
+
+def _webvtt(blocks: list[tuple[float, float, str]]) -> str:
+    """A WebVTT document over `blocks`, the format ffrwd itself writes."""
+    written = ["WEBVTT"]
+    for start, end, text in blocks:
+        written.append(f"{_timestamp(start)} --> {_timestamp(end)}\n{text}")
+    return "\n\n".join(written) + "\n"
+
+
+def _timestamp(seconds: float) -> str:
+    """One bound as WebVTT's HH:MM:SS.mmm."""
+    total = round(seconds * 1000)
+    hours, total = divmod(total, 3_600_000)
+    minutes, total = divmod(total, 60_000)
+    whole, milliseconds = divmod(total, 1000)
+    return f"{hours:02d}:{minutes:02d}:{whole:02d}.{milliseconds:03d}"
+
+
+def _generate_described() -> None:
+    """av.mp4 plus two titled metadata tracks: `speech` and `clip_vectors`.
+
+    The file the read-back recipe names. Written here rather than by the
+    compiler so that generating fixtures needs ffmpeg and nothing else -- the
+    vector payloads are built the way a vector track's are, each row's
+    numbers as little-endian f32 in base64, so what reads them back is
+    reading a file it did not write. Must run after av.mp4 exists.
+    """
+    described = FIXTURES_DIR / _DESCRIBED_NAME
+    if described.exists():
+        print(f"skip (already exists): {described}")
+        return
+    speech = FIXTURES_DIR / _DESCRIBED_SPEECH_NAME
+    vectors = FIXTURES_DIR / _DESCRIBED_VECTORS_NAME
+    FIXTURES_DIR.mkdir(parents=True, exist_ok=True)
+    speech.write_text(
+        _webvtt([(start, end, text) for start, end, text, _ in _DESCRIBED_ROWS]),
+        encoding="utf-8",
+    )
+    vectors.write_text(
+        _webvtt(
+            [
+                (
+                    start,
+                    end,
+                    base64.b64encode(
+                        struct.pack(f"<{len(vector)}f", *vector)
+                    ).decode(),
+                )
+                for start, end, _, vector in _DESCRIBED_ROWS
+            ]
+        ),
+        encoding="utf-8",
+    )
+    _run(
+        described,
+        [
+            "-i", str(FIXTURES_DIR / _AV_NAME),
+            "-f", "webvtt", "-i", str(speech),
+            "-f", "webvtt", "-i", str(vectors),
+            "-map", "0:v:0", "-map", "0:a:0", "-map", "1:s:0", "-map", "2:s:0",
+            "-c", "copy",
+            "-metadata:s:2", "title=speech",
+            "-metadata:s:3", "title=clip_vectors",
+            "-metadata:s:3", f"vector_dims={_DESCRIBED_DIMS}",
+        ],
+    )
+    speech.unlink()
+    vectors.unlink()
+
+
 def _generate_av_chapters() -> None:
     """av2.mp4 remuxed with two chapters, via ffmpeg's own ffmetadata `data:` URI.
 
@@ -560,6 +650,7 @@ def main() -> int:
     subs_path = _generate_subs_vtt()
     _generate_avs(subs_path)
     _generate_av_chapters()
+    _generate_described()
     _generate_av_2eng()
     _generate_tagged()
     _generate_frame_png()

@@ -13,7 +13,8 @@ One row per input: the shape of a container file. Arrays of streams plus the con
 | `video`, `audio`, `subtitle`, `data` | stream array | splat (`f.audio` = every track), subscript (`f.audio[1]`, 1-based), or `unnest` into track rows. `subtitle`/`data` are passthrough-only |
 | `chapters` | record array | `unnest` into chapter rows; no splat, no subscript. Bare, it prints as one array cell |
 | `attachments` | record array | files riding inside the container - `unnest` into attachment rows |
-| `cues` | record array | a WebVTT file's caption cues, read-only - `unnest` into cue rows |
+| `cues` | record array | a WebVTT file's caption cues, or every caption track's, read-only - `unnest` into cue rows |
+| `embeddings` | record array | every vector track's rows, read-only - `unnest` into embedding rows |
 | `t` | timeline | only in `WHERE` trim windows: `f.t BETWEEN 5 AND 60`, either bound alone, or against chapter bounds |
 | `duration` | number | probed container duration in seconds |
 | `tags` | tag map | the container's own tags, read by path: `f.tags.title`, `f.tags.artist`, any key. NULL when the file doesn't carry it. Bare, it prints as one array cell of `(key,value)` records |
@@ -22,7 +23,7 @@ Subscripts reach track-row columns without unnest: `f.audio[1].tags.language` (s
 
 Only an input-side read has facts to report. A field read off a FILTER OUTPUT - `scale(f.video[1], 640, -2).width`, `volume(t, 0.2).tags.language` - is a typed rejection: nothing probed that stream, and the hint names the input-side read to write instead.
 
-`SELECT *` over an input alias is its ARRAY columns, never the scalars. In a media query that is the four stream arrays in `video`, `audio`, `subtitle`, `data` order, each a passthrough - the remux shape; chapters ride through as ffmpeg's own default. In a table/CSV query it is every writable array column - the four stream arrays plus `chapters` and `attachments` - one cell each; `cues` is read-only and stays out. `f.*` does one alias, a bare `*` every alias in `FROM` order.
+`SELECT *` over an input alias is its ARRAY columns, never the scalars. In a media query that is the four stream arrays in `video`, `audio`, `subtitle`, `data` order, each a passthrough - the remux shape; chapters ride through as ffmpeg's own default. In a table/CSV query it is every writable array column - the four stream arrays plus `chapters` and `attachments` - one cell each; `cues` and `embeddings` are read-only and stay out. `f.*` does one alias, a bare `*` every alias in `FROM` order.
 
 ## Rendition rows - `input('ladder.m3u8') r`
 
@@ -61,7 +62,7 @@ leaves the command entirely.
 
 ## Track rows - `unnest(f.audio) t`
 
-One row per track. The argument is an array column of an input declared earlier in the same FROM list; alias mandatory. All seven array columns unnest - the four stream arrays here, and `chapters`, `cues` and `attachments` below. The schema varies by stream type:
+One row per track. The argument is an array column of an input declared earlier in the same FROM list; alias mandatory. All eight array columns unnest - the four stream arrays here, and `chapters`, `cues`, `embeddings` and `attachments` below. The schema varies by stream type:
 
 The row IS the stream: a bare `t` where a stream is expected selects it, filters it, or gathers it. The columns below are the metadata ABOUT it.
 
@@ -106,15 +107,35 @@ Written chapters are checked at compile time: `start_t` and `end_t` must be numb
 
 ## Cue rows - `unnest(v.cues) c`
 
-A WebVTT file's caption cues, the same shape as chapters. ffprobe does not enumerate cues, so ffrwd reads the file itself; `cues` off anything but a WebVTT input is a typed rejection naming the format it found.
+Caption cues, the same shape as chapters: a WebVTT file's, or every caption track a container carries. ffprobe does not enumerate cues, so ffrwd reads the document itself - extracting an embedded track once, cached like a probe. A file carrying no caption track reads zero rows.
 
 | column | type | notes |
 | --- | --- | --- |
-| `index` | number | document order, 1-based |
+| `index` | number | document order within its own track, 1-based |
+| `track` | text | the title of the track it came from; NULL for a `.vtt` document and for an untitled track |
 | `text` | text | the cue payload; multiple lines joined with a newline |
 | `start_t`, `end_t` | number | seconds |
 
-Writing is the mirror and needs no column name: an array of `cue` records **in a stream position** IS a WebVTT subtitle track, minted as one self-contained input. Cues must each end after they start and run in ascending order; unlike chapters they may overlap, which WebVTT allows. Because a cue and a chapter are the same shape, converting either way is one `array_agg` - [recipe 65](examples.md#65-turn-chapters-into-a-subtitle-track-and-back).
+`unnest(f.cues['speech']) c` reads ONE track, the one titled `speech`. The subscript is an assertion, like a stream subscript: a title the file does not carry is a typed rejection listing the ones it does. Bounds are milliseconds - what WebVTT writes and what reads back.
+
+Writing is the mirror: an array of `cue` records **in a stream position** IS a WebVTT subtitle track, minted as one self-contained input. Cues must each end after they start and run in ascending order; unlike chapters they may overlap, which WebVTT allows. Because a cue and a chapter are the same shape, converting either way is one `array_agg` - [recipe 65](examples.md#65-turn-chapters-into-a-subtitle-track-and-back).
+
+An ALIAS on that column is the track's TITLE - `ARRAY[...] AS speech` emits `-metadata:s:<n> title=speech` - and it is the name `f.cues['speech']` finds it by afterwards. Several aliased columns are several tracks. A titled track is written to Matroska only: every other container rewrites or drops the title, so a destination that is not `.mkv` is refused by name. Untitled, the column writes wherever captions do.
+
+## Embedding rows - `unnest(f.embeddings) v`
+
+Every vector track's rows: a vector over a time span, and what it says about that stretch of the file.
+
+| column | type | notes |
+| --- | --- | --- |
+| `index` | number | order within its own track, 1-based |
+| `track` | text | the title of the track it came from |
+| `start_t`, `end_t` | number | seconds |
+| `vector` | vector | the numbers themselves; read by `cos_similarity`/`vector_length`, never compared |
+
+A vector track rides in the same WebVTT document a caption track does, each block's text the row's numbers as little-endian f32 in base64, and the track's `vector_dims` tag says how many. That tag is what tells the two apart: a caption track has none, and a track that has one never shows up in `cues`. `unnest(f.embeddings['clip_vectors']) v` reads one track by title, the same as cues.
+
+Writing is the mirror again: an array of `embedding` records **in a stream position** IS a vector track, `STRUCT(<start_t>, <end_t>, <vector>)::embedding`. There is no vector literal, so the `vector` field comes from a `RETURNS vector` wasm function or from another file's own rows. Every row of one track carries the same number of values - two lengths in one column is a rejection naming both - and the track's title is the column's alias. Matroska only, since no other container keeps `vector_dims`. [Recipes 115-116](examples.md#118-write-rows-as-titled-tracks).
 
 ## Attachment rows - `unnest(f.attachments) a`
 

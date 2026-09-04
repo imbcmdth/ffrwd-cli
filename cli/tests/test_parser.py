@@ -1933,6 +1933,45 @@ def test_unnest_requires_an_alias() -> None:
     assert "requires an alias" in err.message
 
 
+def test_a_title_subscript_names_one_track_of_a_record_column() -> None:
+    for column in ("cues", "embeddings"):
+        res = _resolve(f"SELECT r.track FROM input('f.mkv') f, unnest(f.{column}['x']) r")
+        rows = res.track_rows["r"]
+        assert (rows.column, rows.title) == (column, "x")
+
+
+def test_a_title_subscript_on_a_stream_array_is_a_typed_rejection() -> None:
+    """Titles name the record columns read out of a file's tracks; a stream
+    array is narrowed by its rows instead."""
+    err = _reject("SELECT t FROM input('f.mkv') f, unnest(f.audio['x']) t")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'f.audio' is not read by track title" in err.message
+    assert "narrow it in WHERE" in (err.hint or "")
+
+
+def test_a_numeric_subscript_in_unnest_is_still_one_stream() -> None:
+    err = _reject("SELECT t FROM input('f.mkv') f, unnest(f.audio[1]) t")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "one subscripted stream" in err.message
+
+
+def test_a_vector_row_column_neither_compares_nor_sorts() -> None:
+    """The same posture a computed vector has, on the column a file carries."""
+    err = _reject(
+        "SELECT v.track FROM input('f.mkv') f, unnest(f.embeddings) v "
+        "WHERE v.vector = 'x'"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'v.vector' is a vector, and a vector cannot be compared" in err.message
+    assert "cos_similarity(...)" in (err.hint or "")
+    err = _reject(
+        "SELECT v.track FROM input('f.mkv') f, unnest(f.embeddings) v "
+        "ORDER BY v.vector"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "a vector has no order to sort by" in err.message
+
+
 def test_unnest_rejects_a_column_alias_list() -> None:
     err = _reject("SELECT t FROM input('f.mkv') f, unnest(f.audio) t(x)")
     assert err.code is ErrorCode.UNSUPPORTED_SQL
@@ -3181,7 +3220,7 @@ def test_an_unknown_column_on_an_input_alias_is_still_unknown_the_same_way() -> 
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "unknown column 'r.mood'" in err.message
     assert "an input exposes attachments, audio, chapters, cues, data, " \
-        "duration, subtitle, t, tags, video" in (err.hint or "")
+        "duration, embeddings, subtitle, t, tags, video" in (err.hint or "")
 
 
 # -- rendition columns in WHERE: the same row-predicate grammar an unnest
