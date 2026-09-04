@@ -1792,11 +1792,11 @@ A row-bounded window needs one of the two: a `TO` expression to give each row a 
 
 ## 76. Trim a filter call to a computed window
 
-`WHERE <alias>.t` isn't the only way to bound a clip - `ffmpeg.trim`/`ffmpeg.atrim`'s own `starti`/`endi`/`durationi` options take a number of seconds too, and that number may be a compile-time expression over `<alias>.duration`, not just a literal: half the file to its own end, without knowing the file's length up front.
+`WHERE <alias>.t` isn't the only way to bound a clip - `ffmpeg.trim`/`ffmpeg.atrim`'s own `start`/`end`/`duration` options take a number of seconds too, and that number may be a compile-time expression over `<alias>.duration`, not just a literal: half the file to its own end, without knowing the file's length up front.
 
 ```pgsql
 COPY (
-  SELECT ffmpeg.trim(a.video[1], starti => a.duration / 4, endi => a.duration)
+  SELECT ffmpeg.trim(a.video[1], start => a.duration / 4, end => a.duration)
   FROM input('tests/fixtures/testsrc.mp4') a
 ) TO 'second_part.mp4'
 ```
@@ -1804,7 +1804,7 @@ COPY (
 ```
 $ ffrwd compile -f query.sql
 ffmpeg -i tests/fixtures/testsrc.mp4 -filter_complex \
-  '[0:v:0]trim=starti=1.0:endi=4.0,setpts=PTS-STARTPTS[out0]' -map '[out0]' \
+  '[0:v:0]trim=start=1.0:end=4.0,setpts=PTS-STARTPTS[out0]' -map '[out0]' \
   second_part.mp4
 ```
 
@@ -1816,10 +1816,10 @@ A `trim`/`atrim` call leaves the source's timestamps alone - each clip still car
 
 ```pgsql
 COPY (
-  SELECT ffmpeg.trim(a.video[1], starti => 0, endi => 1)
+  SELECT ffmpeg.trim(a.video[1], start => 0, end => 1)
   FROM input('tests/fixtures/testsrc.mp4') a
   UNION ALL
-  SELECT ffmpeg.trim(b.video[1], starti => 2, endi => 3)
+  SELECT ffmpeg.trim(b.video[1], start => 2, end => 3)
   FROM input('tests/fixtures/testsrc.mp4') b
 ) TO 'joined.mp4'
 ```
@@ -1827,7 +1827,7 @@ COPY (
 ```
 $ ffrwd compile -f query.sql
 ffmpeg -i tests/fixtures/testsrc.mp4 -filter_complex \
-  '[0:v:0]trim=starti=0:endi=1[n1];[0:v:0]trim=starti=2:endi=3[n2];'\
+  '[0:v:0]trim=start=0:end=1[n1];[0:v:0]trim=start=2:end=3[n2];'\
 '[n1]setpts=PTS-STARTPTS[n1_pts];[n2]setpts=PTS-STARTPTS[n2_pts];'\
 '[n1_pts][n2_pts]concat=n=2:v=1:a=0[out0]' -map '[out0]' joined.mp4
 ```

@@ -996,6 +996,101 @@ def test_adjacent_alias_run_ties_break_by_first_occurrence(
     assert list(opts) == ["bb"]
 
 
+# --- a trailing-letter twin never shadows the documented name ---------------
+#
+# trim/atrim help text as ffmpeg 9.0.1 prints it (the build the reference
+# registry pins), cut to the AVOptions block: `start`/`starti` and friends
+# are adjacent same-doc pairs where the longer name is not the documented one.
+
+HELP_TRIM_TRIMMED = """\
+Filter trim
+  Pick one continuous section from the input, drop the rest.
+    Inputs:
+       #0: default (video)
+    Outputs:
+       #0: default (video)
+trim AVOptions:
+   start             <duration>   ..FV....... Timestamp of the first frame that should be passed (default INT64_MAX)
+   starti            <duration>   ..FV....... Timestamp of the first frame that should be passed (default INT64_MAX)
+   end               <duration>   ..FV....... Timestamp of the first frame that should be dropped again (default INT64_MAX)
+   endi              <duration>   ..FV....... Timestamp of the first frame that should be dropped again (default INT64_MAX)
+   start_pts         <int64>      ..FV....... Timestamp of the first frame that should be  passed (from I64_MIN to I64_MAX) (default I64_MIN)
+   end_pts           <int64>      ..FV....... Timestamp of the first frame that should be dropped again (from I64_MIN to I64_MAX) (default I64_MIN)
+   duration          <duration>   ..FV....... Maximum duration of the output (default 0)
+   durationi         <duration>   ..FV....... Maximum duration of the output (default 0)
+   start_frame       <int64>      ..FV....... Number of the first frame that should be passed to the output (from -1 to I64_MAX) (default -1)
+   end_frame         <int64>      ..FV....... Number of the first frame that should be dropped again (from 0 to I64_MAX) (default I64_MAX)
+
+"""
+
+HELP_ATRIM_TRIMMED = """\
+Filter atrim
+  Pick one continuous section from the input, drop the rest.
+    Inputs:
+       #0: default (audio)
+    Outputs:
+       #0: default (audio)
+atrim AVOptions:
+   start             <duration>   ..F.A...... Timestamp of the first frame that should be passed (default INT64_MAX)
+   starti            <duration>   ..F.A...... Timestamp of the first frame that should be passed (default INT64_MAX)
+   end               <duration>   ..F.A...... Timestamp of the first frame that should be dropped again (default INT64_MAX)
+   endi              <duration>   ..F.A...... Timestamp of the first frame that should be dropped again (default INT64_MAX)
+   start_pts         <int64>      ..F.A...... Timestamp of the first frame that should be  passed (from I64_MIN to I64_MAX) (default I64_MIN)
+   end_pts           <int64>      ..F.A...... Timestamp of the first frame that should be dropped again (from I64_MIN to I64_MAX) (default I64_MIN)
+   duration          <duration>   ..F.A...... Maximum duration of the output (default 0)
+   durationi         <duration>   ..F.A...... Maximum duration of the output (default 0)
+   start_sample      <int64>      ..F.A...... Number of the first audio sample that should be passed to the output (from -1 to I64_MAX) (default -1)
+   end_sample        <int64>      ..F.A...... Number of the first audio sample that should be dropped again (from 0 to I64_MAX) (default I64_MAX)
+
+"""
+
+
+def test_trim_alias_dedup_keeps_documented_name_over_i_suffixed_twin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(registry_mod, "_run", lambda argv: HELP_TRIM_TRIMMED)
+    opts = registry_mod._parse_filter_help("ffmpeg", "trim")
+    assert "start" in opts and "starti" not in opts
+    assert "end" in opts and "endi" not in opts
+    assert "duration" in opts and "durationi" not in opts
+    # start_pts/end_pts repeat end's doc text but are not adjacent to it.
+    assert "start_pts" in opts
+    assert "end_pts" in opts
+    assert list(opts) == [
+        "start", "end", "start_pts", "end_pts", "duration",
+        "start_frame", "end_frame",
+    ]
+
+
+def test_atrim_alias_dedup_keeps_documented_name_over_i_suffixed_twin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(registry_mod, "_run", lambda argv: HELP_ATRIM_TRIMMED)
+    opts = registry_mod._parse_filter_help("ffmpeg", "atrim")
+    assert "start" in opts and "starti" not in opts
+    assert "end" in opts and "endi" not in opts
+    assert "duration" in opts and "durationi" not in opts
+    assert list(opts) == [
+        "start", "end", "start_pts", "end_pts", "duration",
+        "start_sample", "end_sample",
+    ]
+
+
+def test_trailing_letter_alias_does_not_shadow_a_genuinely_longer_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`width` is `w` plus a whole word, not one trailing character -- still wins."""
+    help_text = (
+        "Filter x\nx AVOptions:\n"
+        "   w                 <int>        ..FV....... shared doc (default 1)\n"
+        "   width             <int>        ..FV....... shared doc (default 1)\n"
+        "\n"
+    )
+    monkeypatch.setattr(registry_mod, "_run", lambda argv: help_text)
+    opts = registry_mod._parse_filter_help("ffmpeg", "x")
+    assert list(opts) == ["width"]
+
+
 def test_empty_doc_options_are_not_merged_across_the_list(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

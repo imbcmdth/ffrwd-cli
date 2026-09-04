@@ -60,12 +60,18 @@ from a full scan of `ffmpeg version 7.1-full_build-www.gyan.dev` (captured
   - Short/long option aliases appear as separate AVOption lines with
     IDENTICAL description text (`subtitles`: `filename`/`f`; `testsrc`:
     `size`/`s`, `rate`/`r`; `scale`: `w`/`width`, `h`/`height`). The LONGER
-    name is the one to keep: 456 long-first vs 29 short-first vs 17
+    name is usually the one to keep: 456 long-first vs 29 short-first vs 17
     equal-length duplicate-doc groups. File ORDER is not a reliable signal
     on its own -- `scale` lists `w` before `width` but `size` before `s`.
     So: dedup by identical doc text, keep the longest name, break length
     ties by first occurrence -- but ONLY within a run of CONSECUTIVE lines
     sharing that doc text.
+
+    One exception to "longer": `trim`/`atrim` list `start`/`starti`,
+    `end`/`endi` and `duration`/`durationi`, where the longer name is the
+    documented one plus a single trailing letter. Those six runs are the
+    only such shape across all of ffmpeg 9.0.1's filters, so a name that is
+    the running choice plus one trailing character never replaces it.
 
     Adjacency is ffmpeg's own rule, not a heuristic. An alias pair is two
     AVOption entries at the same struct OFFSET, and libavfilter's
@@ -375,13 +381,19 @@ def _parse_option_block(lines: list[str]) -> dict[str, FilterOption]:
     return _dedup_and_convert(raw)
 
 
+def _is_trailing_letter_alias(name: str, of: str) -> bool:
+    # `starti` for `start`: trim's typed twin, not a longer spelling.
+    return len(name) == len(of) + 1 and name.startswith(of)
+
+
 def _dedup_and_convert(raw: list[_RawOption]) -> dict[str, FilterOption]:
     # Collapse each run of CONSECUTIVE same-doc lines (ffmpeg's short/long
-    # alias signal) to the longest name in the run, ties by first occurrence.
+    # alias signal) to the longest name in the run, ties by first occurrence,
+    # except that a trailing-letter twin never replaces the name it twins.
     # Adjacency is the whole rule: ffmpeg's positional binding skips a
     # duplicate only when it immediately follows the entry it aliases, so
     # NON-adjacent same-doc options are two real options and both keep their
-    # slot. See the module docstring for the seven filters this decides.
+    # slot. See the module docstring for the filters this decides.
     keep: list[int] = []
     start = 0
     while start < len(raw):
@@ -390,6 +402,8 @@ def _dedup_and_convert(raw: list[_RawOption]) -> dict[str, FilterOption]:
             end += 1
         best = start
         for i in range(start + 1, end + 1):
+            if _is_trailing_letter_alias(raw[i].name, raw[best].name):
+                continue
             if len(raw[i].name) > len(raw[best].name):
                 best = i
         keep.append(best)

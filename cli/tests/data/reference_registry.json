@@ -8531,8 +8531,8 @@
       }
     },
     "atrim": {
-      "starti": {
-        "name": "starti",
+      "start": {
+        "name": "start",
         "type": "duration",
         "doc": "Timestamp of the first frame that should be passed",
         "minimum": null,
@@ -8541,8 +8541,8 @@
         "constants": [],
         "unusable": false
       },
-      "endi": {
-        "name": "endi",
+      "end": {
+        "name": "end",
         "type": "duration",
         "doc": "Timestamp of the first frame that should be dropped again",
         "minimum": null,
@@ -8571,8 +8571,8 @@
         "constants": [],
         "unusable": false
       },
-      "durationi": {
-        "name": "durationi",
+      "duration": {
+        "name": "duration",
         "type": "duration",
         "doc": "Maximum duration of the output",
         "minimum": null,
@@ -31853,8 +31853,8 @@
       }
     },
     "trim": {
-      "starti": {
-        "name": "starti",
+      "start": {
+        "name": "start",
         "type": "duration",
         "doc": "Timestamp of the first frame that should be passed",
         "minimum": null,
@@ -31863,8 +31863,8 @@
         "constants": [],
         "unusable": false
       },
-      "endi": {
-        "name": "endi",
+      "end": {
+        "name": "end",
         "type": "duration",
         "doc": "Timestamp of the first frame that should be dropped again",
         "minimum": null,
@@ -31893,8 +31893,8 @@
         "constants": [],
         "unusable": false
       },
-      "durationi": {
-        "name": "durationi",
+      "duration": {
+        "name": "duration",
         "type": "duration",
         "doc": "Maximum duration of the output",
         "minimum": null,

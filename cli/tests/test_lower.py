@@ -6589,15 +6589,15 @@ def test_the_real_trim_filter_runs_through_the_namespace(
 ) -> None:
     """ffmpeg's `trim` filter, the one Postgres's TRIM grammar hides.
 
-    The option names are ffmpeg's own as the registry reports them, aliases
-    deduped to the longer spelling (`starti`, not `start`) -- read out of the
-    binary, not from any table here.
+    The option names are ffmpeg's own as the registry reports them -- read
+    out of the binary, not from any table here -- with the documented
+    `start`/`duration` kept over their `starti`/`durationi` twins.
     """
     query = (
-        f"SELECT ffmpeg.trim(a.video[1], starti => 0.5, durationi => 1) "
+        f"SELECT ffmpeg.trim(a.video[1], start => 0.5, duration => 1) "
         f"FROM input('{_av_fixture}') a"
     )
-    assert compile_sql(query).nodes["n1"].args == {"starti": 0.5, "durationi": 1}
+    assert compile_sql(query).nodes["n1"].args == {"start": 0.5, "duration": 1}
     _run_compiled(query, tmp_path / "ns-trim.mp4")
 
 
@@ -6610,7 +6610,7 @@ def test_the_real_trim_filter_runs_through_the_namespace(
 
 def test_a_trim_written_straight_to_output_gets_a_pts_reset() -> None:
     g = compile_sql(
-        "SELECT ffmpeg.trim(a.video[1], starti => 1) FROM input('x.mp4') a"
+        "SELECT ffmpeg.trim(a.video[1], start => 1) FROM input('x.mp4') a"
     )
     assert [node.filter for node in g.nodes.values()] == ["trim", "setpts"]
     assert g.nodes["n1_pts"].args == {"expr": "PTS-STARTPTS"}
@@ -6619,9 +6619,9 @@ def test_a_trim_written_straight_to_output_gets_a_pts_reset() -> None:
 
 def test_two_trims_concatenated_each_get_their_own_pts_reset() -> None:
     g = compile_sql(
-        "SELECT ffmpeg.trim(a.video[1], starti => 0, endi => 1) FROM input('x.mp4') a "
+        "SELECT ffmpeg.trim(a.video[1], start => 0, end => 1) FROM input('x.mp4') a "
         "UNION ALL "
-        "SELECT ffmpeg.trim(b.video[1], starti => 2, endi => 3) FROM input('x.mp4') b"
+        "SELECT ffmpeg.trim(b.video[1], start => 2, end => 3) FROM input('x.mp4') b"
     )
     filters = [node.filter for node in g.nodes.values()]
     assert filters.count("setpts") == 2
@@ -6633,7 +6633,7 @@ def test_two_trims_concatenated_each_get_their_own_pts_reset() -> None:
 
 def test_a_video_and_an_audio_trim_in_one_query_get_setpts_and_asetpts() -> None:
     g = compile_sql(
-        "SELECT ffmpeg.trim(a.video[1], starti => 1), ffmpeg.atrim(a.audio[1], starti => 1) "
+        "SELECT ffmpeg.trim(a.video[1], start => 1), ffmpeg.atrim(a.audio[1], start => 1) "
         "FROM input('x.mp4') a"
     )
     filters_by_type = {node.filter: node.outputs[0] for node in g.nodes.values()}
@@ -6645,7 +6645,7 @@ def test_ffrwd_speed_on_a_trim_takes_over_timing_no_extra_reset() -> None:
     """`ffrwd.speed` expands to its own `setpts`; that already takes
     control of the trimmed stream's timing, so nothing extra is inserted."""
     g = compile_sql(
-        "SELECT ffrwd.speed(ffmpeg.trim(a.video[1], starti => 1), 2) "
+        "SELECT ffrwd.speed(ffmpeg.trim(a.video[1], start => 1), 2) "
         "FROM input('x.mp4') a"
     )
     assert [node.filter for node in g.nodes.values()] == ["trim", "setpts"]
@@ -11550,27 +11550,27 @@ def test_a_computed_argument_still_meets_the_option_table() -> None:
 
 
 def test_a_computed_duration_option_matches_the_equivalent_seek_bound() -> None:
-    """`starti` computed from `f.duration` prints through the same spelling
+    """`start` computed from `f.duration` prints through the same spelling
     rule an equivalent `-ss` bound does -- digit for digit."""
     probes = _duration_probes(9.0)
     trimmed = _lower(
-        "SELECT ffmpeg.trim(f.video[1], starti => f.duration / 3) FROM input('f.mkv') f",
+        "SELECT ffmpeg.trim(f.video[1], start => f.duration / 3) FROM input('f.mkv') f",
         probes,
     )
     seeked = _lower(
         "SELECT f.video[1] FROM input('f.mkv') f WHERE f.t >= f.duration / 3",
         probes,
     )
-    assert trimmed.nodes["n1"].args["starti"] == seeked.input_trims["f"][0] == 3.0
+    assert trimmed.nodes["n1"].args["start"] == seeked.input_trims["f"][0] == 3.0
 
 
 def test_a_bare_duration_column_bounds_a_duration_option() -> None:
     """No arithmetic at all -- the probed scalar itself, unwritable before."""
     g = _lower(
-        "SELECT ffmpeg.trim(f.video[1], endi => f.duration) FROM input('f.mkv') f",
+        "SELECT ffmpeg.trim(f.video[1], end => f.duration) FROM input('f.mkv') f",
         _duration_probes(9.0),
     )
-    assert g.nodes["n1"].args == {"endi": 9.0}
+    assert g.nodes["n1"].args == {"end": 9.0}
 
 
 def test_a_bare_row_column_bounds_a_duration_option_per_element() -> None:
@@ -11579,22 +11579,22 @@ def test_a_bare_row_column_bounds_a_duration_option_per_element() -> None:
         "f": ProbeResult(streams=[_track("video", 0, bitrate=1), _track("video", 1, bitrate=2)])
     }
     g = _lower(
-        "SELECT array_agg(ffmpeg.trim(t, starti => t.bitrate)) "
+        "SELECT array_agg(ffmpeg.trim(t, start => t.bitrate)) "
         "FROM input('f.mkv') f, unnest(f.video) t",
         probes,
     )
-    assert [n.args["starti"] for n in g.nodes.values() if n.filter == "trim"] == [1, 2]
+    assert [n.args["start"] for n in g.nodes.values() if n.filter == "trim"] == [1, 2]
 
 
 def test_a_stream_argument_to_a_duration_option_is_the_typed_rejection() -> None:
     """Not compile-time-countable: a stream is not a number of seconds, and
     the rejection is the existing FILTER_OPTION_TYPE shape."""
     err = _reject_lower(
-        "SELECT ffmpeg.trim(f.video[1], starti => f.video[1]) FROM input('f.mkv') f",
+        "SELECT ffmpeg.trim(f.video[1], start => f.video[1]) FROM input('f.mkv') f",
         _duration_probes(9.0),
     )
     assert err.code is ErrorCode.FILTER_OPTION_TYPE
-    assert "'starti' of filter 'trim'" in err.message
+    assert "'start' of filter 'trim'" in err.message
     assert "expects a string" in err.message
 
 
@@ -12794,7 +12794,7 @@ def test_a_filter_option_reading_no_row_still_makes_one_node() -> None:
 def test_an_input_column_is_not_a_row_column() -> None:
     """``f.duration`` is the same for every row, so it expands nothing."""
     g = _lower(
-        "COPY (SELECT array_agg(ffmpeg.trim(f.video[1], starti => f.duration / 2)) "
+        "COPY (SELECT array_agg(ffmpeg.trim(f.video[1], start => f.duration / 2)) "
         "FROM input('a.mkv') f, generate_series(1, 3) i) TO 'one.mkv'",
         {"f": ProbeResult(streams=list(_probe_result().streams), duration=10.0)},
     )

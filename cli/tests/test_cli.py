@@ -379,7 +379,7 @@ def test_explain_shows_the_inserted_pts_reset_node(
     """`explain` dumps the compiled IR, so the `setpts` this compiler
     inserts after an unreset `ffmpeg.trim` call shows up in it, exactly as
     an inserted `split` node would."""
-    query = "SELECT ffmpeg.trim(a.video[1], starti => 1) FROM input('x.mp4') a"
+    query = "SELECT ffmpeg.trim(a.video[1], start => 1) FROM input('x.mp4') a"
     code = cli.main(["explain", query])
     payload = json.loads(capsys.readouterr().out)
     assert code == 0
