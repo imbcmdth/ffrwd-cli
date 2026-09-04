@@ -149,6 +149,8 @@ def _packet_source_plan(tracks: int) -> ProcessPlan:
                 node="relay",
                 outputs=tuple(kinds),
                 packet_source=True,
+                # The whole catalog is read here, so every track is an output.
+                tracks=tuple(range(tracks)),
             ),
             FfmpegProcess(id="reader", graph=reader),
         ),

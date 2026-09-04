@@ -325,6 +325,9 @@ struct OutputSpec {
     /// Absent for an output that carries frames, and for the one rows
     /// document a line ordinarily writes.
     rows: Option<usize>,
+    /// `-track`: which track of a packet source's catalog this output
+    /// carries, 0-based. Absent on every other output.
+    track: Option<usize>,
     /// The output as it was spelled, for a refusal that names it.
     spelling: String,
 }
@@ -574,6 +577,8 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
     let mut jobs: Option<usize> = None;
     // What the `-rows` before the next output said, if one was given.
     let mut pending_rows: Option<usize> = None;
+    // What the `-track` before the next output said, if one was given.
+    let mut pending_track: Option<usize> = None;
 
     while let Some(arg) = it.next() {
         let mut next = |name: &str| -> Result<String> {
@@ -632,6 +637,19 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
                     bail!("two -rows options in a row: each names the output that follows it");
                 }
                 pending_rows = Some(index);
+            }
+            // `-track <index> -f nut <path>`: which track of a packet
+            // source's catalog the output that follows carries. It precedes
+            // its output the way `-rows` does.
+            "-track" => {
+                let raw = next("-track")?;
+                let index: usize = raw
+                    .parse()
+                    .map_err(|_| anyhow!("-track expects a 0-based index, got {raw}"))?;
+                if pending_track.is_some() {
+                    bail!("two -track options in a row: each names the output that follows it");
+                }
+                pending_track = Some(index);
             }
             "-filter_complex" => {
                 if wiring.is_some() {
@@ -700,17 +718,26 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
                     ),
                 };
                 let rows = pending_rows.take();
+                let track = pending_track.take();
                 let output = OutputSpec {
                     target: pending_map.take(),
                     kind,
                     path: resolve_output_path(other)?,
                     rows,
+                    track,
                     spelling: format!("-f {taken} {other}"),
                 };
                 if rows.is_some() && !output.rows_bearing() {
                     bail!(
                         "{}: -rows names whose rows a document holds, and this output \
                          writes none",
+                        output.spelling
+                    );
+                }
+                if track.is_some() && output.kind != OutputKind::Frames {
+                    bail!(
+                        "{}: -track names a packet source's coded track, and only \
+                         -f {EDGE_FORMAT} carries one",
                         output.spelling
                     );
                 }
@@ -724,6 +751,9 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
     }
     if let Some(index) = pending_rows {
         bail!("-rows {index} names no output: an output path must follow it");
+    }
+    if let Some(index) = pending_track {
+        bail!("-track {index} names no output: an output path must follow it");
     }
     // A packet source takes no -i input at all, so the ordinary "no input
     // specified" refusal cannot be decided here - it needs to know whether
@@ -875,6 +905,13 @@ fn build_modules(
         bail!(
             "the -f {} output has no -map naming which of the network's labels it writes",
             output.kind.format()
+        );
+    }
+    if let Some(output) = outputs.iter().find(|o| o.track.is_some()) {
+        bail!(
+            "{}: -track names a track of a packet source's catalog, and a source rides \
+             alone rather than in a network",
+            output.spelling
         );
     }
     let bindings = stream_raws
@@ -2186,8 +2223,57 @@ fn settle_track(
     Ok(())
 }
 
-/// A packet source rides alone: no `-i`, one `-f nut` output per catalog
-/// track, in catalog order. Packets arrive in decode order already -
+/// Which catalog track each output carries, in output order.
+///
+/// Every output names its track with `-track`, and the outputs are then the
+/// tracks the caller wants: fewer than the catalog holds is ordinary, and the
+/// rest are dropped. An index past the catalog, or one named twice, is
+/// refused. Outputs that name NO track are the older spelling and must match
+/// the catalog one for one, in catalog order. Mixing the two is refused.
+fn select_source_tracks(outputs: &[OutputSpec], tracks: usize, module: &str) -> Result<Vec<usize>> {
+    let named = outputs.iter().filter(|o| o.track.is_some()).count();
+    if named == 0 {
+        if outputs.len() != tracks {
+            bail!(
+                "{module}'s catalog names {} track(s) and this command was given {} output(s); \
+                 an output that writes fewer says which track each one carries, with -track",
+                tracks,
+                outputs.len()
+            );
+        }
+        return Ok((0..tracks).collect());
+    }
+    if named != outputs.len() {
+        bail!(
+            "{module}: {named} of {} outputs name a track with -track; either all of them do \
+             or none of them do",
+            outputs.len()
+        );
+    }
+    let mut selected: Vec<usize> = Vec::with_capacity(outputs.len());
+    for output in outputs {
+        let index = output.track.unwrap_or_default();
+        if index >= tracks {
+            bail!(
+                "{}: -track {index} is past the end of {module}'s catalog, which names {tracks} \
+                 track(s)",
+                output.spelling
+            );
+        }
+        if selected.contains(&index) {
+            bail!(
+                "{}: -track {index} is already written by an earlier output; each track is \
+                 written once",
+                output.spelling
+            );
+        }
+        selected.push(index);
+    }
+    Ok(selected)
+}
+
+/// A packet source rides alone: no `-i`, one `-f nut` output per track the
+/// command asked for. Packets arrive in decode order already -
 /// `PacketSource::next`'s own contract - so nothing here reorders them; the
 /// only work is settling each track's `decode_delay` before its output's
 /// header is written, since the wit `coded-stream` a source publishes
@@ -2219,7 +2305,7 @@ fn run_packet_source(args: &Args, module: &str, params: &str) -> Result<()> {
     for output in &args.outputs {
         if output.kind != OutputKind::Frames {
             bail!(
-                "{}: a packet source writes every track as -f {EDGE_FORMAT}; -f {} is not that",
+                "{}: a packet source writes its tracks as -f {EDGE_FORMAT}; -f {} is not that",
                 output.spelling,
                 output.kind.format()
             );
@@ -2229,53 +2315,57 @@ fn run_packet_source(args: &Args, module: &str, params: &str) -> Result<()> {
     let (mut source, catalog) = runtime::PacketSource::open(module, params)
         .with_context(|| format!("opening module {module}"))?;
 
-    if args.outputs.len() != catalog.tracks.len() {
-        bail!(
-            "{module}'s catalog names {} track(s) and this command was given {} output(s)",
-            catalog.tracks.len(),
-            args.outputs.len()
-        );
+    let selected = select_source_tracks(&args.outputs, catalog.tracks.len(), module)?;
+    // Which output each catalog track goes to, None for one nobody asked for.
+    let mut slot_of: Vec<Option<usize>> = vec![None; catalog.tracks.len()];
+    for (slot, &track) in selected.iter().enumerate() {
+        slot_of[track] = Some(slot);
     }
 
-    let tracks = catalog.tracks.len();
-    let mut pending: Vec<Vec<runtime::Packet>> = (0..tracks).map(|_| Vec::new()).collect();
-    let mut muxers: Vec<Option<FrameOutput>> = (0..tracks).map(|_| None).collect();
+    let mut pending: Vec<Vec<runtime::Packet>> = selected.iter().map(|_| Vec::new()).collect();
+    let mut muxers: Vec<Option<FrameOutput>> = selected.iter().map(|_| None).collect();
 
     while let Some(pads) = source
         .next()
         .with_context(|| format!("{}: pulling packets", source.name()))?
     {
         for (index, pad) in pads.into_iter().enumerate() {
+            // The module answers with every catalog track, so a track no
+            // output asked for is dropped here. Subscribing to the wanted
+            // tracks alone is a change to the wit interface.
+            let Some(slot) = slot_of.get(index).copied().flatten() else {
+                continue;
+            };
             for packet in pad.packets {
-                if let Some(muxer) = muxers[index].as_mut() {
+                if let Some(muxer) = muxers[slot].as_mut() {
                     write_coded_packet(muxer, &packet)?;
                     continue;
                 }
                 let settled = packet.dts.is_some();
-                pending[index].push(packet);
+                pending[slot].push(packet);
                 if settled {
-                    let decode_delay = (pending[index].len() - 1) as u64;
+                    let decode_delay = (pending[slot].len() - 1) as u64;
                     settle_track(
                         decode_delay,
                         &catalog.tracks[index],
-                        &args.outputs[index],
-                        &mut pending[index],
-                        &mut muxers[index],
+                        &args.outputs[slot],
+                        &mut pending[slot],
+                        &mut muxers[slot],
                     )?;
                 }
             }
         }
     }
 
-    for index in 0..tracks {
-        if muxers[index].is_none() {
-            let decode_delay = pending[index].len() as u64;
+    for (slot, &index) in selected.iter().enumerate() {
+        if muxers[slot].is_none() {
+            let decode_delay = pending[slot].len() as u64;
             settle_track(
                 decode_delay,
                 &catalog.tracks[index],
-                &args.outputs[index],
-                &mut pending[index],
-                &mut muxers[index],
+                &args.outputs[slot],
+                &mut pending[slot],
+                &mut muxers[slot],
             )?;
         }
     }
@@ -3534,5 +3624,161 @@ mod probe_args_tests {
     fn an_unknown_flag_is_still_refused() {
         let err = parse_probe_args(&strings(&["-net", "module.wasm", "-bogus"])).unwrap_err();
         assert_eq!(err.to_string(), "--probe: unknown flag -bogus");
+    }
+}
+
+#[cfg(test)]
+mod source_track_tests {
+    use super::{parse_args, select_source_tracks, OutputKind, OutputPath, OutputSpec};
+
+    fn strings(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// What `parse_args` refused this command line with.
+    fn refusal(args: &[&str]) -> String {
+        match parse_args(strings(args)) {
+            Ok(_) => panic!("expected a refusal, and the line parsed"),
+            Err(err) => err.to_string(),
+        }
+    }
+
+    /// One `-f nut` output, with or without the track it names.
+    fn output(track: Option<usize>) -> OutputSpec {
+        OutputSpec {
+            target: None,
+            kind: OutputKind::Frames,
+            path: OutputPath::File("pipe".to_string()),
+            rows: None,
+            track,
+            spelling: "-f nut pipe".to_string(),
+        }
+    }
+
+    /// The single-module spelling opens the module to parse at all, so what
+    /// the selector parsed to is read off a refusal that names the output it
+    /// landed on. A network never opens one, and refuses a selector by name.
+    #[test]
+    fn a_track_selector_reaches_the_output_that_follows_it() {
+        let err = refusal(&[
+            "-m",
+            "a=x.wasm",
+            "-filter_complex",
+            "[in]a[out]",
+            "-map",
+            "[out]",
+            "-track",
+            "2",
+            "-f",
+            "nut",
+            "p0",
+        ]);
+        assert!(err.starts_with("-f nut p0:"), "{err}");
+        assert!(err.contains("rides alone"), "{err}");
+    }
+
+    /// The selector names the output AFTER it, not the one before: the nut
+    /// output here takes none, and the null output takes the selector and is
+    /// refused for it.
+    #[test]
+    fn a_selector_passes_over_the_output_before_it() {
+        let err = refusal(&[
+            "-m", "s.wasm", "-f", "nut", "p0", "-track", "0", "-f", "null", "-",
+        ]);
+        assert!(err.starts_with("-f null -:"), "{err}");
+        assert!(err.contains("only -f nut carries one"), "{err}");
+    }
+
+    #[test]
+    fn two_selectors_in_a_row_are_refused() {
+        let err = refusal(&[
+            "-m", "s.wasm", "-track", "0", "-track", "1", "-f", "nut", "p0",
+        ]);
+        assert!(err.contains("two -track options in a row"), "{err}");
+    }
+
+    #[test]
+    fn a_selector_naming_no_output_is_refused() {
+        let err = refusal(&["-m", "s.wasm", "-f", "nut", "p0", "-track", "1"]);
+        assert_eq!(
+            err,
+            "-track 1 names no output: an output path must follow it"
+        );
+    }
+
+    #[test]
+    fn a_selector_on_an_output_carrying_no_packets_is_refused() {
+        let err = refusal(&["-m", "s.wasm", "-track", "0", "-f", "null", "-"]);
+        assert!(err.contains("only -f nut carries one"), "{err}");
+    }
+
+    #[test]
+    fn a_non_numeric_selector_is_refused() {
+        let err = refusal(&["-m", "s.wasm", "-track", "v", "-f", "nut", "p0"]);
+        assert_eq!(err, "-track expects a 0-based index, got v");
+    }
+
+    #[test]
+    fn fewer_outputs_than_tracks_is_accepted_when_each_names_its_track() {
+        let outputs = vec![output(Some(1))];
+        assert_eq!(
+            select_source_tracks(&outputs, 3, "s.wasm").expect("selects"),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn selected_tracks_are_taken_in_the_order_the_outputs_name_them() {
+        let outputs = vec![output(Some(2)), output(Some(0))];
+        assert_eq!(
+            select_source_tracks(&outputs, 3, "s.wasm").expect("selects"),
+            vec![2, 0]
+        );
+    }
+
+    #[test]
+    fn fewer_outputs_than_tracks_naming_none_is_still_refused() {
+        let outputs = vec![output(None)];
+        let err = select_source_tracks(&outputs, 3, "s.wasm")
+            .expect_err("a bare output count must match the catalog")
+            .to_string();
+        assert!(err.contains("catalog names 3 track(s)"), "{err}");
+        assert!(err.contains("-track"), "{err}");
+    }
+
+    #[test]
+    fn one_output_per_track_naming_none_is_the_catalog_in_order() {
+        let outputs = vec![output(None), output(None)];
+        assert_eq!(
+            select_source_tracks(&outputs, 2, "s.wasm").expect("selects"),
+            vec![0, 1]
+        );
+    }
+
+    #[test]
+    fn a_selector_past_the_end_of_the_catalog_is_refused() {
+        let outputs = vec![output(Some(3))];
+        let err = select_source_tracks(&outputs, 3, "s.wasm")
+            .expect_err("track 3 of a three-track catalog does not exist")
+            .to_string();
+        assert!(err.contains("past the end of s.wasm's catalog"), "{err}");
+    }
+
+    #[test]
+    fn the_same_track_named_twice_is_refused() {
+        let outputs = vec![output(Some(0)), output(Some(0))];
+        let err = select_source_tracks(&outputs, 2, "s.wasm")
+            .expect_err("a track is written once")
+            .to_string();
+        assert!(err.contains("already written"), "{err}");
+    }
+
+    #[test]
+    fn some_outputs_naming_a_track_and_some_not_is_refused() {
+        let outputs = vec![output(Some(0)), output(None)];
+        let err = select_source_tracks(&outputs, 2, "s.wasm")
+            .expect_err("the two spellings do not mix")
+            .to_string();
+        assert!(err.contains("either all of them do"), "{err}");
     }
 }

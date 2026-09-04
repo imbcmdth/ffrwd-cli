@@ -4792,32 +4792,66 @@ def test_an_absent_source_key_is_not_a_source() -> None:
 # -- packet source argv, and per-pad metadata on a packet sink's reads -----
 
 
-def _packet_source(outputs: tuple[str, ...] = ("video", "audio")) -> SidecarProcess:
+def _packet_source(
+    outputs: tuple[str, ...] = ("video", "audio"), tracks: tuple[int, ...] | None = None
+) -> SidecarProcess:
+    """A source whose outputs are the whole catalog unless `tracks` narrows it."""
     return SidecarProcess(
         id="sidecar0",
         module=PACKET_SOURCE_MODULE,
         node="s",
         outputs=outputs,
         packet_source=True,
+        tracks=tuple(range(len(outputs))) if tracks is None else tracks,
     )
 
 
 def test_a_packet_source_writes_one_nut_pipe_per_track_and_no_input() -> None:
     """Its tracks lead `writes` -- the mirror of a packet sink's several
-    `reads` -- since a source with a rows document too puts that after them."""
+    `reads` -- since a source with a rows document too puts that after them.
+    Each is preceded by the catalog track it carries."""
     argv = wasm.shown_argv(_packet_source(), writes=["p0", "p1"])
     assert argv == [
         "ffrwd-wasm",
         "-m",
         PACKET_SOURCE_MODULE,
+        "-track",
+        "0",
         "-f",
         "nut",
         "p0",
+        "-track",
+        "1",
         "-f",
         "nut",
         "p1",
     ]
     assert "-i" not in argv
+
+
+def test_a_narrowed_packet_source_writes_only_the_tracks_it_names() -> None:
+    """One output off a three-track catalog: one pipe, and the selector says
+    which track it carries. The tracks nobody reads are never written."""
+    argv = wasm.shown_argv(_packet_source(outputs=("audio",), tracks=(1,)), writes=["p0"])
+    assert argv == [
+        "ffrwd-wasm",
+        "-m",
+        PACKET_SOURCE_MODULE,
+        "-track",
+        "1",
+        "-f",
+        "nut",
+        "p0",
+    ]
+
+
+def test_a_packet_source_naming_no_track_for_an_output_is_refused() -> None:
+    """The four places that spell a source agree on one output per selected
+    track; a process that disagrees is a bug, not a query the user wrote."""
+    process = replace(_packet_source(), tracks=())
+    with pytest.raises(FfrwdError) as caught:
+        wasm.shown_argv(process, writes=["p0", "p1"])
+    assert caught.value.code is ErrorCode.INTERNAL
 
 
 def test_a_packet_source_with_no_tracks_is_refused() -> None:

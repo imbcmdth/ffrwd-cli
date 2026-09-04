@@ -273,6 +273,10 @@ _ROWS_FROM_FLAG = "-rows-from"
 # document on the line needs no such flag: it is the only one there is.
 _ROWS_FLAG = "-rows"
 
+# How one of a packet source's outputs is told which track of the module's
+# catalog it carries, 0-based. The sidecar drops the tracks none names.
+_TRACK_FLAG = "-track"
+
 # How a model file is bound to the name the module loads it by, and what the
 # file is called: the export's own name, beside the module.
 _NN_FLAG = "-nn"
@@ -1215,8 +1219,10 @@ def _argv(
     `writes` with one path per track, ahead of any rows document, and its
     `reads` are empty, since it takes no ``-i`` at all.
 
-    A packet SOURCE writes one ``-f nut <pipe>`` per track in catalog order.
-    A source declaring no track is refused: it would have nothing to write.
+    A packet SOURCE writes one ``-f nut <pipe>`` per track the plan takes
+    from it, in catalog order, each preceded by ``-track <index>`` saying
+    which track of the module's catalog it carries. A source with no output
+    is refused: it would have nothing to write.
 
     ``-jobs`` caps the sidecar's worker threads, and is written on every
     sidecar process whenever the run gave one -- the sidecar itself decides
@@ -1228,6 +1234,14 @@ def _argv(
             f"the module '{process.module}' produces no track to write",
             hint="a source with nothing to write is not one; give it at "
             "least one track, or drop it from the query",
+        )
+    if process.packet_source and len(process.tracks) != len(process.outputs):
+        raise FfrwdError(
+            ErrorCode.INTERNAL,
+            f"process {process.id!r} writes {len(process.outputs)} track(s) and "
+            f"names {len(process.tracks)} of its catalog",
+            hint="a packet source's `tracks` says which catalog track each of "
+            "its outputs carries, one per output",
         )
     argv = [binary]
     if not process.packet_source:
@@ -1279,8 +1293,8 @@ def _split_writes(
     Every other process writes rows documents and nothing else."""
     if not process.packet_source:
         return (), writes
-    tracks = len(process.outputs)
-    return writes[:tracks], writes[tracks:]
+    count = len(process.outputs)
+    return writes[:count], writes[count:]
 
 
 def _stream_output(process: SidecarProcess, writes: Sequence[str] = ()) -> list[str]:
@@ -1289,18 +1303,20 @@ def _stream_output(process: SidecarProcess, writes: Sequence[str] = ()) -> list[
     NUT to stdout for a region whose frames feed the next process; a null
     output for a SINK region, whose module consumes its frames and whose
     effects are the product -- nothing rides its stdout. A packet SOURCE
-    writes one ``-f nut <pipe>`` per track instead of the single stdout every
-    other region gets, `writes` naming each in catalog order -- a printed
-    command with none given still numbers them the way a single output's own
-    ``pipe:1`` already does.
+    writes one ``-track <index> -f nut <pipe>`` per track the plan takes
+    instead of the single stdout every other region gets, `writes` naming
+    each in catalog order -- a printed command with none given still numbers
+    them the way a single output's own ``pipe:1`` already does. The selector
+    is what lets a source write fewer tracks than its catalog holds: the
+    sidecar routes the named ones and drops the rest.
     """
     if process.sink:
         return ["-f", _NULL_FORMAT, "-"]
     if process.packet_source:
         paths = writes or tuple(f"pipe:{i + 1}" for i in range(len(process.outputs)))
         argv: list[str] = []
-        for path in paths:
-            argv += ["-f", EDGE_FORMAT, path]
+        for track, path in zip(process.tracks, paths):
+            argv += [_TRACK_FLAG, str(track), "-f", EDGE_FORMAT, path]
         return argv
     return ["-f", EDGE_FORMAT, STDOUT]
 

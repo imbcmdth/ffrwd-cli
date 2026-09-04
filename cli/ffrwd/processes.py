@@ -742,6 +742,9 @@ class SidecarProcess:
     # and its `outputs` -- more than one, ordinarily illegal -- are each their
     # own NUT pipe rather than pads cut from one stdout.
     packet_source: bool = False
+    # Which track of the source's catalog each output carries, one per output
+    # in catalog order. Empty for every process but a packet source.
+    tracks: tuple[int, ...] = ()
     # The ROWS modules this region hosts, in region order. They carry no
     # stream, so they are not in `graph` and not in the ``-m`` table a
     # network's filtergraph names -- each is its own ``-m`` after those,
@@ -799,6 +802,8 @@ class SidecarProcess:
             written["sink"] = True
         if self.packet_source:
             written["packet_source"] = True
+        if self.tracks:
+            written["tracks"] = list(self.tracks)
         if self.rows_modules:
             written["rows_modules"] = [one.to_dict() for one in self.rows_modules]
         if self.pads:
@@ -1341,9 +1346,11 @@ class _Partitioner:
     def _place_module_sources(self) -> None:
         """Give each module source its own sidecar, ridden alone.
 
-        The mirror of a sink module: no inputs, one NUT pipe per track, in
-        catalog order. Every process that reads `src:<alias>:...` directly is
-        found here -- the same `_reads`/`_opened` scan
+        The mirror of a sink module: no inputs, one NUT pipe per track the
+        query READS, in catalog order. A track nothing consumes is not
+        written at all -- its pipe would have no reader, and the source would
+        block writing it. Every process that reads `src:<alias>:...` directly
+        is found here -- the same `_reads`/`_opened` scan
         :meth:`_redirect_live_reads` uses -- and folded onto ONE reader,
         because a sidecar's own pipe cannot be reopened whether or not the
         source declared itself unbounded: unlike a live URL, there is no real
@@ -1351,18 +1358,25 @@ class _Partitioner:
         consolidates, even down to a single direct reader.
 
         That reader then gets the source's own pipes as INCOMING edges from a
-        freshly placed :class:`SidecarProcess`, one per track -- what stands
-        where the alias's own ``-i`` would have stood, and what
+        freshly placed :class:`SidecarProcess`, one per selected track -- what
+        stands where the alias's own ``-i`` would have stood, and what
         :meth:`_materialize` turns into that reader's own ``-f nut -i pipe:``
-        inputs, one per track, addressed under fresh aliases the way any
-        other piped edge already is. Every existing `src:<alias>:...` ref
-        elsewhere in the graph is untouched.
+        inputs, addressed under fresh aliases the way any other piped edge
+        already is. The sidecar's `tracks` records which catalog track each of
+        its outputs carries, which is what the argv names. Every existing
+        `src:<alias>:...` ref elsewhere in the graph is untouched.
         """
         source: ModuleSource
         for alias, source in sorted(self.g.module_sources.items()):
             readers = [p for p in self.pending if self._reads(p, alias)]
-            if not readers:
-                continue  # nothing downstream ever reads this source
+            wanted = {ref for process in readers for ref in self._reads(process, alias)}
+            selected = [
+                (index, track)
+                for index, track in enumerate(source.tracks)
+                if track.ref in wanted
+            ]
+            if not selected:
+                raise self._unread_source(alias, source)
             reader = next((p for p in readers if not self._consumed(p)), None)
             if reader is None:
                 reader = _Pending(
@@ -1396,18 +1410,32 @@ class _Partitioner:
                 node=alias,  # no graph node backs a module source; the alias stands in
                 args=json.loads(source.params) if source.params else {},
                 inputs=(),
-                outputs=tuple(track.kind for track in source.tracks),
+                outputs=tuple(track.kind for _, track in selected),
                 modules=_bindings((source.module,)),
                 grants=tuple(
                     EffectGrant(effect=effect, module=source.module)
                     for effect in self.effects.get(source.module, ())
                 ),
                 packet_source=True,
+                tracks=tuple(index for index, _ in selected),
             )
             self.sidecars.append(sidecar)
             self.members[sidecar.id] = []
-            for track in source.tracks:
+            for _, track in selected:
                 self._add_edge(sidecar.id, reader.id, track.ref)
+
+    def _unread_source(self, alias: str, source: ModuleSource) -> FfrwdError:
+        """The rejection for a source module no track of which is consumed."""
+        line, col = self.anchors.get(alias, (None, None))
+        return FfrwdError(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"the module '{source.module}' is read as '{alias}' and the query "
+            "takes none of its tracks",
+            line=line,
+            col=col,
+            hint=f"select a stream off it -- {alias}.video[1], {alias}.audio[1] "
+            "-- or drop it from FROM",
+        )
 
     def _redirect_live_reads(self) -> None:
         """Leave one process opening each live input; the rest read its pipes.

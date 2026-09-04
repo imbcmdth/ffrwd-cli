@@ -1497,6 +1497,84 @@ def _module_source_round_trip() -> Graph:
     return g
 
 
+def _three_track_source(alias: str = "s") -> ModuleSource:
+    """A catalog of three: two video renditions and one audio track."""
+    return ModuleSource(
+        alias=alias,
+        module="ffrwd.moq.subscribe",
+        params='{"relay": "https://relay.example"}',
+        tracks=(
+            SourceTrack(
+                ref=f"src:{alias}:v:0", kind="video", codec="h264",
+                time_base=(1, 90000), row=0,
+            ),
+            SourceTrack(
+                ref=f"src:{alias}:v:1", kind="video", codec="h264",
+                time_base=(1, 90000), row=1,
+            ),
+            SourceTrack(
+                ref=f"src:{alias}:a:0", kind="audio", codec="aac",
+                time_base=(1, 48000), row=2,
+            ),
+        ),
+        bounded=False,
+    )  # fmt: skip
+
+
+def _narrowed_graph(*refs: str) -> Graph:
+    """The three-track source with only `refs` mapped into one file."""
+    g = Graph(input_paths=[], sources={})
+    g.module_sources["s"] = _three_track_source()
+    g.sinks = [
+        SinkUnit(
+            outputs=[
+                _out(ref, "audio" if ":a:" in ref else "video") for ref in refs
+            ],
+            path="out.mp4",
+        )
+    ]
+    return g
+
+
+def test_a_module_source_writes_only_the_tracks_the_query_reads() -> None:
+    """One track of three mapped: one output, one edge, one pipe -- and the
+    argv names which track of the catalog that pipe carries. The two tracks
+    nobody reads are never written, so no pipe of theirs can fill."""
+    plan = partition(_narrowed_graph("src:s:a:0"))
+
+    source = next(p for p in plan.sidecars if p.packet_source)
+    assert source.outputs == ("audio",)
+    assert source.tracks == (2,)
+    assert len([e for e in plan.stream_edges if e.source == source.id]) == 1
+    argv = wasm.shown_argv(source, writes=["p0"])
+    assert argv[-5:] == ["-track", "2", "-f", "nut", "p0"]
+    assert argv.count("-f") == 1
+
+
+def test_a_module_sources_selected_tracks_keep_catalog_order() -> None:
+    """Two of three, named by the query in the other order: the outputs and
+    their selectors still run in catalog order."""
+    plan = partition(_narrowed_graph("src:s:a:0", "src:s:v:0"))
+
+    source = next(p for p in plan.sidecars if p.packet_source)
+    assert source.outputs == ("video", "audio")
+    assert source.tracks == (0, 2)
+
+
+def test_a_module_source_no_track_of_which_is_read_is_refused() -> None:
+    """A source writing nothing is not one -- and an empty process would sit
+    in the plan with no pipe to write."""
+    g = Graph(input_paths=[], sources={})
+    g.module_sources["s"] = _three_track_source()
+    g.sinks = [SinkUnit(outputs=[_out("src:other:v:0")], path="out.mp4")]
+
+    with pytest.raises(FfrwdError) as caught:
+        partition(g)
+    assert caught.value.code is ErrorCode.UNSUPPORTED_SQL
+    assert "takes none of its tracks" in caught.value.message
+    assert caught.value.hint is not None
+
+
 def test_a_module_source_round_trips_through_to_dict() -> None:
     g = _module_source_round_trip()
     restored = Graph.from_dict(g.to_dict())

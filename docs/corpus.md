@@ -2242,7 +2242,7 @@ COPY (
 
 ```
 $ ffrwd compile -f query.sql -v dest=source.mp4
-ffrwd-wasm -m ../sidecar/modules/target/wasm32-wasip2/release/source_replay.wasm -f nut pipe:1 | ffmpeg -f nut -i pipe:0 -map 0:v:0 -c:0 libx264 -crf:0 20 source.mp4
+ffrwd-wasm -m ../sidecar/modules/target/wasm32-wasip2/release/source_replay.wasm -track 0 -f nut pipe:1 | ffmpeg -f nut -i pipe:0 -map 0:v:0 -c:0 libx264 -crf:0 20 source.mp4
 ```
 
 Reach for this for a module that manufactures a stream rather than filtering one - a synthetic test pattern, a packet source pulled off a socket - anywhere a query wants to name it as an input alongside, or instead of, a probed file.
