@@ -293,16 +293,18 @@ def _at(declared: WasmFunction) -> Iterator[None]:
 
 
 def _nn_models(
-    declared_stream: Mapping[str, WasmFunction], describes: Mapping[str, Described]
+    hosted: Mapping[str, WasmFunction], describes: Mapping[str, Described]
 ) -> dict[str, ModelBinding]:
-    """The model each module that runs one binds, keyed by module path.
+    """The model each hosted module binds, keyed by module path.
 
-    A module whose describe says it runs none binds nothing and emits no
-    ``-nn``. One that does names the file at compile time, so a missing model
-    is a rejection here rather than a load failure at run time.
+    Every module the sidecar runs -- a stream one and a rows one alike --
+    whose describe says it runs a model. One whose describe says it runs
+    none binds nothing and emits no ``-nn``. One that does names the file at
+    compile time, so a missing model is a rejection here rather than a load
+    failure at run time.
     """
     models: dict[str, ModelBinding] = {}
-    for declared in declared_stream.values():
+    for declared in hosted.values():
         described = describes.get(declared.module)
         if described is None or not described.nn or declared.module in models:
             continue
@@ -513,7 +515,7 @@ def compile_all(
                 pix_fmts=_wire_formats(stream_wasm, describes),
                 shapes=_module_shapes(stream_wasm, describes),
                 audio_wires=_audio_wires(stream_wasm, describes),
-                models=_nn_models(stream_wasm, describes),
+                models=_nn_models(hosted, describes),
                 effects=_effect_grants(stream_wasm, describes),
                 anchors=res.input_anchors,
             )

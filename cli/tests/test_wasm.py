@@ -5321,6 +5321,7 @@ def _rows_module_described(
     rows_module: bool = True,
     reads: dict[str, object] | None = None,
     writes: dict[str, object] | None = None,
+    nn: bool = False,
 ) -> Described:
     """A module that reads cue rows and writes cue rows, as --describe says it."""
     return Described(
@@ -5331,10 +5332,11 @@ def _rows_module_described(
         rows_schema=writes or _CUE_ROWS,
         input_rows_schema=reads or _CUE_ROWS,
         rows_module=rows_module,
+        nn=nn,
     )
 
 
-def _captioner() -> Described:
+def _captioner(*, nn: bool = False) -> Described:
     """A window module that reads video and hands each frame a cue row."""
     return Described(
         world="ffrwd:av@0.14.0",
@@ -5344,6 +5346,7 @@ def _captioner() -> Described:
         rows_schema=_CUE_ROWS,
         pixel_formats=("rgba",),
         windowed=True,
+        nn=nn,
     )
 
 
@@ -5730,6 +5733,68 @@ def test_a_second_rows_module_names_the_first_by_its_own_m_slot() -> None:
     argv = plan_argv(plan, sidecar_argv=wasm.shown_argv)["sidecar0"]
     assert argv.count("-rows-from") == 2
     assert [argv[i + 1] for i, a in enumerate(argv) if a == "-rows-from"] == ["0", "1"]
+
+
+# a rows module running a model of its own
+
+
+def _nn_rows_paths(root: Path) -> tuple[str, str]:
+    """The producer's and the rows module's own paths, under a real directory."""
+    return (str(root / "captions.wasm"), str(root / "fauxlate.wasm"))
+
+
+def _nn_rows_query(paths: tuple[str, str]) -> str:
+    captioner, rows_module = paths
+    return (
+        f"CREATE FUNCTION captions(v video_stream)\n"
+        f"RETURNS STRUCT(v video_stream, cues cue[])\n"
+        f"  AS '{captioner}', 'captions' LANGUAGE wasm;\n"
+        f"CREATE FUNCTION fauxlate(cues cue[]) RETURNS cue[]\n"
+        f"  AS '{rows_module}', 'fauxlate' LANGUAGE wasm;\n"
+    ) + _copy("s.video[1], s.audio[1], fauxlate(captions(s.video[1]).cues)", path="out.mkv")
+
+
+def _nn_rows_plan(
+    sql: str, paths: tuple[str, str], *, stream_nn: bool = True, rows_nn: bool = True
+) -> Compiled:
+    captioner, rows_module = paths
+    modules = {
+        captioner: _captioner(nn=stream_nn),
+        rows_module: _rows_module_described(nn=rows_nn),
+    }
+    return compile_all(sql, describe=lambda path: modules[path])
+
+
+def test_a_rows_module_s_own_model_binds_beside_its_producer_s(tmp_path: Path) -> None:
+    """A rows module chained onto a stream module's rows binds its OWN model
+    the same way the producer binds its, rather than being skipped."""
+    paths = _nn_rows_paths(tmp_path)
+    (tmp_path / "captions.onnx").write_bytes(b"")
+    (tmp_path / "fauxlate.onnx").write_bytes(b"")
+    plan = _nn_rows_plan(_nn_rows_query(paths), paths).plan
+    assert plan is not None
+    argv = wasm.shown_argv(plan.sidecars[0])
+    positions = [i for i, a in enumerate(argv) if a == "-nn"]
+    assert [argv[i + 1] for i in positions] == [
+        f"captions={tmp_path / 'captions.onnx'}",
+        f"fauxlate={tmp_path / 'fauxlate.onnx'}",
+    ]
+
+
+def test_a_rows_module_s_missing_model_is_refused(tmp_path: Path) -> None:
+    """The same refusal a stream module's missing model gets, shared by a
+    rows module: the file has to be there at compile time, not just at run
+    time when the sidecar rejects the load by name."""
+    paths = _nn_rows_paths(tmp_path)
+    (tmp_path / "captions.onnx").write_bytes(b"")
+    with pytest.raises(FfrwdError) as caught:
+        _nn_rows_plan(_nn_rows_query(paths), paths)
+    error = caught.value
+    assert error.code is ErrorCode.UNSUPPORTED_SQL
+    assert str(tmp_path / "fauxlate.onnx") in error.message
+    assert "is not there" in error.message
+    assert error.line is not None and error.hint
+    assert "fetch" in error.hint
 
 
 # several documents off one region

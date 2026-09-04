@@ -34,6 +34,7 @@ from ffrwd.processes import (
     AudioFormat,
     FfmpegProcess,
     FileEdge,
+    ModelBinding,
     ModuleShape,
     PadMeta,
     ProcessPlan,
@@ -1694,3 +1695,41 @@ def test_the_documents_a_region_writes_are_written_out() -> None:
             "source": 1,
         },
     ]
+
+
+# ---------------------------------------------------------------------------
+# a rows module running a model of its own
+# ---------------------------------------------------------------------------
+
+
+def test_a_region_binds_a_stream_and_a_rows_module_s_model_alike() -> None:
+    """A rows module chained onto its producer's rows binds a model the same
+    way the producer does, once the caller hands `models` an entry for its
+    own path -- it is a member of the region like any other."""
+    plan = partition(
+        _two_document_graph(),
+        external=external_ids("e0", "r0"),
+        probes={"a": _video_probe()},
+        models={
+            "captions.wasm": ModelBinding(name="captions", path="captions.onnx"),
+            "fauxlate.wasm": ModelBinding(name="fauxlate", path="fauxlate.onnx"),
+        },
+    )
+    region = plan.sidecars[0]
+    assert [(m.name, m.path) for m in region.models] == [
+        ("captions", "captions.onnx"),
+        ("fauxlate", "fauxlate.onnx"),
+    ]
+
+
+def test_a_rows_module_with_no_model_binds_none_of_its_own() -> None:
+    """A rows module `models` names nothing for binds none -- its producer's
+    binding is untouched, and the rows module itself takes no ``-nn``."""
+    plan = partition(
+        _two_document_graph(),
+        external=external_ids("e0", "r0"),
+        probes={"a": _video_probe()},
+        models={"captions.wasm": ModelBinding(name="captions", path="captions.onnx")},
+    )
+    region = plan.sidecars[0]
+    assert [m.path for m in region.models] == ["captions.onnx"]
