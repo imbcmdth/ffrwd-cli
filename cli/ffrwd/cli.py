@@ -2419,6 +2419,46 @@ def _lock_to_write(args: argparse.Namespace, hint: str | None = None) -> tuple[P
     return found, 0
 
 
+def _lock_to_write_starting(args: argparse.Namespace) -> tuple[Path | None, int, bool]:
+    """Like `_lock_to_write`, but a manifest with no lockfile beside it starts one.
+
+    Only `ffrwd link <name>` calls this. npm's `npm link <pkg>` works in any
+    directory holding a `package.json`; the same shape here is a directory
+    holding `ffrwd.json` with no `ffrwd.lock` yet -- the lock started is
+    empty, written the way `ffrwd init` writes one. A directory with no
+    manifest at all still refuses, naming `ffrwd init` as the way forward.
+    The third element is True when this call is the one that started the
+    lock, so the caller can say so.
+    """
+    if args.global_lock:
+        return store.global_lock_path(), 0, False
+    found = find_lockfile(Path.cwd())
+    if found is not None:
+        return found, 0, False
+    manifest = find_manifest(Path.cwd())
+    if manifest is None:
+        print(
+            f"error: {args.command}: no {LOCKFILE_NAME} in {Path.cwd()} or above it",
+            file=sys.stderr,
+        )
+        print(
+            "hint: a link is recorded in the project that reads it; run `ffrwd init` "
+            "to start one here",
+            file=sys.stderr,
+        )
+        return None, 2, False
+    lock = manifest.parent / LOCKFILE_NAME
+    try:
+        write_lockfile(lock, ())
+    except OSError as err:
+        print(
+            f"error: {args.command}: {lock} could not be written: {err.strerror or err}",
+            file=sys.stderr,
+        )
+        return None, 1, False
+    return lock, 0, True
+
+
 def _held_entries(path: Path) -> tuple[LockEntry, ...]:
     """What `path` already pins, or nothing when there is no file there yet."""
     return read_lockfile(path).entries if path.is_file() else ()
@@ -2691,7 +2731,9 @@ def _cmd_link(args: argparse.Namespace, on_warning: OnWarning) -> int:
     this project's links file, never the lockfile -- a link is this
     machine's, and the lockfile is everyone's. The name resolves through the
     machine-wide record, so re-linking from a new directory re-points every
-    project at once.
+    project at once. A directory with a manifest but no lockfile yet gets one
+    started, empty, the way `ffrwd init` writes one -- npm's `npm link <pkg>`
+    works the same way, in any directory holding a `package.json`.
     """
     if args.global_lock:
         print("error: link: -g is retired -- a link is machine-wide already", file=sys.stderr)
@@ -2710,10 +2752,7 @@ def _cmd_link(args: argparse.Namespace, on_warning: OnWarning) -> int:
             )
         )
         return 1
-    lock, code = _lock_to_write(
-        args, hint="a link is recorded in the project that reads it; run `ffrwd init` "
-        "to start one here"
-    )
+    lock, code, started = _lock_to_write_starting(args)
     if lock is None:
         return code
 
@@ -2736,6 +2775,8 @@ def _cmd_link(args: argparse.Namespace, on_warning: OnWarning) -> int:
         _print_error(err)
         return 1
 
+    if started:
+        print(f"started {lock}")
     print(f"linked {name} -> {root} in {links_file}")
     if replaced is not None and replaced.path is not None:
         print(f"  replacing the link to {replaced.path}")

@@ -654,9 +654,12 @@ manifest pins - its own lockfile, the shared store - and records
 name -> directory in the machine-wide `ffrwd.links` under the cache
 directory. `ffrwd link <namespace>/<package>`, run in a consuming
 project: records the name in the project's `ffrwd.links` beside its
-lockfile, which itself is untouched. A name nothing on this machine
-links is refused, hint naming the first command; so is a directory
-path - the consumer names packages, never directories.
+lockfile, which itself is untouched. A directory holding a manifest but
+no lockfile yet gets one started, empty, before the link is recorded;
+with no manifest at all the command still refuses, hint naming
+`ffrwd init`. A name nothing on this machine links is refused, hint
+naming the first command; so is a directory path - the consumer names
+packages, never directories.
 
 The name resolves through the machine-wide record, so re-running the
 bare form from a new directory re-points every consumer at once. The

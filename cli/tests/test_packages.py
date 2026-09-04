@@ -986,6 +986,84 @@ def test_bare_install_moves_an_old_lockfile_link_into_the_links_file(
     assert code == 0 and "volume=volume=0.5" in out
 
 
+def test_link_by_name_in_a_manifest_only_directory_starts_the_lock(
+    store_home: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A directory holding only a manifest is where npm's `npm link` works too.
+
+    `link <name>` starts the lock the way `ffrwd init` would -- empty -- and
+    records the link beside it, rather than refusing for want of a file
+    nothing has written yet.
+    """
+    dev = _package(tmp_path / "dev", name="broadcast/tracks")
+    assert _run(dev, monkeypatch, capsys, "link")[0] == 0
+    project = _package(tmp_path / "work", name="consumer/mine")
+    assert not (project / "ffrwd.lock").exists()
+
+    code, out, _err = _run(project, monkeypatch, capsys, "link", "broadcast/tracks")
+    assert code == 0
+    lock = project / "ffrwd.lock"
+    assert f"started {lock}" in out
+    assert "linked broadcast/tracks -> " in out and "ffrwd.links" in out
+    assert lock.is_file()
+    assert read_lockfile(lock).entries == ()
+    assert read_linksfile(links_path(lock)) == (LinkEntry(name="broadcast/tracks"),)
+
+
+def test_link_then_bare_install_resolves_the_published_and_leaves_the_linked(
+    store_home: Path,
+    registry: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The gap this closes: a dependency nobody has published yet, linked, next
+    to one the registry already has -- with no lockfile in the tree at all
+    until `link` starts one."""
+    monkeypatch.setenv(packages.REGISTRY_ENV, str(registry))
+    _publish(registry, _package(tmp_path / "pub", name="broadcast/video", factor="0.5"))
+    dev = _package(tmp_path / "dev", name="broadcast/tracks")
+    assert _run(dev, monkeypatch, capsys, "link")[0] == 0
+
+    project = _package(
+        tmp_path / "work",
+        name="consumer/mine",
+        dependencies={"broadcast/video": "1.0.0", "broadcast/tracks": "1.0.0"},
+    )
+    assert not (project / "ffrwd.lock").exists()
+    assert _run(project, monkeypatch, capsys, "link", "broadcast/tracks")[0] == 0
+
+    code, out, err = _run(project, monkeypatch, capsys, "install")
+    assert code == 0, err
+    assert "broadcast/tracks is linked to a working directory" in err
+    held = read_lockfile(project / "ffrwd.lock")
+    assert [
+        (entry.name, entry.version)
+        for entry in held.entries
+        if isinstance(entry, RegistryEntry)
+    ] == [("broadcast/video", "1.0.0")]
+    assert read_linksfile(links_path(project / "ffrwd.lock")) == (
+        LinkEntry(name="broadcast/tracks"),
+    )
+
+
+def test_link_by_name_with_no_manifest_still_refuses(
+    store_home: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    bare = tmp_path / "elsewhere"
+    bare.mkdir()
+    code, _out, err = _run(bare, monkeypatch, capsys, "link", "broadcast/tracks")
+    assert code == 2
+    assert "no ffrwd.lock" in err and "ffrwd init" in err
+    assert not (bare / "ffrwd.lock").exists()
+
+
 def test_bare_install_fetches_the_projects_own_pinned_models(
     store_home: Path,
     served: _Served,
