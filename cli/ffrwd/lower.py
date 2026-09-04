@@ -12834,6 +12834,28 @@ class _Lowerer:
 
     # -- the ordinary case: any filter the installed ffmpeg reports --------
 
+    def _twin_pair(self, name: str, dynamic: DynamicFilter) -> DynamicFilter | None:
+        """``name``'s audio twin ``a<name>``, if the pair is eligible, else None.
+
+        Eligibility comes straight from the registry, not a curated list:
+        ``name`` takes video-only input, ``a<name>`` exists and takes
+        audio-only input. That excludes a pair that only shares a stem, like
+        ``interleave``/``ainterleave`` or ``mix``/``amix`` (both N-input, so
+        neither has a fixed pad type to compare). Shared between the twin
+        dispatch itself and the refusal hint that names a stem, so the two
+        never disagree about what counts as a pair.
+        """
+        if self.registry is None:
+            return None
+        if dynamic.n_input or not dynamic.inputs or any(k != "video" for k in dynamic.inputs):
+            return None
+        twin = self.registry.get("a" + name)
+        if twin is None or twin.n_input or not twin.inputs:
+            return None
+        if any(k != "audio" for k in twin.inputs):
+            return None
+        return twin
+
     def _dispatch_audio(
         self,
         name: str,
@@ -12845,25 +12867,15 @@ class _Lowerer:
         """A bare video-only name dispatches to its audio twin over audio input.
 
         ``ffmpeg.<name>(...)`` is untouched -- only a bare call dispatches.
-        Eligibility comes straight from the registry, not a curated list:
-        ``name`` takes video-only input, ``a<name>`` exists and takes
-        audio-only input. That excludes a pair that only shares a stem, like
-        ``interleave``/``ainterleave`` or ``mix``/``amix`` (both N-input, so
-        neither has a fixed pad type to compare).
         """
         if call.namespaced or self.registry is None:
             return name, dynamic
-        if dynamic.n_input or not dynamic.inputs or any(k != "video" for k in dynamic.inputs):
-            return name, dynamic
-        twin_name = "a" + name
-        twin = self.registry.get(twin_name)
-        if twin is None or twin.n_input or not twin.inputs:
-            return name, dynamic
-        if any(k != "audio" for k in twin.inputs):
+        twin = self._twin_pair(name, dynamic)
+        if twin is None:
             return name, dynamic
         kinds = self._stream_kinds(call, env, select, len(dynamic.inputs))
         if kinds[:1] == ["audio"]:
-            return twin_name, twin
+            return "a" + name, twin
         return name, dynamic
 
     def _lower_dynamic_call(
@@ -12890,7 +12902,8 @@ class _Lowerer:
         expected = list(dynamic.inputs)
         kinds = self._stream_kinds(call, env, select, len(expected))
         if kinds != expected:
-            raise self._bad_streams(call, node, select, expected, kinds)
+            twin_stem = self._twin_dispatch_stem(name, call, kinds)
+            raise self._bad_streams(call, node, select, expected, kinds, twin_stem=twin_stem)
         args_at, per_row = self._option_binder(
             name,
             call,
@@ -13444,6 +13457,28 @@ class _Lowerer:
             self._reject_passthrough_args(call.display, kinds, call, call.args[0])
         return kinds
 
+    def _twin_dispatch_stem(self, name: str, call: _Call, got: list[str]) -> str | None:
+        """The video stem to name in a refusal, when a hand-spelled audio
+        twin was handed a video stream, or None for the ordinary hint.
+
+        Only ``a<stem>(video)`` qualifies: a bare call (not
+        ``ffmpeg.a<stem>(...)``, which is exact and never switches), whose
+        name starts with ``a``, whose stem is a video-only filter with
+        exactly this name as its eligible audio twin (:meth:`_twin_pair`),
+        and whose first stream argument is video -- the shape the twin
+        dispatch would have picked up had the query spelled the bare stem
+        instead.
+        """
+        if call.namespaced or self.registry is None:
+            return None
+        if len(name) < 2 or not name.startswith("a") or got[:1] != ["video"]:
+            return None
+        stem = name[1:]
+        video = self.registry.get(stem)
+        if video is None:
+            return None
+        return stem if self._twin_pair(stem, video) is not None else None
+
     def _bad_streams(
         self,
         call: _Call,
@@ -13451,13 +13486,26 @@ class _Lowerer:
         select: exp.Select,
         expected: list[StreamType],
         got: list[str],
+        *,
+        twin_stem: str | None = None,
     ) -> FfrwdError:
         """The stream-signature rejection — UDF_ARG_TYPE's remaining job.
 
         Option problems never reach here: they are ``UNKNOWN_FILTER_OPTION`` /
-        ``FILTER_OPTION_TYPE`` uniformly, positional or named.
+        ``FILTER_OPTION_TYPE`` uniformly, positional or named. ``twin_stem``,
+        when given, names the bare video filter whose audio twin the caller
+        hand-spelled -- the hint then points at calling the stem instead of
+        repeating the ordinary calling-convention reminder.
         """
         shown = call.display
+        hint = (
+            f"call {twin_stem}(...) on either kind: the compiler picks the "
+            f"audio twin, {shown}, from the column's type"
+            if twin_stem is not None
+            else f"stream inputs come first, then options in the filter's own order, "
+            f"then named options: {shown}({', '.join(expected)}, <option>, "
+            f"<option> => <value>)"
+        )
         return _error(
             ErrorCode.UDF_ARG_TYPE,
             f"{shown}() is an ffmpeg filter: it takes {', '.join(expected)} as its "
@@ -13465,9 +13513,7 @@ class _Lowerer:
             f"got ({', '.join(got) or 'nothing'})",
             node,
             fallback=select,
-            hint=f"stream inputs come first, then options in the filter's own order, "
-            f"then named options: {shown}({', '.join(expected)}, <option>, "
-            f"<option> => <value>)",
+            hint=hint,
         )
 
     def _options_for(

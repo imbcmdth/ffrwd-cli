@@ -3878,6 +3878,55 @@ def test_an_n_input_pair_is_not_touched_by_audio_dispatch() -> None:
     assert "its stream inputs are all video" in err.message
 
 
+# -- hand-spelling the audio twin over a video stream names the stem --------
+#
+# `realtime`/`arealtime` is another clean pair in the snapshot registry
+# (tests/data/reference_registry.json): `realtime` video-only, `arealtime`
+# audio-only. `setpts`/`asetpts` and `settb`/`asettb` are also present there,
+# if either were ever needed as a second pair.
+
+
+def test_hand_spelled_twin_on_video_names_the_stem_in_the_hint() -> None:
+    """`arealtime(video)` is still refused -- dispatch only ever runs off the
+    BARE video name -- but since `realtime` is `arealtime`'s eligible twin,
+    the hint points at calling `realtime` instead of repeating the generic
+    calling-convention reminder."""
+    err = _reject_lower("SELECT arealtime(a.video[1]) FROM input('x.mp4') a", {})
+    assert err.code is ErrorCode.UDF_ARG_TYPE
+    assert "arealtime() is an ffmpeg filter: it takes audio as its stream input" in err.message
+    assert "got (video)" in err.message
+    assert err.hint == (
+        "call realtime(...) on either kind: the compiler picks the audio "
+        "twin, arealtime, from the column's type"
+    )
+
+
+def test_audio_only_filter_with_no_video_stem_keeps_the_generic_hint() -> None:
+    """`volume` does not start with `a`, so it is never mistaken for a
+    hand-spelled twin -- the ordinary calling-convention hint stands."""
+    err = _reject_lower("SELECT volume(a.video[1]) FROM input('x.mp4') a", {})
+    assert err.code is ErrorCode.UDF_ARG_TYPE
+    assert "volume() is an ffmpeg filter: it takes audio as its stream input" in err.message
+    assert err.hint == (
+        "stream inputs come first, then options in the filter's own order, "
+        "then named options: volume(audio, <option>, <option> => <value>)"
+    )
+
+
+def test_namespaced_twin_on_video_keeps_the_generic_hint() -> None:
+    """`ffmpeg.arealtime(...)` is exact and never dispatches -- the stem hint
+    is a bare-call courtesy only."""
+    err = _reject_lower("SELECT ffmpeg.arealtime(a.video[1]) FROM input('x.mp4') a", {})
+    assert err.code is ErrorCode.UDF_ARG_TYPE
+    assert "ffmpeg.arealtime() is an ffmpeg filter: it takes audio as its stream input" in (
+        err.message
+    )
+    assert err.hint == (
+        "stream inputs come first, then options in the filter's own order, "
+        "then named options: ffmpeg.arealtime(audio, <option>, <option> => <value>)"
+    )
+
+
 # -- named option validation (both tiers, same two codes) -------------------
 
 
