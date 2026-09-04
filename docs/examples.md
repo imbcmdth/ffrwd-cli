@@ -3137,7 +3137,7 @@ CREATE FUNCTION embed_text(prompt text) RETURNS vector
   AS '../sidecar/modules/target/wasm32-wasip2/release/fauxlate.wasm', 'embed_text'
   LANGUAGE wasm;
 
-SELECT r.label, cos_similarity(embed_text(r.blurb), embed_text('a small pet')) AS score
+SELECT r.label, round(cos_similarity(embed_text(r.blurb), embed_text('a small pet')), 4) AS score
 FROM unnest(ARRAY[
   STRUCT('cat' AS label, 'a cat sat on the mat' AS blurb),
   STRUCT('dog' AS label, 'a dog ran in the yard' AS blurb),
@@ -3150,9 +3150,9 @@ LIMIT 2
 ```
 $ ffrwd -f query.sql
  label | score
--------+--------------------
- car   | 0.8098582871985258
- dog   | 0.7840702021320191
+-------+--------
+ car   | 0.8099
+ dog   | 0.7841
 (2 rows)
 ```
 

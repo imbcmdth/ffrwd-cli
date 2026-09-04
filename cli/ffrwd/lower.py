@@ -14187,6 +14187,30 @@ class _Lowerer:
             groups.setdefault(key, []).append(row)
         return list(groups.values())
 
+    def _is_printable_value(self, node: exp.Expr) -> bool:
+        """True for a shape a table column prints as a computed value cell,
+        the same grammar :meth:`_eval_value` evaluates: the parser's own
+        value shapes (``is_value_expr``), a vector builtin call
+        (``cos_similarity``/``vector_length``), a declared wasm value
+        function call, or a built-in text/number function (``round``,
+        ``upper``, ...) wrapping one of those -- what lets
+        ``round(cos_similarity(...), 4)`` print a rounded score the same
+        way ``round(a + b, 2)`` prints a rounded sum.
+        """
+        if is_value_expr(node):
+            return True
+        call = _call_parts(node)
+        if call is not None and not call.namespaced and not call.is_macro:
+            name = call.name.lower()
+            if name in _VECTOR_BUILTIN_ARITY:
+                return True
+            declared = self.res.wasm.get(name)
+            if declared is not None and declared.is_value:
+                return True
+        if isinstance(node, _BUILTIN_VALUE_FUNCS):
+            return self._is_printable_value(node.this)
+        return False
+
     def _table_projection(
         self, projection: exp.Expr, env: _Env, select: exp.Select, cardinality: int
     ) -> list[CellValue]:
@@ -14232,14 +14256,7 @@ class _Lowerer:
                     # array, re-exposed through the CTE) stays ONE cell.
                     if column is not None and column.value.is_array and not column.splat:
                         return self._array_cell_broadcast(expr, env, select, cardinality)
-        if (
-            is_value_expr(expr)
-            or _is_input_value_column(expr, env)
-            or (
-                isinstance(expr, exp.Anonymous)
-                and str(expr.name).lower() in _VECTOR_BUILTIN_ARITY
-            )
-        ):
+        if self._is_printable_value(expr) or _is_input_value_column(expr, env):
             return self._value_cells(expr, env, select, cardinality)
         shape = subscript_metadata_shape(expr)
         if shape is not None:

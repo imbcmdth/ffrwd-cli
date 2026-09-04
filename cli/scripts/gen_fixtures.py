@@ -400,6 +400,14 @@ def _generate_described() -> None:
     vector payloads are built the way a vector track's are, each row's
     numbers as little-endian f32 in base64, so what reads them back is
     reading a file it did not write. Must run after av.mp4 exists.
+
+    The audio track is re-encoded to PCM rather than copied: av.mp4's AAC
+    track carries the codec's usual priming delay (its first packet's pts is
+    a few milliseconds negative), and some muxers shift every stream in the
+    output by that amount to keep timestamps non-negative -- carrying the
+    freshly-authored, zero-based caption and vector tracks along with it.
+    PCM has no priming delay, so nothing triggers that shift and every
+    track's start stays at 0 regardless of which ffmpeg build wrote the file.
     """
     described = FIXTURES_DIR / _DESCRIBED_NAME
     if described.exists():
@@ -434,7 +442,7 @@ def _generate_described() -> None:
             "-f", "webvtt", "-i", str(speech),
             "-f", "webvtt", "-i", str(vectors),
             "-map", "0:v:0", "-map", "0:a:0", "-map", "1:s:0", "-map", "2:s:0",
-            "-c", "copy",
+            "-c:v", "copy", "-c:a", "pcm_s16le", "-c:s", "copy",
             "-metadata:s:2", "title=speech",
             "-metadata:s:3", "title=clip_vectors",
             "-metadata:s:3", f"vector_dims={_DESCRIBED_DIMS}",
