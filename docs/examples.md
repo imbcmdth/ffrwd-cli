@@ -3255,7 +3255,7 @@ $ ffrwd -f query.sql
 
 `cues` reads back the same way over the caption tracks - `unnest(f.cues) c` is every one of them, with `c.track`, `c.text` and the bounds - and a title names one track: `unnest(f.embeddings['clip_vectors']) v`, `unnest(f.cues['speech']) c`. A title the file does not carry is a rejection listing the ones it does. The rows are compile-time rows like any other, so `WHERE`, `ORDER BY` and `cos_similarity(v.vector, embed_text('a small pet'))` narrow and rank them ([recipe 114](#114-rank-rows-by-a-vector)) before anything runs.
 
-## 120. Pace a concatenation to a live destination
+## 121. Pace a concatenation to a live destination
 
 A VARIADIC call stands wherever a stream does, including as another call's argument: `concat(VARIADIC array_agg(t))` is `realtime`'s own stream argument here, not a whole SELECT column of its own. `realtime` after the concat holds the stitched stream to the clock, which `-re` on each input cannot do for a concatenation - each input would be paced from process start, not from where the stitched result actually is. The column is audio, so the compiler writes the audio twin, `arealtime` ([filters.md](filters.md)). Reach for this to play a stitched sequence out to a socket in real time.
 
