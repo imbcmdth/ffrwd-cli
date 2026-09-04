@@ -3264,6 +3264,10 @@ COPY (
   SELECT realtime(concat(VARIADIC array_agg(t)))
   FROM input('tests/fixtures/av-chapters.mkv') f, unnest(f.audio) t
 ) TO 'udp://127.0.0.1:5004' WITH (format 'mpegts', audio_codec 'aac')
+```
+
+```
+$ ffrwd compile -f query.sql
 ffmpeg -i tests/fixtures/av-chapters.mkv -filter_complex \
   '[0:a:0][0:a:1]concat=n=2:v=0:a=1,arealtime[out0]' -map '[out0]' -f mpegts -c:0 aac \
   udp://127.0.0.1:5004
