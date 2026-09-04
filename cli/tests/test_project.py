@@ -2570,12 +2570,32 @@ def _list(
     return code, captured.out, captured.err
 
 
+# A recipe carrying its own `-- example:` line: `ffrwd list` derives the
+# required/optional split from one probe compile of exactly those values
+# (see `test_publish.py`'s `RECIPE`, which is the same shape), so a recipe
+# used to exercise that split has to carry one too -- unlike the bare
+# `RECIPE` above, which plenty of other tests here compile directly with
+# their own `-v` values and never through the split at all.
+_RUNNABLE_RECIPE = (
+    "-- variables: source (input media path), dest (output path)\n"
+    "-- example: ffrwd run split-chapters -v source=in.mp4 -v dest=out.mp4\n"
+    "COPY (SELECT f.video[1] FROM input(:'source') f) TO :'dest';\n"
+)
+
+# A recipe whose probe compile cannot succeed: no package declares
+# `nosuchfilter`, the shape the deleted publish-time gate test used.
+_UNCOMPILABLE_RECIPE = (
+    "-- variables: source (input media path)\n"
+    "COPY (SELECT nosuchfilter(f.audio[1]) FROM input(:'source') f) TO 'out.mkv';\n"
+)
+
+
 def test_list_prints_the_exports_recipes_and_dependencies_a_project_provides(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     _project(
         tmp_path,
-        files={"src/tracks.sql": QUIETER + PICK, "queries/split.sql": RECIPE},
+        files={"src/tracks.sql": QUIETER + PICK, "queries/split.sql": _RUNNABLE_RECIPE},
         manifest={**_BIN, "dependencies": {"broadcast/tracks": "^1.2.0"}},
     )
     code, out, _err = _list(tmp_path, monkeypatch, capsys)
@@ -2604,7 +2624,7 @@ def test_list_as_json_carries_the_signatures_and_the_variables(
 ) -> None:
     _project(
         tmp_path,
-        files={"src/tracks.sql": QUIETER, "queries/split.sql": RECIPE},
+        files={"src/tracks.sql": QUIETER, "queries/split.sql": _RUNNABLE_RECIPE},
         manifest={**_BIN, "dependencies": {"broadcast/tracks": "^1.2.0"}},
     )
     code, out, _err = _list(tmp_path, monkeypatch, capsys, "--json")
@@ -2629,6 +2649,7 @@ def test_list_as_json_carries_the_signatures_and_the_variables(
         {
             "name": "split-chapters",
             "file": "queries/split.sql",
+            "compiles": True,
             "required": [
                 {"name": "source", "description": "input media path"},
                 {"name": "dest", "description": "output path"},
@@ -2637,6 +2658,37 @@ def test_list_as_json_carries_the_signatures_and_the_variables(
         }
     ]
     assert package["dependencies"] == [{"name": "broadcast/tracks", "range": "^1.2.0"}]
+
+
+def test_list_marks_a_recipe_that_cannot_compile_instead_of_claiming_its_variables(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A recipe whose probe compile fails prints ``<compilation failed>``, not a
+    required/optional split nobody checked -- and a working recipe beside it
+    still prints its own."""
+    _project(
+        tmp_path,
+        files={
+            "queries/split.sql": _RUNNABLE_RECIPE,
+            "queries/broken.sql": _UNCOMPILABLE_RECIPE,
+        },
+        manifest={"bin": {"split-chapters": "queries/split.sql", "broken": "queries/broken.sql"}},
+    )
+    code, out, _err = _list(tmp_path, monkeypatch, capsys)
+    assert code == 0
+    assert "source (input media path), dest (output path)" in out
+    assert "<compilation failed>" in out
+
+    code, out, _err = _list(tmp_path, monkeypatch, capsys, "--json")
+    assert code == 0
+    recipes = {
+        recipe["name"]: recipe for recipe in json.loads(out)["packages"][0]["recipes"]
+    }
+    assert recipes["split-chapters"]["compiles"] is True
+    assert recipes["split-chapters"]["required"] != []
+    assert recipes["broken"]["compiles"] is False
+    assert recipes["broken"]["required"] == []
+    assert recipes["broken"]["optional"] == []
 
 
 def test_list_names_the_layer_and_marks_a_linked_package(

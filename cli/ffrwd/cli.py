@@ -233,7 +233,7 @@ from .project import (
     write_manifest,
 )
 from .prompt import build_system_prompt
-from .publish import required_variables as _required_variables
+from .publish import recipe_variables as _recipe_variables
 from .split import insert_splits
 from .table import CellValue, TableResult, TableSink, render_csv, render_table
 from .vars import Variable, declared_variables, referenced, substitute, unset_variable
@@ -1700,13 +1700,17 @@ def _echo_command(argv: list[str]) -> None:
 class _ListedRecipe:
     """One recipe: the variables its query declares, split required from optional.
 
-    The split is derived, not read off the header -- see :func:`_required_variables`.
+    The split is derived, not read off the header -- see :func:`_recipe_variables`.
+    `compiles` is False when the probe compile that derives the split could
+    not even run once; `required` and `optional` are then both empty, and the
+    table prints ``<compilation failed>`` in their place.
     """
 
     name: str
     path: Path
     required: tuple[Variable, ...]
     optional: tuple[Variable, ...]
+    compiles: bool
 
 
 @dataclass(frozen=True)
@@ -1738,16 +1742,14 @@ def _listed(package: Package, packages: PackageSet | None) -> _Listed:
     recipes = []
     for name, path in package.recipes.items():
         text = path.read_text(encoding="utf-8")
-        declared = declared_variables(text)
-        required = _required_variables(
-            text, frozenset(variable.name for variable in declared), packages
-        )
+        split = _recipe_variables(text, packages)
         recipes.append(
             _ListedRecipe(
                 name=name,
                 path=path,
-                required=tuple(v for v in declared if v.name in required),
-                optional=tuple(v for v in declared if v.name not in required),
+                required=split.required,
+                optional=split.optional,
+                compiles=split.compiles,
             )
         )
     return _Listed(
@@ -1784,6 +1786,7 @@ def _listing_json(listed: list[_Listed]) -> str:
                 {
                     "name": listed_recipe.name,
                     "file": _relative(listed_recipe.path, entry.package.root),
+                    "compiles": listed_recipe.compiles,
                     "required": [
                         {"name": variable.name, "description": variable.description}
                         for variable in listed_recipe.required
@@ -1832,13 +1835,18 @@ def _export_rows(listed: list[_Listed]) -> TableResult:
     return TableResult(columns=["package", "export", "returns", "file"], rows=rows)
 
 
+_NOT_COMPILED = "<compilation failed>"
+
+
 def _recipe_rows(listed: list[_Listed]) -> TableResult:
     rows: list[list[CellValue]] = [
         [
             entry.package.name,
             listed_recipe.name,
-            _written_variables(listed_recipe.required),
-            _written_variables(listed_recipe.optional),
+            _NOT_COMPILED
+            if not listed_recipe.compiles
+            else _written_variables(listed_recipe.required),
+            "" if not listed_recipe.compiles else _written_variables(listed_recipe.optional),
             _relative(listed_recipe.path, entry.package.root),
         ]
         for entry in listed

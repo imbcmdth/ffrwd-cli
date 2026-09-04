@@ -15,7 +15,10 @@ the recipe's own ``-- example:`` line names substituted in -- not to validate
 the recipe, which is the package's own ``test`` command's job, but to read
 off each variable's required or optional list for the version document. A
 recipe with no example line compiles with its variables unset, which is what
-running it that way would do.
+running it that way would do. A recipe that will not even compile that way
+never blocks the publish: its entry gets ``"compiles": false`` and empty
+``required``/``optional`` lists instead of a claim nobody checked, and one
+warning names the recipe and the compiler's own message.
 
 What the registry then checks is only what it alone can: the token and its
 scope, that the namespace is the publisher's, that a version already
@@ -58,7 +61,7 @@ from .project import (
     name_refusal,
     read_manifest,
 )
-from .vars import declared_variables, substitute, unset_variable
+from .vars import Variable, declared_variables, substitute, unset_variable
 from .warnings import FfrwdWarning, OnWarning, WarningCode
 
 __all__ = [
@@ -67,8 +70,10 @@ __all__ = [
     "SYNTHETIC_PROBE",
     "Prepared",
     "Published",
+    "RecipeVariables",
     "prepare",
     "publish",
+    "recipe_variables",
     "required_variables",
 ]
 
@@ -337,6 +342,63 @@ def required_variables(
     return frozenset(required)
 
 
+@dataclass(frozen=True)
+class RecipeVariables:
+    """One recipe's declared variables, split when the split is knowable.
+
+    A single probe compile decides it -- `text`'s own ``-- example:`` values
+    substituted in, exactly as running the example would set them, tried once
+    through :func:`_try_compile`. A recipe that compiles that way gets its
+    usual split, one further compile per declared variable
+    (:func:`required_variables`). A recipe that does not is never swept: a
+    rejection off a recipe that fails outright says nothing about any one
+    variable, and `failure` carries the compiler's own message instead, with
+    both lists left empty -- N further failing compiles would only repeat
+    what this one rejection already said.
+    """
+
+    required: tuple[Variable, ...]
+    optional: tuple[Variable, ...]
+    failure: str | None = None
+
+    @property
+    def compiles(self) -> bool:
+        return self.failure is None
+
+
+def recipe_variables(text: str, packages: PackageSet | None) -> RecipeVariables:
+    """`text`'s declared variables, required split from optional -- or why that
+    split cannot be known.
+
+    Shared by ``ffrwd publish`` (the version document's per-recipe
+    ``required``/``optional``) and ``ffrwd list`` (the same split, read
+    without a network round trip): both want the identical rule -- a recipe
+    that cannot compile even once must not claim a split nobody checked.
+
+    Runs under :func:`_synthetic_probe` regardless of the caller: a recipe's
+    own ``-- example:`` values are real-looking paths (``in.mkv``), not files
+    on this machine, and neither reader is validating media -- only reading
+    off what a recipe declares. Nested safely inside ``prepare``'s own
+    synthetic-probe block, since the seam only ever redirects to the same
+    synthetic answer.
+    """
+    declared = declared_variables(text)
+    names = frozenset(variable.name for variable in declared)
+    with _synthetic_probe():
+        try:
+            probe = substitute(text, _placeholders(text))
+        except FfrwdError as err:
+            return RecipeVariables(required=(), optional=(), failure=err.message)
+        rejection = _try_compile(probe.text, packages, probe.unset)
+        if rejection is not None:
+            return RecipeVariables(required=(), optional=(), failure=rejection.message)
+        required = required_variables(text, names, packages)
+    return RecipeVariables(
+        required=tuple(variable for variable in declared if variable.name in required),
+        optional=tuple(variable for variable in declared if variable.name not in required),
+    )
+
+
 # --------------------------------------------------------------------------
 # validating one package
 # --------------------------------------------------------------------------
@@ -519,21 +581,6 @@ def _tested(package: Package, announce: Announce | None) -> None:
 # --------------------------------------------------------------------------
 
 
-def _recipe_variables(text: str, packages: PackageSet) -> tuple[list[Document], list[Document]]:
-    """`text`'s declared variables, required split from optional -- as ``ffrwd list`` would."""
-    declared = declared_variables(text)
-    required = required_variables(
-        text, frozenset(variable.name for variable in declared), packages
-    )
-    documented = [
-        {"name": variable.name, "description": variable.description} for variable in declared
-    ]
-    return (
-        [doc for doc, variable in zip(documented, declared) if variable.name in required],
-        [doc for doc, variable in zip(documented, declared) if variable.name not in required],
-    )
-
-
 def _readme_html(package: Package) -> str | None:
     """The package's ``README.md`` rendered from CommonMark, or None when it has none.
 
@@ -562,6 +609,7 @@ def _detail_document(
     sha256: str,
     size: int,
     readme_html: str | None,
+    on_warning: OnWarning | None,
 ) -> Document:
     """This version, as the registry stores and serves it."""
     functions = [
@@ -577,15 +625,32 @@ def _detail_document(
     recipes = []
     for name, path in package.recipes.items():
         text = path.read_text(encoding="utf-8")
-        required, optional = _recipe_variables(text, packages)
+        split = recipe_variables(text, packages)
+        if not split.compiles and on_warning is not None:
+            on_warning(
+                FfrwdWarning(
+                    code=WarningCode.RECIPE_DOES_NOT_COMPILE,
+                    package=_qualified_recipe(package, name),
+                    message=f"package '{package.name}': recipe '{name}' does not compile "
+                    f"({split.failure}), so its variables are listed as not known",
+                    hint="fix the recipe so it compiles, or drop it from the package",
+                )
+            )
         recipes.append(
             {
                 "name": name,
                 "file": _relative(path, package.root),
                 "description": _recipe_description(text),
                 "usage": _usage(package, name, text),
-                "required": required,
-                "optional": optional,
+                "compiles": split.compiles,
+                "required": [
+                    {"name": variable.name, "description": variable.description}
+                    for variable in split.required
+                ],
+                "optional": [
+                    {"name": variable.name, "description": variable.description}
+                    for variable in split.optional
+                ],
             }
         )
     document: Document = {
@@ -747,7 +812,13 @@ def prepare(
             )
         sha256 = hashlib.sha256(archive).hexdigest()
         detail = _detail_document(
-            package, _description(manifest), resolvable, sha256, len(archive), readme_html
+            package,
+            _description(manifest),
+            resolvable,
+            sha256,
+            len(archive),
+            readme_html,
+            on_warning,
         )
         sources = _sources(package)
     return Prepared(

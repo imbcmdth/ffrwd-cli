@@ -235,6 +235,7 @@ def test_the_preflight_describes_the_version_it_packed(tmp_path: Path) -> None:
                 "file": "recipes/duck.sql",
                 "description": "Halve a file's audio and write it out.",
                 "usage": "ffrwd run broadcast/tracks:duck -v source=in.mkv -v dest=out.mkv",
+                "compiles": True,
                 "required": [
                     {"name": "source", "description": "input media path"},
                     {"name": "dest", "description": "output path"},
@@ -316,6 +317,12 @@ def test_a_package_declaring_no_homepage_sends_none_in_the_metadata(tmp_path: Pa
     assert prepared.metadata()["homepage"] is None
 
 
+_UNCOMPILABLE_RECIPE = (
+    "-- variables: source (input media path)\n"
+    "COPY (SELECT nosuchfilter(f.audio[1]) FROM input(:'source') f) TO 'out.mkv';\n"
+)
+
+
 def test_a_manifest_with_no_test_command_publishes_without_compiling_recipes(
     tmp_path: Path,
 ) -> None:
@@ -325,13 +332,45 @@ def test_a_manifest_with_no_test_command_publishes_without_compiling_recipes(
     still publishes with it, because ``ffrwd publish`` no longer compiles
     recipes as a check of its own.
     """
-    root = _package(
-        tmp_path / "built",
-        recipe="-- variables: source (input media path)\n"
-        "COPY (SELECT nosuchfilter(f.audio[1]) FROM input(:'source') f) TO 'out.mkv';\n",
-    )
+    root = _package(tmp_path / "built", recipe=_UNCOMPILABLE_RECIPE)
     prepared = publish.prepare(root / "ffrwd.json")
     assert prepared.package.test == ""
+
+
+def test_a_recipe_that_cannot_compile_is_reported_not_swept_and_still_publishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The probe compile decides ``compiles``: false stays empty, not silently optional.
+
+    A recipe that fails its ONE probe compile gets ``"compiles": false`` and
+    both lists empty, one warning names it, and the per-variable sweep --
+    which would only repeat compiles this single one already failed -- never
+    runs at all.
+    """
+    swept: list[str] = []
+    original = publish.required_variables
+
+    def _spy(text: str, names: frozenset[str], packages: object) -> frozenset[str]:
+        swept.append(text)
+        return original(text, names, packages)
+
+    monkeypatch.setattr(publish, "required_variables", _spy)
+
+    root = _package(tmp_path / "built", recipe=_UNCOMPILABLE_RECIPE)
+    said: list[FfrwdWarning] = []
+    prepared = publish.prepare(root / "ffrwd.json", on_warning=said.append)
+
+    recipe = prepared.detail["recipes"][0]
+    assert recipe["name"] == "duck"
+    assert recipe["compiles"] is False
+    assert recipe["required"] == []
+    assert recipe["optional"] == []
+    assert swept == []  # the sweep never ran
+
+    warned = [w for w in said if w.code is WarningCode.RECIPE_DOES_NOT_COMPILE]
+    assert len(warned) == 1
+    assert "broadcast/tracks" in warned[0].message
+    assert "duck" in warned[0].message
 
 
 def test_a_manifest_whose_test_command_exits_0_publishes(tmp_path: Path) -> None:
