@@ -3134,7 +3134,7 @@ $ ffrwd -f query.sql
 
 ```pgsql
 CREATE FUNCTION embed_text(prompt text) RETURNS vector
-  AS '../sidecar/modules/target/wasm32-wasip2/release/embed_text.wasm', 'embed_text'
+  AS '../sidecar/modules/target/wasm32-wasip2/release/fauxlate.wasm', 'embed_text'
   LANGUAGE wasm;
 
 SELECT r.label, cos_similarity(embed_text(r.blurb), embed_text('a small pet')) AS score
@@ -3151,9 +3151,11 @@ LIMIT 2
 $ ffrwd -f query.sql
  label | score
 -------+--------------------
- cat   | 0.9953089707326302
- dog   | 0.9938070008129037
+ car   | 0.8098582871985258
+ dog   | 0.7840702021320191
 (2 rows)
 ```
 
 There is no vector literal - `ARRAY[0.1, 0.2]` names an array of numbers, not the dialect's `vector`, so the only way to a vector value is a value function's own RETURNS, over a row column or a literal alike, the same per-row footing every value function stands on. `r.blurb` feeds `embed_text` once per row, memoized on its argument the way any other value call is; `embed_text('a small pet')` runs once, since its argument is a literal. The two calls in `ORDER BY` and `SELECT` name the same row and the same literal, so they cost one call each, not two.
+
+`embed_text` here is `fauxlate.wasm`'s third export - a stand-in for a real embedder, same as `translate` stands in for a real translator ([recipe 113](#113-translate-captions-as-they-are-produced)). It counts each blurb's letters into eight buckets and L2-normalizes, so a blurb closer in cosine to `'a small pet'` is one that shares more letters with it, not one that means anything like it - which is why `car` and `dog` outrank `cat` above.

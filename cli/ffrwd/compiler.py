@@ -580,7 +580,9 @@ def compile_table_sql(
     :class:`~ffrwd.table.TableSink` per COPY, or one for a bare SELECT.
     Metadata columns and NULL-row gaps, both rejections under
     :func:`compile_sql`, are legal here — that is the whole difference. Inputs
-    are probed opportunistically, same as :func:`compile_sql`.
+    are probed opportunistically, same as :func:`compile_sql`; a declared
+    wasm module is described the same way too, so a value function reached
+    from a bare SELECT folds exactly as it would from a COPY.
 
     `describe`, `invoke` and `probe_path` are the same seams
     :func:`compile_all` and :func:`ffrwd.lower.lower_table` offer: a

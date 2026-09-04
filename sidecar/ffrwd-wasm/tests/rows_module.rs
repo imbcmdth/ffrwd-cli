@@ -295,13 +295,17 @@ fn describe_reports_the_rows_kind_and_both_schemas() {
         output_schema["required"],
         serde_json::json!(["start_t", "end_t", "text"])
     );
-    // fauxlate also exports `values`, alongside the rows module, and the
-    // description carries both.
+    // fauxlate also exports `values` -- both `translate` and `embed_text`
+    // -- alongside the rows module, and the description carries all of it.
     let functions = description["functions"]
         .as_array()
         .expect("a functions array");
-    assert_eq!(functions.len(), 1);
-    assert_eq!(functions[0]["name"], "translate");
+    assert_eq!(functions.len(), 2);
+    let names: Vec<&str> = functions
+        .iter()
+        .map(|f| f["name"].as_str().expect("a function name"))
+        .collect();
+    assert_eq!(names, vec!["translate", "embed_text"]);
 }
 
 // A rows module chained onto a stream module in one process:
