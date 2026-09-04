@@ -19,7 +19,7 @@ def _trim_into_filter_graph() -> Graph:
     """A trimmed stream that nothing has reset: hflip is not setpts."""
     g = Graph(input_paths=["a.mp4"], sources={"a": 0})
     g.nodes["n1"] = Node(
-        id="n1", filter="trim", args={"starti": 5}, inputs=["src:a:v:0"], outputs=["video"]
+        id="n1", filter="trim", args={"start": 5}, inputs=["src:a:v:0"], outputs=["video"]
     )
     g.nodes["n2"] = Node(id="n2", filter="hflip", args={}, inputs=["n1"], outputs=["video"])
     g.sinks = [SinkUnit(outputs=[_out("n2")])]
@@ -30,7 +30,7 @@ def _trim_direct_to_output_graph() -> Graph:
     """One trim, written to a file with no filter in between at all."""
     g = Graph(input_paths=["a.mp4"], sources={"a": 0})
     g.nodes["n1"] = Node(
-        id="n1", filter="trim", args={"starti": 5}, inputs=["src:a:v:0"], outputs=["video"]
+        id="n1", filter="trim", args={"start": 5}, inputs=["src:a:v:0"], outputs=["video"]
     )
     g.sinks = [SinkUnit(outputs=[_out("n1")])]
     return g
@@ -39,7 +39,7 @@ def _trim_direct_to_output_graph() -> Graph:
 def _atrim_graph() -> Graph:
     g = Graph(input_paths=["a.mp4"], sources={"a": 0})
     g.nodes["n1"] = Node(
-        id="n1", filter="atrim", args={"starti": 5}, inputs=["src:a:a:0"], outputs=["audio"]
+        id="n1", filter="atrim", args={"start": 5}, inputs=["src:a:a:0"], outputs=["audio"]
     )
     g.nodes["n2"] = Node(id="n2", filter="highpass", args={}, inputs=["n1"], outputs=["audio"])
     g.sinks = [SinkUnit(outputs=[_out("n2", "audio")])]
@@ -50,11 +50,11 @@ def _mixed_audio_video_trim_graph() -> Graph:
     """One query, one video trim and one audio trim, each unreset."""
     g = Graph(input_paths=["a.mp4"], sources={"a": 0})
     g.nodes["v1"] = Node(
-        id="v1", filter="trim", args={"starti": 5}, inputs=["src:a:v:0"], outputs=["video"]
+        id="v1", filter="trim", args={"start": 5}, inputs=["src:a:v:0"], outputs=["video"]
     )
     g.nodes["v2"] = Node(id="v2", filter="hflip", args={}, inputs=["v1"], outputs=["video"])
     g.nodes["a1"] = Node(
-        id="a1", filter="atrim", args={"starti": 5}, inputs=["src:a:a:0"], outputs=["audio"]
+        id="a1", filter="atrim", args={"start": 5}, inputs=["src:a:a:0"], outputs=["audio"]
     )
     g.nodes["a2"] = Node(id="a2", filter="highpass", args={}, inputs=["a1"], outputs=["audio"])
     g.sinks = [SinkUnit(outputs=[_out("v2", "video"), _out("a2", "audio")])]
@@ -65,7 +65,7 @@ def _author_written_setpts_graph() -> Graph:
     """The author's own setpts sits directly on the trim's only edge."""
     g = Graph(input_paths=["a.mp4"], sources={"a": 0})
     g.nodes["n1"] = Node(
-        id="n1", filter="trim", args={"starti": 5}, inputs=["src:a:v:0"], outputs=["video"]
+        id="n1", filter="trim", args={"start": 5}, inputs=["src:a:v:0"], outputs=["video"]
     )
     g.nodes["n2"] = Node(
         id="n2", filter="setpts", args={"expr": "PTS-STARTPTS"}, inputs=["n1"], outputs=["video"]
@@ -79,7 +79,7 @@ def _speed_macro_graph() -> Graph:
     counting as the author taking control of timing."""
     g = Graph(input_paths=["a.mp4"], sources={"a": 0})
     g.nodes["n1"] = Node(
-        id="n1", filter="trim", args={"starti": 5}, inputs=["src:a:v:0"], outputs=["video"]
+        id="n1", filter="trim", args={"start": 5}, inputs=["src:a:v:0"], outputs=["video"]
     )
     g.nodes["n2"] = Node(
         id="n2", filter="setpts", args={"expr": "PTS/2"}, inputs=["n1"], outputs=["video"]
@@ -92,7 +92,7 @@ def _mixed_protection_graph() -> Graph:
     """One trim, two consumers: one already has its own setpts, one does not."""
     g = Graph(input_paths=["a.mp4"], sources={"a": 0})
     g.nodes["n1"] = Node(
-        id="n1", filter="trim", args={"starti": 5}, inputs=["src:a:v:0"], outputs=["video"]
+        id="n1", filter="trim", args={"start": 5}, inputs=["src:a:v:0"], outputs=["video"]
     )
     g.nodes["n2"] = Node(id="n2", filter="hflip", args={}, inputs=["n1"], outputs=["video"])
     g.nodes["n3"] = Node(
@@ -106,11 +106,11 @@ def _two_trims_into_concat_graph() -> Graph:
     """Recipe 77's shape: two trims of the same source, joined by concat."""
     g = Graph(input_paths=["a.mp4"], sources={"a": 0})
     g.nodes["n1"] = Node(
-        id="n1", filter="trim", args={"starti": 0, "endi": 1}, inputs=["src:a:v:0"],
+        id="n1", filter="trim", args={"start": 0, "end": 1}, inputs=["src:a:v:0"],
         outputs=["video"],
     )
     g.nodes["n2"] = Node(
-        id="n2", filter="trim", args={"starti": 2, "endi": 3}, inputs=["src:a:v:0"],
+        id="n2", filter="trim", args={"start": 2, "end": 3}, inputs=["src:a:v:0"],
         outputs=["video"],
     )
     g.nodes["n3"] = Node(

@@ -940,10 +940,10 @@ installed ffmpeg -- a wrong name is `UNKNOWN_FILTER_OPTION` with the real
 list in `hint`, a wrong value is `FILTER_OPTION_TYPE` with the type, range or
 constants in `message`. Values are bare numbers, `true`/`false`, or
 single-quoted strings; enum options take a quoted constant name, never its
-number. A `duration` option (ffmpeg's own AVOption type -- `trim`'s `starti`/
-`endi`/`durationi`, `xfade`'s `duration`/`offset`, `fade`'s `start_time`, and
+number. A `duration` option (ffmpeg's own AVOption type -- `trim`'s `start`/
+`end`/`duration`, `xfade`'s `duration`/`offset`, `fade`'s `start_time`, and
 others) additionally accepts a compile-time-countable numeric EXPRESSION, not
-just a bare number: `starti => f.duration / 2`, arithmetic over a row column,
+just a bare number: `start => f.duration / 2`, arithmetic over a row column,
 or a row column a pinned row makes a number. It is evaluated at compile time
 and written as seconds, the same as a `WHERE <alias>.t` bound; an expression
 that cannot be evaluated to a number at compile time is `FILTER_OPTION_TYPE`,

@@ -13659,7 +13659,7 @@ class _Lowerer:
         per-row option and a written one bind through the same
         :meth:`_bind_options` and are validated by the same option table.
         A bare column bound to a non-boolean option counts too --
-        ``ffmpeg.trim(f, starti => f.duration)``, ``scale(f.video[1], r.w,
+        ``ffmpeg.trim(f, start => f.duration)``, ``scale(f.video[1], r.w,
         -2)`` -- because a probed/row scalar may be exactly what the option
         wants (the option table still rejects it once evaluated if it is
         not); a bare column bound to a boolean option, or to a stream
@@ -15100,7 +15100,7 @@ def _is_row_scalar(node: exp.Expr, env: _Env) -> bool:
     """True for a bare column that is a compile-time VALUE, never a stream --
     an input's probed duration/tag, or a row table's metadata field.
 
-    Lets a ``duration``-typed filter option accept ``starti => f.duration``
+    Lets a ``duration``-typed filter option accept ``start => f.duration``
     the way it already accepts arithmetic over one (`_option_binder`).
     """
     inner = _unwrap(node)

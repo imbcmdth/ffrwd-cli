@@ -2350,9 +2350,9 @@ def test_concatenated_trims_produce_the_correct_combined_duration(tmp_path: Path
     out_path = tmp_path / "joined.mp4"
     source = _sql_path(_TESTSRC)
     query = (
-        f"SELECT ffmpeg.trim(a.video[1], starti => 0, endi => 1) FROM input('{source}') a "
+        f"SELECT ffmpeg.trim(a.video[1], start => 0, end => 1) FROM input('{source}') a "
         "UNION ALL "
-        f"SELECT ffmpeg.trim(b.video[1], starti => 2, endi => 3) FROM input('{source}') b"
+        f"SELECT ffmpeg.trim(b.video[1], start => 2, end => 3) FROM input('{source}') b"
     )
 
     _compile_and_run(query, out_path)
