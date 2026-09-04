@@ -3222,4 +3222,35 @@ $ ffrwd -f query.sql
 (3 rows)
 ```
 
+## 120. Rows named once, used twice
+
+SQL cannot reference a column alias it is still computing, so a CTE is the only way to write a producer's rows once and read them twice: on their own, and as a rows function's argument. The CTE column resolves back to the producer that wrote it, exactly as the inline spelling does, so `captions` still lowers once - `cues` and `translated` both read off the one node:
+
+```pgsql
+CREATE FUNCTION captions(v video_stream)
+RETURNS STRUCT(v video_stream, cues cue[])
+  AS '../sidecar/modules/target/wasm32-wasip2/release/captions.wasm', 'captions'
+  LANGUAGE wasm;
+
+CREATE FUNCTION fauxlate(cues cue[]) RETURNS cue[]
+  AS '../sidecar/modules/target/wasm32-wasip2/release/fauxlate.wasm', 'fauxlate'
+  LANGUAGE wasm;
+
+WITH d AS (
+  SELECT f.video[1] AS v, captions(f.video[1]).cues AS cues
+  FROM input('tests/fixtures/av.mp4') f
+)
+SELECT d.v, d.cues, fauxlate(d.cues) AS translated FROM d
+```
+
+```
+$ ffrwd -f query.sql
+ v             | cues             | translated
+---------------+------------------+------------------
+ <video 0:v:0> | <subtitle 1:s:0> | <subtitle 2:s:0>
+(1 row)
+```
+
+`cues` and `translated` are two different subtitle placeholders, each its own rows document - but one `captions` node writes both: `translated` reads `cues`'s rows through the same rows edge [recipe 113](#113-translate-captions-as-they-are-produced) draws inline, resolved here through the CTE column that names it instead of the call that produced it. A chain of CTEs - `d` selecting from a CTE that itself selects `captions(...).cues` - resolves the same edge the same way, one level further back.
+
 `cues` reads back the same way over the caption tracks - `unnest(f.cues) c` is every one of them, with `c.track`, `c.text` and the bounds - and a title names one track: `unnest(f.embeddings['clip_vectors']) v`, `unnest(f.cues['speech']) c`. A title the file does not carry is a rejection listing the ones it does. The rows are compile-time rows like any other, so `WHERE`, `ORDER BY` and `cos_similarity(v.vector, embed_text('a small pet'))` narrow and rank them ([recipe 114](#114-rank-rows-by-a-vector)) before anything runs.

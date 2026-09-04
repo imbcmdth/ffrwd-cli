@@ -2492,6 +2492,19 @@ class _CteBinding:
     # Scalar columns of the body, name -> one value per body row. Read back
     # by position, the same way a stream column is.
     values: dict[str, tuple[RowValue, ...]] = field(default_factory=dict)
+    # Columns whose value is a run-time annotation -- the producer's own
+    # rows, or another rows function's result read one module later -- name
+    # -> the same (producer, kind, record) triple `_rows_source` returns for
+    # the inline spelling. A rows function reading `<cte>.<name>` resolves
+    # through here instead of re-lowering the producer, so the producer node
+    # is not minted twice.
+    rows_columns: dict[str, tuple[FrameRef, StreamType, Annotation]] = field(
+        default_factory=dict
+    )
+    # Columns whose value is a compile-time cue array (a written document,
+    # not a module's rows), named so a rows function refuses one by what it
+    # is instead of mistaking it for a stream.
+    cue_columns: frozenset[str] = frozenset()
 
 
 @dataclass
@@ -3247,6 +3260,29 @@ class _Lowerer:
         self.cte_values: dict[str, dict[str, tuple[RowValue, ...]]] = {}
         # The value columns the query being lowered has collected so far.
         self.branch_values: dict[str, tuple[RowValue, ...]] = {}
+        # The rows-bearing stream columns of each CTE body, name -> its
+        # (producer, kind, record) triple. Filled as each body lowers, read
+        # when its alias binds -- the `_CteBinding.rows_columns` a rows
+        # function's argument resolves through.
+        self.cte_rows_columns: dict[
+            str, dict[str, tuple[FrameRef, StreamType, Annotation]]
+        ] = {}
+        # The rows-bearing columns the query being lowered has collected so
+        # far, keyed by column name -- `_lower_rows_projection` and
+        # `_lower_rows_call` record here (via `rows_producers`, below) as
+        # each stream column of the branch lowers.
+        self.branch_rows_columns: dict[str, tuple[FrameRef, StreamType, Annotation]] = {}
+        # unwrapped SELECT-list node id -> its (producer, kind, record)
+        # triple, set by `_lower_rows_projection` / `_lower_rows_call` on
+        # success and consumed once, in `_lower_branch`, by the projection
+        # that produced it -- the bridge from a stream column's OWN lowering
+        # back to the column loop, which alone knows the column's name.
+        self.rows_producers: dict[int, tuple[FrameRef, StreamType, Annotation]] = {}
+        # The compile-time cue-array columns of each CTE body -- the names
+        # only, so a rows function fed one refuses it as what it is (a
+        # written document) rather than as a stream.
+        self.cte_cue_columns: dict[str, frozenset[str]] = {}
+        self.branch_cue_columns: set[str] = set()
         # Inputs this pass minted itself (`ffrwd.empty_captions()`),
         # alias -> its INTERNAL input options. Merged into `Graph.input_options`
         # by `_lower_input_options`, which is the only writer of that field.
@@ -3376,11 +3412,17 @@ class _Lowerer:
         """
         for name, body in self.res.ctes.items():
             self.branch_values = {}
+            self.branch_rows_columns = {}
+            self.branch_cue_columns = set()
             self.cte_columns[name] = tuple(
                 self._lower_query(union_branches(body), body, tags="rows")
             )
             self.cte_values[name] = self.branch_values
+            self.cte_rows_columns[name] = self.branch_rows_columns
+            self.cte_cue_columns[name] = frozenset(self.branch_cue_columns)
             self.branch_values = {}
+            self.branch_rows_columns = {}
+            self.branch_cue_columns = set()
             self._harvest_cte_tags(body)
             self._harvest_cte_dispositions(body)
         if self.res.sinks:
@@ -5406,6 +5448,13 @@ class _Lowerer:
                 value=self._branch_value(projection, env, select),
                 splat=self._is_splat_projection(projection, env),
             )
+            if column.name is not None:
+                node = _unwrap(projection)
+                source = self._rows_column_source(node, env)
+                if source is not None:
+                    self.branch_rows_columns[column.name] = source
+                elif self._is_cue_array_column(node, env):
+                    self.branch_cue_columns.add(column.name)
             self._title_minted_track(column)
             columns.append(column)
         if not columns:
@@ -7387,6 +7436,8 @@ class _Lowerer:
             name = _fold(inner)
             columns = self.cte_columns.get(name)
             body_values = self.cte_values.get(name, {})
+            body_rows_columns = self.cte_rows_columns.get(name, {})
+            body_cue_columns = self.cte_cue_columns.get(name, frozenset())
             if columns is None:
                 raise _error(
                     ErrorCode.UNKNOWN_ALIAS,
@@ -7404,7 +7455,16 @@ class _Lowerer:
             local = name
             if isinstance(alias_node, exp.TableAlias) and alias_node.this is not None:
                 local = _fold(alias_node.this)
-            self._add_cte_rows(local, columns, body_values, env, select, join)
+            self._add_cte_rows(
+                local,
+                columns,
+                body_values,
+                body_rows_columns,
+                body_cue_columns,
+                env,
+                select,
+                join,
+            )
             return
         raise _error(
             ErrorCode.UNSUPPORTED_SQL,
@@ -7494,6 +7554,8 @@ class _Lowerer:
         local: str,
         columns: tuple[_Column, ...],
         values: dict[str, tuple[RowValue, ...]],
+        rows_columns: dict[str, tuple[FrameRef, StreamType, Annotation]],
+        cue_columns: frozenset[str],
         env: _Env,
         select: exp.Select,
         join: RawRowJoin | None = None,
@@ -7516,6 +7578,8 @@ class _Lowerer:
             rows=rows,
             relation=env.relation,
             values=values,
+            rows_columns=rows_columns,
+            cue_columns=cue_columns,
         )
         self._join_rows(
             env.relation,
@@ -9720,6 +9784,8 @@ class _Lowerer:
             return None
         call, declared = found
         module = self._row_filtered(self._lower_expr(call, env, select), node)
+        assert declared.emits is not None  # what `_rows_projection` selected on
+        self.rows_producers[id(node)] = (module.streams[0].ref, module.type, declared.emits)
         return self._rows_output(
             module.streams[0].ref, module.type, declared, call, node, env, select
         )
@@ -9781,7 +9847,8 @@ class _Lowerer:
         if found is None:
             return None
         call, declared = found
-        ref, kind, _ = self._rows_node(node, env, select)
+        ref, kind, emitted = self._rows_node(node, env, select)
+        self.rows_producers[id(node)] = (ref, kind, emitted)
         return self._rows_output(ref, kind, declared, call, node, env, select)
 
     def _rows_node(
@@ -9810,21 +9877,73 @@ class _Lowerer:
         written = _unwrap(arguments[0])
         source = self._rows_source(written, env, select)
         if source is None:
-            raise self._not_rows(declared, written, node)
+            raise self._not_rows(declared, written, node, env)
         producer, kind, emitted = source
         self._check_rows_argument(declared, emitted, written, node, select)
         assert declared.returns_rows is not None  # what is_rows selected on
         ref = self.ctx.node(declared.module, {}, [], [], rows_inputs=[producer])
         return ref, kind, declared.returns_rows
 
+    def _cte_column_ref(
+        self, node: exp.Expr, env: _Env
+    ) -> tuple[_CteBinding, str] | None:
+        """``<alias>.<column>``, when `alias` names a CTE in scope.
+
+        The binding and the column's folded name, so a caller can look up
+        what that column carries. None for everything else -- no error, no
+        lowering, a pure probe over `env`.
+        """
+        if not isinstance(node, exp.Column):
+            return None
+        table_node = node.args.get("table")
+        if table_node is None:
+            return None
+        binding = env.bindings.get(_fold(table_node))
+        if not isinstance(binding, _CteBinding):
+            return None
+        return binding, _fold(node.this)
+
+    def _rows_column_source(
+        self, node: exp.Expr, env: _Env
+    ) -> tuple[FrameRef, StreamType, Annotation] | None:
+        """A stream expression's run-time annotation source, if it has one.
+
+        Either half of `_lower_expr`'s two rows-bearing matches, read back
+        from `rows_producers` rather than re-lowered (the producer already
+        ran, when the expression first lowered as a stream column) -- or a
+        bare reference to a CTE column that carries one, chased through
+        `_CteBinding.rows_columns`. That dict is filled the same way one CTE
+        level down, so a chain of CTEs resolves exactly as one does.
+        """
+        source = self.rows_producers.pop(id(node), None)
+        if source is not None:
+            return source
+        cte_ref = self._cte_column_ref(node, env)
+        if cte_ref is None:
+            return None
+        binding, name = cte_ref
+        return binding.rows_columns.get(name)
+
+    def _is_cue_array_column(self, node: exp.Expr, env: _Env) -> bool:
+        """True for a compile-time cue array, spelled inline or read off a
+        CTE column that is one."""
+        if _is_cue_array(node):
+            return True
+        cte_ref = self._cte_column_ref(node, env)
+        return cte_ref is not None and cte_ref[1] in cte_ref[0].cue_columns
+
     def _rows_source(
         self, written: exp.Expr, env: _Env, select: exp.Select
     ) -> tuple[FrameRef, StreamType, Annotation] | None:
         """The node whose rows `written` names, and the record they carry.
 
-        Either half of the dialect's two row producers: the annotation column
-        a stream module reads off its frames, or another rows function's
-        result. None for everything else.
+        The dialect's two row producers, spelled inline: the annotation
+        column a stream module reads off its frames, or another rows
+        function's result. A CTE column carrying either -- directly, or
+        through another CTE column that does -- resolves to the SAME
+        producer `_rows_column_source` already recorded when that column
+        first lowered, so the producer runs once whether its rows go to a
+        track, to a rows function, or to both. None for everything else.
         """
         produced = self._rows_projection(written)
         if produced is not None:
@@ -9844,18 +9963,45 @@ class _Lowerer:
             return module.streams[0].ref, module.type, producer.emits
         if self._rows_call(written) is not None:
             return self._rows_node(written, env, select)
-        return None
+        return self._rows_column_source(written, env)
 
     def _not_rows(
-        self, declared: WasmFunction, written: exp.Expr, node: exp.Expr
+        self, declared: WasmFunction, written: exp.Expr, node: exp.Expr, env: _Env
     ) -> FfrwdError:
         """Why this argument is not the rows a rows function reads.
 
         Compile-time rows are their own answer: a caption file's cues are
         known before anything runs, so a module hosted beside a producer has
         nothing to run against, and the value grammar is where that work
-        already happens.
+        already happens. A CTE column is named rather than merely typed --
+        'a stream' alone would not say WHICH one -- and classified against
+        what its own body actually bound it to, not against `written`'s own
+        shape (a Column, whatever it carries).
         """
+        cte_ref = self._cte_column_ref(written, env)
+        if cte_ref is not None:
+            binding, name = cte_ref
+            label = f"'{binding.name}.{name}'"
+            if name in binding.cue_columns:
+                return _error(
+                    ErrorCode.UDF_ARG_TYPE,
+                    f"{declared.name}() reads a module's rows, and {label} is a "
+                    "compile-time cue array",
+                    written,
+                    fallback=node,
+                    hint=f"cues the compiler already holds are rewritten one row "
+                    f"at a time by the value form, e.g. {declared.name}(<row>.text) "
+                    "inside a STRUCT(...)::cue",
+                )
+            said = "a value" if name in binding.values else "a stream"
+            return _error(
+                ErrorCode.UDF_ARG_TYPE,
+                f"{declared.name}() reads rows, and {label} is {said}",
+                written,
+                fallback=node,
+                hint=f"call it over the annotation column a module produces, e.g. "
+                f"{declared.name}(<producer>(<stream>).<column>)",
+            )
         if _is_cue_array(written):
             return _error(
                 ErrorCode.UDF_ARG_TYPE,
@@ -13993,11 +14139,17 @@ class _Lowerer:
         """One :class:`~ffrwd.table.TableSink` per COPY, or one bare-select."""
         for name, body in self.res.ctes.items():
             self.branch_values = {}
+            self.branch_rows_columns = {}
+            self.branch_cue_columns = set()
             self.cte_columns[name] = tuple(
                 self._lower_query(union_branches(body), body, tags="rows")
             )
             self.cte_values[name] = self.branch_values
+            self.cte_rows_columns[name] = self.branch_rows_columns
+            self.cte_cue_columns[name] = frozenset(self.branch_cue_columns)
             self.branch_values = {}
+            self.branch_rows_columns = {}
+            self.branch_cue_columns = set()
             self._harvest_cte_tags(body)
             self._harvest_cte_dispositions(body)
         self.table_mode = True

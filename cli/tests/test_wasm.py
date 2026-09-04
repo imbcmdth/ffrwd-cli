@@ -5376,6 +5376,26 @@ def _rows_module_plan(sql: str, described: Described | None = None) -> Compiled:
     return compile_all(sql, describe=lambda path: modules[path])
 
 
+def _rows_module_graph(sql: str, described: Described | None = None) -> Graph:
+    """Lower `sql` to its IR graph, without partitioning it into processes.
+
+    A region whose rows a producer's own annotation column AND a rows
+    function both need lands two rows documents in one sidecar process --
+    unsupported today past the graph this pass builds, so a shape check
+    that only cares whether the GRAPH wires one producer to both uses stops
+    here rather than going through `compile_all`'s partition step.
+    """
+    modules = {
+        ROWS_MODULE: described or _rows_module_described(),
+        CAPTIONER: _captioner(),
+        TRANSCRIBER: _transcriber(),
+    }
+    graph = lower(
+        _resolved(sql), {}, registry=_snapshot_registry(), describes=modules
+    )
+    return insert_splits(graph)
+
+
 def _rows_module_rejects(
     sql: str, code: ErrorCode, needle: str, described: Described | None = None
 ) -> FfrwdError:
@@ -5511,6 +5531,110 @@ def test_the_producers_record_has_to_be_the_one_the_function_reads() -> None:
         sql, ErrorCode.UDF_ARG_TYPE, "and its argument carries 'cues'", described
     )
     assert "fauxlate() reads 'boxes'" in error.message
+
+
+# the CTE column
+#
+# A CTE forced by needing a producer's annotation column twice -- once
+# written as its own track, once fed to a rows function -- since SQL cannot
+# reference a column alias a second time in the same SELECT list.
+
+CTE_ROWS_RECIPE = _CAPTIONS_DECLARE + _fauxlate_declare() + (
+    "COPY (WITH d AS (\n"
+    "  SELECT s.video[1] AS v, s.audio[1] AS a,\n"
+    "         captions(s.video[1]).cues AS c\n"
+    "  FROM input('angel-one.mp4') s\n"
+    ")\n"
+    "SELECT d.v, d.a, d.c, fauxlate(d.c) AS translated FROM d) TO 'out.mkv'"
+)
+
+
+def test_a_cte_column_bound_to_a_module_s_rows_feeds_a_rows_function() -> None:
+    """The CTE column resolves back to the producer that wrote it, so the
+    edge is the one edge -- the producer's own node, not a second lowering
+    of its call -- and the rows go both to the 'c' track and to fauxlate."""
+    graph = _rows_module_graph(CTE_ROWS_RECIPE)
+    producers = [n for n in graph.nodes.values() if n.filter == CAPTIONER]
+    assert len(producers) == 1
+    producer = producers[0]
+    consumer = next(n for n in graph.nodes.values() if n.filter == ROWS_MODULE)
+    assert consumer.rows_inputs == [producer.id]
+    assert set(graph.rows_sinks) == {producer.id, consumer.id}
+
+
+def test_a_rows_column_chains_through_two_ctes() -> None:
+    """A CTE selecting another CTE's rows-bearing column passes the same
+    edge along, so a rows function two levels up still finds the producer."""
+    sql = _CAPTIONS_DECLARE + _fauxlate_declare() + (
+        "COPY (WITH c AS (\n"
+        "  SELECT s.video[1] AS v, captions(s.video[1]).cues AS cues\n"
+        "  FROM input('angel-one.mp4') s\n"
+        "), d AS (\n"
+        "  SELECT c.v AS v, c.cues AS cues FROM c\n"
+        ")\n"
+        "SELECT d.v, fauxlate(d.cues) AS translated FROM d) TO 'out.mkv'"
+    )
+    graph = _rows_module_graph(sql)
+    producers = [n for n in graph.nodes.values() if n.filter == CAPTIONER]
+    assert len(producers) == 1
+    consumer = next(n for n in graph.nodes.values() if n.filter == ROWS_MODULE)
+    assert consumer.rows_inputs == [producers[0].id]
+
+
+def test_a_cte_column_bound_to_a_stream_is_refused() -> None:
+    sql = _fauxlate_declare() + (
+        "COPY (WITH d AS (\n"
+        "  SELECT s.video[1] AS v FROM input('angel-one.mp4') s\n"
+        ")\n"
+        "SELECT fauxlate(d.v) FROM d) TO 'cues.ndjson'"
+    )
+    error = _rows_module_rejects(
+        sql, ErrorCode.UDF_ARG_TYPE, "fauxlate() reads rows, and 'd.v' is a stream"
+    )
+    assert error.hint is not None and "annotation column a module produces" in error.hint
+
+
+def test_a_cte_column_bound_to_a_compile_time_cue_array_is_refused() -> None:
+    sql = _fauxlate_declare() + (
+        "COPY (WITH d AS (\n"
+        "  SELECT ARRAY[STRUCT('Cue.' AS text, 0 AS start_t, 1 AS end_t)::cue] AS cues\n"
+        "  FROM input('angel-one.mp4') s\n"
+        ")\n"
+        "SELECT fauxlate(d.cues) FROM d) TO 'cues.ndjson'"
+    )
+    error = _rows_module_rejects(
+        sql,
+        ErrorCode.UDF_ARG_TYPE,
+        "fauxlate() reads a module's rows, and 'd.cues' is a compile-time cue array",
+    )
+    assert error.hint is not None and "fauxlate(<row>.text)" in error.hint
+
+
+def test_a_cte_column_bound_to_a_value_is_refused() -> None:
+    sql = _fauxlate_declare() + (
+        "COPY (WITH d AS (\n"
+        "  SELECT s.video[1] AS v, 'hello' AS greeting\n"
+        "  FROM input('angel-one.mp4') s\n"
+        ")\n"
+        "SELECT fauxlate(d.greeting) FROM d) TO 'cues.ndjson'"
+    )
+    error = _rows_module_rejects(
+        sql, ErrorCode.UDF_ARG_TYPE, "fauxlate() reads rows, and 'd.greeting' is a value"
+    )
+    assert error.hint is not None and "annotation column a module produces" in error.hint
+
+
+def test_the_inline_spelling_still_refuses_a_stream_with_no_cte_wording() -> None:
+    """The non-CTE refusal is untouched: no quoted column name, since a bare
+    argument has no CTE alias to name it by."""
+    sql = _fauxlate_declare() + _copy("fauxlate(s.video[1])", path="cues.ndjson")
+    error = _rows_module_rejects(
+        sql,
+        ErrorCode.UDF_ARG_TYPE,
+        "fauxlate() reads rows, and its argument is a stream",
+    )
+    assert "'d." not in error.message
+    assert error.hint is not None and "annotation column a module produces" in error.hint
 
 
 # the graph, the plan and the argv
