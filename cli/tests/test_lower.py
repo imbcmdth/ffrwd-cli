@@ -12057,6 +12057,31 @@ def test_an_empty_row_set_still_stops_the_media_query_it_would_write() -> None:
     assert "no data track of 'f.mkv' survived" in err.message
 
 
+def test_a_grouped_table_query_over_an_unprobed_input_is_a_typed_refusal() -> None:
+    """Fuzz find: ``array_agg(r.video[1])`` used to assert ``relation is not
+    None``, on the theory that a grouped branch always has rows by the time
+    it lowers. That only holds once a probe has bound the alias's rendition
+    rows (:meth:`_bind_renditions`); an input that cannot be probed never
+    gets that table, and the assert panicked instead of refusing cleanly."""
+    err = _reject_lower_table(
+        "SELECT array_agg(r.video[1]) FROM input('in.mp4') r", {"r": None}
+    )
+    assert err.code is ErrorCode.INPUT_NOT_FOUND
+    assert "cannot gather rows for 'r' from 'in.mp4'" in err.message
+
+
+def test_the_same_unprobed_array_agg_is_already_a_typed_refusal_in_media_mode() -> None:
+    """The media path never had the table path's assert: an alias with no
+    row table -- unprobed here, same as a plain non-manifest input -- leaves
+    `array_agg` nothing to gather, and it already says so."""
+    err = _reject_lower(
+        "COPY (SELECT array_agg(r.video[1]) FROM input('in.mp4') r) TO 'out.mkv'",
+        {"r": None},
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "array_agg() aggregates track rows, and this query has none" in err.message
+
+
 def test_unaliased_array_agg_column_is_named_array_agg() -> None:
     sinks = lower_table(
         resolve(

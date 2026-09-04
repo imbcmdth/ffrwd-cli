@@ -14429,7 +14429,8 @@ class _Lowerer:
         and every projection lowers as one ordinary, single-row column.
         """
         relation = env.relation
-        assert relation is not None  # is_grouped implies rows; resolve enforced it
+        if relation is None:
+            raise self._grouped_no_relation_error(env, select)
         groups = self._grouped_partitions(env, select)
         original = relation.tuples
         rows: list[list[CellValue]] = []
@@ -14447,6 +14448,30 @@ class _Lowerer:
         finally:
             relation.tuples = original
         return TableResult(columns=names, rows=rows)
+
+    def _grouped_no_relation_error(self, env: _Env, select: exp.Select) -> FfrwdError:
+        """The refusal for a grouped branch with no rows to gather: an input
+        whose probe failed never got its rendition table, and a probed one
+        without renditions is the same shape error the media path gives."""
+        for binding in env.bindings.values():
+            if isinstance(binding, _InputBinding) and self.probes.get(binding.alias) is None:
+                return self._unreadable_error(
+                    ErrorCode.INPUT_NOT_FOUND,
+                    binding.alias,
+                    f"cannot gather rows for '{binding.alias}' from "
+                    f"'{self._path_of(binding.alias)}'",
+                    select,
+                    select,
+                    hint=f"array_agg(...) over '{binding.alias}' reads its rendition "
+                    "rows, and only a readable input has any",
+                )
+        return _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            "array_agg() aggregates track rows, and this query has none",
+            select,
+            fallback=select,
+            hint=_ARRAY_AGG_HINT,
+        )
 
     def _grouped_partitions(
         self, env: _Env, select: exp.Select
