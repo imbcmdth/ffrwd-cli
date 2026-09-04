@@ -660,6 +660,90 @@ def test_invoke_grants_http_ahead_of_the_flag_only_when_described_asks(
     ]
 
 
+def test_invoke_binds_the_model_ahead_of_grants_when_described_runs_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An nn value module's compile-time run gets the same ``-nn name=path``
+    binding, plus ``-nn-runtime``/``-nn-target``, that a hosted module's run
+    gets -- ahead of any effect grant, ahead of ``--invoke``."""
+    module = str(tmp_path / "embed.wasm")
+    (tmp_path / "embed.onnx").write_bytes(b"")
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout="[0.1]", stderr="")
+
+    monkeypatch.setattr(wasm.subprocess, "run", fake_run)
+    monkeypatch.setattr(wasm.binaries, "ffrwd_wasm_path", lambda: "ffrwd-wasm")
+    monkeypatch.setattr(
+        wasm.nn, "spawn_args", lambda: ["-nn-runtime", "/cache/rt", "-nn-target", "cpu"]
+    )
+
+    described = Described(world="ffrwd:av@0.14.0", name="embed", nn=True, http=True)
+    wasm.invoke(module, "embed_text", {"prompt": "a sine wave tone"}, described=described)
+    assert calls == [
+        [
+            "ffrwd-wasm",
+            "-nn-runtime",
+            "/cache/rt",
+            "-nn-target",
+            "cpu",
+            "-nn",
+            f"embed={tmp_path / 'embed.onnx'}",
+            "-http",
+            module,
+            "--invoke",
+            module,
+            "embed_text",
+            '{"prompt": "a sine wave tone"}',
+        ]
+    ]
+
+
+def test_invoke_of_a_non_nn_module_gets_no_nn_flags(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A module whose description says ``nn: False`` -- every module this
+    file otherwise describes -- takes no part of the model binding at all."""
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout="42", stderr="")
+
+    monkeypatch.setattr(wasm.subprocess, "run", fake_run)
+    monkeypatch.setattr(wasm.binaries, "ffrwd_wasm_path", lambda: "ffrwd-wasm")
+
+    wasm.invoke(MODULE, "fn", {}, described=_described())
+    assert calls == [["ffrwd-wasm", "--invoke", MODULE, "fn", "{}"]]
+    assert "-nn" not in calls[0]
+
+
+def test_invoke_of_an_nn_module_refuses_a_missing_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same "runs a model, and it is not there" rejection a hosted
+    module's compile-time model binding gives, raised before anything runs."""
+    monkeypatch.setattr(wasm.binaries, "ffrwd_wasm_path", lambda: "ffrwd-wasm")
+
+    def fail_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        raise AssertionError("invoke must refuse before spawning the sidecar")
+
+    monkeypatch.setattr(wasm.subprocess, "run", fail_run)
+
+    module = str(tmp_path / "embed.wasm")
+    described = Described(world="ffrwd:av@0.14.0", name="embed", nn=True)
+    with pytest.raises(FfrwdError) as caught:
+        wasm.invoke(module, "embed_text", {}, described=described)
+    error = caught.value
+    expected_path = str(tmp_path / "embed.onnx")
+    assert error.message == (
+        f"the module '{module}' runs a model, and '{expected_path}' is not there"
+    )
+    assert error.hint is not None and "ffrwd install" in error.hint
+
+
 def test_the_plan_renders_as_one_shell_pipeline() -> None:
     plan = _compiled(QUERY).plan
     assert plan is not None

@@ -688,14 +688,19 @@ def invoke(
     already read one -- the same :class:`Described` :func:`describe` returns.
     A module that imports `wasi:http` or `wasi:sockets` needs its effect
     granted the same way a run grants it: ``-http``/``-net <path>`` ahead of
-    ``--invoke``, the sidecar's own argv order. `described` left at its
-    default of None grants neither, which is what a caller with no
-    description in hand -- one invoking a module it knows imports nothing --
-    gets.
+    ``--invoke``, the sidecar's own argv order. A module that runs a model
+    gets the same ``-nn name=path`` binding, plus ``-nn-runtime``/
+    ``-nn-target``, ahead of those grants -- :func:`model_binding` names the
+    file, and raises the same "runs a model, and '<path>' is not there"
+    rejection a hosted module's compile-time check does when it is missing.
+    `described` left at its default of None grants nothing, which is what a
+    caller with no description in hand -- one invoking a module it knows
+    imports nothing and runs no model -- gets.
 
     Raises ``FfrwdError`` -- and nothing else -- when the sidecar is not
-    installed, the module rejects the call, or the answer is not JSON. The
-    rejection carries no position; the caller anchors it on the call site.
+    installed, the module runs a model with no file beside it, the module
+    rejects the call, or the answer is not JSON. The rejection carries no
+    position; the caller anchors it on the call site.
     """
     sidecar = binaries.ffrwd_wasm_path()
     if sidecar is None:
@@ -707,6 +712,8 @@ def invoke(
     payload = json.dumps(args, sort_keys=True)
     argv = [sidecar]
     if described is not None:
+        if described.nn:
+            argv += _nn_args((model_binding(described, path),), nn.spawn_args())
         if described.http:
             argv += [_GRANT_FLAGS["http"], path]
         if described.udp:
@@ -1092,6 +1099,21 @@ def _first_line(text: str) -> str:
     return "it wrote nothing"
 
 
+def _nn_args(models: Sequence[ModelBinding], runtime: Sequence[str]) -> list[str]:
+    """The ``-nn-runtime``/``-nn-target`` pair, then one ``-nn name=path`` per model.
+
+    Shared by a sidecar process's argv and a compile-time :func:`invoke` of a
+    module that runs one -- both bind a model the same way. `runtime` is
+    written only when there is at least one model to bind.
+    """
+    argv: list[str] = []
+    if models:
+        argv += list(runtime)
+    for model in models:
+        argv += [_NN_FLAG, f"{model.name}={model.path}"]
+    return argv
+
+
 def _argv(
     binary: str,
     process: SidecarProcess,
@@ -1179,10 +1201,7 @@ def _argv(
         argv += [_JOBS_FLAG, str(jobs)]
     if process.reads_rows:
         argv += [_ANNOTATIONS_FLAG, ANNOTATIONS_IN]
-    if process.models:
-        argv += list(runtime)
-    for model in process.models:
-        argv += [_NN_FLAG, f"{model.name}={model.path}"]
+    argv += _nn_args(process.models, runtime)
     for grant in process.grants:
         argv += [_GRANT_FLAGS[grant.effect], grant.module]
     if process.network:
