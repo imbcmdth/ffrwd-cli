@@ -1650,8 +1650,8 @@ def _name_counts(*candidate_lists: list[str | None]) -> dict[str, int]:
     """How many times each name appears, across every list given.
 
     `%v` is ONE directory namespace regardless of kind -- a video row named
-    ``v720p`` and an audio row also named ``v720p`` (the same rendition's
-    own name, read off its audio cell) would both land in ``out/vv720p/``
+    ``720p`` and an audio row also named ``720p`` (the same rendition's
+    own name, read off its audio cell) would both land in ``out/720p/``
     -- so a collision is counted across video and audio together, not per
     kind.
     """
@@ -4665,11 +4665,11 @@ class _Lowerer:
         options.setdefault("master_pl_name", filename)
         extension = "m4s" if options.get("hls_segment_type") == "fmp4" else "ts"
         options.setdefault(
-            "hls_segment_filename", f"{prefix}v%v/segment_%d.{extension}"
+            "hls_segment_filename", f"{prefix}%v/segment_%d.{extension}"
         )
         if options.get("hls_segment_type") == "fmp4":
             options.setdefault("hls_fmp4_init_filename", "init.mp4")
-        return f"{prefix}v%v/index.m3u8"
+        return f"{prefix}%v/index.m3u8"
 
     def _derive_keyframes(
         self,

@@ -151,7 +151,7 @@ def test_url_source_115_stitches_kept_rows_then_re_encodes_to_a_ladder(
     `concat`, so only `av.mp4` and `av2.mp4` are stitched; the result is
     re-encoded to a two-rung HLS ladder. The master and both variant
     playlists exist, and the top rung's own duration (the 800k/320-wide
-    rung, `vv0/index.m3u8`) is the sum of the two kept files' durations --
+    rung, `v0/index.m3u8`) is the sum of the two kept files' durations --
     proof `testsrc.mp4` never reached the command at all.
 
     Runs from `tmp_path` with a relative destination: ffmpeg's hls muxer
@@ -198,8 +198,8 @@ def test_url_source_115_stitches_kept_rows_then_re_encodes_to_a_ladder(
     assert result.returncode == 0, result.stderr
 
     assert dest.exists()
-    top_rung = dest.parent / "vv0" / "index.m3u8"
-    other_rung = dest.parent / "vv1" / "index.m3u8"
+    top_rung = dest.parent / "v0" / "index.m3u8"
+    other_rung = dest.parent / "v1" / "index.m3u8"
     assert top_rung.exists()
     assert other_rung.exists()
     assert _ffprobe_duration(top_rung) == pytest.approx(

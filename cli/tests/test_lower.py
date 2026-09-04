@@ -7568,8 +7568,8 @@ def test_the_direct_read_of_a_ladder_at_a_manifest_is_unchanged() -> None:
         "-sc_threshold:1", "0",
         "-var_stream_map", "v:0,a:0,name:Low v:1,a:1,name:High",
         "-master_pl_name", "master.m3u8",
-        "-hls_segment_filename", "out/v%v/segment_%d.ts",
-        "out/v%v/index.m3u8",
+        "-hls_segment_filename", "out/%v/segment_%d.ts",
+        "out/%v/index.m3u8",
     ]
     subscripted = build_ffmpeg_args(
         emit(_lower(bare.replace("r.video, r.audio", "r.video[1], r.audio[1]"), probes)),
@@ -7741,7 +7741,7 @@ def test_a_video_and_an_audio_row_sharing_a_name_both_fall_back() -> None:
     """``%v`` is one directory namespace regardless of kind: an audio-only
     row copying its rendition's name off the SAME rung a video row is also
     named for (recipe 123's own shape -- the audio comes from the Low
-    variant's own audio cell) would put both in ``out/vLow/``. Neither owns
+    variant's own audio cell) would put both in ``out/Low/``. Neither owns
     the name, so both fall back to their position, the same as two
     same-kind rows sharing one would -- the High row, uninvolved, keeps
     its own."""

@@ -2498,15 +2498,15 @@ def test_the_hls_ladder_writes_an_accepted_master_and_aligned_segments(
     assert master.count("#EXT-X-STREAM-INF") == 2
     assert "#EXT-X-MEDIA:TYPE=AUDIO" in master and 'GROUP-ID="group_aud"' in master
 
-    for variant in ("v240p", "v120p", "va0"):
+    for variant in ("240p", "120p", "a0"):
         playlist = dest.parent / variant / "index.m3u8"
         assert playlist.exists(), f"missing {playlist}"
         assert (dest.parent / variant / "segment_0.m4s").exists()
 
-    video_stream = _ffprobe_video_stream(dest.parent / "v240p" / "index.m3u8")
+    video_stream = _ffprobe_video_stream(dest.parent / "240p" / "index.m3u8")
     assert video_stream["width"] == 320
 
-    times = _keyframe_times(dest.parent / "v240p" / "index.m3u8")
+    times = _keyframe_times(dest.parent / "240p" / "index.m3u8")
     assert len(times) >= 2
     gaps = [round(b - a, 3) for a, b in zip(times, times[1:])]
     assert all(gap == 2.0 for gap in gaps), gaps

@@ -427,8 +427,8 @@ def test_a_hybrid_hls_master_keeps_its_own_audio_beside_the_group(
     for rendition in video:
         assert sorted(s.type for s in rendition.streams) == ["audio", "video"]
     assert {r.height: r.name for r in video} == {
-        1080: "v1080p",
-        720: "v720p",
+        1080: "1080p",
+        720: "720p",
     }
 
     assert len(audio_only) == 1
@@ -537,18 +537,16 @@ def _assert_names_round_trip(
     against what ffmpeg's hls muxer actually put on disk (confirmed against
     a real ffmpeg run, hand-built `-var_stream_map` and all, independent of
     the compiler): a video rung's name rides in its variant playlist's own
-    directory, `out/v%v/...` -- so a republish always gains one literal `v`
-    over the source's own name, landing `0` in `v0/`, or a name that was
-    ALREADY `v1080p` (an earlier compiler's own output) in `vv1080p/`. An
-    audio-only row's `language:` rides in its #EXT-X-MEDIA LANGUAGE=
-    attribute and reads back exactly -- but ffmpeg's hls muxer does not
-    carry `name:` into that entry's NAME= at all: it always writes
-    `audio_<output stream index>` there regardless of what var_stream_map
-    said, so an audio rendition's own name does not survive an HLS
-    round-trip through this attribute. The compiler still WROTE the real
-    name into var_stream_map (recipes 126-127's own pinned command proves
-    that); this is ffmpeg's own limitation on the read side, not the
-    compiler's to work around.
+    directory, `out/%v/...` -- so a republish reads back the exact same
+    name the rung had going in, whatever it was. An audio-only row's
+    `language:` rides in its #EXT-X-MEDIA LANGUAGE= attribute and reads
+    back exactly -- but ffmpeg's hls muxer does not carry `name:` into
+    that entry's NAME= at all: it always writes `audio_<output stream
+    index>` there regardless of what var_stream_map said, so an audio
+    rendition's own name does not survive an HLS round-trip through this
+    attribute. The compiler still WROTE the real name into var_stream_map
+    (recipes 126-127's own pinned command proves that); this is ffmpeg's
+    own limitation on the read side, not the compiler's to work around.
     """
     assert before.keys() == after.keys()
     for kind, before_rendition in before.items():
@@ -557,7 +555,7 @@ def _assert_names_round_trip(
         if kind == ("audio",):
             assert after_rendition.name == "audio_2"
         else:
-            assert after_rendition.name == f"v{before_rendition.name}"
+            assert after_rendition.name == before_rendition.name
 
 
 @pytest.mark.exec
@@ -583,8 +581,9 @@ def test_a_star_republish_of_the_demuxed_hls_ladder_keeps_its_names(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _fixtures: None
 ) -> None:
     """The same proof over an HLS source whose OWN names are already
-    directory-derived (`v1080p`, `v720p`, from a prior compiler run) -- a
-    republish adds the same one `v`, landing in `vv1080p/`."""
+    directory-derived (`1080p`, `720p`, from a prior compiler run) -- a
+    republish reads back into the same directories, `1080p/` and
+    `720p/`."""
     monkeypatch.chdir(tmp_path)
     (tmp_path / "out").mkdir()
     source = FIXTURES_DIR / "ladder-demuxed-hls" / "master.m3u8"

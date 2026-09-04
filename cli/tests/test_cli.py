@@ -1262,9 +1262,9 @@ def test_a_protocol_url_destination_skips_the_directory_check() -> None:
 def test_a_muxer_name_pattern_checks_its_literal_ancestor(tmp_path: Path) -> None:
     """A manifest's `%v` directories are the muxer's to create, so the
     pre-flight checks the deepest literal ancestor, not the pattern."""
-    dest = tmp_path / "v%v" / "index.m3u8"
+    dest = tmp_path / "%v" / "index.m3u8"
     assert cli._check_output_dir(str(dest)) is None
-    missing = tmp_path / "no-such-dir" / "v%v" / "index.m3u8"
+    missing = tmp_path / "no-such-dir" / "%v" / "index.m3u8"
     assert cli._check_output_dir(str(missing)) is not None
 
 

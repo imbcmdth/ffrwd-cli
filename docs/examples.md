@@ -2768,8 +2768,8 @@ ffmpeg -i tests/fixtures/av.mp4 -filter_complex \
   libx264 -c:1 libx264 -b:0 800k -b:1 300k -c:2 aac -g:0 30 -g:1 30 -keyint_min:0 30 \
   -keyint_min:1 30 -sc_threshold:0 0 -sc_threshold:1 0 -var_stream_map \
   'v:0,agroup:aud,name:240p v:1,agroup:aud,name:120p a:0,agroup:aud,name:a0,default:yes' \
-  -master_pl_name master.m3u8 -hls_segment_filename out/v%v/segment_%d.ts \
-  out/v%v/index.m3u8
+  -master_pl_name master.m3u8 -hls_segment_filename out/%v/segment_%d.ts \
+  out/%v/index.m3u8
 ```
 
 `format 'dash'` is the same plan wearing different words: `seg_duration`
@@ -2850,9 +2850,9 @@ ffmpeg -i tests/fixtures/ladder/master.m3u8 -map 0:v:0 -map 0:v:1 -map 0:a:0 -ma
   -f hls -hls_time 2 -hls_playlist_type vod -hls_segment_type fmp4 -c:0 libx264 -c:1 \
   libx264 -c:2 aac -c:3 aac -g:0 30 -g:1 30 -keyint_min:0 30 -keyint_min:1 30 \
   -sc_threshold:0 0 -sc_threshold:1 0 -var_stream_map \
-  'v:0,a:0,name:v1080p v:1,a:1,name:v720p' -master_pl_name master.m3u8 \
-  -hls_segment_filename out/v%v/segment_%d.m4s -hls_fmp4_init_filename init.mp4 \
-  out/v%v/index.m3u8
+  'v:0,a:0,name:1080p v:1,a:1,name:720p' -master_pl_name master.m3u8 \
+  -hls_segment_filename out/%v/segment_%d.m4s -hls_fmp4_init_filename init.mp4 \
+  out/%v/index.m3u8
 ```
 
 Reach for this to repackage or re-encode someone else's ladder into
@@ -3097,8 +3097,8 @@ ffmpeg -i tests/fixtures/av.mp4 -i tests/fixtures/av2.mp4 -filter_complex \
   300k -c:2 aac -g:0 30 -g:1 30 -keyint_min:0 30 -keyint_min:1 30 -sc_threshold:0 0 \
   -sc_threshold:1 0 -var_stream_map \
   'v:0,agroup:aud,name:v0 v:1,agroup:aud,name:v1 a:0,agroup:aud,name:a0,default:yes' \
-  -master_pl_name master.m3u8 -hls_segment_filename out/v%v/segment_%d.ts \
-  out/v%v/index.m3u8
+  -master_pl_name master.m3u8 -hls_segment_filename out/%v/segment_%d.ts \
+  out/%v/index.m3u8
 ```
 
 Reach for this when each segment of a sequence needs its own best-fit
@@ -3354,16 +3354,16 @@ ffmpeg -i tests/fixtures/ladder/master.m3u8 -map 0:v:0 -map 0:v:1 -map 0:a:1 -f 
   -hls_time 2 -hls_playlist_type vod -hls_segment_type fmp4 -c:0 libx264 -c:1 libx264 \
   -c:2 aac -g:0 30 -g:1 30 -keyint_min:0 30 -keyint_min:1 30 -sc_threshold:0 0 \
   -sc_threshold:1 0 -var_stream_map \
-  'v:0,agroup:aud,name:v1080p v:1,agroup:aud,name:v1 a:0,agroup:aud,name:a0,default:yes' \
-  -master_pl_name master.m3u8 -hls_segment_filename out/v%v/segment_%d.m4s \
-  -hls_fmp4_init_filename init.mp4 out/v%v/index.m3u8
+  'v:0,agroup:aud,name:1080p v:1,agroup:aud,name:v1 a:0,agroup:aud,name:a0,default:yes' \
+  -master_pl_name master.m3u8 -hls_segment_filename out/%v/segment_%d.m4s \
+  -hls_fmp4_init_filename init.mp4 out/%v/index.m3u8
 ```
 
 `WHERE s.height = 720` is an unmodified read of the 720p variant's own
-audio cell, so it carries that rendition's identity - `v720p` - into the
+audio cell, so it carries that rendition's identity - `720p` - into the
 audio-only row it becomes here, the same way its video cell would. But the
-720p rung's OWN video row is also named `v720p`, and `%v` is one directory
-namespace regardless of kind, so the two would collide (`out/vv720p/`) -
+720p rung's OWN video row is also named `720p`, and `%v` is one directory
+namespace regardless of kind, so the two would collide (`out/720p/`) -
 both fall back to their position (`v1`, `a0`) instead, exactly as two same-
 named rows of one kind already did before this recipe existed.
 
@@ -3399,7 +3399,7 @@ ffmpeg -i tests/fixtures/av.mp4 -filter_complex \
   -hls_playlist_type vod -c:0 libx264 -c:1 libx264 -c:2 aac -c:3 aac -g:0 30 -g:1 30 \
   -keyint_min:0 30 -keyint_min:1 30 -sc_threshold:0 0 -sc_threshold:1 0 -var_stream_map \
   'v:0,a:0,name:240p v:1,a:1,name:120p' -master_pl_name master.m3u8 \
-  -hls_segment_filename out/v%v/segment_%d.ts out/v%v/index.m3u8
+  -hls_segment_filename out/%v/segment_%d.ts out/%v/index.m3u8
 ```
 
 Reach for this for the plain ABR ladder, where the audio is encoded once and
@@ -3442,8 +3442,8 @@ ffmpeg -i tests/fixtures/ladder-demuxed/master.mpd -filter_complex \
   -c:1 libx264 -c:2 aac -c:3 aac -c:4 aac -g:0 30 -g:1 30 -keyint_min:0 30 -keyint_min:1 \
   30 -sc_threshold:0 0 -sc_threshold:1 0 -var_stream_map \
   'v:0,a:0,agroup:aud,name:0 v:1,a:1,agroup:aud,name:1 a:2,agroup:aud,name:2,'\
-'default:yes' -master_pl_name master.m3u8 -hls_segment_filename out/v%v/segment_%d.m4s \
-  -hls_fmp4_init_filename init.mp4 out/v%v/index.m3u8
+'default:yes' -master_pl_name master.m3u8 -hls_segment_filename out/%v/segment_%d.m4s \
+  -hls_fmp4_init_filename init.mp4 out/%v/index.m3u8
 ```
 
 Reach for this when a player has to be given both - a variant it can play
@@ -3472,8 +3472,8 @@ $ ffrwd compile -f query.sql -v ladder=tests/fixtures/ladder-demuxed/master.mpd 
 ffmpeg -i tests/fixtures/ladder-demuxed/master.mpd -map 0:v:0 -c:0 copy -map 0:v:1 -c:1 \
   copy -map 0:a:0 -c:2 copy -f hls -var_stream_map \
   'v:0,agroup:aud,name:0 v:1,agroup:aud,name:1 a:0,agroup:aud,name:2,default:yes' \
-  -master_pl_name master.m3u8 -hls_segment_filename out/v%v/segment_%d.ts \
-  out/v%v/index.m3u8
+  -master_pl_name master.m3u8 -hls_segment_filename out/%v/segment_%d.ts \
+  out/%v/index.m3u8
 ```
 
 The names - `0`, `1`, `2` - are this MPD's own Representation ids, carried
@@ -3498,8 +3498,8 @@ $ ffrwd compile -f query.sql -v ladder=tests/fixtures/ladder-demuxed/master.mpd 
 ffmpeg -i tests/fixtures/ladder-demuxed/master.mpd -map 0:v:0 -c:0 copy -map 0:v:1 -c:1 \
   copy -map 0:a:0 -c:2 copy -f hls -var_stream_map \
   'v:0,agroup:aud,name:0 v:1,agroup:aud,name:1 a:0,agroup:aud,name:2,default:yes' \
-  -master_pl_name master.m3u8 -hls_segment_filename out/v%v/segment_%d.ts \
-  out/v%v/index.m3u8
+  -master_pl_name master.m3u8 -hls_segment_filename out/%v/segment_%d.ts \
+  out/%v/index.m3u8
 ```
 
 Byte for byte recipe 126's command - `*` over a rendition alias is exactly
@@ -3520,7 +3520,7 @@ COPY (SELECT * FROM input(:'ladder') r WHERE r.height >= 720) TO :'dest' WITH (f
 $ ffrwd compile -f query.sql -v ladder=tests/fixtures/ladder-demuxed/master.mpd -v dest=out/master.m3u8
 ffmpeg -i tests/fixtures/ladder-demuxed/master.mpd -map 0:v:0 -c:0 copy -map 0:v:1 -c:1 \
   copy -f hls -var_stream_map 'v:0,name:0 v:1,name:1' -master_pl_name master.m3u8 \
-  -hls_segment_filename out/v%v/segment_%d.ts out/v%v/index.m3u8
+  -hls_segment_filename out/%v/segment_%d.ts out/%v/index.m3u8
 ```
 
 Reach for this to publish a floor under a ladder - drop the low rungs (or,
@@ -3553,7 +3553,7 @@ ffmpeg -i tests/fixtures/ladder-demuxed/master.mpd -filter_complex \
   '[0:v:0]scale=width=960:height=-2[out0]' -map '[out0]' -map 0:a:0 -f hls -c:0 libx264 \
   -c:1 aac -g:0 30 -keyint_min:0 30 -sc_threshold:0 0 -var_stream_map \
   'v:0,agroup:aud,name:720p a:0,agroup:aud,name:2,default:yes' -master_pl_name \
-  master.m3u8 -hls_segment_filename out/v%v/segment_%d.ts out/v%v/index.m3u8
+  master.m3u8 -hls_segment_filename out/%v/segment_%d.ts out/%v/index.m3u8
 ```
 
 `720p` is computed from the scaled output's own height (960 wide, 4:3 in →

@@ -315,15 +315,15 @@ def test_an_unknowable_rate_is_refused_asking_for_fps(
 
 def test_the_hls_layout_is_derived_beside_the_master() -> None:
     unit = _unit(_demuxed(_HLS + ", hls_segment_type 'fmp4'"))
-    assert unit.path == "out/v%v/index.m3u8"
+    assert unit.path == "out/%v/index.m3u8"
     assert unit.options["master_pl_name"] == "master.m3u8"
-    assert unit.options["hls_segment_filename"] == "out/v%v/segment_%d.m4s"
+    assert unit.options["hls_segment_filename"] == "out/%v/segment_%d.m4s"
     assert unit.options["hls_fmp4_init_filename"] == "init.mp4"
 
 
 def test_mpegts_segments_take_the_ts_extension_and_no_init() -> None:
     unit = _unit(_demuxed(_HLS))
-    assert unit.options["hls_segment_filename"] == "out/v%v/segment_%d.ts"
+    assert unit.options["hls_segment_filename"] == "out/%v/segment_%d.ts"
     assert "hls_fmp4_init_filename" not in unit.options
 
 
