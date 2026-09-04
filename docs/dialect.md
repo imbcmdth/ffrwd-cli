@@ -981,7 +981,9 @@ resolved-row-count principle, and grouped fan-out are in
 OFFSET are legal only over row-table queries; Postgres's grouping rule
 is enforced. LIMIT and OFFSET narrow the resolved row set after WHERE
 and ORDER BY and before the one-row rule, so `ORDER BY t.width DESC
-LIMIT 1` is the top row with no aggregate. Their counts are integer
+LIMIT 1` is the top row with no aggregate. A bare name in ORDER BY that
+matches a SELECT alias sorts by that alias's expression, and outranks a
+row column of the same name, as in Postgres. Their counts are integer
 literals after `-v` substitution (the generate_series rule); `LIMIT 0`
 is rejected - a query that selects nothing is a mistake worth naming -
 and so is an OFFSET that skips every row.

@@ -2436,6 +2436,81 @@ def test_the_other_streaming_rejections_are_untouched_by_the_carve_out() -> None
     assert err.code is ErrorCode.NO_STREAMING_EQUIVALENT
 
 
+# -- ORDER BY: a bare name resolves to a SELECT-list alias ------------------
+
+# A fake `RETURNS vector` declaration, resolve-only: nothing here reads the
+# module file, so a path that names no real one is fine.
+_VECTOR_FUNC_SQL = (
+    "CREATE FUNCTION embed_text(prompt text) RETURNS vector\n"
+    "  AS 'e.wasm', 'embed_text' LANGUAGE wasm;\n"
+)
+
+
+def test_order_by_a_bare_alias_resolves_to_the_aliased_expression() -> None:
+    """The repro: `score` names a SELECT-list alias, not a row column, so
+    Postgres's own rule applies -- ORDER BY sorts by the aliased expression
+    instead of demanding the user repeat it."""
+    res = _resolve(
+        _VECTOR_FUNC_SQL
+        + "SELECT v.track, v.start_t, "
+        "round(cos_similarity(v.vector, embed_text('x')), 4) AS score\n"
+        "FROM input('described.mkv') f, unnest(f.embeddings) v\n"
+        "ORDER BY score DESC"
+    )
+    order = res.branches[0].args["order"]
+    assert isinstance(order, exp.Order)
+    key = order.expressions[0].this
+    assert isinstance(key, exp.Column)
+    assert key.name.lower() == "score"
+
+
+def test_order_by_alias_precedence_over_a_row_columns_own_name() -> None:
+    """An output-column name outranks an input column of the same name --
+    here the SELECT-list alias is spelled exactly like a real row column,
+    and the alias's own expression is still what gets sorted."""
+    res = _resolve(
+        _VECTOR_FUNC_SQL
+        + "SELECT v.track, "
+        "round(cos_similarity(v.vector, embed_text('x')), 4) AS track\n"
+        "FROM input('described.mkv') f, unnest(f.embeddings) v\n"
+        "ORDER BY track"
+    )
+    order = res.branches[0].args["order"]
+    assert isinstance(order, exp.Order)
+
+
+def test_order_by_an_alias_over_a_stream_is_refused() -> None:
+    err = _reject(
+        "SELECT t, t AS strm FROM input('f.mkv') f, unnest(f.audio) t "
+        "ORDER BY strm"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'t' is a stream, and streams have no order to sort by" in err.message
+
+
+def test_order_by_an_alias_over_a_vector_is_refused() -> None:
+    err = _reject(
+        _VECTOR_FUNC_SQL
+        + "SELECT v.track, embed_text('x') AS vec\n"
+        "FROM input('described.mkv') f, unnest(f.embeddings) v\n"
+        "ORDER BY vec"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "a vector has no order to sort by" in err.message
+
+
+def test_order_by_a_name_matching_no_alias_is_still_rejected() -> None:
+    """Nothing in the SELECT list is named `nope`, so this is the same
+    unqualified-name rejection ORDER BY always gave."""
+    err = _reject(
+        "SELECT v.track, v.start_t AS score\n"
+        "FROM input('f.mkv') f, unnest(f.embeddings) v\n"
+        "ORDER BY nope"
+    )
+    assert err.code is ErrorCode.NO_STREAMING_EQUIVALENT
+    assert "only track-row metadata columns can be sorted" in (err.hint or "")
+
+
 # -- LIMIT / OFFSET: co-legal with ORDER BY ---------------------------------
 
 

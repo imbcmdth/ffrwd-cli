@@ -9342,6 +9342,22 @@ def test_a_struct_row_column_filters_and_sorts_like_any_row_column() -> None:
     assert sinks[0].result.rows == [["Act One"]]
 
 
+def test_order_by_a_bare_alias_resorts_by_the_aliased_expression() -> None:
+    """The parser resolves a bare ORDER BY name to its SELECT-list alias
+    (:meth:`ffrwd.parser._Resolver._check_order_key`); lowering has to chase
+    the same alias (:meth:`ffrwd.lower._Lowerer._order_rows`) to actually
+    re-sort by it instead of failing to find a row binding for a name no
+    column owns."""
+    sinks = lower_table(
+        resolve(parse(
+            "SELECT m.title, m.end_t - m.start_t AS duration "
+            f"FROM input('f.mkv') f, {_MARKS} ORDER BY duration DESC"
+        )),
+        {"f": ProbeResult(streams=[_track("video", 0)])},
+    )
+    assert sinks[0].result.rows == [["Act One", 240], ["Intro", 60]]
+
+
 def test_a_tag_column_over_struct_rows_tags_the_container() -> None:
     """Rows with no track have nothing to tag per stream, so the file gets it."""
     g = _lower(

@@ -2726,6 +2726,22 @@ def _projection_expr(projection: exp.Expr) -> exp.Expr:
     return _unwrap_paren(inner) if isinstance(inner, exp.Expr) else projection
 
 
+def _order_by_alias_expr(name: str, select: exp.Select) -> exp.Expr | None:
+    """The SELECT-list expression a bare ORDER BY name aliases, if any.
+
+    Postgres's own ORDER BY rule: an output-column name takes precedence
+    over an input column of the same name, and only a BARE name resolves
+    this way -- ``ORDER BY alias + 1`` is an expression, not a name, and
+    callers only reach for this helper once a key is a table-less column.
+    The first matching ``AS`` alias wins, left to right, the same as
+    Postgres.
+    """
+    for projection in select.expressions:
+        if _projection_alias(projection) == name:
+            return _projection_expr(projection)
+    return None
+
+
 def group_keys(select: exp.Select) -> list[exp.Expr]:
     """The GROUP BY key expressions of a branch, empty when it has none."""
     group = select.args.get("group")
@@ -7433,8 +7449,10 @@ class _Resolver:
         self, order: exp.Order, scope: dict[str, str], select: exp.Select
     ) -> None:
         """Every sort key is a track-row metadata column, a rendition column
-        of a plain input alias, or a compile-time value computed over one --
-        the same domain a WHERE operand admits -- and nothing else.
+        of a plain input alias, a compile-time value computed over one, or a
+        bare SELECT-list alias naming one of those -- the same domain a
+        WHERE operand admits, plus Postgres's own ORDER BY alias rule -- and
+        nothing else.
 
         Reaching here at all means the branch has a row source or an
         `input(...)` alias (:func:`_has_row_source` and
@@ -7470,72 +7488,104 @@ class _Resolver:
             )
             key = ordered.this
             key = _unwrap_paren(key) if isinstance(key, exp.Expr) else None
-            if isinstance(key, exp.Column) and not isinstance(key.this, exp.Star):
-                table_node = key.args.get("table")
-                alias = _ident_name(table_node) if table_node is not None else ""
-                kind = scope.get(alias)
-                if kind == "input" and (
-                    _ident_name(key.this) in RENDITION_COLUMNS
-                    or (
-                        alias in self.wasm_sources
-                        and _is_module_source_column(_ident_name(key.this))
-                    )
-                ):
-                    # A rendition column of a plain input alias: admitted on
-                    # spec, since only lower's probe can say whether this input
-                    # actually resolved to a rendition row table. A `RETURNS
-                    # source` alias's own value columns ride the same admission,
-                    # named by the module rather than by the manifest.
-                    continue
-                if kind != "row":
-                    raise _error(
-                        ErrorCode.NO_STREAMING_EQUIVALENT,
-                        "ORDER BY has no streaming equivalent",
-                        key,
-                        fallback=order,
-                        hint="only track-row metadata columns can be sorted; "
-                        + _ROW_ORDER_HINT,
-                    )
-                key_type = self._check_row_column(key, alias, order)
-                if key_type == "stream":
-                    raise _error(
-                        ErrorCode.UNSUPPORTED_SQL,
-                        f"'{alias}' is a stream, and streams have no order to "
-                        "sort by",
-                        key,
-                        fallback=order,
-                        hint=_ROW_ORDER_HINT,
-                    )
-                if key_type == "vector":
-                    raise _error(
-                        ErrorCode.UNSUPPORTED_SQL,
-                        "a vector has no order to sort by",
-                        key,
-                        fallback=order,
-                        hint="sort by a function over it instead, e.g. "
-                        "ORDER BY cos_similarity(...)",
-                    )
-                continue
-            if key is not None and self._is_row_predicate_value(key):
-                sort_type = self._check_value_expr(key, scope, order)
-                if sort_type == "vector":
-                    raise _error(
-                        ErrorCode.UNSUPPORTED_SQL,
-                        "a vector has no order to sort by",
-                        key,
-                        fallback=order,
-                        hint="sort by a function over it instead, e.g. "
-                        "ORDER BY cos_similarity(...)",
-                    )
-                continue
-            raise _error(
-                ErrorCode.NO_STREAMING_EQUIVALENT,
-                "ORDER BY has no streaming equivalent",
-                ordered,
-                fallback=order,
-                hint="only track-row metadata columns can be sorted; "
-                + _ROW_ORDER_HINT,
-            )
+            self._check_order_key(key, scope, order, select, ordered)
+
+    def _check_order_key(
+        self,
+        key: exp.Expr | None,
+        scope: dict[str, str],
+        order: exp.Order,
+        select: exp.Select,
+        ordered: exp.Ordered,
+    ) -> None:
+        """Type-check one ORDER BY key, chasing a bare SELECT-list alias once.
+
+        A table-less column name is tried against the SELECT list's own
+        aliases before anything else -- Postgres's output-column-over-input-
+        column precedence -- and, once resolved, is checked exactly as if
+        the aliased expression had been written in ORDER BY directly.
+        Resolution stops after that one hop: :func:`_order_by_alias_expr`
+        only ever looks at the SELECT list, never at another ORDER BY key,
+        so there is no cycle to guard against.
+        """
+        if isinstance(key, exp.Column) and not isinstance(key.this, exp.Star):
+            table_node = key.args.get("table")
+            if table_node is None:
+                resolved = _order_by_alias_expr(_ident_name(key.this), select)
+                if resolved is not None:
+                    self._check_order_key(resolved, scope, order, select, ordered)
+                    return
+                raise _error(
+                    ErrorCode.NO_STREAMING_EQUIVALENT,
+                    "ORDER BY has no streaming equivalent",
+                    key,
+                    fallback=order,
+                    hint="only track-row metadata columns can be sorted; "
+                    + _ROW_ORDER_HINT,
+                )
+            alias = _ident_name(table_node)
+            kind = scope.get(alias)
+            if kind == "input" and (
+                _ident_name(key.this) in RENDITION_COLUMNS
+                or (
+                    alias in self.wasm_sources
+                    and _is_module_source_column(_ident_name(key.this))
+                )
+            ):
+                # A rendition column of a plain input alias: admitted on
+                # spec, since only lower's probe can say whether this input
+                # actually resolved to a rendition row table. A `RETURNS
+                # source` alias's own value columns ride the same admission,
+                # named by the module rather than by the manifest.
+                return
+            if kind != "row":
+                raise _error(
+                    ErrorCode.NO_STREAMING_EQUIVALENT,
+                    "ORDER BY has no streaming equivalent",
+                    key,
+                    fallback=order,
+                    hint="only track-row metadata columns can be sorted; "
+                    + _ROW_ORDER_HINT,
+                )
+            key_type = self._check_row_column(key, alias, order)
+            if key_type == "stream":
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"'{alias}' is a stream, and streams have no order to "
+                    "sort by",
+                    key,
+                    fallback=order,
+                    hint=_ROW_ORDER_HINT,
+                )
+            if key_type == "vector":
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    "a vector has no order to sort by",
+                    key,
+                    fallback=order,
+                    hint="sort by a function over it instead, e.g. "
+                    "ORDER BY cos_similarity(...)",
+                )
+            return
+        if key is not None and self._is_row_predicate_value(key):
+            sort_type = self._check_value_expr(key, scope, order)
+            if sort_type == "vector":
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    "a vector has no order to sort by",
+                    key,
+                    fallback=order,
+                    hint="sort by a function over it instead, e.g. "
+                    "ORDER BY cos_similarity(...)",
+                )
+            return
+        raise _error(
+            ErrorCode.NO_STREAMING_EQUIVALENT,
+            "ORDER BY has no streaming equivalent",
+            ordered,
+            fallback=order,
+            hint="only track-row metadata columns can be sorted; " + _ROW_ORDER_HINT,
+        )
 
     # -- LIMIT / OFFSET over track rows --------------------------
 

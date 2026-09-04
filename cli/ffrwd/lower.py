@@ -340,6 +340,7 @@ from ffrwd.parser import (
     RawTrackRows,
     RawValuesTable,
     Resolved,
+    _order_by_alias_expr,
     _pos,
     _projection_expr,
     _time_bounds,
@@ -8875,8 +8876,16 @@ class _Lowerer:
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL, "malformed ORDER BY", fallback=order
                 )
-            binding = self._row_binding_of(ordered, env, select)
             key = _unwrap(ordered.this)
+            if isinstance(key, exp.Column) and key.args.get("table") is None:
+                # A bare SELECT-list alias: resolve already chased this back
+                # to its aliased expression (:meth:`ffrwd.parser._Resolver.
+                # _check_order_key`), so sorting runs against that expression
+                # instead of a column no binding owns.
+                resolved = _order_by_alias_expr(_fold(key.this), select)
+                if resolved is not None:
+                    key = _unwrap(resolved)
+            binding = self._row_binding_of(key, env, select)
             relation = binding.relation
 
             value_of: Callable[[_RowTuple], RowValue]
