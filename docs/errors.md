@@ -492,7 +492,7 @@ SELECT p.video[1] FROM input('logo.png', framerate => 'fast') p
 {"line": 1, "col": 55, "code": "INPUT_OPTION_TYPE", "message": "option 'framerate' expects a number, got 'fast'", "hint": "framerate takes a bare numeric literal, e.g. framerate => 15"}
 ```
 
-**Also fires for `realtime => true` on a socket** (`srt://`, `udp://`, `rtmp://`, `rtsp://`, `http(s)://`, ...): a socket already delivers at its own pace, so pacing it a second time with `-re` is refused rather than silently doubled up. This does NOT cover a `format =>`-forced capture device — telling one apart from a synthetic source like `format => 'lavfi'` (recipe 101 in [docs/examples.md](examples.md), which legitimately pairs `format => 'lavfi'` with `realtime => true`) needs a device-name list this table does not carry, so that case still compiles.
+**Also fires for `realtime => true` on a socket** (`srt://`, `udp://`, `rtmp://`, `rtsp://`, `http(s)://`, ...): a socket already delivers at its own pace, so pacing it a second time with `-re` is refused rather than silently doubled up. This does NOT cover a `format =>`-forced capture device — telling one apart from a synthetic source like `format => 'lavfi'` (recipe 101 in [docs/corpus.md](corpus.md), which legitimately pairs `format => 'lavfi'` with `realtime => true`) needs a device-name list this table does not carry, so that case still compiles.
 
 **Example query:**
 

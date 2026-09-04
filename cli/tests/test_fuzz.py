@@ -56,13 +56,17 @@ from .test_examples import _parse as parse_examples
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _REPO_ROOT = _PROJECT_ROOT.parent
 _GOLDEN_DIR = _PROJECT_ROOT / "tests" / "golden"
-_COOKBOOK = _REPO_ROOT / "docs" / "examples.md"
+_COOKBOOK = (_REPO_ROOT / "docs" / "examples.md", _REPO_ROOT / "docs" / "corpus.md")
 _CORPUS: list[str] = sorted(
     {
         *(p.read_text(encoding="utf-8") for p in _GOLDEN_DIR.glob("*.sql")),
-        # The cookbook is where the row and grouping surface lives, and it is
-        # already kept honest by its own byte-verification.
-        *(example.sql for example in parse_examples(_COOKBOOK.read_text(encoding="utf-8"))),
+        # The cookbook and its corpus are where the row and grouping surface
+        # lives, and both are already kept honest by their own pins.
+        *(
+            example.sql
+            for page in _COOKBOOK
+            for example in parse_examples(page.read_text(encoding="utf-8"))
+        ),
     }
 )
 assert _CORPUS, f"no seed queries found under {_GOLDEN_DIR}"

@@ -5315,7 +5315,7 @@ class _Lowerer:
         rule conflates a device with a SYNTHETIC one -- `format => 'lavfi'`
         generates frames as fast as it is asked to, and pacing it with
         `realtime => true` is exactly the documented idiom (recipe 101, 102 in
-        `../docs/examples.md`). Telling a capture device from a generator by
+        `../docs/corpus.md`). Telling a capture device from a generator by
         its `format` value needs a name list this table does not carry, so
         that half stays unrefused -- only a URL (`is_url`: udp, srt, rtmp,
         rtsp, http(s), ...) is unambiguous enough to reject here.
@@ -8789,7 +8789,7 @@ class _Lowerer:
     # ASSERTION, checked once at compile time against the probed file: TRUE
     # proceeds unchanged, FALSE or UNKNOWN (3VL -- a field that was never
     # probed) is a typed rejection, because an ffmpeg command line cannot
-    # encode "select nothing" (recipe 29 of docs/examples.md).
+    # encode "select nothing" (recipe 29 of docs/corpus.md).
     #
     # The boolean algebra is the row evaluator's, reused wholesale; the only
     # new piece is where a leaf's VALUE comes from (`_accessor_value`, probed

@@ -174,7 +174,7 @@ ffmpeg -i film.mkv -filter_complex '
 
 A view is to statements what a CTE is to branches: `main` decodes and filters `film.mkv` exactly once - `scale` and `volume` each appear a single time in the graph above - and the split pass hands out however many pads its readers need (`split=2` for the two video consumers, `asplit=3` for the three audio ones).
 
-There's much more - watermarks, GIFs, subtitle muxing, multiband compression, generated test media - and it all lives in the **[cookbook](docs/examples.md)**: nearly sixty real tasks, simple to complex, every shown output rerun and byte-checked by the test suite - and most of them parameterized with `-v` variables, so they run against your files as-is.
+There's much more - watermarks, GIFs, subtitle muxing, multiband compression, generated test media - and it all lives in the **[cookbook](docs/examples.md)**: thirty real tasks, simple to complex, with [a hundred more](docs/corpus.md) beside them. Every shown output is rerun and byte-checked by the test suite, and most are parameterized with `-v` variables, so they run against your files as-is.
 
 ## CLI reference
 

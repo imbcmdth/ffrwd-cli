@@ -44,7 +44,7 @@ On a CTE, open windows pass only the bounds they have (`trim=start=3` with no `e
 A bound may read a row column - `WHERE f.t BETWEEN c.start_t AND c.end_t`, `WHERE f.t >= i.i - 1` - which makes the window one seek per surviving row. Where those seeks go is the query's business, and there are two answers:
 
 - **A fan-out `TO (expression)`** gives each row a file of its own; the windows are per-FILE, described below.
-- **An aggregate** gathers the rows into one file. Each row then mints its own `-i` of the same path with its own `-ss`/`-to`, all in ONE graph, and the per-row streams flow into the aggregate: `ffmpeg.concat(VARIADIC array_agg(shots.frame))` over N series rows is N seeks of one file joined end to end. Two rows naming the same window share one `-i`. [Recipe 75](examples.md#75-gather-n-clips-from-one-file-into-one).
+- **An aggregate** gathers the rows into one file. Each row then mints its own `-i` of the same path with its own `-ss`/`-to`, all in ONE graph, and the per-row streams flow into the aggregate: `ffmpeg.concat(VARIADIC array_agg(shots.frame))` over N series rows is N seeks of one file joined end to end. Two rows naming the same window share one `-i`. [Recipe 75](corpus.md#75-gather-n-clips-from-one-file-into-one).
 
 Neither, and N windows reach a single destination: a `ROW_COUNT_MISMATCH` naming both ways out. The alias being windowed has to be an `input()` one - a CTE name is a filtergraph pad, with no `-i` to repeat.
 
@@ -56,7 +56,7 @@ A fan-out `TO (expression)` whose rows carry a window writes one file per row, a
 
 Seeking an output re-encodes it. A stream that would have been a plain copy therefore takes whatever codec the sink names, or ffmpeg's default encoder for the container when it names none.
 
-When every mapped stream in every output is a stream copy, that form is unavailable - ffmpeg writes corrupt files from an output seek plus `-c copy`. Such a fan-out compiles to one command per file instead, `&&`-chained, each seeking its own `-i`: fast, nothing decodes, cuts snapping to keyframes. [Recipe 47](examples.md#47-split-a-file-by-its-chapters) shows both forms of one query.
+When every mapped stream in every output is a stream copy, that form is unavailable - ffmpeg writes corrupt files from an output seek plus `-c copy`. Such a fan-out compiles to one command per file instead, `&&`-chained, each seeking its own `-i`: fast, nothing decodes, cuts snapping to keyframes. [Recipe 47](corpus.md#47-split-a-file-by-its-chapters) shows both forms of one query.
 
 ## Accuracy: decoded vs. stream-copied
 

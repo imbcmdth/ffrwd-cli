@@ -70,7 +70,7 @@ The fourth expands in TIME rather than in the graph, and is the one macro with n
 
 - **`ffrwd.loudnorm2(stream, I => ..., TP => ..., LRA => ...)`** - normalize audio to a loudness target the broadcast-compliant way: measure the whole stream, then correct it with one linear gain change. The three options are named only and all optional (ffmpeg's own `loudnorm` defaults cover any you omit); only what you write is rendered. Audio only.
 
-  It compiles to TWO chained commands, not one. Pass 1 runs the same stream through `loudnorm=<your options>:print_format=json` into `-f null -`; `ffrwd loudnorm2env` turns the JSON block on its stderr into `export FFRWD_LN_*=` lines; pass 2 splices those variables into its filtergraph alongside `linear=true`. Recipe 49 in [examples.md](examples.md) shows the whole line.
+  It compiles to TWO chained commands, not one. Pass 1 runs the same stream through `loudnorm=<your options>:print_format=json` into `-f null -`; `ffrwd loudnorm2env` turns the JSON block on its stderr into `export FFRWD_LN_*=` lines; pass 2 splices those variables into its filtergraph alongside `linear=true`. Recipe 49 in [corpus.md](corpus.md) shows the whole line.
 
   Two costs come with that shape:
 
@@ -118,7 +118,7 @@ To choose which tracks to pass in the first place (by language, codec, resolutio
 
 Two filters load code at runtime, and both compile like any other call:
 
-- `frei0r(video, filter_name => '<plugin>', filter_params => 'a|b|c')` and the source `ffmpeg.frei0r_src(...)`: video effect plugins found through the `FREI0R_PATH` environment variable. [Recipe 62](examples.md#62-use-a-plugin-filter).
+- `frei0r(video, filter_name => '<plugin>', filter_params => 'a|b|c')` and the source `ffmpeg.frei0r_src(...)`: video effect plugins found through the `FREI0R_PATH` environment variable. [Recipe 62](corpus.md#62-use-a-plugin-filter).
 - `ladspa(audio, ..., file => '<library>', plugin => '<label>', controls => 'c0|c1')`: audio plugins found through `LADSPA_PATH`; pass as many streams as the plugin has input ports.
 
 Whether either exists is a property of the installed ffmpeg build, exactly like every other filter - `frei0r` and `ladspa` both appear in common full builds. Plugin parameters are opaque strings to the compiler; their meaning belongs to the plugin.

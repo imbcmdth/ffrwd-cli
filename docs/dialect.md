@@ -100,17 +100,17 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   describe; both are denied without it. Secrets do not belong in the
   value arguments - the query text is the command line. Recipes
   [98](examples.md#98-post-what-a-module-found-as-it-is-found),
-  [99](examples.md#99-watch-the-frames-go-by).
+  [99](corpus.md#99-watch-the-frames-go-by).
 - A **value-returning `LANGUAGE wasm` function** (`RETURNS text`,
   `number`, `boolean` or `vector`) takes no stream at all: every
   parameter is one of those same `vtype`s, matched name-for-name against
   the schema the module's own function declares, and RETURNS against
   what that function returns. It runs once per call, at compile time -
   like ffprobe, not like a filter. Recipe
-  [89](examples.md#89-compute-a-tag-with-a-wasm-module). Over a row
+  [89](corpus.md#89-compute-a-tag-with-a-wasm-module). Over a row
   column it runs once per row, memoized on its arguments - the same
   per-row footing the built-in text and number functions have
-  ([recipe 112](examples.md#112-a-function-over-a-caption-files-cues)).
+  ([recipe 112](corpus.md#112-a-function-over-a-caption-files-cues)).
   A `vector` is a JSON array of numbers - the wire shape of an
   embedding - and joins `vtype` for exactly this: a value function's
   own parameters and RETURNS, and an annotation field. It is not a
@@ -119,7 +119,7 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   `cos_similarity(vector, vector) -> number` and `vector_length(vector)
   -> number` are the two built-ins over it, evaluated at compile time
   and, over a row column, once per row like any other. Recipe
-  [114](examples.md#114-rank-rows-by-a-vector).
+  [117](examples.md#117-rank-rows-by-a-vector).
 - A **rows `LANGUAGE wasm` function** (one annotation parameter,
   `RETURNS` an annotation) reads rows and writes rows with no stream
   at all. Its argument is the annotation column a run-time module
@@ -1053,7 +1053,7 @@ An option value is a literal or `ARRAY[literal, ...][k]` - what
 ffmpeg runs, so a column off the media is a rejection naming the
 option. A subscript reading a row column picks per file, so a fan-out
 `TO` may vary its encode per rung ([recipe
-103](examples.md#103-give-each-rung-of-the-ladder-its-own-encode));
+103](corpus.md#103-give-each-rung-of-the-ladder-its-own-encode));
 under a quoted `TO` there is no row to read, and that is a rejection
 too.
 

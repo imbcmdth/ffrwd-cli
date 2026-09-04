@@ -5,7 +5,8 @@ names and already-resolved cell values -- and this module turns one into
 either the psql-style ASCII table or a CSV document. No SQL, no IR graph
 knowledge: pure formatting over already-typed data.
 
-Format is PINNED byte-for-byte by cookbook recipes 30/31 (docs/examples.md):
+Format is PINNED byte-for-byte by cookbook recipes 30 (docs/examples.md) and
+31 (docs/corpus.md):
 one leading space per cell, cells left-justified to ``max(header width, every
 value's width)``, columns joined with ``" | "``, a dashed rule with ``"+"`` at
 the column separators (``width + 2`` dashes each), a ``"(N rows)"`` /

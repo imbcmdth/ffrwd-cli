@@ -1,11 +1,17 @@
-"""Tests for docs/examples.md -- the cookbook.
+"""Tests for docs/examples.md and docs/corpus.md -- the cookbook and the rest
+of the exec-tier regression corpus.
 
 Data-driven, not one test per recipe: every ```sql / ```pgsql code block in
-the cookbook is compiled by running the exact command line the code block
+either file is compiled by running the exact command line the code block
 below it shows, and the printed ffmpeg command must match that block byte for
 byte.
-Adding a recipe to the cookbook therefore adds its test here automatically,
+Adding a recipe to either file therefore adds its test here automatically,
 and a recipe whose command drifts fails with the diff in front of it.
+
+`docs/examples.md` is the cookbook a newcomer reads; `docs/corpus.md` holds
+the recipes that carry the same exec-tier weight without a place in that
+narrative. Both are parsed the same way and pooled into one set of
+examples -- a recipe's home file changes nothing about how it is tested.
 
 The two tiers are the ones the cookbook's own "How to read this file" section
 documents:
@@ -46,6 +52,8 @@ from ffrwd.registry import Registry
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 REPO_ROOT = PROJECT_ROOT.parent
 EXAMPLES_PATH = REPO_ROOT / "docs" / "examples.md"
+CORPUS_PATH = REPO_ROOT / "docs" / "corpus.md"
+DOC_PATHS = (EXAMPLES_PATH, CORPUS_PATH)
 
 _TIERS = {"sql": "offline", "pgsql": "exec"}
 
@@ -119,14 +127,18 @@ def _ids(examples: list[Example]) -> list[str]:
     return ids
 
 
-_EXAMPLES = _parse(EXAMPLES_PATH.read_text(encoding="utf-8"))
+_EXAMPLES = [
+    example
+    for path in DOC_PATHS
+    for example in _parse(path.read_text(encoding="utf-8"))
+]
 _OFFLINE = [e for e in _EXAMPLES if e.tier == "offline"]
 _EXEC = [e for e in _EXAMPLES if e.tier == "exec"]
 
 _MISSING_BLOCK_HELP = (
-    "every query in docs/examples.md is followed by a code block holding the real "
-    "compiled command: a ``` block whose first line is the `$ ffrwd compile "
-    "...` invocation and whose remaining lines are exactly what it prints"
+    "every query in docs/examples.md or docs/corpus.md is followed by a code block "
+    "holding the real compiled command: a ``` block whose first line is the `$ ffrwd "
+    "compile ...` invocation and whose remaining lines are exactly what it prints"
 )
 
 
@@ -366,8 +378,9 @@ def test_every_example_shows_its_compiled_command(example: Example) -> None:
     _split_command(example)
 
 
-def test_examples_md_uses_lf_newlines_only() -> None:
-    assert b"\r" not in EXAMPLES_PATH.read_bytes()
+@pytest.mark.parametrize("path", DOC_PATHS, ids=lambda path: path.name)
+def test_examples_md_uses_lf_newlines_only(path: Path) -> None:
+    assert b"\r" not in path.read_bytes()
 
 
 # ---------------------------------------------------------------------------
