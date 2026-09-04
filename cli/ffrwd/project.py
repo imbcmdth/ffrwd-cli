@@ -249,6 +249,15 @@ _REVISION_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _MODEL_DIGEST_RE = re.compile(r"[0-9a-f]{64}")
 _MODEL_KEYS = ("repo", "revision", "file", "sha256")
 
+# "not_on" is optional, so it sits apart from the four every pin must give.
+_MODEL_OPTIONAL_KEYS = ("not_on",)
+
+# The execution providers a model's pin may deny itself, spelled the way the
+# sidecar's own ``-nn-exclude`` takes them. "cpu" is not among them: every
+# model runs somewhere, and CPU is the one provider ONNX Runtime always
+# offers.
+EXCLUDABLE_PROVIDERS = ("coreml", "cuda", "directml")
+
 # Keys older manifests wrote, each with the hint that says what replaced it.
 _RETIRED = {
     "namespace": 'the name carries the namespace: "name" is "<namespace>/<package>"',
@@ -312,6 +321,10 @@ _MODELS_HINT = (
     '{"depth": {"repo": "<owner>/<name>", "revision": "<branch, tag or commit>", '
     '"file": "model.onnx", "sha256": "<64 hex>"}}; a model of several files is a '
     "list of those, the graph first"
+)
+_NOT_ON_HINT = (
+    '"not_on" is a list of execution providers this model refuses, from '
+    f"{', '.join(EXCLUDABLE_PROVIDERS)}"
 )
 _TEST_HINT = (
     '"test" is one line: the command `ffrwd publish` runs instead of compiling the recipes'
@@ -382,12 +395,20 @@ class ModelPin:
     revision, and `sha256` is what the bytes must hash to. Install fetches it
     beside the module the export belongs to; the model is not in the archive,
     which is what keeps a package that runs one down to kilobytes.
+
+    `not_on` is the execution providers this model's own graph cannot run on
+    -- measured, not guessed, and carried on the graph's own pin since the
+    constraint belongs to the model, not the module hosting it. Empty for a
+    model that runs anywhere. A model pinned as several files carries it on
+    the first entry only, the graph itself; the files after it are inputs
+    that graph reads, not their own model.
     """
 
     repo: str
     revision: str
     file: str
     sha256: str
+    not_on: tuple[str, ...] = ()
 
     @property
     def filename(self) -> str:
@@ -968,17 +989,45 @@ def _engines(data: dict[str, object], path: Path, text: str) -> str | None:
     return written
 
 
+def _not_on(
+    written: dict[str, object], named: str, path: Path, line: int | None
+) -> tuple[str, ...]:
+    """The providers ``not_on`` denies, validated against what the sidecar knows."""
+    if "not_on" not in written:
+        return ()
+    value = written["not_on"]
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise _reject(
+            path,
+            f'{named} must give "not_on" as a list of provider names',
+            line=line,
+            hint=_NOT_ON_HINT,
+        )
+    seen: list[str] = []
+    for provider in value:
+        if provider not in EXCLUDABLE_PROVIDERS:
+            raise _reject(
+                path,
+                f'{named} names an unknown provider {provider!r} in "not_on"',
+                line=line,
+                hint=_did_you_mean(provider, list(EXCLUDABLE_PROVIDERS)) or _NOT_ON_HINT,
+            )
+        if provider not in seen:
+            seen.append(provider)
+    return tuple(seen)
+
+
 def _model(written: object, named: str, path: Path, line: int | None) -> ModelPin:
     """One pin, every field checked before it is part of a URL."""
     if not isinstance(written, dict):
         raise _reject(path, f"{named} must be a JSON object", line=line, hint=_MODELS_HINT)
     for key in sorted(written):
-        if key not in _MODEL_KEYS:
+        if key not in _MODEL_KEYS and key not in _MODEL_OPTIONAL_KEYS:
             raise _reject(
                 path,
                 f"unknown key {key!r} in {named}",
                 line=line,
-                hint=_did_you_mean(key, list(_MODEL_KEYS))
+                hint=_did_you_mean(key, list(_MODEL_KEYS) + list(_MODEL_OPTIONAL_KEYS))
                 or f"a model holds: {', '.join(_MODEL_KEYS)}",
             )
     for key in _MODEL_KEYS:
@@ -1021,7 +1070,8 @@ def _model(written: object, named: str, path: Path, line: int | None) -> ModelPi
             line=line,
             hint="a digest is 64 lowercase hex characters",
         )
-    return ModelPin(repo=repo, revision=revision, file=file, sha256=sha256)
+    not_on = _not_on(written, named, path, line)
+    return ModelPin(repo=repo, revision=revision, file=file, sha256=sha256, not_on=not_on)
 
 
 def _landings(
@@ -1032,6 +1082,14 @@ def _landings(
     graph = f"{export}{MODEL_SUFFIX}"
     seen: dict[str, int] = {}
     for number, pin in enumerate(pins[1:], start=2):
+        if pin.not_on:
+            raise _reject(
+                path,
+                f'{named} entry {number} names "not_on"',
+                line=line,
+                hint="a provider constraint belongs to the model, not one of its "
+                "files; put it on the first entry, the graph the export loads",
+            )
         landing = pin.filename
         if not landing or landing in (".", "..") or "\\" in landing:
             raise _reject(

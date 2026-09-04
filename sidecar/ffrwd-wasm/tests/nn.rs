@@ -360,6 +360,125 @@ fn a_gpu_target_that_ended_up_on_the_cpu_says_so() {
 }
 
 #[test]
+fn nn_exclude_refuses_cpu_and_a_misspelling() {
+    let output = run_bare(&["-nn-exclude", "cpu", "--describe", "x.wasm"]);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("cannot be excluded"),
+        "got: {}",
+        stderr(&output)
+    );
+
+    let output = run_bare(&["-nn-exclude", "dml", "--describe", "x.wasm"]);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("cuda, directml and coreml"),
+        "got: {}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn nn_exclude_accepts_every_deniable_provider() {
+    // A named provider is accepted whether or not this machine can offer it:
+    // only cpu, and a misspelling, are refused.
+    for provider in ["cuda", "directml", "coreml"] {
+        let output = run_bare(&["-nn-exclude", provider, "--describe", "x.wasm"]);
+        let message = stderr(&output);
+        assert!(
+            !message.contains("-nn-exclude"),
+            "-nn-exclude {provider} should be accepted: {message}"
+        );
+    }
+}
+
+#[test]
+fn a_gpu_walk_with_directml_excluded_never_engages_it() {
+    let Some(runtime) = runtime_dir() else {
+        announce_skip("there is no session to establish a provider for");
+        return;
+    };
+    let module = probe_module();
+    let output = run_with_runtime(
+        &runtime,
+        &[
+            "-nn",
+            &format!("tiny={}", tiny_model().display()),
+            "-nn-target",
+            "gpu",
+            "-nn-exclude",
+            "directml",
+            "--invoke",
+            &module.to_string_lossy(),
+            "run",
+            r#"{"model":"tiny","input":[1,2,3,4]}"#,
+        ],
+    );
+
+    assert!(
+        output.status.success(),
+        "excluding a provider from the walk still runs, on whatever is left:\n{}",
+        stderr(&output)
+    );
+    let message = stderr(&output);
+    assert!(
+        message.contains("[nn] -nn-exclude: directml"),
+        "the excluded provider is named once, regardless of the walk's outcome: {message}"
+    );
+    assert!(
+        !message.contains("execution provider: DIRECTML"),
+        "an excluded provider never engages: {message}"
+    );
+}
+
+#[test]
+fn every_gpu_provider_excluded_runs_on_cpu_and_says_why() {
+    let Some(runtime) = runtime_dir() else {
+        announce_skip("there is no session to establish a provider for");
+        return;
+    };
+    let module = probe_module();
+    let model_arg = format!("tiny={}", tiny_model().display());
+    let module_arg = module.to_string_lossy().to_string();
+    // Every provider `-nn-target gpu` could reach on this platform, so the
+    // walk has nowhere left to land but the CPU.
+    let output = run_with_runtime(
+        &runtime,
+        &[
+            "-nn",
+            &model_arg,
+            "-nn-target",
+            "gpu",
+            "-nn-exclude",
+            "directml",
+            "-nn-exclude",
+            "cuda",
+            "-nn-exclude",
+            "coreml",
+            "--invoke",
+            &module_arg,
+            "run",
+            r#"{"model":"tiny","input":[1,2,3,4]}"#,
+        ],
+    );
+
+    assert!(
+        output.status.success(),
+        "a walk with nowhere left still runs, on the cpu:\n{}",
+        stderr(&output)
+    );
+    let message = stderr(&output);
+    assert!(
+        message.contains("execution provider: CPU"),
+        "got: {message}"
+    );
+    assert!(
+        message.contains("tiny runs on cpu:") && message.contains("excluded by its pin"),
+        "a walk left with only cpu by exclusion says why it is slow: {message}"
+    );
+}
+
+#[test]
 fn a_name_that_was_never_bound_comes_back_not_found() {
     let Some(runtime) = runtime_dir() else {
         announce_skip("there is no registry to miss in");

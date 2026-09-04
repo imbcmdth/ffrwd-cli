@@ -1579,6 +1579,20 @@ def test_pad_meta_omits_absent_attributes() -> None:
     assert meta.to_dict() == {"row": 2, "rendition": {"name": "1080p"}}
 
 
+def test_a_model_binding_with_no_not_on_omits_the_key() -> None:
+    binding = ModelBinding(name="detect", path="detect.onnx")
+    assert binding.to_dict() == {"name": "detect", "path": "detect.onnx"}
+
+
+def test_a_model_bindings_not_on_serializes_as_a_list() -> None:
+    binding = ModelBinding(name="transcribe", path="transcribe.onnx", not_on=("directml",))
+    assert binding.to_dict() == {
+        "name": "transcribe",
+        "path": "transcribe.onnx",
+        "not_on": ["directml"],
+    }
+
+
 def test_a_sidecars_pads_are_absent_from_to_dict_by_default() -> None:
     """Empty `pads` is the ordinary case: no key at all, not an empty list."""
     sidecar = SidecarProcess(id="sidecar0", module="m.wasm", node="n0", outputs=("video",))

@@ -48,7 +48,7 @@ from . import wasm
 from .emit import Emitted, emit
 from .errors import ErrorCode, FfrwdError
 from .execute import DEFAULT_TIMEOUT
-from .functions import WasmFunction
+from .functions import WasmFunction, package_modules
 from .inputs import forces_demuxer, probe_options, render_options
 from .ir import Graph
 from .lower import ProbePath, input_option_values, lower_commands, lower_table
@@ -65,7 +65,7 @@ from .processes import (
     external_filters,
     partition,
 )
-from .project import PackageSet
+from .project import ModelPin, PackageSet
 from .pts import insert_pts_resets
 from .split import insert_splits
 from .table import TableSink
@@ -292,8 +292,34 @@ def _at(declared: WasmFunction) -> Iterator[None]:
         ) from err
 
 
+def _pinned_models(packages: PackageSet | None) -> dict[tuple[str, str], ModelPin]:
+    """The first pin behind every (module path, export name) `packages` names.
+
+    A module bound at compile time carries nothing back to the package it
+    came from -- :func:`~ffrwd.wasm.model_binding` finds it purely by the
+    file beside the module -- so this is the only way to find its pin again,
+    and with it the providers the pin denies. Empty with no package set.
+    """
+    found: dict[tuple[str, str], ModelPin] = {}
+    if packages is None:
+        return found
+    seen: set[int] = set()
+    for by_version in packages.versions.values():
+        for package in by_version.values():
+            if not package.models or id(package) in seen:
+                continue
+            seen.add(id(package))
+            for declared in package_modules(package):
+                pins = package.models.get(declared.export)
+                if pins:
+                    found.setdefault((declared.module, declared.export), pins[0])
+    return found
+
+
 def _nn_models(
-    hosted: Mapping[str, WasmFunction], describes: Mapping[str, Described]
+    hosted: Mapping[str, WasmFunction],
+    describes: Mapping[str, Described],
+    packages: PackageSet | None = None,
 ) -> dict[str, ModelBinding]:
     """The model each hosted module binds, keyed by module path.
 
@@ -301,15 +327,21 @@ def _nn_models(
     whose describe says it runs a model. One whose describe says it runs
     none binds nothing and emits no ``-nn``. One that does names the file at
     compile time, so a missing model is a rejection here rather than a load
-    failure at run time.
+    failure at run time. `packages` is where its pin's own ``not_on`` comes
+    from, when the module belongs to one.
     """
+    pinned = _pinned_models(packages)
     models: dict[str, ModelBinding] = {}
     for declared in hosted.values():
         described = describes.get(declared.module)
         if described is None or not described.nn or declared.module in models:
             continue
         with _at(declared):
-            models[declared.module] = wasm.model_binding(described, declared.module)
+            pin = pinned.get((declared.module, described.name))
+            not_on = pin.not_on if pin is not None else ()
+            models[declared.module] = wasm.model_binding(
+                described, declared.module, not_on=not_on
+            )
     return models
 
 
@@ -515,7 +547,7 @@ def compile_all(
                 pix_fmts=_wire_formats(stream_wasm, describes),
                 shapes=_module_shapes(stream_wasm, describes),
                 audio_wires=_audio_wires(stream_wasm, describes),
-                models=_nn_models(hosted, describes),
+                models=_nn_models(hosted, describes, packages),
                 effects=_effect_grants(stream_wasm, describes),
                 anchors=res.input_anchors,
             )

@@ -276,6 +276,7 @@ _ROWS_FLAG = "-rows"
 # How a model file is bound to the name the module loads it by, and what the
 # file is called: the export's own name, beside the module.
 _NN_FLAG = "-nn"
+_NN_EXCLUDE_FLAG = "-nn-exclude"
 
 # The sidecar's worker-thread cap. Unwritten, the sidecar sizes its own pool.
 _JOBS_FLAG = "-jobs"
@@ -1100,15 +1101,22 @@ def _first_line(text: str) -> str:
 
 
 def _nn_args(models: Sequence[ModelBinding], runtime: Sequence[str]) -> list[str]:
-    """The ``-nn-runtime``/``-nn-target`` pair, then one ``-nn name=path`` per model.
+    """The ``-nn-runtime``/``-nn-target`` pair, ``-nn-exclude`` per denied provider,
+    then one ``-nn name=path`` per model.
 
     Shared by a sidecar process's argv and a compile-time :func:`invoke` of a
     module that runs one -- both bind a model the same way. `runtime` is
-    written only when there is at least one model to bind.
+    written only when there is at least one model to bind. ``-nn-exclude`` is
+    the union of every bound model's own ``not_on``, sorted: every model on
+    one process shares the one provider walk, so one model's pin narrows it
+    for the process, not for its own binding alone.
     """
     argv: list[str] = []
     if models:
         argv += list(runtime)
+    excluded: set[str] = {provider for model in models for provider in model.not_on}
+    for provider in sorted(excluded):
+        argv += [_NN_EXCLUDE_FLAG, provider]
     for model in models:
         argv += [_NN_FLAG, f"{model.name}={model.path}"]
     return argv
@@ -1156,7 +1164,8 @@ def _argv(
     module table: the host loads them before anything is instantiated.
     `runtime` is what it takes to load them -- the fetched runtime directory
     and the target to run on -- and is empty for a printed command, whose
-    reader has their own machine's.
+    reader has their own machine's. ``-nn-exclude`` names a provider a bound
+    model's own pin denies, ahead of the ``-nn`` table the same way.
 
     ``-http`` and ``-net`` grant one module its effects, also ahead of the
     module table: the sidecar denies both to any module the argv never
@@ -1391,12 +1400,16 @@ def model_path(module: str, export: str) -> str:
     return f"{module[: cut + 1]}{export}{MODEL_SUFFIX}"
 
 
-def model_binding(described: Described, module: str) -> ModelBinding:
+def model_binding(
+    described: Described, module: str, *, not_on: Sequence[str] = ()
+) -> ModelBinding:
     """The ``-nn`` entry `module` needs, or a rejection naming the missing file.
 
     The path is written into the argv at compile time, so the file has to be
     there now: a run that would fail to load it fails here instead, where the
-    declaration can be pointed at.
+    declaration can be pointed at. `not_on` is the providers the model's own
+    manifest pin denies, when the caller has one in hand -- empty for a
+    module bound outside any package.
     """
     path = model_path(module, described.name)
     if not Path(path).is_file():
@@ -1406,7 +1419,7 @@ def model_binding(described: Described, module: str) -> ModelBinding:
             "beside its wasm file; `ffrwd install` in the package fetches "
             "what its manifest pins",
         )
-    return ModelBinding(name=described.name, path=path)
+    return ModelBinding(name=described.name, path=path, not_on=tuple(not_on))
 
 
 def rows_fields(described: Described) -> tuple[tuple[str, str], ...] | None:

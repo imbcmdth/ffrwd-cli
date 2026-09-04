@@ -114,8 +114,13 @@ pub const CUDA_DEPS: &[CudaDep] = &[
 ];
 
 /// cuDNN 9 loads these itself, by bare name, out of its own directory.
+/// `_adv` carries the recurrent ops -- an RNN or LSTM node needs it, where a
+/// plain convolutional graph never touches it -- and its absence does not
+/// register as a missing library until a session tries to build that node,
+/// which is a crash rather than a refusal.
 #[cfg(windows)]
 pub const CUDNN_SUBLIBS: &[&str] = &[
+    "cudnn_adv64_9.dll",
     "cudnn_graph64_9.dll",
     "cudnn_ops64_9.dll",
     "cudnn_heuristic64_9.dll",
@@ -124,6 +129,7 @@ pub const CUDNN_SUBLIBS: &[&str] = &[
 ];
 #[cfg(not(windows))]
 pub const CUDNN_SUBLIBS: &[&str] = &[
+    "libcudnn_adv.so.9",
     "libcudnn_graph.so.9",
     "libcudnn_ops.so.9",
     "libcudnn_heuristic.so.9",

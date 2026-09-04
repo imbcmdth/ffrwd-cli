@@ -4369,6 +4369,40 @@ def test_a_model_written_as_one_file_and_as_a_list_of_one_read_the_same(
     assert dict(one.models) == dict(listed.models)
 
 
+def test_a_models_not_on_is_read_and_deduplicated(tmp_path: Path) -> None:
+    """A pin denying a provider carries it; a provider named twice is one."""
+    manifest = _project(
+        tmp_path,
+        files={"src/tracks.sql": QUIETER},
+        manifest={
+            "models": {
+                "quieter": {**_MODEL, "not_on": ["directml", "directml"]},
+            }
+        },
+    )
+    pin = read_manifest(manifest).models["quieter"][0]
+    assert pin.not_on == ("directml",)
+
+
+def test_a_model_with_no_not_on_carries_none(tmp_path: Path) -> None:
+    manifest = _project(
+        tmp_path, files={"src/tracks.sql": QUIETER}, manifest={"models": {"quieter": dict(_MODEL)}}
+    )
+    pin = read_manifest(manifest).models["quieter"][0]
+    assert pin.not_on == ()
+
+
+def test_an_unknown_provider_in_not_on_suggests_the_close_match(tmp_path: Path) -> None:
+    manifest = _project(
+        tmp_path,
+        files={"src/tracks.sql": QUIETER},
+        manifest={"models": {"quieter": {**_MODEL, "not_on": ["directmll"]}}},
+    )
+    with pytest.raises(FfrwdError) as caught:
+        read_manifest(manifest)
+    assert "did you mean 'directml'?" in (caught.value.hint or "")
+
+
 def test_a_manifest_declaring_none_of_them_carries_none(tmp_path: Path) -> None:
     package = read_manifest(_project(tmp_path, files={"src/tracks.sql": QUIETER}))
     assert (
@@ -4508,6 +4542,33 @@ def test_a_blank_homepage_is_the_same_as_absent(tmp_path: Path) -> None:
                 }
             },
             "model 'quieter' entries 2 and 3 would both land under 'weights.bin'",
+        ),
+        (
+            {"models": {"quieter": {**_MODEL, "not_on": "directml"}}},
+            'model \'quieter\' must give "not_on" as a list of provider names',
+        ),
+        (
+            {"models": {"quieter": {**_MODEL, "not_on": ["directml", 1]}}},
+            'model \'quieter\' must give "not_on" as a list of provider names',
+        ),
+        (
+            {"models": {"quieter": {**_MODEL, "not_on": ["dml"]}}},
+            "model 'quieter' names an unknown provider 'dml' in \"not_on\"",
+        ),
+        (
+            {"models": {"quieter": {**_MODEL, "not_on": ["cpu"]}}},
+            "model 'quieter' names an unknown provider 'cpu' in \"not_on\"",
+        ),
+        (
+            {
+                "models": {
+                    "quieter": [
+                        dict(_MODEL),
+                        {**_MODEL, "file": "a/weights.bin", "not_on": ["directml"]},
+                    ]
+                }
+            },
+            'model \'quieter\' entry 2 names "not_on"',
         ),
     ],
 )

@@ -128,6 +128,11 @@
           "type": "string",
           "description": "What the file's bytes must hash to.",
           "pattern": "^[0-9a-f]{64}$"
+        },
+        "not_on": {
+          "type": "array",
+          "description": "Execution providers this model's graph cannot run on, measured rather than guessed. compile passes the union of every bound model's not_on to the sidecar as -nn-exclude. Belongs on the first entry only when a model is pinned as several files.",
+          "items": { "enum": ["coreml", "cuda", "directml"] }
         }
       }
     }

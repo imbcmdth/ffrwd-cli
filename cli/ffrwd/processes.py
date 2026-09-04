@@ -584,13 +584,23 @@ class RowsDocument:
 
 @dataclass(frozen=True)
 class ModelBinding:
-    """One ``-nn <name>=<path>``: the name a module loads a model by, and the file."""
+    """One ``-nn <name>=<path>``: the name a module loads a model by, and the file.
+
+    `not_on` is what the model's own pin denies -- the execution providers
+    read off its manifest at compile time, empty for a model pinned with no
+    ``not_on`` or bound outside any package. The union of every binding's
+    `not_on` on one process becomes that process's ``-nn-exclude`` argv.
+    """
 
     name: str
     path: str
+    not_on: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
-        return {"name": self.name, "path": self.path}
+        written: dict[str, object] = {"name": self.name, "path": self.path}
+        if self.not_on:
+            written["not_on"] = list(self.not_on)
+        return written
 
 
 @dataclass(frozen=True)

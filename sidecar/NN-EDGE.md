@@ -21,6 +21,7 @@ interface is linked only for the components whose type declares it.
     -nn-runtime <dir>       where ONNX Runtime is, else FFRWD_NN_RUNTIME
     -nn-target <provider>   where sessions run, else FFRWD_NN_TARGET; cpu is
                             the default
+    -nn-exclude <provider>  drop a provider from a `gpu` walk, repeatable
 
 `-nn` is spelled like `-m` and validated the same way: a name is letters,
 digits and underscores, and each name may be bound once.
@@ -58,7 +59,20 @@ Windows takes DirectML first. It runs on any Direct3D 12 adapter and needs
 nothing installed, where CUDA needs a CUDA 12 runtime and cuDNN 9 on the
 machine; CUDA is still reached by naming it.
 
-It says in one line why it passed over each provider it did not take:
+`-nn-exclude <provider>` drops a provider from that walk for the whole
+process, before its preflight ever runs: `cuda`, `directml` and `coreml` are
+the providers it can name, and `cpu` is refused, since a process always
+keeps somewhere to run. It is repeatable, and every model a process binds
+shares the one walk -- a compiler binding several models on one process
+passes the union of what each one's pin excludes. A provider named outright
+with `-nn-target` is unaffected: `-nn-exclude` only narrows the `gpu` walk.
+
+    ffrwd-wasm -nn transcribe=whisper.onnx -nn-runtime <dir> \
+      -nn-target gpu -nn-exclude directml \
+      --invoke transcribe.wasm run '{...}'
+
+It says in one line why it passed over each provider it did not take,
+whether preflight ruled it out or `-nn-exclude` did:
 
     [nn] -nn-target gpu: not DIRECTML, no onnxruntime.dll in
     C:\...\1.22.0\win-x64\directml; `ffrwd setup nn` puts the DirectML build there
@@ -70,6 +84,18 @@ slower:
 
     [nn] -nn-target directml was requested but the DIRECTML execution provider
     did not load; yolo runs on the CPU
+
+Every `-nn-exclude` is named once, ahead of the verdict, regardless of the
+walk's outcome:
+
+    [nn] -nn-exclude: directml
+    [nn] execution provider: CUDA
+
+A walk left with only `cpu` because every candidate was excluded says so
+once at startup, naming what excluded them, so a user knows why the run is
+slow without reading the per-candidate notes above it:
+
+    [nn] transcribe runs on cpu: directml excluded by its pin
 
 A spelling that is not a target is refused, since a misspelling would
 otherwise run on the CPU in silence:

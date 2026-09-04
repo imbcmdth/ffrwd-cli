@@ -26,7 +26,7 @@ import pytest
 from sqlglot import exp
 
 from ffrwd import wasm
-from ffrwd.compiler import Compiled, compile_all
+from ffrwd.compiler import Compiled, _nn_models, _pinned_models, compile_all
 from ffrwd.errors import ErrorCode, FfrwdError
 from ffrwd.execute import CHAIN, PIPELINE, PipeEdge, plan_argv, render_plan
 from ffrwd.functions import WasmFunction, package_modules
@@ -39,6 +39,7 @@ from ffrwd.processes import (
     RAWVIDEO,
     AudioFormat,
     FfmpegProcess,
+    ModelBinding,
     ModuleShape,
     PadMeta,
     ProcessPlan,
@@ -46,7 +47,7 @@ from ffrwd.processes import (
     StreamEdge,
     VideoFormat,
 )
-from ffrwd.project import PackageSet, discover
+from ffrwd.project import PackageSet, discover, read_manifest
 from ffrwd.registry import Registry, load_reference
 from ffrwd.split import insert_splits
 from ffrwd.table import render_table
@@ -717,7 +718,89 @@ def test_invoke_of_a_non_nn_module_gets_no_nn_flags(
 
     wasm.invoke(MODULE, "fn", {}, described=_described())
     assert calls == [["ffrwd-wasm", "--invoke", MODULE, "fn", "{}"]]
-    assert "-nn" not in calls[0]
+
+
+def test_nn_args_renders_nn_exclude_as_the_sorted_union_of_every_models_not_on() -> None:
+    """Every model on one process shares the one provider walk, so one
+    model's pin narrows it for the whole process, not for its own binding."""
+    argv = wasm._nn_args(
+        (
+            ModelBinding(name="detect", path="detect.onnx", not_on=("cuda", "directml")),
+            ModelBinding(name="transcribe", path="transcribe.onnx", not_on=("directml",)),
+        ),
+        (),
+    )
+    assert argv == [
+        "-nn-exclude",
+        "cuda",
+        "-nn-exclude",
+        "directml",
+        "-nn",
+        "detect=detect.onnx",
+        "-nn",
+        "transcribe=transcribe.onnx",
+    ]
+
+
+def test_nn_args_with_no_not_on_renders_no_nn_exclude() -> None:
+    argv = wasm._nn_args((ModelBinding(name="detect", path="detect.onnx"),), ())
+    assert "-nn-exclude" not in argv
+    assert argv == ["-nn", "detect=detect.onnx"]
+
+
+def test_compile_time_not_on_comes_from_the_bound_modules_own_pin(tmp_path: Path) -> None:
+    """`_nn_models` finds a hosted module's pin by matching (module path,
+    export) across the package set that names it, and carries what the pin
+    denies onto the binding -- the only place a compile-time ``not_on`` can
+    come from, since the binding itself is built from the file on disk."""
+    root = tmp_path / "pkg"
+    (root / "src").mkdir(parents=True)
+    (root / "src" / "lib.sql").write_text(
+        "CREATE FUNCTION transcribe(v video_stream) RETURNS video_stream\n"
+        "  AS 'transcribe.wasm', 'transcribe' LANGUAGE wasm;\n",
+        encoding="utf-8",
+    )
+    (root / "transcribe.wasm").write_bytes(b"\0asm")
+    (root / "transcribe.onnx").write_bytes(b"")
+    (root / "ffrwd.json").write_text(
+        json.dumps(
+            {
+                "name": "broadcast/whisper",
+                "version": "1.0.0",
+                "lib": {"transcribe": "src/lib.sql"},
+                "models": {
+                    "transcribe": {
+                        "repo": "openai/whisper",
+                        "revision": "v1",
+                        "file": "model.onnx",
+                        "sha256": "a" * 64,
+                        "not_on": ["directml"],
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    package = read_manifest(root / "ffrwd.json")
+    packages = PackageSet(
+        root=tmp_path,
+        packages={package.name: package},
+        versions={package.name: {package.version: package}},
+    )
+    declared = package_modules(package)[0]
+    described = Described(world="ffrwd:av@0.14.0", name="transcribe", nn=True)
+
+    bindings = _nn_models(
+        {declared.module: declared}, {declared.module: described}, packages
+    )
+    assert bindings[declared.module].not_on == ("directml",)
+
+
+def test_pinned_models_is_empty_with_no_package_set() -> None:
+    """A module the compiler binds with no package set in hand -- a script
+    naming a module directly -- has no pin to find, so `not_on` is always
+    empty for it."""
+    assert _pinned_models(None) == {}
 
 
 def test_invoke_of_an_nn_module_refuses_a_missing_model(

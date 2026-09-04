@@ -310,6 +310,13 @@ records it beside the pin, so a package's page can say what installing
 will download; a size that does not arrive is left out and the publish
 carries on.
 
+The graph's own pin may also carry `not_on`, a list of execution
+providers - `cuda`, `directml`, `coreml` - the model's graph cannot
+run on, measured rather than guessed; `ffrwd compile` passes every
+bound model's `not_on` to the sidecar as `-nn-exclude`, narrowing the
+`gpu` walk before it starts. A model of several files carries it on the
+first entry only, the graph itself.
+
 A query calls into an installed package one of two ways, always
 written in full:
 
