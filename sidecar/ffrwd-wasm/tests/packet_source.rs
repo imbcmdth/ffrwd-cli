@@ -1,5 +1,6 @@
 //! Integration tests for the sidecar's packet-source HEAD mode: no `-i`, one
-//! `-f nut` output per catalog track, driven by `source_replay` - a fixture
+//! `-track <index> -f nut` output per track the command reads, driven by
+//! `source_replay` - a fixture
 //! module that hands back a fixed, compiled-in set of coded packets (see
 //! `modules/source-replay/src/lib.rs` for why it is compiled in rather than
 //! read from a file: the wasm sandbox these modules run in has no
@@ -23,7 +24,7 @@ fn sidecar_root() -> PathBuf {
 /// per test binary. `modules/` is a separate cargo workspace with its own
 /// build lock, so this does not deadlock against the `cargo test` run
 /// driving this binary.
-fn module_path() -> PathBuf {
+fn built_module(name: &str) -> PathBuf {
     static BUILT: OnceLock<()> = OnceLock::new();
     BUILT.get_or_init(|| {
         let workspace = sidecar_root().join("modules");
@@ -35,6 +36,8 @@ fn module_path() -> PathBuf {
                 "wasm32-wasip2",
                 "-p",
                 "source-replay",
+                "-p",
+                "source-replay-0130",
             ])
             .current_dir(&workspace)
             .output()
@@ -47,7 +50,20 @@ fn module_path() -> PathBuf {
             String::from_utf8_lossy(&output.stderr)
         );
     });
-    sidecar_root().join("modules/target/wasm32-wasip2/release/source_replay.wasm")
+    sidecar_root()
+        .join("modules/target/wasm32-wasip2/release")
+        .join(format!("{name}.wasm"))
+}
+
+fn module_path() -> PathBuf {
+    built_module("source_replay")
+}
+
+/// The same fixture built against the vendored `worlds/0.13.0`, whose `open`
+/// takes params alone: what a packet source looked like before it was told
+/// which tracks to pull.
+fn older_module_path() -> PathBuf {
+    built_module("source_replay_0130")
 }
 
 struct Run {
@@ -123,6 +139,8 @@ fn a_packet_source_refuses_an_input() {
         "-",
         "-m",
         module.to_str().expect("module path is UTF-8"),
+        "-track",
+        "0",
         "-f",
         "nut",
         "-",
@@ -136,24 +154,59 @@ fn a_packet_source_refuses_an_input() {
 }
 
 #[test]
-fn the_output_count_must_match_the_catalogs_track_count() {
+fn an_output_naming_no_track_is_refused() {
     let module = module_path();
-    let dir = tempdir();
-    let extra = dir.join("extra.nut");
     let run = run_ffrwd_wasm(&[
         "-m",
         module.to_str().expect("module path is UTF-8"),
         "-f",
         "nut",
         "-",
-        "-f",
-        "nut",
-        extra.to_str().expect("temp path is UTF-8"),
     ]);
     assert!(!run.output.status.success());
     assert!(
-        run.stderr.contains("names 1 track") && run.stderr.contains("2 output"),
-        "stderr does not name both counts:\n{}",
+        run.stderr.contains("writes the tracks it is told to") && run.stderr.contains("-track"),
+        "stderr does not say how to name the track:\n{}",
+        run.stderr
+    );
+}
+
+#[test]
+fn a_track_the_catalog_does_not_publish_is_refused() {
+    let module = module_path();
+    let run = run_ffrwd_wasm(&[
+        "-m",
+        module.to_str().expect("module path is UTF-8"),
+        "-track",
+        "1",
+        "-f",
+        "nut",
+        "-",
+    ]);
+    assert!(!run.output.status.success());
+    assert!(
+        run.stderr.contains("track 1") && run.stderr.contains("publishes 1 track"),
+        "stderr does not name the track the source lacks:\n{}",
+        run.stderr
+    );
+}
+
+#[test]
+fn a_packet_source_built_against_an_older_world_is_refused_at_open() {
+    let module = older_module_path();
+    let run = run_ffrwd_wasm(&[
+        "-m",
+        module.to_str().expect("module path is UTF-8"),
+        "-track",
+        "0",
+        "-f",
+        "nut",
+        "-",
+    ]);
+    assert!(!run.output.status.success());
+    assert!(
+        run.stderr.contains("rebuild it against ffrwd:av@0.15.0"),
+        "stderr does not name the world to rebuild against:\n{}",
         run.stderr
     );
 }
@@ -198,10 +251,10 @@ fn probe_prints_the_catalog_a_run_would_open() {
 }
 
 #[test]
-fn probe_and_open_agree_the_source_never_changed_shape() {
-    // `probe` (compile time) and the catalog `run_packet_source`'s `open`
-    // reads (run time) both come from the same `catalog()` in the module,
-    // so the run's own NUT header must match what probe printed.
+fn probe_and_open_agree_on_the_track_the_run_reads() {
+    // `probe` reads the whole catalog at compile time and `open` the tracks
+    // the run named, both off the same track in the module, so the run's own
+    // NUT header must match what probe printed for it.
     let module = module_path();
     let probed = run_ffrwd_wasm(&["--probe", module.to_str().expect("module path is UTF-8")]);
     assert!(probed.output.status.success());
@@ -211,6 +264,8 @@ fn probe_and_open_agree_the_source_never_changed_shape() {
     let run = run_ffrwd_wasm(&[
         "-m",
         module.to_str().expect("module path is UTF-8"),
+        "-track",
+        "0",
         "-f",
         "nut",
         "-",
@@ -237,6 +292,8 @@ fn a_run_writes_back_exactly_the_packets_the_module_published() {
     let run = run_ffrwd_wasm(&[
         "-m",
         module.to_str().expect("module path is UTF-8"),
+        "-track",
+        "0",
         "-f",
         "nut",
         "-",
@@ -283,6 +340,8 @@ fn annotations_have_nothing_to_give_or_take_on_a_packet_source() {
         module.to_str().expect("module path is UTF-8"),
         "-annotations",
         "out",
+        "-track",
+        "0",
         "-f",
         "nut",
         "-",
@@ -308,27 +367,10 @@ fn describe_reports_the_packet_source() {
     let stdout = String::from_utf8(run.stdout).expect("describe prints UTF-8");
     let description: serde_json::Value =
         serde_json::from_str(stdout.trim()).expect("describe prints one JSON object");
-    assert_eq!(description["world"], "ffrwd:av@0.14.0");
+    assert_eq!(description["world"], "ffrwd:av@0.15.0");
     assert_eq!(description["name"], "source_replay");
     assert_eq!(description["source"], true);
     // No frame interface and no packet-sink export alongside it.
     assert!(description.get("window").is_none());
     assert!(description.get("video_codecs").is_none());
-}
-
-/// A fresh temp directory this test owns, cleaned up on drop by the OS's own
-/// temp-directory sweep - these tests write small files, never read them
-/// back from disk, and the crate carries no tempfile dependency to add one
-/// just for this.
-fn tempdir() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "ffrwd-wasm-packet-source-test-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("the clock is past 1970")
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).expect("create a temp directory");
-    dir
 }

@@ -7213,8 +7213,9 @@ class _Lowerer:
                     f"sidecar's {described.world} cannot host one",
                     node,
                     fallback=select,
-                    hint="packet sources arrived with ffrwd:av@0.13.0; upgrade "
-                    "ffrwd, or point at a newer ffrwd-wasm",
+                    hint=f"a packet source is told which tracks to pull from "
+                    f"{WORLDS[-1]} on; upgrade ffrwd, or point at a newer "
+                    "ffrwd-wasm",
                 )
             return described
         if any(fn.name == declared.export for fn in described.functions):

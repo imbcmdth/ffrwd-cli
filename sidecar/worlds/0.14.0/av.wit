@@ -1,4 +1,4 @@
-package ffrwd:av@0.15.0;
+package ffrwd:av@0.14.0;
 
 interface types {
   /// Static description of a module, available without running anything.
@@ -469,11 +469,10 @@ interface packet-sink {
 /// one or more output tracks. Nothing arrives to push a source, so the host
 /// pulls: `next` is called once per batch until it answers none.
 ///
-/// `probe` reads the whole catalog at compile time - every track the source
-/// publishes and whether it ever ends - which is what makes those tracks
-/// known before anything runs. `open` is told which of them the run reads,
-/// and the source subscribes to exactly those: a track nobody asked for is
-/// never pulled off the wire.
+/// `probe` and `open` both read the same catalog - the tracks the source
+/// publishes and whether it ever ends - the first at compile time, the
+/// second at the start of a run. A module whose two catalogs disagree is
+/// refused at run: the source changed shape between compile and run.
 interface packet-source {
   use types.{coded-stream, meta, pad-packets, rendition-meta, stream-info};
 
@@ -496,19 +495,15 @@ interface packet-source {
   describe: func() -> meta;
 
   /// Reads the catalog at compile time: the source connects or opens its
-  /// file and reports every track it would publish, without producing
-  /// packets.
+  /// file and reports what it would publish, without producing packets.
   probe: func(params: string) -> result<catalog, string>;
 
-  /// Opens the source for a run, subscribing to `tracks` alone: indices into
-  /// the catalog `probe` read, distinct, in the order the run wants them.
-  /// The catalog returned is that restriction - one track per index, in that
-  /// order - and it is the order every later call speaks in. An index the
-  /// source does not publish is refused by name.
-  open: func(params: string, tracks: list<u32>) -> result<catalog, string>;
+  /// Opens the source for a run, returning the same catalog shape `probe`
+  /// read.
+  open: func(params: string) -> result<catalog, string>;
 
-  /// One pull: a packet list per track `open` was given, in that order, or
-  /// none once the source has nothing left.
+  /// One pull: a packet list per track in catalog order, or none once the
+  /// source has nothing left.
   next: func() -> result<option<list<pad-packets>>, string>;
 }
 

@@ -1002,7 +1002,7 @@ def test_a_package_qualified_source_call_keeps_its_alias_after_adoption(
         bounded=False,
     )
     described = Described(
-        world="ffrwd:av@0.13.0",
+        world="ffrwd:av@0.15.0",
         name="subscribe",
         params_schema={
             "properties": {

@@ -134,6 +134,7 @@ WORLDS: tuple[str, ...] = (
     "ffrwd:av@0.12.0",
     "ffrwd:av@0.13.0",
     "ffrwd:av@0.14.0",
+    "ffrwd:av@0.15.0",
 )
 
 # The world a module scaffolded today is built against: the newest of those,
@@ -185,8 +186,10 @@ _AUDIO_ENCODER_CODECS: Mapping[str, str] = {
 # The first world whose sidecar hosts a packet sink.
 _PACKET_SINK_WORLD = "ffrwd:av@0.10.0"
 
-# The first world whose sidecar hosts a packet source.
-_PACKET_SOURCE_WORLD = "ffrwd:av@0.13.0"
+# The world whose packet source this sidecar hosts. `open` takes the tracks
+# the plan mapped from 0.15.0 on, and no older spelling is adapted: a source
+# built against an earlier world is rebuilt.
+_PACKET_SOURCE_WORLD = "ffrwd:av@0.15.0"
 
 # The first world whose sidecar hosts a rows module.
 _ROWS_MODULE_WORLD = "ffrwd:av@0.14.0"
@@ -274,7 +277,8 @@ _ROWS_FROM_FLAG = "-rows-from"
 _ROWS_FLAG = "-rows"
 
 # How one of a packet source's outputs is told which track of the module's
-# catalog it carries, 0-based. The sidecar drops the tracks none names.
+# catalog it carries, 0-based. The tracks the outputs name are what the
+# source subscribes to.
 _TRACK_FLAG = "-track"
 
 # How a model file is bound to the name the module loads it by, and what the
@@ -1308,7 +1312,7 @@ def _stream_output(process: SidecarProcess, writes: Sequence[str] = ()) -> list[
     each in catalog order -- a printed command with none given still numbers
     them the way a single output's own ``pipe:1`` already does. The selector
     is what lets a source write fewer tracks than its catalog holds: the
-    sidecar routes the named ones and drops the rest.
+    sidecar subscribes to the named ones and to nothing else.
     """
     if process.sink:
         return ["-f", _NULL_FORMAT, "-"]

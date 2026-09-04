@@ -2223,43 +2223,25 @@ fn settle_track(
     Ok(())
 }
 
-/// Which catalog track each output carries, in output order.
+/// Which catalog track each output carries, in output order: what `open` is
+/// told to subscribe to.
 ///
-/// Every output names its track with `-track`, and the outputs are then the
-/// tracks the caller wants: fewer than the catalog holds is ordinary, and the
-/// rest are dropped. An index past the catalog, or one named twice, is
-/// refused. Outputs that name NO track are the older spelling and must match
-/// the catalog one for one, in catalog order. Mixing the two is refused.
-fn select_source_tracks(outputs: &[OutputSpec], tracks: usize, module: &str) -> Result<Vec<usize>> {
-    let named = outputs.iter().filter(|o| o.track.is_some()).count();
-    if named == 0 {
-        if outputs.len() != tracks {
-            bail!(
-                "{module}'s catalog names {} track(s) and this command was given {} output(s); \
-                 an output that writes fewer says which track each one carries, with -track",
-                tracks,
-                outputs.len()
-            );
-        }
-        return Ok((0..tracks).collect());
-    }
-    if named != outputs.len() {
-        bail!(
-            "{module}: {named} of {} outputs name a track with -track; either all of them do \
-             or none of them do",
-            outputs.len()
-        );
-    }
-    let mut selected: Vec<usize> = Vec::with_capacity(outputs.len());
+/// Every output names its track with `-track`, so this is read off the command
+/// line before the source is opened at all. An output naming none is refused -
+/// a source is always told what to pull - and so is a track named twice. An
+/// index the source does not publish is the source's own to refuse, since the
+/// catalog is not known here.
+fn source_tracks(outputs: &[OutputSpec], module: &str) -> Result<Vec<u32>> {
+    let mut selected: Vec<u32> = Vec::with_capacity(outputs.len());
     for output in outputs {
-        let index = output.track.unwrap_or_default();
-        if index >= tracks {
+        let Some(index) = output.track else {
             bail!(
-                "{}: -track {index} is past the end of {module}'s catalog, which names {tracks} \
-                 track(s)",
+                "{}: {module} is a packet source and writes the tracks it is told to; say which \
+                 track this output carries, with -track",
                 output.spelling
             );
-        }
+        };
+        let index = u32::try_from(index).unwrap_or(u32::MAX);
         if selected.contains(&index) {
             bail!(
                 "{}: -track {index} is already written by an earlier output; each track is \
@@ -2273,7 +2255,10 @@ fn select_source_tracks(outputs: &[OutputSpec], tracks: usize, module: &str) -> 
 }
 
 /// A packet source rides alone: no `-i`, one `-f nut` output per track the
-/// command asked for. Packets arrive in decode order already -
+/// command asked for, each naming its track with `-track`. Those indices are
+/// what `open` subscribes to, so output i carries the opened catalog's track
+/// i and nothing arrives that nobody reads. Packets arrive in decode order
+/// already -
 /// `PacketSource::next`'s own contract - so nothing here reorders them; the
 /// only work is settling each track's `decode_delay` before its output's
 /// header is written, since the wit `coded-stream` a source publishes
@@ -2312,15 +2297,9 @@ fn run_packet_source(args: &Args, module: &str, params: &str) -> Result<()> {
         }
     }
 
-    let (mut source, catalog) = runtime::PacketSource::open(module, params)
+    let selected = source_tracks(&args.outputs, module)?;
+    let (mut source, catalog) = runtime::PacketSource::open(module, params, &selected)
         .with_context(|| format!("opening module {module}"))?;
-
-    let selected = select_source_tracks(&args.outputs, catalog.tracks.len(), module)?;
-    // Which output each catalog track goes to, None for one nobody asked for.
-    let mut slot_of: Vec<Option<usize>> = vec![None; catalog.tracks.len()];
-    for (slot, &track) in selected.iter().enumerate() {
-        slot_of[track] = Some(slot);
-    }
 
     let mut pending: Vec<Vec<runtime::Packet>> = selected.iter().map(|_| Vec::new()).collect();
     let mut muxers: Vec<Option<FrameOutput>> = selected.iter().map(|_| None).collect();
@@ -2329,13 +2308,7 @@ fn run_packet_source(args: &Args, module: &str, params: &str) -> Result<()> {
         .next()
         .with_context(|| format!("{}: pulling packets", source.name()))?
     {
-        for (index, pad) in pads.into_iter().enumerate() {
-            // The module answers with every catalog track, so a track no
-            // output asked for is dropped here. Subscribing to the wanted
-            // tracks alone is a change to the wit interface.
-            let Some(slot) = slot_of.get(index).copied().flatten() else {
-                continue;
-            };
+        for (slot, pad) in pads.into_iter().enumerate() {
             for packet in pad.packets {
                 if let Some(muxer) = muxers[slot].as_mut() {
                     write_coded_packet(muxer, &packet)?;
@@ -2347,7 +2320,7 @@ fn run_packet_source(args: &Args, module: &str, params: &str) -> Result<()> {
                     let decode_delay = (pending[slot].len() - 1) as u64;
                     settle_track(
                         decode_delay,
-                        &catalog.tracks[index],
+                        &catalog.tracks[slot],
                         &args.outputs[slot],
                         &mut pending[slot],
                         &mut muxers[slot],
@@ -2357,12 +2330,12 @@ fn run_packet_source(args: &Args, module: &str, params: &str) -> Result<()> {
         }
     }
 
-    for (slot, &index) in selected.iter().enumerate() {
+    for slot in 0..selected.len() {
         if muxers[slot].is_none() {
             let decode_delay = pending[slot].len() as u64;
             settle_track(
                 decode_delay,
-                &catalog.tracks[index],
+                &catalog.tracks[slot],
                 &args.outputs[slot],
                 &mut pending[slot],
                 &mut muxers[slot],
@@ -3629,7 +3602,7 @@ mod probe_args_tests {
 
 #[cfg(test)]
 mod source_track_tests {
-    use super::{parse_args, select_source_tracks, OutputKind, OutputPath, OutputSpec};
+    use super::{parse_args, source_tracks, OutputKind, OutputPath, OutputSpec};
 
     fn strings(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()
@@ -3719,66 +3692,36 @@ mod source_track_tests {
     }
 
     #[test]
-    fn fewer_outputs_than_tracks_is_accepted_when_each_names_its_track() {
+    fn the_outputs_tracks_are_what_the_source_is_told_to_pull() {
         let outputs = vec![output(Some(1))];
-        assert_eq!(
-            select_source_tracks(&outputs, 3, "s.wasm").expect("selects"),
-            vec![1]
-        );
+        assert_eq!(source_tracks(&outputs, "s.wasm").expect("selects"), vec![1]);
     }
 
     #[test]
-    fn selected_tracks_are_taken_in_the_order_the_outputs_name_them() {
+    fn tracks_are_taken_in_the_order_the_outputs_name_them() {
         let outputs = vec![output(Some(2)), output(Some(0))];
         assert_eq!(
-            select_source_tracks(&outputs, 3, "s.wasm").expect("selects"),
+            source_tracks(&outputs, "s.wasm").expect("selects"),
             vec![2, 0]
         );
     }
 
     #[test]
-    fn fewer_outputs_than_tracks_naming_none_is_still_refused() {
-        let outputs = vec![output(None)];
-        let err = select_source_tracks(&outputs, 3, "s.wasm")
-            .expect_err("a bare output count must match the catalog")
+    fn an_output_naming_no_track_is_refused() {
+        let outputs = vec![output(Some(0)), output(None)];
+        let err = source_tracks(&outputs, "s.wasm")
+            .expect_err("a source is told what to pull")
             .to_string();
-        assert!(err.contains("catalog names 3 track(s)"), "{err}");
+        assert!(err.contains("writes the tracks it is told to"), "{err}");
         assert!(err.contains("-track"), "{err}");
-    }
-
-    #[test]
-    fn one_output_per_track_naming_none_is_the_catalog_in_order() {
-        let outputs = vec![output(None), output(None)];
-        assert_eq!(
-            select_source_tracks(&outputs, 2, "s.wasm").expect("selects"),
-            vec![0, 1]
-        );
-    }
-
-    #[test]
-    fn a_selector_past_the_end_of_the_catalog_is_refused() {
-        let outputs = vec![output(Some(3))];
-        let err = select_source_tracks(&outputs, 3, "s.wasm")
-            .expect_err("track 3 of a three-track catalog does not exist")
-            .to_string();
-        assert!(err.contains("past the end of s.wasm's catalog"), "{err}");
     }
 
     #[test]
     fn the_same_track_named_twice_is_refused() {
         let outputs = vec![output(Some(0)), output(Some(0))];
-        let err = select_source_tracks(&outputs, 2, "s.wasm")
+        let err = source_tracks(&outputs, "s.wasm")
             .expect_err("a track is written once")
             .to_string();
         assert!(err.contains("already written"), "{err}");
-    }
-
-    #[test]
-    fn some_outputs_naming_a_track_and_some_not_is_refused() {
-        let outputs = vec![output(Some(0)), output(None)];
-        let err = select_source_tracks(&outputs, 2, "s.wasm")
-            .expect_err("the two spellings do not mix")
-            .to_string();
-        assert!(err.contains("either all of them do"), "{err}");
     }
 }

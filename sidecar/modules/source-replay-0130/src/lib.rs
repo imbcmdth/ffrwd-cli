@@ -1,11 +1,10 @@
 //! `source_replay`, built against the vendored `ffrwd:av@0.13.0` world
-//! instead of the current one: `packet-source` arrived in 0.13.0 unchanged
-//! from how 0.14.0 still shapes it (see the diff between
-//! `worlds/0.13.0/av.wit` and `wit/av.wit`, which does not touch
-//! `packet-source`), so this crate is `source-replay` line for line, its
-//! `wit_bindgen::generate!` pointed at the older world instead. It exists so
-//! the runtime's 0.13.0 `PacketSourceInstance` arm is proven against a
-//! module actually built that way, not just against the current one.
+//! instead of the current one: its `open` takes params alone, the shape
+//! every packet source had before 0.15.0 told a source which tracks to pull.
+//! It is `source-replay` line for line, its `wit_bindgen::generate!` pointed
+//! at the older world instead, and it exists so the host's refusal of a
+//! packet source built against an older world is proven against a module
+//! actually built that way.
 //!
 //! The catalog and the seven packets it replays are `source-replay`'s own -
 //! see `modules/source-replay/src/lib.rs` for what they are and why they are

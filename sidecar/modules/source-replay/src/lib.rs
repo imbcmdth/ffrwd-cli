@@ -59,28 +59,53 @@ fn coded_stream() -> CodedStream {
     }
 }
 
+/// The one track this module publishes, index 0 of its catalog.
+fn track() -> SourceTrack {
+    SourceTrack {
+        coded: coded_stream(),
+        info: StreamInfo {
+            index: 0,
+            kind: "video".to_string(),
+            codec: "h264".to_string(),
+            duration: None,
+            tags: vec![],
+            time_base: Rational { num: 1, den: 25 },
+        },
+        row: 0,
+        rendition: RenditionMeta {
+            name: None,
+            bandwidth: None,
+            codecs: None,
+            language: None,
+        },
+    }
+}
+
+/// The whole catalog, which `probe` reports.
 fn catalog() -> Catalog {
     Catalog {
-        tracks: vec![SourceTrack {
-            coded: coded_stream(),
-            info: StreamInfo {
-                index: 0,
-                kind: "video".to_string(),
-                codec: "h264".to_string(),
-                duration: None,
-                tags: vec![],
-                time_base: Rational { num: 1, den: 25 },
-            },
-            row: 0,
-            rendition: RenditionMeta {
-                name: None,
-                bandwidth: None,
-                codecs: None,
-                language: None,
-            },
-        }],
+        tracks: vec![track()],
         bounded: true,
     }
+}
+
+/// The catalog restricted to `tracks`, in that order. This module publishes
+/// one track, so 0 is the only index it has; anything else is refused by
+/// name.
+fn subscribed(tracks: &[u32]) -> Result<Catalog, String> {
+    let mut subscribed = Vec::with_capacity(tracks.len());
+    for index in tracks {
+        if *index != 0 {
+            return Err(format!(
+                "source_replay publishes 1 track, so track {index} is not one of them"
+            ));
+        }
+        subscribed.push(track());
+    }
+    Ok(Catalog {
+        tracks: subscribed,
+        bounded: true,
+    })
 }
 
 /// `source_replay` reads no parameters; anything but empty is refused by
@@ -95,6 +120,9 @@ fn validate_params(params: &str) -> Result<(), String> {
 thread_local! {
     /// The index into `PACKET_TABLE` the next `next()` call hands out.
     static CURSOR: Cell<usize> = const { Cell::new(0) };
+
+    /// How many pads `next()` answers on: one per track `open` was given.
+    static PADS: Cell<usize> = const { Cell::new(0) };
 }
 
 struct SourceReplay;
@@ -119,13 +147,16 @@ impl Guest for SourceReplay {
         Ok(catalog())
     }
 
-    fn open(params: String) -> Result<Catalog, String> {
+    fn open(params: String, tracks: Vec<u32>) -> Result<Catalog, String> {
         validate_params(&params)?;
+        let subscribed = subscribed(&tracks)?;
         CURSOR.with(|c| c.set(0));
-        Ok(catalog())
+        PADS.with(|c| c.set(subscribed.tracks.len()));
+        Ok(subscribed)
     }
 
     fn next() -> Result<Option<Vec<exports::ffrwd::av::packet_source::PadPackets>>, String> {
+        let pads = PADS.with(|c| c.get());
         CURSOR.with(|c| {
             let index = c.get();
             if index >= PACKET_TABLE.len() {
@@ -140,9 +171,15 @@ impl Guest for SourceReplay {
                 keyframe,
                 data: packet_bytes(index).to_vec(),
             };
-            Ok(Some(vec![exports::ffrwd::av::packet_source::PadPackets {
-                packets: vec![packet],
-            }]))
+            // One pad per track `open` was given, in that order - which for
+            // this module is the same track repeated.
+            Ok(Some(
+                (0..pads)
+                    .map(|_| exports::ffrwd::av::packet_source::PadPackets {
+                        packets: vec![packet.clone()],
+                    })
+                    .collect(),
+            ))
         })
     }
 }
@@ -151,7 +188,30 @@ export!(SourceReplay);
 
 #[cfg(test)]
 mod tests {
-    use super::{generated::PACKET_LENS, packet_bytes, PACKET_TABLE};
+    use super::{generated::PACKET_LENS, packet_bytes, subscribed, PACKET_TABLE};
+
+    #[test]
+    fn opening_the_one_track_answers_a_catalog_of_it() {
+        let catalog = subscribed(&[0]).expect("track 0 is the one this module publishes");
+        assert_eq!(catalog.tracks.len(), 1);
+        assert_eq!(catalog.tracks[0].coded.codec, "h264");
+        assert!(catalog.bounded);
+    }
+
+    #[test]
+    fn opening_a_track_this_module_does_not_publish_is_refused_by_name() {
+        let err = subscribed(&[1]).expect_err("this module publishes one track");
+        assert!(err.contains("track 1"), "{err}");
+        assert!(err.contains("publishes 1 track"), "{err}");
+    }
+
+    #[test]
+    fn opening_no_track_answers_an_empty_catalog() {
+        assert!(subscribed(&[])
+            .expect("nothing is asked for")
+            .tracks
+            .is_empty());
+    }
 
     #[test]
     fn the_leading_none_dts_count_is_the_decode_delay_the_stream_needs() {

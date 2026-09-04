@@ -4383,7 +4383,7 @@ def test_a_sources_own_import_is_granted_through_effect_grants() -> None:
     describe payload the same way it reads a stream module's."""
     res = _resolved(SOURCE_QUERY)
     declared = next(iter(res.wasm.values()))
-    described = Described(world="ffrwd:av@0.13.0", name="subscribe", udp=True)
+    described = Described(world="ffrwd:av@0.15.0", name="subscribe", udp=True)
     grants = _effect_grants(_source_wasm(res), {declared.module: described})
     assert grants == {SOURCE_MODULE: ("udp",)}
 
@@ -4391,7 +4391,7 @@ def test_a_sources_own_import_is_granted_through_effect_grants() -> None:
 def test_a_source_needing_no_effect_is_granted_none() -> None:
     res = _resolved(SOURCE_QUERY)
     declared = next(iter(res.wasm.values()))
-    described = Described(world="ffrwd:av@0.13.0", name="subscribe")
+    described = Described(world="ffrwd:av@0.15.0", name="subscribe")
     grants = _effect_grants(_source_wasm(res), {declared.module: described})
     assert grants == {}
 
@@ -4768,23 +4768,24 @@ def test_a_bounded_catalog_is_not_live(monkeypatch: pytest.MonkeyPatch) -> None:
     assert wasm.catalog_as_probe("src", catalog).live is False
 
 
-def test_the_worlds_hosting_packet_sources_start_at_0_13_0() -> None:
-    assert "ffrwd:av@0.13.0" in wasm.WORLDS
-    assert wasm.hosts_packet_source("ffrwd:av@0.13.0")
-    assert not wasm.hosts_packet_source("ffrwd:av@0.12.0")
+def test_only_the_world_that_tells_a_source_what_to_pull_hosts_one() -> None:
+    assert "ffrwd:av@0.15.0" in wasm.WORLDS
+    assert wasm.hosts_packet_source("ffrwd:av@0.15.0")
+    assert not wasm.hosts_packet_source("ffrwd:av@0.14.0")
+    assert not wasm.hosts_packet_source("ffrwd:av@0.13.0")
     assert not wasm.hosts_packet_source("ffrwd:av@9.9.9")
 
 
 def test_the_source_marker_reads_off_the_describe_payload() -> None:
     described = wasm._described(
-        PACKET_SOURCE_MODULE, {"world": "ffrwd:av@0.13.0", "name": "s", "source": True}
+        PACKET_SOURCE_MODULE, {"world": "ffrwd:av@0.15.0", "name": "s", "source": True}
     )
     assert described.source is True
 
 
 def test_an_absent_source_key_is_not_a_source() -> None:
     described = wasm._described(
-        PACKET_SOURCE_MODULE, {"world": "ffrwd:av@0.13.0", "name": "s"}
+        PACKET_SOURCE_MODULE, {"world": "ffrwd:av@0.15.0", "name": "s"}
     )
     assert described.source is False
 

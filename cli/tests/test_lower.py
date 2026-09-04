@@ -13672,8 +13672,8 @@ def test_a_non_packet_source_module_named_in_from_is_refused() -> None:
 
 
 def test_a_module_source_on_a_pre_packet_source_world_is_refused() -> None:
-    """A module built against a world before packet sources arrived (0.13.0)
-    cannot be hosted as one, named by the world it targets."""
+    """A sidecar whose world does not tell a source which tracks to pull
+    cannot host one, named by the world it targets."""
     declared = _source_function()
     described = _source_described(declared, world="ffrwd:av@0.9.0")
     err = _reject_source(

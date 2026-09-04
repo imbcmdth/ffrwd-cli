@@ -282,7 +282,7 @@ fn describe_reports_the_rows_kind_and_both_schemas() {
     let stdout = String::from_utf8(run.stdout).expect("describe prints UTF-8");
     let description: serde_json::Value =
         serde_json::from_str(stdout.trim()).expect("describe prints one JSON object");
-    assert_eq!(description["world"], "ffrwd:av@0.14.0");
+    assert_eq!(description["world"], "ffrwd:av@0.15.0");
     assert_eq!(description["name"], "fauxlate");
     assert_eq!(description["rows_module"], true);
     let output_schema = &description["rows_schema"];

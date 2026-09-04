@@ -4,10 +4,10 @@
 //!
 //! `source_replay` is built twice - once against the current world, once
 //! against the vendored `worlds/0.13.0`, as `source-replay-0130` (see
-//! `modules/source-replay-0130/src/lib.rs`) - to prove the runtime's
-//! `PacketSourceInstance::W0130` arm against a module actually shaped that
-//! way, not just against the current one. Both builds replay the same seven
-//! packets, so a run through either must agree.
+//! `modules/source-replay-0130/src/lib.rs`), whose `open` takes params
+//! alone. The older build is here to be refused: a packet source is told
+//! which tracks to pull, and the shape that cannot be told is rebuilt rather
+//! than adapted.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -57,9 +57,8 @@ fn module_path(name: &str) -> PathBuf {
 }
 
 /// `source_replay`'s own packets, mirrored from
-/// `modules/source-replay/src/lib.rs` (and replayed identically by
-/// `source-replay-0130`). Pinned from the module's own description, the same
-/// way `ffrwd-wasm/tests/packet_source.rs` pins it.
+/// `modules/source-replay/src/lib.rs`. Pinned from the module's own
+/// description, the same way `ffrwd-wasm/tests/packet_source.rs` pins it.
 const EXPECTED: &[(i64, Option<i64>, bool)] = &[
     (0, None, true),
     (3, None, false),
@@ -76,7 +75,7 @@ const EXPECTED_EXTRADATA: &[u8] = &[
     0x68, 0xef, 0x8f, 0x2c, 0x8b,
 ];
 
-/// `RAW` is the module's own checked-in fixture, shared by both builds - see
+/// `RAW` is the module's own checked-in fixture - see
 /// `ffrwd-wasm/tests/packet_source.rs` for why the exact bytes are read back
 /// rather than re-typed.
 const RAW: &[u8] = include_bytes!("../../modules/source-replay/src/generated/packets.bin");
@@ -133,14 +132,39 @@ fn assert_catalog(catalog: &Catalog) {
 }
 
 #[test]
-fn a_module_built_against_0130_still_opens_and_publishes_the_same_catalog() {
+fn a_packet_source_built_against_an_older_world_is_refused_with_the_world_to_rebuild_against() {
     let module = module_path("source_replay_0130");
     let module_str = module.to_str().expect("module path is valid UTF-8");
 
-    let described = describe_packet_source(module_str).expect("describing source_replay_0130");
-    assert_eq!(described.world, "0.13.0");
+    let err = describe_packet_source(module_str)
+        .expect_err("0.13.0's open is not told which tracks to pull");
+    let text = format!("{err:#}");
+    assert!(text.contains("ffrwd:av/packet-source@0.13.0"), "{text}");
+    assert!(
+        text.contains("rebuild it against ffrwd:av@0.15.0"),
+        "{text}"
+    );
 
-    let (source, catalog) = PacketSource::open(module_str, "").expect("opening source_replay_0130");
+    let Err(err) = PacketSource::open(module_str, "", &[0]) else {
+        panic!("the same refusal is expected at open");
+    };
+    let text = err.to_string();
+    assert!(
+        text.contains("rebuild it against ffrwd:av@0.15.0"),
+        "{text}"
+    );
+}
+
+#[test]
+fn the_current_build_opens_the_one_track_it_was_told_to_pull() {
+    let module = module_path("source_replay");
+    let module_str = module.to_str().expect("module path is valid UTF-8");
+
+    let described = describe_packet_source(module_str).expect("describing source_replay");
+    assert_eq!(described.world, "0.15.0");
+
+    let (source, catalog) =
+        PacketSource::open(module_str, "", &[0]).expect("opening source_replay");
     assert_catalog(&catalog);
 
     let got = drain(source);
@@ -160,33 +184,12 @@ fn a_module_built_against_0130_still_opens_and_publishes_the_same_catalog() {
 }
 
 #[test]
-fn the_0130_build_and_the_current_build_agree_on_every_packet() {
-    let module_0140 = module_path("source_replay");
-    let module_0130 = module_path("source_replay_0130");
-
-    let described_0140 =
-        describe_packet_source(module_0140.to_str().unwrap()).expect("describing source_replay");
-    let described_0130 = describe_packet_source(module_0130.to_str().unwrap())
-        .expect("describing source_replay_0130");
-    assert_eq!(described_0140.world, "0.14.0");
-    assert_eq!(described_0130.world, "0.13.0");
-
-    let (source_0140, catalog_0140) =
-        PacketSource::open(module_0140.to_str().unwrap(), "").expect("opening source_replay");
-    let (source_0130, catalog_0130) =
-        PacketSource::open(module_0130.to_str().unwrap(), "").expect("opening source_replay_0130");
-
-    assert_catalog(&catalog_0140);
-    assert_catalog(&catalog_0130);
-    assert_eq!(
-        catalog_0140.tracks[0].stream.codec,
-        catalog_0130.tracks[0].stream.codec
-    );
-
-    let got_0140 = drain(source_0140);
-    let got_0130 = drain(source_0130);
-    assert_eq!(
-        got_0140, got_0130,
-        "a module built against 0.13.0 must replay the same packets as the current build"
-    );
+fn a_track_the_source_does_not_publish_is_refused_by_the_source_itself() {
+    let module = module_path("source_replay");
+    let Err(err) = PacketSource::open(module.to_str().unwrap(), "", &[1]) else {
+        panic!("source_replay publishes one track, so track 1 is not one of them");
+    };
+    let text = err.to_string();
+    assert!(text.contains("track 1"), "{text}");
+    assert!(text.contains("publishes 1 track"), "{text}");
 }
