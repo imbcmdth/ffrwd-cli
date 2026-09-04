@@ -4326,7 +4326,20 @@ def test_a_manifest_declaring_none_of_them_carries_none(tmp_path: Path) -> None:
         package.capabilities,
         package.engines,
         dict(package.models),
-    ) == ((), None, None, (), None, {})
+        package.test,
+    ) == ((), None, None, (), None, {}, "")
+
+
+def test_a_declared_test_command_is_read(tmp_path: Path) -> None:
+    manifest = _project(
+        tmp_path, files={"src/tracks.sql": QUIETER}, manifest={"test": "cargo test --workspace"}
+    )
+    assert read_manifest(manifest).test == "cargo test --workspace"
+
+
+def test_a_blank_test_command_is_the_same_as_absent(tmp_path: Path) -> None:
+    manifest = _project(tmp_path, files={"src/tracks.sql": QUIETER}, manifest={"test": "   "})
+    assert read_manifest(manifest).test == ""
 
 
 @pytest.mark.parametrize("scheme", ["http", "https"])
@@ -4379,6 +4392,10 @@ def test_a_blank_homepage_is_the_same_as_absent(tmp_path: Path) -> None:
         ({"ffrwd": ""}, '"ffrwd" must be a non-empty string'),
         ({"ffrwd": ">=0.9 or whatever you like"}, "is not a version range"),
         ({"ffrwd": ">" * 65}, '"ffrwd" is longer than 64 characters'),
+        ({"test": 1}, '"test" must be a string'),
+        ({"test": "cargo test\ncargo publish"}, "must be one line"),
+        ({"test": "cargo test\rcargo publish"}, "must be one line"),
+        ({"test": "t" * 501}, '"test" is longer than 500 characters'),
         ({"models": {"Quieter": dict(_MODEL)}}, "model name 'Quieter' is not a plain identifier"),
         ({"models": {"quieter": "model.onnx"}}, "model 'quieter' must be a JSON object"),
         (

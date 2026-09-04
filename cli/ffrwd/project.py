@@ -201,6 +201,7 @@ _KNOWN = frozenset(
         "models",
         "capabilities",
         "private",
+        "test",
     }
 )
 
@@ -234,6 +235,11 @@ _MAX_LICENSE_LENGTH = 64
 # only; trimmed, and an empty result is the same as the key never having been
 # written at all.
 _MAX_HOMEPAGE_LENGTH = 300
+
+# "test" is the command `ffrwd publish` runs instead of its own recipe-compile
+# check, when the manifest declares one. One line, trimmed; empty is the same
+# as the key never having been written at all -- the same as "homepage".
+_MAX_TEST_LENGTH = 500
 
 # One model file on the hub: a `<owner>/<name>` repository, one revision --
 # a branch, a tag or a commit -- and one file inside it, each half checked
@@ -306,6 +312,9 @@ _MODELS_HINT = (
     '{"depth": {"repo": "<owner>/<name>", "revision": "<branch, tag or commit>", '
     '"file": "model.onnx", "sha256": "<64 hex>"}}; a model of several files is a '
     "list of those, the graph first"
+)
+_TEST_HINT = (
+    '"test" is one line: the command `ffrwd publish` runs instead of compiling the recipes'
 )
 
 
@@ -413,6 +422,10 @@ class Package:
     compile's: they are read, validated and carried, and nothing here acts on
     them.
 
+    `test` is the command the manifest's ``test`` key declares, empty when it
+    declares none: what ``ffrwd publish`` runs instead of its own
+    recipe-compile check, on `Package`'s own author's word, unrun here.
+
     `linked` marks a package read straight out of a working directory rather
     than out of the store. Its files are whatever they are right now, so no
     digest pins them and no lockfile makes a build using it reproducible.
@@ -432,6 +445,7 @@ class Package:
     engines: str | None = None
     models: Mapping[str, tuple[ModelPin, ...]] = field(default_factory=dict)
     private: bool = False
+    test: str = ""
     # Set only where the manifest wrote a plain string: the one member that
     # answers to the package's own name.
     root_export: str | None = None
@@ -1095,6 +1109,39 @@ def _models(data: dict[str, object], path: Path, text: str) -> dict[str, tuple[M
     return models
 
 
+def _test(data: dict[str, object], path: Path, text: str) -> str:
+    """The command ``test`` declares, empty when the manifest declares none.
+
+    Trimmed; empty after trimming reads as though the key were never written,
+    the same as ``homepage``. One line: a value spanning several is refused,
+    since a shell run against it would take only the first.
+    """
+    if "test" not in data:
+        return ""
+    at = _key_line(text, "test")
+    written = data["test"]
+    if not isinstance(written, str):
+        raise _reject(path, '"test" must be a string', line=at, hint=_TEST_HINT)
+    trimmed = written.strip()
+    if not trimmed:
+        return ""
+    if len(trimmed) > _MAX_TEST_LENGTH:
+        raise _reject(
+            path,
+            f'"test" is longer than {_MAX_TEST_LENGTH} characters',
+            line=at,
+            hint=_TEST_HINT,
+        )
+    if "\n" in trimmed or "\r" in trimmed:
+        raise _reject(
+            path,
+            f'"test" {trimmed!r} must be one line: a shell would run only the first',
+            line=at,
+            hint=_TEST_HINT,
+        )
+    return trimmed
+
+
 def read_manifest(path: Path) -> Package:
     """Parse and validate one ``ffrwd.json`` into the package it declares.
 
@@ -1155,6 +1202,7 @@ def read_manifest(path: Path) -> Package:
         engines=_engines(data, path, text),
         models=_models(data, path, text),
         private=_private(data, path, text),
+        test=_test(data, path, text),
     )
 
 

@@ -96,6 +96,11 @@
       "type": "boolean",
       "description": "true publishes each version private: installable with a token from the namespace, off the public index. A version's visibility never changes after publish.",
       "default": false
+    },
+    "test": {
+      "type": "string",
+      "description": "The command ffrwd publish runs instead of compiling the recipes. One line.",
+      "maxLength": 500
     }
   },
   "$defs": {
