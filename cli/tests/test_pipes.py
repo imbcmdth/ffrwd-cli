@@ -93,6 +93,61 @@ def test_a_read_hands_back_what_has_arrived_rather_than_a_full_chunk(
     pipe.close()
 
 
+@pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="pins the Windows connect-at-creation ordering; POSIX opens a FIFO instead",
+)
+def test_a_windows_pipe_starts_connecting_as_soon_as_it_is_made(tmp_path: Path) -> None:
+    """The connect begins at `create`, not at the first `wait()`.
+
+    A plan makes every named pipe before spawning anything (`plan_argv` runs
+    ahead of `execute_plan`'s stage loop), but the SERVER used to only start
+    listening once a pump thread got around to calling `wait()` -- after every
+    member of the stage was already spawned. A client fast enough to open and
+    operate on the path before that pump thread ran found a pipe nobody had
+    told to accept a connection yet. Starting the connect in `create` itself
+    closes that window: `wait()` now only waits for a connect already under
+    way, so a fast client is never ahead of it.
+    """
+    pipe = pipes.create(tmp_path, "eager", writing=True)
+    try:
+        assert pipe._connector.is_alive()  # type: ignore[attr-defined]
+    finally:
+        pipe.close()
+
+
+def test_a_wait_with_no_client_times_out_at_its_deadline(tmp_path: Path) -> None:
+    """Nobody ever opens the path: `wait` gives up at `deadline` rather than
+    hanging on a connect that has nothing to wait for."""
+    pipe = pipes.create(tmp_path, "lonely", writing=False)
+    try:
+        with pytest.raises(TimeoutError):
+            pipe.wait(time.monotonic() + 0.2)
+    finally:
+        pipe.close()
+
+
+def test_a_close_unblocks_a_wait_that_has_no_client_coming(tmp_path: Path) -> None:
+    """A stage tears down mid-run: `close`, called from another thread, ends
+    a `wait` still parked for a client that was never going to arrive."""
+    pipe = pipes.create(tmp_path, "abandoned", writing=False)
+    result: dict[str, object] = {}
+
+    def block() -> None:
+        try:
+            pipe.wait(time.monotonic() + 30)
+        except Exception as err:  # noqa: BLE001 -- the assertion reports it whole
+            result["error"] = repr(err)
+
+    waiter = threading.Thread(target=block, daemon=True)
+    waiter.start()
+    time.sleep(0.2)
+    pipe.close()
+    waiter.join(10)
+    assert not waiter.is_alive()
+    assert isinstance(result.get("error"), str) and "BrokenPipeError" in result["error"]
+
+
 def test_a_writing_end_hands_its_bytes_over_without_being_flushed(
     tmp_path: Path,
 ) -> None:

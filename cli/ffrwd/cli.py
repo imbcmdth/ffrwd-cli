@@ -194,7 +194,7 @@ from .compiler import (
 from .console import Console
 from .emit import Emitted, build_ffmpeg_commands
 from .errors import ErrorCode, FfrwdError
-from .execute import DEFAULT_TIMEOUT, execute, execute_plan, render_plan
+from .execute import DEFAULT_TIMEOUT, PlanResult, execute, execute_plan, render_plan
 from .functions import Signature, package_signatures
 from .ir import Graph, SinkUnit
 from .probe import is_url
@@ -1670,6 +1670,7 @@ def _run_plan(
         players=players,
         show_only=args.show_only,
     )
+    _debug_dump_stderr(result)
     if result.overflow is not None:
         print(f"error: {result.overflow}", file=sys.stderr)
         return 1
@@ -1686,6 +1687,25 @@ def _run_plan(
             )
         return result.exit_code
     return 0
+
+
+def _debug_dump_stderr(result: PlanResult) -> None:
+    """Write every member's full stderr to FFRWD_DUMP_STDERR, win or lose.
+
+    Diagnostic only: `_run_plan` otherwise prints stderr for a failing run's
+    members, so a pipe lifecycle bug that leaves a run's exit code at 0 (an
+    empty output track, say) has nowhere else to show its evidence.
+    """
+    directory = os.environ.get("FFRWD_DUMP_STDERR")
+    if not directory:
+        return
+    out = Path(directory)
+    out.mkdir(parents=True, exist_ok=True)
+    for stage in result.stages:
+        for member in stage.members:
+            path = out / f"{member.id}.stderr"
+            header = f"exit={member.exit_code} terminated={member.terminated}\n"
+            path.write_text(header + member.stderr, encoding="utf-8", errors="replace")
 
 
 def _echo_member(name: str, argv: list[str]) -> None:

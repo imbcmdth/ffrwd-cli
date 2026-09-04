@@ -47,6 +47,8 @@ __all__ = ["DEFAULT_BUFFER", "NamedPipe", "create"]
 
 # How often a wait re-checks whether the client has arrived.
 _POLL = 0.01
+# How long a cancelled connect's own thread is given to unwind.
+_CANCEL_JOIN = 5.0
 # The pipe's own buffer, per direction, for a pipe nothing asked to size.
 DEFAULT_BUFFER = 1 << 16
 
@@ -114,13 +116,8 @@ if sys.platform == "win32":
     ]
     _kernel32.ConnectNamedPipe.restype = wintypes.BOOL
     _kernel32.ConnectNamedPipe.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
-    _kernel32.SetNamedPipeHandleState.restype = wintypes.BOOL
-    _kernel32.SetNamedPipeHandleState.argtypes = [
-        wintypes.HANDLE,
-        ctypes.POINTER(wintypes.DWORD),
-        ctypes.POINTER(wintypes.DWORD),
-        ctypes.POINTER(wintypes.DWORD),
-    ]
+    _kernel32.CancelIoEx.restype = wintypes.BOOL
+    _kernel32.CancelIoEx.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
     _kernel32.FlushFileBuffers.restype = wintypes.BOOL
     _kernel32.FlushFileBuffers.argtypes = [wintypes.HANDLE]
     _kernel32.DisconnectNamedPipe.restype = wintypes.BOOL
@@ -130,58 +127,77 @@ if sys.platform == "win32":
 
     _PIPE_ACCESS_INBOUND = 0x00000001
     _PIPE_ACCESS_OUTBOUND = 0x00000002
-    _PIPE_ACCESS_DUPLEX = 0x00000003
     _PIPE_WAIT = 0x00000000
-    _PIPE_NOWAIT = 0x00000001
     _ERROR_PIPE_CONNECTED = 535
-    _ERROR_PIPE_LISTENING = 536
     _ERROR_NO_DATA = 232
     _INVALID_HANDLE = ctypes.c_void_p(-1).value
 
     class _Pipe(NamedPipe):
         """A Windows named pipe: this process is the server, ffmpeg the client.
 
-        Created non-blocking so a wait can give up, then switched to blocking
-        once the client is there, which is what lets ordinary reads and writes
-        move the stream afterwards.
+        Created in WAIT mode -- never NOWAIT, which is deprecated and, worse,
+        a per-INSTANCE mode the connecting client inherits too, not just this
+        process's own handle. WAIT mode alone is not enough, though: a client
+        that opens the path before this process has called ``ConnectNamedPipe``
+        finds the path exists (the instance :func:`create` made) and its own
+        ``CreateFile`` succeeds, but the pipe is not yet CONNECTED at the
+        kernel's own bookkeeping -- an I/O call issued in that gap fails with
+        ERROR_PIPE_NOT_CONNECTED, not a wait. `plan_argv` already makes every
+        pipe of a plan before any process is spawned, so the fix is to start
+        that connect here, in `__init__`, rather than lazily in :meth:`wait` --
+        every client born afterwards then finds a pipe already listening.
+        ``ConnectNamedPipe`` itself blocks, so it runs on a thread of its own
+        from the start; a timeout or a :meth:`close` from elsewhere cancels
+        that thread's pending call via ``CancelIoEx``.
         """
 
         def __init__(self, path: str, *, writing: bool, buffer: int = DEFAULT_BUFFER) -> None:
             super().__init__(path, writing=writing, buffer=buffer)
-            # The reading end is DUPLEX, not INBOUND: switching the handle to
-            # blocking mode below needs write-attributes access, which an
-            # inbound handle lacks -- the switch fails, the handle stays
-            # non-blocking, and a read of a momentarily empty pipe errors
-            # instead of waiting.
-            access = _PIPE_ACCESS_OUTBOUND if writing else _PIPE_ACCESS_DUPLEX
+            access = _PIPE_ACCESS_OUTBOUND if writing else _PIPE_ACCESS_INBOUND
             handle = _kernel32.CreateNamedPipeW(
-                path, access, _PIPE_NOWAIT, 1, buffer, buffer, 0, None
+                path, access, _PIPE_WAIT, 1, buffer, buffer, 0, None
             )
             if handle == _INVALID_HANDLE:
                 raise ctypes.WinError(ctypes.get_last_error())
             self._handle: int | None = handle
             self._owned = True
+            self._connected = threading.Event()
+            self._connect_failure: OSError | None = None
+            self._connector = threading.Thread(
+                target=self._connect, args=(handle,), daemon=True
+            )
+            self._connector.start()
+
+        def _connect(self, handle: int) -> None:
+            # Blocks until a client connects or `handle`'s pending I/O is
+            # cancelled -- there is no NOWAIT poll to fall back on, since
+            # NOWAIT is exactly the mode this class no longer creates.
+            try:
+                if not _kernel32.ConnectNamedPipe(handle, None):
+                    code = ctypes.get_last_error()
+                    if code not in (_ERROR_PIPE_CONNECTED, _ERROR_NO_DATA):
+                        self._connect_failure = ctypes.WinError(code)
+            finally:
+                self._connected.set()
 
         def wait(self, deadline: float) -> BinaryIO:
-            while True:
-                with self._lock:
-                    handle = self._handle
-                    if self._stop.is_set() or handle is None:
-                        raise self._closed()
-                    if self._connect(handle):
-                        break
-                if time.monotonic() >= deadline:
-                    raise self._timeout()
-                time.sleep(_POLL)
             with self._lock:
                 handle = self._handle
                 if self._stop.is_set() or handle is None:
                     raise self._closed()
-                mode = wintypes.DWORD(_PIPE_WAIT)
-                if not _kernel32.SetNamedPipeHandleState(
-                    handle, ctypes.byref(mode), None, None
-                ):
-                    raise ctypes.WinError(ctypes.get_last_error())
+            if not self._connected.wait(timeout=max(deadline - time.monotonic(), 0)):
+                # Neither a client nor `close()` arrived in time: cancelling
+                # the pending connect is what lets the connector thread finish.
+                _kernel32.CancelIoEx(handle, None)
+                self._connector.join(_CANCEL_JOIN)
+                raise self._timeout()
+            self._connector.join(_CANCEL_JOIN)
+            with self._lock:
+                handle = self._handle
+                if self._stop.is_set() or handle is None:
+                    raise self._closed()
+                if self._connect_failure is not None:
+                    raise self._connect_failure
                 flags = 0 if self.writing else os.O_RDONLY
                 stream = os.fdopen(
                     msvcrt.open_osfhandle(handle, flags),
@@ -193,24 +209,15 @@ if sys.platform == "win32":
                 self._stream = stream
                 return stream
 
-        @staticmethod
-        def _connect(handle: int) -> bool:
-            if _kernel32.ConnectNamedPipe(handle, None):
-                return True
-            code = ctypes.get_last_error()
-            if code in (_ERROR_PIPE_CONNECTED, _ERROR_NO_DATA):
-                # NO_DATA is a client that already came and went; what it
-                # wrote still sits in the pipe, so the connect happened.
-                return True
-            if code == _ERROR_PIPE_LISTENING:
-                return False
-            raise ctypes.WinError(code)
-
         def close(self) -> None:
             self._stop.set()
             with self._lock:
                 stream, handle, owned = self._stream, self._handle, self._owned
                 self._stream, self._handle, self._owned = None, None, False
+            if handle is not None:
+                # Unblocks the connector thread if it is still parked in its
+                # blocking `ConnectNamedPipe`.
+                _kernel32.CancelIoEx(handle, None)
             if stream is not None:
                 try:
                     if self.writing:
