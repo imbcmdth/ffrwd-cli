@@ -791,6 +791,8 @@ def _with_hls_stream_inf(parsed: ProbeResult, text: str) -> ProbeResult:
         language = audio_languages.get(audio_group) if audio_group is not None else None
         streams = rendition.streams
         if audio_group is not None:
+            if "RESOLUTION" not in entry and not any(s.type == "video" for s in streams):
+                continue  # an audio-only variant is its group's audio under a heading
             streams = [s for s in streams if not (s.type == "audio" and id(s) in claimed_ids)]
             if not streams:
                 continue  # every stream moved to the group's row(s) above

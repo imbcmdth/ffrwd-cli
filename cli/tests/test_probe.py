@@ -1819,10 +1819,11 @@ def test_audio_only_master_yields_one_row(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """No RESOLUTION on the one #EXT-X-STREAM-INF, just an AUDIO= group --
-    the shape ffmpeg's hls muxer writes for an audio-only destination. Its
-    one stream is entirely CLAIMED by the group's own #EXT-X-MEDIA entry
-    (matched by `comment`, same as a hybrid variant's), so it contributes
-    no row of its own: one row, the group's."""
+    the shape ffmpeg's hls muxer writes for an audio-only destination. The
+    variant is the group's audio under a heading and contributes no row.
+    ffprobe 8 lists the shared playlist twice in the program, the group's
+    copy with its comment tag and the variant's own read without one;
+    ffprobe 9 lists it once. One row either way, the group's."""
     master = tmp_path / "master.m3u8"
     master.write_text(
         "#EXTM3U\n"
@@ -1852,6 +1853,26 @@ def test_audio_only_master_yields_one_row(
     assert [s.type for s in audio.streams] == ["audio"]
     assert audio.name == "audio_0"
     assert audio.height is None
+
+    clear_cache()
+    _fake_run(
+        monkeypatch,
+        stdout=json.dumps(
+            {
+                "streams": [
+                    {"index": 0, "codec_type": "audio", "tags": {"comment": "audio_0"}},
+                    {"index": 1, "codec_type": "audio"},
+                ],
+                "programs": [_hls_program(0, [0, 1], "77428")],
+                "format": {"format_name": "hls"},
+            }
+        ),
+    )
+    twice = probe(str(master))
+    assert twice is not None
+    assert [(r.name, [s.type for s in r.streams]) for r in twice.renditions] == [
+        ("audio_0", ["audio"])
+    ]
 
 
 def test_hybrid_variant_keeps_its_own_muxed_audio_beside_the_group(
