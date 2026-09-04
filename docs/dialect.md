@@ -205,8 +205,9 @@ like any script
 the values are the version range for each, recorded and shown, never
 solved.
 
-Seven more keys exist for the registry's sake; no compile reads any of
-them. The whole manifest's shape is pinned by
+Eight more keys exist that no compile reads: seven the registry
+stores, and `test`, which only `ffrwd publish` runs. The whole
+manifest's shape is pinned by
 [ffrwd-json.schema.json](ffrwd-json.schema.json).
 
 ```json
@@ -216,6 +217,7 @@ them. The whole manifest's shape is pinned by
   "capabilities": ["nn"],
   "ffrwd": ">=0.9",
   "private": false,
+  "test": "uv run pytest tests -q && cargo test --release",
   "models": { "depth": { "repo": "depth-anything/small", "revision": "v1",
                          "file": "onnx/model.onnx", "sha256": "<64 hex>" } } }
 ```
@@ -263,6 +265,19 @@ changes, so flipping the key later only changes what the NEXT publish
 is stamped with; every already-public version stays installable exactly
 as it was. One rule follows: a version published public must have every
 dependency resolvable among public versions.
+
+`test` is one line of printable text, at most 500 characters: the
+command `ffrwd publish` runs before it packs anything, in the package
+directory, through the platform's own shell - so `&&` and a pipe mean
+what you wrote. Exit 0 and the publish goes on; anything else stops it,
+naming the command and its status, and its output is the terminal's
+rather than something the publish captures. What the command checks is
+the author's business - a recipe compiled with its own example values,
+a test suite, a linter, a `cargo test`, all four. Absent, or empty, and
+nothing is checked; nothing is compiled in its place either. It runs at
+publish and nowhere else: the key rides in the archive because the
+manifest does, `install` never reads it, and nothing there ever runs
+it.
 
 `models` pins the model each exported wasm function loads, keyed by the
 EXPORT name. `repo` is `<owner>/<name>` on Hugging Face, `revision` one
@@ -700,11 +715,10 @@ machine:
   capabilities come from - a module that runs a model makes the
   version an `nn` one;
 - every model pinned names an export one of those modules declares;
-- every recipe compiles, against one synthetic file (a video, an audio
-  and a subtitle stream, plus chapters) with the values its own
-  `-- example:` line names substituted in. A recipe with no example
-  line compiles with its variables unset, which is what running it that
-  way does.
+- the manifest's own `test` command runs, and its exit status decides
+  whether the publish goes on. A manifest that declares none is not
+  checked: what a package promises about itself is the package's to
+  say, and a version nobody vouched for is one anybody may publish.
 
 Then the directory is packed - the same deterministic archive
 `install` verifies - and one request carries the bytes and the JSON the
