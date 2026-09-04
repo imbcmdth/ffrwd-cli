@@ -21,6 +21,11 @@ Everything is **compile-time countable**: every relation's size is known
 before ffmpeg runs. That is what lets `WHERE` filter tracks at compile
 time, and what keeps the one-row rule decidable.
 
+`ARCHITECTURE.md` beside this file says what each stage may know and
+decide, the invariants a change preserves, how to compose one so a fact
+has one home, and the failures each rule was paid for with. Read it
+before changing the compiler.
+
 ## Layout
 
 - `ffrwd/` — the compiler. `functions.py` expands user-defined
