@@ -30,7 +30,7 @@ from ffrwd.compiler import Compiled, _nn_models, _pinned_models, compile_all
 from ffrwd.errors import ErrorCode, FfrwdError
 from ffrwd.execute import CHAIN, PIPELINE, PipeEdge, plan_argv, render_plan
 from ffrwd.functions import WasmFunction, package_modules
-from ffrwd.ir import Graph
+from ffrwd.ir import Graph, RowsSink
 from ffrwd.lower import lower, lower_table
 from ffrwd.parser import ModuleExport, Resolved, parse, resolve
 from ffrwd.probe import CueMeta, ProbeResult, StreamMeta
@@ -43,6 +43,7 @@ from ffrwd.processes import (
     ModuleShape,
     PadMeta,
     ProcessPlan,
+    RowsDocument,
     SidecarProcess,
     StreamEdge,
     VideoFormat,
@@ -4754,7 +4755,9 @@ def _packet_source(outputs: tuple[str, ...] = ("video", "audio")) -> SidecarProc
 
 
 def test_a_packet_source_writes_one_nut_pipe_per_track_and_no_input() -> None:
-    argv = wasm.shown_argv(_packet_source(), ["p0", "p1"])
+    """Its tracks lead `writes` -- the mirror of a packet sink's several
+    `reads` -- since a source with a rows document too puts that after them."""
+    argv = wasm.shown_argv(_packet_source(), writes=["p0", "p1"])
     assert argv == [
         "ffrwd-wasm",
         "-m",
@@ -4771,9 +4774,22 @@ def test_a_packet_source_writes_one_nut_pipe_per_track_and_no_input() -> None:
 
 def test_a_packet_source_with_no_tracks_is_refused() -> None:
     with pytest.raises(FfrwdError) as caught:
-        wasm.shown_argv(_packet_source(outputs=()), [])
+        wasm.shown_argv(_packet_source(outputs=()), writes=[])
     assert PACKET_SOURCE_MODULE in caught.value.message
     assert "no track to write" in caught.value.message
+
+
+def test_a_packet_sources_rows_document_reads_its_path_past_the_tracks() -> None:
+    """A source's tracks lead `writes`; its rows document's own path is the
+    entry after them, not one of the tracks themselves."""
+    process = replace(
+        _packet_source(outputs=("video", "audio")),
+        rows=(RowsDocument(sink=RowsSink(container="webvtt", alias="cues"), node="s"),),
+    )
+    argv = wasm.shown_argv(process, writes=["p0", "p1", "cues.vtt"])
+    assert argv[-3:] == ["-f", "webvtt", "cues.vtt"]
+    assert "p0" not in argv
+    assert "p1" not in argv
 
 
 def _packet_sink(reads: int, pads: tuple[PadMeta | None, ...] = ()) -> SidecarProcess:

@@ -677,7 +677,7 @@ def plan_argv(
                 process,
                 sidecar_argv,
                 [read[edge] for edge in incoming],
-                _rows_writes(process, plan, write),
+                _sidecar_writes(process, plan, write, outgoing),
                 len(outgoing),
             )
             continue
@@ -690,6 +690,19 @@ def plan_argv(
             pipe_buffers=[edge.buffer for edge in outgoing],
         )
     return argv
+
+
+def _sidecar_writes(
+    process: SidecarProcess,
+    plan: ProcessPlan,
+    write: Mapping[PipeEdge, str],
+    outgoing: Sequence[StreamEdge],
+) -> list[str]:
+    """Where `process` writes go: a packet source's tracks in `outgoing`'s
+    own order, which is its catalog order, and then its rows documents.
+    Everything else hands its frames on over the one stdout instead."""
+    streams = [write[edge] for edge in outgoing] if process.packet_source else []
+    return streams + _rows_writes(process, plan, write)
 
 
 def _rows_writes(
@@ -976,10 +989,13 @@ def _sidecar_args(
     `reads` is one path per incoming edge, in the order the module's own pads
     take them: stdin where the plan hands this process one thing, a named pipe
     per edge where it fans in. Only a SINK reads several -- everything else
-    takes its pads out of one input. `writes` is one path per rows document,
-    which a process may write several of, each to a path of its own;
-    `streams` is how many streams of frames it hands on, and one stdout is
-    all there is to carry those.
+    takes its pads out of one input. `writes` is one path per outgoing stream
+    edge a packet SOURCE hands on, ahead of one path per rows document, which
+    a process may write several of, each to a path of its own; `streams` is
+    how many streams of frames it hands on, and one stdout is all there is to
+    carry those -- except for a packet SOURCE, whose several tracks are each
+    their own named pipe by construction, the mirror of a packet sink's
+    several reads.
     """
     if hook is None:
         raise FfrwdError(
@@ -988,7 +1004,7 @@ def _sidecar_args(
             "nothing was given to spawn it",
             hint="pass sidecar_argv, which renders one sidecar process as argv",
         )
-    if streams > 1:
+    if streams > 1 and not process.packet_source:
         raise FfrwdError(
             ErrorCode.INTERNAL,
             f"process {process.id!r} writes {streams} streams, but only its own "

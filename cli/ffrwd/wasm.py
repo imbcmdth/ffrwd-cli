@@ -1211,12 +1211,12 @@ def _argv(
 
     `writes` is the mirror on the other side: one path per rows document the
     process writes, in document order, since a process writing several of
-    them has only one stdout to put the first on.
+    them has only one stdout to put the first on. A packet SOURCE leads
+    `writes` with one path per track, ahead of any rows document, and its
+    `reads` are empty, since it takes no ``-i`` at all.
 
-    A packet SOURCE takes no ``-i`` at all -- `reads` are instead the paths it
-    WRITES, one ``-f nut <pipe>`` per track in catalog order, the mirror of a
-    packet sink's several reads. A source declaring no track is refused: it
-    would have nothing to write.
+    A packet SOURCE writes one ``-f nut <pipe>`` per track in catalog order.
+    A source declaring no track is refused: it would have nothing to write.
 
     ``-jobs`` caps the sidecar's worker threads, and is written on every
     sidecar process whenever the run gave one -- the sidecar itself decides
@@ -1250,7 +1250,8 @@ def _argv(
         if process.args:
             argv += ["-params", json.dumps(process.args, sort_keys=True)]
         argv += _rows_module_args(process)
-        argv += rows_args(process, writes) or _stream_output(process, reads)
+        tracks, documents = _split_writes(process, writes)
+        argv += rows_args(process, documents) or _stream_output(process, tracks)
     if process.writes_rows:
         argv += [_ANNOTATIONS_FLAG, ANNOTATIONS_OUT]
     return argv
@@ -1268,6 +1269,18 @@ def _rows_module_args(process: SidecarProcess) -> list[str]:
     for module in process.rows_modules:
         argv += ["-m", module.path, _ROWS_FROM_FLAG, str(module.source)]
     return argv
+
+
+def _split_writes(
+    process: SidecarProcess, writes: Sequence[str]
+) -> tuple[Sequence[str], Sequence[str]]:
+    """`writes` as a packet source's track paths and the rows paths after
+    them, which :func:`~ffrwd.execute._sidecar_writes` puts in that order.
+    Every other process writes rows documents and nothing else."""
+    if not process.packet_source:
+        return (), writes
+    tracks = len(process.outputs)
+    return writes[:tracks], writes[tracks:]
 
 
 def _stream_output(process: SidecarProcess, writes: Sequence[str] = ()) -> list[str]:

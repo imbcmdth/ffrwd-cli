@@ -10,6 +10,7 @@ from __future__ import annotations
 import math
 import threading
 from collections.abc import Sequence
+from dataclasses import replace
 
 import pytest
 
@@ -29,7 +30,7 @@ from ffrwd.execute import (
     plan_argv,
     wires,
 )
-from ffrwd.ir import Graph, Node, Output, SinkUnit, StreamType
+from ffrwd.ir import Graph, Node, Output, RowsSink, SinkUnit, StreamType
 from ffrwd.probe import ProbeResult, StreamMeta
 from ffrwd.processes import (
     PIPE,
@@ -37,6 +38,8 @@ from ffrwd.processes import (
     EdgeBuffer,
     FfmpegProcess,
     ProcessPlan,
+    RowsDocument,
+    RowsEdge,
     SidecarProcess,
     StreamEdge,
     VideoFormat,
@@ -118,6 +121,66 @@ def _two_producers() -> ProcessPlan:
             ),
         ),
     )
+
+
+def _packet_source_plan(tracks: int) -> ProcessPlan:
+    """A packet source riding alone, `tracks` outgoing edges to one reader.
+
+    The mirror of a packet sink's several reads: no inputs, and its several
+    pads are each their own outgoing :class:`StreamEdge`, catalog order
+    (video ahead of the trailing audio track) matching `outputs`.
+    """
+    kinds = ["video"] * max(tracks - 1, 0) + (["audio"] if tracks else [])
+    reader = Graph(input_paths=[PIPE] * tracks, sources={f"t{i}": i for i in range(tracks)})
+    reader.sinks = [
+        SinkUnit(
+            outputs=[
+                _out(f"src:t{i}:{'v' if kind == 'video' else 'a'}:0", kind)
+                for i, kind in enumerate(kinds)
+            ],
+            path="out.mkv",
+        )
+    ]
+    return ProcessPlan(
+        processes=(
+            SidecarProcess(
+                id="sidecar0",
+                module="relay.wasm",
+                node="relay",
+                outputs=tuple(kinds),
+                packet_source=True,
+            ),
+            FfmpegProcess(id="reader", graph=reader),
+        ),
+        edges=tuple(
+            StreamEdge(
+                source="sidecar0",
+                target="reader",
+                ref=f"track{i}",
+                format=VideoFormat() if kind == "video" else AudioFormat(),
+            )
+            for i, kind in enumerate(kinds)
+        ),
+    )
+
+
+def _named_by_ref(edge: StreamEdge | RowsEdge, side: str) -> str:
+    """`_named`, disambiguated by what the edge carries -- several of a
+    packet source's edges share one source and one target, so the pair alone
+    will not tell them apart."""
+    carried = edge.ref if isinstance(edge, StreamEdge) else edge.alias
+    return f"/pipes/{edge.source}-{edge.target}-{carried}-{side}"
+
+
+def _stand_in_writes(
+    process: SidecarProcess, reads: Sequence[str] = (), writes: Sequence[str] = ()
+) -> list[str]:
+    """A stand-in spelling one write path per entry it is given, the way a
+    packet source's real argv spells one ``-f nut`` per track."""
+    argv = ["ffmpeg", "-m", process.module]
+    for path in writes:
+        argv += ["-f", "nut", path]
+    return argv
 
 
 def _shared_feeder() -> ProcessPlan:
@@ -306,6 +369,106 @@ def test_a_sidecar_reading_two_streams_is_refused() -> None:
         plan_argv(plan, sidecar_argv=_stand_in, pipe_path=_named)
     assert caught.value.code is ErrorCode.INTERNAL
     assert "sidecar0" in caught.value.message
+
+
+def test_a_non_source_sidecar_writing_two_streams_still_refuses() -> None:
+    """The `streams > 1` exemption is for a packet source only.
+
+    An ordinary module still has one stdout, however many consumers a plan
+    wires it to -- the same shape :func:`plan_argv` refuses whether the two
+    edges reach the plan through a live relay or, as here, by hand.
+    """
+    decode = Graph(input_paths=["a.mp4"], sources={"a": 0})
+    decode.sinks = [SinkUnit(outputs=[_out("src:a:v:0")], path=PIPE)]
+    sink1 = Graph(input_paths=[PIPE], sources={"s": 0})
+    sink1.sinks = [SinkUnit(outputs=[_out("src:s:v:0")], path="one.mp4")]
+    sink2 = Graph(input_paths=[PIPE], sources={"s": 0})
+    sink2.sinks = [SinkUnit(outputs=[_out("src:s:v:0")], path="two.mp4")]
+    plan = ProcessPlan(
+        processes=(
+            FfmpegProcess(id="decode", graph=decode),
+            SidecarProcess(id="sidecar0", module="m0.wasm", node="m0"),
+            FfmpegProcess(id="sink1", graph=sink1),
+            FfmpegProcess(id="sink2", graph=sink2),
+        ),
+        edges=(
+            StreamEdge(source="decode", target="sidecar0", ref="src:a:v:0", format=VideoFormat()),
+            StreamEdge(source="sidecar0", target="sink1", ref="m0", format=VideoFormat()),
+            StreamEdge(source="sidecar0", target="sink2", ref="m0", format=VideoFormat()),
+        ),
+    )
+    with pytest.raises(FfrwdError) as caught:
+        plan_argv(plan, sidecar_argv=_stand_in, pipe_path=_named)
+    assert caught.value.code is ErrorCode.INTERNAL
+    assert caught.value.message == (
+        "process 'sidecar0' writes 2 streams, but only its own stdout is wired"
+    )
+
+
+# ---------------------------------------------------------------- packet sources
+
+
+def test_a_packet_sources_tracks_each_take_their_own_named_pipe() -> None:
+    """No longer refused, and each of a three-track source's edges gets its
+    own pipe -- the same paths its reader's ``-i`` list names."""
+    plan = _packet_source_plan(3)
+    argv = plan_argv(plan, sidecar_argv=_stand_in_writes, pipe_path=_named_by_ref)
+    edges = [e for e in plan.stream_edges if e.source == "sidecar0"]
+    assert len(edges) == 3
+
+    written = [_named_by_ref(edge, "write") for edge in edges]
+    assert len(set(written)) == 3  # three distinct pipes, not one reused
+    assert argv["sidecar0"] == [
+        "ffmpeg", "-m", "relay.wasm",
+        "-f", "nut", written[0],
+        "-f", "nut", written[1],
+        "-f", "nut", written[2],
+    ]  # fmt: skip
+
+    read = [_named_by_ref(edge, "read") for edge in edges]
+    seen = [argv["reader"][i + 1] for i, tok in enumerate(argv["reader"]) if tok == "-i"]
+    assert seen == read
+
+
+def test_a_packet_sources_writes_put_its_tracks_before_its_rows_document() -> None:
+    """Order matters: a packet source's tracks lead `writes`, its rows
+    documents follow -- the same "streams first" order
+    :func:`~ffrwd.wasm._network_args` gives a region's several sinks, so
+    :func:`~ffrwd.wasm._split_writes` can peel the tracks back off the front.
+    """
+    plan = _packet_source_plan(2)
+    doc = RowsDocument(sink=RowsSink(container="webvtt", alias="cues"), node="relay")
+    docs = Graph(input_paths=[PIPE], sources={"cues": 0})
+    docs.sinks = [SinkUnit(outputs=[_out("src:cues:s:0", "subtitle")], path="cues.vtt")]
+    plan = replace(
+        plan,
+        processes=(
+            *(
+                replace(p, rows=(doc,)) if p.id == "sidecar0" else p for p in plan.processes
+            ),
+            FfmpegProcess(id="docs", graph=docs),
+        ),
+        edges=(
+            *plan.edges,
+            RowsEdge(source="sidecar0", target="docs", alias="cues", container="webvtt"),
+        ),
+    )
+    captured: list[str] = []
+
+    def _capture(
+        process: SidecarProcess, reads: Sequence[str] = (), writes: Sequence[str] = ()
+    ) -> list[str]:
+        captured.extend(writes)
+        return ["ffmpeg"]
+
+    plan_argv(plan, sidecar_argv=_capture, pipe_path=_named_by_ref)
+
+    tracks = [e for e in plan.stream_edges if e.source == "sidecar0"]
+    (rows_edge,) = [e for e in plan.rows_edges if e.source == "sidecar0"]
+    assert captured == [
+        *(_named_by_ref(edge, "write") for edge in tracks),
+        _named_by_ref(rows_edge, "write"),
+    ]
 
 
 # ---------------------------------------------------------------- live inputs
