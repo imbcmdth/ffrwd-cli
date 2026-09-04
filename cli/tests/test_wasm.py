@@ -4568,6 +4568,34 @@ def test_probe_source_spawns_the_documented_argv(monkeypatch: pytest.MonkeyPatch
     ]
 
 
+def test_probe_source_grants_the_effects_described_asks_ahead_of_the_probe_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A source module that needs the network to answer its own probe gets
+    the same ``-http``/``-net <path>`` grant :func:`invoke` gives it, ahead
+    of ``--probe``; a source that imports neither -- or a caller with no
+    description in hand -- gets neither flag."""
+    calls = _fake_wasm_run(monkeypatch, json.dumps(_SOURCE_CATALOG_JSON))
+
+    wasm.probe_source(
+        PACKET_SOURCE_MODULE,
+        "{}",
+        described=Described(world="ffrwd:av@0.4.0", udp=True),
+    )
+    wasm.probe_source(
+        PACKET_SOURCE_MODULE, "{}", described=Described(world="ffrwd:av@0.4.0")
+    )
+    wasm.probe_source(PACKET_SOURCE_MODULE, "{}")
+    assert calls == [
+        [
+            "ffrwd-wasm", "-net", PACKET_SOURCE_MODULE,
+            "--probe", PACKET_SOURCE_MODULE, "-params", "{}",
+        ],
+        ["ffrwd-wasm", "--probe", PACKET_SOURCE_MODULE, "-params", "{}"],
+        ["ffrwd-wasm", "--probe", PACKET_SOURCE_MODULE, "-params", "{}"],
+    ]
+
+
 def test_probe_source_parses_a_muxed_rendition_and_an_audio_only_one(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

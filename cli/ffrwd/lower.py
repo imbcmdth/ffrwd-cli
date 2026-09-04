@@ -448,7 +448,7 @@ from ffrwd.wasm import (
     Described,
     DescribedFunction,
     Invoke,
-    SourceCatalog,
+    ProbeSource,
     audio_encoder_codec,
     catalog_as_probe,
     encoder_codec,
@@ -464,12 +464,6 @@ from ffrwd.wasm import invoke as wasm_invoke
 from ffrwd.wasm import probe_source as wasm_probe_source
 
 __all__ = ["lower", "lower_table"]
-
-# Runs one packet-source module's `probe` and returns its compile-time
-# catalog, or raises FfrwdError. :func:`ffrwd.wasm.probe_source` is the real
-# one; a lowering test passes its own, so binding a `RETURNS source` call
-# needs no sidecar.
-ProbeSource = Callable[[str, str], SourceCatalog]
 
 # Probes ONE path a URL source's row named, the way the pre-lowering pass
 # probes an `input()` path -- which one is only known once the module has
@@ -6858,7 +6852,7 @@ class _Lowerer:
         )
         params_json = json.dumps(params, sort_keys=True)
         try:
-            catalog = self.probe_source(declared.module, params_json)
+            catalog = self.probe_source(declared.module, params_json, described=described)
         except FfrwdError as err:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,

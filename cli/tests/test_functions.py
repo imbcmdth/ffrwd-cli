@@ -1015,7 +1015,7 @@ def test_a_package_qualified_source_call_keeps_its_alias_after_adoption(
     g = lower(
         res, {}, registry=_snapshot_registry(),
         describes={declared.module: described},
-        probe_source=lambda module, params: catalog,
+        probe_source=lambda module, params, **_kwargs: catalog,
     )
     assert [(o.ref, o.type) for o in g.outputs] == [("src:s:v:0", "video")]
     assert g.module_sources["s"].alias == "s"

@@ -671,6 +671,18 @@ def describe(path: str) -> Described:
     return _described(path, payload)
 
 
+def _grant_args(described: Described, path: str) -> list[str]:
+    """The ``-http``/``-net`` grants `described`'s own imports need for `path`,
+    which :func:`invoke` and :func:`probe_source` both put ahead of the flag
+    that dispatches their call."""
+    argv: list[str] = []
+    if described.http:
+        argv += [_GRANT_FLAGS["http"], path]
+    if described.udp:
+        argv += [_GRANT_FLAGS["udp"], path]
+    return argv
+
+
 def invoke(
     path: str,
     function: str,
@@ -715,10 +727,7 @@ def invoke(
     if described is not None:
         if described.nn:
             argv += _nn_args((model_binding(described, path),), nn.spawn_args())
-        if described.http:
-            argv += [_GRANT_FLAGS["http"], path]
-        if described.udp:
-            argv += [_GRANT_FLAGS["udp"], path]
+        argv += _grant_args(described, path)
     argv += [_INVOKE_FLAG, path, function, payload]
     try:
         done = subprocess.run(
@@ -961,13 +970,30 @@ def _source_catalog(module: str, payload: object) -> SourceCatalog:
     return SourceCatalog(tracks=tracks, bounded=payload.get("bounded") is True)
 
 
-def probe_source(module: str, params: str) -> SourceCatalog:
+# Runs one packet-source module's `probe` for its compile-time catalog:
+# :func:`probe_source` is the real one, and a lowering test passes its own.
+class ProbeSource(Protocol):
+    def __call__(
+        self,
+        module: str,
+        params: str,
+        *,
+        described: Described | None = None,
+    ) -> SourceCatalog: ...
+
+
+def probe_source(module: str, params: str, *, described: Described | None = None) -> SourceCatalog:
     """Ask the sidecar what the packet-source module at `module` publishes for `params`.
 
     ``ffrwd-wasm --probe <module> -params '<json>'`` prints one JSON line naming
     every coded track the module would produce and whether the source ever
     ends. `params` travels verbatim -- already marshalled JSON, the same
     convention :func:`invoke` follows for its own argument.
+
+    A source that imports `wasi:http` or `wasi:sockets` needs that effect
+    granted to answer its own probe, the same way :func:`invoke` grants it,
+    so `described` carries the module's declared interface. Left at None it
+    grants nothing.
 
     Raises ``FfrwdError`` -- and nothing else -- when the sidecar is not
     installed, cannot probe the module, or answers with something that is not
@@ -981,9 +1007,13 @@ def probe_source(module: str, params: str) -> SourceCatalog:
             "needs it to read the module",
             hint=INSTALL_HINT,
         )
+    argv = [sidecar]
+    if described is not None:
+        argv += _grant_args(described, module)
+    argv += [_PROBE_FLAG, module, _PARAMS_FLAG, params]
     try:
         done = subprocess.run(
-            [sidecar, _PROBE_FLAG, module, _PARAMS_FLAG, params],
+            argv,
             capture_output=True,
             encoding="utf-8",  # what the sidecar writes; see describe()
             errors="replace",

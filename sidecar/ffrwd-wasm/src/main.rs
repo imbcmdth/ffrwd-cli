@@ -2746,7 +2746,12 @@ fn catalog_json(catalog: &runtime::Catalog) -> CatalogJson {
 
 /// The `-params` value out of `--probe`'s trailing argv; every other flag is
 /// refused by name.
+///
+/// `-http`/`-net` go through `take_grant_args` first, the parser a run's own
+/// argv takes them through: a source that needs an effect to answer its
+/// probe is granted it the same way running would grant it.
 fn parse_probe_args(rest: &[String]) -> Result<String> {
+    let rest = take_grant_args(rest.to_vec())?;
     let mut it = rest.iter();
     let mut params: Option<String> = None;
     while let Some(arg) = it.next() {
@@ -3492,5 +3497,42 @@ mod grant_args_tests {
         let argv = strings(&["--invoke", "module.wasm", "fn", "{}"]);
         let rest = take_grant_args(argv.clone()).expect("parses");
         assert_eq!(rest, argv);
+    }
+}
+
+#[cfg(test)]
+mod probe_args_tests {
+    use super::parse_probe_args;
+
+    fn strings(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `-http`/`-net` reach `parse_probe_args` the same as any other grant
+    /// flag would ahead of a run, and are taken out rather than refused.
+    #[test]
+    fn a_grant_flag_is_accepted_and_params_is_still_read() {
+        let params = parse_probe_args(&strings(&[
+            "-http",
+            "module.wasm",
+            "-net",
+            "module.wasm",
+            "-params",
+            "{}",
+        ]))
+        .expect("parses");
+        assert_eq!(params, "{}");
+    }
+
+    #[test]
+    fn no_params_at_all_is_the_empty_string() {
+        let params = parse_probe_args(&strings(&["-http", "module.wasm"])).expect("parses");
+        assert_eq!(params, "");
+    }
+
+    #[test]
+    fn an_unknown_flag_is_still_refused() {
+        let err = parse_probe_args(&strings(&["-net", "module.wasm", "-bogus"])).unwrap_err();
+        assert_eq!(err.to_string(), "--probe: unknown flag -bogus");
     }
 }

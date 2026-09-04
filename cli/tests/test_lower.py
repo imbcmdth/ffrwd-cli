@@ -13488,7 +13488,7 @@ def test_a_module_source_alias_binds_two_rendition_rows() -> None:
     catalog = _subscribe_catalog()
     g = _lower_source(
         "SELECT amix(VARIADIC array_agg(s.audio)) FROM subscribe('relay', 'live') s",
-        declared, described, lambda module, params: catalog,
+        declared, described, lambda module, params, **_kwargs: catalog,
     )
     (node,) = g.nodes.values()
     assert node.filter == "amix"
@@ -13503,12 +13503,12 @@ def test_module_source_rendition_columns_resolve() -> None:
     catalog = _subscribe_catalog()
     by_height = _lower_source(
         "SELECT s.video[1] FROM subscribe('relay', 'live') s WHERE s.height = 720",
-        declared, described, lambda module, params: catalog,
+        declared, described, lambda module, params, **_kwargs: catalog,
     )
     assert _outputs(by_height) == [("src:s:v:0", "video", None)]
     by_language = _lower_source(
         "SELECT s.audio[1] FROM subscribe('relay', 'live') s WHERE s.language = 'en'",
-        declared, described, lambda module, params: catalog,
+        declared, described, lambda module, params, **_kwargs: catalog,
     )
     # the audio-only row's own audio track: the second one the catalog counts
     assert _outputs(by_language) == [("src:s:a:1", "audio", None)]
@@ -13523,7 +13523,7 @@ def test_a_where_on_module_source_height_keeps_one_row() -> None:
     g = _lower_source(
         "SELECT s.video[1], s.audio[1] FROM subscribe('relay', 'live') s "
         "WHERE s.height = 720",
-        declared, described, lambda module, params: catalog,
+        declared, described, lambda module, params, **_kwargs: catalog,
     )
     assert _outputs(g) == [
         ("src:s:v:0", "video", None),
@@ -13540,7 +13540,7 @@ def test_array_agg_of_a_module_source_video_column_gathers() -> None:
     catalog = _subscribe_catalog()
     g = _lower_source(
         "SELECT array_agg(s.video[1]) FROM subscribe('relay', 'live') s",
-        declared, described, lambda module, params: catalog,
+        declared, described, lambda module, params, **_kwargs: catalog,
     )
     assert _outputs(g) == [("src:s:v:0", "video", None)]
 
@@ -13558,7 +13558,7 @@ def test_the_graph_carries_the_module_source_and_its_tracks() -> None:
     # by which rows a WHERE leaves standing.
     g = _lower_source(
         "SELECT s.video[1] FROM subscribe('relay', 'live') s WHERE s.height = 720",
-        declared, described, lambda module, params: catalog,
+        declared, described, lambda module, params, **_kwargs: catalog,
     )
     source = g.module_sources["s"]
     assert source.alias == "s"
@@ -13583,7 +13583,7 @@ def test_a_bounded_module_source_reads_back_on_the_graph() -> None:
     catalog = _subscribe_catalog(bounded=True)
     g = _lower_source(
         "SELECT s.video[1] FROM subscribe('relay', 'live') s WHERE s.height = 720",
-        declared, described, lambda module, params: catalog,
+        declared, described, lambda module, params, **_kwargs: catalog,
     )
     assert g.module_sources["s"].bounded is True
 
@@ -13602,7 +13602,9 @@ def test_a_module_source_probe_failure_is_a_typed_refusal() -> None:
     declared = _source_function()
     described = _source_described(declared)
 
-    def failing_probe(module: str, params: str) -> SourceCatalog:
+    def failing_probe(
+        module: str, params: str, *, described: Described | None = None
+    ) -> SourceCatalog:
         raise FfrwdError(
             ErrorCode.UNSUPPORTED_SQL,
             "the relay refused the subscription: 403",
@@ -13631,7 +13633,7 @@ def test_a_where_time_window_on_a_module_source_row_is_not_a_column() -> None:
     err = _reject_source(
         "SELECT s.video[1] FROM subscribe('relay', 'live') s "
         "WHERE s.height = 720 AND s.t <= 1",
-        declared, described, lambda module, params: catalog,
+        declared, described, lambda module, params, **_kwargs: catalog,
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "unknown column 's.t'" in err.message
@@ -13648,7 +13650,7 @@ def test_a_where_time_window_on_an_empty_module_source_is_refused() -> None:
     empty_catalog = SourceCatalog(tracks=(), bounded=False)
     err = _reject_source(
         "SELECT s.video[1] FROM subscribe('relay', 'live') s WHERE s.t <= 1",
-        declared, described, lambda module, params: empty_catalog,
+        declared, described, lambda module, params, **_kwargs: empty_catalog,
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "'s' is a module source" in err.message
@@ -13663,7 +13665,7 @@ def test_a_non_packet_source_module_named_in_from_is_refused() -> None:
     described = _source_described(declared, source=False)
     err = _reject_source(
         "SELECT s.video[1] FROM subscribe('relay', 'live') s",
-        declared, described, lambda module, params: _subscribe_catalog(),
+        declared, described, lambda module, params, **_kwargs: _subscribe_catalog(),
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "is not a packet source" in err.message
@@ -13676,7 +13678,7 @@ def test_a_module_source_on_a_pre_packet_source_world_is_refused() -> None:
     described = _source_described(declared, world="ffrwd:av@0.9.0")
     err = _reject_source(
         "SELECT s.video[1] FROM subscribe('relay', 'live') s",
-        declared, described, lambda module, params: _subscribe_catalog(),
+        declared, described, lambda module, params, **_kwargs: _subscribe_catalog(),
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "cannot host one" in err.message
