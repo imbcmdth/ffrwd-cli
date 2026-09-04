@@ -169,7 +169,12 @@ wedged on thirty seconds. The stall detector reported it thirty
 seconds later as an overflow, and that report was read as a slow model
 for most of a day. *A process writes its edges. A count read from a
 catalog instead of from the plan is a count that will disagree with
-the plan.*
+the plan.* Fixed in two steps: the partitioner makes a source's
+outputs its edges and the sidecar writes only those (9b9fecd), then
+the interface tells the source what to pull so the rest never leaves
+the relay (c12937e). No compatibility path was kept: the only packet
+sources that existed were rebuilt, and a rule with an exception is
+two homes again.
 
 **The slow-model diagnosis was reasoned, not measured.** The design
 said a model builds its session on the first frame and that could
