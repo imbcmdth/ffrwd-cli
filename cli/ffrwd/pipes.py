@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import math
 import os
 import sys
 import threading
@@ -185,7 +186,12 @@ if sys.platform == "win32":
                 handle = self._handle
                 if self._stop.is_set() or handle is None:
                     raise self._closed()
-            if not self._connected.wait(timeout=max(deadline - time.monotonic(), 0)):
+            # `Event.wait` raises OverflowError on an infinite timeout on
+            # Windows; None is what an unbounded deadline means to it.
+            remaining = (
+                None if deadline == math.inf else max(deadline - time.monotonic(), 0)
+            )
+            if not self._connected.wait(timeout=remaining):
                 # Neither a client nor `close()` arrived in time: cancelling
                 # the pending connect is what lets the connector thread finish.
                 _kernel32.CancelIoEx(handle, None)

@@ -6,6 +6,7 @@ process opening the path as a file, which is exactly what ffmpeg does.
 
 from __future__ import annotations
 
+import math
 import sys
 import threading
 import time
@@ -150,6 +151,34 @@ def test_a_close_unblocks_a_wait_that_has_no_client_coming(tmp_path: Path) -> No
     waiter = threading.Thread(target=block, daemon=True)
     waiter.start()
     time.sleep(0.2)
+    pipe.close()
+    waiter.join(10)
+    assert not waiter.is_alive()
+    assert isinstance(result.get("error"), str) and "BrokenPipeError" in result["error"]
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="pins the Windows Event.wait(inf) overflow fix; POSIX's open never takes a timeout",
+)
+def test_an_untimed_wait_blocks_instead_of_overflowing(tmp_path: Path) -> None:
+    """An unbounded run's deadline is `math.inf`. `Event.wait` raises
+    `OverflowError` if handed that as a timeout directly on Windows, so
+    `wait` must turn it into a plain indefinite wait instead of erroring out
+    at the first call."""
+    pipe = pipes.create(tmp_path, "untimed", writing=False)
+    result: dict[str, object] = {}
+
+    def block() -> None:
+        try:
+            pipe.wait(math.inf)
+        except Exception as err:  # noqa: BLE001 -- the assertion reports it whole
+            result["error"] = repr(err)
+
+    waiter = threading.Thread(target=block, daemon=True)
+    waiter.start()
+    waiter.join(0.2)
+    assert waiter.is_alive()  # still waiting, not blown up on the infinite timeout
     pipe.close()
     waiter.join(10)
     assert not waiter.is_alive()
