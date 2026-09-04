@@ -623,15 +623,36 @@ def _parse_attribute_list(text: str) -> dict[str, str]:
     return attrs
 
 
-def _stream_inf_entries(text: str) -> list[dict[str, str]]:
-    """Every #EXT-X-STREAM-INF line's attributes, in playlist order."""
-    entries: list[dict[str, str]] = []
-    for line in text.splitlines():
-        line = line.strip()
-        if line.startswith(_STREAM_INF_TAG):
-            _, _, rest = line.partition(":")
-            entries.append(_parse_attribute_list(rest))
+def _stream_inf_entries(text: str) -> list[tuple[dict[str, str], str | None]]:
+    """Every #EXT-X-STREAM-INF line's attributes, paired with its variant
+    URI, in playlist order. The URI is the next non-blank, non-comment
+    line after the tag; a master that ends right after it reads as None.
+    """
+    lines = text.splitlines()
+    entries: list[tuple[dict[str, str], str | None]] = []
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped.startswith(_STREAM_INF_TAG):
+            continue
+        _, _, rest = stripped.partition(":")
+        attrs = _parse_attribute_list(rest)
+        uri: str | None = None
+        for candidate in lines[i + 1 :]:
+            candidate = candidate.strip()
+            if not candidate or candidate.startswith("#"):
+                continue
+            uri = candidate
+            break
+        entries.append((attrs, uri))
     return entries
+
+
+def _variant_uri_dir_name(uri: str) -> str | None:
+    """The directory a variant playlist sits in (``v1080p/index.m3u8`` ->
+    ``v1080p``), where ffmpeg's var_stream_map layout puts the variant's
+    name; None for a bare ``index.m3u8``."""
+    directory, sep, _ = uri.split("?", 1)[0].rpartition("/")
+    return directory.rstrip("/").rpartition("/")[2] or None if sep else None
 
 
 def _hls_media_audio_entries(text: str) -> list[dict[str, str]]:
@@ -682,8 +703,8 @@ def _fill(current: str | None, discovered: str | None) -> str | None:
 def _with_hls_stream_inf(parsed: ProbeResult, text: str) -> ProbeResult:
     """`parsed.renditions` with `codecs`/`name`/`language` read from the
     master's own #EXT-X-STREAM-INF and #EXT-X-MEDIA lines, and -- for a
-    DEMUXED master -- a variant's bound audio group split back into its own
-    rendition rows.
+    master with a bound AUDIO group -- that group's streams split back out
+    of the variants that name it, into their own rendition rows.
 
     ffprobe's own JSON never surfaces CODECS=/NAME= -- they live only in
     the playlist's markup, not in anything ``-show_programs`` reports --
@@ -696,18 +717,20 @@ def _with_hls_stream_inf(parsed: ProbeResult, text: str) -> ProbeResult:
     bandwidth are both known, that match is preferred over position --
     it survives the two lists drifting out of step, which position alone
     cannot detect. Every other field of a matched rendition is kept
-    exactly as `_hls_renditions` found it; codecs/name/language are only
-    FILLED IN where not already set, never overwritten.
+    exactly as `_hls_renditions` found it; codecs/language are only FILLED
+    IN where not already set, never overwritten, and a name the master
+    never gave falls back to the variant playlist's directory.
 
-    A variant naming ``AUDIO=<group>`` is video-only: confirmed against a
-    real demuxed ladder (two video-only variants, one AUDIO group with one
-    or two members) that ffprobe's hls demuxer attaches EVERY member of a
-    referenced group to EVERY variant's program that names it, not just its
-    default track -- so a rendition's own audio streams are dropped
-    entirely there (its video, and anything else genuinely muxed in it,
-    stay), and one new RenditionMeta is appended per TYPE=AUDIO
-    #EXT-X-MEDIA entry instead -- see `_hls_media_renditions`. A master
-    with no AUDIO reference is untouched by any of this.
+    A variant naming ``AUDIO=<group>`` keeps every stream the group's own
+    #EXT-X-MEDIA entries did not claim. ffprobe's hls demuxer attaches
+    every member of a referenced group to every variant's program that
+    names it, and stamps the group's copies with a `comment` tag while a
+    variant's own muxed audio carries none, which is how
+    `_claim_media_stream` tells them apart. One RenditionMeta is appended
+    per TYPE=AUDIO entry (`_hls_media_renditions`); a variant the claims
+    empty (an audio-only master, where the variant's one stream is the
+    group's own) contributes no row. A master with no AUDIO reference is
+    untouched by any of this.
     """
     if not parsed.renditions:
         return parsed
@@ -717,54 +740,73 @@ def _with_hls_stream_inf(parsed: ProbeResult, text: str) -> ProbeResult:
     audio_languages = _audio_group_languages(text)
     media_entries = _hls_media_audio_entries(text)
 
-    by_bandwidth: dict[int, dict[str, str]] = {}
-    for candidate in entries:
-        bandwidth = _attr_int(candidate, "BANDWIDTH")
+    group_sizes: dict[str, int] = {}
+    for media_entry in media_entries:
+        group = media_entry.get("GROUP-ID")
+        if group is not None:
+            group_sizes[group] = group_sizes.get(group, 0) + 1
+
+    by_bandwidth: dict[int, tuple[dict[str, str], str | None]] = {}
+    for attrs, uri in entries:
+        bandwidth = _attr_int(attrs, "BANDWIDTH")
         if bandwidth is not None:
-            by_bandwidth.setdefault(bandwidth, candidate)
+            by_bandwidth.setdefault(bandwidth, (attrs, uri))
 
-    matched: list[tuple[RenditionMeta, dict[str, str] | None]] = []
+    Match = tuple[dict[str, str], str | None]
+    matched: list[tuple[RenditionMeta, Match | None]] = []
     for position, rendition in enumerate(parsed.renditions):
-        entry: dict[str, str] | None = None
+        match: Match | None = None
         if rendition.bandwidth is not None:
-            entry = by_bandwidth.get(rendition.bandwidth)
-        if entry is None and position < len(entries):
-            entry = entries[position]
-        matched.append((rendition, entry))
+            match = by_bandwidth.get(rendition.bandwidth)
+        if match is None and position < len(entries):
+            match = entries[position]
+        matched.append((rendition, match))
 
-    # The pool of audio streams each AUDIO group's members draw from: the
-    # FIRST matched rendition naming that group, before its own audio is
+    # The pool each AUDIO group's members claim from: the FIRST matched
+    # rendition naming that group's own audio streams, before anything is
     # dropped -- every other rendition naming the same group carries the
     # identical stream objects (ffprobe's `by_global_index` lookup shares
-    # them), so one pool per group is enough.
+    # them), so one pool per group is enough. Capped to the group's member
+    # count: the program lists the group's streams before the variant's
+    # own muxed audio, which the position fallback must never claim.
     pools: dict[str, list[StreamMeta]] = {}
-    for rendition, entry in matched:
-        if entry is None:
+    for rendition, match in matched:
+        if match is None:
             continue
-        group = entry.get("AUDIO")
+        group = match[0].get("AUDIO")
         if group is not None and group not in pools:
-            pools[group] = [s for s in rendition.streams if s.type == "audio"]
+            audio_streams = [s for s in rendition.streams if s.type == "audio"]
+            pools[group] = audio_streams[: group_sizes.get(group, len(audio_streams))]
+
+    media_renditions = _hls_media_renditions(media_entries, pools)
+    claimed_ids = {id(stream) for rendition in media_renditions for stream in rendition.streams}
 
     renditions: list[RenditionMeta] = []
-    for rendition, entry in matched:
-        if entry is None:
+    for rendition, match in matched:
+        if match is None:
             renditions.append(rendition)
             continue
+        entry, uri = match
         audio_group = entry.get("AUDIO")
         language = audio_languages.get(audio_group) if audio_group is not None else None
         streams = rendition.streams
         if audio_group is not None:
-            streams = [s for s in streams if s.type != "audio"]
+            streams = [s for s in streams if not (s.type == "audio" and id(s) in claimed_ids)]
+            if not streams:
+                continue  # every stream moved to the group's row(s) above
+        name = _fill(rendition.name, entry.get("NAME"))
+        if name is None and uri is not None:
+            name = _variant_uri_dir_name(uri)
         renditions.append(
             replace(
                 rendition,
                 streams=streams,
                 codecs=_fill(rendition.codecs, entry.get("CODECS")),
-                name=_fill(rendition.name, entry.get("NAME")),
+                name=name,
                 language=_fill(rendition.language, language),
             )
         )
-    renditions.extend(_hls_media_renditions(media_entries, pools))
+    renditions.extend(media_renditions)
     return replace(parsed, renditions=renditions)
 
 
@@ -881,9 +923,11 @@ def _parse_mpd(text: str, streams: list[StreamMeta]) -> tuple[list[RenditionMeta
     two-rendition MPD. Width/height/codecs prefer the matched stream (what
     ffprobe itself measured) and fall back to the Representation's own
     attributes, and then its AdaptationSet's, when nothing matched or the
-    stream did not carry them. ``lang="und"`` reads as no language, the same
-    way :func:`_hls_media_renditions`'s LANGUAGE would if HLS ever wrote it
-    -- undetermined is no information.
+    stream did not carry them. `name` is that same ``@id`` -- MPD has no
+    NAME= of its own, and the id is the one thing every Representation is
+    guaranteed to carry. ``lang="und"`` reads as no language, the same way
+    :func:`_hls_media_renditions`'s LANGUAGE would if HLS ever wrote it --
+    undetermined is no information.
     """
     try:
         root = ET.fromstring(text)
@@ -925,7 +969,7 @@ def _parse_mpd(text: str, streams: list[StreamMeta]) -> tuple[list[RenditionMeta
                         width=width,
                         height=height,
                         codecs=representation.get("codecs") or adaptation_set.get("codecs"),
-                        name=None,
+                        name=rep_id,
                         language=lang,
                         program_id=None,
                     )

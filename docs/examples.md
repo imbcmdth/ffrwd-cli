@@ -2916,11 +2916,11 @@ renditions.
 A self-join of the rendition table against itself pairs each video
 rung with each audio rendition. `a.height IS NULL` is what tells an
 audio-only row apart - an audio rendition has no video stream to
-measure a height from - and the destination reads `a.bandwidth`,
-since a rendition's `name` only ever comes from an HLS master, never
-a DASH one. Both go through `::text` before `||`, the same cast
-recipe 81's `n`-keyed names take, so each pairing lands in its own
-file:
+measure a height from - and the destination reads `a.bandwidth`
+rather than `a.name`, since a DASH Representation's id is whatever
+the packager chose. Both go through `::text` before `||`, the same
+cast recipe 81's `n`-keyed names take, so each pairing lands in its
+own file:
 
 ```pgsql
 COPY (

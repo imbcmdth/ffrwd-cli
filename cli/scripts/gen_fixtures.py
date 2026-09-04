@@ -25,6 +25,14 @@ type, so its audio-only row reads back as one by construction.
 ``ladder-demuxed-hls/master.m3u8`` is the same demuxed shape again, but HLS:
 a variant naming an AUDIO group is read back video-only, and the group's own
 ``#EXT-X-MEDIA`` entry reads back as its own audio-only row.
+``ladder-audio-only/master.m3u8`` is a third real ladder, also compiler-built:
+one audio rendition, no video row at all -- the shape ffmpeg's hls muxer
+writes for an audio-only destination. ``ladder-hybrid/master.m3u8`` is the
+one shape ffrwd cannot write directly yet -- a variant that MUXES its own
+audio AND names an AUDIO group -- so it is COMPOSED as text from the other
+two ladders' own playlists (``ladder/master.m3u8``'s variants, each given an
+added ``AUDIO=`` naming ``ladder-demuxed-hls/master.m3u8``'s own group),
+reusing both by relative path rather than copying their segments.
 
 Idempotent: a fixture whose output file already exists is skipped, so this
 is safe to run repeatedly, including once per CI job right before the exec
@@ -78,6 +86,14 @@ _ATTACHED_NAME = "attached.mkv"
 _LADDER_MASTER_NAME = "ladder/master.m3u8"
 _LADDER_DEMUXED_MASTER_NAME = "ladder-demuxed/master.mpd"
 _LADDER_DEMUXED_HLS_MASTER_NAME = "ladder-demuxed-hls/master.m3u8"
+_LADDER_AUDIO_ONLY_MASTER_NAME = "ladder-audio-only/master.m3u8"
+_LADDER_HYBRID_MASTER_NAME = "ladder-hybrid/master.m3u8"
+
+# HLS tag names, read back from playlist text when composing the hybrid
+# ladder below -- kept local rather than imported so this script stays
+# stdlib-only.
+_STREAM_INF_TAG = "#EXT-X-STREAM-INF"
+_MEDIA_TAG = "#EXT-X-MEDIA"
 
 # Two muxed renditions, 1080p and 720p, built by RUNNING THE COMPILER against
 # av.mp4 (never hand-typed) -- read back by `input()` on a manifest path. The
@@ -158,6 +174,16 @@ COPY (
   WITH (format 'hls', hls_time 2, hls_playlist_type 'vod',
         video_codec 'libx264', video_bitrate ARRAY['2000k', '800k'][vid.rung],
         audio_codec 'aac')
+"""
+
+# One audio rendition and no video: ffmpeg's hls muxer writes it as a
+# variant naming an AUDIO group, which must probe as the group's one row.
+_LADDER_AUDIO_ONLY_SQL = """\
+COPY (
+  SELECT a
+  FROM input('av.mp4') f, unnest(f.audio) a
+) TO 'ladder-audio-only/master.m3u8'
+  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', audio_codec 'aac')
 """
 
 # The mimetype ffmpeg itself reports for a TrueType attachment.
@@ -644,6 +670,92 @@ def _generate_ladder_demuxed_hls() -> None:
         raise SystemExit(f"ffrwd run failed generating {master}")
 
 
+def _generate_ladder_audio_only() -> None:
+    """A real AUDIO-ONLY HLS master -- one audio rendition, no video row --
+    run through `ffrwd run` itself. Must run after av.mp4 exists.
+    """
+    master = FIXTURES_DIR / _LADDER_AUDIO_ONLY_MASTER_NAME
+    if master.exists():
+        print(f"skip (already exists): {master}")
+        return
+    master.parent.mkdir(parents=True, exist_ok=True)
+    print(f"generating: {master}")
+    result = subprocess.run(
+        [sys.executable, "-m", "ffrwd", "run", _LADDER_AUDIO_ONLY_SQL, "-y"],
+        cwd=FIXTURES_DIR,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        print(result.stdout, file=sys.stderr)
+        print(result.stderr, file=sys.stderr)
+        raise SystemExit(f"ffrwd run failed generating {master}")
+
+
+def _attr_value(line: str, key: str) -> str:
+    """A ``KEY="value"`` attribute's value out of one playlist tag line."""
+    marker = f'{key}="'
+    start = line.index(marker) + len(marker)
+    end = line.index('"', start)
+    return line[start:end]
+
+
+def _stream_inf_variants(text: str) -> list[tuple[str, str]]:
+    """Every (#EXT-X-STREAM-INF line, its following variant URI) pair, in
+    a master playlist's own order."""
+    lines = text.splitlines()
+    pairs: list[tuple[str, str]] = []
+    for i, line in enumerate(lines):
+        if not line.startswith(_STREAM_INF_TAG):
+            continue
+        uri = next(candidate for candidate in lines[i + 1 :] if candidate.strip())
+        pairs.append((line, uri))
+    return pairs
+
+
+def _generate_ladder_hybrid() -> None:
+    """A HYBRID HLS master composed as text, since the compiler cannot
+    write one yet: `ladder/master.m3u8`'s muxed variants, each given an
+    ``AUDIO=`` naming `ladder-demuxed-hls/master.m3u8`'s group, with both
+    ladders' playlists and segments reused by relative path. Must run
+    after `_generate_ladder` and `_generate_ladder_demuxed_hls`.
+    """
+    master = FIXTURES_DIR / _LADDER_HYBRID_MASTER_NAME
+    out_dir = master.parent
+    if master.exists():
+        print(f"skip (already exists): {master}")
+        return
+    muxed_master = FIXTURES_DIR / _LADDER_MASTER_NAME
+    demuxed_hls_master = FIXTURES_DIR / _LADDER_DEMUXED_HLS_MASTER_NAME
+    if not muxed_master.exists() or not demuxed_hls_master.exists():
+        raise SystemExit(
+            "ladder-hybrid needs ladder/master.m3u8 and "
+            "ladder-demuxed-hls/master.m3u8 to already exist"
+        )
+
+    media_line = next(
+        line
+        for line in demuxed_hls_master.read_text(encoding="utf-8").splitlines()
+        if line.startswith(_MEDIA_TAG)
+    )
+    group_id = _attr_value(media_line, "GROUP-ID")
+    orig_uri = _attr_value(media_line, "URI")
+    media_line = media_line.replace(
+        f'URI="{orig_uri}"', f'URI="../ladder-demuxed-hls/{orig_uri}"'
+    )
+
+    lines = ["#EXTM3U", "#EXT-X-VERSION:3", media_line]
+    for stream_inf, uri in _stream_inf_variants(
+        muxed_master.read_text(encoding="utf-8")
+    ):
+        lines.append(f'{stream_inf},AUDIO="{group_id}"')
+        lines.append(f"../ladder/{uri}")
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    print(f"generating: {master}")
+    master.write_bytes(("\n".join(lines) + "\n").encode("utf-8"))
+
+
 def main() -> int:
     if not _ffmpeg_available():
         print("error: ffmpeg not found on PATH", file=sys.stderr)
@@ -666,6 +778,8 @@ def main() -> int:
     _generate_ladder()
     _generate_ladder_demuxed()
     _generate_ladder_demuxed_hls()
+    _generate_ladder_audio_only()
+    _generate_ladder_hybrid()
     return 0
 
 

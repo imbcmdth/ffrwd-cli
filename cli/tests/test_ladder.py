@@ -7,8 +7,11 @@ against it, reading every result back with ffprobe. A second, DEMUXED
 ladder (recipe 110 needs an audio-only row to self-join against) proves 109
 and 110 over DASH; a third, DEMUXED HLS ladder proves the same audio-only
 row reads back from an HLS master too, video-only variants and all -- see
-the notes on `_LADDER_DEMUXED_SQL` and `_LADDER_DEMUXED_HLS_SQL`. One
-fixture (av.mp4), single-digit seconds.
+the notes on `_LADDER_DEMUXED_SQL` and `_LADDER_DEMUXED_HLS_SQL`. Two more,
+already built by `scripts/gen_fixtures.py` rather than by this module,
+prove the read side of an audio-only master and a HYBRID one (a variant
+that both muxes its own audio and names an AUDIO group). One fixture
+(av.mp4), single-digit seconds.
 """
 
 from __future__ import annotations
@@ -286,3 +289,50 @@ def test_a_demuxed_hls_ladder_probes_video_only_and_audio_only_rows(
     assert len(audio_only) >= 1
     for rendition in audio_only:
         assert [s.type for s in rendition.streams] == ["audio"]
+
+
+@pytest.mark.exec
+def test_an_audio_only_hls_master_probes_as_one_row(_fixtures: None) -> None:
+    """ffmpeg's hls muxer writes an audio-only destination as one variant
+    naming an AUDIO group and no video: one row, the group's own."""
+    master = FIXTURES_DIR / "ladder-audio-only" / "master.m3u8"
+    assert master.exists()
+
+    clear_cache()
+    ladder_probe = probe(str(master))
+    assert isinstance(ladder_probe, ProbeResult)
+    assert len(ladder_probe.renditions) == 1
+
+    rendition = ladder_probe.renditions[0]
+    assert rendition.height is None
+    assert [s.type for s in rendition.streams] == ["audio"]
+    assert rendition.name == "audio_0"
+
+
+@pytest.mark.exec
+def test_a_hybrid_hls_master_keeps_its_own_audio_beside_the_group(
+    _fixtures: None,
+) -> None:
+    """Muxed variants that also name an AUDIO group keep their own audio;
+    the group is its own row; names come from the playlist directories."""
+    master = FIXTURES_DIR / "ladder-hybrid" / "master.m3u8"
+    assert master.exists()
+
+    clear_cache()
+    ladder_probe = probe(str(master))
+    assert isinstance(ladder_probe, ProbeResult)
+    assert ladder_probe.live is False
+
+    video = [r for r in ladder_probe.renditions if r.height is not None]
+    audio_only = [r for r in ladder_probe.renditions if r.height is None]
+    assert sorted(r.height for r in video) == [720, 1080]
+    for rendition in video:
+        assert sorted(s.type for s in rendition.streams) == ["audio", "video"]
+    assert {r.height: r.name for r in video} == {
+        1080: "v1080p",
+        720: "v720p",
+    }
+
+    assert len(audio_only) == 1
+    assert [s.type for s in audio_only[0].streams] == ["audio"]
+    assert audio_only[0].name == "audio_2"

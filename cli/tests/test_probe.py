@@ -1598,15 +1598,18 @@ def test_dash_mpd_yields_one_rendition_per_representation(
     assert hi.width == 640
     assert hi.height == 360
     assert hi.codecs == "avc1.640016"
+    assert hi.name == "0"  # MPD has no NAME=; a Representation's @id fills in
     assert [s.type for s in hi.streams] == ["video"]
 
     assert lo.bandwidth == 300000
     assert lo.width == 320
     assert lo.height == 180
+    assert lo.name == "1"
 
     assert audio.bandwidth == 128000
     assert audio.width is None
     assert audio.height is None
+    assert audio.name == "2"
     assert audio.language is None  # AdaptationSet's lang="und" is no information
 
 
@@ -1618,16 +1621,18 @@ def test_stream_inf_attributes_are_parsed_onto_matching_renditions(
 ) -> None:
     """Quoted CODECS may contain a comma; NAME is read; RESOLUTION is
     present in the playlist but unused -- width/height already come from
-    ffprobe's own stream columns, not the playlist's markup."""
+    ffprobe's own stream columns, not the playlist's markup. Both variant
+    URIs carry a directory too (``hi/index.m3u8``), proving an explicit
+    NAME= wins over that fallback rather than the other way around."""
     master = tmp_path / "master.m3u8"
     master.write_text(
         "#EXTM3U\n"
         '#EXT-X-STREAM-INF:BANDWIDTH=861791,RESOLUTION=640x360,'
         'CODECS="avc1.640020,mp4a.40.2",NAME="High"\n'
-        "hi.m3u8\n"
+        "hi/index.m3u8\n"
         '#EXT-X-STREAM-INF:BANDWIDTH=344917,RESOLUTION=320x180,'
         'CODECS="avc1.42001f,mp4a.40.2",NAME="Low"\n'
-        "lo.m3u8\n",
+        "lo/index.m3u8\n",
         encoding="utf-8",
     )
     _fake_ffprobe_present(monkeypatch)
@@ -1764,8 +1769,10 @@ def test_demuxed_master_splits_audio_group_into_its_own_rows(
     assert [s.type for s in hi.streams] == ["video"]
     assert hi.height == 1080
     assert hi.language == "en"  # backfilled from the group, as before this fix
+    assert hi.name == "v1080p"  # no NAME=; its own URI directory fills in
     assert [s.type for s in lo.streams] == ["video"]
     assert lo.height == 720
+    assert lo.name == "v720p"
 
     assert [s.type for s in audio.streams] == ["audio"]
     assert audio.language == "en"
@@ -1805,6 +1812,93 @@ def test_muxed_master_with_no_audio_group_is_unchanged(
     assert len(result.renditions) == 2
     for rendition in result.renditions:
         assert sorted(s.type for s in rendition.streams) == ["audio", "video"]
+    assert [r.name for r in result.renditions] == ["v1080p", "v720p"]
+
+
+def test_audio_only_master_yields_one_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No RESOLUTION on the one #EXT-X-STREAM-INF, just an AUDIO= group --
+    the shape ffmpeg's hls muxer writes for an audio-only destination. Its
+    one stream is entirely CLAIMED by the group's own #EXT-X-MEDIA entry
+    (matched by `comment`, same as a hybrid variant's), so it contributes
+    no row of its own: one row, the group's."""
+    master = tmp_path / "master.m3u8"
+    master.write_text(
+        "#EXTM3U\n"
+        '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud1",NAME="audio_0",'
+        'DEFAULT=YES,URI="va0/index.m3u8"\n'
+        '#EXT-X-STREAM-INF:BANDWIDTH=77428,CODECS="mp4a.40.2",AUDIO="aud1"\n'
+        "va0/index.m3u8\n",
+        encoding="utf-8",
+    )
+    _fake_ffprobe_present(monkeypatch)
+    _fake_run(
+        monkeypatch,
+        stdout=json.dumps(
+            {
+                "streams": [
+                    {"index": 0, "codec_type": "audio", "tags": {"comment": "audio_0"}},
+                ],
+                "programs": [_hls_program(0, [0], "77428")],
+                "format": {"format_name": "hls"},
+            }
+        ),
+    )
+    result = probe(str(master))
+    assert result is not None
+    assert len(result.renditions) == 1
+    audio = result.renditions[0]
+    assert [s.type for s in audio.streams] == ["audio"]
+    assert audio.name == "audio_0"
+    assert audio.height is None
+
+
+def test_hybrid_variant_keeps_its_own_muxed_audio_beside_the_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A variant that MUXES its own audio AND names an AUDIO group: the
+    group's copy of the audio carries a `comment` tag (its #EXT-X-MEDIA
+    NAME=, stamped by ffprobe's hls demuxer), the variant's OWN audio
+    carries none -- confirmed against a real hybrid ladder. Only the
+    CLAIMED (group) stream drops from the variant row; the variant's own
+    audio stays, beside its video, on the same row as before."""
+    master = tmp_path / "master.m3u8"
+    master.write_text(
+        "#EXTM3U\n"
+        '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud1",NAME="audio_2",'
+        'DEFAULT=YES,URI="va0/index.m3u8"\n'
+        '#EXT-X-STREAM-INF:BANDWIDTH=369984,RESOLUTION=320x240,'
+        'CODECS="avc1.64000c,mp4a.40.2",AUDIO="aud1"\n'
+        "v240p/index.m3u8\n",
+        encoding="utf-8",
+    )
+    _fake_ffprobe_present(monkeypatch)
+    _fake_run(
+        monkeypatch,
+        stdout=json.dumps(
+            {
+                "streams": [
+                    {"index": 0, "codec_type": "audio", "tags": {"comment": "audio_2"}},
+                    {"index": 1, "codec_type": "video", "width": 320, "height": 240},
+                    {"index": 2, "codec_type": "audio", "tags": {}},
+                ],
+                "programs": [_hls_program(0, [0, 1, 2], "369984")],
+                "format": {"format_name": "hls"},
+            }
+        ),
+    )
+    result = probe(str(master))
+    assert result is not None
+    assert len(result.renditions) == 2
+
+    variant, group = result.renditions
+    assert sorted(s.type for s in variant.streams) == ["audio", "video"]
+    assert variant.height == 240
+    assert variant.name == "v240p"
+
+    assert [s.type for s in group.streams] == ["audio"]
+    assert group.name == "audio_2"
 
 
 def test_demuxed_master_with_two_languages_matches_each_row_by_name(

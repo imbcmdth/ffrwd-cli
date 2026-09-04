@@ -35,7 +35,7 @@ Only an input-side read has facts to report. A field read off a FILTER OUTPUT - 
 | `bandwidth` | number | HLS BANDWIDTH / MPD @bandwidth |
 | `width`, `height` | number | from the rendition's video stream |
 | `codecs` | text | HLS CODECS / MPD @codecs, verbatim |
-| `name` | text | HLS NAME, else NULL |
+| `name` | text | HLS NAME, else the variant playlist's directory; a DASH Representation's id |
 | `language` | text | HLS LANGUAGE / MPD @lang, else NULL |
 
 `WHERE`, `ORDER BY` and `LIMIT` over these columns filter and rank renditions the same as track rows do below ([recipes 105-106](examples.md#105-pick-a-rung-from-an-abr-ladder)); a `format 'hls'`/`format 'dash'` destination fed every surviving rendition writes a new ladder, rung for rung ([recipe 107](examples.md#107-re-encode-an-abr-ladder-through-to-another-abr-ladder)).
