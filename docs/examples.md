@@ -3106,3 +3106,25 @@ file stitched in, then the whole result re-encoded to a fixed ladder,
 all in one query. `testsrc.mp4` never reaches the printed command: it
 is row 2, the `WHERE` drops it before the `concat`, and a row a query
 drops leaves the command entirely rather than showing up as a gap.
+
+## 116. List a source's rows as a table
+
+A bare SELECT over the alias prints the rows instead of running anything, the same as any other table query: the module's own column sits beside the probed ones, and nothing runs but the module and ffprobe.
+
+```pgsql
+CREATE FUNCTION files(paths text) RETURNS source
+  AS '../sidecar/modules/target/wasm32-wasip2/release/source_files.wasm', 'files'
+  LANGUAGE wasm;
+
+SELECT s.sequence, s.width, s.height
+FROM files('tests/fixtures/av.mp4,tests/fixtures/testsrc.mp4') s
+```
+
+```
+$ ffrwd -f query.sql
+ sequence | width | height
+----------+-------+--------
+ 1        | 320   | 240
+ 2        | 320   | 240
+(2 rows)
+```

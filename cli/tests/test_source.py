@@ -33,7 +33,7 @@ from pathlib import Path
 import pytest
 
 from ffrwd import binaries, cli
-from ffrwd.compiler import compile_sql
+from ffrwd.compiler import compile_sql, compile_table_sql
 from ffrwd.emit import build_ffmpeg_args, emit
 from ffrwd.errors import ErrorCode, FfrwdError
 from ffrwd.ir import Graph
@@ -279,6 +279,21 @@ def test_a_url_sources_rows_carry_the_modules_column_beside_the_probed_one() -> 
     assert _url_rows(
         "SELECT s.sequence, s.height, s.ad FROM files('a.mp4,b.mp4') s"
     ) == [[1, 360, "a"], [2, 720, "b"]]
+
+
+def test_a_bare_select_over_a_url_source_describes_the_module_too() -> None:
+    """``ffrwd -f query.sql`` takes the table path, `compile_table_sql`, for a
+    bare SELECT -- and a `RETURNS source` call in its FROM needs the module
+    DESCRIBED exactly as the COPY path describes it, or lowering has no
+    `Described` to bind the call against. Same fakes `_url_rows` hands
+    `lower_table` directly, through the compiler entry point instead."""
+    sinks = compile_table_sql(
+        _URL_DECLARE + "SELECT s.sequence, s.height FROM files('a.mp4,b.mp4') s",
+        describe=lambda path: _url_described(),
+        invoke=_Calls(_URL_ANSWER),
+        probe_path=_URL_PROBES.get,
+    )
+    assert sinks[0].result.rows == [[1, 360], [2, 720]]
 
 
 def test_a_where_on_the_modules_column_maps_that_rows_own_input() -> None:

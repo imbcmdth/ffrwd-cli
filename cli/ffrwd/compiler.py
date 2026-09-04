@@ -51,7 +51,7 @@ from .execute import DEFAULT_TIMEOUT
 from .functions import WasmFunction
 from .inputs import forces_demuxer, probe_options, render_options
 from .ir import Graph
-from .lower import input_option_values, lower_commands, lower_table
+from .lower import ProbePath, input_option_values, lower_commands, lower_table
 from .parser import Resolved, parse, resolve
 from .probe import ProbeFailure, ProbeResult
 from .probe import probe as probe_path
@@ -570,6 +570,9 @@ def compile_table_sql(
     on_warning: OnWarning | None = None,
     owner: tuple[str, str] | None = None,
     unset: Mapping[tuple[int, int], str] | None = None,
+    describe: wasm.Describe = wasm.describe,
+    invoke: wasm.Invoke = wasm.invoke,
+    probe_path: ProbePath = probe_path,
 ) -> list[TableSink]:
     """Compile SQL `text` into its printable table/csv result set(s).
 
@@ -579,17 +582,27 @@ def compile_table_sql(
     :func:`compile_sql`, are legal here — that is the whole difference. Inputs
     are probed opportunistically, same as :func:`compile_sql`.
 
+    `describe`, `invoke` and `probe_path` are the same seams
+    :func:`compile_all` and :func:`ffrwd.lower.lower_table` offer: a
+    ``LANGUAGE wasm`` module is described exactly as it is on the COPY path,
+    so a ``RETURNS source`` or value-returning function in a table query's
+    FROM works the same way it does in a media one.
+
     Raises ``FfrwdError`` — and nothing else — on every rejection.
     """
     try:
         res = resolve(parse(text, unset), packages=packages, on_warning=on_warning, owner=owner)
         probes, probe_failures = _probe_inputs(res)
+        describes = _describe_modules(res, describe)
         return lower_table(
             res,
             probes,
             registry=registry_module.load(),
             on_warning=on_warning,
+            describes=describes,
+            invoke=invoke,
             probe_failures=probe_failures,
+            probe_path=probe_path,
         )
     except FfrwdError:
         raise
