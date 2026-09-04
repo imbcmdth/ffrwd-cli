@@ -1398,6 +1398,10 @@ class _Partitioner:
                 inputs=(),
                 outputs=tuple(track.kind for track in source.tracks),
                 modules=_bindings((source.module,)),
+                grants=tuple(
+                    EffectGrant(effect=effect, module=source.module)
+                    for effect in self.effects.get(source.module, ())
+                ),
                 packet_source=True,
             )
             self.sidecars.append(sidecar)

@@ -32,6 +32,7 @@ from ffrwd.processes import (
     PIPE,
     RAWVIDEO,
     AudioFormat,
+    EffectGrant,
     FfmpegProcess,
     FileEdge,
     ModelBinding,
@@ -1465,6 +1466,21 @@ def test_one_ffmpeg_reads_both_of_a_module_sources_pipes() -> None:
     assert unit.path == "out.mp4"
     resolved = [reader.graph.sources[_alias_of(o.ref)] for o in unit.outputs]
     assert resolved == [0, 1]
+
+
+def test_a_module_source_earns_its_grant_from_effects() -> None:
+    """No graph node backs a module source, so `_region_grants` never sees
+    it -- `_place_module_sources` reads its own module path out of
+    `effects` directly, the mirror of a sink region reading its members'."""
+    plan = partition(_source_sink_graph(), effects={"ffrwd.moq.subscribe": ("udp",)})
+    source = next(p for p in plan.sidecars if p.packet_source)
+    assert source.grants == (EffectGrant(effect="udp", module="ffrwd.moq.subscribe"),)
+
+
+def test_a_module_source_needing_no_effect_is_granted_none() -> None:
+    plan = partition(_source_sink_graph())
+    source = next(p for p in plan.sidecars if p.packet_source)
+    assert source.grants == ()
 
 
 def test_a_module_source_with_two_outputs_is_still_spellable() -> None:

@@ -206,6 +206,13 @@ def _stream_wasm(res: Resolved) -> dict[str, WasmFunction]:
     }
 
 
+def _source_wasm(res: Resolved) -> dict[str, WasmFunction]:
+    """The declared `is_source` wasm functions, keyed by name: what
+    :func:`_stream_wasm` leaves out, since a source has no `stream_kind` to
+    negotiate a wire format on. It still needs its own effects granted."""
+    return {name: declared for name, declared in res.wasm.items() if declared.is_source}
+
+
 def _hosted_wasm(res: Resolved) -> dict[str, WasmFunction]:
     """Every declaration the SIDECAR runs, keyed by name.
 
@@ -548,7 +555,7 @@ def compile_all(
                 shapes=_module_shapes(stream_wasm, describes),
                 audio_wires=_audio_wires(stream_wasm, describes),
                 models=_nn_models(hosted, describes, packages),
-                effects=_effect_grants(stream_wasm, describes),
+                effects=_effect_grants(stream_wasm | _source_wasm(res), describes),
                 anchors=res.input_anchors,
             )
             check_spellable(plan)

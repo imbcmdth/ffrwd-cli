@@ -162,6 +162,10 @@ def test_compile_prints_the_source_riding_alone(
     assert "-m " in sidecar_segment
     assert "-f nut" in sidecar_segment
     assert "-i" not in sidecar_segment
+    # source-replay imports neither wasi:http nor wasi:sockets, so its run
+    # carries neither grant -- see test_wasm.py for a source that does.
+    assert "-http" not in sidecar_segment
+    assert "-net" not in sidecar_segment
 
 
 # ---------------------------------------------------------------------------

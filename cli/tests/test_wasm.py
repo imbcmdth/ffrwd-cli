@@ -26,7 +26,15 @@ import pytest
 from sqlglot import exp
 
 from ffrwd import wasm
-from ffrwd.compiler import Compiled, _nn_models, _pinned_models, compile_all
+from ffrwd.compiler import (
+    Compiled,
+    _effect_grants,
+    _nn_models,
+    _pinned_models,
+    _source_wasm,
+    _stream_wasm,
+    compile_all,
+)
 from ffrwd.errors import ErrorCode, FfrwdError
 from ffrwd.execute import CHAIN, PIPELINE, PipeEdge, plan_argv, render_plan
 from ffrwd.functions import WasmFunction, package_modules
@@ -38,6 +46,7 @@ from ffrwd.processes import (
     PIPE,
     RAWVIDEO,
     AudioFormat,
+    EffectGrant,
     FfmpegProcess,
     ModelBinding,
     ModuleShape,
@@ -4348,6 +4357,45 @@ def test_a_source_called_in_select_is_refused() -> None:
     assert error.hint is not None and "FROM" in error.hint
 
 
+# -- a source's own effects, granted for the run ---------------------------
+
+SOURCE_MODULE = "modules/subscribe.wasm"
+SOURCE_QUERY = (
+    "CREATE FUNCTION subscribe(relay text) RETURNS source\n"
+    f"  AS '{SOURCE_MODULE}', 'subscribe' LANGUAGE wasm;\n"
+    "SELECT s.video[1] FROM subscribe('relay-host') s"
+)
+
+
+def test_stream_wasm_leaves_a_source_out_same_as_ever() -> None:
+    """The wire-negotiation exclusion `_stream_wasm` documents is unchanged
+    by this fix: a source still has no `stream_kind`, so it still takes no
+    part in pix-format/audio-wire negotiation."""
+    res = _resolved(SOURCE_QUERY)
+    declared = next(iter(res.wasm.values()))
+    assert declared.is_source
+    assert declared.module not in _stream_wasm(res)
+
+
+def test_a_sources_own_import_is_granted_through_effect_grants() -> None:
+    """`_source_wasm` is where a source's declaration lives for the one
+    purpose `_stream_wasm` cannot serve it: `_effect_grants` reads its
+    describe payload the same way it reads a stream module's."""
+    res = _resolved(SOURCE_QUERY)
+    declared = next(iter(res.wasm.values()))
+    described = Described(world="ffrwd:av@0.13.0", name="subscribe", udp=True)
+    grants = _effect_grants(_source_wasm(res), {declared.module: described})
+    assert grants == {SOURCE_MODULE: ("udp",)}
+
+
+def test_a_source_needing_no_effect_is_granted_none() -> None:
+    res = _resolved(SOURCE_QUERY)
+    declared = next(iter(res.wasm.values()))
+    described = Described(world="ffrwd:av@0.13.0", name="subscribe")
+    grants = _effect_grants(_source_wasm(res), {declared.module: described})
+    assert grants == {}
+
+
 # -- packet sinks: the encoded edge ----------------------------------------
 
 PACKET_MODULE = "modules/packet_stats.wasm"
@@ -4777,6 +4825,26 @@ def test_a_packet_source_with_no_tracks_is_refused() -> None:
         wasm.shown_argv(_packet_source(outputs=()), writes=[])
     assert PACKET_SOURCE_MODULE in caught.value.message
     assert "no track to write" in caught.value.message
+
+
+def test_a_packet_sources_own_grant_rides_ahead_of_its_module_table() -> None:
+    """A source importing wasi:sockets carries the same ``-net <path>``
+    ahead of ``-m`` a sink's own grant does -- the flag reads `process.grants`
+    without asking whether the process is a source or a sink."""
+    process = replace(
+        _packet_source(),
+        grants=(EffectGrant(effect="udp", module=PACKET_SOURCE_MODULE),),
+    )
+    argv = wasm.shown_argv(process, writes=["p0", "p1"])
+    at = argv.index("-net")
+    assert argv[at + 1] == PACKET_SOURCE_MODULE
+    assert at < argv.index("-m")
+    assert "-http" not in argv
+
+
+def test_a_packet_source_needing_no_effect_carries_no_grant_flag() -> None:
+    argv = wasm.shown_argv(_packet_source(), writes=["p0", "p1"])
+    assert "-http" not in argv and "-net" not in argv
 
 
 def test_a_packet_sources_rows_document_reads_its_path_past_the_tracks() -> None:
