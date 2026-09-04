@@ -33,7 +33,8 @@ function := CREATE FUNCTION name(param type [DEFAULT literal], ...) RETURNS rtyp
             AS 'module', 'export' LANGUAGE wasm
           | CREATE FUNCTION name(rows annotation) RETURNS annotation
             AS 'module', 'export' LANGUAGE wasm
-rtype   := text | number | boolean | <kind>_stream | chapter | cue
+rtype   := text | number | boolean | vector | <kind>_stream | chapter | cue
+         | embedding
          | attachment | any of those with [] | TABLE(col type, ...)
 wstype  := video_stream | audio_stream | either of those with []
 wrtype  := wstype | sink | STRUCT(name wstype, name annotation)
@@ -757,7 +758,7 @@ Every FROM item is a compile-time table; the column model per shape is
 | `input('path', name => value, ...) alias` | 1, or one per rendition of an HLS/DASH manifest | alias mandatory; path is a literal, never computed; trailing named options are ffmpeg's per-input flags; a manifest is a row table ([rows.md](rows.md#rendition-rows---inputladderm3u8-r)) |
 | `ffmpeg.<source>(name => value, ...) alias` | 1 | generated stream (testsrc2, sine, color, anullsrc, ...), no `-i`; options named-only |
 | `<pkg>.<source>(<values>) alias` | one per rendition of its catalog | a `RETURNS source` wasm function, probed at compile time; arguments are values only; reads like a manifest input, and a source reporting itself unbounded is live. Over a values-world export it is invoked at compile time instead: each row it answers names a `url` ffmpeg opens with its own `-i`, and the alias still reads as rendition rows |
-| `unnest(alias.<array>) alias` | one per element | the four stream arrays, or `chapters` / `cues` / `attachments`, of an input declared earlier in the same FROM |
+| `unnest(alias.<array>) alias` | one per element | the four stream arrays, or `chapters` / `cues` / `embeddings` / `attachments`, of an input declared earlier in the same FROM; `cues['title']` and `embeddings['title']` name one track by its title |
 | `unnest(ARRAY[STRUCT(v AS c, ...), ...]) alias` | one per array element | a written row table; columns are the STRUCT field names, every element declaring the same set |
 | `generate_series(start, stop[, step]) alias` | `stop - start` over `step`, inclusive | alias mandatory, names both the row table and its one column (`i.i`); bounds and step are integer literals after substitution |
 | `cte_or_view_name [alias]` | its body's rows | a multi-row body is a multi-row source |
