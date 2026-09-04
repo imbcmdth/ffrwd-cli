@@ -503,6 +503,11 @@ _ARRAY_AGG_PLACE_HINT = (
     "array_agg(volume(t, 0.5)) or concat(VARIADIC array_agg(t)), not "
     "volume(array_agg(t), 0.5)"
 )
+_ARRAY_AGG_FILTER_HINT = (
+    "array_agg(...) FILTER (WHERE ...) accepts one predicate: the aggregated "
+    "column IS NOT NULL, e.g. array_agg(v) FILTER (WHERE v IS NOT NULL) -- "
+    "the explicit spelling of the NULL cells array_agg already skips"
+)
 _GROUP_STREAM_HINT = (
     "a grouped query aggregates its streams: wrap it in array_agg(...), or "
     "make it the group's key"
@@ -2720,6 +2725,28 @@ def _aggregated_columns(projection: exp.Expr | None) -> list[exp.Expr]:
     ]
 
 
+def _array_agg_filter_ok(node: exp.Filter) -> bool:
+    """True when a FILTER clause over ``array_agg`` names its own aggregated
+    column ``IS NOT NULL`` -- the explicit spelling of the NULL cells
+    array_agg already skips (an outer join's gap is not a track). False for
+    ``array_agg`` wrapped in anything else: a NULL check on the wrong column,
+    a different predicate, ``IS NULL`` instead of ``IS NOT NULL``.
+    """
+    agg = node.this
+    if not isinstance(agg, exp.ArrayAgg):
+        return False
+    target = agg.this
+    if not isinstance(target, exp.Expr):
+        return False
+    where = node.args.get("expression")
+    predicate = where.this if isinstance(where, exp.Where) else None
+    if not isinstance(predicate, exp.Is) or not predicate.args.get("negate"):
+        return False
+    if not isinstance(predicate.expression, exp.Null):
+        return False
+    return bool(predicate.this.sql() == target.sql())
+
+
 def _projection_expr(projection: exp.Expr) -> exp.Expr:
     """A SELECT column with its ``AS`` alias and parentheses peeled off."""
     inner = projection.this if isinstance(projection, exp.Alias) else projection
@@ -4145,8 +4172,29 @@ class _Resolver:
         A SINK destination's call is exempt in the same way: the columns
         inside it ARE the SELECT list, moved there by the rewrite that made
         the call, so an aggregate among them is as whole as it ever was.
+
+        ``array_agg(...) FILTER (WHERE ...)`` rides the same exemption at the
+        SAME nodes -- a FILTER wraps an otherwise-whole array_agg, never
+        changing its position -- but only when the predicate is the one
+        thing a NULL-skipping aggregate can spell explicitly: the aggregated
+        column itself, IS NOT NULL. Anything else FILTER might say has no
+        streaming equivalent, so it is refused here, naming the one spelling
+        that is admitted.
         """
-        exempt = _aggregated_columns(array_agg)
+        exempt = list(_aggregated_columns(array_agg))
+        for one in exempt.copy():
+            if not isinstance(one, exp.Filter) or not isinstance(one.this, exp.ArrayAgg):
+                continue
+            if not _array_agg_filter_ok(one):
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    "array_agg(...) FILTER (WHERE ...) does not accept this "
+                    "predicate",
+                    one,
+                    fallback=select,
+                    hint=_ARRAY_AGG_FILTER_HINT,
+                )
+            exempt.append(one.this)
         for sub in node.walk():
             if isinstance(sub, exp.ArrayAgg):
                 if not any(sub is one for one in exempt) and not isinstance(

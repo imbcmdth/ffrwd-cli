@@ -534,6 +534,11 @@ _STREAM_STAR_COLUMNS: tuple[str, ...] = tuple(
     name for name in STAR_COLUMNS if name in STREAM_ARRAY_COLUMNS
 )
 
+# A rendition row's `SELECT *` expands to its two stream arrays, video then
+# audio -- the same two columns a manifest destination reads off a row
+# (:meth:`_Lowerer._row_cells`); a rendition never carries subtitle/data.
+_RENDITION_STAR_COLUMNS: tuple[StreamType, ...] = ("video", "audio")
+
 _TYPE_MARKERS: dict[StreamType, str] = {
     "video": "v",
     "audio": "a",
@@ -1597,10 +1602,19 @@ class _VariantRow:
     A NULL cell is None -- that kind absent from this variant. A video-only
     row is a variant drawing from the audio group, an audio-only row a
     rendition in it, a both-cells row a muxed variant.
+
+    `name`/`language` are what this row's cells carry from an UNMODIFIED read
+    of a rendition row (:attr:`_Stream.rendition`), read off in
+    :meth:`_Lowerer._row_cells`: `name` from the video cell, or the audio
+    cell on an audio-only row; `language` from the audio cell, only where its
+    own stream tags none. Both None where the row carries no such cell, which
+    is where :meth:`_Lowerer._variant_names` falls back to a computed name.
     """
 
     video: _Stream | None
     audio: _Stream | None
+    name: str | None = None
+    language: str | None = None
 
 
 def _compress_manifest_lists(
@@ -1632,19 +1646,36 @@ def _compress_manifest_lists(
             ]
 
 
-def _fallback_names(candidates: list[str | None], prefix: str) -> list[str]:
-    """Each candidate name, or its positional fallback where it fails.
+def _name_counts(*candidate_lists: list[str | None]) -> dict[str, int]:
+    """How many times each name appears, across every list given.
 
-    A name fails when it is missing, ``und``, or shared with another of its
-    kind -- the colliding ones ALL fall back, since neither owns the name.
+    `%v` is ONE directory namespace regardless of kind -- a video row named
+    ``v720p`` and an audio row also named ``v720p`` (the same rendition's
+    own name, read off its audio cell) would both land in ``out/vv720p/``
+    -- so a collision is counted across video and audio together, not per
+    kind.
     """
     counts: dict[str, int] = {}
-    for name in candidates:
-        if name is not None:
-            counts[name] = counts.get(name, 0) + 1
+    for candidates in candidate_lists:
+        for name in candidates:
+            if name is not None:
+                counts[name] = counts.get(name, 0) + 1
+    return counts
+
+
+def _fallback_names(
+    candidates: list[str | None], prefix: str, counts: dict[str, int]
+) -> list[str]:
+    """Each candidate name, or its positional fallback where it fails.
+
+    A name fails when it is missing, ``und``, or shared with another --
+    `counts` (:func:`_name_counts`) says how many times, across every kind
+    sharing the ``%v`` namespace, not just this list -- the colliding ones
+    ALL fall back, since none of them owns the name.
+    """
     return [
         name
-        if name is not None and name != _UNDEFINED_LANGUAGE and counts[name] == 1
+        if name is not None and name != _UNDEFINED_LANGUAGE and counts.get(name, 0) == 1
         else f"{prefix}{position}"
         for position, name in enumerate(candidates)
     ]
@@ -1659,6 +1690,26 @@ def _stream_language(stream: _Stream) -> str | None:
     if language is None or language == _UNDEFINED_LANGUAGE:
         return None
     return str(language)
+
+
+def _rendition_name(stream: _Stream | None) -> str | None:
+    """A cell's rendition NAME -- HLS NAME, a DASH Representation's @id, or a
+    variant playlist's directory -- when it is an unmodified rendition-row
+    read, else None."""
+    if stream is None or stream.rendition is None:
+        return None
+    return stream.rendition.name
+
+
+def _rendition_language(stream: _Stream | None) -> str | None:
+    """A cell's rendition LANGUAGE/@lang, None for none, ``und``, or a cell
+    that carries no rendition provenance."""
+    if stream is None or stream.rendition is None:
+        return None
+    language = stream.rendition.language
+    if language is None or language == _UNDEFINED_LANGUAGE:
+        return None
+    return language
 
 
 # The rate-setting args a chain walk reads: the fps filter's own, and a
@@ -2433,11 +2484,19 @@ class _Stream:
     when every stream feeding it agrees on what it says (:func:`_agreed_source`);
     otherwise it is None, same as an unprobed input. :func:`_provenance` turns
     it into ``Output.metadata``.
+
+    `rendition` is the :class:`~ffrwd.probe.RenditionMeta` a rendition row's
+    cell was built from, set only where :meth:`_Lowerer._rendition_row` mints
+    the stream. It threads through nothing else: a filter output is a freshly
+    built ``_Stream`` that never copies it, so an UNMODIFIED read of a
+    rendition row's ``video``/``audio`` cell is the only way to still carry
+    it by the time a manifest destination or ``Output.metadata`` reads it.
     """
 
     ref: FrameRef
     type: StreamType
     source: StreamMeta | None = None
+    rendition: RenditionMeta | None = None
 
 
 # Table mode only: the sentinel `_Stream.ref` for an
@@ -3426,6 +3485,11 @@ class _Lowerer:
         # carries no track of the kind -- and each sink decides what a NULL
         # cell means (an absent variant, an empty table cell, a rejection).
         self.cte_body = False
+        # True while `array_agg`'s own argument lowers: a NULL cell of the
+        # CTE column it names is dropped rather than refused, the one place
+        # this dialect departs from Postgres's own array_agg (which keeps
+        # NULLs) -- an outer join's gap is not a track.
+        self.array_agg_reads_nulls = False
         # Node id -> one {"row": int, "rendition": {...}} per pad, in the
         # same row-major order `_packet_sink_pads` builds a row-reading
         # sink's pads in. Read there to fold `row`/`rendition` into each
@@ -4350,7 +4414,13 @@ class _Lowerer:
                     "row with a WHERE, or use a join that leaves no all-NULL "
                     "row",
                 )
-            rows.append(_VariantRow(video=video, audio=audio))
+            name = _rendition_name(video) if video is not None else _rendition_name(audio)
+            language = (
+                (_stream_language(audio) or _rendition_language(audio))
+                if audio is not None
+                else None
+            )
+            rows.append(_VariantRow(video=video, audio=audio, name=name, language=language))
         return rows, stripped
 
     def _check_no_null_stream_feeds_a_filter(self, anchor: exp.Expr) -> None:
@@ -4486,9 +4556,8 @@ class _Lowerer:
                 video_seen += 1
             elif row.audio is not None:
                 parts.append(f"name:{audio_names[audio_seen]}")
-                language = _stream_language(row.audio)
-                if language is not None:
-                    parts.append(f"language:{language}")
+                if row.language is not None:
+                    parts.append(f"language:{row.language}")
                 if position == default_row:
                     parts.append("default:yes")
             if row.audio is not None:
@@ -4520,23 +4589,35 @@ class _Lowerer:
     ) -> tuple[list[str], list[str]]:
         """Names for the map's entries, per kind, in output order.
 
-        Video takes its height (``1080p``); audio its language tag. A name
-        that cannot be computed, or that collides with another of its kind,
-        falls back to its position (``v0``, ``a1``) -- files carry ``und``
-        more often than not, and ``%v`` becomes a directory name, so names
-        must exist and must not collide.
+        A row whose cell is an unmodified read of a rendition row (`name`,
+        set in :meth:`_row_cells`) copies that row's own name verbatim.
+        Everything else keeps the computed name it always had: video its
+        height (``1080p``), audio its language tag. A name that cannot be
+        computed, or that collides with another one -- video or audio, both
+        share the one ``%v`` directory namespace -- falls back to its
+        position (``v0``, ``a1``): files carry ``und`` more often than not,
+        and a copied name can repeat across kinds (an audio-only row's cell
+        reading the same rendition a video row's name came from), so names
+        must exist and must not collide with ANY other name in the map.
         """
-        video_streams = [row.video for row in variant_rows if row.video is not None]
-        audio_streams = [
-            row.audio for row in variant_rows if row.audio is not None and row.video is None
+        video_rows = [row for row in variant_rows if row.video is not None]
+        audio_only_rows = [
+            row for row in variant_rows if row.audio is not None and row.video is None
         ]
         # A muxed row's audio never names anything, but it still numbers.
-        heights = [self._output_height(stream.ref) for stream in video_streams]
-        video = _fallback_names(
-            [None if h is None else f"{h}p" for h in heights], "v"
-        )
-        languages = [_stream_language(stream) for stream in audio_streams]
-        named = _fallback_names(languages, "a")
+        heights = [self._output_height(row.video.ref) for row in video_rows if row.video]
+        video_candidates = [
+            row.name if row.name is not None else (None if h is None else f"{h}p")
+            for row, h in zip(video_rows, heights)
+        ]
+        audio_candidates = [
+            row.name if row.name is not None else _stream_language(row.audio)
+            for row in audio_only_rows
+            if row.audio is not None
+        ]
+        counts = _name_counts(video_candidates, audio_candidates)
+        video = _fallback_names(video_candidates, "v", counts)
+        named = _fallback_names(audio_candidates, "a", counts)
         # Audio names index by RENDITION order among audio cells; muxed rows
         # consume an audio index without a name of their own.
         audio: list[str] = []
@@ -5645,6 +5726,11 @@ class _Lowerer:
         """One expression of a grouped branch, recursively."""
         if node.sql() in key_texts or isinstance(node, exp.ArrayAgg):
             return
+        if isinstance(node, exp.Filter) and isinstance(node.this, exp.ArrayAgg):
+            # A FILTER over array_agg only ever names the same column the
+            # aggregate reads -- parser confirmed the predicate -- so its
+            # WHERE clause raises nothing new here.
+            return
         if isinstance(node, exp.Column) and not isinstance(node.this, exp.Star):
             table_node = node.args.get("table")
             binding = (
@@ -6174,8 +6260,12 @@ class _Lowerer:
         A bare ``*`` takes every alias of the FROM clause in FROM order
         (``_Env.bindings`` is insertion-ordered and built by `_scope` in exactly
         that order); ``<alias>.*`` takes one. Within an alias: the container's
-        stream array columns in v/a/s/d order for an input, COLUMN order for a
-        CTE, with array columns splatting.
+        stream array columns in v/a/s/d order for an input, video then audio
+        for a rendition row (one cell per surviving row, NULL where the rung
+        lacks the kind -- identical to spelling ``r.video, r.audio`` out),
+        COLUMN order for a CTE, with array columns splatting. Every other row
+        table (track rows, chapters, ...) refuses a star here: its fields are
+        not streams (:func:`_row_star_error`).
 
         The WHERE window of each alias still applies: for an input alias it is
         already on the ``-i`` (so ``SELECT *`` under a WHERE seeks every stream
@@ -6224,9 +6314,21 @@ class _Lowerer:
         def cte_thunk(column: _Column) -> Callable[[], _Column]:
             return lambda: column
 
+        def rendition_thunk(binding: _RowBinding, kind: StreamType) -> Callable[[], _Column]:
+            return lambda: _Column(name=None, value=self._rendition_row_cells(binding, kind))
+
         for binding in self._star_bindings(qualifier, anchor, env, select):
             if isinstance(binding, _RowBinding):
-                raise _row_star_error(binding, anchor, select)
+                if binding.column != RENDITION_COLUMN:
+                    raise _row_star_error(binding, anchor, select)
+                # A rendition alias's star is its two stream arrays, one cell
+                # per row -- the same expansion an input alias gets, applied
+                # per row (:meth:`_rendition_row_cells`, already how a
+                # manifest destination and a CTE body read `r.video`/`r.audio`).
+                vocabulary |= set(_RENDITION_STAR_COLUMNS)
+                for rendition_kind in _RENDITION_STAR_COLUMNS:
+                    slot(rendition_kind, rendition_thunk(binding, rendition_kind))
+                continue
             if isinstance(binding, _InputBinding):
                 vocabulary |= set(_STREAM_STAR_COLUMNS)
                 for kind, meta in self._star_input(binding.alias, anchor, env, select):
@@ -6684,7 +6786,10 @@ class _Lowerer:
         """
         kinds: dict[StreamType, _Stream] = {}
         for meta in rendition.streams:
-            kinds.setdefault(meta.type, self._source_stream(alias, meta.type, meta.index))
+            kinds.setdefault(
+                meta.type,
+                replace(self._source_stream(alias, meta.type, meta.index), rendition=rendition),
+            )
         primary = kinds.get("video") or kinds.get("audio") or next(iter(kinds.values()), None)
         return _TrackRow(
             stream=primary if primary is not None else _STREAMLESS_ROW,
@@ -9427,6 +9532,11 @@ class _Lowerer:
         if isinstance(node, exp.Bracket | exp.Column):
             alias, value = self._base_stream(node, env, select)
             return self._access(env, alias, value, node, select)
+        if isinstance(node, exp.Filter) and isinstance(node.this, exp.ArrayAgg):
+            # FILTER (WHERE <col> IS NOT NULL): parser already confirmed the
+            # predicate names the aggregated column, so it adds nothing here
+            # -- array_agg skips that NULL cell on its own.
+            return self._lower_array_agg(node.this, env, select)
         if isinstance(node, exp.ArrayAgg):
             return self._lower_array_agg(node, env, select)
         if isinstance(node, exp.Cast):
@@ -9500,6 +9610,15 @@ class _Lowerer:
         unnest row's own stream. A ``[1]`` buried inside a larger expression
         (``scale(r.video[1], 320, -2)``) gets the same reading one layer
         down, in :meth:`_lower_rendition_agg_expr`.
+
+        A bare CTE stream column (``array_agg(vid.v)``) is the other
+        exception: outside the aggregate a NULL cell -- an outer join's gap
+        -- is a typed rejection, but `array_agg` skips it instead
+        (:meth:`_cte_array_agg`), the one place this dialect departs from
+        Postgres's own array_agg, which keeps NULLs. ``FILTER (WHERE
+        vid.v IS NOT NULL)`` on the same column is the explicit spelling of
+        the same thing -- parser admits only that predicate, and lowering
+        never distinguishes it from the bare form.
         """
         inner = node.this
         if not isinstance(inner, exp.Expr):
@@ -9521,7 +9640,43 @@ class _Lowerer:
         rendition = self._rendition_array_agg(inner, env, select)
         if rendition is not None:
             return rendition
+        cte = self._cte_array_agg(inner, env, select)
+        if cte is not None:
+            return cte
         return self._lower_rendition_agg_expr(inner, env, select)
+
+    def _cte_array_agg(
+        self, inner: exp.Expr, env: _Env, select: exp.Select
+    ) -> _Value | None:
+        """``array_agg(<CTE stream column>)``: every surviving row's cell,
+        an outer join's gap dropped instead of refused.
+
+        None for anything else -- a plain column outside a CTE binding, a
+        subscript, a call -- so :meth:`_lower_array_agg` falls back to the
+        ordinary lowering, where a NULL cell still refuses. That narrower
+        reach is deliberate: a NULL cell buried inside a filter call
+        (``array_agg(scale(vid.v, 320, -2))``) would otherwise feed the
+        filter a stream that is not there.
+        """
+        column = _unwrap(inner)
+        if not isinstance(column, exp.Column):
+            return None
+        table_node = column.args.get("table")
+        if table_node is None:
+            return None
+        binding = env.bindings.get(_fold(table_node))
+        if not isinstance(binding, _CteBinding):
+            return None
+        previous = self.array_agg_reads_nulls
+        self.array_agg_reads_nulls = True
+        try:
+            value = self._lower_expr(column, env, select)
+        finally:
+            self.array_agg_reads_nulls = previous
+        if not value.is_array:
+            return value
+        streams = [stream for stream in value.streams if stream.ref != _NULL_STREAM_REF]
+        return _array(value.type, streams)
 
     def _lower_rendition_agg_expr(
         self, inner: exp.Expr, env: _Env, select: exp.Select
@@ -11590,13 +11745,15 @@ class _Lowerer:
     def _null_cells_are_read(self) -> bool:
         """True where a NULL stream cell is something the reader understands:
         a table's empty cell, a manifest row's absent stream kind, a
-        row-reading sink's, and a CTE body, which records its rows for one of
-        those to read later."""
+        row-reading sink's, a CTE body, which records its rows for one of
+        those to read later, and `array_agg`'s own argument, which drops the
+        cell instead of keeping it."""
         return (
             self.table_mode
             or self.manifest is not None
             or self.row_reading_sink
             or self.cte_body
+            or self.array_agg_reads_nulls
         )
 
     def _cte_cell_column(self, binding: _CteBinding, column: _Column) -> bool:
@@ -15017,18 +15174,29 @@ def _provenance(stream: _Stream) -> dict[str, str]:
     Only STREAM_TAG_COLUMNS ride, not every key the source carries: a file's
     ``encoder`` or ``handler_name`` tag riding through a filter would emit
     ``-metadata`` ffmpeg does not emit today.
+
+    A stream with no ``language`` tag of its own, but that still carries
+    :attr:`_Stream.rendition` (an unmodified read of a rendition row's cell),
+    falls back to that rendition's own LANGUAGE/``@lang`` -- the same value
+    a manifest destination's variant map names the row by
+    (:meth:`_Lowerer._variant_names`), now on the output stream itself: it is
+    how a DASH destination, whose map has no ``language:`` entry of its own,
+    still carries it.
     """
     source = stream.source
-    if source is None:
-        return {}
     metadata: dict[str, str] = {}
-    for key in STREAM_TAG_COLUMNS:
-        value = source.metadata.get(key)
-        if value is None:
-            continue
-        if key == "language" and value == _UNDEFINED_LANGUAGE:
-            continue
-        metadata[key] = value
+    if source is not None:
+        for key in STREAM_TAG_COLUMNS:
+            value = source.metadata.get(key)
+            if value is None:
+                continue
+            if key == "language" and value == _UNDEFINED_LANGUAGE:
+                continue
+            metadata[key] = value
+    if "language" not in metadata and stream.rendition is not None:
+        language = stream.rendition.language
+        if language is not None and language != _UNDEFINED_LANGUAGE:
+            metadata["language"] = language
     return metadata
 
 

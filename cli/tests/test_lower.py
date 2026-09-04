@@ -7401,6 +7401,72 @@ def test_two_ctes_joined_on_disjoint_keys_are_rows_built_from_parts() -> None:
     assert _variant_cells(g) == ["v:0", "v:1", "a:0"]
 
 
+# The demuxed ladder's CTEs, disjoint on their join key: `{v}`/`{t}` are the
+# two output columns, filled in by each test below. array_agg over either
+# side skips the row the join left NULL rather than refusing it -- an outer
+# join's gap is not a track -- gathering both sides into ONE file instead of
+# a manifest's separate variants.
+_GATHER_JOIN_QUERY = (
+    "WITH vid AS (SELECT r.video[1] AS v, r.height AS rung "
+    "FROM input('ladder.m3u8') r WHERE r.height IS NOT NULL), "
+    "aud AS (SELECT s.audio[1] AS t, 1000 + s.bandwidth AS rung "
+    "FROM input('ladder.m3u8') s WHERE s.height IS NULL) "
+    "SELECT {v}, {t} FROM vid FULL JOIN aud ON vid.rung = aud.rung"
+)
+
+
+def test_array_agg_over_a_full_join_gathers_both_ctes_into_one_file() -> None:
+    """Every video rung plus the one audio rendition, muxed into one file
+    instead of a manifest: the FULL JOIN leaves each row a gap on the side
+    it did not match, and array_agg drops that cell instead of refusing the
+    3-row relation's NULL, the way a bare read of it would."""
+    g = _lower(
+        "COPY (" + _GATHER_JOIN_QUERY.format(v="array_agg(vid.v)", t="array_agg(aud.t)")
+        + ") TO 'out/all.mkv'",
+        _two_ladder_probes(),
+    )
+    assert [o.ref for o in g.sinks[0].outputs] == [
+        "src:r:v:0",
+        "src:r:v:1",
+        "src:s:a:2",
+    ]
+
+
+def test_array_agg_filter_is_not_null_on_its_own_column_compiles_identically() -> None:
+    """FILTER (WHERE vid.v IS NOT NULL) is the explicit spelling of the NULL
+    cells array_agg already skips: the same file, byte for byte."""
+    g = _lower(
+        "COPY ("
+        + _GATHER_JOIN_QUERY.format(
+            v="array_agg(vid.v) FILTER (WHERE vid.v IS NOT NULL)",
+            t="array_agg(aud.t)",
+        )
+        + ") TO 'out/all.mkv'",
+        _two_ladder_probes(),
+    )
+    assert [o.ref for o in g.sinks[0].outputs] == [
+        "src:r:v:0",
+        "src:r:v:1",
+        "src:s:a:2",
+    ]
+
+
+def test_array_agg_filter_on_a_different_predicate_is_rejected() -> None:
+    """array_agg has one FILTER spelling -- the aggregated column IS NOT
+    NULL -- and refuses every other predicate, naming that one."""
+    err = _reject(
+        "COPY ("
+        + _GATHER_JOIN_QUERY.format(
+            v="array_agg(vid.v) FILTER (WHERE vid.rung > 1)",
+            t="array_agg(aud.t)",
+        )
+        + ") TO 'out/all.mkv'"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "array_agg(...) FILTER (WHERE ...) does not accept this predicate" in err.message
+    assert "IS NOT NULL" in (err.hint or "")
+
+
 def test_a_one_row_cte_joined_into_two_rows_is_a_row_set_of_one() -> None:
     """A CTE body with one row still reads per ROW of the branch's relation:
     the video CTE's stream is on the row it matched and NULL on the audio
@@ -7472,7 +7538,9 @@ def test_the_direct_read_of_a_ladder_at_a_manifest_is_unchanged() -> None:
     """The shortcut every ladder recipe takes: bare ``r.video``/``r.audio``
     read straight off the rows at a manifest destination, one variant per
     rung. Pinned as the whole command, and identical to the ``[1]``
-    spelling's -- a rung carries at most one stream of a kind."""
+    spelling's -- a rung carries at most one stream of a kind. The names,
+    ``Low``/``High``, are the fixture's own rendition names, copied verbatim
+    because both spellings are unmodified reads of the row."""
     bare = (
         "COPY (SELECT r.video, r.audio FROM input('ladder.m3u8') r "
         "WHERE r.height IS NOT NULL) TO 'out/master.m3u8' "
@@ -7498,7 +7566,7 @@ def test_the_direct_read_of_a_ladder_at_a_manifest_is_unchanged() -> None:
         "-keyint_min:1", "60",
         "-sc_threshold:0", "0",
         "-sc_threshold:1", "0",
-        "-var_stream_map", "v:0,a:0,name:720p v:1,a:1,name:1080p",
+        "-var_stream_map", "v:0,a:0,name:Low v:1,a:1,name:High",
         "-master_pl_name", "master.m3u8",
         "-hls_segment_filename", "out/v%v/segment_%d.ts",
         "out/v%v/index.m3u8",
@@ -7508,6 +7576,208 @@ def test_the_direct_read_of_a_ladder_at_a_manifest_is_unchanged() -> None:
         None,
     )
     assert subscripted == args
+
+
+# -- SELECT * over a rendition alias: video then audio, one cell per row,
+#    the same expansion the explicit columns give -- and the provenance an
+#    unmodified cell carries into a manifest's names/languages -------------
+
+
+def test_a_rendition_stars_expansion_matches_the_explicit_columns() -> None:
+    """``SELECT *`` over a rendition alias is byte-identical to spelling
+    ``r.video, r.audio`` out, NULL video cell (the audio-only rung) and all."""
+    probes = {"r": _rendition_probe(_LADDER_FPS)}
+    star = _lower(
+        "COPY (SELECT * FROM input('ladder.m3u8') r) TO 'out/master.m3u8' "
+        "WITH (format 'hls')",
+        probes,
+    )
+    explicit = _lower(
+        "COPY (SELECT r.video, r.audio FROM input('ladder.m3u8') r) "
+        "TO 'out/master.m3u8' WITH (format 'hls')",
+        probes,
+    )
+    assert build_ffmpeg_args(emit(star), None) == build_ffmpeg_args(emit(explicit), None)
+    assert _variant_cells(star) == ["v:0,a:0", "v:1,a:1", "a:2"]
+
+
+def test_a_track_row_star_is_still_refused_in_a_media_query() -> None:
+    """The refusal `_expand_star` still raises for every OTHER row table --
+    only a rendition alias's star gets the array-column expansion."""
+    err = _reject_lower(
+        "SELECT t.* FROM input('f.mkv') f, unnest(f.audio) t", _row_probes()
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "expands their fields" in err.message
+    assert err.hint is not None and "the row is the stream: select t" in err.hint
+
+
+def test_a_rendition_stars_except_and_replace() -> None:
+    """EXCEPT/REPLACE narrow or override the star's two names, ``video`` and
+    ``audio``, the same as they do over an input's four -- narrowed to the
+    High rung with WHERE, since a bare (non-manifest) SELECT takes one row."""
+    probes = {"r": _rendition_probe(_LADDER_FPS)}
+    dropped = _lower(
+        "SELECT * EXCEPT(audio) FROM input('ladder.m3u8') r WHERE r.height = 1080",
+        probes,
+    )
+    assert _outputs(dropped) == [("src:r:v:1", "video", None)]
+    replaced = _lower(
+        "SELECT * REPLACE(scale(r.video[1], 640, -2) AS video) "
+        "FROM input('ladder.m3u8') r WHERE r.height = 1080",
+        probes,
+    )
+    assert _filters(replaced) == ["scale"]
+    assert [o.type for o in replaced.outputs] == ["video", "audio"]
+
+
+def test_a_rendition_stars_unknown_except_name_lists_video_and_audio() -> None:
+    err = _reject_lower(
+        "SELECT * EXCEPT(subtitle) FROM input('ladder.m3u8') r",
+        {"r": _rendition_probe(_LADDER_FPS)},
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert err.hint is not None and "'*' holds: audio, video" in err.hint
+
+
+def test_an_unmodified_cells_name_and_language_reach_an_hls_manifest() -> None:
+    """The video cells keep their rendition's own name; the audio-only row's
+    name AND language come from its rendition too, since the fixture's audio
+    stream also tags itself ``en`` -- own tag and rendition agree here."""
+    g = _lower(
+        "COPY (SELECT r.video, r.audio FROM input('ladder.m3u8') r) "
+        "TO 'out/master.m3u8' WITH (format 'hls')",
+        {"r": _rendition_probe(_LADDER_FPS)},
+    )
+    variants = _variants(g)
+    assert "name:Low" in variants[0]
+    assert "name:High" in variants[1]
+    assert "name:Audio" in variants[2]
+    assert "language:en" in variants[2]
+
+
+def test_a_renditions_language_fills_in_where_the_stream_tags_none() -> None:
+    """Only the RENDITION carries a language here -- the audio stream's own
+    tag is absent -- and it still reaches the map's `language:` entry and
+    the output stream's own `-metadata` tag, DASH included (whose map has no
+    `language:` entry of its own)."""
+    solo = _track("audio", 0, channels=2, codec="aac")  # no language tag
+    probe = ProbeResult(
+        streams=[solo],
+        renditions=[
+            RenditionMeta(
+                streams=[solo], bandwidth=100_000, width=None, height=None,
+                codecs="mp4a.40.2", name="Commentary", language="fra", program_id=1,
+            )
+        ],
+    )
+    hls = _lower(
+        "COPY (SELECT r.audio FROM input('ladder.m3u8') r) "
+        "TO 'out/master.m3u8' WITH (format 'hls')",
+        {"r": probe},
+    )
+    (variant,) = _variants(hls)
+    assert "name:Commentary" in variant
+    assert "language:fra" in variant
+
+    dash = _lower(
+        "COPY (SELECT r.audio FROM input('ladder.m3u8') r) "
+        "TO 'out/master.mpd' WITH (format 'dash')",
+        {"r": probe},
+    )
+    (output,) = dash.outputs
+    assert output.metadata.get("language") == "fra"
+
+
+def test_a_scaled_cell_keeps_the_derived_name_while_its_audio_copies() -> None:
+    """`scale()` builds a fresh stream, so its row falls back to the computed
+    height name exactly as before; the row beside it reads its audio
+    unmodified and keeps the rendition's own name."""
+    g = _lower(
+        "COPY (WITH vid AS (SELECT scale(v.video[1], 640, -2) AS s, v.height AS rung "
+        "FROM input('ladder.m3u8') v WHERE v.height = 1080), "
+        "aud AS (SELECT s.audio[1] AS t, 1000 + s.bandwidth AS rung "
+        "FROM input('ladder.m3u8') s WHERE s.height IS NULL) "
+        "SELECT vid.s, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) "
+        "TO 'out/master.m3u8' WITH (format 'hls', video_codec 'libx264', "
+        "audio_codec 'aac')",
+        {"v": _rendition_probe(_LADDER_FPS), "s": _rendition_probe(_LADDER_FPS)},
+    )
+    video_variant, audio_variant = _variants(g)
+    assert "name:360p" in video_variant  # scale(640, -2) over a 1920x1080 source
+    assert "name:Audio" in audio_variant
+
+
+def test_rendition_names_that_collide_fall_back_to_position() -> None:
+    """Two rungs sharing a name is no name at all for either -- ``%v``
+    becomes a directory, so `_fallback_names` refuses to hand out a
+    duplicate and both variants fall back to their position instead."""
+    lo_v = _track("video", 0, width=1280, height=720)
+    hi_v = _track("video", 1, width=1920, height=1080)
+    probe = ProbeResult(
+        streams=[lo_v, hi_v],
+        renditions=[
+            RenditionMeta(
+                streams=[lo_v], bandwidth=800_000, width=1280, height=720,
+                codecs="avc1.640020", name="Mid", language=None, program_id=1,
+            ),
+            RenditionMeta(
+                streams=[hi_v], bandwidth=3_000_000, width=1920, height=1080,
+                codecs="avc1.64002a", name="Mid", language=None, program_id=2,
+            ),
+        ],
+    )
+    g = _lower(
+        "COPY (SELECT r.video FROM input('ladder.m3u8') r) "
+        "TO 'out/master.m3u8' WITH (format 'hls')",
+        {"r": probe},
+    )
+    video_a, video_b = _variants(g)
+    assert "name:v0" in video_a
+    assert "name:v1" in video_b
+
+
+def test_a_video_and_an_audio_row_sharing_a_name_both_fall_back() -> None:
+    """``%v`` is one directory namespace regardless of kind: an audio-only
+    row copying its rendition's name off the SAME rung a video row is also
+    named for (recipe 123's own shape -- the audio comes from the Low
+    variant's own audio cell) would put both in ``out/vLow/``. Neither owns
+    the name, so both fall back to their position, the same as two
+    same-kind rows sharing one would -- the High row, uninvolved, keeps
+    its own."""
+    g = _lower(
+        "COPY (WITH vid AS (SELECT r.video[1] AS v, r.height AS rung "
+        "FROM input('ladder.m3u8') r WHERE r.height IS NOT NULL), "
+        "aud AS (SELECT s.audio[1] AS t, 1000 + s.bandwidth AS rung "
+        "FROM input('ladder.m3u8') s WHERE s.height = 720) "
+        "SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) "
+        "TO 'out/master.m3u8' WITH (format 'hls')",
+        {"r": _rendition_probe(_LADDER_FPS), "s": _rendition_probe(_LADDER_FPS)},
+    )
+    low, high, audio = _variants(g)
+    assert "name:v0" in low  # collided with the audio row below: falls back
+    assert "name:High" in high  # no collision: keeps its own name
+    assert "name:a0" in audio  # collided with the row above: falls back too
+
+
+def test_a_renditions_name_survives_a_cte_and_a_full_join() -> None:
+    """The demuxed spelling (recipe 123's shape): a rendition's own name
+    rides through a CTE and a FULL JOIN unchanged, since neither builds a
+    new stream -- they only decide which rows survive and how they pair."""
+    g = _lower(
+        "COPY (WITH vid AS (SELECT r.video[1] AS v, r.height AS rung "
+        "FROM input('ladder.m3u8') r WHERE r.height IS NOT NULL), "
+        "aud AS (SELECT s.audio[1] AS t, 1000 + s.bandwidth AS rung "
+        "FROM input('ladder.m3u8') s WHERE s.height IS NULL) "
+        "SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) "
+        "TO 'out/master.m3u8' WITH (format 'hls')",
+        _two_ladder_probes(),
+    )
+    low, high, audio = _variants(g)
+    assert "name:Low" in low
+    assert "name:High" in high
+    assert "name:Audio" in audio
+    assert "language:en" in audio
 
 
 # -- a computed TO reading rendition columns off TWO input aliases: recipe

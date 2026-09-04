@@ -862,7 +862,10 @@ Each column is one of:
   output stream.
 - **`array_agg(<per-row stream expression>)`**: gathers rows in row
   order; must be a whole column, or the sole argument of `VARIADIC`
-  ([rows.md](rows.md#combining-rows)).
+  ([rows.md](rows.md#combining-rows)). Over a CTE's own stream column
+  it skips a NULL cell instead of refusing it; `FILTER (WHERE <col> IS
+  NOT NULL)` on that same column is the admitted, explicit spelling of
+  the same thing, and no other FILTER predicate is.
 - **`ARRAY(<select>)`**: gathers a single-column, countable subquery's
   rows into an array, in expression position - the converse of
   `unnest`, and everywhere an `array_agg` result already stands

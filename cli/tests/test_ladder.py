@@ -1,5 +1,5 @@
 """End-to-end proof for the ABR-ladder recipes (docs/examples.md 104-110,
-123-125).
+123-130).
 
 Builds one real HLS ladder with the compiler (the same shape recipe 104's
 own query produces, run for real rather than only compiled), then executes
@@ -15,7 +15,14 @@ that both muxes its own audio and names an AUDIO group). Recipes 123-125
 run the three shapes a stream column's cardinality decides -- a ladder's
 rows carried through a CTE, one audio repeated over two rungs, and a
 COALESCE over two nullable cells -- and read every master back with the
-compiler's own probe. One fixture (av.mp4), single-digit seconds.
+compiler's own probe. Recipes 126-127 copy-republish the demuxed DASH
+ladder as HLS with `SELECT *`, and re-probe the result to prove a rung's
+own name and language ride through an unmodified read (128 the same,
+trimmed by WHERE; 129's exec proof is the unit tier's, a synthetic probe
+being the more direct way to pin a scaled cell beside a copied one).
+Recipe 130 gathers the same demuxed ladder's two CTEs with array_agg
+instead of COALESCE, into one file rather than a manifest. One fixture
+(av.mp4), single-digit seconds.
 """
 
 from __future__ import annotations
@@ -28,7 +35,7 @@ from pathlib import Path
 import pytest
 
 from ffrwd import cli
-from ffrwd.probe import ProbeResult, clear_cache, probe
+from ffrwd.probe import ProbeResult, RenditionMeta, clear_cache, probe
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 FIXTURES_DIR = PROJECT_ROOT / "tests" / "fixtures"
@@ -190,6 +197,36 @@ COPY (
   format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4',
   video_codec 'libx264', audio_codec 'aac'
 )
+"""
+
+
+# Recipes 126-127: a copy republish, `SELECT *` over a rendition alias --
+# every cell an unmodified read, so ffmpeg needs no codec and every rung's
+# own name (and, where it has one, language) rides straight into the new
+# master's variant map.
+_REPUBLISH_STAR_SQL = """\
+COPY (SELECT * FROM input('{ladder}') r) TO 'out/master.m3u8' WITH (format 'hls')
+"""
+
+
+# Recipe 130: the demuxed ladder's two CTEs gathered with array_agg instead
+# of COALESCE'd row by row -- every video rung plus the audio rendition, as
+# separate tracks in one mkv rather than a manifest's separate variants.
+_GATHER_SQL = """\
+COPY (
+  WITH vid AS (
+    SELECT v.video[1] AS v, v.height AS rung
+    FROM input('{ladder}') v
+    WHERE v.height IS NOT NULL
+  ),
+  aud AS (
+    SELECT b.audio[1] AS t, 1000 + b.bandwidth AS rung
+    FROM input('{ladder}') b
+    WHERE b.height IS NULL
+  )
+  SELECT array_agg(vid.v), array_agg(aud.t)
+  FROM vid FULL JOIN aud ON vid.rung = aud.rung
+) TO 'out/all.mkv'
 """
 
 
@@ -461,3 +498,99 @@ def test_a_hybrid_master_muxes_its_variants_and_names_a_group(
         (720, ["video", "audio"]),
         (None, ["audio"]),
     ]
+
+
+@pytest.mark.exec
+def test_array_agg_gathers_the_demuxed_ladder_into_one_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _fixtures: None
+) -> None:
+    """Recipe 130: array_agg over each side of the FULL JOIN skips the row
+    the other CTE did not match, gathering both video rungs and the one
+    audio rendition into a single mkv rather than a manifest's variants."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "out").mkdir()
+    ladder = (FIXTURES_DIR / "ladder-demuxed" / "master.mpd").as_posix()
+
+    assert cli.main(["run", _GATHER_SQL.format(ladder=ladder), "-y"]) == 0
+    output = tmp_path / "out" / "all.mkv"
+    assert output.exists()
+
+    streams = _probe_json(output)["streams"]
+    assert isinstance(streams, list)
+    assert len([s for s in streams if s["codec_type"] == "video"]) == 2
+    assert len([s for s in streams if s["codec_type"] == "audio"]) == 1
+
+
+def _renditions_by_kind(master: Path) -> dict[tuple[str, ...], RenditionMeta]:
+    """A master's renditions keyed by the sorted kinds they carry -- one
+    video-only, one audio-only, matching both fixtures this proof reads."""
+    clear_cache()
+    result = probe(str(master))
+    assert isinstance(result, ProbeResult)
+    return {tuple(sorted(s.type for s in r.streams)): r for r in result.renditions}
+
+
+def _assert_names_round_trip(
+    before: dict[tuple[str, ...], RenditionMeta], after: dict[tuple[str, ...], RenditionMeta]
+) -> None:
+    """What a `SELECT *` copy-republish's own var_stream_map WROTE, checked
+    against what ffmpeg's hls muxer actually put on disk (confirmed against
+    a real ffmpeg run, hand-built `-var_stream_map` and all, independent of
+    the compiler): a video rung's name rides in its variant playlist's own
+    directory, `out/v%v/...` -- so a republish always gains one literal `v`
+    over the source's own name, landing `0` in `v0/`, or a name that was
+    ALREADY `v1080p` (an earlier compiler's own output) in `vv1080p/`. An
+    audio-only row's `language:` rides in its #EXT-X-MEDIA LANGUAGE=
+    attribute and reads back exactly -- but ffmpeg's hls muxer does not
+    carry `name:` into that entry's NAME= at all: it always writes
+    `audio_<output stream index>` there regardless of what var_stream_map
+    said, so an audio rendition's own name does not survive an HLS
+    round-trip through this attribute. The compiler still WROTE the real
+    name into var_stream_map (recipes 126-127's own pinned command proves
+    that); this is ffmpeg's own limitation on the read side, not the
+    compiler's to work around.
+    """
+    assert before.keys() == after.keys()
+    for kind, before_rendition in before.items():
+        after_rendition = after[kind]
+        assert after_rendition.language == before_rendition.language
+        if kind == ("audio",):
+            assert after_rendition.name == "audio_2"
+        else:
+            assert after_rendition.name == f"v{before_rendition.name}"
+
+
+@pytest.mark.exec
+def test_a_star_republish_of_the_demuxed_dash_ladder_keeps_its_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _fixtures: None
+) -> None:
+    """Recipes 126-127: `SELECT *` over `input(<dash mpd>) r` copy-republishes
+    every rung as HLS -- see `_assert_names_round_trip` for what a re-probe
+    of the result can and cannot still see."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "out").mkdir()
+    source = FIXTURES_DIR / "ladder-demuxed" / "master.mpd"
+    before = _renditions_by_kind(source)
+
+    ladder = source.as_posix()
+    assert cli.main(["run", _REPUBLISH_STAR_SQL.format(ladder=ladder), "-y"]) == 0
+    after = _renditions_by_kind(tmp_path / "out" / "master.m3u8")
+    _assert_names_round_trip(before, after)
+
+
+@pytest.mark.exec
+def test_a_star_republish_of_the_demuxed_hls_ladder_keeps_its_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _fixtures: None
+) -> None:
+    """The same proof over an HLS source whose OWN names are already
+    directory-derived (`v1080p`, `v720p`, from a prior compiler run) -- a
+    republish adds the same one `v`, landing in `vv1080p/`."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "out").mkdir()
+    source = FIXTURES_DIR / "ladder-demuxed-hls" / "master.m3u8"
+    before = _renditions_by_kind(source)
+
+    ladder = source.as_posix()
+    assert cli.main(["run", _REPUBLISH_STAR_SQL.format(ladder=ladder), "-y"]) == 0
+    after = _renditions_by_kind(tmp_path / "out" / "master.m3u8")
+    _assert_names_round_trip(before, after)

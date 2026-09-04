@@ -2850,7 +2850,7 @@ ffmpeg -i tests/fixtures/ladder/master.m3u8 -map 0:v:0 -map 0:v:1 -map 0:a:0 -ma
   -f hls -hls_time 2 -hls_playlist_type vod -hls_segment_type fmp4 -c:0 libx264 -c:1 \
   libx264 -c:2 aac -c:3 aac -g:0 30 -g:1 30 -keyint_min:0 30 -keyint_min:1 30 \
   -sc_threshold:0 0 -sc_threshold:1 0 -var_stream_map \
-  'v:0,a:0,name:1080p v:1,a:1,name:720p' -master_pl_name master.m3u8 \
+  'v:0,a:0,name:v1080p v:1,a:1,name:v720p' -master_pl_name master.m3u8 \
   -hls_segment_filename out/v%v/segment_%d.m4s -hls_fmp4_init_filename init.mp4 \
   out/v%v/index.m3u8
 ```
@@ -3354,10 +3354,18 @@ ffmpeg -i tests/fixtures/ladder/master.m3u8 -map 0:v:0 -map 0:v:1 -map 0:a:1 -f 
   -hls_time 2 -hls_playlist_type vod -hls_segment_type fmp4 -c:0 libx264 -c:1 libx264 \
   -c:2 aac -g:0 30 -g:1 30 -keyint_min:0 30 -keyint_min:1 30 -sc_threshold:0 0 \
   -sc_threshold:1 0 -var_stream_map \
-  'v:0,agroup:aud,name:1080p v:1,agroup:aud,name:720p a:0,agroup:aud,name:a0,'\
-'default:yes' -master_pl_name master.m3u8 -hls_segment_filename out/v%v/segment_%d.m4s \
+  'v:0,agroup:aud,name:v1080p v:1,agroup:aud,name:v1 a:0,agroup:aud,name:a0,default:yes' \
+  -master_pl_name master.m3u8 -hls_segment_filename out/v%v/segment_%d.m4s \
   -hls_fmp4_init_filename init.mp4 out/v%v/index.m3u8
 ```
+
+`WHERE s.height = 720` is an unmodified read of the 720p variant's own
+audio cell, so it carries that rendition's identity - `v720p` - into the
+audio-only row it becomes here, the same way its video cell would. But the
+720p rung's OWN video row is also named `v720p`, and `%v` is one directory
+namespace regardless of kind, so the two would collide (`out/vv720p/`) -
+both fall back to their position (`v1`, `a0`) instead, exactly as two same-
+named rows of one kind already did before this recipe existed.
 
 Reach for this to publish someone else's muxed ladder as a demuxed one -
 one audio rendition instead of a copy per rung - without writing the
@@ -3433,7 +3441,7 @@ ffmpeg -i tests/fixtures/ladder-demuxed/master.mpd -filter_complex \
   0:a:0 -f hls -hls_time 2 -hls_playlist_type vod -hls_segment_type fmp4 -c:0 libx264 \
   -c:1 libx264 -c:2 aac -c:3 aac -c:4 aac -g:0 30 -g:1 30 -keyint_min:0 30 -keyint_min:1 \
   30 -sc_threshold:0 0 -sc_threshold:1 0 -var_stream_map \
-  'v:0,a:0,agroup:aud,name:1080p v:1,a:1,agroup:aud,name:720p a:2,agroup:aud,name:a0,'\
+  'v:0,a:0,agroup:aud,name:0 v:1,a:1,agroup:aud,name:1 a:2,agroup:aud,name:2,'\
 'default:yes' -master_pl_name master.m3u8 -hls_segment_filename out/v%v/segment_%d.m4s \
   -hls_fmp4_init_filename init.mp4 out/v%v/index.m3u8
 ```
@@ -3442,4 +3450,154 @@ Reach for this when a player has to be given both - a variant it can play
 alone and an audio rendition it can switch to. Every COALESCE argument is
 one kind of track, and a row where all of them are NULL is a row with no
 stream of that kind, which the variant map writes as an absent one rather
-than a rejection.
+than a rejection. Names come from the source ladder's own DASH
+Representation ids (`0`, `1`, `2`, this MPD's own numbering, not a
+computed `1080p`) - each row's video cell (or, on the audio-only row, its
+audio cell) is an unmodified read of a rendition row, so it carries that
+rendition's own name rather than one derived from height or language.
+
+## 126. Republish a demuxed ladder with `SELECT *`
+
+A rendition alias's star is its two stream arrays, video then audio, one
+cell per row, NULL where a rung lacks the kind - the same expansion an
+input alias's star gets, applied per row. Nothing here touches a cell, so
+`format 'hls'` needs no codec at all: ffmpeg copies every stream through:
+
+```pgsql
+COPY (SELECT * FROM input(:'ladder') r) TO :'dest' WITH (format 'hls')
+```
+
+```
+$ ffrwd compile -f query.sql -v ladder=tests/fixtures/ladder-demuxed/master.mpd -v dest=out/master.m3u8
+ffmpeg -i tests/fixtures/ladder-demuxed/master.mpd -map 0:v:0 -c:0 copy -map 0:v:1 -c:1 \
+  copy -map 0:a:0 -c:2 copy -f hls -var_stream_map \
+  'v:0,agroup:aud,name:0 v:1,agroup:aud,name:1 a:0,agroup:aud,name:2,default:yes' \
+  -master_pl_name master.m3u8 -hls_segment_filename out/v%v/segment_%d.ts \
+  out/v%v/index.m3u8
+```
+
+The names - `0`, `1`, `2` - are this MPD's own Representation ids, carried
+straight through: every cell here is an unmodified read of the rendition
+row, so its identity rides along rather than being recomputed from height
+or language. Reach for this to mirror or repackage someone else's ladder,
+HLS included, without hand-writing `var_stream_map`.
+
+## 127. The same republish, spelled out
+
+`SELECT r.video, r.audio` names the same two array columns `*` expands to,
+in the same order - the two spellings compile to the identical command,
+because a rendition alias's star IS that expansion, not a shortcut around
+it:
+
+```pgsql
+COPY (SELECT r.video, r.audio FROM input(:'ladder') r) TO :'dest' WITH (format 'hls')
+```
+
+```
+$ ffrwd compile -f query.sql -v ladder=tests/fixtures/ladder-demuxed/master.mpd -v dest=out/master.m3u8
+ffmpeg -i tests/fixtures/ladder-demuxed/master.mpd -map 0:v:0 -c:0 copy -map 0:v:1 -c:1 \
+  copy -map 0:a:0 -c:2 copy -f hls -var_stream_map \
+  'v:0,agroup:aud,name:0 v:1,agroup:aud,name:1 a:0,agroup:aud,name:2,default:yes' \
+  -master_pl_name master.m3u8 -hls_segment_filename out/v%v/segment_%d.ts \
+  out/v%v/index.m3u8
+```
+
+Byte for byte recipe 126's command - `*` over a rendition alias is exactly
+this, never an approximation of it.
+
+## 128. A trimmed ladder keeps its names
+
+`WHERE r.height >= 720` narrows the ladder to its two video rungs - the
+audio-only row's `NULL` height drops it, same as any other predicate - and
+the survivors still carry their own names, unaffected by which rows a
+WHERE keeps or drops:
+
+```pgsql
+COPY (SELECT * FROM input(:'ladder') r WHERE r.height >= 720) TO :'dest' WITH (format 'hls')
+```
+
+```
+$ ffrwd compile -f query.sql -v ladder=tests/fixtures/ladder-demuxed/master.mpd -v dest=out/master.m3u8
+ffmpeg -i tests/fixtures/ladder-demuxed/master.mpd -map 0:v:0 -c:0 copy -map 0:v:1 -c:1 \
+  copy -f hls -var_stream_map 'v:0,name:0 v:1,name:1' -master_pl_name master.m3u8 \
+  -hls_segment_filename out/v%v/segment_%d.ts out/v%v/index.m3u8
+```
+
+Reach for this to publish a floor under a ladder - drop the low rungs (or,
+as here, the audio-only row) and keep the rest exactly as named.
+
+## 129. A computed cell beside a copied one
+
+`scale()` builds a new stream, so its cell's name is derived same as
+always - height, when it can be computed, position when it cannot; the
+row beside it reads `a.audio[1]` unmodified and keeps the rendition's own
+name. One query, two rules, side by side:
+
+```pgsql
+COPY (
+  WITH vid AS (
+    SELECT scale(v.video[1], 960, -2) AS s, v.height AS rung
+    FROM input(:'ladder') v WHERE v.height = 1080
+  ),
+  aud AS (
+    SELECT a.audio[1] AS t, 1000 + a.bandwidth AS rung
+    FROM input(:'ladder') a WHERE a.height IS NULL
+  )
+  SELECT vid.s, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung
+) TO :'dest' WITH (format 'hls', video_codec 'libx264', audio_codec 'aac')
+```
+
+```
+$ ffrwd compile -f query.sql -v ladder=tests/fixtures/ladder-demuxed/master.mpd -v dest=out/master.m3u8
+ffmpeg -i tests/fixtures/ladder-demuxed/master.mpd -filter_complex \
+  '[0:v:0]scale=width=960:height=-2[out0]' -map '[out0]' -map 0:a:0 -f hls -c:0 libx264 \
+  -c:1 aac -g:0 30 -keyint_min:0 30 -sc_threshold:0 0 -var_stream_map \
+  'v:0,agroup:aud,name:720p a:0,agroup:aud,name:2,default:yes' -master_pl_name \
+  master.m3u8 -hls_segment_filename out/v%v/segment_%d.ts out/v%v/index.m3u8
+```
+
+`720p` is computed from the scaled output's own height (960 wide, 4:3 in →
+720 tall out); `2` is the audio rendition's own DASH id, copied because
+`a.audio[1]` never passed through a filter.
+
+## 130. Every rung's video and every audio rendition, gathered into one file
+
+The same demuxed ladder as the recipe above, but into ONE file instead of a
+manifest: every video rung as its own track, plus the one audio rendition,
+muxed together. The FULL JOIN pairs a video row with an audio row that
+shares its key, and leaves the rest unmatched - `array_agg` gathers each
+side's column into the file's track list, skipping the NULL cell an
+unmatched row leaves rather than refusing it, since a gap from the join is
+not a track to write:
+
+```pgsql
+COPY (
+  WITH vid AS (
+    SELECT v.video[1] AS v, v.height AS rung
+    FROM input('tests/fixtures/ladder-demuxed/master.mpd') v
+    WHERE v.height IS NOT NULL
+  ),
+  aud AS (
+    SELECT b.audio[1] AS t, 1000 + b.bandwidth AS rung
+    FROM input('tests/fixtures/ladder-demuxed/master.mpd') b
+    WHERE b.height IS NULL
+  )
+  SELECT array_agg(vid.v), array_agg(aud.t)
+  FROM vid FULL JOIN aud ON vid.rung = aud.rung
+) TO 'out/all.mkv'
+```
+
+```
+$ ffrwd compile -f query.sql
+ffmpeg -i tests/fixtures/ladder-demuxed/master.mpd -map 0:v:0 -c:0 copy -map 0:v:1 -c:1 \
+  copy -map 0:a:0 -c:2 copy out/all.mkv
+```
+
+Reach for this to fold a whole ladder into one container instead of a
+streaming manifest - every rung's video plus the shared audio, as separate
+tracks a player picks between locally. `array_agg(vid.v) FILTER (WHERE
+vid.v IS NOT NULL)` compiles to the exact same command: it is the explicit
+spelling of the NULL cells `array_agg` already skips, admitted as long as
+the predicate names the aggregated column itself. Any other FILTER
+predicate is refused - `array_agg` has one way to say "drop the gaps",
+not a general row filter.
