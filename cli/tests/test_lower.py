@@ -1421,6 +1421,24 @@ def test_the_motion_thumbnail_gather_matches_its_hand_written_form() -> None:
     assert len(gathered.input_paths) == 5
 
 
+@pytest.mark.exec
+def test_concat_nests_directly_as_another_calls_argument() -> None:
+    """cookbook 117's shape: `arealtime(concat(VARIADIC array_agg(t)))` --
+    concat is `arealtime`'s own stream ARGUMENT, not reached through a CTE
+    column the way the motion thumbnail gather above reaches it. Only a live
+    ffmpeg reports concat's own options, so this stays exec-marked like that
+    test."""
+    src = (FIXTURES_DIR / "av-chapters.mkv").as_posix()
+    g = compile_sql(
+        "SELECT arealtime(concat(VARIADIC array_agg(t))) "
+        f"FROM input('{src}') f, unnest(f.audio) t"
+    )
+    assert _filters(g) == ["concat", "arealtime"]
+    assert g.nodes["n1"].args == {"n": 2, "v": 0, "a": 1}
+    assert g.nodes["n1"].inputs == ["src:f:a:0", "src:f:a:1"]
+    assert g.nodes["n2"].inputs == ["n1"]
+
+
 # ---------------------------------------------------------------------------
 # open-ended input windows: >= / <=, either operand order, merging
 # ---------------------------------------------------------------------------
@@ -5269,6 +5287,34 @@ def test_an_n_input_filter_nests(_registry: Registry) -> None:
     )
     assert _filters(g) == ["amix", "volume"]
     assert g.nodes["n2"].inputs == ["n1"]
+
+
+def test_a_variadic_call_nests_as_another_calls_argument(_registry: Registry) -> None:
+    """A VARIADIC call is dispatched the same way in argument position as in
+    column position: ``amix(VARIADIC a.audio)`` still spreads the array into
+    amix's pads when it is `volume`'s stream argument, not `volume`'s own
+    -- the same nesting `concat` (untestable at this tier -- its options are
+    excluded from every fixture registry here) hits in cookbook 117."""
+    g = _dyn(
+        "SELECT volume(amix(VARIADIC a.audio), 0.5) FROM input('x.mp4') a",
+        _registry,
+        {"a": _probe_result(audios=2)},
+    )
+    assert _filters(g) == ["amix", "volume"]
+    assert g.nodes["n1"].inputs == ["src:a:a:0", "src:a:a:1"]
+    assert g.nodes["n2"].inputs == ["n1"]
+
+
+def test_concat_without_variadic_is_still_unknown_with_the_variadic_hint() -> None:
+    """`concat(a, b)` stays UNKNOWN_FUNCTION -- concat is `N->N`, excluded
+    from the registry on both sides, and VARIADIC is the only thing that
+    gives its pad count a source. The fix that lets a VARIADIC call dispatch
+    while nested must not touch the genuinely non-VARIADIC case."""
+    err = _reject_lower(
+        "SELECT concat(f.audio[1], f.audio[2]) FROM input('x.mp4') f", _row_probes()
+    )
+    assert err.code is ErrorCode.UNKNOWN_FUNCTION
+    assert err.hint == lower_module._CONCAT_VARIADIC_HINT
 
 
 def test_an_n_input_filter_with_no_help_output_is_still_callable(

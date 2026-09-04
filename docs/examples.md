@@ -3254,3 +3254,17 @@ $ ffrwd -f query.sql
 `cues` and `translated` are two different subtitle placeholders, each its own rows document - but one `captions` node writes both: `translated` reads `cues`'s rows through the same rows edge [recipe 113](#113-translate-captions-as-they-are-produced) draws inline, resolved here through the CTE column that names it instead of the call that produced it. A chain of CTEs - `d` selecting from a CTE that itself selects `captions(...).cues` - resolves the same edge the same way, one level further back.
 
 `cues` reads back the same way over the caption tracks - `unnest(f.cues) c` is every one of them, with `c.track`, `c.text` and the bounds - and a title names one track: `unnest(f.embeddings['clip_vectors']) v`, `unnest(f.cues['speech']) c`. A title the file does not carry is a rejection listing the ones it does. The rows are compile-time rows like any other, so `WHERE`, `ORDER BY` and `cos_similarity(v.vector, embed_text('a small pet'))` narrow and rank them ([recipe 114](#114-rank-rows-by-a-vector)) before anything runs.
+
+## 120. Pace a concatenation to a live destination
+
+A VARIADIC call stands wherever a stream does, including as another call's argument: `concat(VARIADIC array_agg(t))` is `realtime`'s own stream argument here, not a whole SELECT column of its own. `realtime` after the concat holds the stitched stream to the clock, which `-re` on each input cannot do for a concatenation - each input would be paced from process start, not from where the stitched result actually is. The column is audio, so the compiler writes the audio twin, `arealtime` ([filters.md](filters.md)). Reach for this to play a stitched sequence out to a socket in real time.
+
+```pgsql
+COPY (
+  SELECT realtime(concat(VARIADIC array_agg(t)))
+  FROM input('tests/fixtures/av-chapters.mkv') f, unnest(f.audio) t
+) TO 'udp://127.0.0.1:5004' WITH (format 'mpegts', audio_codec 'aac')
+ffmpeg -i tests/fixtures/av-chapters.mkv -filter_complex \
+  '[0:a:0][0:a:1]concat=n=2:v=0:a=1,arealtime[out0]' -map '[out0]' -f mpegts -c:0 aac \
+  udp://127.0.0.1:5004
+```

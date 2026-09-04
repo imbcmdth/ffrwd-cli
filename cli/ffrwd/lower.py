@@ -3251,6 +3251,13 @@ class _Lowerer:
         # (module, function, sorted args) -> result, so two calls with the
         # same arguments run the module once per compile.
         self._invoke_cache: dict[tuple[str, str, tuple[tuple[str, object], ...]], object] = {}
+        # id(VARIADIC array expression) -> its lowered value. The classifier
+        # (:meth:`_classify`) needs a VARIADIC call's real element type to
+        # answer a nested `concat`'s kind, which means lowering the array
+        # once there; the cache is what keeps the call's own later lowering
+        # (:meth:`_variadic_array`) from doing that work, and any node it
+        # creates, a second time.
+        self._variadic_array_cache: dict[int, _Value] = {}
         self.on_warning = on_warning
         self.graph = Graph(input_paths=list(res.input_paths), sources=dict(res.sources))
         self.ctx = _NodeFactory(self.graph)
@@ -13094,10 +13101,20 @@ class _Lowerer:
         non-empty one (a filter call with no inputs is not a filter call, and
         this is the one place that says so), and the streams themselves,
         already lowered.
+
+        Cached by the array expression's identity: the classifier
+        (:meth:`_classify`) needs this same array's element type to answer a
+        nested `concat`'s kind, ahead of the call's own lowering reaching
+        here -- so the second call reuses what the first already lowered
+        instead of building it, and any node under it, twice.
         """
         variadic = call.variadic
         assert variadic is not None  # callers only reach here when it is
+        cached = self._variadic_array_cache.get(id(variadic))
+        if cached is not None:
+            return cached
         value = self._lower_expr(variadic, env, select)
+        self._variadic_array_cache[id(variadic)] = value
         if not value.is_array:
             raise _error(
                 ErrorCode.UDF_ARG_TYPE,
@@ -14108,6 +14125,18 @@ class _Lowerer:
             n_input = self._n_input_call(name)
             if n_input is not None:
                 return n_input[0].output
+            # `concat` is excluded from the registry on BOTH sides (`N->N`),
+            # so it is unreachable here unless VARIADIC gave its pad count a
+            # source -- exactly the condition :meth:`_lower_call` dispatches
+            # on before ever reaching this classifier. Mirrored here so a
+            # nested VARIADIC call (`arealtime(concat(VARIADIC array_agg(t)))`)
+            # is classified the same way a top-level one lowers, instead of
+            # falling through to the ordinary registry lookup, where a call
+            # this shape can never be found.
+            if call.variadic is not None:
+                concat_options = self._concat_options(name)
+                if concat_options is not None:
+                    return self._variadic_array(call, node, env, select).type
             dynamic = self.registry.get(name) if self.registry is not None else None
             if dynamic is None:
                 raise _error(
