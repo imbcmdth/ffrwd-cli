@@ -492,7 +492,9 @@ def test_an_unknown_namespace_says_what_this_project_has(tmp_path: Path) -> None
         ErrorCode.UNKNOWN_FUNCTION,
         "unknown namespace 'you'",
     )
-    assert error.hint == "namespaces this project can call: me"
+    assert error.hint == (
+        f"namespaces this project can call: me; consulted {tmp_path / 'ffrwd.json'}"
+    )
 
 
 def test_a_one_segment_qualifiers_unknown_namespace_hints_the_explicit_form(
@@ -702,7 +704,31 @@ def test_a_two_segment_call_naming_no_package_in_a_shared_namespace_says_what_it
         ErrorCode.UNKNOWN_FUNCTION,
         "namespace 'me' has no package 'quieter'",
     )
-    assert error.hint == "me holds: alpha, beta"
+    assert error.hint == f"me holds: alpha, beta; consulted {project / MANIFEST_NAME}"
+
+
+def test_the_same_call_with_no_project_anywhere_consults_the_global_packages(
+    store_home: Path,
+    tmp_path: Path,
+) -> None:
+    """No manifest and no lockfile above `bare`: the hint names the global set and the
+    directory the walk searched, the other half of the pair above."""
+    first = _installed(_library(tmp_path / "one", "me", "0.5", package="alpha"))
+    second = _installed(_library(tmp_path / "two", "me", "0.25", package="beta"))
+    _lock(store.global_lock_path().parent, [first, second])
+    bare = tmp_path / "no_project"
+    bare.mkdir()
+    packages = discover(bare)
+    assert packages is not None
+    error = _rejects(
+        "COPY (SELECT me.quieter(f.audio[1]) FROM input('film.mkv') f) TO 'out.mkv'",
+        packages,
+        ErrorCode.UNKNOWN_FUNCTION,
+        "namespace 'me' has no package 'quieter'",
+    )
+    assert error.hint == (
+        f"me holds: alpha, beta; consulted the global packages: no ffrwd.json above {bare}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1089,22 +1115,8 @@ def test_a_script_function_does_not_shadow_a_generated_source() -> None:
 
 
 # ---------------------------------------------------------------------------
-# the CLI derives the project from -f's path, or the working directory
+# the CLI derives the project from the working directory; -f's path plays no part
 # ---------------------------------------------------------------------------
-
-
-def test_the_cli_finds_the_project_above_the_query_file(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    _project(tmp_path, files={"src/tracks.sql": QUIETER})
-    query = tmp_path / "queries" / "out.sql"
-    query.parent.mkdir()
-    query.write_text(
-        "COPY (SELECT me.edits.quieter(f.audio[1], 0.5) FROM input('film.mkv') f) TO 'out.mkv'",
-        encoding="utf-8",
-    )
-    assert cli.main(["compile", "-f", str(query)]) == 0
-    assert "volume=volume=0.5" in capsys.readouterr().out
 
 
 def test_the_cli_finds_the_project_above_the_working_directory(
@@ -1122,6 +1134,45 @@ def test_the_cli_finds_the_project_above_the_working_directory(
     )
     assert code == 0
     assert "volume=volume=0.5" in capsys.readouterr().out
+
+
+def test_cwd_inside_a_project_resolves_it_even_with_a_query_file_outside(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The project is the working directory's; where a `-f` file sits is irrelevant."""
+    project = tmp_path / "project"
+    _project(project, files={"src/tracks.sql": QUIETER})
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    query = outside / "out.sql"
+    query.write_text(
+        "COPY (SELECT me.edits.quieter(f.audio[1], 0.5) FROM input('film.mkv') f) TO 'out.mkv'",
+        encoding="utf-8",
+    )
+    code, out, err = _run(project, monkeypatch, capsys, "compile", "-f", str(query))
+    assert code == 0, err
+    assert "volume=volume=0.5" in out
+
+
+def test_a_query_file_inside_a_project_does_not_reach_it_from_another_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A query file is data: sitting inside a project does not make that project the cwd's."""
+    project = tmp_path / "project"
+    _project(project, files={"src/tracks.sql": QUIETER})
+    query = project / "queries" / "out.sql"
+    query.parent.mkdir()
+    query.write_text(
+        "COPY (SELECT me.edits.quieter(f.audio[1], 0.5) FROM input('film.mkv') f) TO 'out.mkv'",
+        encoding="utf-8",
+    )
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    code, _out, err = _run(elsewhere, monkeypatch, capsys, "compile", "-f", str(query))
+    # No project anywhere above `elsewhere`, so `me.edits.quieter(...)` is not a package
+    # call at all -- rejected exactly as an unqualified dotted call always was.
+    assert code == 1
+    assert "got a DOT expression" in err
 
 
 def test_the_cli_reports_a_malformed_manifest(

@@ -524,6 +524,12 @@ class PackageSet:
     a lockfile was found above it. It is what makes landing on the global
     layer worth warning about: outside a project, a globally installed package
     is the only thing there is to resolve against.
+
+    `manifest` is the ``ffrwd.json`` the walk found, or None when it found
+    none; `start` is the directory the walk began from. A rejection that
+    needs to say what discovery consulted reads both rather than guessing
+    from `root`, which is populated from a lockfile or the start directory
+    itself when there is no manifest.
     """
 
     root: Path
@@ -532,6 +538,8 @@ class PackageSet:
     wants: dict[str, dict[str, str]] = field(default_factory=dict)
     project: str | None = None
     in_project: bool = True
+    manifest: Path | None = None
+    start: Path | None = None
 
     def get(self, name: str) -> Package | None:
         """The canonical package `name` names, by its full ``<namespace>/<package>``."""
@@ -2475,4 +2483,6 @@ def discover(start: Path | str | None = None) -> PackageSet | None:
         wants=wants,
         project=project.name if project is not None else None,
         in_project=in_project,
+        manifest=manifest,
+        start=base,
     )

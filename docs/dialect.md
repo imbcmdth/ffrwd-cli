@@ -369,10 +369,10 @@ types are read from the files), the recipes with the variables each
 declares (read from its `-- variables:` header), and the dependencies.
 `--json` for scripting.
 
-The project is found by walking up from the query file's directory, or
-from the working directory for a query typed on the command line; there
-is no flag. Outside a project nothing changes: a namespaced call is
-rejected as it always was. Library callers pass
+The project is found by walking up from the working directory; there
+is no flag, and a query file's own directory plays no part. Outside a
+project nothing changes: a namespaced call is rejected as it always
+was, and the rejection names what was consulted. Library callers pass
 `compile_sql(text, packages=ffrwd.discover(path))` rather than
 relying on a working directory, and the MCP tools take the same path as
 a `project` argument.

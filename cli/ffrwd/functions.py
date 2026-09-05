@@ -2616,6 +2616,19 @@ def _is_null(node: exp.Expr) -> bool:
     return isinstance(node, exp.Null)
 
 
+def _consulted(packages: PackageSet) -> str:
+    """What a package lookup consulted, for a rejection to name.
+
+    The project's own manifest when discovery found one; otherwise the
+    directory the walk started from, so a user running from the wrong
+    place sees why they landed on the global packages.
+    """
+    if packages.manifest is not None:
+        return f"consulted {packages.manifest}"
+    start = packages.start if packages.start is not None else Path.cwd()
+    return f"consulted the global packages: no ffrwd.json above {start}"
+
+
 # -- the pass --------------------------------------------------------------
 
 
@@ -2863,19 +2876,21 @@ class _Expander:
                 hint=f"did you mean '{near[0]}'?"
                 if near
                 else (
-                    f"namespaces this project can call: {', '.join(known)}"
+                    f"namespaces this project can call: {', '.join(known)}; "
+                    f"{_consulted(packages)}"
                     if known
-                    else "no packages are installed"
+                    else f"no packages are installed; {_consulted(packages)}"
                 ),
             )
         held = [package.package for package in packages.in_namespace(namespace)]
+        holds = (
+            f"{namespace} holds: {', '.join(held)}" if held else f"{namespace} holds no packages"
+        )
         raise _error(
             ErrorCode.UNKNOWN_FUNCTION,
             f"namespace '{namespace}' has no package '{package_name}'",
             anchor,
-            hint=f"{namespace} holds: {', '.join(held)}"
-            if held
-            else f"{namespace} holds no packages",
+            hint=f"{holds}; {_consulted(packages)}",
         )
 
     def _reach(

@@ -701,18 +701,6 @@ def _parse_set_vars(pairs: list[str], command: str) -> tuple[dict[str, str] | No
     return variables, 0
 
 
-def _project_start(args: argparse.Namespace) -> Path:
-    """Where the upward walk for ``ffrwd.json`` starts.
-
-    A ``-f PATH`` query is read from a file, and the project it belongs to is
-    the one above that file's own directory. A positional query and ``-f -``
-    were typed at the shell, so the walk starts at the working directory.
-    """
-    if args.file is not None and args.file != "-":
-        return Path(args.file).parent
-    return Path.cwd()
-
-
 _LEADING_WORD_RE = re.compile(r"[A-Za-z]+")
 
 
@@ -995,9 +983,11 @@ def _resolve_query(
     naming a variable the text never references), 1 for a file that could not
     be read.
 
-    ``packages`` is the project the query was written in, or None when the walk
-    finds no manifest -- the ordinary case, and the one where a compile is
-    exactly what it was before projects existed.
+    ``packages`` is the project at the working directory, or None when the walk
+    finds no manifest above it -- the ordinary case, and the one where a
+    compile is exactly what it was before projects existed. A query file's own
+    directory, given with ``-f``, plays no part: a query file is data, not a
+    project marker.
 
     A positional that does not begin a statement and names a recipe one of
     those packages ships is that recipe: its file's text replaces it, and
@@ -1032,7 +1022,7 @@ def _resolve_query(
         assert args.query is not None
         text = args.query
 
-    packages = discover(_project_start(args))
+    packages = discover(Path.cwd())
     recipe: str | None = None
     owner: tuple[str, str] | None = None
     if not has_file and not _starts_a_statement(text):
