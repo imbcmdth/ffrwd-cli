@@ -60,7 +60,7 @@ from ffrwd import packages as packages_module
 from ffrwd.console import Announce, Console, written_size
 from ffrwd.errors import ErrorCode, FfrwdError
 from ffrwd.parser import copy_destinations, input_specs
-from ffrwd.probe import is_url
+from ffrwd.probe import is_url, probe
 from ffrwd.project import (
     LOCKFILE_NAME,
     MANIFEST_NAME,
@@ -151,6 +151,27 @@ def _reject(
     message: str, hint: str, *, line: int | None = None, col: int | None = None
 ) -> FfrwdError:
     return FfrwdError(ErrorCode.UNSUPPORTED_SQL, message, line=line, col=col, hint=hint)
+
+
+def _check_bounded(text: str) -> None:
+    """Refuse an input ffprobe can see is unbounded, before anything uploads.
+
+    A courtesy, not the decision: a path this machine cannot probe -- ffprobe
+    absent, a URL it cannot reach -- passes, and the runner's own probe is
+    what refuses it there.
+    """
+    for spec in input_specs(text):
+        result = probe(spec.path)
+        if result is None:
+            continue
+        if result.live or result.duration is None:
+            raise _reject(
+                f"input '{spec.path}' has no bounded duration, and the hosted "
+                "runner takes only sources it can bound",
+                "drop --remote and run it locally",
+                line=spec.line,
+                col=spec.col,
+            )
 
 
 def _jobs_url() -> str:
@@ -326,6 +347,7 @@ def submit_run(
     token = _token()
     text = query.text
     inputs, uploads = _inputs(text)
+    _check_bounded(text)
     lock, archives = _lock(packages)
 
     spec: dict[str, object] = {

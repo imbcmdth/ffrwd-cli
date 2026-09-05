@@ -23,7 +23,7 @@ import pytest
 import ffrwd
 from ffrwd import cli, credentials, packages, parser, remote, store
 from ffrwd.errors import FfrwdError
-from ffrwd.probe import is_url
+from ffrwd.probe import ProbeResult, is_url
 from ffrwd.project import LinkEntry, RegistryEntry, links_path, write_linksfile, write_lockfile
 from ffrwd.table import TableResult, render_table
 
@@ -68,6 +68,7 @@ class _Served:
 
     def __init__(self) -> None:
         self.answers: dict[str, object] = {}
+        self.probes: dict[str, ProbeResult] = {}
         self.asked: list[tuple[str, dict[str, str], bytes | None]] = []
 
     def __call__(self, request: object, timeout: float | None = None) -> _Fake:
@@ -96,6 +97,9 @@ def served(monkeypatch: pytest.MonkeyPatch) -> Iterator[_Served]:
     fake = _Served()
     monkeypatch.setenv(packages.API_ENV, API)
     monkeypatch.setattr(packages, "_urlopen", fake)
+    # ffprobe never runs in the unit tier: an input probes as whatever the
+    # test put in `probes`, and as nothing at all otherwise.
+    monkeypatch.setattr(remote, "probe", lambda path, *args, **kwargs: fake.probes.get(path))
     yield fake
 
 
@@ -128,6 +132,51 @@ def _query(text: str, **overrides: object) -> cli._Query:
     values: dict[str, object] = {"text": text, "unset": {}, "recipe": None, "source": text}
     values.update(overrides)
     return cli._Query(**values)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "probed",
+    [ProbeResult(streams=[], duration=None), ProbeResult(streams=[], duration=30.0, live=True)],
+    ids=["no-duration", "live"],
+)
+def test_an_input_ffprobe_calls_unbounded_is_refused_before_any_request(
+    served: _Served,
+    logged_in: None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    probed: ProbeResult,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "in.mp4").write_bytes(b"x")
+    served.probes["in.mp4"] = probed
+    with pytest.raises(FfrwdError) as caught:
+        remote.submit_run(_query(MEDIA_QUERY), None, _run_args())
+    assert caught.value.message == (
+        "input 'in.mp4' has no bounded duration, and the hosted runner takes only "
+        "sources it can bound"
+    )
+    assert caught.value.hint == "drop --remote and run it locally"
+    assert caught.value.line == 1
+    assert served.asked == []
+
+
+def test_a_bounded_input_submits_and_an_unprobeable_one_is_the_runners_call(
+    served: _Served, logged_in: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "in.mp4").write_bytes(b"x")
+    digest = hashlib.sha256(b"x").hexdigest()
+    _submit_accepted(served)
+    served.answers[f"{UPLOAD_URL}?sha256={digest}"] = json.dumps(
+        {"already": False, "bytes": 1}
+    ).encode("utf-8")
+    served.probes["in.mp4"] = ProbeResult(streams=[], duration=12.5)
+    remote.submit_run(_query(MEDIA_QUERY), None, _run_args())
+    assert [asked for asked, _headers, _body in served.asked][0] == JOBS_URL
+    served.asked.clear()
+    # A URL this machine cannot probe passes through: the runner probes it.
+    remote.submit_run(_query(STREAM_QUERY), None, _run_args())
+    assert [asked for asked, _headers, _body in served.asked][0] == JOBS_URL
 
 
 # ---------------------------------------------------------------------------
