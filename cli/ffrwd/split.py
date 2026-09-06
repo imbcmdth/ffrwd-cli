@@ -57,10 +57,12 @@ two sinks reading one view's pad DO get a split.
 `insert_splits` is pure (returns a new Graph, never mutates `g`) and
 idempotent -- every ref in the result has exactly one consumer. Everything
 outside the pad SHAPE -- each sink's `path`/`options`, `Graph.input_trims`,
-`Graph.input_options` -- is copied verbatim.
+`Graph.input_options` -- passes through unchanged.
 """
 
 from __future__ import annotations
+
+from dataclasses import replace
 
 from .ir import FrameRef, Graph, Node, Output, SinkUnit, StreamType, is_src, src_parts
 
@@ -194,23 +196,8 @@ def insert_splits(g: Graph) -> Graph:
         for unit in g.sinks
     ]
 
-    return Graph(
-        input_paths=list(g.input_paths),
-        sources=dict(g.sources),
-        nodes=new_nodes,
-        sinks=new_sinks,
-        # Not pad shape -- properties of the output files, the `-i` entries
-        # and the module nodes, which keep their ids -- so they pass through
-        # untouched, already validated.
-        input_trims=dict(g.input_trims),
-        input_options={alias: dict(options) for alias, options in g.input_options.items()},
-        rows_sinks=dict(g.rows_sinks),
-        module_sinks=list(g.module_sinks),
-        packet_sinks={
-            name: [dict(pad) for pad in pads]
-            for name, pads in g.packet_sinks.items()
-        },
-        module_sources=dict(g.module_sources),
-        url_sources=dict(g.url_sources),
-        dropped_aliases=set(g.dropped_aliases),
-    )
+    # Everything else -- properties of the output files, the `-i` entries and
+    # the module nodes, which keep their ids -- is not pad shape, so it passes
+    # through untouched via `replace`: a field added to `Graph` later survives
+    # this pass without another edit here.
+    return replace(g, nodes=new_nodes, sinks=new_sinks)

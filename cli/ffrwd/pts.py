@@ -38,6 +38,8 @@ nodes, same refs, nothing added).
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from .ir import FrameRef, Graph, Node, Output, SinkUnit, StreamType
 
 # The filter names this pass reacts to, and the reset it inserts for each.
@@ -126,24 +128,9 @@ def insert_pts_resets(g: Graph) -> Graph:
         for unit in g.sinks
     ]
 
-    return Graph(
-        input_paths=list(g.input_paths),
-        sources=dict(g.sources),
-        nodes=new_nodes,
-        sinks=new_sinks,
-        # Not filtergraph shape -- properties of the output files, the `-i`
-        # entries and the module nodes, which keep their ids, and the seek
-        # path this pass never touches -- so they pass through untouched,
-        # already validated.
-        input_trims=dict(g.input_trims),
-        input_options={alias: dict(options) for alias, options in g.input_options.items()},
-        rows_sinks=dict(g.rows_sinks),
-        module_sinks=list(g.module_sinks),
-        packet_sinks={
-            name: [dict(pad) for pad in pads]
-            for name, pads in g.packet_sinks.items()
-        },
-        module_sources=dict(g.module_sources),
-        url_sources=dict(g.url_sources),
-        dropped_aliases=set(g.dropped_aliases),
-    )
+    # Everything else -- properties of the output files, the `-i` entries and
+    # the module nodes, which keep their ids, and the seek path this pass
+    # never touches -- is not filtergraph shape, so it passes through
+    # untouched via `replace`: a field added to `Graph` later survives this
+    # pass without another edit here.
+    return replace(g, nodes=new_nodes, sinks=new_sinks)

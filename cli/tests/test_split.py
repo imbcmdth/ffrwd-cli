@@ -421,7 +421,11 @@ def test_one_node_pad_read_by_two_sinks_is_split() -> None:
 
 def test_everything_outside_the_pad_shape_survives_a_graph_with_no_fanout() -> None:
     """This pass rewrites pads; a window and an option set belong to an `-i`,
-    so they pass through verbatim (the same rule `sink` follows)."""
+    so they pass through unchanged (the same rule `sink` follows). The pass
+    rebuilds `nodes`/`sinks` via `dataclasses.replace`, so an untouched field
+    like `input_trims`/`input_options` rides through as the same object `g`
+    holds -- see `test_graph_field_preservation.py` for the general
+    sweep."""
     g = _no_fanout_graph()
     g.input_trims = {"a": (1.5, 4.0), "b": (0, 2)}
     g.input_options = {"a": {"loop": True}, "b": {"framerate": 15}}
@@ -429,11 +433,6 @@ def test_everything_outside_the_pad_shape_survives_a_graph_with_no_fanout() -> N
     assert out.input_trims == {"a": (1.5, 4.0), "b": (0, 2)}
     assert out.input_options == {"a": {"loop": True}, "b": {"framerate": 15}}
     assert out.nodes.keys() == g.nodes.keys()  # nothing else changed either
-    # purity: mutating the result must not reach back into the input graph
-    out.input_trims["b"] = (9.0, 9.0)
-    out.input_options["b"]["framerate"] = 30
-    assert g.input_trims == {"a": (1.5, 4.0), "b": (0, 2)}
-    assert g.input_options == {"a": {"loop": True}, "b": {"framerate": 15}}
 
 
 def test_everything_outside_the_pad_shape_survives_a_graph_that_splits() -> None:
