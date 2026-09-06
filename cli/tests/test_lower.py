@@ -1449,18 +1449,24 @@ def test_concat_nests_directly_as_another_calls_argument() -> None:
 _SEARCH_BRANCH = (
     "SELECT amix(VARIADIC array_agg("
     "ffmpeg.atrim({alias}.audio[1], start => {row}.{row}, end => {row}.{row} + 1))) "
-    "FROM input('x.mp4') {alias}, generate_series(1, 3) {row} WHERE {row}.{row} {bound}"
+    "FROM input('{path}') {alias}, generate_series(1, 3) {row} WHERE {row}.{row} {bound}"
 )
 _KEEPS_TWO = "<= 2"
 _KEEPS_NONE = ">= 9"
 
 
-def _search(*bounds: str) -> str:
-    """One branch per bound, UNION ALL'd, each over its own series rows."""
+def _search(*bounds: str, paths: tuple[str, str] = ("x.mp4", "x.mp4")) -> str:
+    """One branch per bound, UNION ALL'd, each over its own series rows.
+
+    `paths` defaults to the SAME literal for both branches -- the find
+    recipe's own shape, whose two aliases dedup onto one `-i` regardless of
+    which branch drops. Two different paths are what shows a dropped
+    branch's own input never opens at all.
+    """
     names = (("f", "i"), ("g", "j"))
     branches = [
-        _SEARCH_BRANCH.format(alias=alias, row=row, bound=bound)
-        for (alias, row), bound in zip(names, bounds, strict=False)
+        _SEARCH_BRANCH.format(alias=alias, row=row, bound=bound, path=path)
+        for (alias, row), bound, path in zip(names, bounds, paths, strict=False)
     ]
     return "COPY (" + " UNION ALL ".join(branches) + ") TO 'o.mka'"
 
@@ -1505,6 +1511,41 @@ def test_the_surviving_branch_may_be_the_second_one() -> None:
     dropped = _lower(_search(_KEEPS_NONE, _KEEPS_TWO))
     assert _filters(dropped) == ["atrim", "atrim", "amix"]
     assert dropped.nodes["n3"].args == {"inputs": 2}
+
+
+def test_a_dropped_branchs_own_input_alias_is_recorded() -> None:
+    """The dropped branch's own `input()` alias -- not the surviving one's --
+    lands on `Graph.dropped_aliases`, whichever side of the UNION ALL wrote
+    it: what `_drop_dropped_branch_inputs` (emit) later prunes."""
+    first_dropped = _lower(_search(_KEEPS_NONE, _KEEPS_TWO, paths=("x.mp4", "y.mp4")))
+    assert first_dropped.dropped_aliases == {"f"}
+    second_dropped = _lower(_search(_KEEPS_TWO, _KEEPS_NONE, paths=("x.mp4", "y.mp4")))
+    assert second_dropped.dropped_aliases == {"g"}
+
+
+def test_a_dropped_branchs_input_is_never_opened_and_the_survivor_renumbers() -> None:
+    """Dropping a branch's COLUMNS is not the same as dropping its `-i`. Two
+    DIFFERENT files -- the dropped branch's own input never reaches the
+    command at all, and the surviving branch's index shifts down to fill the
+    slot it leaves (its `atrim` reads `[0:...]` even though its own alias
+    was originally index 1)."""
+    g = insert_splits(_lower(_search(_KEEPS_NONE, _KEEPS_TWO, paths=("x.mp4", "y.mp4"))))
+    e = emit(g)
+    assert e.inputs == ["y.mp4"]
+    assert "[0:a:0]" in e.filter_complex
+    args = build_ffmpeg_args(e, "o.mka")
+    assert args[:3] == ["ffmpeg", "-i", "y.mp4"]
+
+
+def test_a_dropped_branch_sharing_its_path_with_a_live_one_keeps_the_input() -> None:
+    """The find recipe's own shape: both branches name the SAME path under
+    different aliases, so dedup folds them onto one `-i` before the drop
+    pass ever runs -- the surviving branch's alias keeps that slot live, and
+    the dropped branch's alias shares it rather than losing it."""
+    g = _lower(_search(_KEEPS_TWO, _KEEPS_NONE))
+    assert g.dropped_aliases == {"g"}
+    e = emit(insert_splits(g))
+    assert e.inputs == ["x.mp4"]
 
 
 def test_every_branch_keeping_no_row_is_refused_by_name() -> None:

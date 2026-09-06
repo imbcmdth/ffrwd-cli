@@ -145,4 +145,5 @@ def insert_pts_resets(g: Graph) -> Graph:
         },
         module_sources=dict(g.module_sources),
         url_sources=dict(g.url_sources),
+        dropped_aliases=set(g.dropped_aliases),
     )

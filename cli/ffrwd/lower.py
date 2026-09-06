@@ -3358,6 +3358,10 @@ class _Lowerer:
         # The refusals this branch's VARIADIC calls deferred by lowering an
         # aggregate over no rows to a NULL cell (:meth:`_variadic_array`).
         self.empty_aggregates: list[FfrwdError] = []
+        # The `input()` aliases this branch's own FROM bound directly
+        # (`_InputBinding`), read by `_lower_query` once the branch's columns
+        # say whether it wrote anything.
+        self.branch_input_aliases: frozenset[str] = frozenset()
         self.on_warning = on_warning
         self.graph = Graph(input_paths=list(res.input_paths), sources=dict(res.sources))
         self.ctx = _NodeFactory(self.graph)
@@ -5395,13 +5399,26 @@ class _Lowerer:
         the file would be empty, which is a refusal rather than a written
         file; a CTE body keeps its NULL columns instead, since recording the
         gaps is what a body is for.
+
+        A dropped branch's own ``input()`` aliases are recorded onto
+        ``Graph.dropped_aliases`` -- nothing in a branch that writes nothing
+        ever reaches an alias's stream (an empty aggregate iterates zero
+        rows), so its ``-i`` is a candidate for :func:`~ffrwd.emit._drop_dropped_branch_inputs`
+        to prune once emit knows nothing ELSE still points at it.
         """
         if not branches:
             raise _error(ErrorCode.UNSUPPORTED_SQL, "query has no SELECT", anchor)
         self.tags = {}
         self.dispositions = {}
         self.container_tags = {}
-        lowered = [self._lower_branch(branch, tags=tags) for branch in branches]
+        lowered: list[list[_Column]] = []
+        branch_aliases: list[frozenset[str]] = []
+        for branch in branches:
+            lowered.append(self._lower_branch(branch, tags=tags))
+            branch_aliases.append(self.branch_input_aliases)
+        for columns, aliases in zip(lowered, branch_aliases, strict=True):
+            if _writes_nothing(columns):
+                self.graph.dropped_aliases |= aliases
         kept = [
             (branch, columns)
             for branch, columns in zip(branches, lowered, strict=True)
@@ -5553,7 +5570,11 @@ class _Lowerer:
 
     def _lower_branch(self, select: exp.Select, *, tags: _TagScope) -> list[_Column]:
         self.empty_aggregates = []
+        self.branch_input_aliases = frozenset()
         env = self._scope(select)
+        self.branch_input_aliases = frozenset(
+            alias for alias, binding in env.bindings.items() if isinstance(binding, _InputBinding)
+        )
         env.grouped = is_grouped(select)
         env.group_keys = _partition_keys(select, env)
         self._check_grouped_cte_columns(select, env)

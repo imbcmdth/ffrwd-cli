@@ -102,6 +102,7 @@ def _graph(
     input_trims: dict[str, tuple[float | None, float | None]] | None = None,
     input_options: dict[str, dict[str, object]] | None = None,
     url_sources: dict[str, UrlSource] | None = None,
+    dropped_aliases: set[str] | None = None,
 ) -> Graph:
     """A ONE-sink graph carrying `outputs` (`sink` names its destination).
 
@@ -133,6 +134,7 @@ def _graph(
         input_trims=dict(input_trims or {}),
         input_options={k: dict(v) for k, v in (input_options or {}).items()},
         url_sources=dict(url_sources or {}),
+        dropped_aliases=set(dropped_aliases or set()),
     )
 
 
@@ -2432,6 +2434,62 @@ def test_dropping_an_unused_url_input_updates_everything_else_that_names_it() ->
     assert [(row.url, row.input) for row in dropped.url_sources["s"].rows] == [
         ("a.mp4", 0), ("c.mp4", 1),
     ]
+
+
+# ---------------------------------------------------------------------------
+# inputs of a dropped UNION ALL branch: lower recorded the branch's own
+# `input()` alias on `Graph.dropped_aliases` because it wrote nothing; emit
+# drops that alias's `-i` exactly when nothing else still points at it.
+# ---------------------------------------------------------------------------
+
+
+def test_a_dropped_branchs_input_is_dropped_and_the_survivor_renumbered() -> None:
+    """Two different files: `f`'s branch wrote nothing (lower recorded it),
+    `g`'s survives and is the only thing this graph still reads. `f`'s `-i`
+    never reaches the command, and `g`'s index shifts from 1 down to 0 to
+    fill the gap it leaves."""
+    g = _graph(
+        [],
+        [_out("src:g:v:0")],
+        input_paths=["a.mp4", "b.mp4"],
+        sources={"f": 0, "g": 1},
+        dropped_aliases={"f"},
+    )
+    e = emit(g)
+    assert e.inputs == ["b.mp4"]
+    assert e.maps[0].target == "0:v:0"
+
+
+def test_a_path_a_dropped_branch_shares_with_a_live_one_keeps_its_input() -> None:
+    """`f` and `g` name the SAME path: `dedup_inputs` folds them onto one
+    `-i` before the drop pass ever runs, so `f` being a dropped branch's
+    alias does not cost `g` its slot -- `g`'s own reference keeps it live."""
+    g = _graph(
+        [],
+        [_out("src:g:v:0")],
+        input_paths=["a.mp4", "a.mp4"],
+        sources={"f": 0, "g": 1},
+        dropped_aliases={"f"},
+    )
+    e = emit(g)
+    assert e.inputs == ["a.mp4"]
+
+
+def test_an_unmapped_alias_in_a_live_branch_is_still_not_dropped() -> None:
+    """Only an alias `Graph.dropped_aliases` actually names is ever a
+    candidate -- the same rule `test_an_unmapped_ordinary_input_is_not_dropped`
+    already pins for a URL source's row, now under this second drop pass:
+    `plain` is unmapped but its branch never wrote nothing, so it keeps its
+    slot even though `f`'s (actually dropped) slot beside it does not."""
+    g = _graph(
+        [],
+        [_out("src:f:v:0")],
+        input_paths=["a.mp4", "b.mp4", "c.mp4"],
+        sources={"f": 0, "dropped": 1, "plain": 2},
+        dropped_aliases={"dropped"},
+    )
+    e = emit(g)
+    assert e.inputs == ["a.mp4", "c.mp4"]
 
 
 # ---------------------------------------------------------------------------

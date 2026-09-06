@@ -209,6 +209,19 @@ from its :class:`~ffrwd.ir.UrlSource`'s ``rows`` -- it no longer names a live
 ``-i``. A URL source cannot lose every row this way: WHERE keeping zero rows
 is refused before emit ever runs.
 
+Inputs of a dropped UNION ALL branch
+-------------------------------------
+A branch whose WHERE keeps no row writes nothing (:mod:`~ffrwd.lower`'s
+``_lower_query``), and lower records the ``input()`` aliases it bound
+directly onto ``Graph.dropped_aliases`` -- nothing in such a branch ever
+reaches its own alias's stream, so its ``-i`` is opened for nothing to read.
+:func:`_drop_dropped_branch_inputs` runs right after
+:func:`_drop_unused_url_inputs` and shares its renumbering
+(:func:`_drop_input_slots`): a dropped alias's slot is removed exactly when
+:func:`_referenced_input_indices` says nothing else in the graph still points
+at it, so an alias a LIVE branch shares -- the same path, folded onto this
+slot by :func:`~ffrwd.ir.dedup_inputs` -- keeps it.
+
 Zero-input nodes
 ----------------
 A generated source (``FROM ffmpeg.testsrc(duration => 2) t``) lowers to a node
@@ -429,11 +442,13 @@ def emit(g: Graph, *, network: bool = False) -> Emitted:
     consume-once rule does not apply. Labels are allocated and values escaped
     identically either way.
 
-    Runs :func:`~ffrwd.ir.dedup_inputs`, then :func:`_drop_unused_url_inputs`,
-    before anything below reads ``g.sources``/``g.input_paths``.
+    Runs :func:`~ffrwd.ir.dedup_inputs`, then :func:`_drop_unused_url_inputs`
+    and :func:`_drop_dropped_branch_inputs`, before anything below reads
+    ``g.sources``/``g.input_paths``.
     """
     g = dedup_inputs(g)
     g = _drop_unused_url_inputs(g)
+    g = _drop_dropped_branch_inputs(g)
     _verify_topological(g)
 
     nodes = list(g.nodes.values())
@@ -590,7 +605,39 @@ def _drop_unused_url_inputs(g: Graph) -> Graph:
     url_indices = {row.input for source in g.url_sources.values() for row in source.rows}
     if not url_indices:
         return g
-    drop = url_indices - _referenced_input_indices(g)
+    return _drop_input_slots(g, url_indices - _referenced_input_indices(g))
+
+
+def _drop_dropped_branch_inputs(g: Graph) -> Graph:
+    """Remove a ``-i`` slot whose only aliases belonged to branches lower dropped.
+
+    See the module docstring's "Inputs of a dropped UNION ALL branch" section.
+    ``g.dropped_aliases`` names every ``input()`` alias a branch that wrote
+    nothing bound directly; such a branch never reached its own alias's
+    stream, so the slot is a candidate the same way a URL source's unused row
+    is -- dropped only when :func:`_referenced_input_indices` still says
+    nothing else in `g` points at it. An alias a LIVE branch shares (the same
+    path, folded onto this slot by :func:`~ffrwd.ir.dedup_inputs`) keeps the
+    slot, since that alias's own index is then in the referenced set too.
+    """
+    if not g.dropped_aliases:
+        return g
+    candidates = {g.sources[alias] for alias in g.dropped_aliases if alias in g.sources}
+    if not candidates:
+        return g
+    return _drop_input_slots(g, candidates - _referenced_input_indices(g))
+
+
+def _drop_input_slots(g: Graph, drop: set[int]) -> Graph:
+    """Remove the ``-i`` slots in `drop`, renumbering the rest to fill the gaps.
+
+    First-occurrence order, same as :func:`~ffrwd.ir.dedup_inputs`: the two
+    other places a raw input index is stored, a sink's ``chapters``/
+    ``metadata`` and a surviving :class:`~ffrwd.ir.UrlSourceRow`'s own
+    ``input``, are remapped alongside ``input_paths``/``sources``. A dropped
+    row is removed from its :class:`~ffrwd.ir.UrlSource`'s ``rows`` -- it no
+    longer names a live ``-i``.
+    """
     if not drop:
         return g
 
@@ -638,6 +685,7 @@ def _drop_unused_url_inputs(g: Graph) -> Graph:
         },
         url_sources=new_url_sources,
         sinks=new_sinks,
+        dropped_aliases={alias for alias in g.dropped_aliases if alias in new_sources},
     )
 
 

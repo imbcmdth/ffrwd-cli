@@ -672,6 +672,12 @@ class Graph:
     # every row IS a key of `sources`: the module named files, and ffmpeg
     # opens them itself. Kept as the record of what the module answered.
     url_sources: dict[str, UrlSource] = field(default_factory=dict)
+    # `input()` aliases lower dropped: a UNION ALL branch whose WHERE kept no
+    # row writes nothing, so none of its aggregates ever reached its own
+    # alias's stream. Emit prunes such an alias's `-i` when nothing ELSE in
+    # the graph still points at its slot (`emit._drop_dropped_branch_inputs`);
+    # an alias a live branch shares keeps it, the same as `url_sources`.
+    dropped_aliases: set[str] = field(default_factory=set)
 
     @property
     def outputs(self) -> list[Output]:
@@ -722,6 +728,8 @@ class Graph:
             d["url_sources"] = {
                 alias: source.to_dict() for alias, source in self.url_sources.items()
             }
+        if self.dropped_aliases:
+            d["dropped_aliases"] = sorted(self.dropped_aliases)
         return d
 
     @classmethod
@@ -804,6 +812,12 @@ class Graph:
                 assert isinstance(written, dict)
                 url_sources[str(alias)] = UrlSource.from_dict(written)
 
+        raw_dropped_aliases = d.get("dropped_aliases")
+        dropped_aliases: set[str] = set()
+        if raw_dropped_aliases is not None:
+            assert isinstance(raw_dropped_aliases, list)
+            dropped_aliases = {str(alias) for alias in raw_dropped_aliases}
+
         return cls(
             input_paths=[str(p) for p in raw_inputs],
             sources={str(k): int(v) for k, v in raw_sources.items()},
@@ -816,6 +830,7 @@ class Graph:
             packet_sinks=packet_sinks,
             module_sources=module_sources,
             url_sources=url_sources,
+            dropped_aliases=dropped_aliases,
         )
 
 

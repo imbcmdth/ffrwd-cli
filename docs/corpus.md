@@ -2866,3 +2866,40 @@ Reach for this to cut to a line of dialogue without reading the timings off
 the subtitle file yourself. The predicate grammar is the compile-time one -
 `=`, `!=`, `<`, `BETWEEN`, `IS [NOT] NULL`, and the built-in text functions
 over them - so an exact line, or `upper(b.text)`, not a pattern match.
+
+## 137. Try two candidate takes, keep whichever one actually matched
+
+Two different files this time, not two branches of one: each candidate gets
+its own `input()`, its own window, and its own `WHERE`. A candidate whose
+window never lands - `av2.mp4`'s series rows never reach 9 - drops out the
+same way an empty vector-space branch does, and that means its `input()`
+alias never opens either. Trying a candidate costs nothing when it does not
+pan out:
+
+```pgsql
+COPY (
+  SELECT amix(VARIADIC array_agg(ffmpeg.atrim(f.audio[1], start => i.i, end => i.i + 1)))
+  FROM input('tests/fixtures/av.mp4') f, generate_series(1, 3) i
+  WHERE i.i <= 2
+  UNION ALL
+  SELECT amix(VARIADIC array_agg(ffmpeg.atrim(g.audio[1], start => j.j, end => j.j + 1)))
+  FROM input('tests/fixtures/av2.mp4') g, generate_series(1, 3) j
+  WHERE j.j >= 9
+) TO 'mix.mka'
+```
+
+```
+$ ffrwd compile -f query.sql
+ffmpeg -i tests/fixtures/av.mp4 -filter_complex \
+  '[0:a:0]asplit=2[src_f_a_0_split0][src_f_a_0_split1];'\
+'[src_f_a_0_split0]atrim=start=1:end=2[n1];[src_f_a_0_split1]atrim=start=2:end=3[n2];'\
+'[n1]asetpts=PTS-STARTPTS[n1_pts];[n2]asetpts=PTS-STARTPTS[n2_pts];'\
+'[n1_pts][n2_pts]amix=inputs=2[out0]' -map '[out0]' mix.mka
+```
+
+The command is exactly what the surviving branch alone compiles to, one
+`-i` and all - `av2.mp4` is as absent as if the second branch had never
+been written. A candidate two branches happen to name the SAME path, under
+different aliases, is a different case: dedup folds them onto one `-i`
+before either branch's own fate is decided, so a live branch sharing that
+path keeps it open even when the other branch beside it drops.
