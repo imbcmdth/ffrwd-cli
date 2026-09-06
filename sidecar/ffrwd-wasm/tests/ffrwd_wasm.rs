@@ -2941,6 +2941,44 @@ fn a_rows_node_with_no_predicate_is_refused_naming_the_option() {
 }
 
 #[test]
+fn a_module_bound_as_the_merge_node_is_refused_naming_it() {
+    let frames: Vec<Vec<u8>> = (0..2u8).map(synthetic_frame).collect();
+    let run = run_network(
+        &[("rowmerge", "invert")],
+        "[0:v]rowmerge[out0]",
+        &[],
+        ONE_OUTPUT,
+        &nut_stream(&frames),
+    );
+    assert!(!run.success(), "the name is the host's own");
+    assert!(
+        run.stderr.contains("rowmerge") && run.stderr.contains("no module is bound to it"),
+        "expected the reserved name named, got:
+{}",
+        run.stderr
+    );
+}
+
+#[test]
+fn a_merge_node_with_no_distance_is_refused_naming_the_option() {
+    let frames: Vec<Vec<u8>> = (0..2u8).map(synthetic_frame).collect();
+    let run = run_network(
+        &[("invert", "invert")],
+        "[0:v]invert[a];[a]rowmerge[out0]",
+        &[],
+        ONE_OUTPUT,
+        &nut_stream(&frames),
+    );
+    assert!(!run.success(), "max_distance is required");
+    assert!(
+        run.stderr.contains("max_distance=<number>"),
+        "expected the option named, got:
+{}",
+        run.stderr
+    );
+}
+
+#[test]
 fn a_predicate_that_is_not_a_predicate_is_refused_before_any_frame() {
     let frames: Vec<Vec<u8>> = (0..2u8).map(synthetic_frame).collect();
     let wiring = format!(

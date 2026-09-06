@@ -14,6 +14,7 @@
 mod graph;
 mod network;
 mod rowfilter;
+mod rowmerge;
 mod rows_chain;
 mod scheduler;
 mod subtitles;
@@ -464,6 +465,12 @@ fn resolve_binding(raw: &str) -> Result<Binding> {
         bail!(
             "-m {raw}: '{name}' is the network's own node and no module is bound to it; \
              it is spelled [a]{name}=pred=<json>[b]"
+        );
+    }
+    if name == rowmerge::NODE {
+        bail!(
+            "-m {raw}: '{name}' is the network's own node and no module is bound to it; \
+             it is spelled [a]{name}=max_distance=<number>[b]"
         );
     }
     if path.is_empty() {

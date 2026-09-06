@@ -102,6 +102,7 @@ from .errors import ErrorCode, FfrwdError
 from .ir import (
     PIPE,
     ROWFILTER,
+    ROWMERGE,
     FrameRef,
     Graph,
     ModuleSource,
@@ -246,7 +247,7 @@ ENCODED_EDGE_DELAY = 8
 
 # Nodes the sidecar hosts itself. They belong to a region the way a module
 # does -- ffmpeg cannot run them -- but no ``-m`` entry binds their name.
-HOSTED_FILTERS = frozenset({ROWFILTER})
+HOSTED_FILTERS = frozenset({ROWFILTER, ROWMERGE})
 
 # What a module's bound name may not contain: a network string names modules
 # where a filtergraph names filters.

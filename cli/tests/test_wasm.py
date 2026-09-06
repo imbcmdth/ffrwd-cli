@@ -3891,6 +3891,34 @@ def test_filtered_rows_go_to_an_ndjson_file() -> None:
     assert argv[-3:] == ["-f", "ndjson", "words.ndjson"]
 
 
+# merge_cues over the same rows, and the two nodes composed
+
+
+def test_merged_rows_mint_a_merge_node_beside_the_module() -> None:
+    """The rows never leave the sidecar: the merge is a node the host runs."""
+    sql = _transcribe_declare() + _copy(
+        "s.video[1], merge_cues(transcribe(s.audio[1], 'en').words, 0.5)"
+    )
+    argv = _rows_argv(sql)["sidecar0"]
+    assert argv[argv.index("-filter_complex") + 1] == (
+        "[0:a]transcribe=language=en[n1];[n1]rowmerge=max_distance=0.5[out0]"
+    )
+    assert argv[-3:] == ["-f", "webvtt", "pipe:1"]
+    assert "rowmerge" not in [argv[i + 1].split("=")[0] for i, a in enumerate(argv) if a == "-m"]
+
+
+def test_a_gather_narrows_before_the_merge_collapses() -> None:
+    """Written outside in, the two nodes run in the order they are read."""
+    sql = _transcribe_declare() + _copy(
+        f"s.video[1], merge_cues({_filtered_cues()}, 1)"
+    )
+    argv = _rows_argv(sql)["sidecar0"]
+    assert argv[argv.index("-filter_complex") + 1] == (
+        f"[0:a]transcribe=language=en[n1];[n1]rowfilter=pred={START_PRED}[n2];"
+        "[n2]rowmerge=max_distance=1[out0]"
+    )
+
+
 # -- the model a module runs ----------------------------------------------
 
 
@@ -5737,6 +5765,22 @@ def _rows_module_rejects(
 
 
 # the declaration
+
+
+def test_merging_the_rows_a_rows_function_reads_is_refused() -> None:
+    """A rows function reads every row its producer wrote; the merge goes on
+    what it hands back instead."""
+    error = _rows_module_rejects(
+        _CAPTIONS_DECLARE
+        + _fauxlate_declare()
+        + _copy(
+            "s.video[1], fauxlate(merge_cues(captions(s.video[1]).cues, 1))",
+            path="out.mkv",
+        ),
+        ErrorCode.UNSUPPORTED_SQL,
+        "rows are merged before a rows function reads them",
+    )
+    assert "merge what the function returns" in (error.hint or "")
 
 
 def test_a_rows_function_reads_back_as_rows_in_rows_out() -> None:

@@ -2616,3 +2616,119 @@ spelling of the NULL cells `array_agg` already skips, admitted as long as
 the predicate names the aggregated column itself. Any other FILTER
 predicate is refused - `array_agg` has one way to say "drop the gaps",
 not a general row filter.
+
+## 131. Collapse a file's rows into runs
+
+`merge_cues(<rows>, <max_distance>)` takes rows in `start_t` order and
+collapses runs of them into one row each: a row whose `start_t` is no more
+than `max_distance` past the run's end joins that run, and the run becomes
+one row from the first start to the furthest end. It stands where the column
+does, so `unnest(merge_cues(...)) v` reads its rows exactly as
+`unnest(f.embeddings) v` reads the file's own. [Recipe
+119](#119-read-a-described-files-rows-back) lists the three rows this file
+carries; back to back, they are one span:
+
+```pgsql
+COPY (
+  SELECT concat(VARIADIC array_agg(ffmpeg.trim(f.video[1], start => v.start_t, end => v.end_t))),
+         concat(VARIADIC array_agg(ffmpeg.atrim(f.audio[1], start => v.start_t, end => v.end_t)))
+  FROM input('tests/fixtures/described.mkv') f,
+       unnest(merge_cues(f.embeddings['clip_vectors'], 1)) v
+) TO 'clips.mp4'
+```
+
+```
+$ ffrwd compile -f query.sql
+ffmpeg -i tests/fixtures/described.mkv -filter_complex \
+  '[0:v:0]trim=start=0.0:end=4.0,setpts=PTS-STARTPTS,concat=n=1:v=1:a=0[out0];'\
+'[0:a:0]atrim=start=0.0:end=4.0,asetpts=PTS-STARTPTS,concat=n=1:v=0:a=1[out1]' -map \
+  '[out0]' -map '[out1]' clips.mp4
+```
+
+Any array of records carrying `start_t` and `end_t` merges - `cues`,
+`embeddings`, `chapters` - and the result is the same record type, so what
+reads it does not change. A `text` field joins with one space; every other
+field is the first row's. `max_distance` defaults to 0, which still merges
+rows that touch or overlap; a negative one is refused, and so is a column
+whose records carry no span.
+
+## 132. Merge only the rows you kept
+
+Merging the whole column collapses everything back to back, which is rarely
+what a search wants. The gather narrows first - `ARRAY(SELECT v FROM
+unnest(<column>) v WHERE ...)` reads the rows under its own name, keeps the
+ones the predicate holds for, and `merge_cues` runs over what is left, so a
+gap the dropped rows used to fill now separates two runs:
+
+```pgsql
+COPY (
+  SELECT concat(VARIADIC array_agg(ffmpeg.trim(f.video[1], start => v.start_t, end => v.end_t))),
+         concat(VARIADIC array_agg(ffmpeg.atrim(f.audio[1], start => v.start_t, end => v.end_t)))
+  FROM input('tests/fixtures/described.mkv') f,
+       unnest(merge_cues(ARRAY(SELECT w FROM unnest(f.embeddings['clip_vectors']) w
+                               WHERE w.start_t <> 1.5), 1)) v
+) TO 'clips.mp4'
+```
+
+```
+$ ffrwd compile -f query.sql
+ffmpeg -i tests/fixtures/described.mkv -filter_complex \
+  '[0:v:0]split=2[src_f_v_0_split0][src_f_v_0_split1];'\
+'[src_f_v_0_split0]trim=start=0.0:end=1.5[n1];'\
+'[src_f_v_0_split1]trim=start=3.0:end=4.0[n2];[n1]setpts=PTS-STARTPTS[n1_pts];'\
+'[n2]setpts=PTS-STARTPTS[n2_pts];[n1_pts][n2_pts]concat=n=2:v=1:a=0[out0];'\
+'[0:a:0]asplit=2[src_f_a_0_split0][src_f_a_0_split1];'\
+'[src_f_a_0_split0]atrim=start=0.0:end=1.5[n4];'\
+'[src_f_a_0_split1]atrim=start=3.0:end=4.0[n5];[n4]asetpts=PTS-STARTPTS[n4_pts];'\
+'[n5]asetpts=PTS-STARTPTS[n5_pts];[n4_pts][n5_pts]concat=n=2:v=0:a=1[out1]' -map \
+  '[out0]' -map '[out1]' clips.mp4
+```
+
+The middle row is dropped, the two that survive are 1.5 seconds apart, and
+`max_distance` is 1 - so they stay two rows and the query cuts two clips. The
+predicate reads the gather's own columns and no other alias; it is the same
+compile-time grammar a `WHERE` over these rows takes. Reach for this to cut
+what a vector search found without one trim per row: swap the predicate for
+`cos_similarity(w.vector, <a prompt's vector>) > <threshold>` ([recipe
+117](examples.md#117-rank-rows-by-a-vector)) and the neighbouring hits arrive as one
+clip each.
+
+## 133. Merge a module's rows as they are written
+
+The same call over rows that do not exist yet. A module's annotation column
+is written while the module runs, so nothing is counted here: `merge_cues`
+becomes `rowmerge`, a node the sidecar hosts beside the module, holding each
+run open until a row arrives outside `max_distance` or the stream ends.
+`captions` says one 0.5-second cue per frame, and at 24 frames a second every
+cue overlaps the next, so the whole stream is one run:
+
+```pgsql
+CREATE FUNCTION captions(v video_stream)
+RETURNS STRUCT(v video_stream, cues cue[])
+  AS '../sidecar/modules/target/wasm32-wasip2/release/captions.wasm', 'captions'
+  LANGUAGE wasm;
+
+COPY (
+  SELECT f.video[1] AS v, merge_cues(captions(f.video[1]).cues, 0) AS speech
+  FROM input('tests/fixtures/av.mp4') f
+) TO 'merged.mkv'
+```
+
+```
+$ ffrwd compile -f query.sql
+ffmpeg -i tests/fixtures/av.mp4 -map 0:v:0 -c:0 rawvideo -pix_fmt:0 rgba -f nut pipe:1 | \
+  ffrwd-wasm -f nut -i pipe:0 -m \
+  captions=../sidecar/modules/target/wasm32-wasip2/release/captions.wasm -filter_complex \
+  '[0:v]captions[n1];[n1]rowmerge=max_distance=0[out0]' -map '[out0]' -f webvtt pipe:1 | \
+  ffmpeg -i tests/fixtures/av.mp4 -f webvtt -i pipe:0 -map 0:v:0 -c:0 copy -map 1:s:0 \
+  -c:1 copy -metadata:s:1 title=speech merged.mkv
+```
+
+`rowmerge` is a node the host provides, like the `rowfilter` a run-time
+`WHERE` writes ([recipe 98](examples.md#98-post-what-a-module-found-as-it-is-found)),
+and the two compose in the order they are written: `merge_cues(ARRAY(SELECT r
+FROM unnest(<call>.<rows>) r WHERE ...), 1)` narrows first, then merges. A
+row carrying no `start_t`/`end_t` - a module's trailing summary record - rides
+through untouched. Merging rows a rows function is about to read is refused
+instead: that function reads every row the module produced, so merge what it
+returns.

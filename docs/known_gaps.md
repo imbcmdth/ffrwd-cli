@@ -81,3 +81,10 @@ output is plain ffmpeg, so the two mix freely in a script.
   Some sources carry streams with no detectable codec (certain DASH
   text tracks, for example). Selecting one is a compile error; table
   queries over the same source still work.
+- **`merge_cues` reads a column or a producer's call, not a name for
+  one.** Over rows a file carries it takes a record array column (with
+  or without a track subscript) or an `ARRAY(SELECT ... WHERE ...)`
+  gather over one; over rows a module writes it takes that module's own
+  annotation column. A CTE column bound to either, and a rows
+  function's result, are refused - the rejection names what it does
+  read. Merge the rows where they are produced instead.

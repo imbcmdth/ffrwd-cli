@@ -100,6 +100,7 @@ from .parser import (
     _VECTOR_BUILTIN_ARITY,
     FILTER_NAMESPACE,
     MACRO_NAMESPACE,
+    MERGE_CUES,
     SINK_STREAMS,
     ModuleExport,
     _check_query_args,
@@ -149,12 +150,12 @@ __all__ = [
 _INPUT = "input"
 
 # Names a definition may not claim: the dialect's own FROM item, the two
-# reserved namespaces, the built-in vector functions, and every name sqlglot
-# parses as a builtin (a call to one comes back as its own node type, never
-# as the anonymous call expansion looks for, so redefining it would silently
-# do nothing).
+# reserved namespaces, the built-in vector and row functions, and every name
+# sqlglot parses as a builtin (a call to one comes back as its own node type,
+# never as the anonymous call expansion looks for, so redefining it would
+# silently do nothing).
 _RESERVED = frozenset(
-    {_INPUT, FILTER_NAMESPACE, MACRO_NAMESPACE, *_VECTOR_BUILTIN_ARITY}
+    {_INPUT, FILTER_NAMESPACE, MACRO_NAMESPACE, MERGE_CUES, *_VECTOR_BUILTIN_ARITY}
 )
 
 # The types a signature may name: the scalars, the four stream records, and

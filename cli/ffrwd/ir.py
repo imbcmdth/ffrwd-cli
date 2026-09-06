@@ -72,6 +72,11 @@ PIPE = "pipe:"
 ROWFILTER = "rowfilter"
 PREDICATE = "pred"
 
+# The node that collapses runs of the rows riding a stream at run time. Hosted
+# the same way, and its one argument is the gap rows still merge across.
+ROWMERGE = "rowmerge"
+MAX_DISTANCE = "max_distance"
+
 
 def is_src(ref: FrameRef) -> bool:
     """True if `ref` points at a raw input stream rather than a Node."""

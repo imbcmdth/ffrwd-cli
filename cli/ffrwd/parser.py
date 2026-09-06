@@ -198,6 +198,7 @@ from sqlglot.dialects.postgres import Postgres
 from sqlglot.errors import ParseError, SqlglotError
 
 from ffrwd.errors import ErrorCode, FfrwdError
+from ffrwd.merge import SPAN_FIELDS
 from ffrwd.types import (
     CHAPTERS_COLUMN,
     CONTAINER_READONLY_FIELDS,
@@ -217,6 +218,7 @@ from ffrwd.types import (
     TAGS_COLUMN,
     TIME_COLUMN,
     TRACK_RECORD_COLUMNS,
+    TYPES,
     UNNEST_COLUMNS,
     is_array,
 )
@@ -245,6 +247,7 @@ __all__ = [
     "RawSinkOption",
     "RawSource",
     "RawRowJoin",
+    "RawRowMerge",
     "RawSourceOption",
     "RawTrackRows",
     "RawValuesTable",
@@ -1897,6 +1900,22 @@ class RawRowJoin:
 
 
 @dataclass(frozen=True)
+class RawRowMerge:
+    """``merge_cues(<rows>, <max_distance>)`` around an unnested column.
+
+    `max_distance` is the gap rows still merge across, in seconds. `where`
+    is the gather's own predicate when the rows were narrowed before they
+    merged -- ``merge_cues(ARRAY(SELECT v FROM unnest(...) v WHERE ...), 1)``
+    -- read under the name `alias` gave them; both are None when the whole
+    column merged.
+    """
+
+    max_distance: int | float
+    alias: str | None = None
+    where: exp.Expr | None = None
+
+
+@dataclass(frozen=True)
 class RawTrackRows:
     """``unnest(<source>.<column>) <alias>`` in FROM.
 
@@ -1918,6 +1937,9 @@ class RawTrackRows:
     `title` is the track a subscript named — ``unnest(f.cues['speech'])`` —
     and None where the column was unnested whole. Only the columns read out
     of a file's TRACKS take one; lower is what checks the file carries it.
+
+    `merge` is set when ``merge_cues(...)`` wrapped the column: runs of its
+    rows collapse into one row each before anything reads them.
     """
 
     alias: str
@@ -1925,6 +1947,7 @@ class RawTrackRows:
     column: str
     node: exp.Expr
     title: str | None = None
+    merge: RawRowMerge | None = None
 
 
 @dataclass(frozen=True)
@@ -2275,6 +2298,60 @@ def _projection_field_name(node: exp.Expr) -> str | None:
 # Where a gather over a module's rows leaves the predicate it was written
 # with, for lowering to mint the node that applies it.
 ROW_PREDICATE = "row_predicate"
+
+# Where `merge_cues(...)` over a module's rows leaves the distance it was
+# written with, for lowering to mint the node that applies it.
+ROW_MERGE = "row_merge"
+
+# The function that collapses runs of rows into one row each.
+MERGE_CUES = "merge_cues"
+
+# The record types it reads: the ones whose rows carry a span.
+MERGEABLE_RECORDS = tuple(
+    name
+    for name, declared in TYPES.items()
+    if declared.kind == "record" and all(declared.field(f) is not None for f in SPAN_FIELDS)
+)
+
+_MERGE_SIGNATURE = f"{MERGE_CUES}(<rows>, <max_distance>)"
+_MERGE_HINT = (
+    f"{_MERGE_SIGNATURE} reads an array of rows carrying "
+    f"{' and '.join(SPAN_FIELDS)} -- an input's "
+    f"{_listed_columns(sorted(RECORD_COLUMNS[r] for r in MERGEABLE_RECORDS))} "
+    "column, or a module's own annotation column"
+)
+
+
+def _merge_call(node: object) -> exp.Anonymous | None:
+    """A bare ``merge_cues(...)`` call, whatever it wraps."""
+    if (
+        isinstance(node, exp.Anonymous)
+        and not isinstance(node.parent, exp.Dot)
+        and str(node.name).lower() == MERGE_CUES
+    ):
+        return node
+    return None
+
+
+def _find_merge_calls(node: exp.Expr) -> list[exp.Anonymous]:
+    """Every ``merge_cues(...)`` call reachable from `node`, outermost first."""
+    matches: list[exp.Anonymous] = []
+
+    def visit(value: object) -> None:
+        if isinstance(value, list):
+            for item in value:
+                visit(item)
+            return
+        if not isinstance(value, exp.Expr):
+            return
+        found = _merge_call(value)
+        if found is not None:
+            matches.append(found)
+        for child in value.args.values():
+            visit(child)
+
+    visit(node)
+    return matches
 
 # The comparisons a runtime predicate holds, and what each is called in it.
 _ROW_COMPARISONS: Mapping[type[exp.Expr], str] = {
@@ -3765,7 +3842,9 @@ class _Resolver:
         path_expr: exp.Expr | None = None,
         no_aggregate: str | None = None,
     ) -> None:
+        self._hoist_from_merges(select)
         self._hoist_array_gathers(select, visible)
+        self._hoist_row_merges(select)
 
         # `ORDER BY`, `GROUP BY`, `LIMIT` and `OFFSET` are admitted for
         # ROW-SOURCE queries and nowhere else. The carve-out is decided from
@@ -4760,6 +4839,146 @@ class _Resolver:
             return
         self._check_row_literal(node, column, column_type, join)
 
+    # -- merge_cues(...) ---------------------------------------------------
+
+    def _merge_distance(self, call: exp.Anonymous, fallback: exp.Expr) -> int | float:
+        """One ``merge_cues()`` call's distance, checked. The default is 0."""
+        if any(isinstance(a, exp.Kwarg) for a in call.expressions):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"{MERGE_CUES}() does not take named arguments",
+                call,
+                fallback=fallback,
+                hint=f"its arguments are positional: {_MERGE_SIGNATURE}",
+            )
+        args = [a for a in call.expressions if isinstance(a, exp.Expr)]
+        if not 1 <= len(args) <= 2:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"{MERGE_CUES}() takes 1 or 2 arguments, got {len(args)}",
+                call,
+                fallback=fallback,
+                hint=f"{_MERGE_SIGNATURE}, and max_distance defaults to 0",
+            )
+        if len(args) == 1:
+            return 0
+        written = _unwrap_paren(args[1])
+        negated = isinstance(written, exp.Neg) and isinstance(written.this, exp.Expr)
+        literal = _unwrap_paren(written.this) if negated else written
+        if not isinstance(literal, exp.Literal) or literal.is_string:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"{MERGE_CUES}()'s max_distance is a number, not "
+                f"{_describe_series_bound(literal)}",
+                args[1],
+                fallback=fallback,
+                hint="write a number of seconds, or a variable holding one",
+            )
+        distance = _row_number(literal.this)
+        if negated and distance != 0:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"{MERGE_CUES}()'s max_distance is a gap in seconds and "
+                f"cannot be -{distance}",
+                args[1],
+                fallback=fallback,
+                hint="a distance of 0 merges rows that touch; a larger one "
+                "merges across a gap that wide",
+            )
+        return distance
+
+    def _hoist_from_merges(self, select: exp.Select) -> None:
+        """Take ``merge_cues(...)`` off this branch's ``unnest`` FROM items.
+
+        The call is replaced by the column it wrapped, so every later pass
+        reads the ordinary ``unnest(<input>.<column>) <alias>`` it already
+        knows, and the merge rides on the FROM item's own meta until
+        :meth:`_add_track_rows` reads it back. A gather inside the call goes
+        the same way: its rows are this table's rows, narrowed, so its
+        predicate rides along and its subquery leaves the tree before the
+        ARRAY(SELECT ...) hoist would find it.
+        """
+        for item in from_items(select):
+            if not isinstance(item, exp.Unnest) or len(item.expressions) != 1:
+                continue
+            argument = item.expressions[0]
+            call = _merge_call(_unwrap_paren(argument) if isinstance(argument, exp.Expr) else None)
+            if call is None:
+                continue
+            distance = self._merge_distance(call, item)
+            rows = call.expressions[0] if call.expressions else None
+            gathered = _unwrap_paren(rows) if isinstance(rows, exp.Expr) else None
+            if isinstance(gathered, exp.Array):
+                column, alias, where = self._merge_gather(gathered, item)
+            elif isinstance(rows, exp.Expr):
+                column, alias, where = rows, None, None
+            else:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"{MERGE_CUES}() takes rows to merge",
+                    call,
+                    fallback=item,
+                    hint=_MERGE_HINT,
+                )
+            call.replace(column)
+            item.meta[ROW_MERGE] = RawRowMerge(distance, alias, where)
+
+    def _merge_gather(
+        self, array_node: exp.Array, unnest: exp.Unnest
+    ) -> tuple[exp.Expr, str, exp.Expr | None]:
+        """One ``ARRAY(SELECT v FROM unnest(<column>) v WHERE ...)`` taken apart.
+
+        The rows a merge reads may be narrowed first, which is the gather
+        spelling a module's own rows already take. It is the same column
+        either way, so what comes back is that column, the name the predicate
+        reads its rows under, and the predicate itself.
+        """
+        subquery = _array_gather_select(array_node)
+        item = subquery.args.get("from_") if isinstance(subquery, exp.Select) else None
+        inner = item.this if isinstance(item, exp.From) else None
+        if subquery is None or not isinstance(inner, exp.Unnest) or len(inner.expressions) != 1:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"{MERGE_CUES}() reads a column, or a gather over one",
+                array_node,
+                fallback=unnest,
+                hint="write ARRAY(SELECT v FROM unnest(f.cues) v WHERE ...) "
+                "to narrow the rows before they merge",
+            )
+        _check_query_args(
+            subquery, frozenset({"expressions", "from_", "where"}), "row gather"
+        )
+        alias = self._row_gather_alias(inner, array_node)
+        self._check_row_gather_projection(subquery, alias, array_node)
+        where = subquery.args.get("where")
+        predicate = where.this if isinstance(where, exp.Where) else None
+        return inner.expressions[0], alias, predicate if isinstance(predicate, exp.Expr) else None
+
+    def _hoist_row_merges(self, select: exp.Select) -> None:
+        """Take ``merge_cues(...)`` off a module's annotation column.
+
+        The rows exist only while the module runs, so nothing is evaluated
+        here: the call is replaced by the column it wrapped, carrying the
+        distance on its meta, and lowering mints the node that merges them as
+        they are written. A call anywhere else is refused by name.
+        """
+        for call in _find_merge_calls(select):
+            rows = call.expressions[0] if call.expressions else None
+            if annotation_projection(rows, self.wasm) is None:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"{MERGE_CUES}() reads rows, and this argument is not a "
+                    "row column",
+                    rows if isinstance(rows, exp.Expr) else call,
+                    fallback=select,
+                    hint=_MERGE_HINT,
+                )
+            distance = self._merge_distance(call, select)
+            assert isinstance(rows, exp.Expr)  # what annotation_projection matched
+            projection = _unwrap_paren(rows)
+            call.replace(projection)
+            projection.meta[ROW_MERGE] = distance
+
     # -- ARRAY(SELECT ...) gathers -----------------------------------------
 
     def _hoist_array_gathers(self, select: exp.Select, visible: set[str]) -> None:
@@ -5416,6 +5635,53 @@ class _Resolver:
             types.append(settled or "text")
         return tuple(types)
 
+    def _check_merge_rows(
+        self,
+        merge: RawRowMerge,
+        source: str,
+        column: str,
+        unnest: exp.Unnest,
+        scope: dict[str, str],
+    ) -> None:
+        """What ``merge_cues(<input>.<column>, ...)`` reads, and the gather
+        that may have narrowed it.
+
+        The column has to hold records with a span -- a run is rows that
+        follow one another in time, and a record with no bounds has no place
+        in one. The gather's predicate reads the rows under its own alias, so
+        that name is registered as a row table of its own before the
+        predicate is type-checked against it.
+        """
+        record = RECORD_ELEMENTS.get(column)
+        if record not in MERGEABLE_RECORDS:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"{MERGE_CUES}() merges rows carrying "
+                f"{_listed_columns(SPAN_FIELDS)}, and '{source}.{column}' "
+                f"carries neither",
+                unnest,
+                hint=_MERGE_HINT,
+            )
+        if merge.alias is None or merge.where is None:
+            return
+        self._reserve(merge.alias, unnest)
+        self.track_rows[merge.alias] = RawTrackRows(
+            alias=merge.alias, source=source, column=column, node=unnest
+        )
+        inner = {**scope, merge.alias: "row"}
+        others = _referenced_aliases(merge.where) - {merge.alias}
+        if others:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"a gather over '{source}.{column}' reads its own rows, not "
+                f"{_listed_columns(others)}",
+                merge.where,
+                fallback=unnest,
+                hint=f"narrow the rows by their own columns, e.g. WHERE "
+                f"{merge.alias}.{SPAN_FIELDS[0]} > 10",
+            )
+        self._check_row_predicate(merge.where, inner, unnest)
+
     # -- FROM unnest(<input>.<type>) alias ------------
 
     def _add_track_rows(self, unnest: exp.Unnest, scope: dict[str, str]) -> None:
@@ -5529,6 +5795,10 @@ class _Resolver:
                 f"{source}.{column} whole, and narrow it in WHERE",
             )
 
+        merge = unnest.meta.get(ROW_MERGE)
+        if isinstance(merge, RawRowMerge):
+            self._check_merge_rows(merge, source, column, unnest, scope)
+
         alias_node = unnest.args.get("alias")
         if not isinstance(alias_node, exp.TableAlias) or alias_node.this is None:
             raise _error(
@@ -5554,7 +5824,12 @@ class _Resolver:
             )
         self.row_aliases.add(alias)
         self.track_rows[alias] = RawTrackRows(
-            alias=alias, source=source, column=column, node=unnest, title=title
+            alias=alias,
+            source=source,
+            column=column,
+            node=unnest,
+            title=title,
+            merge=merge if isinstance(merge, RawRowMerge) else None,
         )
         scope[alias] = "row"
 

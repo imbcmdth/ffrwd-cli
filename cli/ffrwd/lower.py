@@ -295,11 +295,13 @@ from ffrwd.functions import WASM_STREAM_NAMES, Annotation, WasmFunction
 from ffrwd.inputs import render_options
 from ffrwd.inputs import validate_option as validate_input_option
 from ffrwd.ir import (
+    MAX_DISTANCE,
     NO_CHAPTERS,
     NO_METADATA,
     PIPE,
     PREDICATE,
     ROWFILTER,
+    ROWMERGE,
     Attachment,
     FrameRef,
     Graph,
@@ -320,6 +322,7 @@ from ffrwd.ir import (
     SourceTrack as IrSourceTrack,
 )
 from ffrwd.macros import INPUT_MACROS, MACROS, InputMacro, Macro, macro_names
+from ffrwd.merge import RowValue, merge_rows
 from ffrwd.parser import (
     _ARITHMETIC,
     _ARITHMETIC_NAMES,
@@ -329,6 +332,8 @@ from ffrwd.parser import (
     FILTER_NAMESPACE,
     MACRO_NAMESPACE,
     MAP_COLUMNS,
+    MERGE_CUES,
+    ROW_MERGE,
     ROW_PREDICATE,
     ROW_STREAM,
     SINK_STREAMS,
@@ -2625,13 +2630,6 @@ class _SourceBinding:
         return f"{FILTER_NAMESPACE}.{self.name}"
 
 
-# A track-row metadata value: NULL (unprobed input, or a field this file does
-# not carry) or the probed scalar. A disposition flag is the boolean case. A
-# vector row column (an annotation field, or a value function's result) is a
-# tuple of floats -- immutable and hashable, unlike a list, which is what
-# lets one memoize a wasm value call and key a GROUP BY on its result. Never
-# a stream — the row IS that.
-RowValue = str | int | float | bool | tuple[float, ...] | None
 
 # `_TrackRow.stream` for a row that carries no track -- a chapter row, or a
 # written row. Never a real stream (neither exposes a stream column at
@@ -6678,7 +6676,7 @@ class _Lowerer:
             )
         if raw.column in RECORD_ARRAY_COLUMNS:
             stream_type: StreamType = "data"  # filler: a record row has no track
-            rows = self._record_rows(raw, unnest, select)
+            rows = self._merged_rows(raw, self._record_rows(raw, unnest, select), env, select)
         else:
             stream_type = _ARRAY_COLUMNS[raw.column]
             result = self.probes.get(raw.source)
@@ -7337,6 +7335,50 @@ class _Lowerer:
             "options given; run ffprobe on it directly, with the same "
             "options, to see why",
         )
+
+    def _merged_rows(
+        self,
+        raw: RawTrackRows,
+        rows: list[_TrackRow],
+        env: _Env,
+        select: exp.Select,
+    ) -> list[_TrackRow]:
+        """`rows` narrowed by the gather that read them, then merged into runs.
+
+        The gather's predicate reads these rows and nothing else, so it runs
+        over a relation of its own -- one tuple per row, under the name the
+        gather gave them -- before the runs collapse. Without a merge the rows
+        come back as they were.
+        """
+        merge = raw.merge
+        if merge is None:
+            return rows
+        if merge.alias is not None and merge.where is not None:
+            relation = _RowRelation(
+                aliases=[merge.alias], tuples=[{merge.alias: row} for row in rows]
+            )
+            inner = _Env(
+                bindings={
+                    **env.bindings,
+                    merge.alias: _RowBinding(
+                        alias=merge.alias,
+                        source=raw.source,
+                        column=raw.column,
+                        type="data",
+                        relation=relation,
+                    ),
+                },
+                relation=relation,
+            )
+            rows = [
+                row
+                for row, tuple_ in zip(rows, relation.tuples)
+                if self._eval_row(merge.where, inner, tuple_, select) is True
+            ]
+        return [
+            _TrackRow(stream=_STREAMLESS_ROW, columns=columns)
+            for columns in merge_rows([row.columns for row in rows], merge.max_distance)
+        ]
 
     def _record_rows(
         self, raw: RawTrackRows, unnest: exp.Expr, select: exp.Select
@@ -10200,6 +10242,17 @@ class _Lowerer:
                     hint="a rows function reads every row the module produced; "
                     "drop the WHERE, or narrow the rows the function returns",
                 )
+            if written.meta.get(ROW_MERGE) is not None:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"'{producer.name}' rows are merged before a rows function "
+                    "reads them",
+                    written,
+                    fallback=select,
+                    hint="a rows function reads every row the module produced; "
+                    f"drop the {MERGE_CUES}(), or merge what the function "
+                    "returns",
+                )
             module = self._lower_expr(producer_call, env, select)
             assert producer.emits is not None  # what _rows_projection selected on
             return module.streams[0].ref, module.type, producer.emits
@@ -12667,23 +12720,34 @@ class _Lowerer:
         return self._row_filtered(produced, written)
 
     def _row_filtered(self, value: _Value, node: exp.Expr) -> _Value:
-        """`value` through the row filter its gather wrote, or `value` itself.
+        """`value` through the rows nodes written over it, or `value` itself.
 
-        The predicate rides the frames' own chain: the node narrows the rows
-        the stream carries and hands both on, so a filtered column and an
-        unfiltered one are the same value with one more node in front of it.
+        Both ride the frames' own chain: each node changes the rows the stream
+        carries and hands both on, so a narrowed or merged column and a plain
+        one are the same value with one more node in front of it. A gather
+        narrows before ``merge_cues`` collapses, which is the order they are
+        written in.
         """
         predicate = node.meta.get(ROW_PREDICATE)
-        if not isinstance(predicate, str):
-            return value
+        if isinstance(predicate, str):
+            value = self._hosted_rows_node(value, ROWFILTER, {PREDICATE: predicate})
+        distance = node.meta.get(ROW_MERGE)
+        if isinstance(distance, int | float) and not isinstance(distance, bool):
+            value = self._hosted_rows_node(value, ROWMERGE, {MAX_DISTANCE: distance})
+        return value
+
+    def _hosted_rows_node(
+        self, value: _Value, filter: str, args: dict[str, object]
+    ) -> _Value:
+        """One host-provided rows node in front of every stream of `value`."""
         return replace(
             value,
             streams=tuple(
                 replace(
                     stream,
                     ref=self.ctx.node(
-                        ROWFILTER,
-                        {PREDICATE: predicate},
+                        filter,
+                        args,
                         [stream.ref],
                         [stream.type],
                         reads_annotations=True,

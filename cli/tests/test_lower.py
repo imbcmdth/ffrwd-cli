@@ -9456,6 +9456,97 @@ def test_an_untitled_caption_track_still_writes_to_any_container() -> None:
 
 
 # ---------------------------------------------------------------------------
+# merge_cues over probed rows
+# ---------------------------------------------------------------------------
+
+
+def test_merge_cues_collapses_a_cue_documents_rows_into_runs() -> None:
+    """Two cues 0.1s apart merge at distance 0.1; the third is 0.1 past the
+    second and joins the same run, so the whole document is one row whose
+    text is every cue's, joined."""
+    sinks = lower_table(
+        resolve(
+            parse(
+                "SELECT c.index, c.text, c.start_t, c.end_t "
+                "FROM input('f.mkv') f, input('subs.en.vtt') v, "
+                "unnest(merge_cues(v.cues, 0.1)) c"
+            )
+        ),
+        _cue_probes(),
+    )
+    assert sinks[0].result.rows == [[1, "Cue one. Cue two. Cue three.", 0.0, 2.0]]
+
+
+def test_merge_cues_leaves_a_gap_past_max_distance_alone() -> None:
+    sinks = lower_table(
+        resolve(
+            parse(
+                "SELECT c.start_t, c.end_t FROM input('f.mkv') f, "
+                "input('subs.en.vtt') v, unnest(merge_cues(v.cues)) c"
+            )
+        ),
+        _cue_probes(),
+    )
+    assert sinks[0].result.rows == [[0.0, 0.6], [0.7, 1.3], [1.4, 2.0]]
+
+
+def test_merge_cues_merges_vector_rows_and_keeps_the_first_rows_vector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The two rows are back to back, so they are one span; every field but
+    the bounds is the first row's, the vector included."""
+    _extracted(monkeypatch, _described_tracks())
+    sinks = lower_table(
+        resolve(
+            parse(
+                "SELECT v.track, v.start_t, v.end_t, vector_length(v.vector) "
+                "FROM input('d.mkv') f, "
+                "unnest(merge_cues(f.embeddings['clip_vectors'], 0)) v"
+            )
+        ),
+        _described_probes(),
+    )
+    assert sinks[0].result.rows == [["clip_vectors", 0.0, 3.0, 2]]
+
+
+def test_a_gather_narrows_the_rows_before_they_merge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The predicate drops the first row, so the run starts at the second."""
+    _extracted(monkeypatch, _described_tracks())
+    sinks = lower_table(
+        resolve(
+            parse(
+                "SELECT v.start_t, v.end_t FROM input('d.mkv') f, "
+                "unnest(merge_cues(ARRAY(SELECT w FROM "
+                "unnest(f.embeddings['clip_vectors']) w WHERE w.start_t > 0), 0)) v"
+            )
+        ),
+        _described_probes(),
+    )
+    assert sinks[0].result.rows == [[1.5, 3.0]]
+
+
+def test_a_negative_max_distance_is_refused() -> None:
+    err = _reject(
+        "SELECT c.text FROM input('f.mkv') f, input('subs.en.vtt') v, "
+        "unnest(merge_cues(v.cues, -1)) c"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "cannot be -1" in err.message
+    assert "merges rows that touch" in (err.hint or "")
+
+
+def test_merge_cues_over_records_with_no_span_is_refused() -> None:
+    err = _reject(
+        "SELECT a.filename FROM input('f.mkv') f, unnest(merge_cues(f.attachments, 1)) a"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'f.attachments' carries neither" in err.message
+    assert "start_t" in (err.hint or "") and "cues" in (err.hint or "")
+
+
+# ---------------------------------------------------------------------------
 # a built-in function call over a row column: a STRUCT field, and WHERE
 # ---------------------------------------------------------------------------
 

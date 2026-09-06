@@ -16,6 +16,7 @@ use ffrwd_wasm_runtime::runtime::{self, Described, Filter, Format, Kind, Media, 
 
 use crate::graph::{EdgeKind, Pad, ParsedNode};
 use crate::rowfilter::{self, RowFilter};
+use crate::rowmerge::{self, RowMerge};
 use crate::scheduler::{LaneSeed, Reopen, Runner};
 
 /// Where one of a node's streams comes from.
@@ -102,9 +103,9 @@ impl Network {
             check_one_format(&node.module, &placed, &roots, formats)?;
             let format = formats[root];
 
-            // The rows node is the host's own: nothing is compiled, and it
-            // carries whichever kind reaches it, so neither the module kind
-            // nor a params schema applies.
+            // The two rows nodes are the host's own: nothing is compiled, and
+            // each carries whichever kind reaches it, so neither the module
+            // kind nor a params schema applies.
             let seed = if node.module == rowfilter::NODE {
                 check_pad_count(&node.module, 1, placed.len())?;
                 reads_rows.push(true);
@@ -113,6 +114,18 @@ impl Network {
                     name: rowfilter::NODE.to_string(),
                     runners: vec![Runner::Rows(RowFilter::open(&node.options)?)],
                     shape: rowfilter::SHAPE,
+                    sources: placed,
+                    format,
+                    reopen: None,
+                }
+            } else if node.module == rowmerge::NODE {
+                check_pad_count(&node.module, 1, placed.len())?;
+                reads_rows.push(true);
+                forwards_rows.push(true);
+                LaneSeed {
+                    name: rowmerge::NODE.to_string(),
+                    runners: vec![Runner::Merge(RowMerge::open(&node.options)?)],
+                    shape: rowmerge::SHAPE,
                     sources: placed,
                     format,
                     reopen: None,

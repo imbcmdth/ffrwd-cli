@@ -1,8 +1,9 @@
 # The rows edge
 
-`rowfilter`, the one node of a network that is not a module. It keeps or drops
-the rows travelling with the frames, by a predicate written as JSON. The
-compiler builds this spelling.
+`rowfilter` and `rowmerge`, the two nodes of a network that are not modules.
+One keeps or drops the rows travelling with the frames, by a predicate written
+as JSON; the other collapses runs of them into one row each. The compiler
+builds both spellings.
 
 ## The spelling
 
@@ -24,9 +25,9 @@ is written into a `-filter_complex` as:
 That is the `-filter_complex` argument itself, before whatever quoting the
 shell wants on top.
 
-`rowfilter` is a reserved node name. No `-m` binds it, and a `-m rowfilter=...`
-is refused; the host provides it. A network built only of `rowfilter` nodes
-binds nothing, and is not refused for having no `-m`.
+Both names are reserved. No `-m` binds either, and a `-m rowfilter=...` or
+`-m rowmerge=...` is refused; the host provides them. A network built only of
+these nodes binds nothing, and is not refused for having no `-m`.
 
 ## The predicate
 
@@ -95,3 +96,33 @@ A `rowfilter` node given no `pred`, or given an option that is not `pred`:
 
     rowfilter takes one option, pred=<json>, and was given none
     rowfilter has no option 'threshold'; it takes pred=<json>
+
+## rowmerge
+
+    [a]rowmerge=max_distance=<number>[b]
+
+`max_distance` is its only option, and it is required: a gap in seconds, and a
+number with nothing to escape.
+
+Rows arrive in `start_t` order and are collapsed into runs. A row whose
+`start_t` is no more than `max_distance` past the run's end joins that run -
+so rows that overlap or touch always do - and the run becomes one row from the
+first start to the furthest end its rows reached, carrying the first row's
+fields with its `text` joined by single spaces. The run stays open until a row
+arrives outside it, so a merged row leaves on the frame that closed its run;
+the last run has no frame left and goes out with the trailing rows.
+
+A row that is not a JSON object, or that carries no `start_t`/`end_t`, rides
+through untouched - a module's trailing summary record is not a span, and this
+node is not the one that reads it.
+
+Frames pass through untouched, the same as `rowfilter`, and the node reads one
+stream, window 1, stride 1, pure and one-to-one. It is not a module, so
+`--describe` never names it.
+
+Refusals:
+
+    rowmerge takes one option, max_distance=<number>, and was given none
+    rowmerge has no option 'pred'; it takes max_distance=<number>
+    rowmerge: max_distance is not a number: soon
+    rowmerge: max_distance is a distance in seconds and cannot be -1

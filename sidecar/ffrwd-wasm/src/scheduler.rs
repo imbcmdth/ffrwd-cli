@@ -29,6 +29,7 @@ use ffrwd_wasm_runtime::runtime::{Filter, Format, Frame, Processed, Shape, Strea
 
 use crate::network::Source;
 use crate::rowfilter::RowFilter;
+use crate::rowmerge::RowMerge;
 use crate::windows::Windows;
 use crate::Sink;
 
@@ -57,6 +58,7 @@ type StubFn = Box<dyn FnMut(&[Frame], &[String], bool) -> Result<Processed> + Se
 pub enum Runner {
     Module(Box<Filter>),
     Rows(RowFilter),
+    Merge(RowMerge),
     #[cfg(test)]
     Stub(StubFn),
 }
@@ -72,6 +74,23 @@ impl Runner {
                 } else {
                     Vec::new()
                 };
+                Ok(Processed {
+                    frames: out,
+                    trailing,
+                })
+            }
+            Runner::Merge(merge) => {
+                let out = frames.iter().cloned().map(|f| merge.pass(f)).collect();
+                // The run still open when the rows run out has no frame left
+                // to ride, so it leaves with the trailing ones.
+                let mut trailing = if last {
+                    merge.merged(trailing.to_vec())
+                } else {
+                    Vec::new()
+                };
+                if last {
+                    trailing.extend(merge.finish());
+                }
                 Ok(Processed {
                     frames: out,
                     trailing,
@@ -101,7 +120,10 @@ impl LaneSeed {
     /// its own declaration, and an audio module's output is checked as one
     /// continuous run of samples per instance, so it keeps one.
     fn width(&self, workers: usize) -> usize {
-        let module = !matches!(self.runners.first(), Some(Runner::Rows(_)));
+        let module = !matches!(
+            self.runners.first(),
+            Some(Runner::Rows(_) | Runner::Merge(_))
+        );
         if module && self.shape.pure && self.format.video().is_some() {
             workers
         } else {

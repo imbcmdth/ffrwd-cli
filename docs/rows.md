@@ -240,6 +240,17 @@ Over a CTE's own stream column, `array_agg` skips a NULL cell instead of refusin
 
 `ARRAY(<select>)` is `array_agg`'s converse: an expression-position gather of a countable subquery, without the CTE + `array_agg` + `GROUP BY` ceremony - [recipe 86](corpus.md#86-gather-clips-into-one-file-without-the-cte) is recipe 75's contact sheet written as one expression, byte for byte the same command. It stands wherever an `array_agg` result already does (a whole SELECT column, `VARIADIC`'s argument); a multi-column subquery needs `SELECT AS STRUCT <cols>` to gather an array of structs instead, feeding `chapters` / `attachments` / a cue array the way `array_agg(STRUCT(...)::<record>)` does by hand ([recipe 85](corpus.md#85-key-an-encode-ladder-from-written-rows) uses the struct row table above the same way `array_agg` uses any other row source). `array_agg` itself is unchanged - it stays the aggregate a `GROUP BY` partitions; `ARRAY(...)` is the ungrouped, no-partition case, and the two overlapping there is expected, not a duplication to resolve.
 
+## Merging runs of rows - `merge_cues(<rows>, <max_distance>)`
+
+Rows that follow one another closely enough are one span. `merge_cues` reads an array of records carrying `start_t` and `end_t` - `cues`, `embeddings`, `chapters`, or a module's own annotation rows - and returns the same record type with each run collapsed into one row.
+
+Rows are taken in `start_t` order. A row whose `start_t` is no more than `max_distance` past the run's end joins that run - so rows that overlap or touch always do, whatever the distance - and the run becomes one row from the first start to the furthest end its rows reached. A `text` field joins with one space; every other field, `vector` included, is the first row's. `max_distance` defaults to 0, is a number literal or a variable holding one, and a negative one is a rejection; so is a record with no span. An empty array is an empty array.
+
+It stands in two places, and means the same in both:
+
+- **In a FROM `unnest`**, over rows a file already carries: `unnest(merge_cues(f.cues['speech'], 0.5)) c` reads its rows exactly as `unnest(f.cues) c` reads the file's own. The rows are compile-time rows, so the merge happens before anything runs. To narrow before merging - a search that wants its hits collapsed rather than the whole track - wrap a gather instead: `merge_cues(ARRAY(SELECT v FROM unnest(f.embeddings['clip_vectors']) v WHERE <predicate>), 1)`, whose predicate reads the gather's own columns and no other alias. [Recipes 131-132](corpus.md#131-collapse-a-files-rows-into-runs).
+- **Over a module's annotation column**, whose rows do not exist yet: `merge_cues(captions(f.video[1]).cues, 0)` becomes a node in that module's sidecar, holding each run open until a row arrives outside `max_distance` or the stream ends. It composes with the gather the same way a run-time `WHERE` already does - narrowed first, then merged - and a row carrying no span rides through untouched. Merging the rows a rows function is about to read is refused: that function reads every row the module produced, so merge what it hands back. [Recipe 133](corpus.md#133-merge-a-modules-rows-as-they-are-written).
+
 ## Rows between modules
 
 Rows exist at two times, and each has its own way of being read by a function.
