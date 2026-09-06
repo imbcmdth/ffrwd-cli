@@ -1440,6 +1440,12 @@ _REPAIR: dict[ErrorCode, str] = {
         "...) -- write that call as `ffmpeg.<name>(...)` instead. Re-emit one "
         "well-formed SELECT."
     ),
+    ErrorCode.SYNTAX_ERROR: (
+        "The `message`/`hint` name the exact unbalanced `(`/`)` or unterminated "
+        "quote, with `line`/`col` pointing right at it. Fix only that character -- "
+        "add the missing `)`, remove the extra one, or close the quote -- and "
+        "re-validate; do not rewrite the rest of the query."
+    ),
     ErrorCode.UNKNOWN_FUNCTION: (
         "That name is neither one of the 4 `ffrwd.*` macros nor a filter "
         "the installed ffmpeg has. Take the did-you-mean from `hint` if "

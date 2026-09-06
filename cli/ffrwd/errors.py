@@ -12,6 +12,7 @@ from enum import Enum
 
 class ErrorCode(str, Enum):
     PARSE_ERROR = "PARSE_ERROR"
+    SYNTAX_ERROR = "SYNTAX_ERROR"  # unbalanced parens/quotes found scanning a Command fallback
     UNKNOWN_FUNCTION = "UNKNOWN_FUNCTION"
     UNKNOWN_ALIAS = "UNKNOWN_ALIAS"
     UDF_ARG_TYPE = "UDF_ARG_TYPE"

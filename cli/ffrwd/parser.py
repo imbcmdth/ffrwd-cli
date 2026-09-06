@@ -187,6 +187,7 @@ from __future__ import annotations
 
 import difflib
 import json
+import logging
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -346,6 +347,13 @@ QueryExpr = exp.Select | exp.Union
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 _DEFAULT_POS: tuple[int, int] = (1, 1)
+
+# sqlglot logs a "Falling back to parsing as a 'Command'" WARNING straight to
+# stderr through the logging module (not through ffrwd.console) every time it
+# gives up on a statement -- which is the normal, typed-rejection path here,
+# not a diagnostic a terminal should see twice. This is the only place ffrwd
+# configures parsing, so it is the only place that needs to say so.
+logging.getLogger("sqlglot").setLevel(logging.ERROR)
 
 # Select/Union arg keys that map to a hard "no streaming equivalent" rejection.
 _STREAMING_CLAUSES: dict[str, str] = {
@@ -1600,6 +1608,130 @@ def _annotate_unset(tree: exp.Expression, unset: Mapping[tuple[int, int], str]) 
             node.meta["variable"] = unset[found]
 
 
+def _syntax_scan(text: str) -> FfrwdError | None:
+    """First unbalanced paren or unterminated quote in `text`, or None if it balances.
+
+    Only run over an ``exp.Command`` -- the node sqlglot falls back to once it
+    gives up on a statement, carrying no position of its own to reject against
+    (see ``_FfrwdPostgres``'s docstring). This walks the raw text by hand
+    instead, tracking line/col itself and skipping everything that is not
+    code: single- and double-quoted regions (a doubled quote is the only
+    escape this dialect's strings recognize -- an ``E'...'`` string's
+    backslash escapes are not specially handled, so a literal backslash
+    before the closing quote is read as ordinary text, not an escape),
+    ``$tag$ ... $tag$`` dollar-quoted bodies, and ``--``/``/* */`` comments.
+
+    Reports the first offender: the first ``)`` with nothing open to close,
+    the first quote/comment/dollar-quoted body never closed before the text
+    ends, or -- if the text has neither -- the first ``(`` still open at the
+    end.
+    """
+    line, col, i, n = 1, 1, 0, len(text)
+    open_parens: list[tuple[int, int]] = []
+
+    def advance(count: int = 1) -> None:
+        nonlocal line, col, i
+        for _ in range(count):
+            if text[i] == "\n":
+                line += 1
+                col = 1
+            else:
+                col += 1
+            i += 1
+
+    while i < n:
+        if text[i : i + 2] == "--":
+            while i < n and text[i] != "\n":
+                advance()
+            continue
+        if text[i : i + 2] == "/*":
+            start = (line, col)
+            advance(2)
+            while i < n and text[i : i + 2] != "*/":
+                advance()
+            if i >= n:
+                return FfrwdError(
+                    ErrorCode.SYNTAX_ERROR,
+                    "unterminated block comment",
+                    line=start[0],
+                    col=start[1],
+                    hint="add the closing '*/'",
+                )
+            advance(2)
+            continue
+        if text[i] == "$":
+            tag_match = re.match(r"\$([A-Za-z_][A-Za-z0-9_]*)?\$", text[i:])
+            if tag_match is not None:
+                tag = tag_match.group(0)
+                start = (line, col)
+                advance(len(tag))
+                end = text.find(tag, i)
+                if end == -1:
+                    return FfrwdError(
+                        ErrorCode.SYNTAX_ERROR,
+                        "unterminated dollar-quoted string",
+                        line=start[0],
+                        col=start[1],
+                        hint=f"add the closing '{tag}'",
+                    )
+                while i < end:
+                    advance()
+                advance(len(tag))
+                continue
+        if text[i] in "'\"":
+            quote = text[i]
+            start = (line, col)
+            advance()
+            closed = False
+            while i < n:
+                if text[i] == quote:
+                    if text[i : i + 2] == quote * 2:
+                        advance(2)
+                        continue
+                    advance()
+                    closed = True
+                    break
+                advance()
+            if not closed:
+                kind = "string" if quote == "'" else "quoted identifier"
+                return FfrwdError(
+                    ErrorCode.SYNTAX_ERROR,
+                    f"unterminated {kind}",
+                    line=start[0],
+                    col=start[1],
+                    hint=f"this {quote} never closes; add the matching {quote}",
+                )
+            continue
+        if text[i] == "(":
+            open_parens.append((line, col))
+            advance()
+            continue
+        if text[i] == ")":
+            if not open_parens:
+                return FfrwdError(
+                    ErrorCode.SYNTAX_ERROR,
+                    "unbalanced ')'",
+                    line=line,
+                    col=col,
+                    hint="this ')' closes nothing; an earlier '(' already matched",
+                )
+            open_parens.pop()
+            advance()
+            continue
+        advance()
+
+    if open_parens:
+        first_line, first_col = open_parens[0]
+        return FfrwdError(
+            ErrorCode.SYNTAX_ERROR,
+            "unbalanced '('",
+            line=first_line,
+            col=first_col,
+            hint="this '(' is never closed; add the matching ')'",
+        )
+    return None
+
+
 def parse(
     text: str, unset: Mapping[tuple[int, int], str] | None = None
 ) -> exp.Expression:
@@ -1624,7 +1756,16 @@ def parse(
     parsed"). Keeping ``parse_one`` keeps that PARSE_ERROR, and every other
     single-statement behavior, exactly as it was.
 
-    Raises ``FfrwdError(PARSE_ERROR)`` — and nothing else — on any failure.
+    A tree sqlglot could only build by falling back to ``exp.Command`` gets
+    one more pass before it comes back: :func:`_syntax_scan` looks for the
+    unbalanced paren or unterminated quote that is usually why, and raises
+    ``FfrwdError(SYNTAX_ERROR)`` naming it. A ``Command`` whose text actually
+    balances (real syntax outside the dialect, e.g. ``DROP TABLE x``) is
+    unaffected -- it comes back like any other tree, for the caller's own
+    "unsupported statement" rejection to catch.
+
+    Raises ``FfrwdError(PARSE_ERROR)`` or ``FfrwdError(SYNTAX_ERROR)`` — and
+    nothing else — on any failure.
     """
     if not text.strip():
         raise FfrwdError(
@@ -1662,6 +1803,10 @@ def parse(
         ) from err
     if not isinstance(tree, exp.Expression):
         raise FfrwdError(ErrorCode.PARSE_ERROR, "no statement found", line=1, col=1)
+    if any(isinstance(node, exp.Command) for node in tree.walk()):
+        syntax_error = _syntax_scan(text)
+        if syntax_error is not None:
+            raise syntax_error
     if unset:
         _annotate_unset(tree, unset)
     return tree

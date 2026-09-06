@@ -18,6 +18,7 @@
       "type": "string",
       "enum": [
         "PARSE_ERROR",
+        "SYNTAX_ERROR",
         "UNKNOWN_FUNCTION",
         "UNKNOWN_ALIAS",
         "UDF_ARG_TYPE",

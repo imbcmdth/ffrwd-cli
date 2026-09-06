@@ -24,6 +24,26 @@ SELECT a.video[1] FROM input('x.mp4' a
 {"line": 1, "col": 38, "code": "PARSE_ERROR", "message": "Expecting )", "hint": null}
 ```
 
+## SYNTAX_ERROR
+
+**Meaning:** the text does not parse as SQL, and the fault is one the parser cannot point at itself: an unmatched parenthesis, or an unterminated string, quoted identifier or dollar-quoted body. Reported at the offending character, before the statement is refused as unsupported.
+
+**Fires when:** the parse fell back to an opaque command and a scan of the raw text, skipping strings, quoted identifiers, dollar-quoted bodies and comments, finds a `)` that closes nothing, a `(` never closed, or a quote never closed. A text that balances is not this: it is the ordinary "unsupported statement" refusal.
+
+**Example query** (one `)` too many at the end -- the balanced form is an ordinary `COPY`):
+
+```sql
+copy(select v.audio[1] from input('x.mp4') v) TO 'out.mp4' with (audio_codec 'aac'))
+```
+
+**Error JSON:**
+
+```json
+{"line": 1, "col": 84, "code": "SYNTAX_ERROR", "message": "unbalanced ')'", "hint": "this ')' closes nothing; an earlier '(' already matched"}
+```
+
+A statement missing a `)` instead reports the earliest `(` still open at the end of the text (`"unbalanced '('"`, hint `"this '(' is never closed; add the matching ')'"`), and one with a string, quoted identifier, or dollar-quoted body that never closes reports the opening quote/tag (`"unterminated string"` / `"unterminated quoted identifier"` / `"unterminated dollar-quoted string"`). In practice sqlglot's own tokenizer already rejects most unterminated quotes as `PARSE_ERROR` before a statement can even reach `exp.Command` -- this half of the scan exists for the `Command` that reaches ffrwd with one anyway.
+
 ## UNKNOWN_FUNCTION
 
 **Meaning:** A call names a function that is not a filter the installed ffmpeg reports (`ffrwd/registry.py`, see [docs/filters.md](filters.md)) and not one of the three `ffrwd.<name>` macros. Checked for the outer call and for nested calls used as arguments.

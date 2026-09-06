@@ -12,6 +12,7 @@ from ffrwd.parser import (
     RawSink,
     RawSource,
     Resolved,
+    _syntax_scan,
     from_entries,
     parse,
     resolve,
@@ -102,6 +103,95 @@ def test_parse_error_is_line_anchored() -> None:
         parse("SELECT a.video[1]\nFROM input('x') a\nWHERE a.t BETWEEN AND 2")
     assert excinfo.value.code is ErrorCode.PARSE_ERROR
     assert excinfo.value.line == 3
+
+
+# ---------------------------------------------------------------------------
+# parse — exp.Command fallback: unbalanced parens / unterminated quotes
+# ---------------------------------------------------------------------------
+
+# One ')' too many at the end; the balanced form is an ordinary COPY that
+# sqlglot never falls back on -- see test_syntax_error_balanced_falls_through.
+_ONE_TOO_MANY_PARENS = (
+    "copy(select v.audio[1] from input('d:\\projects\\angel-one.mp4') v) "
+    "TO 'out.mp4' with (audio_codec 'aac'))"
+)
+
+
+def test_syntax_error_on_unbalanced_close_paren() -> None:
+    with pytest.raises(FfrwdError) as excinfo:
+        parse(_ONE_TOO_MANY_PARENS)
+    err = excinfo.value
+    assert err.code is ErrorCode.SYNTAX_ERROR
+    assert err.line == 1
+    assert err.col == 104
+    assert err.message == "unbalanced ')'"
+    assert err.hint == "this ')' closes nothing; an earlier '(' already matched"
+
+
+def test_syntax_error_silences_sqlglot_on_the_terminal(
+    caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """sqlglot's own fallback WARNING never reaches the terminal or the log."""
+    with pytest.raises(FfrwdError):
+        parse(_ONE_TOO_MANY_PARENS)
+    assert caplog.records == []
+    assert capsys.readouterr().err == ""
+
+
+def test_syntax_error_balanced_command_falls_through_to_unsupported_sql() -> None:
+    """A Command whose text balances is not this code's business."""
+    text = _ONE_TOO_MANY_PARENS[:-1]  # drop the extra ')': now a real COPY
+    tree = parse(text)  # does not raise: it is an ordinary exp.Copy now
+    assert isinstance(tree, exp.Copy)
+
+    # sqlglot cannot parse RECURSIVE VIEW at all and falls back to exp.Command
+    # with perfectly balanced text -- the pre-existing refusal still fires.
+    with pytest.raises(FfrwdError) as excinfo:
+        resolve(
+            parse(
+                "CREATE RECURSIVE VIEW v (c) AS SELECT a.video[1] AS f FROM input('x.mp4') a;\n"
+                "COPY (SELECT v.f FROM v) TO 'out.mp4';"
+            )
+        )
+    err = excinfo.value
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert err.message == "unsupported statement: COMMAND"
+
+
+def test_syntax_scan_finds_unterminated_string() -> None:
+    err = _syntax_scan("copy(select v.audio[1]) TO 'out.mp4")
+    assert err is not None
+    assert err.code is ErrorCode.SYNTAX_ERROR
+    assert err.message == "unterminated string"
+    assert (err.line, err.col) == (1, 28)
+    assert err.hint == "this ' never closes; add the matching '"
+
+
+def test_syntax_scan_finds_unterminated_quoted_identifier() -> None:
+    err = _syntax_scan('copy(select "abc) TO \'out.mp4\'')
+    assert err is not None
+    assert err.message == "unterminated quoted identifier"
+
+
+def test_syntax_scan_finds_unterminated_dollar_quoted_body() -> None:
+    err = _syntax_scan("copy(select $tag$abc) TO 'out.mp4'")
+    assert err is not None
+    assert err.message == "unterminated dollar-quoted string"
+
+
+def test_syntax_scan_finds_unbalanced_open_paren() -> None:
+    err = _syntax_scan("copy(select v.audio[1]")
+    assert err is not None
+    assert err.message == "unbalanced '('"
+    assert (err.line, err.col) == (1, 5)
+
+
+def test_syntax_scan_skips_parens_and_quotes_in_comments_and_strings() -> None:
+    balanced = (
+        "copy(select 'a)b''c' -- a ')' and an unmatched quote in a comment\n"
+        "from input($tag$x)y$tag$) v) TO 'out.mp4'"
+    )
+    assert _syntax_scan(balanced) is None
 
 
 # ---------------------------------------------------------------------------
