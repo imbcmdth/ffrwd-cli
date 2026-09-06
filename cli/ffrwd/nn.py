@@ -61,10 +61,8 @@ from pathlib import Path
 from typing import IO
 
 from . import binaries
+from .console import Announce, Progress
 from .errors import ErrorCode, FfrwdError
-
-# What a fetch tells the caller, so nothing here decides where a line prints.
-Announce = Callable[[str], None]
 
 __all__ = [
     "Info",
@@ -92,6 +90,9 @@ _NN_TARGET_FLAG = "-nn-target"
 SETUP_HINT = "run `ffrwd setup nn` once with a network connection"
 
 _TIMEOUT = 60.0
+
+# What one read off the network takes, and how often progress is reported.
+_BLOCK_BYTES = 1024 * 1024
 
 # How long the sidecar gets to answer --nn-info. It reads no model and opens
 # no runtime, so this is process startup and nothing else.
@@ -623,7 +624,7 @@ def _mismatched(url: str, found: str, expected: str) -> FfrwdError:
     )
 
 
-def _download(artifact: Artifact, into: Path) -> Path:
+def _download(artifact: Artifact, into: Path, progress: Progress | None = None) -> Path:
     """Fetch and verify one archive into `into`, returning where it landed.
 
     Streamed to disk rather than held: the largest pinned artifact is most of
@@ -633,7 +634,7 @@ def _download(artifact: Artifact, into: Path) -> Path:
     handle, temporary = tempfile.mkstemp(dir=into, prefix="archive-", suffix=".tmp")
     try:
         with os.fdopen(handle, "wb") as file:
-            found, oversized = _stream(artifact, file)
+            found, oversized = _stream(artifact, file, progress)
         if oversized:
             raise _unreachable(
                 artifact.url, f"it is longer than the {artifact.size} bytes pinned for it"
@@ -646,25 +647,32 @@ def _download(artifact: Artifact, into: Path) -> Path:
     return Path(temporary)
 
 
-def _stream(artifact: Artifact, file: IO[bytes]) -> tuple[str, bool]:
+def _stream(
+    artifact: Artifact, file: IO[bytes], progress: Progress | None = None
+) -> tuple[str, bool]:
     """Copy the artifact into `file`, hashing it: the digest, and whether it ran long.
 
     Abandoned at the block that crosses the pinned size rather than after the
-    whole answer has been written.
+    whole answer has been written. `progress` hears every block against the
+    artifact's pinned size.
     """
     digest = hashlib.sha256()
     written = 0
     try:
         with _urlopen(urllib.request.Request(artifact.url), timeout=_TIMEOUT) as response:
             while True:
-                block = response.read(1024 * 1024)
+                block = response.read(_BLOCK_BYTES)
                 if not block:
+                    if progress is not None:
+                        progress(written, artifact.size)
                     return digest.hexdigest(), False
                 written += len(block)
                 if written > artifact.size:
                     return digest.hexdigest(), True
                 digest.update(block)
                 file.write(block)
+                if progress is not None:
+                    progress(written, artifact.size)
     except urllib.error.HTTPError as err:
         raise _unreachable(artifact.url, f"HTTP {err.code}") from err
     except (OSError, ValueError, urllib.error.URLError) as err:
@@ -766,14 +774,19 @@ def _link_aliases(directory: Path, artifacts: Sequence[Artifact]) -> None:
                     shutil.copyfile(target, beside)
 
 
-def _fetch_tier(directory: Path, tier: str, artifacts: Sequence[Artifact]) -> None:
+def _fetch_tier(
+    directory: Path,
+    tier: str,
+    artifacts: Sequence[Artifact],
+    progress: Progress | None = None,
+) -> None:
     """Put one tier on disk, completely or not at all."""
     directory.mkdir(parents=True, exist_ok=True)
     pending: list[tuple[Path, Path]] = []
     archives: list[Path] = []
     try:
         for artifact in artifacts:
-            archive = _download(artifact, directory)
+            archive = _download(artifact, directory, progress)
             archives.append(archive)
             _extract(archive, artifact, directory, pending)
     except BaseException:
@@ -809,12 +822,13 @@ def provision(
     *,
     announce: Announce | None = None,
     found: Info | None = None,
+    progress: Progress | None = None,
 ) -> Path:
     """Put every tier of `tiers` under the runtime directory, and return it.
 
     A tier already on disk is left alone and costs nothing. `announce` is
     called with the one line a fetch prints, and not called at all when
-    nothing had to be fetched.
+    nothing had to be fetched; `progress` hears the bytes of every archive.
     """
     known = found if found is not None else info()
     pinned = _table(known)
@@ -830,11 +844,13 @@ def provision(
     if absent and announce is not None:
         announce(_notice(known, absent, sum(_size_of(pinned[tier]) for tier in absent)))
     for tier in absent:
-        _fetch_tier(directory, tier, pinned[tier])
+        _fetch_tier(directory, tier, pinned[tier], progress)
     return directory
 
 
-def ensure(*, announce: Announce | None = None) -> Path | None:
+def ensure(
+    *, announce: Announce | None = None, progress: Progress | None = None
+) -> Path | None:
     """Provision what this platform wants, unless the environment names its own.
 
     `FFRWD_NN_RUNTIME` set is a developer pointing the sidecar at a directory
@@ -845,7 +861,9 @@ def ensure(*, announce: Announce | None = None) -> Path | None:
     if _named_runtime() is not None:
         return None
     known = info()
-    return provision(wanted_tiers(known), announce=announce, found=known)
+    return provision(
+        wanted_tiers(known), announce=announce, found=known, progress=progress
+    )
 
 
 def _named_runtime() -> str | None:

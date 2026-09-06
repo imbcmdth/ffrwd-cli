@@ -39,6 +39,7 @@ from types import SimpleNamespace
 import pytest
 
 from ffrwd import cli, credentials, packages, store
+from ffrwd.console import Console
 from ffrwd.errors import ErrorCode, FfrwdError
 from ffrwd.mcp import tools as mcp_tools
 from ffrwd.project import (
@@ -178,8 +179,11 @@ TOKEN = "ffrwd_" + "A" * 43
 class _Fake:
     """One canned HTTP answer, shaped the way urllib hands one back."""
 
-    def __init__(self, status: int, body: bytes) -> None:
+    def __init__(
+        self, status: int, body: bytes, headers: Mapping[str, str] | None = None
+    ) -> None:
         self.status = status
+        self.headers = dict(headers) if headers else {}
         self._body = io.BytesIO(body)
 
     def read(self, size: int = -1) -> bytes:
@@ -192,13 +196,21 @@ class _Fake:
         return None
 
 
+class _WithLength:
+    """An answer naming its Content-Length, which the hub's own answer does."""
+
+    def __init__(self, body: bytes) -> None:
+        self.body = body
+
+
 class _Served:
     """The HTTP seam: a table of URL to answer, and what was asked for.
 
-    An answer is bytes for a 200, or an ``(status, body)`` pair for anything
-    else -- which urllib raises rather than returns, so this does too. A URL
-    the table does not hold is a 404, since that is what a registry says about
-    something it has never published.
+    An answer is bytes for a 200, an ``(status, body)`` pair for anything
+    else -- which urllib raises rather than returns, so this does too -- or a
+    :class:`_WithLength` for a 200 that names its size. A URL the table does
+    not hold is a 404, since that is what a registry says about something it
+    has never published.
     """
 
     def __init__(self, answers: Mapping[str, object]) -> None:
@@ -215,6 +227,8 @@ class _Served:
         body = request.data  # type: ignore[attr-defined]
         self.asked.append((url, headers, body))
         answer = self.answers.get(url, (404, b'{"error": "not found"}'))
+        if isinstance(answer, _WithLength):
+            return _Fake(200, answer.body, {"Content-Length": str(len(answer.body))})
         status, content = answer if isinstance(answer, tuple) else (200, answer)
         assert isinstance(content, bytes)
         if status >= 400:
@@ -1677,6 +1691,10 @@ MODEL_URL = "https://huggingface.co/depth-anything/small/resolve/v1/model.onnx"
 DATA = b"nor really the weights that graph would refer to"
 DATA_DIGEST = hashlib.sha256(DATA).hexdigest()
 DATA_URL = "https://huggingface.co/depth-anything/small/resolve/v1/onnx/model.onnx.data"
+# A model past the megabyte a bar draws for, in more blocks than one.
+LARGE_MODEL = b"m" * (2 * 1024 * 1024 + 11)
+LARGE_MODEL_DIGEST = hashlib.sha256(LARGE_MODEL).hexdigest()
+BLOCK = 1024 * 1024
 
 
 def _model_package(root: Path, *, models: dict[str, object] | None = None) -> Path:
@@ -1725,6 +1743,90 @@ def test_the_model_notice_carries_the_size_when_the_answer_names_one() -> None:
     answer = SimpleNamespace(headers={"Content-Length": "86000000"})
     assert packages._content_length(answer) == 86_000_000
     assert packages._content_length(SimpleNamespace()) is None
+
+
+def _large_model_pin() -> ModelPin:
+    return ModelPin(
+        repo="depth-anything/small",
+        revision="v1",
+        file="model.onnx",
+        sha256=LARGE_MODEL_DIGEST,
+    )
+
+
+def test_a_model_stream_reports_every_block_and_the_count_it_ended_at(
+    served: _Served,
+) -> None:
+    """The size the answer names is the total; without one the end names the count."""
+    seen: list[tuple[int, int | None]] = []
+
+    def report(done: int, total: int | None) -> None:
+        seen.append((done, total))
+
+    _serves(served, **{MODEL_URL: _WithLength(LARGE_MODEL)})
+    packages._stream(
+        MODEL_URL, io.BytesIO(), "broadcast/depth", "depth", _large_model_pin(), None, report
+    )
+    weighs = len(LARGE_MODEL)
+    assert seen == [(BLOCK, weighs), (2 * BLOCK, weighs), (weighs, weighs), (weighs, weighs)]
+
+    seen.clear()
+    _serves(served, **{MODEL_URL: LARGE_MODEL})
+    packages._stream(
+        MODEL_URL, io.BytesIO(), "broadcast/depth", "depth", _large_model_pin(), None, report
+    )
+    assert seen == [(BLOCK, None), (2 * BLOCK, None), (weighs, None), (weighs, weighs)]
+
+
+def test_the_archive_download_reports_its_bytes_against_the_recorded_size(
+    store_home: Path, served: _Served, tmp_path: Path
+) -> None:
+    _sha256, archive = _served_package(served, tmp_path)
+    seen: list[tuple[int, int | None]] = []
+
+    packages.fetch(
+        packages.resolve("broadcast/tracks"),
+        lambda done, total: seen.append((done, total)),
+    )
+    # One block holds this archive; the release's own size is the total.
+    weighs = len(archive)
+    assert seen == [(weighs, weighs), (weighs, weighs)]
+
+
+def test_installing_a_large_model_draws_a_bar_on_a_terminal(
+    store_home: Path,
+    registry: Path,
+    served: _Served,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The narration line names the model; the bar redraws under it."""
+    monkeypatch.setenv(packages.REGISTRY_ENV, str(registry))
+    _publish(
+        registry,
+        _model_package(
+            tmp_path / "built",
+            models={
+                "depth": {
+                    "repo": "depth-anything/small",
+                    "revision": "v1",
+                    "file": "model.onnx",
+                    "sha256": LARGE_MODEL_DIGEST,
+                }
+            },
+        ),
+        functions=("depth",),
+    )
+    _serves(served, **{MODEL_URL: _WithLength(LARGE_MODEL)})
+    monkeypatch.setattr(Console, "_is_tty", lambda self: True)
+    project = _project(tmp_path / "work", monkeypatch, capsys)
+
+    code, _out, err = _run(project, monkeypatch, capsys, "install", "broadcast/depth")
+    assert code == 0, err
+    assert "model model.onnx (2 MB) from depth-anything/small" in err
+    assert "\rdownloading  [" in err
+    assert "/ 2 MB" in err
 
 
 def test_a_pinned_model_lands_beside_the_module_hash_verified(

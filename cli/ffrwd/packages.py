@@ -70,7 +70,7 @@ from pathlib import Path
 from typing import IO
 
 from . import credentials, nn, store, wasm
-from .console import Announce, written_size
+from .console import Announce, Progress, written_size
 from .errors import ErrorCode, FfrwdError
 from .functions import package_modules
 from .project import (
@@ -155,6 +155,8 @@ _MAX_SEARCH_BYTES = 4 * 1024 * 1024
 _MAX_MODEL_BYTES = 256 * 1024 * 1024 * 1024
 # What the hub's listing of pinned paths may answer with.
 _MAX_PATHS_INFO_BYTES = 4 * 1024 * 1024
+# What one read off the network takes, and how often progress is reported.
+_BLOCK_BYTES = 1024 * 1024
 
 # Where Hugging Face serves a pinned file from.
 HUGGINGFACE = "https://huggingface.co"
@@ -407,6 +409,46 @@ def _fetched(url: str, limit: int, request: urllib.request.Request) -> bytes:
         return _read(url, limit, request)
     except _Status as status:
         raise _unreachable(url, f"HTTP {status.code}") from status
+
+
+def _read_blocks(
+    url: str,
+    limit: int,
+    request: urllib.request.Request,
+    total: int | None,
+    progress: Progress | None,
+) -> bytes:
+    """:func:`_read` block by block, reporting each block to `progress`.
+
+    The same bound and the same refusals; the reading is split only so a
+    download worth waiting for can be watched while it arrives.
+    """
+    blocks: list[bytes] = []
+    written = 0
+    try:
+        with _urlopen(request, timeout=TIMEOUT) as response:
+            while written <= limit:
+                block = bytes(response.read(_BLOCK_BYTES))
+                if not block:
+                    break
+                blocks.append(block)
+                written += len(block)
+                if progress is not None:
+                    progress(written, total)
+    except urllib.error.HTTPError as err:
+        try:
+            said = bytes(err.read(limit + 1))
+        except OSError:  # a refusal with no body to read
+            said = b""
+        raise _Status(err.code, said) from err
+    except (OSError, ValueError, urllib.error.URLError) as err:
+        reason = getattr(err, "reason", None)
+        raise _unreachable(url, str(reason or err)) from err
+    if written > limit:
+        raise _too_large(url, limit)
+    if progress is not None:
+        progress(written, total if total is not None else written)
+    return b"".join(blocks)
 
 
 def _local_dir(base: str) -> Path | None:
@@ -853,7 +895,7 @@ def sign_url(release: Release) -> str:
     return signed
 
 
-def _archive_bytes(release: Release) -> bytes:
+def _archive_bytes(release: Release, progress: Progress | None = None) -> bytes:
     """`release`'s archive: off the filesystem, or through a signed URL."""
     relative = f"archives/{release.sha256}"
     root = _local_dir(base_url())
@@ -863,17 +905,22 @@ def _archive_bytes(release: Release) -> bytes:
             raise _unreachable(_where(relative), "no such file")
         return raw
     signed = sign_url(release)
-    return _fetched(signed, _MAX_ARCHIVE_BYTES, _request(signed))
+    try:
+        return _read_blocks(
+            signed, _MAX_ARCHIVE_BYTES, _request(signed), release.size, progress
+        )
+    except _Status as status:
+        raise _unreachable(signed, f"HTTP {status.code}") from status
 
 
-def fetch(release: Release) -> Path:
+def fetch(release: Release, progress: Progress | None = None) -> Path:
     """`release`'s content in the store, downloading it only when it is not there.
 
     The bytes are verified against the digest the registry recorded before
     anything opens them, which is :func:`ffrwd.store.unpack`'s contract: a
     download that does not match is discarded unopened and nothing is written.
     """
-    archive = _archive_bytes(release)
+    archive = _archive_bytes(release, progress)
     if len(archive) != release.size:
         raise _reject(
             f"package '{release.name}': the registry served {len(archive)} bytes for "
@@ -928,6 +975,7 @@ def _download_model(
     pin: ModelPin,
     destination: Path,
     announce: Announce | None = None,
+    progress: Progress | None = None,
 ) -> None:
     """Fetch, verify and place one model file. Nothing is written until it verifies.
 
@@ -947,7 +995,7 @@ def _download_model(
         ) from err
     try:
         with os.fdopen(handle, "wb") as file:
-            found, arrived = _stream(url, file, package, export, pin, announce)
+            found, arrived = _stream(url, file, package, export, pin, announce, progress)
         if arrived > _MAX_MODEL_BYTES:
             raise _model_refusal(
                 package,
@@ -997,6 +1045,7 @@ def _stream(
     export: str,
     pin: ModelPin,
     announce: Announce | None = None,
+    progress: Progress | None = None,
 ) -> tuple[str, int]:
     """Copy `url` into `file`, hashing it: the digest, and how many bytes arrived.
 
@@ -1004,23 +1053,28 @@ def _stream(
     whole thing has been written, so a hostile answer costs one block over the
     bound -- and a count past the backstop is what says it was abandoned.
     `announce` hears the one line naming the model, once the answer is open
-    and its size is known.
+    and its size is known; `progress` hears every block against that size.
     """
     digest = hashlib.sha256()
     written = 0
     try:
         with _urlopen(_request(url), timeout=TIMEOUT) as response:
+            total = _content_length(response)
             if announce is not None:
-                announce(_model_notice(pin, _content_length(response)))
+                announce(_model_notice(pin, total))
             while True:
-                block = response.read(1024 * 1024)
+                block = response.read(_BLOCK_BYTES)
                 if not block:
+                    if progress is not None:
+                        progress(written, total if total is not None else written)
                     return digest.hexdigest(), written
                 written += len(block)
                 if written > _MAX_MODEL_BYTES:
                     return digest.hexdigest(), written
                 digest.update(block)
                 file.write(block)
+                if progress is not None:
+                    progress(written, total)
     except urllib.error.HTTPError as err:
         raise _model_refusal(package, export, pin, f"answered HTTP {err.code}") from err
     except (OSError, ValueError, urllib.error.URLError) as err:
@@ -1030,7 +1084,11 @@ def _stream(
         ) from err
 
 
-def _install_models(package: Package, announce: Announce | None = None) -> None:
+def _install_models(
+    package: Package,
+    announce: Announce | None = None,
+    progress: Progress | None = None,
+) -> None:
     """Put every file `package` pins beside the module whose export loads it.
 
     The compiler looks for ``<export>.onnx`` beside the module's wasm file, so
@@ -1054,7 +1112,7 @@ def _install_models(package: Package, announce: Announce | None = None) -> None:
             destination = graph if number == 0 else graph.parent / pin.filename
             if _digest_of(destination) == pin.sha256:
                 continue
-            _download_model(package.name, export, pin, destination, announce)
+            _download_model(package.name, export, pin, destination, announce, progress)
 
 
 def model_sizes(pins: Sequence[ModelPin]) -> dict[ModelPin, int]:
@@ -1137,7 +1195,11 @@ def capabilities(package: Package) -> tuple[str, ...]:
     )
 
 
-def _install_runtime(package: Package, announce: Announce | None = None) -> None:
+def _install_runtime(
+    package: Package,
+    announce: Announce | None = None,
+    progress: Progress | None = None,
+) -> None:
     """Fetch the ONNX Runtime a package that runs models will need to run it.
 
     Here rather than at the first query, so the whole cost of installing such
@@ -1151,7 +1213,7 @@ def _install_runtime(package: Package, announce: Announce | None = None) -> None
     except FfrwdError:
         return
     if needed:
-        nn.ensure(announce=announce)
+        nn.ensure(announce=announce, progress=progress)
 
 
 # --------------------------------------------------------------------------
@@ -1193,6 +1255,7 @@ def _ensure(
     chain: list[str],
     brought: list[Release],
     announce: Announce | None = None,
+    progress: Progress | None = None,
 ) -> None:
     """Make sure `release`, and everything its manifest depends on, sits in `entries`.
 
@@ -1222,11 +1285,11 @@ def _ensure(
         announce(
             f"fetching {release.name} {release.version} ({written_size(release.size)})"
         )
-    root = already if already is not None else fetch(release)
+    root = already if already is not None else fetch(release, progress)
     _agrees(release, root)
     package = read_manifest(root / MANIFEST_NAME)
-    _install_models(package, announce)
-    _install_runtime(package, announce)
+    _install_models(package, announce, progress)
+    _install_runtime(package, announce, progress)
 
     if pinned is not None:
         # The entry already says what this version resolved each dependency
@@ -1236,7 +1299,9 @@ def _ensure(
         for name, version in pinned.dependencies.items():
             if announce is not None:
                 announce(f"resolving {name}")
-            _ensure(resolve(f"{name}@{version}"), entries, chain, brought, announce)
+            _ensure(
+                resolve(f"{name}@{version}"), entries, chain, brought, announce, progress
+            )
         chain.pop()
         brought.append(release)
         return
@@ -1247,7 +1312,7 @@ def _ensure(
         if announce is not None:
             announce(f"resolving {name}")
         dependency = resolve(name)
-        _ensure(dependency, entries, chain, brought, announce)
+        _ensure(dependency, entries, chain, brought, announce, progress)
         resolved[name] = dependency.version
     chain.pop()
 
@@ -1294,6 +1359,7 @@ def install(
     lock: Path,
     manifest: Path | None = None,
     announce: Announce | None = None,
+    progress: Progress | None = None,
 ) -> Installed:
     """Install `request` into the lockfile `lock`, recording it in `manifest`.
 
@@ -1313,7 +1379,7 @@ def install(
 
     `announce` hears one line per step -- resolving, each archive fetched,
     each model downloaded, the runtime -- and nothing when a step costs
-    nothing.
+    nothing. `progress` hears the bytes of every one of those downloads.
     """
     if announce is not None:
         announce(f"resolving {request}")
@@ -1331,7 +1397,7 @@ def install(
     )
 
     brought: list[Release] = []
-    _ensure(release, entries, [], brought, announce)
+    _ensure(release, entries, [], brought, announce, progress)
     # `release` itself was brought along too, by the same walk; it is not one
     # of its OWN dependencies.
     brought = [
@@ -1367,6 +1433,7 @@ def install_project(
     *,
     lock: Path,
     announce: Announce | None = None,
+    progress: Progress | None = None,
 ) -> ProjectInstalled:
     """Install what the package at `manifest` needs to build and publish.
 
@@ -1398,10 +1465,10 @@ def install_project(
         if announce is not None:
             announce(f"resolving {name} {version}")
         release = resolve(f"{name}@{version}")
-        _ensure(release, entries, [], brought, announce)
+        _ensure(release, entries, [], brought, announce, progress)
         wanted[name] = release.version
     _write_lockfile_migrating(lock, entries, wanted)
 
-    _install_models(package, announce)
-    _install_runtime(package, announce)
+    _install_models(package, announce, progress)
+    _install_runtime(package, announce, progress)
     return ProjectInstalled(package=package, brought=tuple(brought), lock=lock)

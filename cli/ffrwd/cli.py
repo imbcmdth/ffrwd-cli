@@ -1620,7 +1620,7 @@ def _provision_nn(plan: ProcessPlan, console: Console) -> int:
     ):
         return 0
     try:
-        nn.ensure(announce=console.say)
+        nn.ensure(announce=console.say, progress=console.progress("downloading"))
     except FfrwdError as err:
         _print_error(err)
         return 1
@@ -2555,7 +2555,10 @@ def _install_here(args: argparse.Namespace) -> int:
     try:
         with console.status("installing"):
             installed = packages_module.install_project(
-                manifest, lock=lock, announce=console.say
+                manifest,
+                lock=lock,
+                announce=console.say,
+                progress=console.progress("downloading"),
             )
     except FfrwdError as err:
         _print_error(err)
@@ -2597,6 +2600,7 @@ def _cmd_install(args: argparse.Namespace, on_warning: OnWarning) -> int:
                 lock=lock,
                 manifest=manifest if manifest.is_file() else None,
                 announce=console.say,
+                progress=console.progress("downloading"),
             )
     except FfrwdError as err:
         _print_error(err)
@@ -2824,7 +2828,10 @@ def _link_here(args: argparse.Namespace) -> int:
         package = read_manifest(manifest)
         with console.status("linking"):
             installed = packages_module.install_project(
-                manifest, lock=manifest.parent / LOCKFILE_NAME, announce=console.say
+                manifest,
+                lock=manifest.parent / LOCKFILE_NAME,
+                announce=console.say,
+                progress=console.progress("downloading"),
             )
         _print_project_install(installed)
         root = manifest.parent.resolve()
@@ -3098,7 +3105,12 @@ def _cmd_setup(args: argparse.Namespace, on_warning: OnWarning) -> int:
         if args.full:
             tiers.append("full")
         with console.status("provisioning"):
-            directory = nn.provision(tiers, announce=console.say, found=found)
+            directory = nn.provision(
+                tiers,
+                announce=console.say,
+                found=found,
+                progress=console.progress("downloading"),
+            )
     except FfrwdError as err:
         _print_error(err)
         return 1
@@ -3149,7 +3161,9 @@ def _cmd_jobs(args: argparse.Namespace, on_warning: OnWarning) -> int:
         return code
     console = _console(args)
     try:
-        return remote.jobs_command(args, announce=console.say)
+        return remote.jobs_command(
+            args, announce=console.say, progress=console.progress("downloading")
+        )
     except FfrwdError as err:
         _print_error(err)
         return 1

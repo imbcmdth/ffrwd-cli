@@ -1221,6 +1221,31 @@ def test_fetch_streams_each_output_to_its_as_written_path(
     assert (tmp_path / "clips" / "out.mp4").read_bytes() == b"the output bytes"
 
 
+def test_fetch_reports_each_chunk_against_the_size_the_job_recorded(
+    served: _Served,
+    logged_in: None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    content = b"o" * (2 * (1 << 20) + 13)
+    download_url = _fetchable(served, content)
+    served.answers[download_url] = content
+    seen: list[tuple[int, int | None]] = []
+
+    remote._fetch(
+        TOKEN,
+        "aaaa",
+        overwrite=False,
+        progress=lambda done, total: seen.append((done, total)),
+        quiet=True,
+    )
+
+    chunk = 1 << 20
+    weighs = len(content)
+    assert seen == [(chunk, weighs), (2 * chunk, weighs), (weighs, weighs), (weighs, weighs)]
+
+
 def test_fetch_refuses_an_existing_file_without_dash_y(
     served: _Served,
     logged_in: None,

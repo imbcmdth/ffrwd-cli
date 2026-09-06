@@ -9,6 +9,9 @@ The spinner is plain ASCII over carriage returns, and runs only when the
 stream is a TTY: a pipe or a CI log carries the narration lines alone. A
 narration line printed while it spins clears the spinner's line first, so
 nothing interleaves.
+
+A download reports through a ``Progress`` the same way, and :meth:`Console.progress`
+turns one into a bar redrawn over :meth:`Console.transient`.
 """
 
 from __future__ import annotations
@@ -16,18 +19,35 @@ from __future__ import annotations
 import itertools
 import sys
 import threading
+import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import TextIO
 
-__all__ = ["Announce", "Console", "written_size"]
+__all__ = ["Announce", "Console", "Progress", "written_size"]
 
 # What a step tells the caller, so nothing in the library decides where a
 # line prints.
 Announce = Callable[[str], None]
 
+# How a download reports itself: the bytes so far, and the total when it is
+# known. The last call of a transfer names the total it ended with -- a
+# transfer whose total was never known names the count it reached -- and that
+# is what ends the line.
+Progress = Callable[[int, int | None], None]
+
 _FRAMES = "-\\|/"
 _TICK = 0.1
+
+# The clock every bar reads. A seam, so a check can hold time still.
+_now = time.monotonic
+
+# Nothing draws for a transfer smaller than this.
+_PROGRESS_FLOOR = 1024 * 1024
+_BAR_WIDTH = 20
+_REDRAW = 0.1
+_ETA_AFTER = 1.0
+_COLUMNS = 79
 
 
 def written_size(count: int) -> str:
@@ -41,18 +61,107 @@ def written_size(count: int) -> str:
     return f"{count / (1024 * 1024 * 1024):.1f} GB"
 
 
+def _elapsed_time(seconds: float) -> str:
+    """`seconds` as ``0:12`` or ``1:02:03``."""
+    whole = int(seconds)
+    hours, rest = divmod(whole, 3600)
+    minutes, second = divmod(rest, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{second:02d}"
+    return f"{minutes}:{second:02d}"
+
+
+def _bar(fraction: float) -> str:
+    """The fixed-width bar for `fraction`: ``=========>          ``."""
+    filled = min(_BAR_WIDTH, int(_BAR_WIDTH * fraction))
+    if filled >= _BAR_WIDTH:
+        return "=" * _BAR_WIDTH
+    return "=" * filled + ">" + " " * (_BAR_WIDTH - filled - 1)
+
+
+class _Bar:
+    """One download's line: where it started, and when it last drew.
+
+    Reused across transfers -- one `Progress` covers a whole install -- so a
+    count that does not continue the previous one starts the timing again.
+    """
+
+    def __init__(self, label: str) -> None:
+        self.label = label
+        self._start = 0.0
+        self._last_draw = 0.0
+        self._counted = 0
+        self.drawn = False
+        self._ended = True
+
+    def _restart(self) -> None:
+        self._start = _now()
+        self._last_draw = 0.0
+        self._counted = 0
+        self.drawn = False
+        self._ended = False
+
+    def ends(self, done: int, total: int | None) -> bool:
+        """Whether this call is the transfer's last, the state carried forward."""
+        if self._ended or done < self._counted:
+            self._restart()
+        self._counted = done
+        finished = total is not None and done >= total
+        self._ended = finished
+        return finished
+
+    def line(self, done: int, total: int | None) -> str | None:
+        """The line to redraw, or None when this call draws nothing."""
+        known_large = total is not None and total > _PROGRESS_FLOOR
+        if not known_large and done <= _PROGRESS_FLOOR:
+            return None
+        now = _now()
+        if self.drawn and now - self._last_draw < _REDRAW:
+            return None
+        self._last_draw = now
+        self.drawn = True
+        return _fit(self.label, self._tail(done, total, now - self._start))
+
+    def _tail(self, done: int, total: int | None, elapsed: float) -> str:
+        if total is None:
+            return f"  {written_size(done)}"
+        percent = min(100, int(100 * done / total)) if total else 100
+        sizes = f"{written_size(done)} / {written_size(total)}"
+        eta = ""
+        if elapsed >= _ETA_AFTER and done:
+            eta = f"  eta {_elapsed_time(max(0, total - done) * elapsed / done)}"
+        return f"  [{_bar(done / total if total else 1.0)}] {percent:3d}%  {sizes}{eta}"
+
+
+def _fit(label: str, tail: str) -> str:
+    """`label` and `tail` in one line, the label shortened to keep it in the terminal."""
+    room = max(0, _COLUMNS - len(tail))
+    if len(label) <= room:
+        return label + tail
+    return (label[: max(0, room - 3)] + "...")[:room] + tail
+
+
 class _Spinner(threading.Thread):
     """One spinner line, redrawn in place until stopped.
 
     Every write happens under the caller's lock, which is how a narration
     line and a frame never share a line: whoever holds the lock clears first.
+    `held` says a redrawn line of someone else's stands there, and the
+    spinner leaves it alone until it is gone.
     """
 
-    def __init__(self, stream: TextIO, label: str, lock: threading.Lock) -> None:
+    def __init__(
+        self,
+        stream: TextIO,
+        label: str,
+        lock: threading.Lock,
+        held: Callable[[], bool] = lambda: False,
+    ) -> None:
         super().__init__(daemon=True)
         self._stream = stream
         self._label = label
         self._lock = lock
+        self._held = held
         self._done = threading.Event()
         self._frames = itertools.cycle(_FRAMES)
         self._width = 0
@@ -74,7 +183,7 @@ class _Spinner(threading.Thread):
     def run(self) -> None:
         while not self._done.wait(_TICK):
             with self._lock:
-                if not self._done.is_set():
+                if not self._done.is_set() and not self._held():
                     self.draw()
 
     def stop(self) -> None:
@@ -103,12 +212,13 @@ class Console:
         return self._stream if self._stream is not None else sys.stderr
 
     def say(self, line: str) -> None:
-        """Print one narration line, the spinner cleared out of its way first."""
+        """Print one narration line, whatever stands on the line cleared first."""
         if self.quiet:
             return
         with self._lock:
             if self._spinner is not None:
                 self._spinner.clear()
+            self._clear_transient()
             self.stream.write(line + "\n")
             self.stream.flush()
 
@@ -122,7 +232,9 @@ class Console:
         if self.quiet or self._spinner is not None or not self._is_tty():
             yield
             return
-        spinner = _Spinner(self.stream, label, self._lock)
+        spinner = _Spinner(
+            self.stream, label, self._lock, lambda: self._transient_width > 0
+        )
         self._spinner = spinner
         with self._lock:
             spinner.draw()
@@ -154,10 +266,37 @@ class Console:
         if self.quiet or not self._is_tty():
             return
         with self._lock:
-            if self._transient_width:
-                self.stream.write("\r" + " " * self._transient_width + "\r")
-                self.stream.flush()
-                self._transient_width = 0
+            self._clear_transient()
+
+    def _clear_transient(self) -> None:
+        """Blank the redrawn line, if one stands. Caller holds the lock."""
+        if self._transient_width:
+            self.stream.write("\r" + " " * self._transient_width + "\r")
+            self.stream.flush()
+            self._transient_width = 0
+
+    def progress(self, label: str) -> Progress:
+        """A `Progress` drawing `label`'s bar in place, cleared when it finishes.
+
+        ``yolo26n.onnx  [=========>          ]  47%  61 MB / 128 MB  eta 0:12``.
+        Nothing draws below a megabyte, and nothing off a TTY or under
+        `quiet`, which `transient` already answers for. Redraws are capped at
+        ten a second, and the ETA -- the average rate since the first byte --
+        appears once a second of it has been measured. One `Progress` covers
+        however many transfers a command makes, each drawing its own line.
+        """
+        bar = _Bar(label)
+
+        def report(done: int, total: int | None) -> None:
+            if bar.ends(done, total):
+                if bar.drawn:
+                    self.end_transient()
+                return
+            line = bar.line(done, total)
+            if line is not None:
+                self.transient(line)
+
+        return report
 
     def _is_tty(self) -> bool:
         try:

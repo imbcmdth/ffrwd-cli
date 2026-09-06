@@ -57,7 +57,7 @@ from typing import Protocol
 
 from ffrwd import __version__, credentials, store
 from ffrwd import packages as packages_module
-from ffrwd.console import Announce, Console, written_size
+from ffrwd.console import Announce, Console, Progress, written_size
 from ffrwd.errors import ErrorCode, FfrwdError
 from ffrwd.parser import copy_destinations, input_specs
 from ffrwd.probe import is_url, probe
@@ -721,17 +721,28 @@ def _upload_bytes(upload_url: str, job_token: str, content: bytes, digest: str) 
 # --------------------------------------------------------------------------
 
 
-def jobs_command(args: argparse.Namespace, *, announce: Announce | None = None) -> int:
+def jobs_command(
+    args: argparse.Namespace,
+    *,
+    announce: Announce | None = None,
+    progress: Progress | None = None,
+) -> int:
     """``ffrwd jobs``: list (the default), an ID, --json, --watch, --cancel, --fetch.
 
-    `announce` hears one line per output ``--fetch`` downloads; the other
-    modes print their answer and narrate nothing.
+    `announce` hears one line per output ``--fetch`` downloads and `progress`
+    its bytes; the other modes print their answer and narrate nothing.
     """
     token = _token()
     if args.cancel is not None:
         return _cancel(token, str(args.cancel))
     if args.fetch is not None:
-        _fetch(token, str(args.fetch), overwrite=bool(args.overwrite), announce=announce)
+        _fetch(
+            token,
+            str(args.fetch),
+            overwrite=bool(args.overwrite),
+            announce=announce,
+            progress=progress,
+        )
         return 0
     written_id = getattr(args, "id", None)
     if written_id is not None:
@@ -1052,6 +1063,7 @@ def _fetch(
     *,
     overwrite: bool,
     announce: Announce | None = None,
+    progress: Progress | None = None,
     quiet: bool = False,
 ) -> list[str]:
     """Download a job's outputs to their as-written paths. Returns what it wrote.
@@ -1092,9 +1104,11 @@ def _fetch(
             )
             announce(f"downloading {output.path}{written_bytes}")
         if output.kind == "tree":
-            _fetch_tree(output, target)
+            _fetch_tree(output, target, progress)
         else:
-            _download(output.url, target, output.sha256)
+            _download(
+                output.url, target, output.sha256, total=output.size, progress=progress
+            )
         if not quiet:
             print(f"wrote {output.path}")
     return [output.path for output in outputs]
@@ -1155,7 +1169,7 @@ def _fetch_target(written: str) -> Path:
 _TREE_ARCHIVE_HINT = "the archive is not one this ffrwd will unpack; nothing was written"
 
 
-def _fetch_tree(output: _Output, target: Path) -> None:
+def _fetch_tree(output: _Output, target: Path, progress: Progress | None = None) -> None:
     """Download `output`'s archive and unpack it around `target`.
 
     The archive holds the destination's whole directory, members relative to
@@ -1175,7 +1189,14 @@ def _fetch_tree(output: _Output, target: Path) -> None:
         ) from err
     try:
         archive = staging / "tree.tar"
-        _download(output.url, archive, output.sha256, shown=output.path)
+        _download(
+            output.url,
+            archive,
+            output.sha256,
+            shown=output.path,
+            total=output.size,
+            progress=progress,
+        )
         unpacked = staging / "tree"
         unpacked.mkdir()
         _extract_tree(output.path, archive, unpacked)
@@ -1256,12 +1277,21 @@ def _place_tree(written: str, unpacked: Path, destination: Path) -> None:
         ) from err
 
 
-def _download(url: str, path: Path, sha256: str, *, shown: str | None = None) -> None:
+def _download(
+    url: str,
+    path: Path,
+    sha256: str,
+    *,
+    shown: str | None = None,
+    total: int | None = None,
+    progress: Progress | None = None,
+) -> None:
     """Stream `url` to `path`, verifying the digest before the file lands.
 
     Written beside the destination and moved onto it, so an interrupted or
     corrupt download never leaves a half-file under the real name. `shown`
-    names the output in refusals when `path` is a staging file.
+    names the output in refusals when `path` is a staging file. `progress`
+    hears every chunk against `total`, which is what the job recorded.
     """
     named = shown if shown is not None else str(path)
     parent = path.parent
@@ -1279,12 +1309,18 @@ def _download(url: str, path: Path, sha256: str, *, shown: str | None = None) ->
     try:
         with packages_module._urlopen(request, timeout=_DATA_PLANE_TIMEOUT) as response:
             with open(part, "wb") as handle:
+                written = 0
                 while True:
                     chunk = bytes(response.read(_CHUNK_BYTES))
                     if not chunk:
+                        if progress is not None:
+                            progress(written, total if total is not None else written)
                         break
                     hasher.update(chunk)
                     handle.write(chunk)
+                    written += len(chunk)
+                    if progress is not None:
+                        progress(written, total)
     except urllib.error.HTTPError as err:
         part.unlink(missing_ok=True)
         try:
@@ -1417,6 +1453,7 @@ def wait_for_run(job_id: str, args: argparse.Namespace, *, console: Console) -> 
         job_id,
         overwrite=bool(args.overwrite),
         announce=announce,
+        progress=None if args.as_json else console.progress("downloading"),
         quiet=bool(args.as_json),
     )
     if args.as_json:

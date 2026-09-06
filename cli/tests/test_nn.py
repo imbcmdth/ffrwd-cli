@@ -329,6 +329,26 @@ def test_a_tier_lands_where_the_host_looks_for_it(
     assert len(seen) == 2
 
 
+def test_every_archive_reports_its_bytes_against_the_pinned_size(
+    monkeypatch: pytest.MonkeyPatch, pinned: dict[str, bytes]
+) -> None:
+    seen: list[str] = []
+    _serving(monkeypatch, pinned, seen)
+    reported: list[tuple[int, int | None]] = []
+
+    nn.provision(
+        ["cpu", "directml"],
+        found=WINDOWS,
+        progress=lambda done, total: reported.append((done, total)),
+    )
+
+    cpu = len(pinned["https://example.invalid/cpu.zip"])
+    gpu = len(pinned["https://example.invalid/gpu.tgz"])
+    # One block holds each of these; the pinned size is always the total, and
+    # the end of a download names it again.
+    assert reported == [(cpu, cpu), (cpu, cpu), (gpu, gpu), (gpu, gpu)]
+
+
 def test_a_tier_already_on_disk_costs_nothing(
     monkeypatch: pytest.MonkeyPatch, pinned: dict[str, bytes]
 ) -> None:
