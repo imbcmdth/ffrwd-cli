@@ -1608,6 +1608,7 @@ _REPAIR: dict[ErrorCode, str] = {
 NOT_REPAIRABLE: frozenset[ErrorCode] = frozenset(
     {
         ErrorCode.BUFFER_OVERFLOW,
+        ErrorCode.INPUT_NEVER_OPENED,
         ErrorCode.NOTHING_TO_SHOW,
         ErrorCode.PLAYER_NOT_FOUND,
         ErrorCode.UNKNOWN_RECIPE,

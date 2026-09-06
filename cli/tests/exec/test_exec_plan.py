@@ -29,12 +29,14 @@ import pytest
 
 from ffrwd.errors import ErrorCode
 from ffrwd.execute import execute_plan
-from ffrwd.ir import Graph, Node, Output, SinkUnit, StreamType
+from ffrwd.ir import Graph, Node, Output, RowsSink, SinkUnit, StreamType
 from ffrwd.processes import (
     PIPE,
     AudioFormat,
     FfmpegProcess,
     ProcessPlan,
+    RowsDocument,
+    RowsEdge,
     SidecarProcess,
     StreamEdge,
     VideoFormat,
@@ -446,3 +448,97 @@ def test_either_way_round_the_merge_is_written_the_run_starts(
         for m in stage.members
     )
     assert out_path.stat().st_size > 0
+
+
+# --- two rows documents into one ffmpeg ---------------------------------------
+
+# Cues per document, chosen to put each one well past the 128 KiB a named pipe
+# and the copy reading it hold between them.
+_DOCUMENT_CUES = 1000
+# Long enough for two documents to cross two pipes, short enough that a stage
+# which cannot finish does not hold the suite up.
+_ROWS_TIMEOUT = 20.0
+
+_WRITER = Path(__file__).resolve().parent / "rows_writer.py"
+
+
+def _two_documents(out_path: Path) -> ProcessPlan:
+    """One process writing two rows documents, one ffmpeg reading both.
+
+    Two documents off one process is a fan-out and two into one ffmpeg a
+    fan-in, so all four ends are named pipes -- and the reading ffmpeg opens
+    them in ``-i`` order, reading each document whole before it opens the
+    next.
+    """
+    docs = Graph(input_paths=[PIPE, PIPE], sources={"first": 0, "second": 1})
+    docs.sinks = [
+        SinkUnit(
+            outputs=[_out("src:first:s:0", "subtitle"), _out("src:second:s:0", "subtitle")],
+            path=str(out_path),
+            options={"subtitle_codec": "webvtt"},
+        )
+    ]
+    writer = SidecarProcess(
+        id="sidecar0",
+        module="captions.wasm",
+        node="n0",
+        rows=(
+            RowsDocument(sink=RowsSink(container="webvtt", alias="first"), node="n0"),
+            RowsDocument(sink=RowsSink(container="webvtt", alias="second"), node="n1"),
+        ),
+    )
+    return ProcessPlan(
+        processes=(writer, FfmpegProcess(id="docs", graph=docs)),
+        edges=(
+            RowsEdge(source="sidecar0", target="docs", alias="first", container="webvtt"),
+            RowsEdge(source="sidecar0", target="docs", alias="second", container="webvtt"),
+        ),
+    )
+
+
+def _subtitle_packets(path: Path) -> list[int]:
+    args = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "s",
+        "-count_packets", "-show_entries", "stream=nb_read_packets",
+        "-of", "json", str(path),
+    ]  # fmt: skip
+    done = subprocess.run(
+        args, capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT
+    )
+    assert done.returncode == 0, done.stderr
+    return [int(s["nb_read_packets"]) for s in json.loads(done.stdout)["streams"]]
+
+
+def test_two_rows_documents_reach_one_ffmpeg_in_turn(tmp_path: Path) -> None:
+    """The second document is written while the first input is still open.
+
+    ffmpeg reads a rows document whole at open time and opens its inputs in
+    order, so the process writing the second one is writing into an input
+    nothing will open until the first ends -- and it holds the first open
+    while it does. Nothing paces a rows edge: the copy takes the whole
+    document off the writer and hands it over when its consumer opens.
+    """
+    out_path = tmp_path / "documents.mkv"
+
+    def _writer(
+        process: SidecarProcess, reads: Sequence[str], writes: Sequence[str] = ()
+    ) -> list[str]:
+        return [sys.executable, str(_WRITER), str(_DOCUMENT_CUES), *writes]
+
+    result = execute_plan(
+        _two_documents(out_path),
+        sidecar_argv=_writer,
+        timeout=_ROWS_TIMEOUT,
+        overwrite=True,
+    )
+
+    assert result.exit_code == 0, "\n".join(
+        f"{m.id} exited {m.exit_code}: {m.stderr_tail}"
+        for stage in result.stages
+        for m in stage.members
+    )
+    assert not result.timed_out
+    assert result.overflow is None, str(result.overflow)
+    assert _subtitle_packets(out_path) == [_DOCUMENT_CUES, _DOCUMENT_CUES]
+    assert _live_pipes() == []

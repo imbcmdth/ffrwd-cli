@@ -18,6 +18,7 @@ from ffrwd import pipes
 from ffrwd.errors import ErrorCode, FfrwdError
 from ffrwd.execute import (
     _CHUNK,
+    _SPOOL_MEMORY,
     STDIN,
     STDOUT,
     Flow,
@@ -28,6 +29,8 @@ from ffrwd.execute import (
     overflow_error,
     overflowed,
     plan_argv,
+    unopened,
+    unopened_error,
     wires,
 )
 from ffrwd.ir import Graph, Node, Output, RowsSink, SinkUnit, StreamType
@@ -629,6 +632,54 @@ def test_a_full_buffer_names_the_edge_and_the_depth_it_was_given() -> None:
     assert error.hint is not None
 
 
+# ------------------------------------------------------- an end nobody opened
+
+
+def _rows_flow(name: str, at: float, *, moved: int = 1, opening: bool = False) -> Flow:
+    edge = RowsEdge(source="sidecar0", target=name, alias="cues", container="webvtt")
+    return Flow(edge=edge, at=at, moved=moved, opening=opening)
+
+
+def test_a_stopped_stage_with_a_copy_still_in_its_open_names_that_edge() -> None:
+    """The wedge the timeout used to be all that caught.
+
+    One edge carried its document and stopped, because the process reading it
+    will not end while the writer holds it; the other holds a whole document
+    for an input that process has not opened. Nothing moves again.
+    """
+    stuck = _rows_flow("docs", at=0.0, moved=200_000, opening=True)
+
+    assert unopened([_flow("docs", at=0.0), stuck], now=31.0, stall=30.0) is stuck
+
+
+@pytest.mark.parametrize(
+    ("flows", "why"),
+    [
+        ([_flow("ffmpeg0", at=0.0)], "no copy is waiting to open anything"),
+        (
+            [_flow("ffmpeg0", at=30.0), _rows_flow("docs", at=0.0, opening=True)],
+            "one pipe is still moving",
+        ),
+        ([_rows_flow("docs", at=0.0, moved=0, opening=True)], "nothing has crossed yet"),
+    ],
+)
+def test_a_stage_that_is_merely_slow_has_no_end_to_name(
+    flows: list[Flow], why: str
+) -> None:
+    assert unopened(flows, now=31.0, stall=30.0) is None, why
+
+
+def test_an_end_nobody_opened_names_the_edge_and_what_it_waited_for() -> None:
+    error = unopened_error(_rows_flow("docs", at=0.0, moved=200_000, opening=True), 30.0)
+
+    assert error.code is ErrorCode.INPUT_NEVER_OPENED
+    assert "'cues' from sidecar0 to docs" in error.message
+    assert "the consumer never opened its input" in error.message
+    assert "30s" in error.message
+    assert error.hint is not None
+    assert "waiting on an earlier one of its own" in error.hint
+
+
 # ---------------------------------------------------------------- the copy
 
 
@@ -747,3 +798,55 @@ def test_an_edge_with_no_depth_hands_each_read_straight_on() -> None:
     assert _read_ahead(None) == _CHUNK
     assert _read_ahead(_flow("ffmpeg0", at=0.0)) == _CHUNK
     assert _read_ahead(_flow("ffmpeg0", at=0.0, bound=1)) > _CHUNK
+
+
+class _Late(_End):
+    """A consuming end that is not open until the test lets it be."""
+
+    def __init__(self, stream: object) -> None:
+        self.stream = stream
+        self.let_go = threading.Event()
+
+    def open(self, deadline: float) -> object:  # type: ignore[override]
+        assert self.let_go.wait(10), "the consumer was never let go"
+        return self.stream
+
+    def close(self) -> None:
+        pass
+
+
+@pytest.mark.parametrize(
+    "size", [1 << 20, _SPOOL_MEMORY + (1 << 20)], ids=["memory", "file"]
+)
+def test_a_rows_edge_is_taken_whole_while_its_consumer_is_still_opening(
+    size: int,
+) -> None:
+    """Nothing paces a rows edge, over either place the copy holds it.
+
+    The process a rows document goes to reads it whole at the moment it opens
+    that input, and opens its inputs in order, so a producer writing a second
+    document is writing into an input that will not be opened until the first
+    one ends. The copy takes the whole document instead -- in memory under
+    `_SPOOL_MEMORY`, in a temporary file over it -- and hands it on when its
+    consumer arrives.
+    """
+    whole = b"x" * size
+    source = _Pieces([whole[at : at + _CHUNK] for at in range(0, len(whole), _CHUNK)])
+    dest = _Late(_Trickle(_CHUNK))
+    edge = RowsEdge(source="sidecar0", target="docs", alias="cues", container="webvtt")
+    flow = Flow(edge=edge, at=0.0)
+    copy = threading.Thread(
+        target=_pump, args=(_Held(source), dest, math.inf, flow), daemon=True
+    )
+
+    copy.start()
+    taken = source.drained.wait(10)
+    still_opening = flow.opening
+    dest.let_go.set()
+    copy.join(10)
+
+    assert taken, "the copy stopped reading before its consumer opened"
+    assert still_opening, "the copy was not recorded as waiting for its consumer"
+    assert flow.moved == len(whole), "the spool was not counted as it filled"
+    assert b"".join(dest.stream.writes) == whole
+    assert not flow.opening and not flow.writing

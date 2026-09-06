@@ -58,11 +58,19 @@ pipe's EOF and exits 0 anyway, so stderr says nothing about whether a member
 worked; it is captured to be reported, not to be read.
 
 One failure is not an exit code: a stage whose pipes have all stopped moving
-while every member still runs and one copy still waits to hand its bytes over.
-That is a buffer the plan sized from a bound (:attr:`StreamEdge.bound`) that
-the run outgrew, and it ends the stage with a typed
-:attr:`PlanResult.overflow` naming the edge and the depth it was given -- not
-with a timeout that would say only that something hung.
+while every member still runs and one copy still waits on the far end. Where
+that copy waits to WRITE, the buffer the plan sized from a bound
+(:attr:`StreamEdge.bound`) is one the run outgrew; where it waits to OPEN, the
+process that edge goes to never asked for it. Either ends the stage with a
+typed :attr:`PlanResult.overflow` naming the edge -- not with a timeout that
+would say only that something hung.
+
+A ROWS edge is the one edge nothing paces. ffmpeg reads a rows document whole
+when it opens that input, and opens its inputs in order, so a producer writing
+a second document is writing into an input that will not be opened until the
+first one ends: the copy takes the whole document off the producer instead --
+in memory, and in a temporary file past a few megabytes -- and hands it over
+once the consumer opens.
 
 A plan shows the same way a command list does. A member ``players`` names
 gets an ffplay of its own, reading the display output off that member's
@@ -142,6 +150,8 @@ __all__ = [
     "overflowed",
     "plan_argv",
     "render_plan",
+    "unopened",
+    "unopened_error",
     "wires",
 ]
 
@@ -165,7 +175,7 @@ CHAIN = " && "
 # How often a running stage is re-checked.
 _POLL = 0.02
 # How long every pipe of a stage may stand still, with every member running and
-# one of them waiting to write, before the buffer it waits on is called full.
+# one copy still waiting on the far end, before that edge is called wedged.
 DEFAULT_STALL = 30.0
 # How long a member that was told to stop is given before it is killed.
 _GRACE = 5.0
@@ -177,6 +187,9 @@ _CHUNK = 1 << 16
 # depth. Generous enough for several frames of the largest one a plan carries,
 # and bounded, so a run whose paths really have drifted apart still stops.
 _READ_AHEAD = 1 << 25
+# How much of a spooled rows document is held in memory before the rest of it
+# goes to a temporary file.
+_SPOOL_MEMORY = 1 << 22
 # What `ProcessResult.summary` and `.stderr_tail` keep.
 _SUMMARY_CHARS = 160
 _TAIL_LINES = 20
@@ -516,13 +529,15 @@ class Flow:
 
     `at` is when the last bytes moved, and `writing` is True while the copy is
     waiting for the consuming end to take what it was handed -- which is what
-    a full buffer looks like from here.
+    a full buffer looks like from here. `opening` is True earlier than that:
+    the copy is waiting for the consuming process to open its end at all.
     """
 
     edge: PipeEdge
     at: float
     moved: int = 0
     writing: bool = False
+    opening: bool = False
 
     @property
     def bound(self) -> int:
@@ -567,6 +582,27 @@ def overflow_error(flow: Flow, stall: float) -> FfrwdError:
     )
 
 
+def unopened_error(flow: Flow, stall: float) -> FfrwdError:
+    """The typed failure for a stage wedged on an end its consumer never opened.
+
+    Names the edge and what the copy was waiting for, the same way
+    :func:`overflow_error` does: a copy holding everything the producer gave
+    it, and a consuming process that has not asked for any of it.
+    """
+    carried = flow.edge.ref if isinstance(flow.edge, StreamEdge) else flow.edge.alias
+    return FfrwdError(
+        ErrorCode.INPUT_NEVER_OPENED,
+        f"the pipe carrying '{carried}' from {flow.edge.source} to "
+        f"{flow.edge.target} has nowhere to go: the consumer never opened its "
+        f"input, and with every process still running nothing has crossed any "
+        f"pipe of this stage for {stall:.0f}s",
+        hint="the process reading it opens its inputs in order and is still "
+        "waiting on an earlier one of its own, which cannot end while this "
+        "one waits: hand it that earlier input first, or write this one to a "
+        "file and run the query over the file",
+    )
+
+
 @dataclass(frozen=True)
 class StageResult:
     """One stage: every member it ran, and the outcome of running them."""
@@ -586,9 +622,10 @@ class StageResult:
     # it and nothing distinguishes the cause from the consequence. On a
     # timeout, the member that was still running.
     failures: list[ProcessResult] = field(default_factory=list)
-    # The full buffer that wedged this stage, when that is what ended it. Set
-    # instead of `timed_out`, since the two answer the same question and this
-    # one names the edge.
+    # The edge that wedged this stage -- a buffer that filled, or an end its
+    # consumer never opened -- when that is what ended it. Set instead of
+    # `timed_out`, since the two answer the same question and this one names
+    # the edge.
     overflow: FfrwdError | None = None
 
 
@@ -875,10 +912,10 @@ def execute_plan(
     cleanly.
 
     `stall` is how long every pipe of a stage may stand still, with every
-    member running and one of them waiting to write, before the buffer it is
-    waiting on is reported full: :attr:`PlanResult.overflow` names the edge and
-    the depth it was sized for, rather than leaving a wedged run to the
-    timeout. None turns that off.
+    member running and one copy still waiting on the far end, before that
+    edge is reported: :attr:`PlanResult.overflow` names it, and whether it was
+    a buffer that filled or an input nobody opened, rather than leaving a
+    wedged run to the timeout. None turns that off.
 
     Named pipes and any temporary directory holding them are removed before
     this returns, whether the plan finished or failed.
@@ -1120,7 +1157,7 @@ def _run_stage(
     flows: list[Flow] = []
     failed: str | None = None
     timed_out = False
-    full: Flow | None = None
+    wedge: FfrwdError | None = None
     try:
         for pid in _spawn_order(ids, stage_wires):
             process = plan.process(pid)
@@ -1184,7 +1221,7 @@ def _run_stage(
         for member in members.values():
             helpers.append(_start(_drain, _stream(member.proc.stderr), member.stderr))
 
-        failed, timed_out, full = _watch(
+        failed, timed_out, wedge = _watch(
             members.values(),
             deadline,
             list(watching.values()) if show_only and watching else None,
@@ -1217,14 +1254,10 @@ def _run_stage(
         index=stage.index,
         members=results,
         exit_code=code,
-        timed_out=timed_out and full is None,
+        timed_out=timed_out and wedge is None,
         failure=failure,
         failures=failures,
-        overflow=(
-            None
-            if full is None
-            else overflow_error(full, stall if stall is not None else DEFAULT_STALL)
-        ),
+        overflow=wedge,
     )
 
 
@@ -1266,19 +1299,21 @@ def _watch(
     windows: Sequence[subprocess.Popen[bytes]] | None = None,
     flows: Sequence[Flow] = (),
     stall: float | None = DEFAULT_STALL,
-) -> tuple[str | None, bool, Flow | None]:
+) -> tuple[str | None, bool, FfrwdError | None]:
     """Watch a running stage.
 
-    ``(the member that ended it, whether it timed out, the edge that filled)``.
+    ``(the member that ended it, whether it timed out, what wedged it)``.
 
     Exit codes only: a raw demuxer writes an error to stderr at the pipe's EOF
     and exits 0, so what a member wrote says nothing about whether it worked.
 
-    `flows` are the stage's own pipes, and a stage where every one of them has
-    stood still while a copy waits to write is one whose buffers were too
-    small (:func:`overflowed`) -- caught here rather than left to the timeout,
-    which would report a wedge without naming what wedged it. `stall` of None
-    turns that off.
+    `flows` are the stage's own pipes. A stage where every one of them has
+    stood still is wedged in one of two ways, and both are named rather than
+    left to the timeout, which would report a wedge without saying what wedged
+    it: a copy waiting to WRITE means the buffer it waits on was too small
+    (:func:`overflowed`), and one waiting to OPEN means the consumer never
+    asked for the edge at all (:func:`unopened`). `stall` of None turns both
+    off.
 
     `windows` are passed only for a stage whose display windows are all it
     feeds: once every one of them has been closed the stage is done, and
@@ -1296,10 +1331,15 @@ def _watch(
         if windows is not None and all(w.poll() is not None for w in windows):
             return None, False, None
         if stall is not None:
-            full = overflowed(flows, time.monotonic(), stall)
+            now = time.monotonic()
+            full = overflowed(flows, now, stall)
             if full is not None:
                 held = next(m for m in watched if m.proc.poll() is None)
-                return held.id, True, full
+                return held.id, True, overflow_error(full, stall)
+            stuck = unopened(flows, now, stall)
+            if stuck is not None:
+                held = next(m for m in watched if m.proc.poll() is None)
+                return held.id, True, unopened_error(stuck, stall)
         if time.monotonic() >= deadline:
             hung = next(m for m in watched if m.proc.poll() is None)
             return hung.id, True, None
@@ -1454,8 +1494,92 @@ class _Ahead:
             self._change.notify_all()
 
 
-def _fill(reader: IO[bytes], ahead: _Ahead) -> None:
-    """Take from the producer as fast as it writes, up to `ahead`'s limit."""
+class _Spool:
+    """Bytes taken off the producer and held until the consumer opens.
+
+    A rows document is read WHOLE by the process it goes to, at the moment
+    that process opens the input, so there is nothing to pace and everything
+    to hold: a producer left blocked on a consumer that has not opened yet is
+    a stage that never moves again. Held in memory up to `_SPOOL_MEMORY`, and
+    in a temporary file past that, which goes when the copy does.
+
+    `flow` counts the bytes as they arrive rather than as they are handed on,
+    so a stage watching its pipes sees this edge moving while its consumer is
+    still opening.
+    """
+
+    def __init__(self, flow: Flow | None = None) -> None:
+        self._flow = flow
+        self._held: deque[bytes] = deque()
+        self._size = 0
+        self._file: IO[bytes] | None = None
+        self._written = 0
+        self._read = 0
+        self._ended = False
+        self._change = threading.Condition()
+
+    def put(self, chunk: bytes) -> bool:
+        """Hold `chunk`, never waiting. False once the copy has finished."""
+        with self._change:
+            if self._ended:
+                return False
+            if self._file is None and self._size + len(chunk) > _SPOOL_MEMORY:
+                self._file = tempfile.TemporaryFile(prefix="ffrwd-rows-")
+            if self._file is None:
+                self._held.append(chunk)
+                self._size += len(chunk)
+            else:
+                self._file.seek(self._written)
+                self._file.write(chunk)
+                self._written += len(chunk)
+            if self._flow is not None:
+                self._flow.moved += len(chunk)
+                self._flow.at = time.monotonic()
+            self._change.notify_all()
+            return True
+
+    def take(self) -> bytes | None:
+        """The next bytes to write; None once nothing more will arrive."""
+        with self._change:
+            while not self._ready() and not self._ended:
+                self._change.wait()
+            if self._held:
+                chunk = self._held.popleft()
+                self._size -= len(chunk)
+                return chunk
+            if self._file is not None and self._read < self._written:
+                self._file.seek(self._read)
+                chunk = self._file.read(min(_CHUNK, self._written - self._read))
+                self._read += len(chunk)
+                return chunk
+            return None
+
+    def _ready(self) -> bool:
+        """True while there are bytes to hand on: memory first, then file."""
+        spilled = self._file is not None and self._read < self._written
+        return bool(self._held) or spilled
+
+    def finish(self) -> None:
+        """Nothing more will be read. Releases a take that is waiting."""
+        with self._change:
+            self._ended = True
+            self._change.notify_all()
+
+    def release(self) -> None:
+        """Drop what is still held, and the temporary file with it."""
+        with self._change:
+            self._ended = True
+            self._held.clear()
+            self._size = 0
+            if self._file is not None:
+                with contextlib.suppress(OSError):
+                    self._file.close()
+                self._file = None
+            self._change.notify_all()
+
+
+def _fill(reader: IO[bytes], ahead: _Ahead | _Spool) -> None:
+    """Take from the producer as fast as it writes, as far as `ahead` holds."""
     try:
         while (chunk := reader.read(_CHUNK)) and ahead.put(chunk):
             continue
@@ -1496,27 +1620,38 @@ def _pump(source: _End, dest: _End, deadline: float, flow: Flow | None = None) -
     waiting for. How far it reads ahead of the consumer is the depth the
     compiler counted (:func:`_read_ahead`).
 
+    A ROWS edge is spooled instead (:class:`_Spool`): the process it goes to
+    reads the whole document when it opens the input, so there is nothing to
+    pace, and the producer must never be the one waiting.
+
     `flow` is where the copy records what it has moved and when, and marks
     itself as waiting on the consuming end -- which is what makes a full
-    buffer visible to :func:`overflowed` rather than a stage that simply hangs.
+    buffer visible to :func:`overflowed`, and an end nobody opened visible to
+    :func:`unopened`, rather than a stage that simply hangs.
     """
-    ahead = _Ahead(_read_ahead(flow))
+    spooled = flow is not None and isinstance(flow.edge, RowsEdge)
+    ahead: _Ahead | _Spool = _Spool(flow) if spooled else _Ahead(_read_ahead(flow))
     reading: threading.Thread | None = None
     try:
         reader = source.open(deadline)
+        if flow is not None:
+            flow.opening = True
         # Reading starts before the consuming end is even open: ffmpeg opens
         # its inputs one at a time, so a producer whose first output nobody is
         # taking yet stops before it reaches the output the consumer is
         # actually waiting on.
         reading = _start(_fill, reader, ahead)
         writer = dest.open(deadline)
+        if flow is not None:
+            flow.opening = False
         while (chunk := ahead.take()) is not None:
             if flow is not None:
                 flow.writing = True
             _write_all(writer, chunk)
             if flow is not None:
                 flow.writing = False
-                flow.moved += len(chunk)
+                if not spooled:  # a spool counted these as it took them
+                    flow.moved += len(chunk)
                 flow.at = time.monotonic()
         writer.flush()
     except (OSError, ValueError):
@@ -1525,10 +1660,13 @@ def _pump(source: _End, dest: _End, deadline: float, flow: Flow | None = None) -
         ahead.finish()
         if flow is not None:
             flow.writing = False
+            flow.opening = False
         dest.close()
         source.close()
         if reading is not None:
             reading.join(_JOIN)
+        if isinstance(ahead, _Spool):
+            ahead.release()
 
 
 def _write_all(writer: IO[bytes], chunk: bytes) -> None:
@@ -1556,6 +1694,26 @@ def overflowed(flows: Sequence[Flow], now: float, stall: float) -> Flow | None:
     if not waiting:
         return None
     return max(waiting, key=lambda flow: (flow.bound, flow.held))
+
+
+def unopened(flows: Sequence[Flow], now: float, stall: float) -> Flow | None:
+    """The edge whose consumer never opened it, out of a stage that has stopped.
+
+    The stillness test :func:`overflowed` makes -- nothing has crossed ANY
+    pipe of the stage for `stall` seconds -- over the copies waiting for the
+    consuming process to open its end rather than to take what it was handed.
+    A copy still in its open holds everything the producer gave it and can
+    hand none of it on, so the process it reads is not going to finish either.
+    None for a stage where every copy is through its open: that one is idle,
+    not wedged. The edge to name is the one holding the most.
+    """
+    moving = [flow for flow in flows if flow.moved]
+    if not moving or any(now - flow.at < stall for flow in moving):
+        return None
+    stuck = [flow for flow in flows if flow.opening]
+    if not stuck:
+        return None
+    return max(stuck, key=lambda flow: flow.moved)
 
 
 def _drain(stream: IO[bytes], into: list[bytes]) -> None:

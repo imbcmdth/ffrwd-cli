@@ -571,6 +571,20 @@ Like `NOTHING_TO_SHOW` and `PLAYER_NOT_FOUND` this is no compile's, so `ffrwd pr
 error: BUFFER_OVERFLOW: the pipe buffer carrying 'src_a_v_0_split:1' from ffmpeg1 to ffmpeg0 overflowed: it was sized for the 2 frames the compiler bounded it at, and with every process still running nothing has crossed any pipe of this stage for 30s (hint: the paths out of the one process reading the input drifted further apart than the compiler counted them: record the input to a file and run this query over the file, or take the slower path's work out of the pipeline)
 ```
 
+## INPUT_NEVER_OPENED
+
+**Meaning:** A run-time code, beside `BUFFER_OVERFLOW`. A copy between two of a stage's processes holds everything its producer wrote and is still waiting for the consumer to open the pipe at all, while nothing has crossed any pipe of the stage for the stall time. Reported instead of waiting out the timeout.
+
+**Fires when:** the consumer opens its inputs in order and is still on an earlier one that cannot end while this one waits. A rows document is spooled whole for exactly that shape, so what is left to report is a wait that is genuinely circular.
+
+Like `BUFFER_OVERFLOW` this is no compile's, so `ffrwd prompt` does not list it and the repair loop never sees one.
+
+**Error text** (printed to stderr by `ffrwd run`, not as JSON):
+
+```
+error: INPUT_NEVER_OPENED: the pipe carrying 'cues' from sidecar0 to ffmpeg0 has nowhere to go: the consumer never opened its input, and with every process still running nothing has crossed any pipe of this stage for 30s (hint: the process reading it opens its inputs in order and is still waiting on an earlier one of its own, which cannot end while this one waits: hand it that earlier input first, or write this one to a file and run the query over the file)
+```
+
 ## STARTUP_DEADLOCK
 
 **Meaning:** The plan's processes would each wait on the next before any of them could read or write, so the run could never reach its first frame. ffmpeg opens its inputs one at a time and writes its outputs interleaved, so a process blocked opening its first pipe is not draining the pipes it already opened - and the producer filling one of those stops before it reaches the output the blocked open is waiting for. The compiler chooses the order of every pipe to avoid that; this is the plan no order avoids it for.
