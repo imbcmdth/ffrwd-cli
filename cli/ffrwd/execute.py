@@ -1397,8 +1397,11 @@ def _cpu_seconds(proc: subprocess.Popen[bytes]) -> float | None:
             return None
         return (kernel.value + user.value) / _FILETIME_TICKS
     if sys.platform.startswith("linux"):
+        pid = getattr(proc, "pid", None)
+        if pid is None:
+            return None
         try:
-            stat = Path(f"/proc/{proc.pid}/stat").read_text(encoding="utf-8")
+            stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
         except OSError:
             return None
         # The command name is parenthesised and may hold spaces, so the fields
