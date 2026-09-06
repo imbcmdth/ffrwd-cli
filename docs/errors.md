@@ -559,7 +559,7 @@ The anchor is the `input()` path itself, since the input is what constrains the 
 
 ## BUFFER_OVERFLOW
 
-**Meaning:** Not a compile rejection - the one code a RUN produces. The buffers a plan sized from its bounds were not deep enough, and the pipeline wedged: nothing crossed any pipe of the stage while every process was still alive and one of them was still waiting to hand its bytes over. `ffrwd run` reports it instead of letting the stage sit until the timeout, so the message names the edge, the depth it was given, and how long nothing moved - never a bare "timed out", and never a silently dropped frame.
+**Meaning:** Not a compile rejection - the one code a RUN produces. The buffers a plan sized from its bounds were not deep enough, and the pipeline wedged: nothing crossed any pipe of the stage, and no process of it used any CPU, while every one was still alive and one of them was still waiting to hand its bytes over. The CPU is half the test: a stage's pumped pipes are not all the pipes it has, so a process computing over what it read stands still on all of them without being wedged. `ffrwd run` reports it instead of letting the stage sit until the timeout, so the message names the edge, the depth it was given, and how long nothing moved - never a bare "timed out", and never a silently dropped frame.
 
 **Fires when:** the paths out of a one-open input's single reader drift further apart at run time than the compiler counted them - a filter slower than its declared shape, a consumer that cannot keep up with a live source, or a delay in a stage the compiler bounded at zero because it had nothing better to go on.
 
@@ -568,12 +568,12 @@ Like `NOTHING_TO_SHOW` and `PLAYER_NOT_FOUND` this is no compile's, so `ffrwd pr
 **Error text** (printed to stderr by `ffrwd run`, not as JSON):
 
 ```
-error: BUFFER_OVERFLOW: the pipe buffer carrying 'src_a_v_0_split:1' from ffmpeg1 to ffmpeg0 overflowed: it was sized for the 2 frames the compiler bounded it at, and with every process still running nothing has crossed any pipe of this stage for 30s (hint: the paths out of the one process reading the input drifted further apart than the compiler counted them: record the input to a file and run this query over the file, or take the slower path's work out of the pipeline)
+error: BUFFER_OVERFLOW: the pipe buffer carrying 'src_a_v_0_split:1' from ffmpeg1 to ffmpeg0 overflowed: it was sized for the 2 frames the compiler bounded it at, and with every process still running, nothing has crossed any pipe of this stage and every process of it has sat idle for 30s (hint: the paths out of the one process reading the input drifted further apart than the compiler counted them: record the input to a file and run this query over the file, or take the slower path's work out of the pipeline)
 ```
 
 ## INPUT_NEVER_OPENED
 
-**Meaning:** A run-time code, beside `BUFFER_OVERFLOW`. A copy between two of a stage's processes holds everything its producer wrote and is still waiting for the consumer to open the pipe at all, while nothing has crossed any pipe of the stage for the stall time. Reported instead of waiting out the timeout.
+**Meaning:** A run-time code, beside `BUFFER_OVERFLOW`. A copy between two of a stage's processes holds everything its producer wrote and is still waiting for the consumer to open the pipe at all, while nothing has crossed any pipe of the stage and no process of it has used any CPU for the stall time. Reported instead of waiting out the timeout.
 
 **Fires when:** the consumer opens its inputs in order and is still on an earlier one that cannot end while this one waits. A rows document is spooled whole for exactly that shape, so what is left to report is a wait that is genuinely circular.
 
@@ -582,7 +582,7 @@ Like `BUFFER_OVERFLOW` this is no compile's, so `ffrwd prompt` does not list it 
 **Error text** (printed to stderr by `ffrwd run`, not as JSON):
 
 ```
-error: INPUT_NEVER_OPENED: the pipe carrying 'cues' from sidecar0 to ffmpeg0 has nowhere to go: the consumer never opened its input, and with every process still running nothing has crossed any pipe of this stage for 30s (hint: the process reading it opens its inputs in order and is still waiting on an earlier one of its own, which cannot end while this one waits: hand it that earlier input first, or write this one to a file and run the query over the file)
+error: INPUT_NEVER_OPENED: the pipe carrying 'cues' from sidecar0 to ffmpeg0 has nowhere to go: the consumer never opened its input, and with every process still running, nothing has crossed any pipe of this stage and every process of it has sat idle for 30s (hint: the process reading it opens its inputs in order and is still waiting on an earlier one of its own, which cannot end while this one waits: hand it that earlier input first, or write this one to a file and run the query over the file)
 ```
 
 ## STARTUP_DEADLOCK

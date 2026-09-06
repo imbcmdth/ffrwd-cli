@@ -8,9 +8,13 @@ pipe are decided before any process exists, so both are testable without one.
 from __future__ import annotations
 
 import math
+import subprocess
+import sys
 import threading
+import time
 from collections.abc import Sequence
 from dataclasses import replace
+from typing import Any, cast
 
 import pytest
 
@@ -22,10 +26,13 @@ from ffrwd.execute import (
     STDIN,
     STDOUT,
     Flow,
+    _cpu_seconds,
     _End,
+    _Member,
     _pipe_buffer,
     _pump,
     _read_ahead,
+    _watch,
     overflow_error,
     overflowed,
     plan_argv,
@@ -678,6 +685,141 @@ def test_an_end_nobody_opened_names_the_edge_and_what_it_waited_for() -> None:
     assert "30s" in error.message
     assert error.hint is not None
     assert "waiting on an earlier one of its own" in error.hint
+
+
+# ------------------------------------------------- a stage that is still working
+
+# Short, so a stage has to stand still for a fraction of a second rather than
+# the thirty a run gets.
+_STALL = 0.05
+
+# The module itself: the package rebinds the name `execute` to the function.
+_EXECUTE = sys.modules["ffrwd.execute"]
+
+
+class _Running:
+    """A stand-in for a member's process: never exited, and the CPU it has used.
+
+    `per_poll` is what each reading adds, so a member computing and one sitting
+    idle are the same class with a different number.
+    """
+
+    def __init__(self, per_poll: float = 0.0) -> None:
+        self.used = 1.0
+        self.per_poll = per_poll
+
+    def poll(self) -> int | None:
+        return None
+
+    def cpu(self) -> float:
+        self.used += self.per_poll
+        return self.used
+
+
+def _stage(*procs: _Running) -> list[_Member]:
+    return [
+        _Member(id=f"p{index}", argv=[], proc=cast("subprocess.Popen[bytes]", proc))
+        for index, proc in enumerate(procs)
+    ]
+
+
+def _reading(proc: Any) -> float:
+    return cast("_Running", proc).cpu()
+
+
+def test_a_stage_whose_processes_are_working_names_no_edge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The false positive the pumped pipes alone cannot tell from a wedge.
+
+    A stage's pumped edges are not all the pipes it has, so a member computing
+    over what it already read moves nothing across any of them while it works.
+    Nothing here is wedged, and neither detector is asked.
+    """
+    monkeypatch.setattr(_EXECUTE, "_cpu_seconds", _reading)
+    flows = [_flow("sidecar0", at=0.0, writing=True, bound=1)]
+
+    ended, timed_out, wedge = _watch(
+        _stage(_Running(per_poll=0.01), _Running()),
+        deadline=time.monotonic() + 20 * _STALL,
+        flows=flows,
+        stall=_STALL,
+    )
+
+    assert wedge is None, "a working stage was called wedged"
+    assert timed_out, "the stage was left to its timeout, having not ended"
+    assert ended == "p0"
+
+
+@pytest.mark.parametrize(
+    ("flows", "code"),
+    [
+        ([_flow("sidecar0", at=0.0, writing=True, bound=1)], ErrorCode.BUFFER_OVERFLOW),
+        (
+            [_rows_flow("docs", at=0.0, moved=200_000, opening=True)],
+            ErrorCode.INPUT_NEVER_OPENED,
+        ),
+    ],
+    ids=["full", "unopened"],
+)
+def test_a_stage_whose_processes_have_gone_idle_too_names_the_edge(
+    monkeypatch: pytest.MonkeyPatch, flows: list[Flow], code: ErrorCode
+) -> None:
+    """The same still pipes, with nothing using any CPU: the wedge itself."""
+    monkeypatch.setattr(_EXECUTE, "_cpu_seconds", _reading)
+
+    ended, timed_out, wedge = _watch(
+        _stage(_Running(), _Running()),
+        deadline=time.monotonic() + 200 * _STALL,
+        flows=flows,
+        stall=_STALL,
+    )
+
+    assert wedge is not None, "the wedged stage was left to its timeout"
+    assert wedge.code is code
+    assert timed_out
+    assert ended == "p0"
+
+
+def test_a_platform_that_cannot_read_a_process_goes_on_the_pipes_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Nothing to read means the detectors answer the way they always did."""
+    monkeypatch.setattr(_EXECUTE, "_cpu_seconds", lambda proc: None)
+
+    _, _, wedge = _watch(
+        _stage(_Running(per_poll=0.01)),
+        deadline=time.monotonic() + 200 * _STALL,
+        flows=[_flow("sidecar0", at=0.0, writing=True, bound=1)],
+        stall=_STALL,
+    )
+
+    assert wedge is not None
+    assert wedge.code is ErrorCode.BUFFER_OVERFLOW
+
+
+def test_the_cpu_a_running_child_has_used_is_readable() -> None:
+    """The reading itself, against a real process on whatever this platform is.
+
+    A child that does nothing but compute, because Windows accounts a process's
+    CPU at the scheduler's tick and can miss a burst shorter than one -- and the
+    interpreter itself rather than a venv's, which on Windows can be a stub that
+    spawns the real one and then sits idle while it works.
+    """
+    python = getattr(sys, "_base_executable", None) or sys.executable
+    child = subprocess.Popen([python, "-c", "while True: pass"])
+    try:
+        deadline = time.monotonic() + 30
+        used = _cpu_seconds(child)
+        while used is not None and used <= 0.0 and time.monotonic() < deadline:
+            used = _cpu_seconds(child)
+    finally:
+        child.kill()
+        child.wait(30)
+
+    if used is None:
+        pytest.skip("this platform does not report a process's CPU time")
+    assert used > 0.0
 
 
 # ---------------------------------------------------------------- the copy

@@ -458,8 +458,14 @@ _DOCUMENT_CUES = 1000
 # Long enough for two documents to cross two pipes, short enough that a stage
 # which cannot finish does not hold the suite up.
 _ROWS_TIMEOUT = 20.0
+# The stall window the computing writer has to outlast, and how long it computes.
+_ROWS_STALL = 3.0
+_COMPUTE = 6.0
 
 _WRITER = Path(__file__).resolve().parent / "rows_writer.py"
+# The interpreter itself, not a venv's: on Windows that can be a stub which
+# spawns the real one and then sits idle, and the writer's CPU is the point.
+_PYTHON = getattr(sys, "_base_executable", None) or sys.executable
 
 
 def _two_documents(out_path: Path) -> ProcessPlan:
@@ -540,5 +546,47 @@ def test_two_rows_documents_reach_one_ffmpeg_in_turn(tmp_path: Path) -> None:
     )
     assert not result.timed_out
     assert result.overflow is None, str(result.overflow)
+    assert _subtitle_packets(out_path) == [_DOCUMENT_CUES, _DOCUMENT_CUES]
+    assert _live_pipes() == []
+
+
+def test_a_writer_computing_between_documents_is_left_to_finish(
+    tmp_path: Path,
+) -> None:
+    """The false positive: the stage stands still because it is working.
+
+    The shape above, with the writer spending twice the stall window on CPU
+    before the second document. Every pumped pipe of the stage is still for
+    longer than the window -- one document is across and the other input has
+    not been opened -- and the run is not the detector's to end.
+    """
+    out_path = tmp_path / "computed.mkv"
+
+    def _writer(
+        process: SidecarProcess, reads: Sequence[str], writes: Sequence[str] = ()
+    ) -> list[str]:
+        return [
+            _PYTHON,
+            str(_WRITER),
+            f"--compute={_COMPUTE}",
+            str(_DOCUMENT_CUES),
+            *writes,
+        ]
+
+    result = execute_plan(
+        _two_documents(out_path),
+        sidecar_argv=_writer,
+        timeout=_ROWS_TIMEOUT,
+        overwrite=True,
+        stall=_ROWS_STALL,
+    )
+
+    assert result.overflow is None, str(result.overflow)
+    assert not result.timed_out
+    assert result.exit_code == 0, "\n".join(
+        f"{m.id} exited {m.exit_code}: {m.stderr_tail}"
+        for stage in result.stages
+        for m in stage.members
+    )
     assert _subtitle_packets(out_path) == [_DOCUMENT_CUES, _DOCUMENT_CUES]
     assert _live_pipes() == []

@@ -96,6 +96,7 @@ already carries for the printed ``loudnorm2`` chain.
 from __future__ import annotations
 
 import contextlib
+import ctypes
 import heapq
 import math
 import os
@@ -174,9 +175,12 @@ CHAIN = " && "
 
 # How often a running stage is re-checked.
 _POLL = 0.02
-# How long every pipe of a stage may stand still, with every member running and
-# one copy still waiting on the far end, before that edge is called wedged.
+# How long every pipe of a stage may stand still and every member sit idle,
+# with all of them running and one copy still waiting on the far end, before
+# that edge is called wedged.
 DEFAULT_STALL = 30.0
+# The 100 ns units Windows reports a process's CPU time in, per second.
+_FILETIME_TICKS = 1e7
 # How long a member that was told to stop is given before it is killed.
 _GRACE = 5.0
 # How long a helper thread is waited for once its process has gone.
@@ -573,8 +577,8 @@ def overflow_error(flow: Flow, stall: float) -> FfrwdError:
         ErrorCode.BUFFER_OVERFLOW,
         f"the {flow.road} buffer carrying '{carried}' from {flow.edge.source} to "
         f"{flow.edge.target} overflowed: it was {sized}, and with every process "
-        f"still running nothing has crossed any pipe of this stage for "
-        f"{stall:.0f}s",
+        f"still running, nothing has crossed any pipe of this stage and every "
+        f"process of it has sat idle for {stall:.0f}s",
         hint="the paths out of the one process reading the input drifted "
         "further apart than the compiler counted them: record the input to a "
         "file and run this query over the file, or take the slower path's "
@@ -594,8 +598,9 @@ def unopened_error(flow: Flow, stall: float) -> FfrwdError:
         ErrorCode.INPUT_NEVER_OPENED,
         f"the pipe carrying '{carried}' from {flow.edge.source} to "
         f"{flow.edge.target} has nowhere to go: the consumer never opened its "
-        f"input, and with every process still running nothing has crossed any "
-        f"pipe of this stage for {stall:.0f}s",
+        f"input, and with every process still running, nothing has crossed any "
+        f"pipe of this stage and every process of it has sat idle for "
+        f"{stall:.0f}s",
         hint="the process reading it opens its inputs in order and is still "
         "waiting on an earlier one of its own, which cannot end while this "
         "one waits: hand it that earlier input first, or write this one to a "
@@ -1315,12 +1320,19 @@ def _watch(
     asked for the edge at all (:func:`unopened`). `stall` of None turns both
     off.
 
+    Neither is asked while the stage is working: the pipes a stage pumps are
+    not all the pipes it has, so a member computing between two writes stands
+    still on every pumped edge without being wedged. Both detectors wait for
+    the members' own CPU time to stop advancing for `stall` seconds too.
+
     `windows` are passed only for a stage whose display windows are all it
     feeds: once every one of them has been closed the stage is done, and
     ending it that way is no failure -- the caller stops the members still
     running, and a member it stopped is not counted against the run.
     """
     watched = list(members)
+    used: dict[str, float | None] = {m.id: _cpu_seconds(m.proc) for m in watched}
+    working = time.monotonic()
     while True:
         for member in watched:
             code = member.proc.poll()
@@ -1332,18 +1344,74 @@ def _watch(
             return None, False, None
         if stall is not None:
             now = time.monotonic()
-            full = overflowed(flows, now, stall)
-            if full is not None:
-                held = next(m for m in watched if m.proc.poll() is None)
-                return held.id, True, overflow_error(full, stall)
-            stuck = unopened(flows, now, stall)
-            if stuck is not None:
-                held = next(m for m in watched if m.proc.poll() is None)
-                return held.id, True, unopened_error(stuck, stall)
+            readable = False
+            for member in watched:
+                seconds = _cpu_seconds(member.proc)
+                if seconds is None:
+                    continue
+                readable = True
+                before = used[member.id]
+                if before is None or seconds > before:
+                    working = now
+                used[member.id] = seconds
+            # Where no member's CPU can be read the pipes are all there is to
+            # go on, and the stall detectors answer on them alone.
+            if not readable or now - working >= stall:
+                full = overflowed(flows, now, stall)
+                if full is not None:
+                    held = next(m for m in watched if m.proc.poll() is None)
+                    return held.id, True, overflow_error(full, stall)
+                stuck = unopened(flows, now, stall)
+                if stuck is not None:
+                    held = next(m for m in watched if m.proc.poll() is None)
+                    return held.id, True, unopened_error(stuck, stall)
         if time.monotonic() >= deadline:
             hung = next(m for m in watched if m.proc.poll() is None)
             return hung.id, True, None
         time.sleep(_POLL)
+
+
+def _cpu_seconds(proc: subprocess.Popen[bytes]) -> float | None:
+    """The CPU time one member has used so far, kernel and user, in seconds.
+
+    None where this platform, or this process, cannot be read -- and a member
+    that has already exited reads as None on Linux, its ``/proc`` entry being
+    gone the moment :meth:`Popen.poll` reaps it.
+    """
+    if sys.platform == "win32":
+        handle = getattr(proc, "_handle", None)
+        if handle is None:
+            return None
+        created = ctypes.c_uint64()
+        exited = ctypes.c_uint64()
+        kernel = ctypes.c_uint64()
+        user = ctypes.c_uint64()
+        ok = ctypes.windll.kernel32.GetProcessTimes(
+            ctypes.c_void_p(int(handle)),
+            ctypes.byref(created),
+            ctypes.byref(exited),
+            ctypes.byref(kernel),
+            ctypes.byref(user),
+        )
+        if not ok:
+            return None
+        return (kernel.value + user.value) / _FILETIME_TICKS
+    if sys.platform.startswith("linux"):
+        try:
+            stat = Path(f"/proc/{proc.pid}/stat").read_text(encoding="utf-8")
+        except OSError:
+            return None
+        # The command name is parenthesised and may hold spaces, so the fields
+        # are counted from after it: utime and stime are the 12th and 13th.
+        fields = stat.rpartition(")")[2].split()
+        if len(fields) < 13:
+            return None
+        try:
+            ticks = int(fields[11]) + int(fields[12])
+        except ValueError:
+            return None
+        return ticks / os.sysconf("SC_CLK_TCK")
+    return None
 
 
 def _writes_rows_to_stdout(process: Process) -> bool:
@@ -1679,10 +1747,11 @@ def _write_all(writer: IO[bytes], chunk: bytes) -> None:
 def overflowed(flows: Sequence[Flow], now: float, stall: float) -> Flow | None:
     """The edge whose buffer is full, out of a stage that has stopped moving.
 
-    A stage is wedged when nothing has crossed ANY of its pipes for `stall`
-    seconds -- the producer waiting on a full buffer stops writing to its other
-    edges too, so their consumers starve and the whole stage goes still at
-    once. The edge to name is one the copy is waiting to hand over, and the
+    Nothing across ANY of the stage's pipes for `stall` seconds is the half of
+    a wedge this answers -- the producer waiting on a full buffer stops writing
+    to its other edges too, so their consumers starve and the whole stage goes
+    still at once. :func:`_watch` asks only once the members have gone idle as
+    well. The edge to name is one the copy is waiting to hand over, and the
     deepest bound among those, since that is the one the compiler promised the
     most about. None while anything is still moving, and for a stage where no
     copy is waiting -- that one is idle, not full.
