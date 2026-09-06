@@ -1479,7 +1479,13 @@ def _cmd_run(args: argparse.Namespace, on_warning: OnWarning) -> int:
                     "set prints right here",
                 )
             with console.status("submitting"):
-                submitted = remote.submit_run(query, packages, args, announce=console.say)
+                submitted = remote.submit_run(
+                    query,
+                    packages,
+                    args,
+                    announce=console.say,
+                    progress=console.progress("uploading"),
+                )
             # --wait --json speaks JSON alone on stdout; the plain submit
             # lines are the narration --json replaces, not adds to.
             if not (args.wait and args.as_json):

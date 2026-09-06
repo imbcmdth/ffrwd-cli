@@ -154,7 +154,7 @@ def test_progress_draws_a_bar_with_figures_and_an_eta_then_clears(clock: _Clock)
 
     written = stream.getvalue()
     assert "\ryolo26n.onnx  [>                   ]   0%  1 MB / 128 MB" in written
-    # 67 of 128 MB left at the 30.5 MB a second measured so far: two more.
+    # 67 of 128 MB left at the 30 MB a second the window spans: two more.
     line = "yolo26n.onnx  [=========>          ]  47%  61 MB / 128 MB  eta 0:02"
     assert "\r" + line in written
     assert len(line) < 80
@@ -224,8 +224,28 @@ def test_progress_times_the_next_download_from_its_own_first_byte(clock: _Clock)
     report(2 * MB, total)
 
     written = stream.getvalue()
-    # Half of 4 MB in the one second since this download's first byte.
-    assert "eta 0:01" in written
+    # 1 MB in the one second since this download's first byte, so the 2 MB
+    # left take two -- not the six the earlier transfer's clock would say.
+    assert "eta 0:02" in written
+    assert "eta 0:06" not in written
+
+
+def test_progress_reads_the_rate_off_the_window_so_a_burst_settles(clock: _Clock) -> None:
+    stream = _Tty()
+    report = Console(stream).progress("archive")
+    total = 100 * MB
+    report(1 * MB, total)
+    # 40 MB in a fifth of a second, then a steady 2 MB a second for eight.
+    clock.reading = 0.2
+    report(41 * MB, total)
+    for second in range(1, 9):
+        clock.reading = float(second)
+        report((41 + 2 * second) * MB, total)
+
+    written = stream.getvalue()
+    # 43 MB left at the steady 2 MB a second, not at the 7 MB a second the
+    # burst leaves in the average.
+    assert written.split("\r")[-1].rstrip().endswith("eta 0:21")
     assert "eta 0:06" not in written
 
 

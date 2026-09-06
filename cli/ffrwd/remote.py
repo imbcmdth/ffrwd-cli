@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 import os
 import shutil
@@ -234,7 +235,7 @@ def _call(
     url: str,
     *,
     headers: dict[str, str],
-    data: bytes | None = None,
+    data: bytes | packages_module.CountedBody | None = None,
     limit: int = _MAX_RESPONSE_BYTES,
     timeout: float = packages_module.TIMEOUT,
 ) -> bytes:
@@ -329,6 +330,7 @@ def submit_run(
     args: argparse.Namespace,
     *,
     announce: Announce | None = None,
+    progress: Progress | None = None,
 ) -> Submitted:
     """Submit `query` as a hosted job: post the spec, upload the inputs, start it.
 
@@ -337,7 +339,7 @@ def submit_run(
     before the first request, the server's passed through -- and returns the
     job id the caller reports, alongside what the account has left this
     month. `announce` hears one line per step: the submit, each upload with
-    its size, and the start.
+    its size, and the start; `progress` hears the bytes of every upload.
     """
     if args.show or args.show_only:
         raise _reject(
@@ -394,9 +396,11 @@ def submit_run(
                 f"uploading package {archive.entry.name} "
                 f"({written_size(len(archive.content))})"
             )
-        _upload_bytes(upload_url, job_token, archive.content, archive.entry.sha256)
+        _upload_bytes(
+            upload_url, job_token, archive.content, archive.entry.sha256, progress
+        )
     for path, digest in uploads:
-        _upload(upload_url, job_token, path, digest, announce)
+        _upload(upload_url, job_token, path, digest, announce, progress)
     if announce is not None:
         announce("starting the job")
     _call(
@@ -686,23 +690,50 @@ def _upload(
     path: str,
     digest: str,
     announce: Announce | None = None,
+    progress: Progress | None = None,
 ) -> None:
-    """POST one file input's bytes. An ``already: true`` answer is the dedupe
-    hit -- the content is staged, nothing more to send for it."""
+    """POST one file input, streamed off the disk. An ``already: true`` answer
+    is the dedupe hit -- the content is staged, nothing more to send for it."""
+    file = Path(path)
     try:
-        content = Path(path).read_bytes()
+        size = file.stat().st_size
+        opened = file.open("rb")
     except OSError as err:
         raise _reject(
             f"input '{path}' could not be read: {err.strerror or err}",
             "a file input is uploaded from this machine, so it has to be readable",
         ) from err
-    if announce is not None:
-        announce(f"uploading {path} ({written_size(len(content))})")
-    _upload_bytes(upload_url, job_token, content, digest)
+    with opened as handle:
+        if announce is not None:
+            announce(f"uploading {path} ({written_size(size)})")
+        _upload_body(
+            upload_url,
+            job_token,
+            packages_module.CountedBody(handle, size, progress),
+            digest,
+        )
 
 
-def _upload_bytes(upload_url: str, job_token: str, content: bytes, digest: str) -> None:
-    """POST `content` to the content-addressed endpoint under its digest.
+def _upload_bytes(
+    upload_url: str,
+    job_token: str,
+    content: bytes,
+    digest: str,
+    progress: Progress | None = None,
+) -> None:
+    """POST `content`, which is already in hand, through the same counted body."""
+    _upload_body(
+        upload_url,
+        job_token,
+        packages_module.CountedBody(io.BytesIO(content), len(content), progress),
+        digest,
+    )
+
+
+def _upload_body(
+    upload_url: str, job_token: str, body: packages_module.CountedBody, digest: str
+) -> None:
+    """POST `body` to the content-addressed endpoint under its digest.
 
     Shared by the file inputs and the packed linked packages: both are bytes
     the runner reads back by digest, and the endpoint answers ``already: true``
@@ -711,7 +742,7 @@ def _upload_bytes(upload_url: str, job_token: str, content: bytes, digest: str) 
     _call(
         f"{upload_url}?sha256={digest}",
         headers={"x-job-token": job_token, "Content-Type": "application/octet-stream"},
-        data=content,
+        data=body,
         timeout=_DATA_PLANE_TIMEOUT,
     )
 

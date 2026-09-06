@@ -101,6 +101,7 @@ __all__ = [
     "DEFAULT_API",
     "DEFAULT_REGISTRY",
     "REGISTRY_ENV",
+    "CountedBody",
     "Installed",
     "Listing",
     "Release",
@@ -370,12 +371,51 @@ def _absent(status: _Status) -> bool:
     )
 
 
+class CountedBody:
+    """A request body read out of `source`, reporting what has been sent.
+
+    An upload worth waiting for is streamed rather than held in memory, so
+    the bytes are counted where http.client pulls them: `read` reports the
+    running count against `size` to `progress`, and the read that comes back
+    empty reports the total, which is what ends a bar's line. http.client
+    pulls 8 KiB at a time, so a report is made once a block of them has gone
+    by rather than on every read.
+
+    Never more than `size` bytes leave, whatever the source turns out to
+    hold: that is the length the request declares.
+    """
+
+    def __init__(self, source: IO[bytes], size: int, progress: Progress | None) -> None:
+        self._source = source
+        self.size = size
+        self._progress = progress
+        self._sent = 0
+        self._reported = 0
+
+    def read(self, amount: int = -1, /) -> bytes:
+        room = self.size - self._sent
+        block = self._source.read(room if amount < 0 else min(amount, room))
+        self._sent += len(block)
+        unreported = self._sent - self._reported
+        if self._progress is not None and unreported:
+            if not block or unreported >= _BLOCK_BYTES:
+                self._reported = self._sent
+                self._progress(self._sent, self.size)
+        return block
+
+
 def _request(
-    url: str, *, headers: Mapping[str, str] | None = None, data: bytes | None = None
+    url: str,
+    *,
+    headers: Mapping[str, str] | None = None,
+    data: bytes | CountedBody | None = None,
 ) -> urllib.request.Request:
     written = {"Accept": "*/*", **(dict(headers) if headers else {})}
     if data is not None:
         written.setdefault("Content-Type", "application/json")
+    if isinstance(data, CountedBody):
+        # urllib sends a reader chunked unless the length is named.
+        written.setdefault("Content-Length", str(data.size))
     return urllib.request.Request(url, data=data, headers=written)
 
 
@@ -473,7 +513,7 @@ def exchange(
     url: str,
     *,
     headers: Mapping[str, str],
-    data: bytes,
+    data: bytes | CountedBody,
     limit: int,
     timeout: float = TIMEOUT,
 ) -> tuple[int, bytes]:
@@ -484,6 +524,9 @@ def exchange(
     registry's own -- a name it will not take, a version it already has -- and
     they carry their own message and hint for the caller to render. Any
     success reads as 200; only whether it succeeded is a caller's question.
+
+    `data` is the whole body, or a :class:`CountedBody` streamed out of a
+    file and reported as it goes.
     """
     request = _request(url, headers=headers, data=data)
     try:

@@ -10,8 +10,9 @@ stream is a TTY: a pipe or a CI log carries the narration lines alone. A
 narration line printed while it spins clears the spinner's line first, so
 nothing interleaves.
 
-A download reports through a ``Progress`` the same way, and :meth:`Console.progress`
-turns one into a bar redrawn over :meth:`Console.transient`.
+A transfer -- a download, or an upload of a file input -- reports through a
+``Progress`` the same way, and :meth:`Console.progress` turns one into a bar
+redrawn over :meth:`Console.transient`.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ import itertools
 import sys
 import threading
 import time
+from collections import deque
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import TextIO
@@ -30,7 +32,7 @@ __all__ = ["Announce", "Console", "Progress", "written_size"]
 # line prints.
 Announce = Callable[[str], None]
 
-# How a download reports itself: the bytes so far, and the total when it is
+# How a transfer reports itself: the bytes so far, and the total when it is
 # known. The last call of a transfer names the total it ended with -- a
 # transfer whose total was never known names the count it reached -- and that
 # is what ends the line.
@@ -48,6 +50,8 @@ _BAR_WIDTH = 20
 _REDRAW = 0.1
 _ETA_AFTER = 1.0
 _COLUMNS = 79
+# How far back the rate behind the ETA is measured.
+_RATE_WINDOW = 5.0
 
 
 def written_size(count: int) -> str:
@@ -80,10 +84,13 @@ def _bar(fraction: float) -> str:
 
 
 class _Bar:
-    """One download's line: where it started, and when it last drew.
+    """One transfer's line: where it started, when it last drew, and its recent rate.
 
     Reused across transfers -- one `Progress` covers a whole install -- so a
     count that does not continue the previous one starts the timing again.
+    The rate comes off the counts of the last few redraws rather than the
+    whole transfer, so a connection that bursts and then settles reports the
+    rate it settled at.
     """
 
     def __init__(self, label: str) -> None:
@@ -91,6 +98,7 @@ class _Bar:
         self._start = 0.0
         self._last_draw = 0.0
         self._counted = 0
+        self._samples: deque[tuple[float, int]] = deque()
         self.drawn = False
         self._ended = True
 
@@ -98,6 +106,7 @@ class _Bar:
         self._start = _now()
         self._last_draw = 0.0
         self._counted = 0
+        self._samples.clear()
         self.drawn = False
         self._ended = False
 
@@ -120,7 +129,27 @@ class _Bar:
             return None
         self._last_draw = now
         self.drawn = True
+        self._sample(now, done)
         return _fit(self.label, self._tail(done, total, now - self._start))
+
+    def _sample(self, now: float, done: int) -> None:
+        """Record this redraw's count, dropping what has fallen out of the window.
+
+        One sample older than the window is kept, so the span it measures
+        covers the whole window rather than stopping just inside it.
+        """
+        self._samples.append((now, done))
+        while len(self._samples) > 1 and now - self._samples[1][0] > _RATE_WINDOW:
+            self._samples.popleft()
+
+    def _rate(self, done: int, elapsed: float) -> float:
+        """Bytes a second across the window, or the average while it holds one sample."""
+        first_at, first_done = self._samples[0]
+        last_at, last_done = self._samples[-1]
+        span = last_at - first_at
+        if len(self._samples) > 1 and span > 0:
+            return (last_done - first_done) / span
+        return done / elapsed if elapsed else 0.0
 
     def _tail(self, done: int, total: int | None, elapsed: float) -> str:
         if total is None:
@@ -128,8 +157,9 @@ class _Bar:
         percent = min(100, int(100 * done / total)) if total else 100
         sizes = f"{written_size(done)} / {written_size(total)}"
         eta = ""
-        if elapsed >= _ETA_AFTER and done:
-            eta = f"  eta {_elapsed_time(max(0, total - done) * elapsed / done)}"
+        rate = self._rate(done, elapsed)
+        if elapsed >= _ETA_AFTER and rate > 0:
+            eta = f"  eta {_elapsed_time(max(0, total - done) / rate)}"
         return f"  [{_bar(done / total if total else 1.0)}] {percent:3d}%  {sizes}{eta}"
 
 
@@ -281,7 +311,7 @@ class Console:
         ``yolo26n.onnx  [=========>          ]  47%  61 MB / 128 MB  eta 0:12``.
         Nothing draws below a megabyte, and nothing off a TTY or under
         `quiet`, which `transient` already answers for. Redraws are capped at
-        ten a second, and the ETA -- the average rate since the first byte --
+        ten a second, and the ETA -- the rate over the last few seconds --
         appears once a second of it has been measured. One `Progress` covers
         however many transfers a command makes, each drawing its own line.
         """

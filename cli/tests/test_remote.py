@@ -22,6 +22,7 @@ import pytest
 
 import ffrwd
 from ffrwd import cli, credentials, packages, parser, remote, store
+from ffrwd.console import Console, Progress
 from ffrwd.errors import FfrwdError
 from ffrwd.probe import ProbeResult, is_url
 from ffrwd.project import LinkEntry, RegistryEntry, links_path, write_linksfile, write_lockfile
@@ -63,6 +64,18 @@ class _Fake:
         return None
 
 
+def _posted(data: object) -> bytes | None:
+    """A request body as bytes, a reader drained the way http.client drains it.
+
+    An upload posts a reader rather than the whole content, so the seam has
+    to pull it -- in 8 KiB pieces, which is what makes the reader report.
+    """
+    if data is None or isinstance(data, bytes):
+        return data
+    read = data.read  # type: ignore[attr-defined]
+    return b"".join(iter(lambda: read(8192), b""))
+
+
 class _Served:
     """The HTTP seam: a table of URL to answer, and what was asked for."""
 
@@ -77,7 +90,7 @@ class _Served:
             str(key).lower(): str(value)
             for key, value in dict(request.headers).items()  # type: ignore[attr-defined]
         }
-        self.asked.append((url, headers, request.data))  # type: ignore[attr-defined]
+        self.asked.append((url, headers, _posted(request.data)))  # type: ignore[attr-defined]
         answer = self.answers.get(url, (404, b'{"error": "not found"}'))
         status, content = answer if isinstance(answer, tuple) else (200, answer)
         assert isinstance(content, bytes)
@@ -370,9 +383,85 @@ def test_submit_posts_the_spec_uploads_the_file_and_starts(
     upload_headers, upload_body = served.sent_to(f"{UPLOAD_URL}?sha256={digest}")
     assert upload_headers["x-job-token"] == JOB_TOKEN
     assert upload_headers["content-type"] == "application/octet-stream"
+    # The body is streamed off the disk, so its length is named rather than
+    # left for urllib to measure.
+    assert upload_headers["content-length"] == "11"
     assert upload_body == b"media bytes"
     start_headers, _start_body = served.sent_to(START_URL)
     assert start_headers["x-job-token"] == JOB_TOKEN
+
+
+def _reported(progress: list[tuple[int, int | None]]) -> Progress:
+    def report(done: int, total: int | None) -> None:
+        progress.append((done, total))
+
+    return report
+
+
+def test_an_upload_reports_its_bytes_block_by_block(
+    served: _Served, logged_in: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A file input reports as it goes, the last call naming the total."""
+    monkeypatch.chdir(tmp_path)
+    block = packages._BLOCK_BYTES
+    content = b"m" * (3 * block)
+    (tmp_path / "in.mp4").write_bytes(content)
+    digest = hashlib.sha256(content).hexdigest()
+    _submit_accepted(served)
+    served.answers[f"{UPLOAD_URL}?sha256={digest}"] = json.dumps(
+        {"already": False, "bytes": len(content)}
+    ).encode("utf-8")
+    served.probes["in.mp4"] = ProbeResult(streams=[], duration=12.5)
+
+    seen: list[tuple[int, int | None]] = []
+    remote.submit_run(
+        _query(MEDIA_QUERY), None, _run_args(), progress=_reported(seen)
+    )
+
+    size = 3 * block
+    assert seen == [(block, size), (2 * block, size), (size, size)]
+    headers, body = served.sent_to(f"{UPLOAD_URL}?sha256={digest}")
+    assert headers["content-length"] == str(size)
+    assert body == content
+
+
+def test_a_remote_run_draws_the_upload_bar_on_a_terminal(
+    served: _Served,
+    logged_in: None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The notice naming the file stands above the bar the bytes redraw."""
+    monkeypatch.chdir(tmp_path)
+    content = b"m" * (2 * packages._BLOCK_BYTES)
+    (tmp_path / "in.mp4").write_bytes(content)
+    digest = hashlib.sha256(content).hexdigest()
+    _submit_accepted(served)
+    served.answers[f"{UPLOAD_URL}?sha256={digest}"] = json.dumps(
+        {"already": False, "bytes": len(content)}
+    ).encode("utf-8")
+    served.probes["in.mp4"] = ProbeResult(streams=[], duration=12.5)
+    monkeypatch.setattr(Console, "_is_tty", lambda self: True)
+
+    assert cli.main(["run", "--remote", MEDIA_QUERY]) == 0
+    err = capsys.readouterr().err
+    assert "uploading in.mp4 (2 MB)\n" in err
+    assert "\ruploading  [" in err
+    assert "/ 2 MB" in err
+
+
+def test_an_input_that_stops_being_readable_before_its_upload_is_refused(
+    tmp_path: Path,
+) -> None:
+    """The upload opens the file itself, and says so when it cannot."""
+    with pytest.raises(FfrwdError) as caught:
+        remote._upload(UPLOAD_URL, JOB_TOKEN, str(tmp_path / "gone.mp4"), "0" * 64)
+    assert caught.value.message.startswith("input '")
+    assert "gone.mp4' could not be read:" in caught.value.message
+    assert caught.value.hint == (
+        "a file input is uploaded from this machine, so it has to be readable"
+    )
 
 
 def test_a_recipe_run_carries_its_owner_and_the_lock_text(
@@ -584,11 +673,15 @@ def test_a_linked_package_packs_and_its_digest_pins_the_submitted_lock(
         {"already": False, "bytes": len(archive)}
     ).encode("utf-8")
 
-    remote.submit_run(_query(STREAM_QUERY), None, _run_args())
+    seen: list[tuple[int, int | None]] = []
+    remote.submit_run(_query(STREAM_QUERY), None, _run_args(), progress=_reported(seen))
 
     # The spec names the digest as one this submit uploads, not one the
     # registry publishes.
     assert _submitted_packages(served) == [digest]
+    # The archive goes through the same counted body an input does, and it
+    # fits in one block, so its one report names the total.
+    assert seen == [(len(archive), len(archive))]
     # The lock the runner reads holds a registry pin, not a link.
     lock = _submitted_lock(served)
     assert lock is not None
