@@ -331,6 +331,11 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v5
 
+      # The package's readme is the repository's; setuptools reads only
+      # inside the project directory, so the build gets a copy.
+      - name: Give the package its readme
+        run: cp README.md cli/README.md
+
       - name: Build the cli distribution
         working-directory: cli
         run: uv build --out-dir ../dist

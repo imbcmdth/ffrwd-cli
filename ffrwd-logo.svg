@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="-10 -8 234 45" width="468" height="90" role="img" aria-label="ffrwd.video">
+  <title>ffrwd.video logo</title>
+  <rect x="-10" y="-8" width="234" height="45" rx="6" fill="#ffffff" fill-opacity="0.75"></rect>
+  <rect x="1" y="1" width="25" height="27" fill="none" stroke="#201e1d" stroke-width="2"></rect>
+  <rect x="30" y="1" width="25" height="27" fill="none" stroke="#201e1d" stroke-width="2"></rect>
+  <path d="M7 7.5 L14 14.5 L7 21.5 Z M14 7.5 L21 14.5 L14 21.5 Z" fill="#ec3013"></path>
+  <path d="M49 7.5 L42 14.5 L49 21.5 Z M42 7.5 L35 14.5 L42 21.5 Z" fill="#ec3013"></path>
+  <text x="69" y="22" font-family="Archivo, 'Helvetica Neue', Arial, sans-serif" font-size="23" font-weight="800" letter-spacing="-0.7" fill="#201e1d">ffrwd<tspan fill="#8a8785">.video</tspan></text>
+</svg>

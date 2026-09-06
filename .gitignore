@@ -13,3 +13,6 @@ __pycache__/
 
 # A link from a package under test writes a lock here; the world package has no dependencies to pin.
 /sidecar/wasm/ffrwd.lock
+
+# The build copies the repository README in; it is never committed here.
+cli/README.md
