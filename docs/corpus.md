@@ -2782,3 +2782,87 @@ however many spaces did the describing: add a branch per track and let the
 ones that match nothing fall away. Every branch matching nothing is the
 other case - there is no file to write, and the compile refuses by name
 rather than writing an empty one.
+
+## 135. Rank in a CTE, stitch in time order
+
+A find is two orders at once: the rows are picked by score and written by
+time. One SELECT has only one - it sorts once, and row order is the
+aggregation order - so the ranking goes in a CTE and the outer query
+re-sorts what survives. A body column read off a track, cue, embedding or
+rendition row is a value column of the CTE's rows, named after itself when
+nothing renames it, so `w.start_t` reads back as `b.start_t` outside:
+
+```pgsql
+CREATE FUNCTION embed_text(prompt text) RETURNS vector
+  AS '../sidecar/modules/target/wasm32-wasip2/release/fauxlate.wasm', 'embed_text'
+  LANGUAGE wasm;
+
+COPY (
+  WITH best AS (
+    SELECT g.video[1] AS v, g.audio[1] AS a, w.start_t, w.end_t
+    FROM input('tests/fixtures/described.mkv') g,
+         unnest(g.embeddings['clip_vectors']) w
+    ORDER BY cos_similarity(w.vector, embed_text('a small pet')) DESC
+    LIMIT 2
+  )
+  SELECT concat(VARIADIC array_agg(ffmpeg.trim(b.v,  start => b.start_t, end => b.end_t))),
+         concat(VARIADIC array_agg(ffmpeg.atrim(b.a, start => b.start_t, end => b.end_t)))
+  FROM best b
+  ORDER BY b.start_t
+) TO 'clips.mp4'
+```
+
+```
+$ ffrwd compile -f query.sql
+ffmpeg -i tests/fixtures/described.mkv -filter_complex \
+  '[0:v:0]split=2[src_g_v_0_split0][src_g_v_0_split1];'\
+'[src_g_v_0_split0]trim=start=0.0:end=1.5[n1];'\
+'[src_g_v_0_split1]trim=start=1.5:end=3.0[n2];[n1]setpts=PTS-STARTPTS[n1_pts];'\
+'[n2]setpts=PTS-STARTPTS[n2_pts];[n1_pts][n2_pts]concat=n=2:v=1:a=0[out0];'\
+'[0:a:0]asplit=2[src_g_a_0_split0][src_g_a_0_split1];'\
+'[src_g_a_0_split0]atrim=start=0.0:end=1.5[n4];'\
+'[src_g_a_0_split1]atrim=start=1.5:end=3.0[n5];[n4]asetpts=PTS-STARTPTS[n4_pts];'\
+'[n5]asetpts=PTS-STARTPTS[n5_pts];[n4_pts][n5_pts]concat=n=2:v=0:a=1[out1]' -map \
+  '[out0]' -map '[out1]' clips.mp4
+```
+
+The prompt ranks the second span above the first and the third last, so the
+`LIMIT 2` keeps spans 2 and 1 in that order; `ORDER BY b.start_t` puts them
+back as 0.0-1.5 then 1.5-3.0, which is what the concat writes. Drop the
+outer `ORDER BY` and the same two spans stitch in score order instead -
+1.5-3.0 first. `ORDER BY`, `LIMIT` and `WHERE` inside the body narrow and
+order its rows before the outer query sees them; outside, they re-order and
+filter what the body handed over.
+
+## 136. Filter outside a CTE on what a caption says
+
+The same rule read the other way: a cue's `text` carried out of a CTE is a
+value column, so the outer `WHERE` picks the row by what was said and the
+bounds beside it trim to that span. One cue matches, so the branch is one
+row and needs no aggregate:
+
+```pgsql
+COPY (
+  WITH lines AS (
+    SELECT g.video[1] AS v, g.audio[1] AS a, c.text, c.start_t, c.end_t
+    FROM input('tests/fixtures/described.mkv') g, unnest(g.cues['speech']) c
+  )
+  SELECT ffmpeg.trim(b.v, start => b.start_t, end => b.end_t),
+         ffmpeg.atrim(b.a, start => b.start_t, end => b.end_t)
+  FROM lines b
+  WHERE b.text = 'a dog ran in the yard'
+) TO 'said.mp4'
+```
+
+```
+$ ffrwd compile -f query.sql
+ffmpeg -i tests/fixtures/described.mkv -filter_complex \
+  '[0:v:0]trim=start=1.5:end=3.0[n1];[0:a:0]atrim=start=1.5:end=3.0[n2];'\
+'[n1]setpts=PTS-STARTPTS[out0];[n2]asetpts=PTS-STARTPTS[out1]' -map '[out0]' -map \
+  '[out1]' said.mp4
+```
+
+Reach for this to cut to a line of dialogue without reading the timings off
+the subtitle file yourself. The predicate grammar is the compile-time one -
+`=`, `!=`, `<`, `BETWEEN`, `IS [NOT] NULL`, and the built-in text functions
+over them - so an exact line, or `upper(b.text)`, not a pattern match.

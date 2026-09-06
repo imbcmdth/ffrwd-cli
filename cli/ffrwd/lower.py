@@ -5618,28 +5618,31 @@ class _Lowerer:
                 continue
             # The flag map is the stream's own field, not metadata: it says
             # what the whole map is and emits -disposition.
-            if _projection_name(projection) == DISPOSITION_COLUMN and _is_value_column(
-                projection, env
+            if (
+                _projection_name(projection) == DISPOSITION_COLUMN
+                and _value_column_name(projection, env, natural=False) is not None
             ):
                 self._collect_disposition(projection, env, select, scope=tags)
                 continue
             # Every other compile-time scalar is a VALUE column: a column of
-            # the rows a CTE body produces, readable downstream. A sink writes
-            # streams, so one there has nowhere to go.
-            if _is_value_column(projection, env):
+            # the rows a CTE body produces, readable downstream. A body names
+            # a bare one after the column it reads; a sink writes streams, so
+            # one there has nowhere to go.
+            value_name = _value_column_name(projection, env, natural=tags == "rows")
+            if value_name is not None:
                 if tags == "sink":
                     raise _error(
                         ErrorCode.UNSUPPORTED_SQL,
-                        f"'{_projection_name(projection)}' is a value, and a "
-                        "SELECT column of a media query is an output stream",
+                        f"'{value_name}' is a value, and a SELECT column of a "
+                        "media query is an output stream",
                         projection,
                         fallback=select,
                         hint="metadata is written by a tags column, e.g. "
-                        f"STRUCT(... AS {_projection_name(projection)}) AS "
-                        f"{TAGS_COLUMN}; a value read by a TO expression or a "
-                        "WHERE needs no SELECT column at all",
+                        f"STRUCT(... AS {value_name}) AS {TAGS_COLUMN}; a value "
+                        "read by a TO expression or a WHERE needs no SELECT "
+                        "column at all",
                     )
-                self._collect_value_column(projection, env, select)
+                self._collect_value_column(value_name, projection, env, select)
                 continue
             column = _Column(
                 name=_projection_name(projection),
@@ -6156,20 +6159,15 @@ class _Lowerer:
         )
 
     def _collect_value_column(
-        self, projection: exp.Expr, env: _Env, select: exp.Select
+        self, name: str, projection: exp.Expr, env: _Env, select: exp.Select
     ) -> None:
         """One VALUE column of a CTE body: its value, once per body row.
 
         The rows are the branch's relation, so a body cross-joined against a
         series carries one value per series row and a downstream fan-out reads
-        the one its pinned row computed.
+        the one its pinned row computed. `name` is what the body called it
+        (:func:`_value_column_name`).
         """
-        name = _projection_name(projection)
-        if name is None:  # defensive: `_is_value_column` checked
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL, "malformed value column", projection,
-                fallback=select,
-            )
         node = _unwrap(projection)
         relation = env.relation
         tuples = relation.tuples if relation is not None and relation.tuples else [{}]
@@ -9111,6 +9109,11 @@ class _Lowerer:
         position is ``nulls_first``, which sqlglot fills in from the Postgres
         defaults (ASC -> NULLS LAST, DESC -> NULLS FIRST) whether or not the
         query spelled it.
+
+        Every key goes through the one value evaluator, so a CTE's value
+        column sorts the branch's rows exactly as a track row's own column
+        does, and a name the body never selected is the unknown-column
+        refusal that names what it did.
         """
         order = select.args.get("order")
         if not isinstance(order, exp.Order):
@@ -9126,6 +9129,7 @@ class _Lowerer:
                 fallback=select,
                 hint="remove the ORDER BY clause",
             )
+        relation = env.relation
         for ordered in reversed(order.expressions):
             if not isinstance(ordered, exp.Ordered):
                 raise _error(
@@ -9140,27 +9144,12 @@ class _Lowerer:
                 resolved = _order_by_alias_expr(_fold(key.this), select)
                 if resolved is not None:
                     key = _unwrap(resolved)
-            binding = self._row_binding_of(key, env, select)
-            relation = binding.relation
-
-            value_of: Callable[[_RowTuple], RowValue]
-            if isinstance(key, exp.Column):
-                name = _fold(key.this)
-
-                def value_of(
-                    row: _RowTuple,
-                    alias: str = binding.alias,
-                    name: str = name,
-                ) -> RowValue:
-                    track = _track_of(row, alias)
-                    return None if track is None else track.columns.get(name)
-            else:
-                # A computed sort key -- a built-in text/number function, or a
-                # value wasm function's result -- over the same row columns a
-                # bare one reads; resolve checked its shape and type
-                # (:meth:`ffrwd.parser._Resolver._check_order`).
-                def value_of(row: _RowTuple, key: exp.Expr = key) -> RowValue:
-                    return self._eval_value(key, env, row, select)
+            # A bare column, or a computed key -- a built-in text/number
+            # function, a value wasm function's result -- over the same row
+            # columns a bare one reads; resolve checked its shape and type
+            # (:meth:`ffrwd.parser._Resolver._check_order`).
+            def value_of(row: _RowTuple, key: exp.Expr = key) -> RowValue:
+                return self._eval_value(key, env, row, select)
 
             nulls = [row for row in relation.tuples if value_of(row) is None]
             rest = [row for row in relation.tuples if value_of(row) is not None]
@@ -15541,24 +15530,33 @@ def _group_row(env: _Env) -> _RowTuple:
     return relation.tuples[0]
 
 
-def _is_value_column(projection: exp.Expr, env: _Env) -> bool:
-    """True for a SELECT column that is a compile-time VALUE, not a stream.
+def _value_column_name(projection: exp.Expr, env: _Env, *, natural: bool) -> str | None:
+    """The name a VALUE column takes, or None when the projection is not one.
 
-    A value column is aliased — the alias names it — and its value is a
-    compile-time expression over the row: a literal, NULL, a row's metadata
-    column, an input's ``duration`` or container tag, CASE, ``||``, arithmetic
-    or ``::text``. Everything else is a stream expression and lowers as one.
+    A value column's expression is a compile-time one over the row: a
+    literal, NULL, a row's metadata column, an input's ``duration`` or
+    container tag, a CTE's own value column, CASE, ``||``, arithmetic or
+    ``::text``. Everything else is a stream expression and lowers as one.
+
+    The name is the ``AS`` alias. In a CTE BODY (`natural`) a bare column
+    reference names itself instead, as Postgres names any unaliased one, so
+    ``SELECT w.start_t`` gives the CTE's rows a ``start_t`` the outer query
+    reads back. Under a sink an unaliased value stays unnamed and keeps the
+    rejection it already had — there is no output column for it to be.
     """
-    if _projection_name(projection) is None:
-        return False
     value = _unwrap(projection)
-    if isinstance(value, exp.Null | exp.Literal | exp.Neg) or is_value_expr(value):
-        return True
-    if _is_input_value_column(value, env):
-        return True
-    if _is_cte_value_column(value, env):
-        return True
-    return _row_metadata_column(value, env) is not None
+    if not (
+        isinstance(value, exp.Null | exp.Literal | exp.Neg)
+        or is_value_expr(value)
+        or _is_input_value_column(value, env)
+        or _is_cte_value_column(value, env)
+        or _row_metadata_column(value, env) is not None
+    ):
+        return None
+    name = _projection_name(projection)
+    if name is not None:
+        return name
+    return _table_column_name(value) if natural and isinstance(value, exp.Column) else None
 
 
 def _reads_cte_value(alias: str, conjunct: exp.Expr, env: _Env) -> bool:
@@ -15627,24 +15625,33 @@ def _reads_row_column(node: exp.Expr, env: _Env) -> bool:
     """True when `node` reads a metadata column off a row alias.
 
     What makes an option's value differ from row to row: ``t.width``,
-    ``:'widths'[i.i]``, anything arithmetic over one. An input alias's probed
-    column (``f.duration``) is the same for every row and is not one.
+    ``:'widths'[i.i]``, a CTE's own value column, anything arithmetic over
+    one. An input alias's probed column (``f.duration``) is the same for
+    every row and is not one.
     """
     for sub in _unwrap(node).walk():
-        if isinstance(sub, exp.Expr) and _row_metadata_column(sub, env) is not None:
+        if not isinstance(sub, exp.Expr):
+            continue
+        if _row_metadata_column(sub, env) is not None or _is_cte_value_column(sub, env):
             return True
     return False
 
 
 def _is_row_scalar(node: exp.Expr, env: _Env) -> bool:
     """True for a bare column that is a compile-time VALUE, never a stream --
-    an input's probed duration/tag, or a row table's metadata field.
+    an input's probed duration/tag, a row table's metadata field, or a CTE's
+    value column.
 
     Lets a ``duration``-typed filter option accept ``start => f.duration``
-    the way it already accepts arithmetic over one (`_option_binder`).
+    the way it already accepts arithmetic over one (`_option_binder`), and
+    ``start => b.start_t`` off the CTE that carried the bound out.
     """
     inner = _unwrap(node)
-    return _is_input_value_column(inner, env) or _row_metadata_column(inner, env) is not None
+    return (
+        _is_input_value_column(inner, env)
+        or _is_cte_value_column(inner, env)
+        or _row_metadata_column(inner, env) is not None
+    )
 
 
 def _flatten(columns: list[_Column]) -> list[_Column]:

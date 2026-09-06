@@ -12137,6 +12137,114 @@ def test_order_by_a_cte_column_has_no_streaming_equivalent() -> None:
 
 
 # ---------------------------------------------------------------------------
+# a CTE's VALUE columns: read off a row inside, sorted and filtered outside
+# ---------------------------------------------------------------------------
+
+_THREE_SPANS = (
+    CueMeta(index=1, text="a cat sat on the mat", start_t=0.0, end_t=1.5),
+    CueMeta(index=2, text="a dog ran in the yard", start_t=1.5, end_t=3.0),
+    CueMeta(index=3, text="a car drove down the road", start_t=3.0, end_t=4.0),
+)
+
+# A body carrying a stream column beside the two bounds it read off the
+# vector rows, so the rules for the two kinds are exercised side by side.
+_BEST_CTE = (
+    "WITH best AS ("
+    "  SELECT g.video[1] AS v, w.start_t, w.end_t"
+    "  FROM input('o.mkv') g, input('d.mkv') f, unnest(f.embeddings) w"
+)
+
+
+def _three_span_tracks() -> dict[int, list[CueMeta]]:
+    """A caption track and a vector track over the same three spans."""
+    return {
+        0: list(_THREE_SPANS),
+        1: [
+            replace(cue, text=_payload(_TWO_VECTORS[cue.index % 2]))
+            for cue in _THREE_SPANS
+        ],
+    }
+
+
+def _trim_windows(g: Graph) -> list[tuple[object, object]]:
+    """Every trim's window, in the order the graph minted them."""
+    return [
+        (node.args["start"], node.args["end"])
+        for node in g.nodes.values()
+        if node.filter in ("trim", "atrim")
+    ]
+
+
+def test_an_embedding_rows_bounds_sort_the_cte_they_left(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unaliased `w.start_t` names itself, as Postgres names any unaliased
+    column, so the outer ORDER BY re-sorts the body's ROWS by a bound it
+    carried out -- without one they keep the document's own order."""
+    _extracted(monkeypatch, _three_span_tracks())
+    sinks = lower_table(
+        resolve(
+            parse(
+                _BEST_CTE + ") SELECT b.start_t, b.end_t FROM best b "
+                "ORDER BY b.start_t DESC"
+            )
+        ),
+        _described_probes(),
+    )
+    assert sinks[0].result.rows == [[3.0, 4.0], [1.5, 3.0], [0.0, 1.5]]
+
+
+def test_a_cte_limited_inside_reads_back_its_top_rows_in_time_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The two orders one SELECT cannot hold at once: LIMIT inside keeps the
+    top rows by the body's ranking, ORDER BY outside puts them back in time."""
+    _extracted(monkeypatch, _three_span_tracks())
+    sinks = lower_table(
+        resolve(
+            parse(
+                _BEST_CTE + "  ORDER BY w.end_t DESC LIMIT 2"
+                ") SELECT b.start_t, b.end_t FROM best b ORDER BY b.start_t"
+            )
+        ),
+        _described_probes(),
+    )
+    assert sinks[0].result.rows == [[1.5, 3.0], [3.0, 4.0]]
+
+
+def test_a_cues_text_filters_the_cte_rows_from_outside(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cue's text is a value column like any other bound, so the outer WHERE
+    picks the row and the bounds beside it trim to that cue's span."""
+    _extracted(monkeypatch, _three_span_tracks())
+    g = _lower(
+        "COPY (WITH lines AS ("
+        "  SELECT g.video[1] AS v, c.text, c.start_t, c.end_t"
+        "  FROM input('o.mkv') g, input('d.mkv') f, unnest(f.cues) c"
+        ") SELECT ffmpeg.trim(b.v, start => b.start_t, end => b.end_t) "
+        "FROM lines b WHERE b.text = 'a dog ran in the yard') TO 'out.mp4'",
+        _described_probes(),
+    )
+    assert _trim_windows(g) == [(1.5, 3.0)]
+
+
+def test_an_outer_sort_key_the_cte_never_selected_names_what_it_carries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sorting by a name the body did not select is the unknown-column
+    rejection, and the hint lists the columns it did."""
+    _extracted(monkeypatch, _three_span_tracks())
+    err = _reject_lower_table(
+        _BEST_CTE + ") SELECT b.start_t FROM best b ORDER BY b.score",
+        _described_probes(),
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "unknown column 'b.score'" in err.message
+    assert "'b' exposes: end_t, start_t, v" in (err.hint or "")
+
+
+# ---------------------------------------------------------------------------
 # compile-time arithmetic, ::text and <input>.duration
 # ---------------------------------------------------------------------------
 

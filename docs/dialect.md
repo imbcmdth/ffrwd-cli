@@ -857,10 +857,12 @@ Each column is one of:
   It is the ONLY column that writes metadata.
 - **A `disposition` column**: an aliased value that sets the row's
   flags rather than a tag.
-- **A value column** (CTE bodies): any other aliased compile-time
-  value becomes a column of the body's rows, readable downstream. At a
-  media sink such a column is a rejection - a SELECT column there is an
-  output stream.
+- **A value column** (CTE bodies): any other compile-time value
+  becomes a column of the body's rows, readable downstream. Its name
+  is its `AS` alias, or - for a bare column read off a track, cue,
+  embedding or rendition row - the column's own name, as Postgres
+  names any unaliased column reference. At a media sink such a column
+  is a rejection - a SELECT column there is an output stream.
 - **`array_agg(<per-row stream expression>)`**: gathers rows in row
   order; must be a whole column, or the sole argument of `VARIADIC`
   ([rows.md](rows.md#combining-rows)). Over a CTE's own stream column

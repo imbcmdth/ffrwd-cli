@@ -686,6 +686,23 @@ def _projection_alias(projection: exp.Expr) -> str | None:
     return _ident_name(alias) if isinstance(alias, exp.Expr) else None
 
 
+def _body_column_name(projection: exp.Expr) -> str | None:
+    """The name a CTE body's projection gives its column, else None.
+
+    The ``AS`` alias, else -- for a qualified column read -- the column's own
+    name, as Postgres names any unaliased column reference.
+    """
+    alias = _projection_alias(projection)
+    if alias is not None:
+        return alias
+    inner = _unwrap_paren(projection)
+    if not isinstance(inner, exp.Column) or inner.args.get("table") is None:
+        return None
+    name = _ident_name(inner.this)
+    ref = map_ref(name)
+    return ref[1] if ref is not None else name
+
+
 def map_path(column: str, key: str) -> str:
     """The internal column name ``<alias>.<column>.<key>`` folds into."""
     return f"<{column}>{key}"
@@ -7772,10 +7789,10 @@ class _Resolver:
         self, order: exp.Order, scope: dict[str, str], select: exp.Select
     ) -> None:
         """Every sort key is a track-row metadata column, a rendition column
-        of a plain input alias, a compile-time value computed over one, or a
-        bare SELECT-list alias naming one of those -- the same domain a
-        WHERE operand admits, plus Postgres's own ORDER BY alias rule -- and
-        nothing else.
+        of a plain input alias, a CTE's value column, a compile-time value
+        computed over one, or a bare SELECT-list alias naming one of those --
+        the same domain a WHERE operand admits, plus Postgres's own ORDER BY
+        alias rule -- and nothing else.
 
         Reaching here at all means the branch has a row source or an
         `input(...)` alias (:func:`_has_row_source` and
@@ -7787,6 +7804,10 @@ class _Resolver:
         actually has renditions, and lower is what refuses it when it does
         not. Sorting frames, a CTE's streams, or a time column is still
         NO_STREAMING_EQUIVALENT, and so is a vector -- it has no order.
+
+        A CTE's own columns type OPEN, the way a WHERE operand's do: lowering
+        knows which of them the body computed as values and which are
+        streams, and it names the ones that are neither.
         """
         _check_query_args(order, frozenset({"expressions"}), "ORDER BY")
         expressions = order.expressions
@@ -7848,6 +7869,18 @@ class _Resolver:
                 )
             alias = _ident_name(table_node)
             kind = scope.get(alias)
+            if (
+                kind == "cte"
+                and _ident_name(key.this) != TIME_COLUMN
+                and not self._cte_selects_a_stream(select, alias, _ident_name(key.this))
+            ):
+                # A CTE's value column sorts its rows the way a track row's
+                # own column does. Its TYPE is whatever the body computed,
+                # which only lowering has seen, so the check stays OPEN here
+                # -- the posture a WHERE operand takes -- and lowering names
+                # a column the body did not select. `t` is the seek handle,
+                # not a value, so it keeps the rejection below.
+                return
             if kind == "input" and (
                 _ident_name(key.this) in RENDITION_COLUMNS
                 or (
@@ -7909,6 +7942,70 @@ class _Resolver:
             fallback=order,
             hint="only track-row metadata columns can be sorted; " + _ROW_ORDER_HINT,
         )
+
+    def _cte_selects_a_stream(self, select: exp.Select, alias: str, name: str) -> bool:
+        """True when the CTE bound under `alias` named `name` as a STREAM.
+
+        A stream has no order to sort by, whichever relation carries it, and
+        the body's own SELECT list says which of its columns are streams: a
+        bare row alias, a subscript, a filter call. Every other answer --
+        a value shape, a name the body does not carry, a body this branch
+        cannot see -- is False, leaving lowering to answer against the
+        columns it actually built.
+        """
+        body = self._cte_body_of(select, alias)
+        if body is None:
+            return False
+        return any(
+            _body_column_name(projection) == name
+            and not self._is_body_value(projection)
+            for branch in union_branches(body)
+            for projection in branch.expressions
+        )
+
+    def _cte_body_of(self, select: exp.Select, alias: str) -> QueryExpr | None:
+        """The body of the CTE a FROM item of `select` bound under `alias`."""
+        items: list[exp.Expr] = []
+        from_ = select.args.get("from_")
+        if isinstance(from_, exp.From):
+            items.append(from_)
+        items += [join for join in (select.args.get("joins") or []) if isinstance(join, exp.Join)]
+        for item in items:
+            for table in item.find_all(exp.Table):
+                inner = table.this
+                if not isinstance(inner, exp.Identifier):
+                    continue
+                if self._local_name(table, inner) == alias:
+                    return self.ctes.get(_ident_name(inner))
+        return None
+
+    @staticmethod
+    def _local_name(table: exp.Table, inner: exp.Identifier) -> str:
+        """The name a CTE FROM item is read by: its alias, else the CTE's own."""
+        alias_node = table.args.get("alias")
+        if isinstance(alias_node, exp.TableAlias) and alias_node.this is not None:
+            return _ident_name(alias_node.this)
+        return _ident_name(inner)
+
+    def _is_body_value(self, projection: exp.Expr) -> bool:
+        """True for a CTE body projection that is a compile-time VALUE.
+
+        The resolve-time half of lowering's own test: the structural value
+        shapes, a literal, a folded function call, and any QUALIFIED column
+        read other than the row's own stream handle -- which covers a row's
+        metadata, an input's duration or container tag, and an earlier CTE's
+        value column. A qualified column that turns out to be a stream array
+        is left to lowering, which knows; being generous here only defers,
+        while calling a value a stream would refuse a query that works.
+        """
+        inner = _projection_expr(projection)
+        if isinstance(inner, exp.Null | exp.Literal | exp.Neg):
+            return True
+        if self._is_row_predicate_value(inner):
+            return True
+        if not isinstance(inner, exp.Column) or inner.args.get("table") is None:
+            return False
+        return _ident_name(inner.this) != ROW_STREAM
 
     # -- LIMIT / OFFSET over track rows --------------------------
 
