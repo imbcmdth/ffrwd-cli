@@ -1119,14 +1119,21 @@ fn stamp_row(row: &str, pts: i64, time_base: nut::TimeBase) -> String {
 /// A subtitle output: where the document goes, and the cues gathered for it so
 /// far. A cue's end time is its own, so the whole document is written when the
 /// stream ends rather than a cue at a time.
-struct SubtitleOutput {
-    writer: RowOutput,
+///
+/// Generic only so a test can hand it a writer that records whether it was
+/// dropped; production code always gets the default, `RowOutput`.
+struct SubtitleOutput<W: Write = RowOutput> {
+    /// Taken and dropped in `finish`, closing the pipe or file the instant
+    /// the document is complete: ffmpeg reads a WebVTT or SRT input to EOF
+    /// before it counts that input open, so a finished document whose writer
+    /// stays open blocks every input after it.
+    writer: Option<W>,
     document: subtitles::Document,
     /// The output as it was spelled, for a refusal that names it.
     spelling: String,
 }
 
-impl SubtitleOutput {
+impl<W: Write> SubtitleOutput<W> {
     fn push(&mut self, rows: &[String]) -> Result<()> {
         for row in rows {
             self.document.push_row(row, &self.spelling)?;
@@ -1134,9 +1141,15 @@ impl SubtitleOutput {
         Ok(())
     }
 
+    /// A second call is a no-op: `finish` runs exactly once per output, but
+    /// taking the writer makes that true even if that ever changes.
     fn finish(&mut self) -> Result<()> {
-        self.writer.write_all(self.document.render().as_bytes())?;
-        self.writer.flush()?;
+        let Some(mut writer) = self.writer.take() else {
+            return Ok(());
+        };
+        writer.write_all(self.document.render().as_bytes())?;
+        writer.flush()?;
+        drop(writer);
         Ok(())
     }
 }
@@ -1187,7 +1200,7 @@ impl Sink {
             OutputKind::Rows => sink.rows = Some(open_row_output(&output.path)?),
             OutputKind::Subtitles(format) => {
                 sink.subtitles = Some(SubtitleOutput {
-                    writer: open_row_output(&output.path)?,
+                    writer: Some(open_row_output(&output.path)?),
                     document: subtitles::Document::new(format),
                     spelling: output.spelling.clone(),
                 });
@@ -3197,6 +3210,52 @@ mod stream_field_tests {
         assert!(durations.push(packet(5)).is_none());
         let first = durations.push(packet(5)).expect("released");
         assert_eq!(first.duration, None, "unknown is never 0");
+    }
+}
+
+#[cfg(test)]
+mod subtitle_output_tests {
+    use super::subtitles::{Document, Format};
+    use super::SubtitleOutput;
+    use std::io::{self, Write};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    /// A writer that only records whether it was dropped.
+    struct TrackedWriter(Arc<AtomicBool>);
+
+    impl Write for TrackedWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Drop for TrackedWriter {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn finish_drops_the_writer_instead_of_holding_it_open() {
+        let closed = Arc::new(AtomicBool::new(false));
+        let mut output = SubtitleOutput {
+            writer: Some(TrackedWriter(Arc::clone(&closed))),
+            document: Document::new(Format::WebVtt),
+            spelling: "sub.vtt".to_string(),
+        };
+        output.finish().expect("finish renders and closes");
+        assert!(
+            closed.load(Ordering::SeqCst),
+            "the writer is dropped as soon as the document is written, not held \
+             until the sink itself is torn down"
+        );
+        // A second finish finds no writer left and does nothing, rather than
+        // touching a handle that is already gone.
+        output.finish().expect("a second finish is a no-op");
     }
 }
 
