@@ -115,16 +115,14 @@ __all__ = [
     "version_key",
 ]
 
-# The hosted registry's project. The storage base serves the detail
-# documents; the API base serves the search function, the archive-signing
-# endpoint and the private detail endpoint; the anon key is public by
-# design -- it identifies the project and authorizes nothing the row
-# policies do not already allow.
-_PROJECT_REF = "oanxpjiidhkijziqdhuv"
-DEFAULT_REGISTRY = (
-    f"https://{_PROJECT_REF}.supabase.co/storage/v1/object/public/packages"
-)
-DEFAULT_API = f"https://{_PROJECT_REF}.supabase.co"
+# The hosted registry. The storage base serves the detail documents; the
+# API base serves the search function, the archive-signing endpoint and
+# the private detail endpoint; the anon key is public by design -- it
+# identifies the project and authorizes nothing the row policies do not
+# already allow.
+_API_HOST = "https://api.ffrwd.video"
+DEFAULT_REGISTRY = f"{_API_HOST}/storage/v1/object/public/packages"
+DEFAULT_API = _API_HOST
 ANON_KEY = (
     "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9h"
     "bnhwamlpZGhraWp6aXFkaHV2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODc5MTk0NzYsImV4"
