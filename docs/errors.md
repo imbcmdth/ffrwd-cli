@@ -245,9 +245,9 @@ ffrwd validate --json ffrwd.examples.abr-ladder
 
 ## STREAM_NOT_FOUND
 
-**Meaning:** A subscript (`<alias>.video[k]` / `<alias>.audio[k]`, or the recorded bound of a CTE array column) is out of range for the streams actually present. Only reachable against a probed input (local, readable) or against a CTE array column whose length was recorded when it lowered. An explicit subscript against an unprobed input compiles unchecked and lets ffmpeg deliver the bad news at run time instead.
+**Meaning:** A subscript (`<alias>.video[k]` / `<alias>.audio[k]`, or the recorded bound of a CTE array column) is out of range for the streams actually present. Only reachable against a probed input (local, readable) or against a CTE array column whose length was recorded when it lowered. An explicit subscript against an unprobed input compiles unchecked and lets ffmpeg deliver the bad news at run time instead. Also the code for a `COPY` with nothing left to write: no branch kept a row, so every column is a NULL aggregate and the file would be empty.
 
-**Fires when:** the subscript is positive and 1-based but exceeds the probed file's per-type stream count, exceeds a CTE array column's recorded length, or the whole array is empty (splatting `.audio` on a video-only file would select nothing, which is never what was meant).
+**Fires when:** the subscript is positive and 1-based but exceeds the probed file's per-type stream count, exceeds a CTE array column's recorded length, or the whole array is empty (splatting `.audio` on a video-only file would select nothing, which is never what was meant). Or: every branch of the query aggregated over zero rows.
 
 **Example query** (`tests/fixtures/av.mp4` has exactly one video stream):
 
@@ -261,6 +261,28 @@ FROM input('tests/fixtures/av.mp4') a
 ```json
 {"line": 1, "col": 8, "code": "STREAM_NOT_FOUND", "message": "'a.video[2]' does not exist: 'tests/fixtures/av.mp4' has 1 video stream", "hint": "stream subscripts are 1-based: a.video[1] is the first video stream"}
 ```
+
+**Example query** (`described.mkv` carries clip vectors and neither of the two tracks these branches name, so both keep no row):
+
+```sql
+COPY (
+  SELECT concat(VARIADIC array_agg(ffmpeg.trim(f.video[1], start => v.start_t, end => v.end_t)))
+  FROM input('tests/fixtures/described.mkv') f, unnest(f.embeddings) v
+  WHERE v.track = 'sound_vectors'
+  UNION ALL
+  SELECT concat(VARIADIC array_agg(ffmpeg.trim(g.video[1], start => w.start_t, end => w.end_t)))
+  FROM input('tests/fixtures/described.mkv') g, unnest(g.embeddings) w
+  WHERE w.track = 'speech_vectors'
+) TO 'clips.mp4'
+```
+
+**Error JSON:**
+
+```json
+{"line": 4, "col": 9, "code": "STREAM_NOT_FOUND", "message": "this COPY has nothing to write: no row matched WHERE v.track = 'sound_vectors'; WHERE w.track = 'speech_vectors'", "hint": "every selected column aggregates over zero rows, and an empty file is never written; widen the WHERE, or lower the threshold it compares against"}
+```
+
+One branch keeping no row is not this: it contributes no segment and the surviving branches compile as if it were never written ([corpus 134](corpus.md#134-search-two-vector-spaces-at-once)). Nor is a branch that keeps rows for its OTHER columns - an aggregate that gathered nothing beside a column that did is a hole in a file that still gets written, and stays the `UDF_ARG_TYPE` refusal it always was.
 
 ## INPUT_NOT_FOUND
 

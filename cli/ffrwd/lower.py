@@ -2532,6 +2532,23 @@ def _array(stream_type: StreamType, streams: Iterable[_Stream]) -> _Value:
     return _Value(type=stream_type, streams=tuple(streams), is_array=True)
 
 
+def _is_null(value: _Value) -> bool:
+    """True for a single NULL cell: a gap, or an aggregate over no rows."""
+    if value.is_array or not value.streams:
+        return False
+    return value.streams[0].ref == _NULL_STREAM_REF
+
+
+def _writes_nothing(columns: list[_Column]) -> bool:
+    """True when every column of a branch is a NULL cell.
+
+    Only a NULL cell counts. A branch with no columns, or one whose column is
+    an empty array, is a different shape -- a module sink, a rows file --
+    that writes through something other than these columns.
+    """
+    return bool(columns) and all(_is_null(column.value) for column in columns)
+
+
 @dataclass(frozen=True)
 class _Column:
     """One SELECT column of a branch (or of a CTE body): its name and value.
@@ -3338,6 +3355,9 @@ class _Lowerer:
         # (:meth:`_variadic_array`) from doing that work, and any node it
         # creates, a second time.
         self._variadic_array_cache: dict[int, _Value] = {}
+        # The refusals this branch's VARIADIC calls deferred by lowering an
+        # aggregate over no rows to a NULL cell (:meth:`_variadic_array`).
+        self.empty_aggregates: list[FfrwdError] = []
         self.on_warning = on_warning
         self.graph = Graph(input_paths=list(res.input_paths), sources=dict(res.sources))
         self.ctx = _NodeFactory(self.graph)
@@ -5366,22 +5386,65 @@ class _Lowerer:
     def _lower_query(
         self, branches: list[exp.Select], anchor: exp.Expr, *, tags: _TagScope
     ) -> list[_Column]:
+        """Every branch, joined by ``concat`` where there is more than one.
+
+        A branch whose every column is NULL -- one whose ``WHERE`` kept no
+        row, so its aggregates gathered nothing -- contributes no segment and
+        is dropped here, leaving the surviving branches to compile exactly as
+        they would written alone. Under a sink, every branch dropping means
+        the file would be empty, which is a refusal rather than a written
+        file; a CTE body keeps its NULL columns instead, since recording the
+        gaps is what a body is for.
+        """
         if not branches:
             raise _error(ErrorCode.UNSUPPORTED_SQL, "query has no SELECT", anchor)
         self.tags = {}
         self.dispositions = {}
         self.container_tags = {}
         lowered = [self._lower_branch(branch, tags=tags) for branch in branches]
-        if len(lowered) == 1:
+        kept = [
+            (branch, columns)
+            for branch, columns in zip(branches, lowered, strict=True)
+            if not _writes_nothing(columns)
+        ]
+        if not kept:
+            if tags == "sink":
+                raise self._nothing_to_write_error(branches, anchor)
+            return lowered[0]
+        if len(kept) == 1:
             # A single branch keeps its arrays: a CTE body's array column stays
             # an array for `<cte>.<name>` to splat, broadcast over, or subscript.
-            return lowered[0]
+            return kept[0][1]
+        written = [branch for branch, _ in kept]
+        surviving = [columns for _, columns in kept]
         # concat maps one input pad per column, so arrays are flattened to
         # one column per element BEFORE it sees them.
-        flattened = [_flatten(columns) for columns in lowered]
-        self._check_concat_columns(branches, flattened)
-        self._check_concat_signature(branches, lowered, flattened)
+        flattened = [_flatten(columns) for columns in surviving]
+        self._check_concat_columns(written, flattened)
+        self._check_concat_signature(written, surviving, flattened)
         return self._concat(flattened)
+
+    def _nothing_to_write_error(
+        self, branches: list[exp.Select], anchor: exp.Expr
+    ) -> FfrwdError:
+        """No branch kept a row, so this COPY would write an empty file."""
+        filters = [branch.args.get("where") for branch in branches]
+        written = "; ".join(
+            f"WHERE {_sql_text(node.this)}"
+            for node in filters
+            if isinstance(node, exp.Where) and isinstance(node.this, exp.Expr)
+        )
+        matched = f"no row matched {written}" if written else "no branch kept a row"
+        first = next((node for node in filters if isinstance(node, exp.Where)), None)
+        return _error(
+            ErrorCode.STREAM_NOT_FOUND,
+            f"this COPY has nothing to write: {matched}",
+            first,
+            fallback=anchor,
+            hint="every selected column aggregates over zero rows, and an empty "
+            "file is never written; widen the WHERE, or lower the threshold it "
+            "compares against",
+        )
 
     def _check_concat_columns(
         self, branches: list[exp.Select], flattened: list[list[_Column]]
@@ -5489,6 +5552,7 @@ class _Lowerer:
     # -- one SELECT branch ------------------------------------------------
 
     def _lower_branch(self, select: exp.Select, *, tags: _TagScope) -> list[_Column]:
+        self.empty_aggregates = []
         env = self._scope(select)
         env.grouped = is_grouped(select)
         env.group_keys = _partition_keys(select, env)
@@ -5600,6 +5664,11 @@ class _Lowerer:
                 hint="metadata rides on the file the query writes; select its "
                 "tracks too, e.g. SELECT t, STRUCT('Main' AS title) AS tags",
             )
+        if self.empty_aggregates and not _writes_nothing(columns):
+            # Some columns of this branch still write, so the ones whose
+            # aggregate gathered nothing are a hole rather than an empty
+            # branch: the refusal deferred in `_variadic_array` stands.
+            raise self.empty_aggregates[0]
         if tags == "sink":
             self._check_one_row_per_file(select, env)
         return columns
@@ -9656,6 +9725,11 @@ class _Lowerer:
         vid.v IS NOT NULL)`` on the same column is the explicit spelling of
         the same thing -- parser admits only that predicate, and lowering
         never distinguishes it from the bare form.
+
+        An aggregate that gathers NOTHING -- a branch whose ``WHERE`` kept no
+        row, or a join every one of whose cells is a gap -- is NULL, as in
+        Postgres, rather than a zero-length array. A NULL column is one
+        ``COPY`` does not write (:meth:`_lower_query`).
         """
         inner = node.this
         if not isinstance(inner, exp.Expr):
@@ -9674,13 +9748,14 @@ class _Lowerer:
                 fallback=select,
                 hint=_ARRAY_AGG_HINT,
             )
-        rendition = self._rendition_array_agg(inner, env, select)
-        if rendition is not None:
-            return rendition
-        cte = self._cte_array_agg(inner, env, select)
-        if cte is not None:
-            return cte
-        return self._lower_rendition_agg_expr(inner, env, select)
+        gathered = self._rendition_array_agg(inner, env, select)
+        if gathered is None:
+            gathered = self._cte_array_agg(inner, env, select)
+        if gathered is None:
+            gathered = self._lower_rendition_agg_expr(inner, env, select)
+        if gathered.is_array and not gathered.streams:
+            return _scalar(_Stream(ref=_NULL_STREAM_REF, type=gathered.type))
+        return gathered
 
     def _cte_array_agg(
         self, inner: exp.Expr, env: _Env, select: exp.Select
@@ -13634,6 +13709,14 @@ class _Lowerer:
         this is the one place that says so), and the streams themselves,
         already lowered.
 
+        Gathering nothing is the one shape that is not a refusal outright:
+        with no positional stream ahead of it the call has nothing to run on
+        and nothing to write, so it lowers to a NULL cell. The refusal it
+        stands in for is recorded rather than dropped -- a branch that ends up
+        writing its OTHER columns raises it after all (:meth:`_lower_branch`),
+        since only a branch that is NULL throughout has nothing to write.
+        Positional streams ahead of the array keep the empty refusal outright.
+
         Cached by the array expression's identity: the classifier
         (:meth:`_classify`) needs this same array's element type to answer a
         nested `concat`'s kind, ahead of the call's own lowering reaching
@@ -13646,8 +13729,20 @@ class _Lowerer:
         if cached is not None:
             return cached
         value = self._lower_expr(variadic, env, select)
-        self._variadic_array_cache[id(variadic)] = value
-        if not value.is_array:
+        if _is_null(value) or (value.is_array and not value.streams):
+            empty = _error(
+                ErrorCode.UDF_ARG_TYPE,
+                f"{call.display}() has no inputs: {_sql_text(variadic)} is empty",
+                variadic,
+                fallback=node,
+                hint="VARIADIC spreads the array as the call's argument list; "
+                "an empty array leaves the filter nothing to run on",
+            )
+            if call.args:
+                raise empty
+            self.empty_aggregates.append(empty)
+            value = _scalar(_Stream(ref=_NULL_STREAM_REF, type=value.type))
+        elif not value.is_array:
             raise _error(
                 ErrorCode.UDF_ARG_TYPE,
                 f"VARIADIC needs an array: {_sql_text(variadic)} is a single "
@@ -13656,15 +13751,7 @@ class _Lowerer:
                 fallback=node,
                 hint="drop VARIADIC to pass it as one ordinary stream argument",
             )
-        if not value.streams:
-            raise _error(
-                ErrorCode.UDF_ARG_TYPE,
-                f"{call.display}() has no inputs: {_sql_text(variadic)} is empty",
-                variadic,
-                fallback=node,
-                hint="VARIADIC spreads the array as the call's argument list; "
-                "an empty array leaves the filter nothing to run on",
-            )
+        self._variadic_array_cache[id(variadic)] = value
         return value
 
     def _lower_variadic_n_input_call(
@@ -13708,6 +13795,8 @@ class _Lowerer:
                 fallback=node,
                 hint=_N_INPUT_HINT,
             )
+        if _is_null(array_value):
+            return array_value  # the aggregate gathered nothing: a NULL cell
         prefix = [self._lower_expr(arg, env, select).at(0) for arg in call.args]
         streams = prefix + list(array_value.streams)
         count = len(streams)
@@ -13805,6 +13894,8 @@ class _Lowerer:
                 fallback=select,
                 hint=_CONCAT_VARIADIC_HINT,
             )
+        if _is_null(array_value):
+            return array_value  # the aggregate gathered nothing: a NULL cell
         prefix = [self._lower_expr(arg, env, select).at(0) for arg in call.args]
         streams = prefix + list(array_value.streams)
         count = len(streams)

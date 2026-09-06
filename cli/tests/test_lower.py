@@ -1440,6 +1440,124 @@ def test_concat_nests_directly_as_another_calls_argument() -> None:
 
 
 # ---------------------------------------------------------------------------
+# an aggregate over no rows: NULL, and the branch it stands in
+# ---------------------------------------------------------------------------
+
+# One clip per series row, gathered -- the search recipe's shape with the
+# aggregate spelled `amix`, which the snapshot registry answers for (concat's
+# pad count needs a live ffmpeg, so that spelling is the corpus's).
+_SEARCH_BRANCH = (
+    "SELECT amix(VARIADIC array_agg("
+    "ffmpeg.atrim({alias}.audio[1], start => {row}.{row}, end => {row}.{row} + 1))) "
+    "FROM input('x.mp4') {alias}, generate_series(1, 3) {row} WHERE {row}.{row} {bound}"
+)
+_KEEPS_TWO = "<= 2"
+_KEEPS_NONE = ">= 9"
+
+
+def _search(*bounds: str) -> str:
+    """One branch per bound, UNION ALL'd, each over its own series rows."""
+    names = (("f", "i"), ("g", "j"))
+    branches = [
+        _SEARCH_BRANCH.format(alias=alias, row=row, bound=bound)
+        for (alias, row), bound in zip(names, bounds, strict=False)
+    ]
+    return "COPY (" + " UNION ALL ".join(branches) + ") TO 'o.mka'"
+
+
+def test_an_aggregate_over_no_rows_is_null() -> None:
+    """Postgres's own answer, and a NULL column is one COPY does not write:
+    the bare aggregate reaches the empty-file refusal rather than lowering to
+    a zero-length array some filter is then handed."""
+    err = _reject(
+        "COPY (SELECT array_agg(ffmpeg.atrim(f.audio[1], start => i.i, end => i.i + 1)) "
+        "FROM input('x.mp4') f, generate_series(1, 3) i WHERE i.i >= 9) TO 'o.mka'"
+    )
+    assert err.code is ErrorCode.STREAM_NOT_FOUND
+    assert err.message == (
+        "this COPY has nothing to write: no row matched WHERE i.i >= 9"
+    )
+
+
+def test_a_variadic_call_over_an_empty_aggregate_is_a_null_cell() -> None:
+    """The call itself is not refused for having no inputs -- it stands for a
+    NULL cell, which is what lets the branch drop. The only branch here is
+    that one, so what surfaces is the empty-file refusal, not `has no
+    inputs`."""
+    err = _reject(_search(_KEEPS_NONE))
+    assert err.code is ErrorCode.STREAM_NOT_FOUND
+    assert "nothing to write" in err.message
+
+
+def test_a_union_all_branch_that_kept_no_row_lowers_to_the_other() -> None:
+    """An empty branch contributes no segment: no `concat` joins the branches,
+    and the graph is the surviving branch's, node for node."""
+    dropped = _lower(_search(_KEEPS_TWO, _KEEPS_NONE))
+    alone = _lower(_search(_KEEPS_TWO))
+    assert _filters(dropped) == _filters(alone) == ["atrim", "atrim", "amix"]
+    assert dropped.nodes == alone.nodes
+    assert dropped.outputs == alone.outputs
+
+
+def test_the_surviving_branch_may_be_the_second_one() -> None:
+    """Order is nothing to do with it: the kept branch keeps its own reading
+    whichever side of the UNION ALL it was written on."""
+    dropped = _lower(_search(_KEEPS_NONE, _KEEPS_TWO))
+    assert _filters(dropped) == ["atrim", "atrim", "amix"]
+    assert dropped.nodes["n3"].args == {"inputs": 2}
+
+
+def test_every_branch_keeping_no_row_is_refused_by_name() -> None:
+    """Nothing to write, so nothing is written: the refusal names each
+    branch's own WHERE and says what to widen."""
+    err = _reject(_search(_KEEPS_NONE, _KEEPS_NONE))
+    assert err.code is ErrorCode.STREAM_NOT_FOUND
+    assert err.message == (
+        "this COPY has nothing to write: no row matched WHERE i.i >= 9; "
+        "WHERE j.j >= 9"
+    )
+    assert err.hint == (
+        "every selected column aggregates over zero rows, and an empty file is "
+        "never written; widen the WHERE, or lower the threshold it compares "
+        "against"
+    )
+
+
+def test_a_variadic_argument_that_is_not_an_array_is_still_refused() -> None:
+    err = _reject(
+        "COPY (SELECT amix(VARIADIC f.audio[1]) FROM input('x.mp4') f) TO 'o.mka'"
+    )
+    assert err.code is ErrorCode.UDF_ARG_TYPE
+    assert err.message == "VARIADIC needs an array: f.audio[1] is a single audio stream"
+
+
+def test_an_empty_aggregate_behind_a_positional_stream_is_still_refused() -> None:
+    """A call with a stream of its own still has something to run on, so the
+    empty array is a hole in its argument list rather than a NULL column."""
+    err = _reject(
+        "COPY (SELECT amix(f.audio[1], VARIADIC array_agg("
+        "ffmpeg.atrim(f.audio[1], start => i.i, end => i.i + 1))) "
+        "FROM input('x.mp4') f, generate_series(1, 3) i WHERE i.i >= 9) TO 'o.mka'"
+    )
+    assert err.code is ErrorCode.UDF_ARG_TYPE
+    assert "amix() has no inputs" in err.message
+    assert "an empty array leaves the filter nothing to run on" in (err.hint or "")
+
+
+def test_an_empty_aggregate_beside_a_column_that_writes_is_still_refused() -> None:
+    """Only a branch that is NULL THROUGHOUT has nothing to write. This one
+    still writes its second column, so the aggregate that gathered nothing is
+    a hole in the file, and the refusal it deferred stands."""
+    err = _reject(
+        "COPY (SELECT amix(VARIADIC array_agg("
+        "ffmpeg.atrim(f.audio[1], start => i.i, end => i.i + 1))), f.audio[1] "
+        "FROM input('x.mp4') f, generate_series(1, 3) i WHERE i.i >= 9) TO 'o.mka'"
+    )
+    assert err.code is ErrorCode.UDF_ARG_TYPE
+    assert "amix() has no inputs" in err.message
+
+
+# ---------------------------------------------------------------------------
 # open-ended input windows: >= / <=, either operand order, merging
 # ---------------------------------------------------------------------------
 

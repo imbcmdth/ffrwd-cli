@@ -2732,3 +2732,53 @@ row carrying no `start_t`/`end_t` - a module's trailing summary record - rides
 through untouched. Merging rows a rows function is about to read is refused
 instead: that function reads every row the module produced, so merge what it
 returns.
+
+## 134. Search two vector spaces at once
+
+A vector only means anything against the embedder that wrote it, so a search
+over a file described by two of them is one branch per track, `UNION ALL`'d,
+each narrowed to its own rows before the comparison that ranks them - one
+`WHERE` mixing both would compare every row against both prompts, including
+rows of a width the other embedder never wrote. A branch whose `WHERE` keeps
+no row aggregates over nothing, and `array_agg` over zero rows is NULL, as
+in Postgres; a NULL column is one `COPY` does not write, so that branch
+contributes no segment and the command is the surviving branch's alone.
+`described.mkv` carries clip vectors and no sound vectors, so the second
+branch here drops out entirely:
+
+```pgsql
+COPY (
+  SELECT concat(VARIADIC array_agg(ffmpeg.trim(f.video[1], start => v.start_t, end => v.end_t))),
+         concat(VARIADIC array_agg(ffmpeg.atrim(f.audio[1], start => v.start_t, end => v.end_t)))
+  FROM input('tests/fixtures/described.mkv') f, unnest(f.embeddings) v
+  WHERE v.track = 'clip_vectors'
+  UNION ALL
+  SELECT concat(VARIADIC array_agg(ffmpeg.trim(g.video[1], start => w.start_t, end => w.end_t))),
+         concat(VARIADIC array_agg(ffmpeg.atrim(g.audio[1], start => w.start_t, end => w.end_t)))
+  FROM input('tests/fixtures/described.mkv') g, unnest(g.embeddings) w
+  WHERE w.track = 'sound_vectors'
+) TO 'clips.mp4'
+```
+
+```
+$ ffrwd compile -f query.sql
+ffmpeg -i tests/fixtures/described.mkv -filter_complex \
+  '[0:v:0]split=3[src_f_v_0_split0][src_f_v_0_split1][src_f_v_0_split2];'\
+'[src_f_v_0_split0]trim=start=0.0:end=1.5[n1];'\
+'[src_f_v_0_split1]trim=start=1.5:end=3.0[n2];'\
+'[src_f_v_0_split2]trim=start=3.0:end=4.0[n3];[n1]setpts=PTS-STARTPTS[n1_pts];'\
+'[n2]setpts=PTS-STARTPTS[n2_pts];[n3]setpts=PTS-STARTPTS[n3_pts];'\
+'[n1_pts][n2_pts][n3_pts]concat=n=3:v=1:a=0[out0];'\
+'[0:a:0]asplit=3[src_f_a_0_split0][src_f_a_0_split1][src_f_a_0_split2];'\
+'[src_f_a_0_split0]atrim=start=0.0:end=1.5[n5];'\
+'[src_f_a_0_split1]atrim=start=1.5:end=3.0[n6];'\
+'[src_f_a_0_split2]atrim=start=3.0:end=4.0[n7];[n5]asetpts=PTS-STARTPTS[n5_pts];'\
+'[n6]asetpts=PTS-STARTPTS[n6_pts];[n7]asetpts=PTS-STARTPTS[n7_pts];'\
+'[n5_pts][n6_pts][n7_pts]concat=n=3:v=0:a=1[out1]' -map '[out0]' -map '[out1]' clips.mp4
+```
+
+Reach for this to search everything a file was described with in one query,
+however many spaces did the describing: add a branch per track and let the
+ones that match nothing fall away. Every branch matching nothing is the
+other case - there is no file to write, and the compile refuses by name
+rather than writing an empty one.
