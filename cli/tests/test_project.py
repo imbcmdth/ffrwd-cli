@@ -20,6 +20,7 @@ import json
 import re
 import shutil
 import subprocess
+import sys
 import tarfile
 from collections.abc import Callable
 from pathlib import Path
@@ -1636,6 +1637,30 @@ def test_packing_a_tree_holding_a_link_is_refused(tmp_path: Path) -> None:
     with pytest.raises(FfrwdError) as caught:
         store.pack(source)
     assert "regular files and directories only" in caught.value.message
+
+
+def test_the_store_stages_with_mkdir_so_an_entry_keeps_its_parents_permissions(
+    store_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """mkdtemp writes its own access list on Windows; a plain mkdir inherits."""
+
+    def never(*args: object, **kwargs: object) -> str:
+        raise AssertionError("the store staged through tempfile.mkdtemp")
+
+    monkeypatch.setattr(store.tempfile, "mkdtemp", never)
+    archive, sha256 = _one_member("ffrwd.json")
+    stored = store.unpack("tracks/lib", archive, sha256)
+    assert stored.is_dir()
+    assert [path.name for path in stored.parent.iterdir()] == [stored.name]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="an access list is a Windows fact")
+def test_on_windows_a_stored_entry_inherits_its_access_list(store_home: Path) -> None:
+    archive, sha256 = _one_member("ffrwd.json")
+    stored = store.unpack("tracks/lib", archive, sha256)
+    listed = subprocess.run(["icacls", str(stored)], capture_output=True, text=True).stdout
+    entries = [line for line in listed.splitlines() if ":(" in line]
+    assert entries and all(":(I)" in entry for entry in entries), listed
 
 
 def test_a_verified_archive_unpacks_into_the_store(store_home: Path, tmp_path: Path) -> None:

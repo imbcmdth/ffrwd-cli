@@ -45,6 +45,7 @@ import hashlib
 import io
 import os
 import re
+import secrets
 import shutil
 import tarfile
 import tempfile
@@ -485,6 +486,24 @@ def _extract(package: str, archive: bytes, destination: Path) -> None:
                 shutil.copyfileobj(content, handle)
 
 
+def _staging_dir(parent: Path, prefix: str) -> Path:
+    """A fresh directory under `parent`, holding the parent's own permissions.
+
+    A plain mkdir rather than ``tempfile.mkdtemp``: on Windows mkdtemp writes
+    its own access list, and one made from an elevated shell is owned by the
+    Administrators group alone, so the user who ran the install cannot read
+    the entry afterwards.
+    """
+    for _ in range(100):
+        candidate = parent / f"{prefix}{secrets.token_hex(4)}"
+        try:
+            candidate.mkdir()
+        except FileExistsError:
+            continue
+        return candidate
+    raise FileExistsError(f"no free staging name under {parent}")
+
+
 def unpack(package: str, archive: bytes, sha256: str) -> Path:
     """Verify `archive` against `sha256`, then write what it holds into the store.
 
@@ -509,7 +528,7 @@ def unpack(package: str, archive: bytes, sha256: str) -> Path:
         return destination
     try:
         destination.parent.mkdir(parents=True, exist_ok=True)
-        staging = Path(tempfile.mkdtemp(dir=destination.parent, prefix=f"{sha256[:16]}-"))
+        staging = _staging_dir(destination.parent, f"{sha256[:16]}-")
     except OSError as err:
         raise _reject(
             f"package '{package}': the store could not be written: {err.strerror or err}",
