@@ -1330,3 +1330,64 @@ def test_a_rows_edge_is_taken_whole_while_its_consumer_is_still_opening(
     assert flow.moved == len(whole), "the spool was not counted as it filled"
     assert b"".join(dest.stream.writes) == whole
     assert not flow.opening and not flow.writing
+
+
+# ------------------------------------------------- ending a tree, off Windows
+
+
+def test_a_child_in_this_processs_own_group_is_ended_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Off Windows, `_end_tree` signals a child's group -- never the group this
+    process shares with its shell, which a child spawned without a session of
+    its own still belongs to."""
+    monkeypatch.setattr(_EXECUTE.sys, "platform", "linux")
+    signalled: list[int] = []
+    monkeypatch.setattr(_EXECUTE.os, "getpgid", lambda pid: 4242, raising=False)
+    monkeypatch.setattr(
+        _EXECUTE.os, "killpg", lambda group, sig: signalled.append(group), raising=False
+    )
+
+    class _Child:
+        pid = 99
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+    child = _Child()
+    _EXECUTE._end_tree(cast(Any, child))
+
+    assert signalled == []
+    assert child.terminated
+
+
+def test_a_child_in_a_session_of_its_own_has_its_group_ended(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(_EXECUTE.sys, "platform", "linux")
+    signalled: list[int] = []
+    monkeypatch.setattr(
+        _EXECUTE.os, "getpgid", lambda pid: 7 if pid == 99 else 4242, raising=False
+    )
+    monkeypatch.setattr(
+        _EXECUTE.os, "killpg", lambda group, sig: signalled.append(group), raising=False
+    )
+
+    class _Child:
+        pid = 99
+
+        def terminate(self) -> None:
+            pass
+
+    _EXECUTE._end_tree(cast(Any, _Child()))
+
+    assert signalled == [7]
+
+
+def test_a_watched_command_runs_in_a_session_of_its_own_off_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(_EXECUTE.sys, "platform", "linux")
+    assert _EXECUTE._own_session() is True
+    monkeypatch.setattr(_EXECUTE.sys, "platform", "win32")
+    assert _EXECUTE._own_session() is False

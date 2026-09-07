@@ -419,7 +419,9 @@ def _run_watched(
     back is everything else on that stream, which is the log a failure is
     reported with.
     """
-    proc = subprocess.Popen(argv, stdout=stdout, stderr=subprocess.PIPE, bufsize=0)
+    proc = subprocess.Popen(
+        argv, stdout=stdout, stderr=subprocess.PIPE, bufsize=0, start_new_session=_own_session()
+    )
     log: list[bytes] = []
     reading = _start(_drain_work, _stream(proc.stderr), log, work)
 
@@ -460,8 +462,12 @@ def _run_with_player(
 ) -> tuple[int, str]:
     """One ffmpeg command whose stdout an ffplay window is reading."""
     stderr = subprocess.PIPE if capture else None
-    watching = subprocess.Popen(player, stdin=subprocess.PIPE, bufsize=0)
-    ffmpeg = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=stderr, bufsize=0)
+    watching = subprocess.Popen(
+        player, stdin=subprocess.PIPE, bufsize=0, start_new_session=_own_session()
+    )
+    ffmpeg = subprocess.Popen(
+        argv, stdout=subprocess.PIPE, stderr=stderr, bufsize=0, start_new_session=_own_session()
+    )
     # Not communicate(): it would close the stdout this thread is reading.
     forward = threading.Thread(
         target=_forward, args=(ffmpeg.stdout, watching.stdin), daemon=True
@@ -1805,6 +1811,15 @@ def _spawn(
     )
 
 
+def _own_session() -> bool:
+    """Whether a child is put in a session of its own: off Windows, always.
+
+    What lets :func:`_end_tree` signal the child's whole group without
+    signalling this process and its shell, which share the inherited group.
+    """
+    return sys.platform != "win32"
+
+
 def _end_tree(proc: subprocess.Popen[bytes]) -> None:
     """End `proc` AND anything it started.
 
@@ -1823,7 +1838,11 @@ def _end_tree(proc: subprocess.Popen[bytes]) -> None:
             )
     else:
         with contextlib.suppress(OSError):
-            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            group = os.getpgid(proc.pid)
+            # A child sharing this process's group is ended alone: signalling
+            # the group would end this process and its shell with it.
+            if group != os.getpgid(0):
+                os.killpg(group, signal.SIGTERM)
     with contextlib.suppress(OSError):
         proc.terminate()
 
