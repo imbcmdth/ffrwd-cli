@@ -1616,7 +1616,9 @@ NOT_REPAIRABLE: frozenset[ErrorCode] = frozenset(
         ErrorCode.BUFFER_OVERFLOW,
         ErrorCode.INPUT_NEVER_OPENED,
         ErrorCode.NOTHING_TO_SHOW,
+        ErrorCode.OUTPUT_EXISTS,
         ErrorCode.PLAYER_NOT_FOUND,
+        ErrorCode.RUNTIME_NOT_FOUND,
         ErrorCode.UNKNOWN_RECIPE,
     }
 )

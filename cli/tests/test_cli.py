@@ -22,6 +22,7 @@ import pytest
 
 from ffrwd import cli, show
 from ffrwd.compiler import Compiled
+from ffrwd.errors import ErrorCode
 from ffrwd.execute import PlanResult
 from ffrwd.ir import Graph, Node, Output, RowsSink, SinkUnit
 from ffrwd.processes import (
@@ -1269,6 +1270,104 @@ def test_a_muxer_name_pattern_checks_its_literal_ancestor(tmp_path: Path) -> Non
     assert cli._check_output_dir(str(dest)) is None
     missing = tmp_path / "no-such-dir" / "%v" / "index.m3u8"
     assert cli._check_output_dir(str(missing)) is not None
+
+
+def test_a_destination_already_there_is_a_typed_refusal(tmp_path: Path) -> None:
+    """The refusal `-n` cannot make: ffmpeg prints its own and exits 0, so the
+    run has to say it before anything is spawned."""
+    dest = tmp_path / "out.mp4"
+    dest.write_bytes(b"")
+
+    err = cli._check_output_exists(str(dest))
+
+    assert err is not None
+    assert err.code is ErrorCode.OUTPUT_EXISTS
+    assert err.message == f"output '{dest}' already exists"
+    assert err.hint == "pass -y to overwrite it"
+
+
+@pytest.mark.parametrize(
+    "destination",
+    [
+        "udp://127.0.0.1:12399?pkt_size=1316",
+        "pipe:1",
+        "no-such-dir/out.mp4",
+        ".",
+    ],
+    ids=["url", "pipe", "missing", "directory"],
+)
+def test_a_destination_that_is_no_existing_file_is_not_refused(destination: str) -> None:
+    """Only a plain file is one anybody would be overwriting: a protocol URL
+    is ffmpeg's, a `pipe:` is the plan's wiring, and a directory (as a device
+    node or a fifo would be) is not a file at all."""
+    assert cli._check_output_exists(destination) is None
+
+
+def test_run_refuses_an_existing_destination_before_it_looks_for_ffmpeg(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    dest = tmp_path / "out.mp4"
+    dest.write_bytes(b"")
+
+    def _boom() -> str | None:
+        raise AssertionError("nothing runs for a destination already there")
+
+    monkeypatch.setattr(cli.binaries, "ffmpeg_path", _boom)
+    code = cli.main(["run", f"COPY ({VALID_QUERY}) TO :'dest'", "-v", f"dest={dest}"])
+
+    captured = capsys.readouterr()
+    assert code == 1
+    assert captured.err == (
+        f"error: OUTPUT_EXISTS: output '{dest}' already exists "
+        "(hint: pass -y to overwrite it)\n"
+    )
+
+
+def test_run_with_y_writes_over_a_destination_already_there(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """-y is the answer the hint names: the run gets as far as ffmpeg itself."""
+    dest = tmp_path / "out.mp4"
+    dest.write_bytes(b"")
+    monkeypatch.setattr(cli.binaries, "ffmpeg_path", lambda: None)
+
+    code = cli.main(
+        ["run", "-y", f"COPY ({VALID_QUERY}) TO :'dest'", "-v", f"dest={dest}"]
+    )
+
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "OUTPUT_EXISTS" not in captured.err
+    assert "not found" in captured.err
+
+
+def test_run_checks_every_destination_a_query_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A fan-out writes one file per row, so each destination is checked -- and
+    the "://" one among them is not a file to check at all."""
+    dest = tmp_path / "720.mp4"
+    dest.write_bytes(b"")
+
+    def _boom() -> str | None:
+        raise AssertionError("nothing runs for a destination already there")
+
+    monkeypatch.setattr(
+        cli,
+        "compile_all",
+        lambda text, **kw: Compiled(
+            [_multi_sink_graph(("udp://127.0.0.1:12399", {}), (str(dest), {}))]
+        ),
+    )
+    monkeypatch.setattr(cli.binaries, "ffmpeg_path", _boom)
+    code = cli.main(["run", SINKED_QUERY])
+
+    captured = capsys.readouterr()
+    assert code == 1
+    assert captured.err == (
+        f"error: OUTPUT_EXISTS: output '{dest}' already exists "
+        "(hint: pass -y to overwrite it)\n"
+    )
 
 
 def test_version_flag_prints_the_tool_version(capsys: pytest.CaptureFixture[str]) -> None:

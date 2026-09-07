@@ -26,6 +26,9 @@ from ffrwd.execute import (
     STDIN,
     STDOUT,
     Flow,
+    ProcessResult,
+    _attribute,
+    _broken_pipe,
     _cpu_seconds,
     _End,
     _Member,
@@ -820,6 +823,153 @@ def test_the_cpu_a_running_child_has_used_is_readable() -> None:
     if used is None:
         pytest.skip("this platform does not report a process's CPU time")
     assert used > 0.0
+
+
+# -------------------------------------------------- cause before consequence
+
+
+class _Exits:
+    """A stand-in for a member's process: running for `after` polls, then gone."""
+
+    def __init__(self, code: int, after: int = 0) -> None:
+        self.code = code
+        self.left = after
+
+    def poll(self) -> int | None:
+        if self.left > 0:
+            self.left -= 1
+            return None
+        return self.code
+
+
+def _ended(
+    id_: str, code: int, *, stderr: str = "", terminated: bool = False
+) -> ProcessResult:
+    return ProcessResult(
+        id=id_, argv=["ffmpeg"], exit_code=code, stderr=stderr, terminated=terminated
+    )
+
+
+def test_a_member_that_ends_while_a_producer_still_writes_ends_the_stage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The muxer that stops early: a 0, and the end of the run all the same.
+
+    The exit times are recorded either way, so the report can tell the member
+    that went first from the ones its closing pipes took with it.
+    """
+    monkeypatch.setattr(_EXECUTE, "_CASCADE", _STALL)
+    members = _stage(_Exits(0), _Exits(0, after=10_000))
+
+    ended, timed_out, wedge = _watch(
+        members,
+        deadline=time.monotonic() + 200 * _STALL,
+        stall=None,
+        feeds=[("p1", "p0")],
+    )
+
+    assert ended == "p0"
+    assert not timed_out
+    assert wedge is None
+    assert members[0].ended_at is not None
+    assert members[1].ended_at is None, "the member still running has no exit time"
+
+
+def test_a_producer_ending_before_its_consumer_is_a_normal_finish() -> None:
+    """The shape every healthy stage has: nothing here ended anything."""
+    members = _stage(_Exits(0), _Exits(0, after=3))
+
+    ended, timed_out, wedge = _watch(
+        members,
+        deadline=time.monotonic() + 200 * _STALL,
+        stall=None,
+        feeds=[("p0", "p1")],
+    )
+
+    assert (ended, timed_out, wedge) == (None, False, None)
+    assert all(member.ended_at is not None for member in members)
+
+
+def test_the_member_that_went_first_is_the_cause_and_the_broken_pipes_follow() -> None:
+    """The measured shape: a muxer exits 0 over a file it will not overwrite,
+    and everything upstream dies writing into the pipe it just closed."""
+    results = [
+        _ended("ffmpeg0", 0, stderr="File 'out.mp4' already exists. Exiting."),
+        _ended("ffmpeg1", 224, stderr="Error submitting a packet to the muxer: Broken pipe"),
+        _ended("sidecar0", 224),
+    ]
+
+    cause, consequences = _attribute(
+        results,
+        {"ffmpeg0": 1.0, "ffmpeg1": 1.4, "sidecar0": 1.5},
+        [("ffmpeg1", "ffmpeg0"), ("sidecar0", "ffmpeg1")],
+    )
+
+    assert cause is results[0]
+    assert [result.id for result in consequences] == ["ffmpeg1", "sidecar0"]
+
+
+def test_two_exits_inside_one_poll_still_read_cause_before_consequence() -> None:
+    """A stage small enough to collapse between two polls has one exit time
+    for both members; a broken pipe is never why a pipe closed, so it loses."""
+    results = [
+        _ended("ffmpeg1", 224, stderr="Error muxing a packet: Broken pipe"),
+        _ended("ffmpeg0", 0, stderr="File 'out.mp4' already exists. Exiting."),
+    ]
+
+    cause, consequences = _attribute(
+        results, {"ffmpeg1": 3.0, "ffmpeg0": 3.0}, [("ffmpeg1", "ffmpeg0")]
+    )
+
+    assert cause is results[1]
+    assert [result.id for result in consequences] == ["ffmpeg1"]
+
+
+def test_a_producer_that_had_finished_is_not_blamed_for_what_came_after() -> None:
+    """It ended first, but in its turn: the consumer's own failure is the cause."""
+    results = [_ended("ffmpeg1", 0), _ended("ffmpeg0", 1)]
+
+    cause, consequences = _attribute(
+        results, {"ffmpeg1": 1.0, "ffmpeg0": 2.0}, [("ffmpeg1", "ffmpeg0")]
+    )
+
+    assert cause is results[1]
+    assert consequences == []
+
+
+@pytest.mark.parametrize(
+    ("results", "ended", "why"),
+    [
+        (
+            [_ended("ffmpeg1", 0), _ended("ffmpeg0", 0)],
+            {"ffmpeg1": 1.0, "ffmpeg0": 2.0},
+            "every member exited 0, each after the one feeding it",
+        ),
+        (
+            [
+                _ended("ffmpeg1", 224, terminated=True),
+                _ended("ffmpeg0", 1, terminated=True),
+            ],
+            {},
+            "every member was told to stop, so none of them ended anything",
+        ),
+    ],
+    ids=["finished", "stopped"],
+)
+def test_a_stage_with_nothing_to_blame_names_nobody(
+    results: list[ProcessResult], ended: dict[str, float], why: str
+) -> None:
+    assert _attribute(results, ended, [("ffmpeg1", "ffmpeg0")]) == (None, []), why
+
+
+def test_a_broken_pipe_is_read_off_the_code_or_off_what_ffmpeg_said() -> None:
+    """224 is how POSIX spells ffmpeg's EPIPE and 0xffffffe0 how Windows does;
+    a member that spells it neither way still said what happened."""
+    assert _broken_pipe(_ended("a", 224))
+    assert _broken_pipe(_ended("b", 0xFFFFFFE0))
+    assert _broken_pipe(_ended("c", 1, stderr="av_write_frame(): Broken pipe"))
+    assert not _broken_pipe(_ended("d", 1, stderr="Invalid data found"))
+    assert not _broken_pipe(_ended("e", 224, terminated=True))
 
 
 # ---------------------------------------------------------------- the copy

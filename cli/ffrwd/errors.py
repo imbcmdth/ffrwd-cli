@@ -31,8 +31,10 @@ class ErrorCode(str, Enum):
     FILTER_OPTION_TYPE = "FILTER_OPTION_TYPE"  # value vs introspected type/range/consts
     UNKNOWN_INPUT_OPTION = "UNKNOWN_INPUT_OPTION"  # name not in inputs.INPUT_OPTIONS
     INPUT_OPTION_TYPE = "INPUT_OPTION_TYPE"  # value vs declared str/int/bool/num
+    OUTPUT_EXISTS = "OUTPUT_EXISTS"  # a destination file is already there, and no -y
     NOTHING_TO_SHOW = "NOTHING_TO_SHOW"  # --show/--show-only, no video-bearing output
     PLAYER_NOT_FOUND = "PLAYER_NOT_FOUND"  # --show asked for, ffplay not on PATH
+    RUNTIME_NOT_FOUND = "RUNTIME_NOT_FOUND"  # setup nn: no ONNX Runtime pinned for this platform
     UNBOUNDED_LIVE_INPUT = "UNBOUNDED_LIVE_INPUT"  # one-open input, uncountable paths
     BUFFER_OVERFLOW = "BUFFER_OVERFLOW"  # a run-time edge outgrew its computed bound
     INPUT_NEVER_OPENED = "INPUT_NEVER_OPENED"  # a run-time consumer never opened its end

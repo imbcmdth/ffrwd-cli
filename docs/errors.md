@@ -548,13 +548,29 @@ SELECT p.video[1] FROM input('srt://host/stream', realtime => true) p
 {"line": 1, "col": 30, "code": "INPUT_OPTION_TYPE", "message": "'p' is already live -- realtime => true would pace it a second time", "hint": "drop realtime; a socket is already paced by its own clock"}
 ```
 
+## OUTPUT_EXISTS
+
+**Meaning:** Not a compile rejection. `ffrwd run` was given a query whose destination file is already there, and no `-y`. Checked once the query has compiled and before any process is spawned, for every file the run would write -- a fan-out `TO (<expression>)` writes one per row, and each is checked. A "://" destination is ffmpeg's own protocol, a `pipe:` is the plan's wiring, and a device node or a fifo is not a file anyone would be overwriting: none of the three is checked.
+
+ffmpeg's `-n` stays on the argv behind it, but it is not a report anyone can act on: on an existing file ffmpeg prints its own line and exits **0**, which reads as a success to whatever is running it -- and in a plan, that success closes the pipes feeding the muxer and every process upstream dies of a broken pipe instead.
+
+**Fires when:** the destination file exists and `-y` was not passed. `-y` is the answer, and the hint says so.
+
+This code, like `NOTHING_TO_SHOW` and `PLAYER_NOT_FOUND`, refuses a `run` rather than a query, so `ffrwd prompt` does not list it and the repair loop never sees one: no rewriting of the SQL answers it.
+
+**Error text** (printed to stderr by `ffrwd run`, not as JSON):
+
+```
+error: OUTPUT_EXISTS: output 'angel-one-mosaic.mp4' already exists (hint: pass -y to overwrite it)
+```
+
 ## NOTHING_TO_SHOW
 
 **Meaning:** `ffrwd run --show` or `--show-only` was asked for and the query has no video output file to play. A window shows a `COPY` that writes video; a bare `SELECT`, a `FORMAT csv` COPY, an audio-only output, a subtitle document and a module's rows have nothing to put in one. A query calling a `LANGUAGE wasm` module shows like any other: it runs as several processes, and the one writing the video file is the one the window reads.
 
 **Fires when:** the flag is given for a table query; or for a media query whose every output file is audio-only, subtitles or rows.
 
-This code, `PLAYER_NOT_FOUND` and `UNKNOWN_RECIPE` refuse a `run` flag or a command-line name, not a query, so `ffrwd prompt` lists none of them and the repair loop never sees one.
+This code, `PLAYER_NOT_FOUND`, `RUNTIME_NOT_FOUND` and `UNKNOWN_RECIPE` refuse a `run` flag or a command-line name, not a query, so `ffrwd prompt` lists none of them and the repair loop never sees one.
 
 **Error JSON:**
 
@@ -570,6 +586,18 @@ This code, `PLAYER_NOT_FOUND` and `UNKNOWN_RECIPE` refuse a `run` flag or a comm
 
 ```json
 {"line": 1, "col": 1, "code": "PLAYER_NOT_FOUND", "message": "ffplay not found", "hint": "ffplay ships with ffmpeg but the static-ffmpeg provisioner does not supply it; install a full ffmpeg build and put ffplay on PATH, or drop the flag and let the run write its files"}
+```
+
+## RUNTIME_NOT_FOUND
+
+**Meaning:** `ffrwd setup nn` (or a query reaching a model, provisioning the same tiers on its way) asked for a tier of the ONNX Runtime this machine's platform has no artifacts pinned for -- `--cuda`/`--full` on a platform that pins no such tier, or a sidecar demanding a runtime version this ffrwd carries no table for at all. Never a query problem: the table is keyed on the sidecar's own reported version and platform, not on anything the SQL names.
+
+**Fires when:** a tier passed to `nn.provision()` is absent from the pinned table for this platform, or the sidecar's `--nn-info` names an ONNX Runtime version/platform pair nothing is pinned for.
+
+**Error JSON:**
+
+```json
+{"line": null, "col": null, "code": "RUNTIME_NOT_FOUND", "message": "there is no cuda ONNX Runtime for osx-arm64", "hint": "osx-arm64 has cpu"}
 ```
 
 ## UNBOUNDED_LIVE_INPUT

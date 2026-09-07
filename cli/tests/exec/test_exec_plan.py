@@ -29,7 +29,7 @@ import pytest
 
 from ffrwd.console import Work
 from ffrwd.errors import ErrorCode
-from ffrwd.execute import execute_plan, terminal_member
+from ffrwd.execute import _broken_pipe, execute_plan, terminal_member
 from ffrwd.ir import Graph, Node, Output, RowsSink, SinkUnit, StreamType
 from ffrwd.processes import (
     PIPE,
@@ -320,6 +320,35 @@ def test_a_member_that_dies_takes_the_stage_with_it(tmp_path: Path) -> None:
     members = result.stages[0].members
     assert len(members) == 3
     assert all(member.exit_code != 0 or member.terminated for member in members)
+    assert _live_pipes() == []
+
+
+def test_a_member_that_stops_early_is_named_over_the_pipes_it_broke(
+    tmp_path: Path,
+) -> None:
+    """The measured cascade, from the other end.
+
+    The muxing member is given a destination that is already there and no
+    ``-y``, so ffmpeg says so and exits 0 -- and everything upstream of it
+    dies writing into the pipe it just closed. The run is a failure, the
+    member reported is the one that went first, and the broken pipe is
+    reported under it rather than as a failure of its own.
+    """
+    out_path = tmp_path / "already.mp4"
+    out_path.write_bytes(b"")
+
+    result = execute_plan(_endless(out_path), timeout=_STAGE_TIMEOUT, overwrite=False)
+
+    assert result.exit_code != 0
+    assert not result.timed_out
+    assert result.failure is not None
+    assert result.failure.id == "sink"
+    assert result.failure.exit_code == 0
+    assert "already exists" in result.failure.stderr_tail
+    assert [member.id for member in result.consequences] == ["source"]
+    assert _broken_pipe(result.consequences[0])
+    # And the producer is reported as a consequence, not counted a failure.
+    assert [member.id for member in result.failures] == ["sink"]
     assert _live_pipes() == []
 
 

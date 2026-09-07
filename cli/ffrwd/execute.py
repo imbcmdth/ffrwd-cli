@@ -64,6 +64,17 @@ Members are judged by EXIT CODE only. A raw demuxer logs an error at the
 pipe's EOF and exits 0 anyway, so stderr says nothing about whether a member
 worked; it is captured to be reported, not to be read.
 
+Exit codes alone name the wrong member, though, because losing one member
+takes its pipe neighbours with it. Every member's exit TIME is recorded as
+well, and the one reported (:attr:`StageResult.failure`) is the one that
+ended first while the others were still running -- whatever its code, since
+a member that exits 0 while a producer is still writing to it is exactly the
+member that ended the run. The members that then died writing into a pipe
+nobody was reading are :attr:`StageResult.consequences`, reported as such
+rather than mixed in with the failures. A stage that has lost a member waits
+`_CASCADE` seconds for those to arrive, so a broken pipe is reported as one
+instead of as a member this process stopped.
+
 One failure is not an exit code: a stage whose pipes have all stopped moving
 while every member still runs and one copy still waits on the far end. Where
 that copy waits to WRITE, the buffer the plan sized from a bound
@@ -193,6 +204,12 @@ DEFAULT_STALL = 30.0
 _FILETIME_TICKS = 1e7
 # How long a member that was told to stop is given before it is killed.
 _GRACE = 5.0
+# How long a stage that has lost a member waits for the members around it to
+# end on their own, so their broken pipes are reported rather than stopped.
+_CASCADE = 1.0
+# ffmpeg's EPIPE, which is AVERROR(EPIPE) == -32, as each platform's exit
+# status spells it: POSIX keeps the low byte, Windows the whole word.
+_BROKEN_PIPE = frozenset({224, 0xFFFFFFE0})
 # How long a helper thread is waited for once its process has gone.
 _JOIN = 5.0
 # Bytes moved per copy between a named pipe and a process's stdio.
@@ -685,19 +702,22 @@ class StageResult:
 
     index: int
     members: list[ProcessResult] = field(default_factory=list)
-    # The failing member's exit code, or 1 for a timeout, or 0.
+    # The failing member's exit code, or 1 where there is none to report --
+    # a timeout, or a member that ended the stage by exiting 0 -- or 0.
     exit_code: int = 0
     timed_out: bool = False
-    # The member that ended the stage: the first SEEN to exit nonzero, or the
-    # one still running when the timeout struck. None when every member exited
-    # 0. Which one is seen first is a matter of milliseconds, so a report that
-    # names a single member should say `failures` instead.
+    # The member that ended the stage: the first to end while the others were
+    # still running -- a nonzero exit, or a 0 from a member a producer was
+    # still writing to. None when every member exited 0 in its turn. On a
+    # timeout, the member still running when it struck.
     failure: ProcessResult | None = None
-    # Every member that failed on its own rather than being told to stop --
-    # the whole truth, since one member dying takes its pipe neighbours with
-    # it and nothing distinguishes the cause from the consequence. On a
-    # timeout, the member that was still running.
+    # Every member that failed on its own rather than being told to stop, and
+    # not because the member before it had gone: `failure` first, then any
+    # member that failed independently. On a timeout, the member still running.
     failures: list[ProcessResult] = field(default_factory=list)
+    # The members that ended after `failure` writing into a pipe nobody was
+    # reading -- consequences of it, in the order they were spawned.
+    consequences: list[ProcessResult] = field(default_factory=list)
     # The edge that wedged this stage -- a buffer that filled, or an end its
     # consumer never opened -- when that is what ended it. Set instead of
     # `timed_out`, since the two answer the same question and this one names
@@ -715,6 +735,7 @@ class PlanResult:
     failure: ProcessResult | None = None
     failures: list[ProcessResult] = field(default_factory=list)
     overflow: FfrwdError | None = None
+    consequences: list[ProcessResult] = field(default_factory=list)
 
 
 def wires(plan: ProcessPlan) -> tuple[Wire, ...]:
@@ -1072,6 +1093,7 @@ def execute_plan(
                     result.failure,
                     result.failures,
                     result.overflow,
+                    result.consequences,
                 )
         return PlanResult(stages)
     finally:
@@ -1198,6 +1220,9 @@ class _Member:
     proc: subprocess.Popen[bytes]
     stderr: list[bytes] = field(default_factory=list)
     terminated: bool = False
+    # When the watch first saw this member had exited; None while it runs, and
+    # for one still running when the stage was stopped.
+    ended_at: float | None = None
 
 
 class _End:
@@ -1259,6 +1284,12 @@ def _run_stage(
 
     `terminal` is the member whose progress `work` draws, which is in the last
     stage; every other member, and every stage before it, is untouched.
+
+    :func:`_watch` says WHETHER the stage ended in failure; when it did,
+    :func:`_attribute` says which member is the cause, read off the exit times
+    it recorded rather than off the exit codes. A stage nothing ended -- every
+    member finished, or every one was stopped because the last display window
+    closed -- is asked neither question.
     """
     ids = list(stage.processes)
     inside = set(ids)
@@ -1267,6 +1298,7 @@ def _run_stage(
         for wire in assigned
         if wire.edge.source in inside and wire.edge.target in inside
     ]
+    feeds = [(wire.edge.source, wire.edge.target) for wire in stage_wires]
     deadline = math.inf if timeout is None else time.monotonic() + timeout
     members: dict[str, _Member] = {}
     watching: dict[str, subprocess.Popen[bytes]] = {}
@@ -1350,6 +1382,7 @@ def _run_stage(
             list(watching.values()) if show_only and watching else None,
             flows,
             stall,
+            feeds,
         )
     finally:
         # Whatever ended the stage, the rest of it goes too.
@@ -1366,13 +1399,32 @@ def _run_stage(
             helper.join(_JOIN)
 
     results = [_result(members[pid]) for pid in ids if pid in members]
-    failure = next((r for r in results if r.id == failed), None)
-    failures = (
-        [r for r in results if r.id == failed]
-        if timed_out
-        else [r for r in results if r.exit_code != 0 and not r.terminated]
-    )
-    code = 0 if failure is None else (_FAILED if timed_out else failure.exit_code)
+    consequences: list[ProcessResult] = []
+    failure: ProcessResult | None = None
+    failures: list[ProcessResult] = []
+    code = 0
+    if timed_out:
+        failure = next((r for r in results if r.id == failed), None)
+        failures = [r for r in results if r.id == failed]
+        code = 0 if failure is None else _FAILED
+    elif failed is not None:
+        ended = {
+            member.id: member.ended_at
+            for member in members.values()
+            if member.ended_at is not None
+        }
+        failure, consequences = _attribute(results, ended, feeds)
+        blamed = {r.id for r in consequences}
+        failures = [
+            r
+            for r in results
+            if r.exit_code != 0 and not r.terminated and r.id not in blamed
+        ]
+        if failure is not None and failure.id not in {r.id for r in failures}:
+            failures.insert(0, failure)
+        # A member that ended the stage by exiting 0 leaves no code to report,
+        # so the stage carries the one a timeout does.
+        code = 0 if failure is None else (failure.exit_code or _FAILED)
     return StageResult(
         index=stage.index,
         members=results,
@@ -1380,8 +1432,67 @@ def _run_stage(
         timed_out=timed_out and wedge is None,
         failure=failure,
         failures=failures,
+        consequences=consequences,
         overflow=wedge,
     )
+
+
+def _attribute(
+    results: Sequence[ProcessResult],
+    ended: Mapping[str, float],
+    feeds: Sequence[tuple[str, str]] = (),
+) -> tuple[ProcessResult | None, list[ProcessResult]]:
+    """Which member ended the stage, and which ones broke because it did.
+
+    The cause is the first member to end while others were still running and
+    to have no business ending: any nonzero exit, or a 0 from a member one of
+    `feeds`' producers was still writing to. `ended` is when each member was
+    first seen to have exited, and a member missing from it was still running
+    when the stage was stopped. The consequences are the members that ended
+    from that moment on writing into a pipe nobody was reading.
+
+    Called only for a stage something ended, which is what lets two members
+    seen ending in the SAME poll be read as the cascade they are: one poll
+    cannot order two exits inside it, so a producer seen ending no earlier
+    than its consumer still counts as writing to it, and a broken pipe loses
+    the tie to anything else -- it is never the reason a pipe closed.
+    """
+    producers: dict[str, list[str]] = {}
+    for source, target in feeds:
+        producers.setdefault(target, []).append(source)
+
+    def writing_at(pid: str, when: float) -> bool:
+        at = ended.get(pid)
+        return at is None or at >= when
+
+    candidates: list[tuple[float, bool, ProcessResult]] = []
+    for result in results:
+        at = ended.get(result.id)
+        if at is None or result.terminated:
+            continue
+        if result.exit_code != 0 or any(
+            writing_at(pid, at) for pid in producers.get(result.id, ())
+        ):
+            candidates.append((at, _broken_pipe(result), result))
+    if not candidates:
+        return None, []
+    cause = min(candidates, key=lambda entry: (entry[0], entry[1]))[2]
+    since = ended[cause.id]
+    consequences = [
+        result
+        for result in results
+        if result.id != cause.id
+        and _broken_pipe(result)
+        and ended.get(result.id, math.inf) >= since
+    ]
+    return cause, consequences
+
+
+def _broken_pipe(result: ProcessResult) -> bool:
+    """True when this member died writing to a pipe nobody was reading."""
+    if result.terminated or result.exit_code == 0:
+        return False
+    return result.exit_code in _BROKEN_PIPE or "Broken pipe" in result.stderr
 
 
 def _spawn_order(ids: Sequence[str], stage_wires: Sequence[Wire]) -> list[str]:
@@ -1416,19 +1527,49 @@ def _spawn_order(ids: Sequence[str], stage_wires: Sequence[Wire]) -> list[str]:
     return order
 
 
+def _ends_the_stage(
+    member: _Member,
+    by_id: Mapping[str, _Member],
+    producers: Mapping[str, Sequence[str]],
+) -> bool:
+    """True when this member's ending is the end of the stage.
+
+    Any nonzero exit, and a 0 from a member one of its producers is still
+    writing to -- the muxer that stops early leaves everything upstream
+    writing into a closed pipe, and its 0 is the cause of every broken pipe
+    that follows.
+    """
+    if member.proc.poll() != 0:
+        return True
+    return any(
+        by_id[pid].ended_at is None
+        for pid in producers.get(member.id, ())
+        if pid in by_id
+    )
+
+
 def _watch(
     members: Iterable[_Member],
     deadline: float,
     windows: Sequence[subprocess.Popen[bytes]] | None = None,
     flows: Sequence[Flow] = (),
     stall: float | None = DEFAULT_STALL,
+    feeds: Sequence[tuple[str, str]] = (),
 ) -> tuple[str | None, bool, FfrwdError | None]:
-    """Watch a running stage.
+    """Watch a running stage, recording when each member ends.
 
     ``(the member that ended it, whether it timed out, what wedged it)``.
 
     Exit codes only: a raw demuxer writes an error to stderr at the pipe's EOF
     and exits 0, so what a member wrote says nothing about whether it worked.
+    A 0 is not always a finish, though: `feeds` are the stage's own
+    ``(producer, consumer)`` pairs, and a member that exits 0 while one of its
+    producers is still writing to it ends the stage the same way a nonzero
+    exit does -- it is about to leave everything upstream writing into a
+    closed pipe. From there the stage is given `_CASCADE` seconds for those
+    members to end on their own, so their broken pipes are recorded rather
+    than stopped, and :attr:`_Member.ended_at` orders cause before
+    consequence.
 
     `flows` are the stage's own pipes. A stage where every one of them has
     stood still is wedged in one of two ways, and both are named rather than
@@ -1449,15 +1590,37 @@ def _watch(
     running, and a member it stopped is not counted against the run.
     """
     watched = list(members)
+    by_id = {member.id: member for member in watched}
+    producers: dict[str, list[str]] = {}
+    for source, target in feeds:
+        producers.setdefault(target, []).append(source)
     used: dict[str, float | None] = {m.id: _cpu_seconds(m.proc) for m in watched}
     working = time.monotonic()
+    ended: str | None = None
+    settled = math.inf
     while True:
-        for member in watched:
-            code = member.proc.poll()
-            if code is not None and code != 0:
-                return member.id, False, None
-        if all(member.proc.poll() is not None for member in watched):
-            return None, False, None
+        now = time.monotonic()
+        just_ended = [
+            member
+            for member in watched
+            if member.ended_at is None and member.proc.poll() is not None
+        ]
+        for member in just_ended:
+            member.ended_at = now
+        if ended is None:
+            ender = next(
+                (m for m in just_ended if _ends_the_stage(m, by_id, producers)), None
+            )
+            if ender is not None:
+                ended = ender.id
+                settled = now + _CASCADE
+        if all(member.ended_at is not None for member in watched):
+            return ended, False, None
+        if ended is not None:
+            if time.monotonic() >= settled:
+                return ended, False, None
+            time.sleep(_POLL)
+            continue
         if windows is not None and all(w.poll() is not None for w in windows):
             return None, False, None
         if stall is not None:

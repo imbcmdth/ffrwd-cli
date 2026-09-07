@@ -41,7 +41,9 @@ Subcommands:
   stderr surfaced on failure). A query with no media ``COPY`` prints its
   result set as a table (or CSV, for ``COPY ... WITH (FORMAT csv)``);
   otherwise it runs the compiled ffmpeg command(s) against the ``COPY``'s
-  own destination paths. ``--remote`` submits the run to the hosted runner
+  own destination paths. A destination file that is already there is
+  refused before anything is spawned unless ``-y`` was given.
+  ``--remote`` submits the run to the hosted runner
   instead (``ffrwd.remote``): file inputs are hashed and uploaded, "://"
   inputs pass through for the runner to open, and no local ffmpeg is needed
   -- ``ffrwd jobs`` follows the job from there.
@@ -194,9 +196,16 @@ from .compiler import (
 from .console import Console, WorkProgress
 from .emit import Emitted, build_ffmpeg_commands
 from .errors import ErrorCode, FfrwdError
-from .execute import DEFAULT_TIMEOUT, PlanResult, execute, execute_plan, render_plan
+from .execute import (
+    DEFAULT_TIMEOUT,
+    PlanResult,
+    ProcessResult,
+    execute,
+    execute_plan,
+    render_plan,
+)
 from .functions import Signature, package_signatures
-from .ir import Graph, SinkUnit
+from .ir import PIPE, Graph, SinkUnit
 from .probe import is_url
 from .processes import ProcessPlan, SidecarProcess
 from .project import (
@@ -1142,6 +1151,30 @@ def _check_output_dir(out_path: str) -> str | None:
     return None
 
 
+def _check_output_exists(out_path: str) -> FfrwdError | None:
+    """Return a refusal if `out_path` is a file that is already there.
+
+    Only a plain FILE counts. A "://" destination is ffmpeg's own protocol, a
+    ``pipe:`` is the plan's wiring rather than a destination, and a device
+    node or a fifo is not a file anyone would be overwriting.
+
+    ffmpeg's own ``-n`` says the same thing, but it says it on stdout and
+    exits 0, which reads as a success to everything downstream of it.
+    """
+    if is_url(out_path) or out_path.startswith(PIPE):
+        return None
+    try:
+        if not Path(out_path).is_file():
+            return None
+    except OSError:  # an unreadable parent, a name this platform will not stat
+        return None
+    return FfrwdError(
+        ErrorCode.OUTPUT_EXISTS,
+        f"output '{out_path}' already exists",
+        hint="pass -y to overwrite it",
+    )
+
+
 def _sinks(graphs: list[Graph]) -> list[SinkUnit]:
     """Every command's sink units, in command order."""
     return [unit for graph in graphs for unit in graph.sinks]
@@ -1562,6 +1595,11 @@ def _cmd_run(args: argparse.Namespace, on_warning: OnWarning) -> int:
         if dir_error is not None:
             print(dir_error, file=sys.stderr)
             return 1
+        if not args.overwrite:
+            exists = _check_output_exists(path)
+            if exists is not None:
+                print(f"error: {exists}", file=sys.stderr)
+                return 1
 
     if binaries.ffmpeg_path() is None:
         print(f"error: ffmpeg not found: {binaries.INSTALL_HINT}", file=sys.stderr)
@@ -1668,8 +1706,9 @@ def _run_plan(
     A plan's members share one terminal, so unlike `execute` their stderr is
     captured and only a FAILING stage's is printed -- several ffmpegs and a
     sidecar interleaving progress lines is nothing anyone can read. Losing one
-    member closes the pipes around it, so every member that failed on its own
-    is named, not just the first seen.
+    member closes the pipes around it, so the member that ended FIRST is
+    reported with its stderr, and every member that then died of a broken pipe
+    is named under it as a consequence rather than as a failure of its own.
 
     `players` is the ffplay each shown process's stdout feeds, empty for a run
     that asked for no window. `timeout` is per stage, None for a run nothing
@@ -1705,13 +1744,30 @@ def _run_plan(
     if result.exit_code != 0:
         for member in result.failures:
             print(member.stderr_tail, file=sys.stderr)
+            print(_member_error(member), file=sys.stderr)
+        for member in result.consequences:
             print(
-                f"error: {member.id} exited with code {member.exit_code}: "
-                f"{member.summary}",
+                f"{member.id} then exited {member.exit_code} (broken pipe): "
+                "its reader had ended",
                 file=sys.stderr,
             )
         return result.exit_code
     return 0
+
+
+def _member_error(member: ProcessResult) -> str:
+    """The line naming one member that ended a run.
+
+    A 0 is one of them: a member that exits while its producers are still
+    writing to it takes the whole stage down, and reporting it as an exit code
+    would report nothing.
+    """
+    if member.exit_code == 0:
+        return (
+            f"error: {member.id} exited 0 while its producers were still "
+            f"writing to it: {member.summary}"
+        )
+    return f"error: {member.id} exited with code {member.exit_code}: {member.summary}"
 
 
 def _debug_dump_stderr(result: PlanResult) -> None:
