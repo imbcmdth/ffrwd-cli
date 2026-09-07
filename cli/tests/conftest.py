@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import functools
 import warnings
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -71,6 +71,19 @@ def pinned_ffmpeg() -> None:
         pytest.skip(message)
 
 
+def clear_leaks(home: Path, paths: Iterable[Path]) -> None:
+    """Remove each of `paths`, and refuse any that is not under `home`.
+
+    The guard is the point: nothing this suite deletes may sit outside the
+    store it was given, whatever a test did to the seam that named it.
+    """
+    for leaked in paths:
+        if not leaked.is_relative_to(home):
+            raise AssertionError(f"refusing to delete {leaked}, which is outside {home}")
+        if leaked.exists():
+            leaked.unlink()
+
+
 @pytest.fixture(scope="session")
 def _store_home(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return tmp_path_factory.mktemp("store-home")
@@ -94,20 +107,22 @@ def _isolated_store(
     demands is cached per process, so that answer is cleared as well.
     """
     from ffrwd import nn, store
+    from ffrwd.project import links_path
 
     monkeypatch.setattr(store, "_cache_dir", lambda: _store_home)
     monkeypatch.setattr(nn, "_cache_dir", lambda: _store_home)
     monkeypatch.setattr(nn, "_INFO", None)
+    # Named here, while the redirection above is certainly in force. A test
+    # that calls monkeypatch.undo() drops every patch on its own monkeypatch,
+    # this fixture's included, so a path recomputed after the body would name
+    # the developer's real cache.
+    leaks = (store.global_lock_path(), links_path(store.global_lock_path()))
     yield
     # The directory is shared for speed - a per-test one costs four times the
     # suite's runtime. Only the machine-wide lockfile and links file leak
     # between tests, so only those are cleared: what a project can SEE is
     # what several tests assert.
-    from ffrwd.project import links_path
-
-    for leaked in (store.global_lock_path(), links_path(store.global_lock_path())):
-        if leaked.exists():
-            leaked.unlink()
+    clear_leaks(_store_home, leaks)
 
 
 @pytest.fixture(autouse=True)
