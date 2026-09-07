@@ -8,6 +8,7 @@ pipe are decided before any process exists, so both are testable without one.
 from __future__ import annotations
 
 import math
+import os
 import subprocess
 import sys
 import threading
@@ -823,6 +824,103 @@ def test_the_cpu_a_running_child_has_used_is_readable() -> None:
     if used is None:
         pytest.skip("this platform does not report a process's CPU time")
     assert used > 0.0
+
+
+# -------------------------------------------------------- CUDA provider paths
+
+
+class _FakePopen:
+    """Records the kwargs :func:`_spawn` built it with, spawns nothing."""
+
+    def __init__(self, command: Sequence[str], **kwargs: Any) -> None:
+        self.command = command
+        self.kwargs = kwargs
+
+
+def test_the_nn_runtime_directory_leads_ld_library_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-Windows: the provider's sonames resolve through the linker there."""
+    monkeypatch.setattr(_EXECUTE.sys, "platform", "linux")
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/already")
+
+    env = _EXECUTE._nn_runtime_env(["sidecar", "-nn-runtime", "/x", "-nn-target", "gpu"])
+
+    assert env is not None
+    assert env["LD_LIBRARY_PATH"] == f"/x{os.pathsep}/already"
+
+
+def test_the_nn_runtime_directory_stands_alone_with_nothing_inherited(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No prior LD_LIBRARY_PATH to keep means the directory alone is set."""
+    monkeypatch.setattr(_EXECUTE.sys, "platform", "linux")
+    monkeypatch.delenv("LD_LIBRARY_PATH", raising=False)
+
+    env = _EXECUTE._nn_runtime_env(["sidecar", "-nn-runtime", "/x"])
+
+    assert env is not None
+    assert env["LD_LIBRARY_PATH"] == "/x"
+
+
+def test_a_member_with_no_nn_runtime_flag_is_untouched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ffmpeg member's argv names no runtime, so nothing is added for it."""
+    monkeypatch.setattr(_EXECUTE.sys, "platform", "linux")
+
+    assert _EXECUTE._nn_runtime_env(["ffmpeg", "-i", "in.mp4", "out.mp4"]) is None
+
+
+def test_windows_sets_nothing_even_with_a_runtime_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The sidecar's own loader already covers Windows; the cli leaves it be."""
+    monkeypatch.setattr(_EXECUTE.sys, "platform", "win32")
+
+    assert _EXECUTE._nn_runtime_env(["sidecar", "-nn-runtime", "/x"]) is None
+
+
+def test_a_sidecar_with_a_runtime_is_spawned_with_the_built_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`_spawn` passes the environment `_nn_runtime_env` built straight through."""
+    monkeypatch.setattr(_EXECUTE.sys, "platform", "linux")
+    monkeypatch.setattr(_EXECUTE.subprocess, "Popen", _FakePopen)
+
+    command = ["sidecar", "-nn-runtime", "/x"]
+    proc = cast(
+        Any,
+        _EXECUTE._spawn(
+            command,
+            subprocess.DEVNULL,
+            subprocess.DEVNULL,
+            env=_EXECUTE._nn_runtime_env(command),
+        ),
+    )
+
+    assert proc.kwargs["env"]["LD_LIBRARY_PATH"] == "/x"
+
+
+def test_an_ffmpeg_member_is_spawned_with_no_environment_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No `-nn-runtime` in its argv, so it is spawned to inherit as before."""
+    monkeypatch.setattr(_EXECUTE.sys, "platform", "linux")
+    monkeypatch.setattr(_EXECUTE.subprocess, "Popen", _FakePopen)
+
+    command = ["ffmpeg", "-i", "in.mp4", "out.mp4"]
+    proc = cast(
+        Any,
+        _EXECUTE._spawn(
+            command,
+            subprocess.DEVNULL,
+            subprocess.DEVNULL,
+            env=_EXECUTE._nn_runtime_env(command),
+        ),
+    )
+
+    assert proc.kwargs["env"] is None
 
 
 # -------------------------------------------------- cause before consequence

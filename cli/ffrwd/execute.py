@@ -1343,7 +1343,9 @@ def _run_stage(
                     player, stdin=subprocess.PIPE, bufsize=0
                 )
             members[pid] = _Member(
-                id=pid, argv=command, proc=_spawn(command, stdin, stdout)
+                id=pid,
+                argv=command,
+                proc=_spawn(command, stdin, stdout, env=_nn_runtime_env(command)),
             )
             if chained is not None and not isinstance(stdin, int):
                 stdin.close()  # the spawned member owns it now
@@ -1710,19 +1712,55 @@ def _writes_rows_to_stdout(process: Process) -> bool:
     )
 
 
+_NN_RUNTIME_FLAG = "-nn-runtime"
+
+
+def _nn_runtime_env(command: Sequence[str]) -> dict[str, str] | None:
+    """The environment a spawn needs beyond what it would inherit, if any.
+
+    A sidecar given ``-nn-runtime <dir>`` fetched ONNX Runtime's CUDA provider
+    into that directory, but the provider then dlopens its own CUDA/cuDNN
+    libraries by soname -- not by any path the sidecar passes it. On Windows
+    the sidecar's own loader adds the directory itself; elsewhere only
+    LD_LIBRARY_PATH puts it where the platform loader resolves those sonames,
+    so a non-Windows spawn gets the directory prepended to it. None where
+    there is nothing to add, which leaves the member spawned with the
+    inherited environment untouched.
+    """
+    if sys.platform == "win32":
+        return None
+    try:
+        runtime = command[command.index(_NN_RUNTIME_FLAG) + 1]
+    except (ValueError, IndexError):
+        return None
+    env = dict(os.environ)
+    existing = env.get("LD_LIBRARY_PATH")
+    env["LD_LIBRARY_PATH"] = f"{runtime}{os.pathsep}{existing}" if existing else runtime
+    return env
+
+
 def _spawn(
-    command: list[str], stdin: int | IO[bytes], stdout: int | None
+    command: list[str],
+    stdin: int | IO[bytes],
+    stdout: int | None,
+    env: Mapping[str, str] | None = None,
 ) -> subprocess.Popen[bytes]:
     """Spawn one member, in a process group of its own where there are any.
 
     ``bufsize=0`` for the same reason :mod:`ffrwd.pipes` opens its streams
     unbuffered: a stdio end a copy runs through must hand on what it has,
     since the process that would fill a buffer up to its size is waiting on
-    what the buffer holds.
+    what the buffer holds. `env` of None inherits this process's own
+    environment, exactly as leaving it out of :class:`subprocess.Popen` would.
     """
     if sys.platform == "win32":
         return subprocess.Popen(
-            command, stdin=stdin, stdout=stdout, stderr=subprocess.PIPE, bufsize=0
+            command,
+            stdin=stdin,
+            stdout=stdout,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+            env=env,
         )
     return subprocess.Popen(
         command,
@@ -1731,6 +1769,7 @@ def _spawn(
         stderr=subprocess.PIPE,
         bufsize=0,
         start_new_session=True,
+        env=env,
     )
 
 
