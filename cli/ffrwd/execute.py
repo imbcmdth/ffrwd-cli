@@ -262,6 +262,8 @@ class ExecutionResult:
     # The `loudnorm.parse` failure text when a measuring pass printed no
     # loudnorm JSON block; None otherwise.
     measure_error: str | None = None
+    # True when Ctrl-C ended the run: not a failure, so `exit_code` stays 0.
+    interrupted: bool = False
 
 
 def execute(
@@ -341,6 +343,12 @@ def execute(
                 partial = err.stderr if isinstance(err.stderr, str) else ""
                 results.append(CommandResult(argv, _FAILED, partial, kept))
                 return ExecutionResult(results, _FAILED, timed_out=True)
+            except KeyboardInterrupt:
+                # The command itself has already killed its ffmpeg by the time
+                # this is caught (`_run_watched`, `_run_with_player`, and
+                # `subprocess.run` all do); nothing to append for one that
+                # never finished.
+                return ExecutionResult(results, 0, interrupted=True)
 
             results.append(CommandResult(argv, code, captured, kept))
             if code != 0:
@@ -414,16 +422,26 @@ def _run_watched(
     proc = subprocess.Popen(argv, stdout=stdout, stderr=subprocess.PIPE, bufsize=0)
     log: list[bytes] = []
     reading = _start(_drain_work, _stream(proc.stderr), log, work)
-    try:
-        proc.wait(timeout=timeout)
-    except subprocess.TimeoutExpired as err:
+
+    def _abort() -> None:
         _end_tree(proc)
         with contextlib.suppress(subprocess.TimeoutExpired):
             proc.wait(_GRACE)
         reading.join(_JOIN)
+
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired as err:
+        _abort()
         raise subprocess.TimeoutExpired(
             argv, err.timeout, stderr=_text(log)
         ) from err
+    except KeyboardInterrupt:
+        # Unlike `subprocess.run`, a bare `Popen.wait()` does not kill its
+        # child on an interrupt -- Ctrl-C would otherwise leave this ffmpeg
+        # running past the command that was watching it.
+        _abort()
+        raise
     reading.join(_JOIN)
     return proc.returncode, _text(log)
 
@@ -458,7 +476,7 @@ def _run_with_player(
         draining.start()
     try:
         code = _await_ffmpeg(ffmpeg, timeout, watching if show_only else None)
-    except subprocess.TimeoutExpired:
+    except (subprocess.TimeoutExpired, KeyboardInterrupt):
         _end_tree(ffmpeg)
         _stop_player(watching)
         raise
@@ -723,6 +741,10 @@ class StageResult:
     # `timed_out`, since the two answer the same question and this one names
     # the edge.
     overflow: FfrwdError | None = None
+    # True when Ctrl-C ended the stage: every member stopped the way `_stop`
+    # always stops one, not a failure -- `exit_code` stays 0 and `failure`
+    # stays None.
+    interrupted: bool = False
 
 
 @dataclass(frozen=True)
@@ -736,6 +758,8 @@ class PlanResult:
     failures: list[ProcessResult] = field(default_factory=list)
     overflow: FfrwdError | None = None
     consequences: list[ProcessResult] = field(default_factory=list)
+    # True when Ctrl-C ended the run at the stage named last in `stages`.
+    interrupted: bool = False
 
 
 def wires(plan: ProcessPlan) -> tuple[Wire, ...]:
@@ -1085,6 +1109,8 @@ def execute_plan(
                 terminal=terminal,
             )
             stages.append(result)
+            if result.interrupted:
+                return PlanResult(stages, interrupted=True)
             if result.exit_code != 0:
                 return PlanResult(
                     stages,
@@ -1308,6 +1334,7 @@ def _run_stage(
     failed: str | None = None
     timed_out = False
     wedge: FfrwdError | None = None
+    interrupted = False
     try:
         for pid in _spawn_order(ids, stage_wires):
             process = plan.process(pid)
@@ -1386,6 +1413,10 @@ def _run_stage(
             stall,
             feeds,
         )
+    except KeyboardInterrupt:
+        # `failed`/`timed_out`/`wedge` stay at their unstruck defaults: the
+        # stage below reads as a clean stop, not a failure.
+        interrupted = True
     finally:
         # Whatever ended the stage, the rest of it goes too.
         _stop(members.values())
@@ -1436,6 +1467,7 @@ def _run_stage(
         failures=failures,
         consequences=consequences,
         overflow=wedge,
+        interrupted=interrupted,
     )
 
 

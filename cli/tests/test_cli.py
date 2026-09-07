@@ -23,7 +23,7 @@ import pytest
 from ffrwd import cli, show
 from ffrwd.compiler import Compiled
 from ffrwd.errors import ErrorCode
-from ffrwd.execute import PlanResult
+from ffrwd.execute import ExecutionResult, PlanResult
 from ffrwd.ir import Graph, Node, Output, RowsSink, SinkUnit
 from ffrwd.processes import (
     PIPE,
@@ -885,6 +885,26 @@ def test_run_executes_both_passes_in_order(
     assert calls[0][-3:] == ["-f", "null", "-"]
     assert calls[1][-1] == "out.mp4"
     assert captured.out.count("$ ffmpeg") == 2
+
+
+def test_main_reports_a_keyboard_interrupt_as_a_typed_exit_not_a_traceback(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Ctrl-C anywhere `main` dispatches to -- here, before `execute` even
+    gets called -- ends the process the way an interrupted one conventionally
+    does: one line, code 130, no traceback."""
+
+    def _boom(*args: object, **kwargs: object) -> ExecutionResult:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli.binaries, "ffmpeg_path", lambda: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(cli, "execute", _boom)
+
+    code = cli.main(["run", MEDIA_QUERY, "-y"])
+    captured = capsys.readouterr()
+
+    assert code == 130
+    assert captured.err.strip() == "interrupted"
 
 
 def test_run_stops_at_the_first_failing_pass(

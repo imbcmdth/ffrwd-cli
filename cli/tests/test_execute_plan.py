@@ -36,6 +36,8 @@ from ffrwd.execute import (
     _pipe_buffer,
     _pump,
     _read_ahead,
+    _run_stage,
+    _run_watched,
     _watch,
     overflow_error,
     overflowed,
@@ -55,6 +57,7 @@ from ffrwd.processes import (
     RowsDocument,
     RowsEdge,
     SidecarProcess,
+    Stage,
     StreamEdge,
     VideoFormat,
     external_ids,
@@ -922,6 +925,92 @@ def test_an_ffmpeg_member_is_spawned_with_no_environment_override(
     )
 
     assert proc.kwargs["env"] is None
+
+
+def test_a_keyboard_interrupt_in_the_watch_loop_stops_every_member(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ctrl-C during `_watch` is not a failure: `_stop` still ends every
+    member (the same path a real failure takes), and the stage reports
+    `interrupted` rather than an exit code or a `failure`."""
+    python = getattr(sys, "_base_executable", None) or sys.executable
+    plan = ProcessPlan(processes=(SidecarProcess(id="s0", module="x", node="x"),))
+    stage = Stage(index=0, processes=("s0",))
+    argv = {"s0": [python, "-c", "import time; time.sleep(30)"]}
+
+    real_spawn = _EXECUTE._spawn
+    spawned: list[subprocess.Popen[bytes]] = []
+
+    def _spawn_and_capture(
+        command: list[str], stdin: object, stdout: object
+    ) -> subprocess.Popen[bytes]:
+        proc = real_spawn(command, stdin, stdout)
+        spawned.append(proc)
+        return proc
+
+    def _interrupted_watch(
+        *args: object, **kwargs: object
+    ) -> tuple[str | None, bool, FfrwdError | None]:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(_EXECUTE, "_spawn", _spawn_and_capture)
+    monkeypatch.setattr(_EXECUTE, "_watch", _interrupted_watch)
+
+    result = _run_stage(
+        plan,
+        stage,
+        argv,
+        served={},
+        assigned=(),
+        timeout=None,
+        overwrite=False,
+        echo=None,
+        players={},
+    )
+
+    assert result.interrupted
+    assert result.exit_code == 0
+    assert result.failure is None
+    assert result.failures == []
+    assert len(spawned) == 1
+    assert spawned[0].poll() is not None, "the interrupted member is still running"
+    assert result.members[0].terminated
+
+
+def test_a_keyboard_interrupt_while_watching_progress_still_kills_the_child(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`_run_watched` waits with a bare `Popen.wait()`, not `subprocess.run`
+    (which kills its own child on any exception, interrupt included): it has
+    to do that killing itself, or Ctrl-C during a drawn progress bar leaves
+    ffmpeg running past the command that was watching it.
+
+    The interrupt is raised straight out of the first `proc.wait()` rather
+    than timed against a real signal: `Popen.wait()` is not reliably
+    interruptible while its child is still running (unlike the `_watch`
+    poll loop's `time.sleep`), so a real Ctrl-Break only ever unblocks it
+    once ffmpeg -- sharing the same console process group -- has already
+    exited on its own. Forcing the exception here is what tests `_run_watched`
+    itself rather than ffmpeg's own signal handling.
+    """
+    python = getattr(sys, "_base_executable", None) or sys.executable
+    argv = [python, "-c", "import time; time.sleep(30)"]
+    real_wait = subprocess.Popen.wait
+    struck: list[subprocess.Popen[bytes]] = []
+
+    def _wait(self: subprocess.Popen[bytes], timeout: float | None = None) -> int:
+        if list(self.args) == argv and not struck:
+            struck.append(self)
+            raise KeyboardInterrupt
+        return cast("int", real_wait(self, timeout))
+
+    monkeypatch.setattr(subprocess.Popen, "wait", _wait)
+
+    with pytest.raises(KeyboardInterrupt):
+        _run_watched(argv, None, stdout=subprocess.DEVNULL, work=lambda work: None)
+
+    assert struck
+    assert struck[0].poll() is not None, "the interrupted child is still running"
 
 
 # -------------------------------------------------- cause before consequence

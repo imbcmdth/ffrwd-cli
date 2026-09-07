@@ -174,6 +174,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 from collections.abc import Sequence
@@ -290,6 +291,7 @@ def _version() -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
+    _catch_ctrl_break()
     if argv is None:
         argv = sys.argv[1:]
     # psql's spelling (-v is taken by variables there too); checked before the
@@ -313,8 +315,31 @@ def main(argv: list[str] | None = None) -> int:
     warnings = WarningLog()
     try:
         return handler(args, warnings)
+    except KeyboardInterrupt:
+        # A run's own interrupt is already reported by its result
+        # (`_cmd_run`/`_run_plan` read `interrupted` off it); this is the
+        # fallback for a Ctrl-C anywhere else -- compiling, probing, a
+        # download -- so none of them can print a raw traceback either.
+        print("interrupted", file=sys.stderr)
+        return 130
     finally:
         _print_warnings(warnings)
+
+
+def _catch_ctrl_break() -> None:
+    """Make Ctrl-Break end a run the same way Ctrl-C does.
+
+    Windows delivers Ctrl-C as ``SIGINT``, which Python already turns into
+    :class:`KeyboardInterrupt`. Ctrl-Break is a second console event with no
+    such default: left alone, it kills the process outright, before any
+    `finally` here or in `execute`/`execute_plan` runs. Routing it through
+    the same handler `SIGINT` uses raises `KeyboardInterrupt` for it too.
+    Sending Ctrl-C to a process of its own console group is what a shell's
+    ``CTRL_C_EVENT`` reaches; a process started in a group of its own only
+    answers to ``CTRL_BREAK_EVENT``, which is why both are wired.
+    """
+    if sys.platform == "win32":
+        signal.signal(signal.SIGBREAK, signal.default_int_handler)
 
 
 _QUERY_HELP = (
@@ -1626,6 +1651,8 @@ def _cmd_run(args: argparse.Namespace, on_warning: OnWarning) -> int:
         work=work,
     )
 
+    if result.interrupted:
+        return _interrupted(console)
     if result.timed_out:
         print(f"error: ffmpeg timed out after {budget}s", file=sys.stderr)
         return 1
@@ -1638,6 +1665,13 @@ def _cmd_run(args: argparse.Namespace, on_warning: OnWarning) -> int:
         return result.exit_code
 
     return 0
+
+
+def _interrupted(console: Console) -> int:
+    """Ctrl-C ending a run: the drawn progress line cleared, one line said."""
+    console.end_transient()
+    print("interrupted", file=sys.stderr)
+    return 130
 
 
 def _timeout(args: argparse.Namespace, compiled: Compiled) -> float | None:
@@ -1735,6 +1769,8 @@ def _run_plan(
         _print_error(err, source=args.query, packages=packages, query=query)
         return 1
     _debug_dump_stderr(result)
+    if result.interrupted:
+        return _interrupted(console)
     if result.overflow is not None:
         print(f"error: {result.overflow}", file=sys.stderr)
         return 1
