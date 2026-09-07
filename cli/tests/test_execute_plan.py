@@ -887,6 +887,7 @@ def test_a_sidecar_with_a_runtime_is_spawned_with_the_built_environment(
     """`_spawn` passes the environment `_nn_runtime_env` built straight through."""
     monkeypatch.setattr(_EXECUTE.sys, "platform", "linux")
     monkeypatch.setattr(_EXECUTE.subprocess, "Popen", _FakePopen)
+    monkeypatch.delenv("LD_LIBRARY_PATH", raising=False)
 
     command = ["sidecar", "-nn-runtime", "/x"]
     proc = cast(
