@@ -27,8 +27,9 @@ from pathlib import Path
 
 import pytest
 
+from ffrwd.console import Work
 from ffrwd.errors import ErrorCode
-from ffrwd.execute import execute_plan
+from ffrwd.execute import execute_plan, terminal_member
 from ffrwd.ir import Graph, Node, Output, RowsSink, SinkUnit, StreamType
 from ffrwd.processes import (
     PIPE,
@@ -246,6 +247,33 @@ def test_a_three_process_chain_writes_every_frame(tmp_path: Path) -> None:
     assert all(member.exit_code == 0 for member in result.stages[0].members)
     assert out_path.exists()
     assert _frame_count(out_path) == _SRC_FRAMES
+    assert _live_pipes() == []
+
+
+def test_only_the_member_writing_the_file_is_asked_for_its_progress(
+    tmp_path: Path,
+) -> None:
+    """Three members, one of them writing the destination: it is the one the
+    flags go on, and the others are spawned exactly as they always were."""
+    _require_fixture(_AV)
+    out_path = tmp_path / "watched.mp4"
+    plan = _chain(out_path)
+    terminal = terminal_member(plan)
+    seen: list[Work] = []
+
+    result = execute_plan(
+        plan,
+        sidecar_argv=_negate,
+        timeout=_STAGE_TIMEOUT,
+        overwrite=True,
+        work=seen.append,
+    )
+
+    assert result.exit_code == 0, result.failure
+    asked = [m.id for m in result.stages[-1].members if "-progress" in m.argv]
+    assert asked == [terminal]
+    assert seen and seen[-1].done
+    assert out_path.exists()
     assert _live_pipes() == []
 
 

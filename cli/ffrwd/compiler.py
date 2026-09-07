@@ -420,35 +420,86 @@ class Compiled:
     IS named, since ffmpeg cannot host one and the streams around it move
     between processes over pipes.
 
-    `default_timeout` is what a run applies when the caller sets no timeout of
-    its own: seconds scaled to the longest input, or None -- no timeout --
-    when any input's duration is unknown (see :func:`_default_timeout`).
+    `duration` is how much material the run actually writes -- the longest
+    stretch any of its graphs reads, a trimmed input counting its window and
+    not the whole file (:func:`_run_duration`) -- which is the length a
+    progress line is a fraction of. `default_timeout` is what a run applies
+    when the caller sets no timeout of its own, and scales by the whole
+    input instead: a seek into a long file still has to reach the seek.
     """
 
     graphs: list[Graph]
     plan: ProcessPlan | None = None
     default_timeout: float | None = None
+    duration: float | None = None
 
 
-def _default_timeout(probes: Mapping[str, ProbeResult | None]) -> float | None:
-    """The timeout a run of this compile applies when the caller sets none.
+def _input_duration(probes: Mapping[str, ProbeResult | None]) -> float | None:
+    """The longest input duration this compile reads, in seconds.
 
-    Ten times the longest input duration, floored at ``DEFAULT_TIMEOUT``: a
-    slow encode legitimately runs at many multiples of its material's length.
-    None -- no timeout at all -- when any input's duration is unknown (a
-    device, a live URL, a lavfi graph, an unreadable file), since nothing
-    bounds how long such a run should live.
+    None where any input's is unknown -- a device, a live URL, a lavfi graph,
+    an unreadable file -- since a run reaching one of those is as long as that
+    one, which is to say unbounded.
     """
-    # A no-forward-progress watchdog eventually replaces the duration
-    # multiple; until then the multiple is the budget.
     durations: list[float] = []
     for result in probes.values():
         if result is None or result.duration is None:
             return None
         durations.append(result.duration)
-    if not durations:
+    return max(durations) if durations else None
+
+
+def _probed_paths(
+    res: Resolved, probes: Mapping[str, ProbeResult | None]
+) -> dict[str, ProbeResult | None]:
+    """`probes`, which are keyed by alias, re-keyed by input path.
+
+    Lowering mints an alias of its own per row for a windowed fan-out, and
+    those are in no alias-keyed map: the path is what every graph input can
+    be looked up by.
+    """
+    return {
+        res.input_paths[index]: probes.get(alias) for alias, index in res.sources.items()
+    }
+
+
+def _run_duration(
+    graphs: Sequence[Graph], by_path: Mapping[str, ProbeResult | None]
+) -> float | None:
+    """How long the material this compile writes runs, in seconds.
+
+    The longest stretch any one graph reads, and a windowed input contributes
+    the window rather than the file: a two-minute cut of an episode is two
+    minutes of work, whatever the episode's own length is. None where any of
+    it is unknown, the same as :func:`_input_duration`, since a run reaching a
+    live input is a fraction of nothing.
+    """
+    lengths: list[float] = []
+    for graph in graphs:
+        for alias, index in graph.sources.items():
+            if index >= len(graph.input_paths):  # defensive: an unwired alias
+                continue
+            result = by_path.get(graph.input_paths[index])
+            if result is None or result.duration is None:
+                return None
+            start, end = graph.input_trims.get(alias, (None, None))
+            last = result.duration if end is None else min(end, result.duration)
+            lengths.append(max(0.0, last - (start or 0.0)))
+    return max(lengths) if lengths else None
+
+
+def _default_timeout(duration: float | None) -> float | None:
+    """The timeout a run of this compile applies when the caller sets none.
+
+    Ten times `duration`, floored at ``DEFAULT_TIMEOUT``: a slow encode
+    legitimately runs at many multiples of its material's length. None -- no
+    timeout at all -- for a run nothing bounds, which is nothing to scale by.
+    """
+    # A no-forward-progress watchdog eventually replaces the duration
+    # multiple; until then the multiple is the budget.
+    if duration is None:
         return None
-    return max(float(DEFAULT_TIMEOUT), 10 * max(durations))
+    return max(float(DEFAULT_TIMEOUT), 10 * duration)
 
 
 def compile_sql(
@@ -541,11 +592,12 @@ def compile_all(
             probe_failures=probe_failures,
         )
         ready = [insert_splits(insert_pts_resets(graph)) for graph in graphs]
-        budget = _default_timeout(probes)
+        budget = _default_timeout(_input_duration(probes))
+        span = _run_duration(ready, _probed_paths(res, probes))
         stream_wasm = _stream_wasm(res)
         hosted = _hosted_wasm(res)
         if not hosted and not ready[0].module_sources:
-            return Compiled(graphs=ready, default_timeout=budget)
+            return Compiled(graphs=ready, default_timeout=budget, duration=span)
         try:
             plan = partition(
                 ready[0],
@@ -561,7 +613,9 @@ def compile_all(
             check_spellable(plan)
         except FfrwdError as err:
             raise _anchored(err, stream_wasm) from err
-        return Compiled(graphs=ready, plan=plan, default_timeout=budget)
+        return Compiled(
+            graphs=ready, plan=plan, default_timeout=budget, duration=span
+        )
     except FfrwdError:
         raise
     except RecursionError as err:

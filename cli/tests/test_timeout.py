@@ -18,6 +18,9 @@ from ffrwd.ir import Graph, Output, SinkUnit
 from ffrwd.probe import ProbeResult, StreamMeta
 
 ONE_INPUT = "COPY (SELECT a.video[1] FROM input('x.mp4') a) TO 'out.mp4'"
+TRIMMED = (
+    "COPY (SELECT a.video[1] FROM input('x.mp4') a WHERE a.t <= 120) TO 'out.mp4'"
+)
 TWO_INPUTS = (
     "COPY (SELECT a.video[1], b.audio[1] FROM input('x.mp4') a, input('y.mp4') b) "
     "TO 'out.mkv'"
@@ -71,6 +74,26 @@ def test_the_budget_is_ten_times_the_longest_input(
     _probes(monkeypatch, {"x.mp4": _probe(300.0), "y.mp4": _probe(120.0)})
 
     assert compile_all(TWO_INPUTS).default_timeout == 3000.0
+
+
+def test_the_compile_carries_the_longest_input_duration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The length a run's progress is a fraction of, and what scales the
+    budget: the longest input, whatever the others are."""
+    _probes(monkeypatch, {"x.mp4": _probe(300.0), "y.mp4": _probe(120.0)})
+
+    assert compile_all(TWO_INPUTS).duration == 300.0
+
+
+def test_a_trimmed_input_counts_the_window_it_reads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two minutes cut out of a forty-minute episode is two minutes of work,
+    however long the episode is."""
+    _probes(monkeypatch, {"x.mp4": _probe(2400.0)})
+
+    assert compile_all(TRIMMED).duration == 120.0
 
 
 def test_a_short_input_still_gets_the_floor(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -26,6 +26,13 @@ Two stderr modes, because two callers want opposite things:
   :class:`CommandResult`, for a library or server caller that has no terminal
   to share.
 
+A `work` callback adds a third, for one command of each graph: the one that
+writes the destinations is asked for ffmpeg's own ``-progress`` blocks in
+place of its status line, and its stderr is piped so the blocks can be read
+off it as they arrive and reported through the callback. What comes back is
+the log alone -- the progress lines are taken out of it, so a failure report
+carries the warnings and none of them.
+
 Nothing here prints or raises: the caller reads :class:`ExecutionResult` --
 the argv actually run per command, the exit code, the captured stderr, and
 which of the two non-ffmpeg failures (a timeout, an unparseable measuring
@@ -100,6 +107,7 @@ import ctypes
 import heapq
 import math
 import os
+import re
 import shlex
 import signal
 import subprocess
@@ -114,6 +122,7 @@ from pathlib import Path
 from typing import IO, Literal
 
 from . import loudnorm, pipes
+from .console import Work, WorkProgress
 from .emit import Emitted, build_ffmpeg_commands, build_process_args
 from .errors import ErrorCode, FfrwdError
 from .pipes import NamedPipe
@@ -151,6 +160,7 @@ __all__ = [
     "overflowed",
     "plan_argv",
     "render_plan",
+    "terminal_member",
     "unopened",
     "unopened_error",
     "wires",
@@ -198,6 +208,16 @@ _SPOOL_MEMORY = 1 << 22
 _SUMMARY_CHARS = 160
 _TAIL_LINES = 20
 
+# What the one ffmpeg whose progress is drawn is asked for instead of its own
+# status line: a key=value block on its stderr, twice a second.
+_PROGRESS_ARGS = ("-nostats", "-progress", "pipe:2", "-stats_period", "0.5")
+# Where those flags go: after `-hide_banner` and `-y`/`-n`, still ahead of the
+# first input, since they are global options.
+_PROGRESS_AT = 3
+# A line of one of those blocks, as against a line of ffmpeg's log. The digits
+# are for the per-stream keys, `stream_0_0_q` and its siblings.
+_PROGRESS_LINE = re.compile(rb"^[a-z_][a-z0-9_]*=")
+
 
 @dataclass(frozen=True)
 class CommandResult:
@@ -236,6 +256,7 @@ def execute(
     echo: Callable[[list[str]], None] | None = None,
     players: Sequence[list[str] | None] = (),
     show_only: bool = False,
+    work: WorkProgress | None = None,
 ) -> ExecutionResult:
     """Run every command of `emitted`, in order, stopping at the first failure.
 
@@ -256,6 +277,12 @@ def execute(
     whose window the viewer closes ends CLEANLY, exit 0, instead of feeding a
     display nobody is watching. Without it a closed window never ends a
     command, since its files are still being written.
+
+    `work` is where ffmpeg's own progress is reported, for the command of each
+    graph that writes its destinations -- the last, a measuring pass being a
+    pass and not the work. That command's stderr is piped, whatever
+    `capture_stderr` says, and comes back with the progress lines taken out. A
+    command feeding a window reports nothing: its output is the window.
     """
     results: list[CommandResult] = []
     measured: dict[str, str] = {}
@@ -268,16 +295,20 @@ def execute(
             # The measuring pass is captured whatever the caller asked for:
             # parsing its stderr is the only reason it runs.
             measuring = measures and index == 0
-            capture = capture_stderr or measuring
             last = index == len(commands) - 1
+            reports = work if last and not measuring and player is None else None
+            capture = capture_stderr or measuring
 
             argv = [loudnorm.substitute(word, measured) for word in command]
             argv.insert(1, "-y" if overwrite else "-n")
             argv.insert(1, "-hide_banner")
+            if reports is not None:
+                argv[_PROGRESS_AT:_PROGRESS_AT] = _PROGRESS_ARGS
 
             if echo is not None:
                 echo(argv)
 
+            kept = capture or reports is not None
             try:
                 code, captured = _run_ffmpeg(
                     argv,
@@ -286,14 +317,15 @@ def execute(
                     player=player if last else None,
                     mute=player is not None and not last,
                     show_only=show_only,
+                    work=reports,
                 )
             except subprocess.TimeoutExpired as err:
                 # Whatever the killed child had written by then, if captured.
                 partial = err.stderr if isinstance(err.stderr, str) else ""
-                results.append(CommandResult(argv, _FAILED, partial, capture))
+                results.append(CommandResult(argv, _FAILED, partial, kept))
                 return ExecutionResult(results, _FAILED, timed_out=True)
 
-            results.append(CommandResult(argv, code, captured, capture))
+            results.append(CommandResult(argv, code, captured, kept))
             if code != 0:
                 return ExecutionResult(results, code)
 
@@ -314,11 +346,13 @@ def _run_ffmpeg(
     player: list[str] | None = None,
     mute: bool = False,
     show_only: bool = False,
+    work: WorkProgress | None = None,
 ) -> tuple[int, str]:
     """Run one ffmpeg command; ``(exit code, its stderr)``.
 
     Uncaptured stderr writes straight through to the caller's terminal,
-    progress lines included, and comes back as "".
+    progress lines included, and comes back as "". `work` pipes it instead,
+    and comes back with the log alone (:func:`_run_watched`).
 
     `player` is the ffplay reading this command's display output; it is
     spawned first, takes ffmpeg's stdout as its stdin, and is torn down with
@@ -333,6 +367,8 @@ def _run_ffmpeg(
     """
     if player is None:
         stdout = subprocess.DEVNULL if mute else None
+        if work is not None:
+            return _run_watched(argv, timeout, stdout=stdout, work=work)
         if not capture:
             return subprocess.run(argv, timeout=timeout, stdout=stdout).returncode, ""
         done = subprocess.run(
@@ -342,6 +378,41 @@ def _run_ffmpeg(
     return _run_with_player(
         argv, timeout, capture=capture, player=player, show_only=show_only
     )
+
+
+def _run_watched(
+    argv: list[str],
+    timeout: float | None,
+    *,
+    stdout: int | None,
+    work: WorkProgress,
+) -> tuple[int, str]:
+    """Run one ffmpeg command, reporting its progress as it writes it.
+
+    Its stderr is piped and read in a thread of its own, so a block reaches
+    `work` as ffmpeg writes it rather than when the command ends; what comes
+    back is everything else on that stream, which is the log a failure is
+    reported with.
+    """
+    proc = subprocess.Popen(argv, stdout=stdout, stderr=subprocess.PIPE, bufsize=0)
+    log: list[bytes] = []
+    reading = _start(_drain_work, _stream(proc.stderr), log, work)
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired as err:
+        _end_tree(proc)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(_GRACE)
+        reading.join(_JOIN)
+        raise subprocess.TimeoutExpired(
+            argv, err.timeout, stderr=_text(log)
+        ) from err
+    reading.join(_JOIN)
+    return proc.returncode, _text(log)
+
+
+def _text(log: Sequence[bytes]) -> str:
+    return b"".join(log).decode("utf-8", "replace")
 
 
 def _run_with_player(
@@ -878,6 +949,26 @@ def _role(process: Process) -> str:
     return "ffmpeg" if isinstance(process, FfmpegProcess) else "sidecar"
 
 
+def terminal_member(plan: ProcessPlan) -> str | None:
+    """The member that writes `plan`'s destinations, whose progress is the run's.
+
+    The last stage's ffmpeg that hands nothing on: everything else feeds a
+    pipe, and a run is waiting on the one actually writing files. Several
+    destinations out of one ffmpeg are still one member. None for a plan whose
+    last stage ends in a sidecar instead, which reports nothing of the kind.
+    """
+    stages = plan.stages
+    if not stages:
+        return None
+    handing_on = {edge.source for edge in plan.edges}
+    writing = [
+        pid
+        for pid in stages[-1].processes
+        if pid not in handing_on and isinstance(plan.process(pid), FfmpegProcess)
+    ]
+    return writing[-1] if writing else None
+
+
 def execute_plan(
     plan: ProcessPlan,
     *,
@@ -888,6 +979,7 @@ def execute_plan(
     players: Mapping[str, list[str]] | None = None,
     show_only: bool = False,
     stall: float | None = DEFAULT_STALL,
+    work: WorkProgress | None = None,
 ) -> PlanResult:
     """Run `plan`, stage by stage, stopping at the first stage that fails.
 
@@ -922,6 +1014,10 @@ def execute_plan(
     a buffer that filled or an input nobody opened, rather than leaving a
     wedged run to the timeout. None turns that off.
 
+    `work` is where ffmpeg's own progress is reported, for the one member that
+    writes the plan's destinations (:func:`terminal_member`). Every other
+    member's stderr is collected as it always was.
+
     Named pipes and any temporary directory holding them are removed before
     this returns, whether the plan finished or failed.
     """
@@ -948,6 +1044,7 @@ def execute_plan(
 
         argv = plan_argv(plan, sidecar_argv=sidecar_argv, pipe_path=pipe_path)
         assigned = wires(plan)
+        terminal = terminal_member(plan) if work is not None else None
 
         stages: list[StageResult] = []
         for stage in plan.stages:
@@ -963,6 +1060,8 @@ def execute_plan(
                 players or {},
                 show_only,
                 stall,
+                work=work,
+                terminal=terminal,
             )
             stages.append(result)
             if result.exit_code != 0:
@@ -1070,13 +1169,20 @@ def _spawn_argv(
     argv: Sequence[str],
     *,
     overwrite: bool,
+    progress: bool = False,
 ) -> list[str]:
-    """`argv` as it is actually spawned. A sidecar's is the hook's, verbatim."""
+    """`argv` as it is actually spawned. A sidecar's is the hook's, verbatim.
+
+    `progress` asks this one for the blocks a drawn line reads, in place of
+    the status line it would write.
+    """
     if not isinstance(process, FfmpegProcess):
         return list(argv)
     command = list(argv)
     command.insert(1, "-y" if overwrite else "-n")
     command.insert(1, "-hide_banner")
+    if progress:
+        command[_PROGRESS_AT:_PROGRESS_AT] = _PROGRESS_ARGS
     return command
 
 
@@ -1145,8 +1251,15 @@ def _run_stage(
     players: Mapping[str, list[str]],
     show_only: bool = False,
     stall: float | None = DEFAULT_STALL,
+    *,
+    work: WorkProgress | None = None,
+    terminal: str | None = None,
 ) -> StageResult:
-    """Spawn every member of `stage` at once, watch them, and report."""
+    """Spawn every member of `stage` at once, watch them, and report.
+
+    `terminal` is the member whose progress `work` draws, which is in the last
+    stage; every other member, and every stage before it, is untouched.
+    """
     ids = list(stage.processes)
     inside = set(ids)
     stage_wires = [
@@ -1189,6 +1302,7 @@ def _run_stage(
                 process,
                 argv[pid],
                 overwrite=overwrite or any(not w.write_stdio for w in writes),
+                progress=work is not None and pid == terminal,
             )
             if echo is not None:
                 echo(pid, command)
@@ -1224,7 +1338,11 @@ def _run_stage(
             helpers.append(_start(_pump, source, dest, deadline, flow))
 
         for member in members.values():
-            helpers.append(_start(_drain, _stream(member.proc.stderr), member.stderr))
+            stderr = _stream(member.proc.stderr)
+            if work is not None and member.id == terminal:
+                helpers.append(_start(_drain_work, stderr, member.stderr, work))
+            else:
+                helpers.append(_start(_drain, stderr, member.stderr))
 
         failed, timed_out, wedge = _watch(
             members.values(),
@@ -1801,3 +1919,137 @@ def _drain(stream: IO[bytes], into: list[bytes]) -> None:
     finally:
         with contextlib.suppress(OSError, ValueError):
             stream.close()
+
+
+def _drain_work(stream: IO[bytes], into: list[bytes], report: WorkProgress) -> None:
+    """Drain the one member whose progress is drawn, `into` keeping its log.
+
+    The same drain as every other member's, with a reader in front of it: the
+    progress blocks go to `report` as they arrive, the rest to `into`. The
+    run's line is ended whatever ends the stream, so a member that was killed
+    leaves no line standing.
+    """
+    reader = _WorkReader(into, report)
+    try:
+        while True:
+            chunk = stream.read(_CHUNK)
+            if not chunk:
+                break
+            reader.feed(chunk)
+    except (OSError, ValueError):
+        pass
+    finally:
+        reader.finish()
+        with contextlib.suppress(OSError, ValueError):
+            stream.close()
+
+
+class _WorkReader:
+    """One member's stderr split into ffmpeg's progress blocks and its log.
+
+    ``-progress`` writes a block of ``key=value`` lines per period, ending in
+    ``progress=continue`` or ``progress=end``. Everything else on the stream is
+    the log a failure is reported with, and the progress lines never join it.
+    Chunks arrive as the pipe hands them over, so a block -- and a line --
+    routinely spans two of them.
+    """
+
+    def __init__(self, log: list[bytes], report: WorkProgress) -> None:
+        self._log = log
+        self._report = report
+        self._rest = b""
+        self._block: dict[str, str] = {}
+        self._reached = 0.0
+        self._ended = False
+
+    def feed(self, chunk: bytes) -> None:
+        """Take what has arrived, reporting every block it completes."""
+        lines = (self._rest + chunk).split(b"\n")
+        self._rest = lines.pop()
+        for line in lines:
+            self._line(line)
+
+    def finish(self) -> None:
+        """Take what the last chunk left over, and end the run's line."""
+        if self._rest:
+            self._line(self._rest)
+            self._rest = b""
+        self._end()
+
+    def _line(self, line: bytes) -> None:
+        if not _PROGRESS_LINE.match(line.rstrip(b"\r")):
+            self._log.append(line + b"\n")
+            return
+        key, _, value = line.strip().decode("utf-8", "replace").partition("=")
+        if key != "progress":
+            self._block[key] = value
+            return
+        if value == "end":
+            self._end()
+        else:
+            self._report(self._work(done=False))
+        self._block.clear()
+
+    def _end(self) -> None:
+        if self._ended:
+            return
+        self._ended = True
+        self._report(self._work(done=True))
+
+    def _work(self, *, done: bool) -> Work:
+        self._reached = self._out_time()
+        return Work(
+            out_time=self._reached,
+            fps=_figure(self._block.get("fps")),
+            speed=_figure(self._block.get("speed"), "x"),
+            bitrate=_figure(self._block.get("bitrate"), "kbits/s"),
+            total_size=_count(self._block.get("total_size")),
+            done=done,
+        )
+
+    def _out_time(self) -> float:
+        """How far into the output this block reached, in seconds.
+
+        ``out_time`` is a timestamp; the two counts beside it are both in
+        microseconds, ``out_time_ms`` included. A block that named none of
+        them -- the last one of a run that wrote nothing -- holds where the
+        run had got to.
+        """
+        stamp = self._block.get("out_time")
+        if stamp is not None:
+            seconds = _timestamp(stamp)
+            if seconds is not None:
+                return seconds
+        for key in ("out_time_us", "out_time_ms"):
+            micros = _figure(self._block.get(key))
+            if micros is not None:
+                return micros / 1e6
+        return self._reached
+
+
+def _figure(value: str | None, suffix: str = "") -> float | None:
+    """One progress value as a number, or None where ffmpeg said ``N/A``."""
+    if value is None:
+        return None
+    text = value.strip().removesuffix(suffix)
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _count(value: str | None) -> int | None:
+    number = _figure(value)
+    return None if number is None else int(number)
+
+
+def _timestamp(value: str) -> float | None:
+    """``00:20:15.150000`` as seconds, or None for anything else."""
+    parts = value.strip().split(":")
+    if len(parts) != 3:
+        return None
+    try:
+        hours, minutes, seconds = (float(part) for part in parts)
+    except ValueError:
+        return None
+    return hours * 3600 + minutes * 60 + seconds

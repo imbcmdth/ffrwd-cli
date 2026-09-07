@@ -191,7 +191,7 @@ from .compiler import (
     compile_table_sql,
     emitted_commands,
 )
-from .console import Console
+from .console import Console, WorkProgress
 from .emit import Emitted, build_ffmpeg_commands
 from .errors import ErrorCode, FfrwdError
 from .execute import DEFAULT_TIMEOUT, PlanResult, execute, execute_plan, render_plan
@@ -1568,14 +1568,16 @@ def _cmd_run(args: argparse.Namespace, on_warning: OnWarning) -> int:
         return 1
 
     budget = _timeout(args, compiled)
+    work = _work(args, compiled, console)
 
     if plan is not None:
-        return _run_plan(plan, args, packages, query, windows, budget, console)
+        return _run_plan(plan, args, packages, query, windows, budget, console, work)
 
     # `ffrwd.execute` owns the loop; the CLI owns the printing. stderr stays
-    # uncaptured (`capture_stderr` left false) so ffmpeg writes its progress
+    # uncaptured (`capture_stderr` left false) so ffmpeg writes its own output
     # straight to the terminal, and `echo` puts each `$ <cmd>` line in front
-    # of the output it produced.
+    # of the output it produced -- except for the command whose progress is
+    # drawn, which is piped so the line can be drawn from it.
     result = execute(
         emitted,
         timeout=budget,
@@ -1583,6 +1585,7 @@ def _cmd_run(args: argparse.Namespace, on_warning: OnWarning) -> int:
         echo=_echo_command,
         players=players,
         show_only=args.show_only,
+        work=work,
     )
 
     if result.timed_out:
@@ -1610,6 +1613,23 @@ def _timeout(args: argparse.Namespace, compiled: Compiled) -> float | None:
         timeout: float = args.timeout
         return timeout
     return compiled.default_timeout
+
+
+def _work(
+    args: argparse.Namespace, compiled: Compiled, console: Console
+) -> WorkProgress | None:
+    """Where the encode reports its progress, or None when nothing draws it.
+
+    The bar is a fraction of the material's length
+    (:attr:`ffrwd.compiler.Compiled.duration`), and a live input has none: the
+    line then carries the figures alone. Under ``--quiet``, ``--json`` or a
+    piped stderr there is no line to draw, and None leaves ffmpeg's own output
+    on the terminal exactly as it has always been -- a CI log still carries
+    everything it said.
+    """
+    if getattr(args, "as_json", False) or not console.drawing:
+        return None
+    return console.work("encoding", compiled.duration)
 
 
 def _provision_nn(plan: ProcessPlan, console: Console) -> int:
@@ -1641,6 +1661,7 @@ def _run_plan(
     players: dict[str, list[str]],
     timeout: float | None,
     console: Console,
+    work: WorkProgress | None = None,
 ) -> int:
     """Run a query that reaches a wasm module, and report it as `run` reports.
 
@@ -1652,7 +1673,8 @@ def _run_plan(
 
     `players` is the ffplay each shown process's stdout feeds, empty for a run
     that asked for no window. `timeout` is per stage, None for a run nothing
-    bounds. ``--jobs`` reaches each sidecar through the renderer.
+    bounds. `work` draws the progress of the one member writing the
+    destinations. ``--jobs`` reaches each sidecar through the renderer.
     """
     code = _provision_nn(plan, console)
     if code != 0:
@@ -1666,6 +1688,7 @@ def _run_plan(
             echo=_echo_member,
             players=players,
             show_only=args.show_only,
+            work=work,
         )
     except FfrwdError as err:
         # Rendering the argv or spawning a stage, not the query text:

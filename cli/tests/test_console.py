@@ -1,4 +1,4 @@
-"""Tests for the CLI's narration: lines, sizes, the spinner, and the progress bar.
+"""Tests for the CLI's narration: lines, sizes, the spinner, and the two bars.
 
 The spinner is exercised against two injected streams -- a plain StringIO,
 which is what a pipe or a captured test run looks like, and one whose
@@ -20,7 +20,7 @@ import time
 import pytest
 
 from ffrwd import console as console_module
-from ffrwd.console import Console, written_size
+from ffrwd.console import Console, Work, written_size
 
 MB = 1024 * 1024
 
@@ -281,3 +281,56 @@ def test_a_line_said_over_a_standing_progress_line_starts_clean(clock: _Clock) -
     assert written.endswith(
         "\r" + " " * len(bar) + "\rmodel model.onnx (4 MB) from imbcmdth/yolo26-onnx\n"
     )
+
+
+# --- what ffmpeg reports while it works -------------------------------------
+
+_FIGURES = {"fps": 61.0, "speed": 1.94, "bitrate": 2100.0}
+_EPISODE = 43 * 60 + 5
+_REACHED = 20 * 60 + 15
+
+
+def test_work_draws_a_bar_with_the_figures_and_an_eta_then_clears(
+    clock: _Clock,
+) -> None:
+    stream = _Tty()
+    report = Console(stream).work("encoding", float(_EPISODE))
+    report(Work(out_time=0.0, **_FIGURES))
+    # 20:15 of output written in the 11:15 of wall clock since it started:
+    # 1.8 seconds of material a second.
+    clock.reading = _REACHED / 1.8
+    report(Work(out_time=float(_REACHED), **_FIGURES))
+    report(Work(out_time=float(_REACHED), done=True))
+
+    written = stream.getvalue()
+    # Nothing has been measured yet, so the first line carries no ETA.
+    opening = "encoding  [>           ]   0%  0:00 / 43:05  61 fps  1.9x  2.1 Mb/s"
+    assert "\r" + opening in written
+    # 22:50 of material left at 1.8 a second is 12:41.
+    line = (
+        "encoding  [=====>      ]  47%  20:15 / 43:05  "
+        "61 fps  1.9x  2.1 Mb/s  eta 12:41"
+    )
+    assert "\r" + line in written
+    # Ending blanks the line, so the next narration starts clean.
+    assert written.endswith("\r" + " " * len(line) + "\r")
+
+
+def test_work_without_a_duration_shows_how_far_it_has_got(clock: _Clock) -> None:
+    """A live input is a fraction of nothing: the figures, and no bar."""
+    stream = _Tty()
+    report = Console(stream).work("encoding", None)
+    report(Work(out_time=float(_REACHED), **_FIGURES))
+
+    assert stream.getvalue() == "\rencoding  20:15  61 fps  1.9x  2.1 Mb/s"
+
+
+def test_work_never_writes_off_a_tty(clock: _Clock) -> None:
+    stream = io.StringIO()
+    console = Console(stream)
+    report = console.work("encoding", 100.0)
+    report(Work(out_time=50.0, **_FIGURES))
+    report(Work(out_time=100.0, done=True))
+
+    assert stream.getvalue() == ""
+    assert not console.drawing
