@@ -22,6 +22,15 @@ statuses) pass through as themselves. All HTTP goes through
 ``ffrwd.packages``' seams, so the unit tier fakes the server the way
 ``test_publish`` does.
 
+A file input goes wherever the submit's answer says. When that answer carries
+an ``uploads`` entry for the digest, the bytes are PUT straight to the object
+store at the signed URL it names -- the URL is the credential, sent verbatim,
+and a single PUT is what the store signed for, so a file past its size limit
+is refused before anything leaves. Without such an entry -- a registry with no
+store configured, or a digest it did not sign -- the bytes take the job API's
+own content-addressed endpoint under the job token, which is also where a
+packed package always goes.
+
 A LINKED package does ride along. It has no published digest, so it is packed
 at submit time -- the same :func:`ffrwd.store.pack` ``publish`` uses, so what
 travels is the manifest's closure and what the ignore files allow, models
@@ -129,7 +138,7 @@ _sleep = time.sleep
 
 
 def _utcnow() -> datetime:
-    """The clock the listing reads. A test pins it."""
+    """The clock this module reads. A test pins it."""
     return datetime.now(timezone.utc)
 
 
@@ -233,9 +242,14 @@ _DATA_PLANE_TIMEOUT = 600.0
 _TRANSFER_TIMEOUT = 60.0
 
 # How many times an upload retries a send that timed out or was reset. Safe
-# to retry: the endpoint is content-addressed and answers `already: true`
-# for bytes it already holds, so a resend never duplicates anything.
+# to retry either way it goes: the job API's endpoint is content-addressed
+# and answers `already: true` for bytes it already holds, and putting the
+# same bytes to the store writes the same object.
 _UPLOAD_RETRIES = 3
+
+# The largest file the store signs a single PUT for. Beyond it the upload
+# would have to be multipart, which the submit does not sign for.
+_PUT_LIMIT_BYTES = 5 * 1024**3
 
 _T = TypeVar("_T")
 
@@ -465,8 +479,13 @@ def submit_run(
             announce,
             progress,
         )
+    destinations = _destinations(answer)
     for path, digest in uploads:
-        _upload(upload_url, job_token, path, digest, announce, progress)
+        destination = destinations.get(digest)
+        if destination is None:
+            _upload(upload_url, job_token, path, digest, announce, progress)
+        else:
+            _put(destination, path, announce, progress)
     if announce is not None:
         announce("starting the job")
     _call(
@@ -750,6 +769,127 @@ def _global_lock(local: Path | None) -> Lockfile | None:
     return read_lockfile(path)
 
 
+@dataclass(frozen=True)
+class _Destination:
+    """Where one file input's bytes go: the signed URL, and when it stops working."""
+
+    url: str
+    expires_at: str | None
+
+
+def _destinations(answer: Mapping[str, object]) -> dict[str, _Destination]:
+    """The submit's ``uploads``: a signed PUT target per input digest.
+
+    Empty when the answer carries none, which is what a registry with no
+    store configured answers; an input whose digest is missing from it takes
+    the job API's own upload endpoint instead.
+    """
+    offered = answer.get("uploads")
+    if not isinstance(offered, dict):
+        return {}
+    found: dict[str, _Destination] = {}
+    for digest, entry in offered.items():
+        if not isinstance(entry, dict):
+            continue
+        url = entry.get("url")
+        if not isinstance(url, str):
+            continue
+        expires = entry.get("expires_at")
+        found[str(digest)] = _Destination(
+            url=url, expires_at=expires if isinstance(expires, str) else None
+        )
+    return found
+
+
+def _put(
+    destination: _Destination,
+    path: str,
+    announce: Announce | None = None,
+    progress: Progress | None = None,
+) -> None:
+    """PUT one file input straight to the store, streamed off the disk.
+
+    The URL is the credential and travels verbatim, query string included:
+    no bearer, no job token, and nothing to read back -- any 2xx means the
+    bytes are stored. A file the store will not take in one request is
+    refused here, before anything is opened or sent.
+    """
+    file = Path(path)
+    try:
+        size = file.stat().st_size
+    except OSError as err:
+        raise _unreadable(path, err) from err
+    if size > _PUT_LIMIT_BYTES:
+        raise _reject(
+            f"input '{path}' is {written_size(size)}, and a single upload takes "
+            f"at most {_PUT_LIMIT_BYTES // 1024**3} GB",
+            "split the input into smaller files, or run it without --remote",
+        )
+    try:
+        opened = file.open("rb")
+    except OSError as err:
+        raise _unreadable(path, err) from err
+    with opened as stream:
+        if announce is not None:
+            announce(f"uploading {path} ({written_size(size)})")
+        _put_body(
+            destination,
+            packages_module.CountedBody(stream, size, progress),
+            path,
+            announce=announce,
+        )
+
+
+def _put_body(
+    destination: _Destination,
+    body: packages_module.CountedBody,
+    name: str,
+    *,
+    announce: Announce | None = None,
+) -> None:
+    """PUT `body` to `destination`, retried on the timeouts an upload is.
+
+    Writing the same bytes to the same URL twice stores the same object, so a
+    resend is as safe as the content-addressed endpoint's.
+    """
+
+    def _send(handle: packages_module.Handle) -> bytes:
+        request = packages_module._request(destination.url, data=body, method="PUT")
+        try:
+            with packages_module._urlopen(request, timeout=_TRANSFER_TIMEOUT) as response:
+                handle.set(response)
+                return b""
+        except urllib.error.HTTPError as err:
+            raise _store_refusal(destination, name, err.code) from err
+        except (TimeoutError, ConnectionError):
+            raise
+        except (OSError, ValueError, urllib.error.URLError) as err:
+            raise _unreachable(destination.url, err) from err
+
+    _sent(_send, body, destination.url, announce=announce, name=name)
+
+
+def _store_refusal(destination: _Destination, name: str, status: int) -> FfrwdError:
+    """The store's refusal of a PUT, told apart from a URL whose time is up."""
+    expires = _parse_when(destination.expires_at)
+    if status == 403 and expires is not None and _utcnow() >= expires:
+        return _reject(
+            f"the upload URL for input '{name}' expired at {destination.expires_at}",
+            "submit the run again: an upload URL is good for 24 hours",
+        )
+    return _reject(
+        f"the store refused the upload of input '{name}' with HTTP {status}",
+        "try the run again; if it keeps happening, report it",
+    )
+
+
+def _unreadable(path: str, err: OSError) -> FfrwdError:
+    return _reject(
+        f"input '{path}' could not be read: {err.strerror or err}",
+        "a file input is uploaded from this machine, so it has to be readable",
+    )
+
+
 def _upload(
     upload_url: str,
     job_token: str,
@@ -765,10 +905,7 @@ def _upload(
         size = file.stat().st_size
         opened = file.open("rb")
     except OSError as err:
-        raise _reject(
-            f"input '{path}' could not be read: {err.strerror or err}",
-            "a file input is uploaded from this machine, so it has to be readable",
-        ) from err
+        raise _unreadable(path, err) from err
     with opened as stream:
         if announce is not None:
             announce(f"uploading {path} ({written_size(size)})")
@@ -813,15 +950,10 @@ def _upload_body(
 ) -> None:
     """POST `body` to the content-addressed endpoint under its digest.
 
-    Shared by the file inputs and the packed linked packages: both are bytes
-    the runner reads back by digest, and the endpoint answers ``already: true``
-    for content it already holds. Each send is bounded by `_TRANSFER_TIMEOUT`
-    rather than the full ten minutes a cold start gets -- an upload that goes
-    quiet mid-send (the far end took the bytes and stopped reading) is
-    noticed there, not sat through -- and a socket timeout or a reset
-    connection retries the send from the start up to `_UPLOAD_RETRIES` times:
-    safe, since the endpoint answers ``already: true`` for content it already
-    has. A Ctrl-C during any attempt is never retried.
+    Taken by the packed linked packages, and by a file input whenever the
+    submit offered no store URL for it: both are bytes the runner reads back
+    by digest, and the endpoint answers ``already: true`` for content it
+    already holds -- which is what makes a retried send safe.
     """
     url = f"{upload_url}?sha256={digest}"
     headers = {"x-job-token": job_token, "Content-Type": "application/octet-stream"}
@@ -843,9 +975,28 @@ def _upload_body(
         except (OSError, ValueError, urllib.error.URLError) as err:
             raise _unreachable(url, err) from err
 
+    _sent(_send, body, url, announce=announce, name=name)
+
+
+def _sent(
+    send: Callable[[packages_module.Handle], bytes],
+    body: packages_module.CountedBody,
+    url: str,
+    *,
+    announce: Announce | None = None,
+    name: str | None = None,
+) -> None:
+    """Run `send`, retrying a timed-out or reset connection from the start.
+
+    Each attempt is bounded by `_TRANSFER_TIMEOUT` rather than the full ten
+    minutes a cold start gets -- an upload that goes quiet mid-send (the far
+    end took the bytes and stopped reading) is noticed there, not sat through
+    -- and up to `_UPLOAD_RETRIES` attempts are made. A Ctrl-C during any
+    attempt is never retried.
+    """
     for attempt in range(1, _UPLOAD_RETRIES + 1):
         try:
-            _interruptible(_send)
+            _interruptible(send)
             return
         except (TimeoutError, ConnectionError) as err:
             if attempt >= _UPLOAD_RETRIES:

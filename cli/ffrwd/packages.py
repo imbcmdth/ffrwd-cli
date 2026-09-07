@@ -453,14 +453,18 @@ def _request(
     *,
     headers: Mapping[str, str] | None = None,
     data: bytes | CountedBody | None = None,
+    method: str | None = None,
 ) -> urllib.request.Request:
+    """`method` defaults to urllib's own reading: POST with a body, GET without."""
     written = {"Accept": "*/*", **(dict(headers) if headers else {})}
-    if data is not None:
+    if data is not None and method in (None, "POST"):
+        # A POST here carries JSON unless its caller names another type; a PUT
+        # declares its own, or none.
         written.setdefault("Content-Type", "application/json")
     if isinstance(data, CountedBody):
         # urllib sends a reader chunked unless the length is named.
         written.setdefault("Content-Length", str(data.size))
-    return urllib.request.Request(url, data=data, headers=written)
+    return urllib.request.Request(url, data=data, headers=written, method=method)
 
 
 def _read(
@@ -569,8 +573,9 @@ def exchange(
     limit: int,
     timeout: float = TIMEOUT,
     handle: Handle | None = None,
+    method: str = "POST",
 ) -> tuple[int, bytes]:
-    """One POST through this module's HTTP seam: the status, and the body.
+    """One request with a body through this module's HTTP seam: the status, and the body.
 
     Unlike everything else here the STATUS comes back rather than becoming a
     rejection. Publishing is the one exchange whose refusals are the
@@ -579,10 +584,10 @@ def exchange(
     success reads as 200; only whether it succeeded is a caller's question.
 
     `data` is the whole body, or a :class:`CountedBody` streamed out of a
-    file and reported as it goes. `handle` is :func:`_read`'s own -- see
-    there.
+    file and reported as it goes. `method` is POST unless a caller names
+    another. `handle` is :func:`_read`'s own -- see there.
     """
-    request = _request(url, headers=headers, data=data)
+    request = _request(url, headers=headers, data=data, method=method)
     try:
         return 200, _read(url, limit, request, timeout, handle=handle)
     except _Status as status:
