@@ -26,7 +26,7 @@ from typing import Any
 import pytest
 
 from ffrwd import nn, wasm
-from ffrwd.errors import FfrwdError
+from ffrwd.errors import ErrorCode, FfrwdError
 from ffrwd.processes import ModelBinding, SidecarProcess
 
 WINDOWS = nn.Info(
@@ -256,6 +256,7 @@ def test_a_version_this_ffrwd_does_not_pin_is_refused_by_name() -> None:
     assert "99.0.0" in caught.value.message
     assert "win-x64" in caught.value.message
     assert caught.value.hint is not None
+    assert caught.value.code == ErrorCode.RUNTIME_NOT_FOUND
 
 
 # --------------------------------------------------------------------------
@@ -432,6 +433,7 @@ def test_a_tier_this_platform_has_none_of_is_refused_with_what_it_has(
     assert "cuda" in caught.value.message
     assert caught.value.hint is not None
     assert "directml" in caught.value.hint
+    assert caught.value.code == ErrorCode.RUNTIME_NOT_FOUND
 
 
 def test_the_environment_naming_a_runtime_stops_the_bootstrap(
@@ -503,6 +505,64 @@ def test_the_full_tier_carries_every_cudnn_sublibrary_the_sidecar_loads() -> Non
     names = {member.name for artifact in full for member in artifact.members}
     for lib in _CUDNN_SUBLIBS_WINDOWS:
         assert lib in names, f"{lib} is missing from the full tier's cudnn artifact"
+
+
+def test_the_linux_full_tier_resolves_to_its_four_artifacts() -> None:
+    # cuda_cudart, libcublas (carrying both libcublas and libcublasLt),
+    # libcufft, and cudnn -- the same four packages the Windows tier pins,
+    # at the same NVIDIA-published versions.
+    full = nn._PINS[("1.22.0", "linux-x64")]["full"]
+    assert len(full) == 4
+    names = {member.name for artifact in full for member in artifact.members}
+    assert names >= {
+        "libcudart.so.12",
+        "libcublas.so.12",
+        "libcublasLt.so.12",
+        "libcufft.so.11",
+        "libcudnn.so.9",
+    }
+
+
+# The soname the CUDA execution provider dlopens for each library -- the
+# same names cudnn_adv64_9.dll and friends answer to on Windows, one
+# libcudnn_*.so.9 apiece.
+_CUDNN_SUBLIBS_LINUX = (
+    "libcudnn_adv.so.9",
+    "libcudnn_graph.so.9",
+    "libcudnn_ops.so.9",
+    "libcudnn_heuristic.so.9",
+    "libcudnn_engines_precompiled.so.9",
+    "libcudnn_engines_runtime_compiled.so.9",
+)
+
+
+def test_the_linux_full_tier_carries_every_cudnn_sublibrary_the_sidecar_loads() -> None:
+    full = nn._PINS[("1.22.0", "linux-x64")]["full"]
+    names = {member.name for artifact in full for member in artifact.members}
+    for lib in _CUDNN_SUBLIBS_LINUX:
+        assert lib in names, f"{lib} is missing from the linux full tier's cudnn artifact"
+
+
+def _txz_bytes(entries: dict[str, bytes]) -> bytes:
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:xz") as archive:
+        for name, payload in entries.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(payload)
+            archive.addfile(info, io.BytesIO(payload))
+    return buffer.getvalue()
+
+
+def test_a_tar_xz_archive_is_read_the_same_way_a_tgz_is(tmp_path: Path) -> None:
+    # The NVIDIA redistributables the linux full tier pins ship as .tar.xz,
+    # not .tgz -- tarfile's "r:*" mode already detects the compression, so
+    # _opened needs no branch for it, only proof that it works.
+    payload = b"the shared object's bytes"
+    archive = tmp_path / "archive.tar.xz"
+    archive.write_bytes(_txz_bytes({"lib/libthing.so.1.2.3": payload}))
+    member = nn.Member(entry="lib/libthing.so.1.2.3", name="libthing.so.1")
+    with nn._opened(archive) as reader:
+        assert reader(member).read() == payload
 
 
 # --------------------------------------------------------------------------

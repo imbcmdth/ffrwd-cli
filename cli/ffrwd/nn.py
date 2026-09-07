@@ -99,8 +99,10 @@ _BLOCK_BYTES = 1024 * 1024
 _INFO_TIMEOUT = 30.0
 
 
-def _reject(message: str, hint: str) -> FfrwdError:
-    return FfrwdError(ErrorCode.UNSUPPORTED_SQL, message, hint=hint)
+def _reject(
+    message: str, hint: str, *, code: ErrorCode = ErrorCode.UNSUPPORTED_SQL
+) -> FfrwdError:
+    return FfrwdError(code, message, hint=hint)
 
 
 # --------------------------------------------------------------------------
@@ -462,6 +464,86 @@ _PINS: Mapping[tuple[str, str], Mapping[str, tuple[Artifact, ...]]] = {
                 ),
             ),
         ),
+        # The CUDA 12 runtime and cuDNN 9 belong to the machine, like the
+        # driver -- the same escape hatch the Windows tier is, at the same
+        # NVIDIA-pinned versions. The provider dlopens each by its soname
+        # (`libcudart.so.12` and so on), which is what `name` is written as;
+        # the archive's own unversioned and fully-versioned names become
+        # aliases beside it.
+        "full": (
+            Artifact(
+                url=f"{_NVIDIA}/cuda/redist/cuda_cudart/linux-x86_64"
+                "/cuda_cudart-linux-x86_64-12.9.79-archive.tar.xz",
+                sha256="1f6ad42d4f530b24bfa35894ccf6b7209d2354f59101fd62ec4a6192a184ce99",
+                size=1514676,
+                members=(
+                    Member(
+                        entry="cuda_cudart-linux-x86_64-12.9.79-archive/lib"
+                        "/libcudart.so.12.9.79",
+                        name="libcudart.so.12",
+                        aliases=("libcudart.so", "libcudart.so.12.9.79"),
+                    ),
+                ),
+            ),
+            Artifact(
+                url=f"{_NVIDIA}/cuda/redist/libcublas/linux-x86_64"
+                "/libcublas-linux-x86_64-12.9.1.4-archive.tar.xz",
+                sha256="546addc4a9d82b8f23aa9ba9274b6bc0429a63008a31c759884ac24880796057",
+                size=933611504,
+                members=(
+                    Member(
+                        entry="libcublas-linux-x86_64-12.9.1.4-archive/lib"
+                        "/libcublas.so.12.9.1.4",
+                        name="libcublas.so.12",
+                        aliases=("libcublas.so", "libcublas.so.12.9.1.4"),
+                    ),
+                    Member(
+                        entry="libcublas-linux-x86_64-12.9.1.4-archive/lib"
+                        "/libcublasLt.so.12.9.1.4",
+                        name="libcublasLt.so.12",
+                        aliases=("libcublasLt.so", "libcublasLt.so.12.9.1.4"),
+                    ),
+                ),
+            ),
+            Artifact(
+                url=f"{_NVIDIA}/cuda/redist/libcufft/linux-x86_64"
+                "/libcufft-linux-x86_64-11.4.1.4-archive.tar.xz",
+                sha256="b0e65af59b0c2f6c8ed9f5552a9b375890855b7926ae2c0404d15dcf2565bda4",
+                size=470942192,
+                members=(
+                    Member(
+                        entry="libcufft-linux-x86_64-11.4.1.4-archive/lib"
+                        "/libcufft.so.11.4.1.4",
+                        name="libcufft.so.11",
+                        aliases=("libcufft.so", "libcufft.so.11.4.1.4"),
+                    ),
+                ),
+            ),
+            # cudnn.so.9 loads the rest itself, by soname, out of this
+            # directory -- the same set the Windows tier carries.
+            Artifact(
+                url=f"{_NVIDIA}/cudnn/redist/cudnn/linux-x86_64"
+                "/cudnn-linux-x86_64-9.10.2.21_cuda12-archive.tar.xz",
+                sha256="d0defcbc4c6dad711ff4cb66d254036a300c9071b07c7b64199aacab534313c1",
+                size=1003149584,
+                members=tuple(
+                    Member(
+                        entry=f"cudnn-linux-x86_64-9.10.2.21_cuda12-archive/lib/{lib}.9.10.2",
+                        name=f"{lib}.9",
+                        aliases=(lib, f"{lib}.9.10.2"),
+                    )
+                    for lib in (
+                        "libcudnn.so",
+                        "libcudnn_adv.so",
+                        "libcudnn_graph.so",
+                        "libcudnn_ops.so",
+                        "libcudnn_heuristic.so",
+                        "libcudnn_engines_precompiled.so",
+                        "libcudnn_engines_runtime_compiled.so",
+                    )
+                ),
+            ),
+        ),
     },
     ("1.22.0", "osx-arm64"): {
         "cpu": (
@@ -520,6 +602,7 @@ def _table(found: Info) -> Mapping[str, tuple[Artifact, ...]]:
             "and the sidecar demands exactly that one",
             hint="this ffrwd is older than the sidecar it found; install the two "
             "together, or point FFRWD_NN_RUNTIME at a runtime of your own",
+            code=ErrorCode.RUNTIME_NOT_FOUND,
         )
     return pinned
 
@@ -838,6 +921,7 @@ def provision(
                 f"there is no {tier} ONNX Runtime for {known.platform}",
                 f"{known.platform} has "
                 + ", ".join(name for name in _TIER_ORDER if name in pinned),
+                code=ErrorCode.RUNTIME_NOT_FOUND,
             )
     directory = runtime_dir(known)
     absent = missing_tiers(tiers, known)
