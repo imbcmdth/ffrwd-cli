@@ -942,9 +942,9 @@ def test_a_keyboard_interrupt_in_the_watch_loop_stops_every_member(
     spawned: list[subprocess.Popen[bytes]] = []
 
     def _spawn_and_capture(
-        command: list[str], stdin: object, stdout: object
+        command: list[str], stdin: object, stdout: object, env: object = None
     ) -> subprocess.Popen[bytes]:
-        proc = real_spawn(command, stdin, stdout)
+        proc = real_spawn(command, stdin, stdout, env=env)
         spawned.append(proc)
         return proc
 
