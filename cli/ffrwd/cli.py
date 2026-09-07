@@ -1559,6 +1559,8 @@ def _cmd_run(args: argparse.Namespace, on_warning: OnWarning) -> int:
         except FfrwdError as err:
             _print_error(err, source=args.query, packages=packages, query=query)
             return 1
+        except KeyboardInterrupt:
+            return _interrupted(console)
         return 0
 
     showing = args.show or args.show_only

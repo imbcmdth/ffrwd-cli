@@ -13,6 +13,7 @@ import hashlib
 import io
 import json
 import tarfile
+import threading
 import urllib.error
 from collections.abc import Iterator
 from datetime import datetime, timezone
@@ -56,6 +57,9 @@ class _Fake:
 
     def read(self, size: int = -1) -> bytes:
         return self._body.read(size)
+
+    def close(self) -> None:
+        self._body.close()
 
     def __enter__(self) -> _Fake:
         return self
@@ -103,6 +107,35 @@ class _Served:
             if asked == url:
                 return headers, body
         raise AssertionError(f"nothing was sent to {url}")
+
+
+class _FlakyUpload:
+    """`served`'s own answers, except `url` times out `fail_times` times first.
+
+    Stands in for a send that hangs and is reset: the timeout is raised
+    before anything is read off the request, so `body.reset()` between
+    attempts has nothing to undo but is exercised all the same.
+    """
+
+    def __init__(self, served: _Served, url: str, fail_times: int) -> None:
+        self.served = served
+        self.url = url
+        self.fail_times = fail_times
+        self.calls = 0
+
+    def __call__(self, request: object, timeout: float | None = None) -> _Fake:
+        if str(request.full_url) == self.url:  # type: ignore[attr-defined]
+            self.calls += 1
+            if self.calls <= self.fail_times:
+                raise TimeoutError("timed out")
+        return self.served(request, timeout)
+
+
+class _RaisesKeyboardInterrupt:
+    """A seam that never answers: whatever it is asked, Ctrl-C got there first."""
+
+    def __call__(self, request: object, timeout: float | None = None) -> _Fake:
+        raise KeyboardInterrupt
 
 
 @pytest.fixture
@@ -1902,3 +1935,102 @@ def test_json_with_wait_on_failure_emits_the_row_and_exits_1(
     payload = json.loads(captured.out)
     assert payload["job"]["state"] == "failed"
     assert payload["job"]["error"] == "ffmpeg exited 1"
+
+
+# ---------------------------------------------------------------------------
+# a Ctrl-C reaching a stuck data-plane request, and a stalled send retrying
+# ---------------------------------------------------------------------------
+
+
+def test_interruptible_closes_the_handle_and_lets_the_worker_end(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Ctrl-C during `_interruptible`'s wait closes what the call opened,
+    unblocking it, and re-raises without waiting for it to actually finish.
+
+    The interrupt is delivered through a seam on the wait loop itself
+    (`Thread.join`, made to raise once) rather than a real Ctrl-C's own
+    timing, which a busy machine could deliver anywhere.
+    """
+    closed = threading.Event()
+    worker_saw_close = threading.Event()
+
+    class _Closeable:
+        def close(self) -> None:
+            closed.set()
+
+    def _blocked(handle: packages.Handle) -> str:
+        handle.set(_Closeable())
+        # Stands in for the blocked C socket call the real request makes:
+        # released only by closing `handle`, same as closing a live socket
+        # unblocks a `recv` stuck in it.
+        if closed.wait(5):
+            worker_saw_close.set()
+        return "unreachable once closed below ever wins the wait"
+
+    real_join = threading.Thread.join
+    fired: list[bool] = []
+
+    def _join_raises_once(self: threading.Thread, timeout: float | None = None) -> None:
+        if not fired:
+            fired.append(True)
+            raise KeyboardInterrupt
+        real_join(self, timeout)
+
+    monkeypatch.setattr(threading.Thread, "join", _join_raises_once)
+
+    with pytest.raises(KeyboardInterrupt):
+        remote._interruptible(_blocked)
+    assert closed.is_set()
+    assert worker_saw_close.wait(5)
+
+
+def test_an_upload_that_times_out_retries_and_narrates_it(
+    served: _Served, logged_in: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "in.mp4").write_bytes(b"x" * 10)
+    digest = hashlib.sha256(b"x" * 10).hexdigest()
+    _submit_accepted(served)
+    served.answers[f"{UPLOAD_URL}?sha256={digest}"] = json.dumps(
+        {"already": False, "bytes": 10}
+    ).encode("utf-8")
+    served.probes["in.mp4"] = ProbeResult(streams=[], duration=1.0)
+    flaky = _FlakyUpload(served, f"{UPLOAD_URL}?sha256={digest}", fail_times=2)
+    monkeypatch.setattr(packages, "_urlopen", flaky)
+    announced: list[str] = []
+
+    remote.submit_run(_query(MEDIA_QUERY), None, _run_args(), announce=announced.append)
+
+    assert flaky.calls == 3
+    assert announced.count("retrying the upload of in.mp4") == 2
+
+
+def test_three_upload_timeouts_raise_the_typed_unreachable_error(
+    served: _Served, logged_in: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "in.mp4").write_bytes(b"x")
+    digest = hashlib.sha256(b"x").hexdigest()
+    _submit_accepted(served)
+    served.probes["in.mp4"] = ProbeResult(streams=[], duration=1.0)
+    flaky = _FlakyUpload(served, f"{UPLOAD_URL}?sha256={digest}", fail_times=3)
+    monkeypatch.setattr(packages, "_urlopen", flaky)
+
+    with pytest.raises(FfrwdError) as caught:
+        remote.submit_run(_query(MEDIA_QUERY), None, _run_args())
+    assert flaky.calls == 3
+    assert "could not be reached" in caught.value.message
+
+
+def test_run_remote_interrupted_during_submit_prints_interrupted_and_exits_130(
+    served: _Served,
+    logged_in: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(packages, "_urlopen", _RaisesKeyboardInterrupt())
+    code = cli.main(["run", "--remote", STREAM_QUERY])
+    err = capsys.readouterr().err
+    assert code == 130
+    assert err.rstrip().endswith("interrupted")

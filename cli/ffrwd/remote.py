@@ -48,13 +48,14 @@ import shutil
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 import urllib.error
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Protocol
+from typing import Protocol, TypeVar
 
 from ffrwd import __version__, credentials, store
 from ffrwd import packages as packages_module
@@ -218,9 +219,25 @@ def _server_refusal(status: int, body: bytes) -> FfrwdError:
 
 
 # Data-plane calls wait out a cold runner: the first request to a Modal
-# endpoint holds until its container is up, and an upload's answer follows
-# the whole body.
+# endpoint holds until its container is up. Submit, start and a poll are
+# small round trips even so, and keep this long timeout; an upload or a
+# download is bounded far tighter below, since a per-operation timeout
+# applies to each blocking send or read, not to the transfer as a whole.
 _DATA_PLANE_TIMEOUT = 600.0
+
+# An upload or a download's own timeout: short enough that a connection gone
+# half-open -- the far end accepted the byte stream and stopped reading, or
+# stopped answering -- is noticed and retried well inside a person's
+# patience, rather than sitting in a blocked send or read for the ten
+# minutes above.
+_TRANSFER_TIMEOUT = 60.0
+
+# How many times an upload retries a send that timed out or was reset. Safe
+# to retry: the endpoint is content-addressed and answers `already: true`
+# for bytes it already holds, so a resend never duplicates anything.
+_UPLOAD_RETRIES = 3
+
+_T = TypeVar("_T")
 
 
 def _unreachable(url: str, err: Exception) -> FfrwdError:
@@ -229,6 +246,42 @@ def _unreachable(url: str, err: Exception) -> FfrwdError:
         f"the job service could not be reached at {url}: {reason}",
         "check the network connection, or try again -- a cold runner can take a minute",
     )
+
+
+def _interruptible(fn: Callable[[packages_module.Handle], _T]) -> _T:
+    """Run `fn(handle)` on a worker thread so a Ctrl-C lands promptly.
+
+    The calling thread waits in short joins rather than inside whatever
+    blocking call `fn` makes -- on Windows a blocked socket call notices
+    nothing until it returns, and SIGINT is only ever checked between
+    bytecodes on the thread that is not stuck in one. On interrupt this
+    closes whatever `fn` has registered on `handle` (empty if the call is
+    still connecting or sending; a per-operation timeout is what ends that
+    phase) and re-raises without waiting further for the worker to unwind --
+    it is a daemon, and the interpreter drops it the moment this process next
+    exits.
+    """
+    handle = packages_module.Handle()
+    value: list[_T] = []
+    failure: list[BaseException] = []
+
+    def _run() -> None:
+        try:
+            value.append(fn(handle))
+        except BaseException as err:  # replayed on the calling thread below
+            failure.append(err)
+
+    worker = threading.Thread(target=_run, daemon=True)
+    worker.start()
+    try:
+        while worker.is_alive():
+            worker.join(0.2)
+    except KeyboardInterrupt:
+        handle.close()
+        raise
+    if failure:
+        raise failure[0]
+    return value[0]
 
 
 def _call(
@@ -243,36 +296,43 @@ def _call(
 
     POSTs ride ``packages.exchange``; a GET is the same seam one layer down
     (``packages._urlopen``), which exchange does not offer. Either way a
-    status >= 400 becomes the server's own {error, hint}.
+    status >= 400 becomes the server's own {error, hint}, and the wait runs
+    on a worker thread (:func:`_interruptible`) so a Ctrl-C is never stuck
+    behind it.
     """
-    if data is not None:
+
+    def _once(handle: packages_module.Handle) -> bytes:
+        if data is not None:
+            try:
+                status, body = packages_module.exchange(
+                    url, headers=headers, data=data, limit=limit, timeout=timeout, handle=handle
+                )
+            except FfrwdError as err:
+                raise _unreachable(url, err) from err
+            if status >= 400:
+                raise _server_refusal(status, body)
+            return body
+        request = packages_module._request(url, headers=headers)
         try:
-            status, body = packages_module.exchange(
-                url, headers=headers, data=data, limit=limit, timeout=timeout
-            )
-        except FfrwdError as err:
+            with packages_module._urlopen(request, timeout=timeout) as response:
+                handle.set(response)
+                body = bytes(response.read(limit + 1))
+        except urllib.error.HTTPError as err:
+            try:
+                said = bytes(err.read(limit + 1))
+            except OSError:
+                said = b""
+            raise _server_refusal(err.code, said) from err
+        except (OSError, ValueError, urllib.error.URLError) as err:
             raise _unreachable(url, err) from err
-        if status >= 400:
-            raise _server_refusal(status, body)
+        if len(body) > limit:
+            raise _reject(
+                f"the job service served more than {limit} bytes at {url}",
+                "that is not an answer this client reads; check the API base URL",
+            )
         return body
-    request = packages_module._request(url, headers=headers)
-    try:
-        with packages_module._urlopen(request, timeout=timeout) as response:
-            body = bytes(response.read(limit + 1))
-    except urllib.error.HTTPError as err:
-        try:
-            said = bytes(err.read(limit + 1))
-        except OSError:
-            said = b""
-        raise _server_refusal(err.code, said) from err
-    except (OSError, ValueError, urllib.error.URLError) as err:
-        raise _unreachable(url, err) from err
-    if len(body) > limit:
-        raise _reject(
-            f"the job service served more than {limit} bytes at {url}",
-            "that is not an answer this client reads; check the API base URL",
-        )
-    return body
+
+    return _interruptible(_once)
 
 
 def _malformed(where: str) -> FfrwdError:
@@ -397,7 +457,13 @@ def submit_run(
                 f"({written_size(len(archive.content))})"
             )
         _upload_bytes(
-            upload_url, job_token, archive.content, archive.entry.sha256, progress
+            upload_url,
+            job_token,
+            archive.content,
+            archive.entry.sha256,
+            archive.entry.name,
+            announce,
+            progress,
         )
     for path, digest in uploads:
         _upload(upload_url, job_token, path, digest, announce, progress)
@@ -703,14 +769,16 @@ def _upload(
             f"input '{path}' could not be read: {err.strerror or err}",
             "a file input is uploaded from this machine, so it has to be readable",
         ) from err
-    with opened as handle:
+    with opened as stream:
         if announce is not None:
             announce(f"uploading {path} ({written_size(size)})")
         _upload_body(
             upload_url,
             job_token,
-            packages_module.CountedBody(handle, size, progress),
+            packages_module.CountedBody(stream, size, progress),
             digest,
+            announce=announce,
+            name=path,
         )
 
 
@@ -719,6 +787,8 @@ def _upload_bytes(
     job_token: str,
     content: bytes,
     digest: str,
+    name: str,
+    announce: Announce | None = None,
     progress: Progress | None = None,
 ) -> None:
     """POST `content`, which is already in hand, through the same counted body."""
@@ -727,24 +797,62 @@ def _upload_bytes(
         job_token,
         packages_module.CountedBody(io.BytesIO(content), len(content), progress),
         digest,
+        announce=announce,
+        name=name,
     )
 
 
 def _upload_body(
-    upload_url: str, job_token: str, body: packages_module.CountedBody, digest: str
+    upload_url: str,
+    job_token: str,
+    body: packages_module.CountedBody,
+    digest: str,
+    *,
+    announce: Announce | None = None,
+    name: str | None = None,
 ) -> None:
     """POST `body` to the content-addressed endpoint under its digest.
 
     Shared by the file inputs and the packed linked packages: both are bytes
     the runner reads back by digest, and the endpoint answers ``already: true``
-    for content it already holds.
+    for content it already holds. Each send is bounded by `_TRANSFER_TIMEOUT`
+    rather than the full ten minutes a cold start gets -- an upload that goes
+    quiet mid-send (the far end took the bytes and stopped reading) is
+    noticed there, not sat through -- and a socket timeout or a reset
+    connection retries the send from the start up to `_UPLOAD_RETRIES` times:
+    safe, since the endpoint answers ``already: true`` for content it already
+    has. A Ctrl-C during any attempt is never retried.
     """
-    _call(
-        f"{upload_url}?sha256={digest}",
-        headers={"x-job-token": job_token, "Content-Type": "application/octet-stream"},
-        data=body,
-        timeout=_DATA_PLANE_TIMEOUT,
-    )
+    url = f"{upload_url}?sha256={digest}"
+    headers = {"x-job-token": job_token, "Content-Type": "application/octet-stream"}
+
+    def _send(handle: packages_module.Handle) -> bytes:
+        request = packages_module._request(url, headers=headers, data=body)
+        try:
+            with packages_module._urlopen(request, timeout=_TRANSFER_TIMEOUT) as response:
+                handle.set(response)
+                return bytes(response.read(_MAX_RESPONSE_BYTES + 1))
+        except urllib.error.HTTPError as err:
+            try:
+                said = bytes(err.read(_MAX_RESPONSE_BYTES + 1))
+            except OSError:
+                said = b""
+            raise _server_refusal(err.code, said) from err
+        except (TimeoutError, ConnectionError):
+            raise
+        except (OSError, ValueError, urllib.error.URLError) as err:
+            raise _unreachable(url, err) from err
+
+    for attempt in range(1, _UPLOAD_RETRIES + 1):
+        try:
+            _interruptible(_send)
+            return
+        except (TimeoutError, ConnectionError) as err:
+            if attempt >= _UPLOAD_RETRIES:
+                raise _unreachable(url, err) from err
+            if announce is not None:
+                announce(f"retrying the upload of {name or url}")
+            body.reset()
 
 
 # --------------------------------------------------------------------------
@@ -1322,7 +1430,11 @@ def _download(
     Written beside the destination and moved onto it, so an interrupted or
     corrupt download never leaves a half-file under the real name. `shown`
     names the output in refusals when `path` is a staging file. `progress`
-    hears every chunk against `total`, which is what the job recorded.
+    hears every chunk against `total`, which is what the job recorded. The
+    read runs on a worker thread (:func:`_interruptible`), bounded chunk by
+    chunk at `_TRANSFER_TIMEOUT` rather than the ten minutes a cold start
+    gets, so a Ctrl-C or a connection gone quiet is noticed promptly rather
+    than sat through.
     """
     named = shown if shown is not None else str(path)
     parent = path.parent
@@ -1336,10 +1448,12 @@ def _download(
         ) from err
     part = path.with_name(f"{path.name}.part")
     hasher = hashlib.sha256()
-    request = packages_module._request(url)
-    try:
-        with packages_module._urlopen(request, timeout=_DATA_PLANE_TIMEOUT) as response:
-            with open(part, "wb") as handle:
+
+    def _receive(handle: packages_module.Handle) -> None:
+        request = packages_module._request(url)
+        with packages_module._urlopen(request, timeout=_TRANSFER_TIMEOUT) as response:
+            handle.set(response)
+            with open(part, "wb") as stream:
                 written = 0
                 while True:
                     chunk = bytes(response.read(_CHUNK_BYTES))
@@ -1348,10 +1462,13 @@ def _download(
                             progress(written, total if total is not None else written)
                         break
                     hasher.update(chunk)
-                    handle.write(chunk)
+                    stream.write(chunk)
                     written += len(chunk)
                     if progress is not None:
                         progress(written, total)
+
+    try:
+        _interruptible(_receive)
     except urllib.error.HTTPError as err:
         part.unlink(missing_ok=True)
         try:

@@ -56,18 +56,20 @@ in that walk is the one thing this module refuses outright, naming the loop.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
 import re
 import tempfile
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import IO
+from typing import IO, Protocol
 
 from . import credentials, nn, store, wasm
 from .console import Announce, Progress, written_size
@@ -102,6 +104,7 @@ __all__ = [
     "DEFAULT_REGISTRY",
     "REGISTRY_ENV",
     "CountedBody",
+    "Handle",
     "Installed",
     "Listing",
     "Release",
@@ -327,6 +330,43 @@ def _too_large(where: str, limit: int) -> FfrwdError:
 _urlopen = urllib.request.urlopen
 
 
+class _Closeable(Protocol):
+    def close(self) -> None: ...
+
+
+class Handle:
+    """What an interrupted request closes to unblock itself.
+
+    Filled by the request as soon as something exists to close -- a response
+    once its headers are back. Nothing is set while a call is still
+    connecting or sending: ``urlopen`` holds no handle to hand over until it
+    returns, so that phase is bounded by its own timeout instead. Closing
+    before anything is set is remembered, so whatever `set` gets next closes
+    immediately rather than being waited on.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._target: _Closeable | None = None
+        self._closed = False
+
+    def set(self, target: _Closeable) -> None:
+        with self._lock:
+            if not self._closed:
+                self._target = target
+                return
+        with contextlib.suppress(Exception):
+            target.close()
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+            target, self._target = self._target, None
+        if target is not None:
+            with contextlib.suppress(Exception):
+                target.close()
+
+
 class _Status(Exception):
     """An HTTP status the caller judges rather than the fetcher.
 
@@ -401,6 +441,12 @@ class CountedBody:
                 self._progress(self._sent, self.size)
         return block
 
+    def reset(self) -> None:
+        """Rewind for a retried send, as if nothing had gone out yet."""
+        self._source.seek(0)
+        self._sent = 0
+        self._reported = 0
+
 
 def _request(
     url: str,
@@ -418,14 +464,22 @@ def _request(
 
 
 def _read(
-    url: str, limit: int, request: urllib.request.Request, timeout: float = TIMEOUT
+    url: str,
+    limit: int,
+    request: urllib.request.Request,
+    timeout: float = TIMEOUT,
+    handle: Handle | None = None,
 ) -> bytes:
     """The bytes `url` serves, bounded by `limit`, or a rejection naming it.
 
     Raises :class:`_Status` for an HTTP status, which the caller decides about.
+    `handle`, when given, holds the response open as soon as it exists, so an
+    interrupted caller can close it out from under a blocked `read`.
     """
     try:
         with _urlopen(request, timeout=timeout) as response:
+            if handle is not None:
+                handle.set(response)
             content = bytes(response.read(limit + 1))
     except urllib.error.HTTPError as err:
         try:
@@ -514,6 +568,7 @@ def exchange(
     data: bytes | CountedBody,
     limit: int,
     timeout: float = TIMEOUT,
+    handle: Handle | None = None,
 ) -> tuple[int, bytes]:
     """One POST through this module's HTTP seam: the status, and the body.
 
@@ -524,11 +579,12 @@ def exchange(
     success reads as 200; only whether it succeeded is a caller's question.
 
     `data` is the whole body, or a :class:`CountedBody` streamed out of a
-    file and reported as it goes.
+    file and reported as it goes. `handle` is :func:`_read`'s own -- see
+    there.
     """
     request = _request(url, headers=headers, data=data)
     try:
-        return 200, _read(url, limit, request, timeout)
+        return 200, _read(url, limit, request, timeout, handle=handle)
     except _Status as status:
         return status.code, status.body
 
