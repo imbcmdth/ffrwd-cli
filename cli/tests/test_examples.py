@@ -399,26 +399,37 @@ def test_offline_example_compiles_to_the_shown_command(
     _assert_shlex_invariant(actual, expected)
 
 
-def _require_modules(example: Example) -> None:
-    """Skip a recipe naming a wasm module the machine cannot describe.
+def missing_module(example: Example) -> str | None:
+    """Why this machine cannot describe the wasm modules `example` names, or None.
 
     The same courtesy the rest of the exec tier extends to a missing ffmpeg:
     describing a module needs the sidecar installed and the module itself
     built, and neither ships with the Python package. Resolve is enough to
     learn which modules a recipe names -- it reads the declarations without
     running anything.
+
+    Separate from the skip below so another exec-tier module can ask the
+    question without skipping its whole test on the answer.
     """
     if f"language {_WASM}" not in example.sql.lower():
-        return
+        return None
     if binaries.ffrwd_wasm_path() is None:
-        pytest.skip("ffrwd-wasm not found (uv sync --extra wasm)")
+        return "ffrwd-wasm not found (uv sync --extra wasm)"
     try:
         declared = resolve(parse(example.sql)).wasm
     except FfrwdError:  # a rejection the compile below will report properly
-        return
+        return None
     for function in declared.values():
         if not (PROJECT_ROOT / function.module).exists():
-            pytest.skip(f"module missing: {function.module}")
+            return f"module missing: {function.module}"
+    return None
+
+
+def _require_modules(example: Example) -> None:
+    """Skip a recipe naming a wasm module the machine cannot describe."""
+    reason = missing_module(example)
+    if reason is not None:
+        pytest.skip(reason)
 
 
 @pytest.mark.exec

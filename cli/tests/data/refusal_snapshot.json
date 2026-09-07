@@ -1,0 +1,1367 @@
+{
+  "cli/tests/golden/010-readme-pip": {
+    "command": [
+      "ffmpeg -i game.mp4 -filter_complex '[0:v:0]crop=out_w=1200:out_h=50:x=600:y=200,scale=width=iw/2[n2];[0:v:0][n2]overlay=x=20:y=20[out0]' -map '[out0]' out.mp4"
+    ],
+    "tier": "offline",
+    "verdict": "accepted"
+  },
+  "cli/tests/golden/011-readme-pip-audio": {
+    "command": [
+      "ffmpeg -i game.mp4 -filter_complex '[0:v:0]crop=out_w=1200:out_h=50:x=600:y=200,scale=width=iw/2[n2];[0:v:0][n2]overlay=x=20:y=20[out0];[0:a:0]volume=volume=0.65[n4];[0:a:0]volume=volume=0.35[n5];[n4][n5]amix=inputs=2[out1]' -map '[out0]' -map '[out1]' out.mp4"
+    ],
+    "tier": "offline",
+    "verdict": "accepted"
+  },
+  "cli/tests/golden/020-scale-only": {
+    "command": [
+      "ffmpeg -i clip.mp4 -filter_complex '[0:v:0]scale=width=iw/2[out0]' -map '[out0]' out.mp4"
+    ],
+    "tier": "offline",
+    "verdict": "accepted"
+  },
+  "cli/tests/golden/021-crop-scale-chain": {
+    "command": [
+      "ffmpeg -i clip.mp4 -filter_complex '[0:v:0]crop=out_w=10:out_h=20:x=300:y=400,scale=width=640:height=480[out0]' -map '[out0]' out.mp4"
+    ],
+    "tier": "offline",
+    "verdict": "accepted"
+  },
+  "cli/tests/golden/030-trim-where": {
+    "command": [
+      "ffmpeg -ss 1 -to 5 -i clip.mp4 -filter_complex '[0:v:0]scale=width=iw*2[out0]' -map '[out0]' out.mp4"
+    ],
+    "tier": "offline",
+    "verdict": "accepted"
+  },
+  "cli/tests/golden/031-trim-tail": {
+    "command": [
+      "ffmpeg -ss 5 -i clip.mp4 -filter_complex '[0:v:0]scale=width=iw*2[out0]' -map '[out0]' out.mp4"
+    ],
+    "tier": "offline",
+    "verdict": "accepted"
+  },
+  "cli/tests/golden/040-union-concat": {
+    "command": [
+      "ffmpeg -i one.mp4 -i two.mp4 -filter_complex '[0:v:0][1:v:0]concat=n=2:v=1:a=0[out0]' -map '[out0]' out.mp4"
+    ],
+    "tier": "offline",
+    "verdict": "accepted"
+  },
+  "cli/tests/golden/050-cte-reuse-split": {
+    "command": [
+      "ffmpeg -i clip.mp4 -filter_complex '[0:v:0]scale=width=iw/2,split=2[n1_split0][n1_split1];[n1_split0][n1_split1]overlay=x=10:y=10[out0]' -map '[out0]' out.mp4"
+    ],
+    "tier": "offline",
+    "verdict": "accepted"
+  },
+  "cli/tests/golden/060-blur-regions-macro": {
+    "command": [
+      "ffmpeg -i clip.mp4 -filter_complex '[0:v:0]split=2[src_a_v_0_split0][src_a_v_0_split1];[src_a_v_0_split0]crop=out_w=200:out_h=150:x=100:y=100,gblur=sigma=5[n2];[src_a_v_0_split1][n2]overlay=x=100:y=100[out0]' -map '[out0]' out.mp4"
+    ],
+    "tier": "offline",
+    "verdict": "accepted"
+  },
+  "cli/tests/golden/070-overlay-pip": {
+    "command": [
+      "ffmpeg -i main.mp4 -i logo.mp4 -filter_complex '[1:v:0]scale=width=iw*0.3[n1];[0:v:0][n1]overlay=x=50:y=50[out0]' -map '[out0]' out.mp4"
+    ],
+    "tier": "offline",
+    "verdict": "accepted"
+  },
+  "cli/tests/golden/080-remap-only": {
+    "command": [
+      "ffmpeg -i foo.mp4 -map 0:v:0 -c:0 copy -map 0:a:1 -c:1 copy out.mp4"
+    ],
+    "tier": "offline",
+    "verdict": "accepted"
+  },
+  "cli/tests/golden/081-filtered-plus-passthrough": {
+    "command": [
+      "ffmpeg -i foo.mp4 -filter_complex '[0:v:0]scale=width=iw/2[out0]' -map '[out0]' -map 0:a:0 -c:1 copy out.mp4"
+    ],
+    "tier": "offline",
+    "verdict": "accepted"
+  },
+  "cli/tests/golden/082-union-av-concat": {
+    "command": [
+      "ffmpeg -i intro.mp4 -i main.mp4 -filter_complex '[0:v:0][0:a:0][1:v:0][1:a:0]concat=n=2:v=1:a=1[out0][out1]' -map '[out0]' -map '[out1]' out.mp4"
+    ],
+    "tier": "offline",
+    "verdict": "accepted"
+  },
+  "cli/tests/golden/090-sink-codecs": {
+    "command": [
+      "ffmpeg -i foo.mp4 -map 0:v:0 -map 0:a:0 -c:0 libx264 -crf:0 20 -preset:0 slow -c:1 aac -b:1 192k -movflags +faststart out.mkv"
+    ],
+    "tier": "offline",
+    "verdict": "accepted"
+  },
+  "cli/tests/golden/095-subtitle-join": {
+    "command": [
+      "ffmpeg -i film.mp4 -i subs.en.vtt -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -map 1:s:0 -c:2 mov_text out.mp4"
+    ],
+    "tier": "offline",
+    "verdict": "accepted"
+  },
+  "cli/tests/golden/096-ad-insert": {
+    "command": [
+      "ffmpeg -i film.mp4 -i ad.mp4 -filter_complex '[1:v:0]scale=width=iw*0.33:height=ih*0.33,format=pix_fmts=yuva420p,tpad=start_duration=1:stop=1:color=black@0[n3];[0:v:0][n3]overlay=x=20:y=20[out0];[1:a:0]adelay=delays=1000,volume=volume=0.5[n6];[0:a:0][n6]amix=inputs=2[out1]' -map '[out0]' -map '[out1]' out.mp4"
+    ],
+    "tier": "offline",
+    "verdict": "accepted"
+  },
+  "cli/tests/golden/097-input-loop": {
+    "command": [
+      "ffmpeg -i film.mp4 -loop 1 -framerate 15 -i logo.png -filter_complex '[0:v:0][1:v:0]overlay=x=20:y=20[out0]' -map '[out0]' out.mp4"
+    ],
+    "tier": "offline",
+    "verdict": "accepted"
+  },
+  "cli/tests/golden/098-centered-overlay": {
+    "command": [
+      "ffmpeg -i film.mp4 -i logo.png -filter_complex '[0:v:0][1:v:0]overlay=x=(W-w)/2:y=(H-h)/2[out0]' -map '[out0]' out.mp4"
+    ],
+    "tier": "offline",
+    "verdict": "accepted"
+  },
+  "cli/tests/golden/099-view-single-sink": {
+    "command": [
+      "ffmpeg -i film.mp4 -filter_complex '[0:v:0]scale=width=1280:height=-2[n1];[0:a:0]volume=volume=0.8[out1];[n1]gblur=sigma=2[out0]' -map '[out0]' -map '[out1]' -c:0 libx264 -crf:0 20 720.mp4"
+    ],
+    "tier": "offline",
+    "verdict": "accepted"
+  },
+  "cli/tests/golden/100-abr-ladder": {
+    "command": [
+      "ffmpeg -i film.mkv -filter_complex '[0:v:0]scale=width=1920:height=-2[n1];[0:a:0]volume=volume=0.9[n2];[n1]split=2[n1_split0][n1_split1];[n1_split0]scale=width=1280:height=-2[out0];[n1_split1]scale=width=640:height=-2[out2];[n2]asplit=3[out1][out3][out4]' -map '[out0]' -map '[out1]' -c:0 libx264 -crf:0 21 -c:1 aac 720.mp4 -map '[out2]' -map '[out3]' -c:0 libx264 -crf:0 26 -c:1 aac 360.mp4 -map '[out4]' -c:0 aac -b:0 128k audio.m4a"
+    ],
+    "tier": "offline",
+    "verdict": "accepted"
+  },
+  "cli/tests/golden/900-group-by": {
+    "error": {
+      "code": "NO_STREAMING_EQUIVALENT",
+      "col": 10,
+      "hint": "remove the GROUP BY clause",
+      "line": 3,
+      "message": "GROUP BY has no streaming equivalent"
+    },
+    "tier": "offline",
+    "verdict": "refused"
+  },
+  "cli/tests/golden/910-nonstream-column": {
+    "error": {
+      "code": "UNSUPPORTED_SQL",
+      "col": 20,
+      "hint": "a SELECT column must be a stream, e.g. a.video[1] or scale(a.video[1], 640, -2)",
+      "line": 1,
+      "message": "every SELECT column must be a stream expression, got a numeric literal"
+    },
+    "tier": "offline",
+    "verdict": "refused"
+  },
+  "cli/tests/golden/920-unknown-func": {
+    "error": {
+      "code": "UNKNOWN_FUNCTION",
+      "col": 8,
+      "hint": "every function is a filter of your installed ffmpeg, and this is not one of them; filters with a variable pad count, more than one output, or no input at all are not callable",
+      "line": 1,
+      "message": "unknown function xyzzyplugh()"
+    },
+    "tier": "offline",
+    "verdict": "refused"
+  },
+  "cli/tests/golden/930-bad-arity": {
+    "error": {
+      "code": "UDF_ARG_TYPE",
+      "col": 38,
+      "hint": "its options, in the order they bind: sigma, steps, planes, sigmaV",
+      "line": 1,
+      "message": "gblur() got 5 positional options, but the 'gblur' filter has 4"
+    },
+    "tier": "offline",
+    "verdict": "refused"
+  },
+  "docs/corpus.md::100-read-the-encoder-s-output-packet-by-packet": {
+    "command": [
+      "ffmpeg -i tests/fixtures/av.mp4 -map 0:v:0 -c:0 copy -f nut pipe:1 | ffrwd-wasm -f nut -i pipe:0 -m ../sidecar/modules/target/wasm32-wasip2/release/packet_stats.wasm -f ndjson pipe:1"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::100-read-the-encoder-s-output-packet-by-packet-2": {
+    "command": [
+      "ffmpeg -i tests/fixtures/av.mp4 -map 0:v:0 -c:0 libx265 -pix_fmt:0 yuv420p -crf:0 30 -preset:0 fast -f nut pipe:1 | ffrwd-wasm -f nut -i pipe:0 -m ../sidecar/modules/target/wasm32-wasip2/release/packet_stats.wasm -f ndjson pipe:1"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::100-read-the-encoder-s-output-packet-by-packet-3": {
+    "command": [
+      "# named pipes: sidecar0 reads ffmpeg0, ffmpeg0; ffmpeg0 feeds sidecar0, sidecar0",
+      "1. ffmpeg: ffmpeg -i tests/fixtures/av.mp4 -filter_complex '[0:v:0]split=2[src_s_v_0_split0][src_s_v_0_split1];[src_s_v_0_split0]scale=width=640:height=-2[out0];[src_s_v_0_split1]scale=width=320:height=-2[out1]' -map '[out0]' -c:0 libx264 -pix_fmt:0 yuv420p -b:0 1200k -f nut '<named pipe ffmpeg0-sidecar0 n1 write>' -map '[out1]' -c:0 libx264 -pix_fmt:0 yuv420p -b:0 400k -f nut '<named pipe ffmpeg0-sidecar0 n2 write>'",
+      "2. sidecar: ffrwd-wasm -f nut -i '<named pipe ffmpeg0-sidecar0 n1 read>' -f nut -i '<named pipe ffmpeg0-sidecar0 n2 read>' -m ../sidecar/modules/target/wasm32-wasip2/release/packet_tally.wasm -f ndjson pipe:1",
+      "# this listing is not a shell command -- run the plan with `ffrwd run`"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::101-read-a-live-source-once-however-many-ways-the-query-uses-it": {
+    "command": [
+      "# named pipes: ffmpeg0 reads ffmpeg1, sidecar0; ffmpeg1 feeds sidecar0, ffmpeg0",
+      "1. ffmpeg: ffmpeg -f nut -i '<named pipe ffmpeg1-ffmpeg0 src_a_v_0_split:1 read>' -f nut -i '<named pipe sidecar0-ffmpeg0 n1 read>' -filter_complex '[0:v:0][1:v:0]hstack=inputs=2[out0]' -map '[out0]' -c:0 libx264 -crf:0 22 live.mp4",
+      "2. ffmpeg: ffmpeg -f lavfi -re -i testsrc2=size=640x360:rate=30:duration=5 -filter_complex '[0:v:0]split=2[out0][out1]' -map '[out0]' -c:0 rawvideo -pix_fmt:0 rgba -f nut '<named pipe ffmpeg1-sidecar0 src_a_v_0_split:0 write>' -map '[out1]' -c:0 rawvideo -pix_fmt:0 yuv420p -f nut '<named pipe ffmpeg1-ffmpeg0 src_a_v_0_split:1 write>'",
+      "3. sidecar: ffrwd-wasm -f nut -i pipe:0 -m ../sidecar/modules/target/wasm32-wasip2/release/invert.wasm -f nut pipe:1",
+      "# this listing is not a shell command -- run the plan with `ffrwd run`"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::102-size-the-buffer-between-a-live-source-s-two-paths": {
+    "command": [
+      "# named pipes: ffmpeg0 reads ffmpeg1, sidecar0; ffmpeg1 feeds sidecar0, ffmpeg0",
+      "1. ffmpeg: ffmpeg -f nut -i '<named pipe ffmpeg1-ffmpeg0 src_a_v_0_split:1 read>' -f nut -i '<named pipe sidecar0-ffmpeg0 n1 read>' -filter_complex '[0:v:0][1:v:0]hstack=inputs=2[out0]' -map '[out0]' -c:0 libx264 -crf:0 22 live.mp4",
+      "2. ffmpeg: ffmpeg -f lavfi -re -i testsrc2=size=1920x1080:rate=30:duration=5 -filter_complex '[0:v:0]split=2[out0][out1]' -map '[out0]' -c:0 rawvideo -pix_fmt:0 rgba -f nut '<named pipe ffmpeg1-sidecar0 src_a_v_0_split:0 write>' -map '[out1]' -c:0 rawvideo -pix_fmt:0 yuv420p -fifo_format nut -queue_size 2 -f fifo '<named pipe ffmpeg1-ffmpeg0 src_a_v_0_split:1 write>'",
+      "3. sidecar: ffrwd-wasm -f nut -i pipe:0 -m ../sidecar/modules/target/wasm32-wasip2/release/invert.wasm -f nut pipe:1",
+      "# this listing is not a shell command -- run the plan with `ffrwd run`"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::103-give-each-rung-of-the-ladder-its-own-encode": {
+    "command": [
+      "ffmpeg -i tests/fixtures/av.mp4 -filter_complex '[0:v:0]split=3[src_f_v_0_split0][src_f_v_0_split1][src_f_v_0_split2];[src_f_v_0_split0]scale=width=1920:height=-2[out0];[src_f_v_0_split1]scale=width=1280:height=-2[out2];[src_f_v_0_split2]scale=width=640:height=-2[out4]' -map '[out0]' -map 0:a:0 -c:0 libx264 -b:0 6000k -c:1 aac 1080p.mp4 -map '[out2]' -map 0:a:0 -c:0 libx264 -b:0 3000k -c:1 aac 720p.mp4 -map '[out4]' -map 0:a:0 -c:0 libx264 -b:0 1000k -c:1 aac 360p.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::106-the-widest-rung-of-an-abr-ladder": {
+    "command": [
+      "ffmpeg -i tests/fixtures/ladder/master.m3u8 -map 0:v:0 -map 0:a:0 -c:0 libx264 -crf:0 20 -c:1 aac widest.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::107-re-encode-an-abr-ladder-through-to-another-abr-ladder": {
+    "command": [
+      "ffmpeg -i tests/fixtures/ladder/master.m3u8 -map 0:v:0 -map 0:v:1 -map 0:a:0 -map 0:a:1 -f hls -hls_time 2 -hls_playlist_type vod -hls_segment_type fmp4 -c:0 libx264 -c:1 libx264 -c:2 aac -c:3 aac -g:0 30 -g:1 30 -keyint_min:0 30 -keyint_min:1 30 -sc_threshold:0 0 -sc_threshold:1 0 -var_stream_map 'v:0,a:0,name:1080p v:1,a:1,name:720p' -master_pl_name master.m3u8 -hls_segment_filename out/%v/segment_%d.m4s -hls_fmp4_init_filename init.mp4 out/%v/index.m3u8"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::108-stream-a-file-as-if-it-were-live": {
+    "command": [
+      "ffmpeg -re -i film.mkv -map 0:v:0 -map 0:a:0 -f flv -c:0 libx264 -c:1 aac rtmp://live.example.com/app/streamkey"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::109-a-ladder-into-one-file-with-every-rung-as-its-own-track": {
+    "command": [
+      "ffmpeg -i tests/fixtures/ladder/master.m3u8 -map 0:v:0 -map 0:v:1 -c:0 libx264 -c:1 libx264 -crf:0 20 -crf:1 20 archive.mkv"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::11-burn-subtitles-into-the-picture": {
+    "command": [
+      "ffmpeg -i film.mp4 -filter_complex '[0:v:0]subtitles=filename=subs.en.srt[out0]' -map '[out0]' -map 0:a:0 -c:1 copy burned.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::110-every-video-rung-muxed-with-every-audio-rendition-one-mp4-each": {
+    "command": [
+      "ffmpeg -i tests/fixtures/ladder-demuxed/master.mpd -map 0:v:0 -map 0:a:0 -c:0 libx264 -crf:0 20 -c:1 aac out-1080p-69000.mp4 -map 0:v:1 -map 0:a:0 -c:0 libx264 -crf:0 20 -c:1 aac out-720p-69000.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::111-a-source-module-in-from": {
+    "command": [
+      "ffrwd-wasm -m ../sidecar/modules/target/wasm32-wasip2/release/source_replay.wasm -track 0 -f nut pipe:1 | ffmpeg -f nut -i pipe:0 -map 0:v:0 -c:0 libx264 -crf:0 20 source.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::112-a-function-over-a-caption-file-s-cues": {
+    "command": [
+      "ffmpeg -i tests/fixtures/av.mp4 -i tests/fixtures/subs.en.vtt -f webvtt -i 'data:text/vtt;base64,V0VCVlRUCgowMDowMDowMC4wMDAgLS0+IDAwOjAwOjAwLjYwMApDVUUgT05FLgoKMDA6MDA6MDAuNzAwIC0tPiAwMDowMDowMS4zMDAKQ1VFIFRXTy4KCjAwOjAwOjAxLjQwMCAtLT4gMDA6MDA6MDIuMDAwCkNVRSBUSFJFRS4K' -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -map 2:s:0 -c:2 copy shouted.mkv"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::114-a-source-whose-rows-are-files-ffmpeg-opens-itself": {
+    "command": [
+      "ffmpeg -i tests/fixtures/av.mp4 -i tests/fixtures/av2.mp4 -filter_complex '[0:v:0][1:v:0]concat=n=2:v=1:a=0[out0];[0:a:0][1:a:0]concat=n=2:v=0:a=1[out1]' -map '[out0]' -map '[out1]' joined.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::116-list-a-source-s-rows-as-a-table": {
+    "command": [
+      " sequence | width | height",
+      "----------+-------+--------",
+      " 1        | 320   | 240",
+      " 2        | 320   | 240",
+      "(2 rows)"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::119-read-a-described-file-s-rows-back": {
+    "command": [
+      " track        | start_t | end_t | dims",
+      "--------------+---------+-------+------",
+      " clip_vectors | 0.0     | 1.5   | 8",
+      " clip_vectors | 1.5     | 3.0   | 8",
+      " clip_vectors | 3.0     | 4.0   | 8",
+      "(3 rows)"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::12-speed-a-clip-up-2x-picture-and-sound-together": {
+    "command": [
+      "ffmpeg -i film.mp4 -filter_complex '[0:v:0]setpts=PTS/2[out0];[0:a:0]atempo=tempo=2[out1]' -map '[out0]' -map '[out1]' fast.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::120-rows-named-once-used-twice": {
+    "command": [
+      " v             | cues             | translated",
+      "---------------+------------------+------------------",
+      " <video 0:v:0> | <subtitle 1:s:0> | <subtitle 2:s:0>",
+      "(1 row)"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::121-pace-a-concatenation-to-a-live-destination": {
+    "command": [
+      "ffmpeg -i tests/fixtures/av-chapters.mkv -filter_complex '[0:a:0][0:a:1]concat=n=2:v=0:a=1,arealtime[out0]' -map '[out0]' -f mpegts -c:0 aac udp://127.0.0.1:5004"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::122-rows-written-twice-once-translated": {
+    "command": [
+      "# named pipes: ffmpeg0 reads sidecar0, sidecar0; sidecar0 feeds ffmpeg0, ffmpeg0",
+      "1. ffmpeg: ffmpeg -i tests/fixtures/av.mp4 -f webvtt -i '<named pipe sidecar0-ffmpeg0 ffrwd.cues#2 read>' -f webvtt -i '<named pipe sidecar0-ffmpeg0 ffrwd.cues#3 read>' -map 0:v:0 -c:0 copy -map 1:s:0 -c:1 copy -metadata:s:1 title=speech -map 2:s:0 -c:2 copy -metadata:s:2 title=translated spoken.mkv",
+      "2. ffmpeg: ffmpeg -i tests/fixtures/av.mp4 -map 0:v:0 -c:0 rawvideo -pix_fmt:0 rgba -f nut pipe:1",
+      "3. sidecar: ffrwd-wasm -f nut -i pipe:0 -m ../sidecar/modules/target/wasm32-wasip2/release/captions.wasm -m ../sidecar/modules/target/wasm32-wasip2/release/fauxlate.wasm -rows-from 0 -rows 0 -f webvtt '<named pipe sidecar0-ffmpeg0 ffrwd.cues#2 write>' -rows 1 -f webvtt '<named pipe sidecar0-ffmpeg0 ffrwd.cues#3 write>'",
+      "# this listing is not a shell command -- run the plan with `ffrwd run`"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::124-a-muxed-ladder-from-one-file": {
+    "command": [
+      "ffmpeg -i tests/fixtures/av.mp4 -filter_complex '[0:v:0]split=2[src_f_v_0_split0][src_f_v_0_split1];[src_f_v_0_split0]scale=width=320:height=-2[out0];[src_f_v_0_split1]scale=width=160:height=-2[out1];[0:a:0]asplit=2[out2][out3]' -map '[out0]' -map '[out1]' -map '[out2]' -map '[out3]' -f hls -hls_time 2 -hls_playlist_type vod -c:0 libx264 -c:1 libx264 -c:2 aac -c:3 aac -g:0 30 -g:1 30 -keyint_min:0 30 -keyint_min:1 30 -sc_threshold:0 0 -sc_threshold:1 0 -var_stream_map 'v:0,a:0,name:240p v:1,a:1,name:120p' -master_pl_name master.m3u8 -hls_segment_filename out/%v/segment_%d.ts out/%v/index.m3u8"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::126-republish-a-demuxed-ladder-with-select": {
+    "command": [
+      "ffmpeg -i tests/fixtures/ladder-demuxed/master.mpd -map 0:v:0 -c:0 copy -map 0:v:1 -c:1 copy -map 0:a:0 -c:2 copy -f hls -var_stream_map 'v:0,agroup:aud,name:0 v:1,agroup:aud,name:1 a:0,agroup:aud,name:2,default:yes' -master_pl_name master.m3u8 -hls_segment_filename out/%v/segment_%d.ts out/%v/index.m3u8"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::127-the-same-republish-spelled-out": {
+    "command": [
+      "ffmpeg -i tests/fixtures/ladder-demuxed/master.mpd -map 0:v:0 -c:0 copy -map 0:v:1 -c:1 copy -map 0:a:0 -c:2 copy -f hls -var_stream_map 'v:0,agroup:aud,name:0 v:1,agroup:aud,name:1 a:0,agroup:aud,name:2,default:yes' -master_pl_name master.m3u8 -hls_segment_filename out/%v/segment_%d.ts out/%v/index.m3u8"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::128-a-trimmed-ladder-keeps-its-names": {
+    "command": [
+      "ffmpeg -i tests/fixtures/ladder-demuxed/master.mpd -map 0:v:0 -c:0 copy -map 0:v:1 -c:1 copy -f hls -var_stream_map 'v:0,name:0 v:1,name:1' -master_pl_name master.m3u8 -hls_segment_filename out/%v/segment_%d.ts out/%v/index.m3u8"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::129-a-computed-cell-beside-a-copied-one": {
+    "command": [
+      "ffmpeg -i tests/fixtures/ladder-demuxed/master.mpd -filter_complex '[0:v:0]scale=width=960:height=-2[out0]' -map '[out0]' -map 0:a:0 -f hls -c:0 libx264 -c:1 aac -g:0 30 -keyint_min:0 30 -sc_threshold:0 0 -var_stream_map 'v:0,agroup:aud,name:720p a:0,agroup:aud,name:2,default:yes' -master_pl_name master.m3u8 -hls_segment_filename out/%v/segment_%d.ts out/%v/index.m3u8"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::13-crossfade-between-two-clips": {
+    "command": [
+      "ffmpeg -i one.mp4 -i two.mp4 -filter_complex '[0:v:0][1:v:0]xfade=duration=1:offset=9[out0];[0:a:0][1:a:0]acrossfade=duration=1[out1]' -map '[out0]' -map '[out1]' dissolve.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::130-every-rung-s-video-and-every-audio-rendition-gathered-into-one-file": {
+    "command": [
+      "ffmpeg -i tests/fixtures/ladder-demuxed/master.mpd -map 0:v:0 -c:0 copy -map 0:v:1 -c:1 copy -map 0:a:0 -c:2 copy out/all.mkv"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::131-collapse-a-file-s-rows-into-runs": {
+    "command": [
+      "ffmpeg -i tests/fixtures/described.mkv -filter_complex '[0:v:0]trim=start=0.0:end=4.0,setpts=PTS-STARTPTS,concat=n=1:v=1:a=0[out0];[0:a:0]atrim=start=0.0:end=4.0,asetpts=PTS-STARTPTS,concat=n=1:v=0:a=1[out1]' -map '[out0]' -map '[out1]' clips.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::132-merge-only-the-rows-you-kept": {
+    "command": [
+      "ffmpeg -i tests/fixtures/described.mkv -filter_complex '[0:v:0]split=2[src_f_v_0_split0][src_f_v_0_split1];[src_f_v_0_split0]trim=start=0.0:end=1.5[n1];[src_f_v_0_split1]trim=start=3.0:end=4.0[n2];[n1]setpts=PTS-STARTPTS[n1_pts];[n2]setpts=PTS-STARTPTS[n2_pts];[n1_pts][n2_pts]concat=n=2:v=1:a=0[out0];[0:a:0]asplit=2[src_f_a_0_split0][src_f_a_0_split1];[src_f_a_0_split0]atrim=start=0.0:end=1.5[n4];[src_f_a_0_split1]atrim=start=3.0:end=4.0[n5];[n4]asetpts=PTS-STARTPTS[n4_pts];[n5]asetpts=PTS-STARTPTS[n5_pts];[n4_pts][n5_pts]concat=n=2:v=0:a=1[out1]' -map '[out0]' -map '[out1]' clips.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::133-merge-a-module-s-rows-as-they-are-written": {
+    "command": [
+      "ffmpeg -i tests/fixtures/av.mp4 -map 0:v:0 -c:0 rawvideo -pix_fmt:0 rgba -f nut pipe:1 | ffrwd-wasm -f nut -i pipe:0 -m captions=../sidecar/modules/target/wasm32-wasip2/release/captions.wasm -filter_complex '[0:v]captions[n1];[n1]rowmerge=max_distance=0[out0]' -map '[out0]' -f webvtt pipe:1 | ffmpeg -i tests/fixtures/av.mp4 -f webvtt -i pipe:0 -map 0:v:0 -c:0 copy -map 1:s:0 -c:1 copy -metadata:s:1 title=speech merged.mkv"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::134-search-two-vector-spaces-at-once": {
+    "command": [
+      "ffmpeg -i tests/fixtures/described.mkv -filter_complex '[0:v:0]split=3[src_f_v_0_split0][src_f_v_0_split1][src_f_v_0_split2];[src_f_v_0_split0]trim=start=0.0:end=1.5[n1];[src_f_v_0_split1]trim=start=1.5:end=3.0[n2];[src_f_v_0_split2]trim=start=3.0:end=4.0[n3];[n1]setpts=PTS-STARTPTS[n1_pts];[n2]setpts=PTS-STARTPTS[n2_pts];[n3]setpts=PTS-STARTPTS[n3_pts];[n1_pts][n2_pts][n3_pts]concat=n=3:v=1:a=0[out0];[0:a:0]asplit=3[src_f_a_0_split0][src_f_a_0_split1][src_f_a_0_split2];[src_f_a_0_split0]atrim=start=0.0:end=1.5[n5];[src_f_a_0_split1]atrim=start=1.5:end=3.0[n6];[src_f_a_0_split2]atrim=start=3.0:end=4.0[n7];[n5]asetpts=PTS-STARTPTS[n5_pts];[n6]asetpts=PTS-STARTPTS[n6_pts];[n7]asetpts=PTS-STARTPTS[n7_pts];[n5_pts][n6_pts][n7_pts]concat=n=3:v=0:a=1[out1]' -map '[out0]' -map '[out1]' clips.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::135-rank-in-a-cte-stitch-in-time-order": {
+    "command": [
+      "ffmpeg -i tests/fixtures/described.mkv -filter_complex '[0:v:0]split=2[src_g_v_0_split0][src_g_v_0_split1];[src_g_v_0_split0]trim=start=0.0:end=1.5[n1];[src_g_v_0_split1]trim=start=1.5:end=3.0[n2];[n1]setpts=PTS-STARTPTS[n1_pts];[n2]setpts=PTS-STARTPTS[n2_pts];[n1_pts][n2_pts]concat=n=2:v=1:a=0[out0];[0:a:0]asplit=2[src_g_a_0_split0][src_g_a_0_split1];[src_g_a_0_split0]atrim=start=0.0:end=1.5[n4];[src_g_a_0_split1]atrim=start=1.5:end=3.0[n5];[n4]asetpts=PTS-STARTPTS[n4_pts];[n5]asetpts=PTS-STARTPTS[n5_pts];[n4_pts][n5_pts]concat=n=2:v=0:a=1[out1]' -map '[out0]' -map '[out1]' clips.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::136-filter-outside-a-cte-on-what-a-caption-says": {
+    "command": [
+      "ffmpeg -i tests/fixtures/described.mkv -filter_complex '[0:v:0]trim=start=1.5:end=3.0[n1];[0:a:0]atrim=start=1.5:end=3.0[n2];[n1]setpts=PTS-STARTPTS[out0];[n2]asetpts=PTS-STARTPTS[out1]' -map '[out0]' -map '[out1]' said.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::137-try-two-candidate-takes-keep-whichever-one-actually-matched": {
+    "command": [
+      "ffmpeg -i tests/fixtures/av.mp4 -filter_complex '[0:a:0]asplit=2[src_f_a_0_split0][src_f_a_0_split1];[src_f_a_0_split0]atrim=start=1:end=2[n1];[src_f_a_0_split1]atrim=start=2:end=3[n2];[n1]asetpts=PTS-STARTPTS[n1_pts];[n2]asetpts=PTS-STARTPTS[n2_pts];[n1_pts][n2_pts]amix=inputs=2[out0]' -map '[out0]' mix.mka"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::14-turn-a-clip-into-a-gif": {
+    "command": [
+      "ffmpeg -i clip.mp4 -filter_complex '[0:v:0]scale=width=480:height=-2,fps=fps=12,split=2[n2_split0][n2_split1];[n2_split0]palettegen[n3];[n2_split1][n3]paletteuse[out0]' -map '[out0]' clip.gif"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::16-picture-in-picture": {
+    "command": [
+      "ffmpeg -i film.mp4 -i camera.mp4 -filter_complex '[1:v:0]scale=width=iw/4:height=-2[n1];[0:v:0][n1]overlay=x=W-w-20:y=H-h-20[out0]' -map '[out0]' -map 0:a:0 -c:1 copy pip.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::17-insert-a-clip-at-a-timestamp": {
+    "command": [
+      "ffmpeg -to 120 -i film.mp4 -i promo.mp4 -ss 120 -i film.mp4 -filter_complex '[0:v:0][0:a:0][1:v:0][1:a:0][2:v:0][2:a:0]concat=n=3:v=1:a=1[out0][out1]' -map '[out0]' -map '[out1]' spliced.mp4"
+    ],
+    "tier": "offline",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::17-insert-a-clip-at-a-timestamp-2": {
+    "command": [
+      "ffmpeg -i film.mp4 -i promo.mp4 -filter_complex '[1:v:0]format=pix_fmts=yuva420p,tpad=start_duration=120:stop=1:color=black@0[n2];[0:v:0][n2]overlay=x=20:y=20[out0]' -map '[out0]' -map 0:a:0 -c:1 copy overlaid.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::18-normalize-loudness-on-every-language-track-at-once": {
+    "command": [
+      "ffmpeg -i tests/fixtures/av2.mp4 -filter_complex '[0:a:0]loudnorm=I=-23[out1];[0:a:1]loudnorm=I=-23[out2]' -map 0:v:0 -c:0 copy -map '[out1]' -metadata:s:1 language=eng -map '[out2]' -metadata:s:2 language=fra broadcast.mkv"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::2-remux-into-another-container-without-re-encoding": {
+    "command": [
+      "ffmpeg -i tests/fixtures/avs.mkv -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -map 0:s:0 -metadata:s:2 language=eng -c:2 mov_text film.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::20-generate-test-media": {
+    "command": [
+      "ffmpeg -filter_complex 'testsrc2=duration=10:size=1280x720:rate=30[out0];sine=frequency=440:duration=10[out1]' -map '[out0]' -map '[out1]' bars.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::20-generate-test-media-2": {
+    "command": [
+      "ffmpeg -i clip.mp4 -filter_complex 'color=color=black:duration=3:size=1280x720:rate=30[n1];anullsrc=duration=3[n2];[0:v:0][0:a:0][n1][n2]concat=n=2:v=1:a=1[out0][out1]' -map '[out0]' -map '[out1]' with-slate.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::21-split-a-stereo-track-or-compress-it-in-bands": {
+    "command": [
+      "ffmpeg -i stereo.mp4 -filter_complex '[0:a:0]channelsplit[out0][out1]' -map '[out0]' -map '[out1]' channels.mkv"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::21-split-a-stereo-track-or-compress-it-in-bands-2": {
+    "command": [
+      "ffmpeg -i song.m4a -filter_complex '[0:a:0]acrossover=split=300\\ 3000[n10][n11][n12];[n10]acompressor=threshold=0.1:ratio=4[n2];[n11]acompressor=threshold=0.05:ratio=6[n3];[n2][n3]amix=inputs=2[n4];[n12]acompressor=threshold=0.1:ratio=4[n5];[n4][n5]amix=inputs=2[out0]' -map '[out0]' mastered.m4a"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::24-extract-captions-by-language": {
+    "command": [
+      "ffmpeg -i tests/fixtures/avs.mkv -map 0:s:0 -c:0 copy -metadata:s:0 language=eng subs.srt"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::25-mix-two-files-tracks-pairwise-matched-by-language": {
+    "command": [
+      "ffmpeg -i tests/fixtures/av2.mp4 -i tests/fixtures/av3.mp4 -filter_complex '[0:a:0][1:a:0]amix=inputs=2[out0];[0:a:1][1:a:1]amix=inputs=2[out1]' -map '[out0]' -metadata:s:0 language=eng -map '[out1]' -metadata:s:1 language=fra mixed.mka"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::28-side-by-side-matched-by-resolution": {
+    "command": [
+      "ffmpeg -i tests/fixtures/testsrc.mp4 -i tests/fixtures/smptebars.mp4 -filter_complex '[0:v:0][1:v:0]hstack=inputs=2[out0]' -map '[out0]' sxs.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::29-assert-what-you-re-shipping": {
+    "command": [
+      "ffmpeg -i tests/fixtures/av2.mp4 -map 0:a:0 -c:0 copy -metadata:s:0 language=eng eng.m4a"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::3-extract-the-audio-track-to-its-own-file": {
+    "command": [
+      "ffmpeg -i film.mkv -map 0:a:0 -c:0 copy soundtrack.m4a"
+    ],
+    "tier": "offline",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::31-inspect-a-join-before-you-trust-it": {
+    "command": [
+      " language | film          | promo",
+      "----------+---------------+---------------",
+      " eng      | <audio 0:a:0> | <audio 1:a:0>",
+      " fra      | <audio 0:a:1> |",
+      "(2 rows)"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::32-export-track-metadata-as-csv": {
+    "command": [
+      "language,codec,channel_layout",
+      "eng,aac,mono",
+      "fra,aac,mono"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::33-one-query-many-files": {
+    "command": [
+      "ffmpeg -i film.mkv -map 0:v:0 -map 0:a:0 -c:0 libx264 -crf:0 20 -c:1 aac out.mkv"
+    ],
+    "tier": "offline",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::34-grab-a-poster-frame": {
+    "command": [
+      "ffmpeg -ss 90 -i film.mkv -map 0:v:0 -c:0 png -frames:0 1 poster.png"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::36-keep-the-last-minute": {
+    "command": [
+      "ffmpeg -sseof -60 -i clip.mp4 -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy tail.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::37-retitle-tracks-from-their-own-metadata": {
+    "command": [
+      "ffmpeg -i tests/fixtures/av-eng.mp4 -map 0:a:0 -c:0 copy -metadata:s:0 language=eng -metadata:s:0 'title=Audio (eng)' titled.mka"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::38-normalize-language-tags": {
+    "command": [
+      "ffmpeg -i tests/fixtures/av2.mp4 -map 0:a:0 -c:0 copy -metadata:s:0 language=eng -map 0:a:1 -c:1 copy -metadata:s:1 language=fre retagged.mka"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::39-list-a-file-s-chapters": {
+    "command": [
+      " index | title     | start_t | end_t",
+      "-------+-----------+---------+-------",
+      " 1     | Intro     | 0.0     | 1.0",
+      " 2     | Chapter 1 | 1.0     | 2.0",
+      " 3     | Chapter 2 | 2.0     | 3.0",
+      " 4     | Credits   | 3.0     | 4.0",
+      "(4 rows)"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::40-write-chapters": {
+    "command": [
+      "ffmpeg -i film.mkv -f ffmetadata -i 'data:text/plain;base64,O0ZGTUVUQURBVEExCltDSEFQVEVSXQpUSU1FQkFTRT0xLzEKU1RBUlQ9MApFTkQ9NjAKdGl0bGU9SW50cm8KW0NIQVBURVJdClRJTUVCQVNFPTEvMQpTVEFSVD02MApFTkQ9MzAwCnRpdGxlPUFjdCBPbmUK' -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -map_chapters 1 chaptered.mkv"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::42-title-the-file-and-keep-its-global-tags": {
+    "command": [
+      "ffmpeg -i film.mkv -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -map_metadata 0 -metadata 'title=Director Cut' cut.mkv"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::43-two-pass-encode-to-a-target-bitrate": {
+    "command": [
+      "ffmpeg -i in.mkv -map 0:v:0 -c:0 libx264 -b:0 2500k -pass 1 -passlogfile out.mp4 -f null - && ffmpeg -i in.mkv -map 0:v:0 -map 0:a:0 -c:0 libx264 -b:0 2500k -pass 2 -passlogfile out.mp4 -c:1 aac out.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::44-merge-two-audio-tracks-into-one": {
+    "command": [
+      "ffmpeg -i one.mp4 -i two.mp4 -filter_complex '[0:a:0][1:a:0]amerge=inputs=2[out0]' -map '[out0]' merged.mka"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::45-scale-each-track-relative-to-itself": {
+    "command": [
+      "ffmpeg -i tests/fixtures/av2.mp4 -filter_complex '[0:v:0]scale=width=160:height=-2[out0]' -map '[out0]' half.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::46-keep-everything-but-the-end": {
+    "command": [
+      "ffmpeg -to 3.5 -i tests/fixtures/av2.mp4 -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -metadata:s:1 language=eng trimmed.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::47-split-a-file-by-its-chapters": {
+    "command": [
+      "ffmpeg -ss 0.0 -to 1.0 -i tests/fixtures/av-chapters.mkv -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -metadata:s:1 language=eng -map 0:a:1 -c:2 copy -metadata:s:2 language=fra ch-Intro.mkv && ffmpeg -ss 1.0 -to 2.0 -i tests/fixtures/av-chapters.mkv -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -metadata:s:1 language=eng -map 0:a:1 -c:2 copy -metadata:s:2 language=fra 'ch-Chapter 1.mkv' && ffmpeg -ss 2.0 -to 3.0 -i tests/fixtures/av-chapters.mkv -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -metadata:s:1 language=eng -map 0:a:1 -c:2 copy -metadata:s:2 language=fra 'ch-Chapter 2.mkv' && ffmpeg -ss 3.0 -to 4.0 -i tests/fixtures/av-chapters.mkv -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -metadata:s:1 language=eng -map 0:a:1 -c:2 copy -metadata:s:2 language=fra ch-Credits.mkv"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::47-split-a-file-by-its-chapters-2": {
+    "command": [
+      "ffmpeg -i tests/fixtures/av-chapters.mkv -ss 0.0 -to 1.0 -map 0:v:0 -map 0:a:0 -metadata:s:1 language=eng -map 0:a:1 -metadata:s:2 language=fra -c:0 libx264 -crf:0 18 -c:1 aac -c:2 aac ch-Intro.mkv -ss 1.0 -to 2.0 -map 0:v:0 -map 0:a:0 -metadata:s:1 language=eng -map 0:a:1 -metadata:s:2 language=fra -c:0 libx264 -crf:0 18 -c:1 aac -c:2 aac 'ch-Chapter 1.mkv' -ss 2.0 -to 3.0 -map 0:v:0 -map 0:a:0 -metadata:s:1 language=eng -map 0:a:1 -metadata:s:2 language=fra -c:0 libx264 -crf:0 18 -c:1 aac -c:2 aac 'ch-Chapter 2.mkv' -ss 3.0 -to 4.0 -map 0:v:0 -map 0:a:0 -metadata:s:1 language=eng -map 0:a:1 -metadata:s:2 language=fra -c:0 libx264 -crf:0 18 -c:1 aac -c:2 aac ch-Credits.mkv"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::48-extract-every-language-to-its-own-file": {
+    "command": [
+      "ffmpeg -i tests/fixtures/av2.mp4 -map 0:a:0 -c:0 copy -metadata:s:0 language=eng eng.m4a -map 0:a:1 -c:0 copy -metadata:s:0 language=fra fra.m4a"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::49-normalize-loudness-properly-two-pass": {
+    "command": [
+      "eval \"$(ffmpeg -i film.mkv -filter_complex '[0:a:0]loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json[out0]' -map '[out0]' -f null - 2>&1 | ffrwd loudnorm2env)\" && ffmpeg -i film.mkv -filter_complex '[0:a:0]loudnorm=I=-16:TP=-1.5:LRA=11:measured_I='\"${FFRWD_LN_I}\"':measured_TP='\"${FFRWD_LN_TP}\"':measured_LRA='\"${FFRWD_LN_LRA}\"':measured_thresh='\"${FFRWD_LN_THRESH}\"':offset='\"${FFRWD_LN_OFFSET}\"':linear=true[out0]' -map '[out0]' -c:0 aac out.m4a"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::50-stream-instead-of-writing-a-file": {
+    "command": [
+      "ffmpeg -i film.mkv -map 0:v:0 -map 0:a:0 -f flv -c:0 libx264 -c:1 aac rtmp://live.example.com/app/streamkey"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::51-set-the-container-s-title-clear-its-artist": {
+    "command": [
+      "ffmpeg -i film.mkv -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -metadata artist= -metadata 'title=Remastered 2026' out.mkv"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::52-read-the-container-s-tags-rewrite-them-with-case": {
+    "command": [
+      "ffmpeg -i tests/fixtures/tagged.mp4 -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -metadata 'comment=no notes' -metadata 'title=Angel One (restored)' restored.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::53-tag-the-tracks-and-the-container-in-one-query": {
+    "command": [
+      "ffmpeg -i tests/fixtures/av2.mp4 -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -metadata:s:1 language=eng -metadata:s:1 'title=Audio (eng)' -map 0:a:1 -c:2 copy -metadata:s:2 language=fra -metadata:s:2 'title=Audio (fra)' -metadata 'title=Director Cut' out.mkv"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::56-preview-a-grouped-shape-as-a-table": {
+    "command": [
+      " video           | array_agg",
+      "-----------------+-------------------------------",
+      " {<video 0:v:0>} | {<audio 0:a:0>,<audio 0:a:1>}",
+      "(1 row)"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::56-preview-a-grouped-shape-as-a-table-2": {
+    "command": [
+      " language | array_agg",
+      "----------+-------------------------------",
+      " eng      | {<audio 0:a:0>,<audio 0:a:1>}",
+      " fra      | {<audio 0:a:2>}",
+      "(2 rows)"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::57-combine-tracks-selected-by-separate-ctes": {
+    "command": [
+      " track         | array_agg",
+      "---------------+-------------------------------",
+      " <video 0:v:0> | {<audio 0:a:0>,<audio 0:a:1>}",
+      "(1 row)"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::57-combine-tracks-selected-by-separate-ctes-2": {
+    "command": [
+      "ffmpeg -i tests/fixtures/av-2eng.mp4 -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -metadata:s:1 language=eng -map 0:a:1 -c:2 copy -metadata:s:2 language=eng combo.mkv"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::58-burn-a-title-onto-the-picture": {
+    "command": [
+      "ffmpeg -i film.mkv -filter_complex '[0:v:0]drawtext=text=Hello:fontfile=arial.ttf:fontsize=48:x=20:y=20:fontcolor=white[out0]' -map '[out0]' -map 0:a:0 -c:1 copy titled.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::59-turn-an-image-sequence-into-a-video-and-back": {
+    "command": [
+      "ffmpeg -framerate 24 -i frames/%04d.png -map 0:v:0 -c:0 libx264 -crf:0 18 out.mp4"
+    ],
+    "tier": "offline",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::59-turn-an-image-sequence-into-a-video-and-back-2": {
+    "command": [
+      "ffmpeg -i film.mkv -filter_complex '[0:v:0]fps=fps=1[out0]' -map '[out0]' frame-%04d.png"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::6-rotate-a-phone-video-90-degrees": {
+    "command": [
+      "ffmpeg -i phone.mp4 -filter_complex '[0:v:0]transpose=dir=clock[out0]' -map '[out0]' -map 0:a:0 -c:1 copy upright.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::60-draw-a-waveform-for-an-audio-file": {
+    "command": [
+      "ffmpeg -i song.mp3 -filter_complex '[0:a:0]asplit=2[src_f_a_0_split0][out1];[src_f_a_0_split0]showwaves=size=1280x240:mode=line[out0]' -map '[out0]' -map '[out1]' waves.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::61-record-a-stream": {
+    "command": [
+      "ffmpeg -i https://example.com/live/stream.m3u8 -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy capture.mp4"
+    ],
+    "tier": "offline",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::62-use-a-plugin-filter": {
+    "command": [
+      "ffmpeg -i film.mkv -filter_complex '[0:v:0]frei0r=filter_name=glow:filter_params=0.5[out0]' -map '[out0]' -map 0:a:0 -c:1 copy glow.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::63-copy-or-rebuild-a-chapter-list": {
+    "command": [
+      "ffmpeg -i tests/fixtures/av2.mp4 -i tests/fixtures/av-chapters.mkv -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -metadata:s:1 language=eng -map_chapters 1 borrowed.mkv"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::63-copy-or-rebuild-a-chapter-list-2": {
+    "command": [
+      "ffmpeg -i film.mkv -f ffmetadata -i 'data:text/plain;base64,O0ZGTUVUQURBVEExCltDSEFQVEVSXQpUSU1FQkFTRT0xLzEKU1RBUlQ9MApFTkQ9NjAKdGl0bGU9SW50cm8KW0NIQVBURVJdClRJTUVCQVNFPTEvMQpTVEFSVD02MApFTkQ9MzAwCnRpdGxlPUFjdCBPbmUK' -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -map_chapters 1 chaptered.mkv"
+    ],
+    "tier": "offline",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::64-read-a-subtitle-file-s-cues": {
+    "command": [
+      " index | start_t | end_t | text",
+      "-------+---------+-------+------------",
+      " 1     | 0.0     | 0.6   | Cue one.",
+      " 2     | 0.7     | 1.3   | Cue two.",
+      " 3     | 1.4     | 2.0   | Cue three.",
+      "(3 rows)"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::65-turn-chapters-into-a-subtitle-track-and-back": {
+    "command": [
+      "ffmpeg -i tests/fixtures/av-chapters.mkv -f webvtt -i 'data:text/vtt;base64,V0VCVlRUCgowMDowMDowMC4wMDAgLS0+IDAwOjAwOjAxLjAwMApJbnRybwoKMDA6MDA6MDEuMDAwIC0tPiAwMDowMDowMi4wMDAKQ2hhcHRlciAxCgowMDowMDowMi4wMDAgLS0+IDAwOjAwOjAzLjAwMApDaGFwdGVyIDIKCjAwOjAwOjAzLjAwMCAtLT4gMDA6MDA6MDQuMDAwCkNyZWRpdHMK' -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -metadata:s:1 language=eng -map 1:s:0 -c:2 copy with-cues.mkv"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::66-attach-a-font-and-list-what-a-file-carries": {
+    "command": [
+      "ffmpeg -i tests/fixtures/av2.mp4 -attach tests/fixtures/font.ttf -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -metadata:s:1 language=eng -metadata:s:2 mimetype=application/x-truetype-font -metadata:s:2 filename=font.ttf fonted.mkv"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::66-attach-a-font-and-list-what-a-file-carries-2": {
+    "command": [
+      " index | filename | mimetype",
+      "-------+----------+-----------------------------",
+      " 1     | font.ttf | application/x-truetype-font",
+      "(1 row)"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::68-a-function-that-returns-rows": {
+    "command": [
+      "ffmpeg -i tests/fixtures/av-2eng.mp4 -i tests/fixtures/av2.mp4 -map 1:v:0 -c:0 copy -map 0:a:0 -c:1 copy -metadata:s:1 language=eng -map 0:a:1 -c:2 copy -metadata:s:2 language=eng out.mkv"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::69-leave-a-knob-unset": {
+    "command": [
+      "ffmpeg -i film.mp4 -filter_complex '[0:v:0]scale=height=480[out0]' -map '[out0]' -map 0:a:0 -c:1 copy small.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::69-leave-a-knob-unset-2": {
+    "command": [
+      "ffmpeg -i film.mkv -map 0:v:0 -map 0:a:0 -c:1 copy -c:0 libx264 -preset:0 fast out.mkv"
+    ],
+    "tier": "offline",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::69-leave-a-knob-unset-3": {
+    "command": [
+      "ffmpeg -i tests/fixtures/tagged.mp4 -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -metadata artist= -metadata 'title=Angel One' out.mkv"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::7-sharpen-a-soft-looking-video": {
+    "command": [
+      "ffmpeg -i clip.mp4 -filter_complex '[0:v:0]unsharp=luma_msize_x=7:luma_amount=1.5[out0]' -map '[out0]' -map 0:a:0 -c:1 copy out.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::70-join-however-many-tracks-a-file-has-with-concat": {
+    "command": [
+      "ffmpeg -i tests/fixtures/av-chapters.mkv -filter_complex '[0:a:0][0:a:1]concat=n=2:v=0:a=1[out0]' -map '[out0]' joined.mka"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::71-mix-however-many-tracks-a-file-has": {
+    "command": [
+      "ffmpeg -i tests/fixtures/av2.mp4 -filter_complex '[0:a:0][0:a:1]amix=inputs=2[out0]' -map '[out0]' mixed.mka"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::72-write-evenly-spaced-chapters-however-many-you-want": {
+    "command": [
+      "ffmpeg -i film.mkv -f ffmetadata -i 'data:text/plain;base64,O0ZGTUVUQURBVEExCltDSEFQVEVSXQpUSU1FQkFTRT0xLzEKU1RBUlQ9MApFTkQ9MTAKdGl0bGU9Q2hhcHRlciAxCltDSEFQVEVSXQpUSU1FQkFTRT0xLzEKU1RBUlQ9MTAKRU5EPTIwCnRpdGxlPUNoYXB0ZXIgMgpbQ0hBUFRFUl0KVElNRUJBU0U9MS8xClNUQVJUPTIwCkVORD0zMAp0aXRsZT1DaGFwdGVyIDMKW0NIQVBURVJdClRJTUVCQVNFPTEvMQpTVEFSVD0zMApFTkQ9NDAKdGl0bGU9Q2hhcHRlciA0Cg==' -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -map_chapters 1 chaptered.mkv"
+    ],
+    "tier": "offline",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::73-join-a-series-against-a-file-s-tracks": {
+    "command": [
+      " language | pass",
+      "----------+------",
+      " eng      | 1",
+      " eng      | 2",
+      " fra      | 1",
+      " fra      | 2",
+      "(4 rows)"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::75-gather-n-clips-from-one-file-into-one": {
+    "command": [
+      "ffmpeg -ss 0 -to 1 -i tests/fixtures/av.mp4 -ss 2 -to 3 -i tests/fixtures/av.mp4 -ss 4 -to 5 -i tests/fixtures/av.mp4 -filter_complex '[0:v:0][1:v:0][2:v:0]concat=n=3:v=1:a=0[out0]' -map '[out0]' sampled.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::76-trim-a-filter-call-to-a-computed-window": {
+    "command": [
+      "ffmpeg -i tests/fixtures/testsrc.mp4 -filter_complex '[0:v:0]trim=start=1.0:end=4.0,setpts=PTS-STARTPTS[out0]' -map '[out0]' second_part.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::77-concatenate-two-windows-of-the-same-file": {
+    "command": [
+      "ffmpeg -i tests/fixtures/testsrc.mp4 -filter_complex '[0:v:0]trim=start=0:end=1[n1];[0:v:0]trim=start=2:end=3[n2];[n1]setpts=PTS-STARTPTS[n1_pts];[n2]setpts=PTS-STARTPTS[n2_pts];[n1_pts][n2_pts]concat=n=2:v=1:a=0[out0]' -map '[out0]' joined.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::78-lay-four-windows-into-a-grid": {
+    "command": [
+      "ffmpeg -ss 0 -to 1 -i tests/fixtures/av.mp4 -ss 1 -to 2 -i tests/fixtures/av.mp4 -ss 2 -to 3 -i tests/fixtures/av.mp4 -ss 3 -to 4 -i tests/fixtures/av.mp4 -filter_complex '[0:v:0][1:v:0][2:v:0][3:v:0]xstack=grid=2x2:inputs=4[out0]' -map '[out0]' grid.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::80-fade-in-video-or-audio-with-one-name": {
+    "command": [
+      "ffmpeg -i film.mp4 -filter_complex '[0:v:0]fade=type=in:duration=1[out0];[0:a:0]afade=type=in:duration=1[out1]' -map '[out0]' -map '[out1]' faded.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::81-grab-n-evenly-spaced-frames-one-file-each": {
+    "command": [
+      "ffmpeg -ss 0.5 -i tests/fixtures/av2.mp4 -ss 1.5 -i tests/fixtures/av2.mp4 -ss 2.5 -i tests/fixtures/av2.mp4 -ss 3.5 -i tests/fixtures/av2.mp4 -map 0:v:0 -c:0 png -frames:0 1 shot1.png -map 1:v:0 -c:0 png -frames:0 1 shot2.png -map 2:v:0 -c:0 png -frames:0 1 shot3.png -map 3:v:0 -c:0 png -frames:0 1 shot4.png"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::82-keep-a-file-s-tags-and-change-one": {
+    "command": [
+      "ffmpeg -i tests/fixtures/tagged.mp4 -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -map_metadata 0 -metadata comment= -metadata 'title=Angel One (restored)' restored.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::83-re-encode-one-track-and-carry-the-rest": {
+    "command": [
+      "ffmpeg -i tests/fixtures/avs.mkv -filter_complex '[0:v:0]scale=width=1280:height=-2[out0]' -map '[out0]' -map 0:a:0 -c:1 copy -map 0:s:0 -metadata:s:2 language=eng -c:2 mov_text film.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::84-drop-a-kind": {
+    "command": [
+      "ffmpeg -i tests/fixtures/avs.mkv -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy film.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::85-key-an-encode-ladder-from-written-rows": {
+    "command": [
+      "ffmpeg -i tests/fixtures/av.mp4 -filter_complex '[0:v:0]split=2[src_f_v_0_split0][src_f_v_0_split1];[src_f_v_0_split0]scale=width=1920:height=-2[out0];[src_f_v_0_split1]scale=width=1280:height=-2[out2]' -map '[out0]' -map 0:a:0 -c:1 copy 1080p.mp4 -map '[out2]' -map 0:a:0 -c:1 copy 720p.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::86-gather-clips-into-one-file-without-the-cte": {
+    "command": [
+      "ffmpeg -ss 0 -to 1 -i tests/fixtures/av.mp4 -ss 2 -to 3 -i tests/fixtures/av.mp4 -ss 4 -to 5 -i tests/fixtures/av.mp4 -filter_complex '[0:v:0][1:v:0][2:v:0]concat=n=3:v=1:a=0[out0]' -map '[out0]' sampled.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::88-blur-the-faces-a-module-found": {
+    "command": [
+      "ffmpeg -i tests/fixtures/av.mp4 -map 0:v:0 -c:0 rawvideo -pix_fmt:0 yuv420p -f nut pipe:1 | ffrwd-wasm -f nut -i pipe:0 -m facebox=../sidecar/modules/target/wasm32-wasip2/release/facebox.wasm -m blur_boxes=../sidecar/modules/target/wasm32-wasip2/release/blur_boxes.wasm -filter_complex '[0:v]facebox[n1];[n1]blur_boxes[out0]' -map '[out0]' -f nut pipe:1 | ffmpeg -i tests/fixtures/av.mp4 -f nut -i pipe:0 -map 1:v:0 -map 0:a:0 -c:1 copy -c:0 libx264 -crf:0 20 blurred.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::89-compute-a-tag-with-a-wasm-module": {
+    "command": [
+      "ffmpeg -i tests/fixtures/tagged.mp4 -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -map_metadata 0 -metadata 'title=Angel One (restored)' restored.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::9-watermark-a-video": {
+    "command": [
+      "ffmpeg -i film.mp4 -loop 1 -i watermark.png -filter_complex '[0:v:0][1:v:0]overlay=x=(W-w)/2:y=(H-h)/2[out0]' -map '[out0]' -map 0:a:0 -c:1 copy branded.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::90-crop-to-a-rectangle": {
+    "command": [
+      "ffmpeg -i tests/fixtures/av2.mp4 -filter_complex '[0:v:0]crop=out_w=160:out_h=120:x=80:y=60[out0]' -map '[out0]' -map 0:a:0 -c:1 copy -metadata:s:1 language=eng cropped.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::91-keep-the-blur-boxes-steady-across-cuts": {
+    "command": [
+      "ffmpeg -i tests/fixtures/av.mp4 -map 0:v:0 -c:0 rawvideo -pix_fmt:0 yuv420p -f nut pipe:1 | ffrwd-wasm -f nut -i pipe:0 -m shots=../sidecar/modules/target/wasm32-wasip2/release/shots.wasm -m facebox=../sidecar/modules/target/wasm32-wasip2/release/facebox.wasm -m blur_boxes=../sidecar/modules/target/wasm32-wasip2/release/blur_boxes.wasm -filter_complex '[0:v]shots[n1];[n1]facebox[n2];[n2]blur_boxes[out0]' -map '[out0]' -f nut pipe:1 | ffmpeg -i tests/fixtures/av.mp4 -f nut -i pipe:0 -map 1:v:0 -map 0:a:0 -c:1 copy -c:0 libx264 -crf:0 20 blurred.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::92-subtitle-a-film-in-a-language-it-does-not-speak": {
+    "command": [
+      "ffmpeg -i tests/fixtures/av.mp4 -map 0:a:0 -ar:0 16000 -ac:0 1 -c:0 pcm_f32le -f nut pipe:1 | ffrwd-wasm -f nut -i pipe:0 -m ../sidecar/modules/target/wasm32-wasip2/release/transcribe.wasm -params '{\"language\": \"es\", \"language_to\": \"en\"}' -f webvtt pipe:1 | ffmpeg -i tests/fixtures/av.mp4 -f webvtt -i pipe:0 -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -map 1:s:0 -metadata:s:2 language=eng -c:2 mov_text subbed.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::93-depth-of-field-from-the-scene-s-own-geometry": {
+    "command": [
+      "ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 rawvideo -pix_fmt:0 yuv420p -f nut pipe:1 | ffrwd-wasm -f nut -i pipe:0 -nn depth=../sidecar/modules/target/wasm32-wasip2/release/depth.onnx -m depth=../sidecar/modules/target/wasm32-wasip2/release/depth.wasm -m blur_mask=../sidecar/modules/target/wasm32-wasip2/release/blur_mask.wasm -filter_complex '[0:v]depth[n1];[0:v][n1]blur_mask=max_radius=24:invert=1[out0]' -map '[out0]' -f nut pipe:1 | ffmpeg -f nut -i pipe:0 -map 0:v:0 -c:0 libx264 -crf:0 20 bokeh.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::95-make-a-clip-out-of-nothing": {
+    "command": [
+      "ffmpeg -f lavfi -i testsrc2=size=640x360:rate=25:duration=2 -filter_complex '[0:v:0]gblur=sigma=4[out0]' -map '[out0]' synthetic.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::96-take-the-top-row-order-by-limit": {
+    "command": [
+      "ffmpeg -i tests/fixtures/av2.mp4 -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -metadata:s:1 language=eng picked.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::97-key-a-ladder-from-list-variables": {
+    "command": [
+      "ffmpeg -i tests/fixtures/av.mp4 -filter_complex '[0:v:0]split=3[src_f_v_0_split0][src_f_v_0_split1][src_f_v_0_split2];[src_f_v_0_split0]scale=width=1920:height=-2[out0];[src_f_v_0_split1]scale=width=1280:height=-2[out2];[src_f_v_0_split2]scale=width=640:height=-2[out4]' -map '[out0]' -map 0:a:0 -c:0 libx264 -c:1 aac 1080p.mp4 -map '[out2]' -map 0:a:0 -c:0 libx264 -c:1 aac 720p.mp4 -map '[out4]' -map 0:a:0 -c:0 libx264 -c:1 aac 360p.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::99-watch-the-frames-go-by": {
+    "command": [
+      "ffmpeg -i tests/fixtures/av.mp4 -map 0:v:0 -c:0 rawvideo -pix_fmt:0 rgba -f nut pipe:1 | ffrwd-wasm -f nut -i pipe:0 -m ../sidecar/modules/target/wasm32-wasip2/release/frame_stats.wasm -f null -"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/examples.md::1-transcode-a-file-to-h-264-aac": {
+    "command": [
+      "ffmpeg -i film.mkv -map 0:v:0 -map 0:a:0 -c:0 libx264 -crf:0 20 -preset:0 slow -c:1 aac -b:1 192k -movflags +faststart film.mp4"
+    ],
+    "tier": "offline",
+    "verdict": "accepted"
+  },
+  "docs/examples.md::10-mux-external-subtitles-in-or-pull-them-back-out": {
+    "command": [
+      "ffmpeg -i film.mp4 -i subs.en.vtt -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -map 1:s:0 -c:2 mov_text captioned.mp4"
+    ],
+    "tier": "offline",
+    "verdict": "accepted"
+  },
+  "docs/examples.md::10-mux-external-subtitles-in-or-pull-them-back-out-2": {
+    "command": [
+      "ffmpeg -i film.mkv -map 0:s:0 -c:0 copy subs.en.srt"
+    ],
+    "tier": "offline",
+    "verdict": "accepted"
+  },
+  "docs/examples.md::104-publish-the-ladder-as-hls": {
+    "command": [
+      "ffmpeg -i tests/fixtures/av.mp4 -filter_complex '[0:v:0]fps=fps=15,split=2[n1_split0][n1_split1];[n1_split0]scale=width=320:height=-2[out0];[n1_split1]scale=width=160:height=-2[out1]' -map '[out0]' -map '[out1]' -map 0:a:0 -f hls -hls_time 2 -hls_playlist_type vod -c:0 libx264 -c:1 libx264 -b:0 800k -b:1 300k -c:2 aac -g:0 30 -g:1 30 -keyint_min:0 30 -keyint_min:1 30 -sc_threshold:0 0 -sc_threshold:1 0 -var_stream_map 'v:0,agroup:aud,name:240p v:1,agroup:aud,name:120p a:0,agroup:aud,name:a0,default:yes' -master_pl_name master.m3u8 -hls_segment_filename out/%v/segment_%d.ts out/%v/index.m3u8"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/examples.md::105-pick-a-rung-from-an-abr-ladder": {
+    "command": [
+      "ffmpeg -i tests/fixtures/ladder/master.m3u8 -map 0:v:1 -map 0:a:1 -c:0 libx264 -crf:0 20 -c:1 aac rung720.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/examples.md::113-translate-captions-as-they-are-produced": {
+    "command": [
+      "ffmpeg -i tests/fixtures/av.mp4 -map 0:v:0 -c:0 rawvideo -pix_fmt:0 rgba -f nut pipe:1 | ffrwd-wasm -f nut -i pipe:0 -m ../sidecar/modules/target/wasm32-wasip2/release/captions.wasm -m ../sidecar/modules/target/wasm32-wasip2/release/fauxlate.wasm -rows-from 0 -f webvtt pipe:1 | ffmpeg -i tests/fixtures/av.mp4 -f webvtt -i pipe:0 -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -map 1:s:0 -c:2 copy fauxlated.mkv"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/examples.md::115-stitch-the-rows-you-keep-then-re-encode-them-to-a-ladder": {
+    "command": [
+      "ffmpeg -i tests/fixtures/av.mp4 -i tests/fixtures/av2.mp4 -filter_complex '[0:v:0]scale=width=320:height=-2[n1];[1:v:0]scale=width=320:height=-2[n2];[n1][n2]concat=n=2:v=1:a=0[n3];[0:a:0][1:a:0]concat=n=2:v=0:a=1[out2];[n3]split=2[n3_split0][n3_split1];[n3_split0]scale=width=320:height=-2[out0];[n3_split1]scale=width=160:height=-2[out1]' -map '[out0]' -map '[out1]' -map '[out2]' -f hls -hls_time 2 -hls_playlist_type vod -c:0 libx264 -c:1 libx264 -b:0 800k -b:1 300k -c:2 aac -g:0 30 -g:1 30 -keyint_min:0 30 -keyint_min:1 30 -sc_threshold:0 0 -sc_threshold:1 0 -var_stream_map 'v:0,agroup:aud,name:v0 v:1,agroup:aud,name:v1 a:0,agroup:aud,name:a0,default:yes' -master_pl_name master.m3u8 -hls_segment_filename out/%v/segment_%d.ts out/%v/index.m3u8"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/examples.md::117-rank-rows-by-a-vector": {
+    "command": [
+      " label | score",
+      "-------+--------",
+      " car   | 0.8099",
+      " dog   | 0.7841",
+      "(2 rows)"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/examples.md::118-write-rows-as-titled-tracks": {
+    "command": [
+      "ffmpeg -i tests/fixtures/av.mp4 -f webvtt -i 'data:text/vtt;base64,V0VCVlRUCgowMDowMDowMC4wMDAgLS0+IDAwOjAwOjAxLjUwMAphIGNhdCBzYXQgb24gdGhlIG1hdAoKMDA6MDA6MDEuNTAwIC0tPiAwMDowMDowMy4wMDAKYSBkb2cgcmFuIGluIHRoZSB5YXJkCg==' -f webvtt -i 'data:text/vtt;base64,V0VCVlRUCgowMDowMDowMC4wMDAgLS0+IDAwOjAwOjAxLjUwMAorNlk3UC9reitqMEFBQUFBZkdBY1Ava3plajRBQUFBQUFBQUFBUGt6K2owPQoKMDA6MDA6MDEuNTAwIC0tPiAwMDowMDowMy4wMDAKOHdRMVB3QUFBQUFBQUFBQWRka1dQd0FBQUFEdlcvRTk4d1MxUHU5YjhUMD0K' -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -map 1:s:0 -c:2 copy -metadata:s:2 title=speech -map 2:s:0 -c:3 copy -metadata:s:3 title=clip_vectors -metadata:s:3 vector_dims=8 described.mkv"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/examples.md::123-re-lay-a-muxed-ladder-as-a-demuxed-one": {
+    "command": [
+      "ffmpeg -i tests/fixtures/ladder/master.m3u8 -map 0:v:0 -map 0:v:1 -map 0:a:1 -f hls -hls_time 2 -hls_playlist_type vod -hls_segment_type fmp4 -c:0 libx264 -c:1 libx264 -c:2 aac -g:0 30 -g:1 30 -keyint_min:0 30 -keyint_min:1 30 -sc_threshold:0 0 -sc_threshold:1 0 -var_stream_map 'v:0,agroup:aud,name:1080p v:1,agroup:aud,name:v1 a:0,agroup:aud,name:a0,default:yes' -master_pl_name master.m3u8 -hls_segment_filename out/%v/segment_%d.m4s -hls_fmp4_init_filename init.mp4 out/%v/index.m3u8"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/examples.md::125-a-hybrid-master-muxed-variants-and-an-audio-group": {
+    "command": [
+      "ffmpeg -i tests/fixtures/ladder-demuxed/master.mpd -filter_complex '[0:a:0]asplit=2[out2][out3]' -map 0:v:0 -map 0:v:1 -map '[out2]' -map '[out3]' -map 0:a:0 -f hls -hls_time 2 -hls_playlist_type vod -hls_segment_type fmp4 -c:0 libx264 -c:1 libx264 -c:2 aac -c:3 aac -c:4 aac -g:0 30 -g:1 30 -keyint_min:0 30 -keyint_min:1 30 -sc_threshold:0 0 -sc_threshold:1 0 -var_stream_map 'v:0,a:0,agroup:aud,name:0 v:1,a:1,agroup:aud,name:1 a:2,agroup:aud,name:2,default:yes' -master_pl_name master.m3u8 -hls_segment_filename out/%v/segment_%d.m4s -hls_fmp4_init_filename init.mp4 out/%v/index.m3u8"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/examples.md::15-replace-a-video-s-audio-or-duck-music-under-the-dialogue": {
+    "command": [
+      "ffmpeg -i film.mp4 -i voiceover.wav -map 0:v:0 -c:0 copy -map 1:a:0 -c:1 copy dubbed.mp4"
+    ],
+    "tier": "offline",
+    "verdict": "accepted"
+  },
+  "docs/examples.md::15-replace-a-video-s-audio-or-duck-music-under-the-dialogue-2": {
+    "command": [
+      "ffmpeg -i film.mp4 -i music.m4a -filter_complex '[1:a:0]volume=volume=0.2[n1];[0:a:0][n1]amix=inputs=2[out1]' -map 0:v:0 -c:0 copy -map '[out1]' scored.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/examples.md::15-replace-a-video-s-audio-or-duck-music-under-the-dialogue-3": {
+    "command": [
+      "ffmpeg -i film.mp4 -i music.m4a -filter_complex '[0:a:0]asplit=2[src_v_a_0_split0][src_v_a_0_split1];[1:a:0][src_v_a_0_split0]sidechaincompress=threshold=0.03:ratio=8[n1];[src_v_a_0_split1][n1]amix=inputs=2[out1]' -map 0:v:0 -c:0 copy -map '[out1]' ducked.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/examples.md::19-blur-a-region-or-blur-during-a-time-window": {
+    "command": [
+      "ffmpeg -i interview.mp4 -filter_complex '[0:v:0]split=2[src_f_v_0_split0][src_f_v_0_split1];[src_f_v_0_split0]crop=out_w=320:out_h=180:x=900:y=60,gblur=sigma=20[n2];[src_f_v_0_split1][n2]overlay=x=900:y=60[out0]' -map '[out0]' -map 0:a:0 -c:1 copy anonymized.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/examples.md::19-blur-a-region-or-blur-during-a-time-window-2": {
+    "command": [
+      "ffmpeg -i clip.mp4 -filter_complex '[0:v:0]gblur=sigma=12:enable=between(t\\,0.5\\,1.5)[out0]' -map '[out0]' out.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/examples.md::22-one-decode-several-outputs": {
+    "command": [
+      "ffmpeg -i film.mp4 -loop 1 -i watermark.png -filter_complex '[0:v:0][1:v:0]overlay=x=W-w-20:y=20,scale=width=1280:height=-2[out0]' -map '[out0]' -map 0:a:0 -c:0 libx264 -crf:0 21 -c:1 aac web.mp4 -map 0:a:0 -c:0 aac -b:0 128k podcast.m4a"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/examples.md::23-pick-a-track-by-what-it-is-not-where-it-sits": {
+    "command": [
+      "ffmpeg -i tests/fixtures/av2.mp4 -map 0:a:0 -c:0 copy -metadata:s:0 language=eng eng.m4a"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/examples.md::26-mix-everything-the-files-have-missing-tracks-count-as-silence": {
+    "command": [
+      "ffmpeg -i tests/fixtures/av2.mp4 -i tests/fixtures/av-eng.mp4 -filter_complex 'anullsrc=duration=4[n1];[0:a:0][1:a:0]amix=inputs=2[out0];[0:a:1][n1]amix=inputs=2[out1]' -map '[out0]' -metadata:s:0 language=eng -map '[out1]' -metadata:s:1 language=fra full.mka"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/examples.md::27-concatenate-files-with-different-track-counts": {
+    "command": [
+      "ffmpeg -i tests/fixtures/av2.mp4 -i tests/fixtures/av-eng.mp4 -filter_complex 'anullsrc=duration=4[n1];[0:v:0][0:a:0][0:a:1][1:v:0][1:a:0][n1]concat=n=2:v=1:a=2[out0][out1][out2]' -map '[out0]' -map '[out1]' -metadata:s:1 language=eng -map '[out2]' -metadata:s:2 language=fra joined.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/examples.md::30-look-at-a-file-s-tracks-as-a-table": {
+    "command": [
+      " index | language | codec | channel_layout",
+      "-------+----------+-------+----------------",
+      " 1     | eng      | aac   | mono",
+      " 2     | fra      | aac   | mono",
+      "(2 rows)"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/examples.md::35-hit-a-delivery-spec": {
+    "command": [
+      "ffmpeg -i in.mkv -map 0:v:0 -map 0:a:0 -c:0 libx264 -profile:0 baseline -level:0 3.1 -maxrate:0 2675k -bufsize:0 5350k -c:1 aac -t 30 out.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/examples.md::4-trim-a-clip-fast-stream-copy-or-frame-accurate-re-encode": {
+    "command": [
+      "ffmpeg -ss 5 -to 60 -i clip.mp4 -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy cut.mp4"
+    ],
+    "tier": "offline",
+    "verdict": "accepted"
+  },
+  "docs/examples.md::4-trim-a-clip-fast-stream-copy-or-frame-accurate-re-encode-2": {
+    "command": [
+      "ffmpeg -ss 5 -to 60 -i clip.mp4 -map 0:v:0 -map 0:a:0 -c:0 libx264 -crf:0 18 -c:1 aac cut.mp4"
+    ],
+    "tier": "offline",
+    "verdict": "accepted"
+  },
+  "docs/examples.md::41-flag-the-default-track": {
+    "command": [
+      "ffmpeg -i tests/fixtures/av2.mp4 -map 0:a:0 -c:0 copy -metadata:s:0 language=eng -disposition:0 default -map 0:a:1 -c:1 copy -metadata:s:1 language=fra -disposition:1 0 flagged.mka"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/examples.md::41-flag-the-default-track-2": {
+    "command": [
+      " index | language | default | forced",
+      "-------+----------+---------+--------",
+      " 1     | eng      | true    | false",
+      " 2     | fra      | false   | false",
+      "(2 rows)"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/examples.md::5-resize-to-1280-wide-or-to-half-size": {
+    "command": [
+      "ffmpeg -i film.mp4 -filter_complex '[0:v:0]scale=width=1280:height=-2[out0]' -map '[out0]' -map 0:a:0 -c:1 copy small.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/examples.md::5-resize-to-1280-wide-or-to-half-size-2": {
+    "command": [
+      "ffmpeg -i film.mp4 -filter_complex '[0:v:0]scale=width=iw/2:height=-2[out0]' -map '[out0]' -map 0:a:0 -c:1 copy half.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/examples.md::54-gather-rows-into-one-file": {
+    "command": [
+      "ffmpeg -i tests/fixtures/av2.mp4 -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -metadata:s:1 language=eng -map 0:a:1 -c:2 copy -metadata:s:2 language=fra out.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/examples.md::55-one-file-per-language-all-its-tracks-inside": {
+    "command": [
+      "ffmpeg -i tests/fixtures/av-2eng.mp4 -map 0:a:0 -c:0 copy -metadata:s:0 language=eng -map 0:a:1 -c:1 copy -metadata:s:1 language=eng -metadata title=eng eng.mka -map 0:a:2 -c:0 copy -metadata:s:0 language=fra -metadata title=fra fra.mka"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/examples.md::67-write-a-function-and-reuse-it": {
+    "command": [
+      "ffmpeg -i tests/fixtures/av2.mp4 -map 0:a:0 -c:0 copy -metadata:s:0 language=eng eng.mka -map 0:a:1 -c:0 copy -metadata:s:0 language=fra fra.mka"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/examples.md::74-cut-a-file-into-n-clips-one-file-each": {
+    "command": [
+      "ffmpeg -ss 0 -to 5 -i film.mp4 -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy clip1.mp4 && ffmpeg -ss 5 -to 10 -i film.mp4 -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy clip2.mp4 && ffmpeg -ss 10 -to 15 -i film.mp4 -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy clip3.mp4"
+    ],
+    "tier": "offline",
+    "verdict": "accepted"
+  },
+  "docs/examples.md::79-give-a-parameter-a-default": {
+    "command": [
+      "ffmpeg -i film.mp4 -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -metadata title=clip out.mp4"
+    ],
+    "tier": "offline",
+    "verdict": "accepted"
+  },
+  "docs/examples.md::8-concatenate-two-clips": {
+    "command": [
+      "ffmpeg -i part1.mp4 -i part2.mp4 -filter_complex '[0:v:0][0:a:0][1:v:0][1:a:0]concat=n=2:v=1:a=1[out0][out1]' -map '[out0]' -map '[out1]' joined.mp4"
+    ],
+    "tier": "offline",
+    "verdict": "accepted"
+  },
+  "docs/examples.md::8-concatenate-two-clips-2": {
+    "command": [
+      "ffmpeg -i tests/fixtures/av2.mp4 -i tests/fixtures/av3.mp4 -filter_complex '[0:v:0][0:a:0][0:a:1][1:v:0][1:a:0][1:a:1]concat=n=2:v=1:a=2[out0][out1][out2]' -map '[out0]' -map '[out1]' -metadata:s:1 language=eng -map '[out2]' -metadata:s:2 language=fra season.mkv"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/examples.md::87-run-a-wasm-module-over-the-picture": {
+    "command": [
+      "ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 rawvideo -pix_fmt:0 rgba -f nut pipe:1 | ffrwd-wasm -f nut -i pipe:0 -m ../sidecar/modules/target/wasm32-wasip2/release/invert.wasm -f nut pipe:1 | ffmpeg -f nut -i pipe:0 -map 0:v:0 -c:0 libx264 -crf:0 20 inverted.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/examples.md::94-blur-the-people-and-only-the-people": {
+    "command": [
+      "ffmpeg -i tests/fixtures/av.mp4 -map 0:v:0 -c:0 rawvideo -pix_fmt:0 yuv420p -f nut pipe:1 | ffrwd-wasm -f nut -i pipe:0 -nn segment=../sidecar/modules/target/wasm32-wasip2/release/segment.onnx -m segment=../sidecar/modules/target/wasm32-wasip2/release/segment.wasm -m mask_select=../sidecar/modules/target/wasm32-wasip2/release/mask_select.wasm -m blur_mask=../sidecar/modules/target/wasm32-wasip2/release/blur_mask.wasm -filter_complex '[0:v]segment[n1];[n1]rowfilter=pred={\"eq\"\\\\:\\[{\"field\"\\\\:\"class\"}\\,{\"lit\"\\\\:\"person\"}\\]}[n2];[n2]mask_select[n3];[0:v][n3]blur_mask=max_radius=24:invert=0[out0]' -map '[out0]' -f nut pipe:1 | ffmpeg -i tests/fixtures/av.mp4 -f nut -i pipe:0 -map 1:v:0 -map 0:a:0 -c:1 copy -c:0 libx264 -crf:0 20 blurred.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/examples.md::98-post-what-a-module-found-as-it-is-found": {
+    "command": [
+      "ffmpeg -i tests/fixtures/av.mp4 -map 0:v:0 -c:0 rawvideo -pix_fmt:0 yuv420p -f nut pipe:1 | ffrwd-wasm -f nut -i pipe:0 -http ../sidecar/modules/target/wasm32-wasip2/release/post_rows.wasm -m facebox=../sidecar/modules/target/wasm32-wasip2/release/facebox.wasm -m post_rows=../sidecar/modules/target/wasm32-wasip2/release/post_rows.wasm -filter_complex '[0:v]facebox[n1];[n1]post_rows=url=http\\\\://127.0.0.1\\\\:8123/detections[out0]' -map '[out0]' -f null -"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  }
+}
