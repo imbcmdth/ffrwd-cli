@@ -4655,3 +4655,26 @@ def test_a_registry_key_this_ffrwd_cannot_read_is_refused(
     with pytest.raises(FfrwdError) as caught:
         read_manifest(manifest)
     assert needle in caught.value.message, caught.value.message
+
+
+# -------------------------------------- the suite deletes nothing of its own
+
+
+def test_the_suites_leak_sweep_refuses_a_path_outside_its_store(tmp_path: Path) -> None:
+    """A test that calls `monkeypatch.undo()` drops the store redirection with
+    every other patch it holds, so the sweep is handed paths it must check."""
+    from tests.conftest import clear_leaks
+
+    home = tmp_path / "store"
+    home.mkdir()
+    inside = home / "ffrwd.lock"
+    inside.write_text("mine", encoding="utf-8")
+    outside = tmp_path / "ffrwd.lock"
+    outside.write_text("the developer's", encoding="utf-8")
+
+    clear_leaks(home, [inside])
+    assert not inside.exists()
+
+    with pytest.raises(AssertionError, match="outside"):
+        clear_leaks(home, [outside])
+    assert outside.read_text(encoding="utf-8") == "the developer's"
