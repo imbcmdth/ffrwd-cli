@@ -1949,6 +1949,31 @@ def test_an_aliased_name_may_not_collide_with_another_from_entry() -> None:
     assert "duplicate name 'z'" in err.message
 
 
+def test_every_from_item_kind_catches_a_collision_with_a_local_alias() -> None:
+    """A view or CTE read under a local alias records nothing in the flat
+    namespace, so `_reserve` cannot see it and each kind of FROM item that
+    binds a name has to catch the collision against the FROM clause itself.
+    """
+    cte = "WITH c AS (SELECT a.video[1] FROM input('x.mp4') a) "
+    for sql in (
+        cte + "SELECT z.w FROM c z, unnest(ARRAY[STRUCT(1920 AS w)]) z",
+        cte + "SELECT z FROM input('f.mkv') f, c z, unnest(f.audio) z",
+        cte + "SELECT z.video[1] FROM c z, input('y.mp4') z",
+        SOURCE_DECLARE + cte + "SELECT z.height FROM c z, subscribe('r', 'b') z",
+        cte + "SELECT z.video[1] FROM c z, ffmpeg.testsrc() z",
+        cte + "SELECT z.video[1] FROM c z, generate_series(1, 3) z",
+    ):
+        err = _reject(sql)
+        assert err.code is ErrorCode.UNSUPPORTED_SQL, sql
+        assert err.message == "duplicate name 'z'", sql
+        # No hint: the flat-namespace advice `_reserve` carries would be wrong
+        # about a name bound only in this FROM clause.
+        assert err.hint is None, sql
+        # Anchored on the duplicate alias, written last by every query above.
+        lines = sql.splitlines()
+        assert (err.line, err.col) == (len(lines), len(lines[-1])), sql
+
+
 # ---------------------------------------------------------------------------
 # track rows: FROM unnest(<input>.<type>) alias
 # ---------------------------------------------------------------------------

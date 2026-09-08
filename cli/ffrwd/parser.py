@@ -3993,6 +3993,19 @@ class _Resolver:
                 "must be unique across the whole script",
             )
 
+    def _bind_alias(self, identifier: exp.Expr, scope: dict[str, str]) -> str:
+        """The folded alias a FROM item takes, claimed and checked against scope.
+
+        Records nothing in `scope`: a caller may still refuse after this, and a
+        rejected query must leave no name bound behind it. Each caller writes
+        its own `scope[alias]` once it has accepted the item.
+        """
+        alias = _ident_name(identifier)
+        self._reserve(alias, identifier)
+        if alias in scope:
+            raise _error(ErrorCode.UNSUPPORTED_SQL, f"duplicate name '{alias}'", identifier)
+        return alias
+
     # -- selects ----------------------------------------------------------
 
     def _validate_select(
@@ -5694,12 +5707,7 @@ class _Resolver:
                 fallback=unnest,
                 hint="a struct row table's columns are its STRUCT field names",
             )
-        alias = _ident_name(alias_node.this)
-        self._reserve(alias, alias_node.this)
-        if alias in scope:
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL, f"duplicate name '{alias}'", alias_node.this
-            )
+        alias = self._bind_alias(alias_node.this, scope)
 
         elements = array.expressions
         if not elements:
@@ -5978,12 +5986,7 @@ class _Resolver:
                 hint="a track row's columns are fixed by the stream type: "
                 f"{_listed_columns(ROW_SCHEMAS[column])}",
             )
-        alias = _ident_name(alias_node.this)
-        self._reserve(alias, alias_node.this)
-        if alias in scope:
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL, f"duplicate name '{alias}'", alias_node.this
-            )
+        alias = self._bind_alias(alias_node.this, scope)
         self.row_aliases.add(alias)
         self.track_rows[alias] = RawTrackRows(
             alias=alias,
@@ -6096,12 +6099,7 @@ class _Resolver:
                 fallback=table,
                 hint=_ALIAS_HINT,
             )
-        alias = _ident_name(alias_node.this)
-        self._reserve(alias, alias_node.this)
-        if alias in scope:
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL, f"duplicate name '{alias}'", alias_node.this
-            )
+        alias = self._bind_alias(alias_node.this, scope)
         # Dedup key is the ALIAS, not the path: the same file under two aliases
         # is two -i entries (see the README PiP example).
         self.sources[alias] = len(self.input_paths)
@@ -6160,12 +6158,7 @@ class _Resolver:
                 fallback=table,
                 hint=f"add an alias, e.g. FROM {declared.name}(...) s",
             )
-        alias = _ident_name(alias_node.this)
-        self._reserve(alias, alias_node.this)
-        if alias in scope:
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL, f"duplicate name '{alias}'", alias_node.this
-            )
+        alias = self._bind_alias(alias_node.this, scope)
         self.wasm_sources[alias] = RawWasmSource(alias=alias, name=declared.name, call_node=call)
         scope[alias] = "input"
 
@@ -6235,12 +6228,7 @@ class _Resolver:
                 fallback=table,
                 hint=_SOURCE_ALIAS_HINT,
             )
-        alias = _ident_name(alias_node.this)
-        self._reserve(alias, alias_node.this)
-        if alias in scope:
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL, f"duplicate name '{alias}'", alias_node.this
-            )
+        alias = self._bind_alias(alias_node.this, scope)
         # NO input index is assigned: a source is a zero-input filter node,
         # not an `-i`. `input_paths`/`sources` stay untouched.
         self.source_filters[alias] = RawSource(
@@ -6320,12 +6308,7 @@ class _Resolver:
                 fallback=table,
                 hint=_SERIES_ALIAS_HINT,
             )
-        alias = _ident_name(alias_node.this)
-        self._reserve(alias, alias_node.this)
-        if alias in scope:
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL, f"duplicate name '{alias}'", alias_node.this
-            )
+        alias = self._bind_alias(alias_node.this, scope)
         self.series[alias] = values
         self.values_rows[alias] = RawValuesTable(
             alias=alias, columns=(alias,), rows=(), node=series, types=("number",)
