@@ -432,7 +432,7 @@ FROM input('x.mp4') a
 **Error JSON** (against ffmpeg 7.1; the option list is that binary's):
 
 ```json
-{"line": 1, "col": 33, "code": "UNKNOWN_FILTER_OPTION", "message": "filter 'gblur' has no option 'sigmma'", "hint": "did you mean sigma => ...?"}
+{"line": 1, "col": 36, "code": "UNKNOWN_FILTER_OPTION", "message": "filter 'gblur' has no option 'sigmma'", "hint": "did you mean sigma => ...?"}
 ```
 
 The anchor lands on the option's VALUE: sqlglot records no token position on the `exp.Var` holding a named argument's name (the same gap `COPY ... WITH` option names have), so `line`/`col` point at the `5`.
@@ -447,7 +447,7 @@ FROM input('x.mp4') a
 ```
 
 ```json
-{"line": 1, "col": 43, "code": "UNKNOWN_FILTER_OPTION", "message": "filter 'scale' has no option 'enable': your ffmpeg does not flag 'scale' as supporting timeline editing", "hint": "enable is only accepted by filters your ffmpeg flags with timeline support (the T column of `ffmpeg -filters`: gblur has it, scale does not); drop it, or express the timing with a WHERE window over the input"}
+{"line": 1, "col": 46, "code": "UNKNOWN_FILTER_OPTION", "message": "filter 'scale' has no option 'enable': your ffmpeg does not flag 'scale' as supporting timeline editing", "hint": "enable is only accepted by filters your ffmpeg flags with timeline support (the T column of `ffmpeg -filters`: gblur has it, scale does not); drop it, or express the timing with a WHERE window over the input"}
 ```
 
 ## FILTER_OPTION_TYPE
@@ -466,15 +466,20 @@ FROM input('x.mp4') a
 **Error JSON** (against ffmpeg 7.1; the range is that binary's):
 
 ```json
-{"line": 1, "col": 32, "code": "FILTER_OPTION_TYPE", "message": "option 'sigma' of filter 'gblur' accepts a number from 0 to 1024, got 5000", "hint": "pick a value from 0 to 1024"}
+{"line": 1, "col": 35, "code": "FILTER_OPTION_TYPE", "message": "option 'sigma' of filter 'gblur' accepts a number from 0 to 1024, got 5000", "hint": "pick a value from 0 to 1024"}
 ```
 
 Enum options quote their constant name (`transition => 'wipeleft'`), and the message lists the constants, truncated with a count when there are many (`xfade`'s `transition` alone has 59). Anchoring matches `UNKNOWN_FILTER_OPTION`: the value, not the name.
 
 **Also fires for the positional/named collision:** a named argument naming an option a positional already bound is this code, never a silent override:
 
+```sql
+SELECT gblur(a.video[1], 5, sigma => 5)
+FROM input('x.mp4') a
+```
+
 ```json
-{"line": 1, "col": 35, "code": "FILTER_OPTION_TYPE", "message": "option 'sigma' of filter 'gblur' is already set positionally by gblur()", "hint": "a named argument never overrides what the call itself set; drop one of the two spellings"}
+{"line": 1, "col": 38, "code": "FILTER_OPTION_TYPE", "message": "option 'sigma' of filter 'gblur' is already set positionally by gblur()", "hint": "a named argument never overrides what the call itself set; drop one of the two spellings"}
 ```
 
 **Also fires for `enable`:** on a filter that does accept it, `enable`'s value must still be a single-quoted string (an ffmpeg timeline expression) — anything else is this code, not `UNKNOWN_FILTER_OPTION`, since the name itself was fine:
@@ -485,7 +490,7 @@ FROM input('x.mp4') a
 ```
 
 ```json
-{"line": 1, "col": 35, "code": "FILTER_OPTION_TYPE", "message": "option 'enable' of filter 'gblur' expects an ffmpeg timeline expression, got 5", "hint": "enable takes a single-quoted ffmpeg timeline expression over t (seconds), n (frame number) or pos, e.g. enable => 'between(t,2,5)'"}
+{"line": 1, "col": 39, "code": "FILTER_OPTION_TYPE", "message": "option 'enable' of filter 'gblur' expects an ffmpeg timeline expression, got 5", "hint": "enable takes a single-quoted ffmpeg timeline expression over t (seconds), n (frame number) or pos, e.g. enable => 'between(t,2,5)'"}
 ```
 
 **Also fires for a required option** (the hand-kept list in [docs/dialect.md](dialect.md#variables): `subtitles`' `filename`, `frei0r`'s `filter_name`, ...). A NULL value drops an option before validation — absence, ffmpeg's default applies — so a filter that cannot run without one rejects at compile time, whether the option was dropped by an unset variable (the message names it: `"':subs' was not set"`) or never written at all:
@@ -511,7 +516,7 @@ SELECT p.video[1] FROM input('logo.png', loob => true) p
 **Error JSON:**
 
 ```json
-{"line": 1, "col": 27, "code": "UNKNOWN_INPUT_OPTION", "message": "unknown input option 'loob'", "hint": "did you mean 'loop'?"}
+{"line": 1, "col": 30, "code": "UNKNOWN_INPUT_OPTION", "message": "unknown input option 'loob'", "hint": "did you mean 'loop'?"}
 ```
 
 Anchoring: like a named argument's `exp.Var` name (`UNKNOWN_FILTER_OPTION`) and a `WITH (...)` option name (`UNKNOWN_SINK_OPTION`), sqlglot records no token position on the `Var` holding an `=>` name, so the anchor falls back to the option's VALUE -- except here the value is `true`, an `exp.Boolean`, which ALSO carries none, so it falls back one step further, to the `input()`'s own path string literal (`'logo.png'`), which is why `line`/`col` land there instead.

@@ -21,6 +21,16 @@ Tiers follow the corpus, the same split test_examples.py makes:
 * A ```pgsql recipe needs this machine's ffmpeg and the generated fixtures, so
   its rows are checked in an `exec`-marked test.
 
+`../docs/errors.md` is pinned by the page itself and so has no row below:
+every ```sql query there is followed by the ```json its rejection prints, and
+the check is that the compiler still prints exactly that -- line, col, code,
+message and hint. A query on that page that COMPILES is a failure; the page
+is a list of refusals, and one that stopped refusing documents nothing. Its
+tiers split on the query rather than on the block's language: one naming
+`tests/fixtures/` media or a wasm module is the exec tier's, and every other
+one compiles against the committed registry snapshot with probing stubbed,
+so the default suite reads no media and runs no binary.
+
 The file is `tests/data/refusal_snapshot.json`: one row per query, keyed by the
 repo-relative source and the recipe's heading (or the fixture's name), sorted,
 LF-only, with machine-specific path prefixes stripped, so two runs over the
@@ -59,6 +69,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 REPO_ROOT = PROJECT_ROOT.parent
 SNAPSHOT_PATH = PROJECT_ROOT / "tests" / "data" / "refusal_snapshot.json"
 GOLDEN_DIR = PROJECT_ROOT / "tests" / "golden"
+ERRORS_PATH = REPO_ROOT / "docs" / "errors.md"
 
 OFFLINE = "offline"
 EXEC = "exec"
@@ -116,6 +127,74 @@ def _corpus_keys() -> set[str]:
     return {key for key, _ in _doc_corpus()} | {key for key, _ in _golden_corpus()}
 
 
+def _needs_this_machine(sql: str) -> bool:
+    """Whether `sql` names generated media or a wasm module.
+
+    The unit tier reads neither, so this is the whole of the errors.md split.
+    """
+    return "tests/fixtures/" in sql or f"language {examples._WASM}" in sql.lower()
+
+
+def _documented_refusals() -> list[examples.Example]:
+    """Every query docs/errors.md pins a refusal for, carrying that pin.
+
+    Read with test_examples' own block regex and heading lookup, so the two
+    pages are cut into blocks the same way. What differs is the pairing -- a
+    query there is followed by the ```json of its rejection, not by a command
+    block, and that JSON becomes the example's `command` -- and the tier,
+    which the query text decides rather than the block's language.
+    """
+    text = ERRORS_PATH.read_text(encoding="utf-8")
+    blocks = list(examples._BLOCK_RE.finditer(text))
+    documented: list[examples.Example] = []
+    for index, block in enumerate(blocks):
+        if block.group("info").strip() != "sql":
+            continue
+        following = blocks[index + 1] if index + 1 < len(blocks) else None
+        pinned = (
+            following.group("body")
+            if following is not None and following.group("info").strip() == "json"
+            else None
+        )
+        sql = block.group("body")
+        documented.append(
+            examples.Example(
+                heading=examples._heading_before(text, block.start()),
+                tier=EXEC if _needs_this_machine(sql) else OFFLINE,
+                sql=sql,
+                command=pinned,
+            )
+        )
+    return documented
+
+
+_DOCUMENTED = _documented_refusals()
+_DOCUMENTED_IDS = examples._ids(_DOCUMENTED)
+
+
+def _documented_of(tier: str) -> tuple[list[examples.Example], list[str]]:
+    """One tier's queries, and their ids -- named once over the whole page, so
+    a query answers to the same id in every check below."""
+    chosen = [
+        (example, name)
+        for example, name in zip(_DOCUMENTED, _DOCUMENTED_IDS)
+        if example.tier == tier
+    ]
+    return [example for example, _ in chosen], [name for _, name in chosen]
+
+
+_DOCUMENTED_OFFLINE, _OFFLINE_IDS = _documented_of(OFFLINE)
+_DOCUMENTED_EXEC, _EXEC_IDS = _documented_of(EXEC)
+
+_MISSING_PIN_HELP = (
+    "every query in docs/errors.md is followed by the ```json block its "
+    "rejection prints -- the whole object, as `ffrwd validate --json` emits it"
+)
+
+# The command the page documents as the structured form of a rejection.
+_VALIDATE = ["validate", "--json", "-f", "query.sql"]
+
+
 # ---------------------------------------------------------------------------
 # rows
 # ---------------------------------------------------------------------------
@@ -151,15 +230,19 @@ def _refused(tier: str, err: FfrwdError, temp_dir: Path | None = None) -> Entry:
     }
 
 
-def _recipe_row(
-    example: examples.Example, tier: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> Entry:
-    """Run a recipe's own command line; record what it printed, or what it refused."""
-    argv, _ = examples._split_command(example)
+def _run(
+    argv: list[str], sql: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[int, str, list[FfrwdError]]:
+    """Run `argv` over `sql`: its exit code, what it printed, what it refused with.
+
+    `-f <name>` is rewritten to a file under `tmp_path` holding `sql`, so the
+    query under test is the one the page shows.
+    """
+    argv = list(argv)
     for index, token in enumerate(argv):
         if token in ("-f", "--file"):
             query = tmp_path / argv[index + 1]
-            query.write_text(example.sql, encoding="utf-8")
+            query.write_text(sql, encoding="utf-8")
             argv[index + 1] = str(query)
 
     refusals: list[FfrwdError] = []
@@ -174,9 +257,17 @@ def _recipe_row(
         patched.setattr(cli, "_print_error", _record)
         with redirect_stdout(printed):
             code = cli.main(argv)
+    return code, printed.getvalue(), refusals
 
+
+def _recipe_row(
+    example: examples.Example, tier: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Entry:
+    """Run a recipe's own command line; record what it printed, or what it refused."""
+    argv, _ = examples._split_command(example)
+    code, printed, refusals = _run(argv, example.sql, tmp_path, monkeypatch)
     if code == 0:
-        return _accepted(tier, printed.getvalue().rstrip("\n").split("\n"), tmp_path)
+        return _accepted(tier, printed.rstrip("\n").split("\n"), tmp_path)
     assert refusals, (
         f"{example.heading}: `{shlex.join(argv)}` exited {code} without a typed error; "
         f"a row is a command or an FfrwdError, and this is neither"
@@ -326,3 +417,64 @@ def test_exec_queries_still_say_what_the_snapshot_records(
     assert {key: entry for key, entry in stored.items() if key not in unreachable} == built, (
         f"a pinned query's command or refusal moved -- if that is the intent, {_REGEN_HINT}"
     )
+
+
+# ---------------------------------------------------------------------------
+# docs/errors.md: the page carries its own pins
+# ---------------------------------------------------------------------------
+
+
+def _assert_refuses_as_documented(
+    example: examples.Example, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Compile the query; compare its rejection to the ```json below it."""
+    assert example.command is not None, f"{example.heading}: {_MISSING_PIN_HELP}"
+    # `--json` prints the object rather than rendering it, so the comparison is
+    # against stdout: the bytes the page says it captured.
+    code, printed, _ = _run(_VALIDATE, example.sql, tmp_path, monkeypatch)
+    assert code != 0, (
+        f"{example.heading}: this query compiled. Every query on the error page "
+        f"is one the compiler refuses; one that stopped refusing documents nothing"
+    )
+    assert printed.strip(), (
+        f"{example.heading}: exited {code} printing no error object; "
+        f"`ffrwd validate --json` answers a rejection with one"
+    )
+    assert json.loads(printed) == json.loads(example.command), (
+        f"{example.heading}: the rejection and the ```json below the query "
+        f"disagree. The page pins line, col, code, message and hint; regenerate "
+        f"it by running the compiler over the query above it, never by editing "
+        f"the field that moved"
+    )
+
+
+@pytest.mark.parametrize("example", _DOCUMENTED, ids=_DOCUMENTED_IDS)
+def test_every_documented_query_shows_its_error_json(example: examples.Example) -> None:
+    """Checked for BOTH tiers in the default suite: an exec-tier query missing
+    its pin would otherwise go unnoticed until someone ran `-m exec`."""
+    assert example.command is not None, f"{example.heading}: {_MISSING_PIN_HELP}"
+
+
+@pytest.mark.parametrize("example", _DOCUMENTED_OFFLINE, ids=_OFFLINE_IDS)
+def test_documented_query_refuses_as_the_page_pins_it(
+    example: examples.Example, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Filters resolve against the committed registry snapshot, as everything
+    # in this tier does (tests/conftest.py); probing is stubbed on top of that,
+    # so a query naming 'x.mp4' or a socket reads nothing and reaches no host.
+    monkeypatch.setattr("ffrwd.compiler.probe_path", lambda path, args=(), **kw: None)
+    _assert_refuses_as_documented(example, tmp_path, monkeypatch)
+
+
+@pytest.mark.exec
+@pytest.mark.parametrize("example", _DOCUMENTED_EXEC, ids=_EXEC_IDS)
+def test_documented_query_over_real_media_refuses_as_the_page_pins_it(
+    example: examples.Example,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _fixtures: None,
+) -> None:
+    reason = examples.missing_module(example)
+    if reason is not None:
+        pytest.skip(reason)
+    _assert_refuses_as_documented(example, tmp_path, monkeypatch)
