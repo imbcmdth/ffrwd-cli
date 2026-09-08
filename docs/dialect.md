@@ -205,9 +205,9 @@ like any script
 the values are the version range for each, recorded and shown, never
 solved.
 
-Eight more keys exist that no compile reads: seven the registry
-stores, and `test`, which only `ffrwd publish` runs. The whole
-manifest's shape is pinned by
+Nine more keys exist that no compile reads: seven the registry stores,
+`test`, which only `ffrwd publish` runs, and `files`, which only
+packing reads. The whole manifest's shape is pinned by
 [ffrwd-json.schema.json](ffrwd-json.schema.json).
 
 ```json
@@ -217,10 +217,16 @@ manifest's shape is pinned by
   "capabilities": ["nn"],
   "ffrwd": ">=0.9",
   "private": false,
+  "files": ["docs/", "CHANGELOG.md"],
   "test": "uv run pytest tests -q && cargo test --release",
   "models": { "depth": { "repo": "depth-anything/small", "revision": "v1",
                          "file": "onnx/model.onnx", "sha256": "<64 hex>" } } }
 ```
+
+`files` names what ships on top of what the package cannot be read
+without. Absent or empty - the ordinary case - means the archive is
+that closure alone; the rules are under
+[Publishing](#publishing).
 
 `keywords` is a list of at most 16 short labels, each at most 32
 characters; the registry indexes and ranks over them. `ffrwd` is the
@@ -742,23 +748,39 @@ registry stores: the version's detail document, the recipe sources, the
 capabilities, and the manifest's `ffrwd`, `keywords`, `license` and
 `models`, each pin carrying what the hub says the file weighs.
 
-What the archive holds is the manifest's closure plus whatever is left.
-The closure is the manifest, every `lib` and `bin` file it names, every
-module its lib SQL declares, and `README.md`; those ship whatever the
+What the archive holds is the manifest's closure plus whatever the
+manifest's `files` names, and nothing else. The closure is the
+manifest, every `lib` and `bin` file it names, every module its lib SQL
+declares, `README.md` and the licence - `LICENSE`, `LICENCE`, either
+with `.md` or `.txt`, at the package root. Those ship whatever the
 ignore rules say, which is what lets a build directory be excluded
-while the built wasm inside it travels. Everything else ships unless it
-is excluded: entries whose name starts with `.` never ship, and
-`.ffrwdignore` and `.gitignore` at the package root add to that. Both
-are read when both are there, and their patterns union.
+while the built wasm inside it travels.
 
-The patterns are a gitignore subset - blank lines, `#` comments, a bare
-name matching at any depth, `dir/` for a directory's whole subtree, a
-leading `/` anchoring to the package root, `*` within a path segment
-and `**` across them. Matching is case-sensitive. There is no
-negation: the closure is what pulls a file back, so nothing needs one.
-A `!` line in `.ffrwdignore` is refused, naming it; a `!` line - or any
-other line outside the subset - in a borrowed `.gitignore` is skipped
-with a warning instead, since that file was written for another tool.
+`files` is a list of patterns, and absent or empty is the ordinary
+case: the built module is the package, and the tree it was built from
+stays home. A package that wants more shipped names it -
+`"files": ["docs/", "CHANGELOG.md"]` - rather than relying on nobody
+having excluded it. To work on a package, clone what its `homepage`
+names and `ffrwd link` it; the archive is the built thing.
+
+`.ffrwdignore` and `.gitignore` at the package root take back what
+`files` named. Both are read when both are there, and their patterns
+union. Neither reaches the closure. An entry whose name starts with `.`
+never ships, and neither does `ffrwd.lock` - a package's own record,
+not something a consumer resolves against. Packing says once what sits
+at the package root and ships nothing, unless an ignore file names it -
+which is how a package says the omission is deliberate. Those two it
+never says.
+
+The patterns, in `files` and in either ignore file, are a gitignore
+subset - blank lines, `#` comments, a bare name matching at any depth,
+`dir/` for a directory's whole subtree, a leading `/` anchoring to the
+package root, `*` within a path segment and `**` across them. Matching
+is case-sensitive. There is no negation: `files` is what puts a file
+in, and an ignore file is what takes one out. A `!` line in `files` or
+in `.ffrwdignore` is refused, naming it; a `!` line - or any other line
+outside the subset - in a borrowed `.gitignore` is skipped with a
+warning instead, since that file was written for another tool.
 
 `README.md` is rendered from CommonMark to HTML at publish and stored
 on the version as `readme_html`, which is what the site shows. Raw HTML

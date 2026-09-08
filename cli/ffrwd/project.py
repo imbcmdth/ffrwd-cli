@@ -194,6 +194,7 @@ _KNOWN = frozenset(
         "lib",
         "bin",
         "dependencies",
+        "files",
         "keywords",
         "license",
         "homepage",
@@ -302,6 +303,13 @@ _KEYWORDS_HINT = (
 _ENGINES_HINT = (
     '"ffrwd" is the range of ffrwd versions this package runs on, written as a '
     'string, e.g. ">=0.9"'
+)
+_FILES_HINT = (
+    '"files" is a list of what ships on top of what the package cannot be read '
+    'without, e.g. ["docs/", "CHANGELOG.md"]'
+)
+_FILES_NEGATION_HINT = (
+    f'"files" names what ships; {store.IGNORE_NAME} is where a path is taken back out'
 )
 _LICENSE_HINT = (
     '"license" is what this package is published under, written as an SPDX '
@@ -432,6 +440,12 @@ class Package:
     each value the version range as written -- recorded and shown, never
     solved.
 
+    `files` is what the manifest names to ship on top of what the package
+    cannot be read without -- patterns of the grammar the ignore files are
+    written in, read by the packer and by nothing else. Empty is the ordinary
+    case: the built module is the package, and the tree it was built from
+    stays home.
+
     `keywords` are the labels the registry indexes it under, `license` what
     the package is published under (None when it says nothing), `homepage` a
     project page for it (None the same way), `capabilities` what the manifest
@@ -459,6 +473,7 @@ class Package:
     exports: Mapping[str, Path] = field(default_factory=dict)
     recipes: Mapping[str, Path] = field(default_factory=dict)
     dependencies: Mapping[str, str] = field(default_factory=dict)
+    files: tuple[str, ...] = ()
     keywords: tuple[str, ...] = ()
     license: str | None = None
     homepage: str | None = None
@@ -883,6 +898,32 @@ def _keywords(data: dict[str, object], path: Path, text: str) -> tuple[str, ...]
     return tuple(found)
 
 
+def _files(data: dict[str, object], path: Path, text: str) -> tuple[str, ...]:
+    """What ``files`` names, in written order; empty when it names nothing.
+
+    Absent and empty are the same claim: the archive is the closure alone.
+    Each entry is a pattern of the grammar the ignore files are written in,
+    checked here so a manifest says what it means before a publish reads it.
+    """
+    if "files" not in data:
+        return ()
+    at = _key_line(text, "files")
+    written = data["files"]
+    if not isinstance(written, list):
+        raise _reject(path, '"files" must be a list', line=at, hint=_FILES_HINT)
+    found: list[str] = []
+    for entry in written:
+        if not isinstance(entry, str) or not entry.strip():
+            raise _reject(path, f"files entry {entry!r} is not a path", line=at, hint=_FILES_HINT)
+        pattern = entry.strip()
+        wrong = store.unreadable_pattern(pattern)
+        if wrong is not None:
+            hint = _FILES_NEGATION_HINT if pattern.startswith("!") else store.SUBSET_HINT
+            raise _reject(path, f"files entry {entry!r} {wrong}", line=at, hint=hint)
+        found.append(pattern)
+    return tuple(found)
+
+
 def _capabilities(data: dict[str, object], path: Path, text: str) -> tuple[str, ...]:
     """What ``capabilities`` declares, in name order; empty when it declares none.
 
@@ -1261,6 +1302,7 @@ def read_manifest(path: Path) -> Package:
         root_export=segment if isinstance(data.get("lib"), str) else None,
         root_recipe=segment if isinstance(data.get("bin"), str) else None,
         dependencies=_dependencies(data, path, text),
+        files=_files(data, path, text),
         keywords=_keywords(data, path, text),
         license=_license(data, path, text),
         homepage=_homepage(data, path, text),

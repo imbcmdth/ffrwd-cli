@@ -1471,12 +1471,14 @@ _MODULE_LIB = (
 )
 
 
-def _wasm_package(root: Path, *, ignores: dict[str, str] | None = None) -> Path:
+def _wasm_package(
+    root: Path, *, ignores: dict[str, str] | None = None, files: list[str] | None = None
+) -> Path:
     """A wasm package whose module is build output, with junk around it.
 
-    The manifest names the wasm under ``target/``; every ignore file the test
-    wants is written at the root. ``.git/`` and ``build.log`` and ``notes/``
-    are here to be left out.
+    The manifest names the wasm under ``target/`` and whatever `files` says;
+    every ignore file the test wants is written at the root. ``.git/`` and
+    ``build.log`` and ``notes/`` are here to be left out.
     """
     for relative, text in {
         "src/lib.sql": _MODULE_LIB,
@@ -1495,18 +1497,15 @@ def _wasm_package(root: Path, *, ignores: dict[str, str] | None = None) -> Path:
     module.write_bytes(b"\0asm\x01\x00\x00\x00")
     for name, text in (ignores or {}).items():
         (root / name).write_text(text, encoding="utf-8")
-    (root / "ffrwd.json").write_text(
-        json.dumps(
-            {
-                "name": "broadcast/depth",
-                "version": "1.0.0",
-                "lib": {"depth": "src/lib.sql"},
-                "bin": {"run": "recipes/run.sql"},
-            }
-        )
-        + "\n",
-        encoding="utf-8",
-    )
+    declared: dict[str, object] = {
+        "name": "broadcast/depth",
+        "version": "1.0.0",
+        "lib": {"depth": "src/lib.sql"},
+        "bin": {"run": "recipes/run.sql"},
+    }
+    if files is not None:
+        declared["files"] = files
+    (root / "ffrwd.json").write_text(json.dumps(declared) + "\n", encoding="utf-8")
     return root
 
 
@@ -1516,17 +1515,17 @@ def _members(archive: bytes) -> list[str]:
         return opened.getnames()
 
 
-def test_the_closure_ships_out_of_an_ignored_build_directory(tmp_path: Path) -> None:
-    """The whole member list: what the manifest names, and nothing else excluded.
+def test_the_archive_is_the_closure_and_nothing_the_manifest_did_not_name(
+    tmp_path: Path,
+) -> None:
+    """The whole member list, with no ignore file anywhere: the closure alone.
 
-    ``target/`` is excluded, so the archive carries exactly the one wasm the
-    lib declares and none of its siblings; ``notes/`` and ``build.log`` go by
-    the ignore file; ``.git/`` and ``.ffrwdignore`` itself go for being
-    dot-entries. The directories above the pulled-back module ship with it.
+    The wasm the lib declares travels out of ``target/`` with the directories
+    above it, and everything nobody named -- ``notes/``, ``build.log``, the
+    rest of the build -- stays home. No ignore file was needed to leave any of
+    it out.
     """
-    source = _wasm_package(
-        tmp_path / "built", ignores={".ffrwdignore": "# junk\n\nnotes/\n*.log\ntarget/\n"}
-    )
+    source = _wasm_package(tmp_path / "built")
     assert _members(store.pack(source)) == [
         "README.md",
         "ffrwd.json",
@@ -1541,39 +1540,76 @@ def test_the_closure_ships_out_of_an_ignored_build_directory(tmp_path: Path) -> 
     ]
 
 
-def test_a_stock_rust_gitignore_excludes_the_build_and_the_closure_still_ships(
+def test_the_licence_ships_with_the_closure_however_it_is_spelled(tmp_path: Path) -> None:
+    """A package arrives with its terms: the file travels like README.md does."""
+    source = _wasm_package(tmp_path / "built", ignores={".ffrwdignore": "LICEN*E*\n"})
+    (source / "LICENSE").write_text("Apache-2.0\n", encoding="utf-8")
+    (source / "LICENCE.md").write_text("also mine\n", encoding="utf-8")
+    (source / "COPYING").write_text("not one of the names\n", encoding="utf-8")
+    members = _members(store.pack(source))
+    assert "LICENSE" in members and "LICENCE.md" in members
+    assert "COPYING" not in members
+
+
+def test_files_names_what_ships_on_top_of_the_closure(tmp_path: Path) -> None:
+    """A directory's whole subtree, a name, and a pattern within a segment."""
+    source = _wasm_package(tmp_path / "built", files=["notes/", "CHANGELOG.md", "*.log"])
+    (source / "CHANGELOG.md").write_text("# 1.0.0\n", encoding="utf-8")
+    members = _members(store.pack(source))
+    assert "notes" in members and "notes/design.md" in members
+    assert "CHANGELOG.md" in members and "build.log" in members
+    assert "target/debug/junk.txt" not in members
+
+
+def test_an_ignore_file_takes_back_what_files_named_and_never_the_closure(
     tmp_path: Path,
 ) -> None:
-    """What `cargo new` writes is enough: no .ffrwdignore, and the wasm travels."""
-    source = _wasm_package(tmp_path / "built", ignores={".gitignore": "/target\n"})
-    members = _members(store.pack(source))
-    assert "target/wasm32-wasip2/release/depth.wasm" in members
-    assert "target/debug/junk.txt" not in members
-    assert "target/wasm32-wasip2/release/depth.d" not in members
-
-
-def test_the_two_ignore_files_union_rather_than_replace(tmp_path: Path) -> None:
-    """Each file alone excludes its own; together they exclude both sets."""
+    """The two ignore files still union, and still cannot reach the closure."""
     ours = {".ffrwdignore": "notes/\n"}
-    theirs = {".gitignore": "*.log\n"}
-    only_ours = _members(store.pack(_wasm_package(tmp_path / "ours", ignores=ours)))
-    only_theirs = _members(store.pack(_wasm_package(tmp_path / "theirs", ignores=theirs)))
-    both = _members(store.pack(_wasm_package(tmp_path / "both", ignores={**ours, **theirs})))
+    theirs = {".gitignore": "*.log\ntarget/\n"}
+    def packed(name: str, ignores: dict[str, str]) -> list[str]:
+        source = _wasm_package(tmp_path / name, ignores=ignores, files=["notes/", "*.log"])
+        return _members(store.pack(source))
+
+    only_ours = packed("ours", ours)
+    only_theirs = packed("theirs", theirs)
+    both = packed("both", {**ours, **theirs})
 
     assert "notes/design.md" not in only_ours and "build.log" in only_ours
     assert "build.log" not in only_theirs and "notes/design.md" in only_theirs
     assert "notes/design.md" not in both and "build.log" not in both
+    # `target/` is ignored in theirs, and the declared module ships anyway.
+    assert "target/wasm32-wasip2/release/depth.wasm" in only_theirs
 
 
-def test_a_package_with_no_ignore_file_ships_everything_but_the_dot_entries(
+def test_packing_says_what_the_archive_leaves_out_unless_a_rule_said_so(
     tmp_path: Path,
 ) -> None:
-    source = _wasm_package(tmp_path / "built")
-    members = _members(store.pack(source))
-    assert "notes/design.md" in members
-    assert "build.log" in members
-    assert "target/debug/junk.txt" in members
-    assert not [name for name in members if name.split("/")[0].startswith(".")]
+    """The warning the whisper package never got: what is here and is not shipping.
+
+    An entry named in an ignore file is the author saying they know, so it is
+    not said again; a dot-entry never ships and is never said, and neither
+    does the lockfile, which is the project's own record.
+    """
+    source = _wasm_package(tmp_path / "built", ignores={".ffrwdignore": "target/\n"})
+    _lock(source, [])
+    said: list[FfrwdWarning] = []
+    store.pack(source, on_warning=said.append)
+    assert _codes(said) == [WarningCode.NOT_SHIPPED]
+    assert said[0].message == (
+        "package 'broadcast/depth' leaves build.log, notes/ out of the archive"
+    )
+    assert '"files"' in (said[0].hint or "")
+
+    quiet: list[FfrwdWarning] = []
+    store.pack(
+        _wasm_package(
+            tmp_path / "quiet",
+            ignores={".ffrwdignore": "target/\nnotes/\n*.log\n"},
+        ),
+        on_warning=quiet.append,
+    )
+    assert quiet == []
 
 
 def test_a_negation_in_our_ignore_file_is_refused_naming_the_line(tmp_path: Path) -> None:
@@ -1591,14 +1627,14 @@ def test_a_negation_in_a_borrowed_gitignore_is_skipped_and_warned_about(
 ) -> None:
     """A user's gitignore is not ours to refuse: the line is dropped, the pack runs."""
     source = _wasm_package(
-        tmp_path / "built", ignores={".gitignore": "*.log\n!keep.log\n"}
+        tmp_path / "built", ignores={".gitignore": "*.log\nnotes/\n!keep.log\n"}
     )
     said: list[FfrwdWarning] = []
     members = _members(store.pack(source, on_warning=said.append))
     assert "build.log" not in members
     assert _codes(said) == [WarningCode.IGNORE_PATTERN]
-    assert said[0].message == ".gitignore line 2: '!keep.log' negates a pattern, and was skipped"
-    assert said[0].line == 2
+    assert said[0].message == ".gitignore line 3: '!keep.log' negates a pattern, and was skipped"
+    assert said[0].line == 3
 
 
 def test_packing_a_tree_twice_produces_the_same_bytes(tmp_path: Path) -> None:
@@ -1628,15 +1664,20 @@ def test_packing_the_same_content_from_two_directories_produces_the_same_bytes(
     assert store.pack(first) == store.pack(second)
 
 
-def test_packing_a_tree_holding_a_link_is_refused(tmp_path: Path) -> None:
-    source = _library(tmp_path / "built", "tracks", "0.5")
+def test_packing_a_link_the_package_declares_is_refused(tmp_path: Path) -> None:
+    """A declared link is a rejection; one nothing names is simply not packed."""
+    source = _wasm_package(tmp_path / "built", files=["elsewhere.sql"])
     try:
-        (source / "src" / "elsewhere.sql").symlink_to(tmp_path / "outside.sql")
+        (source / "elsewhere.sql").symlink_to(tmp_path / "outside.sql")
+        (source / "unnamed.sql").symlink_to(tmp_path / "outside.sql")
     except (NotImplementedError, OSError) as err:  # a platform that will not make one
         pytest.skip(f"symlinks unavailable: {err}")
     with pytest.raises(FfrwdError) as caught:
         store.pack(source)
     assert "regular files and directories only" in caught.value.message
+
+    (source / "elsewhere.sql").unlink()
+    assert "unnamed.sql" not in _members(store.pack(source))
 
 
 def test_the_store_stages_with_mkdir_so_an_entry_keeps_its_parents_permissions(
@@ -1677,13 +1718,13 @@ def test_a_wasm_module_round_trips_through_the_archive_byte_for_byte(
     store_home: Path, tmp_path: Path
 ) -> None:
     """A package's modules ship with it, so the archive carries them unchanged."""
-    source = _library(tmp_path / "built", "tracks", "0.5")
+    source = _wasm_package(tmp_path / "built")
+    built = source / "target" / "wasm32-wasip2" / "release" / "depth.wasm"
     module = bytes(range(256)) * 64  # every byte value, nothing text-shaped
-    (source / "modules").mkdir()
-    (source / "modules" / "invert.wasm").write_bytes(module)
+    built.write_bytes(module)
     archive = store.pack(source)
-    stored = store.unpack("tracks/lib", archive, _digest(archive))
-    assert (stored / "modules" / "invert.wasm").read_bytes() == module
+    stored = store.unpack("broadcast/depth", archive, _digest(archive))
+    assert (stored / built.relative_to(source)).read_bytes() == module
 
 
 def test_an_archive_that_is_not_what_was_pinned_is_refused(
@@ -4503,6 +4544,19 @@ def test_the_registry_keys_are_read_and_carried(tmp_path: Path) -> None:
     }
 
 
+def test_files_is_read_in_written_order_and_absent_is_empty(tmp_path: Path) -> None:
+    """The packer's own key: patterns as written, trimmed, and nothing implied."""
+    manifest = _project(
+        tmp_path,
+        files={"src/tracks.sql": QUIETER},
+        manifest={"files": ["docs/", "  CHANGELOG.md  "]},
+    )
+    assert read_manifest(manifest).files == ("docs/", "CHANGELOG.md")
+
+    bare = _project(tmp_path / "bare", files={"src/tracks.sql": QUIETER})
+    assert read_manifest(bare).files == ()
+
+
 def test_a_model_of_several_files_is_read_in_the_order_it_is_written(
     tmp_path: Path,
 ) -> None:
@@ -4631,6 +4685,14 @@ def test_a_blank_homepage_is_the_same_as_absent(tmp_path: Path) -> None:
         ({"keywords": [""]}, "keyword '' is not a label"),
         ({"keywords": ["a" * 33]}, "is longer than 32 characters"),
         ({"keywords": ["k"] * 17}, '"keywords" declares 17, and at most 16 are read'),
+        ({"files": "docs/"}, '"files" must be a list'),
+        ({"files": [""]}, "files entry '' is not a path"),
+        ({"files": [1]}, "files entry 1 is not a path"),
+        ({"files": ["!docs/"]}, "files entry '!docs/' negates a pattern"),
+        (
+            {"files": ["docs/[abc].md"]},
+            "files entry 'docs/[abc].md' is written with a pattern character",
+        ),
         ({"capabilities": "nn"}, '"capabilities" must be a list'),
         ({"capabilities": ["gpu"]}, "capability 'gpu' is not one this ffrwd grants"),
         ({"capabilities": [1]}, "capability 1 is not one this ffrwd grants"),

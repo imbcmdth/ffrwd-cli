@@ -33,6 +33,7 @@ class WarningCode(str, Enum):
     LINKED_PACKAGE = "LINKED_PACKAGE"  # a linked directory, so no lockfile pins it
     EMPTY_STREAM_ARRAY = "EMPTY_STREAM_ARRAY"  # a column the file has no tracks for
     IGNORE_PATTERN = "IGNORE_PATTERN"  # a .gitignore line the packer does not read
+    NOT_SHIPPED = "NOT_SHIPPED"  # a package root entry the archive leaves out, unasked
     MISSING_README = "MISSING_README"  # a package published with no README.md
     MISSING_LICENSE = "MISSING_LICENSE"  # a package published with no "license"
     RECIPE_DOES_NOT_COMPILE = "RECIPE_DOES_NOT_COMPILE"  # a recipe the probe compile rejected

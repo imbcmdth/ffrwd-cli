@@ -9,11 +9,11 @@ the pin, discard. Nothing unverified reaches the extractor.
 Three things live here. :func:`pack` builds a package directory into a
 deterministic gzipped tar, so the same content produces the same bytes and so
 the same digest on any machine. What it puts in is the manifest's closure --
-the files a package cannot be read without -- plus everything else the ignore
-rules do not exclude, which is what lets a build directory be left out while
-the built module inside it still ships. :func:`unpack` verifies bytes against
-a digest and writes what they hold into the store. :func:`load` turns a
-lockfile entry back into a directory to read.
+the files a package cannot be read without -- plus whatever the manifest's
+``files`` names, and nothing else: the built module ships and the tree it was
+built from does not. :func:`unpack` verifies bytes against a digest and writes
+what they hold into the store. :func:`load` turns a lockfile entry back into a
+directory to read.
 
 Layout follows the registry's disk cache (`registry.py`): everything under
 ``~/.cache/ffrwd/``, :func:`_cache_dir` the only place that names the home
@@ -58,13 +58,16 @@ from .warnings import FfrwdWarning, OnWarning, WarningCode
 __all__ = [
     "GITIGNORE_NAME",
     "IGNORE_NAME",
+    "LICENSE_NAMES",
     "STORE_FORMAT",
+    "SUBSET_HINT",
     "entry_path",
     "global_lock_path",
     "load",
     "pack",
     "store_dir",
     "unpack",
+    "unreadable_pattern",
 ]
 
 # The store layout's version, and the first component of every store path.
@@ -142,11 +145,25 @@ def _require_digest(package: str, sha256: str) -> None:
 IGNORE_NAME = ".ffrwdignore"
 GITIGNORE_NAME = ".gitignore"
 
+# The licence spellings that ship with the closure, at the package root. A
+# package arriving without its terms is worse than one carrying a spare
+# kilobyte, so the file travels like README.md rather than waiting to be
+# named. Separate from the manifest's "license", which is the identifier:
+# the field says which licence, the file carries its text.
+LICENSE_NAMES = (
+    "LICENSE",
+    "LICENSE.md",
+    "LICENSE.txt",
+    "LICENCE",
+    "LICENCE.md",
+    "LICENCE.txt",
+)
+
 # Pattern characters this subset does not read: character classes, the
 # single-character wildcard, and escapes.
 _UNREADABLE_CHARACTERS = frozenset("?[]\\")
 
-_SUBSET_HINT = (
+SUBSET_HINT = (
     "the patterns read here are a name, 'dir/', '*' within a path segment and "
     "'**' across them"
 )
@@ -201,12 +218,16 @@ def _pattern(written: str) -> _Pattern:
     return _Pattern(regex=re.compile(_translate(glob)), anchored=anchored, directory=directory)
 
 
-def _unreadable(written: str) -> str | None:
-    """What is wrong with this ignore line, or None when the subset reads it."""
+def unreadable_pattern(written: str) -> str | None:
+    """What is wrong with this pattern, or None when the subset reads it.
+
+    One grammar, wherever a pattern is written: an ignore file's lines and the
+    manifest's ``files``.
+    """
     if written.startswith("!"):
         return "negates a pattern"
     if _UNREADABLE_CHARACTERS.intersection(written):
-        return "is written with a pattern character this ignore grammar does not read"
+        return "is written with a pattern character this grammar does not read"
     return None
 
 
@@ -230,11 +251,11 @@ def _patterns(root: Path, package: str, on_warning: OnWarning | None) -> tuple[_
             written = line.strip()
             if not written or written.startswith("#"):
                 continue
-            wrong = _unreadable(written)
+            wrong = unreadable_pattern(written)
             if wrong is None:
                 found.append(_pattern(written))
                 continue
-            hint = _NEGATION_HINT if written.startswith("!") else _SUBSET_HINT
+            hint = _NEGATION_HINT if written.startswith("!") else SUBSET_HINT
             if own:
                 raise _reject(f"{path}: line {number}: {written!r} {wrong}", hint)
             if on_warning is not None:
@@ -250,8 +271,8 @@ def _patterns(root: Path, package: str, on_warning: OnWarning | None) -> tuple[_
     return tuple(found)
 
 
-def _excluded(patterns: tuple[_Pattern, ...], relative: str, directory: bool) -> bool:
-    """True when the ignore rules exclude `relative` or a directory above it."""
+def _matched(patterns: tuple[_Pattern, ...], relative: str, directory: bool) -> bool:
+    """True when `patterns` match `relative` or a directory above it."""
     segments = relative.split("/")
     for depth in range(1, len(segments) + 1):
         prefix = "/".join(segments[:depth])
@@ -266,14 +287,31 @@ def _excluded(patterns: tuple[_Pattern, ...], relative: str, directory: bool) ->
     return False
 
 
-def _manifest(root: Path) -> tuple[frozenset[str], str]:
-    """What the manifest at `root` makes essential, and the name to call it by.
+@dataclass(frozen=True)
+class _Declared:
+    """What the package at the root says its archive holds.
+
+    `closure` is what the package cannot be read without; `files` is what the
+    manifest's own ``files`` names on top of it. `manifested` is False for a
+    directory holding no manifest, which has nothing to declare an archive
+    with and packs the way it always did.
+    """
+
+    closure: frozenset[str]
+    files: tuple[_Pattern, ...]
+    package: str
+    manifested: bool = True
+
+
+def _declared(root: Path) -> _Declared:
+    """What the manifest at `root` puts in the archive, and the name to call it by.
 
     The closure is the manifest itself, every lib and bin file it names, every
-    module its lib SQL declares, and README.md -- as relative posix paths.
-    These ship whatever the ignore rules say, which is what lets a build
-    directory be excluded while the built module inside it still travels. A
-    directory with no manifest has no closure, and answers to its own name.
+    module its lib SQL declares, README.md and the licence -- as relative posix
+    paths. These ship whatever the ignore rules say, which is what lets a build
+    directory be excluded while the built module inside it still travels.
+    ``files`` is read as patterns of the same grammar the ignore files are
+    written in.
 
     A manifest that does not read, or that names a lib or bin file that is not
     there, raises where it always did.
@@ -284,11 +322,12 @@ def _manifest(root: Path) -> tuple[frozenset[str], str]:
 
     manifest = root / MANIFEST_NAME
     if not manifest.is_file():
-        return frozenset(), root.name
+        return _Declared(closure=frozenset(), files=(), package=root.name, manifested=False)
     package = read_manifest(manifest)
     found = {MANIFEST_NAME}
-    if (root / README_NAME).is_file():
-        found.add(README_NAME)
+    for name in (README_NAME, *LICENSE_NAMES):
+        if (root / name).is_file():
+            found.add(name)
     named = [*package.exports.values(), *package.recipes.values()]
     named.extend(Path(declared.module) for declared in package_modules(package))
     for path in named:
@@ -296,95 +335,199 @@ def _manifest(root: Path) -> tuple[frozenset[str], str]:
             found.add(path.relative_to(root).as_posix())
         except ValueError:  # a path the package does not hold
             continue
-    return frozenset(found), package.name
+    return _Declared(
+        closure=frozenset(found),
+        files=tuple(_pattern(written) for written in package.files),
+        package=package.name,
+    )
 
 
-def _ships(
-    relative: str, directory: bool, closure: frozenset[str], patterns: tuple[_Pattern, ...]
-) -> bool:
-    """True when this entry belongs in the archive.
+def _ships(relative: str, declared: _Declared, patterns: tuple[_Pattern, ...]) -> bool:
+    """True when this file belongs in the archive.
 
-    The closure first and unconditionally, every directory above a closure file
-    with it. Everything else ships unless it is a dot-entry or the ignore rules
-    exclude it.
+    The closure first and unconditionally. Everything else ships only because
+    the manifest's ``files`` names it, and not then if it is a dot-entry or the
+    ignore rules exclude it: the archive is what the package declares, not the
+    directory minus what someone remembered to exclude. A directory holding no
+    manifest has neither, and keeps the older rule -- everything the ignore
+    rules leave.
     """
-    if relative in closure:
-        return True
-    if directory and any(path.startswith(f"{relative}/") for path in closure):
+    if relative in declared.closure:
         return True
     if relative.rpartition("/")[2].startswith("."):
         return False
-    return not _excluded(patterns, relative, directory)
+    if _matched(patterns, relative, False):
+        return False
+    if not declared.manifested:
+        return True
+    return _matched(declared.files, relative, False)
+
+
+def _descends(relative: str, declared: _Declared, patterns: tuple[_Pattern, ...]) -> bool:
+    """True when the archive may hold something under this directory.
+
+    The closure reaching inside is what pulls a built module out of an excluded
+    build directory. Past that a walk is worth it only where something could
+    ship: what ``files`` names, or -- with no manifest to name anything -- the
+    whole tree.
+    """
+    if any(path.startswith(f"{relative}/") for path in declared.closure):
+        return True
+    if relative.rpartition("/")[2].startswith("."):
+        return False
+    if _matched(patterns, relative, True):
+        return False
+    return bool(declared.files) or not declared.manifested
+
+
+def _refuse_irregular(path: Path, link: bool) -> None:
+    """Refuse an entry that would ship and is not a regular file.
+
+    A link the package declares as content is a rejection; one lying about the
+    tree unnamed is simply not packed, like anything else nothing names.
+    """
+    if link or not (path.is_dir() or path.is_file()):
+        raise _reject(
+            f"{path} cannot be packed: a package holds regular files and directories only",
+            "remove the link or special file from the package directory",
+        )
 
 
 def _walk(
     directory: Path,
     prefix: str,
-    closure: frozenset[str],
+    declared: _Declared,
     patterns: tuple[_Pattern, ...],
     found: list[tuple[str, Path]],
-) -> None:
-    """Collect what ships under `directory`, whose path from the root is `prefix`."""
+) -> bool:
+    """Collect what ships under `directory`, whose path from the root is `prefix`.
+
+    True when anything under it ships, which is what makes the directory itself
+    a member: an archive carries no directory it puts nothing in.
+    """
+    holds_shipped = False
     for path in directory.iterdir():
         relative = f"{prefix}{path.name}"
         link = path.is_symlink()
         holds = path.is_dir() and not link
-        if not _ships(relative, holds, closure, patterns):
-            continue
-        if link or not (path.is_dir() or path.is_file()):
-            raise _reject(
-                f"{path} cannot be packed: a package holds regular files and directories only",
-                "remove the link or special file from the package directory",
-            )
-        found.append((relative, path))
         if holds:
-            _walk(path, f"{relative}/", closure, patterns, found)
+            if not _descends(relative, declared, patterns):
+                continue
+            if _walk(path, f"{relative}/", declared, patterns, found):
+                found.append((relative, path))
+                holds_shipped = True
+            continue
+        if not _ships(relative, declared, patterns):
+            continue
+        _refuse_irregular(path, link)
+        found.append((relative, path))
+        holds_shipped = True
+    return holds_shipped
 
 
 def _entries(
-    root: Path, closure: frozenset[str], patterns: tuple[_Pattern, ...]
+    root: Path, declared: _Declared, patterns: tuple[_Pattern, ...]
 ) -> list[tuple[str, Path]]:
     """Every directory and file under `root` that ships, as (relative posix path, path).
 
     Sorted, so a parent comes before what it holds and the member order is the
-    tree's own order rather than the filesystem's. An excluded directory is not
-    descended into unless the closure reaches inside it, so a build directory
-    costs one decision rather than a walk.
+    tree's own order rather than the filesystem's. A directory nothing ships
+    out of is not descended into, so a build directory costs one decision
+    rather than a walk.
     """
     found: list[tuple[str, Path]] = []
-    _walk(root, "", closure, patterns, found)
+    _walk(root, "", declared, patterns, found)
     return sorted(found)
+
+
+# How many left-out names one warning prints before it counts the rest.
+_LEFT_OUT_SHOWN = 8
+
+
+def _left_out(
+    root: Path,
+    entries: list[tuple[str, Path]],
+    declared: _Declared,
+    patterns: tuple[_Pattern, ...],
+) -> list[str]:
+    """What sits at the package root and put nothing in the archive, unasked.
+
+    An entry nobody excluded and nobody named is one whose author probably
+    expected it to travel, and saying nothing is what let a package ship a
+    megabyte of build input for a year. Anything an ignore file names is
+    silent -- naming it there is the author saying they know -- and so is a
+    dot-entry, which never ships, and the lockfile, which is this project's
+    own record rather than anything a consumer of the package resolves
+    against.
+    """
+    from .project import LOCKFILE_NAME
+
+    if not declared.manifested:
+        return []
+    shipped = {relative.partition("/")[0] for relative, _ in entries}
+    missing: list[str] = []
+    for path in sorted(root.iterdir()):
+        name = path.name
+        holds = path.is_dir() and not path.is_symlink()
+        if name in shipped or name.startswith(".") or name == LOCKFILE_NAME:
+            continue
+        if _matched(patterns, name, holds):
+            continue
+        missing.append(f"{name}/" if holds else name)
+    return missing
+
+
+def _left_out_warning(package: str, missing: list[str]) -> FfrwdWarning:
+    shown = ", ".join(missing[:_LEFT_OUT_SHOWN])
+    rest = len(missing) - _LEFT_OUT_SHOWN
+    written = shown if rest <= 0 else f"{shown} and {rest} more"
+    return FfrwdWarning(
+        code=WarningCode.NOT_SHIPPED,
+        package=package,
+        message=f"package '{package}' leaves {written} out of the archive",
+        hint=f'name what should ship in "files"; name what should not in '
+        f"{IGNORE_NAME}, which is also how this stops being said",
+    )
 
 
 def pack(root: Path, *, on_warning: OnWarning | None = None) -> bytes:
     """The package directory `root` as one gzipped tar, byte-for-byte reproducible.
 
     What ships is the manifest's closure -- the manifest, its lib and bin
-    files, the modules its lib SQL declares, and README.md -- plus everything
-    else the ignore rules do not exclude. Dot-entries are excluded by default,
-    and ``.ffrwdignore`` and ``.gitignore`` at the root add to that; the
-    closure ships regardless of either. A directory holding no manifest packs
-    the same way with no closure.
+    files, the modules its lib SQL declares, README.md and the licence -- plus
+    whatever the manifest's ``files`` names. Nothing else: a package is what it
+    declares, so a directory nobody thought about stays out of the archive
+    rather than travelling because nobody remembered to exclude it. A
+    dot-entry never ships, and ``.ffrwdignore`` and ``.gitignore`` at the root
+    take back what ``files`` named; the closure ships regardless of either. A
+    directory holding no manifest has nothing to declare an archive with, and
+    packs the way it always did: everything the ignore rules leave.
 
     Sorted member order, zeroed mtimes, uid/gid 0 with empty owner names, fixed
     modes and a gzip header with no timestamp: the same content packs to the
     same bytes on any machine, which is what keeps a published version's digest
     stable.
 
-    `on_warning` hears about a ``.gitignore`` line this subset does not read.
+    `on_warning` hears about a ``.gitignore`` line this subset does not read,
+    and about what sits at the package root and ships nothing.
 
-    Raises ``FfrwdError`` for a tree holding anything but regular files and
-    directories, for a manifest that does not read, and for an ``.ffrwdignore``
+    Raises ``FfrwdError`` for a declared entry that is not a regular file or
+    directory, for a manifest that does not read, and for an ``.ffrwdignore``
     line outside the grammar; OSError if the tree cannot be read.
     """
-    closure, package = _manifest(root)
-    patterns = _patterns(root, package, on_warning)
+    declared = _declared(root)
+    patterns = _patterns(root, declared.package, on_warning)
+    entries = _entries(root, declared, patterns)
+    if on_warning is not None:
+        missing = _left_out(root, entries, declared, patterns)
+        if missing:
+            on_warning(_left_out_warning(declared.package, missing))
     raw = io.BytesIO()
     with gzip.GzipFile(
         filename="", mode="wb", compresslevel=9, fileobj=raw, mtime=0
     ) as compressed:
         with tarfile.open(fileobj=compressed, mode="w", format=tarfile.PAX_FORMAT) as archive:
-            for relative, path in _entries(root, closure, patterns):
+            for relative, path in entries:
                 info = tarfile.TarInfo(relative)
                 info.mtime = 0
                 info.uid = 0

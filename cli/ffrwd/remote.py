@@ -717,8 +717,9 @@ def _pack_link(
         raise _reject(
             f"package '{package.name}' packs to {written_size(len(content))}, and a "
             f"submit carries at most {written_size(MAX_PACKAGE_BYTES)} per package",
-            f"exclude what the run does not need in {store.IGNORE_NAME}; a build "
-            "directory or test media in the package tree is the usual cause",
+            'a submit carries what the package ships: narrow "files" in its '
+            "manifest, since a module or test media the archive names is the "
+            "usual cause",
         )
     digest = hashlib.sha256(content).hexdigest()
     pin = RegistryEntry(

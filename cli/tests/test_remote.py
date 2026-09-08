@@ -885,9 +885,17 @@ def test_no_lockfile_anywhere_submits_none(
 
 
 def _linked_package(
-    root: Path, *, name: str = "broadcast/tools", version: str = "1.0.0", factor: str = "0.5"
+    root: Path,
+    *,
+    name: str = "broadcast/tools",
+    version: str = "1.0.0",
+    factor: str = "0.5",
+    files: list[str] | None = None,
 ) -> Path:
-    """A package directory: a manifest, and one lib file defining ``quieter``."""
+    """A package directory: a manifest, and one lib file defining ``quieter``.
+
+    `files` is the manifest's own, for a package shipping more than its lib.
+    """
     (root / "src").mkdir(parents=True, exist_ok=True)
     (root / "src" / "lib.sql").write_text(
         "CREATE FUNCTION quieter(track audio_stream) RETURNS audio_stream AS $$\n"
@@ -895,10 +903,14 @@ def _linked_package(
         "$$ LANGUAGE sql;\n",
         encoding="utf-8",
     )
-    (root / "ffrwd.json").write_text(
-        json.dumps({"name": name, "version": version, "lib": {"quieter": "src/lib.sql"}}),
-        encoding="utf-8",
-    )
+    declared: dict[str, object] = {
+        "name": name,
+        "version": version,
+        "lib": {"quieter": "src/lib.sql"},
+    }
+    if files is not None:
+        declared["files"] = files
+    (root / "ffrwd.json").write_text(json.dumps(declared), encoding="utf-8")
     return root
 
 
@@ -1103,11 +1115,13 @@ def test_a_link_cycle_is_refused_naming_the_loop(
     assert served.asked == []
 
 
-def test_an_oversize_package_is_refused_naming_the_ignore_file(
+def test_an_oversize_package_is_refused_naming_what_it_ships(
     served: _Served, logged_in: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.chdir(tmp_path)
-    linked = _linked_package(tmp_path / "tools")
+    # The media ships because the manifest names it, which is what makes the
+    # package big enough to refuse -- and what the hint points the author at.
+    linked = _linked_package(tmp_path / "tools", files=["media.mkv"])
     (linked / "media.mkv").write_bytes(b"take one" * 512)
     write_lockfile(tmp_path / "ffrwd.lock", [LinkEntry(path="tools")])
     # The real cap is megabytes; what this pins is the refusal, not the number.
@@ -1118,7 +1132,7 @@ def test_an_oversize_package_is_refused_naming_the_ignore_file(
         remote.submit_run(_query(STREAM_QUERY), None, _run_args())
     assert caught.value.message.startswith("package 'broadcast/tools' packs to ")
     assert "a submit carries at most 64 bytes per package" in caught.value.message
-    assert ".ffrwdignore" in (caught.value.hint or "")
+    assert '"files"' in (caught.value.hint or "")
     assert served.asked == []
 
 

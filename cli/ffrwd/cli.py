@@ -2418,10 +2418,17 @@ COPY (
 ) TO :'dest'
 """
 
+# The archive is what the manifest declares, so nothing here has to be
+# excluded to keep it out. Naming it anyway is how a package says the
+# omission is deliberate, and what stops `publish` listing it back.
 _RUST_IGNORE = """\
-# Build output. The one file the lib SQL names is pulled back in by the
-# manifest's closure; the rest of the directory stays out of the archive.
+# Build input, and the output it produces. The one wasm the lib SQL names
+# ships out of target/ regardless; nothing else here belongs in the archive.
+Cargo.toml
+build.rs
+src/*.rs
 target/
+wit/
 """
 
 # `wit/` is written by build.rs, not by hand.

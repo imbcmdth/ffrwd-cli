@@ -49,6 +49,11 @@
       "propertyNames": { "pattern": "^[a-z_][a-z0-9_]*/[a-z_][a-z0-9_]*$" },
       "additionalProperties": { "type": "string", "minLength": 1 }
     },
+    "files": {
+      "type": "array",
+      "description": "What ships on top of the closure the package cannot be read without, as gitignore-subset patterns. Absent or empty is the closure alone: the built module is the package, not the tree it was built from.",
+      "items": { "type": "string", "minLength": 1 }
+    },
     "keywords": {
       "type": "array",
       "description": "Labels the registry indexes and ranks over. The compiler never reads them.",
