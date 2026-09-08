@@ -3803,11 +3803,35 @@ def test_a_predicate_outside_the_grammar_is_refused() -> None:
     assert error.hint is not None and "AND, OR, NOT" in error.hint
 
 
-def test_between_is_outside_the_runtime_grammar() -> None:
+def test_between_and_in_travel_as_the_comparisons_they_mean() -> None:
+    """Neither reaches the sidecar as itself: BETWEEN is the inclusive pair,
+    IN the =/OR chain, so the wire holds only comparisons and logic."""
+    where = "o.score BETWEEN 1 AND 2 AND o.class IN ('person', 'cat')"
+    network = _segment_network(_segment_query(_masked(where)))
+    predicate = network.split("pred=")[1].split("[n2];")[0]
+    assert json.loads(_unescaped(predicate)) == {
+        "and": [
+            {
+                "and": [
+                    {"ge": [{"field": "score"}, {"lit": 1}]},
+                    {"le": [{"field": "score"}, {"lit": 2}]},
+                ]
+            },
+            {
+                "or": [
+                    {"eq": [{"field": "class"}, {"lit": "person"}]},
+                    {"eq": [{"field": "class"}, {"lit": "cat"}]},
+                ]
+            },
+        ]
+    }
+
+
+def test_a_between_bound_is_typed_against_the_record() -> None:
     _segment_rejects(
-        _segment_query(_masked("o.score BETWEEN 1 AND 2")),
-        ErrorCode.UNSUPPORTED_SQL,
-        "BETWEEN is not part of the runtime predicate grammar",
+        _segment_query(_masked("o.score BETWEEN 'a' AND 'b'")),
+        ErrorCode.UDF_ARG_TYPE,
+        "the field 'score' is number, and 'a' is text",
     )
 
 

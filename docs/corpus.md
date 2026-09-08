@@ -2903,3 +2903,263 @@ been written. A candidate two branches happen to name the SAME path, under
 different aliases, is a different case: dedup folds them onto one `-i`
 before either branch's own fate is decided, so a live branch sharing that
 path keeps it open even when the other branch beside it drops.
+
+## 138. Define a view or a function between two outputs
+
+A script resolves left to right, so a `CREATE VIEW` or `CREATE FUNCTION` may sit anywhere among the `COPY`s - only the statements after it can read it. Write the definition where it becomes relevant rather than hoisting every one of them to the top:
+
+```pgsql
+COPY (SELECT f.audio[1] FROM input('tests/fixtures/av2.mp4') f) TO 'sound.m4a';
+
+CREATE FUNCTION thumbnail(v video_stream) RETURNS video_stream AS $$
+  SELECT scale(v, 320, -2)
+$$ LANGUAGE sql;
+
+CREATE VIEW small AS
+  SELECT thumbnail(g.video[1]) AS v FROM input('tests/fixtures/av2.mp4') g;
+
+COPY (SELECT s.v FROM small s) TO 'small.mp4'
+```
+
+```
+$ ffrwd compile -f query.sql
+ffmpeg -i tests/fixtures/av2.mp4 -filter_complex \
+  '[0:v:0]scale=width=320:height=-2[out1]' -map 0:a:0 -c:0 copy -metadata:s:0 \
+  language=eng sound.m4a -map '[out1]' small.mp4
+```
+
+Both outputs still come out of the one run over the one input. A forward reference is still a rejection: a `COPY` naming a view or a function written below it is refused where it reads the name.
+
+## 139. Match two files' tracks without writing JOIN
+
+A `WHERE` conjunct may compare columns of two different row tables, which is the comma join Postgres has always had: cross join in `FROM`, keep the pairs the predicate matches. It compiles to the same graph [recipe 25](#25-mix-two-files-tracks-pairwise-matched-by-language) gets from `JOIN ... ON`, byte for byte:
+
+```pgsql
+COPY (
+  SELECT array_agg(amix(a, b))
+  FROM input('tests/fixtures/av2.mp4') f, input('tests/fixtures/av3.mp4') g,
+       unnest(f.audio) a, unnest(g.audio) b
+  WHERE a.tags.language = b.tags.language
+) TO 'mixed.mka'
+```
+
+```
+$ ffrwd compile -f query.sql
+ffmpeg -i tests/fixtures/av2.mp4 -i tests/fixtures/av3.mp4 -filter_complex \
+  '[0:a:0][1:a:0]amix=inputs=2[out0];[0:a:1][1:a:1]amix=inputs=2[out1]' -map '[out0]' \
+  -metadata:s:0 language=eng -map '[out1]' -metadata:s:1 language=fra mixed.mka
+```
+
+`JOIN ... ON` is still the spelling to reach for - it says which relation is the left one, and it is the only way to write `LEFT`/`FULL OUTER`. This one is for the inner join you already had in `WHERE`. The two sides are typed the same way `ON` types them, so `a.tags.language = b.channels` is refused rather than evaluated to nothing, and the same rule reads two columns of ONE row against each other: `WHERE t.channels > t.index`.
+
+## 140. Spell the cross join CROSS JOIN
+
+`CROSS JOIN` is the comma written out - the same bounded compile-time cross join, legal in the same places, including between two `input()` aliases. Both spellings exist because Postgres has both; reach for this one when the pairing is the point and a comma buried in a long `FROM` would not say so:
+
+```pgsql
+SELECT t.tags.language, i.i AS pass
+FROM input('tests/fixtures/av2.mp4') f, unnest(f.audio) t
+     CROSS JOIN generate_series(1, 2) i
+```
+
+```
+$ ffrwd -f query.sql
+ language | pass
+----------+------
+ eng      | 1
+ eng      | 2
+ fra      | 1
+ fra      | 2
+(4 rows)
+```
+
+Four rows, exactly what [recipe 73](#73-join-a-series-against-a-files-tracks) gets from the comma. A `CROSS JOIN` carrying an `ON` is refused rather than read as an inner join - Postgres refuses it too.
+
+## 141. Gather rows inside the CTE that produced them
+
+`array_agg` is legal in a CTE or a view body, not only in the SELECT a `COPY` writes. Gathering where the rows are is what collapses a many-row relation to one, so the outer query can put the result beside a column that was one row all along:
+
+```pgsql
+COPY (
+  WITH bed AS (
+    SELECT amix(VARIADIC array_agg(t)) AS a
+    FROM input('tests/fixtures/av2.mp4') f, unnest(f.audio) t
+  )
+  SELECT g.video[1], volume(bed.a, 0.5)
+  FROM input('tests/fixtures/av2.mp4') g, bed
+) TO 'one.mp4'
+```
+
+```
+$ ffrwd compile -f query.sql
+ffmpeg -i tests/fixtures/av2.mp4 -filter_complex \
+  '[0:a:0][0:a:1]amix=inputs=2,volume=volume=0.5[out1]' -map 0:v:0 -c:0 copy -map \
+  '[out1]' one.mp4
+```
+
+Written the other way round - the aggregate in the outer SELECT - the video column would have to survive a `GROUP BY` beside it. `GROUP BY` itself is still refused in a body: one group is one file, and a body names no destination to fan out to.
+
+## 142. Cut the chapter a timestamp falls in
+
+`BETWEEN` takes a value on its left and row columns as its bounds, which is how you ask which row a number lands in. One chapter contains 2.5, so the relation is one row and the trim takes that chapter's own bounds:
+
+```pgsql
+COPY (
+  SELECT ffmpeg.trim(f.video[1], start => c.start_t, end => c.end_t),
+         ffmpeg.atrim(f.audio[1], start => c.start_t, end => c.end_t)
+  FROM input('tests/fixtures/av-chapters.mkv') f, unnest(f.chapters) c
+  WHERE :at BETWEEN c.start_t AND c.end_t
+) TO 'chapter.mkv'
+```
+
+```
+$ ffrwd compile -f query.sql -v at=2.5
+ffmpeg -i tests/fixtures/av-chapters.mkv -filter_complex \
+  '[0:v:0]trim=start=2.0:end=3.0[n1];[0:a:0]atrim=start=2.0:end=3.0[n2];'\
+'[n1]setpts=PTS-STARTPTS[out0];[n2]asetpts=PTS-STARTPTS[out1]' -map '[out0]' -map \
+  '[out1]' -metadata:s:1 language=eng chapter.mkv
+```
+
+`BETWEEN` is inclusive at both ends, so a timestamp sitting exactly on a chapter boundary matches the two chapters that share it - two rows, and a single destination refuses them. The same left-hand value grammar works in a `JOIN ... ON`, where it pairs each row of one table with the rows of another whose span contains it.
+
+## 143. A CTE written where it is read
+
+`FROM (SELECT ...) alias` is a CTE without the `WITH`: same rows, same columns, same one-decode sharing, named and read in one place. Reach for it when the body is only read once and hoisting it to the top of the query would put it further from its use:
+
+```pgsql
+COPY (
+  SELECT overlay(a.video[1], pip.frame, 20, 20)
+  FROM input('tests/fixtures/testsrc.mp4') a,
+       (SELECT scale(b.video[1], 160, -2) AS frame
+        FROM input('tests/fixtures/smptebars.mp4') b) pip
+) TO 'pip.mp4'
+```
+
+```
+$ ffrwd compile -f query.sql
+ffmpeg -i tests/fixtures/testsrc.mp4 -i tests/fixtures/smptebars.mp4 -filter_complex \
+  '[1:v:0]scale=width=160:height=-2[n1];[0:v:0][n1]overlay=x=20:y=20[out0]' -map \
+  '[out0]' pip.mp4
+```
+
+The name is required, as it is in Postgres, and it shares the one flat namespace views, CTEs and input aliases share - so it may not collide with any of them. Everything else follows the CTE rules on [rows.md](rows.md#cte-rows---with-x-as-): a body column that is a value is a value column, a stream column is one cell per row, and a `WITH` at the top of the query is still the spelling to use when two places read the same body.
+
+## 144. A UNION ALL branch with a WITH of its own
+
+A `WITH` belongs to whatever query writes it, and a `UNION ALL` branch is a query: parenthesize the branch and it carries its own bindings, read by that branch and nothing else. A CTE body may write one too, so a body that needs a step of its own no longer has to hoist it above the query that reads it:
+
+```pgsql
+COPY (
+  SELECT f.video[1], f.audio[1] FROM input('tests/fixtures/av.mp4') f
+  UNION ALL
+  (WITH sized AS (
+     SELECT scale(g.video[1], 320, 240) AS v, g.audio[1] AS a
+     FROM input('tests/fixtures/av2.mp4') g
+   )
+   SELECT sized.v, volume(sized.a, 0.5) FROM sized)
+) TO 'joined.mp4'
+```
+
+```
+$ ffrwd compile -f query.sql
+ffmpeg -i tests/fixtures/av2.mp4 -i tests/fixtures/av.mp4 -filter_complex \
+  '[0:v:0]scale=width=320:height=240[n1];[0:a:0]volume=volume=0.5[n2];'\
+'[1:v:0][1:a:0][n1][n2]concat=n=2:v=1:a=1[out0][out1]' -map '[out0]' -map '[out1]' \
+  joined.mp4
+```
+
+Names still share the one flat namespace, so two branches cannot both call their binding `sized`. A `WITH` written between two branches, on the parenthesized union rather than on a branch, belongs to no query and is refused.
+
+## 145. Switch a tag on a variable
+
+A comparison needs no row column on either side: two compile-time values type against each other and the answer is known before ffmpeg starts. That makes `CASE WHEN :'var' = ...` a switch over what `-v` was given:
+
+```pgsql
+COPY (
+  SELECT f.video[1], f.audio[1],
+         STRUCT(CASE WHEN :'edition' = 'extended' THEN 'Extended edition'
+                     ELSE NULL END AS title) AS tags
+  FROM input('tests/fixtures/av.mp4') f
+) TO 'out.mp4'
+```
+
+```
+$ ffrwd compile -f query.sql -v edition=extended
+ffmpeg -i tests/fixtures/av.mp4 -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -metadata \
+  'title=Extended edition' out.mp4
+```
+
+Any other `-v edition=` value takes the `ELSE NULL`, which is the clear-the-key spelling: `-metadata title=` and no title on the output. Dropping the `ELSE` entirely means the same thing, since an unmatched `CASE` is NULL. The two sides are still typed, so `:'edition' = 1` is refused rather than quietly false.
+
+## 146. Pass a filter's own option list through
+
+Some filters take a whole option list of their own: `libplacebo`'s `extra_opts` is an ffmpeg `dictionary` option, a `:`-separated run of `key=value` pairs that libplacebo parses itself. Write it as the string it is and the separators are escaped for you, so the filtergraph reads it as one value:
+
+```pgsql
+COPY (
+  SELECT libplacebo(f.video[1], extra_opts => 'upscaler=bilinear:brightness=0.1')
+  FROM input('tests/fixtures/testsrc.mp4') f
+) TO 'graded.mp4'
+```
+
+```
+$ ffrwd compile -f query.sql
+ffmpeg -i tests/fixtures/testsrc.mp4 -filter_complex \
+  '[0:v:0]libplacebo=extra_opts=upscaler\\=bilinear\\:brightness\\=0.1:inputs=1[out0]' \
+  -map '[out0]' graded.mp4
+```
+
+The keys inside are libplacebo's, not ffrwd's, so a wrong one is ffmpeg's error at run time - the same deal a `color` or an expression option has always had. A `binary` option (`custom_shader_bin`) is a string too, and ffmpeg reads it as hex.
+
+## 147. Narrow a module's rows with IN and BETWEEN
+
+The runtime predicate the sidecar evaluates holds comparisons and logic, and `IN` and `BETWEEN` are spellings of those: an `IN` list is the `=`/`OR` chain it always was, and `BETWEEN` is the inclusive `>=`/`<=` pair. Both compile into the same `rowfilter` node [recipe 94](examples.md#94-blur-the-people-and-only-the-people) builds, so a wider selection reads as SQL rather than as a hand-expanded chain:
+
+```pgsql
+CREATE FUNCTION segment(v video_stream)
+RETURNS STRUCT(map video_stream, objects STRUCT(id number, class text, score number,
+                                                x number, y number, w number, h number)[])
+  AS '../sidecar/modules/target/wasm32-wasip2/release/segment.wasm', 'segment' LANGUAGE wasm;
+
+CREATE FUNCTION mask_select(map video_stream,
+                            objects STRUCT(id number, class text, score number,
+                                           x number, y number, w number, h number)[])
+RETURNS video_stream
+  AS '../sidecar/modules/target/wasm32-wasip2/release/mask_select.wasm', 'mask_select' LANGUAGE wasm;
+
+CREATE FUNCTION blur_mask(v video_stream, mask video_stream,
+                          max_radius number DEFAULT 16, invert boolean DEFAULT FALSE)
+RETURNS video_stream
+  AS '../sidecar/modules/target/wasm32-wasip2/release/blur_mask.wasm', 'blur_mask' LANGUAGE wasm;
+
+COPY (
+  SELECT blur_mask(s.video[1],
+                   mask_select(segment(s.video[1]).map,
+                               ARRAY(SELECT o FROM unnest(segment(s.video[1]).objects) o
+                                     WHERE o.class IN ('person', 'cat')
+                                       AND o.score BETWEEN 0.4 AND 0.9)),
+                   24), s.audio
+  FROM input('tests/fixtures/av.mp4') s
+) TO 'blurred.mp4' WITH (video_codec 'libx264', crf 20)
+```
+
+```
+$ ffrwd compile -f query.sql
+ffmpeg -i tests/fixtures/av.mp4 -map 0:v:0 -c:0 rawvideo -pix_fmt:0 yuv420p -f nut \
+  pipe:1 | ffrwd-wasm -f nut -i pipe:0 -nn \
+  segment=../sidecar/modules/target/wasm32-wasip2/release/segment.onnx -m \
+  segment=../sidecar/modules/target/wasm32-wasip2/release/segment.wasm -m \
+  mask_select=../sidecar/modules/target/wasm32-wasip2/release/mask_select.wasm -m \
+  blur_mask=../sidecar/modules/target/wasm32-wasip2/release/blur_mask.wasm \
+  -filter_complex \
+  '[0:v]segment[n1];'\
+'[n1]rowfilter=pred={"and"\\:\[{"or"\\:\[{"eq"\\:\[{"field"\\:"class"}\,'\
+'{"lit"\\:"person"}\]}\,{"eq"\\:\[{"field"\\:"class"}\,{"lit"\\:"cat"}\]}\]}\,'\
+'{"and"\\:\[{"ge"\\:\[{"field"\\:"score"}\,{"lit"\\:0.4}\]}\,'\
+'{"le"\\:\[{"field"\\:"score"}\,{"lit"\\:0.9}\]}\]}\]}[n2];[n2]mask_select[n3];'\
+'[0:v][n3]blur_mask=max_radius=24:invert=0[out0]' -map '[out0]' -f nut pipe:1 | ffmpeg \
+  -i tests/fixtures/av.mp4 -f nut -i pipe:0 -map 1:v:0 -map 0:a:0 -c:1 copy -c:0 libx264 \
+  -crf:0 20 blurred.mp4
+```
+
+Both bounds of a `BETWEEN` are inclusive, and both sides of every comparison are type-checked against the record the module publishes, so `o.score BETWEEN 'a' AND 'b'` is refused where it is written. What still has no spelling inside the grammar - a function call, `IS NULL`, arithmetic - is refused by name.

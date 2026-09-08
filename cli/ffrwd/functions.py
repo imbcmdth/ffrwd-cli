@@ -2743,16 +2743,8 @@ class _Expander:
     def _collect(self, statements: list[exp.Expr]) -> list[exp.Expr]:
         """Read every definition out of the script; return what is left to compile."""
         rest: list[exp.Expr] = []
-        written = False
         for statement in statements:
             if isinstance(statement, exp.Create) and _create_kind(statement) == "FUNCTION":
-                if written:
-                    raise _error(
-                        ErrorCode.UNSUPPORTED_SQL,
-                        "a CREATE FUNCTION may not follow a COPY",
-                        statement,
-                        hint="define every function before the first COPY",
-                    )
                 function = _define(statement)
                 if function.name in self.functions or function.name in self.wasm:
                     line, col = (
@@ -2773,7 +2765,6 @@ class _Expander:
                 function.position = len(rest)
                 self.functions[function.name] = function
                 continue
-            written = written or isinstance(statement, exp.Copy)
             rest.append(statement)
         return rest
 

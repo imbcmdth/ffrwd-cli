@@ -174,7 +174,7 @@ FROM input('y.mp4') b
 
 ## UNSUPPORTED_SQL
 
-**Meaning:** The catch-all for syntactically valid SQL outside the dialect that isn't one of the more specific codes above. No streaming-vs-batch philosophy involved; the surface just doesn't include it. This is the most common code in practice. Most of `ffrwd/parser.py`'s rejections use it: multiple statements, unsupported clause keys, explicit `JOIN` syntax (comma cross-joins only), aliased or nested subqueries, `WITH RECURSIVE`, malformed or duplicate CTE/alias names, an empty `WHERE`, a non-positive or non-literal array subscript, or a top-level statement that isn't a `SELECT`/`UNION ALL`. (`SELECT *` and `<alias>.*` compile now, so they are off this list; see [docs/trimming.md](trimming.md) for the caption rejections below.)
+**Meaning:** The catch-all for syntactically valid SQL outside the dialect that isn't one of the more specific codes above. No streaming-vs-batch philosophy involved; the surface just doesn't include it. This is the most common code in practice. Most of `ffrwd/parser.py`'s rejections use it: multiple statements, unsupported clause keys, `JOIN ... ON` outside two row tables, an unnamed subquery in FROM, a subquery in an expression, `WITH RECURSIVE`, malformed or duplicate CTE/alias names, an empty `WHERE`, a non-positive or non-literal array subscript, or a top-level statement that isn't a `SELECT`/`UNION ALL`. (`SELECT *` and `<alias>.*` compile now, so they are off this list; see [docs/trimming.md](trimming.md) for the caption rejections below.)
 
 The unset-variable rejections land here when the NULL sits where a value is REQUIRED. An unset `:'variable'` (psql-style, filled by `-v name=value`) substitutes to `NULL` — absence, which drops an option cleanly — but `input()` needs a path, `COPY` needs a destination, and a `TO` expression must come out text, so a NULL there is rejected at its point of use, naming the variable when the NULL came from one:
 
@@ -202,11 +202,10 @@ Three caption rejections land here too, all consequences of one measured fact: f
 - a `WHERE` window on a CTE whose columns include a subtitle/data column. A CTE trim is a filtergraph trim (`trim`/`atrim`), and a filtergraph cannot carry captions at all, so this rejects unconditionally, selected or not;
 - a subtitle/data column inside a `UNION ALL` branch. `concat` has video and audio pads, full stop.
 
-Three script rejections (`CREATE VIEW name AS <query>;`* followed by `COPY ...;`+, see [the README](../README.md#views-and-multiple-outputs)) land here too, all typo/shape guards rather than anything semantic:
+Two script rejections (`CREATE VIEW name AS <query>;` and `COPY ...;` statements in any order, at least one COPY, see [the README](../README.md#views-and-multiple-outputs)) land here too, both typo/shape guards rather than anything semantic:
 
-- a view nobody ever reads, anchored on its `CREATE VIEW` (captured example below) -- a script's whole point is that its views feed later views or COPYs, so one that feeds nothing is almost always a misspelled name somewhere else;
-- a bare `SELECT` sitting among other statements. Only `COPY` carries a destination, so a lone `SELECT` in a multi-statement script has nowhere to send its streams -- wrap it in `COPY (<query>) TO '<path>'`;
-- a `CREATE VIEW` written after the first `COPY`. Every view must precede every `COPY`, so the whole script can resolve names left-to-right in one pass.
+- a view nobody ever reads, anchored on its `CREATE VIEW` (captured example below) -- a script's whole point is that its views feed later views or COPYs, so one that feeds nothing is almost always a misspelled name somewhere else. A view written after the last `COPY` lands here, since statements resolve left to right and nothing after it is left to read it;
+- a bare `SELECT` sitting among other statements. Only `COPY` carries a destination, so a lone `SELECT` in a multi-statement script has nowhere to send its streams -- wrap it in `COPY (<query>) TO '<path>'`.
 
 The output fan-out rejections land here too. `COPY (...) TO (<expression>)` writes one file per surviving row when the expression reads a row table's columns, and everything about that shape that cannot be answered is typed rather than guessed at:
 
@@ -454,7 +453,7 @@ FROM input('x.mp4') a
 
 **Meaning:** An option's value doesn't match its introspected type, declared range, or set of named constants. Positional or named makes no difference: a positional binds to the option its slot lands on and validates as that option, so `gblur(a.video[1], 5000)` and `gblur(a.video[1], sigma => 5000)` fail identically.
 
-**Fires when:** a numeric option gets a string or a value outside its `(from A to B)` range, a boolean option gets anything but `true`/`false`, an enum option gets something that isn't one of its constants (or a bare number instead of a quoted constant name), or the option's ffmpeg type is one ffrwd cannot set at all (`binary`, `dictionary`).
+**Fires when:** a numeric option gets a string or a value outside its `(from A to B)` range, a boolean option gets anything but `true`/`false`, an enum option gets something that isn't one of its constants (or a bare number instead of a quoted constant name).
 
 **Example query:**
 

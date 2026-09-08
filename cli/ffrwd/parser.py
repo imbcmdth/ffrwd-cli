@@ -164,8 +164,10 @@ Notes for downstream passes (lower):
   table, ``generate_series`` — is admitted: INNER (``JOIN`` / ``INNER JOIN``),
   ``LEFT [OUTER]`` and ``FULL [OUTER]``, each with a mandatory ``ON``, and
   nowhere else. A join whose right side is not a row table, or that stands
-  before any row table is bound, is rejected, as are ``RIGHT``, ``CROSS``,
-  ``NATURAL`` and ``USING``. :func:`from_entries` pairs each FROM
+  before any row table is bound, is rejected, as are ``RIGHT``, ``NATURAL``
+  and ``USING``. A bare ``CROSS JOIN`` is the comma written out and takes the
+  comma's path, at input level too; one carrying an ``ON`` is rejected, as
+  Postgres rejects it. :func:`from_entries` pairs each FROM
   item with the :class:`RawRowJoin` describing how it attaches (``"cross"`` for
   a comma source), which is what lower evaluates the join from. The ``ON``
   predicate is the row grammar plus one addition: both operands may be row
@@ -388,6 +390,7 @@ _STREAMING_HINTS: dict[str, str] = {
 _SELECT_ALLOWED = frozenset({"with_", "expressions", "from_", "joins", "where"})
 _UNION_ALLOWED = frozenset({"with_", "this", "expression", "distinct"})
 _SUBQUERY_ALLOWED = frozenset({"this"})
+_DERIVED_ALLOWED = frozenset({"this", "alias"})
 _BRACKET_ALLOWED = frozenset({"this", "expressions"})
 # Every arg sqlglot 30.17 puts on an exp.Copy. `kind` and `credentials` are
 # whitelisted here only so the generic check does not fire on them — each has
@@ -463,18 +466,23 @@ _SERIES_RANGE_HINT = (
 )
 _FROM_ITEM_MESSAGE = (
     "only input('path'), unnest(...), ffmpeg.<source>(...), "
-    "generate_series(...), and CTE or view names are allowed in FROM"
+    "generate_series(...), (<select>) alias, and CTE or view names are "
+    "allowed in FROM"
 )
 _ROW_WHERE_HINT = (
-    "a track-row predicate compares one row column against a literal: "
-    "=, !=, <, <=, >, >=, BETWEEN, IS [NOT] NULL, joined with AND/OR/NOT"
+    "a track-row predicate compares row columns against each other or against "
+    "a literal: =, !=, <, <=, >, >=, BETWEEN, IS [NOT] NULL, joined with "
+    "AND/OR/NOT"
+)
+_ROW_COLUMN_PAIR_HINT = (
+    "compare columns of the same kind, e.g. a.tags.language = b.tags.language"
 )
 _JOIN_HINT = (
     "JOIN matches the ROWS of two row tables (unnest, a CTE, a struct row "
     "table, generate_series): FROM input('a.mkv') f, input('b.mkv') g, "
     "unnest(f.audio) a JOIN unnest(g.audio) b ON "
     "a.tags.language = b.tags.language (INNER, LEFT [OUTER] and FULL [OUTER] only); "
-    "at input level, FROM stays a comma cross-join"
+    "a comma, or CROSS JOIN, pairs any two items with no ON at all"
 )
 _JOIN_ON_HINT = (
     "an ON predicate compares track-row columns against each other or against "
@@ -2527,7 +2535,8 @@ _ROW_COMPARISONS: Mapping[type[exp.Expr], str] = {
 
 _ROW_PREDICATE_HINT = (
     "a runtime predicate compares a row's own fields against literals with "
-    "=, <>, <, <=, >, >=, AND, OR, NOT and parentheses, and holds nothing else"
+    "=, <>, <, <=, >, >=, BETWEEN, IN, AND, OR, NOT and parentheses, and "
+    "holds nothing else"
 )
 
 
@@ -2901,10 +2910,11 @@ def _normalize_map_paths(select: exp.Select, path_expr: exp.Expr | None = None) 
 
 def _has_row_source(select: exp.Select, visible: set[str]) -> bool:
     """True if this branch's FROM clause holds rows: ``unnest(...)``,
-    ``generate_series(...)``, or a reference to a CTE or view -- each of
-    which contributes rows to group over, and admits the ORDER BY carve-out."""
+    ``generate_series(...)``, a subquery, or a reference to a CTE or view --
+    each of which contributes rows to group over, and admits the ORDER BY
+    carve-out."""
     for item in from_items(select):
-        if isinstance(item, exp.Unnest):
+        if isinstance(item, exp.Unnest | exp.Subquery):
             return True
         if isinstance(item, exp.Table) and isinstance(item.this, exp.GenerateSeries):
             return True
@@ -3100,17 +3110,19 @@ def _collect_branches(
     node: exp.Expr, root: exp.Expr, out: list[exp.Select]
 ) -> None:
     node = _unwrap(node)
-    if node is not root and node.args.get("with_") is not None:
-        raise _error(
-            ErrorCode.UNSUPPORTED_SQL,
-            "nested WITH clauses are not supported",
-            node.args.get("with_"),
-            fallback=node,
-            hint="hoist the CTE to the top-level WITH",
-        )
     if isinstance(node, exp.Select):
         out.append(node)
         return
+    if node is not root and node.args.get("with_") is not None:
+        # A branch writes its own WITH; a nested UNION between branches has
+        # no body of its own for one to belong to.
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            "a WITH clause here belongs to no query",
+            node.args.get("with_"),
+            fallback=node,
+            hint="write it on one UNION ALL branch, or on the whole query",
+        )
     if isinstance(node, exp.Union):
         if node.args.get("distinct"):
             raise _error(
@@ -3520,12 +3532,12 @@ class _Resolver:
 
         Script rules, all of them typed rejections:
 
-        * every ``CREATE VIEW`` precedes every ``COPY`` (forward references are
-          already banned, so this only costs an ordering a Postgres script is
-          free to write either way, and buys a single left-to-right pass);
         * a script writes its outputs with ``COPY`` — at least one, and a bare
           ``SELECT`` among several statements has nowhere to go;
         * a view nobody reads is a typo, not a no-op.
+
+        Statements resolve left to right, so a ``CREATE VIEW`` may sit anywhere
+        among the ``COPY``s; only the ones after it can read it.
 
         A SINGLE statement keeps its pre-script behavior exactly: a bare SELECT
         (no sink) or one COPY.
@@ -3539,13 +3551,6 @@ class _Resolver:
 
         for statement in statements:
             if isinstance(statement, exp.Create):
-                if sinks:
-                    raise _error(
-                        ErrorCode.UNSUPPORTED_SQL,
-                        "a CREATE VIEW may not follow a COPY",
-                        statement,
-                        hint="define every view before the first COPY",
-                    )
                 self._view(statement)
                 continue
             if isinstance(statement, exp.Copy):
@@ -3656,9 +3661,9 @@ class _Resolver:
     ) -> tuple[QueryExpr, list[exp.Select]]:
         """Validate one whole query — a view body, a COPY's, or a bare SELECT.
 
-        Its own ``WITH`` is resolved into the shared, ordered binding table
-        FIRST, so the names it defines are visible to it and to everything
-        written after it, and nothing else.
+        It starts from the views written above it, which are the only names a
+        script carries from one statement to the next. Its own ``WITH`` is
+        resolved on top of those and read by this query alone.
 
         ``table_mode`` is True for a bare SELECT and a
         csv COPY — the two contexts a metadata SELECT output is legal in —
@@ -3674,8 +3679,7 @@ class _Resolver:
                 query,
                 hint="ffrwd accepts a single SELECT statement",
             )
-        self._resolve_ctes(query)
-        branches = union_branches(query)
+        branches = self._resolve_body_ctes(query, set(self.views))
         if path_expr is not None and len(branches) > 1:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
@@ -3689,8 +3693,7 @@ class _Resolver:
         # UNION ALL branch aggregates like any other: it is one concat segment,
         # and a segment with several rows has to gather them the same way.
         no_aggregate = context
-        visible = set(self.ctes)
-        for branch in branches:
+        for branch, visible in branches:
             self._validate_select(
                 branch,
                 visible,
@@ -3698,7 +3701,7 @@ class _Resolver:
                 path_expr=path_expr,
                 no_aggregate=no_aggregate,
             )
-        return query, branches
+        return query, [branch for branch, _ in branches]
 
     # -- CREATE VIEW --------------------------------------------
 
@@ -3859,10 +3862,17 @@ class _Resolver:
 
     # -- CTEs -------------------------------------------------------------
 
-    def _resolve_ctes(self, query: QueryExpr) -> None:
+    def _resolve_ctes(self, query: QueryExpr, visible: set[str]) -> set[str]:
+        """Bind ``query``'s own WITH: `visible` plus the names it writes.
+
+        The bodies land in the script-wide table lowering reads them from;
+        what comes back is the narrower thing -- the names in scope for the
+        query that wrote them.
+        """
+        visible = set(visible)
         with_ = query.args.get("with_")
         if with_ is None:
-            return
+            return visible
         if not isinstance(with_, exp.With):
             raise _error(ErrorCode.UNSUPPORTED_SQL, "malformed WITH clause", fallback=query)
         if with_.args.get("recursive"):
@@ -3903,19 +3913,31 @@ class _Resolver:
                     cte.this,
                     fallback=cte,
                 )
-            if body.args.get("with_") is not None:
-                raise _error(
-                    ErrorCode.UNSUPPORTED_SQL,
-                    "nested WITH clauses are not supported",
-                    body.args.get("with_"),
-                    fallback=body,
-                    hint="hoist the CTE to the top-level WITH",
-                )
-            # A CTE only sees the CTEs defined before it (no forward refs).
-            visible = set(self.ctes)
-            for branch in union_branches(body):
-                self._validate_select(branch, visible, no_aggregate="a CTE body")
+            # A CTE only sees the CTEs defined before it (no forward refs),
+            # its own WITH included -- resolved first, so it is defined before.
+            for branch, branch_visible in self._resolve_body_ctes(body, visible):
+                self._validate_select(branch, branch_visible, no_aggregate="a CTE body")
             self.ctes[name] = body
+            visible.add(name)
+        return visible
+
+    def _resolve_body_ctes(
+        self, body: QueryExpr, visible: set[str]
+    ) -> list[tuple[exp.Select, set[str]]]:
+        """`body`'s UNION ALL branches, each with the names it may read.
+
+        A relation body -- a view's, a CTE's, a FROM subquery's -- writes its
+        own ``WITH``, and so does a single UNION ALL branch. Every binding
+        lands in the same flat table, but a branch reads only what it wrote
+        itself and what stands above the body: a sibling branch's names are
+        out of scope in both directions, forward and back.
+        """
+        visible = self._resolve_ctes(body, visible)
+        # A single-SELECT body IS its one branch, and its WITH is resolved.
+        return [
+            (branch, visible if branch is body else self._resolve_ctes(branch, visible))
+            for branch in union_branches(body)
+        ]
 
     def _reject_column_list_cte(
         self, name: str, alias: exp.TableAlias, cte: exp.CTE
@@ -4053,7 +4075,7 @@ class _Resolver:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL, "SELECT has no output column", fallback=select
             )
-        aggregating = may_aggregate and no_aggregate is None
+        aggregating = may_aggregate
         for projection in projections:
             # A star projection carries nothing but the star and its qualifier,
             # so there is no expression to check inside it -- and running the
@@ -4202,11 +4224,15 @@ class _Resolver:
         seen[name] = node
 
     def _check_aggregate_context(self, select: exp.Select, where: str | None) -> None:
-        """Aggregation belongs to a query's own SELECT, never a CTE body.
+        """A GROUP BY belongs to a query's own SELECT, never a CTE body.
+
+        One group is one output file, and a relation body names no
+        destination to fan out to. The aggregate itself is free here: a body
+        may gather its rows with ``array_agg``.
 
         Fires only for a branch that HAS rows: without them the generic
-        ``GROUP BY has no streaming equivalent`` / ``aggregate function ...``
-        rejections already say the right thing.
+        ``GROUP BY has no streaming equivalent`` rejection already says the
+        right thing.
         """
         if where is None:
             return
@@ -4217,16 +4243,8 @@ class _Resolver:
                 f"GROUP BY is not supported in {where}",
                 keys[0],
                 fallback=select,
-                hint="aggregation belongs to a media COPY's own SELECT",
-            )
-        aggregates = _array_aggs(select)
-        if aggregates:
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL,
-                f"array_agg() is not supported in {where}",
-                aggregates[0],
-                fallback=select,
-                hint="aggregation belongs to a media COPY's own SELECT",
+                hint="group in the SELECT a media COPY writes, where one group "
+                "can name one file",
             )
 
     # -- grouping validity ------------------------------------------------
@@ -4797,9 +4815,12 @@ class _Resolver:
             if not isinstance(join, exp.Join):
                 raise _error(ErrorCode.UNSUPPORTED_SQL, "malformed FROM clause", fallback=select)
             spec = _join_spec(join)
+            # `CROSS JOIN` is the comma spelling of the same cross join, so a
+            # bare one takes the comma path; anything decorating a join makes
+            # it explicit.
             explicit = spec.kind != "cross" or any(
                 join.args.get(key)
-                for key in ("on", "using", "side", "kind", "method", "match_condition")
+                for key in ("on", "using", "side", "method", "match_condition")
             )
             before = dict(scope) if explicit else scope
             self._add_from_item(join.this, scope, visible)
@@ -4823,12 +4844,14 @@ class _Resolver:
         """Admit one explicit JOIN, which only row tables may use.
 
         JOIN syntax is admitted between row relations -- unnest tables, CTEs
-        and views, struct row tables, generate_series; input-level FROM stays
-        comma-cross-join. Everything a row join cannot be (a stream-level
-        operand, RIGHT, CROSS, NATURAL, USING) is rejected, with the hint
-        saying which spelling to reach for instead. `before` is the scope as
-        it stood ahead of this join's own item, so the check can tell the
-        joined item's bindings from what the left side already held.
+        and views, struct row tables, generate_series. Everything a row join
+        cannot be (a stream-level operand, RIGHT, NATURAL, USING) is rejected,
+        with the hint saying which spelling to reach for instead. `before` is
+        the scope as it stood ahead of this join's own item, so the check can
+        tell the joined item's bindings from what the left side already held.
+
+        A bare ``CROSS JOIN`` never reaches here: it means the comma, and takes
+        the comma's path.
         """
         for key in ("using", "method", "match_condition"):
             value = join.args.get(key)
@@ -4841,6 +4864,15 @@ class _Resolver:
                     fallback=join,
                     hint=_JOIN_HINT,
                 )
+        if spec.kind == "cross":
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "CROSS JOIN takes no ON predicate",
+                _first_expression(join.args.get("on")),
+                fallback=join,
+                hint="CROSS JOIN pairs every row with every row, the same as a "
+                "comma; to match rows write JOIN ... ON",
+            )
         row_kinds = ("row", "cte")
         joined = [kind for name, kind in scope.items() if name not in before]
         if any(kind not in row_kinds for kind in joined) or not any(
@@ -4865,14 +4897,6 @@ class _Resolver:
                 hint="swap the two unnest tables and write LEFT JOIN, or use "
                 "FULL OUTER JOIN — row order follows the LEFT side",
             )
-        if spec.kind == "cross":
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL,
-                "CROSS JOIN is not supported",
-                fallback=join,
-                hint="a comma between two unnest tables IS the cross join: "
-                "FROM ..., unnest(f.audio) a, unnest(g.audio) b",
-            )
         if spec.on is None:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
@@ -4886,17 +4910,15 @@ class _Resolver:
     def _check_join_predicate(
         self, node: exp.Expr, scope: dict[str, str], join: exp.Join
     ) -> None:
-        """One ON predicate: 061's row grammar, plus column-to-column comparison.
+        """One ON predicate: the row grammar :meth:`_check_row_predicate` takes.
 
-        The addition over :meth:`_check_row_predicate` is the whole reason JOIN
-        exists — ``a.tags.language = b.tags.language`` compares two row COLUMNS — so the
-        two operands may now both be columns, and then their static types must
-        match (a text column never equals a numeric one, whatever the files
-        turned out to contain). Everything else is the same closed grammar:
-        AND/OR/NOT over comparisons, BETWEEN and IS [NOT] NULL, with only
-        track-row columns and literals as operands. ``IN`` / ``NOT IN`` never
-        reach the dispatch below -- :func:`_desugar_in` rewrites them into
-        that same grammar first.
+        ``a.tags.language = b.tags.language`` compares two row COLUMNS, and
+        their static types must match (a text column never equals a numeric
+        one, whatever the files turned out to contain). The rest is the same
+        closed grammar: AND/OR/NOT over comparisons, BETWEEN and IS [NOT]
+        NULL, with only track-row columns, literals and computed values as
+        operands. ``IN`` / ``NOT IN`` never reach the dispatch below --
+        :func:`_desugar_in` rewrites them into that same grammar first.
         """
         node = _desugar_in(_unwrap_paren(node))
         if isinstance(node, exp.And | exp.Or):
@@ -4948,13 +4970,10 @@ class _Resolver:
                 )
             column = _unwrap_paren(node.this) if isinstance(node.this, exp.Expr) else None
             if not isinstance(column, exp.Column):
-                raise _error(
-                    ErrorCode.UNSUPPORTED_SQL,
-                    "BETWEEN needs a track-row column on its left",
-                    node,
-                    fallback=join,
-                    hint=_JOIN_ON_HINT,
-                )
+                # Same reversed and computed spellings the WHERE grammar takes.
+                for bound in (node.args.get("low"), node.args.get("high")):
+                    self._check_value_pair(column, bound, scope, join, _JOIN_ON_HINT)
+                return
             column_type = self._row_operand(column, scope, join)
             for bound in (node.args.get("low"), node.args.get("high")):
                 self._check_join_operand(bound, column, column_type, scope, join)
@@ -4992,12 +5011,17 @@ class _Resolver:
         column: exp.Column,
         column_type: str | None,
         scope: dict[str, str],
-        join: exp.Join,
+        fallback: exp.Expr,
+        hint: str = "join columns of the same kind, e.g. ON a.tags.language = b.tags.language",
     ) -> None:
-        """An ON comparison's other operand: another row column, or a literal."""
+        """A comparison's other operand: another row column, or a literal.
+
+        Shared by ``JOIN ... ON`` and by a WHERE conjunct over two row tables,
+        which is the same comparison written as a comma join.
+        """
         other = _unwrap_paren(node) if isinstance(node, exp.Expr) else None
         if isinstance(other, exp.Column):
-            other_type = self._row_operand(other, scope, join)
+            other_type = self._row_operand(other, scope, fallback)
             if other_type != column_type:
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,
@@ -5007,12 +5031,11 @@ class _Resolver:
                     f"{_ident_name(other.this)}' is {other_type}, so they can "
                     "never match",
                     other,
-                    fallback=join,
-                    hint="join columns of the same kind, e.g. "
-                    "ON a.tags.language = b.tags.language",
+                    fallback=fallback,
+                    hint=hint,
                 )
             return
-        self._check_row_literal(node, column, column_type, join)
+        self._check_row_literal(node, column, column_type, fallback)
 
     # -- merge_cues(...) ---------------------------------------------------
 
@@ -5299,8 +5322,14 @@ class _Resolver:
         alias: str,
         fallback: exp.Expr,
     ) -> dict[str, object]:
-        """One predicate node: a comparison, or the logic joining them."""
-        node = _unwrap_paren(node)
+        """One predicate node: a comparison, or the logic joining them.
+
+        ``IN`` and ``BETWEEN`` have exact spellings inside the admitted set
+        and are rewritten into it -- ``IN`` by the same desugaring the
+        compile-time grammar uses, ``BETWEEN`` into the ``>=``/``<=`` pair it
+        means -- so the sidecar still reads only comparisons and logic.
+        """
+        node = _desugar_in(_unwrap_paren(node))
         for logic, key in ((exp.And, "and"), (exp.Or, "or")):
             if isinstance(node, logic):
                 return {key: self._predicate_operands(node, logic, fields, alias, fallback)}
@@ -5309,6 +5338,8 @@ class _Resolver:
             if not isinstance(inner, exp.Expr):
                 raise _row_grammar_error(node, fallback)
             return {"not": self._predicate_condition(inner, fields, alias, fallback)}
+        if isinstance(node, exp.Between):
+            return self._predicate_between(node, fields, alias, fallback)
         comparison = _ROW_COMPARISONS.get(type(node))
         left, right = node.this, node.args.get("expression")
         if (
@@ -5317,6 +5348,46 @@ class _Resolver:
             or not isinstance(right, exp.Expr)
         ):
             raise _row_grammar_error(node, fallback)
+        return self._predicate_comparison(comparison, left, right, node, fields, alias, fallback)
+
+    def _predicate_between(
+        self,
+        node: exp.Between,
+        fields: Mapping[str, str],
+        alias: str,
+        fallback: exp.Expr,
+    ) -> dict[str, object]:
+        """``x BETWEEN a AND b`` as the inclusive pair it means."""
+        low, high = node.args.get("low"), node.args.get("high")
+        if (
+            node.args.get("symmetric")
+            or not isinstance(node.this, exp.Expr)
+            or not isinstance(low, exp.Expr)
+            or not isinstance(high, exp.Expr)
+        ):
+            raise _row_grammar_error(node, fallback)
+        return {
+            "and": [
+                self._predicate_comparison(
+                    "ge", node.this, low, node, fields, alias, fallback
+                ),
+                self._predicate_comparison(
+                    "le", node.this, high, node, fields, alias, fallback
+                ),
+            ]
+        }
+
+    def _predicate_comparison(
+        self,
+        comparison: str,
+        left: exp.Expr,
+        right: exp.Expr,
+        node: exp.Expr,
+        fields: Mapping[str, str],
+        alias: str,
+        fallback: exp.Expr,
+    ) -> dict[str, object]:
+        """One comparison of the admitted set, both operands typed."""
         first, first_type = self._predicate_operand(left, fields, alias, fallback)
         second, second_type = self._predicate_operand(right, fields, alias, fallback)
         if first_type != second_type:
@@ -5552,7 +5623,62 @@ class _Resolver:
             return
         if isinstance(item, exp.Values):
             self._reject_values(item)
+        if isinstance(item, exp.Subquery):
+            self._add_derived(item, scope, visible)
+            return
         self._add_table(item, scope, visible)
+
+    def _add_derived(
+        self, item: exp.Subquery, scope: dict[str, str], visible: set[str]
+    ) -> None:
+        """``FROM (<select>) alias`` -- a CTE written where it is read.
+
+        Bound exactly as a ``WITH`` binding is: the name joins the same flat
+        namespace, the body is validated as a relation body, and lowering
+        reads it by name. Registered AFTER its body validates, so a nested one
+        is bound before the one that holds it.
+
+        The name enters this FROM clause's scope and nothing wider -- it is
+        readable where it is written, and gone with the statement.
+        """
+        _check_query_args(item, _DERIVED_ALLOWED, "subquery")
+        alias_node = item.args.get("alias")
+        if not isinstance(alias_node, exp.TableAlias) or alias_node.this is None:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "a subquery in FROM needs a name",
+                item,
+                hint="name it: FROM (SELECT ...) alias",
+            )
+        if alias_node.args.get("columns"):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "table column aliases are not supported",
+                alias_node,
+            )
+        name = _ident_name(alias_node.this)
+        self._reserve(name, alias_node.this)
+        body = item.this
+        if not isinstance(body, exp.Select | exp.Union):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"subquery '{name}' must be a SELECT",
+                item,
+            )
+        for branch, branch_visible in self._resolve_body_ctes(body, visible):
+            self._validate_select(branch, branch_visible, no_aggregate="a subquery in FROM")
+        # The body may have bound this very name; the reservation above ran
+        # before it could, so the collision is only visible now.
+        if name in self.ctes:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"duplicate name '{name}'",
+                alias_node.this,
+            )
+        self.ctes[name] = body
+        self.used.add(name)
+        scope[name] = "cte"
+        self.row_aliases.add(name)
 
     def _reject_values(self, values: exp.Values) -> NoReturn:
         """``FROM (VALUES (...)) AS r(w, q)`` -- a written row table, but not
@@ -5582,7 +5708,7 @@ class _Resolver:
                 ErrorCode.UNSUPPORTED_SQL,
                 _FROM_ITEM_MESSAGE,
                 table,
-                hint="use a WITH ... AS (...) CTE instead of a subquery",
+                hint="name a subquery to read it as a table: FROM (SELECT ...) alias",
             )
         # `FROM ffmpeg.<source>(...) alias` is the ONE qualified
         # table name there is: the namespace lands in `db`. A three-part name
@@ -7109,16 +7235,6 @@ class _Resolver:
                 hint="track rows are filtered at compile time and a time window "
                 "is a seek on the input; write them as separate AND conjuncts",
             )
-        if len(rows) > 1:
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL,
-                "a WHERE predicate may reference only one track-row table, got "
-                f"{_listed_columns(rows)}",
-                conjunct,
-                fallback=where,
-                hint="filter each unnest separately; matching rows of two "
-                "tables against each other is a JOIN",
-            )
         self._check_row_predicate(conjunct, scope, where)
         return True
 
@@ -7211,27 +7327,25 @@ class _Resolver:
                     hint=_ROW_WHERE_HINT,
                 )
             column = _unwrap_paren(node.this) if isinstance(node.this, exp.Expr) else None
-            if self._is_row_predicate_value(column):
-                # A computed subject types against each bound the way any
-                # comparison's two sides do; there is no COLUMN to name.
+            if not isinstance(column, exp.Column):
+                # A computed or literal subject types against each bound the
+                # way any comparison's two sides do; there is no COLUMN to
+                # name. `<value> BETWEEN <row column> AND <row column>` is the
+                # reversed spelling, and lands here too.
                 for bound in (node.args.get("low"), node.args.get("high")):
                     self._check_value_pair(column, bound, scope, where, _ROW_WHERE_HINT)
                 return
-            if not isinstance(column, exp.Column):
-                raise _error(
-                    ErrorCode.UNSUPPORTED_SQL,
-                    "BETWEEN needs a track-row column on its left",
-                    node,
-                    fallback=where,
-                    hint=_ROW_WHERE_HINT,
-                )
             column_type = self._row_predicate_operand(column, scope, where)
             for bound in (node.args.get("low"), node.args.get("high")):
                 unwrapped = _unwrap_paren(bound) if isinstance(bound, exp.Expr) else None
                 if self._is_row_predicate_value(unwrapped):
                     self._check_value_pair(column, bound, scope, where, _ROW_WHERE_HINT)
                     continue
-                self._check_row_literal(bound, column, column_type, where)
+                # A bound takes the operands a comparison takes: another row
+                # column, or a literal of the subject's type.
+                self._check_join_operand(
+                    bound, column, column_type, scope, where, hint=_ROW_COLUMN_PAIR_HINT
+                )
             return
         if isinstance(node, exp.EQ | exp.NEQ | exp.GT | exp.GTE | exp.LT | exp.LTE):
             left = _unwrap_paren(node.this) if isinstance(node.this, exp.Expr) else None
@@ -7242,23 +7356,19 @@ class _Resolver:
                 return
             column, literal = (left, right) if isinstance(left, exp.Column) else (right, left)
             if not isinstance(column, exp.Column):
-                raise _error(
-                    ErrorCode.UNSUPPORTED_SQL,
-                    "a track-row comparison needs a row column on one side",
-                    node,
-                    fallback=where,
-                    hint=_ROW_WHERE_HINT,
-                )
-            if isinstance(literal, exp.Column):
-                raise _error(
-                    ErrorCode.UNSUPPORTED_SQL,
-                    "a track-row comparison compares one column against a literal",
-                    node,
-                    fallback=where,
-                    hint="matching two columns against each other is a JOIN",
-                )
+                # Neither side is a row column: two compile-time values, typed
+                # against each other the way the value grammar types any pair.
+                self._check_value_pair(left, right, scope, where, _ROW_WHERE_HINT)
+                return
             column_type = self._row_predicate_operand(column, scope, where)
-            self._check_row_literal(literal, column, column_type, where)
+            self._check_join_operand(
+                literal,
+                column,
+                column_type,
+                scope,
+                where,
+                hint=_ROW_COLUMN_PAIR_HINT,
+            )
             return
         if isinstance(node, exp.Boolean):
             return

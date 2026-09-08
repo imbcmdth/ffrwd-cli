@@ -924,13 +924,17 @@ def test_unknown_alias_is_line_anchored() -> None:
         "SELECT a.video[1] FROM input('x') a JOIN input('y') b ON a.t = b.t",
         "SELECT a.video[1] FROM input('x') a INNER JOIN input('y') b ON a.t = b.t",
         "SELECT a.video[1] FROM input('x') a LEFT JOIN input('y') b ON a.t = b.t",
-        "SELECT a.video[1] FROM input('x') a CROSS JOIN input('y') b",
     ],
 )
 def test_explicit_join_syntax(sql: str) -> None:
     err = _reject(sql)
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert err.hint is not None and "comma" in err.hint
+
+
+def test_cross_join_is_the_comma_at_input_level_too() -> None:
+    res = _resolve("SELECT a.video[1] FROM input('x') a CROSS JOIN input('y') b")
+    assert res.sources == {"a": 0, "b": 1}
 
 
 def test_input_without_alias() -> None:
@@ -1315,17 +1319,32 @@ def test_outside_the_surface() -> None:
         "CREATE TABLE t (x INT)",
         "SELECT 1; SELECT 2",
         "SELECT 1",
-        "SELECT a.video[1] FROM (SELECT b.video[1] FROM input('x') b) a",
+        "SELECT a.video[1] FROM (SELECT b.video[1] FROM input('x') b)",  # unnamed
         "SELECT a.video[1] FROM input('x') a EXCEPT SELECT b.video[1] FROM input('y') b",
         "SELECT a.video[1] FROM input('x') a INTERSECT SELECT b.video[1] FROM input('y') b",
         "WITH RECURSIVE c AS (SELECT a.video[1] AS v FROM input('x') a) SELECT c.v FROM c",
-        "WITH c AS (WITH d AS (SELECT a.video[1] AS v FROM input('x') a) SELECT d.v FROM d) "
-        "SELECT c.v FROM c",
         "SELECT a.video[1] FROM input('x') a(c)",
         "SELECT video FROM input('x') a",
         "SELECT a.video[1] FROM sch.tbl a",
     ):
         assert _reject(sql).code is ErrorCode.UNSUPPORTED_SQL, sql
+
+
+def test_a_named_subquery_in_from_binds_like_a_cte() -> None:
+    res = _resolve("SELECT s.v FROM (SELECT a.video[1] AS v FROM input('x.mp4') a) s")
+    assert "s" in res.ctes
+    # A view is a CTE downstream; a FROM subquery is one too, and neither is
+    # the OTHER introspection view.
+    assert "s" not in res.views
+
+
+def test_a_from_subquery_may_not_shadow_a_name() -> None:
+    err = _reject(
+        "WITH s AS (SELECT a.video[1] AS v FROM input('x.mp4') a) "
+        "SELECT s.v FROM (SELECT b.video[1] AS v FROM input('y.mp4') b) s"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "duplicate name 's'" in err.message
 
 
 def test_cte_body_must_be_a_select() -> None:
@@ -1730,14 +1749,78 @@ def test_a_view_body_may_have_its_own_with() -> None:
     assert list(res.views) == ["v"]
 
 
-def test_a_cte_body_still_may_not_have_its_own_with() -> None:
-    err = _reject(
+def test_a_cte_body_may_have_its_own_with() -> None:
+    """Every binding lands in the one flat table, innermost first."""
+    res = _resolve(
         "CREATE VIEW v AS WITH c AS (WITH d AS (SELECT a.video[1] AS f "
         "FROM input('x.mp4') a) SELECT d.f AS f FROM d) SELECT c.f AS v FROM c;\n"
         "COPY (SELECT v.v FROM v) TO 'out.mp4';"
     )
+    assert list(res.ctes) == ["d", "c", "v"]
+
+
+def test_a_union_all_branch_may_have_its_own_with() -> None:
+    res = _resolve(
+        "SELECT a.video[1] FROM input('x.mp4') a UNION ALL "
+        "(WITH d AS (SELECT b.video[1] AS v FROM input('y.mp4') b) SELECT d.v FROM d)"
+    )
+    assert list(res.ctes) == ["d"]
+
+
+def test_a_branch_reads_what_the_query_wrote_above_it() -> None:
+    res = _resolve(
+        "WITH top AS (SELECT a.video[1] AS v FROM input('x.mp4') a) "
+        "SELECT top.v FROM top UNION ALL "
+        "(WITH d AS (SELECT b.video[1] AS v FROM input('y.mp4') b) SELECT d.v FROM d)"
+    )
+    assert list(res.ctes) == ["top", "d"]
+
+
+def test_a_branchs_with_is_out_of_scope_in_its_siblings() -> None:
+    """Forward and back: a sibling's bindings are not this branch's."""
+    branch = "(WITH d AS (SELECT b.video[1] AS v FROM input('y.mp4') b) SELECT d.v FROM d)"
+    reader = "SELECT d.v FROM d"
+    for sql in (f"{reader} UNION ALL {branch}", f"{branch} UNION ALL {reader}"):
+        err = _reject(sql)
+        assert err.code is ErrorCode.UNKNOWN_ALIAS, sql
+        assert "unknown table 'd'" in err.message, sql
+
+
+def test_a_subquery_may_not_take_a_name_its_own_body_binds() -> None:
+    """The name is claimed before the body is read, so a body binding the same
+    name collides with the FROM item that holds it."""
+    with pytest.raises(FfrwdError) as caught:
+        resolve(
+            parse(
+                "COPY (SELECT d.v FROM (WITH d AS (SELECT g.video[1] AS v "
+                "FROM input('a.mp4') g) SELECT f.video[1] AS v "
+                "FROM input('b.mp4') f) d) TO 'o.mp4'"
+            )
+        )
+    assert caught.value.code is ErrorCode.UNSUPPORTED_SQL
+    assert caught.value.message == "duplicate name 'd'"
+
+
+def test_a_statements_bindings_are_gone_at_the_next_statement() -> None:
+    """A view outlives the statement that wrote it; a CTE and a FROM
+    subquery, which name no destination, do not."""
+    for body in (
+        "WITH d AS (SELECT a.video[1] AS v FROM input('x.mp4') a) SELECT d.v FROM d",
+        "SELECT d.v FROM (SELECT a.video[1] AS v FROM input('x.mp4') a) d",
+    ):
+        err = _reject(f"COPY ({body}) TO 'one.mp4';\nCOPY (SELECT d.v FROM d) TO 'two.mp4';")
+        assert err.code is ErrorCode.UNKNOWN_ALIAS, body
+        assert err.line == 2, body
+
+
+def test_a_with_between_two_union_all_branches_belongs_to_no_query() -> None:
+    err = _reject(
+        "SELECT a.video[1] FROM input('x.mp4') a UNION ALL "
+        "(WITH d AS (SELECT b.video[1] AS v FROM input('y.mp4') b) "
+        "SELECT d.v FROM d UNION ALL SELECT c.video[1] FROM input('z.mp4') c)"
+    )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "nested WITH" in err.message
+    assert "belongs to no query" in err.message
 
 
 def test_a_view_body_may_be_a_union_all() -> None:
@@ -1772,14 +1855,27 @@ def test_several_copies_resolve_cleanly() -> None:
     assert res.select is res.sinks[0].query
 
 
-def test_a_view_must_precede_every_copy() -> None:
+def test_a_view_after_the_last_copy_has_nothing_left_to_read_it() -> None:
+    """A view may sit anywhere among the COPYs; only the ones after it can
+    read it, so one written last is unused."""
     err = _reject(
         "COPY (SELECT a.video[1] FROM input('x.mp4') a) TO 'out.mp4';\n"
         "CREATE VIEW v AS SELECT b.video[1] AS f FROM input('y.mp4') b;"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "may not follow a COPY" in err.message
+    assert "view 'v' is never used" in err.message
     assert err.line == 2
+
+
+def test_a_definition_between_two_copies_resolves() -> None:
+    res = _resolve(
+        "COPY (SELECT a.audio[1] FROM input('x.mp4') a) TO 'sound.m4a';\n"
+        "CREATE FUNCTION half(v video_stream) RETURNS video_stream AS $$ "
+        "SELECT scale(v, 0.5) $$ LANGUAGE sql;\n"
+        "CREATE VIEW small AS SELECT half(b.video[1]) AS v FROM input('x.mp4') b;\n"
+        "COPY (SELECT small.v FROM small) TO 'small.mp4';"
+    )
+    assert [sink.path for sink in res.sinks] == ["sound.m4a", "small.mp4"]
 
 
 def test_a_bare_select_in_a_script_is_rejected() -> None:
@@ -2164,6 +2260,10 @@ def test_admitted_join_forms_between_unnest_tables() -> None:
         assert sorted(_resolve(_joined(join)).track_rows) == ["a", "b"], join
 
 
+def test_a_bare_cross_join_is_the_comma_between_row_tables() -> None:
+    assert sorted(_resolve(_joined("CROSS JOIN", "")).track_rows) == ["a", "b"]
+
+
 def test_from_entries_reports_each_items_join_kind() -> None:
     select = parse(_joined("FULL OUTER JOIN"))
     assert isinstance(select, exp.Select)
@@ -2233,7 +2333,11 @@ def test_unsupported_on_shapes_are_rejected() -> None:
     ("join", "on", "message"),
     [
         ("RIGHT JOIN", "ON a.tags.language = b.tags.language", "RIGHT JOIN is not supported"),
-        ("CROSS JOIN", "", "CROSS JOIN is not supported"),
+        (
+            "CROSS JOIN",
+            "ON a.tags.language = b.tags.language",
+            "CROSS JOIN takes no ON predicate",
+        ),
         ("NATURAL JOIN", "", "this JOIN form is not supported"),
         ("JOIN", "USING (language)", "USING is not supported"),
     ],
@@ -2379,7 +2483,6 @@ def test_row_predicates_are_admitted() -> None:
     [
         "t.tags.language LIKE 'e%'",
         "t.channels BETWEEN SYMMETRIC 2 AND 6",
-        "t.channels = t.sample_rate",
         "t.tags.language IS TRUE",
     ],
 )
@@ -2470,13 +2573,42 @@ def test_a_conjunct_may_not_mix_a_row_column_with_another_alias() -> None:
     assert "cannot mix track-row columns" in err.message
 
 
-def test_a_conjunct_may_reference_only_one_row_table() -> None:
-    err = _reject(
+def test_a_conjunct_may_compare_two_row_tables() -> None:
+    """The comma-join spelling of `JOIN ... ON`: one conjunct, two row tables."""
+    res = _resolve(
         "SELECT a FROM input('f.mkv') f, unnest(f.audio) a, unnest(f.video) b "
         "WHERE a.tags.language = b.tags.language"
     )
+    assert res.track_rows["a"].source == "f"
+    assert res.track_rows["b"].source == "f"
+
+
+def test_a_conjunct_comparing_two_row_tables_types_both_sides() -> None:
+    err = _reject(
+        "SELECT a FROM input('f.mkv') f, unnest(f.audio) a, unnest(f.video) b "
+        "WHERE a.tags.language = b.height"
+    )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "only one track-row table" in err.message
+    assert "so they can never match" in err.message
+
+
+def test_a_row_between_takes_a_row_column_as_a_bound() -> None:
+    """A BETWEEN bound takes the operands a comparison takes, so the subject
+    may be a row column on either side of the widening."""
+    res = _resolve(
+        "SELECT a FROM input('f.mkv') f, unnest(f.audio) a, unnest(f.video) b "
+        "WHERE a.index BETWEEN b.index AND 4"
+    )
+    assert sorted(res.track_rows) == ["a", "b"]
+
+
+def test_a_row_between_bound_is_typed_against_the_subject() -> None:
+    err = _reject(
+        "SELECT a FROM input('f.mkv') f, unnest(f.audio) a, unnest(f.video) b "
+        "WHERE a.index BETWEEN b.tags.language AND 4"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "so they can never match" in err.message
 
 
 def test_a_time_window_over_an_input_still_rejects_a_non_t_column() -> None:
@@ -2869,7 +3001,7 @@ def test_a_subscript_accessor_over_a_cte_is_rejected() -> None:
         "SELECT c.v FROM c WHERE c.v[1].tags.language = 'eng'"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "needs a row column on one side" in err.message
+    assert "unsupported value expression: DOT" in err.message
 
 
 def test_a_subscript_accessor_over_a_generated_source_is_rejected() -> None:

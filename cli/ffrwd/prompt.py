@@ -467,8 +467,8 @@ _DIALECT_TAIL = """\
 - `CREATE FUNCTION <name>(<param> <type> [DEFAULT <literal>], ...) RETURNS
   <type> AS $$ <one SELECT> $$ LANGUAGE sql;` defines a reusable
   expression, expanded at compile time -- it is the query you could have
-  typed by hand. Define it before it is used and before the first `COPY`;
-  every definition must be called (an uncalled one is a rejection).
+  typed by hand. Define it before it is used; every definition must be
+  called (an uncalled one is a rejection).
 - Parameter and `RETURNS` types are the dialect's own: `text`, `number`,
   `boolean`, `video_stream`/`audio_stream`/`subtitle_stream`/`data_stream`,
   `chapter`, `cue`, `attachment`, any of those with `[]`, or
@@ -749,17 +749,19 @@ _DIALECT_TAIL = """\
 ### Scripts, views and multiple outputs
 - A query is normally one statement: a bare `SELECT`, or one wrapped in
   `COPY (<query>) TO '<path>' WITH (<options>)` (see Output below). It may
-  also be a SCRIPT -- zero or more `CREATE VIEW <name> AS <query>;`
-  statements, EVERY one of them before the first `COPY`, followed by one or
-  more `COPY (<query>) TO '<path>' WITH (<options>);` statements. A script
-  still compiles to ONE ffmpeg command, with one output group per `COPY`.
+  also be a SCRIPT -- `CREATE VIEW <name> AS <query>;` statements and one or
+  more `COPY (<query>) TO '<path>' WITH (<options>);` statements, in any
+  order: they resolve left to right, so only the statements after a view
+  can read it. A script still compiles to ONE ffmpeg command, with one
+  output group per `COPY`.
 - `CREATE VIEW <name> AS <query>` is to STATEMENTS what a CTE is to
   branches: a named, shared subgraph, built once and split across every
   later view or `COPY` that reads it. Its columns are its SELECT's `AS`
   names (same rule as a CTE column), its body is a full query and may carry
   its own `WITH`, and it may reference an earlier view (no forward
   references, same as a CTE). View, CTE and alias names all share ONE flat
-  namespace for the WHOLE script, not just one statement.
+  namespace for the WHOLE script, so every name is unique across it; a
+  view is the only one a later statement can READ.
 - Reference a view exactly like a CTE -- bare name, or aliased in `FROM`
   (`FROM master m`, branch-local, may not shadow).
 - Rejected, typed: `CREATE OR REPLACE VIEW`, `CREATE TEMP`/`TEMPORARY VIEW`,

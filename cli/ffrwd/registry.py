@@ -102,10 +102,11 @@ from a full scan of `ffmpeg version 7.1-full_build-www.gyan.dev` (captured
   - `(from A to B)` bounds are not always numeric (`DBL_MAX`, `INT_MAX`,
     `INT_MIN`; hqdn3d's `luma_spatial` is `(from 0 to DBL_MAX)`);
     `minimum`/`maximum` are None when a bound does not parse as a float.
-  - No real `binary` or `dictionary` typed option was observed across all
-    ~460 included filters. The exclusion rule for them (`type="str"`,
-    `unusable=True`) is implemented but exercised only by a constructed
-    fixture.
+  - `binary` and `dictionary` typed options are rare -- `libplacebo`'s
+    `custom_shader_bin` and `extra_opts` are the only ones across the
+    included filters, and not every build has that filter. Both take
+    `type="str"` and `unusable=True`, which is how ffmpeg reads them off a
+    command line: a dictionary as its own key=value list, a binary as hex.
   - `boolean` options can have a non-boolean-looking default: subtitles'
     `wrap_unicode` is `<boolean> ... (default auto)`. Again, verbatim.
   - Types beyond `_TYPE_MAP` (`channel_layout`, `pix_fmt`) map to
@@ -169,7 +170,7 @@ class FilterOption:
     maximum: float | None
     default: str | None  # verbatim ffmpeg text, doc use only -- never validated
     constants: tuple[str, ...]  # enum constant names, () if not an enum
-    unusable: bool = False  # binary/dictionary AVOption types; lower rejects use
+    unusable: bool = False  # binary/dictionary AVOption types; typed as strings
 
 
 @dataclass(frozen=True)

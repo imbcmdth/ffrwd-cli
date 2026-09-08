@@ -25,8 +25,6 @@ output is plain ffmpeg, so the two mix freely in a script.
   that spelling never needs `VARIADIC`.
 - Sources with more than one output pad (`avsynctest`, `movie`); all
   sinks.
-- Options typed `binary` or `dictionary`: setting one is
-  `FILTER_OPTION_TYPE`; the filter's other options work.
 - Runtime filter commands (`sendcmd`, `zmq`).
 
 ## Sharp edges

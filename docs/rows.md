@@ -91,7 +91,7 @@ The row IS the stream: a bare `t` where a stream is expected selects it, filters
 
 `disposition` is the same shape over a CLOSED key set - the flags ffmpeg itself reports: `default`, `dub`, `original`, `comment`, `lyrics`, `karaoke`, `forced`, `hearing_impaired`, `visual_impaired`, `clean_effects`, `attached_pic`, `timed_thumbnails`, `non_diegetic`, `captions`, `descriptions`, `metadata`, `dependent`, `still_image`, `multilayer`. `t.disposition.forced` is a boolean; a key outside the set is a typed rejection. Bare, `t.disposition` prints as one array cell of `(key,set)` records. Writing it is under Tags below.
 
-`WHERE` over row columns filters tracks; `ORDER BY` re-sorts them (multi-key, Postgres NULL placement) - without it, rows keep file order, which is player-visible and never changed implicitly. Both take the compile-time predicate grammar: `=`, `!=`, `<`, `<=`, `>`, `>=`, `BETWEEN`, `IS [NOT] NULL`, `AND`/`OR`/`NOT`, statically type-checked.
+`WHERE` over row columns filters tracks; `ORDER BY` re-sorts them (multi-key, Postgres NULL placement) - without it, rows keep file order, which is player-visible and never changed implicitly. Both take the compile-time predicate grammar: `=`, `!=`, `<`, `<=`, `>`, `>=`, `BETWEEN`, `IS [NOT] NULL`, `AND`/`OR`/`NOT`, statically type-checked. Either side may be a row column, so a predicate compares two columns as readily as a column and a literal, and `BETWEEN` reads the same operands in every position - a row column or a value as the subject, row columns or literals as the bounds ([recipe 142](corpus.md#142-cut-the-chapter-a-timestamp-falls-in)).
 
 `LIMIT` and `OFFSET` narrow the row set after `WHERE` and `ORDER BY` and before grouping, the fan-out pin, and the one-row rule - `ORDER BY t.width DESC LIMIT 1` is the top row, no aggregate. They are legal exactly where `ORDER BY` is (any row-table branch, CTE bodies included). Counts are integer literals after `-v` substitution; `LIMIT 0` and an `OFFSET` that skips every row are rejections - a query that selects nothing is a mistake worth naming.
 
@@ -161,6 +161,12 @@ A body column that is a compile-time VALUE rather than a stream - a series value
 
 `WHERE`, `ORDER BY` and `LIMIT` inside the body narrow and order its rows before the outer query sees them; outside, they re-order and filter what it handed over - which is what lets a find rank by score inside and stitch by time outside ([recipe 135](corpus.md#135-rank-in-a-cte-stitch-in-time-order)). A name the outer query reads that the body did not select is an unknown column, listing the ones it did.
 
+`FROM (<select>) alias` is the same binding written where it is read ([recipe 143](corpus.md#143-a-cte-written-where-it-is-read)). The name is required and joins the same flat namespace; a body read in two places wants the `WITH` spelling, since only a name at the top of the query can be read twice.
+
+A body writes its own `WITH`, and so does a parenthesized `UNION ALL` branch ([recipe 144](corpus.md#144-a-union-all-branch-with-a-with-of-its-own)). Every binding joins the one flat, ordered table whatever it was written inside, so the names are still unique across the script and an inner one is defined before the body that reads it.
+
+Unique across the script, readable only where it was written: a binding is in scope for the query that wrote it and for what is nested inside, never for a sibling `UNION ALL` branch and never for the next statement. A view is the one name a statement leaves behind.
+
 ## Series rows - `generate_series(1, 5) i`
 
 A count rather than a file: one row per integer in the range, computed at compile time from `start`, `stop`, and an optional `step` - a struct row table with its cells computed instead of written. The alias is mandatory, like every other call-shaped FROM item (`input()`, `unnest()`, `ffmpeg.<source>()`), and it names both the row table and its one column: `generate_series(1, 5) i` reads its value back as `i.i`, the same dot-qualified spelling any row column takes - there is no bare `i` for the value, and no other column.
@@ -190,10 +196,11 @@ FROM input('film.mkv') f, input('commentary.mkv') g,
      unnest(f.audio) a JOIN unnest(g.audio) b ON a.tags.language = b.tags.language
 ```
 
-- `INNER`, `LEFT`, `FULL OUTER` between row tables - unnest tables, CTEs and views, struct row tables, `generate_series`; comma between them is a cross join. Joins at input level stay rejected.
+- `INNER`, `LEFT`, `FULL OUTER` between row tables - unnest tables, CTEs and views, struct row tables, `generate_series`; comma between them is a cross join, and `CROSS JOIN` is the comma spelled out, legal wherever the comma is. `JOIN ... ON` at input level stays rejected.
 - Result order: the left side's track order; a FULL join appends unmatched right rows after, in their order.
 - Real join multiplicity: one row matching two pairs with both. To pair a 5.1 and a stereo English track separately, widen the key: `ON a.tags.language = b.tags.language AND a.channel_layout = b.channel_layout`.
 - `ON` takes the same grammar as `WHERE`, column vs column or literal. A bare row alias is a stream, not a value to compare, so it is not usable inside `ON`.
+- The comma join spells the inner join too: a `WHERE` conjunct comparing columns of two row tables is the same join, typed the same way ([recipe 139](corpus.md#139-match-two-files-tracks-without-writing-join)). `JOIN ... ON` remains the only spelling for `LEFT` and `FULL OUTER`.
 
 A stream column's cardinality follows its relation: one cell per surviving row, NULL where the row carries no track of that kind, and a single stream on every row of the relation it is read beside - so one audio track is the audio of every rung ([recipe 124](corpus.md#124-a-muxed-ladder-from-one-file)), and a one-row CTE joined into three rows is present on the row it matched and NULL on the others. A gathered array (`array_agg`, a bare input array) is one unit instead, and one whose length is not the row count is a typed rejection.
 
@@ -234,7 +241,7 @@ COPY (
 
 The row count is the RESOLVED count against the actual file: a `WHERE` that narrows a row table to one row needs no aggregate, and neither does an `ORDER BY ... LIMIT 1`. Queries with only input aliases in FROM are one row - arrays are values inside it, so splats, subscripts, and `SELECT *` never need gathering.
 
-`array_agg` takes any per-row stream expression (`array_agg(volume(a, 0.5))`) and must be a whole SELECT column, or the sole argument of `VARIADIC` (`concat(VARIADIC array_agg(a))`, [recipe 70](corpus.md#70-join-however-many-tracks-a-file-has-with-concat)); row order is the aggregation order (`ORDER BY` before the aggregate reorders it; `ORDER BY` inside `array_agg` is rejected). Postgres's grouping rule is enforced: outside an aggregate, a row-varying expression must match a `GROUP BY` key. Group keys may be streams (`GROUP BY vid`, `GROUP BY f.video[1]`).
+`array_agg` takes any per-row stream expression (`array_agg(volume(a, 0.5))`) and must be a whole SELECT column, or the sole argument of `VARIADIC` (`concat(VARIADIC array_agg(a))`, [recipe 70](corpus.md#70-join-however-many-tracks-a-file-has-with-concat)); row order is the aggregation order (`ORDER BY` before the aggregate reorders it; `ORDER BY` inside `array_agg` is rejected). Postgres's grouping rule is enforced: outside an aggregate, a row-varying expression must match a `GROUP BY` key. Group keys may be streams (`GROUP BY vid`, `GROUP BY f.video[1]`). It gathers wherever rows are, a CTE or view body included ([recipe 141](corpus.md#141-gather-rows-inside-the-cte-that-produced-them)); `GROUP BY` is the one that stays outside, since a group is a file and a body names none.
 
 Over a CTE's own stream column, `array_agg` skips a NULL cell instead of refusing it - an outer join's gap is not a track, the one place this dialect departs from Postgres's `array_agg`, which keeps NULLs. `FILTER (WHERE <col> IS NOT NULL)` on the same column is the explicit spelling of the same thing and compiles identically; any other FILTER predicate is refused, naming that one spelling. [Recipe 130](corpus.md#130-every-rungs-video-and-every-audio-rendition-gathered-into-one-file) gathers a FULL JOIN's two disjoint CTEs - every video rung and the audio rendition - into one file this way.
 

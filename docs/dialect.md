@@ -22,7 +22,8 @@ A query is ONE statement, or a script:
 
 ```
 query   := select | copy
-script  := (function ;)* (CREATE VIEW name AS select ;)* (copy ;)* copy?
+script  := (stmt ;)* stmt ;?
+stmt    := function | CREATE VIEW name AS select | copy
 function := CREATE FUNCTION name(param type [DEFAULT literal], ...) RETURNS rtype
             AS $$ select $$ LANGUAGE sql
           | CREATE FUNCTION name(stream wstype, ...,
@@ -54,11 +55,15 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
 - A `COPY` with a media destination compiles to the ffmpeg command(s).
 - A script's views compile into ONE ffmpeg invocation, one output per
   COPY.
+- A script's statements resolve left to right, so a function or a view
+  may sit anywhere among the COPYs; only the statements after it can
+  read it. Recipe
+  [138](corpus.md#138-define-a-view-or-a-function-between-two-outputs).
 - A **FUNCTION** is a reusable expression, inlined at compile time -
   it is the query you could have typed by hand. It must be defined
-  before it is used and before the first `COPY`, every definition must
-  be called, and a value-returning one is legal anywhere a value of its
-  type is while a `TABLE`-returning one is a `FROM` row source only. A
+  before it is used, every definition must be called, and a
+  value-returning one is legal anywhere a value of its type is while a
+  `TABLE`-returning one is a `FROM` row source only. A
   parameter may declare `DEFAULT literal`; calls are positional, so an
   omitted trailing argument takes it. Recipes
   [67-68](examples.md#67-write-a-function-and-reuse-it),
@@ -149,15 +154,22 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   fed by the call that produced the rows.
   The subquery selects the whole row (`SELECT r`) and carries a `FROM`
   and a `WHERE` and nothing else. The predicate holds `=`, `<>`, `<`,
-  `<=`, `>`, `>=`, `AND`, `OR`, `NOT` and parentheses over the row's
-  own fields and literals of their declared types. A field the record
-  does not name, a literal of the wrong type for the field it is
-  compared against, a reference past the alias, a computed projection,
-  and anything else in the `WHERE` are each rejected where they are
-  written.
+  `<=`, `>`, `>=`, `BETWEEN`, `IN`, `AND`, `OR`, `NOT` and parentheses
+  over the row's own fields and literals of their declared types;
+  `BETWEEN` and `IN` travel as the comparisons they mean, so the
+  sidecar reads the same six ([recipe
+  147](corpus.md#147-narrow-a-modules-rows-with-in-and-between)). A
+  field the record does not name, a literal of the wrong type for the
+  field it is compared against, a reference past the alias, a computed
+  projection, and anything else in the `WHERE` are each rejected where
+  they are written.
 - Trailing `;` allowed; `--` and `/* */` comments allowed. Unquoted
   identifiers fold to lowercase. View, CTE, and alias names share one
-  flat namespace across the whole script.
+  flat namespace across the whole script, and are read only where
+  they are written: a CTE or a FROM subquery is in scope for the
+  query that wrote it and what is nested inside, never for a sibling
+  `UNION ALL` branch and never for the next statement. A view is the
+  one name a statement leaves behind.
 
 ## Projects and packages
 
@@ -787,9 +799,12 @@ Every FROM item is a compile-time table; the column model per shape is
 | `unnest(ARRAY[STRUCT(v AS c, ...), ...]) alias` | one per array element | a written row table; columns are the STRUCT field names, every element declaring the same set |
 | `generate_series(start, stop[, step]) alias` | `stop - start` over `step`, inclusive | alias mandatory, names both the row table and its one column (`i.i`); bounds and step are integer literals after substitution |
 | `cte_or_view_name [alias]` | its body's rows | a multi-row body is a multi-row source |
+| `(<select>) alias` | its body's rows | a CTE written where it is read; alias mandatory, and it joins the same flat namespace ([recipe 143](corpus.md#143-a-cte-written-where-it-is-read)) |
 | `function_name(args) alias` | its body's rows | a table-returning function, expanded at compile time |
 
-Comma between items is a cross join with real multiplicity.
+Comma between items is a cross join with real multiplicity, and
+`CROSS JOIN` is the same thing spelled out - anywhere the comma is
+legal, input level included ([recipe 140](corpus.md#140-spell-the-cross-join-cross-join)).
 `JOIN ... ON` exists between two row tables - `unnest` tables (chapter
 rows included), CTEs and views, struct row tables, `generate_series` -
 and nowhere else: `INNER`, `LEFT [OUTER]`, `FULL [OUTER]`, each with
@@ -1146,18 +1161,20 @@ Every one of these is a typed rejection, never a silent reinterpretation:
 
 - **Statements**: anything but SELECT / COPY / CREATE VIEW; more than
   one bare statement; INSERT/UPDATE/DELETE/DDL.
-- **Subqueries** anywhere except CTE and view bodies - `IN (SELECT
-  ...)`, `EXISTS`, derived tables in FROM.
-- **Joins**: `RIGHT [OUTER] JOIN`, `CROSS JOIN` (spell it with a
-  comma), `NATURAL JOIN`, `USING`, and any `JOIN ... ON` not between
-  two row tables.
+- **Subqueries** anywhere except CTE bodies, view bodies and FROM -
+  `IN (SELECT ...)`, `EXISTS`. A FROM subquery is a CTE and needs a
+  name.
+- **Joins**: `RIGHT [OUTER] JOIN`, `NATURAL JOIN`, `USING`, a `CROSS
+  JOIN` carrying an `ON`, and any `JOIN ... ON` not between two row
+  tables.
 - **No streaming equivalent**: `HAVING`, `DISTINCT`, `UNION` without
   `ALL`, window functions, `QUALIFY`, aggregates other than `array_agg`
   (`count`, `sum`, ...), `ORDER BY` inside `array_agg`; `LIMIT` and
   `OFFSET` outside a row-table query (see Grouping and combining).
-- **Aggregation context**: GROUP BY / array_agg inside a CTE body, a
-  view body, or a UNION ALL branch; a per-stream `tags` column in a
-  grouped query (tag inside a CTE, aggregate outside).
+- **Aggregation context**: GROUP BY inside a CTE body or a view body -
+  one group is one file, and a body names no destination; a per-stream
+  `tags` column in a grouped query (tag inside a CTE, aggregate
+  outside).
 - **Values**: casts other than to text; computed input paths;
   computed subscripts; `0` or negative subscripts; `||` over numbers
   without `::text`; division by a known zero; a vector compared,
@@ -1174,14 +1191,13 @@ Every one of these is a typed rejection, never a silent reinterpretation:
 - **Filters**: variable-OUTPUT-pad (`split` - what the compiler's own
   split pass is for; UNION ALL is `concat` without ever naming it),
   multi-output (`scale2ref`, `feedback`), sinks, multi-output sources
-  (`movie`, `avsynctest`); options typed `binary` or `dictionary`;
-  runtime filter commands (`sendcmd`, `zmq`). A variable-INPUT-pad
-  filter (`amix`, `hstack`, `xstack`, and every other filter your
-  ffmpeg reports that way) is an ordinary callable filter, taking any
-  stream count positionally or under `VARIADIC`. `ffmpeg.concat`/
-  `concat` takes any stream count too, but ONLY under `VARIADIC` -
-  called without it, `concat` is still `UNKNOWN_FUNCTION` (its own pad
-  count is variable on the OUTPUT side too).
+  (`movie`, `avsynctest`); runtime filter commands (`sendcmd`, `zmq`).
+  A variable-INPUT-pad filter (`amix`, `hstack`, `xstack`, and every
+  other filter your ffmpeg reports that way) is an ordinary callable
+  filter, taking any stream count positionally or under `VARIADIC`.
+  `ffmpeg.concat`/`concat` takes any stream count too, but ONLY under
+  `VARIADIC` - called without it, `concat` is still `UNKNOWN_FUNCTION`
+  (its own pad count is variable on the OUTPUT side too).
 - **Functions**: `OR REPLACE`, `IF NOT EXISTS`, a schema-qualified
   name, any property but `RETURNS`/`LANGUAGE`, a language other than
   `sql` or `wasm`, `OUT`/`INOUT`/`VARIADIC`/`COLLATE` on a parameter,
@@ -1242,8 +1258,9 @@ Every one of these is a typed rejection, never a silent reinterpretation:
   record does not declare, qualifying one with anything but the
   gather's own alias, comparing a field against a value of another
   type, or holding anything outside `=`, `<>`, `<`, `<=`, `>`, `>=`,
-  `AND`, `OR`, `NOT` and parentheses; and a written annotation column
-  whose producing call is not the one the stream argument names.
+  `BETWEEN`, `IN`, `AND`, `OR`, `NOT` and parentheses; and a written
+  annotation column whose producing call is not the one the stream
+  argument names.
 - **Packages**: a namespace no package claims; a namespace with no
   package by that name; a two-segment call on a package whose `lib` is
   a map, naming its exports instead; a two-segment call naming an

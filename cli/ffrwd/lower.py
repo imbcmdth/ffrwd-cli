@@ -5026,6 +5026,20 @@ class _Lowerer:
         env: _Env,
         select: exp.Select,
     ) -> None:
+        if isinstance(table, exp.Subquery):
+            # `FROM (<select>) alias`: resolve bound the body under the alias,
+            # so it reads back as the CTE it is.
+            alias_node = table.args.get("alias")
+            if not isinstance(alias_node, exp.TableAlias) or alias_node.this is None:
+                raise _error(  # defensive: resolve already required a name
+                    ErrorCode.UNSUPPORTED_SQL,
+                    "a subquery in FROM needs a name",
+                    table,
+                    fallback=select,
+                )
+            local = _fold(alias_node.this)
+            self._add_cte_table(local, local, table, select, join, env, select)
+            return
         if not isinstance(table, exp.Table):
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
@@ -5092,45 +5106,55 @@ class _Lowerer:
             self._bind_renditions(alias, join, env, select)
             return
         if isinstance(inner, exp.Identifier):
-            name = _fold(inner)
-            columns = self.cte_columns.get(name)
-            body_values = self.cte_values.get(name, {})
-            body_rows_columns = self.cte_rows_columns.get(name, {})
-            body_cue_columns = self.cte_cue_columns.get(name, frozenset())
-            if columns is None:
-                raise _error(
-                    ErrorCode.UNKNOWN_ALIAS,
-                    f"unknown table '{name}'",
-                    inner,
-                    fallback=table,
-                    hint=self._known_hint(),
-                )
             # `FROM master m` binds the view/CTE under a BRANCH-LOCAL name
             # (resolve checked it shadows nothing in the flat namespace). The
             # binding records the local name, so `m.v` resolves and messages
             # read back as written; the columns -- and therefore the graph
             # refs -- are the same objects either way, which is what makes the
             # shared subgraph shared.
+            name = _fold(inner)
             local = name
             if isinstance(alias_node, exp.TableAlias) and alias_node.this is not None:
                 local = _fold(alias_node.this)
-            _add_cte_rows(
-                self._eval_ctx,
-                local,
-                columns,
-                body_values,
-                body_rows_columns,
-                body_cue_columns,
-                env,
-                select,
-                join,
-            )
+            self._add_cte_table(name, local, inner, table, join, env, select)
             return
         raise _error(
             ErrorCode.UNSUPPORTED_SQL,
             _FROM_ITEM_MESSAGE,
             table,
             fallback=select,
+        )
+
+    def _add_cte_table(
+        self,
+        name: str,
+        local: str,
+        anchor: exp.Expr,
+        fallback: exp.Expr,
+        join: RawRowJoin | None,
+        env: _Env,
+        select: exp.Select,
+    ) -> None:
+        """Bind one named relation's rows: a view, a CTE, or a FROM subquery."""
+        columns = self.cte_columns.get(name)
+        if columns is None:
+            raise _error(
+                ErrorCode.UNKNOWN_ALIAS,
+                f"unknown table '{name}'",
+                anchor,
+                fallback=fallback,
+                hint=self._known_hint(),
+            )
+        _add_cte_rows(
+            self._eval_ctx,
+            local,
+            columns,
+            self.cte_values.get(name, {}),
+            self.cte_rows_columns.get(name, {}),
+            self.cte_cue_columns.get(name, frozenset()),
+            env,
+            select,
+            join,
         )
 
     def _known_hint(self) -> str:
@@ -5272,13 +5296,13 @@ class _Lowerer:
                 self._check_row_window_seeks_a_file(conjunct, where, env)
                 time_conjuncts.append(conjunct)
                 continue
-            if aliases - rows or len(rows) > 1:  # defensive: resolve rejected both
+            if aliases - rows:  # defensive: resolve rejected the mix already
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,
-                    "a WHERE predicate may reference only one track-row table",
+                    "a WHERE predicate cannot mix track-row columns with other aliases",
                     conjunct,
                     fallback=where,
-                    hint="filter each unnest separately",
+                    hint="write them as separate AND conjuncts",
                 )
             row_conjuncts.append(conjunct)
         return time_conjuncts, row_conjuncts, assertion_conjuncts

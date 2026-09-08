@@ -44,7 +44,7 @@ from pathlib import Path
 
 import pytest
 
-from ffrwd import binaries, cli
+from ffrwd import binaries, cli, registry
 from ffrwd.errors import FfrwdError
 from ffrwd.parser import parse, resolve
 from ffrwd.registry import Registry
@@ -432,12 +432,26 @@ def _require_modules(example: Example) -> None:
         pytest.skip(reason)
 
 
+# Filters an ffmpeg may simply not be built with. CI's is, so a recipe naming
+# one still carries its weight there; a machine without it is skipped, not
+# failed.
+_OPTIONAL_FILTERS = ("libplacebo",)
+
+
+def _require_filters(example: Example) -> None:
+    """Skip a recipe naming a filter this ffmpeg does not have."""
+    for name in _OPTIONAL_FILTERS:
+        if re.search(rf"\b{name}\s*\(", example.sql) and registry.load().get(name) is None:
+            pytest.skip(f"this ffmpeg has no '{name}' filter")
+
+
 @pytest.mark.exec
 @pytest.mark.parametrize("example", _EXEC, ids=_ids(_EXEC))
 def test_exec_example_compiles_to_the_shown_command(
     example: Example, tmp_path: Path, _fixtures: None
 ) -> None:
     _require_modules(example)
+    _require_filters(example)
     actual = _run(example, tmp_path)
     expected = _split_command(example)[1]
     assert "\n".join(wrap_command(line) for line in actual.split("\n")) == expected

@@ -593,12 +593,15 @@ def test_a_function_is_defined_before_it_is_called() -> None:
     _rejects(sql, ErrorCode.UNSUPPORTED_SQL, "before it is defined")
 
 
-def test_a_definition_may_not_follow_a_copy() -> None:
+def test_a_definition_after_the_last_copy_has_nothing_left_to_call_it() -> None:
+    """A definition may sit anywhere among the COPYs; only the ones after it
+    can call it, so one written last is uncalled."""
     sql = (
         "COPY (SELECT f.audio[1] FROM input('a.mka') f) TO 'out.mka';\n"
         "CREATE FUNCTION m(a text) RETURNS text AS $$ SELECT a $$ LANGUAGE sql"
     )
-    _rejects(sql, ErrorCode.UNSUPPORTED_SQL, "may not follow a COPY")
+    error = _rejects(sql, ErrorCode.UNSUPPORTED_SQL, "never called")
+    assert error.line == 2
 
 
 def test_create_or_replace_function_is_rejected() -> None:

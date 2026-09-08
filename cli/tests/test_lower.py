@@ -4966,6 +4966,21 @@ def test_channels_narrows_the_split_to_a_subset(_registry: Registry) -> None:
     assert g.nodes["n1"].outputs == ["audio", "audio"]
 
 
+def test_a_binary_or_dictionary_option_binds_as_a_string() -> None:
+    """ffmpeg reads a `dictionary` AVOption as its own `key=value` list and a
+    `binary` one as hex, both off the same text every option value is, so both
+    bind like any other string. libplacebo carries one of each."""
+    g = _lower(
+        "SELECT libplacebo(f.video[1], extra_opts => 'brightness=0.1', "
+        "custom_shader_bin => '48656c6c6f') FROM input('f.mkv') f"
+    )
+    assert g.nodes["n1"].args == {
+        "extra_opts": "brightness=0.1",
+        "custom_shader_bin": "48656c6c6f",
+        "inputs": 1,
+    }
+
+
 def test_channels_all_falls_back_to_the_layout(_registry: Registry) -> None:
     g = _dyn(
         "SELECT ffmpeg.channelsplit(a.audio[1], channel_layout => '5.1', "
@@ -8190,6 +8205,8 @@ def test_an_unprobed_field_is_null_for_every_row() -> None:
         ("NOT (t.channels = 2)", ["src:f:a:1"]),
         ("t.index = 1", ["src:f:a:0"]),
         ("t.index = 3", ["src:f:a:2"]),
+        # two columns of one row, compared against each other
+        ("t.channels > t.index", ["src:f:a:0", "src:f:a:1"]),
         ("t.tags.language IN ('eng', 'fra')", ["src:f:a:0", "src:f:a:1"]),
         # NULL matches nothing, same as `=`: the untagged third track survives
         # neither the IN nor the NOT IN.
@@ -11106,13 +11123,22 @@ def test_an_unaliased_value_column_is_still_not_a_stream() -> None:
     assert err.hint is not None and "give it an alias" in err.hint
 
 
-def test_a_case_column_over_literals_is_still_not_a_row_predicate() -> None:
-    err = _reject(
+def test_a_case_column_over_literals_is_decided_at_compile_time() -> None:
+    """A comparison needs no row column: two literals type against each other
+    and the CASE picks its branch here, never at run time. An unmatched CASE
+    with no ELSE is NULL, which is the clear-the-key spelling."""
+    taken = _lower(
         "SELECT f.audio[1], "
         "STRUCT(CASE WHEN 'a' = 'a' THEN 'x' END AS title) AS tags "
         "FROM input('f.mkv') f"
     )
-    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert taken.sinks[0].tags == {"title": "x"}
+    cleared = _lower(
+        "SELECT f.audio[1], "
+        "STRUCT(CASE WHEN 'a' = 'b' THEN 'x' END AS title) AS tags "
+        "FROM input('f.mkv') f"
+    )
+    assert cleared.sinks[0].tags == {"title": None}
 
 
 # ---------------------------------------------------------------------------
@@ -13083,10 +13109,35 @@ _AGG_CONTEXTS = [
 
 
 @pytest.mark.parametrize("where,sql", _AGG_CONTEXTS, ids=[c[0] for c in _AGG_CONTEXTS])
-def test_aggregation_is_a_media_copys_own_select(where: str, sql: str) -> None:
+def test_grouping_is_a_media_copys_own_select(where: str, sql: str) -> None:
     err = _reject(sql)
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert f"GROUP BY is not supported in {where}" in err.message
+
+
+_GATHER_IN_A_BODY = [
+    (
+        "a CTE body",
+        "COPY (WITH c AS (SELECT array_agg(t) AS track FROM input('f.mkv') f, "
+        "unnest(f.audio) t) SELECT c.track FROM c) TO 'out.mka'",
+    ),
+    (
+        "a view body",
+        "CREATE VIEW v AS SELECT array_agg(t) AS track FROM input('f.mkv') f, "
+        "unnest(f.audio) t; COPY (SELECT v.track FROM v) TO 'out.mka'",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "where,sql", _GATHER_IN_A_BODY, ids=[c[0] for c in _GATHER_IN_A_BODY]
+)
+def test_a_relation_body_gathers_its_own_rows(where: str, sql: str) -> None:
+    """`array_agg` collapses the body's rows where they are, and the outer
+    query reads the one row that comes back."""
+    argv = _agg_argv(sql, _row_probes())
+    assert argv.count("-map") == 3
+    assert argv[-1] == "out.mka"
 
 
 def test_group_by_without_track_rows_still_has_no_streaming_equivalent() -> None:

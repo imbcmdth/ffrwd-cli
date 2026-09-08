@@ -455,9 +455,85 @@
     "tier": "exec",
     "verdict": "accepted"
   },
+  "docs/corpus.md::138-define-a-view-or-a-function-between-two-outputs": {
+    "command": [
+      "ffmpeg -i tests/fixtures/av2.mp4 -filter_complex '[0:v:0]scale=width=320:height=-2[out1]' -map 0:a:0 -c:0 copy -metadata:s:0 language=eng sound.m4a -map '[out1]' small.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::139-match-two-files-tracks-without-writing-join": {
+    "command": [
+      "ffmpeg -i tests/fixtures/av2.mp4 -i tests/fixtures/av3.mp4 -filter_complex '[0:a:0][1:a:0]amix=inputs=2[out0];[0:a:1][1:a:1]amix=inputs=2[out1]' -map '[out0]' -metadata:s:0 language=eng -map '[out1]' -metadata:s:1 language=fra mixed.mka"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
   "docs/corpus.md::14-turn-a-clip-into-a-gif": {
     "command": [
       "ffmpeg -i clip.mp4 -filter_complex '[0:v:0]scale=width=480:height=-2,fps=fps=12,split=2[n2_split0][n2_split1];[n2_split0]palettegen[n3];[n2_split1][n3]paletteuse[out0]' -map '[out0]' clip.gif"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::140-spell-the-cross-join-cross-join": {
+    "command": [
+      " language | pass",
+      "----------+------",
+      " eng      | 1",
+      " eng      | 2",
+      " fra      | 1",
+      " fra      | 2",
+      "(4 rows)"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::141-gather-rows-inside-the-cte-that-produced-them": {
+    "command": [
+      "ffmpeg -i tests/fixtures/av2.mp4 -filter_complex '[0:a:0][0:a:1]amix=inputs=2,volume=volume=0.5[out1]' -map 0:v:0 -c:0 copy -map '[out1]' one.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::142-cut-the-chapter-a-timestamp-falls-in": {
+    "command": [
+      "ffmpeg -i tests/fixtures/av-chapters.mkv -filter_complex '[0:v:0]trim=start=2.0:end=3.0[n1];[0:a:0]atrim=start=2.0:end=3.0[n2];[n1]setpts=PTS-STARTPTS[out0];[n2]asetpts=PTS-STARTPTS[out1]' -map '[out0]' -map '[out1]' -metadata:s:1 language=eng chapter.mkv"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::143-a-cte-written-where-it-is-read": {
+    "command": [
+      "ffmpeg -i tests/fixtures/testsrc.mp4 -i tests/fixtures/smptebars.mp4 -filter_complex '[1:v:0]scale=width=160:height=-2[n1];[0:v:0][n1]overlay=x=20:y=20[out0]' -map '[out0]' pip.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::144-a-union-all-branch-with-a-with-of-its-own": {
+    "command": [
+      "ffmpeg -i tests/fixtures/av2.mp4 -i tests/fixtures/av.mp4 -filter_complex '[0:v:0]scale=width=320:height=240[n1];[0:a:0]volume=volume=0.5[n2];[1:v:0][1:a:0][n1][n2]concat=n=2:v=1:a=1[out0][out1]' -map '[out0]' -map '[out1]' joined.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::145-switch-a-tag-on-a-variable": {
+    "command": [
+      "ffmpeg -i tests/fixtures/av.mp4 -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -metadata 'title=Extended edition' out.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::146-pass-a-filter-s-own-option-list-through": {
+    "command": [
+      "ffmpeg -i tests/fixtures/testsrc.mp4 -filter_complex '[0:v:0]libplacebo=extra_opts=upscaler\\\\=bilinear\\\\:brightness\\\\=0.1:inputs=1[out0]' -map '[out0]' graded.mp4"
+    ],
+    "tier": "exec",
+    "verdict": "accepted"
+  },
+  "docs/corpus.md::147-narrow-a-module-s-rows-with-in-and-between": {
+    "command": [
+      "ffmpeg -i tests/fixtures/av.mp4 -map 0:v:0 -c:0 rawvideo -pix_fmt:0 yuv420p -f nut pipe:1 | ffrwd-wasm -f nut -i pipe:0 -nn segment=../sidecar/modules/target/wasm32-wasip2/release/segment.onnx -m segment=../sidecar/modules/target/wasm32-wasip2/release/segment.wasm -m mask_select=../sidecar/modules/target/wasm32-wasip2/release/mask_select.wasm -m blur_mask=../sidecar/modules/target/wasm32-wasip2/release/blur_mask.wasm -filter_complex '[0:v]segment[n1];[n1]rowfilter=pred={\"and\"\\\\:\\[{\"or\"\\\\:\\[{\"eq\"\\\\:\\[{\"field\"\\\\:\"class\"}\\,{\"lit\"\\\\:\"person\"}\\]}\\,{\"eq\"\\\\:\\[{\"field\"\\\\:\"class\"}\\,{\"lit\"\\\\:\"cat\"}\\]}\\]}\\,{\"and\"\\\\:\\[{\"ge\"\\\\:\\[{\"field\"\\\\:\"score\"}\\,{\"lit\"\\\\:0.4}\\]}\\,{\"le\"\\\\:\\[{\"field\"\\\\:\"score\"}\\,{\"lit\"\\\\:0.9}\\]}\\]}\\]}[n2];[n2]mask_select[n3];[0:v][n3]blur_mask=max_radius=24:invert=0[out0]' -map '[out0]' -f nut pipe:1 | ffmpeg -i tests/fixtures/av.mp4 -f nut -i pipe:0 -map 1:v:0 -map 0:a:0 -c:1 copy -c:0 libx264 -crf:0 20 blurred.mp4"
     ],
     "tier": "exec",
     "verdict": "accepted"

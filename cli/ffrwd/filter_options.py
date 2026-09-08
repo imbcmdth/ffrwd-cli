@@ -212,24 +212,19 @@ def _option_value(
 ) -> object:
     """One named argument's value, checked against its introspected AVOption.
 
-    The type map is the RFC's: numeric AVOptions take a bare number (range
-    checked whenever ffmpeg printed a parseable one), booleans take ``true`` /
-    ``false``, an enum takes one of its named constants, and everything else
-    takes a string — or a bare number, since an ffmpeg option value is text on
-    the command line either way and ``duration``/``video_rate``/expression
-    options (``xfade``'s ``duration``, ``crop``'s ``x``) are routinely numeric.
+    Numeric AVOptions take a bare number (range checked whenever ffmpeg
+    printed a parseable one), booleans take ``true`` / ``false``, an enum
+    takes one of its named constants, and everything else takes a string — or
+    a bare number, since an ffmpeg option value is text on the command line
+    either way and ``duration``/``video_rate``/expression options
+    (``xfade``'s ``duration``, ``crop``'s ``x``) are routinely numeric.
+
+    ``binary`` and ``dictionary`` AVOptions are strings here too: ffmpeg reads
+    a dictionary as its own ``key=value`` list and a binary as hex, both from
+    the same text an option value always is.
     """
     value = _literal_value(arg.value)
     got = _option_got(arg.value, value)
-    if option.unusable:
-        raise _option_error(
-            filter_name,
-            option,
-            arg,
-            call,
-            "has an ffmpeg type (binary/dictionary) ffrwd cannot set",
-            "drop it; ffrwd sets numeric, string and boolean options only",
-        )
     if option.type == "num":
         if not isinstance(value, int | float) or isinstance(value, bool):
             bounds = _range_text(option)

@@ -1166,9 +1166,9 @@ def test_unparseable_option_line_degrades_to_str_type(monkeypatch: pytest.Monkey
 
 
 def test_binary_and_dictionary_types_marked_unusable(monkeypatch: pytest.MonkeyPatch) -> None:
-    # CONSTRUCTED: no real filter in a full scan of ffmpeg 7.1's included
-    # filters used <binary> or <dictionary>; this exercises the RFC's
-    # exclusion rule for those AVOption types regardless.
+    # CONSTRUCTED, so the parse is pinned on every build: the only real
+    # filter carrying these types is libplacebo, which not every ffmpeg has.
+    # Both type as strings, which is how ffmpeg reads them off a command line.
     synthetic_help = (
         "Filter syntheticfilter\n"
         "syntheticfilter AVOptions:\n"
