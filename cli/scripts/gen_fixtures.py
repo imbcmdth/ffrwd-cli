@@ -33,12 +33,26 @@ a variant naming an AUDIO group is read back video-only, and the group's own
 ``#EXT-X-MEDIA`` entry reads back as its own audio-only row.
 ``ladder-audio-only/master.m3u8`` is a third real ladder, also compiler-built:
 one audio rendition, no video row at all -- the shape ffmpeg's hls muxer
-writes for an audio-only destination. ``ladder-hybrid/master.m3u8`` is the
-one shape ffrwd cannot write directly yet -- a variant that MUXES its own
-audio AND names an AUDIO group -- so it is COMPOSED as text from the other
-two ladders' own playlists (``ladder/master.m3u8``'s variants, each given an
-added ``AUDIO=`` naming ``ladder-demuxed-hls/master.m3u8``'s own group),
-reusing both by relative path rather than copying their segments.
+writes for an audio-only destination. ``ladder-hybrid/master.m3u8`` is a
+variant that MUXES its own audio AND names an AUDIO group, COMPOSED as text
+from the other two ladders' own playlists (``ladder/master.m3u8``'s variants,
+each given an added ``AUDIO=`` naming ``ladder-demuxed-hls/master.m3u8``'s own
+group), reusing both by relative path rather than copying their segments; the
+compiler writes that shape directly too, in the three hybrid ladders below.
+
+Eight more name a RENDITION count the set otherwise skips, so every manifest
+shape a query can read has a manifest to stand for it. All eight are
+compiler-built, all HLS, and all built from the same 960- and 1440-wide
+encodes the ladders above use:
+``ladder-video-only`` (one video rendition, no audio anywhere),
+``ladder-muxed-1v`` (one variant carrying its own video and audio),
+``ladder-demuxed-1v1a`` / ``ladder-demuxed-1v2a`` / ``ladder-demuxed-2v2a``
+(one or two video-only variants beside one or two rows of an audio group),
+and ``ladder-hybrid-1v1a`` / ``ladder-hybrid-1v2a`` / ``ladder-hybrid-2v2a``
+(the same counts again, but each variant muxes its own audio AND names the
+group). The five with one audio row read av.mp4; the ones with two read
+av2.mp4, whose two audio tracks are tagged ``eng`` and ``fra``, so the two
+rows are told apart by name and by language rather than by position.
 
 Idempotent: a fixture whose output file already exists is skipped, so this
 is safe to run repeatedly, including once per CI job right before the exec
@@ -99,6 +113,14 @@ _LADDER_DEMUXED_MASTER_NAME = "ladder-demuxed/master.mpd"
 _LADDER_DEMUXED_HLS_MASTER_NAME = "ladder-demuxed-hls/master.m3u8"
 _LADDER_AUDIO_ONLY_MASTER_NAME = "ladder-audio-only/master.m3u8"
 _LADDER_HYBRID_MASTER_NAME = "ladder-hybrid/master.m3u8"
+_LADDER_VIDEO_ONLY_MASTER_NAME = "ladder-video-only/master.m3u8"
+_LADDER_MUXED_1V_MASTER_NAME = "ladder-muxed-1v/master.m3u8"
+_LADDER_DEMUXED_1V1A_MASTER_NAME = "ladder-demuxed-1v1a/master.m3u8"
+_LADDER_DEMUXED_1V2A_MASTER_NAME = "ladder-demuxed-1v2a/master.m3u8"
+_LADDER_DEMUXED_2V2A_MASTER_NAME = "ladder-demuxed-2v2a/master.m3u8"
+_LADDER_HYBRID_1V1A_MASTER_NAME = "ladder-hybrid-1v1a/master.m3u8"
+_LADDER_HYBRID_1V2A_MASTER_NAME = "ladder-hybrid-1v2a/master.m3u8"
+_LADDER_HYBRID_2V2A_MASTER_NAME = "ladder-hybrid-2v2a/master.m3u8"
 
 # HLS tag names, read back from playlist text when composing the hybrid
 # ladder below -- kept local rather than imported so this script stays
@@ -195,6 +217,162 @@ COPY (
   FROM input('av.mp4') f, unnest(f.audio) a
 ) TO 'ladder-audio-only/master.m3u8'
   WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', audio_codec 'aac')
+"""
+
+# The eight ladders below fill in the rendition counts the four above skip.
+# Two shapes recur through all of them:
+#
+#   * a video rung is `scale(f.video[1], W, -2)` at 1440 or 960 wide, the same
+#     two encodes the ladders above use, so every rung in the set reads back at
+#     1080 or 720 high;
+#   * an audio-only row is keyed so the FULL JOIN never matches -- video rungs
+#     count from 1, and an audio track's rung is its own stream index pushed
+#     past the last of them. What a join leaves unmatched on one side is a row
+#     with only the other side's stream, which is what a demuxed rendition is.
+#
+# A hybrid row is the muxed and the demuxed shape at once: `vid` carries a
+# video AND an audio cell, `aud` carries an audio cell alone, and the COALESCE
+# takes the variant's own audio where there is one and the group's otherwise.
+
+# One video rendition and no audio anywhere.
+_LADDER_VIDEO_ONLY_SQL = """\
+COPY (
+  SELECT scale(f.video[1], 960, -2)
+  FROM input('av.mp4') f
+) TO 'ladder-video-only/master.m3u8'
+  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod',
+        video_codec 'libx264', video_bitrate '800k')
+"""
+
+# One variant carrying its own video and audio: `ladder/master.m3u8`'s shape
+# with a single rung.
+_LADDER_MUXED_1V_SQL = """\
+COPY (
+  SELECT scale(f.video[1], 960, -2), f.audio[1]
+  FROM input('av.mp4') f
+) TO 'ladder-muxed-1v/master.m3u8'
+  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod',
+        video_codec 'libx264', video_bitrate '800k', audio_codec 'aac')
+"""
+
+# One video-only variant and one row of its audio group: av.mp4's one audio
+# track takes rung `1 + 1`, past the single video rung.
+_LADDER_DEMUXED_1V1A_SQL = """\
+COPY (
+  WITH vid AS (
+    SELECT scale(f.video[1], 960, -2) AS v, 1 AS rung
+    FROM input('av.mp4') f
+  ),
+  aud AS (
+    SELECT a AS t, 1 + a.index AS rung
+    FROM input('av.mp4') g, unnest(g.audio) a
+  )
+  SELECT vid.v, aud.t
+  FROM vid FULL JOIN aud ON vid.rung = aud.rung
+) TO 'ladder-demuxed-1v1a/master.m3u8'
+  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod',
+        video_codec 'libx264', video_bitrate '800k', audio_codec 'aac')
+"""
+
+# One video-only variant and TWO rows of its audio group: av2.mp4's two
+# language-tagged tracks take rungs `1 + 1` and `1 + 2`.
+_LADDER_DEMUXED_1V2A_SQL = """\
+COPY (
+  WITH vid AS (
+    SELECT scale(f.video[1], 960, -2) AS v, 1 AS rung
+    FROM input('av2.mp4') f
+  ),
+  aud AS (
+    SELECT a AS t, 1 + a.index AS rung
+    FROM input('av2.mp4') g, unnest(g.audio) a
+  )
+  SELECT vid.v, aud.t
+  FROM vid FULL JOIN aud ON vid.rung = aud.rung
+) TO 'ladder-demuxed-1v2a/master.m3u8'
+  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod',
+        video_codec 'libx264', video_bitrate '800k', audio_codec 'aac')
+"""
+
+# Two video-only variants and two rows of their audio group: both columns
+# many, the fullest demuxed shape.
+_LADDER_DEMUXED_2V2A_SQL = """\
+COPY (
+  WITH vid AS (
+    SELECT scale(f.video[1], ARRAY[1440, 960][i.i], -2) AS v, i.i AS rung
+    FROM input('av2.mp4') f, generate_series(1, 2) i
+  ),
+  aud AS (
+    SELECT a AS t, 2 + a.index AS rung
+    FROM input('av2.mp4') g, unnest(g.audio) a
+  )
+  SELECT vid.v, aud.t
+  FROM vid FULL JOIN aud ON vid.rung = aud.rung
+) TO 'ladder-demuxed-2v2a/master.m3u8'
+  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod',
+        video_codec 'libx264', video_bitrate ARRAY['2000k', '800k'][vid.rung],
+        audio_codec 'aac')
+"""
+
+# One muxed variant beside one row of an audio group. The variant's audio is
+# av.mp4's one track read a second time, so the group's row and the muxed row
+# carry the same track encoded twice -- which is what the shape is: an audio
+# rendition a player may take INSTEAD of the one already in the variant.
+_LADDER_HYBRID_1V1A_SQL = """\
+COPY (
+  WITH vid AS (
+    SELECT scale(f.video[1], 960, -2) AS v, f.audio[1] AS a, 1 AS rung
+    FROM input('av.mp4') f
+  ),
+  aud AS (
+    SELECT a AS t, 1 + a.index AS rung
+    FROM input('av.mp4') g, unnest(g.audio) a
+  )
+  SELECT vid.v, COALESCE(vid.a, aud.t)
+  FROM vid FULL JOIN aud ON vid.rung = aud.rung
+) TO 'ladder-hybrid-1v1a/master.m3u8'
+  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod',
+        video_codec 'libx264', video_bitrate '800k', audio_codec 'aac')
+"""
+
+# One muxed variant beside TWO rows of an audio group: the variant muxes
+# av2.mp4's eng track, and the group carries eng and fra both.
+_LADDER_HYBRID_1V2A_SQL = """\
+COPY (
+  WITH vid AS (
+    SELECT scale(f.video[1], 960, -2) AS v, f.audio[1] AS a, 1 AS rung
+    FROM input('av2.mp4') f
+  ),
+  aud AS (
+    SELECT a AS t, 1 + a.index AS rung
+    FROM input('av2.mp4') g, unnest(g.audio) a
+  )
+  SELECT vid.v, COALESCE(vid.a, aud.t)
+  FROM vid FULL JOIN aud ON vid.rung = aud.rung
+) TO 'ladder-hybrid-1v2a/master.m3u8'
+  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod',
+        video_codec 'libx264', video_bitrate '800k', audio_codec 'aac')
+"""
+
+# Two muxed variants beside two rows of an audio group: the fullest hybrid,
+# and the shape `ladder-hybrid/master.m3u8` composes by hand with one group
+# row instead of two.
+_LADDER_HYBRID_2V2A_SQL = """\
+COPY (
+  WITH vid AS (
+    SELECT scale(f.video[1], ARRAY[1440, 960][i.i], -2) AS v,
+           f.audio[1] AS a, i.i AS rung
+    FROM input('av2.mp4') f, generate_series(1, 2) i
+  ),
+  aud AS (
+    SELECT a AS t, 2 + a.index AS rung
+    FROM input('av2.mp4') g, unnest(g.audio) a
+  )
+  SELECT vid.v, COALESCE(vid.a, aud.t)
+  FROM vid FULL JOIN aud ON vid.rung = aud.rung
+) TO 'ladder-hybrid-2v2a/master.m3u8'
+  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod',
+        video_codec 'libx264', video_bitrate ARRAY['2000k', '800k'][vid.rung],
+        audio_codec 'aac')
 """
 
 # The mimetype ffmpeg itself reports for a TrueType attachment.
@@ -683,22 +861,24 @@ def _generate_attached(font_path: Path) -> None:
     )
 
 
-def _generate_ladder() -> None:
-    """A real two-rendition HLS ladder, run through `ffrwd run` itself
-    (`python -m ffrwd`, the console entry point) rather than a hand-typed
-    ffmpeg call -- this is the one fixture that IS the compiler's own
-    output, since recipes 105-107 read `input()` on a manifest path and
-    need `-show_programs` to report real renditions. Must run after
-    av.mp4 exists.
+def _compile_ladder(name: str, sql: str) -> None:
+    """Build one ladder by running `sql` through `ffrwd run` itself
+    (`python -m ffrwd`, the console entry point), unless its master playlist
+    is already there.
+
+    Every ladder here is the compiler's own output rather than a hand-typed
+    ffmpeg call: what reads a manifest back with `input()` is then reading a
+    real one, and `-show_programs` reports real renditions. Must run after
+    the source the query names exists.
     """
-    master = FIXTURES_DIR / _LADDER_MASTER_NAME
+    master = FIXTURES_DIR / name
     if master.exists():
         print(f"skip (already exists): {master}")
         return
     master.parent.mkdir(parents=True, exist_ok=True)
     print(f"generating: {master}")
     result = subprocess.run(
-        [sys.executable, "-m", "ffrwd", "run", _LADDER_SQL, "-y"],
+        [sys.executable, "-m", "ffrwd", "run", sql, "-y"],
         cwd=FIXTURES_DIR,
         capture_output=True,
         text=True,
@@ -707,34 +887,25 @@ def _generate_ladder() -> None:
         print(result.stdout, file=sys.stderr)
         print(result.stderr, file=sys.stderr)
         raise SystemExit(f"ffrwd run failed generating {master}")
+
+
+def _generate_ladder() -> None:
+    """A real two-rendition HLS ladder, every rung muxing its own audio --
+    what recipes 105-107 read `input()` on.
+    """
+    _compile_ladder(_LADDER_MASTER_NAME, _LADDER_SQL)
 
 
 def _generate_ladder_demuxed() -> None:
     """A real DEMUXED DASH ladder -- two video-only rungs, one audio-only
-    rendition -- again run through `ffrwd run` rather than hand-typed.
-    Recipe 110 self-joins a ladder against itself to pick video rows from
-    one side and audio rows from the other; `ladder/master.m3u8` has no
-    audio-only row to find (its FULL JOIN key is chosen to mux every rung),
-    and neither would an HLS reading of THIS query's demuxed rows -- see
-    `_LADDER_DEMUXED_SQL`'s comment for why DASH is what makes the
-    audio-only row read back as its own. Must run after av.mp4 exists.
+    rendition. Recipe 110 self-joins a ladder against itself to pick video
+    rows from one side and audio rows from the other; `ladder/master.m3u8`
+    has no audio-only row to find (its FULL JOIN key is chosen to mux every
+    rung), and neither would an HLS reading of THIS query's demuxed rows --
+    see `_LADDER_DEMUXED_SQL`'s comment for why DASH is what makes the
+    audio-only row read back as its own.
     """
-    master = FIXTURES_DIR / _LADDER_DEMUXED_MASTER_NAME
-    if master.exists():
-        print(f"skip (already exists): {master}")
-        return
-    master.parent.mkdir(parents=True, exist_ok=True)
-    print(f"generating: {master}")
-    result = subprocess.run(
-        [sys.executable, "-m", "ffrwd", "run", _LADDER_DEMUXED_SQL, "-y"],
-        cwd=FIXTURES_DIR,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        print(result.stdout, file=sys.stderr)
-        print(result.stderr, file=sys.stderr)
-        raise SystemExit(f"ffrwd run failed generating {master}")
+    _compile_ladder(_LADDER_DEMUXED_MASTER_NAME, _LADDER_DEMUXED_SQL)
 
 
 def _generate_ladder_demuxed_hls() -> None:
@@ -742,46 +913,59 @@ def _generate_ladder_demuxed_hls() -> None:
     AUDIO group, whose one member is the audio-only rendition. Same
     video/audio split as `_generate_ladder_demuxed`'s DASH one, proving
     `input()` on an HLS master reads a demuxed AUDIO group back as its own
-    row too. Must run after av.mp4 exists.
+    row too.
     """
-    master = FIXTURES_DIR / _LADDER_DEMUXED_HLS_MASTER_NAME
-    if master.exists():
-        print(f"skip (already exists): {master}")
-        return
-    master.parent.mkdir(parents=True, exist_ok=True)
-    print(f"generating: {master}")
-    result = subprocess.run(
-        [sys.executable, "-m", "ffrwd", "run", _LADDER_DEMUXED_HLS_SQL, "-y"],
-        cwd=FIXTURES_DIR,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        print(result.stdout, file=sys.stderr)
-        print(result.stderr, file=sys.stderr)
-        raise SystemExit(f"ffrwd run failed generating {master}")
+    _compile_ladder(_LADDER_DEMUXED_HLS_MASTER_NAME, _LADDER_DEMUXED_HLS_SQL)
 
 
 def _generate_ladder_audio_only() -> None:
-    """A real AUDIO-ONLY HLS master -- one audio rendition, no video row --
-    run through `ffrwd run` itself. Must run after av.mp4 exists.
-    """
-    master = FIXTURES_DIR / _LADDER_AUDIO_ONLY_MASTER_NAME
-    if master.exists():
-        print(f"skip (already exists): {master}")
-        return
-    master.parent.mkdir(parents=True, exist_ok=True)
-    print(f"generating: {master}")
-    result = subprocess.run(
-        [sys.executable, "-m", "ffrwd", "run", _LADDER_AUDIO_ONLY_SQL, "-y"],
-        cwd=FIXTURES_DIR,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        print(result.stdout, file=sys.stderr)
-        print(result.stderr, file=sys.stderr)
-        raise SystemExit(f"ffrwd run failed generating {master}")
+    """A real AUDIO-ONLY HLS master -- one audio rendition, no video row."""
+    _compile_ladder(_LADDER_AUDIO_ONLY_MASTER_NAME, _LADDER_AUDIO_ONLY_SQL)
+
+
+def _generate_ladder_video_only() -> None:
+    """One video rendition and no audio anywhere: the mirror of
+    `ladder-audio-only`, and the only manifest here with no audio at all."""
+    _compile_ladder(_LADDER_VIDEO_ONLY_MASTER_NAME, _LADDER_VIDEO_ONLY_SQL)
+
+
+def _generate_ladder_muxed_1v() -> None:
+    """One variant carrying its own video and audio: `ladder/master.m3u8`'s
+    shape at one rung instead of two."""
+    _compile_ladder(_LADDER_MUXED_1V_MASTER_NAME, _LADDER_MUXED_1V_SQL)
+
+
+def _generate_ladder_demuxed_1v1a() -> None:
+    """One video-only variant and one row of its audio group."""
+    _compile_ladder(_LADDER_DEMUXED_1V1A_MASTER_NAME, _LADDER_DEMUXED_1V1A_SQL)
+
+
+def _generate_ladder_demuxed_1v2a() -> None:
+    """One video-only variant and two rows of its audio group, eng and fra."""
+    _compile_ladder(_LADDER_DEMUXED_1V2A_MASTER_NAME, _LADDER_DEMUXED_1V2A_SQL)
+
+
+def _generate_ladder_demuxed_2v2a() -> None:
+    """Two video-only variants and two rows of their audio group: the
+    demuxed shape with both counts many."""
+    _compile_ladder(_LADDER_DEMUXED_2V2A_MASTER_NAME, _LADDER_DEMUXED_2V2A_SQL)
+
+
+def _generate_ladder_hybrid_1v1a() -> None:
+    """One variant that muxes its own audio AND names an audio group, beside
+    that group's one row."""
+    _compile_ladder(_LADDER_HYBRID_1V1A_MASTER_NAME, _LADDER_HYBRID_1V1A_SQL)
+
+
+def _generate_ladder_hybrid_1v2a() -> None:
+    """One muxed variant beside two rows of an audio group, eng and fra."""
+    _compile_ladder(_LADDER_HYBRID_1V2A_MASTER_NAME, _LADDER_HYBRID_1V2A_SQL)
+
+
+def _generate_ladder_hybrid_2v2a() -> None:
+    """Two muxed variants beside two rows of an audio group: the hybrid
+    shape with both counts many."""
+    _compile_ladder(_LADDER_HYBRID_2V2A_MASTER_NAME, _LADDER_HYBRID_2V2A_SQL)
 
 
 def _attr_value(line: str, key: str) -> str:
@@ -877,6 +1061,14 @@ def main() -> int:
     _generate_ladder_demuxed_hls()
     _generate_ladder_audio_only()
     _generate_ladder_hybrid()
+    _generate_ladder_video_only()
+    _generate_ladder_muxed_1v()
+    _generate_ladder_demuxed_1v1a()
+    _generate_ladder_demuxed_1v2a()
+    _generate_ladder_demuxed_2v2a()
+    _generate_ladder_hybrid_1v1a()
+    _generate_ladder_hybrid_1v2a()
+    _generate_ladder_hybrid_2v2a()
     return 0
 
 

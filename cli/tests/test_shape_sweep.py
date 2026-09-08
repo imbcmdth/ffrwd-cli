@@ -52,6 +52,8 @@ from pathlib import Path
 
 import pytest
 
+from ffrwd.probe import ProbeResult, probe
+
 from . import test_refusal_snapshot as snapshot
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -141,28 +143,26 @@ SOURCES: tuple[Stand, ...] = (
         f"two video tracks, two audio tracks -- both columns arrays; {_FILE_ROWS}",
     ),
     Stand(
-        "1 manifest 1 video", None, None, None,
-        "nothing stands for it: every ladder here carries audio somewhere, and the "
-        "one video-only manifest would be a new fixture rather than a flag on an "
-        "existing one",
+        "1 manifest 1 video", "tests/fixtures/ladder-video-only/master.m3u8", 720, "audio_0",
+        f"one video rendition and no audio anywhere; {_NO_AUDIO_ROW}",
     ),
     Stand(
         "1 manifest 1 audio", "tests/fixtures/ladder-audio-only/master.m3u8", 720, "audio_0",
         f"one audio rendition and no video row at all; {_NO_VIDEO_ROW}",
     ),
     Stand(
-        "1 manifest - muxed 1 video + audio", None, None, None,
-        "nothing stands for it: the muxed ladder has two rungs, and a one-rung "
-        "ladder is another real encode rather than a flag on it",
+        "1 manifest - muxed 1 video + audio",
+        "tests/fixtures/ladder-muxed-1v/master.m3u8", 720, "audio_0",
+        f"one variant carrying its own video and audio; {_NO_AUDIO_ROW}",
     ),
     Stand(
         "1 manifest - muxed M video + audio", "tests/fixtures/ladder/master.m3u8", 720, "audio_0",
         f"two variants, each carrying its own video and audio; {_NO_AUDIO_ROW}",
     ),
     Stand(
-        "1 manifest - demuxed 1 video 1 audio", None, None, None,
-        "nothing stands for it: the demuxed ladders have two video rungs, and a "
-        "one-rung one is another real encode",
+        "1 manifest - demuxed 1 video 1 audio",
+        "tests/fixtures/ladder-demuxed-1v1a/master.m3u8", 720, "audio_1",
+        "one video-only variant and the audio group's own row",
     ),
     Stand(
         "1 manifest - demuxed M video 1 audio",
@@ -172,17 +172,22 @@ SOURCES: tuple[Stand, ...] = (
         "matrix names format 'hls', so this keeps the container out of the reading",
     ),
     Stand(
-        "1 manifest - demuxed 1 video M audio", None, None, None,
-        "nothing stands for it: no ladder here has two audio renditions",
+        "1 manifest - demuxed 1 video M audio",
+        "tests/fixtures/ladder-demuxed-1v2a/master.m3u8", 720, "audio_1",
+        "one video-only variant and two rows of its audio group; the name is the "
+        "eng row's, the fra one beside it",
     ),
     Stand(
-        "1 manifest - demuxed M video N audio", None, None, None,
-        "nothing stands for it: no ladder here has two audio renditions",
+        "1 manifest - demuxed M video N audio",
+        "tests/fixtures/ladder-demuxed-2v2a/master.m3u8", 720, "audio_2",
+        "two video-only variants and two rows of their audio group; the height is "
+        "the 720p rung's, the 1080p one beside it, and the name the eng row's",
     ),
     Stand(
-        "1 manifest - hybrid 1 video + audio 1 audio", None, None, None,
-        "nothing stands for it: the hybrid ladder has two muxed variants, and a "
-        "one-variant one is another composed playlist",
+        "1 manifest - hybrid 1 video + audio 1 audio",
+        "tests/fixtures/ladder-hybrid-1v1a/master.m3u8", 720, "audio_1",
+        "one variant that muxes its own audio AND names an audio group, plus that "
+        "group's own row",
     ),
     Stand(
         "1 manifest - hybrid M video + audio 1 audio",
@@ -191,12 +196,16 @@ SOURCES: tuple[Stand, ...] = (
         "group's own row",
     ),
     Stand(
-        "1 manifest - hybrid 1 video + audio M audio", None, None, None,
-        "nothing stands for it: no ladder here has two audio renditions",
+        "1 manifest - hybrid 1 video + audio M audio",
+        "tests/fixtures/ladder-hybrid-1v2a/master.m3u8", 720, "audio_1",
+        "one muxed variant and two rows of its audio group; the name is the eng "
+        "row's, the fra one beside it",
     ),
     Stand(
-        "1 manifest - hybrid M video + audio N audio", None, None, None,
-        "nothing stands for it: no ladder here has two audio renditions",
+        "1 manifest - hybrid M video + audio N audio",
+        "tests/fixtures/ladder-hybrid-2v2a/master.m3u8", 720, "audio_2",
+        "two muxed variants and two rows of their audio group; the height is the "
+        "720p variant's, the 1080p one beside it, and the name the eng row's",
     ),
 )
 
@@ -287,6 +296,19 @@ def _references_bare(sql: str, name: str) -> bool:
             return True
         at = sql.find(marker, after)
     return False
+
+
+def _named_by(variable: str) -> set[str]:
+    """Every input shape some cell of whose row names `variable`.
+
+    `_bindings`' own rule, asked the other way round: which rows are handed a
+    value at all, and so which stands have to name a row that is really there.
+    """
+    return {
+        cell.input
+        for cell in _QUERIES
+        if f":'{variable}'" in cell.sql or _references_bare(cell.sql, variable)
+    }
 
 
 def _row(cell: Cell, verdict: str, **extra: object) -> Row:
@@ -381,6 +403,63 @@ def _fixtures() -> None:
 
 
 # ---------------------------------------------------------------------------
+# what a shape label claims
+# ---------------------------------------------------------------------------
+
+# What an M or an N is in this fixture set.
+_MANY = 2
+
+
+def _count(word: str) -> int:
+    """A shape label's ``0``, ``1``, ``M`` or ``N`` as a number."""
+    return _MANY if word in ("M", "N") else int(word)
+
+
+def _claimed_tracks(shape: str) -> tuple[int, int]:
+    """The (video, audio) track counts a ``1 file ...`` label claims."""
+    words = shape.split()
+    return _count(words[2]), _count(words[5])
+
+
+def _claimed_renditions(shape: str) -> tuple[int, int, int]:
+    """The (muxed, video-only, audio-only) rendition counts a manifest label
+    claims.
+
+    ``1 manifest 1 video`` and ``1 manifest 1 audio`` name their one kind
+    outright. Every other label names a kind -- muxed, demuxed or hybrid --
+    and then its counts, always in the same positions.
+    """
+    words = shape.split()
+    if words[2] != "-":
+        return (0, 1, 0) if words[3] == "video" else (0, 0, 1)
+    if words[3] == "muxed":  # muxed M video + audio
+        return _count(words[4]), 0, 0
+    if words[3] == "demuxed":  # demuxed M video N audio
+        return 0, _count(words[4]), _count(words[6])
+    return _count(words[4]), 0, _count(words[8])  # hybrid M video + audio N audio
+
+
+def _read_tracks(parsed: ProbeResult) -> tuple[int, int]:
+    """A file's own (video, audio) track counts."""
+    kinds = [stream.type for stream in parsed.streams]
+    return kinds.count("video"), kinds.count("audio")
+
+
+def _read_renditions(parsed: ProbeResult) -> tuple[int, int, int]:
+    """A manifest's (muxed, video-only, audio-only) rendition counts."""
+    muxed = video = audio = 0
+    for rendition in parsed.renditions:
+        kinds = {stream.type for stream in rendition.streams}
+        if {"video", "audio"} <= kinds:
+            muxed += 1
+        elif "video" in kinds:
+            video += 1
+        elif "audio" in kinds:
+            audio += 1
+    return muxed, video, audio
+
+
+# ---------------------------------------------------------------------------
 # the checks
 # ---------------------------------------------------------------------------
 
@@ -402,6 +481,37 @@ def test_every_named_fixture_is_one_the_generator_writes(_fixtures: None) -> Non
     for stand in SOURCES:
         if stand.fixture is not None:
             assert (PROJECT_ROOT / stand.fixture).exists(), stand.fixture
+
+
+@pytest.mark.exec
+def test_every_fixture_reads_back_as_the_shape_it_stands_for(_fixtures: None) -> None:
+    """Probed, each fixture really has the tracks or renditions its row's own
+    label claims, and each bound value picks exactly one row of it.
+
+    A cell that refuses because its fixture is subtly the wrong shape -- or
+    because ``:h``/``:'audio'`` matched nothing and emptied the relation -- is
+    a refusal about the fixture rather than about the compiler, and worse than
+    no measurement at all.
+    """
+    by_height = _named_by("h")
+    by_name = _named_by("audio")
+    for stand in SOURCES:
+        if stand.fixture is None:
+            continue
+        parsed = probe(str(PROJECT_ROOT / stand.fixture))
+        assert parsed is not None, f"{stand.shape}: ffprobe read nothing from {stand.fixture}"
+        if stand.shape.startswith("1 file"):
+            assert _read_tracks(parsed) == _claimed_tracks(stand.shape), stand.shape
+        else:
+            assert _read_renditions(parsed) == _claimed_renditions(stand.shape), stand.shape
+        if stand.shape in by_height:
+            matched = [r for r in parsed.renditions if r.height == stand.height]
+            assert len(matched) == 1, f"{stand.shape}: height {stand.height}"
+        if stand.shape in by_name:
+            matched = [
+                r for r in parsed.renditions if r.height is None and r.name == stand.name
+            ]
+            assert len(matched) == 1, f"{stand.shape}: name {stand.name!r}"
 
 
 def test_the_baseline_covers_every_cell() -> None:

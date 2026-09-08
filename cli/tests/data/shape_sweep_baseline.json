@@ -984,122 +984,102 @@
     "09->01": {
       "input": "1 manifest 1 video",
       "output": "1 file 1 video track 0 audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: every ladder here carries audio somewhere, and the one video-only manifest would be a new fixture rather than a flag on an existing one"
+      "verdict": "compiled"
     },
     "09->02": {
       "input": "1 manifest 1 video",
       "output": "1 file 0 video track 1 audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: every ladder here carries audio somewhere, and the one video-only manifest would be a new fixture rather than a flag on an existing one"
+      "verdict": "compiled"
     },
     "09->03": {
       "input": "1 manifest 1 video",
       "output": "1 file M video track 0 audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: every ladder here carries audio somewhere, and the one video-only manifest would be a new fixture rather than a flag on an existing one"
+      "verdict": "compiled"
     },
     "09->04": {
       "input": "1 manifest 1 video",
       "output": "1 file 0 video track M audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: every ladder here carries audio somewhere, and the one video-only manifest would be a new fixture rather than a flag on an existing one"
+      "verdict": "compiled"
     },
     "09->05": {
       "input": "1 manifest 1 video",
       "output": "1 file 1 video track 1 audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: every ladder here carries audio somewhere, and the one video-only manifest would be a new fixture rather than a flag on an existing one"
+      "verdict": "compiled"
     },
     "09->06": {
       "input": "1 manifest 1 video",
       "output": "1 file 1 video track M audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: every ladder here carries audio somewhere, and the one video-only manifest would be a new fixture rather than a flag on an existing one"
+      "verdict": "compiled"
     },
     "09->07": {
       "input": "1 manifest 1 video",
       "output": "1 file M video track 1 audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: every ladder here carries audio somewhere, and the one video-only manifest would be a new fixture rather than a flag on an existing one"
+      "verdict": "compiled"
     },
     "09->08": {
       "input": "1 manifest 1 video",
       "output": "1 file M video track N audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: every ladder here carries audio somewhere, and the one video-only manifest would be a new fixture rather than a flag on an existing one"
+      "verdict": "compiled"
     },
     "09->09": {
       "input": "1 manifest 1 video",
       "output": "1 manifest 1 video",
-      "verdict": "unrun",
-      "why": "nothing stands for it: every ladder here carries audio somewhere, and the one video-only manifest would be a new fixture rather than a flag on an existing one"
+      "verdict": "compiled"
     },
     "09->10": {
       "input": "1 manifest 1 video",
       "output": "1 manifest 1 audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: every ladder here carries audio somewhere, and the one video-only manifest would be a new fixture rather than a flag on an existing one"
+      "verdict": "compiled"
     },
     "09->11": {
       "input": "1 manifest 1 video",
       "output": "1 manifest - muxed 1 video + audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: every ladder here carries audio somewhere, and the one video-only manifest would be a new fixture rather than a flag on an existing one"
+      "verdict": "compiled"
     },
     "09->12": {
       "input": "1 manifest 1 video",
       "output": "1 manifest - muxed M video + audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: every ladder here carries audio somewhere, and the one video-only manifest would be a new fixture rather than a flag on an existing one"
+      "verdict": "compiled"
     },
     "09->13": {
       "input": "1 manifest 1 video",
       "output": "1 manifest - demuxed 1 video 1 audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: every ladder here carries audio somewhere, and the one video-only manifest would be a new fixture rather than a flag on an existing one"
+      "verdict": "compiled"
     },
     "09->14": {
       "input": "1 manifest 1 video",
       "output": "1 manifest - demuxed M video 1 audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: every ladder here carries audio somewhere, and the one video-only manifest would be a new fixture rather than a flag on an existing one"
+      "verdict": "compiled"
     },
     "09->15": {
       "input": "1 manifest 1 video",
       "output": "1 manifest - demuxed 1 video M audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: every ladder here carries audio somewhere, and the one video-only manifest would be a new fixture rather than a flag on an existing one"
+      "verdict": "compiled"
     },
     "09->16": {
       "input": "1 manifest 1 video",
       "output": "1 manifest - demuxed M video N audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: every ladder here carries audio somewhere, and the one video-only manifest would be a new fixture rather than a flag on an existing one"
+      "verdict": "compiled"
     },
     "09->17": {
       "input": "1 manifest 1 video",
       "output": "1 manifest - hybrid 1 video + audio 1 audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: every ladder here carries audio somewhere, and the one video-only manifest would be a new fixture rather than a flag on an existing one"
+      "verdict": "compiled"
     },
     "09->18": {
       "input": "1 manifest 1 video",
       "output": "1 manifest - hybrid M video + audio 1 audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: every ladder here carries audio somewhere, and the one video-only manifest would be a new fixture rather than a flag on an existing one"
+      "verdict": "compiled"
     },
     "09->19": {
       "input": "1 manifest 1 video",
       "output": "1 manifest - hybrid 1 video + audio M audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: every ladder here carries audio somewhere, and the one video-only manifest would be a new fixture rather than a flag on an existing one"
+      "verdict": "compiled"
     },
     "09->20": {
       "input": "1 manifest 1 video",
       "output": "1 manifest - hybrid M video + audio N audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: every ladder here carries audio somewhere, and the one video-only manifest would be a new fixture rather than a flag on an existing one"
+      "verdict": "compiled"
     },
     "10->00": {
       "input": "1 manifest 1 audio",
@@ -1216,122 +1196,102 @@
     "11->01": {
       "input": "1 manifest - muxed 1 video + audio",
       "output": "1 file 1 video track 0 audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: the muxed ladder has two rungs, and a one-rung ladder is another real encode rather than a flag on it"
+      "verdict": "compiled"
     },
     "11->02": {
       "input": "1 manifest - muxed 1 video + audio",
       "output": "1 file 0 video track 1 audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: the muxed ladder has two rungs, and a one-rung ladder is another real encode rather than a flag on it"
+      "verdict": "compiled"
     },
     "11->03": {
       "input": "1 manifest - muxed 1 video + audio",
       "output": "1 file M video track 0 audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: the muxed ladder has two rungs, and a one-rung ladder is another real encode rather than a flag on it"
+      "verdict": "compiled"
     },
     "11->04": {
       "input": "1 manifest - muxed 1 video + audio",
       "output": "1 file 0 video track M audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: the muxed ladder has two rungs, and a one-rung ladder is another real encode rather than a flag on it"
+      "verdict": "compiled"
     },
     "11->05": {
       "input": "1 manifest - muxed 1 video + audio",
       "output": "1 file 1 video track 1 audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: the muxed ladder has two rungs, and a one-rung ladder is another real encode rather than a flag on it"
+      "verdict": "compiled"
     },
     "11->06": {
       "input": "1 manifest - muxed 1 video + audio",
       "output": "1 file 1 video track M audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: the muxed ladder has two rungs, and a one-rung ladder is another real encode rather than a flag on it"
+      "verdict": "compiled"
     },
     "11->07": {
       "input": "1 manifest - muxed 1 video + audio",
       "output": "1 file M video track 1 audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: the muxed ladder has two rungs, and a one-rung ladder is another real encode rather than a flag on it"
+      "verdict": "compiled"
     },
     "11->08": {
       "input": "1 manifest - muxed 1 video + audio",
       "output": "1 file M video track N audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: the muxed ladder has two rungs, and a one-rung ladder is another real encode rather than a flag on it"
+      "verdict": "compiled"
     },
     "11->09": {
       "input": "1 manifest - muxed 1 video + audio",
       "output": "1 manifest 1 video",
-      "verdict": "unrun",
-      "why": "nothing stands for it: the muxed ladder has two rungs, and a one-rung ladder is another real encode rather than a flag on it"
+      "verdict": "compiled"
     },
     "11->10": {
       "input": "1 manifest - muxed 1 video + audio",
       "output": "1 manifest 1 audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: the muxed ladder has two rungs, and a one-rung ladder is another real encode rather than a flag on it"
+      "verdict": "compiled"
     },
     "11->11": {
       "input": "1 manifest - muxed 1 video + audio",
       "output": "1 manifest - muxed 1 video + audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: the muxed ladder has two rungs, and a one-rung ladder is another real encode rather than a flag on it"
+      "verdict": "compiled"
     },
     "11->12": {
       "input": "1 manifest - muxed 1 video + audio",
       "output": "1 manifest - muxed M video + audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: the muxed ladder has two rungs, and a one-rung ladder is another real encode rather than a flag on it"
+      "verdict": "compiled"
     },
     "11->13": {
       "input": "1 manifest - muxed 1 video + audio",
       "output": "1 manifest - demuxed 1 video 1 audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: the muxed ladder has two rungs, and a one-rung ladder is another real encode rather than a flag on it"
+      "verdict": "compiled"
     },
     "11->14": {
       "input": "1 manifest - muxed 1 video + audio",
       "output": "1 manifest - demuxed M video 1 audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: the muxed ladder has two rungs, and a one-rung ladder is another real encode rather than a flag on it"
+      "verdict": "compiled"
     },
     "11->15": {
       "input": "1 manifest - muxed 1 video + audio",
       "output": "1 manifest - demuxed 1 video M audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: the muxed ladder has two rungs, and a one-rung ladder is another real encode rather than a flag on it"
+      "verdict": "compiled"
     },
     "11->16": {
       "input": "1 manifest - muxed 1 video + audio",
       "output": "1 manifest - demuxed M video N audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: the muxed ladder has two rungs, and a one-rung ladder is another real encode rather than a flag on it"
+      "verdict": "compiled"
     },
     "11->17": {
       "input": "1 manifest - muxed 1 video + audio",
       "output": "1 manifest - hybrid 1 video + audio 1 audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: the muxed ladder has two rungs, and a one-rung ladder is another real encode rather than a flag on it"
+      "verdict": "compiled"
     },
     "11->18": {
       "input": "1 manifest - muxed 1 video + audio",
       "output": "1 manifest - hybrid M video + audio 1 audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: the muxed ladder has two rungs, and a one-rung ladder is another real encode rather than a flag on it"
+      "verdict": "compiled"
     },
     "11->19": {
       "input": "1 manifest - muxed 1 video + audio",
       "output": "1 manifest - hybrid 1 video + audio M audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: the muxed ladder has two rungs, and a one-rung ladder is another real encode rather than a flag on it"
+      "verdict": "compiled"
     },
     "11->20": {
       "input": "1 manifest - muxed 1 video + audio",
       "output": "1 manifest - hybrid M video + audio N audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: the muxed ladder has two rungs, and a one-rung ladder is another real encode rather than a flag on it"
+      "verdict": "compiled"
     },
     "12->00": {
       "input": "1 manifest - muxed M video + audio",
@@ -1448,122 +1408,102 @@
     "13->01": {
       "input": "1 manifest - demuxed 1 video 1 audio",
       "output": "1 file 1 video track 0 audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: the demuxed ladders have two video rungs, and a one-rung one is another real encode"
+      "verdict": "compiled"
     },
     "13->02": {
       "input": "1 manifest - demuxed 1 video 1 audio",
       "output": "1 file 0 video track 1 audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: the demuxed ladders have two video rungs, and a one-rung one is another real encode"
+      "verdict": "compiled"
     },
     "13->03": {
       "input": "1 manifest - demuxed 1 video 1 audio",
       "output": "1 file M video track 0 audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: the demuxed ladders have two video rungs, and a one-rung one is another real encode"
+      "verdict": "compiled"
     },
     "13->04": {
       "input": "1 manifest - demuxed 1 video 1 audio",
       "output": "1 file 0 video track M audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: the demuxed ladders have two video rungs, and a one-rung one is another real encode"
+      "verdict": "compiled"
     },
     "13->05": {
       "input": "1 manifest - demuxed 1 video 1 audio",
       "output": "1 file 1 video track 1 audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: the demuxed ladders have two video rungs, and a one-rung one is another real encode"
+      "verdict": "compiled"
     },
     "13->06": {
       "input": "1 manifest - demuxed 1 video 1 audio",
       "output": "1 file 1 video track M audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: the demuxed ladders have two video rungs, and a one-rung one is another real encode"
+      "verdict": "compiled"
     },
     "13->07": {
       "input": "1 manifest - demuxed 1 video 1 audio",
       "output": "1 file M video track 1 audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: the demuxed ladders have two video rungs, and a one-rung one is another real encode"
+      "verdict": "compiled"
     },
     "13->08": {
       "input": "1 manifest - demuxed 1 video 1 audio",
       "output": "1 file M video track N audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: the demuxed ladders have two video rungs, and a one-rung one is another real encode"
+      "verdict": "compiled"
     },
     "13->09": {
       "input": "1 manifest - demuxed 1 video 1 audio",
       "output": "1 manifest 1 video",
-      "verdict": "unrun",
-      "why": "nothing stands for it: the demuxed ladders have two video rungs, and a one-rung one is another real encode"
+      "verdict": "compiled"
     },
     "13->10": {
       "input": "1 manifest - demuxed 1 video 1 audio",
       "output": "1 manifest 1 audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: the demuxed ladders have two video rungs, and a one-rung one is another real encode"
+      "verdict": "compiled"
     },
     "13->11": {
       "input": "1 manifest - demuxed 1 video 1 audio",
       "output": "1 manifest - muxed 1 video + audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: the demuxed ladders have two video rungs, and a one-rung one is another real encode"
+      "verdict": "compiled"
     },
     "13->12": {
       "input": "1 manifest - demuxed 1 video 1 audio",
       "output": "1 manifest - muxed M video + audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: the demuxed ladders have two video rungs, and a one-rung one is another real encode"
+      "verdict": "compiled"
     },
     "13->13": {
       "input": "1 manifest - demuxed 1 video 1 audio",
       "output": "1 manifest - demuxed 1 video 1 audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: the demuxed ladders have two video rungs, and a one-rung one is another real encode"
+      "verdict": "compiled"
     },
     "13->14": {
       "input": "1 manifest - demuxed 1 video 1 audio",
       "output": "1 manifest - demuxed M video 1 audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: the demuxed ladders have two video rungs, and a one-rung one is another real encode"
+      "verdict": "compiled"
     },
     "13->15": {
       "input": "1 manifest - demuxed 1 video 1 audio",
       "output": "1 manifest - demuxed 1 video M audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: the demuxed ladders have two video rungs, and a one-rung one is another real encode"
+      "verdict": "compiled"
     },
     "13->16": {
       "input": "1 manifest - demuxed 1 video 1 audio",
       "output": "1 manifest - demuxed M video N audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: the demuxed ladders have two video rungs, and a one-rung one is another real encode"
+      "verdict": "compiled"
     },
     "13->17": {
       "input": "1 manifest - demuxed 1 video 1 audio",
       "output": "1 manifest - hybrid 1 video + audio 1 audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: the demuxed ladders have two video rungs, and a one-rung one is another real encode"
+      "verdict": "compiled"
     },
     "13->18": {
       "input": "1 manifest - demuxed 1 video 1 audio",
       "output": "1 manifest - hybrid M video + audio 1 audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: the demuxed ladders have two video rungs, and a one-rung one is another real encode"
+      "verdict": "compiled"
     },
     "13->19": {
       "input": "1 manifest - demuxed 1 video 1 audio",
       "output": "1 manifest - hybrid 1 video + audio M audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: the demuxed ladders have two video rungs, and a one-rung one is another real encode"
+      "verdict": "compiled"
     },
     "13->20": {
       "input": "1 manifest - demuxed 1 video 1 audio",
       "output": "1 manifest - hybrid M video + audio N audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: the demuxed ladders have two video rungs, and a one-rung one is another real encode"
+      "verdict": "compiled"
     },
     "14->00": {
       "input": "1 manifest - demuxed M video 1 audio",
@@ -1680,122 +1620,102 @@
     "15->01": {
       "input": "1 manifest - demuxed 1 video M audio",
       "output": "1 file 1 video track 0 audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "15->02": {
       "input": "1 manifest - demuxed 1 video M audio",
       "output": "1 file 0 video track 1 audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "15->03": {
       "input": "1 manifest - demuxed 1 video M audio",
       "output": "1 file M video track 0 audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "15->04": {
       "input": "1 manifest - demuxed 1 video M audio",
       "output": "1 file 0 video track M audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "15->05": {
       "input": "1 manifest - demuxed 1 video M audio",
       "output": "1 file 1 video track 1 audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "15->06": {
       "input": "1 manifest - demuxed 1 video M audio",
       "output": "1 file 1 video track M audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "15->07": {
       "input": "1 manifest - demuxed 1 video M audio",
       "output": "1 file M video track 1 audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "15->08": {
       "input": "1 manifest - demuxed 1 video M audio",
       "output": "1 file M video track N audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "15->09": {
       "input": "1 manifest - demuxed 1 video M audio",
       "output": "1 manifest 1 video",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "15->10": {
       "input": "1 manifest - demuxed 1 video M audio",
       "output": "1 manifest 1 audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "15->11": {
       "input": "1 manifest - demuxed 1 video M audio",
       "output": "1 manifest - muxed 1 video + audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "15->12": {
       "input": "1 manifest - demuxed 1 video M audio",
       "output": "1 manifest - muxed M video + audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "15->13": {
       "input": "1 manifest - demuxed 1 video M audio",
       "output": "1 manifest - demuxed 1 video 1 audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "15->14": {
       "input": "1 manifest - demuxed 1 video M audio",
       "output": "1 manifest - demuxed M video 1 audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "15->15": {
       "input": "1 manifest - demuxed 1 video M audio",
       "output": "1 manifest - demuxed 1 video M audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "15->16": {
       "input": "1 manifest - demuxed 1 video M audio",
       "output": "1 manifest - demuxed M video N audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "15->17": {
       "input": "1 manifest - demuxed 1 video M audio",
       "output": "1 manifest - hybrid 1 video + audio 1 audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "15->18": {
       "input": "1 manifest - demuxed 1 video M audio",
       "output": "1 manifest - hybrid M video + audio 1 audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "15->19": {
       "input": "1 manifest - demuxed 1 video M audio",
       "output": "1 manifest - hybrid 1 video + audio M audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "15->20": {
       "input": "1 manifest - demuxed 1 video M audio",
       "output": "1 manifest - hybrid M video + audio N audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "16->00": {
       "input": "1 manifest - demuxed M video N audio",
@@ -1806,122 +1726,102 @@
     "16->01": {
       "input": "1 manifest - demuxed M video N audio",
       "output": "1 file 1 video track 0 audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "16->02": {
       "input": "1 manifest - demuxed M video N audio",
       "output": "1 file 0 video track 1 audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "16->03": {
       "input": "1 manifest - demuxed M video N audio",
       "output": "1 file M video track 0 audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "16->04": {
       "input": "1 manifest - demuxed M video N audio",
       "output": "1 file 0 video track M audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "16->05": {
       "input": "1 manifest - demuxed M video N audio",
       "output": "1 file 1 video track 1 audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "16->06": {
       "input": "1 manifest - demuxed M video N audio",
       "output": "1 file 1 video track M audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "16->07": {
       "input": "1 manifest - demuxed M video N audio",
       "output": "1 file M video track 1 audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "16->08": {
       "input": "1 manifest - demuxed M video N audio",
       "output": "1 file M video track N audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "16->09": {
       "input": "1 manifest - demuxed M video N audio",
       "output": "1 manifest 1 video",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "16->10": {
       "input": "1 manifest - demuxed M video N audio",
       "output": "1 manifest 1 audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "16->11": {
       "input": "1 manifest - demuxed M video N audio",
       "output": "1 manifest - muxed 1 video + audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "16->12": {
       "input": "1 manifest - demuxed M video N audio",
       "output": "1 manifest - muxed M video + audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "16->13": {
       "input": "1 manifest - demuxed M video N audio",
       "output": "1 manifest - demuxed 1 video 1 audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "16->14": {
       "input": "1 manifest - demuxed M video N audio",
       "output": "1 manifest - demuxed M video 1 audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "16->15": {
       "input": "1 manifest - demuxed M video N audio",
       "output": "1 manifest - demuxed 1 video M audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "16->16": {
       "input": "1 manifest - demuxed M video N audio",
       "output": "1 manifest - demuxed M video N audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "16->17": {
       "input": "1 manifest - demuxed M video N audio",
       "output": "1 manifest - hybrid 1 video + audio 1 audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "16->18": {
       "input": "1 manifest - demuxed M video N audio",
       "output": "1 manifest - hybrid M video + audio 1 audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "16->19": {
       "input": "1 manifest - demuxed M video N audio",
       "output": "1 manifest - hybrid 1 video + audio M audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "16->20": {
       "input": "1 manifest - demuxed M video N audio",
       "output": "1 manifest - hybrid M video + audio N audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "17->00": {
       "input": "1 manifest - hybrid 1 video + audio 1 audio",
@@ -1932,122 +1832,102 @@
     "17->01": {
       "input": "1 manifest - hybrid 1 video + audio 1 audio",
       "output": "1 file 1 video track 0 audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: the hybrid ladder has two muxed variants, and a one-variant one is another composed playlist"
+      "verdict": "compiled"
     },
     "17->02": {
       "input": "1 manifest - hybrid 1 video + audio 1 audio",
       "output": "1 file 0 video track 1 audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: the hybrid ladder has two muxed variants, and a one-variant one is another composed playlist"
+      "verdict": "compiled"
     },
     "17->03": {
       "input": "1 manifest - hybrid 1 video + audio 1 audio",
       "output": "1 file M video track 0 audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: the hybrid ladder has two muxed variants, and a one-variant one is another composed playlist"
+      "verdict": "compiled"
     },
     "17->04": {
       "input": "1 manifest - hybrid 1 video + audio 1 audio",
       "output": "1 file 0 video track M audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: the hybrid ladder has two muxed variants, and a one-variant one is another composed playlist"
+      "verdict": "compiled"
     },
     "17->05": {
       "input": "1 manifest - hybrid 1 video + audio 1 audio",
       "output": "1 file 1 video track 1 audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: the hybrid ladder has two muxed variants, and a one-variant one is another composed playlist"
+      "verdict": "compiled"
     },
     "17->06": {
       "input": "1 manifest - hybrid 1 video + audio 1 audio",
       "output": "1 file 1 video track M audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: the hybrid ladder has two muxed variants, and a one-variant one is another composed playlist"
+      "verdict": "compiled"
     },
     "17->07": {
       "input": "1 manifest - hybrid 1 video + audio 1 audio",
       "output": "1 file M video track 1 audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: the hybrid ladder has two muxed variants, and a one-variant one is another composed playlist"
+      "verdict": "compiled"
     },
     "17->08": {
       "input": "1 manifest - hybrid 1 video + audio 1 audio",
       "output": "1 file M video track N audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: the hybrid ladder has two muxed variants, and a one-variant one is another composed playlist"
+      "verdict": "compiled"
     },
     "17->09": {
       "input": "1 manifest - hybrid 1 video + audio 1 audio",
       "output": "1 manifest 1 video",
-      "verdict": "unrun",
-      "why": "nothing stands for it: the hybrid ladder has two muxed variants, and a one-variant one is another composed playlist"
+      "verdict": "compiled"
     },
     "17->10": {
       "input": "1 manifest - hybrid 1 video + audio 1 audio",
       "output": "1 manifest 1 audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: the hybrid ladder has two muxed variants, and a one-variant one is another composed playlist"
+      "verdict": "compiled"
     },
     "17->11": {
       "input": "1 manifest - hybrid 1 video + audio 1 audio",
       "output": "1 manifest - muxed 1 video + audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: the hybrid ladder has two muxed variants, and a one-variant one is another composed playlist"
+      "verdict": "compiled"
     },
     "17->12": {
       "input": "1 manifest - hybrid 1 video + audio 1 audio",
       "output": "1 manifest - muxed M video + audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: the hybrid ladder has two muxed variants, and a one-variant one is another composed playlist"
+      "verdict": "compiled"
     },
     "17->13": {
       "input": "1 manifest - hybrid 1 video + audio 1 audio",
       "output": "1 manifest - demuxed 1 video 1 audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: the hybrid ladder has two muxed variants, and a one-variant one is another composed playlist"
+      "verdict": "compiled"
     },
     "17->14": {
       "input": "1 manifest - hybrid 1 video + audio 1 audio",
       "output": "1 manifest - demuxed M video 1 audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: the hybrid ladder has two muxed variants, and a one-variant one is another composed playlist"
+      "verdict": "compiled"
     },
     "17->15": {
       "input": "1 manifest - hybrid 1 video + audio 1 audio",
       "output": "1 manifest - demuxed 1 video M audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: the hybrid ladder has two muxed variants, and a one-variant one is another composed playlist"
+      "verdict": "compiled"
     },
     "17->16": {
       "input": "1 manifest - hybrid 1 video + audio 1 audio",
       "output": "1 manifest - demuxed M video N audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: the hybrid ladder has two muxed variants, and a one-variant one is another composed playlist"
+      "verdict": "compiled"
     },
     "17->17": {
       "input": "1 manifest - hybrid 1 video + audio 1 audio",
       "output": "1 manifest - hybrid 1 video + audio 1 audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: the hybrid ladder has two muxed variants, and a one-variant one is another composed playlist"
+      "verdict": "compiled"
     },
     "17->18": {
       "input": "1 manifest - hybrid 1 video + audio 1 audio",
       "output": "1 manifest - hybrid M video + audio 1 audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: the hybrid ladder has two muxed variants, and a one-variant one is another composed playlist"
+      "verdict": "compiled"
     },
     "17->19": {
       "input": "1 manifest - hybrid 1 video + audio 1 audio",
       "output": "1 manifest - hybrid 1 video + audio M audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: the hybrid ladder has two muxed variants, and a one-variant one is another composed playlist"
+      "verdict": "compiled"
     },
     "17->20": {
       "input": "1 manifest - hybrid 1 video + audio 1 audio",
       "output": "1 manifest - hybrid M video + audio N audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: the hybrid ladder has two muxed variants, and a one-variant one is another composed playlist"
+      "verdict": "compiled"
     },
     "18->00": {
       "input": "1 manifest - hybrid M video + audio 1 audio",
@@ -2164,122 +2044,102 @@
     "19->01": {
       "input": "1 manifest - hybrid 1 video + audio M audio",
       "output": "1 file 1 video track 0 audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "19->02": {
       "input": "1 manifest - hybrid 1 video + audio M audio",
       "output": "1 file 0 video track 1 audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "19->03": {
       "input": "1 manifest - hybrid 1 video + audio M audio",
       "output": "1 file M video track 0 audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "19->04": {
       "input": "1 manifest - hybrid 1 video + audio M audio",
       "output": "1 file 0 video track M audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "19->05": {
       "input": "1 manifest - hybrid 1 video + audio M audio",
       "output": "1 file 1 video track 1 audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "19->06": {
       "input": "1 manifest - hybrid 1 video + audio M audio",
       "output": "1 file 1 video track M audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "19->07": {
       "input": "1 manifest - hybrid 1 video + audio M audio",
       "output": "1 file M video track 1 audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "19->08": {
       "input": "1 manifest - hybrid 1 video + audio M audio",
       "output": "1 file M video track N audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "19->09": {
       "input": "1 manifest - hybrid 1 video + audio M audio",
       "output": "1 manifest 1 video",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "19->10": {
       "input": "1 manifest - hybrid 1 video + audio M audio",
       "output": "1 manifest 1 audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "19->11": {
       "input": "1 manifest - hybrid 1 video + audio M audio",
       "output": "1 manifest - muxed 1 video + audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "19->12": {
       "input": "1 manifest - hybrid 1 video + audio M audio",
       "output": "1 manifest - muxed M video + audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "19->13": {
       "input": "1 manifest - hybrid 1 video + audio M audio",
       "output": "1 manifest - demuxed 1 video 1 audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "19->14": {
       "input": "1 manifest - hybrid 1 video + audio M audio",
       "output": "1 manifest - demuxed M video 1 audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "19->15": {
       "input": "1 manifest - hybrid 1 video + audio M audio",
       "output": "1 manifest - demuxed 1 video M audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "19->16": {
       "input": "1 manifest - hybrid 1 video + audio M audio",
       "output": "1 manifest - demuxed M video N audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "19->17": {
       "input": "1 manifest - hybrid 1 video + audio M audio",
       "output": "1 manifest - hybrid 1 video + audio 1 audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "19->18": {
       "input": "1 manifest - hybrid 1 video + audio M audio",
       "output": "1 manifest - hybrid M video + audio 1 audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "19->19": {
       "input": "1 manifest - hybrid 1 video + audio M audio",
       "output": "1 manifest - hybrid 1 video + audio M audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "19->20": {
       "input": "1 manifest - hybrid 1 video + audio M audio",
       "output": "1 manifest - hybrid M video + audio N audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "20->00": {
       "input": "1 manifest - hybrid M video + audio N audio",
@@ -2290,122 +2150,102 @@
     "20->01": {
       "input": "1 manifest - hybrid M video + audio N audio",
       "output": "1 file 1 video track 0 audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "20->02": {
       "input": "1 manifest - hybrid M video + audio N audio",
       "output": "1 file 0 video track 1 audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "20->03": {
       "input": "1 manifest - hybrid M video + audio N audio",
       "output": "1 file M video track 0 audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "20->04": {
       "input": "1 manifest - hybrid M video + audio N audio",
       "output": "1 file 0 video track M audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "20->05": {
       "input": "1 manifest - hybrid M video + audio N audio",
       "output": "1 file 1 video track 1 audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "20->06": {
       "input": "1 manifest - hybrid M video + audio N audio",
       "output": "1 file 1 video track M audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "20->07": {
       "input": "1 manifest - hybrid M video + audio N audio",
       "output": "1 file M video track 1 audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "20->08": {
       "input": "1 manifest - hybrid M video + audio N audio",
       "output": "1 file M video track N audio track",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "20->09": {
       "input": "1 manifest - hybrid M video + audio N audio",
       "output": "1 manifest 1 video",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "20->10": {
       "input": "1 manifest - hybrid M video + audio N audio",
       "output": "1 manifest 1 audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "20->11": {
       "input": "1 manifest - hybrid M video + audio N audio",
       "output": "1 manifest - muxed 1 video + audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "20->12": {
       "input": "1 manifest - hybrid M video + audio N audio",
       "output": "1 manifest - muxed M video + audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "20->13": {
       "input": "1 manifest - hybrid M video + audio N audio",
       "output": "1 manifest - demuxed 1 video 1 audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "20->14": {
       "input": "1 manifest - hybrid M video + audio N audio",
       "output": "1 manifest - demuxed M video 1 audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "20->15": {
       "input": "1 manifest - hybrid M video + audio N audio",
       "output": "1 manifest - demuxed 1 video M audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "20->16": {
       "input": "1 manifest - hybrid M video + audio N audio",
       "output": "1 manifest - demuxed M video N audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "20->17": {
       "input": "1 manifest - hybrid M video + audio N audio",
       "output": "1 manifest - hybrid 1 video + audio 1 audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "20->18": {
       "input": "1 manifest - hybrid M video + audio N audio",
       "output": "1 manifest - hybrid M video + audio 1 audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "20->19": {
       "input": "1 manifest - hybrid M video + audio N audio",
       "output": "1 manifest - hybrid 1 video + audio M audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     },
     "20->20": {
       "input": "1 manifest - hybrid M video + audio N audio",
       "output": "1 manifest - hybrid M video + audio N audio",
-      "verdict": "unrun",
-      "why": "nothing stands for it: no ladder here has two audio renditions"
+      "verdict": "compiled"
     }
   }
 }
