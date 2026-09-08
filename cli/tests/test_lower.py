@@ -45,6 +45,7 @@ import pytest
 import sqlglot
 
 from ffrwd import compiler
+from ffrwd import filters as filters_module
 from ffrwd import lower as lower_module
 from ffrwd import registry as registry_module
 from ffrwd.compiler import compile_sql
@@ -5774,8 +5775,8 @@ def test_derived_n_input_spec_reproduces_the_original_table_exactly() -> None:
         assert dynamic is not None and dynamic.n_input, name
         options = registry.options(name)
         assert options is not None, name
-        spec = lower_module._n_input_spec(name, dynamic, options)
-        assert spec == lower_module._NInputFilter(
+        spec = filters_module._n_input_spec(name, dynamic, options)
+        assert spec == filters_module._NInputFilter(
             name=name,
             stream=stream,  # type: ignore[arg-type]
             output=output,  # type: ignore[arg-type]
