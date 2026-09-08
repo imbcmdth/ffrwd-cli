@@ -18,14 +18,14 @@ but an ffmpeg filtergraph carries video and audio only, so they may never be a
 filter input. Three rejections enforce that, all keyed off ``_PASSTHROUGH_ONLY``:
 
 * as a function argument, in EITHER tier -> ``UDF_ARG_TYPE``
-  (:meth:`_Lowerer._reject_passthrough_args`);
+  (:func:`ffrwd.calls._reject_passthrough_args`);
 * under a **CTE's** WHERE time range that is actually consumed in that branch ->
   ``UNSUPPORTED_SQL`` (:meth:`_Lowerer._access`). An INPUT alias's WHERE is not
   a filtergraph trim at all any more (see the WHERE bullet below), so it carries
   captions perfectly well; a CTE's window IS a filtergraph trim, so for it the
   rejection is permanent;
 * as a UNION ALL branch column -> ``UNSUPPORTED_SQL``
-  (:meth:`_Lowerer._check_concat_columns`; ``concat`` has ``v``/``a`` pads only).
+  (:func:`ffrwd.admit._check_concat_columns`; ``concat`` has ``v``/``a`` pads only).
 
 Everything else about them is ordinary: they lower to ``"src:<alias>:s:<k>"`` /
 ``"src:<alias>:d:<k>"`` refs, carry provenance (a caption track's ``language``
@@ -93,7 +93,7 @@ What lowering does, in order:
 
 Generated sources: ``FROM ffmpeg.<source>(...) a``
 --------------------------------------------------
-A source alias is the third kind of binding (:class:`_SourceBinding`), and
+A source alias is the third kind of binding (:class:`ffrwd.bindings._SourceBinding`), and
 it is the registry surface in TABLE position: the name resolves through
 ``Registry.get_source`` alone (never ``get``), and its options through the
 same ``Registry.options`` path a call's named arguments take, with the same
@@ -281,16 +281,101 @@ import binascii
 import difflib
 import json
 import math
-import re
 import struct
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from typing import Literal
 
 from sqlglot import exp
 
 from ffrwd import binaries, loudnorm
+from ffrwd.admit import (
+    _check_annotation_schema,
+    _check_coalesce_width,
+    _check_concat_columns,
+    _check_concat_signature,
+    _check_named_args,
+    _check_per_track_options,
+    _check_required_options,
+    _check_row_sink_arity,
+    _check_rows_argument,
+    _check_rows_schema,
+    _check_sink_shape,
+    _check_star_table_mode,
+    _check_stream_arity,
+    _check_tag_key,
+    _check_variadic_count,
+    _check_vector_dims,
+    _check_wasm_result_type,
+)
+from ffrwd.bindings import (
+    _RENDITION_SCHEMA,
+    RENDITION_COLUMN,
+    _Binding,
+    _CteBinding,
+    _CteRow,
+    _Env,
+    _has_track_rows,
+    _InputBinding,
+    _row_value_as_cell,
+    _RowBinding,
+    _RowRelation,
+    _RowTuple,
+    _SourceBinding,
+    _tags_to_cell,
+    _track_of,
+    _TrackRow,
+)
+from ffrwd.calls import (
+    _bad_count,
+    _bad_streams,
+    _macro_function_hint,
+    _macro_options,
+    _n_input_count,
+    _reject_null_stream,
+    _reject_passthrough_args,
+    _zip_length,
+)
+from ffrwd.ctes import (
+    _cte_cell_column,
+    _cte_column,
+    _cte_column_ref,
+    _cte_columns_hint,
+)
+from ffrwd.destinations import (
+    _PER_TRACK_OPTION_HINT,
+    _bind_sink_streams,
+    _default_audio_row,
+    _disable_scene_cuts,
+    _each,
+    _join_codecs,
+    _packet_sink_audio_codec,
+    _VariantRow,
+)
 from ffrwd.errors import ErrorCode, FfrwdError
+from ffrwd.expressions import (
+    _coalesce_label,
+    _describe,
+    _error,
+    _number,
+    _sql_text,
+    _struct_fields,
+    _unwrap,
+)
+from ffrwd.fills import (
+    _COALESCE_HINT,
+    _FILL_SPELLINGS,
+    _coalesce_arguments,
+    _coalesce_binding,
+    _fill_hint,
+    _inherited_fill_options,
+    _paired_row,
+)
+from ffrwd.filter_options import (
+    _listed,
+    _NamedArg,
+    _option_value,
+)
 from ffrwd.functions import WASM_STREAM_NAMES, Annotation, WasmFunction
 from ffrwd.inputs import render_options
 from ffrwd.inputs import validate_option as validate_input_option
@@ -321,8 +406,14 @@ from ffrwd.ir import (
 from ffrwd.ir import (
     SourceTrack as IrSourceTrack,
 )
-from ffrwd.macros import INPUT_MACROS, MACROS, InputMacro, Macro, macro_names
+from ffrwd.macros import INPUT_MACROS, MACROS, InputMacro
 from ffrwd.merge import RowValue, merge_rows
+from ffrwd.modules import (
+    _annotation_fields,
+    _bad_wasm_param,
+    _folded_result,
+    _vector_field,
+)
 from ffrwd.parser import (
     _ARITHMETIC,
     _ARITHMETIC_NAMES,
@@ -352,7 +443,6 @@ from ffrwd.parser import (
     annotation_projection,
     article,
     column_label,
-    flag_error,
     from_entries,
     group_keys,
     is_grouped,
@@ -390,6 +480,19 @@ from ffrwd.probe import (
 from ffrwd.probe import probe as probe_one_path
 from ffrwd.processes import COPY_CODEC, ref_type
 from ffrwd.registry import DynamicFilter, FilterOption, Registry, SourceFilter
+from ffrwd.rows import (
+    _from_rendition_table,
+    _is_row_window,
+    _literal_of,
+    _per_row_seeks,
+    _reads_row_alias,
+    _reads_unbound_rendition_column,
+    _rendition_row_cells,
+    _row_binding_of,
+    _row_bound,
+    _row_elements,
+    _row_metadata_cells,
+)
 from ffrwd.sink import (
     CODEC_PARAMS_FLAGS,
     MANIFEST_DEFAULT_SEGMENT,
@@ -403,6 +506,12 @@ from ffrwd.sink import (
     validate_csv_option,
 )
 from ffrwd.sink import validate_option as validate_sink_option
+from ffrwd.sources import (
+    _URL_SOURCE_SHAPE_HINT,
+    _source_columns_hint,
+    _url_source_row,
+    _UrlRow,
+)
 from ffrwd.table import (
     ArrayCell,
     CellValue,
@@ -410,14 +519,12 @@ from ffrwd.table import (
     StreamCell,
     TableResult,
     TableSink,
-    VectorCell,
 )
 from ffrwd.types import (
     ATTACHMENT_TYPE,
     ATTACHMENTS_COLUMN,
     CHAPTER_TYPE,
     CHAPTERS_COLUMN,
-    CONTAINER_READONLY_FIELDS,
     CUE_TYPE,
     CUES_COLUMN,
     DISPOSITION_COLUMN,
@@ -428,7 +535,6 @@ from ffrwd.types import (
     RECORD_ARRAY_COLUMNS,
     RECORD_ELEMENTS,
     RECORD_FIELDS,
-    ROW_READONLY_FIELDS,
     ROW_SCHEMAS,
     ROW_STAR_COLUMNS,
     STAR_COLUMNS,
@@ -437,15 +543,25 @@ from ffrwd.types import (
     TAGS_COLUMN,
     TIME_COLUMN,
     TRACK_RECORD_COLUMNS,
-    Field,
     RowColumnType,
-    is_array,
 )
-from ffrwd.vars import unset_error
+from ffrwd.values import (
+    _ARRAY_COLUMNS,
+    _NULL_STREAM_REF,
+    _PASSTHROUGH_ONLY,
+    _TYPE_MARKERS,
+    _array,
+    _Column,
+    _is_null,
+    _scalar,
+    _Stream,
+    _stream_count,
+    _stream_to_cell,
+    _Value,
+    _writes_nothing,
+)
 from ffrwd.warnings import FfrwdWarning, OnWarning, WarningCode
 from ffrwd.wasm import (
-    ANNOTATION_TYPES,
-    AUDIO_CODEC_ENCODERS,
     CODEC_ENCODERS,
     WIRE_AUDIO_CODECS,
     WIRE_VIDEO_CODECS,
@@ -454,7 +570,6 @@ from ffrwd.wasm import (
     DescribedFunction,
     Invoke,
     ProbeSource,
-    audio_encoder_codec,
     catalog_as_probe,
     encoder_codec,
     hosts_packet_sink,
@@ -467,6 +582,7 @@ from ffrwd.wasm import (
 )
 from ffrwd.wasm import invoke as wasm_invoke
 from ffrwd.wasm import probe_source as wasm_probe_source
+from ffrwd.written import _embedding_dims, _flag_spec, _named_record_cells
 
 __all__ = ["lower", "lower_table"]
 
@@ -500,32 +616,6 @@ def _declares_params(known: dict[str, object]) -> str:
         return "the module declares no parameters"
     return "the module declares " + ", ".join(sorted(known))
 
-# The array-typed pseudo-columns an input exposes, and their element type.
-# subtitle/data have the identical array/subscript/splat surface but are
-# passthrough-only (see `_PASSTHROUGH_ONLY` below).
-_ARRAY_COLUMNS: dict[str, StreamType] = {
-    "video": "video",
-    "audio": "audio",
-    "subtitle": "subtitle",
-    "data": "data",
-}
-
-# The pseudo `_RowBinding.column` a manifest's ABR ladder binds under: one row
-# per `RenditionMeta`, read straight off an `input()` alias with no `unnest`
-# to ask for it. Its schema is not a view over `container` like ROW_SCHEMAS is
-# -- a rendition is not a container array field, only ever a probed fact.
-RENDITION_COLUMN = "rendition"
-_RENDITION_SCHEMA: dict[str, RowColumnType] = {
-    "bandwidth": "number",
-    "width": "number",
-    "height": "number",
-    "codecs": "text",
-    "name": "text",
-    "language": "text",
-}
-# Every rendition column is a probed fact, never an assertion a query can make.
-_RENDITION_READONLY: frozenset[str] = frozenset(_RENDITION_SCHEMA)
-
 # The container array columns a MEDIA query's `SELECT *` expands: the stream
 # ones, in declaration order. `chapters` is an array column too, but a chapter
 # is not a stream, so it takes no output position.
@@ -537,18 +627,6 @@ _STREAM_STAR_COLUMNS: tuple[str, ...] = tuple(
 # audio -- the same two columns a manifest destination reads off a row
 # (:meth:`_Lowerer._row_cells`); a rendition never carries subtitle/data.
 _RENDITION_STAR_COLUMNS: tuple[StreamType, ...] = ("video", "audio")
-
-_TYPE_MARKERS: dict[StreamType, str] = {
-    "video": "v",
-    "audio": "a",
-    "subtitle": "s",
-    "data": "d",
-}
-
-# Stream types an ffmpeg filtergraph cannot carry: they may only become an
-# Output (a bare `-map`), never a filter argument and never a WHERE trim's
-# input.
-_PASSTHROUGH_ONLY: frozenset[StreamType] = frozenset({"subtitle", "data"})
 
 # Kind label used in UDF_ARG_TYPE "got" lists for anything that is neither a
 # literal nor a stream-typed subexpression (e.g. `1 + 2`, NULL, TRUE). The
@@ -575,16 +653,8 @@ _FROM_ITEM_MESSAGE = (
     "only input('path'), unnest(...), ffmpeg.<source>(...), "
     "generate_series(...), and CTE or view names are allowed in FROM"
 )
-_ZIP_HINT = (
-    "broadcast arrays zip elementwise, one output per element; "
-    "subscript one of them to pair a single stream with the other, e.g. a.audio[1]"
-)
 _NO_REGISTRY_HINT = (
     f"ffrwd's function surface IS your installed ffmpeg's filter set; {binaries.INSTALL_HINT}"
-)
-_PASSTHROUGH_HINT = (
-    "subtitle and data streams can only be selected (and copied), never filtered; "
-    "drop them from the call and select them as their own column"
 )
 _SOURCE_DURATION_HINT = (
     "a generated source has no timeline to seek into; give it a length with "
@@ -620,12 +690,6 @@ _CTE_ROW_FILE_HINT = (
     "gather the rows into that one file with array_agg(...), or give each row a "
     "file of its own with a TO expression over a value the CTE body selected, "
     "e.g. SELECT ..., i.i AS n in the body and TO ('clip' || x.n::text || '.mp4')"
-)
-_PER_TRACK_OPTION_HINT = (
-    "a per-row option binds one TRACK per row: gather the rows into this "
-    "destination with array_agg(...) so it has a track for each; or give each "
-    "row a file of its own with a TO expression, e.g. TO (:'names'[i.i] || "
-    "'.mp4')"
 )
 _ONE_FILE_PER_GROUP_HINT = (
     "one group is one file, so the destination has to name the group, e.g. "
@@ -701,45 +765,6 @@ _CAPTION_TRIM_HINT = (
     "them in a query without a WHERE time range; to caption a trimmed clip, join "
     "an external subtitle file whose cues are timed for the cut"
 )
-
-# `enable` is FRAMEWORK-level: ffmpeg implements it in the filter framework,
-# not in any filter, so it never appears in a filter's `-help` AVOptions and no
-# options table can contain it. Which filters honour it is the `T` column of
-# `ffmpeg -filters`, captured as DynamicFilter.timeline; that flag admits the
-# name here.
-_ENABLE = "enable"
-_ENABLE_HINT = (
-    "enable takes a single-quoted ffmpeg timeline expression over t (seconds), "
-    "n (frame number) or pos, e.g. enable => 'between(t,2,5)'"
-)
-_NO_TIMELINE_HINT = (
-    "enable is only accepted by filters your ffmpeg flags with timeline support "
-    "(the T column of `ffmpeg -filters`: gblur has it, scale does not); drop it, "
-    "or express the timing with a WHERE window over the input"
-)
-
-# Options a filter cannot run without. ffmpeg has no required-option
-# metadata -- AVOption carries no such flag; each filter enforces its own in
-# init() -- so this table is hand-kept, curated knowledge like MACROS. Each
-# value is a tuple of groups; a group is satisfied when any one of its names
-# is written (drawtext runs on `text` OR `textfile`). xfade's conditional
-# requirement -- `expr`, only when `transition` is 'custom' -- cannot be a
-# name list and lives in `_check_required_options` directly.
-REQUIRED_OPTIONS: dict[str, tuple[tuple[str, ...], ...]] = {
-    "subtitles": (("filename",),),
-    "lut3d": (("file",),),
-    "frei0r": (("filter_name",),),
-    # plugin only matters when the library holds more than one; file always.
-    "ladspa": (("file",),),
-    "movie": (("filename",),),
-    "amovie": (("filename",),),
-    "drawtext": (("text", "textfile"),),
-}
-
-# Longest option/constant list a hint or message renders before it stops
-# counting (xfade's `transition` alone has 59 constants).
-_MAX_LISTED = 12
-
 
 # array-RETURNING filters.
 #
@@ -1088,21 +1113,6 @@ _VARIADIC_HINT = (
 )
 
 
-# errors
-
-
-def _error(
-    code: ErrorCode,
-    message: str,
-    node: exp.Expr | None = None,
-    *,
-    fallback: exp.Expr | None = None,
-    hint: str | None = None,
-) -> FfrwdError:
-    line, col = _pos(node, fallback)
-    return FfrwdError(code, message, line=line, col=col, hint=hint)
-
-
 def _computed_segments(expression: exp.Expr, row_aliases: set[str]) -> list[exp.Expr]:
     """The pieces of a path expression whose text comes from row metadata.
 
@@ -1155,19 +1165,6 @@ def _stream_projection(
     return base if _fold(field) == declared.stream_field else None
 
 
-def _annotation_fields(annotation: Annotation) -> tuple[tuple[str, str], ...]:
-    """One annotation record's fields, name-ordered, for comparing two of them."""
-    return tuple(sorted((f.name, f.type) for f in annotation.fields))
-
-
-def _vector_field(annotation: Annotation) -> str | None:
-    """The name of `annotation`'s vector-typed field, or None if it has none."""
-    for f in annotation.fields:
-        if f.type == "vector":
-            return f.name
-    return None
-
-
 def _is_cue_array(node: exp.Expr) -> bool:
     """True for the two spellings of a compile-time cue list.
 
@@ -1183,29 +1180,6 @@ def _is_cue_array(node: exp.Expr) -> bool:
     return False
 
 
-def _annotation_matches(
-    declared: Sequence[tuple[str, str]], emitted: Sequence[tuple[str, str]]
-) -> bool:
-    """Whether a declared annotation record and a module's rows are the same shape.
-
-    Same column names, and each declared type covering the JSON type the
-    module gave that column. Order says nothing: the rows travel keyed by name.
-    """
-    if len(declared) != len(emitted):
-        return False
-    return all(
-        name == emitted_name and json_type in ANNOTATION_TYPES.get(kind, ())
-        for (name, kind), (emitted_name, json_type) in zip(declared, emitted)
-    )
-
-
-def _written_json_fields(fields: Sequence[tuple[str, str]]) -> str:
-    """A module's row schema as a message spells it."""
-    if not fields:
-        return "rows with no columns"
-    return "rows of " + ", ".join(f"{name} ({kind or 'no type'})" for name, kind in fields)
-
-
 def _fill_call(node: exp.Expr) -> _Call | None:
     """The generated stand-in `node` spells -- ``ffmpeg.<source>()``,
     ``ffrwd.empty_captions()`` -- or None, which makes it a stream
@@ -1217,43 +1191,7 @@ def _fill_call(node: exp.Expr) -> _Call | None:
     return call
 
 
-def _coalesce_label(node: exp.Expr) -> str:
-    """How a rejection names a COALESCE argument: as it was written."""
-    written = _unwrap(node)
-    if isinstance(written, exp.Column | exp.Bracket):
-        return written.sql()
-    return _describe(written)
-
-
-def _describe(node: exp.Expr) -> str:
-    """Short human name for an expression that cannot produce a stream."""
-    if isinstance(node, exp.Literal):
-        return "a string literal" if node.is_string else "a numeric literal"
-    if isinstance(node, exp.Neg):
-        return "a numeric literal"
-    if isinstance(node, exp.Null):
-        return "NULL"
-    if isinstance(node, exp.Boolean):
-        return "a boolean literal"
-    if isinstance(node, exp.Case):
-        return "a CASE expression"
-    if isinstance(node, exp.DPipe):
-        return "a '||' expression"
-    return f"a {node.__class__.__name__.upper()} expression"
-
-
 # small AST helpers
-
-
-def _unwrap(node: exp.Expr) -> exp.Expr:
-    """Strip projection aliases and redundant parentheses."""
-    while True:
-        if isinstance(node, exp.Alias | exp.Paren):
-            inner = node.this
-            if isinstance(inner, exp.Expr):
-                node = inner
-                continue
-        return node
 
 
 def _projection_name(node: exp.Expr) -> str | None:
@@ -1314,20 +1252,6 @@ def _flatten_and(node: exp.Expr | None) -> list[exp.Expr]:
             continue
         out.append(current)
     return out
-
-
-@dataclass(frozen=True)
-class _NamedArg:
-    """One ``name => value`` call argument.
-
-    `name` is verbatim (ffmpeg AVOption names are case-sensitive) and `value` is
-    the raw sqlglot node — the option table this is checked against comes from
-    the installed ffmpeg, so nothing is interpreted before the registry says
-    what the option's type is.
-    """
-
-    name: str
-    value: exp.Expr
 
 
 @dataclass(frozen=True)
@@ -1487,33 +1411,6 @@ def _split_args(
     return _Call(name, positional, named, namespaced, is_macro, variadic)
 
 
-# literal coercion
-
-
-def _number(node: exp.Expr, code: ErrorCode = ErrorCode.UDF_ARG_TYPE) -> int | float:
-    """Python value of a numeric literal, negation included.
-
-    ``to_py()`` hands back ``decimal.Decimal`` for non-integers (the IR only
-    carries JSON/ffmpeg-renderable scalars, so that is narrowed to float here)
-    and raises ``ValueError`` on malformed literals sqlglot still tokenized as
-    numbers, e.g. ``1e`` — which must surface as a typed rejection, not a panic.
-    """
-    node = _unwrap(node)
-    sign = 1
-    if isinstance(node, exp.Neg) and isinstance(node.this, exp.Expr):
-        sign = -1
-        node = node.this
-    if not isinstance(node, exp.Literal) or node.is_string:
-        raise _error(code, "expected a numeric literal", node)
-    try:
-        value = node.to_py()
-        if isinstance(value, bool):
-            raise ValueError(value)
-        return sign * value if isinstance(value, int) else sign * float(value)
-    except (ArithmeticError, TypeError, ValueError):
-        raise _error(code, f"could not read {str(node.this)!r} as a number", node) from None
-
-
 @dataclass(frozen=True)
 class _Unrepresentable:
     """A COPY option value that is no python scalar at all (``NULL``, a bare word).
@@ -1537,17 +1434,6 @@ def _sink_describe(node: exp.Expr) -> str:
     if isinstance(node, exp.Identifier):
         return f'the identifier "{node.name}"'
     return _describe(node)
-
-
-def _each(value: object) -> list[object]:
-    """One option's values: every element of a per-pad list, or the one value.
-
-    Empty for an option that is not written at all, so a caller loops over
-    nothing rather than checking first.
-    """
-    if value is None:
-        return []
-    return list(value) if isinstance(value, list) else [value]
 
 
 def _sink_stream_count(node: exp.Expr, arguments: int) -> int:
@@ -1592,28 +1478,6 @@ def _manifest_format(raw: RawSink) -> str | None:
         if isinstance(value, str) and value in MANIFEST_FORMATS:
             return value
     return None
-
-
-@dataclass(frozen=True)
-class _VariantRow:
-    """One row of a manifest destination: the streams its cells hold.
-
-    A NULL cell is None -- that kind absent from this variant. A video-only
-    row is a variant drawing from the audio group, an audio-only row a
-    rendition in it, a both-cells row a muxed variant.
-
-    `name`/`language` are what this row's cells carry from an UNMODIFIED read
-    of a rendition row (:attr:`_Stream.rendition`), read off in
-    :meth:`_Lowerer._row_cells`: `name` from the video cell, or the audio
-    cell on an audio-only row; `language` from the audio cell, only where its
-    own stream tags none. Both None where the row carries no such cell, which
-    is where :meth:`_Lowerer._variant_names` falls back to a computed name.
-    """
-
-    video: _Stream | None
-    audio: _Stream | None
-    name: str | None = None
-    language: str | None = None
 
 
 def _compress_manifest_lists(
@@ -1805,38 +1669,6 @@ def _struct_node(node: exp.Expr) -> exp.Struct | None:
     """The ``STRUCT(...)`` a cast wraps, else None."""
     inner = _unwrap(node.this) if isinstance(node.this, exp.Expr) else None
     return inner if isinstance(inner, exp.Struct) else None
-
-
-def _struct_fields(node: exp.Struct) -> dict[str, exp.Expr]:
-    """One ``STRUCT(value AS name, ...)`` as its fields, by name.
-
-    Every field is named: a positional entry has no name to match against the
-    record's own, so it is rejected rather than silently taken in order.
-    """
-    fields: dict[str, exp.Expr] = {}
-    for entry in node.expressions:
-        if not isinstance(entry, exp.PropertyEQ):
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL,
-                f"a STRUCT field is named, got {_describe(entry)}",
-                entry if isinstance(entry, exp.Expr) else node,
-                fallback=node,
-                hint="name every field with AS, e.g. STRUCT('Intro' AS title)",
-            )
-        name = _fold(entry.this)
-        value = entry.expression
-        if not isinstance(value, exp.Expr):
-            continue
-        if name in fields:
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL,
-                f"STRUCT names the field '{name}' twice",
-                entry,
-                fallback=node,
-                hint="one value per field name",
-            )
-        fields[name] = value
-    return fields
 
 
 @dataclass(frozen=True)
@@ -2310,7 +2142,7 @@ def _input_value(node: exp.Expr) -> object:
     Mirrors :func:`_sink_value`, with one addition: INPUT_OPTIONS has a
     ``"num"`` type (``framerate``, ``itsoffset``) whose value may carry a
     leading ``-`` -- ``itsoffset`` legitimately takes a negative offset.
-    ``exp.Neg`` is unwrapped first, the same rule :func:`_number` applies to
+    ``exp.Neg`` is unwrapped first, the same rule :func:`ffrwd.expressions._number` applies to
     positional numeric literals. Never raises: an unusable shape comes back
     as an :class:`_Unrepresentable`, exactly like `_sink_value`, and the
     option table decides.
@@ -2352,13 +2184,6 @@ def input_option_values(raw_options: Sequence[RawInputOption]) -> dict[str, obje
 _PACKET_SINK_OPTIONS = frozenset(
     name for name, spec in SINK_OPTIONS.items() if spec.scope == "video"
 )
-
-
-def _join_codecs(names: Sequence[str]) -> str:
-    """A codec list as a message says it."""
-    if len(names) == 1:
-        return names[0]
-    return ", ".join(names[:-1]) + " or " + names[-1]
 
 
 def _check_sink_option_conflicts(
@@ -2471,183 +2296,6 @@ def _check_two_pass_is_single_sink(sinks: list[SinkUnit], raws: list[RawSink]) -
 # typed values, bindings, per-branch environment
 
 
-@dataclass(frozen=True)
-class _Stream:
-    """One typed stream: an IR ref, the pad type it carries, and its origin.
-
-    `source` is the probed :class:`~ffrwd.probe.StreamMeta` this stream comes
-    from 1:1 — directly (a passthrough subscript) or through a chain of
-    single-stream-input filters, the WHERE trim included — and is threaded
-    unconditionally. A call over two or more streams (``amix``, ``overlay``)
-    and a ``concat`` pad are the other kind of join: each keeps `source` only
-    when every stream feeding it agrees on what it says (:func:`_agreed_source`);
-    otherwise it is None, same as an unprobed input. :func:`_provenance` turns
-    it into ``Output.metadata``.
-
-    `rendition` is the :class:`~ffrwd.probe.RenditionMeta` a rendition row's
-    cell was built from, set only where :meth:`_Lowerer._rendition_row` mints
-    the stream. It threads through nothing else: a filter output is a freshly
-    built ``_Stream`` that never copies it, so an UNMODIFIED read of a
-    rendition row's ``video``/``audio`` cell is the only way to still carry
-    it by the time a manifest destination or ``Output.metadata`` reads it.
-    """
-
-    ref: FrameRef
-    type: StreamType
-    source: StreamMeta | None = None
-    rendition: RenditionMeta | None = None
-
-
-# Table mode only: the sentinel `_Stream.ref` for an
-# outer join's NULL row, read back by `_value_to_cells`. Never a real
-# FrameRef -- every well-formed one is non-empty (a node id or a "src:..."
-# ref) -- so there is no ambiguity with an actual stream.
-_NULL_STREAM_REF: FrameRef = ""
-
-
-@dataclass(frozen=True)
-class _Value:
-    """What every expression lowers to: one stream, or a whole array of them.
-
-    `is_array` is deliberately not ``len(streams) != 1``: a one-element array
-    is still an array — it splats, broadcasts and subscripts — and on a
-    single-track file that is the ONLY thing separating ``a.audio`` from
-    ``a.audio[1]``.
-    """
-
-    type: StreamType  # element type; every element of an array agrees on it
-    streams: tuple[_Stream, ...]
-    is_array: bool
-
-    def at(self, index: int) -> _Stream:
-        """Element `index` of an array; the one stream of a scalar (it repeats)."""
-        return self.streams[index] if self.is_array else self.streams[0]
-
-
-def _scalar(stream: _Stream) -> _Value:
-    return _Value(type=stream.type, streams=(stream,), is_array=False)
-
-
-def _array(stream_type: StreamType, streams: Iterable[_Stream]) -> _Value:
-    return _Value(type=stream_type, streams=tuple(streams), is_array=True)
-
-
-def _is_null(value: _Value) -> bool:
-    """True for a single NULL cell: a gap, or an aggregate over no rows."""
-    if value.is_array or not value.streams:
-        return False
-    return value.streams[0].ref == _NULL_STREAM_REF
-
-
-def _writes_nothing(columns: list[_Column]) -> bool:
-    """True when every column of a branch is a NULL cell.
-
-    Only a NULL cell counts. A branch with no columns, or one whose column is
-    an empty array, is a different shape -- a module sink, a rows file --
-    that writes through something other than these columns.
-    """
-    return bool(columns) and all(_is_null(column.value) for column in columns)
-
-
-@dataclass(frozen=True)
-class _Column:
-    """One SELECT column of a branch (or of a CTE body): its name and value.
-
-    An array column carries every one of its streams here, so a CTE records an
-    array column's LENGTH statically and a later ``<cte>.<name>[k]`` is
-    bounds-checked without re-probing anything.
-
-    `splat` matters only when `value.is_array`: True means the array IS a row
-    set (a row alias's stream column, or a call over one) that a table query
-    prints one row per element, like :meth:`_Lowerer._value_to_cells` already
-    does outside a CTE. False means the array is a single unit -- an
-    ``array_agg`` or a bare input array column -- that a table query
-    broadcasts as ONE cell instead (see :meth:`_Lowerer._array_cell_broadcast`).
-    Ignored for a scalar column.
-    """
-
-    name: str | None
-    value: _Value
-    splat: bool = True
-
-
-@dataclass(frozen=True)
-class _InputBinding:
-    """``FROM input('x.mp4') a`` — exposes ``a.video[k]`` / ``a.audio[k]``."""
-
-    alias: str
-
-
-@dataclass(frozen=True)
-class _CteBinding:
-    """``FROM <cte>`` — a TABLE of the rows its body produced.
-
-    `columns` is what the body's SELECT list named, each column holding every
-    stream it carries. `rows` is the body's ROW count, which a splat array
-    column carries one element per; `relation` is the branch's joined row set,
-    so a column of that width reads back one element per result row and a
-    cross join with a second source repeats it honestly.
-    """
-
-    name: str
-    columns: tuple[_Column, ...]
-    rows: int = 1
-    relation: _RowRelation | None = None
-    # Scalar columns of the body, name -> one value per body row. Read back
-    # by position, the same way a stream column is.
-    values: dict[str, tuple[RowValue, ...]] = field(default_factory=dict)
-    # Columns whose value is a run-time annotation -- the producer's own
-    # rows, or another rows function's result read one module later -- name
-    # -> the same (producer, kind, record) triple `_rows_source` returns for
-    # the inline spelling. A rows function reading `<cte>.<name>` resolves
-    # through here instead of re-lowering the producer, so the producer node
-    # is not minted twice.
-    rows_columns: dict[str, tuple[FrameRef, StreamType, Annotation]] = field(
-        default_factory=dict
-    )
-    # Columns whose value is a compile-time cue array (a written document,
-    # not a module's rows), named so a rows function refuses one by what it
-    # is instead of mistaking it for a stream.
-    cue_columns: frozenset[str] = frozenset()
-
-
-@dataclass
-class _SourceBinding:
-    """``FROM ffmpeg.<source>(...) a`` — exposes ONE statically-typed stream.
-
-    Everything about the stream is known before any projection lowers: the
-    registry's :class:`~ffrwd.registry.SourceFilter` says which
-    type the source's single output pad carries, so ``a.video[1]``
-    (video sources), ``a.audio[1]`` (audio ones), the bare array
-    ``a.video`` (length 1, statically), and ``a.*`` are all answered without
-    a probe — there is no file to probe, and no ``-i``: the source is a
-    ZERO-INPUT filter node.
-
-    `options` is already validated against the source's introspected option
-    table (the exact same ``Registry.options`` path a tier-2 call's named
-    arguments take), because that happens when the FROM clause binds, not
-    when a column is read.
-
-    Mutable on purpose: `ref` memoizes the node, which is minted lazily on
-    the FIRST column access and shared by every later one. Fan-out beyond
-    that is the split pass's job, exactly as for any other node, so
-    ``SELECT a.video[1], hflip(a.video[1]) FROM ffmpeg.testsrc(...) a`` is one
-    ``testsrc`` plus a ``split``, never two generators.
-    """
-
-    alias: str
-    name: str  # the ffmpeg source filter's name, e.g. "testsrc"
-    output: StreamType
-    options: dict[str, object]
-    ref: FrameRef | None = None
-
-    @property
-    def display(self) -> str:
-        """The source as the user spelled it, for error messages."""
-        return f"{FILTER_NAMESPACE}.{self.name}"
-
-
-
 # `_TrackRow.stream` for a row that carries no track -- a chapter row, or a
 # written row. Never a real stream (neither exposes a stream column at
 # all), only a dataclass filler. Its ref deliberately fails `is_src()` (no
@@ -2655,58 +2303,6 @@ class _SourceBinding:
 # to render it fails fast with "unknown node" rather than silently wiring up
 # the wrong stream.
 _STREAMLESS_ROW = _Stream(ref="rows:no-stream", type="data", source=None)
-
-
-@dataclass(frozen=True)
-class _TrackRow:
-    """One row of an ``unnest`` table: the track, plus its metadata columns.
-
-    `stream` IS the row's stream, and its ``_Stream.source`` is the very
-    ``StreamMeta`` `columns` was read from — a row's provenance and its columns
-    are the same probed fact, seen twice.
-
-    `kinds` holds every stream of a RENDITION row, by type — a manifest's
-    variant may carry video and audio together — with `stream` staying the
-    row's primary one (its first video stream, else its first audio one).
-    Empty for every other row kind, unnest rows included.
-    """
-
-    stream: _Stream
-    columns: dict[str, RowValue]
-    kinds: dict[StreamType, _Stream] = field(default_factory=dict)
-
-
-# What a URL source's row names its input with, the attributes a row MAY
-# carry beside it, and the ones it may not: width, height and the stream
-# arrays are what the probe of that url reports, so a row naming one would
-# be overruled by the file itself.
-_URL_SOURCE_URL = "url"
-_URL_SOURCE_TEXT = ("codecs", "name", "language")
-_URL_SOURCE_PROBED = frozenset({"width", "height"}) | frozenset(_ARRAY_COLUMNS)
-# A value column's name: a plain lowercase identifier, so every column a
-# module names is one a query can spell.
-_URL_SOURCE_NAME = re.compile(r"[a-z][a-z0-9_]*")
-_URL_SOURCE_SHAPE_HINT = (
-    'a source answers with {"rows": [{"url": "clip.mp4", ...}, ...]}, one '
-    "object per row"
-)
-
-
-@dataclass(frozen=True)
-class _UrlRow:
-    """One checked row of a URL source's answer.
-
-    The four rendition attributes a row may declare (a probe cannot report
-    them: they describe the ladder, not the file), and `columns` -- every
-    other key it named, which is a value column of the alias.
-    """
-
-    url: str
-    bandwidth: int | None
-    codecs: str | None
-    name: str | None
-    language: str | None
-    columns: dict[str, RowValue]
 
 
 @dataclass(frozen=True)
@@ -2799,132 +2395,6 @@ def _url_source_types(
     return types
 
 
-@dataclass(frozen=True)
-class _CteRow:
-    """One row of a CTE source: which row of the body's row set it is.
-
-    The position is all a result tuple needs: it indexes both the stream
-    columns' arrays and the body's value columns, which is what makes
-    ``x.n`` read the value this very row computed.
-    """
-
-    position: int
-
-
-# What one result row holds per FROM alias: a track (or a gap, where an outer
-# join found no counterpart) for a row table, a position for a CTE source.
-_RowTuple = dict[str, "_TrackRow | _CteRow | None"]
-
-
-@dataclass
-class _RowRelation:
-    """One branch's joined row set: every row source, aligned.
-
-    `tuples` is the relation itself — one dict per result ROW, mapping each row
-    alias to that row's track, or to ``None`` where an outer join left a gap,
-    and each CTE alias to the body row it took. All of a branch's row sources
-    share this one object, which is what keeps
-    ``a`` and ``b`` aligned: element `i` of each is the pair the
-    join made, so the existing zip/broadcast machinery wires the right streams
-    together without learning that joins exist.
-
-    Row order is the join's, never sorted implicitly: the
-    LEFT side's order, then — for a FULL join only — the unmatched right rows
-    in their own order. `keys` remembers which columns each side was matched
-    on, so a NULL track can say what it failed to match.
-    """
-
-    aliases: list[str] = field(default_factory=list)
-    tuples: list[_RowTuple] = field(default_factory=list)
-    keys: dict[str, list[str]] = field(default_factory=dict)
-
-
-@dataclass
-class _RowBinding:
-    """``FROM ..., unnest(<input>.<type>) t`` — a compile-time TABLE.
-
-    `rows` is this alias's column of the branch's joined relation, in ROW
-    ORDER: the surviving row set, one entry per result row, ``None`` where an
-    outer join found no counterpart. It is what the WHERE predicate and the
-    ORDER BY rewrite (both act on the shared :class:`_RowRelation`, so every
-    alias stays aligned), and both happen once per branch before any projection
-    lowers. Selecting ``t`` over N surviving rows is an N-element array in
-    that order, which is the same array value a bare ``f.audio`` produces — the
-    row model and the array model are one mechanism.
-
-    `source` is the INPUT alias the tracks belong to. Everything downstream
-    (the ``-i``, its WHERE window, provenance) keys off THAT alias, not the row
-    one: a row table takes no input slot of its own. `values` is set instead
-    for a WRITTEN row source (a struct row table in FROM), whose rows come
-    from the query rather than from a probe; it has no input alias and no
-    streams.
-
-    `extra` is set for a RENDITION table whose rows a module wrote: the value
-    columns it named beside the six rendition ones, each with the type its
-    values settled on. Empty for a manifest's own rows, which carry the six
-    and no more.
-    """
-
-    alias: str
-    source: str
-    column: str  # the array that was unnested: video/audio/subtitle/data
-    type: StreamType
-    relation: _RowRelation
-    values: RawValuesTable | None = None
-    extra: Mapping[str, RowColumnType] = field(default_factory=dict)
-
-    @property
-    def rows(self) -> tuple[_TrackRow | None, ...]:
-        return tuple(_track_of(row, self.alias) for row in self.relation.tuples)
-
-    @property
-    def streamless(self) -> bool:
-        """True for rows that carry no track: records, and written rows."""
-        return self.values is not None or self.column in RECORD_ARRAY_COLUMNS
-
-    @property
-    def record(self) -> str:
-        """The record these rows are one of. Only a record array has one."""
-        return RECORD_ELEMENTS[self.column]
-
-    @property
-    def schema(self) -> dict[str, RowColumnType]:
-        """The columns these rows expose, in declaration (or written) order."""
-        if self.column == RENDITION_COLUMN:
-            return {**_RENDITION_SCHEMA, **self.extra}
-        return (
-            self.values.schema() if self.values is not None else ROW_SCHEMAS[self.column]
-        )
-
-    @property
-    def star(self) -> tuple[str, ...]:
-        """What ``<alias>.*`` expands to: the scalar columns, in order."""
-        if self.column == RENDITION_COLUMN:
-            return (*_RENDITION_SCHEMA, *self.extra)
-        if self.values is not None:
-            return self.values.columns
-        return ROW_STAR_COLUMNS[self.column]
-
-    @property
-    def readonly(self) -> frozenset[str]:
-        """The columns a query may not assert. A written row has none."""
-        if self.column == RENDITION_COLUMN:
-            return _RENDITION_READONLY | frozenset(self.extra)
-        if self.values is not None:
-            return frozenset()
-        return ROW_READONLY_FIELDS[self.column]
-
-    @property
-    def exposes(self) -> str:
-        """How a rejection names this row source's column list."""
-        listed = ", ".join(sorted(self.schema))
-        if self.values is not None or self.extra:
-            return f"'{self.alias}' exposes {listed}"
-        return f"{self.column} track rows expose {listed}"
-
-
-_Binding = _InputBinding | _CteBinding | _SourceBinding | _RowBinding
-
 # Metadata tag overrides for one query: probed StreamMeta identity -> the keys
 # its output streams set, with None for a key the query clears.
 _TagOverrides = dict[int, dict[str, str | None]]
@@ -2938,12 +2408,6 @@ _TagScope = Literal["sink", "rows"]
 # flags that stream's output sets, in declared order. An empty tuple is the
 # written `'0'`: every flag off.
 _DispositionOverrides = dict[int, tuple[str, ...]]
-
-
-def _track_of(row: _RowTuple, alias: str) -> _TrackRow | None:
-    """One result row's track for a row alias; None for a gap or a CTE row."""
-    entry = row.get(alias)
-    return entry if isinstance(entry, _TrackRow) else None
 
 
 def _cte_row_count(
@@ -2968,53 +2432,6 @@ def _map_key(name: str) -> str:
     """The key a folded map path names, else the column name itself."""
     ref = map_ref(name)
     return ref[1] if ref is not None else name
-
-
-def _tags_to_cell(tags: dict[str, str]) -> ArrayCell:
-    """One tag map as an array cell of ``(key,value)`` records, in key order."""
-    return ArrayCell(
-        elements=tuple(RecordCell(fields=(key, tags[key])) for key in sorted(tags))
-    )
-
-
-def _tag_cell(row: _TrackRow | None) -> CellValue:
-    """One row's whole tag map as a cell; NULL for an outer join's gap."""
-    if row is None:
-        return None
-    source = row.stream.source
-    return _tags_to_cell({} if source is None else source.metadata)
-
-
-def _flags_to_cell(flags: dict[str, bool]) -> ArrayCell:
-    """One disposition as an array cell of ``(key,set)`` records, in flag order.
-
-    The key set is CLOSED, so every declared flag is an entry; one this ffmpeg
-    did not report reads NULL, the way an absent tag does.
-    """
-    return ArrayCell(
-        elements=tuple(
-            RecordCell(fields=(key, flags.get(key))) for key in DISPOSITION_KEYS
-        )
-    )
-
-
-def _disposition_cell(row: _TrackRow | None) -> CellValue:
-    """One row's whole flag map as a cell; NULL where nothing was probed."""
-    if row is None or row.stream.source is None:
-        return None
-    return _flags_to_cell(row.stream.source.disposition)
-
-
-def _row_value_as_cell(value: RowValue) -> CellValue:
-    """A row value as a printable cell: a vector wraps, everything else already is one."""
-    return VectorCell(values=value) if isinstance(value, tuple) else value
-
-
-def _is_number_list(result: object) -> bool:
-    """True for a JSON array of numbers -- a vector-returning module's answer."""
-    return isinstance(result, list) and all(
-        isinstance(v, int | float) and not isinstance(v, bool) for v in result
-    )
 
 
 def _row_star_error(
@@ -3141,24 +2558,6 @@ def _join_keys(on: exp.Expr) -> dict[str, list[str]]:
     return keys
 
 
-# The fill each track type takes when an outer join leaves a gap. Quoted
-# verbatim in the NULL-track hint, so it is spelled the way a user would paste
-# it. `data` is absent deliberately: nothing generates a data track, so there
-# is no fill to suggest.
-_FILL_SPELLINGS: dict[StreamType, str] = {
-    "audio": f"{FILTER_NAMESPACE}.anullsrc()",
-    "video": f"{FILTER_NAMESPACE}.color()",
-    "subtitle": f"{MACRO_NAMESPACE}.empty_captions()",
-}
-
-_COALESCE_HINT = (
-    "COALESCE fills an outer join's gaps: COALESCE(b, "
-    f"{FILTER_NAMESPACE}.anullsrc(duration => 2)) for audio, "
-    f"{FILTER_NAMESPACE}.color() for video, "
-    f"{MACRO_NAMESPACE}.empty_captions() for captions"
-)
-
-
 # The compile-time row predicate evaluator.
 #
 # Every column of a track row is PROBED metadata, so a predicate over rows is
@@ -3237,48 +2636,6 @@ def _compare(node: exp.Expr, left: RowValue, right: RowValue) -> bool | None:
     if isinstance(node, exp.LT):
         return left < right  # type: ignore[operator]
     return left <= right  # type: ignore[operator]
-
-
-@dataclass
-class _Env:
-    """Everything one SELECT branch resolves names against."""
-
-    bindings: dict[str, _Binding] = field(default_factory=dict)
-    # CTE name -> its WHERE window. CTE-ONLY: an INPUT alias's window is a
-    # property of its `-i`, not of this branch, so `_collect_trims` records it
-    # in `Graph.input_trims` instead and no filter trim is ever spliced for it.
-    # Either half may be None (an open-ended window).
-    trims: dict[str, tuple[int | float | None, int | float | None]] = field(
-        default_factory=dict
-    )
-    # base stream ref -> its trimmed ref, so one filter trim is shared by every
-    # consumer of that stream inside this branch (CTE-only, as above).
-    trimmed: dict[FrameRef, FrameRef] = field(default_factory=dict)
-    # The branch's joined row set, or None until its first
-    # `unnest` binds. There is at most ONE: every row table of a branch joins
-    # into it, comma sources included (the comma between two unnests is the
-    # bounded cross join), so all row aliases stay aligned by construction.
-    relation: _RowRelation | None = None
-    # True for a branch that aggregates -- a GROUP BY, an `array_agg`, or both.
-    # Its scalar columns are group-constants (resolve's grouping check proves
-    # that), so they tag the CONTAINER rather than the tracks.
-    grouped: bool = False
-    # The GROUP BY keys that read a track-row column: the ones that actually
-    # partition the relation. An input-level or constant key has the same value
-    # for every tuple and leaves one group.
-    group_keys: tuple[exp.Expr, ...] = ()
-    # Input alias -> the `-i` each ROW of `relation` seeks, in row order. Set
-    # only for a window whose bounds read a row column with no fan-out TO: the
-    # rows stay in one graph, so each takes its own copy of the input with its
-    # own `-ss`/`-to`, and every stream column of the alias reads one stream
-    # per row.
-    row_inputs: dict[str, list[str]] = field(default_factory=dict)
-    # The rendition row alias `array_agg(<expression over its [1] columns>)`
-    # is currently lowering, if any (:meth:`_lower_rendition_agg_expr`). While
-    # set, that alias's `.video[1]` / `.audio[1]` reads the array every
-    # surviving row contributes instead of picking one row out of it -- the
-    # same reading a bare `array_agg(r.video[1])` already gets.
-    rendition_agg: str | None = None
 
 
 # ExpandCtx
@@ -3752,7 +3109,7 @@ class _Lowerer:
         _check_two_pass_outputs(options, outputs, raw.path_node)
         if variant_rows is not None:
             _compress_manifest_lists(options, variant_rows)
-        self._check_per_track_options(options, option_nodes, outputs, raw)
+        _check_per_track_options(options, option_nodes, outputs, raw)
         path = raw.path
         if raw.path_expr is not None:
             self._check_fanout_options(options, raw)
@@ -4032,62 +3389,8 @@ class _Lowerer:
                 )
             options["video_codec"] = CODEC_ENCODERS[codec]
         if "audio" in scopes:
-            self._packet_sink_audio_codec(declared, described, options, option_nodes, raw)
+            _packet_sink_audio_codec(declared, described, options, option_nodes, raw)
         return options
-
-    def _packet_sink_audio_codec(
-        self,
-        declared: WasmFunction,
-        described: Described,
-        options: dict[str, object],
-        option_nodes: dict[str, exp.Expr],
-        raw: RawSink,
-    ) -> None:
-        """`audio_codec` settled the way `video_codec` is, against the audio
-        the stream edge carries and the codecs the module accepts."""
-        accepted = described.sink_codecs("audio")
-        for written in _each(options.get("audio_codec")):
-            assert isinstance(written, str)  # validated as a str above
-            codec = audio_encoder_codec(written)
-            line, col = _pos(option_nodes["audio_codec"], raw.path_node)
-            if codec is None:
-                raise FfrwdError(
-                    ErrorCode.UNSUPPORTED_SQL,
-                    f"the audio stream into a packet sink travels as "
-                    f"{_join_codecs(WIRE_AUDIO_CODECS)}, and '{written}' "
-                    "encodes none of them",
-                    line=line,
-                    col=col,
-                    hint="name an encoder for one of them, e.g. "
-                    + ", ".join(AUDIO_CODEC_ENCODERS.values()),
-                )
-            if accepted and codec not in accepted:
-                raise FfrwdError(
-                    ErrorCode.UNSUPPORTED_SQL,
-                    f"'{written}' writes {codec}, and the module "
-                    f"'{declared.module}' consumes {_join_codecs(accepted)} "
-                    "audio",
-                    line=line,
-                    col=col,
-                    hint=f"name an encoder for {_join_codecs(accepted)}, or "
-                    "drop audio_codec to take the module's preference",
-                )
-        if "audio_codec" not in options:
-            codec = next(
-                (c for c in accepted if c in WIRE_AUDIO_CODECS),
-                WIRE_AUDIO_CODECS[0] if not accepted else None,
-            )
-            if codec is None:
-                raise _error(
-                    ErrorCode.UNSUPPORTED_SQL,
-                    f"the module '{declared.module}' consumes "
-                    f"{_join_codecs(accepted)} audio, and the stream edge "
-                    f"carries {_join_codecs(WIRE_AUDIO_CODECS)}",
-                    raw.path_node,
-                    hint="the module has to accept one of the codecs the "
-                    "sidecar's packets travel in",
-                )
-            options["audio_codec"] = AUDIO_CODEC_ENCODERS[codec]
 
     def _check_metadata_track_container(
         self,
@@ -4229,39 +3532,6 @@ class _Lowerer:
         env = self.fanout_env if self.fanout_env is not None else _Env()
         return self._eval_list_element(node, env, self.fanout_row, anchor)
 
-    def _check_per_track_options(
-        self,
-        options: dict[str, object],
-        option_nodes: dict[str, exp.Expr],
-        outputs: list[Output],
-        raw: RawSink,
-    ) -> None:
-        """A per-row option against the tracks it binds to, one apiece.
-
-        The rows were gathered into this destination, so it holds one track
-        per row of the option's own scope -- and a count that does not line up
-        is a query saying two different things about how many renditions it
-        writes.
-        """
-        for name, value in options.items():
-            if not isinstance(value, list):
-                continue
-            scope = SINK_OPTIONS[name].scope
-            tracks = sum(1 for output in outputs if output.type == scope)
-            if tracks == len(value):
-                continue
-            anchor = option_nodes.get(name)
-            line, col = _pos(anchor, raw.path_node) if anchor else _pos(raw.path_node)
-            raise FfrwdError(
-                ErrorCode.ROW_COUNT_MISMATCH,
-                f"sink option {name!r} is read once per row over "
-                f"{len(value)} rows, and this destination has "
-                f"{tracks} {scope} track{'' if tracks == 1 else 's'}",
-                line=line,
-                col=col,
-                hint=_PER_TRACK_OPTION_HINT,
-            )
-
     def _check_fanout_options(self, options: dict[str, object], raw: RawSink) -> None:
         """The sink options a fan-out COPY does not take, v1.
 
@@ -4402,7 +3672,7 @@ class _Lowerer:
                     f"each row of {subject} is one variant map entry",
                     anchor,
                     hint=_RENDITION_PICK_HINT
-                    if self._from_rendition_table(self.sink_env)
+                    if _from_rendition_table(self.sink_env)
                     else "one variant per row: unnest or join the tracks "
                     "into rows instead of selecting an array",
                 )
@@ -4555,7 +3825,7 @@ class _Lowerer:
 
         video_names, audio_names = self._variant_names(variant_rows)
         demuxed = any(row.audio is not None and row.video is None for row in variant_rows)
-        default_row = self._default_audio_row(variant_rows)
+        default_row = _default_audio_row(variant_rows)
         entries: list[str] = []
         video_seen = 0
         audio_seen = 0
@@ -4580,25 +3850,6 @@ class _Lowerer:
                 audio_seen += 1
             entries.append(",".join(parts))
         return " ".join(entries)
-
-    def _default_audio_row(self, variant_rows: list[_VariantRow]) -> int | None:
-        """Which rendition row gets ``default:yes``.
-
-        The probed disposition wins when a track carries one; otherwise the
-        first audio-only row. A muxed row is a variant, not a rendition, and
-        never takes the flag.
-        """
-        renditions = [
-            position
-            for position, row in enumerate(variant_rows)
-            if row.audio is not None and row.video is None
-        ]
-        for position in renditions:
-            audio = variant_rows[position].audio
-            source = audio.source if audio is not None else None
-            if source is not None and source.disposition.get("default"):
-                return position
-        return renditions[0] if renditions else None
 
     def _variant_names(
         self, variant_rows: list[_VariantRow]
@@ -4748,39 +3999,7 @@ class _Lowerer:
             options["gop"] = targets[0] if len(set(targets)) == 1 else list(targets)
         keyint = options["gop"]
         options["keyint_min"] = list(keyint) if isinstance(keyint, list) else keyint
-        self._disable_scene_cuts(options)
-
-    def _disable_scene_cuts(self, options: dict[str, object]) -> None:
-        """Scene cuts off, in the encoder's own spelling.
-
-        libx264 reads ``-sc_threshold 0``; libx265 and libsvtav1 read a
-        private param, carried on the codec_params road the table already
-        renders. Any other encoder is left alone: a knob it does not have
-        would be a silent no-op.
-        """
-        codec = options.get("video_codec")
-        if codec == "libx264":
-            options["sc_threshold"] = 0
-            return
-        param = {"libx265": "scenecut=0", "libsvtav1": "scd=0"}.get(
-            codec if isinstance(codec, str) else ""
-        )
-        if param is None:
-            return
-        key = param.partition("=")[0]
-        written = options.get("codec_params")
-        if written is None:
-            options["codec_params"] = param
-        elif isinstance(written, str):
-            if key not in written:
-                options["codec_params"] = f"{written}:{param}"
-        elif isinstance(written, list):
-            options["codec_params"] = [
-                element
-                if not isinstance(element, str) or key in element
-                else f"{element}:{param}"
-                for element in written
-            ]
+        _disable_scene_cuts(options)
 
     def _output_rate(self, ref: FrameRef, raw: RawSink, format_name: str) -> float:
         """One video output's frame rate, walked back through its chain.
@@ -4884,7 +4103,7 @@ class _Lowerer:
             # so it is evaluated against the branch's real bindings instead
             # of raising the generic message below.
             bound_env = self.sink_env if self.sink_env is not None else _Env()
-            if not self._reads_unbound_rendition_column(expression, bound_env):
+            if not _reads_unbound_rendition_column(expression, bound_env):
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,
                     "a TO expression reads a track-row table this COPY's FROM "
@@ -4908,22 +4127,6 @@ class _Lowerer:
                 hint="COALESCE the column, or filter the rows that lack it",
             )
         return _tag_text(value)
-
-    def _reads_unbound_rendition_column(self, expression: exp.Expr, env: _Env) -> bool:
-        """True if `expression` reads a rendition column off an input alias
-        `env` binds, but only as a plain `_InputBinding` -- a ladder column
-        resolve admitted on spec, that this alias's own probe turned up no
-        renditions for."""
-        for sub in expression.walk():
-            if not isinstance(sub, exp.Column):
-                continue
-            table_node = sub.args.get("table")
-            if table_node is None:
-                continue
-            binding = env.bindings.get(_fold(table_node))
-            if isinstance(binding, _InputBinding) and _fold(sub.this) in _RENDITION_SCHEMA:
-                return True
-        return False
 
     def _check_path_segment(
         self, segment: exp.Expr, env: _Env, raw: RawSink, anchor: exp.Select
@@ -5118,40 +4321,10 @@ class _Lowerer:
                 fallback=select,
                 hint=hint,
             )
-        cells = self._named_record_cells(struct, record, fields, select)
+        cells = _named_record_cells(struct, record, fields, select)
         return {
             name: (cell, self._eval_value(cell, env, row, select))
             for name, cell in cells.items()
-        }
-
-    def _named_record_cells(
-        self,
-        struct: exp.Struct,
-        record: str,
-        fields: tuple[Field, ...],
-        select: exp.Select,
-    ) -> dict[str, exp.Expr]:
-        """One ``STRUCT(... AS name)`` matched to a record's declared fields.
-
-        Order-free: the field NAME picks the slot. A field the struct leaves
-        out is NULL, which the per-field checks then accept or reject exactly
-        as a written NULL is accepted or rejected.
-        """
-        written = _struct_fields(struct)
-        declared = {field.name for field in fields}
-        for name in written:
-            if name in declared:
-                continue
-            listed = ", ".join(field.name for field in fields)
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL,
-                f"{article(record)} {record} has no field '{name}'",
-                written[name],
-                fallback=select,
-                hint=f"the fields a {record} takes are {listed}",
-            )
-        return {
-            field.name: written.get(field.name, exp.Null()) for field in fields
         }
 
     def _chapter_record(
@@ -5437,8 +4610,8 @@ class _Lowerer:
         # concat maps one input pad per column, so arrays are flattened to
         # one column per element BEFORE it sees them.
         flattened = [_flatten(columns) for columns in surviving]
-        self._check_concat_columns(written, flattened)
-        self._check_concat_signature(written, surviving, flattened)
+        _check_concat_columns(written, flattened)
+        _check_concat_signature(written, surviving, flattened)
         return self._concat(flattened)
 
     def _nothing_to_write_error(
@@ -5462,56 +4635,6 @@ class _Lowerer:
             "file is never written; widen the WHERE, or lower the threshold it "
             "compares against",
         )
-
-    def _check_concat_columns(
-        self, branches: list[exp.Select], flattened: list[list[_Column]]
-    ) -> None:
-        """No UNION ALL branch may carry a subtitle/data column.
-
-        ``concat`` is a filtergraph filter and takes ``v`` video plus ``a``
-        audio pads — there is no ``s``/``d`` half — so a caption column in a
-        concatenated branch has nowhere to go. Checked before
-        :meth:`_check_concat_signature` so the rejection names the real reason
-        rather than a column-count mismatch.
-        """
-        for index, columns in enumerate(flattened):
-            for column in columns:
-                if column.value.type in _PASSTHROUGH_ONLY:
-                    raise _error(
-                        ErrorCode.UNSUPPORTED_SQL,
-                        f"UNION ALL concatenates video and audio only: branch "
-                        f"{index + 1} selects a {column.value.type} stream",
-                        branches[index],
-                        hint="select subtitle and data streams outside the UNION ALL "
-                        "(they are copied, never concatenated)",
-                    )
-
-    def _check_concat_signature(
-        self,
-        branches: list[exp.Select],
-        lowered: list[list[_Column]],
-        flattened: list[list[_Column]],
-    ) -> None:
-        """Every UNION ALL branch must agree on column count, types and order.
-
-        On the FLATTENED signature: an array column contributes one concat
-        column per element, so branches must agree on element counts too. The
-        message renders each column as written (``audio[2]`` for an array), so
-        a pure length mismatch reads as one.
-        """
-        expected = [column.value.type for column in flattened[0]]
-        for index in range(1, len(flattened)):
-            got = [column.value.type for column in flattened[index]]
-            if got == expected:
-                continue
-            raise _error(
-                ErrorCode.CONCAT_MISMATCH,
-                "UNION ALL branches must select the same stream types in the same "
-                f"order: branch 1 selects ({_signature(lowered[0])}), "
-                f"branch {index + 1} selects ({_signature(lowered[index])})",
-                branches[index],
-                hint="ffmpeg concat needs identical segments; reorder or add columns",
-            )
 
     def _concat(self, lowered: list[list[_Column]]) -> list[_Column]:
         """Join branches with one ``concat`` node, interleaved as ffmpeg wants.
@@ -5590,7 +4713,7 @@ class _Lowerer:
         # A bound naming a row column is one window per row, so it -- like a
         # fan-out's, which waits for the pin -- is read off the relation the
         # WHERE and the ORDER BY leave behind.
-        per_row = any(self._is_row_window(conjunct, env) for conjunct in time_conjuncts)
+        per_row = any(_is_row_window(conjunct, env) for conjunct in time_conjuncts)
         if not fanout and not per_row:
             self._collect_trims(select, env, time_conjuncts)
         self._filter_rows(row_conjuncts, env, select)
@@ -5714,20 +4837,6 @@ class _Lowerer:
 
     # -- one row, one file -------------------------------------------------
 
-    def _from_rendition_table(self, env: _Env | None) -> bool:
-        """True when `env` binds a rendition ladder's row table.
-
-        The fix for "too many rows/streams for one slot" is different for a
-        ladder than for a joined CTE or an unnest table: narrow it to one
-        rendition (WHERE, or ORDER BY ... LIMIT 1), not restructure the query.
-        """
-        if env is None:
-            return False
-        return any(
-            isinstance(binding, _RowBinding) and binding.column == RENDITION_COLUMN
-            for binding in env.bindings.values()
-        )
-
     def _check_one_row_per_file(self, select: exp.Select, env: _Env) -> None:
         """One row is one file, so a single destination needs a single row.
 
@@ -5743,7 +4852,7 @@ class _Lowerer:
         third answer: its one written name binds many outputs, so the rows
         stand -- each becomes a variant map entry. A row-reading sink is a
         fourth: its own arity, not this rule, says how many rows it takes
-        (:meth:`_check_row_sink_arity`).
+        (:func:`ffrwd.admit._check_row_sink_arity`).
         """
         if (
             self.fanout_expr is not None
@@ -5751,7 +4860,7 @@ class _Lowerer:
             or self.row_reading_sink
         ):
             return
-        rendition_rows = self._from_rendition_table(env)
+        rendition_rows = _from_rendition_table(env)
         if env.grouped:
             count = len(self._grouped_partitions(env, select))
             what = "group" if count == 1 else "groups"
@@ -5843,7 +4952,7 @@ class _Lowerer:
         more than one of them -- the shape that differs tuple by tuple."""
         if binding.rows <= 1:
             return False
-        column = self._cte_column(binding, name)
+        column = _cte_column(binding, name)
         return column is not None and column.splat and column.value.is_array
 
     def _branch_value(
@@ -5922,8 +5031,8 @@ class _Lowerer:
             if isinstance(binding, _InputBinding) and _fold(table_node) in env.row_inputs:
                 return True
             if isinstance(binding, _CteBinding):
-                column = self._cte_column(binding, _fold(sub.this))
-                if column is not None and self._cte_cell_column(binding, column):
+                column = _cte_column(binding, _fold(sub.this))
+                if column is not None and _cte_cell_column(binding, column):
                     return True
         return False
 
@@ -6002,7 +5111,7 @@ class _Lowerer:
         node = _unwrap(projection)
         spec = self._read_tags(node, env, select)
         for key, value_node in spec.entries.items():
-            self._check_tag_key(key, value_node, env, select)
+            _check_tag_key(key, value_node, env, select)
         if _has_track_rows(env) and not env.grouped:
             self._collect_stream_tags(spec, node, env, select)
             return
@@ -6131,53 +5240,13 @@ class _Lowerer:
                     f"unknown column '{alias}.{TAGS_COLUMN}'",
                     operand,
                     fallback=select,
-                    hint=self._cte_columns_hint(binding),
+                    hint=_cte_columns_hint(binding),
                 )
             # A row alias's map is what already rides through to the output,
             # so copying it names nothing new; only an input's globals do.
             if isinstance(binding, _InputBinding):
                 copy_alias = alias
         return _Tags(entries=entries, copy_alias=copy_alias, stripped=stripped)
-
-    def _check_tag_key(
-        self, key: str, anchor: exp.Expr, env: _Env, select: exp.Select
-    ) -> None:
-        """A tags field names a tag KEY, never a probed field or the flag map.
-
-        The reserved set is the read-only field names of whatever the column
-        sits over: the file reports those, so a query cannot claim them.
-        """
-        if key == DISPOSITION_COLUMN:
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL,
-                f"'{DISPOSITION_COLUMN}' is the stream's flag map, not a tag",
-                anchor,
-                fallback=select,
-                hint="write it as its own column, e.g. "
-                f"'{DISPOSITION_KEYS[0]}' AS {DISPOSITION_COLUMN}",
-            )
-        if _has_track_rows(env) and not env.grouped:
-            what = "track row"
-            reserved = frozenset(
-                name
-                for binding in env.bindings.values()
-                if isinstance(binding, _RowBinding)
-                for name in binding.readonly
-            )
-        else:
-            what = "container"
-            reserved = CONTAINER_READONLY_FIELDS
-        if key not in reserved:
-            return
-        raise _error(
-            ErrorCode.UNSUPPORTED_SQL,
-            f"'{key}' is a probed field of the {what}, not something a query "
-            "can set",
-            anchor,
-            fallback=select,
-            hint=f"the file reports {key}; a tags field is a free-form key, "
-            "e.g. STRUCT('eng' AS language) AS tags",
-        )
 
     def _collect_value_column(
         self, name: str, projection: exp.Expr, env: _Env, select: exp.Select
@@ -6223,56 +5292,12 @@ class _Lowerer:
             )
         value_node = _unwrap(projection)
         for row in relation.tuples:
-            flags = self._flag_spec(
+            flags = _flag_spec(
                 self._eval_value(value_node, env, row, select), projection, select
             )
             for track in row.values():
                 if isinstance(track, _TrackRow):
                     self._record_disposition(track.stream.source, flags, projection, select)
-
-    def _flag_spec(
-        self, value: RowValue, anchor: exp.Expr, select: exp.Select
-    ) -> tuple[str, ...]:
-        """One written disposition value as the flags it sets, in declared order.
-
-        ``'default+forced'`` sets those two, ``'0'`` and NULL set none, and a
-        name outside the closed set is a rejection naming the ones that are in
-        it. Order is the type's, not the writer's, so one flag map has one
-        spelling however it was typed.
-        """
-        if value is None:
-            return ()
-        if not isinstance(value, str):
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL,
-                f"'{DISPOSITION_COLUMN}' takes ffmpeg's flag spec, not a number",
-                anchor,
-                fallback=select,
-                hint=f"quote the flags, e.g. '{DISPOSITION_KEYS[0]}' or '0' to "
-                "clear them",
-            )
-        if value == "0":
-            return ()
-        named = set()
-        for part in value.split("+"):
-            key = part.strip().lower()
-            if not key or key.startswith(("+", "-")):
-                # ffmpeg's own `+flag`/`-flag` adjusts what the source carries;
-                # this column says what the whole map is, so there is nothing
-                # for a relative spec to adjust.
-                raise _error(
-                    ErrorCode.UNSUPPORTED_SQL,
-                    f"'{value}' is not a flag list",
-                    anchor,
-                    fallback=select,
-                    hint="name every flag the track should have, joined with "
-                    f"'+', e.g. '{DISPOSITION_KEYS[0]}+{DISPOSITION_KEYS[6]}'; "
-                    "'0' clears them all",
-                )
-            if key not in DISPOSITION_KEYS:
-                raise flag_error(part.strip(), key, anchor, select)
-            named.add(key)
-        return tuple(key for key in DISPOSITION_KEYS if key in named)
 
     def _record_disposition(
         self,
@@ -6395,7 +5420,7 @@ class _Lowerer:
             return lambda: column
 
         def rendition_thunk(binding: _RowBinding, kind: StreamType) -> Callable[[], _Column]:
-            return lambda: _Column(name=None, value=self._rendition_row_cells(binding, kind))
+            return lambda: _Column(name=None, value=_rendition_row_cells(binding, kind))
 
         for binding in self._star_bindings(qualifier, anchor, env, select):
             if isinstance(binding, _RowBinding):
@@ -6403,7 +5428,7 @@ class _Lowerer:
                     raise _row_star_error(binding, anchor, select)
                 # A rendition alias's star is its two stream arrays, one cell
                 # per row -- the same expansion an input alias gets, applied
-                # per row (:meth:`_rendition_row_cells`, already how a
+                # per row (:func:`ffrwd.rows._rendition_row_cells`, already how a
                 # manifest destination and a CTE body read `r.video`/`r.audio`).
                 vocabulary |= set(_RENDITION_STAR_COLUMNS)
                 for rendition_kind in _RENDITION_STAR_COLUMNS:
@@ -6571,19 +5596,6 @@ class _Lowerer:
             )
         return [binding]
 
-    def _check_star_table_mode(self, anchor: exp.Expr, select: exp.Select) -> None:
-        """EXCEPT/REPLACE narrow a MEDIA star's stream expansion; a table
-        query's star prints record fields instead, which they do not reach."""
-        star = star_node(anchor)
-        if star is not None and (star.args.get("except_") or star.args.get("replace")):
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL,
-                "EXCEPT/REPLACE are not supported on a table query's '*'",
-                anchor,
-                fallback=select,
-                hint="write the columns out, or drop the modifier",
-            )
-
     def _star_names(
         self, qualifier: str, anchor: exp.Expr, env: _Env, select: exp.Select
     ) -> list[str]:
@@ -6594,7 +5606,7 @@ class _Lowerer:
         one array column its output type fills. `_star_cells` walks the very
         same lists in the same order.
         """
-        self._check_star_table_mode(anchor, select)
+        _check_star_table_mode(anchor, select)
         names: list[str] = []
         for binding in self._star_bindings(qualifier, anchor, env, select):
             if isinstance(binding, _RowBinding):
@@ -6620,7 +5632,7 @@ class _Lowerer:
         for binding in self._star_bindings(qualifier, anchor, env, select):
             if isinstance(binding, _RowBinding):
                 columns += [
-                    self._row_metadata_cells(binding, name, anchor, select)
+                    _row_metadata_cells(binding, name, anchor, select)
                     for name in binding.star
                 ]
             elif isinstance(binding, _InputBinding):
@@ -6632,7 +5644,7 @@ class _Lowerer:
                 ]
             elif isinstance(binding, _SourceBinding):
                 cell = ArrayCell(
-                    elements=(self._stream_to_cell(self._source_stream_of(binding)),)
+                    elements=(_stream_to_cell(self._source_stream_of(binding)),)
                 )
                 columns.append([cell] * cardinality)
             else:
@@ -6646,7 +5658,7 @@ class _Lowerer:
                             select,
                         ),
                         cardinality,
-                        splat=self._cte_cell_column(binding, column),
+                        splat=_cte_cell_column(binding, column),
                     )
                     for column in binding.columns
                 ]
@@ -6686,7 +5698,7 @@ class _Lowerer:
                     ).streams
                 )
             return ArrayCell(
-                elements=tuple(self._stream_to_cell(stream) for stream in streams)
+                elements=tuple(_stream_to_cell(stream) for stream in streams)
             )
 
         row_inputs = env.row_inputs.get(alias)
@@ -7157,7 +6169,7 @@ class _Lowerer:
                 "or false, and defaults to true",
             )
         rows = [
-            self._url_source_row(alias, position, entry, refuse)
+            _url_source_row(alias, position, entry, refuse)
             for position, entry in enumerate(written, start=1)
         ]
         return _UrlPayload(
@@ -7165,77 +6177,6 @@ class _Lowerer:
             bounded=bounded,
             rows=rows,
             types=_url_source_types(alias, rows, refuse),
-        )
-
-    def _url_source_row(
-        self,
-        alias: str,
-        position: int,
-        entry: object,
-        refuse: Callable[[str, str], FfrwdError],
-    ) -> _UrlRow:
-        """One row of a URL source's answer: its url, attributes and columns."""
-        if not isinstance(entry, dict):
-            raise refuse(
-                f"row {position} of '{alias}' is {entry!r}",
-                _URL_SOURCE_SHAPE_HINT,
-            )
-        url = entry.get("url")
-        if not isinstance(url, str) or not url:
-            raise refuse(
-                f"row {position} of '{alias}' names no url",
-                "every row a source produces names the url to open, e.g. "
-                '{"url": "clip.mp4"}',
-            )
-        bandwidth: int | None = None
-        text: dict[str, str | None] = dict.fromkeys(_URL_SOURCE_TEXT)
-        columns: dict[str, RowValue] = {}
-        for key, value in entry.items():
-            if key == _URL_SOURCE_URL:
-                continue
-            if key in _URL_SOURCE_PROBED:
-                raise refuse(
-                    f"row {position} of '{alias}' names '{key}'",
-                    f"'{key}' is what the probe reports; drop it from the row",
-                )
-            if key == "bandwidth":
-                if value is None or (
-                    isinstance(value, int) and not isinstance(value, bool)
-                ):
-                    bandwidth = value
-                    continue
-                raise refuse(
-                    f"row {position} of '{alias}' gives 'bandwidth' {value!r}",
-                    "'bandwidth' is a whole number of bits per second, or null",
-                )
-            if key in _URL_SOURCE_TEXT:
-                if value is None or isinstance(value, str):
-                    text[key] = value
-                    continue
-                raise refuse(
-                    f"row {position} of '{alias}' gives '{key}' {value!r}",
-                    f"'{key}' is a string, or null",
-                )
-            if _URL_SOURCE_NAME.fullmatch(key) is None:
-                raise refuse(
-                    f"row {position} of '{alias}' names the column '{key}'",
-                    "a source's column names are lowercase identifiers, e.g. "
-                    "sequence",
-                )
-            if value is not None and not isinstance(value, str | int | float | bool):
-                raise refuse(
-                    f"row {position} of '{alias}' gives '{key}' {value!r}",
-                    "a source's column value is a string, a number, a boolean "
-                    "or null",
-                )
-            columns[key] = value
-        return _UrlRow(
-            url=url,
-            bandwidth=bandwidth,
-            codecs=text["codecs"],
-            name=text["name"],
-            language=text["language"],
-            columns=columns,
         )
 
     def _described_source(
@@ -7247,7 +6188,7 @@ class _Lowerer:
         rules rather than reused whole: a source reads no streams and emits
         no per-frame annotations, so the filter-shaped checks
         :meth:`_described` runs after the world/export match --
-        :meth:`_check_stream_arity` chief among them, which would read
+        :func:`ffrwd.admit._check_stream_arity` chief among them, which would read
         ``described.inputs`` as if it were a filter's pad count -- have
         nothing to check here and would misjudge a module that correctly
         reads none at all.
@@ -7938,7 +6879,7 @@ class _Lowerer:
         # is never timeline-capable -- there is no upstream frame to switch
         # on/off. `enable => ...` on a source rejects unconditionally.
         dropped: dict[str, exp.Expr] = {}
-        args = self._check_named_args(
+        args = _check_named_args(
             raw.name,
             options,
             named,
@@ -7947,7 +6888,7 @@ class _Lowerer:
             occupied=set(),
             dropped=dropped,
         )
-        self._check_required_options(raw.name, args, dropped, raw.call_node, select)
+        _check_required_options(raw.name, args, dropped, raw.call_node, select)
         env.bindings[alias] = _SourceBinding(
             alias=alias, name=raw.name, output=source.output, options=args
         )
@@ -8079,7 +7020,7 @@ class _Lowerer:
             if not rows:
                 time_conjuncts.append(conjunct)
                 continue
-            if aliases - rows and len(rows) == 1 and self._is_row_window(conjunct, env):
+            if aliases - rows and len(rows) == 1 and _is_row_window(conjunct, env):
                 # A time window whose BOUNDS are row columns: one seek per row.
                 # A fan-out TO gives each row a file; without one the rows stay
                 # in this graph and each seeks its own `-i` of the same file.
@@ -8123,28 +7064,6 @@ class _Lowerer:
             hint=f"window the input() alias '{alias}' was built from, or write "
             "TO ('clip' || i.i::text || '.mp4') for one command per row",
         )
-
-    def _reads_row_alias(self, node: exp.Expr, env: _Env) -> bool:
-        """True when `node` reads a column of any row table of this branch."""
-        for sub in node.walk():
-            if not isinstance(sub, exp.Column):
-                continue
-            table_node = sub.args.get("table")
-            if table_node is not None and isinstance(
-                env.bindings.get(_fold(table_node)), _RowBinding
-            ):
-                return True
-        return False
-
-    def _is_row_window(self, conjunct: exp.Expr, env: _Env) -> bool:
-        """True for a time window on a non-row alias bounded by row columns."""
-        parsed = _time_bounds(conjunct)
-        if parsed is None:
-            return False
-        table_node = parsed[0].args.get("table")
-        if table_node is None or _fold(parsed[0].this) != TIME_COLUMN:
-            return False
-        return not isinstance(env.bindings.get(_fold(table_node)), _RowBinding)
 
     # -- compile-time row filtering / ordering -------------------
 
@@ -8263,7 +7182,7 @@ class _Lowerer:
             return track.stream if track is not None else None
         if not isinstance(binding, _CteBinding):
             return None
-        column = self._cte_column(binding, name)
+        column = _cte_column(binding, name)
         if column is None or not column.value.streams:
             return None
         entry = row.get(binding.name)
@@ -8293,27 +7212,7 @@ class _Lowerer:
             binding = env.bindings.get(_fold(table_node))
             if isinstance(binding, _CteBinding) and binding.relation is not None:
                 return binding.relation
-        return self._row_binding_of(conjunct, env, select).relation
-
-    def _row_binding_of(
-        self, node: exp.Expr, env: _Env, select: exp.Select
-    ) -> _RowBinding:
-        """The single row table `node`'s columns belong to (checked upstream)."""
-        for sub in node.walk():
-            if not isinstance(sub, exp.Column):
-                continue
-            table_node = sub.args.get("table")
-            if table_node is None:
-                continue
-            binding = env.bindings.get(_fold(table_node))
-            if isinstance(binding, _RowBinding):
-                return binding
-        raise _error(  # defensive: the caller only passes row expressions
-            ErrorCode.UNSUPPORTED_SQL,
-            "unsupported track-row expression",
-            node,
-            fallback=select,
-        )
+        return _row_binding_of(conjunct, env, select).relation
 
     def _eval_row(
         self,
@@ -8404,7 +7303,7 @@ class _Lowerer:
                 f"unknown column '{binding.name}.{column.name}'",
                 column,
                 fallback=select,
-                hint=self._cte_columns_hint(binding),
+                hint=_cte_columns_hint(binding),
             )
         if binding.name in rows and rows[binding.name] is None:
             return None  # an outer join's gap reads NULL in every column
@@ -8547,7 +7446,7 @@ class _Lowerer:
                 declared = self.res.wasm.get(name)
                 if declared is not None and declared.is_value:
                     return self._eval_wasm_value(declared, call, value, env, rows, select)
-        return self._literal_of(value, select)
+        return _literal_of(value, select)
 
     def _eval_vector(
         self,
@@ -8880,7 +7779,7 @@ class _Lowerer:
         element = elements[index - 1]
         if isinstance(_unwrap(element), exp.Null):
             return None  # a NULL element is absence, like a NULL subscript
-        return self._literal_of(element, select)
+        return _literal_of(element, select)
 
     def _eval_concat(
         self,
@@ -8895,22 +7794,6 @@ class _Lowerer:
         if left is None or right is None:
             return None
         return f"{left}{right}"
-
-    def _literal_of(self, node: exp.Expr | None, select: exp.Select) -> RowValue:
-        """A row predicate's literal operand as a python scalar."""
-        value = _unwrap(node) if isinstance(node, exp.Expr) else None
-        if isinstance(value, exp.Neg) and isinstance(value.this, exp.Expr):
-            return -_number(_unwrap(value.this), ErrorCode.UNSUPPORTED_SQL)
-        if isinstance(value, exp.Literal):
-            if value.is_string:
-                return str(value.this)
-            return _number(value, ErrorCode.UNSUPPORTED_SQL)
-        raise _error(
-            ErrorCode.UNSUPPORTED_SQL,
-            "a track-row predicate compares a row column against a literal",
-            value,
-            fallback=select,
-        )
 
     # -- subscript metadata WHERE assertions --
     #
@@ -8967,8 +7850,8 @@ class _Lowerer:
             return not is_null if node.args.get("negate") else is_null
         if isinstance(node, exp.Between):
             value = self._accessor_value(node.this, select)
-            low = self._literal_of(node.args.get("low"), select)
-            high = self._literal_of(node.args.get("high"), select)
+            low = _literal_of(node.args.get("low"), select)
+            high = _literal_of(node.args.get("high"), select)
             return _kleene_and(
                 _compare(exp.GTE(), value, low), _compare(exp.LTE(), value, high)
             )
@@ -8984,13 +7867,13 @@ class _Lowerer:
                 return _compare(
                     node,
                     self._accessor_value(left_node, select),
-                    self._literal_of(right_node, select),
+                    _literal_of(right_node, select),
                 )
             mirrored = _MIRRORED_COMPARISONS[type(node)]()
             return _compare(
                 mirrored,
                 self._accessor_value(right_node, select),
-                self._literal_of(left_node, select),
+                _literal_of(left_node, select),
             )
         raise _error(
             ErrorCode.UNSUPPORTED_SQL, "unsupported WHERE predicate", node,
@@ -9216,12 +8099,12 @@ class _Lowerer:
                     hint=_RENDITIONLESS_ROW_CLAUSE_HINT,
                 )
         take = (
-            self._row_bound(limit.args.get("expression"), "LIMIT", select)
+            _row_bound(limit.args.get("expression"), "LIMIT", select)
             if isinstance(limit, exp.Limit)
             else None
         )
         skip = (
-            self._row_bound(offset.args.get("expression"), "OFFSET", select)
+            _row_bound(offset.args.get("expression"), "OFFSET", select)
             if isinstance(offset, exp.Offset)
             else None
         )
@@ -9243,22 +8126,6 @@ class _Lowerer:
             return
         end = None if take is None else (skip or 0) + take
         relation.tuples = relation.tuples[skip or 0 : end]
-
-    def _row_bound(
-        self, node: exp.Expr | None, clause: str, select: exp.Select
-    ) -> int:
-        """One LIMIT/OFFSET count as a python int (defensive: resolve checked)."""
-        value = _unwrap(node) if isinstance(node, exp.Expr) else None
-        if isinstance(value, exp.Literal) and not value.is_string:
-            text = str(value.this)
-            if text.isascii() and text.isdigit():
-                return int(text)
-        raise _error(
-            ErrorCode.UNSUPPORTED_SQL,
-            f"{clause} must be an integer literal",
-            node if isinstance(node, exp.Expr) else None,
-            fallback=select,
-        )
 
     def _collect_trims(
         self, select: exp.Select, env: _Env, conjuncts: list[exp.Expr]
@@ -9432,7 +8299,7 @@ class _Lowerer:
         if not isinstance(env.bindings.get(alias), _InputBinding):
             return False
         return any(
-            node is not None and self._reads_row_alias(node, env)
+            node is not None and _reads_row_alias(node, env)
             for node in (low, high)
         )
 
@@ -9934,7 +8801,7 @@ class _Lowerer:
                 hint=f"write at least one row, e.g. ARRAY[{_EMBEDDING_EXAMPLE}], "
                 "or drop the column",
             )
-        dims = self._embedding_dims(rows, node, select)
+        dims = _embedding_dims(rows, node, select)
         text = _cues_webvtt(
             [
                 _Cue(
@@ -9952,37 +8819,6 @@ class _Lowerer:
             EMBEDDINGS_COLUMN, text, {VECTOR_DIMS_TAG: str(dims)}
         )
         return _scalar(_Stream(ref=ref, type="subtitle", source=None))
-
-    def _embedding_dims(
-        self, rows: list[_Embedding], node: exp.Expr, select: exp.Select
-    ) -> int:
-        """How many numbers every row of one vector track carries.
-
-        A track has ONE width -- it is a stream tag, not a per-row field --
-        so two rows of different lengths are a rejection naming both.
-        """
-        dims = len(rows[0].vector)
-        for position, row in enumerate(rows[1:], start=2):
-            if len(row.vector) != dims:
-                raise _error(
-                    ErrorCode.UNSUPPORTED_SQL,
-                    f"{EMBEDDING_TYPE} {position} carries {len(row.vector)} "
-                    f"numbers, and {EMBEDDING_TYPE} 1 carries {dims}",
-                    row.vector_node,
-                    fallback=select,
-                    hint="one track holds vectors of one length; write the rows "
-                    "of one embedder per track",
-                )
-        if dims == 0:
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL,
-                f"{EMBEDDING_TYPE} 1 carries an empty vector",
-                rows[0].vector_node,
-                fallback=select,
-                hint="a vector track holds the numbers an embedder wrote; an "
-                "empty one says nothing",
-            )
-        return dims
 
     def _embedding_records(
         self, node: exp.Expr, env: _Env, select: exp.Select
@@ -10162,7 +8998,7 @@ class _Lowerer:
         -- `declared.emits` or `declared.returns_rows`. A vector field passed
         module to module, never written to a track, names no length at all;
         one reaching a track here needs one fixed, which is what
-        :meth:`_check_vector_dims` checks -- only at this, its one path to an
+        :func:`ffrwd.admit._check_vector_dims` checks -- only at this, its one path to an
         output, and not at every call a vector annotation happens to pass
         through.
         """
@@ -10173,7 +9009,7 @@ class _Lowerer:
             return _Value(type=kind, streams=(), is_array=False)
         described = self.describes.get(declared.module)
         assert described is not None  # the caller already described it
-        self._check_vector_dims(declared, annotation, described, node, select)
+        _check_vector_dims(declared, annotation, described, node, select)
         tag = self._rows_language(declared, call, node, env, select)
         ref = self._mint_stream_input(
             CUES_COLUMN, PIPE, WEBVTT_FORMAT, "subtitle"
@@ -10248,29 +9084,10 @@ class _Lowerer:
         if source is None:
             raise self._not_rows(declared, written, node, env)
         producer, kind, emitted = source
-        self._check_rows_argument(declared, emitted, written, node, select)
+        _check_rows_argument(declared, emitted, written, node, select)
         assert declared.returns_rows is not None  # what is_rows selected on
         ref = self.ctx.node(declared.module, {}, [], [], rows_inputs=[producer])
         return ref, kind, declared.returns_rows
-
-    def _cte_column_ref(
-        self, node: exp.Expr, env: _Env
-    ) -> tuple[_CteBinding, str] | None:
-        """``<alias>.<column>``, when `alias` names a CTE in scope.
-
-        The binding and the column's folded name, so a caller can look up
-        what that column carries. None for everything else -- no error, no
-        lowering, a pure probe over `env`.
-        """
-        if not isinstance(node, exp.Column):
-            return None
-        table_node = node.args.get("table")
-        if table_node is None:
-            return None
-        binding = env.bindings.get(_fold(table_node))
-        if not isinstance(binding, _CteBinding):
-            return None
-        return binding, _fold(node.this)
 
     def _rows_column_source(
         self, node: exp.Expr, env: _Env
@@ -10287,7 +9104,7 @@ class _Lowerer:
         source = self.rows_producers.pop(id(node), None)
         if source is not None:
             return source
-        cte_ref = self._cte_column_ref(node, env)
+        cte_ref = _cte_column_ref(node, env)
         if cte_ref is None:
             return None
         binding, name = cte_ref
@@ -10298,7 +9115,7 @@ class _Lowerer:
         CTE column that is one."""
         if _is_cue_array(node):
             return True
-        cte_ref = self._cte_column_ref(node, env)
+        cte_ref = _cte_column_ref(node, env)
         return cte_ref is not None and cte_ref[1] in cte_ref[0].cue_columns
 
     def _rows_source(
@@ -10358,7 +9175,7 @@ class _Lowerer:
         what its own body actually bound it to, not against `written`'s own
         shape (a Column, whatever it carries).
         """
-        cte_ref = self._cte_column_ref(written, env)
+        cte_ref = _cte_column_ref(written, env)
         if cte_ref is not None:
             binding, name = cte_ref
             label = f"'{binding.name}.{name}'"
@@ -10467,7 +9284,7 @@ class _Lowerer:
                 hint=f"a module carries one rows export; write '{described.name}' "
                 "as the export",
             )
-        self._check_rows_schema(
+        _check_rows_schema(
             declared,
             declared.rows_param,
             input_rows_arms(described),
@@ -10476,7 +9293,7 @@ class _Lowerer:
             select=select,
         )
         assert declared.returns_rows is not None  # what is_rows selected on
-        self._check_rows_schema(
+        _check_rows_schema(
             declared,
             declared.returns_rows,
             rows_arms(described),
@@ -10485,68 +9302,6 @@ class _Lowerer:
             select=select,
         )
         return described
-
-    def _check_rows_schema(
-        self,
-        declared: WasmFunction,
-        annotation: Annotation,
-        arms: tuple[tuple[tuple[str, str], ...], ...] | None,
-        *,
-        reads: bool,
-        node: exp.Expr,
-        select: exp.Select,
-    ) -> None:
-        """One end of a rows declaration against the schema the module publishes.
-
-        The same field-for-field match a per-frame annotation gets, run twice:
-        once for the rows the module reads, once for the rows it writes.
-        """
-        side = "reads" if reads else "writes"
-        if arms is None:
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL,
-                f"the module '{declared.module}' names no shape for the rows "
-                f"it {side}",
-                node,
-                fallback=select,
-                hint="a rows function needs a module that publishes both row "
-                "schemas; rebuild it declaring them",
-            )
-        fields = _annotation_fields(annotation)
-        if any(_annotation_matches(fields, arm) for arm in arms):
-            return
-        raise _error(
-            ErrorCode.UDF_ARG_TYPE,
-            f"function '{declared.name}' declares the rows it {side} as "
-            f"{annotation.written}, and the module '{declared.module}' {side} "
-            f"{' or '.join(_written_json_fields(arm) for arm in arms)}",
-            node,
-            fallback=select,
-            hint="a rows record names the module's own row columns, with a "
-            "type each value fits",
-        )
-
-    def _check_rows_argument(
-        self,
-        declared: WasmFunction,
-        emitted: Annotation,
-        written: exp.Expr,
-        node: exp.Expr,
-        select: exp.Select,
-    ) -> None:
-        """That the rows arriving are the rows this function declares reading."""
-        if _annotation_fields(declared.rows_param) == _annotation_fields(emitted):
-            return
-        raise _error(
-            ErrorCode.UDF_ARG_TYPE,
-            f"{declared.name}() reads '{declared.rows_param.name}' as "
-            f"{declared.rows_param.written}, and its argument carries "
-            f"'{emitted.name}' as {emitted.written}",
-            written,
-            fallback=node,
-            hint="the two annotation records have to name the same fields, "
-            "with the same types",
-        )
 
     def _rows_language(
         self,
@@ -10717,7 +9472,7 @@ class _Lowerer:
         ``r.video[k]`` names one element of it.
 
         A reader that counts rows reads it per ROW instead
-        (:meth:`_rendition_row_cells`): a manifest destination, whose every
+        (:func:`ffrwd.rows._rendition_row_cells`): a manifest destination, whose every
         row is one variant map entry; a row-reading sink; and a CTE body,
         which carries its rows to whichever of those reads it later. An
         audio-only rung's video cell is NULL there, not absent -- the same
@@ -10730,7 +9485,7 @@ class _Lowerer:
         kind = _ARRAY_COLUMNS[name]
         per_row = self.manifest is not None or self.row_reading_sink or self.cte_body
         if per_row and index in (None, 1):
-            return self._rendition_row_cells(binding, kind)
+            return _rendition_row_cells(binding, kind)
         streams = [
             row.kinds[kind] for row in binding.rows if row is not None and kind in row.kinds
         ]
@@ -10747,24 +9502,6 @@ class _Lowerer:
                 hint=_SUBSCRIPT_HINT,
             )
         return _scalar(streams[index - 1])
-
-    def _rendition_row_cells(self, binding: _RowBinding, kind: StreamType) -> _Value:
-        """``<alias>.video``/``.audio`` as one cell per ladder rung, in row
-        order -- a bare column and its ``[1]`` subscript read the same thing,
-        since a rung carries at most one stream of a kind. A rung without
-        that kind (an audio-only rendition's ``.video``) contributes the NULL
-        sentinel a manifest's variant map already knows how to read as an
-        absent cell, exactly like an unmatched FULL JOIN row.
-        """
-        return _array(
-            kind,
-            (
-                row.kinds[kind]
-                if row is not None and kind in row.kinds
-                else _Stream(ref=_NULL_STREAM_REF, type=kind, source=None)
-                for row in binding.rows
-            ),
-        )
 
     def _row_value(
         self,
@@ -10837,7 +9574,7 @@ class _Lowerer:
                 hint="an empty row set would select no streams; widen the WHERE, "
                 "or check that the file has the tracks you expect",
             )
-        streams = self._per_row_seeks(
+        streams = _per_row_seeks(
             binding,
             [
                 self._row_stream(binding, row, position, anchor, select)
@@ -10858,31 +9595,6 @@ class _Lowerer:
                 hint=_SUBSCRIPT_HINT,
             )
         return _scalar(streams[index - 1])
-
-    def _per_row_seeks(
-        self, binding: _RowBinding, streams: list[_Stream], env: _Env
-    ) -> list[_Stream]:
-        """Re-point a row table's tracks at the ``-i`` each row seeks.
-
-        A row-bounded window on the input the tracks came from gives every
-        result row a copy of the file with its own ``-ss``/``-to``, and a row's
-        track belongs to the copy that row seeks: the same stream of the same
-        file, read through a different input slot.
-        """
-        row_inputs = env.row_inputs.get(binding.source)
-        if row_inputs is None:
-            return streams
-        reseeked: list[_Stream] = []
-        for position, stream in enumerate(streams):
-            if position >= len(row_inputs) or not is_src(stream.ref):
-                reseeked.append(stream)
-                continue
-            _, stream_type, index = src_parts(stream.ref)
-            marker = _TYPE_MARKERS[stream_type]
-            reseeked.append(
-                replace(stream, ref=f"src:{row_inputs[position]}:{marker}:{index}")
-            )
-        return reseeked
 
     def _row_stream(
         self,
@@ -10942,7 +9654,7 @@ class _Lowerer:
         """What the missing row failed to match, named from its paired row."""
         relation = binding.relation
         row = relation.tuples[position]
-        paired_alias, paired = self._paired_row(relation, row, binding.alias)
+        paired_alias, paired = _paired_row(relation, row, binding.alias)
         keys = relation.keys.get(paired_alias or "", [])
         if paired is None or not keys:
             return f"the join found no {binding.column} row of '{binding.alias}'"
@@ -10951,27 +9663,6 @@ class _Lowerer:
             for key in keys
         )
         return f"no '{binding.alias}' row matched {described}"
-
-    def _paired_row(
-        self,
-        relation: _RowRelation,
-        row: _RowTuple,
-        alias: str,
-    ) -> tuple[str | None, _TrackRow | None]:
-        """The counterpart of a gap: the first row table that DID match here.
-
-        A fill's provenance is the paired (non-NULL counterpart) row's metadata,
-        and its inherited options come from that same row, so a silence-filled
-        French mix stays French.
-        Relation order (FROM order) breaks the tie when three tables joined.
-        """
-        for other in relation.aliases:
-            if other == alias:
-                continue
-            track = _track_of(row, other)
-            if track is not None:
-                return other, track
-        return None, None
 
     # -- COALESCE(<nullable cell>, <stand-in>) -----------------
 
@@ -10986,8 +9677,8 @@ class _Lowerer:
         (:meth:`_lower_cell_coalesce`), which is where a second nullable
         column can stand in for the first.
         """
-        arguments = self._coalesce_arguments(node, select)
-        binding = self._coalesce_binding(arguments[0], env)
+        arguments = _coalesce_arguments(node, select)
+        binding = _coalesce_binding(arguments[0], env)
         if binding is None:
             return self._lower_cell_coalesce(arguments, env, node, select)
         return self._lower_row_coalesce(binding, arguments[1], env, node, select)
@@ -11032,7 +9723,7 @@ class _Lowerer:
             self._check_coalesce_fill(
                 binding.type, stand_in, binding.alias, fill, select
             )
-            self._check_coalesce_width(stand_in, cardinality, fill, select)
+            _check_coalesce_width(stand_in, cardinality, fill, select)
             streams = [
                 stream
                 if stream is not None
@@ -11048,7 +9739,7 @@ class _Lowerer:
                     fill_call,
                     binding.type,
                     binding.alias,
-                    self._paired_row(relation, row, binding.alias)[1],
+                    _paired_row(relation, row, binding.alias)[1],
                     node,
                     select,
                 )
@@ -11121,8 +9812,8 @@ class _Lowerer:
             other = self._lower_expr(second, env, select)
             self._check_coalesce_fill(first.type, other, label, second, select)
             cardinality = max(cardinality, len(other.streams))
-            self._check_coalesce_width(first, cardinality, arguments[0], select)
-            self._check_coalesce_width(other, cardinality, second, select)
+            _check_coalesce_width(first, cardinality, arguments[0], select)
+            _check_coalesce_width(other, cardinality, second, select)
             for position in range(cardinality):
                 cell = first.at(min(position, len(first.streams) - 1))
                 if cell.ref == _NULL_STREAM_REF:
@@ -11149,7 +9840,7 @@ class _Lowerer:
                 f"'{_coalesce_label(node)}' produces neither",
                 node,
                 fallback=select,
-                hint=self._fill_hint(kind, label),
+                hint=_fill_hint(kind, label),
             )
         if other.type != kind:
             raise _error(
@@ -11158,57 +9849,8 @@ class _Lowerer:
                 f"and '{_coalesce_label(node)}' is {other.type}",
                 node,
                 fallback=select,
-                hint=self._fill_hint(kind, label),
+                hint=_fill_hint(kind, label),
             )
-
-    def _check_coalesce_width(
-        self, value: _Value, cardinality: int, node: exp.Expr, select: exp.Select
-    ) -> None:
-        """A COALESCE argument is one cell per row, or one stream every row
-        repeats -- nothing in between."""
-        if len(value.streams) in (1, cardinality):
-            return
-        raise _error(
-            ErrorCode.ROW_COUNT_MISMATCH,
-            f"'{_coalesce_label(node)}' carries {len(value.streams)} streams, "
-            f"and COALESCE is over {cardinality} rows",
-            node,
-            fallback=select,
-            hint="every argument is one cell per row, or one stream the rows "
-            "repeat",
-        )
-
-    def _coalesce_arguments(self, node: exp.Expr, select: exp.Select) -> list[exp.Expr]:
-        """COALESCE's two arguments, or a rejection. Creates no nodes, which
-        is what lets :meth:`_classify` read the type without lowering it."""
-        arguments = [
-            argument
-            for argument in [node.this, *node.expressions]
-            if isinstance(argument, exp.Expr)
-        ]
-        if len(arguments) != 2:
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL,
-                f"COALESCE takes a track column and one fill, got "
-                f"{len(arguments)} argument{'' if len(arguments) == 1 else 's'}",
-                node,
-                fallback=select,
-                hint=_COALESCE_HINT,
-            )
-        return arguments
-
-    def _coalesce_binding(self, argument: exp.Expr, env: _Env) -> _RowBinding | None:
-        """The track-row table a bare ``<alias>`` first argument names, whose
-        own relation says which rows are gaps. None for every other nullable
-        cell, which carries its gaps in the value itself."""
-        column = _unwrap(argument)
-        if not isinstance(column, exp.Column):
-            return None
-        table_node = column.args.get("table")
-        binding = env.bindings.get(_fold(table_node)) if table_node is not None else None
-        if not isinstance(binding, _RowBinding) or _fold(column.this) != ROW_STREAM:
-            return None
-        return binding
 
     def _lower_fill(
         self,
@@ -11228,7 +9870,7 @@ class _Lowerer:
         ``ffrwd.empty_captions()`` is an INPUT, because a filtergraph carries
         no subtitle pads to generate one on. Either way the fill inherits from
         the PAIRED row — the counterpart that did match — both its options
-        (:meth:`_inherited_fill_options`) and its provenance, so a
+        (:func:`ffrwd.fills._inherited_fill_options`) and its provenance, so a
         silence-filled French mix is still tagged French.
         """
         source_meta = paired.stream.source if paired is not None else None
@@ -11243,7 +9885,7 @@ class _Lowerer:
         self._check_fill_type(source.output, call.display, kind, label, node, select)
         options = self._filter_options(name, node, select)
         dropped: dict[str, exp.Expr] = {}
-        args = self._check_named_args(
+        args = _check_named_args(
             name,
             options,
             call.named,
@@ -11252,8 +9894,8 @@ class _Lowerer:
             occupied=set(),
             dropped=dropped,
         )
-        self._check_required_options(name, args, dropped, node, select)
-        for option, value in self._inherited_fill_options(kind, paired).items():
+        _check_required_options(name, args, dropped, node, select)
+        for option, value in _inherited_fill_options(kind, paired).items():
             if value is None or option in args or option not in options:
                 continue
             args[option] = value
@@ -11298,7 +9940,7 @@ class _Lowerer:
                 else f"unknown function {call.display}()",
                 node,
                 fallback=select,
-                hint=self._fill_hint(kind, label),
+                hint=_fill_hint(kind, label),
             )
         if call.named:
             raise _error(
@@ -11332,54 +9974,8 @@ class _Lowerer:
             f"'{label}' is {kind}",
             node,
             fallback=select,
-            hint=self._fill_hint(kind, label),
+            hint=_fill_hint(kind, label),
         )
-
-    def _fill_hint(self, kind: StreamType, label: str) -> str:
-        spelling = _FILL_SPELLINGS.get(kind)
-        if spelling is None:
-            return (
-                f"nothing generates a {kind} track, so there is no fill "
-                f"for '{label}'; select it from a "
-                "join that always matches"
-            )
-        return (
-            f"the fill for a {kind} track is {spelling}; its options "
-            "inherit from the paired row unless you give them"
-        )
-
-    def _inherited_fill_options(
-        self, stream_type: StreamType, paired: _TrackRow | None
-    ) -> dict[str, object]:
-        """What the fill copies from the row it stands beside.
-
-        Audio inherits DURATION only in v1 — a silent track's sample rate and
-        layout are ffmpeg's own defaults, and amix resamples anyway, so
-        inventing them would put options in the command nobody wrote. Video
-        inherits size, rate and duration, because a black frame of the wrong
-        size or rate is not a stand-in for the picture that is missing.
-        An option the query set explicitly always wins (the caller only fills
-        the ones it did not).
-        """
-        if paired is None:
-            return {}
-        columns = paired.columns
-        if stream_type == "audio":
-            return {"duration": columns.get("duration")}
-        if stream_type == "video":
-            width = columns.get("width")
-            height = columns.get("height")
-            size = (
-                f"{int(width)}x{int(height)}"
-                if isinstance(width, int | float) and isinstance(height, int | float)
-                else None
-            )
-            return {
-                "size": size,
-                "rate": columns.get("fps"),
-                "duration": columns.get("duration"),
-            }
-        return {}
 
     def _mint_input(self, macro: InputMacro) -> FrameRef:
         """Add the macro's own ``-i`` to the graph and ref its single stream."""
@@ -11465,7 +10061,7 @@ class _Lowerer:
                 f"unknown column '{binding.alias}.{name}'",
                 anchor,
                 fallback=select,
-                hint=self._source_columns_hint(binding),
+                hint=_source_columns_hint(binding),
             )
         if array_type != binding.output:
             raise _error(
@@ -11473,7 +10069,7 @@ class _Lowerer:
                 f"'{binding.alias}.{name}' does not exist: {produces}",
                 anchor,
                 fallback=select,
-                hint=self._source_columns_hint(binding),
+                hint=_source_columns_hint(binding),
             )
         if index is None:
             return _array(binding.output, (self._source_stream_of(binding),))
@@ -11486,9 +10082,6 @@ class _Lowerer:
                 hint=_SUBSCRIPT_HINT,
             )
         return _scalar(self._source_stream_of(binding))
-
-    def _source_columns_hint(self, binding: _SourceBinding) -> str:
-        return f"'{binding.display}' exposes {binding.alias}.{binding.output}"
 
     def _input_value(
         self,
@@ -11756,7 +10349,7 @@ class _Lowerer:
         anchor: exp.Expr,
         select: exp.Select,
     ) -> _Value:
-        column = self._cte_column(binding, name)
+        column = _cte_column(binding, name)
         if column is None:
             if name in binding.values:
                 raise _error(
@@ -11775,7 +10368,7 @@ class _Lowerer:
                 f"unknown column '{binding.name}.{name}'",
                 anchor,
                 fallback=select,
-                hint=self._cte_columns_hint(binding),
+                hint=_cte_columns_hint(binding),
             )
         if index is None:
             return self._cte_column_value(binding, column, anchor, select)
@@ -11824,7 +10417,7 @@ class _Lowerer:
         one unit and reads as itself.
         """
         relation = binding.relation
-        if relation is None or not self._cte_cell_column(binding, column):
+        if relation is None or not _cte_cell_column(binding, column):
             return column.value
         cells = (
             column.value.streams
@@ -11888,31 +10481,6 @@ class _Lowerer:
             or self.cte_body
             or self.array_agg_reads_nulls
         )
-
-    def _cte_cell_column(self, binding: _CteBinding, column: _Column) -> bool:
-        """True when a CTE's stream column reads one cell per row of the
-        branch's relation: a row set, one stream per body row, or a single
-        value every row repeats. A gathered array is one unit instead."""
-        value = column.value
-        if column.splat and value.is_array:
-            return len(value.streams) == binding.rows
-        return not value.is_array and len(value.streams) == 1
-
-    def _cte_column(self, binding: _CteBinding, name: str) -> _Column | None:
-        for column in binding.columns:
-            if column.name == name:
-                return column
-        return None
-
-    def _cte_columns_hint(self, binding: _CteBinding) -> str:
-        names = {column.name for column in binding.columns if column.name is not None}
-        names |= set(binding.values)
-        if not names:
-            return (
-                f"'{binding.name}' has no named columns; name them with AS "
-                "inside its SELECT"
-            )
-        return f"'{binding.name}' exposes: {', '.join(sorted(names))}"
 
     def _check_bounds(
         self,
@@ -12092,9 +10660,9 @@ class _Lowerer:
         # streams of each kind it takes is what it declares, and that is
         # checked against the signature in `_check_sink_shape`.
         if not described.packet_sink:
-            self._check_stream_arity(declared, described, node, select)
+            _check_stream_arity(declared, described, node, select)
         if declared.emits is not None:
-            self._check_annotation_schema(declared, declared.emits, described, node, select)
+            _check_annotation_schema(declared, declared.emits, described, node, select)
         # A windowed module is handed each frame's rows either way and reads
         # them at its own option, so a declaration without an annotation
         # column just wires none in. A per-frame consumer exists only to read
@@ -12197,186 +10765,10 @@ class _Lowerer:
                 )
         # A row-reading sink declares no stream parameters at all -- its
         # shape is judged against the SELECT list's actual rows instead,
-        # once they are known (:meth:`_check_row_sink_arity`), not here
+        # once they are known (:func:`ffrwd.admit._check_row_sink_arity`), not here
         # against a signature that names none.
         if not declared.reads_rows_from_select:
-            self._check_sink_shape(declared, described, node, select)
-
-    def _check_sink_shape(
-        self,
-        declared: WasmFunction,
-        described: Described,
-        node: exp.Expr,
-        select: exp.Select,
-    ) -> None:
-        """What the signature says it reads against what the module declares.
-
-        Per kind, since a sink reads each independently. A declaration naming
-        one stream of a kind always hands over one, so a module reading one,
-        many or any accepts it; anything that can hand over SEVERAL -- an
-        array, or several parameters of one kind -- needs a module that reads
-        many or any. A module reading ANY works without the kind entirely, so
-        a declaration naming none of it is a shape it accepts too. The refusal
-        lands here, at the call, where the run-time one it forestalls can be
-        said before anything runs.
-        """
-        for kind in WASM_STREAM_NAMES:
-            params = [
-                param
-                for param, declared_kind in zip(
-                    declared.stream_params, declared.stream_kinds, strict=True
-                )
-                if declared_kind == kind
-            ]
-            reads = described.sink_streams(kind)
-            if not params:
-                if reads not in ("none", "any"):
-                    raise _error(
-                        ErrorCode.UNSUPPORTED_SQL,
-                        f"the module '{declared.module}' reads {reads} "
-                        f"{kind} stream(s), and '{declared.name}' declares no "
-                        f"{WASM_STREAM_NAMES[kind]} parameter",
-                        node,
-                        fallback=select,
-                        hint=f"declare a {WASM_STREAM_NAMES[kind]} parameter "
-                        f"before the module's value parameters",
-                    )
-                continue
-            several = len(params) > 1 or any(is_array(p.type) for p in params)
-            if reads == "none" or (several and reads not in ("many", "any")):
-                written = ", ".join(f"{p.name} {p.type}" for p in params)
-                raise _error(
-                    ErrorCode.UNSUPPORTED_SQL,
-                    f"function '{declared.name}' declares ({written}), and the "
-                    f"module '{declared.module}' reads {reads} {kind} stream"
-                    f"{'' if reads == 'one' else 's'}",
-                    node,
-                    fallback=select,
-                    hint="declare what the module reads: "
-                    + (
-                        f"no {WASM_STREAM_NAMES[kind]} parameter"
-                        if reads == "none"
-                        else f"one {WASM_STREAM_NAMES[kind]} parameter"
-                    ),
-                )
-
-    def _check_stream_arity(
-        self,
-        declared: WasmFunction,
-        described: Described,
-        node: exp.Expr,
-        select: exp.Select,
-    ) -> None:
-        """The streams the signature declares against the streams the module reads.
-
-        A module reading several at once is a WINDOWED-interface export that
-        hands one frame back per frame in: a windowing one has no answer for
-        which frame of which input pairs with which, and a per-frame one
-        predates the declaration entirely.
-        """
-        reads = described.inputs
-        if reads > 1 and not described.windowed:
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL,
-                f"the module '{declared.module}' reads {reads} streams, and "
-                "declares the per-frame interface",
-                node,
-                fallback=select,
-                hint="rebuild the module against the windowed interface, which "
-                "is where a module reads more than one stream",
-            )
-        if reads > 1 and (described.window != 1 or described.stride != 1):
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL,
-                f"the module '{declared.module}' reads {reads} streams over a "
-                f"window of {described.window} every {described.stride}",
-                node,
-                fallback=select,
-                hint="a module reading several streams takes one frame off each "
-                "and hands one back; rebuild it with a window and stride of 1",
-            )
-        if declared.stream_arity != reads:
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL,
-                f"function '{declared.name}' declares {declared.stream_arity} "
-                f"stream parameter{'' if declared.stream_arity == 1 else 's'}, "
-                f"and the module '{declared.module}' reads {reads}",
-                node,
-                fallback=select,
-                hint=f"declare one {declared.returns} parameter per stream the "
-                f"module reads, {reads} of them, before its value parameters",
-            )
-
-    def _check_annotation_schema(
-        self,
-        declared: WasmFunction,
-        annotation: Annotation,
-        described: Described,
-        node: exp.Expr,
-        select: exp.Select,
-    ) -> None:
-        """The declared annotation record against the rows the module says it emits.
-
-        Field for field, by name and by type. A module publishing SEVERAL row
-        shapes is matched against each in turn, and one arm fitting is enough.
-        A module that declares no rows has nothing to annotate with, so
-        declaring an annotation return over one is a rejection of its own.
-        """
-        arms = rows_arms(described)
-        if arms is None:
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL,
-                f"function '{declared.name}' returns the annotation column "
-                f"'{annotation.name}', and the module '{declared.module}' emits no rows",
-                node,
-                fallback=select,
-                hint=f"declare '{declared.name}' as RETURNS {declared.returns}; a "
-                "module that reads nothing off its frames has no annotations "
-                "to return",
-            )
-        fields = _annotation_fields(annotation)
-        if any(_annotation_matches(fields, arm) for arm in arms):
-            return
-        raise _error(
-            ErrorCode.UDF_ARG_TYPE,
-            f"function '{declared.name}' declares '{annotation.name}' as "
-            f"{annotation.written}, and the module '{declared.module}' "
-            f"emits {' or '.join(_written_json_fields(arm) for arm in arms)}",
-            node,
-            fallback=select,
-            hint="an annotation record names the module's own row columns, "
-            "with a type each value fits",
-        )
-
-    def _check_vector_dims(
-        self,
-        declared: WasmFunction,
-        annotation: Annotation,
-        described: Described,
-        node: exp.Expr,
-        select: exp.Select,
-    ) -> None:
-        """A vector-typed annotation field's length, fixed by the module's schema.
-
-        The declaration says a field is a vector; only the module's own
-        schema says how many numbers one carries, and that is what tags the
-        track the field becomes (:meth:`_rows_output`). A field the schema
-        does not fix a length for is refused here, rather than minting a
-        track later with nothing to tag it.
-        """
-        field = _vector_field(annotation)
-        if field is None:
-            return
-        if rows_vector_dims(described, field) is None:
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL,
-                f"function '{declared.name}' declares '{field}' as vector, and "
-                f"the module '{declared.module}' does not fix its length",
-                node,
-                fallback=select,
-                hint="a vector track needs its dimension: declare minItems and "
-                "maxItems on the field",
-            )
+            _check_sink_shape(declared, described, node, select)
 
     def _wasm_params(
         self,
@@ -12448,27 +10840,11 @@ class _Lowerer:
         # bool is an int in Python, and a module asking for a number does not
         # mean true.
         if isinstance(value, bool) != (wanted == "boolean"):
-            raise self._bad_wasm_param(name, value, wanted, anchor, select)
+            raise _bad_wasm_param(name, value, wanted, anchor, select)
         if not isinstance(value, allowed):
-            raise self._bad_wasm_param(name, value, wanted, anchor, select)
+            raise _bad_wasm_param(name, value, wanted, anchor, select)
         if wanted == "integer" and isinstance(value, float) and value != int(value):
-            raise self._bad_wasm_param(name, value, wanted, anchor, select)
-
-    def _bad_wasm_param(
-        self,
-        name: str,
-        value: RowValue,
-        wanted: str,
-        anchor: exp.Expr,
-        select: exp.Select,
-    ) -> FfrwdError:
-        return _error(
-            ErrorCode.UDF_ARG_TYPE,
-            f"the module's parameter '{name}' is {wanted}, got {value!r}",
-            anchor,
-            fallback=select,
-            hint=f"write a value the module can take: '{name}' is {wanted}",
-        )
+            raise _bad_wasm_param(name, value, wanted, anchor, select)
 
     # -- wasm value calls --
 
@@ -12525,31 +10901,8 @@ class _Lowerer:
                 hint=f"a module's function list names what it offers; write one "
                 f"of {names} as the export",
             )
-        self._check_wasm_result_type(declared, found, node, select)
+        _check_wasm_result_type(declared, found, node, select)
         return found
-
-    def _check_wasm_result_type(
-        self,
-        declared: WasmFunction,
-        described: DescribedFunction,
-        node: exp.Expr,
-        select: exp.Select,
-    ) -> None:
-        """RETURNS against the module's own ``result_schema``, once per declaration."""
-        schema = described.result_schema
-        wanted = schema.get("type") if isinstance(schema, dict) else None
-        if isinstance(wanted, str) and wanted in ANNOTATION_TYPES.get(declared.returns, ()):
-            return
-        raise _error(
-            ErrorCode.UDF_ARG_TYPE,
-            f"function '{declared.name}' declares RETURNS {declared.returns}, and "
-            f"the module's function '{declared.export}' returns "
-            f"{wanted if isinstance(wanted, str) else 'nothing'}",
-            node,
-            fallback=select,
-            hint="a value-returning wasm function's RETURNS matches what the "
-            "module's function declares",
-        )
 
     def _eval_wasm_value(
         self,
@@ -12619,37 +10972,7 @@ class _Lowerer:
             self._invoke_cache[key] = result
         else:
             result = cached
-        return self._folded_result(declared, result, node, select)
-
-    def _folded_result(
-        self, declared: WasmFunction, result: object, node: exp.Expr, select: exp.Select
-    ) -> RowValue:
-        """The module's JSON answer as this call's compile-time value.
-
-        Checked against the DECLARED return type, not the schema -- the
-        schema was already checked once, at :meth:`_described_value`, but the
-        module could still hand back a value of the wrong JSON type at this
-        particular call.
-        """
-        if declared.returns == "boolean":
-            if isinstance(result, bool):
-                return result
-        elif not isinstance(result, bool):
-            if declared.returns == "text" and isinstance(result, str):
-                return result
-            if declared.returns == "number" and isinstance(result, int | float):
-                return result
-            if declared.returns == "vector" and _is_number_list(result):
-                assert isinstance(result, list)
-                return tuple(float(v) for v in result)
-        raise _error(
-            ErrorCode.UDF_ARG_TYPE,
-            f"function '{declared.name}' declares RETURNS {declared.returns}, and "
-            f"the module '{declared.module}' returned {result!r}",
-            node,
-            fallback=select,
-            hint=f"the module's result must be {declared.returns}",
-        )
+        return _folded_result(declared, result, node, select)
 
     def _annotating_call(self, node: exp.Expr) -> WasmFunction | None:
         """The annotation-returning wasm function `node` calls, if it calls one."""
@@ -12900,7 +11223,7 @@ class _Lowerer:
         expected: list[StreamType] = [kind] * arity
         kinds = self._stream_kinds(call, env, select, arity)
         if kinds != expected:
-            raise self._bad_streams(call, node, select, expected, kinds)
+            raise _bad_streams(call, node, select, expected, kinds)
         self._check_annotation_argument(declared, call, node, select)
         positions = list(range(arity))
         wired = self._written_annotation(declared, call, env, node, select)
@@ -12950,7 +11273,7 @@ class _Lowerer:
             positions=positions,
             returns=kind,
             build=build,
-            rows=self._row_elements(per_row, env),
+            rows=_row_elements(per_row, env),
         )
         return lowered
 
@@ -12992,7 +11315,7 @@ class _Lowerer:
         for argument in call.args[:at]:
             value = self._lower_expr(argument, env, select)
             gathered += [(stream, argument) for stream in value.streams]
-        pads = self._bind_sink_streams(declared, gathered, node, select)
+        pads = _bind_sink_streams(declared, gathered, node, select)
         # One instance, so its parameters are read once. A row-varying value
         # argument has no one row to read here; the FIRST is what a call over
         # a gathered relation means everywhere else.
@@ -13051,7 +11374,7 @@ class _Lowerer:
         cardinality = max(len(self.sink_rows), 1)
         rows, _ = self._row_cells(columns, cardinality, node, f"'{declared.name}'")
         self._check_no_null_stream_feeds_a_filter(node)
-        self._check_row_sink_arity(declared, described, rows, node, select)
+        _check_row_sink_arity(declared, described, rows, node, select)
         renditions = self._row_renditions(rows, env)
         pads: list[_Stream] = []
         meta: list[dict[str, object]] = []
@@ -13086,38 +11409,6 @@ class _Lowerer:
         self.row_reading_sink_rows[ref] = rows
         self.graph.module_sinks.append(ref)
         return _Value(type=pads[0].type, streams=(), is_array=False)
-
-    def _check_row_sink_arity(
-        self,
-        declared: WasmFunction,
-        described: Described,
-        rows: list[_VariantRow],
-        node: exp.Expr,
-        select: exp.Select,
-    ) -> None:
-        """A sink whose arity holds one row at a time, handed several.
-
-        `video_streams`/`audio_streams` say how many pads of each kind a
-        sink reads; neither declaring "many" or "any" means it is
-        file-shaped, and a multi-row relation reaching it is the one-row
-        rule again (:meth:`_check_one_row_per_file`, which a row-reading
-        sink skips), this time naming the sink instead of a path.
-        """
-        if len(rows) <= 1:
-            return
-        if described.video_streams in ("many", "any") or described.audio_streams in (
-            "many",
-            "any",
-        ):
-            return
-        raise _error(
-            ErrorCode.ROW_COUNT_MISMATCH,
-            f"this query has {len(rows)} rows, and '{declared.name}()' reads one",
-            node,
-            fallback=select,
-            hint="narrow to one row with WHERE or ORDER BY ... LIMIT, or use "
-            "a sink whose module reads many",
-        )
 
     def _row_renditions(
         self, rows: list[_VariantRow], env: _Env
@@ -13167,60 +11458,6 @@ class _Lowerer:
             else:
                 out.append({})
         return out
-
-    def _bind_sink_streams(
-        self,
-        declared: WasmFunction,
-        gathered: list[tuple[_Stream, exp.Expr]],
-        node: exp.Expr,
-        select: exp.Select,
-    ) -> list[_Stream]:
-        """The SELECT's streams against the sink's parameters, matched by kind.
-
-        Each parameter takes streams of its own kind in SELECT order: a bare
-        one exactly one, an ARRAY one every remaining stream of that kind. The
-        pads come back in DECLARATION order, which is the order `init` names
-        them, so a module reading video and audio knows which is which without
-        being told.
-        """
-        remaining: dict[StreamType, list[tuple[_Stream, exp.Expr]]] = {}
-        for entry in gathered:
-            remaining.setdefault(entry[0].type, []).append(entry)
-        pads: list[_Stream] = []
-        for param, kind in zip(
-            declared.stream_params, declared.stream_kinds, strict=True
-        ):
-            waiting = remaining.get(kind, [])
-            wanted = len(waiting) if is_array(param.type) else 1
-            if len(waiting) < max(wanted, 1):
-                raise _error(
-                    ErrorCode.UDF_ARG_TYPE,
-                    f"{declared.name}() takes '{param.name}' as {param.type}, "
-                    f"and this query's SELECT list carries "
-                    f"{_stream_count(len(waiting))} of that kind",
-                    node,
-                    fallback=select,
-                    hint=f"a sink reads the streams its SELECT list names: "
-                    f"COPY (SELECT <{kind} stream>, ...) TO {declared.called}"
-                    f"(<values>)",
-                )
-            pads += [stream for stream, _ in waiting[:wanted]]
-            remaining[kind] = waiting[wanted:]
-        left = [entry for entries in remaining.values() for entry in entries]
-        if left:
-            stream, anchor = left[0]
-            raise _error(
-                ErrorCode.UDF_ARG_TYPE,
-                f"{declared.name}() reads {_stream_count(len(pads))}, and this "
-                f"query's SELECT list carries "
-                f"{_stream_count(len(pads) + len(left))}",
-                anchor,
-                fallback=node,
-                hint=f"declare the parameter as {WASM_STREAM_NAMES[stream.type]}[] "
-                "to read every stream of its kind the SELECT carries, or drop "
-                "the extra columns",
-            )
-        return pads
 
     def _lower_variadic_call(
         self, node: exp.Expr, name: str, call: _Call, env: _Env, select: exp.Select
@@ -13307,7 +11544,7 @@ class _Lowerer:
                 f"unknown function {call.display}()",
                 node,
                 fallback=select,
-                hint=self._macro_function_hint(name),
+                hint=_macro_function_hint(name),
             )
         if call.named and not macro.options:
             raise _error(
@@ -13338,9 +11575,9 @@ class _Lowerer:
             )
         stream_pos = macro.stream_positions[0]
         stream_param = macro.params[stream_pos]
-        self._reject_null_stream(call.display, call.args[stream_pos], select)
+        _reject_null_stream(call.display, call.args[stream_pos], select)
         kind = self._classify(call.args[stream_pos], env, select)
-        self._reject_passthrough_args(call.display, [kind], call, call.args[stream_pos])
+        _reject_passthrough_args(call.display, [kind], call, call.args[stream_pos])
         if kind != stream_param.stream_type:
             hint = macro.kind_hints.get(
                 kind,
@@ -13371,7 +11608,7 @@ class _Lowerer:
                     fallback=node,
                     hint=f"its signature is {macro.signature}",
                 ) from None
-        options = self._macro_options(macro, call, node)
+        options = _macro_options(macro, call, node)
         streams = {stream_pos: self._lower_expr(call.args[stream_pos], env, select)}
 
         def build(values: list[object], _element: int) -> FrameRef:
@@ -13388,52 +11625,6 @@ class _Lowerer:
             positions=[stream_pos],
             returns=macro.output,
             build=build,
-        )
-
-    def _macro_options(
-        self, macro: Macro, call: _Call, node: exp.Expr
-    ) -> dict[str, object]:
-        """A macro's named-only options: every one optional, none repeated.
-
-        Returned in the MACRO's declared order, not the order they were
-        written, so the rendered filter is the same whichever way round the
-        query spells them. An omitted option is left out entirely -- the
-        expansion renders only what was written, and ffmpeg's own default
-        covers the rest. Repeats need no check here: resolve rejects a
-        duplicate `name =>` on any call before lowering starts.
-        """
-        written: dict[str, object] = {}
-        for argument in call.named:
-            if argument.name not in macro.options:
-                raise _error(
-                    ErrorCode.UDF_ARG_TYPE,
-                    f"{call.display}() has no '{argument.name}' option",
-                    argument.value,
-                    fallback=node,
-                    hint=f"its signature is {macro.signature}",
-                )
-            try:
-                written[argument.name] = _number(argument.value)
-            except FfrwdError as exc:
-                raise _error(
-                    exc.code,
-                    f"{call.display}()'s '{argument.name}' option must be a "
-                    "numeric literal",
-                    argument.value,
-                    fallback=node,
-                    hint=f"its signature is {macro.signature}",
-                ) from None
-        return {name: written[name] for name in macro.options if name in written}
-
-    def _macro_function_hint(self, name: str) -> str:
-        """Did-you-mean over :data:`MACROS`, the small-by-design macro set."""
-        matches = difflib.get_close_matches(name, macro_names(), n=1, cutoff=0.6)
-        if matches:
-            return f"did you mean {MACRO_NAMESPACE}.{matches[0]}()?"
-        return (
-            f"{MACRO_NAMESPACE}.<name> is one of ffrwd's own macros -- "
-            f"{', '.join(macro_names())} -- not an ffmpeg filter; filters live "
-            f"bare or under {FILTER_NAMESPACE}.<filter>(...)"
         )
 
     # -- the ordinary case: any filter the installed ffmpeg reports --------
@@ -13507,7 +11698,7 @@ class _Lowerer:
         kinds = self._stream_kinds(call, env, select, len(expected))
         if kinds != expected:
             twin_stem = self._twin_dispatch_stem(name, call, kinds)
-            raise self._bad_streams(call, node, select, expected, kinds, twin_stem=twin_stem)
+            raise _bad_streams(call, node, select, expected, kinds, twin_stem=twin_stem)
         args_at, per_row = self._option_binder(
             name,
             call,
@@ -13540,19 +11731,8 @@ class _Lowerer:
             positions=list(range(len(expected))),
             returns=output,
             build=build,
-            rows=self._row_elements(per_row, env),
+            rows=_row_elements(per_row, env),
         )
-
-    def _row_elements(self, per_row: bool, env: _Env) -> int | None:
-        """How many rows a per-row call runs over, or None when it reads none.
-
-        The relation as this branch left it: a grouped branch has already been
-        cut to the group being gathered, and a fan-out to the one row this
-        command writes -- so both keep making the one node they always made.
-        """
-        if not per_row or env.relation is None:
-            return None
-        return len(env.relation.tuples)
 
     # -- N-input filters ----------------------------
 
@@ -13605,7 +11785,7 @@ class _Lowerer:
         `amix(a, b, c)` is not, and says so with both numbers.
         """
         kinds = [self._classify(arg, env, select) for arg in call.args]
-        self._reject_passthrough_args(call.display, kinds, call, node)
+        _reject_passthrough_args(call.display, kinds, call, node)
         count = 0
         for kind in kinds:
             if kind not in _STREAM_KINDS:
@@ -13636,7 +11816,7 @@ class _Lowerer:
         # streams themselves ARE the count, decided by the loaded plugin.
         option_name = spec.option
         if option_name is not None:
-            declared = self._n_input_count(spec, option_name, args, options)
+            declared = _n_input_count(spec, option_name, args, options)
             if declared != count:
                 anchor = next(
                     (arg.value for arg in call.named if arg.name == option_name), node
@@ -13678,33 +11858,6 @@ class _Lowerer:
             returns=spec.output,
             build=build,
         )
-
-    def _n_input_count(
-        self,
-        spec: _NInputFilter,
-        option_name: str,
-        args: dict[str, object],
-        options: dict[str, FilterOption],
-    ) -> int:
-        """What the count option says, written or introspected-default or fallback.
-
-        `args` has already been validated against the option table, so a
-        written value is a number in range; only the DEFAULT needs care, since
-        `FilterOption.default` is verbatim ffmpeg text that is documented as
-        never re-typed (it can be a constant name, or absent entirely). Called
-        only when `spec.option` is not None; `option_name` is that narrowed
-        value, passed separately so mypy sees a plain `str`.
-        """
-        written = args.get(option_name)
-        if isinstance(written, (int, float)) and not isinstance(written, bool):
-            return int(written)
-        option = options.get(option_name)
-        if option is not None and option.default is not None:
-            try:
-                return int(float(option.default))
-            except ValueError:
-                pass
-        return spec.fallback
 
     # -- VARIADIC: an array IS the argument list --------------------------
 
@@ -13813,7 +11966,7 @@ class _Lowerer:
         args = self._bind_options(
             spec.name, call, node, select, env, options=options, extras=[], timeline=False,
         )
-        self._check_variadic_count(spec.option, count, args, call, node, select, _N_INPUT_HINT)
+        _check_variadic_count(spec.option, count, args, call, node, select, _N_INPUT_HINT)
         if spec.option is not None and (
             spec.emit_default or spec.option in args or count != spec.fallback
         ):
@@ -13823,40 +11976,6 @@ class _Lowerer:
         )
         source = streams[0].source if count == 1 else _agreed_source(streams)
         return _scalar(_Stream(ref=node_id, type=spec.output, source=source))
-
-    def _check_variadic_count(
-        self,
-        option_name: str | None,
-        count: int,
-        args: dict[str, object],
-        call: _Call,
-        node: exp.Expr,
-        select: exp.Select,
-        hint: str,
-    ) -> None:
-        """A WRITTEN count option must agree with the array's length.
-
-        Unlike the positional call (:meth:`_lower_n_input_call`), there is no
-        "did you forget to write it" ambiguity here: the array's length IS the
-        count, full stop, so an unwritten option is simply set to it below --
-        only a value the query itself wrote can possibly disagree.
-        """
-        if option_name is None:
-            return
-        written = args.get(option_name)
-        if not isinstance(written, (int, float)) or isinstance(written, bool):
-            return
-        if int(written) == count:
-            return
-        anchor = next((arg.value for arg in call.named if arg.name == option_name), node)
-        raise _error(
-            ErrorCode.UDF_ARG_TYPE,
-            f"{call.display}() was given {_stream_count(count)} but its "
-            f"'{option_name}' option says {int(written)}",
-            anchor,
-            fallback=select,
-            hint=hint,
-        )
 
     # -- VARIADIC concat: N segments of one stream type --------------------
 
@@ -13913,7 +12032,7 @@ class _Lowerer:
         args = self._bind_options(
             "concat", call, node, select, env, options=bindable, extras=[], timeline=False,
         )
-        self._check_variadic_count("n", count, args, call, node, select, _CONCAT_VARIADIC_HINT)
+        _check_variadic_count("n", count, args, call, node, select, _CONCAT_VARIADIC_HINT)
         args["n"] = count
         args["v"] = 1 if stream_type == "video" else 0
         args["a"] = 1 if stream_type == "audio" else 0
@@ -13963,7 +12082,7 @@ class _Lowerer:
         expected = [spec.input]
         kinds = self._stream_kinds(call, env, select, 1)
         if kinds != expected:
-            raise self._bad_streams(call, node, select, expected, kinds)
+            raise _bad_streams(call, node, select, expected, kinds)
         args = self._bind_options(
             spec.name,
             call,
@@ -13976,7 +12095,7 @@ class _Lowerer:
         )
         count = spec.count(args)
         if isinstance(count, _BadCount):
-            raise self._bad_count(spec, count, call, node, select)
+            raise _bad_count(spec, count, call, node, select)
 
         value = self._lower_expr(call.args[0], env, select)
         if value.is_array:
@@ -14001,64 +12120,7 @@ class _Lowerer:
             ],
         )
 
-    def _bad_count(
-        self,
-        spec: _ArrayFilter,
-        bad: _BadCount,
-        call: _Call,
-        node: exp.Expr,
-        select: exp.Select,
-    ) -> FfrwdError:
-        """A count rule's rejection, anchored on the argument that caused it.
-
-        The offending option is normally one the query wrote, and that is the
-        token worth pointing at; a rule can only reject a DEFAULT if the table
-        itself is wrong, so falling back to the call keeps that case anchored
-        rather than unanchored.
-        """
-        written = next((arg for arg in call.named if arg.name == bad.option), None)
-        anchor = written.value if written is not None else node
-        return _error(
-            ErrorCode.FILTER_OPTION_TYPE,
-            f"option '{bad.option}' of filter '{spec.name}' decides how many "
-            f"streams the call returns, so it must be {bad.expected}, "
-            f"got {bad.value!r}",
-            anchor,
-            fallback=select,
-            hint=bad.hint,
-        )
-
     # -- shared call machinery --------------------------------------------
-
-    def _reject_passthrough_args(
-        self,
-        name: str,
-        kinds: list[str],
-        call: _Call,
-        node: exp.Expr,
-    ) -> None:
-        """No function takes a subtitle or data stream.
-
-        An ffmpeg filtergraph carries video and audio only, so a caption or
-        timed-metadata stream can never be a filter INPUT — in either tier.
-        Tier 1 would otherwise report it as a generic signature mismatch and
-        tier 2 as "expects gblur(video)"; both are true but neither says the
-        thing that actually matters, which is that no signature could ever
-        accept it. ``ParamKind`` and ``DynamicFilter.inputs`` are deliberately
-        left alone ("ParamKind is UNCHANGED"), so this is the one
-        place that knows it.
-        """
-        for position, kind in enumerate(kinds):
-            if kind not in _PASSTHROUGH_ONLY:
-                continue
-            raise _error(
-                ErrorCode.UDF_ARG_TYPE,
-                f"{name}() cannot take a {kind} stream: {kind} streams cannot be "
-                "filtered, only selected",
-                call.args[position],
-                fallback=node,
-                hint=_PASSTHROUGH_HINT,
-            )
 
     def _stream_kinds(
         self, call: _Call, env: _Env, select: exp.Select, arity: int
@@ -14071,10 +12133,10 @@ class _Lowerer:
         comparison against the pad signature reports the missing argument.
         """
         for arg in call.args[:arity]:
-            self._reject_null_stream(call.display, arg, select)
+            _reject_null_stream(call.display, arg, select)
         kinds = [self._classify(arg, env, select) for arg in call.args[:arity]]
         if kinds:
-            self._reject_passthrough_args(call.display, kinds, call, call.args[0])
+            _reject_passthrough_args(call.display, kinds, call, call.args[0])
         return kinds
 
     def _twin_dispatch_stem(self, name: str, call: _Call, got: list[str]) -> str | None:
@@ -14098,43 +12160,6 @@ class _Lowerer:
         if video is None:
             return None
         return stem if self._twin_pair(stem, video) is not None else None
-
-    def _bad_streams(
-        self,
-        call: _Call,
-        node: exp.Expr,
-        select: exp.Select,
-        expected: list[StreamType],
-        got: list[str],
-        *,
-        twin_stem: str | None = None,
-    ) -> FfrwdError:
-        """The stream-signature rejection — UDF_ARG_TYPE's remaining job.
-
-        Option problems never reach here: they are ``UNKNOWN_FILTER_OPTION`` /
-        ``FILTER_OPTION_TYPE`` uniformly, positional or named. ``twin_stem``,
-        when given, names the bare video filter whose audio twin the caller
-        hand-spelled -- the hint then points at calling the stem instead of
-        repeating the ordinary calling-convention reminder.
-        """
-        shown = call.display
-        hint = (
-            f"call {twin_stem}(...) on either kind: the compiler picks the "
-            f"audio twin, {shown}, from the column's type"
-            if twin_stem is not None
-            else f"stream inputs come first, then options in the filter's own order, "
-            f"then named options: {shown}({', '.join(expected)}, <option>, "
-            f"<option> => <value>)"
-        )
-        return _error(
-            ErrorCode.UDF_ARG_TYPE,
-            f"{shown}() is an ffmpeg filter: it takes {', '.join(expected)} as its "
-            f"stream input{'' if len(expected) == 1 else 's'}, "
-            f"got ({', '.join(got) or 'nothing'})",
-            node,
-            fallback=select,
-            hint=hint,
-        )
 
     def _options_for(
         self,
@@ -14318,7 +12343,7 @@ class _Lowerer:
         positional binding order (verified against ffmpeg 7.1 for the whole
         registry; see ``ffrwd/registry.py``). Having landed on an option, a
         positional is validated AS that option by the very same
-        :func:`_option_value` a named argument goes through, which is what
+        :func:`ffrwd.filter_options._option_value` a named argument goes through, which is what
         makes option errors uniform across the two spellings.
 
         Named arguments are then checked with the positionally-bound names
@@ -14354,7 +12379,7 @@ class _Lowerer:
                 filter_name, option, _NamedArg(name=option.name, value=arg), node
             )
         bound.update(
-            self._check_named_args(
+            _check_named_args(
                 filter_name,
                 options,
                 call.named,
@@ -14365,7 +12390,7 @@ class _Lowerer:
                 dropped=dropped,
             )
         )
-        self._check_required_options(filter_name, bound, dropped, node, select)
+        _check_required_options(filter_name, bound, dropped, node, select)
         return bound
 
     def _expand_call(
@@ -14396,7 +12421,7 @@ class _Lowerer:
         whose options are read per row is one node per row, even where every
         stream argument it takes is a single stream.
         """
-        length = self._zip_length(name, node, arg_nodes, streams, select, rows)
+        length = _zip_length(name, node, arg_nodes, streams, select, rows)
         expanded: list[_Stream] = []
         for element in range(1 if length is None else length):
             values: list[object] = [
@@ -14460,161 +12485,6 @@ class _Lowerer:
             )
         return options
 
-    def _check_named_args(
-        self,
-        filter_name: str,
-        options: dict[str, FilterOption],
-        named: list[_NamedArg],
-        call: exp.Expr,
-        *,
-        owner: str,
-        occupied: set[str],
-        timeline: bool = False,
-        dropped: dict[str, exp.Expr] | None = None,
-    ) -> dict[str, object]:
-        """Validate every named argument against `options`, in written order.
-
-        A NULL value -- an unset variable's, or a literal one -- means the
-        option is not written: it is recorded in `dropped` (when the caller
-        passes one) and never reaches `_option_value`. An UNKNOWN name still
-        rejects whatever its value, NULL included: the name is wrong before
-        the value matters.
-
-        `occupied` holds the option names this call already bound
-        POSITIONALLY, so ``crop(f, 100, 50, 10, 20, out_w => 5)`` reads as the
-        conflict it is rather than silently overriding what the call itself
-        said. A collision is ``FILTER_OPTION_TYPE``, an option problem like any
-        other, and the fix is to drop one of the two spellings.
-
-        The collision check comes FIRST so the message names the conflict
-        rather than whatever the registry would say about the name.
-
-        `timeline` is the target's ``DynamicFilter.timeline`` flag, and it is a
-        PARAMETER because this method cannot look filters up: every caller
-        already holds the registry entry (or, for a generated source, knows
-        there is no such field to hold — a source is never timeline-capable, so
-        the default rejects). It admits ``enable`` BEFORE `options` is consulted
-: ffmpeg implements ``enable`` in the filter framework, so
-        it is in no filter's option table and a registry lookup would always
-        call it unknown.
-        """
-        checked: dict[str, object] = {}
-        for arg in named:
-            if arg.name in occupied:
-                raise _error(
-                    ErrorCode.FILTER_OPTION_TYPE,
-                    f"option '{arg.name}' of filter '{filter_name}' is already set "
-                    f"positionally by {owner}()",
-                    arg.value,
-                    fallback=call,
-                    hint="a named argument never overrides what the call itself "
-                    "set; drop one of the two spellings",
-                )
-            is_null = isinstance(_unwrap(arg.value), exp.Null)
-            if arg.name == _ENABLE:
-                if is_null:
-                    if dropped is not None:
-                        dropped[_ENABLE] = arg.value
-                    continue
-                checked[_ENABLE] = _enable_value(filter_name, arg, call, timeline)
-                continue
-            option = options.get(arg.name)
-            if option is None:
-                raise _error(
-                    ErrorCode.UNKNOWN_FILTER_OPTION,
-                    f"filter '{filter_name}' has no option '{arg.name}'",
-                    arg.value,
-                    fallback=call,
-                    hint=_option_hint(arg.name, options),
-                )
-            if is_null:
-                if dropped is not None:
-                    dropped[arg.name] = arg.value
-                continue
-            checked[arg.name] = _option_value(filter_name, option, arg, call)
-        return checked
-
-    def _check_required_options(
-        self,
-        filter_name: str,
-        bound: dict[str, object],
-        dropped: dict[str, exp.Expr],
-        node: exp.Expr,
-        select: exp.Select,
-    ) -> None:
-        """The curated :data:`REQUIRED_OPTIONS` check, on what was WRITTEN.
-
-        A NULL dropped the option before this runs, so an unset variable and
-        an omitted option fail the same way -- ffmpeg's init() would refuse
-        both at run time, and this says so at compile time, naming the
-        variable when the NULL came from one.
-        """
-        required: list[tuple[tuple[str, ...], str]] = [
-            (group, "") for group in REQUIRED_OPTIONS.get(filter_name, ())
-        ]
-        if filter_name == "xfade" and bound.get("transition") == "custom":
-            required.append((("expr",), " when transition is 'custom'"))
-        for group, because in required:
-            if any(option in bound for option in group):
-                continue
-            option_name = next((o for o in group if o in dropped), None)
-            if option_name is not None:
-                anchor = dropped[option_name]
-                variable = null_variable(_unwrap(anchor))
-                if variable is not None:
-                    line, col = _pos(anchor, node)
-                    raise unset_error(
-                        ErrorCode.FILTER_OPTION_TYPE,
-                        variable,
-                        what=f"option '{option_name}' of filter "
-                        f"'{filter_name}' is required{because}",
-                        line=line,
-                        col=col,
-                    )
-                raise _error(
-                    ErrorCode.FILTER_OPTION_TYPE,
-                    f"option '{option_name}' of filter '{filter_name}' is "
-                    f"required{because}, got NULL",
-                    anchor,
-                    fallback=node,
-                    hint="NULL is absence, and this filter cannot run "
-                    "without the option; write a value",
-                )
-            spelled = " or ".join(f"'{option}'" for option in group)
-            raise _error(
-                ErrorCode.FILTER_OPTION_TYPE,
-                f"filter '{filter_name}' requires option {spelled}{because}",
-                node,
-                fallback=select,
-                hint=f"ffmpeg would refuse the filter at run time; write "
-                f"{group[0]} => <value>",
-            )
-
-    def _reject_null_stream(
-        self, display: str, arg: exp.Expr, select: exp.Select
-    ) -> None:
-        """A NULL where a stream input belongs: absence has no stream to offer."""
-        inner = _unwrap(arg)
-        if not isinstance(inner, exp.Null):
-            return
-        variable = null_variable(inner)
-        if variable is not None:
-            line, col = _pos(inner, select)
-            raise unset_error(
-                ErrorCode.UDF_ARG_TYPE,
-                variable,
-                what=f"{display}() needs a stream in this position",
-                line=line,
-                col=col,
-            )
-        raise _error(
-            ErrorCode.UDF_ARG_TYPE,
-            f"{display}() takes a stream in this position, got NULL",
-            inner,
-            fallback=select,
-            hint="a stream input cannot be absent; pass one, e.g. f.video[1]",
-        )
-
     def _unknown_function_hint(self, name: str) -> str:
         """Did-you-mean over the registry (there is nothing else)."""
         registry = self.registry
@@ -14674,60 +12544,6 @@ class _Lowerer:
             "filter set; the provisioner failed to supply one"
         )
 
-    def _zip_length(
-        self,
-        name: str,
-        node: exp.Expr,
-        arg_nodes: list[exp.Expr],
-        streams: dict[int, _Value],
-        select: exp.Select,
-        rows: int | None = None,
-    ) -> int | None:
-        """The element count this call expands to, or None if it expands to one.
-
-        Arrays zip (no cross products): they must all have the same length, and
-        scalar arguments repeat into every element.
-
-        `rows` is how many rows an argument that READS one runs over -- a
-        filter option computed per row makes one node per row, the way an
-        array argument makes one per element. An array and a per-row option in
-        the same call zip too: both count the same relation, so a disagreement
-        is the same mismatch a pair of arrays of different lengths is.
-        """
-        first: tuple[int, int] | None = None  # (argument position, length)
-        for position, value in sorted(streams.items()):
-            if not value.is_array:
-                continue
-            length = len(value.streams)
-            if first is None:
-                first = (position, length)
-                continue
-            if length == first[1]:
-                continue
-            raise _error(
-                ErrorCode.BROADCAST_MISMATCH,
-                f"{name}() cannot broadcast over arrays of different lengths: "
-                f"{_sql_text(arg_nodes[first[0]])} has {_stream_count(first[1])}, "
-                f"{_sql_text(arg_nodes[position])} has {_stream_count(length)}",
-                node,
-                fallback=select,
-                hint=_ZIP_HINT,
-            )
-        if first is None:
-            return rows
-        if rows is not None and rows != first[1]:
-            raise _error(
-                ErrorCode.BROADCAST_MISMATCH,
-                f"{name}() cannot broadcast over arrays of different lengths: "
-                f"{_sql_text(arg_nodes[first[0]])} has "
-                f"{_stream_count(first[1])}, and its options are read once per "
-                f"row over {rows} rows",
-                node,
-                fallback=select,
-                hint=_ZIP_HINT,
-            )
-        return first[1]
-
     def _classify(self, node: exp.Expr, env: _Env, select: exp.Select) -> str:
         """Kind label for one call argument: a stream type, ``num``/``str``, or
         :data:`_UNSUPPORTED_KIND`.
@@ -14760,8 +12576,8 @@ class _Lowerer:
         if isinstance(node, exp.Coalesce):
             # A filled track column is a stream of its first argument's type,
             # which is knowable without lowering anything (no fill is minted).
-            first = self._coalesce_arguments(node, select)[0]
-            binding = self._coalesce_binding(first, env)
+            first = _coalesce_arguments(node, select)[0]
+            binding = _coalesce_binding(first, env)
             return binding.type if binding is not None else self._classify(
                 first, env, select
             )
@@ -14778,7 +12594,7 @@ class _Lowerer:
                         f"unknown function {call.display}()",
                         node,
                         fallback=select,
-                        hint=self._macro_function_hint(name),
+                        hint=_macro_function_hint(name),
                     )
                 return macro.output
             # A module's output type is its declaration's, not the registry's:
@@ -14908,7 +12724,7 @@ class _Lowerer:
         env.group_keys = _partition_keys(select, env)
         self._check_grouped_cte_columns(select, env)
         time_conjuncts, row_conjuncts, assertion_conjuncts = self._split_where(select, env)
-        per_row = any(self._is_row_window(conjunct, env) for conjunct in time_conjuncts)
+        per_row = any(_is_row_window(conjunct, env) for conjunct in time_conjuncts)
         if not per_row:
             self._collect_trims(select, env, time_conjuncts)
         self._filter_rows(row_conjuncts, env, select)
@@ -15087,7 +12903,7 @@ class _Lowerer:
                 if isinstance(binding, _RowBinding):
                     name = _fold(expr.this)
                     if name != ROW_STREAM:
-                        return self._row_metadata_cells(binding, name, expr, select)
+                        return _row_metadata_cells(binding, name, expr, select)
                 elif (
                     isinstance(binding, _InputBinding)
                     and _fold(expr.this) in RECORD_ARRAY_COLUMNS
@@ -15111,7 +12927,7 @@ class _Lowerer:
                     if _fold(expr.this) in binding.values:
                         # A value column of the body prints as plain data.
                         return self._value_cells(expr, env, select, cardinality)
-                    column = self._cte_column(binding, _fold(expr.this))
+                    column = _cte_column(binding, _fold(expr.this))
                     # A splat column falls through to `_value_to_cells` below,
                     # which is where its per-row cardinality is already
                     # honored; a non-splat one (array_agg / a bare input
@@ -15156,28 +12972,6 @@ class _Lowerer:
         return [
             _row_value_as_cell(self._eval_value(node, env, row, select))
             for row in relation.tuples
-        ]
-
-    def _row_metadata_cells(
-        self, binding: _RowBinding, name: str, anchor: exp.Expr, select: exp.Select
-    ) -> list[CellValue]:
-        """A row alias's metadata column, one value per row (NULL for a gap)."""
-        schema = binding.schema
-        if name == TAGS_COLUMN:
-            return [_tag_cell(row) for row in binding.rows]
-        if name == DISPOSITION_COLUMN and name in schema:
-            return [_disposition_cell(row) for row in binding.rows]
-        if name not in schema and map_ref(name) is None:
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL,
-                f"unknown column '{binding.alias}.{column_label(name)}'",
-                anchor,
-                fallback=select,
-                hint=binding.exposes,
-            )
-        return [
-            None if row is None else _row_value_as_cell(row.columns.get(name))
-            for row in binding.rows
         ]
 
     def _container_tag_cells(
@@ -15249,7 +13043,7 @@ class _Lowerer:
         (or, grouped, which group) is printing it."""
         value = self._lower_expr(node, env, select)
         cell = ArrayCell(
-            elements=tuple(self._stream_to_cell(stream) for stream in value.streams)
+            elements=tuple(_stream_to_cell(stream) for stream in value.streams)
         )
         return [cell] * cardinality
 
@@ -15266,20 +13060,14 @@ class _Lowerer:
         array cell per row, exactly as the bare array column does.
         """
         if value.is_array and splat:
-            return [self._stream_to_cell(stream) for stream in value.streams]
+            return [_stream_to_cell(stream) for stream in value.streams]
         if value.is_array:
             array_cell = ArrayCell(
-                elements=tuple(self._stream_to_cell(stream) for stream in value.streams)
+                elements=tuple(_stream_to_cell(stream) for stream in value.streams)
             )
             return [array_cell] * cardinality
-        cell = self._stream_to_cell(value.streams[0])
+        cell = _stream_to_cell(value.streams[0])
         return [cell] * cardinality
-
-    def _stream_to_cell(self, stream: _Stream) -> CellValue:
-        """One stream as a cell, carrying its REF until `_render_specs` runs."""
-        if stream.ref == _NULL_STREAM_REF:
-            return None
-        return StreamCell(type=stream.type, spec=stream.ref)
 
     def _render_specs(self, sinks: list[TableSink]) -> list[TableSink]:
         """Turn every cell's stream ref into the spec the command will name.
@@ -15525,18 +13313,6 @@ def _reads_row_source(node: exp.Expr, env: _Env) -> bool:
     return False
 
 
-def _has_track_rows(env: _Env) -> bool:
-    """True when the branch has rows carrying a track to tag per stream.
-
-    Chapter rows and written rows carry none, so a branch holding only those
-    tags the CONTAINER, exactly as one with no rows at all does.
-    """
-    return any(
-        isinstance(binding, _RowBinding) and not binding.streamless
-        for binding in env.bindings.values()
-    )
-
-
 def _group_row(env: _Env) -> _RowTuple:
     """The one tuple a FILE-level value reads, or no row at all.
 
@@ -15688,17 +13464,6 @@ def _flatten(columns: list[_Column]) -> list[_Column]:
     ]
 
 
-def _signature(columns: list[_Column]) -> str:
-    """Branch column types for a CONCAT_MISMATCH message, arrays as ``audio[2]``."""
-    parts = [
-        f"{column.value.type}[{len(column.value.streams)}]"
-        if column.value.is_array
-        else column.value.type
-        for column in columns
-    ]
-    return ", ".join(parts) or "nothing"
-
-
 def _as_ref(value: object) -> FrameRef:
     """A lowered argument value as a stream ref (dynamic calls take only those)."""
     if not isinstance(value, str):  # pragma: no cover -- structurally impossible
@@ -15710,70 +13475,6 @@ def _as_ref(value: object) -> FrameRef:
             hint="please report this query as a bug",
         )
     return value
-
-
-def _listed(names: Iterable[str]) -> str:
-    """Comma-list at most ``_MAX_LISTED`` names, then count the rest."""
-    items = list(names)
-    if len(items) <= _MAX_LISTED:
-        return ", ".join(items)
-    rest = len(items) - _MAX_LISTED
-    return ", ".join(items[:_MAX_LISTED]) + f", ... ({rest} more)"
-
-
-def _option_hint(name: str, options: dict[str, FilterOption]) -> str:
-    """Did-you-mean over the filter's REAL option names, else list them."""
-    matches = difflib.get_close_matches(name, sorted(options), n=1, cutoff=0.6)
-    if matches:
-        return f"did you mean {matches[0]} => ...?"
-    if not options:
-        return "this filter has no options ffrwd can set"
-    return "its options: " + _listed(sorted(options))
-
-
-def _number_text(value: float) -> str:
-    """A range bound as ffmpeg meant it: ``1024`` rather than ``1024.0``."""
-    if value == int(value):
-        return str(int(value))
-    return str(value)
-
-
-def _range_text(option: FilterOption) -> str | None:
-    if option.minimum is not None and option.maximum is not None:
-        return f"from {_number_text(option.minimum)} to {_number_text(option.maximum)}"
-    if option.minimum is not None:
-        return f"at least {_number_text(option.minimum)}"
-    if option.maximum is not None:
-        return f"at most {_number_text(option.maximum)}"
-    return None
-
-
-def _literal_value(node: exp.Expr) -> object | None:
-    """A named argument's value as a python scalar, or None if it is not a literal.
-
-    Deliberately separate from :func:`_number`: that raises its own message,
-    and an option's expected type is only known after the registry has been
-    consulted, so reading the value and judging it are two steps here.
-    """
-    node = _unwrap(node)
-    if isinstance(node, exp.Boolean):
-        return bool(node.this)
-    negated = False
-    if isinstance(node, exp.Neg) and isinstance(node.this, exp.Expr):
-        negated = True
-        node = _unwrap(node.this)
-    if not isinstance(node, exp.Literal):
-        return None
-    if node.is_string:
-        return None if negated else str(node.this)
-    try:
-        value = node.to_py()
-    except (ArithmeticError, TypeError, ValueError):
-        return None
-    if isinstance(value, bool):  # sqlglot never does this; be explicit anyway
-        return None
-    number = value if isinstance(value, int) else float(value)
-    return -number if negated else number
 
 
 def _literal_node(value: RowValue, source: exp.Expr) -> exp.Expr:
@@ -15801,175 +13502,6 @@ def _literal_node(value: RowValue, source: exp.Expr) -> exp.Expr:
     line, col = _pos(source)
     node.meta.update({"line": line, "col": col})
     return node
-
-
-def _option_got(node: exp.Expr, value: object) -> str:
-    """How a rejected option value is echoed back in the message."""
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, int | float):
-        return str(value)
-    if isinstance(value, str):
-        return repr(value)
-    inner = _unwrap(node)
-    if isinstance(inner, exp.Literal):
-        # A literal `_literal_value` could not read (sqlglot tokenizes `1e` as a
-        # number but `to_py()` raises): echo what was written, not its shape.
-        return repr(str(inner.this))
-    return _describe(inner)
-
-
-def _option_error(
-    filter_name: str, option: FilterOption, arg: _NamedArg, call: exp.Expr, what: str, hint: str
-) -> FfrwdError:
-    return _error(
-        ErrorCode.FILTER_OPTION_TYPE,
-        f"option '{option.name}' of filter '{filter_name}' {what}",
-        arg.value,
-        fallback=call,
-        hint=hint,
-    )
-
-
-def _enable_value(
-    filter_name: str, arg: _NamedArg, call: exp.Expr, timeline: bool
-) -> str:
-    """The timeline ``enable`` expression, or the rejection for this filter.
-
-    Two ways it fails. The filter has no timeline support at all, which is a
-    property of the FILTER and so reads as an unknown option on it — flavoured
-    with the reason, because "gblur has no option 'enable'" would be a lie
-    about gblur. Or the value is not a string: an ffmpeg timeline expression is
-    text, and a bare number would silently mean "always on"/"never on" rather
-    than the window the writer had in mind.
-
-    The expression's CONTENT is deliberately unchecked: the variable
-    vocabulary is per-filter and not introspectable, so it is ffmpeg's to
-    validate at run time.
-    """
-    if not timeline:
-        raise _error(
-            ErrorCode.UNKNOWN_FILTER_OPTION,
-            f"filter '{filter_name}' has no option 'enable': your ffmpeg does "
-            f"not flag '{filter_name}' as supporting timeline editing",
-            arg.value,
-            fallback=call,
-            hint=_NO_TIMELINE_HINT,
-        )
-    value = _literal_value(arg.value)
-    if not isinstance(value, str):
-        raise _error(
-            ErrorCode.FILTER_OPTION_TYPE,
-            f"option 'enable' of filter '{filter_name}' expects an ffmpeg "
-            f"timeline expression, got {_option_got(arg.value, value)}",
-            arg.value,
-            fallback=call,
-            hint=_ENABLE_HINT,
-        )
-    return value
-
-
-def _option_value(
-    filter_name: str, option: FilterOption, arg: _NamedArg, call: exp.Expr
-) -> object:
-    """One named argument's value, checked against its introspected AVOption.
-
-    The type map is the RFC's: numeric AVOptions take a bare number (range
-    checked whenever ffmpeg printed a parseable one), booleans take ``true`` /
-    ``false``, an enum takes one of its named constants, and everything else
-    takes a string — or a bare number, since an ffmpeg option value is text on
-    the command line either way and ``duration``/``video_rate``/expression
-    options (``xfade``'s ``duration``, ``crop``'s ``x``) are routinely numeric.
-    """
-    value = _literal_value(arg.value)
-    got = _option_got(arg.value, value)
-    if option.unusable:
-        raise _option_error(
-            filter_name,
-            option,
-            arg,
-            call,
-            "has an ffmpeg type (binary/dictionary) ffrwd cannot set",
-            "drop it; ffrwd sets numeric, string and boolean options only",
-        )
-    if option.type == "num":
-        if not isinstance(value, int | float) or isinstance(value, bool):
-            bounds = _range_text(option)
-            raise _option_error(
-                filter_name,
-                option,
-                arg,
-                call,
-                f"expects a number, got {got}",
-                f"write a bare numeric literal ({bounds})" if bounds else
-                "write a bare numeric literal, e.g. sigma => 5",
-            )
-        bounds = _range_text(option)
-        below = option.minimum is not None and value < option.minimum
-        above = option.maximum is not None and value > option.maximum
-        if (below or above) and bounds is not None:
-            raise _option_error(
-                filter_name,
-                option,
-                arg,
-                call,
-                f"accepts a number {bounds}, got {got}",
-                f"pick a value {bounds}",
-            )
-        return value
-    if option.type == "bool":
-        if not isinstance(value, bool):
-            raise _option_error(
-                filter_name,
-                option,
-                arg,
-                call,
-                f"expects true or false, got {got}",
-                "write the bare word true or false, with no quotes",
-            )
-        return value
-    if option.constants:
-        if not isinstance(value, str) or value not in option.constants:
-            constants = _listed(option.constants)
-            matches = (
-                difflib.get_close_matches(value, list(option.constants), n=1, cutoff=0.6)
-                if isinstance(value, str)
-                else []
-            )
-            raise _option_error(
-                filter_name,
-                option,
-                arg,
-                call,
-                f"expects one of its named constants ({constants}), got {got}",
-                f"did you mean '{matches[0]}'?"
-                if matches
-                else "the value is a single-quoted constant name, not a number",
-            )
-        return value
-    if isinstance(value, str) or (isinstance(value, int | float) and not isinstance(value, bool)):
-        return value
-    raise _option_error(
-        filter_name,
-        option,
-        arg,
-        call,
-        f"expects a string, got {got}",
-        "write a single-quoted string literal, e.g. flags => 'lanczos'",
-    )
-
-
-def _sql_text(node: exp.Expr) -> str:
-    """The argument as the user wrote it, for a BROADCAST_MISMATCH message.
-
-    ``dialect="postgres"`` matters: it re-adds the ``INDEX_OFFSET`` sqlglot
-    subtracted at parse time, so ``a.audio[2]`` renders as ``a.audio[2]``.
-    """
-    return str(node.sql(dialect="postgres"))
-
-
-def _stream_count(count: int) -> str:
-    return f"{count} stream" + ("" if count == 1 else "s")
 
 
 def _contains_array_agg(node: exp.Expr) -> bool:
