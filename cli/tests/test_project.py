@@ -2666,7 +2666,23 @@ _UNCOMPILABLE_RECIPE = (
 )
 
 
-def test_list_prints_the_exports_recipes_and_dependencies_a_project_provides(
+def test_list_prints_the_installed_packages_and_nothing_inside_them(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A bare `list` is the packages: what is inside one is that package's own listing."""
+    _project(
+        tmp_path,
+        files={"src/tracks.sql": QUIETER + PICK, "queries/split.sql": _RUNNABLE_RECIPE},
+        manifest={**_BIN, "dependencies": {"broadcast/tracks": "^1.2.0"}},
+    )
+    code, out, _err = _list(tmp_path, monkeypatch, capsys)
+    assert code == 0
+    assert "me/edits | 0.1.0   | project | false" in out
+    assert out.count("(1 row)") == 1
+    assert "quieter" not in out and "split-chapters" not in out
+
+
+def test_list_prints_the_exports_recipes_and_dependencies_of_one_package(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     _project(
@@ -2674,7 +2690,7 @@ def test_list_prints_the_exports_recipes_and_dependencies_a_project_provides(
         files={"src/tracks.sql": QUIETER + PICK, "queries/split.sql": _RUNNABLE_RECIPE},
         manifest={**_BIN, "dependencies": {"broadcast/tracks": "^1.2.0"}},
     )
-    code, out, _err = _list(tmp_path, monkeypatch, capsys)
+    code, out, _err = _list(tmp_path, monkeypatch, capsys, "me/edits")
     assert code == 0
     assert "quieter(track audio_stream, factor number) | audio_stream" in out
     assert "pick(path text)" in out and "TABLE(track audio_stream)" in out
@@ -2685,14 +2701,14 @@ def test_list_prints_the_exports_recipes_and_dependencies_a_project_provides(
     assert "broadcast/tracks" in out and "^1.2.0" in out
 
 
-def test_list_outside_a_project_prints_empty_tables(
+def test_list_outside_a_project_prints_an_empty_table(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     bare = tmp_path / "no_project"
     bare.mkdir()
     code, out, _err = _list(bare, monkeypatch, capsys)
     assert code == 0
-    assert out.count("(0 rows)") == 4
+    assert out.count("(0 rows)") == 1
 
 
 def test_list_as_json_carries_the_signatures_and_the_variables(
@@ -2703,11 +2719,10 @@ def test_list_as_json_carries_the_signatures_and_the_variables(
         files={"src/tracks.sql": QUIETER, "queries/split.sql": _RUNNABLE_RECIPE},
         manifest={**_BIN, "dependencies": {"broadcast/tracks": "^1.2.0"}},
     )
-    code, out, _err = _list(tmp_path, monkeypatch, capsys, "--json")
+    code, out, _err = _list(tmp_path, monkeypatch, capsys, "me/edits", "--json")
     assert code == 0
-    listed = json.loads(out)["packages"]
-    assert [package["name"] for package in listed] == ["me/edits"]
-    package = listed[0]
+    package = json.loads(out)["package"]
+    assert package["name"] == "me/edits"
     assert package["layer"] == "project"
     assert package["linked"] is False
     assert package["exports"] == [
@@ -2750,15 +2765,15 @@ def test_list_marks_a_recipe_that_cannot_compile_instead_of_claiming_its_variabl
         },
         manifest={"bin": {"split-chapters": "queries/split.sql", "broken": "queries/broken.sql"}},
     )
-    code, out, _err = _list(tmp_path, monkeypatch, capsys)
+    code, out, _err = _list(tmp_path, monkeypatch, capsys, "me/edits")
     assert code == 0
     assert "source (input media path), dest (output path)" in out
     assert "<compilation failed>" in out
 
-    code, out, _err = _list(tmp_path, monkeypatch, capsys, "--json")
+    code, out, _err = _list(tmp_path, monkeypatch, capsys, "me/edits", "--json")
     assert code == 0
     recipes = {
-        recipe["name"]: recipe for recipe in json.loads(out)["packages"][0]["recipes"]
+        recipe["name"]: recipe for recipe in json.loads(out)["package"]["recipes"]
     }
     assert recipes["split-chapters"]["compiles"] is True
     assert recipes["split-chapters"]["required"] != []
@@ -2779,7 +2794,12 @@ def test_list_names_the_layer_and_marks_a_linked_package(
     listed = {package["name"]: package for package in json.loads(out)["packages"]}
     assert listed["me/edits"]["layer"] == "project" and listed["me/edits"]["linked"] is False
     assert listed["tracks/lib"]["layer"] == "local" and listed["tracks/lib"]["linked"] is True
-    assert [f["name"] for f in listed["tracks/lib"]["exports"]] == ["quieter"]
+    # The packages themselves: what one holds is its own listing's answer.
+    assert "exports" not in listed["tracks/lib"]
+
+    code, out, _err = _list(project, monkeypatch, capsys, "tracks/lib", "--json")
+    assert code == 0
+    assert [f["name"] for f in json.loads(out)["package"]["exports"]] == ["quieter"]
 
 
 def test_list_reports_a_malformed_manifest(
@@ -2796,18 +2816,96 @@ def test_list_reports_a_lib_file_that_is_not_a_library(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     _project(tmp_path, files={"src/tracks.sql": QUIETER + "SELECT 1;"})
-    code, _out, err = _list(tmp_path, monkeypatch, capsys)
+    code, _out, err = _list(tmp_path, monkeypatch, capsys, "me/edits")
     assert code == 1
     assert "is not a CREATE FUNCTION" in err
 
 
-def test_list_takes_no_query(
+# Two definitions in one file, the first holding a `;` inside a string
+# literal: what proves a printed definition is cut at the statement the
+# lexer ends, not at the first semicolon in the text.
+_TWO_DEFINITIONS = (
+    "-- Fold a language name to its three-letter code.\n"
+    "CREATE FUNCTION normalize_lang(raw text) RETURNS text AS $$\n"
+    "  SELECT CASE WHEN raw = 'english; british' THEN 'eng' ELSE raw END\n"
+    "$$ LANGUAGE sql;\n"
+    "\n"
+    "-- Turn a track down by a factor.\n"
+    "CREATE FUNCTION quieter(track audio_stream, factor number) RETURNS audio_stream AS $$\n"
+    "  SELECT volume(track, factor)\n"
+    "$$ LANGUAGE sql;\n"
+)
+
+
+def test_list_prints_one_recipe_with_its_comments_and_its_query(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    monkeypatch.chdir(tmp_path)
-    with pytest.raises(SystemExit) as caught:
-        cli.main(["list", "SELECT 1"])
-    assert caught.value.code == 2
+    _project(tmp_path, files={"queries/split.sql": _RUNNABLE_RECIPE}, manifest=_BIN)
+    code, out, _err = _list(tmp_path, monkeypatch, capsys, "me/edits:split-chapters")
+    assert code == 0
+    assert out.startswith("me/edits:split-chapters (queries/split.sql)\n")
+    assert "-- variables: source (input media path), dest (output path)" in out
+    assert "COPY (SELECT f.video[1] FROM input(:'source') f) TO :'dest';" in out
+
+    code, out, _err = _list(tmp_path, monkeypatch, capsys, "me/edits:split-chapters", "--json")
+    assert code == 0
+    recipe = json.loads(out)["recipe"]
+    assert recipe["package"] == "me/edits" and recipe["name"] == "split-chapters"
+    assert recipe["file"] == "queries/split.sql"
+    assert recipe["text"] == _RUNNABLE_RECIPE.strip()
+
+
+def test_list_prints_one_function_with_its_comments_and_its_definition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """One definition out of a file holding two: its own comments, and no neighbour's."""
+    _project(tmp_path, files={"src/tracks.sql": _TWO_DEFINITIONS})
+    code, out, _err = _list(tmp_path, monkeypatch, capsys, "me/edits.quieter")
+    assert code == 0
+    assert out.startswith(
+        "me/edits.quieter(track audio_stream, factor number) (src/tracks.sql)\n"
+    )
+    assert "-- Turn a track down by a factor." in out
+    assert "SELECT volume(track, factor)" in out
+    assert "normalize_lang" not in out and "english; british" not in out
+
+    code, out, _err = _list(tmp_path, monkeypatch, capsys, "me/edits.normalize_lang", "--json")
+    assert code == 0
+    function = json.loads(out)["function"]
+    assert function["package"] == "me/edits" and function["name"] == "normalize_lang"
+    assert function["returns"] == "text" and function["file"] == "src/tracks.sql"
+    assert function["text"].startswith("-- Fold a language name")
+    assert function["text"].endswith("$$ LANGUAGE sql;")
+    assert "english; british" in function["text"]
+
+
+@pytest.mark.parametrize(
+    ("target", "code", "needle"),
+    [
+        ("me/nope", ErrorCode.UNKNOWN_RECIPE, "names a package that is not installed"),
+        ("me/edits:nope", ErrorCode.UNKNOWN_RECIPE, "does not ship a recipe named 'nope'"),
+        ("me/edits.nope", ErrorCode.UNKNOWN_FUNCTION, "does not export a function named 'nope'"),
+        ("me.edits.quieter", ErrorCode.UNKNOWN_RECIPE, "does not name a package"),
+        ("SELECT 1", ErrorCode.UNKNOWN_RECIPE, "does not name a package"),
+    ],
+)
+def test_list_refuses_a_target_naming_nothing_it_holds(
+    target: str,
+    code: ErrorCode,
+    needle: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _project(
+        tmp_path,
+        files={"src/tracks.sql": QUIETER, "queries/split.sql": _RUNNABLE_RECIPE},
+        manifest=_BIN,
+    )
+    exit_code, out, err = _list(tmp_path, monkeypatch, capsys, target)
+    assert exit_code == 1
+    assert out == ""
+    assert code.value in err and needle in err
 
 
 # ---------------------------------------------------------------------------
@@ -2993,7 +3091,11 @@ def test_init_then_list_then_run_the_starter_recipe(
 
     code, out, _err = _run(root, monkeypatch, capsys, "list")
     assert code == 0
-    assert "resize" in out and "me/my_edits" in out
+    assert "me/my_edits" in out
+
+    code, out, _err = _run(root, monkeypatch, capsys, "list", "me/my_edits")
+    assert code == 0
+    assert "resize" in out
 
     code, out, _err = _run(
         root, monkeypatch, capsys, "compile", "resize", "-v", "source=in.mp4", "-v", "dest=out.mp4"

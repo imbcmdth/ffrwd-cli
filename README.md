@@ -207,7 +207,7 @@ ffrwd [<command>] [-h] [-f FILE] [-v NAME=VALUE] [-q] [query | recipe]
 | `compile` | print the full ffmpeg command | `--graph-only` (just the filtergraph string) |
 | `explain` | dump the compiled graph as JSON | `--mermaid` (as a flowchart) · `--diagram` (rendered in the terminal; needs `ffrwd[diagram]`) |
 | `validate` | exit 0 if the query compiles, else a line-anchored error | `--json` (machine-readable error object on stdout) |
-| `list` | every package this project and the machine hold, with each one's functions and recipes | `--json` |
+| `list [TARGET]` | with no target, every package this project and the machine hold; `ns/pkg`, what that one exports, ships and depends on; `ns/pkg:recipe` or `ns/pkg.function`, that one member's source, comments and all | `--json` |
 | `search` | ask the registry for packages matching a term | |
 | `install` | install a package into this project, or with `-g` machine-wide; with no argument, install what the project's `ffrwd.json` declares | `-g` |
 | `init` | start a package here: `ffrwd.json`, an empty lockfile, a starter recipe | `--name` · `--namespace` |

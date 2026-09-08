@@ -363,11 +363,17 @@ A project's own definitions stay bare - `normalize(...)` inside the
 project that defines it; unqualified names are never a package lookup.
 
 `ffrwd list` prints what the project at the working directory and its
-dependencies provide: the packages with their layer, the exports with
-their signatures and files (the list is the manifest's; only parameter
-types are read from the files), the recipes with the variables each
-declares (read from its `-- variables:` header), and the dependencies.
-`--json` for scripting.
+dependencies provide, at the depth its argument asks for. With none, the
+packages themselves with their version and layer. `ns/pkg` is that one
+package: the exports with their signatures and files (the list is the
+manifest's; only parameter types are read from the files), the recipes
+with the variables each declares (read from its `-- variables:` header),
+and the dependencies. `ns/pkg:recipe` and `ns/pkg.function` print that
+one member as its file writes it, comments and all - the two spellings
+the rest of the CLI already uses, a recipe named the way `run` names one
+and a function the way a call reaches it. A target naming nothing
+installed is a refusal, not an empty table. `--json` for scripting,
+carrying whichever of the four was asked for.
 
 The project is found by walking up from the working directory; there
 is no flag, and a query file's own directory plays no part. Outside a

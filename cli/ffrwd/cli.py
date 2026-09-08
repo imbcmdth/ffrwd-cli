@@ -56,11 +56,15 @@ Subcommands:
   ``run --remote --wait`` when the job it followed lands there -- right
   under the error, bounded to the last few lines. An ID may be any unique
   prefix of the id ``submit`` printed.
-* ``list [--json]`` -- print what the project at the working directory and its
-  dependencies provide: one table of packages, one of the functions they
-  export, one of the recipes they ship with the variables each declares, and
-  one of the dependencies each manifest declares. Takes no query; the export
-  list is the manifest's ``lib``, with parameter types read from the files.
+* ``list [TARGET] [--json]`` -- print what the project at the working
+  directory and its dependencies provide, at the depth ``TARGET`` asks for.
+  No target is one table of the installed packages. ``ns/pkg`` is that one
+  package: what it exports (the manifest's ``lib``, with parameter types read
+  from the files), the recipes it ships with the variables each declares, and
+  the dependencies its manifest declares. ``ns/pkg:recipe`` and
+  ``ns/pkg.function`` are that one member's own source, comments and all, as
+  its file writes it. ``--json`` emits whichever of the four the target asked
+  for; a target naming nothing installed is a refusal, never an empty table.
 * ``init [--name NAME] [--namespace NS] [--rust]`` -- write ``ffrwd.json``, an
   empty ``ffrwd.lock`` and a starter recipe into the working directory. The
   package segment is the directory's name unless ``--name`` says otherwise;
@@ -205,7 +209,7 @@ from .execute import (
     execute_plan,
     render_plan,
 )
-from .functions import Signature, package_signatures
+from .functions import Signature, package_signatures, package_sources
 from .ir import PIPE, Graph, SinkUnit
 from .probe import is_url
 from .processes import ProcessPlan, SidecarProcess
@@ -577,6 +581,14 @@ def _build_parser() -> argparse.ArgumentParser:
         "list", help="print what this project and its dependencies provide"
     )
     list_p.add_argument(
+        "target",
+        nargs="?",
+        default=None,
+        metavar="TARGET",
+        help="a package (ns/pkg), one of its recipes (ns/pkg:recipe) or one of "
+        "its functions (ns/pkg.function); with none, the installed packages",
+    )
+    list_p.add_argument(
         "--json", action="store_true", dest="as_json", help="emit the listing as JSON"
     )
     init_p = subparsers.add_parser(
@@ -929,8 +941,8 @@ def _recipe_text(
                 else f"'{name}' names a package with no default recipe",
                 hint=f"it ships: {shipped}"
                 if shipped
-                else f"'{package.name}' ships no recipes -- `ffrwd list` shows "
-                "what it provides",
+                else f"'{package.name}' ships no recipes -- `ffrwd list "
+                f"{package.name}` shows what it provides",
             )
         return _read_recipe(package, member if member is not None else package.package, file)
     refused = _dotted_spelling(name, packages)
@@ -1896,91 +1908,90 @@ def _listed(package: Package, packages: PackageSet | None) -> _Listed:
     )
 
 
-def _listing_json(listed: list[_Listed]) -> str:
-    """The listing as one JSON object, for scripting."""
-    packages = [
-        {
-            "name": entry.package.name,
-            "version": entry.package.version,
-            "layer": entry.package.layer,
-            "linked": entry.package.linked,
-            "root": str(entry.package.root),
-            "exports": [
-                {
-                    "name": signature.name,
-                    "params": [
-                        {
-                            "name": param.name,
-                            "type": param.type,
-                            "default": param.written_default,
-                        }
-                        for param in signature.params
-                    ],
-                    "returns": signature.returns,
-                    "file": _relative(signature.export, entry.package.root),
-                }
-                for signature in entry.functions
-            ],
-            "recipes": [
-                {
-                    "name": listed_recipe.name,
-                    "file": _relative(listed_recipe.path, entry.package.root),
-                    "compiles": listed_recipe.compiles,
-                    "required": [
-                        {"name": variable.name, "description": variable.description}
-                        for variable in listed_recipe.required
-                    ],
-                    "optional": [
-                        {"name": variable.name, "description": variable.description}
-                        for variable in listed_recipe.optional
-                    ],
-                }
-                for listed_recipe in entry.recipes
-            ],
-            "dependencies": [
-                {"name": name, "range": range_}
-                for name, range_ in entry.package.dependencies.items()
-            ],
-        }
-        for entry in listed
-    ]
-    return json.dumps({"packages": packages}, indent=2)
+def _identity_json(package: Package) -> dict[str, object]:
+    """What names one package: the same four columns the listing prints, and its root."""
+    return {
+        "name": package.name,
+        "version": package.version,
+        "layer": package.layer,
+        "linked": package.linked,
+        "root": str(package.root),
+    }
 
 
-def _package_rows(listed: list[_Listed]) -> TableResult:
+def _export_json(signature: Signature, root: Path) -> dict[str, object]:
+    return {
+        "name": signature.name,
+        "params": [
+            {"name": param.name, "type": param.type, "default": param.written_default}
+            for param in signature.params
+        ],
+        "returns": signature.returns,
+        "file": _relative(signature.export, root),
+    }
+
+
+def _recipe_json(recipe: _ListedRecipe, root: Path) -> dict[str, object]:
+    return {
+        "name": recipe.name,
+        "file": _relative(recipe.path, root),
+        "compiles": recipe.compiles,
+        "required": [
+            {"name": variable.name, "description": variable.description}
+            for variable in recipe.required
+        ],
+        "optional": [
+            {"name": variable.name, "description": variable.description}
+            for variable in recipe.optional
+        ],
+    }
+
+
+def _package_json(entry: _Listed) -> dict[str, object]:
+    """One package's own listing: what the table form prints, keyed."""
+    root = entry.package.root
+    return {
+        **_identity_json(entry.package),
+        "exports": [_export_json(signature, root) for signature in entry.functions],
+        "recipes": [_recipe_json(recipe, root) for recipe in entry.recipes],
+        "dependencies": [
+            {"name": name, "range": range_}
+            for name, range_ in entry.package.dependencies.items()
+        ],
+    }
+
+
+def _print_json(key: str, body: object) -> None:
+    """The listing as one JSON object, keyed by the depth the target asked for."""
+    print(json.dumps({key: body}, indent=2))
+
+
+def _package_rows(packages: list[Package]) -> TableResult:
     rows: list[list[CellValue]] = [
-        [
-            entry.package.name,
-            entry.package.version,
-            entry.package.layer,
-            entry.package.linked,
-        ]
-        for entry in listed
+        [package.name, package.version, package.layer, package.linked]
+        for package in packages
     ]
     return TableResult(columns=["package", "version", "layer", "linked"], rows=rows)
 
 
-def _export_rows(listed: list[_Listed]) -> TableResult:
+def _export_rows(entry: _Listed) -> TableResult:
     rows: list[list[CellValue]] = [
         [
-            entry.package.name,
             signature.written,
             signature.returns,
             _relative(signature.export, entry.package.root),
         ]
-        for entry in listed
         for signature in entry.functions
     ]
-    return TableResult(columns=["package", "export", "returns", "file"], rows=rows)
+    return TableResult(columns=["export", "returns", "file"], rows=rows)
 
 
 _NOT_COMPILED = "<compilation failed>"
 
 
-def _recipe_rows(listed: list[_Listed]) -> TableResult:
+def _recipe_rows(entry: _Listed) -> TableResult:
     rows: list[list[CellValue]] = [
         [
-            entry.package.name,
             listed_recipe.name,
             _NOT_COMPILED
             if not listed_recipe.compiles
@@ -1988,21 +1999,16 @@ def _recipe_rows(listed: list[_Listed]) -> TableResult:
             "" if not listed_recipe.compiles else _written_variables(listed_recipe.optional),
             _relative(listed_recipe.path, entry.package.root),
         ]
-        for entry in listed
         for listed_recipe in entry.recipes
     ]
-    return TableResult(
-        columns=["package", "recipe", "required", "optional", "file"], rows=rows
-    )
+    return TableResult(columns=["recipe", "required", "optional", "file"], rows=rows)
 
 
-def _dependency_rows(listed: list[_Listed]) -> TableResult:
+def _dependency_rows(entry: _Listed) -> TableResult:
     rows: list[list[CellValue]] = [
-        [entry.package.name, name, range_]
-        for entry in listed
-        for name, range_ in entry.package.dependencies.items()
+        [name, range_] for name, range_ in entry.package.dependencies.items()
     ]
-    return TableResult(columns=["package", "dependency", "range"], rows=rows)
+    return TableResult(columns=["dependency", "range"], rows=rows)
 
 
 def _written_variables(variables: tuple[Variable, ...]) -> str:
@@ -2013,16 +2019,194 @@ def _written_variables(variables: tuple[Variable, ...]) -> str:
     )
 
 
+_TARGET_HINT = (
+    "a target is <namespace>/<package>, <namespace>/<package>:<recipe> or "
+    "<namespace>/<package>.<function>"
+)
+
+
+@dataclass(frozen=True)
+class _Target:
+    """What one `list` argument names: a package, and the member inside it.
+
+    At most one of `recipe` and `function` is set; neither names the package
+    itself. Both separators are the ones already written elsewhere: a recipe
+    is run as ``ns/pkg:recipe``, and a function is called through the dot a
+    query reaches it with.
+    """
+
+    package: str
+    recipe: str | None = None
+    function: str | None = None
+
+
+def _bad_target(text: str) -> FfrwdError:
+    return FfrwdError(
+        ErrorCode.UNKNOWN_RECIPE,
+        f"'{text}' does not name a package or anything in one",
+        hint=_TARGET_HINT,
+    )
+
+
+def _target(text: str) -> _Target:
+    """`text` read as ``ns/pkg``, ``ns/pkg:recipe`` or ``ns/pkg.function``.
+
+    Spelling only: whether the package is installed, and whether it ships what
+    the target names, are the lookups' own refusals.
+    """
+    name, colon, recipe = text.partition(":")
+    if colon:
+        if not is_package_name(name) or not recipe:
+            raise _bad_target(text)
+        return _Target(package=name, recipe=recipe)
+    name, dot, function = text.partition(".")
+    if dot:
+        if not is_package_name(name) or not function:
+            raise _bad_target(text)
+        return _Target(package=name, function=function)
+    if not is_package_name(text):
+        raise _bad_target(text)
+    return _Target(package=text)
+
+
+def _discovered_package(name: str, packages: PackageSet | None) -> Package:
+    """The discovered package `name` names, or the refusal saying it is not installed."""
+    found = None if packages is None else packages.get(name)
+    if found is None:
+        raise FfrwdError(
+            ErrorCode.UNKNOWN_RECIPE,
+            f"'{name}' names a package that is not installed",
+            hint=f"`ffrwd list` shows what is; `ffrwd install {name}` installs it",
+        )
+    return found
+
+
+def _shipped_recipe(package: Package, name: str) -> Path:
+    """The file of the recipe `package` ships as `name`, or the refusal naming what it does ship."""
+    file = package.recipe(name)
+    if file is None:
+        shipped = ", ".join(
+            _qualified_recipe(package, recipe) for recipe in sorted(package.recipes)
+        )
+        raise FfrwdError(
+            ErrorCode.UNKNOWN_RECIPE,
+            f"'{package.name}' does not ship a recipe named '{name}'",
+            hint=f"it ships: {shipped}"
+            if shipped
+            else f"'{package.name}' ships no recipes -- `ffrwd list {package.name}` "
+            "shows what it provides",
+        )
+    return file
+
+
+def _exported_function(package: Package, name: str, entry: _Listed) -> Signature:
+    """`package`'s export named `name`, or the refusal naming what it does export."""
+    found = next((signature for signature in entry.functions if signature.name == name), None)
+    if found is None:
+        exported = ", ".join(f"{package.name}.{export}" for export in sorted(package.exports))
+        raise FfrwdError(
+            ErrorCode.UNKNOWN_FUNCTION,
+            f"'{package.name}' does not export a function named '{name}'",
+            hint=f"it exports: {exported}"
+            if exported
+            else f"'{package.name}' exports nothing -- `ffrwd list {package.name}` "
+            "shows what it provides",
+        )
+    return found
+
+
+def _print_source(title: str, file: str, text: str) -> None:
+    """One recipe or function under a line naming it and the file it is written in."""
+    print(f"{title} ({file})\n\n{text}")
+
+
+def _list_package(entry: _Listed, *, as_json: bool) -> int:
+    """One package: what it exports, what it ships, and what it depends on."""
+    if as_json:
+        _print_json("package", _package_json(entry))
+        return 0
+    # One section per kind, each headed by its own name: four tables in a row
+    # are unreadable without one.
+    sections = [
+        f"{heading}\n{render_table(table)}"
+        for heading, table in (
+            ("package", _package_rows([entry.package])),
+            ("exports", _export_rows(entry)),
+            ("recipes", _recipe_rows(entry)),
+            ("dependencies", _dependency_rows(entry)),
+        )
+    ]
+    print("\n\n".join(sections))
+    return 0
+
+
+def _list_recipe(package: Package, name: str, *, as_json: bool) -> int:
+    """One recipe as its file writes it: the header comments and the query."""
+    file = _shipped_recipe(package, name)
+    text = _read_recipe(package, name, file)[0].strip()
+    written = _relative(file, package.root)
+    if as_json:
+        _print_json(
+            "recipe",
+            {
+                "package": package.name,
+                "version": package.version,
+                "name": name,
+                "file": written,
+                "text": text,
+            },
+        )
+        return 0
+    _print_source(f"{package.name}:{name}", written, text)
+    return 0
+
+
+def _list_function(package: Package, name: str, entry: _Listed, *, as_json: bool) -> int:
+    """One exported function as its lib file writes it, comments and all."""
+    signature = _exported_function(package, name, entry)
+    text = package_sources(package)[name]
+    written = _relative(signature.export, package.root)
+    if as_json:
+        _print_json(
+            "function",
+            {
+                "package": package.name,
+                "version": package.version,
+                **_export_json(signature, package.root),
+                "text": text,
+            },
+        )
+        return 0
+    _print_source(f"{package.name}.{signature.written}", written, text)
+    return 0
+
+
+def _list_target(text: str, packages: PackageSet | None, *, as_json: bool) -> int:
+    """The listing for one ``ns/pkg[:recipe|.function]`` argument."""
+    target = _target(text)
+    package = _discovered_package(target.package, packages)
+    if target.recipe is not None:
+        return _list_recipe(package, target.recipe, as_json=as_json)
+    entry = _listed(package, packages)
+    if target.function is not None:
+        return _list_function(package, target.function, entry, as_json=as_json)
+    return _list_package(entry, as_json=as_json)
+
+
 def _cmd_list(args: argparse.Namespace, on_warning: OnWarning) -> int:
-    """Print what the project at the working directory provides. Takes no query.
+    """Print what this project and its dependencies provide, at one of three depths.
+
+    No target is the packages themselves; a package is what it exports, ships
+    and depends on; a recipe or a function is that one thing's own source.
 
     The same upward walk every other subcommand does, so the answer is the one
     a compile here would resolve against.
     """
     try:
         found = discover(Path.cwd())
+        if args.target is not None:
+            return _list_target(args.target, found, as_json=args.as_json)
         packages = [] if found is None else [found.packages[name] for name in found.names()]
-        listed = [_listed(package, found) for package in packages]
     except FfrwdError as err:
         _print_error(err)
         return 1
@@ -2032,21 +2216,9 @@ def _cmd_list(args: argparse.Namespace, on_warning: OnWarning) -> int:
         return 1
 
     if args.as_json:
-        print(_listing_json(listed))
+        _print_json("packages", [_identity_json(package) for package in packages])
         return 0
-
-    # One section per kind, each headed by its own name: four tables in a row
-    # are unreadable without one.
-    sections = [
-        f"{heading}\n{render_table(table)}"
-        for heading, table in (
-            ("packages", _package_rows(listed)),
-            ("exports", _export_rows(listed)),
-            ("recipes", _recipe_rows(listed)),
-            ("dependencies", _dependency_rows(listed)),
-        )
-    ]
-    print("\n\n".join(sections))
+    print(render_table(_package_rows(packages)))
     return 0
 
 
@@ -2741,7 +2913,10 @@ def _cmd_install(args: argparse.Namespace, on_warning: OnWarning) -> int:
         brought = ", ".join(f"{one.name} {one.version}" for one in installed.brought)
         print(f"  brought along as dependencies: {brought}")
     full = release.name.replace("/", ".")
-    print(f"a query calls it as {full}.<name>() -- `ffrwd list` shows what it provides")
+    print(
+        f"a query calls it as {full}.<name>() -- `ffrwd list {release.name}` "
+        "shows what it provides"
+    )
     return 0
 
 

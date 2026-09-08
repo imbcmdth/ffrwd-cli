@@ -85,6 +85,7 @@ from __future__ import annotations
 
 import copy
 import difflib
+import re
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
@@ -143,6 +144,7 @@ __all__ = [
     "expanded",
     "package_modules",
     "package_signatures",
+    "package_sources",
 ]
 
 # The FROM item that mints an `-i`. Never an argument: it is a table, and a
@@ -1993,8 +1995,22 @@ def _package_module(
     )
 
 
+def _lib_text(package: Package, path: Path, anchor: exp.Expr | None) -> str:
+    """One lib file's text, or the rejection naming what could not be read."""
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError as err:
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"package '{package.name}': could not read {path}: "
+            f"{err.strerror or err}",
+            anchor,
+            hint=f"{package.manifest} names it in lib",
+        ) from err
+
+
 def _source_definitions(
-    package: Package, path: Path, anchor: exp.Expr | None
+    package: Package, path: Path, anchor: exp.Expr | None, text: str | None = None
 ) -> list[_Function | WasmFunction]:
     """Every ``CREATE FUNCTION`` one lib file holds, validated.
 
@@ -2005,18 +2021,11 @@ def _source_definitions(
     module path resolved against the package root.
 
     `path` is always one of ``package.exports``' files. A recipe's file is a
-    query and is never read here.
+    query and is never read here. `text` is that file's contents for a caller
+    that already read them, and None to read them here.
     """
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError as err:
-        raise _error(
-            ErrorCode.UNSUPPORTED_SQL,
-            f"package '{package.name}': could not read {path}: "
-            f"{err.strerror or err}",
-            anchor,
-            hint=f"{package.manifest} names it in lib",
-        ) from err
+    if text is None:
+        text = _lib_text(package, path, anchor)
     try:
         statements = _statements(parse(text))
     except FfrwdError as err:
@@ -2142,6 +2151,26 @@ def package_signatures(package: Package) -> tuple[Signature, ...]:
     )
 
 
+def package_sources(package: Package) -> dict[str, str]:
+    """Every definition in `package`'s lib files as the file writes it.
+
+    Keyed by defined name -- exported or not -- to the ``CREATE FUNCTION``
+    source, the comments written above it included. What answers "show me
+    this function": the file's own words, which no rendering of the parsed
+    tree gives back. Reads and validates exactly as
+    :func:`package_signatures`, and raises the same way.
+    """
+    sources: dict[str, str] = {}
+    for path in dict.fromkeys(package.exports.values()):
+        text = _lib_text(package, path, None)
+        blocks = _statement_blocks(text)
+        for index, definition in enumerate(_source_definitions(package, path, None, text)):
+            # The whole file where a cut could not be paired with a
+            # definition, so a reader always sees source rather than nothing.
+            sources[definition.name] = blocks[index] if index < len(blocks) else text.strip()
+    return sources
+
+
 def package_modules(package: Package) -> tuple[WasmFunction, ...]:
     """Every ``LANGUAGE wasm`` declaration across `package`'s lib files.
 
@@ -2155,6 +2184,79 @@ def package_modules(package: Package) -> tuple[WasmFunction, ...]:
     return tuple(
         declared for declared in scope.values() if isinstance(declared, WasmFunction)
     )
+
+
+# Dollar quoting, tag and all: `$$ ... $$` is what a function body is written
+# in, and everything inside one is text.
+_DOLLAR_TAG_RE = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)?\$")
+
+
+def _statement_blocks(text: str) -> list[str]:
+    """`text` cut into one block per statement, in written order.
+
+    Each block is the statement's own source with the comments written above
+    it. The cut is at every ``;`` the lexer would see as one -- outside a
+    comment, a quoted run and a dollar-quoted body -- and text past the last
+    one is a block too, since a file's last statement may omit it.
+    """
+    blocks: list[str] = []
+    start = at = 0
+    end = len(text)
+    while at < end:
+        if text.startswith("--", at):
+            newline = text.find("\n", at)
+            at = end if newline == -1 else newline + 1
+        elif text.startswith("/*", at):
+            at = _past_block_comment(text, at)
+        elif text[at] in "'\"":
+            at = _past_quoted(text, at)
+        elif text[at] == "$" and (tag := _DOLLAR_TAG_RE.match(text, at)) is not None:
+            close = text.find(tag.group(), tag.end())
+            at = end if close == -1 else close + len(tag.group())
+        elif text[at] == ";":
+            blocks.append(text[start : at + 1].strip())
+            at = start = at + 1
+        else:
+            at += 1
+    if text[start:].strip():
+        blocks.append(text[start:].strip())
+    return blocks
+
+
+def _past_block_comment(text: str, at: int) -> int:
+    """The offset past the block comment beginning at `at`. Postgres nests them."""
+    depth = 0
+    end = len(text)
+    while at < end:
+        if text.startswith("/*", at):
+            depth += 1
+            at += 2
+        elif text.startswith("*/", at):
+            depth -= 1
+            at += 2
+            if depth == 0:
+                return at
+        else:
+            at += 1
+    return end
+
+
+def _past_quoted(text: str, at: int) -> int:
+    """The offset past the quoted run beginning at `at`.
+
+    A doubled quote inside is an escaped one: ``'it''s'`` is one string.
+    """
+    quote = text[at]
+    end = len(text)
+    at += 1
+    while at < end:
+        if text[at] != quote:
+            at += 1
+        elif at + 1 < end and text[at + 1] == quote:
+            at += 2
+        else:
+            return at + 1
+    return end
 
 
 # -- reading and rewriting nodes ------------------------------------------

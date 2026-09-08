@@ -914,7 +914,8 @@ ffrwd's own).
 
    `ffrwd` is a reserved name too: never use it as an alias or a CTE name.
 4. **A package call** -- only inside a project with a `ffrwd.json`, and only
-   for a package it installed (`ffrwd list` shows what one provides). Every
+   for a package it installed (`ffrwd list` names them, and
+   `ffrwd list <namespace>/<package>` shows what one provides). Every
    call across packages is written in full, three segments:
    `<namespace>.<package>.<member>(...)` reaches that package's export named
    `<member>`; `<namespace>.<package>(...)`, two segments, reaches its DEFAULT
