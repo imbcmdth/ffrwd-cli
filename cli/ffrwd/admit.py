@@ -97,7 +97,7 @@ def _check_concat_columns(
     ``concat`` is a filtergraph filter and takes ``v`` video plus ``a``
     audio pads — there is no ``s``/``d`` half — so a caption column in a
     concatenated branch has nowhere to go. Checked before
-    :meth:`_check_concat_signature` so the rejection names the real reason
+    :func:`_check_concat_signature` so the rejection names the real reason
     rather than a column-count mismatch.
     """
     for index, columns in enumerate(flattened):

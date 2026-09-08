@@ -116,7 +116,7 @@ def _range_text(option: FilterOption) -> str | None:
 def _literal_value(node: exp.Expr) -> object | None:
     """A named argument's value as a python scalar, or None if it is not a literal.
 
-    Deliberately separate from :func:`_number`: that raises its own message,
+    Deliberately separate from :func:`ffrwd.expressions._number`: that raises its own message,
     and an option's expected type is only known after the registry has been
     consulted, so reading the value and judging it are two steps here.
     """

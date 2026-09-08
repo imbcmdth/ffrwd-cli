@@ -48,8 +48,8 @@ class _Stream:
     single-stream-input filters, the WHERE trim included — and is threaded
     unconditionally. A call over two or more streams (``amix``, ``overlay``)
     and a ``concat`` pad are the other kind of join: each keeps `source` only
-    when every stream feeding it agrees on what it says (:func:`_agreed_source`);
-    otherwise it is None, same as an unprobed input. :func:`_provenance` turns
+    when every stream feeding it agrees on what it says (:func:`ffrwd.lower._agreed_source`);
+    otherwise it is None, same as an unprobed input. :func:`ffrwd.lower._provenance` turns
     it into ``Output.metadata``.
 
     `rendition` is the :class:`~ffrwd.probe.RenditionMeta` a rendition row's
