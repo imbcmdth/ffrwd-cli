@@ -1270,6 +1270,11 @@ def module_capabilities(package: Package) -> dict[str, tuple[str, ...]]:
     the manifest claims: a module that runs a model is what makes the package
     one that needs one. Keyed by the written path so a caller can name the
     module a capability came from.
+
+    The manifest vocabulary (:data:`~ffrwd.project.CAPABILITIES`) is a
+    superset of the effects the sidecar grants: ``nn`` is a capability a
+    package declares and no ``-http``/``-net`` grant, so it joins
+    :func:`~ffrwd.wasm.effects`' answer here rather than in that table.
     """
     found: dict[str, tuple[str, ...]] = {}
     for declared in package_modules(package):
@@ -1279,13 +1284,7 @@ def module_capabilities(package: Package) -> dict[str, tuple[str, ...]]:
             written = declared.module
         described = wasm.describe(declared.module)
         found[written] = tuple(
-            name
-            for name, needed in (
-                ("http", described.http),
-                ("nn", described.nn),
-                ("udp", described.udp),
-            )
-            if needed
+            sorted(wasm.effects(described) + (("nn",) if described.nn else ()))
         )
     return found
 

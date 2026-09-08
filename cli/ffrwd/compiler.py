@@ -353,26 +353,30 @@ def _nn_models(
 
 
 def _effect_grants(
-    declared_stream: Mapping[str, WasmFunction], describes: Mapping[str, Described]
+    declarations: Mapping[str, WasmFunction], describes: Mapping[str, Described]
 ) -> dict[str, tuple[str, ...]]:
     """What each module needs granted, keyed by module path.
 
-    Read off the describe: a module importing wasi:http needs ``http``, one
-    importing wasi:sockets needs ``udp``. The sidecar denies both without
-    the matching argv, which is what these become.
+    Read off the describe (:func:`~ffrwd.wasm.effects`). The sidecar denies
+    every effect without the matching argv, which is what these become.
+
+    Every module the sidecar RUNS answers here: a stream one, a rows one and
+    a packet source alike become a process, and a process is where a grant is
+    rendered. A URL SOURCE takes none -- it names files at compile time and
+    is granted its effects there, by :func:`~ffrwd.wasm.invoke` -- so it is
+    left out. Which of the two a ``RETURNS source`` declaration is comes from
+    its describe rather than its SQL, the branch lowering takes.
     """
     found: dict[str, tuple[str, ...]] = {}
-    for declared in declared_stream.values():
+    for declared in declarations.values():
         described = describes.get(declared.module)
         if described is None or declared.module in found:
             continue
-        effects = tuple(
-            effect
-            for effect, needed in (("http", described.http), ("udp", described.udp))
-            if needed
-        )
-        if effects:
-            found[declared.module] = effects
+        if declared.is_source and not described.source:
+            continue
+        needed = wasm.effects(described)
+        if needed:
+            found[declared.module] = needed
     return found
 
 
@@ -607,7 +611,7 @@ def compile_all(
                 shapes=_module_shapes(stream_wasm, describes),
                 audio_wires=_audio_wires(stream_wasm, describes),
                 models=_nn_models(hosted, describes, packages),
-                effects=_effect_grants(stream_wasm | _source_wasm(res), describes),
+                effects=_effect_grants(hosted | _source_wasm(res), describes),
                 anchors=res.input_anchors,
             )
             check_spellable(plan)

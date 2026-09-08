@@ -4411,7 +4411,9 @@ def test_a_sources_own_import_is_granted_through_effect_grants() -> None:
     describe payload the same way it reads a stream module's."""
     res = _resolved(SOURCE_QUERY)
     declared = next(iter(res.wasm.values()))
-    described = Described(world="ffrwd:av@0.15.0", name="subscribe", udp=True)
+    described = Described(
+        world="ffrwd:av@0.15.0", name="subscribe", source=True, udp=True
+    )
     grants = _effect_grants(_source_wasm(res), {declared.module: described})
     assert grants == {SOURCE_MODULE: ("udp",)}
 
@@ -4419,7 +4421,22 @@ def test_a_sources_own_import_is_granted_through_effect_grants() -> None:
 def test_a_source_needing_no_effect_is_granted_none() -> None:
     res = _resolved(SOURCE_QUERY)
     declared = next(iter(res.wasm.values()))
-    described = Described(world="ffrwd:av@0.15.0", name="subscribe")
+    described = Described(world="ffrwd:av@0.15.0", name="subscribe", source=True)
+    grants = _effect_grants(_source_wasm(res), {declared.module: described})
+    assert grants == {}
+
+
+def test_a_url_source_is_granted_nothing_the_plan_could_render() -> None:
+    """The other half of ``RETURNS source``: a module that names FILES
+    produces no packets and takes no process, so no command line has a
+    place to put its grant. It runs at compile time instead, where
+    :func:`~ffrwd.wasm.invoke` grants it -- and which half a declaration is
+    is the describe's `source` answer, not the SQL's `RETURNS source`."""
+    res = _resolved(SOURCE_QUERY)
+    declared = next(iter(res.wasm.values()))
+    assert declared.is_source
+    described = Described(world="ffrwd:av@0.15.0", name="subscribe", udp=True)
+    assert not described.source
     grants = _effect_grants(_source_wasm(res), {declared.module: described})
     assert grants == {}
 
@@ -5664,6 +5681,7 @@ def _rows_module_described(
     reads: dict[str, object] | None = None,
     writes: dict[str, object] | None = None,
     nn: bool = False,
+    http: bool = False,
 ) -> Described:
     """A module that reads cue rows and writes cue rows, as --describe says it."""
     return Described(
@@ -5675,6 +5693,7 @@ def _rows_module_described(
         input_rows_schema=reads or _CUE_ROWS,
         rows_module=rows_module,
         nn=nn,
+        http=http,
     )
 
 
@@ -6215,6 +6234,21 @@ def test_a_rows_module_s_missing_model_is_refused(tmp_path: Path) -> None:
     assert "is not there" in error.message
     assert error.line is not None and error.hint
     assert "fetch" in error.hint
+
+
+# a rows module importing an effect of its own
+
+
+def test_a_rows_module_s_own_effect_is_granted_beside_its_producer_s() -> None:
+    """A rows module rides in its producer's process, and the sidecar refuses
+    a module importing wasi:http there without a ``-http`` naming it. The
+    grant is read off the rows module's OWN describe, the way its model is."""
+    plan = _plan_of(ROWS_RECIPE, _rows_module_described(http=True))
+    (sidecar,) = plan.sidecars
+    assert EffectGrant(effect="http", module=ROWS_MODULE) in sidecar.grants
+    argv = wasm.shown_argv(sidecar)
+    at = argv.index("-http")
+    assert argv[at + 1] == ROWS_MODULE
 
 
 # several documents off one region

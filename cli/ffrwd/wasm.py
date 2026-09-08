@@ -679,16 +679,28 @@ def describe(path: str) -> Described:
     return _described(path, payload)
 
 
+def effects(described: Described) -> tuple[str, ...]:
+    """The effects `described`'s own imports need granted, in argv order.
+
+    A module importing wasi:http needs ``http``, one importing wasi:sockets
+    needs ``udp``, and the sidecar denies both to a module the command line
+    never names. The one read of a describe that answers this; what a caller
+    does with the answer -- a grant flag, a manifest capability -- is its own.
+    """
+    return tuple(
+        effect
+        for effect, needed in (("http", described.http), ("udp", described.udp))
+        if needed
+    )
+
+
 def _grant_args(described: Described, path: str) -> list[str]:
     """The ``-http``/``-net`` grants `described`'s own imports need for `path`,
     which :func:`invoke` and :func:`probe_source` both put ahead of the flag
     that dispatches their call."""
-    argv: list[str] = []
-    if described.http:
-        argv += [_GRANT_FLAGS["http"], path]
-    if described.udp:
-        argv += [_GRANT_FLAGS["udp"], path]
-    return argv
+    return [
+        flag for effect in effects(described) for flag in (_GRANT_FLAGS[effect], path)
+    ]
 
 
 def invoke(
