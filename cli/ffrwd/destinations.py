@@ -13,10 +13,11 @@ from dataclasses import dataclass
 from sqlglot import exp
 
 from ffrwd.errors import ErrorCode, FfrwdError
-from ffrwd.expressions import _error
+from ffrwd.expressions import _error, _sql_text, _unwrap
 from ffrwd.functions import WASM_STREAM_NAMES, WasmFunction
 from ffrwd.ir import StreamType
-from ffrwd.parser import RawSink, _pos
+from ffrwd.parser import RawSink, Resolved, _pos
+from ffrwd.parser import _ident_name as _fold
 from ffrwd.types import is_array
 from ffrwd.values import _Stream, _stream_count
 from ffrwd.wasm import (
@@ -232,3 +233,90 @@ def _bind_sink_streams(
             "the extra columns",
         )
     return pads
+
+
+def _nothing_to_write_error(
+    branches: list[exp.Select], anchor: exp.Expr
+) -> FfrwdError:
+    """No branch kept a row, so this COPY would write an empty file."""
+    filters = [branch.args.get("where") for branch in branches]
+    written = "; ".join(
+        f"WHERE {_sql_text(node.this)}"
+        for node in filters
+        if isinstance(node, exp.Where) and isinstance(node.this, exp.Expr)
+    )
+    matched = f"no row matched {written}" if written else "no branch kept a row"
+    first = next((node for node in filters if isinstance(node, exp.Where)), None)
+    return _error(
+        ErrorCode.STREAM_NOT_FOUND,
+        f"this COPY has nothing to write: {matched}",
+        first,
+        fallback=anchor,
+        hint="every selected column aggregates over zero rows, and an empty "
+        "file is never written; widen the WHERE, or lower the threshold it "
+        "compares against",
+    )
+
+
+def _rows_call(res: Resolved, node: exp.Expr) -> tuple[exp.Anonymous, WasmFunction] | None:
+    """``<rows function>(<rows>)``, as the call and what declares it."""
+    if not isinstance(node, exp.Anonymous):
+        return None
+    declared = res.wasm.get(str(node.name).lower())
+    return (node, declared) if declared is not None and declared.is_rows else None
+
+
+def _rows_projection(
+    res: Resolved, node: exp.Expr
+) -> tuple[exp.Anonymous, WasmFunction] | None:
+    """``<module call>.<annotation column>``, as the call and what declares it.
+
+    None for every other expression. Resolve has already refused a field
+    read that is not the annotation column, so a projection reaching here
+    names one.
+    """
+    if not isinstance(node, exp.Dot):
+        return None
+    field = node.args.get("expression")
+    base = _unwrap(node.this) if isinstance(node.this, exp.Expr) else None
+    if not isinstance(field, exp.Identifier) or not isinstance(base, exp.Anonymous):
+        return None
+    declared = res.wasm.get(str(base.name).lower())
+    if declared is None or declared.emits is None:
+        return None
+    return (base, declared) if _fold(field) == declared.emits.name else None
+
+
+def _rows_file(res: Resolved, raw: RawSink) -> str:
+    """The rows file this COPY writes, or "" for a COPY that writes media.
+
+    A destination spelled as a rows file writes ONE thing: the annotation
+    column a module's call projects. Anything else in the SELECT list is a
+    rejection -- a rows file has no track to put a stream in.
+    """
+    path = raw.path
+    if path is None or not path.lower().endswith(_ROWS_SUFFIX):
+        return ""
+    written = [
+        column
+        for branch in (raw.branches or [raw.query])
+        if isinstance(branch, exp.Select)
+        for column in branch.expressions
+        if isinstance(column, exp.Expr)
+    ]
+    sole = _unwrap(written[0]) if len(written) == 1 else None
+    if sole is not None and (
+        _rows_projection(res, sole) is not None or _rows_call(res, sole) is not None
+    ):
+        return path
+    raise _error(
+        ErrorCode.UNSUPPORTED_SQL,
+        f"'{path}' is a rows file, and this query writes "
+        f"{len(written)} columns to it",
+        raw.path_node,
+        hint="a rows file holds one module's annotation column and nothing "
+        "else; write the streams to a media file of their own",
+    )
+
+
+_ROWS_SUFFIX = ".ndjson"

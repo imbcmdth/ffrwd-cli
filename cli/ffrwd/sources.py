@@ -9,12 +9,17 @@ probed.
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
+from sqlglot import exp
+
 from ffrwd.bindings import _SourceBinding
-from ffrwd.errors import FfrwdError
+from ffrwd.errors import ErrorCode, FfrwdError
+from ffrwd.expressions import _error
+from ffrwd.functions import WasmFunction
 from ffrwd.merge import RowValue
+from ffrwd.types import RowColumnType
 from ffrwd.values import _ARRAY_COLUMNS
 
 # What a URL source's row names its input with, the attributes a row MAY
@@ -126,3 +131,146 @@ def _url_source_row(
 
 def _source_columns_hint(binding: _SourceBinding) -> str:
     return f"'{binding.display}' exposes {binding.alias}.{binding.output}"
+
+
+def _url_source_payload(
+    alias: str,
+    declared: WasmFunction,
+    params: Mapping[str, object],
+    answered: object,
+    node: exp.Expr,
+    select: exp.Select,
+) -> _UrlPayload:
+    """The module's JSON answer as this alias's rows, checked.
+
+    One object: ``rows`` (required, at least one), ``document`` and
+    ``bounded`` beside it. Each row names a ``url`` and may name the
+    rendition attributes a probe cannot report -- everything else it
+    names is a value column of the alias, which is why the rows all have
+    to name the same ones.
+    """
+
+    def refuse(message: str, hint: str) -> FfrwdError:
+        return _error(
+            ErrorCode.UNSUPPORTED_SQL, message, node, fallback=select, hint=hint
+        )
+
+    if not isinstance(answered, dict):
+        raise refuse(
+            f"'{declared.name}()' returned {answered!r}, and a source "
+            "returns an object of rows",
+            _URL_SOURCE_SHAPE_HINT,
+        )
+    written = answered.get("rows")
+    if not isinstance(written, list):
+        raise refuse(
+            f"'{declared.name}()' returned no 'rows' list",
+            _URL_SOURCE_SHAPE_HINT,
+        )
+    if not written:
+        raise refuse(
+            f"'{alias}' produced no rows",
+            f"'{declared.name}()' answered nothing for "
+            f"{_written_params(params)}; a source that produces no rows "
+            "selects nothing",
+        )
+    document = answered.get("document")
+    if document is not None and not isinstance(document, str):
+        raise refuse(
+            f"'{declared.name}()' returned a 'document' that is "
+            f"{document!r}",
+            "a source's 'document' is the text it wrote beside its rows",
+        )
+    bounded = answered.get("bounded", True)
+    if not isinstance(bounded, bool):
+        raise refuse(
+            f"'{declared.name}()' returned a 'bounded' that is {bounded!r}",
+            "a source's 'bounded' says whether its rows end; it is true "
+            "or false, and defaults to true",
+        )
+    rows = [
+        _url_source_row(alias, position, entry, refuse)
+        for position, entry in enumerate(written, start=1)
+    ]
+    return _UrlPayload(
+        document=document,
+        bounded=bounded,
+        rows=rows,
+        types=_url_source_types(alias, rows, refuse),
+    )
+
+
+@dataclass(frozen=True)
+class _UrlPayload:
+    """A URL source's whole answer, checked: its rows and what came beside."""
+
+    document: str | None
+    bounded: bool
+    rows: list[_UrlRow]
+    types: dict[str, RowColumnType]
+
+
+def _written_params(params: Mapping[str, object]) -> str:
+    """A call's folded arguments, as a message names them."""
+    written = ", ".join(f"{name} = {value!r}" for name, value in sorted(params.items()))
+    return written or "no arguments"
+
+
+def _url_column_type(value: str | int | float | bool) -> RowColumnType:
+    """The row-column type one JSON scalar reads as."""
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int | float):
+        return "number"
+    return "text"
+
+
+def _url_source_types(
+    alias: str,
+    rows: Sequence[_UrlRow],
+    refuse: Callable[[str, str], FfrwdError],
+) -> dict[str, RowColumnType]:
+    """The value columns a URL source's rows expose, and the type of each.
+
+    A written row table's own two rules: every row names the same columns,
+    and every row of a column carries the same type, with null fitting any
+    of them and an all-null column reading as text the way Postgres types
+    one.
+    """
+    columns = tuple(rows[0].columns)
+    known = set(columns)
+    for position, row in enumerate(rows[1:], start=2):
+        missing = known - set(row.columns)
+        unexpected = set(row.columns) - known
+        if missing or unexpected:
+            odd = sorted(missing | unexpected)[0]
+            raise refuse(
+                f"row {position} of '{alias}' does not name the same columns "
+                f"row 1 does ({', '.join(columns) or 'none'}): '{odd}' "
+                f"{'is missing' if odd in missing else 'is unexpected'}",
+                "every row a source produces names the same columns",
+            )
+    types: dict[str, RowColumnType] = {}
+    for column in columns:
+        settled: RowColumnType | None = None
+        for row in rows:
+            value = row.columns[column]
+            if value is None:
+                continue
+            if isinstance(value, tuple):
+                raise refuse(
+                    f"column '{alias}.{column}' is a vector",
+                    "a source's columns are text, number or boolean; a vector "
+                    "rides in a row a module writes, not in a source's catalog",
+                )
+            written = _url_column_type(value)
+            if settled is not None and written != settled:
+                raise refuse(
+                    f"column '{alias}.{column}' holds both {settled} and "
+                    f"{written}",
+                    "every row of a column carries the same type; null fits "
+                    "any of them",
+                )
+            settled = written
+        types[column] = settled or "text"
+    return types

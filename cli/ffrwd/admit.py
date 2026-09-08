@@ -8,14 +8,18 @@ next, instead of a check in one method being invisible to a check in another.
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING
 
 from sqlglot import exp
 
-from ffrwd.bindings import _Env, _has_track_rows, _RowBinding
-from ffrwd.destinations import _PER_TRACK_OPTION_HINT
+from ffrwd.bindings import _CteBinding, _Env, _has_track_rows, _RowBinding
+from ffrwd.calls import _Call, _call_parts
+from ffrwd.ctes import _cte_column
+from ffrwd.destinations import _PER_TRACK_OPTION_HINT, _join_codecs
 from ffrwd.errors import ErrorCode, FfrwdError
 from ffrwd.expressions import _coalesce_label, _error, _unwrap
+from ffrwd.fills import _fill_hint
 from ffrwd.filter_options import (
     _ENABLE,
     REQUIRED_OPTIONS,
@@ -25,14 +29,27 @@ from ffrwd.filter_options import (
     _option_value,
 )
 from ffrwd.functions import WASM_STREAM_NAMES, Annotation, WasmFunction
-from ffrwd.ir import Output
+from ffrwd.ir import Output, StreamType
 from ffrwd.modules import (
     _annotation_fields,
     _annotation_matches,
     _vector_field,
     _written_json_fields,
 )
-from ffrwd.parser import RawSink, _pos, null_variable, star_node
+from ffrwd.parser import (
+    RawInputOption,
+    RawSink,
+    Resolved,
+    _pos,
+    _projection_expr,
+    annotation_projection,
+    group_keys,
+    null_variable,
+    star_node,
+    star_replace_entries,
+)
+from ffrwd.parser import _ident_name as _fold
+from ffrwd.probe import is_url
 from ffrwd.registry import FilterOption
 from ffrwd.sink import SINK_OPTIONS
 from ffrwd.types import (
@@ -45,15 +62,20 @@ from ffrwd.values import _PASSTHROUGH_ONLY, _Column, _signature, _stream_count, 
 from ffrwd.vars import unset_error
 from ffrwd.wasm import (
     ANNOTATION_TYPES,
+    WIRE_AUDIO_CODECS,
+    WORLDS,
     Described,
     DescribedFunction,
+    hosts_packet_sink,
+    hosts_packet_source,
+    hosts_rows_module,
+    input_rows_arms,
     rows_arms,
     rows_vector_dims,
 )
 
 if TYPE_CHECKING:
     from ffrwd.destinations import _VariantRow
-    from ffrwd.lower import _Call
 
 
 def _check_per_track_options(
@@ -668,3 +690,631 @@ def _check_required_options(
             hint=f"ffmpeg would refuse the filter at run time; write "
             f"{group[0]} => <value>",
         )
+
+
+def _described_source(
+    describes: Mapping[str, Described], declared: WasmFunction, node: exp.Expr, select: exp.Select
+) -> Described:
+    """What a ``RETURNS source`` call's module declares, checked.
+
+    The source mirror of :meth:`_described`, checked against its OWN
+    rules rather than reused whole: a source reads no streams and emits
+    no per-frame annotations, so the filter-shaped checks
+    :meth:`_described` runs after the world/export match --
+    :func:`ffrwd.admit._check_stream_arity` chief among them, which would read
+    ``described.inputs`` as if it were a filter's pad count -- have
+    nothing to check here and would misjudge a module that correctly
+    reads none at all.
+
+    Two module shapes answer a ``RETURNS source`` call. A PACKET source
+    names the export as its own single export and reports ``source``; a
+    URL source is a values module that offers the export in its
+    ``functions`` list and names files instead of producing packets.
+    Anything else is refused.
+    """
+    described = describes.get(declared.module)
+    if described is None:
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"the module '{declared.module}' was never described",
+            node,
+            fallback=select,
+            hint="this is a compiler bug; please report the query that "
+            "produced it",
+        )
+    if described.world not in WORLDS:
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"the module '{declared.module}' targets {described.world}, and "
+            f"this ffrwd hosts {' or '.join(WORLDS)}",
+            node,
+            fallback=select,
+            hint="rebuild the module against a world this ffrwd hosts, or "
+            "upgrade ffrwd",
+        )
+    # A values module names no single export, so there is nothing to
+    # match; the export it has to offer is checked against `functions`
+    # below instead.
+    if described.name and described.name != declared.export:
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"function '{declared.name}' names the export '{declared.export}', "
+            f"and '{declared.module}' exports '{described.name}'",
+            node,
+            fallback=select,
+            hint=f"a module carries one filter; write '{described.name}' as "
+            "the export",
+        )
+    if described.source:
+        if not hosts_packet_source(described.world):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"the module '{declared.module}' produces packets, and the "
+                f"sidecar's {described.world} cannot host one",
+                node,
+                fallback=select,
+                hint=f"a packet source is told which tracks to pull from "
+                f"{WORLDS[-1]} on; upgrade ffrwd, or point at a newer "
+                "ffrwd-wasm",
+            )
+        return described
+    if any(fn.name == declared.export for fn in described.functions):
+        return described
+    raise _error(
+        ErrorCode.UNSUPPORTED_SQL,
+        f"function '{declared.name}' declares RETURNS source, and the "
+        f"module '{declared.module}' is not a packet source",
+        node,
+        fallback=select,
+        hint=f"'{declared.module}' has to export a packet source built "
+        f"RETURNS source, or offer '{declared.export}' among its own "
+        "functions; check the module and the export named",
+    )
+
+
+def _described_rows(
+    describes: Mapping[str, Described], declared: WasmFunction, node: exp.Expr, select: exp.Select
+) -> Described:
+    """What a ROWS function's module turned out to declare, checked.
+
+    The rows mirror of :meth:`_described`: the world has to host a rows
+    module, the module has to BE one, and both ends of the declaration --
+    the column it reads and the record it returns -- are matched against
+    the two schemas the module publishes.
+    """
+    described = describes.get(declared.module)
+    if described is None:
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"the module '{declared.module}' was never described",
+            node,
+            fallback=select,
+            hint="this is a compiler bug; please report the query that "
+            "produced it",
+        )
+    if described.world not in WORLDS:
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"the module '{declared.module}' targets {described.world}, and "
+            f"this ffrwd hosts {' or '.join(WORLDS)}",
+            node,
+            fallback=select,
+            hint="rebuild the module against a world this ffrwd hosts, or "
+            "upgrade ffrwd",
+        )
+    if not described.rows_module:
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"function '{declared.name}' returns {declared.returns}, and the "
+            f"module '{declared.module}' reads no rows",
+            node,
+            fallback=select,
+            hint="a rows function needs a module that reads rows and writes "
+            "rows; declare a stream and a return to filter a stream instead",
+        )
+    if not hosts_rows_module(described.world):
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"the module '{declared.module}' is a rows module, and the "
+            f"sidecar's {described.world} cannot host one",
+            node,
+            fallback=select,
+            hint="rebuild the module against a world whose sidecar runs "
+            "rows modules, or upgrade ffrwd",
+        )
+    if described.name != declared.export:
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"function '{declared.name}' names the export '{declared.export}', "
+            f"and '{declared.module}' exports '{described.name}'",
+            node,
+            fallback=select,
+            hint=f"a module carries one rows export; write '{described.name}' "
+            "as the export",
+        )
+    _check_rows_schema(
+        declared,
+        declared.rows_param,
+        input_rows_arms(described),
+        reads=True,
+        node=node,
+        select=select,
+    )
+    assert declared.returns_rows is not None  # what is_rows selected on
+    _check_rows_schema(
+        declared,
+        declared.returns_rows,
+        rows_arms(described),
+        reads=False,
+        node=node,
+        select=select,
+    )
+    return described
+
+
+def _described(
+    describes: Mapping[str, Described], declared: WasmFunction, node: exp.Expr, select: exp.Select
+) -> Described:
+    """What the module a declaration names turned out to declare, checked.
+
+    The describe itself happened before lowering, once per module path
+    (:mod:`ffrwd.wasm`); what happens here is comparing it against the
+    declaration that named it. Both rejections anchor on the CALL, since
+    the declaration's own position is not in the query being lowered by
+    the time a rejection is worth reporting.
+    """
+    described = describes.get(declared.module)
+    if described is None:
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"the module '{declared.module}' was never described",
+            node,
+            fallback=select,
+            hint="this is a compiler bug; please report the query that "
+            "produced it",
+        )
+    if described.world not in WORLDS:
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"the module '{declared.module}' targets {described.world}, and "
+            f"this ffrwd hosts {' or '.join(WORLDS)}",
+            node,
+            fallback=select,
+            hint="rebuild the module against a world this ffrwd hosts, or "
+            "upgrade ffrwd",
+        )
+    if described.name != declared.export:
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"function '{declared.name}' names the export '{declared.export}', "
+            f"and '{declared.module}' exports '{described.name}'",
+            node,
+            fallback=select,
+            hint=f"a module carries one filter; write '{described.name}' as "
+            "the export",
+        )
+    if described.packet_sink:
+        _check_packet_sink(declared, described, node, select)
+    if described.both_kinds:
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"the module '{declared.module}' accepts both pixel formats and "
+            "sample formats",
+            node,
+            fallback=select,
+            hint="a module filters video or audio; rebuild it declaring one "
+            "of the two",
+        )
+    # A module naming NEITHER list has nothing to compare against, and is
+    # refused where its wire format is negotiated instead.
+    if described.kind is not None and described.kind != declared.stream_kind:
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"function '{declared.name}' takes {declared.returns}, and the "
+            f"module '{declared.module}' filters {described.kind}",
+            node,
+            fallback=select,
+            hint=f"declare the stream and the return as "
+            f"{WASM_STREAM_NAMES[described.kind]}, or name a module that "
+            f"filters {declared.stream_kind}",
+        )
+    # A packet sink has no frame interface to read a window over: how many
+    # streams of each kind it takes is what it declares, and that is
+    # checked against the signature in `_check_sink_shape`.
+    if not described.packet_sink:
+        _check_stream_arity(declared, described, node, select)
+    if declared.emits is not None:
+        _check_annotation_schema(declared, declared.emits, described, node, select)
+    # A windowed module is handed each frame's rows either way and reads
+    # them at its own option, so a declaration without an annotation
+    # column just wires none in. A per-frame consumer exists only to read
+    # them, so there the bare declaration is a mistake.
+    if (
+        described.reads_annotations
+        and declared.reads is None
+        and not described.windowed
+    ):
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"the module '{declared.module}' reads annotations off its "
+            f"frames, and '{declared.name}' takes none",
+            node,
+            fallback=select,
+            hint="declare an annotation column right after the stream: "
+            f"{declared.name}(<stream> {declared.returns}, <name> "
+            "STRUCT(<field> <type>, ...)[])",
+        )
+    if not described.reads_annotations and declared.reads is not None:
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"function '{declared.name}' takes the annotation column "
+            f"'{declared.reads.name}', and the module '{declared.module}' "
+            "does not read annotations",
+            node,
+            fallback=select,
+            hint="drop the annotation column, or use a module built to "
+            "consume them",
+        )
+    # Only a windowed module can be handed no rows: a per-frame consumer
+    # reads them on every frame, so its column cannot be optional.
+    if (
+        declared.reads is not None
+        and declared.reads_optional
+        and not described.windowed
+    ):
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"function '{declared.name}' defaults the annotation column "
+            f"'{declared.reads.name}', and the module '{declared.module}' "
+            "reads rows on every frame",
+            node,
+            fallback=select,
+            hint="drop the DEFAULT; a per-frame consumer always needs a "
+            "producer under it",
+        )
+    return described
+
+
+def _check_packet_sink(
+    declared: WasmFunction,
+    described: Described,
+    node: exp.Expr,
+    select: exp.Select,
+) -> None:
+    """A packet-sink module against the declaration that named it.
+
+    The module consumes the encoder's own output: it is a COPY
+    destination over one video stream, hosted only by a sidecar new
+    enough to hand packets through. Each mismatch is refused here, where
+    the run-time refusal it forestalls can be said at the call.
+    """
+    if not hosts_packet_sink(described.world):
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"the module '{declared.module}' consumes encoded packets, and "
+            f"the sidecar's {described.world} cannot hand them through",
+            node,
+            fallback=select,
+            hint="packet sinks arrived with ffrwd:av@0.10.0; upgrade "
+            "ffrwd, or point at a newer ffrwd-wasm",
+        )
+    if not declared.is_sink:
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"function '{declared.name}' returns {declared.returns}, and "
+            f"the module '{declared.module}' consumes encoded packets and "
+            "hands nothing back",
+            node,
+            fallback=select,
+            hint=f"declare '{declared.name}' as RETURNS sink and write it "
+            "as a COPY destination",
+        )
+    # An audio pad reaches a sink only where the module accepts a codec
+    # the stream edge can carry: the edge is what the sidecar's NUT reader
+    # hands through, and it hands through nothing else.
+    if "audio" in declared.stream_kinds:
+        accepted = described.sink_codecs("audio")
+        if accepted and not any(c in WIRE_AUDIO_CODECS for c in accepted):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"the module '{declared.module}' consumes "
+                f"{_join_codecs(accepted)} audio, and the stream edge into "
+                f"a packet sink carries {_join_codecs(WIRE_AUDIO_CODECS)}",
+                node,
+                fallback=select,
+                hint="the module has to accept one of the codecs the "
+                "sidecar's packets travel in",
+            )
+    # A row-reading sink declares no stream parameters at all -- its
+    # shape is judged against the SELECT list's actual rows instead,
+    # once they are known (:func:`ffrwd.admit._check_row_sink_arity`), not here
+    # against a signature that names none.
+    if not declared.reads_rows_from_select:
+        _check_sink_shape(declared, described, node, select)
+
+
+def _varies_per_row(binding: _CteBinding, name: str) -> bool:
+    """True when a CTE column carries a stream per body row, and there is
+    more than one of them -- the shape that differs tuple by tuple."""
+    if binding.rows <= 1:
+        return False
+    column = _cte_column(binding, name)
+    return column is not None and column.splat and column.value.is_array
+
+
+def _check_grouped_cte_expr(
+    node: exp.Expr, env: _Env, select: exp.Select, key_texts: set[str]
+) -> None:
+    """One expression of a grouped branch, recursively."""
+    if node.sql() in key_texts or isinstance(node, exp.ArrayAgg):
+        return
+    if isinstance(node, exp.Filter) and isinstance(node.this, exp.ArrayAgg):
+        # A FILTER over array_agg only ever names the same column the
+        # aggregate reads -- parser confirmed the predicate -- so its
+        # WHERE clause raises nothing new here.
+        return
+    if isinstance(node, exp.Column) and not isinstance(node.this, exp.Star):
+        table_node = node.args.get("table")
+        binding = (
+            env.bindings.get(_fold(table_node)) if table_node is not None else None
+        )
+        name = _fold(node.this)
+        if isinstance(binding, _CteBinding) and _varies_per_row(binding, name):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"'{binding.name}.{name}' is neither aggregated nor a GROUP "
+                "BY key",
+                node,
+                fallback=select,
+                hint=_GROUPED_CTE_HINT,
+            )
+        return
+    for value in node.args.values():
+        items = value if isinstance(value, list) else [value]
+        for item in items:
+            if isinstance(item, exp.Expr):
+                _check_grouped_cte_expr(item, env, select, key_texts)
+
+
+def _check_grouped_cte_columns(select: exp.Select, env: _Env) -> None:
+    """Postgres's grouping rule for the columns only lowering can judge.
+
+    Resolve enforces the rule wherever the SQL text settles it -- a track
+    row's columns vary within a group, an input alias's do not. A CTE
+    column is neither until its body has been lowered: it varies exactly
+    when the body produced more than one row and the column carries one
+    stream per row. So the same rejection is raised here, with the same
+    wording, for the shape resolve could not see.
+    """
+    if not env.grouped:
+        return
+    key_texts = {key.sql() for key in group_keys(select)}
+    for projection in select.expressions:
+        if not isinstance(projection, exp.Expr):
+            continue
+        star = star_node(projection)
+        if star is None:
+            _check_grouped_cte_expr(
+                _projection_expr(projection), env, select, key_texts
+            )
+        else:
+            for _, _, expr in star_replace_entries(star):
+                _check_grouped_cte_expr(expr, env, select, key_texts)
+
+
+def _check_fill_type(
+    output: StreamType,
+    display: str,
+    kind: StreamType,
+    label: str,
+    node: exp.Expr,
+    select: exp.Select,
+) -> None:
+    """A fill stands in for a track, so it has to BE one of the same type."""
+    if output == kind:
+        return
+    raise _error(
+        ErrorCode.UDF_ARG_TYPE,
+        f"{display}() generates a {output} stream, but "
+        f"'{label}' is {kind}",
+        node,
+        fallback=select,
+        hint=_fill_hint(kind, label),
+    )
+
+
+def _check_coalesce_fill(
+    kind: StreamType,
+    other: _Value,
+    label: str,
+    node: exp.Expr,
+    select: exp.Select,
+) -> None:
+    """What stands in for a gap is a stream of the SAME kind as the cell
+    it fills: another column's, or a generated one."""
+    if not other.streams:
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"a COALESCE fill is a stream or a generated stand-in, and "
+            f"'{_coalesce_label(node)}' produces neither",
+            node,
+            fallback=select,
+            hint=_fill_hint(kind, label),
+        )
+    if other.type != kind:
+        raise _error(
+            ErrorCode.UDF_ARG_TYPE,
+            f"COALESCE stands in for one track: '{label}' is {kind}, "
+            f"and '{_coalesce_label(node)}' is {other.type}",
+            node,
+            fallback=select,
+            hint=_fill_hint(kind, label),
+        )
+
+
+def _check_realtime_option(
+    res: Resolved,
+    alias: str,
+    options: dict[str, object],
+    raw_options: Sequence[RawInputOption],
+) -> None:
+    """Refuse `realtime => true` on a socket: it is already paced by reality.
+
+    `ffrwd.processes.is_live` also calls a `format =>`-forced input live
+    (a capture device cannot be opened twice, same as a socket), but that
+    rule conflates a device with a SYNTHETIC one -- `format => 'lavfi'`
+    generates frames as fast as it is asked to, and pacing it with
+    `realtime => true` is exactly the documented idiom (recipe 101, 102 in
+    `../docs/corpus.md`). Telling a capture device from a generator by
+    its `format` value needs a name list this table does not carry, so
+    that half stays unrefused -- only a URL (`is_url`: udp, srt, rtmp,
+    rtsp, http(s), ...) is unambiguous enough to reject here.
+    """
+    if options.get("realtime") is not True:
+        return
+    index = res.sources.get(alias)
+    path = res.input_paths[index] if index is not None else ""
+    if not is_url(path):
+        return
+    value_node = next((o.value for o in raw_options if o.name == "realtime"), None)
+    path_node = raw_options[0].path_node if raw_options else None
+    line, col = _pos(value_node, path_node)
+    raise FfrwdError(
+        ErrorCode.INPUT_OPTION_TYPE,
+        f"'{alias}' is already live -- realtime => true would pace it a second time",
+        line=line,
+        col=col,
+        hint="drop realtime; a socket is already paced by its own clock",
+    )
+
+
+def _annotating_call(res: Resolved, node: exp.Expr) -> WasmFunction | None:
+    """The annotation-returning wasm function `node` calls, if it calls one."""
+    call = _call_parts(_unwrap(node))
+    if call is None or call.namespaced or call.is_macro:
+        return None
+    found = res.wasm.get(call.name.lower())
+    return found if found is not None and found.emits is not None else None
+
+
+def _reads_annotations(res: Resolved, node: exp.Expr) -> WasmFunction | None:
+    """The annotation-taking wasm function `node` is written as an argument of.
+
+    Through a field read as well as directly: a call writing both halves
+    of a struct names each of them, and each name is one of its arguments.
+    """
+    inner, parent = node, node.parent
+    while isinstance(parent, exp.Paren) or (
+        isinstance(parent, exp.Dot) and parent.this is inner
+    ):
+        inner, parent = parent, parent.parent
+    if not isinstance(parent, exp.Expr):
+        return None
+    call = _call_parts(parent)
+    if call is None or call.namespaced or call.is_macro:
+        return None
+    found = res.wasm.get(call.name.lower())
+    return found if found is not None and found.reads is not None else None
+
+
+def _check_annotation_argument(
+    res: Resolved, declared: WasmFunction, call: _Call, node: exp.Expr, select: exp.Select
+) -> None:
+    """That the annotation columns at a call site line up, both ways.
+
+    A function taking annotations is written over the call that produces
+    them, or writes the column itself; either way their records have to be
+    the same shape. A function RETURNING them has to be written under one
+    that takes them: the struct it produces is not a stream, and nothing
+    else in the dialect reads one.
+    """
+    # Any stream argument may be the producer: a module reading several
+    # streams is handed annotations by whichever of them returns some. A
+    # call writing the column names its producer there instead.
+    anchor, producer = next(
+        (
+            (argument, found)
+            for argument in call.args[: max(declared.stream_arity, 1)]
+            if (found := _annotating_call(res, argument)) is not None
+        ),
+        (call.args[0] if call.args else node, None),
+    )
+    at = declared.stream_arity
+    gathered = (
+        annotation_projection(_unwrap(call.args[at]), res.wasm)
+        if declared.reads is not None and len(call.args) > at
+        else None
+    )
+    if gathered is not None:
+        anchor, producer = call.args[at], gathered[1]
+    if (
+        declared.emits is not None
+        and _reads_annotations(res, node) is None
+        and not _projects_annotations(node, declared.emits.name)
+    ):
+        raise _error(
+            ErrorCode.UDF_ARG_TYPE,
+            f"{declared.name}() returns the annotation column "
+            f"'{declared.emits.name}', and nothing here reads it",
+            node,
+            fallback=select,
+            hint=f"read the column off the call, {declared.name}"
+            f"(...).{declared.emits.name}, or pass {declared.name}(...) to a "
+            "function that takes an annotation column; a struct is not a "
+            "stream and cannot be selected, trimmed or written",
+        )
+    if declared.reads is None:
+        if producer is None or producer.emits is None:
+            return
+        raise _error(
+            ErrorCode.UDF_ARG_TYPE,
+            f"{declared.name}() takes {declared.returns}, and {producer.name}() "
+            f"returns it with the annotation column '{producer.emits.name}'",
+            anchor,
+            fallback=node,
+            hint=f"declare {declared.name}() with an annotation column after "
+            f"its stream, or call it over a plain {declared.returns}",
+        )
+    if producer is None:
+        if declared.reads_optional:
+            return
+        raise _error(
+            ErrorCode.UDF_ARG_TYPE,
+            f"{declared.name}() takes the annotation column "
+            f"'{declared.reads.name}', and its argument produces none",
+            anchor,
+            fallback=node,
+            hint=f"call {declared.name}() over a function that returns "
+            "annotations, or declare the column DEFAULT NULL to make it "
+            "optional",
+        )
+    assert producer.emits is not None  # what _annotating_call selected on
+    if _annotation_fields(declared.reads) == _annotation_fields(producer.emits):
+        return
+    raise _error(
+        ErrorCode.UDF_ARG_TYPE,
+        f"{declared.name}() takes '{declared.reads.name}' as "
+        f"{declared.reads.written}, and {producer.name}() returns "
+        f"'{producer.emits.name}' as {producer.emits.written}",
+        anchor,
+        fallback=node,
+        hint="the two annotation records have to name the same fields, "
+        "with the same types",
+    )
+
+
+_GROUPED_CTE_HINT = (
+    "a CTE with several rows varies inside the group: wrap the column in "
+    "array_agg(...), or add it to the GROUP BY to make it the group's key"
+)
+
+
+def _projects_annotations(node: exp.Expr, column: str) -> bool:
+    """True when `column` is read off `node`, through any wrapping parens."""
+    inner, parent = node, node.parent
+    while isinstance(parent, exp.Paren):
+        inner, parent = parent, parent.parent
+    if not isinstance(parent, exp.Dot) or parent.this is not inner:
+        return False
+    field = parent.args.get("expression")
+    return isinstance(field, exp.Identifier) and _fold(field) == column

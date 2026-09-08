@@ -82,9 +82,9 @@ def _folded_result(
     """The module's JSON answer as this call's compile-time value.
 
     Checked against the DECLARED return type, not the schema -- the
-    schema was already checked once, at :meth:`_described_value`, but the
-    module could still hand back a value of the wrong JSON type at this
-    particular call.
+    schema was already checked once, at :func:`ffrwd.evaluate._described_value`,
+    but the module could still hand back a value of the wrong JSON type at
+    this particular call.
     """
     if declared.returns == "boolean":
         if isinstance(result, bool):
@@ -105,3 +105,50 @@ def _folded_result(
         fallback=select,
         hint=f"the module's result must be {declared.returns}",
     )
+
+
+# The python types each JSON Schema type a module parameter may declare
+# accepts. A schema naming anything else is left alone: what the module
+# takes is the module's business, and only the shapes named here are ones a
+# written argument can be judged against. `array` is a vector's own wire
+# type -- the tuple `RowValue` already folds it to.
+_JSON_TYPES: dict[str, tuple[type, ...]] = {
+    "string": (str,),
+    "number": (int, float),
+    "integer": (int, float),
+    "boolean": (bool,),
+    "array": (tuple,),
+}
+
+# A miss in `ffrwd.lower._Lowerer._invoke_cache`: distinct from every JSON value a module
+# could hand back, `None` (JSON null) included.
+_UNCACHED = object()
+
+
+def _declares_params(known: dict[str, object]) -> str:
+    """What a module's parameters are, for a message; said when it has none."""
+    if not known:
+        return "the module declares no parameters"
+    return "the module declares " + ", ".join(sorted(known))
+
+
+def _check_wasm_param(
+    name: str,
+    value: RowValue,
+    schema: object,
+    anchor: exp.Expr,
+    select: exp.Select,
+) -> None:
+    """One written parameter against the JSON Schema type the module gave it."""
+    wanted = schema.get("type") if isinstance(schema, dict) else None
+    if not isinstance(wanted, str) or wanted not in _JSON_TYPES:
+        return  # a schema shape this compiler does not judge
+    allowed = _JSON_TYPES[wanted]
+    # bool is an int in Python, and a module asking for a number does not
+    # mean true.
+    if isinstance(value, bool) != (wanted == "boolean"):
+        raise _bad_wasm_param(name, value, wanted, anchor, select)
+    if not isinstance(value, allowed):
+        raise _bad_wasm_param(name, value, wanted, anchor, select)
+    if wanted == "integer" and isinstance(value, float) and value != int(value):
+        raise _bad_wasm_param(name, value, wanted, anchor, select)

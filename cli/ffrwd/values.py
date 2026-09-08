@@ -11,8 +11,9 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 
 from ffrwd.ir import FrameRef, StreamType
-from ffrwd.probe import RenditionMeta, StreamMeta
+from ffrwd.probe import _UNDEFINED_LANGUAGE, RenditionMeta, StreamMeta
 from ffrwd.table import CellValue, StreamCell
+from ffrwd.types import STREAM_TAG_COLUMNS
 
 # The array-typed pseudo-columns an input exposes, and their element type.
 # subtitle/data have the identical array/subscript/splat surface but are
@@ -158,3 +159,67 @@ def _stream_to_cell(stream: _Stream) -> CellValue:
     if stream.ref == _NULL_STREAM_REF:
         return None
     return StreamCell(type=stream.type, spec=stream.ref)
+
+
+def _provenance(stream: _Stream) -> dict[str, str]:
+    """Language/title tags of the source stream an output is derived 1:1 from.
+
+    `_Stream.source` is what threads them: it survives a passthrough, the WHERE
+    trim, and any chain of single-stream-input calls unconditionally; a call
+    over two or more streams (``amix``, ``overlay``) and a concat pad thread it
+    only when every stream feeding them agrees (:func:`_agreed_source`).
+    ``language=und`` is what an mp4 muxer stamps on an untagged stream, so it
+    carries no information and is not copied.
+
+    Only STREAM_TAG_COLUMNS ride, not every key the source carries: a file's
+    ``encoder`` or ``handler_name`` tag riding through a filter would emit
+    ``-metadata`` ffmpeg does not emit today.
+
+    A stream with no ``language`` tag of its own, but that still carries
+    :attr:`_Stream.rendition` (an unmodified read of a rendition row's cell),
+    falls back to that rendition's own LANGUAGE/``@lang`` -- the same value
+    a manifest destination's variant map names the row by
+    (:meth:`_Lowerer._variant_names`), now on the output stream itself: it is
+    how a DASH destination, whose map has no ``language:`` entry of its own,
+    still carries it.
+    """
+    source = stream.source
+    metadata: dict[str, str] = {}
+    if source is not None:
+        for key in STREAM_TAG_COLUMNS:
+            value = source.metadata.get(key)
+            if value is None:
+                continue
+            if key == "language" and value == _UNDEFINED_LANGUAGE:
+                continue
+            metadata[key] = value
+    if "language" not in metadata and stream.rendition is not None:
+        language = stream.rendition.language
+        if language is not None and language != _UNDEFINED_LANGUAGE:
+            metadata["language"] = language
+    return metadata
+
+
+def _agreed_source(segments: list[_Stream]) -> StreamMeta | None:
+    """The provenance an N:1 join inherits from the streams feeding it.
+
+    Used by both kinds of join that take more than one input stream: a concat
+    pad (`segments` is one stream per UNION ALL branch, in branch order) and a
+    multi-stream call like ``amix``/``overlay`` (`segments` is its stream
+    arguments, in argument order, one element already picked out of each). The
+    result is only still "that stream" when every segment says the SAME thing
+    about it: the comparison is on the FILTERED provenance dicts, not on the
+    raw ``StreamMeta``, so two segments that differ in sample rate or index but
+    agree on ``language=fra`` do agree, and two "und"-tagged segments both
+    filter down to ``{}`` — nothing to say, so nothing survives. Any
+    disagreement, or an empty dict, gives None.
+
+    The first segment's ``StreamMeta`` is what gets threaded: it and the others
+    render identically, and it keeps ``_Stream.source`` a real probed stream.
+    """
+    agreed = _provenance(segments[0])
+    if not agreed:
+        return None
+    if any(_provenance(segment) != agreed for segment in segments[1:]):
+        return None
+    return segments[0].source
