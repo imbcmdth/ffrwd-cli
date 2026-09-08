@@ -1,0 +1,2697 @@
+{
+  "about": "The maintainer's input/output shape matrix, extracted from the workbook that holds it: 21 input shapes down the side, 21 output shapes across the top, and in each cell the query that turns one into the other. The workbook is the source of truth and a human edits it there; this file is a copy, and each cell's SQL is that cell's text unchanged. A cell is \"query\" or \"n/a\" -- the 20 n/a cells write a file with no tracks, which writes nothing.",
+  "inputs": [
+    "1 file 0 video track 0 audio track",
+    "1 file 1 video track 0 audio track",
+    "1 file 0 video track 1 audio track",
+    "1 file M video track 0 audio track",
+    "1 file 0 video track M audio track",
+    "1 file 1 video track 1 audio track",
+    "1 file 1 video track M audio track",
+    "1 file M video track 1 audio track",
+    "1 file M video track N audio track",
+    "1 manifest 1 video",
+    "1 manifest 1 audio",
+    "1 manifest - muxed 1 video + audio",
+    "1 manifest - muxed M video + audio",
+    "1 manifest - demuxed 1 video 1 audio",
+    "1 manifest - demuxed M video 1 audio",
+    "1 manifest - demuxed 1 video M audio",
+    "1 manifest - demuxed M video N audio",
+    "1 manifest - hybrid 1 video + audio 1 audio",
+    "1 manifest - hybrid M video + audio 1 audio",
+    "1 manifest - hybrid 1 video + audio M audio",
+    "1 manifest - hybrid M video + audio N audio"
+  ],
+  "outputs": [
+    "1 file 0 video track 0 audio track",
+    "1 file 1 video track 0 audio track",
+    "1 file 0 video track 1 audio track",
+    "1 file M video track 0 audio track",
+    "1 file 0 video track M audio track",
+    "1 file 1 video track 1 audio track",
+    "1 file 1 video track M audio track",
+    "1 file M video track 1 audio track",
+    "1 file M video track N audio track",
+    "1 manifest 1 video",
+    "1 manifest 1 audio",
+    "1 manifest - muxed 1 video + audio",
+    "1 manifest - muxed M video + audio",
+    "1 manifest - demuxed 1 video 1 audio",
+    "1 manifest - demuxed M video 1 audio",
+    "1 manifest - demuxed 1 video M audio",
+    "1 manifest - demuxed M video N audio",
+    "1 manifest - hybrid 1 video + audio 1 audio",
+    "1 manifest - hybrid M video + audio 1 audio",
+    "1 manifest - hybrid 1 video + audio M audio",
+    "1 manifest - hybrid M video + audio N audio"
+  ],
+  "cells": [
+    {
+      "input": "1 file 0 video track 0 audio track",
+      "output": "1 file 0 video track 0 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT * FROM input(:'src') f) TO :'dest'"
+    },
+    {
+      "input": "1 file 0 video track 0 audio track",
+      "output": "1 file 1 video track 0 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT blk.video[1]\n  FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk) TO :'dest'\n-- black video synthesized"
+    },
+    {
+      "input": "1 file 0 video track 0 audio track",
+      "output": "1 file 0 video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT sil.audio[1]\n  FROM ffmpeg.anullsrc(duration => :duration) sil) TO :'dest'\n-- silence synthesized"
+    },
+    {
+      "input": "1 file 0 video track 0 audio track",
+      "output": "1 file M video track 0 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT array_agg(scale(blk.video[1], ARRAY[1280, 640][i.i], -2))\n  FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk, generate_series(1, 2) i) TO :'dest'\n-- black video synthesized"
+    },
+    {
+      "input": "1 file 0 video track 0 audio track",
+      "output": "1 file 0 video track M audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT array_agg(sil.audio[1])\n  FROM ffmpeg.anullsrc(duration => :duration) sil, generate_series(1, 2) i) TO :'dest'\n-- silence synthesized"
+    },
+    {
+      "input": "1 file 0 video track 0 audio track",
+      "output": "1 file 1 video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT blk.video[1], sil.audio[1]\n  FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk, ffmpeg.anullsrc(duration => :duration) sil) TO :'dest'\n-- black video synthesized; silence synthesized"
+    },
+    {
+      "input": "1 file 0 video track 0 audio track",
+      "output": "1 file 1 video track M audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT blk.video[1], array_agg(sil.audio[1])\n  FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk, ffmpeg.anullsrc(duration => :duration) sil, generate_series(1, 2) i) TO :'dest'\n-- black video synthesized; silence synthesized"
+    },
+    {
+      "input": "1 file 0 video track 0 audio track",
+      "output": "1 file M video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT array_agg(scale(blk.video[1], ARRAY[1280, 640][i.i], -2)), sil.audio[1]\n  FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk, ffmpeg.anullsrc(duration => :duration) sil, generate_series(1, 2) i) TO :'dest'\n-- black video synthesized; silence synthesized"
+    },
+    {
+      "input": "1 file 0 video track 0 audio track",
+      "output": "1 file M video track N audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT array_agg(scale(blk.video[1], ARRAY[1280, 640][i.i], -2)), array_agg(sil.audio[1])\n  FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk, ffmpeg.anullsrc(duration => :duration) sil, generate_series(1, 2) i) TO :'dest'\n-- black video synthesized; silence synthesized"
+    },
+    {
+      "input": "1 file 0 video track 0 audio track",
+      "output": "1 manifest 1 video",
+      "kind": "query",
+      "sql": "COPY (SELECT blk.video[1] FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n-- black video synthesized"
+    },
+    {
+      "input": "1 file 0 video track 0 audio track",
+      "output": "1 manifest 1 audio",
+      "kind": "query",
+      "sql": "COPY (SELECT sil.audio[1] FROM ffmpeg.anullsrc(duration => :duration) sil) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n-- silence synthesized"
+    },
+    {
+      "input": "1 file 0 video track 0 audio track",
+      "output": "1 manifest - muxed 1 video + audio",
+      "kind": "query",
+      "sql": "COPY (SELECT blk.video[1], sil.audio[1] FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk, ffmpeg.anullsrc(duration => :duration) sil) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n-- black video synthesized; silence synthesized"
+    },
+    {
+      "input": "1 file 0 video track 0 audio track",
+      "output": "1 manifest - muxed M video + audio",
+      "kind": "query",
+      "sql": "COPY (SELECT scale(blk.video[1], ARRAY[1280, 640][i.i], -2), sil.audio[1]\n  FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk, ffmpeg.anullsrc(duration => :duration) sil, generate_series(1, 2) i) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n-- black video synthesized; silence synthesized"
+    },
+    {
+      "input": "1 file 0 video track 0 audio track",
+      "output": "1 manifest - demuxed 1 video 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT blk.video[1] AS v, 1 AS rung FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk),\n          aud AS (SELECT sil2.audio[1] AS t, 1000 AS rung FROM ffmpeg.anullsrc(duration => :duration) sil2)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n-- black video synthesized; silence synthesized"
+    },
+    {
+      "input": "1 file 0 video track 0 audio track",
+      "output": "1 manifest - demuxed M video 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT scale(blk.video[1], ARRAY[1280, 640][i.i], -2) AS v, i.i AS rung FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk, generate_series(1, 2) i),\n          aud AS (SELECT sil2.audio[1] AS t, 1000 AS rung FROM ffmpeg.anullsrc(duration => :duration) sil2)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n-- black video synthesized; silence synthesized"
+    },
+    {
+      "input": "1 file 0 video track 0 audio track",
+      "output": "1 manifest - demuxed 1 video M audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT blk.video[1] AS v, 1 AS rung FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk),\n          aud AS (SELECT sil2.audio[1] AS t, 1000 + j.j AS rung FROM ffmpeg.anullsrc(duration => :duration) sil2, generate_series(1, 2) j)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n-- black video synthesized; silence synthesized"
+    },
+    {
+      "input": "1 file 0 video track 0 audio track",
+      "output": "1 manifest - demuxed M video N audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT scale(blk.video[1], ARRAY[1280, 640][i.i], -2) AS v, i.i AS rung FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk, generate_series(1, 2) i),\n          aud AS (SELECT sil2.audio[1] AS t, 1000 + j.j AS rung FROM ffmpeg.anullsrc(duration => :duration) sil2, generate_series(1, 2) j)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n-- black video synthesized; silence synthesized"
+    },
+    {
+      "input": "1 file 0 video track 0 audio track",
+      "output": "1 manifest - hybrid 1 video + audio 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT blk.video[1] AS v, sil.audio[1] AS a, 1 AS rung FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk, ffmpeg.anullsrc(duration => :duration) sil),\n          aud AS (SELECT sil2.audio[1] AS t, 1000 AS rung FROM ffmpeg.anullsrc(duration => :duration) sil2)\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n\n-- black video synthesized; silence synthesized"
+    },
+    {
+      "input": "1 file 0 video track 0 audio track",
+      "output": "1 manifest - hybrid M video + audio 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT scale(blk.video[1], ARRAY[1280, 640][i.i], -2) AS v, sil.audio[1] AS a, i.i AS rung FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk, generate_series(1, 2) i, ffmpeg.anullsrc(duration => :duration) sil),\n          aud AS (SELECT sil2.audio[1] AS t, 1000 AS rung FROM ffmpeg.anullsrc(duration => :duration) sil2)\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n\n-- black video synthesized; silence synthesized"
+    },
+    {
+      "input": "1 file 0 video track 0 audio track",
+      "output": "1 manifest - hybrid 1 video + audio M audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT blk.video[1] AS v, sil.audio[1] AS a, 1 AS rung FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk, ffmpeg.anullsrc(duration => :duration) sil),\n          aud AS (SELECT sil2.audio[1] AS t, 1000 + j.j AS rung FROM ffmpeg.anullsrc(duration => :duration) sil2, generate_series(1, 2) j)\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n\n-- black video synthesized; silence synthesized"
+    },
+    {
+      "input": "1 file 0 video track 0 audio track",
+      "output": "1 manifest - hybrid M video + audio N audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT scale(blk.video[1], ARRAY[1280, 640][i.i], -2) AS v, sil.audio[1] AS a, i.i AS rung FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk, generate_series(1, 2) i, ffmpeg.anullsrc(duration => :duration) sil),\n          aud AS (SELECT sil2.audio[1] AS t, 1000 + j.j AS rung FROM ffmpeg.anullsrc(duration => :duration) sil2, generate_series(1, 2) j)\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n\n-- black video synthesized; silence synthesized"
+    },
+    {
+      "input": "1 file 1 video track 0 audio track",
+      "output": "1 file 0 video track 0 audio track",
+      "kind": "n/a",
+      "sql": "n/a: a file with no tracks writes nothing"
+    },
+    {
+      "input": "1 file 1 video track 0 audio track",
+      "output": "1 file 1 video track 0 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT * FROM input(:'src') f) TO :'dest'"
+    },
+    {
+      "input": "1 file 1 video track 0 audio track",
+      "output": "1 file 0 video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT sil.audio[1]\n  FROM ffmpeg.anullsrc(duration => :duration) sil) TO :'dest'\n-- silence synthesized"
+    },
+    {
+      "input": "1 file 1 video track 0 audio track",
+      "output": "1 file M video track 0 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT array_agg(scale(f.video[1], ARRAY[1280, 640][i.i], -2))\n  FROM input(:'src') f, generate_series(1, 2) i) TO :'dest'"
+    },
+    {
+      "input": "1 file 1 video track 0 audio track",
+      "output": "1 file 0 video track M audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT array_agg(sil.audio[1])\n  FROM ffmpeg.anullsrc(duration => :duration) sil, generate_series(1, 2) i) TO :'dest'\n-- silence synthesized"
+    },
+    {
+      "input": "1 file 1 video track 0 audio track",
+      "output": "1 file 1 video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT f.video[1], sil.audio[1]\n  FROM input(:'src') f, ffmpeg.anullsrc(duration => :duration) sil) TO :'dest'\n-- silence synthesized"
+    },
+    {
+      "input": "1 file 1 video track 0 audio track",
+      "output": "1 file 1 video track M audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT f.video[1], array_agg(sil.audio[1])\n  FROM input(:'src') f, ffmpeg.anullsrc(duration => :duration) sil, generate_series(1, 2) i) TO :'dest'\n-- silence synthesized"
+    },
+    {
+      "input": "1 file 1 video track 0 audio track",
+      "output": "1 file M video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT array_agg(scale(f.video[1], ARRAY[1280, 640][i.i], -2)), sil.audio[1]\n  FROM input(:'src') f, ffmpeg.anullsrc(duration => :duration) sil, generate_series(1, 2) i) TO :'dest'\n-- silence synthesized"
+    },
+    {
+      "input": "1 file 1 video track 0 audio track",
+      "output": "1 file M video track N audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT array_agg(scale(f.video[1], ARRAY[1280, 640][i.i], -2)), array_agg(sil.audio[1])\n  FROM input(:'src') f, ffmpeg.anullsrc(duration => :duration) sil, generate_series(1, 2) i) TO :'dest'\n-- silence synthesized"
+    },
+    {
+      "input": "1 file 1 video track 0 audio track",
+      "output": "1 manifest 1 video",
+      "kind": "query",
+      "sql": "COPY (SELECT f.video[1] FROM input(:'src') f) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 file 1 video track 0 audio track",
+      "output": "1 manifest 1 audio",
+      "kind": "query",
+      "sql": "COPY (SELECT sil.audio[1] FROM ffmpeg.anullsrc(duration => :duration) sil) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n-- silence synthesized"
+    },
+    {
+      "input": "1 file 1 video track 0 audio track",
+      "output": "1 manifest - muxed 1 video + audio",
+      "kind": "query",
+      "sql": "COPY (SELECT f.video[1], sil.audio[1] FROM input(:'src') f, ffmpeg.anullsrc(duration => :duration) sil) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n-- silence synthesized"
+    },
+    {
+      "input": "1 file 1 video track 0 audio track",
+      "output": "1 manifest - muxed M video + audio",
+      "kind": "query",
+      "sql": "COPY (SELECT scale(f.video[1], ARRAY[1280, 640][i.i], -2), sil.audio[1]\n  FROM input(:'src') f, ffmpeg.anullsrc(duration => :duration) sil, generate_series(1, 2) i) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n-- silence synthesized"
+    },
+    {
+      "input": "1 file 1 video track 0 audio track",
+      "output": "1 manifest - demuxed 1 video 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT f.video[1] AS v, 1 AS rung FROM input(:'src') f),\n          aud AS (SELECT sil2.audio[1] AS t, 1000 AS rung FROM ffmpeg.anullsrc(duration => :duration) sil2)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n-- silence synthesized"
+    },
+    {
+      "input": "1 file 1 video track 0 audio track",
+      "output": "1 manifest - demuxed M video 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT scale(f.video[1], ARRAY[1280, 640][i.i], -2) AS v, i.i AS rung FROM input(:'src') f, generate_series(1, 2) i),\n          aud AS (SELECT sil2.audio[1] AS t, 1000 AS rung FROM ffmpeg.anullsrc(duration => :duration) sil2)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n-- silence synthesized"
+    },
+    {
+      "input": "1 file 1 video track 0 audio track",
+      "output": "1 manifest - demuxed 1 video M audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT f.video[1] AS v, 1 AS rung FROM input(:'src') f),\n          aud AS (SELECT sil2.audio[1] AS t, 1000 + j.j AS rung FROM ffmpeg.anullsrc(duration => :duration) sil2, generate_series(1, 2) j)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n-- silence synthesized"
+    },
+    {
+      "input": "1 file 1 video track 0 audio track",
+      "output": "1 manifest - demuxed M video N audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT scale(f.video[1], ARRAY[1280, 640][i.i], -2) AS v, i.i AS rung FROM input(:'src') f, generate_series(1, 2) i),\n          aud AS (SELECT sil2.audio[1] AS t, 1000 + j.j AS rung FROM ffmpeg.anullsrc(duration => :duration) sil2, generate_series(1, 2) j)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n-- silence synthesized"
+    },
+    {
+      "input": "1 file 1 video track 0 audio track",
+      "output": "1 manifest - hybrid 1 video + audio 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT f.video[1] AS v, sil.audio[1] AS a, 1 AS rung FROM input(:'src') f, ffmpeg.anullsrc(duration => :duration) sil),\n          aud AS (SELECT sil2.audio[1] AS t, 1000 AS rung FROM ffmpeg.anullsrc(duration => :duration) sil2)\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n\n-- silence synthesized"
+    },
+    {
+      "input": "1 file 1 video track 0 audio track",
+      "output": "1 manifest - hybrid M video + audio 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT scale(f.video[1], ARRAY[1280, 640][i.i], -2) AS v, sil.audio[1] AS a, i.i AS rung FROM input(:'src') f, generate_series(1, 2) i, ffmpeg.anullsrc(duration => :duration) sil),\n          aud AS (SELECT sil2.audio[1] AS t, 1000 AS rung FROM ffmpeg.anullsrc(duration => :duration) sil2)\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n\n-- silence synthesized"
+    },
+    {
+      "input": "1 file 1 video track 0 audio track",
+      "output": "1 manifest - hybrid 1 video + audio M audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT f.video[1] AS v, sil.audio[1] AS a, 1 AS rung FROM input(:'src') f, ffmpeg.anullsrc(duration => :duration) sil),\n          aud AS (SELECT sil2.audio[1] AS t, 1000 + j.j AS rung FROM ffmpeg.anullsrc(duration => :duration) sil2, generate_series(1, 2) j)\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n\n-- silence synthesized"
+    },
+    {
+      "input": "1 file 1 video track 0 audio track",
+      "output": "1 manifest - hybrid M video + audio N audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT scale(f.video[1], ARRAY[1280, 640][i.i], -2) AS v, sil.audio[1] AS a, i.i AS rung FROM input(:'src') f, generate_series(1, 2) i, ffmpeg.anullsrc(duration => :duration) sil),\n          aud AS (SELECT sil2.audio[1] AS t, 1000 + j.j AS rung FROM ffmpeg.anullsrc(duration => :duration) sil2, generate_series(1, 2) j)\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n\n-- silence synthesized"
+    },
+    {
+      "input": "1 file 0 video track 1 audio track",
+      "output": "1 file 0 video track 0 audio track",
+      "kind": "n/a",
+      "sql": "n/a: a file with no tracks writes nothing"
+    },
+    {
+      "input": "1 file 0 video track 1 audio track",
+      "output": "1 file 1 video track 0 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT blk.video[1]\n  FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk) TO :'dest'\n-- black video synthesized"
+    },
+    {
+      "input": "1 file 0 video track 1 audio track",
+      "output": "1 file 0 video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT * FROM input(:'src') f) TO :'dest'"
+    },
+    {
+      "input": "1 file 0 video track 1 audio track",
+      "output": "1 file M video track 0 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT array_agg(scale(blk.video[1], ARRAY[1280, 640][i.i], -2))\n  FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk, generate_series(1, 2) i) TO :'dest'\n-- black video synthesized"
+    },
+    {
+      "input": "1 file 0 video track 1 audio track",
+      "output": "1 file 0 video track M audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT array_agg(f.audio[1])\n  FROM input(:'src') f, generate_series(1, 2) i) TO :'dest'"
+    },
+    {
+      "input": "1 file 0 video track 1 audio track",
+      "output": "1 file 1 video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT blk.video[1], f.audio[1]\n  FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk, input(:'src') f) TO :'dest'\n-- black video synthesized"
+    },
+    {
+      "input": "1 file 0 video track 1 audio track",
+      "output": "1 file 1 video track M audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT blk.video[1], array_agg(f.audio[1])\n  FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk, input(:'src') f, generate_series(1, 2) i) TO :'dest'\n-- black video synthesized"
+    },
+    {
+      "input": "1 file 0 video track 1 audio track",
+      "output": "1 file M video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT array_agg(scale(blk.video[1], ARRAY[1280, 640][i.i], -2)), f.audio[1]\n  FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk, input(:'src') f, generate_series(1, 2) i) TO :'dest'\n-- black video synthesized"
+    },
+    {
+      "input": "1 file 0 video track 1 audio track",
+      "output": "1 file M video track N audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT array_agg(scale(blk.video[1], ARRAY[1280, 640][i.i], -2)), array_agg(f.audio[1])\n  FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk, input(:'src') f, generate_series(1, 2) i) TO :'dest'\n-- black video synthesized"
+    },
+    {
+      "input": "1 file 0 video track 1 audio track",
+      "output": "1 manifest 1 video",
+      "kind": "query",
+      "sql": "COPY (SELECT blk.video[1] FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n-- black video synthesized"
+    },
+    {
+      "input": "1 file 0 video track 1 audio track",
+      "output": "1 manifest 1 audio",
+      "kind": "query",
+      "sql": "COPY (SELECT f.audio[1] FROM input(:'src') f) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 file 0 video track 1 audio track",
+      "output": "1 manifest - muxed 1 video + audio",
+      "kind": "query",
+      "sql": "COPY (SELECT blk.video[1], f.audio[1] FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk, input(:'src') f) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n-- black video synthesized"
+    },
+    {
+      "input": "1 file 0 video track 1 audio track",
+      "output": "1 manifest - muxed M video + audio",
+      "kind": "query",
+      "sql": "COPY (SELECT scale(blk.video[1], ARRAY[1280, 640][i.i], -2), f.audio[1]\n  FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk, input(:'src') f, generate_series(1, 2) i) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n-- black video synthesized"
+    },
+    {
+      "input": "1 file 0 video track 1 audio track",
+      "output": "1 manifest - demuxed 1 video 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT blk.video[1] AS v, 1 AS rung FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk),\n          aud AS (SELECT g.audio[1] AS t, 1000 AS rung FROM input(:'src') g)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n-- black video synthesized"
+    },
+    {
+      "input": "1 file 0 video track 1 audio track",
+      "output": "1 manifest - demuxed M video 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT scale(blk.video[1], ARRAY[1280, 640][i.i], -2) AS v, i.i AS rung FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk, generate_series(1, 2) i),\n          aud AS (SELECT g.audio[1] AS t, 1000 AS rung FROM input(:'src') g)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n-- black video synthesized"
+    },
+    {
+      "input": "1 file 0 video track 1 audio track",
+      "output": "1 manifest - demuxed 1 video M audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT blk.video[1] AS v, 1 AS rung FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk),\n          aud AS (SELECT g.audio[1] AS t, 1000 + j.j AS rung FROM input(:'src') g, generate_series(1, 2) j)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n-- black video synthesized"
+    },
+    {
+      "input": "1 file 0 video track 1 audio track",
+      "output": "1 manifest - demuxed M video N audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT scale(blk.video[1], ARRAY[1280, 640][i.i], -2) AS v, i.i AS rung FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk, generate_series(1, 2) i),\n          aud AS (SELECT g.audio[1] AS t, 1000 + j.j AS rung FROM input(:'src') g, generate_series(1, 2) j)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n-- black video synthesized"
+    },
+    {
+      "input": "1 file 0 video track 1 audio track",
+      "output": "1 manifest - hybrid 1 video + audio 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT blk.video[1] AS v, f.audio[1] AS a, 1 AS rung FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk, input(:'src') f),\n          aud AS (SELECT g.audio[1] AS t, 1000 AS rung FROM input(:'src') g)\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n\n-- black video synthesized"
+    },
+    {
+      "input": "1 file 0 video track 1 audio track",
+      "output": "1 manifest - hybrid M video + audio 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT scale(blk.video[1], ARRAY[1280, 640][i.i], -2) AS v, f.audio[1] AS a, i.i AS rung FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk, generate_series(1, 2) i, input(:'src') f),\n          aud AS (SELECT g.audio[1] AS t, 1000 AS rung FROM input(:'src') g)\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n\n-- black video synthesized"
+    },
+    {
+      "input": "1 file 0 video track 1 audio track",
+      "output": "1 manifest - hybrid 1 video + audio M audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT blk.video[1] AS v, f.audio[1] AS a, 1 AS rung FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk, input(:'src') f),\n          aud AS (SELECT g.audio[1] AS t, 1000 + j.j AS rung FROM input(:'src') g, generate_series(1, 2) j)\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n\n-- black video synthesized"
+    },
+    {
+      "input": "1 file 0 video track 1 audio track",
+      "output": "1 manifest - hybrid M video + audio N audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT scale(blk.video[1], ARRAY[1280, 640][i.i], -2) AS v, f.audio[1] AS a, i.i AS rung FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk, generate_series(1, 2) i, input(:'src') f),\n          aud AS (SELECT g.audio[1] AS t, 1000 + j.j AS rung FROM input(:'src') g, generate_series(1, 2) j)\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n\n-- black video synthesized"
+    },
+    {
+      "input": "1 file M video track 0 audio track",
+      "output": "1 file 0 video track 0 audio track",
+      "kind": "n/a",
+      "sql": "n/a: a file with no tracks writes nothing"
+    },
+    {
+      "input": "1 file M video track 0 audio track",
+      "output": "1 file 1 video track 0 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT f.video[1]\n  FROM input(:'src') f) TO :'dest'"
+    },
+    {
+      "input": "1 file M video track 0 audio track",
+      "output": "1 file 0 video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT sil.audio[1]\n  FROM ffmpeg.anullsrc(duration => :duration) sil) TO :'dest'\n-- silence synthesized"
+    },
+    {
+      "input": "1 file M video track 0 audio track",
+      "output": "1 file M video track 0 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT * FROM input(:'src') f) TO :'dest'"
+    },
+    {
+      "input": "1 file M video track 0 audio track",
+      "output": "1 file 0 video track M audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT array_agg(sil.audio[1])\n  FROM ffmpeg.anullsrc(duration => :duration) sil, generate_series(1, 2) i) TO :'dest'\n-- silence synthesized"
+    },
+    {
+      "input": "1 file M video track 0 audio track",
+      "output": "1 file 1 video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT f.video[1], sil.audio[1]\n  FROM input(:'src') f, ffmpeg.anullsrc(duration => :duration) sil) TO :'dest'\n-- silence synthesized"
+    },
+    {
+      "input": "1 file M video track 0 audio track",
+      "output": "1 file 1 video track M audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT f.video[1], array_agg(sil.audio[1])\n  FROM input(:'src') f, ffmpeg.anullsrc(duration => :duration) sil, generate_series(1, 2) i) TO :'dest'\n-- silence synthesized"
+    },
+    {
+      "input": "1 file M video track 0 audio track",
+      "output": "1 file M video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT f.video, sil.audio[1]\n  FROM input(:'src') f, ffmpeg.anullsrc(duration => :duration) sil) TO :'dest'\n-- silence synthesized"
+    },
+    {
+      "input": "1 file M video track 0 audio track",
+      "output": "1 file M video track N audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT f.video, array_agg(sil.audio[1])\n  FROM input(:'src') f, ffmpeg.anullsrc(duration => :duration) sil, generate_series(1, 2) i) TO :'dest'\n-- silence synthesized"
+    },
+    {
+      "input": "1 file M video track 0 audio track",
+      "output": "1 manifest 1 video",
+      "kind": "query",
+      "sql": "COPY (SELECT f.video[1] FROM input(:'src') f) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 file M video track 0 audio track",
+      "output": "1 manifest 1 audio",
+      "kind": "query",
+      "sql": "COPY (SELECT sil.audio[1] FROM ffmpeg.anullsrc(duration => :duration) sil) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n-- silence synthesized"
+    },
+    {
+      "input": "1 file M video track 0 audio track",
+      "output": "1 manifest - muxed 1 video + audio",
+      "kind": "query",
+      "sql": "COPY (SELECT f.video[1], sil.audio[1] FROM input(:'src') f, ffmpeg.anullsrc(duration => :duration) sil) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n-- silence synthesized"
+    },
+    {
+      "input": "1 file M video track 0 audio track",
+      "output": "1 manifest - muxed M video + audio",
+      "kind": "query",
+      "sql": "COPY (SELECT vv, sil.audio[1] FROM input(:'src') f, ffmpeg.anullsrc(duration => :duration) sil, unnest(f.video) vv) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n-- silence synthesized"
+    },
+    {
+      "input": "1 file M video track 0 audio track",
+      "output": "1 manifest - demuxed 1 video 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT vv AS v, vv.index AS rung FROM input(:'src') f, unnest(f.video) vv),\n          aud AS (SELECT sil2.audio[1] AS t, 1000 AS rung FROM ffmpeg.anullsrc(duration => :duration) sil2)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n-- silence synthesized"
+    },
+    {
+      "input": "1 file M video track 0 audio track",
+      "output": "1 manifest - demuxed M video 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT vv AS v, vv.index AS rung FROM input(:'src') f, unnest(f.video) vv),\n          aud AS (SELECT sil2.audio[1] AS t, 1000 AS rung FROM ffmpeg.anullsrc(duration => :duration) sil2)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n-- silence synthesized"
+    },
+    {
+      "input": "1 file M video track 0 audio track",
+      "output": "1 manifest - demuxed 1 video M audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT vv AS v, vv.index AS rung FROM input(:'src') f, unnest(f.video) vv),\n          aud AS (SELECT sil2.audio[1] AS t, 1000 + j.j AS rung FROM ffmpeg.anullsrc(duration => :duration) sil2, generate_series(1, 2) j)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n-- silence synthesized"
+    },
+    {
+      "input": "1 file M video track 0 audio track",
+      "output": "1 manifest - demuxed M video N audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT vv AS v, vv.index AS rung FROM input(:'src') f, unnest(f.video) vv),\n          aud AS (SELECT sil2.audio[1] AS t, 1000 + j.j AS rung FROM ffmpeg.anullsrc(duration => :duration) sil2, generate_series(1, 2) j)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n-- silence synthesized"
+    },
+    {
+      "input": "1 file M video track 0 audio track",
+      "output": "1 manifest - hybrid 1 video + audio 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT vv AS v, sil.audio[1] AS a, vv.index AS rung FROM input(:'src') f, unnest(f.video) vv, ffmpeg.anullsrc(duration => :duration) sil),\n          aud AS (SELECT sil2.audio[1] AS t, 1000 AS rung FROM ffmpeg.anullsrc(duration => :duration) sil2)\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n\n-- silence synthesized"
+    },
+    {
+      "input": "1 file M video track 0 audio track",
+      "output": "1 manifest - hybrid M video + audio 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT vv AS v, sil.audio[1] AS a, vv.index AS rung FROM input(:'src') f, unnest(f.video) vv, ffmpeg.anullsrc(duration => :duration) sil),\n          aud AS (SELECT sil2.audio[1] AS t, 1000 AS rung FROM ffmpeg.anullsrc(duration => :duration) sil2)\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n\n-- silence synthesized"
+    },
+    {
+      "input": "1 file M video track 0 audio track",
+      "output": "1 manifest - hybrid 1 video + audio M audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT vv AS v, sil.audio[1] AS a, vv.index AS rung FROM input(:'src') f, unnest(f.video) vv, ffmpeg.anullsrc(duration => :duration) sil),\n          aud AS (SELECT sil2.audio[1] AS t, 1000 + j.j AS rung FROM ffmpeg.anullsrc(duration => :duration) sil2, generate_series(1, 2) j)\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n\n-- silence synthesized"
+    },
+    {
+      "input": "1 file M video track 0 audio track",
+      "output": "1 manifest - hybrid M video + audio N audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT vv AS v, sil.audio[1] AS a, vv.index AS rung FROM input(:'src') f, unnest(f.video) vv, ffmpeg.anullsrc(duration => :duration) sil),\n          aud AS (SELECT sil2.audio[1] AS t, 1000 + j.j AS rung FROM ffmpeg.anullsrc(duration => :duration) sil2, generate_series(1, 2) j)\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n\n-- silence synthesized"
+    },
+    {
+      "input": "1 file 0 video track M audio track",
+      "output": "1 file 0 video track 0 audio track",
+      "kind": "n/a",
+      "sql": "n/a: a file with no tracks writes nothing"
+    },
+    {
+      "input": "1 file 0 video track M audio track",
+      "output": "1 file 1 video track 0 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT blk.video[1]\n  FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk) TO :'dest'\n-- black video synthesized"
+    },
+    {
+      "input": "1 file 0 video track M audio track",
+      "output": "1 file 0 video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT f.audio[1]\n  FROM input(:'src') f) TO :'dest'"
+    },
+    {
+      "input": "1 file 0 video track M audio track",
+      "output": "1 file M video track 0 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT array_agg(scale(blk.video[1], ARRAY[1280, 640][i.i], -2))\n  FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk, generate_series(1, 2) i) TO :'dest'\n-- black video synthesized"
+    },
+    {
+      "input": "1 file 0 video track M audio track",
+      "output": "1 file 0 video track M audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT * FROM input(:'src') f) TO :'dest'"
+    },
+    {
+      "input": "1 file 0 video track M audio track",
+      "output": "1 file 1 video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT blk.video[1], f.audio[1]\n  FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk, input(:'src') f) TO :'dest'\n-- black video synthesized"
+    },
+    {
+      "input": "1 file 0 video track M audio track",
+      "output": "1 file 1 video track M audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT blk.video[1], f.audio\n  FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk, input(:'src') f) TO :'dest'\n-- black video synthesized"
+    },
+    {
+      "input": "1 file 0 video track M audio track",
+      "output": "1 file M video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT array_agg(scale(blk.video[1], ARRAY[1280, 640][i.i], -2)), f.audio[1]\n  FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk, input(:'src') f, generate_series(1, 2) i) TO :'dest'\n-- black video synthesized"
+    },
+    {
+      "input": "1 file 0 video track M audio track",
+      "output": "1 file M video track N audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT array_agg(scale(blk.video[1], ARRAY[1280, 640][i.i], -2)), f.audio\n  FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk, input(:'src') f, generate_series(1, 2) i) TO :'dest'\n-- black video synthesized"
+    },
+    {
+      "input": "1 file 0 video track M audio track",
+      "output": "1 manifest 1 video",
+      "kind": "query",
+      "sql": "COPY (SELECT blk.video[1] FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n-- black video synthesized"
+    },
+    {
+      "input": "1 file 0 video track M audio track",
+      "output": "1 manifest 1 audio",
+      "kind": "query",
+      "sql": "COPY (SELECT f.audio[1] FROM input(:'src') f) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 file 0 video track M audio track",
+      "output": "1 manifest - muxed 1 video + audio",
+      "kind": "query",
+      "sql": "COPY (SELECT blk.video[1], f.audio[1] FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk, input(:'src') f) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n-- black video synthesized"
+    },
+    {
+      "input": "1 file 0 video track M audio track",
+      "output": "1 manifest - muxed M video + audio",
+      "kind": "query",
+      "sql": "COPY (SELECT scale(blk.video[1], ARRAY[1280, 640][i.i], -2), f.audio[1]\n  FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk, input(:'src') f, generate_series(1, 2) i) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n-- black video synthesized"
+    },
+    {
+      "input": "1 file 0 video track M audio track",
+      "output": "1 manifest - demuxed 1 video 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT blk.video[1] AS v, 1 AS rung FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk),\n          aud AS (SELECT ab AS t, 1000 + ab.index AS rung FROM input(:'src') g, unnest(g.audio) ab)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n-- black video synthesized"
+    },
+    {
+      "input": "1 file 0 video track M audio track",
+      "output": "1 manifest - demuxed M video 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT scale(blk.video[1], ARRAY[1280, 640][i.i], -2) AS v, i.i AS rung FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk, generate_series(1, 2) i),\n          aud AS (SELECT ab AS t, 1000 + ab.index AS rung FROM input(:'src') g, unnest(g.audio) ab)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n-- black video synthesized"
+    },
+    {
+      "input": "1 file 0 video track M audio track",
+      "output": "1 manifest - demuxed 1 video M audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT blk.video[1] AS v, 1 AS rung FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk),\n          aud AS (SELECT ab AS t, 1000 + ab.index AS rung FROM input(:'src') g, unnest(g.audio) ab)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n-- black video synthesized"
+    },
+    {
+      "input": "1 file 0 video track M audio track",
+      "output": "1 manifest - demuxed M video N audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT scale(blk.video[1], ARRAY[1280, 640][i.i], -2) AS v, i.i AS rung FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk, generate_series(1, 2) i),\n          aud AS (SELECT ab AS t, 1000 + ab.index AS rung FROM input(:'src') g, unnest(g.audio) ab)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n-- black video synthesized"
+    },
+    {
+      "input": "1 file 0 video track M audio track",
+      "output": "1 manifest - hybrid 1 video + audio 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT blk.video[1] AS v, f.audio[1] AS a, 1 AS rung FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk, input(:'src') f),\n          aud AS (SELECT ab AS t, 1000 + ab.index AS rung FROM input(:'src') g, unnest(g.audio) ab)\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n\n-- black video synthesized"
+    },
+    {
+      "input": "1 file 0 video track M audio track",
+      "output": "1 manifest - hybrid M video + audio 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT scale(blk.video[1], ARRAY[1280, 640][i.i], -2) AS v, f.audio[1] AS a, i.i AS rung FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk, generate_series(1, 2) i, input(:'src') f),\n          aud AS (SELECT ab AS t, 1000 + ab.index AS rung FROM input(:'src') g, unnest(g.audio) ab)\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n\n-- black video synthesized"
+    },
+    {
+      "input": "1 file 0 video track M audio track",
+      "output": "1 manifest - hybrid 1 video + audio M audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT blk.video[1] AS v, f.audio[1] AS a, 1 AS rung FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk, input(:'src') f),\n          aud AS (SELECT ab AS t, 1000 + ab.index AS rung FROM input(:'src') g, unnest(g.audio) ab)\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n\n-- black video synthesized"
+    },
+    {
+      "input": "1 file 0 video track M audio track",
+      "output": "1 manifest - hybrid M video + audio N audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT scale(blk.video[1], ARRAY[1280, 640][i.i], -2) AS v, f.audio[1] AS a, i.i AS rung FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk, generate_series(1, 2) i, input(:'src') f),\n          aud AS (SELECT ab AS t, 1000 + ab.index AS rung FROM input(:'src') g, unnest(g.audio) ab)\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n\n-- black video synthesized"
+    },
+    {
+      "input": "1 file 1 video track 1 audio track",
+      "output": "1 file 0 video track 0 audio track",
+      "kind": "n/a",
+      "sql": "n/a: a file with no tracks writes nothing"
+    },
+    {
+      "input": "1 file 1 video track 1 audio track",
+      "output": "1 file 1 video track 0 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT f.video[1]\n  FROM input(:'src') f) TO :'dest'"
+    },
+    {
+      "input": "1 file 1 video track 1 audio track",
+      "output": "1 file 0 video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT f.audio[1]\n  FROM input(:'src') f) TO :'dest'"
+    },
+    {
+      "input": "1 file 1 video track 1 audio track",
+      "output": "1 file M video track 0 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT array_agg(scale(f.video[1], ARRAY[1280, 640][i.i], -2))\n  FROM input(:'src') f, generate_series(1, 2) i) TO :'dest'"
+    },
+    {
+      "input": "1 file 1 video track 1 audio track",
+      "output": "1 file 0 video track M audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT array_agg(f.audio[1])\n  FROM input(:'src') f, generate_series(1, 2) i) TO :'dest'"
+    },
+    {
+      "input": "1 file 1 video track 1 audio track",
+      "output": "1 file 1 video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT * FROM input(:'src') f) TO :'dest'"
+    },
+    {
+      "input": "1 file 1 video track 1 audio track",
+      "output": "1 file 1 video track M audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT f.video[1], array_agg(f.audio[1])\n  FROM input(:'src') f, generate_series(1, 2) i) TO :'dest'"
+    },
+    {
+      "input": "1 file 1 video track 1 audio track",
+      "output": "1 file M video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT array_agg(scale(f.video[1], ARRAY[1280, 640][i.i], -2)), f.audio[1]\n  FROM input(:'src') f, generate_series(1, 2) i) TO :'dest'"
+    },
+    {
+      "input": "1 file 1 video track 1 audio track",
+      "output": "1 file M video track N audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT array_agg(scale(f.video[1], ARRAY[1280, 640][i.i], -2)), array_agg(f.audio[1])\n  FROM input(:'src') f, generate_series(1, 2) i) TO :'dest'"
+    },
+    {
+      "input": "1 file 1 video track 1 audio track",
+      "output": "1 manifest 1 video",
+      "kind": "query",
+      "sql": "COPY (SELECT f.video[1] FROM input(:'src') f) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 file 1 video track 1 audio track",
+      "output": "1 manifest 1 audio",
+      "kind": "query",
+      "sql": "COPY (SELECT f.audio[1] FROM input(:'src') f) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 file 1 video track 1 audio track",
+      "output": "1 manifest - muxed 1 video + audio",
+      "kind": "query",
+      "sql": "COPY (SELECT f.video[1], f.audio[1] FROM input(:'src') f) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 file 1 video track 1 audio track",
+      "output": "1 manifest - muxed M video + audio",
+      "kind": "query",
+      "sql": "COPY (SELECT scale(f.video[1], ARRAY[1280, 640][i.i], -2), f.audio[1]\n  FROM input(:'src') f, generate_series(1, 2) i) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 file 1 video track 1 audio track",
+      "output": "1 manifest - demuxed 1 video 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT f.video[1] AS v, 1 AS rung FROM input(:'src') f),\n          aud AS (SELECT g.audio[1] AS t, 1000 AS rung FROM input(:'src') g)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 file 1 video track 1 audio track",
+      "output": "1 manifest - demuxed M video 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT scale(f.video[1], ARRAY[1280, 640][i.i], -2) AS v, i.i AS rung FROM input(:'src') f, generate_series(1, 2) i),\n          aud AS (SELECT g.audio[1] AS t, 1000 AS rung FROM input(:'src') g)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 file 1 video track 1 audio track",
+      "output": "1 manifest - demuxed 1 video M audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT f.video[1] AS v, 1 AS rung FROM input(:'src') f),\n          aud AS (SELECT g.audio[1] AS t, 1000 + j.j AS rung FROM input(:'src') g, generate_series(1, 2) j)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 file 1 video track 1 audio track",
+      "output": "1 manifest - demuxed M video N audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT scale(f.video[1], ARRAY[1280, 640][i.i], -2) AS v, i.i AS rung FROM input(:'src') f, generate_series(1, 2) i),\n          aud AS (SELECT g.audio[1] AS t, 1000 + j.j AS rung FROM input(:'src') g, generate_series(1, 2) j)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 file 1 video track 1 audio track",
+      "output": "1 manifest - hybrid 1 video + audio 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT f.video[1] AS v, f.audio[1] AS a, 1 AS rung FROM input(:'src') f),\n          aud AS (SELECT g.audio[1] AS t, 1000 AS rung FROM input(:'src') g)\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 file 1 video track 1 audio track",
+      "output": "1 manifest - hybrid M video + audio 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT scale(f.video[1], ARRAY[1280, 640][i.i], -2) AS v, f.audio[1] AS a, i.i AS rung FROM input(:'src') f, generate_series(1, 2) i),\n          aud AS (SELECT g.audio[1] AS t, 1000 AS rung FROM input(:'src') g)\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 file 1 video track 1 audio track",
+      "output": "1 manifest - hybrid 1 video + audio M audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT f.video[1] AS v, f.audio[1] AS a, 1 AS rung FROM input(:'src') f),\n          aud AS (SELECT g.audio[1] AS t, 1000 + j.j AS rung FROM input(:'src') g, generate_series(1, 2) j)\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 file 1 video track 1 audio track",
+      "output": "1 manifest - hybrid M video + audio N audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT scale(f.video[1], ARRAY[1280, 640][i.i], -2) AS v, f.audio[1] AS a, i.i AS rung FROM input(:'src') f, generate_series(1, 2) i),\n          aud AS (SELECT g.audio[1] AS t, 1000 + j.j AS rung FROM input(:'src') g, generate_series(1, 2) j)\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 file 1 video track M audio track",
+      "output": "1 file 0 video track 0 audio track",
+      "kind": "n/a",
+      "sql": "n/a: a file with no tracks writes nothing"
+    },
+    {
+      "input": "1 file 1 video track M audio track",
+      "output": "1 file 1 video track 0 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT f.video[1]\n  FROM input(:'src') f) TO :'dest'"
+    },
+    {
+      "input": "1 file 1 video track M audio track",
+      "output": "1 file 0 video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT f.audio[1]\n  FROM input(:'src') f) TO :'dest'"
+    },
+    {
+      "input": "1 file 1 video track M audio track",
+      "output": "1 file M video track 0 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT array_agg(scale(f.video[1], ARRAY[1280, 640][i.i], -2))\n  FROM input(:'src') f, generate_series(1, 2) i) TO :'dest'"
+    },
+    {
+      "input": "1 file 1 video track M audio track",
+      "output": "1 file 0 video track M audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT f.audio\n  FROM input(:'src') f) TO :'dest'"
+    },
+    {
+      "input": "1 file 1 video track M audio track",
+      "output": "1 file 1 video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT f.video[1], f.audio[1]\n  FROM input(:'src') f) TO :'dest'"
+    },
+    {
+      "input": "1 file 1 video track M audio track",
+      "output": "1 file 1 video track M audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT * FROM input(:'src') f) TO :'dest'"
+    },
+    {
+      "input": "1 file 1 video track M audio track",
+      "output": "1 file M video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT array_agg(scale(f.video[1], ARRAY[1280, 640][i.i], -2)), f.audio[1]\n  FROM input(:'src') f, generate_series(1, 2) i) TO :'dest'"
+    },
+    {
+      "input": "1 file 1 video track M audio track",
+      "output": "1 file M video track N audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT array_agg(scale(f.video[1], ARRAY[1280, 640][i.i], -2)), f.audio\n  FROM input(:'src') f, generate_series(1, 2) i) TO :'dest'"
+    },
+    {
+      "input": "1 file 1 video track M audio track",
+      "output": "1 manifest 1 video",
+      "kind": "query",
+      "sql": "COPY (SELECT f.video[1] FROM input(:'src') f) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 file 1 video track M audio track",
+      "output": "1 manifest 1 audio",
+      "kind": "query",
+      "sql": "COPY (SELECT f.audio[1] FROM input(:'src') f) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 file 1 video track M audio track",
+      "output": "1 manifest - muxed 1 video + audio",
+      "kind": "query",
+      "sql": "COPY (SELECT f.video[1], f.audio[1] FROM input(:'src') f) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 file 1 video track M audio track",
+      "output": "1 manifest - muxed M video + audio",
+      "kind": "query",
+      "sql": "COPY (SELECT scale(f.video[1], ARRAY[1280, 640][i.i], -2), f.audio[1]\n  FROM input(:'src') f, generate_series(1, 2) i) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 file 1 video track M audio track",
+      "output": "1 manifest - demuxed 1 video 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT f.video[1] AS v, 1 AS rung FROM input(:'src') f),\n          aud AS (SELECT ab AS t, 1000 + ab.index AS rung FROM input(:'src') g, unnest(g.audio) ab)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 file 1 video track M audio track",
+      "output": "1 manifest - demuxed M video 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT scale(f.video[1], ARRAY[1280, 640][i.i], -2) AS v, i.i AS rung FROM input(:'src') f, generate_series(1, 2) i),\n          aud AS (SELECT ab AS t, 1000 + ab.index AS rung FROM input(:'src') g, unnest(g.audio) ab)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 file 1 video track M audio track",
+      "output": "1 manifest - demuxed 1 video M audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT f.video[1] AS v, 1 AS rung FROM input(:'src') f),\n          aud AS (SELECT ab AS t, 1000 + ab.index AS rung FROM input(:'src') g, unnest(g.audio) ab)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 file 1 video track M audio track",
+      "output": "1 manifest - demuxed M video N audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT scale(f.video[1], ARRAY[1280, 640][i.i], -2) AS v, i.i AS rung FROM input(:'src') f, generate_series(1, 2) i),\n          aud AS (SELECT ab AS t, 1000 + ab.index AS rung FROM input(:'src') g, unnest(g.audio) ab)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 file 1 video track M audio track",
+      "output": "1 manifest - hybrid 1 video + audio 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT f.video[1] AS v, f.audio[1] AS a, 1 AS rung FROM input(:'src') f),\n          aud AS (SELECT ab AS t, 1000 + ab.index AS rung FROM input(:'src') g, unnest(g.audio) ab)\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 file 1 video track M audio track",
+      "output": "1 manifest - hybrid M video + audio 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT scale(f.video[1], ARRAY[1280, 640][i.i], -2) AS v, f.audio[1] AS a, i.i AS rung FROM input(:'src') f, generate_series(1, 2) i),\n          aud AS (SELECT ab AS t, 1000 + ab.index AS rung FROM input(:'src') g, unnest(g.audio) ab)\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 file 1 video track M audio track",
+      "output": "1 manifest - hybrid 1 video + audio M audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT f.video[1] AS v, f.audio[1] AS a, 1 AS rung FROM input(:'src') f),\n          aud AS (SELECT ab AS t, 1000 + ab.index AS rung FROM input(:'src') g, unnest(g.audio) ab)\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 file 1 video track M audio track",
+      "output": "1 manifest - hybrid M video + audio N audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT scale(f.video[1], ARRAY[1280, 640][i.i], -2) AS v, f.audio[1] AS a, i.i AS rung FROM input(:'src') f, generate_series(1, 2) i),\n          aud AS (SELECT ab AS t, 1000 + ab.index AS rung FROM input(:'src') g, unnest(g.audio) ab)\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 file M video track 1 audio track",
+      "output": "1 file 0 video track 0 audio track",
+      "kind": "n/a",
+      "sql": "n/a: a file with no tracks writes nothing"
+    },
+    {
+      "input": "1 file M video track 1 audio track",
+      "output": "1 file 1 video track 0 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT f.video[1]\n  FROM input(:'src') f) TO :'dest'"
+    },
+    {
+      "input": "1 file M video track 1 audio track",
+      "output": "1 file 0 video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT f.audio[1]\n  FROM input(:'src') f) TO :'dest'"
+    },
+    {
+      "input": "1 file M video track 1 audio track",
+      "output": "1 file M video track 0 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT f.video\n  FROM input(:'src') f) TO :'dest'"
+    },
+    {
+      "input": "1 file M video track 1 audio track",
+      "output": "1 file 0 video track M audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT array_agg(f.audio[1])\n  FROM input(:'src') f, generate_series(1, 2) i) TO :'dest'"
+    },
+    {
+      "input": "1 file M video track 1 audio track",
+      "output": "1 file 1 video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT f.video[1], f.audio[1]\n  FROM input(:'src') f) TO :'dest'"
+    },
+    {
+      "input": "1 file M video track 1 audio track",
+      "output": "1 file 1 video track M audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT f.video[1], array_agg(f.audio[1])\n  FROM input(:'src') f, generate_series(1, 2) i) TO :'dest'"
+    },
+    {
+      "input": "1 file M video track 1 audio track",
+      "output": "1 file M video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT * FROM input(:'src') f) TO :'dest'"
+    },
+    {
+      "input": "1 file M video track 1 audio track",
+      "output": "1 file M video track N audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT f.video, array_agg(f.audio[1])\n  FROM input(:'src') f, generate_series(1, 2) i) TO :'dest'"
+    },
+    {
+      "input": "1 file M video track 1 audio track",
+      "output": "1 manifest 1 video",
+      "kind": "query",
+      "sql": "COPY (SELECT f.video[1] FROM input(:'src') f) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 file M video track 1 audio track",
+      "output": "1 manifest 1 audio",
+      "kind": "query",
+      "sql": "COPY (SELECT f.audio[1] FROM input(:'src') f) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 file M video track 1 audio track",
+      "output": "1 manifest - muxed 1 video + audio",
+      "kind": "query",
+      "sql": "COPY (SELECT f.video[1], f.audio[1] FROM input(:'src') f) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 file M video track 1 audio track",
+      "output": "1 manifest - muxed M video + audio",
+      "kind": "query",
+      "sql": "COPY (SELECT vv, f.audio[1] FROM input(:'src') f, unnest(f.video) vv) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 file M video track 1 audio track",
+      "output": "1 manifest - demuxed 1 video 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT vv AS v, vv.index AS rung FROM input(:'src') f, unnest(f.video) vv),\n          aud AS (SELECT g.audio[1] AS t, 1000 AS rung FROM input(:'src') g)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 file M video track 1 audio track",
+      "output": "1 manifest - demuxed M video 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT vv AS v, vv.index AS rung FROM input(:'src') f, unnest(f.video) vv),\n          aud AS (SELECT g.audio[1] AS t, 1000 AS rung FROM input(:'src') g)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 file M video track 1 audio track",
+      "output": "1 manifest - demuxed 1 video M audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT vv AS v, vv.index AS rung FROM input(:'src') f, unnest(f.video) vv),\n          aud AS (SELECT g.audio[1] AS t, 1000 + j.j AS rung FROM input(:'src') g, generate_series(1, 2) j)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 file M video track 1 audio track",
+      "output": "1 manifest - demuxed M video N audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT vv AS v, vv.index AS rung FROM input(:'src') f, unnest(f.video) vv),\n          aud AS (SELECT g.audio[1] AS t, 1000 + j.j AS rung FROM input(:'src') g, generate_series(1, 2) j)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 file M video track 1 audio track",
+      "output": "1 manifest - hybrid 1 video + audio 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT vv AS v, f.audio[1] AS a, vv.index AS rung FROM input(:'src') f, unnest(f.video) vv),\n          aud AS (SELECT g.audio[1] AS t, 1000 AS rung FROM input(:'src') g)\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 file M video track 1 audio track",
+      "output": "1 manifest - hybrid M video + audio 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT vv AS v, f.audio[1] AS a, vv.index AS rung FROM input(:'src') f, unnest(f.video) vv),\n          aud AS (SELECT g.audio[1] AS t, 1000 AS rung FROM input(:'src') g)\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 file M video track 1 audio track",
+      "output": "1 manifest - hybrid 1 video + audio M audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT vv AS v, f.audio[1] AS a, vv.index AS rung FROM input(:'src') f, unnest(f.video) vv),\n          aud AS (SELECT g.audio[1] AS t, 1000 + j.j AS rung FROM input(:'src') g, generate_series(1, 2) j)\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 file M video track 1 audio track",
+      "output": "1 manifest - hybrid M video + audio N audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT vv AS v, f.audio[1] AS a, vv.index AS rung FROM input(:'src') f, unnest(f.video) vv),\n          aud AS (SELECT g.audio[1] AS t, 1000 + j.j AS rung FROM input(:'src') g, generate_series(1, 2) j)\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 file M video track N audio track",
+      "output": "1 file 0 video track 0 audio track",
+      "kind": "n/a",
+      "sql": "n/a: a file with no tracks writes nothing"
+    },
+    {
+      "input": "1 file M video track N audio track",
+      "output": "1 file 1 video track 0 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT f.video[1]\n  FROM input(:'src') f) TO :'dest'"
+    },
+    {
+      "input": "1 file M video track N audio track",
+      "output": "1 file 0 video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT f.audio[1]\n  FROM input(:'src') f) TO :'dest'"
+    },
+    {
+      "input": "1 file M video track N audio track",
+      "output": "1 file M video track 0 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT f.video\n  FROM input(:'src') f) TO :'dest'"
+    },
+    {
+      "input": "1 file M video track N audio track",
+      "output": "1 file 0 video track M audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT f.audio\n  FROM input(:'src') f) TO :'dest'"
+    },
+    {
+      "input": "1 file M video track N audio track",
+      "output": "1 file 1 video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT f.video[1], f.audio[1]\n  FROM input(:'src') f) TO :'dest'"
+    },
+    {
+      "input": "1 file M video track N audio track",
+      "output": "1 file 1 video track M audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT f.video[1], f.audio\n  FROM input(:'src') f) TO :'dest'"
+    },
+    {
+      "input": "1 file M video track N audio track",
+      "output": "1 file M video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT f.video, f.audio[1]\n  FROM input(:'src') f) TO :'dest'"
+    },
+    {
+      "input": "1 file M video track N audio track",
+      "output": "1 file M video track N audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT * FROM input(:'src') f) TO :'dest'"
+    },
+    {
+      "input": "1 file M video track N audio track",
+      "output": "1 manifest 1 video",
+      "kind": "query",
+      "sql": "COPY (SELECT f.video[1] FROM input(:'src') f) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 file M video track N audio track",
+      "output": "1 manifest 1 audio",
+      "kind": "query",
+      "sql": "COPY (SELECT f.audio[1] FROM input(:'src') f) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 file M video track N audio track",
+      "output": "1 manifest - muxed 1 video + audio",
+      "kind": "query",
+      "sql": "COPY (SELECT f.video[1], f.audio[1] FROM input(:'src') f) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 file M video track N audio track",
+      "output": "1 manifest - muxed M video + audio",
+      "kind": "query",
+      "sql": "COPY (SELECT vv, f.audio[1] FROM input(:'src') f, unnest(f.video) vv) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 file M video track N audio track",
+      "output": "1 manifest - demuxed 1 video 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT vv AS v, vv.index AS rung FROM input(:'src') f, unnest(f.video) vv),\n          aud AS (SELECT ab AS t, 1000 + ab.index AS rung FROM input(:'src') g, unnest(g.audio) ab)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 file M video track N audio track",
+      "output": "1 manifest - demuxed M video 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT vv AS v, vv.index AS rung FROM input(:'src') f, unnest(f.video) vv),\n          aud AS (SELECT ab AS t, 1000 + ab.index AS rung FROM input(:'src') g, unnest(g.audio) ab)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 file M video track N audio track",
+      "output": "1 manifest - demuxed 1 video M audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT vv AS v, vv.index AS rung FROM input(:'src') f, unnest(f.video) vv),\n          aud AS (SELECT ab AS t, 1000 + ab.index AS rung FROM input(:'src') g, unnest(g.audio) ab)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 file M video track N audio track",
+      "output": "1 manifest - demuxed M video N audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT vv AS v, vv.index AS rung FROM input(:'src') f, unnest(f.video) vv),\n          aud AS (SELECT ab AS t, 1000 + ab.index AS rung FROM input(:'src') g, unnest(g.audio) ab)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 file M video track N audio track",
+      "output": "1 manifest - hybrid 1 video + audio 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT vv AS v, f.audio[1] AS a, vv.index AS rung FROM input(:'src') f, unnest(f.video) vv),\n          aud AS (SELECT ab AS t, 1000 + ab.index AS rung FROM input(:'src') g, unnest(g.audio) ab)\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 file M video track N audio track",
+      "output": "1 manifest - hybrid M video + audio 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT vv AS v, f.audio[1] AS a, vv.index AS rung FROM input(:'src') f, unnest(f.video) vv),\n          aud AS (SELECT ab AS t, 1000 + ab.index AS rung FROM input(:'src') g, unnest(g.audio) ab)\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 file M video track N audio track",
+      "output": "1 manifest - hybrid 1 video + audio M audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT vv AS v, f.audio[1] AS a, vv.index AS rung FROM input(:'src') f, unnest(f.video) vv),\n          aud AS (SELECT ab AS t, 1000 + ab.index AS rung FROM input(:'src') g, unnest(g.audio) ab)\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 file M video track N audio track",
+      "output": "1 manifest - hybrid M video + audio N audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT vv AS v, f.audio[1] AS a, vv.index AS rung FROM input(:'src') f, unnest(f.video) vv),\n          aud AS (SELECT ab AS t, 1000 + ab.index AS rung FROM input(:'src') g, unnest(g.audio) ab)\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest 1 video",
+      "output": "1 file 0 video track 0 audio track",
+      "kind": "n/a",
+      "sql": "n/a: a file with no tracks writes nothing"
+    },
+    {
+      "input": "1 manifest 1 video",
+      "output": "1 file 1 video track 0 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video[1]\n  FROM input(:'src') r) TO :'dest'"
+    },
+    {
+      "input": "1 manifest 1 video",
+      "output": "1 file 0 video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT sil.audio[1]\n  FROM ffmpeg.anullsrc(duration => :duration) sil) TO :'dest'\n-- silence synthesized"
+    },
+    {
+      "input": "1 manifest 1 video",
+      "output": "1 file M video track 0 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT array_agg(scale(r.video[1], ARRAY[1280, 640][i.i], -2))\n  FROM input(:'src') r, generate_series(1, 2) i) TO :'dest'"
+    },
+    {
+      "input": "1 manifest 1 video",
+      "output": "1 file 0 video track M audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT array_agg(sil.audio[1])\n  FROM ffmpeg.anullsrc(duration => :duration) sil, generate_series(1, 2) i) TO :'dest'\n-- silence synthesized"
+    },
+    {
+      "input": "1 manifest 1 video",
+      "output": "1 file 1 video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video[1], sil.audio[1]\n  FROM input(:'src') r, ffmpeg.anullsrc(duration => :duration) sil) TO :'dest'\n-- silence synthesized"
+    },
+    {
+      "input": "1 manifest 1 video",
+      "output": "1 file 1 video track M audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video[1], array_agg(sil.audio[1])\n  FROM input(:'src') r, ffmpeg.anullsrc(duration => :duration) sil, generate_series(1, 2) i) TO :'dest'\n-- silence synthesized"
+    },
+    {
+      "input": "1 manifest 1 video",
+      "output": "1 file M video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT array_agg(scale(r.video[1], ARRAY[1280, 640][i.i], -2)), sil.audio[1]\n  FROM input(:'src') r, ffmpeg.anullsrc(duration => :duration) sil, generate_series(1, 2) i) TO :'dest'\n-- silence synthesized"
+    },
+    {
+      "input": "1 manifest 1 video",
+      "output": "1 file M video track N audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT array_agg(scale(r.video[1], ARRAY[1280, 640][i.i], -2)), array_agg(sil.audio[1])\n  FROM input(:'src') r, ffmpeg.anullsrc(duration => :duration) sil, generate_series(1, 2) i) TO :'dest'\n-- silence synthesized"
+    },
+    {
+      "input": "1 manifest 1 video",
+      "output": "1 manifest 1 video",
+      "kind": "query",
+      "sql": "COPY (SELECT * FROM input(:'src') r) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4')"
+    },
+    {
+      "input": "1 manifest 1 video",
+      "output": "1 manifest 1 audio",
+      "kind": "query",
+      "sql": "COPY (SELECT sil.audio[1] FROM ffmpeg.anullsrc(duration => :duration) sil) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n-- silence synthesized"
+    },
+    {
+      "input": "1 manifest 1 video",
+      "output": "1 manifest - muxed 1 video + audio",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video[1], sil.audio[1] FROM input(:'src') r, ffmpeg.anullsrc(duration => :duration) sil) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n-- silence synthesized"
+    },
+    {
+      "input": "1 manifest 1 video",
+      "output": "1 manifest - muxed M video + audio",
+      "kind": "query",
+      "sql": "COPY (SELECT scale(r.video[1], ARRAY[1280, 640][i.i], -2), sil.audio[1]\n  FROM input(:'src') r, ffmpeg.anullsrc(duration => :duration) sil, generate_series(1, 2) i) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n-- silence synthesized"
+    },
+    {
+      "input": "1 manifest 1 video",
+      "output": "1 manifest - demuxed 1 video 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT r.video[1] AS v, 1 AS rung FROM input(:'src') r),\n          aud AS (SELECT sil2.audio[1] AS t, 1000 AS rung FROM ffmpeg.anullsrc(duration => :duration) sil2)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n-- silence synthesized"
+    },
+    {
+      "input": "1 manifest 1 video",
+      "output": "1 manifest - demuxed M video 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT scale(r.video[1], ARRAY[1280, 640][i.i], -2) AS v, i.i AS rung FROM input(:'src') r, generate_series(1, 2) i),\n          aud AS (SELECT sil2.audio[1] AS t, 1000 AS rung FROM ffmpeg.anullsrc(duration => :duration) sil2)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n-- silence synthesized"
+    },
+    {
+      "input": "1 manifest 1 video",
+      "output": "1 manifest - demuxed 1 video M audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT r.video[1] AS v, 1 AS rung FROM input(:'src') r),\n          aud AS (SELECT sil2.audio[1] AS t, 1000 + j.j AS rung FROM ffmpeg.anullsrc(duration => :duration) sil2, generate_series(1, 2) j)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n-- silence synthesized"
+    },
+    {
+      "input": "1 manifest 1 video",
+      "output": "1 manifest - demuxed M video N audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT scale(r.video[1], ARRAY[1280, 640][i.i], -2) AS v, i.i AS rung FROM input(:'src') r, generate_series(1, 2) i),\n          aud AS (SELECT sil2.audio[1] AS t, 1000 + j.j AS rung FROM ffmpeg.anullsrc(duration => :duration) sil2, generate_series(1, 2) j)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n-- silence synthesized"
+    },
+    {
+      "input": "1 manifest 1 video",
+      "output": "1 manifest - hybrid 1 video + audio 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT r.video[1] AS v, sil.audio[1] AS a, 1 AS rung FROM input(:'src') r, ffmpeg.anullsrc(duration => :duration) sil),\n          aud AS (SELECT sil2.audio[1] AS t, 1000 AS rung FROM ffmpeg.anullsrc(duration => :duration) sil2)\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n\n-- silence synthesized"
+    },
+    {
+      "input": "1 manifest 1 video",
+      "output": "1 manifest - hybrid M video + audio 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT scale(r.video[1], ARRAY[1280, 640][i.i], -2) AS v, sil.audio[1] AS a, i.i AS rung FROM input(:'src') r, generate_series(1, 2) i, ffmpeg.anullsrc(duration => :duration) sil),\n          aud AS (SELECT sil2.audio[1] AS t, 1000 AS rung FROM ffmpeg.anullsrc(duration => :duration) sil2)\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n\n-- silence synthesized"
+    },
+    {
+      "input": "1 manifest 1 video",
+      "output": "1 manifest - hybrid 1 video + audio M audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT r.video[1] AS v, sil.audio[1] AS a, 1 AS rung FROM input(:'src') r, ffmpeg.anullsrc(duration => :duration) sil),\n          aud AS (SELECT sil2.audio[1] AS t, 1000 + j.j AS rung FROM ffmpeg.anullsrc(duration => :duration) sil2, generate_series(1, 2) j)\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n\n-- silence synthesized"
+    },
+    {
+      "input": "1 manifest 1 video",
+      "output": "1 manifest - hybrid M video + audio N audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT scale(r.video[1], ARRAY[1280, 640][i.i], -2) AS v, sil.audio[1] AS a, i.i AS rung FROM input(:'src') r, generate_series(1, 2) i, ffmpeg.anullsrc(duration => :duration) sil),\n          aud AS (SELECT sil2.audio[1] AS t, 1000 + j.j AS rung FROM ffmpeg.anullsrc(duration => :duration) sil2, generate_series(1, 2) j)\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n\n-- silence synthesized"
+    },
+    {
+      "input": "1 manifest 1 audio",
+      "output": "1 file 0 video track 0 audio track",
+      "kind": "n/a",
+      "sql": "n/a: a file with no tracks writes nothing"
+    },
+    {
+      "input": "1 manifest 1 audio",
+      "output": "1 file 1 video track 0 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT blk.video[1]\n  FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk) TO :'dest'\n-- black video synthesized"
+    },
+    {
+      "input": "1 manifest 1 audio",
+      "output": "1 file 0 video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT r.audio[1]\n  FROM input(:'src') r) TO :'dest'"
+    },
+    {
+      "input": "1 manifest 1 audio",
+      "output": "1 file M video track 0 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT array_agg(scale(blk.video[1], ARRAY[1280, 640][i.i], -2))\n  FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk, generate_series(1, 2) i) TO :'dest'\n-- black video synthesized"
+    },
+    {
+      "input": "1 manifest 1 audio",
+      "output": "1 file 0 video track M audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT array_agg(r.audio[1])\n  FROM input(:'src') r, generate_series(1, 2) i) TO :'dest'"
+    },
+    {
+      "input": "1 manifest 1 audio",
+      "output": "1 file 1 video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT blk.video[1], r.audio[1]\n  FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk, input(:'src') r) TO :'dest'\n-- black video synthesized"
+    },
+    {
+      "input": "1 manifest 1 audio",
+      "output": "1 file 1 video track M audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT blk.video[1], array_agg(r.audio[1])\n  FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk, input(:'src') r, generate_series(1, 2) i) TO :'dest'\n-- black video synthesized"
+    },
+    {
+      "input": "1 manifest 1 audio",
+      "output": "1 file M video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT array_agg(scale(blk.video[1], ARRAY[1280, 640][i.i], -2)), r.audio[1]\n  FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk, input(:'src') r, generate_series(1, 2) i) TO :'dest'\n-- black video synthesized"
+    },
+    {
+      "input": "1 manifest 1 audio",
+      "output": "1 file M video track N audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT array_agg(scale(blk.video[1], ARRAY[1280, 640][i.i], -2)), array_agg(r.audio[1])\n  FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk, input(:'src') r, generate_series(1, 2) i) TO :'dest'\n-- black video synthesized"
+    },
+    {
+      "input": "1 manifest 1 audio",
+      "output": "1 manifest 1 video",
+      "kind": "query",
+      "sql": "COPY (SELECT blk.video[1] FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n-- black video synthesized"
+    },
+    {
+      "input": "1 manifest 1 audio",
+      "output": "1 manifest 1 audio",
+      "kind": "query",
+      "sql": "COPY (SELECT * FROM input(:'src') r) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4')"
+    },
+    {
+      "input": "1 manifest 1 audio",
+      "output": "1 manifest - muxed 1 video + audio",
+      "kind": "query",
+      "sql": "COPY (SELECT blk.video[1], r.audio[1] FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk, input(:'src') r) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n-- black video synthesized"
+    },
+    {
+      "input": "1 manifest 1 audio",
+      "output": "1 manifest - muxed M video + audio",
+      "kind": "query",
+      "sql": "COPY (SELECT scale(blk.video[1], ARRAY[1280, 640][i.i], -2), r.audio[1]\n  FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk, input(:'src') r, generate_series(1, 2) i) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n-- black video synthesized"
+    },
+    {
+      "input": "1 manifest 1 audio",
+      "output": "1 manifest - demuxed 1 video 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT blk.video[1] AS v, 1 AS rung FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk),\n          aud AS (SELECT s.audio[1] AS t, 1000 AS rung FROM input(:'src') s)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n-- black video synthesized"
+    },
+    {
+      "input": "1 manifest 1 audio",
+      "output": "1 manifest - demuxed M video 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT scale(blk.video[1], ARRAY[1280, 640][i.i], -2) AS v, i.i AS rung FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk, generate_series(1, 2) i),\n          aud AS (SELECT s.audio[1] AS t, 1000 AS rung FROM input(:'src') s)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n-- black video synthesized"
+    },
+    {
+      "input": "1 manifest 1 audio",
+      "output": "1 manifest - demuxed 1 video M audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT blk.video[1] AS v, 1 AS rung FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk),\n          aud AS (SELECT s.audio[1] AS t, 1000 + j.j AS rung FROM input(:'src') s, generate_series(1, 2) j)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n-- black video synthesized"
+    },
+    {
+      "input": "1 manifest 1 audio",
+      "output": "1 manifest - demuxed M video N audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT scale(blk.video[1], ARRAY[1280, 640][i.i], -2) AS v, i.i AS rung FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk, generate_series(1, 2) i),\n          aud AS (SELECT s.audio[1] AS t, 1000 + j.j AS rung FROM input(:'src') s, generate_series(1, 2) j)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n-- black video synthesized"
+    },
+    {
+      "input": "1 manifest 1 audio",
+      "output": "1 manifest - hybrid 1 video + audio 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT blk.video[1] AS v, r.audio[1] AS a, 1 AS rung FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk, input(:'src') r),\n          aud AS (SELECT s.audio[1] AS t, 1000 AS rung FROM input(:'src') s)\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n\n-- black video synthesized"
+    },
+    {
+      "input": "1 manifest 1 audio",
+      "output": "1 manifest - hybrid M video + audio 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT scale(blk.video[1], ARRAY[1280, 640][i.i], -2) AS v, r.audio[1] AS a, i.i AS rung FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk, generate_series(1, 2) i, input(:'src') r),\n          aud AS (SELECT s.audio[1] AS t, 1000 AS rung FROM input(:'src') s)\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n\n-- black video synthesized"
+    },
+    {
+      "input": "1 manifest 1 audio",
+      "output": "1 manifest - hybrid 1 video + audio M audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT blk.video[1] AS v, r.audio[1] AS a, 1 AS rung FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk, input(:'src') r),\n          aud AS (SELECT s.audio[1] AS t, 1000 + j.j AS rung FROM input(:'src') s, generate_series(1, 2) j)\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n\n-- black video synthesized"
+    },
+    {
+      "input": "1 manifest 1 audio",
+      "output": "1 manifest - hybrid M video + audio N audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT scale(blk.video[1], ARRAY[1280, 640][i.i], -2) AS v, r.audio[1] AS a, i.i AS rung FROM ffmpeg.color(size => '1280x720', rate => 30, duration => :duration) blk, generate_series(1, 2) i, input(:'src') r),\n          aud AS (SELECT s.audio[1] AS t, 1000 + j.j AS rung FROM input(:'src') s, generate_series(1, 2) j)\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')\n\n-- black video synthesized"
+    },
+    {
+      "input": "1 manifest - muxed 1 video + audio",
+      "output": "1 file 0 video track 0 audio track",
+      "kind": "n/a",
+      "sql": "n/a: a file with no tracks writes nothing"
+    },
+    {
+      "input": "1 manifest - muxed 1 video + audio",
+      "output": "1 file 1 video track 0 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video[1] FROM input(:'src') r) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - muxed 1 video + audio",
+      "output": "1 file 0 video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT r.audio[1] FROM input(:'src') r) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - muxed 1 video + audio",
+      "output": "1 file M video track 0 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT array_agg(r.video[1]) FROM input(:'src') r) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - muxed 1 video + audio",
+      "output": "1 file 0 video track M audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT array_agg(r.audio[1]) FROM input(:'src') r) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - muxed 1 video + audio",
+      "output": "1 file 1 video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video[1], r.audio[1] FROM input(:'src') r) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - muxed 1 video + audio",
+      "output": "1 file 1 video track M audio track",
+      "kind": "query",
+      "sql": "COPY (WITH vs AS (SELECT r.video[1] AS v, 1 AS rung FROM input(:'src') r),\n          au AS (SELECT s.audio[1] AS a, 1000 + s.bandwidth AS rung FROM input(:'src') s)\n  SELECT array_agg(vs.v), array_agg(au.a) FROM vs FULL JOIN au ON vs.rung = au.rung) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - muxed 1 video + audio",
+      "output": "1 file M video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (WITH vs AS (SELECT r.video[1] AS v, r.height AS rung FROM input(:'src') r),\n          au AS (SELECT s.audio[1] AS a, 1000 + 0 AS rung FROM input(:'src') s)\n  SELECT array_agg(vs.v), array_agg(au.a) FROM vs FULL JOIN au ON vs.rung = au.rung) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - muxed 1 video + audio",
+      "output": "1 file M video track N audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT array_agg(r.video[1]), array_agg(r.audio[1]) FROM input(:'src') r) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - muxed 1 video + audio",
+      "output": "1 manifest 1 video",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video FROM input(:'src') r) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - muxed 1 video + audio",
+      "output": "1 manifest 1 audio",
+      "kind": "query",
+      "sql": "COPY (SELECT r.audio FROM input(:'src') r) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - muxed 1 video + audio",
+      "output": "1 manifest - muxed 1 video + audio",
+      "kind": "query",
+      "sql": "COPY (SELECT * FROM input(:'src') r) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4')"
+    },
+    {
+      "input": "1 manifest - muxed 1 video + audio",
+      "output": "1 manifest - muxed M video + audio",
+      "kind": "query",
+      "sql": "COPY (SELECT scale(r.video[1], ARRAY[1280, 640][i.i], -2), r.audio[1] FROM input(:'src') r, generate_series(1, 2) i) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - muxed 1 video + audio",
+      "output": "1 manifest - demuxed 1 video 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT r.video[1] AS v, r.height AS rung FROM input(:'src') r),\n          aud AS (SELECT s.audio[1] AS t, 1000 + s.bandwidth AS rung FROM input(:'src') s)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - muxed 1 video + audio",
+      "output": "1 manifest - demuxed M video 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT r.video[1] AS v, r.height AS rung FROM input(:'src') r),\n          aud AS (SELECT s.audio[1] AS t, 1000 + s.bandwidth AS rung FROM input(:'src') s)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - muxed 1 video + audio",
+      "output": "1 manifest - demuxed 1 video M audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT r.video[1] AS v, r.height AS rung FROM input(:'src') r),\n          aud AS (SELECT s.audio[1] AS t, 1000 + s.bandwidth AS rung FROM input(:'src') s)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - muxed 1 video + audio",
+      "output": "1 manifest - demuxed M video N audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT r.video[1] AS v, r.height AS rung FROM input(:'src') r),\n          aud AS (SELECT s.audio[1] AS t, 1000 + s.bandwidth AS rung FROM input(:'src') s)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - muxed 1 video + audio",
+      "output": "1 manifest - hybrid 1 video + audio 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT r.video[1] AS v, r.audio[1] AS a, r.height AS rung FROM input(:'src') r),\n          aud AS (SELECT s.audio[1] AS t, 1000 + s.bandwidth AS rung FROM input(:'src') s)\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - muxed 1 video + audio",
+      "output": "1 manifest - hybrid M video + audio 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT r.video[1] AS v, r.audio[1] AS a, r.height AS rung FROM input(:'src') r),\n          aud AS (SELECT s.audio[1] AS t, 1000 + s.bandwidth AS rung FROM input(:'src') s)\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - muxed 1 video + audio",
+      "output": "1 manifest - hybrid 1 video + audio M audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT r.video[1] AS v, r.audio[1] AS a, r.height AS rung FROM input(:'src') r),\n          aud AS (SELECT s.audio[1] AS t, 1000 + s.bandwidth AS rung FROM input(:'src') s)\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - muxed 1 video + audio",
+      "output": "1 manifest - hybrid M video + audio N audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT r.video[1] AS v, r.audio[1] AS a, r.height AS rung FROM input(:'src') r),\n          aud AS (SELECT s.audio[1] AS t, 1000 + s.bandwidth AS rung FROM input(:'src') s)\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - muxed M video + audio",
+      "output": "1 file 0 video track 0 audio track",
+      "kind": "n/a",
+      "sql": "n/a: a file with no tracks writes nothing"
+    },
+    {
+      "input": "1 manifest - muxed M video + audio",
+      "output": "1 file 1 video track 0 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video[1] FROM input(:'src') r\n  WHERE r.height = :h) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - muxed M video + audio",
+      "output": "1 file 0 video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT r.audio[1] FROM input(:'src') r\n  WHERE r.height = :h) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - muxed M video + audio",
+      "output": "1 file M video track 0 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT array_agg(r.video[1]) FROM input(:'src') r) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - muxed M video + audio",
+      "output": "1 file 0 video track M audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT array_agg(r.audio[1]) FROM input(:'src') r) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - muxed M video + audio",
+      "output": "1 file 1 video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video[1], r.audio[1] FROM input(:'src') r\n  WHERE r.height = :h) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - muxed M video + audio",
+      "output": "1 file 1 video track M audio track",
+      "kind": "query",
+      "sql": "COPY (WITH vs AS (SELECT r.video[1] AS v, 1 AS rung FROM input(:'src') r\n  WHERE r.height = :h),\n          au AS (SELECT s.audio[1] AS a, 1000 + s.bandwidth AS rung FROM input(:'src') s)\n  SELECT array_agg(vs.v), array_agg(au.a) FROM vs FULL JOIN au ON vs.rung = au.rung) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - muxed M video + audio",
+      "output": "1 file M video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (WITH vs AS (SELECT r.video[1] AS v, r.height AS rung FROM input(:'src') r),\n          au AS (SELECT s.audio[1] AS a, 1000 + 0 AS rung FROM input(:'src') s\n  WHERE s.height = :h)\n  SELECT array_agg(vs.v), array_agg(au.a) FROM vs FULL JOIN au ON vs.rung = au.rung) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - muxed M video + audio",
+      "output": "1 file M video track N audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT array_agg(r.video[1]), array_agg(r.audio[1]) FROM input(:'src') r) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - muxed M video + audio",
+      "output": "1 manifest 1 video",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video FROM input(:'src') r\n  WHERE r.height = :h) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - muxed M video + audio",
+      "output": "1 manifest 1 audio",
+      "kind": "query",
+      "sql": "COPY (SELECT r.audio FROM input(:'src') r\n  WHERE r.height = :h) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - muxed M video + audio",
+      "output": "1 manifest - muxed 1 video + audio",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video, r.audio FROM input(:'src') r\n  WHERE r.height = :h) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - muxed M video + audio",
+      "output": "1 manifest - muxed M video + audio",
+      "kind": "query",
+      "sql": "COPY (SELECT * FROM input(:'src') r) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4')"
+    },
+    {
+      "input": "1 manifest - muxed M video + audio",
+      "output": "1 manifest - demuxed 1 video 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT r.video[1] AS v, r.height AS rung FROM input(:'src') r),\n          aud AS (SELECT s.audio[1] AS t, 1000 + s.bandwidth AS rung FROM input(:'src') s\n  WHERE s.height = :h)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - muxed M video + audio",
+      "output": "1 manifest - demuxed M video 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT r.video[1] AS v, r.height AS rung FROM input(:'src') r),\n          aud AS (SELECT s.audio[1] AS t, 1000 + s.bandwidth AS rung FROM input(:'src') s\n  WHERE s.height = :h)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - muxed M video + audio",
+      "output": "1 manifest - demuxed 1 video M audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT r.video[1] AS v, r.height AS rung FROM input(:'src') r),\n          aud AS (SELECT s.audio[1] AS t, 1000 + s.bandwidth AS rung FROM input(:'src') s)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - muxed M video + audio",
+      "output": "1 manifest - demuxed M video N audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT r.video[1] AS v, r.height AS rung FROM input(:'src') r),\n          aud AS (SELECT s.audio[1] AS t, 1000 + s.bandwidth AS rung FROM input(:'src') s)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - muxed M video + audio",
+      "output": "1 manifest - hybrid 1 video + audio 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT r.video[1] AS v, r.audio[1] AS a, r.height AS rung FROM input(:'src') r\n  WHERE r.height = :h),\n          aud AS (SELECT s.audio[1] AS t, 1000 + s.bandwidth AS rung FROM input(:'src') s\n  WHERE s.height = :h)\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - muxed M video + audio",
+      "output": "1 manifest - hybrid M video + audio 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT r.video[1] AS v, r.audio[1] AS a, r.height AS rung FROM input(:'src') r\n  WHERE r.height = :h),\n          aud AS (SELECT s.audio[1] AS t, 1000 + s.bandwidth AS rung FROM input(:'src') s\n  WHERE s.height = :h)\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - muxed M video + audio",
+      "output": "1 manifest - hybrid 1 video + audio M audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT r.video[1] AS v, r.audio[1] AS a, r.height AS rung FROM input(:'src') r\n  WHERE r.height = :h),\n          aud AS (SELECT s.audio[1] AS t, 1000 + s.bandwidth AS rung FROM input(:'src') s\n  WHERE s.height = :h)\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - muxed M video + audio",
+      "output": "1 manifest - hybrid M video + audio N audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT r.video[1] AS v, r.audio[1] AS a, r.height AS rung FROM input(:'src') r\n  WHERE r.height = :h),\n          aud AS (SELECT s.audio[1] AS t, 1000 + s.bandwidth AS rung FROM input(:'src') s\n  WHERE s.height = :h)\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - demuxed 1 video 1 audio",
+      "output": "1 file 0 video track 0 audio track",
+      "kind": "n/a",
+      "sql": "n/a: a file with no tracks writes nothing"
+    },
+    {
+      "input": "1 manifest - demuxed 1 video 1 audio",
+      "output": "1 file 1 video track 0 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video[1] FROM input(:'src') r\n  WHERE r.height IS NOT NULL) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - demuxed 1 video 1 audio",
+      "output": "1 file 0 video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT r.audio[1] FROM input(:'src') r\n  WHERE r.height IS NULL) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - demuxed 1 video 1 audio",
+      "output": "1 file M video track 0 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT array_agg(r.video[1]) FROM input(:'src') r\n  WHERE r.height IS NOT NULL) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - demuxed 1 video 1 audio",
+      "output": "1 file 0 video track M audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT array_agg(r.audio[1]) FROM input(:'src') r\n  WHERE r.height IS NULL) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - demuxed 1 video 1 audio",
+      "output": "1 file 1 video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT v.video[1], a.audio[1] FROM input(:'src') v, input(:'src') a\n  WHERE v.height IS NOT NULL AND a.height IS NULL) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - demuxed 1 video 1 audio",
+      "output": "1 file 1 video track M audio track",
+      "kind": "query",
+      "sql": "COPY (WITH vs AS (SELECT r.video[1] AS v, 1 AS rung FROM input(:'src') r\n  WHERE r.height IS NOT NULL),\n          au AS (SELECT s.audio[1] AS a, 1000 + s.bandwidth AS rung FROM input(:'src') s\n  WHERE s.height IS NULL)\n  SELECT array_agg(vs.v), array_agg(au.a) FROM vs FULL JOIN au ON vs.rung = au.rung) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - demuxed 1 video 1 audio",
+      "output": "1 file M video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (WITH vs AS (SELECT r.video[1] AS v, r.height AS rung FROM input(:'src') r\n  WHERE r.height IS NOT NULL),\n          au AS (SELECT s.audio[1] AS a, 1000 + 0 AS rung FROM input(:'src') s\n  WHERE s.height IS NULL)\n  SELECT array_agg(vs.v), array_agg(au.a) FROM vs FULL JOIN au ON vs.rung = au.rung) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - demuxed 1 video 1 audio",
+      "output": "1 file M video track N audio track",
+      "kind": "query",
+      "sql": "COPY (WITH vs AS (SELECT r.video[1] AS v, r.height AS rung FROM input(:'src') r\n  WHERE r.height IS NOT NULL),\n          au AS (SELECT s.audio[1] AS a, 1000 + s.bandwidth AS rung FROM input(:'src') s\n  WHERE s.height IS NULL)\n  SELECT array_agg(vs.v), array_agg(au.a) FROM vs FULL JOIN au ON vs.rung = au.rung) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - demuxed 1 video 1 audio",
+      "output": "1 manifest 1 video",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video FROM input(:'src') r\n  WHERE r.height IS NOT NULL) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - demuxed 1 video 1 audio",
+      "output": "1 manifest 1 audio",
+      "kind": "query",
+      "sql": "COPY (SELECT r.audio FROM input(:'src') r\n  WHERE r.height IS NULL) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - demuxed 1 video 1 audio",
+      "output": "1 manifest - muxed 1 video + audio",
+      "kind": "query",
+      "sql": "COPY (SELECT v.video[1], a.audio[1] FROM input(:'src') v, input(:'src') a\n  WHERE v.height IS NOT NULL AND a.height IS NULL) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - demuxed 1 video 1 audio",
+      "output": "1 manifest - muxed M video + audio",
+      "kind": "query",
+      "sql": "COPY (SELECT v.video[1], a.audio[1] FROM input(:'src') v, input(:'src') a\n  WHERE v.height IS NOT NULL AND a.height IS NULL) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - demuxed 1 video 1 audio",
+      "output": "1 manifest - demuxed 1 video 1 audio",
+      "kind": "query",
+      "sql": "COPY (SELECT * FROM input(:'src') r) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4')"
+    },
+    {
+      "input": "1 manifest - demuxed 1 video 1 audio",
+      "output": "1 manifest - demuxed M video 1 audio",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video, r.audio FROM input(:'src') r\n  WHERE r.height IS NOT NULL OR r.height IS NULL) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - demuxed 1 video 1 audio",
+      "output": "1 manifest - demuxed 1 video M audio",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video, r.audio FROM input(:'src') r\n  WHERE r.height IS NOT NULL OR r.height IS NULL) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - demuxed 1 video 1 audio",
+      "output": "1 manifest - demuxed M video N audio",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video, r.audio FROM input(:'src') r\n  WHERE r.height IS NOT NULL OR r.height IS NULL) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - demuxed 1 video 1 audio",
+      "output": "1 manifest - hybrid 1 video + audio 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT v.video[1] AS v, a.audio[1] AS a, v.height AS rung FROM input(:'src') v, input(:'src') a\n  WHERE v.height IS NOT NULL AND a.height IS NULL),\n          aud AS (SELECT s.audio[1] AS t, 1000 + s.bandwidth AS rung FROM input(:'src') s\n  WHERE s.height IS NULL)\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - demuxed 1 video 1 audio",
+      "output": "1 manifest - hybrid M video + audio 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT v.video[1] AS v, a.audio[1] AS a, v.height AS rung FROM input(:'src') v, input(:'src') a\n  WHERE v.height IS NOT NULL AND a.height IS NULL),\n          aud AS (SELECT s.audio[1] AS t, 1000 + s.bandwidth AS rung FROM input(:'src') s\n  WHERE s.height IS NULL)\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - demuxed 1 video 1 audio",
+      "output": "1 manifest - hybrid 1 video + audio M audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT v.video[1] AS v, a.audio[1] AS a, v.height AS rung FROM input(:'src') v, input(:'src') a\n  WHERE v.height IS NOT NULL AND a.height IS NULL),\n          aud AS (SELECT s.audio[1] AS t, 1000 + s.bandwidth AS rung FROM input(:'src') s\n  WHERE s.height IS NULL)\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - demuxed 1 video 1 audio",
+      "output": "1 manifest - hybrid M video + audio N audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT v.video[1] AS v, a.audio[1] AS a, v.height AS rung FROM input(:'src') v, input(:'src') a\n  WHERE v.height IS NOT NULL AND a.height IS NULL),\n          aud AS (SELECT s.audio[1] AS t, 1000 + s.bandwidth AS rung FROM input(:'src') s\n  WHERE s.height IS NULL)\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - demuxed M video 1 audio",
+      "output": "1 file 0 video track 0 audio track",
+      "kind": "n/a",
+      "sql": "n/a: a file with no tracks writes nothing"
+    },
+    {
+      "input": "1 manifest - demuxed M video 1 audio",
+      "output": "1 file 1 video track 0 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video[1] FROM input(:'src') r\n  WHERE r.height = :h) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - demuxed M video 1 audio",
+      "output": "1 file 0 video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT r.audio[1] FROM input(:'src') r\n  WHERE r.height IS NULL) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - demuxed M video 1 audio",
+      "output": "1 file M video track 0 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT array_agg(r.video[1]) FROM input(:'src') r\n  WHERE r.height IS NOT NULL) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - demuxed M video 1 audio",
+      "output": "1 file 0 video track M audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT array_agg(r.audio[1]) FROM input(:'src') r\n  WHERE r.height IS NULL) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - demuxed M video 1 audio",
+      "output": "1 file 1 video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT v.video[1], a.audio[1] FROM input(:'src') v, input(:'src') a\n  WHERE v.height = :h AND a.height IS NULL) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - demuxed M video 1 audio",
+      "output": "1 file 1 video track M audio track",
+      "kind": "query",
+      "sql": "COPY (WITH vs AS (SELECT r.video[1] AS v, 1 AS rung FROM input(:'src') r\n  WHERE r.height = :h),\n          au AS (SELECT s.audio[1] AS a, 1000 + s.bandwidth AS rung FROM input(:'src') s\n  WHERE s.height IS NULL)\n  SELECT array_agg(vs.v), array_agg(au.a) FROM vs FULL JOIN au ON vs.rung = au.rung) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - demuxed M video 1 audio",
+      "output": "1 file M video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (WITH vs AS (SELECT r.video[1] AS v, r.height AS rung FROM input(:'src') r\n  WHERE r.height IS NOT NULL),\n          au AS (SELECT s.audio[1] AS a, 1000 + 0 AS rung FROM input(:'src') s\n  WHERE s.height IS NULL)\n  SELECT array_agg(vs.v), array_agg(au.a) FROM vs FULL JOIN au ON vs.rung = au.rung) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - demuxed M video 1 audio",
+      "output": "1 file M video track N audio track",
+      "kind": "query",
+      "sql": "COPY (WITH vs AS (SELECT r.video[1] AS v, r.height AS rung FROM input(:'src') r\n  WHERE r.height IS NOT NULL),\n          au AS (SELECT s.audio[1] AS a, 1000 + s.bandwidth AS rung FROM input(:'src') s\n  WHERE s.height IS NULL)\n  SELECT array_agg(vs.v), array_agg(au.a) FROM vs FULL JOIN au ON vs.rung = au.rung) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - demuxed M video 1 audio",
+      "output": "1 manifest 1 video",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video FROM input(:'src') r\n  WHERE r.height = :h) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - demuxed M video 1 audio",
+      "output": "1 manifest 1 audio",
+      "kind": "query",
+      "sql": "COPY (SELECT r.audio FROM input(:'src') r\n  WHERE r.height IS NULL) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - demuxed M video 1 audio",
+      "output": "1 manifest - muxed 1 video + audio",
+      "kind": "query",
+      "sql": "COPY (SELECT v.video[1], a.audio[1] FROM input(:'src') v, input(:'src') a\n  WHERE v.height = :h AND a.height IS NULL) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - demuxed M video 1 audio",
+      "output": "1 manifest - muxed M video + audio",
+      "kind": "query",
+      "sql": "COPY (SELECT v.video[1], a.audio[1] FROM input(:'src') v, input(:'src') a\n  WHERE v.height IS NOT NULL AND a.height IS NULL) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - demuxed M video 1 audio",
+      "output": "1 manifest - demuxed 1 video 1 audio",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video, r.audio FROM input(:'src') r\n  WHERE r.height = :h OR r.height IS NULL) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - demuxed M video 1 audio",
+      "output": "1 manifest - demuxed M video 1 audio",
+      "kind": "query",
+      "sql": "COPY (SELECT * FROM input(:'src') r) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4')"
+    },
+    {
+      "input": "1 manifest - demuxed M video 1 audio",
+      "output": "1 manifest - demuxed 1 video M audio",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video, r.audio FROM input(:'src') r\n  WHERE r.height = :h OR r.height IS NULL) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - demuxed M video 1 audio",
+      "output": "1 manifest - demuxed M video N audio",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video, r.audio FROM input(:'src') r\n  WHERE r.height = :h OR r.height IS NULL) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - demuxed M video 1 audio",
+      "output": "1 manifest - hybrid 1 video + audio 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT v.video[1] AS v, a.audio[1] AS a, v.height AS rung FROM input(:'src') v, input(:'src') a\n  WHERE v.height = :h AND a.height IS NULL),\n          aud AS (SELECT s.audio[1] AS t, 1000 + s.bandwidth AS rung FROM input(:'src') s\n  WHERE s.height IS NULL)\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - demuxed M video 1 audio",
+      "output": "1 manifest - hybrid M video + audio 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT v.video[1] AS v, a.audio[1] AS a, v.height AS rung FROM input(:'src') v, input(:'src') a\n  WHERE v.height = :h AND a.height IS NULL),\n          aud AS (SELECT s.audio[1] AS t, 1000 + s.bandwidth AS rung FROM input(:'src') s\n  WHERE s.height IS NULL)\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - demuxed M video 1 audio",
+      "output": "1 manifest - hybrid 1 video + audio M audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT v.video[1] AS v, a.audio[1] AS a, v.height AS rung FROM input(:'src') v, input(:'src') a\n  WHERE v.height = :h AND a.height IS NULL),\n          aud AS (SELECT s.audio[1] AS t, 1000 + s.bandwidth AS rung FROM input(:'src') s\n  WHERE s.height IS NULL)\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - demuxed M video 1 audio",
+      "output": "1 manifest - hybrid M video + audio N audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT v.video[1] AS v, a.audio[1] AS a, v.height AS rung FROM input(:'src') v, input(:'src') a\n  WHERE v.height = :h AND a.height IS NULL),\n          aud AS (SELECT s.audio[1] AS t, 1000 + s.bandwidth AS rung FROM input(:'src') s\n  WHERE s.height IS NULL)\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - demuxed 1 video M audio",
+      "output": "1 file 0 video track 0 audio track",
+      "kind": "n/a",
+      "sql": "n/a: a file with no tracks writes nothing"
+    },
+    {
+      "input": "1 manifest - demuxed 1 video M audio",
+      "output": "1 file 1 video track 0 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video[1] FROM input(:'src') r\n  WHERE r.height IS NOT NULL) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - demuxed 1 video M audio",
+      "output": "1 file 0 video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT r.audio[1] FROM input(:'src') r\n  WHERE r.height IS NULL AND r.name = :'audio') TO :'dest'"
+    },
+    {
+      "input": "1 manifest - demuxed 1 video M audio",
+      "output": "1 file M video track 0 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT array_agg(r.video[1]) FROM input(:'src') r\n  WHERE r.height IS NOT NULL) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - demuxed 1 video M audio",
+      "output": "1 file 0 video track M audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT array_agg(r.audio[1]) FROM input(:'src') r\n  WHERE r.height IS NULL) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - demuxed 1 video M audio",
+      "output": "1 file 1 video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT v.video[1], a.audio[1] FROM input(:'src') v, input(:'src') a\n  WHERE v.height IS NOT NULL AND a.height IS NULL AND a.name = :'audio') TO :'dest'"
+    },
+    {
+      "input": "1 manifest - demuxed 1 video M audio",
+      "output": "1 file 1 video track M audio track",
+      "kind": "query",
+      "sql": "COPY (WITH vs AS (SELECT r.video[1] AS v, 1 AS rung FROM input(:'src') r\n  WHERE r.height IS NOT NULL),\n          au AS (SELECT s.audio[1] AS a, 1000 + s.bandwidth AS rung FROM input(:'src') s\n  WHERE s.height IS NULL)\n  SELECT array_agg(vs.v), array_agg(au.a) FROM vs FULL JOIN au ON vs.rung = au.rung) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - demuxed 1 video M audio",
+      "output": "1 file M video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (WITH vs AS (SELECT r.video[1] AS v, r.height AS rung FROM input(:'src') r\n  WHERE r.height IS NOT NULL),\n          au AS (SELECT s.audio[1] AS a, 1000 + 0 AS rung FROM input(:'src') s\n  WHERE s.height IS NULL AND s.name = :'audio')\n  SELECT array_agg(vs.v), array_agg(au.a) FROM vs FULL JOIN au ON vs.rung = au.rung) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - demuxed 1 video M audio",
+      "output": "1 file M video track N audio track",
+      "kind": "query",
+      "sql": "COPY (WITH vs AS (SELECT r.video[1] AS v, r.height AS rung FROM input(:'src') r\n  WHERE r.height IS NOT NULL),\n          au AS (SELECT s.audio[1] AS a, 1000 + s.bandwidth AS rung FROM input(:'src') s\n  WHERE s.height IS NULL)\n  SELECT array_agg(vs.v), array_agg(au.a) FROM vs FULL JOIN au ON vs.rung = au.rung) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - demuxed 1 video M audio",
+      "output": "1 manifest 1 video",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video FROM input(:'src') r\n  WHERE r.height IS NOT NULL) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - demuxed 1 video M audio",
+      "output": "1 manifest 1 audio",
+      "kind": "query",
+      "sql": "COPY (SELECT r.audio FROM input(:'src') r\n  WHERE r.height IS NULL AND r.name = :'audio') TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - demuxed 1 video M audio",
+      "output": "1 manifest - muxed 1 video + audio",
+      "kind": "query",
+      "sql": "COPY (SELECT v.video[1], a.audio[1] FROM input(:'src') v, input(:'src') a\n  WHERE v.height IS NOT NULL AND a.height IS NULL AND a.name = :'audio') TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - demuxed 1 video M audio",
+      "output": "1 manifest - muxed M video + audio",
+      "kind": "query",
+      "sql": "COPY (SELECT v.video[1], a.audio[1] FROM input(:'src') v, input(:'src') a\n  WHERE v.height IS NOT NULL AND a.height IS NULL) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - demuxed 1 video M audio",
+      "output": "1 manifest - demuxed 1 video 1 audio",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video, r.audio FROM input(:'src') r\n  WHERE r.height IS NOT NULL OR (r.height IS NULL AND r.name = :'audio')) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - demuxed 1 video M audio",
+      "output": "1 manifest - demuxed M video 1 audio",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video, r.audio FROM input(:'src') r\n  WHERE r.height IS NOT NULL OR (r.height IS NULL AND r.name = :'audio')) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - demuxed 1 video M audio",
+      "output": "1 manifest - demuxed 1 video M audio",
+      "kind": "query",
+      "sql": "COPY (SELECT * FROM input(:'src') r) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4')"
+    },
+    {
+      "input": "1 manifest - demuxed 1 video M audio",
+      "output": "1 manifest - demuxed M video N audio",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video, r.audio FROM input(:'src') r\n  WHERE r.height IS NOT NULL OR (r.height IS NULL AND r.name = :'audio')) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - demuxed 1 video M audio",
+      "output": "1 manifest - hybrid 1 video + audio 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT v.video[1] AS v, a.audio[1] AS a, v.height AS rung FROM input(:'src') v, input(:'src') a\n  WHERE v.height IS NOT NULL AND a.height IS NULL AND a.name = :'audio'),\n          aud AS (SELECT s.audio[1] AS t, 1000 + s.bandwidth AS rung FROM input(:'src') s\n  WHERE s.height IS NULL AND s.name = :'audio')\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - demuxed 1 video M audio",
+      "output": "1 manifest - hybrid M video + audio 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT v.video[1] AS v, a.audio[1] AS a, v.height AS rung FROM input(:'src') v, input(:'src') a\n  WHERE v.height IS NOT NULL AND a.height IS NULL AND a.name = :'audio'),\n          aud AS (SELECT s.audio[1] AS t, 1000 + s.bandwidth AS rung FROM input(:'src') s\n  WHERE s.height IS NULL AND s.name = :'audio')\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - demuxed 1 video M audio",
+      "output": "1 manifest - hybrid 1 video + audio M audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT v.video[1] AS v, a.audio[1] AS a, v.height AS rung FROM input(:'src') v, input(:'src') a\n  WHERE v.height IS NOT NULL AND a.height IS NULL AND a.name = :'audio'),\n          aud AS (SELECT s.audio[1] AS t, 1000 + s.bandwidth AS rung FROM input(:'src') s\n  WHERE s.height IS NULL AND s.name = :'audio')\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - demuxed 1 video M audio",
+      "output": "1 manifest - hybrid M video + audio N audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT v.video[1] AS v, a.audio[1] AS a, v.height AS rung FROM input(:'src') v, input(:'src') a\n  WHERE v.height IS NOT NULL AND a.height IS NULL AND a.name = :'audio'),\n          aud AS (SELECT s.audio[1] AS t, 1000 + s.bandwidth AS rung FROM input(:'src') s\n  WHERE s.height IS NULL AND s.name = :'audio')\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - demuxed M video N audio",
+      "output": "1 file 0 video track 0 audio track",
+      "kind": "n/a",
+      "sql": "n/a: a file with no tracks writes nothing"
+    },
+    {
+      "input": "1 manifest - demuxed M video N audio",
+      "output": "1 file 1 video track 0 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video[1] FROM input(:'src') r\n  WHERE r.height = :h) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - demuxed M video N audio",
+      "output": "1 file 0 video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT r.audio[1] FROM input(:'src') r\n  WHERE r.height IS NULL AND r.name = :'audio') TO :'dest'"
+    },
+    {
+      "input": "1 manifest - demuxed M video N audio",
+      "output": "1 file M video track 0 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT array_agg(r.video[1]) FROM input(:'src') r\n  WHERE r.height IS NOT NULL) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - demuxed M video N audio",
+      "output": "1 file 0 video track M audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT array_agg(r.audio[1]) FROM input(:'src') r\n  WHERE r.height IS NULL) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - demuxed M video N audio",
+      "output": "1 file 1 video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT v.video[1], a.audio[1] FROM input(:'src') v, input(:'src') a\n  WHERE v.height = :h AND a.height IS NULL AND a.name = :'audio') TO :'dest'"
+    },
+    {
+      "input": "1 manifest - demuxed M video N audio",
+      "output": "1 file 1 video track M audio track",
+      "kind": "query",
+      "sql": "COPY (WITH vs AS (SELECT r.video[1] AS v, 1 AS rung FROM input(:'src') r\n  WHERE r.height = :h),\n          au AS (SELECT s.audio[1] AS a, 1000 + s.bandwidth AS rung FROM input(:'src') s\n  WHERE s.height IS NULL)\n  SELECT array_agg(vs.v), array_agg(au.a) FROM vs FULL JOIN au ON vs.rung = au.rung) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - demuxed M video N audio",
+      "output": "1 file M video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (WITH vs AS (SELECT r.video[1] AS v, r.height AS rung FROM input(:'src') r\n  WHERE r.height IS NOT NULL),\n          au AS (SELECT s.audio[1] AS a, 1000 + 0 AS rung FROM input(:'src') s\n  WHERE s.height IS NULL AND s.name = :'audio')\n  SELECT array_agg(vs.v), array_agg(au.a) FROM vs FULL JOIN au ON vs.rung = au.rung) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - demuxed M video N audio",
+      "output": "1 file M video track N audio track",
+      "kind": "query",
+      "sql": "COPY (WITH vs AS (SELECT r.video[1] AS v, r.height AS rung FROM input(:'src') r\n  WHERE r.height IS NOT NULL),\n          au AS (SELECT s.audio[1] AS a, 1000 + s.bandwidth AS rung FROM input(:'src') s\n  WHERE s.height IS NULL)\n  SELECT array_agg(vs.v), array_agg(au.a) FROM vs FULL JOIN au ON vs.rung = au.rung) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - demuxed M video N audio",
+      "output": "1 manifest 1 video",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video FROM input(:'src') r\n  WHERE r.height = :h) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - demuxed M video N audio",
+      "output": "1 manifest 1 audio",
+      "kind": "query",
+      "sql": "COPY (SELECT r.audio FROM input(:'src') r\n  WHERE r.height IS NULL AND r.name = :'audio') TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - demuxed M video N audio",
+      "output": "1 manifest - muxed 1 video + audio",
+      "kind": "query",
+      "sql": "COPY (SELECT v.video[1], a.audio[1] FROM input(:'src') v, input(:'src') a\n  WHERE v.height = :h AND a.height IS NULL AND a.name = :'audio') TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - demuxed M video N audio",
+      "output": "1 manifest - muxed M video + audio",
+      "kind": "query",
+      "sql": "COPY (SELECT v.video[1], a.audio[1] FROM input(:'src') v, input(:'src') a\n  WHERE v.height IS NOT NULL AND a.height IS NULL) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - demuxed M video N audio",
+      "output": "1 manifest - demuxed 1 video 1 audio",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video, r.audio FROM input(:'src') r\n  WHERE r.height = :h OR (r.height IS NULL AND r.name = :'audio')) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - demuxed M video N audio",
+      "output": "1 manifest - demuxed M video 1 audio",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video, r.audio FROM input(:'src') r\n  WHERE r.height = :h OR (r.height IS NULL AND r.name = :'audio')) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - demuxed M video N audio",
+      "output": "1 manifest - demuxed 1 video M audio",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video, r.audio FROM input(:'src') r\n  WHERE r.height = :h OR (r.height IS NULL AND r.name = :'audio')) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - demuxed M video N audio",
+      "output": "1 manifest - demuxed M video N audio",
+      "kind": "query",
+      "sql": "COPY (SELECT * FROM input(:'src') r) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4')"
+    },
+    {
+      "input": "1 manifest - demuxed M video N audio",
+      "output": "1 manifest - hybrid 1 video + audio 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT v.video[1] AS v, a.audio[1] AS a, v.height AS rung FROM input(:'src') v, input(:'src') a\n  WHERE v.height = :h AND a.height IS NULL AND a.name = :'audio'),\n          aud AS (SELECT s.audio[1] AS t, 1000 + s.bandwidth AS rung FROM input(:'src') s\n  WHERE s.height IS NULL AND s.name = :'audio')\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - demuxed M video N audio",
+      "output": "1 manifest - hybrid M video + audio 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT v.video[1] AS v, a.audio[1] AS a, v.height AS rung FROM input(:'src') v, input(:'src') a\n  WHERE v.height = :h AND a.height IS NULL AND a.name = :'audio'),\n          aud AS (SELECT s.audio[1] AS t, 1000 + s.bandwidth AS rung FROM input(:'src') s\n  WHERE s.height IS NULL AND s.name = :'audio')\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - demuxed M video N audio",
+      "output": "1 manifest - hybrid 1 video + audio M audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT v.video[1] AS v, a.audio[1] AS a, v.height AS rung FROM input(:'src') v, input(:'src') a\n  WHERE v.height = :h AND a.height IS NULL AND a.name = :'audio'),\n          aud AS (SELECT s.audio[1] AS t, 1000 + s.bandwidth AS rung FROM input(:'src') s\n  WHERE s.height IS NULL AND s.name = :'audio')\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - demuxed M video N audio",
+      "output": "1 manifest - hybrid M video + audio N audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT v.video[1] AS v, a.audio[1] AS a, v.height AS rung FROM input(:'src') v, input(:'src') a\n  WHERE v.height = :h AND a.height IS NULL AND a.name = :'audio'),\n          aud AS (SELECT s.audio[1] AS t, 1000 + s.bandwidth AS rung FROM input(:'src') s\n  WHERE s.height IS NULL AND s.name = :'audio')\n  SELECT vid.v, COALESCE(vid.a, aud.t) FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - hybrid 1 video + audio 1 audio",
+      "output": "1 file 0 video track 0 audio track",
+      "kind": "n/a",
+      "sql": "n/a: a file with no tracks writes nothing"
+    },
+    {
+      "input": "1 manifest - hybrid 1 video + audio 1 audio",
+      "output": "1 file 1 video track 0 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video[1] FROM input(:'src') r\n  WHERE r.height IS NOT NULL) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - hybrid 1 video + audio 1 audio",
+      "output": "1 file 0 video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT r.audio[1] FROM input(:'src') r\n  WHERE r.height IS NOT NULL) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - hybrid 1 video + audio 1 audio",
+      "output": "1 file M video track 0 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT array_agg(r.video[1]) FROM input(:'src') r\n  WHERE r.height IS NOT NULL) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - hybrid 1 video + audio 1 audio",
+      "output": "1 file 0 video track M audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT array_agg(r.audio[1]) FROM input(:'src') r\n  WHERE r.height IS NULL) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - hybrid 1 video + audio 1 audio",
+      "output": "1 file 1 video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video[1], r.audio[1] FROM input(:'src') r\n  WHERE r.height IS NOT NULL) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - hybrid 1 video + audio 1 audio",
+      "output": "1 file 1 video track M audio track",
+      "kind": "query",
+      "sql": "COPY (WITH vs AS (SELECT r.video[1] AS v, 1 AS rung FROM input(:'src') r\n  WHERE r.height IS NOT NULL),\n          au AS (SELECT s.audio[1] AS a, 1000 + s.bandwidth AS rung FROM input(:'src') s\n  WHERE s.height IS NULL)\n  SELECT array_agg(vs.v), array_agg(au.a) FROM vs FULL JOIN au ON vs.rung = au.rung) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - hybrid 1 video + audio 1 audio",
+      "output": "1 file M video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (WITH vs AS (SELECT r.video[1] AS v, r.height AS rung FROM input(:'src') r\n  WHERE r.height IS NOT NULL),\n          au AS (SELECT s.audio[1] AS a, 1000 + 0 AS rung FROM input(:'src') s\n  WHERE s.height IS NOT NULL)\n  SELECT array_agg(vs.v), array_agg(au.a) FROM vs FULL JOIN au ON vs.rung = au.rung) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - hybrid 1 video + audio 1 audio",
+      "output": "1 file M video track N audio track",
+      "kind": "query",
+      "sql": "COPY (WITH vs AS (SELECT r.video[1] AS v, r.height AS rung FROM input(:'src') r\n  WHERE r.height IS NOT NULL),\n          au AS (SELECT s.audio[1] AS a, 1000 + s.bandwidth AS rung FROM input(:'src') s\n  WHERE s.height IS NULL)\n  SELECT array_agg(vs.v), array_agg(au.a) FROM vs FULL JOIN au ON vs.rung = au.rung) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - hybrid 1 video + audio 1 audio",
+      "output": "1 manifest 1 video",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video FROM input(:'src') r\n  WHERE r.height IS NOT NULL) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - hybrid 1 video + audio 1 audio",
+      "output": "1 manifest 1 audio",
+      "kind": "query",
+      "sql": "COPY (SELECT r.audio FROM input(:'src') r\n  WHERE r.height IS NOT NULL) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - hybrid 1 video + audio 1 audio",
+      "output": "1 manifest - muxed 1 video + audio",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video, r.audio FROM input(:'src') r\n  WHERE r.height IS NOT NULL) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - hybrid 1 video + audio 1 audio",
+      "output": "1 manifest - muxed M video + audio",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video, r.audio FROM input(:'src') r\n  WHERE r.height IS NOT NULL) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - hybrid 1 video + audio 1 audio",
+      "output": "1 manifest - demuxed 1 video 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT r.video[1] AS v, r.height AS rung FROM input(:'src') r\n  WHERE r.height IS NOT NULL),\n          aud AS (SELECT s.audio[1] AS t, 1000 + s.bandwidth AS rung FROM input(:'src') s\n  WHERE s.height IS NOT NULL)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - hybrid 1 video + audio 1 audio",
+      "output": "1 manifest - demuxed M video 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT r.video[1] AS v, r.height AS rung FROM input(:'src') r\n  WHERE r.height IS NOT NULL),\n          aud AS (SELECT s.audio[1] AS t, 1000 + s.bandwidth AS rung FROM input(:'src') s\n  WHERE s.height IS NOT NULL)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - hybrid 1 video + audio 1 audio",
+      "output": "1 manifest - demuxed 1 video M audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT r.video[1] AS v, r.height AS rung FROM input(:'src') r\n  WHERE r.height IS NOT NULL),\n          aud AS (SELECT s.audio[1] AS t, 1000 + s.bandwidth AS rung FROM input(:'src') s\n  WHERE s.height IS NOT NULL)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - hybrid 1 video + audio 1 audio",
+      "output": "1 manifest - demuxed M video N audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT r.video[1] AS v, r.height AS rung FROM input(:'src') r\n  WHERE r.height IS NOT NULL),\n          aud AS (SELECT s.audio[1] AS t, 1000 + s.bandwidth AS rung FROM input(:'src') s\n  WHERE s.height IS NOT NULL)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - hybrid 1 video + audio 1 audio",
+      "output": "1 manifest - hybrid 1 video + audio 1 audio",
+      "kind": "query",
+      "sql": "COPY (SELECT * FROM input(:'src') r) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4')"
+    },
+    {
+      "input": "1 manifest - hybrid 1 video + audio 1 audio",
+      "output": "1 manifest - hybrid M video + audio 1 audio",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video, r.audio FROM input(:'src') r\n  WHERE r.height IS NOT NULL OR r.height IS NULL) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - hybrid 1 video + audio 1 audio",
+      "output": "1 manifest - hybrid 1 video + audio M audio",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video, r.audio FROM input(:'src') r\n  WHERE r.height IS NOT NULL OR r.height IS NULL) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - hybrid 1 video + audio 1 audio",
+      "output": "1 manifest - hybrid M video + audio N audio",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video, r.audio FROM input(:'src') r\n  WHERE r.height IS NOT NULL OR r.height IS NULL) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - hybrid M video + audio 1 audio",
+      "output": "1 file 0 video track 0 audio track",
+      "kind": "n/a",
+      "sql": "n/a: a file with no tracks writes nothing"
+    },
+    {
+      "input": "1 manifest - hybrid M video + audio 1 audio",
+      "output": "1 file 1 video track 0 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video[1] FROM input(:'src') r\n  WHERE r.height = :h) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - hybrid M video + audio 1 audio",
+      "output": "1 file 0 video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT r.audio[1] FROM input(:'src') r\n  WHERE r.height = :h) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - hybrid M video + audio 1 audio",
+      "output": "1 file M video track 0 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT array_agg(r.video[1]) FROM input(:'src') r\n  WHERE r.height IS NOT NULL) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - hybrid M video + audio 1 audio",
+      "output": "1 file 0 video track M audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT array_agg(r.audio[1]) FROM input(:'src') r\n  WHERE r.height IS NULL) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - hybrid M video + audio 1 audio",
+      "output": "1 file 1 video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video[1], r.audio[1] FROM input(:'src') r\n  WHERE r.height = :h) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - hybrid M video + audio 1 audio",
+      "output": "1 file 1 video track M audio track",
+      "kind": "query",
+      "sql": "COPY (WITH vs AS (SELECT r.video[1] AS v, 1 AS rung FROM input(:'src') r\n  WHERE r.height = :h),\n          au AS (SELECT s.audio[1] AS a, 1000 + s.bandwidth AS rung FROM input(:'src') s\n  WHERE s.height IS NULL)\n  SELECT array_agg(vs.v), array_agg(au.a) FROM vs FULL JOIN au ON vs.rung = au.rung) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - hybrid M video + audio 1 audio",
+      "output": "1 file M video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (WITH vs AS (SELECT r.video[1] AS v, r.height AS rung FROM input(:'src') r\n  WHERE r.height IS NOT NULL),\n          au AS (SELECT s.audio[1] AS a, 1000 + 0 AS rung FROM input(:'src') s\n  WHERE s.height = :h)\n  SELECT array_agg(vs.v), array_agg(au.a) FROM vs FULL JOIN au ON vs.rung = au.rung) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - hybrid M video + audio 1 audio",
+      "output": "1 file M video track N audio track",
+      "kind": "query",
+      "sql": "COPY (WITH vs AS (SELECT r.video[1] AS v, r.height AS rung FROM input(:'src') r\n  WHERE r.height IS NOT NULL),\n          au AS (SELECT s.audio[1] AS a, 1000 + s.bandwidth AS rung FROM input(:'src') s\n  WHERE s.height IS NULL)\n  SELECT array_agg(vs.v), array_agg(au.a) FROM vs FULL JOIN au ON vs.rung = au.rung) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - hybrid M video + audio 1 audio",
+      "output": "1 manifest 1 video",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video FROM input(:'src') r\n  WHERE r.height = :h) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - hybrid M video + audio 1 audio",
+      "output": "1 manifest 1 audio",
+      "kind": "query",
+      "sql": "COPY (SELECT r.audio FROM input(:'src') r\n  WHERE r.height = :h) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - hybrid M video + audio 1 audio",
+      "output": "1 manifest - muxed 1 video + audio",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video, r.audio FROM input(:'src') r\n  WHERE r.height = :h) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - hybrid M video + audio 1 audio",
+      "output": "1 manifest - muxed M video + audio",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video, r.audio FROM input(:'src') r\n  WHERE r.height IS NOT NULL) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - hybrid M video + audio 1 audio",
+      "output": "1 manifest - demuxed 1 video 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT r.video[1] AS v, r.height AS rung FROM input(:'src') r\n  WHERE r.height IS NOT NULL),\n          aud AS (SELECT s.audio[1] AS t, 1000 + s.bandwidth AS rung FROM input(:'src') s\n  WHERE s.height = :h)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - hybrid M video + audio 1 audio",
+      "output": "1 manifest - demuxed M video 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT r.video[1] AS v, r.height AS rung FROM input(:'src') r\n  WHERE r.height IS NOT NULL),\n          aud AS (SELECT s.audio[1] AS t, 1000 + s.bandwidth AS rung FROM input(:'src') s\n  WHERE s.height = :h)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - hybrid M video + audio 1 audio",
+      "output": "1 manifest - demuxed 1 video M audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT r.video[1] AS v, r.height AS rung FROM input(:'src') r\n  WHERE r.height IS NOT NULL),\n          aud AS (SELECT s.audio[1] AS t, 1000 + s.bandwidth AS rung FROM input(:'src') s\n  WHERE s.height IS NOT NULL)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - hybrid M video + audio 1 audio",
+      "output": "1 manifest - demuxed M video N audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT r.video[1] AS v, r.height AS rung FROM input(:'src') r\n  WHERE r.height IS NOT NULL),\n          aud AS (SELECT s.audio[1] AS t, 1000 + s.bandwidth AS rung FROM input(:'src') s\n  WHERE s.height IS NOT NULL)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - hybrid M video + audio 1 audio",
+      "output": "1 manifest - hybrid 1 video + audio 1 audio",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video, r.audio FROM input(:'src') r\n  WHERE r.height = :h OR r.height IS NULL) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - hybrid M video + audio 1 audio",
+      "output": "1 manifest - hybrid M video + audio 1 audio",
+      "kind": "query",
+      "sql": "COPY (SELECT * FROM input(:'src') r) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4')"
+    },
+    {
+      "input": "1 manifest - hybrid M video + audio 1 audio",
+      "output": "1 manifest - hybrid 1 video + audio M audio",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video, r.audio FROM input(:'src') r\n  WHERE r.height = :h OR r.height IS NULL) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - hybrid M video + audio 1 audio",
+      "output": "1 manifest - hybrid M video + audio N audio",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video, r.audio FROM input(:'src') r\n  WHERE r.height = :h OR r.height IS NULL) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - hybrid 1 video + audio M audio",
+      "output": "1 file 0 video track 0 audio track",
+      "kind": "n/a",
+      "sql": "n/a: a file with no tracks writes nothing"
+    },
+    {
+      "input": "1 manifest - hybrid 1 video + audio M audio",
+      "output": "1 file 1 video track 0 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video[1] FROM input(:'src') r\n  WHERE r.height IS NOT NULL) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - hybrid 1 video + audio M audio",
+      "output": "1 file 0 video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT r.audio[1] FROM input(:'src') r\n  WHERE r.height IS NOT NULL) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - hybrid 1 video + audio M audio",
+      "output": "1 file M video track 0 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT array_agg(r.video[1]) FROM input(:'src') r\n  WHERE r.height IS NOT NULL) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - hybrid 1 video + audio M audio",
+      "output": "1 file 0 video track M audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT array_agg(r.audio[1]) FROM input(:'src') r\n  WHERE r.height IS NULL) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - hybrid 1 video + audio M audio",
+      "output": "1 file 1 video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video[1], r.audio[1] FROM input(:'src') r\n  WHERE r.height IS NOT NULL) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - hybrid 1 video + audio M audio",
+      "output": "1 file 1 video track M audio track",
+      "kind": "query",
+      "sql": "COPY (WITH vs AS (SELECT r.video[1] AS v, 1 AS rung FROM input(:'src') r\n  WHERE r.height IS NOT NULL),\n          au AS (SELECT s.audio[1] AS a, 1000 + s.bandwidth AS rung FROM input(:'src') s\n  WHERE s.height IS NULL)\n  SELECT array_agg(vs.v), array_agg(au.a) FROM vs FULL JOIN au ON vs.rung = au.rung) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - hybrid 1 video + audio M audio",
+      "output": "1 file M video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (WITH vs AS (SELECT r.video[1] AS v, r.height AS rung FROM input(:'src') r\n  WHERE r.height IS NOT NULL),\n          au AS (SELECT s.audio[1] AS a, 1000 + 0 AS rung FROM input(:'src') s\n  WHERE s.height IS NOT NULL)\n  SELECT array_agg(vs.v), array_agg(au.a) FROM vs FULL JOIN au ON vs.rung = au.rung) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - hybrid 1 video + audio M audio",
+      "output": "1 file M video track N audio track",
+      "kind": "query",
+      "sql": "COPY (WITH vs AS (SELECT r.video[1] AS v, r.height AS rung FROM input(:'src') r\n  WHERE r.height IS NOT NULL),\n          au AS (SELECT s.audio[1] AS a, 1000 + s.bandwidth AS rung FROM input(:'src') s\n  WHERE s.height IS NULL)\n  SELECT array_agg(vs.v), array_agg(au.a) FROM vs FULL JOIN au ON vs.rung = au.rung) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - hybrid 1 video + audio M audio",
+      "output": "1 manifest 1 video",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video FROM input(:'src') r\n  WHERE r.height IS NOT NULL) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - hybrid 1 video + audio M audio",
+      "output": "1 manifest 1 audio",
+      "kind": "query",
+      "sql": "COPY (SELECT r.audio FROM input(:'src') r\n  WHERE r.height IS NOT NULL) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - hybrid 1 video + audio M audio",
+      "output": "1 manifest - muxed 1 video + audio",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video, r.audio FROM input(:'src') r\n  WHERE r.height IS NOT NULL) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - hybrid 1 video + audio M audio",
+      "output": "1 manifest - muxed M video + audio",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video, r.audio FROM input(:'src') r\n  WHERE r.height IS NOT NULL) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - hybrid 1 video + audio M audio",
+      "output": "1 manifest - demuxed 1 video 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT r.video[1] AS v, r.height AS rung FROM input(:'src') r\n  WHERE r.height IS NOT NULL),\n          aud AS (SELECT s.audio[1] AS t, 1000 + s.bandwidth AS rung FROM input(:'src') s\n  WHERE s.height IS NOT NULL)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - hybrid 1 video + audio M audio",
+      "output": "1 manifest - demuxed M video 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT r.video[1] AS v, r.height AS rung FROM input(:'src') r\n  WHERE r.height IS NOT NULL),\n          aud AS (SELECT s.audio[1] AS t, 1000 + s.bandwidth AS rung FROM input(:'src') s\n  WHERE s.height IS NOT NULL)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - hybrid 1 video + audio M audio",
+      "output": "1 manifest - demuxed 1 video M audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT r.video[1] AS v, r.height AS rung FROM input(:'src') r\n  WHERE r.height IS NOT NULL),\n          aud AS (SELECT s.audio[1] AS t, 1000 + s.bandwidth AS rung FROM input(:'src') s\n  WHERE s.height IS NOT NULL)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - hybrid 1 video + audio M audio",
+      "output": "1 manifest - demuxed M video N audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT r.video[1] AS v, r.height AS rung FROM input(:'src') r\n  WHERE r.height IS NOT NULL),\n          aud AS (SELECT s.audio[1] AS t, 1000 + s.bandwidth AS rung FROM input(:'src') s\n  WHERE s.height IS NOT NULL)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - hybrid 1 video + audio M audio",
+      "output": "1 manifest - hybrid 1 video + audio 1 audio",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video, r.audio FROM input(:'src') r\n  WHERE r.height IS NOT NULL OR (r.height IS NULL AND r.name = :'audio')) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - hybrid 1 video + audio M audio",
+      "output": "1 manifest - hybrid M video + audio 1 audio",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video, r.audio FROM input(:'src') r\n  WHERE r.height IS NOT NULL OR (r.height IS NULL AND r.name = :'audio')) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - hybrid 1 video + audio M audio",
+      "output": "1 manifest - hybrid 1 video + audio M audio",
+      "kind": "query",
+      "sql": "COPY (SELECT * FROM input(:'src') r) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4')"
+    },
+    {
+      "input": "1 manifest - hybrid 1 video + audio M audio",
+      "output": "1 manifest - hybrid M video + audio N audio",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video, r.audio FROM input(:'src') r\n  WHERE r.height IS NOT NULL OR (r.height IS NULL AND r.name = :'audio')) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - hybrid M video + audio N audio",
+      "output": "1 file 0 video track 0 audio track",
+      "kind": "n/a",
+      "sql": "n/a: a file with no tracks writes nothing"
+    },
+    {
+      "input": "1 manifest - hybrid M video + audio N audio",
+      "output": "1 file 1 video track 0 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video[1] FROM input(:'src') r\n  WHERE r.height = :h) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - hybrid M video + audio N audio",
+      "output": "1 file 0 video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT r.audio[1] FROM input(:'src') r\n  WHERE r.height = :h) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - hybrid M video + audio N audio",
+      "output": "1 file M video track 0 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT array_agg(r.video[1]) FROM input(:'src') r\n  WHERE r.height IS NOT NULL) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - hybrid M video + audio N audio",
+      "output": "1 file 0 video track M audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT array_agg(r.audio[1]) FROM input(:'src') r\n  WHERE r.height IS NULL) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - hybrid M video + audio N audio",
+      "output": "1 file 1 video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video[1], r.audio[1] FROM input(:'src') r\n  WHERE r.height = :h) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - hybrid M video + audio N audio",
+      "output": "1 file 1 video track M audio track",
+      "kind": "query",
+      "sql": "COPY (WITH vs AS (SELECT r.video[1] AS v, 1 AS rung FROM input(:'src') r\n  WHERE r.height = :h),\n          au AS (SELECT s.audio[1] AS a, 1000 + s.bandwidth AS rung FROM input(:'src') s\n  WHERE s.height IS NULL)\n  SELECT array_agg(vs.v), array_agg(au.a) FROM vs FULL JOIN au ON vs.rung = au.rung) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - hybrid M video + audio N audio",
+      "output": "1 file M video track 1 audio track",
+      "kind": "query",
+      "sql": "COPY (WITH vs AS (SELECT r.video[1] AS v, r.height AS rung FROM input(:'src') r\n  WHERE r.height IS NOT NULL),\n          au AS (SELECT s.audio[1] AS a, 1000 + 0 AS rung FROM input(:'src') s\n  WHERE s.height = :h)\n  SELECT array_agg(vs.v), array_agg(au.a) FROM vs FULL JOIN au ON vs.rung = au.rung) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - hybrid M video + audio N audio",
+      "output": "1 file M video track N audio track",
+      "kind": "query",
+      "sql": "COPY (WITH vs AS (SELECT r.video[1] AS v, r.height AS rung FROM input(:'src') r\n  WHERE r.height IS NOT NULL),\n          au AS (SELECT s.audio[1] AS a, 1000 + s.bandwidth AS rung FROM input(:'src') s\n  WHERE s.height IS NULL)\n  SELECT array_agg(vs.v), array_agg(au.a) FROM vs FULL JOIN au ON vs.rung = au.rung) TO :'dest'"
+    },
+    {
+      "input": "1 manifest - hybrid M video + audio N audio",
+      "output": "1 manifest 1 video",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video FROM input(:'src') r\n  WHERE r.height = :h) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - hybrid M video + audio N audio",
+      "output": "1 manifest 1 audio",
+      "kind": "query",
+      "sql": "COPY (SELECT r.audio FROM input(:'src') r\n  WHERE r.height = :h) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - hybrid M video + audio N audio",
+      "output": "1 manifest - muxed 1 video + audio",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video, r.audio FROM input(:'src') r\n  WHERE r.height = :h) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - hybrid M video + audio N audio",
+      "output": "1 manifest - muxed M video + audio",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video, r.audio FROM input(:'src') r\n  WHERE r.height IS NOT NULL) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - hybrid M video + audio N audio",
+      "output": "1 manifest - demuxed 1 video 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT r.video[1] AS v, r.height AS rung FROM input(:'src') r\n  WHERE r.height IS NOT NULL),\n          aud AS (SELECT s.audio[1] AS t, 1000 + s.bandwidth AS rung FROM input(:'src') s\n  WHERE s.height = :h)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - hybrid M video + audio N audio",
+      "output": "1 manifest - demuxed M video 1 audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT r.video[1] AS v, r.height AS rung FROM input(:'src') r\n  WHERE r.height IS NOT NULL),\n          aud AS (SELECT s.audio[1] AS t, 1000 + s.bandwidth AS rung FROM input(:'src') s\n  WHERE s.height = :h)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - hybrid M video + audio N audio",
+      "output": "1 manifest - demuxed 1 video M audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT r.video[1] AS v, r.height AS rung FROM input(:'src') r\n  WHERE r.height IS NOT NULL),\n          aud AS (SELECT s.audio[1] AS t, 1000 + s.bandwidth AS rung FROM input(:'src') s\n  WHERE s.height IS NOT NULL)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - hybrid M video + audio N audio",
+      "output": "1 manifest - demuxed M video N audio",
+      "kind": "query",
+      "sql": "COPY (WITH vid AS (SELECT r.video[1] AS v, r.height AS rung FROM input(:'src') r\n  WHERE r.height IS NOT NULL),\n          aud AS (SELECT s.audio[1] AS t, 1000 + s.bandwidth AS rung FROM input(:'src') s\n  WHERE s.height IS NOT NULL)\n  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - hybrid M video + audio N audio",
+      "output": "1 manifest - hybrid 1 video + audio 1 audio",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video, r.audio FROM input(:'src') r\n  WHERE r.height = :h OR (r.height IS NULL AND r.name = :'audio')) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - hybrid M video + audio N audio",
+      "output": "1 manifest - hybrid M video + audio 1 audio",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video, r.audio FROM input(:'src') r\n  WHERE r.height = :h OR (r.height IS NULL AND r.name = :'audio')) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - hybrid M video + audio N audio",
+      "output": "1 manifest - hybrid 1 video + audio M audio",
+      "kind": "query",
+      "sql": "COPY (SELECT r.video, r.audio FROM input(:'src') r\n  WHERE r.height = :h OR (r.height IS NULL AND r.name = :'audio')) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4', video_codec 'libx264', audio_codec 'aac')"
+    },
+    {
+      "input": "1 manifest - hybrid M video + audio N audio",
+      "output": "1 manifest - hybrid M video + audio N audio",
+      "kind": "query",
+      "sql": "COPY (SELECT * FROM input(:'src') r) TO :'dest'\n  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', hls_segment_type 'fmp4')"
+    }
+  ]
+}

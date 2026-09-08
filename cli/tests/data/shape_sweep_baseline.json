@@ -1,0 +1,2411 @@
+{
+  "about": "One row per cell of tests/data/shape_matrix.json: whether the compiler took the query pinned there, and the whole typed error where it did not. The count of refused rows may only go down; see tests/test_shape_sweep.py.",
+  "cells": {
+    "00->00": {
+      "input": "1 file 0 video track 0 audio track",
+      "output": "1 file 0 video track 0 audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: ffmpeg writes no container with no streams in it"
+    },
+    "00->01": {
+      "input": "1 file 0 video track 0 audio track",
+      "output": "1 file 1 video track 0 audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: ffmpeg writes no container with no streams in it"
+    },
+    "00->02": {
+      "input": "1 file 0 video track 0 audio track",
+      "output": "1 file 0 video track 1 audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: ffmpeg writes no container with no streams in it"
+    },
+    "00->03": {
+      "input": "1 file 0 video track 0 audio track",
+      "output": "1 file M video track 0 audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: ffmpeg writes no container with no streams in it"
+    },
+    "00->04": {
+      "input": "1 file 0 video track 0 audio track",
+      "output": "1 file 0 video track M audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: ffmpeg writes no container with no streams in it"
+    },
+    "00->05": {
+      "input": "1 file 0 video track 0 audio track",
+      "output": "1 file 1 video track 1 audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: ffmpeg writes no container with no streams in it"
+    },
+    "00->06": {
+      "input": "1 file 0 video track 0 audio track",
+      "output": "1 file 1 video track M audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: ffmpeg writes no container with no streams in it"
+    },
+    "00->07": {
+      "input": "1 file 0 video track 0 audio track",
+      "output": "1 file M video track 1 audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: ffmpeg writes no container with no streams in it"
+    },
+    "00->08": {
+      "input": "1 file 0 video track 0 audio track",
+      "output": "1 file M video track N audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: ffmpeg writes no container with no streams in it"
+    },
+    "00->09": {
+      "input": "1 file 0 video track 0 audio track",
+      "output": "1 manifest 1 video",
+      "verdict": "unrun",
+      "why": "nothing stands for it: ffmpeg writes no container with no streams in it"
+    },
+    "00->10": {
+      "input": "1 file 0 video track 0 audio track",
+      "output": "1 manifest 1 audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: ffmpeg writes no container with no streams in it"
+    },
+    "00->11": {
+      "input": "1 file 0 video track 0 audio track",
+      "output": "1 manifest - muxed 1 video + audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: ffmpeg writes no container with no streams in it"
+    },
+    "00->12": {
+      "input": "1 file 0 video track 0 audio track",
+      "output": "1 manifest - muxed M video + audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: ffmpeg writes no container with no streams in it"
+    },
+    "00->13": {
+      "input": "1 file 0 video track 0 audio track",
+      "output": "1 manifest - demuxed 1 video 1 audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: ffmpeg writes no container with no streams in it"
+    },
+    "00->14": {
+      "input": "1 file 0 video track 0 audio track",
+      "output": "1 manifest - demuxed M video 1 audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: ffmpeg writes no container with no streams in it"
+    },
+    "00->15": {
+      "input": "1 file 0 video track 0 audio track",
+      "output": "1 manifest - demuxed 1 video M audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: ffmpeg writes no container with no streams in it"
+    },
+    "00->16": {
+      "input": "1 file 0 video track 0 audio track",
+      "output": "1 manifest - demuxed M video N audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: ffmpeg writes no container with no streams in it"
+    },
+    "00->17": {
+      "input": "1 file 0 video track 0 audio track",
+      "output": "1 manifest - hybrid 1 video + audio 1 audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: ffmpeg writes no container with no streams in it"
+    },
+    "00->18": {
+      "input": "1 file 0 video track 0 audio track",
+      "output": "1 manifest - hybrid M video + audio 1 audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: ffmpeg writes no container with no streams in it"
+    },
+    "00->19": {
+      "input": "1 file 0 video track 0 audio track",
+      "output": "1 manifest - hybrid 1 video + audio M audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: ffmpeg writes no container with no streams in it"
+    },
+    "00->20": {
+      "input": "1 file 0 video track 0 audio track",
+      "output": "1 manifest - hybrid M video + audio N audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: ffmpeg writes no container with no streams in it"
+    },
+    "01->00": {
+      "input": "1 file 1 video track 0 audio track",
+      "output": "1 file 0 video track 0 audio track",
+      "verdict": "unrun",
+      "why": "n/a: a file with no tracks writes nothing"
+    },
+    "01->01": {
+      "input": "1 file 1 video track 0 audio track",
+      "output": "1 file 1 video track 0 audio track",
+      "verdict": "compiled"
+    },
+    "01->02": {
+      "input": "1 file 1 video track 0 audio track",
+      "output": "1 file 0 video track 1 audio track",
+      "verdict": "compiled"
+    },
+    "01->03": {
+      "input": "1 file 1 video track 0 audio track",
+      "output": "1 file M video track 0 audio track",
+      "verdict": "compiled"
+    },
+    "01->04": {
+      "input": "1 file 1 video track 0 audio track",
+      "output": "1 file 0 video track M audio track",
+      "verdict": "compiled"
+    },
+    "01->05": {
+      "input": "1 file 1 video track 0 audio track",
+      "output": "1 file 1 video track 1 audio track",
+      "verdict": "compiled"
+    },
+    "01->06": {
+      "input": "1 file 1 video track 0 audio track",
+      "output": "1 file 1 video track M audio track",
+      "verdict": "compiled"
+    },
+    "01->07": {
+      "input": "1 file 1 video track 0 audio track",
+      "output": "1 file M video track 1 audio track",
+      "verdict": "compiled"
+    },
+    "01->08": {
+      "input": "1 file 1 video track 0 audio track",
+      "output": "1 file M video track N audio track",
+      "verdict": "compiled"
+    },
+    "01->09": {
+      "input": "1 file 1 video track 0 audio track",
+      "output": "1 manifest 1 video",
+      "verdict": "compiled"
+    },
+    "01->10": {
+      "input": "1 file 1 video track 0 audio track",
+      "output": "1 manifest 1 audio",
+      "verdict": "compiled"
+    },
+    "01->11": {
+      "input": "1 file 1 video track 0 audio track",
+      "output": "1 manifest - muxed 1 video + audio",
+      "verdict": "compiled"
+    },
+    "01->12": {
+      "input": "1 file 1 video track 0 audio track",
+      "output": "1 manifest - muxed M video + audio",
+      "verdict": "compiled"
+    },
+    "01->13": {
+      "input": "1 file 1 video track 0 audio track",
+      "output": "1 manifest - demuxed 1 video 1 audio",
+      "verdict": "compiled"
+    },
+    "01->14": {
+      "input": "1 file 1 video track 0 audio track",
+      "output": "1 manifest - demuxed M video 1 audio",
+      "verdict": "compiled"
+    },
+    "01->15": {
+      "input": "1 file 1 video track 0 audio track",
+      "output": "1 manifest - demuxed 1 video M audio",
+      "verdict": "compiled"
+    },
+    "01->16": {
+      "input": "1 file 1 video track 0 audio track",
+      "output": "1 manifest - demuxed M video N audio",
+      "verdict": "compiled"
+    },
+    "01->17": {
+      "input": "1 file 1 video track 0 audio track",
+      "output": "1 manifest - hybrid 1 video + audio 1 audio",
+      "verdict": "compiled"
+    },
+    "01->18": {
+      "input": "1 file 1 video track 0 audio track",
+      "output": "1 manifest - hybrid M video + audio 1 audio",
+      "verdict": "compiled"
+    },
+    "01->19": {
+      "input": "1 file 1 video track 0 audio track",
+      "output": "1 manifest - hybrid 1 video + audio M audio",
+      "verdict": "compiled"
+    },
+    "01->20": {
+      "input": "1 file 1 video track 0 audio track",
+      "output": "1 manifest - hybrid M video + audio N audio",
+      "verdict": "compiled"
+    },
+    "02->00": {
+      "input": "1 file 0 video track 1 audio track",
+      "output": "1 file 0 video track 0 audio track",
+      "verdict": "unrun",
+      "why": "n/a: a file with no tracks writes nothing"
+    },
+    "02->01": {
+      "input": "1 file 0 video track 1 audio track",
+      "output": "1 file 1 video track 0 audio track",
+      "verdict": "compiled"
+    },
+    "02->02": {
+      "input": "1 file 0 video track 1 audio track",
+      "output": "1 file 0 video track 1 audio track",
+      "verdict": "compiled"
+    },
+    "02->03": {
+      "input": "1 file 0 video track 1 audio track",
+      "output": "1 file M video track 0 audio track",
+      "verdict": "compiled"
+    },
+    "02->04": {
+      "input": "1 file 0 video track 1 audio track",
+      "output": "1 file 0 video track M audio track",
+      "verdict": "compiled"
+    },
+    "02->05": {
+      "input": "1 file 0 video track 1 audio track",
+      "output": "1 file 1 video track 1 audio track",
+      "verdict": "compiled"
+    },
+    "02->06": {
+      "input": "1 file 0 video track 1 audio track",
+      "output": "1 file 1 video track M audio track",
+      "verdict": "compiled"
+    },
+    "02->07": {
+      "input": "1 file 0 video track 1 audio track",
+      "output": "1 file M video track 1 audio track",
+      "verdict": "compiled"
+    },
+    "02->08": {
+      "input": "1 file 0 video track 1 audio track",
+      "output": "1 file M video track N audio track",
+      "verdict": "compiled"
+    },
+    "02->09": {
+      "input": "1 file 0 video track 1 audio track",
+      "output": "1 manifest 1 video",
+      "verdict": "compiled"
+    },
+    "02->10": {
+      "input": "1 file 0 video track 1 audio track",
+      "output": "1 manifest 1 audio",
+      "verdict": "compiled"
+    },
+    "02->11": {
+      "input": "1 file 0 video track 1 audio track",
+      "output": "1 manifest - muxed 1 video + audio",
+      "verdict": "compiled"
+    },
+    "02->12": {
+      "input": "1 file 0 video track 1 audio track",
+      "output": "1 manifest - muxed M video + audio",
+      "verdict": "compiled"
+    },
+    "02->13": {
+      "input": "1 file 0 video track 1 audio track",
+      "output": "1 manifest - demuxed 1 video 1 audio",
+      "verdict": "compiled"
+    },
+    "02->14": {
+      "input": "1 file 0 video track 1 audio track",
+      "output": "1 manifest - demuxed M video 1 audio",
+      "verdict": "compiled"
+    },
+    "02->15": {
+      "input": "1 file 0 video track 1 audio track",
+      "output": "1 manifest - demuxed 1 video M audio",
+      "verdict": "compiled"
+    },
+    "02->16": {
+      "input": "1 file 0 video track 1 audio track",
+      "output": "1 manifest - demuxed M video N audio",
+      "verdict": "compiled"
+    },
+    "02->17": {
+      "input": "1 file 0 video track 1 audio track",
+      "output": "1 manifest - hybrid 1 video + audio 1 audio",
+      "verdict": "compiled"
+    },
+    "02->18": {
+      "input": "1 file 0 video track 1 audio track",
+      "output": "1 manifest - hybrid M video + audio 1 audio",
+      "verdict": "compiled"
+    },
+    "02->19": {
+      "input": "1 file 0 video track 1 audio track",
+      "output": "1 manifest - hybrid 1 video + audio M audio",
+      "verdict": "compiled"
+    },
+    "02->20": {
+      "input": "1 file 0 video track 1 audio track",
+      "output": "1 manifest - hybrid M video + audio N audio",
+      "verdict": "compiled"
+    },
+    "03->00": {
+      "input": "1 file M video track 0 audio track",
+      "output": "1 file 0 video track 0 audio track",
+      "verdict": "unrun",
+      "why": "n/a: a file with no tracks writes nothing"
+    },
+    "03->01": {
+      "input": "1 file M video track 0 audio track",
+      "output": "1 file 1 video track 0 audio track",
+      "verdict": "compiled"
+    },
+    "03->02": {
+      "input": "1 file M video track 0 audio track",
+      "output": "1 file 0 video track 1 audio track",
+      "verdict": "compiled"
+    },
+    "03->03": {
+      "input": "1 file M video track 0 audio track",
+      "output": "1 file M video track 0 audio track",
+      "verdict": "compiled"
+    },
+    "03->04": {
+      "input": "1 file M video track 0 audio track",
+      "output": "1 file 0 video track M audio track",
+      "verdict": "compiled"
+    },
+    "03->05": {
+      "input": "1 file M video track 0 audio track",
+      "output": "1 file 1 video track 1 audio track",
+      "verdict": "compiled"
+    },
+    "03->06": {
+      "input": "1 file M video track 0 audio track",
+      "output": "1 file 1 video track M audio track",
+      "verdict": "compiled"
+    },
+    "03->07": {
+      "input": "1 file M video track 0 audio track",
+      "output": "1 file M video track 1 audio track",
+      "verdict": "compiled"
+    },
+    "03->08": {
+      "input": "1 file M video track 0 audio track",
+      "output": "1 file M video track N audio track",
+      "verdict": "compiled"
+    },
+    "03->09": {
+      "input": "1 file M video track 0 audio track",
+      "output": "1 manifest 1 video",
+      "verdict": "compiled"
+    },
+    "03->10": {
+      "input": "1 file M video track 0 audio track",
+      "output": "1 manifest 1 audio",
+      "verdict": "compiled"
+    },
+    "03->11": {
+      "input": "1 file M video track 0 audio track",
+      "output": "1 manifest - muxed 1 video + audio",
+      "verdict": "compiled"
+    },
+    "03->12": {
+      "input": "1 file M video track 0 audio track",
+      "output": "1 manifest - muxed M video + audio",
+      "verdict": "compiled"
+    },
+    "03->13": {
+      "input": "1 file M video track 0 audio track",
+      "output": "1 manifest - demuxed 1 video 1 audio",
+      "verdict": "compiled"
+    },
+    "03->14": {
+      "input": "1 file M video track 0 audio track",
+      "output": "1 manifest - demuxed M video 1 audio",
+      "verdict": "compiled"
+    },
+    "03->15": {
+      "input": "1 file M video track 0 audio track",
+      "output": "1 manifest - demuxed 1 video M audio",
+      "verdict": "compiled"
+    },
+    "03->16": {
+      "input": "1 file M video track 0 audio track",
+      "output": "1 manifest - demuxed M video N audio",
+      "verdict": "compiled"
+    },
+    "03->17": {
+      "input": "1 file M video track 0 audio track",
+      "output": "1 manifest - hybrid 1 video + audio 1 audio",
+      "verdict": "compiled"
+    },
+    "03->18": {
+      "input": "1 file M video track 0 audio track",
+      "output": "1 manifest - hybrid M video + audio 1 audio",
+      "verdict": "compiled"
+    },
+    "03->19": {
+      "input": "1 file M video track 0 audio track",
+      "output": "1 manifest - hybrid 1 video + audio M audio",
+      "verdict": "compiled"
+    },
+    "03->20": {
+      "input": "1 file M video track 0 audio track",
+      "output": "1 manifest - hybrid M video + audio N audio",
+      "verdict": "compiled"
+    },
+    "04->00": {
+      "input": "1 file 0 video track M audio track",
+      "output": "1 file 0 video track 0 audio track",
+      "verdict": "unrun",
+      "why": "n/a: a file with no tracks writes nothing"
+    },
+    "04->01": {
+      "input": "1 file 0 video track M audio track",
+      "output": "1 file 1 video track 0 audio track",
+      "verdict": "compiled"
+    },
+    "04->02": {
+      "input": "1 file 0 video track M audio track",
+      "output": "1 file 0 video track 1 audio track",
+      "verdict": "compiled"
+    },
+    "04->03": {
+      "input": "1 file 0 video track M audio track",
+      "output": "1 file M video track 0 audio track",
+      "verdict": "compiled"
+    },
+    "04->04": {
+      "input": "1 file 0 video track M audio track",
+      "output": "1 file 0 video track M audio track",
+      "verdict": "compiled"
+    },
+    "04->05": {
+      "input": "1 file 0 video track M audio track",
+      "output": "1 file 1 video track 1 audio track",
+      "verdict": "compiled"
+    },
+    "04->06": {
+      "input": "1 file 0 video track M audio track",
+      "output": "1 file 1 video track M audio track",
+      "verdict": "compiled"
+    },
+    "04->07": {
+      "input": "1 file 0 video track M audio track",
+      "output": "1 file M video track 1 audio track",
+      "verdict": "compiled"
+    },
+    "04->08": {
+      "input": "1 file 0 video track M audio track",
+      "output": "1 file M video track N audio track",
+      "verdict": "compiled"
+    },
+    "04->09": {
+      "input": "1 file 0 video track M audio track",
+      "output": "1 manifest 1 video",
+      "verdict": "compiled"
+    },
+    "04->10": {
+      "input": "1 file 0 video track M audio track",
+      "output": "1 manifest 1 audio",
+      "verdict": "compiled"
+    },
+    "04->11": {
+      "input": "1 file 0 video track M audio track",
+      "output": "1 manifest - muxed 1 video + audio",
+      "verdict": "compiled"
+    },
+    "04->12": {
+      "input": "1 file 0 video track M audio track",
+      "output": "1 manifest - muxed M video + audio",
+      "verdict": "compiled"
+    },
+    "04->13": {
+      "input": "1 file 0 video track M audio track",
+      "output": "1 manifest - demuxed 1 video 1 audio",
+      "verdict": "compiled"
+    },
+    "04->14": {
+      "input": "1 file 0 video track M audio track",
+      "output": "1 manifest - demuxed M video 1 audio",
+      "verdict": "compiled"
+    },
+    "04->15": {
+      "input": "1 file 0 video track M audio track",
+      "output": "1 manifest - demuxed 1 video M audio",
+      "verdict": "compiled"
+    },
+    "04->16": {
+      "input": "1 file 0 video track M audio track",
+      "output": "1 manifest - demuxed M video N audio",
+      "verdict": "compiled"
+    },
+    "04->17": {
+      "input": "1 file 0 video track M audio track",
+      "output": "1 manifest - hybrid 1 video + audio 1 audio",
+      "verdict": "compiled"
+    },
+    "04->18": {
+      "input": "1 file 0 video track M audio track",
+      "output": "1 manifest - hybrid M video + audio 1 audio",
+      "verdict": "compiled"
+    },
+    "04->19": {
+      "input": "1 file 0 video track M audio track",
+      "output": "1 manifest - hybrid 1 video + audio M audio",
+      "verdict": "compiled"
+    },
+    "04->20": {
+      "input": "1 file 0 video track M audio track",
+      "output": "1 manifest - hybrid M video + audio N audio",
+      "verdict": "compiled"
+    },
+    "05->00": {
+      "input": "1 file 1 video track 1 audio track",
+      "output": "1 file 0 video track 0 audio track",
+      "verdict": "unrun",
+      "why": "n/a: a file with no tracks writes nothing"
+    },
+    "05->01": {
+      "input": "1 file 1 video track 1 audio track",
+      "output": "1 file 1 video track 0 audio track",
+      "verdict": "compiled"
+    },
+    "05->02": {
+      "input": "1 file 1 video track 1 audio track",
+      "output": "1 file 0 video track 1 audio track",
+      "verdict": "compiled"
+    },
+    "05->03": {
+      "input": "1 file 1 video track 1 audio track",
+      "output": "1 file M video track 0 audio track",
+      "verdict": "compiled"
+    },
+    "05->04": {
+      "input": "1 file 1 video track 1 audio track",
+      "output": "1 file 0 video track M audio track",
+      "verdict": "compiled"
+    },
+    "05->05": {
+      "input": "1 file 1 video track 1 audio track",
+      "output": "1 file 1 video track 1 audio track",
+      "verdict": "compiled"
+    },
+    "05->06": {
+      "input": "1 file 1 video track 1 audio track",
+      "output": "1 file 1 video track M audio track",
+      "verdict": "compiled"
+    },
+    "05->07": {
+      "input": "1 file 1 video track 1 audio track",
+      "output": "1 file M video track 1 audio track",
+      "verdict": "compiled"
+    },
+    "05->08": {
+      "input": "1 file 1 video track 1 audio track",
+      "output": "1 file M video track N audio track",
+      "verdict": "compiled"
+    },
+    "05->09": {
+      "input": "1 file 1 video track 1 audio track",
+      "output": "1 manifest 1 video",
+      "verdict": "compiled"
+    },
+    "05->10": {
+      "input": "1 file 1 video track 1 audio track",
+      "output": "1 manifest 1 audio",
+      "verdict": "compiled"
+    },
+    "05->11": {
+      "input": "1 file 1 video track 1 audio track",
+      "output": "1 manifest - muxed 1 video + audio",
+      "verdict": "compiled"
+    },
+    "05->12": {
+      "input": "1 file 1 video track 1 audio track",
+      "output": "1 manifest - muxed M video + audio",
+      "verdict": "compiled"
+    },
+    "05->13": {
+      "input": "1 file 1 video track 1 audio track",
+      "output": "1 manifest - demuxed 1 video 1 audio",
+      "verdict": "compiled"
+    },
+    "05->14": {
+      "input": "1 file 1 video track 1 audio track",
+      "output": "1 manifest - demuxed M video 1 audio",
+      "verdict": "compiled"
+    },
+    "05->15": {
+      "input": "1 file 1 video track 1 audio track",
+      "output": "1 manifest - demuxed 1 video M audio",
+      "verdict": "compiled"
+    },
+    "05->16": {
+      "input": "1 file 1 video track 1 audio track",
+      "output": "1 manifest - demuxed M video N audio",
+      "verdict": "compiled"
+    },
+    "05->17": {
+      "input": "1 file 1 video track 1 audio track",
+      "output": "1 manifest - hybrid 1 video + audio 1 audio",
+      "verdict": "compiled"
+    },
+    "05->18": {
+      "input": "1 file 1 video track 1 audio track",
+      "output": "1 manifest - hybrid M video + audio 1 audio",
+      "verdict": "compiled"
+    },
+    "05->19": {
+      "input": "1 file 1 video track 1 audio track",
+      "output": "1 manifest - hybrid 1 video + audio M audio",
+      "verdict": "compiled"
+    },
+    "05->20": {
+      "input": "1 file 1 video track 1 audio track",
+      "output": "1 manifest - hybrid M video + audio N audio",
+      "verdict": "compiled"
+    },
+    "06->00": {
+      "input": "1 file 1 video track M audio track",
+      "output": "1 file 0 video track 0 audio track",
+      "verdict": "unrun",
+      "why": "n/a: a file with no tracks writes nothing"
+    },
+    "06->01": {
+      "input": "1 file 1 video track M audio track",
+      "output": "1 file 1 video track 0 audio track",
+      "verdict": "compiled"
+    },
+    "06->02": {
+      "input": "1 file 1 video track M audio track",
+      "output": "1 file 0 video track 1 audio track",
+      "verdict": "compiled"
+    },
+    "06->03": {
+      "input": "1 file 1 video track M audio track",
+      "output": "1 file M video track 0 audio track",
+      "verdict": "compiled"
+    },
+    "06->04": {
+      "input": "1 file 1 video track M audio track",
+      "output": "1 file 0 video track M audio track",
+      "verdict": "compiled"
+    },
+    "06->05": {
+      "input": "1 file 1 video track M audio track",
+      "output": "1 file 1 video track 1 audio track",
+      "verdict": "compiled"
+    },
+    "06->06": {
+      "input": "1 file 1 video track M audio track",
+      "output": "1 file 1 video track M audio track",
+      "verdict": "compiled"
+    },
+    "06->07": {
+      "input": "1 file 1 video track M audio track",
+      "output": "1 file M video track 1 audio track",
+      "verdict": "compiled"
+    },
+    "06->08": {
+      "input": "1 file 1 video track M audio track",
+      "output": "1 file M video track N audio track",
+      "verdict": "compiled"
+    },
+    "06->09": {
+      "input": "1 file 1 video track M audio track",
+      "output": "1 manifest 1 video",
+      "verdict": "compiled"
+    },
+    "06->10": {
+      "input": "1 file 1 video track M audio track",
+      "output": "1 manifest 1 audio",
+      "verdict": "compiled"
+    },
+    "06->11": {
+      "input": "1 file 1 video track M audio track",
+      "output": "1 manifest - muxed 1 video + audio",
+      "verdict": "compiled"
+    },
+    "06->12": {
+      "input": "1 file 1 video track M audio track",
+      "output": "1 manifest - muxed M video + audio",
+      "verdict": "compiled"
+    },
+    "06->13": {
+      "input": "1 file 1 video track M audio track",
+      "output": "1 manifest - demuxed 1 video 1 audio",
+      "verdict": "compiled"
+    },
+    "06->14": {
+      "input": "1 file 1 video track M audio track",
+      "output": "1 manifest - demuxed M video 1 audio",
+      "verdict": "compiled"
+    },
+    "06->15": {
+      "input": "1 file 1 video track M audio track",
+      "output": "1 manifest - demuxed 1 video M audio",
+      "verdict": "compiled"
+    },
+    "06->16": {
+      "input": "1 file 1 video track M audio track",
+      "output": "1 manifest - demuxed M video N audio",
+      "verdict": "compiled"
+    },
+    "06->17": {
+      "input": "1 file 1 video track M audio track",
+      "output": "1 manifest - hybrid 1 video + audio 1 audio",
+      "verdict": "compiled"
+    },
+    "06->18": {
+      "input": "1 file 1 video track M audio track",
+      "output": "1 manifest - hybrid M video + audio 1 audio",
+      "verdict": "compiled"
+    },
+    "06->19": {
+      "input": "1 file 1 video track M audio track",
+      "output": "1 manifest - hybrid 1 video + audio M audio",
+      "verdict": "compiled"
+    },
+    "06->20": {
+      "input": "1 file 1 video track M audio track",
+      "output": "1 manifest - hybrid M video + audio N audio",
+      "verdict": "compiled"
+    },
+    "07->00": {
+      "input": "1 file M video track 1 audio track",
+      "output": "1 file 0 video track 0 audio track",
+      "verdict": "unrun",
+      "why": "n/a: a file with no tracks writes nothing"
+    },
+    "07->01": {
+      "input": "1 file M video track 1 audio track",
+      "output": "1 file 1 video track 0 audio track",
+      "verdict": "compiled"
+    },
+    "07->02": {
+      "input": "1 file M video track 1 audio track",
+      "output": "1 file 0 video track 1 audio track",
+      "verdict": "compiled"
+    },
+    "07->03": {
+      "input": "1 file M video track 1 audio track",
+      "output": "1 file M video track 0 audio track",
+      "verdict": "compiled"
+    },
+    "07->04": {
+      "input": "1 file M video track 1 audio track",
+      "output": "1 file 0 video track M audio track",
+      "verdict": "compiled"
+    },
+    "07->05": {
+      "input": "1 file M video track 1 audio track",
+      "output": "1 file 1 video track 1 audio track",
+      "verdict": "compiled"
+    },
+    "07->06": {
+      "input": "1 file M video track 1 audio track",
+      "output": "1 file 1 video track M audio track",
+      "verdict": "compiled"
+    },
+    "07->07": {
+      "input": "1 file M video track 1 audio track",
+      "output": "1 file M video track 1 audio track",
+      "verdict": "compiled"
+    },
+    "07->08": {
+      "input": "1 file M video track 1 audio track",
+      "output": "1 file M video track N audio track",
+      "verdict": "compiled"
+    },
+    "07->09": {
+      "input": "1 file M video track 1 audio track",
+      "output": "1 manifest 1 video",
+      "verdict": "compiled"
+    },
+    "07->10": {
+      "input": "1 file M video track 1 audio track",
+      "output": "1 manifest 1 audio",
+      "verdict": "compiled"
+    },
+    "07->11": {
+      "input": "1 file M video track 1 audio track",
+      "output": "1 manifest - muxed 1 video + audio",
+      "verdict": "compiled"
+    },
+    "07->12": {
+      "input": "1 file M video track 1 audio track",
+      "output": "1 manifest - muxed M video + audio",
+      "verdict": "compiled"
+    },
+    "07->13": {
+      "input": "1 file M video track 1 audio track",
+      "output": "1 manifest - demuxed 1 video 1 audio",
+      "verdict": "compiled"
+    },
+    "07->14": {
+      "input": "1 file M video track 1 audio track",
+      "output": "1 manifest - demuxed M video 1 audio",
+      "verdict": "compiled"
+    },
+    "07->15": {
+      "input": "1 file M video track 1 audio track",
+      "output": "1 manifest - demuxed 1 video M audio",
+      "verdict": "compiled"
+    },
+    "07->16": {
+      "input": "1 file M video track 1 audio track",
+      "output": "1 manifest - demuxed M video N audio",
+      "verdict": "compiled"
+    },
+    "07->17": {
+      "input": "1 file M video track 1 audio track",
+      "output": "1 manifest - hybrid 1 video + audio 1 audio",
+      "verdict": "compiled"
+    },
+    "07->18": {
+      "input": "1 file M video track 1 audio track",
+      "output": "1 manifest - hybrid M video + audio 1 audio",
+      "verdict": "compiled"
+    },
+    "07->19": {
+      "input": "1 file M video track 1 audio track",
+      "output": "1 manifest - hybrid 1 video + audio M audio",
+      "verdict": "compiled"
+    },
+    "07->20": {
+      "input": "1 file M video track 1 audio track",
+      "output": "1 manifest - hybrid M video + audio N audio",
+      "verdict": "compiled"
+    },
+    "08->00": {
+      "input": "1 file M video track N audio track",
+      "output": "1 file 0 video track 0 audio track",
+      "verdict": "unrun",
+      "why": "n/a: a file with no tracks writes nothing"
+    },
+    "08->01": {
+      "input": "1 file M video track N audio track",
+      "output": "1 file 1 video track 0 audio track",
+      "verdict": "compiled"
+    },
+    "08->02": {
+      "input": "1 file M video track N audio track",
+      "output": "1 file 0 video track 1 audio track",
+      "verdict": "compiled"
+    },
+    "08->03": {
+      "input": "1 file M video track N audio track",
+      "output": "1 file M video track 0 audio track",
+      "verdict": "compiled"
+    },
+    "08->04": {
+      "input": "1 file M video track N audio track",
+      "output": "1 file 0 video track M audio track",
+      "verdict": "compiled"
+    },
+    "08->05": {
+      "input": "1 file M video track N audio track",
+      "output": "1 file 1 video track 1 audio track",
+      "verdict": "compiled"
+    },
+    "08->06": {
+      "input": "1 file M video track N audio track",
+      "output": "1 file 1 video track M audio track",
+      "verdict": "compiled"
+    },
+    "08->07": {
+      "input": "1 file M video track N audio track",
+      "output": "1 file M video track 1 audio track",
+      "verdict": "compiled"
+    },
+    "08->08": {
+      "input": "1 file M video track N audio track",
+      "output": "1 file M video track N audio track",
+      "verdict": "compiled"
+    },
+    "08->09": {
+      "input": "1 file M video track N audio track",
+      "output": "1 manifest 1 video",
+      "verdict": "compiled"
+    },
+    "08->10": {
+      "input": "1 file M video track N audio track",
+      "output": "1 manifest 1 audio",
+      "verdict": "compiled"
+    },
+    "08->11": {
+      "input": "1 file M video track N audio track",
+      "output": "1 manifest - muxed 1 video + audio",
+      "verdict": "compiled"
+    },
+    "08->12": {
+      "input": "1 file M video track N audio track",
+      "output": "1 manifest - muxed M video + audio",
+      "verdict": "compiled"
+    },
+    "08->13": {
+      "input": "1 file M video track N audio track",
+      "output": "1 manifest - demuxed 1 video 1 audio",
+      "verdict": "compiled"
+    },
+    "08->14": {
+      "input": "1 file M video track N audio track",
+      "output": "1 manifest - demuxed M video 1 audio",
+      "verdict": "compiled"
+    },
+    "08->15": {
+      "input": "1 file M video track N audio track",
+      "output": "1 manifest - demuxed 1 video M audio",
+      "verdict": "compiled"
+    },
+    "08->16": {
+      "input": "1 file M video track N audio track",
+      "output": "1 manifest - demuxed M video N audio",
+      "verdict": "compiled"
+    },
+    "08->17": {
+      "input": "1 file M video track N audio track",
+      "output": "1 manifest - hybrid 1 video + audio 1 audio",
+      "verdict": "compiled"
+    },
+    "08->18": {
+      "input": "1 file M video track N audio track",
+      "output": "1 manifest - hybrid M video + audio 1 audio",
+      "verdict": "compiled"
+    },
+    "08->19": {
+      "input": "1 file M video track N audio track",
+      "output": "1 manifest - hybrid 1 video + audio M audio",
+      "verdict": "compiled"
+    },
+    "08->20": {
+      "input": "1 file M video track N audio track",
+      "output": "1 manifest - hybrid M video + audio N audio",
+      "verdict": "compiled"
+    },
+    "09->00": {
+      "input": "1 manifest 1 video",
+      "output": "1 file 0 video track 0 audio track",
+      "verdict": "unrun",
+      "why": "n/a: a file with no tracks writes nothing"
+    },
+    "09->01": {
+      "input": "1 manifest 1 video",
+      "output": "1 file 1 video track 0 audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: every ladder here carries audio somewhere, and the one video-only manifest would be a new fixture rather than a flag on an existing one"
+    },
+    "09->02": {
+      "input": "1 manifest 1 video",
+      "output": "1 file 0 video track 1 audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: every ladder here carries audio somewhere, and the one video-only manifest would be a new fixture rather than a flag on an existing one"
+    },
+    "09->03": {
+      "input": "1 manifest 1 video",
+      "output": "1 file M video track 0 audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: every ladder here carries audio somewhere, and the one video-only manifest would be a new fixture rather than a flag on an existing one"
+    },
+    "09->04": {
+      "input": "1 manifest 1 video",
+      "output": "1 file 0 video track M audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: every ladder here carries audio somewhere, and the one video-only manifest would be a new fixture rather than a flag on an existing one"
+    },
+    "09->05": {
+      "input": "1 manifest 1 video",
+      "output": "1 file 1 video track 1 audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: every ladder here carries audio somewhere, and the one video-only manifest would be a new fixture rather than a flag on an existing one"
+    },
+    "09->06": {
+      "input": "1 manifest 1 video",
+      "output": "1 file 1 video track M audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: every ladder here carries audio somewhere, and the one video-only manifest would be a new fixture rather than a flag on an existing one"
+    },
+    "09->07": {
+      "input": "1 manifest 1 video",
+      "output": "1 file M video track 1 audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: every ladder here carries audio somewhere, and the one video-only manifest would be a new fixture rather than a flag on an existing one"
+    },
+    "09->08": {
+      "input": "1 manifest 1 video",
+      "output": "1 file M video track N audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: every ladder here carries audio somewhere, and the one video-only manifest would be a new fixture rather than a flag on an existing one"
+    },
+    "09->09": {
+      "input": "1 manifest 1 video",
+      "output": "1 manifest 1 video",
+      "verdict": "unrun",
+      "why": "nothing stands for it: every ladder here carries audio somewhere, and the one video-only manifest would be a new fixture rather than a flag on an existing one"
+    },
+    "09->10": {
+      "input": "1 manifest 1 video",
+      "output": "1 manifest 1 audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: every ladder here carries audio somewhere, and the one video-only manifest would be a new fixture rather than a flag on an existing one"
+    },
+    "09->11": {
+      "input": "1 manifest 1 video",
+      "output": "1 manifest - muxed 1 video + audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: every ladder here carries audio somewhere, and the one video-only manifest would be a new fixture rather than a flag on an existing one"
+    },
+    "09->12": {
+      "input": "1 manifest 1 video",
+      "output": "1 manifest - muxed M video + audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: every ladder here carries audio somewhere, and the one video-only manifest would be a new fixture rather than a flag on an existing one"
+    },
+    "09->13": {
+      "input": "1 manifest 1 video",
+      "output": "1 manifest - demuxed 1 video 1 audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: every ladder here carries audio somewhere, and the one video-only manifest would be a new fixture rather than a flag on an existing one"
+    },
+    "09->14": {
+      "input": "1 manifest 1 video",
+      "output": "1 manifest - demuxed M video 1 audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: every ladder here carries audio somewhere, and the one video-only manifest would be a new fixture rather than a flag on an existing one"
+    },
+    "09->15": {
+      "input": "1 manifest 1 video",
+      "output": "1 manifest - demuxed 1 video M audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: every ladder here carries audio somewhere, and the one video-only manifest would be a new fixture rather than a flag on an existing one"
+    },
+    "09->16": {
+      "input": "1 manifest 1 video",
+      "output": "1 manifest - demuxed M video N audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: every ladder here carries audio somewhere, and the one video-only manifest would be a new fixture rather than a flag on an existing one"
+    },
+    "09->17": {
+      "input": "1 manifest 1 video",
+      "output": "1 manifest - hybrid 1 video + audio 1 audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: every ladder here carries audio somewhere, and the one video-only manifest would be a new fixture rather than a flag on an existing one"
+    },
+    "09->18": {
+      "input": "1 manifest 1 video",
+      "output": "1 manifest - hybrid M video + audio 1 audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: every ladder here carries audio somewhere, and the one video-only manifest would be a new fixture rather than a flag on an existing one"
+    },
+    "09->19": {
+      "input": "1 manifest 1 video",
+      "output": "1 manifest - hybrid 1 video + audio M audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: every ladder here carries audio somewhere, and the one video-only manifest would be a new fixture rather than a flag on an existing one"
+    },
+    "09->20": {
+      "input": "1 manifest 1 video",
+      "output": "1 manifest - hybrid M video + audio N audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: every ladder here carries audio somewhere, and the one video-only manifest would be a new fixture rather than a flag on an existing one"
+    },
+    "10->00": {
+      "input": "1 manifest 1 audio",
+      "output": "1 file 0 video track 0 audio track",
+      "verdict": "unrun",
+      "why": "n/a: a file with no tracks writes nothing"
+    },
+    "10->01": {
+      "input": "1 manifest 1 audio",
+      "output": "1 file 1 video track 0 audio track",
+      "verdict": "compiled"
+    },
+    "10->02": {
+      "input": "1 manifest 1 audio",
+      "output": "1 file 0 video track 1 audio track",
+      "verdict": "compiled"
+    },
+    "10->03": {
+      "input": "1 manifest 1 audio",
+      "output": "1 file M video track 0 audio track",
+      "verdict": "compiled"
+    },
+    "10->04": {
+      "input": "1 manifest 1 audio",
+      "output": "1 file 0 video track M audio track",
+      "verdict": "compiled"
+    },
+    "10->05": {
+      "input": "1 manifest 1 audio",
+      "output": "1 file 1 video track 1 audio track",
+      "verdict": "compiled"
+    },
+    "10->06": {
+      "input": "1 manifest 1 audio",
+      "output": "1 file 1 video track M audio track",
+      "verdict": "compiled"
+    },
+    "10->07": {
+      "input": "1 manifest 1 audio",
+      "output": "1 file M video track 1 audio track",
+      "verdict": "compiled"
+    },
+    "10->08": {
+      "input": "1 manifest 1 audio",
+      "output": "1 file M video track N audio track",
+      "verdict": "compiled"
+    },
+    "10->09": {
+      "input": "1 manifest 1 audio",
+      "output": "1 manifest 1 video",
+      "verdict": "compiled"
+    },
+    "10->10": {
+      "input": "1 manifest 1 audio",
+      "output": "1 manifest 1 audio",
+      "verdict": "compiled"
+    },
+    "10->11": {
+      "input": "1 manifest 1 audio",
+      "output": "1 manifest - muxed 1 video + audio",
+      "verdict": "compiled"
+    },
+    "10->12": {
+      "input": "1 manifest 1 audio",
+      "output": "1 manifest - muxed M video + audio",
+      "verdict": "compiled"
+    },
+    "10->13": {
+      "input": "1 manifest 1 audio",
+      "output": "1 manifest - demuxed 1 video 1 audio",
+      "verdict": "compiled"
+    },
+    "10->14": {
+      "input": "1 manifest 1 audio",
+      "output": "1 manifest - demuxed M video 1 audio",
+      "verdict": "compiled"
+    },
+    "10->15": {
+      "input": "1 manifest 1 audio",
+      "output": "1 manifest - demuxed 1 video M audio",
+      "verdict": "compiled"
+    },
+    "10->16": {
+      "input": "1 manifest 1 audio",
+      "output": "1 manifest - demuxed M video N audio",
+      "verdict": "compiled"
+    },
+    "10->17": {
+      "input": "1 manifest 1 audio",
+      "output": "1 manifest - hybrid 1 video + audio 1 audio",
+      "verdict": "compiled"
+    },
+    "10->18": {
+      "input": "1 manifest 1 audio",
+      "output": "1 manifest - hybrid M video + audio 1 audio",
+      "verdict": "compiled"
+    },
+    "10->19": {
+      "input": "1 manifest 1 audio",
+      "output": "1 manifest - hybrid 1 video + audio M audio",
+      "verdict": "compiled"
+    },
+    "10->20": {
+      "input": "1 manifest 1 audio",
+      "output": "1 manifest - hybrid M video + audio N audio",
+      "verdict": "compiled"
+    },
+    "11->00": {
+      "input": "1 manifest - muxed 1 video + audio",
+      "output": "1 file 0 video track 0 audio track",
+      "verdict": "unrun",
+      "why": "n/a: a file with no tracks writes nothing"
+    },
+    "11->01": {
+      "input": "1 manifest - muxed 1 video + audio",
+      "output": "1 file 1 video track 0 audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: the muxed ladder has two rungs, and a one-rung ladder is another real encode rather than a flag on it"
+    },
+    "11->02": {
+      "input": "1 manifest - muxed 1 video + audio",
+      "output": "1 file 0 video track 1 audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: the muxed ladder has two rungs, and a one-rung ladder is another real encode rather than a flag on it"
+    },
+    "11->03": {
+      "input": "1 manifest - muxed 1 video + audio",
+      "output": "1 file M video track 0 audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: the muxed ladder has two rungs, and a one-rung ladder is another real encode rather than a flag on it"
+    },
+    "11->04": {
+      "input": "1 manifest - muxed 1 video + audio",
+      "output": "1 file 0 video track M audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: the muxed ladder has two rungs, and a one-rung ladder is another real encode rather than a flag on it"
+    },
+    "11->05": {
+      "input": "1 manifest - muxed 1 video + audio",
+      "output": "1 file 1 video track 1 audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: the muxed ladder has two rungs, and a one-rung ladder is another real encode rather than a flag on it"
+    },
+    "11->06": {
+      "input": "1 manifest - muxed 1 video + audio",
+      "output": "1 file 1 video track M audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: the muxed ladder has two rungs, and a one-rung ladder is another real encode rather than a flag on it"
+    },
+    "11->07": {
+      "input": "1 manifest - muxed 1 video + audio",
+      "output": "1 file M video track 1 audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: the muxed ladder has two rungs, and a one-rung ladder is another real encode rather than a flag on it"
+    },
+    "11->08": {
+      "input": "1 manifest - muxed 1 video + audio",
+      "output": "1 file M video track N audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: the muxed ladder has two rungs, and a one-rung ladder is another real encode rather than a flag on it"
+    },
+    "11->09": {
+      "input": "1 manifest - muxed 1 video + audio",
+      "output": "1 manifest 1 video",
+      "verdict": "unrun",
+      "why": "nothing stands for it: the muxed ladder has two rungs, and a one-rung ladder is another real encode rather than a flag on it"
+    },
+    "11->10": {
+      "input": "1 manifest - muxed 1 video + audio",
+      "output": "1 manifest 1 audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: the muxed ladder has two rungs, and a one-rung ladder is another real encode rather than a flag on it"
+    },
+    "11->11": {
+      "input": "1 manifest - muxed 1 video + audio",
+      "output": "1 manifest - muxed 1 video + audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: the muxed ladder has two rungs, and a one-rung ladder is another real encode rather than a flag on it"
+    },
+    "11->12": {
+      "input": "1 manifest - muxed 1 video + audio",
+      "output": "1 manifest - muxed M video + audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: the muxed ladder has two rungs, and a one-rung ladder is another real encode rather than a flag on it"
+    },
+    "11->13": {
+      "input": "1 manifest - muxed 1 video + audio",
+      "output": "1 manifest - demuxed 1 video 1 audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: the muxed ladder has two rungs, and a one-rung ladder is another real encode rather than a flag on it"
+    },
+    "11->14": {
+      "input": "1 manifest - muxed 1 video + audio",
+      "output": "1 manifest - demuxed M video 1 audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: the muxed ladder has two rungs, and a one-rung ladder is another real encode rather than a flag on it"
+    },
+    "11->15": {
+      "input": "1 manifest - muxed 1 video + audio",
+      "output": "1 manifest - demuxed 1 video M audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: the muxed ladder has two rungs, and a one-rung ladder is another real encode rather than a flag on it"
+    },
+    "11->16": {
+      "input": "1 manifest - muxed 1 video + audio",
+      "output": "1 manifest - demuxed M video N audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: the muxed ladder has two rungs, and a one-rung ladder is another real encode rather than a flag on it"
+    },
+    "11->17": {
+      "input": "1 manifest - muxed 1 video + audio",
+      "output": "1 manifest - hybrid 1 video + audio 1 audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: the muxed ladder has two rungs, and a one-rung ladder is another real encode rather than a flag on it"
+    },
+    "11->18": {
+      "input": "1 manifest - muxed 1 video + audio",
+      "output": "1 manifest - hybrid M video + audio 1 audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: the muxed ladder has two rungs, and a one-rung ladder is another real encode rather than a flag on it"
+    },
+    "11->19": {
+      "input": "1 manifest - muxed 1 video + audio",
+      "output": "1 manifest - hybrid 1 video + audio M audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: the muxed ladder has two rungs, and a one-rung ladder is another real encode rather than a flag on it"
+    },
+    "11->20": {
+      "input": "1 manifest - muxed 1 video + audio",
+      "output": "1 manifest - hybrid M video + audio N audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: the muxed ladder has two rungs, and a one-rung ladder is another real encode rather than a flag on it"
+    },
+    "12->00": {
+      "input": "1 manifest - muxed M video + audio",
+      "output": "1 file 0 video track 0 audio track",
+      "verdict": "unrun",
+      "why": "n/a: a file with no tracks writes nothing"
+    },
+    "12->01": {
+      "input": "1 manifest - muxed M video + audio",
+      "output": "1 file 1 video track 0 audio track",
+      "verdict": "compiled"
+    },
+    "12->02": {
+      "input": "1 manifest - muxed M video + audio",
+      "output": "1 file 0 video track 1 audio track",
+      "verdict": "compiled"
+    },
+    "12->03": {
+      "input": "1 manifest - muxed M video + audio",
+      "output": "1 file M video track 0 audio track",
+      "verdict": "compiled"
+    },
+    "12->04": {
+      "input": "1 manifest - muxed M video + audio",
+      "output": "1 file 0 video track M audio track",
+      "verdict": "compiled"
+    },
+    "12->05": {
+      "input": "1 manifest - muxed M video + audio",
+      "output": "1 file 1 video track 1 audio track",
+      "verdict": "compiled"
+    },
+    "12->06": {
+      "input": "1 manifest - muxed M video + audio",
+      "output": "1 file 1 video track M audio track",
+      "verdict": "compiled"
+    },
+    "12->07": {
+      "input": "1 manifest - muxed M video + audio",
+      "output": "1 file M video track 1 audio track",
+      "verdict": "compiled"
+    },
+    "12->08": {
+      "input": "1 manifest - muxed M video + audio",
+      "output": "1 file M video track N audio track",
+      "verdict": "compiled"
+    },
+    "12->09": {
+      "input": "1 manifest - muxed M video + audio",
+      "output": "1 manifest 1 video",
+      "verdict": "compiled"
+    },
+    "12->10": {
+      "input": "1 manifest - muxed M video + audio",
+      "output": "1 manifest 1 audio",
+      "verdict": "compiled"
+    },
+    "12->11": {
+      "input": "1 manifest - muxed M video + audio",
+      "output": "1 manifest - muxed 1 video + audio",
+      "verdict": "compiled"
+    },
+    "12->12": {
+      "input": "1 manifest - muxed M video + audio",
+      "output": "1 manifest - muxed M video + audio",
+      "verdict": "compiled"
+    },
+    "12->13": {
+      "input": "1 manifest - muxed M video + audio",
+      "output": "1 manifest - demuxed 1 video 1 audio",
+      "verdict": "compiled"
+    },
+    "12->14": {
+      "input": "1 manifest - muxed M video + audio",
+      "output": "1 manifest - demuxed M video 1 audio",
+      "verdict": "compiled"
+    },
+    "12->15": {
+      "input": "1 manifest - muxed M video + audio",
+      "output": "1 manifest - demuxed 1 video M audio",
+      "verdict": "compiled"
+    },
+    "12->16": {
+      "input": "1 manifest - muxed M video + audio",
+      "output": "1 manifest - demuxed M video N audio",
+      "verdict": "compiled"
+    },
+    "12->17": {
+      "input": "1 manifest - muxed M video + audio",
+      "output": "1 manifest - hybrid 1 video + audio 1 audio",
+      "verdict": "compiled"
+    },
+    "12->18": {
+      "input": "1 manifest - muxed M video + audio",
+      "output": "1 manifest - hybrid M video + audio 1 audio",
+      "verdict": "compiled"
+    },
+    "12->19": {
+      "input": "1 manifest - muxed M video + audio",
+      "output": "1 manifest - hybrid 1 video + audio M audio",
+      "verdict": "compiled"
+    },
+    "12->20": {
+      "input": "1 manifest - muxed M video + audio",
+      "output": "1 manifest - hybrid M video + audio N audio",
+      "verdict": "compiled"
+    },
+    "13->00": {
+      "input": "1 manifest - demuxed 1 video 1 audio",
+      "output": "1 file 0 video track 0 audio track",
+      "verdict": "unrun",
+      "why": "n/a: a file with no tracks writes nothing"
+    },
+    "13->01": {
+      "input": "1 manifest - demuxed 1 video 1 audio",
+      "output": "1 file 1 video track 0 audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: the demuxed ladders have two video rungs, and a one-rung one is another real encode"
+    },
+    "13->02": {
+      "input": "1 manifest - demuxed 1 video 1 audio",
+      "output": "1 file 0 video track 1 audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: the demuxed ladders have two video rungs, and a one-rung one is another real encode"
+    },
+    "13->03": {
+      "input": "1 manifest - demuxed 1 video 1 audio",
+      "output": "1 file M video track 0 audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: the demuxed ladders have two video rungs, and a one-rung one is another real encode"
+    },
+    "13->04": {
+      "input": "1 manifest - demuxed 1 video 1 audio",
+      "output": "1 file 0 video track M audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: the demuxed ladders have two video rungs, and a one-rung one is another real encode"
+    },
+    "13->05": {
+      "input": "1 manifest - demuxed 1 video 1 audio",
+      "output": "1 file 1 video track 1 audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: the demuxed ladders have two video rungs, and a one-rung one is another real encode"
+    },
+    "13->06": {
+      "input": "1 manifest - demuxed 1 video 1 audio",
+      "output": "1 file 1 video track M audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: the demuxed ladders have two video rungs, and a one-rung one is another real encode"
+    },
+    "13->07": {
+      "input": "1 manifest - demuxed 1 video 1 audio",
+      "output": "1 file M video track 1 audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: the demuxed ladders have two video rungs, and a one-rung one is another real encode"
+    },
+    "13->08": {
+      "input": "1 manifest - demuxed 1 video 1 audio",
+      "output": "1 file M video track N audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: the demuxed ladders have two video rungs, and a one-rung one is another real encode"
+    },
+    "13->09": {
+      "input": "1 manifest - demuxed 1 video 1 audio",
+      "output": "1 manifest 1 video",
+      "verdict": "unrun",
+      "why": "nothing stands for it: the demuxed ladders have two video rungs, and a one-rung one is another real encode"
+    },
+    "13->10": {
+      "input": "1 manifest - demuxed 1 video 1 audio",
+      "output": "1 manifest 1 audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: the demuxed ladders have two video rungs, and a one-rung one is another real encode"
+    },
+    "13->11": {
+      "input": "1 manifest - demuxed 1 video 1 audio",
+      "output": "1 manifest - muxed 1 video + audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: the demuxed ladders have two video rungs, and a one-rung one is another real encode"
+    },
+    "13->12": {
+      "input": "1 manifest - demuxed 1 video 1 audio",
+      "output": "1 manifest - muxed M video + audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: the demuxed ladders have two video rungs, and a one-rung one is another real encode"
+    },
+    "13->13": {
+      "input": "1 manifest - demuxed 1 video 1 audio",
+      "output": "1 manifest - demuxed 1 video 1 audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: the demuxed ladders have two video rungs, and a one-rung one is another real encode"
+    },
+    "13->14": {
+      "input": "1 manifest - demuxed 1 video 1 audio",
+      "output": "1 manifest - demuxed M video 1 audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: the demuxed ladders have two video rungs, and a one-rung one is another real encode"
+    },
+    "13->15": {
+      "input": "1 manifest - demuxed 1 video 1 audio",
+      "output": "1 manifest - demuxed 1 video M audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: the demuxed ladders have two video rungs, and a one-rung one is another real encode"
+    },
+    "13->16": {
+      "input": "1 manifest - demuxed 1 video 1 audio",
+      "output": "1 manifest - demuxed M video N audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: the demuxed ladders have two video rungs, and a one-rung one is another real encode"
+    },
+    "13->17": {
+      "input": "1 manifest - demuxed 1 video 1 audio",
+      "output": "1 manifest - hybrid 1 video + audio 1 audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: the demuxed ladders have two video rungs, and a one-rung one is another real encode"
+    },
+    "13->18": {
+      "input": "1 manifest - demuxed 1 video 1 audio",
+      "output": "1 manifest - hybrid M video + audio 1 audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: the demuxed ladders have two video rungs, and a one-rung one is another real encode"
+    },
+    "13->19": {
+      "input": "1 manifest - demuxed 1 video 1 audio",
+      "output": "1 manifest - hybrid 1 video + audio M audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: the demuxed ladders have two video rungs, and a one-rung one is another real encode"
+    },
+    "13->20": {
+      "input": "1 manifest - demuxed 1 video 1 audio",
+      "output": "1 manifest - hybrid M video + audio N audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: the demuxed ladders have two video rungs, and a one-rung one is another real encode"
+    },
+    "14->00": {
+      "input": "1 manifest - demuxed M video 1 audio",
+      "output": "1 file 0 video track 0 audio track",
+      "verdict": "unrun",
+      "why": "n/a: a file with no tracks writes nothing"
+    },
+    "14->01": {
+      "input": "1 manifest - demuxed M video 1 audio",
+      "output": "1 file 1 video track 0 audio track",
+      "verdict": "compiled"
+    },
+    "14->02": {
+      "input": "1 manifest - demuxed M video 1 audio",
+      "output": "1 file 0 video track 1 audio track",
+      "verdict": "compiled"
+    },
+    "14->03": {
+      "input": "1 manifest - demuxed M video 1 audio",
+      "output": "1 file M video track 0 audio track",
+      "verdict": "compiled"
+    },
+    "14->04": {
+      "input": "1 manifest - demuxed M video 1 audio",
+      "output": "1 file 0 video track M audio track",
+      "verdict": "compiled"
+    },
+    "14->05": {
+      "input": "1 manifest - demuxed M video 1 audio",
+      "output": "1 file 1 video track 1 audio track",
+      "verdict": "compiled"
+    },
+    "14->06": {
+      "input": "1 manifest - demuxed M video 1 audio",
+      "output": "1 file 1 video track M audio track",
+      "verdict": "compiled"
+    },
+    "14->07": {
+      "input": "1 manifest - demuxed M video 1 audio",
+      "output": "1 file M video track 1 audio track",
+      "verdict": "compiled"
+    },
+    "14->08": {
+      "input": "1 manifest - demuxed M video 1 audio",
+      "output": "1 file M video track N audio track",
+      "verdict": "compiled"
+    },
+    "14->09": {
+      "input": "1 manifest - demuxed M video 1 audio",
+      "output": "1 manifest 1 video",
+      "verdict": "compiled"
+    },
+    "14->10": {
+      "input": "1 manifest - demuxed M video 1 audio",
+      "output": "1 manifest 1 audio",
+      "verdict": "compiled"
+    },
+    "14->11": {
+      "input": "1 manifest - demuxed M video 1 audio",
+      "output": "1 manifest - muxed 1 video + audio",
+      "verdict": "compiled"
+    },
+    "14->12": {
+      "input": "1 manifest - demuxed M video 1 audio",
+      "output": "1 manifest - muxed M video + audio",
+      "verdict": "compiled"
+    },
+    "14->13": {
+      "input": "1 manifest - demuxed M video 1 audio",
+      "output": "1 manifest - demuxed 1 video 1 audio",
+      "verdict": "compiled"
+    },
+    "14->14": {
+      "input": "1 manifest - demuxed M video 1 audio",
+      "output": "1 manifest - demuxed M video 1 audio",
+      "verdict": "compiled"
+    },
+    "14->15": {
+      "input": "1 manifest - demuxed M video 1 audio",
+      "output": "1 manifest - demuxed 1 video M audio",
+      "verdict": "compiled"
+    },
+    "14->16": {
+      "input": "1 manifest - demuxed M video 1 audio",
+      "output": "1 manifest - demuxed M video N audio",
+      "verdict": "compiled"
+    },
+    "14->17": {
+      "input": "1 manifest - demuxed M video 1 audio",
+      "output": "1 manifest - hybrid 1 video + audio 1 audio",
+      "verdict": "compiled"
+    },
+    "14->18": {
+      "input": "1 manifest - demuxed M video 1 audio",
+      "output": "1 manifest - hybrid M video + audio 1 audio",
+      "verdict": "compiled"
+    },
+    "14->19": {
+      "input": "1 manifest - demuxed M video 1 audio",
+      "output": "1 manifest - hybrid 1 video + audio M audio",
+      "verdict": "compiled"
+    },
+    "14->20": {
+      "input": "1 manifest - demuxed M video 1 audio",
+      "output": "1 manifest - hybrid M video + audio N audio",
+      "verdict": "compiled"
+    },
+    "15->00": {
+      "input": "1 manifest - demuxed 1 video M audio",
+      "output": "1 file 0 video track 0 audio track",
+      "verdict": "unrun",
+      "why": "n/a: a file with no tracks writes nothing"
+    },
+    "15->01": {
+      "input": "1 manifest - demuxed 1 video M audio",
+      "output": "1 file 1 video track 0 audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "15->02": {
+      "input": "1 manifest - demuxed 1 video M audio",
+      "output": "1 file 0 video track 1 audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "15->03": {
+      "input": "1 manifest - demuxed 1 video M audio",
+      "output": "1 file M video track 0 audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "15->04": {
+      "input": "1 manifest - demuxed 1 video M audio",
+      "output": "1 file 0 video track M audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "15->05": {
+      "input": "1 manifest - demuxed 1 video M audio",
+      "output": "1 file 1 video track 1 audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "15->06": {
+      "input": "1 manifest - demuxed 1 video M audio",
+      "output": "1 file 1 video track M audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "15->07": {
+      "input": "1 manifest - demuxed 1 video M audio",
+      "output": "1 file M video track 1 audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "15->08": {
+      "input": "1 manifest - demuxed 1 video M audio",
+      "output": "1 file M video track N audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "15->09": {
+      "input": "1 manifest - demuxed 1 video M audio",
+      "output": "1 manifest 1 video",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "15->10": {
+      "input": "1 manifest - demuxed 1 video M audio",
+      "output": "1 manifest 1 audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "15->11": {
+      "input": "1 manifest - demuxed 1 video M audio",
+      "output": "1 manifest - muxed 1 video + audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "15->12": {
+      "input": "1 manifest - demuxed 1 video M audio",
+      "output": "1 manifest - muxed M video + audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "15->13": {
+      "input": "1 manifest - demuxed 1 video M audio",
+      "output": "1 manifest - demuxed 1 video 1 audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "15->14": {
+      "input": "1 manifest - demuxed 1 video M audio",
+      "output": "1 manifest - demuxed M video 1 audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "15->15": {
+      "input": "1 manifest - demuxed 1 video M audio",
+      "output": "1 manifest - demuxed 1 video M audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "15->16": {
+      "input": "1 manifest - demuxed 1 video M audio",
+      "output": "1 manifest - demuxed M video N audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "15->17": {
+      "input": "1 manifest - demuxed 1 video M audio",
+      "output": "1 manifest - hybrid 1 video + audio 1 audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "15->18": {
+      "input": "1 manifest - demuxed 1 video M audio",
+      "output": "1 manifest - hybrid M video + audio 1 audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "15->19": {
+      "input": "1 manifest - demuxed 1 video M audio",
+      "output": "1 manifest - hybrid 1 video + audio M audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "15->20": {
+      "input": "1 manifest - demuxed 1 video M audio",
+      "output": "1 manifest - hybrid M video + audio N audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "16->00": {
+      "input": "1 manifest - demuxed M video N audio",
+      "output": "1 file 0 video track 0 audio track",
+      "verdict": "unrun",
+      "why": "n/a: a file with no tracks writes nothing"
+    },
+    "16->01": {
+      "input": "1 manifest - demuxed M video N audio",
+      "output": "1 file 1 video track 0 audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "16->02": {
+      "input": "1 manifest - demuxed M video N audio",
+      "output": "1 file 0 video track 1 audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "16->03": {
+      "input": "1 manifest - demuxed M video N audio",
+      "output": "1 file M video track 0 audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "16->04": {
+      "input": "1 manifest - demuxed M video N audio",
+      "output": "1 file 0 video track M audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "16->05": {
+      "input": "1 manifest - demuxed M video N audio",
+      "output": "1 file 1 video track 1 audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "16->06": {
+      "input": "1 manifest - demuxed M video N audio",
+      "output": "1 file 1 video track M audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "16->07": {
+      "input": "1 manifest - demuxed M video N audio",
+      "output": "1 file M video track 1 audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "16->08": {
+      "input": "1 manifest - demuxed M video N audio",
+      "output": "1 file M video track N audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "16->09": {
+      "input": "1 manifest - demuxed M video N audio",
+      "output": "1 manifest 1 video",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "16->10": {
+      "input": "1 manifest - demuxed M video N audio",
+      "output": "1 manifest 1 audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "16->11": {
+      "input": "1 manifest - demuxed M video N audio",
+      "output": "1 manifest - muxed 1 video + audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "16->12": {
+      "input": "1 manifest - demuxed M video N audio",
+      "output": "1 manifest - muxed M video + audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "16->13": {
+      "input": "1 manifest - demuxed M video N audio",
+      "output": "1 manifest - demuxed 1 video 1 audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "16->14": {
+      "input": "1 manifest - demuxed M video N audio",
+      "output": "1 manifest - demuxed M video 1 audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "16->15": {
+      "input": "1 manifest - demuxed M video N audio",
+      "output": "1 manifest - demuxed 1 video M audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "16->16": {
+      "input": "1 manifest - demuxed M video N audio",
+      "output": "1 manifest - demuxed M video N audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "16->17": {
+      "input": "1 manifest - demuxed M video N audio",
+      "output": "1 manifest - hybrid 1 video + audio 1 audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "16->18": {
+      "input": "1 manifest - demuxed M video N audio",
+      "output": "1 manifest - hybrid M video + audio 1 audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "16->19": {
+      "input": "1 manifest - demuxed M video N audio",
+      "output": "1 manifest - hybrid 1 video + audio M audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "16->20": {
+      "input": "1 manifest - demuxed M video N audio",
+      "output": "1 manifest - hybrid M video + audio N audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "17->00": {
+      "input": "1 manifest - hybrid 1 video + audio 1 audio",
+      "output": "1 file 0 video track 0 audio track",
+      "verdict": "unrun",
+      "why": "n/a: a file with no tracks writes nothing"
+    },
+    "17->01": {
+      "input": "1 manifest - hybrid 1 video + audio 1 audio",
+      "output": "1 file 1 video track 0 audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: the hybrid ladder has two muxed variants, and a one-variant one is another composed playlist"
+    },
+    "17->02": {
+      "input": "1 manifest - hybrid 1 video + audio 1 audio",
+      "output": "1 file 0 video track 1 audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: the hybrid ladder has two muxed variants, and a one-variant one is another composed playlist"
+    },
+    "17->03": {
+      "input": "1 manifest - hybrid 1 video + audio 1 audio",
+      "output": "1 file M video track 0 audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: the hybrid ladder has two muxed variants, and a one-variant one is another composed playlist"
+    },
+    "17->04": {
+      "input": "1 manifest - hybrid 1 video + audio 1 audio",
+      "output": "1 file 0 video track M audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: the hybrid ladder has two muxed variants, and a one-variant one is another composed playlist"
+    },
+    "17->05": {
+      "input": "1 manifest - hybrid 1 video + audio 1 audio",
+      "output": "1 file 1 video track 1 audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: the hybrid ladder has two muxed variants, and a one-variant one is another composed playlist"
+    },
+    "17->06": {
+      "input": "1 manifest - hybrid 1 video + audio 1 audio",
+      "output": "1 file 1 video track M audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: the hybrid ladder has two muxed variants, and a one-variant one is another composed playlist"
+    },
+    "17->07": {
+      "input": "1 manifest - hybrid 1 video + audio 1 audio",
+      "output": "1 file M video track 1 audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: the hybrid ladder has two muxed variants, and a one-variant one is another composed playlist"
+    },
+    "17->08": {
+      "input": "1 manifest - hybrid 1 video + audio 1 audio",
+      "output": "1 file M video track N audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: the hybrid ladder has two muxed variants, and a one-variant one is another composed playlist"
+    },
+    "17->09": {
+      "input": "1 manifest - hybrid 1 video + audio 1 audio",
+      "output": "1 manifest 1 video",
+      "verdict": "unrun",
+      "why": "nothing stands for it: the hybrid ladder has two muxed variants, and a one-variant one is another composed playlist"
+    },
+    "17->10": {
+      "input": "1 manifest - hybrid 1 video + audio 1 audio",
+      "output": "1 manifest 1 audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: the hybrid ladder has two muxed variants, and a one-variant one is another composed playlist"
+    },
+    "17->11": {
+      "input": "1 manifest - hybrid 1 video + audio 1 audio",
+      "output": "1 manifest - muxed 1 video + audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: the hybrid ladder has two muxed variants, and a one-variant one is another composed playlist"
+    },
+    "17->12": {
+      "input": "1 manifest - hybrid 1 video + audio 1 audio",
+      "output": "1 manifest - muxed M video + audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: the hybrid ladder has two muxed variants, and a one-variant one is another composed playlist"
+    },
+    "17->13": {
+      "input": "1 manifest - hybrid 1 video + audio 1 audio",
+      "output": "1 manifest - demuxed 1 video 1 audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: the hybrid ladder has two muxed variants, and a one-variant one is another composed playlist"
+    },
+    "17->14": {
+      "input": "1 manifest - hybrid 1 video + audio 1 audio",
+      "output": "1 manifest - demuxed M video 1 audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: the hybrid ladder has two muxed variants, and a one-variant one is another composed playlist"
+    },
+    "17->15": {
+      "input": "1 manifest - hybrid 1 video + audio 1 audio",
+      "output": "1 manifest - demuxed 1 video M audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: the hybrid ladder has two muxed variants, and a one-variant one is another composed playlist"
+    },
+    "17->16": {
+      "input": "1 manifest - hybrid 1 video + audio 1 audio",
+      "output": "1 manifest - demuxed M video N audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: the hybrid ladder has two muxed variants, and a one-variant one is another composed playlist"
+    },
+    "17->17": {
+      "input": "1 manifest - hybrid 1 video + audio 1 audio",
+      "output": "1 manifest - hybrid 1 video + audio 1 audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: the hybrid ladder has two muxed variants, and a one-variant one is another composed playlist"
+    },
+    "17->18": {
+      "input": "1 manifest - hybrid 1 video + audio 1 audio",
+      "output": "1 manifest - hybrid M video + audio 1 audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: the hybrid ladder has two muxed variants, and a one-variant one is another composed playlist"
+    },
+    "17->19": {
+      "input": "1 manifest - hybrid 1 video + audio 1 audio",
+      "output": "1 manifest - hybrid 1 video + audio M audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: the hybrid ladder has two muxed variants, and a one-variant one is another composed playlist"
+    },
+    "17->20": {
+      "input": "1 manifest - hybrid 1 video + audio 1 audio",
+      "output": "1 manifest - hybrid M video + audio N audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: the hybrid ladder has two muxed variants, and a one-variant one is another composed playlist"
+    },
+    "18->00": {
+      "input": "1 manifest - hybrid M video + audio 1 audio",
+      "output": "1 file 0 video track 0 audio track",
+      "verdict": "unrun",
+      "why": "n/a: a file with no tracks writes nothing"
+    },
+    "18->01": {
+      "input": "1 manifest - hybrid M video + audio 1 audio",
+      "output": "1 file 1 video track 0 audio track",
+      "verdict": "compiled"
+    },
+    "18->02": {
+      "input": "1 manifest - hybrid M video + audio 1 audio",
+      "output": "1 file 0 video track 1 audio track",
+      "verdict": "compiled"
+    },
+    "18->03": {
+      "input": "1 manifest - hybrid M video + audio 1 audio",
+      "output": "1 file M video track 0 audio track",
+      "verdict": "compiled"
+    },
+    "18->04": {
+      "input": "1 manifest - hybrid M video + audio 1 audio",
+      "output": "1 file 0 video track M audio track",
+      "verdict": "compiled"
+    },
+    "18->05": {
+      "input": "1 manifest - hybrid M video + audio 1 audio",
+      "output": "1 file 1 video track 1 audio track",
+      "verdict": "compiled"
+    },
+    "18->06": {
+      "input": "1 manifest - hybrid M video + audio 1 audio",
+      "output": "1 file 1 video track M audio track",
+      "verdict": "compiled"
+    },
+    "18->07": {
+      "input": "1 manifest - hybrid M video + audio 1 audio",
+      "output": "1 file M video track 1 audio track",
+      "verdict": "compiled"
+    },
+    "18->08": {
+      "input": "1 manifest - hybrid M video + audio 1 audio",
+      "output": "1 file M video track N audio track",
+      "verdict": "compiled"
+    },
+    "18->09": {
+      "input": "1 manifest - hybrid M video + audio 1 audio",
+      "output": "1 manifest 1 video",
+      "verdict": "compiled"
+    },
+    "18->10": {
+      "input": "1 manifest - hybrid M video + audio 1 audio",
+      "output": "1 manifest 1 audio",
+      "verdict": "compiled"
+    },
+    "18->11": {
+      "input": "1 manifest - hybrid M video + audio 1 audio",
+      "output": "1 manifest - muxed 1 video + audio",
+      "verdict": "compiled"
+    },
+    "18->12": {
+      "input": "1 manifest - hybrid M video + audio 1 audio",
+      "output": "1 manifest - muxed M video + audio",
+      "verdict": "compiled"
+    },
+    "18->13": {
+      "input": "1 manifest - hybrid M video + audio 1 audio",
+      "output": "1 manifest - demuxed 1 video 1 audio",
+      "verdict": "compiled"
+    },
+    "18->14": {
+      "input": "1 manifest - hybrid M video + audio 1 audio",
+      "output": "1 manifest - demuxed M video 1 audio",
+      "verdict": "compiled"
+    },
+    "18->15": {
+      "input": "1 manifest - hybrid M video + audio 1 audio",
+      "output": "1 manifest - demuxed 1 video M audio",
+      "verdict": "compiled"
+    },
+    "18->16": {
+      "input": "1 manifest - hybrid M video + audio 1 audio",
+      "output": "1 manifest - demuxed M video N audio",
+      "verdict": "compiled"
+    },
+    "18->17": {
+      "input": "1 manifest - hybrid M video + audio 1 audio",
+      "output": "1 manifest - hybrid 1 video + audio 1 audio",
+      "verdict": "compiled"
+    },
+    "18->18": {
+      "input": "1 manifest - hybrid M video + audio 1 audio",
+      "output": "1 manifest - hybrid M video + audio 1 audio",
+      "verdict": "compiled"
+    },
+    "18->19": {
+      "input": "1 manifest - hybrid M video + audio 1 audio",
+      "output": "1 manifest - hybrid 1 video + audio M audio",
+      "verdict": "compiled"
+    },
+    "18->20": {
+      "input": "1 manifest - hybrid M video + audio 1 audio",
+      "output": "1 manifest - hybrid M video + audio N audio",
+      "verdict": "compiled"
+    },
+    "19->00": {
+      "input": "1 manifest - hybrid 1 video + audio M audio",
+      "output": "1 file 0 video track 0 audio track",
+      "verdict": "unrun",
+      "why": "n/a: a file with no tracks writes nothing"
+    },
+    "19->01": {
+      "input": "1 manifest - hybrid 1 video + audio M audio",
+      "output": "1 file 1 video track 0 audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "19->02": {
+      "input": "1 manifest - hybrid 1 video + audio M audio",
+      "output": "1 file 0 video track 1 audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "19->03": {
+      "input": "1 manifest - hybrid 1 video + audio M audio",
+      "output": "1 file M video track 0 audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "19->04": {
+      "input": "1 manifest - hybrid 1 video + audio M audio",
+      "output": "1 file 0 video track M audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "19->05": {
+      "input": "1 manifest - hybrid 1 video + audio M audio",
+      "output": "1 file 1 video track 1 audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "19->06": {
+      "input": "1 manifest - hybrid 1 video + audio M audio",
+      "output": "1 file 1 video track M audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "19->07": {
+      "input": "1 manifest - hybrid 1 video + audio M audio",
+      "output": "1 file M video track 1 audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "19->08": {
+      "input": "1 manifest - hybrid 1 video + audio M audio",
+      "output": "1 file M video track N audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "19->09": {
+      "input": "1 manifest - hybrid 1 video + audio M audio",
+      "output": "1 manifest 1 video",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "19->10": {
+      "input": "1 manifest - hybrid 1 video + audio M audio",
+      "output": "1 manifest 1 audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "19->11": {
+      "input": "1 manifest - hybrid 1 video + audio M audio",
+      "output": "1 manifest - muxed 1 video + audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "19->12": {
+      "input": "1 manifest - hybrid 1 video + audio M audio",
+      "output": "1 manifest - muxed M video + audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "19->13": {
+      "input": "1 manifest - hybrid 1 video + audio M audio",
+      "output": "1 manifest - demuxed 1 video 1 audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "19->14": {
+      "input": "1 manifest - hybrid 1 video + audio M audio",
+      "output": "1 manifest - demuxed M video 1 audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "19->15": {
+      "input": "1 manifest - hybrid 1 video + audio M audio",
+      "output": "1 manifest - demuxed 1 video M audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "19->16": {
+      "input": "1 manifest - hybrid 1 video + audio M audio",
+      "output": "1 manifest - demuxed M video N audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "19->17": {
+      "input": "1 manifest - hybrid 1 video + audio M audio",
+      "output": "1 manifest - hybrid 1 video + audio 1 audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "19->18": {
+      "input": "1 manifest - hybrid 1 video + audio M audio",
+      "output": "1 manifest - hybrid M video + audio 1 audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "19->19": {
+      "input": "1 manifest - hybrid 1 video + audio M audio",
+      "output": "1 manifest - hybrid 1 video + audio M audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "19->20": {
+      "input": "1 manifest - hybrid 1 video + audio M audio",
+      "output": "1 manifest - hybrid M video + audio N audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "20->00": {
+      "input": "1 manifest - hybrid M video + audio N audio",
+      "output": "1 file 0 video track 0 audio track",
+      "verdict": "unrun",
+      "why": "n/a: a file with no tracks writes nothing"
+    },
+    "20->01": {
+      "input": "1 manifest - hybrid M video + audio N audio",
+      "output": "1 file 1 video track 0 audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "20->02": {
+      "input": "1 manifest - hybrid M video + audio N audio",
+      "output": "1 file 0 video track 1 audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "20->03": {
+      "input": "1 manifest - hybrid M video + audio N audio",
+      "output": "1 file M video track 0 audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "20->04": {
+      "input": "1 manifest - hybrid M video + audio N audio",
+      "output": "1 file 0 video track M audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "20->05": {
+      "input": "1 manifest - hybrid M video + audio N audio",
+      "output": "1 file 1 video track 1 audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "20->06": {
+      "input": "1 manifest - hybrid M video + audio N audio",
+      "output": "1 file 1 video track M audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "20->07": {
+      "input": "1 manifest - hybrid M video + audio N audio",
+      "output": "1 file M video track 1 audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "20->08": {
+      "input": "1 manifest - hybrid M video + audio N audio",
+      "output": "1 file M video track N audio track",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "20->09": {
+      "input": "1 manifest - hybrid M video + audio N audio",
+      "output": "1 manifest 1 video",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "20->10": {
+      "input": "1 manifest - hybrid M video + audio N audio",
+      "output": "1 manifest 1 audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "20->11": {
+      "input": "1 manifest - hybrid M video + audio N audio",
+      "output": "1 manifest - muxed 1 video + audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "20->12": {
+      "input": "1 manifest - hybrid M video + audio N audio",
+      "output": "1 manifest - muxed M video + audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "20->13": {
+      "input": "1 manifest - hybrid M video + audio N audio",
+      "output": "1 manifest - demuxed 1 video 1 audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "20->14": {
+      "input": "1 manifest - hybrid M video + audio N audio",
+      "output": "1 manifest - demuxed M video 1 audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "20->15": {
+      "input": "1 manifest - hybrid M video + audio N audio",
+      "output": "1 manifest - demuxed 1 video M audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "20->16": {
+      "input": "1 manifest - hybrid M video + audio N audio",
+      "output": "1 manifest - demuxed M video N audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "20->17": {
+      "input": "1 manifest - hybrid M video + audio N audio",
+      "output": "1 manifest - hybrid 1 video + audio 1 audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "20->18": {
+      "input": "1 manifest - hybrid M video + audio N audio",
+      "output": "1 manifest - hybrid M video + audio 1 audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "20->19": {
+      "input": "1 manifest - hybrid M video + audio N audio",
+      "output": "1 manifest - hybrid 1 video + audio M audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    },
+    "20->20": {
+      "input": "1 manifest - hybrid M video + audio N audio",
+      "output": "1 manifest - hybrid M video + audio N audio",
+      "verdict": "unrun",
+      "why": "nothing stands for it: no ladder here has two audio renditions"
+    }
+  }
+}

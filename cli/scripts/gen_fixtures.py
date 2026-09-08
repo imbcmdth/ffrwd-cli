@@ -12,6 +12,12 @@ tests expand over. av2 and av3 differ only in their sine frequencies, so a
 ``UNION ALL`` of the two concatenates two distinguishable multi-language
 sources whose language tags agree track for track. ``stereo.mp4`` adds the
 one thing none of those have: a genuinely 2-CHANNEL audio track (plan 047).
+Five more name a track COUNT the set otherwise skips: ``audio.m4a`` (one
+audio track, no video), ``audio2.mka`` (two audio tracks, no video),
+``video2.mkv`` (two video tracks, no audio), ``av-2v.mkv`` (two video, one
+audio) and ``av-2v2a.mkv`` (two video, two audio) -- so every combination
+of one-or-many video and one-or-many audio tracks in a single file has a
+file to stand for it.
 ``font.ttf`` is a stub TrueType file and ``attached.mkv`` is a container
 carrying it, for reading attachments back. ``described.mkv`` carries two
 TITLED metadata tracks beside its video and audio -- captions and vectors --
@@ -81,6 +87,11 @@ _DESCRIBED_SPEECH_NAME = "described.speech.vtt"
 _DESCRIBED_VECTORS_NAME = "described.vectors.vtt"
 _TAGGED_NAME = "tagged.mp4"
 _AV_2ENG_NAME = "av-2eng.mp4"
+_AUDIO_NAME = "audio.m4a"
+_AUDIO2_NAME = "audio2.mka"
+_VIDEO2_NAME = "video2.mkv"
+_AV_2V_NAME = "av-2v.mkv"
+_AV_2V2A_NAME = "av-2v2a.mkv"
 _FONT_TTF_NAME = "font.ttf"
 _ATTACHED_NAME = "attached.mkv"
 _LADDER_MASTER_NAME = "ladder/master.m3u8"
@@ -522,6 +533,87 @@ def _generate_av_2eng() -> None:
     )
 
 
+def _generate_audio() -> None:
+    """One sine track and no video: the audio-only file.
+
+    Every other fixture here carries a video track, so a query reading a
+    file with none had nothing to read.
+    """
+    _run(
+        FIXTURES_DIR / _AUDIO_NAME,
+        ["-f", "lavfi", "-i", f"sine=frequency=440:duration={_DURATION}"],
+    )
+
+
+def _generate_audio2() -> None:
+    """TWO language-tagged sine tracks and no video (440 eng, 880 fra):
+    av2.mp4's audio, without the video."""
+    _run(
+        FIXTURES_DIR / _AUDIO2_NAME,
+        [
+            "-f", "lavfi", "-i", f"sine=frequency=440:duration={_DURATION}",
+            "-f", "lavfi", "-i", f"sine=frequency=880:duration={_DURATION}",
+            "-map", "0:a:0", "-map", "1:a:0",
+            "-c:a", "aac",
+            "-metadata:s:a:0", "language=eng",
+            "-metadata:s:a:1", "language=fra",
+        ],
+    )
+
+
+def _generate_video2() -> None:
+    """TWO video tracks and no audio: testsrc2 beside smptebars.
+
+    Distinguishable patterns, so which track a query picked is visible in
+    the output rather than inferred from the stream index.
+    """
+    _run(
+        FIXTURES_DIR / _VIDEO2_NAME,
+        [
+            "-f", "lavfi", "-i", f"testsrc2=duration={_DURATION}:size={_SIZE}:rate={_RATE}",
+            "-f", "lavfi", "-i", f"smptebars=duration={_DURATION}:size={_SIZE}:rate={_RATE}",
+            "-map", "0:v:0", "-map", "1:v:0",
+            "-pix_fmt", "yuv420p",
+        ],
+    )
+
+
+def _generate_av_2v() -> None:
+    """TWO video tracks and one audio track: video2.mkv plus a sine track."""
+    _run(
+        FIXTURES_DIR / _AV_2V_NAME,
+        [
+            "-f", "lavfi", "-i", f"testsrc2=duration={_DURATION}:size={_SIZE}:rate={_RATE}",
+            "-f", "lavfi", "-i", f"smptebars=duration={_DURATION}:size={_SIZE}:rate={_RATE}",
+            "-f", "lavfi", "-i", f"sine=frequency=440:duration={_DURATION}",
+            "-map", "0:v:0", "-map", "1:v:0", "-map", "2:a:0",
+            "-c:a", "aac",
+            "-pix_fmt", "yuv420p",
+            "-shortest",
+        ],
+    )
+
+
+def _generate_av_2v2a() -> None:
+    """TWO video tracks and TWO language-tagged audio tracks: the fullest
+    single-file shape, where both `.video` and `.audio` are arrays."""
+    _run(
+        FIXTURES_DIR / _AV_2V2A_NAME,
+        [
+            "-f", "lavfi", "-i", f"testsrc2=duration={_DURATION}:size={_SIZE}:rate={_RATE}",
+            "-f", "lavfi", "-i", f"smptebars=duration={_DURATION}:size={_SIZE}:rate={_RATE}",
+            "-f", "lavfi", "-i", f"sine=frequency=440:duration={_DURATION}",
+            "-f", "lavfi", "-i", f"sine=frequency=880:duration={_DURATION}",
+            "-map", "0:v:0", "-map", "1:v:0", "-map", "2:a:0", "-map", "3:a:0",
+            "-c:a", "aac",
+            "-metadata:s:a:0", "language=eng",
+            "-metadata:s:a:1", "language=fra",
+            "-pix_fmt", "yuv420p",
+            "-shortest",
+        ],
+    )
+
+
 def _generate_tagged() -> None:
     """testsrc2 video + sine audio with container tags (title/artist/date):
     the container-tag read fixture. No comment tag, so a CASE fill has a
@@ -772,6 +864,11 @@ def main() -> int:
     _generate_av_chapters()
     _generate_described()
     _generate_av_2eng()
+    _generate_audio()
+    _generate_audio2()
+    _generate_video2()
+    _generate_av_2v()
+    _generate_av_2v2a()
     _generate_tagged()
     _generate_frame_png()
     _generate_attached(_generate_font_ttf())
