@@ -993,7 +993,7 @@ def test_split_by_chapter_runs(
     """
     monkeypatch.undo()  # the synthetic probe: this one reads the real file
     monkeypatch.chdir(tmp_path)
-    assert cli.main(["run", _chapter_split_sql(), "-y"]) == 0
+    assert cli.main(["run", "--verbose", _chapter_split_sql(), "-y"]) == 0
     printed = capsys.readouterr().out
     assert "-ss 0.0 -to 1.0" in printed
     assert "-ss 1.0 -to 2.0" in printed
@@ -1020,7 +1020,7 @@ def test_split_by_chapter_re_encoding_runs(
     monkeypatch.undo()
     monkeypatch.chdir(tmp_path)
     options = " WITH (video_codec 'libx264', audio_codec 'aac')"
-    assert cli.main(["run", _chapter_split_sql(options), "-y"]) == 0
+    assert cli.main(["run", "--verbose", _chapter_split_sql(options), "-y"]) == 0
     printed = capsys.readouterr().out
     assert " && " not in printed
     assert "-ss 0.0 -to 1.0 -map" in printed

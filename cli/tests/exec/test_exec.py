@@ -2184,10 +2184,11 @@ def test_loudnorm2_run_lands_on_target(
     _require_fixture(_AV)
     out_path = tmp_path / "loudnorm2.m4a"
 
-    assert cli.main(["run", _loudnorm2_query(_AV, out_path), "-y"]) == 0
+    assert cli.main(["run", "--verbose", _loudnorm2_query(_AV, out_path), "-y"]) == 0
     printed = capsys.readouterr().out
 
-    # The second command really carries numbers, not variable references.
+    # The second command, echoed under --verbose, really carries numbers,
+    # not variable references.
     assert "${FFRWD_LN_" not in printed
     assert "measured_I=" in printed
 
