@@ -406,11 +406,11 @@ def test_submit_posts_the_spec_uploads_the_file_and_starts(
         "COPY (SELECT a.video[1] FROM input('in.mp4') a, input('in.mp4') again, "
         "input('https://cdn.example/x.mp4') b, input('rtmp://live/key') c) TO 'out.mp4'"
     )
-    code = cli.main(["run", "--remote", "--timeout", "120", query])
+    code = cli.main(["run", "--remote", "--verbose", "--timeout", "120", query])
     captured = capsys.readouterr()
     assert code == 0
     # The free line sits between the job id and the follow line, on stdout
-    # like the rest of the result.
+    # like the rest of the result; the follow line is --verbose's.
     assert captured.out == (
         f"submitted {JOB_ID}\n"
         "free this month: 47m CPU + 15m GPU remaining\n"

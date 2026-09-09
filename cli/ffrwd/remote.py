@@ -405,6 +405,7 @@ def submit_run(
     *,
     announce: Announce | None = None,
     progress: Progress | None = None,
+    detail: Announce | None = None,
 ) -> Submitted:
     """Submit `query` as a hosted job: post the spec, upload the inputs, start it.
 
@@ -447,8 +448,8 @@ def submit_run(
         "timeout_s": args.timeout,
         "client_version": __version__,
     }
-    if announce is not None:
-        announce("submitting the job")
+    if detail is not None:
+        detail("submitting the job")
     where = _jobs_url()
     body = _call(where, headers=_bearer(token), data=json.dumps(spec).encode("utf-8"))
     answer = _json_object(body, where)
@@ -486,8 +487,8 @@ def submit_run(
             _upload(upload_url, job_token, path, digest, announce, progress)
         else:
             _put(destination, path, announce, progress)
-    if announce is not None:
-        announce("starting the job")
+    if detail is not None:
+        detail("starting the job")
     _call(
         start_url,
         headers={"x-job-token": job_token},

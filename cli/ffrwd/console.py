@@ -2,8 +2,12 @@
 
 Narration is one line per meaningful step, present tense, to stderr -- never
 stdout, which carries what a script would parse. The library modules stay
-silent by contract; they take an ``Announce`` callback and the CLI wires it
-to :meth:`Console.say`. ``--quiet`` drops the lines and the spinner both.
+silent by contract; they take an ``Announce`` callback for what moves --
+an archive fetched, a model downloaded, an input uploaded -- and a second
+one for the steps between, and the CLI wires them to :meth:`Console.say`
+and :meth:`Console.detail`. Three levels: by default a transfer and the
+bars draw and the steps do not; ``--verbose`` says the steps too; and
+``--quiet`` drops everything but the result.
 
 The spinner is plain ASCII over carriage returns, and runs only when the
 stream is a TTY: a pipe or a CI log carries the narration lines alone. A
@@ -352,13 +356,17 @@ class _Spinner(threading.Thread):
 class Console:
     """The CLI's one voice on stderr: `say` a line, or `status` a spinner.
 
-    `quiet` silences both. The stream defaults to ``sys.stderr`` read at
-    write time, so a captured stderr is the one written to.
+    `quiet` silences everything; `verbose` adds the lines `detail` carries.
+    The stream defaults to ``sys.stderr`` read at write time, so a captured
+    stderr is the one written to.
     """
 
-    def __init__(self, stream: TextIO | None = None, *, quiet: bool = False) -> None:
+    def __init__(
+        self, stream: TextIO | None = None, *, quiet: bool = False, verbose: bool = False
+    ) -> None:
         self._stream = stream
         self.quiet = quiet
+        self.verbose = verbose
         self._lock = threading.Lock()
         self._spinner: _Spinner | None = None
         self._transient_width = 0
@@ -381,6 +389,15 @@ class Console:
         """Print one narration line, whatever stands on the line cleared first."""
         if self.quiet:
             return
+        self._line(line)
+
+    def detail(self, line: str) -> None:
+        """Print one step's line, under ``--verbose`` alone."""
+        if self.quiet or not self.verbose:
+            return
+        self._line(line)
+
+    def _line(self, line: str) -> None:
         with self._lock:
             if self._spinner is not None:
                 self._spinner.clear()

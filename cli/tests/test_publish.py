@@ -415,7 +415,7 @@ def test_running_the_test_command_is_announced(tmp_path: Path) -> None:
     command = _test_command("import sys; sys.exit(0)")
     root = _package(tmp_path / "built", extra={"test": command})
     said: list[str] = []
-    publish.prepare(root / "ffrwd.json", announce=said.append)
+    publish.prepare(root / "ffrwd.json", detail=said.append)
     assert f"running {command}" in said
 
 
@@ -805,7 +805,7 @@ def test_publish_validates_then_uploads_and_says_both(
     credentials.save(TOKEN, api=API)
     _accepts(served)
     root = _package(tmp_path / "built")
-    code, out, err = _run(root, monkeypatch, capsys, "publish")
+    code, out, err = _run(root, monkeypatch, capsys, "publish", "--verbose")
     assert code == 0, err
     assert "validated broadcast/tracks 1.0.0" in out
     assert "published broadcast/tracks 1.0.0 (public)" in out
@@ -817,14 +817,12 @@ def test_prepare_and_publish_announce_their_steps(served: _Served, tmp_path: Pat
     credentials.save(TOKEN, api=API)
     _accepts(served)
     root = _package(tmp_path / "built")
-    said: list[str] = []
-    prepared = publish.prepare(root / "ffrwd.json", announce=said.append)
-    publish.publish(prepared, announce=said.append)
-    assert said == [
-        "validating broadcast/tracks 1.0.0",
-        f"packing {root}",
-        f"uploading broadcast/tracks 1.0.0 ({written_size(prepared.size)})",
-    ]
+    moved: list[str] = []
+    steps: list[str] = []
+    prepared = publish.prepare(root / "ffrwd.json", announce=moved.append, detail=steps.append)
+    publish.publish(prepared, announce=moved.append)
+    assert steps == ["validating broadcast/tracks 1.0.0", f"packing {root}"]
+    assert moved == [f"uploading broadcast/tracks 1.0.0 ({written_size(prepared.size)})"]
 
 
 def test_publish_narrates_to_stderr_and_quiet_silences_it(
@@ -837,6 +835,12 @@ def test_publish_narrates_to_stderr_and_quiet_silences_it(
     _accepts(served)
     root = _package(tmp_path / "built")
     code, out, err = _run(root, monkeypatch, capsys, "publish")
+    assert code == 0
+    assert out == "published broadcast/tracks 1.0.0 (public)\n"
+    assert "uploading broadcast/tracks 1.0.0 (" in err
+    assert "validating" not in err
+
+    code, out, err = _run(root, monkeypatch, capsys, "publish", "--verbose")
     assert code == 0
     assert "validating broadcast/tracks 1.0.0\n" in err
     assert "uploading broadcast/tracks 1.0.0 (" in err

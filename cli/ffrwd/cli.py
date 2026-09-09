@@ -154,12 +154,16 @@ or a call into a linked directory, which no lockfile pins. Those print as
 which carries the ffmpeg command, the IR JSON or ``validate --json``'s error
 object -- and never twice for one package.
 
-Long steps narrate on stderr: one present-tense line per meaningful step --
-an archive fetched, a model downloaded, an input uploaded -- with names and
-sizes, and an ASCII spinner while a step with nothing finer to say runs (a
-compile, the registry, the job service). The spinner shows only when stderr
-is a TTY, so pipes and CI logs carry the lines alone; ``-q/--quiet`` keeps
-only the final result. stdout carries neither.
+Long steps narrate on stderr, at three levels. By default a command prints
+its result and shows what moves: one present-tense line per transfer -- an
+archive fetched, a model downloaded, an input uploaded -- with names and
+sizes, a bar under it, and an ASCII spinner while a step with nothing finer
+to say runs (a compile, the registry, the job service). ``--verbose`` adds
+the steps between -- each name resolved, each command run, echoed as
+``$ ...`` -- and the hints a result could carry. ``-q/--quiet`` keeps only
+the result: no lines, no bars, no spinner. The spinner and the bars draw
+only when stderr is a TTY, so pipes and CI logs carry the lines alone.
+stdout carries none of it.
 
 Two flags are deliberately absent. ``--no-probe`` made a READABLE
 file compile as if unreadable, silently stripping provenance metadata -- a
@@ -312,6 +316,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command is None:
         parser.print_usage(sys.stderr)
         return 2
+    code = _check_verbosity(args)
+    if code != 0:
+        return code
 
     handler = _HANDLERS[args.command]
     # One sink per invocation: `compile` and `validate` compile the same text
@@ -375,8 +382,25 @@ def _add_quiet_argument(subparser: argparse.ArgumentParser) -> None:
         "-q",
         "--quiet",
         action="store_true",
-        help="print only the final result: no narration, no spinner",
+        help="print only the final result: no transfers, no progress, no spinner",
     )
+
+
+def _add_verbose_argument(subparser: argparse.ArgumentParser) -> None:
+    subparser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="narrate every step, echo every command run, and print every hint",
+    )
+
+
+def _check_verbosity(args: argparse.Namespace) -> int:
+    """0, or 2 with the usage error printed when ``-q`` and ``--verbose`` were both given."""
+    if not (getattr(args, "quiet", False) and getattr(args, "verbose", False)):
+        return 0
+    print(f"error: {args.command}: -q and --verbose contradict each other", file=sys.stderr)
+    print("hint: -q keeps only the result; --verbose says everything", file=sys.stderr)
+    return 2
 
 
 _JOBS_HELP = (
@@ -435,8 +459,12 @@ def _check_jobs_id(args: argparse.Namespace) -> int:
 
 
 def _console(args: argparse.Namespace) -> Console:
-    """The narration this invocation speaks with: stderr, muted by -q/--quiet."""
-    return Console(quiet=bool(getattr(args, "quiet", False)))
+    """The narration this invocation speaks with: stderr, muted by -q, opened up by --verbose."""
+    return Console(quiet=bool(getattr(args, "quiet", False)), verbose=_verbose(args))
+
+
+def _verbose(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "verbose", False))
 
 
 def _add_global_argument(
@@ -709,6 +737,10 @@ def _build_parser() -> argparse.ArgumentParser:
         help="read ffmpeg's stderr on stdin, print loudnorm's measurements as exports",
     )
 
+    # Every subcommand, the same way: what it says by default is its result
+    # and what moves, and --verbose is how to hear the rest.
+    for subparser in subparsers.choices.values():
+        _add_verbose_argument(subparser)
     return parser
 
 
@@ -1555,6 +1587,7 @@ def _cmd_run(args: argparse.Namespace, on_warning: OnWarning) -> int:
                     args,
                     announce=console.say,
                     progress=console.progress("uploading"),
+                    detail=console.detail,
                 )
             # --wait --json speaks JSON alone on stdout; the plain submit
             # lines are the narration --json replaces, not adds to.
@@ -1562,10 +1595,11 @@ def _cmd_run(args: argparse.Namespace, on_warning: OnWarning) -> int:
                 print(f"submitted {submitted.job_id}")
                 if submitted.remaining is not None:
                     print(remote.free_footer(submitted.remaining))
-                print(
-                    "follow: ffrwd jobs --watch    "
-                    f"fetch: ffrwd jobs --fetch {submitted.job_id[:8]}"
-                )
+                if _verbose(args):
+                    print(
+                        "follow: ffrwd jobs --watch    "
+                        f"fetch: ffrwd jobs --fetch {submitted.job_id[:8]}"
+                    )
             if args.wait:
                 return remote.wait_for_run(submitted.job_id, args, console=console)
         except FfrwdError as err:
@@ -1650,16 +1684,19 @@ def _cmd_run(args: argparse.Namespace, on_warning: OnWarning) -> int:
     if plan is not None:
         return _run_plan(plan, args, packages, query, windows, budget, console, work)
 
-    # `ffrwd.execute` owns the loop; the CLI owns the printing. stderr stays
-    # uncaptured (`capture_stderr` left false) so ffmpeg writes its own output
-    # straight to the terminal, and `echo` puts each `$ <cmd>` line in front
+    # `ffrwd.execute` owns the loop; the CLI owns the printing. By default
+    # ffmpeg's own output is captured and printed only for a command that
+    # failed, the progress line being what a run shows; --verbose leaves it
+    # writing straight to the terminal, each `$ <cmd>` line echoed in front
     # of the output it produced -- except for the command whose progress is
     # drawn, which is piped so the line can be drawn from it.
+    verbose = _verbose(args)
     result = execute(
         emitted,
         timeout=budget,
         overwrite=args.overwrite,
-        echo=_echo_command,
+        capture_stderr=not verbose,
+        echo=_echo_command if verbose else None,
         players=players,
         show_only=args.show_only,
         work=work,
@@ -1761,7 +1798,8 @@ def _run_plan(
     `players` is the ffplay each shown process's stdout feeds, empty for a run
     that asked for no window. `timeout` is per stage, None for a run nothing
     bounds. `work` draws the progress of the one member writing the
-    destinations. ``--jobs`` reaches each sidecar through the renderer.
+    destinations. ``--jobs`` reaches each sidecar through the renderer, and
+    ``--verbose`` echoes each member's command as it is spawned.
     """
     code = _provision_nn(plan, console)
     if code != 0:
@@ -1772,7 +1810,7 @@ def _run_plan(
             sidecar_argv=functools.partial(wasm.sidecar_argv, jobs=args.jobs),
             timeout=timeout,
             overwrite=args.overwrite,
-            echo=_echo_member,
+            echo=_echo_member if _verbose(args) else None,
             players=players,
             show_only=args.show_only,
             work=work,
@@ -2115,9 +2153,11 @@ def _exported_function(package: Package, name: str, entry: _Listed) -> Signature
     return found
 
 
-def _print_source(title: str, file: str, text: str) -> None:
-    """One recipe or function under a line naming it and the file it is written in."""
-    print(f"{title} ({file})\n\n{text}")
+def _print_source(title: str, file: str, text: str, *, verbose: bool) -> None:
+    """One recipe or function as its file writes it; ``--verbose`` heads it with name and file."""
+    if verbose:
+        print(f"{title} ({file})\n")
+    print(text)
 
 
 def _list_package(entry: _Listed, *, as_json: bool) -> int:
@@ -2140,7 +2180,7 @@ def _list_package(entry: _Listed, *, as_json: bool) -> int:
     return 0
 
 
-def _list_recipe(package: Package, name: str, *, as_json: bool) -> int:
+def _list_recipe(package: Package, name: str, *, as_json: bool, verbose: bool) -> int:
     """One recipe as its file writes it: the header comments and the query."""
     file = _shipped_recipe(package, name)
     text = _read_recipe(package, name, file)[0].strip()
@@ -2157,11 +2197,13 @@ def _list_recipe(package: Package, name: str, *, as_json: bool) -> int:
             },
         )
         return 0
-    _print_source(f"{package.name}:{name}", written, text)
+    _print_source(f"{package.name}:{name}", written, text, verbose=verbose)
     return 0
 
 
-def _list_function(package: Package, name: str, entry: _Listed, *, as_json: bool) -> int:
+def _list_function(
+    package: Package, name: str, entry: _Listed, *, as_json: bool, verbose: bool
+) -> int:
     """One exported function as its lib file writes it, comments and all."""
     signature = _exported_function(package, name, entry)
     text = package_sources(package)[name]
@@ -2177,19 +2219,23 @@ def _list_function(package: Package, name: str, entry: _Listed, *, as_json: bool
             },
         )
         return 0
-    _print_source(f"{package.name}.{signature.written}", written, text)
+    _print_source(f"{package.name}.{signature.written}", written, text, verbose=verbose)
     return 0
 
 
-def _list_target(text: str, packages: PackageSet | None, *, as_json: bool) -> int:
+def _list_target(
+    text: str, packages: PackageSet | None, *, as_json: bool, verbose: bool
+) -> int:
     """The listing for one ``ns/pkg[:recipe|.function]`` argument."""
     target = _target(text)
     package = _discovered_package(target.package, packages)
     if target.recipe is not None:
-        return _list_recipe(package, target.recipe, as_json=as_json)
+        return _list_recipe(package, target.recipe, as_json=as_json, verbose=verbose)
     entry = _listed(package, packages)
     if target.function is not None:
-        return _list_function(package, target.function, entry, as_json=as_json)
+        return _list_function(
+            package, target.function, entry, as_json=as_json, verbose=verbose
+        )
     return _list_package(entry, as_json=as_json)
 
 
@@ -2205,7 +2251,9 @@ def _cmd_list(args: argparse.Namespace, on_warning: OnWarning) -> int:
     try:
         found = discover(Path.cwd())
         if args.target is not None:
-            return _list_target(args.target, found, as_json=args.as_json)
+            return _list_target(
+                args.target, found, as_json=args.as_json, verbose=_verbose(args)
+            )
         packages = [] if found is None else [found.packages[name] for name in found.names()]
     except FfrwdError as err:
         _print_error(err)
@@ -2689,6 +2737,8 @@ def _cmd_init(args: argparse.Namespace, on_warning: OnWarning) -> int:
         print(f"wrote {MANIFEST_NAME}, {LOCKFILE_NAME} and the module scaffold in {directory}")
     else:
         print(f"wrote {MANIFEST_NAME}, {LOCKFILE_NAME} and {_STARTER_FILE} in {directory}")
+    if not _verbose(args):
+        return 0
     print(
         f"package '{name}' (namespace from {namespace_source}); a project that installs "
         f"it calls its functions as {name.replace('/', '.')}.name()"
@@ -2861,19 +2911,24 @@ def _install_here(args: argparse.Namespace) -> int:
                 lock=lock,
                 announce=console.say,
                 progress=console.progress("downloading"),
+                detail=console.detail,
             )
     except FfrwdError as err:
         _print_error(err)
         return 1
 
-    _print_project_install(installed)
+    _print_project_install(installed, verbose=_verbose(args))
     return 0
 
 
-def _print_project_install(installed: packages_module.ProjectInstalled) -> None:
-    """The bare-install summary: what was made whole, and what arrived for it."""
+def _print_project_install(
+    installed: packages_module.ProjectInstalled, *, verbose: bool
+) -> None:
+    """The bare-install summary: what was made whole and, under ``--verbose``, what arrived."""
     package = installed.package
-    print(f"installed what {package.name} {package.version} needs in {installed.lock}")
+    print(f"added what {package.name} {package.version} needs to {installed.lock}")
+    if not verbose:
+        return
     if installed.brought:
         brought = ", ".join(f"{one.name} {one.version}" for one in installed.brought)
         print(f"  fetched: {brought}")
@@ -2903,13 +2958,16 @@ def _cmd_install(args: argparse.Namespace, on_warning: OnWarning) -> int:
                 manifest=manifest if manifest.is_file() else None,
                 announce=console.say,
                 progress=console.progress("downloading"),
+                detail=console.detail,
             )
     except FfrwdError as err:
         _print_error(err)
         return 1
 
     release = installed.release
-    print(f"installed {release.name} {release.version} in {lock}")
+    print(f"added {release.name} {release.version} to {lock}")
+    if not _verbose(args):
+        return 0
     if installed.replaced is not None:
         print(f"  replacing {_described(installed.replaced)}")
     if not installed.downloaded:
@@ -2919,11 +2977,6 @@ def _cmd_install(args: argparse.Namespace, on_warning: OnWarning) -> int:
     if installed.brought:
         brought = ", ".join(f"{one.name} {one.version}" for one in installed.brought)
         print(f"  brought along as dependencies: {brought}")
-    full = release.name.replace("/", ".")
-    print(
-        f"a query calls it as {full}.<name>() -- `ffrwd list {release.name}` "
-        "shows what it provides"
-    )
     return 0
 
 
@@ -3103,6 +3156,8 @@ def _cmd_link(args: argparse.Namespace, on_warning: OnWarning) -> int:
     if started:
         print(f"started {lock}")
     print(f"linked {name} -> {root} in {links_file}")
+    if not _verbose(args):
+        return 0
     if replaced is not None and replaced.path is not None:
         print(f"  replacing the link to {replaced.path}")
     if pinned is not None:
@@ -3137,8 +3192,9 @@ def _link_here(args: argparse.Namespace) -> int:
                 lock=manifest.parent / LOCKFILE_NAME,
                 announce=console.say,
                 progress=console.progress("downloading"),
+                detail=console.detail,
             )
-        _print_project_install(installed)
+        _print_project_install(installed, verbose=_verbose(args))
         root = manifest.parent.resolve()
         held = read_linksfile(machine)
         replaced = next(
@@ -3156,6 +3212,8 @@ def _link_here(args: argparse.Namespace) -> int:
         return 1
 
     print(f"linked {package.name} -> {root} in {machine}")
+    if not _verbose(args):
+        return 0
     if replaced is not None and replaced.path not in (None, entry.path):
         print(f"  replacing the link to {replaced.path}")
     print(f"a project reads it live after `ffrwd link {package.name}` there")
@@ -3318,7 +3376,8 @@ def _cmd_login(args: argparse.Namespace, on_warning: OnWarning) -> int:
         _print_error(err)
         return 1
     print(f"saved a token for {packages_module.api_url()} in {path}")
-    print("`ffrwd publish` uses it; `ffrwd logout` removes it")
+    if _verbose(args):
+        print("`ffrwd publish` uses it; `ffrwd logout` removes it")
     return 0
 
 
@@ -3365,6 +3424,7 @@ def _cmd_publish(args: argparse.Namespace, on_warning: OnWarning) -> int:
                 discover(manifest.parent),
                 on_warning=on_warning,
                 announce=console.say,
+                detail=console.detail,
             )
     except FfrwdError as err:
         _print_error(err)
@@ -3375,7 +3435,11 @@ def _cmd_publish(args: argparse.Namespace, on_warning: OnWarning) -> int:
         return 1
 
     package = prepared.package
-    print(f"validated {package.name} {package.version}: {prepared.size} bytes, {prepared.sha256}")
+    if _verbose(args):
+        print(
+            f"validated {package.name} {package.version}: "
+            f"{prepared.size} bytes, {prepared.sha256}"
+        )
     try:
         with console.status("uploading"):
             published = publish_module.publish(prepared, announce=console.say)
@@ -3383,7 +3447,8 @@ def _cmd_publish(args: argparse.Namespace, on_warning: OnWarning) -> int:
         _print_error(err)
         return 1
     print(f"published {published.name} {published.version} ({published.visibility})")
-    print(f"install it with `ffrwd install {published.name}`")
+    if _verbose(args):
+        print(f"install it with `ffrwd install {published.name}`")
     return 0
 
 
@@ -3423,6 +3488,8 @@ def _cmd_setup(args: argparse.Namespace, on_warning: OnWarning) -> int:
     if args.cuda and "cuda" in nn.wanted_tiers(found):
         print("--cuda: this platform already takes the CUDA provider without asking")
     print(f"ONNX Runtime {found.ort_version} for {found.platform} is in {directory}")
+    if not _verbose(args):
+        return 0
     for line in _runtime_listing(directory):
         print(f"  {line}")
     print(f"a query that runs a model finds it there; {nn.TARGET_VAR} names the target")

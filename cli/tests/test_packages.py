@@ -370,7 +370,7 @@ def test_init_then_install_then_a_query_calling_it(
 
     code, out, _err = _run(project, monkeypatch, capsys, "install", "broadcast/tracks")
     assert code == 0
-    assert "installed broadcast/tracks 1.0.0" in out
+    assert "added broadcast/tracks 1.0.0" in out
 
     entries = read_lockfile(project / "ffrwd.lock").entries
     assert len(entries) == 1
@@ -397,7 +397,9 @@ def test_install_records_the_dependency_keyed_by_name(
     project = _project(tmp_path / "work", monkeypatch, capsys)
     before = _read_json(project / "ffrwd.json")
 
-    code, out, _err = _run(project, monkeypatch, capsys, "install", "broadcast/tracks")
+    code, out, _err = _run(
+        project, monkeypatch, capsys, "install", "--verbose", "broadcast/tracks"
+    )
     assert code == 0
     assert "recorded in ffrwd.json as a dependency" in out
 
@@ -436,10 +438,18 @@ def test_install_narrates_each_step_to_stderr(
 ) -> None:
     _publish(registry, _package(tmp_path / "built"))
     project = _project(tmp_path / "work", monkeypatch, capsys)
-    code, _out, err = _run(project, monkeypatch, capsys, "install", "broadcast/tracks")
+    code, out, err = _run(project, monkeypatch, capsys, "install", "broadcast/tracks")
+    assert code == 0
+    # What moves is said; the steps between are not, and neither is a hint.
+    assert "fetching broadcast/tracks 1.0.0 (" in err
+    assert "resolving" not in err
+    assert out == f"added broadcast/tracks 1.0.0 to {project / 'ffrwd.lock'}\n"
+
+    code, _out, err = _run(
+        project, monkeypatch, capsys, "install", "--verbose", "broadcast/tracks"
+    )
     assert code == 0
     assert "resolving broadcast/tracks\n" in err
-    assert "fetching broadcast/tracks 1.0.0 (" in err
 
 
 def test_install_quiet_keeps_stderr_empty(
@@ -456,7 +466,7 @@ def test_install_quiet_keeps_stderr_empty(
     )
     assert code == 0
     assert err == ""
-    assert "installed broadcast/tracks 1.0.0" in out
+    assert "added broadcast/tracks 1.0.0" in out
 
 
 # ---------------------------------------------------------------------------
@@ -505,7 +515,9 @@ def test_install_fetches_a_dependency_and_its_recipe_runs_unaided(
     )
     project = _project(tmp_path / "work", monkeypatch, capsys)
 
-    code, out, _err = _run(project, monkeypatch, capsys, "install", "broadcast/images")
+    code, out, _err = _run(
+        project, monkeypatch, capsys, "install", "--verbose", "broadcast/images"
+    )
     assert code == 0
     assert "brought along as dependencies: broadcast/video 1.0.0" in out
 
@@ -781,7 +793,9 @@ def test_content_already_in_the_store_is_not_downloaded_again(
     # The only copy of the archive left is the one in the store.
     (registry / "archives" / sha256).unlink()
     second = _project(tmp_path / "two", monkeypatch, capsys)
-    code, out, _err = _run(second, monkeypatch, capsys, "install", "broadcast/tracks")
+    code, out, _err = _run(
+        second, monkeypatch, capsys, "install", "--verbose", "broadcast/tracks"
+    )
     assert code == 0
     assert "already in the store" in out
     assert read_lockfile(second / "ffrwd.lock").entries[0].sha256 == sha256
@@ -918,9 +932,9 @@ def test_bare_install_fetches_the_manifests_dependencies_at_their_written_versio
         dependencies={"broadcast/tracks": "1.0.0"},
     )
 
-    code, out, err = _run(project, monkeypatch, capsys, "install")
+    code, out, err = _run(project, monkeypatch, capsys, "install", "--verbose")
     assert code == 0, err
-    assert "installed what consumer/mine 1.0.0 needs in" in out
+    assert "added what consumer/mine 1.0.0 needs to" in out
     assert "fetched: broadcast/tracks 1.0.0" in out
     held = read_lockfile(project / "ffrwd.lock")
     assert held.dependencies == {"broadcast/tracks": "1.0.0"}
@@ -934,7 +948,7 @@ def test_bare_install_fetches_the_manifests_dependencies_at_their_written_versio
     )
     assert code == 0 and "volume=volume=0.5" in out
 
-    code, out, _err = _run(project, monkeypatch, capsys, "install")
+    code, out, _err = _run(project, monkeypatch, capsys, "install", "--verbose")
     assert code == 0
     assert "all dependencies were already pinned" in out
 
@@ -958,10 +972,10 @@ def test_bare_install_leaves_a_dependency_that_is_linked_to_a_directory(
     assert _run(dev, monkeypatch, capsys, "link")[0] == 0
     assert _run(project, monkeypatch, capsys, "link", "broadcast/tracks")[0] == 0
 
-    code, out, err = _run(project, monkeypatch, capsys, "install")
+    code, out, err = _run(project, monkeypatch, capsys, "install", "--verbose")
     assert code == 0, err
     assert "broadcast/tracks is linked to a working directory" in err
-    assert "installed what consumer/mine 1.0.0 needs in" in out
+    assert "added what consumer/mine 1.0.0 needs to" in out
     held = read_lockfile(project / "ffrwd.lock")
     assert held.entries == (), "nothing was fetched over the link"
     assert held.dependencies == {}, "nothing was pinned to a published version"
@@ -1050,7 +1064,7 @@ def test_link_then_bare_install_resolves_the_published_and_leaves_the_linked(
     assert not (project / "ffrwd.lock").exists()
     assert _run(project, monkeypatch, capsys, "link", "broadcast/tracks")[0] == 0
 
-    code, out, err = _run(project, monkeypatch, capsys, "install")
+    code, out, err = _run(project, monkeypatch, capsys, "install", "--verbose")
     assert code == 0, err
     assert "broadcast/tracks is linked to a working directory" in err
     held = read_lockfile(project / "ffrwd.lock")
@@ -1094,7 +1108,7 @@ def test_bare_install_fetches_the_projects_own_pinned_models(
     assert (project / "depth.onnx").read_bytes() == MODEL
     assert served.urls() == [MODEL_URL]
 
-    code, out, _err = _run(project, monkeypatch, capsys, "install")
+    code, out, _err = _run(project, monkeypatch, capsys, "install", "--verbose")
     assert code == 0
     assert served.urls() == [MODEL_URL]  # already there and matching; not refetched
     assert "all dependencies were already pinned" in out
@@ -1140,7 +1154,9 @@ def test_installing_another_version_changes_the_want_but_keeps_the_old_entry(
     project = _project(tmp_path / "work", monkeypatch, capsys)
     assert _run(project, monkeypatch, capsys, "install", "broadcast/tracks@1.0.0")[0] == 0
 
-    code, out, _err = _run(project, monkeypatch, capsys, "install", "broadcast/tracks@2.0.0")
+    code, out, _err = _run(
+        project, monkeypatch, capsys, "install", "--verbose", "broadcast/tracks@2.0.0"
+    )
     assert code == 0
     assert "replacing the installed broadcast/tracks 1.0.0" in out
     entries = read_lockfile(project / "ffrwd.lock").entries
@@ -1628,7 +1644,7 @@ def test_an_archive_is_asked_for_by_signing_and_then_downloaded(
 
     code, out, _err = _run(project, monkeypatch, capsys, "install", "broadcast/tracks")
     assert code == 0
-    assert "installed broadcast/tracks 1.0.0" in out
+    assert "added broadcast/tracks 1.0.0" in out
     assert served.urls()[-2:] == [
         _sign_url(sha256),
         f"https://blob.example/{sha256}?token=xyz",

@@ -876,7 +876,7 @@ def test_run_executes_both_passes_in_order(
 ) -> None:
     calls = _record_runs(monkeypatch, [0, 0])
 
-    code = cli.main(["run", TWO_PASS_QUERY, "-y"])
+    code = cli.main(["run", "--verbose", TWO_PASS_QUERY, "-y"])
     captured = capsys.readouterr()
 
     assert code == 0
@@ -885,6 +885,22 @@ def test_run_executes_both_passes_in_order(
     assert calls[0][-3:] == ["-f", "null", "-"]
     assert calls[1][-1] == "out.mp4"
     assert captured.out.count("$ ffmpeg") == 2
+
+
+def test_run_echoes_its_commands_only_under_verbose(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The default run shows its progress, not the ffmpeg lines `compile` prints."""
+    calls = _record_runs(monkeypatch, [0, 0])
+    code = cli.main(["run", TWO_PASS_QUERY, "-y"])
+    captured = capsys.readouterr()
+    assert code == 0 and len(calls) == 2
+    assert captured.out == ""
+
+
+def test_quiet_and_verbose_together_are_refused(capsys: pytest.CaptureFixture[str]) -> None:
+    assert cli.main(["compile", "-q", "--verbose", MEDIA_QUERY]) == 2
+    assert "-q and --verbose contradict each other" in capsys.readouterr().err
 
 
 def test_main_reports_a_keyboard_interrupt_as_a_typed_exit_not_a_traceback(

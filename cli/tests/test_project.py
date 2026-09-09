@@ -2956,9 +2956,13 @@ def test_list_prints_one_recipe_with_its_comments_and_its_query(
     _project(tmp_path, files={"queries/split.sql": _RUNNABLE_RECIPE}, manifest=_BIN)
     code, out, _err = _list(tmp_path, monkeypatch, capsys, "me/edits:split-chapters")
     assert code == 0
-    assert out.startswith("me/edits:split-chapters (queries/split.sql)\n")
-    assert "-- variables: source (input media path), dest (output path)" in out
-    assert "COPY (SELECT f.video[1] FROM input(:'source') f) TO :'dest';" in out
+    assert out == _RUNNABLE_RECIPE.strip() + "\n", "the source alone, as the file writes it"
+
+    code, out, _err = _list(
+        tmp_path, monkeypatch, capsys, "--verbose", "me/edits:split-chapters"
+    )
+    assert code == 0
+    assert out.startswith("me/edits:split-chapters (queries/split.sql)\n\n-- variables:")
 
     code, out, _err = _list(tmp_path, monkeypatch, capsys, "me/edits:split-chapters", "--json")
     assert code == 0
@@ -2974,6 +2978,9 @@ def test_list_prints_one_function_with_its_comments_and_its_definition(
     """One definition out of a file holding two: its own comments, and no neighbour's."""
     _project(tmp_path, files={"src/tracks.sql": _TWO_DEFINITIONS})
     code, out, _err = _list(tmp_path, monkeypatch, capsys, "me/edits.quieter")
+    assert code == 0
+    assert out.startswith("-- Turn a track down by a factor.")
+    code, out, _err = _list(tmp_path, monkeypatch, capsys, "--verbose", "me/edits.quieter")
     assert code == 0
     assert out.startswith(
         "me/edits.quieter(track audio_stream, factor number) (src/tracks.sql)\n"
@@ -3186,7 +3193,12 @@ def test_init_writes_a_project_that_reads_back(
     root.mkdir()
     code, out, _err = _run(root, monkeypatch, capsys, "init", "--namespace", "me")
     assert code == 0
-    assert "ffrwd.json" in out
+    assert out.startswith("wrote ffrwd.json, ffrwd.lock and recipes/resize.sql in ")
+    assert "--namespace" not in out, "the hints wait for --verbose"
+    other = tmp_path / "other-edits"
+    other.mkdir()
+    code, out, _err = _run(other, monkeypatch, capsys, "init", "--verbose", "--namespace", "me")
+    assert code == 0
     assert "--namespace" in out
     package = read_manifest(root / "ffrwd.json")
     assert package.name == "me/my_edits" and package.version == "0.1.0"
@@ -3223,7 +3235,9 @@ def test_init_takes_the_whole_name(
 ) -> None:
     root = tmp_path / "whatever"
     root.mkdir()
-    code, out, _err = _run(root, monkeypatch, capsys, "init", "--name", "broadcast/tracks")
+    code, out, _err = _run(
+        root, monkeypatch, capsys, "init", "--verbose", "--name", "broadcast/tracks"
+    )
     assert code == 0
     assert "--name" in out
     assert read_manifest(root / "ffrwd.json").name == "broadcast/tracks"
@@ -3243,7 +3257,7 @@ def test_init_derives_the_namespace_from_the_git_remote(
         cwd=root,
         check=True,
     )
-    code, out, _err = _run(root, monkeypatch, capsys, "init")
+    code, out, _err = _run(root, monkeypatch, capsys, "init", "--verbose")
     assert code == 0
     assert "git remote" in out
     assert read_manifest(root / "ffrwd.json").name == "broadcast/tracks"
@@ -3322,7 +3336,9 @@ def test_init_rust_writes_a_module_package_that_reads_back(
 ) -> None:
     root = tmp_path / "my-filter"
     root.mkdir()
-    code, out, _err = _run(root, monkeypatch, capsys, "init", "--rust", "--namespace", "me")
+    code, out, _err = _run(
+        root, monkeypatch, capsys, "init", "--verbose", "--rust", "--namespace", "me"
+    )
     assert code == 0
     assert "cargo build --target wasm32-wasip2 --release" in out
 
@@ -3454,7 +3470,7 @@ def test_link_answers_over_an_installed_package_and_the_pin_stays(
     lock = _lock(project, [entry], dependencies={"tracks/lib": "2.0.0"})
     before = lock.read_text(encoding="utf-8")
     _registered(_library(tmp_path / "dev", "tracks", "0.9"))
-    code, out, _err = _run(project, monkeypatch, capsys, "link", "tracks/lib")
+    code, out, _err = _run(project, monkeypatch, capsys, "link", "--verbose", "tracks/lib")
     assert code == 0
     assert "over the installed tracks/lib 2.0.0, which stays pinned" in out
     assert lock.read_text(encoding="utf-8") == before
@@ -3547,9 +3563,9 @@ def test_link_in_the_package_directory_installs_and_records_it_machine_wide(
         tmp_path / "dev", "studio", "0.5", package="pipe", dependencies={"shared/d": "1.0.0"}
     )
 
-    code, out, err = _run(dev, monkeypatch, capsys, "link")
+    code, out, err = _run(dev, monkeypatch, capsys, "link", "--verbose")
     assert code == 0, err
-    assert "installed what studio/pipe 1.0.0 needs in" in out
+    assert "added what studio/pipe 1.0.0 needs to" in out
     assert "fetched: shared/d 1.0.0" in out
     assert "linked studio/pipe -> " in out and "ffrwd.links" in out
     own = read_lockfile(dev / "ffrwd.lock")
@@ -3568,7 +3584,7 @@ def test_link_in_the_package_directory_installs_and_records_it_machine_wide(
     assert not store.global_lock_path().exists()
 
     # Run again: the install answers cheaply, the record replaces, never stacks.
-    code, out, _err = _run(dev, monkeypatch, capsys, "link")
+    code, out, _err = _run(dev, monkeypatch, capsys, "link", "--verbose")
     assert code == 0
     assert "all dependencies were already pinned" in out
     assert read_linksfile(machine) == held

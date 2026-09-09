@@ -541,7 +541,7 @@ def _pin_document(pin: ModelPin, size: int | None) -> Document:
     return written
 
 
-def _tested(package: Package, announce: Announce | None) -> None:
+def _tested(package: Package, detail: Announce | None) -> None:
     """Run the manifest's own ``test`` command in place of compiling recipes as a check.
 
     Runs through the platform's own shell (``&&`` and a pipe mean what the
@@ -556,8 +556,8 @@ def _tested(package: Package, announce: Announce | None) -> None:
     """
     if not package.test:
         return
-    if announce is not None:
-        announce(f"running {package.test}")
+    if detail is not None:
+        detail(f"running {package.test}")
     try:
         result = subprocess.run(package.test, shell=True, cwd=package.root)
     except OSError as err:
@@ -736,6 +736,7 @@ def prepare(
     *,
     on_warning: OnWarning | None = None,
     announce: Announce | None = None,
+    detail: Announce | None = None,
 ) -> Prepared:
     """Validate the package `manifest` declares, and pack it. Reaches the registry
     to resolve what the package depends on, and the hub for what each pinned
@@ -760,8 +761,8 @@ def prepare(
     """
     package = read_manifest(manifest)
     _checked_name(package)
-    if announce is not None:
-        announce(f"validating {package.name} {package.version}")
+    if detail is not None:
+        detail(f"validating {package.name} {package.version}")
     _resolvable(package)
     resolvable = packages if packages is not None else PackageSet(
         root=package.root, packages={package.name: package}
@@ -771,7 +772,7 @@ def prepare(
         capabilities = _capabilities(package)
         _checked_models(package)
         sizes = _model_sizes(package)
-        _tested(package, announce)
+        _tested(package, detail)
 
         readme_html = _readme_html(package)
         if readme_html is None and on_warning is not None:
@@ -794,8 +795,8 @@ def prepare(
                     hint='add "license" to the manifest, e.g. "MIT"',
                 )
             )
-        if announce is not None:
-            announce(f"packing {package.root}")
+        if detail is not None:
+            detail(f"packing {package.root}")
         try:
             archive = store.pack(package.root, on_warning=on_warning)
         except OSError as err:
@@ -811,7 +812,7 @@ def prepare(
                 "directory; install fetches it from the hub",
             )
         sha256 = hashlib.sha256(archive).hexdigest()
-        detail = _detail_document(
+        document = _detail_document(
             package,
             _description(manifest),
             resolvable,
@@ -825,7 +826,7 @@ def prepare(
         package=package,
         archive=archive,
         sha256=sha256,
-        detail=detail,
+        detail=document,
         sources=sources,
         capabilities=capabilities,
         visibility=PRIVATE if package.private else PUBLIC,

@@ -1343,6 +1343,7 @@ def _ensure(
     brought: list[Release],
     announce: Announce | None = None,
     progress: Progress | None = None,
+    detail: Announce | None = None,
 ) -> None:
     """Make sure `release`, and everything its manifest depends on, sits in `entries`.
 
@@ -1384,10 +1385,10 @@ def _ensure(
         # versions, and leave the lockfile as it was.
         chain.append(release.name)
         for name, version in pinned.dependencies.items():
-            if announce is not None:
-                announce(f"resolving {name}")
+            if detail is not None:
+                detail(f"resolving {name}")
             _ensure(
-                resolve(f"{name}@{version}"), entries, chain, brought, announce, progress
+                resolve(f"{name}@{version}"), entries, chain, brought, announce, progress, detail
             )
         chain.pop()
         brought.append(release)
@@ -1396,10 +1397,10 @@ def _ensure(
     chain.append(release.name)
     resolved: dict[str, str] = {}
     for name in package.dependencies:
-        if announce is not None:
-            announce(f"resolving {name}")
+        if detail is not None:
+            detail(f"resolving {name}")
         dependency = resolve(name)
-        _ensure(dependency, entries, chain, brought, announce, progress)
+        _ensure(dependency, entries, chain, brought, announce, progress, detail)
         resolved[name] = dependency.version
     chain.pop()
 
@@ -1447,6 +1448,7 @@ def install(
     manifest: Path | None = None,
     announce: Announce | None = None,
     progress: Progress | None = None,
+    detail: Announce | None = None,
 ) -> Installed:
     """Install `request` into the lockfile `lock`, recording it in `manifest`.
 
@@ -1464,12 +1466,13 @@ def install(
     directly asked for, since that is what lets a call written in THIS
     lockfile's own script resolve at the right version.
 
-    `announce` hears one line per step -- resolving, each archive fetched,
-    each model downloaded, the runtime -- and nothing when a step costs
-    nothing. `progress` hears the bytes of every one of those downloads.
+    `announce` hears one line per transfer -- each archive fetched, each
+    model downloaded, the runtime -- and nothing when a step costs nothing;
+    `detail` hears the steps between, each name resolved. `progress` hears
+    the bytes of every one of those downloads.
     """
-    if announce is not None:
-        announce(f"resolving {request}")
+    if detail is not None:
+        detail(f"resolving {request}")
     release = resolve(request)
     was_stored = stored(release) is not None
 
@@ -1484,7 +1487,7 @@ def install(
     )
 
     brought: list[Release] = []
-    _ensure(release, entries, [], brought, announce, progress)
+    _ensure(release, entries, [], brought, announce, progress, detail)
     # `release` itself was brought along too, by the same walk; it is not one
     # of its OWN dependencies.
     brought = [
@@ -1521,6 +1524,7 @@ def install_project(
     lock: Path,
     announce: Announce | None = None,
     progress: Progress | None = None,
+    detail: Announce | None = None,
 ) -> ProjectInstalled:
     """Install what the package at `manifest` needs to build and publish.
 
@@ -1546,13 +1550,13 @@ def install_project(
     brought: list[Release] = []
     for name, version in package.dependencies.items():
         if name in linked:
-            if announce is not None:
-                announce(f"{name} is linked to a working directory")
+            if detail is not None:
+                detail(f"{name} is linked to a working directory")
             continue
-        if announce is not None:
-            announce(f"resolving {name} {version}")
+        if detail is not None:
+            detail(f"resolving {name} {version}")
         release = resolve(f"{name}@{version}")
-        _ensure(release, entries, [], brought, announce, progress)
+        _ensure(release, entries, [], brought, announce, progress, detail)
         wanted[name] = release.version
     _write_lockfile_migrating(lock, entries, wanted)
 
