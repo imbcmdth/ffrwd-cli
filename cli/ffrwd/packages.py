@@ -93,6 +93,7 @@ from .project import (
     read_lockfile,
     read_manifest,
     stored_name,
+    version_key,
     write_linksfile,
     write_lockfile,
 )
@@ -811,22 +812,6 @@ def _matches(listing: Listing, needle: str) -> bool:
 # --------------------------------------------------------------------------
 # resolving one package to one archive
 # --------------------------------------------------------------------------
-
-
-def version_key(version: str) -> tuple[tuple[int, int, str], ...]:
-    """Sort key for a version: dot-separated parts, numeric ones compared as numbers.
-
-    Enough for the exact-pin world v0 lives in -- it orders 1.10.0 above 1.9.0,
-    which string order does not -- and it never has to decide what a range
-    means, because nothing here solves one.
-    """
-    parts: list[tuple[int, int, str]] = []
-    for piece in version.split("."):
-        if piece.isdigit():
-            parts.append((0, int(piece), ""))
-        else:
-            parts.append((1, 0, piece))
-    return tuple(parts)
 
 
 def is_version(text: str) -> bool:

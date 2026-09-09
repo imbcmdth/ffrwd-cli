@@ -339,6 +339,22 @@ _TEST_HINT = (
 )
 
 
+def version_key(version: str) -> tuple[tuple[int, int, str], ...]:
+    """Sort key for a version: dot-separated parts, numeric ones compared as numbers.
+
+    Enough for the exact-pin world v0 lives in -- it orders 1.10.0 above 1.9.0,
+    which string order does not -- and it never has to decide what a range
+    means, because nothing here solves one.
+    """
+    parts: list[tuple[int, int, str]] = []
+    for piece in version.split("."):
+        if piece.isdigit():
+            parts.append((0, int(piece), ""))
+        else:
+            parts.append((1, 0, piece))
+    return tuple(parts)
+
+
 def is_namespace(text: str) -> bool:
     """True when `text` is spelled like a namespace -- a lowercase plain identifier.
 
@@ -521,8 +537,9 @@ class Package:
 class PackageSet:
     """The packages a compile may resolve a call in, keyed by name.
 
-    `packages` is one CANONICAL `Package` per name -- the first layer that
-    claimed it -- for listing and for a fallback resolution. `versions` is
+    `packages` is one CANONICAL `Package` per name -- from the first layer
+    that claimed it, at the version that layer's lockfile pins for the name,
+    else its highest -- for listing and for a fallback resolution. `versions` is
     every installed version of every name, since install never makes two
     versions of one package fight over the name: a project depending on two
     packages that each depend on a different version of a third package pins
@@ -2332,10 +2349,18 @@ def _add_layer(
     lock: Lockfile | None,
     layer: Layer,
 ) -> None:
-    """Add `lock`'s packages under the names/versions no earlier layer claimed."""
+    """Add `lock`'s packages under the names/versions no earlier layer claimed.
+
+    Every version pins into `versions`; the name itself goes to ONE of them.
+    Within this layer that is the version the lockfile's own `dependencies`
+    pins -- what its project directly installed -- and, for a name it does
+    not pin, the highest version it carries. Entry order never decides:
+    install appends a newer version after the older one it keeps.
+    """
     if lock is None:
         return
     resolved: set[tuple[str, str]] = set()
+    claimed: dict[str, Package] = {}  # this layer's answer for each name, so far
     for entry in lock.entries:
         if isinstance(entry, LinkEntry):
             package = _linked_package(entry, lock, layer)
@@ -2356,9 +2381,24 @@ def _add_layer(
             )
         resolved.add(identity)
         versions.setdefault(package.name, {}).setdefault(package.version, package)
-        if package.name in packages:  # first claim wins, layer by layer
-            continue
-        packages[package.name] = package
+        if package.name in packages and package.name not in claimed:
+            continue  # an earlier layer answered the name
+        held = claimed.get(package.name)
+        if held is None or _canonical_over(lock, package, held):
+            claimed[package.name] = package
+            packages[package.name] = package
+
+
+def _canonical_over(lock: Lockfile, package: Package, held: Package) -> bool:
+    """True when `package` answers its name for `lock`'s layer rather than `held`.
+
+    The lockfile's own pin on the name wins when either is it; otherwise the
+    higher version.
+    """
+    pinned = lock.dependencies.get(package.name)
+    if pinned in (package.version, held.version):
+        return package.version == pinned
+    return version_key(package.version) > version_key(held.version)
 
 
 def _add_links(
@@ -2472,10 +2512,11 @@ def discover(start: Path | str | None = None) -> PackageSet | None:
     Three layers, the first claim on a name winning: the project's own
     manifest, then its lockfile, then the machine-wide one -- each lockfile
     preceded by the links file beside it, so a linked directory answers its
-    name over anything installed under it. The layering lives here and
-    nowhere else -- what the compiler gets is one name to one canonical
-    package per layer, plus every version install ever pinned, with no idea
-    which layer answered.
+    name over anything installed under it. A lockfile carrying several
+    versions of one name answers with the one its own `dependencies` pins,
+    else the highest. The layering lives here and nowhere else -- what the
+    compiler gets is one name to one canonical package per layer, plus every
+    version install ever pinned, with no idea which layer answered.
 
     Raises ``FfrwdError`` for a manifest, lockfile or links file that is
     found but malformed, for a recorded package the store or the linked

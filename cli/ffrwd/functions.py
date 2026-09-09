@@ -2955,10 +2955,16 @@ class _Expander:
         """
         packages = self.packages
         assert packages is not None
-        # A recipe's own statements resolve at its package's versions too.
+        # A recipe's own statements resolve at its package's versions too,
+        # and a package calling into itself by name gets its own version,
+        # whatever else pins that name.
         holder = self.scope if self.scope is not None else self.owner
-        dependent = holder[0] if holder is not None else None
-        found = packages.resolve(dependent, f"{namespace}/{package_name}")
+        full = f"{namespace}/{package_name}"
+        found = None
+        if holder is not None and holder[0] == full:
+            found = packages.versions.get(full, {}).get(holder[1])
+        if found is None:
+            found = packages.resolve(holder[0] if holder is not None else None, full)
         if found is not None:
             return found
         known = packages.namespaces()

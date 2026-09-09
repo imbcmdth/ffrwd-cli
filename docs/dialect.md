@@ -523,13 +523,16 @@ moves them into `ffrwd.links` and out of the lockfile.
 A package resolves through three layers, the first claim on its name
 winning: the project's own manifest, then its links file and lockfile,
 then the machine-wide pair a global install and a bare `ffrwd link`
-write. A link claims its name over anything installed under it. Two of those
-layers are worth saying out loud, so a compile reports them without
-refusing: resolving inside a project but landing on the machine-wide
-layer, and compiling against a link. Each is reported once per package
-- as a `warning:` line on stderr from the CLI, in the `warnings` array
-of an MCP tool result, and through `compile_sql`'s optional
-`on_warning` callback for a library caller.
+write. A link claims its name over anything installed under it. A lockfile
+holding several versions of one name answers with the one its own
+`dependencies` pins, else the highest; a package calling into itself by
+name gets its own version. Two of those layers are worth saying out
+loud, so a compile reports them without refusing: resolving inside a
+project but landing on the machine-wide layer, and compiling against a
+link. Each is reported once per package - as a `warning:` line on
+stderr from the CLI, in the `warnings` array of an MCP tool result, and
+through `compile_sql`'s optional `on_warning` callback for a library
+caller.
 
 A third travels the same channel and is not about packages at all. A
 stream array a file has no tracks for - `f.subtitle` where the file

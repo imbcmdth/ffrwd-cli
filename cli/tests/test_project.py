@@ -2190,6 +2190,78 @@ def test_a_recipe_reaches_the_version_its_own_package_declares(
     assert "volume=volume=0.1" in out, out
 
 
+def _self_calling(root: Path, version: str, factor: str) -> Path:
+    """A ``me/tool`` at `version` whose lib and recipe both call into the package by name."""
+    lib = (
+        "CREATE FUNCTION half(track audio_stream) RETURNS audio_stream AS $$\n"
+        f"  SELECT volume(track, {factor})\n"
+        "$$ LANGUAGE sql;\n"
+        "CREATE FUNCTION use(track audio_stream) RETURNS audio_stream AS $$\n"
+        "  SELECT me.tool.half(track)\n"
+        "$$ LANGUAGE sql;\n"
+    )
+    _write(root / "src" / "lib.sql", lib)
+    recipe = (
+        "-- variables: dest (output path)\n"
+        "COPY (SELECT me.tool.half(f.audio[1]) FROM input('film.mkv') f) TO :'dest'\n"
+    )
+    _write(root / "queries" / "go.sql", recipe)
+    manifest = {
+        "name": "me/tool",
+        "version": version,
+        "lib": {"half": "src/lib.sql", "use": "src/lib.sql"},
+        "bin": {"go": "queries/go.sql"},
+    }
+    _write(root / "ffrwd.json", json.dumps(manifest, indent=2) + chr(10))
+    return root
+
+
+def test_a_recipe_calling_its_own_package_by_name_gets_its_own_version(
+    store_home: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The lock pins 2.0.0; the 1.0.0 recipe run by version still reaches 1.0.0's half."""
+    low = _installed(_self_calling(tmp_path / "t1", "1.0.0", "0.1"))
+    high = _installed(_self_calling(tmp_path / "t2", "2.0.0", "0.2"))
+    project = tmp_path / "work"
+    _project(project, files={}, manifest={"name": "other/edits"})
+    _lock(project, [high, low], dependencies={"me/tool": "2.0.0"})
+
+    code, out, err = _run(
+        project, monkeypatch, capsys, "compile", "me/tool:go@1.0.0", "-v", "dest=o.mkv"
+    )
+    assert code == 0, err
+    assert "volume=volume=0.1" in out, out
+
+
+def test_a_body_calling_its_own_package_by_name_gets_its_own_version(
+    store_home: Path, tmp_path: Path
+) -> None:
+    """B binds me/tool at 1.0.0, whose `use` calls `me.tool.half`: 1.0.0's, not the pin's."""
+    low = _installed(_self_calling(tmp_path / "t1", "1.0.0", "0.1"))
+    high = _installed(_self_calling(tmp_path / "t2", "2.0.0", "0.2"))
+    reach = (
+        "CREATE FUNCTION use(track audio_stream) RETURNS audio_stream AS $$\n"
+        "  SELECT me.tool.use(track)\n"
+        "$$ LANGUAGE sql;\n"
+    )
+    b = _installed(
+        _library(
+            tmp_path / "b", "me", "", package="b", member="use", src=reach,
+            dependencies={"me/tool": "1.0.0"},
+        ),
+        dependencies={"me/tool": "1.0.0"},
+    )
+    project = tmp_path / "work"
+    _project(project, files={}, manifest={"name": "other/edits"})
+    _lock(project, [high, low, b], dependencies={"me/tool": "2.0.0", "me/b": "1.0.0"})
+
+    argv = _argv(QUERY.format(call="me.b.use"), _packages(project))
+    assert "volume=volume=0.1" in " ".join(argv)
+
+
 def test_a_recipe_calls_the_function_it_defines_itself(
     store_home: Path,
     tmp_path: Path,
@@ -4295,6 +4367,60 @@ def test_a_project_pin_wins_over_a_higher_global_version(
     )
     assert code == 0, err
     assert "v19.mkv" in out
+
+
+def test_a_lockfile_pin_answers_the_name_over_entry_order_and_a_higher_version(
+    store_home: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Two versions machine-wide, the higher one listed first, the lock pinning the lower.
+
+    The pin is what was installed directly; `list` and a query written outside
+    any project both answer with it.
+    """
+    older = _installed(
+        _library(tmp_path / "v19", "broadcast", "0.1", package="tracks", version="1.9.0")
+    )
+    newer = _installed(
+        _library(tmp_path / "v110", "broadcast", "0.2", package="tracks", version="1.10.0")
+    )
+    _lock(
+        store.global_lock_path().parent, [newer, older], dependencies={"broadcast/tracks": "1.9.0"}
+    )
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+
+    code, out, err = _run(elsewhere, monkeypatch, capsys, "list")
+    assert code == 0, err
+    assert "1.9.0" in out and "1.10.0" not in out
+    argv = _argv(QUERY.format(call="broadcast.tracks.quieter"), _packages(elsewhere))
+    assert "volume=volume=0.1" in " ".join(argv)
+
+
+def test_a_lockfile_pinning_nothing_answers_the_highest_version_not_the_first_entry(
+    store_home: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Install appends a newer version after the older one it keeps; order never decides."""
+    older = _installed(
+        _library(tmp_path / "v19", "broadcast", "0.1", package="tracks", version="1.9.0")
+    )
+    newer = _installed(
+        _library(tmp_path / "v110", "broadcast", "0.2", package="tracks", version="1.10.0")
+    )
+    _lock(store.global_lock_path().parent, [older, newer])
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+
+    code, out, err = _run(elsewhere, monkeypatch, capsys, "list")
+    assert code == 0, err
+    assert "1.10.0" in out and "1.9.0" not in out
+    argv = _argv(QUERY.format(call="broadcast.tracks.quieter"), _packages(elsewhere))
+    assert "volume=volume=0.2" in " ".join(argv)
 
 
 def test_a_version_nothing_installed_refuses_naming_what_is(

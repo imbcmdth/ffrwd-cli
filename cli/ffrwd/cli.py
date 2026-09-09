@@ -852,8 +852,9 @@ def _installed_package(
 
     ``@version`` is exact among the installed versions. Without one, a version
     a project layer claims -- its own manifest, or its lockfile -- wins, and a
-    name only the machine-wide layer holds resolves at its highest installed
-    version.
+    name only the machine-wide layer holds resolves at the version installed
+    there directly, else its highest. A name no layer claims at all -- pinned
+    only by a linked package's own lockfile -- takes its highest version.
     """
     installed = packages.versions.get(name, {}) if packages is not None else {}
     if not installed:
@@ -876,8 +877,7 @@ def _installed_package(
         return found
     assert packages is not None  # `installed` came out of it
     pinned = packages.resolve(None, name)
-    wants = packages.wants.get(packages.project, {}) if packages.project is not None else {}
-    if pinned is not None and (pinned.layer != "global" or pinned.version == wants.get(name)):
+    if pinned is not None:
         return pinned
     return max(
         installed.values(),
