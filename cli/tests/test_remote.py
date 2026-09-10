@@ -32,11 +32,10 @@ from ffrwd.table import TableResult, render_table
 
 API = "https://api.example"
 JOBS_URL = f"{API}/functions/v1/jobs"
-UPLOAD_URL = "https://runner.example/upload"
-START_URL = "https://runner.example/start"
 TOKEN = "ffrwd_" + "d" * 43
 JOB_ID = "0a1b2c3d-1111-2222-3333-444455556666"
-JOB_TOKEN = "payload.signature"
+READY_URL = f"{JOBS_URL}/{JOB_ID}/ready"
+QUEUED_ROW: dict[str, object] = {"id": JOB_ID, "state": "queued"}
 
 MEDIA_QUERY = "COPY (SELECT a.video[1] FROM input('in.mp4') a) TO 'out.mp4'"
 
@@ -175,25 +174,42 @@ def logged_in(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(credentials.TOKEN_ENV, TOKEN)
 
 
+def _put_url(digest: str) -> str:
+    """The store URL a submit signs for `digest`."""
+    return f"https://store.example/inputs/{digest}?X-Amz-Signature=deadbeef"
+
+
+def _signed(served: _Served, *digests: str) -> dict[str, object]:
+    """One ``uploads`` entry per digest, each with its own URL, each PUT answered."""
+    entries: dict[str, object] = {}
+    for digest in digests:
+        served.answers[_put_url(digest)] = b""
+        entries[digest] = {"url": _put_url(digest), "expires_at": FRESH_UNTIL}
+    return entries
+
+
 def _submit_accepted(
     served: _Served,
-    *,
+    *digests: str,
     remaining: dict[str, object] | None = REMAINING,
     uploads: dict[str, object] | None = None,
 ) -> None:
+    """The submit answer, the PUTs its ``uploads`` name, and the queued row.
+
+    Each of `digests` is signed for a URL naming it, answered with the empty
+    2xx a store gives; `uploads` replaces the object outright, for the tests
+    that pin a URL of their own.
+    """
     answer: dict[str, object] = {
         "job_id": JOB_ID,
-        "job_token": JOB_TOKEN,
-        "upload_url": UPLOAD_URL,
-        "start_url": START_URL,
+        "uploads": uploads if uploads is not None else _signed(served, *digests),
+        "ready_url": READY_URL,
         "outputs_expire_days": 7,
     }
     if remaining is not None:
         answer["remaining"] = remaining
-    if uploads is not None:
-        answer["uploads"] = uploads
     served.answers[JOBS_URL] = json.dumps(answer).encode("utf-8")
-    served.answers[START_URL] = (202, json.dumps({"state": "queued"}).encode("utf-8"))
+    served.answers[READY_URL] = (200, json.dumps(QUEUED_ROW).encode("utf-8"))
 
 
 def _run_args(**overrides: object) -> argparse.Namespace:
@@ -240,10 +256,7 @@ def test_a_bounded_input_submits_and_an_unprobeable_one_is_the_runners_call(
     monkeypatch.chdir(tmp_path)
     (tmp_path / "in.mp4").write_bytes(b"x")
     digest = hashlib.sha256(b"x").hexdigest()
-    _submit_accepted(served)
-    served.answers[f"{UPLOAD_URL}?sha256={digest}"] = json.dumps(
-        {"already": False, "bytes": 1}
-    ).encode("utf-8")
+    _submit_accepted(served, digest)
     served.probes["in.mp4"] = ProbeResult(streams=[], duration=12.5)
     remote.submit_run(_query(MEDIA_QUERY), None, _run_args())
     assert served.asked[0].url == JOBS_URL
@@ -387,7 +400,7 @@ def test_a_missing_file_input_is_refused_with_its_anchor(
 # ---------------------------------------------------------------------------
 
 
-def test_submit_posts_the_spec_uploads_the_file_and_starts(
+def test_submit_posts_the_spec_puts_the_file_and_queues_the_job(
     served: _Served,
     logged_in: None,
     tmp_path: Path,
@@ -397,10 +410,7 @@ def test_submit_posts_the_spec_uploads_the_file_and_starts(
     monkeypatch.chdir(tmp_path)
     (tmp_path / "in.mp4").write_bytes(b"media bytes")
     digest = hashlib.sha256(b"media bytes").hexdigest()
-    _submit_accepted(served)
-    served.answers[f"{UPLOAD_URL}?sha256={digest}"] = json.dumps(
-        {"already": False, "bytes": 11}
-    ).encode("utf-8")
+    _submit_accepted(served, digest)
 
     query = (
         "COPY (SELECT a.video[1] FROM input('in.mp4') a, input('in.mp4') again, "
@@ -419,7 +429,7 @@ def test_submit_posts_the_spec_uploads_the_file_and_starts(
     # Each step narrates on stderr, sizes and all; stdout stays the result.
     assert "submitting the job\n" in captured.err
     assert "uploading in.mp4 (11 bytes)\n" in captured.err
-    assert "starting the job\n" in captured.err
+    assert "queueing the job\n" in captured.err
 
     headers, body = served.sent_to(JOBS_URL)
     assert headers["authorization"] == f"Bearer {TOKEN}"
@@ -441,18 +451,18 @@ def test_submit_posts_the_spec_uploads_the_file_and_starts(
         "timeout_s": 120.0,
         "client_version": ffrwd.__version__,
     }
-    # No `uploads` in the answer, so the input takes the job API's own
-    # content-addressed endpoint, under the job token.
-    upload = served.request_to(f"{UPLOAD_URL}?sha256={digest}")
-    assert upload.method == "POST"
-    assert upload.headers["x-job-token"] == JOB_TOKEN
-    assert upload.headers["content-type"] == "application/octet-stream"
+    # The bytes go to the URL the answer signed for the digest.
+    put = served.request_to(_put_url(digest))
+    assert put.method == "PUT"
+    assert put.body == b"media bytes"
     # The body is streamed off the disk, so its length is named rather than
     # left for urllib to measure.
-    assert upload.headers["content-length"] == "11"
-    assert upload.body == b"media bytes"
-    start_headers, _start_body = served.sent_to(START_URL)
-    assert start_headers["x-job-token"] == JOB_TOKEN
+    assert put.headers["content-length"] == "11"
+    # Then the same bearer queues it, and nothing goes anywhere else.
+    ready = served.request_to(READY_URL)
+    assert ready.method == "POST"
+    assert ready.headers["authorization"] == f"Bearer {TOKEN}"
+    assert [asked.url for asked in served.asked] == [JOBS_URL, _put_url(digest), READY_URL]
 
 
 def _reported(progress: list[tuple[int, int | None]]) -> Progress:
@@ -471,10 +481,7 @@ def test_an_upload_reports_its_bytes_block_by_block(
     content = b"m" * (3 * block)
     (tmp_path / "in.mp4").write_bytes(content)
     digest = hashlib.sha256(content).hexdigest()
-    _submit_accepted(served)
-    served.answers[f"{UPLOAD_URL}?sha256={digest}"] = json.dumps(
-        {"already": False, "bytes": len(content)}
-    ).encode("utf-8")
+    _submit_accepted(served, digest)
     served.probes["in.mp4"] = ProbeResult(streams=[], duration=12.5)
 
     seen: list[tuple[int, int | None]] = []
@@ -484,7 +491,7 @@ def test_an_upload_reports_its_bytes_block_by_block(
 
     size = 3 * block
     assert seen == [(block, size), (2 * block, size), (size, size)]
-    headers, body = served.sent_to(f"{UPLOAD_URL}?sha256={digest}")
+    headers, body = served.sent_to(_put_url(digest))
     assert headers["content-length"] == str(size)
     assert body == content
 
@@ -501,10 +508,7 @@ def test_a_remote_run_draws_the_upload_bar_on_a_terminal(
     content = b"m" * (2 * packages._BLOCK_BYTES)
     (tmp_path / "in.mp4").write_bytes(content)
     digest = hashlib.sha256(content).hexdigest()
-    _submit_accepted(served)
-    served.answers[f"{UPLOAD_URL}?sha256={digest}"] = json.dumps(
-        {"already": False, "bytes": len(content)}
-    ).encode("utf-8")
+    _submit_accepted(served, digest)
     served.probes["in.mp4"] = ProbeResult(streams=[], duration=12.5)
     monkeypatch.setattr(Console, "_is_tty", lambda self: True)
 
@@ -519,8 +523,9 @@ def test_an_input_that_stops_being_readable_before_its_upload_is_refused(
     tmp_path: Path,
 ) -> None:
     """The upload opens the file itself, and says so when it cannot."""
+    destination = remote._Destination(url=PUT_URL, expires_at=FRESH_UNTIL)
     with pytest.raises(FfrwdError) as caught:
-        remote._upload(UPLOAD_URL, JOB_TOKEN, str(tmp_path / "gone.mp4"), "0" * 64)
+        remote._put(destination, str(tmp_path / "gone.mp4"))
     assert caught.value.message.startswith("input '")
     assert "gone.mp4' could not be read:" in caught.value.message
     assert caught.value.hint == (
@@ -529,11 +534,10 @@ def test_an_input_that_stops_being_readable_before_its_upload_is_refused(
 
 
 # ---------------------------------------------------------------------------
-# a file input PUT to the store the submit signed for
+# every upload PUT to the URL the submit signed for it
 # ---------------------------------------------------------------------------
 
 PUT_URL = "https://store.example/inputs/9f1c?X-Amz-Signature=deadbeef&X-Amz-Expires=86400"
-OTHER_PUT_URL = "https://store.example/inputs/2b7e?X-Amz-Signature=cafe"
 # Either side of the clock `fixed_clock` pins.
 FRESH_UNTIL = "2026-08-30T12:00:00+00:00"
 EXPIRED_AT = "2026-08-29T11:00:00+00:00"
@@ -550,14 +554,10 @@ def _offered(
     return {digest: {"url": url, "expires_at": expires_at, "region": "auto"}}
 
 
-def test_a_signed_input_is_put_to_the_store_and_never_to_the_job_api(
-    served: _Served,
-    logged_in: None,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
+def test_the_signed_url_travels_verbatim_and_carries_no_credential(
+    served: _Served, logged_in: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The URL is the credential: it travels verbatim and carries no token."""
+    """The URL is the credential: query string and all, and nothing beside it."""
     monkeypatch.chdir(tmp_path)
     (tmp_path / "in.mp4").write_bytes(b"media bytes")
     digest = hashlib.sha256(b"media bytes").hexdigest()
@@ -567,75 +567,97 @@ def test_a_signed_input_is_put_to_the_store_and_never_to_the_job_api(
     assert cli.main(["run", "--remote", MEDIA_QUERY]) == 0
 
     put = served.request_to(PUT_URL)
-    assert put.method == "PUT"
     assert put.url == PUT_URL
     assert put.body == b"media bytes"
-    assert put.headers["content-length"] == "11"
     assert "authorization" not in put.headers
-    assert "x-job-token" not in put.headers
     assert "content-type" not in put.headers
-    assert f"{UPLOAD_URL}?sha256={digest}" not in [asked.url for asked in served.asked]
-    # The narration and the start POST are what they were.
-    assert "uploading in.mp4 (11 bytes)\n" in capsys.readouterr().err
-    assert served.request_to(START_URL).headers["x-job-token"] == JOB_TOKEN
 
 
-def test_a_digest_the_answer_left_out_posts_while_the_other_puts(
+@pytest.mark.parametrize(
+    "answer",
+    [
+        {"job_id": JOB_ID, "uploads": {}},
+        {"job_id": JOB_ID, "ready_url": READY_URL, "uploads": []},
+    ],
+    ids=["no-ready-url", "uploads-not-an-object"],
+)
+def test_a_submit_answer_this_client_cannot_read_is_refused_before_any_upload(
+    served: _Served,
+    logged_in: None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    answer: dict[str, object],
+) -> None:
+    """The answer says where every byte goes, so a shape it does not have stops it."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "in.mp4").write_bytes(b"media bytes")
+    served.answers[JOBS_URL] = json.dumps(answer).encode("utf-8")
+
+    with pytest.raises(FfrwdError) as caught:
+        remote.submit_run(_query(MEDIA_QUERY), None, _run_args())
+    assert caught.value.message == (
+        f"{JOBS_URL} answered with something this client does not read"
+    )
+    assert "upgrade it" in (caught.value.hint or "")
+    assert [asked.url for asked in served.asked] == [JOBS_URL]
+
+
+def test_a_digest_the_answer_left_out_is_refused_before_any_upload(
     served: _Served, logged_in: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Each input is decided on its own: an entry, or the endpoint."""
+    """The store is the only way in, so an unsigned input is a malformed answer."""
     monkeypatch.chdir(tmp_path)
     (tmp_path / "in.mp4").write_bytes(b"first bytes")
     (tmp_path / "other.mp4").write_bytes(b"second bytes")
     signed = hashlib.sha256(b"first bytes").hexdigest()
-    unsigned = hashlib.sha256(b"second bytes").hexdigest()
-    _submit_accepted(served, uploads=_offered(signed))
-    served.answers[PUT_URL] = b""
-    served.answers[f"{UPLOAD_URL}?sha256={unsigned}"] = json.dumps(
-        {"already": False, "bytes": 12}
-    ).encode("utf-8")
+    _submit_accepted(served, signed)
 
-    remote.submit_run(_query(TWO_INPUTS_QUERY), None, _run_args())
-
-    assert served.request_to(PUT_URL).body == b"first bytes"
-    posted = served.request_to(f"{UPLOAD_URL}?sha256={unsigned}")
-    assert posted.method == "POST"
-    assert posted.headers["x-job-token"] == JOB_TOKEN
-    assert posted.body == b"second bytes"
-    assert f"{UPLOAD_URL}?sha256={signed}" not in [asked.url for asked in served.asked]
+    with pytest.raises(FfrwdError) as caught:
+        remote.submit_run(_query(TWO_INPUTS_QUERY), None, _run_args())
+    assert "answered with something this client does not read" in caught.value.message
+    # Not even the input that WAS signed for got its bytes sent.
+    assert [asked.url for asked in served.asked] == [JOBS_URL]
 
 
-def test_a_packed_package_still_posts_with_the_token_beside_a_put(
+def test_a_packed_package_is_put_to_the_entry_its_digest_keys(
     served: _Served, logged_in: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``uploads`` is for file inputs; a linked package keeps its endpoint."""
+    """``uploads`` covers a packed package the way it covers a file input."""
     monkeypatch.chdir(tmp_path)
     (tmp_path / "in.mp4").write_bytes(b"media bytes")
     input_digest = hashlib.sha256(b"media bytes").hexdigest()
     linked = _linked_package(tmp_path / "tools")
     write_lockfile(tmp_path / "ffrwd.lock", [LinkEntry(path="tools")])
     archive, archive_digest = _packed(linked)
-    _submit_accepted(
-        served,
-        uploads={
-            **_offered(input_digest),
-            # Even were the store to sign one, an archive does not go there.
-            archive_digest: {"url": OTHER_PUT_URL, "expires_at": FRESH_UNTIL},
-        },
-    )
-    served.answers[PUT_URL] = b""
-    served.answers[f"{UPLOAD_URL}?sha256={archive_digest}"] = json.dumps(
-        {"already": False, "bytes": len(archive)}
-    ).encode("utf-8")
+    _submit_accepted(served, input_digest, archive_digest)
+    announced: list[str] = []
 
-    remote.submit_run(_query(MEDIA_QUERY), None, _run_args())
+    remote.submit_run(_query(MEDIA_QUERY), None, _run_args(), announce=announced.append)
 
-    assert _uploaded(served) == {archive_digest: archive}
-    packed = served.request_to(f"{UPLOAD_URL}?sha256={archive_digest}")
-    assert packed.method == "POST"
-    assert packed.headers["x-job-token"] == JOB_TOKEN
-    assert OTHER_PUT_URL not in [asked.url for asked in served.asked]
-    assert served.request_to(PUT_URL).body == b"media bytes"
+    assert _uploaded(served) == {archive_digest: archive, input_digest: b"media bytes"}
+    packed = served.request_to(_put_url(archive_digest))
+    assert packed.method == "PUT"
+    assert packed.headers["content-length"] == str(len(archive))
+    assert "authorization" not in packed.headers
+    assert any(one.startswith("uploading package broadcast/tools (") for one in announced)
+
+
+def test_a_packages_digest_the_answer_left_out_is_refused_before_any_upload(
+    served: _Served, logged_in: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A package is signed for like an input, and refused like one when it is not."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "in.mp4").write_bytes(b"media bytes")
+    input_digest = hashlib.sha256(b"media bytes").hexdigest()
+    _linked_package(tmp_path / "tools")
+    write_lockfile(tmp_path / "ffrwd.lock", [LinkEntry(path="tools")])
+    # The input is signed for; the archive the lock pins is not.
+    _submit_accepted(served, input_digest)
+
+    with pytest.raises(FfrwdError) as caught:
+        remote.submit_run(_query(MEDIA_QUERY), None, _run_args())
+    assert "answered with something this client does not read" in caught.value.message
+    assert [asked.url for asked in served.asked] == [JOBS_URL]
 
 
 def test_a_put_that_times_out_twice_retries_and_narrates_it(
@@ -663,19 +685,19 @@ def test_a_put_that_times_out_twice_retries_and_narrates_it(
         (
             403,
             EXPIRED_AT,
-            f"the upload URL for input 'in.mp4' expired at {EXPIRED_AT}",
+            f"the upload URL for 'in.mp4' expired at {EXPIRED_AT}",
             "submit the run again: an upload URL is good for 24 hours",
         ),
         (
             403,
             FRESH_UNTIL,
-            "the store refused the upload of input 'in.mp4' with HTTP 403",
+            "the store refused the upload of 'in.mp4' with HTTP 403",
             "try the run again; if it keeps happening, report it",
         ),
         (
             500,
             FRESH_UNTIL,
-            "the store refused the upload of input 'in.mp4' with HTTP 500",
+            "the store refused the upload of 'in.mp4' with HTTP 500",
             "try the run again; if it keeps happening, report it",
         ),
     ],
@@ -754,10 +776,7 @@ def test_a_recipe_run_carries_its_owner_and_the_lock_text(
     lock_text = (tmp_path / "ffrwd.lock").read_text(encoding="utf-8")
     (tmp_path / "in.mkv").write_bytes(b"tracks")
     digest = hashlib.sha256(b"tracks").hexdigest()
-    _submit_accepted(served)
-    served.answers[f"{UPLOAD_URL}?sha256={digest}"] = json.dumps(
-        {"already": False, "bytes": 6}
-    ).encode("utf-8")
+    _submit_accepted(served, digest)
 
     code = cli.main(
         ["run", "--remote", "duck", "-v", "source=in.mkv", "-v", "dest=out.mkv"]
@@ -923,11 +942,11 @@ def _submitted_packages(served: _Served) -> list[str]:
 
 
 def _uploaded(served: _Served) -> dict[str, bytes]:
-    """Every content-addressed POST this submit made, keyed by its digest."""
+    """Every PUT this submit made, keyed by the digest its URL names."""
     sent: dict[str, bytes] = {}
     for asked in served.asked:
-        if asked.url.startswith(f"{UPLOAD_URL}?sha256=") and asked.body is not None:
-            sent[asked.url.rpartition("=")[2]] = asked.body
+        if asked.method == "PUT" and asked.body is not None:
+            sent[asked.url.rpartition("/")[2].partition("?")[0]] = asked.body
     return sent
 
 
@@ -943,10 +962,7 @@ def test_a_linked_package_packs_and_its_digest_pins_the_submitted_lock(
     linked = _linked_package(tmp_path / "tools")
     write_lockfile(tmp_path / "ffrwd.lock", [LinkEntry(path="tools")])
     archive, digest = _packed(linked)
-    _submit_accepted(served)
-    served.answers[f"{UPLOAD_URL}?sha256={digest}"] = json.dumps(
-        {"already": False, "bytes": len(archive)}
-    ).encode("utf-8")
+    _submit_accepted(served, digest)
 
     seen: list[tuple[int, int | None]] = []
     remote.submit_run(_query(STREAM_QUERY), None, _run_args(), progress=_reported(seen))
@@ -971,7 +987,7 @@ def test_a_linked_package_packs_and_its_digest_pins_the_submitted_lock(
             "store": store.entry_path(digest),
         }
     ]
-    # And the bytes went to the same content-addressed endpoint an input uses.
+    # And the bytes went to the entry its digest keys, like a file input's.
     assert _uploaded(served) == {digest: archive}
 
 
@@ -983,11 +999,8 @@ def test_a_link_recorded_in_the_links_file_packs_the_same_way(
     linked = _linked_package(tmp_path / "tools")
     write_lockfile(tmp_path / "ffrwd.lock", [])
     write_linksfile(links_path(tmp_path / "ffrwd.lock"), [LinkEntry(path="tools")])
-    archive, digest = _packed(linked)
-    _submit_accepted(served)
-    served.answers[f"{UPLOAD_URL}?sha256={digest}"] = json.dumps(
-        {"already": False, "bytes": len(archive)}
-    ).encode("utf-8")
+    _archive, digest = _packed(linked)
+    _submit_accepted(served, digest)
 
     remote.submit_run(_query(STREAM_QUERY), None, _run_args())
 
@@ -1009,11 +1022,8 @@ def test_the_packed_archive_holds_the_manifests_closure(
     (linked / "build" / "module.wasm").write_bytes(b"x" * 4096)
     (linked / ".ffrwdignore").write_text("build/\n", encoding="utf-8")
     write_lockfile(tmp_path / "ffrwd.lock", [LinkEntry(path="tools")])
-    _submit_accepted(served)
     _archive, digest = _packed(linked)
-    served.answers[f"{UPLOAD_URL}?sha256={digest}"] = json.dumps({"already": False}).encode(
-        "utf-8"
-    )
+    _submit_accepted(served, digest)
 
     remote.submit_run(_query(STREAM_QUERY), None, _run_args())
 
@@ -1022,46 +1032,40 @@ def test_the_packed_archive_holds_the_manifests_closure(
     assert held == ["ffrwd.json", "src/lib.sql"]
 
 
-def test_an_unchanged_link_hits_the_endpoints_dedup_on_a_second_submit(
+def test_an_unchanged_link_puts_the_same_key_again_and_an_edit_changes_it(
     served: _Served, logged_in: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The digest is over the packed bytes, so an unedited link keeps it.
 
-    The endpoint answers ``already`` for content it holds, so a second submit
-    stores nothing new; an edit changes the digest and pays again.
+    Every submit sends the bytes: the same ones to the same key are the same
+    object. An edit changes the digest, and the key with it.
     """
     monkeypatch.chdir(tmp_path)
     linked = _linked_package(tmp_path / "tools")
     write_lockfile(tmp_path / "ffrwd.lock", [LinkEntry(path="tools")])
-    _archive, digest = _packed(linked)
-    _submit_accepted(served)
-    served.answers[f"{UPLOAD_URL}?sha256={digest}"] = json.dumps(
-        {"already": False, "bytes": 1}
-    ).encode("utf-8")
+    archive, digest = _packed(linked)
+    _submit_accepted(served, digest)
     remote.submit_run(_query(STREAM_QUERY), None, _run_args())
     assert _submitted_packages(served) == [digest]
+    assert _uploaded(served) == {digest: archive}
 
-    # Same tree, same digest -- and the endpoint says it already holds it.
+    # Same tree, same digest -- and the bytes go again, to the same key.
     again = _Served()
     monkeypatch.setattr(packages, "_urlopen", again)
-    _submit_accepted(again)
-    again.answers[f"{UPLOAD_URL}?sha256={digest}"] = json.dumps(
-        {"already": True, "bytes": 1}
-    ).encode("utf-8")
+    _submit_accepted(again, digest)
     remote.submit_run(_query(STREAM_QUERY), None, _run_args())
     assert _submitted_packages(again) == [digest]
+    assert _uploaded(again) == {digest: archive}
 
-    # An edit is what pays again.
+    # An edit is what moves it.
     edited = _Served()
     monkeypatch.setattr(packages, "_urlopen", edited)
     _linked_package(tmp_path / "tools", factor="0.9")
-    _archive, changed = _packed(linked)
-    _submit_accepted(edited)
-    edited.answers[f"{UPLOAD_URL}?sha256={changed}"] = json.dumps({"already": False}).encode(
-        "utf-8"
-    )
+    changed_archive, changed = _packed(linked)
+    _submit_accepted(edited, changed)
     remote.submit_run(_query(STREAM_QUERY), None, _run_args())
     assert _submitted_packages(edited) == [changed]
+    assert _uploaded(edited) == {changed: changed_archive}
     assert changed != digest
 
 
@@ -1077,11 +1081,7 @@ def test_a_link_inside_a_linked_package_travels_too(
     write_lockfile(tmp_path / "ffrwd.lock", [LinkEntry(path="tools")])
     _tools_archive, tools_digest = _packed(tools)
     _helper_archive, helper_digest = _packed(helper)
-    _submit_accepted(served)
-    for one in (tools_digest, helper_digest):
-        served.answers[f"{UPLOAD_URL}?sha256={one}"] = json.dumps({"already": False}).encode(
-            "utf-8"
-        )
+    _submit_accepted(served, tools_digest, helper_digest)
 
     remote.submit_run(_query(STREAM_QUERY), None, _run_args())
 
@@ -1160,10 +1160,7 @@ def test_a_submit_leaves_the_lockfile_on_disk_alone(
     write_lockfile(lock_path, [LinkEntry(path="tools")])
     before = lock_path.read_text(encoding="utf-8")
     _archive, digest = _packed(linked)
-    _submit_accepted(served)
-    served.answers[f"{UPLOAD_URL}?sha256={digest}"] = json.dumps({"already": False}).encode(
-        "utf-8"
-    )
+    _submit_accepted(served, digest)
 
     remote.submit_run(_query(STREAM_QUERY), None, _run_args())
 
@@ -1181,10 +1178,7 @@ def test_a_quiet_submit_prints_only_the_result(
     monkeypatch.chdir(tmp_path)
     (tmp_path / "in.mp4").write_bytes(b"media bytes")
     digest = hashlib.sha256(b"media bytes").hexdigest()
-    _submit_accepted(served)
-    served.answers[f"{UPLOAD_URL}?sha256={digest}"] = json.dumps(
-        {"already": False, "bytes": 11}
-    ).encode("utf-8")
+    _submit_accepted(served, digest)
 
     code = cli.main(["run", "--remote", "-q", MEDIA_QUERY])
     captured = capsys.readouterr()
@@ -1193,27 +1187,33 @@ def test_a_quiet_submit_prints_only_the_result(
     assert captured.err == ""
 
 
-def test_an_already_staged_upload_is_a_success(
+def test_readys_refusal_of_an_upload_that_did_not_land_says_what_the_server_said(
     served: _Served,
     logged_in: None,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    """Ready HEADs every upload before it queues, and its count is the message."""
     monkeypatch.chdir(tmp_path)
     (tmp_path / "in.mp4").write_bytes(b"media bytes")
     digest = hashlib.sha256(b"media bytes").hexdigest()
-    _submit_accepted(served)
-    served.answers[f"{UPLOAD_URL}?sha256={digest}"] = json.dumps(
-        {"already": True, "bytes": 11}
-    ).encode("utf-8")
+    _submit_accepted(served, digest)
+    served.answers[READY_URL] = (
+        409,
+        json.dumps(
+            {
+                "error": f"1 of the job's 2 uploads have not landed ({digest[:12]})",
+                "hint": "submit the run again",
+            }
+        ).encode("utf-8"),
+    )
 
     code = cli.main(["run", "--remote", MEDIA_QUERY])
-    out = capsys.readouterr().out
-    assert code == 0
-    assert f"submitted {JOB_ID}" in out
-    start_headers, _body = served.sent_to(START_URL)
-    assert start_headers["x-job-token"] == JOB_TOKEN
+    err = capsys.readouterr().err
+    assert code == 1
+    assert f"1 of the job's 2 uploads have not landed ({digest[:12]})" in err
+    assert "submit the run again" in err
 
 
 def test_the_servers_refusal_passes_through_as_itself(
@@ -1528,7 +1528,7 @@ def _fetchable(
 ) -> str:
     """One fetchable output over `content`'s digest. No `kind` key unless
     given: an older row's entry, which fetch treats as a file."""
-    download_url = "https://runner.example/download/aaaa/0?token=t"
+    download_url = "https://store.example/outputs/aaaa/0/out.mp4?X-Amz-Signature=deadbeef"
     fetch_url = f"{JOBS_URL}/{ROW_DONE['id']}/fetch"
     _listing(served, ROW_DONE)
     entry: dict[str, object] = {
@@ -1589,6 +1589,24 @@ def test_fetch_streams_each_output_to_its_as_written_path(
     assert "wrote clips/out.mp4" in captured.out
     assert "downloading clips/out.mp4 (16 bytes)\n" in captured.err
     assert (tmp_path / "clips" / "out.mp4").read_bytes() == b"the output bytes"
+
+
+def test_a_fetch_download_carries_no_authorization_header(
+    served: _Served, logged_in: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The url is presigned, and a store refuses one that carries a bearer too."""
+    monkeypatch.chdir(tmp_path)
+    download_url = _fetchable(served, b"the output bytes")
+    served.answers[download_url] = b"the output bytes"
+
+    remote._fetch(TOKEN, "aaaa", overwrite=False, quiet=True)
+
+    asked = served.request_to(download_url)
+    assert asked.method == "GET"
+    assert "authorization" not in asked.headers
+    # The POST that named the url is where the bearer belongs.
+    fetch = served.request_to(f"{JOBS_URL}/{ROW_DONE['id']}/fetch")
+    assert fetch.headers["authorization"] == f"Bearer {TOKEN}"
 
 
 def test_fetch_reports_each_chunk_against_the_size_the_job_recorded(
@@ -1840,7 +1858,7 @@ def test_jobs_without_a_token_is_refused(
 # poll and the fetch, not the submit machinery `test_submit_...` already covers.
 WAIT_QUERY = "COPY (SELECT a.video[1] FROM input('https://cdn.example/x.mp4') a) TO 'out.mp4'"
 
-DOWNLOAD_URL = "https://runner.example/download/aaaa/0?token=t"
+DOWNLOAD_URL = "https://store.example/outputs/aaaa/0/out.mp4?X-Amz-Signature=cafe"
 
 
 def _wait_row(state: str, *, progress_pct: float = 0) -> dict[str, object]:
@@ -2229,36 +2247,15 @@ def test_interruptible_closes_the_handle_and_lets_the_worker_end(
     assert worker_saw_close.wait(5)
 
 
-def test_an_upload_that_times_out_retries_and_narrates_it(
-    served: _Served, logged_in: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / "in.mp4").write_bytes(b"x" * 10)
-    digest = hashlib.sha256(b"x" * 10).hexdigest()
-    _submit_accepted(served)
-    served.answers[f"{UPLOAD_URL}?sha256={digest}"] = json.dumps(
-        {"already": False, "bytes": 10}
-    ).encode("utf-8")
-    served.probes["in.mp4"] = ProbeResult(streams=[], duration=1.0)
-    flaky = _FlakyUpload(served, f"{UPLOAD_URL}?sha256={digest}", fail_times=2)
-    monkeypatch.setattr(packages, "_urlopen", flaky)
-    announced: list[str] = []
-
-    remote.submit_run(_query(MEDIA_QUERY), None, _run_args(), announce=announced.append)
-
-    assert flaky.calls == 3
-    assert announced.count("retrying the upload of in.mp4") == 2
-
-
 def test_three_upload_timeouts_raise_the_typed_unreachable_error(
     served: _Served, logged_in: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.chdir(tmp_path)
     (tmp_path / "in.mp4").write_bytes(b"x")
     digest = hashlib.sha256(b"x").hexdigest()
-    _submit_accepted(served)
+    _submit_accepted(served, digest)
     served.probes["in.mp4"] = ProbeResult(streams=[], duration=1.0)
-    flaky = _FlakyUpload(served, f"{UPLOAD_URL}?sha256={digest}", fail_times=3)
+    flaky = _FlakyUpload(served, _put_url(digest), fail_times=3)
     monkeypatch.setattr(packages, "_urlopen", flaky)
 
     with pytest.raises(FfrwdError) as caught:

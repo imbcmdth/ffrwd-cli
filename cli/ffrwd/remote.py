@@ -8,7 +8,7 @@ project's entries over the machine-wide lockfile's, one document), every
 ``input()`` path (local files hashed and uploaded; any "://" spec passed
 through untouched, the runner's to open), every ``COPY ... TO`` destination,
 and ``--timeout`` -- posts it, uploads the file inputs and the packed linked
-packages, and starts the job.
+packages, and queues the job.
 :func:`jobs_command` is the other half: list, watch, cancel, fetch a
 succeeded job's outputs, or show one job's own detail -- the fields a
 listing row omits, its log tail included. A failed or cancelled job's tail
@@ -22,22 +22,22 @@ statuses) pass through as themselves. All HTTP goes through
 ``ffrwd.packages``' seams, so the unit tier fakes the server the way
 ``test_publish`` does.
 
-A file input goes wherever the submit's answer says. When that answer carries
-an ``uploads`` entry for the digest, the bytes are PUT straight to the object
-store at the signed URL it names -- the URL is the credential, sent verbatim,
-and a single PUT is what the store signed for, so a file past its size limit
-is refused before anything leaves. Without such an entry -- a registry with no
-store configured, or a digest it did not sign -- the bytes take the job API's
-own content-addressed endpoint under the job token, which is also where a
-packed package always goes.
+Every byte a job carries goes through the object store. The submit's answer
+holds one ``uploads`` entry per distinct file input and per packed package,
+keyed by sha256, and the bytes are PUT to the signed URL that entry names --
+the URL is the credential, sent verbatim, and any 2xx is the upload. A digest
+the answer left out is an answer this client does not read, refused before
+anything leaves; a file past what a single PUT signs for is refused before it
+is even opened. Once every upload is in, ``ready_url`` queues the job under
+the same bearer the submit carried.
 
 A LINKED package does ride along. It has no published digest, so it is packed
 at submit time -- the same :func:`ffrwd.store.pack` ``publish`` uses, so what
 travels is the manifest's closure and what the ignore files allow, models
-excluded -- uploaded to the content-addressed endpoint the file inputs use, and
-spelled in the submitted lock as a pin against that archive's digest. The
-lockfile ON DISK is untouched: a link stays a link for local development, and
-the rewrite exists only on the wire.
+excluded -- PUT to the entry its own digest keys, and spelled in the submitted
+lock as a pin against that archive's digest. The lockfile ON DISK is
+untouched: a link stays a link for local development, and the rewrite exists
+only on the wire.
 
 What does NOT ride along: the project's own source files. A query resolving a
 call through the project's OWN manifest package compiles here and fails
@@ -227,11 +227,12 @@ def _server_refusal(status: int, body: bytes) -> FfrwdError:
     return _reject(message, hint)
 
 
-# Data-plane calls wait out a cold runner: the first request to a Modal
-# endpoint holds until its container is up. Submit, start and a poll are
-# small round trips even so, and keep this long timeout; an upload or a
-# download is bounded far tighter below, since a per-operation timeout
-# applies to each blocking send or read, not to the transfer as a whole.
+# How long one API answer is waited for. Every call is an Edge Function, so
+# there is no cold container to sit through, but ready HEADs every upload
+# before it queues and a submit carries the whole spec: the wait stays
+# generous rather than tight. An upload or a download is bounded far tighter
+# below, since a per-operation timeout applies to each blocking send or read,
+# not to the transfer as a whole.
 _DATA_PLANE_TIMEOUT = 600.0
 
 # An upload or a download's own timeout: short enough that a connection gone
@@ -242,9 +243,7 @@ _DATA_PLANE_TIMEOUT = 600.0
 _TRANSFER_TIMEOUT = 60.0
 
 # How many times an upload retries a send that timed out or was reset. Safe
-# to retry either way it goes: the job API's endpoint is content-addressed
-# and answers `already: true` for bytes it already holds, and putting the
-# same bytes to the store writes the same object.
+# to retry: putting the same bytes to the same URL writes the same object.
 _UPLOAD_RETRIES = 3
 
 # The largest file the store signs a single PUT for. Beyond it the upload
@@ -258,7 +257,7 @@ def _unreachable(url: str, err: Exception) -> FfrwdError:
     reason = getattr(err, "reason", None) or getattr(err, "__cause__", None) or err
     return _reject(
         f"the job service could not be reached at {url}: {reason}",
-        "check the network connection, or try again -- a cold runner can take a minute",
+        "check the network connection, or try again",
     )
 
 
@@ -407,14 +406,14 @@ def submit_run(
     progress: Progress | None = None,
     detail: Announce | None = None,
 ) -> Submitted:
-    """Submit `query` as a hosted job: post the spec, upload the inputs, start it.
+    """Submit `query` as a hosted job: post the spec, upload the bytes, queue it.
 
     Called from ``run``'s fork after the query classified as a media one.
     Raises :class:`FfrwdError` for every refusal -- this machine's own all
     before the first request, the server's passed through -- and returns the
     job id the caller reports, alongside what the account has left this
     month. `announce` hears one line per step: the submit, each upload with
-    its size, and the start; `progress` hears the bytes of every upload.
+    its size, and the queueing; `progress` hears the bytes of every upload.
     """
     if args.show or args.show_only:
         raise _reject(
@@ -454,47 +453,32 @@ def submit_run(
     body = _call(where, headers=_bearer(token), data=json.dumps(spec).encode("utf-8"))
     answer = _json_object(body, where)
     job_id = answer.get("job_id")
-    job_token = answer.get("job_token")
-    upload_url = answer.get("upload_url")
-    start_url = answer.get("start_url")
-    if not (
-        isinstance(job_id, str)
-        and isinstance(job_token, str)
-        and isinstance(upload_url, str)
-        and isinstance(start_url, str)
-    ):
+    ready_url = answer.get("ready_url")
+    if not (isinstance(job_id, str) and isinstance(ready_url, str)):
         raise _malformed(where)
 
-    for archive in archives:
+    # Every destination is looked up before the first PUT: a digest the answer
+    # left out is an answer this client does not read, not bytes half sent.
+    destinations = _destinations(answer, where)
+    packed = [
+        (archive, _destination(destinations, archive.entry.sha256, where))
+        for archive in archives
+    ]
+    staged = [
+        (path, _destination(destinations, digest, where)) for path, digest in uploads
+    ]
+    for archive, destination in packed:
         if announce is not None:
             announce(
                 f"uploading package {archive.entry.name} "
                 f"({written_size(len(archive.content))})"
             )
-        _upload_bytes(
-            upload_url,
-            job_token,
-            archive.content,
-            archive.entry.sha256,
-            archive.entry.name,
-            announce,
-            progress,
-        )
-    destinations = _destinations(answer)
-    for path, digest in uploads:
-        destination = destinations.get(digest)
-        if destination is None:
-            _upload(upload_url, job_token, path, digest, announce, progress)
-        else:
-            _put(destination, path, announce, progress)
+        _put_bytes(destination, archive.content, archive.entry.name, announce, progress)
+    for path, destination in staged:
+        _put(destination, path, announce, progress)
     if detail is not None:
-        detail("starting the job")
-    _call(
-        start_url,
-        headers={"x-job-token": job_token},
-        data=b"{}",
-        timeout=_DATA_PLANE_TIMEOUT,
-    )
+        detail("queueing the job")
+    _call(ready_url, headers=_bearer(token), data=b"{}", timeout=_DATA_PLANE_TIMEOUT)
     return Submitted(job_id=job_id, remaining=_remaining(answer))
 
 
@@ -773,22 +757,22 @@ def _global_lock(local: Path | None) -> Lockfile | None:
 
 @dataclass(frozen=True)
 class _Destination:
-    """Where one file input's bytes go: the signed URL, and when it stops working."""
+    """Where one upload's bytes go: the signed URL, and when it stops working."""
 
     url: str
     expires_at: str | None
 
 
-def _destinations(answer: Mapping[str, object]) -> dict[str, _Destination]:
-    """The submit's ``uploads``: a signed PUT target per input digest.
+def _destinations(answer: Mapping[str, object], where: str) -> dict[str, _Destination]:
+    """The submit's ``uploads``: a signed PUT target per digest the job carries.
 
-    Empty when the answer carries none, which is what a registry with no
-    store configured answers; an input whose digest is missing from it takes
-    the job API's own upload endpoint instead.
+    One entry per distinct file input and per packed package. Empty is an
+    answer -- a job of url inputs and registry packages alone carries nothing
+    -- but anything other than an object under the key is not.
     """
     offered = answer.get("uploads")
     if not isinstance(offered, dict):
-        return {}
+        raise _malformed(where)
     found: dict[str, _Destination] = {}
     for digest, entry in offered.items():
         if not isinstance(entry, dict):
@@ -803,6 +787,20 @@ def _destinations(answer: Mapping[str, object]) -> dict[str, _Destination]:
     return found
 
 
+def _destination(
+    destinations: Mapping[str, _Destination], digest: str, where: str
+) -> _Destination:
+    """Where `digest`'s bytes go. A digest the answer left out is malformed.
+
+    The store is the only way in, so an entry this client was not given is an
+    upload it cannot make -- not a fallback to somewhere else.
+    """
+    found = destinations.get(digest)
+    if found is None:
+        raise _malformed(where)
+    return found
+
+
 def _put(
     destination: _Destination,
     path: str,
@@ -812,9 +810,9 @@ def _put(
     """PUT one file input straight to the store, streamed off the disk.
 
     The URL is the credential and travels verbatim, query string included:
-    no bearer, no job token, and nothing to read back -- any 2xx means the
-    bytes are stored. A file the store will not take in one request is
-    refused here, before anything is opened or sent.
+    no bearer, no token, and nothing to read back -- any 2xx means the bytes
+    are stored. A file the store will not take in one request is refused
+    here, before anything is opened or sent.
     """
     file = Path(path)
     try:
@@ -842,6 +840,26 @@ def _put(
         )
 
 
+def _put_bytes(
+    destination: _Destination,
+    content: bytes,
+    name: str,
+    announce: Announce | None = None,
+    progress: Progress | None = None,
+) -> None:
+    """PUT `content`, which is already in hand, through the same counted body.
+
+    What a packed package takes: its bytes were built here rather than read
+    off the disk, and `name` is the package's own, so a refusal names it.
+    """
+    _put_body(
+        destination,
+        packages_module.CountedBody(io.BytesIO(content), len(content), progress),
+        name,
+        announce=announce,
+    )
+
+
 def _put_body(
     destination: _Destination,
     body: packages_module.CountedBody,
@@ -852,7 +870,7 @@ def _put_body(
     """PUT `body` to `destination`, retried on the timeouts an upload is.
 
     Writing the same bytes to the same URL twice stores the same object, so a
-    resend is as safe as the content-addressed endpoint's.
+    resend is safe.
     """
 
     def _send(handle: packages_module.Handle) -> bytes:
@@ -876,11 +894,11 @@ def _store_refusal(destination: _Destination, name: str, status: int) -> FfrwdEr
     expires = _parse_when(destination.expires_at)
     if status == 403 and expires is not None and _utcnow() >= expires:
         return _reject(
-            f"the upload URL for input '{name}' expired at {destination.expires_at}",
+            f"the upload URL for '{name}' expired at {destination.expires_at}",
             "submit the run again: an upload URL is good for 24 hours",
         )
     return _reject(
-        f"the store refused the upload of input '{name}' with HTTP {status}",
+        f"the store refused the upload of '{name}' with HTTP {status}",
         "try the run again; if it keeps happening, report it",
     )
 
@@ -890,94 +908,6 @@ def _unreadable(path: str, err: OSError) -> FfrwdError:
         f"input '{path}' could not be read: {err.strerror or err}",
         "a file input is uploaded from this machine, so it has to be readable",
     )
-
-
-def _upload(
-    upload_url: str,
-    job_token: str,
-    path: str,
-    digest: str,
-    announce: Announce | None = None,
-    progress: Progress | None = None,
-) -> None:
-    """POST one file input, streamed off the disk. An ``already: true`` answer
-    is the dedupe hit -- the content is staged, nothing more to send for it."""
-    file = Path(path)
-    try:
-        size = file.stat().st_size
-        opened = file.open("rb")
-    except OSError as err:
-        raise _unreadable(path, err) from err
-    with opened as stream:
-        if announce is not None:
-            announce(f"uploading {path} ({written_size(size)})")
-        _upload_body(
-            upload_url,
-            job_token,
-            packages_module.CountedBody(stream, size, progress),
-            digest,
-            announce=announce,
-            name=path,
-        )
-
-
-def _upload_bytes(
-    upload_url: str,
-    job_token: str,
-    content: bytes,
-    digest: str,
-    name: str,
-    announce: Announce | None = None,
-    progress: Progress | None = None,
-) -> None:
-    """POST `content`, which is already in hand, through the same counted body."""
-    _upload_body(
-        upload_url,
-        job_token,
-        packages_module.CountedBody(io.BytesIO(content), len(content), progress),
-        digest,
-        announce=announce,
-        name=name,
-    )
-
-
-def _upload_body(
-    upload_url: str,
-    job_token: str,
-    body: packages_module.CountedBody,
-    digest: str,
-    *,
-    announce: Announce | None = None,
-    name: str | None = None,
-) -> None:
-    """POST `body` to the content-addressed endpoint under its digest.
-
-    Taken by the packed linked packages, and by a file input whenever the
-    submit offered no store URL for it: both are bytes the runner reads back
-    by digest, and the endpoint answers ``already: true`` for content it
-    already holds -- which is what makes a retried send safe.
-    """
-    url = f"{upload_url}?sha256={digest}"
-    headers = {"x-job-token": job_token, "Content-Type": "application/octet-stream"}
-
-    def _send(handle: packages_module.Handle) -> bytes:
-        request = packages_module._request(url, headers=headers, data=body)
-        try:
-            with packages_module._urlopen(request, timeout=_TRANSFER_TIMEOUT) as response:
-                handle.set(response)
-                return bytes(response.read(_MAX_RESPONSE_BYTES + 1))
-        except urllib.error.HTTPError as err:
-            try:
-                said = bytes(err.read(_MAX_RESPONSE_BYTES + 1))
-            except OSError:
-                said = b""
-            raise _server_refusal(err.code, said) from err
-        except (TimeoutError, ConnectionError):
-            raise
-        except (OSError, ValueError, urllib.error.URLError) as err:
-            raise _unreachable(url, err) from err
-
-    _sent(_send, body, url, announce=announce, name=name)
 
 
 def _sent(
@@ -991,7 +921,7 @@ def _sent(
     """Run `send`, retrying a timed-out or reset connection from the start.
 
     Each attempt is bounded by `_TRANSFER_TIMEOUT` rather than the full ten
-    minutes a cold start gets -- an upload that goes quiet mid-send (the far
+    minutes an API call gets -- an upload that goes quiet mid-send (the far
     end took the bytes and stopped reading) is noticed there, not sat through
     -- and up to `_UPLOAD_RETRIES` attempts are made. A Ctrl-C during any
     attempt is never retried.
@@ -1580,12 +1510,15 @@ def _download(
 ) -> None:
     """Stream `url` to `path`, verifying the digest before the file lands.
 
-    Written beside the destination and moved onto it, so an interrupted or
-    corrupt download never leaves a half-file under the real name. `shown`
+    The request carries no header of its own, and must not: `url` is a
+    presigned GET, and a store refuses one that also sends an
+    ``Authorization``. Written beside the destination and moved onto it, so
+    an interrupted or corrupt download never leaves a half-file under the
+    real name. `shown`
     names the output in refusals when `path` is a staging file. `progress`
     hears every chunk against `total`, which is what the job recorded. The
     read runs on a worker thread (:func:`_interruptible`), bounded chunk by
-    chunk at `_TRANSFER_TIMEOUT` rather than the ten minutes a cold start
+    chunk at `_TRANSFER_TIMEOUT` rather than the ten minutes an API call
     gets, so a Ctrl-C or a connection gone quiet is noticed promptly rather
     than sat through.
     """
