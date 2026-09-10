@@ -590,7 +590,7 @@ This code, `PLAYER_NOT_FOUND`, `RUNTIME_NOT_FOUND` and `UNKNOWN_RECIPE` refuse a
 
 ## RUNTIME_NOT_FOUND
 
-**Meaning:** `ffrwd setup nn` (or a query reaching a model, provisioning the same tiers on its way) asked for a tier of the ONNX Runtime this machine's platform has no artifacts pinned for -- `--cuda`/`--full` on a platform that pins no such tier, or a sidecar demanding a runtime version this ffrwd carries no table for at all. Never a query problem: the table is keyed on the sidecar's own reported version and platform, not on anything the SQL names.
+**Meaning:** `ffrwd setup nn` (or a query reaching a model, provisioning the same tiers on its way) asked for a tier of the ONNX Runtime this machine's platform has no artifacts pinned for -- `--cuda`/`--full` on a platform that pins no such tier (detection itself never asks for one), or a sidecar demanding a runtime version this ffrwd carries no table for at all. Never a query problem: the table is keyed on the sidecar's own reported version and platform, not on anything the SQL names.
 
 **Fires when:** a tier passed to `nn.provision()` is absent from the pinned table for this platform, or the sidecar's `--nn-info` names an ONNX Runtime version/platform pair nothing is pinned for.
 

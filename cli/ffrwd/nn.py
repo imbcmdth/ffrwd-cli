@@ -26,14 +26,16 @@ Version-scoped, because a sidecar upgrade must not read the set fetched for
 the version before it; and under the cache, because every byte here is
 redownloadable, unlike a token or a lockfile.
 
-What is fetched is per platform, and the point is that a run never has to ask
-for it. Windows takes the CPU library and the DirectML pair -- DirectML runs
-on any Direct3D 12 adapter and asks for nothing installed. The CUDA tier is
-five times the size and needs a CUDA 12 runtime and cuDNN 9 on the machine, so
-on Windows it is only ever fetched by ``ffrwd setup nn --cuda``. Linux takes
-the CPU library, and the CUDA provider beside it when an NVIDIA driver is
-there -- CUDA is the only accelerator Linux has. macOS takes the stock
-archive, which carries CoreML inside it.
+What is fetched is what the machine turns out to have, and the point is that a
+run never has to ask for it. :func:`detect` looks for an NVIDIA driver and for
+a CUDA 12 runtime and cuDNN 9 beside it; :func:`wanted_tiers` reads that.
+Windows takes the CPU library and the DirectML pair -- DirectML runs on any
+Direct3D 12 adapter and asks for nothing installed -- and Linux the CPU
+library alone, CUDA being the only accelerator it has. Either takes the CUDA
+provider wherever a driver is, and the pinned CUDA 12 and cuDNN 9 with it
+where the machine has none of its own. macOS takes the stock archive, which
+carries CoreML inside it. ``ffrwd setup nn --cuda``/``--full`` add a tier
+detection did not.
 
 Every artifact is pinned: a URL, a sha256, and its exact byte count, per
 runtime version and platform. The download stops at the first block past that
@@ -66,7 +68,10 @@ from .errors import ErrorCode, FfrwdError
 
 __all__ = [
     "Info",
+    "Machine",
     "SETUP_HINT",
+    "describe",
+    "detect",
     "ensure",
     "info",
     "provision",
@@ -612,33 +617,219 @@ def _table(found: Info) -> Mapping[str, tuple[Artifact, ...]]:
 # --------------------------------------------------------------------------
 
 
+# The kernel module's own directory, which the driver creates.
+_PROC_DRIVER = "/proc/driver/nvidia"
+
+# The driver's own library, which is there whether or not nvidia-smi is.
+_DRIVER_LIB_WINDOWS = "nvcuda.dll"
+_DRIVER_LIB_LINUX = "libcuda.so.1"
+
+# The two libraries the CUDA provider needs that the machine, not this module,
+# usually supplies: a CUDA 12 runtime and cuDNN 9. The sidecar's own preflight
+# names the same files.
+_CUDA_LIBS_WINDOWS = ("cudart64_12.dll", "cudnn64_9.dll")
+_CUDA_LIBS_LINUX = ("libcudart.so.12", "libcudnn.so.9")
+
+# Where a Linux loader looks when ldconfig does not answer.
+_LINUX_LIB_DIRS = (
+    "/usr/lib/x86_64-linux-gnu",
+    "/usr/lib64",
+    "/usr/lib",
+    "/lib/x86_64-linux-gnu",
+    "/lib64",
+)
+
+# Where a CUDA toolkit puts itself when nothing on the machine points at it.
+_CUDA_TOOLKIT_LIB = "/usr/local/cuda/lib64"
+
+# How long ldconfig gets. It prints a cache file and exits.
+_LDCONFIG_TIMEOUT = 5.0
+
+
+@dataclass(frozen=True)
+class Machine:
+    """What one look at this machine found.
+
+    `driver` is an NVIDIA driver of any version; `cuda_libraries` a CUDA 12
+    runtime and cuDNN 9 already installed beside it, which is what decides
+    whether the pinned set has to come too.
+    """
+
+    driver: bool
+    cuda_libraries: bool
+
+
+def detect(found: Info | None = None) -> Machine:
+    """Look at this machine once: what `wanted_tiers` and ``setup nn`` share."""
+    known = found if found is not None else info()
+    return Machine(
+        driver=nvidia_driver(), cuda_libraries=cuda_libraries(known.platform)
+    )
+
+
 def nvidia_driver() -> bool:
     """Whether this machine looks like it has an NVIDIA driver.
 
-    Deliberately shallow: the kernel module's own directory under /proc, or
-    the tool the driver installs on PATH. Either is enough to decide whether
-    downloading a CUDA provider is worth the bytes, and a wrong answer costs
-    a fetch or a fall back to the CPU, never a wrong result.
+    Deliberately shallow, and four places rather than a version: the kernel
+    module's own directory under /proc, the tool the driver installs on PATH,
+    the driver's own library in the Windows system directory, and that library
+    on a Linux loader's path. The sidecar reports what CUDA refuses, so a
+    wrong answer here costs a fetch or a fall back to the CPU, never a wrong
+    result.
     """
-    if Path("/proc/driver/nvidia").exists():
+    if Path(_PROC_DRIVER).exists():
         return True
-    return shutil.which("nvidia-smi") is not None
+    if shutil.which("nvidia-smi") is not None:
+        return True
+    system = _system_dir()
+    if system is not None and (system / _DRIVER_LIB_WINDOWS).is_file():
+        return True
+    listed = _ldconfig()
+    if listed is not None:
+        return _DRIVER_LIB_LINUX in listed
+    return any(
+        (Path(directory) / _DRIVER_LIB_LINUX).is_file() for directory in _LINUX_LIB_DIRS
+    )
 
 
-def wanted_tiers(found: Info | None = None) -> tuple[str, ...]:
-    """What a run that reaches a model fetches on this platform, unasked.
+def cuda_libraries(platform: str) -> bool:
+    """Whether a CUDA 12 runtime and cuDNN 9 are already on this machine.
 
-    Windows takes DirectML, which runs on any Direct3D 12 adapter; its CUDA
-    tier is an explicit `ffrwd setup nn --cuda` and never lands here. Linux
-    takes CUDA when a driver is there, since it is the only accelerator it
-    has. macOS takes the stock archive alone -- CoreML is inside it.
+    Looked for where the sidecar's loader would find them: PATH and the bin
+    directory CUDA_PATH names on Windows; ldconfig's cache, LD_LIBRARY_PATH
+    and the toolkit's own directory on Linux. Never the runtime directory this
+    module fills -- a `full` tier already fetched is `missing_tiers`' answer,
+    not this one -- and never on a platform with no CUDA to have.
+    """
+    if platform.startswith("win-"):
+        directories = [*_path_dirs("PATH"), *_cuda_path()]
+        return all(_in_any(directories, name) for name in _CUDA_LIBS_WINDOWS)
+    if platform.startswith("linux-"):
+        listed = _ldconfig() or ()
+        directories = [*_path_dirs("LD_LIBRARY_PATH"), Path(_CUDA_TOOLKIT_LIB)]
+        return all(
+            name in listed or _in_any(directories, name) for name in _CUDA_LIBS_LINUX
+        )
+    return False
+
+
+def _in_any(directories: Sequence[Path], name: str) -> bool:
+    return any((directory / name).is_file() for directory in directories)
+
+
+def _path_dirs(variable: str) -> list[Path]:
+    """Every directory a search-path variable names."""
+    raw = os.environ.get(variable, "")
+    return [Path(part) for part in raw.split(os.pathsep) if part]
+
+
+def _cuda_path() -> list[Path]:
+    """The bin directory a CUDA toolkit install points at, where one does."""
+    named = os.environ.get("CUDA_PATH")
+    return [Path(named) / "bin"] if named else []
+
+
+def _system_dir() -> Path | None:
+    """The Windows system directory, or None where there is none."""
+    root = os.environ.get("SystemRoot")
+    return Path(root) / "System32" if root else None
+
+
+def _ldconfig() -> tuple[str, ...] | None:
+    """Every soname ``ldconfig -p`` lists, or None where it does not run."""
+    if shutil.which("ldconfig") is None:
+        return None
+    try:
+        done = subprocess.run(
+            ["ldconfig", "-p"],
+            capture_output=True,
+            text=True,
+            timeout=_LDCONFIG_TIMEOUT,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if done.returncode != 0:
+        return None
+    return tuple(line.strip().split(" ", 1)[0] for line in done.stdout.splitlines())
+
+
+def _pinned_tiers(platform: str) -> frozenset[str]:
+    """Every tier the table carries for `platform`, whatever the version.
+
+    By platform alone: what a machine wants is a property of the machine, and
+    a version this ffrwd pins nothing for is `provision`'s own refusal rather
+    than something detection has to answer for.
+    """
+    return frozenset(
+        tier for (_, key), tiers in _PINS.items() if key == platform for tier in tiers
+    )
+
+
+def wanted_tiers(
+    found: Info | None = None, machine: Machine | None = None
+) -> tuple[str, ...]:
+    """What a run that reaches a model fetches on this machine, unasked.
+
+    Windows takes DirectML, which runs on any Direct3D 12 adapter, and Linux
+    the CPU library alone. Either takes the CUDA provider wherever an NVIDIA
+    driver is -- on Windows for the graphs DirectML cannot run, which land on
+    the CPU otherwise -- and the pinned CUDA 12 and cuDNN 9 with it where the
+    machine has neither, since a provider that cannot load them falls back in
+    silence. macOS takes the stock archive alone: CoreML is inside it. A tier
+    this platform pins nothing for is never asked for.
     """
     known = found if found is not None else info()
+    seen = machine if machine is not None else detect(known)
+    pinned = _pinned_tiers(known.platform)
+    tiers = ["cpu"]
     if known.platform.startswith("win-"):
-        return ("cpu", "directml")
-    if known.platform.startswith("linux-") and nvidia_driver():
-        return ("cpu", "cuda")
-    return ("cpu",)
+        tiers.append("directml")
+    if seen.driver and "cuda" in pinned:
+        tiers.append("cuda")
+        if not seen.cuda_libraries and "full" in pinned:
+            tiers.append("full")
+    return tuple(tiers)
+
+
+def describe(found: Info | None = None, machine: Machine | None = None) -> str:
+    """The one line ``setup nn`` prints: what was found, and what it turns on."""
+    known = found if found is not None else info()
+    seen = machine if machine is not None else detect(known)
+    taking = _joined(_means(known.platform, wanted_tiers(known, seen)))
+    if "cuda" not in _pinned_tiers(known.platform):
+        return f"{known.platform} has no CUDA provider to look for: taking {taking}"
+    if not seen.driver:
+        return f"no NVIDIA driver: taking {taking}"
+    beside = (
+        "a CUDA 12 runtime and cuDNN 9 beside it"
+        if seen.cuda_libraries
+        else "no CUDA 12 runtime or cuDNN 9 beside it"
+    )
+    return f"an NVIDIA driver, and {beside}: taking {taking}"
+
+
+def _means(platform: str, tiers: Sequence[str]) -> list[str]:
+    """What each wanted tier turns on: the accelerators first, the CPU last."""
+    parts = []
+    if "directml" in tiers:
+        parts.append("DirectML on any Direct3D 12 adapter")
+    if "cuda" in tiers:
+        parts.append("the CUDA provider")
+    if "full" in tiers:
+        parts.append("the pinned libraries")
+    # The macOS archive has CoreML linked into it; everywhere else the CPU
+    # tier is the CPU and nothing more.
+    coreml = platform.startswith("osx-")
+    parts.append("CoreML, inside the stock library" if coreml else "the CPU")
+    return parts
+
+
+def _joined(parts: Sequence[str]) -> str:
+    """`parts` as prose, the last one named after a comma."""
+    if len(parts) == 1:
+        return parts[0]
+    return ", ".join(parts[:-1]) + ", and " + parts[-1]
 
 
 def default_target(found: Info | None = None) -> str:

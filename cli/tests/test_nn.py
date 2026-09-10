@@ -25,7 +25,7 @@ from typing import Any
 
 import pytest
 
-from ffrwd import nn, wasm
+from ffrwd import cli, nn, wasm
 from ffrwd.errors import ErrorCode, FfrwdError
 from ffrwd.processes import ModelBinding, SidecarProcess
 
@@ -265,40 +265,143 @@ def test_a_version_this_ffrwd_does_not_pin_is_refused_by_name() -> None:
 
 
 @pytest.mark.parametrize(
-    ("found", "driver", "tiers", "target"),
+    ("found", "driver", "libraries", "tiers", "target"),
     [
-        # Windows never auto-fetches CUDA: DirectML runs on any Direct3D 12
-        # adapter, and the CUDA tier is five times the size.
-        (WINDOWS, False, ("cpu", "directml"), "gpu"),
-        (WINDOWS, True, ("cpu", "directml"), "gpu"),
+        # DirectML runs on any Direct3D 12 adapter and asks for nothing
+        # installed; CUDA rides behind it for the graphs it cannot run, and
+        # only where a driver is. Libraries without a driver turn on nothing.
+        (WINDOWS, False, False, ("cpu", "directml"), "gpu"),
+        (WINDOWS, False, True, ("cpu", "directml"), "gpu"),
+        (WINDOWS, True, True, ("cpu", "directml", "cuda"), "gpu"),
+        # No CUDA 12 or cuDNN 9 of its own: the provider needs the pinned set
+        # beside it, or it falls back to the CPU in silence.
+        (WINDOWS, True, False, ("cpu", "directml", "cuda", "full"), "gpu"),
         # CUDA is Linux' only accelerator, and only worth the bytes with a driver.
-        (LINUX, True, ("cpu", "cuda"), "gpu"),
-        (LINUX, False, ("cpu",), "cpu"),
-        # CoreML rides inside the stock archive and is part of the system.
-        (MACOS, False, ("cpu",), "gpu"),
+        (LINUX, True, True, ("cpu", "cuda"), "gpu"),
+        (LINUX, True, False, ("cpu", "cuda", "full"), "gpu"),
+        (LINUX, False, False, ("cpu",), "cpu"),
+        (LINUX, False, True, ("cpu",), "cpu"),
+        # CoreML rides inside the stock archive and is part of the system;
+        # a driver on a platform pinning no CUDA tier changes nothing.
+        (MACOS, False, False, ("cpu",), "gpu"),
+        (MACOS, True, False, ("cpu",), "gpu"),
     ],
 )
 def test_what_a_platform_fetches_and_what_it_runs_on(
     monkeypatch: pytest.MonkeyPatch,
     found: nn.Info,
     driver: bool,
+    libraries: bool,
     tiers: tuple[str, ...],
     target: str,
 ) -> None:
     monkeypatch.setattr(nn, "nvidia_driver", lambda: driver)
+    monkeypatch.setattr(nn, "cuda_libraries", lambda platform: libraries)
     assert nn.wanted_tiers(found) == tiers
     assert nn.default_target(found) == target
 
 
-def test_the_driver_probe_reads_the_two_places_a_driver_shows_up(
+def test_a_platform_pinning_no_full_tier_takes_the_cuda_one_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Detection never asks for a tier the table pins nothing for: the refusal
+    # would name a platform the machine cannot do anything about.
+    monkeypatch.setattr(nn, "nvidia_driver", lambda: True)
+    monkeypatch.setattr(nn, "cuda_libraries", lambda platform: False)
+    monkeypatch.setattr(nn, "_PINS", {("9.9.9", "linux-x64"): {"cpu": (), "cuda": ()}})
+    assert nn.wanted_tiers(LINUX) == ("cpu", "cuda")
+
+
+def _ldconfig_answering(monkeypatch: pytest.MonkeyPatch, stdout: str) -> None:
+    """Make ``ldconfig -p`` run and print `stdout`, wherever this suite runs."""
+    monkeypatch.setattr(
+        nn.shutil,
+        "which",
+        lambda name: "/sbin/ldconfig" if name == "ldconfig" else None,
+    )
+    monkeypatch.setattr(
+        nn.subprocess,
+        "run",
+        lambda argv, **kwargs: SimpleNamespace(returncode=0, stdout=stdout, stderr=""),
+    )
+
+
+def test_the_driver_probe_reads_every_place_a_driver_shows_up(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    proc = tmp_path / "proc-driver-nvidia"
+    system = tmp_path / "System32"
+    libraries = tmp_path / "lib"
+    system.mkdir()
+    libraries.mkdir()
+    monkeypatch.setattr(nn, "_PROC_DRIVER", str(proc))
+    monkeypatch.setattr(nn, "_LINUX_LIB_DIRS", (str(libraries),))
     monkeypatch.setattr(nn.shutil, "which", lambda name: None)
-    monkeypatch.setattr(nn, "Path", lambda p: tmp_path / "absent")
+    monkeypatch.delenv("SystemRoot", raising=False)
     assert nn.nvidia_driver() is False
 
+    # The kernel module's own directory.
+    proc.mkdir()
+    assert nn.nvidia_driver() is True
+    proc.rmdir()
+
+    # The tool the driver installs.
     monkeypatch.setattr(nn.shutil, "which", lambda name: "/usr/bin/nvidia-smi")
     assert nn.nvidia_driver() is True
+    monkeypatch.setattr(nn.shutil, "which", lambda name: None)
+
+    # The driver's own library, under the Windows system directory...
+    monkeypatch.setenv("SystemRoot", str(tmp_path))
+    assert nn.nvidia_driver() is False
+    (system / "nvcuda.dll").write_bytes(b"")
+    assert nn.nvidia_driver() is True
+    (system / "nvcuda.dll").unlink()
+
+    # ... and where a Linux loader looks, ldconfig having nothing to say.
+    (libraries / "libcuda.so.1").write_bytes(b"")
+    assert nn.nvidia_driver() is True
+    (libraries / "libcuda.so.1").unlink()
+
+    # ldconfig, where it runs, is the answer on its own.
+    _ldconfig_answering(monkeypatch, "\tlibcuda.so.1 (libc6,x86-64) => /usr/lib/libcuda.so.1\n")
+    assert nn.nvidia_driver() is True
+    _ldconfig_answering(monkeypatch, "\tlibz.so.1 (libc6,x86-64) => /usr/lib/libz.so.1\n")
+    assert nn.nvidia_driver() is False
+
+
+def test_the_library_probe_reads_where_the_loader_would_look(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    searched = tmp_path / "searched"
+    toolkit = tmp_path / "toolkit"
+    (toolkit / "bin").mkdir(parents=True)
+    searched.mkdir()
+    monkeypatch.setattr(nn, "_CUDA_TOOLKIT_LIB", str(toolkit / "lib64"))
+    monkeypatch.setattr(nn.shutil, "which", lambda name: None)
+    monkeypatch.setenv("PATH", str(searched))
+    monkeypatch.setenv("CUDA_PATH", str(toolkit))
+    monkeypatch.setenv("LD_LIBRARY_PATH", str(searched))
+    assert nn.cuda_libraries("win-x64") is False
+
+    # One of the two is not both: a provider that finds a runtime and no cuDNN
+    # falls back to the CPU as surely as one that finds neither.
+    (searched / "cudart64_12.dll").write_bytes(b"")
+    assert nn.cuda_libraries("win-x64") is False
+    (toolkit / "bin" / "cudnn64_9.dll").write_bytes(b"")
+    assert nn.cuda_libraries("win-x64") is True
+
+    # Linux reads ldconfig's cache and LD_LIBRARY_PATH together.
+    assert nn.cuda_libraries("linux-x64") is False
+    _ldconfig_answering(
+        monkeypatch,
+        "\tlibcudart.so.12 (libc6,x86-64) => /usr/local/cuda/lib64/libcudart.so.12\n",
+    )
+    assert nn.cuda_libraries("linux-x64") is False
+    (searched / "libcudnn.so.9").write_bytes(b"")
+    assert nn.cuda_libraries("linux-x64") is True
+
+    # A platform with no CUDA to have has nothing to look for.
+    assert nn.cuda_libraries("osx-arm64") is False
 
 
 # --------------------------------------------------------------------------
@@ -445,6 +548,68 @@ def test_the_environment_naming_a_runtime_stops_the_bootstrap(
 
     assert nn.ensure() is None
     assert seen == []
+
+
+# --------------------------------------------------------------------------
+# what setup nn takes
+# --------------------------------------------------------------------------
+
+
+def _table_with_cuda(monkeypatch: pytest.MonkeyPatch, pinned: dict[str, bytes]) -> None:
+    """The two-tier table with a CUDA tier beside it, so a machine with a
+    driver has something to take and one without has something to leave."""
+    table = dict(nn._PINS[("9.9.9", "win-x64")])
+    table["cuda"] = (
+        _artifact(
+            "https://example.invalid/gpu.tgz",
+            pinned["https://example.invalid/gpu.tgz"],
+            [nn.Member(entry="build/lib/provider.so", name="provider.so")],
+        ),
+    )
+    monkeypatch.setattr(nn, "_PINS", {("9.9.9", "win-x64"): table})
+
+
+def test_setup_nn_says_what_it_found_and_takes_that(
+    monkeypatch: pytest.MonkeyPatch,
+    pinned: dict[str, bytes],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _serving(monkeypatch, pinned, [])
+    _table_with_cuda(monkeypatch, pinned)
+    monkeypatch.setattr(nn, "_INFO", WINDOWS)
+    monkeypatch.setattr(nn, "nvidia_driver", lambda: False)
+    monkeypatch.setattr(nn, "cuda_libraries", lambda platform: False)
+
+    assert cli.main(["setup", "nn"]) == 0
+
+    out = capsys.readouterr().out
+    assert (
+        "no NVIDIA driver: taking DirectML on any Direct3D 12 adapter, and the CPU"
+        in out
+    )
+    assert str(nn.runtime_dir(WINDOWS)) in out
+    # What landed is what detection asked for, and nothing beside it.
+    assert nn.missing_tiers(["cpu", "directml", "cuda"], WINDOWS) == ("cuda",)
+
+
+def test_setup_nn_cuda_takes_the_tier_detection_did_not(
+    monkeypatch: pytest.MonkeyPatch,
+    pinned: dict[str, bytes],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _serving(monkeypatch, pinned, [])
+    _table_with_cuda(monkeypatch, pinned)
+    monkeypatch.setattr(nn, "_INFO", WINDOWS)
+    monkeypatch.setattr(nn, "nvidia_driver", lambda: False)
+    monkeypatch.setattr(nn, "cuda_libraries", lambda platform: False)
+
+    assert cli.main(["setup", "nn", "--cuda"]) == 0
+
+    out = capsys.readouterr().out
+    assert "no NVIDIA driver" in out
+    # The notice belongs to a machine detection took CUDA for, not to this one.
+    assert "--cuda:" not in out
+    assert nn.missing_tiers(["cpu", "directml", "cuda"], WINDOWS) == ()
 
 
 # --------------------------------------------------------------------------

@@ -180,21 +180,24 @@ redownloadable.
 | cuda | the CUDA build of `onnxruntime.dll`, `onnxruntime_providers_shared.dll`, `onnxruntime_providers_cuda.dll` | 298 MB |
 | full | also a pinned CUDA 12 and cuDNN 9 set | 1.4 GB |
 
-What a query fetches for itself is per platform: Windows takes cpu and
-directml, 47 MB on disk; Linux takes cpu, and cuda beside it when an NVIDIA
-driver is there; macOS takes its stock archive, which carries CoreML inside
-it. The `cuda` tier on Windows is `ffrwd setup nn --cuda` and nothing else -
-it is six times the DirectML download for a provider the machine may not have
-the prerequisites for.
+What a query fetches for itself is what the machine turns out to have,
+looked at once by the compiler's `nn.detect`: Windows takes cpu and directml,
+DirectML asking for nothing beyond a Direct3D 12 adapter; Linux takes cpu;
+either takes cuda wherever an NVIDIA driver shows up - the kernel module's
+directory, `nvidia-smi` on PATH, `nvcuda.dll` in the system directory or
+`libcuda.so.1` on the loader's path - and full beside it where no CUDA 12
+runtime and cuDNN 9 are already on PATH, under CUDA_PATH, in ldconfig's
+cache or under LD_LIBRARY_PATH. macOS takes its stock archive, which carries
+CoreML inside it. A run fetches the same set on its way, naming what and how
+big before it does.
 
-    ffrwd setup nn                  what this platform takes anyway
-    ffrwd setup nn --cuda           also the CUDA execution provider
-    ffrwd setup nn --cuda --full    also the CUDA 12 and cuDNN 9 it needs
+    ffrwd setup nn                  what this machine takes, said in one line first
+    ffrwd setup nn --cuda           the CUDA execution provider whatever detection said
+    ffrwd setup nn --cuda --full    and the CUDA 12 and cuDNN 9 it needs
 
-The CUDA 12 runtime and cuDNN 9 are the machine's, like the driver. `--cuda`
-carries the provider and expects to find them installed; `--full` is the
-escape hatch for a machine that has neither. DirectML asks for nothing
-installed beyond a Direct3D 12 adapter, which is every recent Windows machine.
+The CUDA 12 runtime and cuDNN 9 are the machine's, like the driver, and the
+pinned set is for a machine that has neither. Detection decides that; the
+two flags add a tier it did not take.
 
 Every artifact is pinned - a URL, a sha256, and its exact byte count, per
 runtime version and platform, in the compiler's `nn.py`. The download stops at
@@ -213,7 +216,7 @@ loaded beside it the way the CUDA one is. Its `onnxruntime.dll` is therefore a
 different binary from the CPU and CUDA one, carrying the same name, and it
 cannot share a directory with them:
 
-    <dir>/onnxruntime.dll                 CPU, or the CUDA build with --cuda
+    <dir>/onnxruntime.dll                 CPU, or the CUDA build when the cuda tier is taken
     <dir>/onnxruntime_providers_cuda.dll  the CUDA provider
     <dir>/directml/onnxruntime.dll        the DirectML build
     <dir>/directml/DirectML.dll           DirectML itself

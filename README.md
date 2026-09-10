@@ -33,7 +33,7 @@ Or run it without installing anything:
 uvx ffrwd
 ```
 
-`ffmpeg` and `ffprobe` are required and, optionally, handled for you. A preexisting ffmpeg install on `PATH` always wins. On a machine without one, the bundled provisioner (`static-ffmpeg`) fetches both binaries on first use. The sidecar ships as a wheel pinned to the same version, so a query that calls a module needs nothing more; a module that runs a model needs an ONNX Runtime, which `ffrwd setup nn` downloads once (`--cuda` for the GPU provider).
+`ffmpeg` and `ffprobe` are required and, optionally, handled for you. A preexisting ffmpeg install on `PATH` always wins. On a machine without one, the bundled provisioner (`static-ffmpeg`) fetches both binaries on first use. The sidecar ships as a wheel pinned to the same version, so a query that calls a module needs nothing more; a module that runs a model needs an ONNX Runtime, which `ffrwd setup nn` downloads once, picking the tiers for the machine it finds itself on: DirectML on Windows, CUDA wherever an NVIDIA driver is, and the CUDA 12 and cuDNN 9 libraries when the machine has none of its own. A query that reaches a model does the same on its first run, saying what it fetches and how big it is.
 
 ## Ask before you act
 
@@ -215,7 +215,7 @@ ffrwd [<command>] [-h] [-f FILE] [-v NAME=VALUE] [-q] [query | recipe]
 | `link` / `unlink` | develop a package from its checkout: the project resolves it from there until unlinked | |
 | `login` / `logout` | hold, or forget, a registry token on this machine | |
 | `publish` | run the package's tests, pack it, and publish it to the registry | |
-| `setup nn` | download the ONNX Runtime the model-running modules need | `--cuda` · `--full` |
+| `setup nn` | download the ONNX Runtime the model-running modules need, the tiers chosen for this machine | `--cuda` · `--full` to take a tier detection did not |
 | `jobs` | list, watch, cancel or fetch your remote runs | `--watch` · `--cancel ID` · `--fetch ID` · `-y` · `--json` |
 | `prompt` | print the LLM system prompt | |
 | `mcp` | serve the compiler to an editor or agent over MCP (stdio) | `--allow-unsafe` (also expose the tools that do more than answer about a query) |

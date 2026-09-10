@@ -713,14 +713,14 @@ def _build_parser() -> argparse.ArgumentParser:
     setup_p.add_argument(
         "--cuda",
         action="store_true",
-        help="also take the CUDA execution provider, which needs a CUDA 12 "
-        "runtime and cuDNN 9 already on the machine",
+        help="take the CUDA execution provider whatever this machine looks "
+        "like; detection takes it wherever an NVIDIA driver is",
     )
     setup_p.add_argument(
         "--full",
         action="store_true",
-        help="with --cuda, also take a pinned CUDA 12 and cuDNN 9, for a "
-        "machine that has neither",
+        help="with --cuda, also take a pinned CUDA 12 and cuDNN 9; detection "
+        "takes them where the machine has neither",
     )
     _add_quiet_argument(setup_p)
 
@@ -3456,9 +3456,10 @@ def _cmd_setup(args: argparse.Namespace, on_warning: OnWarning) -> int:
     """Download what a query would otherwise fetch on its way to running.
 
     Nothing depends on this having been run -- a query that reaches a model
-    provisions the same tiers itself. It is for a CI image, a machine about to
-    lose its network, and the Windows CUDA tier, which is five times the size
-    of the DirectML one and never fetched unasked.
+    looks at the same machine and provisions the same tiers itself. It is for
+    a CI image, a machine about to lose its network, and the one line naming
+    what was found before any of it is fetched. ``--cuda`` and ``--full`` add
+    a tier whatever detection said.
     """
     console = _console(args)
     if args.full and not args.cuda:
@@ -3469,11 +3470,14 @@ def _cmd_setup(args: argparse.Namespace, on_warning: OnWarning) -> int:
         return 2
     try:
         found = nn.info()
-        tiers = list(nn.wanted_tiers(found))
+        machine = nn.detect(found)
+        detected = nn.wanted_tiers(found, machine)
+        tiers = list(detected)
         if args.cuda and "cuda" not in tiers:
             tiers.append("cuda")
-        if args.full:
+        if args.full and "full" not in tiers:
             tiers.append("full")
+        print(nn.describe(found, machine))
         with console.status("provisioning"):
             directory = nn.provision(
                 tiers,
@@ -3485,8 +3489,8 @@ def _cmd_setup(args: argparse.Namespace, on_warning: OnWarning) -> int:
         _print_error(err)
         return 1
 
-    if args.cuda and "cuda" in nn.wanted_tiers(found):
-        print("--cuda: this platform already takes the CUDA provider without asking")
+    if args.cuda and "cuda" in detected:
+        print("--cuda: detection already took the CUDA provider on this machine")
     print(f"ONNX Runtime {found.ort_version} for {found.platform} is in {directory}")
     if not _verbose(args):
         return 0
