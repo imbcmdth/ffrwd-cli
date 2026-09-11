@@ -1349,30 +1349,31 @@ def test_jobs_json_carries_a_null_remaining_when_the_server_sends_none(
     assert json.loads(captured.out) == {"jobs": [ROW_DONE], "remaining": None}
 
 
-def test_watch_redraws_until_nothing_is_running(
+def test_watch_redraws_until_nothing_is_under_way(
     served: _Served,
     logged_in: None,
     fixed_clock: None,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    running = dict(ROW_DONE, state="running")
-    _listing(served, running)
+    """A job is under way from submitted through finalizing; each state holds the loop."""
+    ahead = ["running", "finalizing"]
+    _listing(served, dict(ROW_DONE, state="starting"))
     slept: list[float] = []
 
-    def _finish(seconds: float) -> None:
+    def _advance(seconds: float) -> None:
         slept.append(seconds)
-        _listing(served, ROW_DONE)
+        _listing(served, dict(ROW_DONE, state=ahead.pop(0)) if ahead else ROW_DONE)
 
-    monkeypatch.setattr(remote, "_sleep", _finish)
+    monkeypatch.setattr(remote, "_sleep", _advance)
     code = cli.main(["jobs", "--watch"])
     out = capsys.readouterr().out
     assert code == 0
-    assert slept == [remote.WATCH_SECONDS]
-    assert out.count("\nthis month:") == 2
-    assert out.count("free this month:") == 2  # both footer lines redraw
-    assert "running" in out and "succeeded" in out
-
+    assert slept == [remote.WATCH_SECONDS] * 3
+    assert out.count("\nthis month:") == 4
+    assert out.count("free this month:") == 4  # both footer lines redraw
+    for state in ("starting", "running", "finalizing", "succeeded"):
+        assert state in out
 
 def test_cancel_resolves_a_prefix_against_the_callers_jobs(
     served: _Served, logged_in: None, capsys: pytest.CaptureFixture[str]

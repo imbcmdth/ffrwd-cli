@@ -121,7 +121,11 @@ WATCH_SECONDS = 3.0
 
 _CHUNK_BYTES = 1 << 20
 
-_ACTIVE_STATES = frozenset({"submitted", "queued", "running"})
+# The states a job is still under way in, in the order it passes through them:
+# waiting for its uploads, waiting for a slot, being staged and compiled, the
+# pipeline running, and the outputs being stored. --watch polls while any
+# row is in one.
+_ACTIVE_STATES = frozenset({"submitted", "queued", "starting", "running", "finalizing"})
 
 # --wait's terminal states: whatever a job lands on once it stops polling.
 _WAIT_TERMINAL_STATES = frozenset({"succeeded", "failed", "cancelled"})
@@ -1203,7 +1207,7 @@ def _print_row_failure(row: dict[str, object], detail: dict[str, object] | None)
 
 
 def _watch(token: str) -> int:
-    """Redraw the listing until nothing is submitted, queued or running.
+    """Redraw the listing until no job is still under way.
 
     The final redraw, the one that ends the loop, also prints any failed or
     cancelled row's error and log tail -- the same shape ``--wait`` prints
