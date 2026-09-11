@@ -3711,12 +3711,16 @@ def test_a_numeric_comparison_narrows_the_rows() -> None:
     )
 
 
+def _segment_pred(where: str) -> object:
+    """The predicate JSON a gather narrowed by `where` compiles to."""
+    network = _segment_network(_segment_query(_masked(where)))
+    return json.loads(_unescaped(network.split("pred=")[1].split("[n2];")[0]))
+
+
 def test_and_or_and_not_travel_as_one_predicate() -> None:
     """AND and OR spell a list, and a chain of one of them flattens into it."""
     where = "(o.class = 'person' OR o.class = 'cat') AND NOT o.score < 0.25"
-    network = _segment_network(_segment_query(_masked(where)))
-    predicate = network.split("pred=")[1].split("[n2];")[0]
-    assert json.loads(_unescaped(predicate)) == {
+    assert _segment_pred(where) == {
         "and": [
             {
                 "or": [
@@ -3727,6 +3731,138 @@ def test_and_or_and_not_travel_as_one_predicate() -> None:
             {"not": {"lt": [{"field": "score"}, {"lit": 0.25}]}},
         ]
     }
+
+
+def test_a_pattern_travels_as_like_or_ilike_over_the_field_and_the_pattern() -> None:
+    assert _segment_pred("o.class LIKE 'pe%'") == {
+        "like": [{"field": "class"}, {"lit": "pe%"}]
+    }
+    assert _segment_pred("o.class ILIKE 'PE_SON'") == {
+        "ilike": [{"field": "class"}, {"lit": "PE_SON"}]
+    }
+
+
+def test_not_like_travels_under_the_not_the_grammar_already_held() -> None:
+    assert _segment_pred("o.class NOT LIKE 'pe%'") == {
+        "not": {"like": [{"field": "class"}, {"lit": "pe%"}]}
+    }
+
+
+def test_a_quantified_pattern_is_one_match_per_pattern_joined_by_its_word() -> None:
+    assert _segment_pred("o.class LIKE ANY (ARRAY['pe%', 'ca%'])") == {
+        "or": [
+            {"like": [{"field": "class"}, {"lit": "pe%"}]},
+            {"like": [{"field": "class"}, {"lit": "ca%"}]},
+        ]
+    }
+    assert _segment_pred("o.class ILIKE ALL (ARRAY['%e%', 'p%'])") == {
+        "and": [
+            {"ilike": [{"field": "class"}, {"lit": "%e%"}]},
+            {"ilike": [{"field": "class"}, {"lit": "p%"}]},
+        ]
+    }
+
+
+def test_a_quantified_not_like_negates_each_match_before_the_word_joins_them() -> None:
+    """NOT LIKE ANY holds where ONE pattern fails; NOT (LIKE ANY) where all do."""
+    assert _segment_pred("o.class NOT LIKE ANY (ARRAY['pe%', 'ca%'])") == {
+        "or": [
+            {"not": {"like": [{"field": "class"}, {"lit": "pe%"}]}},
+            {"not": {"like": [{"field": "class"}, {"lit": "ca%"}]}},
+        ]
+    }
+    assert _segment_pred("NOT (o.class LIKE ANY (ARRAY['pe%', 'ca%']))") == {
+        "not": {
+            "or": [
+                {"like": [{"field": "class"}, {"lit": "pe%"}]},
+                {"like": [{"field": "class"}, {"lit": "ca%"}]},
+            ]
+        }
+    }
+
+
+def test_in_and_a_quantified_comparison_are_the_or_or_and_of_the_comparisons() -> None:
+    """One comparison per element: ANY and IN join with OR, ALL and NOT IN with AND."""
+    either = {
+        "or": [
+            {"eq": [{"field": "class"}, {"lit": "person"}]},
+            {"eq": [{"field": "class"}, {"lit": "cat"}]},
+        ]
+    }
+    assert _segment_pred("o.class IN ('person', 'cat')") == either
+    assert _segment_pred("o.class = ANY (ARRAY['person', 'cat'])") == either
+    neither = {
+        "and": [
+            {"ne": [{"field": "class"}, {"lit": "person"}]},
+            {"ne": [{"field": "class"}, {"lit": "cat"}]},
+        ]
+    }
+    assert _segment_pred("o.class NOT IN ('person', 'cat')") == neither
+    assert _segment_pred("o.score <> ALL (ARRAY[1, 2])") == {
+        "and": [
+            {"ne": [{"field": "score"}, {"lit": 1}]},
+            {"ne": [{"field": "score"}, {"lit": 2}]},
+        ]
+    }
+
+
+def test_a_patterns_wildcards_and_quotes_reach_the_argument_as_written() -> None:
+    """Neither level of filtergraph escaping has an opinion about % or _."""
+    where = "o.class LIKE 'it''s 50%_off'"
+    assert _segment_pred(where) == {
+        "like": [{"field": "class"}, {"lit": "it's 50%_off"}]
+    }
+    network = _segment_network(_segment_query(_masked(where)))
+    assert "50%_off" in network, "the wildcards travel unescaped"
+
+
+def test_a_pattern_on_a_number_field_is_refused_naming_its_type() -> None:
+    error = _segment_rejects(
+        _segment_query(_masked("o.score LIKE '1%'")),
+        ErrorCode.UDF_ARG_TYPE,
+        "LIKE matches text, and the field 'score' is number",
+    )
+    assert error.hint is not None and "score number" in error.hint
+
+
+def test_a_pattern_that_is_not_a_literal_is_refused_listing_the_grammar() -> None:
+    error = _segment_rejects(
+        _segment_query(_masked("o.class LIKE o.class")),
+        ErrorCode.UNSUPPORTED_SQL,
+        "LIKE matches against literals, and this is the field 'class'",
+    )
+    assert error.hint is not None and "LIKE, ILIKE" in error.hint
+
+
+@pytest.mark.parametrize(
+    ("where", "message"),
+    [
+        ("o.class LIKE ANY (ARRAY[])", "LIKE ANY over an empty list matches no row"),
+        ("o.class LIKE ALL (ARRAY[])", "LIKE ALL over an empty list matches every row"),
+        ("o.class IN ()", "IN over an empty list matches no row"),
+        ("o.class NOT IN ()", "NOT IN over an empty list matches every row"),
+    ],
+)
+def test_an_empty_list_is_refused_saying_what_it_would_have_matched(
+    where: str, message: str
+) -> None:
+    _segment_rejects(_segment_query(_masked(where)), ErrorCode.UNSUPPORTED_SQL, message)
+
+
+def test_a_list_element_of_another_type_is_refused_naming_both() -> None:
+    _segment_rejects(
+        _segment_query(_masked("o.class IN ('person', 3)")),
+        ErrorCode.UDF_ARG_TYPE,
+        "the field 'class' is text, and 3 is number",
+    )
+
+
+def test_a_list_that_is_a_subquery_is_outside_the_runtime_grammar() -> None:
+    _segment_rejects(
+        _segment_query(_masked("o.class IN (SELECT 1)")),
+        ErrorCode.UNSUPPORTED_SQL,
+        "a subquery is not part of the runtime predicate grammar",
+    )
 
 
 def test_a_gather_with_no_where_mints_no_filter() -> None:

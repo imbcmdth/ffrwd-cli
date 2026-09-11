@@ -28,7 +28,7 @@ pub const SHAPE: Shape = Shape {
 };
 
 /// The operators a predicate is built from, for a refusal listing them.
-const OPERATORS: &str = "eq, ne, lt, le, gt, ge, and, or, not";
+const OPERATORS: &str = "eq, ne, lt, le, gt, ge, like, ilike, and, or, not";
 
 /// One side of a comparison: a field of the row, or a value written into the
 /// predicate.
@@ -76,6 +76,12 @@ impl Compare {
 /// A predicate over one row.
 enum Pred {
     Compare(Compare, Operand, Operand),
+    /// A SQL pattern match, case-folded for `ilike`.
+    Match {
+        fold: bool,
+        value: Operand,
+        pattern: Operand,
+    },
     And(Vec<Pred>),
     Or(Vec<Pred>),
     Not(Box<Pred>),
@@ -171,6 +177,14 @@ fn parse_pred(value: &Value) -> Result<Pred> {
         return Ok(Pred::Compare(op, left, right));
     }
     match key.as_str() {
+        "like" | "ilike" => {
+            let (value, pattern) = parse_operands(key, argument)?;
+            Ok(Pred::Match {
+                fold: key == "ilike",
+                value,
+                pattern,
+            })
+        }
         "and" | "or" => {
             let list = argument.as_array().ok_or_else(|| {
                 anyhow!(
@@ -234,6 +248,73 @@ fn compare(
     }
 }
 
+/// SQL LIKE, over the whole string: `%` matches any run of characters
+/// including none, `_` matches exactly one character, and every other
+/// character matches itself. A character is a Unicode scalar, so `_` matches
+/// one of those.
+///
+/// There is no escape character yet, so a pattern cannot ask for a literal
+/// `%` or `_`: both always read as wildcards.
+fn like(value: &str, pattern: &str) -> bool {
+    let value: Vec<char> = value.chars().collect();
+    let pattern: Vec<char> = pattern.chars().collect();
+    // The usual two-cursor walk: on a mismatch, back up to the last `%` and
+    // let it swallow one more character.
+    let (mut v, mut p) = (0usize, 0usize);
+    let (mut star, mut swallowed) = (None, 0usize);
+    while v < value.len() {
+        match pattern.get(p) {
+            Some('%') => {
+                star = Some(p);
+                p += 1;
+                swallowed = v;
+            }
+            Some('_') => {
+                p += 1;
+                v += 1;
+            }
+            Some(&c) if c == value[v] => {
+                p += 1;
+                v += 1;
+            }
+            _ => match star {
+                Some(at) => {
+                    p = at + 1;
+                    swallowed += 1;
+                    v = swallowed;
+                }
+                None => return false,
+            },
+        }
+    }
+    pattern[p..].iter().all(|&c| c == '%')
+}
+
+/// One value matched against one pattern. Both sides must be strings; a row
+/// whose field is a number or is absent is undecided, the way a comparison of
+/// two types is.
+///
+/// `ilike` folds case by lowercasing both sides with `str::to_lowercase`,
+/// which is Unicode's full lowercase mapping rather than case folding proper.
+fn matches(
+    fold: bool,
+    value: &Value,
+    pattern: &Value,
+    field: Option<String>,
+) -> Result<bool, Undecided> {
+    match (value, pattern) {
+        (Value::String(value), Value::String(pattern)) if fold => {
+            Ok(like(&value.to_lowercase(), &pattern.to_lowercase()))
+        }
+        (Value::String(value), Value::String(pattern)) => Ok(like(value, pattern)),
+        _ => Err(Undecided::Mismatch {
+            field,
+            left: spell_type(value),
+            right: spell_type(pattern),
+        }),
+    }
+}
+
 /// One row judged. An undecidable comparison anywhere drops the row.
 fn eval(pred: &Pred, row: &Map<String, Value>) -> Result<bool, Undecided> {
     match pred {
@@ -241,6 +322,15 @@ fn eval(pred: &Pred, row: &Map<String, Value>) -> Result<bool, Undecided> {
             let a = resolve(left, row)?;
             let b = resolve(right, row)?;
             compare(*op, a, b, about(left, right))
+        }
+        Pred::Match {
+            fold,
+            value,
+            pattern,
+        } => {
+            let a = resolve(value, row)?;
+            let b = resolve(pattern, row)?;
+            matches(*fold, a, b, about(value, pattern))
         }
         Pred::And(list) => {
             for pred in list {
@@ -405,6 +495,74 @@ mod tests {
         assert_eq!(
             kept,
             rows(&[r#"{"c":"a","s":0.9}"#, r#"{"c":"b","s":0.6}"#])
+        );
+    }
+
+    #[test]
+    fn a_pattern_anchors_at_both_ends_and_its_wildcards_span_what_they_must() {
+        // pattern, value, whether the value matches it.
+        let cases = [
+            ("spe%", "speech", true),
+            ("spe%", "spe", true),
+            ("spe%", "a speech", false),
+            ("%ech", "speech", true),
+            ("%ech", "speeches", false),
+            ("%eec%", "speech", true),
+            ("%", "", true),
+            ("s_e", "she", true),
+            ("s_e", "se", false),
+            ("s_e", "sale", false),
+            ("_", "e", true),
+            ("speech", "speech", true),
+            ("speech", "speeches", false),
+            ("", "", true),
+            ("", "x", false),
+        ];
+        for (pattern, value, expected) in cases {
+            assert_eq!(like(value, pattern), expected, "{value:?} LIKE {pattern:?}");
+        }
+    }
+
+    #[test]
+    fn one_underscore_matches_one_scalar_however_many_bytes_it_takes() {
+        assert!(like("é", "_"));
+        assert!(!like("é", "__"));
+    }
+
+    #[test]
+    fn like_keeps_the_matching_rows_and_ilike_keeps_them_whatever_their_case() {
+        let cased = rows(&[r#"{"text":"Speech"}"#, r#"{"text":"speech"}"#]);
+        let mut sensitive = open(r#"{"like":[{"field":"text"},{"lit":"spe%"}]}"#);
+        assert_eq!(
+            sensitive.keep(cased.clone()),
+            rows(&[r#"{"text":"speech"}"#])
+        );
+        let mut folded = open(r#"{"ilike":[{"field":"text"},{"lit":"SPE%"}]}"#);
+        assert_eq!(folded.keep(cased.clone()), cased, "both sides fold");
+    }
+
+    #[test]
+    fn a_pattern_over_a_field_that_is_not_a_string_drops_the_row_and_notes_it() {
+        let mut filter = open(r#"{"like":[{"field":"text"},{"lit":"spe%"}]}"#);
+        let kept = filter.keep(rows(&[
+            r#"{"text":7}"#,
+            r#"{"other":"speech"}"#,
+            r#"{"text":"speech"}"#,
+        ]));
+        assert_eq!(kept, rows(&[r#"{"text":"speech"}"#]));
+        assert_eq!(
+            filter.noted.len(),
+            1,
+            "the number is a mismatch, the absent field is not"
+        );
+    }
+
+    #[test]
+    fn a_pattern_given_one_operand_is_refused_by_name() {
+        let message = refuse(&[(PRED, r#"{"ilike":[{"field":"text"}]}"#)]);
+        assert!(
+            message.contains("'ilike' takes two operands, got 1"),
+            "got: {message}"
         );
     }
 

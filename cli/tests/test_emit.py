@@ -666,6 +666,8 @@ def test_escaping_maps_every_value_to_its_two_level_graph_form() -> None:
         "0x00FF00@0.5": "0x00FF00@0.5",
         "in_w/2": "in_w/2",
         "a.b+c%d": "a.b+c%d",
+        # A LIKE pattern's wildcards mean nothing to either level.
+        "%it_s%": "%it_s%",
         "12:30": r"12\\:30",
         "w=2": r"w\\=2",
         "it's": r"it\\\'s",

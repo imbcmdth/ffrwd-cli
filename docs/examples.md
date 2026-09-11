@@ -600,8 +600,9 @@ ffmpeg -i tests/fixtures/av.mp4 -map 0:v:0 -c:0 rawvideo -pix_fmt:0 yuv420p -f n
 `rowfilter` is the WHERE, compiled: not a module, but a node the host
 provides, with the predicate carried in the graph. Swap `'person'` for any
 COCO class, or write `AND o.score >= 0.5` to trim low-confidence matches -
-the predicate grammar is comparisons, AND, OR, NOT and parentheses over the
-row's own fields. Both `segment(...)` spellings are one call: the map and
+the predicate grammar is comparisons, `LIKE`/`ILIKE` on a text field and
+their `ANY (ARRAY[...])` and `IN (...)` spellings, AND, OR, NOT and
+parentheses over the row's own fields. Both `segment(...)` spellings are one call: the map and
 the rows leave the same node, and the rows ride the map's frames through
 the filter.
 

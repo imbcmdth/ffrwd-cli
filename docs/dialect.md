@@ -150,7 +150,12 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   The subquery selects the whole row (`SELECT r`) and carries a `FROM`
   and a `WHERE` and nothing else. The predicate holds `=`, `<>`, `<`,
   `<=`, `>`, `>=`, `AND`, `OR`, `NOT` and parentheses over the row's
-  own fields and literals of their declared types. A field the record
+  own fields and literals of their declared types, and `LIKE` and
+  `ILIKE` between a text field and a pattern literal: `%` any run,
+  `_` one character, `ILIKE` case-folded, no escape. Postgres's
+  quantified spellings fold to those: `x LIKE ANY (ARRAY[...])` and
+  `x IN (...)` are an `OR` over the elements, `LIKE ALL` and `NOT IN`
+  an `AND`. A field the record
   does not name, a literal of the wrong type for the field it is
   compared against, a reference past the alias, a computed projection,
   and anything else in the `WHERE` are each rejected where they are

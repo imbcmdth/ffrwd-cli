@@ -626,9 +626,17 @@ _DIALECT_TAIL = """\
   compile time, so this gather is not evaluated like every other
   `ARRAY(SELECT ...)`: it becomes one more node in the module network.
   The subquery selects the whole row and carries only `FROM` and
-  `WHERE`; the predicate holds `=`, `<>`, `<`, `<=`, `>`, `>=`, `AND`,
-  `OR`, `NOT` and parentheses over the row's own fields and literals of
-  their declared types, and nothing else.
+  `WHERE`; the predicate holds `=`, `<>`, `<`, `<=`, `>`, `>=`, `LIKE`,
+  `ILIKE`, `AND`, `OR`, `NOT` and parentheses over the row's own fields
+  and literals of their declared types, and nothing else. Each
+  comparison may be written over a list -- `r.class IN ('person',
+  'cat')`, `r.class = ANY (ARRAY['person', 'cat'])`, `r.text LIKE ANY
+  (ARRAY['spe%', 'wri%'])`, `ALL` for the AND of them -- whose elements
+  are literals of the field's type; an empty list is refused. `LIKE`
+  matches a text field against a pattern where `%` is any run of
+  characters and `_` is exactly one, anchored at both ends; `ILIKE`
+  ignores case. There is no escape character, so a pattern cannot ask
+  for a literal `%` or `_`.
 - A call may then WRITE the annotation column, naming each half of the
   struct: `blur_boxes(detect(v).mask, ARRAY(SELECT ...))`. Both halves
   must name the same producing call -- the rows ride the stream they

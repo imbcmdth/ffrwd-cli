@@ -2525,9 +2525,29 @@ _ROW_COMPARISONS: Mapping[type[exp.Expr], str] = {
     exp.GTE: "ge",
 }
 
+# The pattern matches a runtime predicate holds, and what each is called in it.
+_ROW_PATTERNS: Mapping[type[exp.Expr], str] = {
+    exp.Like: "like",
+    exp.ILike: "ilike",
+}
+
+# What each of them is written as, for a message quoting the comparison.
+_ROW_WRITTEN: Mapping[str, str] = {
+    "eq": "=",
+    "ne": "<>",
+    "lt": "<",
+    "le": "<=",
+    "gt": ">",
+    "ge": ">=",
+    "like": "LIKE",
+    "ilike": "ILIKE",
+}
+
 _ROW_PREDICATE_HINT = (
     "a runtime predicate compares a row's own fields against literals with "
-    "=, <>, <, <=, >, >=, AND, OR, NOT and parentheses, and holds nothing else"
+    "=, <>, <, <=, >, >=, LIKE, ILIKE, AND, OR, NOT and parentheses -- each "
+    "comparison over a list too, as IN (...) or ANY/ALL (ARRAY[...]) -- and "
+    "holds nothing else"
 )
 
 
@@ -2561,6 +2581,50 @@ def _row_operand_noun(operand: Mapping[str, object]) -> str:
     if isinstance(written, bool):
         return "true" if written else "false"
     return repr(written)
+
+
+def _quantified(node: exp.Expr) -> tuple[str, list[exp.Expr]] | None:
+    """``ANY (ARRAY[...])`` / ``ALL (ARRAY[...])`` as the word and its elements.
+
+    sqlglot parses ALL beside a comparison as an anonymous call and ALL beside
+    LIKE as a node of its own; both are the same written form. None for every
+    other right-hand side, a quantifier over a subquery included.
+    """
+    inner: object
+    if isinstance(node, exp.Any):
+        word, inner = "ANY", node.this
+    elif isinstance(node, exp.All):
+        word, inner = "ALL", node.this
+    elif (
+        isinstance(node, exp.Anonymous)
+        and str(node.name).upper() == "ALL"
+        and len(node.expressions) == 1
+    ):
+        word, inner = "ALL", node.expressions[0]
+    else:
+        return None
+    array = _unwrap_paren(inner) if isinstance(inner, exp.Expr) else None
+    if not isinstance(array, exp.Array):
+        return None
+    return word, [item for item in array.expressions if isinstance(item, exp.Expr)]
+
+
+def _every(word: str) -> bool:
+    """Whether a list form holds only where EVERY element does.
+
+    ALL and NOT IN do; ANY and the IN it spells hold where one element does.
+    """
+    return word in ("ALL", "NOT IN")
+
+
+def _joined(word: str, clauses: list[dict[str, object]]) -> dict[str, object]:
+    """One clause per element, joined the way its list form reads them."""
+    return {"and" if _every(word) else "or": clauses}
+
+
+def _negated(clause: dict[str, object], negate: bool) -> dict[str, object]:
+    """`clause` under a NOT, or as it stands."""
+    return {"not": clause} if negate else clause
 
 
 def _row_projection_noun(projections: Sequence[exp.Expr]) -> str:
@@ -5286,7 +5350,7 @@ class _Resolver:
         alias: str,
         fallback: exp.Expr,
     ) -> dict[str, object]:
-        """One predicate node: a comparison, or the logic joining them."""
+        """One predicate node: a comparison, a pattern, or the logic joining them."""
         node = _unwrap_paren(node)
         for logic, key in ((exp.And, "and"), (exp.Or, "or")):
             if isinstance(node, logic):
@@ -5295,7 +5359,15 @@ class _Resolver:
             inner = node.this
             if not isinstance(inner, exp.Expr):
                 raise _row_grammar_error(node, fallback)
+            listed = _unwrap_paren(inner)
+            if isinstance(listed, exp.In):
+                return self._predicate_in(listed, fields, alias, fallback, negate=True)
             return {"not": self._predicate_condition(inner, fields, alias, fallback)}
+        if isinstance(node, exp.In):
+            return self._predicate_in(node, fields, alias, fallback)
+        pattern = _ROW_PATTERNS.get(type(node))
+        if pattern is not None:
+            return self._predicate_pattern(node, pattern, fields, alias, fallback)
         comparison = _ROW_COMPARISONS.get(type(node))
         left, right = node.this, node.args.get("expression")
         if (
@@ -5305,6 +5377,13 @@ class _Resolver:
         ):
             raise _row_grammar_error(node, fallback)
         first, first_type = self._predicate_operand(left, fields, alias, fallback)
+        quantified = _quantified(right)
+        if quantified is not None:
+            word, elements = quantified
+            values = self._predicate_values(
+                node, comparison, word, elements, first, first_type, fields, alias, fallback
+            )
+            return _joined(word, [{comparison: [first, value]} for value in values])
         second, second_type = self._predicate_operand(right, fields, alias, fallback)
         if first_type != second_type:
             raise _error(
@@ -5317,6 +5396,123 @@ class _Resolver:
                 f"type: {_row_record_fields(fields)}",
             )
         return {comparison: [first, second]}
+
+    def _predicate_in(
+        self,
+        node: exp.In,
+        fields: Mapping[str, str],
+        alias: str,
+        fallback: exp.Expr,
+        *,
+        negate: bool = False,
+    ) -> dict[str, object]:
+        """``<field> [NOT] IN (<literal>, ...)``: one comparison per value.
+
+        IN is the OR of the equalities and NOT IN the AND of the inequalities,
+        which is what Postgres reads them as.
+        """
+        source = node.args.get("query") or node.args.get("unnest") or node.args.get("field")
+        if source is not None:
+            raise _row_grammar_error(source if isinstance(source, exp.Expr) else node, fallback)
+        left = node.this
+        if not isinstance(left, exp.Expr):
+            raise _row_grammar_error(node, fallback)
+        elements = [item for item in node.expressions if isinstance(item, exp.Expr)]
+        first, first_type = self._predicate_operand(left, fields, alias, fallback)
+        op, word = ("ne", "NOT IN") if negate else ("eq", "IN")
+        values = self._predicate_values(
+            node, op, word, elements, first, first_type, fields, alias, fallback
+        )
+        return _joined(word, [{op: [first, value]} for value in values])
+
+    def _predicate_pattern(
+        self,
+        node: exp.Expr,
+        op: str,
+        fields: Mapping[str, str],
+        alias: str,
+        fallback: exp.Expr,
+    ) -> dict[str, object]:
+        """``<field> [NOT] LIKE`` / ``ILIKE``, over one pattern or a list of them.
+
+        NOT is the ordinary negation. A quantified NOT LIKE negates each match
+        before the quantifier joins them, which is what Postgres reads it as.
+        """
+        left, right = node.this, node.args.get("expression")
+        if not isinstance(left, exp.Expr) or not isinstance(right, exp.Expr):
+            raise _row_grammar_error(node, fallback)
+        first, first_type = self._predicate_operand(left, fields, alias, fallback)
+        if first_type != "text":
+            raise _error(
+                ErrorCode.UDF_ARG_TYPE,
+                f"{_ROW_WRITTEN[op]} matches text, and {_row_operand_noun(first)} "
+                f"is {first_type}",
+                node,
+                fallback=fallback,
+                hint=f"a pattern matches a text field: {_row_record_fields(fields)}",
+            )
+        quantified = _quantified(right)
+        word, elements = quantified if quantified is not None else ("", [right])
+        patterns = self._predicate_values(
+            node, op, word, elements, first, first_type, fields, alias, fallback
+        )
+        negate = bool(node.args.get("negate"))
+        clauses = [_negated({op: [first, pattern]}, negate) for pattern in patterns]
+        return clauses[0] if quantified is None else _joined(word, clauses)
+
+    def _predicate_values(
+        self,
+        node: exp.Expr,
+        op: str,
+        word: str,
+        elements: Sequence[exp.Expr],
+        first: dict[str, object],
+        first_type: str,
+        fields: Mapping[str, str],
+        alias: str,
+        fallback: exp.Expr,
+    ) -> list[dict[str, object]]:
+        """The literals one comparison is written against, each of the field's type.
+
+        One for a plain comparison, and one per element for the list forms --
+        which hold literals only, since a runtime predicate reads no second
+        field.
+        """
+        written = word if word.endswith("IN") else f"{_ROW_WRITTEN[op]} {word}".strip()
+        if not elements:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"{written} over an empty list matches "
+                f"{'every row' if _every(word) else 'no row'}",
+                node,
+                fallback=fallback,
+                hint="write the values the rows are matched against; an empty "
+                "list is refused rather than read as a filter that does nothing",
+            )
+        values: list[dict[str, object]] = []
+        for element in elements:
+            value, kind = self._predicate_operand(element, fields, alias, fallback)
+            if "lit" not in value:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"{written} matches against literals, and this is "
+                    f"{_row_operand_noun(value)}",
+                    element,
+                    fallback=fallback,
+                    hint=_ROW_PREDICATE_HINT,
+                )
+            if kind != first_type:
+                raise _error(
+                    ErrorCode.UDF_ARG_TYPE,
+                    f"{_row_operand_noun(first)} is {first_type}, and "
+                    f"{_row_operand_noun(value)} is {kind}",
+                    element,
+                    fallback=fallback,
+                    hint="a row's field is compared against a value of its own "
+                    f"type: {_row_record_fields(fields)}",
+                )
+            values.append(value)
+        return values
 
     def _predicate_operands(
         self,
