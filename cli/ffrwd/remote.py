@@ -5,8 +5,8 @@ this machine's ffmpeg. :func:`submit_run` builds the submit payload -- the
 substituted SQL plus the raw ``-v`` pairs it was substituted from, the recipe
 name and owning package when one was run by name, the effective lock (the
 project's entries over the machine-wide lockfile's, one document), every
-``input()`` path (local files hashed and uploaded; any "://" spec passed
-through untouched, the runner's to open), every ``COPY ... TO`` destination,
+``input()`` path (local files uploaded; any "://" spec passed through
+untouched, the runner's to open), every ``COPY ... TO`` destination,
 and ``--timeout`` -- posts it, uploads the file inputs and the packed linked
 packages, and queues the job.
 :func:`jobs_command` is the other half: list, watch, cancel, fetch a
@@ -22,14 +22,16 @@ statuses) pass through as themselves. All HTTP goes through
 ``ffrwd.packages``' seams, so the unit tier fakes the server the way
 ``test_publish`` does.
 
-Every byte a job carries goes through the object store. The submit's answer
-holds one ``uploads`` entry per distinct file input and per packed package,
-keyed by sha256, and the bytes are PUT to the signed URL that entry names --
-the URL is the credential, sent verbatim, and any 2xx is the upload. A digest
-the answer left out is an answer this client does not read, refused before
-anything leaves; a file past what a single PUT signs for is refused before it
-is even opened. Once every upload is in, ``ready_url`` queues the job under
-the same bearer the submit carried.
+Every byte a job carries goes through the object store, and nothing is hashed
+to get there. The submit's answer holds one ``uploads`` entry per distinct
+file input, naming the input's position in the submitted ``inputs``, and one
+``packages`` entry per packed package, keyed by its digest; the bytes are PUT
+to the signed URL that entry names -- the URL is the credential, sent
+verbatim, and any 2xx is the upload. An input or a package the answer left
+out is an answer this client does not read, refused before anything leaves; a
+file past what a single PUT signs for is refused before it is even opened.
+Once every upload is in, ``ready_url`` queues the job under the same bearer
+the submit carried.
 
 A LINKED package does ride along. It has no published digest, so it is packed
 at submit time -- the same :func:`ffrwd.store.pack` ``publish`` uses, so what
@@ -247,7 +249,7 @@ _DATA_PLANE_TIMEOUT = 600.0
 _TRANSFER_TIMEOUT = 60.0
 
 # How many times an upload retries a send that timed out or was reset. Safe
-# to retry: putting the same bytes to the same URL writes the same object.
+# to retry: a resend to the same URL writes the same object.
 _UPLOAD_RETRIES = 3
 
 # The largest file the store signs a single PUT for. Beyond it the upload
@@ -255,6 +257,7 @@ _UPLOAD_RETRIES = 3
 _PUT_LIMIT_BYTES = 5 * 1024**3
 
 _T = TypeVar("_T")
+_K = TypeVar("_K")
 
 
 def _unreachable(url: str, err: Exception) -> FfrwdError:
@@ -461,16 +464,15 @@ def submit_run(
     if not (isinstance(job_id, str) and isinstance(ready_url, str)):
         raise _malformed(where)
 
-    # Every destination is looked up before the first PUT: a digest the answer
-    # left out is an answer this client does not read, not bytes half sent.
-    destinations = _destinations(answer, where)
+    # Every destination is looked up before the first PUT: an input or a
+    # package the answer left out is an answer this client does not read, not
+    # bytes half sent.
+    by_index, by_digest = _destinations(answer, where)
     packed = [
-        (archive, _destination(destinations, archive.entry.sha256, where))
+        (archive, _destination(by_digest, archive.entry.sha256, where))
         for archive in archives
     ]
-    staged = [
-        (path, _destination(destinations, digest, where)) for path, digest in uploads
-    ]
+    staged = [(path, _destination(by_index, index, where)) for index, path in uploads]
     for archive, destination in packed:
         if announce is not None:
             announce(
@@ -486,17 +488,17 @@ def submit_run(
     return Submitted(job_id=job_id, remaining=_remaining(answer))
 
 
-def _inputs(text: str) -> tuple[list[dict[str, object]], list[tuple[str, str]]]:
-    """The payload's inputs, and the (path, sha256) pairs to upload.
+def _inputs(text: str) -> tuple[list[dict[str, object]], list[tuple[int, str]]]:
+    """The payload's inputs, and the (index, path) pairs to upload.
 
     One entry per distinct path, in first-written order -- two aliases over
-    one file are one declaration and one upload. Any "://" spec passes
-    through untouched: a live rtmp/udp/srt input is the runner's to open,
-    never existence-checked here.
+    one path are one declaration and one upload. `index` is a file entry's
+    position in the payload's inputs, which is what the answer signs its URL
+    against. Any "://" spec passes through untouched: a live rtmp/udp/srt
+    input is the runner's to open, never existence-checked here.
     """
     entries: list[dict[str, object]] = []
-    uploads: list[tuple[str, str]] = []
-    staged: set[str] = set()
+    uploads: list[tuple[int, str]] = []
     seen: set[str] = set()
     for spec in input_specs(text):
         if spec.path in seen:
@@ -512,27 +514,22 @@ def _inputs(text: str) -> tuple[list[dict[str, object]], list[tuple[str, str]]]:
                 line=spec.line,
                 col=spec.col,
             )
-        digest, size = _digest(spec.path, line=spec.line, col=spec.col)
-        entries.append(
-            {"path": spec.path, "kind": "file", "sha256": digest, "bytes": size}
-        )
-        if digest not in staged:
-            staged.add(digest)
-            uploads.append((spec.path, digest))
+        size = _size(spec.path, line=spec.line, col=spec.col)
+        uploads.append((len(entries), spec.path))
+        entries.append({"path": spec.path, "kind": "file", "bytes": size})
     return entries, uploads
 
 
-def _digest(path: str, *, line: int, col: int) -> tuple[str, int]:
-    hasher = hashlib.sha256()
-    size = 0
+def _size(path: str, *, line: int, col: int) -> int:
+    """How big `path` is, opened to say so.
+
+    Nothing is read: the upload's own PUT is the only pass over the bytes.
+    The open is the readability check, so a file the submit cannot get at is
+    refused at its ``input()`` rather than partway through an upload.
+    """
     try:
         with open(path, "rb") as handle:
-            while True:
-                chunk = handle.read(_CHUNK_BYTES)
-                if not chunk:
-                    break
-                hasher.update(chunk)
-                size += len(chunk)
+            return os.fstat(handle.fileno()).st_size
     except OSError as err:
         raise _reject(
             f"input '{path}' could not be read: {err.strerror or err}",
@@ -540,7 +537,6 @@ def _digest(path: str, *, line: int, col: int) -> tuple[str, int]:
             line=line,
             col=col,
         ) from err
-    return hasher.hexdigest(), size
 
 
 @dataclass(frozen=True)
@@ -767,39 +763,57 @@ class _Destination:
     expires_at: str | None
 
 
-def _destinations(answer: Mapping[str, object], where: str) -> dict[str, _Destination]:
-    """The submit's ``uploads``: a signed PUT target per digest the job carries.
+def _destinations(
+    answer: Mapping[str, object], where: str
+) -> tuple[dict[int, _Destination], dict[str, _Destination]]:
+    """The submit's signed PUT targets: ``uploads`` by index, ``packages`` by digest.
 
-    One entry per distinct file input and per packed package. Empty is an
-    answer -- a job of url inputs and registry packages alone carries nothing
-    -- but anything other than an object under the key is not.
+    ``uploads`` is a list, one entry per file input, naming that input's
+    position in the submitted inputs; ``packages`` is a map keyed by the
+    digests the spec sent. Either being empty is an answer -- a job of url
+    inputs and registry packages alone carries nothing -- but anything other
+    than the shape each has is not.
     """
     offered = answer.get("uploads")
-    if not isinstance(offered, dict):
+    listed = answer.get("packages")
+    if not isinstance(offered, list) or not isinstance(listed, dict):
         raise _malformed(where)
-    found: dict[str, _Destination] = {}
-    for digest, entry in offered.items():
+    by_index: dict[int, _Destination] = {}
+    for entry in offered:
         if not isinstance(entry, dict):
             continue
-        url = entry.get("url")
-        if not isinstance(url, str):
-            continue
-        expires = entry.get("expires_at")
-        found[str(digest)] = _Destination(
-            url=url, expires_at=expires if isinstance(expires, str) else None
-        )
-    return found
+        index = entry.get("index")
+        signed = _signed(entry)
+        if isinstance(index, int) and signed is not None:
+            by_index[index] = signed
+    by_digest: dict[str, _Destination] = {}
+    for digest, entry in listed.items():
+        signed = _signed(entry)
+        if signed is not None:
+            by_digest[str(digest)] = signed
+    return by_index, by_digest
+
+
+def _signed(entry: object) -> _Destination | None:
+    """One ``{url, expires_at}`` entry, or None for anything this client cannot use."""
+    if not isinstance(entry, dict):
+        return None
+    url = entry.get("url")
+    if not isinstance(url, str):
+        return None
+    expires = entry.get("expires_at")
+    return _Destination(url=url, expires_at=expires if isinstance(expires, str) else None)
 
 
 def _destination(
-    destinations: Mapping[str, _Destination], digest: str, where: str
+    destinations: Mapping[_K, _Destination], key: _K, where: str
 ) -> _Destination:
-    """Where `digest`'s bytes go. A digest the answer left out is malformed.
+    """Where `key`'s bytes go. An input or a package the answer left out is malformed.
 
     The store is the only way in, so an entry this client was not given is an
     upload it cannot make -- not a fallback to somewhere else.
     """
-    found = destinations.get(digest)
+    found = destinations.get(key)
     if found is None:
         raise _malformed(where)
     return found
