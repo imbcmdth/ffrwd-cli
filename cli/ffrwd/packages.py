@@ -58,16 +58,21 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import http.client
 import json
 import os
+import random
 import re
 import tempfile
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import IO, Protocol
 
@@ -163,6 +168,46 @@ _BLOCK_BYTES = 1024 * 1024
 
 # Where Hugging Face serves a pinned file from.
 HUGGINGFACE = "https://huggingface.co"
+
+# What a model download retries, and how long it is prepared to wait.
+#
+# 429 is the one that matters: a runner installing several packages pulls
+# several gigabyte-sized models back to back, and being told to slow down is
+# expected traffic rather than an exceptional condition. The 5xx codes are the
+# hub or its CDN having a moment. Everything else a 4xx says -- no such
+# revision, no such file, not allowed to read it -- is the manifest's pin
+# being wrong, and no amount of asking again fixes that.
+_RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
+
+# The exceptions a connection raises when it did not carry: refused, reset,
+# timed out, or cut off mid-body. HTTPError is caught BEFORE these -- it is a
+# URLError subclass, and a status is judged by its code, not by its class.
+_TRANSIENT = (
+    urllib.error.URLError,
+    TimeoutError,
+    ConnectionError,
+    http.client.IncompleteRead,
+)
+
+# A few attempts, not many. Three retries over the doubling below waits at
+# most seven seconds in total, which is inside the patience of someone
+# watching an install and long enough for a burst limit to clear. A hub that
+# is still refusing after that is not going to stop while anyone waits.
+_MODEL_RETRIES = 3
+_RETRY_BASE = 1.0
+_RETRY_CAP = 8.0
+# The longest a `Retry-After` is honoured for. The header is worth reading --
+# the hub knows when its own limit clears -- but a job must not be parked for
+# an hour by a mistaken or hostile one.
+_RETRY_AFTER_CAP = 30.0
+
+# The status that says a range was honoured and the answer is the rest of the
+# file rather than all of it.
+_PARTIAL = 206
+
+# Seams, so a check pays neither the waiting nor the randomness.
+_sleep: Callable[[float], object] = time.sleep
+_jitter: Callable[[], float] = random.random
 
 # A package name's SHAPE is the project reader's rule (`is_package_name`):
 # `<namespace>/<package>`, each half a lowercase plain identifier. Checked
@@ -1030,6 +1075,15 @@ def stored(release: Release) -> Path | None:
 # the models a package pins
 # --------------------------------------------------------------------------
 
+# A pin is keyed in the cache by its `sha256` and nothing else -- by what
+# identifies the bytes, not by what names them. There is no fallback key and
+# no need of one: the manifest reader requires `sha256` on every model and
+# refuses anything that is not 64 hex characters, so a ModelPin in hand
+# always carries one. Repo, revision and filename would be the obvious
+# fallback if that ever changed, since a hub revision is a commit -- but a
+# branch or tag revision is not, and keying on one would serve stale bytes
+# the day it moved.
+
 
 def model_url(pin: ModelPin) -> str:
     """Where Hugging Face serves the exact file `pin` names."""
@@ -1063,19 +1117,27 @@ def _download_model(
     destination: Path,
     announce: Announce | None = None,
     progress: Progress | None = None,
+    detail: Announce | None = None,
 ) -> None:
-    """Fetch, verify and place one model file. Nothing is written until it verifies.
+    """Fetch, verify and place one model file. Nothing is named until it verifies.
 
-    Streamed into a temporary file beside its destination and moved onto it,
-    so a model is complete or absent and never half of either -- and hashed on
-    the way through, since it is far too large to hold.
+    Streamed into a temporary file and hashed on the way through, since it is
+    far too large to hold. The temporary is written in the model cache, beside
+    the name it will be kept under, and renamed onto that name only once it
+    verifies -- so neither the cache nor the destination ever holds a torn or
+    unverified file -- and the destination is then placed from the cache. A
+    cache that cannot be written is done without: the temporary is written
+    beside the destination and renamed onto it, as it was before there was one.
     """
     url = model_url(pin)
+    staging = store.model_staging(pin.sha256)
     try:
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        handle, temporary = tempfile.mkstemp(
-            dir=destination.parent, prefix=f"{destination.name}-", suffix=".tmp"
-        )
+        if staging is None:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            directory, prefix = destination.parent, f"{destination.name}-"
+        else:
+            directory, prefix = staging, f"{pin.sha256[:16]}-"
+        handle, temporary = tempfile.mkstemp(dir=directory, prefix=prefix, suffix=".tmp")
     except OSError as err:
         raise _model_refusal(
             package, export, pin, f"could not be written: {err.strerror or err}"
@@ -1095,6 +1157,13 @@ def _download_model(
             raise _model_refusal(
                 package, export, pin, f"hashes to {found}, and {pin.sha256} was expected"
             )
+        if staging is not None:
+            if store.keep_model(Path(temporary), pin.sha256) is None:
+                raise _model_refusal(
+                    package, export, pin, f"could not be kept in the cache at {staging}"
+                )
+            _place(package, export, pin, destination, detail)
+            return
         try:
             os.replace(temporary, destination)
         except OSError as err:
@@ -1104,15 +1173,115 @@ def _download_model(
     finally:
         try:
             os.unlink(temporary)
-        except OSError:  # already moved onto the destination, or already gone
+        except OSError:  # already renamed onto its name, or already gone
             pass
 
 
-def _model_notice(pin: ModelPin, size: int | None) -> str:
-    """The one line a model fetch announces: the file, its size, and the repo."""
+def _place(
+    package: str, export: str, pin: ModelPin, destination: Path, detail: Announce | None
+) -> None:
+    """Put the cached file `pin` names at `destination`, or refuse naming the pin.
+
+    A hard link is the expected road and says nothing. A symlink or a copy
+    is a filesystem that refused a link -- a network volume, a second disk --
+    which is worth knowing under ``--verbose`` and noise otherwise.
+    """
+    how = store.place_model(pin.sha256, destination)
+    if how is None:
+        raise _model_refusal(package, export, pin, f"could not be written at {destination}")
+    _placed(pin, how, detail)
+
+
+def _placed(pin: ModelPin, how: str, detail: Announce | None) -> None:
+    """Say, under ``--verbose``, that a model was placed by something other than a hard link."""
+    if detail is None or how == "hard link":
+        return
+    if how == "symlink":
+        detail(f"{pin.filename} is a symlink into the model cache: a hard link was refused")
+    else:
+        detail(f"{pin.filename} is a copy out of the model cache: a link was refused")
+
+
+def _same_file(one: Path, other: Path) -> bool:
+    """Whether the two paths reach the same file, following links; False when either is absent."""
+    try:
+        return os.path.samefile(one, other)
+    except OSError:
+        return False
+
+
+def _model_notice(pin: ModelPin, size: int | None, source: str | None = None) -> str:
+    """The one line a model fetch announces: the file, its size, and where it came from.
+
+    `source` names somewhere other than the hub -- the cache, for a file
+    nothing crossed the network for.
+    """
+    where = source if source is not None else pin.repo
     if size is None:
-        return f"model {pin.file} from {pin.repo}"
-    return f"model {pin.file} ({written_size(size)}) from {pin.repo}"
+        return f"model {pin.file} from {where}"
+    return f"model {pin.file} ({written_size(size)}) from {where}"
+
+
+def _file_size(path: Path) -> int | None:
+    """What the file at `path` weighs, or None when it cannot be read."""
+    try:
+        return path.stat().st_size
+    except OSError:
+        return None
+
+
+def _retry_after(headers: object) -> float | None:
+    """The delay a ``Retry-After`` asks for, in seconds, in either of its forms.
+
+    A count of seconds, or an HTTP date to wait until. None when there is no
+    such header or it is not either of those. Never negative: a date already
+    past asks for no wait at all. The CLAMP is the caller's -- what a header
+    asks for is a request, not an instruction.
+    """
+    got = getattr(headers, "get", None)
+    written = got("Retry-After") if got is not None else None
+    if not written:
+        return None
+    written = str(written).strip()
+    try:
+        return float(int(written))
+    except ValueError:
+        pass
+    try:
+        when = parsedate_to_datetime(written)
+    except (TypeError, ValueError):
+        return None
+    if when.tzinfo is None:  # an HTTP date with no zone is GMT
+        when = when.replace(tzinfo=timezone.utc)
+    return max((when - datetime.now(timezone.utc)).total_seconds(), 0.0)
+
+
+def _backoff(retries: int, after: float | None) -> float:
+    """How long to wait before the next attempt, in seconds.
+
+    Doubling from `_RETRY_BASE` and capped, with jitter over the upper half
+    of each step so a runner installing several packages at once does not
+    line its retries up and rate-limit itself all over again. A
+    ``Retry-After`` the answer carried wins, clamped to `_RETRY_AFTER_CAP`:
+    a mistaken or hostile header must not park a job for an hour.
+    """
+    if after is not None:
+        return min(max(after, 0.0), _RETRY_AFTER_CAP)
+    step = min(_RETRY_BASE * 2.0**retries, _RETRY_CAP)
+    return step * (0.5 + 0.5 * _jitter())
+
+
+def _tried(detail: str, retries: int, waited: float) -> str:
+    """`detail`, saying what was tried before it when anything was.
+
+    A refusal nothing retried reads exactly as it did before there was a
+    retry at all: a 404 is the pin's own problem, and saying "was retried 0
+    times" about it would be noise.
+    """
+    if not retries:
+        return detail
+    times = "once" if retries == 1 else f"{retries} times"
+    return f"was retried {times} over {waited:.0f}s and still {detail}"
 
 
 def _content_length(response: object) -> int | None:
@@ -1141,40 +1310,98 @@ def _stream(
     bound -- and a count past the backstop is what says it was abandoned.
     `announce` hears the one line naming the model, once the answer is open
     and its size is known; `progress` hears every block against that size.
+
+    A refusal the hub may answer differently in a moment is tried again, up to
+    `_MODEL_RETRIES` times: 429, which a runner installing several packages
+    back to back should EXPECT rather than treat as exceptional, the transient
+    server codes, and a connection that failed, timed out or was cut short.
+    Anything else -- 401, 403, 404, any other 4xx -- will not change on its
+    own and fails on the first answer, with the message it has always had.
+
+    What has already arrived is kept across attempts: the next one asks for
+    the rest with a ``Range`` header and appends to it, so a gigabyte model
+    that dies at nine tenths costs the last tenth rather than all of it. An
+    answer that ignores the range -- anything but a 206 -- starts the file and
+    the digest over, since appending to it would hash the head twice.
     """
     digest = hashlib.sha256()
     written = 0
-    try:
-        with _urlopen(_request(url), timeout=TIMEOUT) as response:
-            total = _content_length(response)
-            if announce is not None:
-                announce(_model_notice(pin, total))
-            while True:
-                block = response.read(_BLOCK_BYTES)
-                if not block:
+    waited = 0.0
+    retries = 0
+    announced = False
+    while True:
+        try:
+            resuming = {"Range": f"bytes={written}-"} if written else None
+            with _urlopen(_request(url, headers=resuming), timeout=TIMEOUT) as response:
+                if written and getattr(response, "status", None) != _PARTIAL:
+                    file.seek(0)
+                    file.truncate()
+                    digest, written = hashlib.sha256(), 0
+                length = _content_length(response)
+                total = None if length is None else length + written
+                if announce is not None and not announced:
+                    announce(_model_notice(pin, total))
+                    announced = True
+                while True:
+                    block = response.read(_BLOCK_BYTES)
+                    if not block:
+                        if total is not None and written < total:
+                            # http.client ends a sized read quietly when the
+                            # connection closes early, rather than raising, so
+                            # an answer cut short is caught by its own length.
+                            raise ConnectionError(
+                                f"the connection closed {total - written} bytes short "
+                                f"of the {total} it promised"
+                            )
+                        if progress is not None:
+                            progress(written, total if total is not None else written)
+                        return digest.hexdigest(), written
+                    written += len(block)
+                    if written > _MAX_MODEL_BYTES:
+                        return digest.hexdigest(), written
+                    digest.update(block)
+                    file.write(block)
                     if progress is not None:
-                        progress(written, total if total is not None else written)
-                    return digest.hexdigest(), written
-                written += len(block)
-                if written > _MAX_MODEL_BYTES:
-                    return digest.hexdigest(), written
-                digest.update(block)
-                file.write(block)
-                if progress is not None:
-                    progress(written, total)
-    except urllib.error.HTTPError as err:
-        raise _model_refusal(package, export, pin, f"answered HTTP {err.code}") from err
-    except (OSError, ValueError, urllib.error.URLError) as err:
-        reason = getattr(err, "reason", None)
-        raise _model_refusal(
-            package, export, pin, f"could not be read at {url}: {reason or err}"
-        ) from err
+                        progress(written, total)
+        except urllib.error.HTTPError as err:
+            detail = f"answered HTTP {err.code}"
+            if err.code not in _RETRY_STATUSES or retries >= _MODEL_RETRIES:
+                raise _model_refusal(
+                    package, export, pin, _tried(detail, retries, waited)
+                ) from err
+            note = f"the hub answered HTTP {err.code}"
+            delay = _backoff(retries, _retry_after(err.headers))
+        except _TRANSIENT as err:
+            reason = getattr(err, "reason", None)
+            detail = f"could not be read at {url}: {reason or err}"
+            if retries >= _MODEL_RETRIES:
+                raise _model_refusal(
+                    package, export, pin, _tried(detail, retries, waited)
+                ) from err
+            note = "the hub could not be read"
+            delay = _backoff(retries, None)
+        except (OSError, ValueError) as err:
+            # Not the network: a disk that cannot be written, a URL that is
+            # not one. Neither answers differently for being asked again.
+            reason = getattr(err, "reason", None)
+            raise _model_refusal(
+                package, export, pin, f"could not be read at {url}: {reason or err}"
+            ) from err
+        retries += 1
+        waited += delay
+        if announce is not None:
+            announce(
+                f"{note}; retrying {pin.filename} in {delay:.1f}s "
+                f"({retries} of {_MODEL_RETRIES})"
+            )
+        _sleep(delay)
 
 
 def _install_models(
     package: Package,
     announce: Announce | None = None,
     progress: Progress | None = None,
+    detail: Announce | None = None,
 ) -> None:
     """Put every file `package` pins beside the module whose export loads it.
 
@@ -1184,6 +1411,17 @@ def _install_models(
     refers to them by. A file already there and hashing to its pin is left
     alone; one that fails to arrive fails the install, naming the model and
     the pin.
+
+    Each file is found the cheapest way there is. Already a link to its
+    cached copy: nothing to do, and nothing hashed, since the cache verified
+    it before naming it. Already there and hashing to its pin, from before
+    there was a cache: left alone, and kept in the cache on the way past. In
+    the cache: placed from it, with no network at all -- which is all a
+    package version that did not touch a model pin costs. Otherwise fetched
+    from the hub, into the cache, and placed from there.
+
+    Called directly, with the package alone, by the cloud runner staging a
+    job onto its volume; the name and that call stay as they are.
     """
     if not package.models:
         return
@@ -1197,9 +1435,30 @@ def _install_models(
         graph = Path(wasm.model_path(module, export))
         for number, pin in enumerate(pins):
             destination = graph if number == 0 else graph.parent / pin.filename
-            if _digest_of(destination) == pin.sha256:
+            cached = store.cached_model(pin.sha256)
+            if cached is not None and _same_file(cached, destination):
                 continue
-            _download_model(package.name, export, pin, destination, announce, progress)
+            if _digest_of(destination) == pin.sha256:
+                if cached is None:
+                    # The first whole copy seen becomes the cached one, by a
+                    # link where it can, so it is kept rather than duplicated.
+                    store.cache_model(destination, pin.sha256)
+                else:
+                    # A second whole copy of a file already cached: an install
+                    # from before the cache, one per package version. Replaced
+                    # by a link to the cached file so its disk comes back. Where
+                    # no link can be made it is left as it is, verified.
+                    how = store.place_model(pin.sha256, destination, copy=False)
+                    if how is not None:
+                        _placed(pin, how, detail)
+                continue
+            how = store.place_model(pin.sha256, destination) if cached is not None else None
+            if cached is not None and how is not None:
+                if announce is not None:
+                    announce(_model_notice(pin, _file_size(cached), "the cache"))
+                _placed(pin, how, detail)
+                continue
+            _download_model(package.name, export, pin, destination, announce, progress, detail)
 
 
 def model_sizes(pins: Sequence[ModelPin]) -> dict[ModelPin, int]:
@@ -1376,7 +1635,7 @@ def _ensure(
     root = already if already is not None else fetch(release, progress)
     _agrees(release, root)
     package = read_manifest(root / MANIFEST_NAME)
-    _install_models(package, announce, progress)
+    _install_models(package, announce, progress, detail)
     _install_runtime(package, announce, progress)
 
     if pinned is not None:
@@ -1560,6 +1819,6 @@ def install_project(
         wanted[name] = release.version
     _write_lockfile_migrating(lock, entries, wanted)
 
-    _install_models(package, announce, progress)
+    _install_models(package, announce, progress, detail)
     _install_runtime(package, announce, progress)
     return ProjectInstalled(package=package, brought=tuple(brought), lock=lock)

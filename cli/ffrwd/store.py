@@ -6,14 +6,18 @@ lockfile pins is over that archive's bytes. Hashing what travels is what lets
 a bad download be thrown away without being opened: bytes in, hash, compare to
 the pin, discard. Nothing unverified reaches the extractor.
 
-Three things live here. :func:`pack` builds a package directory into a
+Four things live here. :func:`pack` builds a package directory into a
 deterministic gzipped tar, so the same content produces the same bytes and so
 the same digest on any machine. What it puts in is the manifest's closure --
 the files a package cannot be read without -- plus whatever the manifest's
 ``files`` names, and nothing else: the built module ships and the tree it was
 built from does not. :func:`unpack` verifies bytes against a digest and writes
 what they hold into the store. :func:`load` turns a lockfile entry back into a
-directory to read.
+directory to read. The fourth is the MODEL cache at the foot of the file,
+which is a different thing under the same roof: the large files a manifest
+pins on the hub, kept once by their own digest and linked into each package
+entry that pins them -- by hard link, symlink or copy, whichever the
+filesystem allows.
 
 Layout follows the registry's disk cache (`registry.py`): everything under
 ``~/.cache/ffrwd/``, :func:`_cache_dir` the only place that names the home
@@ -59,12 +63,20 @@ __all__ = [
     "GITIGNORE_NAME",
     "IGNORE_NAME",
     "LICENSE_NAMES",
+    "MODEL_FORMAT",
     "STORE_FORMAT",
     "SUBSET_HINT",
+    "cache_model",
+    "cached_model",
+    "keep_model",
     "entry_path",
     "global_lock_path",
     "load",
+    "model_entry_path",
+    "model_staging",
+    "models_dir",
     "pack",
+    "place_model",
     "store_dir",
     "unpack",
     "unreadable_pattern",
@@ -755,3 +767,231 @@ def load(package: str, stored: str, sha256: str) -> Path:
             _REINSTALL_HINT,
         )
     return directory
+
+
+# --------------------------------------------------------------------------
+# the model cache
+# --------------------------------------------------------------------------
+
+# A pinned model is fetched from the hub and placed beside the module whose
+# export loads it -- inside a package's own store entry, which is addressed by
+# its ARCHIVE's digest. So a package that republishes without touching a model
+# pin lands in a new entry, and the same file used to be pulled over the
+# network again for it. Here the file is kept once, addressed by its OWN
+# digest, and what sits beside each module is a link to it.
+#
+# Unlike a store entry, the cache is an OPTIMIZATION: a file kept here can
+# always be fetched again, so a cache that cannot be read is a miss rather
+# than a rejection. What it must never hold is a torn or unverified file under
+# a final name. Everything written here is written to a temporary in the same
+# directory, verified, and renamed onto its name -- the one step a reader can
+# observe -- and a name already taken is success, since a digest names one
+# content. Several processes, or several containers sharing one volume, may
+# fetch the same model at once; each pays for its download and the cache ends
+# holding one whole file either way.
+#
+# NOTHING EVICTS. There is no safe rule to evict by. An entry is addressed by
+# a digest some manifest on this machine pins, and the lockfiles that pin it
+# live in projects all over the disk -- there is no reference count to read,
+# and a last-used time cannot tell "stale" from "a project not opened this
+# month", whose model would then cost a gigabyte to fetch again. A cap would
+# evict by size, which is exactly backwards: the largest entry is the one
+# most worth keeping. Clearing it is the user's own removal of the directory,
+# which costs a refetch -- and, where a module's model is a symlink into it,
+# an install of that package to put the file back.
+
+# The model cache's layout version, and the first component of every path in
+# it. Separate from STORE_FORMAT -- the two hold different things, and a
+# change to one has no business invalidating the other.
+MODEL_FORMAT = "v1"
+
+# Whether a symlink is worth trying where a hard link was refused. POSIX only:
+# Windows needs a privilege for one that nothing here can assume. A seam, so
+# a check can take either road on any machine.
+_SYMLINKS = os.name == "posix"
+
+
+def models_dir() -> Path:
+    """The root every cached model file sits under."""
+    return _cache_dir() / "models"
+
+
+def model_entry_path(sha256: str) -> str:
+    """Where a model file of this digest belongs, relative to :func:`models_dir`."""
+    return f"{MODEL_FORMAT}/{sha256[:2]}/{sha256}"
+
+
+def cached_model(sha256: str) -> Path | None:
+    """The cached file of this digest, or None when nothing is cached under it.
+
+    Nothing is hashed here, for the reason nothing is hashed reading the
+    package store: the digest did its work before the file was given its
+    name, and what carries that name is the user's own cache.
+    """
+    if _SHA256_RE.fullmatch(sha256) is None:
+        return None
+    path = models_dir() / model_entry_path(sha256)
+    try:
+        return path if path.is_file() else None
+    except OSError:  # pragma: no cover -- a path the OS refuses to stat
+        return None
+
+
+def model_staging(sha256: str) -> Path | None:
+    """The directory to write a model of this digest into before it is kept.
+
+    The directory its final name is in, so keeping it is a rename and never a
+    copy. None when the directory cannot be made, which leaves the caller to
+    do without the cache.
+    """
+    if _SHA256_RE.fullmatch(sha256) is None:
+        return None
+    directory = (models_dir() / model_entry_path(sha256)).parent
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    return directory
+
+
+def keep_model(temporary: Path, sha256: str) -> Path | None:
+    """Give a VERIFIED temporary in :func:`model_staging` its final name in the cache.
+
+    The caller hashed `temporary` as it wrote it; this does not read it
+    again. A name already there is success -- it holds this digest's content
+    by definition -- and `temporary` is discarded rather than renamed over it.
+    Returns the cached path, or None when the rename failed and nothing holds
+    the name.
+    """
+    final = models_dir() / model_entry_path(sha256)
+    try:
+        if final.is_file():
+            _discard(temporary)
+            return final
+        os.replace(temporary, final)
+    except OSError:
+        _discard(temporary)
+        # Another writer can take the name between the check and the rename;
+        # on a platform that refuses to rename over it, that is still success.
+        return final if final.is_file() else None
+    return final
+
+
+def cache_model(source: Path, sha256: str) -> Path | None:
+    """Keep a file already verified where it sits, leaving `source` in place.
+
+    For a model an earlier install put beside its module before there was a
+    cache, hashed by the caller just now. A hard link costs nothing and needs
+    no second look. A copy is new bytes on what may be a network volume, so
+    it is hashed as it is written and kept only when it matches. Returns the
+    cached path, or None when nothing could be kept.
+    """
+    existing = cached_model(sha256)
+    if existing is not None:
+        return existing
+    staging = model_staging(sha256)
+    if staging is None:
+        return None
+    temporary = _fresh(staging, f"{sha256[:16]}-")
+    if temporary is None:
+        return None
+    try:
+        try:
+            os.link(source, temporary)
+        except OSError:
+            if _copied_digest(source, temporary) != sha256:
+                _discard(temporary)
+                return None
+    except OSError:
+        _discard(temporary)
+        return None
+    return keep_model(temporary, sha256)
+
+
+def place_model(sha256: str, destination: Path, *, copy: bool = True) -> str | None:
+    """Put the cached file of this digest at `destination`, saying how.
+
+    Tried in order: a hard link, which costs nothing and survives the cache
+    being cleared; on POSIX, a RELATIVE symlink, which costs nothing and
+    survives the volume holding both being mounted somewhere else; a copy.
+    Returns ``"hard link"``, ``"symlink"`` or ``"copy"``, or None when there is
+    nothing cached or nothing could be written. Made beside `destination` and
+    renamed onto it, so the file there is whole or absent -- a symlink is
+    renamed like any other file, never followed.
+
+    `copy=False` stops short of the copy and answers None instead. That is for
+    replacing a file that is already whole with a link to the cached one: a
+    link frees the duplicate's disk, and a copy would write a gigabyte to end
+    exactly where it started.
+    """
+    source = cached_model(sha256)
+    if source is None:
+        return None
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    temporary = _fresh(destination.parent, f"{destination.name}-")
+    if temporary is None:
+        return None
+    try:
+        how = _made(source, temporary, copy=copy)
+        if how is None:
+            return None
+        os.replace(temporary, destination)
+    except OSError:
+        _discard(temporary)
+        return None
+    return how
+
+
+def _made(source: Path, temporary: Path, *, copy: bool = True) -> str | None:
+    """Make `temporary` stand for `source` by the cheapest road the filesystem allows.
+
+    None, with nothing written, when only a copy is left and `copy` is False.
+    """
+    try:
+        os.link(source, temporary)
+        return "hard link"
+    except OSError:
+        pass
+    if _SYMLINKS:
+        try:
+            os.symlink(os.path.relpath(source, temporary.parent), temporary)
+            return "symlink"
+        except OSError:
+            pass
+    if not copy:
+        return None
+    shutil.copyfile(source, temporary)
+    return "copy"
+
+
+def _fresh(directory: Path, prefix: str) -> Path | None:
+    """An unused temporary name in `directory`, with nothing at it yet."""
+    try:
+        handle, written = tempfile.mkstemp(dir=directory, prefix=prefix, suffix=".tmp")
+    except OSError:
+        return None
+    os.close(handle)
+    path = Path(written)
+    _discard(path)
+    return path
+
+
+def _copied_digest(source: Path, target: Path) -> str:
+    """Copy `source` to `target` block by block: the sha256 of what was written."""
+    digest = hashlib.sha256()
+    with open(source, "rb") as reading, open(target, "xb") as writing:
+        for block in iter(lambda: reading.read(1024 * 1024), b""):
+            digest.update(block)
+            writing.write(block)
+    return digest.hexdigest()
+
+
+def _discard(path: Path) -> None:
+    """Remove a temporary, whatever state it is in."""
+    try:
+        os.unlink(path)
+    except OSError:
+        pass

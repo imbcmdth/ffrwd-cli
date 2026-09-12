@@ -30,7 +30,9 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import shutil
+import threading
 import urllib.error
 from collections.abc import Iterator, Mapping
 from pathlib import Path
@@ -208,9 +210,13 @@ class _Served:
 
     An answer is bytes for a 200, an ``(status, body)`` pair for anything
     else -- which urllib raises rather than returns, so this does too -- or a
-    :class:`_WithLength` for a 200 that names its size. A URL the table does
-    not hold is a 404, since that is what a registry says about something it
-    has never published.
+    :class:`_WithLength` for a 200 that names its size. A status may carry
+    headers as a third member, the way a 429 carries ``Retry-After``. An
+    exception is raised as a connection that did not carry would raise it,
+    and a ready-made :class:`_Fake` is handed back as it is. A LIST is a
+    script, one answer per request in order, its last answer repeating. A URL
+    the table does not hold is a 404, since that is what a registry says
+    about something it has never published.
     """
 
     def __init__(self, answers: Mapping[str, object]) -> None:
@@ -227,13 +233,23 @@ class _Served:
         body = request.data  # type: ignore[attr-defined]
         self.asked.append((url, headers, body))
         answer = self.answers.get(url, (404, b'{"error": "not found"}'))
+        if isinstance(answer, list):
+            answer = answer.pop(0) if len(answer) > 1 else answer[0]
+        if isinstance(answer, BaseException):
+            raise answer
+        if isinstance(answer, _Fake):
+            return answer
         if isinstance(answer, _WithLength):
             return _Fake(200, answer.body, {"Content-Length": str(len(answer.body))})
-        status, content = answer if isinstance(answer, tuple) else (200, answer)
+        if isinstance(answer, tuple):
+            status, content, *rest = answer
+            said = dict(rest[0]) if rest else {}
+        else:
+            status, content, said = 200, answer, {}
         assert isinstance(content, bytes)
         if status >= 400:
-            raise urllib.error.HTTPError(url, status, "refused", {}, io.BytesIO(content))  # type: ignore[arg-type]
-        return _Fake(status, content)
+            raise urllib.error.HTTPError(url, status, "refused", said, io.BytesIO(content))  # type: ignore[arg-type]
+        return _Fake(status, content, said)
 
     def urls(self) -> list[str]:
         return [url for url, _headers, _body in self.asked]
@@ -1713,7 +1729,9 @@ LARGE_MODEL_DIGEST = hashlib.sha256(LARGE_MODEL).hexdigest()
 BLOCK = 1024 * 1024
 
 
-def _model_package(root: Path, *, models: dict[str, object] | None = None) -> Path:
+def _model_package(
+    root: Path, *, models: dict[str, object] | None = None, version: str = "1.0.0"
+) -> Path:
     """A package whose one export is a wasm module, pinning a model for it."""
     (root / "src").mkdir(parents=True, exist_ok=True)
     (root / "src" / "lib.sql").write_text(
@@ -1724,7 +1742,7 @@ def _model_package(root: Path, *, models: dict[str, object] | None = None) -> Pa
     (root / "depth.wasm").write_bytes(b"\0asm")
     declared: dict[str, object] = {
         "name": "broadcast/depth",
-        "version": "1.0.0",
+        "version": version,
         "lib": {"depth": "src/lib.sql"},
         "models": models
         if models is not None
@@ -1792,6 +1810,176 @@ def test_a_model_stream_reports_every_block_and_the_count_it_ended_at(
         MODEL_URL, io.BytesIO(), "broadcast/depth", "depth", _large_model_pin(), None, report
     )
     assert seen == [(BLOCK, None), (2 * BLOCK, None), (weighs, None), (weighs, weighs)]
+
+
+# ---------------------------------------------------------------------------
+# a model download the hub refuses, and tries again
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def waits(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Every wait a retry makes, recorded instead of slept; the jitter held at its top."""
+    slept: list[float] = []
+    monkeypatch.setattr(packages, "_sleep", slept.append)
+    monkeypatch.setattr(packages, "_jitter", lambda: 1.0)
+    return slept
+
+
+def _model_pin() -> ModelPin:
+    return ModelPin(
+        repo="depth-anything/small", revision="v1", file="model.onnx", sha256=MODEL_DIGEST
+    )
+
+
+class _CutOff(_Fake):
+    """A 200 naming its whole length whose body ends after the first block.
+
+    What http.client really does when the connection closes mid-body: a read
+    by size comes back empty, and nothing is raised.
+    """
+
+    def __init__(self, body: bytes) -> None:
+        super().__init__(200, body, {"Content-Length": str(len(body))})
+        self._served = False
+
+    def read(self, size: int = -1) -> bytes:
+        if self._served:
+            return b""
+        self._served = True
+        return super().read(size)
+
+
+def test_a_rate_limited_model_install_waits_says_so_and_succeeds(
+    store_home: Path,
+    registry: Path,
+    served: _Served,
+    waits: list[float],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """429 is expected traffic: the install waits, narrates the wait, and lands the model.
+
+    The wait line is a transfer's line -- it prints by default so a pause is
+    not mistaken for a hang, and `-q` silences it with everything else.
+    """
+    monkeypatch.setenv(packages.REGISTRY_ENV, str(registry))
+    sha256 = _publish(registry, _model_package(tmp_path / "built"), functions=("depth",))
+    _serves(served, **{MODEL_URL: [(429, b"slow down"), MODEL]})
+    project = _project(tmp_path / "work", monkeypatch, capsys)
+
+    code, _out, err = _run(project, monkeypatch, capsys, "install", "broadcast/depth")
+    assert code == 0, err
+    assert (store.store_dir() / store.entry_path(sha256) / "depth.onnx").read_bytes() == MODEL
+    assert served.urls() == [MODEL_URL, MODEL_URL]
+    assert waits == [1.0]
+    assert "the hub answered HTTP 429; retrying model.onnx in 1.0s (1 of 3)\n" in err
+
+    quiet = _project(tmp_path / "quiet", monkeypatch, capsys)
+    shutil.rmtree(store.models_dir())  # so the quiet install has to fetch as well
+    shutil.rmtree(store.store_dir())
+    _serves(served, **{MODEL_URL: [(503, b""), MODEL]})
+    code, _out, err = _run(quiet, monkeypatch, capsys, "install", "-q", "broadcast/depth")
+    assert code == 0, err
+    assert waits == [1.0, 1.0]
+    assert err == ""
+
+
+def test_a_retry_after_is_honoured_in_both_its_forms_and_clamped(
+    served: _Served, waits: list[float]
+) -> None:
+    """Seconds and an HTTP date are both read; an hour is not waited for."""
+    _serves(
+        served,
+        **{
+            MODEL_URL: [
+                (429, b"", {"Retry-After": "3600"}),
+                (503, b"", {"Retry-After": "Fri, 31 Dec 2100 23:59:59 GMT"}),
+                (429, b"", {"Retry-After": "2"}),
+                MODEL,
+            ]
+        },
+    )
+    found, arrived = packages._stream(
+        MODEL_URL, io.BytesIO(), "broadcast/depth", "depth", _model_pin()
+    )
+    assert (found, arrived) == (MODEL_DIGEST, len(MODEL))
+    assert waits == [packages._RETRY_AFTER_CAP, packages._RETRY_AFTER_CAP, 2.0]
+    assert packages._RETRY_AFTER_CAP <= 60.0
+    # A date already past asks for no wait; a header that is neither form is ignored.
+    assert packages._retry_after({"Retry-After": "Sun, 06 Nov 1994 08:49:37 GMT"}) == 0.0
+    assert packages._retry_after({"Retry-After": "soon"}) is None
+
+
+def test_a_model_download_that_never_recovers_says_what_was_tried(
+    served: _Served, waits: list[float]
+) -> None:
+    """Exhausted: every retry made, the wait it cost, and the LAST refusal, with the pin hint."""
+    _serves(
+        served,
+        **{
+            MODEL_URL: [
+                urllib.error.URLError(ConnectionRefusedError("connection refused")),
+                (502, b""),
+                (429, b""),
+            ]
+        },
+    )
+    with pytest.raises(FfrwdError) as caught:
+        packages._stream(MODEL_URL, io.BytesIO(), "ffrwd/faceage", "ages", _model_pin())
+    assert caught.value.message == (
+        "package 'ffrwd/faceage': the model for 'ages' (depth-anything/small@v1 model.onnx) "
+        "was retried 3 times over 7s and still answered HTTP 429"
+    )
+    assert caught.value.hint == (
+        "the package pins it in its manifest's models; nothing was installed"
+    )
+    assert served.urls() == [MODEL_URL] * 4
+    assert waits == [1.0, 2.0, 4.0]
+    assert sum(waits) < 60.0
+
+
+def test_a_model_download_cut_off_resumes_from_what_already_arrived(
+    served: _Served, waits: list[float]
+) -> None:
+    """The retry asks for the rest; a hub that ignores the range starts the file over."""
+    rest = LARGE_MODEL[BLOCK:]
+    _serves(
+        served,
+        **{
+            MODEL_URL: [
+                _CutOff(LARGE_MODEL),
+                _Fake(206, rest, {"Content-Length": str(len(rest))}),
+            ]
+        },
+    )
+    file = io.BytesIO()
+    seen: list[tuple[int, int | None]] = []
+    found, arrived = packages._stream(
+        MODEL_URL,
+        file,
+        "broadcast/depth",
+        "depth",
+        _large_model_pin(),
+        None,
+        lambda done, total: seen.append((done, total)),
+    )
+    assert (found, arrived) == (LARGE_MODEL_DIGEST, len(LARGE_MODEL))
+    assert file.getvalue() == LARGE_MODEL
+    assert "range" not in served.asked[0][1]
+    assert served.asked[1][1]["range"] == f"bytes={BLOCK}-"
+    assert seen[-1] == (len(LARGE_MODEL), len(LARGE_MODEL))  # the rest, against the whole
+
+    served.asked.clear()
+    _serves(served, **{MODEL_URL: [_CutOff(LARGE_MODEL), _WithLength(LARGE_MODEL)]})
+    file = io.BytesIO()
+    found, arrived = packages._stream(
+        MODEL_URL, file, "broadcast/depth", "depth", _large_model_pin()
+    )
+    assert served.asked[1][1]["range"] == f"bytes={BLOCK}-"
+    assert (found, arrived) == (LARGE_MODEL_DIGEST, len(LARGE_MODEL))
+    assert file.getvalue() == LARGE_MODEL
 
 
 def test_the_archive_download_reports_its_bytes_against_the_recorded_size(
@@ -1933,6 +2121,229 @@ def test_a_model_already_there_and_matching_is_not_fetched_again(
     assert served.urls() == [MODEL_URL]  # once, for the first install
 
 
+def test_a_version_bump_that_keeps_its_model_pin_fetches_no_model(
+    store_home: Path,
+    registry: Path,
+    served: _Served,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A republish changes the package's digest and not the model's: nothing is refetched.
+
+    The model is cached by its own digest, so the new version's entry gets a
+    hard link to the file the first version already fetched -- one file on
+    disk, not one per version -- and the console says where it came from. The
+    cloud runner's own call, the private installer handed a manifest read out
+    of an unpacked archive, gets the same.
+    """
+    monkeypatch.setenv(packages.REGISTRY_ENV, str(registry))
+    first = _publish(registry, _model_package(tmp_path / "one"), functions=("depth",))
+    _serves(served, **{MODEL_URL: MODEL})
+    project = _project(tmp_path / "work", monkeypatch, capsys)
+    assert _run(project, monkeypatch, capsys, "install", "broadcast/depth")[0] == 0
+    assert served.urls() == [MODEL_URL]
+
+    second = _publish(
+        registry, _model_package(tmp_path / "two", version="1.1.0"), functions=("depth",)
+    )
+    assert second != first
+    code, _out, err = _run(project, monkeypatch, capsys, "install", "broadcast/depth")
+    assert code == 0, err
+    assert served.urls() == [MODEL_URL]  # the bump crossed the network for no model
+    landed = store.store_dir() / store.entry_path(second) / "depth.onnx"
+    assert landed.read_bytes() == MODEL
+    assert f"model model.onnx ({len(MODEL)} bytes) from the cache\n" in err
+    assert "from depth-anything/small" not in err
+
+    cached = store.cached_model(MODEL_DIGEST)
+    assert cached is not None
+    assert os.path.samefile(cached, landed)
+    assert os.path.samefile(cached, store.store_dir() / store.entry_path(first) / "depth.onnx")
+
+    third = _publish(
+        registry, _model_package(tmp_path / "three", version="1.2.0"), functions=("depth",)
+    )
+    root = store.unpack("archive", (registry / "archives" / third).read_bytes(), third)
+    package = read_manifest(root / "ffrwd.json")
+    assert package.models["depth"][0].sha256 == MODEL_DIGEST
+    packages._install_models(package)
+
+    def rehashed(path: Path) -> str | None:
+        raise AssertionError(f"{path} is linked to the cache, which verified it already")
+
+    # Every job calls it again: a model linked to the cache is not read again.
+    monkeypatch.setattr(packages, "_digest_of", rehashed)
+    packages._install_models(package)
+    assert served.urls() == [MODEL_URL]
+    assert os.path.samefile(cached, root / "depth.onnx")
+    assert capsys.readouterr() == ("", "")
+
+
+def test_copies_installed_before_the_cache_collapse_to_one_file(
+    store_home: Path,
+    registry: Path,
+    served: _Served,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Two versions that each hold their own whole copy end up sharing one file.
+
+    That is the store as an install before the cache left it: one copy of the
+    same model per package version. The first copy seen becomes the cached
+    one; every other is replaced by a link to it, so its disk comes back, and
+    nothing is fetched to do it.
+    """
+    monkeypatch.setenv(packages.REGISTRY_ENV, str(registry))
+    entries = []
+    for number, version in enumerate(("1.0.0", "1.1.0")):
+        digest = _publish(
+            registry,
+            _model_package(tmp_path / f"v{number}", version=version),
+            functions=("depth",),
+        )
+        root = store.unpack("archive", (registry / "archives" / digest).read_bytes(), digest)
+        # A separate whole file in each entry, as the pre-cache installer wrote.
+        (root / "depth.onnx").write_bytes(MODEL)
+        entries.append(root)
+    assert not os.path.samefile(entries[0] / "depth.onnx", entries[1] / "depth.onnx")
+
+    for root in entries:
+        packages._install_models(read_manifest(root / "ffrwd.json"))
+
+    cached = store.cached_model(MODEL_DIGEST)
+    assert cached is not None
+    for root in entries:
+        assert os.path.samefile(cached, root / "depth.onnx")
+        assert (root / "depth.onnx").read_bytes() == MODEL
+    assert served.urls() == []  # nothing crossed the network to collapse them
+
+
+def _refuse_hard_links(monkeypatch: pytest.MonkeyPatch) -> None:
+    def refuse(*_args: object, **_kwargs: object) -> None:
+        raise OSError("hard links are not supported on this volume")
+
+    monkeypatch.setattr(store.os, "link", refuse)
+
+
+def test_a_volume_refusing_hard_links_gets_a_copy_or_a_relative_symlink(
+    store_home: Path,
+    registry: Path,
+    served: _Served,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A network volume may refuse a hard link: a copy, or on POSIX a relative symlink.
+
+    Either road is said under --verbose and silent otherwise. The symlink is
+    relative, so it still resolves once the volume holding the store and the
+    cache is mounted somewhere else.
+    """
+    _refuse_hard_links(monkeypatch)
+    monkeypatch.setenv(packages.REGISTRY_ENV, str(registry))
+    _serves(served, **{MODEL_URL: MODEL})
+    project = _project(tmp_path / "work", monkeypatch, capsys)
+
+    monkeypatch.setattr(store, "_SYMLINKS", False)
+    copied = _publish(registry, _model_package(tmp_path / "one"), functions=("depth",))
+    code, _out, err = _run(project, monkeypatch, capsys, "install", "--verbose", "broadcast/depth")
+    assert code == 0, err
+    landed = store.store_dir() / store.entry_path(copied) / "depth.onnx"
+    assert landed.read_bytes() == MODEL
+    assert not landed.is_symlink()
+    assert "model.onnx is a copy out of the model cache: a link was refused\n" in err
+
+    # A copy INTO the cache is new bytes, so it is hashed before it is named.
+    stranger = tmp_path / "stranger.onnx"
+    stranger.write_bytes(b"not what the pin names")
+    assert store.cache_model(stranger, DATA_DIGEST) is None
+    assert store.cached_model(DATA_DIGEST) is None
+    assert list(store.models_dir().rglob("*.tmp")) == []
+
+    probe = tmp_path / "probe"
+    try:
+        os.symlink("work", probe)
+    except OSError:
+        pytest.skip("this machine cannot create a symlink")
+    monkeypatch.setattr(store, "_SYMLINKS", True)
+    shutil.rmtree(store.models_dir())  # so one install below fetches, and one reuses
+    for version in ("1.1.0", "1.2.0"):
+        linked = _publish(
+            registry, _model_package(tmp_path / version, version=version), functions=("depth",)
+        )
+        code, _out, err = _run(project, monkeypatch, capsys, "install", "broadcast/depth")
+        assert code == 0, err
+        assert "refused" not in err
+        landed = store.store_dir() / store.entry_path(linked) / "depth.onnx"
+        assert landed.is_symlink()
+        assert not os.path.isabs(os.readlink(landed))
+    assert served.urls() == [MODEL_URL, MODEL_URL]
+
+    moved = tmp_path / "remounted"
+    store_home.rename(moved)
+    assert (moved / landed.relative_to(store_home)).read_bytes() == MODEL
+
+
+def test_installs_fetching_one_model_at_once_leave_one_whole_file(
+    store_home: Path,
+    registry: Path,
+    served: _Served,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two containers staging the same model at the same moment: both fetch, neither tears it.
+
+    Each download is held until the other has its answer too, so both write
+    the cache at once; a name already taken is success, not an error.
+    """
+    monkeypatch.setenv(packages.REGISTRY_ENV, str(registry))
+    _serves(served, **{MODEL_URL: MODEL})
+    roots = []
+    for version in ("1.0.0", "1.1.0"):
+        digest = _publish(
+            registry, _model_package(tmp_path / version, version=version), functions=("depth",)
+        )
+        roots.append(
+            store.unpack("archive", (registry / "archives" / digest).read_bytes(), digest)
+        )
+    both = threading.Barrier(2, timeout=10)
+
+    def held(request: object, timeout: float | None = None) -> _Fake:
+        answer = served(request, timeout)
+        both.wait()
+        return answer
+
+    monkeypatch.setattr(packages, "_urlopen", held)
+    failed: list[BaseException] = []
+
+    def stage(root: Path) -> None:
+        try:
+            packages._install_models(read_manifest(root / "ffrwd.json"))
+        except BaseException as err:  # surfaced below, on the test's own thread
+            failed.append(err)
+
+    workers = [threading.Thread(target=stage, args=(root,)) for root in roots]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join()
+    assert failed == []
+    assert served.urls() == [MODEL_URL, MODEL_URL]
+    cached = store.cached_model(MODEL_DIGEST)
+    assert cached is not None
+    assert cached.read_bytes() == MODEL
+    assert all((root / "depth.onnx").read_bytes() == MODEL for root in roots)
+    assert [path.name for path in cached.parent.iterdir()] == [MODEL_DIGEST]
+
+    late = cached.parent / "late.tmp"
+    late.write_bytes(b"a third writer, arriving after the name was taken")
+    assert store.keep_model(late, MODEL_DIGEST) == cached
+    assert cached.read_bytes() == MODEL
+    assert not late.exists()
+
+
 def test_a_model_that_hashes_to_something_else_fails_the_install(
     store_home: Path,
     registry: Path,
@@ -1951,10 +2362,14 @@ def test_a_model_that_hashes_to_something_else_fails_the_install(
     assert "the model for 'depth' (depth-anything/small@v1 model.onnx)" in err
     assert f"and {MODEL_DIGEST} was expected" in err
     assert not (store.store_dir() / store.entry_path(sha256) / "depth.onnx").exists()
+    # Verified before it is kept: bytes that are not the pin never enter the
+    # cache under the pin's digest, where every later install would trust them.
+    assert store.cached_model(MODEL_DIGEST) is None
+    assert list(store.models_dir().rglob("*.tmp")) == []
     assert read_lockfile(project / "ffrwd.lock").entries == ()
 
 
-def test_a_model_the_hub_does_not_serve_fails_the_install(
+def test_a_model_the_hub_does_not_serve_fails_the_install_without_retrying(
     store_home: Path,
     registry: Path,
     served: _Served,
@@ -1962,12 +2377,19 @@ def test_a_model_the_hub_does_not_serve_fails_the_install(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    """A 404 will not change on its own: one request, no wait, today's message."""
+    slept: list[float] = []
+    monkeypatch.setattr(packages, "_sleep", slept.append)
     monkeypatch.setenv(packages.REGISTRY_ENV, str(registry))
     _publish(registry, _model_package(tmp_path / "built"), functions=("depth",))
     project = _project(tmp_path / "work", monkeypatch, capsys)
     code, _out, err = _run(project, monkeypatch, capsys, "install", "broadcast/depth")
     assert code == 1
-    assert "answered HTTP 404" in err
+    assert "(depth-anything/small@v1 model.onnx) answered HTTP 404" in err
+    assert "retried" not in err
+    assert "the package pins it in its manifest's models; nothing was installed" in err
+    assert served.urls() == [MODEL_URL]
+    assert slept == []
     assert read_lockfile(project / "ffrwd.lock").entries == ()
 
 
