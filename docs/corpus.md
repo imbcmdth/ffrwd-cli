@@ -1542,8 +1542,8 @@ ffmpeg -i tests/fixtures/av.mp4 -map 0:v:0 -c:0 rawvideo -pix_fmt:0 yuv420p -f n
   facebox=../sidecar/modules/target/wasm32-wasip2/release/facebox.wasm -m \
   blur_boxes=../sidecar/modules/target/wasm32-wasip2/release/blur_boxes.wasm \
   -filter_complex '[0:v]facebox[n1];[n1]blur_boxes[out0]' -map '[out0]' -f nut pipe:1 | \
-  ffmpeg -i tests/fixtures/av.mp4 -f nut -i pipe:0 -map 1:v:0 -map 0:a:0 -c:1 copy -c:0 \
-  libx264 -crf:0 20 blurred.mp4
+  ffmpeg -i tests/fixtures/av.mp4 -f nut -analyzeduration 0 -fpsprobesize 3 -i pipe:0 \
+  -map 1:v:0 -map 0:a:0 -c:1 copy -c:0 libx264 -crf:0 20 blurred.mp4
 ```
 
 The annotation record is checked twice before anything runs: against the row schema `facebox` publishes, so a misspelled field or a wrong type is a rejection at the declaration, and against `blur_boxes`'s own parameter, so the two ends of the composition have to agree. The names are the writer's - nothing carries them at run time - which is what makes this a type and not a protocol.
@@ -1632,8 +1632,8 @@ ffmpeg -i tests/fixtures/av.mp4 -map 0:v:0 -c:0 rawvideo -pix_fmt:0 yuv420p -f n
   facebox=../sidecar/modules/target/wasm32-wasip2/release/facebox.wasm -m \
   blur_boxes=../sidecar/modules/target/wasm32-wasip2/release/blur_boxes.wasm \
   -filter_complex '[0:v]shots[n1];[n1]facebox[n2];[n2]blur_boxes[out0]' -map '[out0]' -f \
-  nut pipe:1 | ffmpeg -i tests/fixtures/av.mp4 -f nut -i pipe:0 -map 1:v:0 -map 0:a:0 \
-  -c:1 copy -c:0 libx264 -crf:0 20 blurred.mp4
+  nut pipe:1 | ffmpeg -i tests/fixtures/av.mp4 -f nut -analyzeduration 0 -fpsprobesize 3 \
+  -i pipe:0 -map 1:v:0 -map 0:a:0 -c:1 copy -c:0 libx264 -crf:0 20 blurred.mp4
 ```
 
 The `DEFAULT NULL` on `cuts` makes the column optional: delete the `shots(...)` call and the same declaration still compiles, with no rows wired in - `detect_faces` then simply never clears what it remembers. Only a module that reads rows at its own option can default the column; one that exists to consume them, like `blur_boxes`, is refused a DEFAULT at the declaration.
@@ -1700,8 +1700,8 @@ ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 rawvideo -pix_fmt:0 yuv420p
   depth=../sidecar/modules/target/wasm32-wasip2/release/depth.wasm -m \
   blur_mask=../sidecar/modules/target/wasm32-wasip2/release/blur_mask.wasm \
   -filter_complex '[0:v]depth[n1];[0:v][n1]blur_mask=max_radius=24:invert=1[out0]' -map \
-  '[out0]' -f nut pipe:1 | ffmpeg -f nut -i pipe:0 -map 0:v:0 -c:0 libx264 -crf:0 20 \
-  bokeh.mp4
+  '[out0]' -f nut pipe:1 | ffmpeg -f nut -analyzeduration 0 -fpsprobesize 3 -i pipe:0 \
+  -map 0:v:0 -c:0 libx264 -crf:0 20 bokeh.mp4
 ```
 
 The `-nn` binding is the model file beside the module, found by name; the
@@ -1967,8 +1967,9 @@ COPY (
 ```
 $ ffrwd compile -f query.sql
 # named pipes: ffmpeg0 reads ffmpeg1, sidecar0; ffmpeg1 feeds sidecar0, ffmpeg0
-1. ffmpeg: ffmpeg -f nut -i '<named pipe ffmpeg1-ffmpeg0 src_a_v_0_split:1 read>' -f nut \
-  -i '<named pipe sidecar0-ffmpeg0 n1 read>' -filter_complex \
+1. ffmpeg: ffmpeg -f nut -analyzeduration 0 -fpsprobesize 3 -i \
+  '<named pipe ffmpeg1-ffmpeg0 src_a_v_0_split:1 read>' -f nut -analyzeduration 0 \
+  -fpsprobesize 3 -i '<named pipe sidecar0-ffmpeg0 n1 read>' -filter_complex \
   '[0:v:0][1:v:0]hstack=inputs=2[out0]' -map '[out0]' -c:0 libx264 -crf:0 22 live.mp4
 2. ffmpeg: ffmpeg -f lavfi -re -i testsrc2=size=640x360:rate=30:duration=5 \
   -filter_complex '[0:v:0]split=2[out0][out1]' -map '[out0]' -c:0 rawvideo -pix_fmt:0 \
@@ -2019,8 +2020,9 @@ COPY (
 ```
 $ ffrwd compile -f query.sql
 # named pipes: ffmpeg0 reads ffmpeg1, sidecar0; ffmpeg1 feeds sidecar0, ffmpeg0
-1. ffmpeg: ffmpeg -f nut -i '<named pipe ffmpeg1-ffmpeg0 src_a_v_0_split:1 read>' -f nut \
-  -i '<named pipe sidecar0-ffmpeg0 n1 read>' -filter_complex \
+1. ffmpeg: ffmpeg -f nut -analyzeduration 0 -fpsprobesize 3 -i \
+  '<named pipe ffmpeg1-ffmpeg0 src_a_v_0_split:1 read>' -f nut -analyzeduration 0 \
+  -fpsprobesize 3 -i '<named pipe sidecar0-ffmpeg0 n1 read>' -filter_complex \
   '[0:v:0][1:v:0]hstack=inputs=2[out0]' -map '[out0]' -c:0 libx264 -crf:0 22 live.mp4
 2. ffmpeg: ffmpeg -f lavfi -re -i testsrc2=size=1920x1080:rate=30:duration=5 \
   -filter_complex '[0:v:0]split=2[out0][out1]' -map '[out0]' -c:0 rawvideo -pix_fmt:0 \
@@ -2242,7 +2244,7 @@ COPY (
 
 ```
 $ ffrwd compile -f query.sql -v dest=source.mp4
-ffrwd-wasm -m ../sidecar/modules/target/wasm32-wasip2/release/source_replay.wasm -track 0 -f nut pipe:1 | ffmpeg -f nut -i pipe:0 -map 0:v:0 -c:0 libx264 -crf:0 20 source.mp4
+ffrwd-wasm -m ../sidecar/modules/target/wasm32-wasip2/release/source_replay.wasm -track 0 -f nut pipe:1 | ffmpeg -f nut -analyzeduration 0 -fpsprobesize 3 -i pipe:0 -map 0:v:0 -c:0 libx264 -crf:0 20 source.mp4
 ```
 
 Reach for this for a module that manufactures a stream rather than filtering one - a synthetic test pattern, a packet source pulled off a socket - anywhere a query wants to name it as an input alongside, or instead of, a probed file.

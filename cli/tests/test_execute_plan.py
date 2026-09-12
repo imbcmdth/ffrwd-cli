@@ -65,6 +65,11 @@ from ffrwd.processes import (
     partition,
 )
 
+# What every NUT pipe input carries so its open reads a fixed few frames
+# whatever their size: the producer filling the pipe cannot reach its next
+# output while this open is still running.
+_PROBE = ["-analyzeduration", "0", "-fpsprobesize", "3"]
+
 
 def _out(ref: str, type_: StreamType = "video") -> Output:
     return Output(ref=ref, type=type_, name=None, metadata={})
@@ -295,7 +300,7 @@ def test_a_chain_spells_its_pipes_as_stdio() -> None:
         "-map", "0:v:0", "-c:0", "rawvideo", "-pix_fmt:0", "yuv420p",
         "-f", "nut", STDOUT,
     ]  # fmt: skip
-    assert argv["ffmpeg0"][:5] == ["ffmpeg", "-f", "nut", "-i", STDIN]
+    assert argv["ffmpeg0"][:9] == ["ffmpeg", "-f", "nut", *_PROBE, "-i", STDIN]
 
 
 def test_a_video_edge_carries_rawvideo_and_an_audio_edge_pcm() -> None:
@@ -308,10 +313,10 @@ def test_a_video_edge_carries_rawvideo_and_an_audio_edge_pcm() -> None:
 
 def test_a_fan_in_reader_names_one_pipe_per_input() -> None:
     argv = plan_argv(_two_producers(), pipe_path=_named)
-    assert argv["mux"][:9] == [
+    assert argv["mux"][:17] == [
         "ffmpeg",
-        "-f", "nut", "-i", "/pipes/video-mux-read",
-        "-f", "nut", "-i", "/pipes/audio-mux-read",
+        "-f", "nut", *_PROBE, "-i", "/pipes/video-mux-read",
+        "-f", "nut", *_PROBE, "-i", "/pipes/audio-mux-read",
     ]  # fmt: skip
     # Both producers keep their own stdout: only the reading end fans in.
     assert argv["video"][-1] == STDOUT
@@ -323,8 +328,9 @@ def test_two_piped_inputs_stay_two_inputs() -> None:
     argv = plan_argv(_two_producers(), pipe_path=_named)
     assert argv["mux"].count("-i") == 2
     assert "-map" in argv["mux"]
-    assert argv["mux"][argv["mux"].index("-map") + 1] == "0:v:0"
-    assert argv["mux"][argv["mux"].index("-map", 10) + 1] == "1:a:0"
+    first = argv["mux"].index("-map")
+    assert argv["mux"][first + 1] == "0:v:0"
+    assert argv["mux"][argv["mux"].index("-map", first + 1) + 1] == "1:a:0"
 
 
 def test_a_sidecar_between_two_ffmpegs_reads_and_writes_stdio() -> None:
@@ -563,8 +569,8 @@ def test_the_one_reader_of_a_live_input_writes_a_pipe_per_consumer() -> None:
     ]  # fmt: skip
     assert argv["ffmpeg0"] == [
         "ffmpeg",
-        "-f", "nut", "-i", "/pipes/ffmpeg1-ffmpeg0-read",
-        "-f", "nut", "-i", "/pipes/sidecar0-ffmpeg0-read",
+        "-f", "nut", *_PROBE, "-i", "/pipes/ffmpeg1-ffmpeg0-read",
+        "-f", "nut", *_PROBE, "-i", "/pipes/sidecar0-ffmpeg0-read",
         "-filter_complex", "[0:v:0][1:v:0]hstack[out0]",
         "-map", "[out0]",
         "out.mp4",

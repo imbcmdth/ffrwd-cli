@@ -507,6 +507,97 @@ def test_either_way_round_the_merge_is_written_the_run_starts(
     assert out_path.stat().st_size > 0
 
 
+def _split_to_one_consumer(out_path: Path) -> ProcessPlan:
+    """One process splitting a file two ways, one consumer reading both pipes.
+
+    The shape a query gets whenever two legs off one decode meet again in a
+    later process: the producer's two raw outputs go to the SAME consumer, so
+    the consumer takes them at its own interleaving. No bound is computed for
+    a file input's edges -- it can be opened twice, so nothing here is pacing
+    a live source -- which leaves the consumer's first open the only thing
+    that may not read frames off its pipe.
+
+    `_AV` is 320x240: a frame small enough that a default demuxer probe wants
+    dozens of them, where the producer interleaves its outputs and runs about
+    a dozen frames ahead of the one the consumer has not opened yet.
+    """
+    producer = Graph(input_paths=[_sql_path(_AV)], sources={"s": 0})
+    producer.nodes["sp"] = Node(
+        id="sp",
+        filter="split",
+        args={"n": 2},
+        inputs=["src:s:v:0"],
+        outputs=["video", "video"],
+    )
+    producer.nodes["ng"] = Node(
+        id="ng", filter="negate", args={}, inputs=["sp:0"], outputs=["video"]
+    )
+    producer.sinks = [
+        SinkUnit(outputs=[_out("ng")], path=PIPE),
+        SinkUnit(outputs=[_out("sp:1")], path=PIPE),
+    ]
+    consumer = Graph(input_paths=[PIPE, PIPE], sources={"p": 0, "q": 1})
+    consumer.nodes["st"] = Node(
+        id="st",
+        filter="hstack",
+        args={},
+        inputs=["src:p:v:0", "src:q:v:0"],
+        outputs=["video"],
+    )
+    consumer.sinks = [
+        SinkUnit(
+            outputs=[_out("st")],
+            path=str(out_path),
+            options={"video_codec": "libx264", "pix_fmt": "yuv420p"},
+        )
+    ]
+    return ProcessPlan(
+        processes=(
+            FfmpegProcess(id="producer", graph=producer),
+            FfmpegProcess(id="consumer", graph=consumer),
+        ),
+        edges=(
+            StreamEdge(
+                source="producer", target="consumer", ref="ng", format=VideoFormat()
+            ),
+            StreamEdge(
+                source="producer", target="consumer", ref="sp:1", format=VideoFormat()
+            ),
+        ),
+    )
+
+
+def test_a_consumer_of_two_pipes_from_one_producer_opens_both(
+    tmp_path: Path,
+) -> None:
+    """A small frame does not wedge the pair on the consumer's first open.
+
+    The consumer opens its inputs one at a time, and the process writing them
+    cannot reach the second while the first is being opened. So that open has
+    to cost the HEADER and not the frames behind it, however small the frame:
+    a 320x240 frame is 115 KiB, and a demuxer left to its default 5 MB probe
+    would want more than forty of them before it returned.
+    """
+    _require_fixture(_AV)
+    out_path = tmp_path / "split.mp4"
+    result = execute_plan(
+        _split_to_one_consumer(out_path),
+        sidecar_argv=_negate,
+        timeout=_STAGE_TIMEOUT,
+        overwrite=True,
+        stall=_STALL,
+    )
+
+    assert result.overflow is None, str(result.overflow)
+    assert result.exit_code == 0, "\n".join(
+        f"{m.id} exited {m.exit_code}: {m.stderr_tail}"
+        for stage in result.stages
+        for m in stage.members
+    )
+    assert _frame_count(out_path) == _SRC_FRAMES
+    assert _live_pipes() == []
+
+
 # --- two rows documents into one ffmpeg ---------------------------------------
 
 # Cues per document, chosen to put each one well past the 128 KiB a named pipe

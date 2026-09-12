@@ -87,6 +87,13 @@ def relation(plan: ProcessPlan) -> dict[Milestone, tuple[Milestone, ...]]:
     never waits on another's. Frames are not -- a raw video frame is larger
     than a pipe -- so an output whose frames nobody is taking stops the frames
     of every output after it.
+
+    An open that waits on its producer's HEADER and nothing further is what
+    :data:`~ffrwd.emit._PIPE_PROBE` buys. The demuxer reads frames past the
+    header to settle what the header does not say, and its own limits count
+    those in BYTES: a small enough frame makes an open outlast the producer
+    it is waiting on, which is an arc nothing here models. Bounded in frames,
+    the open costs a handful the producer can always write ahead of.
     """
     ids = [process.id for process in plan.processes]
     inputs = {pid: _pipe_inputs(plan, pid) for pid in ids}

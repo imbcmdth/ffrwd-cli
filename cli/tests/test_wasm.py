@@ -3177,7 +3177,8 @@ def test_the_bokeh_chain_renders_every_argv() -> None:
     """One ffmpeg feeds the region, both modules run in it, one ffmpeg muxes."""
     assert _multi_argv(BOKEH, _bokeh_modules()) == {
         "ffmpeg0": [
-            "ffmpeg", "-f", "nut", "-i", "pipe:0",
+            "ffmpeg", "-f", "nut", "-analyzeduration", "0", "-fpsprobesize", "3",
+            "-i", "pipe:0",
             "-map", "0:v:0", "-c:0", "copy",
             "bokeh.mp4",
         ],

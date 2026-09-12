@@ -541,7 +541,8 @@ $ ffrwd compile -f query.sql
 ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 rawvideo -pix_fmt:0 rgba -f nut \
   pipe:1 | ffrwd-wasm -f nut -i pipe:0 -m \
   ../sidecar/modules/target/wasm32-wasip2/release/invert.wasm -f nut pipe:1 | ffmpeg -f \
-  nut -i pipe:0 -map 0:v:0 -c:0 libx264 -crf:0 20 inverted.mp4
+  nut -analyzeduration 0 -fpsprobesize 3 -i pipe:0 -map 0:v:0 -c:0 libx264 -crf:0 20 \
+  inverted.mp4
 ```
 
 A module cannot be a link in one ffmpeg's filter graph, so the query compiles to three processes joined by pipes rather than one command: an ffmpeg that decodes, the sidecar hosting the module, and an ffmpeg that encodes what comes back. The frames travel as NUT, and the pixel format on both seams is the one the module and the wire agree on - `rgba` here, because that is what `invert` accepts. `ffrwd run` executes the whole pipeline itself; the printed form is for reading and pasting.
@@ -593,8 +594,8 @@ ffmpeg -i tests/fixtures/av.mp4 -map 0:v:0 -c:0 rawvideo -pix_fmt:0 yuv420p -f n
   '[0:v]segment[n1];'\
 '[n1]rowfilter=pred={"eq"\\:\[{"field"\\:"class"}\,{"lit"\\:"person"}\]}[n2];'\
 '[n2]mask_select[n3];[0:v][n3]blur_mask=max_radius=24:invert=0[out0]' -map '[out0]' -f \
-  nut pipe:1 | ffmpeg -i tests/fixtures/av.mp4 -f nut -i pipe:0 -map 1:v:0 -map 0:a:0 \
-  -c:1 copy -c:0 libx264 -crf:0 20 blurred.mp4
+  nut pipe:1 | ffmpeg -i tests/fixtures/av.mp4 -f nut -analyzeduration 0 -fpsprobesize 3 \
+  -i pipe:0 -map 1:v:0 -map 0:a:0 -c:1 copy -c:0 libx264 -crf:0 20 blurred.mp4
 ```
 
 `rowfilter` is the WHERE, compiled: not a module, but a node the host

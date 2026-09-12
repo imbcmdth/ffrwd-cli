@@ -246,15 +246,26 @@ INPUT_OPTIONS: dict[str, InputOptionSpec] = {
 # `validate_option` still rejects these names as unknown, only `option_spec`
 # (which emit renders through) resolves them.
 #
-# Currently empty: `format` used to live here for `ffrwd.empty_captions()`
-# (a `data:` URI carries no extension, so the demuxer has to be named --
-# `-f webvtt -i "data:..."`), but `format` is now also a user-facing option
-# (capture devices, rawvideo, image2 need it too), so `INPUT_OPTIONS` alone
-# already resolves it -- `option_spec` never reaches this table for it.
+# `format` used to live here for `ffrwd.empty_captions()` (a `data:` URI
+# carries no extension, so the demuxer has to be named -- `-f webvtt -i
+# "data:..."`), but `format` is now also a user-facing option (capture
+# devices, rawvideo, image2 need it too), so `INPUT_OPTIONS` alone already
+# resolves it -- `option_spec` never reaches this table for it.
 # `empty_captions` itself still bypasses `validate_option` entirely (its
-# option dict is built directly, not parsed from SQL); this table stays for
-# the next flag that is compiler-only from the start.
-_INTERNAL_INPUT_OPTIONS: dict[str, InputOptionSpec] = {}
+# option dict is built directly, not parsed from SQL).
+_INTERNAL_INPUT_OPTIONS: dict[str, InputOptionSpec] = {
+    "fpsprobesize": InputOptionSpec(
+        name="fpsprobesize",
+        type="int",
+        doc="Frames read to settle an input's frame rate.",
+        flag="-fpsprobesize",
+        # Compiler-only: what bounds the analysis of a PIPE input in FRAMES
+        # rather than in bytes, which is the difference between an open that
+        # returns and one that outlasts the process filling the pipe. A real
+        # file has no such producer to outlast, so no query needs to say it.
+        probes=False,
+    ),
+}
 
 
 def option_spec(name: str) -> InputOptionSpec | None:

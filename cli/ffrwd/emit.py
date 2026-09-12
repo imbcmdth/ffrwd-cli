@@ -253,7 +253,7 @@ values do NOT: they are passed as argv words, not parsed as a filtergraph.
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 
 from . import loudnorm
@@ -276,6 +276,7 @@ from .processes import (
     COPY_CODEC,
     FIFO,
     FIFO_FORMAT,
+    NUT,
     PIPE,
     QUEUE_SIZE,
     AudioFormat,
@@ -326,6 +327,17 @@ _LABEL_UNSAFE = re.compile(r"[^A-Za-z0-9_]")
 
 _TWO_PASS = "two_pass"
 _FORMAT = "format"
+# How much of a NUT pipe input is analysed before its ``-i`` returns. The
+# demuxer's own limits are a byte budget (5 MB) and a stream-time one (5 s),
+# and each comes to MORE frames the smaller the frame -- while the process
+# filling the pipe interleaves its outputs and runs only about a dozen frames
+# ahead of the output this consumer has not opened yet. A small enough frame
+# therefore makes the probe outlast its own producer: the open never returns,
+# and the input after it is never opened at all. Counted in FRAMES instead,
+# so the same handful is read whatever the geometry -- enough to settle the
+# frame rate, which a NUT header need not carry, and never enough to outlast
+# the producer. Only NUT: no other container read here is a frame edge.
+_PIPE_PROBE: Mapping[str, object] = {"analyzeduration": "0", "fpsprobesize": 3}
 # Pass 1 analyses and throws the muxed result away.
 _ANALYSIS_PATH = "-"
 _ANALYSIS_FORMAT = "null"
@@ -860,11 +872,14 @@ def build_process_args(
     fifo muxer in front of the real one where the depth is held there. A short
     or empty list leaves the remaining edges plain.
 
-    An input renders ``-f <container> -i <spelling>``. An output renders the
-    wire's codec for each stream it carries, its pixel format when it carries
-    video, the rate and channel count it is conformed to when it carries audio
-    a module constrains, ``-f <container>``, and `spelling` as the destination
-    -- so the reader finds every parameter in the NUT header.
+    An input renders ``-f <container> -i <spelling>``, with the probe limits
+    that bound its open to a few frames whatever their size
+    (:data:`_PIPE_PROBE`).
+    An output renders the wire's codec for each stream it carries, its pixel
+    format when it carries video, the rate and channel count it is conformed
+    to when it carries audio a module constrains, ``-f <container>``, and
+    `spelling` as the destination -- so the reader finds every parameter in
+    the NUT header.
 
     Input paths are substituted BEFORE the graph is emitted: two ``pipe:``
     inputs are two different streams, and only their real spellings keep
@@ -879,9 +894,14 @@ def build_process_args(
     options = {alias: dict(values) for alias, values in g.input_options.items()}
     for slot, (spelling, container) in zip(slots, pipe_inputs):
         paths[slot] = spelling
+        probe = _PIPE_PROBE if container == NUT else {}
         for alias, index in g.sources.items():
             if index == slot:
-                options[alias] = {_FORMAT: container, **options.get(alias, {})}
+                options[alias] = {
+                    _FORMAT: container,
+                    **probe,
+                    **options.get(alias, {}),
+                }
 
     e = emit(replace(g, input_paths=paths, input_options=options))
 
