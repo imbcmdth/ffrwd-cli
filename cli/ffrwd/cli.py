@@ -1832,7 +1832,10 @@ def _run_plan(
     if result.exit_code != 0:
         for member in result.failures:
             print(member.stderr_tail, file=sys.stderr)
-            print(_member_error(member), file=sys.stderr)
+            print(
+                _member_error(member, _member_writes(plan, member.id)),
+                file=sys.stderr,
+            )
         for member in result.consequences:
             print(
                 f"{member.id} then exited {member.exit_code} (broken pipe): "
@@ -1843,19 +1846,49 @@ def _run_plan(
     return 0
 
 
-def _member_error(member: ProcessResult) -> str:
-    """The line naming one member that ended a run.
+def _member_error(member: ProcessResult, writes: Sequence[str] = ()) -> str:
+    """The two lines naming one member that ended a run.
 
-    A 0 is one of them: a member that exits while its producers are still
-    writing to it takes the whole stage down, and reporting it as an exit code
-    would report nothing.
+    What happened comes first -- which member, how it ended, and the files it
+    was writing where the plan names any -- and its whole command follows on
+    the next line: a prefix of an ffmpeg argv says nothing about the failure
+    it is quoted for.
+
+    A 0 is one of the ways a member ends a run: a member that exits while its
+    producers are still writing to it takes the whole stage down, and
+    reporting it as an exit code would report nothing.
     """
-    if member.exit_code == 0:
-        return (
-            f"error: {member.id} exited 0 while its producers were still "
-            f"writing to it: {member.summary}"
-        )
-    return f"error: {member.id} exited with code {member.exit_code}: {member.summary}"
+    destinations = ", ".join(writes)
+    where = f" (writing {destinations})" if destinations else ""
+    ended = (
+        "exited 0 while its producers were still writing to it"
+        if member.exit_code == 0
+        else f"exited with code {member.exit_code}"
+    )
+    return f"error: {member.id} {ended}{where}\n  {member.command}"
+
+
+def _member_writes(plan: ProcessPlan, member: str) -> list[str]:
+    """The files this member of `plan` writes, in plan order.
+
+    The destinations a reader can act on: the pipes it feeds are the stage's
+    own and name nothing outside the run. Empty for a member that writes only
+    pipes, and for one the plan does not hold.
+    """
+    try:
+        process = plan.process(member)
+    except KeyError:
+        return []
+    written = [
+        sink.path
+        for sink in (process.graph.sinks if process.graph is not None else ())
+        if sink.path and sink.path != PIPE
+    ]
+    if isinstance(process, SidecarProcess):
+        written += [
+            document.sink.path for document in process.rows if document.sink.path
+        ]
+    return written
 
 
 def _debug_dump_stderr(result: PlanResult) -> None:

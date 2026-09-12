@@ -221,8 +221,7 @@ _READ_AHEAD = 1 << 25
 # How much of a spooled rows document is held in memory before the rest of it
 # goes to a temporary file.
 _SPOOL_MEMORY = 1 << 22
-# What `ProcessResult.summary` and `.stderr_tail` keep.
-_SUMMARY_CHARS = 160
+# What `ProcessResult.stderr_tail` keeps.
 _TAIL_LINES = 20
 
 # What the one ffmpeg whose progress is drawn is asked for instead of its own
@@ -625,12 +624,9 @@ class ProcessResult:
     terminated: bool = False
 
     @property
-    def summary(self) -> str:
-        """This member's argv, shortened enough to name it in a message."""
-        text = " ".join(self.argv)
-        if len(text) <= _SUMMARY_CHARS:
-            return text
-        return text[: _SUMMARY_CHARS - 3] + "..."
+    def command(self) -> str:
+        """This member's argv as one line, whole: a report shows all of it."""
+        return " ".join(self.argv)
 
     @property
     def stderr_tail(self) -> str:
@@ -732,8 +728,9 @@ class StageResult:
     timed_out: bool = False
     # The member that ended the stage: the first to end while the others were
     # still running -- a nonzero exit, or a 0 from a member a producer was
-    # still writing to. None when every member exited 0 in its turn. On a
-    # timeout, the member still running when it struck.
+    # still writing to in a stage something else failed in. None when nothing
+    # failed, whatever order the members ended in. On a timeout, the member
+    # still running when it struck.
     failure: ProcessResult | None = None
     # Every member that failed on its own rather than being told to stop, and
     # not because the member before it had gone: `failure` first, then any
@@ -1317,11 +1314,11 @@ def _run_stage(
     `terminal` is the member whose progress `work` draws, which is in the last
     stage; every other member, and every stage before it, is untouched.
 
-    :func:`_watch` says WHETHER the stage ended in failure; when it did,
-    :func:`_attribute` says which member is the cause, read off the exit times
-    it recorded rather than off the exit codes. A stage nothing ended -- every
-    member finished, or every one was stopped because the last display window
-    closed -- is asked neither question.
+    :func:`_watch` says WHETHER a member ended the stage; :func:`_attribute`
+    then says which member is the cause and whether there was one at all, read
+    off the exit times it recorded rather than off the exit codes. A stage
+    nothing ended -- every member finished, or every one was stopped because
+    the last display window closed -- is asked neither question.
     """
     ids = list(stage.processes)
     inside = set(ids)
@@ -1485,11 +1482,20 @@ def _attribute(
     """Which member ended the stage, and which ones broke because it did.
 
     The cause is the first member to end while others were still running and
-    to have no business ending: any nonzero exit, or a 0 from a member one of
-    `feeds`' producers was still writing to. `ended` is when each member was
-    first seen to have exited, and a member missing from it was still running
-    when the stage was stopped. The consequences are the members that ended
-    from that moment on writing into a pipe nobody was reading.
+    to have no business ending: any nonzero exit, or -- where something in the
+    stage did fail -- a 0 from a member one of `feeds`' producers was still
+    writing to. `ended` is when each member was first seen to have
+    exited, and a member missing from it was still running when the stage was
+    stopped. The consequences are the members that ended from that moment on
+    writing into a pipe nobody was reading.
+
+    A stage every member of which exited 0, none of them stopped, has no
+    cause and names nobody: nothing there was cut short, since a producer
+    whose reader had gone would have died of a broken pipe rather than
+    exited 0. A consumer reaching the end of its own graph while its
+    producers are still draining theirs is how a finite output legitimately
+    ends, and only a real failure elsewhere -- a nonzero exit, a member told
+    to stop -- makes such a 0 the reason for it.
 
     Called only for a stage something ended, which is what lets two members
     seen ending in the SAME poll be read as the cascade they are: one poll
@@ -1505,13 +1511,17 @@ def _attribute(
         at = ended.get(pid)
         return at is None or at >= when
 
+    # Whether anything in this stage failed at all, which is what a 0 needs
+    # behind it before it can be read as the end of anything.
+    any_failed = any(result.exit_code != 0 or result.terminated for result in results)
     candidates: list[tuple[float, bool, ProcessResult]] = []
     for result in results:
         at = ended.get(result.id)
         if at is None or result.terminated:
             continue
-        if result.exit_code != 0 or any(
-            writing_at(pid, at) for pid in producers.get(result.id, ())
+        writing = producers.get(result.id, ())
+        if result.exit_code != 0 or (
+            any_failed and any(writing_at(pid, at) for pid in writing)
         ):
             candidates.append((at, _broken_pipe(result), result))
     if not candidates:

@@ -13,7 +13,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import replace
 from typing import Any, cast
 
@@ -28,6 +28,7 @@ from ffrwd.execute import (
     STDOUT,
     Flow,
     ProcessResult,
+    Wire,
     _attribute,
     _broken_pipe,
     _cpu_seconds,
@@ -1150,6 +1151,36 @@ def test_a_stage_with_nothing_to_blame_names_nobody(
     assert _attribute(results, ended, [("ffmpeg1", "ffmpeg0")]) == (None, []), why
 
 
+def test_a_consumer_finishing_first_is_no_failure_when_every_member_exited_0() -> None:
+    """The shape a finite output has: the consumer's filtergraph reaches EOF
+    over the one frame it writes and goes while its producers are still
+    draining theirs. Nothing here was cut short -- a producer whose reader had
+    gone would have died of a broken pipe -- so there is nothing to blame."""
+    results = [_ended("ffmpeg0", 0), _ended("ffmpeg1", 0), _ended("sidecar0", 0)]
+
+    cause, consequences = _attribute(
+        results,
+        {"ffmpeg0": 1.0, "ffmpeg1": 1.2, "sidecar0": 1.3},
+        [("ffmpeg1", "ffmpeg0"), ("sidecar0", "ffmpeg1")],
+    )
+
+    assert (cause, consequences) == (None, [])
+
+
+def test_the_same_order_blames_the_0_again_once_another_member_failed() -> None:
+    """A producer that had to be stopped rather than ending on its own: this
+    stage did lose something, and the member that went first while it was
+    still writing is why."""
+    results = [_ended("ffmpeg0", 0), _ended("ffmpeg1", 1, terminated=True)]
+
+    cause, consequences = _attribute(
+        results, {"ffmpeg0": 1.0}, [("ffmpeg1", "ffmpeg0")]
+    )
+
+    assert cause is results[0]
+    assert consequences == []
+
+
 def test_a_broken_pipe_is_read_off_the_code_or_off_what_ffmpeg_said() -> None:
     """224 is how POSIX spells ffmpeg's EPIPE and 0xffffffe0 how Windows does;
     a member that spells it neither way still said what happened."""
@@ -1158,6 +1189,121 @@ def test_a_broken_pipe_is_read_off_the_code_or_off_what_ffmpeg_said() -> None:
     assert _broken_pipe(_ended("c", 1, stderr="av_write_frame(): Broken pipe"))
     assert not _broken_pipe(_ended("d", 1, stderr="Invalid data found"))
     assert not _broken_pipe(_ended("e", 224, terminated=True))
+
+
+# ------------------------------------------------------ what a stage reports
+
+
+def _settled(
+    order: Sequence[str],
+) -> Callable[..., tuple[str | None, bool, FfrwdError | None]]:
+    """A `_watch` stand-in recording the exit times a real one would read.
+
+    It waits for every member, then stamps them in `order` -- the first of
+    which is the member that ended the stage, as a real watch reads it off a
+    nonzero exit or a 0 taken while a producer still writes. Exit codes stay
+    the children's own; only the clock is arranged.
+    """
+
+    def _watching(
+        members: Iterable[_Member], deadline: float, *rest: object
+    ) -> tuple[str | None, bool, FfrwdError | None]:
+        by_id = {member.id: member for member in members}
+        for member in by_id.values():
+            member.proc.wait(timeout=30)
+        for index, pid in enumerate(order, start=1):
+            by_id[pid].ended_at = float(index)
+        return order[0], False, None
+
+    return _watching
+
+
+@pytest.mark.parametrize(
+    ("codes", "order", "code", "failure", "failures", "consequences", "why"),
+    [
+        (
+            {"p1": 0, "p0": 0},
+            ("p0", "p1"),
+            0,
+            None,
+            [],
+            [],
+            "the consumer finished over its last frame and its producer "
+            "followed, both 0: a run that wrote what it was asked for",
+        ),
+        (
+            {"p1": 224, "p0": 0},
+            ("p0", "p1"),
+            1,
+            "p0",
+            ["p0"],
+            ["p1"],
+            "the consumer stopped early and its producer died of the broken "
+            "pipe: the 0 is the cause, and the 224 its consequence",
+        ),
+        (
+            {"p1": 3, "p0": 0},
+            ("p1", "p0"),
+            3,
+            "p1",
+            ["p1"],
+            [],
+            "the producer failed on its own, and its code is the stage's",
+        ),
+    ],
+    ids=["finished", "early-exit", "nonzero"],
+)
+def test_a_stage_reports_a_failure_only_where_a_member_failed(
+    monkeypatch: pytest.MonkeyPatch,
+    codes: dict[str, int],
+    order: tuple[str, ...],
+    code: int,
+    failure: str | None,
+    failures: list[str],
+    consequences: list[str],
+    why: str,
+) -> None:
+    """One producer piped into one consumer, run for real and read off their
+    exit codes: what the stage reports is the caller's own composition of the
+    attribution, so the outcome is asserted where a run would see it."""
+    python = getattr(sys, "_base_executable", None) or sys.executable
+    plan = ProcessPlan(
+        processes=(
+            SidecarProcess(id="p1", module="p1", node="p1"),
+            SidecarProcess(id="p0", module="p0", node="p0"),
+        ),
+        edges=(
+            StreamEdge(
+                source="p1", target="p0", ref="src:a:v:0", format=VideoFormat()
+            ),
+        ),
+    )
+    argv = {
+        pid: [python, "-c", f"raise SystemExit({exit_code})"]
+        for pid, exit_code in codes.items()
+    }
+    wire = Wire(edge=plan.edges[0], read_stdio=True, write_stdio=True)
+    monkeypatch.setattr(_EXECUTE, "_watch", _settled(order))
+
+    result = _run_stage(
+        plan,
+        Stage(index=0, processes=("p1", "p0")),
+        argv,
+        served={},
+        assigned=(wire,),
+        timeout=None,
+        overwrite=False,
+        echo=None,
+        players={},
+    )
+
+    assert not any(member.terminated for member in result.members), (
+        "a member was stopped, so this stage tests something else"
+    )
+    assert result.exit_code == code, why
+    assert (None if result.failure is None else result.failure.id) == failure, why
+    assert [member.id for member in result.failures] == failures, why
+    assert [member.id for member in result.consequences] == consequences, why
 
 
 # ---------------------------------------------------------------- the copy
