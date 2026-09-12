@@ -313,7 +313,7 @@ def test_a_member_that_dies_takes_the_stage_with_it(tmp_path: Path) -> None:
     # their pipes, and which of the three is seen first is milliseconds.
     named = {member.id: member for member in result.failures}
     assert "sidecar0" in named
-    assert "ffrwd_no_such_filter" in named["sidecar0"].summary
+    assert "ffrwd_no_such_filter" in named["sidecar0"].command
     assert named["sidecar0"].stderr_tail != ""
     # Every member is accounted for, and the two that were still going were
     # told to stop rather than left behind.
