@@ -9,5 +9,12 @@ description = "ffmpeg-shaped sidecar: hosts one ffrwd:av filter between two raw 
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
 
+[project.urls]
+Homepage = "https://ffrwd.video"
+Documentation = "https://ffrwd.video/docs/getting-started"
+Source = "https://github.com/imbcmdth/ffrwd-cli"
+Issues = "https://github.com/imbcmdth/ffrwd-cli/issues"
+Changelog = "https://github.com/imbcmdth/ffrwd-cli/releases"
+
 [tool.maturin]
 bindings = "bin"
