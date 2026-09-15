@@ -7413,6 +7413,17 @@ class _Lowerer:
         if failure is None:
             return _error(code, f"{lead}: file not found or unreadable", anchor,
                            fallback=select, hint=hint)
+        if failure.timed_out:
+            waited = f" after {failure.seconds:g}s" if failure.seconds else ""
+            return _error(
+                code,
+                f"{lead}: the probe of '{self._path_of(alias)}' timed out{waited}",
+                anchor,
+                fallback=select,
+                hint="the file exists, but reading it was too slow to finish, "
+                "which is usually slow or network-backed storage rather than "
+                "the file itself; running again usually reads it",
+            )
         detail = failure.stderr or "ffprobe exited without reporting why"
         return _error(
             code,
@@ -9007,7 +9018,19 @@ class _Lowerer:
         there is nothing to guess an expression's value from.
         """
         result = self.probes.get(alias)
-        duration = None if result is None else result.duration
+        if result is None:
+            # No probe at all is a different story from a container that
+            # declares no length: say what happened to the probe instead.
+            raise self._unreadable_error(
+                ErrorCode.INPUT_NOT_FOUND,
+                alias,
+                f"'{alias}.{INPUT_DURATION_COLUMN}' is unknown",
+                anchor,
+                select,
+                hint="the duration is probed from the file, so the input has "
+                "to exist and be readable",
+            )
+        duration = result.duration
         if duration is None:
             raise _error(
                 ErrorCode.INPUT_NOT_FOUND,

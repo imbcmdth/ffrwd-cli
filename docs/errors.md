@@ -8,7 +8,9 @@ Structured form: `ffrwd validate --json "<query>"` (or `-f query.sql`). Success 
 
 **Meaning:** The query text is not valid SQL under sqlglot's `postgres` dialect (guardrail #2: ffrwd always parses Postgres dialect). This fires before any ffrwd-specific validation runs. It is whatever sqlglot itself rejects, plus ffrwd's own "empty query" and "no statement found" checks for degenerate input.
 
-**Fires when:** the text fails to tokenize or parse. Missing parens, garbled keywords, truncated statements, an empty or whitespace-only query.
+**Fires when:** the text fails to tokenize or parse. Missing parens, garbled keywords, truncated statements, an empty or whitespace-only query. The message is sqlglot's description followed by the word it stopped at and a little of the query around it, since a column number alone means counting characters. A construct left unfinished is named in the query's own words ("BETWEEN is missing its upper bound after AND") rather than by sqlglot's class names.
+
+A comparison written with an `IS` it does not take — `IS BETWEEN`, `IS IN`, `IS LIKE`, `IS ILIKE`, and their `NOT` forms — is reported as that spelling, anchored on the `IS`, with the comparison written without it as the hint.
 
 **Example query:**
 
@@ -21,7 +23,17 @@ SELECT a.video[1] FROM input('x.mp4' a
 **Error JSON:**
 
 ```json
-{"line": 1, "col": 38, "code": "PARSE_ERROR", "message": "Expecting )", "hint": null}
+{"line": 1, "col": 38, "code": "PARSE_ERROR", "message": "Expecting ), at 'a' in: FROM input('x.mp4' a", "hint": null}
+```
+
+And for the `IS` spelling:
+
+```sql
+SELECT f.video[1] FROM input('x.mp4') f WHERE f.t IS BETWEEN 10 AND 20
+```
+
+```json
+{"line": 1, "col": 51, "code": "PARSE_ERROR", "message": "'IS BETWEEN' is not SQL", "hint": "drop the IS: write BETWEEN on its own, e.g. f.t BETWEEN 10 AND 20"}
 ```
 
 ## SYNTAX_ERROR

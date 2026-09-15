@@ -1435,16 +1435,114 @@ def _parse_error_position(err: Exception) -> tuple[int, int]:
     return _DEFAULT_POS
 
 
+# How much of the query either side of the word sqlglot stopped at is quoted
+# back in a parse error. Enough to find the place in a one-line query typed at
+# a prompt, where a column number means counting characters by hand.
+_PARSE_CONTEXT_CHARS = 24
+
+
 def _parse_error_message(err: Exception) -> str:
+    """sqlglot's own description, with the word it stopped at and the text around it.
+
+    sqlglot says what it expected ("Expecting )") and knows the token it could
+    not fit, but its description names only the expectation, which on its own
+    can point nowhere near the mistake: ``f.t is BETWEEN 10`` is refused as
+    "Expecting )". Quoting the token and a little of the query either side is
+    what lets a reader see the place without counting to the column.
+    """
     errors = getattr(err, "errors", None)
     if isinstance(errors, list) and errors:
         first = errors[0]
         if isinstance(first, dict):
             description = first.get("description")
             if isinstance(description, str) and description:
-                return _ANSI_RE.sub("", description).strip()
+                said = _plain_description(_ANSI_RE.sub("", description).strip())
+                highlight = first.get("highlight")
+                if not isinstance(highlight, str) or not highlight.strip():
+                    return said
+                before = " ".join(str(first.get("start_context") or "").split())
+                after = " ".join(str(first.get("end_context") or "").split())
+                word = _ANSI_RE.sub("", highlight).strip()
+                head = before[-_PARSE_CONTEXT_CHARS:]
+                if len(before) > _PARSE_CONTEXT_CHARS and " " in head:
+                    head = head[head.index(" ") + 1 :]  # no word cut in half
+                tail = after[:_PARSE_CONTEXT_CHARS]
+                if len(after) > _PARSE_CONTEXT_CHARS and " " in tail:
+                    tail = tail[: tail.rindex(" ")]
+                near = " ".join(part for part in (head.strip(), word, tail.strip()) if part)
+                return f"{said}, at '{word}' in: {near}"
     text = _ANSI_RE.sub("", str(err)).strip()
     return text.splitlines()[0] if text else err.__class__.__name__
+
+
+# sqlglot reports a construct left unfinished by its own class and argument
+# names: "Required keyword: 'high' missing for <class '...Between'>". The
+# construct and what it lacks, in the words the query uses, are what a reader
+# needs; the ones written most often get a sentence of their own.
+_REQUIRED_RE = re.compile(r"Required keyword: '(\w+)' missing for <class '[\w.]*?(\w+)'>")
+_REQUIRED_SAID = {
+    ("Between", "high"): "BETWEEN is missing its upper bound after AND",
+    ("Between", "low"): "BETWEEN is missing its lower bound",
+    ("In", "expressions"): "IN is missing its list of values",
+    ("Like", "expression"): "LIKE is missing its pattern",
+    ("ILike", "expression"): "ILIKE is missing its pattern",
+}
+
+
+def _plain_description(said: str) -> str:
+    """sqlglot's description without its internal class and argument names."""
+    match = _REQUIRED_RE.search(said)
+    if match is None:
+        return said
+    argument, construct = match.group(1), match.group(2)
+    return _REQUIRED_SAID.get(
+        (construct, argument), f"an unfinished {construct.upper()} is missing its {argument}"
+    )
+
+
+# Comparisons people write with an `IS` they do not take. `IS` only goes with
+# NULL, TRUE, FALSE, UNKNOWN and DISTINCT FROM; these are spelled without it,
+# and sqlglot's refusal of the `IS` form ("Expecting )") says nothing of that.
+_WITHOUT_IS = {
+    TokenType.BETWEEN: ("BETWEEN", "f.t BETWEEN 10 AND 20"),
+    TokenType.IN: ("IN", "a.index IN (1, 2)"),
+    TokenType.LIKE: ("LIKE", "c.text LIKE '%word%'"),
+    TokenType.ILIKE: ("ILIKE", "c.text ILIKE '%word%'"),
+}
+
+
+def _known_mistake(text: str) -> FfrwdError | None:
+    """A parse failure that is one of the common misspellings, said plainly.
+
+    Only consulted once sqlglot has already refused the text, so it never
+    changes what parses. Reads tokens rather than the raw text, so the words
+    inside a string literal are never mistaken for the query's own.
+    """
+    try:
+        tokens = _FfrwdPostgres().tokenize(text)
+    except Exception:  # a text that does not tokenize has its own error
+        return None
+    for index, token in enumerate(tokens):
+        if token.token_type is not TokenType.IS:
+            continue
+        following = index + 1
+        negated = following < len(tokens) and tokens[following].token_type is TokenType.NOT
+        if negated:
+            following += 1
+        if following >= len(tokens) or tokens[following].token_type not in _WITHOUT_IS:
+            continue
+        word, example = _WITHOUT_IS[tokens[following].token_type]
+        spelled = f"NOT {word}" if negated else word
+        if negated:
+            example = example.replace(f" {word} ", f" NOT {word} ", 1)
+        return FfrwdError(
+            ErrorCode.PARSE_ERROR,
+            f"'IS {spelled}' is not SQL",
+            line=token.line,
+            col=max(token.col - len(token.text) + 1, 1),
+            hint=f"drop the IS: write {spelled} on its own, e.g. {example}",
+        )
+    return None
 
 
 class ModuleExport(exp.Expression):
@@ -1778,6 +1876,9 @@ def parse(
     try:
         tree = sqlglot.parse_one(text, read=_FfrwdPostgres)
     except ParseError as err:
+        mistake = _known_mistake(text)
+        if mistake is not None:
+            raise mistake from err
         line, col = _parse_error_position(err)
         raise FfrwdError(
             ErrorCode.PARSE_ERROR, _parse_error_message(err), line=line, col=col

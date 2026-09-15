@@ -331,6 +331,73 @@ def test_probe_failure_is_none_for_a_url(monkeypatch: pytest.MonkeyPatch) -> Non
     assert probe_failure("rtsp://example.com/stream") is None
 
 
+def test_a_probe_that_times_out_is_asked_again_and_succeeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A slow first read on network storage is not an unreadable file.
+
+    The first ffprobe runs out of time and the second answers: the probe
+    succeeds, the second try had the longer ceiling, and no failure is left
+    recorded for the path.
+    """
+    f = tmp_path / "x.mp4"
+    f.write_bytes(b"data")
+    _fake_ffprobe_present(monkeypatch)
+    ceilings: list[float] = []
+    answer = json.dumps(
+        {
+            "streams": [
+                {"index": 0, "codec_type": "video", "codec_name": "h264", "width": 16, "height": 16}
+            ],
+            "format": {"duration": "15.9"},
+        }
+    )
+
+    def run(argv: list[str], **kw: object) -> subprocess.CompletedProcess[str]:
+        ceilings.append(float(kw["timeout"]))  # type: ignore[arg-type]
+        if len(ceilings) == 1:
+            raise subprocess.TimeoutExpired(argv, kw["timeout"])  # type: ignore[arg-type]
+        return subprocess.CompletedProcess(argv, 0, stdout=answer, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    result = probe(str(f))
+    assert result is not None
+    assert result.duration == pytest.approx(15.9)
+    assert ceilings[0] < ceilings[1]
+    assert probe_failure(str(f)) is None
+
+
+def test_a_probe_that_times_out_twice_is_recorded_as_a_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    f = tmp_path / "x.mp4"
+    f.write_bytes(b"data")
+    _fake_ffprobe_present(monkeypatch)
+
+    def run(argv: list[str], **kw: object) -> subprocess.CompletedProcess[str]:
+        raise subprocess.TimeoutExpired(argv, kw["timeout"])  # type: ignore[arg-type]
+
+    monkeypatch.setattr(subprocess, "run", run)
+    assert probe(str(f)) is None
+    failure = probe_failure(str(f))
+    assert failure is not None and failure.timed_out
+    assert failure.seconds == pytest.approx(60.0)
+
+
+def test_a_url_that_times_out_is_not_asked_again(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A remote spec already has the network ceiling; it gets one try."""
+    _fake_ffprobe_present(monkeypatch)
+    tries: list[object] = []
+
+    def run(argv: list[str], **kw: object) -> subprocess.CompletedProcess[str]:
+        tries.append(kw["timeout"])
+        raise subprocess.TimeoutExpired(argv, kw["timeout"])  # type: ignore[arg-type]
+
+    monkeypatch.setattr(subprocess, "run", run)
+    assert probe("https://example.com/x.mp4") is None
+    assert len(tries) == 1
+
+
 def test_probe_failure_is_none_when_ffprobe_is_absent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

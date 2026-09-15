@@ -42,7 +42,14 @@ from dataclasses import dataclass, field, replace
 from ffrwd import binaries
 from ffrwd.ir import StreamType
 
-_TIMEOUT_SECONDS = 5.0
+# A local probe reads a header and a few megabytes and normally answers in a
+# tenth of a second, so these ceilings only matter when the storage under the
+# file is slow. On a network-backed volume the first read of a freshly written
+# file can stall for seconds while later reads of the same bytes are quick, and
+# a 4K upload hit a 5-second ceiling there about one time in three. So a probe
+# that times out is asked once more, with room, before it is given up on.
+_TIMEOUT_SECONDS = 15.0
+_RETRY_TIMEOUT_SECONDS = 60.0
 # Demuxing one caption track reads the whole file, not just its header.
 _EXTRACT_TIMEOUT_SECONDS = 20.0
 # Remote specs fetch a manifest and often an init segment per stream before
@@ -225,6 +232,10 @@ class ProbeFailure:
     """
 
     stderr: str | None
+    #: True when ffprobe never answered: it ran out of time, after the retry.
+    timed_out: bool = False
+    #: The ceiling it ran out of, in seconds, when `timed_out`.
+    seconds: float | None = None
 
 
 # (realpath, mtime_ns, size, input flags)
@@ -298,12 +309,17 @@ def probe(
         return None
 
     return _cached_ffprobe(
-        real, (real, st.st_mtime_ns, st.st_size, flags), _TIMEOUT_SECONDS, flags
+        real, (real, st.st_mtime_ns, st.st_size, flags), _TIMEOUT_SECONDS, flags, retry=True
     )
 
 
 def _cached_ffprobe(
-    spec: str, cache_key: _CacheKey, timeout: float, flags: tuple[str, ...] = ()
+    spec: str,
+    cache_key: _CacheKey,
+    timeout: float,
+    flags: tuple[str, ...] = (),
+    *,
+    retry: bool = False,
 ) -> ProbeResult | None:
     """One memoized ffprobe invocation over `spec` (a path, URL or device).
 
@@ -335,16 +351,28 @@ def _cached_ffprobe(
         *flags,
         spec,
     ]
-    try:
-        result = subprocess.run(
-            argv,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-    except (OSError, subprocess.SubprocessError):
-        _failure_cache[cache_key] = ProbeFailure(stderr=None)
+    # A local file that times out is asked again with a longer ceiling: a slow
+    # first read is usually storage warming, not a file that cannot be read.
+    # A url, device or forced format already has the long ceiling and one try.
+    ceilings = (timeout, _RETRY_TIMEOUT_SECONDS) if retry else (timeout,)
+    result = None
+    for ceiling in ceilings:
+        try:
+            result = subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=ceiling,
+            )
+            break
+        except subprocess.TimeoutExpired:
+            _failure_cache[cache_key] = ProbeFailure(stderr=None, timed_out=True, seconds=ceiling)
+        except (OSError, subprocess.SubprocessError):
+            _failure_cache[cache_key] = ProbeFailure(stderr=None)
+            return None
+    if result is None:
         return None
+    _failure_cache.pop(cache_key, None)
 
     if result.returncode != 0:
         _failure_cache[cache_key] = ProbeFailure(stderr=_last_line(result.stderr))

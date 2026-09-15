@@ -105,6 +105,60 @@ def test_parse_error_is_line_anchored() -> None:
     assert excinfo.value.line == 3
 
 
+def _parse_error(text: str) -> FfrwdError:
+    with pytest.raises(FfrwdError) as excinfo:
+        parse(text)
+    assert excinfo.value.code is ErrorCode.PARSE_ERROR, text
+    return excinfo.value
+
+
+@pytest.mark.parametrize(
+    ("clause", "said", "example"),
+    [
+        ("f.t IS BETWEEN 10 AND 20", "'IS BETWEEN' is not SQL", "f.t BETWEEN 10 AND 20"),
+        (
+            "f.t is not between 10 and 20",
+            "'IS NOT BETWEEN' is not SQL",
+            "f.t NOT BETWEEN 10 AND 20",
+        ),
+        ("f.index IS IN (1, 2)", "'IS IN' is not SQL", "a.index IN (1, 2)"),
+        ("f.title IS LIKE '%a%'", "'IS LIKE' is not SQL", "c.text LIKE '%word%'"),
+    ],
+)
+def test_an_is_the_comparison_does_not_take_is_named_with_its_fix(
+    clause: str, said: str, example: str
+) -> None:
+    """sqlglot refuses these as "Expecting )", which says nothing of the IS.
+
+    The error names the spelling, anchors on the IS itself rather than on the
+    token after it, and shows the comparison written without it.
+    """
+    prefix = "SELECT f.video[1] FROM input('x.mp4') f WHERE "
+    error = _parse_error(prefix + clause)
+    assert error.message == said
+    assert error.col == len(prefix) + 1 + clause.lower().index(" is ") + 1
+    assert error.hint is not None and example in error.hint
+
+
+def test_is_between_inside_a_string_is_not_mistaken_for_the_query() -> None:
+    """Only tokens of the query count: a file named with the words is not the mistake."""
+    error = _parse_error("SELECT a.video[1] FROM input('is between.mp4' a")
+    assert "IS BETWEEN" not in error.message
+
+
+def test_a_parse_error_quotes_the_word_it_stopped_at_and_the_text_around_it() -> None:
+    """A column number alone means counting characters in a one-line query."""
+    error = _parse_error("SELECT a.video[1] FROM input('x.mp4' a")
+    assert error.message.startswith("Expecting ), at 'a' in: ")
+    assert error.message.endswith("input('x.mp4' a")
+
+
+def test_an_unfinished_construct_is_named_without_sqlglot_class_names() -> None:
+    error = _parse_error("SELECT f.video[1] FROM input('x.mp4') f WHERE f.t BETWEEN 10 AND")
+    assert "<class" not in error.message
+    assert "Required keyword" not in error.message
+
+
 # ---------------------------------------------------------------------------
 # parse — exp.Command fallback: unbalanced parens / unterminated quotes
 # ---------------------------------------------------------------------------

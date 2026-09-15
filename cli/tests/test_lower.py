@@ -673,6 +673,27 @@ def test_a_probe_failure_with_no_stderr_still_avoids_the_missing_file_claim() ->
     assert "the probe failed" in err.message
 
 
+def test_a_duration_read_from_a_probe_that_timed_out_says_it_timed_out() -> None:
+    """`f.duration` on an input whose probe never answered used to claim the
+    container declares no duration, which sent people looking for a missing
+    or broken file. It now says the probe timed out, and why that happens."""
+    sql = (
+        "COPY (SELECT a.video[1] FROM input('x.mp4') a "
+        "WHERE a.t <= a.duration - 1) TO 'y.mp4'"
+    )
+    with pytest.raises(FfrwdError) as excinfo:
+        lower(
+            resolve(parse(sql)),
+            {"a": None},
+            registry=_snapshot_registry(),
+            probe_failures={"a": ProbeFailure(stderr=None, timed_out=True, seconds=60.0)},
+        )
+    err = excinfo.value
+    assert "reports no container duration" not in err.message
+    assert "timed out after 60s" in err.message
+    assert err.hint is not None and "slow" in err.hint
+
+
 def test_no_recorded_failure_keeps_the_old_missing_file_message() -> None:
     """An alias `probe_failures` has nothing to say about -- unset entirely,
     or explicitly None -- keeps the familiar wording; this is the same
