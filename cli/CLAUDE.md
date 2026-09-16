@@ -116,11 +116,14 @@ sidecar at X.Y" is always true.
 
 1. Full local checks green.
 2. Push the feature commits; wait for CI.
-3. Bump ALL FOUR version sites to the same X.Y.Z: `uv version X.Y.Z`
+3. Bump the lockstep version sites to the same X.Y.Z: `uv version X.Y.Z`
    here (it does not tag), the three marker-gated
-   `ffrwd-wasm==X.Y.Z` pins in dependencies, `../sidecar/Cargo.toml`'s workspace version, and
-   `../sidecar/ffrwd-wasm/pyproject.toml`. Commit the bump. The release
-   workflow refuses a tag whose versions disagree.
+   `ffrwd-wasm==X.Y.Z` pins in dependencies, and
+   `../sidecar/ffrwd-wasm/pyproject.toml`. Then `uv lock`, and commit the
+   bump with the `uv.lock` change. The release workflow refuses a tag
+   whose versions disagree; it checks exactly those two pyproject files.
+   `../sidecar/Cargo.toml`'s workspace version is the sidecar crate's own
+   version line and is NOT part of the lockstep: leave it alone.
 4. Annotated tag `vX.Y.Z` on the bump commit.
 5. Push the commit and the tag together — the one tag releases both
    packages.
