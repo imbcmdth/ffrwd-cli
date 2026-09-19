@@ -673,6 +673,21 @@ cheap, and `fetch` copies one payload's bytes in on demand, so a
 module reading one frame of a wide window never pays for the rest.
 Modules built against earlier worlds load and run unchanged.
 
+`ffrwd:av@0.16.0` adds `packet-filter`: encoded packets in, encoded
+packets out, with JSON rows arriving beside them. Where `packet-sink`
+consumes the encoder's output and answers rows alone, a filter hands
+the packets on, so it sits between the encoder and whatever muxes or
+publishes them - which is what a module weaving data into a stream
+needs. It declares the codecs and stream counts a sink does, plus
+whether it acts on the rows; `init` answers the streams leaving, and
+`process` takes one packet list per pad, the rows that have arrived,
+and a `last` marking the call everything held back leaves on. Packet
+order per pad is preserved and one packet in is one packet out, so a
+filter cannot break the count a container describes. The sidecar hosts
+one - `ffrwd-wasm -f nut -i <in> -m <module> -rows-in <rows.ndjson>
+-f nut <out>` - and `ffrwd` reads its describe, but no query places
+one yet: see [known gaps](known_gaps.md).
+
 ### Linking
 
 Linking is npm's two commands, each with its effects in one place.

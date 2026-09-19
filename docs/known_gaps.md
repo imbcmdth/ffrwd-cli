@@ -28,6 +28,10 @@ output is plain ffmpeg, so the two mix freely in a script.
 - Options typed `binary` or `dictionary`: setting one is
   `FILTER_OPTION_TYPE`; the filter's other options work.
 - Runtime filter commands (`sendcmd`, `zmq`).
+- A wasm module exporting `packet-filter`. The sidecar hosts one and
+  `ffrwd` reads its describe, so a package carrying one installs and
+  lists; no part of a query places one yet, and a declaration naming
+  one is `UNSUPPORTED_SQL` saying so.
 
 ## Sharp edges
 
