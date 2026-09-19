@@ -291,7 +291,7 @@ from sqlglot import exp
 
 from ffrwd import binaries, loudnorm
 from ffrwd.errors import ErrorCode, FfrwdError
-from ffrwd.functions import WASM_STREAM_NAMES, Annotation, WasmFunction
+from ffrwd.functions import WASM_STREAM_NAMES, Annotation, Parameter, WasmFunction
 from ffrwd.inputs import render_options
 from ffrwd.inputs import validate_option as validate_input_option
 from ffrwd.ir import (
@@ -302,6 +302,7 @@ from ffrwd.ir import (
     PREDICATE,
     ROWFILTER,
     ROWMERGE,
+    ROWS_DOCUMENT,
     Attachment,
     FrameRef,
     Graph,
@@ -3634,6 +3635,9 @@ class _Lowerer:
         self.packet_filter_calls: list[
             tuple[FrameRef, WasmFunction, exp.Expr, exp.Select]
         ] = []
+        # How many rows documents this query has minted, which is what
+        # numbers the next one (:meth:`_rows_document`).
+        self.rows_documents = 0
 
     # -- entry point ------------------------------------------------------
 
@@ -12753,17 +12757,6 @@ class _Lowerer:
                 hint=f"declare '{declared.name}' as RETURNS packets and write "
                 "it as a column of a COPY's SELECT",
             )
-        if described.reads_annotations or declared.reads is not None:
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL,
-                f"the module '{declared.module}' reads rows beside its "
-                "packets, and no query writes them where it could read them",
-                node,
-                fallback=select,
-                hint="a filter's rows reach the sidecar as a file written "
-                "before it starts, and nothing emits one yet; rewrite the "
-                "stream with a tool after the COPY",
-            )
         kind = declared.stream_kind
         accepted = described.sink_codecs(kind)
         carried = WIRE_AUDIO_CODECS if kind == "audio" else WIRE_VIDEO_CODECS
@@ -13506,7 +13499,9 @@ class _Lowerer:
                 f"{declared.signature}",
             )
         if declared.is_packets:
-            self._check_packets_position(declared, node, select)
+            return self._lower_packets_call(
+                declared, described, node, call, env, select
+            )
         if declared.is_sink:
             return self._lower_sink_call(node, declared, described, call, env, select)
         kind = declared.stream_kind
@@ -13574,10 +13569,6 @@ class _Lowerer:
                 [kind],
                 reads_annotations=declared.reads is not None,
             )
-            if declared.is_packets:
-                # The destination settles what encodes onto this node's input
-                # edge; the record here is what it looks the node up by.
-                self.packet_filter_calls.append((ref, declared, node, select))
             return ref
 
         lowered = self._expand_call(
@@ -13594,6 +13585,160 @@ class _Lowerer:
             rows=self._row_elements(per_row, env),
         )
         return lowered
+
+    def _lower_packets_call(
+        self,
+        declared: WasmFunction,
+        described: Described,
+        node: exp.Expr,
+        call: _Call,
+        env: _Env,
+        select: exp.Select,
+    ) -> _Value:
+        """A ``RETURNS packets`` call: one filter node, its rows written down.
+
+        The stream arguments become the node's inputs, exactly as a frame
+        filter's do. The rows arguments do NOT ride them: an encoder stands
+        between the filter and anything upstream of it, and ffmpeg drops a
+        stream it does not understand, so rows produced above the encoder
+        cannot reach the filter on the wire. Each rows argument is lowered
+        into a DOCUMENT of its own instead -- an ndjson file the producing
+        stage writes before the filter's stage starts -- and the sidecar is
+        handed one ``-rows-in`` per argument, named after the parameter it
+        fills.
+        """
+        self._check_packets_position(declared, node, select)
+        kind = declared.stream_kind
+        arity = declared.stream_arity
+        expected: list[StreamType] = [kind] * arity
+        kinds = self._stream_kinds(call, env, select, arity)
+        if kinds != expected:
+            raise self._bad_streams(call, node, select, expected, kinds)
+        wired = self._packet_filter_rows(declared, call, env, node, select)
+        streams = {
+            position: self._lower_expr(call.args[position], env, select)
+            for position in range(arity)
+        }
+        first = arity + len(declared.reads_params)
+        tuples = env.relation.tuples if env.relation is not None else []
+        per_row = any(_reads_row_column(arg, env) for arg in call.args[first:])
+
+        def build(values: list[object], element: int) -> FrameRef:
+            row = tuples[element] if element < len(tuples) else {}
+            params = self._wasm_params(
+                declared, described, call, node, select, env, row, first=first
+            )
+            ref = self.ctx.node(
+                declared.module,
+                params,
+                [_as_ref(values[position]) for position in range(arity)],
+                [kind],
+            )
+            # The destination settles what encodes onto this node's input
+            # edge; the record here is what it looks the node up by.
+            self.packet_filter_calls.append((ref, declared, node, select))
+            if wired:
+                self.graph.packet_filter_rows[ref] = [dict(one) for one in wired]
+            return ref
+
+        return self._expand_call(
+            declared.name,
+            node,
+            call.args[:arity],
+            select,
+            streams=streams,
+            literals={},
+            arity=arity,
+            positions=list(range(arity)),
+            returns=kind,
+            build=build,
+            rows=self._row_elements(per_row, env),
+        )
+
+    def _packet_filter_rows(
+        self,
+        declared: WasmFunction,
+        call: _Call,
+        env: _Env,
+        node: exp.Expr,
+        select: exp.Select,
+    ) -> list[dict[str, str]]:
+        """Each rows argument written down, as the argument name and its path.
+
+        One entry per annotation parameter the call filled, in declaration
+        order. A parameter written NULL, or left off the end, contributes
+        none -- the filter is simply given no rows for it.
+
+        The path is a placeholder the plan carries and the RUN resolves
+        (:data:`ROWS_DOCUMENT`): a compile prints the same text on any
+        machine, and a run writes the file in its own temporary directory and
+        removes it afterwards.
+        """
+        at = declared.stream_arity
+        columns = declared.reads_params
+        wired: list[dict[str, str]] = []
+        for index, param in enumerate(columns):
+            position = at + index
+            if position >= len(call.args):
+                break
+            argument = call.args[position]
+            if isinstance(_unwrap(argument), exp.Null):
+                continue
+            self._check_packets_rows_argument(declared, param, argument, node, select)
+            path = self._rows_document()
+            written, self.rows_file = self.rows_file, path
+            try:
+                self._lower_expr(argument, env, select)
+            finally:
+                self.rows_file = written
+            wired.append({"arg": param.name, "path": path})
+        return wired
+
+    def _check_packets_rows_argument(
+        self,
+        declared: WasmFunction,
+        param: Parameter,
+        argument: exp.Expr,
+        node: exp.Expr,
+        select: exp.Select,
+    ) -> None:
+        """One rows argument against the column it fills.
+
+        It has to be a module's annotation column -- the only rows a query
+        can write to a file before the filter reads them -- and its record
+        has to be the record the parameter declares.
+        """
+        found = annotation_projection(_unwrap(argument), self.res.wasm)
+        if found is None:
+            raise _error(
+                ErrorCode.UDF_ARG_TYPE,
+                f"{declared.name}() takes '{param.name}' as {param.type}, and "
+                "its argument produces no annotation column",
+                argument,
+                fallback=node,
+                hint=f"write the column a module returns: {declared.name}"
+                "(<stream>, <producer>(<stream>).<column>, ...), or NULL for "
+                "no rows at all",
+            )
+        producer = found[1]
+        assert producer.emits is not None  # what annotation_projection selects on
+        assert param.annotation is not None  # `reads_params` selected on it
+        if _annotation_fields(param.annotation) != _annotation_fields(producer.emits):
+            raise _error(
+                ErrorCode.UDF_ARG_TYPE,
+                f"{declared.name}() takes '{param.name}' as {param.type}, and "
+                f"{producer.name}() returns '{producer.emits.name}' as "
+                f"{producer.emits.written}",
+                argument,
+                fallback=node,
+                hint="the two annotation records have to name the same fields, "
+                "with the same types",
+            )
+
+    def _rows_document(self) -> str:
+        """The next rows document this query writes, as a run resolves it."""
+        self.rows_documents += 1
+        return f"{ROWS_DOCUMENT}{self.rows_documents - 1}"
 
     def _check_packets_position(
         self,

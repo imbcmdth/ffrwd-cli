@@ -34,6 +34,7 @@ members = [
     "packet-sei",
     "packet-keys",
     "packet-head",
+    "note-rows",
     "source-replay",
     "source-replay-pair",
     "source-replay-0130",

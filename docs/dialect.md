@@ -96,11 +96,30 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   module accepts is copied INTO it too, so weaving into a file that is
   already encoded re-encodes nothing. Other streams of the same
   destination are muxed straight off the source beside it, in sync.
+  It may declare one or more annotation columns after its stream, and each
+  is an ARGUMENT the call writes: `weave(v video_stream, faces cue[], words
+  cue[]) RETURNS packets`, called as `weave(f.video[1],
+  find_faces(f.video[1]).cues, transcribe(f.video[1]).cues)`. An encoder
+  stands between the filter and any producer, and ffmpeg drops a stream it
+  does not understand, so those rows cannot ride the frames: each argument's
+  rows go to a document of their own, the producing stage finishes writing
+  before the filter's stage starts, and the sidecar reads one document per
+  argument. Every row reaches the module carrying `"_arg": "<parameter>"`,
+  which is how a filter reading several tells them apart; a producer row
+  already carrying that field is refused. An argument written `NULL`, or
+  left off the end, hands the filter no rows for it at all.
+  A rows document is named `ffrwd:rows:<n>` in the compiled command, at both
+  ends, so the output is the same text on any machine; `ffrwd run` resolves
+  each to a file in the run's own temporary directory and removes it when
+  the run ends, whether it finished or failed. A printed plan carrying one
+  therefore reads rather than runs.
   Refused: the call anywhere but a COPY cell, an ffmpeg filter over it, a
   destination that places no encoder (a frame sink, a rows file, a table
   query), a second column of the same kind at a destination whose encoder
-  options went upstream with the filter, `two_pass`, and a filter that
-  reads rows. See [known gaps](known_gaps.md).
+  options went upstream with the filter, `two_pass`, a manifest destination,
+  a rows argument that is not a module's annotation column, and rows whose
+  producer cannot be put in a stage of its own. See
+  [known gaps](known_gaps.md).
 - A **sink `LANGUAGE wasm` function** (`RETURNS sink`) is a COPY
   destination: `COPY (SELECT <cells>) TO name(<values>)`. It declares
   value parameters only; the SELECT list supplies the ROWS it reads,
@@ -736,12 +755,20 @@ arrive over the calls that follow. Rows read from a PIPE arrive
 whenever they are written, and packets never wait on one, so a live
 run whose rows are still being produced keeps flowing.
 
+A filter may be given SEVERAL rows inputs, one per rows argument its
+caller wrote: `-rows-in <name>=<path>`, repeated. They are not
+separate lists - every row arrives in the one `rows` the module is
+handed - and a row from a named input carries `"_arg": "<name>"`
+saying which argument it filled. The host writes that field and
+refuses a producer row that already has one, so a module may read it
+as the host's word. The readers share one buffer, so what settles
+before the first call is the first megabyte of all of them together.
+
 The sidecar hosts one - `ffrwd-wasm -f nut -i <in> -m <module>
--rows-in <rows.ndjson> -f nut <out>`, with `-params-from <file>` where
-the parameters are too long for a command line - and `ffrwd` places one
-where a COPY's SELECT writes a `RETURNS packets` call. A filter that
-READS rows has no spelling for them yet: see
-[known gaps](known_gaps.md).
+-rows-in <name>=<rows.ndjson> -f nut <out>`, with `-params-from
+<file>` where the parameters are too long for a command line - and
+`ffrwd` places one where a COPY's SELECT writes a `RETURNS packets`
+call.
 
 ### Linking
 

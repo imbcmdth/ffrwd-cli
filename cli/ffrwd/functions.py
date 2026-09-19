@@ -764,7 +764,9 @@ class WasmFunction:
         not simply the ones its stream argument arrived with -- a filtered
         gather, say, which no single argument can cover.
         """
-        if self.is_value or self.reads is None:
+        if self.is_value or self.is_packets or self.reads is None:
+            # A packet filter's columns are already in `written_params`: it
+            # writes every one of them, always.
             return self.written_params
         return (
             *self.stream_params,

@@ -77,6 +77,18 @@ PREDICATE = "pred"
 ROWMERGE = "rowmerge"
 MAX_DISTANCE = "max_distance"
 
+# Where a rows DOCUMENT one process hands another goes, numbered from 0 per
+# query: ``ffrwd:rows:0``, ``ffrwd:rows:1``. It is a placeholder, not a path
+# -- a compile prints the same text on any machine, and a run resolves each
+# to a file in its own temporary directory, removed with it. A printed
+# command carrying one reads rather than runs.
+ROWS_DOCUMENT = "ffrwd:rows:"
+
+
+def is_rows_document(path: str) -> bool:
+    """True for a path that is one of those placeholders."""
+    return path.startswith(ROWS_DOCUMENT)
+
 
 def is_src(ref: FrameRef) -> bool:
     """True if `ref` points at a raw input stream rather than a Node."""
@@ -672,6 +684,12 @@ class Graph:
     # `<kind>_codec: copy` instead, and nothing re-encodes it. Unlike a packet
     # sink, the node hands its packets on, so it is in no other table here.
     packet_filters: dict[str, list[dict[str, object]]] = field(default_factory=dict)
+    # Node id -> the rows each PACKET FILTER reads, one entry per rows
+    # argument its call filled, in declaration order: `arg` is the parameter
+    # the rows fill and `path` the document they arrive in, which is one of
+    # the nodes of `rows_sinks` writing that same path. A filter reading no
+    # rows is absent.
+    packet_filter_rows: dict[str, list[dict[str, str]]] = field(default_factory=dict)
     # Alias -> the RETURNS source module bound to it. Not a key of `sources`:
     # its bytes never come from a real `-i`, so the partitioner gives it a
     # sidecar of its own rather than an input slot.
@@ -732,6 +750,11 @@ class Graph:
             d["packet_filters"] = {
                 name: [dict(pad) for pad in pads]
                 for name, pads in self.packet_filters.items()
+            }
+        if self.packet_filter_rows:
+            d["packet_filter_rows"] = {
+                name: [dict(one) for one in reads]
+                for name, reads in self.packet_filter_rows.items()
             }
         if self.module_sources:
             d["module_sources"] = {
@@ -817,6 +840,16 @@ class Graph:
                 assert isinstance(pads, list)
                 packet_filters[str(name)] = [dict(pad) for pad in pads]
 
+        raw_filter_rows = d.get("packet_filter_rows")
+        packet_filter_rows: dict[str, list[dict[str, str]]] = {}
+        if raw_filter_rows is not None:
+            assert isinstance(raw_filter_rows, dict)
+            for name, reads in raw_filter_rows.items():
+                assert isinstance(reads, list)
+                packet_filter_rows[str(name)] = [
+                    {str(k): str(v) for k, v in dict(one).items()} for one in reads
+                ]
+
         raw_module_sources = d.get("module_sources")
         module_sources: dict[str, ModuleSource] = {}
         if raw_module_sources is not None:
@@ -850,6 +883,7 @@ class Graph:
             module_sinks=module_sinks,
             packet_sinks=packet_sinks,
             packet_filters=packet_filters,
+            packet_filter_rows=packet_filter_rows,
             module_sources=module_sources,
             url_sources=url_sources,
             dropped_aliases=dropped_aliases,

@@ -674,6 +674,23 @@ class PadMeta:
 
 
 @dataclass(frozen=True)
+class RowsRead:
+    """One rows document a packet filter reads, and which argument it fills.
+
+    `arg` is the declared parameter's name, which the sidecar writes onto
+    every row it delivers from this input so a filter reading several tells
+    them apart. `path` is the document, which is a placeholder
+    (:data:`~ffrwd.ir.ROWS_DOCUMENT`) the run resolves.
+    """
+
+    arg: str
+    path: str
+
+    def to_dict(self) -> dict[str, object]:
+        return {"arg": self.arg, "path": self.path}
+
+
+@dataclass(frozen=True)
 class SidecarProcess:
     """One REGION of wasm modules the sidecar hosts, reading and writing pipes.
 
@@ -743,6 +760,10 @@ class SidecarProcess:
     # back: it reads a packet sink's pads and writes one `-f nut` per pad,
     # each its own pipe rather than a pad cut out of one stdout.
     packet_filter: bool = False
+    # The rows documents a packet FILTER reads, one per rows argument its
+    # call filled, in declaration order -- one ``-rows-in <arg>=<path>``
+    # apiece. Empty for every other process, and for a filter given none.
+    rows_in: tuple[RowsRead, ...] = ()
     # True for a region holding a SOURCE MODULE: it rides alone, no inputs,
     # and its `outputs` -- more than one, ordinarily illegal -- are each their
     # own NUT pipe rather than pads cut from one stdout.
@@ -808,6 +829,8 @@ class SidecarProcess:
             written["sink"] = True
         if self.packet_filter:
             written["packet_filter"] = True
+        if self.rows_in:
+            written["rows_in"] = [read.to_dict() for read in self.rows_in]
         if self.packet_source:
             written["packet_source"] = True
         if self.tracks:
@@ -1161,6 +1184,9 @@ class _Partitioner:
         # Kept apart from the stream edges: everything reading `edges` reads
         # frame pipes, and rows are neither frames nor a ref.
         self.rows: list[RowsEdge] = []
+        # The rows DOCUMENTS a packet filter reads: files, so they order two
+        # stages rather than joining them the way a pipe does.
+        self.documents: list[FileEdge] = []
 
     # -- depths
 
@@ -2042,6 +2068,7 @@ class _Partitioner:
                 sink=any(name in self.g.module_sinks for name in members),
                 packet_sink=any(name in self.g.packet_sinks for name in members),
                 packet_filter=any(name in self.g.packet_filters for name in members),
+                rows_in=self._region_rows_in(members),
                 pads=self._region_pad_meta(members),
             )
             self.sidecars.append(sidecar)
@@ -2134,11 +2161,13 @@ class _Partitioner:
         self._place_module_sources()
         self._redirect_live_reads()
         self._add_rows_edges()
+        self._add_rows_documents()
         self._bound_edges()
         processes: list[Process] = [self._materialize(p) for p in self.pending]
         processes.extend(self._materialize_region(sidecar) for sidecar in self.sidecars)
         return ProcessPlan(
-            processes=tuple(processes), edges=(*self.edges, *self.rows)
+            processes=tuple(processes),
+            edges=(*self.edges, *self.rows, *self.documents),
         )
 
     def _region_models(self, members: Sequence[str]) -> tuple[ModelBinding, ...]:
@@ -2196,6 +2225,52 @@ class _Partitioner:
                     for pad in table[name]
                 )
         return ()
+
+    def _region_rows_in(self, members: Sequence[str]) -> tuple[RowsRead, ...]:
+        """The rows documents this region's packet filter reads, in order.
+
+        Empty for every region but one holding a filter whose call filled a
+        rows argument.
+        """
+        name = next((n for n in members if n in self.g.packet_filter_rows), None)
+        if name is None:
+            return ()
+        return tuple(
+            RowsRead(arg=str(read["arg"]), path=str(read["path"]))
+            for read in self.g.packet_filter_rows[name]
+        )
+
+    def _add_rows_documents(self) -> None:
+        """One FILE edge per rows document a packet filter reads.
+
+        The edge orders the two: a document is a file, and a file is finished
+        before whatever reads it starts. The writer is the region whose own
+        rows sink names that document -- the module that read the rows off
+        its frames, wherever in the query that was.
+        """
+        writers = {
+            document.sink.path: sidecar.id
+            for sidecar in self.sidecars
+            for document in sidecar.rows
+            if document.sink.path
+        }
+        for sidecar in self.sidecars:
+            for read in sidecar.rows_in:
+                source = writers.get(read.path)
+                if source is None:
+                    raise FfrwdError(
+                        ErrorCode.INTERNAL,
+                        f"the rows '{sidecar.module}' reads for '{read.arg}' are "
+                        "written by no process",
+                        hint="please report this query as a bug",
+                    )
+                self.documents.append(
+                    FileEdge(
+                        source=source,
+                        target=sidecar.id,
+                        format=FileFormat("rows", read.path),
+                    )
+                )
 
     def _region_rows(
         self, members: Sequence[str], bindings: Sequence[ModuleBinding]
@@ -2856,7 +2931,7 @@ def check_spellable(plan: ProcessPlan) -> None:
     pipe by construction, the same way a packet sink's several inputs are.
     """
     for sidecar in plan.sidecars:
-        if sidecar.packet_source or len(sidecar.outputs) <= 1:
+        if sidecar.packet_source or sidecar.packet_filter or len(sidecar.outputs) <= 1:
             continue
         raise FfrwdError(
             ErrorCode.UNSUPPORTED_SQL,
@@ -2865,6 +2940,38 @@ def check_spellable(plan: ProcessPlan) -> None:
             hint="write one COPY per stream the module produces, each naming "
             "its own destination; a module running once per row is one COPY "
             "per row",
+        )
+    _check_rows_documents(plan)
+
+
+def _check_rows_documents(plan: ProcessPlan) -> None:
+    """Refuse a plan whose rows document is read in the stage that writes it.
+
+    A packet filter's rows are a FILE, and the file edge naming it is what
+    puts the writing stage ahead of the reading one. Two processes a pipe
+    already joins are ONE stage, so an edge between them orders nothing and
+    the filter would read a file still being written. That happens where the
+    producer and the encoder cannot be separated -- both reading a live
+    input, which is opened once and handed round.
+    """
+    stage_of = {
+        member: stage.index for stage in plan.stages for member in stage.processes
+    }
+    for edge in plan.file_edges:
+        if edge.format.content != "rows" or edge.format.path is None:
+            continue
+        if stage_of.get(edge.source) != stage_of.get(edge.target):
+            continue
+        reader = plan.process(edge.target)
+        module = reader.module if isinstance(reader, SidecarProcess) else reader.id
+        raise FfrwdError(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"the rows '{module}' reads are written by a process that runs "
+            "beside it, and it needs them finished before it starts",
+            hint="the rows a packet filter reads come from a stage of their "
+            "own, which a live input cannot have: it is opened once, so "
+            "everything reading it runs together. Write the rows down in one "
+            "query and filter a recording in the next",
         )
 
 

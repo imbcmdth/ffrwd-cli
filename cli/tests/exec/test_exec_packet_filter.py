@@ -30,7 +30,7 @@ import pytest
 from ffrwd import binaries, wasm
 from ffrwd.compiler import compile_all
 from ffrwd.emit import build_ffmpeg_args, emit
-from ffrwd.execute import execute_plan
+from ffrwd.execute import execute_plan, render_plan
 
 pytestmark = pytest.mark.exec
 
@@ -299,3 +299,171 @@ def test_the_compiled_shape_is_encoder_filter_muxer() -> None:
     # The audio never travels a pipe: the muxer reads the file for it.
     muxer = next(p for p in plan.ffmpeg if p.id == muxed.target)
     assert _AV.as_posix() in [Path(p).as_posix() for p in muxer.graph.input_paths]
+
+
+# -- a filter's ROWS: written in one stage, read in the next ---------------
+
+_PACKET_SEI = _BUILT / "packet_sei.wasm"
+_NOTE_ROWS = _BUILT / "note_rows.wasm"
+
+_NOTES = (
+    "CREATE FUNCTION notes(v video_stream, label text DEFAULT 'note')\n"
+    "RETURNS STRUCT(v video_stream, seen STRUCT(pts number, note text)[])\n"
+    f"  AS '{_NOTE_ROWS.as_posix()}', 'note_rows' LANGUAGE wasm;\n"
+)
+_WEAVE_ONE = (
+    "CREATE FUNCTION weave(v video_stream,\n"
+    "                      seen STRUCT(pts number, note text)[])\n"
+    "  RETURNS packets\n"
+    f"  AS '{_PACKET_SEI.as_posix()}', 'packet_sei' LANGUAGE wasm;\n"
+)
+_WEAVE_TWO = (
+    "CREATE FUNCTION weave(v video_stream,\n"
+    "                      faces STRUCT(pts number, note text)[],\n"
+    "                      words STRUCT(pts number, note text)[])\n"
+    "  RETURNS packets\n"
+    f"  AS '{_PACKET_SEI.as_posix()}', 'packet_sei' LANGUAGE wasm;\n"
+)
+
+
+def _require_weaving() -> None:
+    for module in (_PACKET_SEI, _NOTE_ROWS):
+        if not module.exists():
+            pytest.skip(
+                f"module missing: {module} (cargo build --target wasm32-wasip2 "
+                f"--release, from {_SIDECAR_MODULES})"
+            )
+
+
+def _video_bytes(path: Path) -> bytes:
+    """The file's video stream, copied out, for reading what rode in it."""
+    done = subprocess.run(
+        [
+            "ffmpeg", "-v", "error", "-i", str(path),
+            "-map", "0:v:0", "-c", "copy", "-f", "data", "-",
+        ],
+        capture_output=True,
+        timeout=_TIMEOUT,
+        check=False,
+    )
+    assert done.returncode == 0, done.stderr.decode(errors="replace")
+    return done.stdout
+
+
+def _woven(path: Path, text: str) -> int:
+    """How many times `text` appears in the file's video bytes."""
+    return _video_bytes(path).count(text.encode())
+
+
+def test_rows_written_in_one_stage_reach_the_filter_in_the_next(tmp_path: Path) -> None:
+    """The producer's rows go to a document, the document orders the stages,
+    and the filter weaves what it read into packets it copied through."""
+    _require_weaving()
+    out = tmp_path / "woven.mp4"
+    _run(
+        _NOTES
+        + _WEAVE_ONE
+        + "COPY (\n"
+        + "  SELECT weave(f.video[1], notes(f.video[1]).seen), f.audio[1]\n"
+        + f"  FROM input('{_AV.as_posix()}') f\n"
+        + f") TO '{out.as_posix()}'"
+    )
+    plain = tmp_path / "plain.mp4"
+    _run(
+        "COPY (\n"
+        + "  SELECT f.video[1], f.audio[1]\n"
+        + f"  FROM input('{_AV.as_posix()}') f\n"
+        + f") TO '{plain.as_posix()}'"
+    )
+
+    assert _woven(out, "note-0") == 1, "the first note never reached the stream"
+    # A note rides the packet; it does not move one. The audio the filter
+    # never saw is untouched either.
+    assert _packet_times(out, "a") == _packet_times(plain, "a")
+    assert _framemd5(out, "v") == _framemd5(plain, "v")
+    assert _framemd5(out, "a") == _framemd5(plain, "a")
+    # ffmpeg decodes it without complaint, which an ill-framed NAL would not.
+    assert _stream_facts(out, "v")["nb_read_packets"] == _stream_facts(plain, "v")[
+        "nb_read_packets"
+    ]
+
+
+def test_an_encoded_weave_reaches_every_keyframe_at_an_mkv(tmp_path: Path) -> None:
+    """The re-encoding half, at a second container: a short gop gives the
+    filter a keyframe to put nearly every note on, and the pictures are the
+    unfiltered encode's own."""
+    _require_weaving()
+    options = " WITH (video_codec 'libx264', gop 5, preset 'ultrafast', audio_codec 'aac')"
+    out = tmp_path / "woven.mkv"
+    _run(
+        _NOTES
+        + _WEAVE_ONE
+        + "COPY (\n"
+        + "  SELECT weave(f.video[1], notes(f.video[1]).seen), f.audio[1]\n"
+        + f"  FROM input('{_AV.as_posix()}') f\n"
+        + f") TO '{out.as_posix()}'{options}"
+    )
+    plain = tmp_path / "plain.mkv"
+    _run(
+        "COPY (\n"
+        + "  SELECT f.video[1], f.audio[1]\n"
+        + f"  FROM input('{_AV.as_posix()}') f\n"
+        + f") TO '{plain.as_posix()}'{options}"
+    )
+
+    written = _video_bytes(out)
+    assert written.count(b"note-") >= 5, "few notes reached the stream"
+    assert _framemd5(out, "v") == _framemd5(plain, "v")
+    assert _packet_times(out, "v") == _packet_times(plain, "v")
+    assert _packet_times(out, "a") == _packet_times(plain, "a")
+
+
+def test_two_rows_arguments_arrive_tagged_with_the_one_they_filled(
+    tmp_path: Path,
+) -> None:
+    """Two producers, two documents, two `-rows-in`: the host writes the
+    argument's name onto every row, and the module weaves it in, so the
+    stream itself says which argument each note came from."""
+    _require_weaving()
+    out = tmp_path / "two.mp4"
+    _run(
+        _NOTES
+        + _WEAVE_TWO
+        + "COPY (\n"
+        + "  SELECT weave(f.video[1],\n"
+        + "               notes(f.video[1], 'a').seen,\n"
+        + "               notes(ffmpeg.hflip(f.video[1]), 'b').seen)\n"
+        + f"  FROM input('{_AV.as_posix()}') f\n"
+        + f") TO '{out.as_posix()}'"
+    )
+
+    written = _video_bytes(out)
+    assert b"faces:a-0" in written, "the first argument's note is not tagged with it"
+    assert b"words:b-0" in written, "the second argument's note is not tagged with it"
+
+
+def test_a_rows_document_is_a_placeholder_until_a_run_resolves_it() -> None:
+    """A compile prints the same text on every machine: the document is
+    named `ffrwd:rows:<n>` at both ends, and the run is what turns it into a
+    file in its own temporary directory."""
+    _require_weaving()
+    compiled = compile_all(
+        _NOTES
+        + _WEAVE_ONE
+        + "COPY (\n"
+        + "  SELECT weave(f.video[1], notes(f.video[1]).seen)\n"
+        + f"  FROM input('{_AV.as_posix()}') f\n"
+        + ") TO 'out.mp4'"
+    )
+    plan = compiled.plan
+    assert plan is not None
+    shown = render_plan(plan, sidecar_argv=wasm.shown_argv)
+    assert "-f ndjson ffrwd:rows:0" in shown
+    assert "-rows-in seen=ffrwd:rows:0" in shown
+    # Two stages: the document is a file, and a file is finished before what
+    # reads it starts.
+    assert len(plan.stages) == 2
+    (document,) = plan.file_edges
+    assert document.format.path == "ffrwd:rows:0"
+    assert document.source in plan.stages[0].processes
+    assert document.target in plan.stages[1].processes

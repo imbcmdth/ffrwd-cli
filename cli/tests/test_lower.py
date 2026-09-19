@@ -51,7 +51,7 @@ from ffrwd.compiler import compile_sql
 from ffrwd.emit import build_ffmpeg_args, emit
 from ffrwd.errors import ErrorCode, FfrwdError
 from ffrwd.functions import WASM_SOURCE, Parameter, WasmFunction
-from ffrwd.ir import NO_CHAPTERS, NO_METADATA, Attachment, Graph, StreamType
+from ffrwd.ir import NO_CHAPTERS, NO_METADATA, Attachment, Graph, RowsSink, StreamType
 from ffrwd.lower import lower, lower_table
 from ffrwd.parser import Resolved, parse, resolve
 from ffrwd.probe import (
@@ -14439,15 +14439,179 @@ def test_an_encoder_a_packet_filter_does_not_rewrite_is_refused() -> None:
     assert "rewrites h264" in err.message
 
 
-def test_a_packet_filter_that_reads_rows_has_nowhere_to_read_them() -> None:
-    """The placement is there; the rows are not. A module that acts on them
-    would run blind, so it is refused at the call."""
+def test_a_packet_filter_that_reads_rows_needs_a_column_declared() -> None:
+    """A module that acts on rows and is handed none would run blind, so a
+    declaration naming none is refused where any consumer's is."""
     err = _packets_rejects(
         "COPY (SELECT weave(f.video[1]) FROM input('f.mp4') f) TO 'out.mp4'",
         _packets_described(reads_rows=True),
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "reads rows beside its packets" in err.message
+    assert "reads annotations beside its packets" in err.message
+
+
+# --------------------------------------------------------------------------
+# A packet filter's ROWS: written down as documents the run resolves, one per
+# rows argument, rather than riding frames an encoder stands between.
+# --------------------------------------------------------------------------
+
+ROWS_MODULE = "shots.wasm"
+
+ROWS_PRODUCER = (
+    "CREATE FUNCTION shots(v video_stream)\n"
+    "RETURNS STRUCT(v video_stream, notes STRUCT(pts number, note text)[])\n"
+    f"  AS '{ROWS_MODULE}', 'shots' LANGUAGE wasm;\n"
+)
+
+WEAVE_ONE = (
+    "CREATE FUNCTION weave(v video_stream,\n"
+    "                      notes STRUCT(pts number, note text)[])\n"
+    "  RETURNS packets\n"
+    f"  AS '{PACKETS_MODULE}', 'weave' LANGUAGE wasm;\n"
+)
+
+WEAVE_TWO = (
+    "CREATE FUNCTION weave(v video_stream,\n"
+    "                      faces STRUCT(pts number, note text)[],\n"
+    "                      words STRUCT(pts number, note text)[])\n"
+    "  RETURNS packets\n"
+    f"  AS '{PACKETS_MODULE}', 'weave' LANGUAGE wasm;\n"
+)
+
+
+def _rows_producer_described() -> Described:
+    """The shot detector's describe: frames in, frames and rows out."""
+    return Described(
+        world=WORLDS[-1],
+        name="shots",
+        version="0.1.0",
+        params_schema={"type": "object", "additionalProperties": False},
+        rows_schema={
+            "type": "object",
+            "properties": {"pts": {"type": "integer"}, "note": {"type": "string"}},
+        },
+        pixel_formats=("rgb24",),
+    )
+
+
+def _weaving_graph(declare: str, sql: str) -> Graph:
+    return lower(
+        resolve(parse(ROWS_PRODUCER + declare + sql)),
+        _row_probes(_track("video", 0), _track("audio", 0)),
+        registry=_snapshot_registry(),
+        describes={
+            ROWS_MODULE: _rows_producer_described(),
+            PACKETS_MODULE: _packets_described(reads_rows=True),
+        },
+    )
+
+
+def _weaving_rejects(declare: str, sql: str) -> FfrwdError:
+    with pytest.raises(FfrwdError) as caught:
+        _weaving_graph(declare, sql)
+    return caught.value
+
+
+def test_a_packet_filters_rows_are_written_down_rather_than_ridden() -> None:
+    """An encoder stands between the filter and its producer, and ffmpeg
+    drops a stream it does not understand: the rows go to a document of
+    their own, and the filter is told which argument reads it."""
+    g = _weaving_graph(
+        WEAVE_ONE,
+        "COPY (SELECT weave(f.video[1], shots(f.video[1]).notes) "
+        "FROM input('f.mp4') f) TO 'out.mp4'",
+    )
+    (node,) = g.packet_filter_rows
+    assert g.packet_filter_rows[node] == [{"arg": "notes", "path": "ffrwd:rows:0"}]
+    (producer,) = [n for n, sink in g.rows_sinks.items() if sink.path]
+    assert g.rows_sinks[producer] == RowsSink(container="ndjson", path="ffrwd:rows:0")
+    # Nothing wires the producer's frames into the filter: it reads the
+    # encoder's packets, and the rows reach it as a file.
+    assert producer not in g.nodes[node].inputs
+
+
+def test_several_rows_arguments_each_take_a_document_of_their_own() -> None:
+    """One document per argument, in declaration order, so the host can tag
+    every row with the argument it filled."""
+    g = _weaving_graph(
+        WEAVE_TWO,
+        "COPY (SELECT weave(f.video[1], shots(f.video[1]).notes, "
+        "shots(ffmpeg.hflip(f.video[1])).notes) FROM input('f.mp4') f) "
+        "TO 'out.mp4'",
+    )
+    (node,) = g.packet_filter_rows
+    assert g.packet_filter_rows[node] == [
+        {"arg": "faces", "path": "ffrwd:rows:0"},
+        {"arg": "words", "path": "ffrwd:rows:1"},
+    ]
+    assert sorted(s.path for s in g.rows_sinks.values()) == [
+        "ffrwd:rows:0",
+        "ffrwd:rows:1",
+    ]
+
+
+def test_a_rows_argument_written_null_hands_the_filter_none() -> None:
+    """One declaration serves both shapes: NULL is no rows for that
+    argument, and nothing is written for it."""
+    g = _weaving_graph(
+        WEAVE_TWO,
+        "COPY (SELECT weave(f.video[1], shots(f.video[1]).notes, NULL) "
+        "FROM input('f.mp4') f) TO 'out.mp4'",
+    )
+    (node,) = g.packet_filter_rows
+    assert g.packet_filter_rows[node] == [{"arg": "faces", "path": "ffrwd:rows:0"}]
+
+
+def test_a_rows_argument_that_produces_no_column_is_refused() -> None:
+    with pytest.raises(FfrwdError) as caught:
+        lower(
+            resolve(
+                parse(
+                    WEAVE_ONE
+                    + "COPY (SELECT weave(f.video[1], f.video[1]) "
+                    "FROM input('f.mp4') f) TO 'out.mp4'"
+                )
+            ),
+            _row_probes(_track("video", 0)),
+            registry=_snapshot_registry(),
+            describes={PACKETS_MODULE: _packets_described(reads_rows=True)},
+        )
+    assert caught.value.code is ErrorCode.UDF_ARG_TYPE
+    assert "produces no annotation column" in caught.value.message
+
+
+def test_a_packets_call_counts_its_rows_arguments_as_arguments() -> None:
+    """The rows a packet filter reads are written at the call, so the arity
+    it reports counts them -- a frame filter's column is covered by the
+    stream argument beside it and is not one."""
+    err = _weaving_rejects(
+        WEAVE_ONE,
+        "COPY (SELECT weave(f.video[1], shots(f.video[1]).notes, NULL) "
+        "FROM input('f.mp4') f) TO 'out.mp4'",
+    )
+    assert err.code is ErrorCode.UDF_ARG_TYPE
+    assert "got 3 arguments, but it declares 2" in err.message
+
+
+def test_only_a_packet_filter_declares_several_annotation_columns() -> None:
+    """A frame filter's rows ride the stream they were read off, and one
+    stream carries one column."""
+    declare = (
+        "CREATE FUNCTION blur(v video_stream,\n"
+        "                     a STRUCT(pts number, note text)[],\n"
+        "                     b STRUCT(pts number, note text)[])\n"
+        "  RETURNS video_stream\n"
+        f"  AS '{ROWS_MODULE}', 'shots' LANGUAGE wasm;\n"
+    )
+    with pytest.raises(FfrwdError) as caught:
+        resolve(
+            parse(
+                declare
+                + "COPY (SELECT blur(f.video[1]) FROM input('f.mp4') f) TO 'o.mp4'"
+            )
+        )
+    assert caught.value.code is ErrorCode.UNSUPPORTED_SQL
+    assert "takes the annotation column 'b' in position 3" in caught.value.message
 
 
 def test_a_packets_call_inside_a_cte_body_is_refused() -> None:

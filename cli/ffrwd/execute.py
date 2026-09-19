@@ -136,6 +136,7 @@ from . import loudnorm, pipes
 from .console import Work, WorkProgress
 from .emit import Emitted, build_ffmpeg_commands, build_process_args
 from .errors import ErrorCode, FfrwdError
+from .ir import is_rows_document
 from .pipes import NamedPipe
 from .processes import (
     FfmpegProcess,
@@ -161,6 +162,7 @@ __all__ = [
     "PipeNamer",
     "PlanResult",
     "ProcessResult",
+    "RowsNamer",
     "Side",
     "SidecarArgv",
     "StageResult",
@@ -585,6 +587,11 @@ PipeEdge = StreamEdge | RowsEdge
 # cannot carry.
 PipeNamer = Callable[[PipeEdge, Side], str]
 
+# Names the real file one rows DOCUMENT placeholder stands for. Called once
+# per distinct placeholder in a plan; a caller giving none leaves the
+# placeholders as they are, which is what a printed command shows.
+RowsNamer = Callable[[str], str]
+
 # Renders one sidecar process as the argv that runs it, given the path each
 # stream it reads arrives on and the path each rows document it writes goes
 # to. The real one lands with the sidecar itself; until then a caller
@@ -805,6 +812,7 @@ def plan_argv(
     *,
     sidecar_argv: SidecarArgv | None = None,
     pipe_path: PipeNamer | None = None,
+    rows_path: RowsNamer | None = None,
 ) -> dict[str, list[str]]:
     """The argv that runs each process of `plan`, keyed by process id.
 
@@ -816,6 +824,11 @@ def plan_argv(
     wasm module.
 
     `pipe_path` names a named pipe, and is called once per end that needs one.
+
+    `rows_path` names the file each rows DOCUMENT placeholder stands for, and
+    is called once per distinct placeholder. Without it the placeholders are
+    left as they are, which is what a printed command shows and what keeps a
+    compile the same text on every machine.
     """
     read: dict[PipeEdge, str] = {}
     write: dict[PipeEdge, str] = {}
@@ -850,7 +863,34 @@ def plan_argv(
             pipe_outputs=[(write[edge], edge.format) for edge in outgoing],
             pipe_buffers=[edge.buffer for edge in outgoing],
         )
-    return argv
+    return _resolve_rows_documents(argv, rows_path)
+
+
+def _resolve_rows_documents(
+    argv: dict[str, list[str]], rows_path: RowsNamer | None
+) -> dict[str, list[str]]:
+    """Every rows DOCUMENT placeholder in `argv` replaced by its real file.
+
+    Both ends of a document are argv tokens -- the writer's ``-f ndjson
+    <path>`` and the reader's ``-rows-in <arg>=<path>`` -- so one pass over
+    the tokens is what keeps the two agreeing. Without a namer nothing
+    changes: the placeholder is what a printed command shows.
+    """
+    if rows_path is None:
+        return argv
+    named: dict[str, str] = {}
+
+    def resolve(token: str) -> str:
+        arg, sep, path = token.partition("=")
+        if sep and is_rows_document(path):
+            return f"{arg}={resolve(path)}"
+        if not is_rows_document(token):
+            return token
+        if token not in named:
+            named[token] = rows_path(token)
+        return named[token]
+
+    return {pid: [resolve(token) for token in args] for pid, args in argv.items()}
 
 
 def _sidecar_writes(
@@ -1068,19 +1108,31 @@ def execute_plan(
     writes the plan's destinations (:func:`terminal_member`). Every other
     member's stderr is collected as it always was.
 
-    Named pipes and any temporary directory holding them are removed before
-    this returns, whether the plan finished or failed.
+    Named pipes, the rows DOCUMENTS a packet filter reads, and the temporary
+    directory holding them are removed before this returns, whether the plan
+    finished or failed.
     """
     stack = contextlib.ExitStack()
     try:
         served: dict[tuple[PipeEdge, Side], NamedPipe] = {}
         home: list[Path] = []
 
-        def pipe_path(edge: PipeEdge, side: Side) -> str:
+        def workspace() -> Path:
             if not home:
                 home.append(
                     Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="ffrwd-")))
                 )
+            return home[0]
+
+        def rows_path(placeholder: str) -> str:
+            # A rows document is an ordinary file in the run's own directory,
+            # which goes with the directory when the run ends -- whether it
+            # finished or failed.
+            name = placeholder.rpartition(":")[2] or "0"
+            return str(workspace() / f"rows-{name}.ndjson")
+
+        def pipe_path(edge: PipeEdge, side: Side) -> str:
+            workspace()
             # A named pipe on the consumer's side is one this process writes.
             pipe = pipes.create(
                 home[0],
@@ -1092,7 +1144,12 @@ def execute_plan(
             served[(edge, side)] = pipe
             return pipe.path
 
-        argv = plan_argv(plan, sidecar_argv=sidecar_argv, pipe_path=pipe_path)
+        argv = plan_argv(
+            plan,
+            sidecar_argv=sidecar_argv,
+            pipe_path=pipe_path,
+            rows_path=rows_path,
+        )
         assigned = wires(plan)
         terminal = terminal_member(plan) if work is not None else None
 

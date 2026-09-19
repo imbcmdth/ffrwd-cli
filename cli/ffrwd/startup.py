@@ -32,6 +32,16 @@ its producer wait, sooner or later, for that consumer to be reading -- and
 the order has to be right on its own, with the depths as headroom rather than
 as an excuse.
 
+A rows DOCUMENT is not one of these edges at all. The rows a packet filter
+reads are a FILE, and the file edge naming it puts the writing stage ahead of
+the reading one (:attr:`~ffrwd.processes.ProcessPlan.stages`), so by the time
+the filter's process exists the file is finished and opening it waits for
+nothing. That is what costs a second pass over the input where the rows
+producer reads the same one the encoder does: the two cannot share a read and
+still be ordered, and a file reads twice for nothing but time. A live input
+does not, which is where :func:`~ffrwd.processes.check_spellable` refuses the
+plan instead of letting the filter read a file still being written.
+
 :func:`relation` is that reasoning as data -- each milestone and what must
 happen before it -- and :func:`stalled` is the cycle in it, if there is one.
 :func:`check` refuses a plan that has one, naming the processes that wait on

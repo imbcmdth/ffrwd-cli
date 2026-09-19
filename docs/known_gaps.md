@@ -28,14 +28,13 @@ output is plain ffmpeg, so the two mix freely in a script.
 - Options typed `binary` or `dictionary`: setting one is
   `FILTER_OPTION_TYPE`; the filter's other options work.
 - Runtime filter commands (`sendcmd`, `zmq`).
-- A wasm module exporting `packet-filter` that READS ROWS. The
-  placement is there -- a `RETURNS packets` call in a COPY's SELECT
-  compiles to encoder, filter, muxer -- but the rows such a filter reads
-  have no spelling: they reach the sidecar on `-rows-in`, which needs a
-  rows file the plan writes before the filter's stage starts, and
-  nothing emits one. A module declaring `reads-rows`, and a declaration
-  with an annotation parameter, are `UNSUPPORTED_SQL` at the call. Rows
-  arriving on a pipe while the packets flow is further out still.
+- LIVE rows into a packet filter. The rows a filter reads are a FILE,
+  written in full by an earlier stage, which is what lets a module see
+  every row before packet one. Rows arriving on a pipe while the packets
+  flow is a different shape, and nothing builds it: a query whose rows
+  producer cannot be put in a stage of its own -- it and the encoder both
+  reading one live input, which is opened once and handed round -- is
+  `UNSUPPORTED_SQL` saying so.
 - A packet filter at a MANIFEST destination. One filter instance per
   rendition row is the shape it would take, and the planner treats each
   pad as its own encoded stream already; what is missing is a manifest
@@ -45,6 +44,18 @@ output is plain ffmpeg, so the two mix freely in a script.
 
 ## Sharp edges
 
+- **A packet filter's rows cost a second pass over the input.** The rows
+  it reads are a file, and a file is finished before whatever reads it
+  starts -- so a producer reading the same input the encoder reads runs
+  in a stage of its own, and the input is opened twice. For a file that
+  is time, not correctness, and it is what makes the rows a module sees
+  complete. For a live input it is impossible, and the plan is refused.
+- **A packet filter sees the framing its container used.** h264 travels
+  Annex B from an encoder and length-prefixed (`avcC`) out of an MP4,
+  and the packets reach a filter exactly as they were. A module that
+  rewrites NAL units must read `coded.extradata` and write the framing
+  it finds there; one that assumes Annex B corrupts a stream-copied MP4
+  rather than failing.
 - **Stream-copied splits snap to keyframes.** An output fan-out that
   splits by chapter (or any time window) with stream copy starts each
   piece at the nearest preceding keyframe, exactly as ffmpeg does.

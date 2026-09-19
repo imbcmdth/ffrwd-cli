@@ -102,6 +102,8 @@ struct State {
     /// The distinct `_arg` values seen, in the order they first arrived.
     /// Empty where the rows came in unnamed.
     args: Vec<String>,
+    /// How the stream frames its NALs, read off `init`'s extradata.
+    framing: Framing,
 }
 
 /// What the instance saw of its rows, emitted once at the end.
@@ -124,13 +126,57 @@ fn validate_params(params: &str) -> Result<(), String> {
     }
 }
 
-/// One `user_data_unregistered` SEI NAL in Annex B framing, carrying `notes`
-/// joined by newlines. `payload_size` is coded the way the standard says:
-/// `0xff` for each whole 255, then the remainder.
+/// How this stream frames its NALs, read off the codec's out-of-band header.
+///
+/// An h264 stream travels one of two ways and a filter rewriting NALs has to
+/// know which: Annex B prefixes each with a start code, and the `avcC`
+/// framing an MP4 uses prefixes each with its own length. The header says
+/// so -- `avcC` begins with a version byte of 1 and carries the length size
+/// in its fifth -- and a stream copied out of an MP4 arrives framed the
+/// second way, where an encoder writing into NUT arrives framed the first.
+#[derive(Clone, Copy, Default)]
+enum Framing {
+    #[default]
+    AnnexB,
+    Length(usize),
+}
+
+impl Framing {
+    fn read(extradata: &[u8]) -> Framing {
+        if extradata.len() >= 5 && extradata[0] == 1 {
+            return Framing::Length((extradata[4] & 0x03) as usize + 1);
+        }
+        Framing::AnnexB
+    }
+
+    /// `nal`, without its framing, written the way this stream frames one.
+    fn frame(self, nal: Vec<u8>) -> Vec<u8> {
+        match self {
+            Framing::AnnexB => {
+                let mut framed = vec![0x00, 0x00, 0x00, 0x01];
+                framed.extend_from_slice(&nal);
+                framed
+            }
+            Framing::Length(size) => {
+                let mut framed = Vec::with_capacity(size + nal.len());
+                let length = nal.len();
+                for shift in (0..size).rev() {
+                    framed.push(((length >> (shift * 8)) & 0xff) as u8);
+                }
+                framed.extend_from_slice(&nal);
+                framed
+            }
+        }
+    }
+}
+
+/// One `user_data_unregistered` SEI NAL, unframed, carrying `notes` joined by
+/// newlines. `payload_size` is coded the way the standard says: `0xff` for
+/// each whole 255, then the remainder.
 fn sei_nal(notes: &[&str]) -> Vec<u8> {
     let text = notes.join("\n");
     let payload_size = UUID.len() + text.len();
-    let mut nal = vec![0x00, 0x00, 0x00, 0x01, 0x06, 0x05];
+    let mut nal = vec![0x06, 0x05];
     let mut left = payload_size;
     while left >= 255 {
         nal.push(0xff);
@@ -148,6 +194,7 @@ fn sei_nal(notes: &[&str]) -> Vec<u8> {
 /// each keyframe woven into it. Rows this call consumed leave `pending`.
 fn weave(
     pad: u32,
+    framing: Framing,
     packets: Vec<Packet>,
     pending: &mut Vec<NoteRow>,
     rows: &mut Vec<String>,
@@ -169,7 +216,9 @@ fn weave(
                 return packet;
             }
             let texts: Vec<String> = due.iter().map(NoteRow::text).collect();
-            let nal = sei_nal(&texts.iter().map(String::as_str).collect::<Vec<&str>>());
+            let nal = framing.frame(sei_nal(
+                &texts.iter().map(String::as_str).collect::<Vec<&str>>(),
+            ));
             rows.push(
                 serde_json::to_string(&WovenRow {
                     pad,
@@ -224,10 +273,12 @@ impl Guest for PacketSei {
                 streams.len()
             ));
         }
+        let framing = Framing::read(&streams[0].coded.extradata);
         STATE.with(|s| {
             *s.borrow_mut() = State {
                 pads: streams.len(),
                 held: vec![Vec::new(); streams.len()],
+                framing,
                 ..State::default()
             }
         });
@@ -267,7 +318,13 @@ impl Guest for PacketSei {
             for (index, carried) in pads.into_iter().enumerate() {
                 let releasing = std::mem::replace(&mut state.held[index], carried.packets);
                 let mut pending = std::mem::take(&mut state.pending);
-                let packets = weave(index as u32, releasing, &mut pending, &mut written);
+                let packets = weave(
+                    index as u32,
+                    state.framing,
+                    releasing,
+                    &mut pending,
+                    &mut written,
+                );
                 state.pending = pending;
                 out.push(PadPackets { packets });
             }
@@ -277,8 +334,13 @@ impl Guest for PacketSei {
                 for (index, pad) in out.iter_mut().enumerate() {
                     let flushing = std::mem::take(&mut state.held[index]);
                     let mut pending = std::mem::take(&mut state.pending);
-                    pad.packets
-                        .extend(weave(index as u32, flushing, &mut pending, &mut written));
+                    pad.packets.extend(weave(
+                        index as u32,
+                        state.framing,
+                        flushing,
+                        &mut pending,
+                        &mut written,
+                    ));
                     state.pending = pending;
                 }
             }

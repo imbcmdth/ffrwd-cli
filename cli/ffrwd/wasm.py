@@ -308,6 +308,11 @@ _ROWS_FROM_FLAG = "-rows-from"
 # document on the line needs no such flag: it is the only one there is.
 _ROWS_FLAG = "-rows"
 
+# Where a packet FILTER's rows come from, repeated once per rows argument:
+# ``-rows-in <arg>=<path>``, the argument named so the sidecar can write it
+# onto every row that input delivers.
+_ROWS_IN_FLAG = "-rows-in"
+
 # How one of a packet source's outputs is told which track of the module's
 # catalog it carries, 0-based. The tracks the outputs name are what the
 # source subscribes to.
@@ -1654,11 +1659,25 @@ def _argv(
         argv += ["-m", process.module]
         if process.args:
             argv += ["-params", json.dumps(process.args, sort_keys=True)]
+        argv += _rows_in_args(process)
         argv += _rows_module_args(process)
         tracks, documents = _split_writes(process, writes)
         argv += rows_args(process, documents) or _stream_output(process, tracks)
     if process.writes_rows:
         argv += [_ANNOTATIONS_FLAG, ANNOTATIONS_OUT]
+    return argv
+
+
+def _rows_in_args(process: SidecarProcess) -> list[str]:
+    """One ``-rows-in <arg>=<path>`` per rows document this filter reads.
+
+    In declaration order, and named: the sidecar writes the argument's name
+    onto every row it delivers from that input, which is how a filter
+    reading several rows arguments tells them apart.
+    """
+    argv: list[str] = []
+    for read in process.rows_in:
+        argv += [_ROWS_IN_FLAG, f"{read.arg}={read.path}"]
     return argv
 
 
