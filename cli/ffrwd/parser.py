@@ -448,6 +448,10 @@ _UNNEST_HINT = (
     "unnest takes one bare array column of an input alias and needs a name for "
     "its rows, e.g. FROM input('film.mkv') f, unnest(f.audio) t"
 )
+_PACKET_ROWS_SOURCE_HINT = (
+    "a packet sink read in FROM reads one stream of an input as it is on "
+    "disk, e.g. FROM input('film.mp4') f, records(f.video[1]) v"
+)
 _SERIES_HINT = (
     "generate_series(start, stop[, step]) takes integer literals only -- a "
     "substituted variable is fine (generate_series(1, :count)), a column "
@@ -2147,6 +2151,29 @@ class RawWasmSource:
 
 
 @dataclass(frozen=True)
+class RawPacketRows:
+    """``FROM <name>(<stream>, <values>) alias`` where ``<name>`` is a wasm
+    function returning rows over a stream: a packet sink read while compiling.
+
+    A ROW SOURCE, bound the kind an ``unnest`` table is -- its rows are a
+    compile-time relation like a caption track's cues, read out of the
+    stream's own encoded packets rather than out of a demuxed track.
+    `source` is the input alias the stream argument reads, written before
+    this item; `stream_node` is that argument, the anchor for anything lower
+    rejects about it, and `call_node` is the call itself.
+    `columns`/`types` are what the declaration says one row carries.
+    """
+
+    alias: str
+    name: str
+    source: str
+    stream_node: exp.Expr
+    call_node: exp.Expr
+    columns: tuple[str, ...]
+    types: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class RawRowJoin:
     """How one FROM item attaches to the ones before it.
 
@@ -2306,6 +2333,12 @@ class Resolved:
     resolve scope, so the rendition-column admissions apply to it exactly as
     they do to ``input(...)``; its rows are the module's own catalog
     (``Resolved.wasm[name]``), not a probe."""
+
+    packet_rows: dict[str, RawPacketRows] = field(default_factory=dict)
+    """``FROM <packet sink>(<stream>, ...) alias`` records, keyed by ROW
+    alias, in FROM order across the whole script. Bound as a ROW alias, like
+    an ``unnest`` table: the rows are a compile-time relation, read out of
+    the stream's own encoded packets by the module the declaration names."""
 
     track_rows: dict[str, RawTrackRows] = field(default_factory=dict)
     """``unnest(<input>.<type>) alias`` records, keyed by ROW alias, in FROM
@@ -3688,6 +3721,7 @@ class _Resolver:
         self.input_anchors: dict[str, tuple[int, int]] = {}
         self.source_filters: dict[str, RawSource] = {}
         self.wasm_sources: dict[str, RawWasmSource] = {}
+        self.packet_rows: dict[str, RawPacketRows] = {}
         self.track_rows: dict[str, RawTrackRows] = {}
         self.struct_rows: dict[str, RawValuesTable] = {}
         # The struct row tables THIS branch's FROM clause binds, by the local
@@ -3809,6 +3843,7 @@ class _Resolver:
             input_anchors=self.input_anchors,
             source_filters=self.source_filters,
             wasm_sources=self.wasm_sources,
+            packet_rows=self.packet_rows,
             track_rows=self.track_rows,
             struct_rows=self.struct_rows,
             series=self.series,
@@ -4167,6 +4202,7 @@ class _Resolver:
             or name in self.sources
             or name in self.source_filters
             or name in self.wasm_sources
+            or name in self.packet_rows
             or name in self.track_rows
             or name in self.struct_rows
             or name in self.series
@@ -5934,6 +5970,9 @@ class _Resolver:
             if declared is not None and declared.is_source:
                 self._add_wasm_source(table, inner, declared, alias_node, scope)
                 return
+            if declared is not None and declared.is_packet_rows:
+                self._add_packet_rows(table, inner, declared, alias_node, scope)
+                return
             self._add_input(table, inner, alias_node, scope)
             return
         if isinstance(inner, exp.Identifier):
@@ -6487,6 +6526,151 @@ class _Resolver:
         self.wasm_sources[alias] = RawWasmSource(alias=alias, name=declared.name, call_node=call)
         scope[alias] = "input"
 
+    def _add_packet_rows(
+        self,
+        table: exp.Table,
+        call: exp.Anonymous,
+        declared: WasmFunction,
+        alias_node: exp.Expr | None,
+        scope: dict[str, str],
+    ) -> None:
+        """``FROM <name>(<stream>, <values>) alias`` where ``<name>`` returns
+        rows over a stream: a packet sink whose rows are read while compiling.
+
+        Where the call is written is what it means. The same module after
+        ``TO`` is a run-time destination and nothing here applies to it; in
+        FROM it is a row table, and the rows are read now.
+
+        The first argument names a stream of an ``input(...)`` written
+        earlier in the same FROM -- Postgres scopes an implicit-LATERAL call
+        to the items before it, the same rule an ``unnest`` follows. Only an
+        input: a compile-time read reads a file as it is on disk, and there
+        is no file under a filtered stream or one another query stage built.
+        Past it every argument is a value, exactly as a source's are.
+        """
+        arguments = [a for a in call.expressions if isinstance(a, exp.Expr)]
+        if not arguments:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"{declared.name}() reads a stream and was given none",
+                call,
+                fallback=table,
+                hint=f"write the stream it reads: {declared.name}(f.video[1])",
+            )
+        source = self._packet_rows_source(table, call, declared, arguments[0], scope)
+        for argument in arguments[1:]:
+            value = (
+                argument.args.get("expression")
+                if isinstance(argument, exp.Kwarg)
+                else argument
+            )
+            anchor = value if isinstance(value, exp.Expr) else argument
+            if not isinstance(value, exp.Expr) or not _is_wasm_source_argument(value):
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"{declared.name}() reads one stream; its other arguments "
+                    "are values",
+                    anchor,
+                    fallback=table,
+                    hint=f"{declared.name}(...) takes the stream it reads and "
+                    "then literals and substituted variables",
+                )
+        if not isinstance(alias_node, exp.TableAlias) or alias_node.this is None:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"{declared.name}() requires an alias",
+                call,
+                fallback=table,
+                hint=f"add an alias, e.g. FROM {declared.name}(f.video[1]) v",
+            )
+        alias = _ident_name(alias_node.this)
+        self._reserve(alias, alias_node.this)
+        if alias in scope:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL, f"duplicate name '{alias}'", alias_node.this
+            )
+        fields = declared.returns_rows.fields if declared.returns_rows else ()
+        columns = tuple(f.name for f in fields)
+        types = tuple(f.type for f in fields)
+        self.packet_rows[alias] = RawPacketRows(
+            alias=alias,
+            name=declared.name,
+            source=source,
+            stream_node=arguments[0],
+            call_node=call,
+            columns=columns,
+            types=types,
+        )
+        # The declaration fixes the shape, so the written-row machinery types
+        # the alias's columns for free -- the same schema-only table
+        # `generate_series` registers for its one column.
+        self.values_rows[alias] = RawValuesTable(
+            alias=alias, columns=columns, rows=(), node=call, types=types
+        )
+        scope[alias] = "row"
+        self.row_aliases.add(alias)
+
+    def _packet_rows_source(
+        self,
+        table: exp.Table,
+        call: exp.Anonymous,
+        declared: WasmFunction,
+        argument: exp.Expr,
+        scope: dict[str, str],
+    ) -> str:
+        """The input alias a packet-sink call's stream argument reads, checked.
+
+        ``f.video[1]`` and ``f.audio[1]`` and nothing else: a bare column, or
+        one subscript over it. What is refused here is refused by SHAPE --
+        that the argument is not a stream OF AN INPUT -- and which stream of
+        that input it is stays lower's to settle.
+        """
+        node = argument
+        if isinstance(node, exp.Bracket):
+            inner = node.this
+            node = inner if isinstance(inner, exp.Expr) else node
+        if not isinstance(node, exp.Column) or isinstance(node.this, exp.Star):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"{declared.name}() reads a file's own packets, and this is "
+                "not a stream of one",
+                argument,
+                fallback=call,
+                hint=_PACKET_ROWS_SOURCE_HINT,
+            )
+        table_node = node.args.get("table")
+        if table_node is None or node.args.get("db") or node.args.get("catalog"):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"unqualified column '{node.name}' in {declared.name}()",
+                node,
+                fallback=call,
+                hint=_PACKET_ROWS_SOURCE_HINT,
+            )
+        source = _ident_name(table_node)
+        kind = scope.get(source)
+        if kind is None:
+            raise _error(
+                ErrorCode.UNKNOWN_ALIAS,
+                f"unknown alias '{source}'",
+                table_node,
+                fallback=call,
+                hint=self._known_hint(scope),
+            )
+        if kind != "input" or source in self.wasm_sources:
+            what = "a track-row table" if kind == "row" else f"a {kind}"
+            if source in self.wasm_sources:
+                what = "a module source"
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"'{source}' is {what}, and a compile-time read needs a "
+                "stream of a file as it is on disk",
+                table_node,
+                fallback=call,
+                hint=_PACKET_ROWS_SOURCE_HINT,
+            )
+        return source
+
     def _add_source(
         self,
         table: exp.Table,
@@ -6836,9 +7020,10 @@ class _Resolver:
         schema = values.schema()
         name = _ident_name(column.this)
         if name == ROW_STREAM and not column.this.args.get("quoted"):
+            what = "a packet row" if alias in self.packet_rows else "a written row"
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
-                f"'{alias}' is a written row, not a stream",
+                f"'{alias}' is {what}, not a stream",
                 column,
                 fallback=select,
                 hint=f"read its columns instead, e.g. {alias}.{values.columns[0]}",

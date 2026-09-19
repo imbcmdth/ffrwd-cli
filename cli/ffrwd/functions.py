@@ -222,6 +222,17 @@ _WASM_SOURCE_HINT = (
     "number or boolean, the values it is configured with"
 )
 _WASM_SOURCE_CALL_HINT = "a source is called in FROM: FROM <name>(<values>) <alias>"
+# A PACKET ROWS function: a rows-array RETURNS written over a STREAM rather
+# than over rows. The module is a packet sink, and the call is a FROM item
+# whose rows the compiler reads while it compiles.
+_WASM_PACKET_ROWS_HINT = (
+    "a packet sink read in FROM takes one stream and returns its rows: "
+    "<name>(<stream> video_stream, ...) RETURNS STRUCT(<column> <type>, ...)[]"
+)
+_WASM_PACKET_ROWS_CALL_HINT = (
+    "a packet sink whose rows are a relation is called in FROM over a stream "
+    "of an input: FROM input('<path>') f, <name>(f.video[1]) <alias>"
+)
 # The type name `vector` spells: sqlglot parses it as its own DataType (it
 # knows pgvector's), so it reads back through `_type_name` like any other
 # scalar, but it is never a NAMEABLE type -- only a value function's own
@@ -484,7 +495,14 @@ class WasmFunction:
     stream_field: str = ""
     # The record the RETURNS declares for a ROWS function -- one that reads
     # rows and writes rows, with no stream anywhere. None for every other kind.
+    # It is also what a PACKET ROWS function declares, where the same record
+    # is written over a stream instead; `reads_packets` is what tells the two
+    # apart.
     returns_rows: Annotation | None = None
+    # True where the rows the RETURNS declares are read off a STREAM's own
+    # encoded packets: the module is a packet sink, and the call is a FROM
+    # item the compiler evaluates while it compiles.
+    reads_packets: bool = False
     # Which statement of the script declared this, the same counter a sql
     # function's carries: what "used before it is defined" compares against.
     position: int = 0
@@ -503,6 +521,7 @@ class WasmFunction:
             and not self.is_packets
             and not self.is_source
             and not self.is_rows
+            and not self.is_packet_rows
         )
 
     @property
@@ -513,7 +532,19 @@ class WasmFunction:
         beside the one producing its rows, in that sidecar, and its result is
         a row column of the declared record.
         """
-        return self.returns_rows is not None
+        return self.returns_rows is not None and not self.reads_packets
+
+    @property
+    def is_packet_rows(self) -> bool:
+        """True for a PACKET ROWS function: a stream in, a relation out.
+
+        The same rows-array RETURNS a ROWS function declares, written over a
+        stream instead of over rows. The module is a packet sink, and where
+        the call is written is what it means: after ``TO`` such a module is a
+        run-time destination, and in ``FROM`` over a stream of an input its
+        rows are read while the query compiles.
+        """
+        return self.returns_rows is not None and self.reads_packets
 
     @property
     def rows_param(self) -> Annotation:
@@ -577,7 +608,7 @@ class WasmFunction:
             )
         written = (
             self.params[0].type
-            if (self.is_sink or self.is_packets) and self.params
+            if (self.is_sink or self.is_packets or self.is_packet_rows) and self.params
             else self.returns
         )
         kind = WASM_STREAM_TYPES.get(element_type(written))
@@ -646,9 +677,10 @@ class WasmFunction:
         """The annotation column this function takes BESIDE a stream.
 
         None for a ROWS function, whose rows are the whole argument rather
-        than a column riding one: :attr:`rows_param` is that one.
+        than a column riding one: :attr:`rows_param` is that one. None for a
+        PACKET ROWS function too, whose rows are what it hands back.
         """
-        if self.is_value or self.is_rows:
+        if self.is_value or self.is_rows or self.is_packet_rows:
             return None
         after = self.stream_arity
         return self.params[after].annotation if len(self.params) > after else None
@@ -1529,6 +1561,86 @@ def _define_wasm_rows(
     )
 
 
+def _define_wasm_packet_rows(
+    name: str,
+    module: str,
+    export: str,
+    params: tuple[Parameter, ...],
+    returns: str,
+    returns_rows: Annotation,
+    identifier: exp.Identifier,
+    create: exp.Create,
+) -> WasmFunction:
+    """One validated PACKET ROWS declaration: one stream in, its rows out.
+
+    The rows-array RETURNS of a ROWS function written over a stream. The
+    module behind it is a packet sink -- the same module a ``RETURNS sink``
+    declaration makes a COPY destination -- and this declaration is what
+    makes its rows readable as a relation.
+
+    One stream, never an array: the compiler reads one stream of one file at
+    a time, and a ladder is the call written over each rendition row. Then
+    any number of value parameters, which become the module's own exactly as
+    a sink's do. There is no annotation column: the rows are what it hands
+    back, not something riding its packets.
+    """
+    stream = params[0]
+    if is_array(stream.type):
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"wasm function '{name}' returns rows and takes '{stream.name}' as "
+            f"{stream.type}",
+            identifier,
+            fallback=create,
+            hint="a packet sink read in FROM reads one stream; a ladder is the "
+            "call written over each rendition row",
+        )
+    if len(_leading_streams(params)) > 1:
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"wasm function '{name}' returns rows and takes "
+            f"{len(_leading_streams(params))} streams",
+            identifier,
+            fallback=create,
+            hint="a packet sink read in FROM reads one stream; a ladder is the "
+            "call written over each rendition row",
+        )
+    for param in params[1:]:
+        if param.annotation is not None:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"wasm function '{name}' takes the stream '{stream.name}' and "
+                f"the annotation column '{param.name}'",
+                identifier,
+                fallback=create,
+                hint=_WASM_ROWS_HINT
+                + "; a packet sink read in FROM reads one stream and returns "
+                "its rows -- this declares both",
+            )
+        if param.type not in _ANNOTATION_FIELD_TYPES:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"wasm function '{name}' takes '{param.name}' as {param.type}",
+                identifier,
+                fallback=create,
+                hint=_WASM_PACKET_ROWS_HINT
+                + "; past the stream its parameters are the values it is "
+                "configured with: " + ", ".join(_ANNOTATION_FIELD_TYPES),
+            )
+    line, col = _pos(identifier, create)
+    return WasmFunction(
+        name=name,
+        module=module,
+        export=export,
+        params=params,
+        returns=returns,
+        returns_rows=returns_rows,
+        reads_packets=True,
+        line=line,
+        col=col,
+    )
+
+
 def _define_wasm_value(
     name: str,
     module: str,
@@ -1646,12 +1758,27 @@ def _define_wasm(
             # STRUCT(...)[] has no name in the type vocabulary.
             returns_rows = _annotation(node, _ROWS_RETURN, name, identifier)
             if returns_rows is not None:
+                # What the FIRST parameter is says which of the two the
+                # declaration means: rows in, rows out is a ROWS function;
+                # a stream in, rows out is a packet sink read in FROM.
+                written_returns = _type_name(node) or returns_rows.written
+                if params and element_type(params[0].type) in WASM_STREAM_TYPES:
+                    return _define_wasm_packet_rows(
+                        name,
+                        module,
+                        export,
+                        params,
+                        written_returns,
+                        returns_rows,
+                        identifier,
+                        create,
+                    )
                 return _define_wasm_rows(
                     name,
                     module,
                     export,
                     params,
-                    _type_name(node) or returns_rows.written,
+                    written_returns,
                     returns_rows,
                     identifier,
                     create,
@@ -1981,7 +2108,7 @@ def _not_a_table(declared: WasmFunction, item: exp.Table) -> FfrwdError | None:
     still be refused downstream until that half lands.
     """
     written = declared.called
-    if declared.is_source:
+    if declared.is_source or declared.is_packet_rows:
         return None
     if declared.is_sink:
         return _error(
@@ -3411,6 +3538,17 @@ class _Expander:
                     "call is not in FROM",
                     node,
                     hint=_WASM_SOURCE_CALL_HINT,
+                )
+            if declared.is_packet_rows:
+                # As above: a Table-position call is skipped before this
+                # loop sees it, so anything reaching here is written where
+                # a stream or a value belongs.
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"function '{declared.name}' returns rows read off a "
+                    "stream's packets, and this call is not in FROM",
+                    node,
+                    hint=_WASM_PACKET_ROWS_CALL_HINT,
                 )
             self._check_wasm_position(declared, node, position)
             arguments = [

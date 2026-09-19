@@ -37,25 +37,28 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, Protocol, cast
 
-from . import binaries, nn
+from . import binaries, nn, probe
 from .emit import build_network_graph
 from .errors import ErrorCode, FfrwdError
 from .execute import STDIN, STDOUT
-from .ir import StreamType
+from .ir import RowsSink, StreamType
 from .probe import ProbeResult, RenditionMeta, StreamMeta
 from .processes import (
     NUT,
     PCM_F32LE,
     PCM_S16LE,
     AudioFormat,
+    EffectGrant,
     ModelBinding,
     ModuleShape,
     PadMeta,
+    RowsDocument,
     SidecarProcess,
 )
 
@@ -83,6 +86,8 @@ __all__ = [
     "Described",
     "DescribedFunction",
     "Invoke",
+    "PacketRead",
+    "ReadPackets",
     "SourceCatalog",
     "SourceRendition",
     "SourceTrack",
@@ -99,7 +104,9 @@ __all__ = [
     "language_tag",
     "model_binding",
     "model_path",
+    "copy_argv",
     "probe_source",
+    "read_packet_rows",
     "rows_arms",
     "rows_fields",
     "rows_vector_dims",
@@ -1170,6 +1177,326 @@ def _first_line(text: str) -> str:
         if stripped:
             return stripped
     return "it wrote nothing"
+
+
+def _last_line(text: str) -> str:
+    """The last non-blank line a process wrote, for a message.
+
+    ffmpeg says what it was doing first and what went wrong last, and a
+    sidecar that fails mid-run does the same: the last line is the cause.
+    """
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return lines[-1] if lines else "it wrote nothing"
+
+
+# -- reading a packet sink's rows while compiling --------------------------
+#
+# The run-time arrangement, run now: one ffmpeg stream-copying one stream as
+# coded NUT onto a pipe, one sidecar hosting the sink on the other end,
+# writing its rows as NDJSON. `read_packet_rows` runs the pair; `lower` is
+# what decides there is a question to ask.
+
+# The rows document a packet sink writes, and the specifier every flag on the
+# copy's one output stream carries.
+_ROWS_FORMAT = "ndjson"
+_OUTPUT_STREAM = "0"
+
+# How a `-map` names one stream of a kind, ffmpeg's own letters.
+_TYPE_SPECIFIERS: Mapping[StreamType, str] = {"video": "v", "audio": "a"}
+
+# The keyframes, without relying on a demuxer to skip: `noise` drops every
+# packet decoding cannot start at. `-discard nokey` reads less of the file,
+# but mov is the only demuxer that honours it AND its keyframe pts come back
+# wrong on a stream that reorders, so this is the one path for every
+# container.
+_KEYFRAMES_FILTER = "noise=drop=not(key)"
+# What puts the copy on the same clock the query's own times are on. A stream
+# that reorders frames opens with a negative dts, and the muxer's
+# `avoid_negative_ts` would then shift every timestamp -- pts included -- by
+# that lead-in. Lifting the dts instead leaves pts alone, so what a sink
+# reports is what `trim` means.
+_CLOCK_FILTER = "setts=dts=DTS-STARTDTS"
+
+
+@dataclass(frozen=True)
+class PacketRead:
+    """One compile-time read: which stream of which file, through which module.
+
+    `spec` and `input_args` are the input exactly as the query wrote it -- the
+    same path and the same per-input options the probe was taken under, so
+    the demuxer sees what it will see at run time. `kind` and `index` name
+    the stream, `index` 0-based within its kind, the way a ``-map`` counts.
+    `params` is the module's own parameters, already marshalled the way
+    :func:`invoke` marshals its argument. `wants` is how much of the stream
+    the module asked for.
+    """
+
+    spec: str
+    input_args: tuple[str, ...]
+    kind: StreamType
+    index: int
+    module: str
+    params: str
+    wants: SinkWants
+
+
+# Runs one packet sink over one stream and returns the rows it wrote:
+# :func:`read_packet_rows` is the real one, and a lowering test passes its own
+# so the unit tier spawns neither ffmpeg nor the sidecar.
+class ReadPackets(Protocol):
+    def __call__(
+        self,
+        read: PacketRead,
+        *,
+        described: Described | None = None,
+    ) -> tuple[dict[str, object], ...]: ...
+
+
+def _bsf_chain(wants: SinkWants, attempt: int) -> str:
+    """The bitstream filters this attempt puts on the copied stream.
+
+    Attempt 0 is what `wants` asked for. Each later attempt drops one filter,
+    widening the copy rather than failing: an ffmpeg whose `noise` cannot take
+    the expression hands over the whole stream, which `wants` allows, and one
+    with no `setts` at all hands it over on whatever clock it writes.
+    """
+    filters = []
+    if wants == "keyframes" and attempt < 1:
+        filters.append(_KEYFRAMES_FILTER)
+    if attempt < 2:
+        filters.append(_CLOCK_FILTER)
+    return ",".join(filters)
+
+
+def copy_argv(ffmpeg: str, read: PacketRead, attempt: int = 0) -> list[str]:
+    """The ffmpeg command that copies `read`'s stream as coded NUT onto a pipe.
+
+    One stream, stream-copied, no decode. `wants` shapes what is copied and
+    nothing else: ``first`` stops after one packet, ``keyframes`` drops what
+    decoding cannot start at, and ``all`` copies the stream whole. A host may
+    hand a sink more than it asked for, so every widening is legal and only
+    handing over less would not be.
+    """
+    argv = [ffmpeg, "-v", "error", *read.input_args, "-i", read.spec]
+    argv += ["-map", f"0:{_TYPE_SPECIFIERS[read.kind]}:{read.index}"]
+    if read.wants == "first":
+        argv += [f"-frames:{_OUTPUT_STREAM}", "1"]
+    argv += ["-c", "copy"]
+    chain = _bsf_chain(read.wants, attempt)
+    if chain:
+        argv += [f"-bsf:{_OUTPUT_STREAM}", chain]
+    return [*argv, "-f", EDGE_FORMAT, STDOUT]
+
+
+def _reader_argv(binary: str, read: PacketRead, described: Described | None) -> list[str]:
+    """The sidecar command that hosts the sink on the other end of the pipe.
+
+    Built as a one-module region reading stdin and writing one rows document,
+    which is the same argv a run-time packet sink takes -- the arrangement is
+    not a second one, it is this one run early.
+    """
+    process = SidecarProcess(
+        id="read",
+        module=read.module,
+        node="read",
+        args=_params_object(read.params),
+        sink=True,
+        packet_sink=True,
+        rows=(RowsDocument(sink=RowsSink(container=_ROWS_FORMAT), node="read"),),
+        grants=tuple(
+            EffectGrant(effect=effect, module=read.module)
+            for effect in ("http", "udp")
+            if described is not None and getattr(described, effect)
+        ),
+    )
+    return _argv(binary, process, reads=(STDIN,), writes=(STDOUT,))
+
+
+def _params_object(params: str) -> dict[str, object]:
+    """A marshalled params string back as the object the argv writes."""
+    if not params:
+        return {}
+    loaded = json.loads(params)
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def read_packet_rows(
+    read: PacketRead, *, described: Described | None = None
+) -> tuple[dict[str, object], ...]:
+    """Run `read` and return the rows the module wrote, one dict per row.
+
+    ffmpeg copies the stream as coded NUT onto a pipe and the sidecar hosts
+    the sink on the other end, writing NDJSON -- the same two processes a
+    run-time packet sink is, run while the query compiles.
+
+    A copy ffmpeg refuses is retried WIDER (:func:`_bsf_chain`) rather than
+    given up on, since every widening hands the sink more of the stream than
+    it asked for and that is always allowed. The ceilings are the probe's own:
+    one demux of a track, retried once with room.
+
+    Raises ``FfrwdError`` -- and nothing else -- when ffmpeg or the sidecar is
+    missing, the copy fails however it is written, the module rejects the
+    stream, or a row is not JSON. The rejection carries no position; the
+    caller anchors it on the call that named the module.
+    """
+    ffmpeg = binaries.ffmpeg_path()
+    if ffmpeg is None:
+        raise _reject(
+            f"ffmpeg is not installed, and reading '{read.spec}' at compile "
+            "time needs it to copy the stream",
+            hint="install ffmpeg, or put one on PATH",
+        )
+    binary = binaries.ffrwd_wasm_path()
+    if binary is None:
+        raise _reject(
+            f"the ffrwd-wasm sidecar is not installed, and reading '{read.module}' "
+            "needs it to host the module",
+            hint=INSTALL_HINT,
+        )
+    sidecar_command = _reader_argv(binary, read, described)
+    failure: FfrwdError | None = None
+    for attempt in range(3):
+        command = copy_argv(ffmpeg, read, attempt)
+        if attempt and command == copy_argv(ffmpeg, read, attempt - 1):
+            continue  # nothing left to widen; the previous attempt was this one
+        try:
+            return _run_read(command, sidecar_command, read)
+        except _CopyRefused as refused:
+            failure = refused.error
+    assert failure is not None  # the loop runs at least one attempt
+    raise failure
+
+
+class _CopyRefused(Exception):
+    """ffmpeg would not write the copy: retryable with a wider one."""
+
+    def __init__(self, error: FfrwdError) -> None:
+        super().__init__(error.message)
+        self.error = error
+
+
+def _run_read(
+    command: Sequence[str], sidecar_command: Sequence[str], read: PacketRead
+) -> tuple[dict[str, object], ...]:
+    """One attempt: spawn the pair, collect the rows, or raise.
+
+    A refusal ffmpeg alone is responsible for comes back as
+    :class:`_CopyRefused`, which the caller retries with a wider copy;
+    everything else is final.
+    """
+    for ceiling in (probe.EXTRACT_TIMEOUT_SECONDS, probe.RETRY_TIMEOUT_SECONDS):
+        try:
+            copy, copy_error, rows_text, rows_error, code = _spawn_read(
+                command, sidecar_command, ceiling
+            )
+            break
+        except subprocess.TimeoutExpired:
+            if ceiling is probe.RETRY_TIMEOUT_SECONDS:
+                raise _reject(
+                    f"reading '{read.spec}' through '{read.module}' did not "
+                    f"finish within {ceiling:.0f}s",
+                    hint="a compile-time read copies one stream of the file; "
+                    "check the input is reachable and not far slower to read "
+                    "than it is to probe",
+                ) from None
+        except OSError as err:
+            raise _reject(
+                f"could not read '{read.spec}' through '{read.module}': "
+                f"{getattr(err, 'strerror', None) or err}",
+                hint=INSTALL_HINT,
+            ) from err
+    if code != 0:
+        raise _reject(
+            f"the module '{read.module}' rejected the stream: "
+            f"{_last_line(rows_error)}",
+            hint="check the module reads the codec the stream carries, and "
+            "that its parameters are the ones it declares",
+        )
+    if copy != 0:
+        raise _CopyRefused(
+            _reject(
+                f"ffmpeg could not copy the stream out of '{read.spec}': "
+                f"{_last_line(copy_error)}",
+                hint="a compile-time read stream-copies one stream of the "
+                "input; check the file carries that stream",
+            )
+        )
+    return _packet_rows(read.module, rows_text)
+
+
+def _spawn_read(
+    command: Sequence[str], sidecar_command: Sequence[str], ceiling: float
+) -> tuple[int, str, str, str, int]:
+    """The pair, run to completion: ffmpeg's exit and stderr, then the sidecar's.
+
+    ffmpeg's stderr is drained by a thread of its own: it writes at ``-v
+    error`` and so says very little, but a pipe nobody reads is a pipe that
+    fills, and a copy blocked on its own diagnostics would never reach the
+    ceiling as a timeout.
+    """
+    with subprocess.Popen(
+        list(command),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    ) as copy:
+        assert copy.stdout is not None and copy.stderr is not None
+        diagnostics = copy.stderr
+        drained: list[bytes] = []
+        drain = threading.Thread(target=lambda: drained.append(diagnostics.read()))
+        drain.start()
+        try:
+            with subprocess.Popen(
+                list(sidecar_command),
+                stdin=copy.stdout,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            ) as reader:
+                # This process's own handle on the pipe closes here, so the
+                # sidecar sees the end of the stream when ffmpeg is done.
+                copy.stdout.close()
+                try:
+                    out, err = reader.communicate(timeout=ceiling)
+                except subprocess.TimeoutExpired:
+                    reader.kill()
+                    copy.kill()
+                    drain.join()
+                    raise
+                code = reader.returncode
+        finally:
+            copy.wait()
+            drain.join()
+    written = drained[0] if drained else b""
+    return (
+        copy.returncode,
+        written.decode("utf-8", errors="replace"),
+        out.decode("utf-8", errors="replace"),
+        err.decode("utf-8", errors="replace"),
+        code,
+    )
+
+
+def _packet_rows(module: str, text: str) -> tuple[dict[str, object], ...]:
+    """The sidecar's NDJSON as one dict per row, or a rejection naming it."""
+    rows: list[dict[str, object]] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            row = json.loads(stripped)
+        except ValueError as err:
+            raise _reject(
+                f"the module '{module}' wrote a row that is not JSON",
+                hint="the sidecar on PATH may be a different version than this ffrwd",
+            ) from err
+        if not isinstance(row, dict):
+            raise _reject(
+                f"the module '{module}' wrote a row that is not an object",
+                hint="a packet sink's rows are JSON objects, one per line",
+            )
+        rows.append(row)
+    return tuple(rows)
 
 
 def _nn_args(models: Sequence[ModelBinding], runtime: Sequence[str]) -> list[str]:

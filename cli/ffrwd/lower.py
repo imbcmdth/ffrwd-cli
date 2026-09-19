@@ -285,7 +285,7 @@ import re
 import struct
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from typing import Literal
+from typing import Literal, cast
 
 from sqlglot import exp
 
@@ -338,6 +338,7 @@ from ffrwd.parser import (
     ROW_STREAM,
     SINK_STREAMS,
     RawInputOption,
+    RawPacketRows,
     RawRowJoin,
     RawSink,
     RawSinkOption,
@@ -384,7 +385,11 @@ from ffrwd.probe import (
     ProbeResult,
     RenditionMeta,
     StreamMeta,
+    cached_packet_rows,
     is_url,
+    module_digest,
+    packet_rows_key,
+    remember_packet_rows,
     track_cues,
 )
 from ffrwd.probe import probe as probe_one_path
@@ -456,7 +461,9 @@ from ffrwd.wasm import (
     Described,
     DescribedFunction,
     Invoke,
+    PacketRead,
     ProbeSource,
+    ReadPackets,
     audio_encoder_codec,
     catalog_as_probe,
     encoder_codec,
@@ -471,6 +478,7 @@ from ffrwd.wasm import (
 )
 from ffrwd.wasm import invoke as wasm_invoke
 from ffrwd.wasm import probe_source as wasm_probe_source
+from ffrwd.wasm import read_packet_rows as wasm_read_packet_rows
 
 __all__ = ["lower", "lower_table"]
 
@@ -1201,6 +1209,78 @@ def _annotation_matches(
         name == emitted_name and json_type in ANNOTATION_TYPES.get(kind, ())
         for (name, kind), (emitted_name, json_type) in zip(declared, emitted)
     )
+
+
+def _packet_rows_match(
+    declared: Sequence[tuple[str, str]], emitted: Sequence[tuple[str, str]]
+) -> bool:
+    """Whether every declared packet-row column is one the module writes.
+
+    A SUBSET, unlike an annotation record's field-for-field match: the
+    declaration names the columns the query reads off the rows, and a module
+    writing more than that is writing more than was asked for, which is
+    allowed everywhere else a sink is handed something.
+    """
+    written = dict(emitted)
+    return all(
+        name in written and written[name] in ANNOTATION_TYPES.get(kind, ())
+        for name, kind in declared
+    )
+
+
+# What a row column held, when the declaration says it should have held
+# something else: a sentinel rather than an exception, so one walk over the
+# rows both converts and reports.
+_MISTYPED = object()
+
+
+def _packet_row_value(value: object, written: str) -> object:
+    """One JSON row cell as the declared type, or :data:`_MISTYPED`.
+
+    JSON's null is SQL's, whatever the column is declared. A `vector` is a
+    plain array of numbers, read as the tuple every vector value in the
+    dialect is; the scalars read as themselves, with a bool never passing
+    for a number the way Python alone would let it.
+    """
+    if value is None:
+        return None
+    if written == "vector":
+        if isinstance(value, list) and all(
+            isinstance(item, int | float) and not isinstance(item, bool)
+            for item in value
+        ):
+            return tuple(float(item) for item in value)
+        return _MISTYPED
+    if written == "boolean":
+        return value if isinstance(value, bool) else _MISTYPED
+    if written == "number":
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            return _MISTYPED
+        return value
+    if written == "text":
+        return value if isinstance(value, str) else _MISTYPED
+    return _MISTYPED
+
+
+def _written_json_value(value: object) -> str:
+    """One JSON cell as a message names it: what it is, not what it says."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "a boolean"
+    if isinstance(value, int | float):
+        return "a number"
+    if isinstance(value, str):
+        return "text"
+    if isinstance(value, list):
+        return "an array"
+    return "an object"
+
+
+def _ref_index(ref: str) -> int:
+    """The 0-based stream index a ``src:<alias>:<marker>:<index>`` ref names."""
+    tail = ref.rsplit(":", 1)[-1]
+    return int(tail) if tail.isdigit() else 0
 
 
 def _written_json_fields(fields: Sequence[tuple[str, str]]) -> str:
@@ -2014,6 +2094,13 @@ def _chapter_title(value: RowValue, node: exp.Expr) -> str | None:
 # itself, and the destination that asks for it.
 _ROWS_CONTAINER = "ndjson"
 _ROWS_SUFFIX = ".ndjson"
+
+# What a compile-time read of a packet sink's rows needs under it.
+_PACKET_ROWS_INPUT_HINT = (
+    "a compile-time read opens the file and reads the stream's own packets: "
+    "write it over a stream of an input('path'), not over a filtered stream "
+    "or one another query stage built"
+)
 
 # The subtitle codec a minted rows track is written with, per container, and
 # the ffmpeg option that names it. A container missing here carries WebVTT as
@@ -3337,6 +3424,7 @@ class _Lowerer:
         probe_failures: Mapping[str, ProbeFailure | None] | None = None,
         probe_source: ProbeSource = wasm_probe_source,
         probe_path: ProbePath = probe_one_path,
+        read_packets: ReadPackets = wasm_read_packet_rows,
     ) -> None:
         self.res = res
         self.probes = probes
@@ -3349,6 +3437,7 @@ class _Lowerer:
         self.invoke = invoke
         self.probe_source = probe_source
         self.probe_path = probe_path
+        self.read_packets = read_packets
         # (module, function, sorted args) -> result, so two calls with the
         # same arguments run the module once per compile.
         self._invoke_cache: dict[tuple[str, str, tuple[tuple[str, object], ...]], object] = {}
@@ -7722,6 +7811,18 @@ class _Lowerer:
                 alias = _fold(alias_node.this)
                 self._add_module_source(alias, inner, declared, join, env, select)
                 return
+            if declared is not None and declared.is_packet_rows:
+                if not isinstance(alias_node, exp.TableAlias) or alias_node.this is None:
+                    raise _error(
+                        ErrorCode.UNSUPPORTED_SQL,
+                        f"{declared.name}() requires an alias",
+                        table,
+                        fallback=select,
+                        hint=f"add an alias, e.g. FROM {declared.name}(f.video[1]) v",
+                    )
+                alias = _fold(alias_node.this)
+                self._add_packet_rows(alias, inner, declared, join, env, select)
+                return
             if not isinstance(alias_node, exp.TableAlias) or alias_node.this is None:
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,
@@ -7822,6 +7923,328 @@ class _Lowerer:
             values=values,
         )
         self._join_rows(env.relation, local, rows, join, env, select)
+
+    # -- FROM <packet sink>(<stream>) alias: a compile-time read ----------
+
+    def _add_packet_rows(
+        self,
+        alias: str,
+        inner: exp.Anonymous,
+        declared: WasmFunction,
+        join: RawRowJoin | None,
+        env: _Env,
+        select: exp.Select,
+    ) -> None:
+        """``FROM <name>(<stream>, <values>) alias`` -- a packet sink read now.
+
+        The same module is two things by where it is written. After ``TO`` it
+        is a run-time destination and none of this happens. Here, over a
+        stream of an ``input()``, the compiler builds the arrangement that
+        destination would have built -- one ffmpeg stream-copying the stream
+        as coded NUT, one sidecar hosting the sink -- runs it, and binds what
+        the module wrote as a row table (:meth:`_join_rows`), the way a
+        caption track's cues are bound.
+
+        Only a stream of a file as it is on disk: a compile-time read has a
+        file to open and a filtered stream has none. The read is memoized
+        beside the probes, so a query naming several of the alias's columns
+        reads once, and the whole run is behind :attr:`read_packets`, which a
+        lowering test replaces with rows of its own.
+        """
+        raw = self.res.packet_rows.get(alias)
+        if raw is None:  # defensive: resolve records every packet-rows alias
+            raise _error(
+                ErrorCode.UNKNOWN_ALIAS,
+                f"unknown alias '{alias}'",
+                inner,
+                fallback=select,
+                hint=self._known_hint(),
+            )
+        call = _call_parts(inner)
+        assert call is not None  # inner is exp.Anonymous; _call_parts always answers
+        if call.named:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"{declared.name}() does not take named arguments",
+                call.named[0].value,
+                fallback=inner,
+                hint=f"a wasm function's parameters are positional: "
+                f"{declared.signature}",
+            )
+        described = self._described_packet_rows(declared, inner, select)
+        kind, index = self._packet_rows_stream(raw, declared, env, select)
+        spec = self._path_of(raw.source)
+        flags = self._input_flags(raw.source)
+        params = self._wasm_params(
+            declared, described, call, inner, select, env, {}, first=1
+        )
+        params_json = json.dumps(params, sort_keys=True) if params else ""
+        read = PacketRead(
+            spec=spec,
+            input_args=flags,
+            kind=kind,
+            index=index,
+            module=declared.module,
+            params=params_json,
+            wants=described.wants,
+        )
+        key = packet_rows_key(
+            spec,
+            flags,
+            kind,
+            index,
+            declared.module,
+            module_digest(declared.module),
+            params_json,
+            described.wants,
+        )
+        written = cached_packet_rows(key)
+        if written is None:
+            try:
+                written = self.read_packets(read, described=described)
+            except FfrwdError as err:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"cannot read '{alias}': {err.message}",
+                    raw.stream_node,
+                    fallback=select,
+                    hint=err.hint,
+                ) from err
+            remember_packet_rows(key, written)
+        columns = self._packet_rows_columns(alias, raw, written, select)
+        if env.relation is None:
+            env.relation = _RowRelation()
+        rows = [_TrackRow(stream=_STREAMLESS_ROW, columns=row) for row in columns]
+        env.bindings[alias] = _RowBinding(
+            alias=alias,
+            source="",
+            column=alias,
+            type="data",  # filler: a packet row carries no track of its own
+            relation=env.relation,
+            values=RawValuesTable(
+                alias=alias,
+                columns=raw.columns,
+                rows=(),
+                node=inner,
+                types=raw.types,
+            ),
+        )
+        self._join_rows(env.relation, alias, rows, join, env, select)
+
+    def _described_packet_rows(
+        self, declared: WasmFunction, node: exp.Expr, select: exp.Select
+    ) -> Described:
+        """What a packet-rows call's module declares, checked against it.
+
+        The module has to BE a packet sink, hosted by a sidecar new enough to
+        hand packets through, exporting the name the declaration wrote; and
+        the columns the declaration names have to be columns it emits. The
+        declaration may name fewer than the module writes -- those are the
+        ones the query reads -- but never one the module never writes.
+        """
+        described = self.describes.get(declared.module)
+        if described is None:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"the module '{declared.module}' was never described",
+                node,
+                fallback=select,
+                hint="this is a compiler bug; please report the query that "
+                "produced it",
+            )
+        if described.world not in WORLDS:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"the module '{declared.module}' targets {described.world}, and "
+                f"this ffrwd hosts {' or '.join(WORLDS)}",
+                node,
+                fallback=select,
+                hint="rebuild the module against a world this ffrwd hosts, or "
+                "upgrade ffrwd",
+            )
+        if described.name != declared.export:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"function '{declared.name}' names the export '{declared.export}', "
+                f"and '{declared.module}' exports '{described.name}'",
+                node,
+                fallback=select,
+                hint=f"a module carries one export; write '{described.name}' as "
+                "the export",
+            )
+        if not described.packet_sink:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"function '{declared.name}' returns rows read off a stream's "
+                f"packets, and the module '{declared.module}' is not a packet sink",
+                node,
+                fallback=select,
+                hint="only a module exporting ffrwd:av's packet-sink reads a "
+                "stream's encoded packets; declare this one as what it is",
+            )
+        if not hosts_packet_sink(described.world):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"the module '{declared.module}' consumes encoded packets, and "
+                f"the sidecar's {described.world} cannot hand them through",
+                node,
+                fallback=select,
+                hint="packet sinks arrived with ffrwd:av@0.10.0; upgrade "
+                "ffrwd, or point at a newer ffrwd-wasm",
+            )
+        kind = declared.stream_kind
+        if described.sink_streams(kind) == "none":
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"function '{declared.name}' reads a {kind} stream, and the "
+                f"module '{declared.module}' reads none",
+                node,
+                fallback=select,
+                hint=f"name a module that reads {kind}, or declare the stream "
+                "as the kind this one does read",
+            )
+        self._check_packet_rows_schema(declared, described, node, select)
+        return described
+
+    def _check_packet_rows_schema(
+        self,
+        declared: WasmFunction,
+        described: Described,
+        node: exp.Expr,
+        select: exp.Select,
+    ) -> None:
+        """Every declared column against the rows the module says it writes."""
+        annotation = declared.returns_rows
+        arms = rows_arms(described)
+        if annotation is None:  # defensive: only a rows RETURNS reaches here
+            return
+        if arms is None:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"function '{declared.name}' returns rows, and the module "
+                f"'{declared.module}' writes none",
+                node,
+                fallback=select,
+                hint=f"declare '{declared.name}' as RETURNS sink; a module "
+                "that writes no rows has none to read",
+            )
+        fields = _annotation_fields(annotation)
+        if any(_packet_rows_match(fields, arm) for arm in arms):
+            return
+        raise _error(
+            ErrorCode.UDF_ARG_TYPE,
+            f"function '{declared.name}' returns {annotation.written}, and the "
+            f"module '{declared.module}' writes "
+            f"{' or '.join(_written_json_fields(arm) for arm in arms)}",
+            node,
+            fallback=select,
+            hint="the RETURNS names the module's own row columns, with a type "
+            "each value fits; a module writing more than the query reads is "
+            "fine, a column it never writes is not",
+        )
+
+    def _packet_rows_stream(
+        self,
+        raw: RawPacketRows,
+        declared: WasmFunction,
+        env: _Env,
+        select: exp.Select,
+    ) -> tuple[StreamType, int]:
+        """Which stream of which file a packet-rows call reads, checked.
+
+        One stream of a plain input, never a splat and never a live one: a
+        compile-time read opens a file and reads it to the end, and neither
+        an array of streams nor a source that never ends is that.
+        """
+        binding = env.bindings.get(raw.source)
+        if not isinstance(binding, _InputBinding):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"'{raw.source}' is not an input, and a compile-time read "
+                "needs a stream of a file as it is on disk",
+                raw.stream_node,
+                fallback=select,
+                hint=_PACKET_ROWS_INPUT_HINT,
+            )
+        alias, value = self._base_stream(raw.stream_node, env, select)
+        if value.is_array or len(value.streams) != 1:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"{declared.name}() reads one stream, and this names "
+                f"{len(value.streams)}",
+                raw.stream_node,
+                fallback=select,
+                hint="subscript the array to name one, e.g. "
+                f"{declared.name}({raw.source}.video[1])",
+            )
+        stream = value.streams[0]
+        if stream.type != declared.stream_kind:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"function '{declared.name}' takes "
+                f"{WASM_STREAM_NAMES[declared.stream_kind]}, and this is "
+                f"{stream.type}",
+                raw.stream_node,
+                fallback=select,
+                hint=f"name a {declared.stream_kind} stream of '{alias}', or "
+                f"declare '{declared.name}' over {stream.type}",
+            )
+        result = self.probes.get(alias)
+        if result is None:
+            raise self._unreadable_error(
+                ErrorCode.INPUT_NOT_FOUND,
+                alias,
+                f"'{declared.name}()' reads '{self._path_of(alias)}'",
+                raw.stream_node,
+                select,
+                "a compile-time read opens the file itself; check the path",
+            )
+        if result.live:
+            raise _error(
+                ErrorCode.UNBOUNDED_LIVE_INPUT,
+                f"'{self._path_of(alias)}' never ends, and a compile-time read "
+                "reads a stream to the end",
+                raw.stream_node,
+                fallback=select,
+                hint="a live stream is read at run time, by the same module "
+                f"written as a destination: COPY (SELECT ...) TO {declared.name}()",
+            )
+        return stream.type, _ref_index(stream.ref)
+
+    def _packet_rows_columns(
+        self,
+        alias: str,
+        raw: RawPacketRows,
+        written: Sequence[Mapping[str, object]],
+        select: exp.Select,
+    ) -> list[dict[str, RowValue]]:
+        """The module's rows as this alias's typed columns.
+
+        The declaration is the shape: a column it names and a row leaves out
+        reads NULL, the way an unreported probe field does, and a column the
+        module wrote that nothing declared is not this alias's to expose. A
+        value of the wrong type is a rejection naming the row and the column,
+        since the alias's whole column is typed by the declaration.
+        """
+        columns: list[dict[str, RowValue]] = []
+        for position, row in enumerate(written, start=1):
+            read: dict[str, RowValue] = {}
+            for name, written_type in zip(raw.columns, raw.types, strict=True):
+                value = _packet_row_value(row.get(name), written_type)
+                if value is _MISTYPED:
+                    raise _error(
+                        ErrorCode.UDF_ARG_TYPE,
+                        f"row {position} of '{alias}' holds "
+                        f"{_written_json_value(row.get(name))} in '{name}', "
+                        f"which is declared {written_type}",
+                        raw.call_node,
+                        fallback=select,
+                        hint="every row of a column carries the declared type; "
+                        "a column a row leaves out reads NULL",
+                    )
+                read[name] = cast(RowValue, value)
+            columns.append(read)
+        return columns
 
     def _add_series_rows(
         self,
@@ -16126,6 +16549,7 @@ def lower(
     invoke: Invoke = wasm_invoke,
     probe_failures: Mapping[str, ProbeFailure | None] | None = None,
     probe_source: ProbeSource = wasm_probe_source,
+    read_packets: ReadPackets = wasm_read_packet_rows,
     probe_path: ProbePath = probe_one_path,
 ) -> Graph:
     """Lower a resolved query into an IR graph -- its FIRST command's.
@@ -16158,7 +16582,7 @@ def lower(
     return lower_commands(
         res, probes, registry=registry, on_warning=on_warning, describes=describes,
         invoke=invoke, probe_failures=probe_failures, probe_source=probe_source,
-        probe_path=probe_path,
+        read_packets=read_packets, probe_path=probe_path,
     )[0]
 
 
@@ -16172,6 +16596,7 @@ def lower_commands(
     invoke: Invoke = wasm_invoke,
     probe_failures: Mapping[str, ProbeFailure | None] | None = None,
     probe_source: ProbeSource = wasm_probe_source,
+    read_packets: ReadPackets = wasm_read_packet_rows,
     probe_path: ProbePath = probe_one_path,
 ) -> list[Graph]:
     """Lower a resolved query into one IR graph per ffmpeg COMMAND.
@@ -16193,7 +16618,7 @@ def lower_commands(
         shared = _Lowerer(
             res, probes, registry, fanout_sinks=True, on_warning=on_warning,
             describes=describes, invoke=invoke, probe_failures=probe_failures,
-            probe_source=probe_source, probe_path=probe_path,
+            probe_source=probe_source, read_packets=read_packets, probe_path=probe_path,
         )
         graph = shared.run()
         count = shared.fanout_count
@@ -16208,7 +16633,7 @@ def lower_commands(
             _Lowerer(
                 res, probes, registry, fanout_index=index, on_warning=on_warning,
                 describes=describes, invoke=invoke, probe_failures=probe_failures,
-                probe_source=probe_source, probe_path=probe_path,
+                probe_source=probe_source, read_packets=read_packets, probe_path=probe_path,
             ).run()
             for index in range(count)
         ]
@@ -16290,6 +16715,7 @@ def lower_table(
     invoke: Invoke = wasm_invoke,
     probe_failures: Mapping[str, ProbeFailure | None] | None = None,
     probe_source: ProbeSource = wasm_probe_source,
+    read_packets: ReadPackets = wasm_read_packet_rows,
     probe_path: ProbePath = probe_one_path,
 ) -> list[TableSink]:
     """Lower a resolved TABLE query into its printable result set(s).
@@ -16304,7 +16730,8 @@ def lower_table(
     try:
         return _Lowerer(
         res, probes, registry, on_warning=on_warning, describes=describes, invoke=invoke,
-        probe_failures=probe_failures, probe_source=probe_source, probe_path=probe_path,
+        probe_failures=probe_failures, probe_source=probe_source,
+        read_packets=read_packets, probe_path=probe_path,
     ).run_table()
     except FfrwdError:
         raise

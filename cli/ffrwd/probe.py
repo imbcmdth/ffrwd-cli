@@ -30,6 +30,7 @@ downstream can say what actually went wrong instead of guessing "not found".
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -49,9 +50,10 @@ from ffrwd.ir import StreamType
 # a 4K upload hit a 5-second ceiling there about one time in three. So a probe
 # that times out is asked once more, with room, before it is given up on.
 _TIMEOUT_SECONDS = 15.0
-_RETRY_TIMEOUT_SECONDS = 60.0
-# Demuxing one caption track reads the whole file, not just its header.
-_EXTRACT_TIMEOUT_SECONDS = 20.0
+RETRY_TIMEOUT_SECONDS = 60.0
+# Demuxing one track reads the whole file, not just its header. Shared with
+# the compile-time packet read, which copies a track the same way.
+EXTRACT_TIMEOUT_SECONDS = 20.0
 # Remote specs fetch a manifest and often an init segment per stream before
 # ffprobe can report anything; 5s flakes on real networks, so they get more.
 _REMOTE_TIMEOUT_SECONDS = 15.0
@@ -245,6 +247,54 @@ _failure_cache: dict[_CacheKey, ProbeFailure] = {}
 # (spec, input flags, subtitle track index) -> that track's cues
 _CueCacheKey = tuple[str, tuple[str, ...], int]
 _cue_cache: dict[_CueCacheKey, list[CueMeta]] = {}
+# One compile-time packet read: which file, read how, through which module.
+# `digest` is the module file's own contents, so rebuilding a module reads
+# the stream again rather than answering from what the old one said; `wants`
+# is in the key because it decides how much of the stream was copied, and two
+# modules asking for different amounts are two different reads.
+PacketRowsKey = tuple[str, tuple[str, ...], str, int, str, str, str, str]
+_packet_rows_cache: dict[PacketRowsKey, tuple[dict[str, object], ...]] = {}
+
+
+def packet_rows_key(
+    spec: str,
+    args: Sequence[str],
+    kind: str,
+    index: int,
+    module: str,
+    digest: str,
+    params: str,
+    wants: str,
+) -> PacketRowsKey:
+    """The memo key one compile-time packet read is remembered under."""
+    return (spec, tuple(args), kind, index, module, digest, params, wants)
+
+
+def cached_packet_rows(key: PacketRowsKey) -> tuple[dict[str, object], ...] | None:
+    """The rows a previous read under `key` produced, or None for a fresh one."""
+    return _packet_rows_cache.get(key)
+
+
+def remember_packet_rows(
+    key: PacketRowsKey, rows: Sequence[Mapping[str, object]]
+) -> None:
+    """Record `rows` as what `key` reads, so a second call runs nothing."""
+    _packet_rows_cache[key] = tuple(dict(row) for row in rows)
+
+
+def module_digest(path: str) -> str:
+    """A content digest of the module file at `path`, or "" when unreadable.
+
+    A rebuilt module is a different module: the digest is what keeps a read
+    memoized against the old build from being handed back after a new one is
+    in place. Unreadable reads as "" -- the module is about to be refused
+    anyway, and the key still carries its path.
+    """
+    try:
+        with open(path, "rb") as handle:
+            return hashlib.sha256(handle.read()).hexdigest()
+    except OSError:
+        return ""
 
 
 def clear_cache() -> None:
@@ -252,6 +302,7 @@ def clear_cache() -> None:
     _cache.clear()
     _failure_cache.clear()
     _cue_cache.clear()
+    _packet_rows_cache.clear()
 
 
 def is_url(spec: str) -> bool:
@@ -354,7 +405,7 @@ def _cached_ffprobe(
     # A local file that times out is asked again with a longer ceiling: a slow
     # first read is usually storage warming, not a file that cannot be read.
     # A url, device or forced format already has the long ceiling and one try.
-    ceilings = (timeout, _RETRY_TIMEOUT_SECONDS) if retry else (timeout,)
+    ceilings = (timeout, RETRY_TIMEOUT_SECONDS) if retry else (timeout,)
     result = None
     for ceiling in ceilings:
         try:
@@ -487,7 +538,7 @@ def track_cues(spec: str, index: int, args: Sequence[str] = ()) -> list[CueMeta]
     ]
     try:
         result = subprocess.run(
-            argv, capture_output=True, text=True, timeout=_EXTRACT_TIMEOUT_SECONDS
+            argv, capture_output=True, text=True, timeout=EXTRACT_TIMEOUT_SECONDS
         )
     except (OSError, subprocess.SubprocessError):
         return []

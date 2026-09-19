@@ -75,6 +75,13 @@ _STEREO_NAME = "stereo.mp4"
 _SUBS_NAME = "subs.en.vtt"
 _AVS_NAME = "avs.mkv"
 _FRAME_PNG_NAME = "frame.png"
+_KEYS_NAME = "keys.mp4"
+_KEYS_MKV_NAME = "keys.mkv"
+# A keyframe every half second of a 15fps clip, and two B-frames between
+# anchors so the stream reorders and opens on a negative dts -- which is what
+# a compile-time read of it has to stay on the right side of.
+_KEYS_GOP = _RATE // 2
+_KEYS_BFRAMES = 2
 _AV_CHAPTERS_NAME = "av-chapters.mkv"
 _DESCRIBED_NAME = "described.mkv"
 _DESCRIBED_SPEECH_NAME = "described.speech.vtt"
@@ -360,6 +367,34 @@ def _generate_subs_vtt() -> Path:
     print(f"generating: {out_path}")
     out_path.write_text(_SUBS_VTT, encoding="utf-8")
     return out_path
+
+
+def _generate_keys() -> None:
+    """A clip with SEVERAL keyframes and a reordering stream, in two containers.
+
+    Every other fixture here takes ffmpeg's default GOP, which over four
+    seconds is one keyframe, so nothing in them can tell a keyframe copy from
+    a whole one. This one anchors twice a second and puts two B-frames
+    between anchors, which is also what makes its first dts negative: the
+    case where a copy's timestamps and the file's own presentation clock come
+    apart unless the copy is written to keep them together.
+
+    `keys.mkv` is the same encode remuxed, not a second one -- the two files
+    carry the same packets, so a read of one is comparable with a read of the
+    other, which is what makes the container the only variable.
+    """
+    _run(
+        FIXTURES_DIR / _KEYS_NAME,
+        [
+            "-f", "lavfi", "-i", f"testsrc2=duration={_DURATION}:size={_SIZE}:rate={_RATE}",
+            "-c:v", "libx264", "-g", str(_KEYS_GOP), "-bf", str(_KEYS_BFRAMES),
+            "-pix_fmt", "yuv420p",
+        ],
+    )
+    _run(
+        FIXTURES_DIR / _KEYS_MKV_NAME,
+        ["-i", str(FIXTURES_DIR / _KEYS_NAME), "-c", "copy"],
+    )
 
 
 def _generate_avs(subs_path: Path) -> None:
@@ -774,6 +809,7 @@ def main() -> int:
     _generate_av_2eng()
     _generate_tagged()
     _generate_frame_png()
+    _generate_keys()
     _generate_attached(_generate_font_ttf())
     _generate_ladder()
     _generate_ladder_demuxed()

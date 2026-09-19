@@ -5959,7 +5959,13 @@ def test_a_rows_function_reads_back_as_rows_in_rows_out() -> None:
 @pytest.mark.parametrize(
     ("params", "needle", "hint"),
     [
-        ("v video_stream, cues cue[]", "takes 2 parameters", "one array"),
+        # A stream first says the declaration means a packet sink read in
+        # FROM, so what is wrong with this one is the column beside it.
+        (
+            "v video_stream, cues cue[]",
+            "takes the stream 'v' and the annotation column 'cues'",
+            "this declares both",
+        ),
         ("cues text", "takes 'cues' as text", "one array"),
         ("", "returns rows and reads none", "one array"),
         (
