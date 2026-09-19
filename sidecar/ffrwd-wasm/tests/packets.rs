@@ -87,6 +87,8 @@ fn module_path(name: &str) -> PathBuf {
                 "-p",
                 "packet-tally",
                 "-p",
+                "adapted-0150",
+                "-p",
                 "invert",
             ])
             .current_dir(&workspace)
@@ -236,6 +238,50 @@ fn packet_stats_reports_the_groups_ffprobe_counted() {
             r#"{"packets":50,"keyframes":2,"bytes":4250,"gops":2,"pts_monotonic":false}"#,
         ]
     );
+}
+
+#[test]
+fn a_sink_built_against_the_previous_world_still_loads() {
+    // The adapter path, over a module actually shaped that way: 0.15.0 kept
+    // `arity` and `input-stream` on `packet-sink` itself, where 0.16.0 has
+    // them in the shared `types` interface.
+    let module = module_path("adapted_0150");
+    let run = run_ffrwd_wasm(
+        &[
+            "-f",
+            "nut",
+            "-i",
+            fixture_path().to_str().expect("fixture path is UTF-8"),
+            "-m",
+            module.to_str().expect("module path is UTF-8"),
+            "-f",
+            "ndjson",
+            "-",
+        ],
+        &[],
+    );
+    assert!(
+        run.output.status.success(),
+        "adapted_0150 exited with {:?}\nstderr:\n{}",
+        run.output.status.code(),
+        run.stderr
+    );
+    assert_eq!(
+        run.stdout.lines().collect::<Vec<&str>>(),
+        vec![format!(r#"{{"codec":"h264","packets":{PACKETS}}}"#)]
+    );
+
+    let described = run_ffrwd_wasm(
+        &["--describe", module.to_str().expect("module path is UTF-8")],
+        &[],
+    );
+    let description: serde_json::Value =
+        serde_json::from_str(described.stdout.trim()).expect("describe prints one JSON object");
+    // The host reports the world it was BUILT for, not the module's own -
+    // which is the same answer every adapted module gets.
+    assert_eq!(description["world"], "ffrwd:av@0.16.0");
+    assert_eq!(description["name"], "adapted_0150");
+    assert_eq!(description["packet_filter"], false);
 }
 
 #[test]
@@ -520,7 +566,7 @@ fn describe_reports_the_packet_sink() {
     );
     let description: serde_json::Value =
         serde_json::from_str(run.stdout.trim()).expect("describe prints one JSON object");
-    assert_eq!(description["world"], "ffrwd:av@0.15.0");
+    assert_eq!(description["world"], "ffrwd:av@0.16.0");
     assert_eq!(description["name"], "packet_stats");
     // The codecs list is what reports the packet-sink export; empty accepts
     // every codec.

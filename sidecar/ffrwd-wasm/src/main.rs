@@ -887,12 +887,15 @@ fn build_modules(
             bail!("-map [{target}] names a label of a network, and no -filter_complex wires one");
         }
         let path = stream_raws.into_iter().next().expect("one module");
-        // A packet source writes one output per catalog track, so the
-        // one-output-per-format rule below - built for a filter's single
-        // stream - does not hold for it; every other module still gets it.
-        let is_source = ffrwd_wasm_runtime::runtime::exports_packet_source(&path)
-            .with_context(|| format!("opening module {path}"))?;
-        if !is_source {
+        // A packet source writes one output per catalog track and a packet
+        // filter one per pad, so the one-output-per-format rule below -
+        // built for a filter's single stream - does not hold for either;
+        // every other module still gets it.
+        let several_streams = ffrwd_wasm_runtime::runtime::exports_packet_source(&path)
+            .with_context(|| format!("opening module {path}"))?
+            || ffrwd_wasm_runtime::runtime::exports_packet_filter(&path)
+                .with_context(|| format!("opening module {path}"))?;
+        if !several_streams {
             check_one_output_per_format(outputs)?;
         }
         return Ok((
@@ -1504,13 +1507,22 @@ fn run(args: &Args) -> Result<()> {
             return run_rows_module(args, path, params, rows_in);
         }
     }
-    // -rows-in names a rows module's input; every other shape reads neither
-    // a rows module's -i (none) nor -rows-in (nothing) - so a -rows-in this
-    // far along names something that is not one.
-    if args.rows_in.is_some() {
+    // A packet filter reads a stream, so it is dispatched below with the
+    // packet sink; but it also reads rows through -rows-in, so it is one of
+    // the two shapes the refusal just below lets past.
+    let packet_filter = match &args.modules {
+        Modules::Single { path, .. } => ffrwd_wasm_runtime::runtime::exports_packet_filter(path)
+            .with_context(|| format!("opening module {path}"))?,
+        Modules::Network { .. } => false,
+    };
+
+    // -rows-in names a rows module's or a packet filter's input; every other
+    // shape reads neither a rows module's -i (none) nor -rows-in (nothing) -
+    // so a -rows-in this far along names something that is neither.
+    if args.rows_in.is_some() && !packet_filter {
         match &args.modules {
             Modules::Single { path, .. } => {
-                bail!("-rows-in follows a rows module's -m; {path} is not one")
+                bail!("-rows-in follows a rows module's or a packet filter's -m; {path} is neither")
             }
             Modules::Network { .. } => bail!(
                 "-rows-in names a rows module's input; a network wires modules together and \
@@ -1521,6 +1533,15 @@ fn run(args: &Args) -> Result<()> {
 
     if args.inputs.is_empty() {
         bail!("no input specified (-i)");
+    }
+
+    // A packet filter is dispatched before any header is read here, for the
+    // reason a packet sink is: its reader threads open the inputs themselves
+    // and drain them from the first byte.
+    if packet_filter {
+        if let Modules::Single { path, params } = &args.modules {
+            return run_packet_filter(args, path, params);
+        }
     }
 
     // A packet sink is dispatched before any header is read here: its
@@ -1759,6 +1780,338 @@ fn run_packet_sink(args: &Args, module: &str, params: &str) -> Result<()> {
         writer.flush()?;
     }
     Ok(())
+}
+
+/// The encoded inputs of a packet filter through ONE instance: packets in,
+/// packets out, with `-rows-in`'s rows arriving beside them.
+///
+/// The packet side is a sink's, pad for pad - one reader thread per `-i`
+/// into a byte-bounded queue, the drive loop handing over whatever arrived -
+/// and the difference is the other end: each pad has an `-f nut` output,
+/// written from the header `init` answered for it, and one writer thread per
+/// output so a pad whose consumer is slow blocks alone. The filter's own
+/// rows, if it emits any, go to an `-f ndjson` output as a sink's do.
+///
+/// Rows arrive on their own schedule. The reader thread fills a bounded
+/// queue from the first line, and every call is handed whatever is in it -
+/// none while packets outrun the rows, several at once when they do not.
+/// Nothing here pairs a row with a packet: the row carries its own time and
+/// the module decides where it belongs, which is what lets a file of rows
+/// written by an earlier stage and a live feed arriving mid-run be the same
+/// input. On the final call the queue is drained to the end of the rows
+/// input, so nothing written is left unseen.
+fn run_packet_filter(args: &Args, module: &str, params: &str) -> Result<()> {
+    if args.annotations.input || args.annotations.output {
+        bail!(
+            "a packet filter carries encoded packets, not frames, so -annotations has nothing \
+             to give or take here; its rows arrive through -rows-in"
+        );
+    }
+
+    let mut pad_outputs: Vec<&OutputSpec> = Vec::new();
+    let mut row_outputs: Vec<RowOutput> = Vec::new();
+    for output in &args.outputs {
+        match output.kind {
+            OutputKind::Frames => pad_outputs.push(output),
+            OutputKind::Rows => row_outputs.push(open_row_output(&output.path)?),
+            OutputKind::Null => {}
+            _ => bail!(
+                "{}: a packet filter writes encoded packets and rows; its outputs are \
+                 -f {EDGE_FORMAT}, -f {ROWS_FORMAT} and -f null",
+                output.spelling
+            ),
+        }
+    }
+    let pads = args.inputs.len();
+    if pad_outputs.len() != pads {
+        bail!(
+            "{module} hands on the packets of every pad it reads: {pads} -i input(s) need \
+             {pads} -f {EDGE_FORMAT} output(s), and this command gives {}",
+            pad_outputs.len()
+        );
+    }
+
+    // The readers start before anything else, for the reason a packet
+    // sink's do: each drains its own input from the first byte, so a fast
+    // producer is not held up by a slow one's warmup or by the module's own
+    // open. The threads are not joined - see `run_packet_sink`.
+    let queues = Arc::new(PadQueues::new(pads));
+    let (told, headers) = std::sync::mpsc::channel();
+    for (pad, path) in args.inputs.iter().enumerate() {
+        let queues = Arc::clone(&queues);
+        let told = told.clone();
+        let path = path.clone();
+        std::thread::spawn(move || {
+            let opened = (|| {
+                let reader = io::BufReader::with_capacity(1 << 20, open_input(&path)?);
+                nut::Demuxer::open(reader).context("reading the NUT input")
+            })();
+            match opened {
+                Ok(input) => {
+                    let _ = told.send((pad, Ok(input.stream().clone())));
+                    read_pad(input, pad, &queues);
+                }
+                Err(err) => {
+                    let _ = told.send((pad, Err(err)));
+                }
+            }
+        });
+    }
+    drop(told);
+
+    let mut streams: Vec<Option<nut::Stream>> = (0..pads).map(|_| None).collect();
+    for _ in 0..pads {
+        let (pad, stream) = headers.recv().expect("every reader reports its header");
+        streams[pad] = Some(stream.with_context(|| format!("input {pad}"))?);
+    }
+    let streams: Vec<nut::Stream> = streams
+        .into_iter()
+        .map(|s| s.expect("every pad reported"))
+        .collect();
+    let mut inputs = Vec::with_capacity(pads);
+    for (pad, stream) in streams.iter().enumerate() {
+        let (row, rendition) = resolve_pad(&args.pads, pad);
+        inputs.push(coded_pad(args, module, pad, stream, row, rendition.into())?);
+    }
+    let mut filter = runtime::PacketFilter::open(module, &inputs, params)
+        .with_context(|| format!("opening module {module}"))?;
+
+    // The rows reader, once the module is open: a filter that acts on rows
+    // and is given none would run blind, so it is refused instead.
+    //
+    // The OPEN happens on the reader's own thread, the way a pad's does. A
+    // named pipe blocks on open until its writer arrives, and for a live
+    // run that writer is a stage that has not started yet; opening here
+    // would stop the packets waiting for a row.
+    let rows = Arc::new(RowsQueue::new());
+    match &args.rows_in {
+        Some(path) => {
+            let path = path.clone();
+            let queue = Arc::clone(&rows);
+            std::thread::spawn(move || match open_input(&path) {
+                Ok(reader) => read_rows(reader, &queue),
+                Err(error) => queue.fail(error.context("opening -rows-in")),
+            });
+        }
+        None if filter.reads_rows() => bail!(
+            "{} reads the rows woven into its packets, and this command gives it none; \
+             name them with -rows-in <path>",
+            filter.name()
+        ),
+        None => rows.close_input(),
+    }
+
+    // One writer per output, each on its own pipe: a reader opens its inputs
+    // one at a time, so a single loop writing every pad would stop on the
+    // first full pipe with the packets that would drain it unsent. The
+    // channels hold one batch, which overlaps a write with the next call and
+    // bounds what a stalled consumer can pile up.
+    let mut senders = Vec::with_capacity(pads);
+    let mut writers = Vec::with_capacity(pads);
+    for (pad, output) in pad_outputs.iter().enumerate() {
+        // The codec, geometry and time base are the arriving stream's and
+        // not a filter's to change, so the header written is the input's
+        // own; only the out-of-band header is what `init` answered.
+        let mut header = streams[pad].clone();
+        header.extradata = filter.streams()[pad].extradata.clone();
+        let muxer = open_frame_output(&output.path, &header, false)
+            .with_context(|| format!("opening output {}", output.spelling))?;
+        let (sender, batches) = mpsc::sync_channel::<Vec<runtime::Packet>>(1);
+        let spelling = output.spelling.clone();
+        senders.push(sender);
+        writers.push(thread::spawn(move || {
+            write_track(muxer, &batches).with_context(|| format!("writing output {spelling}"))
+        }));
+    }
+
+    let mut sending = true;
+    let outcome = (|| -> Result<()> {
+        while sending {
+            let (carried, done) = queues.take()?;
+            if done {
+                return Ok(());
+            }
+            let (arrived, _) = rows.take()?;
+            let filtered = filter
+                .process(&carried, &arrived, false)
+                .with_context(|| format!("{}: processing packets", filter.name()))?;
+            for (pad, packets) in filtered.pads.into_iter().enumerate() {
+                if !packets.is_empty() {
+                    sending &= senders[pad].send(packets).is_ok();
+                }
+            }
+            for writer in &mut row_outputs {
+                write_rows(writer, &filtered.rows)?;
+            }
+        }
+        Ok(())
+    })();
+    // A reader still waiting for queue space must wake and stop.
+    queues.close();
+    if let Err(error) = outcome {
+        rows.close();
+        return Err(error);
+    }
+
+    // The final call: whatever the filter held back leaves here, and with it
+    // every row the input still had.
+    let remaining = rows.drain_to_end()?;
+    let filtered = filter
+        .process(&vec![Vec::new(); pads], &remaining, true)
+        .with_context(|| format!("{}: the final call", filter.name()))?;
+    for (pad, packets) in filtered.pads.into_iter().enumerate() {
+        if !packets.is_empty() {
+            // A send fails only once that output's writer has stopped, and
+            // its failure is what `join` below hands back.
+            let _ = senders[pad].send(packets);
+        }
+    }
+    drop(senders);
+    for writer in &mut row_outputs {
+        write_rows(writer, &filtered.rows)?;
+        write_rows(writer, &filtered.trailing)?;
+        writer.flush()?;
+    }
+
+    let mut wrote = Ok(());
+    for writer in writers {
+        let written = writer.join().unwrap_or_else(|panic| resume_unwind(panic));
+        if wrote.is_ok() {
+            wrote = written;
+        }
+    }
+    wrote
+}
+
+/// How many buffered bytes the rows reader may hold before it waits for the
+/// drive loop to drain. Rows are small beside packets, and a megabyte holds
+/// thousands of them - enough that the reader stays ahead of a filter that
+/// takes rows in bursts, and small enough that a large rows file is read as
+/// the run needs it rather than all at once.
+const ROWS_BUFFER_BYTES: usize = 1 << 20;
+
+/// What the rows reader and the drive loop share.
+#[derive(Default)]
+struct RowsState {
+    rows: Vec<String>,
+    bytes: usize,
+    /// The rows input ended; set after its last row is queued.
+    closed: bool,
+    /// The read failed; the drive loop raises it.
+    failed: Option<anyhow::Error>,
+    /// The drive loop has stopped; the reader stops instead of waiting for
+    /// space that will never come.
+    dead: bool,
+}
+
+/// The rows a packet filter reads beside its packets: one reader thread
+/// filling a bounded queue, the drive loop taking whatever is in it without
+/// ever waiting. Packets pace the run, so a call that finds no rows ready
+/// gets none rather than stalling the packets behind them.
+struct RowsQueue {
+    state: Mutex<RowsState>,
+    /// The drive loop drained, freeing space - or is gone for good.
+    drained: Condvar,
+    /// A row arrived, or the input closed or failed.
+    filled: Condvar,
+}
+
+impl RowsQueue {
+    fn new() -> RowsQueue {
+        RowsQueue {
+            state: Mutex::new(RowsState::default()),
+            drained: Condvar::new(),
+            filled: Condvar::new(),
+        }
+    }
+
+    /// Everything read so far, and whether the input has ended. Never waits.
+    fn take(&self) -> Result<(Vec<String>, bool)> {
+        let mut state = self.state.lock().expect("the reader holds no panic");
+        if let Some(error) = state.failed.take() {
+            return Err(error);
+        }
+        state.bytes = 0;
+        let taken = std::mem::take(&mut state.rows);
+        let closed = state.closed;
+        self.drained.notify_all();
+        Ok((taken, closed))
+    }
+
+    /// Every row left, waiting for the reader to reach the end of its input.
+    /// The rows a run reads end when its packets do - the stage writing them
+    /// is the one feeding the encoder - so this is the remainder of a file,
+    /// not an open-ended wait on a live feed.
+    fn drain_to_end(&self) -> Result<Vec<String>> {
+        let mut gathered = Vec::new();
+        loop {
+            let (taken, closed) = self.take()?;
+            gathered.extend(taken);
+            if closed {
+                return Ok(gathered);
+            }
+            let mut state = self.state.lock().expect("the reader holds no panic");
+            while !state.closed && state.rows.is_empty() && state.failed.is_none() {
+                state = self.filled.wait(state).expect("the reader holds no panic");
+            }
+        }
+    }
+
+    /// Stores a read failure for the drive loop to raise, and ends the
+    /// input: nothing more is coming, and the run stops on the error rather
+    /// than on the wait.
+    fn fail(&self, error: anyhow::Error) {
+        let mut state = self.state.lock().expect("the drive loop holds no panic");
+        state.failed = Some(error);
+        state.closed = true;
+        self.filled.notify_all();
+    }
+
+    /// Marks the input ended without one ever being opened: a filter reading
+    /// no rows is handed none, and its final call waits for nothing.
+    fn close_input(&self) {
+        let mut state = self.state.lock().expect("the reader holds no panic");
+        state.closed = true;
+        self.filled.notify_all();
+    }
+
+    /// The drive loop is done: wake the reader so it can stop.
+    fn close(&self) {
+        self.state.lock().expect("the reader holds no panic").dead = true;
+        self.drained.notify_all();
+    }
+}
+
+/// One rows reader: blocking line reads off the rows input, each non-blank
+/// line into the queue, waiting whenever the queue is over its byte bound.
+fn read_rows(reader: InputReader, queue: &RowsQueue) {
+    for line in io::BufReader::new(reader).lines() {
+        match line {
+            Ok(row) if row.trim().is_empty() => {}
+            Ok(row) => {
+                let mut state = queue.state.lock().expect("the drive loop holds no panic");
+                while !state.dead && state.bytes >= ROWS_BUFFER_BYTES {
+                    state = queue
+                        .drained
+                        .wait(state)
+                        .expect("the drive loop holds no panic");
+                }
+                if state.dead {
+                    return;
+                }
+                state.bytes += row.len();
+                state.rows.push(row);
+                queue.filled.notify_all();
+            }
+            Err(error) => {
+                queue.fail(anyhow::Error::new(error).context("reading -rows-in"));
+                return;
+            }
+        }
+    }
+    let mut state = queue.state.lock().expect("the drive loop holds no panic");
+    state.closed = true;
+    queue.filled.notify_all();
 }
 
 /// `-rows-in`: one JSON object per line, blank lines skipped. No stream
@@ -2531,6 +2884,11 @@ struct Description {
     video_streams: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     audio_streams: Option<&'static str>,
+    /// Whether the module exports a packet filter: encoded packets in,
+    /// encoded packets out. False for every module built before 0.16.0. The
+    /// codec and arity fields above are a filter's too, read the way a
+    /// sink's are; this flag is what tells the two apart.
+    packet_filter: bool,
     /// Whether the module exports a packet source: the same boolean-flag
     /// convention `nn`/`http`/`udp` use, false for every module built before
     /// 0.13.0.
@@ -2604,20 +2962,28 @@ fn describe_module(module_path: &str) -> Result<String> {
         .with_context(|| format!("describing {module_path}"))?;
     let has_packet = ffrwd_wasm_runtime::runtime::exports_packet_sink(module_path)
         .with_context(|| format!("describing {module_path}"))?;
+    let has_packet_filter = ffrwd_wasm_runtime::runtime::exports_packet_filter(module_path)
+        .with_context(|| format!("describing {module_path}"))?;
     let has_source = ffrwd_wasm_runtime::runtime::exports_packet_source(module_path)
         .with_context(|| format!("describing {module_path}"))?;
     let has_rows_module = ffrwd_wasm_runtime::runtime::exports_rows_module(module_path)
         .with_context(|| format!("describing {module_path}"))?;
 
     let has_frames = has_filter || has_window;
-    if !has_frames && !has_values && !has_packet && !has_source && !has_rows_module {
+    if !has_frames
+        && !has_values
+        && !has_packet
+        && !has_packet_filter
+        && !has_source
+        && !has_rows_module
+    {
         let exports = ffrwd_wasm_runtime::runtime::exports(module_path)?;
         if exports.is_empty() {
             bail!("{module_path} exports nothing, so no describe is possible");
         }
         bail!(
-            "{module_path} exports neither a filter, a packet sink, a packet source, a rows \
-             module, nor value functions; it exports {}",
+            "{module_path} exports neither a filter, a packet sink, a packet filter, a packet \
+             source, a rows module, nor value functions; it exports {}",
             exports.join(", ")
         );
     }
@@ -2627,9 +2993,12 @@ fn describe_module(module_path: &str) -> Result<String> {
              a module is one or the other"
         );
     }
-    if has_source && (has_frames || has_packet) {
+    // A packet filter reads the same packets a sink does and hands them on;
+    // which of the two a module is decides how a host drives it, so it is
+    // one or the other.
+    if has_packet_filter && (has_frames || has_packet) {
         bail!(
-            "{module_path} exports a packet source alongside {}; a module is one or the other",
+            "{module_path} exports a packet filter alongside {}; a module is one or the other",
             if has_frames {
                 "a frame interface"
             } else {
@@ -2637,10 +3006,22 @@ fn describe_module(module_path: &str) -> Result<String> {
             }
         );
     }
+    if has_source && (has_frames || has_packet || has_packet_filter) {
+        bail!(
+            "{module_path} exports a packet source alongside {}; a module is one or the other",
+            if has_frames {
+                "a frame interface"
+            } else if has_packet {
+                "a packet sink"
+            } else {
+                "a packet filter"
+            }
+        );
+    }
     // A rows module carries no stream at all - `values` is the one interface
     // every other kind may also export, so it is the one thing a rows module
     // may share, the way `fauxlate` does.
-    if has_rows_module && (has_frames || has_packet || has_source) {
+    if has_rows_module && (has_frames || has_packet || has_packet_filter || has_source) {
         bail!(
             "{module_path} exports a rows module alongside {}; a module reading a stream and \
              a module reading none are one or the other",
@@ -2648,6 +3029,8 @@ fn describe_module(module_path: &str) -> Result<String> {
                 "a frame interface"
             } else if has_packet {
                 "a packet sink"
+            } else if has_packet_filter {
+                "a packet filter"
             } else {
                 "a packet source"
             }
@@ -2675,6 +3058,7 @@ fn describe_module(module_path: &str) -> Result<String> {
         audio_codecs: None,
         video_streams: None,
         audio_streams: None,
+        packet_filter: false,
         source: false,
         rows_module: false,
         input_rows_schema: None,
@@ -2739,6 +3123,33 @@ fn describe_module(module_path: &str) -> Result<String> {
         description.audio_codecs = Some(described.audio_codecs);
         description.video_streams = Some(streams_read(described.video));
         description.audio_streams = Some(streams_read(described.audio));
+    }
+
+    if has_packet_filter {
+        let described = ffrwd_wasm_runtime::runtime::describe_packet_filter(module_path)
+            .with_context(|| format!("describing {module_path}"))?;
+        let meta = described.meta;
+        description.params_schema = Some(parse_schema(
+            &meta.params_schema,
+            &meta.name,
+            "params_schema",
+        )?);
+        description.rows_schema = Some(parse_schema(&meta.rows_schema, &meta.name, "rows_schema")?);
+        description.pixel_formats = Some(meta.pixel_formats);
+        description.sample_formats = Some(meta.sample_formats);
+        description.sample_rates = Some(meta.sample_rates);
+        description.channel_counts = Some(meta.channel_counts);
+        description.rows_language = meta.rows_language;
+        description.version = Some(meta.version);
+        description.name = Some(meta.name);
+        description.video_codecs = Some(described.video_codecs);
+        description.audio_codecs = Some(described.audio_codecs);
+        description.video_streams = Some(streams_read(described.video));
+        description.audio_streams = Some(streams_read(described.audio));
+        // A filter's rows arrive beside its packets rather than on them, so
+        // this is what says it wants a `-rows-in` at all.
+        description.reads_rows = Some(described.reads_rows);
+        description.packet_filter = true;
     }
 
     if has_source {

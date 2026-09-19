@@ -30,9 +30,12 @@ members = [
     "frame-stats",
     "packet-stats",
     "packet-tally",
+    "packet-passthrough",
+    "packet-sei",
     "source-replay",
     "source-replay-pair",
     "source-replay-0130",
+    "source-replay-0150",
     "source-files",
     "fauxlate",
     "post-rows",
@@ -46,6 +49,7 @@ members = [
     "adapted-080",
     "adapted-090",
     "adapted-0110",
+    "adapted-0150",
 ]
 resolver = "2"
 

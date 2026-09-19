@@ -41,6 +41,8 @@ fn built_module(name: &str) -> PathBuf {
                 "source-replay-pair",
                 "-p",
                 "source-replay-0130",
+                "-p",
+                "source-replay-0150",
             ])
             .current_dir(&workspace)
             .output()
@@ -73,6 +75,12 @@ fn pair_module_path() -> PathBuf {
 /// which tracks to pull.
 fn older_module_path() -> PathBuf {
     built_module("source_replay_0130")
+}
+
+/// The same module built against `worlds/0.15.0`, whose `open` IS told which
+/// tracks to pull: the previous world, hosted rather than refused.
+fn previous_module_path() -> PathBuf {
+    built_module("source_replay_0150")
 }
 
 struct Run {
@@ -214,7 +222,7 @@ fn a_packet_source_built_against_an_older_world_is_refused_at_open() {
     ]);
     assert!(!run.output.status.success());
     assert!(
-        run.stderr.contains("rebuild it against ffrwd:av@0.15.0"),
+        run.stderr.contains("rebuild it against ffrwd:av@0.16.0"),
         "stderr does not name the world to rebuild against:\n{}",
         run.stderr
     );
@@ -295,9 +303,9 @@ fn probe_and_open_agree_on_the_track_the_run_reads() {
     );
 }
 
-#[test]
-fn a_run_writes_back_exactly_the_packets_the_module_published() {
-    let module = module_path();
+/// Runs `module` as a one-track packet source and checks the NUT it wrote
+/// carries back the module's own header and packets, byte for byte.
+fn assert_replays(module: &Path) {
     let run = run_ffrwd_wasm(&[
         "-m",
         module.to_str().expect("module path is UTF-8"),
@@ -342,6 +350,20 @@ fn a_run_writes_back_exactly_the_packets_the_module_published() {
 }
 
 #[test]
+fn a_run_writes_back_exactly_the_packets_the_module_published() {
+    assert_replays(&module_path());
+}
+
+#[test]
+fn a_source_built_against_the_previous_world_runs_the_same_way() {
+    // `open` was told which tracks to pull in 0.15.0 and still is, so a
+    // source published against that world is hosted under this one rather
+    // than refused: end to end, the NUT it writes is the NUT the current
+    // build writes.
+    assert_replays(&previous_module_path());
+}
+
+#[test]
 fn annotations_have_nothing_to_give_or_take_on_a_packet_source() {
     let module = module_path();
     let run = run_ffrwd_wasm(&[
@@ -376,7 +398,7 @@ fn describe_reports_the_packet_source() {
     let stdout = String::from_utf8(run.stdout).expect("describe prints UTF-8");
     let description: serde_json::Value =
         serde_json::from_str(stdout.trim()).expect("describe prints one JSON object");
-    assert_eq!(description["world"], "ffrwd:av@0.15.0");
+    assert_eq!(description["world"], "ffrwd:av@0.16.0");
     assert_eq!(description["name"], "source_replay");
     assert_eq!(description["source"], true);
     // No frame interface and no packet-sink export alongside it.

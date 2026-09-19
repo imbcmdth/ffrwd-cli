@@ -1,4 +1,4 @@
-package ffrwd:av@0.16.0;
+package ffrwd:av@0.15.0;
 
 interface types {
   /// Static description of a module, available without running anything.
@@ -171,33 +171,6 @@ interface types {
     bandwidth: option<u64>,
     codecs: option<string>,
     language: option<string>,
-  }
-
-  /// How many streams of one kind a module reading encoded packets takes.
-  /// Shared between `packet-sink` and `packet-filter`.
-  enum arity {
-    /// None of this kind reaches the module.
-    zero,
-    /// Exactly one, which is what every sink before 0.12.0 read.
-    one,
-    /// One or more, as many as the query hands over.
-    many,
-    /// As many as the query hands over, none included: the module reads
-    /// them when they are there and works when they are not.
-    any,
-  }
-
-  /// One pad's stream, told once at init: what the wire's own header said
-  /// about the encoding, and what the process driving the host said about
-  /// the stream. Shared between `packet-sink` and `packet-filter`.
-  record input-stream {
-    coded: coded-stream,
-    info: stream-info,
-    /// Which relation row this pad belongs to - the moq sink learns
-    /// renditions from the rows instead of from argument names.
-    row: u32,
-    /// What the source read of that row.
-    rendition: rendition-meta,
   }
 }
 
@@ -417,7 +390,20 @@ interface window-filter {
 /// query named, in that order, and `process` is handed one packet list per
 /// pad in the same order.
 interface packet-sink {
-  use types.{arity, input-stream, meta, pad-packets};
+  use types.{coded-stream, meta, pad-packets, rendition-meta, stream-info};
+
+  /// How many streams of one kind a sink reads.
+  enum arity {
+    /// None of this kind reaches the sink.
+    zero,
+    /// Exactly one, which is what every sink before 0.12.0 read.
+    one,
+    /// One or more, as many as the query hands over.
+    many,
+    /// As many as the query hands over, none included: the sink reads
+    /// them when they are there and works when they are not.
+    any,
+  }
 
   /// `meta`, plus what this sink accepts. A packet sink names codecs the way
   /// a frame module names pixel formats; `meta`'s own format lists stay
@@ -434,6 +420,19 @@ interface packet-sink {
     video: arity,
     /// How many audio streams this sink reads.
     audio: arity,
+  }
+
+  /// One pad's stream, told once at init: what the wire's own header said
+  /// about the encoding, and what the process driving the host said about
+  /// the stream.
+  record input-stream {
+    coded: coded-stream,
+    info: stream-info,
+    /// Which relation row this pad belongs to - the moq sink learns
+    /// renditions from the rows instead of from argument names.
+    row: u32,
+    /// What the source read of that row.
+    rendition: rendition-meta,
   }
 
   /// What one call produced. Rows only: a packet sink's rows are its whole
@@ -464,131 +463,6 @@ interface packet-sink {
   /// carries whatever is left, which may be no packets at all, and happens
   /// exactly once.
   process: func(pads: list<pad-packets>, last: bool) -> processed;
-}
-
-/// A transform over encoded packets: packets in, packets out, with rows
-/// arriving beside them. Where `packet-sink` is a terminus - the encoder's
-/// output goes in and rows alone come back - a filter hands the packets on,
-/// so it sits BETWEEN the encoder that wrote them and whatever muxes or
-/// publishes them. Nothing here decodes: the bytes a filter does not touch
-/// are the bytes that leave.
-///
-/// It reads pads the way a sink does, and declares what it accepts the same
-/// way, so `describe`, `init` and `set-params` mean here what they mean
-/// there. The two differences are that `init` answers the streams leaving -
-/// ordinarily the ones that arrived - and that `process` answers packets as
-/// well as rows.
-///
-/// ROWS are the second input. A module weaving data into a stream needs the
-/// data, and it arrives as JSON objects with times of their own rather than
-/// on the packets: the host hands over whatever rows it has at each call,
-/// and the module decides what to do with one whose time is ahead of or
-/// behind the packets it has seen. A row ahead is held; a row behind is the
-/// module's to place or drop. Nothing here pairs a row with a packet, so a
-/// file of rows produced by an earlier stage and a live feed arriving while
-/// packets flow are the same interface.
-///
-/// What a filter must not break is the container on the other side:
-///
-/// - Packet ORDER per pad is preserved. What arrives in decode order leaves
-///   in decode order, and a module that holds packets back releases them in
-///   that same order.
-/// - ONE packet in, one packet out per access unit. A filter may hold a
-///   packet back across calls and release it later, but over the instance's
-///   life the packets leaving a pad are the packets that arrived on it,
-///   neither dropped nor invented. A muxer counts frames; a filter that
-///   changed the count would write a file whose timestamps no longer
-///   describe its pictures.
-/// - `pts`, `dts` and `duration` pass through untouched unless the module
-///   is rewriting timestamps on purpose. They are the arriving packet's
-///   own, and a module that rewrites them keeps dts non-decreasing.
-/// - `keyframe` says of the OUTGOING packet what it said of the incoming
-///   one: whether decoding can start there. Adding a parameter set or an
-///   SEI to a keyframe leaves it a keyframe; nothing a filter does to the
-///   bytes makes a non-keyframe one.
-///
-/// A filter that rewrites a stream's out-of-band header - new extradata,
-/// a different profile - says so by answering `init` with the changed
-/// `coded-stream`; the host writes that header rather than the one it read.
-/// The header is the only part a filter may change: the codec, the time
-/// base and the geometry belong to the stream that arrived.
-interface packet-filter {
-  use types.{arity, coded-stream, input-stream, meta, pad-packets};
-
-  /// `meta`, plus what this filter accepts. A packet filter names codecs
-  /// the way a frame module names pixel formats; `meta`'s own format lists
-  /// stay empty, since no decoded payload ever reaches it.
-  record packet-filter-meta {
-    meta: meta,
-    /// ffmpeg's names for the VIDEO codecs accepted, most preferred first.
-    /// Empty is every codec.
-    video-codecs: list<string>,
-    /// ffmpeg's names for the AUDIO codecs accepted, most preferred first.
-    /// Empty is every codec.
-    audio-codecs: list<string>,
-    /// How many video streams this filter reads.
-    video: arity,
-    /// How many audio streams this filter reads.
-    audio: arity,
-    /// Whether this filter ACTS on the rows handed to `process`. Every call
-    /// receives whatever rows have arrived whatever this says, so
-    /// availability is no answer: a filter that only rewrites packets
-    /// declares false, and one weaving rows into the stream declares true.
-    /// A host with no rows to give refuses a filter declaring true rather
-    /// than run it blind.
-    reads-rows: bool,
-  }
-
-  /// What one call produced.
-  record filtered {
-    /// The packets leaving, one list per pad in `init`'s order, each in
-    /// decode order. A pad's list is empty when the call released nothing
-    /// on it - which a filter holding packets back does, and which says
-    /// nothing about whether more are coming.
-    pads: list<pad-packets>,
-    /// JSON objects matching `meta.rows-schema`, zero or more per call:
-    /// what the filter itself has to say, exactly as a sink's `processed`
-    /// carries them.
-    rows: list<string>,
-    /// Rows with no packet left to prompt them. Only the last call may fill
-    /// this.
-    trailing: list<string>,
-  }
-
-  describe: func() -> packet-filter-meta;
-
-  /// Called once per instance, with every stream the filter reads: video
-  /// pads first, then audio, each group in the order the query named them.
-  /// A filter declaring `one` of a kind is opened with exactly one of it,
-  /// and one declaring `zero` with none.
-  ///
-  /// The list answered is the streams LEAVING, one per input pad and in the
-  /// same order: ordinarily the ones that arrived, handed straight back. A
-  /// filter that rewrites a stream's extradata, profile or level answers the
-  /// changed `coded-stream` instead, and the host writes that header. The
-  /// codec, the time base and the geometry are not a filter's to change -
-  /// the packets leaving are packets of the stream that arrived - and a host
-  /// refuses those, and a list of any other length.
-  init: func(streams: list<input-stream>, params: string) -> result<list<coded-stream>, string>;
-
-  /// Replaces the parameters between calls, as the other interfaces do.
-  set-params: func(params: string) -> result<_, string>;
-
-  /// Packets in decode order, one list per pad in `init`'s order, and the
-  /// rows that have arrived since the last call. Pads run independently:
-  /// packets are not frames, so nothing pairs a pad's packet with another
-  /// pad's, and a call may carry packets on some pads and none on others.
-  ///
-  /// `rows` is whatever the host had ready, which may be none while packets
-  /// flow and may be many at once; they arrive in the order they were
-  /// written and never arrive twice. A module needing a row's time reads it
-  /// out of the row.
-  ///
-  /// `last` marks the final call of the instance's life: it carries whatever
-  /// packets and rows are left, which may be none of either, and happens
-  /// exactly once. Everything held back leaves on it - a packet still held
-  /// when `last` returns is a packet the container never gets.
-  process: func(pads: list<pad-packets>, rows: list<string>, last: bool) -> filtered;
 }
 
 /// A source of encoded packets, the mirror of `packet-sink`: no input pads,
@@ -693,7 +567,6 @@ world video-module  { export filter; }
 world meta-module   { export filter; export meta-filter; }
 world window-module { import window-source; export window-filter; }
 world packet-sink-module { export packet-sink; }
-world packet-filter-module { export packet-filter; }
 world packet-source-module { export packet-source; }
 world values-module { export values; }
 world rows-module-host { export rows-module; }
