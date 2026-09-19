@@ -10,7 +10,7 @@ column tables are in [rows.md](rows.md).
 | --- | --- | --- |
 | scalar | `text`, `number`, `boolean`, `vector` | a compile-time value. `number` follows Postgres typing (int/int truncates); `boolean` comes from a flag map and stands alone as a predicate |
 | stream record | `video_stream`, `audio_stream`, `subtitle_stream`, `data_stream` | one track: **the record IS the stream**, plus the metadata about it |
-| record | `chapter`, `cue`, `attachment`, `embedding` | data the container carries that is not a stream |
+| record | `chapter`, `cue`, `attachment` | data the container carries that is not a stream |
 | map | `tag`, `flag` | key/value pairs read by path, never unnested |
 | container | `container` | one input file: its stream arrays, its chapter list, its scalars |
 | array | `T[]` | `unnest` turns it into rows of `T` |
@@ -20,17 +20,16 @@ column tables are in [rows.md](rows.md).
 
 `vector` is a scalar with no literal: a list of numbers, which reaches a
 query as a `LANGUAGE wasm` value function's own domain (a parameter, a
-`RETURNS`, an annotation field) or as the `vector` field of an
-`embedding` row read out of a file's vector track. A vector reads and
-prints (capped, as a cell), but does not compare, concatenate, or cast to
-text; `cos_similarity(vector, vector)` and `vector_length(vector)` are the
-two functions that read one, each returning `number`, and a tag may not
-carry one at all.
-
-`embedding` is the record over it: `index`, `track`, `start_t`, `end_t`,
-`vector`, the same read/write split a `cue` has. An array of them in a
-stream position IS a vector track, the way an array of cues is a subtitle
-track ([rows.md](rows.md#embedding-rows---unnestfembeddings-v)).
+`RETURNS`, an annotation field) or as a `vector` column of a packet
+sink's rows ([rows.md](rows.md#packet-rows---ffrwdindexrecordsfvideo1-v)).
+A vector reads and prints (capped in a table, whole in csv and json), but
+does not compare, concatenate, or cast to text;
+`cos_similarity(vector, vector)` and `vector_length(vector)` are the two
+functions that read one, each returning `number`, and a tag may not carry
+one at all. The container has no record type over it: vectors belonging to
+spans of a file travel in that file's own encoded packets, put there by a
+`RETURNS packets` filter and read back by a packet sink, neither of which
+core ffrwd defines.
 
 ## The record is the stream
 
@@ -49,8 +48,8 @@ NULL. Read the field on what goes in.
 Every field is one or the other, and the distinction is enforced:
 
 - **Writable** — an assertion your query may make: a stream's `tags`
-  and `disposition`, a container's `tags`, a chapter's, cue's,
-  embedding's or attachment's own fields. A `tags` map is written with a
+  and `disposition`, a container's `tags`, a chapter's, cue's or
+  attachment's own fields. A `tags` map is written with a
   `tags` column (`STRUCT('eng' AS language) AS tags`, a `NULL` field
   clears); a record's fields are written by name in a literal,
   `STRUCT('Intro' AS title, 0 AS start_t, 60 AS end_t)::chapter`.
@@ -99,7 +98,7 @@ filter to the output. The rest describe the source.
 
 - Over a container: its stream arrays, video/audio/subtitle/data - the
   remux shape. In a table query its `chapters` and `attachments` join
-  them; `cues` and `embeddings` are read-only and stay out.
+  them; `cues` is read-only and stays out.
 - Over rows: the record's scalar fields, the metadata table. Map
   columns are excluded (a disposition cell is 250 characters wide);
   name them when you want them.

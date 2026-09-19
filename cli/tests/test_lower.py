@@ -34,7 +34,6 @@ import base64
 import functools
 import re
 import shlex
-import struct
 import subprocess
 import sys
 from collections.abc import Sequence
@@ -9380,33 +9379,18 @@ def test_a_bare_cues_column_in_a_media_copy_is_a_typed_rejection() -> None:
 
 
 # ---------------------------------------------------------------------------
-# titled metadata tracks: a container's own cue and vector tracks, read and
-# written
+# titled metadata tracks: a container's own cue tracks, read and written
 # ---------------------------------------------------------------------------
-
-# One vector per row of a 2-number track, as `_vector_payload` writes them:
-# little-endian f32, base64.
-_TWO_VECTORS = ((0.5, -0.25), (1.0, 0.0))
-
-
-def _payload(values: tuple[float, ...]) -> str:
-    return base64.b64encode(struct.pack(f"<{len(values)}f", *values)).decode()
 
 
 def _described_probes() -> dict[str, ProbeResult | None]:
-    """A container carrying video, a titled caption track, and a vector track."""
+    """A container carrying video and two titled caption tracks."""
     return {
         "f": ProbeResult(
             streams=[
                 _track("video", 0),
                 _track("subtitle", 0, title="speech", codec="webvtt"),
-                _track(
-                    "subtitle",
-                    1,
-                    title="clip_vectors",
-                    codec="webvtt",
-                    tags={"vector_dims": "2"},
-                ),
+                _track("subtitle", 1, title="aside", codec="webvtt"),
             ],
             format_name="matroska,webm",
         ),
@@ -9429,8 +9413,8 @@ def _described_tracks() -> dict[int, list[CueMeta]]:
     return {
         0: [CueMeta(index=1, text="Hello", start_t=0.0, end_t=1.5)],
         1: [
-            CueMeta(index=1, text=_payload(_TWO_VECTORS[0]), start_t=0.0, end_t=1.5),
-            CueMeta(index=2, text=_payload(_TWO_VECTORS[1]), start_t=1.5, end_t=3.0),
+            CueMeta(index=1, text="Look", start_t=0.0, end_t=1.5),
+            CueMeta(index=2, text="Listen", start_t=1.5, end_t=3.0),
         ],
     }
 
@@ -9438,31 +9422,17 @@ def _described_tracks() -> dict[int, list[CueMeta]]:
 def test_cue_rows_read_a_containers_own_caption_tracks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The vector track is not among them: its blocks are payloads, not text."""
+    """Every caption track the container carries, in file order, each row
+    naming the title it came from."""
     _extracted(monkeypatch, _described_tracks())
     sinks = lower_table(
         resolve(parse("SELECT c.track, c.index, c.text FROM input('d.mkv') f, unnest(f.cues) c")),
         _described_probes(),
     )
-    assert sinks[0].result.rows == [["speech", 1, "Hello"]]
-
-
-def test_vector_rows_read_the_numbers_their_tracks_dims_names(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _extracted(monkeypatch, _described_tracks())
-    sinks = lower_table(
-        resolve(
-            parse(
-                "SELECT v.track, v.start_t, v.end_t, vector_length(v.vector) "
-                "FROM input('d.mkv') f, unnest(f.embeddings) v"
-            )
-        ),
-        _described_probes(),
-    )
     assert sinks[0].result.rows == [
-        ["clip_vectors", 0.0, 1.5, 2],
-        ["clip_vectors", 1.5, 3.0, 2],
+        ["speech", 1, "Hello"],
+        ["aside", 1, "Look"],
+        ["aside", 2, "Listen"],
     ]
 
 
@@ -9495,41 +9465,7 @@ def test_a_title_no_track_carries_is_a_typed_rejection(
     )
     assert err.code is ErrorCode.STREAM_NOT_FOUND
     assert "carries no cues track titled 'nope'" in err.message
-    assert "the cues tracks it carries are titled 'speech'" in (err.hint or "")
-
-
-def test_a_vector_row_that_is_not_the_tracks_dims_is_a_typed_rejection(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _extracted(
-        monkeypatch,
-        {1: [CueMeta(index=1, text=_payload((1.0, 2.0, 3.0)), start_t=0.0, end_t=1.0)]},
-    )
-    err = _reject_lower_table(
-        "SELECT v.track FROM input('d.mkv') f, unnest(f.embeddings) v",
-        _described_probes(),
-    )
-    assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "track 'clip_vectors' row 1 does not hold 2 numbers" in err.message
-
-
-def test_a_vector_track_whose_dims_tag_is_not_a_count_is_a_typed_rejection(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _extracted(monkeypatch, _described_tracks())
-    probes: dict[str, ProbeResult | None] = {
-        "f": ProbeResult(
-            streams=[
-                _track("subtitle", 0, title="clip_vectors", tags={"vector_dims": "many"})
-            ],
-            format_name="matroska,webm",
-        )
-    }
-    err = _reject_lower_table(
-        "SELECT v.track FROM input('d.mkv') f, unnest(f.embeddings) v", probes
-    )
-    assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "track 'clip_vectors' says vector_dims='many'" in err.message
+    assert "the cues tracks it carries are titled 'speech', 'aside'" in (err.hint or "")
 
 
 def test_an_aliased_cue_array_titles_the_track_it_mints() -> None:
@@ -9542,60 +9478,6 @@ def test_an_aliased_cue_array_titles_the_track_it_mints() -> None:
     assert g.outputs[1].metadata == {"title": "speech"}
 
 
-def test_a_vector_track_is_written_back_from_the_rows_it_was_read_as(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The round trip: a file's own vector rows, written into a new one."""
-    _extracted(monkeypatch, _described_tracks())
-    g = _lower(
-        "COPY (SELECT g.video[1], array_agg(STRUCT(v.start_t AS start_t, "
-        "v.end_t AS end_t, v.vector AS vector)::embedding) AS clip_vectors "
-        "FROM input('o.mkv') g, input('d.mkv') f, unnest(f.embeddings) v "
-        "GROUP BY g.video[1]) TO 'out.mkv'",
-        _described_probes(),
-    )
-    assert g.outputs[1].metadata == {"title": "clip_vectors", "vector_dims": "2"}
-    assert _vtt_payload(g, 2) == (
-        "WEBVTT\n\n"
-        f"00:00:00.000 --> 00:00:01.500\n{_payload(_TWO_VECTORS[0])}\n\n"
-        f"00:00:01.500 --> 00:00:03.000\n{_payload(_TWO_VECTORS[1])}\n"
-    )
-
-
-def test_two_vector_lengths_in_one_track_are_refused_by_both_counts(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _extracted(
-        monkeypatch,
-        {
-            1: [
-                CueMeta(index=1, text=_payload((1.0, 2.0)), start_t=0.0, end_t=1.0),
-                CueMeta(index=2, text=_payload((1.0, 2.0)), start_t=1.0, end_t=2.0),
-            ],
-            2: [CueMeta(index=1, text=_payload((1.0, 2.0, 3.0)), start_t=2.0, end_t=3.0)],
-        },
-    )
-    probes = _described_probes()
-    result = probes["f"]
-    assert result is not None
-    probes["f"] = replace(
-        result,
-        streams=[
-            *result.streams,
-            _track("subtitle", 2, title="other", tags={"vector_dims": "3"}),
-        ],
-    )
-    err = _reject_lower(
-        "COPY (SELECT g.video[1], array_agg(STRUCT(v.start_t AS start_t, "
-        "v.end_t AS end_t, v.vector AS vector)::embedding) AS all_vectors "
-        "FROM input('o.mkv') g, input('d.mkv') f, unnest(f.embeddings) v "
-        "GROUP BY g.video[1]) TO 'out.mkv'",
-        probes,
-    )
-    assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "embedding 3 carries 3 numbers, and embedding 1 carries 2" in err.message
-
-
 def test_a_titled_track_into_a_container_that_is_not_matroska_is_refused() -> None:
     err = _reject_lower(
         "COPY (SELECT f.video[1], "
@@ -9606,22 +9488,6 @@ def test_a_titled_track_into_a_container_that_is_not_matroska_is_refused() -> No
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "'out.mp4' is mp4, and a titled track is Matroska's" in err.message
     assert "write the file as .mkv" in (err.hint or "")
-
-
-def test_a_vector_track_into_a_container_that_is_not_matroska_is_refused(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _extracted(monkeypatch, _described_tracks())
-    err = _reject_lower(
-        "COPY (SELECT g.video[1], array_agg(STRUCT(v.start_t AS start_t, "
-        "v.end_t AS end_t, v.vector AS vector)::embedding) AS clip_vectors "
-        "FROM input('o.mkv') g, input('d.mkv') f, unnest(f.embeddings) v "
-        "GROUP BY g.video[1]) TO 'out.mp4'",
-        _described_probes(),
-    )
-    assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "'out.mp4' is mp4, and a vector track is Matroska's" in err.message
-    assert "no other container keeps its vector_dims tag" in err.message
 
 
 def test_an_untitled_caption_track_still_writes_to_any_container() -> None:
@@ -9670,23 +9536,23 @@ def test_merge_cues_leaves_a_gap_past_max_distance_alone() -> None:
     assert sinks[0].result.rows == [[0.0, 0.6], [0.7, 1.3], [1.4, 2.0]]
 
 
-def test_merge_cues_merges_vector_rows_and_keeps_the_first_rows_vector(
+def test_merge_cues_over_one_titled_track_keeps_the_first_rows_fields(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The two rows are back to back, so they are one span; every field but
-    the bounds is the first row's, the vector included."""
+    the bounds is the first row's, and `text` joins with one space."""
     _extracted(monkeypatch, _described_tracks())
     sinks = lower_table(
         resolve(
             parse(
-                "SELECT v.track, v.start_t, v.end_t, vector_length(v.vector) "
+                "SELECT v.track, v.start_t, v.end_t, v.text "
                 "FROM input('d.mkv') f, "
-                "unnest(merge_cues(f.embeddings['clip_vectors'], 0)) v"
+                "unnest(merge_cues(f.cues['aside'], 0)) v"
             )
         ),
         _described_probes(),
     )
-    assert sinks[0].result.rows == [["clip_vectors", 0.0, 3.0, 2]]
+    assert sinks[0].result.rows == [["aside", 0.0, 3.0, "Look Listen"]]
 
 
 def test_a_gather_narrows_the_rows_before_they_merge(
@@ -9699,7 +9565,7 @@ def test_a_gather_narrows_the_rows_before_they_merge(
             parse(
                 "SELECT v.start_t, v.end_t FROM input('d.mkv') f, "
                 "unnest(merge_cues(ARRAY(SELECT w FROM "
-                "unnest(f.embeddings['clip_vectors']) w WHERE w.start_t > 0), 0)) v"
+                "unnest(f.cues['aside']) w WHERE w.start_t > 0), 0)) v"
             )
         ),
         _described_probes(),
@@ -12208,24 +12074,18 @@ _THREE_SPANS = (
     CueMeta(index=3, text="a car drove down the road", start_t=3.0, end_t=4.0),
 )
 
-# A body carrying a stream column beside the two bounds it read off the
-# vector rows, so the rules for the two kinds are exercised side by side.
+# A body carrying a stream column beside the two bounds it read off the cue
+# rows, so the rules for the two kinds are exercised side by side.
 _BEST_CTE = (
     "WITH best AS ("
     "  SELECT g.video[1] AS v, w.start_t, w.end_t"
-    "  FROM input('o.mkv') g, input('d.mkv') f, unnest(f.embeddings) w"
+    "  FROM input('o.mkv') g, input('d.mkv') f, unnest(f.cues['speech']) w"
 )
 
 
 def _three_span_tracks() -> dict[int, list[CueMeta]]:
-    """A caption track and a vector track over the same three spans."""
-    return {
-        0: list(_THREE_SPANS),
-        1: [
-            replace(cue, text=_payload(_TWO_VECTORS[cue.index % 2]))
-            for cue in _THREE_SPANS
-        ],
-    }
+    """One caption track over three spans; the file's other track is empty."""
+    return {0: list(_THREE_SPANS)}
 
 
 def _trim_windows(g: Graph) -> list[tuple[object, object]]:
@@ -12237,7 +12097,7 @@ def _trim_windows(g: Graph) -> list[tuple[object, object]]:
     ]
 
 
-def test_an_embedding_rows_bounds_sort_the_cte_they_left(
+def test_a_cue_rows_bounds_sort_the_cte_they_left(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """An unaliased `w.start_t` names itself, as Postgres names any unaliased

@@ -2322,25 +2322,6 @@ $ ffrwd -f query.sql
  2        | 320   | 240
 (2 rows)
 ```
-## 119. Read a described file's rows back
-
-The mirror: `embeddings` is the rows of every vector track a file carries, read at compile time by extracting each track once, and `track` names the title it came from.
-
-```pgsql
-SELECT v.track, v.start_t, v.end_t, vector_length(v.vector) AS dims
-FROM input('tests/fixtures/described.mkv') f, unnest(f.embeddings) v
-```
-
-```
-$ ffrwd -f query.sql
- track        | start_t | end_t | dims
---------------+---------+-------+------
- clip_vectors | 0.0     | 1.5   | 8
- clip_vectors | 1.5     | 3.0   | 8
- clip_vectors | 3.0     | 4.0   | 8
-(3 rows)
-```
-
 ## 120. Rows named once, used twice
 
 SQL cannot reference a column alias it is still computing, so a CTE is the only way to write a producer's rows once and read them twice: on their own, and as a rows function's argument. The CTE column resolves back to the producer that wrote it, exactly as the inline spelling does, so `captions` still lowers once - `cues` and `translated` both read off the one node:
@@ -2372,7 +2353,7 @@ $ ffrwd -f query.sql
 
 `cues` and `translated` are two different subtitle placeholders, each its own rows document - but one `captions` node writes both: `translated` reads `cues`'s rows through the same rows edge [recipe 113](#113-translate-captions-as-they-are-produced) draws inline, resolved here through the CTE column that names it instead of the call that produced it. A chain of CTEs - `d` selecting from a CTE that itself selects `captions(...).cues` - resolves the same edge the same way, one level further back.
 
-`cues` reads back the same way over the caption tracks - `unnest(f.cues) c` is every one of them, with `c.track`, `c.text` and the bounds - and a title names one track: `unnest(f.embeddings['clip_vectors']) v`, `unnest(f.cues['speech']) c`. A title the file does not carry is a rejection listing the ones it does. The rows are compile-time rows like any other, so `WHERE`, `ORDER BY` and `cos_similarity(v.vector, embed_text('a small pet'))` narrow and rank them ([recipe 114](#114-rank-rows-by-a-vector)) before anything runs.
+`cues` reads back the same way over the caption tracks - `unnest(f.cues) c` is every one of them, with `c.track`, `c.text` and the bounds - and a title names one track: `unnest(f.cues['speech']) c`. A title the file does not carry is a rejection listing the ones it does. The rows are compile-time rows like any other, so `WHERE` and `ORDER BY` narrow and rank them before anything runs.
 
 ## 121. Pace a concatenation to a live destination
 
@@ -2626,16 +2607,15 @@ collapses runs of them into one row each: a row whose `start_t` is no more
 than `max_distance` past the run's end joins that run, and the run becomes
 one row from the first start to the furthest end. It stands where the column
 does, so `unnest(merge_cues(...)) v` reads its rows exactly as
-`unnest(f.embeddings) v` reads the file's own. [Recipe
-119](#119-read-a-described-files-rows-back) lists the three rows this file
-carries; back to back, they are one span:
+`unnest(f.cues) v` reads the file's own. This file's `speech` track carries
+three rows; back to back, they are one span:
 
 ```pgsql
 COPY (
   SELECT concat(VARIADIC array_agg(ffmpeg.trim(f.video[1], start => v.start_t, end => v.end_t))),
          concat(VARIADIC array_agg(ffmpeg.atrim(f.audio[1], start => v.start_t, end => v.end_t)))
   FROM input('tests/fixtures/described.mkv') f,
-       unnest(merge_cues(f.embeddings['clip_vectors'], 1)) v
+       unnest(merge_cues(f.cues['speech'], 1)) v
 ) TO 'clips.mp4'
 ```
 
@@ -2648,8 +2628,8 @@ ffmpeg -i tests/fixtures/described.mkv -filter_complex \
 ```
 
 Any array of records carrying `start_t` and `end_t` merges - `cues`,
-`embeddings`, `chapters` - and the result is the same record type, so what
-reads it does not change. A `text` field joins with one space; every other
+`chapters`, a module's own annotation rows - and the result is the same
+record type, so what reads it does not change. A `text` field joins with one space; every other
 field is the first row's. `max_distance` defaults to 0, which still merges
 rows that touch or overlap; a negative one is refused, and so is a column
 whose records carry no span.
@@ -2667,7 +2647,7 @@ COPY (
   SELECT concat(VARIADIC array_agg(ffmpeg.trim(f.video[1], start => v.start_t, end => v.end_t))),
          concat(VARIADIC array_agg(ffmpeg.atrim(f.audio[1], start => v.start_t, end => v.end_t)))
   FROM input('tests/fixtures/described.mkv') f,
-       unnest(merge_cues(ARRAY(SELECT w FROM unnest(f.embeddings['clip_vectors']) w
+       unnest(merge_cues(ARRAY(SELECT w FROM unnest(f.cues['speech']) w
                                WHERE w.start_t <> 1.5), 1)) v
 ) TO 'clips.mp4'
 ```
@@ -2690,10 +2670,10 @@ The middle row is dropped, the two that survive are 1.5 seconds apart, and
 `max_distance` is 1 - so they stay two rows and the query cuts two clips. The
 predicate reads the gather's own columns and no other alias; it is the same
 compile-time grammar a `WHERE` over these rows takes. Reach for this to cut
-what a vector search found without one trim per row: swap the predicate for
-`cos_similarity(w.vector, <a prompt's vector>) > <threshold>` ([recipe
-117](examples.md#117-rank-rows-by-a-vector)) and the neighbouring hits arrive as one
-clip each.
+what a search found without one trim per row: swap the predicate for one
+that scores each row - `cos_similarity(...) > <threshold>` over a packet
+sink's own rows ([recipe 138](#138-read-a-streams-own-packets-while-compiling))
+reads the same way - and the neighbouring hits arrive as one clip each.
 
 ## 133. Merge a module's rows as they are written
 
@@ -2735,64 +2715,14 @@ through untouched. Merging rows a rows function is about to read is refused
 instead: that function reads every row the module produced, so merge what it
 returns.
 
-## 134. Search two vector spaces at once
-
-A vector only means anything against the embedder that wrote it, so a search
-over a file described by two of them is one branch per track, `UNION ALL`'d,
-each narrowed to its own rows before the comparison that ranks them - one
-`WHERE` mixing both would compare every row against both prompts, including
-rows of a width the other embedder never wrote. A branch whose `WHERE` keeps
-no row aggregates over nothing, and `array_agg` over zero rows is NULL, as
-in Postgres; a NULL column is one `COPY` does not write, so that branch
-contributes no segment and the command is the surviving branch's alone.
-`described.mkv` carries clip vectors and no sound vectors, so the second
-branch here drops out entirely:
-
-```pgsql
-COPY (
-  SELECT concat(VARIADIC array_agg(ffmpeg.trim(f.video[1], start => v.start_t, end => v.end_t))),
-         concat(VARIADIC array_agg(ffmpeg.atrim(f.audio[1], start => v.start_t, end => v.end_t)))
-  FROM input('tests/fixtures/described.mkv') f, unnest(f.embeddings) v
-  WHERE v.track = 'clip_vectors'
-  UNION ALL
-  SELECT concat(VARIADIC array_agg(ffmpeg.trim(g.video[1], start => w.start_t, end => w.end_t))),
-         concat(VARIADIC array_agg(ffmpeg.atrim(g.audio[1], start => w.start_t, end => w.end_t)))
-  FROM input('tests/fixtures/described.mkv') g, unnest(g.embeddings) w
-  WHERE w.track = 'sound_vectors'
-) TO 'clips.mp4'
-```
-
-```
-$ ffrwd compile -f query.sql
-ffmpeg -i tests/fixtures/described.mkv -filter_complex \
-  '[0:v:0]split=3[src_f_v_0_split0][src_f_v_0_split1][src_f_v_0_split2];'\
-'[src_f_v_0_split0]trim=start=0.0:end=1.5[n1];'\
-'[src_f_v_0_split1]trim=start=1.5:end=3.0[n2];'\
-'[src_f_v_0_split2]trim=start=3.0:end=4.0[n3];[n1]setpts=PTS-STARTPTS[n1_pts];'\
-'[n2]setpts=PTS-STARTPTS[n2_pts];[n3]setpts=PTS-STARTPTS[n3_pts];'\
-'[n1_pts][n2_pts][n3_pts]concat=n=3:v=1:a=0[out0];'\
-'[0:a:0]asplit=3[src_f_a_0_split0][src_f_a_0_split1][src_f_a_0_split2];'\
-'[src_f_a_0_split0]atrim=start=0.0:end=1.5[n5];'\
-'[src_f_a_0_split1]atrim=start=1.5:end=3.0[n6];'\
-'[src_f_a_0_split2]atrim=start=3.0:end=4.0[n7];[n5]asetpts=PTS-STARTPTS[n5_pts];'\
-'[n6]asetpts=PTS-STARTPTS[n6_pts];[n7]asetpts=PTS-STARTPTS[n7_pts];'\
-'[n5_pts][n6_pts][n7_pts]concat=n=3:v=0:a=1[out1]' -map '[out0]' -map '[out1]' clips.mp4
-```
-
-Reach for this to search everything a file was described with in one query,
-however many spaces did the describing: add a branch per track and let the
-ones that match nothing fall away. Every branch matching nothing is the
-other case - there is no file to write, and the compile refuses by name
-rather than writing an empty one.
-
 ## 135. Rank in a CTE, stitch in time order
 
 A find is two orders at once: the rows are picked by score and written by
 time. One SELECT has only one - it sorts once, and row order is the
 aggregation order - so the ranking goes in a CTE and the outer query
-re-sorts what survives. A body column read off a track, cue, embedding or
-rendition row is a value column of the CTE's rows, named after itself when
-nothing renames it, so `w.start_t` reads back as `b.start_t` outside:
+re-sorts what survives. A body column read off a track, cue or rendition
+row is a value column of the CTE's rows, named after itself when nothing
+renames it, so `w.start_t` reads back as `b.start_t` outside:
 
 ```pgsql
 CREATE FUNCTION embed_text(prompt text) RETURNS vector
@@ -2803,8 +2733,8 @@ COPY (
   WITH best AS (
     SELECT g.video[1] AS v, g.audio[1] AS a, w.start_t, w.end_t
     FROM input('tests/fixtures/described.mkv') g,
-         unnest(g.embeddings['clip_vectors']) w
-    ORDER BY cos_similarity(w.vector, embed_text('a small pet')) DESC
+         unnest(g.cues['speech']) w
+    ORDER BY cos_similarity(embed_text(w.text), embed_text('a small pet')) DESC
     LIMIT 2
   )
   SELECT concat(VARIADIC array_agg(ffmpeg.trim(b.v,  start => b.start_t, end => b.end_t))),
@@ -2818,21 +2748,22 @@ COPY (
 $ ffrwd compile -f query.sql
 ffmpeg -i tests/fixtures/described.mkv -filter_complex \
   '[0:v:0]split=2[src_g_v_0_split0][src_g_v_0_split1];'\
-'[src_g_v_0_split0]trim=start=0.0:end=1.5[n1];'\
-'[src_g_v_0_split1]trim=start=1.5:end=3.0[n2];[n1]setpts=PTS-STARTPTS[n1_pts];'\
+'[src_g_v_0_split0]trim=start=1.5:end=3.0[n1];'\
+'[src_g_v_0_split1]trim=start=3.0:end=4.0[n2];[n1]setpts=PTS-STARTPTS[n1_pts];'\
 '[n2]setpts=PTS-STARTPTS[n2_pts];[n1_pts][n2_pts]concat=n=2:v=1:a=0[out0];'\
 '[0:a:0]asplit=2[src_g_a_0_split0][src_g_a_0_split1];'\
-'[src_g_a_0_split0]atrim=start=0.0:end=1.5[n4];'\
-'[src_g_a_0_split1]atrim=start=1.5:end=3.0[n5];[n4]asetpts=PTS-STARTPTS[n4_pts];'\
+'[src_g_a_0_split0]atrim=start=1.5:end=3.0[n4];'\
+'[src_g_a_0_split1]atrim=start=3.0:end=4.0[n5];[n4]asetpts=PTS-STARTPTS[n4_pts];'\
 '[n5]asetpts=PTS-STARTPTS[n5_pts];[n4_pts][n5_pts]concat=n=2:v=0:a=1[out1]' -map \
   '[out0]' -map '[out1]' clips.mp4
 ```
 
-The prompt ranks the second span above the first and the third last, so the
-`LIMIT 2` keeps spans 2 and 1 in that order; `ORDER BY b.start_t` puts them
-back as 0.0-1.5 then 1.5-3.0, which is what the concat writes. Drop the
+The prompt ranks the third span first and the second next ([recipe
+117](examples.md#117-rank-rows-by-a-vector) scores the same three lines), so
+the `LIMIT 2` keeps spans 3 and 2 in that order; `ORDER BY b.start_t` puts
+them back as 1.5-3.0 then 3.0-4.0, which is what the concat writes. Drop the
 outer `ORDER BY` and the same two spans stitch in score order instead -
-1.5-3.0 first. `ORDER BY`, `LIMIT` and `WHERE` inside the body narrow and
+3.0-4.0 first. `ORDER BY`, `LIMIT` and `WHERE` inside the body narrow and
 order its rows before the outer query sees them; outside, they re-order and
 filter what the body handed over.
 
@@ -2874,7 +2805,7 @@ over them - so an exact line, or `upper(b.text)`, not a pattern match.
 Two different files this time, not two branches of one: each candidate gets
 its own `input()`, its own window, and its own `WHERE`. A candidate whose
 window never lands - `av2.mp4`'s series rows never reach 9 - drops out the
-same way an empty vector-space branch does, and that means its `input()`
+same way a branch whose `WHERE` keeps no row does, and that means its `input()`
 alias never opens either. Trying a candidate costs nothing when it does not
 pan out:
 

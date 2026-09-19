@@ -277,12 +277,10 @@ sqlglot notes that matter here
 from __future__ import annotations
 
 import base64
-import binascii
 import difflib
 import json
 import math
 import re
-import struct
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Literal, cast
@@ -429,8 +427,6 @@ from ffrwd.types import (
     CUES_COLUMN,
     DISPOSITION_COLUMN,
     DISPOSITION_KEYS,
-    EMBEDDING_TYPE,
-    EMBEDDINGS_COLUMN,
     INPUT_DURATION_COLUMN,
     RECORD_ARRAY_COLUMNS,
     RECORD_ELEMENTS,
@@ -475,7 +471,6 @@ from ffrwd.wasm import (
     input_rows_arms,
     language_tag,
     rows_arms,
-    rows_vector_dims,
 )
 from ffrwd.wasm import invoke as wasm_invoke
 from ffrwd.wasm import probe_source as wasm_probe_source
@@ -681,18 +676,6 @@ _CUE_ARRAY_HINT = (
     f"ARRAY[{_CUE_EXAMPLE}], or "
     f"array_agg(STRUCT(c.title AS text, c.start_t AS start_t, c.end_t AS "
     f"end_t)::{CUE_TYPE}) over chapter rows"
-)
-_EMBEDDING_LITERAL = (
-    f"STRUCT(... AS start_t, ... AS end_t, ... AS vector)::{EMBEDDING_TYPE}"
-)
-_EMBEDDING_EXAMPLE = (
-    f"STRUCT(v.start_t AS start_t, v.end_t AS end_t, v.vector AS vector)"
-    f"::{EMBEDDING_TYPE}"
-)
-_EMBEDDING_ARRAY_HINT = (
-    f"an array of {EMBEDDING_TYPE} records IS a vector track, e.g. "
-    f"array_agg({_EMBEDDING_EXAMPLE}) over the rows of "
-    f"unnest(<input>.{EMBEDDINGS_COLUMN})"
 )
 _ATTACHMENT_LITERAL = (
     f"STRUCT(... AS filename, ... AS mimetype, ... AS path)::{ATTACHMENT_TYPE}"
@@ -2025,18 +2008,6 @@ class _Cue:
     end_node: exp.Expr
 
 
-@dataclass(frozen=True)
-class _Embedding:
-    """One written embedding: its span, its vector, and where both were written."""
-
-    start: int | float
-    end: int | float
-    vector: tuple[float, ...]
-    start_node: exp.Expr
-    end_node: exp.Expr
-    vector_node: exp.Expr
-
-
 def _chapters_ffmetadata(chapters: Sequence[_Chapter]) -> str:
     """One evaluated ``chapter[]`` as an ffmetadata document's text.
 
@@ -2229,12 +2200,6 @@ def _rows_meta(tag: str | None) -> StreamMeta | None:
 # track read back is named by.
 STREAM_TITLE_TAG = "title"
 
-# A vector track's own stream tag: how many numbers each of its blocks
-# carries. It is what tells a vector track from a caption track when a file
-# is read back, and how to read the payload.
-VECTOR_DIMS_TAG = "vector_dims"
-_VECTOR_ITEM_BYTES = 4
-
 # The document's first word, the separator between a cue's two bounds, and
 # the two characters WebVTT reads as markup inside a cue.
 _WEBVTT_MAGIC = "WEBVTT"
@@ -2242,7 +2207,7 @@ _CUE_ARROW = "-->"
 _WEBVTT_ESCAPES = (("&", "&amp;"), ("<", "&lt;"))
 
 
-def _cues_webvtt(cues: Sequence[_Cue], noun: str = CUE_TYPE) -> str:
+def _cues_webvtt(cues: Sequence[_Cue]) -> str:
     """One evaluated ``cue[]`` as a WebVTT document's text.
 
     ``WEBVTT`` then one block per cue, in written order, blocks separated by
@@ -2250,45 +2215,17 @@ def _cues_webvtt(cues: Sequence[_Cue], noun: str = CUE_TYPE) -> str:
     cues in it. Bounds render as ``HH:MM:SS.mmm``, which is the only
     timestamp spelling WebVTT has -- so a bound is written to the
     millisecond and reads back to the millisecond.
-
-    `noun` names the record a rejection is about: an embedding's rows travel
-    in this same document, its vectors written as the text of each block.
     """
     blocks = [_WEBVTT_MAGIC]
     previous: int | float | None = None
     for position, cue in enumerate(cues, start=1):
         _check_cue_span(
-            noun, position, cue.start, cue.end, previous, cue.start_node, cue.end_node
+            position, cue.start, cue.end, previous, cue.start_node, cue.end_node
         )
         previous = cue.start
         timing = f"{_cue_timestamp(cue.start)} {_CUE_ARROW} {_cue_timestamp(cue.end)}"
         blocks.append(f"{timing}\n{cue.text}")
     return "\n\n".join(blocks) + "\n"
-
-
-def _vector_payload(values: Sequence[float]) -> str:
-    """One vector as the text its block carries: little-endian f32, base64.
-
-    The row's other fields are not in the payload -- its bounds are the
-    block's own timing, and the track's title names the column it came from.
-    """
-    return base64.b64encode(struct.pack(f"<{len(values)}f", *values)).decode()
-
-
-def _vector_values(payload: str, dims: int) -> tuple[float, ...] | None:
-    """One block's text read back as `dims` floats, or None if it is not that.
-
-    The converse of :func:`_vector_payload`: text that is not base64, or
-    whose bytes are not exactly `dims` little-endian f32, is not a vector
-    this wrote.
-    """
-    try:
-        raw = base64.b64decode(payload.strip(), validate=True)
-    except (ValueError, binascii.Error):
-        return None
-    if len(raw) != dims * _VECTOR_ITEM_BYTES:
-        return None
-    return struct.unpack(f"<{dims}f", raw)
 
 
 def _cue_timestamp(seconds: int | float) -> str:
@@ -2301,7 +2238,6 @@ def _cue_timestamp(seconds: int | float) -> str:
 
 
 def _check_cue_span(
-    noun: str,
     position: int,
     start: int | float,
     end: int | float,
@@ -2309,27 +2245,28 @@ def _check_cue_span(
     start_cell: exp.Expr,
     end_cell: exp.Expr,
 ) -> None:
-    """One written row against the two rules a WebVTT document obeys.
+    """One written cue against the two rules a WebVTT document obeys.
 
-    A row runs forward and the document lists its rows in ascending order.
+    A cue runs forward and the document lists its cues in ascending order.
     Overlap is NOT a rule here, unlike a chapter list: WebVTT is allowed to
     show two captions at once, and a player draws both.
     """
     if start >= end:
         raise _error(
             ErrorCode.UNSUPPORTED_SQL,
-            f"{noun} {position} ends at {end}, which is not after its start {start}",
+            f"{CUE_TYPE} {position} ends at {end}, which is not after its start "
+            f"{start}",
             end_cell,
-            hint=f"a {noun} runs from start_t to end_t: end_t must be larger",
+            hint=f"a {CUE_TYPE} runs from start_t to end_t: end_t must be larger",
         )
     if previous is not None and start < previous:
         raise _error(
             ErrorCode.UNSUPPORTED_SQL,
-            f"{noun} {position} starts at {start}, before {noun} {position - 1} at "
-            f"{previous}",
+            f"{CUE_TYPE} {position} starts at {start}, before {CUE_TYPE} "
+            f"{position - 1} at {previous}",
             start_cell,
-            hint=f"a WebVTT document lists its rows in ascending order; reorder "
-            f"them. Two {noun} rows MAY overlap",
+            hint="a WebVTT document lists its rows in ascending order; reorder "
+            f"them. Two {CUE_TYPE} rows MAY overlap",
         )
 
 
@@ -2386,18 +2323,10 @@ def _cue_rows(
     ]
 
 
-def _record_tracks(column: str, result: ProbeResult) -> list[StreamMeta]:
-    """The tracks one record column reads, in file order.
-
-    A container's caption streams, each belonging to `cues` or to
-    `embeddings` by its ``vector_dims`` tag and never to both.
-    """
-    wants_vectors = column == EMBEDDINGS_COLUMN
-    return [
-        meta
-        for meta in result.by_type("subtitle")
-        if (VECTOR_DIMS_TAG in meta.metadata) == wants_vectors
-    ]
+def _record_tracks(result: ProbeResult) -> list[StreamMeta]:
+    """The tracks the `cues` column reads: a container's caption streams, in
+    file order."""
+    return list(result.by_type("subtitle"))
 
 
 def _track_name(title: str | None, meta: StreamMeta) -> str:
@@ -2414,25 +2343,6 @@ def _titled_track_hint(source: str, column: str, titles: Sequence[str]) -> str:
         )
     listed = ", ".join(f"'{title}'" for title in titles)
     return f"the {column} tracks it carries are titled {listed}"
-
-
-def _written_vector(value: RowValue, node: exp.Expr) -> tuple[float, ...]:
-    """One evaluated ``vector`` as the numbers its block carries.
-
-    A vector has no literal, so the value here came from a row column or a
-    value function's own RETURNS; anything else -- a number, text, NULL --
-    is not one.
-    """
-    if not isinstance(value, tuple):
-        got = "NULL" if value is None else repr(value)
-        raise _error(
-            ErrorCode.UNSUPPORTED_SQL,
-            f"'{EMBEDDING_TYPE}.vector' must be a vector, got {got}",
-            node,
-            hint="a vector comes from a vector row column or a RETURNS vector "
-            f"function, e.g. {_EMBEDDING_EXAMPLE}",
-        )
-    return value
 
 
 def _attachment_path(value: RowValue, node: exp.Expr) -> str:
@@ -3587,10 +3497,9 @@ class _Lowerer:
         # alias -> its INTERNAL input options. Merged into `Graph.input_options`
         # by `_lower_input_options`, which is the only writer of that field.
         self.minted_input_options: dict[str, dict[str, object]] = {}
-        # The metadata tracks this pass minted -- a written cue or embedding
-        # array, a module's rows -- each mapped to the `-metadata:s:` keys it
-        # carries. A SELECT alias over one adds `title`; a vector track
-        # already carries its `vector_dims`. Read by `_outputs`.
+        # The metadata tracks this pass minted -- a written cue array, a
+        # module's rows -- each mapped to the `-metadata:s:` keys it carries.
+        # A SELECT alias over one adds `title`. Read by `_outputs`.
         self.minted_track_meta: dict[FrameRef, dict[str, str]] = {}
         # The tag columns of the query being lowered; reset per query, since
         # two COPYs may tag the same track differently.
@@ -4373,14 +4282,13 @@ class _Lowerer:
         path: str | None,
         raw: RawSink,
     ) -> None:
-        """Refuse a titled or vector track into a container that loses it.
+        """Refuse a titled track into a container that loses its title.
 
         A metadata track is written to be READ again, and what makes that
-        possible is the tags beside it: the title the column's alias wrote,
-        and a vector track's ``vector_dims``. Matroska keeps both verbatim;
-        mp4 renames a title and drops any tag it has no field for, so the
-        file would come back nameless or unreadable. An UNTITLED caption
-        track is unaffected -- it says nothing about itself to lose.
+        possible is the title the column's alias wrote beside it. Matroska
+        keeps it verbatim; mp4 renames it, so the file would come back
+        nameless. An UNTITLED caption track is unaffected -- it says nothing
+        about itself to lose.
         """
         if path is None:
             return
@@ -4391,16 +4299,6 @@ class _Lowerer:
             metadata = self.minted_track_meta.get(output.ref)
             if not metadata:
                 continue
-            if VECTOR_DIMS_TAG in metadata:
-                raise _error(
-                    ErrorCode.UNSUPPORTED_SQL,
-                    f"'{path}' is {container}, and a vector track is "
-                    f"Matroska's: no other container keeps its "
-                    f"{VECTOR_DIMS_TAG} tag, so the rows could not be read "
-                    "back",
-                    raw.path_node,
-                    hint="write the file as .mkv, or drop the vector column",
-                )
             title = metadata.get(STREAM_TITLE_TAG)
             if title is not None:
                 raise _error(
@@ -5978,7 +5876,7 @@ class _Lowerer:
         """A metadata track's alias is the title the output writes for it.
 
         The one place a SELECT alias means anything to a STREAM column: a
-        written cue or embedding array is a track this pass minted, and the
+        written cue array is a track this pass minted, and the
         name the query gave the column is the only name that track has. A
         column over anything else keeps the alias as documentation.
         """
@@ -7793,38 +7691,31 @@ class _Lowerer:
         anchor: exp.Expr,
         select: exp.Select,
     ) -> list[dict[str, RowValue]]:
-        """The rows of a ``cues`` / ``embeddings`` column, track by track.
+        """The rows of a ``cues`` column, track by track.
 
         ffprobe reports that a file CARRIES caption tracks and never what is
         in them, so each one is demuxed to WebVTT text and read from there
         (:func:`ffrwd.probe.track_cues`). A WebVTT DOCUMENT is its own single
-        nameless track, already read when it was probed, and carries no
-        vectors.
+        nameless track, already read when it was probed.
 
-        A track's ``vector_dims`` tag is what says which column it belongs
-        to: with it, the blocks are vectors and the rows are `embeddings`;
-        without it, they are captions and the rows are `cues`. Rows keep
-        file order, and `index` counts within each track. `title_wanted` is
-        a subscript naming ONE track, which the file has to carry.
+        Rows keep file order, and `index` counts within each track.
+        `title_wanted` is a subscript naming ONE track, which the file has to
+        carry.
         """
         path = self._path_of(source)
         rows: list[dict[str, RowValue]] = []
         titles: list[str] = []
         document = result.format_name == WEBVTT_FORMAT
         if document and title_wanted is None:
-            return (
-                []
-                if column == EMBEDDINGS_COLUMN
-                else _cue_rows(result.cues, None)
-            )
-        for meta in [] if document else _record_tracks(column, result):
+            return _cue_rows(result.cues, None)
+        for meta in [] if document else _record_tracks(result):
             title = meta.metadata.get(STREAM_TITLE_TAG)
             if title is not None:
                 titles.append(title)
             if title_wanted is not None and title != title_wanted:
                 continue
             cues = track_cues(path, meta.index, self._input_flags(source))
-            rows += self._track_rows(source, column, meta, title, cues, anchor, select)
+            rows += _cue_rows(cues, title)
         if title_wanted is not None and not rows:
             raise _error(
                 ErrorCode.STREAM_NOT_FOUND,
@@ -7834,67 +7725,6 @@ class _Lowerer:
                 hint=_titled_track_hint(source, column, titles),
             )
         return rows
-
-    def _track_rows(
-        self,
-        source: str,
-        column: str,
-        meta: StreamMeta,
-        title: str | None,
-        cues: Sequence[CueMeta],
-        anchor: exp.Expr,
-        select: exp.Select,
-    ) -> list[dict[str, RowValue]]:
-        """One track's blocks as its rows: captions, or the vectors in them."""
-        if column == CUES_COLUMN:
-            return _cue_rows(cues, title)
-        dims = self._track_dims(source, meta, title, anchor, select)
-        rows: list[dict[str, RowValue]] = []
-        for cue in cues:
-            values = _vector_values(cue.text, dims)
-            if values is None:
-                raise _error(
-                    ErrorCode.UNSUPPORTED_SQL,
-                    f"'{self._path_of(source)}' track {_track_name(title, meta)} "
-                    f"row {cue.index} does not hold {dims} numbers",
-                    anchor,
-                    fallback=select,
-                    hint=f"a vector track's rows are its {VECTOR_DIMS_TAG} numbers "
-                    "as little-endian f32, base64; this one was written by "
-                    "something else",
-                )
-            rows.append(
-                {
-                    "index": cue.index,
-                    "track": title,
-                    "start_t": cue.start_t,
-                    "end_t": cue.end_t,
-                    "vector": values,
-                }
-            )
-        return rows
-
-    def _track_dims(
-        self,
-        source: str,
-        meta: StreamMeta,
-        title: str | None,
-        anchor: exp.Expr,
-        select: exp.Select,
-    ) -> int:
-        """How many numbers one vector track's rows carry, from its own tag."""
-        written = meta.metadata.get(VECTOR_DIMS_TAG, "")
-        if not written.isdigit() or int(written) == 0:
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL,
-                f"'{self._path_of(source)}' track {_track_name(title, meta)} says "
-                f"{VECTOR_DIMS_TAG}='{written}'",
-                anchor,
-                fallback=select,
-                hint=f"{VECTOR_DIMS_TAG} counts the numbers in each row's vector, "
-                "so it is a positive whole number",
-            )
-        return int(written)
 
     def _input_flags(self, alias: str) -> tuple[str, ...]:
         """One input's own options as argv, for a second read of the file.
@@ -7923,9 +7753,9 @@ class _Lowerer:
     ) -> ProbeResult:
         """The probe a record array column reads, or the rejection for it.
 
-        Only that the file was readable at all: what a `cues` or
-        `embeddings` column then finds in it is a property of its TRACKS,
-        which :meth:`_track_record_columns` reads one at a time.
+        Only that the file was readable at all: what a `cues` column then
+        finds in it is a property of its TRACKS, which
+        :meth:`_track_record_columns` reads one at a time.
         """
         result = self.probes.get(alias)
         if result is None:
@@ -10255,11 +10085,6 @@ class _Lowerer:
         cues = self._lower_cue_array(node, env, select)
         if cues is not None:
             return cues
-        # An array of embedding records is a track the same way, its rows
-        # carrying vectors instead of captions.
-        vectors = self._lower_embedding_array(node, env, select)
-        if vectors is not None:
-            return vectors
         # A module's annotation column is a track too, minted from the rows
         # instead of from a written document.
         rows = self._lower_rows_projection(node, env, select)
@@ -10525,167 +10350,19 @@ class _Lowerer:
                 "drop the column",
             )
         text = _cues_webvtt(cues)
-        ref = self._mint_webvtt_input(CUES_COLUMN, text, {})
+        ref = self._mint_webvtt_input(CUES_COLUMN, text)
         return _scalar(_Stream(ref=ref, type="subtitle", source=None))
 
-    def _mint_webvtt_input(
-        self, name: str, text: str, metadata: dict[str, str]
-    ) -> FrameRef:
+    def _mint_webvtt_input(self, name: str, text: str) -> FrameRef:
         """One written WebVTT document as a self-contained ``-i``, and its ref.
 
-        `metadata` is what the track says about itself beyond its title --
-        a vector track's ``vector_dims`` -- and is recorded for the output to
-        emit; the title itself lands later, from the SELECT column's alias.
+        The track is registered as one this pass minted, carrying no tags of
+        its own; a title lands later, from the SELECT column's alias.
         """
         uri = "data:text/vtt;base64," + base64.b64encode(text.encode()).decode()
         ref = self._mint_stream_input(name, uri, WEBVTT_FORMAT, "subtitle")
-        self.minted_track_meta[ref] = metadata
+        self.minted_track_meta[ref] = {}
         return ref
-
-    # -- an embedding array as a vector track -------------------------------
-
-    def _lower_embedding_array(
-        self, node: exp.Expr, env: _Env, select: exp.Select
-    ) -> _Value | None:
-        """``ARRAY[STRUCT(...)::embedding, ...]`` / ``array_agg(...)`` as a track.
-
-        A vector track rides in the same WebVTT document a caption track does
-        -- one block per row, the row's bounds as the block's timing -- with
-        each block's text the vector itself, little-endian f32 in base64. The
-        track's ``vector_dims`` tag says how many numbers that is, which is
-        what reads them back.
-        """
-        rows = self._embedding_records(node, env, select)
-        if rows is None:
-            return None
-        if not rows:
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL,
-                f"{article(EMBEDDING_TYPE)} {EMBEDDING_TYPE} array is empty, so "
-                "there is no vector track to write",
-                node,
-                fallback=select,
-                hint=f"write at least one row, e.g. ARRAY[{_EMBEDDING_EXAMPLE}], "
-                "or drop the column",
-            )
-        dims = self._embedding_dims(rows, node, select)
-        text = _cues_webvtt(
-            [
-                _Cue(
-                    start=row.start,
-                    end=row.end,
-                    text=_vector_payload(row.vector),
-                    start_node=row.start_node,
-                    end_node=row.end_node,
-                )
-                for row in rows
-            ],
-            noun=EMBEDDING_TYPE,
-        )
-        ref = self._mint_webvtt_input(
-            EMBEDDINGS_COLUMN, text, {VECTOR_DIMS_TAG: str(dims)}
-        )
-        return _scalar(_Stream(ref=ref, type="subtitle", source=None))
-
-    def _embedding_dims(
-        self, rows: list[_Embedding], node: exp.Expr, select: exp.Select
-    ) -> int:
-        """How many numbers every row of one vector track carries.
-
-        A track has ONE width -- it is a stream tag, not a per-row field --
-        so two rows of different lengths are a rejection naming both.
-        """
-        dims = len(rows[0].vector)
-        for position, row in enumerate(rows[1:], start=2):
-            if len(row.vector) != dims:
-                raise _error(
-                    ErrorCode.UNSUPPORTED_SQL,
-                    f"{EMBEDDING_TYPE} {position} carries {len(row.vector)} "
-                    f"numbers, and {EMBEDDING_TYPE} 1 carries {dims}",
-                    row.vector_node,
-                    fallback=select,
-                    hint="one track holds vectors of one length; write the rows "
-                    "of one embedder per track",
-                )
-        if dims == 0:
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL,
-                f"{EMBEDDING_TYPE} 1 carries an empty vector",
-                rows[0].vector_node,
-                fallback=select,
-                hint="a vector track holds the numbers an embedder wrote; an "
-                "empty one says nothing",
-            )
-        return dims
-
-    def _embedding_records(
-        self, node: exp.Expr, env: _Env, select: exp.Select
-    ) -> list[_Embedding] | None:
-        """The rows an embedding array lists, in written order; None if it is
-        not one. The two spellings a record list takes, exactly as a cue
-        array's."""
-        if isinstance(node, exp.ArrayAgg):
-            inner = node.this
-            relation = env.relation
-            if not isinstance(inner, exp.Expr) or record_cast_type(
-                _unwrap(inner)
-            ) != EMBEDDING_TYPE:
-                return None
-            if relation is None:
-                raise _error(
-                    ErrorCode.UNSUPPORTED_SQL,
-                    "array_agg() aggregates rows, and this query has none",
-                    node,
-                    fallback=select,
-                    hint=_EMBEDDING_ARRAY_HINT,
-                )
-            return [
-                self._embedding_record(inner, env, row, select)
-                for row in relation.tuples
-            ]
-        if isinstance(node, exp.Array):
-            elements = [item for item in node.expressions if isinstance(item, exp.Expr)]
-            if not elements or record_cast_type(_unwrap(elements[0])) != EMBEDDING_TYPE:
-                return None
-            row = _group_row(env)
-            return [
-                self._embedding_record(element, env, row, select)
-                for element in elements
-            ]
-        return None
-
-    def _embedding_record(
-        self, node: exp.Expr, env: _Env, row: _RowTuple, select: exp.Select
-    ) -> _Embedding:
-        """One ``STRUCT(start_t, end_t, vector)::embedding``, evaluated."""
-        cells = self._written_record(
-            node,
-            EMBEDDING_TYPE,
-            _EMBEDDING_LITERAL,
-            _EMBEDDING_ARRAY_HINT,
-            env,
-            row,
-            select,
-        )
-        start_cell, start = cells["start_t"]
-        end_cell, end = cells["end_t"]
-        vector_cell, vector = cells["vector"]
-        return _Embedding(
-            start=_span_number(
-                start,
-                f"{EMBEDDING_TYPE}.start_t",
-                "start_t",
-                start_cell,
-                _EMBEDDING_EXAMPLE,
-            ),
-            end=_span_number(
-                end, f"{EMBEDDING_TYPE}.end_t", "end_t", end_cell, _EMBEDDING_EXAMPLE
-            ),
-            vector=_written_vector(vector, vector_cell),
-            start_node=start_cell,
-            end_node=end_cell,
-            vector_node=vector_cell,
-        )
 
     def _cue_records(
         self, node: exp.Expr, env: _Env, select: exp.Select
@@ -10793,32 +10470,22 @@ class _Lowerer:
         The one place a row column becomes an output, whichever node ends the
         rows -- the module that read them off its frames, or the rows module
         that ran over them afterwards. `annotation` is that end's own record
-        -- `declared.emits` or `declared.returns_rows`. A vector field passed
-        module to module, never written to a track, names no length at all;
-        one reaching a track here needs one fixed, which is what
-        :meth:`_check_vector_dims` checks -- only at this, its one path to an
-        output, and not at every call a vector annotation happens to pass
-        through.
+        -- `declared.emits` or `declared.returns_rows`. A track is a WebVTT
+        document and holds text, so a record carrying a vector has no track
+        to become and is refused here, at its one path to an output, rather
+        than at every call a vector annotation passes through.
         """
         if self.rows_file:
             self.graph.rows_sinks[producer] = RowsSink(
                 container=_ROWS_CONTAINER, path=self.rows_file
             )
             return _Value(type=kind, streams=(), is_array=False)
-        described = self.describes.get(declared.module)
-        assert described is not None  # the caller already described it
-        self._check_vector_dims(declared, annotation, described, node, select)
+        self._check_no_vector_track(declared, annotation, node, select)
         tag = self._rows_language(declared, call, node, env, select)
         ref = self._mint_stream_input(
             CUES_COLUMN, PIPE, WEBVTT_FORMAT, "subtitle"
         )
-        meta: dict[str, str] = {}
-        field = _vector_field(annotation)
-        if field is not None:
-            dims = rows_vector_dims(described, field)
-            assert dims is not None  # _check_vector_dims just fixed one
-            meta[VECTOR_DIMS_TAG] = str(dims)
-        self.minted_track_meta[ref] = meta
+        self.minted_track_meta[ref] = {}
         self.graph.rows_sinks[producer] = RowsSink(
             container=WEBVTT_FORMAT, alias=src_alias(ref)
         )
@@ -13051,35 +12718,33 @@ class _Lowerer:
             "with a type each value fits",
         )
 
-    def _check_vector_dims(
+    def _check_no_vector_track(
         self,
         declared: WasmFunction,
         annotation: Annotation,
-        described: Described,
         node: exp.Expr,
         select: exp.Select,
     ) -> None:
-        """A vector-typed annotation field's length, fixed by the module's schema.
+        """Refuse a record carrying a vector where the rows become a TRACK.
 
-        The declaration says a field is a vector; only the module's own
-        schema says how many numbers one carries, and that is what tags the
-        track the field becomes (:meth:`_rows_output`). A field the schema
-        does not fix a length for is refused here, rather than minting a
-        track later with nothing to tag it.
+        A minted track is a WebVTT document, which holds text: there is no
+        spelling of a vector in one. The rows themselves are another matter
+        -- a `.ndjson` or table destination writes the vector whole -- so
+        this is about the destination, not the record.
         """
         field = _vector_field(annotation)
         if field is None:
             return
-        if rows_vector_dims(described, field) is None:
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL,
-                f"function '{declared.name}' declares '{field}' as vector, and "
-                f"the module '{declared.module}' does not fix its length",
-                node,
-                fallback=select,
-                hint="a vector track needs its dimension: declare minItems and "
-                "maxItems on the field",
-            )
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"function '{declared.name}' returns '{field}' as vector, and a "
+            "subtitle track holds text",
+            node,
+            fallback=select,
+            hint="write the rows to a .ndjson or table destination, or put the "
+            "vectors into the file itself with a RETURNS packets filter such as "
+            "ffrwd.index.weave()",
+        )
 
     def _wasm_params(
         self,
@@ -16586,8 +16251,8 @@ def _outputs(
     alias names the column, not the stream.
 
     `minted` is what a compiler-minted metadata track says about itself --
-    its title, a vector track's dimensions -- which no probe reported and
-    which therefore rides here rather than through provenance.
+    its title -- which no probe reported and which therefore rides here
+    rather than through provenance.
     """
     carried = minted or {}
     return [

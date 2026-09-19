@@ -877,19 +877,13 @@ There is no vector literal - `ARRAY[0.1, 0.2]` names an array of numbers, not th
 
 ## 118. Write rows as titled tracks
 
-A cue array in a stream position is a subtitle track; an ALIAS on it is that track's title, and several such columns are several tracks. An `embedding` array is the same shape over vectors instead of text - one row per span, its `vector` field a number list a `RETURNS vector` function produced - and it writes a track whose blocks hold those numbers as little-endian f32 in base64, tagged with how many each carries:
+A cue array in a stream position is a subtitle track; an ALIAS on it is that track's title, and several such columns are several tracks. The rows can come from anywhere the compiler can count at compile time - here a written row table, one span per line:
 
 ```pgsql
-CREATE FUNCTION embed_text(prompt text) RETURNS vector
-  AS '../sidecar/modules/target/wasm32-wasip2/release/fauxlate.wasm', 'embed_text'
-  LANGUAGE wasm;
-
 COPY (
   SELECT f.video[1], f.audio[1],
          array_agg(STRUCT(r.line AS text, r.start_t AS start_t,
-                          r.end_t AS end_t)::cue) AS speech,
-         array_agg(STRUCT(r.start_t AS start_t, r.end_t AS end_t,
-                          embed_text(r.line) AS vector)::embedding) AS clip_vectors
+                          r.end_t AS end_t)::cue) AS speech
   FROM input('tests/fixtures/av.mp4') f,
        unnest(ARRAY[
          STRUCT('a cat sat on the mat' AS line, 0 AS start_t, 1.5 AS end_t),
@@ -905,18 +899,15 @@ ffmpeg -i tests/fixtures/av.mp4 -f webvtt -i \
   'data:text/vtt;'\
 'base64,'\
 'V0VCVlRUCgowMDowMDowMC4wMDAgLS0+IDAwOjAwOjAxLjUwMAphIGNhdCBzYXQgb24gdGhlIG1hdAoKMDA6MDA6MDEuNTAwIC0tPiAwMDowMDowMy4wMDAKYSBkb2cgcmFuIGluIHRoZSB5YXJkCg==' \
-  -f webvtt -i \
-  'data:text/vtt;'\
-'base64,'\
-'V0VCVlRUCgowMDowMDowMC4wMDAgLS0+IDAwOjAwOjAxLjUwMAorNlk3UC9reitqMEFBQUFBZkdBY1Ava3plajRBQUFBQUFBQUFBUGt6K2owPQoKMDA6MDA6MDEuNTAwIC0tPiAwMDowMDowMy4wMDAKOHdRMVB3QUFBQUFBQUFBQWRka1dQd0FBQUFEdlcvRTk4d1MxUHU5YjhUMD0K' \
   -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -map 1:s:0 -c:2 copy -metadata:s:2 \
-  title=speech -map 2:s:0 -c:3 copy -metadata:s:3 title=clip_vectors -metadata:s:3 \
-  vector_dims=8 described.mkv
+  title=speech described.mkv
 ```
 
-`-metadata:s:2 title=speech` and `-metadata:s:3 title=clip_vectors` are the aliases, and `vector_dims=8` is the width `embed_text` returned - the tag that says a track holds vectors rather than captions, and how to read them. The row's other fields are not in the payload: a block's bounds are its span, and the title is the column's.
+`-metadata:s:2 title=speech` is the alias, and it is the name `f.cues['speech']` finds the track by afterwards. The row's other fields are not in the payload: a block's bounds are its span, and the title is the column's.
 
-Matroska only. A titled track written anywhere else comes back under a different name or under none, and no other container keeps `vector_dims` at all, so a `.mp4` destination is refused by name and the hint says `.mkv`. An UNTITLED cue array still writes wherever captions do ([recipe 65](#65-turn-chapters-into-a-subtitle-track-and-back)).
+Matroska only. A titled track written anywhere else comes back under a different name or under none, so a `.mp4` destination is refused by name and the hint says `.mkv`. An UNTITLED cue array still writes wherever captions do ([recipe 65](#65-turn-chapters-into-a-subtitle-track-and-back)).
+
+Vectors are not a track. A vector belonging to a span of a file goes into the file's own encoded packets, written by a `RETURNS packets` filter the destination places behind its encoder ([recipe 139](#139-rewrite-a-streams-packets-without-decoding-it)) and read back by a packet sink called in `FROM` ([corpus 138](corpus.md#138-read-a-streams-own-packets-while-compiling)). `ffrwd/index` is the package that does both for embedding vectors.
 
 ## 123. Re-lay a muxed ladder as a demuxed one
 

@@ -305,8 +305,7 @@ def test_where_over_the_rows_shapes_the_graph() -> None:
     assert "trim=start=0.0" not in printed
 
 
-# The shape `ffrwd/describe`'s find recipe writes, with packet rows standing
-# where `unnest(f.embeddings)` stands today: two spaces kept apart in two
+# The shape `ffrwd/describe`'s find recipe writes: two spaces kept apart in two
 # UNION ALL branches, each narrowed to its own space by an AND before its own
 # `cos_similarity`, so neither prompt is ever scored against the other's rows.
 _FIND_DECLARE = (
@@ -357,7 +356,7 @@ _FIND_SCHEMA: dict[str, object] = {
 
 def test_the_find_recipes_shape_works_over_packet_rows() -> None:
     """The whole point of the feature, in the shape it exists for. Packet rows
-    go through the same predicate evaluator a `unnest(f.embeddings)` row does,
+    go through the same predicate evaluator an `unnest` row does,
     so all of it holds at once: text `<>` and number `=` on a row column,
     ANDed with a `cos_similarity` against a compile-time module value, against
     a threshold that came in as a variable, in two UNION ALL branches, with

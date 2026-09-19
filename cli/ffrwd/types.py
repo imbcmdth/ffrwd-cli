@@ -25,8 +25,7 @@ Kinds:
                ``subtitle_stream``, ``data_stream``. The record IS the
                stream; identity is nominal, never field-by-field.
     record     a record that is not a stream and is a set of rows:
-               ``chapter``, ``attachment``, ``cue``, ``embedding``. An array
-               of one unnests.
+               ``chapter``, ``attachment``, ``cue``. An array of one unnests.
     map        a key/value record read by path off the column that holds it:
                ``tag``, ``flag``. ``f.tags.title`` names one entry; the array
                is never a set of rows, so it never unnests.
@@ -66,8 +65,6 @@ __all__ = [
     "CUE_TYPE",
     "DISPOSITION_COLUMN",
     "DISPOSITION_KEYS",
-    "EMBEDDINGS_COLUMN",
-    "EMBEDDING_TYPE",
     "INPUT_COLUMNS",
     "INPUT_DURATION_COLUMN",
     "MAP_ELEMENTS",
@@ -318,20 +315,6 @@ _DECLARED: tuple[Type, ...] = (
             _w("end_t", "number"),  # seconds
         ),
     ),
-    # A vector over a time span: what an embedder wrote about that stretch of
-    # the file. `index` and `track` read like a cue's; `vector` is the
-    # embedding itself.
-    Type(
-        "embedding",
-        "record",
-        (
-            _ro("index", "number"),
-            _ro("track", "text"),
-            _w("start_t", "number"),  # seconds
-            _w("end_t", "number"),  # seconds
-            _w("vector", "vector"),
-        ),
-    ),
     Type(
         "container",
         "container",
@@ -348,9 +331,6 @@ _DECLARED: tuple[Type, ...] = (
             # position (it IS a subtitle track), never as a column named
             # `cues`.
             _ro("cues", "cue[]"),
-            # Read-only, the same way: the rows of every vector track the
-            # container carries. Written in a stream position too.
-            _ro("embeddings", "embedding[]"),
             _w("attachments", "attachment[]"),
             # The seek handle: legal only in a WHERE trim window, never a
             # value and never part of SELECT *.
@@ -439,17 +419,9 @@ CUES_COLUMN = _sole(
 )
 CUE_TYPE = RECORD_ELEMENTS[CUES_COLUMN]
 
-# The container column an input's vector tracks are read as, and the record
-# each row holds.
-EMBEDDINGS_COLUMN = _sole(
-    tuple(name for name, record in RECORD_ELEMENTS.items() if record == "embedding"),
-    "the embedding array column",
-)
-EMBEDDING_TYPE = RECORD_ELEMENTS[EMBEDDINGS_COLUMN]
-
 # The record columns read out of a container's TRACKS rather than off the
 # probe: their rows come from the caption documents ffrwd extracts.
-TRACK_RECORD_COLUMNS = frozenset({CUES_COLUMN, EMBEDDINGS_COLUMN})
+TRACK_RECORD_COLUMNS = frozenset({CUES_COLUMN})
 
 # The container column an input's attachment list lives in, and the record it
 # holds.

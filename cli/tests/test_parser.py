@@ -2078,10 +2078,9 @@ def test_unnest_requires_an_alias() -> None:
 
 
 def test_a_title_subscript_names_one_track_of_a_record_column() -> None:
-    for column in ("cues", "embeddings"):
-        res = _resolve(f"SELECT r.track FROM input('f.mkv') f, unnest(f.{column}['x']) r")
-        rows = res.track_rows["r"]
-        assert (rows.column, rows.title) == (column, "x")
+    res = _resolve("SELECT r.track FROM input('f.mkv') f, unnest(f.cues['x']) r")
+    rows = res.track_rows["r"]
+    assert (rows.column, rows.title) == ("cues", "x")
 
 
 def test_a_title_subscript_on_a_stream_array_is_a_typed_rejection() -> None:
@@ -2099,17 +2098,26 @@ def test_a_numeric_subscript_in_unnest_is_still_one_stream() -> None:
     assert "one subscripted stream" in err.message
 
 
+_PACKET_ROWS_SQL = (
+    "CREATE FUNCTION records(v video_stream)\n"
+    "RETURNS STRUCT(space text, start_t number, vector vector)[]\n"
+    "  AS 'r.wasm', 'records' LANGUAGE wasm;\n"
+)
+
+
 def test_a_vector_row_column_neither_compares_nor_sorts() -> None:
-    """The same posture a computed vector has, on the column a file carries."""
+    """The same posture a computed vector has, on a row column that is one."""
     err = _reject(
-        "SELECT v.track FROM input('f.mkv') f, unnest(f.embeddings) v "
+        _PACKET_ROWS_SQL
+        + "SELECT v.space FROM input('f.mkv') f, records(f.video[1]) v "
         "WHERE v.vector = 'x'"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "'v.vector' is a vector, and a vector cannot be compared" in err.message
     assert "cos_similarity(...)" in (err.hint or "")
     err = _reject(
-        "SELECT v.track FROM input('f.mkv') f, unnest(f.embeddings) v "
+        _PACKET_ROWS_SQL
+        + "SELECT v.space FROM input('f.mkv') f, records(f.video[1]) v "
         "ORDER BY v.vector"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
@@ -2597,8 +2605,8 @@ def test_order_by_a_bare_alias_resolves_to_the_aliased_expression() -> None:
     res = _resolve(
         _VECTOR_FUNC_SQL
         + "SELECT v.track, v.start_t, "
-        "round(cos_similarity(v.vector, embed_text('x')), 4) AS score\n"
-        "FROM input('described.mkv') f, unnest(f.embeddings) v\n"
+        "round(cos_similarity(embed_text(v.text), embed_text('x')), 4) AS score\n"
+        "FROM input('described.mkv') f, unnest(f.cues) v\n"
         "ORDER BY score DESC"
     )
     order = res.branches[0].args["order"]
@@ -2615,8 +2623,8 @@ def test_order_by_alias_precedence_over_a_row_columns_own_name() -> None:
     res = _resolve(
         _VECTOR_FUNC_SQL
         + "SELECT v.track, "
-        "round(cos_similarity(v.vector, embed_text('x')), 4) AS track\n"
-        "FROM input('described.mkv') f, unnest(f.embeddings) v\n"
+        "round(cos_similarity(embed_text(v.text), embed_text('x')), 4) AS track\n"
+        "FROM input('described.mkv') f, unnest(f.cues) v\n"
         "ORDER BY track"
     )
     order = res.branches[0].args["order"]
@@ -2636,7 +2644,7 @@ def test_order_by_an_alias_over_a_vector_is_refused() -> None:
     err = _reject(
         _VECTOR_FUNC_SQL
         + "SELECT v.track, embed_text('x') AS vec\n"
-        "FROM input('described.mkv') f, unnest(f.embeddings) v\n"
+        "FROM input('described.mkv') f, unnest(f.cues) v\n"
         "ORDER BY vec"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
@@ -2648,7 +2656,7 @@ def test_order_by_a_name_matching_no_alias_is_still_rejected() -> None:
     unqualified-name rejection ORDER BY always gave."""
     err = _reject(
         "SELECT v.track, v.start_t AS score\n"
-        "FROM input('f.mkv') f, unnest(f.embeddings) v\n"
+        "FROM input('f.mkv') f, unnest(f.cues) v\n"
         "ORDER BY nope"
     )
     assert err.code is ErrorCode.NO_STREAMING_EQUIVALENT
@@ -3439,7 +3447,7 @@ def test_an_unknown_column_on_an_input_alias_is_still_unknown_the_same_way() -> 
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "unknown column 'r.mood'" in err.message
     assert "an input exposes attachments, audio, chapters, cues, data, " \
-        "duration, embeddings, subtitle, t, tags, video" in (err.hint or "")
+        "duration, subtitle, t, tags, video" in (err.hint or "")
 
 
 # -- rendition columns in WHERE: the same row-predicate grammar an unnest

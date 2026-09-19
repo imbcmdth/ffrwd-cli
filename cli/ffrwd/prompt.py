@@ -685,19 +685,30 @@ _DIALECT_TAIL = """\
   Matroska only -- another container rewrites or drops the title -- so the
   destination is a `.mkv`.
 
-### Embeddings
-- `embeddings` is a fourth record array of the input alias, the rows of
-  every VECTOR track the container carries: `FROM input('film.mkv') f,
-  unnest(f.embeddings) v`, or `unnest(f.embeddings['clip_vectors']) v` for
-  one track by title. Every row carries `index`, `track`, `start_t`, `end_t`
-  and `vector`. Read-only, like `cues`.
-- To WRITE one, put an array of `embedding` records in a STREAM position --
-  it IS a vector track: `array_agg(STRUCT(r.at AS start_t, r.at + 1 AS
-  end_t, embed_text(r.line) AS vector)::embedding) AS clip_vectors`. There
-  is no vector literal, so the `vector` field comes from a `RETURNS vector`
-  wasm function or from another file's own vector rows. The alias titles the
-  track; every row of one track carries the same number of values, which the
-  track's `vector_dims` tag records. Matroska only, for the same reason.
+### Vectors in a file
+- There is no vector track and no `embedding` record. A vector that
+  describes a span of a file travels INSIDE that file's own encoded packets,
+  so it survives a `-c copy` remux, a trim and a `UNION ALL`, and the
+  container is free. Core ffrwd learns no format: a package ships both ends,
+  and `ffrwd/index` is the one that does it for embedding vectors.
+- To WRITE them, call a `RETURNS packets` filter as a cell of the COPY's
+  SELECT. The destination places it behind the encoder it was already going
+  to place, and each producer's rows reach it as an argument of its own:
+  `COPY (SELECT <weave>(f.video[1], <producer>(f.video[1]).<rows>), f.audio[1]
+  FROM input(:'src') f) TO :'dest'`. The stream comes back packet for packet
+  with the same timestamps.
+- To READ them, call a packet SINK in `FROM` over one stream of an
+  `input()`: a declaration whose `RETURNS` is an array of records is a row
+  table the compiler fills while it compiles, by stream-copying that stream
+  into the module. `FROM input(:'src') f, <records>(f.video[1]) v WHERE ...`
+  then narrows, ranks and trims like any other rows. The module's own
+  `wants` decides how much of the stream the copy carries.
+- The `vector` VALUE type is unchanged: a `RETURNS vector` wasm function is
+  how a prompt becomes something to compare against, and
+  `cos_similarity(vector, vector)` and `vector_length(vector)` are the two
+  built-ins over it. A module's rows may carry a `vector` column to a
+  `.ndjson` or table destination, where it writes whole; a subtitle track
+  holds text, so a rows column carrying one has no track to become.
 
 ### Attachments
 - `attachments` is a third record array of the input alias, the files riding

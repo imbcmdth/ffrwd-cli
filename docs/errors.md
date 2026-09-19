@@ -332,27 +332,27 @@ FROM input('tests/fixtures/av.mp4') a
 {"line": 1, "col": 8, "code": "STREAM_NOT_FOUND", "message": "'a.video[2]' does not exist: 'tests/fixtures/av.mp4' has 1 video stream", "hint": "stream subscripts are 1-based: a.video[1] is the first video stream"}
 ```
 
-**Example query** (`described.mkv` carries clip vectors and neither of the two tracks these branches name, so both keep no row):
+**Example query** (`described.mkv` carries a caption track titled `speech` and neither of the two these branches name, so both keep no row):
 
 ```sql
 COPY (
   SELECT concat(VARIADIC array_agg(ffmpeg.trim(f.video[1], start => v.start_t, end => v.end_t)))
-  FROM input('tests/fixtures/described.mkv') f, unnest(f.embeddings) v
-  WHERE v.track = 'sound_vectors'
+  FROM input('tests/fixtures/described.mkv') f, unnest(f.cues) v
+  WHERE v.track = 'commentary'
   UNION ALL
   SELECT concat(VARIADIC array_agg(ffmpeg.trim(g.video[1], start => w.start_t, end => w.end_t)))
-  FROM input('tests/fixtures/described.mkv') g, unnest(g.embeddings) w
-  WHERE w.track = 'speech_vectors'
+  FROM input('tests/fixtures/described.mkv') g, unnest(g.cues) w
+  WHERE w.track = 'narration'
 ) TO 'clips.mp4'
 ```
 
 **Error JSON:**
 
 ```json
-{"line": 4, "col": 9, "code": "STREAM_NOT_FOUND", "message": "this COPY has nothing to write: no row matched WHERE v.track = 'sound_vectors'; WHERE w.track = 'speech_vectors'", "hint": "every selected column aggregates over zero rows, and an empty file is never written; widen the WHERE, or lower the threshold it compares against"}
+{"line": 4, "col": 9, "code": "STREAM_NOT_FOUND", "message": "this COPY has nothing to write: no row matched WHERE v.track = 'commentary'; WHERE w.track = 'narration'", "hint": "every selected column aggregates over zero rows, and an empty file is never written; widen the WHERE, or lower the threshold it compares against"}
 ```
 
-One branch keeping no row is not this: it contributes no segment and the surviving branches compile as if it were never written ([corpus 134](corpus.md#134-search-two-vector-spaces-at-once)). Nor is a branch that keeps rows for its OTHER columns - an aggregate that gathered nothing beside a column that did is a hole in a file that still gets written, and stays the `UDF_ARG_TYPE` refusal it always was.
+One branch keeping no row is not this: it contributes no segment and the surviving branches compile as if it were never written ([corpus 136](corpus.md#136-filter-outside-a-cte-on-what-a-caption-says)). Nor is a branch that keeps rows for its OTHER columns - an aggregate that gathered nothing beside a column that did is a hole in a file that still gets written, and stays the `UDF_ARG_TYPE` refusal it always was.
 
 ## INPUT_NOT_FOUND
 

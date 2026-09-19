@@ -14,7 +14,6 @@ One row per input: the shape of a container file. Arrays of streams plus the con
 | `chapters` | record array | `unnest` into chapter rows; no splat, no subscript. Bare, it prints as one array cell |
 | `attachments` | record array | files riding inside the container - `unnest` into attachment rows |
 | `cues` | record array | a WebVTT file's caption cues, or every caption track's, read-only - `unnest` into cue rows |
-| `embeddings` | record array | every vector track's rows, read-only - `unnest` into embedding rows |
 | `t` | timeline | only in `WHERE` trim windows: `f.t BETWEEN 5 AND 60`, either bound alone, or against chapter bounds |
 | `duration` | number | probed container duration in seconds |
 | `tags` | tag map | the container's own tags, read by path: `f.tags.title`, `f.tags.artist`, any key. NULL when the file doesn't carry it. Bare, it prints as one array cell of `(key,value)` records |
@@ -23,7 +22,7 @@ Subscripts reach track-row columns without unnest: `f.audio[1].tags.language` (s
 
 Only an input-side read has facts to report. A field read off a FILTER OUTPUT - `scale(f.video[1], 640, -2).width`, `volume(t, 0.2).tags.language` - is a typed rejection: nothing probed that stream, and the hint names the input-side read to write instead.
 
-`SELECT *` over an input alias is its ARRAY columns, never the scalars. In a media query that is the four stream arrays in `video`, `audio`, `subtitle`, `data` order, each a passthrough - the remux shape; chapters ride through as ffmpeg's own default. In a table/CSV query it is every writable array column - the four stream arrays plus `chapters` and `attachments` - one cell each; `cues` and `embeddings` are read-only and stay out. `f.*` does one alias, a bare `*` every alias in `FROM` order.
+`SELECT *` over an input alias is its ARRAY columns, never the scalars. In a media query that is the four stream arrays in `video`, `audio`, `subtitle`, `data` order, each a passthrough - the remux shape; chapters ride through as ffmpeg's own default. In a table/CSV query it is every writable array column - the four stream arrays plus `chapters` and `attachments` - one cell each; `cues` is read-only and stays out. `f.*` does one alias, a bare `*` every alias in `FROM` order.
 
 ## Rendition rows - `input('ladder.m3u8') r`
 
@@ -85,9 +84,11 @@ How much of the stream is copied is the module's own `wants` - all of it, the ke
 
 **Times are the input's own.** `start_t` and `end_t` are on the clock every other time in a query is on: `ffmpeg.trim(f.video[1], start => v.start_t)` opens on the frame the row describes. That is a promise the compiler keeps rather than something a stream copy gives for free - a stream that reorders frames opens on a negative decode timestamp, and a copy written without care shifts every timestamp, presentation times included, by that lead-in.
 
+**Writing is the other half.** Rows get INTO a stream's packets through a `RETURNS packets` filter, which the destination places behind the encoder it was already going to place and which takes each producer's rows as an argument of its own ([dialect.md](dialect.md)). Core ffrwd learns no format either way: what a record means is the module's, and the same package ships the filter that writes and the sinks that read. `ffrwd/index` is that package for embedding vectors. Because the records ride the packets, they survive a `-c copy` remux, a trim and a `UNION ALL`, and the container is free.
+
 ## Track rows - `unnest(f.audio) t`
 
-One row per track. The argument is an array column of an input declared earlier in the same FROM list; alias mandatory. All eight array columns unnest - the four stream arrays here, and `chapters`, `cues`, `embeddings` and `attachments` below. The schema varies by stream type:
+One row per track. The argument is an array column of an input declared earlier in the same FROM list; alias mandatory. All seven array columns unnest - the four stream arrays here, and `chapters`, `cues` and `attachments` below. The schema varies by stream type:
 
 The row IS the stream: a bare `t` where a stream is expected selects it, filters it, or gathers it. The columns below are the metadata ABOUT it.
 
@@ -147,21 +148,6 @@ Writing is the mirror: an array of `cue` records **in a stream position** IS a W
 
 An ALIAS on that column is the track's TITLE - `ARRAY[...] AS speech` emits `-metadata:s:<n> title=speech` - and it is the name `f.cues['speech']` finds it by afterwards. Several aliased columns are several tracks. A titled track is written to Matroska only: every other container rewrites or drops the title, so a destination that is not `.mkv` is refused by name. Untitled, the column writes wherever captions do.
 
-## Embedding rows - `unnest(f.embeddings) v`
-
-Every vector track's rows: a vector over a time span, and what it says about that stretch of the file.
-
-| column | type | notes |
-| --- | --- | --- |
-| `index` | number | order within its own track, 1-based |
-| `track` | text | the title of the track it came from |
-| `start_t`, `end_t` | number | seconds |
-| `vector` | vector | the numbers themselves; read by `cos_similarity`/`vector_length`, never compared |
-
-A vector track rides in the same WebVTT document a caption track does, each block's text the row's numbers as little-endian f32 in base64, and the track's `vector_dims` tag says how many. That tag is what tells the two apart: a caption track has none, and a track that has one never shows up in `cues`. `unnest(f.embeddings['clip_vectors']) v` reads one track by title, the same as cues.
-
-Writing is the mirror again: an array of `embedding` records **in a stream position** IS a vector track, `STRUCT(<start_t>, <end_t>, <vector>)::embedding`. There is no vector literal, so the `vector` field comes from a `RETURNS vector` wasm function or from another file's own rows. Every row of one track carries the same number of values - two lengths in one column is a rejection naming both - and the track's title is the column's alias. Matroska only, since no other container keeps `vector_dims`. [Recipes 115-116](examples.md#118-write-rows-as-titled-tracks).
-
 ## Attachment rows - `unnest(f.attachments) a`
 
 Files riding inside the container: subtitle fonts, cover art, scripts.
@@ -178,7 +164,7 @@ Writing takes a third field, `path` - the file to read - which is **write-only**
 
 A CTE's SELECT list is its row's columns, and referencing it in FROM contributes its body's ROWS - a two-row CTE is a two-row source, and comma between sources is a cross join with real multiplicity, exactly as SQL says. A `tags` column in the body rides on its streams (see Tags below).
 
-A body column that is a compile-time VALUE rather than a stream - a series value, a probed scalar, a row column, arithmetic over those - is a **value column** of the CTE's rows, readable wherever row columns are: `WHERE`, `ORDER BY`, a fan-out `TO` expression, a filter's option, `GROUP BY`, a further CTE, and table/CSV output. It is named by its `AS` alias, or, for a bare column read off a track, cue, embedding or rendition row, by the column itself, as Postgres names any unaliased column reference - `SELECT g.video[1] AS v, w.start_t, w.end_t` reads back as `b.start_t`, `b.end_t`. `SELECT v AS frame, i.i AS n ...` gives the rows an `n` that names one file per row ([recipe 81](corpus.md#81-grab-n-evenly-spaced-frames-one-file-each)). Selecting one as a column of a MEDIA query is a rejection: a SELECT column there is an output stream. A value the compiler cannot evaluate is a typed rejection naming the column. A `tags` column is not one of them either: it is spent on the body's own streams, so reading `<cte>.tags` is an unknown column. A stream column keeps the row-set rule it has, and has no order to sort by. Views referenced in FROM follow the same rules.
+A body column that is a compile-time VALUE rather than a stream - a series value, a probed scalar, a row column, arithmetic over those - is a **value column** of the CTE's rows, readable wherever row columns are: `WHERE`, `ORDER BY`, a fan-out `TO` expression, a filter's option, `GROUP BY`, a further CTE, and table/CSV output. It is named by its `AS` alias, or, for a bare column read off a track, cue or rendition row, by the column itself, as Postgres names any unaliased column reference - `SELECT g.video[1] AS v, w.start_t, w.end_t` reads back as `b.start_t`, `b.end_t`. `SELECT v AS frame, i.i AS n ...` gives the rows an `n` that names one file per row ([recipe 81](corpus.md#81-grab-n-evenly-spaced-frames-one-file-each)). Selecting one as a column of a MEDIA query is a rejection: a SELECT column there is an output stream. A value the compiler cannot evaluate is a typed rejection naming the column. A `tags` column is not one of them either: it is spent on the body's own streams, so reading `<cte>.tags` is an unknown column. A stream column keeps the row-set rule it has, and has no order to sort by. Views referenced in FROM follow the same rules.
 
 `WHERE`, `ORDER BY` and `LIMIT` inside the body narrow and order its rows before the outer query sees them; outside, they re-order and filter what it handed over - which is what lets a find rank by score inside and stitch by time outside ([recipe 135](corpus.md#135-rank-in-a-cte-stitch-in-time-order)). A name the outer query reads that the body did not select is an unknown column, listing the ones it did.
 
@@ -265,13 +251,13 @@ Over a CTE's own stream column, `array_agg` skips a NULL cell instead of refusin
 
 ## Merging runs of rows - `merge_cues(<rows>, <max_distance>)`
 
-Rows that follow one another closely enough are one span. `merge_cues` reads an array of records carrying `start_t` and `end_t` - `cues`, `embeddings`, `chapters`, or a module's own annotation rows - and returns the same record type with each run collapsed into one row.
+Rows that follow one another closely enough are one span. `merge_cues` reads an array of records carrying `start_t` and `end_t` - `cues`, `chapters`, or a module's own annotation rows - and returns the same record type with each run collapsed into one row.
 
 Rows are taken in `start_t` order. A row whose `start_t` is no more than `max_distance` past the run's end joins that run - so rows that overlap or touch always do, whatever the distance - and the run becomes one row from the first start to the furthest end its rows reached. A `text` field joins with one space; every other field, `vector` included, is the first row's. `max_distance` defaults to 0, is a number literal or a variable holding one, and a negative one is a rejection; so is a record with no span. An empty array is an empty array.
 
 It stands in two places, and means the same in both:
 
-- **In a FROM `unnest`**, over rows a file already carries: `unnest(merge_cues(f.cues['speech'], 0.5)) c` reads its rows exactly as `unnest(f.cues) c` reads the file's own. The rows are compile-time rows, so the merge happens before anything runs. To narrow before merging - a search that wants its hits collapsed rather than the whole track - wrap a gather instead: `merge_cues(ARRAY(SELECT v FROM unnest(f.embeddings['clip_vectors']) v WHERE <predicate>), 1)`, whose predicate reads the gather's own columns and no other alias. [Recipes 131-132](corpus.md#131-collapse-a-files-rows-into-runs).
+- **In a FROM `unnest`**, over rows a file already carries: `unnest(merge_cues(f.cues['speech'], 0.5)) c` reads its rows exactly as `unnest(f.cues) c` reads the file's own. The rows are compile-time rows, so the merge happens before anything runs. To narrow before merging - a search that wants its hits collapsed rather than the whole track - wrap a gather instead: `merge_cues(ARRAY(SELECT c FROM unnest(f.cues['speech']) c WHERE <predicate>), 1)`, whose predicate reads the gather's own columns and no other alias. [Recipes 131-132](corpus.md#131-collapse-a-files-rows-into-runs).
 - **Over a module's annotation column**, whose rows do not exist yet: `merge_cues(captions(f.video[1]).cues, 0)` becomes a node in that module's sidecar, holding each run open until a row arrives outside `max_distance` or the stream ends. It composes with the gather the same way a run-time `WHERE` already does - narrowed first, then merged - and a row carrying no span rides through untouched. Merging the rows a rows function is about to read is refused: that function reads every row the module produced, so merge what it hands back. [Recipe 133](corpus.md#133-merge-a-modules-rows-as-they-are-written).
 
 ## Rows between modules

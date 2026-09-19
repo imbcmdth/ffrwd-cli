@@ -34,7 +34,6 @@ function := CREATE FUNCTION name(param type [DEFAULT literal], ...) RETURNS rtyp
           | CREATE FUNCTION name(rows annotation) RETURNS annotation
             AS 'module', 'export' LANGUAGE wasm
 rtype   := text | number | boolean | vector | <kind>_stream | chapter | cue
-         | embedding
          | attachment | any of those with [] | TABLE(col type, ...)
 wstype  := video_stream | audio_stream | either of those with []
 wrtype  := wstype | sink | packets | STRUCT(name wstype, name annotation)
@@ -180,7 +179,8 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   ([recipe 112](corpus.md#112-a-function-over-a-caption-files-cues)).
   A `vector` is a JSON array of numbers - the wire shape of an
   embedding - and joins `vtype` for exactly this: a value function's
-  own parameters and RETURNS, and an annotation field. It is not a
+  own parameters and RETURNS, an annotation field, and a packet sink's
+  own row column. It is not a
   scalar column type otherwise: it prints (capped, as a cell) but
   cannot be compared, concatenated, cast to text, or written as a tag.
   `cos_similarity(vector, vector) -> number` and `vector_length(vector)
@@ -923,8 +923,8 @@ Every FROM item is a compile-time table; the column model per shape is
 | `ffmpeg.<source>(name => value, ...) alias` | 1 | generated stream (testsrc2, sine, color, anullsrc, ...), no `-i`; options named-only |
 | `<pkg>.<source>(<values>) alias` | one per rendition of its catalog | a `RETURNS source` wasm function, probed at compile time; arguments are values only; reads like a manifest input, and a source reporting itself unbounded is live. Over a values-world export it is invoked at compile time instead: each row it answers names a `url` ffmpeg opens with its own `-i`, and the alias still reads as rendition rows |
 | `<pkg>.<sink>(<stream>, <values>) alias` | one per row the module wrote | a packet sink read at compile time: the stream is one of an `input()` written earlier in the same FROM, the columns are the ones its `RETURNS STRUCT(...)[]` names, and the same module after `TO` is a run-time destination instead ([rows.md](rows.md#packet-rows---ffrwdindexrecordsfvideo1-v)) |
-| `unnest(alias.<array>) alias` | one per element | the four stream arrays, or `chapters` / `cues` / `embeddings` / `attachments`, of an input declared earlier in the same FROM; `cues['title']` and `embeddings['title']` name one track by its title |
-| `unnest(merge_cues(<rows>[, max_distance])) alias` | one per run | the same rows with runs collapsed into one row each. `<rows>` is a record array carrying `start_t`/`end_t` - `chapters`, `cues`, `embeddings` - or an `ARRAY(SELECT r FROM unnest(<one of those>) r WHERE ...)` gather that narrows them first ([recipes 131-132](corpus.md#131-collapse-a-files-rows-into-runs)) |
+| `unnest(alias.<array>) alias` | one per element | the four stream arrays, or `chapters` / `cues` / `attachments`, of an input declared earlier in the same FROM; `cues['title']` names one track by its title |
+| `unnest(merge_cues(<rows>[, max_distance])) alias` | one per run | the same rows with runs collapsed into one row each. `<rows>` is a record array carrying `start_t`/`end_t` - `chapters`, `cues` - or an `ARRAY(SELECT r FROM unnest(<one of those>) r WHERE ...)` gather that narrows them first ([recipes 131-132](corpus.md#131-collapse-a-files-rows-into-runs)) |
 | `unnest(ARRAY[STRUCT(v AS c, ...), ...]) alias` | one per array element | a written row table; columns are the STRUCT field names, every element declaring the same set |
 | `generate_series(start, stop[, step]) alias` | `stop - start` over `step`, inclusive | alias mandatory, names both the row table and its one column (`i.i`); bounds and step are integer literals after substitution |
 | `cte_or_view_name [alias]` | its body's rows | a multi-row body is a multi-row source |
@@ -1000,8 +1000,8 @@ Each column is one of:
   flags rather than a tag.
 - **A value column** (CTE bodies): any other compile-time value
   becomes a column of the body's rows, readable downstream. Its name
-  is its `AS` alias, or - for a bare column read off a track, cue,
-  embedding or rendition row - the column's own name, as Postgres
+  is its `AS` alias, or - for a bare column read off a track, cue or
+  rendition row - the column's own name, as Postgres
   names any unaliased column reference. At a media sink such a column
   is a rejection - a SELECT column there is an output stream.
 - **`array_agg(<per-row stream expression>)`**: gathers rows in row
