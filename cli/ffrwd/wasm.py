@@ -67,6 +67,7 @@ __all__ = [
     "CODEC_ENCODERS",
     "LANGUAGE_TAGS",
     "MODEL_SUFFIX",
+    "PACKET_SOURCE_WORLD",
     "SAMPLE_FMT_CODECS",
     "WIRE_AUDIO_CODECS",
     "WIRE_PIX_FMTS",
@@ -87,6 +88,7 @@ __all__ = [
     "catalog_as_probe",
     "describe",
     "encoder_codec",
+    "hosts_packet_filter",
     "hosts_packet_sink",
     "hosts_packet_source",
     "hosts_rows_module",
@@ -135,6 +137,7 @@ WORLDS: tuple[str, ...] = (
     "ffrwd:av@0.13.0",
     "ffrwd:av@0.14.0",
     "ffrwd:av@0.15.0",
+    "ffrwd:av@0.16.0",
 )
 
 # The world a module scaffolded today is built against: the newest of those,
@@ -186,13 +189,19 @@ _AUDIO_ENCODER_CODECS: Mapping[str, str] = {
 # The first world whose sidecar hosts a packet sink.
 _PACKET_SINK_WORLD = "ffrwd:av@0.10.0"
 
-# The world whose packet source this sidecar hosts. `open` takes the tracks
-# the plan mapped from 0.15.0 on, and no older spelling is adapted: a source
-# built against an earlier world is rebuilt.
-_PACKET_SOURCE_WORLD = "ffrwd:av@0.15.0"
+# The first world whose packet source this sidecar hosts. `open` takes the
+# tracks the plan mapped from 0.15.0 on and has not moved since, so that
+# world and every later one load; no older spelling is adapted, since a
+# source that cannot be told what to pull would subscribe to tracks nobody
+# reads.
+PACKET_SOURCE_WORLD = "ffrwd:av@0.15.0"
 
 # The first world whose sidecar hosts a rows module.
 _ROWS_MODULE_WORLD = "ffrwd:av@0.14.0"
+
+# The first world whose sidecar hosts a packet filter: encoded packets in,
+# encoded packets out, with rows arriving beside them.
+_PACKET_FILTER_WORLD = "ffrwd:av@0.16.0"
 
 # The sample formats one can carry, and the pcm each of them travels as.
 WIRE_SAMPLE_FMTS: tuple[str, ...] = ("f32", "s16")
@@ -404,13 +413,21 @@ class Described:
     video_streams: SinkArity = "one"
     audio_streams: SinkArity = "none"
     source: bool = False
+    # Whether the module's export is a packet FILTER rather than a sink: the
+    # two declare the same codecs and arities, and this is what tells them
+    # apart.
+    packet_filter: bool = False
     rows_module: bool = False
     input_rows_schema: Mapping[str, object] | None = None
 
     @property
     def packet_sink(self) -> bool:
-        """True for a module whose export consumes encoded packets."""
-        return self.video_codecs is not None
+        """True for a module whose export CONSUMES encoded packets.
+
+        A packet filter fills the same codec and arity fields, so the flag
+        beside them is what keeps a filter out of every sink path.
+        """
+        return self.video_codecs is not None and not self.packet_filter
 
     def sink_streams(self, kind: StreamType) -> SinkArity:
         """How many streams of `kind` this sink reads."""
@@ -597,6 +614,7 @@ def _described(path: str, payload: object) -> Described:
         video_streams=_sink_arity(payload.get("video_streams"), "one"),
         audio_streams=_sink_arity(payload.get("audio_streams"), "none"),
         source=payload.get("source") is True,
+        packet_filter=payload.get("packet_filter") is True,
         rows_module=payload.get("rows_module") is True,
         input_rows_schema=payload["input_rows_schema"]
         if isinstance(payload.get("input_rows_schema"), dict)
@@ -1678,6 +1696,11 @@ def audio_encoder_codec(encoder: str) -> str | None:
     return _AUDIO_ENCODER_CODECS.get(encoder)
 
 
+def hosts_packet_filter(world: str) -> bool:
+    """True when `world`'s sidecar can host a packet filter."""
+    return world in WORLDS and WORLDS.index(world) >= WORLDS.index(_PACKET_FILTER_WORLD)
+
+
 def hosts_packet_sink(world: str) -> bool:
     """True when `world`'s sidecar can host a packet sink."""
     return world in WORLDS and WORLDS.index(world) >= WORLDS.index(_PACKET_SINK_WORLD)
@@ -1685,7 +1708,7 @@ def hosts_packet_sink(world: str) -> bool:
 
 def hosts_packet_source(world: str) -> bool:
     """True when `world`'s sidecar can host a packet source."""
-    return world in WORLDS and WORLDS.index(world) >= WORLDS.index(_PACKET_SOURCE_WORLD)
+    return world in WORLDS and WORLDS.index(world) >= WORLDS.index(PACKET_SOURCE_WORLD)
 
 
 def hosts_rows_module(world: str) -> bool:

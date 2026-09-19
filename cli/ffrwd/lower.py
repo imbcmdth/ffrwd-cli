@@ -447,6 +447,7 @@ from ffrwd.wasm import (
     ANNOTATION_TYPES,
     AUDIO_CODEC_ENCODERS,
     CODEC_ENCODERS,
+    PACKET_SOURCE_WORLD,
     WIRE_AUDIO_CODECS,
     WIRE_VIDEO_CODECS,
     WORLDS,
@@ -7300,8 +7301,8 @@ class _Lowerer:
                     node,
                     fallback=select,
                     hint=f"a packet source is told which tracks to pull from "
-                    f"{WORLDS[-1]} on; upgrade ffrwd, or point at a newer "
-                    "ffrwd-wasm",
+                    f"{PACKET_SOURCE_WORLD} on; upgrade ffrwd, or point at a "
+                    "newer ffrwd-wasm",
                 )
             return described
         if any(fn.name == declared.export for fn in described.functions):
@@ -12085,6 +12086,20 @@ class _Lowerer:
                 fallback=select,
                 hint=f"a module carries one filter; write '{described.name}' as "
                 "the export",
+            )
+        # A packet filter loads and describes, so a package carrying one
+        # installs and lists; what the dialect has no spelling for yet is
+        # where in a query it would sit.
+        if described.packet_filter:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"the module '{declared.module}' is a packet filter, and no "
+                "part of a query places one yet",
+                node,
+                fallback=select,
+                hint="a packet filter rewrites an encoded stream on its way "
+                "to a destination; until the dialect names one, reach for a "
+                "RETURNS sink module or a frame filter",
             )
         if described.packet_sink:
             self._check_packet_sink(declared, described, node, select)

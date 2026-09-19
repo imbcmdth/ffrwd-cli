@@ -14272,6 +14272,23 @@ def test_an_unaccepted_codec_still_encodes_onto_the_sink() -> None:
     assert pads[1]["audio_codec"] == "copy"
 
 
+def test_a_packet_filter_is_refused_with_no_place_to_put_it() -> None:
+    """A filter describes and loads, so a package carrying one installs;
+    what no part of the dialect has yet is somewhere to write it."""
+    import dataclasses
+
+    err = _row_sink_rejects(
+        "COPY (SELECT f.video[1] FROM input('f.mp4') f) "
+        "TO publish('relay', 'live')",
+        _row_probes(_track("video", 0)),
+        dataclasses.replace(_row_sink_described(), packet_filter=True),
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "is a packet filter" in err.message
+    assert "no part of a query places one yet" in err.message
+    assert err.hint is not None and "RETURNS sink" in err.hint
+
+
 def test_a_value_column_into_a_row_reading_sink_names_its_type() -> None:
     """A column that is not a video or audio stream -- a plain subtitle
     track here, a rows projection reads back the same way -- is refused

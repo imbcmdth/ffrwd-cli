@@ -4941,6 +4941,34 @@ def test_only_the_world_that_tells_a_source_what_to_pull_hosts_one() -> None:
     assert not wasm.hosts_packet_source("ffrwd:av@9.9.9")
 
 
+def test_a_packet_filter_needs_the_world_that_carries_one() -> None:
+    assert wasm.WORLDS[-1] == "ffrwd:av@0.16.0"
+    assert wasm.hosts_packet_filter("ffrwd:av@0.16.0")
+    assert not wasm.hosts_packet_filter("ffrwd:av@0.15.0")
+    assert not wasm.hosts_packet_filter("ffrwd:av@9.9.9")
+
+
+def test_a_packet_filter_is_not_read_as_a_packet_sink() -> None:
+    """Both fill the codec and arity fields; the flag is what parts them."""
+    payload = {
+        "world": "ffrwd:av@0.16.0",
+        "name": "weave",
+        "video_codecs": ["h264"],
+        "video_streams": "one",
+        "audio_streams": "none",
+        "reads_rows": True,
+    }
+    sink = wasm._described(PACKET_SOURCE_MODULE, payload)
+    assert (sink.packet_filter, sink.packet_sink) == (False, True)
+    weaver = wasm._described(
+        PACKET_SOURCE_MODULE, {**payload, "packet_filter": True}
+    )
+    assert (weaver.packet_filter, weaver.packet_sink) == (True, False)
+    assert weaver.video_codecs == ("h264",)
+    assert weaver.sink_streams("video") == "one"
+    assert weaver.reads_rows is True
+
+
 def test_the_source_marker_reads_off_the_describe_payload() -> None:
     described = wasm._described(
         PACKET_SOURCE_MODULE, {"world": "ffrwd:av@0.15.0", "name": "s", "source": True}
