@@ -1390,9 +1390,9 @@ def _run_read(
 ) -> tuple[dict[str, object], ...]:
     """One attempt: spawn the pair, collect the rows, or raise.
 
-    A refusal ffmpeg alone is responsible for comes back as
-    :class:`_CopyRefused`, which the caller retries with a wider copy;
-    everything else is final.
+    A failure the copy may be responsible for comes back as
+    :class:`_CopyRefused`, which the caller retries with a wider copy; a
+    module that rejected a stream it was handed whole is final.
     """
     for ceiling in (probe.EXTRACT_TIMEOUT_SECONDS, probe.RETRY_TIMEOUT_SECONDS):
         try:
@@ -1415,6 +1415,22 @@ def _run_read(
                 f"{getattr(err, 'strerror', None) or err}",
                 hint=INSTALL_HINT,
             ) from err
+    if copy != 0 and code != 0:
+        # Both ends died and neither exit code says which one started it: a
+        # copy that never wrote leaves the module reading an empty stream,
+        # and a module that quit leaves the copy writing into a closed pipe.
+        # Saying both is the honest answer, and the copy is still widened in
+        # case it was the one that could not start.
+        raise _CopyRefused(
+            _reject(
+                f"reading '{read.spec}' through '{read.module}' failed at both "
+                f"ends: ffmpeg said '{_last_line(copy_error)}' and the module "
+                f"said '{_last_line(rows_error)}'",
+                hint="a compile-time read is one ffmpeg copying the stream "
+                "into one sidecar hosting the module; the end that failed "
+                "first is the one to look at",
+            )
+        )
     if code != 0:
         raise _reject(
             f"the module '{read.module}' rejected the stream: "

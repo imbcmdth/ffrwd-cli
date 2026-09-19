@@ -293,7 +293,7 @@ And the read itself failing, which carries what the sidecar or ffmpeg said last,
 {"line": 5, "col": 36, "code": "UNSUPPORTED_SQL", "message": "cannot read 'v': the module 'records.wasm' rejected the stream: records: this stream is vp9, and this build reads h264 and hevc", "hint": "check the module reads the codec the stream carries, and that its parameters are the ones it declares"}
 ```
 
-A read that never finishes is the same code, with the ceiling named - the probe's own, since a read copies one stream of the file the way extracting a caption track does.
+A read is two processes, and when BOTH ends die neither exit code says which one started it - a copy that never wrote leaves the module reading nothing, and a module that quit leaves the copy writing into a closed pipe - so the message names both rather than picking one. A read that never finishes is the same code again, with the ceiling named: the probe's own, since a read copies one stream of the file the way extracting a caption track does.
 
 ## UNKNOWN_RECIPE
 
