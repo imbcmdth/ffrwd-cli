@@ -107,7 +107,14 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   argument. Every row reaches the module carrying `"_arg": "<parameter>"`,
   which is how a filter reading several tells them apart; a producer row
   already carrying that field is refused. An argument written `NULL`, or
-  left off the end, hands the filter no rows for it at all.
+  left off the end, hands the filter no rows for it at all: each rows
+  column carries `DEFAULT NULL`, and such a column starts no run of
+  defaults, so the values that configure the filter may follow it and
+  still be required.
+  A rows column names the fields the filter READS, and the producer's
+  record has to carry each of them with the same type. A producer writing
+  more than that is allowed, and its whole record goes to the document
+  either way.
   A rows document is named `ffrwd:rows:<n>` in the compiled command, at both
   ends, so the output is the same text on any machine; `ffrwd run` resolves
   each to a file in the run's own temporary directory and removes it when
@@ -1342,8 +1349,10 @@ Every one of these is a typed rejection, never a silent reinterpretation:
   in the module's own function list; a wit world this ffrwd does not
   host; a module declaring both pixel formats and sample formats, or
   one whose formats and the wire's do not overlap; a
-  parameter the module's schema does not declare, or a value of the
-  wrong type for one, on either side of the call; a value function's
+  parameter the module's schema does not declare, a value of the
+  wrong type for one, on either side of the call, or one the module
+  declares as a type no value the dialect has can fill (an object, say -
+  a module wanting one takes text holding its JSON); a value function's
   `RETURNS` that does not match the module's result type, or a module
   answering with the wrong JSON type; a named argument; a call in
   `FROM` unless it returns source, a `RETURNS source` call anywhere
@@ -1365,8 +1374,9 @@ Every one of these is a typed rejection, never a silent reinterpretation:
   stream, beside several streams, given a `DEFAULT` other than `NULL`,
   or defaulted on a per-frame consumer; a call returning annotations that
   nothing reads; a call taking them written over an argument that
-  produces none, unless the column defaults; and two annotation
-  records that disagree.
+  produces none, unless the column defaults; two annotation records
+  that disagree; and a packet filter's rows column naming a field its
+  producer does not carry, or carries as another type.
 - **Projections**: a field read off a wasm call that returns no struct;
   the stream half of one read back anywhere but beside the same call's
   rows; a field the return does not declare; a `.ndjson` destination

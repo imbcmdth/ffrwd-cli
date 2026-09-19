@@ -455,6 +455,85 @@ def test_a_parameter_of_the_wrong_type_is_refused() -> None:
     )
 
 
+# What a parameter's schema may say, and what a query can fill.
+
+_SCHEMA_SHAPES: tuple[tuple[str, dict[str, object]], ...] = (
+    ("a type", {"type": "string"}),
+    ("a type list", {"type": ["string", "null"]}),
+    ("an enum with no type", {"enum": ["loud", "quiet"]}),
+    ("a oneOf", {"oneOf": [{"type": "string"}, {"type": "boolean"}]}),
+)
+
+_TEXT_PARAM = (
+    "CREATE FUNCTION m(v video_stream, n text) RETURNS video_stream "
+    f"AS '{MODULE}', 'invert' LANGUAGE wasm;\n"
+    "COPY (SELECT m(f.video[1], 'loud') FROM input('a.mp4') f) TO 'out.mp4'"
+)
+
+
+def test_a_schema_says_what_it_takes_in_four_spellings() -> None:
+    """A `type`, a type list, an `enum` judged by what its own members are,
+    or branches: all four of these allow text, so all four take a text
+    argument."""
+    for what, schema in _SCHEMA_SHAPES:
+        graph = _lowered(_TEXT_PARAM, _described(params={"n": schema}))
+        assert isinstance(graph, Graph)
+        node = next(n for n in graph.nodes.values() if n.filter == MODULE)
+        assert node.args == {"n": "loud"}, what
+
+
+def test_an_argument_fitting_no_type_the_schema_allows_is_refused() -> None:
+    """The types a schema allows are read the same way whether it spells them
+    or its members do, and a number is none of the ones these two allow."""
+    sql = (
+        "CREATE FUNCTION m(v video_stream, n number) RETURNS video_stream "
+        f"AS '{MODULE}', 'invert' LANGUAGE wasm;\n"
+        "COPY (SELECT m(f.video[1], 2) FROM input('a.mp4') f) TO 'out.mp4'"
+    )
+    for schema in ({"enum": ["loud", "quiet"]}, {"type": ["string", "null"]}):
+        error = _rejects(
+            sql,
+            ErrorCode.UDF_ARG_TYPE,
+            "parameter 'n' is string",
+            _described(params={"n": schema}),
+        )
+        assert error.hint is not None and "'n' is string" in error.hint
+
+
+def test_a_schema_naming_nothing_judgeable_leaves_its_argument_alone() -> None:
+    """What the module takes is the module's business where it says nothing
+    this compiler reads -- including a branch it cannot judge, which leaves
+    the whole schema open rather than half of it."""
+    for schema in (
+        {"description": "whatever the module likes"},
+        {"oneOf": [{"type": "string"}, {"minimum": 0}]},
+    ):
+        graph = _lowered(_TEXT_PARAM, _described(params={"n": schema}))
+        assert isinstance(graph, Graph)
+        node = next(n for n in graph.nodes.values() if n.filter == MODULE)
+        assert node.args == {"n": "loud"}
+
+
+def test_a_parameter_no_value_can_fill_is_refused_at_the_declaration() -> None:
+    """A query writes values, and an object is not one, so a module taking one
+    has a parameter nothing could ever fill. It is refused whether or not the
+    call wrote the argument: what is wrong is the declaration."""
+    sql = (
+        "CREATE FUNCTION m(v video_stream, n text DEFAULT NULL) RETURNS video_stream "
+        f"AS '{MODULE}', 'invert' LANGUAGE wasm;\n"
+        "COPY (SELECT m(f.video[1]) FROM input('a.mp4') f) TO 'out.mp4'"
+    )
+    error = _rejects(
+        sql,
+        ErrorCode.UDF_ARG_TYPE,
+        "takes 'n' as object",
+        _described(params={"n": {"type": "object", "properties": {}}}),
+    )
+    assert error.hint is not None
+    assert "text, number, boolean or vector" in error.hint
+    assert "holding that value's JSON" in error.hint
+
+
 def test_a_written_parameter_reaches_the_node() -> None:
     sql = (
         "CREATE FUNCTION m(v video_stream, n number) RETURNS video_stream "
@@ -6548,6 +6627,32 @@ def test_a_value_function_may_take_a_vector_parameter() -> None:
     declared = _resolved(sql).wasm["similar"]
     assert declared.is_value
     assert [p.type for p in declared.params] == ["vector", "vector"]
+
+
+def test_an_array_parameter_is_the_one_a_vector_fills() -> None:
+    """`array` is a vector's own wire type, so a module taking a vector says
+    array -- which makes it a parameter a query CAN fill, unlike an object."""
+    sql = (
+        "CREATE FUNCTION m(v video_stream, e vector) RETURNS video_stream\n"
+        f"  AS '{MODULE}', 'invert' LANGUAGE wasm;\n"
+        + VECTOR_DECLARE
+        + "COPY (SELECT m(f.video[1], embed('a cat sat on the mat')) "
+        "FROM input('a.mp4') f) TO 'out.mp4'"
+    )
+    graph = lower(
+        _resolved(sql),
+        {},
+        registry=_snapshot_registry(),
+        describes={
+            MODULE: _described(
+                params={"e": {"type": "array", "items": {"type": "number"}}}
+            ),
+            EMBEDDER: _embed_described(),
+        },
+        invoke=_embed_invoke,
+    )
+    node = next(n for n in graph.nodes.values() if n.filter == MODULE)
+    assert node.args == {"e": (0.9, 0.1, 0.2)}
 
 
 def test_the_result_type_is_checked_against_the_modules_own() -> None:

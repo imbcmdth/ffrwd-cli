@@ -512,6 +512,35 @@ def test_a_parameter_without_a_default_after_one_with_one_is_rejected() -> None:
     _rejects(sql, ErrorCode.UNSUPPORTED_SQL, "no DEFAULT after one that has one")
 
 
+_WEAVE = (
+    "CREATE FUNCTION weave(v video_stream,\n"
+    "                      clip  STRUCT(start_t number, vector vector)[] DEFAULT NULL,\n"
+    "                      sound STRUCT(start_t number, vector vector)[] DEFAULT NULL,\n"
+    "                      {values})\n"
+    "  RETURNS packets AS 'weave.wasm', 'weave' LANGUAGE wasm;\n"
+    "COPY (SELECT weave(f.video[1], NULL, NULL, 'one') FROM input('a.mp4') f) "
+    "TO 'out.mp4'"
+)
+
+
+def test_an_optional_rows_column_does_not_default_the_values_after_it() -> None:
+    """DEFAULT NULL on an annotation column says the ROWS are optional, and
+    starts no run of defaults among the values. A packet filter is declared in
+    exactly that shape -- a rows argument per producer, each omissible, then
+    the values that configure it, which may be required."""
+    sql = _WEAVE.format(values="spaces text,\n                      planes number DEFAULT NULL")
+    declared = _resolved(sql).wasm["weave"]
+    assert tuple(p.name for p in declared.reads_params) == ("clip", "sound")
+    assert tuple(p.name for p in declared.value_params) == ("spaces", "planes")
+    assert [p.default is None for p in declared.value_params] == [True, False]
+
+
+def test_a_value_after_a_defaulted_value_still_needs_a_default() -> None:
+    """The columns are exempt; the values after them are not."""
+    sql = _WEAVE.format(values="spaces text DEFAULT 'x',\n                      planes number")
+    _rejects(sql, ErrorCode.UNSUPPORTED_SQL, "no DEFAULT after one that has one")
+
+
 def test_default_null_makes_the_parameter_omissible() -> None:
     """DEFAULT NULL is the spelling for an optional knob: omitting the
     argument is legal and gives NULL, which drops wherever the body uses it

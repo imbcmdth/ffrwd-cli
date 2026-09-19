@@ -14580,6 +14580,56 @@ def test_a_rows_argument_that_produces_no_column_is_refused() -> None:
     assert "produces no annotation column" in caught.value.message
 
 
+WEAVE_SUBSET = (
+    "CREATE FUNCTION weave(v video_stream,\n"
+    "                      notes STRUCT(pts number)[])\n"
+    "  RETURNS packets\n"
+    f"  AS '{PACKETS_MODULE}', 'weave' LANGUAGE wasm;\n"
+)
+
+
+def test_a_rows_argument_may_carry_more_than_the_filter_reads() -> None:
+    """The declaration names the fields the filter reads, not the producer's
+    whole record: `shots` writes pts and note, this filter names pts, and the
+    rows file is still the producer's own record."""
+    g = _weaving_graph(
+        WEAVE_SUBSET,
+        "COPY (SELECT weave(f.video[1], shots(f.video[1]).notes) "
+        "FROM input('f.mp4') f) TO 'out.mp4'",
+    )
+    (node,) = g.packet_filter_rows
+    assert g.packet_filter_rows[node] == [{"arg": "notes", "path": "ffrwd:rows:0"}]
+    (producer,) = [n for n, sink in g.rows_sinks.items() if sink.path]
+    assert g.rows_sinks[producer] == RowsSink(container="ndjson", path="ffrwd:rows:0")
+
+
+def test_a_rows_argument_the_producer_does_not_carry_is_refused() -> None:
+    """A subset by NAME AND TYPE: a field the producer never writes, and a
+    field it writes as something else, are both the filter reading what is
+    not there."""
+    absent = (
+        "CREATE FUNCTION weave(v video_stream,\n"
+        "                      notes STRUCT(pts number, score number)[])\n"
+        "  RETURNS packets\n"
+        f"  AS '{PACKETS_MODULE}', 'weave' LANGUAGE wasm;\n"
+    )
+    mistyped = (
+        "CREATE FUNCTION weave(v video_stream,\n"
+        "                      notes STRUCT(pts text)[])\n"
+        "  RETURNS packets\n"
+        f"  AS '{PACKETS_MODULE}', 'weave' LANGUAGE wasm;\n"
+    )
+    call = (
+        "COPY (SELECT weave(f.video[1], shots(f.video[1]).notes) "
+        "FROM input('f.mp4') f) TO 'out.mp4'"
+    )
+    for declare in (absent, mistyped):
+        err = _weaving_rejects(declare, call)
+        assert err.code is ErrorCode.UDF_ARG_TYPE
+        assert "weave() takes 'notes' as" in err.message
+        assert err.hint is not None and "extra fields are allowed" in err.hint
+
+
 def test_a_packets_call_counts_its_rows_arguments_as_arguments() -> None:
     """The rows a packet filter reads are written at the call, so the arity
     it reports counts them -- a frame filter's column is covered by the

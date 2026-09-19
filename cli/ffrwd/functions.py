@@ -1389,6 +1389,13 @@ def _column_defs(
                     "fills it; DEFAULT NULL, the only default it can carry, "
                     "makes it optional",
                 )
+            # DELIBERATELY not `seen_default`: an annotation column's DEFAULT
+            # NULL says the ROWS are optional, not that a value follows one.
+            # The two runs are independent -- a packet filter declares a rows
+            # argument per producer, each defaulting to NULL, and then the
+            # values that configure it, which may be required. "Every
+            # parameter after the first DEFAULT must have one too" is a rule
+            # about values, and it is still enforced among them below.
             declared.append(Parameter(written, annotation.written, default, annotation))
             continue
         kind_node = node.args.get("kind")

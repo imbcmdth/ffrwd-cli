@@ -490,10 +490,11 @@ __all__ = ["lower", "lower_table"]
 ProbePath = Callable[[str], ProbeResult | None]
 
 # The python types each JSON Schema type a module parameter may declare
-# accepts. A schema naming anything else is left alone: what the module
-# takes is the module's business, and only the shapes named here are ones a
-# written argument can be judged against. `array` is a vector's own wire
-# type -- the tuple `RowValue` already folds it to.
+# accepts. These are the wire types of the dialect's own value types, and so
+# the whole of what a query can write an argument for: text, a number, a
+# boolean, a vector. `array` is a vector's -- the tuple `RowValue` already
+# folds it to. A parameter declared any OTHER type is one no argument could
+# fill, which is `_check_value_param_schemas`.
 _JSON_TYPES: dict[str, tuple[type, ...]] = {
     "string": (str,),
     "number": (int, float),
@@ -1210,6 +1211,80 @@ def _annotation_matches(
         name == emitted_name and json_type in ANNOTATION_TYPES.get(kind, ())
         for (name, kind), (emitted_name, json_type) in zip(declared, emitted)
     )
+
+
+def _enum_member_type(member: object) -> str:
+    """The JSON type one ``enum`` member is, which is what it allows."""
+    if member is None:
+        return "null"
+    if isinstance(member, bool):
+        return "boolean"
+    if isinstance(member, int | float):
+        return "number"
+    if isinstance(member, str):
+        return "string"
+    if isinstance(member, list):
+        return "array"
+    return "object"
+
+
+def _schema_types(schema: object) -> tuple[str, ...]:
+    """Every JSON type one parameter's schema allows, in the order it says them.
+
+    Four spellings, because module authors use all four: a `type`, written
+    once or as a list; an `enum` with no `type`, which says what it allows by
+    what its members ARE; and `oneOf`/`anyOf`, whose branches each answer and
+    whose answers add up. Empty for a schema that names none of them, or one
+    whose branches do not all answer -- there the module's own business is
+    all it is, and nothing here judges it.
+    """
+    if not isinstance(schema, dict):
+        return ()
+    written = schema.get("type")
+    if isinstance(written, str):
+        return (written,)
+    if isinstance(written, list):
+        return tuple(dict.fromkeys(t for t in written if isinstance(t, str)))
+    members = schema.get("enum")
+    if isinstance(members, list) and members:
+        return tuple(dict.fromkeys(_enum_member_type(m) for m in members))
+    for key in ("oneOf", "anyOf"):
+        branches = schema.get(key)
+        if not isinstance(branches, list) or not branches:
+            continue
+        found: dict[str, None] = {}
+        for branch in branches:
+            kinds = _schema_types(branch)
+            if not kinds:
+                return ()  # one branch nobody can judge leaves the whole open
+            found.update(dict.fromkeys(kinds))
+        return tuple(found)
+    return ()
+
+
+def _fits_json_type(value: RowValue, wanted: str) -> bool:
+    """Whether one compile-time value is the JSON type a schema named."""
+    # bool is an int in Python, and a module asking for a number does not
+    # mean true.
+    if isinstance(value, bool) != (wanted == "boolean"):
+        return False
+    if not isinstance(value, _JSON_TYPES[wanted]):
+        return False
+    return not (wanted == "integer" and isinstance(value, float) and value != int(value))
+
+
+def _annotation_covers(declared: Annotation, emitted: Annotation) -> bool:
+    """Whether a producer's record carries every field a declaration names.
+
+    A SUBSET, the way :func:`_packet_rows_match` reads a compile-time sink's
+    declaration against the module's ``rows_schema``: the declaration names
+    the fields the reader wants, and a producer emitting more than that is
+    producing more than was asked for. The extra fields still travel -- the
+    rows file is the producer's whole record -- so the reader sees them if it
+    looks. Order says nothing: the rows are keyed by name.
+    """
+    produced = dict(_annotation_fields(emitted))
+    return all(produced.get(name) == kind for name, kind in _annotation_fields(declared))
 
 
 def _packet_rows_match(
@@ -13037,6 +13112,7 @@ class _Lowerer:
         )
         properties = schema_source.get("properties")
         known = properties if isinstance(properties, dict) else {}
+        self._check_value_param_schemas(declared, known, node, select)
         params: dict[str, object] = {}
         for index, param in enumerate(declared.value_params, start=first):
             written = call.args[index] if index < len(call.args) else param.default
@@ -13068,19 +13144,51 @@ class _Lowerer:
         anchor: exp.Expr,
         select: exp.Select,
     ) -> None:
-        """One written parameter against the JSON Schema type the module gave it."""
-        wanted = schema.get("type") if isinstance(schema, dict) else None
-        if not isinstance(wanted, str) or wanted not in _JSON_TYPES:
+        """One written parameter against the JSON Schema types the module gave it.
+
+        A schema allowing several -- a type list, an enum, a `oneOf` of
+        scalars -- is satisfied by an argument fitting ANY of them. The types
+        this compiler cannot judge are dropped first, so a parameter written
+        `["string", "null"]` is judged as string: a SQL NULL never reaches
+        here, since absence drops the argument.
+        """
+        judged = tuple(t for t in _schema_types(schema) if t in _JSON_TYPES)
+        if not judged:
             return  # a schema shape this compiler does not judge
-        allowed = _JSON_TYPES[wanted]
-        # bool is an int in Python, and a module asking for a number does not
-        # mean true.
-        if isinstance(value, bool) != (wanted == "boolean"):
-            raise self._bad_wasm_param(name, value, wanted, anchor, select)
-        if not isinstance(value, allowed):
-            raise self._bad_wasm_param(name, value, wanted, anchor, select)
-        if wanted == "integer" and isinstance(value, float) and value != int(value):
-            raise self._bad_wasm_param(name, value, wanted, anchor, select)
+        if any(_fits_json_type(value, wanted) for wanted in judged):
+            return
+        raise self._bad_wasm_param(name, value, " or ".join(judged), anchor, select)
+
+    def _check_value_param_schemas(
+        self,
+        declared: WasmFunction,
+        known: Mapping[str, object],
+        node: exp.Expr,
+        select: exp.Select,
+    ) -> None:
+        """Every value parameter the declaration names, against what SQL can write.
+
+        A query writes VALUES, and the dialect's are text, a number, a
+        boolean and a vector. A module parameter whose schema allows none of
+        those -- an object, say -- is one no argument could ever fill, so the
+        declaration is wrong whether or not this call wrote it, and saying so
+        here beats the module failing on a key it never got. A schema naming
+        nothing judgeable is left alone, as it is at the argument.
+        """
+        for param in declared.value_params:
+            kinds = _schema_types(known.get(param.name))
+            if not kinds or any(kind in _JSON_TYPES for kind in kinds):
+                continue
+            raise _error(
+                ErrorCode.UDF_ARG_TYPE,
+                f"the module '{declared.module}' takes '{param.name}' as "
+                f"{' or '.join(kinds)}, and no value a query writes is one",
+                node,
+                fallback=select,
+                hint="a wasm function's value parameters are text, number, "
+                "boolean or vector; rebuild the module taking a text parameter "
+                "holding that value's JSON",
+            )
 
     def _bad_wasm_param(
         self,
@@ -13209,6 +13317,7 @@ class _Lowerer:
         described = self._described_value(declared, node, select)
         properties = described.params_schema.get("properties")
         known = properties if isinstance(properties, dict) else {}
+        self._check_value_param_schemas(declared, known, node, select)
         args: dict[str, object] = {}
         for param, argument in zip(declared.value_params, call.args):
             value = self._eval_value(argument, env, rows, select)
@@ -13706,7 +13815,9 @@ class _Lowerer:
 
         It has to be a module's annotation column -- the only rows a query
         can write to a file before the filter reads them -- and its record
-        has to be the record the parameter declares.
+        has to CARRY the fields the parameter declares. A producer emitting
+        more than the filter reads is fine: the whole record is written to
+        the rows file either way, and the filter reads the fields it named.
         """
         found = annotation_projection(_unwrap(argument), self.res.wasm)
         if found is None:
@@ -13723,7 +13834,7 @@ class _Lowerer:
         producer = found[1]
         assert producer.emits is not None  # what annotation_projection selects on
         assert param.annotation is not None  # `reads_params` selected on it
-        if _annotation_fields(param.annotation) != _annotation_fields(producer.emits):
+        if not _annotation_covers(param.annotation, producer.emits):
             raise _error(
                 ErrorCode.UDF_ARG_TYPE,
                 f"{declared.name}() takes '{param.name}' as {param.type}, and "
@@ -13731,8 +13842,8 @@ class _Lowerer:
                 f"{producer.emits.written}",
                 argument,
                 fallback=node,
-                hint="the two annotation records have to name the same fields, "
-                "with the same types",
+                hint="every field the filter names has to be one the producer's "
+                "rows carry, with the same type; extra fields are allowed",
             )
 
     def _rows_document(self) -> str:
