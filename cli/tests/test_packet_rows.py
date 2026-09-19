@@ -17,6 +17,7 @@ import json
 import os
 import shutil
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -311,6 +312,40 @@ def test_the_read_names_the_stream_and_what_the_module_asked_for() -> None:
     assert read.module == _MODULE
     assert read.wants == "keyframes"
     assert read.params == ""
+
+
+def test_the_calls_arguments_become_the_modules_own_parameters() -> None:
+    """Past the stream the arguments are positional, like every other wasm
+    call, and reach the sidecar as the named object a run-time sink's do --
+    checked against the schema the module declares, by name and by type."""
+    declare = (
+        "CREATE FUNCTION keys(v video_stream, space number, label text)\n"
+        "RETURNS STRUCT(index number, start_t number, keyframe boolean, vector vector)[]\n"
+        f"  AS '{_MODULE}', 'keys' LANGUAGE wasm;\n"
+    )
+    configured = _described()
+    configured = replace(
+        configured,
+        params_schema={
+            "properties": {"space": {"type": "number"}, "label": {"type": "string"}}
+        },
+    )
+    reads = _Reads()
+    _rows(
+        "SELECT v.index FROM input('f.mp4') f, keys(f.video[1], 3, 'clip') v",
+        declare=declare,
+        reads=reads,
+        described=configured,
+    )
+    assert reads.reads[0].params == '{"label": "clip", "space": 3}'
+
+    with pytest.raises(FfrwdError) as caught:
+        _rows(
+            "SELECT v.index FROM input('f.mp4') f, keys(f.video[1], 'three', 'clip') v",
+            declare=declare,
+            described=configured,
+        )
+    assert "space" in caught.value.message
 
 
 def test_one_read_answers_every_column_and_a_second_alias_of_the_same_stream() -> None:
