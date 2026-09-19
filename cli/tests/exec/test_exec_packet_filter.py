@@ -569,3 +569,67 @@ def test_vectors_for_two_spaces_reach_the_real_weave_and_read_back(
     # Every record's span is the one the producer wrote: one second long.
     for row in records:
         assert row["end_t"] - row["start_t"] == pytest.approx(1.0, abs=0.1)
+
+
+# -- both halves of the packet surface in one query ------------------------
+
+_PACKET_KEYS = _BUILT / "packet_keys.wasm"
+_KEYS = _FIXTURES_DIR / "keys.mkv"
+
+
+def test_a_compile_time_read_and_a_packet_filter_in_one_query(tmp_path: Path) -> None:
+    """The find-then-weave shape: a packet sink read in FROM picks the spans
+    while the query compiles, and a packet filter weaves rows into what the
+    encoder made of them.
+
+    The two use the packet surface at opposite ends -- one before ffmpeg
+    runs, one in the middle of the run -- and this is what says they compose:
+    the trims are already numbers in the filtergraph, the rows document is
+    its own stage, and the filter sits behind the encoder as always.
+    """
+    _require_weaving()
+    for fixture in (_PACKET_KEYS, _KEYS):
+        if not fixture.exists():
+            pytest.skip(f"missing: {fixture}")
+    out = tmp_path / "found.mp4"
+    keys = (
+        "CREATE FUNCTION packet_keys(v video_stream)\n"
+        "  RETURNS STRUCT(index number, start_t number, keyframe boolean,\n"
+        "                 bytes number, vector vector)[]\n"
+        f"  AS '{_PACKET_KEYS.as_posix()}', 'packet_keys' LANGUAGE wasm;\n"
+    )
+    trim = "ffmpeg.trim(f.video[1], start => v.start_t, duration => 0.4)"
+    sql = (
+        keys
+        + _NOTES
+        + _WEAVE_ONE
+        + "COPY (\n"
+        + f"  SELECT weave(concat(VARIADIC array_agg({trim})),\n"
+        + "               notes(f.video[1]).seen)\n"
+        + f"  FROM input('{_KEYS.as_posix()}') f, packet_keys(f.video[1]) v\n"
+        + "  WHERE v.start_t > 3\n"
+        + ") TO '" + out.as_posix() + "' WITH (video_codec 'libx264', gop 5)"
+    )
+
+    compiled = compile_all(sql)
+    plan = compiled.plan
+    assert plan is not None
+    # The compile-time read already happened: its rows are numbers in the
+    # graph, not a process. 3.266 is the keyframe packet_keys found past 3s.
+    starts = {
+        value
+        for process in plan.ffmpeg
+        for node in process.graph.nodes.values()
+        if node.filter == "trim"
+        for name, value in node.args.items()
+        if name == "start"
+    }
+    assert starts == {3.266, 3.733}, starts
+    # Two stages, the rows document between them, the filter in the second.
+    assert len(plan.stages) == 2
+    (document,) = plan.file_edges
+    assert document.format.content == "rows"
+
+    _run(sql)
+    assert _woven(out, "note-") >= 1, "no note reached the stream"
+    assert int(str(_stream_facts(out, "v")["nb_read_packets"])) > 0

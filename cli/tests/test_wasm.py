@@ -4967,6 +4967,20 @@ def test_a_packet_filter_is_not_read_as_a_packet_sink() -> None:
     assert weaver.video_codecs == ("h264",)
     assert weaver.sink_streams("video") == "one"
     assert weaver.reads_rows is True
+    # `wants` is the packet SINK's field and a filter never sets it, but a
+    # describe carrying both parses and neither key reads the other's: the
+    # two halves of the packet surface arrived separately and share a record.
+    asking = wasm._described(
+        PACKET_SOURCE_MODULE, {**payload, "packet_filter": True, "wants": "keyframes"}
+    )
+    assert (asking.packet_filter, asking.packet_sink) == (True, False)
+    assert asking.wants == "keyframes"
+    reading = wasm._described(PACKET_SOURCE_MODULE, {**payload, "wants": "first"})
+    assert (reading.packet_filter, reading.packet_sink, reading.wants) == (
+        False,
+        True,
+        "first",
+    )
 
 
 def test_the_source_marker_reads_off_the_describe_payload() -> None:

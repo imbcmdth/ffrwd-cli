@@ -21,6 +21,7 @@ import pytest
 
 from ffrwd.emit import build_ffmpeg_args, emit
 from ffrwd.errors import ErrorCode, FfrwdError
+from ffrwd.functions import Annotation, AnnotationField, Parameter, WasmFunction
 from ffrwd.lower import lower, lower_table
 from ffrwd.parser import Resolved, parse, resolve
 from ffrwd.probe import ProbeResult, StreamMeta
@@ -1265,3 +1266,135 @@ def test_a_malformed_definition_is_a_rejection_not_a_crash() -> None:
         except FfrwdError as error:
             assert error.code is not ErrorCode.INTERNAL, error
             assert error.line is not None and 1 <= error.line <= 10, error
+
+
+# --------------------------------------------------------------------------
+# The four kinds a wasm declaration comes in, and what each says about its
+# ROWS. `reads`, `reads_params` and `value_params` are read together --
+# `value_params` skips exactly what `reads_params` claims -- so a kind one of
+# them treats differently from the others is a parameter that silently
+# changes meaning. Built as the declarations they are rather than through a
+# query: what is under test is the three properties agreeing, and each kind's
+# own definition path is tested above.
+# --------------------------------------------------------------------------
+
+_NOTE = Annotation(
+    name="notes",
+    fields=(
+        AnnotationField(name="pts", type="number"),
+        AnnotationField(name="note", type="text"),
+    ),
+)
+
+
+def _column(name: str) -> Parameter:
+    # The annotation carries the parameter's own name, so what `reads`
+    # answers reads as the column it came from.
+    record = Annotation(name=name, fields=_NOTE.fields)
+    return Parameter(name=name, type=record.written, annotation=record)
+
+
+def _value(name: str, type: str = "number") -> Parameter:
+    return Parameter(name=name, type=type)
+
+
+def _stream(name: str, type: str = "video_stream") -> Parameter:
+    return Parameter(name=name, type=type)
+
+
+def _declared(params: tuple[Parameter, ...], returns: str, **over: object) -> WasmFunction:
+    fields: dict[str, object] = {
+        "name": "m",
+        "module": "m.wasm",
+        "export": "m",
+        "params": params,
+        "returns": returns,
+        "line": 1,
+        "col": 1,
+    }
+    fields.update(over)
+    return WasmFunction(**fields)  # type: ignore[arg-type]
+
+
+# (what it is, the declaration, reads, reads_params, value_params, written_params)
+_Kind = tuple[str, WasmFunction, str | None, tuple[str, ...], tuple[str, ...], tuple[str, ...]]
+
+_ROWS_BY_KIND: list[_Kind] = [
+    (
+        "a frame filter",
+        _declared((_stream("v"), _column("notes"), _value("size")), "video_stream"),
+        "notes",
+        ("notes",),
+        ("size",),
+        # The column is not written: the call producing it produces the
+        # stream beside it, so one argument covers both.
+        ("v", "size"),
+    ),
+    (
+        "a rows function",
+        _declared((_column("rows"),), _NOTE.written, returns_rows=_NOTE),
+        None,
+        (),
+        # Its one parameter is its rows, so it configures nothing.
+        (),
+        ("rows",),
+    ),
+    (
+        "a packet rows function",
+        _declared(
+            (_stream("v"), _value("every")),
+            _NOTE.written,
+            returns_rows=_NOTE,
+            reads_packets=True,
+        ),
+        None,
+        (),
+        ("every",),
+        ("v", "every"),
+    ),
+    (
+        "a packet filter",
+        _declared(
+            (_stream("v"), _column("faces"), _column("words"), _value("budget")),
+            "packets",
+        ),
+        "faces",
+        ("faces", "words"),
+        ("budget",),
+        # Every column IS written: an encoder stands between the filter and
+        # any producer, so its rows arrive as arguments of their own.
+        ("v", "faces", "words", "budget"),
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("what", "declared", "reads", "columns", "values", "written"),
+    _ROWS_BY_KIND,
+    ids=[kind[0] for kind in _ROWS_BY_KIND],
+)
+def test_every_wasm_kind_agrees_about_which_parameters_are_rows(
+    what: str,
+    declared: WasmFunction,
+    reads: str | None,
+    columns: tuple[str, ...],
+    values: tuple[str, ...],
+    written: tuple[str, ...],
+) -> None:
+    assert (declared.reads.name if declared.reads else None) == reads, what
+    assert tuple(p.name for p in declared.reads_params) == columns, what
+    assert tuple(p.name for p in declared.value_params) == values, what
+    assert tuple(p.name for p in declared.written_params) == written, what
+    # What the four are for: every parameter falls in exactly one bucket --
+    # a stream, a row column beside one, a value the module is configured
+    # with, or (a ROWS function alone) the rows that are its whole argument.
+    named = [
+        tuple(p.name for p in declared.stream_params),
+        columns,
+        values,
+        (declared.params[0].name,) if declared.is_rows else (),
+    ]
+    assert sum(len(one) for one in named) == len(declared.params), what
+    assert len({name for one in named for name in one}) == len(declared.params), what
+    # `reads` is the first of the columns, wherever there are any.
+    assert reads == (columns[0] if columns else None), what

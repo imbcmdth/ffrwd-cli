@@ -51,11 +51,13 @@ output is plain ffmpeg, so the two mix freely in a script.
   is time, not correctness, and it is what makes the rows a module sees
   complete. For a live input it is impossible, and the plan is refused.
 - **A packet filter sees the framing its container used.** h264 travels
-  Annex B from an encoder and length-prefixed (`avcC`) out of an MP4,
-  and the packets reach a filter exactly as they were. A module that
-  rewrites NAL units must read `coded.extradata` and write the framing
-  it finds there; one that assumes Annex B corrupts a stream-copied MP4
-  rather than failing.
+  Annex B from an encoder and length-prefixed (`avcC`, `hvcC`) out of an
+  MP4, and the packets reach a filter exactly as they were: the host
+  reframes nothing. A module that rewrites NAL units reads
+  `coded.extradata`, which says which of the two it has, and writes the
+  framing it finds there; one that assumes either corrupts the other
+  silently rather than failing. Stream-copy hosting is the path that
+  hands a filter an MP4's own samples, so that is where it bites.
 - **Stream-copied splits snap to keyframes.** An output fan-out that
   splits by chapter (or any time window) with stream copy starts each
   piece at the nearest preceding keyframe, exactly as ffmpeg does.

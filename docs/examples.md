@@ -547,7 +547,7 @@ ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 rawvideo -pix_fmt:0 rgba -f
 
 A module cannot be a link in one ffmpeg's filter graph, so the query compiles to three processes joined by pipes rather than one command: an ffmpeg that decodes, the sidecar hosting the module, and an ffmpeg that encodes what comes back. The frames travel as NUT, and the pixel format on both seams is the one the module and the wire agree on - `rgba` here, because that is what `invert` accepts. `ffrwd run` executes the whole pipeline itself; the printed form is for reading and pasting.
 
-## 138. Rewrite a stream's packets without decoding it
+## 139. Rewrite a stream's packets without decoding it
 
 `RETURNS packets` declares a module that reads a stream's ENCODED bytes and hands the same stream back - the interface a module weaving data into a file uses. Write the call as a column of the COPY's SELECT and the compiler defers it past the encoder the destination would have placed:
 

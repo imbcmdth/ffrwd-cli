@@ -681,8 +681,15 @@ class WasmFunction:
         instead -- an encoder stands between it and any producer, so nothing
         rides anything -- and may declare one per rows source, each written
         at the call and each reaching the module as an input of its own.
+
+        None for the kinds whose rows are not a column beside a stream: a
+        value function, a ROWS function whose rows are its whole argument,
+        and a PACKET ROWS function whose rows are what it hands back. The
+        same three :attr:`reads` answers None for -- the two are read
+        together, and a parameter one skipped would be a value parameter the
+        other kept.
         """
-        if self.is_value or self.is_rows:
+        if self.is_value or self.is_rows or self.is_packet_rows:
             return ()
         found: list[Parameter] = []
         for param in self.params[self.stream_arity :]:
