@@ -21,6 +21,7 @@ fault, since the filter itself changed nothing.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -467,3 +468,104 @@ def test_a_rows_document_is_a_placeholder_until_a_run_resolves_it() -> None:
     assert document.format.path == "ffrwd:rows:0"
     assert document.source in plan.stages[0].processes
     assert document.target in plan.stages[1].processes
+
+
+# -- the real index package, when its artefacts are here -------------------
+#
+# Gated on two environment variables rather than skipped by discovery: the
+# `ffrwd/index` package is a repository of its own, and this suite neither
+# builds it nor knows where it lives.
+#
+#   FFRWD_INDEX_WEAVE  the built weave.wasm, against THIS sidecar's wit
+#   FFRWD_INDEX_TOOL   the built ffrwd-index binary
+#
+# What it proves is the placement, not the format: vectors for two spaces
+# reach one filter through two rows arguments, the filter is hosted by a
+# stream copy so no picture is touched, and the tool reads every record back
+# out of the MP4 with the spans the query put in.
+
+_INDEX_WEAVE = os.environ.get("FFRWD_INDEX_WEAVE", "")
+_INDEX_TOOL = os.environ.get("FFRWD_INDEX_TOOL", "")
+
+
+def _index_spaces_param() -> str | None:
+    """The `spaces` parameter weave declares, if the dialect can fill it.
+
+    A value parameter is a text, number, boolean or vector, so a params
+    schema asking for an array of objects is one no query can supply. That
+    is a property of the package, not of this suite, and reading it off the
+    module's own describe is what keeps this test skipping for a reason it
+    can state rather than failing for one it cannot.
+    """
+    described = wasm.describe(_INDEX_WEAVE)
+    schema = described.params_schema or {}
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        return None
+    member = properties.get("spaces")
+    kind = member.get("type") if isinstance(member, dict) else None
+    return str(kind) if isinstance(kind, str) else None
+
+
+def _require_index_package() -> None:
+    for name, path in (
+        ("FFRWD_INDEX_WEAVE", _INDEX_WEAVE),
+        ("FFRWD_INDEX_TOOL", _INDEX_TOOL),
+    ):
+        if not path or not Path(path).exists():
+            pytest.skip(f"{name} does not name a built artefact")
+    if not _NOTE_ROWS.exists():
+        pytest.skip(f"module missing: {_NOTE_ROWS}")
+    kind = _index_spaces_param()
+    if kind not in (None, "string", "number", "boolean"):
+        pytest.skip(
+            f"weave declares 'spaces' as {kind}, and a wasm function's value "
+            "parameters are text, number, boolean or vector -- no query can "
+            "configure it until the package takes scalars"
+        )
+
+
+def test_vectors_for_two_spaces_reach_the_real_weave_and_read_back(
+    tmp_path: Path,
+) -> None:
+    """Two rows arguments into `ffrwd/index`'s own filter, hosted by a stream
+    copy on an MP4, and `ffrwd-index read --mp4` gets every record back."""
+    _require_index_package()
+    out = tmp_path / "indexed.mp4"
+    record = "STRUCT(space text, start_t number, end_t number, vector vector)[]"
+    _run(
+        "CREATE FUNCTION vecs(v video_stream, space text, dims number)\n"
+        f"RETURNS STRUCT(v video_stream, out {record})\n"
+        f"  AS '{_NOTE_ROWS.as_posix()}', 'note_rows' LANGUAGE wasm;\n"
+        "CREATE FUNCTION weave(v video_stream,\n"
+        f"                      clip {record},\n"
+        f"                      speech {record},\n"
+        "                      spaces text)\n"
+        "RETURNS packets\n"
+        f"  AS '{Path(_INDEX_WEAVE).as_posix()}', 'weave' LANGUAGE wasm;\n"
+        "COPY (\n"
+        "  SELECT weave(f.video[1],\n"
+        "               vecs(f.video[1], 'clip', 8).out,\n"
+        "               vecs(ffmpeg.hflip(f.video[1]), 'speech', 8).out,\n"
+        "               '[{\"name\":\"clip\",\"dims\":8},"
+        "{\"name\":\"speech\",\"dims\":8}]')\n"
+        f"  FROM input('{_AV.as_posix()}') f\n"
+        f") TO '{out.as_posix()}'"
+    )
+
+    done = subprocess.run(
+        [_INDEX_TOOL, "read", "--mp4", str(out)],
+        capture_output=True,
+        text=True,
+        timeout=_TIMEOUT,
+        check=False,
+    )
+    assert done.returncode == 0, done.stderr
+    rows = [json.loads(line) for line in done.stdout.splitlines() if line.strip()]
+    records = [row for row in rows if "vector" in row]
+    assert records, f"the tool read no record back:\n{done.stdout}"
+    spaces = {row.get("space") for row in rows if "space" in row}
+    assert len(spaces) >= 1
+    # Every record's span is the one the producer wrote: one second long.
+    for row in records:
+        assert row["end_t"] - row["start_t"] == pytest.approx(1.0, abs=0.1)

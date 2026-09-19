@@ -21,8 +21,11 @@ use exports::ffrwd::av::window_filter::{
 };
 use serde::{Deserialize, Serialize};
 
-const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{"label":{"type":"string"},"every":{"type":"integer"}},"additionalProperties":false}"#;
-const ROWS_SCHEMA: &str = r#"{"type":"object","properties":{"pts":{"type":"integer"},"note":{"type":"string"}},"required":["pts","note"],"additionalProperties":false}"#;
+const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{"label":{"type":"string"},"every":{"type":"integer"},"space":{"type":"string"},"dims":{"type":"integer"}},"additionalProperties":false}"#;
+/// Two shapes: the note a packet filter weaves as text, and the vector
+/// record an index writer weaves as an embedding. Which one a run emits is
+/// `dims`: zero is a note, anything else is a vector that long.
+const ROWS_SCHEMA: &str = r#"{"oneOf":[{"type":"object","properties":{"pts":{"type":"integer"},"note":{"type":"string"}},"required":["pts","note"],"additionalProperties":false},{"type":"object","properties":{"space":{"type":"string"},"start_t":{"type":"number"},"end_t":{"type":"number"},"vector":{"type":"array","items":{"type":"number"}}},"required":["space","start_t","end_t","vector"],"additionalProperties":false}]}"#;
 
 #[derive(Deserialize)]
 struct Params {
@@ -30,6 +33,12 @@ struct Params {
     label: String,
     #[serde(default = "default_every")]
     every: u64,
+    /// The space a VECTOR row names. Ignored where `dims` is 0.
+    #[serde(default = "default_label")]
+    space: String,
+    /// How many components each vector carries. 0 emits notes instead.
+    #[serde(default)]
+    dims: usize,
 }
 
 fn default_label() -> String {
@@ -47,9 +56,27 @@ struct Row {
     note: String,
 }
 
+/// The other shape: one embedding over a span of the stream's own clock.
+///
+/// The components are a ramp off the frame index, so a reader knows what it
+/// should have got without the two ends sharing a model.
+#[derive(Serialize)]
+struct VectorRow {
+    space: String,
+    start_t: f64,
+    end_t: f64,
+    vector: Vec<f64>,
+}
+
 struct State {
     label: String,
     every: u64,
+    space: String,
+    dims: usize,
+    /// Seconds per tick, so a vector row's span is in the stream's own
+    /// presentation clock rather than in ticks.
+    num: f64,
+    den: f64,
     seen: u64,
 }
 
@@ -62,6 +89,8 @@ fn read_params(params: &str) -> Result<Params, String> {
         "" | "{}" => Ok(Params {
             label: default_label(),
             every: default_every(),
+            space: default_label(),
+            dims: 0,
         }),
         written => {
             let read: Params = serde_json::from_str(written)
@@ -102,7 +131,7 @@ impl Guest for NoteRows {
         }
     }
 
-    fn init(format: Format, _stream_info: StreamInfo, params: String) -> Result<(), String> {
+    fn init(format: Format, stream_info: StreamInfo, params: String) -> Result<(), String> {
         let read = read_params(&params)?;
         let Format::Video(_) = format else {
             return Err("note_rows reads pictures, and this stream is audio".to_string());
@@ -111,6 +140,10 @@ impl Guest for NoteRows {
             *s.borrow_mut() = Some(State {
                 label: read.label,
                 every: read.every,
+                space: read.space,
+                dims: read.dims,
+                num: f64::from(stream_info.time_base.num),
+                den: f64::from(stream_info.time_base.den),
                 seen: 0,
             });
         });
@@ -131,14 +164,27 @@ impl Guest for NoteRows {
                 let index = state.seen;
                 state.seen += 1;
                 let pts = window.pts(i);
-                let rows = if index % state.every == 0 {
+                let rows = if index % state.every != 0 {
+                    Vec::new()
+                } else if state.dims == 0 {
                     let row = Row {
                         pts,
                         note: format!("{}-{index}", state.label),
                     };
                     vec![serde_json::to_string(&row).expect("a row serializes")]
                 } else {
-                    Vec::new()
+                    let start = pts as f64 * state.num / state.den;
+                    let row = VectorRow {
+                        space: state.space.clone(),
+                        start_t: start,
+                        end_t: start + 1.0,
+                        // A ramp off the frame index: predictable at the far
+                        // end without the two sharing a model.
+                        vector: (0..state.dims)
+                            .map(|c| ((index as usize + c) % 8) as f64 / 8.0)
+                            .collect(),
+                    };
+                    vec![serde_json::to_string(&row).expect("a row serializes")]
                 };
                 // The pictures are not this module's business: it reads the
                 // times and hands every frame straight back.
