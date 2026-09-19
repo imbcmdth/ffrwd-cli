@@ -38,7 +38,7 @@ use exports::ffrwd::av::packet_filter::{
 use serde::{Deserialize, Serialize};
 
 const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{},"additionalProperties":false}"#;
-const ROWS_SCHEMA: &str = r#"{"type":"object","properties":{"pad":{"type":"integer"},"pts":{"type":"integer"},"notes":{"type":"integer"},"bytes":{"type":"integer"},"calls":{"type":"integer"},"rows_first_call":{"type":"integer"},"rows_total":{"type":"integer"},"note":{"type":"string"},"woven":{"type":"boolean"}}}"#;
+const ROWS_SCHEMA: &str = r#"{"type":"object","properties":{"pad":{"type":"integer"},"pts":{"type":"integer"},"notes":{"type":"integer"},"bytes":{"type":"integer"},"calls":{"type":"integer"},"rows_first_call":{"type":"integer"},"rows_total":{"type":"integer"},"args":{"type":"array","items":{"type":"string"}},"note":{"type":"string"},"woven":{"type":"boolean"}}}"#;
 
 /// The unit's own name, 16 bytes of `uuid_iso_iec_11578`. Chosen with no
 /// zero byte in it so nothing in the message can start an emulation
@@ -49,10 +49,29 @@ const UUID: [u8; 16] = [
 ];
 
 /// One row this module reads: a note and the tick it belongs at.
+///
+/// `arg` is the `_arg` the host writes on every row arriving through a NAMED
+/// `-rows-in`, which is how a filter reading several rows arguments tells
+/// them apart. Absent for an unnamed input, and the note is then woven
+/// exactly as it was written; present, and the note is prefixed with it, so
+/// the bytes in the stream say which argument each one came from.
 #[derive(Deserialize)]
 struct NoteRow {
     pts: i64,
     note: String,
+    #[serde(rename = "_arg", default)]
+    arg: Option<String>,
+}
+
+impl NoteRow {
+    /// What this note writes into the stream: `<arg>:<note>` for a tagged
+    /// row, the note itself for an untagged one.
+    fn text(&self) -> String {
+        match &self.arg {
+            Some(arg) => format!("{arg}:{}", self.note),
+            None => self.note.clone(),
+        }
+    }
 }
 
 /// One row this module writes: which packet carried how many notes.
@@ -80,6 +99,9 @@ struct State {
     /// lands then depends on which thread won.
     rows_first_call: u64,
     rows_total: u64,
+    /// The distinct `_arg` values seen, in the order they first arrived.
+    /// Empty where the rows came in unnamed.
+    args: Vec<String>,
 }
 
 /// What the instance saw of its rows, emitted once at the end.
@@ -88,6 +110,7 @@ struct ArrivalRow {
     calls: u64,
     rows_first_call: u64,
     rows_total: u64,
+    args: Vec<String>,
 }
 
 thread_local! {
@@ -145,8 +168,8 @@ fn weave(
             if due.is_empty() {
                 return packet;
             }
-            let texts: Vec<&str> = due.iter().map(|r| r.note.as_str()).collect();
-            let nal = sei_nal(&texts);
+            let texts: Vec<String> = due.iter().map(NoteRow::text).collect();
+            let nal = sei_nal(&texts.iter().map(String::as_str).collect::<Vec<&str>>());
             rows.push(
                 serde_json::to_string(&WovenRow {
                     pad,
@@ -229,6 +252,11 @@ impl Guest for PacketSei {
             // at; the rows it writes say how many it used.
             for row in &rows {
                 if let Ok(parsed) = serde_json::from_str::<NoteRow>(row) {
+                    if let Some(arg) = &parsed.arg {
+                        if !state.args.iter().any(|seen| seen == arg) {
+                            state.args.push(arg.clone());
+                        }
+                    }
                     state.pending.push(parsed);
                 }
             }
@@ -262,7 +290,7 @@ impl Guest for PacketSei {
                     trailing.push(
                         serde_json::to_string(&serde_json::json!({
                             "pts": note.pts,
-                            "note": note.note,
+                            "note": note.text(),
                             "woven": false
                         }))
                         .expect("a trailing row serializes"),
@@ -273,6 +301,7 @@ impl Guest for PacketSei {
                         calls: state.calls,
                         rows_first_call: state.rows_first_call,
                         rows_total: state.rows_total,
+                        args: state.args.clone(),
                     })
                     .expect("an arrival row serializes"),
                 );

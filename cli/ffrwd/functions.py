@@ -673,12 +673,32 @@ class WasmFunction:
         return len(self.stream_params)
 
     @property
+    def reads_params(self) -> tuple[Parameter, ...]:
+        """Every annotation parameter declared right after the streams.
+
+        One at most for a frame filter, whose rows ride the stream they were
+        read off. A ``RETURNS packets`` filter reads its rows as ARGUMENTS
+        instead -- an encoder stands between it and any producer, so nothing
+        rides anything -- and may declare one per rows source, each written
+        at the call and each reaching the module as an input of its own.
+        """
+        if self.is_value or self.is_rows:
+            return ()
+        found: list[Parameter] = []
+        for param in self.params[self.stream_arity :]:
+            if param.annotation is None:
+                break
+            found.append(param)
+        return tuple(found)
+
+    @property
     def reads(self) -> Annotation | None:
         """The annotation column this function takes BESIDE a stream.
 
-        None for a ROWS function, whose rows are the whole argument rather
-        than a column riding one: :attr:`rows_param` is that one. None for a
-        PACKET ROWS function too, whose rows are what it hands back.
+        The FIRST of them where several are declared. None for a ROWS
+        function, whose rows are the whole argument rather than a column
+        riding one: :attr:`rows_param` is that one. None for a PACKET ROWS
+        function too, whose rows are what it hands back.
         """
         if self.is_value or self.is_rows or self.is_packet_rows:
             return None
@@ -714,7 +734,7 @@ class WasmFunction:
             return ()
         if self.is_value:
             return self.params
-        skip = self.stream_arity + (1 if self.reads is not None else 0)
+        skip = self.stream_arity + len(self.reads_params)
         return self.params[skip:]
 
     @property
@@ -724,9 +744,15 @@ class WasmFunction:
         A value function's are all of them, and so are a rows function's. A
         stream function's annotation column is not one: the call producing it
         produces the stream beside it, so a single written argument covers both.
+
+        A ``RETURNS packets`` filter's columns ARE: an encoder stands between
+        it and any producer, so the rows reach it as arguments of their own
+        and every one of them is written at the call.
         """
         if self.is_value or self.is_rows:
             return self.params
+        if self.is_packets:
+            return (*self.stream_params, *self.reads_params, *self.value_params)
         return (*self.stream_params, *self.value_params)
 
     @property
@@ -1875,7 +1901,20 @@ def _define_wasm(
         )
     if len(streams) > 1 or any(is_array(p.type) for p in streams):
         _reject_annotation_column(name, params, identifier, create)
-    for position, extra in enumerate(params[len(streams) + 1 :], start=len(streams) + 2):
+    # A packet filter reads its rows as arguments rather than off the stream
+    # they ride, so it may declare one column per rows source; every other
+    # shape reads the one column beside its stream and no more. Either way
+    # they are the run right after the streams: a column anywhere else is a
+    # value position, and refused as one.
+    columns = 0
+    for extra in params[len(streams) :]:
+        if extra.annotation is None:
+            break
+        columns += 1
+    allowed = columns if returns == WASM_PACKETS else min(columns, 1)
+    for position, extra in enumerate(
+        params[len(streams) + allowed :], start=len(streams) + allowed + 1
+    ):
         if extra.annotation is None:
             continue
         raise _error(

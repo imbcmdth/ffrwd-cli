@@ -620,15 +620,27 @@ interface packet-filter {
   ///
   /// `rows` is whatever the host had ready. They arrive in the order they
   /// were written and never arrive twice, and a module needing a row's time
-  /// reads it out of the row. WHEN they arrive depends on where they come
-  /// from, and a module may rely on this much:
+  /// reads it out of the row.
+  ///
+  /// A filter may be given SEVERAL rows inputs, one per rows argument the
+  /// query wrote. They are not separate lists: every row arrives in this one,
+  /// and a row from a NAMED input carries an extra `"_arg": "<name>"` field
+  /// saying which argument it filled. The host writes that field itself and
+  /// refuses a producer row that already carries one, so a module may read it
+  /// as the host's word rather than the producer's. An input the host was
+  /// given no name for adds nothing, and its rows arrive exactly as written.
+  ///
+  /// WHEN they arrive depends on where they come from, and a module may rely
+  /// on this much:
   ///
   /// - From a FILE, every row is in hand before the first call, as many as
   ///   the host's own buffer holds. A file whose rows outrun that buffer
   ///   fills it, and the rest arrive over the calls that follow as the
   ///   module takes them. So a filter fed a file of any ordinary size sees
   ///   the lot before packet one, and one fed a very large file sees them in
-  ///   order as it drains them.
+  ///   order as it drains them. SEVERAL files share that one buffer, so what
+  ///   is in hand before the first call is the first bufferful of all of them
+  ///   together, in whatever order their readers interleaved.
   /// - From a PIPE, they arrive whenever they are written, which may be none
   ///   for many calls and many at once. Packets never wait on a pipe: a live
   ///   run whose rows are still being produced keeps flowing.

@@ -362,9 +362,12 @@ struct Args {
     stream_info: Option<StreamInfo>,
     outputs: Vec<OutputSpec>,
     annotations: Annotations,
-    /// `-rows-in`: where a rows module's input rows come from. A rows
-    /// module reads no `-i` stream at all, so this is its only input.
-    rows_in: Option<InputPath>,
+    /// `-rows-in`, in the order the line gave them: where a rows module's or
+    /// a packet filter's input rows come from. A rows module reads no `-i`
+    /// stream at all, so its one entry is its only input; a packet filter is
+    /// given one per rows argument its caller wrote, each naming the
+    /// argument it fills.
+    rows_in: Vec<RowsInput>,
     /// Every `-m <path> -rows-from <index>` on the line, in the order they
     /// were given - the hops a rows-bearing output's rows may flow through
     /// before they are written.
@@ -402,6 +405,72 @@ struct PadRendition {
 enum InputPath {
     Stdin,
     File(String),
+}
+
+/// One `-rows-in`: where the rows come from, and which of the reading call's
+/// rows arguments they fill.
+///
+/// `arg` is the name written as `-rows-in <name>=<path>`, and None for the
+/// bare `-rows-in <path>` a rows module takes. Every row read through a
+/// NAMED input is handed to the module carrying a `"_arg": "<name>"` field,
+/// which is how a filter reading several rows arguments tells them apart.
+#[derive(Clone)]
+struct RowsInput {
+    arg: Option<String>,
+    path: InputPath,
+}
+
+/// The field a named `-rows-in` adds to every row it delivers.
+const ROWS_ARG_FIELD: &str = "_arg";
+
+/// `-rows-in`'s value read as an optional name and a path.
+///
+/// `<name>=<path>` names the rows argument this input fills; anything else
+/// is a bare path. A name is an identifier -- letters, digits and
+/// underscores, not starting with a digit -- so a path that happens to
+/// carry an `=` is still read as the path it is. A path that would be
+/// mistaken for one is written with a leading `./`.
+fn parse_rows_input(written: &str) -> Result<RowsInput> {
+    if let Some((head, rest)) = written.split_once('=') {
+        let named = !head.is_empty()
+            && !head.starts_with(|c: char| c.is_ascii_digit())
+            && head.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if named {
+            return Ok(RowsInput {
+                arg: Some(head.to_string()),
+                path: resolve_input_path(rest)?,
+            });
+        }
+    }
+    Ok(RowsInput {
+        arg: None,
+        path: resolve_input_path(written)?,
+    })
+}
+
+/// `row` with `"_arg": "<name>"` added, for a row arriving on a named
+/// `-rows-in`.
+///
+/// A row that already carries the field is refused rather than overwritten:
+/// the producer would be claiming an argument the reader did not give it,
+/// and a filter that dispatches on the field would act on the wrong one.
+fn tag_row(row: &str, arg: &str) -> Result<String> {
+    let mut value: serde_json::Value =
+        serde_json::from_str(row).with_context(|| format!("-rows-in {arg}: a row is not JSON"))?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("-rows-in {arg}: a row is not a JSON object"))?;
+    if object.contains_key(ROWS_ARG_FIELD) {
+        bail!(
+            "-rows-in {arg}: a row already carries {ROWS_ARG_FIELD}, which is the host's to \
+             write; the producer must not"
+        );
+    }
+    object.insert(
+        ROWS_ARG_FIELD.to_string(),
+        serde_json::Value::String(arg.to_string()),
+    );
+    Ok(value.to_string())
 }
 
 enum OutputPath {
@@ -583,7 +652,7 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
     let mut outputs: Vec<OutputSpec> = Vec::new();
     let mut stream_info_path: Option<String> = None;
     let mut annotations = Annotations::default();
-    let mut rows_in: Option<InputPath> = None;
+    let mut rows_in: Vec<RowsInput> = Vec::new();
     let mut jobs: Option<usize> = None;
     // What the `-rows` before the next output said, if one was given.
     let mut pending_rows: Option<usize> = None;
@@ -707,10 +776,18 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
             }
             "-stream_info" => stream_info_path = Some(next("-stream_info")?),
             "-rows-in" => {
-                if rows_in.is_some() {
-                    bail!("second -rows-in specified");
+                let read = parse_rows_input(&next("-rows-in")?)?;
+                if let Some(name) = &read.arg {
+                    if rows_in
+                        .iter()
+                        .any(|r: &RowsInput| r.arg.as_deref() == Some(name))
+                    {
+                        bail!("second -rows-in {name}= specified");
+                    }
+                } else if rows_in.iter().any(|r: &RowsInput| r.arg.is_none()) {
+                    bail!("second unnamed -rows-in specified");
                 }
-                rows_in = Some(resolve_input_path(&next("-rows-in")?)?);
+                rows_in.push(read);
             }
             "-jobs" => {
                 let raw = next("-jobs")?;
@@ -1522,10 +1599,20 @@ fn run(args: &Args) -> Result<()> {
                     args.inputs.len()
                 );
             }
-            let rows_in = args.rows_in.as_ref().ok_or_else(|| {
-                anyhow!("{path} is a rows module: it reads rows through -rows-in, which this command does not give it")
-            })?;
-            return run_rows_module(args, path, params, rows_in);
+            let [read] = args.rows_in.as_slice() else {
+                bail!(
+                    "{path} is a rows module: it reads one rows input through -rows-in, and this \
+                     command gives it {}",
+                    args.rows_in.len()
+                );
+            };
+            if read.arg.is_some() {
+                bail!(
+                    "{path} is a rows module: its rows are its whole argument, so -rows-in names \
+                     no argument for them to fill"
+                );
+            }
+            return run_rows_module(args, path, params, &read.path);
         }
     }
     // A packet filter reads a stream, so it is dispatched below with the
@@ -1540,7 +1627,7 @@ fn run(args: &Args) -> Result<()> {
     // -rows-in names a rows module's or a packet filter's input; every other
     // shape reads neither a rows module's -i (none) nor -rows-in (nothing) -
     // so a -rows-in this far along names something that is neither.
-    if args.rows_in.is_some() && !packet_filter {
+    if !args.rows_in.is_empty() && !packet_filter {
         match &args.modules {
             Modules::Single { path, .. } => {
                 bail!("-rows-in follows a rows module's or a packet filter's -m; {path} is neither")
@@ -1861,25 +1948,29 @@ fn run_packet_filter(args: &Args, module: &str, params: &str) -> Result<()> {
     // is read, and where a module puts a row would depend on which thread
     // won. The open still happens on the reader's own thread, since a named
     // pipe blocks on open until its writer arrives.
-    let rows = Arc::new(RowsQueue::new());
-    let rows_from_file = match &args.rows_in {
-        Some(path) => {
-            // Decided here rather than on the reader: `metadata` answers at
-            // once where opening a pipe would block.
-            let bounded = rows_are_a_file(path);
-            let path = path.clone();
-            let queue = Arc::clone(&rows);
-            std::thread::spawn(move || match open_input(&path) {
-                Ok(reader) => read_rows(reader, &queue),
-                Err(error) => queue.fail(error.context("opening -rows-in")),
-            });
-            bounded
-        }
-        None => {
-            rows.close_input();
-            false
-        }
-    };
+    //
+    // Several `-rows-in` are several readers filling ONE queue, so every
+    // argument's rows reach the module through the one `rows` list and each
+    // row says which argument it came from. The byte bound is the queue's,
+    // not each reader's: together they hold what one file's rows would.
+    let rows = Arc::new(RowsQueue::new(args.rows_in.len().max(1)));
+    // Decided here rather than on the readers: `metadata` answers at once
+    // where opening a pipe would block. Every input a file is what lets the
+    // rows settle before packet one; one pipe among them and none of them
+    // wait, since packets never wait on a pipe.
+    let rows_from_file =
+        !args.rows_in.is_empty() && args.rows_in.iter().all(|r| rows_are_a_file(&r.path));
+    if args.rows_in.is_empty() {
+        rows.close_one();
+    }
+    for read in &args.rows_in {
+        let read = read.clone();
+        let queue = Arc::clone(&rows);
+        std::thread::spawn(move || match open_input(&read.path) {
+            Ok(reader) => read_rows(reader, &queue, read.arg.as_deref()),
+            Err(error) => queue.fail(error.context("opening -rows-in")),
+        });
+    }
 
     // The readers start before anything else, for the reason a packet
     // sink's do: each drains its own input from the first byte, so a fast
@@ -1928,7 +2019,7 @@ fn run_packet_filter(args: &Args, module: &str, params: &str) -> Result<()> {
 
     // A filter that acts on rows and is given none would run blind, so it
     // is refused instead. The reader itself started above.
-    if args.rows_in.is_none() && filter.reads_rows() {
+    if args.rows_in.is_empty() && filter.reads_rows() {
         bail!(
             "{} reads the rows woven into its packets, and this command gives it none; \
              name them with -rows-in <path>",
@@ -1939,10 +2030,12 @@ fn run_packet_filter(args: &Args, module: &str, params: &str) -> Result<()> {
     // A FILE's rows are all there to be read, so they are read before the
     // first call rather than raced against it: a module is handed every row
     // that fits in the queue before it sees packet one, and where a record
-    // lands is the module's decision rather than the scheduler's. A file
-    // whose rows outrun the queue's bound fills it, and the rest arrive as
-    // the module drains it. Nothing waits on a pipe or on stdin: nothing
-    // says when their rows arrive, and packets do not stop for them.
+    // lands is the module's decision rather than the scheduler's. SEVERAL
+    // files share that one bound, so what settles is the first megabyte of
+    // all of them together, in whatever order their readers interleaved;
+    // past it they fill the queue and the rest arrive as the module drains
+    // it. Nothing waits on a pipe or on stdin: nothing says when their rows
+    // arrive, and packets do not stop for them.
     if rows_from_file {
         rows.settle()?;
     }
@@ -2053,8 +2146,10 @@ const ROWS_BUFFER_BYTES: usize = 1 << 20;
 struct RowsState {
     rows: Vec<String>,
     bytes: usize,
-    /// The rows input ended; set after its last row is queued.
-    closed: bool,
+    /// How many readers are still running. The rows have ended when the last
+    /// one has queued its final row, which for several `-rows-in` is several
+    /// readers rather than one.
+    open: usize,
     /// The read failed; the drive loop raises it.
     failed: Option<anyhow::Error>,
     /// The drive loop has stopped; the reader stops instead of waiting for
@@ -2062,44 +2157,53 @@ struct RowsState {
     dead: bool,
 }
 
-/// The rows a packet filter reads beside its packets: one reader thread
-/// filling a bounded queue, the drive loop taking whatever is in it without
-/// ever waiting. Packets pace the run, so a call that finds no rows ready
-/// gets none rather than stalling the packets behind them.
+/// The rows a packet filter reads beside its packets: a reader thread per
+/// `-rows-in` filling ONE bounded queue, the drive loop taking whatever is
+/// in it without ever waiting. Packets pace the run, so a call that finds no
+/// rows ready gets none rather than stalling the packets behind them.
+///
+/// Several readers share the queue and its bound: a row says which argument
+/// it came from, so one list carries all of them, and the rows a call is
+/// handed are whatever had arrived on any of the inputs.
 struct RowsQueue {
     state: Mutex<RowsState>,
     /// The drive loop drained, freeing space - or is gone for good.
     drained: Condvar,
-    /// A row arrived, or the input closed or failed.
+    /// A row arrived, or an input closed or failed.
     filled: Condvar,
 }
 
 impl RowsQueue {
-    fn new() -> RowsQueue {
+    /// A queue `readers` inputs feed. The rows end when every one of them
+    /// has, which is what `close_one` counts down.
+    fn new(readers: usize) -> RowsQueue {
         RowsQueue {
-            state: Mutex::new(RowsState::default()),
+            state: Mutex::new(RowsState {
+                open: readers,
+                ..RowsState::default()
+            }),
             drained: Condvar::new(),
             filled: Condvar::new(),
         }
     }
 
-    /// Waits until a FILE's rows are all in hand, or until the queue is at
-    /// its byte bound and the reader can hold no more. Called only for a
-    /// regular file, whose end always comes.
+    /// Waits until every FILE's rows are in hand, or until the queue is at
+    /// its byte bound and the readers can hold no more. Called only where
+    /// every input is a regular file, whose end always comes.
     fn settle(&self) -> Result<()> {
         let mut state = self.state.lock().expect("the reader holds no panic");
         loop {
             if let Some(error) = state.failed.take() {
                 return Err(error);
             }
-            if state.closed || state.bytes >= ROWS_BUFFER_BYTES {
+            if state.open == 0 || state.bytes >= ROWS_BUFFER_BYTES {
                 return Ok(());
             }
             state = self.filled.wait(state).expect("the reader holds no panic");
         }
     }
 
-    /// Everything read so far, and whether the input has ended. Never waits.
+    /// Everything read so far, and whether the inputs have ended. Never waits.
     fn take(&self) -> Result<(Vec<String>, bool)> {
         let mut state = self.state.lock().expect("the reader holds no panic");
         if let Some(error) = state.failed.take() {
@@ -2107,7 +2211,7 @@ impl RowsQueue {
         }
         state.bytes = 0;
         let taken = std::mem::take(&mut state.rows);
-        let closed = state.closed;
+        let closed = state.open == 0;
         self.drained.notify_all();
         Ok((taken, closed))
     }
@@ -2125,27 +2229,28 @@ impl RowsQueue {
                 return Ok(gathered);
             }
             let mut state = self.state.lock().expect("the reader holds no panic");
-            while !state.closed && state.rows.is_empty() && state.failed.is_none() {
+            while state.open > 0 && state.rows.is_empty() && state.failed.is_none() {
                 state = self.filled.wait(state).expect("the reader holds no panic");
             }
         }
     }
 
-    /// Stores a read failure for the drive loop to raise, and ends the
+    /// Stores a read failure for the drive loop to raise, and ends EVERY
     /// input: nothing more is coming, and the run stops on the error rather
     /// than on the wait.
     fn fail(&self, error: anyhow::Error) {
         let mut state = self.state.lock().expect("the drive loop holds no panic");
         state.failed = Some(error);
-        state.closed = true;
+        state.open = 0;
         self.filled.notify_all();
     }
 
-    /// Marks the input ended without one ever being opened: a filter reading
-    /// no rows is handed none, and its final call waits for nothing.
-    fn close_input(&self) {
+    /// One reader has reached the end of its input. The rows have ended when
+    /// the last one has; a filter reading no rows at all is closed once, at
+    /// the start, so its final call waits for nothing.
+    fn close_one(&self) {
         let mut state = self.state.lock().expect("the reader holds no panic");
-        state.closed = true;
+        state.open = state.open.saturating_sub(1);
         self.filled.notify_all();
     }
 
@@ -2170,8 +2275,22 @@ fn rows_are_a_file(path: &InputPath) -> bool {
 
 /// One rows reader: blocking line reads off the rows input, each non-blank
 /// line into the queue, waiting whenever the queue is over its byte bound.
-fn read_rows(reader: InputReader, queue: &RowsQueue) {
+///
+/// `arg` is the rows argument this input fills, for a named `-rows-in`: each
+/// row is handed on carrying it, so a filter reading several tells them
+/// apart. None leaves every row exactly as it was written.
+fn read_rows(reader: InputReader, queue: &RowsQueue, arg: Option<&str>) {
     for line in io::BufReader::new(reader).lines() {
+        let line = match (line, arg) {
+            (Ok(row), Some(name)) if !row.trim().is_empty() => match tag_row(&row, name) {
+                Ok(tagged) => Ok(tagged),
+                Err(error) => {
+                    queue.fail(error);
+                    return;
+                }
+            },
+            (other, _) => other.map_err(anyhow::Error::new),
+        };
         match line {
             Ok(row) if row.trim().is_empty() => {}
             Ok(row) => {
@@ -2192,14 +2311,12 @@ fn read_rows(reader: InputReader, queue: &RowsQueue) {
                 queue.filled.notify_all();
             }
             Err(error) => {
-                queue.fail(anyhow::Error::new(error).context("reading -rows-in"));
+                queue.fail(error.context("reading -rows-in"));
                 return;
             }
         }
     }
-    let mut state = queue.state.lock().expect("the drive loop holds no panic");
-    state.closed = true;
-    queue.filled.notify_all();
+    queue.close_one();
 }
 
 /// `-rows-in`: one JSON object per line, blank lines skipped. No stream
@@ -3682,7 +3799,7 @@ mod rows_queue_tests {
         // wait begins, so a `settle` that returns with every row in hand can
         // only have waited for them. `take` is what the drive loop calls
         // between packets, and it is what must NOT wait.
-        let queue = Arc::new(RowsQueue::new());
+        let queue = Arc::new(RowsQueue::new(1));
         let path = scratch("settle.ndjson");
         std::fs::write(&path, "{\"a\":1}\n{\"a\":2}\n{\"a\":3}\n").expect("write the rows");
 
@@ -3695,7 +3812,7 @@ mod rows_queue_tests {
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(100));
             let file = File::open(&opened).expect("open the rows file");
-            read_rows(InputReader::File(file), &reading);
+            read_rows(InputReader::File(file), &reading, None);
         });
 
         queue.settle().expect("a file always reaches its end");

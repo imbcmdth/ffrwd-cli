@@ -579,6 +579,133 @@ fn rows_reach_a_filter_and_the_packets_it_rewrote_still_decode() {
 }
 
 #[test]
+fn several_named_rows_inputs_arrive_tagged_with_the_argument_they_filled() {
+    // Two `-rows-in name=path`, one note each. Both reach the module, and
+    // each carries the `_arg` the host wrote for its own input -- which is
+    // what a filter reading several rows arguments dispatches on. The module
+    // echoes the names it saw, so the assertion is on what it read rather
+    // than on what was written.
+    let first = scratch("vectors_a.ndjson");
+    let second = scratch("vectors_b.ndjson");
+    std::fs::write(&first, "{\"pts\":0,\"note\":\"alpha\"}\n").expect("write the first rows file");
+    std::fs::write(
+        &second,
+        format!("{{\"pts\":{},\"note\":\"beta\"}}\n", KEYFRAME_PTS[0] + 1),
+    )
+    .expect("write the second rows file");
+
+    let module = module_path("packet_sei");
+    let written = scratch("sei_two_args.nut");
+    let run = run_ffrwd_wasm(
+        &[
+            "-f",
+            "nut",
+            "-i",
+            fixture_path().to_str().expect("fixture path is UTF-8"),
+            "-m",
+            module.to_str().expect("module path is UTF-8"),
+            "-rows-in",
+            &format!("faces={}", first.to_str().expect("rows path is UTF-8")),
+            "-rows-in",
+            &format!("words={}", second.to_str().expect("rows path is UTF-8")),
+            "-f",
+            "nut",
+            written.to_str().expect("output path is UTF-8"),
+            "-f",
+            "ndjson",
+            "-",
+        ],
+        &[],
+    );
+    assert!(
+        run.output.status.success(),
+        "packet_sei exited with {:?}\nstderr:\n{}",
+        run.output.status.code(),
+        run.stderr
+    );
+
+    let (emitted, summary) = sei_rows(&run.stdout);
+    assert_eq!(
+        summary["rows_total"], 2,
+        "both inputs' rows reached the module:\n{}",
+        run.stdout
+    );
+    let mut seen: Vec<String> = summary["args"]
+        .as_array()
+        .expect("the summary names the arguments it saw")
+        .iter()
+        .map(|v| v.as_str().expect("an argument name").to_string())
+        .collect();
+    seen.sort();
+    assert_eq!(seen, vec!["faces".to_string(), "words".to_string()]);
+    let woven: u64 = emitted
+        .iter()
+        .map(|row| row["notes"].as_u64().expect("a note count"))
+        .sum();
+    assert_eq!(woven, 2, "both notes were woven in");
+
+    // The tag reaches the bytes: the module writes `<arg>:<note>`, so the
+    // stream itself says which argument each note came from.
+    let wire = std::fs::read(&written).expect("read what the filter wrote");
+    let text = String::from_utf8_lossy(&wire);
+    assert!(
+        text.contains("faces:alpha"),
+        "the first input's note did not reach the stream tagged"
+    );
+    assert!(
+        text.contains("words:beta"),
+        "the second input's note did not reach the stream tagged"
+    );
+
+    for path in [&first, &second, &written] {
+        std::fs::remove_file(path).ok();
+    }
+}
+
+#[test]
+fn a_producer_row_that_already_carries_arg_is_refused() {
+    // `_arg` is the host's field. A producer writing one would be claiming
+    // an argument its reader never gave it, so the run stops rather than
+    // letting the module dispatch on it.
+    let rows = scratch("claimed_arg.ndjson");
+    std::fs::write(&rows, "{\"pts\":0,\"note\":\"alpha\",\"_arg\":\"mine\"}\n")
+        .expect("write the rows file");
+
+    let module = module_path("packet_sei");
+    let written = scratch("claimed_arg.nut");
+    let run = run_ffrwd_wasm(
+        &[
+            "-f",
+            "nut",
+            "-i",
+            fixture_path().to_str().expect("fixture path is UTF-8"),
+            "-m",
+            module.to_str().expect("module path is UTF-8"),
+            "-rows-in",
+            &format!("faces={}", rows.to_str().expect("rows path is UTF-8")),
+            "-f",
+            "nut",
+            written.to_str().expect("output path is UTF-8"),
+        ],
+        &[],
+    );
+    assert!(
+        !run.output.status.success(),
+        "a row claiming _arg was accepted:\n{}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("_arg"),
+        "stderr does not name the field:\n{}",
+        run.stderr
+    );
+
+    for path in [&rows, &written] {
+        std::fs::remove_file(path).ok();
+    }
+}
+
+#[test]
 fn params_come_out_of_a_file_as_readily_as_off_the_line() {
     // A module's parameters can be long, and a command line is a poor place
     // to keep one. The two spellings name the same value, and naming both
