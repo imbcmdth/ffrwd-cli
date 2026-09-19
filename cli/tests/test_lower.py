@@ -14450,6 +14450,17 @@ def test_a_packet_filter_that_reads_rows_has_nowhere_to_read_them() -> None:
     assert "reads rows beside its packets" in err.message
 
 
+def test_a_packets_call_inside_a_cte_body_is_refused() -> None:
+    """A body lowers once, before any COPY, so the destination whose encoder
+    the call sits behind is not settled where it is written."""
+    err = _packets_rejects(
+        "COPY (WITH w AS (SELECT weave(f.video[1]) AS v FROM input('f.mp4') f) "
+        "SELECT x.v FROM w x) TO 'out.mp4'"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "a WITH body has no destination" in err.message
+
+
 def test_a_packets_call_at_a_manifest_destination_is_refused() -> None:
     """A manifest writes a ladder of encoded streams; the filter reads one."""
     err = _packets_rejects(

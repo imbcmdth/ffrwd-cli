@@ -3703,9 +3703,22 @@ class _Lowerer:
                     attachments=list(self.attachments),
                 )
             ]
+        self._check_every_packet_filter_placed()
         self._check_loudnorm2()
         self.graph.input_options = self._lower_input_options()
         return self.graph
+
+    def _check_every_packet_filter_placed(self) -> None:
+        """No packets call may reach the graph without its encoder settled.
+
+        Every destination that can host one places it as it lowers; this is
+        the backstop that turns a call none of them reached into a rejection
+        rather than a module region the partitioner would host as a frame
+        filter.
+        """
+        for ref, declared, node, select in self.packet_filter_calls:
+            if ref not in self.graph.packet_filters:
+                raise self._unplaced_packets(ref, declared, node, select)
 
     def _check_loudnorm2(self) -> None:
         """The v1 limits on ``ffrwd.loudnorm2``.
@@ -13600,6 +13613,19 @@ class _Lowerer:
         that places no encoder -- the destination itself settles
         (:meth:`_place_packet_filters`).
         """
+        if self.cte_body:
+            # A body is lowered once, before any COPY, so the destination
+            # whose encoder the call sits behind is not known here -- and two
+            # COPYs reading the body would want two different ones.
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"'{declared.name}' reads the encoder its destination places, "
+                "and a WITH body has no destination",
+                node,
+                fallback=select,
+                hint="write the call in the COPY's own SELECT, over the "
+                "column the body hands it",
+            )
         if self.table_mode:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
