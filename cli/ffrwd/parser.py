@@ -2028,14 +2028,15 @@ class RawSink:
     are for the single-sink case, fully validated — for a one-COPY statement
     they ARE that pair.
 
-    ``is_csv`` is True exactly when ``WITH (...)`` names
-    ``format`` with value ``'csv'`` — Postgres's own rule for what makes a
-    COPY a table sink rather than a media one. It is decided HERE, from the
-    raw option shape alone, because it changes what the wrapped query is even
+    ``table_format`` is ``'csv'`` or ``'json'`` exactly when ``WITH (...)``
+    names ``format`` with that value, or when the path ends ``.json`` --
+    Postgres's own rule for what makes a COPY a table sink rather than a
+    media one, plus the suffix one. It is decided HERE, from the raw option
+    shape alone, because it changes what the wrapped query is even
     allowed to select (metadata columns become legal SELECT outputs) and
     whether ``TO STDOUT`` is a legal target — both decided before the option
     VALUES are otherwise interpreted, which stays lower's job as always.
-    ``path`` is None for a csv sink's ``TO STDOUT`` and for a parenthesized
+    ``path`` is None for a table sink's ``TO STDOUT`` and for a parenthesized
     ``TO (<expression>)``, whose text lower computes; a plain media sink's path
     is always a real string.
 
@@ -2054,7 +2055,7 @@ class RawSink:
     query: QueryExpr
     branches: tuple[exp.Select, ...]
     options: tuple[RawSinkOption, ...] = ()
-    is_csv: bool = False
+    table_format: str = ""
     path_expr: exp.Expr | None = None
     module_sink: str = ""
 
@@ -3316,28 +3317,42 @@ def union_branches(query: exp.Expr) -> list[exp.Select]:
 # COPY ... TO ... WITH (...)  — the sink wrapper
 
 
-def _is_csv_format(options: tuple[RawSinkOption, ...]) -> bool:
-    """True if ``WITH (...)`` names ``format`` with value ``csv``.
+# The suffix a table sink is inferred from, the way `.ndjson` marks a rows
+# file. Only `.json`: `.csv` has always needed its FORMAT written, and a
+# file named that way today is a media destination somebody meant.
+_JSON_SUFFIX = ".json"
 
-    Postgres's own rule: ``FORMAT csv`` is what makes a COPY a table sink,
-    decided from the option SHAPE alone (its value need not even be a
-    correctly-typed one for the discriminator to work — a malformed `format`
-    value just falls through to the normal media interpretation and fails
-    there instead, same as today). ``_ident_name`` folds both spellings
-    (``format csv`` and ``format 'csv'`` — a bare ``Var`` or a string
-    ``Literal``, VERIFIED under sqlglot 30.17) the Postgres way.
+
+def _table_format(options: tuple[RawSinkOption, ...], path: object) -> str:
+    """Which table format this COPY writes, or ``""`` for a media one.
+
+    Postgres's own rule first: ``FORMAT csv`` (or ``FORMAT json``) is what
+    makes a COPY a table sink, decided from the option SHAPE alone (its value
+    need not even be a correctly-typed one for the discriminator to work -- a
+    malformed `format` value just falls through to the normal media
+    interpretation and fails there instead, same as today). ``_ident_name``
+    folds both spellings (``format csv`` and ``format 'csv'`` -- a bare ``Var``
+    or a string ``Literal``, VERIFIED under sqlglot 30.17) the Postgres way.
+
+    Then the path: a ``.json`` destination is a table sink with no option
+    written, the way a ``.ndjson`` one is a rows file. `.json` names no
+    container ffmpeg would mux, so nothing is taken away by reading it this
+    way, and a vector written to one comes out whole.
     """
     for option in options:
         if option.name == "format":
-            return _ident_name(option.value) == "csv"
-    return False
+            written = _ident_name(option.value)
+            return written if written in ("csv", "json") else ""
+    if isinstance(path, str) and path.lower().endswith(_JSON_SUFFIX):
+        return "json"
+    return ""
 
 
 def _sink(
     copy: exp.Copy,
     wasm: Mapping[str, WasmFunction] | None = None,
 ) -> tuple[
-    str | None, exp.Expr | None, exp.Expr, tuple[RawSinkOption, ...], exp.Expr, bool, str
+    str | None, exp.Expr | None, exp.Expr, tuple[RawSinkOption, ...], exp.Expr, str, str
 ]:
     """Validate a top-level COPY into
     ``(path, path expression, path node, options, wrapped query, is_csv,
@@ -3427,7 +3442,10 @@ def _sink(
             hint=_SINK_HINT,
         )
     options = _sink_options(copy, target)
-    is_csv = _is_csv_format(options)
+    # The option alone, first: it decides whether STDOUT and a TO expression
+    # are legal, which is settled before the path is read.
+    table_format = _table_format(options, None)
+    is_csv = bool(table_format)
 
     path: str | None
     path_expr: exp.Expr | None = None
@@ -3450,7 +3468,7 @@ def _sink(
         # The options ride through: whether the sink takes any is a property
         # of the MODULE (a packet sink takes the encoder's), which only the
         # describe knows -- so lowering is where they are judged.
-        path, module_sink, is_csv = None, declared.name, False
+        path, module_sink, is_csv, table_format = None, declared.name, False, ""
     elif isinstance(target, exp.Paren) and isinstance(target.this, exp.Expr):
         if is_csv:
             raise _error(
@@ -3464,6 +3482,9 @@ def _sink(
         path, path_expr = None, target.this
     elif isinstance(target, exp.Literal) and target.is_string:
         path = str(target.this)
+        # A `.json` path with no format option written is a table sink too.
+        table_format = table_format or _table_format(options, path)
+        is_csv = bool(table_format)
     elif is_csv and isinstance(target, exp.Identifier) and _ident_name(target) == "stdout":
         path = None
     else:
@@ -3486,7 +3507,7 @@ def _sink(
             hint=_SINK_HINT,
         )
 
-    return path, path_expr, target, options, query, is_csv, module_sink
+    return path, path_expr, target, options, query, table_format, module_sink
 
 
 def _sink_options(copy: exp.Copy, target: exp.Expr) -> tuple[RawSinkOption, ...]:
@@ -3717,11 +3738,11 @@ class _Resolver:
                 # Peel the COPY wrapper off; what it wraps is validated exactly
                 # like a bare SELECT from here on -- except a csv sink is table
                 # mode, where metadata columns are legal SELECT outputs.
-                path, path_expr, path_node, options, wrapped, is_csv, module_sink = _sink(
+                path, path_expr, path_node, options, wrapped, table_format, module_sink = _sink(
                     statement, self.wasm
                 )
                 query, query_branches = self._resolve_query(
-                    wrapped, table_mode=is_csv, path_expr=path_expr
+                    wrapped, table_mode=bool(table_format), path_expr=path_expr
                 )
                 sinks.append(
                     RawSink(
@@ -3730,7 +3751,7 @@ class _Resolver:
                         query=query,
                         branches=tuple(query_branches),
                         options=options,
-                        is_csv=is_csv,
+                        table_format=table_format,
                         path_expr=path_expr,
                         module_sink=module_sink,
                     )

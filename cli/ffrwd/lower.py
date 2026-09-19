@@ -408,6 +408,7 @@ from ffrwd.table import (
     CellValue,
     RecordCell,
     StreamCell,
+    TableFormat,
     TableResult,
     TableSink,
     VectorCell,
@@ -1586,7 +1587,7 @@ def _manifest_format(raw: RawSink) -> str | None:
     a multi-row relation -- and that is decided before option values are
     otherwise interpreted.
     """
-    if raw.is_csv:
+    if raw.table_format:
         return None
     for option in raw.options:
         if option.name != "format":
@@ -14967,7 +14968,9 @@ class _Lowerer:
                 sinks.append(self._lower_table_sink(raw))
         else:
             result = self._lower_table_query(self.res.branches, self.res.select)
-            sinks.append(TableSink(result=result, path=None, csv=False, header=False))
+            sinks.append(
+                TableSink(result=result, path=None, format="table", header=False)
+            )
         self.graph.input_options = self._lower_input_options()
         return self._render_specs(sinks)
 
@@ -15001,7 +15004,8 @@ class _Lowerer:
             if option.name == "header":
                 assert isinstance(value, bool)
                 header = value
-        return TableSink(result=result, path=raw.path, csv=True, header=header)
+        written: TableFormat = "json" if raw.table_format == "json" else "csv"
+        return TableSink(result=result, path=raw.path, format=written, header=header)
 
     def _lower_table_query(self, branches: list[exp.Select], anchor: exp.Expr) -> TableResult:
         if not branches:

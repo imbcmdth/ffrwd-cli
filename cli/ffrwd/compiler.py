@@ -655,7 +655,7 @@ def classify(
     Raises ``FfrwdError`` on a query that does not even resolve.
     """
     res = resolve(parse(text, unset), packages=packages, on_warning=on_warning, owner=owner)
-    return all(sink.is_csv for sink in res.sinks), bool(res.sinks)
+    return all(bool(sink.table_format) for sink in res.sinks), bool(res.sinks)
 
 
 def compile_table_sql(

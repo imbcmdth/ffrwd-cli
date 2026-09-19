@@ -427,16 +427,21 @@ REPLACED_OPTIONS = {
 }
 
 
-# CSV option table: a COPY ... WITH (FORMAT csv, ...) sink takes
-# exactly these two. A media option in a csv COPY is rejected against THIS
-# table, not SINK_OPTIONS; `header` in a media COPY is rejected against
+# The formats a TABLE sink writes, beside the ASCII table a bare SELECT
+# prints. `json` writes every value in full, which is what a vector needs.
+TABLE_FORMATS: tuple[str, ...] = ("csv", "json")
+
+
+# Table option table: a COPY ... WITH (FORMAT csv, ...) or (FORMAT json) sink
+# takes exactly these two. A media option in a table COPY is rejected against
+# THIS table, not SINK_OPTIONS; `header` in a media COPY is rejected against
 # SINK_OPTIONS, which never held it.
 CSV_OPTIONS: dict[str, SinkOptionSpec] = {
     "format": SinkOptionSpec(
         name="format",
         scope="container",
         type="str",
-        doc="Must be 'csv' -- this is what makes a COPY a table sink.",
+        doc="'csv' or 'json' -- this is what makes a COPY a table sink.",
         flag="",
         per_stream=False,
     ),
@@ -444,7 +449,7 @@ CSV_OPTIONS: dict[str, SinkOptionSpec] = {
         name="header",
         scope="container",
         type="bool",
-        doc="Emit a header row of column names (default false).",
+        doc="Emit a header row of column names (default false). csv only.",
         flag="",
         per_stream=False,
     ),
@@ -569,7 +574,17 @@ def validate_csv_option(
     A separate table from ``SINK_OPTIONS``: a media option like
     ``video_codec`` is unknown here and gets its own typed rejection.
     """
-    return _validate_against(CSV_OPTIONS, name, value, line=line, col=col)
+    checked = _validate_against(CSV_OPTIONS, name, value, line=line, col=col)
+    if name == "format" and str(checked).lower() not in TABLE_FORMATS:
+        raise FfrwdError(
+            ErrorCode.SINK_OPTION_TYPE,
+            f"option 'format' expects {' or '.join(TABLE_FORMATS)}, got {checked!r}",
+            line=line,
+            col=col,
+            hint="a table sink writes csv or json; every other format is a "
+            "media container, written without a format option",
+        )
+    return checked
 
 
 def _validate_against(

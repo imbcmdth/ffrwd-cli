@@ -1624,7 +1624,7 @@ def test_copy_from_names_the_supported_form() -> None:
 
 def test_format_csv_marks_the_sink_csv() -> None:
     sink = _sink(f"COPY ({SINK_QUERY}) TO 'out.csv' WITH (format 'csv')")
-    assert sink.is_csv is True
+    assert sink.table_format == "csv"
     assert sink.path == "out.csv"
 
 
@@ -1632,29 +1632,29 @@ def test_format_csv_bare_word_also_marks_the_sink_csv() -> None:
     """``format csv`` (unquoted, a bare Var under sqlglot) folds the same way
     a quoted string does -- both spellings are stock Postgres COPY syntax."""
     sink = _sink(f"COPY ({SINK_QUERY}) TO 'out.csv' WITH (format csv)")
-    assert sink.is_csv is True
+    assert sink.table_format == "csv"
 
 
 def test_format_csv_is_case_insensitive_unquoted() -> None:
     sink = _sink(f"COPY ({SINK_QUERY}) TO 'out.csv' WITH (format CSV)")
-    assert sink.is_csv is True
+    assert sink.table_format == "csv"
 
 
 def test_media_copy_with_a_non_csv_format_is_not_csv() -> None:
     """``format`` already means "container format" for a media COPY (an
     existing SINK_OPTIONS entry) -- only the literal value 'csv' flips it."""
     sink = _sink(f"COPY ({SINK_QUERY}) TO 'out.mp4' WITH (format 'mp4')")
-    assert sink.is_csv is False
+    assert sink.table_format == ""
 
 
 def test_copy_without_format_option_is_not_csv() -> None:
     sink = _sink(f"COPY ({SINK_QUERY}) TO 'out.mkv'")
-    assert sink.is_csv is False
+    assert sink.table_format == ""
 
 
 def test_to_stdout_is_legal_for_a_csv_sink() -> None:
     sink = _sink(f"COPY ({SINK_QUERY}) TO STDOUT WITH (format 'csv')")
-    assert sink.is_csv is True
+    assert sink.table_format == "csv"
     assert sink.path is None
 
 

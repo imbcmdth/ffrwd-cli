@@ -46,7 +46,7 @@ from .project import PackageSet, discover
 from .prompt import build_system_prompt
 from .registry import Registry
 from .registry import load as load_registry
-from .table import TableSink, render_csv, render_table
+from .table import TableSink, render_csv, render_json, render_table
 from .warnings import FfrwdWarning, WarningCode
 
 try:
@@ -76,5 +76,6 @@ __all__ = [
     "load_registry",
     "probe",
     "render_csv",
+    "render_json",
     "render_table",
 ]

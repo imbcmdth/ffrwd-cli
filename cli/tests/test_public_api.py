@@ -40,6 +40,7 @@ def test_all_is_sorted_and_complete() -> None:
         "Registry",
         "render_table",
         "render_csv",
+        "render_json",
         "TableSink",
     }
     assert set(ffrwd.__all__) == expected

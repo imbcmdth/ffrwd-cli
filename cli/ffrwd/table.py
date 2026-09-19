@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 from dataclasses import dataclass
+from typing import Literal
 
 from .ir import StreamType
 
@@ -33,7 +35,9 @@ __all__ = [
     "TableResult",
     "TableSink",
     "render_table",
+    "TableFormat",
     "render_csv",
+    "render_json",
 ]
 
 
@@ -74,9 +78,14 @@ class ArrayCell:
     elements: tuple[CellValue, ...]
 
 
-# The most values a vector cell prints before summarizing the rest -- a
-# vector column exists to be compared, not read, and a full embedding would
-# blow out every column's width.
+# What a table query's result is rendered as: the psql-style ASCII table a
+# person reads, or one of the two a program does.
+TableFormat = Literal["table", "csv", "json"]
+
+
+# The most values a vector cell prints in the ASCII TABLE before summarizing
+# the rest -- a table is read by a person, and a full embedding would blow out
+# every column's width. Nothing a program reads is capped: see `_cell_text`.
 VECTOR_CELL_CAP = 4
 
 
@@ -84,11 +93,17 @@ VECTOR_CELL_CAP = 4
 class VectorCell:
     """A vector row column's value, one table cell.
 
-    Printed capped, never in full: the first :data:`VECTOR_CELL_CAP` values,
-    then the vector's own length in place of the rest -- ``[0.12, -0.03, 0.5,
-    0.77, ... (384)]``. A vector no longer than the cap prints whole, with no
-    ellipsis. Not Postgres array-literal style (no braces) -- a vector is
-    read, never re-parsed, so the numeric-array spelling is the plainer one.
+    In the ASCII table it prints capped: the first :data:`VECTOR_CELL_CAP`
+    values, then the vector's own length in place of the rest -- ``[0.12,
+    -0.03, 0.5, 0.77, ... (384)]``. A vector no longer than the cap prints
+    whole, with no ellipsis. Not Postgres array-literal style (no braces) --
+    a vector is read, never re-parsed, so the numeric-array spelling is the
+    plainer one.
+
+    Everywhere a PROGRAM reads the result -- csv, json -- it is written in
+    full. A capped vector is not a vector, and a file written for a machine
+    that silently held four of three hundred numbers would be worse than one
+    that refused.
     """
 
     values: tuple[float, ...]
@@ -110,23 +125,34 @@ class TableResult:
 
 @dataclass(frozen=True)
 class TableSink:
-    """One table/csv query's destination.
+    """One table query's destination.
 
     Mirrors ``ffrwd.ir.SinkUnit`` for the non-media path. A bare SELECT is
-    exactly one of these with ``csv=False``, ``path=None`` (``run`` prints the
-    ASCII table to stdout; there is no file form). A ``COPY ... WITH (FORMAT
-    csv)`` has ``csv=True`` and ``path`` None for ``TO STDOUT`` or the file
-    path for ``TO '<path>'``. ``header`` is the csv ``HEADER`` option's value,
-    irrelevant when ``csv`` is False.
+    exactly one of these with ``format="table"``, ``path=None`` (``run``
+    prints the ASCII table to stdout; there is no file form). A ``COPY ...
+    WITH (FORMAT csv)`` has ``format="csv"``, and ``FORMAT json`` or a
+    ``.json`` path ``format="json"``; either has ``path`` None for ``TO
+    STDOUT`` or the file path for ``TO '<path>'``. ``header`` is the csv
+    ``HEADER`` option's value, irrelevant for the other two.
     """
 
     result: TableResult
     path: str | None
-    csv: bool
+    format: TableFormat
     header: bool
 
+    @property
+    def csv(self) -> bool:
+        """True for the csv spelling. Kept for callers that only ask that."""
+        return self.format == "csv"
 
-def _cell_text(cell: CellValue) -> str:
+
+def _cell_text(cell: CellValue, *, capped: bool = True) -> str:
+    """One cell as text. `capped` is the ASCII table's vector rule.
+
+    Uncapped, a vector writes every value: what a program reads is the
+    vector, not a summary of it.
+    """
     if cell is None:
         return ""
     if isinstance(cell, bool):
@@ -134,14 +160,22 @@ def _cell_text(cell: CellValue) -> str:
     if isinstance(cell, StreamCell):
         return f"<{cell.type} {cell.spec}>"
     if isinstance(cell, ArrayCell):
-        return "{" + ",".join(_cell_text(element) for element in cell.elements) + "}"
+        return (
+            "{"
+            + ",".join(_cell_text(element, capped=capped) for element in cell.elements)
+            + "}"
+        )
     if isinstance(cell, RecordCell):
-        return "(" + ",".join(_cell_text(field) for field in cell.fields) + ")"
+        return (
+            "("
+            + ",".join(_cell_text(field, capped=capped) for field in cell.fields)
+            + ")"
+        )
     if isinstance(cell, VectorCell):
+        if not capped or len(cell.values) <= VECTOR_CELL_CAP:
+            return "[" + ", ".join(str(v) for v in cell.values) + "]"
         shown = ", ".join(str(v) for v in cell.values[:VECTOR_CELL_CAP])
-        if len(cell.values) > VECTOR_CELL_CAP:
-            return f"[{shown}, ... ({len(cell.values)})]"
-        return f"[{shown}]"
+        return f"[{shown}, ... ({len(cell.values)})]"
     return str(cell)
 
 
@@ -181,5 +215,38 @@ def render_csv(result: TableResult, *, header: bool) -> str:
     if header:
         writer.writerow(result.columns)
     for row in result.rows:
-        writer.writerow([_cell_text(cell) for cell in row])
+        writer.writerow([_cell_text(cell, capped=False) for cell in row])
     return buffer.getvalue()
+
+
+def _cell_json(cell: CellValue) -> object:
+    """One cell as JSON. What has a JSON shape keeps it; the rest is text.
+
+    A number is a number, a boolean a boolean, NULL is null and a vector is
+    an array of numbers -- the wire shape a reader wants. A stream, a record
+    and an array of cells have no JSON of their own, so they carry the text
+    the csv writes, which is the only spelling of them there is.
+    """
+    if cell is None:
+        return None
+    if isinstance(cell, bool | int | float):
+        return cell
+    if isinstance(cell, VectorCell):
+        return list(cell.values)
+    if isinstance(cell, StreamCell | RecordCell | ArrayCell):
+        return _cell_text(cell, capped=False)
+    return str(cell)
+
+
+def render_json(result: TableResult) -> str:
+    """`result` as a JSON array of objects, one per row, keyed by column.
+
+    Ends with a trailing newline, as `render_csv` does, so a caller writes
+    or prints it verbatim. Objects rather than arrays of values: a column
+    name is what makes a row readable, and the columns are right there.
+    """
+    rows = [
+        {name: _cell_json(cell) for name, cell in zip(result.columns, row)}
+        for row in result.rows
+    ]
+    return json.dumps(rows, indent=2, ensure_ascii=False) + "\n"

@@ -60,7 +60,7 @@ from ffrwd.processes import (
 from ffrwd.project import PackageSet, discover, read_manifest
 from ffrwd.registry import Registry, load_reference
 from ffrwd.split import insert_splits
-from ffrwd.table import render_table
+from ffrwd.table import render_csv, render_json, render_table
 from ffrwd.wasm import WORLDS, Described, DescribedFunction
 
 SNAPSHOT_PATH = Path(__file__).resolve().parent / "data" / "reference_registry.json"
@@ -6642,6 +6642,49 @@ def test_a_vector_cell_prints_capped() -> None:
     )
     text = render_table(sinks[0].result)
     assert "[0.0, 1.0, 2.0, 3.0, ... (5)]" in text
+
+
+def test_a_vector_is_written_whole_wherever_a_program_reads_it() -> None:
+    """The cap is the ASCII table's alone. A csv or json file a program
+    reads holds the vector, not a summary of it: four of five hundred
+    numbers is not an embedding."""
+    sql = (
+        VECTOR_DECLARE
+        + "COPY (SELECT r.v FROM unnest(ARRAY[\n"
+        "  STRUCT(embed('a cat sat on the mat') AS v)\n"
+        "]) r) TO STDOUT WITH (format 'csv')"
+    )
+    sinks = lower_table(
+        _resolved(sql),
+        {},
+        registry=_snapshot_registry(),
+        describes={EMBEDDER: _embed_described()},
+        invoke=lambda module, function, args, **_: [0.0, 1.0, 2.0, 3.0, 4.0],
+    )
+    assert sinks[0].format == "csv"
+    assert render_csv(sinks[0].result, header=False) == "\"[0.0, 1.0, 2.0, 3.0, 4.0]\"\n"
+
+
+def test_a_json_destination_writes_a_vector_as_numbers() -> None:
+    """json is the one place a vector keeps its shape as well as its
+    values: an array of numbers, which is what reads it back."""
+    sql = (
+        VECTOR_DECLARE
+        + "COPY (SELECT r.v AS embedding FROM unnest(ARRAY[\n"
+        "  STRUCT(embed('a cat sat on the mat') AS v)\n"
+        "]) r) TO 'out.json'"
+    )
+    sinks = lower_table(
+        _resolved(sql),
+        {},
+        registry=_snapshot_registry(),
+        describes={EMBEDDER: _embed_described()},
+        invoke=lambda module, function, args, **_: [0.0, 1.0, 2.0, 3.0, 4.0],
+    )
+    assert (sinks[0].format, sinks[0].path) == ("json", "out.json")
+    assert json.loads(render_json(sinks[0].result)) == [
+        {"embedding": [0.0, 1.0, 2.0, 3.0, 4.0]}
+    ]
 
 
 def test_a_short_vector_prints_with_no_ellipsis() -> None:

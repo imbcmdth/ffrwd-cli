@@ -49,8 +49,10 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
 ```
 
 - A bare `SELECT` is a **table query**: the result prints (psql-style
-  table, or CSV via `COPY ... TO STDOUT WITH (format 'csv')`), and
-  ffmpeg never runs.
+  table, or CSV or JSON via `COPY ... WITH (format 'csv')` /
+  `(format 'json')`), and ffmpeg never runs. A `.json` path is a table
+  destination with no `format` written, the way a `.ndjson` one is a
+  rows file; `.csv` is not, and keeps needing its `format`.
 - A `COPY` with a media destination compiles to the ffmpeg command(s).
 - A script's views compile into ONE ffmpeg invocation, one output per
   COPY.
@@ -130,7 +132,10 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   cannot be compared, concatenated, cast to text, or written as a tag.
   `cos_similarity(vector, vector) -> number` and `vector_length(vector)
   -> number` are the two built-ins over it, evaluated at compile time
-  and, over a row column, once per row like any other. Recipe
+  and, over a row column, once per row like any other. It prints
+  CAPPED in the psql-style table - the first four values and the
+  length - and WHOLE everywhere a program reads it: a csv cell holds
+  every value, and a json one is an array of numbers. Recipe
   [117](examples.md#117-rank-rows-by-a-vector).
 - A **rows `LANGUAGE wasm` function** (one annotation parameter,
   `RETURNS` an annotation) reads rows and writes rows with no stream
@@ -1070,6 +1075,8 @@ and so is an OFFSET that skips every row.
 ## Destinations and options
 
 `TO 'path'` writes one file; `TO STDOUT WITH (format 'csv')` prints;
+`format 'json'`, or a `.json` path, writes the same relation as a JSON
+array of objects, one per row, keyed by column name;
 `TO (value-expression over row columns)` writes one file per row or
 group; `TO <sink>(<values>)` hands the relation's ROWS to a
 `RETURNS sink` wasm function, which writes no file at all: one row is

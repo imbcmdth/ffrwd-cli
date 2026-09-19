@@ -253,7 +253,14 @@ from .project import (
 from .prompt import build_system_prompt
 from .publish import recipe_variables as _recipe_variables
 from .split import insert_splits
-from .table import CellValue, TableResult, TableSink, render_csv, render_table
+from .table import (
+    CellValue,
+    TableResult,
+    TableSink,
+    render_csv,
+    render_json,
+    render_table,
+)
 from .vars import Variable, declared_variables, referenced, substitute, unset_variable
 from .warnings import OnWarning, WarningLog
 
@@ -1288,10 +1295,14 @@ _NO_OUTPUT_PATH_ERROR = "error: no output path given: use COPY ... TO in the que
 def _print_table_sinks(sinks: list[TableSink]) -> int:
     """Print (or write) every sink of a table/csv query. `run`'s table half."""
     for sink in sinks:
-        if not sink.csv:
+        if sink.format == "table":
             print(render_table(sink.result))
             continue
-        text = render_csv(sink.result, header=sink.header)
+        text = (
+            render_json(sink.result)
+            if sink.format == "json"
+            else render_csv(sink.result, header=sink.header)
+        )
         if sink.path is None:
             print(text, end="")  # already newline-terminated per row
             continue
