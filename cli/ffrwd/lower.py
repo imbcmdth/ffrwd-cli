@@ -447,6 +447,7 @@ from ffrwd.wasm import (
     ANNOTATION_TYPES,
     AUDIO_CODEC_ENCODERS,
     CODEC_ENCODERS,
+    PACKET_FILTER_WORLD,
     PACKET_SOURCE_WORLD,
     WIRE_AUDIO_CODECS,
     WIRE_VIDEO_CODECS,
@@ -458,6 +459,7 @@ from ffrwd.wasm import (
     audio_encoder_codec,
     catalog_as_probe,
     encoder_codec,
+    hosts_packet_filter,
     hosts_packet_sink,
     hosts_packet_source,
     hosts_rows_module,
@@ -12087,19 +12089,18 @@ class _Lowerer:
                 hint=f"a module carries one filter; write '{described.name}' as "
                 "the export",
             )
-        # A packet filter loads and describes, so a package carrying one
-        # installs and lists; what the dialect has no spelling for yet is
-        # where in a query it would sit.
         if described.packet_filter:
+            self._check_packet_filter(declared, described, node, select)
+        elif declared.is_packets:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
-                f"the module '{declared.module}' is a packet filter, and no "
-                "part of a query places one yet",
+                f"function '{declared.name}' returns packets, and the module "
+                f"'{declared.module}' is not a packet filter",
                 node,
                 fallback=select,
-                hint="a packet filter rewrites an encoded stream on its way "
-                "to a destination; until the dialect names one, reach for a "
-                "RETURNS sink module or a frame filter",
+                hint="only a module exporting ffrwd:av's packet-filter reads "
+                "encoded packets and hands them back; declare this one as the "
+                "stream it filters",
             )
         if described.packet_sink:
             self._check_packet_sink(declared, described, node, select)
@@ -12142,14 +12143,19 @@ class _Lowerer:
             and declared.reads is None
             and not described.windowed
         ):
+            # A packet filter's rows arrive beside its packets rather than
+            # on them, but the declaration still has to name them: a filter
+            # that reads rows and is handed none has nothing to do.
+            written = WASM_STREAM_NAMES[declared.stream_kind]
+            reads = "beside its packets" if declared.is_packets else "off its frames"
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
-                f"the module '{declared.module}' reads annotations off its "
-                f"frames, and '{declared.name}' takes none",
+                f"the module '{declared.module}' reads annotations "
+                f"{reads}, and '{declared.name}' takes none",
                 node,
                 fallback=select,
                 hint="declare an annotation column right after the stream: "
-                f"{declared.name}(<stream> {declared.returns}, <name> "
+                f"{declared.name}(<stream> {written}, <name> "
                 "STRUCT(<field> <type>, ...)[])",
             )
         if not described.reads_annotations and declared.reads is not None:
@@ -12181,6 +12187,57 @@ class _Lowerer:
                 "producer under it",
             )
         return described
+
+    def _check_packet_filter(
+        self,
+        declared: WasmFunction,
+        described: Described,
+        node: exp.Expr,
+        select: exp.Select,
+    ) -> None:
+        """A packet-filter module against the declaration that named it.
+
+        The module rewrites the encoder's own output and hands it back, so
+        the declaration has to say `RETURNS packets` and the module has to
+        accept a codec the stream edge carries. What no query has yet is
+        somewhere to write the call, which :meth:`_lower_packets_call`
+        refuses at the call itself.
+        """
+        if not hosts_packet_filter(described.world):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"the module '{declared.module}' rewrites encoded packets, and "
+                f"the sidecar's {described.world} cannot hand them through",
+                node,
+                fallback=select,
+                hint=f"packet filters arrived with {PACKET_FILTER_WORLD}; "
+                "upgrade ffrwd, or point at a newer ffrwd-wasm",
+            )
+        if not declared.is_packets:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"function '{declared.name}' returns {declared.written_returns}, "
+                f"and the module '{declared.module}' rewrites encoded packets "
+                "and hands them back",
+                node,
+                fallback=select,
+                hint=f"declare '{declared.name}' as RETURNS packets and write "
+                "it as a column of a COPY's SELECT",
+            )
+        kind = declared.stream_kind
+        accepted = described.sink_codecs(kind)
+        carried = WIRE_AUDIO_CODECS if kind == "audio" else WIRE_VIDEO_CODECS
+        if accepted and not any(c in carried for c in accepted):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"the module '{declared.module}' rewrites "
+                f"{_join_codecs(accepted)} {kind}, and the stream edge into a "
+                f"packet filter carries {_join_codecs(carried)}",
+                node,
+                fallback=select,
+                hint="the module has to accept one of the codecs the "
+                "sidecar's packets travel in",
+            )
 
     def _check_packet_sink(
         self,
@@ -12908,6 +12965,8 @@ class _Lowerer:
                 hint=f"a wasm function's parameters are positional: "
                 f"{declared.signature}",
             )
+        if declared.is_packets:
+            return self._lower_packets_call(declared, node, select)
         if declared.is_sink:
             return self._lower_sink_call(node, declared, described, call, env, select)
         kind = declared.stream_kind
@@ -12991,6 +13050,32 @@ class _Lowerer:
             rows=self._row_elements(per_row, env),
         )
         return lowered
+
+    def _lower_packets_call(
+        self,
+        declared: WasmFunction,
+        node: exp.Expr,
+        select: exp.Select,
+    ) -> _Value:
+        """A ``RETURNS packets`` call, checked and then refused.
+
+        The declaration and the module are paired by the time this runs
+        (:meth:`_check_packet_filter`), so what is left is where the call
+        sits, and no part of the planner puts one anywhere yet: a filter
+        belongs between the encoder a destination places and the muxer that
+        reads it, and nothing builds that shape. Refusing here rather than
+        further in is what keeps the message about the query.
+        """
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"'{declared.name}' returns packets, and no destination places a "
+            "packet filter yet",
+            node,
+            fallback=select,
+            hint="a packet filter belongs between the encoder a destination "
+            "places and what reads it; nothing builds that shape yet, so "
+            "weave the stream with the ffrwd-index tool after the COPY",
+        )
 
     def _lower_sink_call(
         self,

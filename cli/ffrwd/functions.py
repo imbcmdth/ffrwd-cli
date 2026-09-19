@@ -204,6 +204,16 @@ _WASM_SINK_HINT = (
     "a sink function is a COPY destination: COPY (SELECT <streams>) TO "
     "<name>(<values>)"
 )
+# The return type of a module that rewrites a stream's own ENCODED packets:
+# the packets go in and the same packets come back out, so the call hands
+# back the stream it was given and the compiler defers it past the encoder
+# the COPY's destination already places.
+WASM_PACKETS = "packets"
+_WASM_PACKETS_HINT = (
+    "a packets function rewrites an encoded stream on its way out: write it "
+    "as a column of a COPY's SELECT, COPY (SELECT <name>(<stream>, <rows>)) "
+    "TO <destination>"
+)
 # The return type of a module that is a FROM-position row source: the mirror
 # of a sink -- it produces streams and reads none.
 WASM_SOURCE = "source"
@@ -244,7 +254,8 @@ _WASM_STREAM_HINT = " or ".join(WASM_STREAM_TYPES)
 _WASM_VALUE_HINT = (
     f"a wasm function returns one {_WASM_STREAM_HINT}, a STRUCT of that same "
     "stream and one array of annotation records, sink as a COPY destination, "
-    "or text, number, boolean or vector as a compile-time value"
+    "packets as a column of one, or text, number, boolean or vector as a "
+    "compile-time value"
 )
 # A value-returning wasm function's parameters: the same domain an annotation
 # field draws from, since both are values a JSON Schema can hold.
@@ -489,6 +500,7 @@ class WasmFunction:
         return (
             self.returns not in WASM_STREAM_TYPES
             and not self.is_sink
+            and not self.is_packets
             and not self.is_source
             and not self.is_rows
         )
@@ -519,6 +531,17 @@ class WasmFunction:
         its own effects are the product -- so it is legal only after ``TO``.
         """
         return self.returns == WASM_SINK
+
+    @property
+    def is_packets(self) -> bool:
+        """True for a ``RETURNS packets`` function: a filter over ENCODED packets.
+
+        It reads a stream and hands the same stream back, still encoded, so
+        it reads as a stream cell where a destination consumes one -- and
+        only there. Packets exist nowhere else in a query: there are none
+        before an encoder, and none at all in a table query.
+        """
+        return self.returns == WASM_PACKETS
 
     @property
     def is_source(self) -> bool:
@@ -552,7 +575,11 @@ class WasmFunction:
                 f"'{self.name}' reads rows from the SELECT list; its kinds "
                 "come from the rows, not its signature"
             )
-        written = self.params[0].type if self.is_sink and self.params else self.returns
+        written = (
+            self.params[0].type
+            if (self.is_sink or self.is_packets) and self.params
+            else self.returns
+        )
         kind = WASM_STREAM_TYPES.get(element_type(written))
         if kind is None:
             raise ValueError(f"'{self.name}' returns {self.returns}, not a stream")
@@ -1602,6 +1629,8 @@ def _define_wasm(
     if emits is None:
         if _type_name(node) == WASM_SINK:
             returns = WASM_SINK
+        elif _type_name(node) == WASM_PACKETS:
+            returns = WASM_PACKETS
         elif _type_name(node) == WASM_SOURCE:
             return _define_wasm_source(name, module, export, params, identifier, create)
         elif _type_name(node) == _VECTOR_TYPE:
@@ -1667,7 +1696,7 @@ def _define_wasm(
                 hint=f"the stream a module filters is its first parameter, and is "
                 f"{_WASM_STREAM_HINT}",
             )
-    if returns != WASM_SINK and params[0].type != returns:
+    if returns not in (WASM_SINK, WASM_PACKETS) and params[0].type != returns:
         raise _error(
             ErrorCode.UNSUPPORTED_SQL,
             f"wasm function '{name}' takes {params[0].type} and returns "
@@ -1678,6 +1707,16 @@ def _define_wasm(
             "it returns",
         )
     streams = _leading_streams(params)
+    if returns == WASM_PACKETS and len(streams) != 1:
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"wasm function '{name}' returns packets and takes {len(streams)} "
+            "streams",
+            identifier,
+            fallback=create,
+            hint="a packets function rewrites one stream: it takes one, and a "
+            "ladder is the call being written over each rendition row",
+        )
     if returns == WASM_SINK:
         _check_sink_streams(name, streams, identifier, create)
     else:

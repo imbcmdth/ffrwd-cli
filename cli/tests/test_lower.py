@@ -14272,9 +14272,9 @@ def test_an_unaccepted_codec_still_encodes_onto_the_sink() -> None:
     assert pads[1]["audio_codec"] == "copy"
 
 
-def test_a_packet_filter_is_refused_with_no_place_to_put_it() -> None:
-    """A filter describes and loads, so a package carrying one installs;
-    what no part of the dialect has yet is somewhere to write it."""
+def test_a_packet_filter_module_wants_a_packets_declaration() -> None:
+    """A packet filter hands its stream back, so the declaration that names
+    it has to say so: a RETURNS sink declaration reads as a terminus."""
     import dataclasses
 
     err = _row_sink_rejects(
@@ -14284,9 +14284,87 @@ def test_a_packet_filter_is_refused_with_no_place_to_put_it() -> None:
         dataclasses.replace(_row_sink_described(), packet_filter=True),
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "is a packet filter" in err.message
-    assert "no part of a query places one yet" in err.message
-    assert err.hint is not None and "RETURNS sink" in err.hint
+    assert "rewrites encoded packets" in err.message
+    assert "'publish' returns sink" in err.message
+    assert err.hint is not None and "RETURNS packets" in err.hint
+
+
+PACKETS_MODULE = "weave.wasm"
+PACKETS_DECLARE = (
+    "CREATE FUNCTION weave(v video_stream) RETURNS packets\n"
+    f"  AS '{PACKETS_MODULE}', 'weave' LANGUAGE wasm;\n"
+)
+
+
+def _packets_described(**over: object) -> Described:
+    """A packet filter's describe, the way the sidecar reports one."""
+    fields: dict[str, object] = {
+        "world": WORLDS[-1],
+        "name": "weave",
+        "version": "0.1.0",
+        "params_schema": {"type": "object", "additionalProperties": False},
+        "rows_schema": None,
+        "video_codecs": ("h264",),
+        "audio_codecs": (),
+        "video_streams": "one",
+        "audio_streams": "none",
+        "packet_filter": True,
+    }
+    fields.update(over)
+    return Described(**fields)  # type: ignore[arg-type]
+
+
+def _packets_rejects(sql: str, described: Described | None = None) -> FfrwdError:
+    with pytest.raises(FfrwdError) as caught:
+        lower(
+            resolve(parse(PACKETS_DECLARE + sql)),
+            _row_probes(_track("video", 0)),
+            registry=_snapshot_registry(),
+            describes={PACKETS_MODULE: described or _packets_described()},
+        )
+    return caught.value
+
+
+def test_a_packets_call_has_nowhere_to_go_yet() -> None:
+    """The declaration and the module agree; what is missing is the shape
+    that puts a filter between an encoder and what reads its packets."""
+    err = _packets_rejects(
+        "COPY (SELECT weave(f.video[1]) FROM input('f.mp4') f) TO 'out.mp4'"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'weave' returns packets" in err.message
+    assert "no destination places a packet filter yet" in err.message
+
+
+def test_a_packets_declaration_over_a_module_that_is_not_one() -> None:
+    """The pairing reads both ways: a declaration saying packets over a
+    module that hands nothing back is as wrong as the other way round."""
+    err = _packets_rejects(
+        "COPY (SELECT weave(f.video[1]) FROM input('f.mp4') f) TO 'out.mp4'",
+        _packets_described(packet_filter=False, video_codecs=None),
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "returns packets" in err.message
+    assert "is not a packet filter" in err.message
+
+
+def test_a_packet_filter_needs_the_world_that_hosts_one() -> None:
+    err = _packets_rejects(
+        "COPY (SELECT weave(f.video[1]) FROM input('f.mp4') f) TO 'out.mp4'",
+        _packets_described(world="ffrwd:av@0.15.0"),
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "cannot hand them through" in err.message
+    assert err.hint is not None and "ffrwd:av@0.16.0" in err.hint
+
+
+def test_a_packet_filter_has_to_accept_a_codec_the_edge_carries() -> None:
+    err = _packets_rejects(
+        "COPY (SELECT weave(f.video[1]) FROM input('f.mp4') f) TO 'out.mp4'",
+        _packets_described(video_codecs=("vp9",)),
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "rewrites vp9 video" in err.message
 
 
 def test_a_value_column_into_a_row_reading_sink_names_its_type() -> None:

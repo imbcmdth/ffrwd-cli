@@ -67,6 +67,7 @@ __all__ = [
     "CODEC_ENCODERS",
     "LANGUAGE_TAGS",
     "MODEL_SUFFIX",
+    "PACKET_FILTER_WORLD",
     "PACKET_SOURCE_WORLD",
     "SAMPLE_FMT_CODECS",
     "WIRE_AUDIO_CODECS",
@@ -201,7 +202,7 @@ _ROWS_MODULE_WORLD = "ffrwd:av@0.14.0"
 
 # The first world whose sidecar hosts a packet filter: encoded packets in,
 # encoded packets out, with rows arriving beside them.
-_PACKET_FILTER_WORLD = "ffrwd:av@0.16.0"
+PACKET_FILTER_WORLD = "ffrwd:av@0.16.0"
 
 # The sample formats one can carry, and the pcm each of them travels as.
 WIRE_SAMPLE_FMTS: tuple[str, ...] = ("f32", "s16")
@@ -1701,7 +1702,7 @@ def audio_encoder_codec(encoder: str) -> str | None:
 
 def hosts_packet_filter(world: str) -> bool:
     """True when `world`'s sidecar can host a packet filter."""
-    return world in WORLDS and WORLDS.index(world) >= WORLDS.index(_PACKET_FILTER_WORLD)
+    return world in WORLDS and WORLDS.index(world) >= WORLDS.index(PACKET_FILTER_WORLD)
 
 
 def hosts_packet_sink(world: str) -> bool:

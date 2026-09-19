@@ -37,7 +37,7 @@ rtype   := text | number | boolean | vector | <kind>_stream | chapter | cue
          | embedding
          | attachment | any of those with [] | TABLE(col type, ...)
 wstype  := video_stream | audio_stream | either of those with []
-wrtype  := wstype | sink | STRUCT(name wstype, name annotation)
+wrtype  := wstype | sink | packets | STRUCT(name wstype, name annotation)
 annotation := STRUCT(field vtype, ...)[] | cue[]
 vtype   := text | number | boolean | vector
 select  := [WITH cte (, cte)*] SELECT columns FROM from [WHERE pred]
@@ -76,6 +76,18 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   reading encoded packets, run one call at a time whatever N is.
   `--jobs 1` hosts everything serially. The output is byte-identical at
   any N.
+- A **packets `LANGUAGE wasm` function** (`RETURNS packets`) rewrites a
+  stream's own ENCODED packets on their way out, and hands the same
+  stream back: `weave(v video_stream, vecs cue[]) RETURNS packets`. It
+  takes one stream, the rows it reads beside it, and its value
+  parameters, and it names a module exporting `packet-filter` -- a
+  declaration and a module that disagree are refused naming both. It is
+  written as a column of a COPY's SELECT, since packets exist only where
+  a destination encodes them and nowhere in a table query.
+  **No destination places one yet**: a query that writes the call
+  compiles as far as checking it and is then refused, because nothing
+  builds the shape a filter sits in (encoder, filter, muxer). See
+  [known gaps](known_gaps.md).
 - A **sink `LANGUAGE wasm` function** (`RETURNS sink`) is a COPY
   destination: `COPY (SELECT <cells>) TO name(<values>)`. It declares
   value parameters only; the SELECT list supplies the ROWS it reads,
