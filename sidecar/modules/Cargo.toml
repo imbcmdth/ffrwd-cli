@@ -32,6 +32,8 @@ members = [
     "packet-tally",
     "packet-passthrough",
     "packet-sei",
+    "packet-keys",
+    "packet-head",
     "source-replay",
     "source-replay-pair",
     "source-replay-0130",

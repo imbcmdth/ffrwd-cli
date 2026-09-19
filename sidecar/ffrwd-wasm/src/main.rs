@@ -2998,7 +2998,9 @@ struct Description {
     one_to_one: Option<bool>,
     /// Whether the module ACTS on the rows arriving with its frames: declared
     /// by a windowed module, and read off the exports of a per-frame one.
-    /// `null` for a module with no frame interface at all.
+    /// ABSENT for a module with no frame interface at all, which has none to
+    /// act on and so no answer to give.
+    #[serde(skip_serializing_if = "Option::is_none")]
     reads_rows: Option<bool>,
     /// Whether upstream rows may leave on the module's own output frames.
     /// ABSENT for a module with no frame interface at all, which has no
@@ -3029,6 +3031,11 @@ struct Description {
     video_streams: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     audio_streams: Option<&'static str>,
+    /// Whether the module exports a packet sink: encoded packets in, rows
+    /// out. The positive half of the pair below - a reader should not have
+    /// to infer a sink from `packet_filter: false` beside a filled codec
+    /// list.
+    packet_sink: bool,
     /// Whether the module exports a packet filter: encoded packets in,
     /// encoded packets out. False for every module built before 0.16.0. The
     /// codec and arity fields above are a filter's too, read the way a
@@ -3204,6 +3211,7 @@ fn describe_module(module_path: &str) -> Result<String> {
         wants: None,
         video_streams: None,
         audio_streams: None,
+        packet_sink: false,
         packet_filter: false,
         source: false,
         rows_module: false,
@@ -3270,6 +3278,7 @@ fn describe_module(module_path: &str) -> Result<String> {
         description.video_streams = Some(streams_read(described.video));
         description.audio_streams = Some(streams_read(described.audio));
         description.wants = Some(described.wants.written());
+        description.packet_sink = true;
     }
 
     if has_packet_filter {

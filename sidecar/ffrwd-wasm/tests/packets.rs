@@ -571,14 +571,18 @@ fn describe_reports_the_packet_sink() {
         serde_json::from_str(run.stdout.trim()).expect("describe prints one JSON object");
     assert_eq!(description["world"], "ffrwd:av@0.16.0");
     assert_eq!(description["name"], "packet_stats");
-    // The codecs list is what reports the packet-sink export; empty accepts
-    // every codec.
+    // The export says so itself, rather than leaving a reader to infer it
+    // from a filled codec list beside `packet_filter: false`.
+    assert_eq!(description["packet_sink"], true);
+    assert_eq!(description["packet_filter"], false);
+    // Empty accepts every codec.
     assert_eq!(description["video_codecs"], serde_json::json!([]));
     // A sink that counts packets needs every one, and says so.
     assert_eq!(description["wants"], "all");
-    // No frame interface: none of the windowed fields appear.
+    // No frame interface: none of the windowed fields appear, and neither
+    // does the question about rows arriving on frames there are none of.
     assert!(description.get("window").is_none());
-    assert_eq!(description["reads_rows"], serde_json::Value::Null);
+    assert!(description.get("reads_rows").is_none());
 }
 
 #[test]
