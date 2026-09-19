@@ -19,6 +19,13 @@ container's caption track is demuxed to WebVTT text so its cues can be read
 the way a `.vtt` input's are. It is as permissive as `probe()` -- every
 failure is an empty cue list -- and memoized the same way.
 
+One more compile-time read is memoized here without being run here: a packet
+sink read in FROM (:mod:`ffrwd.wasm`) copies one stream of a file through the
+module and answers with rows. Running it needs the sidecar, which this module
+may not import, so what lives here is the memo alone --
+`packet_rows_key`, `cached_packet_rows` and `remember_packet_rows` -- keyed
+like every other answer about a file and cleared by the same `clear_cache()`.
+
 Results are memoized per `(realpath, mtime_ns, size, input flags)` so a
 compile that probes the same input multiple times only shells out once, while
 one path read two ways -- different `input()` options -- stays two probes;

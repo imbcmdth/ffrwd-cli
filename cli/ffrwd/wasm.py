@@ -31,6 +31,16 @@ Which of the two lists a module fills is what says whether it filters video or
 audio (:attr:`Described.kind`). An audio module may also name the sample rates
 and channel counts it accepts, and the edges into it are conformed to the first
 of each the wire can offer.
+
+Running a module while compiling
+--------------------------------
+Three calls here run a module rather than describing one, each for an answer
+the compiler needs before it can build anything: :func:`invoke` folds a value
+function, :func:`probe_source` reads a packet source's catalog, and
+:func:`read_packet_rows` reads a packet sink's rows off one stream of a file.
+The last is the run-time arrangement run early -- ffmpeg stream-copying the
+stream as coded NUT into the sidecar hosting the sink -- and, like the other
+two, it is a seam a lowering test replaces, so the unit tier spawns nothing.
 """
 
 from __future__ import annotations
