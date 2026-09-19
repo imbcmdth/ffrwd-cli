@@ -547,6 +547,33 @@ ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 rawvideo -pix_fmt:0 rgba -f
 
 A module cannot be a link in one ffmpeg's filter graph, so the query compiles to three processes joined by pipes rather than one command: an ffmpeg that decodes, the sidecar hosting the module, and an ffmpeg that encodes what comes back. The frames travel as NUT, and the pixel format on both seams is the one the module and the wire agree on - `rgba` here, because that is what `invert` accepts. `ffrwd run` executes the whole pipeline itself; the printed form is for reading and pasting.
 
+## 138. Rewrite a stream's packets without decoding it
+
+`RETURNS packets` declares a module that reads a stream's ENCODED bytes and hands the same stream back - the interface a module weaving data into a file uses. Write the call as a column of the COPY's SELECT and the compiler defers it past the encoder the destination would have placed:
+
+```pgsql
+CREATE FUNCTION hand_on(v video_stream) RETURNS packets
+  AS '../sidecar/modules/target/wasm32-wasip2/release/packet_passthrough.wasm',
+  'packet_passthrough' LANGUAGE wasm;
+
+COPY (
+  SELECT hand_on(f.video[1]), f.audio[1]
+  FROM input('tests/fixtures/av.mp4') f
+) TO 'woven.mp4'
+```
+
+```
+$ ffrwd compile -f query.sql
+ffmpeg -i tests/fixtures/av.mp4 -map 0:v:0 -c:0 copy -f nut pipe:1 | ffrwd-wasm -f nut \
+  -i pipe:0 -m ../sidecar/modules/target/wasm32-wasip2/release/packet_passthrough.wasm \
+  -f nut pipe:1 | ffmpeg -i tests/fixtures/av.mp4 -f nut -analyzeduration 0 \
+  -fpsprobesize 3 -i pipe:0 -map 1:v:0 -c:0 copy -map 0:a:0 -c:1 copy woven.mp4
+```
+
+Nothing here decodes a picture. The video already arrives in a codec the module accepts, so the first ffmpeg copies it onto the pipe, the sidecar hands the packets through, and the muxer copies them into the file - which is what makes this the cheap way to add data to something already encoded. The audio never touches the pipe at all: the muxer opens the source itself for it, so both streams reach the file with the times they had.
+
+Name an encoder and the same shape re-encodes instead - `WITH (video_codec 'libx264', crf 20)` puts `-c:0 libx264 -crf:0 20` on the first ffmpeg, one process ahead of where it would otherwise have been, and the destination still copies what the filter wrote.
+
 ## 94. Blur the people, and only the people
 
 `segment` finds objects and hands back two things at once: an index map -

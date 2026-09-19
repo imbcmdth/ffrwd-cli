@@ -277,8 +277,9 @@ def _negotiable(
             continue  # a row-reading sink has no single kind; its pads are the rows'
         if declared.stream_kind != kind:
             continue
-        if describes[declared.module].packet_sink:
-            continue  # its edge carries encoded packets, not frames
+        described = describes[declared.module]
+        if described.packet_sink or described.packet_filter:
+            continue  # its edges carry encoded packets, not frames
         seen.add(declared.module)
         found.append(declared)
     return found
