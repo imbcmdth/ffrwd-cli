@@ -282,6 +282,9 @@ fn a_sink_built_against_the_previous_world_still_loads() {
     assert_eq!(description["world"], "ffrwd:av@0.16.0");
     assert_eq!(description["name"], "adapted_0150");
     assert_eq!(description["packet_filter"], false);
+    // 0.15.0 had no field for it, so the adapter answers for it: a sink
+    // that could not ask for less is handed everything.
+    assert_eq!(description["wants"], "all");
 }
 
 #[test]
@@ -571,6 +574,8 @@ fn describe_reports_the_packet_sink() {
     // The codecs list is what reports the packet-sink export; empty accepts
     // every codec.
     assert_eq!(description["video_codecs"], serde_json::json!([]));
+    // A sink that counts packets needs every one, and says so.
+    assert_eq!(description["wants"], "all");
     // No frame interface: none of the windowed fields appear.
     assert!(description.get("window").is_none());
     assert_eq!(description["reads_rows"], serde_json::Value::Null);

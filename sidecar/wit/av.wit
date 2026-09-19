@@ -173,6 +173,26 @@ interface types {
     language: option<string>,
   }
 
+  /// How much of a stream a sink has to be handed to do its work. A sink
+  /// that reads what a writer put on keyframes, or what a stream's first
+  /// packet declares, does not need the rest - and a host reading a file to
+  /// answer a question at compile time can copy far less of it.
+  ///
+  /// It is a REQUEST, not a promise: a host may hand over more than was
+  /// asked for, and every sink has to work when it does. What a host may not
+  /// do is hand over less.
+  enum wants {
+    /// Every packet of every stream. What a sink that counts, tallies or
+    /// republishes needs, and what a host with no way to skip hands over.
+    all,
+    /// The keyframes, and whatever else the host could not cheaply drop.
+    /// What a sink reading data a writer placed on keyframes needs.
+    keyframes,
+    /// The first packet of each stream, and no more. What a sink reading
+    /// only what a stream declares about itself needs.
+    first,
+  }
+
   /// How many streams of one kind a module reading encoded packets takes.
   /// Shared between `packet-sink` and `packet-filter`.
   enum arity {
@@ -427,7 +447,7 @@ interface window-filter {
 /// query named, in that order, and `process` is handed one packet list per
 /// pad in the same order.
 interface packet-sink {
-  use types.{arity, input-stream, meta, pad-packets};
+  use types.{arity, input-stream, meta, pad-packets, wants};
 
   /// `meta`, plus what this sink accepts. A packet sink names codecs the way
   /// a frame module names pixel formats; `meta`'s own format lists stay
@@ -444,6 +464,10 @@ interface packet-sink {
     video: arity,
     /// How many audio streams this sink reads.
     audio: arity,
+    /// How much of the stream this sink has to see. `all` is the answer for
+    /// a sink that reads every packet, and the answer a world before 0.16.0
+    /// is adapted to, since none of them could say otherwise.
+    wants: wants,
   }
 
   /// What one call produced. Rows only: a packet sink's rows are its whole

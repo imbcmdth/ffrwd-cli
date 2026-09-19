@@ -3017,6 +3017,12 @@ struct Description {
     /// 0.12.0, which read no audio stream.
     #[serde(skip_serializing_if = "Option::is_none")]
     audio_codecs: Option<Vec<String>>,
+    /// How much of the stream a packet sink has to be handed: "all",
+    /// "keyframes" or "first". Present only for a module exporting the
+    /// packet sink, and "all" for one built against a world with no field
+    /// for it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wants: Option<&'static str>,
     /// How many streams of each kind a packet sink reads: "none", "one" or
     /// "many". Present only for a module exporting the packet sink.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3195,6 +3201,7 @@ fn describe_module(module_path: &str) -> Result<String> {
         forwards_rows: None,
         video_codecs: None,
         audio_codecs: None,
+        wants: None,
         video_streams: None,
         audio_streams: None,
         packet_filter: false,
@@ -3262,6 +3269,7 @@ fn describe_module(module_path: &str) -> Result<String> {
         description.audio_codecs = Some(described.audio_codecs);
         description.video_streams = Some(streams_read(described.video));
         description.audio_streams = Some(streams_read(described.audio));
+        description.wants = Some(described.wants.written());
     }
 
     if has_packet_filter {

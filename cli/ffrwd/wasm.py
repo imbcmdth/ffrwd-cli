@@ -78,6 +78,7 @@ __all__ = [
     "WORLDS",
     "WORLD_VERSION",
     "SinkArity",
+    "SinkWants",
     "Describe",
     "Described",
     "DescribedFunction",
@@ -122,6 +123,10 @@ _NULL_FORMAT = "null"
 # How many streams of one kind a packet sink reads.
 SinkArity = Literal["none", "one", "many", "any"]
 _SINK_ARITIES = ("none", "one", "many", "any")
+
+# How much of a stream a packet sink asks to be handed.
+SinkWants = Literal["all", "keyframes", "first"]
+_SINK_WANTS = ("all", "keyframes", "first")
 
 WORLDS: tuple[str, ...] = (
     "ffrwd:av@0.2.0",
@@ -416,6 +421,10 @@ class Described:
     audio_codecs: tuple[str, ...] = ()
     video_streams: SinkArity = "one"
     audio_streams: SinkArity = "none"
+    # How much of a stream a packet sink has to be handed: a request the
+    # host may exceed and must not fall short of. "all" for a sink built
+    # against a world with no field for it.
+    wants: SinkWants = "all"
     source: bool = False
     # Whether the module's export is a packet FILTER rather than a sink: the
     # two declare the same codecs and arities, and this is what tells them
@@ -617,6 +626,9 @@ def _described(path: str, payload: object) -> Described:
         # A sink built before the counts existed read one video stream.
         video_streams=_sink_arity(payload.get("video_streams"), "one"),
         audio_streams=_sink_arity(payload.get("audio_streams"), "none"),
+        wants=cast(SinkWants, payload["wants"])
+        if payload.get("wants") in _SINK_WANTS
+        else "all",
         source=payload.get("source") is True,
         packet_filter=payload.get("packet_filter") is True,
         rows_module=payload.get("rows_module") is True,

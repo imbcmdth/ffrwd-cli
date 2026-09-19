@@ -13,7 +13,7 @@ use std::cell::RefCell;
 
 use crate::ffrwd::av::types::Packet;
 use exports::ffrwd::av::packet_sink::{
-    Arity, Guest, InputStream, Meta, PacketSinkMeta, PadPackets, Processed,
+    Arity, Guest, InputStream, Meta, PacketSinkMeta, PadPackets, Processed, Wants,
 };
 use serde::Serialize;
 
@@ -145,6 +145,8 @@ impl Guest for PacketStats {
             // One video stream: this module counts a stream, not a ladder.
             video: Arity::One,
             audio: Arity::Zero,
+            // Every packet is the point: these count what crossed.
+            wants: Wants::All,
         }
     }
 

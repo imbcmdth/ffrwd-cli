@@ -19,7 +19,7 @@ use std::cell::RefCell;
 
 use crate::ffrwd::av::types::CodedFormat;
 use exports::ffrwd::av::packet_sink::{
-    Arity, Guest, InputStream, Meta, PacketSinkMeta, PadPackets, Processed,
+    Arity, Guest, InputStream, Meta, PacketSinkMeta, PadPackets, Processed, Wants,
 };
 use serde::Serialize;
 
@@ -91,6 +91,8 @@ impl Guest for PacketTally {
             audio_codecs: vec![],
             video: Arity::Any,
             audio: Arity::Any,
+            // Every packet is the point: these count what crossed.
+            wants: Wants::All,
         }
     }
 

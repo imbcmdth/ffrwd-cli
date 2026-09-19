@@ -1375,6 +1375,30 @@ pub struct Emitted {
     pub trailing: Vec<String>,
 }
 
+/// How much of a stream a sink has to be handed. A request, not a promise:
+/// a host may hand over more, and every sink works when it does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Wants {
+    /// Every packet. What a world before 0.16.0 is adapted to, since none of
+    /// them could say otherwise.
+    All,
+    /// The keyframes, and whatever else the host could not cheaply drop.
+    Keyframes,
+    /// The first packet of each stream, and no more.
+    First,
+}
+
+impl Wants {
+    /// How the request reads in a description.
+    pub fn written(self) -> &'static str {
+        match self {
+            Wants::All => "all",
+            Wants::Keyframes => "keyframes",
+            Wants::First => "first",
+        }
+    }
+}
+
 /// What a packet sink publishes without being opened for any stream.
 #[derive(Debug, Clone)]
 pub struct DescribedPacketSink {
@@ -1389,6 +1413,9 @@ pub struct DescribedPacketSink {
     pub video: Arity,
     /// How many audio streams the sink reads.
     pub audio: Arity,
+    /// How much of the stream the sink has to see. `All` for a world before
+    /// 0.16.0, which had no field for it.
+    pub wants: Wants,
     /// The wit package version the module was built against.
     pub world: &'static str,
 }
@@ -3215,13 +3242,16 @@ impl PacketInstance {
                     audio_codecs: Vec::new(),
                     video: Arity::One,
                     audio: Arity::Zero,
+                    wants: Wants::All,
                     world: $version,
                 }
             }};
         }
-        // 0.12.0 and 0.13.0 share the same packet-sink shape - a list of
-        // streams, arity and codec lists per kind - so one macro arm covers
-        // both, differing only in the generated types and the version tag.
+        // 0.12.0 through 0.15.0 share the same packet-sink shape - a list
+        // of streams, arity and codec lists per kind - so one macro arm
+        // covers them, differing only in the generated types and the version
+        // tag. None of them says how much of a stream it needs, so each is
+        // adapted as wanting all of it.
         macro_rules! several_streams {
             ($b:expr, $world:ident, $version:literal) => {{
                 use $world::packet::exports::ffrwd::av::packet_sink::Arity as Wit;
@@ -3241,12 +3271,30 @@ impl PacketInstance {
                     audio_codecs: d.audio_codecs,
                     video: arity(d.video),
                     audio: arity(d.audio),
+                    wants: Wants::All,
                     world: $version,
                 }
             }};
         }
+        // 0.16.0 alone says how much of the stream it needs.
+        macro_rules! with_wants {
+            ($b:expr, $world:ident, $version:literal) => {{
+                use $world::packet::exports::ffrwd::av::packet_sink::Wants as Wit;
+                let mut described = several_streams!($b, $world, $version);
+                let d = $b
+                    .ffrwd_av_packet_sink()
+                    .call_describe(&mut *store)
+                    .map_err(wasm_err)?;
+                described.wants = match d.wants {
+                    Wit::All => Wants::All,
+                    Wit::Keyframes => Wants::Keyframes,
+                    Wit::First => Wants::First,
+                };
+                described
+            }};
+        }
         Ok(match self {
-            PacketInstance::W0160(b) => several_streams!(b, world_0160, "0.16.0"),
+            PacketInstance::W0160(b) => with_wants!(b, world_0160, "0.16.0"),
             PacketInstance::W0150(b) => several_streams!(b, world_0150, "0.15.0"),
             PacketInstance::W0140(b) => several_streams!(b, world_0140, "0.14.0"),
             PacketInstance::W0130(b) => several_streams!(b, world_0130, "0.13.0"),
@@ -3888,6 +3936,9 @@ fn check_filter_inputs(described: &DescribedPacketFilter, inputs: &[SinkInput]) 
             audio_codecs: described.audio_codecs.clone(),
             video: described.video,
             audio: described.audio,
+            // Not a filter's question: it is handed what the query's own
+            // destination encodes, whole.
+            wants: Wants::All,
             world: described.world,
         },
         inputs,
