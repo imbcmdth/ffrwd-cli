@@ -860,9 +860,11 @@ def _sidecar_writes(
     outgoing: Sequence[StreamEdge],
 ) -> list[str]:
     """Where `process` writes go: a packet source's tracks in `outgoing`'s
-    own order, which is its catalog order, and then its rows documents.
-    Everything else hands its frames on over the one stdout instead."""
-    streams = [write[edge] for edge in outgoing] if process.packet_source else []
+    own order, which is its catalog order, a packet filter's pads in the same
+    order it reads them, and then its rows documents. Everything else hands
+    its frames on over the one stdout instead."""
+    several = process.packet_source or process.packet_filter
+    streams = [write[edge] for edge in outgoing] if several else []
     return streams + _rows_writes(process, plan, write)
 
 
@@ -1196,7 +1198,7 @@ def _sidecar_args(
             "nothing was given to spawn it",
             hint="pass sidecar_argv, which renders one sidecar process as argv",
         )
-    if streams > 1 and not process.packet_source:
+    if streams > 1 and not (process.packet_source or process.packet_filter):
         raise FfrwdError(
             ErrorCode.INTERNAL,
             f"process {process.id!r} writes {streams} streams, but only its own "
@@ -1204,11 +1206,11 @@ def _sidecar_args(
             hint="a sidecar writing more than one stream needs argv that can "
             "spell a named pipe path",
         )
-    if len(reads) > 1 and not process.packet_sink:
+    if len(reads) > 1 and not (process.packet_sink or process.packet_filter):
         raise FfrwdError(
             ErrorCode.INTERNAL,
             f"process {process.id!r} reads {len(reads)} streams and hosts no "
-            "packet sink",
+            "packet sink or filter",
             hint="a frame module takes its pads out of one input, wired by the "
             "network string",
         )

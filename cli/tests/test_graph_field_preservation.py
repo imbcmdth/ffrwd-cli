@@ -55,6 +55,7 @@ def _sentinel_graph() -> Graph:
     g.rows_sinks = {"m": RowsSink(container="subtitle", alias="rows_in")}
     g.module_sinks = ["m"]
     g.packet_sinks = {"m": [{"video_codec": "h264"}]}
+    g.packet_filters = {"w": [{"video_codec": "libx264"}]}
     g.module_sources = {
         "s": ModuleSource(
             alias="s",

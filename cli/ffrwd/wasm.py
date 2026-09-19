@@ -1679,10 +1679,10 @@ def _rows_module_args(process: SidecarProcess) -> list[str]:
 def _split_writes(
     process: SidecarProcess, writes: Sequence[str]
 ) -> tuple[Sequence[str], Sequence[str]]:
-    """`writes` as a packet source's track paths and the rows paths after
-    them, which :func:`~ffrwd.execute._sidecar_writes` puts in that order.
-    Every other process writes rows documents and nothing else."""
-    if not process.packet_source:
+    """`writes` as a packet source's or a packet filter's stream paths and the
+    rows paths after them, which :func:`~ffrwd.execute._sidecar_writes` puts in
+    that order. Every other process writes rows documents and nothing else."""
+    if not (process.packet_source or process.packet_filter):
         return (), writes
     count = len(process.outputs)
     return writes[:count], writes[count:]
@@ -1693,7 +1693,10 @@ def _stream_output(process: SidecarProcess, writes: Sequence[str] = ()) -> list[
 
     NUT to stdout for a region whose frames feed the next process; a null
     output for a SINK region, whose module consumes its frames and whose
-    effects are the product -- nothing rides its stdout. A packet SOURCE
+    effects are the product -- nothing rides its stdout. A packet FILTER
+    writes one ``-f nut`` per pad it reads, in pad order, `writes` naming
+    each: it hands every stream it was given back, still encoded. A packet
+    SOURCE
     writes one ``-track <index> -f nut <pipe>`` per track the plan takes
     instead of the single stdout every other region gets, `writes` naming
     each in catalog order -- a printed command with none given still numbers
@@ -1703,6 +1706,14 @@ def _stream_output(process: SidecarProcess, writes: Sequence[str] = ()) -> list[
     """
     if process.sink:
         return ["-f", _NULL_FORMAT, "-"]
+    if process.packet_filter:
+        # One output per pad, in pad order: the filter hands every stream it
+        # was given back, and each travels its own pipe the way a source's
+        # tracks do. The order is the order the reader opens them in.
+        paths = writes or tuple(f"pipe:{i + 1}" for i in range(len(process.outputs)))
+        return [
+            token for path in paths for token in ("-f", EDGE_FORMAT, path)
+        ]
     if process.packet_source:
         paths = writes or tuple(f"pipe:{i + 1}" for i in range(len(process.outputs)))
         argv: list[str] = []

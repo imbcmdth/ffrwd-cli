@@ -86,10 +86,21 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   declaration and a module that disagree are refused naming both. It is
   written as a column of a COPY's SELECT, since packets exist only where
   a destination encodes them and nowhere in a table query.
-  **No destination places one yet**: a query that writes the call
-  compiles as far as checking it and is then refused, because nothing
-  builds the shape a filter sits in (encoder, filter, muxer). See
-  [known gaps](known_gaps.md).
+  The compiler defers the call past the encoder the destination already
+  places, so the COPY compiles to `encoder ffmpeg -> coded NUT -> sidecar
+  filter -> coded NUT -> -c copy mux` for a file destination, and the
+  same with the packet sink in place of the mux for a `RETURNS sink` one.
+  The COPY's `WITH` shapes that encoder exactly as it would shape the
+  destination's, and the destination copies what comes back; a column
+  whose stream reaches the filter untouched and already in a codec the
+  module accepts is copied INTO it too, so weaving into a file that is
+  already encoded re-encodes nothing. Other streams of the same
+  destination are muxed straight off the source beside it, in sync.
+  Refused: the call anywhere but a COPY cell, an ffmpeg filter over it, a
+  destination that places no encoder (a frame sink, a rows file, a table
+  query), a second column of the same kind at a destination whose encoder
+  options went upstream with the filter, `two_pass`, and a filter that
+  reads rows. See [known gaps](known_gaps.md).
 - A **sink `LANGUAGE wasm` function** (`RETURNS sink`) is a COPY
   destination: `COPY (SELECT <cells>) TO name(<values>)`. It declares
   value parameters only; the SELECT list supplies the ROWS it reads,
@@ -727,8 +738,9 @@ run whose rows are still being produced keeps flowing.
 
 The sidecar hosts one - `ffrwd-wasm -f nut -i <in> -m <module>
 -rows-in <rows.ndjson> -f nut <out>`, with `-params-from <file>` where
-the parameters are too long for a command line - and `ffrwd` reads its
-describe, but no query places one yet: see
+the parameters are too long for a command line - and `ffrwd` places one
+where a COPY's SELECT writes a `RETURNS packets` call. A filter that
+READS rows has no spelling for them yet: see
 [known gaps](known_gaps.md).
 
 ### Linking

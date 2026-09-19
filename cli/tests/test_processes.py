@@ -1316,6 +1316,82 @@ def test_legs_over_different_inputs_stay_two_processes() -> None:
     )
 
 
+def _packet_filter_graph(codec: str = "libx264", pads: int = 1) -> Graph:
+    """A packet filter between an encoder and a muxing ffmpeg.
+
+    One pad per `pads`: the filter reads bare source streams and hands the
+    same streams back, and the sink unit writes what comes out of it. This
+    is the shape `lower._place_packet_filters` writes for a file destination.
+    """
+    g = Graph(input_paths=["a.mp4"], sources={"a": 0})
+    inputs = [f"src:a:v:{index}" for index in range(pads)]
+    g.nodes["e0"] = Node(
+        id="e0",
+        filter="weave.wasm",
+        args={},
+        inputs=inputs,
+        outputs=["video"] * pads,
+    )
+    g.packet_filters["e0"] = [{"video_codec": codec} for _ in range(pads)]
+    g.sinks = [
+        SinkUnit(
+            outputs=[
+                Output(
+                    ref="e0" if index == 0 else f"e0:{index}",
+                    type="video",
+                    name=None,
+                    metadata={},
+                )
+                for index in range(pads)
+            ],
+            path="out.mp4",
+        )
+    ]
+    return g
+
+
+def test_a_packet_filter_reads_the_encoder_and_hands_copies_on() -> None:
+    """The filter rides alone between an encoding ffmpeg and the muxer that
+    copies what it wrote."""
+    plan = partition(_packet_filter_graph(), external=external_ids("e0"))
+
+    assert len(plan.ffmpeg) == 2
+    (sidecar,) = plan.sidecars
+    assert sidecar.packet_filter
+    assert not sidecar.network
+    into = next(e for e in plan.stream_edges if e.target == sidecar.id)
+    out = next(e for e in plan.stream_edges if e.source == sidecar.id)
+    assert into.format.codec == "libx264"
+    assert out.format.codec == COPY_CODEC
+    # Nothing shapes the copied edge: an encoder option on it would be an
+    # instruction to re-encode what the filter already wrote.
+    assert out.format.options == ()
+
+
+def test_a_packet_filter_that_copies_onto_itself_encodes_nothing() -> None:
+    """A stream already in a codec the module reads travels to the filter as
+    the packets it was, and out of it the same way."""
+    plan = partition(_packet_filter_graph(codec=COPY_CODEC), external=external_ids("e0"))
+    (sidecar,) = plan.sidecars
+    assert all(e.format.codec == COPY_CODEC for e in plan.stream_edges)
+    assert len([e for e in plan.stream_edges if e.source == sidecar.id]) == 1
+
+
+def test_a_packet_filters_pads_are_inputs_of_their_own_not_a_network() -> None:
+    """Its pads are whole encoded streams, so the short argv spells them as
+    the `-i`s they are rather than wiring them through a filtergraph, and
+    each leaves on an `-f nut` of its own."""
+    plan = partition(_packet_filter_graph(pads=2), external=external_ids("e0"))
+    (sidecar,) = plan.sidecars
+    assert sidecar.packet_filter
+    assert not sidecar.network
+    assert len(sidecar.inputs) == 2
+    assert len(sidecar.outputs) == 2
+    argv = wasm.shown_argv(sidecar, ["in0", "in1"], ["out0", "out1"])
+    assert argv.count("-i") == 2
+    assert argv[-6:] == ["-f", "nut", "out0", "-f", "nut", "out1"]
+
+
 def _row_reading_packet_sink_graph() -> Graph:
     """A row-reading sink's pads, hand-built the shape lower.py now writes:
     two rows, each a video and an audio cell, `row`/`rendition` on every pad

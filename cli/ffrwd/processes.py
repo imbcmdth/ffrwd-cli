@@ -739,6 +739,10 @@ class SidecarProcess:
     # True for a region whose module consumes ENCODED PACKETS rather than
     # frames.
     packet_sink: bool = False
+    # True for a region whose module REWRITES encoded packets and hands them
+    # back: it reads a packet sink's pads and writes one `-f nut` per pad,
+    # each its own pipe rather than a pad cut out of one stdout.
+    packet_filter: bool = False
     # True for a region holding a SOURCE MODULE: it rides alone, no inputs,
     # and its `outputs` -- more than one, ordinarily illegal -- are each their
     # own NUT pipe rather than pads cut from one stdout.
@@ -765,13 +769,14 @@ class SidecarProcess:
         stream: the short ``-m <path>`` form says one module, and its pads
         come out of one input wired by the network string.
 
-        A packet sink is the exception, and never a network: its pads are
-        whole encoded streams rather than pads cut out of one, so the short
-        form spells them as the inputs they are, one ``-i`` apiece.
+        A packet sink is the exception, and never a network; so is a packet
+        FILTER, for the same reason: their pads are whole encoded streams
+        rather than pads cut out of one, so the short form spells them as the
+        inputs they are, one ``-i`` apiece.
         """
         if self.graph is None:
             return False
-        if self.packet_sink or self.packet_source:
+        if self.packet_sink or self.packet_source or self.packet_filter:
             return False
         return len(self.graph.nodes) > 1 or any(
             len(node.inputs) > 1 for node in self.graph.nodes.values()
@@ -801,6 +806,8 @@ class SidecarProcess:
             written["rows"] = [document.to_dict() for document in self.rows]
         if self.sink:
             written["sink"] = True
+        if self.packet_filter:
+            written["packet_filter"] = True
         if self.packet_source:
             written["packet_source"] = True
         if self.tracks:
@@ -1593,8 +1600,11 @@ class _Partitioner:
             return True
 
         # A packet sink joins no region but its own: it reads the encoder's
-        # output, and only an ffmpeg on its own side of the pipe encodes.
-        alone = set(self.g.packet_sinks)
+        # output, and only an ffmpeg on its own side of the pipe encodes. A
+        # packet FILTER reads the same thing and rides alone for the same
+        # reason -- and its own output is encoded too, so nothing joins it
+        # from below either.
+        alone = set(self.g.packet_sinks) | set(self.g.packet_filters)
         # A ROWS edge joins its two nodes too: the consumer runs where the
         # rows already are, in the producer's own sidecar.
         links = [
@@ -1969,12 +1979,16 @@ class _Partitioner:
         that emit a frame per frame; anything else hands the module streams
         whose PTS drift apart, and it has no way to say which frames pair up.
 
-        A PACKET SINK is exempt: packets are not frames, nothing pairs one
-        pad's packet with another's, and its pads are separate encodes of the
-        same source by construction.
+        A PACKET SINK is exempt, and a packet FILTER with it: packets are not
+        frames, nothing pairs one pad's packet with another's, and their pads
+        are separate encodes of the same source by construction.
         """
         for name in self.order:
-            if not self.external[name] or name in self.g.packet_sinks:
+            if (
+                not self.external[name]
+                or name in self.g.packet_sinks
+                or name in self.g.packet_filters
+            ):
                 continue
             node = self.g.nodes[name]
             if len(node.inputs) < 2:
@@ -2027,6 +2041,7 @@ class _Partitioner:
                 impure=self._region_impure(members),
                 sink=any(name in self.g.module_sinks for name in members),
                 packet_sink=any(name in self.g.packet_sinks for name in members),
+                packet_filter=any(name in self.g.packet_filters for name in members),
                 pads=self._region_pad_meta(members),
             )
             self.sidecars.append(sidecar)
@@ -2063,13 +2078,22 @@ class _Partitioner:
             producer = _ref_node(ref)
             if producer is not None and self.external.get(producer, False):
                 consumer = self._reader(target, ref)
-                if consumer is not None and consumer in self.g.packet_sinks:
-                    # A packet sink consumes the encoder's output, and a
-                    # module region emits decoded frames: an encoding ffmpeg
-                    # stands between them, reading the region's pipe and
-                    # writing the encoded stream the sink's edge names --
-                    # the same fronting encoder the sink gets when its feed
-                    # is an ffmpeg filter, shaped by the same options.
+                if (
+                    consumer is not None
+                    and (
+                        consumer in self.g.packet_sinks
+                        or consumer in self.g.packet_filters
+                    )
+                    and producer not in self.g.packet_filters
+                ):
+                    # A packet sink or filter consumes the encoder's output,
+                    # and a module region emits decoded frames: an encoding
+                    # ffmpeg stands between them, reading the region's pipe
+                    # and writing the encoded stream the consumer's edge names
+                    # -- the same fronting encoder either gets when its feed
+                    # is an ffmpeg filter, shaped by the same options. A
+                    # filter's OWN output is already encoded, so nothing
+                    # stands between it and what reads it.
                     stage = _Pending(
                         id=self._ffmpeg_id(),
                         depth=depth,
@@ -2154,22 +2178,24 @@ class _Partitioner:
         return tuple(found)
 
     def _region_pad_meta(self, members: Sequence[str]) -> tuple[PadMeta | None, ...]:
-        """This region's packet-sink pad metadata, one per ``-i`` read, in
-        the same order the reads themselves are rendered.
+        """This region's packet pad metadata, one per ``-i`` read, in the same
+        order the reads themselves are rendered.
 
-        Empty for a region holding no packet sink -- the ordinary case, so
-        the argv renders no ``-pad`` flag anywhere. A pad `lower` never
-        marked with a row -- the old, stream-parameter sink form -- carries
-        `None`, the same as a pad the 0.12 sink default fills in at the
-        sidecar's own door.
+        Empty for a region reading no packets -- the ordinary case, so the
+        argv renders no ``-pad`` flag anywhere. A packet FILTER's pads are a
+        sink's, read out of its own table. A pad `lower` never marked with a
+        row -- the old, stream-parameter sink form -- carries `None`, the
+        same as a pad the 0.12 sink default fills in at the sidecar's own
+        door.
         """
-        name = next((n for n in members if n in self.g.packet_sinks), None)
-        if name is None:
-            return ()
-        return tuple(
-            PadMeta.from_dict(pad) if "row" in pad else None
-            for pad in self.g.packet_sinks[name]
-        )
+        for table in (self.g.packet_sinks, self.g.packet_filters):
+            name = next((n for n in members if n in table), None)
+            if name is not None:
+                return tuple(
+                    PadMeta.from_dict(pad) if "row" in pad else None
+                    for pad in table[name]
+                )
+        return ()
 
     def _region_rows(
         self, members: Sequence[str], bindings: Sequence[ModuleBinding]
@@ -2327,10 +2353,29 @@ class _Partitioner:
 
     def _format(self, ref: FrameRef, target: str | None = None) -> StreamFormat:
         meta = self._origin_meta(ref)
+        producer = _ref_node(ref)
+        if producer is not None and producer in self.g.packet_filters:
+            # The edge OUT of a packet filter carries what its input carried:
+            # the filter hands the same encoded stream back, so whatever reads
+            # it copies the packets rather than encoding anything.
+            if ref_type(self.g, ref) == "audio":
+                return AudioFormat(
+                    rate=meta.sample_rate if meta else None,
+                    channels=meta.channels if meta else None,
+                    codec=COPY_CODEC,
+                )
+            return VideoFormat(
+                width=meta.width if meta else None,
+                height=meta.height if meta else None,
+                timebase=_timebase(meta.fps) if meta else None,
+                codec=COPY_CODEC,
+            )
         pads = self.g.packet_sinks.get(target) if target is not None else None
+        if pads is None and target is not None:
+            pads = self.g.packet_filters.get(target)
         if ref_type(self.g, ref) == "audio":
             if pads is not None:
-                # The consumer is a packet sink: this edge carries the audio
+                # The consumer reads packets: this edge carries the audio
                 # encoder's output, not the pcm every other audio edge does.
                 assert target is not None  # `pads` came from it
                 rest = dict(pads[self.g.nodes[target].inputs.index(ref)])
@@ -2348,7 +2393,7 @@ class _Partitioner:
                 channels=meta.channels if meta else None,
             )
         if pads is not None:
-            # The consumer is a packet sink: the edge carries the encoder's
+            # The consumer reads packets: the edge carries the encoder's
             # output, shaped by the COPY's own options -- this PAD's, since a
             # ladder shapes every rendition differently.
             assert target is not None  # `pads` came from it

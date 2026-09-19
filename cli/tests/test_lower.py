@@ -14325,15 +14325,205 @@ def _packets_rejects(sql: str, described: Described | None = None) -> FfrwdError
     return caught.value
 
 
-def test_a_packets_call_has_nowhere_to_go_yet() -> None:
-    """The declaration and the module agree; what is missing is the shape
-    that puts a filter between an encoder and what reads its packets."""
-    err = _packets_rejects(
+def _packets_graph(sql: str, described: Described | None = None) -> Graph:
+    return lower(
+        resolve(parse(PACKETS_DECLARE + sql)),
+        _row_probes(_track("video", 0), _track("audio", 0)),
+        registry=_snapshot_registry(),
+        describes={PACKETS_MODULE: described or _packets_described()},
+    )
+
+
+def test_a_packets_call_moves_the_destinations_encoder_one_process_ahead() -> None:
+    """The COPY's own video options shape the encoder in front of the filter,
+    and the destination is left copying what comes back -- an encoder option
+    written over a stream copy would be an instruction to re-encode it."""
+    g = _packets_graph(
+        "COPY (SELECT weave(f.video[1]), f.audio[1] FROM input('f.mp4') f) "
+        "TO 'out.mp4' WITH (video_codec 'libx264', crf 20, audio_codec 'aac')"
+    )
+    (node,) = g.packet_filters
+    assert g.packet_filters[node] == [{"video_codec": "libx264", "crf": 20}]
+    # The audio never reached the filter, so its own option stays where it was.
+    assert g.sinks[0].options == {"audio_codec": "aac"}
+
+
+def test_a_packets_call_over_an_untouched_stream_copies_onto_the_filter() -> None:
+    """Weaving into a file that is already encoded asks for no encode: the
+    stream travels to the filter as the packets it already was."""
+    g = _packets_graph(
         "COPY (SELECT weave(f.video[1]) FROM input('f.mp4') f) TO 'out.mp4'"
     )
+    (node,) = g.packet_filters
+    assert g.packet_filters[node] == [{"video_codec": "copy"}]
+
+
+def test_a_packets_call_over_a_filtered_stream_takes_the_modules_codec() -> None:
+    """A stream the filter cannot be handed as it stands is encoded into one
+    the module named, the way a packet sink's default codec is chosen."""
+    g = _packets_graph(
+        "COPY (SELECT weave(ffmpeg.hflip(f.video[1])) FROM input('f.mp4') f) "
+        "TO 'out.mp4'"
+    )
+    (node,) = g.packet_filters
+    assert g.packet_filters[node] == [{"video_codec": "libx264"}]
+
+
+def test_an_ffmpeg_filter_over_a_packets_call_is_refused() -> None:
+    """What a filter hands back is the encoded stream, and ffmpeg's filters
+    read frames."""
+    err = _packets_rejects(
+        "COPY (SELECT ffmpeg.hflip(weave(f.video[1])) FROM input('f.mp4') f) "
+        "TO 'out.mp4'"
+    )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "'weave' returns packets" in err.message
-    assert "no destination places a packet filter yet" in err.message
+    assert "ffmpeg filters read frames" in err.message
+    assert err.hint is not None and "the last thing a COPY's column does" in err.hint
+
+
+def test_a_packets_call_in_a_table_query_is_refused() -> None:
+    """A table query runs no ffmpeg, so nothing there encoded anything."""
+    with pytest.raises(FfrwdError) as caught:
+        lower_table(
+            resolve(
+                parse(
+                    PACKETS_DECLARE
+                    + "SELECT weave(f.video[1]) FROM input('f.mp4') f"
+                )
+            ),
+            _row_probes(_track("video", 0)),
+            registry=_snapshot_registry(),
+            describes={PACKETS_MODULE: _packets_described()},
+        )
+    assert caught.value.code is ErrorCode.UNSUPPORTED_SQL
+    assert "a table query runs no ffmpeg" in caught.value.message
+
+
+def test_a_packets_call_at_a_rows_file_is_refused() -> None:
+    """A rows file holds an annotation column; a filter hands back a stream."""
+    err = _packets_rejects(
+        "COPY (SELECT weave(f.video[1]) FROM input('f.mp4') f) TO 'out.ndjson'"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "is a rows file" in err.message
+
+
+def test_a_packets_call_beside_an_unfiltered_video_column_is_refused() -> None:
+    """The COPY's video options went upstream with the filter, and a second
+    video column written at the destination would be left without them."""
+    err = _packets_rejects(
+        "COPY (SELECT weave(f.video[1]), ffmpeg.hflip(f.video[1]) "
+        "FROM input('f.mp4') f) TO 'out.mkv' WITH (crf 20)"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "encodes the video it filters one process ahead" in err.message
+
+
+def test_two_pass_under_a_packet_filter_is_refused() -> None:
+    """Two passes are two encodes, and the filter reads one of them."""
+    err = _packets_rejects(
+        "COPY (SELECT weave(f.video[1]) FROM input('f.mp4') f) TO 'out.mp4' "
+        "WITH (video_codec 'libx264', video_bitrate '2M', two_pass true)"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "a two-pass encode runs twice" in err.message
+
+
+def test_an_encoder_a_packet_filter_does_not_rewrite_is_refused() -> None:
+    err = _packets_rejects(
+        "COPY (SELECT weave(f.video[1]) FROM input('f.mp4') f) TO 'out.mp4' "
+        "WITH (video_codec 'libx265')"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'libx265' writes hevc" in err.message
+    assert "rewrites h264" in err.message
+
+
+def test_a_packet_filter_that_reads_rows_has_nowhere_to_read_them() -> None:
+    """The placement is there; the rows are not. A module that acts on them
+    would run blind, so it is refused at the call."""
+    err = _packets_rejects(
+        "COPY (SELECT weave(f.video[1]) FROM input('f.mp4') f) TO 'out.mp4'",
+        _packets_described(reads_rows=True),
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "reads rows beside its packets" in err.message
+
+
+def test_a_packets_call_at_a_manifest_destination_is_refused() -> None:
+    """A manifest writes a ladder of encoded streams; the filter reads one."""
+    err = _packets_rejects(
+        "COPY (SELECT weave(f.video[1]) FROM input('f.mp4') f) "
+        "TO 'out.m3u8' WITH (format 'hls', video_codec 'libx264')"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "writes a ladder of them" in err.message
+
+
+def _packets_into_sink(
+    sql: str, sink: Described | None = None
+) -> Graph:
+    """A query declaring both a packet filter and a sink destination."""
+    return lower(
+        resolve(parse(PACKETS_DECLARE + ROW_SINK_DECLARE + sql)),
+        _row_probes(_track("video", 0), _track("audio", 0)),
+        registry=_snapshot_registry(),
+        describes={
+            PACKETS_MODULE: _packets_described(),
+            ROW_SINK_MODULE: sink or _row_sink_described(),
+        },
+    )
+
+
+def test_a_packet_filter_in_front_of_a_packet_sink_takes_the_sinks_encoder() -> None:
+    """Both read the encoder the destination places; the filter is the one
+    that reads it first, and the sink is handed what the filter wrote."""
+    g = _packets_into_sink(
+        "COPY (SELECT weave(f.video[1]) FROM input('f.mp4') f) "
+        "TO publish('relay', 'live') WITH (video_codec 'libx264', crf 18)"
+    )
+    (filter_node,) = g.packet_filters
+    assert g.packet_filters[filter_node] == [{"video_codec": "libx264", "crf": 18}]
+    (sink_node,) = g.packet_sinks
+    assert g.nodes[sink_node].inputs == [filter_node]
+
+
+def test_a_packet_filter_into_a_frame_sink_is_refused() -> None:
+    """A frame sink reads decoded pictures, so there is no encoder in front
+    of it for a filter to sit behind."""
+    watcher = "watch.wasm"
+    declare = (
+        "CREATE FUNCTION watch(v video_stream) RETURNS sink\n"
+        f"  AS '{watcher}', 'watch' LANGUAGE wasm;\n"
+    )
+    described = Described(
+        world=WORLDS[-1],
+        name="watch",
+        version="0.1.0",
+        params_schema={"type": "object", "additionalProperties": False},
+        rows_schema=None,
+        pixel_formats=("rgb24",),
+    )
+    with pytest.raises(FfrwdError) as caught:
+        lower(
+            resolve(
+                parse(
+                    PACKETS_DECLARE
+                    + declare
+                    + "COPY (SELECT weave(f.video[1]) FROM input('f.mp4') f) "
+                    "TO watch()"
+                )
+            ),
+            _row_probes(_track("video", 0)),
+            registry=_snapshot_registry(),
+            describes={
+                PACKETS_MODULE: _packets_described(),
+                watcher: described,
+            },
+        )
+    assert caught.value.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'watch' reads decoded frames" in caught.value.message
+    assert "'weave' hands back the encoded stream" in caught.value.message
 
 
 def test_a_packets_declaration_over_a_module_that_is_not_one() -> None:

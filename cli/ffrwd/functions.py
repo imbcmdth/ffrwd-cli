@@ -2870,11 +2870,16 @@ def _declared_kind(declared: str) -> str:
 
     `vector` is not in :data:`TYPES` at all -- it is never a NAMEABLE type,
     only a value function's own domain -- so it is its own bucket here
-    rather than a lookup that would raise.
+    rather than a lookup that would raise. `packets` is not in it either,
+    and reads as a stream: a packet filter hands back the stream it was
+    given, so a cell that calls one is a stream cell wherever a destination
+    consumes one.
     """
     element = element_type(declared)
     if element == _VECTOR_TYPE:
         return _VECTOR_TYPE
+    if element == WASM_PACKETS:
+        return "stream"
     return "stream" if TYPES[element].kind != "scalar" else declared
 
 

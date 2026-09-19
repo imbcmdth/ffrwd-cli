@@ -2452,6 +2452,26 @@ def _join_codecs(names: Sequence[str]) -> str:
     return ", ".join(names[:-1]) + " or " + names[-1]
 
 
+def _reads_node(ref: FrameRef, node_id: str) -> bool:
+    """True when `ref` names a pad of the node `node_id`."""
+    if is_src(ref):
+        return False
+    head, _, pad = ref.rpartition(":")
+    return (head if head and pad.isdigit() else ref) == node_id
+
+
+def _named_output(output: Output) -> str:
+    """One sink output as a message names it: its column, or its kind."""
+    return f"'{output.name}'" if output.name else f"the {output.type} column"
+
+
+def _asked_scopes(raw: RawSink | None) -> frozenset[str]:
+    """The option scopes this COPY's WITH wrote anything in."""
+    if raw is None:
+        return frozenset()
+    return frozenset(SINK_OPTIONS[option.name].scope for option in raw.options)
+
+
 def _check_sink_option_conflicts(
     options: dict[str, object],
     option_nodes: dict[str, exp.Expr],
@@ -3607,6 +3627,13 @@ class _Lowerer:
         # The same sinks' rows, for cutting a per-row option list to the rows
         # that carry the option's kind.
         self.row_reading_sink_rows: dict[str, list[_VariantRow]] = {}
+        # Every ``RETURNS packets`` call lowered so far, in lowering order:
+        # the node it minted, what declared it, and where it was written. A
+        # COPY takes the run of them its own SELECT added and settles what
+        # encodes onto each (:meth:`_place_packet_filters`).
+        self.packet_filter_calls: list[
+            tuple[FrameRef, WasmFunction, exp.Expr, exp.Select]
+        ] = []
 
     # -- entry point ------------------------------------------------------
 
@@ -3658,15 +3685,18 @@ class _Lowerer:
             if self.fanout_count is None:
                 _check_two_pass_is_single_sink(self.graph.sinks, self.res.sinks)
         else:
+            first_filter = len(self.packet_filter_calls)
             columns = self._lower_query(self.res.branches, self.res.select, tags="sink")
+            outputs = _outputs(
+                columns,
+                self._layered_tags(),
+                self._layered_dispositions(),
+                self.minted_track_meta,
+            )
+            self._place_packet_filters(None, {}, outputs, first_filter)
             self.graph.sinks = [
                 SinkUnit(
-                    outputs=_outputs(
-                        columns,
-                        self._layered_tags(),
-                        self._layered_dispositions(),
-                        self.minted_track_meta,
-                    ),
+                    outputs=outputs,
                     tags=dict(self.container_tags),
                     chapters=self.chapters,
                     metadata=self.metadata,
@@ -3796,11 +3826,14 @@ class _Lowerer:
             raw.module_sink
         ].reads_rows_from_select
         first_sink = len(self.graph.module_sinks)
+        first_filter = len(self.packet_filter_calls)
         columns = self._lower_query(list(raw.branches), raw.query, tags="sink")
         if self.rows_file:
             return None
         if raw.module_sink:
-            self._lower_module_sink(raw, self.graph.module_sinks[first_sink:])
+            self._lower_module_sink(
+                raw, self.graph.module_sinks[first_sink:], first_filter
+            )
             return None
         variant_rows: list[_VariantRow] | None = None
         if self.manifest is not None:
@@ -3854,6 +3887,7 @@ class _Lowerer:
             path = self._derive_manifest(
                 options, option_nodes, columns, variant_rows, outputs, path, raw
             )
+        self._place_packet_filters(raw, options, outputs, first_filter)
         self._check_metadata_track_container(options, outputs, path, raw)
         self._codec_for_rows_track(options, outputs, path)
         return SinkUnit(
@@ -3898,7 +3932,9 @@ class _Lowerer:
             "else; write the streams to a media file of their own",
         )
 
-    def _lower_module_sink(self, raw: RawSink, sink_nodes: list[str]) -> None:
+    def _lower_module_sink(
+        self, raw: RawSink, sink_nodes: list[str], first_filter: int = 0
+    ) -> None:
         """The destination side of a COPY whose TO names a sink function.
 
         A FRAME sink takes no WITH options: the call's own value arguments
@@ -3907,11 +3943,13 @@ class _Lowerer:
         same spellings a file sink takes -- shape the stream the feeding
         ffmpeg encodes onto the edge, and the codec answers to the list the
         module's describe names. `sink_nodes` are the sink's graph nodes this
-        COPY just lowered.
+        COPY just lowered, and `first_filter` where this COPY's own packet
+        filter calls start.
         """
         declared = self.res.wasm[raw.module_sink]
         described = self.describes.get(declared.module)
         if described is None or not described.packet_sink:
+            self._no_packets_here(raw, first_filter, declared)
             if raw.options:
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,
@@ -3946,6 +3984,60 @@ class _Lowerer:
                 # The rows are the sink's product, and no path names a home
                 # for them: they ride the hosting process's own stdout.
                 self.graph.rows_sinks[node] = RowsSink(container=_ROWS_CONTAINER)
+        self._place_packet_filters_at_sink(raw, options, sink_nodes, first_filter)
+
+    def _no_packets_here(
+        self, raw: RawSink, first_filter: int, declared: WasmFunction
+    ) -> None:
+        """Refuse a packets cell written into a destination with no encoder.
+
+        A FRAME sink reads decoded frames, and what a filter hands back is the
+        encoded stream: there is no encoder in front of such a destination for
+        the filter to sit behind.
+        """
+        calls = self.packet_filter_calls[first_filter:]
+        if not calls:
+            return
+        _, filter_declared, node, select = calls[0]
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"'{declared.name}' reads decoded frames, and '{filter_declared.name}' "
+            "hands back the encoded stream",
+            node,
+            fallback=select,
+            hint="a packet filter sits behind an encoder; write it into a file "
+            "destination, or into a sink that reads encoded packets",
+        )
+
+    def _place_packet_filters_at_sink(
+        self,
+        raw: RawSink,
+        options: dict[str, object],
+        sink_nodes: list[str],
+        first_filter: int,
+    ) -> None:
+        """Settle the encoder in front of each filter feeding a packet sink.
+
+        The sink's own ``WITH`` is the encoder's, exactly as it is without the
+        filter; what the filter hands the sink is a stream copy, so the sink's
+        pads keep the options only as the record of what shaped the stream.
+        A filter whose pad reaches no sink input is refused where a file
+        destination's is (:meth:`_unplaced_packets`).
+        """
+        calls = self.packet_filter_calls[first_filter:]
+        if not calls:
+            return
+        read = {
+            ref
+            for node in sink_nodes
+            for ref in self.graph.nodes[node].inputs
+        }
+        for ref, declared, node, select in calls:
+            if ref not in read:
+                raise self._unplaced_packets(ref, declared, node, select)
+            self.graph.packet_filters[ref] = self._packet_filter_pads(
+                ref, declared, node, select, dict(options), _asked_scopes(raw)
+            )
 
     def _packet_sink_pads(
         self,
@@ -12648,6 +12740,17 @@ class _Lowerer:
                 hint=f"declare '{declared.name}' as RETURNS packets and write "
                 "it as a column of a COPY's SELECT",
             )
+        if described.reads_annotations or declared.reads is not None:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"the module '{declared.module}' reads rows beside its "
+                "packets, and no query writes them where it could read them",
+                node,
+                fallback=select,
+                hint="a filter's rows reach the sidecar as a file written "
+                "before it starts, and nothing emits one yet; rewrite the "
+                "stream with a tool after the COPY",
+            )
         kind = declared.stream_kind
         accepted = described.sink_codecs(kind)
         carried = WIRE_AUDIO_CODECS if kind == "audio" else WIRE_VIDEO_CODECS
@@ -13390,7 +13493,7 @@ class _Lowerer:
                 f"{declared.signature}",
             )
         if declared.is_packets:
-            return self._lower_packets_call(declared, node, select)
+            self._check_packets_position(declared, node, select)
         if declared.is_sink:
             return self._lower_sink_call(node, declared, described, call, env, select)
         kind = declared.stream_kind
@@ -13458,6 +13561,10 @@ class _Lowerer:
                 [kind],
                 reads_annotations=declared.reads is not None,
             )
+            if declared.is_packets:
+                # The destination settles what encodes onto this node's input
+                # edge; the record here is what it looks the node up by.
+                self.packet_filter_calls.append((ref, declared, node, select))
             return ref
 
         lowered = self._expand_call(
@@ -13475,30 +13582,278 @@ class _Lowerer:
         )
         return lowered
 
-    def _lower_packets_call(
+    def _check_packets_position(
         self,
         declared: WasmFunction,
         node: exp.Expr,
         select: exp.Select,
-    ) -> _Value:
-        """A ``RETURNS packets`` call, checked and then refused.
+    ) -> None:
+        """Where a ``RETURNS packets`` call may be written.
 
         The declaration and the module are paired by the time this runs
-        (:meth:`_check_packet_filter`), so what is left is where the call
-        sits, and no part of the planner puts one anywhere yet: a filter
-        belongs between the encoder a destination places and the muxer that
-        reads it, and nothing builds that shape. Refusing here rather than
-        further in is what keeps the message about the query.
+        (:meth:`_check_packet_filter`); what is left is the position. Packets
+        exist only where a destination encodes them, so the call is a cell of
+        a COPY's SELECT over a media destination and nowhere else. The two
+        positions refused here are the ones no later pass could name: a table
+        query runs no ffmpeg at all, and a rows file holds no stream. What is
+        left -- a cell something downstream reads, a cell of a destination
+        that places no encoder -- the destination itself settles
+        (:meth:`_place_packet_filters`).
         """
-        raise _error(
+        if self.table_mode:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"a table query runs no ffmpeg, and '{declared.name}' reads "
+                "what one encoded",
+                node,
+                fallback=select,
+                hint="write the call as a cell of a COPY's SELECT, whose "
+                "destination is what encodes the packets it reads",
+            )
+        if self.rows_file:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"'{self.rows_file}' is a rows file, and '{declared.name}' "
+                "hands back a stream",
+                node,
+                fallback=select,
+                hint="a rows file holds one module's annotation column; write "
+                "the packets to a media destination instead",
+            )
+        if self.manifest is not None:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"'{declared.name}' filters one encoded stream, and a "
+                f"{self.manifest} destination writes a ladder of them",
+                node,
+                fallback=select,
+                hint="write the renditions to files of their own, filtering "
+                "each, or drop the filter from the manifest's COPY",
+            )
+
+    def _place_packet_filters(
+        self,
+        raw: RawSink | None,
+        options: dict[str, object],
+        outputs: list[Output],
+        first: int,
+    ) -> None:
+        """Settle what encodes onto each packet filter this COPY wrote.
+
+        A filter reads the encoder its destination would have placed anyway,
+        so the encoder moves one process upstream and the destination copies
+        what comes back. The COPY's own ``WITH`` options shape that encoder,
+        exactly as they would have shaped the destination's: they are read
+        off `options` here and taken OUT of it, since the stream reaching the
+        destination is now a stream copy and an encoder option written over
+        one is an instruction to re-encode.
+
+        `first` is where this COPY's own calls start in `packet_filter_calls`.
+        `outputs` are the unit's, already built: a packets cell has to be one
+        of them, which is what says nothing downstream read it.
+        """
+        calls = self.packet_filter_calls[first:]
+        if not calls:
+            return
+        placed = {output.ref for output in outputs}
+        for ref, declared, node, select in calls:
+            if ref not in placed:
+                raise self._unplaced_packets(ref, declared, node, select)
+        kinds = {
+            ref_type(self.graph, ref) for ref, _, _, _ in calls
+        }
+        for kind in sorted(kinds):
+            loose = next(
+                (
+                    output
+                    for output in outputs
+                    if output.type == kind
+                    and output.ref not in {ref for ref, _, _, _ in calls}
+                ),
+                None,
+            )
+            if loose is None:
+                continue
+            _, declared, node, select = calls[0]
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"'{declared.name}' encodes the {kind} it filters one process "
+                f"ahead of the destination, and {_named_output(loose)} is "
+                "written there with the same options",
+                node,
+                fallback=select,
+                hint=f"write one COPY per destination, or filter every {kind} "
+                "column this one selects",
+            )
+        if options.get("two_pass"):
+            _, declared, node, select = calls[0]
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"a two-pass encode runs twice, and '{declared.name}' reads "
+                "one pass's packets",
+                node,
+                fallback=select,
+                hint="drop two_pass, or run the filter over a single-pass "
+                "encode",
+            )
+        moved = {
+            name
+            for name in options
+            if SINK_OPTIONS[name].scope in kinds
+        }
+        for ref, declared, node, select in calls:
+            self.graph.packet_filters[ref] = self._packet_filter_pads(
+                ref,
+                declared,
+                node,
+                select,
+                {name: options[name] for name in moved},
+                _asked_scopes(raw),
+            )
+        for name in moved:
+            del options[name]
+
+    def _packet_filter_pads(
+        self,
+        ref: FrameRef,
+        declared: WasmFunction,
+        node: exp.Expr,
+        select: exp.Select,
+        options: dict[str, object],
+        asked: frozenset[str],
+    ) -> list[dict[str, object]]:
+        """One filter node's encoder options, pad by pad.
+
+        The shape :attr:`Graph.packet_sinks` carries, built the same way: the
+        options of a pad's own kind, a per-row value indexed by the pad's
+        place among the pads of that kind, and `<kind>_codec` always present.
+        A pad of a kind the COPY wrote no option for, whose stream is an
+        unmodified probed one already in a codec the module accepts, COPIES
+        instead -- which is what lets a filter weave into a file that is
+        already encoded without touching a picture.
+        """
+        described = self.describes[declared.module]
+        inputs = self.graph.nodes[ref].inputs
+        seen: dict[str, int] = {}
+        pads: list[dict[str, object]] = []
+        for input_ref in inputs:
+            kind = ref_type(self.graph, input_ref)
+            index = seen.get(kind, 0)
+            seen[kind] = index + 1
+            if kind not in asked and self._copies_onto_sink(input_ref, kind, described):
+                pads.append({f"{kind}_codec": COPY_CODEC})
+                continue
+            pad = {
+                name: value[index] if isinstance(value, list) else value
+                for name, value in options.items()
+                if SINK_OPTIONS[name].scope == kind
+            }
+            self._packet_filter_codec(pad, kind, declared, described, node, select)
+            pads.append(pad)
+        return pads
+
+    def _packet_filter_codec(
+        self,
+        pad: dict[str, object],
+        kind: StreamType,
+        declared: WasmFunction,
+        described: Described,
+        node: exp.Expr,
+        select: exp.Select,
+    ) -> None:
+        """`<kind>_codec` settled for one pad, written or filled.
+
+        The rule a packet sink's own codec follows: a written encoder has to
+        write a codec both the module accepts and the sidecar's packets
+        travel in, and an unwritten one takes the module's first preference.
+        """
+        name = f"{kind}_codec"
+        accepted = described.sink_codecs(kind)
+        carried = WIRE_AUDIO_CODECS if kind == "audio" else WIRE_VIDEO_CODECS
+        encoders = AUDIO_CODEC_ENCODERS if kind == "audio" else CODEC_ENCODERS
+        reads = audio_encoder_codec if kind == "audio" else encoder_codec
+        written = pad.get(name)
+        if isinstance(written, str):
+            codec = reads(written)
+            if codec is None or codec not in carried:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"the stream into '{declared.name}' travels as "
+                    f"{_join_codecs(carried)}, and '{written}' encodes none of "
+                    "them",
+                    node,
+                    fallback=select,
+                    hint="name an encoder for one of them, e.g. "
+                    + ", ".join(encoders.values()),
+                )
+            if accepted and codec not in accepted:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"'{written}' writes {codec}, and the module "
+                    f"'{declared.module}' rewrites {_join_codecs(accepted)}",
+                    node,
+                    fallback=select,
+                    hint=f"name an encoder for {_join_codecs(accepted)}, or "
+                    f"drop {name} to take the module's preference",
+                )
+            return
+        codec = next(
+            (c for c in accepted if c in carried), carried[0] if not accepted else None
+        )
+        if codec is None:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"the module '{declared.module}' rewrites "
+                f"{_join_codecs(accepted)} {kind}, and the stream edge carries "
+                f"{_join_codecs(carried)}",
+                node,
+                fallback=select,
+                hint="the module has to accept one of the codecs the "
+                "sidecar's packets travel in",
+            )
+        pad[name] = encoders[codec]
+
+    def _unplaced_packets(
+        self,
+        ref: FrameRef,
+        declared: WasmFunction,
+        node: exp.Expr,
+        select: exp.Select,
+    ) -> FfrwdError:
+        """Why this packets cell is nowhere a filter can sit.
+
+        Either something downstream reads it -- an ffmpeg filter takes frames,
+        and what comes back here is the encoded stream -- or the cell reached
+        no output of the destination at all.
+        """
+        reader = next(
+            (
+                other
+                for name, other in self.graph.nodes.items()
+                if name != ref
+                and any(_reads_node(taken, ref) for taken in other.inputs)
+            ),
+            None,
+        )
+        if reader is not None:
+            return _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"ffmpeg filters read frames, and '{declared.name}' hands back "
+                "the encoded stream",
+                node,
+                fallback=select,
+                hint=f"filter the stream first and write '{declared.name}' "
+                "over what comes out: a packet filter is the last thing a "
+                "COPY's column does",
+            )
+        return _error(
             ErrorCode.UNSUPPORTED_SQL,
-            f"'{declared.name}' returns packets, and no destination places a "
-            "packet filter yet",
+            f"'{declared.name}' returns packets, and this column writes none "
+            "to the destination",
             node,
             fallback=select,
-            hint="a packet filter belongs between the encoder a destination "
-            "places and what reads it; nothing builds that shape yet, so "
-            "weave the stream with the ffrwd-index tool after the COPY",
+            hint="write the call as a column of the COPY's SELECT, so the "
+            "destination has packets to mux",
         )
 
     def _lower_sink_call(

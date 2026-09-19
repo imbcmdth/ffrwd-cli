@@ -664,6 +664,14 @@ class Graph:
     # a rendition ladder shapes each of them differently. `video_codec` is
     # always present in each. Every key here is also in `module_sinks`.
     packet_sinks: dict[str, list[dict[str, object]]] = field(default_factory=dict)
+    # Node id -> the validated encoder options shaping each stream a PACKET
+    # FILTER reads, one dict per PAD in pad order, exactly as `packet_sinks`
+    # holds them: a filter sits behind the encoder its destination would have
+    # placed, so the options are the destination's own. A pad whose stream
+    # reaches the filter unmodified and already in a codec it accepts carries
+    # `<kind>_codec: copy` instead, and nothing re-encodes it. Unlike a packet
+    # sink, the node hands its packets on, so it is in no other table here.
+    packet_filters: dict[str, list[dict[str, object]]] = field(default_factory=dict)
     # Alias -> the RETURNS source module bound to it. Not a key of `sources`:
     # its bytes never come from a real `-i`, so the partitioner gives it a
     # sidecar of its own rather than an input slot.
@@ -719,6 +727,11 @@ class Graph:
             d["packet_sinks"] = {
                 name: [dict(pad) for pad in pads]
                 for name, pads in self.packet_sinks.items()
+            }
+        if self.packet_filters:
+            d["packet_filters"] = {
+                name: [dict(pad) for pad in pads]
+                for name, pads in self.packet_filters.items()
             }
         if self.module_sources:
             d["module_sources"] = {
@@ -796,6 +809,14 @@ class Graph:
                 assert isinstance(pads, list)
                 packet_sinks[str(name)] = [dict(pad) for pad in pads]
 
+        raw_packet_filters = d.get("packet_filters")
+        packet_filters: dict[str, list[dict[str, object]]] = {}
+        if raw_packet_filters is not None:
+            assert isinstance(raw_packet_filters, dict)
+            for name, pads in raw_packet_filters.items():
+                assert isinstance(pads, list)
+                packet_filters[str(name)] = [dict(pad) for pad in pads]
+
         raw_module_sources = d.get("module_sources")
         module_sources: dict[str, ModuleSource] = {}
         if raw_module_sources is not None:
@@ -828,6 +849,7 @@ class Graph:
             rows_sinks=rows_sinks,
             module_sinks=module_sinks,
             packet_sinks=packet_sinks,
+            packet_filters=packet_filters,
             module_sources=module_sources,
             url_sources=url_sources,
             dropped_aliases=dropped_aliases,

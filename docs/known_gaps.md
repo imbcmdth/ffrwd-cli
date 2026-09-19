@@ -28,12 +28,20 @@ output is plain ffmpeg, so the two mix freely in a script.
 - Options typed `binary` or `dictionary`: setting one is
   `FILTER_OPTION_TYPE`; the filter's other options work.
 - Runtime filter commands (`sendcmd`, `zmq`).
-- A wasm module exporting `packet-filter`, at any destination. The
-  sidecar hosts one, `ffrwd` reads its describe and `RETURNS packets`
-  declares one, so a package carrying one installs, lists and
-  type-checks; what no destination has yet is the shape a filter sits
-  in -- encoder, filter, muxer -- so the call itself is
-  `UNSUPPORTED_SQL` saying so.
+- A wasm module exporting `packet-filter` that READS ROWS. The
+  placement is there -- a `RETURNS packets` call in a COPY's SELECT
+  compiles to encoder, filter, muxer -- but the rows such a filter reads
+  have no spelling: they reach the sidecar on `-rows-in`, which needs a
+  rows file the plan writes before the filter's stage starts, and
+  nothing emits one. A module declaring `reads-rows`, and a declaration
+  with an annotation parameter, are `UNSUPPORTED_SQL` at the call. Rows
+  arriving on a pipe while the packets flow is further out still.
+- A packet filter at a MANIFEST destination. One filter instance per
+  rendition row is the shape it would take, and the planner treats each
+  pad as its own encoded stream already; what is missing is a manifest
+  destination that accepts a filtered column. A packets cell at one is
+  `UNSUPPORTED_SQL`. A filter in front of a `RETURNS sink` packet sink
+  works, ladder or not.
 
 ## Sharp edges
 
