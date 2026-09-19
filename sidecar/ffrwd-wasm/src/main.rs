@@ -1854,6 +1854,33 @@ fn run_packet_filter(args: &Args, module: &str, params: &str) -> Result<()> {
         );
     }
 
+    // The rows reader starts here, with the pad readers and before the
+    // module is opened. Starting it after the open is a race the rows lose:
+    // the pads have been filling their queues since before it, so a short
+    // input can be entirely in the module's hands by the time the first row
+    // is read, and where a module puts a row would depend on which thread
+    // won. The open still happens on the reader's own thread, since a named
+    // pipe blocks on open until its writer arrives.
+    let rows = Arc::new(RowsQueue::new());
+    let rows_from_file = match &args.rows_in {
+        Some(path) => {
+            // Decided here rather than on the reader: `metadata` answers at
+            // once where opening a pipe would block.
+            let bounded = rows_are_a_file(path);
+            let path = path.clone();
+            let queue = Arc::clone(&rows);
+            std::thread::spawn(move || match open_input(&path) {
+                Ok(reader) => read_rows(reader, &queue),
+                Err(error) => queue.fail(error.context("opening -rows-in")),
+            });
+            bounded
+        }
+        None => {
+            rows.close_input();
+            false
+        }
+    };
+
     // The readers start before anything else, for the reason a packet
     // sink's do: each drains its own input from the first byte, so a fast
     // producer is not held up by a slow one's warmup or by the module's own
@@ -1899,29 +1926,25 @@ fn run_packet_filter(args: &Args, module: &str, params: &str) -> Result<()> {
     let mut filter = runtime::PacketFilter::open(module, &inputs, params)
         .with_context(|| format!("opening module {module}"))?;
 
-    // The rows reader, once the module is open: a filter that acts on rows
-    // and is given none would run blind, so it is refused instead.
-    //
-    // The OPEN happens on the reader's own thread, the way a pad's does. A
-    // named pipe blocks on open until its writer arrives, and for a live
-    // run that writer is a stage that has not started yet; opening here
-    // would stop the packets waiting for a row.
-    let rows = Arc::new(RowsQueue::new());
-    match &args.rows_in {
-        Some(path) => {
-            let path = path.clone();
-            let queue = Arc::clone(&rows);
-            std::thread::spawn(move || match open_input(&path) {
-                Ok(reader) => read_rows(reader, &queue),
-                Err(error) => queue.fail(error.context("opening -rows-in")),
-            });
-        }
-        None if filter.reads_rows() => bail!(
+    // A filter that acts on rows and is given none would run blind, so it
+    // is refused instead. The reader itself started above.
+    if args.rows_in.is_none() && filter.reads_rows() {
+        bail!(
             "{} reads the rows woven into its packets, and this command gives it none; \
              name them with -rows-in <path>",
             filter.name()
-        ),
-        None => rows.close_input(),
+        );
+    }
+
+    // A FILE's rows are all there to be read, so they are read before the
+    // first call rather than raced against it: a module is handed every row
+    // that fits in the queue before it sees packet one, and where a record
+    // lands is the module's decision rather than the scheduler's. A file
+    // whose rows outrun the queue's bound fills it, and the rest arrive as
+    // the module drains it. Nothing waits on a pipe or on stdin: nothing
+    // says when their rows arrive, and packets do not stop for them.
+    if rows_from_file {
+        rows.settle()?;
     }
 
     // One writer per output, each on its own pipe: a reader opens its inputs
@@ -2060,6 +2083,22 @@ impl RowsQueue {
         }
     }
 
+    /// Waits until a FILE's rows are all in hand, or until the queue is at
+    /// its byte bound and the reader can hold no more. Called only for a
+    /// regular file, whose end always comes.
+    fn settle(&self) -> Result<()> {
+        let mut state = self.state.lock().expect("the reader holds no panic");
+        loop {
+            if let Some(error) = state.failed.take() {
+                return Err(error);
+            }
+            if state.closed || state.bytes >= ROWS_BUFFER_BYTES {
+                return Ok(());
+            }
+            state = self.filled.wait(state).expect("the reader holds no panic");
+        }
+    }
+
     /// Everything read so far, and whether the input has ended. Never waits.
     fn take(&self) -> Result<(Vec<String>, bool)> {
         let mut state = self.state.lock().expect("the reader holds no panic");
@@ -2117,6 +2156,18 @@ impl RowsQueue {
     }
 }
 
+/// Whether `-rows-in` names a REGULAR FILE, whose rows are all written and
+/// waiting to be read. A pipe, a named pipe and stdin are not: nothing says
+/// when their rows arrive. `metadata` answers at once for all of them, where
+/// opening a pipe blocks until its writer arrives.
+fn rows_are_a_file(path: &InputPath) -> bool {
+    match path {
+        InputPath::Stdin => false,
+        InputPath::File(p) if is_named_pipe(p) => false,
+        InputPath::File(p) => std::fs::metadata(p).is_ok_and(|m| m.is_file()),
+    }
+}
+
 /// One rows reader: blocking line reads off the rows input, each non-blank
 /// line into the queue, waiting whenever the queue is over its byte bound.
 fn read_rows(reader: InputReader, queue: &RowsQueue) {
@@ -2136,6 +2187,8 @@ fn read_rows(reader: InputReader, queue: &RowsQueue) {
                 }
                 state.bytes += row.len();
                 state.rows.push(row);
+                // `settle` waits on this too, for the file whose rows fill
+                // the queue before they run out.
                 queue.filled.notify_all();
             }
             Err(error) => {
@@ -3588,6 +3641,74 @@ fn main() {
     if let Err(e) = run(&args) {
         eprintln!("ffrwd-wasm: {e:#}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod rows_queue_tests {
+    use std::fs::File;
+    use std::sync::Arc;
+
+    use super::{read_rows, rows_are_a_file, InputPath, InputReader, RowsQueue};
+
+    /// A path of this test's own, removed first so a rerun starts clean.
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("ffrwd_rows_{}_{name}", std::process::id()));
+        std::fs::remove_file(&path).ok();
+        path
+    }
+
+    #[test]
+    fn settle_waits_for_a_files_rows_where_take_would_not() {
+        // The whole of the file guarantee, without a race to lose: the reader
+        // is held back long enough that nothing could have been read when the
+        // wait begins, so a `settle` that returns with every row in hand can
+        // only have waited for them. `take` is what the drive loop calls
+        // between packets, and it is what must NOT wait.
+        let queue = Arc::new(RowsQueue::new());
+        let path = scratch("settle.ndjson");
+        std::fs::write(&path, "{\"a\":1}\n{\"a\":2}\n{\"a\":3}\n").expect("write the rows");
+
+        let (taken, closed) = queue.take().expect("no failure yet");
+        assert!(taken.is_empty(), "nothing has been read");
+        assert!(!closed, "and the input has not ended");
+
+        let reading = Arc::clone(&queue);
+        let opened = path.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let file = File::open(&opened).expect("open the rows file");
+            read_rows(InputReader::File(file), &reading);
+        });
+
+        queue.settle().expect("a file always reaches its end");
+        let (rows, closed) = queue.take().expect("no failure");
+        assert_eq!(rows.len(), 3, "every row was in hand when settle returned");
+        assert!(closed, "and the file had ended");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn only_a_regular_file_is_one_the_host_waits_for() {
+        let path = scratch("real.ndjson");
+        std::fs::write(&path, "{}\n").expect("write the rows");
+        let named = path.to_str().expect("a UTF-8 path").to_string();
+        assert!(rows_are_a_file(&InputPath::File(named)));
+
+        // Nothing says when a pipe's rows arrive, and stdin is a pipe by
+        // another name, so neither is waited for.
+        assert!(!rows_are_a_file(&InputPath::Stdin));
+        assert!(!rows_are_a_file(&InputPath::File(
+            r"\\.\pipe\rows".to_string()
+        )));
+        // Nor is a path with nothing behind it: the reader raises that.
+        assert!(!rows_are_a_file(&InputPath::File(
+            scratch("absent.ndjson")
+                .to_str()
+                .expect("a UTF-8 path")
+                .to_string()
+        )));
+        std::fs::remove_file(&path).ok();
     }
 }
 

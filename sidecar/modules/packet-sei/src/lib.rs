@@ -11,6 +11,12 @@
 //! belongs - and its pts, dts, duration and keyframe flag are handed
 //! through.
 //!
+//! The last row it writes says what it SAW of its rows: how many calls it
+//! had, how many rows arrived on the first of them, and how many arrived at
+//! all. A host that starts reading rows only once the module is open leaves
+//! the first number short of the last, and where a note lands then depends
+//! on which thread won rather than on what the module decided.
+//!
 //! It also runs a one-packet lag on every pad: each call releases the
 //! packets it held from the call before and holds the ones it was just
 //! given, with the last call flushing. Nothing needs the lag; it is here so
@@ -32,7 +38,7 @@ use exports::ffrwd::av::packet_filter::{
 use serde::{Deserialize, Serialize};
 
 const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{},"additionalProperties":false}"#;
-const ROWS_SCHEMA: &str = r#"{"type":"object","properties":{"pad":{"type":"integer"},"pts":{"type":"integer"},"notes":{"type":"integer"},"bytes":{"type":"integer"}},"additionalProperties":false}"#;
+const ROWS_SCHEMA: &str = r#"{"type":"object","properties":{"pad":{"type":"integer"},"pts":{"type":"integer"},"notes":{"type":"integer"},"bytes":{"type":"integer"},"calls":{"type":"integer"},"rows_first_call":{"type":"integer"},"rows_total":{"type":"integer"},"note":{"type":"string"},"woven":{"type":"boolean"}}}"#;
 
 /// The unit's own name, 16 bytes of `uuid_iso_iec_11578`. Chosen with no
 /// zero byte in it so nothing in the message can start an emulation
@@ -66,6 +72,22 @@ struct State {
     held: Vec<Vec<Packet>>,
     /// Notes not yet woven in, oldest first.
     pending: Vec<NoteRow>,
+    /// How many `process` calls this instance has had.
+    calls: u64,
+    /// How many rows arrived on the FIRST call, and how many over the whole
+    /// run. A host that starts reading rows after the packets are already
+    /// queued leaves the first number short of the second, and where a note
+    /// lands then depends on which thread won.
+    rows_first_call: u64,
+    rows_total: u64,
+}
+
+/// What the instance saw of its rows, emitted once at the end.
+#[derive(Serialize)]
+struct ArrivalRow {
+    calls: u64,
+    rows_first_call: u64,
+    rows_total: u64,
 }
 
 thread_local! {
@@ -183,7 +205,7 @@ impl Guest for PacketSei {
             *s.borrow_mut() = State {
                 pads: streams.len(),
                 held: vec![Vec::new(); streams.len()],
-                pending: Vec::new(),
+                ..State::default()
             }
         });
         // Nothing out of band changes: the SPS and PPS the stream opened
@@ -198,6 +220,11 @@ impl Guest for PacketSei {
     fn process(pads: Vec<PadPackets>, rows: Vec<String>, last: bool) -> Filtered {
         STATE.with(|held| {
             let mut state = held.borrow_mut();
+            state.calls += 1;
+            state.rows_total += rows.len() as u64;
+            if state.calls == 1 {
+                state.rows_first_call = rows.len() as u64;
+            }
             // A row this module cannot read is dropped rather than guessed
             // at; the rows it writes say how many it used.
             for row in &rows {
@@ -227,26 +254,33 @@ impl Guest for PacketSei {
                     state.pending = pending;
                 }
             }
+            let mut trailing = Vec::new();
+            if last {
+                // Notes no keyframe came along to carry are reported as they
+                // were written, so nothing a caller sent goes unaccounted.
+                for note in std::mem::take(&mut state.pending) {
+                    trailing.push(
+                        serde_json::to_string(&serde_json::json!({
+                            "pts": note.pts,
+                            "note": note.note,
+                            "woven": false
+                        }))
+                        .expect("a trailing row serializes"),
+                    );
+                }
+                trailing.push(
+                    serde_json::to_string(&ArrivalRow {
+                        calls: state.calls,
+                        rows_first_call: state.rows_first_call,
+                        rows_total: state.rows_total,
+                    })
+                    .expect("an arrival row serializes"),
+                );
+            }
             Filtered {
                 pads: out,
                 rows: written,
-                // Notes no keyframe came along to carry are reported as they
-                // were written, so nothing a caller sent goes unaccounted.
-                trailing: if last {
-                    std::mem::take(&mut state.pending)
-                        .into_iter()
-                        .map(|r| {
-                            serde_json::to_string(&serde_json::json!({
-                                "pts": r.pts,
-                                "note": r.note,
-                                "woven": false
-                            }))
-                            .expect("a trailing row serializes")
-                        })
-                        .collect()
-                } else {
-                    Vec::new()
-                },
+                trailing,
             }
         })
     }

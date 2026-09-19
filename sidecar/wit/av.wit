@@ -594,10 +594,24 @@ interface packet-filter {
   /// packets are not frames, so nothing pairs a pad's packet with another
   /// pad's, and a call may carry packets on some pads and none on others.
   ///
-  /// `rows` is whatever the host had ready, which may be none while packets
-  /// flow and may be many at once; they arrive in the order they were
-  /// written and never arrive twice. A module needing a row's time reads it
-  /// out of the row.
+  /// `rows` is whatever the host had ready. They arrive in the order they
+  /// were written and never arrive twice, and a module needing a row's time
+  /// reads it out of the row. WHEN they arrive depends on where they come
+  /// from, and a module may rely on this much:
+  ///
+  /// - From a FILE, every row is in hand before the first call, as many as
+  ///   the host's own buffer holds. A file whose rows outrun that buffer
+  ///   fills it, and the rest arrive over the calls that follow as the
+  ///   module takes them. So a filter fed a file of any ordinary size sees
+  ///   the lot before packet one, and one fed a very large file sees them in
+  ///   order as it drains them.
+  /// - From a PIPE, they arrive whenever they are written, which may be none
+  ///   for many calls and many at once. Packets never wait on a pipe: a live
+  ///   run whose rows are still being produced keeps flowing.
+  ///
+  /// Either way nothing pairs a row with a packet, and a module that needs
+  /// every row before it commits to anything holds its packets back until
+  /// the call that brings them.
   ///
   /// `last` marks the final call of the instance's life: it carries whatever
   /// packets and rows are left, which may be none of either, and happens

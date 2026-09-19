@@ -515,11 +515,7 @@ fn rows_reach_a_filter_and_the_packets_it_rewrote_still_decode() {
         run.stderr
     );
 
-    let emitted: Vec<serde_json::Value> = run
-        .stdout
-        .lines()
-        .map(|line| serde_json::from_str(line).expect("packet_sei emits one JSON row per line"))
-        .collect();
+    let (emitted, summary) = sei_rows(&run.stdout);
     assert!(
         !emitted.is_empty(),
         "the filter reported no woven rows, so no row reached it:\n{}",
@@ -530,11 +526,9 @@ fn rows_reach_a_filter_and_the_packets_it_rewrote_still_decode() {
         .map(|row| row["notes"].as_u64().expect("a note count"))
         .sum();
     assert_eq!(woven, 2, "both notes were woven in");
-    assert!(
-        emitted
-            .iter()
-            .all(|row| row["woven"] != serde_json::json!(false)),
-        "a note was left with no keyframe to ride:\n{}",
+    assert_eq!(
+        summary["rows_total"], 2,
+        "both rows reached the module:\n{}",
         run.stdout
     );
 
@@ -560,7 +554,7 @@ fn rows_reach_a_filter_and_the_packets_it_rewrote_still_decode() {
             grew += 1;
         }
     }
-    assert_eq!(grew, emitted.len(), "one rewritten packet per reported row");
+    assert_eq!(grew, emitted.len(), "one rewritten packet per woven row");
 
     // Through a real muxer with -c copy, and decoded: the pictures are the
     // pictures the encoder wrote, whatever rode beside them.
@@ -670,6 +664,96 @@ fn a_rows_input_that_cannot_be_opened_stops_the_run() {
         run.stderr
     );
     std::fs::remove_file(&unwritten).ok();
+}
+
+/// `packet_sei`'s rows, split into the woven ones and the single summary
+/// the last call carries. A leftover note - one no keyframe came along to
+/// carry - is neither, and fails the split: nothing a caller sent should go
+/// unwoven in these tests.
+fn sei_rows(stdout: &str) -> (Vec<serde_json::Value>, serde_json::Value) {
+    let mut woven = Vec::new();
+    let mut summary = None;
+    for line in stdout.lines() {
+        let row: serde_json::Value =
+            serde_json::from_str(line).expect("packet_sei emits one JSON row per line");
+        if row.get("calls").is_some() {
+            assert!(summary.is_none(), "one summary row, not two:\n{stdout}");
+            summary = Some(row);
+        } else if row.get("notes").is_some() {
+            woven.push(row);
+        } else {
+            panic!("a note was left with no keyframe to ride:\n{stdout}");
+        }
+    }
+    (woven, summary.expect("the last call carries a summary row"))
+}
+
+#[test]
+fn a_files_rows_are_all_in_hand_before_the_first_packet() {
+    // The rows reader starts with the pad readers, not after the module is
+    // open, and a FILE's rows are read to the end before the first call. Run
+    // after the open, the reader loses the race on an input this short: the
+    // pads fill their queues while the module is still being instantiated,
+    // and the rows turn up call by call or not until the last one.
+    //
+    // Repeated, because a race that comes out right once has proven nothing:
+    // every run has to put every row on call one.
+    let module = module_path("packet_sei");
+    let rows = scratch("first_call.ndjson");
+    let written = scratch("first_call.nut");
+    // Enough rows that reading them is not instantaneous. Three would be
+    // in hand before the module finished opening whatever the host did,
+    // and a test that cannot tell the two orderings apart proves nothing.
+    // They all sit at pts 0, so the first keyframe carries the lot.
+    const NOTES: usize = 4000;
+    let mut text = String::new();
+    for index in 0..NOTES {
+        text.push_str(&format!("{{\"pts\":0,\"note\":\"note-{index:06}\"}}\n"));
+    }
+    std::fs::write(&rows, &text).expect("write the rows file");
+
+    for attempt in 1..=5 {
+        let run = run_ffrwd_wasm(
+            &[
+                "-f",
+                "nut",
+                "-i",
+                fixture_path().to_str().expect("fixture path is UTF-8"),
+                "-m",
+                module.to_str().expect("module path is UTF-8"),
+                "-rows-in",
+                rows.to_str().expect("rows path is UTF-8"),
+                "-f",
+                "nut",
+                written.to_str().expect("output path is UTF-8"),
+                "-f",
+                "ndjson",
+                "-",
+            ],
+            &[],
+        );
+        assert!(
+            run.output.status.success(),
+            "attempt {attempt} exited with {:?}\nstderr:\n{}",
+            run.output.status.code(),
+            run.stderr
+        );
+        let (_, summary) = sei_rows(&run.stdout);
+        assert_eq!(
+            summary["rows_total"], NOTES,
+            "attempt {attempt}: every row reached the module\n{}",
+            run.stdout
+        );
+        assert_eq!(
+            summary["rows_first_call"], NOTES,
+            "attempt {attempt}: every row was there before the first packet\n{}",
+            run.stdout
+        );
+    }
+
+    for path in [&rows, &written] {
+        std::fs::remove_file(path).ok();
+    }
 }
 
 #[test]
