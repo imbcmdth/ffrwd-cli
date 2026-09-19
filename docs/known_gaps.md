@@ -62,12 +62,6 @@ output is plain ffmpeg, so the two mix freely in a script.
   (`-discard nokey`) would save the read too, but on mov it reports the
   wrong presentation times for a stream that reorders frames, which
   would put the rows on a different clock from the rest of the query.
-- **A row predicate compares a column against a literal.** That is the
-  whole `WHERE` grammar over any row table, packet rows included, so
-  `WHERE cos_similarity(v.vector, <prompt>) > 0.5` is
-  `UNSUPPORTED_SQL`. Rank in a CTE instead - `ORDER BY
-  cos_similarity(...) DESC LIMIT n` - and read the survivors outside
-  it ([recipe 135](corpus.md#135-rank-in-a-cte-stitch-in-time-order)).
 - **A sidecar process reads one stream and writes one.** A region of
   modules can fan out and fan in as much as it likes inside itself,
   but its BOUNDARY is one pipe each way: only stdin and stdout are

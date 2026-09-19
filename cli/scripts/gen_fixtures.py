@@ -379,6 +379,9 @@ def _generate_keys() -> None:
     case where a copy's timestamps and the file's own presentation clock come
     apart unless the copy is written to keep them together.
 
+    It carries audio too, so a query can trim video and audio by the same
+    rows -- the shape a search over a file's own vectors writes.
+
     `keys.mkv` is the same encode remuxed, not a second one -- the two files
     carry the same packets, so a read of one is comparable with a read of the
     other, which is what makes the container the only variable.
@@ -387,8 +390,10 @@ def _generate_keys() -> None:
         FIXTURES_DIR / _KEYS_NAME,
         [
             "-f", "lavfi", "-i", f"testsrc2=duration={_DURATION}:size={_SIZE}:rate={_RATE}",
+            "-f", "lavfi", "-i", f"sine=frequency=440:duration={_DURATION}",
             "-c:v", "libx264", "-g", str(_KEYS_GOP), "-bf", str(_KEYS_BFRAMES),
             "-pix_fmt", "yuv420p",
+            "-shortest",
         ],
     )
     _run(

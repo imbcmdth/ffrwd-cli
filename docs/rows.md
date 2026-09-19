@@ -77,6 +77,8 @@ CREATE FUNCTION records(v video_stream)
 
 The declaration is the shape. A column it names that the module never writes is refused at the call; a column the module writes that it does not name is not this alias's to expose; a column a row leaves out reads NULL. `vector` is a column type here as it is in any record, so a vector read out of a stream compares through `cos_similarity` like one a value function answered - the length is checked on the two vectors handed over, not declared in advance.
 
+These are rows like any other, with the whole row grammar over them and no narrower one: `AND`/`OR`/`NOT`, `BETWEEN`, `IS [NOT] NULL`, a bare boolean column, a built-in or a wasm value function over a column on either side of a comparison, a bound that came in as a variable, `ORDER BY` and `LIMIT`, joins, `array_agg`, and a `UNION ALL` of two branches reading the same stream under different predicates. A search is that shape: narrow to one space, score what is left against a prompt, and trim video and audio by the rows that survive ([recipe 138](corpus.md#138-read-a-streams-own-packets-while-compiling)).
+
 The argument is one stream of an `input('path')` written earlier in the same FROM, and only that: a compile-time read opens the file and reads the stream's own packets, so a filtered stream, or one another query stage built, is refused, and a live input is refused saying it is read at run time instead.
 
 How much of the stream is copied is the module's own `wants` - all of it, the keyframes, or the first packet - and a host may hand over more than was asked for, never less. The read is memoized per file, stream, module, parameters and `wants`, so a query naming several of the alias's columns reads once.

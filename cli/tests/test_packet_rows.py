@@ -23,7 +23,7 @@ from pathlib import Path
 import pytest
 
 from ffrwd import binaries
-from ffrwd.compiler import compile_table_sql
+from ffrwd.compiler import compile_sql, compile_table_sql
 from ffrwd.emit import build_ffmpeg_args, emit
 from ffrwd.errors import ErrorCode, FfrwdError
 from ffrwd.ir import Graph
@@ -32,6 +32,7 @@ from ffrwd.parser import parse, resolve
 from ffrwd.probe import ProbeResult, StreamMeta, clear_cache
 from ffrwd.registry import load_reference
 from ffrwd.split import insert_splits
+from ffrwd.vars import substitute
 from ffrwd.wasm import (
     WORLDS,
     Described,
@@ -133,21 +134,25 @@ _PROMPT_DECLARE = (
 def _prompt_described() -> Described:
     return Described(
         world=WORLDS[-1],
-        functions=(
+        functions=tuple(
             DescribedFunction(
-                name="prompt",
+                name=name,
                 params_schema={"properties": {"words": {"type": "string"}}},
                 result_schema={"type": "array", "items": {"type": "number"}},
-            ),
+            )
+            for name in ("prompt", "embed_text", "embed_clip_text")
         ),
     )
 
 
 class _Prompt:
-    """A fake `invoke` answering one fixed vector, whatever it is asked."""
+    """A fake `invoke`: one vector per export, so two spaces are two answers."""
 
-    def __init__(self, vector: list[float]) -> None:
+    def __init__(
+        self, vector: list[float], per_export: dict[str, list[float]] | None = None
+    ) -> None:
         self.vector = vector
+        self.per_export = per_export or {}
 
     def __call__(
         self,
@@ -156,7 +161,7 @@ class _Prompt:
         args: dict[str, object],
         described: Described | None = None,
     ) -> object:
-        return self.vector
+        return self.per_export.get(export, self.vector)
 
 
 class _Fails:
@@ -298,6 +303,150 @@ def test_where_over_the_rows_shapes_the_graph() -> None:
     assert "trim=start=1.5:end=2.0" in printed
     assert "trim=start=3.0:end=3.5" in printed
     assert "trim=start=0.0" not in printed
+
+
+# The shape `ffrwd/describe`'s find recipe writes, with packet rows standing
+# where `unnest(f.embeddings)` stands today: two spaces kept apart in two
+# UNION ALL branches, each narrowed to its own space by an AND before its own
+# `cos_similarity`, so neither prompt is ever scored against the other's rows.
+_FIND_DECLARE = (
+    "CREATE FUNCTION keys(v video_stream)\n"
+    "RETURNS STRUCT(space number, label text, start_t number, end_t number,\n"
+    "               vector vector)[]\n"
+    f"  AS '{_MODULE}', 'keys' LANGUAGE wasm;\n"
+    "CREATE FUNCTION embed_text(words text) RETURNS vector\n"
+    f"  AS '{_PROMPT_MODULE}', 'embed_text' LANGUAGE wasm;\n"
+    "CREATE FUNCTION embed_clip_text(words text) RETURNS vector\n"
+    f"  AS '{_PROMPT_MODULE}', 'embed_clip_text' LANGUAGE wasm;\n"
+)
+
+_FIND = """COPY (
+  SELECT array_agg(ffmpeg.trim(f.video[1],  start => v.start_t, end => v.end_t)),
+         array_agg(ffmpeg.atrim(f.audio[1], start => v.start_t, end => v.end_t))
+  FROM input(:'src') f, keys(f.video[1]) v
+  WHERE v.label <> 'clip'
+    AND cos_similarity(v.vector, embed_text(:'prompt')) > :threshold
+  UNION ALL
+  SELECT array_agg(ffmpeg.trim(g.video[1],  start => w.start_t, end => w.end_t)),
+         array_agg(ffmpeg.atrim(g.audio[1], start => w.start_t, end => w.end_t))
+  FROM input(:'src') g, keys(g.video[1]) w
+  WHERE w.space = 1
+    AND cos_similarity(w.vector, embed_clip_text(:'prompt')) > :threshold
+) TO :'dest'"""
+
+# Three rows over two spaces. Against the two prompt vectors below, exactly
+# one row of each branch scores above the threshold: the speech row pointing
+# the way embed_text does, and the clip row pointing the way the other does.
+_FIND_ROWS: tuple[dict[str, object], ...] = (
+    {"space": 0, "label": "speech", "start_t": 0.0, "end_t": 1.0, "vector": [1.0, 0.0]},
+    {"space": 1, "label": "clip", "start_t": 1.0, "end_t": 2.0, "vector": [0.0, 1.0]},
+    {"space": 0, "label": "speech", "start_t": 2.0, "end_t": 3.0, "vector": [0.0, 1.0]},
+)
+
+_FIND_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "properties": {
+        "space": {"type": "integer"},
+        "label": {"type": "string"},
+        "start_t": {"type": "number"},
+        "end_t": {"type": "number"},
+        "vector": {"type": "array", "items": {"type": "number"}},
+    },
+}
+
+
+def test_the_find_recipes_shape_works_over_packet_rows() -> None:
+    """The whole point of the feature, in the shape it exists for. Packet rows
+    go through the same predicate evaluator a `unnest(f.embeddings)` row does,
+    so all of it holds at once: text `<>` and number `=` on a row column,
+    ANDed with a `cos_similarity` against a compile-time module value, against
+    a threshold that came in as a variable, in two UNION ALL branches, with
+    video AND audio trimmed by the same surviving rows."""
+    text = substitute(
+        _FIND_DECLARE + _FIND,
+        {"src": "f.mp4", "prompt": "a cat", "threshold": "0.2", "dest": "out.mkv"},
+    )
+    g = lower(
+        resolve(parse(text.text, text.unset)),
+        {"f": _probe(), "g": _probe()},
+        registry=load_reference(_SNAPSHOT_PATH),
+        describes={
+            _MODULE: replace(_described(), rows_schema=_FIND_SCHEMA),
+            _PROMPT_MODULE: _prompt_described(),
+        },
+        invoke=_Prompt(
+            [1.0, 0.0],
+            {"embed_text": [1.0, 0.0], "embed_clip_text": [0.0, 1.0]},
+        ),
+        read_packets=_Reads(_FIND_ROWS),
+    )
+    assert [(node.filter, node.args) for node in g.nodes.values()] == [
+        ("trim", {"start": 0.0, "end": 1.0}),
+        ("atrim", {"start": 0.0, "end": 1.0}),
+        ("trim", {"start": 1.0, "end": 2.0}),
+        ("atrim", {"start": 1.0, "end": 2.0}),
+        ("concat", {"n": 2, "v": 1, "a": 1}),
+    ]
+
+
+def test_a_threshold_that_keeps_nothing_keeps_nothing() -> None:
+    """The same query with the cutoff raised past every row's score: each
+    branch's WHERE is evaluated on its own rows, so both go empty and the
+    refusal is about the aggregate, not about the read."""
+    text = substitute(
+        _FIND_DECLARE + _FIND,
+        {"src": "f.mp4", "prompt": "a cat", "threshold": "1.5", "dest": "out.mkv"},
+    )
+    with pytest.raises(FfrwdError) as caught:
+        lower(
+            resolve(parse(text.text, text.unset)),
+            {"f": _probe(), "g": _probe()},
+            registry=load_reference(_SNAPSHOT_PATH),
+            describes={
+                _MODULE: replace(_described(), rows_schema=_FIND_SCHEMA),
+                _PROMPT_MODULE: _prompt_described(),
+            },
+            invoke=_Prompt([1.0, 0.0]),
+            read_packets=_Reads(_FIND_ROWS),
+        )
+    assert caught.value.code is ErrorCode.STREAM_NOT_FOUND
+    assert caught.value.message.startswith("this COPY has nothing to write: no row matched")
+    # Both branches' own predicates are named, each with the threshold the
+    # variable carried into it.
+    assert "v.label <> 'clip'" in caught.value.message
+    assert "w.space = 1" in caught.value.message
+    assert caught.value.message.count("1.5") == 2
+
+
+@pytest.mark.parametrize(
+    ("where", "kept"),
+    [
+        ("v.start_t BETWEEN 1 AND 2", [2]),
+        ("NOT (v.index = 1 OR v.index = 3)", [2]),
+        ("v.keyframe", [1, 2, 3]),
+        ("v.start_t IS NOT NULL AND v.index <> 2", [1, 3]),
+        ("round(v.start_t, 0) = 2", [2]),
+    ],
+)
+def test_the_row_predicate_grammar_reaches_packet_rows_whole(
+    where: str, kept: list[int]
+) -> None:
+    """Not a narrower grammar than any other row table's: the same
+    conjunctions, negations, ranges, null tests, bare boolean columns and
+    computed operands, over the columns the declaration named."""
+    assert _rows(
+        f"SELECT v.index FROM input('f.mp4') f, keys(f.video[1]) v WHERE {where}"
+    ) == [[n] for n in kept]
+
+
+def test_order_by_and_limit_rank_packet_rows() -> None:
+    """Ranking by a score rather than filtering by one: the shape a search
+    takes when it wants the best n rather than everything above a cutoff."""
+    assert _rows(
+        "SELECT v.index FROM input('f.mp4') f, keys(f.video[1]) v "
+        "ORDER BY cos_similarity(v.vector, prompt('a cat')) DESC, v.index LIMIT 2",
+        declare=_DECLARE + _PROMPT_DECLARE,
+    ) == [[1], [3]]
 
 
 def test_the_read_names_the_stream_and_what_the_module_asked_for() -> None:
@@ -596,6 +745,16 @@ _EXEC_HEAD_DECLARE = (
     "RETURNS STRUCT(codec text, start_t number, extradata number)[]\n"
     f"  AS '{_HEAD_MODULE.as_posix()}', 'packet_head' LANGUAGE wasm;\n"
 )
+# `fauxlate`'s third export: a fake embedder, and the one thing in this repo
+# that answers a `RETURNS vector`. It writes eight components, which is what
+# `packet_keys` writes too, so a row read out of a stream scores against a
+# prompt without either side being told the other's length.
+_FAUXLATE = _BUILT / "fauxlate.wasm"
+_EXEC_EMBED_DECLARE = (
+    "CREATE FUNCTION embed_text(prompt text) RETURNS vector\n"
+    f"  AS '{_FAUXLATE.as_posix()}', 'embed_text' LANGUAGE wasm;\n"
+)
+_EXEC_PROMPT = "a cat sat on the mat"
 
 
 @pytest.fixture
@@ -604,7 +763,7 @@ def _require_everything() -> None:
         pytest.skip("ffmpeg/ffprobe not found on PATH")
     if binaries.ffrwd_wasm_path() is None:
         pytest.skip("ffrwd-wasm not found (uv sync --extra wasm)")
-    for module in (_KEYS_MODULE, _HEAD_MODULE):
+    for module in (_KEYS_MODULE, _HEAD_MODULE, _FAUXLATE):
         if not module.exists():
             pytest.skip(
                 f"module missing: {module} (cargo build --target wasm32-wasip2 "
@@ -684,6 +843,47 @@ def test_first_reads_one_packet(_require_everything: None) -> None:
         f"FROM input('{source.as_posix()}') f, packet_head(f.video[1]) v"
     )
     assert rows == [["h264", 0.0]]
+
+
+@pytest.mark.exec
+def test_a_search_over_the_vectors_a_read_returned(_require_everything: None) -> None:
+    """The find shape, nothing faked: real ffmpeg copies the keyframes, the
+    real sidecar runs the module, the vectors come back off the stream, and a
+    real prompt vector scores them. The WHERE that survives decides how many
+    trims exist, and video and audio are cut by the same rows."""
+    clear_cache()
+    source = (_FIXTURES / "keys.mkv").as_posix()
+    declare = _EXEC_DECLARE + _EXEC_EMBED_DECLARE
+    scored = _table(
+        declare
+        + "SELECT v.start_t, "
+        f"cos_similarity(v.vector, embed_text('{_EXEC_PROMPT}')) AS score\n"
+        f"FROM input('{source}') f, packet_keys(f.video[1]) v"
+    )
+    assert len(scored) > 2, scored
+    cutoff = 0.5
+    wanted = sorted(float(row[0]) for row in scored if float(row[1]) > cutoff)  # type: ignore[arg-type]
+    assert 0 < len(wanted) < len(scored), (wanted, scored)
+
+    g = compile_sql(
+        declare
+        + "COPY (\n"
+        "  SELECT array_agg(ffmpeg.trim(f.video[1],  start => v.start_t, "
+        "end => v.start_t + 0.2)),\n"
+        "         array_agg(ffmpeg.atrim(f.audio[1], start => v.start_t, "
+        "end => v.start_t + 0.2))\n"
+        f"  FROM input('{source}') f, packet_keys(f.video[1]) v\n"
+        "  WHERE v.keyframe\n"
+        f"    AND cos_similarity(v.vector, embed_text('{_EXEC_PROMPT}')) > {cutoff}\n"
+        ") TO 'clips.mkv'"
+    )
+    cut = {
+        kind: sorted(float(node.args["start"]) for node in g.nodes.values()
+                     if node.filter == kind)
+        for kind in ("trim", "atrim")
+    }
+    assert cut["trim"] == wanted
+    assert cut["atrim"] == wanted
 
 
 @pytest.mark.exec

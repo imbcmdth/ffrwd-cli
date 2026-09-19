@@ -2955,4 +2955,44 @@ ffmpeg -i tests/fixtures/keys.mkv -filter_complex \
   clips.mp4
 ```
 
+A search is the same rows under a predicate that scores them. `packet_keys` writes eight components per row and `embed_text` answers eight, so a row read out of the stream compares against a prompt with neither side declaring the other's length; the rows that clear the cutoff are the ones that become trims, video and audio together:
+
+```pgsql
+CREATE FUNCTION packet_keys(v video_stream)
+  RETURNS STRUCT(index number, start_t number, keyframe boolean, bytes number, vector vector)[]
+  AS '../sidecar/modules/target/wasm32-wasip2/release/packet_keys.wasm', 'packet_keys'
+  LANGUAGE wasm;
+CREATE FUNCTION embed_text(prompt text) RETURNS vector
+  AS '../sidecar/modules/target/wasm32-wasip2/release/fauxlate.wasm', 'embed_text'
+  LANGUAGE wasm;
+
+COPY (
+  SELECT concat(VARIADIC array_agg(ffmpeg.trim(f.video[1],  start => v.start_t, duration => 0.2))),
+         concat(VARIADIC array_agg(ffmpeg.atrim(f.audio[1], start => v.start_t, duration => 0.2)))
+  FROM input('tests/fixtures/keys.mkv') f, packet_keys(f.video[1]) v
+  WHERE v.keyframe
+    AND cos_similarity(v.vector, embed_text('a cat sat on the mat')) > 0.5
+) TO 'clips.mkv'
+```
+
+```
+$ ffrwd compile -f query.sql
+ffmpeg -i tests/fixtures/keys.mkv -filter_complex \
+  '[0:v:0]split=3[src_f_v_0_split0][src_f_v_0_split1][src_f_v_0_split2];'\
+'[src_f_v_0_split0]trim=start=0.0:duration=0.2[n1];'\
+'[src_f_v_0_split1]trim=start=1.4:duration=0.2[n2];'\
+'[src_f_v_0_split2]trim=start=3.733:duration=0.2[n3];[n1]setpts=PTS-STARTPTS[n1_pts];'\
+'[n2]setpts=PTS-STARTPTS[n2_pts];[n3]setpts=PTS-STARTPTS[n3_pts];'\
+'[n1_pts][n2_pts][n3_pts]concat=n=3:v=1:a=0[out0];'\
+'[0:a:0]asplit=3[src_f_a_0_split0][src_f_a_0_split1][src_f_a_0_split2];'\
+'[src_f_a_0_split0]atrim=start=0.0:duration=0.2[n5];'\
+'[src_f_a_0_split1]atrim=start=1.4:duration=0.2[n6];'\
+'[src_f_a_0_split2]atrim=start=3.733:duration=0.2[n7];'\
+'[n5]asetpts=PTS-STARTPTS[n5_pts];[n6]asetpts=PTS-STARTPTS[n6_pts];'\
+'[n7]asetpts=PTS-STARTPTS[n7_pts];[n5_pts][n6_pts][n7_pts]concat=n=3:v=0:a=1[out1]' -map \
+  '[out0]' -map '[out1]' clips.mkv
+```
+
+Three of the nine keyframes score above the cutoff, so the command carries three trims of each kind. Nothing about that shape is particular to this module: narrow to the rows you want, score what is left, and aggregate the survivors.
+
 Declared `RETURNS sink` instead and written after `TO`, the same module is the run-time destination it has always been: nothing is read while compiling, and its rows ride the sidecar's stdout as they are written ([recipe 100](#100-read-the-encoders-output-packet-by-packet)).

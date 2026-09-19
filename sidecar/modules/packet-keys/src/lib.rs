@@ -1,12 +1,14 @@
 //! A packet sink that writes down each packet it was handed: when it is
 //! presented, whether decoding can start there, how many bytes it carries,
-//! and a four-number vector derived from those three. It asks for the
-//! keyframes alone, so a host that can skip hands over a fraction of the
-//! stream - and, since `wants` is a request, it also works when it is handed
-//! all of it.
+//! and a vector that says which of eight buckets its position falls in. It
+//! asks for the keyframes alone, so a host that can skip hands over a
+//! fraction of the stream - and, since `wants` is a request, it also works
+//! when it is handed all of it.
 //!
-//! The vector is the point of the column rather than of the numbers: it is
-//! what exercises a reader that has to carry a vector out of a stream.
+//! The vector is the point of the column rather than of the numbers. Eight
+//! components, unit length, so a query can compare one against a prompt's
+//! the way a search over real embeddings does; what it means is only "this
+//! packet, not that one".
 
 wit_bindgen::generate!({
     path: "../../wit",
@@ -24,10 +26,12 @@ use serde::Serialize;
 const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{},"additionalProperties":false}"#;
 /// `vector`'s two bounds are equal, which is what fixes its length for a
 /// reader that has to type the column before it has a row.
-const ROWS_SCHEMA: &str = r#"{"type":"object","properties":{"index":{"type":"integer"},"start_t":{"type":"number"},"keyframe":{"type":"boolean"},"bytes":{"type":"integer"},"vector":{"type":"array","items":{"type":"number"},"minItems":4,"maxItems":4}},"additionalProperties":false}"#;
+const ROWS_SCHEMA: &str = r#"{"type":"object","properties":{"index":{"type":"integer"},"start_t":{"type":"number"},"keyframe":{"type":"boolean"},"bytes":{"type":"integer"},"vector":{"type":"array","items":{"type":"number"},"minItems":8,"maxItems":8}},"additionalProperties":false}"#;
 
-/// The length `vector` always takes, matching the schema's bounds.
-const DIMS: usize = 4;
+/// The length `vector` always takes, matching the schema's bounds - and the
+/// length `fauxlate`'s `embed_text` answers, so a query can score one of
+/// these against a prompt without either side declaring the other's dims.
+const DIMS: usize = 8;
 
 /// One packet.
 #[derive(Serialize)]
@@ -76,17 +80,17 @@ impl State {
         self.index += 1;
         let start_t = packet.pts as f64 * self.num / self.den;
         let bytes = packet.data.len() as u64;
+        // One component set, the rest zero: unit length by construction, and
+        // a different direction for each of eight consecutive packets, which
+        // is all a query comparing it against a prompt needs of it.
+        let mut vector = [0.0_f64; DIMS];
+        vector[(self.index as usize - 1) % DIMS] = 1.0;
         row(&KeyRow {
             index: self.index,
             start_t,
             keyframe: packet.keyframe,
             bytes,
-            vector: [
-                self.index as f64,
-                start_t,
-                bytes as f64,
-                if packet.keyframe { 1.0 } else { 0.0 },
-            ],
+            vector,
         })
     }
 }
@@ -185,11 +189,22 @@ mod tests {
         let mut state = State { num, den, index: 0 };
         assert_eq!(
             state.write(&packet(500, true, 3)),
-            r#"{"index":1,"start_t":0.5,"keyframe":true,"bytes":3,"vector":[1.0,0.5,3.0,1.0]}"#
+            r#"{"index":1,"start_t":0.5,"keyframe":true,"bytes":3,"vector":[1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0]}"#
         );
         assert_eq!(
             state.write(&packet(1500, false, 2)),
-            r#"{"index":2,"start_t":1.5,"keyframe":false,"bytes":2,"vector":[2.0,1.5,2.0,0.0]}"#
+            r#"{"index":2,"start_t":1.5,"keyframe":false,"bytes":2,"vector":[0.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0]}"#
+        );
+    }
+
+    #[test]
+    fn the_ninth_packet_points_the_way_the_first_did() {
+        let (num, den) = ticks(1, 1000);
+        let mut state = State { num, den, index: 8 };
+        let ninth = state.write(&packet(0, true, 1));
+        assert!(
+            ninth.ends_with(r#""vector":[1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0]}"#),
+            "{ninth}"
         );
     }
 
