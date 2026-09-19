@@ -115,6 +115,22 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   value arguments - the query text is the command line. Recipes
   [98](examples.md#98-post-what-a-module-found-as-it-is-found),
   [99](corpus.md#99-watch-the-frames-go-by).
+- A **packet sink read in FROM** is the same kind of module written
+  somewhere else, and where it is written is what it means. A
+  declaration over a stream whose RETURNS is an array of records -
+  `records(v video_stream) RETURNS STRUCT(space number, start_t
+  number, vector vector)[]` - is a FROM item, and the compiler reads
+  the rows while it compiles: it stream-copies that one stream of the
+  file into the module and binds what the module wrote as a row table
+  ([rows.md](rows.md#packet-rows---ffrwdindexrecordsfvideo1-v)). The
+  same module declared `RETURNS sink` and written after `TO` is the
+  run-time destination it has always been, and nothing is read while
+  compiling. One module, two declarations, and the position decides;
+  neither call is legal where the other belongs. The argument is one
+  stream of an `input('path')` written earlier in the same FROM -
+  there is a file under that and nothing else - and the module's own
+  `wants` says how much of the stream is copied.
+  Recipe [138](corpus.md#138-read-a-streams-own-packets-while-compiling).
 - A **value-returning `LANGUAGE wasm` function** (`RETURNS text`,
   `number`, `boolean` or `vector`) takes no stream at all: every
   parameter is one of those same `vtype`s, matched name-for-name against
@@ -860,6 +876,7 @@ Every FROM item is a compile-time table; the column model per shape is
 | `input('path', name => value, ...) alias` | 1, or one per rendition of an HLS/DASH manifest | alias mandatory; path is a literal, never computed; trailing named options are ffmpeg's per-input flags; a manifest is a row table ([rows.md](rows.md#rendition-rows---inputladderm3u8-r)) |
 | `ffmpeg.<source>(name => value, ...) alias` | 1 | generated stream (testsrc2, sine, color, anullsrc, ...), no `-i`; options named-only |
 | `<pkg>.<source>(<values>) alias` | one per rendition of its catalog | a `RETURNS source` wasm function, probed at compile time; arguments are values only; reads like a manifest input, and a source reporting itself unbounded is live. Over a values-world export it is invoked at compile time instead: each row it answers names a `url` ffmpeg opens with its own `-i`, and the alias still reads as rendition rows |
+| `<pkg>.<sink>(<stream>, <values>) alias` | one per row the module wrote | a packet sink read at compile time: the stream is one of an `input()` written earlier in the same FROM, the columns are the ones its `RETURNS STRUCT(...)[]` names, and the same module after `TO` is a run-time destination instead ([rows.md](rows.md#packet-rows---ffrwdindexrecordsfvideo1-v)) |
 | `unnest(alias.<array>) alias` | one per element | the four stream arrays, or `chapters` / `cues` / `embeddings` / `attachments`, of an input declared earlier in the same FROM; `cues['title']` and `embeddings['title']` name one track by its title |
 | `unnest(merge_cues(<rows>[, max_distance])) alias` | one per run | the same rows with runs collapsed into one row each. `<rows>` is a record array carrying `start_t`/`end_t` - `chapters`, `cues`, `embeddings` - or an `ARRAY(SELECT r FROM unnest(<one of those>) r WHERE ...)` gather that narrows them first ([recipes 131-132](corpus.md#131-collapse-a-files-rows-into-runs)) |
 | `unnest(ARRAY[STRUCT(v AS c, ...), ...]) alias` | one per array element | a written row table; columns are the STRUCT field names, every element declaring the same set |

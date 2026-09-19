@@ -2905,3 +2905,54 @@ been written. A candidate two branches happen to name the SAME path, under
 different aliases, is a different case: dedup folds them onto one `-i`
 before either branch's own fate is decided, so a live branch sharing that
 path keeps it open even when the other branch beside it drops.
+
+## 138. Read a stream's own packets while compiling
+
+A packet sink is a COPY destination after `TO` and a row table in `FROM`, and where the call is written is the only difference. In `FROM` over a stream of an input, the compiler stream-copies that one stream into the module while it compiles and binds the rows the module wrote. `packet_keys` writes one row per packet it was handed - when it is presented, how many bytes it carries, and a vector derived from both - and asks for the keyframes, so that is what the copy hands it:
+
+```pgsql
+CREATE FUNCTION packet_keys(v video_stream)
+  RETURNS STRUCT(index number, start_t number, keyframe boolean, bytes number, vector vector)[]
+  AS '../sidecar/modules/target/wasm32-wasip2/release/packet_keys.wasm', 'packet_keys'
+  LANGUAGE wasm;
+
+SELECT v.index, v.start_t, v.bytes
+FROM input('tests/fixtures/keys.mkv') f, packet_keys(f.video[1]) v
+WHERE v.start_t > 3
+```
+
+```
+$ ffrwd -f query.sql
+ index | start_t | bytes
+-------+---------+-------
+ 8     | 3.266   | 6040
+ 9     | 3.733   | 5749
+(2 rows)
+```
+
+The rows are a compile-time relation like a caption track's cues, so they shape the graph: one trim per surviving row, at that row's own time. The times are the input's own, which is what lets a `trim` written from one open on the frame the row describes:
+
+```pgsql
+CREATE FUNCTION packet_keys(v video_stream)
+  RETURNS STRUCT(index number, start_t number, keyframe boolean, bytes number, vector vector)[]
+  AS '../sidecar/modules/target/wasm32-wasip2/release/packet_keys.wasm', 'packet_keys'
+  LANGUAGE wasm;
+
+COPY (
+  SELECT concat(VARIADIC array_agg(ffmpeg.trim(f.video[1], start => v.start_t, duration => 0.2)))
+  FROM input('tests/fixtures/keys.mkv') f, packet_keys(f.video[1]) v
+  WHERE v.start_t > 3
+) TO 'clips.mp4'
+```
+
+```
+$ ffrwd compile -f query.sql
+ffmpeg -i tests/fixtures/keys.mkv -filter_complex \
+  '[0:v:0]split=2[src_f_v_0_split0][src_f_v_0_split1];'\
+'[src_f_v_0_split0]trim=start=3.266:duration=0.2[n1];'\
+'[src_f_v_0_split1]trim=start=3.733:duration=0.2[n2];[n1]setpts=PTS-STARTPTS[n1_pts];'\
+'[n2]setpts=PTS-STARTPTS[n2_pts];[n1_pts][n2_pts]concat=n=2:v=1:a=0[out0]' -map '[out0]' \
+  clips.mp4
+```
+
+Declared `RETURNS sink` instead and written after `TO`, the same module is the run-time destination it has always been: nothing is read while compiling, and its rows ride the sidecar's stdout as they are written ([recipe 100](#100-read-the-encoders-output-packet-by-packet)).

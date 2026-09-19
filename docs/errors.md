@@ -138,6 +138,18 @@ The NULL flavor: a stream position cannot be absent, so a NULL there — an unse
 {"line": 1, "col": 20, "code": "UDF_ARG_TYPE", "message": "':clip' was not set", "hint": "scale() needs a stream in this position; set it with -v clip=<value>"}
 ```
 
+Two row-shape flavors belong to a packet sink read at compile time ([rows.md](rows.md#packet-rows---ffrwdindexrecordsfvideo1-v)), where the declaration is what types the alias's columns. Before anything runs, a declared column the module's own row schema never writes:
+
+```json
+{"line": 1, "col": 17, "code": "UDF_ARG_TYPE", "message": "function 'records' returns STRUCT(space number, tag text)[], and the module 'records.wasm' writes rows of space (integer), start_t (number), vector (array)", "hint": "the RETURNS names the module's own row columns, with a type each value fits; a module writing more than the query reads is fine, a column it never writes is not"}
+```
+
+And, once the rows are in hand, a value that is not the type its column was declared. The whole column is one type, so this is refused rather than narrowed to the row it came in on:
+
+```json
+{"line": 5, "col": 33, "code": "UDF_ARG_TYPE", "message": "row 2 of 'v' holds text in 'start_t', which is declared number", "hint": "every row of a column carries the declared type; a column a row leaves out reads NULL"}
+```
+
 ## SINGLE_OUTPUT_ONLY
 
 **Reserved, not currently raised.** The SELECT list is the output stream list (every column is its own `-map`, in order), so a multi-column SELECT is ordinary usage rather than an error. The code stays in the enum, and in `docs/error-schema.json`'s `code` enum, purely for wire-format stability. No code path in `ffrwd/*.py` raises it, and no example JSON exists because none can.
@@ -256,6 +268,32 @@ COPY (SELECT b.video[1] FROM input('x.mp4') b) TO 'out.mp4';
 ```json
 {"line": 1, "col": 13, "code": "UNSUPPORTED_SQL", "message": "view 'unused' is never used", "hint": "every view must be read by a later view or COPY; check the spelling of the name in its FROM clauses"}
 ```
+
+A packet sink read at compile time ([rows.md](rows.md#packet-rows---ffrwdindexrecordsfvideo1-v)) has four rejections here, one per thing that can be wrong about where the call is written or what is under it. Written anywhere but FROM, since its rows are a relation and nothing else:
+
+```json
+{"line": 5, "col": 10, "code": "UNSUPPORTED_SQL", "message": "function 'records' returns rows read off a stream's packets, and this call is not in FROM", "hint": "a packet sink whose rows are a relation is called in FROM over a stream of an input: FROM input('<path>') f, records(f.video[1]) v"}
+```
+
+Over anything but a stream of a file as it is on disk - a filtered stream, a module's output, a cell another query stage built - since a compile-time read has a file to open and those have none:
+
+```json
+{"line": 5, "col": 36, "code": "UNSUPPORTED_SQL", "message": "records() reads a file's own packets, and this is not a stream of one", "hint": "a packet sink read in FROM reads one stream of an input as it is on disk, e.g. FROM input('film.mp4') f, records(f.video[1]) v"}
+```
+
+Over a module that is not a packet sink at all, which is checked against the module's own describe before anything runs:
+
+```json
+{"line": 1, "col": 17, "code": "UNSUPPORTED_SQL", "message": "function 'records' returns rows read off a stream's packets, and the module 'weave.wasm' is not a packet sink", "hint": "only a module exporting ffrwd:av's packet-sink reads a stream's encoded packets; declare this one as what it is"}
+```
+
+And the read itself failing, which carries what the sidecar or ffmpeg said last, since that is the part that names the actual cause:
+
+```json
+{"line": 5, "col": 36, "code": "UNSUPPORTED_SQL", "message": "cannot read 'v': the module 'records.wasm' rejected the stream: records: this stream is vp9, and this build reads h264 and hevc", "hint": "check the module reads the codec the stream carries, and that its parameters are the ones it declares"}
+```
+
+A read that never finishes is the same code, with the ceiling named - the probe's own, since a read copies one stream of the file the way extracting a caption track does.
 
 ## UNKNOWN_RECIPE
 
@@ -638,6 +676,12 @@ COPY (
 ```
 
 The anchor is the `input()` path itself, since the input is what constrains the shape. The same code, with a different message, refuses a one-open input whose subtitle or data track a second process would have to read: a pipe between processes carries pictures and sound and nothing else.
+
+The third message under this code refuses a live input to a packet sink read at compile time ([rows.md](rows.md#packet-rows---ffrwdindexrecordsfvideo1-v)). Such a read copies the stream to the end and binds what the module wrote as a relation, and a stream that never ends has no end to read to:
+
+```json
+{"line": 5, "col": 38, "code": "UNBOUNDED_LIVE_INPUT", "message": "'live.m3u8' never ends, and a compile-time read reads a stream to the end", "hint": "a live stream is read at run time, by the same module written as a destination: COPY (SELECT ...) TO records()"}
+```
 
 ## BUFFER_OVERFLOW
 

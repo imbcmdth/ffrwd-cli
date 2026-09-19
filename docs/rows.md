@@ -64,6 +64,25 @@ by its JSON value, while `width`/`height` still come from probing the
 named url, same as any other rendition row. A row the query drops
 leaves the command entirely.
 
+## Packet rows - `ffrwd.index.records(f.video[1]) v`
+
+A `LANGUAGE wasm` function returning an array of records over a STREAM is a packet sink whose rows are read while the query compiles. It is a row table like an `unnest` one: the columns the `RETURNS` names, with the types it gives them, and `WHERE`, `ORDER BY`, `LIMIT` and joins over them decide the graph before ffmpeg is started.
+
+```sql
+CREATE FUNCTION records(v video_stream)
+  RETURNS STRUCT(index number, space number, start_t number,
+                 end_t number, vector vector)[]
+  AS 'records.wasm', 'records' LANGUAGE wasm;
+```
+
+The declaration is the shape. A column it names that the module never writes is refused at the call; a column the module writes that it does not name is not this alias's to expose; a column a row leaves out reads NULL. `vector` is a column type here as it is in any record, so a vector read out of a stream compares through `cos_similarity` like one a value function answered - the length is checked on the two vectors handed over, not declared in advance.
+
+The argument is one stream of an `input('path')` written earlier in the same FROM, and only that: a compile-time read opens the file and reads the stream's own packets, so a filtered stream, or one another query stage built, is refused, and a live input is refused saying it is read at run time instead.
+
+How much of the stream is copied is the module's own `wants` - all of it, the keyframes, or the first packet - and a host may hand over more than was asked for, never less. The read is memoized per file, stream, module, parameters and `wants`, so a query naming several of the alias's columns reads once.
+
+**Times are the input's own.** `start_t` and `end_t` are on the clock every other time in a query is on: `ffmpeg.trim(f.video[1], start => v.start_t)` opens on the frame the row describes. That is a promise the compiler keeps rather than something a stream copy gives for free - a stream that reorders frames opens on a negative decode timestamp, and a copy written without care shifts every timestamp, presentation times included, by that lead-in.
+
 ## Track rows - `unnest(f.audio) t`
 
 One row per track. The argument is an array column of an input declared earlier in the same FROM list; alias mandatory. All eight array columns unnest - the four stream arrays here, and `chapters`, `cues`, `embeddings` and `attachments` below. The schema varies by stream type:
