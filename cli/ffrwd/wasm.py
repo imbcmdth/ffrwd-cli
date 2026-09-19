@@ -394,8 +394,11 @@ class Described:
     rows_language: tuple[str, ...] = ()
     meta: bool = False
     reads_rows: bool | None = None
-    # Whether upstream rows may appear on this module's output frames; None
-    # for a sidecar that predates the declaration.
+    # Whether upstream rows may appear on this module's output frames. None
+    # where the sidecar said nothing: an older one that predates the
+    # declaration, and every module with no frames for a row to leave on --
+    # a packet sink, a source, a rows module, a packet filter -- each of
+    # which carries rows its own way and has no answer to give here.
     forwards_rows: bool | None = None
     window: int = 1
     stride: int = 1

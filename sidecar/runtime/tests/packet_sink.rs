@@ -82,6 +82,7 @@ fn pad_with_meta(width: u32, height: u32, row: u32, rendition: RenditionMeta) ->
         info: StreamInfo::default(),
         row,
         rendition,
+        decode_delay: 0,
     }
 }
 

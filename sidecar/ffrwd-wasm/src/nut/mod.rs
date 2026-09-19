@@ -170,6 +170,15 @@ pub struct Stream {
     /// codec-specific field: for h264, the SPS and PPS. Empty for raw
     /// streams.
     pub extradata: Vec<u8>,
+    /// Frames per second as `num/den`, from the `r_frame_rate` an info
+    /// packet states. None where nothing on the wire said it.
+    ///
+    /// NUT has no per-frame duration field, so this is the only thing that
+    /// carries one: a reader works each packet's duration out of the rate.
+    /// Without it a reordering stream loses its durations entirely, since
+    /// the next packet READ is not the next picture SHOWN and no pair of
+    /// timestamps settles the gap.
+    pub frame_rate: Option<(u64, u64)>,
     pub media: Media,
 }
 
@@ -210,6 +219,7 @@ impl Stream {
             max_pts_distance: time_base.den.div_ceil(time_base.num.max(1)),
             decode_delay: 0,
             extradata: Vec::new(),
+            frame_rate: None,
             media: Media::Video {
                 width,
                 height,
@@ -234,6 +244,7 @@ impl Stream {
             max_pts_distance: u64::from(sample_rate),
             decode_delay: 0,
             extradata: Vec::new(),
+            frame_rate: None,
             media: Media::Audio {
                 sample_rate,
                 channels,
@@ -598,6 +609,7 @@ mod tests {
             decode_delay: 0,
             // 48 kHz mono AAC-LC, as ffprobe reported it.
             extradata: vec![0x11, 0x88, 0x56, 0xe5, 0x00],
+            frame_rate: None,
             media: Media::Audio {
                 sample_rate: 48000,
                 channels: 1,

@@ -20,7 +20,7 @@ use exports::ffrwd::av::packet_filter::{
 use serde::Serialize;
 
 const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{},"additionalProperties":false}"#;
-const ROWS_SCHEMA: &str = r#"{"type":"object","properties":{"pad":{"type":"integer"},"packets":{"type":"integer"},"bytes":{"type":"integer"}},"additionalProperties":false}"#;
+const ROWS_SCHEMA: &str = r#"{"type":"object","properties":{"pad":{"type":"integer"},"packets":{"type":"integer"},"bytes":{"type":"integer"},"decode_delay":{"type":"integer"},"last_packets":{"type":"integer"}},"additionalProperties":false}"#;
 
 /// One pad's tally, emitted once at the end.
 #[derive(Serialize)]
@@ -28,6 +28,13 @@ struct PadRow {
     pad: u32,
     packets: u64,
     bytes: u64,
+    /// The reorder depth `init` was told, straight back out: what says the
+    /// host handed the wire's own bound to the module.
+    decode_delay: u32,
+    /// How many packets rode the FINAL call. A host that ended the run with
+    /// an empty call would leave this 0, and a filter holding anything back
+    /// would have nowhere to put it.
+    last_packets: u64,
 }
 
 thread_local! {
@@ -76,11 +83,15 @@ impl Guest for PacketPassthrough {
             return Err("packet_passthrough reads at least one stream".into());
         }
         PADS.with(|p| {
-            *p.borrow_mut() = (0..streams.len())
-                .map(|pad| PadRow {
+            *p.borrow_mut() = streams
+                .iter()
+                .enumerate()
+                .map(|(pad, stream)| PadRow {
                     pad: pad as u32,
                     packets: 0,
                     bytes: 0,
+                    decode_delay: stream.decode_delay,
+                    last_packets: 0,
                 })
                 .collect()
         });
@@ -102,6 +113,9 @@ impl Guest for PacketPassthrough {
                 for packet in &carried.packets {
                     pad.packets += 1;
                     pad.bytes += packet.data.len() as u64;
+                }
+                if last {
+                    pad.last_packets = carried.packets.len() as u64;
                 }
             }
             let mut trailing = Vec::new();

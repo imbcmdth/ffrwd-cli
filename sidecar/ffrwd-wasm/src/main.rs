@@ -4,7 +4,8 @@
 //! size and pixel format, or a sample rate, channel count and sample format -
 //! comes from the stream header instead of the command line.
 //!
-//! One module is spelled `-m <path>`, with `-params` carrying its parameters.
+//! One module is spelled `-m <path>`, with `-params` carrying its parameters
+//! or `-params-from <file>` reading the same value out of a file.
 //! Several are a network, configured the way ffmpeg is: `-m <name>=<path>` per
 //! module, a `-filter_complex` string wiring the names together, and a `-map`
 //! per output naming the label it writes. Either way the frame loop is the
@@ -31,7 +32,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use ffrwd_wasm::nut;
 use ffrwd_wasm_runtime::nn;
 use ffrwd_wasm_runtime::runtime::{
-    self, AudioFormat, Filter, Format, Frame, Media, StreamInfo, TimeBase, VideoFormat,
+    self, AudioFormat, Emitted, Filter, Format, Frame, Media, StreamInfo, TimeBase, VideoFormat,
 };
 use serde::{Deserialize, Serialize};
 
@@ -678,6 +679,19 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
                 }
                 params = Some(next("-params")?);
             }
+            // The same value, read out of a file. A module's parameters can
+            // be long - a space definition, a model URI - and a command line
+            // is a poor place to keep one.
+            "-params-from" => {
+                if params.is_some() {
+                    bail!("-params-from and -params both name one module's parameters");
+                }
+                let path = next("-params-from")?;
+                params = Some(
+                    std::fs::read_to_string(&path)
+                        .with_context(|| format!("reading -params-from {path}"))?,
+                );
+            }
             "-annotations" => {
                 let side = next("-annotations")?;
                 let seen = match side.as_str() {
@@ -1205,7 +1219,14 @@ impl Sink {
         };
         match output.kind {
             OutputKind::Frames => {
-                sink.frames = Some(open_frame_output(&output.path, stream, annotations)?);
+                // The frame rate the input declared is dropped: a module may
+                // hand back more frames than it was given, or fewer, or move
+                // them in time, so the rate that described the input does not
+                // describe what leaves here. A reader told a rate its frames
+                // do not keep conforms them to it.
+                let mut header = stream.clone();
+                header.frame_rate = None;
+                sink.frames = Some(open_frame_output(&output.path, &header, annotations)?);
             }
             OutputKind::Rows => sink.rows = Some(open_row_output(&output.path)?),
             OutputKind::Subtitles(format) => {
@@ -1751,15 +1772,22 @@ fn run_packet_sink(args: &Args, module: &str, params: &str) -> Result<()> {
     let mut sink = runtime::PacketSink::open(module, &sink_inputs, params)
         .with_context(|| format!("opening module {module}"))?;
 
-    let outcome = (|| -> Result<()> {
+    // The last batch of packets rides the final call, which is what the
+    // interface says `last` carries: whatever is left.
+    let outcome = (|| -> Result<Emitted> {
         loop {
-            let (carried, done) = queues.take()?;
-            if done {
-                return Ok(());
+            let (carried, last) = queues.take()?;
+            let emitted = sink.process(&carried, last).with_context(|| {
+                let which = if last {
+                    "the final call"
+                } else {
+                    "processing packets"
+                };
+                format!("{}: {which}", sink.name())
+            })?;
+            if last {
+                return Ok(emitted);
             }
-            let emitted = sink
-                .process(&carried, false)
-                .with_context(|| format!("{}: processing packets", sink.name()))?;
             for writer in &mut row_outputs {
                 write_rows(writer, &emitted.rows)?;
             }
@@ -1767,13 +1795,8 @@ fn run_packet_sink(args: &Args, module: &str, params: &str) -> Result<()> {
     })();
     // A reader still waiting for queue space must wake and stop.
     queues.close();
-    outcome?;
+    let emitted = outcome?;
 
-    // The final call, carrying no packets: whatever the sink held back
-    // arrives as rows, and the trailing rows follow them.
-    let emitted = sink
-        .process(&vec![Vec::new(); pads], true)
-        .with_context(|| format!("{}: the final call", sink.name()))?;
     for writer in &mut row_outputs {
         write_rows(writer, &emitted.rows)?;
         write_rows(writer, &emitted.trailing)?;
@@ -1924,17 +1947,30 @@ fn run_packet_filter(args: &Args, module: &str, params: &str) -> Result<()> {
         }));
     }
 
+    // The last batch of packets rides the final call: a filter holding
+    // something back places it on a real last carrier instead of holding a
+    // packet out of the stream for the whole run. The rows that arrive with
+    // it are the rest of the rows input.
     let mut sending = true;
-    let outcome = (|| -> Result<()> {
-        while sending {
-            let (carried, done) = queues.take()?;
-            if done {
-                return Ok(());
+    let outcome = (|| -> Result<runtime::Filtered> {
+        loop {
+            let (carried, last) = queues.take()?;
+            let arrived = if last {
+                rows.drain_to_end()?
+            } else {
+                rows.take()?.0
+            };
+            let filtered = filter.process(&carried, &arrived, last).with_context(|| {
+                let which = if last {
+                    "the final call"
+                } else {
+                    "processing packets"
+                };
+                format!("{}: {which}", filter.name())
+            })?;
+            if last {
+                return Ok(filtered);
             }
-            let (arrived, _) = rows.take()?;
-            let filtered = filter
-                .process(&carried, &arrived, false)
-                .with_context(|| format!("{}: processing packets", filter.name()))?;
             for (pad, packets) in filtered.pads.into_iter().enumerate() {
                 if !packets.is_empty() {
                     sending &= senders[pad].send(packets).is_ok();
@@ -1943,22 +1979,21 @@ fn run_packet_filter(args: &Args, module: &str, params: &str) -> Result<()> {
             for writer in &mut row_outputs {
                 write_rows(writer, &filtered.rows)?;
             }
+            if !sending {
+                // Every output's writer has stopped; its failure is what
+                // `join` below hands back.
+                break;
+            }
         }
-        Ok(())
+        filter
+            .process(&vec![Vec::new(); pads], &[], true)
+            .with_context(|| format!("{}: the final call", filter.name()))
     })();
     // A reader still waiting for queue space must wake and stop.
     queues.close();
-    if let Err(error) = outcome {
-        rows.close();
-        return Err(error);
-    }
+    rows.close();
+    let filtered = outcome?;
 
-    // The final call: whatever the filter held back leaves here, and with it
-    // every row the input still had.
-    let remaining = rows.drain_to_end()?;
-    let filtered = filter
-        .process(&vec![Vec::new(); pads], &remaining, true)
-        .with_context(|| format!("{}: the final call", filter.name()))?;
     for (pad, packets) in filtered.pads.into_iter().enumerate() {
         if !packets.is_empty() {
             // A send fails only once that output's writer has stopped, and
@@ -2213,6 +2248,22 @@ struct PadState {
     dead: bool,
 }
 
+/// How many ticks of the stream's own time base one frame lasts, from the
+/// frame rate the wire declared. None where it declared none, or where the
+/// rate does not divide into whole ticks - a duration this host cannot state
+/// exactly is one it does not state.
+fn frame_ticks(stream: &nut::Stream) -> Option<i64> {
+    let (num, den) = stream.frame_rate?;
+    // One frame is den/num seconds; a tick is time_base.num/time_base.den of
+    // one, so a frame is den * time_base.den / (num * time_base.num) ticks.
+    let ticks = u128::from(den) * u128::from(stream.time_base.den);
+    let per = u128::from(num) * u128::from(stream.time_base.num);
+    if per == 0 || ticks % per != 0 {
+        return None;
+    }
+    i64::try_from(ticks / per).ok().filter(|t| *t > 0)
+}
+
 impl PadQueues {
     fn new(pads: usize) -> Self {
         PadQueues {
@@ -2225,9 +2276,13 @@ impl PadQueues {
         }
     }
 
-    /// Everything queued so far, per pad, waiting until at least one pad
-    /// has packets. `(_, true)` once every pad is closed and drained; a
-    /// pad's stored read error is raised here, on the drive loop's thread.
+    /// Everything queued so far, one list per pad, waiting until at least
+    /// one pad has packets. The flag says this is the LAST batch: every pad
+    /// has closed and this call drained the rest of it, so nothing more will
+    /// arrive. It rides with the packets rather than after them, which is
+    /// what lets a module place what it held back on a real last carrier
+    /// instead of holding a packet back for the whole run. A pad's stored
+    /// read error is raised here, on the drive loop's thread.
     fn take(&self) -> Result<(Vec<Vec<runtime::Packet>>, bool)> {
         let mut state = self.state.lock().expect("a reader panicked with the lock");
         loop {
@@ -2238,7 +2293,7 @@ impl PadQueues {
                 break;
             }
             if state.pads.iter().all(|q| q.closed) {
-                return Ok((Vec::new(), true));
+                return Ok((vec![Vec::new(); state.pads.len()], true));
             }
             state = self
                 .filled
@@ -2253,8 +2308,11 @@ impl PadQueues {
                 std::mem::take(&mut queue.packets)
             })
             .collect();
+        // A pad is marked closed only once its last packet is queued, so
+        // every pad closed with nothing left behind means this was it.
+        let last = state.pads.iter().all(|q| q.closed);
         self.drained.notify_all();
-        Ok((carried, false))
+        Ok((carried, last))
     }
 
     /// The drive loop is done, normally or not: wake every waiting reader
@@ -2268,13 +2326,24 @@ impl PadQueues {
     }
 }
 
-/// Settles packet durations for one pad. NUT frames carry no duration
-/// field, so the wire never says it directly; where the stream does not
-/// reorder (decode delay 0) decode order is presentation order, and the
-/// next packet's pts settles the previous one's duration exactly. A
-/// reordering stream's presentation successor is not the next packet read,
-/// and the final packet has no successor at all: both stay None.
+/// Settles packet durations for one pad.
+///
+/// NUT frames carry no duration field, so the wire never states one per
+/// packet. What it can state, in an info packet, is the stream's FRAME RATE,
+/// and where it does that is the answer for every packet: one frame's worth
+/// of ticks, which is what ffmpeg itself hands a reader. That path is the
+/// one that works on a reordering stream, where the next packet read is not
+/// the next picture shown.
+///
+/// Without a rate there is only the pts of the next packet. That settles the
+/// previous one's duration exactly where decode order IS presentation order
+/// (decode delay 0). A reordering stream's presentation successor is not the
+/// next packet read, and the final packet has no successor at all: both stay
+/// None, since unknown is never spelled 0.
 struct Durations {
+    /// One frame in the stream's own time base, from the rate the wire
+    /// declared. Some means every packet's duration is known as it arrives.
+    fixed: Option<i64>,
     /// Whether successive pts settle durations at all.
     settled: bool,
     /// The packet the next one's pts will settle.
@@ -2282,17 +2351,23 @@ struct Durations {
 }
 
 impl Durations {
-    fn new(decode_delay: u64) -> Durations {
+    fn new(stream: &nut::Stream) -> Durations {
         Durations {
-            settled: decode_delay == 0,
+            fixed: frame_ticks(stream),
+            settled: stream.decode_delay == 0,
             pending: None,
         }
     }
 
     /// Takes one packet in and returns the packet now ready to queue: the
-    /// previous one with its duration settled, or - for a stream whose
-    /// durations stay unknown - this one straight through.
-    fn push(&mut self, packet: runtime::Packet) -> Option<runtime::Packet> {
+    /// one just read where the rate settles it, the previous one where
+    /// successive pts do, or - for a stream whose durations stay unknown -
+    /// this one straight through.
+    fn push(&mut self, mut packet: runtime::Packet) -> Option<runtime::Packet> {
+        if let Some(ticks) = self.fixed {
+            packet.duration = Some(ticks);
+            return Some(packet);
+        }
         if !self.settled {
             return Some(packet);
         }
@@ -2317,7 +2392,7 @@ impl Durations {
 /// pad's queue, waiting whenever the queue is over its byte bound. Decode
 /// order per pad is preserved by construction - one thread, one queue.
 fn read_pad(mut input: Input, pad: usize, queues: &PadQueues) {
-    let mut durations = Durations::new(input.stream().decode_delay);
+    let mut durations = Durations::new(input.stream());
     let mut buf: Vec<u8> = Vec::new();
     let mut index = 0u64;
     loop {
@@ -2466,6 +2541,10 @@ fn coded_pad(
         info,
         row,
         rendition,
+        // What the NUT stream header declared: the packets the decoder
+        // holds back, which is also how many of this pad's leading packets
+        // arrive with no dts.
+        decode_delay: u32::try_from(stream.decode_delay).unwrap_or(u32::MAX),
     })
 }
 
@@ -2551,6 +2630,9 @@ fn coded_stream_for(coded: &runtime::CodedStream, decode_delay: u64) -> Result<n
         max_pts_distance,
         decode_delay,
         extradata: coded.extradata.clone(),
+        // A packet source publishes no frame rate: the wit `coded-stream`
+        // has no field for one, the way it has none for the decode delay.
+        frame_rate: None,
         media,
     })
 }
@@ -2866,7 +2948,11 @@ struct Description {
     /// `null` for a module with no frame interface at all.
     reads_rows: Option<bool>,
     /// Whether upstream rows may leave on the module's own output frames.
-    /// `null` for a module with no frame interface at all.
+    /// ABSENT for a module with no frame interface at all, which has no
+    /// frames for a row to leave on and so no answer to give: a sink, a
+    /// source, a rows module and a packet filter each carry rows their own
+    /// way, and a null here would read as one of them saying no.
+    #[serde(skip_serializing_if = "Option::is_none")]
     forwards_rows: Option<bool>,
     /// The ffmpeg codec names a packet sink accepts for VIDEO, most preferred
     /// first, and empty for every codec. Present only for a module exporting
@@ -3507,7 +3593,7 @@ fn main() {
 
 #[cfg(test)]
 mod stream_field_tests {
-    use super::{aspect_from, color_from, h264_profile_level, Durations};
+    use super::{aspect_from, color_from, frame_ticks, h264_profile_level, Durations};
     use ffrwd_wasm::nut;
     use ffrwd_wasm_runtime::runtime;
 
@@ -3597,9 +3683,30 @@ mod stream_field_tests {
         }
     }
 
+    /// A coded stream with the given reorder depth, and the frame rate an
+    /// info packet would have stated - or none, for a wire that stated one.
+    fn a_stream(decode_delay: u64, frame_rate: Option<(u64, u64)>) -> nut::Stream {
+        nut::Stream {
+            fourcc: b"H264".to_vec(),
+            time_base: nut::TimeBase { num: 1, den: 51200 },
+            msb_pts_shift: 14,
+            max_pts_distance: 51200,
+            decode_delay,
+            extradata: Vec::new(),
+            frame_rate,
+            media: nut::Media::Video {
+                width: 64,
+                height: 48,
+                sample_width: 1,
+                sample_height: 1,
+                colorspace_type: 0,
+            },
+        }
+    }
+
     #[test]
     fn the_next_pts_settles_the_previous_packets_duration() {
-        let mut durations = Durations::new(0);
+        let mut durations = Durations::new(&a_stream(0, None));
         assert!(
             durations.push(packet(0)).is_none(),
             "held for its successor"
@@ -3615,16 +3722,38 @@ mod stream_field_tests {
     }
 
     #[test]
-    fn a_reordering_stream_settles_no_durations_and_holds_nothing() {
-        let mut durations = Durations::new(2);
+    fn a_reordering_stream_settles_no_durations_without_a_rate() {
+        let mut durations = Durations::new(&a_stream(2, None));
         let through = durations.push(packet(7)).expect("straight through");
         assert_eq!((through.pts, through.duration), (7, None));
         assert!(durations.finish().is_none(), "nothing was held");
     }
 
     #[test]
+    fn a_declared_rate_settles_every_packet_however_deep_the_reorder() {
+        // 25 fps in a 1/51200 time base is 2048 ticks. The rate is the only
+        // thing that works here: in decode order the next packet READ is not
+        // the next picture SHOWN, so no pair of timestamps settles the gap.
+        let mut durations = Durations::new(&a_stream(2, Some((25, 1))));
+        for pts in [4096, 12288, 8192, 6144] {
+            let through = durations.push(packet(pts)).expect("settled at once");
+            assert_eq!((through.pts, through.duration), (pts, Some(2048)));
+        }
+        assert!(durations.finish().is_none(), "nothing is ever held");
+    }
+
+    #[test]
+    fn a_rate_that_does_not_divide_into_whole_ticks_settles_nothing() {
+        // 30000/1001 in a 1/51200 time base is not a whole number of ticks,
+        // and a duration this host cannot state exactly is one it does not
+        // state.
+        assert_eq!(frame_ticks(&a_stream(0, Some((30000, 1001)))), None);
+        assert_eq!(frame_ticks(&a_stream(0, Some((25, 1)))), Some(2048));
+    }
+
+    #[test]
     fn a_step_that_is_not_forward_settles_nothing() {
-        let mut durations = Durations::new(0);
+        let mut durations = Durations::new(&a_stream(0, None));
         assert!(durations.push(packet(5)).is_none());
         let first = durations.push(packet(5)).expect("released");
         assert_eq!(first.duration, None, "unknown is never 0");

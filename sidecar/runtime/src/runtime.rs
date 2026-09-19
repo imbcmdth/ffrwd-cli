@@ -1310,6 +1310,10 @@ pub struct SinkInput {
     pub info: StreamInfo,
     pub row: u32,
     pub rendition: RenditionMeta,
+    /// How deep this stream reorders, as the wire's header declared it: the
+    /// packets the decoder holds back before the first picture leaves it.
+    /// A world before 0.16.0 has no field for it and never learns it.
+    pub decode_delay: u32,
 }
 
 /// How many streams of one kind a sink reads.
@@ -3333,7 +3337,13 @@ impl PacketInstance {
                         level: input.stream.level,
                     };
                     let info = $world::stream_info(&input.info, input.stream.time_base, name)?;
-                    streams.push($push_extra(coded, info, input.row, input.rendition.clone()));
+                    streams.push($push_extra(
+                        coded,
+                        info,
+                        input.row,
+                        input.rendition.clone(),
+                        input.decode_delay,
+                    ));
                 }
                 $b.ffrwd_av_packet_sink()
                     .call_init(&mut *store, &streams, params)
@@ -3345,12 +3355,13 @@ impl PacketInstance {
                 b,
                 world_0160,
                 world_0160::video::ffrwd::av::types,
-                |coded, info, row, rendition| {
+                |coded, info, row, rendition, decode_delay| {
                     world_0160::packet::exports::ffrwd::av::packet_sink::InputStream {
                         coded,
                         info,
                         row,
                         rendition: world_0160::rendition_meta(rendition),
+                        decode_delay,
                     }
                 }
             ),
@@ -3358,7 +3369,9 @@ impl PacketInstance {
                 b,
                 world_0150,
                 world_0150::video::ffrwd::av::types,
-                |coded, info, row, rendition| {
+                // The reorder depth arrived in 0.16.0; this world's
+                // `input-stream` has no field for it, so it is dropped.
+                |coded, info, row, rendition, _delay| {
                     world_0150::packet::exports::ffrwd::av::packet_sink::InputStream {
                         coded,
                         info,
@@ -3371,7 +3384,9 @@ impl PacketInstance {
                 b,
                 world_0140,
                 world_0140::video::ffrwd::av::types,
-                |coded, info, row, rendition| {
+                // The reorder depth arrived in 0.16.0; this world's
+                // `input-stream` has no field for it, so it is dropped.
+                |coded, info, row, rendition, _delay| {
                     world_0140::packet::exports::ffrwd::av::packet_sink::InputStream {
                         coded,
                         info,
@@ -3384,7 +3399,9 @@ impl PacketInstance {
                 b,
                 world_0130,
                 world_0130::video::ffrwd::av::types,
-                |coded, info, row, rendition| {
+                // The reorder depth arrived in 0.16.0; this world's
+                // `input-stream` has no field for it, so it is dropped.
+                |coded, info, row, rendition, _delay| {
                     world_0130::packet::exports::ffrwd::av::packet_sink::InputStream {
                         coded,
                         info,
@@ -3400,7 +3417,7 @@ impl PacketInstance {
                 b,
                 world_0120,
                 world_0120::packet::exports::ffrwd::av::packet_sink,
-                |coded, info, _row, _rendition| {
+                |coded, info, _row, _rendition, _delay| {
                     world_0120::packet::exports::ffrwd::av::packet_sink::InputStream { coded, info }
                 }
             ),
@@ -3885,10 +3902,13 @@ impl PacketFilter {
     /// stream's codec one it accepts.
     ///
     /// `init`'s answer is the streams LEAVING, one per input pad: a filter
-    /// that rewrites a header answers the changed one, and every other
-    /// filter hands back what it was given. A list of any other length, or
-    /// one that renames a codec or moves a time base, is refused here -
-    /// the packets leaving are packets of the stream that arrived.
+    /// that rewrites a header answers the changed `extradata`, and every
+    /// other filter hands back what it was given. Extradata is the only
+    /// field a filter may move: a list of any other length, or one that
+    /// renames a codec, moves a time base, resizes the picture or restates
+    /// a profile, is refused here. The packets leaving are packets of the
+    /// stream that arrived, and the profile and the level are read back out
+    /// of the header rather than carried beside it.
     pub fn open(module_path: &str, inputs: &[SinkInput], params: &str) -> Result<PacketFilter> {
         let (mut store, instance) = instantiate_packet_filter(module_path, Purpose::Run)?;
         let described = filter_description(&instance, &mut store)?;
@@ -3904,6 +3924,7 @@ impl PacketFilter {
                     info: world_0160::stream_info(&input.info, input.stream.time_base, &meta.name)?,
                     row: input.row,
                     rendition: world_0160::rendition_meta(input.rendition.clone()),
+                    decode_delay: input.decode_delay,
                 },
             );
         }
@@ -3949,6 +3970,14 @@ impl PacketFilter {
                      only the out-of-band header is a filter's to rewrite",
                     meta.name,
                     input.stream.format.kind()
+                );
+            }
+            if (stream.profile, stream.level) != (input.stream.profile, input.stream.level) {
+                bail!(
+                    "{}: pad {pad} answered a different profile or level; nothing carries \
+                     either beside the packets, so a filter states them by writing the header \
+                     that says so",
+                    meta.name
                 );
             }
             streams.push(stream);

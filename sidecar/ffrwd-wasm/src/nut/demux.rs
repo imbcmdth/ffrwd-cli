@@ -10,7 +10,7 @@ use super::adts;
 use super::bytes::{crc32, ByteReader};
 use super::{
     flags, Media, Packet, Stream, TimeBase, ANNOTATION_CLASS, ANNOTATION_FOURCC,
-    ANNOTATION_STREAM_ID, AUDIO_CLASS, FILE_ID, MAIN_STARTCODE, STREAM_STARTCODE,
+    ANNOTATION_STREAM_ID, AUDIO_CLASS, FILE_ID, INFO_STARTCODE, MAIN_STARTCODE, STREAM_STARTCODE,
     SYNCPOINT_STARTCODE, TRAILING_KEY, VERSION, VIDEO_CLASS,
 };
 
@@ -100,6 +100,10 @@ pub struct Demuxer<R> {
     /// stream needs ADTS stripped, and handed back by the next call to
     /// `read_packet`.
     first_packet: Option<(Packet, Vec<u8>)>,
+    /// The byte the header section read one past, when what followed the
+    /// info packets was a frame rather than a syncpoint. Consumed by the
+    /// first read.
+    pending: Option<u8>,
     /// Whether every packet (the buffered first one included) has its ADTS
     /// header stripped before it reaches a caller. Set only for an aac
     /// stream that opened with no extradata of its own, whose first packet
@@ -185,7 +189,50 @@ impl<R: Read> Demuxer<R> {
         }
 
         let main = main.expect("the loop runs until the main header is read");
-        let stream = stream.expect("the loop runs until the stream header is read");
+        let mut stream = stream.expect("the loop runs until the stream header is read");
+
+        // Past the headers and before the first frame sit the info packets,
+        // which is where a writer states the frame rate: NUT carries no
+        // duration field, so `r_frame_rate` is the only thing on the wire a
+        // reader can work one out of. The section ends at the first
+        // syncpoint, which is consumed here and seeds the PTS the way
+        // `read_packet_inner` seeds it; a byte that starts a frame instead
+        // is held for the first read.
+        let mut pending = None;
+        let mut syncpoint = None;
+        loop {
+            let Some(first) = reader.read_u8_or_eof()? else {
+                break;
+            };
+            if first != b'N' {
+                pending = Some(first);
+                break;
+            }
+            match read_startcode(&mut reader, first)? {
+                SYNCPOINT_STARTCODE => {
+                    syncpoint = Some(read_body(&mut reader, "a syncpoint", true)?);
+                    break;
+                }
+                INFO_STARTCODE => {
+                    let body = read_body(&mut reader, "an info packet", true)?;
+                    if let Some(rate) = info_frame_rate(&body) {
+                        stream.frame_rate = Some(rate);
+                    }
+                }
+                MAIN_STARTCODE | STREAM_STARTCODE => bail!(
+                    "NUT input restates its headers before its first frame; this wire carries \
+                     one stream with one set of headers"
+                ),
+                _ => {
+                    read_body(&mut reader, "a packet", false)?;
+                }
+            }
+        }
+        let seeded = match syncpoint {
+            Some(body) => parse_syncpoint(&body, &main.time_bases, &stream)?,
+            None => 0,
+        };
+
         let pts_buffer = vec![None; stream.decode_delay as usize + 1];
         let mut demuxer = Demuxer {
             reader,
@@ -194,11 +241,12 @@ impl<R: Read> Demuxer<R> {
             time_bases: main.time_bases,
             frame_codes: main.frame_codes,
             elision: main.elision,
-            last_pts: [0; 2],
+            last_pts: [seeded; 2],
             pts_buffer,
             unclaimed_rows: HashMap::new(),
             trailing: Vec::new(),
             first_packet: None,
+            pending,
             strip_adts: false,
         };
         demuxer.detect_adts()?;
@@ -286,7 +334,11 @@ impl<R: Read> Demuxer<R> {
     /// unaware of ADTS.
     fn read_packet_inner(&mut self, data: &mut Vec<u8>) -> Result<Option<Packet>> {
         loop {
-            let Some(first) = self.reader.read_u8_or_eof()? else {
+            let next = match self.pending.take() {
+                held @ Some(_) => held,
+                None => self.reader.read_u8_or_eof()?,
+            };
+            let Some(first) = next else {
                 return Ok(None);
             };
 
@@ -531,6 +583,60 @@ fn headers_complete(
     stream.is_some() && (main.stream_count < 2 || annotation_stream)
 }
 
+/// The `r_frame_rate` an info packet states, as `(num, den)`, or None where
+/// it states none. An info packet holds named fields, each a name and a
+/// value whose type the leading signed integer picks; -1 is the UTF-8 string
+/// this one is written as, and every other type is read past. A field this
+/// cannot parse is not an error: an info packet is advisory, and a writer
+/// may put anything in one.
+fn info_frame_rate(body: &[u8]) -> Option<(u64, u64)> {
+    // `read_body` has already checked the checksum and cut it off, so what
+    // is left is the fields alone.
+    let mut r = ByteReader::new(body);
+    // stream_id_plus1, chapter_id, chapter_start, chapter_len, then count.
+    r.read_v().ok()?;
+    r.read_s().ok()?;
+    r.read_v().ok()?;
+    r.read_v().ok()?;
+    let count = r.read_v().ok()?;
+    for _ in 0..count.min(64) {
+        let name = r.read_vb("an info field name").ok()?;
+        let kind = r.read_s().ok()?;
+        let value = match kind {
+            // A UTF-8 string, which is how ffmpeg writes this field.
+            -1 => r.read_vb("an info field value").ok()?,
+            // A named type and its value, both strings.
+            -2 => {
+                r.read_vb("an info field type").ok()?;
+                r.read_vb("an info field value").ok()?
+            }
+            -3 => {
+                r.read_s().ok()?;
+                continue;
+            }
+            -4 => {
+                r.read_v().ok()?;
+                continue;
+            }
+            _ => continue,
+        };
+        if name == b"r_frame_rate" {
+            return parse_rate(&value);
+        }
+    }
+    None
+}
+
+/// `num/den` as an info packet spells a frame rate. Both have to be positive
+/// for the rate to mean anything.
+fn parse_rate(value: &[u8]) -> Option<(u64, u64)> {
+    let text = std::str::from_utf8(value).ok()?;
+    let (num, den) = text.split_once('/')?;
+    let num: u64 = num.trim().parse().ok()?;
+    let den: u64 = den.trim().parse().ok()?;
+    (num > 0 && den > 0).then_some((num, den))
+}
+
 /// Reads the seven bytes of a startcode that follow the `N` already seen.
 fn read_startcode<R: Read>(reader: &mut ByteReader<R>, first: u8) -> Result<u64> {
     let mut rest = [0u8; 7];
@@ -767,6 +873,8 @@ fn parse_stream(body: &[u8], main: &MainHeader, annotations: bool) -> Result<Str
         max_pts_distance,
         decode_delay,
         extradata,
+        // What an info packet states, which is read after this header.
+        frame_rate: None,
         media,
     };
     if decode_delay != 0 && stream.codec_name().is_none() {
@@ -934,6 +1042,7 @@ mod tests {
             max_pts_distance: 48000,
             decode_delay: 0,
             extradata,
+            frame_rate: None,
             media: Media::Audio {
                 sample_rate: 48000,
                 channels: 2,

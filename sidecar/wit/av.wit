@@ -198,6 +198,16 @@ interface types {
     row: u32,
     /// What the source read of that row.
     rendition: rendition-meta,
+    /// How deep this stream reorders: how many packets the decoder holds
+    /// back before the first picture leaves it. 0 where decode order IS
+    /// presentation order, and higher wherever B-frames do.
+    ///
+    /// It is the bound a module that must see packets in PRESENTATION
+    /// order works with: a packet's presentation successor has arrived
+    /// once `decode-delay` more packets have. It is also why `packet.dts`
+    /// is none for a pad's first `decode-delay` packets, which is the wire
+    /// not having settled them rather than the host withholding them.
+    decode-delay: u32,
   }
 }
 
@@ -507,11 +517,14 @@ interface packet-sink {
 ///   SEI to a keyframe leaves it a keyframe; nothing a filter does to the
 ///   bytes makes a non-keyframe one.
 ///
-/// A filter that rewrites a stream's out-of-band header - new extradata,
-/// a different profile - says so by answering `init` with the changed
-/// `coded-stream`; the host writes that header rather than the one it read.
-/// The header is the only part a filter may change: the codec, the time
-/// base and the geometry belong to the stream that arrived.
+/// A filter that rewrites a stream's out-of-band header - a new SPS and
+/// PPS, say - says so by answering `init` with the changed `extradata`, and
+/// the host writes that header rather than the one it read. Extradata is
+/// the only part a filter may change. The codec, the time base and the
+/// geometry belong to the stream that arrived; the profile and the level
+/// are not carried beside the packets at all, but read back out of the
+/// header itself, so a filter that raises a profile does it by writing the
+/// parameter set that says so.
 interface packet-filter {
   use types.{arity, coded-stream, input-stream, meta, pad-packets};
 
@@ -564,11 +577,13 @@ interface packet-filter {
   ///
   /// The list answered is the streams LEAVING, one per input pad and in the
   /// same order: ordinarily the ones that arrived, handed straight back. A
-  /// filter that rewrites a stream's extradata, profile or level answers the
-  /// changed `coded-stream` instead, and the host writes that header. The
-  /// codec, the time base and the geometry are not a filter's to change -
-  /// the packets leaving are packets of the stream that arrived - and a host
-  /// refuses those, and a list of any other length.
+  /// filter that rewrites a stream's out-of-band header answers the changed
+  /// `extradata` instead, and the host writes that. Everything else in the
+  /// record is the arriving stream's: the codec, the time base and the
+  /// geometry because the packets leaving are packets of the stream that
+  /// arrived, and the profile and the level because nothing carries them
+  /// beside the packets - they are read back out of the header. A host
+  /// refuses any of those changed, and a list of any other length.
   init: func(streams: list<input-stream>, params: string) -> result<list<coded-stream>, string>;
 
   /// Replaces the parameters between calls, as the other interfaces do.

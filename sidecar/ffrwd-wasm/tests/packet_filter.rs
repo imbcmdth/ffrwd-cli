@@ -135,16 +135,37 @@ fn read_packets(wire: &[u8]) -> Vec<(Packet, Vec<u8>)> {
     packets
 }
 
-/// The per-frame hash alone, dropping the timestamp and duration columns:
-/// what says two files decode to the same PICTURES. A muxer derives a
-/// sample's duration from its neighbours, and two containers holding the
-/// same packets need not write the same table, so the columns around the
-/// hash are the container's business rather than the filter's.
-fn frame_hashes(path: &Path) -> Vec<String> {
-    framemd5(path)
-        .lines()
-        .filter_map(|line| line.rsplit(',').next().map(|hash| hash.trim().to_string()))
-        .collect()
+/// Every packet's pts, dts and duration, as ffprobe reads them back. It is
+/// the whole of what a container is told about timing, so two files that
+/// agree here hold the same stream however they were written.
+fn packet_timing(path: &Path) -> String {
+    let output = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_packets",
+            "-of",
+            "compact=nk=1",
+            "-show_entries",
+            "packet=pts,dts,duration",
+            path.to_str().expect("path is UTF-8"),
+        ])
+        .output()
+        .expect("spawn ffprobe for packet timing");
+    assert!(
+        output.status.success(),
+        "ffprobe of {} exited with {:?}\nstderr:\n{}",
+        path.display(),
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
+    assert!(
+        text.lines().count() > 1,
+        "ffprobe read no packets out of {}",
+        path.display()
+    );
+    text
 }
 
 /// ffmpeg's framemd5 of a file, one line per decoded frame: what says two
@@ -265,11 +286,22 @@ fn an_identity_filter_hands_back_the_packets_it_was_given() {
         assert_eq!(now_data, was_data, "packet {index} bytes");
     }
 
+    // The tally, and with it the two things only the module can report: the
+    // reorder depth `init` was told, and that the final call carried the
+    // last packets rather than nothing. ffprobe: has_b_frames = 2.
+    let tally: serde_json::Value =
+        serde_json::from_str(run.stdout.trim()).expect("one trailing row");
+    assert_eq!(tally["pad"], 0);
+    assert_eq!(tally["packets"], PACKETS);
+    assert_eq!(tally["bytes"], TOTAL_BYTES);
     assert_eq!(
-        run.stdout.lines().collect::<Vec<&str>>(),
-        vec![format!(
-            r#"{{"pad":0,"packets":{PACKETS},"bytes":{TOTAL_BYTES}}}"#
-        )]
+        tally["decode_delay"], 2,
+        "the wire's reorder depth reached the module"
+    );
+    assert!(
+        tally["last_packets"].as_u64().expect("a packet count") > 0,
+        "the final call carried no packets, so a filter holding one back \
+         would have nowhere to put it"
     );
 }
 
@@ -313,18 +345,123 @@ fn real_ffmpeg_plays_what_an_identity_filter_wrote() {
         "the identity filter's NUT decodes to the fixture frame for frame"
     );
 
+    // Every packet's pts, dts and duration, straight off the wire. NUT has
+    // no duration field, so the only thing that carries one is the frame
+    // rate the stream states, and a filter that dropped it would leave a
+    // reordering stream with no durations at all.
+    assert_eq!(
+        packet_timing(&written),
+        packet_timing(&fixture_path()),
+        "the identity filter's NUT states the timing the fixture states"
+    );
+
     // And through a real muxer with -c copy, which is where a filter that
-    // broke the packet count or the order would show up.
+    // broke the packet count or the order would show up, and where a lost
+    // duration moves the first reordered packet's dts.
     let mp4 = scratch("playable.mp4");
     mux_to_mp4(&written, &mp4);
     let source = scratch("source.mp4");
     mux_to_mp4(&fixture_path(), &source);
     assert_eq!(
-        frame_hashes(&mp4),
-        frame_hashes(&source),
+        packet_timing(&mp4),
+        packet_timing(&source),
+        "the identity filter's mp4 holds the fixture's own packet timing"
+    );
+    assert_eq!(
+        framemd5(&mp4),
+        framemd5(&source),
         "the identity filter's mp4 decodes to the fixture's own frames"
     );
     for path in [&written, &mp4, &source] {
+        std::fs::remove_file(path).ok();
+    }
+}
+
+#[test]
+fn a_reordering_hevc_stream_keeps_its_timing_through_an_identity_filter() {
+    // The h264 fixture is committed; hevc is encoded here, because what is
+    // under test is the wire and not the codec, and a second committed
+    // fixture would only pin the same thing twice.
+    if !ffmpeg_on_path() {
+        announce_skip("real ffmpeg cannot encode the hevc stream this reads");
+        return;
+    }
+    let source = scratch("hevc.nut");
+    let output = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=64x48:rate=25:duration=2",
+            "-c:v",
+            "libx265",
+            "-x265-params",
+            "bframes=3:log-level=none",
+            "-g",
+            "30",
+            "-pix_fmt",
+            "yuv420p",
+            "-f",
+            "nut",
+            source.to_str().expect("path is UTF-8"),
+        ])
+        .output()
+        .expect("spawn ffmpeg to encode hevc");
+    if !output.status.success() {
+        announce_skip("this ffmpeg has no libx265 to encode a reordering hevc stream with");
+        return;
+    }
+
+    let module = module_path("packet_passthrough");
+    let written = scratch("hevc_out.nut");
+    let run = run_ffrwd_wasm(
+        &[
+            "-f",
+            "nut",
+            "-i",
+            source.to_str().expect("path is UTF-8"),
+            "-m",
+            module.to_str().expect("module path is UTF-8"),
+            "-f",
+            "nut",
+            written.to_str().expect("path is UTF-8"),
+            "-f",
+            "null",
+            "-",
+        ],
+        &[],
+    );
+    assert!(
+        run.output.status.success(),
+        "packet_passthrough exited with {:?}\nstderr:\n{}",
+        run.output.status.code(),
+        run.stderr
+    );
+
+    assert_eq!(
+        packet_timing(&written),
+        packet_timing(&source),
+        "the identity filter's hevc NUT states the timing the encode states"
+    );
+    let filtered_mp4 = scratch("hevc_out.mp4");
+    mux_to_mp4(&written, &filtered_mp4);
+    let source_mp4 = scratch("hevc_src.mp4");
+    mux_to_mp4(&source, &source_mp4);
+    assert_eq!(
+        packet_timing(&filtered_mp4),
+        packet_timing(&source_mp4),
+        "the identity filter's hevc mp4 holds the encode's own packet timing"
+    );
+    assert_eq!(
+        framemd5(&filtered_mp4),
+        framemd5(&source_mp4),
+        "the identity filter's hevc mp4 decodes to the encode's own frames"
+    );
+    for path in [&source, &written, &filtered_mp4, &source_mp4] {
         std::fs::remove_file(path).ok();
     }
 }
@@ -432,12 +569,71 @@ fn rows_reach_a_filter_and_the_packets_it_rewrote_still_decode() {
     let source_mp4 = scratch("sei_source.mp4");
     mux_to_mp4(&fixture_path(), &source_mp4);
     assert_eq!(
-        frame_hashes(&filtered_mp4),
-        frame_hashes(&source_mp4),
+        packet_timing(&filtered_mp4),
+        packet_timing(&source_mp4),
+        "weaving a message in moves no packet in time"
+    );
+    assert_eq!(
+        framemd5(&filtered_mp4),
+        framemd5(&source_mp4),
         "the woven stream decodes to the unfiltered encode's frames"
     );
 
     for path in [&rows, &written, &filtered_mp4, &source_mp4] {
+        std::fs::remove_file(path).ok();
+    }
+}
+
+#[test]
+fn params_come_out_of_a_file_as_readily_as_off_the_line() {
+    // A module's parameters can be long, and a command line is a poor place
+    // to keep one. The two spellings name the same value, and naming both
+    // is refused.
+    let module = module_path("packet_passthrough");
+    let params = scratch("params.json");
+    std::fs::write(&params, "{}").expect("write the params file");
+    let written = scratch("params_out.nut");
+    let argv = |from: &str| {
+        vec![
+            "-f".to_string(),
+            "nut".to_string(),
+            "-i".to_string(),
+            fixture_path()
+                .to_str()
+                .expect("fixture path is UTF-8")
+                .to_string(),
+            "-m".to_string(),
+            module.to_str().expect("module path is UTF-8").to_string(),
+            from.to_string(),
+            params.to_str().expect("params path is UTF-8").to_string(),
+            "-f".to_string(),
+            "nut".to_string(),
+            written.to_str().expect("output path is UTF-8").to_string(),
+        ]
+    };
+    let flags: Vec<String> = argv("-params-from");
+    let borrowed: Vec<&str> = flags.iter().map(String::as_str).collect();
+    let run = run_ffrwd_wasm(&borrowed, &[]);
+    assert!(
+        run.output.status.success(),
+        "-params-from exited with {:?}\nstderr:\n{}",
+        run.output.status.code(),
+        run.stderr
+    );
+
+    let mut both = flags.clone();
+    both.insert(6, "-params".to_string());
+    both.insert(7, "{}".to_string());
+    let borrowed: Vec<&str> = both.iter().map(String::as_str).collect();
+    let run = run_ffrwd_wasm(&borrowed, &[]);
+    assert!(!run.output.status.success());
+    assert!(
+        run.stderr.contains("-params-from and -params"),
+        "stderr does not refuse the pair:\n{}",
+        run.stderr
+    );
+
+    for path in [&params, &written] {
         std::fs::remove_file(path).ok();
     }
 }

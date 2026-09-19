@@ -8,8 +8,8 @@ use anyhow::{anyhow, bail, Result};
 use super::bytes::{crc32, put_s, put_u32, put_u64, put_v, put_vb};
 use super::{
     flags, Media, Packet, Stream, ANNOTATION_CLASS, ANNOTATION_FOURCC, ANNOTATION_STREAM_ID,
-    AUDIO_CLASS, FILE_ID, MAIN_STARTCODE, MAX_DISTANCE, STREAM_STARTCODE, SYNCPOINT_STARTCODE,
-    TRAILING_KEY, VERSION, VIDEO_CLASS,
+    AUDIO_CLASS, FILE_ID, INFO_STARTCODE, MAIN_STARTCODE, MAX_DISTANCE, STREAM_STARTCODE,
+    SYNCPOINT_STARTCODE, TRAILING_KEY, VERSION, VIDEO_CLASS,
 };
 
 /// The framecode every frame uses. It sets only `CODED`, so each frame states
@@ -83,6 +83,17 @@ impl<W: Write> Muxer<W> {
         if annotations {
             let header = annotation_stream_header(&muxer.stream);
             muxer.write_packet(STREAM_STARTCODE, &header)?;
+        }
+        // The frame rate, where the stream carries one. NUT has no duration
+        // field, so this info packet is the only thing that tells a reader
+        // how long a packet is shown for - and on a reordering stream it is
+        // the only thing that CAN, since the next packet read is not the
+        // next picture shown. It goes out with the headers, before the first
+        // frame, because a reader that learns the rate later has already
+        // handed out packets without it.
+        if let Some((num, den)) = muxer.stream.frame_rate {
+            let info = frame_rate_info(num, den);
+            muxer.write_packet(INFO_STARTCODE, &info)?;
         }
         // A buffered writer would otherwise hold the headers until a
         // megabyte of frames pushed them out, and a reader waiting on them
@@ -317,6 +328,23 @@ fn put_frame_code_group(body: &mut Vec<u8>, code_flags: u64, size_mul: u64, coun
     put_v(body, count);
 }
 
+/// The info packet that states the stream's frame rate: one field named
+/// `r_frame_rate`, whose value is `num/den` as a UTF-8 string. It is written
+/// against the media stream rather than the file, since the rate is the
+/// stream's.
+fn frame_rate_info(num: u64, den: u64) -> Vec<u8> {
+    let mut body = Vec::with_capacity(32);
+    put_v(&mut body, 1); // stream id plus one: stream 0
+    put_s(&mut body, 0); // chapter id: the whole stream
+    put_v(&mut body, 0); // chapter start
+    put_v(&mut body, 0); // chapter length
+    put_v(&mut body, 1); // one field
+    put_vb(&mut body, b"r_frame_rate");
+    put_s(&mut body, -1); // the value that follows is a UTF-8 string
+    put_vb(&mut body, format!("{num}/{den}").as_bytes());
+    body
+}
+
 /// The stream header: the codec tag, the geometry its class calls for, and
 /// how PTS are coded.
 fn stream_header(stream: &Stream) -> Vec<u8> {
@@ -397,6 +425,7 @@ mod tests {
             max_pts_distance: 25,
             decode_delay: 2,
             extradata: vec![0x67, 0x42, 0x00, 0x1e],
+            frame_rate: Some((25, 1)),
             media: Media::Video {
                 width: 16,
                 height: 16,
@@ -417,6 +446,7 @@ mod tests {
             max_pts_distance: 48000,
             decode_delay: 0,
             extradata: vec![0x11, 0x88, 0x56, 0xe5, 0x00],
+            frame_rate: None,
             media: Media::Audio {
                 sample_rate: 48000,
                 channels: 1,
