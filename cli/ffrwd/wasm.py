@@ -330,10 +330,9 @@ _JOBS_FLAG = "-jobs"
 # name rather than granted.
 EFFECTS: tuple[str, ...] = ("http", "udp", "tcp")
 
-# The sidecar flag that grants each effect to one module, per capability
-# name. Sockets are two grants: `-net` is the UDP one, named for what
-# reached for it first, and `-tcp` is the other.
-_GRANT_FLAGS: Mapping[str, str] = {"http": "-http", "udp": "-net", "tcp": "-tcp"}
+# The sidecar flag that grants each effect to one module: one flag per
+# capability, named for it.
+_GRANT_FLAGS: Mapping[str, str] = {"http": "-http", "udp": "-udp", "tcp": "-tcp"}
 MODEL_SUFFIX = ".onnx"
 ANNOTATIONS_IN = "in"
 ANNOTATIONS_OUT = "out"
@@ -387,7 +386,7 @@ class Described:
     that names none. `nn` is whether the export runs a model, which is what
     puts a ``-nn`` binding on the sidecar's own command line. `http`, `udp`
     and `tcp` are the effects the module imports, each of which puts the
-    matching grant -- ``-http``, ``-net``, ``-tcp`` -- on that command line.
+    matching grant -- ``-http``, ``-udp``, ``-tcp`` -- on that command line.
     The two socket effects are read apart: `wasi:sockets` splits its
     protocols into interfaces of their own, so a module that imports
     ``wasi:sockets/udp`` needs `udp` and one that imports
@@ -447,7 +446,7 @@ class Described:
     nn: bool = False
     # Whether the module imports wasi:http, wasi:sockets/udp or
     # wasi:sockets/tcp, and so runs only under the sidecar's matching
-    # ``-http`` / ``-net`` / ``-tcp`` grant.
+    # ``-http`` / ``-udp`` / ``-tcp`` grant.
     http: bool = False
     udp: bool = False
     tcp: bool = False
@@ -749,7 +748,7 @@ def describe(path: str) -> Described:
 
 
 def _grant_args(described: Described, path: str) -> list[str]:
-    """The ``-http``/``-net``/``-tcp`` grants `described`'s own imports need
+    """The ``-http``/``-udp``/``-tcp`` grants `described`'s own imports need
     for `path`, which :func:`invoke` and :func:`probe_source` both put ahead
     of the flag that dispatches their call."""
     argv: list[str] = []
@@ -776,7 +775,7 @@ def invoke(
     `described` is the module's own declared interface, when the caller has
     already read one -- the same :class:`Described` :func:`describe` returns.
     A module that imports `wasi:http` or `wasi:sockets` needs its effect
-    granted the same way a run grants it: ``-http``/``-net <path>`` ahead of
+    granted the same way a run grants it: ``-http``/``-udp <path>`` ahead of
     ``--invoke``, the sidecar's own argv order. A module that runs a model
     gets the same ``-nn name=path`` binding, plus ``-nn-runtime``/
     ``-nn-target``, ahead of those grants -- :func:`model_binding` names the
@@ -1609,7 +1608,7 @@ def _argv(
     reader has their own machine's. ``-nn-exclude`` names a provider a bound
     model's own pin denies, ahead of the ``-nn`` table the same way.
 
-    ``-http`` and ``-net`` grant one module its effects, also ahead of the
+    ``-http`` and ``-udp`` grant one module its effects, also ahead of the
     module table: the sidecar denies both to any module the argv never
     names.
 

@@ -592,7 +592,7 @@ fn take_nn_args(argv: Vec<String>) -> Result<(nn::Config, Vec<String>)> {
 /// Takes the effect grants out of the argv and leaves the rest.
 ///
 /// `-http <module>` lets the module at that path make outbound HTTP
-/// requests; `-net <module>` lets it open UDP sockets and `-tcp <module>`
+/// requests; `-udp <module>` lets it open UDP sockets and `-tcp <module>`
 /// TCP ones, one protocol each. Each is per module
 /// and repeatable; a module the argv never names gets neither. Read before
 /// the argv is dispatched, the way the inference options are.
@@ -605,7 +605,7 @@ fn take_grant_args(argv: Vec<String>) -> Result<Vec<String>> {
         };
         match arg.as_str() {
             "-http" => ffrwd_wasm_runtime::runtime::grant_http(&next("-http")?)?,
-            "-net" => ffrwd_wasm_runtime::runtime::grant_net(&next("-net")?)?,
+            "-udp" => ffrwd_wasm_runtime::runtime::grant_udp(&next("-udp")?)?,
             "-tcp" => ffrwd_wasm_runtime::runtime::grant_tcp(&next("-tcp")?)?,
             _ => rest.push(arg),
         }
@@ -3165,7 +3165,7 @@ struct Description {
     /// grant to run at all. Read off its imports. Always present.
     http: bool,
     /// Whether the component imports `wasi:sockets/udp`, and so needs a
-    /// `-net` grant to send a datagram. Read off its imports. Always
+    /// `-udp` grant to send a datagram. Read off its imports. Always
     /// present.
     udp: bool,
     /// Whether the component imports `wasi:sockets/tcp`, and so needs a
@@ -3558,7 +3558,7 @@ fn catalog_json(catalog: &runtime::Catalog) -> CatalogJson {
 /// The `-params` value out of `--probe`'s trailing argv; every other flag is
 /// refused by name.
 ///
-/// `-http`/`-net` go through `take_grant_args` first, the parser a run's own
+/// `-http`/`-udp` go through `take_grant_args` first, the parser a run's own
 /// argv takes them through: a source that needs an effect to answer its
 /// probe is granted it the same way running would grant it.
 fn parse_probe_args(rest: &[String]) -> Result<String> {
@@ -4416,11 +4416,11 @@ mod grant_args_tests {
         assert_eq!(rest, strings(&["--invoke", "module.wasm", "fn", "{}"]));
     }
 
-    /// `-net` is taken out the same way, for the udp grant's symmetry with
+    /// `-udp` is taken out the same way, for the udp grant's symmetry with
     /// the http one, and `-tcp` beside it for the same reason.
     #[test]
-    fn a_net_grant_is_taken_out_the_same_way() {
-        let argv = strings(&["-net", "module.wasm", "--invoke", "module.wasm", "fn", "{}"]);
+    fn a_udp_grant_is_taken_out_the_same_way() {
+        let argv = strings(&["-udp", "module.wasm", "--invoke", "module.wasm", "fn", "{}"]);
         let rest = take_grant_args(argv).expect("parses");
         assert_eq!(rest, strings(&["--invoke", "module.wasm", "fn", "{}"]));
     }
@@ -4454,14 +4454,14 @@ mod probe_args_tests {
         args.iter().map(|s| s.to_string()).collect()
     }
 
-    /// `-http`/`-net` reach `parse_probe_args` the same as any other grant
+    /// `-http`/`-udp` reach `parse_probe_args` the same as any other grant
     /// flag would ahead of a run, and are taken out rather than refused.
     #[test]
     fn a_grant_flag_is_accepted_and_params_is_still_read() {
         let params = parse_probe_args(&strings(&[
             "-http",
             "module.wasm",
-            "-net",
+            "-udp",
             "module.wasm",
             "-params",
             "{}",
@@ -4476,9 +4476,19 @@ mod probe_args_tests {
         assert_eq!(params, "");
     }
 
+    /// `-net` was the udp grant's flag before it was named for its own
+    /// capability. It is not an alias: the compiler and the sidecar ship
+    /// together, so an old spelling is a stale caller rather than an
+    /// older one, and it is refused the way any unknown flag is.
+    #[test]
+    fn the_flags_old_spelling_is_not_an_alias() {
+        let err = parse_probe_args(&strings(&["-net", "module.wasm"])).unwrap_err();
+        assert_eq!(err.to_string(), "--probe: unknown flag -net");
+    }
+
     #[test]
     fn an_unknown_flag_is_still_refused() {
-        let err = parse_probe_args(&strings(&["-net", "module.wasm", "-bogus"])).unwrap_err();
+        let err = parse_probe_args(&strings(&["-udp", "module.wasm", "-bogus"])).unwrap_err();
         assert_eq!(err.to_string(), "--probe: unknown flag -bogus");
     }
 }

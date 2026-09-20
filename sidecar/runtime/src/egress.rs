@@ -1,5 +1,5 @@
 //! Outbound network policy, read from `FFRWD_NET_POLICY`. Unset leaves the
-//! two grants (`-net`, `-http`) unrestricted; `public` refuses destinations
+//! two grants (`-udp`, `-http`) unrestricted; `public` refuses destinations
 //! in the private, loopback, link-local, carrier-NAT, multicast and
 //! broadcast ranges. Local binds are never restricted.
 //!

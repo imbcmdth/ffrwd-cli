@@ -4483,14 +4483,14 @@ def test_an_http_module_earns_its_grant_on_the_argv() -> None:
     argv = wasm.shown_argv(plan.sidecars[0])
     at = argv.index("-http")
     assert argv[at + 1] == SINK_MODULE
-    assert "-net" not in argv
+    assert "-udp" not in argv
 
 
 def test_a_udp_module_earns_its_grant_on_the_argv() -> None:
     plan = _sink_plan(SINK_RECIPE, _sink_described(udp=True)).plan
     assert plan is not None
     argv = wasm.shown_argv(plan.sidecars[0])
-    at = argv.index("-net")
+    at = argv.index("-udp")
     assert argv[at + 1] == SINK_MODULE
     assert "-http" not in argv
 
@@ -4499,7 +4499,7 @@ def test_a_module_needing_no_effect_is_granted_none() -> None:
     plan = _sink_plan(SINK_RECIPE).plan
     assert plan is not None
     argv = wasm.shown_argv(plan.sidecars[0])
-    assert "-http" not in argv and "-net" not in argv
+    assert "-http" not in argv and "-udp" not in argv
 
 
 def test_the_effect_flags_are_read_off_the_describe_payload() -> None:
@@ -4532,7 +4532,7 @@ def test_the_two_socket_protocols_are_read_apart() -> None:
 
 
 def test_each_effect_puts_its_own_flag_on_the_argv() -> None:
-    for effect, flag in (("http", "-http"), ("udp", "-net"), ("tcp", "-tcp")):
+    for effect, flag in (("http", "-http"), ("udp", "-udp"), ("tcp", "-tcp")):
         described = Described(world="ffrwd:av@0.15.0", name="p", **{effect: True})
         assert wasm._grant_args(described, SINK_MODULE) == [flag, SINK_MODULE]
 
@@ -4900,7 +4900,7 @@ def test_probe_source_grants_the_effects_described_asks_ahead_of_the_probe_flag(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A source module that needs the network to answer its own probe gets
-    the same ``-http``/``-net <path>`` grant :func:`invoke` gives it, ahead
+    the same ``-http``/``-udp <path>`` grant :func:`invoke` gives it, ahead
     of ``--probe``; a source that imports neither -- or a caller with no
     description in hand -- gets neither flag."""
     calls = _fake_wasm_run(monkeypatch, json.dumps(_SOURCE_CATALOG_JSON))
@@ -4916,7 +4916,7 @@ def test_probe_source_grants_the_effects_described_asks_ahead_of_the_probe_flag(
     wasm.probe_source(PACKET_SOURCE_MODULE, "{}")
     assert calls == [
         [
-            "ffrwd-wasm", "-net", PACKET_SOURCE_MODULE,
+            "ffrwd-wasm", "-udp", PACKET_SOURCE_MODULE,
             "--probe", PACKET_SOURCE_MODULE, "-params", "{}",
         ],
         ["ffrwd-wasm", "--probe", PACKET_SOURCE_MODULE, "-params", "{}"],
@@ -5184,7 +5184,7 @@ def test_a_packet_source_with_no_tracks_is_refused() -> None:
 
 
 def test_a_packet_sources_own_grant_rides_ahead_of_its_module_table() -> None:
-    """A source importing wasi:sockets carries the same ``-net <path>``
+    """A source importing wasi:sockets carries the same ``-udp <path>``
     ahead of ``-m`` a sink's own grant does -- the flag reads `process.grants`
     without asking whether the process is a source or a sink."""
     process = replace(
@@ -5192,7 +5192,7 @@ def test_a_packet_sources_own_grant_rides_ahead_of_its_module_table() -> None:
         grants=(EffectGrant(effect="udp", module=PACKET_SOURCE_MODULE),),
     )
     argv = wasm.shown_argv(process, writes=["p0", "p1"])
-    at = argv.index("-net")
+    at = argv.index("-udp")
     assert argv[at + 1] == PACKET_SOURCE_MODULE
     assert at < argv.index("-m")
     assert "-http" not in argv
@@ -5200,7 +5200,7 @@ def test_a_packet_sources_own_grant_rides_ahead_of_its_module_table() -> None:
 
 def test_a_packet_source_needing_no_effect_carries_no_grant_flag() -> None:
     argv = wasm.shown_argv(_packet_source(), writes=["p0", "p1"])
-    assert "-http" not in argv and "-net" not in argv
+    assert "-http" not in argv and "-udp" not in argv
 
 
 def test_a_packet_sources_rows_document_reads_its_path_past_the_tracks() -> None:

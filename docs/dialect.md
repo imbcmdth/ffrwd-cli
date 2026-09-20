@@ -162,7 +162,7 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   sink call anywhere else is refused. A
   module importing `wasi:http` or `wasi:sockets` runs only under the
   sidecar's matching per-module grant (`-http <module>`,
-  `-net <module>`), which the compiler emits from the module's own
+  `-udp <module>`), which the compiler emits from the module's own
   describe; both are denied without it. Secrets do not belong in the
   value arguments - the query text is the command line. Recipes
   [98](examples.md#98-post-what-a-module-found-as-it-is-found),

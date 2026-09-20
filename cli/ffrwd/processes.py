@@ -606,7 +606,7 @@ class ModelBinding:
 
 @dataclass(frozen=True)
 class EffectGrant:
-    """One ``-http <path>`` or ``-net <path>``: an effect one module is allowed.
+    """One ``-http <path>`` or ``-udp <path>``: an effect one module is allowed.
 
     `effect` is the capability name -- ``http`` for outbound HTTP requests,
     ``udp`` for UDP sockets, ``tcp`` for TCP ones -- and `module` the path of

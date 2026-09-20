@@ -1595,8 +1595,8 @@ pub fn grant_http(path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Records one `-net <module>`: the module at `path` may open UDP sockets.
-pub fn grant_net(path: &str) -> Result<()> {
+/// Records one `-udp <module>`: the module at `path` may open UDP sockets.
+pub fn grant_udp(path: &str) -> Result<()> {
     let mut table = grant_table()
         .lock()
         .map_err(|_| anyhow!("grant table poisoned"))?;
@@ -1617,10 +1617,10 @@ pub fn grant_tcp(path: &str) -> Result<()> {
 }
 
 /// The store's WASI context: no preopens, no env, no args; stderr passes
-/// through. The network is reachable only for a module granted `-net`, and
+/// through. The network is reachable only for a module granted `-udp`, and
 /// One protocol per grant: inherit_network opens only the address check,
 /// and each protocol stays refused until it is allowed by name, so a module
-/// granted `-net` cannot open a TCP socket and one granted `-tcp` cannot
+/// granted `-udp` cannot open a TCP socket and one granted `-tcp` cannot
 /// send a datagram. Name resolution is allowed by neither. Under the public
 /// policy the address check refuses non-public destinations; binds, listens
 /// and accepts stay open, since only where traffic goes is policed.
@@ -1873,7 +1873,7 @@ pub fn imports_wasi_http(module_path: &str) -> Result<bool> {
 }
 
 /// Whether the component at `module_path` asks the host for UDP, and so
-/// needs a `-net` grant to send a datagram. Read off its imports.
+/// needs a `-udp` grant to send a datagram. Read off its imports.
 pub fn imports_wasi_udp(module_path: &str) -> Result<bool> {
     let component = compile(module_path)?;
     Ok(imports_interface(&component, UDP_IMPORT_PREFIX))
@@ -5782,7 +5782,7 @@ mod socket_grant_test {
     fn a_grant_is_per_module_and_per_protocol() {
         let path = "some/module/for/the/grant/table.wasm";
         assert!(!granted(path).expect("read the table").sockets());
-        grant_net(path).expect("record the udp grant");
+        grant_udp(path).expect("record the udp grant");
         let after = granted(path).expect("read the table");
         assert!(
             after.udp && !after.tcp,
@@ -5808,7 +5808,7 @@ mod socket_grant_test {
 // generically here rather than through an adapter. The test skips when the
 // artifact has not been built.
 #[cfg(test)]
-mod net_grant_test {
+mod udp_grant_test {
     use super::*;
     use wasmtime::component::ComponentExportIndex;
 
@@ -5883,7 +5883,7 @@ mod net_grant_test {
         );
 
         // A grant naming a DIFFERENT module leaves this one refused.
-        grant_net("some/other/module.wasm").expect("record the other grant");
+        grant_udp("some/other/module.wasm").expect("record the other grant");
         let still_denied = run_component(&path, NetPolicy::Unrestricted);
         assert!(
             still_denied.is_err(),
@@ -5891,7 +5891,7 @@ mod net_grant_test {
         );
 
         // With its own grant: the same module round-trips its datagram.
-        grant_net(&path.display().to_string()).expect("record the grant");
+        grant_udp(&path.display().to_string()).expect("record the grant");
         run_component(&path, NetPolicy::Unrestricted).expect("granted run");
         assert_eq!(
             peer.join().expect("echo peer"),
