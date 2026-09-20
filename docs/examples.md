@@ -570,7 +570,7 @@ ffmpeg -i tests/fixtures/av.mp4 -map 0:v:0 -c:0 copy -f nut pipe:1 | ffrwd-wasm 
   -fpsprobesize 3 -i pipe:0 -map 1:v:0 -c:0 copy -map 0:a:0 -c:1 copy woven.mp4
 ```
 
-Nothing here decodes a picture. The video already arrives in a codec the module accepts, so the first ffmpeg copies it onto the pipe, the sidecar hands the packets through, and the muxer copies them into the file - which is what makes this the cheap way to add data to something already encoded. The audio never touches the pipe at all: the muxer opens the source itself for it, so both streams reach the file with the times they had.
+Nothing here decodes a picture. The video already arrives in a codec the module accepts, so the first ffmpeg copies it onto the pipe, the sidecar hands the packets through, and the muxer copies them into the file - which is what makes this the cheap way to add data to something already encoded. The audio never touches the pipe at all: the muxer opens the source itself for it, so both streams reach the file with the times they had. That holds whatever else the query does with the audio - a module reading it for rows of its own puts a `split` in front of the column, and the muxer maps the source through it rather than taking the module's decoded samples off a pipe.
 
 Name an encoder and the same shape re-encodes instead - `WITH (video_codec 'libx264', crf 20)` puts `-c:0 libx264 -crf:0 20` on the first ffmpeg, one process ahead of where it would otherwise have been, and the destination still copies what the filter wrote.
 
