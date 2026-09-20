@@ -117,6 +117,14 @@ output is plain ffmpeg, so the two mix freely in a script.
   starts. It is the streams' own start skew, tens of milliseconds on an
   ordinary remux. Chapter and cue rows are unaffected either way:
   MPEG-TS carries neither.
+- **A stream that crosses a pipe starts at zero on the far side.** Each
+  input of an ffmpeg command is re-based by its own start, and a pipe
+  carries one stream, so a video that opened 23 ms after its file did
+  (the usual gap behind primed AAC in Matroska) opens at zero once a
+  packet filter or a module has handed it on, while the sound the
+  muxer reads from the source keeps its place. The pictures arrive
+  that much early against the sound. It is the streams' start skew and
+  no more, and a file whose streams open together is unaffected.
 - **A sidecar process reads one stream and writes one.** A region of
   modules can fan out and fan in as much as it likes inside itself,
   but its BOUNDARY is one pipe each way: only stdin and stdout are
