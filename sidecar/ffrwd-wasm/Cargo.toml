@@ -17,7 +17,7 @@ path = "src/main.rs"
 ffrwd-wasm-runtime = { path = "../runtime" }
 # The NUT wire, which used to be src/nut/, pinned by tag the way ffrwd-frame
 # is. The annotation stream is the sidecar's own, so it asks for the feature.
-ffrwd-nut = { git = "https://github.com/imbcmdth/ffrwd-nut", tag = "v0.1.1", features = ["annotations"] }
+ffrwd-nut = { git = "https://github.com/imbcmdth/ffrwd-nut", tag = "v0.1.2", features = ["annotations"] }
 # The H.264 byte level, pinned by tag the same way. The SPS this reads is the
 # one the NUT wire hands over as extradata.
 ffrwd-nal = { git = "https://github.com/imbcmdth/ffrwd-nal", tag = "v0.1.0" }

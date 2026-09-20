@@ -1422,8 +1422,7 @@ impl Sink {
     fn end_batch(&mut self) -> Result<()> {
         if self.frames_pipe {
             if let Some(w) = self.frames.as_mut() {
-                // The muxer's flush: it leaves the stream open.
-                w.finish()?;
+                w.flush()?;
             }
         }
         Ok(())
@@ -3086,7 +3085,7 @@ fn write_track(
         for packet in &batch {
             write_coded_packet(&mut muxer, packet)?;
         }
-        muxer.finish()?;
+        muxer.flush()?;
     }
     Ok(muxer.finish()?)
 }
