@@ -1117,7 +1117,10 @@ Each column is one of:
   original kind - the same freedom an ordinary aliased SELECT column
   already has.
 
-Subscripts are positive integer literals, 1-based.
+Subscripts are positive integer literals, 1-based. What is subscripted
+is the shape underneath, so parentheses around it change nothing:
+`(f.audio)[1]` is `f.audio[1]`, and `(ARRAY[1920, 1280])[i.i]` is the
+array element below.
 `(f.audio[1]).codec`-style accessors reach row columns without
 unnest; in WHERE they are assertions. A tag is read by path,
 `f.tags.title` / `t.tags.language`, one key at a time, and so is a
@@ -1176,6 +1179,14 @@ value := literal | NULL | row-column | input-scalar
        | ARRAY[STRUCT(...)::chapter, ...]    -- record arrays: chapter,
        | ARRAY[STRUCT(...)::cue, ...]        -- cue, attachment
 ```
+
+An array element's list is literals of one type - written out, or what
+a comma-split `-v` list substitutes to - and may be parenthesized. The
+subscript is 1-based as Postgres, and one past either end is a
+rejection naming the length rather than Postgres's NULL: every
+relation here is counted before ffmpeg runs, so a rung that quietly
+picked nothing would ship a command with the option missing and
+nothing to say why.
 
 `::text` is the spelling; `CAST(value AS text)` compiles too, but only
 because sqlglot 30.17 parses it to the identical node with no marker

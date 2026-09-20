@@ -1916,7 +1916,25 @@ def parse(
             raise syntax_error
     if unset:
         _annotate_unset(tree, unset)
+    _unwrap_subscripted(tree)
     return tree
+
+
+def _unwrap_subscripted(tree: exp.Expression) -> None:
+    """``(<expr>)[k]`` is ``<expr>[k]``: drop the parentheses around a subscript base.
+
+    What is subscripted is decided by the shape underneath, so the brackets a
+    writer puts around it (``(ARRAY[1920, 1280])[i.i]``, ``(f.audio)[1]``)
+    have to come off before anything reads that shape. Only the base moves --
+    the subscript itself, and every other parenthesized expression in the
+    tree, is untouched.
+    """
+    for bracket in tree.find_all(exp.Bracket):
+        inner = bracket.this
+        while isinstance(inner, exp.Paren) and isinstance(inner.this, exp.Expr):
+            inner = inner.this
+        if inner is not bracket.this:
+            bracket.set("this", inner)
 
 
 def _statements(tree: exp.Expr) -> list[exp.Expr]:

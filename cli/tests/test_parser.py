@@ -2835,6 +2835,22 @@ def test_array_element_shape_rejections(expr: str, message: str) -> None:
     assert err.message == message
 
 
+@pytest.mark.parametrize(
+    "spelling", ["ARRAY[1, 2][t.index]", "(ARRAY[1, 2])[t.index]", "((ARRAY[1, 2]))[t.index]"]
+)
+def test_a_subscripted_array_may_be_parenthesized(spelling: str) -> None:
+    """What is subscripted is the shape underneath, so the brackets a writer
+    puts around it change nothing -- the same rule a stream subscript follows."""
+    _resolve(
+        "SELECT t FROM input('f.mkv') f, unnest(f.audio) t "
+        f"WHERE t.channels = {spelling}"
+    )
+
+
+def test_a_parenthesized_stream_column_still_subscripts_as_a_stream() -> None:
+    _resolve("SELECT (f.video)[1] FROM input('f.mkv') f")
+
+
 def test_a_text_column_cannot_subscript_an_array() -> None:
     err = _reject(
         "SELECT t FROM input('f.mkv') f, unnest(f.audio) t "
