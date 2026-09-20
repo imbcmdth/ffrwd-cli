@@ -8,6 +8,10 @@ name = "packet_sei"
 crate-type = ["cdylib"]
 
 [dependencies]
+# The H.264 byte level: this module frames and places its SEI with it rather
+# than writing NAL bytes of its own. Pinned by tag, the way the sidecar
+# workspace pins ffrwd-nut.
+ffrwd-nal = { git = "https://github.com/imbcmdth/ffrwd-nal", tag = "v0.1.0" }
 wit-bindgen = "0.57.1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"

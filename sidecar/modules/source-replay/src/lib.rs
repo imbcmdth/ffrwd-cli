@@ -236,14 +236,17 @@ mod tests {
     #[test]
     fn every_packets_bytes_start_with_its_own_annex_b_start_code() {
         // libx264 writes a 3-byte start code (00 00 01) or a 4-byte one (00
-        // 00 00 01) depending on the NAL - both are legal Annex-B.
+        // 00 00 01) depending on the NAL - both are legal Annex-B, and the
+        // scanner cuts on either. A packet whose first NAL does not begin at
+        // byte zero has bytes in front of its start code, which is what
+        // ffmpeg ignores and what this fixture must not carry.
         for (index, expected_len) in PACKET_LENS.iter().enumerate() {
             let bytes = packet_bytes(index);
             assert_eq!(bytes.len(), *expected_len);
-            let starts_with_code = bytes.starts_with(&[0x00, 0x00, 0x01])
-                || bytes.starts_with(&[0x00, 0x00, 0x00, 0x01]);
-            assert!(
-                starts_with_code,
+            let nals = ffrwd_nal::annexb::scan_nals(bytes);
+            assert_eq!(
+                nals.first().map(|nal| nal.code),
+                Some(0),
                 "packet {index} does not start with a start code"
             );
         }

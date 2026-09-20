@@ -9,3 +9,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 wit-bindgen = "0.57.1"
+
+[dev-dependencies]
+# The Annex B scanner the fixture's own bytes are checked with.
+ffrwd-nal = { git = "https://github.com/imbcmdth/ffrwd-nal", tag = "v0.1.0" }

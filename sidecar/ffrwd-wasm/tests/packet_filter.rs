@@ -547,8 +547,19 @@ fn rows_reach_a_filter_and_the_packets_it_rewrote_still_decode() {
         assert_eq!(now.keyframe, was.keyframe, "packet {index} keyframe");
         if now_data.len() != was_data.len() {
             assert!(now.keyframe, "packet {index} grew and is not a keyframe");
-            assert!(
-                now_data.ends_with(was_data),
+            // The SEI goes in before the first coded slice, not at the very
+            // front, so what is pinned is that ONE run of new bytes was
+            // spliced in somewhere and every byte the encoder wrote is still
+            // there, in its own order, on either side of the splice.
+            let added = now_data.len() - was_data.len();
+            let kept = now_data
+                .iter()
+                .zip(was_data.iter())
+                .take_while(|(now, was)| now == was)
+                .count();
+            assert_eq!(
+                &now_data[kept + added..],
+                &was_data[kept..],
                 "packet {index} lost the bytes the encoder wrote"
             );
             grew += 1;

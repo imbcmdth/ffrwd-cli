@@ -603,6 +603,11 @@ dependencies = [
 ]
 
 [[package]]
+name = "ffrwd-nal"
+version = "0.1.0"
+source = "git+https://github.com/imbcmdth/ffrwd-nal?tag=v0.1.0#bd2ffcf559065b8364369bbc0b24df7220b96eb8"
+
+[[package]]
 name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1322,6 +1327,7 @@ dependencies = [
 name = "packet-sei"
 version = "0.1.0"
 dependencies = [
+ "ffrwd-nal",
  "serde",
  "serde_json",
  "wit-bindgen 0.57.1",
@@ -1731,6 +1737,7 @@ dependencies = [
 name = "source-replay"
 version = "0.1.0"
 dependencies = [
+ "ffrwd-nal",
  "wit-bindgen 0.57.1",
 ]
 
@@ -1745,6 +1752,7 @@ dependencies = [
 name = "source-replay-0150"
 version = "0.1.0"
 dependencies = [
+ "ffrwd-nal",
  "wit-bindgen 0.57.1",
 ]
 

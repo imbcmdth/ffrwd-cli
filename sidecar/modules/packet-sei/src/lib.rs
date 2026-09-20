@@ -6,9 +6,10 @@
 //! base. Rows arrive whenever the host has them, which is not when their
 //! packet does, so they are held until a keyframe at or past their pts goes
 //! by; that keyframe leaves carrying a `user_data_unregistered` SEI NAL with
-//! the notes in it, and a row saying so is emitted. The packet's own bytes
-//! are untouched - the SEI is prepended, which is where a prefix SEI
-//! belongs - and its pts, dts, duration and keyframe flag are handed
+//! the notes in it, and a row saying so is emitted. `ffrwd-nal` builds that
+//! NAL, frames it the way the stream frames one and splices it in before the
+//! first coded slice, where a prefix SEI belongs; the packet's own bytes are
+//! untouched, and its pts, dts, duration and keyframe flag are handed
 //! through.
 //!
 //! The last row it writes says what it SAW of its rows: how many calls it
@@ -35,6 +36,8 @@ use crate::ffrwd::av::types::Packet;
 use exports::ffrwd::av::packet_filter::{
     Arity, CodedStream, Filtered, Guest, InputStream, Meta, PacketFilterMeta, PadPackets,
 };
+use ffrwd_nal::config::{framing_of, Framing};
+use ffrwd_nal::Select;
 use serde::{Deserialize, Serialize};
 
 const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{},"additionalProperties":false}"#;
@@ -42,11 +45,16 @@ const ROWS_SCHEMA: &str = r#"{"type":"object","properties":{"pad":{"type":"integ
 
 /// The unit's own name, 16 bytes of `uuid_iso_iec_11578`. Chosen with no
 /// zero byte in it so nothing in the message can start an emulation
-/// sequence, which is what lets this module write the NAL without escaping
-/// it: the notes beside it are ASCII for the same reason.
+/// sequence: the notes beside it are ASCII for the same reason, so the NAL
+/// written from it comes out of the escaper unchanged.
 const UUID: [u8; 16] = [
     0x66, 0x66, 0x72, 0x77, 0x64, 0x2d, 0x73, 0x65, 0x69, 0x2d, 0x74, 0x65, 0x73, 0x74, 0x21, 0x21,
 ];
+
+/// Which payloads in a stream are this module's. The AV1 `metadata_type`
+/// beside the UUID is never read: `describe` names h264 as the one codec
+/// this can be opened for.
+const SELECT: Select = Select::new(UUID, 25);
 
 /// One row this module reads: a note and the tick it belongs at.
 ///
@@ -102,8 +110,9 @@ struct State {
     /// The distinct `_arg` values seen, in the order they first arrived.
     /// Empty where the rows came in unnamed.
     args: Vec<String>,
-    /// How the stream frames its NALs, read off `init`'s extradata.
-    framing: Framing,
+    /// How the stream frames its NALs, read off `init`'s extradata. None
+    /// only before `init` has run.
+    framing: Option<Framing>,
 }
 
 /// What the instance saw of its rows, emitted once at the end.
@@ -126,79 +135,27 @@ fn validate_params(params: &str) -> Result<(), String> {
     }
 }
 
-/// How this stream frames its NALs, read off the codec's out-of-band header.
-///
-/// An h264 stream travels one of two ways and a filter rewriting NALs has to
-/// know which: Annex B prefixes each with a start code, and the `avcC`
-/// framing an MP4 uses prefixes each with its own length. The header says
-/// so -- `avcC` begins with a version byte of 1 and carries the length size
-/// in its fifth -- and a stream copied out of an MP4 arrives framed the
-/// second way, where an encoder writing into NUT arrives framed the first.
-#[derive(Clone, Copy, Default)]
-enum Framing {
-    #[default]
-    AnnexB,
-    Length(usize),
-}
-
-impl Framing {
-    fn read(extradata: &[u8]) -> Framing {
-        if extradata.len() >= 5 && extradata[0] == 1 {
-            return Framing::Length((extradata[4] & 0x03) as usize + 1);
-        }
-        Framing::AnnexB
-    }
-
-    /// `nal`, without its framing, written the way this stream frames one.
-    fn frame(self, nal: Vec<u8>) -> Vec<u8> {
-        match self {
-            Framing::AnnexB => {
-                let mut framed = vec![0x00, 0x00, 0x00, 0x01];
-                framed.extend_from_slice(&nal);
-                framed
-            }
-            Framing::Length(size) => {
-                let mut framed = Vec::with_capacity(size + nal.len());
-                let length = nal.len();
-                for shift in (0..size).rev() {
-                    framed.push(((length >> (shift * 8)) & 0xff) as u8);
-                }
-                framed.extend_from_slice(&nal);
-                framed
-            }
-        }
-    }
-}
-
-/// One `user_data_unregistered` SEI NAL, unframed, carrying `notes` joined by
-/// newlines. `payload_size` is coded the way the standard says: `0xff` for
-/// each whole 255, then the remainder.
-fn sei_nal(notes: &[&str]) -> Vec<u8> {
-    let text = notes.join("\n");
-    let payload_size = UUID.len() + text.len();
-    let mut nal = vec![0x06, 0x05];
-    let mut left = payload_size;
-    while left >= 255 {
-        nal.push(0xff);
-        left -= 255;
-    }
-    nal.push(left as u8);
-    nal.extend_from_slice(&UUID);
-    nal.extend_from_slice(text.as_bytes());
-    // rbsp_trailing_bits: the stop bit and the alignment zeroes after it.
-    nal.push(0x80);
-    nal
+/// The payload one SEI message carries: the module's UUID, then the notes
+/// joined by newlines. `Framing::insert` wraps it in the NAL and puts that
+/// where a prefix SEI goes.
+fn payload(notes: &[String]) -> Vec<u8> {
+    let mut bytes = UUID.to_vec();
+    bytes.extend_from_slice(notes.join("\n").as_bytes());
+    bytes
 }
 
 /// The packets one pad releases this call, with the notes due at or before
 /// each keyframe woven into it. Rows this call consumed leave `pending`.
 fn weave(
     pad: u32,
-    framing: Framing,
+    framing: Option<Framing>,
     packets: Vec<Packet>,
     pending: &mut Vec<NoteRow>,
     rows: &mut Vec<String>,
 ) -> Vec<Packet> {
+    let Some(framing) = framing else {
+        return packets;
+    };
     packets
         .into_iter()
         .map(|mut packet| {
@@ -216,23 +173,25 @@ fn weave(
                 return packet;
             }
             let texts: Vec<String> = due.iter().map(NoteRow::text).collect();
-            let nal = framing.frame(sei_nal(
-                &texts.iter().map(String::as_str).collect::<Vec<&str>>(),
-            ));
+            let woven = match framing.insert(&packet.data, &payload(&texts), SELECT) {
+                Ok(woven) => woven,
+                // A packet whose NALs cannot be read keeps the bytes the
+                // encoder gave it, and the notes wait for one that can.
+                Err(_) => {
+                    pending.extend(due);
+                    pending.sort_by_key(|r| r.pts);
+                    return packet;
+                }
+            };
             rows.push(
                 serde_json::to_string(&WovenRow {
                     pad,
                     pts: packet.pts,
                     notes: due.len(),
-                    bytes: nal.len(),
+                    bytes: woven.len() - packet.data.len(),
                 })
                 .expect("a woven row serializes"),
             );
-            // Prefix: an SEI NAL belongs before the first VCL NAL of its
-            // access unit, and the bytes already there stay exactly as the
-            // encoder wrote them.
-            let mut woven = nal;
-            woven.extend_from_slice(&packet.data);
             packet.data = woven;
             packet
         })
@@ -273,12 +232,15 @@ impl Guest for PacketSei {
                 streams.len()
             ));
         }
-        let framing = Framing::read(&streams[0].coded.extradata);
+        // Annex B out of an encoder, length-prefixed out of an MP4: the
+        // extradata says which, and the crate reads it.
+        let framing = framing_of(&streams[0].coded.codec, &streams[0].coded.extradata)
+            .map_err(|e| format!("packet_sei cannot frame this stream: {e}"))?;
         STATE.with(|s| {
             *s.borrow_mut() = State {
                 pads: streams.len(),
                 held: vec![Vec::new(); streams.len()],
-                framing,
+                framing: Some(framing),
                 ..State::default()
             }
         });
