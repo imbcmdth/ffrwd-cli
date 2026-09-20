@@ -12,6 +12,10 @@ tests expand over. av2 and av3 differ only in their sine frequencies, so a
 ``UNION ALL`` of the two concatenates two distinguishable multi-language
 sources whose language tags agree track for track. ``stereo.mp4`` adds the
 one thing none of those have: a genuinely 2-CHANNEL audio track (plan 047).
+``keys.mp4`` / ``keys.mkv`` are one reordering encode in two containers, and
+``keys-late.mkv`` / ``keys-offset.mp4`` / ``keys-cut.mp4`` are the same
+packets again with their clock moved three different ways, for reading a
+stream's own times back off a copy of it.
 ``font.ttf`` is a stub TrueType file and ``attached.mkv`` is a container
 carrying it, for reading attachments back. ``described.mkv`` carries a TITLED
 caption track beside its video and audio, for reading a titled track back.
@@ -76,6 +80,20 @@ _AVS_NAME = "avs.mkv"
 _FRAME_PNG_NAME = "frame.png"
 _KEYS_NAME = "keys.mp4"
 _KEYS_MKV_NAME = "keys.mkv"
+# The same encode again, three ways of not starting at zero. Real files do
+# this constantly and a read of one has to stay on its clock.
+_KEYS_LATE_NAME = "keys-late.mkv"
+_KEYS_OFFSET_NAME = "keys-offset.mp4"
+_KEYS_CUT_NAME = "keys-cut.mp4"
+# How far behind the audio the late fixture's video opens. An encoder's own
+# priming lands in this range, which is how the shape turns up in the wild;
+# the number is stated here so the fixture carries it whatever ffmpeg built it.
+_KEYS_LATE_OFFSET = 0.023
+# How far the offset fixture's whole clock is moved.
+_KEYS_OFFSET = 0.5
+# Where the cut fixture is cut. A copy cut keeps whole packets, so the one
+# ahead of the cut lands at a NEGATIVE presentation time.
+_KEYS_CUT_AT = 1
 # A keyframe every half second of a 15fps clip, and two B-frames between
 # anchors so the stream reorders and opens on a negative dts -- which is what
 # a compile-time read of it has to stay on the right side of.
@@ -383,6 +401,12 @@ def _generate_keys() -> None:
     `keys.mkv` is the same encode remuxed, not a second one -- the two files
     carry the same packets, so a read of one is comparable with a read of the
     other, which is what makes the container the only variable.
+
+    The remux disables the muxer's negative-timestamp avoidance, which is what
+    makes the two files carry the same TIMES as well. Left on, the muxer takes
+    its offset from whichever stream it writes first and moves every other one
+    with it, so the audio encoder's priming -- a different number on different
+    ffmpeg builds -- decides where the video opens.
     """
     _run(
         FIXTURES_DIR / _KEYS_NAME,
@@ -396,7 +420,49 @@ def _generate_keys() -> None:
     )
     _run(
         FIXTURES_DIR / _KEYS_MKV_NAME,
-        ["-i", str(FIXTURES_DIR / _KEYS_NAME), "-c", "copy"],
+        ["-i", str(FIXTURES_DIR / _KEYS_NAME), "-c", "copy",
+         "-avoid_negative_ts", "disabled"],
+    )
+
+
+def _generate_keys_offsets() -> None:
+    """The keys encode again, three ways of not opening at zero.
+
+    A file whose video opens away from zero is the ordinary case, not the
+    exotic one: an audio encoder's priming moves the picture behind the sound,
+    a packager writes a timestamp offset, MPEG-TS starts wherever it likes, a
+    fragmented mp4 opens on its first fragment, and a copy cut keeps the whole
+    packet it cut into. Every one of them puts the stream's own times somewhere
+    a copy could quietly lose, and a row read off that copy is what a `trim`
+    is then written from.
+
+    All three are copies of `keys.mp4`'s packets rather than new encodes, so
+    they are small and they say the same thing about the same pictures. Each
+    one states its own offset, and none lets the muxer add one of its own:
+    what the times are is what is written here, on any ffmpeg.
+
+    - `keys-late.mkv` puts the video behind the audio, the file's own start
+      still zero -- the shape an encoder's priming makes, and the one whose
+      rows a `trim` is read back against directly.
+    - `keys-offset.mp4` moves the whole clock, the file's start with it.
+    - `keys-cut.mp4` is cut by copying, so it opens on a packet presented
+      BEFORE zero, which is the one timestamp a NUT pipe cannot carry.
+    """
+    source = str(FIXTURES_DIR / _KEYS_NAME)
+    _run(
+        FIXTURES_DIR / _KEYS_LATE_NAME,
+        ["-itsoffset", str(_KEYS_LATE_OFFSET), "-i", source, "-i", source,
+         "-map", "0:v:0", "-map", "1:a:0", "-c", "copy",
+         "-avoid_negative_ts", "disabled"],
+    )
+    _run(
+        FIXTURES_DIR / _KEYS_OFFSET_NAME,
+        ["-i", source, "-c", "copy",
+         "-output_ts_offset", str(_KEYS_OFFSET), "-avoid_negative_ts", "disabled"],
+    )
+    _run(
+        FIXTURES_DIR / _KEYS_CUT_NAME,
+        ["-ss", str(_KEYS_CUT_AT), "-i", source, "-c", "copy"],
     )
 
 
@@ -782,6 +848,7 @@ def main() -> int:
     _generate_tagged()
     _generate_frame_png()
     _generate_keys()
+    _generate_keys_offsets()
     _generate_attached(_generate_font_ttf())
     _generate_ladder()
     _generate_ladder_demuxed()
