@@ -13,9 +13,9 @@ tests expand over. av2 and av3 differ only in their sine frequencies, so a
 sources whose language tags agree track for track. ``stereo.mp4`` adds the
 one thing none of those have: a genuinely 2-CHANNEL audio track (plan 047).
 ``keys.mp4`` / ``keys.mkv`` are one reordering encode in two containers, and
-``keys-late.mkv`` / ``keys-offset.mp4`` / ``keys-cut.mp4`` are the same
-packets again with their clock moved three different ways, for reading a
-stream's own times back off a copy of it.
+``keys-late.mkv`` / ``keys-offset.mp4`` / ``keys-cut.mp4`` / ``keys.ts`` are
+the same packets again with their clock moved four different ways, for
+reading a stream's own times back off a copy of it.
 ``font.ttf`` is a stub TrueType file and ``attached.mkv`` is a container
 carrying it, for reading attachments back. ``described.mkv`` carries a TITLED
 caption track beside its video and audio, for reading a titled track back.
@@ -85,6 +85,7 @@ _KEYS_MKV_NAME = "keys.mkv"
 _KEYS_LATE_NAME = "keys-late.mkv"
 _KEYS_OFFSET_NAME = "keys-offset.mp4"
 _KEYS_CUT_NAME = "keys-cut.mp4"
+_KEYS_TS_NAME = "keys.ts"
 # How far behind the audio the late fixture's video opens. An encoder's own
 # priming lands in this range, which is how the shape turns up in the wild;
 # the number is stated here so the fixture carries it whatever ffmpeg built it.
@@ -435,7 +436,7 @@ def _generate_keys() -> None:
 
 
 def _generate_keys_offsets() -> None:
-    """The keys encode again, three ways of not opening at zero.
+    """The keys encode again, four ways of not opening at zero.
 
     A file whose video opens away from zero is the ordinary case, not the
     exotic one: an audio encoder's priming moves the picture behind the sound,
@@ -445,7 +446,7 @@ def _generate_keys_offsets() -> None:
     a copy could quietly lose, and a row read off that copy is what a `trim`
     is then written from.
 
-    All three are copies of `keys.mp4`'s packets rather than new encodes, so
+    All four are copies of `keys.mp4`'s packets rather than new encodes, so
     they are small and they say the same thing about the same pictures. Each
     one states its own offset, and none lets the muxer add one of its own:
     what the times are is what is written here, on any ffmpeg.
@@ -456,6 +457,10 @@ def _generate_keys_offsets() -> None:
     - `keys-offset.mp4` moves the whole clock, the file's start with it.
     - `keys-cut.mp4` is cut by copying, so it opens on a packet presented
       BEFORE zero, which is the one timestamp a NUT pipe cannot carry.
+    - `keys.ts` is the MPEG-TS remux, whose start the muxer chooses rather
+      than the query: ffmpeg's own is 1.4 s in, and its two streams do not
+      start together, which is the shape whose start ffmpeg corrects to the
+      streams a command actually reads.
     """
     source = str(FIXTURES_DIR / _KEYS_NAME)
     _run(
@@ -473,6 +478,10 @@ def _generate_keys_offsets() -> None:
     _run(
         FIXTURES_DIR / _KEYS_CUT_NAME,
         ["-ss", str(_KEYS_CUT_AT), "-i", source, "-c", "copy"],
+    )
+    _run(
+        FIXTURES_DIR / _KEYS_TS_NAME,
+        ["-i", source, "-c", "copy", "-f", "mpegts"],
     )
 
 
