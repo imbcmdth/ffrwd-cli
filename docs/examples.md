@@ -730,6 +730,62 @@ ffmpeg -i tests/fixtures/av.mp4 -filter_complex \
 for `hls_time`, adaptation sets for the variant map, and the `.mpd` as
 the written name.
 
+## 139. Ship the ladder as a function
+
+The rungs above are spelled out in the query: a `generate_series` to
+count them and an array to hold their widths. They do not have to be.
+A `TABLE`-returning function's arguments read the FROM items written to
+its left, so a stream can be handed to one, and the rungs become the
+function's business rather than the caller's:
+
+```pgsql
+CREATE FUNCTION ladder(v video_stream) RETURNS TABLE(v video_stream, rung number) AS $$
+  SELECT scale(v, r.width, -2), r.rung
+  FROM unnest(ARRAY[STRUCT(1 AS rung, 320 AS width),
+                    STRUCT(2 AS rung, 160 AS width)]) r
+$$ LANGUAGE sql;
+
+COPY (
+  WITH vid AS (
+    SELECT l.v AS v, l.rung AS rung
+    FROM input('tests/fixtures/av.mp4') f, ladder(fps(f.video[1], 15)) l
+  ),
+  aud AS (
+    SELECT a AS t, 2 + a.index AS rung
+    FROM input('tests/fixtures/av.mp4') g, unnest(g.audio) a
+  )
+  SELECT vid.v, aud.t
+  FROM vid FULL JOIN aud ON vid.rung = aud.rung
+) TO 'out/master.m3u8'
+  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod',
+        video_codec 'libx264', video_bitrate ARRAY['800k', '300k'][vid.rung],
+        audio_codec 'aac')
+```
+
+```
+$ ffrwd compile -f query.sql
+ffmpeg -i tests/fixtures/av.mp4 -filter_complex \
+  '[0:v:0]fps=fps=15,split=2[n1_split0][n1_split1];'\
+'[n1_split0]scale=width=320:height=-2[out0];[n1_split1]scale=width=160:height=-2[out1]' \
+  -map '[out0]' -map '[out1]' -map 0:a:0 -f hls -hls_time 2 -hls_playlist_type vod -c:0 \
+  libx264 -c:1 libx264 -b:0 800k -b:1 300k -c:2 aac -g:0 30 -g:1 30 -keyint_min:0 30 \
+  -keyint_min:1 30 -sc_threshold:0 0 -sc_threshold:1 0 -var_stream_map \
+  'v:0,agroup:aud,name:240p v:1,agroup:aud,name:120p a:0,agroup:aud,name:a0,default:yes' \
+  -master_pl_name master.m3u8 -hls_segment_filename out/%v/segment_%d.ts \
+  out/%v/index.m3u8
+```
+
+Byte for byte recipe 104's command: the function is inlined, so what
+runs is the query you could have typed by hand. What changed is who
+owns the rungs - `ladder` is a definition a package ships and a query
+installs, and the caller writes one call in place of a row table.
+
+The argument belongs to the outer row, so `fps(f.video[1], 15)` runs
+once and splits into both rungs rather than once per rung. Bitrates
+stay the caller's: a `WITH` option is settled before ffmpeg runs, so it
+reads a literal or a subscripted list and never a column, and
+`[vid.rung]` is how each rung picks its own.
+
 ## 105. Pick a rung from an ABR ladder
 
 `input()` on a manifest - an HLS master playlist or a DASH MPD - yields

@@ -2513,6 +2513,97 @@ def test_the_hls_ladder_writes_an_accepted_master_and_aligned_segments(
     assert all(gap == 2.0 for gap in gaps), gaps
 
 
+def test_a_ladder_function_writes_its_rungs_at_the_widths_it_declared(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ladder as a FUNCTION, run for real: three rungs, each at the width
+    its own row named, in the order the body wrote them.
+
+    The rungs live in the function; the caller hands it one stream and reads
+    `rung` back to pick each rung's bitrate. The shared argument is the point
+    of the shape, so the graph is checked too -- one `fps` feeding one split,
+    not one per rung.
+    """
+    _require_fixture(_AV)
+    monkeypatch.chdir(tmp_path)
+    dest = tmp_path / "out" / "master.m3u8"
+    dest.parent.mkdir()
+    query = (
+        "CREATE FUNCTION ladder(v video_stream)"
+        " RETURNS TABLE(v video_stream, rung number) AS $$"
+        "  SELECT scale(v, r.width, -2), r.rung"
+        "  FROM unnest(ARRAY[STRUCT(1 AS rung, 320 AS width),"
+        "                    STRUCT(2 AS rung, 240 AS width),"
+        "                    STRUCT(3 AS rung, 160 AS width)]) r"
+        "$$ LANGUAGE sql;"
+        f" COPY (SELECT l.v FROM input('{_sql_path(_AV)}') f,"
+        "         ladder(fps(f.video[1], 15)) l)"
+        " TO 'out/master.m3u8' WITH (format 'hls', hls_time 2,"
+        "   hls_playlist_type 'vod', video_codec 'libx264', preset 'ultrafast',"
+        "   video_bitrate ARRAY['500k', '350k', '250k'][l.rung])"
+    )
+    args = build_ffmpeg_args(emit(compile_sql(query)))
+    graph = " ".join(args)
+    assert graph.count("fps=fps=15") == 1
+    assert graph.count("split=3") == 1
+    assert graph.count("scale=width=") == 3
+    assert [args[args.index(f"-b:{n}") + 1] for n in range(3)] == [
+        "500k",
+        "350k",
+        "250k",
+    ]
+    args.insert(1, "-y")
+    result = subprocess.run(
+        args, capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT
+    )
+    assert result.returncode == 0, result.stderr
+
+    assert dest.read_text(encoding="utf-8").count("#EXT-X-STREAM-INF") == 3
+    widths = [
+        _ffprobe_video_stream(dest.parent / variant / "index.m3u8")["width"]
+        for variant in ("240p", "180p", "120p")
+    ]
+    assert widths == [320, 240, 160]
+
+
+def test_a_ladder_function_over_two_outer_rows_writes_every_pairing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A two-row outer relation times a two-rung ladder is four files, each
+    named from its own outer row and its own rung.
+
+    The rung's name comes off a parenthesized array, which is the spelling a
+    list subscript takes anywhere a value is read.
+    """
+    ladder = _FIXTURES_DIR / "ladder" / "master.m3u8"
+    _require_fixture(ladder)
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "out").mkdir()
+    query = (
+        "CREATE FUNCTION ladder(v video_stream)"
+        " RETURNS TABLE(v video_stream, rung number) AS $$"
+        "  SELECT scale(v, r.width, -2), r.rung"
+        "  FROM unnest(ARRAY[STRUCT(1 AS rung, 160 AS width),"
+        "                    STRUCT(2 AS rung, 80 AS width)]) r"
+        "$$ LANGUAGE sql;"
+        f" COPY (SELECT l.v FROM input('{_sql_path(ladder)}') s, ladder(s.video[1]) l)"
+        " TO ('out/' || s.height::text || '-' || (ARRAY['a', 'b'])[l.rung] || '.mp4')"
+        " WITH (video_codec 'libx264', preset 'ultrafast')"
+    )
+    args = build_ffmpeg_args(emit(compile_sql(query)))
+    args.insert(1, "-y")
+    result = subprocess.run(
+        args, capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT
+    )
+    assert result.returncode == 0, result.stderr
+
+    written = sorted(path.name for path in (tmp_path / "out").iterdir())
+    assert written == ["1080-a.mp4", "1080-b.mp4", "720-a.mp4", "720-b.mp4"]
+    assert [
+        _ffprobe_video_stream(tmp_path / "out" / name)["width"] for name in written
+    ] == [160, 80, 160, 80]
+
+
 def test_the_dash_ladder_writes_an_mpd_ffprobe_accepts(tmp_path: Path) -> None:
     """The dash twin: the format block reworded, the same rows, and the
     written .mpd accepted end to end."""

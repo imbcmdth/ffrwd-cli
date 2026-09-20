@@ -5813,6 +5813,31 @@ def test_a_module_parameter_reading_no_row_still_makes_one_instance() -> None:
     assert len([n for n in graph.nodes.values() if n.filter == MODULE]) == 1
 
 
+def test_a_module_handed_to_a_table_function_is_one_instance_for_every_row() -> None:
+    """A lateral call's stream argument belongs to the OUTER row, so a module
+    written there is hosted once and split to the rungs. Three instances would
+    be three copies of whatever state the module carries."""
+    sql = (
+        f"CREATE FUNCTION invert(v video_stream) RETURNS video_stream "
+        f"AS '{MODULE}', 'invert' LANGUAGE wasm;\n"
+        "CREATE FUNCTION ladder(v video_stream) "
+        "RETURNS TABLE(v video_stream, rung number) AS $$ "
+        "  SELECT scale(v, r.width, -2), r.rung "
+        "  FROM unnest(ARRAY[STRUCT(1 AS rung, 1280 AS width), "
+        "                    STRUCT(2 AS rung, 854 AS width), "
+        "                    STRUCT(3 AS rung, 640 AS width)]) r $$ LANGUAGE sql;\n"
+        "COPY (SELECT array_agg(l.v) "
+        "FROM input('a.mp4') f, ladder(invert(f.video[1])) l) TO 'o.mkv'"
+    )
+    graph = insert_splits(
+        lower(_resolved(sql), {}, registry=_snapshot_registry(), describes={MODULE: _described()})
+    )
+    filters = [node.filter for node in graph.nodes.values()]
+    assert filters.count(MODULE) == 1
+    assert filters.count("scale") == 3
+    assert filters.count("split") == 1
+
+
 # -- a sink that reads SEVERAL streams --------------------------------------
 
 LADDER_MODULE = "modules/packet_tally.wasm"
