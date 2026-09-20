@@ -14632,7 +14632,55 @@ def test_a_rows_module_writing_less_than_the_filter_reads_is_refused() -> None:
             "FROM input('f.mp4') f) TO 'out.mp4'",
         )
     assert caught.value.code is ErrorCode.UDF_ARG_TYPE
-    assert "embed() returns" in caught.value.message
+    assert "embed() returns STRUCT(pts number, note text, vector vector)[]" in (
+        caught.value.message
+    )
+
+
+def test_a_rows_argument_may_be_a_cte_column_bound_to_a_producer() -> None:
+    """An alias of an accepted producer expression is that expression: the
+    body writes the document the filter reads instead of minting a track,
+    and the command is the one the inline spelling compiles to."""
+    g = _embedding_graph(
+        WEAVE_TWO,
+        "COPY (WITH d AS (SELECT f.video[1] AS v, shots(f.video[1]).notes AS a, "
+        "embed(shots(ffmpeg.hflip(f.video[1])).notes) AS b FROM input('f.mp4') f) "
+        "SELECT weave(d.v, d.a, d.b) FROM d) TO 'out.mp4'",
+    )
+    (filter_node,) = g.packet_filter_rows
+    assert g.packet_filter_rows[filter_node] == [
+        {"arg": "faces", "path": "ffrwd:rows:0"},
+        {"arg": "words", "path": "ffrwd:rows:1"},
+    ]
+    writers = {g.rows_sinks[n].path: g.nodes[n].filter for n in g.rows_sinks}
+    assert writers == {"ffrwd:rows:0": ROWS_MODULE, "ffrwd:rows:1": EMBED_MODULE}
+    # No track was minted for either: the rows went to documents.
+    assert not [s for s in g.rows_sinks.values() if s.alias]
+
+
+def test_a_cte_rows_column_the_filter_reads_is_read_nowhere_else() -> None:
+    """A module writes its rows once. A column that is the filter's document
+    and a projected track too is refused where the second reading is."""
+    err = _weaving_rejects(
+        WEAVE_ONE,
+        "COPY (WITH d AS (SELECT f.video[1] AS v, shots(f.video[1]).notes AS a "
+        "FROM input('f.mp4') f) SELECT weave(d.v, d.a), d.a FROM d) TO 'out.mp4'",
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "reads it somewhere else too" in err.message
+
+
+def test_a_cte_column_that_carries_no_rows_is_refused_at_the_call() -> None:
+    """The look-ahead names a column, not a shape: a name that turns out to
+    hold a stream is refused by the filter's own check, which says so."""
+    err = _weaving_rejects(
+        WEAVE_ONE,
+        "COPY (WITH d AS (SELECT f.video[1] AS v, f.audio[1] AS a, "
+        "shots(f.video[1]).notes AS n FROM input('f.mp4') f) "
+        "SELECT weave(d.v, d.a), d.n FROM d) TO 'out.mp4'",
+    )
+    assert err.code is ErrorCode.UDF_ARG_TYPE
+    assert "is not rows a module writes" in err.message
 
 
 def test_a_gather_over_a_rows_functions_result_is_refused_by_name() -> None:

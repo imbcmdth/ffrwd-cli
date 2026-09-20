@@ -1120,6 +1120,14 @@ def _computed_segments(expression: exp.Expr, row_aliases: set[str]) -> list[exp.
     return [node] if references_row_alias(node, row_aliases) else []
 
 
+def _qualified_column(node: object) -> tuple[str, str] | None:
+    """``<alias>.<column>`` as its two folded names, or None for anything else."""
+    if not isinstance(node, exp.Column) or isinstance(node.this, exp.Star):
+        return None
+    table = node.args.get("table")
+    return None if table is None else (_fold(table), _fold(node.this))
+
+
 def _projects_annotations(node: exp.Expr, column: str) -> bool:
     """True when `column` is read off `node`, through any wrapping parens."""
     inner, parent = node, node.parent
@@ -3622,6 +3630,14 @@ class _Lowerer:
         # How many rows documents this query has minted, which is what
         # numbers the next one (:meth:`_rows_document`).
         self.rows_documents = 0
+        # The CTE whose body is lowering, and the (cte, column) pairs a packet
+        # filter reads as rows -- the look-ahead that tells a body whether its
+        # rows column becomes a track or a document
+        # (:meth:`_packets_rows_columns`). The third holds the document each
+        # such column was given, which the filter's call reads back.
+        self.current_cte: str | None = None
+        self.packets_rows_columns: frozenset[tuple[str, str]] = frozenset()
+        self.cte_rows_documents: dict[tuple[str, str], str] = {}
 
     # -- entry point ------------------------------------------------------
 
@@ -3639,9 +3655,11 @@ class _Lowerer:
         body has no reader to ask, so its stream columns record one cell per
         row of its own relation.
         """
+        self.packets_rows_columns = self._packets_rows_columns()
         self.cte_body = True
         try:
             for name, body in self.res.ctes.items():
+                self.current_cte = name
                 self.branch_values = {}
                 self.branch_rows_columns = {}
                 self.branch_cue_columns = set()
@@ -3658,6 +3676,93 @@ class _Lowerer:
                 self._harvest_cte_dispositions(body)
         finally:
             self.cte_body = False
+            self.current_cte = None
+
+    # -- a CTE column a packet filter reads as rows -------------------------
+
+    def _packets_rows_columns(self) -> frozenset[tuple[str, str]]:
+        """``(<cte>, <column>)`` for every CTE column a packet filter reads as rows.
+
+        A body lowers before any COPY, so what its rows column BECOMES -- the
+        subtitle track a projection mints, or the document a filter reads --
+        is the surrounding query's to settle, not the body's. This is the
+        look-ahead that settles it: a column named here writes a document,
+        and every other rows column mints a track as it always has.
+
+        A column that is ALSO read somewhere else in the same branch is
+        refused here, where both readings are in hand: one module's rows go
+        to one place.
+        """
+        branches = [b for sink in self.res.sinks for b in sink.branches]
+        found: set[tuple[str, str]] = set()
+        for select in branches or list(self.res.branches):
+            read: dict[tuple[str, str], exp.Expr] = {}
+            for call in select.find_all(exp.Anonymous):
+                declared = self.res.wasm.get(str(call.name).lower())
+                if declared is None or not declared.is_packets:
+                    continue
+                arguments = [a for a in call.expressions if isinstance(a, exp.Expr)]
+                at = declared.stream_arity
+                for index in range(len(declared.reads_params)):
+                    position = at + index
+                    if position >= len(arguments):
+                        break
+                    written = _unwrap(arguments[position])
+                    named = _qualified_column(written)
+                    if named is not None and named[0] in self.res.ctes:
+                        read[named] = written
+            for named, written in read.items():
+                self._check_rows_column_read_once(named, written, select)
+            found |= set(read)
+        return frozenset(found)
+
+    def _check_rows_column_read_once(
+        self, named: tuple[str, str], written: exp.Expr, select: exp.Select
+    ) -> None:
+        """That nothing but the filter reads a CTE column bound for its document.
+
+        The rows a module writes go to ONE place: the document, or the track a
+        projection mints, or the rows function that reads them. A column whose
+        rows a filter is given cannot also be one of the others -- the sidecar
+        writes a module's rows once.
+        """
+        elsewhere = [
+            node
+            for node in select.find_all(exp.Column)
+            if node is not written and _qualified_column(node) == named
+        ]
+        if not elsewhere:
+            return
+        cte, column = named
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"'{cte}.{column}' is the rows a packet filter reads, and the "
+            "query reads it somewhere else too",
+            elsewhere[0],
+            fallback=select,
+            hint="a module writes its rows once, to one place; give the filter "
+            "its own producer, or drop the other reading",
+        )
+
+    def _cte_rows_document(self, name: str | None, projection: exp.Expr) -> str | None:
+        """The document this body's rows column writes, or None for a track.
+
+        Only inside a CTE body, only for a column the look-ahead named, and
+        only where the projection really is a module's rows -- a name that
+        turns out to hold something else is refused at the filter's own call,
+        which says what it was given.
+        """
+        if name is None or self.current_cte is None:
+            return None
+        named = (self.current_cte, name)
+        if named not in self.packets_rows_columns:
+            return None
+        node = _unwrap(projection)
+        if self._rows_projection(node) is None and self._rows_call(node) is None:
+            return None
+        path = self._rows_document()
+        self.cte_rows_documents[named] = path
+        return path
 
     def run(self) -> Graph:
         """Lower every CTE/view once, then one :class:`SinkUnit` per COPY.
@@ -5840,9 +5945,16 @@ class _Lowerer:
                     )
                 self._collect_value_column(value_name, projection, env, select)
                 continue
+            name = _projection_name(projection)
+            document = self._cte_rows_document(name, projection)
+            written, self.rows_file = self.rows_file, document or self.rows_file
+            try:
+                value = self._branch_value(projection, env, select)
+            finally:
+                self.rows_file = written
             column = _Column(
-                name=_projection_name(projection),
-                value=self._branch_value(projection, env, select),
+                name=name,
+                value=value,
                 splat=self._is_splat_projection(projection, env),
             )
             if column.name is not None:
@@ -13458,39 +13570,53 @@ class _Lowerer:
             argument = call.args[position]
             if isinstance(_unwrap(argument), exp.Null):
                 continue
-            self._check_packets_rows_argument(declared, param, argument, node, select)
-            path = self._rows_document()
-            written, self.rows_file = self.rows_file, path
-            try:
-                self._lower_expr(argument, env, select)
-            finally:
-                self.rows_file = written
+            self._check_packets_rows_argument(declared, param, argument, node, select, env)
+            # A CTE column's own body already wrote the document, being the
+            # one place that column's rows are produced.
+            named = _qualified_column(_unwrap(argument))
+            path = self.cte_rows_documents.get(named) if named is not None else None
+            if path is None:
+                path = self._rows_document()
+                written, self.rows_file = self.rows_file, path
+                try:
+                    self._lower_expr(argument, env, select)
+                finally:
+                    self.rows_file = written
             wired.append({"arg": param.name, "path": path})
         return wired
 
     def _packets_rows_record(
-        self, argument: exp.Expr
+        self, argument: exp.Expr, env: _Env
     ) -> tuple[str, Annotation] | None:
         """What a packet filter's rows argument hands over: whose rows, and their record.
 
-        The two run-time row producers, exactly as a rows function reads
-        them: a stream module's annotation column -- which is what a gather
-        over one has become by the time this runs -- or a rows function's
-        result, which is that column one module later and may itself be
-        another rows function's argument, however deep the chain. Where the
-        chain actually starts is settled when the argument lowers; this
-        names the record that reaches the filter.
+        The row producers a rows function reads, read the same way here: a
+        stream module's annotation column -- which is what a gather over one
+        has become by the time this runs -- a rows function's result, which
+        is that column one module later and may itself be another rows
+        function's argument however deep the chain, or a CTE column bound to
+        either, which is the same expression under a name. Where the chain
+        starts is settled when the argument lowers; this names the record
+        that reaches the filter.
         """
         found = annotation_projection(argument, self.res.wasm)
         if found is not None:
             producer = found[1]
-            assert producer.emits is not None  # what annotation_projection selects on
-            return producer.name, producer.emits
+            emits = producer.emits
+            assert emits is not None  # what annotation_projection selects on
+            return f"{producer.name}() returns '{emits.name}' as {emits.written}", emits
         called = self._rows_call(argument)
         if called is not None:
             rows_function = called[1]
-            assert rows_function.returns_rows is not None  # what is_rows selects on
-            return rows_function.name, rows_function.returns_rows
+            written = rows_function.returns_rows
+            assert written is not None  # what is_rows selects on
+            return f"{rows_function.name}() returns {written.written}", written
+        cte_ref = self._cte_column_ref(argument, env)
+        if cte_ref is not None:
+            binding, name = cte_ref
+            source = binding.rows_columns.get(name)
+            if source is not None:
+                return f"'{binding.name}.{name}' carries {source[2].written}", source[2]
         return None
 
     def _check_packets_rows_argument(
@@ -13500,6 +13626,7 @@ class _Lowerer:
         argument: exp.Expr,
         node: exp.Expr,
         select: exp.Select,
+        env: _Env,
     ) -> None:
         """One rows argument against the column it fills.
 
@@ -13510,7 +13637,7 @@ class _Lowerer:
         the whole record is written to the rows file either way, and the
         filter reads the fields it named.
         """
-        found = self._packets_rows_record(_unwrap(argument))
+        found = self._packets_rows_record(_unwrap(argument), env)
         if found is None:
             raise _error(
                 ErrorCode.UDF_ARG_TYPE,
@@ -13523,14 +13650,13 @@ class _Lowerer:
                 "<producer>(<stream>).<column>, ...), or NULL for no rows at "
                 "all",
             )
-        producer_name, record = found
+        written, record = found
         assert param.annotation is not None  # `reads_params` selected on it
         if not _annotation_covers(param.annotation, record):
             raise _error(
                 ErrorCode.UDF_ARG_TYPE,
                 f"{declared.name}() takes '{param.name}' as {param.type}, and "
-                f"{producer_name}() returns '{record.name}' as "
-                f"{record.written}",
+                f"{written}",
                 argument,
                 fallback=node,
                 hint="every field the filter names has to be one the producer's "

@@ -116,8 +116,13 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   -- `weave(f.video[1], embed(transcribe(f.audio[1]).words))` -- however many
   rows functions deep. The chain is planned as what it is, each module
   feeding the next, and the last one's rows are what the document holds.
-  Rows the compiler already has, a CTE column bound to any of this, and
-  anything that is not rows at all are refused.
+  A CTE column bound to any of that is the same expression under a name
+  and is accepted as one, compiling to the identical command; the body
+  writes the document rather than minting the subtitle track a projected
+  rows column mints, so the column is the FILTER's and the query may not
+  also read it elsewhere - one module writes its rows once, to one place,
+  and a second reading is refused where it is written. Rows the compiler
+  already has, and anything that is not rows at all, are refused too.
   A rows column names the fields the filter READS, and the record that
   reaches it -- the rows function's return where there is one, the
   producer's otherwise -- has to carry each of them with the same type. A

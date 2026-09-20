@@ -482,6 +482,35 @@ def test_a_rows_argument_may_arrive_through_a_rows_module(tmp_path: Path) -> Non
     assert b"words:e-b-0" in written, "the note never went through the rows module"
 
 
+def test_rows_arguments_named_by_a_cte_reach_the_filter(tmp_path: Path) -> None:
+    """The producers are written once in a WITH body and read by name in the
+    COPY's SELECT. An alias of an accepted producer expression is that
+    expression: the same two notes reach the stream the same way."""
+    _require_weaving()
+    if not _EMBED_NOTES.exists():
+        pytest.skip(f"module missing: {_EMBED_NOTES}")
+    out = tmp_path / "named.mp4"
+    _run(
+        _NOTES
+        + _EMBED
+        + _WEAVE_TWO
+        + "COPY (\n"
+        + "  WITH d AS (\n"
+        + "    SELECT f.video[1] AS v,\n"
+        + "           notes(f.video[1], 'a').seen AS clip,\n"
+        + "           embed(notes(ffmpeg.hflip(f.video[1]), 'b').seen) AS spoken\n"
+        + f"    FROM input('{_AV.as_posix()}') f\n"
+        + "  )\n"
+        + "  SELECT weave(d.v, d.clip, d.spoken)\n"
+        + "  FROM d\n"
+        + f") TO '{out.as_posix()}'"
+    )
+
+    written = _video_bytes(out)
+    assert b"faces:a-0" in written
+    assert b"words:e-b-0" in written
+
+
 def test_a_rows_module_writes_the_document_the_filter_reads() -> None:
     """The chain is planned as what it is: the producer feeds the rows module
     over a rows edge inside one sidecar, and the document the filter reads is
