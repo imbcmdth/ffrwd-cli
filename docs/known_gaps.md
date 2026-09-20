@@ -88,24 +88,35 @@ output is plain ffmpeg, so the two mix freely in a script.
   wrong presentation times for a stream that reorders frames, which
   would put the rows on a different clock from the rest of the query.
 - **A compile-time packet read reports a pre-zero packet at zero.** The
-  read carries the stream's own times through a NUT pipe, and NUT has no
+  read carries the stream's times through a NUT pipe, and NUT has no
   spelling for a presentation time below zero. A file cut by copying can
   open on one -- the packet it cut into -- and that row comes back at
   zero. Nothing is lost by it: the container's own edit list already
   presents nothing before zero, so the row names the first picture the
   file shows.
-- **A run-time filtergraph is on ffmpeg's clock, not the container's.**
-  Row times -- packet rows, cue rows, chapter rows -- are the container's,
-  which is what ffprobe reports and what they are compared against.
-  ffmpeg re-bases an input whose file starts away from zero before the
-  graph sees it, so on such a file a `trim` written from a row time is
-  off by wherever the file starts. A file whose own start is zero is
-  unaffected, and that is the ordinary case even when its video opens
-  later than its sound. Below zero is where ffmpeg builds disagree:
-  n8 re-bases a file whose start is negative and 9.0 leaves it alone, so
-  an input carrying an audio encoder's priming as a negative timestamp
-  (Matroska states one where mp4 hides it behind an edit list) is off by
-  that priming on one of them and right on the other.
+- **Row times are read off the ffmpeg that compiles, not the one that
+  runs.** ffmpeg subtracts an input's start before a filtergraph sees a
+  frame, so that start is what separates a time a container states from
+  a time a query's own `trim` means, and ffrwd takes it off every row
+  time it reports ([rows.md](rows.md#packet-rows---ffrwdindexrecordsfvideo1-v)).
+  A start BELOW zero is where builds disagree -- n8 subtracts it and 9.0
+  leaves it alone -- and the conversion follows whichever ffmpeg is
+  installed. Compile on one and run the printed command on the other and
+  such a file's rows are off by its negative start, which is what an
+  audio encoder's priming looks like where a container states it
+  (Matroska does; mp4 hides it behind an edit list). A file starting at
+  or above zero reads the same on both.
+- **An MPEG-TS row is read against the stream it describes.** For a
+  container that carries discontinuities, the start ffmpeg subtracts is
+  the smallest over the streams the command actually READS, not over all
+  of them. A compile-time packet read reads the one stream its rows are
+  about, so its rows are right for a query filtering that stream; a query
+  that also maps another stream of the same input starting EARLIER
+  subtracts that smaller start instead, and the rows then name times
+  earlier than the frames they describe by the gap between the two
+  starts. It is the streams' own start skew, tens of milliseconds on an
+  ordinary remux. Chapter and cue rows are unaffected either way:
+  MPEG-TS carries neither.
 - **A sidecar process reads one stream and writes one.** A region of
   modules can fan out and fan in as much as it likes inside itself,
   but its BOUNDARY is one pipe each way: only stdin and stdout are
