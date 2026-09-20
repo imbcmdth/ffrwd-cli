@@ -84,7 +84,7 @@ import json
 import os
 import re
 import tempfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from typing import Literal
@@ -533,6 +533,21 @@ class Package:
         return None if member is None else self.recipes.get(member)
 
 
+@dataclass
+class _PendingLink:
+    """A linked package's own pins, not loaded yet.
+
+    `load` resolves that package's lockfile into the set around it. It runs
+    at most once: after it has, `done` says so, and a rejection is kept in
+    `failed` so a second reader is told the same thing rather than sent back
+    into a half-finished walk.
+    """
+
+    load: Callable[[], None]
+    done: bool = False
+    failed: FfrwdError | None = None
+
+
 @dataclass(frozen=True)
 class PackageSet:
     """The packages a compile may resolve a call in, keyed by name.
@@ -572,6 +587,45 @@ class PackageSet:
     in_project: bool = True
     manifest: Path | None = None
     start: Path | None = None
+    # Linked package name -> its own lockfile, not resolved yet. Discovery
+    # reads a link's manifest and stops there; its pins are loaded by
+    # `settle` when a call resolves through that package, so a link the
+    # query never reaches costs nothing and cannot fail the command.
+    pending: dict[str, _PendingLink] = field(default_factory=dict)
+
+    def settle(self, name: str) -> None:
+        """Load linked package `name`'s own pins, if they are not loaded yet.
+
+        A no-op for every other name, and for one already settled. The
+        rejection a broken link raises is kept and raised again, so the
+        reader that needs the package is told what is wrong with it however
+        many readers came before.
+        """
+        held = self.pending.get(name)
+        if held is None or held.done:
+            return
+        if held.failed is not None:
+            raise held.failed
+        try:
+            held.load()
+        except FfrwdError as err:
+            held.failed = err
+            raise
+        held.done = True
+
+    def settle_all(self) -> None:
+        """Load every linked package's pins, leaving the broken ones out.
+
+        For a reader LISTING what is installed rather than resolving a call
+        through one package: a link this machine can no longer resolve is
+        that package's problem, and a query reaching it still gets the typed
+        rejection from :meth:`settle`.
+        """
+        for name in list(self.pending):
+            try:
+                self.settle(name)
+            except FfrwdError:
+                continue
 
     def get(self, name: str) -> Package | None:
         """The canonical package `name` names, by its full ``<namespace>/<package>``."""
@@ -589,8 +643,14 @@ class PackageSet:
         project itself. Falls back to the canonical entry when nothing
         recorded a binding: a linked package (not walked by `install`), or a
         lockfile with no project above it to hold one.
+
+        This is where a LINKED dependent's own pins are loaded, the query
+        having reached it: a call written in that package is what its
+        lockfile answers, and until one is written the lockfile is not read.
         """
         who = dependent or self.project
+        if who is not None:
+            self.settle(who)
         version = self.wants.get(who, {}).get(name) if who is not None else None
         if version is not None:
             found = self.versions.get(name, {}).get(version)
@@ -2405,6 +2465,7 @@ def _add_links(
     packages: dict[str, Package],
     versions: dict[str, dict[str, Package]],
     wants: dict[str, dict[str, str]],
+    pending: dict[str, _PendingLink],
     links: Sequence[tuple[LinkEntry, Path]],
     layer: Layer,
 ) -> dict[str, str]:
@@ -2417,7 +2478,9 @@ def _add_links(
     claimed: dict[str, str] = {}
     chain: list[tuple[Path, str]] = []
     for entry, source in links:
-        package = _add_link(packages, versions, wants, entry, source, layer, chain, claims=True)
+        package = _add_link(
+            packages, versions, wants, pending, entry, source, layer, chain, claims=True
+        )
         if packages.get(package.name) is package:
             claimed[package.name] = package.version
     return claimed
@@ -2427,6 +2490,7 @@ def _add_link(
     packages: dict[str, Package],
     versions: dict[str, dict[str, Package]],
     wants: dict[str, dict[str, str]],
+    pending: dict[str, _PendingLink],
     entry: LinkEntry,
     source: Path,
     layer: Layer,
@@ -2434,15 +2498,21 @@ def _add_link(
     *,
     claims: bool,
 ) -> Package:
-    """One linked directory: the live package, resolving through its own lockfile.
+    """One linked directory: the live package, and its own pins left for later.
 
-    The linked tree's lockfile is where ITS calls bind: its pins load into
-    `versions` and `wants` for the calls it owns, and nowhere else -- the
-    project around the link never sees them. `claims` is True for a link this
-    layer's own project made, which answers the package's name everywhere; a
-    link found inside another linked package claims no name. `chain` is the
-    directories the walk is inside, so a link leading back into one is refused
-    as the cycle it is.
+    The manifest is read here -- it is what answers the package's name, and
+    reading it costs a file. `claims` is True for a link this layer's own
+    project made, which answers the package's name everywhere; a link found
+    inside another linked package claims no name. `chain` is the directories
+    the walk is inside, so a link leading back into one is refused as the
+    cycle it is.
+
+    The linked tree's own LOCKFILE is where ITS calls bind, and the project
+    around the link never sees those pins, so resolving it is deferred:
+    reading it means loading store content and walking further links, and a
+    machine-wide link the query never reaches should cost neither. The work
+    is registered under the package's name and run by
+    :meth:`PackageSet.settle` the first time something resolves through it.
     """
     root = _linked_root(entry, source)
     manifest = _manifest_of(
@@ -2466,29 +2536,91 @@ def _add_link(
     versions.setdefault(package.name, {}).setdefault(package.version, package)
     if claims:
         packages.setdefault(package.name, package)
+    inside = [*chain, (root, package.name)]
+    pending.setdefault(
+        package.name,
+        _PendingLink(
+            lambda: _add_link_pins(
+                packages, versions, wants, pending, root, package, layer, inside
+            )
+        ),
+    )
+    return package
 
+
+def _add_link_pins(
+    packages: dict[str, Package],
+    versions: dict[str, dict[str, Package]],
+    wants: dict[str, dict[str, str]],
+    pending: dict[str, _PendingLink],
+    root: Path,
+    package: Package,
+    layer: Layer,
+    chain: list[tuple[Path, str]],
+) -> None:
+    """One linked package's own lockfile, resolved: what ITS calls bind to.
+
+    Only the entries the lockfile's own project can reach
+    (:func:`_reachable_entries`) are loaded out of the store. An entry
+    nothing in that closure names pins no call this package makes, so
+    whether the store still holds its content is not this resolution's
+    business.
+    """
     own_path = root / LOCKFILE_NAME
     try:
         own = read_lockfile(own_path) if own_path.is_file() else None
     except (OSError, ValueError):
         own = None
     binding: dict[str, str] = dict(own.dependencies) if own is not None else {}
-    chain.append((root, package.name))
     for nested_entry, nested_source in held_links(own_path):
         nested = _add_link(
-            packages, versions, wants, nested_entry, nested_source, layer, chain, claims=False
+            packages,
+            versions,
+            wants,
+            pending,
+            nested_entry,
+            nested_source,
+            layer,
+            chain,
+            claims=False,
         )
         binding[nested.name] = nested.version
-    chain.pop()
     wants.setdefault(package.name, binding)
-    if own is not None:
-        for held in own.entries:
-            if isinstance(held, LinkEntry):
-                continue
-            stored = _stored_package(held, own, layer)
-            versions.setdefault(stored.name, {}).setdefault(stored.version, stored)
-            wants.setdefault(stored.name, dict(held.dependencies))
-    return package
+    if own is None:
+        return
+    for held in _reachable_entries(own):
+        stored = _stored_package(held, own, layer)
+        versions.setdefault(stored.name, {}).setdefault(stored.version, stored)
+        wants.setdefault(stored.name, dict(held.dependencies))
+
+
+def _reachable_entries(lock: Lockfile) -> tuple[RegistryEntry, ...]:
+    """`lock`'s registry entries its own project can still reach.
+
+    From what the project directly installed -- the lockfile's own
+    `dependencies` -- through each entry's own. An entry nothing in that
+    closure names is an install the manifest has since moved past: it answers
+    no call this lockfile is consulted for, and loading it would make an
+    unrelated package's stale pin everybody's problem. A lockfile pinning
+    nothing directly has no closure to walk, so all of it is reachable.
+    """
+    by_identity = {
+        (entry.name, entry.version): entry
+        for entry in lock.entries
+        if isinstance(entry, RegistryEntry)
+    }
+    if not lock.dependencies:
+        return tuple(by_identity.values())
+    wanted: dict[tuple[str, str], RegistryEntry] = {}
+    queue = list(lock.dependencies.items())
+    while queue:
+        identity = queue.pop()
+        entry = by_identity.get(identity)
+        if entry is None or identity in wanted:
+            continue
+        wanted[identity] = entry
+        queue.extend(entry.dependencies.items())
+    return tuple(wanted.values())
 
 
 def _global_lockfile(local: Path | None) -> Lockfile | None:
@@ -2538,17 +2670,18 @@ def discover(start: Path | str | None = None) -> PackageSet | None:
     # Links before pins, layer by layer: a linked directory answers its name
     # over anything installed under it.
     claimed: dict[str, str] = {}
+    pending: dict[str, _PendingLink] = {}
     local_lock = read_lockfile(local) if local is not None else None
     if local is not None:
         pairs = [(entry, links_path(local)) for entry in read_linksfile(links_path(local))]
-        claimed.update(_add_links(packages, versions, wants, pairs, "local"))
+        claimed.update(_add_links(packages, versions, wants, pending, pairs, "local"))
     _add_layer(packages, versions, wants, local_lock, "local")
     global_lock = store.global_lock_path()
     if local is None or global_lock != local:
         pairs = [
             (entry, links_path(global_lock)) for entry in read_linksfile(links_path(global_lock))
         ]
-        claimed.update(_add_links(packages, versions, wants, pairs, "global"))
+        claimed.update(_add_links(packages, versions, wants, pending, pairs, "global"))
     _add_layer(packages, versions, wants, _global_lockfile(local), "global")
 
     if project is not None:
@@ -2568,4 +2701,5 @@ def discover(start: Path | str | None = None) -> PackageSet | None:
         in_project=in_project,
         manifest=manifest,
         start=base,
+        pending=pending,
     )

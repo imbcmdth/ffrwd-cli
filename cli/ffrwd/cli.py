@@ -895,6 +895,10 @@ def _installed_package(
     there directly, else its highest. A name no layer claims at all -- pinned
     only by a linked package's own lockfile -- takes its highest version.
     """
+    if packages is not None:
+        # Naming a package by hand reads across every layer, a linked
+        # package's own pins included, so they are loaded before the look-up.
+        packages.settle_all()
     installed = packages.versions.get(name, {}) if packages is not None else {}
     if not installed:
         request = name if version is None else f"{name}@{version}"

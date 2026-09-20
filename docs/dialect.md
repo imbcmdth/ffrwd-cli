@@ -824,6 +824,16 @@ The consuming project's own queries never see the linked package's
 dependencies. Linking a package something else already pins leaves the
 pin in place; the link answers while it stands.
 
+That lockfile is read only when a query REACHES the package - a call
+written in its own source is what its pins answer - so a machine-wide
+link no query touches costs nothing and cannot fail a command
+elsewhere. What is read of it is what its own project can reach, from
+the `dependencies` it records down through each entry's own; an entry
+nothing in that closure names is an install its manifest has moved
+past, and it is neither loaded nor missed. A command that LISTS what is
+installed reads every link it can and leaves out the ones it cannot,
+while a query reaching one of those still gets the typed rejection.
+
 `ffrwd unlink`, bare in the package's directory, removes the
 machine-wide record - consumers refuse at their next compile, naming
 the way back. `ffrwd unlink <name>` in a project removes that

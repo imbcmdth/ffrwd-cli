@@ -127,12 +127,17 @@ def _argv(sql: str, packages: PackageSet | None = None) -> list[str]:
 
 
 def _rejects(sql: str, packages: PackageSet | None, code: ErrorCode, needle: str) -> FfrwdError:
-    with pytest.raises(FfrwdError) as caught:
-        compile_commands(sql, packages=packages)
-    error = caught.value
+    error = _rejects_error(sql, packages)
     assert error.code is code, f"{error.code} != {code}: {error}"
     assert needle in error.message, error.message
     return error
+
+
+def _rejects_error(sql: str, packages: PackageSet | None) -> FfrwdError:
+    """Whatever compiling `sql` refused with, for a caller checking the text."""
+    with pytest.raises(FfrwdError) as caught:
+        compile_commands(sql, packages=packages)
+    return caught.value
 
 
 # ---------------------------------------------------------------------------
@@ -1218,6 +1223,10 @@ def test_a_malformed_manifest_is_data_for_validate(tmp_path: Path) -> None:
 
 QUERY = "COPY (SELECT {call}(f.audio[1]) FROM input('film.mkv') f) TO 'out.mkv'"
 
+# The same COPY calling into nothing at all: what a project compiles when the
+# packages around it are none of its business.
+_PLAIN = "COPY (SELECT f.audio[1] FROM input('film.mkv') f) TO 'out.mkv'"
+
 
 def _quieter(factor: str) -> str:
     """A one-argument ``quieter`` whose factor shows up in the filter graph.
@@ -1964,6 +1973,83 @@ def test_a_link_inside_a_linked_package_resolves_for_its_holder(
         "unknown namespace 'shared'",
     )
     assert (helper / MANIFEST_NAME).is_file()
+
+
+def test_a_linked_packages_own_lock_is_read_only_when_a_call_reaches_it(
+    store_home: Path, tmp_path: Path
+) -> None:
+    """A link is machine-wide, so its lockfile is every command's business
+    until it is nobody's: discovery reads the manifest and stops, and a query
+    that never calls into the package compiles though the store lost what
+    that package depends on. One that does call in gets the typed rejection,
+    hint and all."""
+    dep = _installed(_library(tmp_path / "d", "shared", "0.25", package="d"))
+    linked = _library(
+        tmp_path / "dev",
+        "studio",
+        "",
+        package="pipe",
+        member="use",
+        src=_REACH,
+        dependencies={"shared/d": "1.0.0"},
+    )
+    _lock(linked, [dep], dependencies={"shared/d": "1.0.0"})
+    project = tmp_path / "work"
+    _linked_consumer(project, linked)
+    shutil.rmtree(store.store_dir() / str(dep["store"]))
+
+    packages = _packages(project)
+    # A query the link has nothing to do with compiles as if it were not there.
+    assert _heard(_PLAIN, packages)[0]
+
+    error = _rejects_error(QUERY.format(call="studio.pipe.use"), packages)
+    assert "is not in the store" in error.message
+    assert error.hint is not None and "install" in error.hint
+
+
+def test_a_broken_link_inside_a_linked_package_is_that_packages_own_problem(
+    store_home: Path, tmp_path: Path
+) -> None:
+    """The link this machine no longer holds is named by the linked tree, not
+    by the project compiling: a query that never reaches that tree compiles,
+    and `settle_all` leaves it out of a listing rather than failing it."""
+    linked = _library(tmp_path / "dev", "studio", "", package="pipe", member="use", src=_REACH)
+    write_linksfile(links_path(linked / "ffrwd.lock"), [LinkEntry(name="shared/d")])
+    project = tmp_path / "work"
+    _linked_consumer(project, linked)
+
+    packages = _packages(project)
+    assert "studio/pipe" in packages.names()
+    packages.settle_all()
+    assert _heard(_PLAIN, packages)[0]
+    error = _rejects_error(QUERY.format(call="studio.pipe.use"), packages)
+    assert "nothing on this machine links it" in error.message
+
+
+def test_a_lock_entry_nothing_depends_on_is_never_loaded(
+    store_home: Path, tmp_path: Path
+) -> None:
+    """Install leaves entries behind when a manifest moves on. One of those
+    answers no call the lockfile is consulted for, so its store content is
+    not wanted and its absence is not an error."""
+    dep = _installed(_library(tmp_path / "d", "shared", "0.25", package="d"))
+    stale = _installed(_library(tmp_path / "old", "gone", "0.9", package="d"))
+    linked = _library(
+        tmp_path / "dev",
+        "studio",
+        "",
+        package="pipe",
+        member="use",
+        src=_REACH,
+        dependencies={"shared/d": "1.0.0"},
+    )
+    _lock(linked, [dep, stale], dependencies={"shared/d": "1.0.0"})
+    project = tmp_path / "work"
+    _linked_consumer(project, linked)
+    shutil.rmtree(store.store_dir() / str(stale["store"]))
+
+    argv, _said = _heard(QUERY.format(call="studio.pipe.use"), _packages(project))
+    assert "volume=volume=0.25" in " ".join(argv)
 
 
 def test_a_linked_tree_that_drifts_uninstalled_refuses_at_resolution(

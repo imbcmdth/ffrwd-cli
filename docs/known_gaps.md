@@ -119,6 +119,17 @@ output is plain ffmpeg, so the two mix freely in a script.
   Some sources carry streams with no detectable codec (certain DASH
   text tracks, for example). Selecting one is a compile error; table
   queries over the same source still work.
+- **Stream-copy hosting needs a probe.** A subscripted stream lowers
+  symbolically, so a query over a file this machine cannot open still
+  compiles - which is the point, for a command meant to run somewhere
+  else. What the compiler then does not know is the stream's codec, so
+  it cannot say the stream reaches a packet filter in one the module
+  accepts, and an encoder goes in front of the filter instead of a
+  copy. Nothing about that is the path's SPELLING: `/e/film.mp4` on
+  Windows and a native path to a file that is not there compile to the
+  same thing, and `/e/film.mp4` is a real path under MSYS or WSL, where
+  the printed command runs. Compile where the file is if you want the
+  copy.
 - **A rows function's own rows cannot be narrowed.** The node that
   narrows rows at run time rides the frames a producing module reads
   them off, so a `WHERE` belongs on that module's column. A rows
