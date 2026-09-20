@@ -215,36 +215,6 @@ fn aspect_from(sample_width: u64, sample_height: u64) -> Option<(i32, i32)> {
     (num > 0 && den > 0).then_some((num, den))
 }
 
-/// The h264 profile and level: bytes 1 and 3 of the SPS payload, the same
-/// two an avcC copies into its own header. The NUT wire carries Annex-B
-/// extradata, so the SPS is found behind its start code; extradata already
-/// shaped as an avcC (first byte 1, a version no Annex-B stream starts
-/// with) reads the same bytes off its header instead.
-fn h264_profile_level(extradata: &[u8]) -> Option<(i32, i32)> {
-    if extradata.first() == Some(&1) {
-        return match extradata {
-            [_, profile, _, level, ..] => Some((i32::from(*profile), i32::from(*level))),
-            _ => None,
-        };
-    }
-    let mut at = 0usize;
-    while at + 4 < extradata.len() {
-        if extradata[at..at + 3] != [0, 0, 1] {
-            at += 1;
-            continue;
-        }
-        let nal = &extradata[at + 3..];
-        if nal[0] & 0x1f == 7 {
-            return match nal {
-                [_, profile, _, level, ..] => Some((i32::from(*profile), i32::from(*level))),
-                _ => None,
-            };
-        }
-        at += 3;
-    }
-    None
-}
-
 /// What arrives on the wire must be what the header said: a whole frame, or a
 /// whole number of samples.
 fn check_frame(format: &Format, frame: &[u8], index: u64) -> Result<()> {
@@ -2693,8 +2663,9 @@ fn coded_pad(
     // this wire names keep theirs elsewhere (hevc and av1 inside their own
     // headers, aac nowhere), and stay None rather than guessed.
     let (profile, level) = match codec {
-        "h264" => match h264_profile_level(&stream.extradata) {
-            Some((profile, level)) => (Some(profile), Some(level)),
+        // The crate hands back the two bytes; ffmpeg's width is i32.
+        "h264" => match ffrwd_nal::sps::profile_level(&stream.extradata) {
+            Some((profile, level)) => (Some(i32::from(profile)), Some(i32::from(level))),
             None => (None, None),
         },
         _ => (None, None),
@@ -3867,7 +3838,7 @@ mod rows_queue_tests {
 
 #[cfg(test)]
 mod stream_field_tests {
-    use super::{aspect_from, color_from, frame_ticks, h264_profile_level, Durations};
+    use super::{aspect_from, color_from, frame_ticks, Durations};
     use ffrwd_wasm::nut;
     use ffrwd_wasm_runtime::runtime;
 
@@ -3916,35 +3887,6 @@ mod stream_field_tests {
         assert_eq!(aspect_from(0, 0), None);
         assert_eq!(aspect_from(4, 0), None);
         assert_eq!(aspect_from(u64::MAX, 1), None);
-    }
-
-    #[test]
-    fn the_h264_profile_and_level_come_off_the_annex_b_sps() {
-        // SPS behind a 4-byte start code: profile 0x64 (High), level 0x1f,
-        // then the PPS the extradata also carries.
-        let extradata = [
-            0u8, 0, 0, 1, 0x67, 0x64, 0x00, 0x1f, 0xab, // SPS
-            0, 0, 0, 1, 0x68, 0xee, // PPS
-        ];
-        assert_eq!(h264_profile_level(&extradata), Some((0x64, 0x1f)));
-        // A PPS first does not confuse the scan.
-        let pps_first = [0u8, 0, 0, 1, 0x68, 0xee, 0, 0, 1, 0x67, 0x42, 0xc0, 0x1e];
-        assert_eq!(h264_profile_level(&pps_first), Some((0x42, 0x1e)));
-    }
-
-    #[test]
-    fn avcc_shaped_extradata_reads_the_same_bytes_off_its_header() {
-        assert_eq!(
-            h264_profile_level(&[1, 0x64, 0x00, 0x1f, 0xff, 0xe1]),
-            Some((0x64, 0x1f))
-        );
-    }
-
-    #[test]
-    fn extradata_without_a_readable_sps_names_no_profile() {
-        assert_eq!(h264_profile_level(&[]), None);
-        assert_eq!(h264_profile_level(&[0, 0, 0, 1, 0x68, 0xee]), None);
-        assert_eq!(h264_profile_level(&[0xab, 0xcd, 0xef]), None);
     }
 
     fn packet(pts: i64) -> runtime::Packet {
