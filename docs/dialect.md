@@ -64,6 +64,16 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   omitted trailing argument takes it. Recipes
   [67-68](examples.md#67-write-a-function-and-reuse-it),
   [79](examples.md#79-give-a-parameter-a-default).
+- A `TABLE`-returning function's arguments read the FROM items written
+  to its left, so a stream can be handed to one and the body runs once
+  per outer row - an encoding ladder is a function a package ships
+  rather than something each query spells out (recipe
+  [133](examples.md#133-ship-the-ladder-as-a-function)). The body is
+  private either way: its parameters and its own aliases are all it
+  sees, and an outer alias spelling one of them changes nothing. A
+  stream argument is the outer row's, built once whatever the body's
+  row count, so `ladder(blur(f.video[1]))` blurs once and splits into
+  the rungs.
 - A **`LANGUAGE wasm` function** names a wasm module and one export
   in it, and is called like any other function. It has no body to
   inline: the module runs in the `ffrwd-wasm` sidecar, so a query
@@ -978,7 +988,24 @@ Every FROM item is a compile-time table; the column model per shape is
 | `unnest(ARRAY[STRUCT(v AS c, ...), ...]) alias` | one per array element | a written row table; columns are the STRUCT field names, every element declaring the same set |
 | `generate_series(start, stop[, step]) alias` | `stop - start` over `step`, inclusive | alias mandatory, names both the row table and its one column (`i.i`); bounds and step are integer literals after substitution |
 | `cte_or_view_name [alias]` | its body's rows | a multi-row body is a multi-row source |
-| `function_name(args) alias` | its body's rows | a table-returning function, expanded at compile time |
+| `function_name(args) alias` | its body's rows, per outer row | a table-returning function, expanded at compile time; its arguments read the items to its left |
+
+An argument of a call in FROM may read any FROM item written to its
+LEFT, and nothing else: a call sees the aliases written before it, as
+Postgres scopes an implicit-LATERAL one. The body then runs once per
+outer row, so the relation is the outer rows times the call's - a
+three-rung ladder over a two-track input is six rows.
+
+`LATERAL fn(...) alias` and `CROSS JOIN LATERAL fn(...) alias` are
+accepted spellings of exactly that, and say nothing a comma does not.
+The keyword is refused where it would mean something else: before a
+CTE or view name, under an outer join, and with `WITH ORDINALITY`,
+`LATERAL VIEW` or `APPLY`.
+
+Two kinds of call read values only, whatever is to their left:
+`generate_series` takes integer literals after substitution, and a
+`RETURNS source` wasm function takes literals and substituted
+variables, since it is probed once before any row exists.
 
 Comma between items is a cross join with real multiplicity.
 `JOIN ... ON` exists between two row tables - `unnest` tables (chapter

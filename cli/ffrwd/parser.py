@@ -2984,6 +2984,107 @@ def from_items(select: exp.Select) -> list[exp.Expr]:
     return [item for item, _ in from_entries(select)]
 
 
+_LATERAL_HINT = (
+    "a call in FROM already sees the items written before it, so LATERAL is "
+    "optional: FROM input('a.mp4') f, ladder(f.video[1]) l"
+)
+
+
+def _lateral_item(lateral: exp.Lateral, inner: exp.Expr) -> exp.Expr | None:
+    """The plain FROM item `lateral` spells, or None if it spells none.
+
+    ``LATERAL`` is sugar over what FROM already means here, so what it wraps
+    is rewritten into the ordinary spelling and no later pass learns the
+    keyword exists. A bare name is not a call and gets no rewriting: LATERAL
+    before one means nothing, in this dialect as in Postgres.
+    """
+    alias = lateral.args.get("alias")
+    if isinstance(inner, exp.Unnest):
+        if alias is not None:
+            inner.set("alias", alias)
+        return inner
+    if isinstance(inner, exp.GenerateSeries | exp.ExplodingGenerateSeries):
+        series = exp.GenerateSeries(**{k: v for k, v in inner.args.items() if v is not None})
+        return exp.Table(this=series, alias=alias)
+    if isinstance(inner, exp.Anonymous):
+        return exp.Table(this=inner, alias=alias)
+    if isinstance(inner, exp.Dot) and isinstance(inner.expression, exp.Anonymous):
+        segments = _dot_identifiers(inner.this)
+        if segments is not None and len(segments) <= 2:
+            qualifiers = dict(zip(("db",) if len(segments) == 1 else ("catalog", "db"), segments))
+            return exp.Table(this=inner.expression, alias=alias, **qualifiers)
+    return None
+
+
+def _dot_identifiers(node: exp.Expr) -> list[exp.Identifier] | None:
+    """The plain identifiers `node` chains, left to right, or None."""
+    if isinstance(node, exp.Identifier):
+        return [node]
+    if isinstance(node, exp.Dot) and isinstance(node.expression, exp.Identifier):
+        left = _dot_identifiers(node.this)
+        return None if left is None else [*left, node.expression]
+    return None
+
+
+def desugar_lateral(tree: exp.Expression) -> None:
+    """Rewrite every ``LATERAL`` FROM item into the plain spelling of the same thing.
+
+    A call in FROM is implicitly lateral -- its arguments see the items written
+    to its left -- so the keyword adds nothing and is accepted as documentation
+    of what is already happening. ``CROSS JOIN LATERAL fn(...) t`` is the same
+    item attached with a comma, so the CROSS that carried it goes too; every
+    other join kind, and the modifiers that would mean something else
+    (``WITH ORDINALITY``, ``LATERAL VIEW``, ``OUTER APPLY``), is refused.
+    """
+    for lateral in list(tree.find_all(exp.Lateral)):
+        if not isinstance(lateral, exp.Lateral):  # pragma: no cover - find_all is typed loosely
+            continue
+        for key, written in (
+            ("view", "LATERAL VIEW"),
+            ("outer", "OUTER APPLY"),
+            ("cross_apply", "APPLY"),
+            ("ordinality", "WITH ORDINALITY"),
+        ):
+            if lateral.args.get(key):
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"{written} is not supported",
+                    lateral,
+                    hint=_LATERAL_HINT,
+                )
+        join = lateral.parent
+        if isinstance(join, exp.Join):
+            spec = _join_spec(join)
+            if spec.kind != "cross" or spec.on is not None:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    "LATERAL is supported after a comma and after CROSS JOIN, "
+                    "not under an outer join",
+                    lateral,
+                    fallback=join,
+                    hint=_LATERAL_HINT,
+                )
+        inner = lateral.this
+        if not isinstance(inner, exp.Expr):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL, "malformed LATERAL item", lateral, hint=_LATERAL_HINT
+            )
+        if isinstance(inner, exp.Identifier):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"LATERAL means nothing before '{_ident_name(inner)}', which "
+                "is a name rather than a call",
+                lateral,
+                hint=_LATERAL_HINT,
+            )
+        # A shape LATERAL cannot introduce (a subquery) is unwrapped and left to
+        # the FROM-item check, whose message is about the shape itself.
+        lateral.replace(_lateral_item(lateral, inner) or inner)
+        if isinstance(join, exp.Join):
+            # The CROSS that carried the item is what a comma already is.
+            join.set("kind", None)
+
+
 def _unnest_aliases(select: exp.Select) -> set[str]:
     """The row-table names this branch's FROM clause binds with ``unnest``."""
     names: set[str] = set()
@@ -8857,6 +8958,9 @@ def resolve(
     from .functions import expanded  # deferred: functions.py imports this module
 
     try:
+        # Before expansion: what the keyword wraps has to be an ordinary FROM
+        # item by the time a call site is looked for.
+        desugar_lateral(tree)
         with expanded(tree, packages=packages, on_warning=on_warning, owner=owner) as script:
             resolved = _Resolver(script.wasm).run(script.tree)
             resolved.wasm = script.wasm

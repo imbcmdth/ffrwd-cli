@@ -979,6 +979,209 @@ def test_a_table_function_is_a_row_source_inside_a_cte() -> None:
     ]
 
 
+# ---------------------------------------------------------------------------
+# table-returning functions: an argument sees the FROM items to its left
+# ---------------------------------------------------------------------------
+
+
+# The ladder a package can ship: one video in, one row per rung out.
+LADDER = (
+    "CREATE FUNCTION ladder(v video_stream)\n"
+    "RETURNS TABLE(v video_stream, rung number, bitrate text) AS $$\n"
+    "  SELECT scale(v, r.width, -2), r.rung, r.bitrate\n"
+    "  FROM unnest(ARRAY[STRUCT(1 AS rung, 1280 AS width, '4500k' AS bitrate),\n"
+    "                    STRUCT(2 AS rung,  854 AS width, '2000k' AS bitrate),\n"
+    "                    STRUCT(3 AS rung,  640 AS width,  '900k' AS bitrate)]) r\n"
+    "$$ LANGUAGE sql;\n"
+)
+_LADDER_FANOUT = LADDER + (
+    "COPY (SELECT l.v FROM input('a.mp4') f, ladder(f.video[1]) l)\n"
+    "TO ('r' || l.rung::text || '.mp4')"
+)
+
+
+def _video_probe(count: int = 1, *, audio: bool = False) -> ProbeResult:
+    """`count` video streams, each 1920x1080 at 30fps, optionally one audio."""
+    streams = [
+        StreamMeta(
+            type="video",
+            index=index,
+            metadata={},
+            width=1920,
+            height=1080,
+            fps=30.0,
+            sample_rate=None,
+            codec="h264",
+            channels=None,
+            channel_layout=None,
+            bitrate=None,
+            duration=None,
+            color_transfer=None,
+        )
+        for index in range(count)
+    ]
+    if audio:
+        streams += _audio_probe({}).streams
+    return ProbeResult(streams=streams)
+
+
+def _scales(args: list[str]) -> list[str]:
+    """Every scale width the filtergraph wrote, in graph order."""
+    return re.findall(r"scale=width=(-?\d+)", " ".join(args))
+
+
+def _variant_map(args: list[str]) -> list[str]:
+    """The manifest's variant map entries, one per row of the relation."""
+    return args[args.index("-var_stream_map") + 1].split(" ")
+
+
+def test_a_table_function_argument_reads_the_from_item_before_it() -> None:
+    """The ladder over one input: three rungs at the widths the body wrote,
+    each fed by the stream the caller passed, each its own file."""
+    args = _argv(_LADDER_FANOUT)
+    assert args.count("-i") == 1
+    assert _scales(args) == ["1280", "854", "640"]
+    assert [arg for arg in args if arg.endswith(".mp4") and arg != "a.mp4"] == [
+        "r1.mp4",
+        "r2.mp4",
+        "r3.mp4",
+    ]
+
+
+def test_a_lateral_call_multiplies_the_outer_rows() -> None:
+    """The product is the outer rows times the body's: two tracks, three
+    rungs, six rows."""
+    sql = LADDER + (
+        "SELECT t.index, l.rung FROM input('a.mp4') f, unnest(f.video) t, ladder(t) l"
+    )
+    rows = _rows(sql, {"f": _video_probe(2)})
+    assert [row[1] for row in rows] == [1, 2, 3, 1, 2, 3]
+
+
+def test_a_stream_argument_expression_is_built_once_for_every_rung() -> None:
+    """The argument belongs to the OUTER row, so the chain behind it is built
+    once and split to the rungs rather than once per rung."""
+    sql = LADDER + (
+        "COPY (SELECT l.v FROM input('a.mp4') f, ladder(hflip(f.video[1])) l)\n"
+        "TO 'out/master.m3u8' WITH (format 'hls', hls_time 2, video_codec 'libx264')"
+    )
+    graph = insert_splits(
+        lower(_resolved(sql), {"f": _video_probe()}, registry=_snapshot_registry())
+    )
+    filters = [node.filter for node in graph.nodes.values()]
+    assert filters.count("hflip") == 1
+    assert filters.count("scale") == 3
+    assert filters.count("split") == 1
+
+
+def test_a_lateral_body_alias_never_captures_an_outer_one() -> None:
+    """The body's own `r` and its parameter `v` are private, so an outer FROM
+    item may be called either without changing what the body reads."""
+    for outer in ("r", "v"):
+        sql = _LADDER_FANOUT.replace(
+            "input('a.mp4') f, ladder(f.", f"input('a.mp4') {outer}, ladder({outer}."
+        )
+        assert _scales(_argv(sql)) == ["1280", "854", "640"], outer
+
+
+def test_a_lateral_call_reads_its_own_rung_in_a_with_option() -> None:
+    """A rung's value picks that rung's encode, the way a longhand ladder's
+    generate_series column already does."""
+    sql = LADDER + (
+        "COPY (SELECT l.v FROM input('a.mp4') f, ladder(fps(f.video[1], 30)) l)\n"
+        "TO 'out/master.m3u8' WITH (format 'hls', hls_time 2,\n"
+        "  video_codec 'libx264',\n"
+        "  video_bitrate ARRAY['4500k', '2000k', '900k'][l.rung])"
+    )
+    args = _argv(sql, {"f": _video_probe()})
+    assert args[args.index("-b:0") + 1] == "4500k"
+    assert args[args.index("-b:2") + 1] == "900k"
+
+
+def test_a_lateral_calls_own_where_narrows_the_host() -> None:
+    sql = LADDER + (
+        "COPY (SELECT l.v FROM input('a.mp4') f, ladder(f.video[1]) l WHERE l.rung = 2)\n"
+        "TO 'out.mp4'"
+    )
+    assert _scales(_argv(sql)) == ["854"]
+
+
+def test_an_argument_reading_an_alias_written_later_names_the_function() -> None:
+    sql = LADDER + (
+        "COPY (SELECT l.v FROM ladder(f.video[1]) l, input('a.mp4') f) TO 'out.mp4'"
+    )
+    error = _rejects(sql, ErrorCode.UNKNOWN_ALIAS, "ladder()'s argument reads 'f.video'")
+    assert "written after the call" in error.message
+    assert error.hint is not None and "before it" in error.hint
+
+
+def test_an_argument_reading_no_from_item_names_the_function() -> None:
+    sql = LADDER + (
+        "COPY (SELECT l.v FROM input('a.mp4') f, ladder(g.video[1]) l) TO 'out.mp4'"
+    )
+    error = _rejects(sql, ErrorCode.UNKNOWN_ALIAS, "no FROM item is named 'g'")
+    assert error.hint == "known names: f"
+
+
+def test_an_undeclared_column_of_a_lateral_call_says_what_it_exposes() -> None:
+    sql = LADDER + (
+        "COPY (SELECT l.height FROM input('a.mp4') f, ladder(f.video[1]) l) TO 'out.mp4'"
+    )
+    error = _rejects(sql, ErrorCode.UNSUPPORTED_SQL, "unknown column 'l.height'")
+    assert error.hint is not None and "v, rung, bitrate" in error.hint
+
+
+def test_a_function_over_both_kinds_writes_muxed_variants() -> None:
+    """One call taking a video AND an audio: each rung carries both, so every
+    variant is muxed."""
+    sql = (
+        "CREATE FUNCTION rungs(v video_stream, a audio_stream)\n"
+        "RETURNS TABLE(v video_stream, a audio_stream, rung number) AS $$\n"
+        "  SELECT scale(v, r.width, -2), a, r.rung\n"
+        "  FROM unnest(ARRAY[STRUCT(1 AS rung, 1280 AS width),\n"
+        "                    STRUCT(2 AS rung, 854 AS width)]) r\n"
+        "$$ LANGUAGE sql;\n"
+        "COPY (SELECT l.v, l.a\n"
+        "      FROM input('a.mp4') f, rungs(fps(f.video[1], 30), f.audio[1]) l)\n"
+        "TO 'out/master.m3u8' WITH (format 'hls', hls_time 2,\n"
+        "  video_codec 'libx264', audio_codec 'aac')"
+    )
+    assert _variant_map(_argv(sql, {"f": _video_probe(audio=True)})) == [
+        "v:0,a:0,name:720p",
+        "v:1,a:1,name:480p",
+    ]
+
+
+def test_a_lateral_calls_rows_join_another_relations_through_a_cte() -> None:
+    """A rung with no audio is what it has always been -- an outer join's gap
+    -- and a call's rows carried through a CTE join like any other rows."""
+    sql = LADDER + (
+        "COPY (\n"
+        "  WITH vid AS (SELECT l.v AS v, l.rung AS rung\n"
+        "               FROM input('a.mp4') f, ladder(fps(f.video[1], 30)) l),\n"
+        "       aud AS (SELECT g.audio[1] AS t, 9 AS rung FROM input('a.mp4') g)\n"
+        "  SELECT vid.v, aud.t FROM vid FULL JOIN aud ON vid.rung = aud.rung)\n"
+        "TO 'out/master.m3u8' WITH (format 'hls', hls_time 2,\n"
+        "  video_codec 'libx264', audio_codec 'aac')"
+    )
+    probes = {"f": _video_probe(audio=True), "g": _video_probe(audio=True)}
+    assert _variant_map(_argv(sql, probes)) == [
+        "v:0,agroup:aud,name:720p",
+        "v:1,agroup:aud,name:480p",
+        "v:2,agroup:aud,name:360p",
+        "a:0,agroup:aud,name:a0,default:yes",
+    ]
+
+
+def test_lateral_and_cross_join_lateral_spell_the_same_call() -> None:
+    """Both keywords say what FROM already does, so the three spellings compile
+    to one command."""
+    written = _LADDER_FANOUT.replace(", ladder(", ", LATERAL ladder(")
+    joined = _LADDER_FANOUT.replace(", ladder(", " CROSS JOIN LATERAL ladder(")
+    assert _argv(written) == _argv(_LADDER_FANOUT)
+    assert _argv(joined) == _argv(_LADDER_FANOUT)
+
+
 def test_a_package_qualified_source_call_keeps_its_alias_after_adoption(
     tmp_path: Path,
 ) -> None:

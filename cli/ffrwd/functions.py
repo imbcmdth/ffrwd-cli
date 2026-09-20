@@ -2638,6 +2638,73 @@ def _substitute(body: exp.Select, bindings: dict[str, exp.Expr]) -> None:
         column.replace(_accessor(argument, _path_after(column, key)))
 
 
+def _item_alias(item: exp.Expr) -> str | None:
+    """The name a FROM item binds, or None for one that binds nothing.
+
+    An alias when the item was written with one; otherwise a bare CTE or view
+    reference, which binds its own name.
+    """
+    alias = item.args.get("alias")
+    if isinstance(alias, exp.TableAlias) and isinstance(alias.this, exp.Identifier):
+        return _ident_name(alias.this)
+    if isinstance(item, exp.Table) and isinstance(item.this, exp.Identifier):
+        return _ident_name(item.this)
+    return None
+
+
+def _neighbours(host: exp.Select, item: exp.Expr) -> tuple[set[str], set[str]]:
+    """What the FROM items to `item`'s left bind, and what those to its right do.
+
+    A call in FROM sees the items written before it and nothing else, so the
+    split is what decides whether an argument reading an alias is lateral or a
+    rejection.
+    """
+    left: set[str] = set()
+    right: set[str] = set()
+    past = False
+    for entry, _ in from_entries(host):
+        if entry is item:
+            past = True
+            continue
+        name = _item_alias(entry)
+        if name is not None:
+            (right if past else left).add(name)
+    return left, right
+
+
+def _alias_reads(call: exp.Anonymous) -> list[tuple[str, exp.Column, bool]]:
+    """Every name an argument reads: the name, the column, and whether it is qualified.
+
+    A qualified read (``f.video[1]``) names a FROM item outright. An
+    unqualified one is a bare track-row alias, where the row IS the stream --
+    only an alias in scope makes it one, so the caller decides.
+    """
+    reads: list[tuple[str, exp.Column, bool]] = []
+    for column in call.find_all(exp.Column):
+        key = _leftmost(column)
+        if key is None:
+            continue
+        identifier = column.args.get(key)
+        if isinstance(identifier, exp.Identifier):
+            reads.append((_ident_name(identifier), column, key != "this"))
+    return reads
+
+
+def _known_hint(names: set[str]) -> str:
+    """What a call in FROM could have read, named the way resolve names it."""
+    known = ", ".join(sorted(names))
+    return f"known names: {known}" if known else "no aliases are in scope"
+
+
+def _written_column(column: exp.Column) -> str:
+    """One column read back the way it was written, for a rejection to quote."""
+    return ".".join(
+        _ident_name(node)
+        for key in _QUALIFIERS
+        if isinstance(node := column.args.get(key), exp.Identifier)
+    )
+
+
 def _and_into(host: exp.Select, predicate: exp.Expr) -> None:
     """Add one conjunct to the host query's WHERE."""
     conjunct = exp.Paren(this=predicate) if isinstance(predicate, exp.Or) else predicate
@@ -2660,6 +2727,30 @@ def _splice(host: exp.Select, body: exp.Select) -> None:
     added.extend(join for join in body.args.get("joins") or [] if isinstance(join, exp.Join))
     if added:
         host.set("joins", [*(host.args.get("joins") or []), *added])
+    where = body.args.get("where")
+    if isinstance(where, exp.Where) and isinstance(where.this, exp.Expr):
+        _and_into(host, where.this)
+
+
+def _splice_over(host: exp.Select, item: exp.Expr, body: exp.Select) -> None:
+    """Put the body's FROM items where `item` stood, keeping written order.
+
+    Order is the whole point: a call in FROM sees the items to its left, so the
+    items it expands into have to land in its own place rather than at the end,
+    where a later call would see them and an earlier one would not.
+    """
+    from_ = body.args.get("from_")
+    if not isinstance(from_, exp.From) or not isinstance(from_.this, exp.Expr):
+        # Unreachable: a body is one SELECT and _body_select requires its FROM.
+        raise _error(ErrorCode.UNSUPPORTED_SQL, "a table function body has no FROM", body)
+    first = from_.this
+    rest = [join for join in body.args.get("joins") or [] if isinstance(join, exp.Join)]
+    joins = list(host.args.get("joins") or [])
+    found = next((index for index, join in enumerate(joins) if join.this is item), None)
+    at = 0 if found is None else found + 1
+    item.replace(first)
+    if rest:
+        host.set("joins", [*joins[:at], *rest, *joins[at:]])
     where = body.args.get("where")
     if isinstance(where, exp.Where) and isinstance(where.this, exp.Expr):
         _and_into(host, where.this)
@@ -2976,6 +3067,10 @@ class _Expander:
     budget: int = _EXPANSION_BUDGET
     # Where the statement being walked keeps its generated CTEs.
     site: _Site | None = None
+    # The statement being walked. An inlined lateral call's alias is read from
+    # the query AND, under a COPY, from the destination and the WITH options
+    # written beside it.
+    statement: exp.Expr | None = None
     # The packages a qualified call may resolve in, and -- keyed by (package
     # name, version), since two versions of one name are never the same
     # scope -- what each one's lib files define and which of those names its
@@ -3341,6 +3436,7 @@ class _Expander:
     def _expand_statement(self, statement: exp.Expr, position: int) -> None:
         """Inline every call the statement writes, each into the query around it."""
         query = _query_node(statement)
+        self.statement = statement
         selects = [node for node in _preorder(statement) if isinstance(node, exp.Select)]
         for select in selects:
             self.site = self._site_of(query, select)
@@ -3353,6 +3449,7 @@ class _Expander:
                 if isinstance(destination, exp.Expr):
                     self._expand_within(destination, selects[0], position, ())
         self.site = None
+        self.statement = None
 
     def _site_of(self, query: exp.Expr | None, select: exp.Select) -> _Site:
         """Where a call written in `select` puts the CTE it becomes."""
@@ -3954,14 +4051,60 @@ class _Expander:
         inner = projection.this if isinstance(projection, exp.Alias) else None
         return inner if isinstance(inner, exp.Expr) else projection
 
+    def _lateral_reads(
+        self, site: _CallSite, host: exp.Select, item: exp.Table
+    ) -> bool:
+        """Whether this call's arguments read a sibling FROM item, checked.
+
+        A call in FROM sees the aliases written to its LEFT, as Postgres has
+        it. Reading one is what makes the call lateral; reading a name bound
+        to its right, or none at all, names the function and the argument.
+        """
+        left, right = _neighbours(host, item)
+        lateral = False
+        for name, column, qualified in _alias_reads(site.call):
+            if name in left:
+                lateral = True
+                continue
+            # A bare name that no FROM item binds is not an alias read at all:
+            # resolve names it, in the words it uses for every other one.
+            if not qualified and name not in right:
+                continue
+            if name in right:
+                raise _error(
+                    ErrorCode.UNKNOWN_ALIAS,
+                    f"{site.function.qualified}()'s argument reads "
+                    f"'{_written_column(column)}', and '{name}' is written "
+                    "after the call",
+                    column,
+                    fallback=item,
+                    hint=f"a call in FROM sees the items written before it; "
+                    f"move '{name}' ahead of "
+                    f"{site.function.qualified}(...)",
+                )
+            raise _error(
+                ErrorCode.UNKNOWN_ALIAS,
+                f"{site.function.qualified}()'s argument reads "
+                f"'{_written_column(column)}', and no FROM item is named "
+                f"'{name}'",
+                column,
+                fallback=item,
+                hint=_known_hint(left),
+            )
+        return lateral
+
     def _expand_row_source(
         self, site: _CallSite, host: exp.Select, position: int, stack: tuple[str, ...]
     ) -> None:
-        """Turn one FROM-position call into a generated CTE, and read that instead.
+        """Turn one FROM-position call into rows the host reads.
 
-        The body becomes a relation of its own, which is what makes the call
-        site carry the body's ROW COUNT: splicing its FROM items into the host
-        would hand the host a product it never wrote.
+        A call reading nothing of the host becomes a generated CTE: the body is
+        a relation of its own, which is what makes the call site carry the
+        body's ROW COUNT. A call reading a sibling alias is LATERAL, and a CTE
+        cannot see the host's FROM items, so the body is inlined instead --
+        its FROM items take the call's own place, its WHERE joins the host's,
+        and each ``<alias>.<column>`` read becomes the projection behind it.
+        The product is the same either way: the outer rows times the body's.
         """
         item = site.node
         if not isinstance(item, exp.Table):  # unreachable: only a Table is a row source
@@ -3973,6 +4116,9 @@ class _Expander:
         _check_query_args(
             item, frozenset({"this", "alias", "db", "catalog"}), "a table function call"
         )
+        if self._lateral_reads(site, host, item):
+            self._expand_lateral_row_source(site, host, item, position, stack)
+            return
         self._enter(function, item, stack)
         arguments = self._arguments(function, site.call, host, position)
         body, index = self._instance(site, arguments)
@@ -3991,6 +4137,119 @@ class _Expander:
             # Unwritten, the alias is the function's own name, as Postgres has it.
             alias = exp.TableAlias(this=exp.Identifier(this=function.name, quoted=False))
         item.replace(exp.Table(this=identifier, alias=alias))
+
+    def _expand_lateral_row_source(
+        self,
+        site: _CallSite,
+        host: exp.Select,
+        item: exp.Table,
+        position: int,
+        stack: tuple[str, ...],
+    ) -> None:
+        """Inline one lateral call: its rows join the host's, its columns are read
+        back off the projections that produced them."""
+        function = site.function
+        self._enter(function, item, stack)
+        arguments = self._arguments(function, site.call, host, position)
+        body, _index = self._instance(site, arguments)
+        # The body's own calls expand into the body, before it leaves for the
+        # host: its aliases are the ones they may see.
+        with self._scoped(function.identity):
+            self._expand_within(body, body, position, (*stack, function.qualified))
+        _name_columns(body, function.columns or (), function.name, item)
+        alias_node = item.args.get("alias")
+        alias = (
+            _ident_name(alias_node.this)
+            if isinstance(alias_node, exp.TableAlias)
+            and isinstance(alias_node.this, exp.Identifier)
+            # Unwritten, the alias is the function's own name, as Postgres has it.
+            else function.name
+        )
+        columns = {
+            name: projection.this
+            for projection in body.expressions
+            if isinstance(projection, exp.Alias)
+            and isinstance(projection.this, exp.Expr)
+            and (name := _projection_alias(projection)) is not None
+        }
+        self._read_lateral(alias, columns, function, item)
+        _splice_over(host, item, body)
+
+    def _read_lateral(
+        self,
+        alias: str,
+        columns: dict[str, exp.Expr],
+        function: _Function,
+        item: exp.Table,
+    ) -> None:
+        """Replace every read of an inlined call's alias with the column behind it.
+
+        The alias names no relation any more, so each ``<alias>.<column>``
+        becomes the body projection that column was, and a read of a name the
+        function does not declare is the rejection it would have been off a CTE.
+        """
+        for root in self._reference_roots():
+            for column in list(root.find_all(exp.Column)):
+                key = _leftmost(column)
+                if key is None:
+                    continue
+                identifier = column.args.get(key)
+                if (
+                    not isinstance(identifier, exp.Identifier)
+                    or _ident_name(identifier) != alias
+                ):
+                    continue
+                path = _path_after(column, key)
+                if not path:
+                    raise _error(
+                        ErrorCode.UNSUPPORTED_SQL,
+                        f"'{alias}' is a table, not a value",
+                        column,
+                        fallback=item,
+                        hint=f"read one of its columns off the alias, e.g. "
+                        f"{alias}.{function.columns[0].name if function.columns else 'column'}",
+                    )
+                name = _ident_name(path[0])
+                found = columns.get(name)
+                if found is None:
+                    raise _error(
+                        ErrorCode.UNSUPPORTED_SQL,
+                        f"unknown column '{alias}.{name}'",
+                        column,
+                        fallback=item,
+                        hint=f"'{alias}' is {function.qualified}(), which "
+                        f"exposes: "
+                        + ", ".join(
+                            column.name for column in function.columns or ()
+                        ),
+                    )
+                read = copy.deepcopy(found)
+                column.replace(read if len(path) == 1 else _accessor(read, path[1:]))
+
+    def _reference_roots(self) -> list[exp.Expr]:
+        """Where a FROM alias of the statement being expanded can be read.
+
+        The query itself, and -- for a COPY -- the destination expression and
+        the ``WITH`` option values, which are written outside it but read its
+        rows.
+        """
+        statement = self.statement
+        if statement is None:  # unreachable: expansion always runs under one
+            return []
+        roots: list[exp.Expr] = [statement]
+        if isinstance(statement, exp.Copy):
+            roots = [
+                *(node for node in statement.args.get("files") or [] if isinstance(node, exp.Expr)),
+                *(
+                    node
+                    for node in statement.args.get("params") or []
+                    if isinstance(node, exp.Expr)
+                ),
+            ]
+            inner = statement.this
+            if isinstance(inner, exp.Expr):
+                roots.append(inner)
+        return roots
 
     def _fresh_name(self, base: str) -> str:
         """A name for a generated CTE that nothing in the script has claimed."""

@@ -495,6 +495,18 @@ _DIALECT_TAIL = """\
   Its body may also write a `tags` column, which tags the streams it
   returns; that column is not declared in `RETURNS TABLE` (declaring one
   called `tags` is a rejection) and is not readable off the alias.
+- Its ARGUMENTS read the FROM items written to its LEFT, as Postgres
+  scopes an implicit-LATERAL call, so a stream can be handed to one:
+  `FROM input('v.mp4') f, ladder(f.video[1]) l` runs the body once per
+  outer row, and a three-rung ladder over a two-track input is six rows.
+  An argument reading an alias written after the call, or one written
+  nowhere, is `UNKNOWN_ALIAS` naming the function and the argument. A
+  stream argument is the outer row's and is built once for all the
+  body's rows, so `ladder(blur(f.video[1]))` blurs once and splits.
+  `LATERAL fn(...) t` and `CROSS JOIN LATERAL fn(...) t` are accepted
+  spellings of the same thing and add nothing; the keyword is refused
+  before a CTE or view name, under an outer join, and with
+  `WITH ORDINALITY`.
 - The body is ONE `SELECT` with no `WITH`, no `GROUP BY`/`ORDER BY`/
   `LIMIT`, referencing only its parameters and its own `FROM` aliases. No
   `OR REPLACE`, no `IF NOT EXISTS`, no schema-qualified name, no `OUT`/

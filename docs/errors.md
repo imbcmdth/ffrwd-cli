@@ -101,6 +101,16 @@ SELECT b.video[1] FROM input('x.mp4') a
 {"line": 1, "col": 8, "code": "UNKNOWN_ALIAS", "message": "unknown alias 'b'", "hint": "known names: a"}
 ```
 
+A call in `FROM` sees the items written to its LEFT, so an argument reading one written after it, or one written nowhere at all, is named against the function and the argument rather than against the rows the call expands into:
+
+```json
+{"line": 2, "col": 13, "code": "UNKNOWN_ALIAS", "message": "ladder()'s argument reads 'f.video', and 'f' is written after the call", "hint": "a call in FROM sees the items written before it; move 'f' ahead of ladder(...)"}
+```
+
+```json
+{"line": 2, "col": 36, "code": "UNKNOWN_ALIAS", "message": "ladder()'s argument reads 'g.video', and no FROM item is named 'g'", "hint": "known names: f"}
+```
+
 ## UDF_ARG_TYPE
 
 **Meaning:** A call's *stream* arguments don't match. For a filter, that is the pad signature: `gblur` is `V->V`, so exactly one video in; `xfade` is `VV->V`, so two. For a `ffrwd.<name>` macro it is the macro's own signature. Option problems are never this code - a positional option validates as the option it binds to, so those are `UNKNOWN_FILTER_OPTION`/`FILTER_OPTION_TYPE` below. The exceptions: more positional options than the filter has options at all; an N-input filter's count option (`inputs`, `n`, ...) disagreeing with the stream count you actually passed, written out or spread with `VARIADIC`; a `VARIADIC` argument that is not an array, or is an empty one (naming what produced it) - all arity statements, all here.
@@ -212,6 +222,12 @@ One probed-reality rejection lands here: a stream ffprobe reports NO codec for (
 
 ```json
 {"line": 1, "col": 26, "code": "UNSUPPORTED_SQL", "message": "'s' (row 1) has no identifiable codec: ffmpeg's demuxer reports none, so the stream can be neither copied nor transcoded and no container can carry it", "hint": "drop it from the SELECT (a query with no COPY can still inspect it as a table row, codec column NULL); if it is a subtitle track, extract it with a tool that can read it and mux the resulting file as its own input() instead"}
+```
+
+The `LATERAL` rejections land here. A call in `FROM` is already lateral, so the keyword is accepted as documentation of what is happening and refused where it would mean something else: before a CTE or view name, under an outer join, and with `WITH ORDINALITY`, `LATERAL VIEW` or `APPLY`:
+
+```json
+{"line": 2, "col": 30, "code": "UNSUPPORTED_SQL", "message": "LATERAL means nothing before 'c', which is a name rather than a call", "hint": "a call in FROM already sees the items written before it, so LATERAL is optional: FROM input('a.mp4') f, ladder(f.video[1]) l"}
 ```
 
 Two argument-shape rejections land here: a named argument written out of place (a positional after a named one, or the same name twice - standard Postgres rules), and a named argument on a `ffrwd.<name>` macro, whose signature is positional only:

@@ -2178,6 +2178,49 @@ def test_unnest_needs_an_input_not_a_cte_or_a_generated_source() -> None:
     assert "only an input's array column can be unnested" in err.message
 
 
+# -- LATERAL, which a FROM call already is --------------
+
+
+def test_lateral_is_accepted_before_a_call_and_changes_nothing() -> None:
+    """The keyword is documentation: every call in FROM already sees the items
+    to its left, so the two spellings resolve to the same FROM clause."""
+    plain = _resolve("SELECT t FROM input('f.mkv') f, unnest(f.audio) t")
+    written = _resolve("SELECT t FROM input('f.mkv') f, LATERAL unnest(f.audio) t")
+    assert set(written.track_rows) == set(plain.track_rows)
+    joined = _resolve(
+        "SELECT i.i FROM input('f.mkv') f CROSS JOIN LATERAL generate_series(1, 3) i"
+    )
+    assert joined.series["i"] == (1, 2, 3)
+
+
+@pytest.mark.parametrize(
+    ("sql", "needle"),
+    [
+        (
+            "WITH c AS (SELECT a.audio AS t FROM input('f.mkv') a) "
+            "SELECT c.t FROM input('f.mkv') f, LATERAL c",
+            "LATERAL means nothing before 'c'",
+        ),
+        (
+            "SELECT i.i FROM input('f.mkv') f LEFT JOIN LATERAL "
+            "generate_series(1, 3) i ON TRUE",
+            "LATERAL is supported after a comma and after CROSS JOIN",
+        ),
+        (
+            "SELECT i.i FROM input('f.mkv') f, LATERAL generate_series(1, 3) "
+            "WITH ORDINALITY i",
+            "WITH ORDINALITY is not supported",
+        ),
+    ],
+)
+def test_lateral_is_refused_where_it_would_mean_something_else(
+    sql: str, needle: str
+) -> None:
+    err = _reject(sql)
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert needle in err.message, err.message
+
+
 # -- JOIN between track-row tables ----------------------
 
 
