@@ -32,6 +32,7 @@ from ffrwd import binaries, wasm
 from ffrwd.compiler import compile_all
 from ffrwd.emit import build_ffmpeg_args, emit
 from ffrwd.execute import execute_plan, render_plan
+from ffrwd.processes import PCM_F32LE, PCM_S16LE
 
 pytestmark = pytest.mark.exec
 
@@ -302,6 +303,109 @@ def test_the_compiled_shape_is_encoder_filter_muxer() -> None:
     assert _AV.as_posix() in [Path(p).as_posix() for p in muxer.graph.input_paths]
 
 
+# -- a SECOND reader of the passed-through stream --------------------------
+#
+# Another module in the same query reading the audio puts an `asplit` in
+# front of the column the COPY passes through. The muxer must still open the
+# source for it: taking it off the split's pipe would decode the samples and
+# write an encode of them where the query asked for the packets themselves.
+
+_RMS = _BUILT / "rms.wasm"
+
+_LEVELS = (
+    "CREATE FUNCTION levels(a audio_stream)\n"
+    "RETURNS STRUCT(a audio_stream,\n"
+    "               seen STRUCT(pts number, samples number, rms number)[])\n"
+    f"  AS '{_RMS.as_posix()}', 'rms' LANGUAGE wasm;\n"
+)
+
+
+def _require_levels() -> None:
+    if not _RMS.exists():
+        pytest.skip(
+            f"module missing: {_RMS} (cargo build --target wasm32-wasip2 "
+            f"--release, from {_SIDECAR_MODULES})"
+        )
+
+
+def _packet_bytes(path: Path, kind: str) -> list[tuple[str, str]]:
+    """Every packet of the first `kind` stream: its size and a hash of it.
+
+    What a decode would change and a copy would not. Sizes alone would miss a
+    re-encode that happened to land on the same lengths, so the payload's own
+    checksum rides with them.
+    """
+    read = _ffprobe(
+        "-select_streams",
+        f"{kind}:0",
+        "-show_entries",
+        "packet=size,data_hash",
+        "-show_data_hash",
+        "adler32",
+        str(path),
+    )
+    packets = read["packets"]
+    assert isinstance(packets, list)
+    return [(str(p.get("size")), str(p.get("data_hash"))) for p in packets]
+
+
+def _second_reader_query(out: Path) -> str:
+    return (
+        _DECLARE
+        + _LEVELS
+        + "COPY (\n"
+        + "  SELECT hand_on(f.video[1]), f.audio[1], levels(f.audio[1]).seen\n"
+        + f"  FROM input('{_AV.as_posix()}') f\n"
+        + f") TO '{out.as_posix()}'"
+    )
+
+
+def test_a_second_reader_of_the_audio_leaves_it_copied_from_the_source(
+    tmp_path: Path,
+) -> None:
+    """The audio the module reads is the audio the COPY passes through, and
+    what lands in the file is the source's own packets -- the same ones the
+    query without the second reader writes, byte for byte, in the codec they
+    were already in."""
+    _require_levels()
+    both = tmp_path / "both.mkv"
+    alone = tmp_path / "alone.mkv"
+    _run(_second_reader_query(both))
+    _run(
+        _DECLARE
+        + "COPY (\n"
+        + "  SELECT hand_on(f.video[1]), f.audio[1]\n"
+        + f"  FROM input('{_AV.as_posix()}') f\n"
+        + f") TO '{alone.as_posix()}'"
+    )
+
+    assert _stream_facts(both, "a")["codec_name"] == _stream_facts(_AV, "a")["codec_name"]
+    assert _packet_bytes(both, "a") == _packet_bytes(_AV, "a")
+    assert _packet_bytes(both, "a") == _packet_bytes(alone, "a")
+    assert _packet_times(both, "a") == _packet_times(alone, "a")
+
+
+def test_a_second_reader_does_not_put_the_audio_on_a_pipe() -> None:
+    """The plan says so too: the muxer opens the source, and no audio edge
+    reaches it."""
+    _require_levels()
+    compiled = compile_all(_second_reader_query(Path("out.mkv")))
+    plan = compiled.plan
+    assert plan is not None
+    muxed = next(
+        e
+        for e in plan.stream_edges
+        if any(s.id == e.source and s.packet_filter for s in plan.sidecars)
+    )
+    muxer = next(p for p in plan.ffmpeg if p.id == muxed.target)
+    assert _AV.as_posix() in [Path(p).as_posix() for p in muxer.graph.input_paths]
+    assert not [
+        e
+        for e in plan.stream_edges
+        if e.target == muxer.id and e.format.codec in (PCM_F32LE, PCM_S16LE)
+    ]
+
+
 # -- a filter's ROWS: written in one stage, read in the next ---------------
 
 _PACKET_SEI = _BUILT / "packet_sei.wasm"
@@ -387,6 +491,35 @@ def test_rows_written_in_one_stage_reach_the_filter_in_the_next(tmp_path: Path) 
     assert _stream_facts(out, "v")["nb_read_packets"] == _stream_facts(plain, "v")[
         "nb_read_packets"
     ]
+
+
+def test_a_rows_producer_over_the_audio_leaves_that_audio_alone(
+    tmp_path: Path,
+) -> None:
+    """The same shape with a THIRD reader in it: one module's rows go into
+    the packets, another module reads the audio the COPY passes through. The
+    notes still land, and the audio is still the source's own packets rather
+    than an encode of what the second module was handed."""
+    _require_weaving()
+    _require_levels()
+    out = tmp_path / "woven.mkv"
+    _run(
+        _NOTES
+        + _WEAVE_ONE
+        + _LEVELS
+        + "COPY (\n"
+        + "  SELECT weave(f.video[1], notes(f.video[1]).seen), f.audio[1],\n"
+        + "         levels(f.audio[1]).seen\n"
+        + f"  FROM input('{_AV.as_posix()}') f\n"
+        + f") TO '{out.as_posix()}'"
+    )
+
+    assert _woven(out, "note-0") == 1, "the first note never reached the stream"
+    assert _stream_facts(out, "a")["codec_name"] == _stream_facts(_AV, "a")["codec_name"]
+    assert _packet_bytes(out, "a") == _packet_bytes(_AV, "a")
+    # The levels reached the file as a track of their own, which is what
+    # made the audio a stream two things read.
+    assert _stream_facts(out, "s")["codec_name"] == "webvtt"
 
 
 def test_an_encoded_weave_reaches_every_keyframe_at_an_mkv(tmp_path: Path) -> None:

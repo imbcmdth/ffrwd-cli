@@ -14,6 +14,7 @@ import pytest
 
 from ffrwd import wasm
 from ffrwd.errors import ErrorCode, FfrwdError
+from ffrwd.execute import plan_argv
 from ffrwd.ir import (
     Graph,
     ModuleSource,
@@ -1390,6 +1391,127 @@ def test_a_packet_filters_pads_are_inputs_of_their_own_not_a_network() -> None:
     argv = wasm.shown_argv(sidecar, ["in0", "in1"], ["out0", "out1"])
     assert argv.count("-i") == 2
     assert argv[-6:] == ["-f", "nut", "out0", "-f", "nut", "out1"]
+
+
+def _second_reader_graph(kind: StreamType = "audio") -> Graph:
+    """A packet filter on the video, and a passed-through stream a module reads.
+
+    The second reader is what puts a split in front of a column the COPY
+    writes untouched, and the filter is what leaves the muxer a level deeper
+    than that split. The shape lowering writes for
+    ``SELECT weave(f.video[1]), f.audio[1], meta(f.audio[1]).rows``.
+    """
+    marker = "a" if kind == "audio" else "v"
+    splitter = "asplit" if kind == "audio" else "split"
+    g = Graph(input_paths=["a.mp4"], sources={"a": 0})
+    g.nodes["e0"] = Node(
+        id="e0", filter="weave.wasm", args={}, inputs=["src:a:v:0"], outputs=["video"]
+    )
+    g.packet_filters["e0"] = [{"video_codec": COPY_CODEC}]
+    g.nodes["sp"] = Node(
+        id="sp",
+        filter=splitter,
+        args={"n": 2},
+        inputs=[f"src:a:{marker}:0"],
+        outputs=[kind, kind],
+    )
+    g.nodes["e1"] = Node(
+        id="e1", filter="meta.wasm", args={}, inputs=["sp:0"], outputs=[kind]
+    )
+    g.rows_sinks["e1"] = RowsSink(path="rows.ndjson", container="ndjson")
+    g.sinks = [SinkUnit(outputs=[_out("e0"), _out("sp:1", kind)], path="out.mp4")]
+    return g
+
+
+def _muxer(plan: ProcessPlan) -> FfmpegProcess:
+    return next(
+        p for p in plan.ffmpeg if any(unit.path == "out.mp4" for unit in p.graph.sinks)
+    )
+
+
+def test_a_passed_through_column_is_mapped_off_the_source_past_a_filter() -> None:
+    """A second reader of the audio puts a split in front of it, and the
+    packet filter leaves the muxer a level below that split. The muxer opens
+    the file for the audio all the same -- the split dissolves there, so what
+    it maps is the source stream, and nothing hands it decoded samples over a
+    pipe."""
+    plan = partition(_second_reader_graph(), external=external_ids("e0", "e1"))
+    muxer = _muxer(plan)
+
+    assert "a.mp4" in muxer.graph.input_paths
+    assert [o.ref for unit in muxer.graph.sinks for o in unit.outputs] == [
+        "src:e0:v:0",
+        "src:a:a:0",
+    ]
+    assert not [
+        e
+        for e in plan.stream_edges
+        if e.target == muxer.id and isinstance(e.format, AudioFormat)
+    ]
+    # And what that map writes is the packets it read, not an encode of them.
+    argv = plan_argv(
+        plan,
+        sidecar_argv=wasm.shown_argv,
+        pipe_path=lambda edge, side: f"pipes/{edge.source}-{edge.target}-{side}",
+    )[muxer.id]
+    assert argv[argv.index("0:a:0") + 1 : argv.index("0:a:0") + 3] == ["-c:1", "copy"]
+
+
+def test_a_video_column_past_a_filter_on_another_stream_maps_the_same_way() -> None:
+    """The video mirror: what decides is the split in front of the column,
+    not which kind of stream it carries."""
+    plan = partition(_second_reader_graph("video"), external=external_ids("e0", "e1"))
+    muxer = _muxer(plan)
+
+    assert "a.mp4" in muxer.graph.input_paths
+    assert [o.ref for unit in muxer.graph.sinks for o in unit.outputs] == [
+        "src:e0:v:0",
+        "src:a:v:0",
+    ]
+
+
+def test_a_live_inputs_passed_through_column_crosses_its_pipe_as_packets() -> None:
+    """A socket opens once, so the column cannot be mapped off it twice and
+    travels a pipe after all. It still travels as the packets it was: the
+    split in front of it filters nothing, so both ends copy."""
+    g = _second_reader_graph()
+    g.input_paths = [LIVE]
+    plan = partition(
+        g,
+        external=external_ids("e0", "e1"),
+        probes={"a": _live_probe()},
+        anchors={"a": (7, 14)},
+    )
+    muxer = _muxer(plan)
+
+    assert _opens(plan, LIVE) != [muxer.id]
+    edge = next(
+        e
+        for e in plan.stream_edges
+        if e.target == muxer.id and isinstance(e.format, AudioFormat)
+    )
+    assert edge.format.codec == COPY_CODEC
+
+
+def test_a_filtered_leg_past_a_filter_still_comes_over_a_pipe() -> None:
+    """Only a column read through nothing but splits is absorbed. A leg with
+    a filter on it stays where it was: decoding it here as well as in the
+    process that already decodes it would read the input one more time."""
+    g = _second_reader_graph()
+    g.nodes["n0"] = Node(
+        id="n0", filter="volume", args={}, inputs=["sp:1"], outputs=["audio"]
+    )
+    g.sinks = [SinkUnit(outputs=[_out("e0"), _out("n0", "audio")], path="out.mp4")]
+    plan = partition(g, external=external_ids("e0", "e1"))
+    muxer = _muxer(plan)
+
+    assert "a.mp4" not in muxer.graph.input_paths
+    edge = next(
+        e
+        for e in plan.stream_edges
+        if e.target == muxer.id and isinstance(e.format, AudioFormat)
+    )
+    assert edge.format.codec == PCM_F32LE
 
 
 def _row_reading_packet_sink_graph() -> Graph:

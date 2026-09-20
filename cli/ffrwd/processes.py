@@ -1219,15 +1219,55 @@ class _Partitioner:
     def _ffmpeg_id(self) -> str:
         return f"ffmpeg{len(self.pending)}"
 
+    def _mapped_splits(self, refs: Iterable[FrameRef], depth: int) -> set[str]:
+        """Splits BELOW `depth` that `refs` reach through splits and nothing else.
+
+        A stream this process hands on untouched reaches it through no filter
+        at all -- only the `split` another consumer of the same stream put in
+        the way. Those splits are shallower than a process whose other columns
+        came through a sidecar, and leaving them out is what would put the
+        stream on a pipe: the process would read a feeder's decoded frames
+        where it could have mapped the source. So they come along, and the
+        payload dissolves them (:meth:`_shrink_splits`) back into the read
+        they were standing in front of.
+
+        The walk stops at the first node that is not a split, which is what
+        keeps a FILTERED leg where it was -- absorbing that would decode the
+        input here as well as in the feeder that already does.
+        """
+        found: set[str] = set()
+        seen: set[str] = set()
+        stack = list(refs)
+        while stack:
+            name = _ref_node(stack.pop())
+            if name is None or name not in self.g.nodes or name in seen:
+                continue
+            node = self.g.nodes[name]
+            if self.external[name] or node.filter not in SPLIT_FILTERS:
+                continue
+            seen.add(name)
+            if self.depth[name] < depth:
+                found.add(name)
+            stack.extend(node.inputs)
+        return found
+
     def _ancestors(self, refs: Iterable[FrameRef], depth: int) -> list[str]:
-        """Node ids at `depth` that `refs` need, in topological order."""
+        """Node ids at `depth` that `refs` need, in topological order.
+
+        Plus the splits standing in front of a stream `refs` map untouched,
+        wherever they sit (:meth:`_mapped_splits`).
+        """
+        refs = list(refs)
+        mapped = self._mapped_splits(refs, depth)
         keep: set[str] = set()
         stack = list(refs)
         while stack:
             name = _ref_node(stack.pop())
             if name is None or name not in self.g.nodes or name in keep:
                 continue
-            if self.external[name] or self.depth[name] != depth:
+            if self.external[name]:
+                continue
+            if self.depth[name] != depth and name not in mapped:
                 continue
             keep.add(name)
             stack.extend(self.g.nodes[name].inputs)
@@ -1521,8 +1561,27 @@ class _Partitioner:
                     )
 
     def _filters(self, process: _Pending, ref: FrameRef) -> bool:
-        """True when a node inside `process` reads `ref` rather than mapping it."""
-        return any(ref in self.g.nodes[name].inputs for name in process.nodes)
+        """True when a node inside `process` reads `ref` rather than mapping it.
+
+        A `split` is not one: it hands its input on unchanged, so what decides
+        is what reads its PADS. A pad nothing inside reads is a column mapped
+        straight to an output, and the stream is still a passthrough.
+        """
+        stack = [ref]
+        seen: set[FrameRef] = set()
+        while stack:
+            current = stack.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            for name in process.nodes:
+                node = self.g.nodes[name]
+                if current not in node.inputs:
+                    continue
+                if node.filter not in SPLIT_FILTERS:
+                    return True
+                stack.extend(f"{name}:{pad}" for pad in range(len(node.outputs)))
+        return False
 
     def _live_refusal(self, alias: str, why: str, *, hint: str) -> FfrwdError:
         """The rejection for a live input this compiler cannot wire safely."""
