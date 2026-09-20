@@ -1281,12 +1281,26 @@ _TYPE_SPECIFIERS: Mapping[StreamType, str] = {"video": "v", "audio": "a"}
 # wrong on a stream that reorders, so this is the one path for every
 # container.
 _KEYFRAMES_FILTER = "noise=drop=not(key)"
-# What puts the copy on the same clock the query's own times are on. A stream
-# that reorders frames opens with a negative dts, and the muxer's
-# `avoid_negative_ts` would then shift every timestamp -- pts included -- by
-# that lead-in. Lifting the dts instead leaves pts alone, so what a sink
-# reports is what `trim` means.
-_CLOCK_FILTER = "setts=dts=DTS-STARTDTS"
+# What puts the copy on the clock the rest of the query is on: the stream's
+# own presentation times, wherever inside its container they start.
+#
+# Two things would otherwise move them, and each loses exactly the offset that
+# a `trim` written from a reported time then lands short of. `-copyts` stops
+# ffmpeg subtracting the input's start time on the way in; `-avoid_negative_ts
+# disabled` stops the muxer shifting the stream so its first decode time is
+# zero.
+#
+# The clamp is what NUT can carry. A frame cannot hold a negative presentation
+# time, and a syncpoint before a negative decode time is written as a wrapped
+# unsigned value the sidecar's reader rejects. Both floors sit at zero, which
+# is where the container itself starts presenting anyway.
+#
+# Both halves of the clamp are spelled out: `setts` sets whichever of pts and
+# dts no expression names to its `ts` expression, which is the packet's DECODE
+# time -- naming dts alone silently overwrites pts with dts.
+_CLOCK_INPUT_FLAG = "-copyts"
+_CLOCK_MUXER_FLAGS = ("-avoid_negative_ts", "disabled")
+_CLOCK_FILTER = r"setts=pts=max(PTS\,0):dts=max(DTS\,0)"
 
 
 @dataclass(frozen=True)
@@ -1334,9 +1348,21 @@ def _bsf_chain(wants: SinkWants, attempt: int) -> str:
     filters = []
     if wants == "keyframes" and attempt < 1:
         filters.append(_KEYFRAMES_FILTER)
-    if attempt < 2:
+    if _keeps_the_clock(attempt):
         filters.append(_CLOCK_FILTER)
     return ",".join(filters)
+
+
+def _keeps_the_clock(attempt: int) -> bool:
+    """Whether this attempt asks for the input's own times.
+
+    The clamp and the two flags stand or fall together: without the clamp a
+    negative timestamp reaches the muxer, and an ffmpeg with no `setts` would
+    write one the sidecar's reader cannot read. The last attempt drops all
+    three and takes whatever clock ffmpeg writes, which is what an ffmpeg too
+    old for `setts` can give.
+    """
+    return attempt < 2
 
 
 def copy_argv(ffmpeg: str, read: PacketRead, attempt: int = 0) -> list[str]:
@@ -1347,8 +1373,16 @@ def copy_argv(ffmpeg: str, read: PacketRead, attempt: int = 0) -> list[str]:
     decoding cannot start at, and ``all`` copies the stream whole. A host may
     hand a sink more than it asked for, so every widening is legal and only
     handing over less would not be.
+
+    The timestamps are the input's own, wherever its container starts them
+    (:data:`_CLOCK_FILTER`), which is what makes a time a sink reports the
+    time a `trim` written from it means.
     """
-    argv = [ffmpeg, "-v", "error", *read.input_args, "-i", read.spec]
+    keeps_the_clock = _keeps_the_clock(attempt)
+    argv = [ffmpeg, "-v", "error"]
+    if keeps_the_clock:
+        argv.append(_CLOCK_INPUT_FLAG)
+    argv += [*read.input_args, "-i", read.spec]
     argv += ["-map", f"0:{_TYPE_SPECIFIERS[read.kind]}:{read.index}"]
     if read.wants == "first":
         argv += [f"-frames:{_OUTPUT_STREAM}", "1"]
@@ -1356,6 +1390,8 @@ def copy_argv(ffmpeg: str, read: PacketRead, attempt: int = 0) -> list[str]:
     chain = _bsf_chain(read.wants, attempt)
     if chain:
         argv += [f"-bsf:{_OUTPUT_STREAM}", chain]
+    if keeps_the_clock:
+        argv += [*_CLOCK_MUXER_FLAGS]
     return [*argv, "-f", EDGE_FORMAT, STDOUT]
 
 

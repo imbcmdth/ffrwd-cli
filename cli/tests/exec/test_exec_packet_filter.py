@@ -843,7 +843,8 @@ def test_a_compile_time_read_and_a_packet_filter_in_one_query(tmp_path: Path) ->
     plan = compiled.plan
     assert plan is not None
     # The compile-time read already happened: its rows are numbers in the
-    # graph, not a process. 3.266 is the keyframe packet_keys found past 3s.
+    # graph, not a process. The two are the keyframes packet_keys found past
+    # 3s, at the times the file itself presents them.
     starts = {
         value
         for process in plan.ffmpeg
@@ -852,7 +853,7 @@ def test_a_compile_time_read_and_a_packet_filter_in_one_query(tmp_path: Path) ->
         for name, value in node.args.items()
         if name == "start"
     }
-    assert starts == {3.266, 3.733}, starts
+    assert starts == {3.267, 3.733}, starts
     # Two stages, the rows document between them, the filter in the second.
     assert len(plan.stages) == 2
     (document,) = plan.file_edges

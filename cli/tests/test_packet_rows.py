@@ -19,6 +19,7 @@ import shutil
 import subprocess
 from dataclasses import replace
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -41,6 +42,7 @@ from ffrwd.wasm import (
     PacketRead,
     SinkWants,
     copy_argv,
+    read_packet_rows,
 )
 
 _CLI_ROOT = Path(__file__).resolve().parent.parent
@@ -701,18 +703,15 @@ def test_a_declaration_reads_back_as_a_stream_in_rows_out() -> None:
 # -- the command the read builds --------------------------------------------
 
 
+_CLAMP = r"setts=pts=max(PTS\,0):dts=max(DTS\,0)"
+
+
 @pytest.mark.parametrize(
     ("wants", "expected"),
     [
-        ("all", ["-c", "copy", "-bsf:0", "setts=dts=DTS-STARTDTS"]),
-        (
-            "keyframes",
-            ["-c", "copy", "-bsf:0", "noise=drop=not(key),setts=dts=DTS-STARTDTS"],
-        ),
-        (
-            "first",
-            ["-frames:0", "1", "-c", "copy", "-bsf:0", "setts=dts=DTS-STARTDTS"],
-        ),
+        ("all", ["-c", "copy", "-bsf:0", _CLAMP]),
+        ("keyframes", ["-c", "copy", "-bsf:0", f"noise=drop=not(key),{_CLAMP}"]),
+        ("first", ["-frames:0", "1", "-c", "copy", "-bsf:0", _CLAMP]),
     ],
 )
 def test_what_each_want_copies(wants: str, expected: list[str]) -> None:
@@ -724,10 +723,12 @@ def test_what_each_want_copies(wants: str, expected: list[str]) -> None:
         module=_MODULE, params="", wants=wants,  # type: ignore[arg-type]
     )
     argv = copy_argv("ffmpeg", read)
-    assert argv[:8] == ["ffmpeg", "-v", "error", "-r", "30", "-i", "f.mp4", "-map"]
-    assert argv[8] == "0:v:1"
-    assert argv[9:-3] == expected
-    assert argv[-3:] == ["-f", "nut", "pipe:1"]
+    assert argv[:9] == [
+        "ffmpeg", "-v", "error", "-copyts", "-r", "30", "-i", "f.mp4", "-map"
+    ]
+    assert argv[9] == "0:v:1"
+    assert argv[10:-5] == expected
+    assert argv[-5:] == ["-avoid_negative_ts", "disabled", "-f", "nut", "pipe:1"]
 
 
 def test_a_refused_copy_widens_rather_than_narrows() -> None:
@@ -743,9 +744,24 @@ def test_a_refused_copy_widens_rather_than_narrows() -> None:
         for attempt in range(3)
     ]
     assert chains == [
-        ["noise=drop=not(key),setts=dts=DTS-STARTDTS"],
-        ["setts=dts=DTS-STARTDTS"],
+        [f"noise=drop=not(key),{_CLAMP}"],
+        [_CLAMP],
         [],
+    ]
+
+
+def test_the_last_attempt_drops_the_whole_clock_arrangement() -> None:
+    """The clamp and the two flags are one thing. Keeping the flags after the
+    clamp is gone would hand the muxer a timestamp it cannot write and the
+    sidecar's reader one it cannot read, so an ffmpeg too old for `setts` gets
+    a plain copy on whatever clock ffmpeg picks."""
+    read = PacketRead(
+        spec="f.mp4", input_args=(), kind="video", index=0,
+        module=_MODULE, params="", wants="all",
+    )
+    assert copy_argv("ffmpeg", read, 2) == [
+        "ffmpeg", "-v", "error", "-i", "f.mp4", "-map", "0:v:0",
+        "-c", "copy", "-f", "nut", "pipe:1",
     ]
 
 
@@ -775,6 +791,12 @@ _EXEC_EMBED_DECLARE = (
 )
 _EXEC_PROMPT = "a cat sat on the mat"
 
+# The same encode as `keys.mp4`, with its clock moved three ways a real file's
+# is: the picture behind the sound in a file that still starts at zero, a whole
+# clock carried forward, and a copy cut that opens on a packet presented before
+# zero. See `scripts/gen_fixtures.py`.
+_OFFSET_FIXTURES = ("keys-late.mkv", "keys-offset.mp4", "keys-cut.mp4")
+
 
 @pytest.fixture
 def _require_everything() -> None:
@@ -788,9 +810,11 @@ def _require_everything() -> None:
                 f"module missing: {module} (cargo build --target wasm32-wasip2 "
                 f"--release, from {_SIDECAR_MODULES})"
             )
-    for fixture in (_FIXTURES / "keys.mp4", _FIXTURES / "keys.mkv"):
-        if not fixture.exists():
-            pytest.skip(f"fixture missing: {fixture} (run scripts/gen_fixtures.py first)")
+    for name in ("keys.mp4", "keys.mkv", *_OFFSET_FIXTURES):
+        if not (_FIXTURES / name).exists():
+            pytest.skip(
+                f"fixture missing: {_FIXTURES / name} (run scripts/gen_fixtures.py first)"
+            )
 
 
 def _table(sql: str) -> list[list[object]]:
@@ -810,6 +834,29 @@ def _keyframe_times(path: Path) -> list[float]:
     )
     assert done.returncode == 0, done.stderr
     return [float(frame["pts_time"]) for frame in json.loads(done.stdout)["frames"]]
+
+
+def _frame_times(path: Path) -> list[float]:
+    """The presentation time of every frame, in the order they are shown."""
+    done = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "frame=pts_time", "-of", "json", str(path),
+        ],
+        capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT, check=False,
+    )
+    assert done.returncode == 0, done.stderr
+    return [float(frame["pts_time"]) for frame in json.loads(done.stdout)["frames"]]
+
+
+def _frame_at(path: Path, time: float) -> int:
+    """Which frame of the file is shown at `time`, counted from its first.
+
+    Counted rather than divided by a frame rate: a file whose pictures do not
+    open at zero would otherwise be off by wherever it does open.
+    """
+    times = _frame_times(path)
+    return min(range(len(times)), key=lambda i: abs(times[i] - time))
 
 
 def _framemd5(args: list[str]) -> list[str]:
@@ -906,15 +953,20 @@ def test_a_search_over_the_vectors_a_read_returned(_require_everything: None) ->
 
 
 @pytest.mark.exec
-@pytest.mark.parametrize("container", ["mp4", "mkv"])
+@pytest.mark.parametrize("name", ["keys.mp4", "keys.mkv", "keys-late.mkv"])
 def test_a_reported_time_is_the_time_a_trim_means(
-    _require_everything: None, container: str
+    _require_everything: None, name: str
 ) -> None:
     """The clock rule. The fixture opens on a negative dts, which is what a
     plain copy's timestamps get shifted by; a trim written from a time this
-    read reported lands on THAT frame of the source, byte for byte."""
+    read reported lands on THAT frame of the source, byte for byte.
+
+    `keys-late.mkv` is the same encode with its picture behind its sound, so
+    the video does not open where the file does. A copy that re-bases on
+    either one of those lands somewhere else.
+    """
     clear_cache()
-    source = _FIXTURES / f"keys.{container}"
+    source = _FIXTURES / name
     rows = _table(
         _EXEC_DECLARE
         + "SELECT v.start_t\n"
@@ -936,7 +988,44 @@ def test_a_reported_time_is_the_time_a_trim_means(
     # it opens on is that keyframe -- not the one a shifted clock would name.
     at = min(range(len(times)), key=lambda i: abs(times[i] - start))
     assert abs(times[at] - start) < 0.002, (start, times)
-    assert trimmed[0] == whole[round(start * 15)]
+    assert trimmed[0] == whole[_frame_at(source, start)]
+
+
+@pytest.mark.exec
+@pytest.mark.parametrize("name", _OFFSET_FIXTURES)
+@pytest.mark.parametrize("wants", ["all", "keyframes", "first"])
+def test_a_read_stays_on_the_clock_its_container_starts(
+    _require_everything: None, name: str, wants: str
+) -> None:
+    """A stream that does not open at zero is read on ITS times, not on times
+    counted from its own first packet.
+
+    Every shape here is the same encode as `keys.mp4` with its clock moved,
+    and every one of them is ordinary: a picture behind its sound, a packager's
+    timestamp offset, a copy cut. What the copy hands the module has to be what
+    ffprobe reads off the file, whichever of the three `wants` shaped it -- the
+    amount of the stream a module asked for is not a clock.
+
+    A copy cut opens on a packet presented BEFORE zero, which is the one time
+    a NUT pipe cannot carry; that one packet arrives at zero instead, which is
+    where the container itself already starts presenting.
+    """
+    clear_cache()
+    source = _FIXTURES / name
+    read = read_packet_rows(
+        PacketRead(
+            spec=source.as_posix(), input_args=(), kind="video", index=0,
+            module=str(_KEYS_MODULE), params="",
+            wants=cast(SinkWants, wants),
+        )
+    )
+    seen = [float(cast(float, row["start_t"])) for row in read]
+    assert seen, (name, wants)
+    if wants == "first":
+        assert abs(seen[0] - _frame_times(source)[0]) < 0.002, (seen, name)
+        return
+    for expected in _keyframe_times(source):
+        assert any(abs(expected - time) < 0.002 for time in seen), (expected, seen)
 
 
 @pytest.mark.exec
