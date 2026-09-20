@@ -34,6 +34,7 @@ from ffrwd.registry import load_reference
 from ffrwd.split import insert_splits
 from ffrwd.vars import substitute
 from ffrwd.wasm import (
+    TIMEOUT_ENV,
     WORLDS,
     Described,
     DescribedFunction,
@@ -547,6 +548,25 @@ def test_a_second_compile_of_the_same_question_runs_nothing() -> None:
         "SELECT v.index FROM input('f.mp4') f, keys(f.video[1]) v", reads=warm
     ) == [[1], [2], [3]]
     assert len(first.reads) == 1 and warm.reads == []
+
+
+def test_a_read_that_ran_out_of_time_is_not_what_the_memo_remembers() -> None:
+    """Only an answer is remembered. A read the budget cut short is a
+    refusal, and the next compile of the same query runs it again rather than
+    handing the failure back -- which is what makes raising the budget and
+    compiling again work in a process that outlives one compile."""
+    sql = "SELECT v.index FROM input('f.mp4') f, keys(f.video[1]) v"
+    timed_out = FfrwdError(
+        ErrorCode.UNSUPPORTED_SQL,
+        "reading 'f.mp4' through 'modules/keys.wasm' did not finish within 120s",
+        hint=f"raise {TIMEOUT_ENV}",
+    )
+    with pytest.raises(FfrwdError):
+        _rows(sql, reads=_Fails(timed_out))
+
+    again = _Reads()
+    assert _rows(sql, reads=again) == [[1], [2], [3]]
+    assert len(again.reads) == 1
 
 
 # -- the position rule ------------------------------------------------------

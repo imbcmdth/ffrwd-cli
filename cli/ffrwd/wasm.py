@@ -46,6 +46,7 @@ two, it is a seam a lowering test replaces, so the unit tier spawns nothing.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import threading
 from collections.abc import Callable, Mapping, Sequence
@@ -78,11 +79,13 @@ __all__ = [
     "ANNOTATIONS_OUT",
     "AUDIO_CODEC_ENCODERS",
     "CODEC_ENCODERS",
+    "DEFAULT_TIMEOUT_SECONDS",
     "LANGUAGE_TAGS",
     "MODEL_SUFFIX",
     "PACKET_FILTER_WORLD",
     "PACKET_SOURCE_WORLD",
     "SAMPLE_FMT_CODECS",
+    "TIMEOUT_ENV",
     "WIRE_AUDIO_CODECS",
     "WIRE_PIX_FMTS",
     "WIRE_SAMPLE_FMTS",
@@ -121,6 +124,7 @@ __all__ = [
     "rows_fields",
     "shown_argv",
     "sidecar_argv",
+    "timeout_seconds",
     "wire_audio",
     "wire_pix_fmt",
     "wire_sample_fmt",
@@ -294,7 +298,45 @@ def _local_use_tag(written: str) -> bool:
 
 _DESCRIBE_FLAG = "--describe"
 _INVOKE_FLAG = "--invoke"
-_TIMEOUT_SECONDS = 20.0
+
+# How long ONE compile-time sidecar call may take: describing a module,
+# running a value function, probing a source, reading a sink's rows. It is
+# not an inference budget. A module that runs a model spends most of it
+# before the first tensor is computed -- reading a file that is hundreds of
+# megabytes, loading the ONNX Runtime, and starting the execution provider,
+# which on a GPU is tens of seconds the first time. Half a gigabyte is a real
+# model size here, and that is twenty seconds of reading on its own where the
+# volume is busy, so the default is minutes rather than the second a warm
+# call takes. `probe.RETRY_TIMEOUT_SECONDS` is 60 for a plain ffprobe of a
+# file; this covers the same read plus a model, and doubles it.
+DEFAULT_TIMEOUT_SECONDS = 120.0
+
+# Where a machine says it wants longer, or shorter.
+TIMEOUT_ENV = "FFRWD_WASM_TIMEOUT"
+
+
+def timeout_seconds() -> float:
+    """The compile-time budget: what `TIMEOUT_ENV` names, or the default.
+
+    A variable holding something that is not a positive number of seconds --
+    left empty by a shell, or filled with ``30s`` -- takes the default, the
+    way every other setting this CLI reads out of the environment does. A
+    stray variable is not a reason to refuse a compile.
+    """
+    try:
+        asked = float(os.environ.get(TIMEOUT_ENV, ""))
+    except ValueError:
+        return DEFAULT_TIMEOUT_SECONDS
+    return asked if asked > 0 else DEFAULT_TIMEOUT_SECONDS
+
+
+def _budget_hint(budget: float) -> str:
+    """Why a compile-time call ran out of time, and how to give it more."""
+    return (
+        f"one compile-time call to the sidecar is budgeted {budget:g}s, and "
+        "reading the module and loading any model it runs count against it: "
+        f"set {TIMEOUT_ENV} to a larger number of seconds"
+    )
 
 # How the sidecar is told a side carries annotations beside the frames.
 _ANNOTATIONS_FLAG = "-annotations"
@@ -705,6 +747,7 @@ def describe(path: str) -> Described:
             "function needs it to read the module",
             hint=INSTALL_HINT,
         )
+    budget = timeout_seconds()
     try:
         done = subprocess.run(
             [sidecar, _DESCRIBE_FLAG, path],
@@ -714,7 +757,7 @@ def describe(path: str) -> Described:
             # hands back None instead of text.
             encoding="utf-8",
             errors="replace",
-            timeout=_TIMEOUT_SECONDS,
+            timeout=budget,
             check=False,
         )
     except (OSError, ValueError) as err:
@@ -728,8 +771,8 @@ def describe(path: str) -> Described:
     except subprocess.TimeoutExpired as err:
         raise _reject(
             f"the ffrwd-wasm sidecar did not describe {path} within "
-            f"{_TIMEOUT_SECONDS:.0f}s",
-            hint="check the module is a wasm component and not something much larger",
+            f"{budget:g}s",
+            hint=_budget_hint(budget),
         ) from err
     if done.returncode != 0:
         raise _reject(
@@ -804,13 +847,14 @@ def invoke(
             argv += _nn_args((model_binding(described, path),), nn.spawn_args())
         argv += _grant_args(described, path)
     argv += [_INVOKE_FLAG, path, function, payload]
+    budget = timeout_seconds()
     try:
         done = subprocess.run(
             argv,
             capture_output=True,
             encoding="utf-8",  # what the sidecar writes; see describe()
             errors="replace",
-            timeout=_TIMEOUT_SECONDS,
+            timeout=budget,
             check=False,
         )
     except (OSError, ValueError) as err:
@@ -822,8 +866,8 @@ def invoke(
     except subprocess.TimeoutExpired as err:
         raise _reject(
             f"the ffrwd-wasm sidecar did not run {function}() within "
-            f"{_TIMEOUT_SECONDS:.0f}s",
-            hint="check the module is a wasm component and not something much larger",
+            f"{budget:g}s",
+            hint=_budget_hint(budget),
         ) from err
     if done.returncode != 0:
         raise _reject(
@@ -1086,13 +1130,14 @@ def probe_source(module: str, params: str, *, described: Described | None = None
     if described is not None:
         argv += _grant_args(described, module)
     argv += [_PROBE_FLAG, module, _PARAMS_FLAG, params]
+    budget = timeout_seconds()
     try:
         done = subprocess.run(
             argv,
             capture_output=True,
             encoding="utf-8",  # what the sidecar writes; see describe()
             errors="replace",
-            timeout=_TIMEOUT_SECONDS,
+            timeout=budget,
             check=False,
         )
     except (OSError, ValueError) as err:
@@ -1104,8 +1149,8 @@ def probe_source(module: str, params: str, *, described: Described | None = None
     except subprocess.TimeoutExpired as err:
         raise _reject(
             f"the ffrwd-wasm sidecar did not probe {module} within "
-            f"{_TIMEOUT_SECONDS:.0f}s",
-            hint="check the module is a wasm component and not something much larger",
+            f"{budget:g}s",
+            hint=_budget_hint(budget),
         ) from err
     if done.returncode != 0:
         raise _reject(
@@ -1409,21 +1454,29 @@ def _run_read(
     A failure the copy may be responsible for comes back as
     :class:`_CopyRefused`, which the caller retries with a wider copy; a
     module that rejected a stream it was handed whole is final.
+
+    The second ceiling is the wider of the probe's retry and the module
+    budget: a sink is a module like any other, so a machine that raised
+    `TIMEOUT_ENV` for the model one of them loads raises this too.
     """
-    for ceiling in (probe.EXTRACT_TIMEOUT_SECONDS, probe.RETRY_TIMEOUT_SECONDS):
+    ceilings = (
+        probe.EXTRACT_TIMEOUT_SECONDS,
+        max(probe.RETRY_TIMEOUT_SECONDS, timeout_seconds()),
+    )
+    for ceiling in ceilings:
         try:
             copy, copy_error, rows_text, rows_error, code = _spawn_read(
                 command, sidecar_command, ceiling
             )
             break
         except subprocess.TimeoutExpired:
-            if ceiling is probe.RETRY_TIMEOUT_SECONDS:
+            if ceiling == ceilings[-1]:
                 raise _reject(
                     f"reading '{read.spec}' through '{read.module}' did not "
-                    f"finish within {ceiling:.0f}s",
-                    hint="a compile-time read copies one stream of the file; "
-                    "check the input is reachable and not far slower to read "
-                    "than it is to probe",
+                    f"finish within {ceiling:g}s",
+                    hint="a compile-time read copies one stream of the file "
+                    "into the module: check the input is reachable and not far "
+                    f"slower to read than it is to probe, or raise {TIMEOUT_ENV}",
                 ) from None
         except OSError as err:
             raise _reject(

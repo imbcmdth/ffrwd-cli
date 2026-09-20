@@ -724,6 +724,69 @@ def test_a_missing_sidecar_refuses_the_describe(monkeypatch: pytest.MonkeyPatch)
     assert caught.value.hint is not None and "reinstall ffrwd" in caught.value.hint
 
 
+def test_the_compile_time_budget_is_the_default_unless_the_environment_says(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A number of seconds is taken; anything else -- a variable a shell left
+    empty, one filled with a duration rather than a count, one asking for
+    nothing at all -- is the default, the way every setting this CLI reads out
+    of the environment falls back."""
+    monkeypatch.delenv(wasm.TIMEOUT_ENV, raising=False)
+    assert wasm.timeout_seconds() == wasm.DEFAULT_TIMEOUT_SECONDS
+    monkeypatch.setenv(wasm.TIMEOUT_ENV, "600")
+    assert wasm.timeout_seconds() == 600.0
+    for written in ("", "  ", "30s", "-1", "0"):
+        monkeypatch.setenv(wasm.TIMEOUT_ENV, written)
+        assert wasm.timeout_seconds() == wasm.DEFAULT_TIMEOUT_SECONDS, written
+
+
+def test_every_compile_time_call_is_spawned_with_that_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Describing a module, running a value function and probing a source are
+    one budget: the environment raises all three together."""
+    asked: list[object] = []
+
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        asked.append(kwargs["timeout"])
+        return subprocess.CompletedProcess(argv, 0, stdout="{}", stderr="")
+
+    monkeypatch.setattr(wasm.subprocess, "run", fake_run)
+    monkeypatch.setattr(wasm.binaries, "ffrwd_wasm_path", lambda: "ffrwd-wasm")
+    monkeypatch.setenv(wasm.TIMEOUT_ENV, "300")
+
+    wasm.invoke(MODULE, "fn", {})
+    with pytest.raises(FfrwdError):
+        wasm.describe(MODULE)  # "{}" is not a description
+    with pytest.raises(FfrwdError):
+        wasm.probe_source(MODULE, "{}")  # nor a catalog
+    assert asked == [300.0, 300.0, 300.0]
+
+
+def test_a_call_that_runs_out_of_time_says_what_the_budget_was(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The refusal names the budget in the seconds it actually was, says that
+    loading a model counts against it, and names the variable that raises
+    it."""
+
+    def slow_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        raise subprocess.TimeoutExpired(argv, 45.0)
+
+    monkeypatch.setattr(wasm.subprocess, "run", slow_run)
+    monkeypatch.setattr(wasm.binaries, "ffrwd_wasm_path", lambda: "ffrwd-wasm")
+    monkeypatch.setenv(wasm.TIMEOUT_ENV, "45")
+
+    with pytest.raises(FfrwdError) as caught:
+        wasm.invoke(MODULE, "embed_text", {})
+    error = caught.value
+    assert error.message == "the ffrwd-wasm sidecar did not run embed_text() within 45s"
+    assert error.hint is not None
+    assert "45s" in error.hint
+    assert "loading any model" in error.hint
+    assert wasm.TIMEOUT_ENV in error.hint
+
+
 def test_invoke_grants_http_ahead_of_the_flag_only_when_described_asks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

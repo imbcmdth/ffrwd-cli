@@ -224,6 +224,14 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   the frames a producer reads them off, and there are none here, so a
   gather over the result is refused saying so. Recipe
   [113](examples.md#113-translate-captions-as-they-are-produced).
+- **The compile-time budget.** Every call the compiler makes into the
+  sidecar while it compiles - reading a module's declaration, running a
+  value function, probing a source, reading a packet sink's rows - is
+  given 120 seconds. Loading the model a module runs counts against it,
+  and a model is often hundreds of megabytes. `FFRWD_WASM_TIMEOUT` is
+  that number of seconds; anything that is not a positive number takes
+  the default. A call that runs out of time is a refusal and nothing is
+  remembered, so raising the variable and compiling again re-runs it.
 - **`cue[]`** is shorthand for the cue record's own shape,
   `STRUCT(text text, start_t number, end_t number)[]`, wherever an
   annotation column is declared - a `RETURNS STRUCT`'s second field, or
