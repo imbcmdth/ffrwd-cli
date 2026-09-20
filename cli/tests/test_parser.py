@@ -2405,10 +2405,49 @@ def test_row_predicates_are_admitted() -> None:
         "t.channels IN (2, 6)",
         "t.disposition.forced IN (true, false)",
         "t.tags.language IN ('eng') AND t.channels = 2",
+        # Two columns of ONE row is a filter over that row, not a match
+        # between two relations.
+        "t.channels = t.sample_rate",
+        "t.sample_rate > t.channels",
+        "t.bitrate BETWEEN t.channels AND t.sample_rate",
     ):
         _resolve(
             f"SELECT t FROM input('f.mkv') f, unnest(f.audio) t WHERE {predicate}"
         )
+
+
+def test_a_row_predicate_may_compare_two_columns_of_one_row() -> None:
+    """A span checked against itself is a filter, and every row relation
+    reads it through the one evaluator."""
+    for source, predicate in (
+        ("unnest(f.cues) c", "c.end_t > c.start_t"),
+        ("unnest(f.chapters) c", "c.end_t > c.start_t"),
+        ("unnest(f.video) c", "c.width > c.height"),
+    ):
+        _resolve(f"SELECT f.video FROM input('f.mkv') f, {source} WHERE {predicate}")
+
+
+def test_a_row_predicate_comparing_two_aliases_is_still_a_join() -> None:
+    """A WHERE conjunct is already cut to one alias before the grammar runs,
+    so the two-alias case reaches it through a CASE condition, which is
+    checked by the same grammar over the whole scope."""
+    err = _reject(
+        "SELECT t, STRUCT(CASE WHEN t.duration = f.duration THEN 'same' "
+        "ELSE 'other' END AS title) AS tags "
+        "FROM input('f.mkv') f, unnest(f.audio) t"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert err.message.endswith("a track-row comparison compares columns of ONE row")
+    assert err.hint is not None and "is a JOIN" in err.hint
+
+
+def test_two_columns_of_one_row_still_have_to_be_the_same_type() -> None:
+    err = _reject(
+        "SELECT t FROM input('f.mkv') f, unnest(f.audio) t "
+        "WHERE t.channels = t.tags.language"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'t.channels' is number and 't.tags.language' is text" in err.message
 
 
 @pytest.mark.parametrize(
@@ -2416,7 +2455,6 @@ def test_row_predicates_are_admitted() -> None:
     [
         "t.tags.language LIKE 'e%'",
         "t.channels BETWEEN SYMMETRIC 2 AND 6",
-        "t.channels = t.sample_rate",
         "t.tags.language IS TRUE",
     ],
 )

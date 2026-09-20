@@ -470,8 +470,10 @@ _FROM_ITEM_MESSAGE = (
     "generate_series(...), and CTE or view names are allowed in FROM"
 )
 _ROW_WHERE_HINT = (
-    "a track-row predicate compares one row column against a literal: "
-    "=, !=, <, <=, >, >=, BETWEEN, IS [NOT] NULL, joined with AND/OR/NOT"
+    "a track-row predicate compares values of ONE row -- its own columns, "
+    "literals, and expressions over either (arithmetic, CASE, ||, a "
+    "function call) -- with =, !=, <, <=, >, >=, BETWEEN, IS [NOT] NULL, "
+    "a bare boolean column, joined with AND/OR/NOT"
 )
 _JOIN_HINT = (
     "JOIN matches the ROWS of two row tables (unnest, a CTE, a struct row "
@@ -7779,6 +7781,9 @@ class _Resolver:
                 if self._is_row_predicate_value(unwrapped):
                     self._check_value_pair(column, bound, scope, where, _ROW_WHERE_HINT)
                     continue
+                if isinstance(unwrapped, exp.Column):
+                    self._check_same_row_pair(column, unwrapped, node, scope, where)
+                    continue
                 self._check_row_literal(bound, column, column_type, where)
             return
         if isinstance(node, exp.EQ | exp.NEQ | exp.GT | exp.GTE | exp.LT | exp.LTE):
@@ -7798,13 +7803,8 @@ class _Resolver:
                     hint=_ROW_WHERE_HINT,
                 )
             if isinstance(literal, exp.Column):
-                raise _error(
-                    ErrorCode.UNSUPPORTED_SQL,
-                    "a track-row comparison compares one column against a literal",
-                    node,
-                    fallback=where,
-                    hint="matching two columns against each other is a JOIN",
-                )
+                self._check_same_row_pair(column, literal, node, scope, where)
+                return
             column_type = self._row_predicate_operand(column, scope, where)
             self._check_row_literal(literal, column, column_type, where)
             return
@@ -7831,6 +7831,50 @@ class _Resolver:
             node,
             fallback=where,
             hint=_ROW_WHERE_HINT,
+        )
+
+    def _check_same_row_pair(
+        self,
+        left: exp.Column,
+        right: exp.Column,
+        node: exp.Expr,
+        scope: dict[str, str],
+        where: exp.Expr,
+    ) -> None:
+        """Two columns compared: one row's own two fields, or two relations.
+
+        Two columns of ONE alias are a predicate OVER that row -- a span
+        checked against itself, a width against a height -- and the evaluator
+        reads both sides off the same tuple, so nothing about it is a match
+        between relations. Two aliases are: that is what JOIN is for, and it
+        stays refused here. Same-alias columns still have to be the same type,
+        the way an ON predicate's two do.
+        """
+        left_alias = _ident_name(left.args.get("table"))
+        right_alias = _ident_name(right.args.get("table"))
+        if left_alias != right_alias:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "a track-row comparison compares columns of ONE row",
+                node,
+                fallback=where,
+                hint="matching the rows of two tables against each other is a "
+                "JOIN",
+            )
+        left_type = self._row_predicate_operand(left, scope, where)
+        right_type = self._row_predicate_operand(right, scope, where)
+        if left_type is None or right_type is None or left_type == right_type:
+            return
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"'{left_alias}.{column_label(_ident_name(left.this))}' is "
+            f"{left_type} and "
+            f"'{right_alias}.{column_label(_ident_name(right.this))}' is "
+            f"{right_type}, so they can never match",
+            node,
+            fallback=where,
+            hint="compare columns of the same kind, e.g. "
+            "WHERE v.end_t > v.start_t",
         )
 
     def _row_predicate_operand(

@@ -1130,8 +1130,13 @@ second supported spelling.
 
 Predicates: `= != < <= > >= BETWEEN IS [NOT] NULL [NOT] IN (literals)`,
 combined with `AND OR NOT`. A boolean value is a predicate on its own
-(`WHERE t.disposition.default`). All decided at compile time against probed
-metadata - never a runtime ffmpeg predicate. NULL follows SQL:
+(`WHERE t.disposition.default`). Either side may be a literal, a column of
+the row, or a value computed over one (arithmetic, `CASE`, `||`, a cast, a
+built-in or a wasm value function), and two columns of the SAME row compare
+against each other - `WHERE v.end_t > v.start_t` is a filter over one row,
+and they still have to be the same type. Matching the rows of two relations
+against each other is a JOIN, and stays refused. All decided at compile time
+against probed metadata - never a runtime ffmpeg predicate. NULL follows SQL:
 `=`/`!=` both fail against it.
 
 `WHERE alias.t BETWEEN a AND b` (either bound alone also works) is the
