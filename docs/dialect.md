@@ -107,9 +107,11 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   which is how a filter reading several tells them apart; a producer row
   already carrying that field is refused. An argument written `NULL`, or
   left off the end, hands the filter no rows for it at all: each rows
-  column carries `DEFAULT NULL`, and such a column starts no run of
-  defaults, so the values that configure the filter may follow it and
-  still be required.
+  column carries `DEFAULT NULL`, written or not, and such a column starts
+  no run of defaults, so the values that configure the filter may follow
+  it and still be required. Writing the `DEFAULT NULL` out is allowed
+  here and refused on a frame filter's column, which is read on every
+  frame and so always needs a producer under it.
   An argument is the rows a module WRITES while the run goes on, in either
   of the two spellings a rows function reads: the annotation column a stream
   module produces, gathered or not, or a rows function's own result over one

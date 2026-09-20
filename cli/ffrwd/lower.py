@@ -12557,11 +12557,15 @@ class _Lowerer:
                 "consume them",
             )
         # Only a windowed module can be handed no rows: a per-frame consumer
-        # reads them on every frame, so its column cannot be optional.
+        # reads them on every frame, so its column cannot be optional. A
+        # packet filter's rows are not per-frame at all -- they are inputs
+        # delivered before packet one, and a filter given none for a column
+        # simply has none, which is what the NULL spelling already means.
         if (
             declared.reads is not None
             and declared.reads_optional
             and not described.windowed
+            and not declared.is_packets
         ):
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,

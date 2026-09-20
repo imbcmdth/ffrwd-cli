@@ -14422,6 +14422,28 @@ def test_a_rows_argument_written_null_hands_the_filter_none() -> None:
     assert g.packet_filter_rows[node] == [{"arg": "faces", "path": "ffrwd:rows:0"}]
 
 
+WEAVE_DEFAULTED = (
+    "CREATE FUNCTION weave(v video_stream,\n"
+    "                      faces STRUCT(pts number, note text)[] DEFAULT NULL,\n"
+    "                      words STRUCT(pts number, note text)[] DEFAULT NULL)\n"
+    "  RETURNS packets\n"
+    f"  AS '{PACKETS_MODULE}', 'weave' LANGUAGE wasm;\n"
+)
+
+
+def test_a_packet_filters_rows_columns_may_carry_a_default() -> None:
+    """A packet filter's rows are inputs delivered before packet one, not
+    something read off every frame, so a column may be left off the call --
+    the rule that refuses a per-frame consumer's DEFAULT is not this one's."""
+    g = _weaving_graph(
+        WEAVE_DEFAULTED,
+        "COPY (SELECT weave(f.video[1], shots(f.video[1]).notes) "
+        "FROM input('f.mp4') f) TO 'out.mp4'",
+    )
+    (node,) = g.packet_filter_rows
+    assert g.packet_filter_rows[node] == [{"arg": "faces", "path": "ffrwd:rows:0"}]
+
+
 def test_a_rows_argument_that_produces_no_column_is_refused() -> None:
     with pytest.raises(FfrwdError) as caught:
         lower(
