@@ -4503,11 +4503,38 @@ def test_a_module_needing_no_effect_is_granted_none() -> None:
 
 
 def test_the_effect_flags_are_read_off_the_describe_payload() -> None:
-    payload = {"world": "ffrwd:av@0.9.0", "name": "p", "http": True, "udp": True}
+    payload = {
+        "world": "ffrwd:av@0.9.0",
+        "name": "p",
+        "http": True,
+        "udp": True,
+        "tcp": True,
+    }
     described = wasm._described(SINK_MODULE, payload)
-    assert described.http is True and described.udp is True
+    assert described.http is True and described.udp is True and described.tcp is True
     bare = wasm._described(SINK_MODULE, {"world": "ffrwd:av@0.9.0", "name": "p"})
-    assert not bare.http and not bare.udp
+    assert not bare.http and not bare.udp and not bare.tcp
+
+
+def test_the_two_socket_protocols_are_read_apart() -> None:
+    """A module that imports one protocol is granted that one alone: the
+    sidecar reads `wasi:sockets/udp` and `wasi:sockets/tcp` separately, and
+    a package that opens a connection is not thereby allowed to send a
+    datagram."""
+    udp_only = wasm._described(
+        SINK_MODULE, {"world": "ffrwd:av@0.15.0", "name": "p", "udp": True}
+    )
+    assert udp_only.udp and not udp_only.tcp
+    tcp_only = wasm._described(
+        SINK_MODULE, {"world": "ffrwd:av@0.15.0", "name": "p", "tcp": True}
+    )
+    assert tcp_only.tcp and not tcp_only.udp
+
+
+def test_each_effect_puts_its_own_flag_on_the_argv() -> None:
+    for effect, flag in (("http", "-http"), ("udp", "-net"), ("tcp", "-tcp")):
+        described = Described(world="ffrwd:av@0.15.0", name="p", **{effect: True})
+        assert wasm._grant_args(described, SINK_MODULE) == [flag, SINK_MODULE]
 
 
 # the namespaced spelling
@@ -4630,6 +4657,14 @@ def test_a_sources_own_import_is_granted_through_effect_grants() -> None:
     described = Described(world="ffrwd:av@0.15.0", name="subscribe", udp=True)
     grants = _effect_grants(_source_wasm(res), {declared.module: described})
     assert grants == {SOURCE_MODULE: ("udp",)}
+
+
+def test_a_sources_tcp_import_is_granted_as_tcp() -> None:
+    res = _resolved(SOURCE_QUERY)
+    declared = next(iter(res.wasm.values()))
+    described = Described(world="ffrwd:av@0.15.0", name="subscribe", tcp=True)
+    grants = _effect_grants(_source_wasm(res), {declared.module: described})
+    assert grants == {SOURCE_MODULE: ("tcp",)}
 
 
 def test_a_source_needing_no_effect_is_granted_none() -> None:

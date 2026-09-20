@@ -345,15 +345,24 @@ trimmed - empty after trimming is the same as omitting the key.
 
 `capabilities` is what the host must grant this package's modules:
 `nn` to run a model, `http` to make HTTP requests, `udp` to open UDP
-sockets. Anything else is refused, naming the list. These are grants, not wasi imports - clocks
+sockets, `tcp` to open TCP ones. Anything else is refused, naming the
+list. These are grants, not wasi imports - clocks
 and random are ambient, and a module having them declares nothing.
 Absent means the same as empty. `publish` derives the set from what
 each module says it does and refuses any disagreement in either
 direction: a module needing a capability the manifest omits, and a
 capability the manifest declares that no module needs.
 
-`FFRWD_NET_POLICY=public` in the environment restricts both network
-grants to public destinations: connects and sends to private
+The two socket capabilities are two, not one. `wasi:sockets` splits its
+protocols into interfaces of their own, so what a module imports says
+which it reached for: a module importing `wasi:sockets/udp` needs `udp`,
+one importing `wasi:sockets/tcp` needs `tcp`, and neither is granted to
+a module that did not ask for it. A module that opens both declares
+both. The interfaces both protocols share - `instance-network`,
+`network` - name neither on their own.
+
+`FFRWD_NET_POLICY=public` in the environment restricts every network
+grant to public destinations: connects and sends to private
 (RFC 1918), loopback, link-local, carrier-NAT, multicast and broadcast
 addresses are refused, and an HTTP request's hostname is judged by the
 addresses it resolves to, not by its spelling. Local binds are

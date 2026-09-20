@@ -622,7 +622,8 @@ fn take_nn_args(argv: Vec<String>) -> Result<(nn::Config, Vec<String>)> {
 /// Takes the effect grants out of the argv and leaves the rest.
 ///
 /// `-http <module>` lets the module at that path make outbound HTTP
-/// requests; `-net <module>` lets it open UDP sockets. Each is per module
+/// requests; `-net <module>` lets it open UDP sockets and `-tcp <module>`
+/// TCP ones, one protocol each. Each is per module
 /// and repeatable; a module the argv never names gets neither. Read before
 /// the argv is dispatched, the way the inference options are.
 fn take_grant_args(argv: Vec<String>) -> Result<Vec<String>> {
@@ -635,6 +636,7 @@ fn take_grant_args(argv: Vec<String>) -> Result<Vec<String>> {
         match arg.as_str() {
             "-http" => ffrwd_wasm_runtime::runtime::grant_http(&next("-http")?)?,
             "-net" => ffrwd_wasm_runtime::runtime::grant_net(&next("-net")?)?,
+            "-tcp" => ffrwd_wasm_runtime::runtime::grant_tcp(&next("-tcp")?)?,
             _ => rest.push(arg),
         }
     }
@@ -3191,9 +3193,15 @@ struct Description {
     /// Whether the component imports `wasi:http`, and so needs an `-http`
     /// grant to run at all. Read off its imports. Always present.
     http: bool,
-    /// Whether the component imports `wasi:sockets`, and so needs a `-net`
-    /// grant to reach the network. Read off its imports. Always present.
+    /// Whether the component imports `wasi:sockets/udp`, and so needs a
+    /// `-net` grant to send a datagram. Read off its imports. Always
+    /// present.
     udp: bool,
+    /// Whether the component imports `wasi:sockets/tcp`, and so needs a
+    /// `-tcp` grant to connect or listen. Read off its imports the same way,
+    /// and separately: the two protocols are two interfaces and two grants.
+    /// Always present.
+    tcp: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     functions: Vec<FunctionDescription>,
     /// The older spelling of `reads_rows`, present only when it is true.
@@ -3347,7 +3355,9 @@ fn describe_module(module_path: &str) -> Result<String> {
             .with_context(|| format!("describing {module_path}"))?,
         http: ffrwd_wasm_runtime::runtime::imports_wasi_http(module_path)
             .with_context(|| format!("describing {module_path}"))?,
-        udp: ffrwd_wasm_runtime::runtime::imports_wasi_sockets(module_path)
+        udp: ffrwd_wasm_runtime::runtime::imports_wasi_udp(module_path)
+            .with_context(|| format!("describing {module_path}"))?,
+        tcp: ffrwd_wasm_runtime::runtime::imports_wasi_tcp(module_path)
             .with_context(|| format!("describing {module_path}"))?,
         functions: Vec::new(),
         meta: false,
@@ -4465,10 +4475,17 @@ mod grant_args_tests {
     }
 
     /// `-net` is taken out the same way, for the udp grant's symmetry with
-    /// the http one.
+    /// the http one, and `-tcp` beside it for the same reason.
     #[test]
     fn a_net_grant_is_taken_out_the_same_way() {
         let argv = strings(&["-net", "module.wasm", "--invoke", "module.wasm", "fn", "{}"]);
+        let rest = take_grant_args(argv).expect("parses");
+        assert_eq!(rest, strings(&["--invoke", "module.wasm", "fn", "{}"]));
+    }
+
+    #[test]
+    fn a_tcp_grant_is_taken_out_the_same_way() {
+        let argv = strings(&["-tcp", "module.wasm", "--invoke", "module.wasm", "fn", "{}"]);
         let rest = take_grant_args(argv).expect("parses");
         assert_eq!(rest, strings(&["--invoke", "module.wasm", "fn", "{}"]));
     }

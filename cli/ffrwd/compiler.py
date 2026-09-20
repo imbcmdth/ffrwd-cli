@@ -359,8 +359,11 @@ def _effect_grants(
     """What each module needs granted, keyed by module path.
 
     Read off the describe: a module importing wasi:http needs ``http``, one
-    importing wasi:sockets needs ``udp``. The sidecar denies both without
-    the matching argv, which is what these become.
+    importing ``wasi:sockets/udp`` needs ``udp`` and one importing
+    ``wasi:sockets/tcp`` needs ``tcp``. The two protocols are two interfaces
+    and two grants, so a module gets the one it reached for and not the
+    other. The sidecar denies every one of them without the matching argv,
+    which is what these become.
     """
     found: dict[str, tuple[str, ...]] = {}
     for declared in declared_stream.values():
@@ -368,9 +371,7 @@ def _effect_grants(
         if described is None or declared.module in found:
             continue
         effects = tuple(
-            effect
-            for effect, needed in (("http", described.http), ("udp", described.udp))
-            if needed
+            effect for effect in wasm.EFFECTS if getattr(described, effect)
         )
         if effects:
             found[declared.module] = effects

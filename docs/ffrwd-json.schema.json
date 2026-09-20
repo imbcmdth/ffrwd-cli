@@ -75,7 +75,7 @@
     "capabilities": {
       "type": "array",
       "description": "What the host must grant this package's modules. Declared here and derived at publish from what each module says it does; a disagreement in either direction is a refusal.",
-      "items": { "enum": ["http", "nn", "udp"] }
+      "items": { "enum": ["http", "nn", "tcp", "udp"] }
     },
     "ffrwd": {
       "type": "string",

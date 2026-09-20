@@ -1527,6 +1527,7 @@ def module_capabilities(package: Package) -> dict[str, tuple[str, ...]]:
             for name, needed in (
                 ("http", described.http),
                 ("nn", described.nn),
+                ("tcp", described.tcp),
                 ("udp", described.udp),
             )
             if needed

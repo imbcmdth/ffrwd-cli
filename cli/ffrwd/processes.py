@@ -609,8 +609,9 @@ class EffectGrant:
     """One ``-http <path>`` or ``-net <path>``: an effect one module is allowed.
 
     `effect` is the capability name -- ``http`` for outbound HTTP requests,
-    ``udp`` for UDP sockets -- and `module` the path of the module granted
-    it. The sidecar denies both by default; the argv is the grant.
+    ``udp`` for UDP sockets, ``tcp`` for TCP ones -- and `module` the path of
+    the module granted it. The sidecar denies every one by default; the argv
+    is the grant.
     """
 
     effect: str
@@ -3016,7 +3017,8 @@ def partition(
     runs none is absent and binds nothing.
 
     `effects` is keyed the same way and is what each module needs granted --
-    ``http``, ``udp`` -- which the sidecar denies without the matching argv.
+    ``http``, ``udp``, ``tcp`` -- which the sidecar denies without the
+    matching argv.
     A module needing neither is absent and is granted nothing.
 
     `anchors` is where each input ALIAS was written, ``(line, col)``, and is

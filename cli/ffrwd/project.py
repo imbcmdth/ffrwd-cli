@@ -209,8 +209,11 @@ _KNOWN = frozenset(
 # What a package may declare it needs the host to grant. Not a list of wasi
 # imports: clocks, random and the rest are ambient, and a module having them
 # says nothing. "http" is outbound HTTP requests, "nn" is model inference,
-# "udp" is UDP sockets.
-CAPABILITIES = ("http", "nn", "udp")
+# "udp" is UDP sockets and "tcp" is TCP ones: two grants rather than one,
+# because a module that sends datagrams and a module that listens for a
+# connection are asking for different things, and a consumer allows one
+# without allowing the other.
+CAPABILITIES = ("http", "nn", "tcp", "udp")
 
 # A keyword is a short label the registry indexes. Both bounds keep a document
 # out of the place a list of labels belongs.

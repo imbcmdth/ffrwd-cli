@@ -1535,9 +1535,13 @@ fn imports_nn(component: &Component) -> bool {
     imports_interface(component, nn::IMPORT_PREFIX)
 }
 
-/// The import prefixes the two granted effects answer to.
+/// The import prefixes the granted effects answer to. Sockets are two
+/// grants, not one: `wasi:sockets` splits its protocols into interfaces of
+/// their own, so what a module imports says which protocol it reaches for.
+/// `instance-network` and `network` are shared by both and name neither.
 const HTTP_IMPORT_PREFIX: &str = "wasi:http/";
-const SOCKETS_IMPORT_PREFIX: &str = "wasi:sockets/";
+const UDP_IMPORT_PREFIX: &str = "wasi:sockets/udp";
+const TCP_IMPORT_PREFIX: &str = "wasi:sockets/tcp";
 
 /// Whether the component imports any interface under `prefix`. Read off the
 /// component type, so nothing is instantiated to find out.
@@ -1549,11 +1553,20 @@ fn imports_interface(component: &Component, prefix: &str) -> bool {
 }
 
 /// The effects the argv granted one module. Deny by default: a module the
-/// argv never named gets neither.
+/// argv never named gets none of them.
 #[derive(Clone, Copy, Default)]
 struct Grants {
     http: bool,
-    net: bool,
+    udp: bool,
+    tcp: bool,
+}
+
+impl Grants {
+    /// Whether this module may open a socket of any protocol, which is what
+    /// decides whether the network is reachable at all.
+    fn sockets(self) -> bool {
+        self.udp || self.tcp
+    }
 }
 
 /// Granted effects per module, keyed by canonical path.
@@ -1587,19 +1600,34 @@ pub fn grant_net(path: &str) -> Result<()> {
     let mut table = grant_table()
         .lock()
         .map_err(|_| anyhow!("grant table poisoned"))?;
-    table.entry(canonical(path)).or_default().net = true;
+    table.entry(canonical(path)).or_default().udp = true;
+    Ok(())
+}
+
+/// Records one `-tcp <module>`: the module at `path` may open TCP sockets.
+/// It is its own grant, not part of the UDP one: a module that listens on
+/// a socket and one that sends datagrams are asking for different things,
+/// and a consumer allows one without allowing the other.
+pub fn grant_tcp(path: &str) -> Result<()> {
+    let mut table = grant_table()
+        .lock()
+        .map_err(|_| anyhow!("grant table poisoned"))?;
+    table.entry(canonical(path)).or_default().tcp = true;
     Ok(())
 }
 
 /// The store's WASI context: no preopens, no env, no args; stderr passes
 /// through. The network is reachable only for a module granted `-net`, and
-/// UDP only: inherit_network opens only the address check, and each protocol
-/// stays refused until allowed. Under the public policy the address check
-/// refuses non-public destinations; binds stay open.
+/// One protocol per grant: inherit_network opens only the address check,
+/// and each protocol stays refused until it is allowed by name, so a module
+/// granted `-net` cannot open a TCP socket and one granted `-tcp` cannot
+/// send a datagram. Name resolution is allowed by neither. Under the public
+/// policy the address check refuses non-public destinations; binds, listens
+/// and accepts stay open, since only where traffic goes is policed.
 fn wasi_ctx(effects: Grants, policy: NetPolicy) -> WasiCtx {
     let mut builder = WasiCtx::builder();
     builder.inherit_stderr();
-    if effects.net {
+    if effects.sockets() {
         match policy {
             NetPolicy::Unrestricted => {
                 builder.inherit_network();
@@ -1610,7 +1638,8 @@ fn wasi_ctx(effects: Grants, policy: NetPolicy) -> WasiCtx {
                 });
             }
         }
-        builder.allow_udp(true);
+        builder.allow_udp(effects.udp);
+        builder.allow_tcp(effects.tcp);
     }
     builder.build()
 }
@@ -1630,9 +1659,9 @@ enum Purpose {
 ///
 /// A run is where the grants are enforced: a module importing `wasi:http`
 /// without its `-http` is refused here, before instantiation, and one
-/// importing `wasi:sockets` without its `-net` is refused by the store's
-/// WASI context at socket creation. A describe touches no effect and is
-/// linked regardless.
+/// importing a `wasi:sockets` protocol without that protocol's grant is
+/// refused by the store's WASI context at socket creation. A describe
+/// touches no effect and is linked regardless.
 fn link(
     component: &Component,
     module_path: &str,
@@ -1843,11 +1872,19 @@ pub fn imports_wasi_http(module_path: &str) -> Result<bool> {
     Ok(imports_interface(&component, HTTP_IMPORT_PREFIX))
 }
 
-/// Whether the component at `module_path` asks the host for sockets, and so
-/// needs a `-net` grant to reach the network. Read off its imports.
-pub fn imports_wasi_sockets(module_path: &str) -> Result<bool> {
+/// Whether the component at `module_path` asks the host for UDP, and so
+/// needs a `-net` grant to send a datagram. Read off its imports.
+pub fn imports_wasi_udp(module_path: &str) -> Result<bool> {
     let component = compile(module_path)?;
-    Ok(imports_interface(&component, SOCKETS_IMPORT_PREFIX))
+    Ok(imports_interface(&component, UDP_IMPORT_PREFIX))
+}
+
+/// Whether the component at `module_path` asks the host for TCP, and so
+/// needs a `-tcp` grant to open a connection or listen for one. Read off
+/// its imports.
+pub fn imports_wasi_tcp(module_path: &str) -> Result<bool> {
+    let component = compile(module_path)?;
+    Ok(imports_interface(&component, TCP_IMPORT_PREFIX))
 }
 
 /// The component's exported interface names, for messages naming what a
@@ -5672,6 +5709,93 @@ mod tests {
         assert!(
             (base.seconds(25) - 1.0).abs() < 1e-12,
             "25 ticks of 1/25 is one second"
+        );
+    }
+}
+
+// What each grant opens, read off the context rather than off a guest: the
+// host side of `create-tcp-socket` and `create-udp-socket` is what a module
+// reaches through the linker, and calling it here needs no component and no
+// artifact to have been built.
+#[cfg(test)]
+mod socket_grant_test {
+    use super::*;
+    use wasmtime_wasi::p2::bindings::sockets::network::IpAddressFamily;
+    use wasmtime_wasi::p2::bindings::sockets::tcp_create_socket::Host as TcpCreateSocket;
+    use wasmtime_wasi::p2::bindings::sync::sockets::udp_create_socket::Host as UdpCreateSocket;
+    use wasmtime_wasi::sockets::WasiSocketsView;
+
+    fn opened(grants: Grants, policy: NetPolicy) -> Host {
+        Host {
+            wasi: wasi_ctx(grants, policy),
+            table: ResourceTable::new(),
+            nn: nn::empty_ctx(),
+            http: WasiHttpCtx::new(),
+            hooks: egress::Hooks::new(policy),
+        }
+    }
+
+    /// Whether a context built from these grants opens each protocol.
+    fn opens(grants: Grants, policy: NetPolicy) -> (bool, bool) {
+        let mut host = opened(grants, policy);
+        let mut view = host.sockets();
+        let udp = UdpCreateSocket::create_udp_socket(&mut view, IpAddressFamily::Ipv4).is_ok();
+        let tcp = TcpCreateSocket::create_tcp_socket(&mut view, IpAddressFamily::Ipv4).is_ok();
+        (udp, tcp)
+    }
+
+    fn grants(udp: bool, tcp: bool) -> Grants {
+        Grants {
+            http: false,
+            udp,
+            tcp,
+        }
+    }
+
+    #[test]
+    fn each_grant_opens_its_own_protocol_and_not_the_other() {
+        for policy in [NetPolicy::Unrestricted, NetPolicy::Public] {
+            assert_eq!(
+                opens(grants(false, false), policy),
+                (false, false),
+                "a module the argv never named opened a socket under {policy:?}"
+            );
+            assert_eq!(
+                opens(grants(true, false), policy),
+                (true, false),
+                "the udp grant should open UDP and only UDP under {policy:?}"
+            );
+            assert_eq!(
+                opens(grants(false, true), policy),
+                (false, true),
+                "the tcp grant should open TCP and only TCP under {policy:?}"
+            );
+            assert_eq!(
+                opens(grants(true, true), policy),
+                (true, true),
+                "both grants together should open both under {policy:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_grant_is_per_module_and_per_protocol() {
+        let path = "some/module/for/the/grant/table.wasm";
+        assert!(!granted(path).expect("read the table").sockets());
+        grant_net(path).expect("record the udp grant");
+        let after = granted(path).expect("read the table");
+        assert!(
+            after.udp && !after.tcp,
+            "one grant should not imply the other"
+        );
+        grant_tcp(path).expect("record the tcp grant");
+        let both = granted(path).expect("read the table");
+        assert!(both.udp && both.tcp);
+        assert!(
+            !granted("some/other/module.wasm")
+                .expect("read the table")
+                .sockets(),
+            "a grant is per module"
         );
     }
 }

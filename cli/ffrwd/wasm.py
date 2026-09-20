@@ -325,8 +325,15 @@ _NN_EXCLUDE_FLAG = "-nn-exclude"
 # The sidecar's worker-thread cap. Unwritten, the sidecar sizes its own pool.
 _JOBS_FLAG = "-jobs"
 
-# The sidecar flag that grants each effect to one module, per capability name.
-_GRANT_FLAGS: Mapping[str, str] = {"http": "-http", "udp": "-net"}
+# The effects a module's own imports can ask the host for, in the order the
+# argv writes their grants. `nn` is not among them: a model is bound to a
+# name rather than granted.
+EFFECTS: tuple[str, ...] = ("http", "udp", "tcp")
+
+# The sidecar flag that grants each effect to one module, per capability
+# name. Sockets are two grants: `-net` is the UDP one, named for what
+# reached for it first, and `-tcp` is the other.
+_GRANT_FLAGS: Mapping[str, str] = {"http": "-http", "udp": "-net", "tcp": "-tcp"}
 MODEL_SUFFIX = ".onnx"
 ANNOTATIONS_IN = "in"
 ANNOTATIONS_OUT = "out"
@@ -378,9 +385,13 @@ class Described:
 
     `inputs` is how many streams the export reads at once, 1 for a module
     that names none. `nn` is whether the export runs a model, which is what
-    puts a ``-nn`` binding on the sidecar's own command line. `http` and
-    `udp` are the effects the module imports, each of which puts the
-    matching grant -- ``-http``, ``-net`` -- on that command line.
+    puts a ``-nn`` binding on the sidecar's own command line. `http`, `udp`
+    and `tcp` are the effects the module imports, each of which puts the
+    matching grant -- ``-http``, ``-net``, ``-tcp`` -- on that command line.
+    The two socket effects are read apart: `wasi:sockets` splits its
+    protocols into interfaces of their own, so a module that imports
+    ``wasi:sockets/udp`` needs `udp` and one that imports
+    ``wasi:sockets/tcp`` needs `tcp`, and neither implies the other.
 
     `video_codecs` is present exactly for a PACKET SINK -- a sink module
     that consumes the encoder's own output rather than decoded frames --
@@ -434,10 +445,12 @@ class Described:
     windowed: bool = False
     inputs: int = 1
     nn: bool = False
-    # Whether the module imports wasi:http / wasi:sockets, and so runs only
-    # under the sidecar's matching ``-http`` / ``-net`` grant.
+    # Whether the module imports wasi:http, wasi:sockets/udp or
+    # wasi:sockets/tcp, and so runs only under the sidecar's matching
+    # ``-http`` / ``-net`` / ``-tcp`` grant.
     http: bool = False
     udp: bool = False
+    tcp: bool = False
     video_codecs: tuple[str, ...] | None = None
     audio_codecs: tuple[str, ...] = ()
     video_streams: SinkArity = "one"
@@ -638,6 +651,7 @@ def _described(path: str, payload: object) -> Described:
         nn=payload.get("nn") is True,
         http=payload.get("http") is True,
         udp=payload.get("udp") is True,
+        tcp=payload.get("tcp") is True,
         # Present only for a packet sink; its ABSENCE is what marks every
         # other module, so an absent key stays None rather than ().
         video_codecs=_strings(payload["video_codecs"])
@@ -735,14 +749,13 @@ def describe(path: str) -> Described:
 
 
 def _grant_args(described: Described, path: str) -> list[str]:
-    """The ``-http``/``-net`` grants `described`'s own imports need for `path`,
-    which :func:`invoke` and :func:`probe_source` both put ahead of the flag
-    that dispatches their call."""
+    """The ``-http``/``-net``/``-tcp`` grants `described`'s own imports need
+    for `path`, which :func:`invoke` and :func:`probe_source` both put ahead
+    of the flag that dispatches their call."""
     argv: list[str] = []
-    if described.http:
-        argv += [_GRANT_FLAGS["http"], path]
-    if described.udp:
-        argv += [_GRANT_FLAGS["udp"], path]
+    for effect in EFFECTS:
+        if getattr(described, effect):
+            argv += [_GRANT_FLAGS[effect], path]
     return argv
 
 
@@ -1319,7 +1332,7 @@ def _reader_argv(binary: str, read: PacketRead, described: Described | None) -> 
         rows=(RowsDocument(sink=RowsSink(container=_ROWS_FORMAT), node="read"),),
         grants=tuple(
             EffectGrant(effect=effect, module=read.module)
-            for effect in ("http", "udp")
+            for effect in EFFECTS
             if described is not None and getattr(described, effect)
         ),
     )

@@ -474,14 +474,19 @@ def test_a_dependency_the_registry_cannot_resolve_is_refused(
 
 
 def _describing(
-    monkeypatch: pytest.MonkeyPatch, *, nn: bool, http: bool = False, udp: bool = False
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    nn: bool,
+    http: bool = False,
+    udp: bool = False,
+    tcp: bool = False,
 ) -> None:
     """The sidecar seam, answering for every module with the same description."""
     monkeypatch.setattr(
         wasm,
         "describe",
         lambda path: Described(
-            world="ffrwd:av", name="depth", nn=nn, http=http, udp=udp
+            world="ffrwd:av", name="depth", nn=nn, http=http, udp=udp, tcp=tcp
         ),
     )
 
@@ -505,6 +510,29 @@ def test_every_effect_a_module_imports_becomes_a_capability(
     _describing(monkeypatch, nn=True, http=True, udp=True)
     prepared = publish.prepare(root / "ffrwd.json")
     assert prepared.capabilities == ("http", "nn", "udp")
+
+
+def test_the_two_socket_capabilities_are_derived_apart(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A module that opens a TCP socket makes the version a `tcp` one and
+    not a `udp` one: the protocols are two interfaces and two grants."""
+    root = _module_package(tmp_path / "built", capabilities=["tcp"])
+    _describing(monkeypatch, nn=False, tcp=True)
+    prepared = publish.prepare(root / "ffrwd.json")
+    assert prepared.capabilities == ("tcp",)
+
+
+def test_a_manifest_declaring_udp_for_a_tcp_module_is_refused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Both halves of the check fire: the module needs what the manifest
+    does not declare, and the manifest declares what no module needs."""
+    root = _module_package(tmp_path / "built", capabilities=["udp"])
+    _describing(monkeypatch, nn=False, tcp=True)
+    with pytest.raises(FfrwdError) as caught:
+        publish.prepare(root / "ffrwd.json")
+    assert "'tcp' capability, which the manifest does not declare" in caught.value.message
 
 
 def test_a_module_needing_a_capability_the_manifest_omits_is_refused(
