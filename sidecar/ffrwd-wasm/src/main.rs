@@ -1107,7 +1107,6 @@ impl Write for OutputWriter {
 /// The demuxed input, and the muxed frame output, as they are actually built.
 type Input = nut::Demuxer<io::BufReader<InputReader>>;
 type FrameOutput = nut::Muxer<io::BufWriter<OutputWriter>>;
-type RowOutput = io::BufWriter<OutputWriter>;
 
 fn open_input(path: &InputPath) -> Result<InputReader> {
     match path {
@@ -1142,8 +1141,58 @@ fn open_output(path: &OutputPath) -> Result<OutputWriter> {
     }
 }
 
-fn open_row_output(path: &OutputPath) -> Result<RowOutput> {
-    Ok(io::BufWriter::with_capacity(1 << 20, open_output(path)?))
+/// Whether this output is a PIPE rather than a regular file: stdout, a
+/// named pipe, a POSIX fifo. Something is reading a pipe as the bytes
+/// arrive, so every batch written to one is flushed as it is written; a
+/// regular file has no such reader, and its writes may sit in the buffer
+/// until the stream ends.
+///
+/// The path is stated after `open_output` has created it, so a regular file
+/// answers as one. An output that cannot be stated at all is taken for a
+/// pipe, which costs a flush and never costs latency.
+fn output_is_pipe(path: &OutputPath) -> bool {
+    match path {
+        OutputPath::Stdout => true,
+        OutputPath::File(p) if is_named_pipe(p) => true,
+        OutputPath::File(p) => !std::fs::metadata(p).is_ok_and(|m| m.is_file()),
+    }
+}
+
+/// One rows output: where the rows go, and whether a reader is waiting on
+/// them. The `BufWriter` is what makes one row one write however many pieces
+/// it is written in; the flush is what stops a written row waiting for the
+/// next megabyte of them.
+struct RowOutput {
+    writer: io::BufWriter<OutputWriter>,
+    pipe: bool,
+}
+
+impl RowOutput {
+    fn open(path: &OutputPath) -> Result<RowOutput> {
+        let writer = io::BufWriter::with_capacity(1 << 20, open_output(path)?);
+        Ok(RowOutput {
+            pipe: output_is_pipe(path),
+            writer,
+        })
+    }
+
+    /// One batch of rows, reaching a waiting reader before this returns.
+    fn write_batch(&mut self, rows: &[String]) -> Result<()> {
+        write_rows(&mut self.writer, rows)?;
+        if self.pipe && !rows.is_empty() {
+            self.writer.flush()?;
+        }
+        Ok(())
+    }
+}
+
+impl Write for RowOutput {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.writer.write(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.writer.flush()
+    }
 }
 
 /// The frame output repeats the stream header of the input its frames came
@@ -1239,6 +1288,9 @@ struct Sink {
     /// The node whose output this writes.
     node: usize,
     frames: Option<FrameOutput>,
+    /// Whether the frame output is a pipe, and so is flushed at the end of
+    /// every batch rather than when its buffer fills. See `output_is_pipe`.
+    frames_pipe: bool,
     rows: Option<RowOutput>,
     subtitles: Option<SubtitleOutput>,
     annotations: bool,
@@ -1264,6 +1316,7 @@ impl Sink {
         let mut sink = Sink {
             node,
             frames: None,
+            frames_pipe: false,
             rows: None,
             subtitles: None,
             annotations: annotations && output.kind == OutputKind::Frames,
@@ -1281,11 +1334,14 @@ impl Sink {
                 let mut header = stream.clone();
                 header.frame_rate = None;
                 sink.frames = Some(open_frame_output(&output.path, &header, annotations)?);
+                // Stated after the output is opened, so a file it just
+                // created answers as the file it is.
+                sink.frames_pipe = output_is_pipe(&output.path);
             }
-            OutputKind::Rows => sink.rows = Some(open_row_output(&output.path)?),
+            OutputKind::Rows => sink.rows = Some(RowOutput::open(&output.path)?),
             OutputKind::Subtitles(format) => {
                 sink.subtitles = Some(SubtitleOutput {
-                    writer: Some(open_row_output(&output.path)?),
+                    writer: Some(RowOutput::open(&output.path)?),
                     document: subtitles::Document::new(format),
                     spelling: output.spelling.clone(),
                 });
@@ -1339,10 +1395,35 @@ impl Sink {
                 None => batch,
             };
             if let Some(w) = self.rows.as_mut() {
-                write_rows(w, &routed)?;
+                w.write_batch(&routed)?;
             }
             if let Some(w) = self.subtitles.as_mut() {
                 w.push(&routed)?;
+            }
+        }
+        if frames.is_empty() {
+            return Ok(());
+        }
+        self.end_batch()
+    }
+
+    /// The end of one batch: what the module handed back is written, so what
+    /// a pipe's reader is waiting for goes to it now rather than when the
+    /// buffer happens to fill. A batch is the natural unit - it is what the
+    /// module produced in one call - and it is what bounds the wait: a frame
+    /// of raw video is larger than the buffer and was never held anyway,
+    /// while a window of pcm_f32le is a few kilobytes and a megabyte of them
+    /// is seconds of sound. Nothing here flushes a regular file: no reader is
+    /// waiting on one, and a long run writes millions of these batches.
+    ///
+    /// A subtitle document is written whole in `finish`, since a run of cues
+    /// is a document rather than a stream of lines, so there is nothing of
+    /// one to flush per batch.
+    fn end_batch(&mut self) -> Result<()> {
+        if self.frames_pipe {
+            if let Some(w) = self.frames.as_mut() {
+                // The muxer's flush: it leaves the stream open.
+                w.finish()?;
             }
         }
         Ok(())
@@ -1372,12 +1453,12 @@ impl Sink {
             None => rows,
         };
         if let Some(w) = self.rows.as_mut() {
-            write_rows(w, routed)?;
+            w.write_batch(routed)?;
         }
         if let Some(w) = self.subtitles.as_mut() {
             w.push(routed)?;
         }
-        Ok(())
+        self.end_batch()
     }
 
     fn finish(&mut self) -> Result<()> {
@@ -1776,7 +1857,7 @@ fn run_packet_sink(args: &Args, module: &str, params: &str) -> Result<()> {
     let mut row_outputs: Vec<RowOutput> = Vec::new();
     for output in &args.outputs {
         match output.kind {
-            OutputKind::Rows => row_outputs.push(open_row_output(&output.path)?),
+            OutputKind::Rows => row_outputs.push(RowOutput::open(&output.path)?),
             // A null output opens nothing; the module's own effects are the
             // product.
             OutputKind::Null => {}
@@ -1853,7 +1934,7 @@ fn run_packet_sink(args: &Args, module: &str, params: &str) -> Result<()> {
                 return Ok(emitted);
             }
             for writer in &mut row_outputs {
-                write_rows(writer, &emitted.rows)?;
+                writer.write_batch(&emitted.rows)?;
             }
         }
     })();
@@ -1862,8 +1943,8 @@ fn run_packet_sink(args: &Args, module: &str, params: &str) -> Result<()> {
     let emitted = outcome?;
 
     for writer in &mut row_outputs {
-        write_rows(writer, &emitted.rows)?;
-        write_rows(writer, &emitted.trailing)?;
+        writer.write_batch(&emitted.rows)?;
+        writer.write_batch(&emitted.trailing)?;
         writer.flush()?;
     }
     Ok(())
@@ -1900,7 +1981,7 @@ fn run_packet_filter(args: &Args, module: &str, params: &str) -> Result<()> {
     for output in &args.outputs {
         match output.kind {
             OutputKind::Frames => pad_outputs.push(output),
-            OutputKind::Rows => row_outputs.push(open_row_output(&output.path)?),
+            OutputKind::Rows => row_outputs.push(RowOutput::open(&output.path)?),
             OutputKind::Null => {}
             _ => bail!(
                 "{}: a packet filter writes encoded packets and rows; its outputs are \
@@ -2070,7 +2151,7 @@ fn run_packet_filter(args: &Args, module: &str, params: &str) -> Result<()> {
                 }
             }
             for writer in &mut row_outputs {
-                write_rows(writer, &filtered.rows)?;
+                writer.write_batch(&filtered.rows)?;
             }
             if !sending {
                 // Every output's writer has stopped; its failure is what
@@ -2096,8 +2177,8 @@ fn run_packet_filter(args: &Args, module: &str, params: &str) -> Result<()> {
     }
     drop(senders);
     for writer in &mut row_outputs {
-        write_rows(writer, &filtered.rows)?;
-        write_rows(writer, &filtered.trailing)?;
+        writer.write_batch(&filtered.rows)?;
+        writer.write_batch(&filtered.trailing)?;
         writer.flush()?;
     }
 
@@ -2328,7 +2409,7 @@ fn run_rows_module(
     let mut row_outputs: Vec<RowOutput> = Vec::new();
     for output in &args.outputs {
         match output.kind {
-            OutputKind::Rows => row_outputs.push(open_row_output(&output.path)?),
+            OutputKind::Rows => row_outputs.push(RowOutput::open(&output.path)?),
             OutputKind::Null => {}
             _ => bail!(
                 "{}: a rows module emits rows alone; its outputs are -f {ROWS_FORMAT} and -f null",
@@ -2351,7 +2432,7 @@ fn run_rows_module(
     );
 
     for writer in &mut row_outputs {
-        write_rows(writer, &emitted)?;
+        writer.write_batch(&emitted)?;
         writer.flush()?;
     }
     Ok(())
