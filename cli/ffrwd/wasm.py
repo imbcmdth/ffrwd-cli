@@ -1291,9 +1291,10 @@ _KEYFRAMES_FILTER = "noise=drop=not(key)"
 # zero.
 #
 # The clamp is what NUT can carry. A frame cannot hold a negative presentation
-# time, and a syncpoint before a negative decode time is written as a wrapped
-# unsigned value the sidecar's reader rejects. Both floors sit at zero, which
-# is where the container itself starts presenting anyway.
+# time at all, and a syncpoint before a negative decode time goes out as a
+# wrapped unsigned value that only a reader expecting the wrap can read, which
+# an older sidecar is not. Both floors sit at zero, which is where the
+# container itself starts presenting anyway.
 #
 # Both halves of the clamp are spelled out: `setts` sets whichever of pts and
 # dts no expression names to its `ts` expression, which is the packet's DECODE

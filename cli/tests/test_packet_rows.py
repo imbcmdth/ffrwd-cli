@@ -836,6 +836,27 @@ def _keyframe_times(path: Path) -> list[float]:
     return [float(frame["pts_time"]) for frame in json.loads(done.stdout)["frames"]]
 
 
+def _graph_times(path: Path, limit: int = 6) -> list[str]:
+    """The pts a FILTERGRAPH is handed, which is what `trim` compares against.
+
+    Not always the file's own times: ffmpeg re-bases an input whose container
+    starts away from zero, and that is the difference a trim written from a
+    row's time would land on the wrong side of.
+    """
+    done = subprocess.run(
+        ["ffmpeg", "-v", "info", "-i", str(path), "-map", "0:v:0",
+         "-vf", "showinfo", "-f", "null", "-"],
+        capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT, check=False,
+    )
+    seen = []
+    for line in done.stderr.splitlines():
+        if "pts_time:" in line:
+            seen.append(line.split("pts_time:")[1].split()[0])
+        if len(seen) >= limit:
+            break
+    return seen
+
+
 def _frame_times(path: Path) -> list[float]:
     """The presentation time of every frame, in the order they are shown."""
     done = subprocess.run(
@@ -983,7 +1004,15 @@ def test_a_reported_time_is_the_time_a_trim_means(
     )
     whole = _framemd5(["-i", str(source), "-map", "0:v:0"])
     times = _keyframe_times(source)
-    assert trimmed, "the trim keeps at least one frame"
+    # An empty trim means the reported time is not a time the graph has a
+    # frame at, and the two clocks below say which of them moved.
+    assert trimmed, (
+        f"the trim keeps at least one frame\n"
+        f"  reported  : {start}\n"
+        f"  keyframes : {times[:6]}\n"
+        f"  the file  : {_frame_times(source)[:6]}\n"
+        f"  the graph : {_graph_times(source)}"
+    )
     # The reported time is a keyframe of the source, and the frame a trim from
     # it opens on is that keyframe -- not the one a shifted clock would name.
     at = min(range(len(times)), key=lambda i: abs(times[i] - start))
