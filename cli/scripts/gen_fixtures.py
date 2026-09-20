@@ -94,6 +94,14 @@ _KEYS_OFFSET = 0.5
 # Where the cut fixture is cut. A copy cut keeps whole packets, so the one
 # ahead of the cut lands at a NEGATIVE presentation time.
 _KEYS_CUT_AT = 1
+# What the Matroska fixtures carry sound as. An AAC encoder primes its stream,
+# which rides in front of the sound as a negative timestamp and as a codec
+# delay the track states; mp4 hides both behind an edit list, Matroska does
+# not, and the file's own start then sits a priming behind its pictures.
+# Different ffmpeg builds read that back differently, and one that re-bases the
+# file before a filtergraph sees it puts every time in the query a priming out.
+# FLAC primes nothing, so the file starts where its streams do.
+_MKV_AUDIO_CODEC = "flac"
 # A keyframe every half second of a 15fps clip, and two B-frames between
 # anchors so the stream reorders and opens on a negative dts -- which is what
 # a compile-time read of it has to stay on the right side of.
@@ -398,15 +406,15 @@ def _generate_keys() -> None:
     It carries audio too, so a query can trim video and audio by the same
     rows -- the shape a search over a file's own records writes.
 
-    `keys.mkv` is the same encode remuxed, not a second one -- the two files
-    carry the same packets, so a read of one is comparable with a read of the
-    other, which is what makes the container the only variable.
+    `keys.mkv` carries the same VIDEO, copied rather than encoded again, so a
+    read of one is comparable with a read of the other and the container is
+    the only variable. Its sound is re-encoded (`_MKV_AUDIO_CODEC`), which is
+    what keeps its clock the same clock on every ffmpeg.
 
-    The remux disables the muxer's negative-timestamp avoidance, which is what
-    makes the two files carry the same TIMES as well. Left on, the muxer takes
-    its offset from whichever stream it writes first and moves every other one
-    with it, so the audio encoder's priming -- a different number on different
-    ffmpeg builds -- decides where the video opens.
+    The remux also disables the muxer's negative-timestamp avoidance. Left on,
+    the muxer takes its offset from whichever stream it writes first and moves
+    every other one with it, so an encoder's priming would decide where the
+    video opens.
     """
     _run(
         FIXTURES_DIR / _KEYS_NAME,
@@ -420,7 +428,8 @@ def _generate_keys() -> None:
     )
     _run(
         FIXTURES_DIR / _KEYS_MKV_NAME,
-        ["-i", str(FIXTURES_DIR / _KEYS_NAME), "-c", "copy",
+        ["-i", str(FIXTURES_DIR / _KEYS_NAME),
+         "-c:v", "copy", "-c:a", _MKV_AUDIO_CODEC,
          "-avoid_negative_ts", "disabled"],
     )
 
@@ -452,7 +461,8 @@ def _generate_keys_offsets() -> None:
     _run(
         FIXTURES_DIR / _KEYS_LATE_NAME,
         ["-itsoffset", str(_KEYS_LATE_OFFSET), "-i", source, "-i", source,
-         "-map", "0:v:0", "-map", "1:a:0", "-c", "copy",
+         "-map", "0:v:0", "-map", "1:a:0",
+         "-c:v", "copy", "-c:a", _MKV_AUDIO_CODEC,
          "-avoid_negative_ts", "disabled"],
     )
     _run(

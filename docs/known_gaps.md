@@ -99,8 +99,13 @@ output is plain ffmpeg, so the two mix freely in a script.
   which is what ffprobe reports and what they are compared against.
   ffmpeg re-bases an input whose file starts away from zero before the
   graph sees it, so on such a file a `trim` written from a row time is
-  off by wherever the file starts. A file whose own start is zero, which
-  is the ordinary case even when its video opens later, is unaffected.
+  off by wherever the file starts. A file whose own start is zero is
+  unaffected, and that is the ordinary case even when its video opens
+  later than its sound. Below zero is where ffmpeg builds disagree:
+  n8 re-bases a file whose start is negative and 9.0 leaves it alone, so
+  an input carrying an audio encoder's priming as a negative timestamp
+  (Matroska states one where mp4 hides it behind an edit list) is off by
+  that priming on one of them and right on the other.
 - **A sidecar process reads one stream and writes one.** A region of
   modules can fan out and fan in as much as it likes inside itself,
   but its BOUNDARY is one pipe each way: only stdin and stdout are
