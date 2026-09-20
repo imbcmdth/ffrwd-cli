@@ -87,6 +87,20 @@ output is plain ffmpeg, so the two mix freely in a script.
   (`-discard nokey`) would save the read too, but on mov it reports the
   wrong presentation times for a stream that reorders frames, which
   would put the rows on a different clock from the rest of the query.
+- **A compile-time packet read reports a pre-zero packet at zero.** The
+  read carries the stream's own times through a NUT pipe, and NUT has no
+  spelling for a presentation time below zero. A file cut by copying can
+  open on one -- the packet it cut into -- and that row comes back at
+  zero. Nothing is lost by it: the container's own edit list already
+  presents nothing before zero, so the row names the first picture the
+  file shows.
+- **A run-time filtergraph is on ffmpeg's clock, not the container's.**
+  Row times -- packet rows, cue rows, chapter rows -- are the container's,
+  which is what ffprobe reports and what they are compared against.
+  ffmpeg re-bases an input whose file starts away from zero before the
+  graph sees it, so on such a file a `trim` written from a row time is
+  off by wherever the file starts. A file whose own start is zero, which
+  is the ordinary case even when its video opens later, is unaffected.
 - **A sidecar process reads one stream and writes one.** A region of
   modules can fan out and fan in as much as it likes inside itself,
   but its BOUNDARY is one pipe each way: only stdin and stdout are
