@@ -1,5 +1,6 @@
-//! What the `ffrwd-wasm` binary is built from. Only the wire lives here so
-//! far: the binary's own frame loop and argument handling stay in `main.rs`,
-//! and tests reach the wire through this crate.
+//! What the `ffrwd-wasm` binary is built from. The binary's own frame loop
+//! and argument handling stay in `main.rs`; the wire itself is now the
+//! `ffrwd-nut` crate, re-exported here so this crate's tests and the binary
+//! reach it by the name they always used.
 
-pub mod nut;
+pub use ffrwd_nut as nut;

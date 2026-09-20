@@ -448,10 +448,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ffrwd-nut"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "ffrwd-wasm"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "ffrwd-nut",
  "ffrwd-wasm-runtime",
  "serde",
  "serde_json",

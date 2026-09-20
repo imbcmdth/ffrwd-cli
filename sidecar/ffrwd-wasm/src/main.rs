@@ -168,6 +168,11 @@ fn format_from_stream(stream: &nut::Stream) -> Result<Format> {
                 channel_layout: None,
             })
         }
+        // The demuxer refuses a stream class it has no geometry for, so this
+        // arm is here for the type rather than for the wire.
+        nut::Media::Other { class } => {
+            bail!("input carries NUT stream class {class}; a module reads video or audio")
+        }
     };
     Ok(Format { media, time_base })
 }
@@ -2676,6 +2681,10 @@ fn coded_pad(
             // The NUT audio header carries no layout; see `format_from_stream`.
             channel_layout: None,
         },
+        // As in `format_from_stream`: the demuxer never opens one of these.
+        nut::Media::Other { class } => bail!(
+            "input {pad} carries NUT stream class {class}; a packet sink reads video or audio"
+        ),
     };
     // Profile and level: the NUT stream header has no field for either, so
     // h264's are read off the SPS the extradata carries. The other codecs
@@ -2828,7 +2837,7 @@ fn write_coded_packet(muxer: &mut FrameOutput, packet: &runtime::Packet) -> Resu
         dts: packet.dts,
         keyframe: packet.keyframe,
     };
-    muxer.write_coded(&framed, &packet.data)
+    Ok(muxer.write_coded(&framed, &packet.data)?)
 }
 
 /// Writes one track's NUT header, now that its `decode_delay` has settled -
@@ -3025,7 +3034,7 @@ fn write_track(
         }
         muxer.finish()?;
     }
-    muxer.finish()
+    Ok(muxer.finish()?)
 }
 
 /// `-annotations in` on a module that neither reads the rows nor passes them
