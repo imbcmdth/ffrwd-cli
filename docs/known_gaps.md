@@ -57,7 +57,11 @@ output is plain ffmpeg, so the two mix freely in a script.
   `coded.extradata`, which says which of the two it has, and writes the
   framing it finds there; one that assumes either corrupts the other
   silently rather than failing. Stream-copy hosting is the path that
-  hands a filter an MP4's own samples, so that is where it bites.
+  hands a filter an MP4's own samples, so that is where it bites. Do not
+  write that reader: [ffrwd-nal](https://github.com/imbcmdth/ffrwd-nal)
+  is the crate for it, and `config::framing_of` with `Framing::insert`
+  is the whole of what the `packet-sei` fixture module needs to carry a
+  payload through either framing.
 - **Stream-copied splits snap to keyframes.** An output fan-out that
   splits by chapter (or any time window) with stream copy starts each
   piece at the nearest preceding keyframe, exactly as ffmpeg does.
