@@ -1091,3 +1091,103 @@ def test_a_woven_file_answers_a_find(_require_everything: None) -> None:
     assert rows, "the woven fixture carries records"
     assert all(len(row) == 5 for row in rows)
     assert all(isinstance(row[4], int) and row[4] > 0 for row in rows)
+
+
+# ---------------------------------------------------------------------------
+# DIAGNOSTIC -- branch ci-clock-diagnose only, deliberately failing so that CI
+# prints what this machine's ffmpeg does. Delete with the branch.
+# ---------------------------------------------------------------------------
+
+
+def _tool_version(tool: str) -> str:
+    done = subprocess.run(
+        [tool, "-version"], capture_output=True, text=True,
+        timeout=_SUBPROCESS_TIMEOUT, check=False,
+    )
+    return done.stdout.splitlines()[0] if done.stdout else "?"
+
+
+def _compact(path: Path, *args: str) -> str:
+    done = subprocess.run(
+        ["ffprobe", "-v", "error", *args, "-of", "compact=p=0", str(path)],
+        capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT, check=False,
+    )
+    return (done.stdout.strip() or done.stderr.strip()).replace("\n", " | ")
+
+
+def _graph_times(path: Path, limit: int = 8) -> list[str]:
+    """The pts a FILTERGRAPH sees, which is what `trim` compares against."""
+    done = subprocess.run(
+        ["ffmpeg", "-v", "info", "-i", str(path), "-map", "0:v:0",
+         "-vf", "showinfo", "-f", "null", "-"],
+        capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT, check=False,
+    )
+    found = []
+    for line in done.stderr.splitlines():
+        if "pts_time:" in line:
+            found.append(line.split("pts_time:")[1].split()[0])
+        if len(found) >= limit:
+            break
+    return found
+
+
+def _window(path: Path, start: float) -> int:
+    """How many frames a 10 ms trim window at `start` keeps."""
+    return len(_framemd5(
+        ["-i", str(path), "-map", "0:v:0",
+         "-vf", f"trim=start={start}:end={start + 0.01},setpts=PTS-STARTPTS"]
+    ))
+
+
+def _a_read(source: Path) -> PacketRead:
+    return PacketRead(
+        spec=source.as_posix(), input_args=(), kind="video", index=0,
+        module=str(_KEYS_MODULE), params="", wants="keyframes",
+    )
+
+
+@pytest.mark.exec
+def test_diagnose_the_mkv_trim_clock(_require_everything: None) -> None:
+    said = [
+        "",
+        f"ffmpeg : {_tool_version('ffmpeg')}",
+        f"ffprobe: {_tool_version('ffprobe')}",
+    ]
+    for name in ("keys.mp4", "keys.mkv", "keys-late.mkv"):
+        source = _FIXTURES / name
+        clear_cache()
+        rows = read_packet_rows(_a_read(source))
+        reported = [float(cast(float, row["start_t"])) for row in rows]
+        start = reported[3]
+        near = [
+            f"{offset:+.3f}:{_window(source, start + offset)}"
+            for offset in (-0.024, -0.002, -0.001, 0.0, 0.001, 0.002, 0.023)
+        ]
+        said += [
+            "",
+            f"=== {name} ===",
+            f"  copy argv  : {copy_argv('ffmpeg', _a_read(source))}",
+            "  format     : " + _compact(
+                source, "-show_entries", "format=start_time,duration,format_name"
+            ),
+            "  streams    : " + _compact(
+                source, "-show_entries",
+                "stream=index,codec_type,start_time,start_pts,time_base",
+            ),
+            "  v packets  : " + _compact(
+                source, "-select_streams", "v:0", "-read_intervals", "%+1",
+                "-show_entries", "packet=pts_time,dts_time,flags",
+            )[:400],
+            "  a packets  : " + _compact(
+                source, "-select_streams", "a:0", "-read_intervals", "%+0.15",
+                "-show_entries", "packet=pts_time,dts_time",
+            )[:300],
+            f"  decoded kf : {_keyframe_times(source)[:6]}",
+            f"  decoded all: {_frame_times(source)[:8]}",
+            f"  graph pts  : {_graph_times(source)}",
+            f"  reported   : {reported[:6]}",
+            f"  index 4    : {start}",
+            f"  window here: {_window(source, start)} frames",
+            f"  nearby     : {near}",
+        ]
+    raise AssertionError("\n".join(said))
