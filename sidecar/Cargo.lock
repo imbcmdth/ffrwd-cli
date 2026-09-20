@@ -450,6 +450,7 @@ dependencies = [
 [[package]]
 name = "ffrwd-nut"
 version = "0.1.0"
+source = "git+https://github.com/imbcmdth/ffrwd-nut?tag=v0.1.0#42bd837cec379ef3a435834b6f64fa2c6ee6afd0"
 dependencies = [
  "serde",
  "serde_json",

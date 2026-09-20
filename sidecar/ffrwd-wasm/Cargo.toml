@@ -15,11 +15,9 @@ path = "src/main.rs"
 
 [dependencies]
 ffrwd-wasm-runtime = { path = "../runtime" }
-# The NUT wire, which used to be src/nut/. Its repo is not public yet, so
-# this is a path dependency and the wheel CI builds cannot see it; that is
-# what makes this branch unmergeable. Flipping it is this one line:
-#   ffrwd-nut = { git = "https://github.com/imbcmdth/ffrwd-nut", tag = "v0.1.0", features = ["annotations"] }
-ffrwd-nut = { path = "../../../../ffrwd-nut", features = ["annotations"] }
+# The NUT wire, which used to be src/nut/, pinned by tag the way ffrwd-frame
+# is. The annotation stream is the sidecar's own, so it asks for the feature.
+ffrwd-nut = { git = "https://github.com/imbcmdth/ffrwd-nut", tag = "v0.1.0", features = ["annotations"] }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
