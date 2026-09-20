@@ -902,3 +902,118 @@ def test_the_live_run_wrote_every_frame_side_by_side(
 
     assert int(str(written["nb_read_frames"])) == _LIVE_FRAMES
     assert (written["width"], written["height"]) == (_LIVE_SIZE[0] * 2, _LIVE_SIZE[1])
+
+
+# --- a paced FILE, read once, picture and sound together ---------------------
+
+# `realtime => true` over a file with a module on each column. A file opens
+# twice happily, but `-re` paces each open off a clock its own process starts
+# and nothing binds two of those together, so the file is one-open the same
+# way a socket is, and both lanes come off the one paced read.
+
+_AGAIN = _built(_SIDECAR_MODULES, "again")
+_AV = _FIXTURES_DIR / "av.mp4"
+
+
+def _paced_query(out_path: Path) -> str:
+    return (
+        "CREATE FUNCTION invert(v video_stream) RETURNS video_stream\n"
+        f"  AS '{_MODULE.as_posix()}', 'invert' LANGUAGE wasm;\n"
+        "CREATE FUNCTION again(a audio_stream) RETURNS audio_stream\n"
+        f"  AS '{_AGAIN.as_posix()}', 'again' LANGUAGE wasm;\n"
+        "COPY (\n"
+        "  SELECT invert(f.video[1]), again(f.audio[1])\n"
+        f"  FROM input('{_AV.as_posix()}', realtime => true) f\n"
+        f") TO '{out_path.as_posix()}' "
+        "WITH (video_codec 'ffv1', audio_codec 'pcm_s16le')"
+    )
+
+
+def _span(path: Path, stream: str) -> tuple[float, float]:
+    """The first and last packet times of `path`'s `stream`, in seconds.
+
+    Read off the packets rather than the stream header: matroska carries the
+    duration on the container, so a per-stream one is not there to read.
+    """
+    done = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-select_streams", stream,
+            "-show_entries", "packet=pts_time", "-of", "csv=p=0", str(path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=_SUBPROCESS_TIMEOUT,
+        check=False,
+    )
+    assert done.returncode == 0, done.stderr
+    times = [float(line) for line in done.stdout.split() if line not in ("", "N/A")]
+    assert times, f"{path} carries no {stream} packets"
+    return times[0], times[-1]
+
+
+@pytest.fixture(scope="module")
+def _paced_run(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, Compiled]:
+    """A paced file with a module on each of its two columns."""
+    if shutil.which("ffmpeg") is None or binaries.ffrwd_wasm_path() is None:
+        pytest.skip("ffmpeg or ffrwd-wasm missing")
+    if not _AV.exists():
+        pytest.skip(f"fixture missing: {_AV} (run scripts/gen_fixtures.py first)")
+    if not _MODULE.exists() or not _AGAIN.exists():
+        pytest.skip(f"module missing: {_MODULE} or {_AGAIN}")
+    out_path = tmp_path_factory.mktemp("paced") / "paced.mkv"
+    compiled = compile_all(_paced_query(out_path))
+    assert compiled.plan is not None
+
+    result = execute_plan(
+        compiled.plan,
+        sidecar_argv=wasm.sidecar_argv,
+        overwrite=True,
+        timeout=_SUBPROCESS_TIMEOUT,
+    )
+    assert result.exit_code == 0, "\n".join(
+        f"{member.id} exited {member.exit_code}: {member.stderr_tail}"
+        for stage in result.stages
+        for member in stage.members
+    )
+    assert not result.timed_out
+    assert result.overflow is None, str(result.overflow)
+    return out_path, compiled
+
+
+def test_a_paced_file_is_opened_by_exactly_one_process(
+    _paced_run: tuple[Path, Compiled],
+) -> None:
+    """One `-i` over the file, and one `-re` in the whole plan."""
+    _, compiled = _paced_run
+    assert compiled.plan is not None
+    opening = [
+        p.id for p in compiled.plan.ffmpeg if _AV.as_posix() in p.graph.input_paths
+    ]
+    paced = [
+        p.id
+        for p in compiled.plan.ffmpeg
+        if any(o.get("realtime") is True for o in p.graph.input_options.values())
+    ]
+
+    assert len(opening) == 1
+    assert paced == opening, "the one reader is the one paced process"
+
+
+def test_the_paced_runs_picture_and_sound_start_and_end_together(
+    _paced_run: tuple[Path, Compiled],
+) -> None:
+    """Both lanes came off one clock, so they span the same stretch of time.
+
+    Two paced readers of one file would be two clocks with nothing between
+    them, and what the destination gets is a picture and a sound that drift.
+    """
+    out_path, _ = _paced_run
+    video_start, video_end = _span(out_path, "v:0")
+    audio_start, audio_end = _span(out_path, "a:0")
+
+    assert abs(video_start - audio_start) < 0.25, (
+        f"the picture starts at {video_start}s and the sound at {audio_start}s"
+    )
+    assert abs(video_end - audio_end) < 0.25, (
+        f"the picture ends at {video_end}s and the sound at {audio_end}s"
+    )

@@ -1005,6 +1005,32 @@ def test_a_plain_file_still_decodes_once_per_leg() -> None:
     assert all(edge.bound == 0 and edge.buffer is None for edge in plan.stream_edges)
 
 
+def test_a_paced_file_is_read_once_and_paced_once() -> None:
+    """The same file with `realtime => true`. Two readers would be two `-re`
+    clocks over one program, with nothing holding them together, so the same
+    single read a socket gets applies here."""
+    graph = _merge_graph("clip.mp4")
+    graph.input_options = {"a": {"realtime": True}}
+    plan = partition(
+        graph,
+        external=external_ids("e0"),
+        probes={"a": _live_probe()},
+        pix_fmts={"invert": "rgba"},
+        shapes={"invert": ModuleShape()},
+        anchors={"a": (7, 14)},
+    )
+
+    assert _opens(plan, "clip.mp4") == ["ffmpeg1"]
+    argv = plan_argv(
+        plan,
+        sidecar_argv=wasm.shown_argv,
+        pipe_path=lambda edge, side: f"pipes/{edge.source}-{edge.target}-{side}",
+    )
+    assert sum(command.count("-re") for command in argv.values()) == 1
+    # And the one reader hands the other leg a pipe, sized as a live input's is.
+    assert _edge(plan, "ffmpeg1", "ffmpeg0").bound == 1
+
+
 def test_the_bound_counts_the_frames_the_quick_path_holds() -> None:
     """The module's leg goes through a process; the direct leg waits for it."""
     plan = _merged()
@@ -1140,6 +1166,8 @@ def test_a_stream_edge_writes_its_bound_and_the_buffer_it_bought() -> None:
 
 
 def test_which_inputs_can_only_be_opened_once() -> None:
+    """The second entry is a plain file: `realtime` is what makes it one-open,
+    since `-re` paces a read off a clock its own process starts."""
     cases: list[tuple[str, dict[str, object]]] = [
         ("clip.mp4", {}),
         ("/media/clip.mp4", {"realtime": True}),
@@ -1153,7 +1181,7 @@ def test_which_inputs_can_only_be_opened_once() -> None:
 
     assert [is_live(spec, options) for spec, options in cases] == [
         False,
-        False,
+        True,
         True,
         True,
         True,

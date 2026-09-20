@@ -61,7 +61,10 @@ Duplicating the producer is only available to an input that can be opened
 twice. A protocol -- srt, udp, rtmp -- and a capture device cannot: the second
 open takes a socket already bound, or a camera already held. Neither can a
 still-live HLS or DASH manifest, whose second read would resume mid-stream
-rather than start over. Such an input (:func:`is_live`, :func:`is_live_probe`)
+rather than start over. Neither can a file the query asked to have PACED,
+``realtime => true``: it opens twice happily, but each open is paced by a
+clock its own process starts, and nothing holds two such clocks together.
+Such an input (:func:`is_live`, :func:`is_live_probe`)
 is therefore read by exactly ONE process whatever the graph shape. Every leg
 over it joins that reader instead of opening the input again,
 and the reader writes each consumer's stream to a pipe of its own -- one
@@ -985,7 +988,16 @@ def is_live(path: str, options: Mapping[str, object] | None = None) -> bool:
     ``format => 'lavfi'``) names a device or a graph rather than a file. A
     plain file path is neither and reads as many times as it is asked to. A
     ``data:`` document is in memory and reads twice for nothing.
+
+    ``realtime => true`` makes any of them one-open, whatever the path is.
+    It renders as ``-re``, which paces a read against a clock the process
+    starts for itself; two processes reading one file with it are two clocks
+    with nothing holding them together, so the picture and the sound of one
+    program drift apart. Asking for an input to be paced is asking for it to
+    be paced once.
     """
+    if (options or {}).get("realtime") is True:
+        return True
     if path.startswith(_DATA_URI):
         return False
     return is_url(path) or "format" in (options or {})

@@ -1947,10 +1947,14 @@ A file can be opened twice, so a query that sends one stream through a
 module and merges the result with the original picture lets each
 process decode the file for itself. A socket cannot: an `srt://` or
 `udp://` URL, or an input whose `format =>` names a capture device,
-binds once and refuses the second open. Such an input is read by
-exactly ONE process, whatever the shape of the graph. Everything the
-consumers need before the split - here the `split` itself - moves into
-that reader, and each consumer gets a pipe of its own:
+binds once and refuses the second open. Neither can anything the query
+paced with `realtime => true`, file or not: `-re` reads off a clock
+the reading process starts, and two such clocks over one program have
+nothing holding them together, so the picture and the sound drift
+apart. Such an input is read by exactly ONE process, whatever the shape
+of the graph. Everything the consumers need before the split - here the
+`split` itself - moves into that reader, and each consumer gets a pipe
+of its own:
 
 ```pgsql
 CREATE FUNCTION invert(v video_stream) RETURNS video_stream
@@ -1982,12 +1986,14 @@ $ ffrwd compile -f query.sql
 ```
 
 `testsrc2=...` appears in exactly one of the three, and process 2 has
-two outputs where a file-backed query would have had two processes.
-`realtime => true` paces the read at the source's own frame rate; a
-real camera or listener paces itself and needs no flag, and `format
-=>` alone is enough to make an input one-open. A stream nothing on the
-far side filters - an audio track mapped straight through - crosses
-its pipe as `-c copy`, so a passthrough stays a passthrough.
+two outputs where a plain file-backed query would have had two
+processes. `realtime => true` paces the read at the source's own frame
+rate; a real camera or listener paces itself and needs no flag, and
+`format =>` alone is enough to make an input one-open - as is
+`realtime` alone, which is what puts a paced FILE on this same road.
+A stream nothing on the far side filters - an audio track mapped
+straight through - crosses its pipe as `-c copy`, so a passthrough
+stays a passthrough.
 
 ## 102. Size the buffer between a live source's two paths
 
@@ -2165,6 +2171,12 @@ already named by a socket (`srt://`, `udp://`, `rtmp://`, ...): it is
 already paced by whatever is sending it, and pacing it a second time
 is refused with a hint to drop the option - see `INPUT_OPTION_TYPE` in
 [docs/errors.md](errors.md).
+
+A paced file is read ONCE however many ways the query uses it, the
+same as a socket (recipe 101). A query taking both a picture and a
+sound column through modules would otherwise compile to two ffmpeg
+readers over one file, each with its own `-re` and its own clock, and
+nothing holds those two together.
 
 ## 109. A ladder into one file with every rung as its own track
 
