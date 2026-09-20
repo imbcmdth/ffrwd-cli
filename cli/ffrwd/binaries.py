@@ -20,9 +20,12 @@ ffmpeg/ffprobe case.
 
 from __future__ import annotations
 
+import functools
 import importlib.metadata
 import os
+import re
 import shutil
+import subprocess
 import sysconfig
 
 INSTALL_HINT = (
@@ -129,3 +132,59 @@ def ffrwd_wasm_path() -> str | None:
     if from_wheel is not None:
         return from_wheel
     return shutil.which(SIDECAR_EXECUTABLE)
+
+
+# `ffmpeg version 9.0.1-full_build-...`, `ffmpeg version n8.0.1`,
+# `ffmpeg version 2026-01-04-git-abc123`: the major number when the build
+# states one, and nothing for a dated git build, which states none.
+_VERSION_RE = re.compile(r"^ffmpeg version n?(\d+)\.")
+
+# The first ffmpeg release that leaves an input starting below zero alone.
+# Before it, such an input is re-based like any other and every frame moves
+# later by the negative start.
+_FIRST_KEEPING_A_NEGATIVE_START = 9
+
+# How long `ffmpeg -version` may take. It prints a banner and exits; a
+# binary that cannot manage that in this long is not one to wait on.
+_VERSION_TIMEOUT_SECONDS = 15.0
+
+
+@functools.cache
+def ffmpeg_major_version() -> int | None:
+    """The installed ffmpeg's major version, or None when it does not say.
+
+    Never raises, like everything else here: a missing binary, a spawn that
+    fails, a timeout, and a banner in a shape this does not know all read as
+    None. Cached, and asked for only where a version actually decides
+    something, so the ordinary compile never spawns this at all.
+    """
+    ffmpeg = ffmpeg_path()
+    if ffmpeg is None:
+        return None
+    try:
+        done = subprocess.run(
+            [ffmpeg, "-version"],
+            capture_output=True,
+            text=True,
+            timeout=_VERSION_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if done.returncode != 0:
+        return None
+    first = done.stdout.splitlines()[0] if done.stdout.splitlines() else ""
+    found = _VERSION_RE.match(first.strip())
+    return int(found.group(1)) if found is not None else None
+
+
+def ffmpeg_rebases_a_negative_start() -> bool:
+    """Whether the installed ffmpeg subtracts an input start BELOW zero too.
+
+    n8 and earlier do, moving every frame of such an input later by the
+    negative start; 9.0 leaves it where it is. A build that does not state a
+    major version is read as a recent one, which is what a git build off the
+    development branch is.
+    """
+    major = ffmpeg_major_version()
+    return major is not None and major < _FIRST_KEEPING_A_NEGATIVE_START

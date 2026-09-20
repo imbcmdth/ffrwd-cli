@@ -119,3 +119,65 @@ def test_a_remux_through_ffmpeg_alone_keeps_the_tracks_and_their_tags(
     assert _rows(remuxed, "cues", "r.track, r.text") == _rows(
         _DESCRIBED, "cues", "r.track, r.text"
     )
+
+
+# How far into its own clock the offset copy below starts. Five seconds is
+# well past the whole fixture, so a cue read on the container's clock instead
+# of the graph's would name a time the file has no picture at.
+_CLOCK_OFFSET = 5
+
+
+def _offset_copy(source: Path, out_path: Path) -> Path:
+    """`source` remuxed so the file's own clock starts `_CLOCK_OFFSET` in.
+
+    `-copyts` keeps the shift the input option makes rather than undoing it
+    on the way through, and the muxer is told to add nothing of its own, so
+    every stream AND every cue in the copy states a time that far later than
+    the one it states in `source`.
+    """
+    result = subprocess.run(
+        ["ffmpeg", "-y", "-v", "error", "-copyts", "-itsoffset", str(_CLOCK_OFFSET),
+         "-i", str(source), "-map", "0", "-c", "copy",
+         "-avoid_negative_ts", "disabled", str(out_path)],
+        capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT,
+    )
+    assert result.returncode == 0, result.stderr
+    return out_path
+
+
+def _framemd5(path: Path, start: float) -> list[str]:
+    """The pictures a trim from `start` keeps, one checksum each."""
+    result = subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", str(path), "-map", "0:v:0",
+         "-vf", f"trim=start={start}:end={start + 0.2},setpts=PTS-STARTPTS",
+         "-f", "framemd5", "-"],
+        capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT,
+    )
+    assert result.returncode == 0, result.stderr
+    return [
+        line.split(",")[-1].strip()
+        for line in result.stdout.splitlines()
+        if line and not line.startswith("#")
+    ]
+
+
+def test_a_cue_row_time_is_the_time_a_trim_means(tmp_path: Path) -> None:
+    """The clock rule over cue rows. A file whose own clock starts five
+    seconds in states every cue five seconds later than the same cue in the
+    file it was copied from, and ffmpeg takes that start off again before any
+    filter runs -- so the rows read back the same, and a trim written from
+    one opens on the same pictures in both files.
+
+    A cue read on the container's clock instead would name a time five
+    seconds past everything the fixture holds, and the trim would keep
+    nothing at all.
+    """
+    offset = _offset_copy(_DESCRIBED, tmp_path / "offset.mkv")
+    native_rows = _rows(_DESCRIBED, "cues", "r.start_t, r.end_t")
+    assert native_rows, "the fixture carries cues"
+    assert _rows(offset, "cues", "r.start_t, r.end_t") == native_rows
+
+    start = float(str(native_rows[1][0]))
+    kept = _framemd5(offset, start)
+    assert kept, f"a trim from the cue at {start} keeps at least one picture"
+    assert kept == _framemd5(_DESCRIBED, start)

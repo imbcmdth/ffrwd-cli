@@ -11,12 +11,40 @@ from __future__ import annotations
 
 import os
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 from types import ModuleType
 
 import pytest
 
 from ffrwd import binaries
+
+
+def _fake_version(
+    monkeypatch: pytest.MonkeyPatch, banner: str, returncode: int = 0
+) -> None:
+    """Make ``ffmpeg -version`` print `banner`, and clear what was cached.
+
+    The answer is memoized for the process, so a test that changes it has to
+    drop the memo on the way in and the next one has to drop it again.
+    """
+    monkeypatch.setattr(binaries, "ffmpeg_path", lambda: "ffmpeg")
+
+    def fake_run(argv: list[str], **kwargs: object) -> object:
+        return binaries.subprocess.CompletedProcess(
+            argv, returncode, stdout=banner + "\nbuilt with gcc 16.1.0\n", stderr=""
+        )
+
+    monkeypatch.setattr(binaries.subprocess, "run", fake_run)
+    binaries.ffmpeg_major_version.cache_clear()
+
+
+@pytest.fixture(autouse=True)
+def _forget_the_version() -> Iterator[None]:
+    """No test leaves a faked ffmpeg version memoized for the next one."""
+    binaries.ffmpeg_major_version.cache_clear()
+    yield
+    binaries.ffmpeg_major_version.cache_clear()
 
 
 def _install_fake_provider(
@@ -219,3 +247,68 @@ def test_ffrwd_wasm_path_is_none_when_absent_everywhere(monkeypatch: pytest.Monk
     monkeypatch.setattr(binaries, "_sidecar_scripts_path", lambda: None)
     monkeypatch.setattr(binaries.shutil, "which", lambda name: None)
     assert binaries.ffrwd_wasm_path() is None
+
+
+# --- which ffmpeg is installed ---------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("banner", "major"),
+    [
+        ("ffmpeg version 9.0.1-full_build-www.gyan.dev Copyright (c) 2000", 9),
+        ("ffmpeg version n8.0.1 Copyright (c) 2000-2025", 8),
+        ("ffmpeg version 7.1-full_build-www.gyan.dev Copyright (c)", 7),
+        # A dated git build states no release number.
+        ("ffmpeg version 2026-01-04-git-abc1234 Copyright (c)", None),
+        ("something else entirely", None),
+        ("", None),
+    ],
+)
+def test_the_major_version_is_read_off_the_banner(
+    monkeypatch: pytest.MonkeyPatch, banner: str, major: int | None
+) -> None:
+    """The first line of ``ffmpeg -version``, in the shapes builds write it.
+    A release states a number, with or without the ``n`` a tag carries; a git
+    build states a date, which is no version at all."""
+    _fake_version(monkeypatch, banner)
+    assert binaries.ffmpeg_major_version() == major
+
+
+@pytest.mark.parametrize(
+    ("banner", "rebases"),
+    [
+        ("ffmpeg version n8.0.1 Copyright (c)", True),
+        ("ffmpeg version 9.0.1-full_build Copyright (c)", False),
+        ("ffmpeg version 2026-01-04-git-abc1234 Copyright (c)", False),
+    ],
+)
+def test_which_builds_rebase_a_start_below_zero(
+    monkeypatch: pytest.MonkeyPatch, banner: str, rebases: bool
+) -> None:
+    """n8 subtracts a negative input start like any other; 9.0 leaves it. A
+    build that states no version is read as a recent one, which is what a git
+    build off the development branch is."""
+    _fake_version(monkeypatch, banner)
+    assert binaries.ffmpeg_rebases_a_negative_start() is rebases
+
+
+def test_a_version_that_cannot_be_read_is_no_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Never raises, like every other lookup here: no ffmpeg, a spawn that
+    fails, and a nonzero exit all read as None."""
+    monkeypatch.setattr(binaries, "ffmpeg_path", lambda: None)
+    binaries.ffmpeg_major_version.cache_clear()
+    assert binaries.ffmpeg_major_version() is None
+
+    _fake_version(monkeypatch, "ffmpeg version 9.0.1 Copyright", returncode=1)
+    assert binaries.ffmpeg_major_version() is None
+
+    monkeypatch.setattr(binaries, "ffmpeg_path", lambda: "ffmpeg")
+
+    def explode(argv: list[str], **kwargs: object) -> object:
+        raise OSError("no such binary")
+
+    monkeypatch.setattr(binaries.subprocess, "run", explode)
+    binaries.ffmpeg_major_version.cache_clear()
+    assert binaries.ffmpeg_major_version() is None

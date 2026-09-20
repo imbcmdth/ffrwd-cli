@@ -25,6 +25,8 @@ from ffrwd.probe import (
     RenditionMeta,
     StreamMeta,
     clear_cache,
+    graph_epoch,
+    graph_time,
     parse_webvtt,
     probe,
     probe_failure,
@@ -632,6 +634,76 @@ def test_per_type_index_counted_in_file_order(
     assert result is not None
     assert [s.type for s in result.streams] == ["video", "audio", "video"]
     assert [s.index for s in result.streams] == [0, 0, 1]
+
+
+# --- the file's clock and the graph's ----------------------------------------
+
+
+def test_the_epoch_is_where_the_file_starts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """ffmpeg subtracts the input's start on the way in, so that start is the
+    whole of the conversion -- and a file that opens at zero, the ordinary
+    case even when its video opens later than its sound, converts to itself.
+
+    A demuxer that reports no start states its times absolutely and is never
+    re-based: a WebVTT document is one.
+    """
+    assert graph_epoch(0.0) == 0.0
+    assert graph_epoch(1.510111) == 1.510111
+    assert graph_epoch(None) == 0.0
+
+
+@pytest.mark.parametrize(("rebases", "epoch"), [(True, -0.023), (False, 0.0)])
+def test_a_start_below_zero_follows_the_installed_ffmpeg(
+    monkeypatch: pytest.MonkeyPatch, rebases: bool, epoch: float
+) -> None:
+    """The one case ffmpeg builds disagree on. n8 re-bases an input whose
+    start is negative, moving every frame later by it; 9.0 leaves it alone. A
+    compile-time time is on the clock the installed ffmpeg keeps, because
+    that is the ffmpeg whose graph it will be compared against.
+    """
+    monkeypatch.setattr(
+        binaries, "ffmpeg_rebases_a_negative_start", lambda: rebases
+    )
+    assert graph_epoch(-0.023) == pytest.approx(epoch)
+
+
+def test_a_time_the_container_never_stated_stays_unstated() -> None:
+    """A chapter bound ffprobe did not report is NULL, and shifting a clock
+    does not invent one."""
+    assert graph_time(None, 1.5) is None
+    assert graph_time(2.0, 1.5) == pytest.approx(0.5)
+
+
+def test_chapter_times_are_taken_off_the_files_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A container states a chapter on its own clock. The file below opens
+    five seconds in, so its first chapter opens where the graph does -- at
+    zero -- and a `WHERE f.t BETWEEN c.start_t AND c.end_t` cuts the picture
+    the chapter names rather than one five seconds past it.
+    """
+    f = tmp_path / "x.mkv"
+    f.write_bytes(b"data")
+    _fake_ffprobe_present(monkeypatch)
+    _fake_run(
+        monkeypatch,
+        stdout=json.dumps(
+            {
+                "streams": [{"codec_type": "video"}],
+                "format": {"start_time": "5.000000"},
+                "chapters": [
+                    {"start_time": "5.000000", "end_time": "6.000000"},
+                    {"start_time": "6.000000", "end_time": "7.000000"},
+                ],
+            }
+        ),
+    )
+
+    result = probe(str(f))
+    assert result is not None
+    assert result.start_t == 5.0
+    assert [c.start_t for c in result.chapters] == [0.0, 1.0]
+    assert [c.end_t for c in result.chapters] == [1.0, 2.0]
 
 
 # --- chapters (monkeypatched, offline) ---------------------------------------

@@ -206,6 +206,12 @@ class ProbeResult:
     # "matroska,webm", ...), verbatim. It is what says a file IS a WebVTT
     # document and so has cues to read.
     format_name: str | None = None
+    # Where the file's own clock starts, from -show_format's `start_time`:
+    # the smallest start over its streams, None for a demuxer reporting none.
+    # ffmpeg subtracts it on the way in, so it is the whole of the difference
+    # between a time the FILE states and the time a filtergraph over it
+    # means. :func:`graph_epoch` is what reads it.
+    start_t: float | None = None
     # The document's cues, for a WebVTT input and nothing else.
     cues: list[CueMeta] = field(default_factory=list)
     # The files riding inside the container, in ffprobe's order. A file with
@@ -245,6 +251,45 @@ class ProbeFailure:
     timed_out: bool = False
     #: The ceiling it ran out of, in seconds, when `timed_out`.
     seconds: float | None = None
+
+
+# -- the file's clock and the graph's ---------------------------------------
+#
+# A time this module reads off a file is stated on the FILE's clock. ffmpeg
+# subtracts the input's start before any filter sees a frame, so a `trim`
+# written from such a time would be off by wherever the file starts. These
+# two are the conversion, and every compile-time time ffrwd reports goes
+# through them.
+
+
+def graph_epoch(start_t: float | None) -> float:
+    """What ffmpeg takes off an input's own times on the way into a graph.
+
+    ffmpeg re-bases an input on `ProbeResult.start_t` -- the smallest start
+    over the streams it reads -- so that is the epoch, and a file starting at
+    zero (the ordinary case) converts to itself.
+
+    A start BELOW zero is where builds disagree: ffmpeg 9.0 leaves such an
+    input alone, and n8 subtracts the negative start, moving every frame
+    later by it. The epoch follows whichever ffmpeg is installed, since that
+    is the one whose clock a compile-time read is on.
+
+    A demuxer that reports no start at all -- a WebVTT document is one --
+    states its times absolutely and is never re-based: the epoch is zero.
+    """
+    if start_t is None:
+        return 0.0
+    if start_t < 0 and not binaries.ffmpeg_rebases_a_negative_start():
+        return 0.0
+    return start_t
+
+
+def graph_time(t: float | None, epoch: float) -> float | None:
+    """`t`, a time the FILE states, as the time a filter over it means.
+
+    None passes through: a time a container did not state stays unstated.
+    """
+    return None if t is None else t - epoch
 
 
 # (realpath, mtime_ns, size, input flags)
@@ -1265,23 +1310,26 @@ def _parse_streams(data: object) -> ProbeResult | None:
         container_duration = None
         container_tags: dict[str, str] = {}
         format_name: str | None = None
+        start_t: float | None = None
         raw_format = data.get("format")
         if isinstance(raw_format, dict):
             container_duration = _float_opt(raw_format, "duration")
             container_tags = _tags(raw_format)
             format_name = _str_opt(raw_format, "format_name")
+            start_t = _float_opt(raw_format, "start_time")
 
         renditions: list[RenditionMeta] = []
         if format_name is not None and "hls" in format_name:
             renditions = _hls_renditions(data.get("programs"), by_global_index)
 
-        chapters = _parse_chapters(data.get("chapters"))
+        chapters = _parse_chapters(data.get("chapters"), graph_epoch(start_t))
 
         return ProbeResult(
             streams=streams,
             duration=container_duration,
             chapters=chapters,
             format_name=format_name,
+            start_t=start_t,
             tags=container_tags,
             attachments=attachments,
             renditions=renditions,
@@ -1290,8 +1338,12 @@ def _parse_streams(data: object) -> ProbeResult | None:
         return None
 
 
-def _parse_chapters(raw_chapters: object) -> list[ChapterMeta]:
+def _parse_chapters(raw_chapters: object, epoch: float = 0.0) -> list[ChapterMeta]:
     """``data["chapters"]`` as a list of :class:`ChapterMeta`, in ffprobe's order.
+
+    ffprobe states a chapter on the file's own clock, so `epoch` is taken off
+    both bounds -- :func:`graph_epoch` -- and the times a query reads are the
+    times its own filters mean.
 
     Permissive like everything else here: a malformed chapter entry is
     dropped rather than failing the whole probe -- the file's streams are
@@ -1308,8 +1360,8 @@ def _parse_chapters(raw_chapters: object) -> list[ChapterMeta]:
         chapters.append(
             ChapterMeta(
                 index=index + 1,
-                start_t=_float_opt(raw, "start_time"),
-                end_t=_float_opt(raw, "end_time"),
+                start_t=graph_time(_float_opt(raw, "start_time"), epoch),
+                end_t=graph_time(_float_opt(raw, "end_time"), epoch),
                 title=title,
             )
         )

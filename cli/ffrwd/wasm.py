@@ -1281,25 +1281,31 @@ _TYPE_SPECIFIERS: Mapping[StreamType, str] = {"video": "v", "audio": "a"}
 # wrong on a stream that reorders, so this is the one path for every
 # container.
 _KEYFRAMES_FILTER = "noise=drop=not(key)"
-# What puts the copy on the clock the rest of the query is on: the stream's
-# own presentation times, wherever inside its container they start.
+# What puts the copy on the clock a run-time filtergraph over the same stream
+# is on: ffmpeg's, not the container's.
 #
-# Two things would otherwise move them, and each loses exactly the offset that
-# a `trim` written from a reported time then lands short of. `-copyts` stops
-# ffmpeg subtracting the input's start time on the way in; `-avoid_negative_ts
-# disabled` stops the muxer shifting the stream so its first decode time is
-# zero.
+# ffmpeg subtracts an input's start time on the way in, so a `trim` written at
+# run time means a time counted from there rather than a time the file states.
+# This copy is read the same way -- no `-copyts` -- and the demuxer does that
+# arithmetic itself, on the same stream, for exactly the input options the
+# query wrote. Nothing here has to know what the start is, and an ffmpeg that
+# re-bases differently (a file starting below zero is where builds disagree)
+# re-bases the copy and the run the same way.
+#
+# What the MUXER would add afterwards is the part to refuse: `-avoid_negative_ts
+# disabled` stops it shifting the stream so its first decode time is zero,
+# which would lose the offset all over again for a stream that opens behind
+# its container.
 #
 # The clamp is what NUT can carry. A frame cannot hold a negative presentation
 # time at all, and a syncpoint before a negative decode time goes out as a
 # wrapped unsigned value that only a reader expecting the wrap can read, which
-# an older sidecar is not. Both floors sit at zero, which is where the
-# container itself starts presenting anyway.
+# an older sidecar is not. Both floors sit at zero, which is where the graph
+# itself starts anyway.
 #
 # Both halves of the clamp are spelled out: `setts` sets whichever of pts and
 # dts no expression names to its `ts` expression, which is the packet's DECODE
 # time -- naming dts alone silently overwrites pts with dts.
-_CLOCK_INPUT_FLAG = "-copyts"
 _CLOCK_MUXER_FLAGS = ("-avoid_negative_ts", "disabled")
 _CLOCK_FILTER = r"setts=pts=max(PTS\,0):dts=max(DTS\,0)"
 
@@ -1355,12 +1361,12 @@ def _bsf_chain(wants: SinkWants, attempt: int) -> str:
 
 
 def _keeps_the_clock(attempt: int) -> bool:
-    """Whether this attempt asks for the input's own times.
+    """Whether this attempt asks for the graph's times rather than the muxer's.
 
-    The clamp and the two flags stand or fall together: without the clamp a
+    The clamp and the muxer flag stand or fall together: without the clamp a
     negative timestamp reaches the muxer, and an ffmpeg with no `setts` would
-    write one the sidecar's reader cannot read. The last attempt drops all
-    three and takes whatever clock ffmpeg writes, which is what an ffmpeg too
+    write one the sidecar's reader cannot read. The last attempt drops both
+    and takes whatever clock the muxer writes, which is what an ffmpeg too
     old for `setts` can give.
     """
     return attempt < 2
@@ -1375,14 +1381,12 @@ def copy_argv(ffmpeg: str, read: PacketRead, attempt: int = 0) -> list[str]:
     hand a sink more than it asked for, so every widening is legal and only
     handing over less would not be.
 
-    The timestamps are the input's own, wherever its container starts them
-    (:data:`_CLOCK_FILTER`), which is what makes a time a sink reports the
-    time a `trim` written from it means.
+    The timestamps are the ones a run-time graph over the same stream is
+    handed (:data:`_CLOCK_MUXER_FLAGS`), which is what makes a time a sink
+    reports the time a `trim` written from it means.
     """
     keeps_the_clock = _keeps_the_clock(attempt)
     argv = [ffmpeg, "-v", "error"]
-    if keeps_the_clock:
-        argv.append(_CLOCK_INPUT_FLAG)
     argv += [*read.input_args, "-i", read.spec]
     argv += ["-map", f"0:{_TYPE_SPECIFIERS[read.kind]}:{read.index}"]
     if read.wants == "first":

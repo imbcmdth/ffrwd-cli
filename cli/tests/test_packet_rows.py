@@ -716,19 +716,23 @@ _CLAMP = r"setts=pts=max(PTS\,0):dts=max(DTS\,0)"
 )
 def test_what_each_want_copies(wants: str, expected: list[str]) -> None:
     """`wants` shapes the copy and nothing else. Every case keeps the clock
-    filter: the copy has to land on the timestamps the file presents, whatever
-    the module asked to be handed."""
+    filter: the copy has to land on the timestamps a run-time graph over the
+    same stream is handed, whatever the module asked to be handed.
+
+    No `-copyts`, which is what puts it there: ffmpeg subtracts the input's
+    start on the way in, at run time and here alike, so the demuxer does the
+    conversion and the read needs to know nothing about where the file starts.
+    """
     read = PacketRead(
         spec="f.mp4", input_args=("-r", "30"), kind="video", index=1,
         module=_MODULE, params="", wants=wants,  # type: ignore[arg-type]
     )
     argv = copy_argv("ffmpeg", read)
-    assert argv[:9] == [
-        "ffmpeg", "-v", "error", "-copyts", "-r", "30", "-i", "f.mp4", "-map"
-    ]
-    assert argv[9] == "0:v:1"
-    assert argv[10:-5] == expected
+    assert argv[:8] == ["ffmpeg", "-v", "error", "-r", "30", "-i", "f.mp4", "-map"]
+    assert argv[8] == "0:v:1"
+    assert argv[9:-5] == expected
     assert argv[-5:] == ["-avoid_negative_ts", "disabled", "-f", "nut", "pipe:1"]
+    assert "-copyts" not in argv
 
 
 def test_a_refused_copy_widens_rather_than_narrows() -> None:
@@ -751,10 +755,10 @@ def test_a_refused_copy_widens_rather_than_narrows() -> None:
 
 
 def test_the_last_attempt_drops_the_whole_clock_arrangement() -> None:
-    """The clamp and the two flags are one thing. Keeping the flags after the
+    """The clamp and the muxer flag are one thing. Keeping the flag after the
     clamp is gone would hand the muxer a timestamp it cannot write and the
     sidecar's reader one it cannot read, so an ffmpeg too old for `setts` gets
-    a plain copy on whatever clock ffmpeg picks."""
+    a plain copy on whatever clock the muxer picks."""
     read = PacketRead(
         spec="f.mp4", input_args=(), kind="video", index=0,
         module=_MODULE, params="", wants="all",
@@ -795,7 +799,7 @@ _EXEC_PROMPT = "a cat sat on the mat"
 # is: the picture behind the sound in a file that still starts at zero, a whole
 # clock carried forward, and a copy cut that opens on a packet presented before
 # zero. See `scripts/gen_fixtures.py`.
-_OFFSET_FIXTURES = ("keys-late.mkv", "keys-offset.mp4", "keys-cut.mp4")
+_OFFSET_FIXTURES = ("keys-late.mkv", "keys-offset.mp4", "keys-cut.mp4", "keys.ts")
 
 
 @pytest.fixture
@@ -822,12 +826,18 @@ def _table(sql: str) -> list[list[object]]:
     return compile_table_sql(sql)[0].result.rows
 
 
-def _keyframe_times(path: Path) -> list[float]:
-    """The presentation time of every keyframe, as ffmpeg's own decode reports
-    it -- the clock a `trim` in a query is written against."""
+def _file_times(path: Path, keyframes_only: bool = False) -> list[float]:
+    """The presentation time of every frame as the FILE states it, in shown order.
+
+    The container's own clock, which is what ffprobe reports and what a row
+    time is NOT: ffmpeg takes the input's start off before any filter runs.
+    Here to be printed beside the graph's times when an assertion fails, so a
+    miss says which of the two clocks moved.
+    """
     done = subprocess.run(
         [
-            "ffprobe", "-v", "error", "-select_streams", "v:0", "-skip_frame", "nokey",
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            *(["-skip_frame", "nokey"] if keyframes_only else []),
             "-show_entries", "frame=pts_time", "-of", "json", str(path),
         ],
         capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT, check=False,
@@ -836,47 +846,39 @@ def _keyframe_times(path: Path) -> list[float]:
     return [float(frame["pts_time"]) for frame in json.loads(done.stdout)["frames"]]
 
 
-def _graph_times(path: Path, limit: int = 6) -> list[str]:
+def _graph_times(path: Path, keyframes_only: bool = False) -> list[float]:
     """The pts a FILTERGRAPH is handed, which is what `trim` compares against.
 
-    Not always the file's own times: ffmpeg re-bases an input whose container
-    starts away from zero, and that is the difference a trim written from a
-    row's time would land on the wrong side of.
+    Not the file's own times: ffmpeg re-bases an input whose container starts
+    away from zero, and that difference is what a trim written from a row's
+    time would otherwise land on the wrong side of. Read off the same
+    one-video-stream mapping the trim below uses, because for a container
+    that carries discontinuities the start ffmpeg subtracts is the smallest
+    over the streams a command actually reads.
     """
     done = subprocess.run(
         ["ffmpeg", "-v", "info", "-i", str(path), "-map", "0:v:0",
          "-vf", "showinfo", "-f", "null", "-"],
         capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT, check=False,
     )
+    assert done.returncode == 0, done.stderr
     seen = []
     for line in done.stderr.splitlines():
-        if "pts_time:" in line:
-            seen.append(line.split("pts_time:")[1].split()[0])
-        if len(seen) >= limit:
-            break
+        if "pts_time:" not in line:
+            continue
+        if keyframes_only and "iskey:1" not in line:
+            continue
+        seen.append(float(line.split("pts_time:")[1].split()[0]))
     return seen
 
 
-def _frame_times(path: Path) -> list[float]:
-    """The presentation time of every frame, in the order they are shown."""
-    done = subprocess.run(
-        [
-            "ffprobe", "-v", "error", "-select_streams", "v:0",
-            "-show_entries", "frame=pts_time", "-of", "json", str(path),
-        ],
-        capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT, check=False,
-    )
-    assert done.returncode == 0, done.stderr
-    return [float(frame["pts_time"]) for frame in json.loads(done.stdout)["frames"]]
-
-
 def _frame_at(path: Path, time: float) -> int:
-    """Which frame of the file is shown at `time`, counted from its first.
+    """Which frame the graph shows at `time`, counted from the first it is handed.
 
     Counted rather than divided by a frame rate: a file whose pictures do not
     open at zero would otherwise be off by wherever it does open.
     """
-    times = _frame_times(path)
+    times = _graph_times(path)
     return min(range(len(times)), key=lambda i: abs(times[i] - time))
 
 
@@ -911,7 +913,7 @@ def test_keyframes_reads_the_keyframes_of_either_container(
     assert rows, "the fixture carries keyframes"
     assert all(row[2] is True for row in rows), rows
     read = [float(row[1]) for row in rows]  # type: ignore[arg-type]
-    truth = _keyframe_times(source)
+    truth = _graph_times(source, keyframes_only=True)
     # A host may hand a sink more than it asked for and never less, so what is
     # pinned is that every keyframe arrived, not that nothing else did.
     for expected in truth:
@@ -974,17 +976,18 @@ def test_a_search_over_the_vectors_a_read_returned(_require_everything: None) ->
 
 
 @pytest.mark.exec
-@pytest.mark.parametrize("name", ["keys.mp4", "keys.mkv", "keys-late.mkv"])
+@pytest.mark.parametrize("name", ["keys.mp4", "keys.mkv", *_OFFSET_FIXTURES])
 def test_a_reported_time_is_the_time_a_trim_means(
     _require_everything: None, name: str
 ) -> None:
-    """The clock rule. The fixture opens on a negative dts, which is what a
-    plain copy's timestamps get shifted by; a trim written from a time this
-    read reported lands on THAT frame of the source, byte for byte.
+    """The clock rule, over every shape whose clock is moved.
 
-    `keys-late.mkv` is the same encode with its picture behind its sound, so
-    the video does not open where the file does. A copy that re-bases on
-    either one of those lands somewhere else.
+    A trim written from a time this read reported lands on THAT keyframe of
+    the graph, byte for byte. The fixtures put the offset somewhere different
+    each time -- a picture behind its sound, a packager's whole-clock offset,
+    a copy cut into a packet presented before zero, an MPEG-TS remux whose
+    start the muxer chose -- and a read that re-based on any one of them
+    lands somewhere else.
     """
     clear_cache()
     source = _FIXTURES / name
@@ -1003,17 +1006,17 @@ def test_a_reported_time_is_the_time_a_trim_means(
          "-vf", f"trim=start={start}:end={start + 0.01},setpts=PTS-STARTPTS"]
     )
     whole = _framemd5(["-i", str(source), "-map", "0:v:0"])
-    times = _keyframe_times(source)
+    times = _graph_times(source, keyframes_only=True)
     # An empty trim means the reported time is not a time the graph has a
     # frame at, and the two clocks below say which of them moved.
     assert trimmed, (
         f"the trim keeps at least one frame\n"
         f"  reported  : {start}\n"
         f"  keyframes : {times[:6]}\n"
-        f"  the file  : {_frame_times(source)[:6]}\n"
-        f"  the graph : {_graph_times(source)}"
+        f"  the file  : {_file_times(source)[:6]}\n"
+        f"  the graph : {_graph_times(source)[:6]}"
     )
-    # The reported time is a keyframe of the source, and the frame a trim from
+    # The reported time is a keyframe the graph has, and the frame a trim from
     # it opens on is that keyframe -- not the one a shifted clock would name.
     at = min(range(len(times)), key=lambda i: abs(times[i] - start))
     assert abs(times[at] - start) < 0.002, (start, times)
@@ -1023,21 +1026,23 @@ def test_a_reported_time_is_the_time_a_trim_means(
 @pytest.mark.exec
 @pytest.mark.parametrize("name", _OFFSET_FIXTURES)
 @pytest.mark.parametrize("wants", ["all", "keyframes", "first"])
-def test_a_read_stays_on_the_clock_its_container_starts(
+def test_a_read_stays_on_the_clock_the_graph_is_handed(
     _require_everything: None, name: str, wants: str
 ) -> None:
-    """A stream that does not open at zero is read on ITS times, not on times
-    counted from its own first packet.
+    """A stream that does not open at zero is read on the times a run-time
+    graph over it is handed, not on times counted from its own first packet
+    and not on the times its container states.
 
     Every shape here is the same encode as `keys.mp4` with its clock moved,
     and every one of them is ordinary: a picture behind its sound, a packager's
-    timestamp offset, a copy cut. What the copy hands the module has to be what
-    ffprobe reads off the file, whichever of the three `wants` shaped it -- the
-    amount of the stream a module asked for is not a clock.
+    timestamp offset, a copy cut, an MPEG-TS remux. What the copy hands the
+    module has to be what a filter over that stream would see, whichever of
+    the three `wants` shaped it -- the amount of the stream a module asked for
+    is not a clock.
 
     A copy cut opens on a packet presented BEFORE zero, which is the one time
     a NUT pipe cannot carry; that one packet arrives at zero instead, which is
-    where the container itself already starts presenting.
+    where the graph itself already starts.
     """
     clear_cache()
     source = _FIXTURES / name
@@ -1051,9 +1056,9 @@ def test_a_read_stays_on_the_clock_its_container_starts(
     seen = [float(cast(float, row["start_t"])) for row in read]
     assert seen, (name, wants)
     if wants == "first":
-        assert abs(seen[0] - _frame_times(source)[0]) < 0.002, (seen, name)
+        assert abs(seen[0] - _graph_times(source)[0]) < 0.002, (seen, name)
         return
-    for expected in _keyframe_times(source):
+    for expected in _graph_times(source, keyframes_only=True):
         assert any(abs(expected - time) < 0.002 for time in seen), (expected, seen)
 
 
