@@ -119,6 +119,12 @@ output is plain ffmpeg, so the two mix freely in a script.
   Some sources carry streams with no detectable codec (certain DASH
   text tracks, for example). Selecting one is a compile error; table
   queries over the same source still work.
+- **A rows function's own rows cannot be narrowed.** The node that
+  narrows rows at run time rides the frames a producing module reads
+  them off, so a `WHERE` belongs on that module's column. A rows
+  function has no frames: narrowing its argument is refused (it reads
+  every row the module produced), and so is a gather over its result.
+  Narrow inside the module, or at whatever reads the rows.
 - **`merge_cues` reads a column or a producer's call, not a name for
   one.** Over rows a file carries it takes a record array column (with
   or without a track subscript) or an `ARRAY(SELECT ... WHERE ...)`

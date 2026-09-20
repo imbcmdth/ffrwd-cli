@@ -10625,8 +10625,8 @@ class _Lowerer:
                     "reads them",
                     written,
                     fallback=select,
-                    hint="a rows function reads every row the module produced; "
-                    "drop the WHERE, or narrow the rows the function returns",
+                    hint="a rows function reads every row the module produced "
+                    "and narrows none of them; drop the WHERE",
                 )
             if written.meta.get(ROW_MERGE) is not None:
                 raise _error(
@@ -13468,6 +13468,31 @@ class _Lowerer:
             wired.append({"arg": param.name, "path": path})
         return wired
 
+    def _packets_rows_record(
+        self, argument: exp.Expr
+    ) -> tuple[str, Annotation] | None:
+        """What a packet filter's rows argument hands over: whose rows, and their record.
+
+        The two run-time row producers, exactly as a rows function reads
+        them: a stream module's annotation column -- which is what a gather
+        over one has become by the time this runs -- or a rows function's
+        result, which is that column one module later and may itself be
+        another rows function's argument, however deep the chain. Where the
+        chain actually starts is settled when the argument lowers; this
+        names the record that reaches the filter.
+        """
+        found = annotation_projection(argument, self.res.wasm)
+        if found is not None:
+            producer = found[1]
+            assert producer.emits is not None  # what annotation_projection selects on
+            return producer.name, producer.emits
+        called = self._rows_call(argument)
+        if called is not None:
+            rows_function = called[1]
+            assert rows_function.returns_rows is not None  # what is_rows selects on
+            return rows_function.name, rows_function.returns_rows
+        return None
+
     def _check_packets_rows_argument(
         self,
         declared: WasmFunction,
@@ -13478,33 +13503,34 @@ class _Lowerer:
     ) -> None:
         """One rows argument against the column it fills.
 
-        It has to be a module's annotation column -- the only rows a query
-        can write to a file before the filter reads them -- and its record
-        has to CARRY the fields the parameter declares. A producer emitting
-        more than the filter reads is fine: the whole record is written to
-        the rows file either way, and the filter reads the fields it named.
+        It has to be rows a module writes while the run goes on -- the only
+        rows a query can put in a file before the filter reads them -- and
+        the record reaching the filter has to CARRY the fields the parameter
+        declares. A producer emitting more than the filter reads is fine:
+        the whole record is written to the rows file either way, and the
+        filter reads the fields it named.
         """
-        found = annotation_projection(_unwrap(argument), self.res.wasm)
+        found = self._packets_rows_record(_unwrap(argument))
         if found is None:
             raise _error(
                 ErrorCode.UDF_ARG_TYPE,
                 f"{declared.name}() takes '{param.name}' as {param.type}, and "
-                "its argument produces no annotation column",
+                "its argument is not rows a module writes",
                 argument,
                 fallback=node,
-                hint=f"write the column a module returns: {declared.name}"
-                "(<stream>, <producer>(<stream>).<column>, ...), or NULL for "
-                "no rows at all",
+                hint=f"write the column a module returns, or a rows function "
+                f"over one: {declared.name}(<stream>, "
+                "<producer>(<stream>).<column>, ...), or NULL for no rows at "
+                "all",
             )
-        producer = found[1]
-        assert producer.emits is not None  # what annotation_projection selects on
+        producer_name, record = found
         assert param.annotation is not None  # `reads_params` selected on it
-        if not _annotation_covers(param.annotation, producer.emits):
+        if not _annotation_covers(param.annotation, record):
             raise _error(
                 ErrorCode.UDF_ARG_TYPE,
                 f"{declared.name}() takes '{param.name}' as {param.type}, and "
-                f"{producer.name}() returns '{producer.emits.name}' as "
-                f"{producer.emits.written}",
+                f"{producer_name}() returns '{record.name}' as "
+                f"{record.written}",
                 argument,
                 fallback=node,
                 hint="every field the filter names has to be one the producer's "

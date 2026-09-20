@@ -110,10 +110,19 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   column carries `DEFAULT NULL`, and such a column starts no run of
   defaults, so the values that configure the filter may follow it and
   still be required.
-  A rows column names the fields the filter READS, and the producer's
-  record has to carry each of them with the same type. A producer writing
-  more than that is allowed, and its whole record goes to the document
-  either way.
+  An argument is the rows a module WRITES while the run goes on, in either
+  of the two spellings a rows function reads: the annotation column a stream
+  module produces, gathered or not, or a rows function's own result over one
+  -- `weave(f.video[1], embed(transcribe(f.audio[1]).words))` -- however many
+  rows functions deep. The chain is planned as what it is, each module
+  feeding the next, and the last one's rows are what the document holds.
+  Rows the compiler already has, a CTE column bound to any of this, and
+  anything that is not rows at all are refused.
+  A rows column names the fields the filter READS, and the record that
+  reaches it -- the rows function's return where there is one, the
+  producer's otherwise -- has to carry each of them with the same type. A
+  producer writing more than that is allowed, and its whole record goes to
+  the document either way.
   A rows document is named `ffrwd:rows:<n>` in the compiled command, at both
   ends, so the output is the same text on any machine; `ffrwd run` resolves
   each to a file in the run's own temporary directory and removes it when
@@ -123,7 +132,7 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   destination that places no encoder (a frame sink, a rows file, a table
   query), a second column of the same kind at a destination whose encoder
   options went upstream with the filter, `two_pass`, a manifest destination,
-  a rows argument that is not a module's annotation column, and rows whose
+  a rows argument that is not rows a module writes, and rows whose
   producer cannot be put in a stage of its own. See
   [known gaps](known_gaps.md).
 - A **sink `LANGUAGE wasm` function** (`RETURNS sink`) is a COPY
@@ -196,13 +205,17 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   produced - `fauxlate(captions(f.video[1]).cues)` - and its result
   is a row column of the declared type, standing wherever the
   producer's did: projected, it is a subtitle track; at a `.ndjson`
-  destination it is the rows. It runs in the producer's own sidecar
+  destination it is the rows; as a packet filter's rows argument it is
+  the document the filter reads. Another rows function reads it too, so
+  a chain of them is one chain of modules. It runs in the producer's own sidecar
   process, fed by the rows as they are written; the declared
   parameter is checked against what the module reads and the return
   against what it writes, and the producer's record has to be the one
   the function reads. Rows that exist before the run - a file's cues -
   are not its business: rewrite those one row at a time with the value
-  form. Recipe
+  form. Its own rows are not narrowed: the node that narrows rows rides
+  the frames a producer reads them off, and there are none here, so a
+  gather over the result is refused saying so. Recipe
   [113](examples.md#113-translate-captions-as-they-are-produced).
 - **`cue[]`** is shorthand for the cue record's own shape,
   `STRUCT(text text, start_t number, end_t number)[]`, wherever an
@@ -216,7 +229,10 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   subtitle track, a `.ndjson` file. Nothing counts those rows at
   compile time, so unlike every other `ARRAY(SELECT ...)` this one is
   not evaluated: it compiles to one more node in the module network,
-  fed by the call that produced the rows.
+  fed by the call that produced the rows. That node rides those frames,
+  so the gather reads a producing module's own column and nothing
+  else - a rows function's result has no frames to put one on, and a
+  gather over one is refused by name.
   The subquery selects the whole row (`SELECT r`) and carries a `FROM`
   and a `WHERE` and nothing else. The predicate holds `=`, `<>`, `<`,
   `<=`, `>`, `>=`, `AND`, `OR`, `NOT` and parentheses over the row's

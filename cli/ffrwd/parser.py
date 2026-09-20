@@ -5426,6 +5426,7 @@ class _Resolver:
         source = arguments[0] if len(arguments) == 1 else None
         found = annotation_projection(source, self.wasm)
         if found is None or not isinstance(source, exp.Expr):
+            self._no_gather_over_rows_function(source, array_node)
             return False
         emits = found[1].emits
         assert emits is not None  # what annotation_projection matched on
@@ -5440,6 +5441,33 @@ class _Resolver:
         if predicate is not None:
             projection.meta[ROW_PREDICATE] = predicate
         return True
+
+    def _no_gather_over_rows_function(self, source: object, fallback: exp.Expr) -> None:
+        """Refuse a gather over a ROWS function's result, by what it is.
+
+        The narrowing a gather asks for is a node the sidecar hosts beside the
+        module reading rows off its frames, on the frames themselves. A rows
+        function's result rides no frames, so there is nowhere to put one, and
+        without this the gather falls through to the compile-time hoist and is
+        refused for something else entirely -- rows nobody has counted, spliced
+        into a FROM that cannot hold them.
+        """
+        call = _unwrap_paren(source) if isinstance(source, exp.Expr) else None
+        if not isinstance(call, exp.Anonymous):
+            return
+        declared = self.wasm.get(str(call.name).lower())
+        if declared is None or not declared.is_rows:
+            return
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"{declared.name}() is a rows function, and its rows cannot be "
+            "narrowed",
+            call,
+            fallback=fallback,
+            hint="a WHERE over a module's rows is hosted beside the module "
+            "that reads them off its frames; what a rows function hands back "
+            "reaches its destination whole",
+        )
 
     def _row_gather_alias(self, unnest: exp.Unnest, fallback: exp.Expr) -> str:
         """The name the gathered rows go by, which its predicate reads them under."""

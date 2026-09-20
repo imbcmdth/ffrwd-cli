@@ -14437,7 +14437,7 @@ def test_a_rows_argument_that_produces_no_column_is_refused() -> None:
             describes={PACKETS_MODULE: _packets_described(reads_rows=True)},
         )
     assert caught.value.code is ErrorCode.UDF_ARG_TYPE
-    assert "produces no annotation column" in caught.value.message
+    assert "is not rows a module writes" in caught.value.message
 
 
 WEAVE_SUBSET = (
@@ -14488,6 +14488,167 @@ def test_a_rows_argument_the_producer_does_not_carry_is_refused() -> None:
         assert err.code is ErrorCode.UDF_ARG_TYPE
         assert "weave() takes 'notes' as" in err.message
         assert err.hint is not None and "extra fields are allowed" in err.hint
+
+
+# --------------------------------------------------------------------------
+# A rows argument that comes THROUGH a rows module: rows in, rows out, no
+# stream, so the chain ends in the document the filter reads.
+# --------------------------------------------------------------------------
+
+EMBED_MODULE = "embed_notes.wasm"
+ROWS_ECHO_MODULE = "echo_notes.wasm"
+
+_NOTE_ROW_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "properties": {"pts": {"type": "integer"}, "note": {"type": "string"}},
+}
+
+EMBED = (
+    "CREATE FUNCTION embed(rows STRUCT(pts number, note text)[])\n"
+    "RETURNS STRUCT(pts number, note text, vector vector)[]\n"
+    f"  AS '{EMBED_MODULE}', 'embed_notes' LANGUAGE wasm;\n"
+)
+
+
+def _embed_described() -> Described:
+    """A rows module's describe: the record it reads, and the wider one it writes."""
+    return Described(
+        world=WORLDS[-1],
+        name="embed_notes",
+        version="0.1.0",
+        params_schema={"type": "object", "additionalProperties": False},
+        rows_schema={
+            "type": "object",
+            "properties": {
+                "pts": {"type": "integer"},
+                "note": {"type": "string"},
+                "vector": {"type": "array", "items": {"type": "number"}},
+            },
+        },
+        rows_module=True,
+        input_rows_schema=_NOTE_ROW_SCHEMA,
+    )
+
+
+def _echo_described() -> Described:
+    """A rows module that hands its rows back unchanged, for a chain of two."""
+    return Described(
+        world=WORLDS[-1],
+        name="echo_notes",
+        version="0.1.0",
+        params_schema={"type": "object", "additionalProperties": False},
+        rows_schema=_NOTE_ROW_SCHEMA,
+        rows_module=True,
+        input_rows_schema=_NOTE_ROW_SCHEMA,
+    )
+
+
+def _embedding_graph(declare: str, sql: str) -> Graph:
+    return lower(
+        resolve(parse(ROWS_PRODUCER + EMBED + declare + sql)),
+        _row_probes(_track("video", 0), _track("audio", 0)),
+        registry=_snapshot_registry(),
+        describes={
+            ROWS_MODULE: _rows_producer_described(),
+            EMBED_MODULE: _embed_described(),
+            ROWS_ECHO_MODULE: _echo_described(),
+            PACKETS_MODULE: _packets_described(reads_rows=True),
+        },
+    )
+
+
+def test_a_rows_argument_may_come_through_a_rows_module() -> None:
+    """A rows function's result is the producer's column one module later, so
+    it fills a rows argument the same way: the rows node is wired to the
+    producer by a rows edge, carries no frames, and its rows are what the
+    document holds."""
+    g = _embedding_graph(
+        WEAVE_ONE,
+        "COPY (SELECT weave(f.video[1], embed(shots(f.video[1]).notes)) "
+        "FROM input('f.mp4') f) TO 'out.mp4'",
+    )
+    (filter_node,) = g.packet_filter_rows
+    assert g.packet_filter_rows[filter_node] == [
+        {"arg": "notes", "path": "ffrwd:rows:0"}
+    ]
+    (writer,) = [n for n, sink in g.rows_sinks.items() if sink.path]
+    # The document is written by the rows module, not by the producer under it.
+    assert g.nodes[writer].filter == EMBED_MODULE
+    (producer,) = g.nodes[writer].rows_inputs
+    assert g.nodes[producer].filter == ROWS_MODULE
+    assert not g.nodes[writer].inputs
+
+
+def test_two_rows_arguments_may_take_different_routes_to_one_filter() -> None:
+    """One argument straight off the producing module, the other through a
+    rows module over the same shape: two documents, and the filter reads both
+    the same way."""
+    g = _embedding_graph(
+        WEAVE_TWO,
+        "COPY (SELECT weave(f.video[1], shots(f.video[1]).notes, "
+        "embed(shots(ffmpeg.hflip(f.video[1])).notes)) "
+        "FROM input('f.mp4') f) TO 'out.mp4'",
+    )
+    (filter_node,) = g.packet_filter_rows
+    assert g.packet_filter_rows[filter_node] == [
+        {"arg": "faces", "path": "ffrwd:rows:0"},
+        {"arg": "words", "path": "ffrwd:rows:1"},
+    ]
+    writers = {g.rows_sinks[n].path: g.nodes[n].filter for n in g.rows_sinks}
+    assert writers == {"ffrwd:rows:0": ROWS_MODULE, "ffrwd:rows:1": EMBED_MODULE}
+
+
+def test_a_chain_of_rows_modules_ends_in_the_filters_document() -> None:
+    """Each rows function reads the one before it, and only the last one's
+    rows are written down."""
+    g = _embedding_graph(
+        "CREATE FUNCTION again(rows STRUCT(pts number, note text)[])\n"
+        "RETURNS STRUCT(pts number, note text)[]\n"
+        f"  AS '{ROWS_ECHO_MODULE}', 'echo_notes' LANGUAGE wasm;\n" + WEAVE_ONE,
+        "COPY (SELECT weave(f.video[1], embed(again(shots(f.video[1]).notes))) "
+        "FROM input('f.mp4') f) TO 'out.mp4'",
+    )
+    (writer,) = [n for n, sink in g.rows_sinks.items() if sink.path]
+    assert g.nodes[writer].filter == EMBED_MODULE
+    (middle,) = g.nodes[writer].rows_inputs
+    assert g.nodes[middle].filter == ROWS_ECHO_MODULE
+    (producer,) = g.nodes[middle].rows_inputs
+    assert g.nodes[producer].filter == ROWS_MODULE
+
+
+def test_a_rows_module_writing_less_than_the_filter_reads_is_refused() -> None:
+    """The record checked is the one that reaches the filter -- the rows
+    function's return, not what the producer under it emitted."""
+    narrow = (
+        "CREATE FUNCTION weave(v video_stream,\n"
+        "                      notes STRUCT(pts number, score number)[])\n"
+        "  RETURNS packets\n"
+        f"  AS '{PACKETS_MODULE}', 'weave' LANGUAGE wasm;\n"
+    )
+    with pytest.raises(FfrwdError) as caught:
+        _embedding_graph(
+            narrow,
+            "COPY (SELECT weave(f.video[1], embed(shots(f.video[1]).notes)) "
+            "FROM input('f.mp4') f) TO 'out.mp4'",
+        )
+    assert caught.value.code is ErrorCode.UDF_ARG_TYPE
+    assert "embed() returns" in caught.value.message
+
+
+def test_a_gather_over_a_rows_functions_result_is_refused_by_name() -> None:
+    """There is nowhere to host the narrowing: the node that does it rides
+    the frames a producer reads rows off, and a rows function has none."""
+    with pytest.raises(FfrwdError) as caught:
+        _embedding_graph(
+            WEAVE_ONE,
+            "COPY (SELECT weave(f.video[1], ARRAY(SELECT r FROM "
+            "unnest(embed(shots(f.video[1]).notes)) r WHERE r.pts > 0)) "
+            "FROM input('f.mp4') f) TO 'out.mp4'",
+        )
+    assert caught.value.code is ErrorCode.UNSUPPORTED_SQL
+    assert caught.value.message == (
+        "embed() is a rows function, and its rows cannot be narrowed"
+    )
 
 
 def test_a_packets_call_counts_its_rows_arguments_as_arguments() -> None:

@@ -41,6 +41,7 @@ members = [
     "source-replay-0150",
     "source-files",
     "fauxlate",
+    "embed-notes",
     "post-rows",
     "broken-audio",
     "adapted-020",

@@ -443,6 +443,72 @@ def test_two_rows_arguments_arrive_tagged_with_the_one_they_filled(
     assert b"words:b-0" in written, "the second argument's note is not tagged with it"
 
 
+_EMBED_NOTES = _BUILT / "embed_notes.wasm"
+
+_EMBED = (
+    "CREATE FUNCTION embed(rows STRUCT(pts number, note text)[])\n"
+    "RETURNS STRUCT(pts number, note text, vector vector)[]\n"
+    f"  AS '{_EMBED_NOTES.as_posix()}', 'embed_notes' LANGUAGE wasm;\n"
+)
+
+
+def test_a_rows_argument_may_arrive_through_a_rows_module(tmp_path: Path) -> None:
+    """One argument straight off the producing module and one through a rows
+    module over the same shape. The rows module adds a vector beside each row
+    and marks the note, so the bytes in the stream say which of the two routes
+    each note took -- and the filter reads both documents the same way."""
+    _require_weaving()
+    if not _EMBED_NOTES.exists():
+        pytest.skip(
+            f"module missing: {_EMBED_NOTES} (cargo build --target "
+            f"wasm32-wasip2 --release, from {_SIDECAR_MODULES})"
+        )
+    out = tmp_path / "embedded.mp4"
+    _run(
+        _NOTES
+        + _EMBED
+        + _WEAVE_TWO
+        + "COPY (\n"
+        + "  SELECT weave(f.video[1],\n"
+        + "               notes(f.video[1], 'a').seen,\n"
+        + "               embed(notes(ffmpeg.hflip(f.video[1]), 'b').seen))\n"
+        + f"  FROM input('{_AV.as_posix()}') f\n"
+        + f") TO '{out.as_posix()}'"
+    )
+
+    written = _video_bytes(out)
+    assert b"faces:a-0" in written, "the straight argument's note is not tagged"
+    # `e-` is what the rows module puts in front of every note it read.
+    assert b"words:e-b-0" in written, "the note never went through the rows module"
+
+
+def test_a_rows_module_writes_the_document_the_filter_reads() -> None:
+    """The chain is planned as what it is: the producer feeds the rows module
+    over a rows edge inside one sidecar, and the document the filter reads is
+    the rows module's own output."""
+    _require_weaving()
+    if not _EMBED_NOTES.exists():
+        pytest.skip(f"module missing: {_EMBED_NOTES}")
+    compiled = compile_all(
+        _NOTES
+        + _EMBED
+        + _WEAVE_ONE
+        + "COPY (\n"
+        + "  SELECT weave(f.video[1], embed(notes(f.video[1]).seen))\n"
+        + f"  FROM input('{_AV.as_posix()}') f\n"
+        + ") TO 'out.mp4'"
+    )
+    plan = compiled.plan
+    assert plan is not None
+    shown = render_plan(plan, sidecar_argv=wasm.shown_argv)
+    assert "-m " + _EMBED_NOTES.as_posix() + " -rows-from 0" in shown
+    assert "-f ndjson ffrwd:rows:0" in shown
+    assert "-rows-in seen=ffrwd:rows:0" in shown
+    # Still two stages: a document is a file, and a file is finished before
+    # whatever reads it starts.
+    assert len(plan.stages) == 2
+
+
 def test_a_rows_document_is_a_placeholder_until_a_run_resolves_it() -> None:
     """A compile prints the same text on every machine: the document is
     named `ffrwd:rows:<n>` at both ends, and the run is what turns it into a
