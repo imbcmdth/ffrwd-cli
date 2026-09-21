@@ -326,6 +326,7 @@ from ffrwd.parser import (
     _ARITHMETIC,
     _ARITHMETIC_NAMES,
     _BUILTIN_VALUE_FUNCS,
+    _COLUMN_QUALIFIERS,
     _REMOVED_FRAME,
     _VECTOR_BUILTIN_ARITY,
     FILTER_NAMESPACE,
@@ -1710,9 +1711,6 @@ def _sink_stream_count(node: exp.Expr, arguments: int) -> int:
     """
     written = node.meta.get(SINK_STREAMS)
     return written if isinstance(written, int) else arguments
-
-
-_COLUMN_QUALIFIERS = ("catalog", "db", "table", "this")
 
 
 def _written_path(column: exp.Column) -> str:
