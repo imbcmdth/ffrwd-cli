@@ -147,8 +147,16 @@ output is plain ffmpeg, so the two mix freely in a script.
   `TO` reads `x.n` like any other row column; the same goes for a
   `GROUP BY` over a CTE column. A body that selects streams alone still
   has nothing to name files with, and the `ROW_COUNT_MISMATCH` says so.
-  A table-returning function is a CTE by the time lowering sees it, so
-  its `RETURNS TABLE(n number, ...)` column works the same way.
+  A table-returning function contributes rows the same way, so its
+  `RETURNS TABLE(n number, ...)` column names files like any other.
+- **A fan-out rebuilds what its rows share.** `TO (expression)` writes
+  one file per row and builds each file's chain on its own, so an
+  upstream every row reads - a `scale` ahead of the rungs, a wasm
+  module ahead of them - appears once per file rather than once with a
+  `split`. The other two multi-row destinations do share it: a manifest
+  (`format 'hls'` / `'dash'`) and a `RETURNS sink` build the relation
+  once. Reach for one of those where the shared work is expensive, or
+  bind it in a CTE column, which is built once whatever reads it.
 - **Filter outputs carry no facts.** Metadata columns describe probed
   input streams only; a filter's output is a stream with no readable
   `channel_layout`, `width`, `codec` and so on, even where ffmpeg
