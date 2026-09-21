@@ -2517,12 +2517,11 @@ def test_a_ladder_function_writes_its_rungs_at_the_widths_it_declared(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The ladder as a FUNCTION, run for real: three rungs, each at the width
-    its own row named, in the order the body wrote them.
+    and the bitrate its own row named, in the order the body wrote them.
 
-    The rungs live in the function; the caller hands it one stream and reads
-    `rung` back to pick each rung's bitrate. The shared argument is the point
-    of the shape, so the graph is checked too -- one `fps` feeding one split,
-    not one per rung.
+    The rungs live in the function, settings and all, and the COPY reads them
+    off the alias. The shared argument is the point of the shape, so the graph
+    is checked too -- one `fps` feeding one split, not one per rung.
     """
     _require_fixture(_AV)
     monkeypatch.chdir(tmp_path)
@@ -2530,17 +2529,17 @@ def test_a_ladder_function_writes_its_rungs_at_the_widths_it_declared(
     dest.parent.mkdir()
     query = (
         "CREATE FUNCTION ladder(v video_stream)"
-        " RETURNS TABLE(v video_stream, rung number) AS $$"
-        "  SELECT scale(v, r.width, -2), r.rung"
-        "  FROM unnest(ARRAY[STRUCT(1 AS rung, 320 AS width),"
-        "                    STRUCT(2 AS rung, 240 AS width),"
-        "                    STRUCT(3 AS rung, 160 AS width)]) r"
+        " RETURNS TABLE(v video_stream, rung number, bitrate text) AS $$"
+        "  SELECT scale(v, r.width, -2), r.rung, r.bitrate"
+        "  FROM unnest(ARRAY[STRUCT(1 AS rung, 320 AS width, '500k' AS bitrate),"
+        "                    STRUCT(2 AS rung, 240 AS width, '350k' AS bitrate),"
+        "                    STRUCT(3 AS rung, 160 AS width, '250k' AS bitrate)]) r"
         "$$ LANGUAGE sql;"
         f" COPY (SELECT l.v FROM input('{_sql_path(_AV)}') f,"
         "         ladder(fps(f.video[1], 15)) l)"
         " TO 'out/master.m3u8' WITH (format 'hls', hls_time 2,"
         "   hls_playlist_type 'vod', video_codec 'libx264', preset 'ultrafast',"
-        "   video_bitrate ARRAY['500k', '350k', '250k'][l.rung])"
+        "   video_bitrate l.bitrate, maxrate l.bitrate)"
     )
     args = build_ffmpeg_args(emit(compile_sql(query)))
     graph = " ".join(args)
@@ -2548,6 +2547,11 @@ def test_a_ladder_function_writes_its_rungs_at_the_widths_it_declared(
     assert graph.count("split=3") == 1
     assert graph.count("scale=width=") == 3
     assert [args[args.index(f"-b:{n}") + 1] for n in range(3)] == [
+        "500k",
+        "350k",
+        "250k",
+    ]
+    assert [args[args.index(f"-maxrate:{n}") + 1] for n in range(3)] == [
         "500k",
         "350k",
         "250k",
