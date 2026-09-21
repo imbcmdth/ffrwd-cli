@@ -4251,9 +4251,11 @@ class _Expander:
         """
         roots: list[exp.Expr] = [host]
         statement = self.statement
-        outermost = next(
-            (node for node in _preorder(statement) if isinstance(node, exp.Select)), None
-        ) if statement is not None else None
+        outermost = (
+            next((n for n in _preorder(statement) if isinstance(n, exp.Select)), None)
+            if statement is not None
+            else None
+        )
         if isinstance(statement, exp.Copy) and outermost is host:
             roots += [
                 node
