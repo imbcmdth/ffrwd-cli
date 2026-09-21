@@ -71,9 +71,10 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   [139](examples.md#139-ship-the-ladder-as-a-function)). The body is
   private either way: its parameters and its own aliases are all it
   sees, and an outer alias spelling one of them changes nothing. A
-  stream argument is the outer row's, built once whatever the body's
-  row count, so `ladder(blur(f.video[1]))` blurs once and splits into
-  the rungs.
+  stream argument is the outer row's, so `ladder(blur(f.video[1]))`
+  blurs once and splits into the rungs - under a fan-out `TO`, which
+  builds each file on its own, it blurs per file
+  ([known_gaps.md](known_gaps.md)).
 - A **`LANGUAGE wasm` function** names a wasm module and one export
   in it, and is called like any other function. It has no body to
   inline: the module runs in the `ffrwd-wasm` sidecar, so a query

@@ -501,8 +501,10 @@ _DIALECT_TAIL = """\
   outer row, and a three-rung ladder over a two-track input is six rows.
   An argument reading an alias written after the call, or one written
   nowhere, is `UNKNOWN_ALIAS` naming the function and the argument. A
-  stream argument is the outer row's and is built once for all the
-  body's rows, so `ladder(blur(f.video[1]))` blurs once and splits.
+  stream argument is the outer row's, so `ladder(blur(f.video[1]))`
+  blurs once and splits into the rungs at a manifest or a `RETURNS
+  sink` destination; a fan-out `TO` builds each file on its own and
+  blurs per file.
   `LATERAL fn(...) t` and `CROSS JOIN LATERAL fn(...) t` are accepted
   spellings of the same thing and add nothing; the keyword is refused
   before a CTE or view name, under an outer join, and with
