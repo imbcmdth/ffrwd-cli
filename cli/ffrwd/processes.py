@@ -1258,10 +1258,31 @@ class _Partitioner:
             if self.external[name] or node.filter not in SPLIT_FILTERS:
                 continue
             seen.add(name)
-            if self.depth[name] < depth:
+            if self.depth[name] < depth and not self._module_fed(name):
                 found.add(name)
             stack.extend(node.inputs)
         return found
+
+    def _module_fed(self, name: str) -> bool:
+        """True when this split's frames reach it from a module.
+
+        Such a split is never absorbed. A module's frames leave its sidecar on
+        ONE pipe, and absorbing the split would make this process a second
+        reader of that pipe; there is no input underneath to map instead, which
+        is the whole reason a source-fed split comes along.
+        """
+        while True:
+            inputs = self.g.nodes[name].inputs
+            if not inputs:
+                return False
+            producer = _ref_node(inputs[0])
+            if producer is None or producer not in self.g.nodes:
+                return False
+            if self.external[producer]:
+                return True
+            if self.g.nodes[producer].filter not in SPLIT_FILTERS:
+                return False
+            name = producer
 
     def _ancestors(self, refs: Iterable[FrameRef], depth: int) -> list[str]:
         """Node ids at `depth` that `refs` need, in topological order.
@@ -1359,6 +1380,40 @@ class _Partitioner:
             elif producer not in inside:
                 outside.add(ref)
         return frozenset(aliases), frozenset(outside)
+
+    # -- one reader per consume-once producer
+
+    def _once_reader(
+        self, target: str, depth: int, nodes: Sequence[str], ref: FrameRef
+    ) -> _Pending | None:
+        """The reader this leg joins because both read one module's output.
+
+        A module's frames leave its sidecar on its own stdout, once: a second
+        leg over the same output joins the first rather than asking the sidecar
+        to write it again, and the joined reader splits the stream and hands
+        each consumer a pipe of its own -- the road a live input's readers
+        already take, and the one a source fan-out takes through
+        :meth:`_sibling_feeder`.
+
+        The legs must read exactly alike, as a sibling feeder's do, so joining
+        them changes nothing about what is opened or consumed. What it drops is
+        that method's requirement that both feed the SAME consumer: a module's
+        pad cannot be read twice whoever the two readers feed.
+        """
+        leg = self._feeder_reads(nodes, [ref])
+        if not any(self._from_module(other) for other in leg[1]):
+            return None
+        for process in self.pending:
+            if process.id == target or process.depth != depth:
+                continue
+            if self._feeder_reads(process.nodes, process.pipes) == leg:
+                return process
+        return None
+
+    def _from_module(self, ref: FrameRef) -> bool:
+        """True when `ref` is a pad of a node only a sidecar can run."""
+        producer = _ref_node(ref)
+        return producer is not None and self.external.get(producer, False)
 
     # -- one reader per live input
 
@@ -1669,17 +1724,22 @@ class _Partitioner:
         Two external nodes join when one reads the other directly. A `split`
         between them joins too, and dissolves when the region is built: the
         network hands one module's frames to several, so a region's own
-        fan-out needs no split node at all. Every merge is taken only while
-        the group stays convex, and the whole thing runs to a fixed point --
-        merging two groups can make a third mergeable.
+        fan-out needs no split node at all -- as long as the legs come back
+        together inside, since a module process writes one stream. Every merge
+        is taken only while the group stays convex, and the whole thing runs to
+        a fixed point -- merging two groups can make a third mergeable.
         """
         reach = self._reachable()
         consumers = self._pad_consumers()
         home = {name: name for name in self.order if self.external[name]}
         groups = {name: [name] for name in home}
 
-        def join(*names: str) -> bool:
-            """Merge the groups these nodes are in, if the result stays convex."""
+        def join(*names: str, one_output: bool = False) -> bool:
+            """Merge the groups these nodes are in, if the result stays convex.
+
+            `one_output` also holds the merge to a region whose frames still
+            leave on one pad, which is all a module process can write.
+            """
             reps = {home.get(name) for name in names}
             if None not in reps and len(reps) == 1:
                 return False  # already one group
@@ -1688,6 +1748,8 @@ class _Partitioner:
                 wanted |= set(groups[home[name]]) if name in home else {name}
             joined = [n for n in self.order if n in wanted]
             if not self._convex(joined, reach):
+                return False
+            if one_output and len(self._region_writes(joined)) > 1:
                 return False
             for rep in reps:
                 if rep is not None:
@@ -1735,7 +1797,10 @@ class _Partitioner:
                 # the split's own input becomes a boundary read of the region.
                 feeds = _ref_node(inputs[0])
                 feeder = [feeds] if feeds is not None and feeds in home else []
-                if join(name, *reads, *feeder):
+                # A fan-out whose legs each leave the region is not one the
+                # network can hand round: the split stays a node of the ffmpeg
+                # reading the region's pipe, which gives each leg its own pad.
+                if join(name, *reads, *feeder, one_output=True):
                     merged = True
         return [groups[name] for name in self.order if name in groups]
 
@@ -2212,6 +2277,8 @@ class _Partitioner:
             sibling = self._sibling_feeder(target, at, nodes, ref)
             if sibling is None:
                 sibling = self._live_reader(at, nodes, ref)
+            if sibling is None:
+                sibling = self._once_reader(target, at, nodes, ref)
             if sibling is not None:
                 wanted = set(sibling.nodes) | set(nodes)
                 sibling.nodes = [name for name in self.order if name in wanted]

@@ -4198,6 +4198,189 @@ def test_a_gather_narrows_before_the_merge_collapses() -> None:
     )
 
 
+# -- a module's output read more than once ---------------------------------
+#
+# A CTE column that is a module's output, or a plain filter's, read by two
+# consumers. The split pass puts one `split` in front of it like any other
+# fanned-out pad; what these pin is where that split LANDS. A module's frames
+# leave its sidecar on one pipe, so the split belongs to the ffmpeg reading
+# that pipe -- one producer, one split, a pad per consumer -- and never to the
+# region, which writes one stream.
+
+FAN_A = "modules/fan-a.wasm"
+FAN_B = "modules/fan-b.wasm"
+FAN_AUDIO = "modules/fan-audio.wasm"
+
+FAN_DECLARE = {
+    "fan_a": (
+        "CREATE FUNCTION fan_a(v video_stream) RETURNS video_stream\n"
+        f"  AS '{FAN_A}', 'fan_a' LANGUAGE wasm;\n"
+    ),
+    "fan_b": (
+        "CREATE FUNCTION fan_b(v video_stream) RETURNS video_stream\n"
+        f"  AS '{FAN_B}', 'fan_b' LANGUAGE wasm;\n"
+    ),
+    "fan_audio": (
+        "CREATE FUNCTION fan_audio(a audio_stream) RETURNS audio_stream\n"
+        f"  AS '{FAN_AUDIO}', 'fan_audio' LANGUAGE wasm;\n"
+    ),
+}
+
+FAN_MODULES = {
+    FAN_A: _multi("fan_a"),
+    FAN_B: _multi("fan_b"),
+    FAN_AUDIO: _multi("fan_audio", pixel_formats=(), sample_formats=("f32",)),
+}
+
+
+def _fanned(produce: str, read: str, *, column: str = "v") -> str:
+    """`produce` as a CTE column, `read` over it, both into one file.
+
+    Declared are the modules the query goes on to call, and only those: a
+    declaration nothing calls is refused.
+    """
+    body = (
+        f"COPY (WITH m AS (SELECT {produce} AS {column} FROM input('a.mp4') f)\n"
+        f"      SELECT {read} FROM m) TO 'out.mkv'"
+    )
+    return "".join(
+        text for name, text in FAN_DECLARE.items() if f"{name}(" in body
+    ) + body
+
+
+def _fan_plan(sql: str) -> ProcessPlan:
+    plan = compile_all(sql, describe=lambda path: FAN_MODULES[path]).plan
+    assert plan is not None
+    return plan
+
+
+def _split_process(plan: ProcessPlan) -> FfmpegProcess:
+    """The one ffmpeg holding a split, with the pads it hands out checked."""
+    holding = [
+        p
+        for p in plan.ffmpeg
+        if any(node.filter in ("split", "asplit") for node in p.graph.nodes.values())
+    ]
+    assert len(holding) == 1, [p.id for p in holding]
+    return holding[0]
+
+
+def _pads_of(process: FfmpegProcess) -> int:
+    split = next(
+        node
+        for node in process.graph.nodes.values()
+        if node.filter in ("split", "asplit")
+    )
+    return int(split.args["n"])
+
+
+def _leaves_once(plan: ProcessPlan) -> None:
+    """Every sidecar hands its frames over on exactly one pipe."""
+    for sidecar in plan.sidecars:
+        outgoing = [e for e in plan.stream_edges if e.source == sidecar.id]
+        assert len(outgoing) <= 1, (sidecar.id, [e.ref for e in outgoing])
+
+
+def _instances(plan: ProcessPlan) -> list[str]:
+    return sorted(
+        binding.path for sidecar in plan.sidecars for binding in sidecar.modules
+    )
+
+
+def test_a_modules_output_read_by_two_modules_splits_below_the_pipe() -> None:
+    plan = _fan_plan(_fanned("fan_a(f.video[1])", "fan_b(m.v) AS x, fan_b(m.v) AS y"))
+
+    _leaves_once(plan)
+    fan = _split_process(plan)
+    assert _pads_of(fan) == 2
+    # The producer feeds the splitting ffmpeg, which feeds a reader per pad.
+    producer = next(s for s in plan.sidecars if s.module == FAN_A)
+    assert [e.target for e in plan.stream_edges if e.source == producer.id] == [fan.id]
+    readers = {e.target for e in plan.stream_edges if e.source == fan.id}
+    assert readers == {s.id for s in plan.sidecars if s.module == FAN_B}
+    assert len(readers) == 2
+
+
+def test_a_modules_output_read_by_a_module_and_a_filter_splits_once() -> None:
+    plan = _fan_plan(_fanned("fan_a(f.video[1])", "fan_b(m.v) AS x, hflip(m.v) AS y"))
+
+    _leaves_once(plan)
+    fan = _split_process(plan)
+    assert _pads_of(fan) == 2
+    # One ffmpeg holds both the split and the filter leg: the module leg
+    # leaves it on a pipe, the filtered one carries on inside.
+    assert "hflip" in [node.filter for node in fan.graph.nodes.values()]
+
+
+def test_a_modules_output_read_by_a_module_and_the_destination_splits_once() -> None:
+    plan = _fan_plan(_fanned("fan_a(f.video[1])", "fan_b(m.v) AS x, m.v AS y"))
+
+    _leaves_once(plan)
+    fan = _split_process(plan)
+    assert _pads_of(fan) == 2
+    assert len({e.target for e in plan.stream_edges if e.source == fan.id}) == 2
+
+
+def test_a_filters_output_read_by_two_modules_reaches_each_on_its_own_pad() -> None:
+    plan = _fan_plan(_fanned("hflip(f.video[1])", "fan_a(m.v) AS x, fan_b(m.v) AS y"))
+
+    _leaves_once(plan)
+    # Two regions, one per module: a region writes one stream, so a fan-out
+    # whose legs both leave it is not absorbed into one.
+    assert sorted(s.module for s in plan.sidecars) == [FAN_A, FAN_B]
+    for sidecar in plan.sidecars:
+        incoming = [e.ref for e in plan.stream_edges if e.target == sidecar.id]
+        assert len(incoming) == 1
+    assert len({e.ref for e in plan.stream_edges if e.target.startswith("sidecar")}) == 2
+
+
+def test_an_audio_modules_output_read_twice_takes_the_same_road() -> None:
+    plan = _fan_plan(
+        _fanned(
+            "fan_audio(f.audio[1])",
+            "fan_audio(m.a) AS x, volume(m.a, 2) AS y",
+            column="a",
+        )
+    )
+
+    _leaves_once(plan)
+    fan = _split_process(plan)
+    assert _pads_of(fan) == 2
+    assert [
+        node.filter for node in fan.graph.nodes.values() if node.filter == "asplit"
+    ] == ["asplit"]
+
+
+def test_a_module_read_twice_is_instantiated_once() -> None:
+    """Two readers of one pad, not two runs of the module that made it."""
+    plan = _fan_plan(_fanned("fan_a(f.video[1])", "fan_b(m.v) AS x, hflip(m.v) AS y"))
+
+    assert _instances(plan) == [FAN_A, FAN_B]
+
+
+def test_the_module_a_query_wrote_twice_is_instantiated_twice() -> None:
+    """The count follows the query: two calls are two instances, as ever."""
+    plan = _fan_plan(_fanned("fan_a(f.video[1])", "fan_b(m.v) AS x, fan_b(m.v) AS y"))
+
+    assert _instances(plan) == [FAN_A, FAN_B, FAN_B]
+
+
+def test_no_pad_of_a_fanned_out_module_is_read_twice() -> None:
+    """What the INTERNAL this fixed was raised on: every process renders."""
+    for read in (
+        "fan_b(m.v) AS x, fan_b(m.v) AS y",
+        "fan_b(m.v) AS x, hflip(m.v) AS y",
+        "fan_b(m.v) AS x, m.v AS y",
+        "fan_b(m.v) AS x, hflip(m.v) AS y, vflip(m.v) AS z",
+    ):
+        plan = _fan_plan(_fanned("fan_a(f.video[1])", read))
+        assert plan_argv(
+            plan,
+            sidecar_argv=wasm.shown_argv,
+            pipe_path=lambda edge, side: f"{edge.source}-{edge.target}-{side}",
+        )
+
+
 # -- the model a module runs ----------------------------------------------
 
 

@@ -719,6 +719,28 @@ def _region_fanout_graph() -> Graph:
     return g
 
 
+def _region_rejoin_graph() -> Graph:
+    """The same fan-out, with the two legs read back by a module of the region."""
+    g = _region_fanout_graph()
+    g.nodes["e3"] = Node(
+        id="e3", filter="stack", args={}, inputs=["e1", "e2"], outputs=["video"]
+    )
+    del g.nodes["n0"]
+    g.sinks = [SinkUnit(outputs=[_out("e3")], path="out.mp4")]
+    return g
+
+
+def _region_leaving_twice_graph() -> Graph:
+    """Two adjacent modules, the frames of both read from outside the region."""
+    g = Graph(input_paths=["a.mp4"], sources={"a": 0})
+    g.nodes["e0"] = Node(
+        id="e0", filter="detect", args={}, inputs=["src:a:v:0"], outputs=["video"]
+    )
+    g.nodes["e1"] = Node(id="e1", filter="blur", args={}, inputs=["e0"], outputs=["video"])
+    g.sinks = [SinkUnit(outputs=[_out("e0"), _out("e1")], path="out.mp4")]
+    return g
+
+
 def _detour_graph() -> Graph:
     """A module reading one leg of its own stream back through an ffmpeg filter.
 
@@ -750,21 +772,42 @@ def _detour_graph() -> Graph:
 
 
 def test_a_regions_fan_out_carries_no_split_node() -> None:
-    plan = partition(_region_fanout_graph(), external=external_ids("e0", "e1", "e2"))
+    """Both legs come back together inside, so the network hands the frames
+    round itself and the split it was lowered with is absorbed."""
+    plan = partition(_region_rejoin_graph(), external=external_ids("e0", "e1", "e2", "e3"))
 
     assert len(plan.sidecars) == 1
     region = plan.sidecars[0]
     assert region.graph is not None
-    # The split is absorbed: three module nodes, and both readers take e0.
-    assert list(region.graph.nodes) == ["e0", "e1", "e2"]
+    assert list(region.graph.nodes) == ["e0", "e1", "e2", "e3"]
     assert region.graph.nodes["e1"].inputs == ["e0"]
     assert region.graph.nodes["e2"].inputs == ["e0"]
+    assert region.outputs == ("video",)
+
+
+def test_a_regions_fan_out_that_leaves_twice_keeps_its_split() -> None:
+    """A module process writes one stream, so a fan-out whose legs each leave
+    the region is not one the network can hand round: the split stays an
+    ffmpeg node, reading the producer's one pipe and giving each leg a pad."""
+    plan = partition(_region_fanout_graph(), external=external_ids("e0", "e1", "e2"))
+
+    assert [region.outputs for region in plan.sidecars] == [("video",)] * 3
+    producer = next(r for r in plan.sidecars if r.node == "e0")
+    readers = [e.target for e in plan.stream_edges if e.source == producer.id]
+    assert len(readers) == 1  # a module's frames leave on one pipe
+    fan = next(p for p in plan.ffmpeg if p.id == readers[0])
+    assert [node.filter for node in fan.graph.nodes.values()] == ["split"]
+    assert sorted(e.ref for e in plan.stream_edges if e.source == fan.id) == [
+        "sp:0",
+        "sp:1",
+    ]
 
 
 def test_a_region_leaving_on_two_edges_is_not_spellable() -> None:
-    """Partitioning says what the region's shape is; a module process
-    writes one stream, so this plan is one nothing can spawn."""
-    plan = partition(_region_fanout_graph(), external=external_ids("e0", "e1", "e2"))
+    """Partitioning says what the region's shape is -- two adjacent modules
+    share a process however many of them write -- and a module process writes
+    one stream, so this plan is one nothing can spawn."""
+    plan = partition(_region_leaving_twice_graph(), external=external_ids("e0", "e1"))
     with pytest.raises(FfrwdError) as caught:
         check_spellable(plan)
     assert caught.value.code is ErrorCode.UNSUPPORTED_SQL
@@ -774,15 +817,6 @@ def test_a_region_leaving_on_two_edges_is_not_spellable() -> None:
 
 def test_a_region_leaving_on_one_edge_is_spellable() -> None:
     check_spellable(partition(_series_graph(), external=external_ids("e0", "e1")))
-
-
-def test_a_regions_fan_out_leaves_the_region_on_two_edges() -> None:
-    plan = partition(_region_fanout_graph(), external=external_ids("e0", "e1", "e2"))
-    region = plan.sidecars[0]
-
-    assert region.outputs == ("video", "video")
-    outgoing = [e.ref for e in plan.stream_edges if e.source == region.id]
-    assert sorted(outgoing) == ["e1", "e2"]
 
 
 def test_a_region_that_would_swallow_an_ffmpeg_process_never_arises() -> None:
