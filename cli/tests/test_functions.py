@@ -1173,6 +1173,22 @@ def test_a_lateral_calls_rows_join_another_relations_through_a_cte() -> None:
     ]
 
 
+def test_a_star_over_a_lateral_call_takes_its_stream_columns() -> None:
+    """A star over a table function's alias has always meant its STREAM
+    columns; an inlined call is no different, so `rung` stays a value."""
+    assert _argv(_LADDER_FANOUT.replace("SELECT l.v", "SELECT l.*")) == _argv(
+        _LADDER_FANOUT
+    )
+
+
+def test_a_bare_lateral_alias_is_not_a_value() -> None:
+    sql = LADDER + (
+        "COPY (SELECT l FROM input('a.mp4') f, ladder(f.video[1]) l) TO 'out.mp4'"
+    )
+    error = _rejects(sql, ErrorCode.UNSUPPORTED_SQL, "'l' is a table, not a value")
+    assert error.hint is not None and "l.v" in error.hint
+
+
 def test_lateral_and_cross_join_lateral_spell_the_same_call() -> None:
     """Both keywords say what FROM already does, so the three spellings compile
     to one command."""

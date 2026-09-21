@@ -41,11 +41,9 @@ rejection whose blame includes a written ARGUMENT anchors on the argument
 instead, since ``ffrwd.parser._pos`` takes the earliest position in the
 subtree and the caller's own text always sorts first.
 
-**A table-returning function is a row source, so it becomes a CTE.**
-``RETURNS TABLE(col type, ...)`` is called in FROM and nowhere else. Its body
-is not spliced into the calling query -- a body with an ``unnest`` produces
-MANY rows, and splicing would hand the host the body's FROM items without the
-body ever being a relation of its own. Each call becomes one generated CTE
+**A table-returning function is a row source, and becomes one of two things.**
+``RETURNS TABLE(col type, ...)`` is called in FROM and nowhere else. A call
+whose arguments read nothing of the calling query becomes one generated CTE
 holding the whole body, its projections aliased to the declared column names,
 and the FROM item becomes a reference to that CTE under the writer's alias.
 Everything about cardinality is then the CTE row source's, already defined:
@@ -54,6 +52,17 @@ comma is a cross join with real multiplicity, ``WHERE`` narrows the product,
 ``ROW_COUNT_MISMATCH``. A call in the SELECT list is a typed rejection: SQL
 reads ``(f(x)).a`` once per FIELD, and input identity here is the alias, so
 each read would mint its own ``-i`` for one file.
+
+A call whose arguments read a FROM item written to its LEFT is LATERAL, and a
+CTE is no longer available to hold it: a CTE cannot see the FROM clause around
+it. The body is INLINED instead -- its FROM items take the call's own place in
+the host's FROM, its WHERE joins the host's, and every ``<alias>.<column>``
+read becomes the body projection that column was (``<alias>.*``, the stream
+ones). That is the same query written by hand, which is what makes the
+cardinality above still hold: the host's rows times the body's, arrived at by
+a comma rather than by a CTE reference. The argument expression is written
+ONCE, in the host, so the chain behind a stream argument is built once and
+split to the body's rows rather than rebuilt per row.
 
 **A definition need not be written in the script.** A qualified call that
 resolves in a package (``me.pick(...)``, :mod:`ffrwd.project`) reaches a
@@ -2690,6 +2699,14 @@ def _alias_reads(call: exp.Anonymous) -> list[tuple[str, exp.Column, bool]]:
     return reads
 
 
+def _star_of(column: exp.Column) -> str | None:
+    """The alias a ``<alias>.*`` names, or None for anything else."""
+    if not isinstance(column.this, exp.Star):
+        return None
+    table = column.args.get("table")
+    return _ident_name(table) if isinstance(table, exp.Identifier) else None
+
+
 def _known_hint(names: set[str]) -> str:
     """What a call in FROM could have read, named the way resolve names it."""
     known = ", ".join(sorted(names))
@@ -4187,9 +4204,14 @@ class _Expander:
         The alias names no relation any more, so each ``<alias>.<column>``
         becomes the body projection that column was, and a read of a name the
         function does not declare is the rejection it would have been off a CTE.
+        ``<alias>.*`` becomes the STREAM columns it declared, which is what a
+        star over a table function's alias has always meant.
         """
         for root in self._reference_roots():
             for column in list(root.find_all(exp.Column)):
+                if _star_of(column) == alias:
+                    self._expand_lateral_star(alias, columns, function, column, item)
+                    continue
                 key = _leftmost(column)
                 if key is None:
                     continue
@@ -4225,6 +4247,46 @@ class _Expander:
                     )
                 read = copy.deepcopy(found)
                 column.replace(read if len(path) == 1 else _accessor(read, path[1:]))
+
+    def _expand_lateral_star(
+        self,
+        alias: str,
+        columns: dict[str, exp.Expr],
+        function: _Function,
+        star: exp.Column,
+        item: exp.Table,
+    ) -> None:
+        """``<alias>.*`` over an inlined call: the stream columns it declared.
+
+        A star over a table function's alias takes its STREAM columns and
+        leaves its value ones, which is what the generated CTE it used to
+        become already did.
+        """
+        select = star.parent
+        streams = [
+            column
+            for column in function.columns or ()
+            if _declared_kind(column.type) == "stream" and column.name in columns
+        ]
+        if not isinstance(select, exp.Select) or not streams:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"'{alias}.*' selects no stream",
+                star,
+                fallback=item,
+                hint=f"'{alias}' is {function.qualified}(), whose columns are "
+                + ", ".join(f"{c.name} {c.type}" for c in function.columns or ()),
+            )
+        expressions = list(select.expressions)
+        at = next(index for index, node in enumerate(expressions) if node is star)
+        expanded = [
+            exp.Alias(
+                this=copy.deepcopy(columns[column.name]),
+                alias=exp.Identifier(this=column.name, quoted=False),
+            )
+            for column in streams
+        ]
+        select.set("expressions", [*expressions[:at], *expanded, *expressions[at + 1 :]])
 
     def _reference_roots(self) -> list[exp.Expr]:
         """Where a FROM alias of the statement being expanded can be read.
