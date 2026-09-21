@@ -68,7 +68,7 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   to its left, so a stream can be handed to one and the body runs once
   per outer row - an encoding ladder is a function a package ships
   rather than something each query spells out (recipe
-  [139](examples.md#139-ship-the-ladder-as-a-function)). The body is
+  [140](examples.md#140-ship-the-ladder-as-a-function)). The body is
   private either way: its parameters and its own aliases are all it
   sees, and an outer alias spelling one of them changes nothing. A
   stream argument is the outer row's, so `ladder(blur(f.video[1]))`

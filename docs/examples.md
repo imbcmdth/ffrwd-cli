@@ -730,7 +730,7 @@ ffmpeg -i tests/fixtures/av.mp4 -filter_complex \
 for `hls_time`, adaptation sets for the variant map, and the `.mpd` as
 the written name.
 
-## 139. Ship the ladder as a function
+## 140. Ship the ladder as a function
 
 The rungs above are spelled out in the query: a `generate_series` to
 count them and an array to hold their widths. They do not have to be.
