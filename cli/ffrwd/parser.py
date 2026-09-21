@@ -3044,7 +3044,7 @@ def _dot_identifiers(node: exp.Expr) -> list[exp.Identifier] | None:
     return None
 
 
-def desugar_lateral(tree: exp.Expression) -> None:
+def _desugar_lateral(tree: exp.Expression) -> None:
     """Rewrite every ``LATERAL`` FROM item into the plain spelling of the same thing.
 
     A call in FROM is implicitly lateral -- its arguments see the items written
@@ -3055,8 +3055,6 @@ def desugar_lateral(tree: exp.Expression) -> None:
     (``WITH ORDINALITY``, ``LATERAL VIEW``, ``OUTER APPLY``), is refused.
     """
     for lateral in list(tree.find_all(exp.Lateral)):
-        if not isinstance(lateral, exp.Lateral):  # pragma: no cover - find_all is typed loosely
-            continue
         for key, written in (
             ("view", "LATERAL VIEW"),
             ("outer", "OUTER APPLY"),
@@ -8978,7 +8976,7 @@ def resolve(
     try:
         # Before expansion: what the keyword wraps has to be an ordinary FROM
         # item by the time a call site is looked for.
-        desugar_lateral(tree)
+        _desugar_lateral(tree)
         with expanded(tree, packages=packages, on_warning=on_warning, owner=owner) as script:
             resolved = _Resolver(script.wasm).run(script.tree)
             resolved.wasm = script.wasm

@@ -1181,6 +1181,22 @@ def test_a_star_over_a_lateral_call_takes_its_stream_columns() -> None:
     )
 
 
+def test_an_inlined_alias_is_read_back_only_where_it_was_bound() -> None:
+    """A FROM alias belongs to its own SELECT: another CTE body binding the
+    same name keeps it. Inlining reads back one query's `l`, not the script's."""
+    sql = LADDER + (
+        "COPY (\n"
+        "  WITH a AS (SELECT l.v AS v, l.rung AS rung\n"
+        "             FROM input('a.mp4') f, ladder(f.video[1]) l),\n"
+        "       b AS (SELECT l.audio[1] AS t FROM input('a.mp4') l)\n"
+        "  SELECT a.v, b.t FROM a, b)\n"
+        "TO ('r' || a.rung::text || '.mp4')"
+    )
+    args = _argv(sql, {"f": _video_probe(audio=True), "l": _video_probe(audio=True)})
+    assert _scales(args) == ["1280", "854", "640"]
+    assert args.count("0:a:0") == 3
+
+
 def test_a_bare_lateral_alias_is_not_a_value() -> None:
     sql = LADDER + (
         "COPY (SELECT l FROM input('a.mp4') f, ladder(f.video[1]) l) TO 'out.mp4'"

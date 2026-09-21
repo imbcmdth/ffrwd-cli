@@ -4189,7 +4189,7 @@ class _Expander:
             and isinstance(projection.this, exp.Expr)
             and (name := _projection_alias(projection)) is not None
         }
-        self._read_lateral(alias, columns, function, item)
+        self._read_lateral(alias, columns, function, host, item)
         _splice_over(host, item, body)
 
     def _read_lateral(
@@ -4197,6 +4197,7 @@ class _Expander:
         alias: str,
         columns: dict[str, exp.Expr],
         function: _Function,
+        host: exp.Select,
         item: exp.Table,
     ) -> None:
         """Replace every read of an inlined call's alias with the column behind it.
@@ -4207,46 +4208,72 @@ class _Expander:
         ``<alias>.*`` becomes the STREAM columns it declared, which is what a
         star over a table function's alias has always meant.
         """
-        for root in self._reference_roots():
-            for column in list(root.find_all(exp.Column)):
-                if _star_of(column) == alias:
-                    self._expand_lateral_star(alias, columns, function, column, item)
+        exposed = ", ".join(column.name for column in function.columns or ())
+        for column in self._alias_readers(host, alias):
+            if _star_of(column) == alias:
+                self._expand_lateral_star(alias, columns, function, column, item)
+                continue
+            key = _leftmost(column)
+            if key is None:
+                continue
+            path = _path_after(column, key)
+            if not path:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"'{alias}' is a table, not a value",
+                    column,
+                    fallback=item,
+                    hint=f"read one of its columns off the alias, e.g. "
+                    f"{alias}.{function.columns[0].name if function.columns else 'column'}",
+                )
+            name = _ident_name(path[0])
+            found = columns.get(name)
+            if found is None:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"unknown column '{alias}.{name}'",
+                    column,
+                    fallback=item,
+                    hint=f"'{alias}' is {function.qualified}(), which exposes: "
+                    f"{exposed}",
+                )
+            read = copy.deepcopy(found)
+            column.replace(read if len(path) == 1 else _accessor(read, path[1:]))
+
+    def _alias_readers(self, host: exp.Select, alias: str) -> list[exp.Column]:
+        """Every column reading `alias`, in the one query where it is bound.
+
+        A FROM alias is visible in its own SELECT and nowhere else, so the
+        search stops at a nested one -- two CTE bodies of one script may each
+        bind the same name. A COPY's destination expression and its WITH
+        option values are written outside the query but read its rows, so they
+        are searched too when this IS that query.
+        """
+        roots: list[exp.Expr] = [host]
+        statement = self.statement
+        outermost = next(
+            (node for node in _preorder(statement) if isinstance(node, exp.Select)), None
+        ) if statement is not None else None
+        if isinstance(statement, exp.Copy) and outermost is host:
+            roots += [
+                node
+                for key in ("files", "params")
+                for node in statement.args.get(key) or []
+                if isinstance(node, exp.Expr)
+            ]
+        found: list[exp.Column] = []
+        for root in roots:
+            for node in _preorder(root, stop=exp.Select if root is host else None):
+                if not isinstance(node, exp.Column):
                     continue
-                key = _leftmost(column)
-                if key is None:
+                if _star_of(node) == alias:
+                    found.append(node)
                     continue
-                identifier = column.args.get(key)
-                if (
-                    not isinstance(identifier, exp.Identifier)
-                    or _ident_name(identifier) != alias
-                ):
-                    continue
-                path = _path_after(column, key)
-                if not path:
-                    raise _error(
-                        ErrorCode.UNSUPPORTED_SQL,
-                        f"'{alias}' is a table, not a value",
-                        column,
-                        fallback=item,
-                        hint=f"read one of its columns off the alias, e.g. "
-                        f"{alias}.{function.columns[0].name if function.columns else 'column'}",
-                    )
-                name = _ident_name(path[0])
-                found = columns.get(name)
-                if found is None:
-                    raise _error(
-                        ErrorCode.UNSUPPORTED_SQL,
-                        f"unknown column '{alias}.{name}'",
-                        column,
-                        fallback=item,
-                        hint=f"'{alias}' is {function.qualified}(), which "
-                        f"exposes: "
-                        + ", ".join(
-                            column.name for column in function.columns or ()
-                        ),
-                    )
-                read = copy.deepcopy(found)
-                column.replace(read if len(path) == 1 else _accessor(read, path[1:]))
+                key = _leftmost(node)
+                identifier = node.args.get(key) if key is not None else None
+                if isinstance(identifier, exp.Identifier) and _ident_name(identifier) == alias:
+                    found.append(node)
+        return found
 
     def _expand_lateral_star(
         self,
@@ -4287,31 +4314,6 @@ class _Expander:
             for column in streams
         ]
         select.set("expressions", [*expressions[:at], *expanded, *expressions[at + 1 :]])
-
-    def _reference_roots(self) -> list[exp.Expr]:
-        """Where a FROM alias of the statement being expanded can be read.
-
-        The query itself, and -- for a COPY -- the destination expression and
-        the ``WITH`` option values, which are written outside it but read its
-        rows.
-        """
-        statement = self.statement
-        if statement is None:  # unreachable: expansion always runs under one
-            return []
-        roots: list[exp.Expr] = [statement]
-        if isinstance(statement, exp.Copy):
-            roots = [
-                *(node for node in statement.args.get("files") or [] if isinstance(node, exp.Expr)),
-                *(
-                    node
-                    for node in statement.args.get("params") or []
-                    if isinstance(node, exp.Expr)
-                ),
-            ]
-            inner = statement.this
-            if isinstance(inner, exp.Expr):
-                roots.append(inner)
-        return roots
 
     def _fresh_name(self, base: str) -> str:
         """A name for a generated CTE that nothing in the script has claimed."""
