@@ -987,11 +987,12 @@ def test_a_table_function_is_a_row_source_inside_a_cte() -> None:
 # The ladder a package can ship: one video in, one row per rung out.
 LADDER = (
     "CREATE FUNCTION ladder(v video_stream)\n"
-    "RETURNS TABLE(v video_stream, rung number, bitrate text) AS $$\n"
-    "  SELECT scale(v, r.width, -2), r.rung, r.bitrate\n"
-    "  FROM unnest(ARRAY[STRUCT(1 AS rung, 1280 AS width, '4500k' AS bitrate),\n"
-    "                    STRUCT(2 AS rung,  854 AS width, '2000k' AS bitrate),\n"
-    "                    STRUCT(3 AS rung,  640 AS width,  '900k' AS bitrate)]) r\n"
+    "RETURNS TABLE(v video_stream, rung number, bitrate text, bufsize text) AS $$\n"
+    "  SELECT scale(v, r.width, -2), r.rung, r.bitrate, r.bufsize\n"
+    "  FROM unnest(ARRAY[\n"
+    "    STRUCT(1 AS rung, 1280 AS width, '4500k' AS bitrate, '2250k' AS bufsize),\n"
+    "    STRUCT(2 AS rung,  854 AS width, '2000k' AS bitrate, '1000k' AS bufsize),\n"
+    "    STRUCT(3 AS rung,  640 AS width,  '900k' AS bitrate,  '450k' AS bufsize)]) r\n"
     "$$ LANGUAGE sql;\n"
 )
 _LADDER_FANOUT = LADDER + (
@@ -1098,6 +1099,25 @@ def test_a_lateral_call_reads_its_own_rung_in_a_with_option() -> None:
     assert args[args.index("-b:2") + 1] == "900k"
 
 
+def test_a_ladder_function_owns_its_encoder_settings() -> None:
+    """What shipping a ladder as a function is for: the rungs declare their own
+    bitrates, and the COPY reads them off the alias instead of repeating them."""
+    sql = LADDER + (
+        "COPY (SELECT l.v FROM input('a.mp4') f, ladder(fps(f.video[1], 30)) l)\n"
+        "TO 'out/master.m3u8' WITH (format 'hls', hls_time 2,\n"
+        "  video_codec 'libx264', video_bitrate l.bitrate, maxrate l.bitrate,\n"
+        "  bufsize l.bufsize, gop 30)"
+    )
+    args = _argv(sql, {"f": _video_probe()})
+    read = [[args[args.index(f"-{flag}:{n}") + 1] for n in range(3)] for flag in
+            ("b", "maxrate", "bufsize")]
+    assert read == [
+        ["4500k", "2000k", "900k"],
+        ["4500k", "2000k", "900k"],
+        ["2250k", "1000k", "450k"],
+    ]
+
+
 def test_a_lateral_calls_own_where_narrows_the_host() -> None:
     sql = LADDER + (
         "COPY (SELECT l.v FROM input('a.mp4') f, ladder(f.video[1]) l WHERE l.rung = 2)\n"
@@ -1128,7 +1148,7 @@ def test_an_undeclared_column_of_a_lateral_call_says_what_it_exposes() -> None:
         "COPY (SELECT l.height FROM input('a.mp4') f, ladder(f.video[1]) l) TO 'out.mp4'"
     )
     error = _rejects(sql, ErrorCode.UNSUPPORTED_SQL, "unknown column 'l.height'")
-    assert error.hint is not None and "v, rung, bitrate" in error.hint
+    assert error.hint == "'l' is ladder(), which exposes: v, rung, bitrate, bufsize"
 
 
 def test_a_function_over_both_kinds_writes_muxed_variants() -> None:

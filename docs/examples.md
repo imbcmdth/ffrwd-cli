@@ -733,21 +733,24 @@ the written name.
 ## 140. Ship the ladder as a function
 
 The rungs above are spelled out in the query: a `generate_series` to
-count them and an array to hold their widths. They do not have to be.
-A `TABLE`-returning function's arguments read the FROM items written to
-its left, so a stream can be handed to one, and the rungs become the
-function's business rather than the caller's:
+count them, an array for their widths, another for their bitrates, and
+a `[vid.rung]` on each to line the two up. They do not have to be. A
+`TABLE`-returning function's arguments read the FROM items written to
+its left, so a stream can be handed to one, and a rung becomes a row
+the function returns - its width, and the encoder settings that belong
+with that width:
 
 ```pgsql
-CREATE FUNCTION ladder(v video_stream) RETURNS TABLE(v video_stream, rung number) AS $$
-  SELECT scale(v, r.width, -2), r.rung
-  FROM unnest(ARRAY[STRUCT(1 AS rung, 320 AS width),
-                    STRUCT(2 AS rung, 160 AS width)]) r
+CREATE FUNCTION ladder(v video_stream)
+RETURNS TABLE(v video_stream, rung number, bitrate text, bufsize text) AS $$
+  SELECT scale(v, r.width, -2), r.rung, r.bitrate, r.bufsize
+  FROM unnest(ARRAY[STRUCT(1 AS rung, 320 AS width, '800k' AS bitrate, '1600k' AS bufsize),
+                    STRUCT(2 AS rung, 160 AS width, '300k' AS bitrate,  '600k' AS bufsize)]) r
 $$ LANGUAGE sql;
 
 COPY (
   WITH vid AS (
-    SELECT l.v AS v, l.rung AS rung
+    SELECT l.v AS v, l.bitrate AS bitrate, l.bufsize AS bufsize, l.rung AS rung
     FROM input('tests/fixtures/av.mp4') f, ladder(fps(f.video[1], 15)) l
   ),
   aud AS (
@@ -758,7 +761,8 @@ COPY (
   FROM vid FULL JOIN aud ON vid.rung = aud.rung
 ) TO 'out/master.m3u8'
   WITH (format 'hls', hls_time 2, hls_playlist_type 'vod',
-        video_codec 'libx264', video_bitrate ARRAY['800k', '300k'][vid.rung],
+        video_codec 'libx264', video_bitrate vid.bitrate,
+        maxrate vid.bitrate, bufsize vid.bufsize,
         audio_codec 'aac')
 ```
 
@@ -768,23 +772,29 @@ ffmpeg -i tests/fixtures/av.mp4 -filter_complex \
   '[0:v:0]fps=fps=15,split=2[n1_split0][n1_split1];'\
 '[n1_split0]scale=width=320:height=-2[out0];[n1_split1]scale=width=160:height=-2[out1]' \
   -map '[out0]' -map '[out1]' -map 0:a:0 -f hls -hls_time 2 -hls_playlist_type vod -c:0 \
-  libx264 -c:1 libx264 -b:0 800k -b:1 300k -c:2 aac -g:0 30 -g:1 30 -keyint_min:0 30 \
-  -keyint_min:1 30 -sc_threshold:0 0 -sc_threshold:1 0 -var_stream_map \
+  libx264 -c:1 libx264 -b:0 800k -b:1 300k -maxrate:0 800k -maxrate:1 300k -bufsize:0 \
+  1600k -bufsize:1 600k -c:2 aac -g:0 30 -g:1 30 -keyint_min:0 30 -keyint_min:1 30 \
+  -sc_threshold:0 0 -sc_threshold:1 0 -var_stream_map \
   'v:0,agroup:aud,name:240p v:1,agroup:aud,name:120p a:0,agroup:aud,name:a0,default:yes' \
   -master_pl_name master.m3u8 -hls_segment_filename out/%v/segment_%d.ts \
   out/%v/index.m3u8
 ```
 
-Byte for byte recipe 104's command: the function is inlined, so what
-runs is the query you could have typed by hand. What changed is who
-owns the rungs - `ladder` is a definition a package ships and a query
-installs, and the caller writes one call in place of a row table.
+Recipe 104's command with a rate control block added, and the function
+is inlined, so what runs is still the query you could have typed by
+hand. What changed is who owns the rungs. `ladder` is a definition a
+package ships and a query installs; the caller writes one call in place
+of a row table, and reads the settings back off the alias instead of
+keeping a parallel array in step with it.
 
-The argument belongs to the outer row, so `fps(f.video[1], 15)` runs
-once and splits into both rungs rather than once per rung. Bitrates
-stay the caller's: a `WITH` option is settled before ffmpeg runs, so it
-reads a literal or a subscripted list and never a column, and
-`[vid.rung]` is how each rung picks its own.
+A `WITH` option is settled before ffmpeg runs, and a row column is: it
+binds once per row, in row order, and is typed exactly as the literal
+in its place would be. `video_bitrate ARRAY['800k', '300k'][vid.rung]`
+is the same option written the other way, and compiles to the same
+command.
+
+The stream argument belongs to the outer row, so `fps(f.video[1], 15)`
+runs once and splits into both rungs rather than once per rung.
 
 ## 105. Pick a rung from an ABR ladder
 

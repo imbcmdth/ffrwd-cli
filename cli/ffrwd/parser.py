@@ -1917,7 +1917,54 @@ def parse(
     if unset:
         _annotate_unset(tree, unset)
     _unwrap_subscripted(tree)
+    _name_option_columns(tree)
     return tree
+
+
+_COLUMN_QUALIFIERS = ("catalog", "db", "table", "this")
+
+
+def _name_option_columns(tree: exp.Expression) -> None:
+    """``WITH (name <alias>.<column>)``: make that value the column it reads.
+
+    A ``COPY`` option's value parses where no column resolution applies, so
+    sqlglot builds a ``Dot`` chain over a ``Var`` rather than the
+    ``exp.Column`` the same text produces in a SELECT or a ``TO`` expression.
+    Rebuilt here, once, so every later pass reads one shape. Anything that is
+    not a plain dotted name is left exactly as it was written.
+    """
+    for copy in tree.find_all(exp.Copy):
+        for param in copy.args.get("params") or []:
+            if not isinstance(param, exp.CopyParameter):
+                continue
+            value = param.args.get("expression")
+            column = _dotted_column(value) if isinstance(value, exp.Expr) else None
+            if column is not None:
+                param.set("expression", column)
+
+
+def _dotted_column(node: exp.Expr) -> exp.Column | None:
+    """One plain ``a.b[.c]`` Dot chain as an ``exp.Column``, else None."""
+    names: list[exp.Identifier] = []
+    current: exp.Expr | None = node
+    while isinstance(current, exp.Dot):
+        expression = current.args.get("expression")
+        if not isinstance(expression, exp.Identifier):
+            return None
+        names.append(expression)
+        current = current.this
+    if not names or not isinstance(current, exp.Var | exp.Identifier):
+        return None
+    leftmost = exp.Identifier(this=str(current.this), quoted=False)
+    leftmost.meta.update(current.meta)
+    names.append(leftmost)
+    names.reverse()
+    if len(names) > len(_COLUMN_QUALIFIERS):
+        return None
+    keys = _COLUMN_QUALIFIERS[len(_COLUMN_QUALIFIERS) - len(names) :]
+    column = exp.Column(**dict(zip(keys, names)))
+    column.meta.update(node.meta)
+    return column
 
 
 def _unwrap_subscripted(tree: exp.Expression) -> None:
@@ -3127,7 +3174,11 @@ def _name_the_stream(part: exp.Expr, names: set[str]) -> None:
         sub.set("table", identifier)
 
 
-def _normalize_row_aliases(select: exp.Select, path_expr: exp.Expr | None = None) -> None:
+def _normalize_row_aliases(
+    select: exp.Select,
+    path_expr: exp.Expr | None = None,
+    extra: Sequence[exp.Expr] = (),
+) -> None:
     """Rewrite every bare row alias into that row's stream column, in place.
 
     A row record used where a stream is expected IS that stream, so ``SELECT
@@ -3145,20 +3196,26 @@ def _normalize_row_aliases(select: exp.Select, path_expr: exp.Expr | None = None
     names = _unnest_aliases(select)
     if not names:
         return
-    for part in _value_parts(select, path_expr):
+    for part in _value_parts(select, path_expr, extra):
         _name_the_stream(part, names)
 
 
-def _value_parts(select: exp.Select, path_expr: exp.Expr | None) -> list[exp.Expr]:
+def _value_parts(
+    select: exp.Select,
+    path_expr: exp.Expr | None,
+    extra: Sequence[exp.Expr] = (),
+) -> list[exp.Expr]:
     """The parts of one branch a value may be written in.
 
     Everything but the FROM clause and any CTE bodies -- each of those is
     normalized as the branch it belongs to. A fan-out ``TO`` expression is
-    included when the caller has one.
+    included when the caller has one, and so are the ``WITH`` option values:
+    both are written outside the query and read its rows.
     """
     parts: list[exp.Expr] = [p for p in select.expressions if isinstance(p, exp.Expr)]
     if path_expr is not None:
         parts.append(path_expr)
+    parts.extend(extra)
     for key in ("where", "group", "order"):
         part = select.args.get(key)
         if isinstance(part, exp.Expr):
@@ -3204,7 +3261,11 @@ def _fold_map_path(sub: exp.Expr) -> None:
     )
 
 
-def _normalize_map_paths(select: exp.Select, path_expr: exp.Expr | None = None) -> None:
+def _normalize_map_paths(
+    select: exp.Select,
+    path_expr: exp.Expr | None = None,
+    extra: Sequence[exp.Expr] = (),
+) -> None:
     """Fold every ``.tags.<key>`` and ``.disposition.<key>`` path into one
     internal column name, in place.
 
@@ -3212,7 +3273,7 @@ def _normalize_map_paths(select: exp.Select, path_expr: exp.Expr | None = None) 
     Folding them here means no later pass has to know the shape: an entry is a
     column with an unspellable name, looked up like any other.
     """
-    for part in _value_parts(select, path_expr):
+    for part in _value_parts(select, path_expr, extra):
         for sub in list(part.walk()):
             _fold_map_path(sub)
 
@@ -3895,7 +3956,10 @@ class _Resolver:
                     statement, self.wasm
                 )
                 query, query_branches = self._resolve_query(
-                    wrapped, table_mode=bool(table_format), path_expr=path_expr
+                    wrapped,
+                    table_mode=bool(table_format),
+                    path_expr=path_expr,
+                    option_values=[option.value for option in options],
                 )
                 sinks.append(
                     RawSink(
@@ -3992,6 +4056,7 @@ class _Resolver:
         *,
         table_mode: bool = False,
         path_expr: exp.Expr | None = None,
+        option_values: Sequence[exp.Expr] = (),
         context: str | None = None,
     ) -> tuple[QueryExpr, list[exp.Select]]:
         """Validate one whole query — a view body, a COPY's, or a bare SELECT.
@@ -4036,6 +4101,7 @@ class _Resolver:
                 visible,
                 table_mode=table_mode,
                 path_expr=path_expr,
+                option_values=option_values,
                 no_aggregate=no_aggregate,
             )
         return query, branches
@@ -4343,6 +4409,7 @@ class _Resolver:
         *,
         table_mode: bool = False,
         path_expr: exp.Expr | None = None,
+        option_values: Sequence[exp.Expr] = (),
         no_aggregate: str | None = None,
     ) -> None:
         self._hoist_from_merges(select)
@@ -4361,8 +4428,8 @@ class _Resolver:
         # turn out to be a ladder's row table, so its `array_agg(...)` is
         # admitted as a whole SELECT column here and lower refuses it, with
         # the file's own rejection, when the probe finds no renditions.
-        _normalize_map_paths(select, path_expr)
-        _normalize_row_aliases(select, path_expr)
+        _normalize_map_paths(select, path_expr, option_values)
+        _normalize_row_aliases(select, path_expr, option_values)
         rows = _has_row_source(select, visible)
         may_aggregate = rows or _has_input_alias(select, self.wasm)
         if rows:

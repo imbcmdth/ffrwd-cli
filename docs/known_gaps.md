@@ -12,6 +12,21 @@ output is plain ffmpeg, so the two mix freely in a script.
 | Protocol options | `-headers`, `-user_agent`, `-rtsp_transport`, `-timeout` | Network inputs and outputs are passed to ffmpeg verbatim; per-protocol tuning options have no input/sink spelling. Authenticated URLs work only if the credential fits in the URL itself. |
 | Lossless concat | concat demuxer (`-f concat -i list.txt -c copy`) | Joining files without re-encoding needs the demuxer's list-file protocol. `concat` in ffrwd is the filter, which re-encodes. |
 
+A `WITH` block names its options one at a time. A row may carry a whole
+map of them - `RETURNS TABLE(..., settings STRUCT(...))` - and spreading
+that map into the block would let a function own its encoder settings
+entirely rather than one declared column per option. The spelling that
+fits is a reserved option NAME, `WITH (options l.settings, gop 30)`,
+which parses today as an ordinary pair; a written row table already
+forces every row's STRUCT to declare the same fields, so the keys are
+known while compiling and each can go through the same validation, with
+a later key overriding a spread one. What it waits on is the option loop
+itself, which assumes every option NAME is known before any row is read,
+and `sink.py`'s rule that the option table is data with no
+option-specific logic anywhere else: `options` belongs in that table
+behind a field of its own, which the docs and the prompt both generate
+from.
+
 ## Not callable
 
 - Variable-OUTPUT-pad filters and multi-output filters (`scale2ref`,

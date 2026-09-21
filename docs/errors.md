@@ -482,6 +482,18 @@ COPY (
 {"line": 5, "col": 7, "code": "SINK_OPTION_TYPE", "message": "option 'crf' expects an int, got 'high'", "hint": "crf takes a bare integer literal, e.g. crf 20"}
 ```
 
+An option value may also be a ROW COLUMN, read once per row. It is typed exactly as the literal in its place would be, and where the rows are gathered into one destination the rejection names the row it read, since the values differ per row:
+
+```json
+{"line": 4, "col": 34, "code": "SINK_OPTION_TYPE", "message": "option 'video_bitrate' expects a str, got 640, in row 1", "hint": "video_bitrate takes a single-quoted string literal, e.g. video_bitrate 'libx264'"}
+```
+
+A stream is not a value, so reading one is named against the option rather than left to the table's type message, which would say only that it wanted a string:
+
+```json
+{"line": 3, "col": 52, "code": "SINK_OPTION_TYPE", "message": "sink option 'video_bitrate' reads 'vid.v', which is a stream rather than a value", "hint": "an option shapes the encoder a stream goes through; read a value column instead, e.g. video_bitrate l.bitrate"}
+```
+
 ## UNKNOWN_FILTER_OPTION
 
 **Meaning:** A named argument (`<name> => <value>`) names an option the targeted ffmpeg filter doesn't have. The option set is read out of the installed ffmpeg (`ffmpeg -help filter=<name>`, see `ffrwd/registry.py`), so it is exactly what that binary supports, not a table somebody in this repo has to keep current.

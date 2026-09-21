@@ -1712,17 +1712,42 @@ def _sink_stream_count(node: exp.Expr, arguments: int) -> int:
     return written if isinstance(written, int) else arguments
 
 
+_COLUMN_QUALIFIERS = ("catalog", "db", "table", "this")
+
+
+def _written_path(column: exp.Column) -> str:
+    """A column read back the way it was written, for a rejection to quote."""
+    return ".".join(
+        _fold(part)
+        for key in _COLUMN_QUALIFIERS
+        if isinstance(part := column.args.get(key), exp.Identifier)
+    )
+
+
 def _validated_option(name: str, written: object, *, line: int, col: int) -> object:
     """One option value through the option table -- element by element when it
     is a per-TRACK list, so a bad element is refused where a bad scalar is.
-    A None element is that row's NULL read: absence, never a type error."""
+    A None element is that row's NULL read: absence, never a type error.
+
+    A bad element names the row it came from: the values differ per row, so
+    "expects a str, got 4500" on its own would not say which one to fix."""
     if isinstance(written, list):
-        return [
-            element
-            if element is None
-            else validate_sink_option(name, element, line=line, col=col)
-            for element in written
-        ]
+        checked: list[object] = []
+        for position, element in enumerate(written):
+            if element is None:
+                checked.append(None)
+                continue
+            try:
+                checked.append(validate_sink_option(name, element, line=line, col=col))
+            except FfrwdError as err:
+                raise FfrwdError(
+                    err.code,
+                    f"{err.message}, in row {position + 1}",
+                    line=err.line,
+                    col=err.col,
+                    hint=err.hint,
+                ) from None
+        return checked
     return validate_sink_option(name, written, line=line, col=col)
 
 
@@ -4468,13 +4493,20 @@ class _Lowerer:
         one element per track of the option's own scope, in row order.
         ffmpeg spells that ``-b:v:0``, ``-b:v:1``, and so on.
 
-        An option is settled before ffmpeg runs, so those two shapes and the
+        A ROW COLUMN reads the same way, and is where a value the query
+        already carries belongs: ``video_bitrate l.bitrate`` binds per row
+        exactly as ``video_bitrate ARRAY['4500k', '2000k'][l.rung]`` does, and
+        the two compile to the same command for the same values.
+
+        An option is settled before ffmpeg runs, so those shapes and the
         constants :func:`_sink_value` reads are all that may stand here; a
         subscript over anything else is refused by name rather than left to
         the option table's type message, which would say only "a BRACKET
         expression".
         """
         node = _unwrap(option.value)
+        if isinstance(node, exp.Column):
+            return self._row_option_value(option, node, raw)
         if not isinstance(node, exp.Bracket):
             return _sink_value(option.value)
         if not isinstance(node.this, exp.Array):
@@ -4508,6 +4540,87 @@ class _Lowerer:
             ]
         env = self.fanout_env if self.fanout_env is not None else _Env()
         return self._eval_list_element(node, env, self.fanout_row, anchor)
+
+    def _row_option_value(
+        self, option: RawSinkOption, column: exp.Column, raw: RawSink
+    ) -> object:
+        """One ``WITH (name <alias>.<column>)`` value, read off the rows.
+
+        The same two readings a subscripted list gets: over a gathered
+        destination the option binds once per row, in row order, and under a
+        fan-out it reads the one row this command writes. What the column may
+        be is what the value grammar can settle before ffmpeg runs -- a row
+        table's own column, a probed metadata column, a CTE's value column, an
+        input scalar -- so a stream is refused here rather than through the
+        option table, which would say only that it wanted a string.
+        """
+        self._check_option_column(option, column, raw)
+        anchor = raw.branches[0] if raw.branches else exp.Select()
+        if references_row_alias(column, set(self.res.row_aliases)) and self.fanout_expr is None:
+            if not self.sink_rows:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"sink option '{option.name}' reads a track row, and this "
+                    "COPY has no rows to read",
+                    column,
+                    fallback=raw.path_node,
+                    hint=_PER_TRACK_OPTION_HINT,
+                )
+            env = self.sink_env if self.sink_env is not None else _Env()
+            return [self._eval_value(column, env, row, anchor) for row in self.sink_rows]
+        # One value for the whole destination: the pinned row under a fan-out,
+        # and otherwise a column no row varies -- an input scalar, or a CTE
+        # column over a single-row body -- which any row of the relation reads
+        # the same way.
+        if self.fanout_expr is not None:
+            env = self.fanout_env if self.fanout_env is not None else _Env()
+            return self._eval_value(column, env, self.fanout_row, anchor)
+        env = self.sink_env if self.sink_env is not None else _Env()
+        row = self.sink_rows[0] if self.sink_rows else {}
+        return self._eval_value(column, env, row, anchor)
+
+    def _check_option_column(
+        self, option: RawSinkOption, column: exp.Column, raw: RawSink
+    ) -> None:
+        """An option value names a VALUE the query carries, never a stream."""
+        written = _written_path(column)
+        env = self.sink_env if self.sink_env is not None else _Env()
+        table_node = column.args.get("table")
+        binding = env.bindings.get(_fold(table_node)) if table_node is not None else None
+        name = _fold(column.this)
+        if isinstance(binding, _CteBinding):
+            stream = name not in binding.values and self._cte_column(binding, name) is not None
+        elif isinstance(binding, _RowBinding):
+            stream = name in STREAM_ARRAY_COLUMNS
+        else:
+            stream = False
+        if stream:
+            raise _error(
+                ErrorCode.SINK_OPTION_TYPE,
+                f"sink option '{option.name}' reads '{written}', which is a "
+                "stream rather than a value",
+                column,
+                fallback=raw.path_node,
+                hint="an option shapes the encoder a stream goes through; read "
+                "a value column instead, e.g. video_bitrate l.bitrate",
+            )
+        # An input alias carries the container's own scalars and nothing else.
+        # Without this the read falls through to the row lookup, which would
+        # report the ALIAS as unknown when it is the column that is.
+        if isinstance(binding, _InputBinding) and not (
+            name == INPUT_DURATION_COLUMN
+            or tag_key(name) is not None
+            or name in _RENDITION_SCHEMA
+        ):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"sink option '{option.name}' reads '{written}', and "
+                f"'{binding.alias}' has no column '{column_label(name)}'",
+                column,
+                fallback=raw.path_node,
+                hint=f"an input carries its probed duration and its container "
+                f"tags: {binding.alias}.duration, {binding.alias}.tags.title",
+            )
 
     def _check_per_track_options(
         self,

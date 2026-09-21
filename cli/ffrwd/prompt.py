@@ -1072,6 +1072,19 @@ integer literal for an `int` option (`crf 20`), or `true`/`false` for a
 `bool` option (`faststart true`) -- a bare word with no quotes
 (`preset slow`) or a computed value are both rejected.
 
+A value may also be a ROW COLUMN (`video_bitrate l.bitrate`) or a
+subscripted list (`video_bitrate ARRAY['4500k', '2000k'][l.rung]`), which
+are two ways of writing the same thing and compile to the same command.
+Either is read ONCE PER ROW: gathered, the option holds one value per row
+in row order (`-b:0`, `-b:1`, ...), and under a fan-out `TO` it reads the
+one row that file is. The column is typed exactly as the literal in its
+place would be -- text for `video_bitrate`, an int for `crf` -- and a
+gathered mismatch names the row. NULL in a row means the option is not set
+for that row. Any column the value grammar can settle works: a struct row
+table's own column, `generate_series`'s value, a probed metadata column, a
+CTE's or a table function's value column, `f.duration`. A STREAM is not a
+value and is refused by name.
+
 ### One file per row
 
 `TO (<expression>)` -- parenthesized, not quoted -- writes ONE file per
@@ -1094,7 +1107,8 @@ COPY (
 The expression is the value grammar (`||`, `CASE`, `::text`, literals) and
 must be text. A `TO` expression reading no row column is just a constant
 path, and a quoted `TO 'path'` is unchanged -- every track still lands in
-that one file. `WITH (...)` applies to every file identically. Rejected:
+that one file. A `WITH (...)` option reading no row column applies to every
+file identically; one reading a row column varies per file. Rejected:
 a computed segment holding `/`, `\\` or `..`; two rows naming one file; zero
 surviving rows; a NULL name; and, in this version, fan-out with `two_pass`,
 a `chapters` column, `FORMAT csv`, `UNION ALL`, or another

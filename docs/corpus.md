@@ -2083,11 +2083,13 @@ ffmpeg -i tests/fixtures/av.mp4 -filter_complex \
 ```
 
 An option value is settled before ffmpeg runs, so what may stand there
-is a literal or a subscripted list variable and nothing else: a column
-off the media itself is a rejection naming the option. A subscript past
-the end of the list is the same rejection it is anywhere else, naming
-the list's length - so a `rates` list shorter than the series says so
-rather than writing a file at the wrong bitrate.
+is a literal, a subscripted list variable, or a row column - a stream
+off the media is a rejection naming the option. A subscript past the
+end of the list is the same rejection it is anywhere else, naming the
+list's length, so a `rates` list shorter than the series says so rather
+than writing a file at the wrong bitrate. Where the rates belong to the
+rows rather than to the command line, read them off the row instead
+([recipe 140](examples.md#140-ship-the-ladder-as-a-function)).
 
 ## 106. The widest rung of an ABR ladder
 

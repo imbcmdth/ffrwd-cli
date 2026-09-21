@@ -5910,6 +5910,21 @@ def test_every_rendition_is_a_pad_of_that_one_instance() -> None:
     assert widths == [640, 1280, 1920]
 
 
+def test_a_sink_ladder_reads_each_rungs_bitrate_off_the_row() -> None:
+    """A sink destination takes the encoder options a file destination takes,
+    so a rung's own value shapes the encoder behind its own pad."""
+    sql = LADDER_DECLARE + (
+        "COPY (SELECT array_agg(scale(f.video[1], r.width, -2)) "
+        "FROM input('a.mp4') f, unnest(ARRAY["
+        "STRUCT(640 AS width, '400k' AS rate), "
+        "STRUCT(1280 AS width, '1200k' AS rate)]) r) "
+        "TO tally() WITH (video_bitrate r.rate)"
+    )
+    graph = _ladder_graph(sql)
+    pads = graph.packet_sinks[graph.module_sinks[0]]
+    assert [pad["video_bitrate"] for pad in pads] == ["400k", "1200k"]
+
+
 def test_a_sink_reading_one_stream_refuses_a_ladder() -> None:
     sql = LADDER_DECLARE.replace("video_stream[]", "video_stream") + (
         "COPY (SELECT array_agg(scale(f.video[1], ARRAY[640, 1280][i.i], -2)) "

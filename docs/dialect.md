@@ -1288,14 +1288,33 @@ two-pass - the full table is generated into the prompt (`ffrwd
 prompt`) and validated per option with typed errors; a sink function
 destination takes none.
 
-An option value is a literal or `ARRAY[literal, ...][k]` - what
-`:'var'[k]` substitutes to - and nothing else: it is settled before
-ffmpeg runs, so a column off the media is a rejection naming the
-option. A subscript reading a row column picks per file, so a fan-out
-`TO` may vary its encode per rung ([recipe
-103](corpus.md#103-give-each-rung-of-the-ladder-its-own-encode));
-under a quoted `TO` there is no row to read, and that is a rejection
-too.
+An option value is a literal, `ARRAY[literal, ...][k]` - what
+`:'var'[k]` substitutes to - or a **row column**: it is settled before
+ffmpeg runs, and those are the three things that are. A stream is not,
+and reading one names the option and says so.
+
+A row column is read once per row and typed exactly as the literal in
+its place would be, so `video_bitrate l.bitrate` wants text where
+`video_bitrate '4500k'` does, and a number there is the same
+`SINK_OPTION_TYPE` rejection. NULL in a row means the option is not
+set for that row and the encoder's own default applies - what NULL
+means everywhere else, and what a NULL element of a subscripted list
+already meant. The column is any the value grammar can settle: a
+written row table's own column, a `generate_series` value, a probed
+metadata column of a track, chapter, cue or rendition row, a
+compile-time packet row's column, a CTE's or a table function's value
+column, or an input scalar such as `f.duration`.
+
+Gathered, the option holds one value per row, in row order, and a
+rejection names the row it read; that is how a ladder gives each rung
+its own encode ([recipe
+140](examples.md#140-ship-the-ladder-as-a-function)). Under a fan-out
+`TO` it reads the one row that command writes ([recipe
+103](corpus.md#103-give-each-rung-of-the-ladder-its-own-encode)), and
+under a quoted `TO` there is no row to read, which is a rejection. The
+two per-row spellings are interchangeable: `video_bitrate l.bitrate`
+and `video_bitrate ARRAY['4500k', '2000k'][l.rung]` compile to the same
+command for the same values.
 
 ## Variables
 

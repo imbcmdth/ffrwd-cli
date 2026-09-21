@@ -635,7 +635,9 @@ def test_a_stream_column_in_an_option_is_rejected_by_name() -> None:
     assert err.hint is not None and ":'rates'[i.i]" in err.hint
 
 
-def test_a_row_column_in_an_option_is_a_typed_option_rejection() -> None:
+def test_a_row_column_of_the_wrong_type_is_a_typed_option_rejection() -> None:
+    """A row column is typed exactly as the literal in its place would be. A
+    fan-out command IS one row, and the file it writes names it."""
     sql = (
         f"COPY (SELECT f.video[1] FROM input('{SRC}') f, generate_series(1, 2) i) "
         "TO ('r' || i.i::text || '.mp4') "
@@ -643,7 +645,102 @@ def test_a_row_column_in_an_option_is_a_typed_option_rejection() -> None:
     )
     err = _rejects(sql)
     assert err.code is ErrorCode.SINK_OPTION_TYPE
-    assert "option 'video_bitrate' expects a str" in err.message
+    assert err.message == "option 'video_bitrate' expects a str, got 1"
+
+
+# -- a row column as a sink option value --------------------------------------
+
+
+_ROWS = (
+    "unnest(ARRAY[STRUCT(640 AS width, '1200k' AS rate), "
+    "STRUCT(320 AS width, '400k' AS rate)]) r"
+)
+
+
+def _ladder_gathered(option: str) -> str:
+    """Two rungs into one file, the bitrate written however `option` says."""
+    return (
+        f"COPY (SELECT array_agg(scale(f.video[1], r.width, -2)) "
+        f"FROM input('{SRC}') f, {_ROWS}) "
+        f"TO 'o.mkv' WITH (video_codec 'libx264', {option})"
+    )
+
+
+def test_a_row_column_option_compiles_to_the_subscripted_lists_command() -> None:
+    """The whole contract: the two spellings are the same command for the same
+    values, so reading a value the query already carries costs nothing."""
+    subscripted = (
+        f"COPY (SELECT array_agg(scale(f.video[1], ARRAY[640, 320][i.i], -2)) "
+        f"FROM input('{SRC}') f, generate_series(1, 2) i) "
+        "TO 'o.mkv' WITH (video_codec 'libx264', "
+        "video_bitrate ARRAY['1200k', '400k'][i.i])"
+    )
+    read = _ladder_gathered("video_bitrate r.rate")
+    assert build_ffmpeg_args(emit(compile_sql(read))) == build_ffmpeg_args(
+        emit(compile_sql(subscripted))
+    )
+
+
+def test_a_gathered_option_names_the_row_whose_value_was_wrong() -> None:
+    """Gathered, the option holds one value per row in one command, so the
+    rejection has to say which row it read."""
+    err = _rejects(_ladder_gathered("video_bitrate r.width"))
+    assert err.code is ErrorCode.SINK_OPTION_TYPE
+    assert err.message == "option 'video_bitrate' expects a str, got 640, in row 1"
+
+
+def test_a_row_column_option_binds_per_file_under_a_fan_out() -> None:
+    sql = (
+        f"COPY (SELECT scale(f.video[1], r.width, -2) FROM input('{SRC}') f, {_ROWS}) "
+        "TO ('r' || r.width::text || '.mp4') "
+        "WITH (video_codec 'libx264', video_bitrate r.rate)"
+    )
+    assert [unit.options["video_bitrate"] for unit in _units(sql)] == ["1200k", "400k"]
+
+
+def test_a_null_row_cell_leaves_the_option_unset_for_that_row() -> None:
+    """NULL is absence everywhere else in the dialect, and a NULL element of a
+    subscripted list already reads that way; a NULL cell is the same."""
+    rows = _ROWS.replace("'400k' AS rate", "NULL AS rate")
+    sql = _ladder_gathered("video_bitrate r.rate").replace(_ROWS, rows)
+    assert _units(sql)[0].options["video_bitrate"] == ["1200k", None]
+
+
+def test_an_option_reads_a_probed_metadata_column_off_a_track_row() -> None:
+    """Every row relation the value grammar settles qualifies, probed columns
+    and tag paths included, not only a written row table's own cells."""
+    sql = (
+        f"COPY (SELECT t FROM input('{SRC}') f, unnest(f.audio) t) "
+        "TO ('a' || t.index::text || '.m4a') "
+        "WITH (audio_codec 'aac', audio_bitrate t.tags.language)"
+    )
+    assert [unit.options["audio_bitrate"] for unit in _units(sql)] == ["eng", "fra"]
+
+
+def test_an_option_reading_a_column_an_input_has_not_got_says_so() -> None:
+    """The alias is known and the column is not, which is what the message has
+    to say: the row lookup alone would report the alias as unknown."""
+    sql = (
+        f"COPY (SELECT f.video[1] FROM input('{SRC}') f) TO 'o.mkv' "
+        "WITH (video_codec 'libx264', video_bitrate f.nope)"
+    )
+    err = _rejects(sql)
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert err.message == (
+        "sink option 'video_bitrate' reads 'f.nope', and 'f' has no column 'nope'"
+    )
+
+
+def test_a_stream_column_in_an_option_says_it_is_not_a_value() -> None:
+    sql = (
+        f"COPY (WITH vid AS (SELECT f.video[1] AS v FROM input('{SRC}') f) "
+        "SELECT vid.v FROM vid) TO 'o.mkv' "
+        "WITH (video_codec 'libx264', video_bitrate vid.v)"
+    )
+    err = _rejects(sql)
+    assert err.code is ErrorCode.SINK_OPTION_TYPE
+    assert "reads 'vid.v', which is a stream rather than a value" in err.message
+    assert err.hint is not None and "video_bitrate l.bitrate" in err.hint
 
 
 def test_two_pass_and_a_fan_out_to_are_rejected() -> None:
