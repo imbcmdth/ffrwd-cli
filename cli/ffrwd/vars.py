@@ -17,8 +17,14 @@ elements for ``:name``, string literals for ``:'name'`` -- and lowering
 reads the element per row. An identifier reference names a compile-time
 name, so ``:"name"[...]`` takes a literal subscript only. A subscript past
 the end of the list is a rejection naming the list's length. Without a
-subscript, a comma-carrying value stays exactly the one raw text it
-always was.
+subscript, a comma-carrying value stays exactly the one raw text it always
+was, with one exception: a ``:'name'`` that is the WHOLE body of an
+``ARRAY[...]``, whitespace aside, writes one string literal per element, so
+``ARRAY[:'bitrates']`` is the three-element array ``ARRAY[:widths]`` already
+is by raw text. Anywhere else -- beside another element, inside a call, in
+an option -- a quoted reference stays the one literal it always was, so a
+comma in a title or a path never splits, and ``:"name"`` never splits at
+all.
 
 An UNSET reference substitutes to the bare keyword ``NULL`` -- absence, which
 every binding site treats as "not written" and the required positions reject.
@@ -133,6 +139,8 @@ def substitute(text: str, variables: dict[str, str]) -> Substitution:
                         subscript[0],
                         at=_line_col(text, i),
                     )
+                elif text[i + 1] == "'" and _whole_array_body(text, i, ref_end):
+                    replacement = _listed(variables[name])
                 else:
                     replacement = _replacement(text[i + 1], variables[name])
                 out.append(replacement)
@@ -274,12 +282,7 @@ def _element(
                 hint="an identifier is a compile-time name, so its subscript "
                 f'must be an integer literal, e.g. :"{name}"[1]',
             )
-        if quote == "'":
-            listed = ",".join(
-                "'" + element.replace("'", "''") + "'" for element in elements
-            )
-        else:
-            listed = value
+        listed = _listed(value) if quote == "'" else value
         return f"ARRAY[{listed}][{body}]"
     raise FfrwdError(
         ErrorCode.UNSUPPORTED_SQL,
@@ -288,6 +291,45 @@ def _element(
         col=col,
         hint="a list subscript is a positive integer literal or a row "
         f"column, e.g. :{name}[1] or :{name}[i.i]",
+    )
+
+
+_ARRAY = "ARRAY"
+_SPACE = " \t\r\n"
+
+
+def _whole_array_body(text: str, start: int, end: int) -> bool:
+    """Whether the reference spanning ``text[start:end]`` is all an
+    ``ARRAY[...]`` holds, whitespace aside.
+
+    Only that position splits a quoted value on commas, because only there is
+    the array's shape what the writer asked for; beside another element, or
+    anywhere else, a comma is part of the value.
+    """
+    at = start
+    while at > 0 and text[at - 1] in _SPACE:
+        at -= 1
+    if at == 0 or text[at - 1] != "[":
+        return False
+    at -= 1
+    while at > 0 and text[at - 1] in _SPACE:
+        at -= 1
+    word = at - len(_ARRAY)
+    if word < 0 or text[word:at].upper() != _ARRAY:
+        return False
+    # Not the tail of a longer name (`myARRAY[...]`).
+    if word > 0 and (text[word - 1].isalnum() or text[word - 1] == "_"):
+        return False
+    at = end
+    while at < len(text) and text[at] in _SPACE:
+        at += 1
+    return at < len(text) and text[at] == "]"
+
+
+def _listed(value: str) -> str:
+    """A comma-split value as string literals, the elements of an array."""
+    return ",".join(
+        "'" + element.replace("'", "''") + "'" for element in value.split(",")
     )
 
 

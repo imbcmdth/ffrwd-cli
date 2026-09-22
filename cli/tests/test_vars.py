@@ -240,3 +240,60 @@ def test_a_subscript_the_grammar_has_no_reading_for_is_rejected() -> None:
 def test_identifier_form_takes_a_literal_subscript_only() -> None:
     err = _substitution_error(':"xs"[i.i]', {"xs": "a,b"})
     assert "identifier" in (err.hint or "")
+
+
+# -- a quoted reference filling an ARRAY -----------------------------------
+
+
+def test_a_quoted_reference_filling_an_array_lists_its_elements() -> None:
+    """One string literal per element, so the quoted form spells the array the
+    bare form already spells by raw text."""
+    assert (
+        substitute("ARRAY[:'xs']", {"xs": "4500k,2000k,900k"}).text
+        == "ARRAY['4500k','2000k','900k']"
+    )
+    assert substitute("ARRAY[:'xs']", {"xs": "O'Brien,b"}).text == (
+        "ARRAY['O''Brien','b']"
+    )
+
+
+def test_whitespace_still_leaves_the_reference_the_whole_body() -> None:
+    assert substitute("ARRAY[\n  :'xs'\n]", {"xs": "a,b"}).text == (
+        "ARRAY[\n  'a','b'\n]"
+    )
+
+
+def test_a_quoted_reference_anywhere_else_stays_one_literal() -> None:
+    """A comma in a title or a path is part of the value: only a reference
+    that is all the array holds is read as a list."""
+    assert substitute("input(:'src')", {"src": "a,b.mkv"}).text == "input('a,b.mkv')"
+    assert (
+        substitute("ARRAY[:'a', :'b']", {"a": "x,y", "b": "z"}).text
+        == "ARRAY['x,y', 'z']"
+    )
+
+
+def test_a_value_with_no_comma_is_a_one_element_array() -> None:
+    assert substitute("ARRAY[:'xs']", {"xs": "solo"}).text == "ARRAY['solo']"
+
+
+def test_the_identifier_form_never_lists() -> None:
+    """A list of identifiers is not a thing: the whole value stays one name."""
+    assert substitute('ARRAY[:"xs"]', {"xs": "a,b"}).text == 'ARRAY["a,b"]'
+
+
+def test_an_unset_variable_in_an_array_is_still_one_null() -> None:
+    sub = substitute("ARRAY[:'xs']", {})
+    assert sub.text == "ARRAY[NULL]"
+    assert sub.unset == {(1, 7): "xs"}
+
+
+def test_only_the_array_keyword_opens_a_listed_body() -> None:
+    """The bracket alone is a subscript, and a name ending in `array` is a
+    name -- neither writes an array for the value to fill."""
+    assert substitute("[:'xs']", {"xs": "a,b"}).text == "['a,b']"
+    assert substitute("myarray[:'xs']", {"xs": "a,b"}).text == "myarray['a,b']"
+
+
+def test_a_subscripted_reference_inside_an_array_is_still_its_element() -> None:
+    assert substitute("ARRAY[:'xs'[2]]", {"xs": "a,b"}).text == "ARRAY['b']"

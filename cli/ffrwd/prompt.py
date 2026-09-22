@@ -421,6 +421,13 @@ _DIALECT_TAIL = """\
 - `:'name'` (string literal), `:"name"` (identifier) and bare `:name` (raw
   text) are psql-style references, filled at compile time by `-v name=value`
   (the MCP tools' `vars`). An UNSET reference substitutes to `NULL`.
+- A `-v` value splits on commas only where the query asks: `:name[k]` /
+  `:'name'[k]` is one element, `:name[i.i]` reads one per row, and a
+  `:'name'` that is all an `ARRAY[...]` holds is the whole list, one string
+  literal per element -- `ARRAY[:'bitrates']` under
+  `-v bitrates=4500k,2000k,900k` is the array `ARRAY[:widths]` under
+  `-v widths=1280,854,640` is. Anywhere else a quoted reference is one
+  literal, commas and all, so a comma in a path or a title is safe.
 - NULL is absence: a NULL in any option position -- filter option
   (positional or named, `enable` included), source option, `input()` option,
   `WITH (...)` option -- means the option is not written and ffmpeg's own

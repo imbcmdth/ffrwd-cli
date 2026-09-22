@@ -95,8 +95,11 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   option. That is what lets the caller pass the rungs rather than the
   function carrying them - `ladder(f.video[1], ARRAY[1280, 854, 640],
   ARRAY['4500k', '2000k', '900k'], 3)` - for the same command the
-  ladder written longhand compiles to. A subscript past the end of the
-  array the caller passed is refused, naming the range it has.
+  ladder written longhand compiles to. Either list is writable as a
+  `-v` list (`ARRAY[:widths]`, `ARRAY[:'bitrates']`, see
+  [Variables](#variables)), so the rungs can come from the command
+  line. A subscript past the end of the array the caller passed is
+  refused, naming the range it has.
 - A **record list parameter** (`rungs STRUCT(width number, bitrate
   text)[]`) is the same rungs written as rows rather than as parallel
   lists, and a body reads them with `unnest(rungs) r`: `r.width`,
@@ -1206,6 +1209,8 @@ value := literal | NULL | row-column | input-scalar
 
        | :'var' | :"var" | :var    -- CLI -v substitution, psql's forms
        | :var[k] | :'var'[k]        -- one element of a comma-split -v list
+       | ARRAY[:'var']              -- a whole comma-split -v list, one string
+                                    -- literal per element
        | ARRAY[literal, ...][k]     -- an array element; the subscript is a
                                     -- positive integer literal or a number
                                     -- row column, picked per row
@@ -1225,11 +1230,12 @@ count comes from the rungs. A dimension other than 1, and anything but
 a written array to count, are refusals.
 
 An array element's list is literals of one type - written out, or what
-a comma-split `-v` list substitutes to - and may be parenthesized. The
-subscript is 1-based as Postgres, and one past either end is a
-rejection naming the length rather than Postgres's NULL: every
-relation here is counted before ffmpeg runs, so a rung that quietly
-picked nothing would ship a command with the option missing and
+a comma-split `-v` list substitutes to (`ARRAY[:widths]` as raw
+elements, `ARRAY[:'bitrates']` as one string literal each) - and may be
+parenthesized. The subscript is 1-based as Postgres, and one past
+either end is a rejection naming the length rather than Postgres's
+NULL: every relation here is counted before ffmpeg runs, so a rung that
+quietly picked nothing would ship a command with the option missing and
 nothing to say why.
 
 `::text` is the spelling; `CAST(value AS text)` compiles too, but only
@@ -1430,9 +1436,27 @@ a row column (`:widths[i.i]`) - then the reference substitutes to an
 for `:'name'`) and the element is read per row during lowering, under
 the same static rule subscripts have everywhere. An identifier is a
 compile-time name, so `:"name"[...]` takes a literal subscript only.
+
 Unsubscripted, a comma-carrying value stays the one raw text it always
-was - splitting happens only where a subscript asks for it. The whole
-variable unset stays NULL-is-absence, subscripted or not.
+was, with ONE exception: a `:'name'` that is the whole body of an
+`ARRAY[...]`, whitespace aside, writes one string literal per
+comma-split element. So `ARRAY[:'bitrates']` under
+`-v bitrates=4500k,2000k,900k` is a three-element array, the way
+`ARRAY[:widths]` under `-v widths=1280,854,640` has always been one by
+raw text, and a ladder taking parallel lists
+(`ladder(p.v, ARRAY[:widths], ARRAY[:'bitrates'], ARRAY[:'bufsizes'])`)
+reads the same from the command line whether a column's elements are
+numbers or text. A value with no comma is the one-element array it
+already was.
+Anywhere else - beside another element, as a call argument, as an
+option value - a quoted reference stays the single literal it always
+was, so a comma inside a title or a path never splits it, and
+`:"name"` never splits at all: a list of identifiers is not a thing
+here. The whole variable unset stays NULL-is-absence, subscripted or
+not, in an array or not: `ARRAY[:'bitrates']` unset is `ARRAY[NULL]`,
+a one-element array of absence, and what refuses it is the array's own
+rule about elements and length rather than a message naming the
+variable.
 
 The check on `-v` points the other way: since an unset reference is
 legal, `-v name=value` for a name the text never references is the

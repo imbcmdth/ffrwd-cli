@@ -1323,6 +1323,31 @@ def test_an_array_parameters_element_carries_the_arrays_element_type() -> None:
     assert _argv(_ARRAY_LADDER_CALL, probes) == _argv(_LONGHAND_LADDER, probes)
 
 
+def test_the_caller_hands_the_rungs_over_as_command_line_lists() -> None:
+    """The same call with the three lists left to `-v`: a quoted reference
+    filling an ARRAY writes one string literal per element, so the text
+    columns arrive as arrays the way the number column always did, and the
+    ladder is the longhand one's command again."""
+    from ffrwd.vars import substitute
+
+    sql = substitute(
+        ARRAY_LADDER
+        + _ARRAY_LADDER_COPY.replace(
+            _ARRAY_LADDER_RUNGS,
+            "ARRAY[:widths],\n"
+            "             ARRAY[:'bitrates'],\n"
+            "             ARRAY[:'bufsizes']",
+        ),
+        {
+            "widths": "1280,854,640",
+            "bitrates": "4500k,2000k,900k",
+            "bufsizes": "2250k,1000k,450k",
+        },
+    ).text
+    probes = {"f": _video_probe()}
+    assert _argv(sql, probes) == _argv(_LONGHAND_LADDER, probes)
+
+
 def test_a_constant_subscript_over_an_array_parameter_is_its_element() -> None:
     """No row column in the subscript at all: still text, and every rung then
     carries the same bitrate."""
