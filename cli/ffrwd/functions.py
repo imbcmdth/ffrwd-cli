@@ -95,6 +95,7 @@ from __future__ import annotations
 import copy
 import difflib
 import re
+from collections import Counter
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
@@ -141,6 +142,7 @@ from .warnings import FfrwdWarning, OnWarning, WarningCode
 
 __all__ = [
     "NAMEABLE_TYPES",
+    "SHARED_ARGUMENT",
     "SINK_STREAMS",
     "WASM_STREAM_NAMES",
     "WASM_STREAM_TYPES",
@@ -159,6 +161,11 @@ __all__ = [
 # The FROM item that mints an `-i`. Never an argument: it is a table, and a
 # table reference in a value position is not SQL.
 _INPUT = "input"
+
+# `node.meta` key: the copies of one stream argument a body reads in more
+# than one place all carry the same value here, and lowering builds what is
+# behind it once for them all (:func:`_substitute`).
+SHARED_ARGUMENT = "shared_argument"
 
 # Names a definition may not claim: the dialect's own FROM item, the two
 # reserved namespaces, the built-in vector and row functions, and every name
@@ -2645,24 +2652,57 @@ def _accessor(argument: exp.Expr, path: list[exp.Identifier]) -> exp.Expr:
     return read
 
 
-def _substitute(body: exp.Select, bindings: dict[str, exp.Expr]) -> None:
+def _substitute(body: exp.Select, bindings: dict[str, exp.Expr], index: int) -> None:
     """Replace every parameter reference with the argument bound to it.
 
     A bare reference becomes the argument itself; a reference with a path off
     it (``track.tags.language``) becomes the accessor form over the argument,
     which is what the same query written by hand parses to.
+
+    A STREAM argument a body reads more than once is one expression the
+    caller wrote, not several, so every copy of it carries one shared key
+    (:data:`SHARED_ARGUMENT`) and lowering builds the chain behind it once --
+    a module written there is hosted once and split, exactly as binding it
+    in a CTE first already gives. `index` is the expansion's own, so two
+    calls to one function never share. A value costs nothing to read twice
+    and is left alone.
     """
-    for column in list(body.find_all(exp.Column)):
+    reads = list(body.find_all(exp.Column))
+    shared = _shared_parameters(reads, bindings)
+    for column in reads:
         key = _leftmost(column)
         if key is None:
             continue
-        argument = bindings.get(_ident_name(column.args.get(key)))
+        name = _ident_name(column.args.get(key))
+        argument = bindings.get(name)
         if argument is None:
             continue
         if key == "this":
-            column.replace(copy.deepcopy(argument))
+            read = copy.deepcopy(argument)
+            if name in shared:
+                read.meta[SHARED_ARGUMENT] = f"{index}:{name}"
+            column.replace(read)
             continue
         column.replace(_accessor(argument, _path_after(column, key)))
+
+
+def _shared_parameters(
+    reads: Sequence[exp.Column], bindings: dict[str, exp.Expr]
+) -> set[str]:
+    """The parameters whose argument is one stream read in more than one place."""
+    counts: Counter[str] = Counter()
+    for column in reads:
+        key = _leftmost(column)
+        if key != "this":
+            continue
+        name = _ident_name(column.args.get(key))
+        if name in bindings:
+            counts[name] += 1
+    return {
+        name
+        for name, count in counts.items()
+        if count > 1 and _argument_kind(bindings[name]) == "stream"
+    }
 
 
 def _item_alias(item: exp.Expr) -> str | None:
@@ -4210,7 +4250,7 @@ class _Expander:
         _rename(body, self._fresh_aliases(function, index))
         self._stamp(body, index)
         bound = self._bound(function, arguments)
-        _substitute(body, {p.name: a for p, a in zip(function.params, bound)})
+        _substitute(body, {p.name: a for p, a in zip(function.params, bound)}, index)
         return body, index
 
     def _expand_call(

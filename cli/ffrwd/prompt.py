@@ -499,6 +499,11 @@ _DIALECT_TAIL = """\
   always writes `:width` needs NULL to mean "not given" here as well. A
   parameter with no DEFAULT still takes NULL as written, unchanged -- that
   is the escape when a caller means NULL itself.
+- An ARGUMENT is one expression, however often the body reads the
+  parameter. A stream argument read twice is built once and split, so a
+  module or a filter chain written there is hosted once rather than twice --
+  the same command binding that expression in a CTE first compiles to. A
+  value argument costs nothing to read twice and is simply read twice.
 - A VALUE-returning function is legal anywhere a value of its type is: a
   SELECT column, `WHERE`, a `tags` field, a fan-out `TO`. A
   `<kind>_stream[]` return splats like a bare array column.

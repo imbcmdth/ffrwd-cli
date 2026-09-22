@@ -289,7 +289,13 @@ from sqlglot import exp
 
 from ffrwd import binaries, loudnorm
 from ffrwd.errors import ErrorCode, FfrwdError
-from ffrwd.functions import WASM_STREAM_NAMES, Annotation, Parameter, WasmFunction
+from ffrwd.functions import (
+    SHARED_ARGUMENT,
+    WASM_STREAM_NAMES,
+    Annotation,
+    Parameter,
+    WasmFunction,
+)
 from ffrwd.inputs import render_options
 from ffrwd.inputs import validate_option as validate_input_option
 from ffrwd.ir import (
@@ -3485,6 +3491,10 @@ class _Lowerer:
         # (:meth:`_variadic_array`) from doing that work, and any node it
         # creates, a second time.
         self._variadic_array_cache: dict[int, _Value] = {}
+        # (shared argument key, id(branch environment)) -> its lowered value.
+        # An argument an inlined body reads in more than one place is built
+        # once for them all (:meth:`_lower_expr`).
+        self._shared_arguments: dict[tuple[str, int], _Value] = {}
         # The refusals this branch's VARIADIC calls deferred by lowering an
         # aggregate over no rows to a NULL cell (:meth:`_variadic_array`).
         self.empty_aggregates: list[FfrwdError] = []
@@ -10302,6 +10312,27 @@ class _Lowerer:
     # -- expressions ------------------------------------------------------
 
     def _lower_expr(self, node: exp.Expr, env: _Env, select: exp.Select) -> _Value:
+        """One stream expression's value, built once where it is SHARED.
+
+        A stream argument an inlined function body reads in more than one
+        place is ONE expression the caller wrote: expansion stamps every copy
+        of it with the same key, and the value is built once for them all, so
+        a module or a filter chain written there is hosted once and split --
+        what binding the same expression in a CTE first already gave. The
+        branch is part of the key: a copy lowered under another environment
+        is another value, and is built again.
+        """
+        shared = node.meta.get(SHARED_ARGUMENT)
+        if shared is None:
+            return self._lower_stream_expr(node, env, select)
+        key = (str(shared), id(env))
+        found = self._shared_arguments.get(key)
+        if found is None:
+            found = self._lower_stream_expr(node, env, select)
+            self._shared_arguments[key] = found
+        return found
+
+    def _lower_stream_expr(self, node: exp.Expr, env: _Env, select: exp.Select) -> _Value:
         node = _unwrap(node)
         # An array of cue records IS a subtitle track, so it lowers here, in a
         # stream position, and not as an output column the way `chapters` does.

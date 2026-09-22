@@ -1536,6 +1536,42 @@ def test_a_call_joins_a_cte_the_query_already_wrote() -> None:
     ]
 
 
+PULLBACK = (
+    "CREATE FUNCTION pullback(v video_stream, w number) RETURNS video_stream AS $$\n"
+    "  SELECT overlay(v, scale(v, w, -2), 0, 0)\n"
+    "$$ LANGUAGE sql;\n"
+)
+
+
+def test_a_filter_chain_argument_is_built_once_however_often_it_is_read() -> None:
+    """The argument is ONE expression the caller wrote: a body reading its
+    parameter twice splits what it was handed rather than building a second
+    chain, which is what binding the same expression in a CTE already gave."""
+    inline = PULLBACK + (
+        "COPY (SELECT pullback(hflip(f.video[1]), 320) FROM input('a.mp4') f)\n"
+        "TO 'o.mkv'"
+    )
+    bound = PULLBACK + (
+        "COPY (WITH m AS (SELECT hflip(f.video[1]) AS v FROM input('a.mp4') f)\n"
+        "      SELECT pullback(m.v, 320) FROM m)\n"
+        "TO 'o.mkv'"
+    )
+    args = _argv(inline)
+    assert " ".join(args).count("hflip") == 1
+    assert args == _argv(bound)
+
+
+def test_a_value_argument_read_twice_stays_the_value_it_is() -> None:
+    """Reading a number twice costs nothing, so nothing is shared and the two
+    reads are the two options they were written as."""
+    sql = PULLBACK.replace(
+        "overlay(v, scale(v, w, -2), 0, 0)", "scale(v, w, w)"
+    ) + (
+        "COPY (SELECT pullback(f.video[1], 320) FROM input('a.mp4') f) TO 'o.mkv'"
+    )
+    assert _scales(_argv(sql)) == ["320"]
+
+
 def test_a_table_function_body_may_call_a_value_function() -> None:
     """The call computes the declared value column; the stream rides beside it,
     keeping whatever tags it already carried."""

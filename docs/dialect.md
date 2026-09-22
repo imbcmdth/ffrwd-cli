@@ -66,6 +66,14 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   omitted trailing argument takes it. Recipes
   [67-68](examples.md#67-write-a-function-and-reuse-it),
   [79](examples.md#79-give-a-parameter-a-default).
+- An **argument is one expression**, however often the body reads the
+  parameter. A stream argument read twice is built once and split, so
+  `pullback(switch(src.v, 9000))` over a body reading `v` twice hosts
+  one module rather than two on one port, and
+  `pullback(scale(f.video[1], 640, -2))` writes one `scale` in the
+  filtergraph. That is what binding the same expression in a CTE first
+  gives, and the two spellings compile to the same command. A value
+  argument costs nothing to read twice and is simply read twice.
 - A `TABLE`-returning function's arguments read the FROM items written
   to its left, so a stream can be handed to one and the body runs once
   per outer row - an encoding ladder is a function a package ships

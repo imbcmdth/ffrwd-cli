@@ -408,6 +408,27 @@ def test_a_filters_output_read_by_two_modules_runs(tmp_path: Path) -> None:
     )
 
 
+# A body that reads its stream parameter twice: the module handed to it is
+# one expression the caller wrote, whichever way the caller names it.
+_PULLBACK = (
+    "CREATE FUNCTION pullback(v video_stream) RETURNS video_stream AS $$\n"
+    "  SELECT overlay(v, scale(v, 32, -2), 0, 0)\n"
+    "$$ LANGUAGE sql;\n"
+)
+
+
+def test_a_module_argument_read_twice_runs_as_the_cte_bound_form(
+    tmp_path: Path,
+) -> None:
+    """One instance of the module, split to both reads, and the frames the
+    same as binding it in a CTE first writes."""
+    inline = tmp_path / "inline.mkv"
+    bound = tmp_path / "bound.mkv"
+    _run_query(_PULLBACK + _copy_to("pullback(inv(f.video[1]))", inline))
+    _run_query(_PULLBACK + _fanned_copy("inv(f.video[1])", "pullback(m.v)", bound))
+    assert _stream_md5(inline, 0) == _stream_md5(bound, 0)
+
+
 def test_the_fan_out_writes_one_stream_per_branch(tmp_path: Path) -> None:
     """Two columns, two streams, every frame of each."""
     out_path = tmp_path / "fanned.mkv"

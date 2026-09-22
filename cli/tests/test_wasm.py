@@ -6042,6 +6042,52 @@ def test_a_module_handed_to_a_table_function_is_one_instance_for_every_row() -> 
     assert filters.count("split") == 1
 
 
+# A body that reads its stream parameter TWICE, over the module as the
+# argument and over the same module bound in a CTE first.
+_PULLBACK = (
+    f"CREATE FUNCTION invert(v video_stream) RETURNS video_stream "
+    f"AS '{MODULE}', 'invert' LANGUAGE wasm;\n"
+    "CREATE FUNCTION pullback(v video_stream, w number) RETURNS video_stream AS $$ "
+    "  SELECT overlay(v, scale(v, w, -2), 0, 0) $$ LANGUAGE sql;\n"
+)
+_PULLBACK_INLINE = _PULLBACK + (
+    "COPY (SELECT pullback(invert(f.video[1]), 320) FROM input('a.mp4') f) TO 'o.mkv'"
+)
+_PULLBACK_BOUND = _PULLBACK + (
+    "COPY (WITH m AS (SELECT invert(f.video[1]) AS v FROM input('a.mp4') f) "
+    "SELECT pullback(m.v, 320) FROM m) TO 'o.mkv'"
+)
+
+
+def test_a_module_argument_is_one_instance_however_often_the_body_reads_it() -> None:
+    """The argument is ONE expression the caller wrote, so a body reading its
+    parameter twice splits what it was given rather than building it twice.
+    Two instances would be two copies of the module on one port."""
+    graphs = [
+        insert_splits(
+            lower(
+                _resolved(sql), {},
+                registry=_snapshot_registry(),
+                describes={MODULE: _described()},
+            )
+        )
+        for sql in (_PULLBACK_INLINE, _PULLBACK_BOUND)
+    ]
+    for graph in graphs:
+        filters = [node.filter for node in graph.nodes.values()]
+        assert filters.count(MODULE) == 1
+        assert filters.count("scale") == 1
+        assert filters.count("split") == 1
+    plans = [_compiled(sql).plan for sql in (_PULLBACK_INLINE, _PULLBACK_BOUND)]
+    assert all(plan is not None for plan in plans)
+    for plan in plans:
+        assert plan is not None
+        assert len([p for p in plan.processes if isinstance(p, SidecarProcess)]) == 1
+    assert plan_argv(plans[0], sidecar_argv=wasm.shown_argv) == plan_argv(
+        plans[1], sidecar_argv=wasm.shown_argv
+    )
+
+
 # -- a sink that reads SEVERAL streams --------------------------------------
 
 LADDER_MODULE = "modules/packet_tally.wasm"
