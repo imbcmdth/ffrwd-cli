@@ -347,12 +347,17 @@ _ARGUMENT_KINDS: list[tuple[_ArgumentShape, str]] = [
     ),
 ]
 
+# What a written record shape (`STRUCT(...)[]`) classifies as: a list of
+# rows, which is neither a value nor a stream.
+_RECORD_KIND = "record"
+
 # How each kind is named back to the writer in a rejection.
 _KIND_NAMES = {
     "text": "a string",
     "number": "a number",
     "boolean": "true or false",
     "stream": "a stream",
+    _RECORD_KIND: "a list of rows",
 }
 
 # Body positions live in this line range, one SPAN per expansion, so a
@@ -1284,6 +1289,7 @@ class _Declared:
     allow_default: bool = False
     allow_annotation: bool = False
     allow_vector: bool = False
+    allow_record_array: bool = False
 
 
 _PARAMETER = _Declared(
@@ -1293,6 +1299,7 @@ _PARAMETER = _Declared(
     "no INOUT, no VARIADIC, no COLLATE",
     once="one name, one position",
     allow_default=True,
+    allow_record_array=True,
 )
 # A wasm signature reads the same way, plus the annotation column a module
 # that consumes rows takes, and `vector` -- legal only where a value
@@ -1409,8 +1416,18 @@ def _column_defs(
             declared.append(Parameter(written, annotation.written, default, annotation))
             continue
         kind_node = node.args.get("kind")
+        # A STRUCT(...)[] parameter is a LIST OF ROWS the caller hands over,
+        # which a body reads with `unnest(<param>) r`. Same record shape an
+        # annotation column declares, in a position that means something else.
+        record = (
+            _annotation(kind_node, written, name, anchor)
+            if kind.allow_record_array
+            else None
+        )
         declared_type = (
-            _VECTOR_TYPE
+            record.written
+            if record is not None
+            else _VECTOR_TYPE
             if kind.allow_vector and _type_name(kind_node) == _VECTOR_TYPE
             else _checked_type(kind_node, name, anchor)
         )
@@ -1426,7 +1443,7 @@ def _column_defs(
                 fallback=create,
                 hint="every parameter after the first DEFAULT must have one too",
             )
-        declared.append(Parameter(written, declared_type, default))
+        declared.append(Parameter(written, declared_type, default, record))
     return tuple(declared)
 
 
@@ -3059,14 +3076,119 @@ def _declared_kind(declared: str) -> str:
     rather than a lookup that would raise. `packets` is not in it either,
     and reads as a stream: a packet filter hands back the stream it was
     given, so a cell that calls one is a stream cell wherever a destination
-    consumes one.
+    consumes one. A written record shape is not in it either, and is its own
+    bucket too: a list of rows is neither a value nor a stream.
     """
     element = element_type(declared)
     if element == _VECTOR_TYPE:
         return _VECTOR_TYPE
     if element == WASM_PACKETS:
         return "stream"
+    if element not in TYPES:
+        return _RECORD_KIND
     return "stream" if TYPES[element].kind != "scalar" else declared
+
+
+def _record_rows(argument: exp.Expr) -> list[exp.Expr] | None:
+    """The rows a ``STRUCT(...)[]`` argument writes, or None for anything else."""
+    node = _unparen(argument)
+    if not isinstance(node, exp.Array):
+        return None
+    return [item for item in node.expressions if isinstance(item, exp.Expr)]
+
+
+def _record_argument_fields(struct: exp.Struct) -> dict[str, exp.Expr]:
+    """One written ``STRUCT(value AS name, ...)`` as its fields, by name."""
+    return {
+        _ident_name(entry.this): entry.expression
+        for entry in struct.expressions
+        if isinstance(entry, exp.PropertyEQ) and isinstance(entry.expression, exp.Expr)
+    }
+
+
+def _record_example(record: Annotation) -> str:
+    """One row of a declared record, spelled the way a caller writes it."""
+    inner = ", ".join(f"<{field.type}> AS {field.name}" for field in record.fields)
+    return f"STRUCT({inner})"
+
+
+def _unparen(node: exp.Expr) -> exp.Expr:
+    """`node` with every wrapping paren taken off."""
+    while isinstance(node, exp.Paren) and isinstance(node.this, exp.Expr):
+        node = node.this
+    return node
+
+
+def _check_record_argument(
+    function: _Function, param: Parameter, argument: exp.Expr, call: exp.Anonymous
+) -> None:
+    """One ``STRUCT(...)[]`` argument against the record the signature declares.
+
+    The argument is the list of rows the body will ``unnest``, so it is
+    checked as a list: an array of STRUCTs, each naming exactly the declared
+    fields, each field written as the declared type says. A row that
+    disagrees is named by its POSITION, which is how the body reads it.
+    """
+    record = param.annotation
+    if record is None:  # unreachable: only a record parameter reaches here
+        return
+    rows = _record_rows(argument)
+    if rows is None:
+        got = _argument_kind(argument)
+        raise _error(
+            ErrorCode.UDF_ARG_TYPE,
+            f"{function.qualified}() takes {param.type} as its '{param.name}' "
+            f"argument, got {_KIND_NAMES.get(got or '', 'that')}",
+            argument,
+            fallback=call,
+            hint=function.signature,
+        )
+    if not rows:
+        raise _error(
+            ErrorCode.UDF_ARG_TYPE,
+            f"{function.qualified}()'s '{param.name}' argument is an empty list "
+            "of rows",
+            argument,
+            fallback=call,
+            hint=f"write at least one row, e.g. ARRAY[{_record_example(record)}]",
+        )
+    declared = {field.name: field.type for field in record.fields}
+    for position, row in enumerate(rows, start=1):
+        where = f"row {position} of {function.qualified}()'s '{param.name}' argument"
+        struct = _unparen(row)
+        if not isinstance(struct, exp.Struct):
+            raise _error(
+                ErrorCode.UDF_ARG_TYPE,
+                f"{where} is not a STRUCT",
+                row,
+                fallback=call,
+                hint=f"every row of a record list writes the declared fields, "
+                f"e.g. {_record_example(record)}",
+            )
+        fields = _record_argument_fields(struct)
+        odd = sorted(set(declared) ^ set(fields))
+        if odd:
+            said = "is missing" if odd[0] in declared else "writes an unknown"
+            raise _error(
+                ErrorCode.UDF_ARG_TYPE,
+                f"{where} {said} field '{odd[0]}'",
+                struct,
+                fallback=call,
+                hint=function.signature,
+            )
+        for name, value in fields.items():
+            written = _argument_kind(value)
+            if written is None or written == declared[name]:
+                continue
+            raise _error(
+                ErrorCode.UDF_ARG_TYPE,
+                f"{where} writes '{name}' as "
+                f"{_KIND_NAMES.get(written, written)}, and it is declared "
+                f"{declared[name]}",
+                value,
+                fallback=call,
+                hint=function.signature,
+            )
 
 
 def _is_null(node: exp.Expr) -> bool:
@@ -4418,6 +4540,11 @@ class _Expander:
                     fallback=call,
                     hint=_ARG_HINT,
                 )
+            if param.annotation is not None:
+                # A record list is checked row by row, not by shape alone.
+                if not _is_null(argument):
+                    _check_record_argument(function, param, argument, call)
+                continue
             written = _argument_kind(argument, self.wasm)
             if written is None or written == _declared_kind(param.type):
                 continue

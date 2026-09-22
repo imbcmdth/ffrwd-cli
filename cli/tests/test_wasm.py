@@ -6129,22 +6129,38 @@ def test_a_sink_ladder_reads_each_rungs_bitrate_off_the_row() -> None:
     assert [pad["video_bitrate"] for pad in pads] == ["400k", "1200k"]
 
 
-def test_a_sink_ladder_takes_the_rungs_the_caller_passed() -> None:
+# The rungs as parallel lists, and as one list of records: two spellings of
+# the same ladder, both read off the call rather than carried by the function.
+_ARRAY_RUNGS = (
+    "CREATE FUNCTION rungs(v video_stream, widths number[], rates text[]) "
+    "RETURNS TABLE(v video_stream, rate text) AS $$ "
+    "  SELECT scale(v, widths[i.i], -2), rates[i.i] "
+    "  FROM generate_series(1, array_length(widths, 1)) i $$ LANGUAGE sql;\n"
+    "COPY (SELECT array_agg(l.v) FROM input('a.mp4') f, "
+    "rungs(f.video[1], ARRAY[640, 1280], ARRAY['400k', '1200k']) l) "
+    "TO tally() WITH (video_bitrate l.rate)"
+)
+_STRUCT_RUNGS = (
+    "CREATE FUNCTION rungs(v video_stream, "
+    "rows STRUCT(width number, rate text)[]) "
+    "RETURNS TABLE(v video_stream, rate text) AS $$ "
+    "  SELECT scale(v, r.width, -2), r.rate FROM unnest(rows) r $$ LANGUAGE sql;\n"
+    "COPY (SELECT array_agg(l.v) FROM input('a.mp4') f, "
+    "rungs(f.video[1], ARRAY[STRUCT(640 AS width, '400k' AS rate), "
+    "STRUCT(1280 AS width, '1200k' AS rate)]) l) "
+    "TO tally() WITH (video_bitrate l.rate)"
+)
+
+
+@pytest.mark.parametrize("sql", [_ARRAY_RUNGS, _STRUCT_RUNGS])
+def test_a_sink_ladder_takes_the_rungs_the_caller_passed(sql: str) -> None:
     """The ladder as a function the caller configures: the widths and the
-    bitrates are array arguments, read one element per row, and what reaches
-    each pad's encoder is the element that row read."""
-    sql = LADDER_DECLARE + (
-        "CREATE FUNCTION rungs(v video_stream, widths number[], rates text[], "
-        "count number) RETURNS TABLE(v video_stream, rate text) AS $$ "
-        "  SELECT scale(v, widths[i.i], -2), rates[i.i] "
-        "  FROM generate_series(1, count) i $$ LANGUAGE sql;\n"
-        "COPY (SELECT array_agg(l.v) FROM input('a.mp4') f, "
-        "rungs(f.video[1], ARRAY[640, 1280], ARRAY['400k', '1200k'], 2) l) "
-        "TO tally() WITH (video_bitrate l.rate)"
-    )
-    graph = _ladder_graph(sql)
-    sink = next(node for node in graph.nodes.values() if node.filter == LADDER_MODULE)
-    assert [graph.nodes[ref].args["width"] for ref in sink.inputs] == [640, 1280]
+    bitrates are arguments, read one row each, and what reaches each pad's
+    encoder is the element that row read. Both spellings, one sink."""
+    graph = _ladder_graph(LADDER_DECLARE + sql)
+    sinks = [node for node in graph.nodes.values() if node.filter == LADDER_MODULE]
+    assert len(sinks) == 1
+    assert [graph.nodes[ref].args["width"] for ref in sinks[0].inputs] == [640, 1280]
     pads = graph.packet_sinks[graph.module_sinks[0]]
     assert [pad["video_bitrate"] for pad in pads] == ["400k", "1200k"]
 

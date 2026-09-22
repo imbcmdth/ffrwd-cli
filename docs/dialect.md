@@ -23,7 +23,7 @@ A query is ONE statement, or a script:
 ```
 query   := select | copy
 script  := (function ;)* (CREATE VIEW name AS select ;)* (copy ;)* copy?
-function := CREATE FUNCTION name(param type [DEFAULT literal], ...) RETURNS rtype
+function := CREATE FUNCTION name(param ptype [DEFAULT literal], ...) RETURNS rtype
             AS $$ select $$ LANGUAGE sql
           | CREATE FUNCTION name(stream wstype, ...,
                                  [ann annotation [DEFAULT NULL],]
@@ -33,6 +33,8 @@ function := CREATE FUNCTION name(param type [DEFAULT literal], ...) RETURNS rtyp
             AS 'module', 'export' LANGUAGE wasm
           | CREATE FUNCTION name(rows annotation) RETURNS annotation
             AS 'module', 'export' LANGUAGE wasm
+ptype   := text | number | boolean | vector | <kind>_stream | chapter | cue
+         | attachment | any of those with [] | annotation
 rtype   := text | number | boolean | vector | <kind>_stream | chapter | cue
          | attachment | any of those with [] | TABLE(col type, ...)
 wstype  := video_stream | audio_stream | either of those with []
@@ -84,6 +86,15 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   ARRAY['4500k', '2000k', '900k'], 3)` - for the same command the
   ladder written longhand compiles to. A subscript past the end of the
   array the caller passed is refused, naming the range it has.
+- A **record list parameter** (`rungs STRUCT(width number, bitrate
+  text)[]`) is the same rungs written as rows rather than as parallel
+  lists, and a body reads them with `unnest(rungs) r`: `r.width`,
+  `r.bitrate`, and `r.index` for the rung number. The caller passes an
+  `ARRAY[STRUCT(...), ...]`, or a variable that substitutes to one, and
+  a row missing a declared field, carrying one nobody declared, writing
+  one as the wrong type, or not being a `STRUCT` at all is refused by
+  its POSITION in the list, which is how the body reads it. Both
+  spellings compile to the same command as the ladder written longhand.
 - A **`LANGUAGE wasm` function** names a wasm module and one export
   in it, and is called like any other function. It has no body to
   inline: the module runs in the `ffrwd-wasm` sidecar, so a query

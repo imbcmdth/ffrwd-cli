@@ -148,6 +148,12 @@ The NULL flavor: a stream position cannot be absent, so a NULL there — an unse
 {"line": 1, "col": 20, "code": "UDF_ARG_TYPE", "message": "':clip' was not set", "hint": "scale() needs a stream in this position; set it with -v clip=<value>"}
 ```
 
+The record-list flavor: a `STRUCT(...)[]` parameter takes the rows a body will `unnest`, so the argument is checked row by row and the refusal names the POSITION the body reads the bad one at. A row missing a declared field, carrying one nobody declared, writing one as the wrong type, or not being a `STRUCT` at all each land here:
+
+```json
+{"line": 8, "col": 53, "code": "UDF_ARG_TYPE", "message": "row 2 of ladder()'s 'rungs' argument writes 'bitrate' as a number, and it is declared text", "hint": "ladder(v video_stream, rungs STRUCT(width number, bitrate text)[]) RETURNS TABLE(v video_stream, rung number, bitrate text)"}
+```
+
 Two row-shape flavors belong to a packet sink read at compile time ([rows.md](rows.md#packet-rows---ffrwdindexrecordsfvideo1-v)), where the declaration is what types the alias's columns. Before anything runs, a declared column the module's own row schema never writes:
 
 ```json
@@ -228,6 +234,18 @@ The `LATERAL` rejections land here. A call in `FROM` is already lateral, so the 
 
 ```json
 {"line": 2, "col": 30, "code": "UNSUPPORTED_SQL", "message": "LATERAL means nothing before 'c', which is a name rather than a call", "hint": "a call in FROM already sees the items written before it, so LATERAL is optional: FROM input('a.mp4') f, ladder(f.video[1]) l"}
+```
+
+Two counting rejections land here. `array_length(<array>, 1)` and `cardinality(<array>)` count a WRITTEN array while compiling, so a dimension other than 1, and anything but a written array to count, are refused; a stream column's length is a probe's answer rather than the query's:
+
+```json
+{"line": 2, "col": 26, "code": "UNSUPPORTED_SQL", "message": "array_length counts a written array, not a column reference", "hint": "array_length(<array>, 1) and cardinality(<array>) count a WRITTEN array: a literal, a substituted list (ARRAY[:widths]), or an array parameter inside a function body, which is the caller's list by the time this runs"}
+```
+
+And a `generate_series` bound is a whole number the compiler can count, which keeps the row count known before anything runs:
+
+```json
+{"line": 2, "col": 26, "code": "UNSUPPORTED_SQL", "message": "generate_series's stop must be a whole number the compiler can count, not a column reference", "hint": "generate_series(start, stop[, step]) takes whole numbers the compiler can count: an integer literal, a substituted variable (generate_series(1, :count)), array_length(<array>, 1), or arithmetic over those -- a column reference is not one"}
 ```
 
 Two argument-shape rejections land here: a named argument written out of place (a positional after a named one, or the same name twice - standard Postgres rules), and a named argument on a `ffrwd.<name>` macro, whose signature is positional only:

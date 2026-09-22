@@ -1331,6 +1331,64 @@ def test_a_subscript_past_the_end_of_an_array_argument_is_refused() -> None:
     assert error.hint == "subscript from 1 to 3"
 
 
+# The same rungs as one list of records rather than three parallel lists.
+STRUCT_LADDER = (
+    "CREATE FUNCTION ladder(v video_stream,\n"
+    "                      rungs STRUCT(width number, bitrate text, bufsize text)[])\n"
+    "RETURNS TABLE(v video_stream, rung number, bitrate text, bufsize text) AS $$\n"
+    "  SELECT scale(v, r.width, -2), r.index, r.bitrate, r.bufsize\n"
+    "  FROM unnest(rungs) r\n"
+    "$$ LANGUAGE sql;\n"
+)
+_STRUCT_LADDER_CALL = STRUCT_LADDER + (
+    "COPY (SELECT l.v FROM input('a.mp4') f,\n"
+    "      ladder(fps(f.video[1], 30), ARRAY[\n"
+    "        STRUCT(1280 AS width, '4500k' AS bitrate, '2250k' AS bufsize),\n"
+    "        STRUCT(854 AS width, '2000k' AS bitrate, '1000k' AS bufsize),\n"
+    "        STRUCT(640 AS width, '900k' AS bitrate, '450k' AS bufsize)]) l)\n"
+    "TO 'out/master.m3u8' WITH (format 'hls', hls_time 2, video_codec 'libx264',\n"
+    "  video_bitrate l.bitrate, maxrate l.bitrate, bufsize l.bufsize, gop 30)"
+)
+
+
+def test_a_struct_array_parameter_takes_the_rungs_as_one_list() -> None:
+    """A rung is a record, so the caller writes it as one and the body unnests
+    the list. Same ladder, same command as the longhand one."""
+    probes = {"f": _video_probe()}
+    assert _argv(_STRUCT_LADDER_CALL, probes) == _argv(_LONGHAND_LADDER, probes)
+
+
+@pytest.mark.parametrize(
+    ("written", "needle"),
+    [
+        (
+            "ARRAY[STRUCT(1280 AS width, '4500k' AS bitrate)]",
+            "row 1 of ladder()'s 'rungs' argument is missing field 'bufsize'",
+        ),
+        (
+            "ARRAY[STRUCT(1280 AS width, 4500 AS bitrate, '2250k' AS bufsize)]",
+            "row 1 of ladder()'s 'rungs' argument writes 'bitrate' as a number, "
+            "and it is declared text",
+        ),
+        (
+            "ARRAY[1280, 640]",
+            "row 1 of ladder()'s 'rungs' argument is not a STRUCT",
+        ),
+        (
+            "3",
+            "ladder() takes STRUCT(width number, bitrate text, bufsize text)[] "
+            "as its 'rungs' argument, got a number",
+        ),
+    ],
+)
+def test_a_record_list_argument_is_refused_by_the_row(written: str, needle: str) -> None:
+    sql = STRUCT_LADDER + (
+        f"COPY (SELECT l.v FROM input('a.mp4') f, ladder(f.video[1], {written}) l)\n"
+        "TO 'out.mp4'"
+    )
+    _rejects(sql, ErrorCode.UDF_ARG_TYPE, needle)
+
+
 def test_a_wrongly_typed_element_of_an_array_argument_names_the_row() -> None:
     """The array is the caller's, so the mistake is caught where the value
     lands -- with the row that carried it."""

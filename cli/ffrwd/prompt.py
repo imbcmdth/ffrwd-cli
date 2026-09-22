@@ -484,7 +484,9 @@ _DIALECT_TAIL = """\
 - Parameter and `RETURNS` types are the dialect's own: `text`, `number`,
   `boolean`, `video_stream`/`audio_stream`/`subtitle_stream`/`data_stream`,
   `chapter`, `cue`, `attachment`, any of those with `[]`, or
-  `TABLE(<col> <type>, ...)`.
+  `TABLE(<col> <type>, ...)`. A PARAMETER may also be a record list,
+  `STRUCT(<field> <vtype>, ...)[]` -- rows the caller hands over, which a
+  body reads with `unnest(<param>) r`.
 - A parameter may declare `DEFAULT <literal>` -- a number, string, or
   boolean matching its own type, or `DEFAULT NULL`, which makes the
   parameter omissible with NULL (absence) as its value. Every parameter written after
@@ -532,6 +534,13 @@ _DIALECT_TAIL = """\
   FROM generate_series(1, rungs) i` compiles to the command the same
   ladder written longhand does. A subscript past the end of the array
   the caller passed is refused, naming the range it has.
+- A RECORD LIST parameter (`rungs STRUCT(width number, bitrate text)[]`)
+  is the same rungs written as rows instead of parallel lists, read with
+  `unnest(rungs) r` -- `r.width`, `r.bitrate`, `r.index` for the rung
+  number. The caller passes `ARRAY[STRUCT(...), ...]`, or a variable that
+  substitutes to one. A row missing a declared field, carrying an
+  undeclared one, writing one as the wrong type, or not being a `STRUCT`
+  at all is `UDF_ARG_TYPE` naming its POSITION in the list.
 - The body is ONE `SELECT` with no `WITH`, no `GROUP BY`/`ORDER BY`/
   `LIMIT`, referencing only its parameters and its own `FROM` aliases. No
   `OR REPLACE`, no `IF NOT EXISTS`, no schema-qualified name, no `OUT`/
