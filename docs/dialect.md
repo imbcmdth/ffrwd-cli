@@ -105,7 +105,8 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   a row missing a declared field, carrying one nobody declared, writing
   one as the wrong type, or not being a `STRUCT` at all is refused by
   its POSITION in the list, which is how the body reads it. Both
-  spellings compile to the same command as the ladder written longhand.
+  spellings compile to the same command as the ladder written longhand
+  (recipe [142](corpus.md#142-let-the-caller-choose-the-rungs)).
 - A **`LANGUAGE wasm` function** names a wasm module and one export
   in it, and is called like any other function. It has no body to
   inline: the module runs in the `ffrwd-wasm` sidecar, so a query

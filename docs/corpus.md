@@ -2984,3 +2984,41 @@ $ ffrwd compile -f query.sql
 ```
 
 Process 2 is that ffmpeg: one input, one `split`, and two outputs - a pad straight onto the pipe `double` reads, and a pad through `hflip` to the destination. The producer is run once whatever reads it; two calls in the query are still two instances, as everywhere else.
+
+## 142. Let the caller choose the rungs
+
+[Recipe 140](examples.md#140-ship-the-ladder-as-a-function)'s ladder carries its own rungs: the widths and the bitrates are written into the function, and a caller who wants other ones edits it. A parameter can be a list of RECORDS instead, so the rungs belong to the call - one `STRUCT` per rung, its width beside the encoder settings that go with that width - and the function is only the shape. `unnest(rungs) r` reads them, and `r.index` is the rung number, the 1-based position every row table carries:
+
+```pgsql
+CREATE FUNCTION ladder(v video_stream,
+                       rungs STRUCT(width number, bitrate text, bufsize text)[])
+RETURNS TABLE(v video_stream, rung number, bitrate text, bufsize text) AS $$
+  SELECT scale(v, r.width, -2), r.index, r.bitrate, r.bufsize
+  FROM unnest(rungs) r
+$$ LANGUAGE sql;
+
+COPY (
+  SELECT l.v
+  FROM input('tests/fixtures/av.mp4') f,
+       ladder(fps(f.video[1], 15),
+              ARRAY[STRUCT(320 AS width, '800k' AS bitrate, '1600k' AS bufsize),
+                    STRUCT(160 AS width, '300k' AS bitrate,  '600k' AS bufsize)]) l
+) TO 'out/master.m3u8'
+  WITH (format 'hls', hls_time 2, hls_playlist_type 'vod',
+        video_codec 'libx264', video_bitrate l.bitrate,
+        maxrate l.bitrate, bufsize l.bufsize)
+```
+
+```
+$ ffrwd compile -f query.sql
+ffmpeg -i tests/fixtures/av.mp4 -filter_complex \
+  '[0:v:0]fps=fps=15,split=2[n1_split0][n1_split1];'\
+'[n1_split0]scale=width=320:height=-2[out0];[n1_split1]scale=width=160:height=-2[out1]' \
+  -map '[out0]' -map '[out1]' -f hls -hls_time 2 -hls_playlist_type vod -c:0 libx264 \
+  -c:1 libx264 -b:0 800k -b:1 300k -maxrate:0 800k -maxrate:1 300k -bufsize:0 1600k \
+  -bufsize:1 600k -g:0 30 -g:1 30 -keyint_min:0 30 -keyint_min:1 30 -sc_threshold:0 0 \
+  -sc_threshold:1 0 -var_stream_map 'v:0,name:240p v:1,name:120p' -master_pl_name \
+  master.m3u8 -hls_segment_filename out/%v/segment_%d.ts out/%v/index.m3u8
+```
+
+Nothing tells the function how many rungs there are: the list says. The other spelling hands the columns over as parallel arrays - `ladder(v video_stream, widths number[], bitrates text[])`, read as `widths[i.i]` over `generate_series(1, array_length(widths, 1))` - and needs no count either, since a written array's length is settled while compiling. Both compile to the command [recipe 104](examples.md#104-publish-the-ladder-as-hls)'s ladder does with a rate control block added, which is what keeps the function a naming convenience rather than a second way through the compiler.
