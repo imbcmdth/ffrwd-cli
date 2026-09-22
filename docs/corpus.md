@@ -2942,7 +2942,7 @@ Three of the nine keyframes score above the cutoff, so the command carries three
 
 Declared `RETURNS sink` instead and written after `TO`, the same module is the run-time destination it has always been: nothing is read while compiling, and its rows ride the sidecar's stdout as they are written ([recipe 100](#100-read-the-encoders-output-packet-by-packet)).
 
-## 140. Use a module's output more than once
+## 141. Use a module's output more than once
 
 A column that is a module's output reads like any other: name it in a CTE and read it twice. It is not like any other underneath, though - a module's frames leave its sidecar on one pipe, so the `split` the compiler inserts cannot sit above that pipe the way a split over a source column sits above the `-i`. It lands in the ffmpeg reading the pipe instead, which gives each reader its own pad:
 

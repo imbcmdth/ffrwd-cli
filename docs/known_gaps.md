@@ -148,7 +148,7 @@ from.
   Reading a module's output column more than once is not that shape and
   is ordinary: the `split` lands in the ffmpeg reading the module's one
   pipe, and each reader gets a pad
-  ([recipe 140](corpus.md#140-use-a-modules-output-more-than-once)). The
+  ([recipe 140](corpus.md#141-use-a-modules-output-more-than-once)). The
   readers have to share that one ffmpeg, though, so they must be handed
   the same streams — a reader that also needs frames another module
   writes cannot join the others, and a `UNSUPPORTED_SQL` names what reads
