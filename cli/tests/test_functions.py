@@ -1217,6 +1217,47 @@ def test_an_inlined_alias_is_read_back_only_where_it_was_bound() -> None:
     assert args.count("0:a:0") == 3
 
 
+_CTE_OVER_LADDER = LADDER + (
+    "COPY (\n"
+    "  WITH vid AS (SELECT {written}\n"
+    "               FROM input('a.mp4') f, ladder(fps(f.video[1], 30)) l)\n"
+    "  SELECT vid.v FROM vid)\n"
+    "TO ('r' || vid.rung::text || '.mp4') WITH (video_codec 'libx264',\n"
+    "  video_bitrate vid.bitrate)"
+)
+
+
+def test_an_unaliased_column_of_an_inlined_call_keeps_its_name() -> None:
+    """`SELECT l.v` names the column `v`, the way an unaliased column of any
+    other FROM item does, so a CTE over the call exposes it. The expression
+    behind it names nothing of its own, which is why it has to be written."""
+    probes = {"f": _video_probe()}
+    bare = _CTE_OVER_LADDER.format(written="l.v, l.rung, l.bitrate")
+    aliased = _CTE_OVER_LADDER.format(
+        written="l.v AS v, l.rung AS rung, l.bitrate AS bitrate"
+    )
+    assert _argv(bare, probes) == _argv(aliased, probes)
+    assert _scales(_argv(bare, probes)) == ["1280", "854", "640"]
+
+
+def test_a_cte_over_an_inlined_call_mixes_aliased_and_bare_columns() -> None:
+    """One column renamed, the others read back under their own names."""
+    sql = _CTE_OVER_LADDER.format(
+        written="l.v, l.rung AS n, l.bitrate"
+    ).replace("vid.rung", "vid.n")
+    args = _argv(sql, {"f": _video_probe()})
+    assert [arg for arg in args if arg.endswith(".mp4") and arg != "a.mp4"] == [
+        "r1.mp4",
+        "r2.mp4",
+        "r3.mp4",
+    ]
+    assert [after for flag, after in zip(args, args[1:]) if flag == "-b:0"] == [
+        "4500k",
+        "2000k",
+        "900k",
+    ]
+
+
 def test_a_bare_lateral_alias_is_not_a_value() -> None:
     sql = LADDER + (
         "COPY (SELECT l FROM input('a.mp4') f, ladder(f.video[1]) l) TO 'out.mp4'"

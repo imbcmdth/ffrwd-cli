@@ -2717,6 +2717,23 @@ def _alias_reads(call: exp.Anonymous) -> list[tuple[str, exp.Column, bool]]:
     return reads
 
 
+def _named_projection(read: exp.Column, replacement: exp.Expr, name: str) -> exp.Expr:
+    """`replacement`, aliased `name` where `read` stood as a bare projection.
+
+    An unaliased ``<item>.<column>`` in a SELECT list is named ``<column>``,
+    and a relation reading that SELECT back exposes it under that name. The
+    expression an inlined call's column becomes has no such name of its own,
+    so the one it was read under is written out; everywhere else -- inside a
+    call, in a WHERE, under an alias the query wrote -- nothing is added.
+    """
+    select = read.parent
+    if not isinstance(select, exp.Select) or not any(
+        node is read for node in select.expressions
+    ):
+        return replacement
+    return exp.Alias(this=replacement, alias=exp.Identifier(this=name, quoted=False))
+
+
 def _star_of(column: exp.Column) -> str | None:
     """The alias a ``<alias>.*`` names, or None for anything else."""
     if not isinstance(column.this, exp.Star):
@@ -4352,6 +4369,13 @@ class _Expander:
         function does not declare is the rejection it would have been off a CTE.
         ``<alias>.*`` becomes the STREAM columns it declared, which is what a
         star over a table function's alias has always meant.
+
+        A projection nobody aliased keeps the name it was read under: what
+        went in as ``l.v`` comes out named ``v``, the way an unaliased column
+        of any other FROM item does. The body expression behind it carries no
+        such name of its own -- ``scale(...)`` names nothing -- so without
+        this a CTE over the call would expose its value columns and lose
+        every stream one.
         """
         exposed = ", ".join(column.name for column in function.columns or ())
         for column in self._alias_readers(host, alias):
@@ -4383,7 +4407,10 @@ class _Expander:
                     f"{exposed}",
                 )
             read = copy.deepcopy(found)
-            column.replace(read if len(path) == 1 else _accessor(read, path[1:]))
+            written = _ident_name(path[-1])
+            if len(path) > 1:
+                read = _accessor(read, path[1:])
+            column.replace(_named_projection(column, read, written))
 
     def _alias_readers(self, host: exp.Select, alias: str) -> list[exp.Column]:
         """Every column reading `alias`, in the one query where it is bound.

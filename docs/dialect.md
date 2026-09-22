@@ -76,7 +76,10 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   stream argument is the outer row's, so `ladder(blur(f.video[1]))`
   blurs once and splits into the rungs - under a fan-out `TO`, which
   builds each file on its own, it blurs per file
-  ([known_gaps.md](known_gaps.md)).
+  ([known_gaps.md](known_gaps.md)). A column read off the call's alias
+  is named like a column read off anything else: `SELECT l.v` is `v`
+  unless an `AS` says otherwise, so a CTE over the call exposes the
+  stream columns as well as the value ones.
 - An **array parameter** (`widths number[]`, `bitrates text[]`) is one
   value the call passes, and a subscript over it is the array's ELEMENT
   type wherever the body writes it: inside a call, as a declared value

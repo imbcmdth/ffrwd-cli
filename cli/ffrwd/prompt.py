@@ -518,7 +518,9 @@ _DIALECT_TAIL = """\
   stream argument is the outer row's, so `ladder(blur(f.video[1]))`
   blurs once and splits into the rungs at a manifest or a `RETURNS
   sink` destination; a fan-out `TO` builds each file on its own and
-  blurs per file.
+  blurs per file. A column read off the alias is named like any other
+  unaliased column read: `SELECT l.v` is `v`, so a CTE over the call
+  exposes its stream columns as well as its value ones.
   `LATERAL fn(...) t` and `CROSS JOIN LATERAL fn(...) t` are accepted
   spellings of the same thing and add nothing; the keyword is refused
   before a CTE or view name, under an outer join, and with
