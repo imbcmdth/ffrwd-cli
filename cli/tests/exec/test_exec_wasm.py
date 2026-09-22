@@ -258,6 +258,169 @@ def test_the_twinned_query_runs_to_a_playable_file(tmp_path: Path) -> None:
     assert twin["nb_read_frames"] == source["nb_read_frames"]
 
 
+# -- a module's output read more than once, really run ---------------------
+#
+# The fan-out the compiler used to refuse: a CTE column that is a module's
+# output, or a plain filter's, read by two consumers at least one of which is
+# a module. The stream crosses a pipe, so the split has to land in the one
+# ffmpeg reading the producer's pipe. What these run is the whole thing, and
+# what they check is that each branch carries the pictures that branch alone
+# would have carried -- the same query written one branch at a time.
+
+# Two names over the one module: two calls are two instances either way, and
+# separate names keep what each branch reads readable.
+_INVERT_AS = {
+    name: (
+        f"CREATE FUNCTION {name}(v video_stream) RETURNS video_stream\n"
+        f"  AS '{_MODULE.as_posix()}', 'invert' LANGUAGE wasm;\n"
+    )
+    for name in ("inv", "inv2")
+}
+
+
+def _declared(select: str) -> str:
+    """The declarations `select` calls, and no others: an uncalled one is refused."""
+    return "".join(
+        block for name, block in _INVERT_AS.items() if f"{name}(" in select
+    )
+
+
+def _run_query(sql: str) -> None:
+    """Run one query, whether it needs the sidecar or one plain ffmpeg."""
+    compiled = compile_all(sql)
+    if compiled.plan is None:
+        (graph,) = compiled.graphs
+        argv = build_ffmpeg_args(emit(graph))
+        done = subprocess.run(
+            [argv[0], "-y", *argv[1:]],
+            capture_output=True,
+            text=True,
+            timeout=_SUBPROCESS_TIMEOUT,
+            check=False,
+        )
+        assert done.returncode == 0, done.stderr
+        return
+    result = execute_plan(
+        compiled.plan,
+        sidecar_argv=wasm.sidecar_argv,
+        overwrite=True,
+        timeout=_SUBPROCESS_TIMEOUT,
+    )
+    assert result.exit_code == 0, "\n".join(
+        f"{member.id} exited {member.exit_code}: {member.stderr_tail}"
+        for stage in result.stages
+        for member in stage.members
+    )
+    assert not result.timed_out
+
+
+def _copy_to(select: str, out_path: Path) -> str:
+    """One lossless COPY of `select` over the fixture, declarations included."""
+    return (
+        _declared(select)
+        + "COPY (\n"
+        + f"  SELECT {select}\n"
+        + f"  FROM input('{_SOURCE.as_posix()}') f\n"
+        + f") TO '{out_path.as_posix()}' WITH (video_codec 'ffv1')"
+    )
+
+
+def _fanned_copy(produce: str, read: str, out_path: Path) -> str:
+    """`produce` as a CTE column, read twice, both branches into one file."""
+    return (
+        _declared(produce + read)
+        + "COPY (\n"
+        + f"  WITH m AS (SELECT {produce} AS v FROM input('{_SOURCE.as_posix()}') f)\n"
+        + f"  SELECT {read}\n"
+        + "  FROM m\n"
+        + f") TO '{out_path.as_posix()}' WITH (video_codec 'ffv1')"
+    )
+
+
+def _stream_md5(path: Path, index: int) -> list[str]:
+    """One md5 per decoded frame of video stream `index`."""
+    done = subprocess.run(
+        [
+            "ffmpeg", "-v", "error", "-i", str(path),
+            "-map", f"0:v:{index}", "-f", "framemd5", "-",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=_SUBPROCESS_TIMEOUT,
+        check=False,
+    )
+    assert done.returncode == 0, done.stderr
+    lines = [
+        line.split(",")[-1].strip()
+        for line in done.stdout.splitlines()
+        if line and not line.startswith("#")
+    ]
+    assert lines, f"{path} stream {index} decoded to nothing"
+    return lines
+
+
+def _branches_match(
+    tmp_path: Path, produce: str, read: str, alone: tuple[str, str]
+) -> None:
+    """Both branches of a fan-out, against the same two written one at a time.
+
+    Every branch ends in a module, so both spellings hand the destination the
+    same frames in the same pixel format: what is compared is the fan-out, not
+    a colour conversion one topology happens to do and the other does not.
+    """
+    fanned = tmp_path / "fanned.mkv"
+    _run_query(_fanned_copy(produce, read, fanned))
+    assert fanned.exists()
+
+    for index, select in enumerate(alone):
+        one = tmp_path / f"alone{index}.mkv"
+        _run_query(_copy_to(select, one))
+        assert _stream_md5(fanned, index) == _stream_md5(one, 0), select
+
+
+def test_a_modules_output_read_by_two_modules_runs(tmp_path: Path) -> None:
+    """Shape (a). Three sidecars, one split in the ffmpeg below the producer."""
+    _branches_match(
+        tmp_path,
+        "inv(f.video[1])",
+        "inv(m.v) AS x, inv2(inv2(m.v)) AS y",
+        ("inv(inv(f.video[1]))", "inv(inv(inv(f.video[1])))"),
+    )
+
+
+def test_a_modules_output_read_by_a_module_and_a_filter_runs(tmp_path: Path) -> None:
+    """Shape (b). One leg leaves on a pipe, the other carries on in ffmpeg."""
+    _branches_match(
+        tmp_path,
+        "inv(f.video[1])",
+        "inv(m.v) AS x, inv2(hflip(m.v)) AS y",
+        ("inv(inv(f.video[1]))", "inv2(hflip(inv(f.video[1])))"),
+    )
+
+
+def test_a_filters_output_read_by_two_modules_runs(tmp_path: Path) -> None:
+    """Shape (d). The producer is plain ffmpeg; both readers are modules."""
+    _branches_match(
+        tmp_path,
+        "hflip(f.video[1])",
+        "inv(m.v) AS x, inv2(inv2(m.v)) AS y",
+        ("inv(hflip(f.video[1]))", "inv2(inv2(hflip(f.video[1])))"),
+    )
+
+
+def test_the_fan_out_writes_one_stream_per_branch(tmp_path: Path) -> None:
+    """Two columns, two streams, every frame of each."""
+    out_path = tmp_path / "fanned.mkv"
+    _run_query(
+        _fanned_copy("inv(f.video[1])", "inv(m.v) AS x, hflip(m.v) AS y", out_path)
+    )
+    source = _video_stream(_SOURCE)
+    for index in (0, 1):
+        assert len(_stream_md5(out_path, index)) == int(
+            str(source["nb_read_frames"])
+        )
+
+
 # -- the annotated chain: one module's rows reaching the next --------------
 
 _FACEBOX = _built(_SIDECAR_MODULES, "facebox")

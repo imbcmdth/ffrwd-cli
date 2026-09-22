@@ -4365,6 +4365,27 @@ def test_the_module_a_query_wrote_twice_is_instantiated_twice() -> None:
     assert _instances(plan) == [FAN_A, FAN_B, FAN_B]
 
 
+def test_a_pad_two_unlike_readers_want_is_refused_by_name() -> None:
+    """The one shape left: the legs are handed different things, so they
+    cannot share a reader, and a module writes its frames once. A typed
+    refusal names what reads them and says what to write instead."""
+    sql = FAN_DECLARE["fan_a"] + FAN_DECLARE["fan_b"] + (
+        "COPY (WITH m AS (SELECT fan_a(f.video[1]) AS v, fan_b(f.video[1]) AS w\n"
+        "                 FROM input('a.mp4') f)\n"
+        "      SELECT fan_b(m.v) AS x, ffmpeg.overlay(m.v, m.w) AS y\n"
+        "      FROM m) TO 'out.mkv'"
+    )
+    with pytest.raises(FfrwdError) as caught:
+        compile_all(sql, describe=lambda path: FAN_MODULES[path])
+    error = caught.value
+    assert error.code is ErrorCode.UNSUPPORTED_SQL
+    assert f"the frames '{FAN_A}' writes are read by" in error.message
+    assert "'overlay'" in error.message and f"'{FAN_B}'" in error.message
+    assert "hands its frames over on one pipe" in error.message
+    assert error.hint is not None and "once per reader" in error.hint
+    assert (error.line, error.col) == (1, 17)  # anchored on the declaration
+
+
 def test_no_pad_of_a_fanned_out_module_is_read_twice() -> None:
     """What the INTERNAL this fixed was raised on: every process renders."""
     for read in (

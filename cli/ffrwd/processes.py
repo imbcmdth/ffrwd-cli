@@ -1395,18 +1395,20 @@ class _Partitioner:
         already take, and the one a source fan-out takes through
         :meth:`_sibling_feeder`.
 
-        The legs must read exactly alike, as a sibling feeder's do, so joining
-        them changes nothing about what is opened or consumed. What it drops is
-        that method's requirement that both feed the SAME consumer: a module's
-        pad cannot be read twice whoever the two readers feed.
+        Both legs must be handed the same refs, so joining adds no demand of
+        its own and cannot make the process DAG a cycle. Two of a sibling
+        feeder's three requirements are dropped: the legs need not feed the
+        same consumer, since a module's pad cannot be read twice whoever reads
+        it; and they need not open the same inputs, since an input is one more
+        ``-i`` on the joined reader rather than something it waits for.
         """
-        leg = self._feeder_reads(nodes, [ref])
-        if not any(self._from_module(other) for other in leg[1]):
+        _, wanted = self._feeder_reads(nodes, [ref])
+        if not any(self._from_module(other) for other in wanted):
             return None
         for process in self.pending:
             if process.id == target or process.depth != depth:
                 continue
-            if self._feeder_reads(process.nodes, process.pipes) == leg:
+            if self._feeder_reads(process.nodes, process.pipes)[1] == wanted:
                 return process
         return None
 
@@ -1414,6 +1416,61 @@ class _Partitioner:
         """True when `ref` is a pad of a node only a sidecar can run."""
         producer = _ref_node(ref)
         return producer is not None and self.external.get(producer, False)
+
+    def _check_handed_once(self) -> None:
+        """Refuse a plan asking one module pad to leave on two pipes.
+
+        A module writes its own stdout, once, so the split over its output
+        belongs to the single process reading that pipe -- which is where
+        :meth:`_once_reader` puts it. Two readers left over are two readers
+        this run could not join, and the plan is one nothing can spawn: the
+        refusal names the stream and what reads it rather than letting emit
+        find the pad twice over.
+        """
+        for sidecar in self.sidecars:
+            if sidecar.packet_source:
+                continue  # each track is its own named pipe by construction
+            handed: dict[FrameRef, set[str]] = {}
+            for edge in self.edges:
+                if edge.source == sidecar.id:
+                    handed.setdefault(edge.ref, set()).add(edge.target)
+            for ref, targets in handed.items():
+                if len(targets) < 2:
+                    continue
+                readers = self._pad_readers(ref)
+                raise FfrwdError(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"the frames '{sidecar.module}' writes are read by "
+                    f"{readers}, each in a process of its own, and a module "
+                    "hands its frames over on one pipe",
+                    hint="call the module once per reader: two calls are two "
+                    "instances, each writing a pipe of its own. A reader that "
+                    "must share the frames belongs in the same COPY as the "
+                    "others, over a column no module produced",
+                )
+
+    def _pad_readers(self, ref: FrameRef) -> str:
+        """What reads `ref`, named: the filters, through any split between."""
+        found: list[str] = []
+        stack = [ref]
+        seen: set[FrameRef] = set()
+        while stack:
+            current = stack.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            for name, node in self.g.nodes.items():
+                if current not in node.inputs:
+                    continue
+                if node.filter in SPLIT_FILTERS:
+                    stack.extend(f"{name}:{pad}" for pad in range(len(node.outputs)))
+                elif node.filter not in found:
+                    found.append(node.filter)
+        if not found:
+            return "two destinations"
+        if len(found) == 1:
+            return f"'{found[0]}' and the destination"
+        return ", ".join(f"'{name}'" for name in found[:-1]) + f" and '{found[-1]}'"
 
     # -- one reader per live input
 
@@ -2302,6 +2359,7 @@ class _Partitioner:
         self._add_rows_edges()
         self._add_rows_documents()
         self._bound_edges()
+        self._check_handed_once()
         processes: list[Process] = [self._materialize(p) for p in self.pending]
         processes.extend(self._materialize_region(sidecar) for sidecar in self.sidecars)
         return ProcessPlan(
@@ -3068,6 +3126,9 @@ def check_spellable(plan: ProcessPlan) -> None:
 
     A SOURCE MODULE is exempt: its several pads are each their own named
     pipe by construction, the same way a packet sink's several inputs are.
+
+    A pad handed to two processes is refused while the plan is built, where
+    what reads it still has a name (:meth:`_Partitioner._check_handed_once`).
     """
     for sidecar in plan.sidecars:
         if sidecar.packet_source or sidecar.packet_filter or len(sidecar.outputs) <= 1:

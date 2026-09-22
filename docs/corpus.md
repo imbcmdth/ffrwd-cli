@@ -2941,3 +2941,46 @@ ffmpeg -i tests/fixtures/keys.mkv -filter_complex \
 Three of the nine keyframes score above the cutoff, so the command carries three trims of each kind. Nothing about that shape is particular to this module: narrow to the rows you want, score what is left, and aggregate the survivors.
 
 Declared `RETURNS sink` instead and written after `TO`, the same module is the run-time destination it has always been: nothing is read while compiling, and its rows ride the sidecar's stdout as they are written ([recipe 100](#100-read-the-encoders-output-packet-by-packet)).
+
+## 140. Use a module's output more than once
+
+A column that is a module's output reads like any other: name it in a CTE and read it twice. It is not like any other underneath, though - a module's frames leave its sidecar on one pipe, so the `split` the compiler inserts cannot sit above that pipe the way a split over a source column sits above the `-i`. It lands in the ffmpeg reading the pipe instead, which gives each reader its own pad:
+
+```pgsql
+CREATE FUNCTION invert(v video_stream) RETURNS video_stream
+  AS '../sidecar/modules/target/wasm32-wasip2/release/invert.wasm', 'invert'
+  LANGUAGE wasm;
+CREATE FUNCTION double(v video_stream) RETURNS video_stream
+  AS '../sidecar/modules/target/wasm32-wasip2/release/double.wasm', 'double'
+  LANGUAGE wasm;
+
+COPY (
+  WITH m AS (
+    SELECT invert(f.video[1]) AS v FROM input('tests/fixtures/testsrc.mp4') f
+  )
+  SELECT double(m.v), hflip(m.v)
+  FROM m
+) TO 'both.mkv' WITH (video_codec 'ffv1')
+```
+
+```
+$ ffrwd compile -f query.sql
+# named pipes: ffmpeg0 reads ffmpeg1, sidecar1; ffmpeg1 feeds sidecar1, ffmpeg0
+1. ffmpeg: ffmpeg -f nut -analyzeduration 0 -fpsprobesize 3 -i \
+  '<named pipe ffmpeg1-ffmpeg0 n3 read>' -f nut -analyzeduration 0 -fpsprobesize 3 -i \
+  '<named pipe sidecar1-ffmpeg0 n2 read>' -map 1:v:0 -map 0:v:0 -c:0 ffv1 -c:1 ffv1 \
+  both.mkv
+2. ffmpeg: ffmpeg -f nut -analyzeduration 0 -fpsprobesize 3 -i pipe:0 -filter_complex \
+  '[0:v:0]split=2[out0][n1_split1];[n1_split1]hflip[out1]' -map '[out0]' -c:0 rawvideo \
+  -pix_fmt:0 rgba -f nut '<named pipe ffmpeg1-sidecar1 n1_split:0 write>' -map '[out1]' \
+  -c:0 rawvideo -pix_fmt:0 yuv420p -f nut '<named pipe ffmpeg1-ffmpeg0 n3 write>'
+3. ffmpeg: ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 rawvideo -pix_fmt:0 rgba \
+  -f nut pipe:1
+4. sidecar: ffrwd-wasm -f nut -i pipe:0 -m \
+  ../sidecar/modules/target/wasm32-wasip2/release/invert.wasm -f nut pipe:1
+5. sidecar: ffrwd-wasm -f nut -i pipe:0 -m \
+  ../sidecar/modules/target/wasm32-wasip2/release/double.wasm -f nut pipe:1
+# this listing is not a shell command -- run the plan with `ffrwd run`
+```
+
+Process 2 is that ffmpeg: one input, one `split`, and two outputs - a pad straight onto the pipe `double` reads, and a pad through `hflip` to the destination. The producer is run once whatever reads it; two calls in the query are still two instances, as everywhere else.

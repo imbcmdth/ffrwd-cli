@@ -144,7 +144,15 @@ from.
   modules can fan out and fan in as much as it likes inside itself,
   but its BOUNDARY is one pipe each way: only stdin and stdout are
   wired to it, so a region reading or writing two streams at its edge
-  is refused. Nothing the dialect can spell today produces one.
+  is refused.
+  Reading a module's output column more than once is not that shape and
+  is ordinary: the `split` lands in the ffmpeg reading the module's one
+  pipe, and each reader gets a pad
+  ([recipe 140](corpus.md#140-use-a-modules-output-more-than-once)). The
+  readers have to share that one ffmpeg, though, so they must be handed
+  the same streams — a reader that also needs frames another module
+  writes cannot join the others, and a `UNSUPPORTED_SQL` names what reads
+  the column and says to call the module once per reader.
 - **A module reading several streams needs them in lockstep.** They
   have to reach it from one point through modules that declare one
   frame out per frame in; a `split` counts, and an ffmpeg filter does
