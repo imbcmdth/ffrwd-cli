@@ -453,9 +453,10 @@ _PACKET_ROWS_SOURCE_HINT = (
     "disk, e.g. FROM input('film.mp4') f, records(f.video[1]) v"
 )
 _SERIES_HINT = (
-    "generate_series(start, stop[, step]) takes integer literals only -- a "
-    "substituted variable is fine (generate_series(1, :count)), a column "
-    "reference or any other expression is not"
+    "generate_series(start, stop[, step]) takes whole numbers the compiler "
+    "can count: an integer literal, a substituted variable "
+    "(generate_series(1, :count)), array_length(<array>, 1), or arithmetic "
+    "over those -- a column reference is not one"
 )
 _SERIES_ALIAS_HINT = (
     "the alias names both the row table and its one column, e.g. FROM "
@@ -1918,6 +1919,7 @@ def parse(
         _annotate_unset(tree, unset)
     _unwrap_subscripted(tree)
     _name_option_columns(tree)
+    _name_array_lengths(tree)
     return tree
 
 
@@ -2958,13 +2960,133 @@ def _describe_series_bound(node: exp.Expr | None) -> str:
     return "that"
 
 
+def whole_number(node: exp.Expr | None) -> int | None:
+    """A compile-time whole number, or None where the shape is not one.
+
+    Integer literals, a sign in front of one, parentheses, and ``+ - * /``
+    over those: the arithmetic the value grammar already folds, narrowed to
+    the cases that stay whole. ``array_length``/``cardinality`` reaches here
+    as the count it folded to (:func:`fold_array_lengths`), so a row count
+    read off the list itself is one of these shapes by the time this runs.
+    """
+    value = _unwrap_paren(node) if isinstance(node, exp.Expr) else None
+    if isinstance(value, exp.Neg) and isinstance(value.this, exp.Expr):
+        inner = whole_number(value.this)
+        return None if inner is None else -inner
+    if isinstance(value, exp.Literal) and not value.is_string:
+        text = str(value.this)
+        return int(text) if _DIGITS_RE.match(text) else None
+    if not isinstance(value, _ARITHMETIC):
+        return None
+    left = whole_number(value.this if isinstance(value.this, exp.Expr) else None)
+    right_node = value.args.get("expression")
+    right = whole_number(right_node if isinstance(right_node, exp.Expr) else None)
+    if left is None or right is None:
+        return None
+    if isinstance(value, exp.Add):
+        return left + right
+    if isinstance(value, exp.Sub):
+        return left - right
+    if isinstance(value, exp.Mul):
+        return left * right
+    if right == 0:
+        return None
+    # Postgres truncates integer division toward zero.
+    quotient = abs(left) // abs(right)
+    return -quotient if (left < 0) != (right < 0) else quotient
+
+
+_ARRAY_LENGTH_HINT = (
+    "array_length(<array>, 1) and cardinality(<array>) count a WRITTEN array: "
+    "a literal, a substituted list (ARRAY[:widths]), or an array parameter "
+    "inside a function body, which is the caller's list by the time this runs"
+)
+
+
+def fold_array_lengths(tree: exp.Expr) -> None:
+    """``array_length(<array>, 1)`` and ``cardinality(<array>)``, folded to the count.
+
+    Every array in this dialect is written out or substituted into, so how
+    many elements one has is a compile-time determination. The fold runs
+    after expansion, where an array PARAMETER has already become the caller's
+    own list, and leaves an integer literal where the call stood -- nothing
+    after this point knows the call was written, which is what makes it legal
+    in every position a number literal is, a ``generate_series`` bound
+    included.
+    """
+    for node in list(tree.find_all(exp.ArraySize)):
+        _fold_array_length(node)
+
+
+def _fold_array_length(node: exp.ArraySize) -> None:
+    """One count folded in place, or the rejection, naming the spelling written."""
+    written = str(node.meta.get("array_length_written") or "array_length")
+    dimension = node.args.get("expression")
+    if dimension is None and written == "array_length":
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            "array_length needs the dimension it counts",
+            node,
+            hint=_ARRAY_LENGTH_HINT,
+        )
+    if isinstance(dimension, exp.Expr) and whole_number(dimension) != 1:
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"{written}'s dimension must be 1",
+            dimension,
+            fallback=node,
+            hint="this dialect's arrays are one-dimensional; write "
+            "array_length(<array>, 1), or cardinality(<array>)",
+        )
+    array = _unwrap_paren(node.this) if isinstance(node.this, exp.Expr) else None
+    if not isinstance(array, exp.Array):
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"{written} counts a written array, not "
+            f"{_describe_series_bound(array)}",
+            node,
+            hint=_ARRAY_LENGTH_HINT,
+        )
+    line, col = _pos(node)
+    counted = exp.Literal(this=str(len(array.expressions)), is_string=False)
+    counted.meta["line"] = line
+    counted.meta["col"] = col
+    node.replace(counted)
+
+
+def _name_array_lengths(tree: exp.Expression) -> None:
+    """``cardinality(x)``: the same count under the other Postgres spelling.
+
+    sqlglot builds ``array_length`` as ``exp.ArraySize`` and ``cardinality``
+    as a bare call, which would read as a filter everywhere a bare call does.
+    Rebuilt here, once, so one node carries both spellings and the one
+    written is remembered for a rejection to quote.
+    """
+    for node in list(tree.find_all(exp.Anonymous)):
+        if str(node.name).lower() != "cardinality" or isinstance(node.parent, exp.Dot):
+            continue
+        written = [item for item in node.expressions if isinstance(item, exp.Expr)]
+        if len(written) != 1:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"cardinality takes one array, got {len(written)} arguments",
+                node,
+                hint=_ARRAY_LENGTH_HINT,
+            )
+        counted = exp.ArraySize(this=written[0].copy())
+        counted.meta.update(node.meta)
+        counted.meta["array_length_written"] = "cardinality"
+        node.replace(counted)
+
+
 def _series_bound(node: exp.Expr | None, label: str, series: exp.Expr) -> int:
     """One ``generate_series`` bound (or step) as a python int, or its rejection.
 
-    Bounds are literals BY THE TIME resolve runs -- substitution already
-    replaced a variable reference with the number it names -- so anything
-    else here, a column reference included, is rejected rather than
-    deferred: that is what keeps the row count known before anything runs.
+    A bound is a whole number BY THE TIME resolve runs: substitution already
+    replaced a variable reference with the number it names, and a written
+    list's own length already folded to one. Anything the compiler cannot
+    count before it runs, a column reference included, is rejected rather
+    than deferred -- that is what keeps the row count known.
     """
     value = _unwrap_paren(node) if isinstance(node, exp.Expr) else None
     name = null_variable(value)
@@ -2977,19 +3099,13 @@ def _series_bound(node: exp.Expr | None, label: str, series: exp.Expr) -> int:
             line=line,
             col=col,
         )
-    negative = False
-    if isinstance(value, exp.Neg) and isinstance(value.this, exp.Expr):
-        negative = True
-        value = _unwrap_paren(value.this)
-    if isinstance(value, exp.Literal) and not value.is_string:
-        text = str(value.this)
-        if _DIGITS_RE.match(text):
-            whole = int(text)
-            return -whole if negative else whole
+    whole = whole_number(value)
+    if whole is not None:
+        return whole
     raise _error(
         ErrorCode.UNSUPPORTED_SQL,
-        f"generate_series's {label} must be an integer literal, not "
-        f"{_describe_series_bound(value)}",
+        f"generate_series's {label} must be a whole number the compiler can "
+        f"count, not {_describe_series_bound(value)}",
         node if isinstance(node, exp.Expr) else series,
         fallback=series,
         hint=_SERIES_HINT,
@@ -9045,6 +9161,9 @@ def resolve(
         # item by the time a call site is looked for.
         _desugar_lateral(tree)
         with expanded(tree, packages=packages, on_warning=on_warning, owner=owner) as script:
+            # After expansion: an array PARAMETER is the caller's own list by
+            # now, so its length is countable wherever the body wrote it.
+            fold_array_lengths(script.tree)
             resolved = _Resolver(script.wasm).run(script.tree)
             resolved.wasm = script.wasm
             return resolved

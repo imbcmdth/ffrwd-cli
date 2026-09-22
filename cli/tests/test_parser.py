@@ -2221,6 +2221,56 @@ def test_lateral_is_refused_where_it_would_mean_something_else(
     assert needle in err.message, err.message
 
 
+# -- array_length, a compile-time count -----------------
+
+
+def test_a_written_arrays_length_counts_the_rows_a_series_has() -> None:
+    """Every array is written out or substituted into, so its length is a
+    compile-time determination and stands wherever a number literal does."""
+    for bound in ("array_length(ARRAY[4, 5, 6], 1)", "cardinality(ARRAY[4, 5, 6])"):
+        resolved = _resolve(f"SELECT i.i FROM generate_series(1, {bound}) i")
+        assert resolved.series["i"] == (1, 2, 3)
+
+
+def test_a_series_bound_may_be_arithmetic_over_counted_numbers() -> None:
+    resolved = _resolve(
+        "SELECT i.i FROM generate_series(1, array_length(ARRAY[4, 5, 6], 1) - 1) i"
+    )
+    assert resolved.series["i"] == (1, 2)
+
+
+@pytest.mark.parametrize(
+    ("sql", "needle"),
+    [
+        (
+            "SELECT i.i FROM generate_series(1, array_length(ARRAY[1, 2], 2)) i",
+            "array_length's dimension must be 1",
+        ),
+        (
+            "SELECT i.i FROM generate_series(1, cardinality(ARRAY[1, 2], 2)) i",
+            "cardinality takes one array, got 2 arguments",
+        ),
+        (
+            "SELECT i.i FROM generate_series(1, array_length(ARRAY[1, 2])) i",
+            "array_length needs the dimension it counts",
+        ),
+        (
+            "SELECT f.video[1] FROM input('f.mkv') f, "
+            "generate_series(1, array_length(f.video, 1)) i",
+            "array_length counts a written array, not a column reference",
+        ),
+        (
+            "SELECT i.i FROM input('f.mkv') f, generate_series(1, f.duration) i",
+            "generate_series's stop must be a whole number the compiler can count",
+        ),
+    ],
+)
+def test_a_count_the_compiler_cannot_make_is_refused(sql: str, needle: str) -> None:
+    err = _reject(sql)
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert needle in err.message, err.message
+
+
 # -- JOIN between track-row tables ----------------------
 
 

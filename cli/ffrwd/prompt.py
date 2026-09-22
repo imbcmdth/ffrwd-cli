@@ -377,11 +377,19 @@ _DIALECT_TAIL = """\
   table and its one column: `generate_series(1, 5) i` reads its value back as
   `i.i`, not bare `i` -- there is no bare-column spelling, same rule as any
   other row.
-- `start` and `stop` (and the optional `step`) must be integer literals BY
-  THE TIME this compiler sees them, which is after `-v` substitution -- so
-  `generate_series(1, :count)` is fine and a column reference or any other
-  computed expression is `UNSUPPORTED_SQL`. That is what keeps the row count
-  known before anything runs: `stop - start` over `step`, inclusive.
+- `start` and `stop` (and the optional `step`) must be whole numbers this
+  compiler can count BY THE TIME it sees them, which is after `-v`
+  substitution -- an integer literal, `generate_series(1, :count)`,
+  `array_length(<array>, 1)`, or arithmetic over those. A column reference
+  or anything else computed at run time is `UNSUPPORTED_SQL`. That is what
+  keeps the row count known before anything runs: `stop - start` over
+  `step`, inclusive.
+- `array_length(<array>, 1)` and `cardinality(<array>)` count a WRITTEN
+  array while compiling, and stand wherever a number literal does. Inside a
+  function body an array parameter is already the caller's own list, so
+  `generate_series(1, array_length(widths, 1))` is a ladder whose rung count
+  comes from the rungs and nobody passes it by hand. A dimension other than
+  1, and anything but a written array to count, are rejections.
 - A zero `step` is a rejection, and so is a range that would produce no
   rows (descending bounds with the default ascending step, or vice versa) --
   a series that silently produces nothing is a mistake worth naming, not a
@@ -1185,8 +1193,8 @@ These are typed errors, never a best-effort graph. Do not reach for them.
   `WITH`, CTE column lists, table functions other than `input()`, `unnest()`
   and `generate_series()`, a statement that is neither a `SELECT` nor (in a script)
   `CREATE VIEW` / `COPY`, a zero/negative/computed array subscript.
-- `generate_series(...)`: a bound or step that is not an integer literal
-  after `-v` substitution (a column reference included), a `0` step, a
+- `generate_series(...)`: a bound or step the compiler cannot count before
+  anything runs (a column reference included), a `0` step, a
   descending or empty range, and an unaliased call -- the alias is
   mandatory, same as `input()`/`unnest()`/`ffmpeg.<source>()`.
 - Any name that is neither one of the four `ffrwd.*` macros nor a filter

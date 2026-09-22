@@ -336,6 +336,7 @@ _ARGUMENT_KINDS: list[tuple[_ArgumentShape, str]] = [
     (exp.Upper, "text"),
     (exp.Lower, "text"),
     (exp.Length, "number"),
+    (exp.ArraySize, "number"),
     (exp.Round, "number"),
     (exp.Replace, "text"),
     (exp.Substring, "text"),

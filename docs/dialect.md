@@ -996,7 +996,7 @@ Every FROM item is a compile-time table; the column model per shape is
 | `unnest(alias.<array>) alias` | one per element | the four stream arrays, or `chapters` / `cues` / `attachments`, of an input declared earlier in the same FROM; `cues['title']` names one track by its title |
 | `unnest(merge_cues(<rows>[, max_distance])) alias` | one per run | the same rows with runs collapsed into one row each. `<rows>` is a record array carrying `start_t`/`end_t` - `chapters`, `cues` - or an `ARRAY(SELECT r FROM unnest(<one of those>) r WHERE ...)` gather that narrows them first ([recipes 131-132](corpus.md#131-collapse-a-files-rows-into-runs)) |
 | `unnest(ARRAY[STRUCT(v AS c, ...), ...]) alias` | one per array element | a written row table; columns are the STRUCT field names, every element declaring the same set |
-| `generate_series(start, stop[, step]) alias` | `stop - start` over `step`, inclusive | alias mandatory, names both the row table and its one column (`i.i`); bounds and step are integer literals after substitution |
+| `generate_series(start, stop[, step]) alias` | `stop - start` over `step`, inclusive | alias mandatory, names both the row table and its one column (`i.i`); bounds and step are whole numbers the compiler can count - an integer literal after substitution, `array_length(<array>, 1)`, or arithmetic over those |
 | `cte_or_view_name [alias]` | its body's rows | a multi-row body is a multi-row source |
 | `function_name(args) alias` | its body's rows, per outer row | a table-returning function, expanded at compile time; its arguments read the items to its left |
 
@@ -1013,7 +1013,7 @@ CTE or view name, under an outer join, and with `WITH ORDINALITY`,
 `LATERAL VIEW` or `APPLY`.
 
 Two kinds of call read values only, whatever is to their left:
-`generate_series` takes integer literals after substitution, and a
+`generate_series` takes whole numbers the compiler can count, and a
 `RETURNS source` wasm function takes literals and substituted
 variables, since it is probed once before any row exists.
 
@@ -1178,6 +1178,8 @@ value := literal | NULL | row-column | input-scalar
        | function(value, ...)      -- upper, lower, length, round, replace,
                                    -- substring, or a value wasm function;
                                    -- over a row column, once per row
+       | array_length(array, 1)    -- how many elements a WRITTEN array has,
+       | cardinality(array)        -- counted while compiling
 
        | :'var' | :"var" | :var    -- CLI -v substitution, psql's forms
        | :var[k] | :'var'[k]        -- one element of a comma-split -v list
@@ -1189,6 +1191,15 @@ value := literal | NULL | row-column | input-scalar
        | ARRAY[STRUCT(...)::chapter, ...]    -- record arrays: chapter,
        | ARRAY[STRUCT(...)::cue, ...]        -- cue, attachment
 ```
+
+Every array is written out or substituted into, so how many elements
+one has is settled while compiling: `array_length(<array>, 1)` and
+`cardinality(<array>)` are that count, and stand wherever a number
+literal does, a `generate_series` bound included. Inside a function
+body the array parameter is the caller's own list by then, so
+`generate_series(1, array_length(widths, 1))` is a ladder whose rung
+count comes from the rungs. A dimension other than 1, and anything but
+a written array to count, are refusals.
 
 An array element's list is literals of one type - written out, or what
 a comma-split `-v` list substitutes to - and may be parenthesized. The
@@ -1431,9 +1442,12 @@ Every one of these is a typed rejection, never a silent reinterpretation:
   anything but a vector - a length mismatch between the two
   `cos_similarity` arguments is refused too, but only once the vectors
   themselves are known, naming both lengths.
-- **`generate_series`**: a bound or step that is not an integer literal
-  after substitution (a column reference included); a `0` step; a
+- **`generate_series`**: a bound or step the compiler cannot count
+  before anything runs (a column reference included); a `0` step; a
   descending or empty range; an unaliased call.
+- **`array_length` / `cardinality`**: a dimension other than 1, and
+  anything but a written array to count - a stream column's length is a
+  probe's answer, not the query's.
 - **Multi-row into one path** (`ROW_COUNT_MISMATCH`): gather or fan
   out, explicitly.
 - **Filters**: variable-OUTPUT-pad (`split` - what the compiler's own

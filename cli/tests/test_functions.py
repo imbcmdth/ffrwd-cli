@@ -1249,14 +1249,19 @@ ARRAY_LADDER = (
     "  FROM generate_series(1, rungs) i\n"
     "$$ LANGUAGE sql;\n"
 )
-_ARRAY_LADDER_CALL = ARRAY_LADDER + (
-    "COPY (SELECT l.v FROM input('a.mp4') f,\n"
-    "      ladder(fps(f.video[1], 30), ARRAY[1280, 854, 640],\n"
+# The rungs a caller hands over, and what it does with what comes back.
+_ARRAY_LADDER_RUNGS = (
+    "ARRAY[1280, 854, 640],\n"
     "             ARRAY['4500k', '2000k', '900k'],\n"
-    "             ARRAY['2250k', '1000k', '450k'], 3) l)\n"
+    "             ARRAY['2250k', '1000k', '450k']"
+)
+_ARRAY_LADDER_COPY = (
+    "COPY (SELECT l.v FROM input('a.mp4') f,\n"
+    f"      ladder(fps(f.video[1], 30), {_ARRAY_LADDER_RUNGS}, 3) l)\n"
     "TO 'out/master.m3u8' WITH (format 'hls', hls_time 2, video_codec 'libx264',\n"
     "  video_bitrate l.bitrate, maxrate l.bitrate, bufsize l.bufsize, gop 30)"
 )
+_ARRAY_LADDER_CALL = ARRAY_LADDER + _ARRAY_LADDER_COPY
 # The same ladder nobody wrapped, for the command to be compared against.
 _LONGHAND_LADDER = (
     "COPY (SELECT scale(fps(f.video[1], 30), ARRAY[1280, 854, 640][i.i], -2)\n"
@@ -1285,9 +1290,21 @@ def test_a_constant_subscript_over_an_array_parameter_is_its_element() -> None:
     assert [args[args.index(f"-b:{n}") + 1] for n in range(3)] == ["4500k"] * 3
 
 
+def test_an_array_parameter_counts_its_own_rungs() -> None:
+    """Nobody passes the count: the body reads it off the list the caller
+    handed in, which is a written array by the time the series is resolved."""
+    counted = ARRAY_LADDER.replace(" bufsizes text[], rungs number)", " bufsizes text[])")
+    counted = counted.replace("generate_series(1, rungs)",
+                              "generate_series(1, array_length(widths, 1))")
+    sql = counted + _ARRAY_LADDER_COPY.replace(f"{_ARRAY_LADDER_RUNGS}, 3)",
+                                               f"{_ARRAY_LADDER_RUNGS})")
+    probes = {"f": _video_probe()}
+    assert _argv(sql, probes) == _argv(_LONGHAND_LADDER, probes)
+
+
 def test_a_subscript_past_the_end_of_an_array_argument_is_refused() -> None:
-    sql = _ARRAY_LADDER_CALL.replace("ARRAY['2250k', '1000k', '450k'], 3)",
-                                     "ARRAY['2250k', '1000k', '450k'], 4)")
+    sql = _ARRAY_LADDER_CALL.replace(f"{_ARRAY_LADDER_RUNGS}, 3)",
+                                     f"{_ARRAY_LADDER_RUNGS}, 4)")
     error = _rejects(sql, ErrorCode.UNSUPPORTED_SQL, "subscript 4 is past the end")
     assert error.hint == "subscript from 1 to 3"
 
