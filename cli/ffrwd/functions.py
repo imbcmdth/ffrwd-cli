@@ -1071,6 +1071,23 @@ def _annotation(
     return Annotation(name=column, fields=tuple(declared))
 
 
+def _record_array(
+    node: exp.Expr | None, column: str, name: str, anchor: exp.Expr
+) -> Annotation | None:
+    """The record shape a WRITTEN ``STRUCT(...)[]`` declares, or None.
+
+    Narrower than :func:`_annotation` by one case: ``cue[]`` is a nameable
+    type of its own, so a parameter declared that way keeps meaning an array
+    of cue records rather than becoming the record spelled out.
+    """
+    if not isinstance(node, exp.DataType) or node.this is not exp.DataType.Type.ARRAY:
+        return None
+    inner = node.expressions[0] if len(node.expressions) == 1 else None
+    if _struct_fields(inner if isinstance(inner, exp.Expr) else None) is None:
+        return None
+    return _annotation(node, column, name, anchor)
+
+
 def _checked_type(node: exp.Expr | None, name: str, anchor: exp.Expr) -> str:
     """The type `node` declares, rejected by name if the dialect has no such type."""
     declared = _type_name(node)
@@ -1427,7 +1444,7 @@ def _column_defs(
         # which a body reads with `unnest(<param>) r`. Same record shape an
         # annotation column declares, in a position that means something else.
         record = (
-            _annotation(kind_node, written, name, anchor)
+            _record_array(kind_node, written, name, anchor)
             if kind.allow_record_array
             else None
         )

@@ -1430,6 +1430,23 @@ def test_a_record_list_argument_is_refused_by_the_row(written: str, needle: str)
     _rejects(sql, ErrorCode.UDF_ARG_TYPE, needle)
 
 
+def test_a_cue_array_parameter_is_the_nameable_type_it_always_was() -> None:
+    """`cue[]` is an array of a type the dialect names, not a record list
+    written out, so a parameter declared that way takes cue records."""
+    sql = (
+        "CREATE FUNCTION kept(cues cue[]) RETURNS cue[] AS $$\n"
+        "  SELECT cues\n"
+        "$$ LANGUAGE sql;\n"
+        "COPY (SELECT f.video[1], kept(ARRAY[\n"
+        "        STRUCT('one' AS text, 0 AS start_t, 1 AS end_t)::cue,\n"
+        "        STRUCT('two' AS text, 1 AS start_t, 2 AS end_t)::cue])\n"
+        "      FROM input('a.mp4') f) TO 'o.mkv'"
+    )
+    args = _argv(sql, {"f": _video_probe()})
+    assert args[args.index("-f") + 1] == "webvtt"
+    assert "1:s:0" in args
+
+
 def test_a_wrongly_typed_element_of_an_array_argument_names_the_row() -> None:
     """The array is the caller's, so the mistake is caught where the value
     lands -- with the row that carried it."""

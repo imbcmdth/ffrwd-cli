@@ -34,7 +34,7 @@ function := CREATE FUNCTION name(param ptype [DEFAULT literal], ...) RETURNS rty
           | CREATE FUNCTION name(rows annotation) RETURNS annotation
             AS 'module', 'export' LANGUAGE wasm
 ptype   := text | number | boolean | vector | <kind>_stream | chapter | cue
-         | attachment | any of those with [] | annotation
+         | attachment | any of those with [] | STRUCT(field vtype, ...)[]
 rtype   := text | number | boolean | vector | <kind>_stream | chapter | cue
          | attachment | any of those with [] | TABLE(col type, ...)
 wstype  := video_stream | audio_stream | either of those with []
