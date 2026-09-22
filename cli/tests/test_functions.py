@@ -1302,6 +1302,28 @@ def test_an_array_parameter_counts_its_own_rungs() -> None:
     assert _argv(sql, probes) == _argv(_LONGHAND_LADDER, probes)
 
 
+def test_a_body_reads_its_written_rows_own_position() -> None:
+    """The rung number is the row's, not a field somebody had to write: a
+    written row carries its 1-based index inside a body as it does outside."""
+    sql = (
+        "CREATE FUNCTION ladder(v video_stream)\n"
+        "RETURNS TABLE(v video_stream, rung number) AS $$\n"
+        "  SELECT scale(v, r.width, -2), r.index\n"
+        "  FROM unnest(ARRAY[STRUCT(1280 AS width), STRUCT(854 AS width),\n"
+        "                    STRUCT(640 AS width)]) r\n"
+        "$$ LANGUAGE sql;\n"
+        "COPY (SELECT l.v FROM input('a.mp4') f, ladder(f.video[1]) l)\n"
+        "TO ('r' || l.rung::text || '.mp4')"
+    )
+    args = _argv(sql)
+    assert _scales(args) == ["1280", "854", "640"]
+    assert [arg for arg in args if arg.endswith(".mp4") and arg != "a.mp4"] == [
+        "r1.mp4",
+        "r2.mp4",
+        "r3.mp4",
+    ]
+
+
 def test_a_subscript_past_the_end_of_an_array_argument_is_refused() -> None:
     sql = _ARRAY_LADDER_CALL.replace(f"{_ARRAY_LADDER_RUNGS}, 3)",
                                      f"{_ARRAY_LADDER_RUNGS}, 4)")

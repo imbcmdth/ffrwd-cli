@@ -205,6 +205,7 @@ from ffrwd.types import (
     CONTAINER_READONLY_FIELDS,
     DISPOSITION_COLUMN,
     DISPOSITION_KEYS,
+    INDEX_COLUMN,
     INPUT_COLUMNS,
     INPUT_DURATION_COLUMN,
     MAP_ELEMENTS,
@@ -2322,6 +2323,11 @@ class RawValuesTable:
     column settled on, parallel to `columns` -- ``text``, ``number`` or
     ``boolean``, with an all-NULL column reading as ``text`` the way Postgres
     types one.
+
+    `derived` names the columns nobody wrote -- the row's own ``index``,
+    which every row table carries. They read like any other column and are
+    left out of ``<alias>.*``, which stays what the query wrote, the way a
+    track row's map columns are read by name and not by star.
     """
 
     alias: str
@@ -2329,10 +2335,15 @@ class RawValuesTable:
     rows: tuple[tuple[exp.Expr, ...], ...]
     node: exp.Expr
     types: tuple[str, ...]
+    derived: tuple[str, ...] = ()
 
     def schema(self) -> dict[str, str]:
         """The row columns this table exposes, in written order."""
         return dict(zip(self.columns, self.types, strict=True))
+
+    def written(self) -> tuple[str, ...]:
+        """The columns the query itself wrote, in written order."""
+        return tuple(name for name in self.columns if name not in self.derived)
 
 
 @dataclass
@@ -6362,7 +6373,7 @@ class _Resolver:
                 ErrorCode.UNSUPPORTED_SQL,
                 "unnest ... WITH ORDINALITY is not supported",
                 unnest,
-                hint="every track row already carries its 1-based position as "
+                hint="every row already carries its 1-based position as "
                 "<alias>.index",
             )
         alias_node = unnest.args.get("alias")
@@ -6441,9 +6452,26 @@ class _Resolver:
             rows.append(tuple(fields[name] for name in columns))
 
         types = self._struct_row_types(alias, columns, rows, scope, unnest)
+        derived: tuple[str, ...] = ()
+        if INDEX_COLUMN not in columns:
+            # Every other row table carries its 1-based position; a written
+            # one is no different, and a rung needs its own number. A row
+            # naming its own `index` field keeps what it wrote.
+            derived = (INDEX_COLUMN,)
+            columns = (*columns, INDEX_COLUMN)
+            rows = [
+                (*row, exp.Literal(this=str(position), is_string=False))
+                for position, row in enumerate(rows, start=1)
+            ]
+            types = (*types, "number")
         self.row_aliases.add(alias)
         table = RawValuesTable(
-            alias=alias, columns=columns, rows=tuple(rows), node=unnest, types=types
+            alias=alias,
+            columns=columns,
+            rows=tuple(rows),
+            node=unnest,
+            types=types,
+            derived=derived,
         )
         self.struct_rows[alias] = table
         self.values_rows[alias] = table
@@ -6563,7 +6591,7 @@ class _Resolver:
                 ErrorCode.UNSUPPORTED_SQL,
                 "unnest ... WITH ORDINALITY is not supported",
                 unnest,
-                hint="every track row already carries its 1-based position as "
+                hint="every row already carries its 1-based position as "
                 "<alias>.index",
             )
 

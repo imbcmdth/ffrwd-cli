@@ -404,7 +404,11 @@ _DIALECT_TAIL = """\
 - `unnest(ARRAY[STRUCT(<v> AS <c>, ...), ...]) alias` is an inline written
   row table whose columns are the STRUCT field names instead of a column
   list: `unnest(ARRAY[STRUCT(1920 AS w, '1080p' AS name), STRUCT(1280 AS w,
-  '720p' AS name)]) r` gives rows readable as `r.w`, `r.name`. Every STRUCT in
+  '720p' AS name)]) r` gives rows readable as `r.w`, `r.name`, and `r.index`
+  -- the 1-based position every other row table carries, here the order the
+  rows were written in. `index` is derived rather than written, so it is read
+  by name and `r.*` stays the written columns; a row declaring its own
+  `index` field keeps that value. Every STRUCT in
   the array must declare the same field set, order-free -- a mismatch names
   the odd field. A field's value takes the compile-time value grammar
   (literals, `-v` variables, `||`, arithmetic, `f.duration`); a stream inside

@@ -9898,11 +9898,21 @@ def test_struct_row_table_prints_its_written_rows() -> None:
 
 
 def test_a_struct_row_table_star_is_its_written_columns() -> None:
+    """The derived `index` is read by name and stays out of the star, so a
+    star over a written row keeps printing what the query wrote."""
     sinks = lower_table(
         resolve(parse(f"SELECT m.* FROM input('f.mkv') f, {_MARKS}")),
         {"f": ProbeResult(streams=[_track("video", 0)])},
     )
     assert sinks[0].result.columns == ["start_t", "end_t", "title"]
+
+
+def test_a_written_rows_index_reads_like_any_other_rows() -> None:
+    sinks = lower_table(
+        resolve(parse(f"SELECT m.index, m.title FROM input('f.mkv') f, {_MARKS}")),
+        {"f": ProbeResult(streams=[_track("video", 0)])},
+    )
+    assert sinks[0].result.rows == [[1, "Intro"], [2, "Act One"]]
 
 
 def test_a_struct_row_table_cross_joins_track_rows() -> None:

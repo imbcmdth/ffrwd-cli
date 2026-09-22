@@ -65,6 +65,7 @@ __all__ = [
     "CUE_TYPE",
     "DISPOSITION_COLUMN",
     "DISPOSITION_KEYS",
+    "INDEX_COLUMN",
     "INPUT_COLUMNS",
     "INPUT_DURATION_COLUMN",
     "MAP_ELEMENTS",
@@ -543,3 +544,14 @@ ROW_COMMON: dict[str, RowColumnType] = {
     for name, type_ in ROW_SCHEMAS[_STREAM_ARRAYS[0]].items()
     if all(name in ROW_SCHEMAS[column] for column in _STREAM_ARRAYS)
 }
+
+# The 1-based position column every row table carries -- a probed one by the
+# declarations above, a written one by the position it was written in.
+INDEX_COLUMN = _sole(
+    tuple(
+        name
+        for name in ROW_SCHEMAS[_STREAM_ARRAYS[0]]
+        if all(name in schema for schema in ROW_SCHEMAS.values())
+    ),
+    "the position column every row shares",
+)

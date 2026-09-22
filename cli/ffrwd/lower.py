@@ -3030,7 +3030,7 @@ class _RowBinding:
         if self.column == RENDITION_COLUMN:
             return (*_RENDITION_SCHEMA, *self.extra)
         if self.values is not None:
-            return self.values.columns
+            return self.values.written()
         return ROW_STAR_COLUMNS[self.column]
 
     @property

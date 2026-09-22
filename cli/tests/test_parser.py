@@ -3311,11 +3311,35 @@ def test_struct_row_table_binds_a_row_table_like_values_do() -> None:
     )
     assert list(res.struct_rows) == ["r"]
     table = res.struct_rows["r"]
-    assert table.columns == ("w", "name")
-    assert table.types == ("number", "text")
+    assert table.written() == ("w", "name")
+    assert table.types == ("number", "text", "number")
     assert len(table.rows) == 2
     assert "r" in res.row_aliases
     assert "r" not in res.track_rows
+
+
+def test_a_written_row_carries_its_own_position() -> None:
+    """The 1-based `index` every other row table has, derived from the order
+    the rows were written in -- read by name, and not part of a star."""
+    res = _resolve(
+        "SELECT r.w FROM input('f.mkv') f, "
+        "unnest(ARRAY[STRUCT(1920 AS w), STRUCT(1280 AS w)]) r"
+    )
+    table = res.struct_rows["r"]
+    assert table.derived == ("index",)
+    assert table.columns == ("w", "index")
+    assert [row[-1].this for row in table.rows] == ["1", "2"]
+
+
+def test_a_written_row_that_names_its_own_index_keeps_it() -> None:
+    res = _resolve(
+        "SELECT r.w FROM input('f.mkv') f, "
+        "unnest(ARRAY[STRUCT(1920 AS w, 7 AS index)]) r"
+    )
+    table = res.struct_rows["r"]
+    assert table.derived == ()
+    assert table.written() == ("w", "index")
+    assert [row[-1].this for row in table.rows] == ["7"]
 
 
 def test_struct_row_table_field_order_is_order_free_across_rows() -> None:
@@ -3324,7 +3348,7 @@ def test_struct_row_table_field_order_is_order_free_across_rows() -> None:
         "unnest(ARRAY[STRUCT(1920 AS w, '1080p' AS name), "
         "STRUCT('720p' AS name, 1280 AS w)]) r"
     )
-    assert res.struct_rows["r"].columns == ("w", "name")
+    assert res.struct_rows["r"].written() == ("w", "name")
 
 
 def test_struct_row_table_field_mismatch_is_rejected() -> None:
@@ -3354,7 +3378,7 @@ def test_struct_row_table_field_takes_arithmetic_over_a_literal() -> None:
     res = _resolve(
         "SELECT r.w FROM input('f.mkv') f, unnest(ARRAY[STRUCT(1920 / 2 AS w)]) r"
     )
-    assert res.struct_rows["r"].types == ("number",)
+    assert res.struct_rows["r"].schema()["w"] == "number"
 
 
 def test_struct_row_table_field_may_not_take_a_map_columns_name() -> None:
