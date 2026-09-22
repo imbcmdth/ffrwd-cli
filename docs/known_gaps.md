@@ -150,7 +150,7 @@ from.
   pipe, and each reader gets a pad
   ([recipe 140](corpus.md#141-use-a-modules-output-more-than-once)). The
   readers have to share that one ffmpeg, though, so they must be handed
-  the same streams — a reader that also needs frames another module
+  the same streams: a reader that also needs frames another module
   writes cannot join the others, and a `UNSUPPORTED_SQL` names what reads
   the column and says to call the module once per reader.
 - **A module reading several streams needs them in lockstep.** They
