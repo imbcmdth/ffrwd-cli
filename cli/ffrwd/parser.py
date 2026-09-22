@@ -2971,27 +2971,27 @@ def _describe_series_bound(node: exp.Expr | None) -> str:
     return "that"
 
 
-def whole_number(node: exp.Expr | None) -> int | None:
+def _whole_number(node: exp.Expr | None) -> int | None:
     """A compile-time whole number, or None where the shape is not one.
 
     Integer literals, a sign in front of one, parentheses, and ``+ - * /``
     over those: the arithmetic the value grammar already folds, narrowed to
     the cases that stay whole. ``array_length``/``cardinality`` reaches here
-    as the count it folded to (:func:`fold_array_lengths`), so a row count
+    as the count it folded to (:func:`_fold_array_lengths`), so a row count
     read off the list itself is one of these shapes by the time this runs.
     """
     value = _unwrap_paren(node) if isinstance(node, exp.Expr) else None
     if isinstance(value, exp.Neg) and isinstance(value.this, exp.Expr):
-        inner = whole_number(value.this)
+        inner = _whole_number(value.this)
         return None if inner is None else -inner
     if isinstance(value, exp.Literal) and not value.is_string:
         text = str(value.this)
         return int(text) if _DIGITS_RE.match(text) else None
     if not isinstance(value, _ARITHMETIC):
         return None
-    left = whole_number(value.this if isinstance(value.this, exp.Expr) else None)
+    left = _whole_number(value.this if isinstance(value.this, exp.Expr) else None)
     right_node = value.args.get("expression")
-    right = whole_number(right_node if isinstance(right_node, exp.Expr) else None)
+    right = _whole_number(right_node if isinstance(right_node, exp.Expr) else None)
     if left is None or right is None:
         return None
     if isinstance(value, exp.Add):
@@ -3014,7 +3014,7 @@ _ARRAY_LENGTH_HINT = (
 )
 
 
-def fold_array_lengths(tree: exp.Expr) -> None:
+def _fold_array_lengths(tree: exp.Expr) -> None:
     """``array_length(<array>, 1)`` and ``cardinality(<array>)``, folded to the count.
 
     Every array in this dialect is written out or substituted into, so how
@@ -3026,10 +3026,10 @@ def fold_array_lengths(tree: exp.Expr) -> None:
     included.
     """
     for node in list(tree.find_all(exp.ArraySize)):
-        _fold_array_length(node)
+        _fold_one_array_length(node)
 
 
-def _fold_array_length(node: exp.ArraySize) -> None:
+def _fold_one_array_length(node: exp.ArraySize) -> None:
     """One count folded in place, or the rejection, naming the spelling written."""
     written = str(node.meta.get("array_length_written") or "array_length")
     dimension = node.args.get("expression")
@@ -3040,7 +3040,7 @@ def _fold_array_length(node: exp.ArraySize) -> None:
             node,
             hint=_ARRAY_LENGTH_HINT,
         )
-    if isinstance(dimension, exp.Expr) and whole_number(dimension) != 1:
+    if isinstance(dimension, exp.Expr) and _whole_number(dimension) != 1:
         raise _error(
             ErrorCode.UNSUPPORTED_SQL,
             f"{written}'s dimension must be 1",
@@ -3110,7 +3110,7 @@ def _series_bound(node: exp.Expr | None, label: str, series: exp.Expr) -> int:
             line=line,
             col=col,
         )
-    whole = whole_number(value)
+    whole = _whole_number(value)
     if whole is not None:
         return whole
     raise _error(
@@ -9191,7 +9191,7 @@ def resolve(
         with expanded(tree, packages=packages, on_warning=on_warning, owner=owner) as script:
             # After expansion: an array PARAMETER is the caller's own list by
             # now, so its length is countable wherever the body wrote it.
-            fold_array_lengths(script.tree)
+            _fold_array_lengths(script.tree)
             resolved = _Resolver(script.wasm).run(script.tree)
             resolved.wasm = script.wasm
             return resolved
