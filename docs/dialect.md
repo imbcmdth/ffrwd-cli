@@ -75,6 +75,15 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   blurs once and splits into the rungs - under a fan-out `TO`, which
   builds each file on its own, it blurs per file
   ([known_gaps.md](known_gaps.md)).
+- An **array parameter** (`widths number[]`, `bitrates text[]`) is one
+  value the call passes, and a subscript over it is the array's ELEMENT
+  type wherever the body writes it: inside a call, as a declared value
+  column of a `RETURNS TABLE`, and read back off the alias in a `WITH`
+  option. That is what lets the caller pass the rungs rather than the
+  function carrying them - `ladder(f.video[1], ARRAY[1280, 854, 640],
+  ARRAY['4500k', '2000k', '900k'], 3)` - for the same command the
+  ladder written longhand compiles to. A subscript past the end of the
+  array the caller passed is refused, naming the range it has.
 - A **`LANGUAGE wasm` function** names a wasm module and one export
   in it, and is called like any other function. It has no body to
   inline: the module runs in the `ffrwd-wasm` sidecar, so a query

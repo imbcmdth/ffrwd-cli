@@ -2855,20 +2855,42 @@ def _check_column_kind(
 def _writes_stream(node: exp.Expr) -> bool | None:
     """Whether a body projection's SHAPE makes it a stream, or None if open.
 
-    A bare alias IS its row's stream and a subscript or filter call names one;
-    a qualified column is that row's metadata, except the stream ARRAYS an
-    input carries.
+    A bare alias IS its row's stream and a filter call names one; a qualified
+    column is that row's metadata, except the stream ARRAYS an input carries.
+    A subscript is whatever its ELEMENT is.
     """
     if isinstance(node, exp.Paren) and isinstance(node.this, exp.Expr):
         return _writes_stream(node.this)
     if isinstance(node, exp.Bracket):
-        return True
+        return _element_writes_stream(node)
     if isinstance(node, exp.Column):
         if node.args.get("table") is None:
             return True
         return _ident_name(node.this) in STREAM_ARRAY_COLUMNS
     kind = _argument_kind(node)
     return None if kind is None else kind == "stream"
+
+
+def _element_writes_stream(node: exp.Bracket) -> bool | None:
+    """Whether a subscript names a stream: whatever the array's ELEMENT is.
+
+    ``f.video[1]`` indexes the stream arrays an input carries, so it is a
+    stream. An array VALUE -- the literal an array argument binds to, a
+    row's array column -- hands back one of its own elements, and a
+    ``text[]`` element is text in a projection exactly as it is inside a
+    call. An array of mixed or no shape says nothing, and lowering decides.
+    """
+    base = node.this
+    while isinstance(base, exp.Paren) and isinstance(base.this, exp.Expr):
+        base = base.this
+    if not isinstance(base, exp.Expr):
+        return None
+    if isinstance(base, exp.Array):
+        kinds = {
+            _writes_stream(item) for item in base.expressions if isinstance(item, exp.Expr)
+        }
+        return kinds.pop() if len(kinds) == 1 else None
+    return _writes_stream(base)
 
 
 def _query_node(statement: exp.Expr) -> exp.Expr | None:

@@ -1234,6 +1234,73 @@ def test_lateral_and_cross_join_lateral_spell_the_same_call() -> None:
     assert _argv(joined) == _argv(_LADDER_FANOUT)
 
 
+# ---------------------------------------------------------------------------
+# table-returning functions: the caller passes the rungs
+# ---------------------------------------------------------------------------
+
+
+# The same ladder with the rungs handed in: every column of a rung is one
+# element of one array argument, read at the row's own index.
+ARRAY_LADDER = (
+    "CREATE FUNCTION ladder(v video_stream, widths number[], bitrates text[],\n"
+    "                      bufsizes text[], rungs number)\n"
+    "RETURNS TABLE(v video_stream, rung number, bitrate text, bufsize text) AS $$\n"
+    "  SELECT scale(v, widths[i.i], -2), i.i, bitrates[i.i], bufsizes[i.i]\n"
+    "  FROM generate_series(1, rungs) i\n"
+    "$$ LANGUAGE sql;\n"
+)
+_ARRAY_LADDER_CALL = ARRAY_LADDER + (
+    "COPY (SELECT l.v FROM input('a.mp4') f,\n"
+    "      ladder(fps(f.video[1], 30), ARRAY[1280, 854, 640],\n"
+    "             ARRAY['4500k', '2000k', '900k'],\n"
+    "             ARRAY['2250k', '1000k', '450k'], 3) l)\n"
+    "TO 'out/master.m3u8' WITH (format 'hls', hls_time 2, video_codec 'libx264',\n"
+    "  video_bitrate l.bitrate, maxrate l.bitrate, bufsize l.bufsize, gop 30)"
+)
+# The same ladder nobody wrapped, for the command to be compared against.
+_LONGHAND_LADDER = (
+    "COPY (SELECT scale(fps(f.video[1], 30), ARRAY[1280, 854, 640][i.i], -2)\n"
+    "      FROM input('a.mp4') f, generate_series(1, 3) i)\n"
+    "TO 'out/master.m3u8' WITH (format 'hls', hls_time 2, video_codec 'libx264',\n"
+    "  video_bitrate ARRAY['4500k', '2000k', '900k'][i.i],\n"
+    "  maxrate ARRAY['4500k', '2000k', '900k'][i.i],\n"
+    "  bufsize ARRAY['2250k', '1000k', '450k'][i.i], gop 30)"
+)
+
+
+def test_an_array_parameters_element_carries_the_arrays_element_type() -> None:
+    """A subscript over a `text[]` parameter is text wherever it is written --
+    in a declared value column as much as inside a call -- so the rungs the
+    caller passed name their own encoder settings, per row. The function and
+    the ladder written longhand compile to one command."""
+    probes = {"f": _video_probe()}
+    assert _argv(_ARRAY_LADDER_CALL, probes) == _argv(_LONGHAND_LADDER, probes)
+
+
+def test_a_constant_subscript_over_an_array_parameter_is_its_element() -> None:
+    """No row column in the subscript at all: still text, and every rung then
+    carries the same bitrate."""
+    sql = _ARRAY_LADDER_CALL.replace("bitrates[i.i]", "bitrates[1]")
+    args = _argv(sql, {"f": _video_probe()})
+    assert [args[args.index(f"-b:{n}") + 1] for n in range(3)] == ["4500k"] * 3
+
+
+def test_a_subscript_past_the_end_of_an_array_argument_is_refused() -> None:
+    sql = _ARRAY_LADDER_CALL.replace("ARRAY['2250k', '1000k', '450k'], 3)",
+                                     "ARRAY['2250k', '1000k', '450k'], 4)")
+    error = _rejects(sql, ErrorCode.UNSUPPORTED_SQL, "subscript 4 is past the end")
+    assert error.hint == "subscript from 1 to 3"
+
+
+def test_a_wrongly_typed_element_of_an_array_argument_names_the_row() -> None:
+    """The array is the caller's, so the mistake is caught where the value
+    lands -- with the row that carried it."""
+    sql = _ARRAY_LADDER_CALL.replace("ARRAY['4500k', '2000k', '900k']",
+                                     "ARRAY[4500, 2000, 900]")
+    error = _rejects(sql, ErrorCode.SINK_OPTION_TYPE, "option 'video_bitrate'")
+    assert "in row 1" in error.message
+
+
 def test_a_package_qualified_source_call_keeps_its_alias_after_adoption(
     tmp_path: Path,
 ) -> None:

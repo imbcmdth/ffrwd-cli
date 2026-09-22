@@ -509,6 +509,17 @@ _DIALECT_TAIL = """\
   spellings of the same thing and add nothing; the keyword is refused
   before a CTE or view name, under an outer join, and with
   `WITH ORDINALITY`.
+- An ARRAY parameter (`widths number[]`, `bitrates text[]`) lets the
+  caller pass what the function would otherwise carry. A subscript over
+  one is the array's ELEMENT type wherever the body writes it: inside a
+  call, as a declared value column of a `RETURNS TABLE`, and read back
+  off the alias in a `WITH` option. So
+  `ladder(f.video[1], ARRAY[1280, 854, 640],
+  ARRAY['4500k', '2000k', '900k'], 3)` with a body of
+  `SELECT scale(v, widths[i.i], -2), bitrates[i.i]
+  FROM generate_series(1, rungs) i` compiles to the command the same
+  ladder written longhand does. A subscript past the end of the array
+  the caller passed is refused, naming the range it has.
 - The body is ONE `SELECT` with no `WITH`, no `GROUP BY`/`ORDER BY`/
   `LIMIT`, referencing only its parameters and its own `FROM` aliases. No
   `OR REPLACE`, no `IF NOT EXISTS`, no schema-qualified name, no `OUT`/

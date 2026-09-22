@@ -6129,6 +6129,26 @@ def test_a_sink_ladder_reads_each_rungs_bitrate_off_the_row() -> None:
     assert [pad["video_bitrate"] for pad in pads] == ["400k", "1200k"]
 
 
+def test_a_sink_ladder_takes_the_rungs_the_caller_passed() -> None:
+    """The ladder as a function the caller configures: the widths and the
+    bitrates are array arguments, read one element per row, and what reaches
+    each pad's encoder is the element that row read."""
+    sql = LADDER_DECLARE + (
+        "CREATE FUNCTION rungs(v video_stream, widths number[], rates text[], "
+        "count number) RETURNS TABLE(v video_stream, rate text) AS $$ "
+        "  SELECT scale(v, widths[i.i], -2), rates[i.i] "
+        "  FROM generate_series(1, count) i $$ LANGUAGE sql;\n"
+        "COPY (SELECT array_agg(l.v) FROM input('a.mp4') f, "
+        "rungs(f.video[1], ARRAY[640, 1280], ARRAY['400k', '1200k'], 2) l) "
+        "TO tally() WITH (video_bitrate l.rate)"
+    )
+    graph = _ladder_graph(sql)
+    sink = next(node for node in graph.nodes.values() if node.filter == LADDER_MODULE)
+    assert [graph.nodes[ref].args["width"] for ref in sink.inputs] == [640, 1280]
+    pads = graph.packet_sinks[graph.module_sinks[0]]
+    assert [pad["video_bitrate"] for pad in pads] == ["400k", "1200k"]
+
+
 def test_a_sink_reading_one_stream_refuses_a_ladder() -> None:
     sql = LADDER_DECLARE.replace("video_stream[]", "video_stream") + (
         "COPY (SELECT array_agg(scale(f.video[1], ARRAY[640, 1280][i.i], -2)) "
