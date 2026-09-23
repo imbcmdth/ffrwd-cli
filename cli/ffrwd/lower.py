@@ -9554,6 +9554,19 @@ class _Lowerer:
                 hint="list subscripts are 1-based: [1] is the first element",
             )
         if index > len(elements):
+            # An unset -v substitutes to one NULL element, so a subscript
+            # past it means the list was never given: name the variable.
+            if len(elements) == 1:
+                variable = null_variable(_unwrap(elements[0]))
+                if variable is not None:
+                    line, col = _pos(node, select)
+                    raise unset_error(
+                        ErrorCode.UNSUPPORTED_SQL,
+                        variable,
+                        what=f"subscript {index} reads element {index} of the list",
+                        line=line,
+                        col=col,
+                    )
             have = f"{len(elements)} element" + ("" if len(elements) == 1 else "s")
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,

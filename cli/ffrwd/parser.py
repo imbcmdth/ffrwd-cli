@@ -5255,6 +5255,18 @@ class _Resolver:
                 inner = _unwrap_paren(node.this) if isinstance(node.this, exp.Expr) else None
                 node = inner if isinstance(inner, exp.Literal) and not inner.is_string else None
             if not isinstance(node, exp.Literal):
+                # A NULL an unset -v left behind names the variable, since the
+                # list is what the reader forgot; a NULL written out is not.
+                variable = null_variable(node)
+                if variable is not None:
+                    line, col = _pos(element if isinstance(element, exp.Expr) else bracket, bracket)
+                    raise unset_error(
+                        ErrorCode.UNSUPPORTED_SQL,
+                        variable,
+                        what="a subscripted array's elements are its list",
+                        line=line,
+                        col=col,
+                    )
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,
                     "a subscripted array takes literal elements only",

@@ -1348,6 +1348,71 @@ def test_the_caller_hands_the_rungs_over_as_command_line_lists() -> None:
     assert _argv(sql, probes) == _argv(_LONGHAND_LADDER, probes)
 
 
+def _lists_call_missing(name: str) -> tuple[str, dict[tuple[int, int], str]]:
+    """The command-line-lists call with one of its three lists left unset."""
+    from ffrwd.vars import substitute
+
+    lists = {
+        "widths": "1280,854,640",
+        "bitrates": "4500k,2000k,900k",
+        "bufsizes": "2250k,1000k,450k",
+    }
+    del lists[name]
+    sub = substitute(
+        ARRAY_LADDER
+        + _ARRAY_LADDER_COPY.replace(
+            _ARRAY_LADDER_RUNGS,
+            "ARRAY[:widths],\n"
+            "             ARRAY[:'bitrates'],\n"
+            "             ARRAY[:'bufsizes']",
+        ),
+        lists,
+    )
+    return sub.text, sub.unset
+
+
+def test_an_unset_list_read_past_its_one_null_names_the_variable() -> None:
+    """`bitrates` left off the command line is `ARRAY[NULL]`, one element;
+    the second rung's subscript runs past it, and the rejection says which
+    `-v` was forgotten rather than how long a list nobody gave is."""
+    from ffrwd.vars import unset_variable
+
+    text, unset = _lists_call_missing("bitrates")
+    with pytest.raises(FfrwdError) as caught:
+        lower(resolve(parse(text, unset)), {"f": _video_probe()}, registry=_snapshot_registry())
+    assert unset_variable(caught.value) == "bitrates"
+    assert "-v bitrates=" in (caught.value.hint or "")
+
+
+def test_an_unset_list_under_a_filter_argument_names_the_variable() -> None:
+    """`widths` unset lands where the array's elements are checked for being
+    literals, before any subscript is read; that site names the variable too."""
+    from ffrwd.vars import unset_variable
+
+    text, unset = _lists_call_missing("widths")
+    with pytest.raises(FfrwdError) as caught:
+        lower(resolve(parse(text, unset)), {"f": _video_probe()}, registry=_snapshot_registry())
+    assert unset_variable(caught.value) == "widths"
+    assert "-v widths=" in (caught.value.hint or "")
+
+
+def test_a_null_somebody_wrote_into_a_list_keeps_the_generic_wording() -> None:
+    """A NULL element written by hand carries no variable, and the messages
+    stay what they were."""
+    from ffrwd.vars import unset_variable
+
+    sql = ARRAY_LADDER + _ARRAY_LADDER_COPY.replace(
+        _ARRAY_LADDER_RUNGS,
+        "ARRAY[1280, 854, 640],\n"
+        "             ARRAY[NULL],\n"
+        "             ARRAY['2250k', '1000k', '450k']",
+    )
+    with pytest.raises(FfrwdError) as caught:
+        lower(_resolved(sql), {"f": _video_probe()}, registry=_snapshot_registry())
+    assert unset_variable(caught.value) is None
+    assert "past the end" in caught.value.message or "literal elements" in caught.value.message
+
+
 def test_a_constant_subscript_over_an_array_parameter_is_its_element() -> None:
     """No row column in the subscript at all: still text, and every rung then
     carries the same bitrate."""
