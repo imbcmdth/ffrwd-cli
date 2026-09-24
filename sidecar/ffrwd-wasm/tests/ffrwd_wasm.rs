@@ -1667,6 +1667,77 @@ fn a_pure_into_impure_graph_keeps_frame_and_row_order() {
 // Rows with no frame to ride: what a module says after its last frame, and
 // how it travels.
 
+#[test]
+fn a_rows_reader_that_stops_reading_does_not_stop_the_module() {
+    // Nobody reads the rows until every frame has gone in. A rows output
+    // written on the module's own thread fills the pipe, stops the calls,
+    // stops the input being read, and the write below never finishes; one
+    // written on a thread of its own holds the rows and keeps going.
+    ensure_modules_built();
+    let count = 20_000u32;
+    let frames: Vec<Vec<u8>> = (0..count).map(|i| synthetic_frame(i as u8)).collect();
+    let wire = nut_stream(&frames);
+
+    let module = module_path("framestats");
+    let named = format!(
+        "framestats={}",
+        module.to_str().expect("module path is valid UTF-8")
+    );
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ffrwd-wasm"))
+        .args([
+            "-f",
+            "nut",
+            "-i",
+            "-",
+            "-m",
+            &named,
+            "-filter_complex",
+            "[0:v]framestats[b]",
+            "-map",
+            "[b]",
+            "-f",
+            "ndjson",
+            "-",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ffrwd-wasm");
+    let mut stdin = child.stdin.take().expect("child stdin");
+    let (fed, done) = std::sync::mpsc::channel();
+    let feeder = thread::spawn(move || {
+        let wrote = stdin.write_all(&wire);
+        drop(stdin);
+        let _ = fed.send(wrote.is_ok());
+    });
+    let finished = done.recv_timeout(Duration::from_secs(60));
+    // Read the rows now either way, so a failure below ends the child too.
+    let output = child.wait_with_output().expect("wait for ffrwd-wasm");
+    feeder.join().expect("the feeder thread");
+    assert_eq!(
+        finished,
+        Ok(true),
+        "every frame went in while nobody read the rows\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rows = output
+        .stdout
+        .split(|b| *b == b'\n')
+        .filter(|line| !line.is_empty())
+        .count();
+    assert_eq!(
+        rows,
+        count as usize + 1,
+        "a row per frame and the trailing count, none lost while they waited"
+    );
+}
+
 /// The summary row framestats ends with.
 #[derive(serde::Deserialize)]
 struct FramestatsSummary {

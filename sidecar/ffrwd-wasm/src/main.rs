@@ -1158,40 +1158,212 @@ fn output_is_pipe(path: &OutputPath) -> bool {
     }
 }
 
-/// One rows output: where the rows go, and whether a reader is waiting on
-/// them. The `BufWriter` is what makes one row one write however many pieces
-/// it is written in; the flush is what stops a written row waiting for the
-/// next megabyte of them.
+/// How many bytes of rows one output holds while its writer is behind.
+///
+/// Rows are written on a thread of their own, so a write that waits - a
+/// pipe whose reader is slow, a file on a disk busy with something else -
+/// never stops the calls into the module. That matters most to a sink that
+/// runs a network session inside its calls: a live publisher not called is
+/// a broadcast not published, and a head stalled 5 to 34 seconds that way
+/// while its log sat behind a build on the same disk. Rows are small, so
+/// 64 MiB is hours of them; past it the writer is plainly stuck, and the
+/// module waits rather than the process growing without end.
+const ROWS_QUEUE_BYTES: usize = 64 << 20;
+
+/// One rows output: where the rows go, written on a thread of its own.
+///
+/// What is handed to it is queued and written in order behind the call that
+/// handed it over. The `BufWriter` on the writing thread is what makes one
+/// row one write however many pieces it is written in; the flush after each
+/// batch, to a pipe, is what stops a written row waiting for the next
+/// megabyte of them. [`RowOutput::flush`] waits until everything queued
+/// before it is written and flushed, so the final flush of a run still means
+/// the rows are out. A write that failed is handed back by the next call.
 struct RowOutput {
-    writer: io::BufWriter<OutputWriter>,
-    pipe: bool,
+    queue: Arc<(Mutex<RowQueue>, Condvar)>,
+    thread: Option<thread::JoinHandle<()>>,
+    /// Said once, the first time the queue fills.
+    warned: bool,
+}
+
+/// What one output's writing thread has still to do.
+#[derive(Default)]
+struct RowQueue {
+    /// Bytes to write, each piece flushed after if `pipe` says so, and the
+    /// flushes asked for, in order.
+    pending: std::collections::VecDeque<RowWork>,
+    bytes: usize,
+    /// How many flushes have been asked for, and how many have finished,
+    /// for a caller waiting on one.
+    asked: u64,
+    flushed: u64,
+    closed: bool,
+    failed: Option<String>,
+}
+
+enum RowWork {
+    Bytes(Vec<u8>),
+    Flush(u64),
 }
 
 impl RowOutput {
     fn open(path: &OutputPath) -> Result<RowOutput> {
-        let writer = io::BufWriter::with_capacity(1 << 20, open_output(path)?);
+        let mut writer = io::BufWriter::with_capacity(1 << 20, open_output(path)?);
+        let pipe = output_is_pipe(path);
+        let queue = Arc::new((Mutex::new(RowQueue::default()), Condvar::new()));
+        let shared = Arc::clone(&queue);
+        let thread = thread::spawn(move || {
+            let (lock, ready) = &*shared;
+            loop {
+                let work = {
+                    let mut state = lock.lock().expect("the rows queue lock is not poisoned");
+                    loop {
+                        if let Some(work) = state.pending.pop_front() {
+                            if let RowWork::Bytes(bytes) = &work {
+                                state.bytes -= bytes.len();
+                            }
+                            // Room has been made for a caller waiting on it.
+                            ready.notify_all();
+                            break Some(work);
+                        }
+                        if state.closed {
+                            break None;
+                        }
+                        state = ready
+                            .wait(state)
+                            .expect("the rows queue lock is not poisoned");
+                    }
+                };
+                let Some(work) = work else {
+                    let _ = writer.flush();
+                    return;
+                };
+                let done = match &work {
+                    RowWork::Bytes(bytes) => {
+                        writer
+                            .write_all(bytes)
+                            .and_then(|()| if pipe { writer.flush() } else { Ok(()) })
+                    }
+                    RowWork::Flush(_) => writer.flush(),
+                };
+                let mut state = lock.lock().expect("the rows queue lock is not poisoned");
+                if let Err(err) = done {
+                    state.failed.get_or_insert_with(|| err.to_string());
+                    state.pending.clear();
+                    state.bytes = 0;
+                    state.closed = true;
+                }
+                if let RowWork::Flush(ticket) = work {
+                    state.flushed = state.flushed.max(ticket);
+                }
+                ready.notify_all();
+                if state.failed.is_some() {
+                    return;
+                }
+            }
+        });
         Ok(RowOutput {
-            pipe: output_is_pipe(path),
-            writer,
+            queue,
+            thread: Some(thread),
+            warned: false,
         })
     }
 
-    /// One batch of rows, reaching a waiting reader before this returns.
+    /// One batch of rows, queued for the writing thread. It reaches a
+    /// waiting reader as soon as that thread gets to it, not before this
+    /// returns: this call waits only when the queue is full.
     fn write_batch(&mut self, rows: &[String]) -> Result<()> {
-        write_rows(&mut self.writer, rows)?;
-        if self.pipe && !rows.is_empty() {
-            self.writer.flush()?;
+        if rows.is_empty() {
+            return self.check();
         }
+        let mut bytes = Vec::new();
+        write_rows(&mut bytes, rows)?;
+        self.enqueue(bytes)?;
         Ok(())
+    }
+
+    /// Queues one piece of bytes, waiting only while the queue is full.
+    fn enqueue(&mut self, bytes: Vec<u8>) -> io::Result<()> {
+        let (lock, ready) = &*self.queue;
+        let mut state = lock.lock().expect("the rows queue lock is not poisoned");
+        while state.failed.is_none()
+            && state.bytes > 0
+            && state.bytes + bytes.len() > ROWS_QUEUE_BYTES
+        {
+            if !self.warned {
+                self.warned = true;
+                eprintln!(
+                    "ffrwd-wasm: a rows output is {} MiB behind; the module waits for it to catch up",
+                    state.bytes >> 20
+                );
+            }
+            state = ready
+                .wait(state)
+                .expect("the rows queue lock is not poisoned");
+        }
+        if let Some(err) = &state.failed {
+            return Err(io::Error::other(format!("writing rows: {err}")));
+        }
+        state.bytes += bytes.len();
+        state.pending.push_back(RowWork::Bytes(bytes));
+        ready.notify_all();
+        Ok(())
+    }
+
+    /// The failure the writing thread met, if it met one.
+    fn check(&self) -> Result<()> {
+        let (lock, _) = &*self.queue;
+        let state = lock.lock().expect("the rows queue lock is not poisoned");
+        match &state.failed {
+            Some(err) => bail!("writing rows: {err}"),
+            None => Ok(()),
+        }
     }
 }
 
 impl Write for RowOutput {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.writer.write(buf)
+        self.enqueue(buf.to_vec())?;
+        Ok(buf.len())
     }
+
+    /// Waits until everything queued before this is written and flushed.
     fn flush(&mut self) -> io::Result<()> {
-        self.writer.flush()
+        let (lock, ready) = &*self.queue;
+        let mut state = lock.lock().expect("the rows queue lock is not poisoned");
+        if let Some(err) = &state.failed {
+            return Err(io::Error::other(format!("writing rows: {err}")));
+        }
+        state.asked += 1;
+        let ticket = state.asked;
+        state.pending.push_back(RowWork::Flush(ticket));
+        ready.notify_all();
+        while state.flushed < ticket && state.failed.is_none() {
+            state = ready
+                .wait(state)
+                .expect("the rows queue lock is not poisoned");
+        }
+        match &state.failed {
+            Some(err) => Err(io::Error::other(format!("writing rows: {err}"))),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for RowOutput {
+    /// Whatever is still queued is written before the output goes: a run
+    /// that ends without a final flush still leaves its rows behind.
+    fn drop(&mut self) {
+        {
+            let (lock, ready) = &*self.queue;
+            if let Ok(mut state) = lock.lock() {
+                state.closed = true;
+            }
+            ready.notify_all();
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
