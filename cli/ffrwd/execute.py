@@ -146,6 +146,7 @@ from .processes import (
     SidecarProcess,
     Stage,
     StreamEdge,
+    encoded,
 )
 
 __all__ = [
@@ -862,8 +863,33 @@ def plan_argv(
             + [(read[edge], edge.format.container) for edge in incoming],
             pipe_outputs=[(write[edge], edge.format) for edge in outgoing],
             pipe_buffers=[edge.buffer for edge in outgoing],
+            copyts=all(keeps_clock(edge, plan) for edge in incoming),
         )
     return _resolve_rows_documents(argv, rows_path)
+
+
+def keeps_clock(edge: StreamEdge, plan: ProcessPlan) -> bool:
+    """True when `edge`'s timestamps are the plan's clock as they stand.
+
+    Decoded frames are: whoever wrote them, ffmpeg or a module, put them
+    there. So are a source module's packets, which carry their origin's own
+    time. Packets an ffmpeg wrote are not: NUT stores no negative timestamp,
+    so a stream with B-frames reaches the pipe shifted by its reorder delay,
+    and only the reader's rebase takes that back out. A packet filter hands
+    on whatever clock its own inputs had.
+    """
+    if not encoded(edge.format):
+        return True
+    producer = next(p for p in plan.processes if p.id == edge.source)
+    if not isinstance(producer, SidecarProcess):
+        return False
+    if producer.packet_source:
+        return True
+    if not producer.packet_filter:
+        return False
+    return all(
+        keeps_clock(e, plan) for e in plan.stream_edges if e.target == producer.id
+    )
 
 
 def _resolve_rows_documents(

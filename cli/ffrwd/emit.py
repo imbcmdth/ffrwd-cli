@@ -355,6 +355,9 @@ MAP_METADATA_FLAG = "-map_metadata"
 # One attached file. An output option: it applies to the output file that
 # follows it, and adds one output stream after that file's mapped ones.
 ATTACH_FLAG = "-attach"
+# Keep every input's own timestamps instead of rebasing each at its first
+# packet. A global option, so it renders straight after the program name.
+COPYTS_FLAG = "-copyts"
 
 
 @dataclass
@@ -423,6 +426,9 @@ class Emitted:
     # graph has no loudnorm2 node. Non-empty means this compile is a sequence
     # (`build_ffmpeg_commands`), same as a two_pass group does.
     measure_filter_complex: str = ""
+    # Every input is a pipe edge another process of the plan writes, so the
+    # command renders ``-copyts``: see :func:`build_process_args`.
+    copyts: bool = False
 
     @property
     def maps(self) -> list[OutputMap]:
@@ -856,6 +862,7 @@ def build_process_args(
     pipe_inputs: Sequence[tuple[str, str]] = (),
     pipe_outputs: Sequence[tuple[str, StreamFormat]] = (),
     pipe_buffers: Sequence[EdgeBuffer | None] = (),
+    copyts: bool = False,
 ) -> list[str]:
     """Full ffmpeg argv for one ffmpeg process of a process plan.
 
@@ -884,6 +891,16 @@ def build_process_args(
     Input paths are substituted BEFORE the graph is emitted: two ``pipe:``
     inputs are two different streams, and only their real spellings keep
     :func:`~ffrwd.ir.dedup_inputs` from folding them onto one ``-i``.
+
+    `copyts` says every edge this process reads already carries the plan's
+    clock (:func:`~ffrwd.execute.keeps_clock`). When it is set and the process
+    opens no real input, the command renders ``-copyts``: rebasing each input
+    at its own first packet would only lose time. A source module's tracks
+    arrive as one input each, and a rebase shifts the sound against the
+    picture by whatever the join gave each track; a live source's own
+    timestamps would not survive the next hop. A process that opens a real
+    input keeps ffmpeg's rebase, which is what puts that input on the plan's
+    clock in the first place.
     """
     slots = [index for index, path in enumerate(g.input_paths) if path == PIPE]
     if len(slots) != len(pipe_inputs):
@@ -904,6 +921,7 @@ def build_process_args(
                 }
 
     e = emit(replace(g, input_paths=paths, input_options=options))
+    e.copyts = copyts and bool(slots) and len(slots) == len(g.input_paths)
 
     pipes = [index for index, group in enumerate(e.groups) if group.path == PIPE]
     if len(pipes) != len(pipe_outputs):
@@ -1015,7 +1033,7 @@ def _render_command(e: Emitted, out_path: str | None, pass_: _Pass | None) -> li
             f"{len(e.groups)}"
         )
 
-    args = ["ffmpeg"]
+    args = ["ffmpeg", COPYTS_FLAG] if e.copyts else ["ffmpeg"]
     for index, input_path in enumerate(e.inputs):
         options = e.input_options[index] if index < len(e.input_options) else {}
         args += _render_input_options(options)

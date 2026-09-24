@@ -1700,8 +1700,8 @@ ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 rawvideo -pix_fmt:0 yuv420p
   depth=../sidecar/modules/target/wasm32-wasip2/release/depth.wasm -m \
   blur_mask=../sidecar/modules/target/wasm32-wasip2/release/blur_mask.wasm \
   -filter_complex '[0:v]depth[n1];[0:v][n1]blur_mask=max_radius=24:invert=1[out0]' -map \
-  '[out0]' -f nut pipe:1 | ffmpeg -f nut -analyzeduration 0 -fpsprobesize 3 -i pipe:0 \
-  -map 0:v:0 -c:0 libx264 -crf:0 20 bokeh.mp4
+  '[out0]' -f nut pipe:1 | ffmpeg -copyts -f nut -analyzeduration 0 -fpsprobesize 3 -i \
+  pipe:0 -map 0:v:0 -c:0 libx264 -crf:0 20 bokeh.mp4
 ```
 
 The `-nn` binding is the model file beside the module, found by name; the
@@ -1971,7 +1971,7 @@ COPY (
 ```
 $ ffrwd compile -f query.sql
 # named pipes: ffmpeg0 reads ffmpeg1, sidecar0; ffmpeg1 feeds sidecar0, ffmpeg0
-1. ffmpeg: ffmpeg -f nut -analyzeduration 0 -fpsprobesize 3 -i \
+1. ffmpeg: ffmpeg -copyts -f nut -analyzeduration 0 -fpsprobesize 3 -i \
   '<named pipe ffmpeg1-ffmpeg0 src_a_v_0_split:1 read>' -f nut -analyzeduration 0 \
   -fpsprobesize 3 -i '<named pipe sidecar0-ffmpeg0 n1 read>' -filter_complex \
   '[0:v:0][1:v:0]hstack=inputs=2[out0]' -map '[out0]' -c:0 libx264 -crf:0 22 live.mp4
@@ -2026,7 +2026,7 @@ COPY (
 ```
 $ ffrwd compile -f query.sql
 # named pipes: ffmpeg0 reads ffmpeg1, sidecar0; ffmpeg1 feeds sidecar0, ffmpeg0
-1. ffmpeg: ffmpeg -f nut -analyzeduration 0 -fpsprobesize 3 -i \
+1. ffmpeg: ffmpeg -copyts -f nut -analyzeduration 0 -fpsprobesize 3 -i \
   '<named pipe ffmpeg1-ffmpeg0 src_a_v_0_split:1 read>' -f nut -analyzeduration 0 \
   -fpsprobesize 3 -i '<named pipe sidecar0-ffmpeg0 n1 read>' -filter_complex \
   '[0:v:0][1:v:0]hstack=inputs=2[out0]' -map '[out0]' -c:0 libx264 -crf:0 22 live.mp4
@@ -2258,7 +2258,7 @@ COPY (
 
 ```
 $ ffrwd compile -f query.sql -v dest=source.mp4
-ffrwd-wasm -m ../sidecar/modules/target/wasm32-wasip2/release/source_replay.wasm -track 0 -f nut pipe:1 | ffmpeg -f nut -analyzeduration 0 -fpsprobesize 3 -i pipe:0 -map 0:v:0 -c:0 libx264 -crf:0 20 source.mp4
+ffrwd-wasm -m ../sidecar/modules/target/wasm32-wasip2/release/source_replay.wasm -track 0 -f nut pipe:1 | ffmpeg -copyts -f nut -analyzeduration 0 -fpsprobesize 3 -i pipe:0 -map 0:v:0 -c:0 libx264 -crf:0 20 source.mp4
 ```
 
 Reach for this for a module that manufactures a stream rather than filtering one - a synthetic test pattern, a packet source pulled off a socket - anywhere a query wants to name it as an input alongside, or instead of, a probed file.
@@ -2966,14 +2966,15 @@ COPY (
 ```
 $ ffrwd compile -f query.sql
 # named pipes: ffmpeg0 reads ffmpeg1, sidecar1; ffmpeg1 feeds sidecar1, ffmpeg0
-1. ffmpeg: ffmpeg -f nut -analyzeduration 0 -fpsprobesize 3 -i \
+1. ffmpeg: ffmpeg -copyts -f nut -analyzeduration 0 -fpsprobesize 3 -i \
   '<named pipe ffmpeg1-ffmpeg0 n3 read>' -f nut -analyzeduration 0 -fpsprobesize 3 -i \
   '<named pipe sidecar1-ffmpeg0 n2 read>' -map 1:v:0 -map 0:v:0 -c:0 ffv1 -c:1 ffv1 \
   both.mkv
-2. ffmpeg: ffmpeg -f nut -analyzeduration 0 -fpsprobesize 3 -i pipe:0 -filter_complex \
-  '[0:v:0]split=2[out0][n1_split1];[n1_split1]hflip[out1]' -map '[out0]' -c:0 rawvideo \
-  -pix_fmt:0 rgba -f nut '<named pipe ffmpeg1-sidecar1 n1_split:0 write>' -map '[out1]' \
-  -c:0 rawvideo -pix_fmt:0 yuv420p -f nut '<named pipe ffmpeg1-ffmpeg0 n3 write>'
+2. ffmpeg: ffmpeg -copyts -f nut -analyzeduration 0 -fpsprobesize 3 -i pipe:0 \
+  -filter_complex '[0:v:0]split=2[out0][n1_split1];[n1_split1]hflip[out1]' -map '[out0]' \
+  -c:0 rawvideo -pix_fmt:0 rgba -f nut '<named pipe ffmpeg1-sidecar1 n1_split:0 write>' \
+  -map '[out1]' -c:0 rawvideo -pix_fmt:0 yuv420p -f nut \
+  '<named pipe ffmpeg1-ffmpeg0 n3 write>'
 3. ffmpeg: ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 rawvideo -pix_fmt:0 rgba \
   -f nut pipe:1
 4. sidecar: ffrwd-wasm -f nut -i pipe:0 -m \

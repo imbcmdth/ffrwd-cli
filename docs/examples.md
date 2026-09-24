@@ -540,9 +540,9 @@ COPY (
 $ ffrwd compile -f query.sql
 ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 rawvideo -pix_fmt:0 rgba -f nut \
   pipe:1 | ffrwd-wasm -f nut -i pipe:0 -m \
-  ../sidecar/modules/target/wasm32-wasip2/release/invert.wasm -f nut pipe:1 | ffmpeg -f \
-  nut -analyzeduration 0 -fpsprobesize 3 -i pipe:0 -map 0:v:0 -c:0 libx264 -crf:0 20 \
-  inverted.mp4
+  ../sidecar/modules/target/wasm32-wasip2/release/invert.wasm -f nut pipe:1 | ffmpeg \
+  -copyts -f nut -analyzeduration 0 -fpsprobesize 3 -i pipe:0 -map 0:v:0 -c:0 libx264 \
+  -crf:0 20 inverted.mp4
 ```
 
 A module cannot be a link in one ffmpeg's filter graph, so the query compiles to three processes joined by pipes rather than one command: an ffmpeg that decodes, the sidecar hosting the module, and an ffmpeg that encodes what comes back. The frames travel as NUT, and the pixel format on both seams is the one the module and the wire agree on - `rgba` here, because that is what `invert` accepts. `ffrwd run` executes the whole pipeline itself; the printed form is for reading and pasting.

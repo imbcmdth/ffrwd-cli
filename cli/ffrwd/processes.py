@@ -151,6 +151,7 @@ __all__ = [
     "StreamEdge",
     "StreamFormat",
     "VideoFormat",
+    "encoded",
     "external_filters",
     "external_ids",
     "from_commands",
@@ -1042,7 +1043,7 @@ def _bindings(paths: Iterable[str]) -> tuple[ModuleBinding, ...]:
     return tuple(bound.values())
 
 
-def _encoded(wire: StreamFormat) -> bool:
+def encoded(wire: StreamFormat) -> bool:
     """True when this edge carries packets rather than raw frames."""
     if isinstance(wire, AudioFormat):
         return wire.codec not in (PCM_F32LE, PCM_S16LE)
@@ -1055,7 +1056,7 @@ def _encodes(wire: StreamFormat) -> bool:
     A copied stream is not one: its packets were encoded before this run and
     cross untouched, so nothing holds frames back to reorder them.
     """
-    return _encoded(wire) and wire.codec != COPY_CODEC
+    return encoded(wire) and wire.codec != COPY_CODEC
 
 
 def _frame_bytes(wire: StreamFormat) -> int | None:
@@ -1065,7 +1066,7 @@ def _frame_bytes(wire: StreamFormat) -> int | None:
     encoded packet's size is not its frame's, and an audio packet holds
     however many samples the muxer put in it: neither has an answer here.
     """
-    if isinstance(wire, AudioFormat) or _encoded(wire):
+    if isinstance(wire, AudioFormat) or encoded(wire):
         return None
     if wire.width is None or wire.height is None:
         return None

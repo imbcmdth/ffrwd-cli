@@ -300,7 +300,9 @@ def test_a_chain_spells_its_pipes_as_stdio() -> None:
         "-map", "0:v:0", "-c:0", "rawvideo", "-pix_fmt:0", "yuv420p",
         "-f", "nut", STDOUT,
     ]  # fmt: skip
-    assert argv["ffmpeg0"][:9] == ["ffmpeg", "-f", "nut", *_PROBE, "-i", STDIN]
+    assert argv["ffmpeg0"][:10] == [
+        "ffmpeg", "-copyts", "-f", "nut", *_PROBE, "-i", STDIN,
+    ]  # fmt: skip
 
 
 def test_a_video_edge_carries_rawvideo_and_an_audio_edge_pcm() -> None:
@@ -313,8 +315,8 @@ def test_a_video_edge_carries_rawvideo_and_an_audio_edge_pcm() -> None:
 
 def test_a_fan_in_reader_names_one_pipe_per_input() -> None:
     argv = plan_argv(_two_producers(), pipe_path=_named)
-    assert argv["mux"][:17] == [
-        "ffmpeg",
+    assert argv["mux"][:18] == [
+        "ffmpeg", "-copyts",
         "-f", "nut", *_PROBE, "-i", "/pipes/video-mux-read",
         "-f", "nut", *_PROBE, "-i", "/pipes/audio-mux-read",
     ]  # fmt: skip
@@ -340,6 +342,104 @@ def test_a_sidecar_between_two_ffmpegs_reads_and_writes_stdio() -> None:
         "-vf", "negate", "-c:v", "rawvideo", "-f", "nut", STDOUT,
     ]  # fmt: skip
     assert argv["sidecar1"][6] == "boost"
+
+
+# ---------------------------------------------------------------- clock
+
+
+def _with_formats(plan: ProcessPlan, video: str, audio: str) -> ProcessPlan:
+    """`plan` with every edge's codec replaced: packets instead of frames."""
+    return replace(
+        plan,
+        edges=tuple(
+            replace(
+                edge,
+                format=replace(
+                    edge.format,
+                    codec=audio if isinstance(edge.format, AudioFormat) else video,
+                ),
+            )
+            if isinstance(edge, StreamEdge)
+            else edge
+            for edge in plan.edges
+        ),
+    )
+
+
+def _copying_filter() -> ProcessPlan:
+    """ffmpeg stream-copies into a packet filter, which hands on to a muxer."""
+    copy = Graph(input_paths=["a.mp4"], sources={"s": 0})
+    copy.sinks = [SinkUnit(outputs=[_out("src:s:v:0")], path=PIPE)]
+    mux = Graph(input_paths=[PIPE], sources={"v": 0})
+    mux.sinks = [SinkUnit(outputs=[_out("src:v:v:0")], path="out.mp4")]
+    packets = VideoFormat(codec="copy")
+    return ProcessPlan(
+        processes=(
+            FfmpegProcess(id="copy", graph=copy),
+            SidecarProcess(
+                id="sidecar0",
+                module="weave.wasm",
+                node="weave",
+                outputs=("video",),
+                packet_filter=True,
+            ),
+            FfmpegProcess(id="mux", graph=mux),
+        ),
+        edges=(
+            StreamEdge(source="copy", target="sidecar0", ref="src:s:v:0", format=packets),
+            StreamEdge(source="sidecar0", target="mux", ref="weave", format=packets),
+        ),
+    )
+
+
+def test_a_reader_of_frames_alone_keeps_the_clock_they_carry() -> None:
+    """Every edge into the encode is decoded frames, already on the plan's
+    clock, so nothing rebases them; the decode opens a file and keeps
+    ffmpeg's rebase, which is what put them on that clock."""
+    argv = plan_argv(_chain(), sidecar_argv=_stand_in)
+    assert argv["ffmpeg0"][:2] == ["ffmpeg", "-copyts"]
+    assert "-copyts" not in argv["ffmpeg1"]
+
+
+def test_a_source_modules_tracks_keep_their_own_clock_and_stay_together() -> None:
+    """Each track of a source module is its own input, and a rebase would
+    shift each by its own first packet: the sound against the picture."""
+    plan = _with_formats(_packet_source_plan(2), "h264", "aac")
+    argv = plan_argv(plan, sidecar_argv=_stand_in_writes, pipe_path=_named_by_ref)
+    assert argv["reader"][:2] == ["ffmpeg", "-copyts"]
+
+
+def test_packets_an_ffmpeg_wrote_are_rebased_by_their_reader() -> None:
+    """NUT holds no negative timestamp, so a stream with B-frames reaches the
+    pipe shifted by its reorder delay, and the reader's rebase undoes it."""
+    plan = _with_formats(_two_producers(), "copy", "copy")
+    argv = plan_argv(plan, pipe_path=_named)
+    assert "-copyts" not in argv["mux"]
+
+
+def test_a_packet_filter_hands_on_the_clock_its_own_input_had() -> None:
+    argv = plan_argv(_copying_filter(), sidecar_argv=_stand_in, pipe_path=_named)
+    assert "-copyts" not in argv["mux"]
+
+
+def test_a_reader_opening_a_file_beside_its_pipes_keeps_the_rebase() -> None:
+    plan = _two_producers()
+    mux = next(p for p in plan.processes if p.id == "mux")
+    assert isinstance(mux, FfmpegProcess)
+    graph = replace(
+        mux.graph,
+        input_paths=[*mux.graph.input_paths, "b.mp4"],
+        sources={**mux.graph.sources, "b": 2},
+    )
+    plan = replace(
+        plan,
+        processes=tuple(
+            replace(p, graph=graph) if p.id == "mux" else p for p in plan.processes
+        ),
+    )
+    argv = plan_argv(plan, pipe_path=_named)
+    assert "-copyts" not in argv["mux"]
+    assert argv["mux"].count("-i") == 3
 
 
 # ---------------------------------------------------------------- refusals
@@ -568,7 +668,7 @@ def test_the_one_reader_of_a_live_input_writes_a_pipe_per_consumer() -> None:
         "/pipes/ffmpeg1-ffmpeg0-write",
     ]  # fmt: skip
     assert argv["ffmpeg0"] == [
-        "ffmpeg",
+        "ffmpeg", "-copyts",
         "-f", "nut", *_PROBE, "-i", "/pipes/ffmpeg1-ffmpeg0-read",
         "-f", "nut", *_PROBE, "-i", "/pipes/sidecar0-ffmpeg0-read",
         "-filter_complex", "[0:v:0][1:v:0]hstack[out0]",
