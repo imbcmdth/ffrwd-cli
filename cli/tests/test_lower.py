@@ -5325,6 +5325,28 @@ def test_enable_compiles_offline(_offline: Registry) -> None:
     assert g.nodes["n1"].args == {"sigma": 5, "enable": "between(t,2,5)"}
 
 
+def test_a_child_class_option_is_set_by_name(_offline: Registry) -> None:
+    """`async` is swresample's, not aresample's own: aresample hands it
+    every option it does not declare, so it is settable all the same."""
+    g = lower(
+        resolve(parse("SELECT aresample(a.audio[1], 48000, async => 1) FROM input('x.mp4') a")),
+        {},
+        registry=_offline,
+    )
+    assert g.nodes["n1"].args == {"sample_rate": 48000, "async": 1}
+
+
+def test_a_child_class_option_is_never_bound_positionally(_offline: Registry) -> None:
+    with pytest.raises(FfrwdError) as excinfo:
+        lower(
+            resolve(parse("SELECT aresample(a.audio[1], 48000, 1) FROM input('x.mp4') a")),
+            {},
+            registry=_offline,
+        )
+    assert excinfo.value.code is ErrorCode.UDF_ARG_TYPE
+    assert "'aresample' filter has 1" in excinfo.value.message
+
+
 def test_enable_still_requires_the_timeline_flag_offline(_offline: Registry) -> None:
     """scale is not T-flagged, and the snapshot carries that flag verbatim."""
     with pytest.raises(FfrwdError) as excinfo:

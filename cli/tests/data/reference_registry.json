@@ -1,5 +1,5 @@
 {
-  "format_version": 3,
+  "format_version": 4,
   "version_line": "ffmpeg version 9.0.1-full_build-www.gyan.dev Copyright (c) 2000-2026 the FFmpeg developers",
   "filters": {
     "aap": {
@@ -7821,6 +7821,415 @@
         "default": "0",
         "constants": [],
         "unusable": false
+      },
+      "in_sample_rate": {
+        "name": "in_sample_rate",
+        "type": "num",
+        "doc": "set input sample rate",
+        "minimum": 0.0,
+        "maximum": null,
+        "default": "0",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "out_sample_rate": {
+        "name": "out_sample_rate",
+        "type": "num",
+        "doc": "set output sample rate",
+        "minimum": 0.0,
+        "maximum": null,
+        "default": "0",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "in_sample_fmt": {
+        "name": "in_sample_fmt",
+        "type": "str",
+        "doc": "set input sample format",
+        "minimum": null,
+        "maximum": null,
+        "default": "none",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "out_sample_fmt": {
+        "name": "out_sample_fmt",
+        "type": "str",
+        "doc": "set output sample format",
+        "minimum": null,
+        "maximum": null,
+        "default": "none",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "internal_sample_fmt": {
+        "name": "internal_sample_fmt",
+        "type": "str",
+        "doc": "set internal sample format",
+        "minimum": null,
+        "maximum": null,
+        "default": "none",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "in_chlayout": {
+        "name": "in_chlayout",
+        "type": "str",
+        "doc": "set input channel layout",
+        "minimum": null,
+        "maximum": null,
+        "default": null,
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "out_chlayout": {
+        "name": "out_chlayout",
+        "type": "str",
+        "doc": "set output channel layout",
+        "minimum": null,
+        "maximum": null,
+        "default": null,
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "used_chlayout": {
+        "name": "used_chlayout",
+        "type": "str",
+        "doc": "set used channel layout",
+        "minimum": null,
+        "maximum": null,
+        "default": null,
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "center_mix_level": {
+        "name": "center_mix_level",
+        "type": "num",
+        "doc": "set center mix level",
+        "minimum": -32.0,
+        "maximum": 32.0,
+        "default": "0.707107",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "slev": {
+        "name": "slev",
+        "type": "num",
+        "doc": "set surround mix level",
+        "minimum": -32.0,
+        "maximum": 32.0,
+        "default": "0.707107",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "surround_mix_level": {
+        "name": "surround_mix_level",
+        "type": "num",
+        "doc": "set surround mix Level",
+        "minimum": -32.0,
+        "maximum": 32.0,
+        "default": "0.707107",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "lfe_mix_level": {
+        "name": "lfe_mix_level",
+        "type": "num",
+        "doc": "set LFE mix level",
+        "minimum": -32.0,
+        "maximum": 32.0,
+        "default": "0",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "rematrix_volume": {
+        "name": "rematrix_volume",
+        "type": "num",
+        "doc": "set rematrix volume",
+        "minimum": -1000.0,
+        "maximum": 1000.0,
+        "default": "1",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "rematrix_maxval": {
+        "name": "rematrix_maxval",
+        "type": "num",
+        "doc": "set rematrix maxval",
+        "minimum": 0.0,
+        "maximum": 1000.0,
+        "default": "0",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "swr_flags": {
+        "name": "swr_flags",
+        "type": "str",
+        "doc": "set flags",
+        "minimum": null,
+        "maximum": null,
+        "default": "0",
+        "constants": [
+          "res"
+        ],
+        "unusable": false,
+        "named_only": true
+      },
+      "dither_scale": {
+        "name": "dither_scale",
+        "type": "num",
+        "doc": "set dither scale",
+        "minimum": 0.0,
+        "maximum": null,
+        "default": "1",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "dither_method": {
+        "name": "dither_method",
+        "type": "str",
+        "doc": "set dither method",
+        "minimum": 0.0,
+        "maximum": 71.0,
+        "default": "0",
+        "constants": [
+          "rectangular",
+          "triangular",
+          "triangular_hp",
+          "lipshitz",
+          "shibata",
+          "low_shibata",
+          "high_shibata",
+          "f_weighted",
+          "modified_e_weighted",
+          "improved_e_weighted"
+        ],
+        "unusable": false,
+        "named_only": true
+      },
+      "filter_size": {
+        "name": "filter_size",
+        "type": "num",
+        "doc": "set swr resampling filter size",
+        "minimum": 0.0,
+        "maximum": null,
+        "default": "32",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "phase_shift": {
+        "name": "phase_shift",
+        "type": "num",
+        "doc": "set swr resampling phase shift",
+        "minimum": 0.0,
+        "maximum": 24.0,
+        "default": "10",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "linear_interp": {
+        "name": "linear_interp",
+        "type": "bool",
+        "doc": "enable linear interpolation",
+        "minimum": null,
+        "maximum": null,
+        "default": "true",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "exact_rational": {
+        "name": "exact_rational",
+        "type": "bool",
+        "doc": "enable exact rational",
+        "minimum": null,
+        "maximum": null,
+        "default": "true",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "resample_cutoff": {
+        "name": "resample_cutoff",
+        "type": "num",
+        "doc": "set cutoff frequency ratio",
+        "minimum": 0.0,
+        "maximum": 1.0,
+        "default": "0",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "resampler": {
+        "name": "resampler",
+        "type": "str",
+        "doc": "set resampling Engine",
+        "minimum": 0.0,
+        "maximum": 1.0,
+        "default": "swr",
+        "constants": [
+          "swr",
+          "soxr"
+        ],
+        "unusable": false,
+        "named_only": true
+      },
+      "precision": {
+        "name": "precision",
+        "type": "num",
+        "doc": "set soxr resampling precision (in bits)",
+        "minimum": 15.0,
+        "maximum": 33.0,
+        "default": "20",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "cheby": {
+        "name": "cheby",
+        "type": "bool",
+        "doc": "enable soxr Chebyshev passband & higher-precision irrational ratio approximation",
+        "minimum": null,
+        "maximum": null,
+        "default": "false",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "min_comp": {
+        "name": "min_comp",
+        "type": "num",
+        "doc": "set minimum difference between timestamps and audio data (in seconds) below which no timestamp compensation of either kind is applied",
+        "minimum": 0.0,
+        "maximum": null,
+        "default": "FLT_MAX",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "min_hard_comp": {
+        "name": "min_hard_comp",
+        "type": "num",
+        "doc": "set minimum difference between timestamps and audio data (in seconds) to trigger padding/trimming the data.",
+        "minimum": 0.0,
+        "maximum": null,
+        "default": "0.1",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "comp_duration": {
+        "name": "comp_duration",
+        "type": "num",
+        "doc": "set duration (in seconds) over which data is stretched/squeezed to make it match the timestamps.",
+        "minimum": 0.0,
+        "maximum": null,
+        "default": "1",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "max_soft_comp": {
+        "name": "max_soft_comp",
+        "type": "num",
+        "doc": "set maximum factor by which data is stretched/squeezed to make it match the timestamps.",
+        "minimum": null,
+        "maximum": null,
+        "default": "0",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "async": {
+        "name": "async",
+        "type": "num",
+        "doc": "simplified 1 parameter audio timestamp matching, 0(disabled), 1(filling and trimming), >1(maximum stretch/squeeze in samples per second)",
+        "minimum": null,
+        "maximum": null,
+        "default": "0",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "first_pts": {
+        "name": "first_pts",
+        "type": "num",
+        "doc": "Assume the first pts should be this value (in samples).",
+        "minimum": null,
+        "maximum": null,
+        "default": "I64_MIN",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "matrix_encoding": {
+        "name": "matrix_encoding",
+        "type": "str",
+        "doc": "set matrixed stereo encoding",
+        "minimum": 0.0,
+        "maximum": 6.0,
+        "default": "none",
+        "constants": [
+          "none",
+          "dolby",
+          "dplii"
+        ],
+        "unusable": false,
+        "named_only": true
+      },
+      "filter_type": {
+        "name": "filter_type",
+        "type": "str",
+        "doc": "select swr filter type",
+        "minimum": 0.0,
+        "maximum": 2.0,
+        "default": "kaiser",
+        "constants": [
+          "cubic",
+          "blackman_nuttall",
+          "kaiser"
+        ],
+        "unusable": false,
+        "named_only": true
+      },
+      "kaiser_beta": {
+        "name": "kaiser_beta",
+        "type": "num",
+        "doc": "set swr Kaiser window beta",
+        "minimum": 2.0,
+        "maximum": 16.0,
+        "default": "9",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "output_sample_bits": {
+        "name": "output_sample_bits",
+        "type": "num",
+        "doc": "set swr number of output sample bits",
+        "minimum": 0.0,
+        "maximum": 64.0,
+        "default": "0",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
       }
     },
     "areverse": {},
@@ -13516,7 +13925,59 @@
       }
     },
     "alphaextract": {},
-    "alphamerge": {},
+    "alphamerge": {
+      "eof_action": {
+        "name": "eof_action",
+        "type": "str",
+        "doc": "Action to take when encountering EOF from secondary input",
+        "minimum": 0.0,
+        "maximum": 2.0,
+        "default": "repeat",
+        "constants": [
+          "repeat",
+          "endall",
+          "pass"
+        ],
+        "unusable": false,
+        "named_only": true
+      },
+      "shortest": {
+        "name": "shortest",
+        "type": "bool",
+        "doc": "force termination when the shortest input terminates",
+        "minimum": null,
+        "maximum": null,
+        "default": "false",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "repeatlast": {
+        "name": "repeatlast",
+        "type": "bool",
+        "doc": "extend last frame of secondary streams beyond EOF",
+        "minimum": null,
+        "maximum": null,
+        "default": "true",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "ts_sync_mode": {
+        "name": "ts_sync_mode",
+        "type": "str",
+        "doc": "How strictly to sync streams based on secondary input timestamps",
+        "minimum": 0.0,
+        "maximum": 1.0,
+        "default": "default",
+        "constants": [
+          "default",
+          "nearest"
+        ],
+        "unusable": false,
+        "named_only": true
+      }
+    },
     "amplify": {
       "radius": {
         "name": "radius",
@@ -14482,6 +14943,57 @@
         "default": "1",
         "constants": [],
         "unusable": false
+      },
+      "eof_action": {
+        "name": "eof_action",
+        "type": "str",
+        "doc": "Action to take when encountering EOF from secondary input",
+        "minimum": 0.0,
+        "maximum": 2.0,
+        "default": "repeat",
+        "constants": [
+          "repeat",
+          "endall",
+          "pass"
+        ],
+        "unusable": false,
+        "named_only": true
+      },
+      "shortest": {
+        "name": "shortest",
+        "type": "bool",
+        "doc": "force termination when the shortest input terminates",
+        "minimum": null,
+        "maximum": null,
+        "default": "false",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "repeatlast": {
+        "name": "repeatlast",
+        "type": "bool",
+        "doc": "extend last frame of secondary streams beyond EOF",
+        "minimum": null,
+        "maximum": null,
+        "default": "true",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "ts_sync_mode": {
+        "name": "ts_sync_mode",
+        "type": "str",
+        "doc": "How strictly to sync streams based on secondary input timestamps",
+        "minimum": 0.0,
+        "maximum": 1.0,
+        "default": "default",
+        "constants": [
+          "default",
+          "nearest"
+        ],
+        "unusable": false,
+        "named_only": true
       }
     },
     "blend_vulkan": {
@@ -17244,10 +17756,113 @@
         "default": "1e-07",
         "constants": [],
         "unusable": false
+      },
+      "eof_action": {
+        "name": "eof_action",
+        "type": "str",
+        "doc": "Action to take when encountering EOF from secondary input",
+        "minimum": 0.0,
+        "maximum": 2.0,
+        "default": "repeat",
+        "constants": [
+          "repeat",
+          "endall",
+          "pass"
+        ],
+        "unusable": false,
+        "named_only": true
+      },
+      "shortest": {
+        "name": "shortest",
+        "type": "bool",
+        "doc": "force termination when the shortest input terminates",
+        "minimum": null,
+        "maximum": null,
+        "default": "false",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "repeatlast": {
+        "name": "repeatlast",
+        "type": "bool",
+        "doc": "extend last frame of secondary streams beyond EOF",
+        "minimum": null,
+        "maximum": null,
+        "default": "true",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "ts_sync_mode": {
+        "name": "ts_sync_mode",
+        "type": "str",
+        "doc": "How strictly to sync streams based on secondary input timestamps",
+        "minimum": 0.0,
+        "maximum": 1.0,
+        "default": "default",
+        "constants": [
+          "default",
+          "nearest"
+        ],
+        "unusable": false,
+        "named_only": true
       }
     },
     "copy": {},
-    "corr": {},
+    "corr": {
+      "eof_action": {
+        "name": "eof_action",
+        "type": "str",
+        "doc": "Action to take when encountering EOF from secondary input",
+        "minimum": 0.0,
+        "maximum": 2.0,
+        "default": "repeat",
+        "constants": [
+          "repeat",
+          "endall",
+          "pass"
+        ],
+        "unusable": false,
+        "named_only": true
+      },
+      "shortest": {
+        "name": "shortest",
+        "type": "bool",
+        "doc": "force termination when the shortest input terminates",
+        "minimum": null,
+        "maximum": null,
+        "default": "false",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "repeatlast": {
+        "name": "repeatlast",
+        "type": "bool",
+        "doc": "extend last frame of secondary streams beyond EOF",
+        "minimum": null,
+        "maximum": null,
+        "default": "true",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "ts_sync_mode": {
+        "name": "ts_sync_mode",
+        "type": "str",
+        "doc": "How strictly to sync streams based on secondary input timestamps",
+        "minimum": 0.0,
+        "maximum": 1.0,
+        "default": "default",
+        "constants": [
+          "default",
+          "nearest"
+        ],
+        "unusable": false,
+        "named_only": true
+      }
+    },
     "cover_rect": {
       "cover": {
         "name": "cover",
@@ -18014,6 +18629,57 @@
         "default": "1e-07",
         "constants": [],
         "unusable": false
+      },
+      "eof_action": {
+        "name": "eof_action",
+        "type": "str",
+        "doc": "Action to take when encountering EOF from secondary input",
+        "minimum": 0.0,
+        "maximum": 2.0,
+        "default": "repeat",
+        "constants": [
+          "repeat",
+          "endall",
+          "pass"
+        ],
+        "unusable": false,
+        "named_only": true
+      },
+      "shortest": {
+        "name": "shortest",
+        "type": "bool",
+        "doc": "force termination when the shortest input terminates",
+        "minimum": null,
+        "maximum": null,
+        "default": "false",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "repeatlast": {
+        "name": "repeatlast",
+        "type": "bool",
+        "doc": "extend last frame of secondary streams beyond EOF",
+        "minimum": null,
+        "maximum": null,
+        "default": "true",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "ts_sync_mode": {
+        "name": "ts_sync_mode",
+        "type": "str",
+        "doc": "How strictly to sync streams based on secondary input timestamps",
+        "minimum": 0.0,
+        "maximum": 1.0,
+        "default": "default",
+        "constants": [
+          "default",
+          "nearest"
+        ],
+        "unusable": false,
+        "named_only": true
       }
     },
     "dedot": {
@@ -21330,6 +21996,57 @@
           "prism"
         ],
         "unusable": false
+      },
+      "eof_action": {
+        "name": "eof_action",
+        "type": "str",
+        "doc": "Action to take when encountering EOF from secondary input",
+        "minimum": 0.0,
+        "maximum": 2.0,
+        "default": "repeat",
+        "constants": [
+          "repeat",
+          "endall",
+          "pass"
+        ],
+        "unusable": false,
+        "named_only": true
+      },
+      "shortest": {
+        "name": "shortest",
+        "type": "bool",
+        "doc": "force termination when the shortest input terminates",
+        "minimum": null,
+        "maximum": null,
+        "default": "false",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "repeatlast": {
+        "name": "repeatlast",
+        "type": "bool",
+        "doc": "extend last frame of secondary streams beyond EOF",
+        "minimum": null,
+        "maximum": null,
+        "default": "true",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "ts_sync_mode": {
+        "name": "ts_sync_mode",
+        "type": "str",
+        "doc": "How strictly to sync streams based on secondary input timestamps",
+        "minimum": 0.0,
+        "maximum": 1.0,
+        "default": "default",
+        "constants": [
+          "default",
+          "nearest"
+        ],
+        "unusable": false,
+        "named_only": true
       }
     },
     "hflip": {},
@@ -21874,6 +22591,57 @@
         "default": "0",
         "constants": [],
         "unusable": false
+      },
+      "eof_action": {
+        "name": "eof_action",
+        "type": "str",
+        "doc": "Action to take when encountering EOF from secondary input",
+        "minimum": 0.0,
+        "maximum": 2.0,
+        "default": "repeat",
+        "constants": [
+          "repeat",
+          "endall",
+          "pass"
+        ],
+        "unusable": false,
+        "named_only": true
+      },
+      "shortest": {
+        "name": "shortest",
+        "type": "bool",
+        "doc": "force termination when the shortest input terminates",
+        "minimum": null,
+        "maximum": null,
+        "default": "false",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "repeatlast": {
+        "name": "repeatlast",
+        "type": "bool",
+        "doc": "extend last frame of secondary streams beyond EOF",
+        "minimum": null,
+        "maximum": null,
+        "default": "true",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "ts_sync_mode": {
+        "name": "ts_sync_mode",
+        "type": "str",
+        "doc": "How strictly to sync streams based on secondary input timestamps",
+        "minimum": 0.0,
+        "maximum": 1.0,
+        "default": "default",
+        "constants": [
+          "default",
+          "nearest"
+        ],
+        "unusable": false,
+        "named_only": true
       }
     },
     "iccdetect": {
@@ -21949,7 +22717,59 @@
         "unusable": false
       }
     },
-    "identity": {},
+    "identity": {
+      "eof_action": {
+        "name": "eof_action",
+        "type": "str",
+        "doc": "Action to take when encountering EOF from secondary input",
+        "minimum": 0.0,
+        "maximum": 2.0,
+        "default": "repeat",
+        "constants": [
+          "repeat",
+          "endall",
+          "pass"
+        ],
+        "unusable": false,
+        "named_only": true
+      },
+      "shortest": {
+        "name": "shortest",
+        "type": "bool",
+        "doc": "force termination when the shortest input terminates",
+        "minimum": null,
+        "maximum": null,
+        "default": "false",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "repeatlast": {
+        "name": "repeatlast",
+        "type": "bool",
+        "doc": "extend last frame of secondary streams beyond EOF",
+        "minimum": null,
+        "maximum": null,
+        "default": "true",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "ts_sync_mode": {
+        "name": "ts_sync_mode",
+        "type": "str",
+        "doc": "How strictly to sync streams based on secondary input timestamps",
+        "minimum": 0.0,
+        "maximum": 1.0,
+        "default": "default",
+        "constants": [
+          "default",
+          "nearest"
+        ],
+        "unusable": false,
+        "named_only": true
+      }
+    },
     "idet": {
       "intl_thres": {
         "name": "intl_thres",
@@ -23511,6 +24331,57 @@
         "default": null,
         "constants": [],
         "unusable": false
+      },
+      "eof_action": {
+        "name": "eof_action",
+        "type": "str",
+        "doc": "Action to take when encountering EOF from secondary input",
+        "minimum": 0.0,
+        "maximum": 2.0,
+        "default": "repeat",
+        "constants": [
+          "repeat",
+          "endall",
+          "pass"
+        ],
+        "unusable": false,
+        "named_only": true
+      },
+      "shortest": {
+        "name": "shortest",
+        "type": "bool",
+        "doc": "force termination when the shortest input terminates",
+        "minimum": null,
+        "maximum": null,
+        "default": "false",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "repeatlast": {
+        "name": "repeatlast",
+        "type": "bool",
+        "doc": "extend last frame of secondary streams beyond EOF",
+        "minimum": null,
+        "maximum": null,
+        "default": "true",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "ts_sync_mode": {
+        "name": "ts_sync_mode",
+        "type": "str",
+        "doc": "How strictly to sync streams based on secondary input timestamps",
+        "minimum": 0.0,
+        "maximum": 1.0,
+        "default": "default",
+        "constants": [
+          "default",
+          "nearest"
+        ],
+        "unusable": false,
+        "named_only": true
       }
     },
     "limitdiff": {
@@ -23851,6 +24722,57 @@
         "default": "0",
         "constants": [],
         "unusable": false
+      },
+      "eof_action": {
+        "name": "eof_action",
+        "type": "str",
+        "doc": "Action to take when encountering EOF from secondary input",
+        "minimum": 0.0,
+        "maximum": 2.0,
+        "default": "repeat",
+        "constants": [
+          "repeat",
+          "endall",
+          "pass"
+        ],
+        "unusable": false,
+        "named_only": true
+      },
+      "shortest": {
+        "name": "shortest",
+        "type": "bool",
+        "doc": "force termination when the shortest input terminates",
+        "minimum": null,
+        "maximum": null,
+        "default": "false",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "repeatlast": {
+        "name": "repeatlast",
+        "type": "bool",
+        "doc": "extend last frame of secondary streams beyond EOF",
+        "minimum": null,
+        "maximum": null,
+        "default": "true",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "ts_sync_mode": {
+        "name": "ts_sync_mode",
+        "type": "str",
+        "doc": "How strictly to sync streams based on secondary input timestamps",
+        "minimum": 0.0,
+        "maximum": 1.0,
+        "default": "default",
+        "constants": [
+          "default",
+          "nearest"
+        ],
+        "unusable": false,
+        "named_only": true
       }
     },
     "lut3d": {
@@ -24873,6 +25795,57 @@
           "all"
         ],
         "unusable": false
+      },
+      "eof_action": {
+        "name": "eof_action",
+        "type": "str",
+        "doc": "Action to take when encountering EOF from secondary input",
+        "minimum": 0.0,
+        "maximum": 2.0,
+        "default": "repeat",
+        "constants": [
+          "repeat",
+          "endall",
+          "pass"
+        ],
+        "unusable": false,
+        "named_only": true
+      },
+      "shortest": {
+        "name": "shortest",
+        "type": "bool",
+        "doc": "force termination when the shortest input terminates",
+        "minimum": null,
+        "maximum": null,
+        "default": "false",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "repeatlast": {
+        "name": "repeatlast",
+        "type": "bool",
+        "doc": "extend last frame of secondary streams beyond EOF",
+        "minimum": null,
+        "maximum": null,
+        "default": "true",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "ts_sync_mode": {
+        "name": "ts_sync_mode",
+        "type": "str",
+        "doc": "How strictly to sync streams based on secondary input timestamps",
+        "minimum": 0.0,
+        "maximum": 1.0,
+        "default": "default",
+        "constants": [
+          "default",
+          "nearest"
+        ],
+        "unusable": false,
+        "named_only": true
       }
     },
     "mpdecimate": {
@@ -24927,7 +25900,59 @@
         "unusable": false
       }
     },
-    "msad": {},
+    "msad": {
+      "eof_action": {
+        "name": "eof_action",
+        "type": "str",
+        "doc": "Action to take when encountering EOF from secondary input",
+        "minimum": 0.0,
+        "maximum": 2.0,
+        "default": "repeat",
+        "constants": [
+          "repeat",
+          "endall",
+          "pass"
+        ],
+        "unusable": false,
+        "named_only": true
+      },
+      "shortest": {
+        "name": "shortest",
+        "type": "bool",
+        "doc": "force termination when the shortest input terminates",
+        "minimum": null,
+        "maximum": null,
+        "default": "false",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "repeatlast": {
+        "name": "repeatlast",
+        "type": "bool",
+        "doc": "extend last frame of secondary streams beyond EOF",
+        "minimum": null,
+        "maximum": null,
+        "default": "true",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "ts_sync_mode": {
+        "name": "ts_sync_mode",
+        "type": "str",
+        "doc": "How strictly to sync streams based on secondary input timestamps",
+        "minimum": 0.0,
+        "maximum": 1.0,
+        "default": "default",
+        "constants": [
+          "default",
+          "nearest"
+        ],
+        "unusable": false,
+        "named_only": true
+      }
+    },
     "multiply": {
       "scale": {
         "name": "scale",
@@ -25852,6 +26877,20 @@
           "premultiplied"
         ],
         "unusable": false
+      },
+      "ts_sync_mode": {
+        "name": "ts_sync_mode",
+        "type": "str",
+        "doc": "How strictly to sync streams based on secondary input timestamps",
+        "minimum": 0.0,
+        "maximum": 1.0,
+        "default": "default",
+        "constants": [
+          "default",
+          "nearest"
+        ],
+        "unusable": false,
+        "named_only": true
       }
     },
     "overlay_opencl": {
@@ -25960,6 +26999,20 @@
         "default": "true",
         "constants": [],
         "unusable": false
+      },
+      "ts_sync_mode": {
+        "name": "ts_sync_mode",
+        "type": "str",
+        "doc": "How strictly to sync streams based on secondary input timestamps",
+        "minimum": 0.0,
+        "maximum": 1.0,
+        "default": "default",
+        "constants": [
+          "default",
+          "nearest"
+        ],
+        "unusable": false,
+        "named_only": true
       }
     },
     "overlay_vaapi": {
@@ -26046,6 +27099,20 @@
         "default": "true",
         "constants": [],
         "unusable": false
+      },
+      "ts_sync_mode": {
+        "name": "ts_sync_mode",
+        "type": "str",
+        "doc": "How strictly to sync streams based on secondary input timestamps",
+        "minimum": 0.0,
+        "maximum": 1.0,
+        "default": "default",
+        "constants": [
+          "default",
+          "nearest"
+        ],
+        "unusable": false,
+        "named_only": true
       }
     },
     "overlay_vulkan": {
@@ -26137,6 +27204,20 @@
         "default": "true",
         "constants": [],
         "unusable": false
+      },
+      "ts_sync_mode": {
+        "name": "ts_sync_mode",
+        "type": "str",
+        "doc": "How strictly to sync streams based on secondary input timestamps",
+        "minimum": 0.0,
+        "maximum": 1.0,
+        "default": "default",
+        "constants": [
+          "default",
+          "nearest"
+        ],
+        "unusable": false,
+        "named_only": true
       }
     },
     "owdenoise": {
@@ -27050,6 +28131,57 @@
         "default": null,
         "constants": [],
         "unusable": false
+      },
+      "eof_action": {
+        "name": "eof_action",
+        "type": "str",
+        "doc": "Action to take when encountering EOF from secondary input",
+        "minimum": 0.0,
+        "maximum": 2.0,
+        "default": "repeat",
+        "constants": [
+          "repeat",
+          "endall",
+          "pass"
+        ],
+        "unusable": false,
+        "named_only": true
+      },
+      "shortest": {
+        "name": "shortest",
+        "type": "bool",
+        "doc": "force termination when the shortest input terminates",
+        "minimum": null,
+        "maximum": null,
+        "default": "false",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "repeatlast": {
+        "name": "repeatlast",
+        "type": "bool",
+        "doc": "extend last frame of secondary streams beyond EOF",
+        "minimum": null,
+        "maximum": null,
+        "default": "true",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "ts_sync_mode": {
+        "name": "ts_sync_mode",
+        "type": "str",
+        "doc": "How strictly to sync streams based on secondary input timestamps",
+        "minimum": 0.0,
+        "maximum": 1.0,
+        "default": "default",
+        "constants": [
+          "default",
+          "nearest"
+        ],
+        "unusable": false,
+        "named_only": true
       }
     },
     "pseudocolor": {
@@ -27177,6 +28309,57 @@
         "default": "false",
         "constants": [],
         "unusable": false
+      },
+      "eof_action": {
+        "name": "eof_action",
+        "type": "str",
+        "doc": "Action to take when encountering EOF from secondary input",
+        "minimum": 0.0,
+        "maximum": 2.0,
+        "default": "repeat",
+        "constants": [
+          "repeat",
+          "endall",
+          "pass"
+        ],
+        "unusable": false,
+        "named_only": true
+      },
+      "shortest": {
+        "name": "shortest",
+        "type": "bool",
+        "doc": "force termination when the shortest input terminates",
+        "minimum": null,
+        "maximum": null,
+        "default": "false",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "repeatlast": {
+        "name": "repeatlast",
+        "type": "bool",
+        "doc": "extend last frame of secondary streams beyond EOF",
+        "minimum": null,
+        "maximum": null,
+        "default": "true",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "ts_sync_mode": {
+        "name": "ts_sync_mode",
+        "type": "str",
+        "doc": "How strictly to sync streams based on secondary input timestamps",
+        "minimum": 0.0,
+        "maximum": 1.0,
+        "default": "default",
+        "constants": [
+          "default",
+          "nearest"
+        ],
+        "unusable": false,
+        "named_only": true
       }
     },
     "pullup": {
@@ -28238,6 +29421,359 @@
           "frame"
         ],
         "unusable": false
+      },
+      "sws_flags": {
+        "name": "sws_flags",
+        "type": "str",
+        "doc": "swscale flags",
+        "minimum": null,
+        "maximum": null,
+        "default": "bicubic",
+        "constants": [
+          "fast_bilinear",
+          "bilinear",
+          "bicubic",
+          "experimental",
+          "neighbor",
+          "area",
+          "bicublin",
+          "gauss",
+          "sinc",
+          "lanczos",
+          "spline",
+          "print_info",
+          "accurate_rnd",
+          "full_chroma_int",
+          "full_chroma_inp",
+          "bitexact",
+          "error_diffusion",
+          "unstable",
+          "strict"
+        ],
+        "unusable": false,
+        "named_only": true
+      },
+      "scaler": {
+        "name": "scaler",
+        "type": "str",
+        "doc": "set scaling algorithm",
+        "minimum": 0.0,
+        "maximum": 8.0,
+        "default": "auto",
+        "constants": [
+          "auto",
+          "bilinear",
+          "bicubic",
+          "point",
+          "neighbor",
+          "area",
+          "gaussian",
+          "sinc",
+          "lanczos",
+          "spline"
+        ],
+        "unusable": false,
+        "named_only": true
+      },
+      "scaler_sub": {
+        "name": "scaler_sub",
+        "type": "str",
+        "doc": "set subsampling algorithm",
+        "minimum": 0.0,
+        "maximum": 8.0,
+        "default": "auto",
+        "constants": [
+          "auto",
+          "bilinear",
+          "bicubic",
+          "point",
+          "neighbor",
+          "area",
+          "gaussian",
+          "sinc",
+          "lanczos",
+          "spline"
+        ],
+        "unusable": false,
+        "named_only": true
+      },
+      "srcw": {
+        "name": "srcw",
+        "type": "num",
+        "doc": "source width",
+        "minimum": 1.0,
+        "maximum": null,
+        "default": "16",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "srch": {
+        "name": "srch",
+        "type": "num",
+        "doc": "source height",
+        "minimum": 1.0,
+        "maximum": null,
+        "default": "16",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "dstw": {
+        "name": "dstw",
+        "type": "num",
+        "doc": "destination width",
+        "minimum": 1.0,
+        "maximum": null,
+        "default": "16",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "dsth": {
+        "name": "dsth",
+        "type": "num",
+        "doc": "destination height",
+        "minimum": 1.0,
+        "maximum": null,
+        "default": "16",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "src_format": {
+        "name": "src_format",
+        "type": "str",
+        "doc": "source format",
+        "minimum": null,
+        "maximum": null,
+        "default": "yuv420p",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "dst_format": {
+        "name": "dst_format",
+        "type": "str",
+        "doc": "destination format",
+        "minimum": null,
+        "maximum": null,
+        "default": "yuv420p",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "src_range": {
+        "name": "src_range",
+        "type": "bool",
+        "doc": "source is full range",
+        "minimum": null,
+        "maximum": null,
+        "default": "false",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "dst_range": {
+        "name": "dst_range",
+        "type": "bool",
+        "doc": "destination is full range",
+        "minimum": null,
+        "maximum": null,
+        "default": "false",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "gamma": {
+        "name": "gamma",
+        "type": "bool",
+        "doc": "gamma correct scaling",
+        "minimum": null,
+        "maximum": null,
+        "default": "false",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "src_v_chr_pos": {
+        "name": "src_v_chr_pos",
+        "type": "num",
+        "doc": "source vertical chroma position in luma grid/256",
+        "minimum": -513.0,
+        "maximum": 1024.0,
+        "default": "-513",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "src_h_chr_pos": {
+        "name": "src_h_chr_pos",
+        "type": "num",
+        "doc": "source horizontal chroma position in luma grid/256",
+        "minimum": -513.0,
+        "maximum": 1024.0,
+        "default": "-513",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "dst_v_chr_pos": {
+        "name": "dst_v_chr_pos",
+        "type": "num",
+        "doc": "destination vertical chroma position in luma grid/256",
+        "minimum": -513.0,
+        "maximum": 1024.0,
+        "default": "-513",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "dst_h_chr_pos": {
+        "name": "dst_h_chr_pos",
+        "type": "num",
+        "doc": "destination horizontal chroma position in luma grid/256",
+        "minimum": -513.0,
+        "maximum": 1024.0,
+        "default": "-513",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "sws_dither": {
+        "name": "sws_dither",
+        "type": "str",
+        "doc": "set dithering algorithm",
+        "minimum": 0.0,
+        "maximum": 5.0,
+        "default": "auto",
+        "constants": [
+          "auto",
+          "none",
+          "bayer",
+          "ed",
+          "a_dither",
+          "x_dither"
+        ],
+        "unusable": false,
+        "named_only": true
+      },
+      "alphablend": {
+        "name": "alphablend",
+        "type": "str",
+        "doc": "mode for alpha -> non alpha",
+        "minimum": 0.0,
+        "maximum": 2.0,
+        "default": "none",
+        "constants": [
+          "none",
+          "uniform_color",
+          "checkerboard"
+        ],
+        "unusable": false,
+        "named_only": true
+      },
+      "threads": {
+        "name": "threads",
+        "type": "str",
+        "doc": "number of threads",
+        "minimum": 0.0,
+        "maximum": null,
+        "default": "1",
+        "constants": [
+          "auto"
+        ],
+        "unusable": false,
+        "named_only": true
+      },
+      "intent": {
+        "name": "intent",
+        "type": "str",
+        "doc": "color mapping intent",
+        "minimum": 0.0,
+        "maximum": 3.0,
+        "default": "relative_colorimetric",
+        "constants": [
+          "perceptual",
+          "relative_colorimetric",
+          "saturation",
+          "absolute_colorimetric"
+        ],
+        "unusable": false,
+        "named_only": true
+      },
+      "sws_backends": {
+        "name": "sws_backends",
+        "type": "str",
+        "doc": "set allowed swscale backends",
+        "minimum": null,
+        "maximum": null,
+        "default": "0",
+        "constants": [
+          "auto",
+          "stable",
+          "unstable",
+          "all",
+          "legacy",
+          "c",
+          "memcpy",
+          "x86",
+          "aarch64",
+          "spirv"
+        ],
+        "unusable": false,
+        "named_only": true
+      },
+      "eof_action": {
+        "name": "eof_action",
+        "type": "str",
+        "doc": "Action to take when encountering EOF from secondary input",
+        "minimum": 0.0,
+        "maximum": 2.0,
+        "default": "repeat",
+        "constants": [
+          "repeat",
+          "endall",
+          "pass"
+        ],
+        "unusable": false,
+        "named_only": true
+      },
+      "shortest": {
+        "name": "shortest",
+        "type": "bool",
+        "doc": "force termination when the shortest input terminates",
+        "minimum": null,
+        "maximum": null,
+        "default": "false",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "repeatlast": {
+        "name": "repeatlast",
+        "type": "bool",
+        "doc": "extend last frame of secondary streams beyond EOF",
+        "minimum": null,
+        "maximum": null,
+        "default": "true",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "ts_sync_mode": {
+        "name": "ts_sync_mode",
+        "type": "str",
+        "doc": "How strictly to sync streams based on secondary input timestamps",
+        "minimum": 0.0,
+        "maximum": 1.0,
+        "default": "default",
+        "constants": [
+          "default",
+          "nearest"
+        ],
+        "unusable": false,
+        "named_only": true
       }
     },
     "vpp_amf": {
@@ -30199,6 +31735,50 @@
         "default": "false",
         "constants": [],
         "unusable": false
+      },
+      "dct": {
+        "name": "dct",
+        "type": "str",
+        "doc": "DCT algorithm",
+        "minimum": 0.0,
+        "maximum": null,
+        "default": "auto",
+        "constants": [
+          "auto",
+          "fastint",
+          "int",
+          "mmx",
+          "altivec",
+          "faan"
+        ],
+        "unusable": false,
+        "named_only": true
+      },
+      "idct": {
+        "name": "idct",
+        "type": "str",
+        "doc": "select IDCT implementation",
+        "minimum": 0.0,
+        "maximum": null,
+        "default": "auto",
+        "constants": [
+          "auto",
+          "int",
+          "simple",
+          "simplemmx",
+          "arm",
+          "altivec",
+          "simplearm",
+          "simplearmv5te",
+          "simplearmv6",
+          "simpleneon",
+          "xvid",
+          "xvidmmx",
+          "faani",
+          "simpleauto"
+        ],
+        "unusable": false,
+        "named_only": true
       }
     },
     "ssim": {
@@ -30211,6 +31791,57 @@
         "default": null,
         "constants": [],
         "unusable": false
+      },
+      "eof_action": {
+        "name": "eof_action",
+        "type": "str",
+        "doc": "Action to take when encountering EOF from secondary input",
+        "minimum": 0.0,
+        "maximum": 2.0,
+        "default": "repeat",
+        "constants": [
+          "repeat",
+          "endall",
+          "pass"
+        ],
+        "unusable": false,
+        "named_only": true
+      },
+      "shortest": {
+        "name": "shortest",
+        "type": "bool",
+        "doc": "force termination when the shortest input terminates",
+        "minimum": null,
+        "maximum": null,
+        "default": "false",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "repeatlast": {
+        "name": "repeatlast",
+        "type": "bool",
+        "doc": "extend last frame of secondary streams beyond EOF",
+        "minimum": null,
+        "maximum": null,
+        "default": "true",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "ts_sync_mode": {
+        "name": "ts_sync_mode",
+        "type": "str",
+        "doc": "How strictly to sync streams based on secondary input timestamps",
+        "minimum": 0.0,
+        "maximum": 1.0,
+        "default": "default",
+        "constants": [
+          "default",
+          "nearest"
+        ],
+        "unusable": false,
+        "named_only": true
       }
     },
     "ssim360": {
@@ -30355,6 +31986,57 @@
         "default": "16",
         "constants": [],
         "unusable": false
+      },
+      "eof_action": {
+        "name": "eof_action",
+        "type": "str",
+        "doc": "Action to take when encountering EOF from secondary input",
+        "minimum": 0.0,
+        "maximum": 2.0,
+        "default": "repeat",
+        "constants": [
+          "repeat",
+          "endall",
+          "pass"
+        ],
+        "unusable": false,
+        "named_only": true
+      },
+      "shortest": {
+        "name": "shortest",
+        "type": "bool",
+        "doc": "force termination when the shortest input terminates",
+        "minimum": null,
+        "maximum": null,
+        "default": "false",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "repeatlast": {
+        "name": "repeatlast",
+        "type": "bool",
+        "doc": "extend last frame of secondary streams beyond EOF",
+        "minimum": null,
+        "maximum": null,
+        "default": "true",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "ts_sync_mode": {
+        "name": "ts_sync_mode",
+        "type": "str",
+        "doc": "How strictly to sync streams based on secondary input timestamps",
+        "minimum": 0.0,
+        "maximum": 1.0,
+        "default": "default",
+        "constants": [
+          "default",
+          "nearest"
+        ],
+        "unusable": false,
+        "named_only": true
       }
     },
     "stereo3d": {
@@ -32835,6 +34517,57 @@
         "default": "15",
         "constants": [],
         "unusable": false
+      },
+      "eof_action": {
+        "name": "eof_action",
+        "type": "str",
+        "doc": "Action to take when encountering EOF from secondary input",
+        "minimum": 0.0,
+        "maximum": 2.0,
+        "default": "repeat",
+        "constants": [
+          "repeat",
+          "endall",
+          "pass"
+        ],
+        "unusable": false,
+        "named_only": true
+      },
+      "shortest": {
+        "name": "shortest",
+        "type": "bool",
+        "doc": "force termination when the shortest input terminates",
+        "minimum": null,
+        "maximum": null,
+        "default": "false",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "repeatlast": {
+        "name": "repeatlast",
+        "type": "bool",
+        "doc": "extend last frame of secondary streams beyond EOF",
+        "minimum": null,
+        "maximum": null,
+        "default": "true",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "ts_sync_mode": {
+        "name": "ts_sync_mode",
+        "type": "str",
+        "doc": "How strictly to sync streams based on secondary input timestamps",
+        "minimum": 0.0,
+        "maximum": 1.0,
+        "default": "default",
+        "constants": [
+          "default",
+          "nearest"
+        ],
+        "unusable": false,
+        "named_only": true
       }
     },
     "vectorscope": {
@@ -33329,7 +35062,59 @@
         "unusable": false
       }
     },
-    "vif": {},
+    "vif": {
+      "eof_action": {
+        "name": "eof_action",
+        "type": "str",
+        "doc": "Action to take when encountering EOF from secondary input",
+        "minimum": 0.0,
+        "maximum": 2.0,
+        "default": "repeat",
+        "constants": [
+          "repeat",
+          "endall",
+          "pass"
+        ],
+        "unusable": false,
+        "named_only": true
+      },
+      "shortest": {
+        "name": "shortest",
+        "type": "bool",
+        "doc": "force termination when the shortest input terminates",
+        "minimum": null,
+        "maximum": null,
+        "default": "false",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "repeatlast": {
+        "name": "repeatlast",
+        "type": "bool",
+        "doc": "extend last frame of secondary streams beyond EOF",
+        "minimum": null,
+        "maximum": null,
+        "default": "true",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "ts_sync_mode": {
+        "name": "ts_sync_mode",
+        "type": "str",
+        "doc": "How strictly to sync streams based on secondary input timestamps",
+        "minimum": 0.0,
+        "maximum": 1.0,
+        "default": "default",
+        "constants": [
+          "default",
+          "nearest"
+        ],
+        "unusable": false,
+        "named_only": true
+      }
+    },
     "vignette": {
       "angle": {
         "name": "angle",
@@ -34030,6 +35815,57 @@
           "all"
         ],
         "unusable": false
+      },
+      "eof_action": {
+        "name": "eof_action",
+        "type": "str",
+        "doc": "Action to take when encountering EOF from secondary input",
+        "minimum": 0.0,
+        "maximum": 2.0,
+        "default": "repeat",
+        "constants": [
+          "repeat",
+          "endall",
+          "pass"
+        ],
+        "unusable": false,
+        "named_only": true
+      },
+      "shortest": {
+        "name": "shortest",
+        "type": "bool",
+        "doc": "force termination when the shortest input terminates",
+        "minimum": null,
+        "maximum": null,
+        "default": "false",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "repeatlast": {
+        "name": "repeatlast",
+        "type": "bool",
+        "doc": "extend last frame of secondary streams beyond EOF",
+        "minimum": null,
+        "maximum": null,
+        "default": "true",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "ts_sync_mode": {
+        "name": "ts_sync_mode",
+        "type": "str",
+        "doc": "How strictly to sync streams based on secondary input timestamps",
+        "minimum": 0.0,
+        "maximum": 1.0,
+        "default": "default",
+        "constants": [
+          "default",
+          "nearest"
+        ],
+        "unusable": false,
+        "named_only": true
       }
     },
     "xfade": {
@@ -34277,6 +36113,57 @@
         "default": "0.5",
         "constants": [],
         "unusable": false
+      },
+      "eof_action": {
+        "name": "eof_action",
+        "type": "str",
+        "doc": "Action to take when encountering EOF from secondary input",
+        "minimum": 0.0,
+        "maximum": 2.0,
+        "default": "repeat",
+        "constants": [
+          "repeat",
+          "endall",
+          "pass"
+        ],
+        "unusable": false,
+        "named_only": true
+      },
+      "shortest": {
+        "name": "shortest",
+        "type": "bool",
+        "doc": "force termination when the shortest input terminates",
+        "minimum": null,
+        "maximum": null,
+        "default": "false",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "repeatlast": {
+        "name": "repeatlast",
+        "type": "bool",
+        "doc": "extend last frame of secondary streams beyond EOF",
+        "minimum": null,
+        "maximum": null,
+        "default": "true",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "ts_sync_mode": {
+        "name": "ts_sync_mode",
+        "type": "str",
+        "doc": "How strictly to sync streams based on secondary input timestamps",
+        "minimum": 0.0,
+        "maximum": 1.0,
+        "default": "default",
+        "constants": [
+          "default",
+          "nearest"
+        ],
+        "unusable": false,
+        "named_only": true
       }
     },
     "xpsnr": {
@@ -34289,6 +36176,57 @@
         "default": null,
         "constants": [],
         "unusable": false
+      },
+      "eof_action": {
+        "name": "eof_action",
+        "type": "str",
+        "doc": "Action to take when encountering EOF from secondary input",
+        "minimum": 0.0,
+        "maximum": 2.0,
+        "default": "repeat",
+        "constants": [
+          "repeat",
+          "endall",
+          "pass"
+        ],
+        "unusable": false,
+        "named_only": true
+      },
+      "shortest": {
+        "name": "shortest",
+        "type": "bool",
+        "doc": "force termination when the shortest input terminates",
+        "minimum": null,
+        "maximum": null,
+        "default": "false",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "repeatlast": {
+        "name": "repeatlast",
+        "type": "bool",
+        "doc": "extend last frame of secondary streams beyond EOF",
+        "minimum": null,
+        "maximum": null,
+        "default": "true",
+        "constants": [],
+        "unusable": false,
+        "named_only": true
+      },
+      "ts_sync_mode": {
+        "name": "ts_sync_mode",
+        "type": "str",
+        "doc": "How strictly to sync streams based on secondary input timestamps",
+        "minimum": 0.0,
+        "maximum": 1.0,
+        "default": "default",
+        "constants": [
+          "default",
+          "nearest"
+        ],
+        "unusable": false,
+        "named_only": true
       }
     },
     "xstack": {

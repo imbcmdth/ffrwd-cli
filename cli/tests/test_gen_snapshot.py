@@ -235,7 +235,7 @@ def test_snapshot_carries_the_options_lowering_needs() -> None:
 
 def test_snapshot_fixture_is_present_and_well_shaped() -> None:
     data = json.loads(_SNAPSHOT_PATH.read_text(encoding="utf-8"))
-    assert data["format_version"] == 3
+    assert data["format_version"] == 4
     assert isinstance(data["filters"], dict) and len(data["filters"]) > 300
     assert isinstance(data["sources"], dict) and len(data["sources"]) > 20
     assert isinstance(data["options"], dict) and len(data["options"]) > 300

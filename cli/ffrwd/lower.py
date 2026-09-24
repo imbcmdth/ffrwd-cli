@@ -15378,7 +15378,7 @@ class _Lowerer:
         dict to every element -- which is every call that existed before
         arithmetic did.
         """
-        order = list(options)
+        order = [name for name, option in options.items() if not option.named_only]
 
         def positional_target(index: int) -> FilterOption | None:
             return options[order[index]] if index < len(order) else None
@@ -15485,7 +15485,7 @@ class _Lowerer:
         marked `occupied`, so a named argument never silently overrides one the
         call already set.
         """
-        order = list(options)
+        order = [name for name, option in options.items() if not option.named_only]
         if len(extras) > len(order):
             raise _error(
                 ErrorCode.UDF_ARG_TYPE,

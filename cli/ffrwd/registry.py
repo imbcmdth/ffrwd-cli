@@ -53,8 +53,14 @@ from a full scan of `ffmpeg version 7.1-full_build-www.gyan.dev` (captured
     blank line: `scale` has its own, then `SWScaler AVOptions:` (whose
     option names are literally `-`-prefixed, e.g. `-sws_flags`, at 2-space
     indent), then `framesync AVOptions:`; `overlay` has its own then
-    `framesync`. Only the FIRST block is parsed -- later sections belong to
-    a different AVClass, not this filter.
+    `framesync`. The first block is the filter's own. A later block is a
+    CHILD class's -- `SWResampler` under `aresample`, `SWScaler` under
+    `scale`, `framesync` under the two-input filters, `AVDCT` under `spp`
+    -- which ffmpeg lists only because the filter hands it every option it
+    does not know itself, so `aresample=async=1` sets swresample's `async`.
+    Its options are parsed too, with the leading `-` dropped, and marked
+    `named_only`: they come after the filter's own in no order positional
+    binding can use, and a name the filter already has keeps the filter's.
   - Filters with no options (e.g. `anullsink`) have no "AVOptions:" line at
     all; that degrades to an empty options dict, not an error.
   - Short/long option aliases appear as separate AVOption lines with
@@ -148,7 +154,7 @@ import os
 import re
 import subprocess
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Literal
 
@@ -170,6 +176,9 @@ class FilterOption:
     default: str | None  # verbatim ffmpeg text, doc use only -- never validated
     constants: tuple[str, ...]  # enum constant names, () if not an enum
     unusable: bool = False  # binary/dictionary AVOption types; lower rejects use
+    # A child AVClass's option the filter passes through (see the module
+    # docstring): settable by name only, never bound positionally.
+    named_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -435,14 +444,28 @@ def _parse_filter_help(ffmpeg: str, name: str) -> dict[str, FilterOption]:
     if out is None:
         return {}
     lines = out.splitlines()
-    start = None
-    for i, line in enumerate(lines):
-        if "AVOptions:" in line:
-            start = i + 1
-            break
-    if start is None:
+    starts = [i + 1 for i, line in enumerate(lines) if "AVOptions:" in line]
+    if not starts:
         return {}
-    return _parse_option_block(lines[start:])
+    options = _parse_option_block(lines[starts[0] :])
+    for start in starts[1:]:
+        child = _parse_option_block([_child_line(line) for line in lines[start:]])
+        for name, option in child.items():
+            if name not in options:
+                options[name] = replace(option, named_only=True)
+    return options
+
+
+def _child_line(line: str) -> str:
+    """A child class's option line in the filter's own layout.
+
+    ffmpeg prints a child's options `-`-prefixed at a two-space indent
+    (``  -async <float> ...``); its constants are indented as the filter's
+    own are.
+    """
+    if line.startswith("  -"):
+        return "   " + line[3:]
+    return line
 
 
 # Disk cache: ~/.cache/ffrwd/, keyed by a hash of `ffmpeg -version`.
@@ -453,7 +476,8 @@ def _parse_filter_help(ffmpeg: str, name: str) -> dict[str, FilterOption]:
 #
 # 3: `DynamicFilter` gained `n_input` (a dynamic INPUT pad count, `N->V`/
 # `N->A`, is now included rather than excluded -- see `_parse_filters_list`).
-_CACHE_FORMAT_VERSION = 3
+# 4: a filter's options include its child classes' (`FilterOption.named_only`).
+_CACHE_FORMAT_VERSION = 4
 
 
 def _cache_dir() -> Path:
@@ -571,6 +595,7 @@ def _decode_option(raw: object) -> FilterOption:
         default=_require_optional_str(raw["default"]),
         constants=tuple(_require_str(c) for c in _require_list(raw["constants"])),
         unusable=_require_bool(raw["unusable"]),
+        named_only=_require_bool(raw.get("named_only", False)),
     )
 
 
@@ -640,6 +665,7 @@ def _encode_payload(
                     "default": o.default,
                     "constants": list(o.constants),
                     "unusable": o.unusable,
+                    **({"named_only": True} if o.named_only else {}),
                 }
                 for opt_name, o in opts.items()
             }

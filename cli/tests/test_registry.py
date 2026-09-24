@@ -706,16 +706,22 @@ def test_xfade_enum_constants_and_name_valued_default(monkeypatch: pytest.Monkey
 # --- -help option parsing: multi-section stop-at-blank-line (overlay) ---
 
 
-def test_overlay_stops_before_framesync_section(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_overlay_takes_framesyncs_options_by_name_only(monkeypatch: pytest.MonkeyPatch) -> None:
     reg = _loaded_registry(monkeypatch, help_map={"overlay": HELP_OVERLAY})
     opts = reg.options("overlay")
     assert opts is not None
     # Options unique to overlay's own AVOptions section.
     for name in ("x", "y", "eof_action", "eval", "shortest", "format", "repeatlast", "alpha"):
         assert name in opts, name
-    # ts_sync_mode ONLY appears in the later "framesync AVOptions:" section,
-    # separated by a blank line -- must NOT be parsed.
-    assert "ts_sync_mode" not in opts
+    for name in ("x", "y", "eof_action", "eval", "shortest", "format", "repeatlast", "alpha"):
+        assert not opts[name].named_only, name
+    # ts_sync_mode ONLY appears in the later "framesync AVOptions:" section:
+    # overlay passes it through, so it is settable, by name and last. The
+    # three framesync names overlay declares itself keep overlay's entry.
+    assert list(opts)[-1] == "ts_sync_mode"
+    assert opts["ts_sync_mode"].named_only
+    assert opts["ts_sync_mode"].constants == ("default", "nearest")
+    assert opts["repeatlast"].doc == "repeat overlay of the last overlay frame"
 
     fmt = opts["format"]
     assert fmt.type == "str"
@@ -883,10 +889,13 @@ def test_scale_alias_dedup_regardless_of_file_order(monkeypatch: pytest.MonkeyPa
     assert "height" in opts and "h" not in opts
     # size/s: long name also comes first here -- same outcome either way.
     assert "size" in opts and "s" not in opts
-    # The SWScaler section (different indent, "-"-prefixed names) must not
-    # leak into scale's own options.
-    assert "sws_flags" not in opts
+    # The SWScaler section (different indent, "-"-prefixed names) is the
+    # child class scale hands its unknown options to: settable by name,
+    # without the dash, after scale's own.
+    assert opts["sws_flags"].named_only
+    assert opts["sws_flags"].constants[0] == "fast_bilinear"
     assert not any(name.startswith("-") for name in opts)
+    assert [n for n, o in opts.items() if o.named_only] == ["sws_flags"]
 
     in_color_matrix = opts["in_color_matrix"]
     assert in_color_matrix.type == "str"
