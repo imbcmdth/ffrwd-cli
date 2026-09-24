@@ -380,8 +380,9 @@ interface window-filter {
     /// consumed, each at that frame's own pts. For audio: whether the samples
     /// leaving over the instance's life are the samples that arrived, neither
     /// dropped nor invented - per-call counts may differ, but the output runs
-    /// on without gap or overlap. Neither window nor stride settles this, so
-    /// it is declared.
+    /// on without overlap, and a gap only where the input had one: a sample
+    /// either follows the last one out or keeps the timestamp the input gave
+    /// it. Neither window nor stride settles this, so it is declared.
     one-to-one: bool,
     /// Whether this module ACTS on the rows arriving with its payloads. Every
     /// call receives them whatever this says, so availability is no answer: a

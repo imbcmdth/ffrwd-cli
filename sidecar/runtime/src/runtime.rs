@@ -54,7 +54,7 @@
 //! `input-stream` into the shared `types` interface so the two interfaces
 //! name one shape, the way `coded-stream` moved there in 0.13.0.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -2680,6 +2680,10 @@ pub struct Filter {
     /// the one-to-one check an audio module is held to.
     samples_in: u64,
     samples_out: u64,
+    /// Where each window consumed so far began, as (sample index, pts), from
+    /// the earliest one the output has not yet passed: the input's own clock,
+    /// gaps included, which a one-to-one audio module may carry through.
+    arrived: VecDeque<(u64, i64)>,
     /// Whether the final call has been made, which may happen once.
     finished: bool,
 }
@@ -5067,6 +5071,7 @@ impl Filter {
             next_pts: None,
             samples_in: 0,
             samples_out: 0,
+            arrived: VecDeque::new(),
             finished: false,
         })
     }
@@ -5195,11 +5200,17 @@ impl Filter {
             // Consumed is the stride, not the window: overlapping windows hand
             // the same samples over more than once, and only one call's worth
             // of them leaves the instance.
-            self.samples_in += if last {
+            let consumed = if last {
                 arriving
             } else {
                 u64::from(self.shape.stride).min(arriving)
             };
+            if consumed > 0 {
+                if let Some(first) = frames.first() {
+                    self.arrived.push_back((self.samples_in, first.pts));
+                }
+            }
+            self.samples_in += consumed;
             self.check_audio_output(audio, &out.frames, last)?;
         }
         Ok(out)
@@ -5324,8 +5335,14 @@ impl Filter {
     }
 
     /// The samples leaving must be whole, and - for a one-to-one module - must
-    /// run on from where the last call left off and, by the final call, add up
-    /// to the samples that arrived.
+    /// either run on from where the last call left off or carry the timestamp
+    /// the input gave the same sample, and by the final call add up to the
+    /// samples that arrived.
+    ///
+    /// The second is what lets a gap through: a window cut after a hole in the
+    /// input starts past the one before it, and a module that stamps its output
+    /// with the input's own timestamps hands that hole on to the encoder, the
+    /// way a picture gap already goes through. Stepping back is still refused.
     fn check_audio_output(
         &mut self,
         audio: AudioFormat,
@@ -5334,20 +5351,28 @@ impl Filter {
     ) -> Result<()> {
         for frame in frames {
             let samples = self.samples(audio, frame.data.len(), frame.pts)?;
+            let start = self.samples_out;
             self.samples_out += samples;
             if !self.shape.one_to_one {
                 continue;
             }
-            let expected = self.next_pts.unwrap_or(frame.pts);
-            if frame.pts != expected {
+            let runs_on = self.next_pts.unwrap_or(frame.pts);
+            let input = self.input_pts(audio, start)?;
+            let carried = input == Some(frame.pts) && frame.pts > runs_on;
+            if frame.pts != runs_on && !carried {
+                let clock = match input {
+                    Some(pts) => format!(" and the input gave that sample pts {pts}"),
+                    None => String::new(),
+                };
                 bail!(
-                    "{} returned samples at pts {} where its output so far ends at pts {expected}; \
-                     a one-to-one audio module leaves no gap and no overlap",
+                    "{} returned samples at pts {} where its output so far ends at pts \
+                     {runs_on}{clock}; a one-to-one audio module runs on from its last sample \
+                     or keeps the input's timestamp, and never steps back",
                     self.meta.name,
                     frame.pts
                 );
             }
-            self.next_pts = Some(expected + self.ticks(audio, samples)?);
+            self.next_pts = Some(frame.pts + self.ticks(audio, samples)?);
         }
         if last && self.shape.one_to_one && self.samples_in != self.samples_out {
             bail!(
@@ -5359,6 +5384,21 @@ impl Filter {
             );
         }
         Ok(())
+    }
+
+    /// The timestamp the input gave its sample number `index`, counted over
+    /// the samples consumed, or None before anything has arrived. Windows the
+    /// output has passed are dropped as it goes.
+    fn input_pts(&mut self, audio: AudioFormat, index: u64) -> Result<Option<i64>> {
+        while self.arrived.len() > 1 && self.arrived[1].0 <= index {
+            self.arrived.pop_front();
+        }
+        match self.arrived.front() {
+            Some(&(first, pts)) if first <= index => {
+                Ok(Some(pts + self.ticks(audio, index - first)?))
+            }
+            _ => Ok(None),
+        }
     }
 
     /// The span `samples` cover, in ticks of the stream's time base. At the

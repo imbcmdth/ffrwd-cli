@@ -1954,18 +1954,32 @@ fn an_audio_stream(sample_fmt: &str, channels: u32) -> Stream {
 /// window's contents say which samples it holds. Every packet carries the
 /// timestamp of its first sample, which at this time base is its offset.
 fn audio_wire(packets: &[usize]) -> Vec<u8> {
+    let mut offset = 0i64;
+    let timed: Vec<(i64, usize)> = packets
+        .iter()
+        .map(|&samples| {
+            let at = offset;
+            offset += samples as i64;
+            (at, samples)
+        })
+        .collect();
+    audio_wire_at(&timed)
+}
+
+/// An audio wire whose packets carry the timestamps given, one `(pts,
+/// samples)` each, so a stream can have a hole in its clock. Each sample's
+/// value is its index across the whole stream.
+fn audio_wire_at(packets: &[(i64, usize)]) -> Vec<u8> {
     let stream = an_audio_stream("f32", 1);
     let mut wire = Vec::new();
     {
         let mut muxer = Muxer::new(&mut wire, &stream).expect("write NUT headers");
         let mut offset = 0usize;
-        for samples in packets {
+        for &(pts, samples) in packets {
             let data: Vec<u8> = (offset..offset + samples)
                 .flat_map(|s| (s as f32).to_le_bytes())
                 .collect();
-            muxer
-                .write_frame(offset as i64, &data)
-                .expect("write NUT packet");
+            muxer.write_frame(pts, &data).expect("write NUT packet");
             offset += samples;
         }
         muxer.finish().expect("finish the NUT stream");
@@ -2096,6 +2110,31 @@ fn gain_scales_every_sample_and_returns_the_samples_it_was_handed() {
         packets.last().expect("a final window").1.len(),
         2800 - 2048,
         "the final call carries whatever the last stride left over"
+    );
+}
+
+#[test]
+fn a_hole_in_the_input_goes_through_a_one_to_one_module_where_it_was() {
+    // Two windows, then nine windows' worth of nothing, then two more: the
+    // module stamps each window with the timestamp it was handed, so the hole
+    // reaches its output at the same place rather than stopping the run.
+    let wire = audio_wire_at(&[(0, 1024), (1024, 1024), (11264, 1024), (12288, 1024)]);
+    let run = run_filter(
+        &module_path("again"),
+        &["-params", r#"{"gain":0.5}"#],
+        &wire,
+    );
+    assert_run_ok(&run, "again");
+
+    let starts: Vec<i64> = audio_packets(&run.stdout)
+        .iter()
+        .map(|(pts, _)| *pts)
+        .collect();
+    assert_eq!(starts, vec![0, 1024, 11264, 12288]);
+    assert_eq!(
+        audio_samples(&run.stdout).len(),
+        4096,
+        "every sample handed in comes back"
     );
 }
 
@@ -2713,7 +2752,7 @@ fn a_hole_in_a_one_to_one_modules_output_is_refused_naming_the_module() {
     // the first one ended and the samples between are nowhere.
     let run = broken_audio("gap");
     assert!(
-        run.stderr.contains("broken-audio") && run.stderr.contains("no gap and no overlap"),
+        run.stderr.contains("broken-audio") && run.stderr.contains("never steps back"),
         "expected the module and the rule named, got:\n{}",
         run.stderr
     );
