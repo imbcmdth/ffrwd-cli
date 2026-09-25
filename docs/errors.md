@@ -749,7 +749,7 @@ error: BUFFER_OVERFLOW: the pipe buffer carrying 'src_a_v_0_split:1' from ffmpeg
 
 **Fires when:** the consumer opens its inputs in order and is still on an earlier one that cannot end while this one waits. A rows document is spooled whole for exactly that shape, so what is left to report is a wait that is genuinely circular.
 
-It fires too when a module never listens on the loopback port its feeder is delivered on: the feeder's writer is started only once the port accepts, and after 30 seconds without it the run stops, naming the port and the process that would have written it.
+It fires too when a module never listens on the loopback port its feeder is delivered on: the feeder's writer is started only once the port accepts, and after 30 seconds without it the run stops, naming the port and the process that would have written it. And when the run cannot listen on the loopback port a run-time lateral's data stream is written to it on, which was free when the query compiled.
 
 Like `BUFFER_OVERFLOW` this is no compile's, so `ffrwd prompt` does not list it and the repair loop never sees one.
 
