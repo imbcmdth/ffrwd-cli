@@ -135,7 +135,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO, Literal
 
-from . import loudnorm, pipes
+from . import loudnorm, pipes, redact
 from .console import Work, WorkProgress
 from .emit import Emitted, build_ffmpeg_commands, build_process_args
 from .errors import ErrorCode, FfrwdError
@@ -655,13 +655,15 @@ class ProcessResult:
 
     @property
     def command(self) -> str:
-        """This member's argv as one line, whole: a report shows all of it."""
-        return " ".join(self.argv)
+        """This member's argv as one line, whole: a report shows all of it,
+        its secrets masked (:mod:`ffrwd.redact`)."""
+        return " ".join(redact.argv(self.argv))
 
     @property
     def stderr_tail(self) -> str:
-        """The last lines of this member's stderr, or "" if it wrote none."""
-        lines = self.stderr.splitlines()
+        """The last lines of this member's stderr, or "" if it wrote none,
+        its secrets masked."""
+        lines = redact.text(self.stderr).splitlines()
         return "\n".join(lines[-_TAIL_LINES:])
 
 
@@ -1057,9 +1059,11 @@ def render_plan(
     actually executes it. `pipe_path` names those pipes as :func:`plan_argv`
     would for a real run; nothing has made one yet at print time, so a plan
     that needs one and is given no `pipe_path` gets a placeholder that says
-    so, rather than :func:`plan_argv`'s refusal.
+    so, rather than :func:`plan_argv`'s refusal. A secret in a command is
+    shown as ``***`` (:mod:`ffrwd.redact`).
     """
-    argv = plan_argv(plan, sidecar_argv=sidecar_argv, pipe_path=pipe_path or _placeholder_pipe)
+    run = plan_argv(plan, sidecar_argv=sidecar_argv, pipe_path=pipe_path or _placeholder_pipe)
+    argv = {pid: redact.argv(words) for pid, words in run.items()}
     if _is_pipeline(plan) and not plan.feeder_edges:
         return _render_pipeline(plan, argv)
     return _render_listing(plan, argv)
@@ -1164,7 +1168,7 @@ def _lateral_lines(plan: ProcessPlan) -> list[str]:
                 + ", ".join(_bound_as(value) for value in lateral.values)
             )
         lines.append("#   template:")
-        lines += [f"#     {one}" for one in _holes(lateral).split(";\n")]
+        lines += [f"#     {one}" for one in redact.text(_holes(lateral)).split(";\n")]
         lines.append(
             "#   one instance at a time; a message that would overlap the running "
             "one is refused with a row"
@@ -1824,7 +1828,7 @@ class _LateralRun:
                 for member in stage.members:
                     header = f"exit={member.exit_code} terminated={member.terminated}\n"
                     (self._dump / f"feeder{launch.row}.{member.id}.stderr").write_text(
-                        header + member.stderr, encoding="utf-8", errors="replace"
+                        header + redact.text(member.stderr), encoding="utf-8", errors="replace"
                     )
         self._row(launch.row, launch.start, exit=_instance_exit(result))
 

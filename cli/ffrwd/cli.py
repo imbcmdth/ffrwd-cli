@@ -190,7 +190,7 @@ from dataclasses import dataclass, field
 from importlib import metadata
 from pathlib import Path
 
-from . import binaries, credentials, diagram, loudnorm, nn, remote, show, store, wasm
+from . import binaries, credentials, diagram, loudnorm, nn, redact, remote, show, store, wasm
 from . import packages as packages_module
 from . import publish as publish_module
 from . import registry as registry_module
@@ -1397,17 +1397,18 @@ def _shell_commands(emitted: list[Emitted]) -> list[str]:
     ``shlex.join`` for all but a ``loudnorm2`` compile: there the measuring
     pass is wrapped in the ``eval "$(...)"`` that exports what it measured,
     and the write pass keeps its ``${FFRWD_LN_*}`` references expandable
-    (:func:`ffrwd.loudnorm.shell_join`).
+    (:func:`ffrwd.loudnorm.shell_join`). A secret in a command is shown as
+    ``***`` (:mod:`ffrwd.redact`).
     """
     lines: list[str] = []
     for e in emitted:
         commands = build_ffmpeg_commands(e)
         if not e.measure_filter_complex:
-            lines += [shlex.join(command) for command in commands]
+            lines += [shlex.join(redact.argv(command)) for command in commands]
             continue
         measure, *rest = commands
-        lines.append(loudnorm.measure_command(shlex.join(measure)))
-        lines += [loudnorm.shell_join(command) for command in rest]
+        lines.append(loudnorm.measure_command(shlex.join(redact.argv(measure))))
+        lines += [loudnorm.shell_join(redact.argv(command)) for command in rest]
     return lines
 
 
@@ -1727,7 +1728,7 @@ def _cmd_run(args: argparse.Namespace, on_warning: OnWarning) -> int:
         print(f"error: {result.measure_error}", file=sys.stderr)
         return 1
     if result.exit_code != 0:
-        print(result.commands[-1].stderr, file=sys.stderr, end="")
+        print(redact.text(result.commands[-1].stderr or ""), file=sys.stderr, end="")
         print(f"error: ffmpeg exited with code {result.exit_code}", file=sys.stderr)
         return result.exit_code
 
@@ -1922,7 +1923,8 @@ def _debug_dump_stderr(result: PlanResult) -> None:
 
     Diagnostic only: `_run_plan` otherwise prints stderr for a failing run's
     members, so a pipe lifecycle bug that leaves a run's exit code at 0 (an
-    empty output track, say) has nowhere else to show its evidence.
+    empty output track, say) has nowhere else to show its evidence. A secret
+    a member wrote is kept out of the file (:mod:`ffrwd.redact`).
     """
     directory = os.environ.get("FFRWD_DUMP_STDERR")
     if not directory:
@@ -1933,15 +1935,17 @@ def _debug_dump_stderr(result: PlanResult) -> None:
         for member in stage.members:
             path = out / f"{member.id}.stderr"
             header = f"exit={member.exit_code} terminated={member.terminated}\n"
-            path.write_text(header + member.stderr, encoding="utf-8", errors="replace")
+            path.write_text(
+                header + redact.text(member.stderr), encoding="utf-8", errors="replace"
+            )
 
 
 def _echo_member(name: str, argv: list[str]) -> None:
-    print(f"$ {name}:", shlex.join(argv))
+    print(f"$ {name}:", shlex.join(redact.argv(argv)))
 
 
 def _echo_command(argv: list[str]) -> None:
-    print("$", shlex.join(argv))
+    print("$", shlex.join(redact.argv(argv)))
 
 
 @dataclass(frozen=True)
