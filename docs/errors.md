@@ -614,9 +614,9 @@ Anchoring: like a named argument's `exp.Var` name (`UNKNOWN_FILTER_OPTION`) and 
 
 ## INPUT_OPTION_TYPE
 
-**Meaning:** An `input('path', <name> => <value>, ...)` option's value doesn't match the type declared for it in `ffrwd.inputs.INPUT_OPTIONS` (`str` / `int` / `bool` / `num`). `num` is new relative to the sink table's vocabulary: it accepts an `int` OR a `float`, and -- for `itsoffset` specifically -- a negative one (ffmpeg legitimately shifts a stream's timestamps earlier).
+**Meaning:** An `input('path', <name> => <value>, ...)` option's value doesn't match the type declared for it in `ffrwd.inputs.INPUT_OPTIONS` (`str` / `int` / `bool` / `num` / `size`). `num` is new relative to the sink table's vocabulary: it accepts an `int` OR a `float`, and -- for `itsoffset` specifically -- a negative one (ffmpeg legitimately shifts a stream's timestamps earlier). `size` is an ffmpeg integer that also reads a suffix: a whole number, or a string such as `'32M'`.
 
-**Fires when:** a `bool` option (`loop`) gets anything but `true`/`false`; an `int` option (`stream_loop`) gets a float, string, or bool; a `num` option (`framerate`, `itsoffset`) gets a string or bool; a `str` option (`hwaccel`) gets anything but a single-quoted literal.
+**Fires when:** a `bool` option (`loop`) gets anything but `true`/`false`; an `int` option (`stream_loop`) gets a float, string, or bool; a `num` option (`framerate`, `itsoffset`) gets a string or bool; a `size` option (`probesize`) gets a negative number, a float, or a bool; a `str` option (`hwaccel`) gets anything but a single-quoted literal.
 
 **Example query:**
 

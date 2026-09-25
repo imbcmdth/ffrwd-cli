@@ -27,13 +27,14 @@ each option rather than as a second list that could drift from this one.
 from __future__ import annotations
 
 import difflib
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal
 
 from ffrwd.errors import ErrorCode, FfrwdError
 
-InputOptionType = Literal["str", "int", "bool", "num"]
+InputOptionType = Literal["str", "int", "bool", "num", "size"]
 
 
 @dataclass(frozen=True)
@@ -195,7 +196,7 @@ INPUT_OPTIONS: dict[str, InputOptionSpec] = {
     ),
     "rtbufsize": InputOptionSpec(
         name="rtbufsize",
-        type="str",
+        type="size",
         doc="Buffer size held for a live source before frames drop, e.g. '256M'.",
         flag="-rtbufsize",
         # Sizes a buffer against frame drops during a long read; the
@@ -204,8 +205,8 @@ INPUT_OPTIONS: dict[str, InputOptionSpec] = {
     ),
     "probesize": InputOptionSpec(
         name="probesize",
-        type="str",
-        doc="Bytes read before the demuxer decides the stream list, e.g. '32M'.",
+        type="size",
+        doc="Bytes read before the demuxer decides the stream list, e.g. 5000000 or '32M'.",
         flag="-probesize",
         # Literally how much ffprobe itself reads before it can answer;
         # omitting it risks the exact under-read this option exists to fix.
@@ -213,8 +214,8 @@ INPUT_OPTIONS: dict[str, InputOptionSpec] = {
     ),
     "analyzeduration": InputOptionSpec(
         name="analyzeduration",
-        type="str",
-        doc="Microseconds analysed before the demuxer decides, e.g. '10M'.",
+        type="size",
+        doc="Microseconds analysed before the demuxer decides, e.g. 10000000 or '10M'.",
         flag="-analyzeduration",
         # The probing counterpart of `probesize`, same reasoning.
         probes=True,
@@ -293,7 +294,9 @@ def validate_option(
     not in the table, ``INPUT_OPTION_TYPE`` for a value whose type doesn't
     match the spec. ``str``/``int``/``bool`` mirror
     ``ffrwd.sink.validate_option``; ``"num"`` accepts any int or float,
-    never a bool, and negatives are legal (``itsoffset``).
+    never a bool, and negatives are legal (``itsoffset``). ``"size"`` is an
+    ffmpeg integer that also reads a suffix: a bare integer, or a string
+    such as ``'32M'``.
     """
     spec = INPUT_OPTIONS.get(name)
     if spec is None:
@@ -338,6 +341,20 @@ def validate_option(
             )
         return value
 
+    if spec.type == "size":
+        if isinstance(value, str) or (
+            isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        ):
+            return value
+        raise FfrwdError(
+            ErrorCode.INPUT_OPTION_TYPE,
+            f"option {name!r} expects a size, got {value!r}",
+            line=line,
+            col=col,
+            hint=f"{name} takes a whole number, or a string with a suffix: "
+            f"{_example(spec)}",
+        )
+
     # spec.type == "str"
     if isinstance(value, bool) or not isinstance(value, str):
         raise FfrwdError(
@@ -345,9 +362,22 @@ def validate_option(
             f"option {name!r} expects a str, got {value!r}",
             line=line,
             col=col,
-            hint=f"{name} takes a single-quoted string literal, e.g. {name} => 'cuda'",
+            hint=f"{name} takes a single-quoted string literal, {_example(spec)}",
         )
     return value
+
+
+# The example a spec's doc gives, after its "e.g.".
+_EXAMPLE = re.compile(r"e\.g\. ('[^']*'|\d+)(?: or ('[^']*'))?")
+
+
+def _example(spec: InputOptionSpec) -> str:
+    """How to write `spec`'s value, from the example its own doc gives."""
+    found = _EXAMPLE.search(spec.doc)
+    if found is None:
+        return f"e.g. {spec.name} => '...'"
+    written = [f"{spec.name} => {value}" for value in found.groups() if value]
+    return "e.g. " + " or ".join(written)
 
 
 def render_value(spec: InputOptionSpec, name: str, value: object) -> str | None:
@@ -362,7 +392,7 @@ def render_value(spec: InputOptionSpec, name: str, value: object) -> str | None:
     """
     if spec.type == "bool":
         return "1" if value is True else None
-    if spec.type in ("int", "num") and isinstance(value, int | float):
+    if spec.type in ("int", "num", "size") and isinstance(value, int | float):
         return str(-value if name == "seek_end" else value)
     return str(value)
 

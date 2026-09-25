@@ -37,9 +37,9 @@ _EXPECTED: dict[str, str] = {
     "pixel_format": "str",
     "sample_rate": "int",
     "channels": "int",
-    "rtbufsize": "str",
-    "probesize": "str",
-    "analyzeduration": "str",
+    "rtbufsize": "size",
+    "probesize": "size",
+    "analyzeduration": "size",
     "rtsp_transport": "str",
     "user_agent": "str",
 }
@@ -182,6 +182,7 @@ def test_validate_option_returns_every_accepted_value_unchanged() -> None:
         "format": ["v4l2"],
         "sub_charenc": ["CP1250"],
         "subtitle_decoder": ["webvtt"],
+        "probesize": [5000000, "32M"],
     }
     assert {
         name: [validate_option(name, value) for value in values]
@@ -266,6 +267,32 @@ def test_validate_option_str_rejects_int() -> None:
     with pytest.raises(FfrwdError) as excinfo:
         validate_option("hwaccel", 5)
     assert excinfo.value.code == ErrorCode.INPUT_OPTION_TYPE
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "hint"),
+    [
+        (
+            "probesize",
+            -1,
+            "probesize takes a whole number, or a string with a suffix: "
+            "e.g. probesize => 5000000 or probesize => '32M'",
+        ),
+        (
+            "rtsp_transport",
+            1,
+            "rtsp_transport takes a single-quoted string literal, "
+            "e.g. rtsp_transport => 'tcp'",
+        ),
+    ],
+)
+def test_a_wrong_value_is_hinted_with_the_options_own_example(
+    name: str, value: object, hint: str
+) -> None:
+    with pytest.raises(FfrwdError) as excinfo:
+        validate_option(name, value)
+    assert excinfo.value.code == ErrorCode.INPUT_OPTION_TYPE
+    assert excinfo.value.hint == hint
 
 
 def test_validate_option_preserves_line_col() -> None:
