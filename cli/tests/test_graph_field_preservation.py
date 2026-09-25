@@ -18,6 +18,7 @@ import dataclasses
 
 from ffrwd.emit import _drop_input_slots
 from ffrwd.ir import (
+    FeederCall,
     Graph,
     ModuleSource,
     Node,
@@ -80,6 +81,7 @@ def _sentinel_graph() -> Graph:
         )
     }
     g.dropped_aliases = {"c"}
+    g.feeders = {"tcp://127.0.0.1:50000": (FeederCall(node="m", function="f", param="feed"),)}
     return g
 
 
