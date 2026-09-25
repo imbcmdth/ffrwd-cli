@@ -436,6 +436,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "data-echo"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "wit-bindgen 0.57.1",
+]
+
+[[package]]
 name = "depth"
 version = "0.1.0"
 dependencies = [
@@ -1778,6 +1787,13 @@ name = "source-replay-0160"
 version = "0.1.0"
 dependencies = [
  "ffrwd-nal",
+ "wit-bindgen 0.57.1",
+]
+
+[[package]]
+name = "source-replay-data"
+version = "0.1.0"
+dependencies = [
  "wit-bindgen 0.57.1",
 ]
 

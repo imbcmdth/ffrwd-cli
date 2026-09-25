@@ -41,6 +41,8 @@ members = [
     "source-replay-0130",
     "source-replay-0150",
     "source-replay-0160",
+    "source-replay-data",
+    "data-echo",
     "source-files",
     "fauxlate",
     "embed-notes",

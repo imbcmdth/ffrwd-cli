@@ -2064,7 +2064,7 @@ fn run_packet_sink(args: &Args, module: &str, params: &str) -> Result<()> {
             match opened {
                 Ok(input) => {
                     let _ = told.send((pad, Ok(input.stream().clone())));
-                    read_pad(input, pad, &queues);
+                    read_pad(input, pad, &queues, false);
                 }
                 Err(err) => {
                     let _ = told.send((pad, Err(err)));
@@ -2131,7 +2131,9 @@ fn run_packet_sink(args: &Args, module: &str, params: &str) -> Result<()> {
 /// and the difference is the other end: each pad has an `-f nut` output,
 /// written from the header `init` answered for it, and one writer thread per
 /// output so a pad whose consumer is slow blocks alone. The filter's own
-/// rows, if it emits any, go to an `-f ndjson` output as a sink's do.
+/// rows, if it emits any, go to an `-f ndjson` output as a sink's do. A data
+/// pad leaves as the JSON stream it arrived as, each batch flushed as it is
+/// written like every other pad's.
 ///
 /// Rows arrive on their own schedule. The reader thread fills a bounded
 /// queue from the first line, and every call is handed whatever is in it -
@@ -2221,7 +2223,7 @@ fn run_packet_filter(args: &Args, module: &str, params: &str) -> Result<()> {
             match opened {
                 Ok(input) => {
                     let _ = told.send((pad, Ok(input.stream().clone())));
-                    read_pad(input, pad, &queues);
+                    read_pad(input, pad, &queues, false);
                 }
                 Err(err) => {
                     let _ = told.send((pad, Err(err)));
@@ -2789,10 +2791,35 @@ impl Durations {
     }
 }
 
+/// What one pad's reader queues: a coded stream's packets as they are, a
+/// data stream's messages, or a clock's times alone.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PadRead {
+    Packets,
+    /// Each packet one message at its own pts: its dts is that pts and it is
+    /// a keyframe, and no duration is settled, so nothing waits on the next
+    /// message to hand this one over.
+    Messages,
+    /// Only the pts matters: the payload is dropped as it is read, and the
+    /// packet is queued the moment it arrives. It still weighs what it
+    /// carried against the queue's bound, which is what paces its producer.
+    Clock,
+}
+
 /// One pad's reader: blocking reads off its own input, each packet into the
 /// pad's queue, waiting whenever the queue is over its byte bound. Decode
 /// order per pad is preserved by construction - one thread, one queue.
-fn read_pad(mut input: Input, pad: usize, queues: &PadQueues) {
+///
+/// A JSON stream is read as messages. Any other stream is read as packets,
+/// or, where `clock` says the pad is a clock, as its times alone.
+fn read_pad(mut input: Input, pad: usize, queues: &PadQueues, clock: bool) {
+    let mode = if input.stream().is_json() {
+        PadRead::Messages
+    } else if clock {
+        PadRead::Clock
+    } else {
+        PadRead::Packets
+    };
     let mut durations = Durations::new(input.stream());
     let mut buf: Vec<u8> = Vec::new();
     let mut index = 0u64;
@@ -2802,23 +2829,42 @@ fn read_pad(mut input: Input, pad: usize, queues: &PadQueues) {
             .with_context(|| format!("reading packet {index} of pad {pad}"));
         match read {
             Ok(Some(packet)) => {
-                let ready = durations.push(runtime::Packet {
+                index += 1;
+                let weight = buf.len();
+                let read = runtime::Packet {
                     pts: packet.pts,
                     dts: packet.dts,
                     duration: None,
                     keyframe: packet.keyframe,
                     data: std::mem::take(&mut buf),
-                });
-                index += 1;
+                };
+                let ready = match mode {
+                    PadRead::Packets => durations.push(read),
+                    PadRead::Messages => Some(runtime::Packet {
+                        dts: Some(read.pts),
+                        keyframe: true,
+                        ..read
+                    }),
+                    PadRead::Clock => Some(runtime::Packet {
+                        data: Vec::new(),
+                        ..read
+                    }),
+                };
                 if let Some(packet) = ready {
-                    if !queue_packet(queues, pad, packet) {
+                    let weight = if mode == PadRead::Clock {
+                        weight
+                    } else {
+                        packet.data.len()
+                    };
+                    if !queue_packet(queues, pad, packet, weight) {
                         return;
                     }
                 }
             }
             Ok(None) => {
                 if let Some(packet) = durations.finish() {
-                    if !queue_packet(queues, pad, packet) {
+                    let weight = packet.data.len();
+                    if !queue_packet(queues, pad, packet, weight) {
                         return;
                     }
                 }
@@ -2839,8 +2885,10 @@ fn read_pad(mut input: Input, pad: usize, queues: &PadQueues) {
 }
 
 /// One packet into its pad's queue, waiting whenever the queue is over its
-/// byte bound. False when the drive loop is gone and the reader must stop.
-fn queue_packet(queues: &PadQueues, pad: usize, packet: runtime::Packet) -> bool {
+/// byte bound; `weight` is what it counts against the bound, which is its
+/// bytes unless the reader dropped them. False when the drive loop is gone
+/// and the reader must stop.
+fn queue_packet(queues: &PadQueues, pad: usize, packet: runtime::Packet, weight: usize) -> bool {
     let mut state = queues.state.lock().expect("the drive loop holds no panic");
     while !state.dead
         && state.pads[pad].bytes >= PAD_BUFFER_BYTES
@@ -2854,7 +2902,7 @@ fn queue_packet(queues: &PadQueues, pad: usize, packet: runtime::Packet) -> bool
     if state.dead {
         return false;
     }
-    state.pads[pad].bytes += packet.data.len();
+    state.pads[pad].bytes += weight;
     state.pads[pad].packets.push(packet);
     // One consumer waits on `filled`, so one wake reaches it.
     queues.filled.notify_one();
@@ -2863,7 +2911,8 @@ fn queue_packet(queues: &PadQueues, pad: usize, packet: runtime::Packet) -> bool
 
 /// One pad of a packet sink, from the NUT header the input opened with. A
 /// stream this wire carries decoded never reaches a sink: the encoder lives
-/// in the ffmpeg on the other side of the pipe.
+/// in the ffmpeg on the other side of the pipe. A JSON stream is a data pad,
+/// its packets the messages.
 fn coded_pad(
     args: &Args,
     module: &str,
@@ -2886,6 +2935,8 @@ fn coded_pad(
         );
     };
     let format = match stream.media {
+        // A data stream of JSON messages: no geometry to carry.
+        nut::Media::Other { .. } if stream.is_json() => runtime::CodedFormat::Data,
         nut::Media::Video {
             width,
             height,
@@ -2909,7 +2960,8 @@ fn coded_pad(
         },
         // As in `format_from_stream`: the demuxer never opens one of these.
         nut::Media::Other { class } => bail!(
-            "input {pad} carries NUT stream class {class}; a packet sink reads video or audio"
+            "input {pad} carries NUT stream class {class}; a packet sink reads video, audio or \
+             {DATA_CODEC} data"
         ),
     };
     // Profile and level: the NUT stream header has no field for either, so
@@ -3070,11 +3122,14 @@ fn colorspace_type_for(color: Option<&runtime::ColorInfo>) -> u64 {
 /// One packet through an already-open track output. `nut::Packet.dts` is not
 /// read by `write_coded`; the field only matters for `run_packet_source`'s
 /// own decode_delay bookkeeping before the output is open.
+///
+/// A data stream's packet is a keyframe whatever it was handed on as: every
+/// message stands alone.
 fn write_coded_packet(muxer: &mut FrameOutput, packet: &runtime::Packet) -> Result<()> {
     let framed = nut::Packet {
         pts: packet.pts,
         dts: packet.dts,
-        keyframe: packet.keyframe,
+        keyframe: packet.keyframe || muxer.stream().is_json(),
     };
     Ok(muxer.write_coded(&framed, &packet.data)?)
 }
@@ -3186,7 +3241,12 @@ fn run_packet_source(args: &Args, module: &str, params: &str) -> Result<()> {
 
     let mut pending: Vec<Vec<runtime::Packet>> = selected.iter().map(|_| Vec::new()).collect();
     // The count of leading `dts: None` packets, once the track has settled.
-    let mut delays: Vec<Option<u64>> = selected.iter().map(|_| None).collect();
+    // A data track has none to count: its messages never reorder.
+    let mut delays: Vec<Option<u64>> = catalog
+        .tracks
+        .iter()
+        .map(|t| (t.stream.format == runtime::CodedFormat::Data).then_some(0))
+        .collect();
 
     // Hold everything until every track's decode_delay is known.
     let mut ended = false;
