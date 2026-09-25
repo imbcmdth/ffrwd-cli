@@ -32,7 +32,7 @@ import io
 from pathlib import Path
 from typing import Any
 
-from .. import binaries, nn, wasm
+from .. import binaries, nn, redact, wasm
 from .. import packages as packages_module
 from .. import registry as registry_module
 from ..compiler import (
@@ -205,7 +205,7 @@ def compile_query(
     if compiled.plan is not None:
         return {
             "pipeline": render_plan(compiled.plan, sidecar_argv=wasm.shown_argv),
-            "plan": compiled.plan.to_dict(),
+            "plan": redact.value(compiled.plan.to_dict()),
             "outputs": [unit.path for unit in _sinks(graphs) if unit.path is not None],
             "warnings": _reported(warnings),
         }
@@ -213,7 +213,7 @@ def compile_query(
     emitted = emitted_commands(graphs)
     commands: list[list[str]] = []
     for e in emitted:
-        commands += build_ffmpeg_commands(e)
+        commands += [redact.argv(command) for command in build_ffmpeg_commands(e)]
     return {
         "commands": commands,
         "filter_complex": [e.filter_complex for e in emitted],
@@ -393,7 +393,9 @@ def list_filters(pattern: str | None = None) -> dict[str, Any]:
 
 
 def _tail(text: str) -> str:
-    """The last `STDERR_LIMIT` characters of `text`, where a failure is stated."""
+    """The last `STDERR_LIMIT` characters of `text`, where a failure is stated,
+    its secrets masked."""
+    text = redact.text(text)
     if len(text) <= STDERR_LIMIT:
         return text
     return "[earlier output dropped]\n" + text[-STDERR_LIMIT:]
@@ -428,7 +430,7 @@ def _run_plan(
                 "members": [
                     {
                         "id": member.id,
-                        "argv": member.argv,
+                        "argv": redact.argv(member.argv),
                         "exit_code": member.exit_code,
                         "terminated": member.terminated,
                         "stderr": _tail(member.stderr),
@@ -490,7 +492,7 @@ def run_query(
         "timed_out": result.timed_out,
         "measure_error": result.measure_error,
         "commands": [
-            {"argv": c.argv, "exit_code": c.exit_code, "stderr": _tail(c.stderr)}
+            {"argv": redact.argv(c.argv), "exit_code": c.exit_code, "stderr": _tail(c.stderr)}
             for c in result.commands
         ],
         "outputs": [unit.path for unit in _sinks(graphs) if unit.path is not None],

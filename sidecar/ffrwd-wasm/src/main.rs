@@ -28,6 +28,7 @@ use std::io::{self, BufRead, Read, Write};
 use std::panic::resume_unwind;
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use ffrwd_wasm::nut;
@@ -2031,7 +2032,9 @@ fn run(args: &Args) -> Result<()> {
 /// blocking write once the other pads' pipes filled. The queue bound is the
 /// flow control: a stalled consumer stops the producer instead of buffering
 /// it without limit. The wasm instance is called from this thread alone;
-/// only the I/O grows threads.
+/// only the I/O grows threads. A sink nothing has reached for [`SINK_IDLE`]
+/// is called with no packets, so a module running a session inside its
+/// calls keeps it running between them.
 fn run_packet_sink(args: &Args, module: &str, params: &str) -> Result<()> {
     // A packet sink is an exclusive lane by nature: packets reach it in
     // decode order, so one instance reads them and `-jobs` caps nothing.
@@ -2088,13 +2091,15 @@ fn run_packet_sink(args: &Args, module: &str, params: &str) -> Result<()> {
         .collect();
 
     // The last batch of packets rides the final call, which is what the
-    // interface says `last` carries: whatever is left.
+    // interface says `last` carries: whatever is left. A sink nothing has
+    // reached for `SINK_IDLE` is called with empty pads, see there.
+    let mut called = Instant::now();
     let outcome = (|| -> Result<Emitted> {
         loop {
-            let (mut carried, last) = queues.take()?;
+            let (mut carried, last) = queues.take_until(Some(called + SINK_IDLE))?;
             // A heartbeat is no message, and a sink is handed messages alone.
             drop_heartbeats(&mut carried, &data);
-            if !last && carried.iter().all(Vec::is_empty) {
+            if !last && carried.iter().all(Vec::is_empty) && called.elapsed() < SINK_IDLE {
                 continue;
             }
             let emitted = sink.process(&carried, last).with_context(|| {
@@ -2105,6 +2110,7 @@ fn run_packet_sink(args: &Args, module: &str, params: &str) -> Result<()> {
                 };
                 format!("{}: {which}", sink.name())
             })?;
+            called = Instant::now();
             if last {
                 return Ok(emitted);
             }
@@ -2124,6 +2130,20 @@ fn run_packet_sink(args: &Args, module: &str, params: &str) -> Result<()> {
     }
     Ok(())
 }
+
+/// How long a packet sink goes without a call before it is called with no
+/// packets at all. A module runs only inside a host call, and one that drives
+/// something of its own there - a network session, whose acknowledgements
+/// arrive between packets - would otherwise stand still for as long as its
+/// packets do: a stream relayed from elsewhere arrives in lumps a second
+/// apart. A fiftieth of a second is less than one AAC frame, so a sink fed
+/// live sound is called about as often as it already was, and less than a
+/// round trip to a public relay; a call with nothing to do costs a module
+/// microseconds.
+///
+/// A packet filter is not called idle: what it writes is packets, and those
+/// come only with packets.
+const SINK_IDLE: Duration = Duration::from_millis(20);
 
 /// The encoded inputs of a packet filter through ONE instance: packets in,
 /// packets out, with `-rows-in`'s rows arriving beside them.
@@ -3170,6 +3190,12 @@ impl PadQueues {
     /// instead of holding a packet back for the whole run. A pad's stored
     /// read error is raised here, on the drive loop's thread.
     fn take(&self) -> Result<(Vec<Vec<runtime::Packet>>, bool)> {
+        self.take_until(None)
+    }
+
+    /// `take`, giving up at `deadline`: past it, with nothing queued, it
+    /// answers an empty list per pad that is not the last.
+    fn take_until(&self, deadline: Option<Instant>) -> Result<(Vec<Vec<runtime::Packet>>, bool)> {
         let mut state = self.state.lock().expect("a reader panicked with the lock");
         loop {
             if let Some(queue) = state.pads.iter_mut().find(|q| q.failed.is_some()) {
@@ -3181,10 +3207,22 @@ impl PadQueues {
             if state.pads.iter().all(|q| q.closed) {
                 return Ok((vec![Vec::new(); state.pads.len()], true));
             }
+            let Some(deadline) = deadline else {
+                state = self
+                    .filled
+                    .wait(state)
+                    .expect("a reader panicked with the lock");
+                continue;
+            };
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Ok((vec![Vec::new(); state.pads.len()], false));
+            }
             state = self
                 .filled
-                .wait(state)
-                .expect("a reader panicked with the lock");
+                .wait_timeout(state, left)
+                .expect("a reader panicked with the lock")
+                .0;
         }
         let carried = state
             .pads
@@ -3962,13 +4000,18 @@ fn run_packet_source(args: &Args, module: &str, params: &str) -> Result<()> {
 
 /// The heartbeats a packet source's data tracks carry (see `heartbeat`): one
 /// at start, at the earliest time anything held back for the headers
-/// carries, and then one whenever the source's media moves on with nothing
-/// on the track for a tenth of a second, at the media's own decode time.
+/// carries, and then those the source hands on the track itself, at most one
+/// a tenth of a second.
+///
+/// The host claims no time of its own past the start. A heartbeat says no
+/// message before its pts is still to come on the track, and only the source
+/// can know that: tracks run independently, so a live source hands a message
+/// whenever it reached it, and its media may be well past the message's pts
+/// by then. A heartbeat written from the media's time put every such message
+/// behind it, and it left at the heartbeat's pts rather than its own.
 struct SourceBeats {
     /// Each track's time base, and its heartbeats where it is a data track.
     tracks: Vec<(TimeBase, Option<heartbeat::Beats>)>,
-    /// How far the media has been pulled: its furthest decode time.
-    media: Option<(i64, TimeBase)>,
     /// The start heartbeat's time, until the first pull has carried it.
     start: Option<(i64, TimeBase)>,
 }
@@ -3991,36 +4034,33 @@ impl SourceBeats {
         }
         SourceBeats {
             tracks,
-            media: None,
             start: Some(start.unwrap_or((0, heartbeat::EVERY))),
         }
     }
 
     /// One pull's packets, a list per track, with the data tracks' messages
-    /// placed on their timeline and their heartbeats added.
+    /// placed on their timeline and their heartbeats added: the start's, and
+    /// the latest one the source handed on the track in this pull.
     fn pull(&mut self, mut pads: Vec<Vec<runtime::Packet>>) -> Vec<Vec<runtime::Packet>> {
-        for (packets, (base, beats)) in pads.iter().zip(&self.tracks) {
-            if beats.is_none() {
-                for packet in packets {
-                    let at = (packet.dts.unwrap_or(packet.pts), *base);
-                    self.media = furthest(self.media, at, true);
-                }
-            }
-        }
         let start = self.start.take();
-        for (packets, (_, beats)) in pads.iter_mut().zip(&mut self.tracks) {
+        for (packets, (base, beats)) in pads.iter_mut().zip(&mut self.tracks) {
             let Some(beats) = beats else { continue };
             let mut placed = Vec::with_capacity(packets.len() + 2);
             if let Some((pts, base)) = start {
                 placed.extend(beats.due(pts, base).map(heartbeat_packet));
             }
+            let mut said = None;
             for mut packet in packets.drain(..) {
+                if heartbeat::is_heartbeat(&packet.data) {
+                    said = said.max(Some(packet.pts));
+                    continue;
+                }
                 packet.pts = beats.place(packet.pts);
                 packet.dts = Some(packet.pts);
                 placed.push(packet);
             }
-            if let Some((pts, base)) = self.media {
-                placed.extend(beats.due(pts, base).map(heartbeat_packet));
+            if let Some(pts) = said {
+                placed.extend(beats.due(pts, *base).map(heartbeat_packet));
             }
             *packets = placed;
         }

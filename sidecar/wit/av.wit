@@ -528,6 +528,13 @@ interface packet-sink {
   /// on others. `last` marks the final call of the instance's life: it
   /// carries whatever is left, which may be no packets at all, and happens
   /// exactly once.
+  ///
+  /// A call that is not the last may carry no packets on any pad. A module
+  /// runs only inside a call, so a host calls a sink nothing has reached for
+  /// a short while anyway, and one that drives something of its own there -
+  /// a network session - keeps it running between packets. Such a call is
+  /// answered like any other, and a module with nothing to do returns at
+  /// once.
   process: func(pads: list<pad-packets>, last: bool) -> processed;
 }
 
@@ -734,6 +741,14 @@ interface packet-source {
 
   /// One pull: a packet list per track `open` was given, in that order, or
   /// none once the source has nothing left.
+  ///
+  /// On a data track a packet holding nothing but whitespace is no message
+  /// but a HEARTBEAT: the source's word that no message before its pts is
+  /// still to come on that track. The host carries it to the track's
+  /// readers, and no module downstream is ever handed one. The host says
+  /// nothing of its own about how far a data track has got past its start,
+  /// since tracks run independently, so a source that knows hands these,
+  /// and one that cannot know hands none.
   next: func() -> result<option<list<pad-packets>>, string>;
 }
 

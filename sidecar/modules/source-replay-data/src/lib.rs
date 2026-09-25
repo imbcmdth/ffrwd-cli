@@ -11,7 +11,15 @@
 //! Track 1 is a picture beside them: the keyframe `source-replay` compiles
 //! in, once every tenth of a second to 3.6 s. Subscribed with it, each pull
 //! is one picture and the messages up to its time, so the messages are
-//! sparse against a media clock that keeps moving.
+//! sparse against a media clock that keeps moving. Each such pull also hands
+//! a heartbeat on the data track at the picture's time, a packet holding a
+//! single space: this source knows no message before it is still to come.
+//!
+//! `{"late":true}` hands each message a second after the picture of its
+//! time instead, as a live source does whose media ran ahead of its data,
+//! and hands no heartbeat, since such a source cannot say where its data
+//! has got to. What it still owes when the pictures end comes in one more
+//! pull.
 
 wit_bindgen::generate!({
     path: "../../wit",
@@ -25,7 +33,7 @@ use exports::ffrwd::av::packet_source::{
     Catalog, Guest, Meta, PadPackets, RenditionMeta, SourceTrack, StreamInfo,
 };
 
-const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{},"additionalProperties":false}"#;
+const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{"late":{"type":"boolean","default":false,"description":"hand each message a second after the picture of its time, and no heartbeat"}},"additionalProperties":false}"#;
 
 /// Microseconds, the unit a data stream's pts are usually counted in.
 const TIME_BASE: Rational = Rational {
@@ -45,6 +53,9 @@ const FRAME_BASE: Rational = Rational { num: 1, den: 10 };
 
 /// How many pictures track 1 carries: to 3.6 s, one past the last message.
 const FRAMES: i64 = 37;
+
+/// How many pictures a late source's messages trail by: a second.
+const LATE_FRAMES: i64 = 10;
 
 /// The messages, in pts order: `(pts, message)`.
 pub const MESSAGES: &[(i64, &str)] = &[
@@ -137,10 +148,16 @@ fn subscribed(tracks: &[u32]) -> Result<Catalog, String> {
     })
 }
 
-fn validate_params(params: &str) -> Result<(), String> {
-    match params.trim() {
-        "" | "{}" => Ok(()),
-        other => Err(format!("source_replay_data takes no params, got: {other}")),
+/// Whether the params ask for a late source: `{}` or `{"late":true}`.
+fn validate_params(params: &str) -> Result<bool, String> {
+    let spelled: String = params.chars().filter(|c| !c.is_whitespace()).collect();
+    match spelled.as_str() {
+        "" | "{}" | r#"{"late":false}"# => Ok(false),
+        r#"{"late":true}"# => Ok(true),
+        _ => Err(format!(
+            "source_replay_data takes {{\"late\":true}} or nothing, got: {}",
+            params.trim()
+        )),
     }
 }
 
@@ -152,6 +169,8 @@ thread_local! {
     static FRAME: Cell<i64> = const { Cell::new(0) };
     /// Which catalog track each pad carries, in `open`'s order.
     static PADS: Cell<[Option<u32>; 2]> = const { Cell::new([None, None]) };
+    /// Whether the messages trail the picture; see the module's docs.
+    static LATE: Cell<bool> = const { Cell::new(false) };
 }
 
 fn message_packet(pts: i64, message: &str) -> Packet {
@@ -202,8 +221,9 @@ impl Guest for SourceReplayData {
     }
 
     fn open(params: String, tracks: Vec<u32>) -> Result<Catalog, String> {
-        validate_params(&params)?;
+        let late = validate_params(&params)?;
         let subscribed = subscribed(&tracks)?;
+        LATE.with(|c| c.set(late));
         CURSOR.with(|c| c.set(0));
         FRAME.with(|c| c.set(0));
         PADS.with(|c| c.set([tracks.first().copied(), tracks.get(1).copied()]));
@@ -219,7 +239,17 @@ impl Guest for SourceReplayData {
         let (pictures, messages) = if pads.contains(&1) {
             let frame = FRAME.with(|c| c.get());
             if frame >= FRAMES {
-                return Ok(None);
+                let owed = messages_until(i64::MAX);
+                if owed.is_empty() {
+                    return Ok(None);
+                }
+                return Ok(Some(
+                    pads.iter()
+                        .map(|track| PadPackets {
+                            packets: if *track == 1 { vec![] } else { owed.clone() },
+                        })
+                        .collect(),
+                ));
             }
             FRAME.with(|c| c.set(frame + 1));
             let keyframe = Packet {
@@ -229,7 +259,14 @@ impl Guest for SourceReplayData {
                 keyframe: true,
                 data: RAW[EXTRADATA_LEN..EXTRADATA_LEN + PACKET_LENS[0]].to_vec(),
             };
-            (vec![keyframe], messages_until(frame * 100_000))
+            let messages = if LATE.with(|c| c.get()) {
+                messages_until((frame - LATE_FRAMES) * 100_000)
+            } else {
+                let mut messages = messages_until(frame * 100_000);
+                messages.push(message_packet(frame * 100_000, " "));
+                messages
+            };
+            (vec![keyframe], messages)
         } else {
             let messages = CURSOR.with(|c| {
                 MESSAGES

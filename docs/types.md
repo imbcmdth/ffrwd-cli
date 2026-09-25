@@ -53,6 +53,12 @@ before a module sees one; anything else reading such a file skips any
 packet that is only whitespace. (Not an empty packet: some ffmpeg builds
 take one for the end of the stream.)
 
+A heartbeat never claims a time a message may still arrive for. A data
+track of a `source`, whose tracks arrive independently, beats at its
+start and then only where the source itself says its data has got to: a
+live broadcast's messages can arrive after the picture of their pts, and
+each keeps its own pts.
+
 ## The record is the stream
 
 A stream record is what filters take and return, what `-map` maps, and

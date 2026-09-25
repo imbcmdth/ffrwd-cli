@@ -209,8 +209,9 @@ fn a_sources_data_track_is_written_as_a_json_nut() {
 #[test]
 fn a_sources_data_track_beats_while_its_picture_moves_on() {
     // With the picture subscribed, a pull is one picture a tenth of a second
-    // on and the messages up to it: the track says where time has got to at
-    // the start and whenever it has been quiet for a tenth of a second.
+    // on, the messages up to it and a heartbeat at its time: the track says
+    // where time has got to at the start and wherever the source says so,
+    // once it has been quiet for a tenth of a second.
     let data = scratch("beats_data.nut");
     let video = scratch("beats_video.nut");
     let module = module_path("source_replay_data");
@@ -238,6 +239,40 @@ fn a_sources_data_track_beats_while_its_picture_moves_on() {
         heartbeats(&wire),
         std::iter::once(0).chain(quiet).collect::<Vec<i64>>()
     );
+}
+
+#[test]
+fn a_message_a_source_hands_behind_its_picture_keeps_its_own_pts() {
+    // The messages trail the picture by a second, as a live source's do when
+    // its media ran ahead of them, and the source says nothing else about
+    // its data. So no heartbeat past the start claims a time a message was
+    // still to come for, and every message leaves at its own pts rather
+    // than behind one.
+    let data = scratch("late_data.nut");
+    let video = scratch("late_video.nut");
+    let module = module_path("source_replay_data");
+    let run = run_ffrwd_wasm(&[
+        "-m",
+        path_str(&module),
+        "-params",
+        r#"{"late":true}"#,
+        "-track",
+        "0",
+        "-f",
+        "nut",
+        path_str(&data),
+        "-track",
+        "1",
+        "-f",
+        "nut",
+        path_str(&video),
+    ]);
+    let wire = std::fs::read(&data).expect("read the data track");
+    std::fs::remove_file(&data).ok();
+    std::fs::remove_file(&video).ok();
+    assert_ok(&run, "source_replay_data");
+    assert_carries_the_messages(&wire);
+    assert_eq!(heartbeats(&wire), vec![0]);
 }
 
 #[test]
