@@ -70,8 +70,11 @@ def _require_everything() -> None:
         )
 
 
-def _run(query: str, out: Path) -> list[tuple[float, dict[str, object]]]:
-    """Run `query`, its declarations ahead of it, and read back what it wrote."""
+def _run(
+    query: str, out: Path, stream: str = "d"
+) -> list[tuple[float, dict[str, object]]]:
+    """Run `query`, its declarations ahead of it, and read back what it wrote
+    on its data `stream`."""
     declared = [
         text.format(module=_STAMP.as_posix())
         for name, text in _DECLARE.items()
@@ -81,7 +84,7 @@ def _run(query: str, out: Path) -> list[tuple[float, dict[str, object]]]:
         [*declared, query.format(deal=_DEAL.as_posix(), out=out.as_posix())]
     )
     assert cli.main(["run", sql, "-y", "-q"]) == 0
-    return _messages(out)
+    return _messages(out, stream)
 
 
 def _messages(path: Path, stream: str = "d") -> list[tuple[float, dict[str, object]]]:
@@ -178,12 +181,13 @@ def test_one_data_filters_output_reaches_two_readers(tmp_path: Path) -> None:
     a second data filter that sets 'es'. Each of the file's two streams
     carries every message, at every message's own time."""
     out = tmp_path / "twice.nut"
-    _run(
+    found = _run(
         "COPY (WITH w AS (SELECT stamp(f.data[1], 'root') AS r FROM input('{deal}') f) "
         "SELECT w.r, stamp(w.r, 'es') FROM w) TO '{out}'",
         out,
+        "d:0",
     )
-    assert _messages(out, "d:0") == _stamped("root")
+    assert found == _stamped("root")
     assert _messages(out, "d:1") == _stamped("es")
 
 
