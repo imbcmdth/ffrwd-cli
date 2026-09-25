@@ -12,7 +12,8 @@ clock pad and `every_s` above 0 it also writes ``{"kind": "tick", "node":
 microseconds. Every expectation is read off that description and off
 `tests/data/deal.nut`, whose three messages tests/exec/test_exec_data.py
 lists: a two second picture at ten frames a second, and messages at 0, 0.4
-and 1.2 seconds.
+and 1.2 seconds. A data filter's output also carries heartbeats, empty
+packets saying how far time has got, which are no messages.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ import json
 import math
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -83,7 +85,8 @@ def _run(query: str, out: Path) -> list[tuple[float, dict[str, object]]]:
 
 
 def _messages(path: Path) -> list[tuple[float, dict[str, object]]]:
-    """Every message on `path`'s data stream: its time and its object."""
+    """Every message on `path`'s data stream: its time and its object. A
+    heartbeat carries no bytes and is left out."""
     done = subprocess.run(
         [
             "ffprobe", "-v", "error", "-select_streams", "d",
@@ -98,8 +101,9 @@ def _messages(path: Path) -> list[tuple[float, dict[str, object]]]:
     parsed = json.loads(done.stdout)
     assert [s["codec_tag_string"] for s in parsed["streams"]] == ["JSON"]
     return [
-        (float(packet["pts_time"]), json.loads(_hexdump_bytes(packet["data"])))
+        (float(packet["pts_time"]), json.loads(body))
         for packet in parsed["packets"]
+        if (body := _hexdump_bytes(packet.get("data", "")))
     ]
 
 
@@ -179,3 +183,37 @@ def test_the_messages_ride_beside_the_picture(tmp_path: Path) -> None:
         out,
     )
     assert found == _stamped("es")
+
+
+def test_a_live_picture_beside_its_own_sparse_clock_runs_in_real_time(
+    tmp_path: Path,
+) -> None:
+    """The picture and the ticks its own clock times, into one file, off a
+    paced lavfi graph. The graph starts half a second in, so the first tick
+    is 5 s away, as a head's first break is: the file's writer opens the
+    data pipe on its first heartbeat rather than waiting those seconds with
+    the clock's producer blocked behind it, and heartbeats keep the picture
+    from waiting on each tick."""
+    out = tmp_path / "live.nut"
+    query = (
+        "COPY (SELECT f.video[1], stamp_clock(f.video[1], 'root', 5) FROM "
+        "input('testsrc2=size=320x240:rate=30:duration=20', format => 'lavfi', "
+        "realtime => true, itsoffset => 0.5) f) TO '{out}'"
+    )
+    started = time.monotonic()
+    found = _run(query, out)
+    took = time.monotonic() - started
+    assert took < 1.3 * 20, f"20 s of picture took {took:.1f} s"
+    frames = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-select_streams", "v", "-count_packets",
+            "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0", str(out),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=_TIMEOUT,
+        check=True,
+    )
+    assert int(frames.stdout.strip()) == 20 * 30
+    tick = {"kind": "tick", "node": "root"}
+    assert found == [(5.0, tick), (10.0, tick), (15.0, tick), (20.0, tick)]
