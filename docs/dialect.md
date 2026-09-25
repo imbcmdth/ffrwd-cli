@@ -120,6 +120,33 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   the way a filter's options do: `ffrwd.ortb.auction(prog.d, prog.v,
   cohort => 'es-ES', viewers => 18000)`. A stream is always written in
   its own position.
+- A **feeder** is a stream argument a frame module reads itself, over a
+  loopback connection, instead of being handed it as a pad. The module's
+  describe names it (`feeders`: which stream argument, counted from 0,
+  the value parameter its port goes in, its kind, its group), and the
+  declaration may default it to NULL: `video(v video_stream, feed
+  video_stream DEFAULT NULL, port number DEFAULT 9000, lead number
+  DEFAULT 0.3)`. What the call writes in that place decides the rest:
+  - a stream: the compiler picks a free loopback port, writes it into
+    the port parameter, and an ffmpeg process of its own writes the
+    stream there as NUT, conformed to the module's pixel format (or its
+    sample format, rate and channel count) and, where the programme is
+    an input's own probed stream, to the programme's size and rate. A
+    port written as well, by position or by name, is refused. `run`
+    starts that process once the port accepts a connection, trying for
+    up to 30 seconds, and fails the run if it never does; the module
+    sees that first try as a connection that ends before a byte arrives.
+  - a number: the port itself, the spelling from before feeders. It
+    wires nothing, and the positionals after it continue from the
+    parameter after the port: `video(v, 9000, 0.5)` reads a lead of 0.5.
+  - nothing, or NULL: nothing is wired, and the port keeps its DEFAULT.
+
+  Feeders naming one group and fed from one FROM item share ONE port,
+  written into each call, and one connection carrying every stream they
+  name, video first; a group fed from two FROM items is refused. A
+  feeder naming no group has a connection of its own. `compile` lists
+  each connection: the process writing it, its port, and the calls
+  reading it.
 - **`--jobs N`**, on `compile` and `run`, caps the sidecar's worker
   threads at N. The sidecar runs a pool sized to the machine's cores by
   default, and a module that describes itself as pure spreads across it
@@ -1573,7 +1600,12 @@ Every one of these is a typed rejection, never a silent reinterpretation:
   `RETURNS` that does not match the module's result type, or a module
   answering with the wrong JSON type; a named argument naming a
   stream, a parameter the declaration does not have, or one a
-  positional argument already wrote; a call in
+  positional argument already wrote; a DEFAULT on a stream parameter
+  other than a feeder's NULL; a feeder the signature does not match
+  (past its stream parameters, of another kind, or naming a port
+  parameter that is not a number), a stream in a feeder's place with
+  the port written too, and one feeder group fed from two FROM items;
+  a call in
   `FROM` unless it returns source, a `RETURNS source` call anywhere
   but `FROM` or one handed a stream; a `RETURNS sink` call anywhere
   but the `TO` position, a non-sink function written there, `WITH`
