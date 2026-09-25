@@ -79,6 +79,7 @@ __all__ = [
     "ANNOTATIONS_OUT",
     "AUDIO_CODEC_ENCODERS",
     "CODEC_ENCODERS",
+    "DATA_FILTER_WORLD",
     "DEFAULT_TIMEOUT_SECONDS",
     "LANGUAGE_TAGS",
     "MODEL_SUFFIX",
@@ -98,6 +99,7 @@ __all__ = [
     "Describe",
     "Described",
     "DescribedFunction",
+    "Feeder",
     "Invoke",
     "PacketRead",
     "ReadPackets",
@@ -108,6 +110,7 @@ __all__ = [
     "catalog_as_probe",
     "describe",
     "encoder_codec",
+    "hosts_data_filter",
     "hosts_packet_filter",
     "hosts_packet_sink",
     "hosts_packet_source",
@@ -164,6 +167,7 @@ WORLDS: tuple[str, ...] = (
     "ffrwd:av@0.14.0",
     "ffrwd:av@0.15.0",
     "ffrwd:av@0.16.0",
+    "ffrwd:av@0.17.0",
 )
 
 # The world a module scaffolded today is built against: the newest of those,
@@ -228,6 +232,10 @@ _ROWS_MODULE_WORLD = "ffrwd:av@0.14.0"
 # The first world whose sidecar hosts a packet filter: encoded packets in,
 # encoded packets out, with rows arriving beside them.
 PACKET_FILTER_WORLD = "ffrwd:av@0.16.0"
+
+# The first world whose sidecar hosts a data filter: data streams of messages
+# in and out, and clock pads beside them.
+DATA_FILTER_WORLD = "ffrwd:av@0.17.0"
 
 # The sample formats one can carry, and the pcm each of them travels as.
 WIRE_SAMPLE_FMTS: tuple[str, ...] = ("f32", "s16")
@@ -400,6 +408,22 @@ class DescribedFunction:
 
 
 @dataclass(frozen=True)
+class Feeder:
+    """One argument a module reads itself over a loopback connection.
+
+    `input` counts the call's stream arguments from 0, `port_param` is the
+    parameter the host writes the port it picked into, `kind` is ``video``
+    or ``audio``, and `group` names the feeders of one module that share a
+    connection, empty for one of its own.
+    """
+
+    input: int
+    port_param: str
+    kind: str
+    group: str = ""
+
+
+@dataclass(frozen=True)
 class Described:
     """One wasm module's declared interface, as the sidecar reports it.
 
@@ -455,6 +479,13 @@ class Described:
     JSON rows with no stream anywhere -- and `input_rows_schema` is the shape
     it READS, beside `rows_schema`'s shape it writes. False and None for
     every other kind.
+
+    `data_filter` marks a DATA FILTER: data streams of messages in and out,
+    and clock pads beside them. `data_outputs` is the codec of each stream it
+    writes, in output order, and `data_time_base` the unit their pts are
+    counted in. `data_streams` is how many data streams a packet sink or
+    packet filter reads beside its video and audio. `feeders` are the
+    arguments a frame module reads itself over a connection of its own.
     """
 
     world: str
@@ -507,6 +538,11 @@ class Described:
     packet_filter: bool = False
     rows_module: bool = False
     input_rows_schema: Mapping[str, object] | None = None
+    data_filter: bool = False
+    data_outputs: tuple[str, ...] = ()
+    data_time_base: tuple[int, int] | None = None
+    data_streams: SinkArity = "none"
+    feeders: tuple[Feeder, ...] = ()
 
     @property
     def packet_sink(self) -> bool:
@@ -519,10 +555,14 @@ class Described:
 
     def sink_streams(self, kind: StreamType) -> SinkArity:
         """How many streams of `kind` this sink reads."""
+        if kind == "data":
+            return self.data_streams
         return self.audio_streams if kind == "audio" else self.video_streams
 
     def sink_codecs(self, kind: StreamType) -> tuple[str, ...]:
         """The codecs this sink accepts for `kind`; empty is every codec."""
+        if kind == "data":
+            return ()
         return self.audio_codecs if kind == "audio" else (self.video_codecs or ())
 
     @property
@@ -711,7 +751,49 @@ def _described(path: str, payload: object) -> Described:
         input_rows_schema=payload["input_rows_schema"]
         if isinstance(payload.get("input_rows_schema"), dict)
         else None,
+        data_filter=payload.get("data_filter") is True,
+        data_outputs=_strings(payload.get("data_outputs")),
+        data_time_base=_rational(payload.get("data_time_base")),
+        data_streams=_sink_arity(payload.get("data_streams"), "none"),
+        feeders=_feeders(payload.get("feeders")),
     )
+
+
+def _rational(value: object) -> tuple[int, int] | None:
+    """A declared ``[num, den]`` pair, or None for anything else."""
+    if (
+        isinstance(value, list)
+        and len(value) == 2
+        and all(isinstance(n, int) and not isinstance(n, bool) for n in value)
+        and value[1] != 0
+    ):
+        return (value[0], value[1])
+    return None
+
+
+def _feeders(value: object) -> tuple[Feeder, ...]:
+    """The ``feeders`` list a frame module's describe carries, else ``()``."""
+    if not isinstance(value, list):
+        return ()
+    found: list[Feeder] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        index = _int_or_none(item.get("input"))
+        port = item.get("port_param")
+        kind = item.get("kind")
+        group = item.get("group")
+        if index is None or not isinstance(port, str) or not isinstance(kind, str):
+            continue
+        found.append(
+            Feeder(
+                input=index,
+                port_param=port,
+                kind=kind,
+                group=group if isinstance(group, str) else "",
+            )
+        )
+    return tuple(found)
 
 
 def _sink_arity(value: object, absent: SinkArity) -> SinkArity:
@@ -977,9 +1059,10 @@ def _source_format(
 ) -> tuple[StreamType, int | None, int | None, int | None, int | None]:
     """A track's ``format`` arm as ``(kind, width, height, sample_rate, channels)``.
 
-    Exactly one of the video pair and the audio pair is filled; the other
-    stays ``(None, None)``. Neither arm present, or the named arm not an
-    object, is a rejection naming the module and the track.
+    At most one of the video pair and the audio pair is filled; the other
+    stays ``(None, None)``, and a data track fills neither. No arm present,
+    or the named arm not an object, is a rejection naming the module and the
+    track.
     """
     if isinstance(value, dict) and isinstance(value.get("video"), dict):
         video = value["video"]
@@ -999,9 +1082,11 @@ def _source_format(
             _int_or_none(audio.get("sample_rate")),
             _int_or_none(audio.get("channels")),
         )
+    if isinstance(value, dict) and isinstance(value.get("data"), dict):
+        return ("data", None, None, None, None)
     raise _reject(
         f"track {index} of the sidecar's probe of {module} names a format "
-        "that is neither video nor audio",
+        "that is neither video, audio nor data",
         hint="the module may be built against a sidecar this ffrwd does not know",
     )
 
@@ -1174,8 +1259,8 @@ def catalog_as_probe(alias: str, catalog: SourceCatalog) -> ProbeResult:
     The bridge from a compile-time SOURCE probe to everything downstream
     that already reads a :class:`ProbeResult` the way ffprobe hands one
     over. One `StreamMeta` per track, catalog order, its per-type `index`
-    counted the way ffprobe counts one -- 0-based, video and audio counted
-    separately. One `RenditionMeta` per distinct `row`, first-seen order,
+    counted the way ffprobe counts one -- 0-based, video, audio and data
+    counted separately. One `RenditionMeta` per distinct `row`, first-seen order,
     holding that row's own streams plus the attributes its FIRST track's
     `rendition` named -- muxed tracks of one row agree on them in practice.
 
@@ -1186,17 +1271,14 @@ def catalog_as_probe(alias: str, catalog: SourceCatalog) -> ProbeResult:
     symmetry with a call site that keys its inputs by alias; nothing here
     reads its value.
     """
-    video_index = 0
-    audio_index = 0
+    counted: dict[StreamType, int] = {}
     streams: list[StreamMeta] = []
     row_order: list[int] = []
     streams_by_row: dict[int, list[StreamMeta]] = {}
     rendition_by_row: dict[int, SourceRendition] = {}
     for track in catalog.tracks:
-        if track.kind == "video":
-            index, video_index = video_index, video_index + 1
-        else:
-            index, audio_index = audio_index, audio_index + 1
+        index = counted.get(track.kind, 0)
+        counted[track.kind] = index + 1
         stream = StreamMeta(
             type=track.kind,
             index=index,
@@ -1767,7 +1849,12 @@ def _argv(
         argv += _rows_in_args(process)
         argv += _rows_module_args(process)
         tracks, documents = _split_writes(process, writes)
-        argv += rows_args(process, documents) or _stream_output(process, tracks)
+        if process.data_filter:
+            # Its outputs AND its rows: the messages go on down the plan, and
+            # the rows are the run's report beside them.
+            argv += _stream_output(process, tracks) + rows_args(process, documents)
+        else:
+            argv += rows_args(process, documents) or _stream_output(process, tracks)
     if process.writes_rows:
         argv += [_ANNOTATIONS_FLAG, ANNOTATIONS_OUT]
     return argv
@@ -1806,7 +1893,7 @@ def _split_writes(
     """`writes` as a packet source's or a packet filter's stream paths and the
     rows paths after them, which :func:`~ffrwd.execute._sidecar_writes` puts in
     that order. Every other process writes rows documents and nothing else."""
-    if not (process.packet_source or process.packet_filter):
+    if not (process.packet_source or process.packet_filter or process.data_filter):
         return (), writes
     count = len(process.outputs)
     return writes[:count], writes[count:]
@@ -1830,10 +1917,11 @@ def _stream_output(process: SidecarProcess, writes: Sequence[str] = ()) -> list[
     """
     if process.sink:
         return ["-f", _NULL_FORMAT, "-"]
-    if process.packet_filter:
+    if process.packet_filter or process.data_filter:
         # One output per pad, in pad order: the filter hands every stream it
         # was given back, and each travels its own pipe the way a source's
-        # tracks do. The order is the order the reader opens them in.
+        # tracks do. The order is the order the reader opens them in. A data
+        # filter's pads are its outputs, in the order it declares them.
         paths = writes or tuple(f"pipe:{i + 1}" for i in range(len(process.outputs)))
         return [
             token for path in paths for token in ("-f", EDGE_FORMAT, path)
@@ -2161,6 +2249,11 @@ def audio_encoder_codec(encoder: str) -> str | None:
     if sep and head in WIRE_AUDIO_CODECS:
         return head
     return _AUDIO_ENCODER_CODECS.get(encoder)
+
+
+def hosts_data_filter(world: str) -> bool:
+    """True when `world`'s sidecar can host a data filter."""
+    return world in WORLDS and WORLDS.index(world) >= WORLDS.index(DATA_FILTER_WORLD)
 
 
 def hosts_packet_filter(world: str) -> bool:

@@ -37,9 +37,12 @@ A node id must never itself look like a source ref (must not start with
 Subtitle / data refs are PASSTHROUGH-ONLY: ffmpeg filtergraphs
 carry only video/audio, so a `"src:<alias>:s:<k>"` or `"src:<alias>:d:<k>"`
 ref may only appear as a `SinkUnit.outputs` entry (a bare `-map`), never as a
-`Node.inputs` entry and never produced by a `Node.outputs` entry. This module
-does not enforce that; it is a property of well-formed IR that parser/lower
-uphold and split/emit check.
+`Node.inputs` entry and never produced by a `Node.outputs` entry. The one
+exception is a DATA FILTER (`Graph.data_filters`): the sidecar hosts it, so
+it reads data refs and produces data pads, which reach ffmpeg only as the
+pipes the partitioner puts between them. This module does not enforce that;
+it is a property of well-formed IR that parser/lower uphold and split/emit
+check.
 """
 
 from __future__ import annotations
@@ -690,6 +693,10 @@ class Graph:
     # the nodes of `rows_sinks` writing that same path. A filter reading no
     # rows is absent.
     packet_filter_rows: dict[str, list[dict[str, str]]] = field(default_factory=dict)
+    # Node ids that are DATA FILTERS, in graph order: each reads its inputs as
+    # data pads (a data stream) and clock pads (video or audio, read for its
+    # time alone), and every one of its outputs is a data stream of its own.
+    data_filters: list[str] = field(default_factory=list)
     # Alias -> the RETURNS source module bound to it. Not a key of `sources`:
     # its bytes never come from a real `-i`, so the partitioner gives it a
     # sidecar of its own rather than an input slot.
@@ -756,6 +763,8 @@ class Graph:
                 name: [dict(one) for one in reads]
                 for name, reads in self.packet_filter_rows.items()
             }
+        if self.data_filters:
+            d["data_filters"] = list(self.data_filters)
         if self.module_sources:
             d["module_sources"] = {
                 alias: source.to_dict() for alias, source in self.module_sources.items()
@@ -850,6 +859,12 @@ class Graph:
                     {str(k): str(v) for k, v in dict(one).items()} for one in reads
                 ]
 
+        raw_data_filters = d.get("data_filters")
+        data_filters: list[str] = []
+        if raw_data_filters is not None:
+            assert isinstance(raw_data_filters, list)
+            data_filters = [str(name) for name in raw_data_filters]
+
         raw_module_sources = d.get("module_sources")
         module_sources: dict[str, ModuleSource] = {}
         if raw_module_sources is not None:
@@ -884,6 +899,7 @@ class Graph:
             packet_sinks=packet_sinks,
             packet_filters=packet_filters,
             packet_filter_rows=packet_filter_rows,
+            data_filters=data_filters,
             module_sources=module_sources,
             url_sources=url_sources,
             dropped_aliases=dropped_aliases,

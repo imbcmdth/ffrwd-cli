@@ -56,6 +56,7 @@ def _sentinel_graph() -> Graph:
     g.module_sinks = ["m"]
     g.packet_sinks = {"m": [{"video_codec": "h264"}]}
     g.packet_filters = {"w": [{"video_codec": "libx264"}]}
+    g.data_filters = ["df"]
     g.module_sources = {
         "s": ModuleSource(
             alias="s",

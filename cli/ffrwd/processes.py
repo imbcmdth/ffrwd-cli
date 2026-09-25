@@ -117,7 +117,7 @@ from .ir import (
     is_src,
     src_parts,
 )
-from .probe import ProbeResult, StreamMeta, is_url
+from .probe import JSON_CODEC, ProbeResult, StreamMeta, is_url
 
 __all__ = [
     "COPY_CODEC",
@@ -129,7 +129,9 @@ __all__ = [
     "PIPE_BUFFER_LIMIT",
     "RAWVIDEO",
     "SAFETY",
+    "CLOCK_SIZE",
     "AudioFormat",
+    "DataFormat",
     "Edge",
     "EdgeBuffer",
     "EffectGrant",
@@ -175,6 +177,11 @@ COPY_CODEC = "copy"
 # ffprobe reports no pixel format, so the wire format is one the compiler
 # picks and the producing ffmpeg is told to write.
 DEFAULT_PIX_FMT = "yuv420p"
+
+# The width and height of the picture a data filter's CLOCK pad is handed: it
+# reads the pts and nothing else, so each frame is made as small as a frame
+# can usefully be before it crosses the pipe.
+CLOCK_SIZE = 16
 
 # The filters whose output pads are interchangeable copies of one input, and so
 # the ones a payload can cut down to the consumers it actually holds.
@@ -260,9 +267,10 @@ _MODULE_NAME_UNSAFE = re.compile(r"[^A-Za-z0-9_]")
 # An input carried in the query text itself rather than opened from anywhere.
 _DATA_URI = "data:"
 
-# The stream types a pipe carries between processes. A subtitle or data track
-# is a bare ``-map`` and NUT has nowhere to put it.
-_PIPED_TYPES: frozenset[StreamType] = frozenset({"video", "audio"})
+# The stream types a pipe carries between processes. A subtitle track is a
+# bare ``-map`` and NUT has nowhere to put it; a data stream crosses as its
+# own packets, stream-copied.
+_PIPED_TYPES: frozenset[StreamType] = frozenset({"video", "audio", "data"})
 
 
 # ---------------------------------------------------------------- formats
@@ -352,7 +360,23 @@ class AudioFormat:
         return written
 
 
-StreamFormat = VideoFormat | AudioFormat
+@dataclass(frozen=True)
+class DataFormat:
+    """One data stream on a pipe: NUT carrying messages, each a packet.
+
+    `codec` is what the messages are, ``json`` for one UTF-8 JSON object
+    each. Nothing decodes or encodes them: every process on the way copies
+    the packets, times and all.
+    """
+
+    container: str = NUT
+    codec: str = JSON_CODEC
+
+    def to_dict(self) -> dict[str, object]:
+        return {"container": self.container, "codec": self.codec}
+
+
+StreamFormat = VideoFormat | AudioFormat | DataFormat
 
 # A media artifact, or rows -- one JSON object per line.
 FileContent = Literal["media", "rows"]
@@ -781,6 +805,10 @@ class SidecarProcess:
     # network's filtergraph names -- each is its own ``-m`` after those,
     # with a ``-rows-from`` saying whose rows it reads.
     rows_modules: tuple[RowsModule, ...] = ()
+    # True for a region holding a DATA FILTER: it rides alone, reads one pipe
+    # per stream argument -- data pads and clock pads, told apart by their
+    # own stream header -- and writes one NUT pipe per data output.
+    data_filter: bool = False
 
     @property
     def nodes(self) -> tuple[str, ...]:
@@ -803,6 +831,8 @@ class SidecarProcess:
         if self.graph is None:
             return False
         if self.packet_sink or self.packet_source or self.packet_filter:
+            return False
+        if self.data_filter:
             return False
         return len(self.graph.nodes) > 1 or any(
             len(node.inputs) > 1 for node in self.graph.nodes.values()
@@ -842,6 +872,8 @@ class SidecarProcess:
             written["tracks"] = list(self.tracks)
         if self.rows_modules:
             written["rows_modules"] = [one.to_dict() for one in self.rows_modules]
+        if self.data_filter:
+            written["data_filter"] = True
         if self.pads:
             written["pads"] = [None if p is None else p.to_dict() for p in self.pads]
         if self.network and self.graph is not None:
@@ -1045,6 +1077,8 @@ def _bindings(paths: Iterable[str]) -> tuple[ModuleBinding, ...]:
 
 def encoded(wire: StreamFormat) -> bool:
     """True when this edge carries packets rather than raw frames."""
+    if isinstance(wire, DataFormat):
+        return True
     if isinstance(wire, AudioFormat):
         return wire.codec not in (PCM_F32LE, PCM_S16LE)
     return wire.codec != RAWVIDEO
@@ -1054,8 +1088,11 @@ def _encodes(wire: StreamFormat) -> bool:
     """True when the producing process ENCODES onto this edge.
 
     A copied stream is not one: its packets were encoded before this run and
-    cross untouched, so nothing holds frames back to reorder them.
+    cross untouched, so nothing holds frames back to reorder them. Nor is a
+    data stream, whose messages are copied wherever they go.
     """
+    if isinstance(wire, DataFormat):
+        return False
     return encoded(wire) and wire.codec != COPY_CODEC
 
 
@@ -1066,7 +1103,7 @@ def _frame_bytes(wire: StreamFormat) -> int | None:
     encoded packet's size is not its frame's, and an audio packet holds
     however many samples the muxer put in it: neither has an answer here.
     """
-    if isinstance(wire, AudioFormat) or encoded(wire):
+    if isinstance(wire, AudioFormat | DataFormat) or encoded(wire):
         return None
     if wire.width is None or wire.height is None:
         return None
@@ -1190,6 +1227,7 @@ class _Partitioner:
         self._compute_depths()
         self.sink_depth = [self._unit_depth(unit) for unit in g.sinks]
         self.pending: list[_Pending] = []
+        self.made = 0
         self.sidecars: list[SidecarProcess] = []
         self.sidecar_of: dict[str, str] = {}  # node id -> process id
         self.members: dict[str, list[str]] = {}  # process id -> its node ids
@@ -1230,7 +1268,10 @@ class _Partitioner:
     # -- process construction
 
     def _ffmpeg_id(self) -> str:
-        return f"ffmpeg{len(self.pending)}"
+        # Counted rather than read off `pending`: a reader left with nothing
+        # to do is dropped from it, and its id is not handed out again.
+        self.made += 1
+        return f"ffmpeg{self.made - 1}"
 
     def _mapped_splits(self, refs: Iterable[FrameRef], depth: int) -> set[str]:
         """Splits BELOW `depth` that `refs` reach through splits and nothing else.
@@ -1502,7 +1543,7 @@ class _Partitioner:
     def _opened(self, process: _Pending) -> dict[str, list[FrameRef]]:
         """The input aliases `process` opens itself, and the refs it reads off each.
 
-        Only video and audio: a subtitle or data track never travels a pipe,
+        Only video, audio and data: a subtitle track never travels a pipe,
         so it is not something a reader could hand over.
         """
         found: dict[str, list[FrameRef]] = {}
@@ -1568,23 +1609,24 @@ class _Partitioner:
         """
         source: ModuleSource
         for alias, source in sorted(self.g.module_sources.items()):
+            direct = self._source_data_to_sidecars(alias)
             readers = [p for p in self.pending if self._reads(p, alias)]
             wanted = {ref for process in readers for ref in self._reads(process, alias)}
             selected = [
                 (index, track)
                 for index, track in enumerate(source.tracks)
-                if track.ref in wanted
+                if track.ref in wanted or track.ref in direct
             ]
             if not selected:
                 raise self._unread_source(alias, source)
             reader = next((p for p in readers if not self._consumed(p)), None)
-            if reader is None:
+            if reader is None and readers:
                 reader = _Pending(
                     id=self._ffmpeg_id(), depth=0, nodes=[], sinks=[], pipes=[]
                 )
                 self.pending.append(reader)
             for process in readers:
-                if process is reader:
+                if process is reader or reader is None:
                     continue
                 stranded = self._unpiped(process, alias)
                 if stranded is not None:
@@ -1592,11 +1634,11 @@ class _Partitioner:
                         alias,
                         "so one process reads it and hands every other one a "
                         f"pipe -- and {_named_ref(stranded)} is read by one of "
-                        "those others, where a subtitle or data track cannot "
-                        "follow",
-                        hint="a pipe between two processes carries pictures and "
-                        "sound and nothing else: map that track from a separate "
-                        "input() over a recording, or drop it from the SELECT",
+                        "those others, where a subtitle track cannot follow",
+                        hint="a pipe between two processes carries pictures, "
+                        "sound and data, and no subtitles: map that track from "
+                        "a separate input() over a recording, or drop it from "
+                        "the SELECT",
                     )
                 for ref in self._opened(process).get(alias, []):
                     if ref not in reader.pipes:
@@ -1622,7 +1664,49 @@ class _Partitioner:
             self.sidecars.append(sidecar)
             self.members[sidecar.id] = []
             for _, track in selected:
-                self._add_edge(sidecar.id, reader.id, track.ref)
+                target = direct.get(track.ref)
+                if target is None:
+                    assert reader is not None  # a track no sidecar takes has one
+                    target = reader.id
+                self._add_edge(sidecar.id, target, track.ref)
+
+    def _source_data_to_sidecars(self, alias: str) -> dict[FrameRef, str]:
+        """The data tracks of source `alias` a sidecar takes straight off it.
+
+        A data track only handed on by the ffmpeg that would read the source,
+        to ONE sidecar and to nothing else, needs no ffmpeg between the two:
+        the messages cross sidecar to sidecar, and nothing holds them back
+        on the way. Each such track is taken out of its reader here, and a
+        reader left with nothing to do is dropped. Returns each track's
+        sidecar.
+        """
+        sidecars = {sidecar.id for sidecar in self.sidecars}
+        found: dict[FrameRef, str] = {}
+        for process in list(self.pending):
+            for ref in list(process.pipes):
+                if not is_src(ref) or src_parts(ref)[0] != alias:
+                    continue
+                if ref_type(self.g, ref) != "data" or ref in found:
+                    continue
+                handed = [e for e in self.edges if e.source == process.id and e.ref == ref]
+                if len(handed) != 1 or handed[0].target not in sidecars:
+                    continue
+                if self._filters(process, ref) or any(
+                    output.ref == ref for unit in process.sinks for output in unit.outputs
+                ):
+                    continue
+                if any(
+                    other is not process and ref in self._reads(other, alias)
+                    for other in self.pending
+                ):
+                    continue
+                found[ref] = handed[0].target
+                self.edges.remove(handed[0])
+                process.pipes.remove(ref)
+            if not (process.nodes or process.sinks or process.pipes):
+                self.pending.remove(process)
+                self.consumer_of.pop(process.id, None)
+        return found
 
     def _unread_source(self, alias: str, source: ModuleSource) -> FfrwdError:
         """The rejection for a source module no track of which is consumed."""
@@ -1672,11 +1756,11 @@ class _Partitioner:
                         alias,
                         f"so one process reads it and hands every other one a "
                         f"pipe -- and {_named_ref(stranded)} is read by one of "
-                        "those others, where a subtitle or data track cannot "
-                        "follow",
-                        hint="a pipe between two processes carries pictures and "
-                        "sound and nothing else: map that track from a separate "
-                        "input() over a recording, or drop it from the SELECT",
+                        "those others, where a subtitle track cannot follow",
+                        hint="a pipe between two processes carries pictures, "
+                        "sound and data, and no subtitles: map that track from "
+                        "a separate input() over a recording, or drop it from "
+                        "the SELECT",
                     )
                 for ref in self._opened(process).get(alias, []):
                     if ref not in reader.pipes:
@@ -1821,8 +1905,13 @@ class _Partitioner:
         # output, and only an ffmpeg on its own side of the pipe encodes. A
         # packet FILTER reads the same thing and rides alone for the same
         # reason -- and its own output is encoded too, so nothing joins it
-        # from below either.
-        alone = set(self.g.packet_sinks) | set(self.g.packet_filters)
+        # from below either. A DATA filter reads and writes messages, which
+        # no frame module takes, so it rides alone too.
+        alone = (
+            set(self.g.packet_sinks)
+            | set(self.g.packet_filters)
+            | set(self.g.data_filters)
+        )
         # A ROWS edge joins its two nodes too: the consumer runs where the
         # rows already are, in the producer's own sidecar.
         links = [
@@ -2202,13 +2291,15 @@ class _Partitioner:
 
         A PACKET SINK is exempt, and a packet FILTER with it: packets are not
         frames, nothing pairs one pad's packet with another's, and their pads
-        are separate encodes of the same source by construction.
+        are separate encodes of the same source by construction. So is a DATA
+        filter, whose messages are sparse and whose clock is read, not paired.
         """
         for name in self.order:
             if (
                 not self.external[name]
                 or name in self.g.packet_sinks
                 or name in self.g.packet_filters
+                or name in self.g.data_filters
             ):
                 continue
             node = self.g.nodes[name]
@@ -2263,6 +2354,7 @@ class _Partitioner:
                 sink=any(name in self.g.module_sinks for name in members),
                 packet_sink=any(name in self.g.packet_sinks for name in members),
                 packet_filter=any(name in self.g.packet_filters for name in members),
+                data_filter=any(name in self.g.data_filters for name in members),
                 rows_in=self._region_rows_in(members),
                 pads=self._region_pad_meta(members),
             )
@@ -2307,6 +2399,7 @@ class _Partitioner:
                         or consumer in self.g.packet_filters
                     )
                     and producer not in self.g.packet_filters
+                    and producer not in self.g.data_filters
                 ):
                     # A packet sink or filter consumes the encoder's output,
                     # and a module region emits decoded frames: an encoding
@@ -2315,7 +2408,8 @@ class _Partitioner:
                     # -- the same fronting encoder either gets when its feed
                     # is an ffmpeg filter, shaped by the same options. A
                     # filter's OWN output is already encoded, so nothing
-                    # stands between it and what reads it.
+                    # stands between it and what reads it, and a data
+                    # filter's messages are packets already.
                     stage = _Pending(
                         id=self._ffmpeg_id(),
                         depth=depth,
@@ -2361,12 +2455,31 @@ class _Partitioner:
         self._add_rows_documents()
         self._bound_edges()
         self._check_handed_once()
+        self._order_data_outputs()
         processes: list[Process] = [self._materialize(p) for p in self.pending]
         processes.extend(self._materialize_region(sidecar) for sidecar in self.sidecars)
         return ProcessPlan(
             processes=tuple(processes),
             edges=(*self.edges, *self.rows, *self.documents),
         )
+
+    def _order_data_outputs(self) -> None:
+        """Put each data filter's outgoing edges in its own output order.
+
+        The module writes output 0 first, then output 1, and so on: its argv
+        names one pipe per output in that order, and the startup walk keeps a
+        sidecar's outputs in the order the plan lists them. The edges swap
+        among the slots they already hold, so nothing else moves.
+        """
+        for sidecar in self.sidecars:
+            if not sidecar.data_filter:
+                continue
+            slots = [i for i, edge in enumerate(self.edges) if edge.source == sidecar.id]
+            ordered = sorted(
+                (self.edges[i] for i in slots), key=lambda edge: _ref_pad(edge.ref)
+            )
+            for slot, edge in zip(slots, ordered):
+                self.edges[slot] = edge
 
     def _region_models(self, members: Sequence[str]) -> tuple[ModelBinding, ...]:
         """The ``-nn`` binding each module of this region needs, in graph order."""
@@ -2553,7 +2666,7 @@ class _Partitioner:
         # format an edge carries is the module's, not the process id's.
         consumer = self._reader(target, ref)
         wire = self._format(ref, consumer)
-        if copy:
+        if copy and not isinstance(wire, DataFormat):
             # Nothing on the far side filters this stream, so it travels as it
             # arrived: NUT carries the packets and both ends copy them, which
             # is the passthrough the query asked for and not a decode.
@@ -2625,6 +2738,10 @@ class _Partitioner:
         return next((s for s in result.by_type(kind) if s.index == index), None)
 
     def _format(self, ref: FrameRef, target: str | None = None) -> StreamFormat:
+        if ref_type(self.g, ref) == "data":
+            # Messages cross as they are, whoever wrote them and whoever reads
+            # them: copied into NUT, one packet each.
+            return DataFormat()
         meta = self._origin_meta(ref)
         producer = _ref_node(ref)
         if producer is not None and producer in self.g.packet_filters:
@@ -2682,6 +2799,14 @@ class _Partitioner:
                 timebase=_timebase(meta.fps) if meta else None,
                 codec=codec,
                 options=tuple(sorted(rest.items())),
+            )
+        if target is not None and target in self.g.data_filters:
+            # A CLOCK pad: the data filter reads each frame's time and nothing
+            # else, so lowering made the picture tiny before it got here.
+            return VideoFormat(
+                width=CLOCK_SIZE,
+                height=CLOCK_SIZE,
+                timebase=_timebase(meta.fps) if meta else None,
             )
         return VideoFormat(
             pix_fmt=self._pix_fmt(ref, target),
@@ -2817,7 +2942,7 @@ class _Partitioner:
             alias = _unique_alias(edge.ref, taken)
             taken.add(alias)
             alias_of[edge.ref] = alias
-            marker_of[edge.ref] = "a" if isinstance(edge.format, AudioFormat) else "v"
+            marker_of[edge.ref] = _marker(edge.format)
 
         def rewrite(ref: FrameRef) -> FrameRef:
             ref = substitute(ref)
@@ -2897,7 +3022,7 @@ class _Partitioner:
             alias = _unique_alias(edge.ref, taken)
             taken.add(alias)
             alias_of[edge.ref] = alias
-            marker_of[edge.ref] = "a" if isinstance(edge.format, AudioFormat) else "v"
+            marker_of[edge.ref] = _marker(edge.format)
 
         names = {binding.path: binding.name for binding in sidecar.modules}
         dissolved: dict[str, FrameRef] = {}
@@ -3085,6 +3210,13 @@ class _Partitioner:
         return paths, sources, trims, options
 
 
+def _marker(wire: StreamFormat) -> str:
+    """The type marker a piped stream is read back under: ``v``, ``a`` or ``d``."""
+    if isinstance(wire, DataFormat):
+        return "d"
+    return "a" if isinstance(wire, AudioFormat) else "v"
+
+
 def _copy_unit(unit: SinkUnit) -> SinkUnit:
     return _rewrite_unit(unit, lambda ref: ref)
 
@@ -3127,12 +3259,18 @@ def check_spellable(plan: ProcessPlan) -> None:
 
     A SOURCE MODULE is exempt: its several pads are each their own named
     pipe by construction, the same way a packet sink's several inputs are.
+    So is a packet filter, and a data filter: each output is a pipe of its own.
 
     A pad handed to two processes is refused while the plan is built, where
     what reads it still has a name (:meth:`_Partitioner._check_handed_once`).
     """
     for sidecar in plan.sidecars:
-        if sidecar.packet_source or sidecar.packet_filter or len(sidecar.outputs) <= 1:
+        if (
+            sidecar.packet_source
+            or sidecar.packet_filter
+            or sidecar.data_filter
+            or len(sidecar.outputs) <= 1
+        ):
             continue
         raise FfrwdError(
             ErrorCode.UNSUPPORTED_SQL,

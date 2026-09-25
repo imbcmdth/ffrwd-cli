@@ -280,6 +280,7 @@ from .processes import (
     PIPE,
     QUEUE_SIZE,
     AudioFormat,
+    DataFormat,
     EdgeBuffer,
     StreamFormat,
 )
@@ -1002,8 +1003,11 @@ def _wire_options(wire: StreamFormat, buffer: EdgeBuffer | None = None) -> dict[
     the edge's bound sized. The pipe road is the named pipe's own buffer and
     renders nothing here.
     """
-    if isinstance(wire, AudioFormat):
-        written: dict[str, object] = {"audio_codec": wire.codec, **dict(wire.options)}
+    if isinstance(wire, DataFormat):
+        # A data stream's map already copies it; nothing here is a codec.
+        written: dict[str, object] = {}
+    elif isinstance(wire, AudioFormat):
+        written = {"audio_codec": wire.codec, **dict(wire.options)}
     elif wire.codec == COPY_CODEC:
         # A copied stream keeps the pixel format it was encoded with; naming
         # one would be an instruction to a decoder that never runs.
