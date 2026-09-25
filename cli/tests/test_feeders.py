@@ -30,7 +30,7 @@ from ffrwd.execute import plan_argv, render_plan
 from ffrwd.ir import FeederCall, Graph
 from ffrwd.parser import parse, resolve
 from ffrwd.probe import ProbeResult, StreamMeta
-from ffrwd.processes import FfmpegProcess, ProcessPlan
+from ffrwd.processes import FfmpegProcess, ProcessPlan, external_filters, partition
 from ffrwd.registry import Registry, load_reference
 from ffrwd.split import insert_splits
 from ffrwd.wasm import WORLDS, Described, Feeder
@@ -293,6 +293,22 @@ def test_sound_carried_as_f32_is_conformed_in_ffmpegs_name_for_it() -> None:
     graph = argv[argv.index("-filter_complex") + 1]
     assert "aformat=sample_fmts=flt:sample_rates=48000:channel_layouts=stereo" in graph
     assert argv[argv.index("-c:0") + 1] == "pcm_f32le"
+
+
+def test_the_tags_on_a_fed_stream_ride_the_connection() -> None:
+    """A timed ad says so on its own picture, and the module reading the
+    connection reads it there, as a file written from it would carry it."""
+    graph = _lowered(
+        "COPY (WITH ad AS (SELECT v AS v, STRUCT('1' AS smart_timed) AS tags "
+        "FROM input('ad.mp4') a, unnest(a.video) v) "
+        "SELECT probe(p.video[1], ad.v[1]) FROM input('prog.mp4') p, ad) TO 'out.mp4'"
+    )
+    argv = _writer_argv(
+        partition(graph, external=external_filters(*_MODULES), probes=_probes())
+    )
+    at = argv.index("-metadata:s:0")
+    assert argv[at : at + 2] == ["-metadata:s:0", "smart_timed=1"]
+    assert argv[-1] == "tcp://127.0.0.1:50000"
 
 
 # -- a number in the feeder's place ----------------------------------------------

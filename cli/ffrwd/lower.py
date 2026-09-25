@@ -14350,6 +14350,7 @@ class _Lowerer:
         connection.streams[fed.stream.ref] = _Stream(
             ref=self._conformed_feed(fed.stream, programme, described),
             type=fed.stream.type,
+            source=fed.stream.source,
         )
 
     def _conformed_feed(
@@ -14399,7 +14400,9 @@ class _Lowerer:
 
     def _place_feeders(self) -> None:
         """One unit per feeder connection: its streams, video first, as NUT
-        to the loopback port the module listens on."""
+        to the loopback port the module listens on, each with the tags a
+        file output of it would carry, so the module reading it sees them."""
+        tags = self._layered_tags()
         for port, connection in self._feeds.items():
             streams = sorted(
                 connection.streams.values(), key=lambda s: 0 if s.type == "video" else 1
@@ -14414,7 +14417,7 @@ class _Lowerer:
             self.graph.sinks.append(
                 SinkUnit(
                     outputs=[
-                        Output(ref=s.ref, type=s.type, name=None, metadata={})
+                        Output(ref=s.ref, type=s.type, name=None, metadata=_metadata(s, tags))
                         for s in streams
                     ],
                     path=path,
