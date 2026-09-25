@@ -3,9 +3,9 @@ loopback connection the host delivers, instead of being handed it as a pad.
 
 Bare-machine, the way tests/test_wasm.py is: every module is a synthetic
 :class:`~ffrwd.wasm.Described`, every input path is one nobody has, and no
-sidecar or ffmpeg is spawned. The port a compile picks is the operating
-system's, so every test here picks from a counter instead. Running a real
-feeder is tests/exec/test_exec_feeders.py's.
+sidecar or ffmpeg is spawned. The port a compile picks is a random one, so
+every test here picks from a counter instead, but for the tests of the pick
+itself at the end. Running a real feeder is tests/exec/test_exec_feeders.py's.
 """
 
 from __future__ import annotations
@@ -639,3 +639,51 @@ def test_a_number_where_a_pad_goes_is_refused() -> None:
         ErrorCode.UDF_ARG_TYPE,
         "pair() takes video_stream as its 'w' argument, got a number",
     )
+
+
+# The real pick, kept before the fixture above stands a counter in for it.
+_PICK = lower.free_loopback_port
+
+
+def _bindable_from(start: int, *, twin: bool) -> int:
+    """The first port from `start` that binds now, with the one above it too
+    where `twin` is set."""
+    return next(
+        port
+        for port in lower.FEEDER_PORTS
+        if port >= start and lower._bindable(port) and (not twin or lower._bindable(port + 1))
+    )
+
+
+def test_a_feeder_port_and_its_twin_are_picked_below_every_outbound_range() -> None:
+    """Outbound connections are handed ports from 32768 up on Linux and 49152
+    up elsewhere, so one cannot take the pick before the module listens."""
+    port = _PICK()
+
+    assert port in lower.FEEDER_PORTS
+    assert port + 1 < 32768
+    assert lower._bindable(port) and lower._bindable(port + 1)
+
+
+def test_a_taken_port_or_a_taken_twin_is_passed_over(monkeypatch: pytest.MonkeyPatch) -> None:
+    with socket.socket() as held, socket.socket() as twin_held:
+        taken = _bindable_from(lower.FEEDER_PORTS.start, twin=False)
+        held.bind(("127.0.0.1", taken))
+        below_twin = _bindable_from(taken + 1, twin=True)
+        twin_held.bind(("127.0.0.1", below_twin + 1))
+        free = _bindable_from(below_twin + 2, twin=True)
+        picks = iter([taken, below_twin, free])
+        monkeypatch.setattr(lower.random, "choice", lambda _: next(picks))
+
+        assert _PICK() == free
+
+
+def test_no_free_port_after_every_try_is_a_typed_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    with socket.socket() as held:
+        taken = _bindable_from(lower.FEEDER_PORTS.start, twin=False)
+        held.bind(("127.0.0.1", taken))
+        monkeypatch.setattr(lower.random, "choice", lambda _: taken)
+        with pytest.raises(FfrwdError) as caught:
+            _PICK()
+    assert caught.value.code is ErrorCode.INTERNAL
+    assert "no free loopback port" in caught.value.message
