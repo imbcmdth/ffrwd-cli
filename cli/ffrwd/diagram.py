@@ -26,6 +26,7 @@ from collections.abc import Sequence
 from .ir import PIPE, FrameRef, Graph, Node, is_src, src_alias
 from .processes import (
     Edge,
+    FeederEdge,
     ProcessPlan,
     RowsEdge,
     SidecarProcess,
@@ -128,6 +129,8 @@ def _edge_label(edge: Edge) -> str:
         return f"{edge.format.container} {edge.format.codec}"
     if isinstance(edge, RowsEdge):
         return f"{edge.container} rows"
+    if isinstance(edge, FeederEdge):
+        return f"feeder on port {edge.port}"
     if edge.format.path is not None:
         return edge.format.path
     return edge.format.content

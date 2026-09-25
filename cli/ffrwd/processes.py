@@ -106,6 +106,7 @@ from .ir import (
     PIPE,
     ROWFILTER,
     ROWMERGE,
+    FeederCall,
     FrameRef,
     Graph,
     ModuleSource,
@@ -114,6 +115,7 @@ from .ir import (
     RowsSink,
     SinkUnit,
     StreamType,
+    feeder_port,
     is_src,
     src_parts,
 )
@@ -136,6 +138,7 @@ __all__ = [
     "EdgeBuffer",
     "EffectGrant",
     "FileContent",
+    "FeederEdge",
     "FfmpegProcess",
     "FileEdge",
     "FileFormat",
@@ -514,7 +517,33 @@ class RowsEdge:
         }
 
 
-Edge = StreamEdge | FileEdge | RowsEdge
+@dataclass(frozen=True)
+class FeederEdge:
+    """A feeder connection: an ffmpeg writing NUT to a loopback port that a
+    module in another process listens on and reads itself.
+
+    No pipe carries it and the plan runner copies nothing: the module opens
+    the port, and the writer is started once the port accepts. It joins the
+    two processes into one stage all the same. `calls` are the calls in
+    `target` reading the connection.
+    """
+
+    source: str
+    target: str
+    port: int
+    calls: tuple[FeederCall, ...]
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "kind": "feeder",
+            "source": self.source,
+            "target": self.target,
+            "port": self.port,
+            "calls": [call.to_dict() for call in self.calls],
+        }
+
+
+Edge = StreamEdge | FileEdge | RowsEdge | FeederEdge
 
 
 # ---------------------------------------------------------------- processes
@@ -924,6 +953,10 @@ class ProcessPlan:
     def rows_edges(self) -> tuple[RowsEdge, ...]:
         return tuple(e for e in self.edges if isinstance(e, RowsEdge))
 
+    @property
+    def feeder_edges(self) -> tuple[FeederEdge, ...]:
+        return tuple(e for e in self.edges if isinstance(e, FeederEdge))
+
     def process(self, id: str) -> Process:
         """The process with this id."""
         for candidate in self.processes:
@@ -937,7 +970,8 @@ class ProcessPlan:
 
         Processes stream edges connect are one stage: they run at the same
         time, passing frames as they are produced -- and a rows edge is a pipe
-        like any other, so it groups the same way. File edges put one stage
+        like any other, so it groups the same way, as does a feeder connection,
+        whose writer and reader run together. File edges put one stage
         after another. A file edge inside a stage says nothing about order and
         is skipped.
         """
@@ -1232,6 +1266,10 @@ class _Partitioner:
         self.sidecar_of: dict[str, str] = {}  # node id -> process id
         self.members: dict[str, list[str]] = {}  # process id -> its node ids
         self.consumer_of: dict[str, str] = {}  # feeder process id -> its reader
+        # The processes writing a FEEDER connection, by the path of the unit
+        # they write. Each rides alone: it starts only once its module
+        # listens, so nothing may wait on it.
+        self.feeding: dict[str, str] = {}
         self.edges: list[StreamEdge] = []
         # Kept apart from the stream edges: everything reading `edges` reads
         # frame pipes, and rows are neither frames nor a ref.
@@ -1450,6 +1488,8 @@ class _Partitioner:
         for process in self.pending:
             if process.id == target or process.depth != depth:
                 continue
+            if process.id in self.feeding.values():
+                continue
             if self._feeder_reads(process.nodes, process.pipes)[1] == wanted:
                 return process
         return None
@@ -1532,7 +1572,7 @@ class _Partitioner:
         if not wanted or outside:
             return None
         for process in self.pending:
-            if process.depth != depth:
+            if process.depth != depth or process.id in self.feeding.values():
                 continue
             theirs, others = self._feeder_reads(process.nodes, process.pipes)
             if others or not theirs & wanted:
@@ -2368,8 +2408,12 @@ class _Partitioner:
         demands: list[tuple[str, FrameRef, int]] = []
         for depth in sorted(set(self.sink_depth)):
             units = [
-                unit for unit, at in zip(self.g.sinks, self.sink_depth) if at == depth
+                unit
+                for unit, at in zip(self.g.sinks, self.sink_depth)
+                if at == depth and unit.path not in self.g.feeders
             ]
+            if not units:
+                continue
             refs = [o.ref for unit in units for o in unit.outputs]
             process = _Pending(
                 id=self._ffmpeg_id(),
@@ -2379,6 +2423,21 @@ class _Partitioner:
                 pipes=[],
             )
             self.pending.append(process)
+            demands.extend((process.id, ref, depth) for ref in self._consumed(process))
+
+        for unit, depth in zip(self.g.sinks, self.sink_depth):
+            if unit.path is None or unit.path not in self.g.feeders:
+                continue
+            refs = [o.ref for o in unit.outputs]
+            process = _Pending(
+                id=self._ffmpeg_id(),
+                depth=depth,
+                nodes=self._ancestors(refs, depth),
+                sinks=[_copy_unit(unit)],
+                pipes=[],
+            )
+            self.pending.append(process)
+            self.feeding[unit.path] = process.id
             demands.extend((process.id, ref, depth) for ref in self._consumed(process))
 
         for sidecar in self.sidecars:
@@ -2460,8 +2519,23 @@ class _Partitioner:
         processes.extend(self._materialize_region(sidecar) for sidecar in self.sidecars)
         return ProcessPlan(
             processes=tuple(processes),
-            edges=(*self.edges, *self.rows, *self.documents),
+            edges=(*self.edges, *self.rows, *self.documents, *self._feeder_edges()),
         )
+
+    def _feeder_edges(self) -> list[FeederEdge]:
+        """One edge per feeder connection and process reading it."""
+        found: list[FeederEdge] = []
+        for path, source in self.feeding.items():
+            targets: dict[str, list[FeederCall]] = {}
+            for call in self.g.feeders[path]:
+                targets.setdefault(self.sidecar_of[call.node], []).append(call)
+            found.extend(
+                FeederEdge(
+                    source=source, target=target, port=feeder_port(path), calls=tuple(calls)
+                )
+                for target, calls in targets.items()
+            )
+        return found
 
     def _order_data_outputs(self) -> None:
         """Put each data filter's outgoing edges in its own output order.
@@ -3436,7 +3510,7 @@ def _stages(processes: Sequence[Process], edges: Sequence[Edge]) -> tuple[Stage,
         return name
 
     for edge in edges:
-        if not isinstance(edge, StreamEdge | RowsEdge):
+        if not isinstance(edge, StreamEdge | RowsEdge | FeederEdge):
             continue
         if edge.source not in parent or edge.target not in parent:
             continue

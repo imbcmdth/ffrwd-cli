@@ -155,6 +155,7 @@ __all__ = [
     "Signature",
     "WasmFunction",
     "expanded",
+    "is_number_argument",
     "package_modules",
     "package_signatures",
     "package_sources",
@@ -487,6 +488,36 @@ def _check_sink_streams(
                 f"carries, so nothing of that kind can follow it",
             )
         seen[kind] = param
+
+
+def _check_stream_defaults(
+    name: str,
+    streams: Sequence[Parameter],
+    feeds: bool,
+    identifier: exp.Identifier,
+    create: exp.Create,
+) -> None:
+    """A stream parameter's DEFAULT: NULL, and only on one a feeder may take.
+
+    A feeder is a later stream of a function returning a stream, which the
+    module reads itself and which may be absent; NULL is what says so. The
+    stream the module filters, and every stream of any other kind of
+    function, is always written.
+    """
+    for position, param in enumerate(streams):
+        if param.default is None:
+            continue
+        if feeds and position > 0:
+            continue
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"wasm function '{name}' gives the stream parameter '{param.name}' "
+            f"DEFAULT {_written(param.default)}",
+            identifier,
+            fallback=create,
+            hint="only a feeder may be left out: a stream after the first of a "
+            "function returning a stream, with DEFAULT NULL",
+        )
 
 
 def _leading_streams(params: tuple[Parameter, ...]) -> tuple[Parameter, ...]:
@@ -1733,6 +1764,7 @@ def _define_wasm_packet_rows(
             hint="a packet sink read in FROM reads one stream; a ladder is the "
             "call written over each rendition row",
         )
+    _check_stream_defaults(name, (stream,), False, identifier, create)
     if len(_leading_streams(params)) > 1:
         raise _error(
             ErrorCode.UNSUPPORTED_SQL,
@@ -2016,6 +2048,9 @@ def _define_wasm(
             hint="a module's streams come first; the parameters after them "
             "are values it is configured with",
         )
+    _check_stream_defaults(
+        name, streams, returns in WASM_STREAM_TYPES, identifier, create
+    )
     if len(streams) > 1 or any(is_array(p.type) for p in streams):
         _reject_annotation_column(name, params, identifier, create)
     # A packet filter reads its rows as arguments rather than off the stream
@@ -2135,6 +2170,7 @@ def _define_wasm_data_filter(
             fallback=create,
             hint=_WASM_DATA_HINT,
         )
+    _check_stream_defaults(name, streams, False, identifier, create)
     for param in streams:
         if param.type not in _DATA_FILTER_PARAM_TYPES:
             raise _error(
@@ -3299,6 +3335,25 @@ def _positional_and_named(
     return positional, named
 
 
+def _port_spelling(declared: WasmFunction, positional: Sequence[exp.Expr]) -> int | None:
+    """Where a number stands in a stream position a feeder may take, else None.
+
+    Only a stream function has feeders, and never in its first position:
+    that one is the stream the module filters.
+    """
+    if declared.returns not in WASM_STREAM_TYPES:
+        return None
+    for index in range(1, min(declared.stream_arity, len(positional))):
+        if is_number_argument(positional[index]):
+            return index
+    return None
+
+
+def is_number_argument(node: exp.Expr) -> bool:
+    """Whether the argument's shape says it is a number."""
+    return _argument_kind(node) == "number"
+
+
 def wasm_named_parameter(
     declared: WasmFunction,
     name: str,
@@ -4299,6 +4354,12 @@ class _Expander:
         An annotation column usually takes no argument of its own -- the call
         that fills it is the leading one -- but a call may write one, and does
         when the rows are not the ones its stream argument arrived with.
+
+        A number where a later stream of a stream function goes may be the
+        port spelling of a feeder, which fills that position and the port's,
+        so the positionals after it land one parameter further on. Which
+        stream is a feeder is the module's own to say, and lowering reads it,
+        so from that number on the positionals are left to lowering.
         """
         streams = call.meta.get(SINK_STREAMS)
         if declared.is_sink and isinstance(streams, int):
@@ -4317,11 +4378,14 @@ class _Expander:
                 call,
                 hint=declared.signature,
             )
+        spelled = _port_spelling(declared, positional)
+        # The port spelling fills two parameters with one argument.
+        filled = len(positional) + (0 if spelled is None else 1)
         taken = {name for name, _ in named}
         unfilled = next(
             (
                 p
-                for p in positions[len(positional) :]
+                for p in positions[filled:]
                 if p.default is None and p.name not in taken
             ),
             None,
@@ -4334,7 +4398,8 @@ class _Expander:
                 call,
                 hint=declared.signature,
             )
-        for param, argument in zip(positions, positional):
+        checked = positional if spelled is None else positional[:spelled]
+        for param, argument in zip(positions, checked):
             self._check_wasm_argument(declared, call, param, argument)
         self._check_wasm_named(declared, call, positions[: len(positional)], named)
 
@@ -4381,7 +4446,9 @@ class _Expander:
     ) -> None:
         """The ``name => value`` arguments: each a value parameter, written once.
 
-        `filled` is what the positionals already wrote.
+        `filled` is what the positionals already wrote. Lowering repeats the
+        check once a feeder's port spelling has said where the positionals
+        really land.
         """
         for name, value in named:
             param = wasm_named_parameter(declared, name, value, call, filled)

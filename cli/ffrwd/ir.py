@@ -646,6 +646,42 @@ class UrlSource:
         )
 
 
+# Where a feeder connection is delivered: loopback only, at the port the
+# host picked.
+FEEDER_HOST = "127.0.0.1"
+
+
+def feeder_path(port: int) -> str:
+    """The destination a feeder connection's writer is given."""
+    return f"tcp://{FEEDER_HOST}:{port}"
+
+
+def feeder_port(path: str) -> int:
+    """The port a feeder connection's destination names."""
+    return int(path.rpartition(":")[2])
+
+
+@dataclass(frozen=True)
+class FeederCall:
+    """One call reading a feeder connection: which node, what it is called
+    as, and the parameter its feeder was written in."""
+
+    node: str
+    function: str
+    param: str
+
+    def to_dict(self) -> dict[str, object]:
+        return {"node": self.node, "function": self.function, "param": self.param}
+
+    @classmethod
+    def from_dict(cls, d: dict[str, object]) -> FeederCall:
+        raw_node, raw_function, raw_param = d["node"], d["function"], d["param"]
+        assert isinstance(raw_node, str)
+        assert isinstance(raw_function, str)
+        assert isinstance(raw_param, str)
+        return cls(node=raw_node, function=raw_function, param=raw_param)
+
+
 @dataclass
 class Graph:
     input_paths: list[str]  # -i order; index is the ffmpeg input index
@@ -711,6 +747,10 @@ class Graph:
     # the graph still points at its slot (`emit._drop_dropped_branch_inputs`);
     # an alias a live branch shares keeps it, the same as `url_sources`.
     dropped_aliases: set[str] = field(default_factory=set)
+    # A sink's path -> the calls that read it as a FEEDER: the module listens
+    # on that loopback port and reads the unit's streams itself, so the unit
+    # is written by a process of its own and reaches no file.
+    feeders: dict[str, tuple[FeederCall, ...]] = field(default_factory=dict)
 
     @property
     def outputs(self) -> list[Output]:
@@ -775,6 +815,11 @@ class Graph:
             }
         if self.dropped_aliases:
             d["dropped_aliases"] = sorted(self.dropped_aliases)
+        if self.feeders:
+            d["feeders"] = {
+                path: [call.to_dict() for call in calls]
+                for path, calls in self.feeders.items()
+            }
         return d
 
     @classmethod
@@ -887,6 +932,16 @@ class Graph:
             assert isinstance(raw_dropped_aliases, list)
             dropped_aliases = {str(alias) for alias in raw_dropped_aliases}
 
+        raw_feeders = d.get("feeders")
+        feeders: dict[str, tuple[FeederCall, ...]] = {}
+        if raw_feeders is not None:
+            assert isinstance(raw_feeders, dict)
+            for path, calls in raw_feeders.items():
+                assert isinstance(calls, list)
+                feeders[str(path)] = tuple(
+                    FeederCall.from_dict(call) for call in calls if isinstance(call, dict)
+                )
+
         return cls(
             input_paths=[str(p) for p in raw_inputs],
             sources={str(k): int(v) for k, v in raw_sources.items()},
@@ -903,6 +958,7 @@ class Graph:
             module_sources=module_sources,
             url_sources=url_sources,
             dropped_aliases=dropped_aliases,
+            feeders=feeders,
         )
 
 

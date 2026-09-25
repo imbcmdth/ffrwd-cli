@@ -281,6 +281,7 @@ import difflib
 import json
 import math
 import re
+import socket
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Literal, cast
@@ -292,14 +293,17 @@ from ffrwd.errors import ErrorCode, FfrwdError
 from ffrwd.functions import (
     SHARED_ARGUMENT,
     WASM_STREAM_NAMES,
+    WASM_STREAM_TYPES,
     Annotation,
     Parameter,
     WasmFunction,
+    is_number_argument,
     wasm_named_parameter,
 )
 from ffrwd.inputs import render_options
 from ffrwd.inputs import validate_option as validate_input_option
 from ffrwd.ir import (
+    FEEDER_HOST,
     MAX_DISTANCE,
     NO_CHAPTERS,
     NO_METADATA,
@@ -309,6 +313,7 @@ from ffrwd.ir import (
     ROWMERGE,
     ROWS_DOCUMENT,
     Attachment,
+    FeederCall,
     FrameRef,
     Graph,
     ModuleSource,
@@ -320,6 +325,7 @@ from ffrwd.ir import (
     UrlSource,
     UrlSourceRow,
     dedup_inputs,
+    feeder_path,
     is_src,
     src_alias,
     src_parts,
@@ -401,7 +407,7 @@ from ffrwd.probe import (
     track_cues,
 )
 from ffrwd.probe import probe as probe_one_path
-from ffrwd.processes import CLOCK_SIZE, COPY_CODEC, ref_type
+from ffrwd.processes import CLOCK_SIZE, COPY_CODEC, NUT, RAWVIDEO, ref_type
 from ffrwd.registry import DynamicFilter, FilterOption, Registry, SourceFilter
 from ffrwd.sink import (
     CODEC_PARAMS_FLAGS,
@@ -467,6 +473,7 @@ from ffrwd.wasm import (
     WORLDS,
     Described,
     DescribedFunction,
+    Feeder,
     Invoke,
     PacketRead,
     ProbeSource,
@@ -482,6 +489,9 @@ from ffrwd.wasm import (
     input_rows_arms,
     language_tag,
     rows_arms,
+    wire_audio,
+    wire_pix_fmt,
+    wire_sample_fmt,
 )
 from ffrwd.wasm import invoke as wasm_invoke
 from ffrwd.wasm import probe_source as wasm_probe_source
@@ -1547,6 +1557,116 @@ class _Call:
         if self.is_macro:
             return f"{MACRO_NAMESPACE}.{self.name}"
         return self.name
+
+
+@dataclass(frozen=True)
+class _Ports:
+    """What a call's feeders settled about the module's value parameters.
+
+    `bound` is what the port spelling of a feeder wrote: the number, in the
+    parameter the module takes its port in, and `after` is that parameter,
+    which the positionals after the number continue past. `owned` is the
+    port the host picked for a stream in a feeder's place, by parameter: the
+    call may not write it.
+    """
+
+    bound: Mapping[str, exp.Expr] = field(default_factory=dict)
+    after: str | None = None
+    owned: Mapping[str, int] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class _Fed:
+    """A stream written in a feeder's place, which the module reads itself.
+
+    `param` is the parameter the declaration names that place by, and
+    `sources` the FROM items the stream is read off, which is what a feeder
+    group's connection is shared by.
+    """
+
+    feeder: Feeder
+    param: Parameter
+    stream: _Stream
+    sources: frozenset[str]
+    argument: exp.Expr
+
+
+@dataclass(frozen=True)
+class _Feeding:
+    """A call to a module with feeders, read apart.
+
+    `declared` and `call` are the declaration and the call with every
+    feeder taken out: the pads and the values, which the rest of lowering
+    reads as it reads any call. `bound` and `after` are what a port spelling
+    wrote (:class:`_Ports`), and `fed` every stream written in a feeder's
+    place.
+    """
+
+    declared: WasmFunction
+    call: _Call
+    bound: Mapping[str, exp.Expr]
+    after: str | None
+    fed: tuple[_Fed, ...]
+
+
+@dataclass
+class _Connection:
+    """One feeder connection: the streams it carries and the calls reading it.
+
+    `streams` maps each stream as the query wrote it to the stream conformed
+    for the module, in the order they were first fed. `audio_codec` is the
+    pcm its sound travels as, which the first module reading sound here
+    decides.
+    """
+
+    streams: dict[FrameRef, _Stream] = field(default_factory=dict)
+    calls: list[FeederCall] = field(default_factory=list)
+    audio_codec: str = ""
+
+
+# How many picks a free feeder port is given before the compile gives up.
+_PORT_TRIES = 20
+
+
+def free_loopback_port() -> int:
+    """A loopback TCP port nothing holds, with the one above it free too.
+
+    The operating system picks it, and it is released at once for the module
+    to listen on. The port above is checked as well because a module may
+    open a second listener there, as the two instances of ffrwd/switch meet
+    on it.
+    """
+    for _ in range(_PORT_TRIES):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as first:
+            first.bind((FEEDER_HOST, 0))
+            port = int(first.getsockname()[1])
+            if port >= 65535:
+                continue
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as above:
+                try:
+                    above.bind((FEEDER_HOST, port + 1))
+                except OSError:
+                    continue
+        return port
+    raise FfrwdError(
+        ErrorCode.INTERNAL,
+        "no free loopback port for a feeder connection",
+        line=1,
+        col=1,
+        hint="free some loopback ports and compile again",
+    )
+
+
+def _listed_sources(sources: frozenset[str]) -> str:
+    """The FROM items a stream is read off, for a message."""
+    if not sources:
+        return "no FROM item"
+    return " and ".join(f"'{alias}'" for alias in sorted(sources))
+
+
+def _channel_layout(channels: int) -> str:
+    """ffmpeg's name for the default layout of `channels` channels."""
+    return {1: "mono", 2: "stereo"}.get(channels, f"{channels}c")
 
 
 def _namespaced_call(node: exp.Expr) -> exp.Anonymous | None:
@@ -3534,6 +3654,12 @@ class _Lowerer:
         self.data_filter_nodes: list[
             tuple[str, WasmFunction, exp.Expr, exp.Select]
         ] = []
+        # Every feeder connection, by the port it is delivered on, in the
+        # order they were opened (:meth:`_feed`).
+        self._feeds: dict[int, _Connection] = {}
+        # A feeder group's one connection: the FROM items it carries, its
+        # port, and the argument that opened it, for a refusal to point at.
+        self._feeder_groups: dict[str, tuple[frozenset[str], int, exp.Expr]] = {}
         # The refusals this branch's VARIADIC calls deferred by lowering an
         # aggregate over no rows to a NULL cell (:meth:`_variadic_array`).
         self.empty_aggregates: list[FfrwdError] = []
@@ -3868,6 +3994,7 @@ class _Lowerer:
                     attachments=list(self.attachments),
                 )
             ]
+        self._place_feeders()
         self._check_every_packet_filter_placed()
         self._check_every_data_output_read()
         self._check_loudnorm2()
@@ -12771,6 +12898,8 @@ class _Lowerer:
         # A packet sink has no frame interface to read a window over: how many
         # streams of each kind it takes is what it declares, and that is
         # checked against the signature in `_check_sink_shape`.
+        if declared.returns in WASM_STREAM_TYPES:
+            self._check_feeders(declared, described, node, select)
         if not described.packet_sink:
             self._check_stream_arity(declared, described, node, select)
         if declared.emits is not None:
@@ -13107,16 +13236,24 @@ class _Lowerer:
                 hint="a module reading several streams takes one frame off each "
                 "and hands one back; rebuild it with a window and stride of 1",
             )
-        if declared.stream_arity != reads:
+        feeders = len(described.feeders)
+        if declared.stream_arity - feeders != reads:
+            count = declared.stream_arity
+            fed = (
+                f", {feeders} of them {'a feeder' if feeders == 1 else 'feeders'}"
+                if feeders
+                else ""
+            )
+            also = ", and one per feeder it declares," if feeders else ""
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
-                f"function '{declared.name}' declares {declared.stream_arity} "
-                f"stream parameter{'' if declared.stream_arity == 1 else 's'}, "
+                f"function '{declared.name}' declares {count} "
+                f"stream parameter{'' if count == 1 else 's'}{fed}, "
                 f"and the module '{declared.module}' reads {reads}",
                 node,
                 fallback=select,
                 hint=f"declare one {declared.returns} parameter per stream the "
-                f"module reads, {reads} of them, before its value parameters",
+                f"module reads, {reads} of them{also} before its value parameters",
             )
 
     def _check_annotation_schema(
@@ -13200,6 +13337,7 @@ class _Lowerer:
         *,
         first: int,
         params_schema: Mapping[str, object] | None = None,
+        ports: _Ports | None = None,
     ) -> dict[str, object]:
         """The value arguments as the module's own parameters, schema-checked.
 
@@ -13213,7 +13351,9 @@ class _Lowerer:
 
         `params_schema` overrides where that schema is read from, for a call
         whose parameters belong to one FUNCTION of the module rather than to
-        the module's single export.
+        the module's single export. `ports` is what the call's feeders
+        settled: a port the host picked is written here, whatever the
+        declaration's DEFAULT says.
         """
         schema_source = (
             described.params_schema if params_schema is None else params_schema
@@ -13221,17 +13361,22 @@ class _Lowerer:
         properties = schema_source.get("properties")
         known = properties if isinstance(properties, dict) else {}
         self._check_value_param_schemas(declared, known, node, select)
-        written = self._wasm_written(declared, call, node, select, first=first)
+        written = self._wasm_written(declared, call, node, select, first=first, ports=ports)
+        owned = ports.owned if ports is not None else {}
         params: dict[str, object] = {}
         for param in declared.value_params:
             argument = written.get(param.name)
             anchor = argument if argument is not None else node
-            source = argument if argument is not None else param.default
-            if source is None:
-                continue
-            value = self._eval_value(source, env, row, select)
-            if value is None:
-                continue
+            value: RowValue
+            if param.name in owned:
+                value = owned[param.name]
+            else:
+                source = argument if argument is not None else param.default
+                if source is None:
+                    continue
+                value = self._eval_value(source, env, row, select)
+                if value is None:
+                    continue
             schema = known.get(param.name)
             if schema is None:
                 raise _error(
@@ -13254,6 +13399,7 @@ class _Lowerer:
         select: exp.Select,
         *,
         first: int,
+        ports: _Ports | None = None,
     ) -> dict[str, exp.Expr]:
         """Each value parameter the call writes, keyed by name.
 
@@ -13261,10 +13407,17 @@ class _Lowerer:
         order; then each ``name => value`` fills the one it names. A name
         refers to a value parameter the positionals left alone, never to a
         stream (:func:`~ffrwd.functions.wasm_named_parameter`).
+
+        `ports` moves the positionals on for the port spelling of a feeder:
+        the number already wrote the port, so the next positional fills the
+        parameter after it. A port the host owns is written by neither.
         """
         values = declared.value_params
-        written: dict[str, exp.Expr] = {}
+        written: dict[str, exp.Expr] = dict(ports.bound) if ports is not None else {}
         targets = values
+        if ports is not None and ports.after is not None:
+            at = next(i for i, p in enumerate(values) if p.name == ports.after)
+            targets = values[at + 1 :]
         positional = call.args[first:]
         if len(positional) > len(targets):
             count = len(positional)
@@ -13283,8 +13436,13 @@ class _Lowerer:
             param = wasm_named_parameter(declared, named.name, named.value, node, filled)
             written[param.name] = named.value
             filled.append(param)
+        owned = ports.owned if ports is not None else {}
         unfilled = next(
-            (p for p in values if p.default is None and p.name not in written),
+            (
+                p
+                for p in values
+                if p.default is None and p.name not in written and p.name not in owned
+            ),
             None,
         )
         if unfilled is not None:
@@ -13294,6 +13452,19 @@ class _Lowerer:
                 "DEFAULT",
                 node,
                 hint=declared.signature,
+            )
+        for name in owned:
+            taken = written.get(name)
+            if taken is None:
+                continue
+            raise _error(
+                ErrorCode.UDF_ARG_TYPE,
+                f"{declared.name}() writes '{name}', the port its feeder is "
+                "delivered on, beside a stream in the feeder's place",
+                taken,
+                fallback=node,
+                hint=f"leave '{name}' out: the port is picked for the stream. To "
+                "name a port yourself, write the number in the feeder's place",
             )
         return written
 
@@ -13775,7 +13946,26 @@ class _Lowerer:
             pads = self._lower_data_filter(node, declared, described, call, env, select)
             return _scalar(_Stream(ref=pads[0], type="data"))
         kind = declared.stream_kind
+        # The declaration as written: what the module's own parameters are
+        # bound against, and what a message about them quotes.
+        written_as = declared
+        feeding = self._feeding(declared, described, call, env, select)
+        if feeding is not None:
+            declared, call = feeding.declared, feeding.call
         arity = declared.stream_arity
+        # A number where a pad goes: only a feeder's place takes a port.
+        for position, argument in enumerate(call.args[1:arity], start=1):
+            if not is_number_argument(argument):
+                continue
+            param = declared.stream_params[position]
+            raise _error(
+                ErrorCode.UDF_ARG_TYPE,
+                f"{declared.name}() takes {param.type} as its '{param.name}' "
+                "argument, got a number",
+                argument,
+                fallback=node,
+                hint=written_as.signature,
+            )
         # A stream position holding a row column: the rows travel beside the
         # frames a module filters, and there are none here to travel beside.
         rows_written = next(
@@ -13825,8 +14015,21 @@ class _Lowerer:
 
         def build(values: list[object], element: int) -> FrameRef:
             row = tuples[element] if element < len(tuples) else {}
+            fed = feeding.fed if feeding is not None else ()
+            ports = (
+                _Ports(
+                    bound=feeding.bound,
+                    after=feeding.after,
+                    owned={
+                        one.feeder.port_param: self._feeder_port(one, select)
+                        for one in fed
+                    },
+                )
+                if feeding is not None
+                else None
+            )
             params = self._wasm_params(
-                declared,
+                written_as,
                 described,
                 call,
                 node,
@@ -13834,14 +14037,26 @@ class _Lowerer:
                 env,
                 row,
                 first=first,
+                ports=ports,
             )
+            inputs = [_as_ref(values[position]) for position in positions]
             ref = self.ctx.node(
                 declared.module,
                 params,
-                [_as_ref(values[position]) for position in positions],
+                inputs,
                 [kind],
                 reads_annotations=declared.reads is not None,
             )
+            for one in fed:
+                assert ports is not None  # built beside `fed`
+                self._feed(
+                    ports.owned[one.feeder.port_param],
+                    one,
+                    ref,
+                    inputs[0],
+                    written_as,
+                    described,
+                )
             return ref
 
         lowered = self._expand_call(
@@ -13858,6 +14073,326 @@ class _Lowerer:
             rows=self._row_elements(per_row, env),
         )
         return lowered
+
+    # -- feeders --
+
+    def _check_feeders(
+        self,
+        declared: WasmFunction,
+        described: Described,
+        node: exp.Expr,
+        select: exp.Select,
+    ) -> None:
+        """The feeders a module declares against the declaration naming it.
+
+        A feeder is a stream argument the module reads itself: a stream
+        parameter past the first, of the kind the feeder reads, with a
+        number parameter beside it the port goes in. A stream parameter
+        defaulting to NULL is one a call may leave out, and only a feeder
+        may be.
+        """
+        streams = declared.stream_params
+        taken: set[int] = set()
+        for feeder in described.feeders:
+            where = (
+                f"the module '{declared.module}' reads a feeder at stream "
+                f"argument {feeder.input}"
+            )
+            if feeder.input in taken:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"{where} twice",
+                    node,
+                    fallback=select,
+                    hint="rebuild the module declaring each feeder once",
+                )
+            if feeder.input < 1 or feeder.input >= len(streams):
+                count = len(streams)
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"{where}, and function '{declared.name}' declares {count} "
+                    f"stream parameter{'' if count == 1 else 's'}",
+                    node,
+                    fallback=select,
+                    hint="a feeder is a stream parameter after the first, counted "
+                    f"from 0: {declared.signature}",
+                )
+            taken.add(feeder.input)
+            param = streams[feeder.input]
+            if WASM_STREAM_TYPES.get(param.type) != feeder.kind:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"{where}, reading {feeder.kind}, and function "
+                    f"'{declared.name}' takes '{param.name}' there as {param.type}",
+                    node,
+                    fallback=select,
+                    hint=f"declare '{param.name}' as the {feeder.kind} stream the "
+                    "module reads there",
+                )
+            port = next(
+                (p for p in declared.value_params if p.name == feeder.port_param), None
+            )
+            if port is None or port.type != "number":
+                declares = (
+                    "declares no such parameter"
+                    if port is None
+                    else f"declares it as {port.type}"
+                )
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"the module '{declared.module}' takes the port of its feeder "
+                    f"'{param.name}' in '{feeder.port_param}', and function "
+                    f"'{declared.name}' {declares}",
+                    node,
+                    fallback=select,
+                    hint=f"declare '{feeder.port_param} number DEFAULT <port>' "
+                    "among its values",
+                )
+        for position, param in enumerate(streams):
+            if param.default is None or position in taken:
+                continue
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"function '{declared.name}' defaults '{param.name}' to NULL, and "
+                f"the module '{declared.module}' reads it as a pad",
+                node,
+                fallback=select,
+                hint="only a feeder may be left out; drop the DEFAULT",
+            )
+
+    def _feeding(
+        self,
+        declared: WasmFunction,
+        described: Described,
+        call: _Call,
+        env: _Env,
+        select: exp.Select,
+    ) -> _Feeding | None:
+        """What a call writes in its feeders' places, and the call without them.
+
+        A stream there is one the module reads itself, over a connection the
+        host delivers (:meth:`_feed`). A number there is the port, the
+        spelling from before feeders: it fills the port's parameter too, and
+        the positionals after it carry on past that parameter. Nothing
+        there, or NULL, wires nothing, and the port keeps its DEFAULT. None
+        for a module with no feeders.
+        """
+        if not described.feeders:
+            return None
+        streams = declared.stream_params
+        arity = len(streams)
+        by_input = {feeder.input: feeder for feeder in described.feeders}
+        bound: dict[str, exp.Expr] = {}
+        after: str | None = None
+        fed: list[_Fed] = []
+        for position, feeder in sorted(by_input.items()):
+            if position >= len(call.args):
+                continue
+            argument = call.args[position]
+            if isinstance(_unwrap(argument), exp.Null):
+                continue
+            if is_number_argument(argument):
+                bound[feeder.port_param] = argument
+                after = feeder.port_param
+                continue
+            param = streams[position]
+            got = self._classify(argument, env, select)
+            value = self._lower_expr(argument, env, select) if got == feeder.kind else None
+            if value is None or value.is_array or len(value.streams) != 1:
+                if value is not None:
+                    shown = f"{len(value.streams)} of them"
+                elif got in _STREAM_KINDS:
+                    shown = f"a {got} stream"
+                elif got == _UNSUPPORTED_KIND:
+                    shown = "a stream of no kind"
+                else:
+                    shown = "a value"
+                raise _error(
+                    ErrorCode.UDF_ARG_TYPE,
+                    f"{declared.name}() takes '{param.name}' as one {param.type} "
+                    "the module reads itself, or the port it listens on, and its "
+                    f"argument is {shown}",
+                    argument,
+                    fallback=select,
+                    hint=f"pass one {feeder.kind} stream, or a port number: "
+                    f"{declared.signature}",
+                )
+            stream = value.streams[0]
+            fed.append(
+                _Fed(feeder, param, stream, self._stream_sources(stream.ref), argument)
+            )
+        pads = [
+            call.args[position]
+            for position in range(min(arity, len(call.args)))
+            if position not in by_input
+        ]
+        return _Feeding(
+            declared=replace(
+                declared,
+                params=tuple(
+                    param
+                    for position, param in enumerate(declared.params)
+                    if position >= arity or position not in by_input
+                ),
+            ),
+            call=replace(call, args=[*pads, *call.args[arity:]]),
+            bound=bound,
+            after=after,
+            fed=tuple(fed),
+        )
+
+    def _stream_sources(self, ref: FrameRef) -> frozenset[str]:
+        """The FROM items a stream is read off, through every node before it."""
+        found: set[str] = set()
+        stack = [ref]
+        seen: set[FrameRef] = set()
+        while stack:
+            current = stack.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            if is_src(current):
+                found.add(src_alias(current))
+                continue
+            producer = self.graph.nodes.get(current.partition(":")[0])
+            if producer is not None:
+                stack.extend(producer.inputs)
+        return frozenset(found)
+
+    def _feeder_port(self, fed: _Fed, select: exp.Select) -> int:
+        """The port the stream in one feeder's place is delivered on.
+
+        A feeder naming no group has a connection of its own. Every feeder
+        naming one shares ONE connection, which carries one source: a stream
+        read off any other is refused.
+        """
+        group = fed.feeder.group
+        if not group:
+            return self._open_feed()
+        found = self._feeder_groups.get(group)
+        if found is None:
+            port = self._open_feed()
+            self._feeder_groups[group] = (fed.sources, port, fed.argument)
+            return port
+        sources, port, first = found
+        if sources == fed.sources:
+            return port
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"the feeder '{fed.param.name}' reads {_listed_sources(fed.sources)}, "
+            f"and another feeder of the group '{group}' reads "
+            f"{_listed_sources(sources)}: the group shares one connection, which "
+            "carries one source",
+            fed.argument,
+            fallback=select,
+            hint=f"feed every call of the group '{group}' from the FROM item "
+            f"{first.sql(dialect='postgres')} is read off",
+        )
+
+    def _open_feed(self) -> int:
+        """A new feeder connection, on a port of its own."""
+        port = free_loopback_port()
+        while port in self._feeds:
+            port = free_loopback_port()
+        self._feeds[port] = _Connection()
+        return port
+
+    def _feed(
+        self,
+        port: int,
+        fed: _Fed,
+        ref: FrameRef,
+        programme: FrameRef,
+        declared: WasmFunction,
+        described: Described,
+    ) -> None:
+        """Deliver the stream in one feeder's place on `port`, to the call `ref`.
+
+        The stream is conformed to what the module reads its programme in
+        (:meth:`_conformed_feed`), once however many calls of one group it
+        feeds.
+        """
+        connection = self._feeds[port]
+        connection.calls.append(
+            FeederCall(node=ref, function=declared.called, param=fed.param.name)
+        )
+        if fed.stream.ref in connection.streams:
+            return
+        if fed.stream.type == "audio" and not connection.audio_codec:
+            connection.audio_codec = wire_audio(described).codec
+        connection.streams[fed.stream.ref] = _Stream(
+            ref=self._conformed_feed(fed.stream, programme, described),
+            type=fed.stream.type,
+        )
+
+    def _conformed_feed(
+        self, stream: _Stream, programme: FrameRef, described: Described
+    ) -> FrameRef:
+        """`stream` made what the module reads its programme in.
+
+        A picture takes the module's pixel format and, where the programme
+        is an input's own stream and so has a probed size and rate, that
+        size and rate too. Sound takes the module's sample format, and the
+        rate and channel count the module asks for, else the programme's
+        where it was probed.
+        """
+        meta = self._probed_meta(programme)
+        ref = stream.ref
+        if stream.type == "video":
+            if meta is not None and meta.width and meta.height:
+                ref = self.ctx.node(
+                    "scale", {"width": meta.width, "height": meta.height}, [ref], ["video"]
+                )
+            if meta is not None and _parse_rate(meta.fps) is not None:
+                ref = self.ctx.node("fps", {"fps": meta.fps}, [ref], ["video"])
+            return self.ctx.node(
+                "format", {"pix_fmts": wire_pix_fmt(described)}, [ref], ["video"]
+            )
+        wire = wire_audio(described)
+        rate = wire.required_rate or (meta.sample_rate if meta is not None else None)
+        channels = wire.required_channels or (meta.channels if meta is not None else None)
+        args: dict[str, object] = {"sample_fmts": wire_sample_fmt(described)}
+        if rate:
+            args["sample_rates"] = rate
+        if channels:
+            args["channel_layouts"] = _channel_layout(channels)
+        return self.ctx.node("aformat", args, [ref], ["audio"])
+
+    def _probed_meta(self, ref: FrameRef) -> StreamMeta | None:
+        """What the probe said of `ref`, when it is an input's own stream."""
+        if not is_src(ref):
+            return None
+        alias, kind, index = src_parts(ref)
+        result = self.probes.get(alias)
+        if result is None:
+            return None
+        return next((s for s in result.by_type(kind) if s.index == index), None)
+
+    def _place_feeders(self) -> None:
+        """One unit per feeder connection: its streams, video first, as NUT
+        to the loopback port the module listens on."""
+        for port, connection in self._feeds.items():
+            streams = sorted(
+                connection.streams.values(), key=lambda s: 0 if s.type == "video" else 1
+            )
+            options: dict[str, object] = {}
+            if any(s.type == "video" for s in streams):
+                options["video_codec"] = RAWVIDEO
+            if connection.audio_codec:
+                options["audio_codec"] = connection.audio_codec
+            options["format"] = NUT
+            path = feeder_path(port)
+            self.graph.sinks.append(
+                SinkUnit(
+                    outputs=[
+                        Output(ref=s.ref, type=s.type, name=None, metadata={})
+                        for s in streams
+                    ],
+                    path=path,
+                    options=options,
+                )
+            )
+            self.graph.feeders[path] = tuple(connection.calls)
 
     def _lower_data_field(
         self, node: exp.Expr, env: _Env, select: exp.Select
