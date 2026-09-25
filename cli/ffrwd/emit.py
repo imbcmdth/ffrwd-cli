@@ -365,6 +365,9 @@ COPYTS_FLAG = "-copyts"
 # microseconds (:func:`_render_interleave`).
 MAX_INTERLEAVE_DELTA_FLAG = "-max_interleave_delta"
 _DATA_INTERLEAVE_DELTA = 100_000
+# Write each packet out as it is muxed rather than when the output's buffer
+# fills: see :func:`_render_data_flush`.
+FLUSH_PACKETS_FLAG = "-flush_packets"
 
 
 @dataclass
@@ -1097,6 +1100,7 @@ def _render_command(e: Emitted, out_path: str | None, pass_: _Pass | None) -> li
         if group.chapters is not None:
             args += [MAP_CHAPTERS_FLAG, str(group.chapters)]
         args += _render_interleave(group)
+        args += _render_data_flush(group)
         args.append(path)
     return args
 
@@ -1114,6 +1118,22 @@ def _render_interleave(group: OutputGroup) -> list[str]:
     if "data" not in kinds or not kinds & {"video", "audio"}:
         return []
     return [MAX_INTERLEAVE_DELTA_FLAG, str(_DATA_INTERLEAVE_DELTA)]
+
+
+def _render_data_flush(group: OutputGroup) -> list[str]:
+    """``-flush_packets 1`` for a pipe carrying a data stream to the next process.
+
+    A message is a few hundred bytes, and ffmpeg writes an output through a
+    buffer it flushes when full: a pipe carrying messages beside nothing that
+    fills it holds them until the end of the run, while the clock the same
+    process writes to another pipe runs on. The module reading both then sees
+    time pass with no messages, and the late ones land behind what it already
+    wrote. Flushing every packet puts each message on the pipe as it is muxed.
+    A file, or a pipe with no data stream, keeps ffmpeg's buffering.
+    """
+    if group.wire is None or not any(m.type == "data" for m in group.maps):
+        return []
+    return [FLUSH_PACKETS_FLAG, "1"]
 
 
 # input option rendering

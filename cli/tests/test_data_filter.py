@@ -820,6 +820,23 @@ def test_a_data_filters_output_beside_the_picture_waits_on_it_too() -> None:
     assert _argv(plan)[writer.id][-3:] == ["-max_interleave_delta", "100000", "out.nut"]
 
 
+def test_a_pipe_carrying_data_flushes_every_packet_and_a_file_does_not() -> None:
+    """A message sat in ffmpeg's output buffer while the clock it shares a
+    process with ran on: the data filter then saw it after time had passed
+    it (CI, static ffmpeg 8.0.1). Every data packet on a pipe goes out as it
+    is muxed; the clock's pipe and the file keep ffmpeg's buffering."""
+    plan = _plan("COPY (SELECT stamp_both(f.data[1], f.video[1], 'es', 0.5)" + _FROM)
+    argv = _argv(plan)
+    (writer,) = [p for p in plan.ffmpeg if any(u.path == "out.nut" for u in p.graph.sinks)]
+    (feeder,) = [p for p in plan.ffmpeg if p.id != writer.id]
+    tokens = argv[feeder.id]
+    at = tokens.index("-flush_packets")
+    assert tokens[at + 1] == "1"
+    assert tokens[at - 2 : at] == ["-f", "nut"], "on the data pipe's own output"
+    assert tokens.count("-flush_packets") == 1, "not on the clock's pipe"
+    assert "-flush_packets" not in argv[writer.id]
+
+
 def _live(query: str, codec: str) -> ProcessPlan:
     """`query` over one live input whose picture is read as `codec`,
     partitioned the way the compiler does it."""

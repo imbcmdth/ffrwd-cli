@@ -43,6 +43,9 @@ struct State {
     clock: Option<Rational>,
     /// The last `now` seen, in microseconds.
     last_now_us: Option<i64>,
+    /// The pts of the last message written, in microseconds: what a message
+    /// that arrives after time has moved past it is written at instead.
+    last_written_us: Option<i64>,
 }
 
 thread_local! {
@@ -135,6 +138,7 @@ impl Guest for DataStamp {
                 data,
                 clock,
                 last_now_us: None,
+                last_written_us: None,
             })
         });
         Ok(())
@@ -179,6 +183,15 @@ impl Guest for DataStamp {
                 state.last_now_us = Some(state.last_now_us.map_or(now_us, |t| t.max(now_us)));
             }
             written.sort_by_key(|(pts, order, _)| (*pts, *order));
+            // An output's pts never go back: a message that reached this call
+            // after the clock had moved past its own time is written now, at
+            // the last time written, rather than behind it.
+            for (pts, _, _) in &mut written {
+                if let Some(floor) = state.last_written_us {
+                    *pts = (*pts).max(floor);
+                }
+                state.last_written_us = Some(*pts);
+            }
             Ok(Processed {
                 outputs: vec![written
                     .into_iter()
