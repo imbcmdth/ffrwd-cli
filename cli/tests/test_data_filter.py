@@ -286,6 +286,57 @@ def test_a_packet_sources_data_track_is_a_json_data_stream_of_its_alias() -> Non
     ]
 
 
+def test_every_data_track_of_a_sources_row_is_its_own_element() -> None:
+    """A source puts all its data tracks on one row beside its picture and
+    sound: each is `s.data[k]`, in catalog order, one past them refused."""
+    catalog = wasm._source_catalog(
+        "subscribe.wasm",
+        {
+            "bounded": False,
+            "tracks": [
+                {"codec": "h264", "time_base": [1, 90000], "row": 0,
+                 "extradata": "", "format": {"video": {"width": 64, "height": 48}}},
+                {"codec": "aac", "time_base": [1, 48000], "row": 0, "extradata": "",
+                 "format": {"audio": {"sample_rate": 48000, "channels": 2}}},
+                {"codec": "json", "time_base": [1, 1000000], "row": 0,
+                 "extradata": "", "format": {"data": {}}, "rendition": {"name": "deal"}},
+                {"codec": "json", "time_base": [1, 1000000], "row": 0,
+                 "extradata": "", "format": {"data": {}}, "rendition": {"name": "launch"}},
+            ],
+        },
+    )
+    declare = (
+        "CREATE FUNCTION subscribe(relay text) RETURNS source "
+        "AS 'subscribe.wasm', 'subscribe' LANGUAGE wasm;\n"
+    )
+
+    def lowered(columns: str) -> Graph:
+        return lower(
+            resolve(parse(f"{declare}SELECT {columns} FROM subscribe('r') s")),
+            {},
+            registry=_registry(),
+            describes={
+                "subscribe.wasm": Described(
+                    world=WORLDS[-1], name="subscribe", source=True,
+                    params_schema={"properties": {"relay": {"type": "string"}}},
+                )
+            },
+            probe_source=lambda module, params, **_: catalog,
+        )
+
+    graph = lowered("s.video[1], s.audio[1], s.data[1], s.data[2]")
+    (unit,) = graph.sinks
+    assert [o.ref for o in unit.outputs] == [
+        "src:s:v:0", "src:s:a:0", "src:s:d:0", "src:s:d:1",
+    ]
+    with pytest.raises(FfrwdError) as caught:
+        lowered("s.data[3]")
+    assert caught.value.code is ErrorCode.STREAM_NOT_FOUND
+    assert caught.value.message == (
+        "'s.data[3]' does not exist: the rows carry 2 data tracks"
+    )
+
+
 # -- the declaration -------------------------------------------------------
 
 

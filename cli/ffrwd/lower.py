@@ -2960,11 +2960,16 @@ class _TrackRow:
     variant may carry video and audio together — with `stream` staying the
     row's primary one (its first video stream, else its first audio one).
     Empty for every other row kind, unnest rows included.
+
+    `data` holds EVERY data stream of a rendition row, in catalog order: a
+    rung carries one picture and one sound, but a packet source puts all its
+    data tracks on one row.
     """
 
     stream: _Stream
     columns: dict[str, RowValue]
     kinds: dict[StreamType, _Stream] = field(default_factory=dict)
+    data: tuple[_Stream, ...] = ()
 
 
 # What a URL source's row names its input with, the attributes a row MAY
@@ -7518,11 +7523,14 @@ class _Lowerer:
         a URL source -- the rows of one table may come from several inputs.
         """
         kinds: dict[StreamType, _Stream] = {}
+        data: list[_Stream] = []
         for meta in rendition.streams:
-            kinds.setdefault(
-                meta.type,
-                replace(self._source_stream(alias, meta.type, meta.index), rendition=rendition),
+            stream = replace(
+                self._source_stream(alias, meta.type, meta.index), rendition=rendition
             )
+            kinds.setdefault(meta.type, stream)
+            if meta.type == "data":
+                data.append(stream)
         primary = kinds.get("video") or kinds.get("audio") or next(iter(kinds.values()), None)
         return _TrackRow(
             stream=primary if primary is not None else _STREAMLESS_ROW,
@@ -7536,6 +7544,7 @@ class _Lowerer:
                 **rendition.extra,
             },
             kinds=kinds,
+            data=tuple(data),
         )
 
     # -- FROM <source>(<values>) alias: a RETURNS source call --------------
@@ -11521,25 +11530,35 @@ class _Lowerer:
         audio-only rung's video cell is NULL there, not absent -- the same
         gap a FULL JOIN's unmatched row leaves.
 
-        A rendition carries at most one stream of a kind, so only ``[1]``
+        A rendition carries at most one picture and one sound, so only ``[1]``
         can name one per row; every other subscript keeps the reading above,
-        which is where its bounds check lives.
+        which is where its bounds check lives. Data is the exception: every
+        data track of every row is an element, a row's in catalog order.
         """
         kind = _ARRAY_COLUMNS[name]
         per_row = self.manifest is not None or self.row_reading_sink or self.cte_body
         if per_row and index in (None, 1):
             return self._rendition_row_cells(binding, kind)
-        streams = [
-            row.kinds[kind] for row in binding.rows if row is not None and kind in row.kinds
-        ]
+        if kind == "data":
+            streams = [s for row in binding.rows if row is not None for s in row.data]
+        else:
+            streams = [
+                row.kinds[kind]
+                for row in binding.rows
+                if row is not None and kind in row.kinds
+            ]
         if index is None:
             return _array(kind, streams)
         if not 1 <= index <= len(streams):
-            have = f"{len(streams)} row" + ("" if len(streams) == 1 else "s")
+            plural = "" if len(streams) == 1 else "s"
+            have = (
+                f"the rows carry {len(streams)} data track{plural}"
+                if kind == "data"
+                else f"{len(streams)} row{plural} carry a {kind} track"
+            )
             raise _error(
                 ErrorCode.STREAM_NOT_FOUND,
-                f"'{binding.alias}.{name}[{index}]' does not exist: "
-                f"{have} carry a {kind} track",
+                f"'{binding.alias}.{name}[{index}]' does not exist: {have}",
                 anchor,
                 fallback=select,
                 hint=_SUBSCRIPT_HINT,
