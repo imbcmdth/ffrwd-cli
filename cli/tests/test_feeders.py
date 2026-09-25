@@ -323,6 +323,20 @@ def test_a_number_in_the_feeders_place_is_the_port_and_wires_nothing() -> None:
     assert [unit.path for unit in graph.sinks] == ["out.mp4"]
 
 
+@pytest.mark.parametrize(
+    ("written", "port"),
+    [("COALESCE(NULL, 9000)", 9000), ("9000 + 100", 9100), ("COALESCE(9200, 9000)", 9200)],
+)
+def test_an_expression_in_the_feeders_place_is_the_port(written: str, port: int) -> None:
+    """Not only a literal: `COALESCE(:port, 9000)` is how a recipe defaults its
+    port, and 0.20.3 refused it as a stream of no kind."""
+    graph = _lowered(f"COPY (SELECT probe(p.video[1], {written}, 0.5)" + _FROM)
+    (name,) = _module_nodes(graph, PROBE)
+    assert graph.nodes[name].args["port"] == port
+    assert graph.nodes[name].args["lead"] == 0.5
+    assert graph.feeders == {}
+
+
 def test_the_port_spelling_compiles_to_the_argv_it_always_did() -> None:
     """The same call against the declaration from before feeders reads the same."""
     query = "COPY (SELECT probe(p.video[1], 9100, 0.5) FROM input('prog.mp4') p) TO 'out.mp4'"

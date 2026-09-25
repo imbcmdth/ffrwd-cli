@@ -14383,22 +14383,21 @@ class _Lowerer:
             argument = call.args[position]
             if isinstance(_unwrap(argument), exp.Null):
                 continue
-            if is_number_argument(argument):
+            got = self._classify(argument, env, select)
+            # Anything that is not a stream is the port: a literal, a
+            # variable, or an expression over them such as
+            # COALESCE(:port, 9000). The port's own parameter checks it is a
+            # number when the call binds it.
+            if is_number_argument(argument) or got not in _STREAM_KINDS:
                 bound[feeder.port_param] = argument
                 after = feeder.port_param
                 continue
             param = streams[position]
-            got = self._classify(argument, env, select)
             value = self._lower_expr(argument, env, select) if got == feeder.kind else None
             if value is None or value.is_array or len(value.streams) != 1:
-                if value is not None:
-                    shown = f"{len(value.streams)} of them"
-                elif got in _STREAM_KINDS:
-                    shown = f"a {got} stream"
-                elif got == _UNSUPPORTED_KIND:
-                    shown = "a stream of no kind"
-                else:
-                    shown = "a value"
+                shown = (
+                    f"{len(value.streams)} of them" if value is not None else f"a {got} stream"
+                )
                 raise _error(
                     ErrorCode.UDF_ARG_TYPE,
                     f"{declared.name}() takes '{param.name}' as one {param.type} "
