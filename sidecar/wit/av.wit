@@ -528,6 +528,13 @@ interface packet-sink {
   /// on others. `last` marks the final call of the instance's life: it
   /// carries whatever is left, which may be no packets at all, and happens
   /// exactly once.
+  ///
+  /// A call that is not the last may carry no packets on any pad. A module
+  /// runs only inside a call, so a host calls a sink nothing has reached for
+  /// a short while anyway, and one that drives something of its own there -
+  /// a network session - keeps it running between packets. Such a call is
+  /// answered like any other, and a module with nothing to do returns at
+  /// once.
   process: func(pads: list<pad-packets>, last: bool) -> processed;
 }
 

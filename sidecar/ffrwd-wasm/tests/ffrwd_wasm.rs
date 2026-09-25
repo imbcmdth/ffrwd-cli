@@ -4645,6 +4645,56 @@ fn spawn_data_stamp(
 }
 
 #[test]
+fn a_sink_nothing_reaches_is_called_anyway() {
+    // A module runs only inside a call, so a sink whose packets stop is
+    // still called, with none, every fiftieth of a second. packet_tally,
+    // asked to count those turns, says how many came while its input was
+    // held open with one message on it and nothing after.
+    ensure_modules_built();
+    let module = module_path("packet_tally");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ffrwd-wasm"))
+        .args(["-f", "nut", "-i", "-", "-m"])
+        .arg(&module)
+        .args(["-params", r#"{"turns":true}"#, "-f", "ndjson", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ffrwd-wasm");
+    let stdin = child.stdin.take().expect("child stdin");
+    let mut muxer = Muxer::new(stdin, &Stream::json(MICROS)).expect("write the data headers");
+    write_message(&mut muxer, 0, r#"{"n":1}"#);
+    muxer.flush().expect("flush the first message");
+    thread::sleep(Duration::from_millis(600));
+    write_message(&mut muxer, 1_000_000, r#"{"n":2}"#);
+    drop(muxer);
+
+    let finished = child.wait_with_output().expect("wait for ffrwd-wasm");
+    assert!(
+        finished.status.success(),
+        "packet_tally exited with {:?}\nstderr:\n{}",
+        finished.status.code(),
+        String::from_utf8_lossy(&finished.stderr)
+    );
+    let rows: Vec<serde_json::Value> = String::from_utf8_lossy(&finished.stdout)
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("each row is JSON"))
+        .collect();
+    let between = rows
+        .iter()
+        .filter(|row| row.get("turns").is_some() && row["packets"] == 1)
+        .count();
+    // Thirty at a fiftieth of a second; a loaded machine calls less often.
+    assert!(
+        between >= 5,
+        "{between} calls with no packets while the input was quiet:\n{rows:?}"
+    );
+    let last = rows.last().expect("a trailing row");
+    assert_eq!(last["packets"], 2, "the final call counts both messages");
+    assert!(last.get("turns").is_none(), "the final call is no turn");
+}
+
+#[test]
 fn a_message_leaves_while_the_clock_is_still_running() {
     // The clock is fed a frame at a time and held open: the stamped message
     // must be readable in the output while the clock input has not ended,

@@ -28,6 +28,7 @@ use std::io::{self, BufRead, Read, Write};
 use std::panic::resume_unwind;
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use ffrwd_wasm::nut;
@@ -2031,7 +2032,9 @@ fn run(args: &Args) -> Result<()> {
 /// blocking write once the other pads' pipes filled. The queue bound is the
 /// flow control: a stalled consumer stops the producer instead of buffering
 /// it without limit. The wasm instance is called from this thread alone;
-/// only the I/O grows threads.
+/// only the I/O grows threads. A sink nothing has reached for [`SINK_IDLE`]
+/// is called with no packets, so a module running a session inside its
+/// calls keeps it running between them.
 fn run_packet_sink(args: &Args, module: &str, params: &str) -> Result<()> {
     // A packet sink is an exclusive lane by nature: packets reach it in
     // decode order, so one instance reads them and `-jobs` caps nothing.
@@ -2088,13 +2091,15 @@ fn run_packet_sink(args: &Args, module: &str, params: &str) -> Result<()> {
         .collect();
 
     // The last batch of packets rides the final call, which is what the
-    // interface says `last` carries: whatever is left.
+    // interface says `last` carries: whatever is left. A sink nothing has
+    // reached for `SINK_IDLE` is called with empty pads, see there.
+    let mut called = Instant::now();
     let outcome = (|| -> Result<Emitted> {
         loop {
-            let (mut carried, last) = queues.take()?;
+            let (mut carried, last) = queues.take_until(Some(called + SINK_IDLE))?;
             // A heartbeat is no message, and a sink is handed messages alone.
             drop_heartbeats(&mut carried, &data);
-            if !last && carried.iter().all(Vec::is_empty) {
+            if !last && carried.iter().all(Vec::is_empty) && called.elapsed() < SINK_IDLE {
                 continue;
             }
             let emitted = sink.process(&carried, last).with_context(|| {
@@ -2105,6 +2110,7 @@ fn run_packet_sink(args: &Args, module: &str, params: &str) -> Result<()> {
                 };
                 format!("{}: {which}", sink.name())
             })?;
+            called = Instant::now();
             if last {
                 return Ok(emitted);
             }
@@ -2124,6 +2130,20 @@ fn run_packet_sink(args: &Args, module: &str, params: &str) -> Result<()> {
     }
     Ok(())
 }
+
+/// How long a packet sink goes without a call before it is called with no
+/// packets at all. A module runs only inside a host call, and one that drives
+/// something of its own there - a network session, whose acknowledgements
+/// arrive between packets - would otherwise stand still for as long as its
+/// packets do: a stream relayed from elsewhere arrives in lumps a second
+/// apart. A fiftieth of a second is less than one AAC frame, so a sink fed
+/// live sound is called about as often as it already was, and less than a
+/// round trip to a public relay; a call with nothing to do costs a module
+/// microseconds.
+///
+/// A packet filter is not called idle: what it writes is packets, and those
+/// come only with packets.
+const SINK_IDLE: Duration = Duration::from_millis(20);
 
 /// The encoded inputs of a packet filter through ONE instance: packets in,
 /// packets out, with `-rows-in`'s rows arriving beside them.
@@ -3170,6 +3190,12 @@ impl PadQueues {
     /// instead of holding a packet back for the whole run. A pad's stored
     /// read error is raised here, on the drive loop's thread.
     fn take(&self) -> Result<(Vec<Vec<runtime::Packet>>, bool)> {
+        self.take_until(None)
+    }
+
+    /// `take`, giving up at `deadline`: past it, with nothing queued, it
+    /// answers an empty list per pad that is not the last.
+    fn take_until(&self, deadline: Option<Instant>) -> Result<(Vec<Vec<runtime::Packet>>, bool)> {
         let mut state = self.state.lock().expect("a reader panicked with the lock");
         loop {
             if let Some(queue) = state.pads.iter_mut().find(|q| q.failed.is_some()) {
@@ -3181,10 +3207,22 @@ impl PadQueues {
             if state.pads.iter().all(|q| q.closed) {
                 return Ok((vec![Vec::new(); state.pads.len()], true));
             }
+            let Some(deadline) = deadline else {
+                state = self
+                    .filled
+                    .wait(state)
+                    .expect("a reader panicked with the lock");
+                continue;
+            };
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Ok((vec![Vec::new(); state.pads.len()], false));
+            }
             state = self
                 .filled
-                .wait(state)
-                .expect("a reader panicked with the lock");
+                .wait_timeout(state, left)
+                .expect("a reader panicked with the lock")
+                .0;
         }
         let carried = state
             .pads
