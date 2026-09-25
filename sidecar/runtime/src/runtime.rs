@@ -4086,7 +4086,7 @@ impl PacketSink {
 
         instance
             .init(&mut store, inputs, &meta.name, params)?
-            .map_err(|e| anyhow!("{} rejected params: {e}", meta.name))?;
+            .map_err(|e| anyhow!("{} refused to open: {e}", meta.name))?;
 
         Ok(PacketSink {
             store,
@@ -4483,7 +4483,7 @@ impl PacketFilter {
 
         let answered = instance
             .init(&mut store, inputs, &meta.name, params)?
-            .map_err(|e| anyhow!("{} rejected params: {e}", meta.name))?;
+            .map_err(|e| anyhow!("{} refused to open: {e}", meta.name))?;
         if answered.len() != inputs.len() {
             bail!(
                 "{}: opened for {} pad(s) and answered {} output stream(s)",
@@ -5026,7 +5026,7 @@ impl PacketSourceInstance {
                     .ffrwd_av_packet_source()
                     .call_probe(&mut *store, params)
                     .map_err(wasm_err)?
-                    .map_err(|e| anyhow!("{name} rejected params: {e}"))?;
+                    .map_err(|e| anyhow!("{name} refused the probe: {e}"))?;
                 $conv::catalog_from_wit(c, name)
             }};
         }
@@ -5050,7 +5050,7 @@ impl PacketSourceInstance {
                     .ffrwd_av_packet_source()
                     .call_open(&mut *store, params, tracks)
                     .map_err(wasm_err)?
-                    .map_err(|e| anyhow!("{name} rejected params: {e}"))?;
+                    .map_err(|e| anyhow!("{name} refused to open: {e}"))?;
                 $conv::catalog_from_wit(c, name)
             }};
         }
@@ -5447,7 +5447,7 @@ impl DataFilter {
             .ffrwd_av_data_filter()
             .call_init(&mut self.store, &infos, params)
             .map_err(wasm_err)?
-            .map_err(|e| anyhow!("{name} rejected params: {e}"))?;
+            .map_err(|e| anyhow!("{name} refused to open: {e}"))?;
         self.pads = pads.iter().map(|p| p.kind).collect();
         Ok(())
     }
@@ -5753,7 +5753,7 @@ impl RowsModule {
         let meta = instance.describe(&mut store)?.meta;
         instance
             .init(&mut store, params)?
-            .map_err(|e| anyhow!("{} rejected params: {e}", meta.name))?;
+            .map_err(|e| anyhow!("{} refused to open: {e}", meta.name))?;
         Ok(RowsModule {
             store,
             instance,
@@ -5833,7 +5833,7 @@ impl Filter {
 
         instance
             .init(&mut store, format, stream, &meta.name, params)?
-            .map_err(|e| anyhow!("{} rejected params: {e}", meta.name))?;
+            .map_err(|e| anyhow!("{} refused to open: {e}", meta.name))?;
 
         // A per-frame module answers purity only once it is init-ed, and the
         // answer may depend on the parameters it was given.
