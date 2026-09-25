@@ -10,6 +10,7 @@ tests/exec/test_exec_data_filter.py's.
 from __future__ import annotations
 
 import functools
+import json
 from dataclasses import replace
 from pathlib import Path
 
@@ -649,8 +650,22 @@ def test_a_data_stream_is_a_packet_sinks_data_pad_after_its_picture() -> None:
         (False, VideoFormat),
         (True, DataFormat),
     ]
-    # A data pad is no rendition's, so it carries no ``-pad``.
+    # A data pad is no rendition's, so an unnamed one carries no ``-pad``.
     assert [type(pad) for pad in sink.pads] == [PadMeta, type(None)]
+
+
+def test_a_data_columns_alias_names_its_pad() -> None:
+    """The alias is what a sink publishes the stream as: `AS deal` is the
+    track a player looks for. It rides row 0, beside the rows."""
+    plan = _plan(
+        "COPY (SELECT f.video[1], stamp(f.data[1], 'es') AS deal "
+        "FROM input('deal.nut') f) TO publish('r')"
+    )
+    sink = next(s for s in plan.sidecars if s.packet_sink)
+    assert sink.pads[-1] == PadMeta(row=0, name="deal")
+    argv = _argv(plan)[sink.id]
+    flags = [json.loads(argv[i + 1]) for i, token in enumerate(argv) if token == "-pad"]
+    assert flags[-1] == {"row": 0, "rendition": {"name": "deal"}}
 
 
 def test_a_packet_sink_destination_takes_its_values_by_name() -> None:

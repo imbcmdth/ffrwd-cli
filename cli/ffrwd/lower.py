@@ -349,6 +349,7 @@ from ffrwd.parser import (
     ROW_MERGE,
     ROW_PREDICATE,
     ROW_STREAM,
+    SINK_ALIAS,
     SINK_STREAMS,
     RawInputOption,
     RawPacketRows,
@@ -1854,6 +1855,12 @@ def _each(value: object) -> list[object]:
     if value is None:
         return []
     return list(value) if isinstance(value, list) else [value]
+
+
+def _sink_alias(argument: exp.Expr) -> str | None:
+    """The alias a sink call's argument carried as a SELECT column, if any."""
+    written = argument.meta.get(SINK_ALIAS)
+    return written if isinstance(written, str) and written else None
 
 
 def _sink_stream_count(node: exp.Expr, arguments: int) -> int:
@@ -15086,8 +15093,15 @@ class _Lowerer:
             for argument in call.args[:at]
         ]
         # A data stream is no rendition's cell: it rides beside the rows, one
-        # pad of its own, after every picture and sound pad.
-        data = [stream for c in columns if c.value.type == "data" for stream in c.value.streams]
+        # pad of its own, after every picture and sound pad. Its column's
+        # alias, when the query wrote one, is its name: the track a sink
+        # publishes it as.
+        data = [
+            (stream, _sink_alias(argument))
+            for argument, c in zip(call.args[:at], columns, strict=True)
+            if c.value.type == "data"
+            for stream in c.value.streams
+        ]
         columns = [c for c in columns if c.value.type != "data"]
         cardinality = max(len(self.sink_rows), 1)
         rows, _ = self._row_cells(columns, cardinality, node, f"'{declared.name}'")
@@ -15107,8 +15121,10 @@ class _Lowerer:
                 if rendition:
                     entry["rendition"] = rendition
                 meta.append(entry)
-        pads += data
-        meta += [{} for _ in data]
+        pads += [stream for stream, _ in data]
+        meta += [
+            {"row": 0, "rendition": {"name": name}} if name else {} for _, name in data
+        ]
         tuples = env.relation.tuples if env.relation is not None else []
         params = self._wasm_params(
             declared,

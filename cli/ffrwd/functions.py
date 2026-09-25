@@ -112,6 +112,7 @@ from .parser import (
     FILTER_NAMESPACE,
     MACRO_NAMESPACE,
     MERGE_CUES,
+    SINK_ALIAS,
     SINK_STREAMS,
     ModuleExport,
     _check_query_args,
@@ -144,6 +145,7 @@ from .warnings import FfrwdWarning, OnWarning, WarningCode
 __all__ = [
     "NAMEABLE_TYPES",
     "SHARED_ARGUMENT",
+    "SINK_ALIAS",
     "SINK_STREAMS",
     "WASM_DATA",
     "WASM_STREAM_NAMES",
@@ -4173,7 +4175,12 @@ class _Expander:
                     hint="spell out the streams the sink reads: "
                     f"COPY (SELECT <stream>, ...) TO {declared.name}(...)",
                 )
-            items.append(item.this if isinstance(item, exp.Alias) else item)
+            if isinstance(item, exp.Alias):
+                unwrapped = item.this
+                unwrapped.meta[SINK_ALIAS] = item.alias
+                items.append(unwrapped)
+            else:
+                items.append(item)
         line, col = _pos(target)
         call = exp.Anonymous(
             this=declared.name,

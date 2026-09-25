@@ -241,6 +241,7 @@ __all__ = [
     "MAP_COLUMNS",
     "RENDITION_COLUMNS",
     "ROW_SCHEMAS",
+    "SINK_ALIAS",
     "SINK_STREAMS",
     "ROW_STREAM",
     "TAGS_COLUMN",
@@ -3449,6 +3450,10 @@ def _has_input_alias(select: exp.Select, wasm: Mapping[str, WasmFunction]) -> bo
 # out of the COPY's SELECT list. Lowering reads it to tell the streams from
 # the values, which a sink reading an ARRAY of streams cannot do by counting.
 SINK_STREAMS = "sink_streams"
+# Meta key on one of those arguments: the alias its SELECT column carried,
+# which the rewrite unwraps. A sink reads it as the name of what it writes,
+# so `awards.d AS deal` publishes a track called deal.
+SINK_ALIAS = "sink_alias"
 
 
 def _aggregated_columns(projection: exp.Expr | None) -> list[exp.Expr]:
