@@ -44,6 +44,14 @@ in NUT: Matroska and mp4 refuse the stream, and MPEG-TS writes it as
 anonymous binary data with its clock moved, so a COPY of one to any other
 container is refused at compile time.
 
+A data stream a module writes also carries heartbeats: empty packets, no
+bytes at all, each saying time has reached its pts. One goes out when the
+stream opens and one whenever the programme moves on a tenth of a second
+with nothing written, so the ffmpeg reading it opens it at once and never
+waits on the next message to write the picture beside it. ffrwd drops them
+before a module sees one; anything else reading such a file skips its empty
+packets.
+
 ## The record is the stream
 
 A stream record is what filters take and return, what `-map` maps, and
