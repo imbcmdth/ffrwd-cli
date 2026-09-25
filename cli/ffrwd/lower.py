@@ -280,6 +280,7 @@ import base64
 import difflib
 import json
 import math
+import random
 import re
 import socket
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -1676,27 +1677,25 @@ class _LateralUse:
 # How many picks a free feeder port is given before the compile gives up.
 _PORT_TRIES = 20
 
+# Where a feeder port is picked from, the port above it included: below the
+# range the operating system hands outbound connections (49152 up on Windows
+# and macOS, 32768 up on Linux), so none of them can take it between the pick
+# and the module's own listen.
+FEEDER_PORTS = range(20000, 32767)
+
 
 def free_loopback_port() -> int:
     """A loopback TCP port nothing holds, with the one above it free too.
 
-    The operating system picks it, and it is released at once for the module
-    to listen on. The port above is checked as well because a module may
-    open a second listener there, as the two instances of ffrwd/switch meet
-    on it.
+    Picked at random from :data:`FEEDER_PORTS`, checked by binding it, and
+    released at once for the module to listen on. The port above is checked
+    as well because a module may open a second listener there, as the two
+    instances of ffrwd/switch meet on it.
     """
     for _ in range(_PORT_TRIES):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as first:
-            first.bind((FEEDER_HOST, 0))
-            port = int(first.getsockname()[1])
-            if port >= 65535:
-                continue
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as above:
-                try:
-                    above.bind((FEEDER_HOST, port + 1))
-                except OSError:
-                    continue
-        return port
+        port = random.choice(FEEDER_PORTS)
+        if _bindable(port) and _bindable(port + 1):
+            return port
     raise FfrwdError(
         ErrorCode.INTERNAL,
         "no free loopback port for a feeder connection",
@@ -1704,6 +1703,16 @@ def free_loopback_port() -> int:
         col=1,
         hint="free some loopback ports and compile again",
     )
+
+
+def _bindable(port: int) -> bool:
+    """True when a listener could take `port` on the loopback interface now."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        try:
+            probe.bind((FEEDER_HOST, port))
+        except OSError:
+            return False
+    return True
 
 
 def _listed_sources(sources: frozenset[str]) -> str:

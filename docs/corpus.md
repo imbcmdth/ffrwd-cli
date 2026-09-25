@@ -2045,6 +2045,15 @@ $ ffrwd compile -f query.sql
 queue of eighteen. `ffrwd explain` prints the number and the road each
 edge took, under the plan's `edges`.
 
+An encoder where the paths meet counts too. x264 takes in dozens of
+frames before its first packet, and until then the ffmpeg running it
+reads nothing more of its other inputs, so a sound mapped straight
+through beside an encoded picture waits that long on its own pipe.
+The count follows the output's `preset`, `tune` and `codec_params`;
+`tune 'zerolatency'` counts none. A stream that crosses as `-c copy`
+always holds its depth in the pipe, never the fifo muxer, which
+cannot carry the codec tags an MP4 gives its streams.
+
 Both roads block when they fill, and neither drops a frame. A run
 whose paths drift further apart than the bound counted stops with
 `BUFFER_OVERFLOW` naming the edge and the depth it was given - see

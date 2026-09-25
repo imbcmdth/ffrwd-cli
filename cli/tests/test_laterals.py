@@ -266,6 +266,25 @@ def test_a_lateral_over_a_data_stream_is_listed_as_its_own_block() -> None:
     assert not any(line.startswith("# feeder:") for line in shown)
 
 
+def test_the_launch_messages_a_lateral_reads_can_be_published_too() -> None:
+    """The auction writes its launch output once: an ffmpeg copies it both to
+    the host, which starts an instance per message, and to the publisher,
+    which carries it on to the next node down the tree."""
+    publisher = replace(_MODULES[PUBLISH], data_streams="many")
+    query = _LEAF.replace("awards.d AS deal", "awards.d AS deal, awards.launch AS launch")
+    plan = compile_all(
+        _declared(query), describe=lambda path: {**_MODULES, PUBLISH: publisher}[path]
+    ).plan
+    assert plan is not None
+    auction = next(s for s in plan.sidecars if s.module == AUCTION)
+    sink = next(s for s in plan.sidecars if s.packet_sink)
+    (lateral,) = plan.laterals
+    launch = next(e for e in plan.stream_edges if e.source == auction.id and e.ref.endswith(":1"))
+    readers = {e.target for e in plan.stream_edges if e.source == launch.target}
+    assert readers == {lateral.writer, sink.id}
+    assert len([e for e in plan.stream_edges if e.source == auction.id]) == 2
+
+
 def test_a_lateral_rides_the_graph_and_the_plan_whole() -> None:
     graph = _lowered(_LEAF)
     (lateral,) = graph.laterals

@@ -70,8 +70,11 @@ def _require_everything() -> None:
         )
 
 
-def _run(query: str, out: Path) -> list[tuple[float, dict[str, object]]]:
-    """Run `query`, its declarations ahead of it, and read back what it wrote."""
+def _run(
+    query: str, out: Path, stream: str = "d"
+) -> list[tuple[float, dict[str, object]]]:
+    """Run `query`, its declarations ahead of it, and read back what it wrote
+    on its data `stream`."""
     declared = [
         text.format(module=_STAMP.as_posix())
         for name, text in _DECLARE.items()
@@ -81,15 +84,15 @@ def _run(query: str, out: Path) -> list[tuple[float, dict[str, object]]]:
         [*declared, query.format(deal=_DEAL.as_posix(), out=out.as_posix())]
     )
     assert cli.main(["run", sql, "-y", "-q"]) == 0
-    return _messages(out)
+    return _messages(out, stream)
 
 
-def _messages(path: Path) -> list[tuple[float, dict[str, object]]]:
-    """Every message on `path`'s data stream: its time and its object. A
+def _messages(path: Path, stream: str = "d") -> list[tuple[float, dict[str, object]]]:
+    """Every message on `path`'s data `stream`: its time and its object. A
     heartbeat carries only whitespace and is left out."""
     done = subprocess.run(
         [
-            "ffprobe", "-v", "error", "-select_streams", "d",
+            "ffprobe", "-v", "error", "-select_streams", stream,
             "-show_entries", "stream=codec_tag_string:packet=pts_time,data",
             "-show_data", "-of", "json", str(path),
         ],
@@ -182,6 +185,21 @@ def test_two_data_filters_chain(tmp_path: Path) -> None:
         tmp_path / "chained.nut",
     )
     assert found == _stamped("es")
+
+
+def test_one_data_filters_output_reaches_two_readers(tmp_path: Path) -> None:
+    """'root' is written once and read twice: straight into the file, and by
+    a second data filter that sets 'es'. Each of the file's two streams
+    carries every message, at every message's own time."""
+    out = tmp_path / "twice.nut"
+    found = _run(
+        "COPY (WITH w AS (SELECT stamp(f.data[1], 'root') AS r FROM input('{deal}') f) "
+        "SELECT w.r, stamp(w.r, 'es') FROM w) TO '{out}'",
+        out,
+        "d:0",
+    )
+    assert found == _stamped("root")
+    assert _messages(out, "d:1") == _stamped("es")
 
 
 def test_the_messages_ride_beside_the_picture(tmp_path: Path) -> None:

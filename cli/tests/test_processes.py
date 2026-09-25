@@ -31,8 +31,10 @@ from ffrwd.processes import (
     NUT,
     PCM_F32LE,
     PIPE,
+    PIPE_BUFFER_LIMIT,
     RAWVIDEO,
     AudioFormat,
+    EdgeBuffer,
     EffectGrant,
     FfmpegProcess,
     FileEdge,
@@ -44,6 +46,7 @@ from ffrwd.processes import (
     StreamEdge,
     VideoFormat,
     check_spellable,
+    encoder_delay,
     external_ids,
     from_commands,
     is_live,
@@ -1105,14 +1108,18 @@ def test_the_frame_size_picks_which_road_the_depth_takes(
     assert (buffer.size, buffer.packets) == expected
 
 
-def _passthrough_graph() -> Graph:
+def _passthrough_graph(options: dict[str, object] | None = None) -> Graph:
     """A module over the picture, and the sound mapped straight through."""
     g = Graph(input_paths=[LIVE], sources={"a": 0})
     g.nodes["e0"] = Node(
         id="e0", filter="invert", args={}, inputs=["src:a:v:0"], outputs=["video"]
     )
     g.sinks = [
-        SinkUnit(outputs=[_out("e0"), _out("src:a:a:0", "audio")], path="out.mkv")
+        SinkUnit(
+            outputs=[_out("e0"), _out("src:a:a:0", "audio")],
+            path="out.mkv",
+            options=dict(options or {}),
+        )
     ]
     return g
 
@@ -1126,6 +1133,124 @@ def test_a_stream_no_process_filters_crosses_its_pipe_as_a_copy() -> None:
     sound = next(e for e in plan.stream_edges if e.ref == "src:a:a:0")
     assert (sound.source, sound.target) == ("ffmpeg1", "ffmpeg0")
     assert sound.format.codec == COPY_CODEC
+
+
+def test_encoder_delays() -> None:
+    """What each encoder takes in before its first packet, by what the output
+    sets. x264 at 720p runs 22 frame threads, two rows of macroblocks each,
+    and holds its lookahead, a frame per thread past the first, and a sync
+    lookahead of its B-frames plus one; x265 its lookahead and 16 frame
+    threads. zerolatency holds nothing."""
+    cases = {
+        ("libx264", (), 720): 40 + 21 + 4,
+        ("libx264", (("preset", "veryfast"),), 720): 10 + 21 + 4,
+        ("libx264", (("preset", "veryslow"),), 720): 60 + 21 + 9,
+        ("libx264", (("tune", "zerolatency"),), 720): 0,
+        ("libx264", (("codec_params", "tune=zerolatency"),), 720): 0,
+        ("libx264", (("codec_params", "rc-lookahead=0:bframes=0:threads=1"),), 720): 0,
+        ("libx264", (("codec_params", "rc_lookahead=20"),), 1080): 20 + 33 + 4,
+        # No codec named is ffmpeg's default, and no height a 2160-row picture.
+        (None, (), None): 40 + 66 + 4,
+        ("libx265", (), 720): 20 + 16,
+        ("libx265", (("preset", "slower"), ("codec_params", "frame-threads=2")), 720): 40 + 2,
+        ("libx265", (("tune", "zerolatency"),), 720): 0,
+        ("libvpx-vp9", (), 720): 25,
+        ("ffv1", (), 720): 0,
+        (COPY_CODEC, (), 720): 0,
+    }
+
+    assert {
+        case: encoder_delay(case[0], dict(case[1]), case[2]) for case in cases
+    } == cases
+
+
+@pytest.mark.parametrize(
+    ("options", "bound"),
+    [
+        # The frame the sidecar holds, and nothing ffv1 holds of its own.
+        ({"video_codec": "ffv1"}, 1),
+        # And x264's at 360p: 11 frame threads, so 40 + 10 + 4.
+        ({"video_codec": "libx264"}, 1 + 54),
+        ({"video_codec": "libx264", "tune": "zerolatency"}, 1),
+    ],
+)
+def test_the_encoder_a_path_meets_lengthens_it(
+    options: dict[str, object], bound: int
+) -> None:
+    """The encoding ffmpeg reads no more sound until the picture's encoder has
+    the frames it holds back, so the sound's pipe holds those too."""
+    plan = _merged(graph=_passthrough_graph(options))
+    sound = next(e for e in plan.stream_edges if e.ref == "src:a:a:0")
+
+    assert sound.bound == bound
+
+
+def test_a_copied_stream_holds_its_depth_in_a_pipe_sized_by_its_bit_rate() -> None:
+    """Never the fifo muxer: stream copy keeps an MP4's `mp4a` tag and NUT
+    inside the fifo refuses it. 110 frames of 128 kb/s at 30 frames a second
+    is 534 bytes a frame, one 64 KiB step; with no bit rate probed, the most
+    a pipe is given."""
+    probe = _live_probe()
+    sound = replace(probe.streams[1], bitrate=128000)
+    for probed, size in [
+        (ProbeResult(streams=[probe.streams[0], sound], duration=None), 65536),
+        (probe, PIPE_BUFFER_LIMIT),
+    ]:
+        plan = partition(
+            _passthrough_graph({"video_codec": "libx264"}),
+            external=external_ids("e0"),
+            probes={"a": probed},
+            pix_fmts={"invert": "rgba"},
+            shapes={"invert": ModuleShape()},
+        )
+        edge = next(e for e in plan.stream_edges if e.ref == "src:a:a:0")
+        assert edge.buffer == EdgeBuffer("pipe", 110, size=size)
+        argv = plan_argv(
+            plan,
+            sidecar_argv=wasm.shown_argv,
+            pipe_path=lambda edge, side: f"pipes/{edge.source}-{edge.target}-{side}",
+        )
+        assert "fifo" not in argv["ffmpeg1"]
+
+
+@pytest.mark.parametrize(
+    ("window", "bound", "size"),
+    [
+        # 106 frames of 12801 bytes, and 104, both round up to 21 steps of
+        # 64 KiB.
+        (1, 53, 21 * 65536),
+        # 1023 samples read ahead are a part of one picture, counted as one.
+        (1024, 52, 21 * 65536),
+    ],
+)
+def test_sound_waiting_on_an_encoded_picture_is_sized_in_samples(
+    window: int, bound: int, size: int
+) -> None:
+    """The module on the sound this time, and the picture copied straight to
+    x264: the sound's edge into the sidecar holds x264's 54 frames less the
+    one the sidecar holds and what the module reads ahead, each frame a
+    thirtieth of a second of 48 kHz stereo f32, 12801 bytes. A sound module
+    declares its window in samples, not pictures."""
+    g = Graph(input_paths=[LIVE], sources={"a": 0})
+    g.nodes["e0"] = Node(
+        id="e0", filter="again", args={}, inputs=["src:a:a:0"], outputs=["audio"]
+    )
+    g.sinks = [
+        SinkUnit(
+            outputs=[_out("src:a:v:0"), _out("e0", "audio")],
+            path="out.mkv",
+            options={"video_codec": "libx264"},
+        )
+    ]
+    plan = partition(
+        g,
+        external=external_ids("e0"),
+        probes={"a": _live_probe()},
+        shapes={"again": ModuleShape(window=window, stride=window)},
+    )
+    sound = next(e for e in plan.stream_edges if e.ref == "src:a:a:0")
+
+    assert (sound.bound, sound.buffer) == (bound, EdgeBuffer("pipe", bound * 2, size=size))
 
 
 def _rate_changing_graph() -> Graph:

@@ -33,7 +33,7 @@ from ffrwd.compiler import Compiled, compile_all, compile_sql
 from ffrwd.emit import build_ffmpeg_args, emit
 from ffrwd.errors import FfrwdError
 from ffrwd.execute import execute_plan
-from ffrwd.processes import PIPE
+from ffrwd.processes import COPY_CODEC, PIPE
 from ffrwd.project import LOCK_FORMAT_VERSION, discover
 
 pytestmark = pytest.mark.exec
@@ -1130,7 +1130,9 @@ def _span(path: Path, stream: str) -> tuple[float, float]:
         check=False,
     )
     assert done.returncode == 0, done.stderr
-    times = [float(line) for line in done.stdout.split() if line not in ("", "N/A")]
+    # A packet carrying side data, as AAC's first does, prints a field after it.
+    fields = [line.split(",")[0] for line in done.stdout.split()]
+    times = [float(field) for field in fields if field not in ("", "N/A")]
     assert times, f"{path} carries no {stream} packets"
     return times[0], times[-1]
 
@@ -1201,3 +1203,94 @@ def test_the_paced_runs_picture_and_sound_start_and_end_together(
     assert abs(video_end - audio_end) < 0.25, (
         f"the picture ends at {video_end}s and the sound at {audio_end}s"
     )
+
+
+# --- a paced MP4, one lane through a module, the other straight on ---------
+
+# Whichever lane is not filtered crosses from the one paced reader to the
+# encoding ffmpeg as the MP4 holds it, a copy, and MP4 names its streams with
+# tags NUT has no entry for (`mp4a`, `avc1`). The encoding ffmpeg reads
+# nothing more of its other input until x264 has the frames it holds back
+# before its first packet, so the lane that reaches it first waits that long.
+
+_PACED_SECONDS = 3
+_PACED_RATE = 30
+
+
+def _paced_mp4(where: Path, width: int, height: int) -> Path:
+    """A programme as a camera or an encoder would hand it over: H.264 and AAC."""
+    path = where / f"programme-{width}x{height}.mp4"
+    subprocess.run(
+        [
+            "ffmpeg", "-v", "error", "-y",
+            "-f", "lavfi", "-i",
+            f"testsrc2=size={width}x{height}:rate={_PACED_RATE}:duration={_PACED_SECONDS}",
+            "-f", "lavfi", "-i", f"sine=frequency=440:sample_rate=48000:duration={_PACED_SECONDS}",
+            "-map", "0:v", "-map", "1:a", "-c:v", "libx264", "-preset", "veryfast",
+            "-pix_fmt", "yuv420p", "-c:a", "aac", "-ac", "2", str(path),
+        ],
+        check=True,
+        timeout=_SUBPROCESS_TIMEOUT,
+    )
+    return path
+
+
+@pytest.mark.parametrize(
+    ("lane", "size", "encode"),
+    [
+        ("picture", (1280, 720), "video_codec 'libx264'"),
+        ("picture", (1280, 720), "video_codec 'ffv1'"),
+        ("picture", (320, 240), "video_codec 'libx264'"),
+        ("sound", (1280, 720), "video_codec 'libx264'"),
+        ("sound", (1280, 720), "video_codec 'libx264', tune 'zerolatency'"),
+    ],
+)
+def test_a_paced_mp4_through_a_module_into_an_encoder_finishes(
+    tmp_path: Path, lane: str, size: tuple[int, int], encode: str
+) -> None:
+    """One lane through a module, the other mapped straight through, both
+    encoded: the run finishes, with every frame and all of the sound."""
+    if lane == "sound" and not _AGAIN.exists():
+        pytest.skip(f"module missing: {_AGAIN}")
+    width, height = size
+    programme = _paced_mp4(tmp_path, width, height)
+    out_path = tmp_path / "out.mkv"
+    if lane == "picture":
+        declared = (
+            "CREATE FUNCTION invert(v video_stream) RETURNS video_stream\n"
+            f"  AS '{_MODULE.as_posix()}', 'invert' LANGUAGE wasm;\n"
+        )
+        columns = "invert(p.video[1]), p.audio[1]"
+    else:
+        declared = (
+            "CREATE FUNCTION again(a audio_stream) RETURNS audio_stream\n"
+            f"  AS '{_AGAIN.as_posix()}', 'again' LANGUAGE wasm;\n"
+        )
+        columns = "p.video[1], again(p.audio[1])"
+    compiled = compile_all(
+        declared + "COPY (\n"
+        f"  SELECT {columns}\n"
+        f"  FROM input('{programme.as_posix()}', realtime => true) p\n"
+        f") TO '{out_path.as_posix()}' WITH ({encode}, audio_codec 'aac')"
+    )
+    assert compiled.plan is not None
+    straight = next(e for e in compiled.plan.stream_edges if e.format.codec == COPY_CODEC)
+    assert straight.buffer is None or straight.buffer.road == "pipe"
+
+    result = execute_plan(
+        compiled.plan,
+        sidecar_argv=wasm.sidecar_argv,
+        overwrite=True,
+        timeout=_SUBPROCESS_TIMEOUT,
+    )
+    assert result.overflow is None, str(result.overflow)
+    assert result.exit_code == 0, "\n".join(
+        f"{member.id} exited {member.exit_code}: {member.stderr_tail}"
+        for stage in result.stages
+        for member in stage.members
+    )
+    assert not result.timed_out
+    written = _video_stream(out_path)
+    assert int(str(written["nb_read_frames"])) == _PACED_SECONDS * _PACED_RATE
+    _, audio_end = _span(out_path, "a:0")
+    assert audio_end > _PACED_SECONDS - 0.25

@@ -132,8 +132,10 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   declaration may default it to NULL: `video(v video_stream, feed
   video_stream DEFAULT NULL, port number DEFAULT 9000, lead number
   DEFAULT 0.3)`. What the call writes in that place decides the rest:
-  - a stream: the compiler picks a free loopback port, writes it into
-    the port parameter, and an ffmpeg process of its own writes the
+  - a stream: the compiler picks a free loopback port between 20000
+    and 32767, below any port the system hands an outbound connection
+    and with the one above it free too, writes it into the port
+    parameter, and an ffmpeg process of its own writes the
     stream there as NUT, conformed to the module's pixel format (or its
     sample format, rate and channel count) and, where the programme is
     an input's own probed stream, to the programme's size and rate. A
@@ -316,7 +318,9 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   read off one call in one query is one instance. An output goes where
   a data stream goes: into a `.nut` file, into another data filter, or
   to a sink reading data streams as a pad after its video and audio.
-  The module runs in a sidecar of its own, one NUT pipe in per stream
+  An output read in several places, by a run-time lateral and a sink
+  say, is written once and copied to each reader by an ffmpeg of its
+  own. The module runs in a sidecar of its own, one NUT pipe in per stream
   argument and one out per output. A clock pad's picture crosses scaled
   to 16x16, every frame and so every time and next to no pixels; a
   sound clock crosses as pcm. Messages go sidecar to sidecar wherever

@@ -17,7 +17,7 @@ from pathlib import Path
 import pytest
 import sqlglot
 
-from ffrwd import wasm
+from ffrwd import processes, wasm
 from ffrwd.compiler import Compiled, compile_all
 from ffrwd.emit import build_ffmpeg_args, emit
 from ffrwd.errors import ErrorCode, FfrwdError
@@ -661,6 +661,63 @@ def test_two_data_filters_chain_sidecar_to_sidecar() -> None:
     first, second = _filters(plan)
     (between,) = [e for e in plan.stream_edges if e.source == first.id]
     assert (between.target, between.format) == (second.id, DataFormat())
+
+
+_READ_TWICE = (
+    "COPY (WITH w AS (SELECT stamp(f.data[1], 'a') AS s FROM input('deal.nut') f) "
+    "SELECT {} FROM w) TO 'out.nut'"
+)
+
+
+@pytest.mark.parametrize(
+    ("columns", "readers"),
+    [
+        # The destination and a second data filter.
+        ("w.s, stamp(w.s, 'b')", 2),
+        # Two data filters.
+        ("stamp(w.s, 'b'), stamp(w.s, 'c')", 2),
+        # All three.
+        ("w.s, stamp(w.s, 'b'), stamp(w.s, 'c')", 3),
+    ],
+)
+def test_a_data_filters_output_several_processes_read_is_copied_to_each(
+    columns: str, readers: int
+) -> None:
+    """The module writes its output once, and one ffmpeg copies the messages
+    to a pipe per reader: no second instance, which would run it twice."""
+    plan = _plan(_READ_TWICE.format(columns))
+    first = next(s for s in _filters(plan) if s.args.get("node") == "a")
+    (out,) = [e for e in plan.stream_edges if e.source == first.id]
+    relay = out.target
+    onward = [e for e in plan.stream_edges if e.source == relay]
+    assert len({e.target for e in onward}) == len(onward) == readers
+    assert {e.ref for e in onward} == {out.ref}
+    assert all(e.format == DataFormat() for e in [out, *onward])
+    argv = _argv(plan)
+    assert argv[first.id][-3:] == ["-f", "nut", "pipe:1"]
+    copy = ["-map", "0:d:0", "-c:0", "copy", "-f", "nut", "-flush_packets", "1"]
+    assert argv[relay] == [
+        "ffmpeg", "-copyts", "-f", "nut", "-analyzeduration", "0", "-fpsprobesize",
+        "3", "-i", "pipe:0",
+        *(token for e in onward for token in [*copy, f"<{relay}-{e.target} write>"]),
+    ]  # fmt: skip
+
+
+def test_a_modules_messages_still_handed_twice_are_not_called_frames() -> None:
+    """The refusal for a pad two processes read, should a data stream ever
+    reach it, says what the stream carries and does not send the reader off
+    to call a data filter a second time."""
+    graph = _lowered(_READ_TWICE.format("w.s"))
+    partitioner = processes._Partitioner(graph, external_filters(STAMP), _deal())
+    partitioner.run()
+    (sidecar,) = partitioner.sidecars
+    out = next(e for e in partitioner.edges if e.source == sidecar.id)
+    partitioner.edges.append(replace(out, target="elsewhere"))
+    with pytest.raises(FfrwdError) as caught:
+        partitioner._check_handed_once()
+    assert caught.value.message.startswith(f"the messages '{STAMP}' writes are read by")
+    assert "frames" not in caught.value.message
+    assert caught.value.hint is not None and "once per reader" not in caught.value.hint
 
 
 def test_a_structs_outputs_leave_in_the_modules_own_order() -> None:

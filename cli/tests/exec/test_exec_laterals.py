@@ -47,6 +47,7 @@ _CLI_ROOT = Path(__file__).resolve().parent.parent.parent
 _RELEASE = _CLI_ROOT.parent / "sidecar" / "modules" / "target" / "wasm32-wasip2" / "release"
 _PROBE = _RELEASE / "feed_probe.wasm"
 _HEAR = _RELEASE / "feed_probe_audio.wasm"
+_STAMP = _RELEASE / "data_stamp.wasm"
 _LAUNCH = _CLI_ROOT / "tests" / "data" / "launch.nut"
 _TIMEOUT = 120.0
 
@@ -187,3 +188,57 @@ def test_an_instance_of_sound_reaches_a_sound_feeder_in_its_format(
         (48000, 2, "f32")
     }
     assert sum(int(row["samples"]) for row in fed) == 2 * 48000
+
+
+def _data_messages(path: Path) -> list[tuple[float, dict[str, object]]]:
+    """Every message on `path`'s data stream, heartbeats left out."""
+    done = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-select_streams", "d", "-show_entries",
+            "packet=pts_time,data", "-show_data", "-of", "json", str(path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=_TIMEOUT,
+        check=True,
+    )
+    found = []
+    for packet in json.loads(done.stdout)["packets"]:
+        body = b"".join(
+            bytes.fromhex(line.split(":", 1)[1][:41].replace(" ", ""))
+            for line in packet.get("data", "").splitlines()
+            if line.strip()
+        )
+        if body.strip():
+            found.append((float(packet["pts_time"]), json.loads(body)))
+    return found
+
+
+def test_a_data_filters_output_reaches_the_lateral_and_the_file_both(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The launch messages pass through ``data-stamp`` first, and its one
+    output is read twice: by the lateral, which starts an instance per message
+    as ever, and by the file, which gets every message with its node set."""
+    if not _STAMP.exists():
+        pytest.skip(f"module missing: {_STAMP}")
+    programme = _media(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    out = tmp_path / "out.nut"
+    sql = (
+        "CREATE FUNCTION probe(v video_stream, feed video_stream DEFAULT NULL, "
+        "port number DEFAULT 9000) RETURNS video_stream "
+        f"AS '{_PROBE.as_posix()}', 'feed-probe' LANGUAGE wasm;\n"
+        "CREATE FUNCTION stamp(d data_stream, node text) RETURNS data_stream "
+        f"AS '{_STAMP.as_posix()}', 'data_stamp' LANGUAGE wasm;\n" + _PLAY
+        + "COPY (WITH w AS (SELECT stamp(f.data[1], 'leaf') AS s "
+        f"FROM input('{_LAUNCH.as_posix()}') f), "
+        "ads AS (SELECT ad.video FROM w, LATERAL play(w.s) ad) "
+        "SELECT probe(p.video[1], ads.video), w.s "
+        f"FROM input('{programme.as_posix()}', realtime => true) p, ads, w) "
+        f"TO '{out.as_posix()}'"
+    )
+    _check_feeder_rows(_run(sql, capsys))
+    written = _data_messages(out)
+    assert [at for at, _ in written] == [0.1, 0.2, 0.3, 0.5]
+    assert {message["node"] for _, message in written} == {"leaf"}
