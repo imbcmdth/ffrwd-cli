@@ -139,6 +139,7 @@ from .errors import ErrorCode, FfrwdError
 from .ir import is_rows_document
 from .pipes import NamedPipe
 from .processes import (
+    DataFormat,
     FfmpegProcess,
     Process,
     ProcessPlan,
@@ -788,11 +789,13 @@ def wires(plan: ProcessPlan) -> tuple[Wire, ...]:
     for edge in edges:
         incoming[edge.target] = incoming.get(edge.target, 0) + 1
         outgoing[edge.source] = outgoing.get(edge.source, 0) + 1
+    # A process whose rows are the caller's own stdout has none left over.
+    taken = {p.id for p in plan.processes if _writes_rows_to_stdout(p)}
     return tuple(
         Wire(
             edge=edge,
             read_stdio=incoming[edge.target] <= 1,
-            write_stdio=outgoing[edge.source] <= 1,
+            write_stdio=outgoing[edge.source] <= 1 and edge.source not in taken,
         )
         for edge in edges
     )
@@ -848,6 +851,9 @@ def plan_argv(
         )
         outgoing = [e for e in plan.stream_edges if e.source == process.id]
         if isinstance(process, SidecarProcess):
+            # A sidecar's reads are its pads, in the order its module takes
+            # them, whatever order the startup walk put the edges in.
+            incoming.sort(key=lambda edge: _pad_of(process, edge))
             argv[process.id] = _sidecar_args(
                 process,
                 sidecar_argv,
@@ -868,6 +874,14 @@ def plan_argv(
     return _resolve_rows_documents(argv, rows_path)
 
 
+def _pad_of(process: SidecarProcess, edge: StreamEdge) -> int:
+    """Which of `process`'s pads `edge` fills; past them all for one it
+    does not name, which keeps its place among the rest."""
+    return process.inputs.index(edge.ref) if edge.ref in process.inputs else len(
+        process.inputs
+    )
+
+
 def keeps_clock(edge: StreamEdge, plan: ProcessPlan) -> bool:
     """True when `edge`'s timestamps are the plan's clock as they stand.
 
@@ -876,9 +890,11 @@ def keeps_clock(edge: StreamEdge, plan: ProcessPlan) -> bool:
     time. Packets an ffmpeg wrote are not: NUT stores no negative timestamp,
     so a stream with B-frames reaches the pipe shifted by its reorder delay,
     and only the reader's rebase takes that back out. A packet filter hands
-    on whatever clock its own inputs had.
+    on whatever clock its own inputs had. A data stream's messages are timed
+    by the programme they belong beside, whoever wrote them, and have no
+    reorder delay to take out.
     """
-    if not encoded(edge.format):
+    if isinstance(edge.format, DataFormat) or not encoded(edge.format):
         return True
     producer = next(p for p in plan.processes if p.id == edge.source)
     if not isinstance(producer, SidecarProcess):
@@ -929,7 +945,7 @@ def _sidecar_writes(
     own order, which is its catalog order, a packet filter's pads in the same
     order it reads them, and then its rows documents. Everything else hands
     its frames on over the one stdout instead."""
-    several = process.packet_source or process.packet_filter
+    several = process.packet_source or process.packet_filter or process.data_filter
     streams = [write[edge] for edge in outgoing] if several else []
     return streams + _rows_writes(process, plan, write)
 
@@ -1042,7 +1058,8 @@ def _render_listing(plan: ProcessPlan, argv: Mapping[str, list[str]]) -> str:
 
 
 def _listing_header(plan: ProcessPlan) -> str:
-    """One line naming which processes fan in or out over named pipes."""
+    """One line naming which processes fan in or out over named pipes, and
+    which hand a stream on over one because their rows hold stdout."""
     incoming: dict[str, list[str]] = {}
     outgoing: dict[str, list[str]] = {}
     for edge in _pipe_edges(plan):
@@ -1057,6 +1074,11 @@ def _listing_header(plan: ProcessPlan) -> str:
         f"{source} feeds {', '.join(targets)}"
         for source, targets in outgoing.items()
         if len(targets) > 1
+    ]
+    fans += [
+        f"{process.id} writes its rows on stdout"
+        for process in plan.processes
+        if _writes_rows_to_stdout(process) and process.id in outgoing
     ]
     return f"# named pipes: {'; '.join(fans)}"
 
@@ -1281,7 +1303,9 @@ def _sidecar_args(
             "nothing was given to spawn it",
             hint="pass sidecar_argv, which renders one sidecar process as argv",
         )
-    if streams > 1 and not (process.packet_source or process.packet_filter):
+    if streams > 1 and not (
+        process.packet_source or process.packet_filter or process.data_filter
+    ):
         raise FfrwdError(
             ErrorCode.INTERNAL,
             f"process {process.id!r} writes {streams} streams, but only its own "
@@ -1289,7 +1313,9 @@ def _sidecar_args(
             hint="a sidecar writing more than one stream needs argv that can "
             "spell a named pipe path",
         )
-    if len(reads) > 1 and not (process.packet_sink or process.packet_filter):
+    if len(reads) > 1 and not (
+        process.packet_sink or process.packet_filter or process.data_filter
+    ):
         raise FfrwdError(
             ErrorCode.INTERNAL,
             f"process {process.id!r} reads {len(reads)} streams and hosts no "
@@ -1441,8 +1467,9 @@ def _run_stage(
                 else subprocess.DEVNULL
             )
             if _writes_rows_to_stdout(process):
-                # A packet sink's rows are its product, and nothing else in
-                # the plan reads them: they reach the caller's own stdout.
+                # A packet sink's rows are its product, and a data filter's
+                # are its report; nothing else in the plan reads them, so
+                # they reach the caller's own stdout.
                 stdout = None
             # A named pipe this process just made is never a file to protect.
             command = _spawn_argv(
@@ -1834,10 +1861,11 @@ def _cpu_seconds(proc: subprocess.Popen[bytes]) -> float | None:
 
 
 def _writes_rows_to_stdout(process: Process) -> bool:
-    """True for a sink region whose rows name no file: they ride its stdout."""
+    """True for a sink region or a data filter whose rows name no file: they
+    ride its stdout."""
     return (
         isinstance(process, SidecarProcess)
-        and process.sink
+        and (process.sink or process.data_filter)
         and any(
             not document.sink.alias and not document.sink.path
             for document in process.rows

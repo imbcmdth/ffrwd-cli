@@ -5083,7 +5083,24 @@ class _Resolver:
         stream half is the stream that was handed in, so reading it back says
         nothing the query cannot say directly; the rows are the half a field
         read is for, and lowering turns them into a track of their own.
+
+        A data filter's struct is its outputs, each a data stream of its own,
+        and every field of it is one.
         """
+        if declared.is_data_filter:
+            if path in declared.data_fields:
+                return
+            fields = ", ".join(f"'{field}'" for field in declared.data_fields)
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"{declared.name}() returns no field '{path}'",
+                sub,
+                fallback=select,
+                hint=f"it returns {fields}"
+                if fields
+                else f"it returns one {declared.returns}: the call itself is "
+                "the stream",
+            )
         emits = declared.emits
         if emits is None:
             raise _error(

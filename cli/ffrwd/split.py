@@ -139,6 +139,11 @@ def insert_splits(g: Graph) -> Graph:
             return ref
         if ref in exempt:
             return ref  # a repeated bare -map is legal ffmpeg (see docstring)
+        if _ref_type(g, ref) == "data":
+            # No filter splits a data stream: each reader of a source's is its
+            # own map, and a data filter's output is refused a second reader
+            # where the plan is built.
+            return ref
         split_id = split_ids.get(ref)
         if split_id is None:
             ref_type = _ref_type(g, ref)

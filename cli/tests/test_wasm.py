@@ -5265,7 +5265,7 @@ def test_a_probe_track_with_an_unknown_format_arm_is_refused(
     )
     with pytest.raises(FfrwdError) as caught:
         wasm.probe_source(PACKET_SOURCE_MODULE, "{}")
-    assert "neither video nor audio" in caught.value.message
+    assert "neither video, audio nor data" in caught.value.message
 
 
 def test_a_probe_with_tracks_not_a_list_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -5323,7 +5323,7 @@ def test_only_the_world_that_tells_a_source_what_to_pull_hosts_one() -> None:
 
 
 def test_a_packet_filter_needs_the_world_that_carries_one() -> None:
-    assert wasm.WORLDS[-1] == "ffrwd:av@0.16.0"
+    assert wasm.hosts_packet_filter(wasm.WORLDS[-1])
     assert wasm.hosts_packet_filter("ffrwd:av@0.16.0")
     assert not wasm.hosts_packet_filter("ffrwd:av@0.15.0")
     assert not wasm.hosts_packet_filter("ffrwd:av@9.9.9")

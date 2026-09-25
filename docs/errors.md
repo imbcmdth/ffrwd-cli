@@ -721,7 +721,7 @@ COPY (
 {"line": 7, "col": 14, "code": "UNBOUNDED_LIVE_INPUT", "message": "'testsrc2=size=640x360:rate=30' can only be opened once, so one process reads it and hands every other one a pipe -- and two of those paths come back together, with 'fps' between them handing on a different number of frames than it reads", "hint": "the buffer between two such paths is sized from how far one runs ahead of the other, and 'fps' makes that distance uncountable: apply it after the two paths come together rather than before, or record the input to a file and run the query over the file"}
 ```
 
-The anchor is the `input()` path itself, since the input is what constrains the shape. The same code, with a different message, refuses a one-open input whose subtitle or data track a second process would have to read: a pipe between processes carries pictures and sound and nothing else.
+The anchor is the `input()` path itself, since the input is what constrains the shape. The same code, with a different message, refuses a one-open input whose subtitle track a second process would have to read: a pipe between processes carries pictures, sound and data, and no subtitles.
 
 The third message under this code refuses a live input to a packet sink read at compile time ([rows.md](rows.md#packet-rows---ffrwdindexrecordsfvideo1-v)). Such a read copies the stream to the end and binds what the module wrote as a relation, and a stream that never ends has no end to read to:
 

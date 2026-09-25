@@ -280,6 +280,7 @@ from .processes import (
     PIPE,
     QUEUE_SIZE,
     AudioFormat,
+    DataFormat,
     EdgeBuffer,
     StreamFormat,
 )
@@ -358,6 +359,12 @@ ATTACH_FLAG = "-attach"
 # Keep every input's own timestamps instead of rebasing each at its first
 # packet. A global option, so it renders straight after the program name.
 COPYTS_FLAG = "-copyts"
+
+# How long a muxer may hold one stream back waiting on another, and the wait
+# a file carrying a data stream beside media is given: 100 ms, in
+# microseconds (:func:`_render_interleave`).
+MAX_INTERLEAVE_DELTA_FLAG = "-max_interleave_delta"
+_DATA_INTERLEAVE_DELTA = 100_000
 
 
 @dataclass
@@ -1002,8 +1009,11 @@ def _wire_options(wire: StreamFormat, buffer: EdgeBuffer | None = None) -> dict[
     the edge's bound sized. The pipe road is the named pipe's own buffer and
     renders nothing here.
     """
-    if isinstance(wire, AudioFormat):
-        written: dict[str, object] = {"audio_codec": wire.codec, **dict(wire.options)}
+    if isinstance(wire, DataFormat):
+        # A data stream's map already copies it; nothing here is a codec.
+        written: dict[str, object] = {}
+    elif isinstance(wire, AudioFormat):
+        written = {"audio_codec": wire.codec, **dict(wire.options)}
     elif wire.codec == COPY_CODEC:
         # A copied stream keeps the pixel format it was encoded with; naming
         # one would be an instruction to a decoder that never runs.
@@ -1086,8 +1096,24 @@ def _render_command(e: Emitted, out_path: str | None, pass_: _Pass | None) -> li
         args += _render_sink_options(group, pass_)
         if group.chapters is not None:
             args += [MAP_CHAPTERS_FLAG, str(group.chapters)]
+        args += _render_interleave(group)
         args.append(path)
     return args
+
+
+def _render_interleave(group: OutputGroup) -> list[str]:
+    """``-max_interleave_delta`` for a file carrying a data stream beside media.
+
+    A data stream is sparse: its next message may be seconds away, and the
+    muxer holds every other stream back waiting for it, up to ten seconds by
+    default. A message announcing what the picture is about to do has to
+    arrive ahead of that picture, so the wait is cut to a tenth of a second.
+    A file with no data stream, or nothing else beside it, waits on nothing.
+    """
+    kinds = {mapping.type for mapping in group.maps}
+    if "data" not in kinds or not kinds & {"video", "audio"}:
+        return []
+    return [MAX_INTERLEAVE_DELTA_FLAG, str(_DATA_INTERLEAVE_DELTA)]
 
 
 # input option rendering
