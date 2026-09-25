@@ -1416,6 +1416,14 @@ def _check_fanout(nodes: list[Node], g: Graph) -> None:
       what lets both files stream-copy that track. A repeat within ONE group,
       or any pad a filter also consumes, is still a split-pass bug.
 
+    One more that only a partitioned plan writes: a live input's one reader
+    may filter a source stream once and ALSO hand it on untouched down a
+    pipe, each pipe mapping it once. The filtergraph reads the decoded
+    frames and the ``-map`` the demuxed packets, which is legal ffmpeg, and
+    it keeps the handed-on stream a copy. The split pass never leaves this
+    shape in a graph it saw whole; the partition's reader is the only
+    producer.
+
     Real filtergraph pads (``"<node-id>[:<pad>]"``) are consume-once in every
     direction, including across groups: two sinks reading one view's pad must
     have been split.
@@ -1443,13 +1451,18 @@ def _is_passthrough_only(ref: FrameRef) -> bool:
 def _exempt_refs(g: Graph) -> set[FrameRef]:
     """Source refs allowed to keep more than one consumer (see `_check_fanout`).
 
-    Deliberately the same rule ``ffrwd.split._exempt_refs`` applies, stated
+    Deliberately the rule ``ffrwd.split._exempt_refs`` applies, stated
     independently: emit never imports the split pass, it CHECKS its output.
+    The one addition is the live reader's pipe, which no graph the split
+    pass sees has.
     """
+    filtered: dict[FrameRef, int] = {}
+    for node in g.nodes.values():
+        for ref in node.inputs:
+            if is_src(ref):
+                filtered[ref] = filtered.get(ref, 0) + 1
     exempt: set[FrameRef] = set()
-    filtered: set[FrameRef] = {
-        ref for node in g.nodes.values() for ref in node.inputs if is_src(ref)
-    }
+    spoiled: set[FrameRef] = set()
     for unit in g.sinks:
         seen: dict[FrameRef, int] = {}
         for output in unit.outputs:
@@ -1458,12 +1471,13 @@ def _exempt_refs(g: Graph) -> set[FrameRef]:
         for ref, count in seen.items():
             if _is_passthrough_only(ref):
                 exempt.add(ref)
-            elif count == 1 and ref not in filtered:
+            elif count == 1 and (
+                ref not in filtered or (unit.path == PIPE and filtered[ref] == 1)
+            ):
                 exempt.add(ref)
             else:
-                exempt.discard(ref)
-                filtered.add(ref)
-    return exempt
+                spoiled.add(ref)
+    return exempt - spoiled
 
 
 def _count_consumers(nodes: list[Node], outputs: list[Output]) -> dict[str, int]:

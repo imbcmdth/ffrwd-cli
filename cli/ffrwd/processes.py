@@ -190,6 +190,10 @@ CLOCK_SIZE = 16
 # the ones a payload can cut down to the consumers it actually holds.
 SPLIT_FILTERS = frozenset({"split", "asplit"})
 
+# Codecs an input may be read as and no container can hold, so a stream of
+# one is never copied between processes.
+_UNMUXABLE_CODECS = frozenset({"wrapped_avframe"})
+
 # The muxer that queues packets ahead of the real one, and the options that
 # name what it wraps and how deep it goes.
 FIFO = "fifo"
@@ -2740,7 +2744,7 @@ class _Partitioner:
         # format an edge carries is the module's, not the process id's.
         consumer = self._reader(target, ref)
         wire = self._format(ref, consumer)
-        if copy and not isinstance(wire, DataFormat):
+        if copy and not isinstance(wire, DataFormat) and self._copyable(ref):
             # Nothing on the far side filters this stream, so it travels as it
             # arrived: NUT carries the packets and both ends copy them, which
             # is the passthrough the query asked for and not a decode.
@@ -2754,6 +2758,15 @@ class _Partitioner:
                 annotations=self._carries_annotations(ref, consumer),
             )
         )
+
+    def _copyable(self, ref: FrameRef) -> bool:
+        """False for a stream NUT cannot carry as it was read.
+
+        A lavfi graph hands ffmpeg its frames as ``wrapped_avframe``, which no
+        muxer takes: such a stream crosses decoded, as a filtered one does.
+        """
+        meta = self._origin_meta(ref)
+        return meta is None or meta.codec not in _UNMUXABLE_CODECS
 
     def _reader(self, target: str, ref: FrameRef) -> str | None:
         """The node inside sidecar process `target` that reads `ref`, if any."""

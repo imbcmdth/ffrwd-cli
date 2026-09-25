@@ -64,6 +64,9 @@ _DECLARATIONS = {
     "cohort text DEFAULT 'x', viewers number DEFAULT 0) "
     "RETURNS STRUCT(d data_stream, launch data_stream) "
     f"AS '{AUCTION}', 'auction' LANGUAGE wasm;",
+    "sell": "CREATE FUNCTION sell(clock video_stream, every_s number DEFAULT 0) "
+    "RETURNS STRUCT(d data_stream, launch data_stream) "
+    f"AS '{AUCTION}', 'auction' LANGUAGE wasm;",
     "publish": "CREATE FUNCTION publish(relay text) RETURNS sink "
     f"AS '{PUBLISH}', 'publish' LANGUAGE wasm;",
 }
@@ -764,3 +767,65 @@ def test_a_data_filters_output_beside_the_picture_waits_on_it_too() -> None:
     plan = _plan("COPY (SELECT f.video[1], stamp(f.data[1], 'es')" + _FROM)
     (writer,) = [p for p in plan.ffmpeg if any(u.path == "out.nut" for u in p.graph.sinks)]
     assert _argv(plan)[writer.id][-3:] == ["-max_interleave_delta", "100000", "out.nut"]
+
+
+def _live(query: str, codec: str) -> ProcessPlan:
+    """`query` over one live input whose picture is read as `codec`,
+    partitioned the way the compiler does it."""
+    probes: dict[str, ProbeResult | None] = {
+        "f": ProbeResult(
+            streams=[
+                StreamMeta(
+                    type="video", index=0, metadata={}, width=320, height=240,
+                    fps="30/1", sample_rate=None, codec=codec,
+                ),
+            ]
+        )
+    }
+    graph = lower(
+        resolve(parse(_declared(query))),
+        probes,
+        registry=_registry(),
+        describes=_MODULES,
+    )
+    return partition(
+        insert_splits(graph), external=external_filters(*_MODULES), probes=probes
+    )
+
+
+_SELL = "sell(f.video[1], 25)"
+_LAVFI = "input('testsrc2=size=320x240:rate=30', format => 'lavfi') f"
+_PACED = "input('prog.mp4', realtime => true) f"
+
+
+@pytest.mark.parametrize(
+    ("query", "codec"),
+    [
+        (f"COPY (SELECT f.video[1], {_SELL}.d, {_SELL}.launch FROM {_LAVFI}) "
+         "TO 'out.nut'", "wrapped_avframe"),
+        (f"COPY (WITH w AS (SELECT f.video[1] AS v, {_SELL}.d AS d, "
+         f"{_SELL}.launch AS l FROM {_LAVFI}) SELECT w.v, w.d, w.l FROM w) "
+         "TO 'out.nut'", "wrapped_avframe"),
+        (f"COPY (SELECT f.video[1], {_SELL}.d, {_SELL}.launch FROM {_PACED}) "
+         "TO 'out.nut'", "h264"),
+    ],
+)
+def test_a_live_picture_projected_beside_its_own_clock_is_read_once(
+    query: str, codec: str
+) -> None:
+    """The one reader filters the picture into the clock and hands the file
+    the picture itself: copied where it can be, decoded where the input's
+    own codec is none a container holds."""
+    plan = _live(query, codec)
+    argv = _argv(plan)
+    (reader,) = [p for p in plan.ffmpeg if p.graph.input_paths[0] != "pipe:"]
+    (sidecar,) = _filters(plan)
+    handed = {e.target: e for e in plan.stream_edges if e.source == reader.id}
+    assert set(handed) == {sidecar.id, next(p.id for p in plan.ffmpeg if p is not reader)}
+    picture = next(e for t, e in handed.items() if t != sidecar.id)
+    assert isinstance(picture.format, VideoFormat)
+    assert picture.format.codec == ("copy" if codec == "h264" else "rawvideo")
+    rendered = argv[reader.id]
+    assert rendered.count("-i") == 1
+    assert rendered[rendered.index("-filter_complex") + 1].startswith("[0:v:0]scale=")
+    assert rendered.count("0:v:0") == 1  # the bare -map beside the filter's read
