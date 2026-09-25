@@ -43,6 +43,7 @@ members = [
     "source-replay-0160",
     "source-replay-data",
     "data-echo",
+    "data-stamp",
     "source-files",
     "fauxlate",
     "embed-notes",

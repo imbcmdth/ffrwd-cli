@@ -21,7 +21,7 @@ mod scheduler;
 mod subtitles;
 mod windows;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{self, BufRead, Read, Write};
 use std::panic::resume_unwind;
@@ -41,7 +41,7 @@ use network::{Binding, Network};
 const EDGE_FORMAT: &str = "nut";
 const ROWS_FORMAT: &str = "ndjson";
 /// The one data codec the wire carries: a message is one UTF-8 JSON object.
-const DATA_CODEC: &str = "json";
+const DATA_CODEC: &str = runtime::DATA_CODEC;
 /// The `-f` values an output may carry, for a refusal listing them.
 const OUTPUT_FORMATS: [&str; 5] = [EDGE_FORMAT, ROWS_FORMAT, "srt", "webvtt", "null"];
 /// The WIT package a module targets; identifies which host generation built
@@ -957,13 +957,16 @@ fn build_modules(
             bail!("-map [{target}] names a label of a network, and no -filter_complex wires one");
         }
         let path = stream_raws.into_iter().next().expect("one module");
-        // A packet source writes one output per catalog track and a packet
-        // filter one per pad, so the one-output-per-format rule below -
-        // built for a filter's single stream - does not hold for either;
-        // every other module still gets it.
+        // A packet source writes one output per catalog track, a packet
+        // filter one per pad and a data filter one per data stream it
+        // writes, so the one-output-per-format rule below - built for a
+        // filter's single stream - does not hold for any of them; every
+        // other module still gets it.
         let several_streams = ffrwd_wasm_runtime::runtime::exports_packet_source(&path)
             .with_context(|| format!("opening module {path}"))?
             || ffrwd_wasm_runtime::runtime::exports_packet_filter(&path)
+                .with_context(|| format!("opening module {path}"))?
+            || ffrwd_wasm_runtime::runtime::exports_data_filter(&path)
                 .with_context(|| format!("opening module {path}"))?;
         if !several_streams {
             check_one_output_per_format(outputs)?;
@@ -1874,6 +1877,17 @@ fn run(args: &Args) -> Result<()> {
         bail!("no input specified (-i)");
     }
 
+    // A data filter is dispatched before any header is read here, for the
+    // reason a packet sink is: its reader threads open the inputs themselves
+    // and drain them from the first byte.
+    if let Modules::Single { path, params } = &args.modules {
+        let is_data_filter = ffrwd_wasm_runtime::runtime::exports_data_filter(path)
+            .with_context(|| format!("opening module {path}"))?;
+        if is_data_filter {
+            return run_data_filter(args, path, params);
+        }
+    }
+
     // A packet filter is dispatched before any header is read here, for the
     // reason a packet sink is: its reader threads open the inputs themselves
     // and drain them from the first byte.
@@ -2050,29 +2064,7 @@ fn run_packet_sink(args: &Args, module: &str, params: &str) -> Result<()> {
     // with it, which a join would wait on forever.
     let pads = args.inputs.len();
     let queues = Arc::new(PadQueues::new(pads));
-    let (told, headers) = std::sync::mpsc::channel();
-    for (pad, path) in args.inputs.iter().enumerate() {
-        let queues = Arc::clone(&queues);
-        let told = told.clone();
-        let path = path.clone();
-        std::thread::spawn(move || {
-            let opened = (|| {
-                let reader = io::BufReader::with_capacity(1 << 20, open_input(&path)?);
-                // -annotations input is refused above, so the packets are bare.
-                nut::Demuxer::open(reader).context("reading the NUT input")
-            })();
-            match opened {
-                Ok(input) => {
-                    let _ = told.send((pad, Ok(input.stream().clone())));
-                    read_pad(input, pad, &queues, false);
-                }
-                Err(err) => {
-                    let _ = told.send((pad, Err(err)));
-                }
-            }
-        });
-    }
-    drop(told);
+    let headers = spawn_pad_readers(&args.inputs, &queues, false);
 
     // The headers arrive in whatever order the producers start; the module
     // is opened once every pad has reported its stream.
@@ -2192,7 +2184,7 @@ fn run_packet_filter(args: &Args, module: &str, params: &str) -> Result<()> {
     // rows settle before packet one; one pipe among them and none of them
     // wait, since packets never wait on a pipe.
     let rows_from_file =
-        !args.rows_in.is_empty() && args.rows_in.iter().all(|r| rows_are_a_file(&r.path));
+        !args.rows_in.is_empty() && args.rows_in.iter().all(|r| is_a_file(&r.path));
     if args.rows_in.is_empty() {
         rows.close_one();
     }
@@ -2210,28 +2202,7 @@ fn run_packet_filter(args: &Args, module: &str, params: &str) -> Result<()> {
     // producer is not held up by a slow one's warmup or by the module's own
     // open. The threads are not joined - see `run_packet_sink`.
     let queues = Arc::new(PadQueues::new(pads));
-    let (told, headers) = std::sync::mpsc::channel();
-    for (pad, path) in args.inputs.iter().enumerate() {
-        let queues = Arc::clone(&queues);
-        let told = told.clone();
-        let path = path.clone();
-        std::thread::spawn(move || {
-            let opened = (|| {
-                let reader = io::BufReader::with_capacity(1 << 20, open_input(&path)?);
-                nut::Demuxer::open(reader).context("reading the NUT input")
-            })();
-            match opened {
-                Ok(input) => {
-                    let _ = told.send((pad, Ok(input.stream().clone())));
-                    read_pad(input, pad, &queues, false);
-                }
-                Err(err) => {
-                    let _ = told.send((pad, Err(err)));
-                }
-            }
-        });
-    }
-    drop(told);
+    let headers = spawn_pad_readers(&args.inputs, &queues, false);
 
     let mut streams: Vec<Option<nut::Stream>> = (0..pads).map(|_| None).collect();
     for _ in 0..pads {
@@ -2367,6 +2338,378 @@ fn run_packet_filter(args: &Args, module: &str, params: &str) -> Result<()> {
     wrote
 }
 
+/// A data filter through ONE instance: messages on its data pads and the
+/// time on its clock pads in, messages and rows out.
+///
+/// Every `-i` is a NUT, in the order the call names its arguments. A JSON
+/// stream is a DATA pad; a video or audio stream, raw or coded, is a CLOCK
+/// pad, read for its frames' pts alone. Each input is read on a thread of
+/// its own into a bounded queue, the way a packet sink's are.
+///
+/// With a clock pad the module is called once each time the first clock
+/// pad's pts advances, with `now` that pts: the clock is what drives it,
+/// whether or not a message arrived. The messages a call carries are those
+/// that have arrived and are not ahead of the clock - a message at a pts the
+/// clock has not reached waits for it, so a module writing on both its clock
+/// and its messages sees them in programme order. A data pad read from a
+/// regular file is all there to be read, so the clock waits for it to be
+/// read past each frame rather than racing it; a pipe is never waited for,
+/// since a live data stream may say nothing for minutes. Once the first
+/// clock pad has ended the messages are no longer held: each batch that
+/// arrives is a call, `now` staying where the clock stopped. Without a clock
+/// pad every batch that arrives is a call, with no `now`. The final call is
+/// made once every input has ended, and carries whatever is left.
+///
+/// Each output is a JSON NUT in the module's own time base, one `-f nut` per
+/// entry of its `outputs`, written by a thread of its own so a slow reader
+/// of one holds up none of the others. What a call returns is handed to the
+/// writers the moment it returns, and each writes and flushes it at once:
+/// a message may announce something ahead of the media it is about, so it
+/// is never held for a later call or for a buffer to fill. Rows go to an
+/// `-f ndjson` output as a sink's do.
+fn run_data_filter(args: &Args, module: &str, params: &str) -> Result<()> {
+    if args.annotations.input || args.annotations.output {
+        bail!(
+            "a data filter reads and writes data streams, not frames, so -annotations has \
+             nothing to give or take here"
+        );
+    }
+    if args.pads.iter().any(Option::is_some) {
+        bail!("-pad follows a packet sink's -i; {module} is a data filter");
+    }
+
+    // The readers start before anything else, for the reason a packet
+    // sink's do: each drains its own input from the first byte.
+    let pads = args.inputs.len();
+    let queues = Arc::new(PadQueues::new(pads));
+    let headers = spawn_pad_readers(&args.inputs, &queues, true);
+
+    let mut streams: Vec<Option<nut::Stream>> = (0..pads).map(|_| None).collect();
+    for _ in 0..pads {
+        let (pad, stream) = headers.recv().expect("every reader reports its header");
+        streams[pad] = Some(stream.with_context(|| format!("input {pad}"))?);
+    }
+    let mut data_pads = Vec::with_capacity(pads);
+    for (pad, stream) in streams.iter().enumerate() {
+        let stream = stream.as_ref().expect("every pad reported");
+        data_pads.push(data_pad(module, pad, stream)?);
+    }
+    let mut filter = runtime::DataFilter::open(module, &data_pads, params)
+        .with_context(|| format!("opening module {module}"))?;
+
+    let described = filter.described().clone();
+    let mut data_outputs: Vec<&OutputSpec> = Vec::new();
+    let mut row_outputs: Vec<RowOutput> = Vec::new();
+    for output in &args.outputs {
+        match output.kind {
+            OutputKind::Frames => data_outputs.push(output),
+            OutputKind::Rows => row_outputs.push(RowOutput::open(&output.path)?),
+            OutputKind::Null => {}
+            _ => bail!(
+                "{}: a data filter writes data streams and rows; its outputs are \
+                 -f {EDGE_FORMAT}, -f {ROWS_FORMAT} and -f null",
+                output.spelling
+            ),
+        }
+    }
+    if data_outputs.len() != described.outputs.len() {
+        bail!(
+            "{} writes {} data stream(s), and this command gives {} -f {EDGE_FORMAT} output(s)",
+            described.meta.name,
+            described.outputs.len(),
+            data_outputs.len()
+        );
+    }
+
+    // Every output's header goes out before the first call, so a reader
+    // opening it is not left waiting on a message that may be minutes off.
+    let out_base = nut::TimeBase {
+        num: described.time_base.num,
+        den: described.time_base.den,
+    };
+    let mut senders = Vec::with_capacity(data_outputs.len());
+    let mut writers = Vec::with_capacity(data_outputs.len());
+    for output in &data_outputs {
+        let mut muxer = open_frame_output(&output.path, &nut::Stream::json(out_base), false)
+            .with_context(|| format!("opening output {}", output.spelling))?;
+        muxer
+            .flush()
+            .with_context(|| format!("writing output {}", output.spelling))?;
+        let (sender, batches) = mpsc::channel::<Vec<runtime::Packet>>();
+        let spelling = output.spelling.clone();
+        senders.push(sender);
+        writers.push(thread::spawn(move || {
+            write_track(muxer, &batches).with_context(|| format!("writing output {spelling}"))
+        }));
+    }
+
+    let clock = data_pads
+        .iter()
+        .position(|p| p.kind == runtime::PadKind::Clock);
+    let settled = data_pads
+        .iter()
+        .zip(&args.inputs)
+        .map(|(pad, path)| pad.kind == runtime::PadKind::Data && is_a_file(path))
+        .collect();
+    let mut drive = DataDrive::new(&data_pads, settled, clock);
+    let mut sending = true;
+    let outcome = (|| -> Result<()> {
+        loop {
+            let (carried, ended, last) = queues.take_ended()?;
+            let calls = drive.arrive(carried, &ended, last);
+            for call in calls {
+                let processed = filter
+                    .process(&call.input, call.now, call.last)
+                    .with_context(|| {
+                        let which = if call.last {
+                            "the final call"
+                        } else {
+                            "processing messages"
+                        };
+                        format!("{}: {which}", filter.name())
+                    })?;
+                for (index, messages) in processed.outputs.into_iter().enumerate() {
+                    if !messages.is_empty() {
+                        let packets = messages
+                            .into_iter()
+                            .map(|m| runtime::Packet {
+                                pts: m.pts,
+                                dts: Some(m.pts),
+                                duration: None,
+                                keyframe: true,
+                                data: m.data,
+                            })
+                            .collect();
+                        sending &= senders[index].send(packets).is_ok();
+                    }
+                }
+                for writer in &mut row_outputs {
+                    writer.write_batch(&processed.rows)?;
+                }
+            }
+            if last || !sending {
+                return Ok(());
+            }
+        }
+    })();
+    queues.close();
+    outcome?;
+    drop(senders);
+    for writer in &mut row_outputs {
+        writer.flush()?;
+    }
+
+    let mut wrote = Ok(());
+    for writer in writers {
+        let written = writer.join().unwrap_or_else(|panic| resume_unwind(panic));
+        if wrote.is_ok() {
+            wrote = written;
+        }
+    }
+    wrote
+}
+
+/// One argument of a data filter, from the NUT header its input opened with:
+/// a JSON stream is a data pad, and a video or audio stream - raw or coded -
+/// is a clock pad.
+fn data_pad(module: &str, pad: usize, stream: &nut::Stream) -> Result<runtime::DataPad> {
+    let time_base = TimeBase {
+        num: stream.time_base.num,
+        den: stream.time_base.den,
+    };
+    if stream.is_json() {
+        return Ok(runtime::DataPad {
+            kind: runtime::PadKind::Data,
+            codec: DATA_CODEC.to_string(),
+            time_base,
+        });
+    }
+    match stream.media {
+        nut::Media::Video { .. } | nut::Media::Audio { .. } => Ok(runtime::DataPad {
+            kind: runtime::PadKind::Clock,
+            codec: String::new(),
+            time_base,
+        }),
+        nut::Media::Other { .. } => bail!(
+            "{module} reads data streams and clocks, and input {pad} carries a {} stream \
+             tagged {}; a data pad is {DATA_CODEC}, a clock pad video or audio",
+            stream.kind(),
+            stream.fourcc_name()
+        ),
+    }
+}
+
+/// One call a data filter's drive loop makes.
+struct DataCall {
+    /// One list per pad, in pad order; empty for a clock pad.
+    input: Vec<Vec<runtime::Message>>,
+    now: Option<i64>,
+    last: bool,
+}
+
+/// What a data filter's drive loop holds between batches: the messages that
+/// have arrived and not yet been handed over, the clock frames not yet
+/// called for, and where the clock is.
+struct DataDrive {
+    /// Every pad's time base, and whether it is a data pad.
+    pads: Vec<(TimeBase, bool)>,
+    /// The data pads read from a regular file. Their messages are all there
+    /// to be read, so the clock waits for them rather than racing them.
+    settled: Vec<bool>,
+    /// The first clock pad, which drives the calls; None without one.
+    clock: Option<usize>,
+    /// Messages arrived and not yet handed over, per pad, in arrival order.
+    held: Vec<VecDeque<runtime::Message>>,
+    /// The pts of the last message each pad has delivered: how far it has
+    /// been read.
+    read_to: Vec<Option<i64>>,
+    /// Which pads have ended.
+    ended: Vec<bool>,
+    /// The first clock pad's frames not yet called for, by pts.
+    ticks: VecDeque<i64>,
+    /// The first clock pad's latest pts, which is `now`.
+    now: Option<i64>,
+}
+
+impl DataDrive {
+    fn new(pads: &[runtime::DataPad], settled: Vec<bool>, clock: Option<usize>) -> DataDrive {
+        DataDrive {
+            pads: pads
+                .iter()
+                .map(|p| (p.time_base, p.kind == runtime::PadKind::Data))
+                .collect(),
+            settled,
+            clock,
+            held: pads.iter().map(|_| VecDeque::new()).collect(),
+            read_to: vec![None; pads.len()],
+            ended: vec![false; pads.len()],
+            ticks: VecDeque::new(),
+            now: None,
+        }
+    }
+
+    /// Takes one batch off the queues and answers the calls it makes, in
+    /// order. `ended` says which pads have ended by this batch, and `last`
+    /// that every one has, in which case the final call is among those
+    /// answered.
+    fn arrive(
+        &mut self,
+        carried: Vec<Vec<runtime::Packet>>,
+        ended: &[bool],
+        last: bool,
+    ) -> Vec<DataCall> {
+        for (pad, packets) in carried.into_iter().enumerate() {
+            if self.pads[pad].1 {
+                if let Some(packet) = packets.last() {
+                    self.read_to[pad] = Some(packet.pts);
+                }
+                self.held[pad].extend(packets.into_iter().map(|p| runtime::Message {
+                    pts: p.pts,
+                    data: p.data,
+                }));
+            } else if Some(pad) == self.clock {
+                self.ticks.extend(packets.into_iter().map(|p| p.pts));
+            }
+        }
+        self.ended.copy_from_slice(ended);
+
+        let mut calls = Vec::new();
+        while let Some(&pts) = self.ticks.front() {
+            // A call is made as the clock advances; a frame at or behind the
+            // last one moves nothing.
+            if self.now.is_some_and(|now| pts <= now) {
+                self.ticks.pop_front();
+                continue;
+            }
+            if !self.caught_up(pts) {
+                break;
+            }
+            self.ticks.pop_front();
+            self.now = Some(pts);
+            let input = self.release(Some(pts));
+            calls.push(DataCall {
+                input,
+                now: Some(pts),
+                last: false,
+            });
+        }
+        // Once the clock has ended, nothing is held for it any more.
+        let clock_done = self
+            .clock
+            .is_none_or(|clock| self.ended[clock] && self.ticks.is_empty());
+        if clock_done {
+            let input = self.release(None);
+            if input.iter().any(|m| !m.is_empty()) {
+                calls.push(DataCall {
+                    input,
+                    now: self.now,
+                    last: false,
+                });
+            }
+        }
+        if last {
+            // The final call rides the last one this batch made, or is one
+            // of its own when the batch made none.
+            match calls.last_mut() {
+                Some(call) => call.last = true,
+                None => calls.push(DataCall {
+                    input: self.release(None),
+                    now: self.now,
+                    last: true,
+                }),
+            }
+        }
+        calls
+    }
+
+    /// Whether every data pad read from a file has been read past `now` on
+    /// the first clock pad's clock, or has ended: until it has, a message it
+    /// has yet to deliver may belong before that frame.
+    fn caught_up(&self, now: i64) -> bool {
+        let Some(clock) = self.clock.map(|clock| self.pads[clock].0) else {
+            return true;
+        };
+        (0..self.pads.len())
+            .filter(|pad| self.settled[*pad] && !self.ended[*pad])
+            .all(|pad| {
+                self.read_to[pad].is_some_and(|pts| !not_after(pts, self.pads[pad].0, now, clock))
+            })
+    }
+
+    /// The held messages up to `now` on the first clock pad's clock, one
+    /// list per pad, or all of them without one. A pad's messages leave in
+    /// the order they arrived, so one ahead of the clock holds back those
+    /// behind it too.
+    fn release(&mut self, now: Option<i64>) -> Vec<Vec<runtime::Message>> {
+        let clock_base = self.clock.map(|clock| self.pads[clock].0);
+        let mut released: Vec<Vec<runtime::Message>> = Vec::with_capacity(self.held.len());
+        for (pad, held) in self.held.iter_mut().enumerate() {
+            let base = self.pads[pad].0;
+            let mut out = Vec::new();
+            while let Some(message) = held.front() {
+                let due = match (now, clock_base) {
+                    (Some(now), Some(clock)) => not_after(message.pts, base, now, clock),
+                    _ => true,
+                };
+                if !due {
+                    break;
+                }
+                out.push(held.pop_front().expect("front is some"));
+            }
+            released.push(out);
+        }
+        released
+    }
+}
+
+/// Whether `pts` in `base` is at or before `now` in `clock`, compared
+/// exactly: `pts * base` against `now * clock` as fractions of a second.
+fn not_after(pts: i64, base: TimeBase, now: i64, clock: TimeBase) -> bool {
+    let left = i128::from(pts) * i128::from(base.num) * i128::from(clock.den);
+    let right = i128::from(now) * i128::from(clock.num) * i128::from(base.den);
+    left <= right
+}
+
 /// How many buffered bytes the rows reader may hold before it waits for the
 /// drive loop to drain. Rows are small beside packets, and a megabyte holds
 /// thousands of them - enough that the reader stays ahead of a filter that
@@ -2494,11 +2837,12 @@ impl RowsQueue {
     }
 }
 
-/// Whether `-rows-in` names a REGULAR FILE, whose rows are all written and
-/// waiting to be read. A pipe, a named pipe and stdin are not: nothing says
-/// when their rows arrive. `metadata` answers at once for all of them, where
-/// opening a pipe blocks until its writer arrives.
-fn rows_are_a_file(path: &InputPath) -> bool {
+/// Whether an input - a `-rows-in`, or a data filter's `-i` - names a
+/// REGULAR FILE, whose contents are all written and waiting to be read. A
+/// pipe, a named pipe and stdin are not: nothing says when what they carry
+/// arrives. `metadata` answers at once for all of them, where opening a pipe
+/// blocks until its writer arrives.
+fn is_a_file(path: &InputPath) -> bool {
     match path {
         InputPath::Stdin => false,
         InputPath::File(p) if is_named_pipe(p) => false,
@@ -2630,6 +2974,8 @@ struct PadQueue {
     bytes: usize,
     /// The pad's input ended; set after its last packet is queued.
     closed: bool,
+    /// Whether a `take_ended` has handed over the end of this pad already.
+    reported: bool,
     /// The pad's read failed; the drive loop raises it.
     failed: Option<anyhow::Error>,
 }
@@ -2716,6 +3062,53 @@ impl PadQueues {
         let last = state.pads.iter().all(|q| q.closed);
         self.drained.notify_all();
         Ok((carried, last))
+    }
+
+    /// `take`, for a drive loop that also has to know WHICH pads have ended:
+    /// everything queued so far, and per pad whether its input has ended with
+    /// it. It returns when a pad has packets or a pad has newly ended, so a
+    /// pad closing is seen as it happens rather than with the next packet
+    /// anywhere. The flag says every pad has ended, as `take`'s does.
+    fn take_ended(&self) -> Result<(Vec<Vec<runtime::Packet>>, Vec<bool>, bool)> {
+        let mut state = self.state.lock().expect("a reader panicked with the lock");
+        loop {
+            if let Some(queue) = state.pads.iter_mut().find(|q| q.failed.is_some()) {
+                return Err(queue.failed.take().expect("found by is_some"));
+            }
+            let newly_ended = state.pads.iter().any(|q| q.closed && !q.reported);
+            if newly_ended
+                || state.pads.iter().any(|q| !q.packets.is_empty())
+                || state.pads.iter().all(|q| q.closed)
+            {
+                break;
+            }
+            state = self
+                .filled
+                .wait(state)
+                .expect("a reader panicked with the lock");
+        }
+        let mut carried = Vec::with_capacity(state.pads.len());
+        let mut ended = Vec::with_capacity(state.pads.len());
+        for queue in state.pads.iter_mut() {
+            queue.bytes = 0;
+            carried.push(std::mem::take(&mut queue.packets));
+            // Closed is set only once the last packet is queued, so a pad
+            // closed now has handed over everything it will.
+            queue.reported |= queue.closed;
+            ended.push(queue.closed);
+        }
+        let last = ended.iter().all(|e| *e);
+        self.drained.notify_all();
+        Ok((carried, ended, last))
+    }
+
+    /// One pad's read failed: the drive loop raises it, and the pad has
+    /// ended.
+    fn fail(&self, pad: usize, error: anyhow::Error) {
+        let mut state = self.state.lock().expect("the drive loop holds no panic");
+        state.pads[pad].failed = Some(error);
+        state.pads[pad].closed = true;
+        self.filled.notify_one();
     }
 
     /// The drive loop is done, normally or not: wake every waiting reader
@@ -2806,13 +3199,123 @@ enum PadRead {
     Clock,
 }
 
+/// What a pad's reader opens: its input, with the bytes its header was
+/// peeked from put back in front.
+struct Replayed {
+    head: io::Cursor<Vec<u8>>,
+    rest: InputReader,
+}
+
+impl Read for Replayed {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if (self.head.position() as usize) < self.head.get_ref().len() {
+            return self.head.read(buf);
+        }
+        self.rest.read(buf)
+    }
+}
+
+/// One pad's demuxed input, as its reader opens it.
+type PadInput = nut::Demuxer<io::BufReader<Replayed>>;
+
+/// The header of the stream an input carries, read the moment it arrives,
+/// and the input with every byte still in it.
+///
+/// A NUT reader cannot finish opening a stream until its first frame, which
+/// is what ends the header section; for a data stream that may be minutes
+/// off, and a module opened only once every pad has reported would wait on
+/// it with the other pads' producers blocked behind their full queues. The
+/// header itself is there at once. None where the input reaches its frames
+/// or its end with no header for its stream, which opening it properly then
+/// refuses by name.
+fn peek_stream(mut reader: InputReader) -> Result<(Option<nut::Stream>, Replayed)> {
+    let mut core = nut::PushDemuxer::new(nut::Limits::default());
+    let mut seen = Vec::new();
+    let mut scratch = vec![0u8; 64 * 1024];
+    let header = loop {
+        match core.next_event().context("reading the NUT input")? {
+            Some(nut::Event::StreamHeader { index: 0, stream }) => break Some(stream),
+            Some(nut::Event::EndOfHeaders | nut::Event::Frame { .. } | nut::Event::EndOfInput) => {
+                break None
+            }
+            Some(_) => continue,
+            None => {}
+        }
+        let read = match reader.read(&mut scratch) {
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            read => read.context("reading the NUT input")?,
+        };
+        if read == 0 {
+            core.finish();
+        } else {
+            core.feed(&scratch[..read]);
+            seen.extend_from_slice(&scratch[..read]);
+        }
+    };
+    let replayed = Replayed {
+        head: io::Cursor::new(seen),
+        rest: reader,
+    };
+    Ok((header, replayed))
+}
+
+/// One reader thread per input, each opening its own input and pumping it
+/// into `queues` from the first byte - see `run_packet_sink` for why. Each
+/// reports its stream's header on the channel returned: a data stream's the
+/// moment it arrives, see `peek_stream`, and any other once its input has
+/// opened, since an aac stream's own is only settled by its first packet.
+/// A failure after a header has been reported is that pad's read failure,
+/// raised by the drive loop. `clock` says the pads that are not data streams
+/// are read for their times alone.
+fn spawn_pad_readers(
+    inputs: &[InputPath],
+    queues: &Arc<PadQueues>,
+    clock: bool,
+) -> mpsc::Receiver<(usize, Result<nut::Stream>)> {
+    let (told, headers) = mpsc::channel();
+    for (pad, path) in inputs.iter().enumerate() {
+        let queues = Arc::clone(queues);
+        let told = told.clone();
+        let path = path.clone();
+        thread::spawn(move || {
+            let (header, replayed) = match open_input(&path).and_then(peek_stream) {
+                Ok(peeked) => peeked,
+                Err(err) => {
+                    let _ = told.send((pad, Err(err)));
+                    return;
+                }
+            };
+            let early = header.filter(nut::Stream::is_json);
+            if let Some(stream) = &early {
+                let _ = told.send((pad, Ok(stream.clone())));
+            }
+            let reader = io::BufReader::with_capacity(1 << 20, replayed);
+            // -annotations input is refused wherever a pad is read, so the
+            // packets are bare.
+            match nut::Demuxer::open(reader).context("reading the NUT input") {
+                Ok(input) => {
+                    if early.is_none() {
+                        let _ = told.send((pad, Ok(input.stream().clone())));
+                    }
+                    read_pad(input, pad, &queues, clock);
+                }
+                Err(err) if early.is_some() => queues.fail(pad, err),
+                Err(err) => {
+                    let _ = told.send((pad, Err(err)));
+                }
+            }
+        });
+    }
+    headers
+}
+
 /// One pad's reader: blocking reads off its own input, each packet into the
 /// pad's queue, waiting whenever the queue is over its byte bound. Decode
 /// order per pad is preserved by construction - one thread, one queue.
 ///
 /// A JSON stream is read as messages. Any other stream is read as packets,
 /// or, where `clock` says the pad is a clock, as its times alone.
-fn read_pad(mut input: Input, pad: usize, queues: &PadQueues, clock: bool) {
+fn read_pad(mut input: PadInput, pad: usize, queues: &PadQueues, clock: bool) {
     let mode = if input.stream().is_json() {
         PadRead::Messages
     } else if clock {
@@ -2874,10 +3377,7 @@ fn read_pad(mut input: Input, pad: usize, queues: &PadQueues, clock: bool) {
                 return;
             }
             Err(error) => {
-                let mut state = queues.state.lock().expect("the drive loop holds no panic");
-                state.pads[pad].failed = Some(error);
-                state.pads[pad].closed = true;
-                queues.filled.notify_one();
+                queues.fail(pad, error);
                 return;
             }
         }
@@ -3477,6 +3977,17 @@ struct Description {
     /// Whether the module exports a rows module: no stream at all, rows in
     /// and out of one call. False for every module built before 0.14.0.
     rows_module: bool,
+    /// Whether the module exports a data filter: data streams in and out,
+    /// with clock pads for time. False for every module built before 0.17.0.
+    data_filter: bool,
+    /// The codec of each data stream a data filter writes, in output order:
+    /// one `-f nut` output each. Present only for a data filter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data_outputs: Option<Vec<String>>,
+    /// The unit a data filter's outputs count pts in, as `[num, den]`.
+    /// Present only for a data filter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data_time_base: Option<[u64; 2]>,
     /// The schema of the row a rows module reads on `process`. `null` for a
     /// module that is not one; present and possibly empty for one that is -
     /// `rows_schema` above is what it emits, this is what it reads.
@@ -3570,6 +4081,8 @@ fn describe_module(module_path: &str) -> Result<String> {
         .with_context(|| format!("describing {module_path}"))?;
     let has_rows_module = ffrwd_wasm_runtime::runtime::exports_rows_module(module_path)
         .with_context(|| format!("describing {module_path}"))?;
+    let has_data_filter = ffrwd_wasm_runtime::runtime::exports_data_filter(module_path)
+        .with_context(|| format!("describing {module_path}"))?;
 
     let has_frames = has_filter || has_window;
     if !has_frames
@@ -3578,6 +4091,7 @@ fn describe_module(module_path: &str) -> Result<String> {
         && !has_packet_filter
         && !has_source
         && !has_rows_module
+        && !has_data_filter
     {
         let exports = ffrwd_wasm_runtime::runtime::exports(module_path)?;
         if exports.is_empty() {
@@ -3585,7 +4099,7 @@ fn describe_module(module_path: &str) -> Result<String> {
         }
         bail!(
             "{module_path} exports neither a filter, a packet sink, a packet filter, a packet \
-             source, a rows module, nor value functions; it exports {}",
+             source, a rows module, a data filter, nor value functions; it exports {}",
             exports.join(", ")
         );
     }
@@ -3638,6 +4152,26 @@ fn describe_module(module_path: &str) -> Result<String> {
             }
         );
     }
+    // A data filter reads and writes data streams, which no other stream
+    // interface does; like a rows module, it may share only `values`.
+    if has_data_filter
+        && (has_frames || has_packet || has_packet_filter || has_source || has_rows_module)
+    {
+        bail!(
+            "{module_path} exports a data filter alongside {}; a module is one or the other",
+            if has_frames {
+                "a frame interface"
+            } else if has_packet {
+                "a packet sink"
+            } else if has_packet_filter {
+                "a packet filter"
+            } else if has_source {
+                "a packet source"
+            } else {
+                "a rows module"
+            }
+        );
+    }
 
     let mut description = Description {
         world: WIT_WORLD,
@@ -3666,6 +4200,9 @@ fn describe_module(module_path: &str) -> Result<String> {
         packet_filter: false,
         source: false,
         rows_module: false,
+        data_filter: false,
+        data_outputs: None,
+        data_time_base: None,
         input_rows_schema: None,
         inputs: 1,
         feeders: None,
@@ -3815,6 +4352,24 @@ fn describe_module(module_path: &str) -> Result<String> {
         description.version = Some(meta.version);
         description.name = Some(meta.name);
         description.rows_module = true;
+    }
+
+    if has_data_filter {
+        let described = ffrwd_wasm_runtime::runtime::describe_data_filter(module_path)
+            .with_context(|| format!("describing {module_path}"))?;
+        let meta = described.meta;
+        description.params_schema = Some(parse_schema(
+            &meta.params_schema,
+            &meta.name,
+            "params_schema",
+        )?);
+        description.rows_schema = Some(parse_schema(&meta.rows_schema, &meta.name, "rows_schema")?);
+        description.rows_language = meta.rows_language;
+        description.version = Some(meta.version);
+        description.name = Some(meta.name);
+        description.data_outputs = Some(described.outputs);
+        description.data_time_base = Some([described.time_base.num, described.time_base.den]);
+        description.data_filter = true;
     }
 
     if has_values {
@@ -4140,7 +4695,7 @@ mod rows_queue_tests {
     use std::fs::File;
     use std::sync::Arc;
 
-    use super::{read_rows, rows_are_a_file, InputPath, InputReader, RowsQueue};
+    use super::{is_a_file, read_rows, InputPath, InputReader, RowsQueue};
 
     /// A path of this test's own, removed first so a rerun starts clean.
     fn scratch(name: &str) -> std::path::PathBuf {
@@ -4184,16 +4739,14 @@ mod rows_queue_tests {
         let path = scratch("real.ndjson");
         std::fs::write(&path, "{}\n").expect("write the rows");
         let named = path.to_str().expect("a UTF-8 path").to_string();
-        assert!(rows_are_a_file(&InputPath::File(named)));
+        assert!(is_a_file(&InputPath::File(named)));
 
         // Nothing says when a pipe's rows arrive, and stdin is a pipe by
         // another name, so neither is waited for.
-        assert!(!rows_are_a_file(&InputPath::Stdin));
-        assert!(!rows_are_a_file(&InputPath::File(
-            r"\\.\pipe\rows".to_string()
-        )));
+        assert!(!is_a_file(&InputPath::Stdin));
+        assert!(!is_a_file(&InputPath::File(r"\\.\pipe\rows".to_string())));
         // Nor is a path with nothing behind it: the reader raises that.
-        assert!(!rows_are_a_file(&InputPath::File(
+        assert!(!is_a_file(&InputPath::File(
             scratch("absent.ndjson")
                 .to_str()
                 .expect("a UTF-8 path")

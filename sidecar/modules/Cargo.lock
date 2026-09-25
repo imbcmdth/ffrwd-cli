@@ -445,6 +445,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "data-stamp"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "wit-bindgen 0.57.1",
+]
+
+[[package]]
 name = "depth"
 version = "0.1.0"
 dependencies = [

@@ -60,7 +60,9 @@
 //! world has the arm, so a module built against one is adapted as reading
 //! none and refused a data stream by name. A windowed module of the same
 //! world also declares its `feeders`, the arguments it reads itself; every
-//! older one is adapted as having none.
+//! older one is adapted as having none. The same world adds `data-filter`,
+//! messages in and messages out with clock pads for time, hosted by
+//! [`DataFilter`] beside [`PacketFilter`].
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -3504,6 +3506,9 @@ fn check_packet_export(component: &Component, module_path: &str) -> Result<()> {
     );
 }
 
+/// The one data codec this host carries: a message is one UTF-8 JSON object.
+pub const DATA_CODEC: &str = "json";
+
 /// The worlds whose `coded-format` has a data arm, so a module built against
 /// one can be handed a data stream at all.
 const DATA_WORLDS: &[&str] = &["0.17.0"];
@@ -5232,6 +5237,299 @@ impl PacketSource {
             );
         }
         Ok(Some(pads))
+    }
+}
+
+/// What one argument of a data filter's call is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PadKind {
+    /// A data stream: its messages reach the module.
+    Data,
+    /// A video or audio stream read for its clock alone.
+    Clock,
+}
+
+/// One argument of a data filter's call, as `init` is told it.
+#[derive(Debug, Clone)]
+pub struct DataPad {
+    pub kind: PadKind,
+    /// For a data pad, its codec; empty for a clock pad.
+    pub codec: String,
+    /// The unit a data pad's pts, or a clock pad's `now`, is counted in.
+    pub time_base: TimeBase,
+}
+
+/// One message on a data stream: for codec "json", one UTF-8 JSON object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Message {
+    pub pts: i64,
+    pub data: Vec<u8>,
+}
+
+/// What a data filter publishes without being opened for any stream.
+#[derive(Debug, Clone)]
+pub struct DescribedDataFilter {
+    pub meta: Meta,
+    /// The codec of each data stream it writes, in output order.
+    pub outputs: Vec<String>,
+    /// The unit the outputs' pts are counted in.
+    pub time_base: TimeBase,
+    /// The wit package version the module was built against.
+    pub world: &'static str,
+}
+
+/// What one data-filter call produced.
+#[derive(Debug, Clone, Default)]
+pub struct DataProcessed {
+    /// The messages written, one list per output in output order, each in
+    /// pts order.
+    pub outputs: Vec<Vec<Message>>,
+    pub rows: Vec<String>,
+}
+
+/// Whether the component at `module_path` exports the data-filter
+/// interface: data streams in and out, with clock pads for time. The
+/// interface arrived in 0.17.0, so no earlier world answers.
+pub fn exports_data_filter(module_path: &str) -> Result<bool> {
+    let component = compile(module_path)?;
+    Ok(world_exporting(&component, "data-filter").is_some())
+}
+
+/// Errors naming the component's actual exports when the data-filter
+/// interface is missing. The interface is new in 0.17.0, so there is nothing
+/// older to adapt.
+fn check_data_filter_export(component: &Component, module_path: &str) -> Result<()> {
+    if world_exporting(component, "data-filter").is_some() {
+        return Ok(());
+    }
+    let wanted = interface("data-filter", WORLD);
+    let exports = component_exports(component);
+    if exports.is_empty() {
+        bail!("{module_path} exports nothing, so not {wanted}");
+    }
+    bail!(
+        "{module_path} does not export {wanted}; it exports {}",
+        exports.join(", ")
+    );
+}
+
+/// Compiles and instantiates the component at `module_path` against the
+/// data-filter world. Shared by `describe_data_filter` and `DataFilter::open`.
+fn instantiate_data_filter(
+    module_path: &str,
+    purpose: Purpose,
+) -> Result<(Store<Host>, world_0170::data_filter::DataFilterModule)> {
+    let component = compile(module_path)?;
+    check_data_filter_export(&component, module_path)?;
+
+    let (linker, nn) = link(&component, module_path, purpose)?;
+
+    let policy = egress::net_policy()?;
+    let wasi = wasi_ctx(granted(module_path)?, policy);
+    let mut store = Store::new(
+        engine(),
+        Host {
+            wasi,
+            table: ResourceTable::new(),
+            nn,
+            http: WasiHttpCtx::new(),
+            hooks: egress::Hooks::new(policy),
+        },
+    );
+    let instance =
+        world_0170::data_filter::DataFilterModule::instantiate(&mut store, &component, &linker)
+            .map_err(wasm_err)
+            .with_context(|| format!("instantiating {module_path}"))?;
+    Ok((store, instance))
+}
+
+/// The data filter's own `describe()`, read before it is opened.
+fn data_filter_description(
+    instance: &world_0170::data_filter::DataFilterModule,
+    store: &mut Store<Host>,
+) -> Result<DescribedDataFilter> {
+    let d = instance
+        .ffrwd_av_data_filter()
+        .call_describe(&mut *store)
+        .map_err(wasm_err)?;
+    let meta = world_0170::meta(d.meta);
+    let time_base = conv_0170::time_base_from_rational(d.time_base, &meta.name)?;
+    Ok(DescribedDataFilter {
+        meta,
+        outputs: d.outputs,
+        time_base,
+        world: WORLD,
+    })
+}
+
+/// Compiles and instantiates the component at `module_path` far enough to
+/// call the data filter's `describe()`, without opening it.
+pub fn describe_data_filter(module_path: &str) -> Result<DescribedDataFilter> {
+    let (mut store, instance) = instantiate_data_filter(module_path, Purpose::Describe)?;
+    data_filter_description(&instance, &mut store)
+}
+
+/// One instantiated data filter: messages on its data pads and the time on
+/// its clock pads in, messages and rows out. Single-threaded by contract,
+/// like [`PacketFilter`].
+pub struct DataFilter {
+    store: Store<Host>,
+    instance: world_0170::data_filter::DataFilterModule,
+    described: DescribedDataFilter,
+    /// Every pad's kind, in `open`'s order.
+    pads: Vec<PadKind>,
+    /// The last pts each output wrote, for the check that it never steps
+    /// back.
+    last_pts: Vec<Option<i64>>,
+    /// Whether the final call has been made, which may happen once.
+    finished: bool,
+}
+
+impl DataFilter {
+    /// Compiles (cached process-wide by path) and instantiates the component
+    /// at `module_path`, then calls `init` with every argument of the call in
+    /// order. Every data pad and every output must be a codec the wire
+    /// carries, which is `json` alone.
+    pub fn open(module_path: &str, pads: &[DataPad], params: &str) -> Result<DataFilter> {
+        use world_0170::data_filter::exports::ffrwd::av::data_filter as wit;
+        let (mut store, instance) = instantiate_data_filter(module_path, Purpose::Run)?;
+        let described = data_filter_description(&instance, &mut store)?;
+        let name = described.meta.name.clone();
+        if let Some(codec) = described.outputs.iter().find(|c| *c != DATA_CODEC) {
+            bail!(
+                "{name} writes {codec}, and the only data stream this host carries is {DATA_CODEC}"
+            );
+        }
+        let mut infos = Vec::with_capacity(pads.len());
+        for pad in pads {
+            if pad.kind == PadKind::Data && pad.codec != DATA_CODEC {
+                bail!(
+                    "{name} was handed a {} data stream, and the only one this host carries is \
+                     {DATA_CODEC}",
+                    pad.codec
+                );
+            }
+            let (num, den) = pad.time_base.rational(&name)?;
+            infos.push(wit::PadInfo {
+                kind: match pad.kind {
+                    PadKind::Data => wit::PadKind::Data,
+                    PadKind::Clock => wit::PadKind::Clock,
+                },
+                codec: pad.codec.clone(),
+                time_base: world_0170::video::ffrwd::av::types::Rational { num, den },
+            });
+        }
+        instance
+            .ffrwd_av_data_filter()
+            .call_init(&mut store, &infos, params)
+            .map_err(wasm_err)?
+            .map_err(|e| anyhow!("{name} rejected params: {e}"))?;
+        let outputs = described.outputs.len();
+        Ok(DataFilter {
+            store,
+            instance,
+            described,
+            pads: pads.iter().map(|p| p.kind).collect(),
+            last_pts: vec![None; outputs],
+            finished: false,
+        })
+    }
+
+    /// What the module published, read once at open.
+    pub fn described(&self) -> &DescribedDataFilter {
+        &self.described
+    }
+
+    /// Module name from `describe()`, for error messages.
+    pub fn name(&self) -> &str {
+        &self.described.meta.name
+    }
+
+    /// One call: `input` is the messages that arrived since the last one,
+    /// a list per pad in `open`'s order - empty for a clock pad and for a
+    /// data pad nothing reached - and `now` the time on the first clock pad,
+    /// none when the call has none. `last` marks the final call, which
+    /// happens once.
+    ///
+    /// The module is handed one entry per DATA pad, in pad order. What it
+    /// answers is checked: one list per output, and no output's pts ever
+    /// stepping back, within a call or across calls.
+    pub fn process(
+        &mut self,
+        input: &[Vec<Message>],
+        now: Option<i64>,
+        last: bool,
+    ) -> Result<DataProcessed> {
+        use world_0170::data_filter::exports::ffrwd::av::data_filter as wit;
+        let name = self.described.meta.name.clone();
+        if self.finished {
+            bail!("{name}: called again after the final call, which happens once");
+        }
+        if input.len() != self.pads.len() {
+            bail!(
+                "{name}: opened for {} pad(s) and handed {}",
+                self.pads.len(),
+                input.len()
+            );
+        }
+        self.finished = last;
+
+        let carried: Vec<wit::PadMessages> = input
+            .iter()
+            .enumerate()
+            .filter(|(pad, _)| self.pads[*pad] == PadKind::Data)
+            .map(|(pad, messages)| wit::PadMessages {
+                pad: pad as u32,
+                messages: messages
+                    .iter()
+                    .map(|m| wit::Message {
+                        pts: m.pts,
+                        data: m.data.clone(),
+                    })
+                    .collect(),
+            })
+            .collect();
+        let produced = self
+            .instance
+            .ffrwd_av_data_filter()
+            .call_process(&mut self.store, &carried, now, last)
+            .map_err(wasm_err)?
+            .map_err(|e| anyhow!("{name}: {e}"))?;
+        if produced.outputs.len() != self.last_pts.len() {
+            bail!(
+                "{name}: publishes {} output(s) and answered {}",
+                self.last_pts.len(),
+                produced.outputs.len()
+            );
+        }
+        let mut outputs = Vec::with_capacity(produced.outputs.len());
+        for (index, messages) in produced.outputs.into_iter().enumerate() {
+            for message in &messages {
+                if let Some(before) = self.last_pts[index] {
+                    if message.pts < before {
+                        bail!(
+                            "{name}: output {index} wrote a message at pts {} after one at \
+                             {before}; an output's pts never decrease",
+                            message.pts
+                        );
+                    }
+                }
+                self.last_pts[index] = Some(message.pts);
+            }
+            outputs.push(
+                messages
+                    .into_iter()
+                    .map(|m| Message {
+                        pts: m.pts,
+                        data: m.data,
+                    })
+                    .collect(),
+            );
+        }
+        Ok(DataProcessed {
+            outputs,
+            rows: produced.rows,
+        })
     }
 }
 
