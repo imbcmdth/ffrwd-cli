@@ -1074,6 +1074,19 @@ def test_the_signatures_a_package_exports_are_readable_without_a_query(tmp_path:
     assert [signature.export.name for signature in signatures] == ["tracks.sql", "tracks.sql"]
 
 
+def test_a_wasm_export_returning_a_struct_lists_the_struct(tmp_path: Path) -> None:
+    manifest = _project(
+        tmp_path,
+        files={
+            "src/ortb.sql": "CREATE FUNCTION sell(clock video_stream, every_s number) "
+            "RETURNS STRUCT(d data_stream, launch data_stream) "
+            "AS 'sell.wasm', 'sell' LANGUAGE wasm;\n"
+        },
+    )
+    (signature,) = package_signatures(read_manifest(manifest))
+    assert signature.returns == "STRUCT(d data_stream, launch data_stream)"
+
+
 def test_reading_the_signatures_of_a_broken_lib_file_is_refused(tmp_path: Path) -> None:
     manifest = _project(tmp_path, files={"src/tracks.sql": QUIETER + "SELECT 1;"})
     with pytest.raises(FfrwdError) as caught:

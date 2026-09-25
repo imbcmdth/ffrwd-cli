@@ -2625,11 +2625,19 @@ def package_signatures(package: Package) -> tuple[Signature, ...]:
             package=package.name,
             name=exported,
             params=scope[exported].params,
-            returns=scope[exported].returns,
+            returns=_written_returns(scope[exported]),
             export=path,
         )
         for exported, path in package.exports.items()
     )
+
+
+def _written_returns(function: _Function | WasmFunction) -> str:
+    """The return type as the declaration wrote it: a wasm function's struct
+    whole, where its `returns` names only the stream."""
+    if isinstance(function, WasmFunction):
+        return function.written_returns
+    return function.returns
 
 
 def package_sources(package: Package) -> dict[str, str]:
