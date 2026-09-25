@@ -96,6 +96,7 @@ from __future__ import annotations
 
 import heapq
 import json
+import math
 import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -2172,8 +2173,12 @@ class _Partitioner:
     def _shape(self, name: str) -> ModuleShape:
         return self.shapes.get(self.g.nodes[name].filter, ModuleShape())
 
-    def _lookahead(self, members: Sequence[str]) -> int:
-        """The region's declared latency: the longest lookahead path through it."""
+    def _lookahead(self, members: Sequence[str], *, frames: bool = False) -> int:
+        """The region's declared latency: the longest lookahead path through it.
+
+        In what each module declares, or with `frames` set, in frames of the
+        bound (:meth:`_frames_ahead`).
+        """
         inside = set(members)
         best: dict[str, int] = {}
         for name in members:  # topological
@@ -2185,8 +2190,38 @@ class _Partitioner:
                 ),
                 default=0,
             )
-            best[name] = above + self._shape(name).lookahead
+            ahead = self._frames_ahead(name) if frames else self._shape(name).lookahead
+            best[name] = above + ahead
         return max(best.values(), default=0)
+
+    def _frames_ahead(self, name: str) -> int:
+        """Module `name`'s lookahead in frames of the bound.
+
+        A picture module declares its window in pictures. A sound module
+        declares it in samples, which at its rate last only a part of one
+        picture of the input: counted as the pictures they span, rounded up.
+        """
+        node = self.g.nodes[name]
+        ahead = self._shape(name).lookahead
+        if not ahead or "audio" not in node.outputs:
+            return ahead
+        wire = self.audio_wires.get(node.filter)
+        rate = (wire.required_rate or wire.rate) if wire is not None else None
+        if rate is None and node.inputs:
+            meta = self._origin_meta(node.inputs[0])
+            rate = meta.sample_rate if meta is not None else None
+        seconds = self._picture_seconds(node.inputs[0]) if node.inputs else None
+        if not rate or seconds is None:
+            return ahead
+        return math.ceil(ahead / rate / seconds)
+
+    def _picture_seconds(self, ref: FrameRef) -> float | None:
+        """How long one picture of the input `ref` comes from lasts, or None
+        where that input has no picture with a rate."""
+        origin = self._origin(ref)
+        probe = self.probes.get(origin[0]) if origin is not None else None
+        pictures = probe.by_type("video") if probe is not None else []
+        return next((found for s in pictures if (found := _frame_seconds(s.fps))), None)
 
     # -- the depth bound
 
@@ -2199,8 +2234,7 @@ class _Partitioner:
         """
         node = self.g.nodes[name]
         if self.external.get(name, False):
-            shape = self._shape(name)
-            return shape.lookahead if shape.one_to_one else None
+            return self._frames_ahead(name) if self._shape(name).one_to_one else None
         if node.filter in SPLIT_FILTERS:
             return 0
         if node.filter in RATE_CHANGING_FILTERS:
@@ -2253,7 +2287,7 @@ class _Partitioner:
             members = self.members[pid]
             if any(self._node_delay(name) is None for name in members):
                 return None
-            return 1 + region.lookahead
+            return 1 + self._lookahead(members, frames=True)
         process = next((p for p in self.pending if p.id == pid), None)
         if process is None:
             return None
@@ -2501,13 +2535,7 @@ class _Partitioner:
         wire = edge.format
         if isinstance(wire, VideoFormat) and wire.codec == RAWVIDEO:
             return _picture_bytes(wire)
-        origin = self._origin(edge.ref)
-        probe = self.probes.get(origin[0]) if origin is not None else None
-        pictures = probe.by_type("video") if probe is not None else []
-        seconds = next(
-            (found for s in pictures if (found := _frame_seconds(s.fps))),
-            LONGEST_FRAME_SECONDS,
-        )
+        seconds = self._picture_seconds(edge.ref) or LONGEST_FRAME_SECONDS
         if _copies(wire):
             meta = self._origin_meta(edge.ref)
             if meta is None or not meta.bitrate:

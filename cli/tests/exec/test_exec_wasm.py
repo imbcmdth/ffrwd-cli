@@ -1236,16 +1236,17 @@ def _paced_mp4(where: Path, width: int, height: int) -> Path:
 
 
 @pytest.mark.parametrize(
-    ("lane", "size", "codec"),
+    ("lane", "size", "encode"),
     [
-        ("picture", (1280, 720), "libx264"),
-        ("picture", (1280, 720), "ffv1"),
-        ("picture", (320, 240), "libx264"),
-        ("sound", (1280, 720), "libx264"),
+        ("picture", (1280, 720), "video_codec 'libx264'"),
+        ("picture", (1280, 720), "video_codec 'ffv1'"),
+        ("picture", (320, 240), "video_codec 'libx264'"),
+        ("sound", (1280, 720), "video_codec 'libx264'"),
+        ("sound", (1280, 720), "video_codec 'libx264', tune 'zerolatency'"),
     ],
 )
 def test_a_paced_mp4_through_a_module_into_an_encoder_finishes(
-    tmp_path: Path, lane: str, size: tuple[int, int], codec: str
+    tmp_path: Path, lane: str, size: tuple[int, int], encode: str
 ) -> None:
     """One lane through a module, the other mapped straight through, both
     encoded: the run finishes, with every frame and all of the sound."""
@@ -1254,20 +1255,23 @@ def test_a_paced_mp4_through_a_module_into_an_encoder_finishes(
     width, height = size
     programme = _paced_mp4(tmp_path, width, height)
     out_path = tmp_path / "out.mkv"
-    columns = (
-        "invert(p.video[1]), p.audio[1]"
-        if lane == "picture"
-        else "p.video[1], again(p.audio[1])"
-    )
+    if lane == "picture":
+        declared = (
+            "CREATE FUNCTION invert(v video_stream) RETURNS video_stream\n"
+            f"  AS '{_MODULE.as_posix()}', 'invert' LANGUAGE wasm;\n"
+        )
+        columns = "invert(p.video[1]), p.audio[1]"
+    else:
+        declared = (
+            "CREATE FUNCTION again(a audio_stream) RETURNS audio_stream\n"
+            f"  AS '{_AGAIN.as_posix()}', 'again' LANGUAGE wasm;\n"
+        )
+        columns = "p.video[1], again(p.audio[1])"
     compiled = compile_all(
-        "CREATE FUNCTION invert(v video_stream) RETURNS video_stream\n"
-        f"  AS '{_MODULE.as_posix()}', 'invert' LANGUAGE wasm;\n"
-        "CREATE FUNCTION again(a audio_stream) RETURNS audio_stream\n"
-        f"  AS '{_AGAIN.as_posix()}', 'again' LANGUAGE wasm;\n"
-        "COPY (\n"
+        declared + "COPY (\n"
         f"  SELECT {columns}\n"
         f"  FROM input('{programme.as_posix()}', realtime => true) p\n"
-        f") TO '{out_path.as_posix()}' WITH (video_codec '{codec}', audio_codec 'aac')"
+        f") TO '{out_path.as_posix()}' WITH ({encode}, audio_codec 'aac')"
     )
     assert compiled.plan is not None
     straight = next(e for e in compiled.plan.stream_edges if e.format.codec == COPY_CODEC)

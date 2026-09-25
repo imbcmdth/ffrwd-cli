@@ -1213,11 +1213,24 @@ def test_a_copied_stream_holds_its_depth_in_a_pipe_sized_by_its_bit_rate() -> No
         assert "fifo" not in argv["ffmpeg1"]
 
 
-def test_sound_waiting_on_an_encoded_picture_is_sized_in_samples() -> None:
+@pytest.mark.parametrize(
+    ("window", "bound", "size"),
+    [
+        # 106 frames of 12801 bytes, and 104, both round up to 21 steps of
+        # 64 KiB.
+        (1, 53, 21 * 65536),
+        # 1023 samples read ahead are a part of one picture, counted as one.
+        (1024, 52, 21 * 65536),
+    ],
+)
+def test_sound_waiting_on_an_encoded_picture_is_sized_in_samples(
+    window: int, bound: int, size: int
+) -> None:
     """The module on the sound this time, and the picture copied straight to
     x264: the sound's edge into the sidecar holds x264's 54 frames less the
-    one the sidecar does, each a thirtieth of a second of 48 kHz stereo f32,
-    12801 bytes; 106 of them round up to 21 steps of 64 KiB."""
+    one the sidecar holds and what the module reads ahead, each frame a
+    thirtieth of a second of 48 kHz stereo f32, 12801 bytes. A sound module
+    declares its window in samples, not pictures."""
     g = Graph(input_paths=[LIVE], sources={"a": 0})
     g.nodes["e0"] = Node(
         id="e0", filter="again", args={}, inputs=["src:a:a:0"], outputs=["audio"]
@@ -1233,14 +1246,11 @@ def test_sound_waiting_on_an_encoded_picture_is_sized_in_samples() -> None:
         g,
         external=external_ids("e0"),
         probes={"a": _live_probe()},
-        shapes={"again": ModuleShape()},
+        shapes={"again": ModuleShape(window=window, stride=window)},
     )
     sound = next(e for e in plan.stream_edges if e.ref == "src:a:a:0")
 
-    assert (sound.bound, sound.buffer) == (
-        53,
-        EdgeBuffer("pipe", 106, size=21 * 65536),
-    )
+    assert (sound.bound, sound.buffer) == (bound, EdgeBuffer("pipe", bound * 2, size=size))
 
 
 def _rate_changing_graph() -> Graph:
