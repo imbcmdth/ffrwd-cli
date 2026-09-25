@@ -295,6 +295,7 @@ from ffrwd.functions import (
     Annotation,
     Parameter,
     WasmFunction,
+    wasm_named_parameter,
 )
 from ffrwd.inputs import render_options
 from ffrwd.inputs import validate_option as validate_input_option
@@ -7436,15 +7437,6 @@ class _Lowerer:
         """
         call = _call_parts(inner)
         assert call is not None  # inner is exp.Anonymous; _call_parts always answers
-        if call.named:
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL,
-                f"{declared.name}() does not take named arguments",
-                call.named[0].value,
-                fallback=inner,
-                hint=f"a wasm function's parameters are positional: "
-                f"{declared.signature}",
-            )
         described = self._described_source(declared, inner, select)
         if not described.source:
             self._add_url_source(
@@ -8319,15 +8311,6 @@ class _Lowerer:
             )
         call = _call_parts(inner)
         assert call is not None  # inner is exp.Anonymous; _call_parts always answers
-        if call.named:
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL,
-                f"{declared.name}() does not take named arguments",
-                call.named[0].value,
-                fallback=inner,
-                hint=f"a wasm function's parameters are positional: "
-                f"{declared.signature}",
-            )
         described = self._described_packet_rows(declared, inner, select)
         kind, index = self._packet_rows_stream(raw, declared, env, select)
         spec = self._path_of(raw.source)
@@ -13220,9 +13203,10 @@ class _Lowerer:
     ) -> dict[str, object]:
         """The value arguments as the module's own parameters, schema-checked.
 
-        `first` is the index the value arguments start at: past the streams,
-        and past the annotation column when the call wrote it explicitly.
-        A parameter left NULL or unwritten is OMITTED, the way absence works
+        `first` is the index the positional value arguments start at: past
+        the streams, and past the annotation column when the call wrote it
+        explicitly. Named ones follow them (:meth:`_wasm_written`). A
+        parameter left NULL or unwritten is OMITTED, the way absence works
         everywhere else in the dialect -- the module then sees its own
         default. What is written is checked against the schema the module
         declares, by name and by type.
@@ -13237,15 +13221,17 @@ class _Lowerer:
         properties = schema_source.get("properties")
         known = properties if isinstance(properties, dict) else {}
         self._check_value_param_schemas(declared, known, node, select)
+        written = self._wasm_written(declared, call, node, select, first=first)
         params: dict[str, object] = {}
-        for index, param in enumerate(declared.value_params, start=first):
-            written = call.args[index] if index < len(call.args) else param.default
-            if written is None:
+        for param in declared.value_params:
+            argument = written.get(param.name)
+            anchor = argument if argument is not None else node
+            source = argument if argument is not None else param.default
+            if source is None:
                 continue
-            value = self._eval_value(written, env, row, select)
+            value = self._eval_value(source, env, row, select)
             if value is None:
                 continue
-            anchor = call.args[index] if index < len(call.args) else node
             schema = known.get(param.name)
             if schema is None:
                 raise _error(
@@ -13259,6 +13245,57 @@ class _Lowerer:
             self._check_wasm_param(param.name, value, schema, anchor, select)
             params[param.name] = value
         return params
+
+    def _wasm_written(
+        self,
+        declared: WasmFunction,
+        call: _Call,
+        node: exp.Expr,
+        select: exp.Select,
+        *,
+        first: int,
+    ) -> dict[str, exp.Expr]:
+        """Each value parameter the call writes, keyed by name.
+
+        The positionals from `first` fill the value parameters in declared
+        order; then each ``name => value`` fills the one it names. A name
+        refers to a value parameter the positionals left alone, never to a
+        stream (:func:`~ffrwd.functions.wasm_named_parameter`).
+        """
+        values = declared.value_params
+        written: dict[str, exp.Expr] = {}
+        targets = values
+        positional = call.args[first:]
+        if len(positional) > len(targets):
+            count = len(positional)
+            raise _error(
+                ErrorCode.UDF_ARG_TYPE,
+                f"{declared.name}() got {count} value argument"
+                f"{'' if count == 1 else 's'} where it declares {len(targets)}",
+                positional[len(targets)],
+                fallback=node,
+                hint=declared.signature,
+            )
+        for param, argument in zip(targets, positional):
+            written[param.name] = argument
+        filled = [p for p in values if p.name in written]
+        for named in call.named:
+            param = wasm_named_parameter(declared, named.name, named.value, node, filled)
+            written[param.name] = named.value
+            filled.append(param)
+        unfilled = next(
+            (p for p in values if p.default is None and p.name not in written),
+            None,
+        )
+        if unfilled is not None:
+            raise _error(
+                ErrorCode.UDF_ARG_TYPE,
+                f"{declared.name}() does not write '{unfilled.name}', which has no "
+                "DEFAULT",
+                node,
+                hint=declared.signature,
+            )
+        return written
 
     def _check_wasm_param(
         self,
@@ -13429,21 +13466,16 @@ class _Lowerer:
         key for it. The module runs once per distinct (module, function,
         arguments) within this compile (:attr:`_invoke_cache`).
         """
-        if call.named:
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL,
-                f"{declared.name}() does not take named arguments",
-                call.named[0].value,
-                fallback=node,
-                hint=f"a wasm function's parameters are positional: "
-                f"{declared.signature}",
-            )
         described = self._described_value(declared, node, select)
         properties = described.params_schema.get("properties")
         known = properties if isinstance(properties, dict) else {}
         self._check_value_param_schemas(declared, known, node, select)
         args: dict[str, object] = {}
-        for param, argument in zip(declared.value_params, call.args):
+        written = self._wasm_written(declared, call, node, select, first=0)
+        for param in declared.value_params:
+            argument = written.get(param.name)
+            if argument is None:
+                continue
             value = self._eval_value(argument, env, rows, select)
             if value is None:
                 continue
@@ -13722,15 +13754,6 @@ class _Lowerer:
         the pad the module reads.
         """
         described = self._described(declared, node, select)
-        if call.named:
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL,
-                f"{declared.name}() does not take named arguments",
-                call.named[0].value,
-                fallback=node,
-                hint=f"a wasm function's parameters are positional: "
-                f"{declared.signature}",
-            )
         if declared.is_packets:
             return self._lower_packets_call(
                 declared, described, node, call, env, select
@@ -13795,7 +13818,10 @@ class _Lowerer:
         first = arity + (1 if wired is not None else 0)
         # A module parameter read off a row is one instance per row, the way a
         # filter option read off one is one node per row.
-        per_row = any(_reads_row_column(arg, env) for arg in call.args[first:])
+        per_row = any(
+            _reads_row_column(arg, env)
+            for arg in [*call.args[first:], *(named.value for named in call.named)]
+        )
 
         def build(values: list[object], element: int) -> FrameRef:
             row = tuples[element] if element < len(tuples) else {}
@@ -13848,15 +13874,6 @@ class _Lowerer:
         call = _call_parts(base)
         assert call is not None  # `_data_projection` read it as one
         described = self._described(declared, base, select)
-        if call.named:
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL,
-                f"{declared.name}() does not take named arguments",
-                call.named[0].value,
-                fallback=base,
-                hint=f"a wasm function's parameters are positional: "
-                f"{declared.signature}",
-            )
         pads = self._lower_data_filter(base, declared, described, call, env, select)
         return _scalar(_Stream(ref=pads[pad], type="data"))
 
@@ -13988,7 +14005,10 @@ class _Lowerer:
         }
         first = arity + len(declared.reads_params)
         tuples = env.relation.tuples if env.relation is not None else []
-        per_row = any(_reads_row_column(arg, env) for arg in call.args[first:])
+        per_row = any(
+            _reads_row_column(arg, env)
+            for arg in [*call.args[first:], *(named.value for named in call.named)]
+        )
 
         def build(values: list[object], element: int) -> FrameRef:
             row = tuples[element] if element < len(tuples) else {}

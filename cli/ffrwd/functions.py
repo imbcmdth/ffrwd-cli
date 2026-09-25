@@ -121,6 +121,7 @@ from .parser import (
     _statements,
     from_entries,
     is_annotation_argument,
+    kwarg_name,
     parse,
 )
 from .project import (
@@ -157,6 +158,7 @@ __all__ = [
     "package_modules",
     "package_signatures",
     "package_sources",
+    "wasm_named_parameter",
 ]
 
 # The FROM item that mints an `-i`. Never an argument: it is a table, and a
@@ -3269,6 +3271,82 @@ def _wasm_argument_kind(call: exp.Anonymous, wasm: Mapping[str, WasmFunction] | 
     return _declared_kind(declared.returns) if declared is not None else "stream"
 
 
+def _positional_and_named(
+    arguments: Sequence[exp.Expr],
+) -> tuple[list[exp.Expr], list[tuple[str, exp.Expr]]]:
+    """A call's arguments split: the positional ones, then each ``name => value``.
+
+    A positional after a named one is refused; resolve has already refused a
+    named one with no value.
+    """
+    positional: list[exp.Expr] = []
+    named: list[tuple[str, exp.Expr]] = []
+    for argument in arguments:
+        if not isinstance(argument, exp.Kwarg):
+            if named:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    "positional arguments must come before named arguments",
+                    argument,
+                    hint="write the positional arguments first, then "
+                    "<name> => <value>",
+                )
+            positional.append(argument)
+            continue
+        value = argument.args.get("expression")
+        if isinstance(value, exp.Expr):
+            named.append((kwarg_name(argument), value))
+    return positional, named
+
+
+def wasm_named_parameter(
+    declared: WasmFunction,
+    name: str,
+    anchor: exp.Expr,
+    call: exp.Expr,
+    filled: Sequence[Parameter],
+) -> Parameter:
+    """The value parameter ``name => ...`` writes, or the refusal saying why not.
+
+    A stream is written in its own position and never by name; a parameter
+    `filled` already holds is not written again; and a name the declaration
+    does not have is refused naming the ones it does.
+    """
+    values = declared.value_params
+    param = next((p for p in values if p.name == name), None)
+    other = next((p for p in declared.params if p.name == name), None)
+    if param is not None and any(p.name == name for p in filled):
+        raise _error(
+            ErrorCode.UDF_ARG_TYPE,
+            f"{declared.name}() gets '{name}' twice: positionally and by name",
+            anchor,
+            fallback=call,
+            hint=f"write '{name}' once: {declared.signature}",
+        )
+    if param is not None:
+        return param
+    if other is not None:
+        raise _error(
+            ErrorCode.UDF_ARG_TYPE,
+            f"{declared.name}() takes '{name}' as {other.type}, which is written "
+            "in its own position and not by name",
+            anchor,
+            fallback=call,
+            hint=f"a name writes one of the values a module is configured with: "
+            f"{declared.signature}",
+        )
+    listed = ", ".join(f"'{p.name}'" for p in values)
+    raise _error(
+        ErrorCode.UDF_ARG_TYPE,
+        f"{declared.name}() has no parameter '{name}'",
+        anchor,
+        fallback=call,
+        hint=f"its value parameters are {listed}"
+        if values
+        else f"it takes no value parameters: {declared.signature}",
+    )
+
+
 def _writes_annotation(
     declared: WasmFunction,
     arguments: Sequence[exp.Expr],
@@ -4162,7 +4240,8 @@ class _Expander:
         The leading `streams` arguments came out of the SELECT list and are
         checked for being streams at all; which parameter each fills is a
         question of KIND, and kinds are settled in lowering. The rest are the
-        module's own values, held to the same rules any call's are.
+        module's own values, positional and then named, held to the same
+        rules any call's are.
         """
         for argument in arguments[:streams]:
             written = _argument_kind(argument, self.wasm)
@@ -4177,7 +4256,7 @@ class _Expander:
                 hint=f"a sink reads the streams its SELECT list names: "
                 f"COPY (SELECT <stream>, ...) TO {declared.name}(<values>)",
             )
-        values = arguments[streams:]
+        values, named = _positional_and_named(arguments[streams:])
         positions = declared.value_params
         plural = "" if len(values) == 1 else "s"
         if len(values) > len(positions):
@@ -4188,7 +4267,15 @@ class _Expander:
                 call,
                 hint=declared.signature,
             )
-        unfilled = next((p for p in positions[len(values) :] if p.default is None), None)
+        taken = {name for name, _ in named}
+        unfilled = next(
+            (
+                p
+                for p in positions[len(values) :]
+                if p.default is None and p.name not in taken
+            ),
+            None,
+        )
         if unfilled is not None:
             raise _error(
                 ErrorCode.UDF_ARG_TYPE,
@@ -4198,26 +4285,8 @@ class _Expander:
                 hint=declared.signature,
             )
         for param, argument in zip(positions, values):
-            if _call_name(argument) == _INPUT:
-                raise _error(
-                    ErrorCode.UDF_ARG_TYPE,
-                    f"{declared.name}() cannot take input() as its '{param.name}' "
-                    "argument: input() mints a FROM item, not a value",
-                    argument,
-                    fallback=call,
-                    hint=_ARG_HINT,
-                )
-            written = _argument_kind(argument, self.wasm)
-            if written is None or written == _declared_kind(param.type):
-                continue
-            raise _error(
-                ErrorCode.UDF_ARG_TYPE,
-                f"{declared.name}() takes {param.type} as its '{param.name}' "
-                f"argument, got {_KIND_NAMES.get(written, written)}",
-                argument,
-                fallback=call,
-                hint=declared.signature,
-            )
+            self._check_wasm_argument(declared, call, param, argument)
+        self._check_wasm_named(declared, call, positions[: len(values)], named)
 
     def _check_wasm_arguments(
         self, declared: WasmFunction, call: exp.Anonymous, arguments: list[exp.Expr]
@@ -4226,64 +4295,97 @@ class _Expander:
 
         The same rules a sql function's call carries, minus the ones about a
         body: the leading argument is the stream the module filters, and the
-        rest are the values it is configured with. An annotation column
-        usually takes no argument of its own -- the call that fills it is the
-        leading one -- but a call may write one, and does when the rows are
-        not the ones its stream argument arrived with.
+        rest are the values it is configured with, positional and then named.
+        An annotation column usually takes no argument of its own -- the call
+        that fills it is the leading one -- but a call may write one, and does
+        when the rows are not the ones its stream argument arrived with.
         """
         streams = call.meta.get(SINK_STREAMS)
         if declared.is_sink and isinstance(streams, int):
             self._check_sink_arguments(declared, call, arguments, streams)
             return
+        positional, named = _positional_and_named(arguments)
         positions = declared.written_params
-        if _writes_annotation(declared, arguments, self.wasm):
+        if _writes_annotation(declared, positional, self.wasm):
             positions = declared.annotation_written_params
-        plural = "" if len(arguments) == 1 else "s"
-        if len(arguments) > len(positions):
+        plural = "" if len(positional) == 1 else "s"
+        if len(positional) > len(positions):
             raise _error(
                 ErrorCode.UDF_ARG_TYPE,
-                f"{declared.name}() got {len(arguments)} argument{plural}, but it "
+                f"{declared.name}() got {len(positional)} argument{plural}, but it "
                 f"declares {len(positions)}",
                 call,
                 hint=declared.signature,
             )
+        taken = {name for name, _ in named}
         unfilled = next(
-            (p for p in positions[len(arguments) :] if p.default is None), None
+            (
+                p
+                for p in positions[len(positional) :]
+                if p.default is None and p.name not in taken
+            ),
+            None,
         )
         if unfilled is not None:
             raise _error(
                 ErrorCode.UDF_ARG_TYPE,
-                f"{declared.name}() got {len(arguments)} argument{plural}, but its "
+                f"{declared.name}() got {len(positional)} argument{plural}, but its "
                 f"parameter '{unfilled.name}' has no DEFAULT",
                 call,
                 hint=declared.signature,
             )
-        for param, argument in zip(positions, arguments):
-            if _call_name(argument) == _INPUT:
-                raise _error(
-                    ErrorCode.UDF_ARG_TYPE,
-                    f"{declared.name}() cannot take input() as its '{param.name}' "
-                    "argument: input() mints a FROM item, not a value",
-                    argument,
-                    fallback=call,
-                    hint=_ARG_HINT,
-                )
-            if param.annotation is not None:
-                # An annotation column's shape is not a kind: what it has to
-                # be is the record the producing module publishes, which
-                # lowering matches against the module's own rows.
-                continue
-            written = _argument_kind(argument, self.wasm)
-            if written is None or written == _declared_kind(param.type):
-                continue
+        for param, argument in zip(positions, positional):
+            self._check_wasm_argument(declared, call, param, argument)
+        self._check_wasm_named(declared, call, positions[: len(positional)], named)
+
+    def _check_wasm_argument(
+        self,
+        declared: WasmFunction,
+        call: exp.Anonymous,
+        param: Parameter,
+        argument: exp.Expr,
+    ) -> None:
+        """One written argument against the parameter it fills."""
+        if _call_name(argument) == _INPUT:
             raise _error(
                 ErrorCode.UDF_ARG_TYPE,
-                f"{declared.name}() takes {param.type} as its '{param.name}' "
-                f"argument, got {_KIND_NAMES.get(written, written)}",
+                f"{declared.name}() cannot take input() as its '{param.name}' "
+                "argument: input() mints a FROM item, not a value",
                 argument,
                 fallback=call,
-                hint=declared.signature,
+                hint=_ARG_HINT,
             )
+        if param.annotation is not None:
+            # An annotation column's shape is not a kind: what it has to be is
+            # the record the producing module publishes, which lowering
+            # matches against the module's own rows.
+            return
+        written = _argument_kind(argument, self.wasm)
+        if written is None or written == _declared_kind(param.type):
+            return
+        raise _error(
+            ErrorCode.UDF_ARG_TYPE,
+            f"{declared.name}() takes {param.type} as its '{param.name}' "
+            f"argument, got {_KIND_NAMES.get(written, written)}",
+            argument,
+            fallback=call,
+            hint=declared.signature,
+        )
+
+    def _check_wasm_named(
+        self,
+        declared: WasmFunction,
+        call: exp.Anonymous,
+        filled: Sequence[Parameter],
+        named: Sequence[tuple[str, exp.Expr]],
+    ) -> None:
+        """The ``name => value`` arguments: each a value parameter, written once.
+
+        `filled` is what the positionals already wrote.
+        """
+        for name, value in named:
+            param = wasm_named_parameter(declared, name, value, call, filled)
+            self._check_wasm_argument(declared, call, param, value)
 
     def _bare_site(self, call: exp.Anonymous) -> _CallSite | _WasmSite | None:
         """An unqualified ``fn(...)`` value call, if something in scope defines `fn`."""

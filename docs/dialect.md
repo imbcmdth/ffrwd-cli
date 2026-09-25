@@ -115,7 +115,11 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   inline: the module runs in the `ffrwd-wasm` sidecar, so a query
   reaching one compiles to several processes joined by pipes rather
   than to one ffmpeg command, and `run` executes them together. Recipe
-  [87](examples.md#87-run-a-wasm-module-over-the-picture).
+  [87](examples.md#87-run-a-wasm-module-over-the-picture). Its value
+  parameters also take `name => value` after the positional arguments,
+  the way a filter's options do: `ffrwd.ortb.auction(prog.d, prog.v,
+  cohort => 'es-ES', viewers => 18000)`. A stream is always written in
+  its own position.
 - **`--jobs N`**, on `compile` and `run`, caps the sidecar's worker
   threads at N. The sidecar runs a pool sized to the machine's cores by
   default, and a module that describes itself as pure spreads across it
@@ -1567,7 +1571,9 @@ Every one of these is a typed rejection, never a silent reinterpretation:
   declares as a type no value the dialect has can fill (an object, say -
   a module wanting one takes text holding its JSON); a value function's
   `RETURNS` that does not match the module's result type, or a module
-  answering with the wrong JSON type; a named argument; a call in
+  answering with the wrong JSON type; a named argument naming a
+  stream, a parameter the declaration does not have, or one a
+  positional argument already wrote; a call in
   `FROM` unless it returns source, a `RETURNS source` call anywhere
   but `FROM` or one handed a stream; a `RETURNS sink` call anywhere
   but the `TO` position, a non-sink function written there, `WITH`
