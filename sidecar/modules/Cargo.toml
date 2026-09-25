@@ -31,6 +31,7 @@ members = [
     "packet-stats",
     "packet-tally",
     "packet-passthrough",
+    "packet-passthrough-0160",
     "packet-sei",
     "packet-keys",
     "packet-head",
@@ -39,6 +40,10 @@ members = [
     "source-replay-pair",
     "source-replay-0130",
     "source-replay-0150",
+    "source-replay-0160",
+    "source-replay-data",
+    "data-echo",
+    "data-stamp",
     "source-files",
     "fauxlate",
     "embed-notes",
@@ -54,6 +59,7 @@ members = [
     "adapted-090",
     "adapted-0110",
     "adapted-0150",
+    "adapted-0160",
 ]
 resolver = "2"
 

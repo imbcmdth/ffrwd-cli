@@ -91,6 +91,7 @@ impl Guest for PacketTally {
             audio_codecs: vec![],
             video: Arity::Any,
             audio: Arity::Any,
+            data: Arity::Any,
             // Every packet is the point: these count what crossed.
             wants: Wants::All,
         }
@@ -105,9 +106,9 @@ impl Guest for PacketTally {
         for stream in &streams {
             let (width, height) = match &stream.coded.format {
                 CodedFormat::Video(video) => (video.width, video.height),
-                // Audio carries no frame geometry; the row's width and
-                // height stay 0 rather than a video pad's borrowed value.
-                CodedFormat::Audio(_) => (0, 0),
+                // Audio and data carry no frame geometry; the row's width
+                // and height stay 0 rather than a video pad's borrowed value.
+                CodedFormat::Audio(_) | CodedFormat::Data => (0, 0),
             };
             pads.push(Pad {
                 row: stream.row,

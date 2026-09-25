@@ -19,6 +19,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "adapted-0160"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "wit-bindgen 0.57.1",
+]
+
+[[package]]
 name = "adapted-020"
 version = "0.1.0"
 dependencies = [
@@ -425,6 +433,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b1e3a325bc115f096c8b77bbf027a7c2592230e70be2d985be950d3d5e60ebe"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "data-echo"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "wit-bindgen 0.57.1",
+]
+
+[[package]]
+name = "data-stamp"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "wit-bindgen 0.57.1",
 ]
 
 [[package]]
@@ -1324,6 +1350,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "packet-passthrough-0160"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "wit-bindgen 0.57.1",
+]
+
+[[package]]
 name = "packet-sei"
 version = "0.1.0"
 dependencies = [
@@ -1753,6 +1788,21 @@ name = "source-replay-0150"
 version = "0.1.0"
 dependencies = [
  "ffrwd-nal",
+ "wit-bindgen 0.57.1",
+]
+
+[[package]]
+name = "source-replay-0160"
+version = "0.1.0"
+dependencies = [
+ "ffrwd-nal",
+ "wit-bindgen 0.57.1",
+]
+
+[[package]]
+name = "source-replay-data"
+version = "0.1.0"
+dependencies = [
  "wit-bindgen 0.57.1",
 ]
 

@@ -454,8 +454,8 @@ source = "git+https://github.com/imbcmdth/ffrwd-nal?tag=v0.1.0#bd2ffcf559065b836
 
 [[package]]
 name = "ffrwd-nut"
-version = "0.1.2"
-source = "git+https://github.com/imbcmdth/ffrwd-nut?tag=v0.1.2#773eeaa0361b4a02c17fbacb771077d962fd3eb4"
+version = "0.1.3"
+source = "git+https://github.com/imbcmdth/ffrwd-nut?tag=v0.1.3#85cd69fbed528cf84d0beca7f1182c4614d1cd32"
 dependencies = [
  "serde",
  "serde_json",

@@ -1,0 +1,15 @@
+[package]
+name = "source-replay-0160"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "source_replay_0160"
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.57.1"
+
+[dev-dependencies]
+# The Annex B scanner the fixture's own bytes are checked with.
+ffrwd-nal = { git = "https://github.com/imbcmdth/ffrwd-nal", tag = "v0.1.0" }

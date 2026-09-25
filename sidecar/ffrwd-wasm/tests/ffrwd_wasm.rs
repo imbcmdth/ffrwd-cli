@@ -705,7 +705,7 @@ fn describe(module: &std::path::Path) -> Description {
 #[test]
 fn describe_prints_one_json_object() {
     let parsed = describe(&module_path("invert"));
-    assert_eq!(parsed.world, "ffrwd:av@0.16.0");
+    assert_eq!(parsed.world, "ffrwd:av@0.17.0");
     assert_eq!(parsed.name, Some("invert".to_string()));
     assert_eq!(parsed.pixel_formats, Some(vec!["rgba".to_string()]));
     assert_eq!(parsed.inputs, 1, "invert reads one stream");
@@ -718,7 +718,7 @@ fn describe_prints_one_json_object() {
 #[test]
 fn describe_on_a_values_only_module_has_no_filter_fields() {
     let parsed = describe(&module_path("brand"));
-    assert_eq!(parsed.world, "ffrwd:av@0.16.0");
+    assert_eq!(parsed.world, "ffrwd:av@0.17.0");
     assert_eq!(parsed.name, None, "brand exports no filter, so no name");
     assert_eq!(
         parsed.pixel_formats, None,
@@ -774,6 +774,22 @@ fn describe_always_carries_rows_language_and_it_is_empty_when_none_is_declared()
             "{name} declares no language for its rows"
         );
     }
+}
+
+#[test]
+fn describe_carries_feeders_for_every_frame_module_and_none_for_the_rest() {
+    // A windowed module of the current world with none, one of a world
+    // with no field for them, and a per-frame one: each answers an empty
+    // list. A module with no frame interface has no call to take feeder
+    // arguments, so the key is absent there.
+    for name in ["note_rows", "adapted_070", "invert"] {
+        let raw = describe_raw(&module_path(name));
+        let parsed: serde_json::Value = serde_json::from_str(&raw).expect("one JSON object");
+        assert_eq!(parsed["feeders"], serde_json::json!([]), "{name}: {raw}");
+    }
+    let raw = describe_raw(&module_path("brand"));
+    let parsed: serde_json::Value = serde_json::from_str(&raw).expect("one JSON object");
+    assert!(parsed.get("feeders").is_none(), "{raw}");
 }
 
 #[test]
@@ -4341,4 +4357,353 @@ fn paced_rows_reach_a_pipe_while_the_stream_is_still_running() {
          row {after})",
         rest.len()
     );
+}
+
+// The data filter. `data_stamp` writes every message of its first data pad
+// back with a `"node"` field added, at the same pts, and with a clock pad and
+// `every_s` above 0 a tick each time the clock crosses a multiple of it. Its
+// output counts microseconds.
+
+/// The unit the data inputs here count in, and the one `data_stamp` writes.
+const MICROS: TimeBase = TimeBase {
+    num: 1,
+    den: 1_000_000,
+};
+
+/// A clock whose frames are tenths of a second apart, so its times are
+/// round: frame `k` is at `k / 10` s.
+const TENTHS: TimeBase = TimeBase { num: 1, den: 10 };
+
+/// A JSON NUT carrying `messages` as (pts in microseconds, message).
+fn json_nut(messages: &[(i64, &str)]) -> Vec<u8> {
+    let mut wire = Vec::new();
+    {
+        let mut muxer = Muxer::new(&mut wire, &Stream::json(MICROS)).expect("write NUT headers");
+        for (pts, message) in messages {
+            write_message(&mut muxer, *pts, message);
+        }
+        muxer.finish().expect("finish the NUT stream");
+    }
+    wire
+}
+
+fn write_message<W: Write>(muxer: &mut Muxer<W>, pts: i64, message: &str) {
+    muxer
+        .write_coded(
+            &ffrwd_wasm::nut::Packet {
+                pts,
+                dts: Some(pts),
+                keyframe: true,
+            },
+            message.as_bytes(),
+        )
+        .expect("write a message");
+}
+
+/// A video clock of `frames` frames in `time_base`, `step` ticks apart.
+fn clock_nut(frames: i64, time_base: TimeBase, step: i64) -> Vec<u8> {
+    let stream = Stream::video("rgba", WIDTH, HEIGHT, time_base).expect("rgba is carried");
+    let mut wire = Vec::new();
+    {
+        let mut muxer = Muxer::new(&mut wire, &stream).expect("write NUT headers");
+        for k in 0..frames {
+            muxer
+                .write_frame(k * step, &synthetic_frame(k as u8))
+                .expect("write a clock frame");
+        }
+        muxer.finish().expect("finish the NUT stream");
+    }
+    wire
+}
+
+/// Every message a JSON NUT carries as (pts, message), for as much of it as
+/// has been written: a stream still being written ends where its bytes do.
+fn read_messages(wire: &[u8]) -> Vec<(i64, String)> {
+    let Ok(mut demuxer) = Demuxer::open(wire) else {
+        return Vec::new();
+    };
+    assert!(demuxer.stream().is_json(), "a data filter writes JSON NUT");
+    assert_eq!(demuxer.stream().time_base, MICROS);
+    let mut messages = Vec::new();
+    let mut buf = Vec::new();
+    while let Ok(Some(packet)) = demuxer.read_packet(&mut buf) {
+        assert!(packet.keyframe, "every message is a keyframe");
+        messages.push((packet.pts, String::from_utf8(buf.clone()).expect("UTF-8")));
+    }
+    messages
+}
+
+/// Runs `data_stamp` with `params` over `inputs` - files, in argument order -
+/// writing its one output to stdout.
+fn run_data_stamp(params: &str, inputs: &[&std::path::Path]) -> FfrwdWasmRun {
+    ensure_modules_built();
+    let module = module_path("data_stamp");
+    let mut args: Vec<&str> = Vec::new();
+    for input in inputs {
+        args.extend(["-f", "nut", "-i", input.to_str().expect("UTF-8 path")]);
+    }
+    args.extend([
+        "-m",
+        module.to_str().expect("module path is valid UTF-8"),
+        "-params",
+        params,
+        "-f",
+        "nut",
+        "-",
+    ]);
+    run_ffrwd_wasm(&args, &[])
+}
+
+fn tick(node: &str) -> String {
+    format!(r#"{{"kind":"tick","node":"{node}"}}"#)
+}
+
+#[test]
+fn a_data_filter_stamps_each_message_at_its_own_pts() {
+    let data = TempFile::new("stamp_in.nut");
+    std::fs::write(
+        data.path(),
+        json_nut(&[
+            (0, r#"{"a":1}"#),
+            (500_000, r#"{ "b" : 2 }"#),
+            (500_000, "{}"),
+            (7_000_000, r#"{"text":"café"}"#),
+        ]),
+    )
+    .expect("write the data input");
+
+    let run = run_data_stamp(r#"{"node":"n1"}"#, &[data.path()]);
+    assert_run_ok(&run, "data_stamp");
+    assert_eq!(
+        read_messages(&run.stdout),
+        vec![
+            (0, r#"{"a":1,"node":"n1"}"#.to_string()),
+            (500_000, r#"{ "b" : 2 ,"node":"n1"}"#.to_string()),
+            (500_000, r#"{"node":"n1"}"#.to_string()),
+            (7_000_000, r#"{"text":"café","node":"n1"}"#.to_string()),
+        ]
+    );
+}
+
+#[test]
+fn a_clock_only_data_filter_ticks_at_programme_times() {
+    // The clock counts 1/65536 of a second at 25 frames a second, which
+    // divides into no whole number of microseconds: 61 frames run to
+    // 2.44 s, so the ticks land on 0, 1 and 2 s exactly, at the multiple
+    // rather than at the frame that crossed it.
+    let clock = TempFile::new("ticks_clock.nut");
+    std::fs::write(clock.path(), clock_nut(61, TIME_BASE, PTS_STEP)).expect("write the clock");
+
+    let run = run_data_stamp(r#"{"node":"n2","every_s":1}"#, &[clock.path()]);
+    assert_run_ok(&run, "data_stamp");
+    assert_eq!(
+        read_messages(&run.stdout),
+        vec![
+            (0, tick("n2")),
+            (1_000_000, tick("n2")),
+            (2_000_000, tick("n2")),
+        ]
+    );
+}
+
+#[test]
+fn a_data_pad_and_a_clock_pad_interleave_in_programme_order() {
+    // Messages ahead of the clock wait for it, so what leaves is one
+    // timeline: every message at its own time between the ticks either side.
+    let data = TempFile::new("both_data.nut");
+    std::fs::write(
+        data.path(),
+        json_nut(&[
+            (500_000, r#"{"n":1}"#),
+            (1_500_000, r#"{"n":2}"#),
+            (1_500_000, r#"{"n":3}"#),
+            (2_200_000, r#"{"n":4}"#),
+        ]),
+    )
+    .expect("write the data input");
+    let clock = TempFile::new("both_clock.nut");
+    std::fs::write(clock.path(), clock_nut(31, TENTHS, 1)).expect("write the clock");
+
+    // The clock second, to show the data pad need not come first.
+    let run = run_data_stamp(r#"{"node":"n3","every_s":1}"#, &[data.path(), clock.path()]);
+    assert_run_ok(&run, "data_stamp");
+    assert_eq!(
+        read_messages(&run.stdout),
+        vec![
+            (0, tick("n3")),
+            (500_000, r#"{"n":1,"node":"n3"}"#.to_string()),
+            (1_000_000, tick("n3")),
+            (1_500_000, r#"{"n":2,"node":"n3"}"#.to_string()),
+            (1_500_000, r#"{"n":3,"node":"n3"}"#.to_string()),
+            (2_000_000, tick("n3")),
+            (2_200_000, r#"{"n":4,"node":"n3"}"#.to_string()),
+            (3_000_000, tick("n3")),
+        ]
+    );
+}
+
+#[test]
+fn the_final_call_carries_what_the_clock_never_reached() {
+    // The clock stops at 2 s; a message at 9 s waits for a clock that never
+    // gets there, and leaves on the final call instead of being lost.
+    let clock = TempFile::new("last_clock.nut");
+    std::fs::write(clock.path(), clock_nut(21, TENTHS, 1)).expect("write the clock");
+    let data = TempFile::new("last_data.nut");
+    std::fs::write(
+        data.path(),
+        json_nut(&[(500_000, r#"{"n":1}"#), (9_000_000, r#"{"n":2}"#)]),
+    )
+    .expect("write the data input");
+
+    let run = run_data_stamp(r#"{"node":"n4"}"#, &[clock.path(), data.path()]);
+    assert_run_ok(&run, "data_stamp");
+    assert_eq!(
+        read_messages(&run.stdout),
+        vec![
+            (500_000, r#"{"n":1,"node":"n4"}"#.to_string()),
+            (9_000_000, r#"{"n":2,"node":"n4"}"#.to_string()),
+        ]
+    );
+}
+
+/// Waits up to `bound` for `path` to hold at least `count` messages, and
+/// answers what it holds when it does or when the bound runs out.
+fn await_messages(path: &std::path::Path, count: usize, bound: Duration) -> Vec<(i64, String)> {
+    let start = Instant::now();
+    loop {
+        let messages = read_messages(&std::fs::read(path).unwrap_or_default());
+        if messages.len() >= count || start.elapsed() > bound {
+            return messages;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// `data_stamp` spawned on `inputs`, with `-` among them for a pad the test
+/// writes itself, its output going to `output`.
+fn spawn_data_stamp(
+    params: &str,
+    inputs: &[&str],
+    output: &std::path::Path,
+) -> std::process::Child {
+    ensure_modules_built();
+    let module = module_path("data_stamp");
+    let mut args: Vec<&str> = Vec::new();
+    for input in inputs {
+        args.extend(["-f", "nut", "-i", input]);
+    }
+    args.extend([
+        "-m",
+        module.to_str().expect("module path is valid UTF-8"),
+        "-params",
+        params,
+        "-f",
+        "nut",
+        output.to_str().expect("UTF-8 path"),
+    ]);
+    Command::new(env!("CARGO_BIN_EXE_ffrwd-wasm"))
+        .args(&args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ffrwd-wasm")
+}
+
+#[test]
+fn a_message_leaves_while_the_clock_is_still_running() {
+    // The clock is fed a frame at a time and held open: the stamped message
+    // must be readable in the output while the clock input has not ended,
+    // not when the run does. Each frame waits a while for it; the message
+    // reaches the module with the first clock frame that finds it arrived.
+    let data = TempFile::new("early_data.nut");
+    std::fs::write(data.path(), json_nut(&[(0, r#"{"n":1}"#)])).expect("write the data input");
+    let output = TempFile::new("early_out.nut");
+    let mut child = spawn_data_stamp(
+        r#"{"node":"n5"}"#,
+        &[data.path().to_str().expect("UTF-8 path"), "-"],
+        output.path(),
+    );
+
+    let stdin = child.stdin.take().expect("child stdin");
+    let clock = Stream::video("rgba", WIDTH, HEIGHT, TENTHS).expect("rgba is carried");
+    let mut muxer = Muxer::new(stdin, &clock).expect("write the clock's headers");
+    let mut seen = Vec::new();
+    for k in 0..50 {
+        muxer
+            .write_frame(k, &synthetic_frame(k as u8))
+            .expect("write a clock frame");
+        muxer.flush().expect("flush the clock");
+        seen = await_messages(output.path(), 1, Duration::from_millis(400));
+        if !seen.is_empty() {
+            break;
+        }
+    }
+    let clock_still_open = !seen.is_empty();
+    drop(muxer);
+    let finished = child.wait_with_output().expect("wait for ffrwd-wasm");
+    assert!(
+        finished.status.success(),
+        "data_stamp exited with {:?}\nstderr:\n{}",
+        finished.status.code(),
+        String::from_utf8_lossy(&finished.stderr)
+    );
+    assert!(
+        clock_still_open,
+        "the stamped message was not in the output while the clock ran"
+    );
+    assert_eq!(seen, vec![(0, r#"{"n":1,"node":"n5"}"#.to_string())]);
+}
+
+#[test]
+fn a_pts_going_back_on_an_output_is_refused_by_name() {
+    // The clock runs to 3 s and ends, ticking at each second. Only then is a
+    // message at 0.5 s written: a clock that has ended holds nothing back,
+    // so the module stamps it behind the tick at 3 s it already wrote.
+    let clock = TempFile::new("back_clock.nut");
+    std::fs::write(clock.path(), clock_nut(31, TENTHS, 1)).expect("write the clock");
+    let output = TempFile::new("back_out.nut");
+    let mut child = spawn_data_stamp(
+        r#"{"node":"n6","every_s":1}"#,
+        &[clock.path().to_str().expect("UTF-8 path"), "-"],
+        output.path(),
+    );
+
+    let stdin = child.stdin.take().expect("child stdin");
+    let mut muxer = Muxer::new(stdin, &Stream::json(MICROS)).expect("write the data headers");
+    muxer.flush().expect("flush the data headers");
+    let ticks = await_messages(output.path(), 4, Duration::from_secs(30));
+    assert_eq!(ticks.len(), 4, "the clock's four ticks, before the message");
+    write_message(&mut muxer, 500_000, r#"{"n":1}"#);
+    drop(muxer);
+
+    let finished = child.wait_with_output().expect("wait for ffrwd-wasm");
+    let stderr = String::from_utf8_lossy(&finished.stderr);
+    assert!(!finished.status.success(), "the run was not refused");
+    assert!(
+        stderr.contains(
+            "data_stamp: output 0 wrote a message at pts 500000 after one at 3000000; an \
+             output's pts never decrease"
+        ),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn describe_reports_a_data_filter() {
+    let raw = describe_raw(&module_path("data_stamp"));
+    let parsed: serde_json::Value = serde_json::from_str(&raw).expect("one JSON object");
+    assert_eq!(parsed["world"], "ffrwd:av@0.17.0");
+    assert_eq!(parsed["name"], "data_stamp");
+    assert_eq!(parsed["data_filter"], true);
+    assert_eq!(parsed["data_outputs"], serde_json::json!(["json"]));
+    assert_eq!(parsed["data_time_base"], serde_json::json!([1, 1_000_000]));
+    assert_eq!(
+        parsed["params_schema"]["required"],
+        serde_json::json!(["node"])
+    );
+    // No frame, packet or rows interface answers for it.
+    assert_eq!(parsed["packet_filter"], false);
+    assert!(parsed.get("window").is_none());
+    assert!(parsed.get("feeders").is_none());
 }

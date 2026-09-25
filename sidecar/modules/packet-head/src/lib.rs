@@ -67,6 +67,7 @@ impl Guest for PacketHead {
             audio_codecs: vec![],
             video: Arity::One,
             audio: Arity::Zero,
+            data: Arity::Zero,
             // What the stream declares about itself is on the first packet.
             wants: Wants::First,
         }

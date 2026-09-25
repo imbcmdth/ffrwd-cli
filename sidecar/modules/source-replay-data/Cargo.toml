@@ -1,0 +1,11 @@
+[package]
+name = "source-replay-data"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "source_replay_data"
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.57.1"

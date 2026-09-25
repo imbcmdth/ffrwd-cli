@@ -43,6 +43,8 @@ fn built_module(name: &str) -> PathBuf {
                 "source-replay-0130",
                 "-p",
                 "source-replay-0150",
+                "-p",
+                "source-replay-0160",
             ])
             .current_dir(&workspace)
             .output()
@@ -77,10 +79,14 @@ fn older_module_path() -> PathBuf {
     built_module("source_replay_0130")
 }
 
-/// The same module built against `worlds/0.15.0`, whose `open` IS told which
-/// tracks to pull: the previous world, hosted rather than refused.
-fn previous_module_path() -> PathBuf {
-    built_module("source_replay_0150")
+/// The same module built against `worlds/0.16.0` and `worlds/0.15.0`, whose
+/// `open` IS told which tracks to pull: older worlds, hosted rather than
+/// refused.
+fn older_hosted_module_paths() -> [PathBuf; 2] {
+    [
+        built_module("source_replay_0160"),
+        built_module("source_replay_0150"),
+    ]
 }
 
 struct Run {
@@ -222,7 +228,7 @@ fn a_packet_source_built_against_an_older_world_is_refused_at_open() {
     ]);
     assert!(!run.output.status.success());
     assert!(
-        run.stderr.contains("rebuild it against ffrwd:av@0.16.0"),
+        run.stderr.contains("rebuild it against ffrwd:av@0.17.0"),
         "stderr does not name the world to rebuild against:\n{}",
         run.stderr
     );
@@ -355,12 +361,14 @@ fn a_run_writes_back_exactly_the_packets_the_module_published() {
 }
 
 #[test]
-fn a_source_built_against_the_previous_world_runs_the_same_way() {
+fn sources_built_against_older_hosted_worlds_run_the_same_way() {
     // `open` was told which tracks to pull in 0.15.0 and still is, so a
-    // source published against that world is hosted under this one rather
-    // than refused: end to end, the NUT it writes is the NUT the current
-    // build writes.
-    assert_replays(&previous_module_path());
+    // source published against 0.15.0 or 0.16.0 is hosted under this one
+    // rather than refused: end to end, the NUT it writes is the NUT the
+    // current build writes.
+    for module in older_hosted_module_paths() {
+        assert_replays(&module);
+    }
 }
 
 #[test]
@@ -398,7 +406,7 @@ fn describe_reports_the_packet_source() {
     let stdout = String::from_utf8(run.stdout).expect("describe prints UTF-8");
     let description: serde_json::Value =
         serde_json::from_str(stdout.trim()).expect("describe prints one JSON object");
-    assert_eq!(description["world"], "ffrwd:av@0.16.0");
+    assert_eq!(description["world"], "ffrwd:av@0.17.0");
     assert_eq!(description["name"], "source_replay");
     assert_eq!(description["source"], true);
     // No frame interface and no packet-sink export alongside it.
