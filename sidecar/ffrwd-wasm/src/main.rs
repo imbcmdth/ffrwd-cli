@@ -40,6 +40,8 @@ use network::{Binding, Network};
 
 const EDGE_FORMAT: &str = "nut";
 const ROWS_FORMAT: &str = "ndjson";
+/// The one data codec the wire carries: a message is one UTF-8 JSON object.
+const DATA_CODEC: &str = "json";
 /// The `-f` values an output may carry, for a refusal listing them.
 const OUTPUT_FORMATS: [&str; 5] = [EDGE_FORMAT, ROWS_FORMAT, "srt", "webvtt", "null"];
 /// The WIT package a module targets; identifies which host generation built
@@ -2977,6 +2979,21 @@ impl From<PadRendition> for runtime::RenditionMeta {
 /// wire has a tag for, the codec's own time base and extradata, and
 /// `decode_delay` as `run_packet_source`'s pull loop settled it.
 fn coded_stream_for(coded: &runtime::CodedStream, decode_delay: u64) -> Result<nut::Stream> {
+    let time_base = nut::TimeBase {
+        num: coded.time_base.num,
+        den: coded.time_base.den,
+    };
+    // A data track has no geometry and no reordering: its header is the
+    // wire's own JSON stream in the track's time base.
+    if coded.format == runtime::CodedFormat::Data {
+        if coded.codec != DATA_CODEC {
+            bail!(
+                "{} is not a data codec this wire carries; only {DATA_CODEC} is",
+                coded.codec
+            );
+        }
+        return Ok(nut::Stream::json(time_base));
+    }
     let kind = coded.format.kind();
     let fourcc = nut::fourcc_for_coded(kind, &coded.codec).ok_or_else(|| {
         let names: Vec<&str> = match kind {
@@ -2995,10 +3012,6 @@ fn coded_stream_for(coded: &runtime::CodedStream, decode_delay: u64) -> Result<n
             names.join(", ")
         )
     })?;
-    let time_base = nut::TimeBase {
-        num: coded.time_base.num,
-        den: coded.time_base.den,
-    };
     let max_pts_distance = time_base.den.div_ceil(time_base.num.max(1));
     let media = match &coded.format {
         runtime::CodedFormat::Video {
@@ -3026,6 +3039,7 @@ fn coded_stream_for(coded: &runtime::CodedStream, decode_delay: u64) -> Result<n
             sample_rate: *sample_rate,
             channels: *channels,
         },
+        runtime::CodedFormat::Data => unreachable!("a data track returned above"),
     };
     Ok(nut::Stream {
         fourcc: fourcc.to_vec(),
@@ -3382,6 +3396,10 @@ struct Description {
     video_streams: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     audio_streams: Option<&'static str>,
+    /// The same for DATA streams: "none" for a module built against a world
+    /// before 0.17.0, which read none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data_streams: Option<&'static str>,
     /// Whether the module exports a packet sink: encoded packets in, rows
     /// out. The positive half of the pair below - a reader should not have
     /// to infer a sink from `packet_filter: false` beside a filled codec
@@ -3409,6 +3427,12 @@ struct Description {
     /// of a world before 0.9.0, for a per-frame one, and for one with no frame
     /// interface at all.
     inputs: u32,
+    /// The call's arguments a frame module reads itself over a loopback
+    /// connection rather than as pads. Present for a module with a frame
+    /// interface, and empty for one with none - which every module of a
+    /// world before 0.17.0 and every per-frame one is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    feeders: Option<Vec<FeederDescription>>,
     /// Whether the component imports `wasi:nn`, and so needs a model bound
     /// with `-nn` to run at all. Read off its imports, so it is answered
     /// without a model or an ONNX Runtime present. Always present.
@@ -3430,6 +3454,15 @@ struct Description {
     /// The older spelling of `reads_rows`, present only when it is true.
     #[serde(skip_serializing_if = "is_false")]
     meta: bool,
+}
+
+/// One feeder argument, as a window module's `describe()` declared it.
+#[derive(Serialize)]
+struct FeederDescription {
+    input: u32,
+    port_param: String,
+    kind: String,
+    group: String,
 }
 
 /// `true` when `b` is `false`, for `skip_serializing_if` on a bool field that
@@ -3568,12 +3601,14 @@ fn describe_module(module_path: &str) -> Result<String> {
         wants: None,
         video_streams: None,
         audio_streams: None,
+        data_streams: None,
         packet_sink: false,
         packet_filter: false,
         source: false,
         rows_module: false,
         input_rows_schema: None,
         inputs: 1,
+        feeders: None,
         nn: ffrwd_wasm_runtime::runtime::imports_wasi_nn(module_path)
             .with_context(|| format!("describing {module_path}"))?,
         http: ffrwd_wasm_runtime::runtime::imports_wasi_http(module_path)
@@ -3612,6 +3647,18 @@ fn describe_module(module_path: &str) -> Result<String> {
         description.reads_rows = Some(described.reads_rows);
         description.forwards_rows = Some(described.forwards_rows);
         description.inputs = described.inputs;
+        description.feeders = Some(
+            described
+                .feeders
+                .into_iter()
+                .map(|f| FeederDescription {
+                    input: f.input,
+                    port_param: f.port_param,
+                    kind: f.kind,
+                    group: f.group,
+                })
+                .collect(),
+        );
         description.meta = described.reads_rows;
     }
 
@@ -3636,6 +3683,7 @@ fn describe_module(module_path: &str) -> Result<String> {
         description.audio_codecs = Some(described.audio_codecs);
         description.video_streams = Some(streams_read(described.video));
         description.audio_streams = Some(streams_read(described.audio));
+        description.data_streams = Some(streams_read(described.data));
         description.wants = Some(described.wants.written());
         description.packet_sink = true;
     }
@@ -3661,6 +3709,7 @@ fn describe_module(module_path: &str) -> Result<String> {
         description.audio_codecs = Some(described.audio_codecs);
         description.video_streams = Some(streams_read(described.video));
         description.audio_streams = Some(streams_read(described.audio));
+        description.data_streams = Some(streams_read(described.data));
         // A filter's rows arrive beside its packets rather than on them, so
         // this is what says it wants a `-rows-in` at all.
         description.reads_rows = Some(described.reads_rows);
@@ -3734,12 +3783,14 @@ fn to_hex(bytes: &[u8]) -> String {
 }
 
 /// A catalog track's geometry, tagged by kind - `probe`'s JSON names the
-/// variant `video` or `audio` and nests only the fields that kind declares.
+/// variant `video`, `audio` or `data` and nests only the fields that kind
+/// declares, which for a data track is none.
 #[derive(Serialize)]
 #[serde(rename_all = "lowercase")]
 enum CatalogFormatJson {
     Video { width: u32, height: u32 },
     Audio { sample_rate: u32, channels: u32 },
+    Data {},
 }
 
 #[derive(Serialize)]
@@ -3752,6 +3803,8 @@ struct CatalogRenditionJson {
 
 #[derive(Serialize)]
 struct CatalogTrackJson {
+    /// `video`, `audio` or `data`: the arm `format` names, said flat.
+    kind: &'static str,
     codec: String,
     time_base: [u64; 2],
     format: CatalogFormatJson,
@@ -3776,6 +3829,7 @@ fn catalog_json(catalog: &runtime::Catalog) -> CatalogJson {
             .tracks
             .iter()
             .map(|t| CatalogTrackJson {
+                kind: t.stream.format.kind(),
                 codec: t.stream.codec.clone(),
                 time_base: [t.stream.time_base.num, t.stream.time_base.den],
                 format: match &t.stream.format {
@@ -3791,6 +3845,7 @@ fn catalog_json(catalog: &runtime::Catalog) -> CatalogJson {
                         sample_rate: *sample_rate,
                         channels: *channels,
                     },
+                    runtime::CodedFormat::Data => CatalogFormatJson::Data {},
                 },
                 extradata: to_hex(&t.stream.extradata),
                 profile: t.stream.profile,

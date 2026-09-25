@@ -1,14 +1,14 @@
-//! The identity packet filter: every packet handed straight back, every
-//! stream handed back as it arrived.
+//! `packet_passthrough`, built against the vendored `ffrwd:av@0.16.0` world
+//! instead of the current one: the world packet filters arrived in, before
+//! a filter said how many data streams it reads. It is the module the host's
+//! 0.16.0 packet-filter arm is proven against - a filter built before the
+//! 0.17.0 bump still loads and hands its packets back untouched - and the one
+//! a data stream is refused at, naming the world it was built for.
 //!
-//! It is what a byte-for-byte test is written against - what leaves this
-//! module is what entered it, so anything the wire loses is the host's or
-//! the container's - and it is the smallest thing a packet filter can be,
-//! so it is also the worked example of the interface. It counts what
-//! crossed and says so once, at the end.
+//! It is `packet-passthrough` line for line but for the world and the name.
 
 wit_bindgen::generate!({
-    path: "../../wit",
+    path: "../../worlds/0.16.0",
     world: "packet-filter-module",
 });
 
@@ -45,17 +45,19 @@ thread_local! {
 fn validate_params(params: &str) -> Result<(), String> {
     match params.trim() {
         "" | "{}" => Ok(()),
-        other => Err(format!("packet_passthrough takes no params, got: {other}")),
+        other => Err(format!(
+            "packet_passthrough_0160 takes no params, got: {other}"
+        )),
     }
 }
 
-struct PacketPassthrough;
+struct PacketPassthrough0160;
 
-impl Guest for PacketPassthrough {
+impl Guest for PacketPassthrough0160 {
     fn describe() -> PacketFilterMeta {
         PacketFilterMeta {
             meta: Meta {
-                name: "packet_passthrough".to_string(),
+                name: "packet_passthrough_0160".to_string(),
                 version: "0.1.0".to_string(),
                 params_schema: PARAMS_SCHEMA.to_string(),
                 rows_schema: ROWS_SCHEMA.to_string(),
@@ -72,7 +74,6 @@ impl Guest for PacketPassthrough {
             audio_codecs: vec![],
             video: Arity::Any,
             audio: Arity::Any,
-            data: Arity::Any,
             // Rows pass nowhere: this filter rewrites nothing.
             reads_rows: false,
         }
@@ -81,7 +82,7 @@ impl Guest for PacketPassthrough {
     fn init(streams: Vec<InputStream>, params: String) -> Result<Vec<CodedStream>, String> {
         validate_params(&params)?;
         if streams.is_empty() {
-            return Err("packet_passthrough reads at least one stream".into());
+            return Err("packet_passthrough_0160 reads at least one stream".into());
         }
         PADS.with(|p| {
             *p.borrow_mut() = streams
@@ -136,4 +137,4 @@ impl Guest for PacketPassthrough {
     }
 }
 
-export!(PacketPassthrough);
+export!(PacketPassthrough0160);

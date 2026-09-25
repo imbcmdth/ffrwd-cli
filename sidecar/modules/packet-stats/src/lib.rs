@@ -145,6 +145,7 @@ impl Guest for PacketStats {
             // One video stream: this module counts a stream, not a ladder.
             video: Arity::One,
             audio: Arity::Zero,
+            data: Arity::Zero,
             // Every packet is the point: these count what crossed.
             wants: Wants::All,
         }

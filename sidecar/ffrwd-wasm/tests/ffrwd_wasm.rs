@@ -705,7 +705,7 @@ fn describe(module: &std::path::Path) -> Description {
 #[test]
 fn describe_prints_one_json_object() {
     let parsed = describe(&module_path("invert"));
-    assert_eq!(parsed.world, "ffrwd:av@0.16.0");
+    assert_eq!(parsed.world, "ffrwd:av@0.17.0");
     assert_eq!(parsed.name, Some("invert".to_string()));
     assert_eq!(parsed.pixel_formats, Some(vec!["rgba".to_string()]));
     assert_eq!(parsed.inputs, 1, "invert reads one stream");
@@ -718,7 +718,7 @@ fn describe_prints_one_json_object() {
 #[test]
 fn describe_on_a_values_only_module_has_no_filter_fields() {
     let parsed = describe(&module_path("brand"));
-    assert_eq!(parsed.world, "ffrwd:av@0.16.0");
+    assert_eq!(parsed.world, "ffrwd:av@0.17.0");
     assert_eq!(parsed.name, None, "brand exports no filter, so no name");
     assert_eq!(
         parsed.pixel_formats, None,
@@ -774,6 +774,22 @@ fn describe_always_carries_rows_language_and_it_is_empty_when_none_is_declared()
             "{name} declares no language for its rows"
         );
     }
+}
+
+#[test]
+fn describe_carries_feeders_for_every_frame_module_and_none_for_the_rest() {
+    // A windowed module of the current world with none, one of a world
+    // with no field for them, and a per-frame one: each answers an empty
+    // list. A module with no frame interface has no call to take feeder
+    // arguments, so the key is absent there.
+    for name in ["note_rows", "adapted_070", "invert"] {
+        let raw = describe_raw(&module_path(name));
+        let parsed: serde_json::Value = serde_json::from_str(&raw).expect("one JSON object");
+        assert_eq!(parsed["feeders"], serde_json::json!([]), "{name}: {raw}");
+    }
+    let raw = describe_raw(&module_path("brand"));
+    let parsed: serde_json::Value = serde_json::from_str(&raw).expect("one JSON object");
+    assert!(parsed.get("feeders").is_none(), "{raw}");
 }
 
 #[test]

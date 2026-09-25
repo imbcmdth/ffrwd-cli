@@ -2,13 +2,14 @@
 //! with no NUT wire and no ffmpeg: the contract the runtime holds a caller
 //! to, whatever drove it.
 //!
-//! `source_replay` is built three times: against the current world, against
-//! the vendored `worlds/0.15.0` as `source-replay-0150`, and against
-//! `worlds/0.13.0` as `source-replay-0130`. The 0.15.0 build is here to be
-//! HOSTED - `open` is told which tracks to pull there as it is now, so a
-//! source built before the 0.16.0 bump still runs - and the 0.13.0 build to
-//! be REFUSED, since its `open` takes params alone and a source that cannot
-//! be told what to pull is rebuilt rather than adapted.
+//! `source_replay` is built four times: against the current world, against
+//! the vendored `worlds/0.16.0` and `worlds/0.15.0` as `source-replay-0160`
+//! and `source-replay-0150`, and against `worlds/0.13.0` as
+//! `source-replay-0130`. The 0.16.0 and 0.15.0 builds are here to be HOSTED -
+//! `open` is told which tracks to pull there as it is now, so a source built
+//! before the 0.17.0 bump still runs - and the 0.13.0 build to be REFUSED,
+//! since its `open` takes params alone and a source that cannot be told what
+//! to pull is rebuilt rather than adapted.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -39,6 +40,8 @@ fn module_path(name: &str) -> PathBuf {
                 "wasm32-wasip2",
                 "-p",
                 "source-replay",
+                "-p",
+                "source-replay-0160",
                 "-p",
                 "source-replay-0150",
                 "-p",
@@ -128,9 +131,7 @@ fn assert_catalog(catalog: &Catalog) {
         ffrwd_wasm_runtime::runtime::CodedFormat::Video { width, height, .. } => {
             assert_eq!((width, height), (32, 24));
         }
-        ffrwd_wasm_runtime::runtime::CodedFormat::Audio { .. } => {
-            panic!("source_replay publishes video, not audio")
-        }
+        other => panic!("source_replay publishes video, not {}", other.kind()),
     }
 }
 
@@ -148,7 +149,7 @@ fn a_packet_source_built_against_an_older_world_is_refused_with_the_world_to_reb
         "the refusal names why 0.13.0 cannot be adapted: {text}"
     );
     assert!(
-        text.contains("rebuild it against ffrwd:av@0.16.0"),
+        text.contains("rebuild it against ffrwd:av@0.17.0"),
         "{text}"
     );
 
@@ -157,7 +158,7 @@ fn a_packet_source_built_against_an_older_world_is_refused_with_the_world_to_reb
     };
     let text = err.to_string();
     assert!(
-        text.contains("rebuild it against ffrwd:av@0.16.0"),
+        text.contains("rebuild it against ffrwd:av@0.17.0"),
         "{text}"
     );
 }
@@ -168,7 +169,7 @@ fn the_current_build_opens_the_one_track_it_was_told_to_pull() {
     let module_str = module.to_str().expect("module path is valid UTF-8");
 
     let described = describe_packet_source(module_str).expect("describing source_replay");
-    assert_eq!(described.world, "0.16.0");
+    assert_eq!(described.world, "0.17.0");
 
     assert_replays(module_str);
 }
@@ -196,21 +197,27 @@ fn assert_replays(module_str: &str) {
 }
 
 #[test]
-fn a_source_built_against_the_previous_world_still_opens_and_pulls() {
-    // The adapter path for a packet source, over a module actually built
+fn sources_built_against_older_hosted_worlds_still_open_and_pull() {
+    // The adapter paths for a packet source, over modules actually built
     // that way: `open` was told which tracks to pull in 0.15.0 and still is,
-    // so a source published against that world is hosted rather than
-    // refused. It answers the world it was BUILT against, not the host's.
-    let module = module_path("source_replay_0150");
-    let module_str = module.to_str().expect("module path is valid UTF-8");
+    // so a source published against either older world is hosted rather
+    // than refused. Each answers the world it was BUILT against, not the
+    // host's.
+    for (name, world) in [
+        ("source_replay_0160", "0.16.0"),
+        ("source_replay_0150", "0.15.0"),
+    ] {
+        let module = module_path(name);
+        let module_str = module.to_str().expect("module path is valid UTF-8");
 
-    let described = describe_packet_source(module_str).expect("describing source_replay_0150");
-    assert_eq!(described.world, "0.15.0");
+        let described = describe_packet_source(module_str).expect("describing the source");
+        assert_eq!(described.world, world, "{name}");
 
-    let catalog = PacketSource::probe(module_str, "").expect("probing source_replay_0150");
-    assert_catalog(&catalog);
+        let catalog = PacketSource::probe(module_str, "").expect("probing the source");
+        assert_catalog(&catalog);
 
-    assert_replays(module_str);
+        assert_replays(module_str);
+    }
 }
 
 #[test]

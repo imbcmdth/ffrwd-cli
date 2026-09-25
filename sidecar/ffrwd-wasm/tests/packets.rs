@@ -89,6 +89,8 @@ fn module_path(name: &str) -> PathBuf {
                 "-p",
                 "adapted-0150",
                 "-p",
+                "adapted-0160",
+                "-p",
                 "invert",
             ])
             .current_dir(&workspace)
@@ -279,12 +281,57 @@ fn a_sink_built_against_the_previous_world_still_loads() {
         serde_json::from_str(described.stdout.trim()).expect("describe prints one JSON object");
     // The host reports the world it was BUILT for, not the module's own -
     // which is the same answer every adapted module gets.
-    assert_eq!(description["world"], "ffrwd:av@0.16.0");
+    assert_eq!(description["world"], "ffrwd:av@0.17.0");
     assert_eq!(description["name"], "adapted_0150");
     assert_eq!(description["packet_filter"], false);
     // 0.15.0 had no field for it, so the adapter answers for it: a sink
     // that could not ask for less is handed everything.
     assert_eq!(description["wants"], "all");
+}
+
+#[test]
+fn a_sink_built_against_the_world_before_data_streams_still_loads() {
+    // The 0.16.0 arm, over a module actually shaped that way: it says how
+    // much of a stream it needs, which the adapter reads through, and has
+    // no field for data streams, which the adapter answers as none.
+    let module = module_path("adapted_0160");
+    let run = run_ffrwd_wasm(
+        &[
+            "-f",
+            "nut",
+            "-i",
+            fixture_path().to_str().expect("fixture path is UTF-8"),
+            "-m",
+            module.to_str().expect("module path is UTF-8"),
+            "-f",
+            "ndjson",
+            "-",
+        ],
+        &[],
+    );
+    assert!(
+        run.output.status.success(),
+        "adapted_0160 exited with {:?}\nstderr:\n{}",
+        run.output.status.code(),
+        run.stderr
+    );
+    // A request, not a promise: this host hands a sink asking for keyframes
+    // every packet anyway.
+    assert_eq!(
+        run.stdout.lines().collect::<Vec<&str>>(),
+        vec![format!(r#"{{"codec":"h264","packets":{PACKETS}}}"#)]
+    );
+
+    let described = run_ffrwd_wasm(
+        &["--describe", module.to_str().expect("module path is UTF-8")],
+        &[],
+    );
+    let description: serde_json::Value =
+        serde_json::from_str(described.stdout.trim()).expect("describe prints one JSON object");
+    assert_eq!(description["name"], "adapted_0160");
+    assert_eq!(description["wants"], "keyframes");
+    assert_eq!(description["video_streams"], "any");
+    assert_eq!(description["data_streams"], "none");
 }
 
 #[test]
@@ -569,7 +616,7 @@ fn describe_reports_the_packet_sink() {
     );
     let description: serde_json::Value =
         serde_json::from_str(run.stdout.trim()).expect("describe prints one JSON object");
-    assert_eq!(description["world"], "ffrwd:av@0.16.0");
+    assert_eq!(description["world"], "ffrwd:av@0.17.0");
     assert_eq!(description["name"], "packet_stats");
     // The export says so itself, rather than leaving a reader to infer it
     // from a filled codec list beside `packet_filter: false`.
@@ -579,6 +626,7 @@ fn describe_reports_the_packet_sink() {
     assert_eq!(description["video_codecs"], serde_json::json!([]));
     // A sink that counts packets needs every one, and says so.
     assert_eq!(description["wants"], "all");
+    assert_eq!(description["data_streams"], "none");
     // No frame interface: none of the windowed fields appear, and neither
     // does the question about rows arriving on frames there are none of.
     assert!(description.get("window").is_none());

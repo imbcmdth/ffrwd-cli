@@ -62,6 +62,7 @@ impl Guest for NewestBorrow {
             reads_rows: false,
             forwards_rows: false,
             inputs: 1,
+            feeders: vec![],
         }
     }
 

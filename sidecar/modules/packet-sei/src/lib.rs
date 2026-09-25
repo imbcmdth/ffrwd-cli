@@ -220,6 +220,7 @@ impl Guest for PacketSei {
             audio_codecs: vec![],
             video: Arity::One,
             audio: Arity::Zero,
+            data: Arity::Zero,
             reads_rows: true,
         }
     }

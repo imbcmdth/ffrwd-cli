@@ -128,6 +128,7 @@ impl Guest for NoteRows {
             // The rows leaving are this module's own.
             forwards_rows: false,
             inputs: 1,
+            feeders: vec![],
         }
     }
 

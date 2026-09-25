@@ -52,6 +52,8 @@ fn module_path(name: &str) -> PathBuf {
                 "-p",
                 "packet-passthrough",
                 "-p",
+                "packet-passthrough-0160",
+                "-p",
                 "packet-sei",
                 "-p",
                 "packet-stats",
@@ -230,8 +232,30 @@ fn mux_to_mp4(nut: &Path, mp4: &Path) {
 
 #[test]
 fn an_identity_filter_hands_back_the_packets_it_was_given() {
-    let module = module_path("packet_passthrough");
-    let written = scratch("identity.nut");
+    assert_hands_back_the_fixture("packet_passthrough");
+}
+
+#[test]
+fn a_filter_built_against_the_world_before_data_streams_still_runs() {
+    // The 0.16.0 arm, over a module actually shaped that way: the world
+    // packet filters arrived in, with no data arity and no data arm.
+    assert_hands_back_the_fixture("packet_passthrough_0160");
+    let module = module_path("packet_passthrough_0160");
+    let run = run_ffrwd_wasm(
+        &["--describe", module.to_str().expect("module path is UTF-8")],
+        &[],
+    );
+    let description: serde_json::Value =
+        serde_json::from_str(run.stdout.trim()).expect("describe prints one JSON object");
+    assert_eq!(description["packet_filter"], true);
+    assert_eq!(description["data_streams"], "none");
+}
+
+/// Runs the identity filter `name` over the fixture and checks it wrote the
+/// fixture's own header and packets back, byte for byte.
+fn assert_hands_back_the_fixture(name: &str) {
+    let module = module_path(name);
+    let written = scratch(&format!("{name}_identity.nut"));
     let run = run_ffrwd_wasm(
         &[
             "-f",
@@ -251,7 +275,7 @@ fn an_identity_filter_hands_back_the_packets_it_was_given() {
     );
     assert!(
         run.output.status.success(),
-        "packet_passthrough exited with {:?}\nstderr:\n{}",
+        "{name} exited with {:?}\nstderr:\n{}",
         run.output.status.code(),
         run.stderr
     );
@@ -986,7 +1010,7 @@ fn describe_reports_the_packet_filter() {
     );
     let description: serde_json::Value =
         serde_json::from_str(run.stdout.trim()).expect("describe prints one JSON object");
-    assert_eq!(description["world"], "ffrwd:av@0.16.0");
+    assert_eq!(description["world"], "ffrwd:av@0.17.0");
     assert_eq!(description["name"], "packet_sei");
     // The flag is what tells a filter from a sink; both carry the codec and
     // arity fields beside it.
@@ -994,6 +1018,7 @@ fn describe_reports_the_packet_filter() {
     assert_eq!(description["video_codecs"], serde_json::json!(["h264"]));
     assert_eq!(description["video_streams"], "one");
     assert_eq!(description["audio_streams"], "none");
+    assert_eq!(description["data_streams"], "none");
     assert_eq!(description["reads_rows"], true);
     // No frame interface: none of the windowed fields appear.
     assert!(description.get("window").is_none());

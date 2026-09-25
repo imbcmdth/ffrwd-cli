@@ -126,6 +126,7 @@ impl Guest for PacketKeys {
             audio_codecs: vec![],
             video: Arity::One,
             audio: Arity::Zero,
+            data: Arity::Zero,
             // What a writer puts on keyframes is all this reads.
             wants: Wants::Keyframes,
         }

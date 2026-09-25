@@ -4,6 +4,6 @@ package ffrwd:fauxlate;
 /// string in and one out, and `translate-rows` as a rows module, running the
 /// same rule over a cue's `text` field. No imports - the rule is pure.
 world fauxlate {
-  export ffrwd:av/values@0.16.0;
-  export ffrwd:av/rows-module@0.16.0;
+  export ffrwd:av/values@0.17.0;
+  export ffrwd:av/rows-module@0.17.0;
 }
