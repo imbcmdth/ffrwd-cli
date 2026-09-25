@@ -4665,7 +4665,7 @@ fn a_sink_nothing_reaches_is_called_anyway() {
     let mut muxer = Muxer::new(stdin, &Stream::json(MICROS)).expect("write the data headers");
     write_message(&mut muxer, 0, r#"{"n":1}"#);
     muxer.flush().expect("flush the first message");
-    thread::sleep(Duration::from_millis(600));
+    thread::sleep(Duration::from_millis(1500));
     write_message(&mut muxer, 1_000_000, r#"{"n":2}"#);
     drop(muxer);
 
@@ -4684,7 +4684,8 @@ fn a_sink_nothing_reaches_is_called_anyway() {
         .iter()
         .filter(|row| row.get("turns").is_some() && row["packets"] == 1)
         .count();
-    // Thirty at a fiftieth of a second; a loaded machine calls less often.
+    // About seventy-five at a fiftieth of a second; a machine loaded by the
+    // rest of the suite calls far less often, so the floor is low.
     assert!(
         between >= 5,
         "{between} calls with no packets while the input was quiet:\n{rows:?}"
@@ -4748,7 +4749,7 @@ fn a_pts_going_back_on_an_output_is_refused_by_name() {
     std::fs::write(clock.path(), clock_nut(31, TENTHS, 1)).expect("write the clock");
     let output = TempFile::new("back_out.nut");
     let mut child = spawn_data_stamp(
-        r#"{"node":"n6","every_s":1}"#,
+        r#"{"node":"n6","every_s":1,"clamp":false}"#,
         &[clock.path().to_str().expect("UTF-8 path"), "-"],
         output.path(),
     );

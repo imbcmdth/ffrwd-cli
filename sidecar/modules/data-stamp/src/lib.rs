@@ -20,7 +20,7 @@ use exports::ffrwd::av::data_filter::{
 };
 use serde::Deserialize;
 
-const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{"node":{"type":"string"},"every_s":{"type":"number","minimum":0,"default":0}},"required":["node"],"additionalProperties":false}"#;
+const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{"node":{"type":"string"},"every_s":{"type":"number","minimum":0,"default":0},"clamp":{"type":"boolean","default":true}},"required":["node"],"additionalProperties":false}"#;
 
 /// Microseconds per second: the output's time base is 1/1000000.
 const MICROS: i128 = 1_000_000;
@@ -31,6 +31,15 @@ struct Params {
     node: String,
     #[serde(default)]
     every_s: f64,
+    /// Whether a late message is written at the last time written rather
+    /// than behind it. Off only for the host's test that a pts going back on
+    /// an output is refused.
+    #[serde(default = "clamp_by_default")]
+    clamp: bool,
+}
+
+fn clamp_by_default() -> bool {
+    true
 }
 
 struct State {
@@ -46,6 +55,8 @@ struct State {
     /// The pts of the last message written, in microseconds: what a message
     /// that arrives after time has moved past it is written at instead.
     last_written_us: Option<i64>,
+    /// See `Params::clamp`.
+    clamp: bool,
 }
 
 thread_local! {
@@ -139,6 +150,7 @@ impl Guest for DataStamp {
                 clock,
                 last_now_us: None,
                 last_written_us: None,
+                clamp: params.clamp,
             })
         });
         Ok(())
@@ -187,7 +199,7 @@ impl Guest for DataStamp {
             // after the clock had moved past its own time is written now, at
             // the last time written, rather than behind it.
             for (pts, _, _) in &mut written {
-                if let Some(floor) = state.last_written_us {
+                if let (true, Some(floor)) = (state.clamp, state.last_written_us) {
                     *pts = (*pts).max(floor);
                 }
                 state.last_written_us = Some(*pts);
