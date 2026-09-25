@@ -492,6 +492,9 @@ interface packet-sink {
     video: arity,
     /// How many audio streams this sink reads.
     audio: arity,
+    /// How many data streams this sink reads. A world before 0.17.0 read
+    /// none, which is what one is adapted to.
+    data: arity,
     /// How much of the stream this sink has to see. `all` is the answer for
     /// a sink that reads every packet, and the answer a world before 0.16.0
     /// is adapted to, since none of them could say otherwise.
@@ -511,9 +514,9 @@ interface packet-sink {
   describe: func() -> packet-sink-meta;
 
   /// Called once per instance, with every stream the sink reads: video pads
-  /// first, then audio, each group in the order the query named them. A sink
-  /// declaring `one` of a kind is opened with exactly one of it, and one
-  /// declaring `zero` with none.
+  /// first, then audio, then data, each group in the order the query named
+  /// them. A sink declaring `one` of a kind is opened with exactly one of
+  /// it, and one declaring `zero` with none.
   init: func(streams: list<input-stream>, params: string) -> result<_, string>;
 
   /// Replaces the parameters between calls, as the other interfaces do.
@@ -595,6 +598,9 @@ interface packet-filter {
     video: arity,
     /// How many audio streams this filter reads.
     audio: arity,
+    /// How many data streams this filter reads. A world before 0.17.0 read
+    /// none, which is what one is adapted to.
+    data: arity,
     /// Whether this filter ACTS on the rows handed to `process`. Every call
     /// receives whatever rows have arrived whatever this says, so
     /// availability is no answer: a filter that only rewrites packets
@@ -623,9 +629,9 @@ interface packet-filter {
   describe: func() -> packet-filter-meta;
 
   /// Called once per instance, with every stream the filter reads: video
-  /// pads first, then audio, each group in the order the query named them.
-  /// A filter declaring `one` of a kind is opened with exactly one of it,
-  /// and one declaring `zero` with none.
+  /// pads first, then audio, then data, each group in the order the query
+  /// named them. A filter declaring `one` of a kind is opened with exactly
+  /// one of it, and one declaring `zero` with none.
   ///
   /// The list answered is the streams LEAVING, one per input pad and in the
   /// same order: ordinarily the ones that arrived, handed straight back. A
