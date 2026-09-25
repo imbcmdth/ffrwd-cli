@@ -228,7 +228,7 @@ from ffrwd.vars import unset_error
 from ffrwd.warnings import OnWarning
 
 if TYPE_CHECKING:  # both import this module; the references here are annotations
-    from ffrwd.functions import Annotation, WasmFunction
+    from ffrwd.functions import Annotation, RuntimeLateral, WasmFunction
     from ffrwd.project import PackageSet
 
 __all__ = [
@@ -2445,6 +2445,11 @@ class Resolved:
     order. Each names a module and one export in it; lower resolves a call to
     one against this table, ahead of the filter registry. Empty for a script
     that declares none."""
+
+    laterals: dict[str, RuntimeLateral] = field(default_factory=dict)
+    """Each run-time lateral: a ``LATERAL`` call over a data stream, keyed by
+    the name its columns are read under (:class:`ffrwd.functions.RuntimeLateral`).
+    Empty for a script that has none."""
 
     series: dict[str, tuple[int, ...]] = field(default_factory=dict)
     """``FROM generate_series(start, stop[, step]) alias`` records, keyed by
@@ -9228,6 +9233,7 @@ def resolve(
             _fold_array_lengths(script.tree)
             resolved = _Resolver(script.wasm).run(script.tree)
             resolved.wasm = script.wasm
+            resolved.laterals = script.laterals
             return resolved
     except FfrwdError:
         raise

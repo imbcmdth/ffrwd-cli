@@ -291,11 +291,14 @@ from sqlglot import exp
 from ffrwd import binaries, loudnorm
 from ffrwd.errors import ErrorCode, FfrwdError
 from ffrwd.functions import (
+    DECLARED_STREAM,
     SHARED_ARGUMENT,
+    WASM_DATA,
     WASM_STREAM_NAMES,
     WASM_STREAM_TYPES,
     Annotation,
     Parameter,
+    RuntimeLateral,
     WasmFunction,
     is_number_argument,
     wasm_named_parameter,
@@ -316,6 +319,9 @@ from ffrwd.ir import (
     FeederCall,
     FrameRef,
     Graph,
+    Lateral,
+    LateralConnection,
+    LateralValue,
     ModuleSource,
     Node,
     Output,
@@ -458,6 +464,7 @@ from ffrwd.types import (
     TRACK_RECORD_COLUMNS,
     Field,
     RowColumnType,
+    element_type,
     is_array,
 )
 from ffrwd.vars import unset_error
@@ -1618,12 +1625,52 @@ class _Connection:
     `streams` maps each stream as the query wrote it to the stream conformed
     for the module, in the order they were first fed. `audio_codec` is the
     pcm its sound travels as, which the first module reading sound here
-    decides.
+    decides, and `pix_fmt` the pixel format its picture does. `lateral` is
+    the key of the run-time lateral whose instances write it, and "" for a
+    connection a process of the plan writes.
     """
 
     streams: dict[FrameRef, _Stream] = field(default_factory=dict)
     calls: list[FeederCall] = field(default_factory=list)
     audio_codec: str = ""
+    pix_fmt: str = ""
+    lateral: str = ""
+
+
+# A run-time lateral's stream while lowering runs: never a node's input and
+# never written by a COPY, only a feeder's (:meth:`_Lowerer._feed`), so it
+# names no pad at all. ``lateral:<key>:<column>``.
+_LATERAL_REF = "lateral:"
+# How a run-time lateral's data stream reaches the host: ffmpeg's raw data
+# muxer, which writes each packet's bytes as they are, so the host reads one
+# JSON object after another and a heartbeat's blank payload is only space.
+_TAP_FORMAT = "data"
+
+
+def _lateral_parts(ref: FrameRef) -> tuple[str, str] | None:
+    """The key and column a run-time lateral's stream names, else None."""
+    if not ref.startswith(_LATERAL_REF):
+        return None
+    key, _, column = ref[len(_LATERAL_REF) :].rpartition(":")
+    return key, column
+
+
+@dataclass
+class _LateralUse:
+    """A run-time lateral as lowering finds it: the data stream its instances
+    are started from, and what the feeders its streams reach settle.
+
+    `shape` is what each feeder says of the programme it reads, by the value
+    it binds (width, height, fps and pix_fmt from a picture's; rate, channels
+    and sample_fmt from a sound's), the first feeder of each kind deciding.
+    `ports` are the connections its instances write, in the order opened.
+    """
+
+    declared: RuntimeLateral
+    stream: _Stream
+    anchor: exp.Expr
+    shape: dict[str, str | int | float] = field(default_factory=dict)
+    ports: list[int] = field(default_factory=list)
 
 
 # How many picks a free feeder port is given before the compile gives up.
@@ -1669,6 +1716,63 @@ def _listed_sources(sources: frozenset[str]) -> str:
 def _channel_layout(channels: int) -> str:
     """ffmpeg's name for the default layout of `channels` channels."""
     return {1: "mono", 2: "stereo"}.get(channels, f"{channels}c")
+
+
+def _lateral_column(lateral: RuntimeLateral, call: _Call) -> tuple[str, StreamType]:
+    """The column a read of a run-time lateral names, and the kind it is.
+
+    Expansion writes the read, always as the data stream and the column's
+    name, so the column is one the declaration has.
+    """
+    written = call.args[1] if len(call.args) > 1 else None
+    name = str(written.this) if isinstance(written, exp.Literal) else ""
+    column = next(c for c in lateral.columns if c.name == name)
+    return name, WASM_STREAM_TYPES[column.type]
+
+
+def _instance_template(
+    declared: RuntimeLateral, connections: Sequence[tuple[int, _Connection]]
+) -> str:
+    """One instance of a run-time lateral, as SQL.
+
+    One COPY per connection its streams go to, writing them there as the
+    NUT a feeder carries, picture then sound. The call writes NULL in the
+    data stream's place, what the call wrote itself, and every other value
+    as a variable, ``:'name'`` for text and ``:name`` for the rest, which
+    the host sets per message; one it leaves unset is NULL, and takes the
+    DEFAULT.
+    """
+    alias = declared.alias
+    arguments = [
+        "NULL",
+        *(f"{name} => {value}" for name, value in declared.written.items()),
+        *(
+            f"{param.name} => "
+            + (f":'{param.name}'" if param.type == "text" else f":{param.name}")
+            for param in declared.params
+        ),
+    ]
+    call = f"{declared.function}({', '.join(arguments)}) {alias}"
+    statements: list[str] = []
+    for port, connection in connections:
+        streams = sorted(
+            connection.streams.values(), key=lambda s: 0 if s.type == "video" else 1
+        )
+        columns = []
+        for stream in streams:
+            parts = _lateral_parts(stream.ref)
+            assert parts is not None  # a lateral's connection carries its streams only
+            columns.append(f"{alias}.{parts[1]}")
+        options = [f"format '{NUT}'"]
+        if connection.pix_fmt:
+            options += [f"video_codec '{RAWVIDEO}'", f"pix_fmt '{connection.pix_fmt}'"]
+        if connection.audio_codec:
+            options.append(f"audio_codec '{connection.audio_codec}'")
+        statements.append(
+            f"COPY (SELECT {', '.join(columns)} FROM {call}) "
+            f"TO '{feeder_path(port)}' WITH ({', '.join(options)})"
+        )
+    return ";\n".join(statements)
 
 
 def _namespaced_call(node: exp.Expr) -> exp.Anonymous | None:
@@ -3582,11 +3686,16 @@ class _Env:
 
 
 class _NodeFactory:
-    """Mints ``n1, n2, ...`` node ids into a graph, in creation order."""
+    """Mints ``n1, n2, ...`` node ids into a graph, in creation order.
+
+    `guard` is shown each node's filter and inputs before it is made, and
+    refuses an input no node may read.
+    """
 
     def __init__(self, graph: Graph) -> None:
         self._graph = graph
         self._counter = 0
+        self.guard: Callable[[str, Sequence[FrameRef]], None] | None = None
 
     def node(
         self,
@@ -3598,6 +3707,8 @@ class _NodeFactory:
         reads_annotations: bool = False,
         rows_inputs: Sequence[str] = (),
     ) -> FrameRef:
+        if self.guard is not None:
+            self.guard(filter, inputs)
         self._counter += 1
         node_id = f"n{self._counter}"
         self._graph.nodes[node_id] = Node(
@@ -3673,6 +3784,14 @@ class _Lowerer:
         # A feeder group's one connection: the FROM items it carries, its
         # port, and the argument that opened it, for a refusal to point at.
         self._feeder_groups: dict[str, tuple[frozenset[str], int, exp.Expr]] = {}
+        # Each run-time lateral a column read reached, by its key
+        # (:meth:`_lower_lateral`), and the expression each of its streams was
+        # last read as, for a refusal to quote.
+        self._laterals: dict[str, _LateralUse] = {}
+        self._lateral_readers: dict[FrameRef, exp.Expr] = {}
+        # The expressions being lowered, innermost last: where a node that
+        # reads a run-time lateral's stream was written.
+        self._lowering: list[exp.Expr] = []
         # The refusals this branch's VARIADIC calls deferred by lowering an
         # aggregate over no rows to a NULL cell (:meth:`_variadic_array`).
         self.empty_aggregates: list[FfrwdError] = []
@@ -3683,6 +3802,7 @@ class _Lowerer:
         self.on_warning = on_warning
         self.graph = Graph(input_paths=list(res.input_paths), sources=dict(res.sources))
         self.ctx = _NodeFactory(self.graph)
+        self.ctx.guard = self._refuse_lateral_input
         self.cte_columns: dict[str, tuple[_Column, ...]] = {}
         # The VALUE columns of each CTE body, name -> column -> one value per
         # body row. Filled as each body lowers, read when its alias binds.
@@ -4008,6 +4128,7 @@ class _Lowerer:
                 )
             ]
         self._place_feeders()
+        self._place_laterals()
         self._check_every_packet_filter_placed()
         self._check_every_data_output_read()
         self._check_loudnorm2()
@@ -10571,16 +10692,57 @@ class _Lowerer:
         what binding the same expression in a CTE first already gave. The
         branch is part of the key: a copy lowered under another environment
         is another value, and is built again.
+
+        A stream argument bound to a sql function's parameter is checked
+        against the kind that parameter declares, now that it is built
+        (:meth:`_check_declared_stream`).
         """
-        shared = node.meta.get(SHARED_ARGUMENT)
-        if shared is None:
-            return self._lower_stream_expr(node, env, select)
-        key = (str(shared), id(env))
-        found = self._shared_arguments.get(key)
-        if found is None:
-            found = self._lower_stream_expr(node, env, select)
-            self._shared_arguments[key] = found
+        self._lowering.append(node)
+        try:
+            shared = node.meta.get(SHARED_ARGUMENT)
+            if shared is None:
+                found = self._lower_stream_expr(node, env, select)
+            else:
+                key = (str(shared), id(env))
+                cached = self._shared_arguments.get(key)
+                found = (
+                    self._lower_stream_expr(node, env, select) if cached is None else cached
+                )
+                self._shared_arguments[key] = found
+        finally:
+            self._lowering.pop()
+        declared = node.meta.get(DECLARED_STREAM)
+        if declared is not None:
+            self._check_declared_stream(node, found, declared, select)
+        if isinstance(_unwrap(node), exp.Column | exp.Bracket):
+            for stream in found.streams:
+                if _lateral_parts(stream.ref) is not None:
+                    self._lateral_readers[stream.ref] = node
         return found
+
+    def _check_declared_stream(
+        self, node: exp.Expr, value: _Value, declared: object, select: exp.Select
+    ) -> None:
+        """A stream bound to a sql function's parameter, against its type.
+
+        Only a data stream against a picture or sound is checked: a data
+        stream is messages, never frames, so neither can stand for the other.
+        """
+        if not isinstance(declared, tuple) or len(declared) != 3:
+            return
+        function, name, written = (str(part) for part in declared)
+        wants_data = element_type(written) == WASM_DATA
+        if (value.type == "data") == wants_data:
+            return
+        got = f"a {value.type} stream"
+        raise _error(
+            ErrorCode.UDF_ARG_TYPE,
+            f"{function}() takes {written} as its '{name}' argument, got {got}",
+            node,
+            fallback=select,
+            hint="a data_stream is messages, a video_stream or audio_stream frames; "
+            "pass the kind the parameter declares",
+        )
 
     def _lower_stream_expr(self, node: exp.Expr, env: _Env, select: exp.Select) -> _Value:
         node = _unwrap(node)
@@ -12791,6 +12953,9 @@ class _Lowerer:
         if call.variadic is not None and not call.is_macro:
             return self._lower_variadic_call(node, name, call, env, select)
         if not call.namespaced and not call.is_macro:
+            lateral = self.res.laterals.get(name)
+            if lateral is not None:
+                return self._lower_lateral(node, name, lateral, call, env, select)
             declared = self.res.wasm.get(name)
             if declared is not None:
                 if declared.is_value:
@@ -14281,6 +14446,10 @@ class _Lowerer:
             if is_src(current):
                 found.add(src_alias(current))
                 continue
+            lateral = _lateral_parts(current)
+            if lateral is not None:
+                found.add(self._laterals[lateral[0]].declared.alias)
+                continue
             producer = self.graph.nodes.get(current.partition(":")[0])
             if producer is not None:
                 stack.extend(producer.inputs)
@@ -14318,10 +14487,21 @@ class _Lowerer:
 
     def _open_feed(self) -> int:
         """A new feeder connection, on a port of its own."""
-        port = free_loopback_port()
-        while port in self._feeds:
-            port = free_loopback_port()
+        port = self._free_port()
         self._feeds[port] = _Connection()
+        return port
+
+    def _free_port(self) -> int:
+        """A loopback port for this compile, clear of every one it has taken
+        and of the one above each, which a module may listen on too."""
+        taken = {
+            *self._feeds,
+            *(lateral.tap for lateral in self.graph.laterals),
+        }
+        near = {port + step for port in taken for step in (-1, 0, 1)}
+        port = free_loopback_port()
+        while port in near:
+            port = free_loopback_port()
         return port
 
     def _feed(
@@ -14337,7 +14517,8 @@ class _Lowerer:
 
         The stream is conformed to what the module reads its programme in
         (:meth:`_conformed_feed`), once however many calls of one group it
-        feeds.
+        feeds. A run-time lateral's stream is conformed by its own instances,
+        whose values the programme's shape binds (:meth:`_feed_shape`).
         """
         connection = self._feeds[port]
         connection.calls.append(
@@ -14347,6 +14528,18 @@ class _Lowerer:
             return
         if fed.stream.type == "audio" and not connection.audio_codec:
             connection.audio_codec = wire_audio(described).codec
+        lateral = _lateral_parts(fed.stream.ref)
+        if lateral is not None:
+            use = self._laterals[lateral[0]]
+            connection.lateral = lateral[0]
+            if fed.stream.type == "video" and not connection.pix_fmt:
+                connection.pix_fmt = wire_pix_fmt(described)
+            if port not in use.ports:
+                use.ports.append(port)
+            for name, value in self._feed_shape(fed.stream.type, programme, described).items():
+                use.shape.setdefault(name, value)
+            connection.streams[fed.stream.ref] = fed.stream
+            return
         connection.streams[fed.stream.ref] = _Stream(
             ref=self._conformed_feed(fed.stream, programme, described),
             type=fed.stream.type,
@@ -14376,17 +14569,43 @@ class _Lowerer:
             return self.ctx.node(
                 "format", {"pix_fmts": wire_pix_fmt(described)}, [ref], ["video"]
             )
+        shape = self._feed_shape("audio", programme, described)
+        args: dict[str, object] = {"sample_fmts": shape["sample_fmt"]}
+        if "rate" in shape:
+            args["sample_rates"] = shape["rate"]
+        if "channels" in shape:
+            args["channel_layouts"] = _channel_layout(int(shape["channels"]))
+        return self.ctx.node("aformat", args, [ref], ["audio"])
+
+    def _feed_shape(
+        self, kind: StreamType, programme: FrameRef, described: Described
+    ) -> dict[str, str | int | float]:
+        """What a feeder of `kind` is made to be, by the value it binds.
+
+        A picture is the module's pixel format and, where the programme is an
+        input's own stream and so was probed, its size and frame rate. Sound
+        is the module's sample format, and the rate and channel count the
+        module asks for, else the programme's where it was probed.
+        """
+        meta = self._probed_meta(programme)
+        shape: dict[str, str | int | float] = {}
+        if kind == "video":
+            if meta is not None and meta.width and meta.height:
+                shape["width"], shape["height"] = meta.width, meta.height
+            fps = _parse_rate(meta.fps) if meta is not None else None
+            if fps is not None:
+                shape["fps"] = int(fps) if fps.is_integer() else fps
+            shape["pix_fmt"] = wire_pix_fmt(described)
+            return shape
         wire = wire_audio(described)
         rate = wire.required_rate or (meta.sample_rate if meta is not None else None)
         channels = wire.required_channels or (meta.channels if meta is not None else None)
-        args: dict[str, object] = {
-            "sample_fmts": FFMPEG_SAMPLE_FMTS[wire_sample_fmt(described)]
-        }
         if rate:
-            args["sample_rates"] = rate
+            shape["rate"] = rate
         if channels:
-            args["channel_layouts"] = _channel_layout(channels)
-        return self.ctx.node("aformat", args, [ref], ["audio"])
+            shape["channels"] = channels
+        shape["sample_fmt"] = FFMPEG_SAMPLE_FMTS[wire_sample_fmt(described)]
+        return shape
 
     def _probed_meta(self, ref: FrameRef) -> StreamMeta | None:
         """What the probe said of `ref`, when it is an input's own stream."""
@@ -14404,6 +14623,8 @@ class _Lowerer:
         file output of it would carry, so the module reading it sees them."""
         tags = self._layered_tags()
         for port, connection in self._feeds.items():
+            if connection.lateral:
+                continue
             streams = sorted(
                 connection.streams.values(), key=lambda s: 0 if s.type == "video" else 1
             )
@@ -14425,6 +14646,147 @@ class _Lowerer:
                 )
             )
             self.graph.feeders[path] = tuple(connection.calls)
+
+    # -- run-time laterals --
+
+    def _lower_lateral(
+        self,
+        node: exp.Expr,
+        key: str,
+        lateral: RuntimeLateral,
+        call: _Call,
+        env: _Env,
+        select: exp.Select,
+    ) -> _Value:
+        """One column of a run-time lateral: a stream only a feeder may read.
+
+        Nothing of it is built here: its instances are compiled per message
+        at run time. The first read lowers the data stream they are started
+        from, which has to be one data stream.
+        """
+        column, kind = _lateral_column(lateral, call)
+        if key not in self._laterals:
+            argument = call.args[0]
+            got = self._classify(argument, env, select)
+            value = self._lower_expr(argument, env, select) if got == "data" else None
+            if value is None or value.is_array or len(value.streams) != 1:
+                if value is not None:
+                    shown = f"{len(value.streams)} of them"
+                elif got in _STREAM_KINDS:
+                    shown = f"a {got} stream"
+                else:
+                    shown = "a value"
+                raise _error(
+                    ErrorCode.UDF_ARG_TYPE,
+                    f"{lateral.function}() takes {lateral.first.type} as its "
+                    f"'{lateral.first.name}' argument, got {shown}",
+                    argument,
+                    fallback=select,
+                    hint="pass one data stream of a FROM item to its left: a data "
+                    "filter's output, or an input's data[1]",
+                )
+            self._laterals[key] = _LateralUse(
+                declared=lateral, stream=value.streams[0], anchor=node
+            )
+        return _scalar(_Stream(ref=f"{_LATERAL_REF}{key}:{column}", type=kind))
+
+    def _refuse_lateral_input(self, filter: str, inputs: Sequence[FrameRef]) -> None:
+        """A node may not read a run-time lateral's stream: between messages
+        there is nothing to read. Refused where the call making it is written."""
+        ref = next((one for one in inputs if _lateral_parts(one) is not None), None)
+        if ref is None:
+            return
+        anchor = self._lowering[-1] if self._lowering else None
+        called = _call_parts(anchor) if anchor is not None else None
+        raise self._lateral_refusal(ref, called.display if called is not None else filter, anchor)
+
+    def _lateral_refusal(
+        self, ref: FrameRef, consumer: str, anchor: exp.Expr | None
+    ) -> FfrwdError:
+        """The refusal for `consumer` reading a run-time lateral's stream."""
+        parts = _lateral_parts(ref)
+        assert parts is not None  # only asked about a lateral's own stream
+        key, column = parts
+        use = self._laterals[key]
+        reader = self._lateral_readers.get(ref)
+        read = (
+            reader.sql(dialect="postgres")
+            if reader is not None
+            else f"{use.declared.alias}.{column}"
+        )
+        kind = next(
+            WASM_STREAM_TYPES[c.type] for c in use.declared.columns if c.name == column
+        )
+        return _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"'{read}' comes from LATERAL {use.declared.call}, which starts a "
+            "source per row of a data stream: it is empty between rows, and "
+            f"{consumer} reads a frame on every tick. A run-time lateral's "
+            "streams can only go to a module input declared 'feeder'",
+            anchor if anchor is not None else (reader or use.anchor),
+            hint="pass it to a feeder, such as the second argument of "
+            f"ffrwd.switch.{kind}(<programme>, {read})",
+        )
+
+    def _place_laterals(self) -> None:
+        """Each run-time lateral whose streams reach a feeder: its data stream
+        written to a loopback port the host reads, and its instance's template.
+
+        A COPY writing one of its streams is refused, as a node reading one
+        was: a destination writes a frame on every tick too.
+        """
+        for unit in self.graph.sinks:
+            for output in unit.outputs:
+                if _lateral_parts(output.ref) is not None:
+                    raise self._lateral_refusal(output.ref, "a COPY", None)
+        for use in self._laterals.values():
+            if not use.ports:
+                continue
+            tap = self._free_port()
+            path = feeder_path(tap)
+            self.graph.sinks.append(
+                SinkUnit(
+                    outputs=[Output(ref=use.stream.ref, type="data", name=None, metadata={})],
+                    path=path,
+                    options={"format": _TAP_FORMAT},
+                )
+            )
+            declared = use.declared
+            line, col = _pos(use.anchor)
+            shapes = {
+                param.name: shape
+                for param in declared.params
+                if (shape := use.shape.get(param.name)) is not None
+                # A shape binds a value of its own type only.
+                and isinstance(shape, str) == (param.type == "text")
+            }
+            self.graph.laterals.append(
+                Lateral(
+                    function=declared.function,
+                    call=declared.call,
+                    stream=declared.stream,
+                    tap=tap,
+                    template=_instance_template(
+                        declared, [(port, self._feeds[port]) for port in use.ports]
+                    ),
+                    values=tuple(
+                        LateralValue(
+                            name=param.name,
+                            type=param.type,
+                            shape=shapes.get(param.name),
+                            default=param.default is not None,
+                        )
+                        for param in declared.params
+                    ),
+                    connections=tuple(
+                        LateralConnection(port=port, calls=tuple(self._feeds[port].calls))
+                        for port in use.ports
+                    ),
+                    needs=declared.needs,
+                    line=line,
+                    col=col,
+                )
+            )
 
     def _lower_data_field(
         self, node: exp.Expr, env: _Env, select: exp.Select
@@ -16894,6 +17256,10 @@ class _Lowerer:
                         hint=self._macro_function_hint(name),
                     )
                 return macro.output
+            # A run-time lateral's column is the stream its declaration names.
+            lateral = None if call.namespaced else self.res.laterals.get(name)
+            if lateral is not None:
+                return _lateral_column(lateral, call)[1]
             # A module's output type is its declaration's, not the registry's:
             # the registry has never heard of it. A VALUE function has no pad
             # at all, and its call is refused where it is lowered.

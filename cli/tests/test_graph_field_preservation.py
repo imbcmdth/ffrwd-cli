@@ -20,6 +20,9 @@ from ffrwd.emit import _drop_input_slots
 from ffrwd.ir import (
     FeederCall,
     Graph,
+    Lateral,
+    LateralConnection,
+    LateralValue,
     ModuleSource,
     Node,
     Output,
@@ -82,6 +85,17 @@ def _sentinel_graph() -> Graph:
     }
     g.dropped_aliases = {"c"}
     g.feeders = {"tcp://127.0.0.1:50000": (FeederCall(node="m", function="f", param="feed"),)}
+    g.laterals = [
+        Lateral(
+            function="play",
+            call="play(s.data[1])",
+            stream="s.data[1]",
+            tap=50002,
+            template="COPY (SELECT ad.video FROM play(NULL, url => :'url') ad) TO 'x'",
+            values=(LateralValue("url", "text"),),
+            connections=(LateralConnection(port=50000, calls=()),),
+        )
+    ]
     return g
 
 

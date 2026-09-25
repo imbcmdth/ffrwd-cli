@@ -62,8 +62,13 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   before it is used and before the first `COPY`, every definition must
   be called, and a value-returning one is legal anywhere a value of its
   type is while a `TABLE`-returning one is a `FROM` row source only. A
-  parameter may declare `DEFAULT literal`; calls are positional, so an
-  omitted trailing argument takes it. Recipes
+  parameter may declare `DEFAULT literal`, which an omitted argument
+  takes. Arguments are positional, and after the positionals a call may
+  write any parameter by name, `name => value`; a name the function does
+  not have, or one a positional already wrote, is refused at the call.
+  A stream argument is checked against the stream a parameter declares
+  wherever the body reads it: a data stream stands for no picture or
+  sound, nor the other way round. Recipes
   [67-68](examples.md#67-write-a-function-and-reuse-it),
   [79](examples.md#79-give-a-parameter-a-default).
 - An **argument is one expression**, however often the body reads the
@@ -147,6 +152,57 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   feeder naming no group has a connection of its own. `compile` lists
   each connection: the process writing it, its port, and the calls
   reading it.
+- A **run-time lateral** is a `TABLE`-returning function whose first
+  parameter is a `data_stream`, called in `FROM` over the data stream of
+  an item to its left: `FROM awards, LATERAL ffrwd.vast.play(awards.launch)
+  ad`. A data stream's rows exist only as it plays, so the call is never
+  expanded at compile time: its body is compiled and run once per
+  message, while the query runs. It is declared `play(launch data_stream,
+  url text, start_pts number, ..., channels number DEFAULT 2) RETURNS
+  TABLE(video video_stream, audio audio_stream)`, either column or both;
+  every parameter after the data stream is a text, number or boolean
+  value, and the body does not read the data stream.
+  - Its streams are empty between messages, so they go to a feeder and
+    nowhere else: `ffrwd.switch.video(prog.v, ads.video)`. A filter, a
+    module's pad or a `COPY` reading one is refused. Feeders of one group
+    fed by its picture and its sound share one connection, which an
+    instance writes as one NUT, picture then sound.
+  - Each value is bound by name, per message, in this order: an argument
+    the call wrote, which is a constant the same for every message; the
+    message's field of that name (a number for a number, a string for
+    text, true or false for a boolean; any other refuses that instance);
+    for `width`, `height`, `fps` and `pix_fmt` what the video feeder the
+    result goes to reads its programme as, and for `rate`, `channels` and
+    `sample_fmt` what the audio feeder does (the module's own format, and
+    the programme's size, rate and channels where it is a probed input's
+    own stream); the `DEFAULT`; else the instance is refused, naming the
+    value.
+  - The body is resolved once while compiling, with a stand-in for each
+    value, so one that cannot compile is refused before the run. While
+    it runs, an ffmpeg writes the data stream to a loopback port the host
+    reads, with the `data` muxer, one JSON object after another; each
+    message is bound, compiled as `ffrwd run -v` compiles a query, and run
+    beside the query as a plan of its own, whose processes end with the
+    run and write their stderr where `FFRWD_DUMP_STDERR` names. An
+    instance starts as its message arrives, not at `start_pts`: the body
+    stamps its own pts, and a switch holds a timed feeder until the
+    programme reaches it. A heartbeat starts nothing.
+  - One instance runs at a time. A message arriving while one runs waits
+    its turn, and one whose `start_pts` to `start_pts + duration`
+    overlaps the running or a waiting instance is refused. Every message
+    ends with a row on the run's rows: `{"event": "feeder", "row": <n>,
+    "start_pts": ..., "exit": <code>}` for an instance that ran, and
+    `"refused": "<why>"` in place of `exit` for one that did not.
+  - Written with NULL in the data stream's place and every value
+    written, the call is one instance, expanded at compile time the way
+    any lateral call is, with the body's `tags` on what the query writes:
+    `FROM play(NULL, url => 'ad.mp4', start_pts => 12.5, ...) ad`. That is
+    what each message compiles.
+  - `compile` lists a run-time lateral as a block of its own after the
+    processes: the data stream and the process writing it to the host,
+    the feeder connections its instances write, what binds each value,
+    and the instance as SQL with each value bound per message a hole,
+    `<url>`.
 - **`--jobs N`**, on `compile` and `run`, caps the sidecar's worker
   threads at N. The sidecar runs a pool sized to the machine's cores by
   default, and a module that describes itself as pure spreads across it
@@ -1086,6 +1142,7 @@ Every FROM item is a compile-time table; the column model per shape is
 | `generate_series(start, stop[, step]) alias` | `stop - start` over `step`, inclusive | alias mandatory, names both the row table and its one column (`i.i`); bounds and step are whole numbers the compiler can count - an integer literal after substitution, `array_length(<array>, 1)`, or arithmetic over those |
 | `cte_or_view_name [alias]` | its body's rows | a multi-row body is a multi-row source |
 | `function_name(args) alias` | its body's rows, per outer row | a table-returning function, expanded at compile time; its arguments read the items to its left |
+| `function_name(<data stream>, args) alias` | 1 | a run-time lateral: a table-returning function whose first parameter is a `data_stream`, its body run once per message while the query runs; its streams go to a feeder only (see [Statements](#statements)) |
 
 An argument of a call in FROM may read any FROM item written to its
 LEFT, and nothing else: a call sees the aliases written before it, as
@@ -1605,6 +1662,13 @@ Every one of these is a typed rejection, never a silent reinterpretation:
   (past its stream parameters, of another kind, or naming a port
   parameter that is not a number), a stream in a feeder's place with
   the port written too, and one feeder group fed from two FROM items;
+  a run-time lateral's stream read by anything but a feeder, one
+  returning a column other than one picture and one sound, taking a
+  stream after its data stream, reading its data stream in its body,
+  called over something other than one data stream of an item to its
+  left, writing a value that reads a FROM item, or with a body that
+  does not compile; a data stream where a sql function declares a
+  picture or sound, or the reverse;
   a call in
   `FROM` unless it returns source, a `RETURNS source` call anywhere
   but `FROM` or one handed a stream; a `RETURNS sink` call anywhere

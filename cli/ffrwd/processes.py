@@ -109,12 +109,14 @@ from .ir import (
     FeederCall,
     FrameRef,
     Graph,
+    Lateral,
     ModuleSource,
     Node,
     Output,
     RowsSink,
     SinkUnit,
     StreamType,
+    feeder_path,
     feeder_port,
     is_src,
     src_parts,
@@ -530,6 +532,11 @@ class FeederEdge:
     the port, and the writer is started once the port accepts. It joins the
     two processes into one stage all the same. `calls` are the calls in
     `target` reading the connection.
+
+    A run-time lateral's connection is written by the instances the host
+    starts per message, and its `source` is the process writing the
+    lateral's data stream to the host: started once the port accepts, as a
+    writer is, since no instance can be heard before then.
     """
 
     source: str
@@ -934,6 +941,9 @@ class ProcessPlan:
 
     processes: tuple[Process, ...] = ()
     edges: tuple[Edge, ...] = ()
+    # Each run-time lateral, the process writing its data stream to the host
+    # named on it.
+    laterals: tuple[Lateral, ...] = ()
 
     @property
     def ffmpeg(self) -> tuple[FfmpegProcess, ...]:
@@ -982,11 +992,14 @@ class ProcessPlan:
         return _stages(self.processes, self.edges)
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        d: dict[str, object] = {
             "processes": [p.to_dict() for p in self.processes],
             "edges": [e.to_dict() for e in self.edges],
             "stages": [s.to_dict() for s in self.stages],
         }
+        if self.laterals:
+            d["laterals"] = [lateral.to_dict() for lateral in self.laterals]
+        return d
 
 
 # ---------------------------------------------------------------- marking
@@ -2414,7 +2427,7 @@ class _Partitioner:
             units = [
                 unit
                 for unit, at in zip(self.g.sinks, self.sink_depth)
-                if at == depth and unit.path not in self.g.feeders
+                if at == depth and unit.path not in self._written_alone
             ]
             if not units:
                 continue
@@ -2430,7 +2443,7 @@ class _Partitioner:
             demands.extend((process.id, ref, depth) for ref in self._consumed(process))
 
         for unit, depth in zip(self.g.sinks, self.sink_depth):
-            if unit.path is None or unit.path not in self.g.feeders:
+            if unit.path is None or unit.path not in self._written_alone:
                 continue
             refs = [o.ref for o in unit.outputs]
             process = _Pending(
@@ -2524,20 +2537,44 @@ class _Partitioner:
         return ProcessPlan(
             processes=tuple(processes),
             edges=(*self.edges, *self.rows, *self.documents, *self._feeder_edges()),
+            laterals=tuple(
+                replace(lateral, writer=self.feeding[feeder_path(lateral.tap)])
+                for lateral in self.g.laterals
+            ),
         )
 
+    @property
+    def _written_alone(self) -> set[str]:
+        """The units a process of their own writes: each feeder connection,
+        and each run-time lateral's data stream on its way to the host."""
+        return {*self.g.feeders, *(feeder_path(one.tap) for one in self.g.laterals)}
+
     def _feeder_edges(self) -> list[FeederEdge]:
-        """One edge per feeder connection and process reading it."""
-        found: list[FeederEdge] = []
+        """One edge per feeder connection and process reading it.
+
+        A run-time lateral's connections are written by the instances the
+        host starts, not by a process of the plan: their edges go from the
+        process writing its data stream, which is what joins it to the
+        stage its readers run in and what starts it once they listen.
+        """
+        connections: list[tuple[str, int, tuple[FeederCall, ...]]] = []
         for path, source in self.feeding.items():
+            if path in self.g.feeders:
+                connections.append((source, feeder_port(path), self.g.feeders[path]))
+        for lateral in self.g.laterals:
+            source = self.feeding[feeder_path(lateral.tap)]
+            connections.extend(
+                (source, connection.port, connection.calls)
+                for connection in lateral.connections
+            )
+        found: list[FeederEdge] = []
+        for source, port, calls in connections:
             targets: dict[str, list[FeederCall]] = {}
-            for call in self.g.feeders[path]:
+            for call in calls:
                 targets.setdefault(self.sidecar_of[call.node], []).append(call)
             found.extend(
-                FeederEdge(
-                    source=source, target=target, port=feeder_port(path), calls=tuple(calls)
-                )
-                for target, calls in targets.items()
+                FeederEdge(source=source, target=target, port=port, calls=tuple(found_calls))
+                for target, found_calls in targets.items()
             )
         return found
 

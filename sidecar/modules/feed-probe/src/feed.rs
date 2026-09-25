@@ -6,9 +6,12 @@
 //!
 //! A connection that ends before it has said anything is dropped and the next
 //! one is taken, since the host tries the port once before it starts the
-//! feeder's writer. The last call waits for the feeder to finish, up to
-//! `DRAIN_SECONDS`, so every packet it sent is counted however the two
-//! streams raced. A run with no feeder at all pays that wait once, at the end.
+//! feeder's writer. One that has said something and ended is followed by the
+//! next one to come, read the same way, since a run-time lateral's instances
+//! each connect in turn. The last call waits for the feeder connected then,
+//! or for a first one if none has come, to finish, up to `DRAIN_SECONDS`, so
+//! every packet it sent is counted however the two streams raced. A run with
+//! no feeder at all pays that wait once, at the end.
 
 use std::marker::PhantomData;
 
@@ -109,8 +112,8 @@ impl Conn {
 /// The listening socket, and the feeder connection once it has come.
 pub struct Feed<P: Probe> {
     conn: Option<Conn>,
-    /// Whether a feeder has come and gone: nothing more is taken after it.
-    done: bool,
+    /// Whether a feeder has come and gone.
+    heard: bool,
     listener: TcpSocket,
     /// Named last so it outlives the socket made from it.
     _network: Network,
@@ -150,7 +153,7 @@ impl<P: Probe> Feed<P> {
             })?;
         Ok(Feed {
             conn: None,
-            done: false,
+            heard: false,
             listener,
             _network: network,
             _probe: PhantomData,
@@ -158,11 +161,8 @@ impl<P: Probe> Feed<P> {
     }
 
     /// Takes a waiting connection, reads what has arrived, and says whether
-    /// the feeder has finished. Never waits.
+    /// a feeder has finished with none connected since. Never waits.
     pub fn step(&mut self, rows: &mut Vec<String>) -> bool {
-        if self.done {
-            return true;
-        }
         if self.conn.is_none() {
             if let Ok((socket, input, output)) = self.listener.accept() {
                 self.conn = Some(Conn {
@@ -177,16 +177,16 @@ impl<P: Probe> Feed<P> {
             }
         }
         let Some(conn) = self.conn.as_mut() else {
-            return false;
+            return self.heard;
         };
         conn.read::<P>(rows);
         if !conn.closed {
             return false;
         }
         // One that said nothing was somebody trying the port.
-        self.done = conn.heard;
+        self.heard |= conn.heard;
         self.conn = None;
-        self.done
+        self.heard
     }
 
     /// Steps until the feeder has finished or the wait runs out.
