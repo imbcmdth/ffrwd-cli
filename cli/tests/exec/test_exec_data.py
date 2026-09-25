@@ -8,12 +8,20 @@ explicitly::
 `tests/data/deal.nut` is a two second 64x48 h264 picture and a data stream
 of three deal messages, at 0, 0.4 and 1.2 seconds. It is committed rather
 than generated, since no ffmpeg on its own writes JSON messages at chosen
-times. It was made with ffrwd-nut's `json_nut` example and one ffmpeg merge::
+times. It was made with ffrwd-nut's `json_nut` example, fed `deal.txt`, one
+message a line as its pts in microseconds, a tab, and the object::
 
-    printf '0\\t{"kind":"break","id":1,"start_pts":0.5,"duration":1.0}\\n400000\\t{"kind":"award","break":1,"node":"root","price":11.42}\\n1200000\\t{"kind":"break","id":2,"start_pts":1.6,"duration":0.3}\\n' > deal.txt
+    0         {"kind":"break","id":1,"start_pts":0.5,"duration":1.0}
+    400000    {"kind":"award","break":1,"node":"root","price":11.42}
+    1200000   {"kind":"break","id":2,"start_pts":1.6,"duration":0.3}
+
+and one ffmpeg merge::
+
     cargo run --example json_nut < deal.txt > deal-only.nut     # in ffrwd-nut
-    ffmpeg -f lavfi -i testsrc2=size=64x48:rate=10:duration=2 -c:v libx264 -bf 0 -g 10 -pix_fmt yuv420p video.mp4
-    ffmpeg -i video.mp4 -copyts -f nut -i deal-only.nut -map 0:v -map 1:d -c copy -f nut deal.nut
+    ffmpeg -f lavfi -i testsrc2=size=64x48:rate=10:duration=2 \
+           -c:v libx264 -bf 0 -g 10 -pix_fmt yuv420p video.mp4
+    ffmpeg -i video.mp4 -copyts -f nut -i deal-only.nut \
+           -map 0:v -map 1:d -c copy -f nut deal.nut
 """
 
 from __future__ import annotations
