@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ffrwd"
-version = "0.18.9"
+version = "0.19.0"
 description = "A free package registry for video pipelines: install recipes and WebAssembly filters, written in SQL and compiled to ffmpeg commands you can read."
 readme = "README.md"
 keywords = [
@@ -33,9 +33,9 @@ dependencies = [
     # alone, wasm calls degrading to the FFRWD_WASM / PATH hint. The wheel
     # matrix covers glibc and musl both, so the linux marker is honest on
     # Alpine-class machines too.
-    'ffrwd-wasm==0.18.9; sys_platform == "linux" and platform_machine in "x86_64 aarch64"',
-    'ffrwd-wasm==0.18.9; sys_platform == "win32" and platform_machine in "AMD64 ARM64"',
-    'ffrwd-wasm==0.18.9; sys_platform == "darwin" and platform_machine == "arm64"',
+    'ffrwd-wasm==0.19.0; sys_platform == "linux" and platform_machine in "x86_64 aarch64"',
+    'ffrwd-wasm==0.19.0; sys_platform == "win32" and platform_machine in "AMD64 ARM64"',
+    'ffrwd-wasm==0.19.0; sys_platform == "darwin" and platform_machine == "arm64"',
 ]
 # No `License ::` classifier here: `license` below is an SPDX expression, and
 # setuptools refuses to build a project that carries both.
