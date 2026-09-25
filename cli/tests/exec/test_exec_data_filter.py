@@ -150,14 +150,25 @@ def test_a_clock_alone_times_what_a_data_filter_writes(tmp_path: Path) -> None:
 
 
 def test_a_data_pad_and_a_clock_together(tmp_path: Path) -> None:
-    """The messages come through stamped, and the ticks fall between them:
-    one stream in pts order."""
+    """The messages come through stamped, in order, and the ticks with them:
+    one stream whose pts never go back.
+
+    WHEN a message reaches the filter against its clock is ffmpeg's to say:
+    one ffmpeg writes the messages to one pipe and the clock's frames to
+    another, and which it gets to first varies by build (static ffmpeg 8.0.1
+    on Linux has handed every message over after the last frame). A message
+    that arrives after its time has passed is written at the latest time
+    written, never behind it, so each message leaves at or after its own pts.
+    """
     found = _run(
         "COPY (SELECT stamp_both(f.data[1], f.video[1], 'es', 0.5) "
         "FROM input('{deal}') f) TO '{out}'",
         tmp_path / "both.nut",
     )
-    assert [m for m in found if m[1].get("kind") != "tick"] == _stamped("es")
+    messages = [m for m in found if m[1].get("kind") != "tick"]
+    want = _stamped("es")
+    assert [message for _, message in messages] == [message for _, message in want]
+    assert all(at >= own - 1e-6 for (at, _), (own, _) in zip(messages, want, strict=True))
     _ticks(found, "es", 0.5)
     assert [at for at, _ in found] == sorted(at for at, _ in found)
 
