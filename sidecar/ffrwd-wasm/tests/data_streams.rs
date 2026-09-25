@@ -2,7 +2,7 @@
 //! publishes, written as a JSON NUT; the same NUT handed to a packet sink
 //! and a packet filter as a data pad; and refused, by name, at a module
 //! built against a world with no data arm. Each data edge also carries
-//! heartbeats, empty packets saying how far time has got, which no module
+//! heartbeats, packets holding a single space saying how far time has got, which no module
 //! is ever handed.
 //!
 //! `source_replay_data` publishes the messages mirrored in `MESSAGES` (see
@@ -139,11 +139,16 @@ fn read_packets(wire: &[u8]) -> Vec<(i64, Option<i64>, bool, Vec<u8>)> {
     packets
 }
 
-/// The pts of every heartbeat a JSON NUT carries: its empty packets.
+/// Whether a packet is a heartbeat: nothing but whitespace.
+fn is_heartbeat(data: &[u8]) -> bool {
+    data.iter().all(u8::is_ascii_whitespace)
+}
+
+/// The pts of every heartbeat a JSON NUT carries.
 fn heartbeats(wire: &[u8]) -> Vec<i64> {
     read_packets(wire)
         .into_iter()
-        .filter(|(_, _, _, data)| data.is_empty())
+        .filter(|(_, _, _, data)| is_heartbeat(data))
         .map(|(pts, _, _, _)| pts)
         .collect()
 }
@@ -177,7 +182,7 @@ fn assert_carries_the_messages(wire: &[u8]) {
 
     let packets: Vec<_> = read_packets(wire)
         .into_iter()
-        .filter(|(_, _, _, data)| !data.is_empty())
+        .filter(|(_, _, _, data)| !is_heartbeat(data))
         .collect();
     assert_eq!(packets.len(), MESSAGES.len(), "one packet per message");
     for (index, ((pts, dts, keyframe, data), (want_pts, want))) in

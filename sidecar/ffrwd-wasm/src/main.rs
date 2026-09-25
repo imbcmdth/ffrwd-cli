@@ -2821,9 +2821,9 @@ fn message_packet(pts: i64, data: Vec<u8>) -> runtime::Packet {
     }
 }
 
-/// A heartbeat at `pts`: a message packet with nothing in it.
+/// A heartbeat at `pts`: a message packet carrying [`heartbeat::PAYLOAD`].
 fn heartbeat_packet(pts: i64) -> runtime::Packet {
-    message_packet(pts, Vec::new())
+    message_packet(pts, heartbeat::PAYLOAD.to_vec())
 }
 
 /// Takes the heartbeats out of the data pads of one batch, `data` saying

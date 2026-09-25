@@ -4439,7 +4439,7 @@ fn read_data_packets(wire: &[u8]) -> Vec<(i64, String)> {
 /// heartbeats.
 fn read_messages(wire: &[u8]) -> Vec<(i64, String)> {
     let mut messages = read_data_packets(wire);
-    messages.retain(|(_, message)| !message.is_empty());
+    messages.retain(|(_, message)| !message.trim().is_empty());
     messages
 }
 
@@ -4447,7 +4447,7 @@ fn read_messages(wire: &[u8]) -> Vec<(i64, String)> {
 fn read_heartbeats(wire: &[u8]) -> Vec<i64> {
     read_data_packets(wire)
         .into_iter()
-        .filter(|(_, message)| message.is_empty())
+        .filter(|(_, message)| message.trim().is_empty())
         .map(|(pts, _)| pts)
         .collect()
 }

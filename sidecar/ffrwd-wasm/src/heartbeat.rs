@@ -3,12 +3,18 @@
 //! A data stream is sparse: minutes may pass between two messages. ffmpeg
 //! cannot open a NUT data input until its first packet arrives, and once
 //! open it holds the other streams of a file back until the data stream's
-//! next packet shows time has moved on. So a data edge also carries EMPTY
-//! packets, zero bytes of payload, each saying "no message; time has reached
-//! this pts". Every writer of a data edge in this host puts one out at start
-//! and then one whenever time moves on with nothing written for
-//! [`EVERY`] of programme time; every reader drops them before a module sees
-//! them. ffmpeg copies them through like any other packet.
+//! next packet shows time has moved on. So a data edge also carries
+//! HEARTBEATS, packets whose payload is a single space, each saying "no
+//! message; time has reached this pts". Every writer of a data edge in this
+//! host puts one out at start and then one whenever time moves on with
+//! nothing written for [`EVERY`] of programme time; every reader drops them
+//! before a module sees them.
+//!
+//! Not an empty packet: some ffmpeg builds take a zero-length packet for
+//! the end of its stream and stop reading the pipe while its writer is still
+//! writing. A space is an ordinary one-byte packet to every ffmpeg, and to a
+//! JSON reader it is whitespace, never a message, since a message is an
+//! object.
 
 use ffrwd_wasm_runtime::runtime::TimeBase;
 
@@ -16,9 +22,13 @@ use ffrwd_wasm_runtime::runtime::TimeBase;
 /// writer knows time is moving: a tenth of a second.
 pub const EVERY: TimeBase = TimeBase { num: 1, den: 10 };
 
-/// Whether a data packet is a heartbeat rather than a message.
+/// What a heartbeat carries.
+pub const PAYLOAD: &[u8] = b" ";
+
+/// Whether a data packet is a heartbeat rather than a message: nothing but
+/// whitespace, which a zero-length packet written by an older host also is.
 pub fn is_heartbeat(data: &[u8]) -> bool {
-    data.is_empty()
+    data.iter().all(u8::is_ascii_whitespace)
 }
 
 /// `pts` in `from` restated in `to`, rounded down, so a time converted is

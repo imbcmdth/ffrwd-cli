@@ -44,13 +44,14 @@ in NUT: Matroska and mp4 refuse the stream, and MPEG-TS writes it as
 anonymous binary data with its clock moved, so a COPY of one to any other
 container is refused at compile time.
 
-A data stream a module writes also carries heartbeats: empty packets, no
-bytes at all, each saying time has reached its pts. One goes out when the
+A data stream a module writes also carries heartbeats: packets holding a
+single space, no message at all, each saying time has reached its pts. One goes out when the
 stream opens and one whenever the programme moves on a tenth of a second
 with nothing written, so the ffmpeg reading it opens it at once and never
 waits on the next message to write the picture beside it. ffrwd drops them
-before a module sees one; anything else reading such a file skips its empty
-packets.
+before a module sees one; anything else reading such a file skips any
+packet that is only whitespace. (Not an empty packet: some ffmpeg builds
+take one for the end of the stream.)
 
 ## The record is the stream
 

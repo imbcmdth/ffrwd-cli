@@ -86,7 +86,7 @@ def _run(query: str, out: Path) -> list[tuple[float, dict[str, object]]]:
 
 def _messages(path: Path) -> list[tuple[float, dict[str, object]]]:
     """Every message on `path`'s data stream: its time and its object. A
-    heartbeat carries no bytes and is left out."""
+    heartbeat carries only whitespace and is left out."""
     done = subprocess.run(
         [
             "ffprobe", "-v", "error", "-select_streams", "d",
@@ -103,7 +103,7 @@ def _messages(path: Path) -> list[tuple[float, dict[str, object]]]:
     return [
         (float(packet["pts_time"]), json.loads(body))
         for packet in parsed["packets"]
-        if (body := _hexdump_bytes(packet.get("data", "")))
+        if (body := _hexdump_bytes(packet.get("data", ""))).strip()
     ]
 
 
