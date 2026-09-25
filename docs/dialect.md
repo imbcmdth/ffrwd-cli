@@ -213,6 +213,36 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   value arguments - the query text is the command line. Recipes
   [98](examples.md#98-post-what-a-module-found-as-it-is-found),
   [99](corpus.md#99-watch-the-frames-go-by).
+- A **data-filter `LANGUAGE wasm` function** (`RETURNS data_stream`)
+  reads data streams of JSON messages and writes them, messages in and
+  messages out and not one for one: `stamp(d data_stream, node text)
+  RETURNS data_stream`. Its streams come first. A `data_stream`
+  parameter is a DATA PAD, whose messages the module reads; a
+  `video_stream` or `audio_stream` one is a CLOCK PAD, whose time alone
+  reaches it, so the module acts at programme times between messages.
+  One with a clock and no data pad (`sell(clock video_stream, every_s
+  number) RETURNS data_stream`) is a source of messages in effect. Its
+  values follow and become the module's parameters. Several outputs are
+  a struct of data streams in the module's own output order, `RETURNS
+  STRUCT(d data_stream, launch data_stream)`, each read off the call by
+  its field, `auction(f.data[1], f.video[1]).launch`, and every field
+  read off one call in one query is one instance. An output goes where
+  a data stream goes: into a `.nut` file, into another data filter, or
+  to a sink reading data streams as a pad after its video and audio.
+  The module runs in a sidecar of its own, one NUT pipe in per stream
+  argument and one out per output. A clock pad's picture crosses scaled
+  to 16x16, every frame and so every time and next to no pixels; a
+  sound clock crosses as pcm. Messages go sidecar to sidecar wherever
+  both ends are one, a process that only maps them keeps their times
+  as written, and a file holding them beside a picture or sound waits
+  at most 100 ms on the next one (`-max_interleave_delta 100000`), so an
+  announcement is not held behind the media it announces. A module
+  declaring rows writes them to the run's stdout, as a sink does.
+  Refused: a module that is not a data filter, or whose outputs do not
+  match the declaration in number; a declaration with no stream
+  parameter; a stream argument of the other kind from its parameter;
+  an output nothing reads; and the call itself where it returns a
+  struct.
 - A **packet sink read in FROM** is the same kind of module written
   somewhere else, and where it is written is what it means. A
   declaration over a stream whose RETURNS is an array of records -
