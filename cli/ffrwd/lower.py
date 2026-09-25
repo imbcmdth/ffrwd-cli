@@ -400,7 +400,7 @@ from ffrwd.probe import (
     track_cues,
 )
 from ffrwd.probe import probe as probe_one_path
-from ffrwd.processes import COPY_CODEC, ref_type
+from ffrwd.processes import CLOCK_SIZE, COPY_CODEC, ref_type
 from ffrwd.registry import DynamicFilter, FilterOption, Registry, SourceFilter
 from ffrwd.sink import (
     CODEC_PARAMS_FLAGS,
@@ -458,6 +458,7 @@ from ffrwd.wasm import (
     ANNOTATION_TYPES,
     AUDIO_CODEC_ENCODERS,
     CODEC_ENCODERS,
+    DATA_FILTER_WORLD,
     PACKET_FILTER_WORLD,
     PACKET_SOURCE_WORLD,
     WIRE_AUDIO_CODECS,
@@ -472,6 +473,7 @@ from ffrwd.wasm import (
     audio_encoder_codec,
     catalog_as_probe,
     encoder_codec,
+    hosts_data_filter,
     hosts_packet_filter,
     hosts_packet_sink,
     hosts_packet_source,
@@ -1166,6 +1168,30 @@ def _stream_projection(
     if declared is None or declared.emits is None:
         return None
     return base if _fold(field) == declared.stream_field else None
+
+
+def _data_projection(
+    node: exp.Expr, wasm: Mapping[str, WasmFunction]
+) -> tuple[exp.Anonymous, WasmFunction, int] | None:
+    """``<data filter call>.<field>``: the call, its declaration and the pad.
+
+    None for every other expression, a field the declaration does not name
+    included: resolve has already refused that one by name.
+    """
+    dot = _unwrap(node)
+    if not isinstance(dot, exp.Dot):
+        return None
+    base = _unwrap(dot.this) if isinstance(dot.this, exp.Expr) else None
+    field = dot.args.get("expression")
+    if not isinstance(base, exp.Anonymous) or not isinstance(field, exp.Identifier):
+        return None
+    declared = wasm.get(str(base.name).lower())
+    if declared is None or not declared.data_fields:
+        return None
+    name = _fold(field)
+    if name not in declared.data_fields:
+        return None
+    return base, declared, declared.data_fields.index(name)
 
 
 def _annotation_fields(annotation: Annotation) -> tuple[tuple[str, str], ...]:
@@ -3498,6 +3524,15 @@ class _Lowerer:
         # An argument an inlined body reads in more than one place is built
         # once for them all (:meth:`_lower_expr`).
         self._shared_arguments: dict[tuple[str, int], _Value] = {}
+        # (call text, id(env)) -> the output pads of the data filter it
+        # lowered to: every field read off one call in one branch is read off
+        # ONE instance, the way both halves of a module's struct are.
+        self._data_filter_calls: dict[tuple[str, int], tuple[FrameRef, ...]] = {}
+        # Every data filter lowered, with its declaration and its call, for
+        # the check that each of its outputs is read.
+        self.data_filter_nodes: list[
+            tuple[str, WasmFunction, exp.Expr, exp.Select]
+        ] = []
         # The refusals this branch's VARIADIC calls deferred by lowering an
         # aggregate over no rows to a NULL cell (:meth:`_variadic_array`).
         self.empty_aggregates: list[FfrwdError] = []
@@ -3833,9 +3868,40 @@ class _Lowerer:
                 )
             ]
         self._check_every_packet_filter_placed()
+        self._check_every_data_output_read()
         self._check_loudnorm2()
         self.graph.input_options = self._lower_input_options()
         return self.graph
+
+    def _check_every_data_output_read(self) -> None:
+        """Refuse a data filter output nothing reads.
+
+        The module writes every output it declares, each to a pipe of its
+        own, and a pipe with no reader stops the writer when it fills.
+        """
+        read: set[tuple[str, int]] = set()
+        refs = [ref for node in self.graph.nodes.values() for ref in node.inputs]
+        refs += [output.ref for output in self.graph.outputs]
+        for ref in refs:
+            if is_src(ref):
+                continue
+            name, _, written = ref.rpartition(":")
+            read.add((name, int(written)) if name and written.isdigit() else (ref, 0))
+        for name, declared, node, select in self.data_filter_nodes:
+            for pad in range(declared.data_output_count):
+                if (name, pad) in read:
+                    continue
+                field = declared.data_fields[pad] if declared.data_fields else ""
+                shown = f"{declared.name}(...).{field}" if field else f"{declared.name}(...)"
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"'{shown}' is read by nothing, and {declared.name}() writes "
+                    "every output it declares",
+                    node,
+                    fallback=select,
+                    hint="a data filter's outputs each need a reader: select "
+                    "it, write it to a .nut file, or hand it to another module",
+                )
 
     def _check_every_packet_filter_placed(self) -> None:
         """No packets call may reach the graph without its encoder settled.
@@ -4241,7 +4307,7 @@ class _Lowerer:
             asked = any(SINK_OPTIONS[name].scope == kind for name in written)
             if not asked and self._copies_onto_sink(inputs[position], kind, described):
                 pad = {f"{kind}_codec": COPY_CODEC}
-            if row_meta is not None:
+            if row_meta is not None and "row" in row_meta[position]:
                 meta = row_meta[position]
                 pad["row"] = meta["row"]
                 rendition = meta.get("rendition")
@@ -4472,11 +4538,7 @@ class _Lowerer:
         if path is None or _container_of(options, path) == _NUT_FORMAT:
             return
         for output in outputs:
-            if output.type != "data" or not is_src(output.ref):
-                continue
-            alias, _, index = output.ref[len("src:") :].rpartition(":d:")
-            meta = self._stream_meta(alias, "data", int(index)) if index.isdigit() else None
-            if meta is not None and meta.codec == JSON_CODEC:
+            if output.type == "data" and self._carries_json(output.ref):
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,
                     f"'{path}' is {_container_of(options, path)}, and a data "
@@ -4487,6 +4549,16 @@ class _Lowerer:
                     hint="write the file as .nut, or hand the stream to a "
                     "module sink such as ffrwd.moq.publish",
                 )
+
+    def _carries_json(self, ref: FrameRef) -> bool:
+        """True for a data stream of JSON messages: a probed input's that
+        says so, and every output of a data filter."""
+        if not is_src(ref):
+            name, _, pad = ref.rpartition(":")
+            return (name if name and pad.isdigit() else ref) in self.graph.data_filters
+        alias, _, index = ref[len("src:") :].rpartition(":d:")
+        meta = self._stream_meta(alias, "data", int(index)) if index.isdigit() else None
+        return meta is not None and meta.codec == JSON_CODEC
 
     def _codec_for_rows_track(
         self, options: dict[str, object], outputs: list[Output], path: str | None
@@ -10441,6 +10513,9 @@ class _Lowerer:
             # Not a call: COALESCE resolves against the ROW model, not the
             # registry -- it is how a nullable track column is spelled.
             return self._lower_coalesce(node, env, select)
+        data = self._lower_data_field(node, env, select)
+        if data is not None:
+            return data
         if is_value_expr(node):
             # A value expression, never a stream. Reaching here means it is not
             # a tag column either: unaliased, or inside a CTE body.
@@ -12669,6 +12744,9 @@ class _Lowerer:
                 hint=f"a module carries one filter; write '{described.name}' as "
                 "the export",
             )
+        if declared.is_data_filter or described.data_filter:
+            self._check_data_filter(declared, described, node, select)
+            return described
         if described.packet_filter:
             self._check_packet_filter(declared, described, node, select)
         elif declared.is_packets:
@@ -12771,6 +12849,78 @@ class _Lowerer:
                 "producer under it",
             )
         return described
+
+    def _check_data_filter(
+        self,
+        declared: WasmFunction,
+        described: Described,
+        node: exp.Expr,
+        select: exp.Select,
+    ) -> None:
+        """A data-filter module against the declaration that named it.
+
+        Both sides have to say it: the declaration RETURNS data streams and
+        the module describes a data filter, and the outputs they each count
+        are the same outputs, in the same order.
+        """
+        if not declared.is_data_filter:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"function '{declared.name}' returns {declared.written_returns}, "
+                f"and the module '{declared.module}' is a data filter",
+                node,
+                fallback=select,
+                hint="declare it as what it is: RETURNS data_stream, or "
+                "STRUCT(<name> data_stream, ...) with one field per output",
+            )
+        if not described.data_filter:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"function '{declared.name}' returns {declared.written_returns}, "
+                f"and the module '{declared.module}' is not a data filter",
+                node,
+                fallback=select,
+                hint="only a module exporting ffrwd:av's data-filter reads and "
+                "writes data streams; declare this one as what it filters",
+            )
+        if not hosts_data_filter(described.world):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"the module '{declared.module}' is a data filter, and the "
+                f"sidecar's {described.world} cannot host one",
+                node,
+                fallback=select,
+                hint=f"data filters arrived with {DATA_FILTER_WORLD}; rebuild "
+                "the module against it, or upgrade ffrwd",
+            )
+        written = described.data_outputs
+        if len(written) != declared.data_output_count:
+            declares = (
+                ", ".join(f"'{field}'" for field in declared.data_fields)
+                if declared.data_fields
+                else "one"
+            )
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"function '{declared.name}' returns {declares}, and the module "
+                f"'{declared.module}' writes {len(written)} data "
+                f"stream{'' if len(written) == 1 else 's'}",
+                node,
+                fallback=select,
+                hint="declare one data_stream field per output the module "
+                "writes, in its own order: RETURNS data_stream for one, "
+                "STRUCT(<name> data_stream, ...) for several",
+            )
+        codec = next((c for c in written if c != JSON_CODEC), None)
+        if codec is not None:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"the module '{declared.module}' writes a data stream of "
+                f"'{codec}', and a data stream here carries {JSON_CODEC} messages",
+                node,
+                fallback=select,
+                hint="rebuild the module to write one JSON object per message",
+            )
 
     def _check_packet_filter(
         self,
@@ -13587,6 +13737,20 @@ class _Lowerer:
             )
         if declared.is_sink:
             return self._lower_sink_call(node, declared, described, call, env, select)
+        if declared.is_data_filter:
+            if declared.data_fields:
+                fields = ", ".join(f".{field}" for field in declared.data_fields)
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"{declared.name}() returns {declared.written_returns}, and a "
+                    "struct is not a stream",
+                    node,
+                    fallback=select,
+                    hint=f"read one output off the call, {declared.name}(...)."
+                    f"{declared.data_fields[0]}: it writes {fields}",
+                )
+            pads = self._lower_data_filter(node, declared, described, call, env, select)
+            return _scalar(_Stream(ref=pads[0], type="data"))
         kind = declared.stream_kind
         arity = declared.stream_arity
         # A stream position holding a row column: the rows travel beside the
@@ -13668,6 +13832,126 @@ class _Lowerer:
             rows=self._row_elements(per_row, env),
         )
         return lowered
+
+    def _lower_data_field(
+        self, node: exp.Expr, env: _Env, select: exp.Select
+    ) -> _Value | None:
+        """``<data filter call>.<field>``: that output of the call, or None.
+
+        None for every expression that is not a field read off a data filter
+        declared to return a struct of them.
+        """
+        found = _data_projection(node, self.res.wasm)
+        if found is None:
+            return None
+        base, declared, pad = found
+        call = _call_parts(base)
+        assert call is not None  # `_data_projection` read it as one
+        described = self._described(declared, base, select)
+        if call.named:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"{declared.name}() does not take named arguments",
+                call.named[0].value,
+                fallback=base,
+                hint=f"a wasm function's parameters are positional: "
+                f"{declared.signature}",
+            )
+        pads = self._lower_data_filter(base, declared, described, call, env, select)
+        return _scalar(_Stream(ref=pads[pad], type="data"))
+
+    def _lower_data_filter(
+        self,
+        node: exp.Expr,
+        declared: WasmFunction,
+        described: Described,
+        call: _Call,
+        env: _Env,
+        select: exp.Select,
+    ) -> tuple[FrameRef, ...]:
+        """A data filter call: ONE node, and the ref of each of its outputs.
+
+        Its inputs are the call's stream arguments in order. A data stream is
+        a pad the module reads messages off; a video or audio stream is a
+        CLOCK, read for its time alone, so a picture crosses to it scaled
+        down to :data:`~ffrwd.processes.CLOCK_SIZE` square first -- every
+        frame, and so every pts, still there. Its outputs are data streams,
+        one per declared output.
+
+        Two reads of the same call in one branch -- its two fields, say --
+        are one instance.
+        """
+        key = (node.sql(), id(env))
+        found = self._data_filter_calls.get(key)
+        if found is not None:
+            return found
+        arity = declared.stream_arity
+        if len(call.args) < arity:
+            missing = declared.stream_params[len(call.args)]
+            raise _error(
+                ErrorCode.UDF_ARG_TYPE,
+                f"{declared.name}() takes '{missing.name}' as {missing.type}, "
+                "and the call does not write it",
+                node,
+                fallback=select,
+                hint=f"write every stream first: {declared.signature}",
+            )
+        inputs: list[FrameRef] = []
+        for param, kind, argument in zip(
+            declared.stream_params, declared.stream_kinds, call.args[:arity], strict=True
+        ):
+            self._reject_null_stream(call.display, argument, select)
+            got = self._classify(argument, env, select)
+            if got != kind:
+                shown = "a stream of no kind" if got == _UNSUPPORTED_KIND else f"a {got} stream"
+                raise _error(
+                    ErrorCode.UDF_ARG_TYPE,
+                    f"{declared.name}() takes '{param.name}' as {param.type}, and "
+                    f"its argument is {shown}",
+                    argument,
+                    fallback=node,
+                    hint="a data_stream parameter reads messages and takes a data "
+                    "stream; a video_stream or audio_stream one reads the time "
+                    f"and takes that kind: {declared.signature}",
+                )
+            value = self._lower_expr(argument, env, select)
+            if len(value.streams) != 1:
+                raise _error(
+                    ErrorCode.UDF_ARG_TYPE,
+                    f"{declared.name}() takes '{param.name}' as one {param.type}, "
+                    f"and its argument is {len(value.streams)} of them",
+                    argument,
+                    fallback=node,
+                    hint="pass one stream per parameter, e.g. f.data[1]",
+                )
+            ref = value.streams[0].ref
+            if kind == "video":
+                ref = self.ctx.node(
+                    "scale", {"width": CLOCK_SIZE, "height": CLOCK_SIZE}, [ref], ["video"]
+                )
+            inputs.append(ref)
+        tuples = env.relation.tuples if env.relation is not None else []
+        params = self._wasm_params(
+            declared,
+            described,
+            call,
+            node,
+            select,
+            env,
+            tuples[0] if len(tuples) == 1 else {},
+            first=arity,
+        )
+        count = declared.data_output_count
+        name = self.ctx.node(declared.module, params, inputs, ["data"] * count)
+        self.graph.data_filters.append(name)
+        self.data_filter_nodes.append((name, declared, node, select))
+        if described.rows_schema is not None:
+            # The rows are the run's report, and no path names a home for
+            # them: they ride the hosting process's own stdout, as a sink's do.
+            self.graph.rows_sinks[name] = RowsSink(container=_ROWS_CONTAINER)
+        pads = (name,) if count == 1 else tuple(f"{name}:{pad}" for pad in range(count))
+        self._data_filter_calls[key] = pads
+        return pads
 
     def _lower_packets_call(
         self,
@@ -14246,10 +14530,15 @@ class _Lowerer:
             )
             for argument in call.args[:at]
         ]
+        # A data stream is no rendition's cell: it rides beside the rows, one
+        # pad of its own, after every picture and sound pad.
+        data = [stream for c in columns if c.value.type == "data" for stream in c.value.streams]
+        columns = [c for c in columns if c.value.type != "data"]
         cardinality = max(len(self.sink_rows), 1)
         rows, _ = self._row_cells(columns, cardinality, node, f"'{declared.name}'")
         self._check_no_null_stream_feeds_a_filter(node)
         self._check_row_sink_arity(declared, described, rows, node, select)
+        self._check_sink_data_arity(declared, described, len(data), node, select)
         renditions = self._row_renditions(rows, env)
         pads: list[_Stream] = []
         meta: list[dict[str, object]] = []
@@ -14263,6 +14552,8 @@ class _Lowerer:
                 if rendition:
                     entry["rendition"] = rendition
                 meta.append(entry)
+        pads += data
+        meta += [{} for _ in data]
         tuples = env.relation.tuples if env.relation is not None else []
         params = self._wasm_params(
             declared,
@@ -14284,6 +14575,31 @@ class _Lowerer:
         self.row_reading_sink_rows[ref] = rows
         self.graph.module_sinks.append(ref)
         return _Value(type=pads[0].type, streams=(), is_array=False)
+
+    def _check_sink_data_arity(
+        self,
+        declared: WasmFunction,
+        described: Described,
+        count: int,
+        node: exp.Expr,
+        select: exp.Select,
+    ) -> None:
+        """The data streams a sink is handed against how many it reads."""
+        reads = described.data_streams
+        if count == 0 or reads in ("many", "any") or (reads == "one" and count == 1):
+            return
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"this query hands '{declared.name}()' {count} data "
+            f"stream{'' if count == 1 else 's'}, and the module '{declared.module}' "
+            f"reads {reads}",
+            node,
+            fallback=select,
+            hint="drop the data column, or use a sink whose module reads data "
+            "streams"
+            if reads == "none"
+            else "hand it one data stream",
+        )
 
     def _check_row_sink_arity(
         self,
@@ -15947,6 +16263,9 @@ class _Lowerer:
             and not node.this.is_string
         ):
             return "num"
+        # An output of a data filter is a data stream.
+        if _data_projection(node, self.res.wasm) is not None:
+            return "data"
         # The stream half of a struct return is the stream the module wrote.
         streamed = _stream_projection(node, self.res.wasm)
         if streamed is not None:

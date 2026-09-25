@@ -144,6 +144,7 @@ __all__ = [
     "NAMEABLE_TYPES",
     "SHARED_ARGUMENT",
     "SINK_STREAMS",
+    "WASM_DATA",
     "WASM_STREAM_NAMES",
     "WASM_STREAM_TYPES",
     "Annotation",
@@ -275,6 +276,21 @@ WASM_STREAM_TYPES: Mapping[str, StreamType] = {
 WASM_STREAM_NAMES: Mapping[StreamType, str] = {
     kind: written for written, kind in WASM_STREAM_TYPES.items()
 }
+# The return type of a DATA FILTER: data streams of messages out, one per
+# output, read off the call as a struct's fields where there are several.
+WASM_DATA = "data_stream"
+# What a data filter's stream parameters may be: a data stream it reads the
+# messages of, or a video or audio stream it reads the time of.
+_DATA_FILTER_PARAM_TYPES: Mapping[str, StreamType] = {
+    **WASM_STREAM_TYPES,
+    WASM_DATA: "data",
+}
+_WASM_DATA_HINT = (
+    "a data filter reads its streams first -- data_stream for messages, "
+    "video_stream or audio_stream for the time alone -- then the values it is "
+    "configured with, and RETURNS data_stream, or STRUCT(<name> data_stream, "
+    "...) for several outputs"
+)
 _WASM_STREAM_HINT = " or ".join(WASM_STREAM_TYPES)
 # What a table-returning wasm function is told; a value return is now wired
 # (text, number, boolean or vector), so only TABLE is left unguessed at.
@@ -533,12 +549,18 @@ class WasmFunction:
     # against the working directory.
     package: str = ""
     package_version: str = ""
+    # The field each output of a DATA FILTER is read by, in output order, for
+    # one returning a STRUCT of data streams. Empty for a bare RETURNS
+    # data_stream, whose one output is the call itself, and for every other
+    # kind.
+    data_fields: tuple[str, ...] = ()
 
     @property
     def is_value(self) -> bool:
         """True for a function returning a compile-time value, not a stream."""
         return (
             self.returns not in WASM_STREAM_TYPES
+            and not self.is_data_filter
             and not self.is_sink
             and not self.is_packets
             and not self.is_source
@@ -597,6 +619,21 @@ class WasmFunction:
         return self.returns == WASM_PACKETS
 
     @property
+    def is_data_filter(self) -> bool:
+        """True for a ``RETURNS data_stream`` function: messages in and out.
+
+        Its stream parameters are data streams it reads the messages of and
+        CLOCKS, video or audio streams it reads the time of; its outputs are
+        data streams, one per :attr:`data_fields` entry, or the one call.
+        """
+        return self.returns == WASM_DATA
+
+    @property
+    def data_output_count(self) -> int:
+        """How many data streams a data filter writes."""
+        return max(len(self.data_fields), 1)
+
+    @property
     def is_source(self) -> bool:
         """True for a ``RETURNS source`` function: a FROM-position row source.
 
@@ -628,6 +665,8 @@ class WasmFunction:
                 f"'{self.name}' reads rows from the SELECT list; its kinds "
                 "come from the rows, not its signature"
             )
+        if self.is_data_filter:
+            return "data"
         written = (
             self.params[0].type
             if (self.is_sink or self.is_packets or self.is_packet_rows) and self.params
@@ -653,7 +692,8 @@ class WasmFunction:
     def stream_kinds(self) -> tuple[StreamType, ...]:
         """The kind each stream parameter reads, in declaration order."""
         return tuple(
-            WASM_STREAM_TYPES[element_type(param.type)] for param in self.stream_params
+            _DATA_FILTER_PARAM_TYPES[element_type(param.type)]
+            for param in self.stream_params
         )
 
     @property
@@ -806,6 +846,9 @@ class WasmFunction:
     @property
     def written_returns(self) -> str:
         """The return type as a signature spells it, annotation column included."""
+        if self.data_fields:
+            written = ", ".join(f"{field} {WASM_DATA}" for field in self.data_fields)
+            return f"STRUCT({written})"
         if self.emits is None:
             return self.returns
         stream, annotation = self.stream_field, self.emits
@@ -1823,6 +1866,11 @@ def _define_wasm(
             hint=_WASM_VALUE_HINT,
         )
     node = returns_prop.this if isinstance(returns_prop.this, exp.Expr) else None
+    data_fields = _data_return(node, name, identifier, create)
+    if data_fields is not None:
+        return _define_wasm_data_filter(
+            name, module, export, params, data_fields, identifier, create
+        )
     # The parameter says which kind the RETURNS is read against, so a hint
     # about the struct return names the kind the writer was already writing.
     written_stream = params[0].type if params else _WASM_STREAM
@@ -2003,6 +2051,127 @@ def _define_wasm(
         stream_field=stream_field,
         line=line,
         col=col,
+    )
+
+
+def _data_return(
+    node: exp.Expr | None,
+    name: str,
+    identifier: exp.Identifier,
+    create: exp.Create,
+) -> tuple[str, ...] | None:
+    """A data filter's RETURNS, as the field each output is read by.
+
+    ``()`` for a bare ``RETURNS data_stream``; the field names, in order, for
+    a ``STRUCT`` all of whose fields are data streams. None for a RETURNS
+    naming no data stream at all, which is some other kind of function. A
+    struct naming one data stream beside anything else is refused by name.
+    """
+    if _type_name(node) == WASM_DATA:
+        return ()
+    fields = _struct_fields(node)
+    if not fields or not any(
+        _type_name(f.args.get("kind")) == WASM_DATA for f in fields
+    ):
+        return None
+    written: list[str] = []
+    for f in fields:
+        field = _ident_name(f.this) if isinstance(f.this, exp.Identifier) else ""
+        kind = f.args.get("kind")
+        if not field:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"wasm function '{name}' returns a struct with an unnamed field",
+                identifier,
+                fallback=create,
+                hint=_WASM_DATA_HINT,
+            )
+        if _type_name(kind) != WASM_DATA:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"wasm function '{name}' returns the field '{field}' as "
+                f"'{_written_type(kind)}' beside data streams",
+                identifier,
+                fallback=create,
+                hint=_WASM_DATA_HINT,
+            )
+        if field in written:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"wasm function '{name}' returns the field '{field}' twice",
+                identifier,
+                fallback=create,
+                hint="each output of a data filter is read by a name of its own",
+            )
+        written.append(field)
+    return tuple(written)
+
+
+def _define_wasm_data_filter(
+    name: str,
+    module: str,
+    export: str,
+    params: tuple[Parameter, ...],
+    data_fields: tuple[str, ...],
+    identifier: exp.Identifier,
+    create: exp.Create,
+) -> WasmFunction:
+    """One validated DATA FILTER declaration.
+
+    A leading run of stream parameters, each one stream: a ``data_stream``
+    is a pad the module reads messages off, a ``video_stream`` or
+    ``audio_stream`` a CLOCK it reads the time of and nothing else. Then the
+    values it is configured with. At least one stream: a module with no
+    clock and no messages would never be called.
+    """
+    streams = _leading_streams(params)
+    if not streams:
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"wasm function '{name}' returns {WASM_DATA} and takes no stream",
+            identifier,
+            fallback=create,
+            hint=_WASM_DATA_HINT,
+        )
+    for param in streams:
+        if param.type not in _DATA_FILTER_PARAM_TYPES:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"wasm function '{name}' takes '{param.name}' as {param.type}, "
+                "and a data filter reads data_stream, video_stream or audio_stream",
+                identifier,
+                fallback=create,
+                hint=_WASM_DATA_HINT,
+            )
+    for extra in params[len(streams) :]:
+        if extra.annotation is not None:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"wasm function '{name}' takes the annotation column "
+                f"'{extra.name}', and a data filter reads messages, not rows",
+                identifier,
+                fallback=create,
+                hint=_WASM_DATA_HINT,
+            )
+        if _declared_kind(extra.type) == "stream":
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"wasm function '{name}' takes a stream, '{extra.name}', after "
+                "its values",
+                identifier,
+                fallback=create,
+                hint=_WASM_DATA_HINT,
+            )
+    line, col = _pos(identifier, create)
+    return WasmFunction(
+        name=name,
+        module=module,
+        export=export,
+        params=params,
+        returns=WASM_DATA,
+        line=line,
+        col=col,
+        data_fields=data_fields,
     )
 
 
