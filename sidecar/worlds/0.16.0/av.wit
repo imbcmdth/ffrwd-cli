@@ -1,4 +1,4 @@
-package ffrwd:av@0.17.0;
+package ffrwd:av@0.16.0;
 
 interface types {
   /// Static description of a module, available without running anything.
@@ -115,10 +115,6 @@ interface types {
   variant coded-format {
     video(coded-video),
     audio(coded-audio),
-    /// A data stream: messages rather than pictures or sound, each packet
-    /// one message at its own pts. For codec "json" a message is one UTF-8
-    /// JSON object. It has no geometry, and every packet is a keyframe.
-    data,
   }
 
   /// One encoded stream an instance is opened for, fixed for its life.
@@ -402,29 +398,6 @@ interface window-filter {
     /// stream. More than 1 is window 1, stride 1 - a call takes one frame off
     /// each pad and hands one back - and a host refuses any other shape.
     inputs: u32,
-    /// Arguments of the call that are FEEDERS rather than pads: a stream
-    /// that may be empty, which the module reads itself over a loopback
-    /// connection instead of being handed its frames. Empty for every
-    /// module that has none.
-    feeders: list<feeder>,
-  }
-
-  /// One feeder argument. The host picks a loopback port, writes it into
-  /// the param `port-param` names, and delivers the stream passed in that
-  /// position there as NUT. A call that passes a number in that position
-  /// instead is naming a port itself, and the host wires nothing.
-  record feeder {
-    /// Which argument of the call it is, counting stream arguments from 0.
-    input: u32,
-    /// The param the host puts the port it picked in.
-    port-param: string,
-    /// "video" or "audio".
-    kind: string,
-    /// Feeders sharing one connection: every feeder in a query fed by the
-    /// same source and naming the same group gets ONE port, written into
-    /// each call's `port-param`, and ONE NUT carrying every stream those
-    /// feeders name, video then audio. Empty: a connection of its own.
-    group: string,
   }
 
   /// What one call produced.
@@ -782,80 +755,6 @@ interface rows-module {
   finish: func() -> result<list<string>, string>;
 }
 
-/// Messages in, messages out: a data stream is a sequence of messages, each
-/// one JSON object timed by its pts, and a module exporting this interface
-/// reads data streams and writes them. It is not one-to-one: a call may
-/// answer any number of messages, or none, and may hold some back for a
-/// later call.
-///
-/// It may also read CLOCK pads: a video or audio argument whose frames the
-/// module never sees, only their time. That is how a module with no data
-/// input still acts at programme times - the host hands it `now` on every
-/// call - and how one reading messages knows what time it is between them.
-interface data-filter {
-  use types.{meta, rational};
-
-  /// One message: for codec "json", one UTF-8 JSON object.
-  record message {
-    pts: s64,
-    data: list<u8>,
-  }
-
-  /// What one argument of the call is.
-  enum pad-kind {
-    /// A data stream: its messages arrive in `process`.
-    data,
-    /// A video or audio stream read for its clock alone.
-    clock,
-  }
-
-  record pad-info {
-    kind: pad-kind,
-    /// For a data pad, its codec: "json". Empty for a clock pad.
-    codec: string,
-    /// The unit a data pad's pts, or a clock pad's `now`, is counted in.
-    time-base: rational,
-  }
-
-  record data-filter-meta {
-    meta: meta,
-    /// The codec of each data stream the module writes, in output order:
-    /// ["json"] for one.
-    outputs: list<string>,
-    /// The unit the outputs' pts are counted in.
-    time-base: rational,
-  }
-
-  /// The messages that arrived on one data pad since the last call, in pts
-  /// order. A clock pad has none.
-  record pad-messages {
-    pad: u32,
-    messages: list<message>,
-  }
-
-  record processed {
-    /// The messages written, one list per output in output order, each in
-    /// pts order. Across calls an output's pts never decrease.
-    outputs: list<list<message>>,
-    /// Rows for the run's rows output, as a sink's are.
-    rows: list<string>,
-  }
-
-  describe: func() -> data-filter-meta;
-
-  /// Called once, with every argument of the call in order.
-  init: func(pads: list<pad-info>, params: string) -> result<_, string>;
-
-  /// One batch: every message that arrived since the last call, across the
-  /// data pads, and `now`, the programme time in ticks of the first clock
-  /// pad's time base - none when the call has no clock pad. A module with
-  /// a clock pad is called as its clock advances, whether or not a message
-  /// arrived; one without is called when messages arrive. `last` marks the
-  /// final call, which happens once and carries whatever is left.
-  process: func(input: list<pad-messages>, now: option<s64>,
-                last: bool) -> result<processed, string>;
-}
-
 world video-module  { export filter; }
 world meta-module   { export filter; export meta-filter; }
 world window-module { import window-source; export window-filter; }
@@ -864,4 +763,3 @@ world packet-filter-module { export packet-filter; }
 world packet-source-module { export packet-source; }
 world values-module { export values; }
 world rows-module-host { export rows-module; }
-world data-filter-module { export data-filter; }
