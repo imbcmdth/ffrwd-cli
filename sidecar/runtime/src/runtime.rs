@@ -5391,7 +5391,15 @@ impl DataFilter {
     /// order. Every data pad and every output must be a codec the wire
     /// carries, which is `json` alone.
     pub fn open(module_path: &str, pads: &[DataPad], params: &str) -> Result<DataFilter> {
-        use world_0170::data_filter::exports::ffrwd::av::data_filter as wit;
+        let mut filter = DataFilter::load(module_path)?;
+        filter.init(pads, params)?;
+        Ok(filter)
+    }
+
+    /// `open`'s first half: the instance and what it describes, its outputs
+    /// checked, and `init` not yet called. A host writes the outputs' headers
+    /// from this before its inputs have said what they carry.
+    pub fn load(module_path: &str) -> Result<DataFilter> {
         let (mut store, instance) = instantiate_data_filter(module_path, Purpose::Run)?;
         let described = data_filter_description(&instance, &mut store)?;
         let name = described.meta.name.clone();
@@ -5400,6 +5408,22 @@ impl DataFilter {
                 "{name} writes {codec}, and the only data stream this host carries is {DATA_CODEC}"
             );
         }
+        let outputs = described.outputs.len();
+        Ok(DataFilter {
+            store,
+            instance,
+            described,
+            pads: Vec::new(),
+            last_pts: vec![None; outputs],
+            finished: false,
+        })
+    }
+
+    /// `open`'s second half: `init` with every argument of the call in
+    /// order, once.
+    pub fn init(&mut self, pads: &[DataPad], params: &str) -> Result<()> {
+        use world_0170::data_filter::exports::ffrwd::av::data_filter as wit;
+        let name = self.described.meta.name.clone();
         let mut infos = Vec::with_capacity(pads.len());
         for pad in pads {
             if pad.kind == PadKind::Data && pad.codec != DATA_CODEC {
@@ -5419,20 +5443,13 @@ impl DataFilter {
                 time_base: world_0170::video::ffrwd::av::types::Rational { num, den },
             });
         }
-        instance
+        self.instance
             .ffrwd_av_data_filter()
-            .call_init(&mut store, &infos, params)
+            .call_init(&mut self.store, &infos, params)
             .map_err(wasm_err)?
             .map_err(|e| anyhow!("{name} rejected params: {e}"))?;
-        let outputs = described.outputs.len();
-        Ok(DataFilter {
-            store,
-            instance,
-            described,
-            pads: pads.iter().map(|p| p.kind).collect(),
-            last_pts: vec![None; outputs],
-            finished: false,
-        })
+        self.pads = pads.iter().map(|p| p.kind).collect();
+        Ok(())
     }
 
     /// What the module published, read once at open.

@@ -4362,7 +4362,8 @@ fn paced_rows_reach_a_pipe_while_the_stream_is_still_running() {
 // The data filter. `data_stamp` writes every message of its first data pad
 // back with a `"node"` field added, at the same pts, and with a clock pad and
 // `every_s` above 0 a tick each time the clock crosses a multiple of it. Its
-// output counts microseconds.
+// output counts microseconds, and carries heartbeats beside the messages:
+// empty packets saying how far time has got.
 
 /// The unit the data inputs here count in, and the one `data_stamp` writes.
 const MICROS: TimeBase = TimeBase {
@@ -4416,21 +4417,39 @@ fn clock_nut(frames: i64, time_base: TimeBase, step: i64) -> Vec<u8> {
     wire
 }
 
-/// Every message a JSON NUT carries as (pts, message), for as much of it as
-/// has been written: a stream still being written ends where its bytes do.
-fn read_messages(wire: &[u8]) -> Vec<(i64, String)> {
+/// Every packet a JSON NUT carries as (pts, payload), heartbeats included
+/// as empty payloads, for as much of it as has been written: a stream still
+/// being written ends where its bytes do.
+fn read_data_packets(wire: &[u8]) -> Vec<(i64, String)> {
     let Ok(mut demuxer) = Demuxer::open(wire) else {
         return Vec::new();
     };
     assert!(demuxer.stream().is_json(), "a data filter writes JSON NUT");
     assert_eq!(demuxer.stream().time_base, MICROS);
-    let mut messages = Vec::new();
+    let mut packets = Vec::new();
     let mut buf = Vec::new();
     while let Ok(Some(packet)) = demuxer.read_packet(&mut buf) {
         assert!(packet.keyframe, "every message is a keyframe");
-        messages.push((packet.pts, String::from_utf8(buf.clone()).expect("UTF-8")));
+        packets.push((packet.pts, String::from_utf8(buf.clone()).expect("UTF-8")));
     }
+    packets
+}
+
+/// Every message a JSON NUT carries as (pts, message): its packets less the
+/// heartbeats.
+fn read_messages(wire: &[u8]) -> Vec<(i64, String)> {
+    let mut messages = read_data_packets(wire);
+    messages.retain(|(_, message)| !message.is_empty());
     messages
+}
+
+/// The pts of every heartbeat a JSON NUT carries.
+fn read_heartbeats(wire: &[u8]) -> Vec<i64> {
+    read_data_packets(wire)
+        .into_iter()
+        .filter(|(_, message)| message.is_empty())
+        .map(|(pts, _)| pts)
+        .collect()
 }
 
 /// Runs `data_stamp` with `params` over `inputs` - files, in argument order -
@@ -4579,6 +4598,21 @@ fn await_messages(path: &std::path::Path, count: usize, bound: Duration) -> Vec<
     }
 }
 
+/// Waits up to `bound` for `path` to hold a heartbeat at `pts`, and answers
+/// whether it came.
+fn await_heartbeat(path: &std::path::Path, pts: i64, bound: Duration) -> bool {
+    let start = Instant::now();
+    loop {
+        if read_heartbeats(&std::fs::read(path).unwrap_or_default()).contains(&pts) {
+            return true;
+        }
+        if start.elapsed() > bound {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// `data_stamp` spawned on `inputs`, with `-` among them for a pad the test
 /// writes itself, its output going to `output`.
 fn spawn_data_stamp(
@@ -4687,6 +4721,98 @@ fn a_pts_going_back_on_an_output_is_refused_by_name() {
         ),
         "{stderr}"
     );
+}
+
+/// A clock of 30 frames a second, so three frames are a tenth of one.
+const THIRTIETHS: TimeBase = TimeBase { num: 1, den: 30 };
+
+#[test]
+fn a_quiet_output_beats_every_tenth_of_a_second_of_its_clock() {
+    // Ticks at 0 and 1 s over a clock running to 1.47 s: a heartbeat at the
+    // start, then on every third frame the output has been quiet since, and
+    // none on the frame a tick went out on.
+    let clock = TempFile::new("beats_clock.nut");
+    std::fs::write(clock.path(), clock_nut(45, THIRTIETHS, 1)).expect("write the clock");
+
+    let run = run_data_stamp(r#"{"node":"n7","every_s":1}"#, &[clock.path()]);
+    assert_run_ok(&run, "data_stamp");
+    assert_eq!(
+        read_messages(&run.stdout),
+        vec![(0, tick("n7")), (1_000_000, tick("n7"))]
+    );
+    let quiet = (0..=14).filter(|tenth| *tenth != 10);
+    assert_eq!(
+        read_heartbeats(&run.stdout),
+        quiet.map(|tenth| tenth * 100_000).collect::<Vec<i64>>()
+    );
+}
+
+#[test]
+fn messages_closer_than_a_tenth_of_a_second_leave_no_heartbeat_between() {
+    // A message every 50 ms for a second, stamped as the clock reaches each:
+    // the output is never quiet long enough to need one past the start.
+    let messages: Vec<(i64, String)> = (0..=20)
+        .map(|k| (k * 50_000, format!(r#"{{"n":{k}}}"#)))
+        .collect();
+    let borrowed: Vec<(i64, &str)> = messages.iter().map(|(p, m)| (*p, m.as_str())).collect();
+    let data = TempFile::new("close_data.nut");
+    std::fs::write(data.path(), json_nut(&borrowed)).expect("write the data input");
+    let clock = TempFile::new("close_clock.nut");
+    std::fs::write(clock.path(), clock_nut(31, THIRTIETHS, 1)).expect("write the clock");
+
+    let run = run_data_stamp(r#"{"node":"n8"}"#, &[data.path(), clock.path()]);
+    assert_run_ok(&run, "data_stamp");
+    assert_eq!(read_messages(&run.stdout).len(), messages.len());
+    assert_eq!(read_heartbeats(&run.stdout), vec![0]);
+}
+
+#[test]
+fn a_data_filter_without_a_clock_takes_its_time_from_the_heartbeats_it_reads() {
+    // The data pad is fed a step at a time. `data_stamp` refuses any message
+    // that is not a JSON object, so an empty one reaching it would fail the
+    // run; each heartbeat instead moves time on, and the output beats
+    // wherever it has been quiet for a tenth of a second.
+    let output = TempFile::new("forward_out.nut");
+    let mut child = spawn_data_stamp(r#"{"node":"n9"}"#, &["-"], output.path());
+    let stdin = child.stdin.take().expect("child stdin");
+    let mut muxer = Muxer::new(stdin, &Stream::json(MICROS)).expect("write the data headers");
+    muxer.flush().expect("flush the data headers");
+    let bound = Duration::from_secs(30);
+    assert!(
+        await_heartbeat(output.path(), 0, bound),
+        "no heartbeat at the start"
+    );
+    write_message(&mut muxer, 1_000_000, "");
+    muxer.flush().expect("flush a heartbeat");
+    assert!(
+        await_heartbeat(output.path(), 1_000_000, bound),
+        "time did not move on"
+    );
+    write_message(&mut muxer, 1_050_000, r#"{"n":1}"#);
+    muxer.flush().expect("flush a message");
+    assert_eq!(await_messages(output.path(), 1, bound).len(), 1);
+    write_message(&mut muxer, 1_100_000, "");
+    write_message(&mut muxer, 1_200_000, "");
+    muxer.flush().expect("flush two heartbeats");
+    assert!(
+        await_heartbeat(output.path(), 1_200_000, bound),
+        "time did not move on"
+    );
+    drop(muxer);
+
+    let finished = child.wait_with_output().expect("wait for ffrwd-wasm");
+    assert!(
+        finished.status.success(),
+        "data_stamp exited with {:?}\nstderr:\n{}",
+        finished.status.code(),
+        String::from_utf8_lossy(&finished.stderr)
+    );
+    let wire = std::fs::read(output.path()).expect("read the output");
+    assert_eq!(
+        read_messages(&wire),
+        vec![(1_050_000, r#"{"n":1,"node":"n9"}"#.to_string())]
+    );
+    assert_eq!(read_heartbeats(&wire), vec![0, 1_000_000, 1_200_000]);
 }
 
 #[test]

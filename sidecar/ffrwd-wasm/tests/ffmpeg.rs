@@ -2608,3 +2608,45 @@ fn a_live_encoder_feeds_the_packet_sink() {
         );
     }
 }
+
+#[test]
+fn a_data_output_that_never_carries_a_message_is_one_ffmpeg_reads_to_the_end() {
+    // A clock with no ticks asked of it: `data_stamp` writes no message at
+    // all, and its output is still a stream with a packet in it, its
+    // heartbeats, which the next ffmpeg opens and copies to the end.
+    ensure_modules_built();
+    let clock = TempFile::new("silent_clock.nut");
+    write_nut("testsrc=size=8x8:rate=10", 20, "rgba", clock.path());
+    let out = TempFile::new("silent_data.nut");
+    let module = module_path("data_stamp");
+    let sidecar = Command::new(env!("CARGO_BIN_EXE_ffrwd-wasm"))
+        .args(["-f", "nut", "-i"])
+        .arg(clock.path())
+        .args(["-m"])
+        .arg(&module)
+        .args(["-params", r#"{"node":"quiet"}"#, "-f", "nut"])
+        .arg(out.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn ffrwd-wasm");
+    assert!(
+        sidecar.status.success(),
+        "ffrwd-wasm exited with {:?}\nstderr:\n{}",
+        sidecar.status.code(),
+        String::from_utf8_lossy(&sidecar.stderr)
+    );
+
+    let reader = Command::new("ffmpeg")
+        .args(["-v", "error", "-f", "nut", "-i"])
+        .arg(out.path())
+        .args(["-map", "0", "-c", "copy", "-f", "null", "-"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn ffmpeg");
+    assert!(
+        reader.status.success(),
+        "ffmpeg refused the data output with {:?}\nstderr:\n{}",
+        reader.status.code(),
+        String::from_utf8_lossy(&reader.stderr)
+    );
+}

@@ -1,7 +1,9 @@
 //! Data streams through the packet interfaces: a JSON track a packet source
 //! publishes, written as a JSON NUT; the same NUT handed to a packet sink
 //! and a packet filter as a data pad; and refused, by name, at a module
-//! built against a world with no data arm.
+//! built against a world with no data arm. Each data edge also carries
+//! heartbeats, empty packets saying how far time has got, which no module
+//! is ever handed.
 //!
 //! `source_replay_data` publishes the messages mirrored in `MESSAGES` (see
 //! `modules/source-replay-data/src/lib.rs`), chosen for what a wire could
@@ -137,6 +139,15 @@ fn read_packets(wire: &[u8]) -> Vec<(i64, Option<i64>, bool, Vec<u8>)> {
     packets
 }
 
+/// The pts of every heartbeat a JSON NUT carries: its empty packets.
+fn heartbeats(wire: &[u8]) -> Vec<i64> {
+    read_packets(wire)
+        .into_iter()
+        .filter(|(_, _, _, data)| data.is_empty())
+        .map(|(pts, _, _, _)| pts)
+        .collect()
+}
+
 /// The source's data track, written to `path` as a JSON NUT.
 fn write_source_track(path: &Path) {
     let module = module_path("source_replay_data");
@@ -154,7 +165,7 @@ fn write_source_track(path: &Path) {
 
 /// Checks a JSON NUT carries exactly `MESSAGES`: a data stream in
 /// microseconds, each message its own keyframe packet at its own pts, bytes
-/// untouched.
+/// untouched. Heartbeats between them are not messages.
 fn assert_carries_the_messages(wire: &[u8]) {
     let demuxer = Demuxer::open(wire).expect("read the NUT headers");
     assert!(
@@ -164,7 +175,10 @@ fn assert_carries_the_messages(wire: &[u8]) {
     assert_eq!(demuxer.stream().codec_name(), Some("json"));
     assert_eq!(demuxer.stream().time_base, MICROS);
 
-    let packets = read_packets(wire);
+    let packets: Vec<_> = read_packets(wire)
+        .into_iter()
+        .filter(|(_, _, _, data)| !data.is_empty())
+        .collect();
     assert_eq!(packets.len(), MESSAGES.len(), "one packet per message");
     for (index, ((pts, dts, keyframe, data), (want_pts, want))) in
         packets.iter().zip(MESSAGES).enumerate()
@@ -183,6 +197,42 @@ fn a_sources_data_track_is_written_as_a_json_nut() {
     let wire = std::fs::read(&path).expect("read what the source wrote");
     std::fs::remove_file(&path).ok();
     assert_carries_the_messages(&wire);
+    // No media moves time on, so the one heartbeat is the start's.
+    assert_eq!(heartbeats(&wire), vec![0]);
+}
+
+#[test]
+fn a_sources_data_track_beats_while_its_picture_moves_on() {
+    // With the picture subscribed, a pull is one picture a tenth of a second
+    // on and the messages up to it: the track says where time has got to at
+    // the start and whenever it has been quiet for a tenth of a second.
+    let data = scratch("beats_data.nut");
+    let video = scratch("beats_video.nut");
+    let module = module_path("source_replay_data");
+    let run = run_ffrwd_wasm(&[
+        "-m",
+        path_str(&module),
+        "-track",
+        "0",
+        "-f",
+        "nut",
+        path_str(&data),
+        "-track",
+        "1",
+        "-f",
+        "nut",
+        path_str(&video),
+    ]);
+    let wire = std::fs::read(&data).expect("read the data track");
+    std::fs::remove_file(&data).ok();
+    std::fs::remove_file(&video).ok();
+    assert_ok(&run, "source_replay_data");
+    assert_carries_the_messages(&wire);
+    let quiet = (2..=34).map(|tenth| tenth * 100_000);
+    assert_eq!(
+        heartbeats(&wire),
+        std::iter::once(0).chain(quiet).collect::<Vec<i64>>()
+    );
 }
 
 #[test]
@@ -203,6 +253,9 @@ fn a_probed_data_track_says_it_is_one() {
 fn a_json_nut_reaches_a_sink_as_a_data_pad() {
     let path = scratch("to_sink.nut");
     write_source_track(&path);
+    // The sink is handed the messages and never the heartbeat among them.
+    let wire = std::fs::read(&path).expect("read what the source wrote");
+    assert_eq!(heartbeats(&wire), vec![0]);
     let module = module_path("data_echo");
     let run = run_ffrwd_wasm(&[
         "-f",
@@ -282,7 +335,8 @@ fn a_filter_hands_a_data_pad_back_beside_a_coded_one() {
     let fixture_bytes = std::fs::read(&fixture).expect("read the h264 fixture");
     assert_eq!(read_packets(&video), read_packets(&fixture_bytes));
 
-    // The filter's own tally says the data pad was opened as one.
+    // The filter's own tally says the data pad was opened as one, and it
+    // was handed the messages and not the heartbeat among them.
     let tallies: Vec<serde_json::Value> = String::from_utf8_lossy(&run.stdout)
         .lines()
         .map(|line| serde_json::from_str(line).expect("each row is JSON"))

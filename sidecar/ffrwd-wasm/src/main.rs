@@ -13,6 +13,7 @@
 //! one.
 
 mod graph;
+mod heartbeat;
 mod network;
 mod rowfilter;
 mod rowmerge;
@@ -2081,12 +2082,21 @@ fn run_packet_sink(args: &Args, module: &str, params: &str) -> Result<()> {
     }
     let mut sink = runtime::PacketSink::open(module, &sink_inputs, params)
         .with_context(|| format!("opening module {module}"))?;
+    let data: Vec<bool> = streams
+        .iter()
+        .map(|s| s.as_ref().is_some_and(nut::Stream::is_json))
+        .collect();
 
     // The last batch of packets rides the final call, which is what the
     // interface says `last` carries: whatever is left.
     let outcome = (|| -> Result<Emitted> {
         loop {
-            let (carried, last) = queues.take()?;
+            let (mut carried, last) = queues.take()?;
+            // A heartbeat is no message, and a sink is handed messages alone.
+            drop_heartbeats(&mut carried, &data);
+            if !last && carried.iter().all(Vec::is_empty) {
+                continue;
+            }
             let emitted = sink.process(&carried, last).with_context(|| {
                 let which = if last {
                     "the final call"
@@ -2271,15 +2281,41 @@ fn run_packet_filter(args: &Args, module: &str, params: &str) -> Result<()> {
     // something back places it on a real last carrier instead of holding a
     // packet out of the stream for the whole run. The rows that arrive with
     // it are the rest of the rows input.
+    //
+    // A heartbeat on a data pad is no message, so the module never sees it;
+    // it leaves on that pad's output after whatever the call wrote there, so
+    // time keeps reaching the reader downstream.
+    let data: Vec<bool> = streams.iter().map(nut::Stream::is_json).collect();
+    let mut beats: Vec<heartbeat::Beats> = streams
+        .iter()
+        .map(|s| {
+            heartbeat::Beats::new(TimeBase {
+                num: s.time_base.num,
+                den: s.time_base.den,
+            })
+        })
+        .collect();
     let mut sending = true;
     let outcome = (|| -> Result<runtime::Filtered> {
         loop {
-            let (carried, last) = queues.take()?;
+            let (mut carried, last) = queues.take()?;
+            let heard = drop_heartbeats(&mut carried, &data);
             let arrived = if last {
                 rows.drain_to_end()?
             } else {
                 rows.take()?.0
             };
+            if !last && arrived.is_empty() && carried.iter().all(Vec::is_empty) {
+                for (pad, pts) in heard.into_iter().enumerate() {
+                    if let Some(pts) = pts.and_then(|pts| beats[pad].pass(pts)) {
+                        sending &= senders[pad].send(vec![heartbeat_packet(pts)]).is_ok();
+                    }
+                }
+                if !sending {
+                    break;
+                }
+                continue;
+            }
             let filtered = filter.process(&carried, &arrived, last).with_context(|| {
                 let which = if last {
                     "the final call"
@@ -2291,7 +2327,15 @@ fn run_packet_filter(args: &Args, module: &str, params: &str) -> Result<()> {
             if last {
                 return Ok(filtered);
             }
-            for (pad, packets) in filtered.pads.into_iter().enumerate() {
+            for (pad, mut packets) in filtered.pads.into_iter().enumerate() {
+                if data[pad] {
+                    for packet in &mut packets {
+                        packet.pts = beats[pad].place(packet.pts);
+                        packet.dts = Some(packet.pts);
+                    }
+                    let beat = heard[pad].and_then(|pts| beats[pad].pass(pts));
+                    packets.extend(beat.map(heartbeat_packet));
+                }
                 if !packets.is_empty() {
                     sending &= senders[pad].send(packets).is_ok();
                 }
@@ -2314,7 +2358,13 @@ fn run_packet_filter(args: &Args, module: &str, params: &str) -> Result<()> {
     rows.close();
     let filtered = outcome?;
 
-    for (pad, packets) in filtered.pads.into_iter().enumerate() {
+    for (pad, mut packets) in filtered.pads.into_iter().enumerate() {
+        if data[pad] {
+            for packet in &mut packets {
+                packet.pts = beats[pad].place(packet.pts);
+                packet.dts = Some(packet.pts);
+            }
+        }
         if !packets.is_empty() {
             // A send fails only once that output's writer has stopped, and
             // its failure is what `join` below hands back.
@@ -2367,6 +2417,15 @@ fn run_packet_filter(args: &Args, module: &str, params: &str) -> Result<()> {
 /// a message may announce something ahead of the media it is about, so it
 /// is never held for a later call or for a buffer to fill. Rows go to an
 /// `-f ndjson` output as a sink's do.
+///
+/// Every output also carries heartbeats (see `heartbeat`): one at pts 0 the
+/// moment its header is out, before any input has said what it carries, since
+/// the ffmpeg reading it may be the one writing the clock and opens every
+/// input before it writes anything; then one each time the clock moves on
+/// with nothing written on that output for a tenth of a second. Without a
+/// clock pad the time is how far the data pads have been read, heartbeats
+/// arriving on them included. A heartbeat arriving on a data pad moves time
+/// on and is never handed to the module.
 fn run_data_filter(args: &Args, module: &str, params: &str) -> Result<()> {
     if args.annotations.input || args.annotations.output {
         bail!(
@@ -2384,19 +2443,8 @@ fn run_data_filter(args: &Args, module: &str, params: &str) -> Result<()> {
     let queues = Arc::new(PadQueues::new(pads));
     let headers = spawn_pad_readers(&args.inputs, &queues, true);
 
-    let mut streams: Vec<Option<nut::Stream>> = (0..pads).map(|_| None).collect();
-    for _ in 0..pads {
-        let (pad, stream) = headers.recv().expect("every reader reports its header");
-        streams[pad] = Some(stream.with_context(|| format!("input {pad}"))?);
-    }
-    let mut data_pads = Vec::with_capacity(pads);
-    for (pad, stream) in streams.iter().enumerate() {
-        let stream = stream.as_ref().expect("every pad reported");
-        data_pads.push(data_pad(module, pad, stream)?);
-    }
-    let mut filter = runtime::DataFilter::open(module, &data_pads, params)
-        .with_context(|| format!("opening module {module}"))?;
-
+    let mut filter =
+        runtime::DataFilter::load(module).with_context(|| format!("opening module {module}"))?;
     let described = filter.described().clone();
     let mut data_outputs: Vec<&OutputSpec> = Vec::new();
     let mut row_outputs: Vec<RowOutput> = Vec::new();
@@ -2421,20 +2469,24 @@ fn run_data_filter(args: &Args, module: &str, params: &str) -> Result<()> {
         );
     }
 
-    // Every output's header goes out before the first call, so a reader
-    // opening it is not left waiting on a message that may be minutes off.
+    // Every output's header and first heartbeat go out before anything is
+    // waited on, so a reader opening it is not left waiting on a message that
+    // may be minutes off, nor on a clock it writes itself.
     let out_base = nut::TimeBase {
         num: described.time_base.num,
         den: described.time_base.den,
     };
     let mut senders = Vec::with_capacity(data_outputs.len());
     let mut writers = Vec::with_capacity(data_outputs.len());
+    let mut beats = Vec::with_capacity(data_outputs.len());
     for output in &data_outputs {
         let mut muxer = open_frame_output(&output.path, &nut::Stream::json(out_base), false)
             .with_context(|| format!("opening output {}", output.spelling))?;
-        muxer
-            .flush()
+        let mut beat = heartbeat::Beats::new(described.time_base);
+        write_coded_packet(&mut muxer, &heartbeat_packet(beat.place(0)))
+            .and_then(|()| Ok(muxer.flush()?))
             .with_context(|| format!("writing output {}", output.spelling))?;
+        beats.push(beat);
         let (sender, batches) = mpsc::channel::<Vec<runtime::Packet>>();
         let spelling = output.spelling.clone();
         senders.push(sender);
@@ -2442,6 +2494,20 @@ fn run_data_filter(args: &Args, module: &str, params: &str) -> Result<()> {
             write_track(muxer, &batches).with_context(|| format!("writing output {spelling}"))
         }));
     }
+
+    let mut streams: Vec<Option<nut::Stream>> = (0..pads).map(|_| None).collect();
+    for _ in 0..pads {
+        let (pad, stream) = headers.recv().expect("every reader reports its header");
+        streams[pad] = Some(stream.with_context(|| format!("input {pad}"))?);
+    }
+    let mut data_pads = Vec::with_capacity(pads);
+    for (pad, stream) in streams.iter().enumerate() {
+        let stream = stream.as_ref().expect("every pad reported");
+        data_pads.push(data_pad(module, pad, stream)?);
+    }
+    filter
+        .init(&data_pads, params)
+        .with_context(|| format!("opening module {module}"))?;
 
     let clock = data_pads
         .iter()
@@ -2468,23 +2534,35 @@ fn run_data_filter(args: &Args, module: &str, params: &str) -> Result<()> {
                         };
                         format!("{}: {which}", filter.name())
                     })?;
+                // The clock moved on: an output quiet for a tenth of a second
+                // says so.
+                let clocked = call
+                    .now
+                    .zip(clock.map(|pad| data_pads[pad].time_base))
+                    .filter(|_| !call.last);
                 for (index, messages) in processed.outputs.into_iter().enumerate() {
-                    if !messages.is_empty() {
-                        let packets = messages
-                            .into_iter()
-                            .map(|m| runtime::Packet {
-                                pts: m.pts,
-                                dts: Some(m.pts),
-                                duration: None,
-                                keyframe: true,
-                                data: m.data,
-                            })
-                            .collect();
+                    let mut packets: Vec<runtime::Packet> = messages
+                        .into_iter()
+                        .map(|m| message_packet(beats[index].place(m.pts), m.data))
+                        .collect();
+                    if let Some((now, base)) = clocked {
+                        packets.extend(beats[index].due(now, base).map(heartbeat_packet));
+                    }
+                    if !packets.is_empty() {
                         sending &= senders[index].send(packets).is_ok();
                     }
                 }
                 for writer in &mut row_outputs {
                     writer.write_batch(&processed.rows)?;
+                }
+            }
+            // Without a clock, time is as far as the data pads have been read.
+            let heard = drive.heard().filter(|_| clock.is_none() && !last);
+            if let Some((heard, base)) = heard {
+                for (index, beat) in beats.iter_mut().enumerate() {
+                    if let Some(pts) = beat.due(heard, base) {
+                        sending &= senders[index].send(vec![heartbeat_packet(pts)]).is_ok();
+                    }
                 }
             }
             if last || !sending {
@@ -2600,13 +2678,20 @@ impl DataDrive {
     ) -> Vec<DataCall> {
         for (pad, packets) in carried.into_iter().enumerate() {
             if self.pads[pad].1 {
+                // A heartbeat says how far the pad has been read, and is no
+                // message.
                 if let Some(packet) = packets.last() {
                     self.read_to[pad] = Some(packet.pts);
                 }
-                self.held[pad].extend(packets.into_iter().map(|p| runtime::Message {
-                    pts: p.pts,
-                    data: p.data,
-                }));
+                self.held[pad].extend(
+                    packets
+                        .into_iter()
+                        .filter(|p| !heartbeat::is_heartbeat(&p.data))
+                        .map(|p| runtime::Message {
+                            pts: p.pts,
+                            data: p.data,
+                        }),
+                );
             } else if Some(pad) == self.clock {
                 self.ticks.extend(packets.into_iter().map(|p| p.pts));
             }
@@ -2662,6 +2747,20 @@ impl DataDrive {
         calls
     }
 
+    /// The furthest any data pad has been read, and the time base it counts
+    /// in; None before any has delivered a packet.
+    fn heard(&self) -> Option<(i64, TimeBase)> {
+        let mut furthest: Option<(i64, TimeBase)> = None;
+        for (pad, read) in self.read_to.iter().enumerate() {
+            let Some(pts) = *read else { continue };
+            let base = self.pads[pad].0;
+            if furthest.is_none_or(|(at, at_base)| !not_after(pts, base, at, at_base)) {
+                furthest = Some((pts, base));
+            }
+        }
+        furthest
+    }
+
     /// Whether every data pad read from a file has been read past `now` on
     /// the first clock pad's clock, or has ended: until it has, a message it
     /// has yet to deliver may belong before that frame.
@@ -2708,6 +2807,44 @@ fn not_after(pts: i64, base: TimeBase, now: i64, clock: TimeBase) -> bool {
     let left = i128::from(pts) * i128::from(base.num) * i128::from(clock.den);
     let right = i128::from(now) * i128::from(clock.num) * i128::from(base.den);
     left <= right
+}
+
+/// One message as the packet a data output carries: every message stands
+/// alone, so it is a keyframe at its own time.
+fn message_packet(pts: i64, data: Vec<u8>) -> runtime::Packet {
+    runtime::Packet {
+        pts,
+        dts: Some(pts),
+        duration: None,
+        keyframe: true,
+        data,
+    }
+}
+
+/// A heartbeat at `pts`: a message packet with nothing in it.
+fn heartbeat_packet(pts: i64) -> runtime::Packet {
+    message_packet(pts, Vec::new())
+}
+
+/// Takes the heartbeats out of the data pads of one batch, `data` saying
+/// which pads are data, and answers the pts of each pad's latest one.
+fn drop_heartbeats(carried: &mut [Vec<runtime::Packet>], data: &[bool]) -> Vec<Option<i64>> {
+    carried
+        .iter_mut()
+        .zip(data)
+        .map(|(packets, is_data)| {
+            if !is_data {
+                return None;
+            }
+            let latest = packets
+                .iter()
+                .filter(|p| heartbeat::is_heartbeat(&p.data))
+                .map(|p| p.pts)
+                .max();
+            packets.retain(|p| !heartbeat::is_heartbeat(&p.data));
+            latest
+        })
+        .collect()
 }
 
 /// How many buffered bytes the rows reader may hold before it waits for the
@@ -3794,9 +3931,10 @@ fn run_packet_source(args: &Args, module: &str, params: &str) -> Result<()> {
     // What the headers were holding back, then the pulls that follow. A send
     // fails only once that output's writer has stopped, and its failure is
     // what `join` below hands back.
+    let mut beats = SourceBeats::new(&catalog.tracks, &pending);
     let mut sending = true;
-    for (slot, sender) in senders.iter().enumerate() {
-        sending &= sender.send(std::mem::take(&mut pending[slot])).is_ok();
+    for (slot, packets) in beats.pull(pending).into_iter().enumerate() {
+        sending &= senders[slot].send(packets).is_ok();
     }
     while sending && !ended {
         let Some(pads) = source
@@ -3805,8 +3943,9 @@ fn run_packet_source(args: &Args, module: &str, params: &str) -> Result<()> {
         else {
             break;
         };
-        for (slot, pad) in pads.into_iter().enumerate() {
-            sending &= senders[slot].send(pad.packets).is_ok();
+        let pulled = pads.into_iter().map(|pad| pad.packets).collect();
+        for (slot, packets) in beats.pull(pulled).into_iter().enumerate() {
+            sending &= senders[slot].send(packets).is_ok();
         }
     }
     drop(senders);
@@ -3819,6 +3958,87 @@ fn run_packet_source(args: &Args, module: &str, params: &str) -> Result<()> {
         }
     }
     wrote
+}
+
+/// The heartbeats a packet source's data tracks carry (see `heartbeat`): one
+/// at start, at the earliest time anything held back for the headers
+/// carries, and then one whenever the source's media moves on with nothing
+/// on the track for a tenth of a second, at the media's own decode time.
+struct SourceBeats {
+    /// Each track's time base, and its heartbeats where it is a data track.
+    tracks: Vec<(TimeBase, Option<heartbeat::Beats>)>,
+    /// How far the media has been pulled: its furthest decode time.
+    media: Option<(i64, TimeBase)>,
+    /// The start heartbeat's time, until the first pull has carried it.
+    start: Option<(i64, TimeBase)>,
+}
+
+impl SourceBeats {
+    fn new(tracks: &[runtime::SourceTrack], held: &[Vec<runtime::Packet>]) -> SourceBeats {
+        let tracks: Vec<(TimeBase, Option<heartbeat::Beats>)> = tracks
+            .iter()
+            .map(|t| {
+                let base = t.stream.time_base;
+                let data = t.stream.format == runtime::CodedFormat::Data;
+                (base, data.then(|| heartbeat::Beats::new(base)))
+            })
+            .collect();
+        let mut start = None;
+        for (packets, (base, _)) in held.iter().zip(&tracks) {
+            if let Some(packet) = packets.first() {
+                start = furthest(start, (packet.dts.unwrap_or(packet.pts), *base), false);
+            }
+        }
+        SourceBeats {
+            tracks,
+            media: None,
+            start: Some(start.unwrap_or((0, heartbeat::EVERY))),
+        }
+    }
+
+    /// One pull's packets, a list per track, with the data tracks' messages
+    /// placed on their timeline and their heartbeats added.
+    fn pull(&mut self, mut pads: Vec<Vec<runtime::Packet>>) -> Vec<Vec<runtime::Packet>> {
+        for (packets, (base, beats)) in pads.iter().zip(&self.tracks) {
+            if beats.is_none() {
+                for packet in packets {
+                    let at = (packet.dts.unwrap_or(packet.pts), *base);
+                    self.media = furthest(self.media, at, true);
+                }
+            }
+        }
+        let start = self.start.take();
+        for (packets, (_, beats)) in pads.iter_mut().zip(&mut self.tracks) {
+            let Some(beats) = beats else { continue };
+            let mut placed = Vec::with_capacity(packets.len() + 2);
+            if let Some((pts, base)) = start {
+                placed.extend(beats.due(pts, base).map(heartbeat_packet));
+            }
+            for mut packet in packets.drain(..) {
+                packet.pts = beats.place(packet.pts);
+                packet.dts = Some(packet.pts);
+                placed.push(packet);
+            }
+            if let Some((pts, base)) = self.media {
+                placed.extend(beats.due(pts, base).map(heartbeat_packet));
+            }
+            *packets = placed;
+        }
+        pads
+    }
+}
+
+/// Whichever of `was` and `at` is further along, or earlier where `latest`
+/// is false; `at` where there was nothing before.
+fn furthest(
+    was: Option<(i64, TimeBase)>,
+    at: (i64, TimeBase),
+    latest: bool,
+) -> Option<(i64, TimeBase)> {
+    Some(match was {
+        Some((pts, base)) if not_after(at.0, at.1, pts, base) == latest => (pts, base),
+        _ => at,
+    })
 }
 
 /// One output's packets, each batch flushed as it is written, until the pull
