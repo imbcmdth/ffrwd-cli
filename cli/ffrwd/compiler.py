@@ -41,16 +41,16 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from . import registry as registry_module
 from . import wasm
 from .emit import Emitted, emit
 from .errors import ErrorCode, FfrwdError
 from .execute import DEFAULT_TIMEOUT
-from .functions import WasmFunction, package_modules
+from .functions import WasmFunction, package_modules, script_definitions
 from .inputs import forces_demuxer, probe_options, render_options
-from .ir import Graph
+from .ir import Graph, Lateral
 from .lower import ProbePath, input_option_values, lower_commands, lower_table
 from .parser import Resolved, parse, resolve
 from .probe import ProbeFailure, ProbeResult
@@ -63,12 +63,14 @@ from .processes import (
     ProcessPlan,
     check_spellable,
     external_filters,
+    from_commands,
     partition,
 )
 from .project import ModelPin, PackageSet
 from .pts import insert_pts_resets
 from .split import insert_splits
 from .table import TableSink
+from .vars import substitute
 from .warnings import OnWarning
 from .wasm import Described
 
@@ -77,6 +79,7 @@ __all__ = [
     "classify",
     "compile_all",
     "compile_commands",
+    "compile_instance",
     "compile_sql",
     "compile_table_sql",
     "emitted_commands",
@@ -594,6 +597,13 @@ def compile_all(
             probe_failures=probe_failures,
         )
         ready = [insert_splits(insert_pts_resets(graph)) for graph in graphs]
+        ready[0] = replace(
+            ready[0],
+            laterals=[
+                _checked_instance(lateral, text, packages, owner)
+                for lateral in ready[0].laterals
+            ],
+        )
         budget = _default_timeout(_input_duration(probes))
         span = _run_duration(ready, _probed_paths(res, probes))
         stream_wasm = _stream_wasm(res)
@@ -636,6 +646,66 @@ def compile_all(
             col=1,
             hint="please report this query as a bug",
         ) from err
+
+
+# What a run-time lateral's body is resolved with at compile time, a value of
+# each declared type standing in for what a message will bind.
+_STAND_INS = {"number": "1", "text": "x", "boolean": "true"}
+
+
+def _checked_instance(
+    lateral: Lateral,
+    text: str,
+    packages: PackageSet | None,
+    owner: tuple[str, str] | None,
+) -> Lateral:
+    """`lateral` with the script's own definitions its instance needs, its
+    body resolved once to refuse one that cannot compile before the run.
+
+    Resolved and not lowered: what the body reads is only known per message.
+    A refusal is said at the call, since the instance is nowhere in the text.
+    """
+    definitions = script_definitions(text, lateral.needs) if lateral.needs else ""
+    stand_ins = substitute(
+        lateral.template,
+        {value.name: _STAND_INS.get(value.type, "1") for value in lateral.values},
+    )
+    try:
+        resolve(parse(f"{definitions}\n{stand_ins.text}"), packages=packages, owner=owner)
+    except FfrwdError as err:
+        raise FfrwdError(
+            err.code,
+            f"an instance of {lateral.call} does not compile: {err.message}",
+            line=lateral.line,
+            col=lateral.col,
+            hint=err.hint,
+        ) from err
+    return replace(lateral, definitions=definitions)
+
+
+def compile_instance(
+    text: str,
+    *,
+    packages: PackageSet | None = None,
+    owner: tuple[str, str] | None = None,
+    unset: Mapping[tuple[int, int], str] | None = None,
+    describe: wasm.Describe = wasm.describe,
+    invoke: wasm.Invoke = wasm.invoke,
+) -> ProcessPlan:
+    """One instance of a run-time lateral, compiled as ``ffrwd run -v``
+    compiles a query, and always as a plan: the host runs it beside the plan
+    that started it, with the same runner.
+
+    Raises ``FfrwdError`` -- and nothing else -- on every rejection.
+    """
+    compiled = compile_all(
+        text, packages=packages, owner=owner, unset=unset, describe=describe, invoke=invoke
+    )
+    if compiled.plan is not None:
+        return compiled.plan
+    if len(compiled.graphs) == 1:
+        return partition(compiled.graphs[0])
+    return from_commands(compiled.graphs)
 
 
 def classify(

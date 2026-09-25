@@ -204,7 +204,8 @@ def _without_idle(plan: ProcessPlan) -> ProcessPlan:
         if not idle:
             break
         live -= idle
-    return ProcessPlan(
+    return replace(
+        plan,
         processes=tuple(p for p in plan.processes if p.id in live),
         edges=tuple(e for e in plan.edges if e.source in live and e.target in live),
     )

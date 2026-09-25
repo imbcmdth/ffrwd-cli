@@ -682,6 +682,138 @@ class FeederCall:
         return cls(node=raw_node, function=raw_function, param=raw_param)
 
 
+@dataclass(frozen=True)
+class LateralValue:
+    """One value a run-time lateral's instance is bound per message.
+
+    `type` is the one declared (number, text or boolean). `shape` is what
+    the feeder the instance writes says of its programme where the name is
+    one it answers (width, height, fps, pix_fmt, rate, channels,
+    sample_fmt), else None. `default` says the declaration gives it one.
+    """
+
+    name: str
+    type: str
+    shape: str | int | float | None = None
+    default: bool = False
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "name": self.name,
+            "type": self.type,
+            "shape": self.shape,
+            "default": self.default,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, object]) -> LateralValue:
+        shape = d.get("shape")
+        assert shape is None or isinstance(shape, str | int | float)
+        return cls(
+            name=str(d["name"]),
+            type=str(d["type"]),
+            shape=shape,
+            default=bool(d.get("default")),
+        )
+
+
+@dataclass(frozen=True)
+class LateralConnection:
+    """One feeder connection a run-time lateral's instances write: its port,
+    and the calls reading it."""
+
+    port: int
+    calls: tuple[FeederCall, ...]
+
+    def to_dict(self) -> dict[str, object]:
+        return {"port": self.port, "calls": [call.to_dict() for call in self.calls]}
+
+    @classmethod
+    def from_dict(cls, d: dict[str, object]) -> LateralConnection:
+        raw_port, raw_calls = d["port"], d["calls"]
+        assert isinstance(raw_port, int)
+        assert isinstance(raw_calls, list)
+        return cls(
+            port=raw_port,
+            calls=tuple(FeederCall.from_dict(c) for c in raw_calls if isinstance(c, dict)),
+        )
+
+
+@dataclass(frozen=True)
+class Lateral:
+    """A run-time lateral: a sql table function started once per message of a
+    data stream, each instance writing the feeder connections its streams go to.
+
+    The data stream is written to `tap`, a loopback port the host reads the
+    messages on. Per message the host binds `values` by name and compiles
+    `template`, one COPY per connection with each value a variable
+    (``:'name'`` or ``:name``), behind `definitions`, the script's own
+    CREATE FUNCTIONs it calls (`needs` names them). `function`, `call` and
+    `stream` are the function, the call and its data stream as written;
+    `line` and `col` are the call's. `writer` is the process writing the
+    tap, which a plan fills in.
+    """
+
+    function: str
+    call: str
+    stream: str
+    tap: int
+    template: str
+    values: tuple[LateralValue, ...]
+    connections: tuple[LateralConnection, ...]
+    needs: tuple[str, ...] = ()
+    definitions: str = ""
+    line: int = 1
+    col: int = 1
+    writer: str = ""
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "function": self.function,
+            "call": self.call,
+            "stream": self.stream,
+            "tap": self.tap,
+            "template": self.template,
+            "values": [value.to_dict() for value in self.values],
+            "connections": [c.to_dict() for c in self.connections],
+            "needs": list(self.needs),
+            "definitions": self.definitions,
+            "line": self.line,
+            "col": self.col,
+            "writer": self.writer,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, object]) -> Lateral:
+        raw_values, raw_connections = d["values"], d["connections"]
+        raw_needs = d.get("needs") or []
+        raw_tap, raw_line, raw_col = d["tap"], d.get("line", 1), d.get("col", 1)
+        assert isinstance(raw_values, list)
+        assert isinstance(raw_connections, list)
+        assert isinstance(raw_needs, list)
+        assert isinstance(raw_tap, int)
+        assert isinstance(raw_line, int)
+        assert isinstance(raw_col, int)
+        return cls(
+            function=str(d["function"]),
+            call=str(d["call"]),
+            stream=str(d["stream"]),
+            tap=raw_tap,
+            template=str(d["template"]),
+            values=tuple(
+                LateralValue.from_dict(v) for v in raw_values if isinstance(v, dict)
+            ),
+            connections=tuple(
+                LateralConnection.from_dict(c) for c in raw_connections if isinstance(c, dict)
+            ),
+            needs=tuple(str(name) for name in raw_needs),
+            definitions=str(d.get("definitions", "")),
+            line=raw_line,
+            col=raw_col,
+            writer=str(d.get("writer", "")),
+        )
+
+
 @dataclass
 class Graph:
     input_paths: list[str]  # -i order; index is the ffmpeg input index
@@ -751,6 +883,9 @@ class Graph:
     # on that loopback port and reads the unit's streams itself, so the unit
     # is written by a process of its own and reaches no file.
     feeders: dict[str, tuple[FeederCall, ...]] = field(default_factory=dict)
+    # Each run-time lateral: its data stream is a sink of its own, written to
+    # the loopback port `tap` names, and its instances are started per message.
+    laterals: list[Lateral] = field(default_factory=list)
 
     @property
     def outputs(self) -> list[Output]:
@@ -820,6 +955,8 @@ class Graph:
                 path: [call.to_dict() for call in calls]
                 for path, calls in self.feeders.items()
             }
+        if self.laterals:
+            d["laterals"] = [lateral.to_dict() for lateral in self.laterals]
         return d
 
     @classmethod
@@ -942,6 +1079,10 @@ class Graph:
                     FeederCall.from_dict(call) for call in calls if isinstance(call, dict)
                 )
 
+        raw_laterals = d.get("laterals") or []
+        assert isinstance(raw_laterals, list)
+        laterals = [Lateral.from_dict(one) for one in raw_laterals if isinstance(one, dict)]
+
         return cls(
             input_paths=[str(p) for p in raw_inputs],
             sources={str(k): int(v) for k, v in raw_sources.items()},
@@ -959,6 +1100,7 @@ class Graph:
             url_sources=url_sources,
             dropped_aliases=dropped_aliases,
             feeders=feeders,
+            laterals=laterals,
         )
 
 

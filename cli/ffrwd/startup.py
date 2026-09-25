@@ -321,8 +321,9 @@ def _reordered(plan: ProcessPlan, order: Sequence[Edge]) -> ProcessPlan:
     edges = tuple(
         next(moved) if isinstance(edge, StreamEdge) else edge for edge in plan.edges
     )
-    after = ProcessPlan(processes=plan.processes, edges=edges)
-    return ProcessPlan(
+    after = replace(plan, edges=edges)
+    return replace(
+        plan,
         processes=tuple(
             _respell(plan, after, process)
             if isinstance(process, FfmpegProcess)

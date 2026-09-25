@@ -143,6 +143,7 @@ from .types import (
 from .warnings import FfrwdWarning, OnWarning, WarningCode
 
 __all__ = [
+    "DECLARED_STREAM",
     "NAMEABLE_TYPES",
     "SHARED_ARGUMENT",
     "SINK_ALIAS",
@@ -153,6 +154,7 @@ __all__ = [
     "Annotation",
     "AnnotationField",
     "Parameter",
+    "RuntimeLateral",
     "Script",
     "Signature",
     "WasmFunction",
@@ -161,6 +163,7 @@ __all__ = [
     "package_modules",
     "package_signatures",
     "package_sources",
+    "script_definitions",
     "wasm_named_parameter",
 ]
 
@@ -172,6 +175,37 @@ _INPUT = "input"
 # than one place all carry the same value here, and lowering builds what is
 # behind it once for them all (:func:`_substitute`).
 SHARED_ARGUMENT = "shared_argument"
+
+# `node.meta` key: a stream argument bound to a parameter of a sql function
+# carries ``(function, parameter, declared type)`` here, and lowering checks
+# the stream it turns out to be against that type (:func:`_substitute`).
+DECLARED_STREAM = "declared_stream"
+
+
+@dataclass(frozen=True)
+class RuntimeLateral:
+    """A LATERAL call over a data stream: a body started once per message.
+
+    Expansion takes the call's FROM item out and reads each of its columns
+    as ``<key>(<data stream>, '<column>')``, `key` being this lateral's name
+    on :attr:`Script.laterals`; lowering turns that into the stream a
+    feeder is written from. `function` is the call path an instance names,
+    `alias` the FROM alias, `call` and `stream` the call and its data stream
+    as written. `params` are the values bound per message and `written` the
+    ones the call wrote itself, as SQL. `needs` are the script's own
+    definitions an instance calls, in the order the script wrote them.
+    """
+
+    function: str
+    alias: str
+    call: str
+    stream: str
+    first: Parameter
+    params: tuple[Parameter, ...]
+    columns: tuple[Parameter, ...]
+    written: Mapping[str, str]
+    needs: tuple[str, ...]
+
 
 # Names a definition may not claim: the dialect's own FROM item, the two
 # reserved namespaces, the built-in vector and row functions, and every name
@@ -902,11 +936,13 @@ class Script:
     `wasm` is keyed by the name a call in the expanded query writes: the
     script's own declaration names, and the full ``ns.pkg.fn`` path of every
     package declaration a call adopted. A script with no ``LANGUAGE wasm``
-    function and no call into a package's leaves it empty.
+    function and no call into a package's leaves it empty. `laterals` holds
+    each run-time lateral, keyed by the name its columns are read under.
     """
 
     tree: exp.Expr
     wasm: dict[str, WasmFunction] = field(default_factory=dict)
+    laterals: dict[str, RuntimeLateral] = field(default_factory=dict)
 
 
 @dataclass
@@ -1018,7 +1054,9 @@ def expanded(
         expanded_tree = expander.run(tree)
     except FfrwdError as err:
         raise expander.translate(err) from err
-    script = Script(tree=expanded_tree, wasm=dict(expander.wasm))
+    script = Script(
+        tree=expanded_tree, wasm=dict(expander.wasm), laterals=dict(expander.laterals)
+    )
     try:
         yield script
     except FfrwdError as err:
@@ -2660,6 +2698,27 @@ def package_sources(package: Package) -> dict[str, str]:
     return sources
 
 
+def script_definitions(text: str, names: Sequence[str]) -> str:
+    """The ``CREATE FUNCTION``s of script `text` that define `names`, as
+    the script writes them and in its order, one after another.
+
+    What a run-time lateral's instance is compiled behind when the function
+    it names, or one its body calls, is the script's own.
+    """
+    wanted = set(names)
+    found: list[str] = []
+    for block in _statement_blocks(text):
+        try:
+            create = parse(block)
+        except FfrwdError:
+            continue
+        if not isinstance(create, exp.Create) or _create_kind(create) != "FUNCTION":
+            continue
+        if _ident_name(_function_name(create)[1]) in wanted:
+            found.append(block)
+    return "\n".join(found)
+
+
 def package_modules(package: Package) -> tuple[WasmFunction, ...]:
     """Every ``LANGUAGE wasm`` declaration across `package`'s lib files.
 
@@ -2886,7 +2945,12 @@ def _accessor(argument: exp.Expr, path: list[exp.Identifier]) -> exp.Expr:
     return read
 
 
-def _substitute(body: exp.Select, bindings: dict[str, exp.Expr], index: int) -> None:
+def _substitute(
+    body: exp.Select,
+    bindings: dict[str, exp.Expr],
+    index: int,
+    streams: Mapping[str, tuple[str, str]] | None = None,
+) -> None:
     """Replace every parameter reference with the argument bound to it.
 
     A bare reference becomes the argument itself; a reference with a path off
@@ -2900,9 +2964,15 @@ def _substitute(body: exp.Select, bindings: dict[str, exp.Expr], index: int) -> 
     in a CTE first already gives. `index` is the expansion's own, so two
     calls to one function never share. A value costs nothing to read twice
     and is left alone.
+
+    `streams` are the stream parameters, each with the function's name and
+    the type it declares: every copy of such an argument carries them
+    (:data:`DECLARED_STREAM`), since what kind of stream it is is only known
+    once lowering has built it.
     """
     reads = list(body.find_all(exp.Column))
     shared = _shared_parameters(reads, bindings)
+    declared = streams or {}
     for column in reads:
         key = _leftmost(column)
         if key is None:
@@ -2915,6 +2985,9 @@ def _substitute(body: exp.Select, bindings: dict[str, exp.Expr], index: int) -> 
             read = copy.deepcopy(argument)
             if name in shared:
                 read.meta[SHARED_ARGUMENT] = f"{index}:{name}"
+            if name in declared:
+                function, written = declared[name]
+                read.meta[DECLARED_STREAM] = (function, name, written)
             column.replace(read)
             continue
         column.replace(_accessor(argument, _path_after(column, key)))
@@ -3080,6 +3153,82 @@ def _splice_over(host: exp.Select, item: exp.Expr, body: exp.Select) -> None:
     where = body.args.get("where")
     if isinstance(where, exp.Where) and isinstance(where.this, exp.Expr):
         _and_into(host, where.this)
+
+
+def _call_alias(item: exp.Table, function: _Function) -> str:
+    """The name a FROM-position call binds: its alias, or unwritten, the
+    function's own name, as Postgres has it."""
+    alias = item.args.get("alias")
+    if isinstance(alias, exp.TableAlias) and isinstance(alias.this, exp.Identifier):
+        return _ident_name(alias.this)
+    return function.name
+
+
+# What a run-time lateral's columns may be, and its values.
+_RUNTIME_COLUMN_TYPES = (_WASM_STREAM, _WASM_AUDIO_STREAM)
+_RUNTIME_VALUE_TYPES = ("number", "text", "boolean")
+_RUNTIME_HINT = (
+    "declare <name>(<launch> data_stream, <value> <type>, ...) RETURNS "
+    "TABLE(video video_stream, audio audio_stream), either column or both, "
+    "each value text, number or boolean"
+)
+
+
+def _runs_per_message(function: _Function) -> bool:
+    """Whether calling `function` in FROM is a run-time lateral: a table
+    function whose first parameter is a data stream."""
+    return function.returns_rows and bool(function.params) and (
+        function.params[0].type == WASM_DATA
+    )
+
+
+def _check_runs_per_message(function: _Function, anchor: exp.Expr) -> None:
+    """A run-time lateral's declaration: the streams a feeder takes out, one
+    value per parameter after the data stream, and a body that reads no
+    message itself -- an instance is started from one, bound by name."""
+    columns = function.columns or ()
+    kinds = [column.type for column in columns]
+    wrong = next(
+        (
+            column
+            for column in columns
+            if column.type not in _RUNTIME_COLUMN_TYPES or kinds.count(column.type) > 1
+        ),
+        None,
+    )
+    if wrong is not None:
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"{function.qualified}() is started once per message of its data "
+            f"stream, and returns '{wrong.name} {wrong.type}': it returns the "
+            "picture and sound a feeder takes, one of each at most",
+            anchor,
+            hint=_RUNTIME_HINT,
+        )
+    for param in function.params[1:]:
+        if param.type in _RUNTIME_VALUE_TYPES:
+            continue
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"{function.qualified}() is started once per message of its data "
+            f"stream, and takes '{param.name}' as {param.type}: every parameter "
+            "after the data stream is a value bound per message",
+            anchor,
+            hint=_RUNTIME_HINT,
+        )
+    stream = function.params[0].name
+    for column in function.body.find_all(exp.Column):
+        key = _leftmost(column)
+        if key is None or _ident_name(column.args.get(key)) != stream:
+            continue
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"the body of {function.qualified}() reads '{stream}', the data stream "
+            "it is started from",
+            anchor,
+            hint="an instance is started once per message and reads none; name "
+            "a parameter after each message field the body needs",
+        )
 
 
 def _name_columns(
@@ -3412,6 +3561,39 @@ def wasm_named_parameter(
     )
 
 
+def _named_position(
+    function: _Function,
+    name: str,
+    anchor: exp.Expr,
+    call: exp.Anonymous,
+    positional: int,
+    placed: Sequence[exp.Expr | None],
+) -> int:
+    """The position ``name => ...`` writes in a sql function's signature, or
+    the refusal saying why not: a name it does not have, or one already
+    written. `positional` is how many the positionals wrote."""
+    index = next((i for i, p in enumerate(function.params) if p.name == name), None)
+    if index is None:
+        listed = ", ".join(f"'{p.name}'" for p in function.params)
+        raise _error(
+            ErrorCode.UDF_ARG_TYPE,
+            f"{function.qualified}() has no parameter '{name}'",
+            anchor,
+            fallback=call,
+            hint=f"its parameters are {listed}" if listed else function.signature,
+        )
+    if index < len(placed) and placed[index] is not None:
+        how = "positionally and by name" if index < positional else "by name twice"
+        raise _error(
+            ErrorCode.UDF_ARG_TYPE,
+            f"{function.qualified}() gets '{name}' twice: {how}",
+            anchor,
+            fallback=call,
+            hint=f"write '{name}' once: {function.signature}",
+        )
+    return index
+
+
 def _writes_annotation(
     declared: WasmFunction,
     arguments: Sequence[exp.Expr],
@@ -3610,6 +3792,8 @@ class _Expander:
     # own, plus every package one a call adopted.
     wasm: dict[str, WasmFunction] = field(default_factory=dict)
     wasm_used: set[str] = field(default_factory=set)
+    # Each run-time lateral, by the name its columns are read under.
+    laterals: dict[str, RuntimeLateral] = field(default_factory=dict)
     expansions: list[_Expansion] = field(default_factory=list)
     taken: set[str] = field(default_factory=set)
     budget: int = _EXPANSION_BUDGET
@@ -4577,39 +4761,67 @@ class _Expander:
         function.used = True
 
     def _arguments(
-        self, function: _Function, call: exp.Anonymous, host: exp.Select, position: int
-    ) -> list[exp.Expr]:
-        """The written arguments, expanded and checked against the signature.
+        self,
+        function: _Function,
+        call: exp.Anonymous,
+        host: exp.Select,
+        position: int,
+        *,
+        every: bool = True,
+    ) -> list[exp.Expr | None]:
+        """The written arguments, expanded and checked, in signature order.
 
+        The positionals fill the parameters from the first, and each
+        ``name => value`` the one it names; a parameter nothing wrote is None.
         An argument is the CALLER's text, so its own calls expand in the
-        caller's context -- f(f(x)) is nesting, never recursion.
+        caller's context -- f(f(x)) is nesting, never recursion. `every` is
+        False where a parameter left unwritten is bound later, not refused.
         """
         raw = [node for node in call.expressions if isinstance(node, exp.Expr)]
-        arguments = [self._expand_within(node, host, position, ()) for node in raw]
-        self._check_arguments(function, call, arguments)
-        return arguments
+        positional, named = _positional_and_named(raw)
+        placed: list[exp.Expr | None] = [
+            self._expand_within(node, host, position, ()) for node in positional
+        ]
+        if len(placed) > len(function.params):
+            plural = "" if len(placed) == 1 else "s"
+            raise _error(
+                ErrorCode.UDF_ARG_TYPE,
+                f"{function.qualified}() got {len(placed)} argument{plural}, but it "
+                f"declares {len(function.params)}",
+                call,
+                hint=function.signature,
+            )
+        for name, value in named:
+            index = _named_position(function, name, value, call, len(positional), placed)
+            placed.extend([None] * (index + 1 - len(placed)))
+            placed[index] = self._expand_within(value, host, position, ())
+        self._check_arguments(function, call, placed, every=every, named=bool(named))
+        return placed
 
-    def _bound(self, function: _Function, arguments: list[exp.Expr]) -> list[exp.Expr]:
+    def _bound(
+        self, function: _Function, arguments: Sequence[exp.Expr | None]
+    ) -> list[exp.Expr]:
         """`arguments`, in signature order, with a default filled in for each
         parameter the caller left NULL or unwritten.
 
         NULL is absence throughout the dialect -- an unset variable
         substitutes to it -- so a NULL argument to a defaulted parameter
         takes the default the same way omitting it does; a caller who means
-        NULL itself has no defaulted parameter to pass it to.
+        NULL itself has no defaulted parameter to pass it to. One with no
+        DEFAULT that nothing wrote never reaches here: :meth:`_check_arguments`
+        refused it.
         """
-        bound = list(arguments)
+        bound: list[exp.Expr] = []
         for index, param in enumerate(function.params):
-            if index < len(bound):
-                if param.default is not None and _is_null(bound[index]):
-                    bound[index] = copy.deepcopy(param.default)
+            argument = arguments[index] if index < len(arguments) else None
+            if param.default is not None and (argument is None or _is_null(argument)):
+                bound.append(copy.deepcopy(param.default))
                 continue
-            assert param.default is not None  # _check_arguments already enforced this
-            bound.append(copy.deepcopy(param.default))
+            bound.append(exp.Null() if argument is None else argument)
         return bound
 
     def _instance(
-        self, site: _CallSite, arguments: list[exp.Expr]
+        self, site: _CallSite, arguments: Sequence[exp.Expr | None]
     ) -> tuple[exp.Select, int]:
         """One private copy of the body: aliases renamed, positions stamped, arguments bound."""
         function = site.function
@@ -4620,7 +4832,16 @@ class _Expander:
         _rename(body, self._fresh_aliases(function, index))
         self._stamp(body, index)
         bound = self._bound(function, arguments)
-        _substitute(body, {p.name: a for p, a in zip(function.params, bound)}, index)
+        _substitute(
+            body,
+            {p.name: a for p, a in zip(function.params, bound)},
+            index,
+            {
+                p.name: (function.qualified, p.type)
+                for p in function.params
+                if _declared_kind(p.type) == "stream"
+            },
+        )
         return body, index
 
     def _expand_call(
@@ -4705,6 +4926,9 @@ class _Expander:
         _check_query_args(
             item, frozenset({"this", "alias", "db", "catalog"}), "a table function call"
         )
+        if _runs_per_message(function):
+            self._expand_runtime_lateral(site, host, item, position, stack)
+            return
         if self._lateral_reads(site, host, item):
             self._expand_lateral_row_source(site, host, item, position, stack)
             return
@@ -4737,23 +4961,35 @@ class _Expander:
     ) -> None:
         """Inline one lateral call: its rows join the host's, its columns are read
         back off the projections that produced them."""
+        self._enter(site.function, item, stack)
+        arguments = self._arguments(site.function, site.call, host, position)
+        self._inline_lateral(site, host, item, position, stack, arguments)
+
+    def _inline_lateral(
+        self,
+        site: _CallSite,
+        host: exp.Select,
+        item: exp.Table,
+        position: int,
+        stack: tuple[str, ...],
+        arguments: Sequence[exp.Expr | None],
+        *,
+        tags: bool = False,
+    ) -> None:
+        """The body put in the call's place in the host, its columns read back
+        off the projections that produced them.
+
+        `tags` carries the body's own ``tags`` projection up into the host,
+        where the host writes none of its own: the metadata the body sets
+        then reaches what the host writes, as it would the body's own COPY.
+        """
         function = site.function
-        self._enter(function, item, stack)
-        arguments = self._arguments(function, site.call, host, position)
         body, _index = self._instance(site, arguments)
         # The body's own calls expand into the body, before it leaves for the
         # host: its aliases are the ones they may see.
         with self._scoped(function.identity):
             self._expand_within(body, body, position, (*stack, function.qualified))
         _name_columns(body, function.columns or (), function.name, item)
-        alias_node = item.args.get("alias")
-        alias = (
-            _ident_name(alias_node.this)
-            if isinstance(alias_node, exp.TableAlias)
-            and isinstance(alias_node.this, exp.Identifier)
-            # Unwritten, the alias is the function's own name, as Postgres has it.
-            else function.name
-        )
         columns = {
             name: projection.this
             for projection in body.expressions
@@ -4761,8 +4997,143 @@ class _Expander:
             and isinstance(projection.this, exp.Expr)
             and (name := _projection_alias(projection)) is not None
         }
-        self._read_lateral(alias, columns, function, host, item)
+        self._read_lateral(_call_alias(item, function), columns, function, host, item)
         _splice_over(host, item, body)
+        written = columns.get(TAGS_COLUMN)
+        if tags and written is not None and not any(
+            isinstance(p, exp.Expr) and _projection_alias(p) == TAGS_COLUMN
+            for p in host.expressions
+        ):
+            host.set(
+                "expressions",
+                [
+                    *host.expressions,
+                    exp.Alias(
+                        this=copy.deepcopy(written),
+                        alias=exp.Identifier(this=TAGS_COLUMN, quoted=False),
+                    ),
+                ],
+            )
+
+    def _expand_runtime_lateral(
+        self,
+        site: _CallSite,
+        host: exp.Select,
+        item: exp.Table,
+        position: int,
+        stack: tuple[str, ...],
+    ) -> None:
+        """A call whose first parameter is a data stream: a run-time lateral.
+
+        Its rows exist only as the stream plays, so nothing is inlined here.
+        The FROM item is taken out, and each ``<alias>.<column>`` becomes a
+        read of the lateral, ``<key>(<data stream>, '<column>')``, which
+        lowering turns into the stream a feeder is written from; the body is
+        compiled once per message, at run time, with that message's values.
+        A value is written once in the call or bound per message, so one
+        reading a FROM item is refused.
+
+        Written with NULL in its data stream's place and every value written,
+        the call is one such instance, and is inlined as a compile-time
+        lateral is, its tags with it.
+        """
+        function = site.function
+        _check_runs_per_message(function, item)
+        self._enter(function, item, stack)
+        arguments = self._arguments(function, site.call, host, position, every=False)
+        first = arguments[0] if arguments else None
+        if first is not None and _is_null(first):
+            named = any(isinstance(node, exp.Kwarg) for node in site.call.expressions)
+            self._check_arguments(function, site.call, arguments, named=named)
+            self._inline_lateral(site, host, item, position, stack, arguments, tags=True)
+            return
+        stream = function.params[0]
+        if first is None or not self._lateral_reads(site, host, item):
+            raise _error(
+                ErrorCode.UDF_ARG_TYPE,
+                f"{function.qualified}() is started once per message of its "
+                f"'{stream.name}' argument, which reads no FROM item written "
+                "before the call",
+                first if first is not None else site.call,
+                fallback=item,
+                hint="pass the data stream of a FROM item to its left: FROM "
+                f"<item> x, LATERAL {function.qualified}(x.<data stream>) <alias>",
+            )
+        written: dict[str, str] = {}
+        for param, argument in zip(function.params[1:], arguments[1:]):
+            if argument is None:
+                continue
+            read = next(iter(argument.find_all(exp.Column)), None)
+            if read is not None:
+                raise _error(
+                    ErrorCode.UDF_ARG_TYPE,
+                    f"{function.qualified}() is started once per message, and its "
+                    f"'{param.name}' argument reads '{_written_column(read)}': a "
+                    "value written in the call is the same for every message",
+                    read,
+                    fallback=item,
+                    hint=f"write a value, or leave '{param.name}' out and give each "
+                    f"message a '{param.name}' field",
+                )
+            written[param.name] = _written(argument)
+        alias = _call_alias(item, function)
+        key = f"{function.qualified}#{len(self.laterals) + 1}"
+        self.laterals[key] = RuntimeLateral(
+            function=function.qualified,
+            alias=alias,
+            call=f"{function.qualified}({_written(first)})",
+            stream=_written(first),
+            first=stream,
+            params=tuple(p for p in function.params[1:] if p.name not in written),
+            columns=function.columns or (),
+            written=written,
+            needs=self._needs(function),
+        )
+        line, col = _pos(item)
+        columns: dict[str, exp.Expr] = {}
+        for column in function.columns or ():
+            read_as = exp.Anonymous(
+                this=key,
+                expressions=[copy.deepcopy(first), exp.Literal.string(column.name)],
+            )
+            read_as.meta.update({"line": line, "col": col, "start": 0, "end": 0})
+            columns[column.name] = read_as
+        self._read_lateral(alias, columns, function, host, item)
+        host.set(
+            "joins",
+            [join for join in host.args.get("joins") or [] if join.this is not item],
+        )
+
+    def _needs(self, function: _Function) -> tuple[str, ...]:
+        """The script's own definitions an instance of `function` calls, itself
+        included, each marked called: the query itself never expands them.
+
+        A package's function needs none of the script's: its body sees its
+        own package.
+        """
+        if function.library:
+            return ()
+        found: dict[str, None] = {}
+        pending = [function]
+        while pending:
+            current = pending.pop()
+            if current.name in found:
+                continue
+            found[current.name] = None
+            current.used = True
+            for call in current.body.find_all(exp.Anonymous):
+                parent = call.parent
+                if isinstance(parent, exp.Dot) or (
+                    isinstance(parent, exp.Table) and parent.args.get("db") is not None
+                ):
+                    continue
+                name = _call_name(call)
+                if name in self.functions:
+                    pending.append(self.functions[name])
+                elif name in self.wasm and self.wasm[name].position >= 0:
+                    found[name] = None
+                    self.wasm_used.add(name)
+        return tuple(found)
 
     def _read_lateral(
         self,
@@ -4939,35 +5310,51 @@ class _Expander:
         return mapping
 
     def _check_arguments(
-        self, function: _Function, call: exp.Anonymous, arguments: list[exp.Expr]
+        self,
+        function: _Function,
+        call: exp.Anonymous,
+        arguments: Sequence[exp.Expr | None],
+        *,
+        every: bool = True,
+        named: bool = False,
     ) -> None:
-        """Arity and what each argument's shape says, against the signature.
+        """What each argument's shape says, against the signature.
 
-        Fewer arguments than parameters is legal exactly when every parameter
-        left unwritten has a DEFAULT -- omission is trailing-only, so a call
-        can never leave a gap earlier than its shortest written prefix.
+        A parameter left unwritten is legal exactly when it has a DEFAULT --
+        written by position, omission is trailing-only, so a call can never
+        leave a gap earlier than its shortest written prefix; a name may skip
+        one. `every` is False for a run-time lateral, whose unwritten values
+        are bound per message instead. `named` says a name wrote one, which
+        is what the refusal counts.
         """
-        plural = "" if len(arguments) == 1 else "s"
-        if len(arguments) > len(function.params):
-            raise _error(
-                ErrorCode.UDF_ARG_TYPE,
-                f"{function.qualified}() got {len(arguments)} argument{plural}, but it "
-                f"declares {len(function.params)}",
-                call,
-                hint=function.signature,
-            )
+        count = sum(1 for argument in arguments if argument is not None)
+        plural = "" if count == 1 else "s"
         unfilled = next(
-            (p for p in function.params[len(arguments) :] if p.default is None), None
+            (
+                p
+                for index, p in enumerate(function.params)
+                if p.default is None
+                and (index >= len(arguments) or arguments[index] is None)
+            ),
+            None,
         )
-        if unfilled is not None:
+        if unfilled is not None and every:
+            said = (
+                f"leaves its parameter '{unfilled.name}' unwritten"
+                if named
+                else f"got {count} argument{plural}, but its parameter "
+                f"'{unfilled.name}'"
+            )
             raise _error(
                 ErrorCode.UDF_ARG_TYPE,
-                f"{function.qualified}() got {len(arguments)} argument{plural}, but its "
-                f"parameter '{unfilled.name}' has no DEFAULT",
+                f"{function.qualified}() {said}"
+                + (", which has no DEFAULT" if named else " has no DEFAULT"),
                 call,
                 hint=function.signature,
             )
         for param, argument in zip(function.params, arguments):
+            if argument is None:
+                continue
             if _call_name(argument) == _INPUT:
                 raise _error(
                     ErrorCode.UDF_ARG_TYPE,

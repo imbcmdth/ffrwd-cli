@@ -199,6 +199,7 @@ from .compiler import (
     classify,
     compile_all,
     compile_commands,
+    compile_instance,
     compile_table_sql,
     emitted_commands,
 )
@@ -1815,10 +1816,16 @@ def _run_plan(
     bounds. `work` draws the progress of the one member writing the
     destinations. ``--jobs`` reaches each sidecar through the renderer, and
     ``--verbose`` echoes each member's command as it is spawned.
+
+    A run-time lateral's instances are compiled as this query was, in the
+    same project and for the same recipe, and each member's stderr is kept
+    where FFRWD_DUMP_STDERR names, as every member of the run's own is.
     """
     code = _provision_nn(plan, console)
     if code != 0:
         return code
+    owner = query.owner if query is not None else None
+    dump = os.environ.get("FFRWD_DUMP_STDERR")
     try:
         result = execute_plan(
             plan,
@@ -1829,6 +1836,10 @@ def _run_plan(
             players=players,
             show_only=args.show_only,
             work=work,
+            compile_instance=lambda text, unset: compile_instance(
+                text, packages=packages, owner=owner, unset=unset
+            ),
+            dump=Path(dump) if dump else None,
         )
     except FfrwdError as err:
         # Rendering the argv or spawning a stage, not the query text:

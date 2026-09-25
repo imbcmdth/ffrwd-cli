@@ -513,13 +513,15 @@ def test_one_group_fed_by_two_sources_is_refused() -> None:
 
 
 def test_feeders_naming_no_group_each_have_a_connection() -> None:
+    """Each on a port of its own, and never on the one above another's, where
+    a module may listen as well."""
     graph = _lowered(
         "COPY (SELECT probe(p.video[1], a.video[1]) AS x, probe(p.video[1], a.video[1]) "
         "AS y" + _FROM
     )
     ports = sorted(graph.nodes[name].args["port"] for name in _module_nodes(graph, PROBE))
-    assert ports == [50000, 50001]
-    assert sorted(graph.feeders) == ["tcp://127.0.0.1:50000", "tcp://127.0.0.1:50001"]
+    assert ports == [50000, 50002]
+    assert sorted(graph.feeders) == ["tcp://127.0.0.1:50000", "tcp://127.0.0.1:50002"]
 
 
 # -- the run waits for the port ------------------------------------------------------

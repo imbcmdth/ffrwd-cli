@@ -113,9 +113,11 @@ already carries for the printed ``loudnorm2`` chain.
 
 from __future__ import annotations
 
+import codecs
 import contextlib
 import ctypes
 import heapq
+import json
 import math
 import os
 import re
@@ -137,7 +139,7 @@ from . import loudnorm, pipes
 from .console import Work, WorkProgress
 from .emit import Emitted, build_ffmpeg_commands, build_process_args
 from .errors import ErrorCode, FfrwdError
-from .ir import FEEDER_HOST, feeder_path, is_rows_document
+from .ir import FEEDER_HOST, Lateral, LateralValue, feeder_path, is_rows_document
 from .pipes import NamedPipe
 from .processes import (
     DataFormat,
@@ -151,6 +153,7 @@ from .processes import (
     StreamEdge,
     encoded,
 )
+from .vars import substitute
 
 __all__ = [
     "CHAIN",
@@ -160,12 +163,14 @@ __all__ = [
     "STDIN",
     "STDOUT",
     "CommandResult",
+    "CompileInstance",
     "ExecutionResult",
     "Flow",
     "PipeEdge",
     "PipeNamer",
     "PlanResult",
     "ProcessResult",
+    "RowSink",
     "RowsNamer",
     "Side",
     "SidecarArgv",
@@ -607,6 +612,14 @@ RowsNamer = Callable[[str], str]
 # to. The real one lands with the sidecar itself; until then a caller
 # supplies it.
 SidecarArgv = Callable[[SidecarProcess, Sequence[str], Sequence[str]], list[str]]
+
+# Compiles one instance of a run-time lateral -- its text, and where each
+# unset variable's NULL landed in it -- into the plan that runs it: the
+# compiler's own entry point, bound to the run's packages.
+CompileInstance = Callable[[str, Mapping[tuple[int, int], str]], ProcessPlan]
+
+# Where a run's rows go that no member writes itself: one object each.
+RowSink = Callable[[Mapping[str, object]], None]
 
 
 @dataclass(frozen=True)
@@ -1101,28 +1114,80 @@ def _render_listing(plan: ProcessPlan, argv: Mapping[str, list[str]]) -> str:
         for index, process in enumerate(plan.processes, start=1)
     ]
     lines += _feeder_lines(plan)
+    lines += _lateral_lines(plan)
     lines.append(_COURTESY_NOTE)
     return "\n".join(lines)
 
 
+def _readers(edges: Iterable[FeederEdge]) -> str:
+    """The calls reading a feeder connection, and the processes they are in."""
+    return " and ".join(
+        f"{call.function}({call.param}) in {edge.target}" for edge in edges for call in edge.calls
+    )
+
+
 def _feeder_lines(plan: ProcessPlan) -> list[str]:
-    """One line per feeder connection: who writes it, on which port, for
-    which calls in which processes."""
+    """One line per feeder connection a process of the plan writes: who
+    writes it, on which port, for which calls in which processes."""
+    tapped = {lateral.writer for lateral in plan.laterals}
     edges: dict[tuple[str, int], list[FeederEdge]] = {}
     for edge in plan.feeder_edges:
-        edges.setdefault((edge.source, edge.port), []).append(edge)
+        if edge.source not in tapped:
+            edges.setdefault((edge.source, edge.port), []).append(edge)
+    return [
+        f"# feeder: {source} writes {feeder_path(port)} for {_readers(found)}, "
+        "started once the port accepts"
+        for (source, port), found in edges.items()
+    ]
+
+
+def _lateral_lines(plan: ProcessPlan) -> list[str]:
+    """Each run-time lateral as a block of its own: the data stream it is
+    started from, the connections its instances write, what binds each value
+    it leaves unwritten, and its instance, each such value a hole."""
     lines: list[str] = []
-    for (source, port), found in edges.items():
-        readers = " and ".join(
-            f"{call.function}({call.param}) in {edge.target}"
-            for edge in found
-            for call in edge.calls
-        )
+    for lateral in plan.laterals:
         lines.append(
-            f"# feeder: {source} writes {feeder_path(port)} for {readers}, "
-            "started once the port accepts"
+            f"# run-time: for each message of {lateral.stream} ({lateral.writer} "
+            f"writes it to {feeder_path(lateral.tap)} for the host), {lateral.function}"
+        )
+        for connection in lateral.connections:
+            found = [
+                edge
+                for edge in plan.feeder_edges
+                if edge.source == lateral.writer and edge.port == connection.port
+            ]
+            lines.append(f"#   feeds {_readers(found)} at {feeder_path(connection.port)}")
+        if lateral.values:
+            lines.append(
+                "#   binds by name, from each message: "
+                + ", ".join(_bound_as(value) for value in lateral.values)
+            )
+        lines.append("#   template:")
+        lines += [f"#     {one}" for one in _holes(lateral).split(";\n")]
+        lines.append(
+            "#   one instance at a time; a message that would overlap the running "
+            "one is refused with a row"
         )
     return lines
+
+
+def _bound_as(value: LateralValue) -> str:
+    """One value of a run-time lateral, and what it falls back on."""
+    if value.shape is not None:
+        return f"{value.name} or {value.shape}"
+    if value.default:
+        return f"{value.name} or its DEFAULT"
+    return value.name
+
+
+def _holes(lateral: Lateral) -> str:
+    """A run-time lateral's template, each value bound per message printed
+    as the hole ``<name>`` it is."""
+    text = lateral.template
+    for value in lateral.values:
+        text = re.sub(rf":'{value.name}'|(?<!:):{value.name}\b", f"<{value.name}>", text)
+    return text
 
 
 def _listing_header(plan: ProcessPlan) -> str | None:
@@ -1189,6 +1254,10 @@ def execute_plan(
     show_only: bool = False,
     stall: float | None = DEFAULT_STALL,
     work: WorkProgress | None = None,
+    compile_instance: CompileInstance | None = None,
+    rows: RowSink | None = None,
+    dump: Path | None = None,
+    stop: threading.Event | None = None,
 ) -> PlanResult:
     """Run `plan`, stage by stage, stopping at the first stage that fails.
 
@@ -1226,6 +1295,13 @@ def execute_plan(
     `work` is where ffmpeg's own progress is reported, for the one member that
     writes the plan's destinations (:func:`terminal_member`). Every other
     member's stderr is collected as it always was.
+
+    A run-time lateral runs beside the stage writing its data stream
+    (:class:`_LateralRun`): `compile_instance` compiles each instance, whose
+    members join the run's and end with it, `rows` hears the row each one
+    ends with (this process's stdout by default), and `dump`, where given, is
+    the directory each member's stderr is written to. `stop` ends the run
+    from outside, as a stage's end ends the instances it started.
 
     Named pipes, the rows DOCUMENTS a packet filter reads, and the temporary
     directory holding them are removed before this returns, whether the plan
@@ -1272,8 +1348,17 @@ def execute_plan(
         assigned = wires(plan)
         terminal = terminal_member(plan) if work is not None else None
 
+        if plan.laterals and compile_instance is None:
+            raise FfrwdError(
+                ErrorCode.INTERNAL,
+                f"{plan.laterals[0].call} is started once per message, and "
+                "nothing was given to compile its instances",
+                hint="pass compile_instance, which compiles one instance into a plan",
+            )
         stages: list[StageResult] = []
         for stage in plan.stages:
+            if stop is not None and stop.is_set():
+                break
             result = _run_stage(
                 plan,
                 stage,
@@ -1288,6 +1373,10 @@ def execute_plan(
                 stall,
                 work=work,
                 terminal=terminal,
+                laterals=_Laterals(
+                    compile_instance, sidecar_argv, rows or _print_row, dump
+                ),
+                stop=stop,
             )
             stages.append(result)
             if result.interrupted:
@@ -1419,7 +1508,352 @@ def _spawn_argv(
     return command
 
 
+# -- run-time laterals
+
+
+@dataclass(frozen=True)
+class _Launch:
+    """One message's instance, waiting or running: the message's number on
+    the lateral's data stream, the variables it binds, and the programme time
+    it plays over, where the message says (``start_pts``, ``duration``)."""
+
+    row: int
+    variables: Mapping[str, str]
+    start: float | None
+    end: float | None
+
+    def overlaps(self, start: float | None, end: float | None) -> bool:
+        if None in (self.start, self.end, start, end):
+            return False
+        assert self.start is not None and self.end is not None
+        assert start is not None and end is not None
+        return start < self.end and self.start < end
+
+
+class _Messages:
+    """The JSON objects on a run-time lateral's tap, as its bytes arrive.
+
+    ffmpeg's data muxer writes each packet's payload as it is, so one message
+    follows the last with nothing between them, and a heartbeat's payload,
+    nothing or blank space, is only space between two messages.
+    """
+
+    def __init__(self) -> None:
+        self._text = ""
+        self._decode = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        self._json = json.JSONDecoder()
+
+    def feed(self, chunk: bytes) -> list[object]:
+        """Every message `chunk` completes, in order."""
+        self._text += self._decode.decode(chunk)
+        found: list[object] = []
+        while True:
+            text = self._text.lstrip()
+            if not text:
+                self._text = ""
+                return found
+            try:
+                value, end = self._json.raw_decode(text)
+            except json.JSONDecodeError:
+                self._text = text
+                return found
+            found.append(value)
+            self._text = text[end:]
+
+    def rest(self) -> str:
+        """What arrived after the last message and made none."""
+        return (self._text + self._decode.decode(b"", final=True)).strip()
+
+
+def _json_kind(value: object) -> str:
+    """What a message field is, in a refusal's words."""
+    if isinstance(value, bool):
+        return "true or false"
+    if isinstance(value, int | float):
+        return "a number"
+    if isinstance(value, str):
+        return "a string"
+    return "a list" if isinstance(value, list) else "an object"
+
+
+def _variable(declared: str, value: object) -> str | None:
+    """A message field as the variable its value sets, or None where it is
+    not of the type the value declares."""
+    if declared == "number":
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            return None
+        return repr(value) if math.isfinite(value) else None
+    if declared == "boolean":
+        return ("true" if value else "false") if isinstance(value, bool) else None
+    return value if isinstance(value, str) else None
+
+
+def _bind(lateral: Lateral, message: Mapping[str, object]) -> tuple[dict[str, str], str | None]:
+    """The variables one message sets for an instance of `lateral`, or why it
+    starts none.
+
+    Each value the call left unwritten, by name, in order: the message's field
+    of that name (a number for a number, a string for text, true or false for
+    a boolean); else what the feeder says of its programme; else nothing, and
+    the DEFAULT takes it; else the instance is refused, naming the value.
+    """
+    variables: dict[str, str] = {}
+    for value in lateral.values:
+        field = message.get(value.name)
+        if field is not None:
+            written = _variable(value.type, field)
+            if written is None:
+                return {}, (
+                    f"'{value.name}' is {value.type}, and the message's "
+                    f"'{value.name}' is {_json_kind(field)}"
+                )
+            variables[value.name] = written
+        elif value.shape is not None:
+            variables[value.name] = str(value.shape)
+        elif not value.default:
+            return {}, (
+                f"nothing binds '{value.name}': the message has no field of that "
+                "name, and it has no DEFAULT"
+            )
+    return variables, None
+
+
+def _seconds(value: object) -> float | None:
+    """A message's time field, when it is a number."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    return float(value) if math.isfinite(value) else None
+
+
+def _print_row(row: Mapping[str, object]) -> None:
+    """A run's row on this process's stdout, where a sink's rows go."""
+    with _ROWS:
+        sys.stdout.write(json.dumps(row) + "\n")
+        sys.stdout.flush()
+
+
+_ROWS = threading.Lock()
+
+# What a message whose instance the run's end came before is told.
+_ENDED = "the run ended before its instance started"
+
+
+class _LateralRun:
+    """One run-time lateral while the stage writing its data stream runs.
+
+    The host listens on the lateral's tap before anything is spawned, reads
+    the messages the stage's writer sends there, and starts one instance per
+    message as it arrives: bound, compiled and run with the plan runner, one
+    at a time. A message that arrives while another's instance runs waits its
+    turn, and one whose programme time would overlap the running or a waiting
+    one is refused with a row. Each instance ends with a row saying how.
+    """
+
+    def __init__(
+        self,
+        lateral: Lateral,
+        compile_instance: CompileInstance,
+        sidecar_argv: SidecarArgv | None,
+        rows: RowSink,
+        dump: Path | None,
+        echo: Callable[[str, list[str]], None] | None,
+    ) -> None:
+        self.lateral = lateral
+        self._compile = compile_instance
+        self._sidecar_argv = sidecar_argv
+        self._rows = rows
+        self._dump = dump
+        self._echo = echo
+        self._stop = threading.Event()
+        self._turn = threading.Condition()
+        self._waiting: deque[_Launch] = deque()
+        self._running: _Launch | None = None
+        self._read_all = False
+        self._count = 0
+        try:
+            self._listener = socket.create_server((FEEDER_HOST, lateral.tap))
+        except OSError as err:
+            raise FfrwdError(
+                ErrorCode.INPUT_NEVER_OPENED,
+                f"the host cannot listen on {feeder_path(lateral.tap)} for the "
+                f"messages of {lateral.stream}: {err}",
+                hint="the port was free when the query compiled; run it again",
+            ) from err
+        self._listener.settimeout(_FEEDER_POLL)
+        self._threads = [_start(self._read), _start(self._launch)]
+
+    def stop(self) -> None:
+        """End the run: no more messages read, the running instance stopped,
+        and each message still waiting its turn said with a row."""
+        self._stop.set()
+        with self._turn:
+            left = list(self._waiting)
+            self._waiting.clear()
+            self._turn.notify_all()
+        for launch in left:
+            self._row(launch.row, launch.start, refused=_ENDED)
+        with contextlib.suppress(OSError):
+            self._listener.close()
+
+    def join(self) -> None:
+        for thread in self._threads:
+            thread.join(_JOIN + 2 * _GRACE)
+
+    def _row(self, row: int, start: float | None, **outcome: object) -> None:
+        self._rows({"event": "feeder", "row": row, "start_pts": start, **outcome})
+
+    def _read(self) -> None:
+        """Take the writer's connection and read every message off it."""
+        try:
+            connection = self._accept()
+            if connection is None:
+                return
+            messages = _Messages()
+            with connection:
+                connection.settimeout(_FEEDER_POLL)
+                while not self._stop.is_set():
+                    try:
+                        chunk = connection.recv(_CHUNK)
+                    except TimeoutError:
+                        continue
+                    except OSError:
+                        break
+                    if not chunk:
+                        break
+                    for message in messages.feed(chunk):
+                        self._arrived(message)
+            rest = messages.rest()
+            if rest:
+                self._count += 1
+                self._row(self._count, None, refused=f"an unreadable message: {rest[:80]}")
+        finally:
+            with self._turn:
+                self._read_all = True
+                self._turn.notify_all()
+
+    def _accept(self) -> socket.socket | None:
+        while not self._stop.is_set():
+            try:
+                connection, _ = self._listener.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                return None
+            return connection
+        return None
+
+    def _arrived(self, message: object) -> None:
+        """One message: bound, checked against the timeline, and queued."""
+        self._count += 1
+        row = self._count
+        if not isinstance(message, dict):
+            self._row(row, None, refused="a message is one JSON object")
+            return
+        start = _seconds(message.get("start_pts"))
+        variables, refused = _bind(self.lateral, message)
+        if refused is not None:
+            self._row(row, start, refused=refused)
+            return
+        length = _seconds(message.get("duration"))
+        end = None if start is None or length is None else start + length
+        with self._turn:
+            ahead = [one for one in (self._running, *self._waiting) if one is not None]
+            clash = next((one for one in ahead if one.overlaps(start, end)), None)
+            if clash is None:
+                self._waiting.append(_Launch(row, variables, start, end))
+                self._turn.notify_all()
+                return
+        self._row(
+            row,
+            start,
+            refused=f"it plays from {start} to {end}, over the instance of message "
+            f"{clash.row}, from {clash.start} to {clash.end}: one instance at a time",
+        )
+
+    def _launch(self) -> None:
+        """Run each queued instance in turn until the run ends."""
+        while True:
+            with self._turn:
+                while not self._waiting and not self._stop.is_set() and not self._read_all:
+                    self._turn.wait(_FEEDER_POLL)
+                if self._stop.is_set() or not self._waiting:
+                    return
+                launch = self._running = self._waiting.popleft()
+            try:
+                self._run(launch)
+            finally:
+                with self._turn:
+                    self._running = None
+
+    def _run(self, launch: _Launch) -> None:
+        """One instance: compiled from the template as ``ffrwd run -v`` would,
+        run by the plan runner, its members' stderr kept, and a row said."""
+        lateral = self.lateral
+        filled = substitute(lateral.template, dict(launch.variables))
+        # The template follows the definitions, so what an unset variable's
+        # NULL is said at moves down by their lines.
+        below = lateral.definitions.count("\n") + 1 if lateral.definitions else 0
+        text = f"{lateral.definitions}\n{filled.text}" if lateral.definitions else filled.text
+        unset = {(line + below, col): name for (line, col), name in filled.unset.items()}
+        try:
+            plan = self._compile(text, unset)
+        except FfrwdError as err:
+            self._row(launch.row, launch.start, refused=err.message)
+            return
+        if self._stop.is_set():
+            self._row(launch.row, launch.start, refused=_ENDED)
+            return
+        echo = self._echo
+        result = execute_plan(
+            plan,
+            sidecar_argv=self._sidecar_argv,
+            timeout=None,
+            overwrite=True,
+            echo=(lambda pid, argv: echo(f"feeder{launch.row} {pid}", argv))
+            if echo is not None
+            else None,
+            stall=None,
+            compile_instance=self._compile,
+            rows=self._rows,
+            dump=self._dump,
+            stop=self._stop,
+        )
+        if self._dump is not None:
+            self._dump.mkdir(parents=True, exist_ok=True)
+            for stage in result.stages:
+                for member in stage.members:
+                    header = f"exit={member.exit_code} terminated={member.terminated}\n"
+                    (self._dump / f"feeder{launch.row}.{member.id}.stderr").write_text(
+                        header + member.stderr, encoding="utf-8", errors="replace"
+                    )
+        self._row(launch.row, launch.start, exit=_instance_exit(result))
+
+
+def _instance_exit(result: PlanResult) -> int:
+    """How an instance ended: its failing member's code, else the code of a
+    member the run's end stopped, else 0."""
+    if result.exit_code != 0:
+        return result.exit_code
+    stopped = [
+        member.exit_code
+        for stage in result.stages
+        for member in stage.members
+        if member.terminated
+    ]
+    return stopped[0] if stopped else 0
+
+
 # -- running a stage
+
+
+@dataclass(frozen=True)
+class _Laterals:
+    """What a stage starts a run-time lateral's instances with."""
+
+    compile_instance: CompileInstance | None
+    sidecar_argv: SidecarArgv | None
+    rows: RowSink
+    dump: Path | None
 
 
 @dataclass
@@ -1490,6 +1924,8 @@ def _run_stage(
     *,
     work: WorkProgress | None = None,
     terminal: str | None = None,
+    laterals: _Laterals | None = None,
+    stop: threading.Event | None = None,
 ) -> StageResult:
     """Spawn every member of `stage` at once, watch them, and report.
 
@@ -1501,6 +1937,9 @@ def _run_stage(
     off the exit times it recorded rather than off the exit codes. A stage
     nothing ended -- every member finished, or every one was stopped because
     the last display window closed -- is asked neither question.
+
+    A run-time lateral whose data stream a member here writes runs for as
+    long as the stage does (`laterals`); `stop` ends the stage from outside.
     """
     ids = list(stage.processes)
     inside = set(ids)
@@ -1590,7 +2029,22 @@ def _run_stage(
         else:
             helpers.append(_start(_drain, stderr, member.stderr))
 
+    runs: list[_LateralRun] = []
     try:
+        for lateral in plan.laterals:
+            if lateral.writer in inside and laterals is not None:
+                assert laterals.compile_instance is not None  # execute_plan checks
+                runs.append(
+                    _LateralRun(
+                        lateral,
+                        laterals.compile_instance,
+                        laterals.sidecar_argv,
+                        laterals.rows,
+                        laterals.dump,
+                        echo,
+                    )
+                )
+
         for pid in _spawn_order(ids, stage_wires):
             if pid not in writers:
                 spawn(pid)
@@ -1633,13 +2087,17 @@ def _run_stage(
                 stall,
                 feeds,
                 {pid: readers for pid, (_, readers) in writers.items()},
+                stop,
             )
     except KeyboardInterrupt:
         # `failed`/`timed_out`/`wedge` stay at their unstruck defaults: the
         # stage below reads as a clean stop, not a failure.
         interrupted = True
     finally:
-        # Whatever ended the stage, the rest of it goes too.
+        # Whatever ended the stage, the rest of it goes too: the instances a
+        # lateral started with it.
+        for run in runs:
+            run.stop()
         _stop(members.values())
         for window in watching.values():
             _stop_player(window)
@@ -1651,6 +2109,8 @@ def _run_stage(
             end.close()
         for helper in helpers:
             helper.join(_JOIN)
+        for run in runs:
+            run.join()
 
     results = [_result(members[pid]) for pid in ids if pid in members]
     consequences: list[ProcessResult] = []
@@ -1837,6 +2297,7 @@ def _watch(
     stall: float | None = DEFAULT_STALL,
     feeds: Sequence[tuple[str, str]] = (),
     writers: Mapping[str, Sequence[str]] | None = None,
+    stop: threading.Event | None = None,
 ) -> tuple[str | None, bool, FfrwdError | None]:
     """Watch a running stage, recording when each member ends.
 
@@ -1876,6 +2337,9 @@ def _watch(
     everything else is, and the caller stops a writer still running then. A
     writer ending after one of its readers has gone lost its reader, and
     ends nothing.
+
+    `stop` set ends the watch as a closed last window does: no failure, and
+    the caller stops what is still running.
     """
     feeding = writers or {}
     watched = list(members)
@@ -1888,6 +2352,8 @@ def _watch(
     ended: str | None = None
     settled = math.inf
     while True:
+        if stop is not None and stop.is_set():
+            return None, False, None
         now = time.monotonic()
         just_ended = [
             member
