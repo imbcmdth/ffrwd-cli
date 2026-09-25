@@ -385,6 +385,7 @@ from ffrwd.parser import (
 )
 from ffrwd.parser import _ident_name as _fold
 from ffrwd.probe import (
+    JSON_CODEC,
     WEBVTT_FORMAT,
     CueMeta,
     ProbeFailure,
@@ -2202,6 +2203,8 @@ _SUBTITLE_CODEC_OPTION = "subtitle_codec"
 # What a metadata track is written to: the names Matroska goes by, as an
 # extension or as a written `format` option.
 _MATROSKA_FORMATS = frozenset({"mkv", "mka", "mks", "matroska"})
+# The one file container a data stream of JSON messages keeps its tag in.
+_NUT_FORMAT = "nut"
 
 
 def _container_of(options: Mapping[str, object], path: str) -> str:
@@ -4028,6 +4031,7 @@ class _Lowerer:
             )
         self._place_packet_filters(raw, options, outputs, first_filter)
         self._check_metadata_track_container(options, outputs, path, raw)
+        self._check_json_container(options, outputs, path, raw)
         self._codec_for_rows_track(options, outputs, path)
         return SinkUnit(
             outputs=outputs,
@@ -4448,6 +4452,40 @@ class _Lowerer:
                     hint=f"write the file as .mkv, or drop the '{title}' "
                     "alias -- an untitled track writes to any container that "
                     "carries captions",
+                )
+
+    def _check_json_container(
+        self,
+        options: dict[str, object],
+        outputs: list[Output],
+        path: str | None,
+        raw: RawSink,
+    ) -> None:
+        """Refuse a data stream of JSON messages into a file that loses what it is.
+
+        ffmpeg has no codec for the messages, so a file keeps them only where
+        the container keeps the stream's tag as it was: NUT does. Matroska and
+        mp4 refuse the stream at the header, and MPEG-TS writes it as anonymous
+        binary data with its clock moved, which reads back as neither JSON nor
+        on time. A module sink is not a file and takes it as it is.
+        """
+        if path is None or _container_of(options, path) == _NUT_FORMAT:
+            return
+        for output in outputs:
+            if output.type != "data" or not is_src(output.ref):
+                continue
+            alias, _, index = output.ref[len("src:") :].rpartition(":d:")
+            meta = self._stream_meta(alias, "data", int(index)) if index.isdigit() else None
+            if meta is not None and meta.codec == JSON_CODEC:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"'{path}' is {_container_of(options, path)}, and a data "
+                    "stream of JSON messages keeps what it is only in NUT: "
+                    "ffmpeg has no codec for the messages, so any other "
+                    "container drops the stream or its tag",
+                    raw.path_node,
+                    hint="write the file as .nut, or hand the stream to a "
+                    "module sink such as ffrwd.moq.publish",
                 )
 
     def _codec_for_rows_track(

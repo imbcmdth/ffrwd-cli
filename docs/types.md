@@ -31,6 +31,19 @@ spans of a file travel in that file's own encoded packets, put there by a
 `RETURNS packets` filter and read back by a packet sink, neither of which
 core ffrwd defines.
 
+## A data stream of JSON messages
+
+A `data_stream` whose codec is `json` is a stream of messages, each one
+UTF-8 JSON object timed by its pts: the moment in the programme it
+belongs beside. ffmpeg has no codec for them and names none; the probe
+reads them off the stream's tag, `JSON` in NUT's data class, so
+`f.data[1]` over such a file has `codec` `json`.
+
+A query copies one like any passthrough stream, and a file keeps it only
+in NUT: Matroska and mp4 refuse the stream, and MPEG-TS writes it as
+anonymous binary data with its clock moved, so a COPY of one to any other
+container is refused at compile time.
+
 ## The record is the stream
 
 A stream record is what filters take and return, what `-map` maps, and

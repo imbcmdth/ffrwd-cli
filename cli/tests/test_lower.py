@@ -8137,6 +8137,48 @@ def test_a_codecless_stream_is_named_through_select_star() -> None:
     assert "'f.*' includes 'f.data[1]'" in err.message
 
 
+def test_a_json_data_stream_is_copied_into_nut() -> None:
+    """A data stream of JSON messages ffmpeg cannot name but ffrwd can: it
+    crosses into a NUT file as a stream copy beside the picture."""
+    probes = _row_probes(_track("video", 0), _track("data", 0, codec="json"))
+    graph = _lower(
+        "COPY (SELECT f.video[1], f.data[1] FROM input('deal.nut') f) TO 'out.nut'",
+        probes,
+    )
+    (sink,) = graph.sinks
+    assert [(o.type, o.ref) for o in sink.outputs] == [
+        ("video", "src:f:v:0"),
+        ("data", "src:f:d:0"),
+    ]
+
+
+@pytest.mark.parametrize("destination", ["out.mkv", "out.mp4", "out.ts"])
+def test_a_json_data_stream_is_refused_into_a_container_that_loses_it(
+    destination: str,
+) -> None:
+    """Matroska and mp4 refuse the stream at the header, and MPEG-TS writes it
+    as anonymous binary data with its clock moved: measured on ffmpeg 9.0.1.
+    NUT alone keeps the tag, so the refusal comes at compile time."""
+    probes = _row_probes(_track("video", 0), _track("data", 0, codec="json"))
+    err = _reject_lower(
+        f"COPY (SELECT f.video[1], f.data[1] FROM input('deal.nut') f) TO '{destination}'",
+        probes,
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "a data stream of JSON messages keeps what it is only in NUT" in err.message
+    assert err.hint is not None and ".nut" in err.hint
+
+
+def test_a_data_stream_of_a_named_codec_is_not_held_to_nut() -> None:
+    """The rule is about JSON messages alone: a data stream ffmpeg names goes
+    wherever it went before."""
+    probes = _row_probes(_track("video", 0), _track("data", 0, codec="bin_data"))
+    graph = _lower(
+        "COPY (SELECT f.video[1], f.data[1] FROM input('x.ts') f) TO 'out.ts'", probes
+    )
+    assert len(graph.sinks) == 1
+
+
 def test_a_codecless_row_track_is_rejected_for_media_queries() -> None:
     probes = _row_probes(_track("data", 0, language="en", codec=None))
     err = _reject_lower(_row_query(column="data"), probes)

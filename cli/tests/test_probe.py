@@ -2368,3 +2368,31 @@ def test_probe_http_url_end_to_end(_fixtures: Path) -> None:
     finally:
         server.shutdown()
         thread.join(timeout=5)
+
+
+def test_a_data_stream_tagged_json_probes_as_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ffmpeg names no codec for a data stream of JSON messages, but it reads
+    the stream's tag, and the tag is what says what the packets are. A data
+    stream with any other unnamed tag stays codec-less."""
+    f = tmp_path / "deal.nut"
+    f.write_bytes(b"data")
+    _fake_ffprobe_present(monkeypatch)
+    _fake_run(
+        monkeypatch,
+        stdout=json.dumps(
+            {
+                "streams": [
+                    {"index": 0, "codec_type": "data", "codec_tag_string": "JSON"},
+                    {"index": 1, "codec_type": "data", "codec_tag_string": "tmcd"},
+                ],
+                "format": {},
+            }
+        ),
+    )
+    result = probe(str(f))
+    assert result is not None
+    json_stream, other = result.by_type("data")
+    assert json_stream.codec == "json"
+    assert other.codec is None

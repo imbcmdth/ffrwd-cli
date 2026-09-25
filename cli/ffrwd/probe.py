@@ -349,6 +349,19 @@ def module_digest(path: str) -> str:
         return ""
 
 
+# The codec a data stream of JSON messages probes as. ffmpeg has no codec for
+# them and names none, but it reads the stream's tag, and the tag is what
+# says what the packets are: one UTF-8 JSON object each, timed by pts.
+JSON_CODEC = "json"
+_JSON_TAG = "JSON"
+
+
+def _data_codec(raw: dict[str, object]) -> str | None:
+    """The codec a data stream ffmpeg could not name carries, read off its
+    tag, or None where the tag names nothing ffrwd knows either."""
+    return JSON_CODEC if raw.get("codec_tag_string") == _JSON_TAG else None
+
+
 def clear_cache() -> None:
     """Clear the probe() memoization cache. For tests."""
     _cache.clear()
@@ -1282,7 +1295,7 @@ def _parse_streams(data: object) -> ProbeResult | None:
                         height=None,
                         fps=None,
                         sample_rate=None,
-                        codec=codec,
+                        codec=codec if codec is not None else _data_codec(raw),
                         channels=None,
                         channel_layout=None,
                         bitrate=bitrate,
