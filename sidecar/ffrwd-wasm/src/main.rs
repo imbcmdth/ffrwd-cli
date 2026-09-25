@@ -4000,13 +4000,18 @@ fn run_packet_source(args: &Args, module: &str, params: &str) -> Result<()> {
 
 /// The heartbeats a packet source's data tracks carry (see `heartbeat`): one
 /// at start, at the earliest time anything held back for the headers
-/// carries, and then one whenever the source's media moves on with nothing
-/// on the track for a tenth of a second, at the media's own decode time.
+/// carries, and then those the source hands on the track itself, at most one
+/// a tenth of a second.
+///
+/// The host claims no time of its own past the start. A heartbeat says no
+/// message before its pts is still to come on the track, and only the source
+/// can know that: tracks run independently, so a live source hands a message
+/// whenever it reached it, and its media may be well past the message's pts
+/// by then. A heartbeat written from the media's time put every such message
+/// behind it, and it left at the heartbeat's pts rather than its own.
 struct SourceBeats {
     /// Each track's time base, and its heartbeats where it is a data track.
     tracks: Vec<(TimeBase, Option<heartbeat::Beats>)>,
-    /// How far the media has been pulled: its furthest decode time.
-    media: Option<(i64, TimeBase)>,
     /// The start heartbeat's time, until the first pull has carried it.
     start: Option<(i64, TimeBase)>,
 }
@@ -4029,36 +4034,33 @@ impl SourceBeats {
         }
         SourceBeats {
             tracks,
-            media: None,
             start: Some(start.unwrap_or((0, heartbeat::EVERY))),
         }
     }
 
     /// One pull's packets, a list per track, with the data tracks' messages
-    /// placed on their timeline and their heartbeats added.
+    /// placed on their timeline and their heartbeats added: the start's, and
+    /// the latest one the source handed on the track in this pull.
     fn pull(&mut self, mut pads: Vec<Vec<runtime::Packet>>) -> Vec<Vec<runtime::Packet>> {
-        for (packets, (base, beats)) in pads.iter().zip(&self.tracks) {
-            if beats.is_none() {
-                for packet in packets {
-                    let at = (packet.dts.unwrap_or(packet.pts), *base);
-                    self.media = furthest(self.media, at, true);
-                }
-            }
-        }
         let start = self.start.take();
-        for (packets, (_, beats)) in pads.iter_mut().zip(&mut self.tracks) {
+        for (packets, (base, beats)) in pads.iter_mut().zip(&mut self.tracks) {
             let Some(beats) = beats else { continue };
             let mut placed = Vec::with_capacity(packets.len() + 2);
             if let Some((pts, base)) = start {
                 placed.extend(beats.due(pts, base).map(heartbeat_packet));
             }
+            let mut said = None;
             for mut packet in packets.drain(..) {
+                if heartbeat::is_heartbeat(&packet.data) {
+                    said = said.max(Some(packet.pts));
+                    continue;
+                }
                 packet.pts = beats.place(packet.pts);
                 packet.dts = Some(packet.pts);
                 placed.push(packet);
             }
-            if let Some((pts, base)) = self.media {
-                placed.extend(beats.due(pts, base).map(heartbeat_packet));
+            if let Some(pts) = said {
+                placed.extend(beats.due(pts, *base).map(heartbeat_packet));
             }
             *packets = placed;
         }
