@@ -653,6 +653,15 @@ def test_a_data_stream_is_a_packet_sinks_data_pad_after_its_picture() -> None:
     assert [type(pad) for pad in sink.pads] == [PadMeta, type(None)]
 
 
+def test_a_packet_sink_destination_takes_its_values_by_name() -> None:
+    query = "COPY (SELECT f.video[1], f.data[1] FROM input('deal.nut') f) TO publish({})"
+    sink = next(s for s in _plan(query.format("relay => 'r'")).sidecars if s.packet_sink)
+    assert sink.args == {"relay": "r"}
+    with pytest.raises(FfrwdError) as caught:
+        _plan(query.format("relays => 'r'"))
+    assert caught.value.message == "publish() has no parameter 'relays'"
+
+
 def _subscribed(query: str) -> ProcessPlan:
     """`query` over a live source publishing a picture and a data track."""
     sql = _declared(query).replace(

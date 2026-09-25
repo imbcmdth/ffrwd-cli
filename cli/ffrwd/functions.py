@@ -4322,6 +4322,7 @@ class _Expander:
                 call,
                 hint=declared.signature,
             )
+        self._check_wasm_named(declared, call, positions[: len(values)], named)
         taken = {name for name, _ in named}
         unfilled = next(
             (
@@ -4341,7 +4342,6 @@ class _Expander:
             )
         for param, argument in zip(positions, values):
             self._check_wasm_argument(declared, call, param, argument)
-        self._check_wasm_named(declared, call, positions[: len(values)], named)
 
     def _check_wasm_arguments(
         self, declared: WasmFunction, call: exp.Anonymous, arguments: list[exp.Expr]
@@ -4378,6 +4378,7 @@ class _Expander:
                 call,
                 hint=declared.signature,
             )
+        self._check_wasm_named(declared, call, positions[: len(positional)], named)
         spelled = _port_spelling(declared, positional)
         # The port spelling fills two parameters with one argument.
         filled = len(positional) + (0 if spelled is None else 1)
@@ -4401,7 +4402,6 @@ class _Expander:
         checked = positional if spelled is None else positional[:spelled]
         for param, argument in zip(positions, checked):
             self._check_wasm_argument(declared, call, param, argument)
-        self._check_wasm_named(declared, call, positions[: len(positional)], named)
 
     def _check_wasm_argument(
         self,
