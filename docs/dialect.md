@@ -318,7 +318,9 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   read off one call in one query is one instance. An output goes where
   a data stream goes: into a `.nut` file, into another data filter, or
   to a sink reading data streams as a pad after its video and audio.
-  The module runs in a sidecar of its own, one NUT pipe in per stream
+  An output read in several places, by a run-time lateral and a sink
+  say, is written once and copied to each reader by an ffmpeg of its
+  own. The module runs in a sidecar of its own, one NUT pipe in per stream
   argument and one out per output. A clock pad's picture crosses scaled
   to 16x16, every frame and so every time and next to no pixels; a
   sound clock crosses as pcm. Messages go sidecar to sidecar wherever

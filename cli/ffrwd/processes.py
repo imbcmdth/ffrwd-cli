@@ -1393,6 +1393,9 @@ class _Partitioner:
         self.sidecar_of: dict[str, str] = {}  # node id -> process id
         self.members: dict[str, list[str]] = {}  # process id -> its node ids
         self.consumer_of: dict[str, str] = {}  # feeder process id -> its reader
+        # The ffmpeg processes copying one module's data stream to each of its
+        # readers, by the sidecar writing it and the stream's ref.
+        self.relays: dict[tuple[str, FrameRef], _Pending] = {}
         # The processes writing a FEEDER connection, by the path of the unit
         # they write. Each rides alone: it starts only once its module
         # listens, so nothing may wait on it.
@@ -1647,6 +1650,15 @@ class _Partitioner:
                 if len(targets) < 2:
                     continue
                 readers = self._pad_readers(ref)
+                if ref_type(self.g, ref) == "data":
+                    raise FfrwdError(
+                        ErrorCode.UNSUPPORTED_SQL,
+                        f"the messages '{sidecar.module}' writes are read by "
+                        f"{readers}, each in a process of its own, and a module "
+                        "hands its messages over on one pipe",
+                        hint="a data stream is copied to each of its readers, and "
+                        "this one was not: please report this query as a bug",
+                    )
                 raise FfrwdError(
                     ErrorCode.UNSUPPORTED_SQL,
                     f"the frames '{sidecar.module}' writes are read by "
@@ -2697,6 +2709,9 @@ class _Partitioner:
                     self._add_edge(stage.id, target, ref)
                     self._add_edge(self.sidecar_of[producer], stage.id, ref)
                     continue
+                if ref_type(self.g, ref) == "data":
+                    self._add_data_read(self.sidecar_of[producer], target, ref, depth)
+                    continue
                 self._add_edge(self.sidecar_of[producer], target, ref)
                 continue
             at = self.depth[producer] if producer in self.depth else depth
@@ -2741,6 +2756,39 @@ class _Partitioner:
                 for lateral in self.g.laterals
             ),
         )
+
+    def _add_data_read(self, source: str, target: str, ref: FrameRef, depth: int) -> None:
+        """One more reader of the data stream `ref`, which sidecar `source` writes.
+
+        The module writes each output on one pipe. A second reader in a
+        process of its own reads it off an ffmpeg that copies the messages to
+        a pipe per reader instead: the first reader's edge moves onto that
+        ffmpeg, and every later reader joins it. Messages are small, so the
+        copy costs next to nothing, where calling the module again would run
+        it twice.
+        """
+        relay = self.relays.get((source, ref))
+        if relay is not None:
+            if not any(
+                (e.source, e.target, e.ref) == (relay.id, target, ref) for e in self.edges
+            ):
+                relay.pipes.append(ref)
+                self._add_edge(relay.id, target, ref)
+            return
+        first = next(
+            (i for i, e in enumerate(self.edges) if e.source == source and e.ref == ref),
+            None,
+        )
+        if first is None or self.edges[first].target == target:
+            self._add_edge(source, target, ref)
+            return
+        relay = _Pending(id=self._ffmpeg_id(), depth=depth, nodes=[], sinks=[], pipes=[ref])
+        self.pending.append(relay)
+        self.relays[(source, ref)] = relay
+        self.edges[first] = replace(self.edges[first], source=relay.id)
+        self._add_edge(source, relay.id, ref)
+        relay.pipes.append(ref)
+        self._add_edge(relay.id, target, ref)
 
     @property
     def _written_alone(self) -> set[str]:
