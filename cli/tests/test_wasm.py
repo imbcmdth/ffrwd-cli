@@ -385,18 +385,59 @@ def test_input_as_an_argument_is_refused() -> None:
     _rejects(sql, ErrorCode.UDF_ARG_TYPE, "cannot take input()")
 
 
-def test_a_named_argument_is_refused() -> None:
-    sql = (
-        "CREATE FUNCTION m(v video_stream, n number DEFAULT 1) RETURNS video_stream "
-        f"AS '{MODULE}', 'invert' LANGUAGE wasm;\n"
-        "COPY (SELECT m(f.video[1], n => 2) FROM input('a.mp4') f) TO 'out.mp4'"
-    )
-    _rejects(
-        sql,
-        ErrorCode.UNSUPPORTED_SQL,
-        "does not take named arguments",
-        _described(params={"n": {"type": "number"}}),
-    )
+_NAMED = (
+    "CREATE FUNCTION m(v video_stream, n number DEFAULT 1, label text DEFAULT 'a') "
+    f"RETURNS video_stream AS '{MODULE}', 'invert' LANGUAGE wasm;\n"
+    "COPY (SELECT {call} FROM input('a.mp4') f) TO 'out.mp4'"
+)
+_NAMED_MODULE = _described(params={"n": {"type": "number"}, "label": {"type": "string"}})
+
+
+def _named_args(call: str) -> dict[str, object]:
+    graph = _lowered(_NAMED.format(call=call), _NAMED_MODULE)
+    (node,) = [n for n in graph.nodes.values() if n.filter == MODULE]
+    return node.args
+
+
+def test_named_arguments_fill_a_modules_values_after_the_positional_ones() -> None:
+    """A name skips the parameters before it, which keep their DEFAULT."""
+    assert _named_args("m(f.video[1], label => 'z')") == {"n": 1, "label": "z"}
+    assert _named_args("m(f.video[1], 3, label => 'z')") == {"n": 3, "label": "z"}
+    assert _named_args("m(f.video[1], label => 'z', n => 5)") == {"n": 5, "label": "z"}
+
+
+@pytest.mark.parametrize(
+    ("call", "code", "needle"),
+    [
+        (
+            "m(f.video[1], n => 2, 'z')",
+            ErrorCode.UNSUPPORTED_SQL,
+            "positional arguments must come before named arguments",
+        ),
+        ("m(f.video[1], size => 2)", ErrorCode.UDF_ARG_TYPE, "has no parameter 'size'"),
+        (
+            "m(f.video[1], v => f.video[1])",
+            ErrorCode.UDF_ARG_TYPE,
+            "takes 'v' as video_stream, which is written in its own position",
+        ),
+        (
+            "m(f.video[1], 3, n => 2)",
+            ErrorCode.UDF_ARG_TYPE,
+            "gets 'n' twice: positionally and by name",
+        ),
+        (
+            "m(f.video[1], n => 'x')",
+            ErrorCode.UDF_ARG_TYPE,
+            "takes number as its 'n' argument, got a string",
+        ),
+    ],
+)
+def test_a_named_argument_to_a_wasm_function_is_refused(
+    call: str, code: ErrorCode, needle: str
+) -> None:
+    error = _rejects(_NAMED.format(call=call), code, needle, _NAMED_MODULE)
+    if "no parameter" in needle:
+        assert error.hint == "its value parameters are 'n', 'label'"
 
 
 def test_an_audio_stream_argument_is_refused() -> None:
@@ -4831,6 +4872,27 @@ def test_a_packages_sink_is_called_in_to_position(tmp_path: Path) -> None:
     assert list(resolved.wasm) == ["ffrwd.tools.drain"]
     assert resolved.sinks[0].module_sink == "ffrwd.tools.drain"
     assert resolved.sinks[0].path is None
+
+
+def test_a_sink_destination_takes_its_values_by_name() -> None:
+    sql = (
+        "CREATE FUNCTION drain(v video_stream, url text, retries number DEFAULT 3)\n"
+        f"  RETURNS sink AS '{SINK_MODULE}', 'drain' LANGUAGE wasm;\n"
+        "COPY (SELECT f.video[1] FROM input('a.mp4') f) TO drain(url => 'http://h/rows')"
+    )
+    sink = _sink_described(
+        name="drain", params={"url": {"type": "string"}, "retries": {"type": "number"}}
+    )
+    plan = _sink_plan(sql, sink).plan
+    assert plan is not None
+    (drain,) = plan.sidecars
+    assert drain.args == {"url": "http://h/rows", "retries": 3}
+    _sink_rejects(
+        sql.replace("url => 'http://h/rows'", "'http://h/rows', url => 'x'"),
+        ErrorCode.UDF_ARG_TYPE,
+        "gets 'url' twice",
+        sink,
+    )
 
 
 # -- source modules: RETURNS source, the mirror of RETURNS sink -----------

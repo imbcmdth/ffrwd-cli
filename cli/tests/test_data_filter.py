@@ -411,6 +411,59 @@ def test_a_structs_fields_are_one_instance_and_another_filter_reads_one() -> Non
     assert [o.ref for o in unit.outputs] == [stamp, f"{auction}:1"]
 
 
+def test_a_data_filter_takes_its_values_by_name() -> None:
+    """The leaf's call as the target query writes it, both fields one instance."""
+    call = "auction(f.data[1], f.video[1], cohort => 'es-ES', viewers => 18000)"
+    graph = _lowered(f"COPY (SELECT {call}.d, {call}.launch" + _FROM)
+    (auction,) = graph.data_filters
+    assert graph.nodes[auction].args == {"cohort": "es-ES", "viewers": 18000}
+    error = _refused(
+        "COPY (SELECT stamp(f.data[1], 'es', node => 'fr')" + _FROM
+    )
+    assert (error.code, error.message) == (
+        ErrorCode.UDF_ARG_TYPE,
+        "stamp() gets 'node' twice: positionally and by name",
+    )
+
+
+def _subscribe(call: str) -> Graph:
+    declare = (
+        "CREATE FUNCTION subscribe(relay text, broadcast text DEFAULT 'live') "
+        "RETURNS source AS 'subscribe.wasm', 'subscribe' LANGUAGE wasm;\n"
+    )
+    return lower(
+        resolve(parse(declare + f"SELECT s.video[1] FROM {call} s")),
+        {},
+        registry=_registry(),
+        describes={
+            "subscribe.wasm": Described(
+                world=WORLDS[-1], name="subscribe", source=True,
+                params_schema={
+                    "properties": {
+                        "relay": {"type": "string"},
+                        "broadcast": {"type": "string"},
+                    }
+                },
+            )
+        },
+        probe_source=lambda module, params, **_: _CATALOG,
+    )
+
+
+def test_a_packet_source_in_from_takes_its_values_by_name() -> None:
+    """A call in FROM is bound by lowering alone, so lowering refuses what
+    a call elsewhere is refused before it."""
+    params = _subscribe("subscribe(broadcast => 'news', relay => 'r')").module_sources["s"]
+    assert params.params == '{"broadcast": "news", "relay": "r"}'
+    with pytest.raises(FfrwdError) as caught:
+        _subscribe("subscribe('r', relays => 'x')")
+    assert caught.value.message == "subscribe() has no parameter 'relays'"
+    assert caught.value.hint == "its value parameters are 'relay', 'broadcast'"
+    with pytest.raises(FfrwdError) as caught:
+        _subscribe("subscribe(broadcast => 'news')")
+    assert caught.value.message == "subscribe() does not write 'relay', which has no DEFAULT"
+
+
 def test_a_data_stream_read_twice_is_not_split() -> None:
     """No filter splits a data stream: each reader maps it on its own."""
     graph = _lowered("COPY (SELECT f.data[1], stamp(f.data[1])" + _FROM)
