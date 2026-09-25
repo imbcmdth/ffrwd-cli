@@ -79,7 +79,7 @@ where they meet again. It is the difference between two path delays, where a
 process on a path holds one frame plus whatever its modules declare they read
 ahead. :attr:`StreamEdge.buffer` is what the bound buys -- a sized named pipe
 where the bytes fit under :data:`PIPE_BUFFER_LIMIT`, ffmpeg's own fifo muxer
-where they do not.
+where they do not. A stream copied as it was read always takes the pipe.
 
 A path whose delay cannot be counted -- a module that does not hand on one
 frame per frame it reads, an ffmpeg filter that changes the frame count -- has
@@ -126,6 +126,7 @@ from .probe import JSON_CODEC, ProbeResult, StreamMeta, is_url
 __all__ = [
     "COPY_CODEC",
     "FIFO",
+    "LONGEST_FRAME_SECONDS",
     "NUT",
     "PCM_F32LE",
     "PCM_S16LE",
@@ -159,6 +160,7 @@ __all__ = [
     "StreamFormat",
     "VideoFormat",
     "encoded",
+    "encoder_delay",
     "external_filters",
     "external_ids",
     "from_commands",
@@ -215,6 +217,11 @@ PIPE_BUFFER_LIMIT = 4 << 20
 # The smallest a named pipe's buffer is made, and the step it is rounded up by.
 PIPE_BUFFER_STEP = 1 << 16
 
+# How long one frame of a bound is taken to last where the input has no
+# picture rate to say: longer than a picture at ten frames a second or more,
+# and than any audio codec's packet.
+LONGEST_FRAME_SECONDS = 0.1
+
 # Bytes one pixel takes on the wire, per pixel format ffrwd carries.
 _PIXEL_BYTES: Mapping[str, int] = {"rgba": 4, "rgb24": 3, "yuv420p": 2, "yuva420p": 3}
 
@@ -264,6 +271,52 @@ FILTER_WINDOWS: Mapping[str, tuple[str, int]] = {
 # reorder depth of every encoder ffrwd puts on an edge without being told the
 # actual b-frame count.
 ENCODED_EDGE_DELAY = 8
+
+# The frames an encoder takes in before it hands out its first packet. While
+# it does, the ffmpeg running it reads nothing more of its other inputs, so
+# the stream that meets it there has to wait that long on its own edge.
+#
+# x264 and x265 by preset: B-frames and rc-lookahead, medium when none is
+# named. x264 holds the larger of the two, plus a frame per frame thread past
+# the first and its sync lookahead of B-frames plus one; x265 the larger plus
+# its frame threads. `tune zerolatency` turns all of it off.
+_X264_PRESETS: Mapping[str, tuple[int, int]] = {
+    "ultrafast": (0, 0),
+    "superfast": (3, 0),
+    "veryfast": (3, 10),
+    "faster": (3, 20),
+    "fast": (3, 30),
+    "medium": (3, 40),
+    "slow": (3, 50),
+    "slower": (3, 60),
+    "veryslow": (8, 60),
+    "placebo": (16, 60),
+}
+_X265_PRESETS: Mapping[str, tuple[int, int]] = {
+    "ultrafast": (3, 5),
+    "superfast": (3, 10),
+    "veryfast": (4, 15),
+    "faster": (4, 15),
+    "fast": (4, 15),
+    "medium": (4, 20),
+    "slow": (4, 25),
+    "slower": (8, 40),
+    "veryslow": (8, 40),
+    "placebo": (8, 60),
+}
+# x264 runs a frame thread per two rows of macroblocks, up to one and a half
+# per core: counted by rows alone, the most any machine gives it. A picture
+# of unknown height is counted as 2160 rows tall.
+_X264_THREADS_MAX = 128
+_UNKNOWN_HEIGHT = 2160
+# x265's frame threads, the most it picks for itself.
+_X265_FRAME_THREADS = 16
+# The rest by their own default lag: the frames each reads ahead to decide.
+_ENCODER_LAGS: Mapping[str, int] = {"libvpx-vp9": 25, "libaom-av1": 35}
+# The encoder a file output with no video codec named gets: ffmpeg's own
+# default for the containers that carry H.264.
+_DEFAULT_VIDEO_ENCODER = "libx264"
+_ZERO_LATENCY = "zerolatency"
 
 # Nodes the sidecar hosts itself. They belong to a region the way a module
 # does -- ffmpeg cannot run them -- but no ``-m`` entry binds their name.
@@ -1147,19 +1200,76 @@ def _encodes(wire: StreamFormat) -> bool:
     return encoded(wire) and wire.codec != COPY_CODEC
 
 
-def _frame_bytes(wire: StreamFormat) -> int | None:
-    """One frame's size on this edge, or None where it cannot be counted.
+def encoder_delay(
+    codec: str | None, options: Mapping[str, object], height: int | None
+) -> int:
+    """The frames the video encoder `codec` takes before its first packet.
 
-    Raw video is width by height by the pixel format's own byte count. An
-    encoded packet's size is not its frame's, and an audio packet holds
-    however many samples the muxer put in it: neither has an answer here.
+    `options` are the output's own sink options: a `preset`, a `tune` and
+    the `codec_params` passthrough each change what x264 and x265 hold, and
+    what they set is what is counted. `height` is the picture's, which caps
+    x264's frame threads. 0 for an encoder that holds nothing back, and for
+    a stream copied rather than encoded.
     """
-    if isinstance(wire, AudioFormat | DataFormat) or encoded(wire):
-        return None
+    name = codec or _DEFAULT_VIDEO_ENCODER
+    if name not in ("libx264", "libx265"):
+        return _ENCODER_LAGS.get(name, 0)
+    params = _codec_params(options.get("codec_params"))
+    tune = str(params.get("tune", options.get("tune", "")))
+    if _ZERO_LATENCY in tune.split(","):
+        return 0
+    presets = _X264_PRESETS if name == "libx264" else _X265_PRESETS
+    preset = str(params.get("preset", options.get("preset", "medium")))
+    bframes, lookahead = presets.get(preset, presets["medium"])
+    bframes = _param_int(params, "bframes", bframes)
+    lookahead = _param_int(params, "rc-lookahead", lookahead)
+    held = max(bframes, lookahead)
+    if name == "libx265":
+        return held + _param_int(params, "frame-threads", _X265_FRAME_THREADS)
+    rows = height if height is not None else _UNKNOWN_HEIGHT
+    threads = min(max((rows + 15) // 16 // 2, 1), _X264_THREADS_MAX)
+    threads = _param_int(params, "threads", threads)
+    sync = _param_int(params, "sync-lookahead", bframes + 1 if threads > 1 else 0)
+    return held + threads - 1 + sync
+
+
+def _codec_params(written: object) -> dict[str, str]:
+    """``key=value:key=value`` as a dict, keys spelled with hyphens."""
+    if not isinstance(written, str):
+        return {}
+    pairs = (item.partition("=") for item in written.split(":") if "=" in item)
+    return {key.strip().replace("_", "-"): value.strip() for key, _, value in pairs}
+
+
+def _param_int(params: Mapping[str, str], key: str, default: int) -> int:
+    """`params[key]` as a whole number, or `default` where it is not one."""
+    try:
+        return max(int(params[key]), 0) if key in params else default
+    except ValueError:
+        return default
+
+
+def _copies(wire: StreamFormat) -> bool:
+    """True when both ends of this edge copy the packets as they were read."""
+    return isinstance(wire, VideoFormat | AudioFormat) and wire.codec == COPY_CODEC
+
+
+def _picture_bytes(wire: VideoFormat) -> int | None:
+    """One raw picture's size: width by height by the pixel format's bytes."""
     if wire.width is None or wire.height is None:
         return None
     per_pixel = _PIXEL_BYTES.get(wire.pix_fmt)
     return None if per_pixel is None else wire.width * wire.height * per_pixel
+
+
+def _frame_seconds(fps: str | None) -> float | None:
+    """How long one frame at `fps` lasts; None where there is no rate."""
+    numerator, _, denominator = (fps or "").partition("/")
+    try:
+        rate = int(numerator) / (int(denominator) if denominator else 1)
+    except (ValueError, ZeroDivisionError):
+        return None
+    return 1 / rate if rate > 0 else None
 
 
 def _rounded(size: int) -> int:
@@ -2171,20 +2281,24 @@ class _Partitioner:
             walk(pid, frozenset())
         return found
 
-    def _cost(self, start: str, target: str) -> int | None:
-        """The longest path delay from `start` to `target`, `target` excluded.
+    def _cost(self, start: StreamEdge, target: str) -> int | None:
+        """The longest path delay from edge `start` into `target`'s encoders.
 
         The processes a frame passes THROUGH on the way, each holding what
-        :meth:`_process_delay` says. 0 when `start` is `target` itself.
+        :meth:`_process_delay` says, and then the encoder it reaches inside
+        `target`, holding what :meth:`_encoder_hold` says.
         """
-        ahead: dict[str, list[str]] = {}
+        ahead: dict[str, list[StreamEdge]] = {}
         for edge in self.edges:
-            ahead.setdefault(edge.source, []).append(edge.target)
+            ahead.setdefault(edge.source, []).append(edge)
         best: dict[str, int | None] = {}
 
+        def arrive(edge: StreamEdge) -> int | None:
+            if edge.target == target:
+                return self._encoder_hold(target, edge.ref)
+            return walk(edge.target)
+
         def walk(pid: str) -> int | None:
-            if pid == target:
-                return 0
             if pid in best:
                 return best[pid]
             best[pid] = None  # cycle guard, and the answer for a dead end
@@ -2193,14 +2307,51 @@ class _Partitioner:
                 return None
             found: int | None = None
             for follower in ahead.get(pid, []):
-                below = walk(follower)
+                below = arrive(follower)
                 if below is None:
                     continue
                 found = below if found is None else max(found, below)
             best[pid] = None if found is None else own + found
             return best[pid]
 
-        return walk(start)
+        return arrive(start)
+
+    def _encoder_hold(self, pid: str, ref: FrameRef) -> int:
+        """The frames the encoders `ref` reaches inside process `pid` hold.
+
+        The streams two paths bring to one process each end in an output of
+        it, and where only one of them is encoded by something that holds
+        frames back, the other waits on its edge that much longer. A path that
+        merges with its sibling first reaches the same encoder, and the two
+        holds cancel.
+        """
+        process = next((p for p in self.pending if p.id == pid), None)
+        if process is None:
+            return 0
+        reached = {ref}
+
+        def carries(other: FrameRef) -> bool:
+            return other in reached or (_ref_node(other) or other) in reached
+
+        for name in process.nodes:  # topological
+            if any(carries(r) for r in self.g.nodes[name].inputs):
+                reached.add(name)
+        held = 0
+        for unit in process.sinks:
+            for output in unit.outputs:
+                if output.type != "video" or not carries(output.ref):
+                    continue
+                meta = self._origin_meta(output.ref)
+                codec = unit.options.get("video_codec")
+                held = max(
+                    held,
+                    encoder_delay(
+                        None if codec is None else str(codec),
+                        unit.options,
+                        meta.height if meta is not None else None,
+                    ),
+                )
+        return held
 
     def _bound_edges(self) -> None:
         """Give every edge leaving a live reader the frames it must hold.
@@ -2240,7 +2391,7 @@ class _Partitioner:
                 for index, edge in outs:
                     if pid not in reach[edge.target]:
                         continue
-                    leg, cost = legs[index], self._cost(edge.target, pid)
+                    leg, cost = legs[index], self._cost(edge, pid)
                     if leg is None or cost is None:
                         raise self._unbounded_refusal(reader, edge, pid)
                     delays[index] = leg + cost
@@ -2256,11 +2407,18 @@ class _Partitioner:
             )
 
     def _edge_leg(self, reader: _Pending, edge: StreamEdge) -> int | None:
-        """One edge's delay inside the reader: its chain, plus any encoder on it."""
+        """One edge's delay inside the reader: its chain, plus any encoder on
+        it and the decoder reordering what that encoder wrote."""
         leg = self._leg_delay(reader, edge.ref)
-        if leg is None:
-            return None
-        return leg + (ENCODED_EDGE_DELAY if _encodes(edge.format) else 0)
+        if leg is None or not _encodes(edge.format):
+            return leg
+        wire = edge.format
+        held = (
+            encoder_delay(wire.codec, dict(wire.options), wire.height)
+            if isinstance(wire, VideoFormat)
+            else 0
+        )
+        return leg + held + ENCODED_EDGE_DELAY
 
     def _unbounded_refusal(
         self, reader: _Pending, edge: StreamEdge, meeting: str
@@ -2297,18 +2455,59 @@ class _Partitioner:
         """The buffer `bound` frames of this edge buys, and where it is held.
 
         The pipe's own buffer where the bytes fit under the limit, and the
-        producing ffmpeg's fifo queue where they do not, or where an audio
-        packet's size is not a number anything here can name. Only an edge
-        leaving a READER is ever sized, and a reader is always an ffmpeg
-        process, so the fifo muxer is always available to it.
+        producing ffmpeg's fifo queue where they do not, or where one frame's
+        size is not a number anything here can name. Only an edge leaving a
+        READER is ever sized, and a reader is always an ffmpeg process, so the
+        fifo muxer is always available to it.
+
+        A COPIED stream never takes the fifo road. Stream copy keeps the codec
+        tag the input's container gave it, the fifo muxer has no tag table to
+        clear it against, and the NUT muxer inside refuses a tag it does not
+        use: an MP4's ``mp4a`` fails on the first packet, before any header
+        reaches the pipe. Its pipe is given the most a pipe is instead.
         """
         if bound <= 0:
             return None
         frames = bound * SAFETY
-        width = _frame_bytes(edge.format)
+        width = self._frame_bytes(edge)
         if width is not None and frames * width <= PIPE_BUFFER_LIMIT:
             return EdgeBuffer("pipe", frames, size=_rounded(frames * width))
+        if _copies(edge.format):
+            return EdgeBuffer("pipe", frames, size=PIPE_BUFFER_LIMIT)
         return EdgeBuffer("fifo", frames, packets=frames)
+
+    def _frame_bytes(self, edge: StreamEdge) -> int | None:
+        """One frame's size on this edge, or None where it cannot be counted.
+
+        Raw video is one picture. Everything else is counted by time: a frame
+        of the bound is one picture of the input the edge comes from, or
+        :data:`LONGEST_FRAME_SECONDS` where it has none with a rate. Samples
+        take that long at the edge's own rate and channels, and a copied
+        stream its probed bit rate. An encoded packet's size is not a
+        number anything here can name.
+        """
+        wire = edge.format
+        if isinstance(wire, VideoFormat) and wire.codec == RAWVIDEO:
+            return _picture_bytes(wire)
+        origin = self._origin(edge.ref)
+        probe = self.probes.get(origin[0]) if origin is not None else None
+        pictures = probe.by_type("video") if probe is not None else []
+        seconds = next(
+            (found for s in pictures if (found := _frame_seconds(s.fps))),
+            LONGEST_FRAME_SECONDS,
+        )
+        if _copies(wire):
+            meta = self._origin_meta(edge.ref)
+            if meta is None or not meta.bitrate:
+                return None
+            return int(meta.bitrate / 8 * seconds) + 1
+        if isinstance(wire, AudioFormat) and wire.codec in _SAMPLE_BYTES:
+            rate = wire.required_rate or wire.rate
+            channels = wire.required_channels or wire.channels
+            if rate is None or channels is None:
+                return None
+            return int(rate * channels * _SAMPLE_BYTES[wire.codec] * seconds) + 1
+        return None
 
     # -- the fan-in rule
 
