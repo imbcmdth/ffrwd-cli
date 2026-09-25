@@ -467,6 +467,7 @@ from ffrwd.wasm import (
     AUDIO_CODEC_ENCODERS,
     CODEC_ENCODERS,
     DATA_FILTER_WORLD,
+    FFMPEG_SAMPLE_FMTS,
     PACKET_FILTER_WORLD,
     PACKET_SOURCE_WORLD,
     WIRE_AUDIO_CODECS,
@@ -14377,7 +14378,9 @@ class _Lowerer:
         wire = wire_audio(described)
         rate = wire.required_rate or (meta.sample_rate if meta is not None else None)
         channels = wire.required_channels or (meta.channels if meta is not None else None)
-        args: dict[str, object] = {"sample_fmts": wire_sample_fmt(described)}
+        args: dict[str, object] = {
+            "sample_fmts": FFMPEG_SAMPLE_FMTS[wire_sample_fmt(described)]
+        }
         if rate:
             args["sample_rates"] = rate
         if channels:

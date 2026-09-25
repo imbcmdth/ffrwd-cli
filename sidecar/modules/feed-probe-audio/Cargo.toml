@@ -1,0 +1,20 @@
+[package]
+name = "feed-probe-audio"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "feed_probe_audio"
+crate-type = ["cdylib"]
+
+[dependencies]
+# The feeder arrives as NUT: read through the crate's push parser, since a
+# socket that must never block cannot be dressed up as a blocking reader.
+# Pinned by tag, the way the sidecar workspace pins it.
+ffrwd-nut = { git = "https://github.com/imbcmdth/ffrwd-nut", tag = "v0.1.3" }
+wit-bindgen = "0.57.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+# The wasi:sockets bindings, matching the interface version the host links
+# for a module granted -tcp.
+wasip2 = "2.0.0"

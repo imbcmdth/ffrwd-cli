@@ -48,6 +48,7 @@ members = [
     "fauxlate",
     "embed-notes",
     "feed-probe",
+    "feed-probe-audio",
     "post-rows",
     "broken-audio",
     "adapted-020",

@@ -640,6 +640,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "feed-probe-audio"
+version = "0.1.0"
+dependencies = [
+ "ffrwd-nut",
+ "serde",
+ "serde_json",
+ "wasip2 2.0.0+wasi-0.2.12",
+ "wit-bindgen 0.57.1",
+]
+
+[[package]]
 name = "ffrwd-nal"
 version = "0.1.0"
 source = "git+https://github.com/imbcmdth/ffrwd-nal?tag=v0.1.0#bd2ffcf559065b8364369bbc0b24df7220b96eb8"

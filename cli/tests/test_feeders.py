@@ -280,6 +280,21 @@ def test_the_plan_starts_the_feeders_writer_alone_and_lists_it() -> None:
     )
 
 
+def _writer_argv(plan: ProcessPlan) -> list[str]:
+    """The argv of the ffmpeg writing the plan's one feeder connection."""
+    (source,) = {edge.source for edge in plan.feeder_edges}
+    return plan_argv(plan, sidecar_argv=wasm.shown_argv)[source]
+
+
+def test_sound_carried_as_f32_is_conformed_in_ffmpegs_name_for_it() -> None:
+    """The wire says f32 and s16; ffmpeg's aformat reads flt and s16."""
+    modules = {**_MODULES, AUDIO: replace(_MODULES[AUDIO], sample_formats=("f32",))}
+    argv = _writer_argv(_plan("COPY (SELECT audio(p.audio[1], a.audio[1]) AS s" + _FROM, modules))
+    graph = argv[argv.index("-filter_complex") + 1]
+    assert "aformat=sample_fmts=flt:sample_rates=48000:channel_layouts=stereo" in graph
+    assert argv[argv.index("-c:0") + 1] == "pcm_f32le"
+
+
 # -- a number in the feeder's place ----------------------------------------------
 
 

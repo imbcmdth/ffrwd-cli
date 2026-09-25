@@ -85,6 +85,7 @@ __all__ = [
     "MODEL_SUFFIX",
     "PACKET_FILTER_WORLD",
     "PACKET_SOURCE_WORLD",
+    "FFMPEG_SAMPLE_FMTS",
     "SAMPLE_FMT_CODECS",
     "TIMEOUT_ENV",
     "WIRE_AUDIO_CODECS",
@@ -237,9 +238,11 @@ PACKET_FILTER_WORLD = "ffrwd:av@0.16.0"
 # in and out, and clock pads beside them.
 DATA_FILTER_WORLD = "ffrwd:av@0.17.0"
 
-# The sample formats one can carry, and the pcm each of them travels as.
+# The sample formats one can carry, the pcm each of them travels as, and
+# the name ffmpeg's own options spell it by.
 WIRE_SAMPLE_FMTS: tuple[str, ...] = ("f32", "s16")
 SAMPLE_FMT_CODECS: Mapping[str, str] = {"f32": PCM_F32LE, "s16": PCM_S16LE}
+FFMPEG_SAMPLE_FMTS: Mapping[str, str] = {"f32": "flt", "s16": "s16"}
 
 # The JSON Schema types each declared annotation field type covers. `number`
 # covers integer as well: the dialect has one numeric type, and a module

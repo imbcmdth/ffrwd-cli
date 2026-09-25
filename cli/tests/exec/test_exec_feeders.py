@@ -130,3 +130,41 @@ def test_a_feeder_left_out_takes_the_ports_default() -> None:
     shown = _shown("probe(p.video[1]).feeds")
     assert """-params '{"port": 9000}'""" in shown
     assert "tcp://" not in shown
+
+
+_HEAR = _SIDECAR_MODULES / "target" / "wasm32-wasip2" / "release" / "feed_probe_audio.wasm"
+_HEAR_DECLARE = (
+    "CREATE FUNCTION hear(a audio_stream, feed audio_stream DEFAULT NULL, "
+    "port number DEFAULT 9000)\n"
+    "RETURNS STRUCT(a audio_stream, feeds STRUCT(feed_pts number, rate number, "
+    "channels number, sample_fmt text, samples number)[])\n"
+    "AS '{module}', 'feed-probe-audio' LANGUAGE wasm;\n"
+)
+
+
+def test_a_sound_feeder_reaches_the_module_in_the_format_it_reads(tmp_path: Path) -> None:
+    """``feed-probe-audio`` reads f32 at 48 kHz in stereo, and its feeder is a
+    second of mono sound at that rate: every sample of it arrives, doubled
+    into two channels, in the module's own format."""
+    if not _HEAR.exists():
+        pytest.skip(f"module missing: {_HEAR}")
+    programme = _CLI_ROOT / "tests" / "fixtures" / "av.mp4"
+    feeder = tmp_path / "feeder.wav"
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
+         "sine=frequency=440:sample_rate=48000:duration=1", str(feeder)],
+        check=True,
+        timeout=_TIMEOUT,
+    )
+    rows_path = tmp_path / "rows.ndjson"
+    sql = _HEAR_DECLARE.format(module=_HEAR.as_posix()) + (
+        f"COPY (SELECT hear(p.audio[1], a.audio[1]).feeds FROM "
+        f"input('{programme.as_posix()}') p, input('{feeder.as_posix()}') a) "
+        f"TO '{rows_path.as_posix()}'"
+    )
+    assert cli.main(["run", sql, "-y", "-q"]) == 0
+    rows = [json.loads(line) for line in rows_path.read_text().splitlines() if line]
+    assert {(row["rate"], row["channels"], row["sample_fmt"]) for row in rows} == {
+        (48000, 2, "f32")
+    }
+    assert sum(int(row["samples"]) for row in rows) == 48000
