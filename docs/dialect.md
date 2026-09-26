@@ -315,7 +315,13 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   a struct of data streams in the module's own output order, `RETURNS
   STRUCT(d data_stream, launch data_stream)`, each read off the call by
   its field, `auction(f.data[1], f.video[1]).launch`, and every field
-  read off one call in one query is one instance. An output goes where
+  read off one call in one query is one instance. `(auction(f.data[1],
+  f.video[1])).*` reads every field at once, one column per output
+  named for it (`d`, `launch`), so a CTE binds the call once and the
+  query reads `w.d` and `w.launch` off it: the arguments are written
+  once, and no second copy of them can drift into a second instance. The
+  expansion takes no `AS`, and a `.*` over a call that returns no struct
+  of data streams is refused. An output goes where
   a data stream goes: into a `.nut` file, into another data filter, or
   to a sink reading data streams as a pad after its video and audio.
   An output read in several places, by a run-time lateral and a sink

@@ -466,6 +466,61 @@ def test_a_structs_fields_are_one_instance_and_another_filter_reads_one() -> Non
     assert [o.ref for o in unit.outputs] == [stamp, f"{auction}:1"]
 
 
+@pytest.mark.parametrize(
+    "star",
+    ["(auction(f.data[1], f.video[1])).*", "auction(f.data[1], f.video[1]).*"],
+)
+def test_a_structs_star_is_its_fields_read_off_one_call(star: str) -> None:
+    """``(<call>).*`` is every field of the call, each named for itself: the
+    graph the hand-written field reads make, with the arguments written once."""
+    by_hand = _lowered(
+        "COPY (WITH w AS (SELECT auction(f.data[1], f.video[1]).d AS d, "
+        "auction(f.data[1], f.video[1]).launch AS launch FROM input('deal.nut') f) "
+        "SELECT stamp(w.d, 'es'), w.launch FROM w) TO 'out.nut'"
+    )
+    starred = _lowered(
+        f"COPY (WITH w AS (SELECT {star} FROM input('deal.nut') f) "
+        "SELECT stamp(w.d, 'es'), w.launch FROM w) TO 'out.nut'"
+    )
+    auction, stamp = starred.data_filters
+    assert starred.nodes[auction].outputs == ["data", "data"]
+    assert starred.nodes[stamp].inputs == [f"{auction}:0"]
+    (unit,) = starred.sinks
+    assert [o.ref for o in unit.outputs] == [stamp, f"{auction}:1"]
+    assert [(n.filter, n.args, n.inputs, n.outputs) for n in starred.nodes.values()] == [
+        (n.filter, n.args, n.inputs, n.outputs) for n in by_hand.nodes.values()
+    ]
+
+
+def test_a_star_beside_other_columns_keeps_its_place() -> None:
+    call = "auction(f.data[1], f.video[1], viewers => 9)"
+    graph = _lowered(f"COPY (SELECT f.video[1], ({call}).*" + _FROM)
+    by_hand = _lowered(f"COPY (SELECT f.video[1], {call}.d AS d, {call}.launch AS launch" + _FROM)
+    (auction,) = graph.data_filters
+    assert graph.nodes[auction].args == {"cohort": "x", "viewers": 9}
+    (unit,) = graph.sinks
+    (written,) = by_hand.sinks
+    assert [(o.ref, o.type) for o in unit.outputs] == [(o.ref, o.type) for o in written.outputs]
+    assert [o.type for o in unit.outputs] == ["video", "data", "data"]
+
+
+@pytest.mark.parametrize(
+    ("projection", "needle", "hint"),
+    [
+        ("(stamp(f.data[1], 'es')).*", "stamp() returns no struct of data streams",
+         "RETURNS STRUCT"),
+        ("(auction(f.data[1], f.video[1])).* AS a", "so it takes no AS",
+         "the columns are 'd', 'launch'"),
+    ],
+)
+def test_a_star_with_no_reading_is_refused(projection: str, needle: str, hint: str) -> None:
+    with pytest.raises(FfrwdError) as caught:
+        resolve(parse(_declared(f"COPY (SELECT {projection}" + _FROM)))
+    assert caught.value.code is ErrorCode.UNSUPPORTED_SQL
+    assert needle in caught.value.message
+    assert hint in (caught.value.hint or "")
+
+
 def test_a_data_filter_takes_its_values_by_name() -> None:
     """The leaf's call as the target query writes it, both fields one instance."""
     call = "auction(f.data[1], f.video[1], cohort => 'es-ES', viewers => 18000)"

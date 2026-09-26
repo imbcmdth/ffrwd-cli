@@ -3842,6 +3842,10 @@ class _Expander:
         }
         for position, statement in enumerate(rest):
             self._expand_statement(statement, position)
+        # After inlining: a data filter called through a package or a body is
+        # a bare name by now, so its `.*` reads the declaration either way.
+        for statement in rest:
+            self._expand_data_stars(statement)
         # After inlining: a package sink call in TO position is a bare name
         # by now, so the rewrite reads script and package sinks the same way.
         for statement in rest:
@@ -4316,6 +4320,67 @@ class _Expander:
         return adopted
 
     # -- wasm calls -------------------------------------------------------
+
+    def _expand_data_stars(self, statement: exp.Expr) -> None:
+        """``(<data filter call>).*``: one projection per output the filter returns.
+
+        ``SELECT (sell(p.v, ...)).* FROM p`` reads as ``sell(p.v, ...).d AS d,
+        sell(p.v, ...).launch AS launch``, every output in the order the
+        declaration's ``RETURNS STRUCT`` names them, each over a copy of the
+        ONE call written. The copies are the same call, so they lower to one
+        instance exactly as hand-written field reads do, and there is no second
+        copy of the arguments to drift out of step with the first.
+        """
+        for select in [node for node in _preorder(statement) if isinstance(node, exp.Select)]:
+            projections: list[exp.Expr] = []
+            expanded = False
+            for projection in select.expressions:
+                call = self._data_star_call(projection)
+                if call is None:
+                    projections.append(projection)
+                    continue
+                expanded = True
+                declared = self.wasm[_call_name(call)]
+                for field_name in declared.data_fields:
+                    read = exp.Dot(this=call.copy(), expression=exp.to_identifier(field_name))
+                    projections.append(exp.alias_(read, field_name))
+            if expanded:
+                select.set("expressions", projections)
+
+    def _data_star_call(self, projection: exp.Expr) -> exp.Anonymous | None:
+        """The call a ``(<call>).*`` projection expands, or None for any other.
+
+        A star over a call that returns no struct of data streams, or one given
+        a name of its own, is refused here: neither has a reading.
+        """
+        named = projection if isinstance(projection, exp.Alias) else None
+        dot = _unparen(named.this) if named is not None else projection
+        if not isinstance(dot, exp.Dot) or not isinstance(dot.expression, exp.Star):
+            return None
+        base = _unparen(dot.this) if isinstance(dot.this, exp.Expr) else None
+        if not isinstance(base, exp.Anonymous):
+            return None
+        name = _call_name(base)
+        declared = self.wasm.get(name)
+        if declared is None or not declared.data_fields:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"({name}(...)).* expands a data filter's outputs, and {name}() "
+                "returns no struct of data streams",
+                projection,
+                hint="expand a call declared RETURNS STRUCT(<name> data_stream, ...), "
+                "or read the call as it is",
+            )
+        if named is not None:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"({name}(...)).* is one column per output, each named for it, "
+                "so it takes no AS",
+                projection,
+                hint="drop the AS; the columns are "
+                + ", ".join(f"'{field_name}'" for field_name in declared.data_fields),
+            )
+        return base
 
     def _rewrite_sink_copy(self, statement: exp.Expr) -> None:
         """A sink function in TO position, rewritten into the query's SELECT list.
