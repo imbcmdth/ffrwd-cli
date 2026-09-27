@@ -1902,10 +1902,21 @@ def _run_plan(
         print(f"error: the pipeline timed out after {timeout}s", file=sys.stderr)
         return 1
     if result.exit_code != 0:
+        # A node whose runner went away took every member it ran along: one
+        # line names the node and them, since none of them said anything.
+        lost: dict[int | None, list[str]] = {}
         for member in result.failures:
+            if member.lost:
+                lost.setdefault(member.node, []).append(member.id)
+                continue
             print(member.stderr_tail, file=sys.stderr)
             print(
                 _member_error(member, _member_writes(plan, member.id)),
+                file=sys.stderr,
+            )
+        for node, ran in lost.items():
+            print(
+                f"error: the runner of node {node} ended while it ran {_names(ran)}",
                 file=sys.stderr,
             )
         for member in result.consequences:
@@ -1938,9 +1949,12 @@ def _member_error(member: ProcessResult, writes: Sequence[str] = ()) -> str:
         else f"exited with code {member.exit_code}"
     )
     name = member.id if member.node is None else f"{member.id} on node {member.node}"
-    if member.lost:
-        ended = f"was lost: the runner of node {member.node} ended while it ran"
     return f"error: {name} {ended}{where}\n  {member.command}"
+
+
+def _names(names: Sequence[str]) -> str:
+    """``a``, ``a and b``, ``a, b and c``."""
+    return names[0] if len(names) == 1 else f"{', '.join(names[:-1])} and {names[-1]}"
 
 
 def _member_writes(plan: ProcessPlan, member: str) -> list[str]:
