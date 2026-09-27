@@ -751,41 +751,56 @@ def test_without_a_leaky_the_same_slow_picture_falls_further_behind(
 # A feed that arrives a second at a time, the way a MoQ relay hands a
 # subscriber each group of pictures at once: 30 pictures within a few
 # milliseconds, once a second, so a group's first picture is a second later
-# than its last. Nothing slow follows the leaky. It learns that spread from
-# the feed's own delivery and drops next to nothing; learning none
-# (max_spread => 0), the older half of every second is past half a second.
+# than its last. It starts the way a leaf joining a relay does: the first
+# delivery is half a second, the piece of a group made so far, handed on as
+# soon as it is made, and each whole group after it arrives a little later
+# than its last picture was made, later than that piece did. The pictures
+# are MPEG-2, whose decoder holds back fewer of them than H.264's frame
+# threads do, so that the piece reaches the leaky as a run of its own.
+# Nothing slow follows the leaky. It learns the groups' spread from their own
+# delivery and drops next to nothing from its first picture on. Judged from
+# the piece's baseline and width, as 0.25.2 judged it, it dropped more than
+# half of the feed (215 of 360); learning none (max_spread => 0), the older
+# half of every second is past half a second.
 _BURST_SECONDS = 12
+_BURST_PIECE = 15
+_BURST_LAG = 0.35
 _BURST_SHAPE = (
-    "shape => STRUCT(640 AS width, 360 AS height, 30 AS fps), analyzeduration => 500000"
+    "shape => STRUCT(640 AS width, 360 AS height, 30 AS fps), analyzeduration => 100000"
 )
 
 
 @pytest.fixture(scope="module")
-def _groups(tmp_path_factory: pytest.TempPathFactory) -> list[bytes]:
-    """The feed as one MPEG-TS piece per second: a group of 30 pictures each."""
+def _groups(tmp_path_factory: pytest.TempPathFactory) -> list[tuple[float, bytes]]:
+    """The feed as MPEG-TS pieces, each with when it is handed on, in
+    seconds from the start: the first piece's pictures once they are made,
+    then each group of 30 _BURST_LAG after its last is made."""
     folder = tmp_path_factory.mktemp("groups")
+    cuts = list(range(_BURST_PIECE, _BURST_SECONDS * 30, 30))
     subprocess.run(
         ["ffmpeg", "-v", "error", "-f", "lavfi", "-i",
          f"testsrc2=size=640x360:rate=30:duration={_BURST_SECONDS}",
-         "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
-         "-g", "30", "-keyint_min", "30", "-sc_threshold", "0", "-pix_fmt", "yuv420p",
-         "-f", "segment", "-segment_time", "1", "-segment_format", "mpegts",
-         "-reset_timestamps", "0", str(folder / "g%03d.ts")],
+         "-c:v", "mpeg2video", "-q:v", "4", "-bf", "0", "-g", "30", "-pix_fmt", "yuv420p",
+         "-force_key_frames", f"expr:eq(n,0)+eq(mod(n-{_BURST_PIECE},30),0)",
+         "-f", "segment", "-segment_frames", ",".join(str(cut) for cut in cuts),
+         "-segment_format", "mpegts", "-reset_timestamps", "0", str(folder / "g%03d.ts")],
         check=True,
         timeout=_TIMEOUT,
     )  # fmt: skip
-    groups = [path.read_bytes() for path in sorted(folder.glob("g*.ts"))]
-    assert len(groups) == _BURST_SECONDS, len(groups)
-    return groups
+    pieces = [path.read_bytes() for path in sorted(folder.glob("g*.ts"))]
+    ends = [*cuts, _BURST_SECONDS * 30]
+    assert len(pieces) == len(ends), len(pieces)
+    handed = [end / 30 + (_BURST_LAG if index else 0.0) for index, end in enumerate(ends)]
+    return list(zip(handed, pieces, strict=True))
 
 
 class _Bursts:
-    """Dials a TCP listener and hands it each second of the feed at once,
-    once that second is over, as a relay hands on a group."""
+    """Dials a TCP listener and hands it each piece of the feed at once, at
+    its time, as a relay hands on a group."""
 
-    def __init__(self, port: int, groups: list[bytes]) -> None:
+    def __init__(self, port: int, pieces: list[tuple[float, bytes]]) -> None:
         self.port = port
-        self.groups = groups
+        self.pieces = pieces
         self.sent = 0
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._pump, daemon=True)
@@ -803,10 +818,10 @@ class _Bursts:
                 continue
             with connection:
                 began = time.monotonic()
-                for index, group in enumerate(self.groups):
-                    if self._stop.wait(max(0.0, began + index + 1 - time.monotonic())):
+                for handed, piece in self.pieces:
+                    if self._stop.wait(max(0.0, began + handed - time.monotonic())):
                         return
-                    connection.sendall(group)
+                    connection.sendall(piece)
                     self.sent += 1
             return
 
@@ -819,7 +834,7 @@ class _Bursts:
 def test_a_leaky_learns_a_bursty_feeds_spread_and_drops_next_to_nothing(
     max_spread: int | None,
     learns: bool,
-    _groups: list[bytes],
+    _groups: list[tuple[float, bytes]],
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -863,7 +878,7 @@ def test_a_leaky_learns_a_bursty_feeds_spread_and_drops_next_to_nothing(
         for stage in result.stages
         for member in stage.members
     )
-    assert pump.sent == _BURST_SECONDS
+    assert pump.sent == len(_groups)
 
     assert rows and all(row["kind"] == "leaky" for row in rows)
     passed = sum(int(str(row["passed"])) for row in rows)
@@ -871,14 +886,11 @@ def test_a_leaky_learns_a_bursty_feeds_spread_and_drops_next_to_nothing(
     assert passed + dropped >= _BURST_SECONDS * 30 - 30, rows
     spreads = [float(str(row["spread_s"])) for row in rows]
     if learns:
-        # A second's pictures, less the time they took to arrive. The reader
-        # hands on its probe backlog first, and the pipeline starting up may
-        # cut that into pieces, so the second group can lose a few of its
-        # oldest pictures; from then on nothing is dropped, and every row
-        # carries the groups' own spread.
-        assert all(0.85 <= spread <= 1.1 for spread in spreads[2:]), rows
-        assert dropped < 15, rows
-        assert all(row["dropped"] == 0 for row in rows[2:]), rows
+        # A second's pictures, less the time they took to arrive, from the
+        # first whole group on. The piece before it is narrower and fresher,
+        # and nothing is dropped while the leaky learns from them, nor after.
+        assert all(0.85 <= spread <= 1.1 for spread in spreads[3:]), rows
+        assert dropped <= 2, rows
     else:
         assert spreads == [0.0] * len(spreads)
         assert dropped > (passed + dropped) // 4, rows
