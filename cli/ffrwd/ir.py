@@ -865,6 +865,12 @@ class Graph:
     # data pads (a data stream) and clock pads (video or audio, read for its
     # time alone), and every one of its outputs is a data stream of its own.
     data_filters: list[str] = field(default_factory=list)
+    # Node ids that are a codec package's ENCODERS, in graph order: each
+    # reads one raw stream and writes it coded, in a codec ffmpeg does not
+    # know, so everything after it copies. And its DECODERS: each reads one
+    # coded stream an input carries and writes it raw.
+    encoders: list[str] = field(default_factory=list)
+    decoders: list[str] = field(default_factory=list)
     # Alias -> the RETURNS source module bound to it. Not a key of `sources`:
     # its bytes never come from a real `-i`, so the partitioner gives it a
     # sidecar of its own rather than an input slot.
@@ -940,6 +946,10 @@ class Graph:
             }
         if self.data_filters:
             d["data_filters"] = list(self.data_filters)
+        if self.encoders:
+            d["encoders"] = list(self.encoders)
+        if self.decoders:
+            d["decoders"] = list(self.decoders)
         if self.module_sources:
             d["module_sources"] = {
                 alias: source.to_dict() for alias, source in self.module_sources.items()
@@ -1046,6 +1056,9 @@ class Graph:
         if raw_data_filters is not None:
             assert isinstance(raw_data_filters, list)
             data_filters = [str(name) for name in raw_data_filters]
+        raw_encoders = d.get("encoders", [])
+        raw_decoders = d.get("decoders", [])
+        assert isinstance(raw_encoders, list) and isinstance(raw_decoders, list)
 
         raw_module_sources = d.get("module_sources")
         module_sources: dict[str, ModuleSource] = {}
@@ -1096,6 +1109,8 @@ class Graph:
             packet_filters=packet_filters,
             packet_filter_rows=packet_filter_rows,
             data_filters=data_filters,
+            encoders=[str(name) for name in raw_encoders],
+            decoders=[str(name) for name in raw_decoders],
             module_sources=module_sources,
             url_sources=url_sources,
             dropped_aliases=dropped_aliases,

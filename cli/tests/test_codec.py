@@ -3,6 +3,7 @@ input() inserts over a stream carrying the tag it reads."""
 
 from __future__ import annotations
 
+import functools
 import json
 from pathlib import Path
 
@@ -11,8 +12,16 @@ from sqlglot import exp
 
 from ffrwd import wasm
 from ffrwd.errors import ErrorCode, FfrwdError
+from ffrwd.ir import Graph
+from ffrwd.lower import lower
 from ffrwd.parser import parse, resolve
+from ffrwd.probe import ProbeResult, StreamMeta
 from ffrwd.project import discover
+from ffrwd.registry import Registry, load_reference
+from ffrwd.split import insert_splits
+from ffrwd.wasm import Described
+
+SNAPSHOT_PATH = Path(__file__).resolve().parent / "data" / "reference_registry.json"
 
 
 def _codec_package(root: Path) -> None:
@@ -132,3 +141,137 @@ def test_a_codec_modules_describe_is_read() -> None:
     assert not wasm.hosts_codec("ffrwd:av@0.17.0")
     plain = wasm._described("m.wasm", {"world": "ffrwd:av@0.18.0", "name": "p"})
     assert plain.encoder is None and plain.decoder is None
+
+
+# -- lowering an encoder ------------------------------------------------------------
+
+CODEC = "modules/codec.wasm"
+_ENCODER = (
+    "CREATE FUNCTION enc(bitrate number DEFAULT 1000) RETURNS encoder "
+    f"AS '{CODEC}', 'encode' LANGUAGE wasm;\n"
+)
+
+
+def _codec(kind: str = "video") -> Described:
+    formats = {"pixel_formats": ("yuv420p",)} if kind == "video" else {"sample_formats": ("f32",)}
+    return Described(
+        world="ffrwd:av@0.18.0",
+        name="codec",
+        params_schema={"type": "object", "properties": {"bitrate": {"type": "number"}}},
+        encoder=wasm.EncoderInfo(codec="testcodec", fourcc="FTST"),
+        decoder=wasm.DecoderInfo(fourccs=("FTST",)),
+        **formats,  # type: ignore[arg-type]
+    )
+
+
+@functools.cache
+def _registry() -> Registry:
+    return load_reference(SNAPSHOT_PATH)
+
+
+def _clip() -> dict[str, ProbeResult | None]:
+    return {
+        "f": ProbeResult(
+            streams=[
+                StreamMeta(
+                    type="video", index=0, metadata={}, width=64, height=48,
+                    fps="10/1", sample_rate=None, codec="h264",
+                ),
+                StreamMeta(
+                    type="audio", index=0, metadata={}, width=None, height=None,
+                    fps=None, sample_rate=48000, codec="aac", channels=2,
+                ),
+            ]
+        )
+    }
+
+
+def _lowered(query: str, codec: Described | None = None) -> Graph:
+    return insert_splits(
+        lower(
+            resolve(parse(_ENCODER + query)),
+            _clip(),
+            registry=_registry(),
+            describes={CODEC: codec or _codec()},
+        )
+    )
+
+
+def _refused(query: str, codec: Described | None = None) -> FfrwdError:
+    with pytest.raises(FfrwdError) as caught:
+        _lowered(query, codec)
+    return caught.value
+
+
+def test_an_encoder_codes_the_outputs_stream_and_the_file_copies_it() -> None:
+    graph = _lowered(
+        "COPY (SELECT f.video[1], f.audio[1] FROM input('clip.mp4') f) TO 'out.nut' "
+        "WITH (video_codec enc(bitrate => 5000), audio_codec 'aac')"
+    )
+    (encoder,) = graph.encoders
+    node = graph.nodes[encoder]
+    assert (node.filter, node.args, node.inputs) == (CODEC, {"bitrate": 5000}, ["src:f:v:0"])
+    (unit,) = graph.sinks
+    assert [o.ref for o in unit.outputs] == [encoder, "src:f:a:0"]
+    assert "video_codec" not in unit.options
+    assert unit.options["audio_codec"] == "aac"
+
+
+@pytest.mark.parametrize("path", ["out.mkv", "out.mov", "out.nut"])
+def test_a_container_that_keeps_a_tag_takes_the_stream(path: str) -> None:
+    graph = _lowered(
+        f"COPY (SELECT f.video[1] FROM input('clip.mp4') f) TO '{path}' "
+        "WITH (video_codec enc())"
+    )
+    assert len(graph.encoders) == 1
+
+
+@pytest.mark.parametrize(
+    ("query", "needle"),
+    [
+        (
+            "COPY (SELECT f.video[1] FROM input('clip.mp4') f) TO 'out.mp4' "
+            "WITH (video_codec enc())",
+            "'out.mp4' is mp4, and it cannot hold testcodec",
+        ),
+        (
+            "COPY (SELECT f.video[1] FROM input('clip.mp4') f) TO 'out.nut' "
+            "WITH (video_codec enc(), crf 20, gop 30)",
+            "'enc' encodes the video itself, so crf, gop have nothing to shape",
+        ),
+        (
+            "COPY (SELECT f.video[1] FROM input('clip.mp4') f) TO 'out.nut' "
+            "WITH (audio_codec enc())",
+            "'enc' encodes video, and audio_codec names the audio codec",
+        ),
+        (
+            "COPY (SELECT f.audio[1] FROM input('clip.mp4') f) TO 'out.nut' "
+            "WITH (video_codec enc())",
+            "'out.nut' is written no video stream",
+        ),
+        (
+            "COPY (SELECT f.video[1] FROM input('clip.mp4') f) TO 'out.nut' "
+            "WITH (crf enc())",
+            "'enc' is an encoder, which names a stream's codec, and 'crf' is not a codec option",
+        ),
+    ],
+)
+def test_an_encoder_with_no_reading_is_refused(query: str, needle: str) -> None:
+    error = _refused(query)
+    assert error.code is ErrorCode.UNSUPPORTED_SQL
+    assert needle in error.message
+
+
+def test_an_encoder_in_a_world_before_codecs_is_refused() -> None:
+    old = Described(
+        world="ffrwd:av@0.17.0",
+        name="codec",
+        pixel_formats=("yuv420p",),
+        encoder=wasm.EncoderInfo(codec="testcodec", fourcc="FTST"),
+    )
+    error = _refused(
+        "COPY (SELECT f.video[1] FROM input('clip.mp4') f) TO 'out.nut' "
+        "WITH (video_codec enc())",
+        old,
+    )
+    assert "hosted from ffrwd:av@0.18.0 on" in error.message

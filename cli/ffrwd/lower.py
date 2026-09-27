@@ -475,6 +475,7 @@ from ffrwd.wasm import (
     ANNOTATION_TYPES,
     AUDIO_CODEC_ENCODERS,
     CODEC_ENCODERS,
+    CODEC_WORLD,
     DATA_FILTER_WORLD,
     FFMPEG_SAMPLE_FMTS,
     PACKET_FILTER_WORLD,
@@ -492,6 +493,7 @@ from ffrwd.wasm import (
     audio_encoder_codec,
     catalog_as_probe,
     encoder_codec,
+    hosts_codec,
     hosts_data_filter,
     hosts_packet_filter,
     hosts_packet_sink,
@@ -2475,6 +2477,40 @@ _MATROSKA_FORMATS = frozenset({"mkv", "mka", "mks", "matroska"})
 # The one file container a data stream of JSON messages keeps its tag in.
 _NUT_FORMAT = "nut"
 
+# The options that name a codec, and the kind of stream each codes. Where one
+# names a codec package's ENCODER (`video_codec ffrwd.pyrowave.encode(...)`)
+# the module codes that kind, and ffmpeg copies what it writes.
+_CODEC_OPTIONS: Mapping[str, StreamType] = {"video_codec": "video", "audio_codec": "audio"}
+
+# The options that shape ffmpeg's own encoder, which a module encoder stands
+# in place of: its settings are its own arguments.
+_ENCODER_SHAPING = frozenset(
+    {
+        "crf",
+        "preset",
+        "pix_fmt",
+        "video_bitrate",
+        "maxrate",
+        "bufsize",
+        "gop",
+        "profile",
+        "level",
+        "tune",
+        "codec_params",
+        "keyint_min",
+        "sc_threshold",
+        "audio_bitrate",
+        "sample_rate",
+    }
+)
+
+# The containers a stream in a codec package's codec may be written to.
+# ffmpeg knows no such codec and keeps it by its tag: NUT and QuickTime keep
+# it exactly, Matroska as a VFW fourcc with its timestamps in milliseconds.
+# mp4 refuses it outright ("Could not find tag for codec none"), and nothing
+# else has been shown to keep it.
+_MODULE_CODEC_CONTAINERS = frozenset({_NUT_FORMAT, "mov", "mkv", "mka", "matroska"})
+
 
 def _container_of(options: Mapping[str, object], path: str) -> str:
     """The container a destination writes: its `format` option, else its
@@ -4348,9 +4384,14 @@ class _Lowerer:
             variant_rows, columns = self._manifest_rows(columns, raw)
         options: dict[str, object] = {}
         option_nodes: dict[str, exp.Expr] = {}
+        encoders: dict[str, tuple[RawSinkOption, WasmFunction]] = {}
         for option in raw.options:
             if variant_rows is not None and option.name in MANIFEST_MAP_OPTION.values():
                 raise self._hand_written_map_error(option, columns, variant_rows, raw)
+            encoder = self._encoder_option(option, raw)
+            if encoder is not None:
+                encoders[option.name] = (option, encoder)
+                continue
             if isinstance(_unwrap(option.value), exp.Null):
                 # NULL is absence: the option is not written, the encoder's /
                 # muxer's own default applies, and the option table never
@@ -4395,6 +4436,7 @@ class _Lowerer:
             path = self._derive_manifest(
                 options, option_nodes, columns, variant_rows, outputs, path, raw
             )
+        self._place_encoders(raw, encoders, options, outputs, path)
         self._place_packet_filters(raw, options, outputs, first_filter)
         self._check_metadata_track_container(options, outputs, path, raw)
         self._check_json_container(options, outputs, path, raw)
@@ -4409,6 +4451,170 @@ class _Lowerer:
             metadata=self.metadata,
             attachments=list(self.attachments),
         )
+
+    # -- a codec package's encoder ------------------------------------------
+
+    def _encoder_option(self, option: RawSinkOption, raw: RawSink) -> WasmFunction | None:
+        """The encoder a ``<kind>_codec <call>`` option names, else None.
+
+        None for every option whose value is not a call to a wasm function,
+        which the option table then reads as it always has. A call that is
+        not an encoder, or an encoder named by any option but a codec one, is
+        refused here, since nothing else could read it.
+        """
+        node = _unwrap(option.value)
+        if not isinstance(node, exp.Anonymous):
+            return None
+        declared = self.res.wasm.get(str(node.name).lower())
+        if declared is None:
+            return None
+        if not declared.is_encoder:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"sink option '{option.name}' names '{declared.name}', which is not "
+                "an encoder",
+                node,
+                fallback=raw.path_node,
+                hint="only a codec package's encoder stands in an option, written "
+                "video_codec <encoder>(<values>)",
+            )
+        if option.name not in _CODEC_OPTIONS:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"'{declared.name}' is an encoder, which names a stream's codec, "
+                f"and '{option.name}' is not a codec option",
+                node,
+                fallback=raw.path_node,
+                hint=f"write video_codec {declared.name}(...) or audio_codec "
+                f"{declared.name}(...)",
+            )
+        return declared
+
+    def _place_encoders(
+        self,
+        raw: RawSink,
+        encoders: Mapping[str, tuple[RawSinkOption, WasmFunction]],
+        options: dict[str, object],
+        outputs: list[Output],
+        path: str | None,
+    ) -> None:
+        """Put each named encoder over every output stream of its kind.
+
+        One node per stream, reading it raw and writing it coded; the output
+        then reads the node, and everything past it copies, since ffmpeg has
+        no encoder of its own for the codec and no decoder either. The
+        encoder's settings are its call's own values, so an option that
+        shapes ffmpeg's encoder for that kind has nothing to shape and is
+        refused by name, and the destination has to be a container that keeps
+        a codec ffmpeg does not know.
+        """
+        for name, (option, declared) in encoders.items():
+            kind = _CODEC_OPTIONS[name]
+            node = _unwrap(option.value)
+            select = raw.branches[0] if raw.branches else exp.Select()
+            described = self._described_codec(declared, node, select)
+            if described.encoder is None:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"function '{declared.name}' declares RETURNS encoder, and the "
+                    f"module '{declared.module}' is not an encoder",
+                    node,
+                    fallback=raw.path_node,
+                    hint="the module has to export the encoder interface of "
+                    f"{CODEC_WORLD} or later",
+                )
+            if described.kind != kind:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"'{declared.name}' encodes {described.kind or 'nothing'}, and "
+                    f"{name} names the {kind} codec",
+                    node,
+                    fallback=raw.path_node,
+                    hint=f"name it as {described.kind}_codec, or name a {kind} "
+                    "encoder here",
+                )
+            if path is not None:
+                container = _container_of(options, path)
+                if container not in _MODULE_CODEC_CONTAINERS:
+                    raise _error(
+                        ErrorCode.UNSUPPORTED_SQL,
+                        f"'{path}' is {container}, and it cannot hold "
+                        f"{described.encoder.codec}: ffmpeg knows no such codec, "
+                        "so only a container that keeps a stream by its tag does",
+                        raw.path_node,
+                        hint="write the file as .nut, .mkv or .mov, or hand the "
+                        "stream to a module sink",
+                    )
+            stray = sorted(
+                other
+                for other in options
+                if other in _ENCODER_SHAPING and SINK_OPTIONS[other].scope == kind
+            )
+            if stray:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"'{declared.name}' encodes the {kind} itself, so "
+                    f"{', '.join(stray)} {'has' if len(stray) == 1 else 'have'} "
+                    "nothing to shape",
+                    node,
+                    fallback=raw.path_node,
+                    hint="an encoder's settings are its own arguments, e.g. "
+                    f"{name} {declared.name}(<name> => <value>)",
+                )
+            call = _call_parts(node)
+            assert call is not None  # `_encoder_option` read it as one
+            params = self._wasm_params(
+                declared, described, call, node, select, _Env(), {}, first=0
+            )
+            coded = False
+            for index, output in enumerate(outputs):
+                if output.type != kind:
+                    continue
+                ref = self.ctx.node(declared.module, params, [output.ref], [kind])
+                self.graph.encoders.append(ref)
+                outputs[index] = replace(output, ref=ref)
+                coded = True
+            if not coded:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"{name} names the encoder '{declared.name}', and '{raw.path}' "
+                    f"is written no {kind} stream",
+                    node,
+                    fallback=raw.path_node,
+                    hint=f"select a {kind} stream, or drop the {name} option",
+                )
+
+    def _described_codec(
+        self, declared: WasmFunction, node: exp.Expr, select: exp.Select
+    ) -> Described:
+        """What an encoder's or a decoder's module declares, checked.
+
+        A codec module reads no stream argument and emits no rows, so the
+        filter-shaped checks :meth:`_described` runs have nothing to check;
+        what matters is that the sidecar's world hosts it. A module carrying
+        both an encoder and a decoder describes itself once for both, so the
+        export the declaration names is not matched against a single name.
+        """
+        described = self.describes.get(declared.module)
+        if described is None:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"the module '{declared.module}' was never described",
+                node,
+                fallback=select,
+                hint="this is a compiler bug; please report the query that "
+                "produced it",
+            )
+        if not hosts_codec(described.world):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"the module '{declared.module}' targets {described.world}, and a "
+                f"codec package's module is hosted from {CODEC_WORLD} on",
+                node,
+                fallback=select,
+                hint="rebuild the module against a newer world, or upgrade ffrwd",
+            )
+        return described
 
     def _rows_file(self, raw: RawSink) -> str:
         """The rows file this COPY writes, or "" for a COPY that writes media.
