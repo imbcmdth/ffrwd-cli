@@ -5107,6 +5107,7 @@ fn leaky_drops_the_frames_a_stall_made_late_and_reports_on_stderr() {
     assert!(rows
         .iter()
         .all(|row| row["kind"] == "leaky" && row["node"] == "n9"));
+    assert!(rows.iter().all(|row| row["spread_s"].is_number()));
     let total = |key: &str| {
         rows.iter()
             .map(|row| row[key].as_u64().unwrap())

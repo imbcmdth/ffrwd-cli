@@ -543,7 +543,8 @@ fn resolve_binding(raw: &str) -> Result<Binding> {
     }
     if name == leaky::NODE {
         bail!(
-            "-m {raw}: '{name}' is the network's own node and no module is bound to it;              it is spelled [a]{name}=max_lateness=<seconds>[b]"
+            "-m {raw}: '{name}' is the network's own node and no module is bound to it; \
+             it is spelled [a]{name}=max_lateness=<seconds>:max_spread=<seconds>[b]"
         );
     }
     if path.is_empty() {
