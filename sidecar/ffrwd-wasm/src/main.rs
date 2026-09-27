@@ -58,16 +58,24 @@ const ANNOTATIONS_IN: &str = "in";
 const ANNOTATIONS_OUT: &str = "out";
 
 /// Byte size of one frame in `pix_fmt`, or an error naming the unsupported
-/// format. `yuv420p` rejects odd width or height.
+/// format. `yuv420p` rejects odd width or height, `yuv422p` odd width.
 fn frame_len_for(pix_fmt: &str, width: u32, height: u32) -> Result<usize> {
+    let pixels = (width as usize) * (height as usize);
     match pix_fmt {
-        "rgba" => Ok((width as usize) * (height as usize) * 4),
+        "rgba" => Ok(pixels * 4),
         "yuv420p" => {
             if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
                 bail!("input is yuv420p, which needs even width and height, got {width}x{height}");
             }
-            Ok((width as usize) * (height as usize) * 3 / 2)
+            Ok(pixels * 3 / 2)
         }
+        "yuv422p" => {
+            if !width.is_multiple_of(2) {
+                bail!("input is yuv422p, which needs an even width, got {width}x{height}");
+            }
+            Ok(pixels * 2)
+        }
+        "yuv444p" => Ok(pixels * 3),
         other => bail!(
             "pixel format {other}: only {} are supported",
             nut::supported_pix_fmts().join(", ")
@@ -5191,6 +5199,38 @@ mod rows_queue_tests {
                 .to_string()
         )));
         std::fs::remove_file(&path).ok();
+    }
+}
+
+#[cfg(test)]
+mod frame_len_tests {
+    use super::frame_len_for;
+    use ffrwd_wasm::nut;
+
+    #[test]
+    fn every_pixel_format_the_wire_carries_has_a_frame_size() {
+        let mut sizes: Vec<(&str, usize)> = nut::supported_pix_fmts()
+            .into_iter()
+            .map(|pix_fmt| (pix_fmt, frame_len_for(pix_fmt, 4, 2).expect(pix_fmt)))
+            .collect();
+        sizes.sort();
+        assert_eq!(
+            sizes,
+            vec![
+                ("rgba", 32),
+                ("yuv420p", 12),
+                ("yuv422p", 16),
+                ("yuv444p", 24)
+            ]
+        );
+    }
+
+    #[test]
+    fn subsampled_chroma_needs_even_sides() {
+        assert!(frame_len_for("yuv420p", 4, 3).is_err());
+        assert!(frame_len_for("yuv422p", 3, 2).is_err());
+        assert_eq!(frame_len_for("yuv422p", 4, 3).unwrap(), 24);
+        assert_eq!(frame_len_for("yuv444p", 3, 3).unwrap(), 27);
     }
 }
 
