@@ -65,7 +65,8 @@
 //! [`DataFilter`] beside [`PacketFilter`].
 //!
 //! 0.18.0 adds `encoder` and `decoder`, a codec package's frames-to-packets
-//! and packets-to-frames: every other interface is 0.17.0's unchanged.
+//! and packets-to-frames, hosted by [`Encoder`] and [`Decoder`]: every other
+//! interface is 0.17.0's unchanged.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -368,6 +369,33 @@ mod world_0180 {
             path: "../wit",
             world: "data-filter-module",
             with: { "ffrwd:av/types": crate::runtime::world_0180::video::ffrwd::av::types },
+        });
+    }
+    pub mod encoder {
+        wasmtime::component::bindgen!({
+            path: "../wit",
+            world: "encoder-module",
+            with: { "ffrwd:av/types": crate::runtime::world_0180::video::ffrwd::av::types },
+        });
+    }
+    pub mod decoder {
+        wasmtime::component::bindgen!({
+            path: "../wit",
+            world: "decoder-module",
+            with: { "ffrwd:av/types": crate::runtime::world_0180::video::ffrwd::av::types },
+        });
+    }
+    // Both halves at once, sharing the two single-export expansions' types
+    // so one conversion serves a module whichever codec world it declared.
+    pub mod codec {
+        wasmtime::component::bindgen!({
+            path: "../wit",
+            world: "codec-module",
+            with: {
+                "ffrwd:av/types": crate::runtime::world_0180::video::ffrwd::av::types,
+                "ffrwd:av/encoder": crate::runtime::world_0180::encoder::exports::ffrwd::av::encoder,
+                "ffrwd:av/decoder": crate::runtime::world_0180::decoder::exports::ffrwd::av::decoder,
+            },
         });
     }
 }
@@ -5918,6 +5946,659 @@ impl DataFilter {
             }
         }
         Ok(DataProcessed { outputs, rows })
+    }
+}
+
+/// What a codec package's encoder publishes without being opened: the
+/// frames it takes (in `meta`), and what it writes.
+#[derive(Debug, Clone)]
+pub struct DescribedEncoder {
+    pub meta: Meta,
+    /// The codec's own name: "pyrowave".
+    pub codec: String,
+    /// The four-character tag a container writes for it, checked at describe
+    /// to be exactly four printable ASCII characters.
+    pub fourcc: String,
+    /// Frames taken in before the first packet leaves.
+    pub delay: u32,
+    /// How deep its packets reorder.
+    pub decode_delay: u32,
+    /// For audio, the samples every frame but the last holds; 0 is a run of
+    /// any length, and always 0 for video.
+    pub frame_samples: u32,
+    /// Video or audio, from which of `meta`'s format lists it filled in.
+    pub kind: Kind,
+    /// The wit package version the module was built against.
+    pub world: &'static str,
+}
+
+/// What a codec package's decoder publishes without being opened: the
+/// frames it writes (in `meta`), and the tags it reads.
+#[derive(Debug, Clone)]
+pub struct DescribedDecoder {
+    pub meta: Meta,
+    /// The four-character tags it reads, each checked at describe.
+    pub fourccs: Vec<String>,
+    /// Packets taken in before the first frame leaves.
+    pub delay: u32,
+    /// Video or audio, from which of `meta`'s format lists it filled in.
+    pub kind: Kind,
+    /// The wit package version the module was built against.
+    pub world: &'static str,
+}
+
+/// One raw frame crossing a codec: a video frame's pixels, or a run of
+/// interleaved samples, in the instance's own format.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawFrame {
+    /// When it is presented, in the stream's time base.
+    pub pts: i64,
+    /// How long it is presented, in the stream's time base; None where
+    /// nothing settles it.
+    pub duration: Option<i64>,
+    pub data: Vec<u8>,
+}
+
+/// The frames a decoder writes, as its `init` answered them. The formats
+/// are owned names: a decoder may answer one the wire cannot carry, and
+/// the host refuses that by name rather than this type refusing to hold it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecodedFormat {
+    Video {
+        width: u32,
+        height: u32,
+        pix_fmt: String,
+        /// The colorimetry the decoder declared; None where it did not.
+        color: Option<ColorInfo>,
+    },
+    Audio {
+        sample_rate: u32,
+        channels: u32,
+        /// `f32` or `s16`, interleaved.
+        sample_fmt: String,
+        channel_layout: Option<String>,
+    },
+}
+
+impl DecodedFormat {
+    /// Which kind of frames these are.
+    pub fn kind(&self) -> Kind {
+        match self {
+            DecodedFormat::Video { .. } => Kind::Video,
+            DecodedFormat::Audio { .. } => Kind::Audio,
+        }
+    }
+}
+
+/// Whether the component at `module_path` exports a codec package's
+/// encoder. The interface arrived in 0.18.0, so no earlier world answers.
+pub fn exports_encoder(module_path: &str) -> Result<bool> {
+    let component = compile(module_path)?;
+    Ok(world_exporting(&component, "encoder").is_some())
+}
+
+/// Whether the component at `module_path` exports a codec package's
+/// decoder. The interface arrived in 0.18.0, so no earlier world answers.
+pub fn exports_decoder(module_path: &str) -> Result<bool> {
+    let component = compile(module_path)?;
+    Ok(world_exporting(&component, "decoder").is_some())
+}
+
+/// A codec's tag as a container writes it: exactly four printable ASCII
+/// characters. `who` names the module and the half declaring it.
+fn check_fourcc(tag: &str, who: &str) -> Result<()> {
+    let bytes = tag.as_bytes();
+    if bytes.len() != 4 || !bytes.iter().all(|b| (0x20..=0x7e).contains(b)) {
+        bail!(
+            "{who} declares the tag {tag:?}; a codec's tag is exactly four printable ASCII \
+             characters, what a container writes for it"
+        );
+    }
+    Ok(())
+}
+
+/// The kind a codec half declares, from which of its format lists is
+/// filled in: exactly one of them is. `who` names the module and the half.
+fn codec_kind(meta: &Meta, who: &str) -> Result<Kind> {
+    meta.kind().with_context(|| format!("{who} is refused"))
+}
+
+/// One instantiated codec module: the half or halves it exports. A module
+/// exporting both is instantiated once, through the world carrying both,
+/// and a run drives one half of it.
+enum CodecInstance {
+    Encoder(world_0180::encoder::EncoderModule),
+    Decoder(world_0180::decoder::DecoderModule),
+    Both(world_0180::codec::CodecModule),
+}
+
+/// `$body` against the encoder half of a codec instance, with `$g` bound
+/// to it; None for a module exporting no encoder. The world carrying both
+/// halves makes export types of its own, nominally distinct from the
+/// single-half worlds' even where the wit is one text, so the body is
+/// expanded once per arm rather than shared through a reference.
+macro_rules! on_encoder {
+    ($instance:expr, |$g:ident| $body:expr) => {
+        match $instance {
+            CodecInstance::Encoder(b) => {
+                let $g = b.ffrwd_av_encoder();
+                Some($body)
+            }
+            CodecInstance::Both(b) => {
+                let $g = b.ffrwd_av_encoder();
+                Some($body)
+            }
+            CodecInstance::Decoder(_) => None,
+        }
+    };
+}
+
+/// `on_encoder`, for the decoder half.
+macro_rules! on_decoder {
+    ($instance:expr, |$g:ident| $body:expr) => {
+        match $instance {
+            CodecInstance::Decoder(b) => {
+                let $g = b.ffrwd_av_decoder();
+                Some($body)
+            }
+            CodecInstance::Both(b) => {
+                let $g = b.ffrwd_av_decoder();
+                Some($body)
+            }
+            CodecInstance::Encoder(_) => None,
+        }
+    };
+}
+
+impl CodecInstance {
+    /// The encoder's own `describe()`, checked: a tag of four printable
+    /// ASCII characters, exactly one kind, and no frame size on a video
+    /// encoder.
+    fn describe_encoder(
+        &self,
+        store: &mut Store<Host>,
+        module_path: &str,
+    ) -> Result<DescribedEncoder> {
+        let answered = on_encoder!(self, |g| g.call_describe(&mut *store).map(|d| {
+            let meta = world_0180::meta(d.meta);
+            (
+                meta,
+                d.codec,
+                d.fourcc,
+                d.delay,
+                d.decode_delay,
+                d.frame_samples,
+            )
+        }));
+        let Some(answered) = answered else {
+            bail!("{module_path} exports no {}", interface("encoder", WORLD));
+        };
+        let (meta, codec, fourcc, delay, decode_delay, frame_samples) =
+            answered.map_err(wasm_err)?;
+        let who = format!("{module_path}: encoder {}", meta.name);
+        let kind = codec_kind(&meta, &who)?;
+        check_fourcc(&fourcc, &who)?;
+        if kind == Kind::Video && frame_samples != 0 {
+            bail!(
+                "{who} is video and declares frame-samples {frame_samples}; a video encoder \
+                 takes whole frames, so it is 0"
+            );
+        }
+        Ok(DescribedEncoder {
+            meta,
+            codec,
+            fourcc,
+            delay,
+            decode_delay,
+            frame_samples,
+            kind,
+            world: "0.18.0",
+        })
+    }
+
+    /// The decoder's own `describe()`, checked: at least one tag, each of
+    /// four printable ASCII characters, and exactly one kind.
+    fn describe_decoder(
+        &self,
+        store: &mut Store<Host>,
+        module_path: &str,
+    ) -> Result<DescribedDecoder> {
+        let answered = on_decoder!(self, |g| g.call_describe(&mut *store).map(|d| (
+            world_0180::meta(d.meta),
+            d.fourccs,
+            d.delay
+        )));
+        let Some(answered) = answered else {
+            bail!("{module_path} exports no {}", interface("decoder", WORLD));
+        };
+        let (meta, fourccs, delay) = answered.map_err(wasm_err)?;
+        let who = format!("{module_path}: decoder {}", meta.name);
+        let kind = codec_kind(&meta, &who)?;
+        if fourccs.is_empty() {
+            bail!("{who} declares no tag, so no stream is one it reads");
+        }
+        for tag in &fourccs {
+            check_fourcc(tag, &who)?;
+        }
+        Ok(DescribedDecoder {
+            meta,
+            fourccs,
+            delay,
+            kind,
+            world: "0.18.0",
+        })
+    }
+}
+
+/// Compiles and instantiates the component at `module_path` against the
+/// codec world its exports say: the encoder's, the decoder's, or the one
+/// carrying both. Linked like every other module, so a codec importing
+/// `wasi:webgpu` is refused a run without its `-gpu` grant and handed the
+/// GPU with one.
+fn instantiate_codec(module_path: &str, purpose: Purpose) -> Result<(Store<Host>, CodecInstance)> {
+    let component = compile(module_path)?;
+    let encoder = has_export(&component, &interface("encoder", "0.18.0"));
+    let decoder = has_export(&component, &interface("decoder", "0.18.0"));
+    if !encoder && !decoder {
+        let wanted = format!(
+            "{} or {}",
+            interface("encoder", WORLD),
+            interface("decoder", WORLD)
+        );
+        let exports = component_exports(&component);
+        if exports.is_empty() {
+            bail!("{module_path} exports nothing, so neither {wanted}");
+        }
+        bail!(
+            "{module_path} exports neither {wanted}; it exports {}",
+            exports.join(", ")
+        );
+    }
+
+    let (linker, nn, gpu) = link(&component, module_path, purpose)?;
+
+    let policy = egress::net_policy()?;
+    let wasi = wasi_ctx(granted(module_path)?, policy);
+    let mut store = Store::new(
+        engine(),
+        Host {
+            wasi,
+            table: ResourceTable::new(),
+            nn,
+            http: WasiHttpCtx::new(),
+            hooks: egress::Hooks::new(policy),
+            gpu,
+        },
+    );
+    let context = || format!("instantiating {module_path}");
+    let instance = match (encoder, decoder) {
+        (true, true) => CodecInstance::Both(
+            world_0180::codec::CodecModule::instantiate(&mut store, &component, &linker)
+                .map_err(wasm_err)
+                .with_context(context)?,
+        ),
+        (true, false) => CodecInstance::Encoder(
+            world_0180::encoder::EncoderModule::instantiate(&mut store, &component, &linker)
+                .map_err(wasm_err)
+                .with_context(context)?,
+        ),
+        _ => CodecInstance::Decoder(
+            world_0180::decoder::DecoderModule::instantiate(&mut store, &component, &linker)
+                .map_err(wasm_err)
+                .with_context(context)?,
+        ),
+    };
+    Ok((store, instance))
+}
+
+/// Compiles and instantiates the component at `module_path` far enough to
+/// call its encoder's `describe()`, checked, without opening it.
+pub fn describe_encoder(module_path: &str) -> Result<DescribedEncoder> {
+    let (mut store, instance) = instantiate_codec(module_path, Purpose::Describe)?;
+    instance.describe_encoder(&mut store, module_path)
+}
+
+/// Compiles and instantiates the component at `module_path` far enough to
+/// call its decoder's `describe()`, checked, without opening it.
+pub fn describe_decoder(module_path: &str) -> Result<DescribedDecoder> {
+    let (mut store, instance) = instantiate_codec(module_path, Purpose::Describe)?;
+    instance.describe_decoder(&mut store, module_path)
+}
+
+/// A raw frame in this world's spelling.
+fn raw_frame_to_wit(frame: &RawFrame) -> world_0180::video::ffrwd::av::types::RawFrame {
+    world_0180::video::ffrwd::av::types::RawFrame {
+        pts: frame.pts,
+        duration: frame.duration,
+        data: frame.data.clone(),
+    }
+}
+
+/// A packet in this world's spelling.
+fn packet_to_wit(packet: &Packet) -> world_0180::video::ffrwd::av::types::Packet {
+    world_0180::video::ffrwd::av::types::Packet {
+        pts: packet.pts,
+        dts: packet.dts,
+        duration: packet.duration,
+        keyframe: packet.keyframe,
+        data: packet.data.clone(),
+    }
+}
+
+/// One instantiated encoder: raw frames in presentation order in, coded
+/// packets in decode order out. Single-threaded by contract, like
+/// [`PacketFilter`]: one instance, called in sequence.
+pub struct Encoder {
+    store: Store<Host>,
+    instance: CodecInstance,
+    described: DescribedEncoder,
+    /// The stream `init` answered; None until it has been called.
+    stream: Option<CodedStream>,
+    /// The last dts a packet carried, for the check that it never steps
+    /// back.
+    last_dts: Option<i64>,
+    /// Whether the final call has been made, which may happen once.
+    finished: bool,
+}
+
+impl Encoder {
+    /// Compiles (cached process-wide by path) and instantiates the component
+    /// at `module_path` and reads its encoder's description, checked. `init`
+    /// is not yet called: a host settles the input's format from what this
+    /// publishes first.
+    pub fn load(module_path: &str) -> Result<Encoder> {
+        let (mut store, instance) = instantiate_codec(module_path, Purpose::Run)?;
+        let described = instance.describe_encoder(&mut store, module_path)?;
+        Ok(Encoder {
+            store,
+            instance,
+            described,
+            stream: None,
+            last_dts: None,
+            finished: false,
+        })
+    }
+
+    /// What the encoder published, read once at load.
+    pub fn described(&self) -> &DescribedEncoder {
+        &self.described
+    }
+
+    /// Module name from `describe()`, for error messages.
+    pub fn name(&self) -> &str {
+        &self.described.meta.name
+    }
+
+    /// `init`, once: the frames it takes, which must be the kind it declared
+    /// in a format it listed, the stream they belong to, and for video the
+    /// stream's nominal frame rate as `num/den` where something says it. An
+    /// audio instance is handed none whatever the caller had, and a rate
+    /// that is not positive is refused. Answers the coded stream it writes,
+    /// which must be the same kind.
+    pub fn init(
+        &mut self,
+        format: &Format,
+        info: &StreamInfo,
+        frame_rate: Option<(i32, i32)>,
+        params: &str,
+    ) -> Result<CodedStream> {
+        let name = self.described.meta.name.clone();
+        if self.stream.is_some() {
+            bail!("{name}: init called twice; an encoder is opened once");
+        }
+        check_accepts(&self.described.meta, self.described.kind, format)?;
+        let frame_rate = match (format.media, frame_rate) {
+            (Media::Video(_), Some((num, den))) => {
+                if num <= 0 || den <= 0 {
+                    bail!("{name}: frame rate {num}/{den} is not a positive rate");
+                }
+                Some(world_0180::video::ffrwd::av::types::Rational { num, den })
+            }
+            _ => None,
+        };
+        let wit_format = world_0180::format(format);
+        let wit_info = world_0180::stream_info(info, format.time_base, &name)?;
+        let store = &mut self.store;
+        let answered = on_encoder!(&self.instance, |g| g.call_init(
+            &mut *store,
+            &wit_format,
+            &wit_info,
+            frame_rate,
+            params
+        ))
+        .expect("loaded for its encoder")
+        .map_err(wasm_err)?
+        .map_err(|e| anyhow!("{name} refused to open: {e}"))?;
+        let stream = conv_0180::coded_stream_from_wit(answered, &name)?;
+        let answered_kind = stream.format.kind();
+        let taken_kind = format.kind().to_string();
+        if answered_kind != taken_kind {
+            bail!(
+                "{name} takes {taken_kind} frames and answered a {answered_kind} coded stream; \
+                 an encoder writes the kind it reads"
+            );
+        }
+        self.stream = Some(stream.clone());
+        Ok(stream)
+    }
+
+    /// Frames through the encoder, in presentation order. `last` marks the
+    /// final call, which happens once and may carry no frame; every frame
+    /// still held leaves on it. Answers the packets that left, in decode
+    /// order: a dts, where one is given, never steps back.
+    pub fn encode(&mut self, frames: &[RawFrame], last: bool) -> Result<Vec<Packet>> {
+        let name = self.described.meta.name.clone();
+        if self.stream.is_none() {
+            bail!("{name}: encode called before init");
+        }
+        if self.finished {
+            bail!("{name}: called again after the final call, which happens once");
+        }
+        self.finished = last;
+        let carried: Vec<_> = frames.iter().map(raw_frame_to_wit).collect();
+        let store = &mut self.store;
+        let packets = on_encoder!(&self.instance, |g| g.call_encode(
+            &mut *store,
+            &carried,
+            last
+        ))
+        .expect("loaded for its encoder")
+        .map_err(wasm_err)?
+        .map_err(|e| anyhow!("{name}: {e}"))?;
+        let mut left = Vec::with_capacity(packets.len());
+        for p in packets {
+            if let Some(dts) = p.dts {
+                if let Some(before) = self.last_dts {
+                    if dts < before {
+                        bail!(
+                            "{name}: wrote a packet at dts {dts} after one at {before}; packets \
+                             leave in decode order, so a dts never steps back"
+                        );
+                    }
+                }
+                self.last_dts = Some(dts);
+            }
+            left.push(Packet {
+                pts: p.pts,
+                dts: p.dts,
+                duration: p.duration,
+                keyframe: p.keyframe,
+                data: p.data,
+            });
+        }
+        Ok(left)
+    }
+}
+
+/// One instantiated decoder: coded packets in decode order in, raw frames in
+/// presentation order out. Single-threaded by contract, like [`Encoder`].
+pub struct Decoder {
+    store: Store<Host>,
+    instance: CodecInstance,
+    described: DescribedDecoder,
+    /// The frames `init` answered; None until it has been called.
+    format: Option<DecodedFormat>,
+    /// The last pts a frame carried, for the check that frames leave in
+    /// presentation order.
+    last_pts: Option<i64>,
+    /// Whether the final call has been made, which may happen once.
+    finished: bool,
+}
+
+impl Decoder {
+    /// Compiles (cached process-wide by path) and instantiates the component
+    /// at `module_path` and reads its decoder's description, checked. `init`
+    /// is not yet called.
+    pub fn load(module_path: &str) -> Result<Decoder> {
+        let (mut store, instance) = instantiate_codec(module_path, Purpose::Run)?;
+        let described = instance.describe_decoder(&mut store, module_path)?;
+        Ok(Decoder {
+            store,
+            instance,
+            described,
+            format: None,
+            last_pts: None,
+            finished: false,
+        })
+    }
+
+    /// What the decoder published, read once at load.
+    pub fn described(&self) -> &DescribedDecoder {
+        &self.described
+    }
+
+    /// Module name from `describe()`, for error messages.
+    pub fn name(&self) -> &str {
+        &self.described.meta.name
+    }
+
+    /// `init`, once: the coded stream as the container declared it, its tag
+    /// in `codec`. The tag must be one the decoder reads and the stream the
+    /// kind it declared. Answers the frames it writes, which must be that
+    /// kind in a format it listed.
+    pub fn init(
+        &mut self,
+        coded: &CodedStream,
+        info: &StreamInfo,
+        params: &str,
+    ) -> Result<DecodedFormat> {
+        let name = self.described.meta.name.clone();
+        if self.format.is_some() {
+            bail!("{name}: init called twice; a decoder is opened once");
+        }
+        if !self.described.fourccs.contains(&coded.codec) {
+            bail!(
+                "{name} reads the tags {}, and this stream carries {}",
+                self.described.fourccs.join(", "),
+                coded.codec
+            );
+        }
+        let declared = self.described.kind.to_string();
+        if coded.format.kind() != declared {
+            bail!(
+                "{name} decodes {declared}, and this {} stream is {}",
+                coded.codec,
+                coded.format.kind()
+            );
+        }
+        let wit_coded = conv_0180::coded_stream_to_wit(coded, &name)?;
+        let wit_info = world_0180::stream_info(info, coded.time_base, &name)?;
+        let store = &mut self.store;
+        let answered = on_decoder!(&self.instance, |g| g.call_init(
+            &mut *store,
+            &wit_coded,
+            &wit_info,
+            params
+        ))
+        .expect("loaded for its decoder")
+        .map_err(wasm_err)?
+        .map_err(|e| anyhow!("{name} refused to open: {e}"))?;
+        use world_0180::video::ffrwd::av::types::Format as Wit;
+        let meta = &self.described.meta;
+        let format = match answered {
+            Wit::Video(v) => {
+                if !meta.pixel_formats.contains(&v.pix_fmt) {
+                    bail!(
+                        "{name} answered pixel format {}, which it does not list; it lists {}",
+                        v.pix_fmt,
+                        meta.pixel_formats.join(", ")
+                    );
+                }
+                DecodedFormat::Video {
+                    width: v.width,
+                    height: v.height,
+                    pix_fmt: v.pix_fmt,
+                    color: v.color.map(conv_0180::color_info_from_wit),
+                }
+            }
+            Wit::Audio(a) => {
+                if !meta.sample_formats.contains(&a.sample_fmt) {
+                    bail!(
+                        "{name} answered sample format {}, which it does not list; it lists {}",
+                        a.sample_fmt,
+                        meta.sample_formats.join(", ")
+                    );
+                }
+                DecodedFormat::Audio {
+                    sample_rate: a.sample_rate,
+                    channels: a.channels,
+                    sample_fmt: a.sample_fmt,
+                    channel_layout: a.channel_layout,
+                }
+            }
+        };
+        if format.kind() != self.described.kind {
+            bail!(
+                "{name} decodes {declared} and answered {} frames",
+                format.kind()
+            );
+        }
+        self.format = Some(format.clone());
+        Ok(format)
+    }
+
+    /// Packets through the decoder, in decode order. `last` marks the final
+    /// call, which happens once and may carry no packet; every frame still
+    /// held leaves on it. Answers the frames that left, in presentation
+    /// order: a pts never steps back.
+    pub fn decode(&mut self, packets: &[Packet], last: bool) -> Result<Vec<RawFrame>> {
+        let name = self.described.meta.name.clone();
+        if self.format.is_none() {
+            bail!("{name}: decode called before init");
+        }
+        if self.finished {
+            bail!("{name}: called again after the final call, which happens once");
+        }
+        self.finished = last;
+        let carried: Vec<_> = packets.iter().map(packet_to_wit).collect();
+        let store = &mut self.store;
+        let frames = on_decoder!(&self.instance, |g| g.call_decode(
+            &mut *store,
+            &carried,
+            last
+        ))
+        .expect("loaded for its decoder")
+        .map_err(wasm_err)?
+        .map_err(|e| anyhow!("{name}: {e}"))?;
+        let mut left = Vec::with_capacity(frames.len());
+        for f in frames {
+            if let Some(before) = self.last_pts {
+                if f.pts < before {
+                    bail!(
+                        "{name}: wrote a frame at pts {} after one at {before}; frames leave in \
+                         presentation order",
+                        f.pts
+                    );
+                }
+            }
+            self.last_pts = Some(f.pts);
+            left.push(RawFrame {
+                pts: f.pts,
+                duration: f.duration,
+                data: f.data,
+            });
+        }
+        Ok(left)
     }
 }
 

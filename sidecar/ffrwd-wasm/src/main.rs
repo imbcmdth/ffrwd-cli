@@ -12,6 +12,7 @@
 //! same windowed driver over a DAG of nodes - a single module is a network of
 //! one.
 
+mod codec;
 mod graph;
 mod heartbeat;
 mod network;
@@ -355,6 +356,12 @@ struct Args {
     /// machine's effective core count either way; the cap only lowers it,
     /// and `-jobs 1` is the serial escape hatch.
     jobs: Option<usize>,
+    /// `-codec`: which half of a codec package's module runs. Needed only
+    /// for a module exporting both an encoder and a decoder.
+    codec: Option<codec::CodecHalf>,
+    /// `-frame_rate`: the stream's nominal frame rate as `num/den`, which an
+    /// encoder is handed at init. Only an encode run takes one.
+    frame_rate: Option<(i32, i32)>,
 }
 
 /// `-pad`'s JSON, following one packet sink `-i`: which relation row this
@@ -637,6 +644,8 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
     let mut annotations = Annotations::default();
     let mut rows_in: Vec<RowsInput> = Vec::new();
     let mut jobs: Option<usize> = None;
+    let mut codec_half: Option<codec::CodecHalf> = None;
+    let mut frame_rate: Option<(i32, i32)> = None;
     // What the `-rows` before the next output said, if one was given.
     let mut pending_rows: Option<usize> = None;
     // What the `-track` before the next output said, if one was given.
@@ -782,6 +791,20 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
                 }
                 jobs = Some(parsed);
             }
+            // Which half of a codec package's module this run drives.
+            "-codec" => {
+                if codec_half.is_some() {
+                    bail!("second -codec specified");
+                }
+                codec_half = Some(codec::CodecHalf::parse(&next("-codec")?)?);
+            }
+            // The nominal frame rate an encoder is handed at init.
+            "-frame_rate" => {
+                if frame_rate.is_some() {
+                    bail!("second -frame_rate specified");
+                }
+                frame_rate = Some(codec::parse_frame_rate(&next("-frame_rate")?)?);
+            }
             "-y" => {}
             // "-" alone is the stdin/stdout shorthand, not a flag.
             other if other != "-" && other.starts_with('-') => bail!("unknown flag: {other}"),
@@ -868,6 +891,8 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
         rows_in,
         rows_chain,
         jobs,
+        codec: codec_half,
+        frame_rate,
     })
 }
 
@@ -1879,6 +1904,40 @@ fn run(args: &Args) -> Result<()> {
 
     if args.inputs.is_empty() {
         bail!("no input specified (-i)");
+    }
+
+    // A codec package's module is one stream in and one out, read and
+    // written in sequence, so it rides alone like a packet filter does.
+    let codec_module = match &args.modules {
+        Modules::Single { path, .. } => {
+            ffrwd_wasm_runtime::runtime::exports_encoder(path)
+                .with_context(|| format!("opening module {path}"))?
+                || ffrwd_wasm_runtime::runtime::exports_decoder(path)
+                    .with_context(|| format!("opening module {path}"))?
+        }
+        Modules::Network { .. } => false,
+    };
+    if let (Modules::Single { path, params }, true) = (&args.modules, codec_module) {
+        return codec::run_codec(args, path, params);
+    }
+    if args.frame_rate.is_some() {
+        bail!("-frame_rate is handed to a codec package's encoder, and this run hosts none");
+    }
+    if let Some(half) = args.codec {
+        let flag = match half {
+            codec::CodecHalf::Encode => "encode",
+            codec::CodecHalf::Decode => "decode",
+        };
+        match &args.modules {
+            Modules::Single { path, .. } => bail!(
+                "-codec {flag} names which half of a codec package's module runs; {path} exports \
+                 neither an encoder nor a decoder"
+            ),
+            Modules::Network { .. } => bail!(
+                "-codec {flag} names which half of a codec package's module runs, and a codec \
+                 rides alone rather than in a network"
+            ),
+        }
     }
 
     // A data filter is dispatched before any header is read here, for the
@@ -4290,6 +4349,37 @@ struct Description {
     /// The older spelling of `reads_rows`, present only when it is true.
     #[serde(skip_serializing_if = "is_false")]
     meta: bool,
+    /// A codec package's encoder: what it writes and the frames it takes.
+    /// Present only for a module exporting one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    encoder: Option<EncoderDescription>,
+    /// A codec package's decoder: the tags it reads and the frames it
+    /// writes. Present only for a module exporting one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    decoder: Option<DecoderDescription>,
+}
+
+/// A codec package's encoder, as its `describe()` published it, checked.
+#[derive(Serialize)]
+struct EncoderDescription {
+    codec: String,
+    fourcc: String,
+    delay: u32,
+    decode_delay: u32,
+    frame_samples: u32,
+    params_schema: serde_json::Value,
+    pixel_formats: Vec<String>,
+    sample_formats: Vec<String>,
+}
+
+/// A codec package's decoder, as its `describe()` published it, checked.
+#[derive(Serialize)]
+struct DecoderDescription {
+    fourccs: Vec<String>,
+    delay: u32,
+    params_schema: serde_json::Value,
+    pixel_formats: Vec<String>,
+    sample_formats: Vec<String>,
 }
 
 /// One feeder argument, as a window module's `describe()` declared it.
@@ -4348,6 +4438,11 @@ fn describe_module(module_path: &str) -> Result<String> {
         .with_context(|| format!("describing {module_path}"))?;
     let has_data_filter = ffrwd_wasm_runtime::runtime::exports_data_filter(module_path)
         .with_context(|| format!("describing {module_path}"))?;
+    let has_encoder = ffrwd_wasm_runtime::runtime::exports_encoder(module_path)
+        .with_context(|| format!("describing {module_path}"))?;
+    let has_decoder = ffrwd_wasm_runtime::runtime::exports_decoder(module_path)
+        .with_context(|| format!("describing {module_path}"))?;
+    let has_codec = has_encoder || has_decoder;
 
     let has_frames = has_filter || has_window;
     if !has_frames
@@ -4357,6 +4452,7 @@ fn describe_module(module_path: &str) -> Result<String> {
         && !has_source
         && !has_rows_module
         && !has_data_filter
+        && !has_codec
     {
         let exports = ffrwd_wasm_runtime::runtime::exports(module_path)?;
         if exports.is_empty() {
@@ -4364,7 +4460,8 @@ fn describe_module(module_path: &str) -> Result<String> {
         }
         bail!(
             "{module_path} exports neither a filter, a packet sink, a packet filter, a packet \
-             source, a rows module, a data filter, nor value functions; it exports {}",
+             source, a rows module, a data filter, an encoder, a decoder, nor value functions; \
+             it exports {}",
             exports.join(", ")
         );
     }
@@ -4438,6 +4535,35 @@ fn describe_module(module_path: &str) -> Result<String> {
         );
     }
 
+    // A codec package's module is an encoder, a decoder or both, and the
+    // host drives it in place of ffmpeg's own codec; like a rows module, it
+    // may share only `values`.
+    if has_codec
+        && (has_frames
+            || has_packet
+            || has_packet_filter
+            || has_source
+            || has_rows_module
+            || has_data_filter)
+    {
+        bail!(
+            "{module_path} exports a codec alongside {}; a module is one or the other",
+            if has_frames {
+                "a frame interface"
+            } else if has_packet {
+                "a packet sink"
+            } else if has_packet_filter {
+                "a packet filter"
+            } else if has_source {
+                "a packet source"
+            } else if has_rows_module {
+                "a rows module"
+            } else {
+                "a data filter"
+            }
+        );
+    }
+
     let mut description = Description {
         world: WIT_WORLD,
         name: None,
@@ -4483,6 +4609,8 @@ fn describe_module(module_path: &str) -> Result<String> {
             .with_context(|| format!("describing {module_path}"))?,
         functions: Vec::new(),
         meta: false,
+        encoder: None,
+        decoder: None,
     };
 
     if has_frames {
@@ -4637,6 +4765,49 @@ fn describe_module(module_path: &str) -> Result<String> {
         description.data_outputs = Some(described.outputs);
         description.data_time_base = Some([described.time_base.num, described.time_base.den]);
         description.data_filter = true;
+    }
+
+    // The decoder first, so an encoder beside it is what the top-level
+    // fields end up carrying: they are the encoder's when there is one.
+    if has_decoder {
+        let described = ffrwd_wasm_runtime::runtime::describe_decoder(module_path)
+            .with_context(|| format!("describing {module_path}"))?;
+        let meta = described.meta;
+        let params_schema = parse_schema(&meta.params_schema, &meta.name, "params_schema")?;
+        description.params_schema = Some(params_schema.clone());
+        description.pixel_formats = Some(meta.pixel_formats.clone());
+        description.sample_formats = Some(meta.sample_formats.clone());
+        description.version = Some(meta.version);
+        description.name = Some(meta.name);
+        description.decoder = Some(DecoderDescription {
+            fourccs: described.fourccs,
+            delay: described.delay,
+            params_schema,
+            pixel_formats: meta.pixel_formats,
+            sample_formats: meta.sample_formats,
+        });
+    }
+
+    if has_encoder {
+        let described = ffrwd_wasm_runtime::runtime::describe_encoder(module_path)
+            .with_context(|| format!("describing {module_path}"))?;
+        let meta = described.meta;
+        let params_schema = parse_schema(&meta.params_schema, &meta.name, "params_schema")?;
+        description.params_schema = Some(params_schema.clone());
+        description.pixel_formats = Some(meta.pixel_formats.clone());
+        description.sample_formats = Some(meta.sample_formats.clone());
+        description.version = Some(meta.version);
+        description.name = Some(meta.name);
+        description.encoder = Some(EncoderDescription {
+            codec: described.codec,
+            fourcc: described.fourcc,
+            delay: described.delay,
+            decode_delay: described.decode_delay,
+            frame_samples: described.frame_samples,
+            params_schema,
+            pixel_formats: meta.pixel_formats,
+            sample_formats: meta.sample_formats,
+        });
     }
 
     if has_values {

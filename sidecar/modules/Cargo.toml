@@ -45,6 +45,7 @@ members = [
     "source-replay-data",
     "data-echo",
     "data-stamp",
+    "testcodec",
     "source-files",
     "fauxlate",
     "embed-notes",

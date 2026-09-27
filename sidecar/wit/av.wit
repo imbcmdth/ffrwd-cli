@@ -898,7 +898,7 @@ interface data-filter {
 /// wire is its four-character tag: what a container writes for it, and what
 /// a `decoder` names as the tags it reads.
 interface encoder {
-  use types.{coded-stream, format, meta, packet, raw-frame, stream-info};
+  use types.{coded-stream, format, meta, packet, raw-frame, rational, stream-info};
 
   record encoder-meta {
     /// `meta.pixel-formats` or `meta.sample-formats` name the frames it
@@ -928,17 +928,25 @@ interface encoder {
   /// Called once per instance. `format` is the frames it takes: the arm is
   /// its kind, and the pix-fmt or sample-fmt one `meta` named. `info` is the
   /// stream being encoded; its time base is the one frames arrive in.
+  /// `frame-rate` is the stream's nominal frame rate for video, what a
+  /// bitrate-driven encoder divides its budget by; none for audio, and where
+  /// nothing says it.
   ///
   /// Answers the coded stream it writes: `codec` its own name, the time base
   /// its packets are counted in (ordinarily `info.time-base`), the geometry,
   /// and `extradata`, the codec's out-of-band header, which a container
   /// writes before the first packet.
-  init: func(format: format, info: stream-info, params: string) -> result<coded-stream, string>;
+  init: func(format: format, info: stream-info, frame-rate: option<rational>, params: string) -> result<coded-stream, string>;
 
   /// Frames in presentation order, as many as have arrived. Answers the
   /// packets that left, in decode order, which may be none while the codec
   /// holds frames back. `last` marks the final call, which happens exactly
   /// once and may carry no frame: every frame still held leaves on it.
+  ///
+  /// A video frame's `data` is tightly packed, exactly as ffmpeg's rawvideo
+  /// carries it in NUT: the planes one after another, each row directly
+  /// after the last with no padding between. The host hands the payload
+  /// through unchanged.
   encode: func(frames: list<raw-frame>, last: bool) -> result<list<packet>, string>;
 }
 
