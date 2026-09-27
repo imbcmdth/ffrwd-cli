@@ -1440,8 +1440,9 @@ queue, and a sink's max-lateness.
   `max_spread`. A backlog drained after a slow stage also arrives at
   once but ends near the edge of the budget, so it teaches nothing. A
   steady feed (an SRT or RTMP head) has runs of one picture and a spread
-  of 0. The first run, the reader's own probe backlog as a rule, stands
-  only until another counts.
+  of 0. The first run, and a run as wide as `max_spread`, stand only
+  until a narrower one counts: those are a reader's own probe backlog as
+  a rule, handed on at once as it starts, or a stall.
 - **Arguments.** One video stream; `max_lateness`, named only, in
   seconds, greater than zero, 0.5 when not written; `max_spread`, named
   only, in seconds, zero or more, 2 when not written (room for a relay

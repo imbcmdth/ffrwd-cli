@@ -28,8 +28,9 @@
 //! the edge of the budget, and so teaches nothing. The spread is the widest
 //! of the last [`KEEP`] counted runs, each capped at `max_spread`. A steady
 //! feed's runs are single pictures, so its spread is 0 and it is judged as
-//! it always was; the first run, the reader's own probe backlog as a rule,
-//! is forgotten as soon as another counts.
+//! it always was. Two kinds of run stand only until a narrower one counts:
+//! the first, and one as wide as `max_spread`. Those are a reader's own
+//! probe backlog as a rule, handed on at once when it starts, or a stall.
 //!
 //! Once a second of wall time it writes a row saying what it did, on stderr
 //! behind [`ROW_PREFIX`], where the run that started it reads it:
@@ -145,10 +146,11 @@ pub struct Leaky {
     last_passed: Option<i64>,
     /// The run the latest frame belongs to, still open.
     run: Option<Run>,
-    /// The widths of the last [`KEEP`] counted runs, each capped.
-    widths: VecDeque<f64>,
-    /// How many runs have counted.
-    counted: u64,
+    /// The widths of the last [`KEEP`] counted runs, each capped, and
+    /// whether each stands only until a narrower one counts.
+    widths: VecDeque<(f64, bool)>,
+    /// Whether any run has counted.
+    counted: bool,
     window: Option<Window>,
     clock: Clock,
     report: Report,
@@ -235,7 +237,7 @@ impl Leaky {
             last_passed: None,
             run: None,
             widths: VecDeque::with_capacity(KEEP),
-            counted: 0,
+            counted: false,
             window: None,
             clock,
             report,
@@ -245,7 +247,10 @@ impl Leaky {
     /// How much later than the baseline the input's own delivery makes a
     /// picture: the widest of the last counted runs, 0 before any.
     pub fn spread(&self) -> f64 {
-        self.widths.iter().copied().fold(0.0, f64::max)
+        self.widths
+            .iter()
+            .map(|(width, _)| *width)
+            .fold(0.0, f64::max)
     }
 
     /// Whether the frame at `pts` passes, read against the clock now.
@@ -318,17 +323,18 @@ impl Leaky {
         if run.least > baseline + self.limits.max_lateness / 2.0 {
             return;
         }
-        if self.counted == 1 {
-            // The first run is the reader's own probe backlog as a rule, as
-            // wide as it probed: it stands only until another counts.
-            self.widths.clear();
+        let width = (run.most - run.least).min(self.limits.max_spread);
+        // The first run, and one as wide as the cap: a reader's probe backlog
+        // as a rule, or a stall. Each stands until a narrower run counts.
+        let provisional = !self.counted || width >= self.limits.max_spread;
+        self.counted = true;
+        if !provisional {
+            self.widths.retain(|(_, standing)| !standing);
         }
-        self.counted += 1;
         if self.widths.len() == KEEP {
             self.widths.pop_front();
         }
-        self.widths
-            .push_back((run.most - run.least).min(self.limits.max_spread));
+        self.widths.push_back((width, provisional));
     }
 
     /// One frame through, or None where it was too late.
@@ -659,6 +665,47 @@ mod tests {
         assert_eq!(served[120].1, 2.0);
         assert!((served[150].1 - 0.9637).abs() < 1e-3, "{}", served[150].1);
         assert!((served.last().unwrap().1 - 0.9637).abs() < 1e-3);
+    }
+
+    #[test]
+    fn a_backlog_as_wide_as_the_cap_stands_only_until_a_narrower_run_counts() {
+        // A reader starting hands on the eight seconds it probed in two
+        // pieces, a second's worth and then the other seven, and after them a
+        // group a second as each is made.
+        let feed: Vec<(f64, f64)> = (0..480)
+            .map(|k| {
+                let arriving = match k {
+                    0..=29 => 1_008.3 + f64::from(k) * 1e-4,
+                    30..=239 => 1_008.35 + f64::from(k - 30) * 1e-4,
+                    _ => 1_000.0 + f64::from(k / 30 + 1) + 0.3 + f64::from(k % 30) * 1e-4,
+                };
+                (arriving, made(k))
+            })
+            .collect();
+        let served = Harness::new(0.5).serve(&feed, |_| 1e-4);
+        assert_eq!(dropped(&served), 0);
+        // Judged with the backlog's capped width for one group, then with
+        // the groups' own.
+        assert_eq!(served[240].1, 2.0);
+        assert!((served[270].1 - 0.9637).abs() < 1e-3, "{}", served[270].1);
+    }
+
+    #[test]
+    fn a_feed_whose_groups_are_wider_than_the_cap_keeps_the_cap() {
+        // Two-second groups, 60 pictures each, against a cap of 1.5 s.
+        let feed: Vec<(f64, f64)> = (0..600)
+            .map(|k| {
+                let group = k / 60;
+                let arriving = 1_000.0 + f64::from(group * 2 + 2) + 10.25;
+                (arriving + f64::from(k % 60) * 1e-4, made(k))
+            })
+            .collect();
+        let limits = Limits {
+            max_lateness: 0.5,
+            max_spread: 1.5,
+        };
+        let served = Harness::limited(limits).serve(&feed, |_| 1e-4);
+        assert!(served[120..].iter().all(|(_, spread)| *spread == 1.5));
     }
 
     #[test]
