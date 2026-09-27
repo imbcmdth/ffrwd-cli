@@ -1,0 +1,44 @@
+# The wasmtime host for wasi:webgpu@0.0.1, the synchronous (WASI 0.2) version
+# of the interface, adapted from wasi-gfx-runtime's `wasi-webgpu-wasmtime` at
+# 301716b (the last revision before upstream moved to wasi:webgpu 0.3.0-rc.2,
+# which is WASI 0.3 and needs an async store). See README.md for what changed.
+#
+# The sidecar hosts every module on a synchronous store, and a 0.3 host
+# function would make every store that links it async-only, so this is the
+# version it can host. Upstream's 0.3 crate is already on wasmtime 48; when
+# the sidecar's stores go async this copy should give way to it.
+
+[package]
+name = "wasi-webgpu-wasmtime"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0 WITH LLVM-exception"
+description = "Wasmtime host for wasi:webgpu@0.0.1 over wgpu-core, compute only (vendored for ffrwd)"
+publish = false
+
+[dependencies]
+wasmtime = { version = "48", default-features = false, features = ["component-model", "runtime", "std"] }
+wasmtime-wasi-io = { version = "48", default-features = false }
+wgpu-types = "29"
+async-broadcast = "0.7"
+async-trait = "0.1"
+log = "0.4"
+
+# One backend set per platform. Windows carries Vulkan beside D3D12 because
+# wgpu's D3D12 backend reports no subgroups without a DXC it can load, and
+# compute modules (pyrowave) need subgroups; the host tries Vulkan first.
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies.wgpu-core]
+version = "29"
+features = ["wgsl", "vulkan"]
+
+[target.'cfg(target_os = "windows")'.dependencies.wgpu-core]
+version = "29"
+features = ["wgsl", "vulkan", "dx12"]
+
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies.wgpu-core]
+version = "29"
+features = ["wgsl", "metal"]
+
+[target.'cfg(all(not(target_os = "linux"), not(target_os = "android"), not(target_os = "windows"), not(target_os = "macos"), not(target_os = "ios")))'.dependencies.wgpu-core]
+version = "29"
+features = ["wgsl", "gles"]

@@ -1,0 +1,8 @@
+// What the host implements: wasi:webgpu@0.0.1, and wasi:graphics-context,
+// which webgpu's types name and which this host answers with refusals.
+package ffrwd:webgpu-host;
+
+world host {
+  include wasi:webgpu/imports@0.0.1;
+  include wasi:graphics-context/imports@0.0.1;
+}
