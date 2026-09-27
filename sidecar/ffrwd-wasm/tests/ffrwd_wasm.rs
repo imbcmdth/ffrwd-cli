@@ -5074,7 +5074,14 @@ fn leaky_drops_the_frames_a_stall_made_late_and_reports_on_stderr() {
                 .expect("write NUT frame");
             muxer.flush().expect("flush NUT");
         };
+        // Three sent as they are made, each on its own: the node learns that
+        // its input hands on one picture at a time. (Sent at once, these and
+        // the three a second later would be a relay's first two deliveries,
+        // which it passes while it learns.)
         for k in 0..3 {
+            if k > 0 {
+                thread::sleep(Duration::from_millis(40));
+            }
             send(k);
         }
         // A stall: the next three were made while nothing was sent, and

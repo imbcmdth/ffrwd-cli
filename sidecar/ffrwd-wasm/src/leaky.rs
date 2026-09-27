@@ -8,13 +8,14 @@
 //!
 //! A live pipeline stamps its pts onto the Unix epoch, so a frame's LATENESS
 //! is the wall clock less its pts, in seconds. The smallest lateness seen so
-//! far is the BASELINE: what a sender that started late, or a relay in
-//! between, adds to every frame alike. A frame later than the baseline by
-//! more than its SPREAD plus `max_lateness` is dropped; every other frame
-//! passes at once, pixels, pts and rows untouched. Nothing is held and
-//! nothing is reordered, so what leaves is the stream that arrived with its
-//! late frames taken out. A frame behind one already passed is dropped too:
-//! the output's timestamps never decrease.
+//! far, after a first delivery of several pictures (below), is the
+//! BASELINE: what a sender that started late, or a relay in between, adds
+//! to every frame alike. A frame later than the baseline by more than its
+//! SPREAD plus `max_lateness` is dropped; every other frame passes at once,
+//! pixels, pts and rows untouched. Nothing is held and nothing is
+//! reordered, so what leaves is the stream that arrived with its late
+//! frames taken out. A frame behind one already passed is dropped too: the
+//! output's timestamps never decrease.
 //!
 //! The spread is what the input's own delivery adds. A relay that hands on a
 //! whole group of pictures at once (MoQ hands a subscriber a second of them
@@ -31,6 +32,28 @@
 //! it always was. Two kinds of run stand only until a narrower one counts:
 //! the first, and one as wide as `max_spread`. Those are a reader's own
 //! probe backlog as a rule, handed on at once when it starts, or a stall.
+//!
+//! A leaf's first delivery is shaped by its own start more than by the
+//! relay's pace: the piece of a group made so far when it joined, handed
+//! on at once, and as a rule read before the decoder's queue has filled.
+//! It is narrower than the groups after it, and fresher: each later
+//! group's freshest picture is read behind the pictures the decoder holds
+//! back and the ones handed on before it. Judged against the baseline that
+//! piece set, a leaf of the SMART demo found no group ending within half of
+//! `max_lateness` of it for 24 s, so it kept the piece's spread and dropped
+//! the oldest 12 pictures of every group. So a first run of more than one
+//! picture stands for its freshness as it does for its width: when it
+//! ends, the baseline starts over from the picture after it.
+//!
+//! And the node LEARNS first: until [`LEARN`] runs have counted, or a run
+//! of one picture after the first, and for no longer than `max_spread` plus
+//! `max_lateness` seconds from its first picture. Meanwhile it drops only a
+//! picture later than the baseline by more than `max_spread` plus
+//! `max_lateness`, and a run begun then counts when its freshest picture is
+//! within `max_lateness` of the baseline, one that would pass with no
+//! spread at all. A steady feed, and a stage too slow from its first
+//! picture, read runs of one picture, so the node stops learning at its
+//! third picture and is judged as it always was.
 //!
 //! Once a second of wall time it writes a row saying what it did, on stderr
 //! behind [`ROW_PREFIX`], where the run that started it reads it:
@@ -69,6 +92,10 @@ const DEFAULT_MAX_SPREAD: f64 = 2.0;
 
 /// How many counted runs the spread is the widest of.
 pub const KEEP: usize = 8;
+
+/// How many runs the node counts while it learns: its first delivery and
+/// two after it.
+pub const LEARN: usize = 3;
 
 /// What a row on stderr starts with, so a reader tells it from the log.
 pub const ROW_PREFIX: &str = "ffrwd:row ";
@@ -109,13 +136,16 @@ struct Window {
     dropped: u64,
 }
 
-/// Pictures arriving faster than they were made: when the latest was read
-/// and made, and the most and least lateness among them.
+/// Pictures arriving faster than they were made: how many, when the latest
+/// was read and made, the most and least lateness among them, and whether
+/// the node was learning when the first was read.
 struct Run {
+    pictures: usize,
     wall: f64,
     at: f64,
     most: f64,
     least: f64,
+    learning: bool,
 }
 
 /// What a node is opened with, in seconds.
@@ -149,8 +179,10 @@ pub struct Leaky {
     /// The widths of the last [`KEEP`] counted runs, each capped, and
     /// whether each stands only until a narrower one counts.
     widths: VecDeque<(f64, bool)>,
-    /// Whether any run has counted.
-    counted: bool,
+    /// How many runs have counted, up to [`LEARN`].
+    counted: usize,
+    /// When the first picture was read.
+    first: Option<f64>,
     window: Option<Window>,
     clock: Clock,
     report: Report,
@@ -237,7 +269,8 @@ impl Leaky {
             last_passed: None,
             run: None,
             widths: VecDeque::with_capacity(KEEP),
-            counted: false,
+            counted: 0,
+            first: None,
             window: None,
             clock,
             report,
@@ -253,17 +286,40 @@ impl Leaky {
             .fold(0.0, f64::max)
     }
 
+    /// Whether the node is still learning its spread at `now`: fewer than
+    /// [`LEARN`] runs have counted, none of one picture but the first, and
+    /// its first picture was read less than `max_spread` plus `max_lateness`
+    /// seconds ago.
+    pub fn learning(&self, now: f64) -> bool {
+        let Limits {
+            max_lateness,
+            max_spread,
+        } = self.limits;
+        max_spread > 0.0
+            && self.counted < LEARN
+            && self
+                .first
+                .is_none_or(|first| now - first < max_spread + max_lateness)
+    }
+
     /// Whether the frame at `pts` passes, read against the clock now.
     pub fn judge(&mut self, pts: i64) -> bool {
         let now = (self.clock)();
         let at = pts as f64 * self.time_base.num as f64 / self.time_base.den.max(1) as f64;
         let lateness = now - at;
+        self.first.get_or_insert(now);
         self.follow(now, at, lateness);
         let baseline = self.baseline.map_or(lateness, |seen| seen.min(lateness));
         self.baseline = Some(baseline);
         self.lateness = lateness;
         let behind = self.last_passed.is_some_and(|last| pts < last);
-        let budget = self.spread() + self.limits.max_lateness;
+        // While it learns, it drops only what no spread it may learn would pass.
+        let spread = if self.learning(now) {
+            self.limits.max_spread
+        } else {
+            self.spread()
+        };
+        let budget = spread + self.limits.max_lateness;
         let passes = !behind && lateness <= baseline + budget;
         if passes {
             self.last_passed = Some(pts);
@@ -296,6 +352,7 @@ impl Leaky {
             // Read less than half its own pts step after the one before: the
             // two arrived faster than they were made, together.
             if at > run.at && now - run.wall < (at - run.at) / 2.0 {
+                run.pictures += 1;
                 run.wall = now;
                 run.at = at;
                 run.most = run.most.max(lateness);
@@ -307,27 +364,47 @@ impl Leaky {
             self.close(&run);
         }
         self.run = Some(Run {
+            pictures: 1,
             wall: now,
             at,
             most: lateness,
             least: lateness,
+            learning: self.learning(now),
         });
     }
 
     /// A run is over. It counts when its freshest picture came within half
-    /// of `max_lateness` of the baseline: the node had caught up.
+    /// of `max_lateness` of the baseline: the node had caught up. A run begun
+    /// while the node learned counts within all of `max_lateness`: its
+    /// freshest picture would have passed with no spread.
     fn close(&mut self, run: &Run) {
         let Some(baseline) = self.baseline else {
             return;
         };
-        if run.least > baseline + self.limits.max_lateness / 2.0 {
+        // The first run of more than one picture is the node's own start as
+        // a rule: after it, the baseline starts over.
+        if self.counted == 0 && run.pictures > 1 && self.limits.max_spread > 0.0 {
+            self.baseline = None;
+        }
+        let margin = if run.learning {
+            self.limits.max_lateness
+        } else {
+            self.limits.max_lateness / 2.0
+        };
+        if run.least > baseline + margin {
             return;
         }
         let width = (run.most - run.least).min(self.limits.max_spread);
         // The first run, and one as wide as the cap: a reader's probe backlog
         // as a rule, or a stall. Each stands until a narrower run counts.
-        let provisional = !self.counted || width >= self.limits.max_spread;
-        self.counted = true;
+        let provisional = self.counted == 0 || width >= self.limits.max_spread;
+        // A picture on its own after the first: the input hands them on one at
+        // a time, and there is nothing more to learn.
+        self.counted = if self.counted > 0 && run.pictures == 1 {
+            LEARN
+        } else {
+            (self.counted + 1).min(LEARN)
+        };
         if !provisional {
             self.widths.retain(|(_, standing)| !standing);
         }
@@ -765,6 +842,129 @@ mod tests {
         let served = Harness::limited(limits).serve(&bursts(6, 1), |_| 1e-4);
         assert_eq!(served.last().unwrap().1, 0.25);
         assert!(dropped(&served) > 0);
+    }
+
+    /// What it costs the stage behind to take a picture in the SMART demo's
+    /// leaf: a group of 30 all handed on reads as a run 0.865 s wide.
+    const HANDING_ON: f64 = 0.0035;
+
+    /// A leaf joining a relay as the SMART demo's did on Cloudflare. Its
+    /// first delivery is a piece of a group: 11 pictures read 0.3 s wide,
+    /// the freshest 2.6 s after it was made. Then the rest of that group,
+    /// and a group of 30 once a second, each out of the decoder 0.5 ms a
+    /// picture apart, its oldest read `late` s past 2.6 s plus the group's
+    /// own length, so that its freshest is read `late` s past 2.6 s plus
+    /// what handing on the pictures before it takes.
+    fn a_leaf_joining(seconds: u32, late: f64) -> Vec<(f64, f64)> {
+        let piece = (0..11).map(|k| (made(10) + 2.6 - f64::from(10 - k) * 0.0033, made(k)));
+        let groups = (11..seconds * 30).map(|k| {
+            let oldest = if k < 30 { 11 } else { k / 30 * 30 };
+            let newest = k / 30 * 30 + 29;
+            let arriving = made(newest) + 2.6 + late + f64::from(k - oldest) * 5e-4;
+            (arriving, made(k))
+        });
+        piece.chain(groups).collect()
+    }
+
+    #[test]
+    fn a_leaf_whose_first_delivery_is_narrow_learns_its_groups_and_drops_nothing() {
+        // Its groups' freshest pictures are read 0.27 s to 0.31 s past the
+        // baseline the first piece set, more than half of max_lateness.
+        // Judged against that piece from the first picture on, as 0.25.2
+        // judged it, the node kept the piece's 0.3 s and dropped the oldest
+        // 12 of every group, 349 of 900 in 30 s, as the demo's leaf did for
+        // its first 24 s.
+        let feed = a_leaf_joining(30, 0.21);
+        let mut h = Harness::new(0.5);
+        let served = h.serve(&feed, |_| HANDING_ON);
+        assert_eq!(dropped(&served), 0);
+        // The rest of the first group teaches it 0.54 s, and the first whole
+        // group, its third delivery, the groups' own width, by which every
+        // group after is judged.
+        assert!(served[30..60]
+            .iter()
+            .all(|(_, spread)| (spread - 0.537).abs() < 2e-3));
+        assert!(served[60..]
+            .iter()
+            .all(|(_, spread)| (spread - 0.865).abs() < 2e-3));
+        assert!(!h.leaky.learning(feed[60].0));
+        assert!(h.rows().iter().all(|row| row["dropped"] == 0));
+        // The baseline started over after the piece.
+        assert!(h.leaky.baseline.unwrap() > 2.6 + 0.2);
+    }
+
+    #[test]
+    fn a_first_delivery_fresher_than_every_group_after_it_sets_no_baseline() {
+        // Two pictures out of the decoder before its queue has filled, read
+        // 0.8 s fresher than any group after them. Against their baseline
+        // every picture after would be late by more than the budget, however
+        // wide the spread learned.
+        let mut feed: Vec<(f64, f64)> = (9..11)
+            .map(|k| (made(10) + 2.0 - f64::from(10 - k) * 1e-4, made(k)))
+            .collect();
+        feed.extend(a_leaf_joining(12, 0.21).into_iter().skip(11));
+        let mut h = Harness::new(0.5);
+        let served = h.serve(&feed, |_| HANDING_ON);
+        assert_eq!(dropped(&served), 0);
+        let baseline = h.leaky.baseline.unwrap();
+        assert!((2.6 + 0.21..2.6 + 0.3).contains(&baseline), "{baseline}");
+        assert!((h.leaky.spread() - 0.865).abs() < 2e-3);
+    }
+
+    #[test]
+    fn a_steady_feed_stops_learning_at_its_third_picture() {
+        let mut h = Harness::new(0.5);
+        for k in 0..3 {
+            let wall = made(k) + 0.25;
+            assert!(h.leaky.learning(wall));
+            assert!(h.at(wall, made(k)));
+        }
+        assert!(!h.leaky.learning(made(3) + 0.25));
+    }
+
+    #[test]
+    fn a_stage_too_slow_from_the_first_picture_is_judged_as_without_learning() {
+        // A steady feed, and bursts, behind a stage that never keeps up.
+        let steady: Vec<(f64, f64)> = (0..300).map(|k| (made(k) + 0.25, made(k))).collect();
+        for (feed, cost) in [(steady, 0.06), (bursts(10, 1), 0.1)] {
+            let learning = Harness::new(0.5).serve(&feed, |_| cost);
+            let blind = Harness::limited(Limits {
+                max_lateness: 0.5,
+                max_spread: 0.0,
+            })
+            .serve(&feed, |_| cost);
+            let passed = |served: &[(bool, f64)]| -> Vec<bool> {
+                served.iter().map(|(passed, _)| *passed).collect()
+            };
+            assert_eq!(passed(&learning), passed(&blind));
+            assert!(
+                dropped(&learning) > feed.len() / 3,
+                "{}",
+                dropped(&learning)
+            );
+        }
+    }
+
+    #[test]
+    fn learning_lasts_no_longer_than_max_spread_and_max_lateness() {
+        // After a first picture on time, every group's freshest picture is
+        // read 0.6 s past it: no run ends fresh enough to count. Up to 2.5 s
+        // from the first picture it drops nothing; then it stops learning,
+        // with nothing learned, and drops what is past max_lateness.
+        let mut feed = vec![(made(0) + 2.6, made(0))];
+        feed.extend(a_leaf_joining(8, 0.6).into_iter().skip(11));
+        let mut h = Harness::new(0.5);
+        let served = h.serve(&feed, |_| 1e-4);
+        let start = feed[0].0;
+        let (early, late): (Vec<_>, Vec<_>) = feed
+            .iter()
+            .zip(&served)
+            .partition(|((arriving, _), _)| arriving - start < 2.5);
+        assert_eq!(early.len(), 1 + 19);
+        assert!(early.iter().all(|(_, (passed, _))| *passed));
+        assert!(!h.leaky.learning(start + 2.5));
+        assert!(late.iter().filter(|(_, (passed, _))| !passed).count() > late.len() / 2);
+        assert_eq!(h.leaky.spread(), 0.0);
     }
 
     fn video() -> Format {
