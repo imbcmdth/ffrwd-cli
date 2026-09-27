@@ -1308,6 +1308,101 @@ def test_a_live_input_this_compiler_cannot_wire_is_refused(
     assert error.hint is not None
 
 
+def _rated_graph(
+    fps: object = 15, *, audio: bool = False, on_one_leg: bool = False
+) -> Graph:
+    """The same merge with a frame rate change AHEAD of the split, so every
+    leg passes through it; with `audio`, the sound filtered into the same
+    sink, and with `on_one_leg`, a second change on the leg that does not
+    filter."""
+    g = _merge_graph()
+    nodes = {
+        "fps": Node(
+            id="fps", filter="fps", args={"fps": fps}, inputs=["src:a:v:0"], outputs=["video"]
+        ),
+        **g.nodes,
+    }
+    nodes["sp"].inputs = ["fps"]
+    outputs = [_out("n0")]
+    if on_one_leg:
+        nodes["half"] = Node(
+            id="half", filter="fps", args={"fps": 5}, inputs=["sp:1"], outputs=["video"]
+        )
+        nodes["n0"].inputs = ["half", "e0"]
+        order = ("fps", "sp", "e0", "half", "n0")
+        nodes = {name: nodes[name] for name in order}
+    if audio:
+        nodes["loud"] = Node(
+            id="loud",
+            filter="volume",
+            args={"volume": 2},
+            inputs=["src:a:a:0"],
+            outputs=["audio"],
+        )
+        outputs.append(_out("loud", "audio"))
+    g.nodes = nodes
+    g.sinks = [SinkUnit(outputs=outputs, path="out.mkv", options={"video_codec": "ffv1"})]
+    return g
+
+
+def test_a_rate_change_every_leg_shares_cancels_out_of_the_bound() -> None:
+    """Both legs pass through the one `fps` before the split parts them, so
+    it delays both alike: the bound is the merge's own, one frame."""
+    plan = _merged(graph=_rated_graph())
+
+    assert _opens(plan, LIVE) == ["ffmpeg1"]
+    assert "fps" in plan.process("ffmpeg1").graph.nodes  # type: ignore[union-attr]
+    assert {(e.source, e.target): e.bound for e in plan.stream_edges} == {
+        ("ffmpeg1", "ffmpeg0"): 1,
+        ("sidecar0", "ffmpeg0"): 0,
+        ("ffmpeg1", "sidecar0"): 0,
+    }
+
+
+def test_a_rate_change_on_one_leg_past_the_split_is_still_refused() -> None:
+    """The shared change is forgiven; the one on a single leg is not, and it
+    is the one the refusal names."""
+    with pytest.raises(FfrwdError) as caught:
+        _merged(graph=_rated_graph(on_one_leg=True))
+
+    assert caught.value.code is ErrorCode.UNBOUNDED_LIVE_INPUT
+    assert "with 'fps' between them" in caught.value.message
+
+
+@pytest.mark.parametrize(
+    ("fps", "sound"),
+    [
+        # 15 from 30: a picture past the change lasts two of the input's. The
+        # picture path holds the change's own frame, then the sidecar's frame
+        # and ffv1's nothing, two input pictures each: 1 + 2 = 3.
+        (15, 3),
+        # 60 from 30: half an input picture each, 1 + 1/2, rounded up.
+        (60, 2),
+        ("60/1", 2),
+    ],
+)
+def test_sound_beside_a_shared_rate_change_counts_the_pictures_in_the_inputs(
+    fps: object, sound: int
+) -> None:
+    """Pictures and sound part at the demuxer, so no node is common to both.
+    The change every picture passes through is then a change of unit, and
+    with both rates numbers it counts."""
+    plan = _merged(graph=_rated_graph(fps, audio=True))
+    by_ref = {e.ref: e for e in plan.stream_edges if e.source == "ffmpeg1"}
+
+    assert by_ref["loud"].bound == sound
+    assert by_ref["sp:1"].bound == 1
+
+
+def test_sound_beside_a_rate_change_with_no_number_is_refused() -> None:
+    """A rate named rather than numbered is no unit to count in."""
+    with pytest.raises(FfrwdError) as caught:
+        _merged(graph=_rated_graph("ntsc", audio=True))
+
+    assert caught.value.code is ErrorCode.UNBOUNDED_LIVE_INPUT
+    assert "with 'fps' between them" in caught.value.message
+
+
 def test_a_stream_edge_writes_its_bound_and_the_buffer_it_bought() -> None:
     edges = _merged().to_dict()["edges"]
     assert isinstance(edges, list)

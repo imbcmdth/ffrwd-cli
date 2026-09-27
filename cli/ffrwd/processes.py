@@ -84,6 +84,8 @@ where they do not. A stream copied as it was read always takes the pipe.
 A path whose delay cannot be counted -- a module that does not hand on one
 frame per frame it reads, an ffmpeg filter that changes the frame count -- has
 no such difference, and a live input feeding one is refused at compile time.
+Only what lies past the point where the paths part is counted: a frame rate
+change ahead of the reader's split delays every path alike and cancels out.
 
 A payload holds only the split it needs. A `split`/`asplit` whose consumers
 landed in other processes is cut to the pads still read here: one left and the
@@ -100,6 +102,7 @@ import math
 import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from fractions import Fraction
 from typing import Literal
 
 from .errors import ErrorCode, FfrwdError
@@ -1274,6 +1277,26 @@ def _frame_seconds(fps: str | None) -> float | None:
     return 1 / rate if rate > 0 else None
 
 
+def _rate(value: object) -> Fraction | None:
+    """A frame rate as a number: an int, a float, or ``'30000/1001'`` text.
+
+    None for anything else, a named rate or an expression included, and for
+    a rate that is not above zero.
+    """
+    if isinstance(value, bool):
+        return None
+    try:
+        if isinstance(value, int | float):
+            found = Fraction(value)
+        elif isinstance(value, str):
+            found = Fraction(value.strip())
+        else:
+            return None
+    except (ValueError, ZeroDivisionError):
+        return None
+    return found if found > 0 else None
+
+
 def _rounded(size: int) -> int:
     """`size` rounded up to whole buffer steps, and never below one."""
     steps = max((size + PIPE_BUFFER_STEP - 1) // PIPE_BUFFER_STEP, 1)
@@ -2274,13 +2297,6 @@ class _Partitioner:
             None,
         )
 
-    def _leg_delay(self, process: _Pending, ref: FrameRef) -> int | None:
-        """The delay of the chain inside `process` that produces `ref`."""
-        name = _ref_node(ref)
-        if name is None or name not in process.nodes:
-            return 0
-        return self._node_delays(process.nodes)[name]
-
     def _process_delay(self, pid: str) -> int | None:
         """Frames a process holds: the one it is working on, plus its own chains."""
         region = next((s for s in self.sidecars if s.id == pid), None)
@@ -2409,6 +2425,11 @@ class _Partitioner:
         one arrives. The bound is that difference, counted over the process
         delays between the reader and the meeting point, plus the reader's own
         chain for each edge.
+
+        Only what lies past the point where the edges part counts. A filter
+        every one of them passes through delays them all alike and cancels
+        out of the difference, so a frame rate change ahead of the split is
+        no reason to refuse: :meth:`_group_legs` says which stages cancel.
         """
         opened = {p.id: self._opened(p) for p in self.pending}
         readers = [
@@ -2427,48 +2448,212 @@ class _Partitioner:
                 for index, edge in enumerate(self.edges)
                 if edge.source == reader.id
             ]
-            legs = {index: self._edge_leg(reader, edge) for index, edge in outs}
             meeting = {
                 pid
                 for pid in reach
                 if sum(1 for _, edge in outs if pid in reach[edge.target]) > 1
             }
             for pid in sorted(meeting):
-                delays: dict[int, int] = {}
-                for index, edge in outs:
-                    if pid not in reach[edge.target]:
-                        continue
-                    leg, cost = legs[index], self._cost(edge, pid)
-                    if leg is None or cost is None:
-                        raise self._unbounded_refusal(reader, edge, pid)
-                    delays[index] = leg + cost
-                if len(delays) < 2:
+                group = [(index, edge) for index, edge in outs if pid in reach[edge.target]]
+                if len(group) < 2:
                     continue
+                legs, forgiven = self._group_legs(reader, [edge for _, edge in group])
+                delays: dict[int, Fraction] = {}
+                scales: dict[int, Fraction] = {}
+                for (index, edge), leg in zip(group, legs):
+                    cost = self._cost(edge, pid)
+                    if leg is None or cost is None:
+                        raise self._unbounded_refusal(reader, edge, pid, forgiven)
+                    counted, scale = leg
+                    delays[index] = counted + scale * cost
+                    scales[index] = scale
                 slowest = max(delays.values())
                 for index, delay in delays.items():
-                    bounds[index] = max(bounds.get(index, 0), slowest - delay)
+                    # In the edge's own frames: one frame of this edge lasts
+                    # `scale` of the frames the difference was counted in.
+                    held = math.ceil((slowest - delay) / scales[index])
+                    bounds[index] = max(bounds.get(index, 0), held)
         for index, bound in bounds.items():
             edge = self.edges[index]
             self.edges[index] = replace(
                 edge, bound=bound, buffer=self._sized(edge, bound)
             )
 
-    def _edge_leg(self, reader: _Pending, edge: StreamEdge) -> int | None:
-        """One edge's delay inside the reader: its chain, plus any encoder on
-        it and the decoder reordering what that encoder wrote."""
-        leg = self._leg_delay(reader, edge.ref)
-        if leg is None or not _encodes(edge.format):
-            return leg
-        wire = edge.format
-        held = (
-            encoder_delay(wire.codec, dict(wire.options), wire.height)
-            if isinstance(wire, VideoFormat)
-            else 0
-        )
-        return leg + held + ENCODED_EDGE_DELAY
+    def _group_legs(
+        self, reader: _Pending, group: Sequence[StreamEdge]
+    ) -> tuple[list[tuple[Fraction, Fraction] | None], frozenset[str]]:
+        """Each edge's delay inside the reader, counted from where they part.
+
+        A node inside the reader that EVERY path into every edge of `group`
+        passes through -- the chain ahead of the split, the split itself --
+        delays them all alike, so it and everything above it count as
+        nothing. Past it, each edge's chain counts as :meth:`_node_delay`
+        says, and a node that changes the frame count on one edge's path and
+        not on another's still has no size: None for that edge.
+
+        Pictures and sound part at the demuxer, so no node is common to both.
+        A frame rate change that every PICTURE of the group passes through is
+        then not a difference between the pictures, only a change of unit:
+        past it, a picture lasts the input's rate over its own output rate in
+        pictures of the input. Where both rates are numbers the delays past it
+        are counted in the input's pictures, the unit every other edge of the
+        group is counted in, and the change itself holds the one picture it
+        reads before it can decide what to hand on.
+
+        Each entry is the leg in those units, with its SCALE: how many of them
+        one frame of that edge lasts, which the delays past the reader are
+        multiplied by. The frozenset is the nodes forgiven, so a refusal names
+        something else.
+        """
+        names = reader.nodes
+        targets = [
+            name
+            for edge in group
+            if (name := _ref_node(edge.ref)) is not None and name in names
+        ]
+        shared: frozenset[str] = frozenset()
+        if len(targets) == len(group):
+            shared = frozenset.intersection(
+                *(self._dominators(names, target) for target in targets)
+            )
+        conversions: dict[str, Fraction] = {}
+        kinds = {ref_type(self.g, edge.ref) for edge in group}
+        if len(kinds) > 1:
+            for kind in sorted(kinds):
+                same = [
+                    name
+                    for edge in group
+                    if ref_type(self.g, edge.ref) == kind
+                    and (name := _ref_node(edge.ref)) is not None
+                    and name in names
+                ]
+                if not same or len(same) < sum(
+                    1 for edge in group if ref_type(self.g, edge.ref) == kind
+                ):
+                    continue
+                common = frozenset.intersection(
+                    *(self._dominators(names, name) for name in same)
+                )
+                for name in common - shared:
+                    ratio = self._rate_ratio(name)
+                    if ratio is not None:
+                        conversions[name] = ratio
+        counted = self._counted_delays(names, shared, conversions)
+        legs: list[tuple[Fraction, Fraction] | None] = []
+        for edge in group:
+            name = _ref_node(edge.ref)
+            found = (
+                (Fraction(0), Fraction(1))
+                if name is None or name not in names
+                else counted[name]
+            )
+            if found is None:
+                legs.append(None)
+                continue
+            leg, scale = found
+            if _encodes(edge.format):
+                wire = edge.format
+                held = (
+                    encoder_delay(wire.codec, dict(wire.options), wire.height)
+                    if isinstance(wire, VideoFormat)
+                    else 0
+                )
+                leg += scale * (held + ENCODED_EDGE_DELAY)
+            legs.append((leg, scale))
+        return legs, shared | frozenset(conversions)
+
+    def _dominators(self, names: Sequence[str], target: str) -> frozenset[str]:
+        """The nodes of `names` that every path into `target` passes through.
+
+        `target` itself among them. A path starts wherever a node reads
+        something no node of `names` produced, an input or a pipe, or reads
+        nothing at all, as a generator does.
+        """
+        inside = set(names)
+        found = {target}
+        for candidate in names:
+            if candidate == target:
+                continue
+            reached: set[str] = set()
+            for name in names:  # topological
+                if name == candidate:
+                    continue
+                inputs = self.g.nodes[name].inputs
+                producers = [
+                    producer
+                    for ref in inputs
+                    if (producer := _ref_node(ref)) is not None and producer in inside
+                ]
+                if (
+                    not inputs
+                    or len(producers) < len(inputs)
+                    or any(producer in reached for producer in producers)
+                ):
+                    reached.add(name)
+            if target not in reached:
+                found.add(candidate)
+        return frozenset(found)
+
+    def _rate_ratio(self, name: str) -> Fraction | None:
+        """How many of its input's pictures one picture out of `name` lasts.
+
+        Only for an ``fps`` whose own rate and whose input's rate are both
+        numbers; None for anything else that changes the frame count.
+        """
+        node = self.g.nodes[name]
+        if node.filter != "fps" or not node.inputs:
+            return None
+        out = _rate(node.args.get("fps"))
+        meta = self._origin_meta(node.inputs[0])
+        rate_in = _rate(meta.fps) if meta is not None else None
+        if out is None or rate_in is None:
+            return None
+        return rate_in / out
+
+    def _counted_delays(
+        self,
+        names: Sequence[str],
+        shared: frozenset[str],
+        conversions: Mapping[str, Fraction],
+    ) -> dict[str, tuple[Fraction, Fraction] | None]:
+        """:meth:`_node_delays` with `shared` nodes counting as nothing and
+        `conversions` changing the unit, each node with the scale past it."""
+        inside = set(names)
+        best: dict[str, tuple[Fraction, Fraction] | None] = {}
+        for name in names:  # topological
+            if name in shared:
+                best[name] = (Fraction(0), Fraction(1))
+                continue
+            above = Fraction(0)
+            scale: Fraction | None = None
+            blocked = False
+            for ref in self.g.nodes[name].inputs:
+                producer = _ref_node(ref)
+                if producer is None or producer not in inside:
+                    continue
+                found = best[producer]
+                if found is None:
+                    blocked = True
+                    break
+                above = max(above, found[0])
+                scale = found[1] if scale is None else max(scale, found[1])
+            if blocked:
+                best[name] = None
+                continue
+            scale = Fraction(1) if scale is None else scale
+            if name in conversions:
+                best[name] = (above + scale, conversions[name])
+                continue
+            step = self._node_delay(name)
+            best[name] = None if step is None else (above + scale * step, scale)
+        return best
 
     def _unbounded_refusal(
-        self, reader: _Pending, edge: StreamEdge, meeting: str
+        self,
+        reader: _Pending,
+        edge: StreamEdge,
+        meeting: str,
+        forgiven: frozenset[str] = frozenset(),
     ) -> FfrwdError:
         """The rejection for a live input whose paths cannot be counted.
 
@@ -2478,7 +2663,7 @@ class _Partitioner:
         that has no size is the DIFFERENCE between the two.
         """
         alias = next(iter(sorted(self._opened(reader).keys() & self.live)), "")
-        blame = self._unbounded_node(reader.nodes)
+        blame = self._unbounded_node([n for n in reader.nodes if n not in forgiven])
         if blame is None:
             between = sorted(self._downstream()[edge.target] - {meeting})
             blame = next(
