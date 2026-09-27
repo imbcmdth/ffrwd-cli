@@ -3989,6 +3989,10 @@ class _Expander:
         for declared in self.wasm.values():
             if declared.position < 0:  # adopted, so already called
                 continue
+            if declared.is_decoder:
+                # Declaring one is how a script has an input read with it:
+                # a stream carrying a tag it reads is decoded by it unasked.
+                continue
             if declared.name not in self.wasm_used:
                 return declared
         return None

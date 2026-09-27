@@ -305,14 +305,27 @@ def _negotiable(
             continue
         if declared.module not in describes or declared.reads_rows_from_select:
             continue  # a row-reading sink has no single kind; its pads are the rows'
-        if declared.stream_kind != kind:
-            continue
         described = describes[declared.module]
+        if _declared_kind(declared, described) != kind:
+            continue
         if described.packet_sink or described.packet_filter:
             continue  # its edges carry encoded packets, not frames
         seen.add(declared.module)
         found.append(declared)
     return found
+
+
+def _declared_kind(declared: WasmFunction, described: Described) -> str | None:
+    """The kind of stream a declaration's edges carry frames of.
+
+    A codec's is its module's to say, since it takes no stream argument: an
+    encoder's is the kind it takes, a decoder's the kind it writes.
+    """
+    if declared.is_encoder:
+        return described.encoder.kind if described.encoder is not None else None
+    if declared.is_decoder:
+        return described.decoder.kind if described.decoder is not None else None
+    return declared.stream_kind
 
 
 @contextmanager

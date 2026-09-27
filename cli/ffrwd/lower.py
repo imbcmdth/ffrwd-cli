@@ -2512,6 +2512,13 @@ _ENCODER_SHAPING = frozenset(
 _MODULE_CODEC_CONTAINERS = frozenset({_NUT_FORMAT, "mov", "mkv", "mka", "matroska"})
 
 
+def _src_parts(ref: FrameRef) -> tuple[str, StreamType, int]:
+    """A source ref's alias, stream kind and per-kind index."""
+    alias, letter, index = ref[len("src:") :].rsplit(":", 2)
+    kinds: dict[str, StreamType] = {"v": "video", "a": "audio", "s": "subtitle", "d": "data"}
+    return alias, kinds.get(letter, "data"), int(index)
+
+
 def _container_of(options: Mapping[str, object], path: str) -> str:
     """The container a destination writes: its `format` option, else its
     extension. An extensionless path with no format reads as "unnamed"."""
@@ -2767,6 +2774,11 @@ def _input_struct(node: exp.Struct) -> object:
         fields[name] = _input_value(entry.expression)
     return fields
 
+# The input() option naming the codec package's decoder a stream is read with,
+# overriding the one its tag would find. A call, not a value: lowering reads
+# it, and neither ffprobe nor ffmpeg ever sees it.
+DECODER_OPTION = "decoder"
+
 
 def input_option_values(raw_options: Sequence[RawInputOption]) -> dict[str, object]:
     """One ``input()``'s trailing named options as validated scalars.
@@ -2782,7 +2794,7 @@ def input_option_values(raw_options: Sequence[RawInputOption]) -> dict[str, obje
     """
     options: dict[str, object] = {}
     for option in raw_options:
-        if isinstance(_unwrap(option.value), exp.Null):
+        if isinstance(_unwrap(option.value), exp.Null) or option.name == DECODER_OPTION:
             continue
         line, col = _pos(option.name_node, option.value, option.path_node)
         options[option.name] = validate_input_option(
@@ -4203,11 +4215,188 @@ class _Lowerer:
             ]
         self._place_feeders()
         self._place_laterals()
+        self._insert_decoders()
         self._check_every_packet_filter_placed()
         self._check_every_data_output_read()
         self._check_loudnorm2()
         self.graph.input_options = self._lower_input_options()
         return self.graph
+
+    # -- a codec package's decoder ------------------------------------------
+
+    def _insert_decoders(self) -> None:
+        """Decode every input stream in a codec package's codec that is read
+        as frames, and leave the rest copied.
+
+        ffmpeg knows no such codec: it can copy the stream but not decode it,
+        so wherever the query reads the stream as frames -- a filter, a module,
+        an encoder, an output that names a codec for its kind -- a decoder
+        node stands in front, ONE per stream however many read it. The
+        decoder is the one the input names with ``decoder => <call>``, else
+        the one whose tags include the stream's. An output that copies the
+        stream keeps it coded, into a container that keeps a stream by its
+        tag.
+        """
+        explicit = self._explicit_decoders()
+        by_tag = self._decoders_by_tag()
+        if not explicit and not by_tag:
+            return
+        made: dict[FrameRef, FrameRef] = {}
+
+        def decoded(ref: FrameRef) -> FrameRef | None:
+            if ref in made:
+                return made[ref]
+            found = self._decoder_for(ref, explicit, by_tag)
+            if found is None:
+                return None
+            declared, described, call, anchor = found
+            params = self._wasm_params(
+                declared,
+                described,
+                call,
+                anchor,
+                exp.Select(),
+                _Env(),
+                {},
+                first=0,
+                params_schema=described.decoder.params_schema if described.decoder else None,
+            )
+            kind = ref_type(self.graph, ref)
+            node = self.ctx.node(declared.module, params, [ref], [kind])
+            self.graph.decoders.append(node)
+            made[ref] = node
+            return node
+
+        coded_readers = (
+            set(self.graph.decoders) | set(self.graph.packet_sinks) | set(self.graph.packet_filters)
+        )
+        for name, node in list(self.graph.nodes.items()):
+            if name in coded_readers:
+                continue
+            node.inputs = [decoded(ref) or ref for ref in node.inputs]
+        for unit in self.graph.sinks:
+            recoded = copy_suppressed_scopes(unit.options)
+            for index, output in enumerate(unit.outputs):
+                if not is_src(output.ref):
+                    continue
+                if self._decoder_for(output.ref, explicit, by_tag) is None:
+                    continue
+                if output.type in recoded:
+                    unit.outputs[index] = replace(output, ref=decoded(output.ref) or output.ref)
+                    continue
+                self._check_copied_module_codec(unit, output)
+
+    def _check_copied_module_codec(self, unit: SinkUnit, output: Output) -> None:
+        """Refuse a stream copied in a codec package's codec into a file that
+        cannot keep it."""
+        if unit.path is None or _container_of(unit.options, unit.path) in _MODULE_CODEC_CONTAINERS:
+            return
+        alias, kind, index = _src_parts(output.ref)
+        meta = self._stream_meta(alias, kind, index)
+        codec = meta.codec if meta is not None else "?"
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"'{unit.path}' is {_container_of(unit.options, unit.path)}, and the {kind} "
+            f"it copies is {codec}, a codec ffmpeg does not know: only a "
+            "container that keeps a stream by its tag holds it",
+            self.sink_anchor,
+            hint=f"write the file as .nut, .mkv or .mov to keep it as it is, or "
+            f"name a codec, e.g. {kind}_codec 'libx264', to decode and encode it",
+        )
+
+    def _decoder_for(
+        self,
+        ref: FrameRef,
+        explicit: Mapping[str, tuple[WasmFunction, exp.Anonymous]],
+        by_tag: Mapping[str, list[WasmFunction]],
+    ) -> tuple[WasmFunction, Described, _Call, exp.Expr] | None:
+        """The decoder a source stream is read with, or None for a stream
+        ffmpeg decodes itself."""
+        if not is_src(ref):
+            return None
+        alias, kind, index = _src_parts(ref)
+        if kind not in ("video", "audio"):
+            return None
+        meta = self._stream_meta(alias, kind, index)
+        if meta is None or meta.codec is None:
+            return None
+        origin = self.row_input_source.get(alias, alias)
+        named = explicit.get(origin)
+        if named is not None:
+            declared, node = named
+            described = self._described_codec(declared, node, exp.Select())
+            if described.decoder is None or meta.codec not in described.decoder.fourccs:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"the input '{alias}' names the decoder '{declared.name}', which "
+                    f"does not read its {kind}, {meta.codec}",
+                    node,
+                    hint="name a decoder whose module reads that tag, or drop "
+                    "the decoder option to let ffmpeg decode it",
+                )
+            call = _call_parts(node)
+            assert call is not None  # `_explicit_decoders` read it as one
+            return declared, described, call, node
+        found = by_tag.get(meta.codec)
+        if not found:
+            return None
+        if len(found) > 1:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"the input '{alias}' carries {meta.codec}, and "
+                f"{', '.join(repr(one.name) for one in found)} all decode it",
+                self.sink_anchor,
+                hint=f"name one: input(..., decoder => {found[0].name}())",
+            )
+        declared = found[0]
+        anchor = exp.Anonymous(this=declared.name, expressions=[])
+        call = _call_parts(anchor)
+        assert call is not None
+        described = self.describes[declared.module]
+        return declared, described, call, anchor
+
+    def _explicit_decoders(self) -> dict[str, tuple[WasmFunction, exp.Anonymous]]:
+        """Each input's ``decoder => <call>``, keyed by alias."""
+        found: dict[str, tuple[WasmFunction, exp.Anonymous]] = {}
+        for alias, raw_options in self.res.input_options.items():
+            for option in raw_options:
+                if option.name != DECODER_OPTION:
+                    continue
+                node = _unwrap(option.value)
+                declared = (
+                    self.res.wasm.get(str(node.name).lower())
+                    if isinstance(node, exp.Anonymous)
+                    else None
+                )
+                if declared is None or not declared.is_decoder or not isinstance(
+                    node, exp.Anonymous
+                ):
+                    raise _error(
+                        ErrorCode.UNSUPPORTED_SQL,
+                        f"the input '{alias}' names {_describe(node)} as its "
+                        "decoder, and only a codec package's decoder stands there",
+                        node,
+                        fallback=option.path_node,
+                        hint="write decoder => <package>.<decoder>(<values>), a "
+                        "function declared RETURNS decoder",
+                    )
+                found[alias] = (declared, node)
+        return found
+
+    def _decoders_by_tag(self) -> dict[str, list[WasmFunction]]:
+        """Every declared decoder, keyed by each tag its module reads."""
+        found: dict[str, list[WasmFunction]] = {}
+        for declared in self.res.wasm.values():
+            if not declared.is_decoder:
+                continue
+            described = self.describes.get(declared.module)
+            if described is None or described.decoder is None:
+                continue
+            for tag in described.decoder.fourccs:
+                listed = found.setdefault(tag, [])
+                if all(one.module != declared.module for one in listed):
+                    listed.append(declared)
+        return found
 
     def _check_every_data_output_read(self) -> None:
         """Refuse a data filter output nothing reads.

@@ -321,3 +321,134 @@ def test_an_encoder_is_a_sidecar_between_a_decode_and_a_copying_mux() -> None:
     muxer = argv[out.target]
     assert muxer[-1] == "out.nut"
     assert "-c:0" in muxer and muxer[muxer.index("-c:0") + 1] == "copy"
+
+
+# -- decoding an input -------------------------------------------------------------
+
+_DECODER = f"CREATE FUNCTION dec() RETURNS decoder AS '{CODEC}', 'decode' LANGUAGE wasm;\n"
+
+
+def _coded() -> dict[str, ProbeResult | None]:
+    """`coded.nut` as the probe reads it: a picture in the test codec, whose
+    tag ffmpeg does not know, and sound it does."""
+    return {
+        "f": ProbeResult(
+            streams=[
+                StreamMeta(
+                    type="video", index=0, metadata={}, width=64, height=48,
+                    fps="10/1", sample_rate=None, codec="FTST",
+                ),
+                StreamMeta(
+                    type="audio", index=0, metadata={}, width=None, height=None,
+                    fps=None, sample_rate=48000, codec="aac", channels=2,
+                ),
+            ]
+        )
+    }
+
+
+def _decoding(query: str) -> Graph:
+    return insert_splits(
+        lower(
+            resolve(parse(_DECODER + query)),
+            _coded(),
+            registry=_registry(),
+            describes={CODEC: _codec()},
+        )
+    )
+
+
+def _decode_refused(query: str) -> FfrwdError:
+    with pytest.raises(FfrwdError) as caught:
+        _decoding(query)
+    return caught.value
+
+
+def test_a_stream_read_as_frames_is_decoded_once_by_the_decoder_its_tag_finds() -> None:
+    graph = _decoding(
+        "COPY (SELECT scale(f.video[1], 32, 24), hflip(f.video[1]) "
+        "FROM input('coded.nut') f) TO 'out.nut' WITH (video_codec 'ffv1')"
+    )
+    (decoder,) = graph.decoders
+    assert graph.nodes[decoder].inputs == ["src:f:v:0"]
+    readers = [n for n in graph.nodes.values() if n.filter in ("scale", "hflip")]
+    assert len(readers) == 2
+    assert all(n.inputs == [decoder] or n.inputs[0].startswith(decoder) for n in readers)
+
+
+def test_a_stream_copied_into_a_container_that_keeps_its_tag_stays_coded() -> None:
+    graph = _decoding("COPY (SELECT f.video[1] FROM input('coded.nut') f) TO 'out.mkv'")
+    assert graph.decoders == []
+    (unit,) = graph.sinks
+    assert [o.ref for o in unit.outputs] == ["src:f:v:0"]
+
+
+def test_a_stream_given_a_codec_is_decoded_then_encoded() -> None:
+    graph = _decoding(
+        "COPY (SELECT f.video[1] FROM input('coded.nut') f) TO 'out.mp4' "
+        "WITH (video_codec 'libx264')"
+    )
+    (decoder,) = graph.decoders
+    (unit,) = graph.sinks
+    assert [o.ref for o in unit.outputs] == [decoder]
+
+
+def test_a_stream_copied_into_mp4_is_refused() -> None:
+    error = _decode_refused("COPY (SELECT f.video[1] FROM input('coded.nut') f) TO 'out.mp4'")
+    assert "and the video it copies is FTST, a codec ffmpeg does not know" in error.message
+    assert "video_codec 'libx264'" in (error.hint or "")
+
+
+def test_an_input_names_its_decoder() -> None:
+    graph = _decoding(
+        "COPY (SELECT scale(f.video[1], 32, 24) FROM input('coded.nut', decoder => dec()) f) "
+        "TO 'out.nut' WITH (video_codec 'ffv1')"
+    )
+    assert len(graph.decoders) == 1
+
+
+def test_a_named_decoder_that_does_not_read_the_tag_is_refused() -> None:
+    other = Described(
+        world="ffrwd:av@0.18.0",
+        name="codec",
+        pixel_formats=("yuv420p",),
+        decoder=wasm.DecoderInfo(fourccs=("XXXX",), pixel_formats=("yuv420p",)),
+    )
+    with pytest.raises(FfrwdError) as caught:
+        lower(
+            resolve(
+                parse(
+                    _DECODER + "COPY (SELECT scale(f.video[1], 32, 24) "
+                    "FROM input('coded.nut', decoder => dec()) f) TO 'out.nut' "
+                    "WITH (video_codec 'ffv1')"
+                )
+            ),
+            _coded(),
+            registry=_registry(),
+            describes={CODEC: other},
+        )
+    assert "names the decoder 'dec', which does not read its video, FTST" in caught.value.message
+
+
+def test_a_decoder_is_a_sidecar_reading_the_copied_stream() -> None:
+    probes = _coded()
+    graph = lower(
+        resolve(
+            parse(
+                _DECODER + "COPY (SELECT scale(f.video[1], 32, 24) FROM input('coded.nut') f) "
+                "TO 'out.nut' WITH (video_codec 'ffv1')"
+            )
+        ),
+        probes,
+        registry=_registry(),
+        describes={CODEC: _codec()},
+    )
+    plan = partition(insert_splits(graph), external=external_filters(CODEC), probes=probes)
+    (decoder,) = plan.sidecars
+    assert decoder.codec == "decode"
+    into = next(e for e in plan.stream_edges if e.target == decoder.id)
+    assert into.format.codec == processes.COPY_CODEC
+    argv = _argv(plan)
+    assert argv[decoder.id][argv[decoder.id].index("-codec") + 1] == "decode"
+    reader = argv[into.source]
+    assert reader[reader.index("-c:0") + 1] == "copy"

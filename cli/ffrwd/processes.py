@@ -3541,6 +3541,21 @@ class _Partitioner:
                 timebase=_timebase(meta.fps) if meta else None,
                 codec=COPY_CODEC,
             )
+        if target is not None and target in self.g.decoders:
+            # A codec package's decoder reads the stream coded, as the input
+            # carries it: ffmpeg cannot decode it, and copies it into NUT.
+            if ref_type(self.g, ref) == "audio":
+                return AudioFormat(
+                    rate=meta.sample_rate if meta else None,
+                    channels=meta.channels if meta else None,
+                    codec=COPY_CODEC,
+                )
+            return VideoFormat(
+                width=meta.width if meta else None,
+                height=meta.height if meta else None,
+                timebase=_timebase(meta.fps) if meta else None,
+                codec=COPY_CODEC,
+            )
         pads = self.g.packet_sinks.get(target) if target is not None else None
         if pads is None and target is not None:
             pads = self.g.packet_filters.get(target)
