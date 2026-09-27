@@ -3958,17 +3958,32 @@ def test_there_is_no_name_collision_left_to_win(_registry: Registry) -> None:
     assert g.nodes["n1"].args == {"out_w": 3, "out_h": 4, "x": 1, "y": 2}
 
 
-def test_a_builtin_that_is_also_a_filter_still_resolves_to_the_filter(
-    _registry: Registry,
-) -> None:
-    """sqlglot parses `trim(...)` with its own TRIM grammar, which parks the
-    argument under `this` rather than in the argument list -- so the call
-    resolves to ffmpeg's trim filter but arrives with NO positional args. The
-    rejection is typed (and names the pad signature), not a panic."""
-    err = _reject_dyn("SELECT trim(a.video[1]) FROM input('x.mp4') a", _registry)
+@pytest.mark.parametrize(
+    "call",
+    [
+        "trim(a.video[1])",
+        "reverse(a.video[1])",
+        "format(a.video[1], 'yuv444p')",
+        "format(a.video[1], pix_fmts => 'yuv444p')",
+    ],
+)
+def test_a_builtin_that_is_also_a_filter_points_at_the_namespace(call: str) -> None:
+    """sqlglot parses `trim(...)`, `reverse(...)` and `format(...)` with
+    Postgres's own grammar, which parks the first argument under `this`
+    rather than in the argument list -- so the call resolves to ffmpeg's
+    filter but arrives with its arguments where no filter reads them. The
+    rejection is typed, names the pad signature, and points at the spelling
+    that skips that grammar."""
+    name = call.partition("(")[0]
+    err = _reject_dyn(f"SELECT {call} FROM input('x.mp4') a", _snapshot_registry())
     assert err.code is ErrorCode.UDF_ARG_TYPE
-    assert "trim() is an ffmpeg filter" in err.message
-    assert "got (nothing)" in err.message
+    assert err.message == (
+        f"{name}() is an ffmpeg filter taking video, and also a Postgres function: "
+        f"called bare it parses as Postgres's {name}, so the filter is handed nothing"
+    )
+    assert err.hint == (
+        f"call the filter as ffmpeg.{name}(video, <option>, <option> => <value>)"
+    )
 
 
 def test_a_dynamic_call_nests_inside_a_stdlib_call(_registry: Registry) -> None:
@@ -4773,12 +4788,8 @@ def test_the_namespace_and_the_bare_name_are_the_same_call(_registry: Registry) 
 
 
 def test_the_namespace_reaches_a_name_postgres_claimed(_registry: Registry) -> None:
-    """Bare `trim(a.video[1])` parses as Postgres's TRIM and arrives with NO
-    positional arguments; the namespaced spelling keeps them."""
-    err = _reject_dyn("SELECT trim(a.video[1]) FROM input('x.mp4') a", _registry)
-    assert err.code is ErrorCode.UDF_ARG_TYPE
-    assert "got (nothing)" in err.message
-
+    """Bare `trim(a.video[1])` parses as Postgres's TRIM and is refused (see
+    above); the namespaced spelling keeps its arguments."""
     g = _dyn("SELECT ffmpeg.trim(a.video[1]) FROM input('x.mp4') a", _registry)
     assert g.nodes["n1"].filter == "trim"
     assert g.nodes["n1"].inputs == ["src:a:v:0"]

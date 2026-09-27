@@ -1866,6 +1866,18 @@ def _call_parts(node: exp.Expr) -> _Call | None:
     return None
 
 
+def _postgres_grammar(node: exp.Expr) -> bool:
+    """True for a bare call sqlglot read with a Postgres builtin's own
+    grammar (``format``, ``reverse``, ``trim``, ``median`` ...), which parks
+    arguments under its own keys, outside the argument list a filter reads.
+    ``overlay`` is not one: :func:`_call_parts` puts its arguments back."""
+    if not isinstance(node, exp.Func) or isinstance(node, exp.Anonymous | exp.Overlay):
+        return False
+    return any(
+        key != "expressions" and isinstance(value, exp.Expr) for key, value in node.args.items()
+    )
+
+
 def _split_args(
     name: str, call: exp.Expr, *, namespaced: bool = False, is_macro: bool = False
 ) -> _Call:
@@ -17384,6 +17396,19 @@ class _Lowerer:
         repeating the ordinary calling-convention reminder.
         """
         shown = call.display
+        if _postgres_grammar(node):
+            # Postgres's own grammar for the name parked the arguments where
+            # no filter reads them; the namespace skips that grammar.
+            return _error(
+                ErrorCode.UDF_ARG_TYPE,
+                f"{shown}() is an ffmpeg filter taking {', '.join(expected)}, and "
+                f"also a Postgres function: called bare it parses as Postgres's "
+                f"{shown}, so the filter is handed nothing",
+                node,
+                fallback=select,
+                hint=f"call the filter as {FILTER_NAMESPACE}.{shown}"
+                f"({', '.join(expected)}, <option>, <option> => <value>)",
+            )
         hint = (
             f"call {twin_stem}(...) on either kind: the compiler picks the "
             f"audio twin, {shown}, from the column's type"

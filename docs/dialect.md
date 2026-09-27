@@ -372,9 +372,9 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   own arguments. `pix_fmt` is the exception: it names the format the
   pictures reach the encoder in, one the module lists and the sidecar
   carries (`rgba`, `yuv420p`, `yuv422p`, `yuv444p`). Without it the
-  pictures keep the source's format, or the one a `format()` on the way
-  gives them, where the encoder takes it, and take the encoder's first
-  otherwise. The stream's colorimetry (range, primaries, transfer,
+  pictures keep the source's format, or the one an `ffmpeg.format()`
+  on the way gives them, where the encoder takes it, and take the
+  encoder's first otherwise. The stream's colorimetry (range, primaries, transfer,
   matrix, chroma siting), as the input declares it or a `setparams()`
   on the way sets it, is handed to the encoder and written into the
   file: `.mkv` keeps all five, `.mov` all but the range and the siting,
@@ -1339,7 +1339,11 @@ Each column is one of:
   a filter call over any of these. In a media COPY, column order is
   `-map` order.
 - **A filter call**: any filter of the installed ffmpeg, bare or
-  `ffmpeg.<name>`, plus the `ffrwd.<name>` macros - streams first,
+  `ffmpeg.<name>`, plus the `ffrwd.<name>` macros. A name Postgres
+  parses with a grammar of its own (`format`, `reverse`, `trim`, `pad`)
+  is reached as `ffmpeg.<name>`: bare, it parses as Postgres's and is
+  refused. `overlay` is the exception, reached bare too, positionally.
+  Streams first,
   then options positionally in the filter's own order, then
   `name => value` ([filters.md](filters.md)). Bare arrays broadcast;
   two arrays in one call zip elementwise. `VARIADIC <array>` is a third
