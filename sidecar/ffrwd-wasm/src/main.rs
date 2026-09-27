@@ -597,9 +597,10 @@ fn take_nn_args(argv: Vec<String>) -> Result<(nn::Config, Vec<String>)> {
 ///
 /// `-http <module>` lets the module at that path make outbound HTTP
 /// requests; `-udp <module>` lets it open UDP sockets and `-tcp <module>`
-/// TCP ones, one protocol each. Each is per module
-/// and repeatable; a module the argv never names gets neither. Read before
-/// the argv is dispatched, the way the inference options are.
+/// TCP ones, one protocol each; `-gpu <module>` lets it use the GPU through
+/// `wasi:webgpu`. Each is per module and repeatable; a module the argv never
+/// names gets none of them. Read before the argv is dispatched, the way the
+/// inference options are.
 fn take_grant_args(argv: Vec<String>) -> Result<Vec<String>> {
     let mut rest = Vec::with_capacity(argv.len());
     let mut it = argv.into_iter();
@@ -611,6 +612,7 @@ fn take_grant_args(argv: Vec<String>) -> Result<Vec<String>> {
             "-http" => ffrwd_wasm_runtime::runtime::grant_http(&next("-http")?)?,
             "-udp" => ffrwd_wasm_runtime::runtime::grant_udp(&next("-udp")?)?,
             "-tcp" => ffrwd_wasm_runtime::runtime::grant_tcp(&next("-tcp")?)?,
+            "-gpu" => ffrwd_wasm_runtime::runtime::grant_gpu(&next("-gpu")?)?,
             _ => rest.push(arg),
         }
     }
@@ -4280,6 +4282,9 @@ struct Description {
     /// and separately: the two protocols are two interfaces and two grants.
     /// Always present.
     tcp: bool,
+    /// Whether the component imports `wasi:webgpu`, and so needs a `-gpu`
+    /// grant to run at all. Read off its imports. Always present.
+    gpu: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     functions: Vec<FunctionDescription>,
     /// The older spelling of `reads_rows`, present only when it is true.
@@ -4473,6 +4478,8 @@ fn describe_module(module_path: &str) -> Result<String> {
         udp: ffrwd_wasm_runtime::runtime::imports_wasi_udp(module_path)
             .with_context(|| format!("describing {module_path}"))?,
         tcp: ffrwd_wasm_runtime::runtime::imports_wasi_tcp(module_path)
+            .with_context(|| format!("describing {module_path}"))?,
+        gpu: ffrwd_wasm_runtime::runtime::imports_wasi_webgpu(module_path)
             .with_context(|| format!("describing {module_path}"))?,
         functions: Vec::new(),
         meta: false,
@@ -5610,6 +5617,14 @@ mod grant_args_tests {
         let argv = strings(&["-tcp", "module.wasm", "--invoke", "module.wasm", "fn", "{}"]);
         let rest = take_grant_args(argv).expect("parses");
         assert_eq!(rest, strings(&["--invoke", "module.wasm", "fn", "{}"]));
+    }
+
+    /// `-gpu` is a grant like the others, taken out ahead of dispatch.
+    #[test]
+    fn a_gpu_grant_is_taken_out_the_same_way() {
+        let argv = strings(&["-gpu", "module.wasm", "-f", "nut", "-i", "-"]);
+        let rest = take_grant_args(argv).expect("parses");
+        assert_eq!(rest, strings(&["-f", "nut", "-i", "-"]));
     }
 
     #[test]

@@ -9,7 +9,15 @@ description = "Run WASM component video filters inside any frei0r-enabled ffmpeg
 name = "ffrwd_wasm_runtime"
 crate-type = ["rlib"]
 
+[features]
+# wasi:webgpu for modules granted `-gpu`, over wgpu-core (Vulkan, D3D12,
+# Metal). Off, a module importing wasi:webgpu is refused at instantiation.
+gpu = ["dep:wasi-webgpu-wasmtime"]
+
 [dependencies]
+# The wasi:webgpu@0.0.1 host, vendored and adapted from wasi-gfx-runtime;
+# see vendor/wasi-webgpu-wasmtime/README.md.
+wasi-webgpu-wasmtime = { path = "../vendor/wasi-webgpu-wasmtime", optional = true }
 wasmtime = { version = "48", default-features = false, features = ["component-model", "cranelift", "runtime", "std", "parallel-compilation"] }
 wasmtime-wasi = { version = "48", default-features = false, features = ["p2"] }
 # Linked only for a module granted `-http`: the outgoing-handler half of

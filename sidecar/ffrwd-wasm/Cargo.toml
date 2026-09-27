@@ -13,6 +13,13 @@ path = "src/lib.rs"
 name = "ffrwd-wasm"
 path = "src/main.rs"
 
+[features]
+# wasi:webgpu for modules granted -gpu (wgpu: Vulkan, D3D12, Metal). A target
+# that cannot build wgpu builds with --no-default-features and refuses such
+# modules by name.
+default = ["gpu"]
+gpu = ["ffrwd-wasm-runtime/gpu"]
+
 [dependencies]
 ffrwd-wasm-runtime = { path = "../runtime" }
 # The NUT wire, which used to be src/nut/, pinned by tag the way ffrwd-frame

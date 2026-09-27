@@ -1,0 +1,10 @@
+package ffrwd:gpu-probe;
+
+/// A frame filter that asks for a GPU and says what it found. It imports
+/// `wasi:webgpu` - the standard interface, the synchronous 0.0.1 version the
+/// sidecar hosts - and so needs a `-gpu` grant to run at all.
+world gpu-probe {
+  include ffrwd:av/video-module@0.17.0;
+
+  import wasi:webgpu/webgpu@0.0.1;
+}

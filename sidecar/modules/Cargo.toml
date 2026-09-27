@@ -23,6 +23,7 @@ members = [
     "captions",
     "transcribe",
     "nn-probe",
+    "gpu-probe",
     "depth",
     "segment",
     "mask_select",

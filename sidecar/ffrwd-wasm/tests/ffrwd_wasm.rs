@@ -3305,6 +3305,117 @@ fn an_http_grant_naming_another_module_grants_this_one_nothing() {
     );
 }
 
+// gpu_probe imports wasi:webgpu, asks for an adapter at init and reports
+// what it found on the first frame's row. These pass on a machine with no
+// GPU as well: the grant is about being allowed to ask, and a host with no
+// adapter answers with none.
+
+#[test]
+fn describe_says_whether_a_module_imports_webgpu() {
+    let probe: serde_json::Value = serde_json::from_str(&describe_raw(&module_path("gpu_probe")))
+        .expect("describe prints JSON");
+    assert_eq!(
+        probe["gpu"],
+        serde_json::json!(true),
+        "gpu_probe imports wasi:webgpu"
+    );
+    let invert: serde_json::Value =
+        serde_json::from_str(&describe_raw(&module_path("invert"))).expect("describe prints JSON");
+    assert_eq!(
+        invert["gpu"],
+        serde_json::json!(false),
+        "invert imports nothing"
+    );
+}
+
+#[test]
+fn a_gpu_module_is_refused_without_the_grant() {
+    ensure_modules_built();
+    let frames: Vec<Vec<u8>> = (0..2u8).map(synthetic_frame).collect();
+    let module = module_path("gpu_probe");
+    let module_str = module.to_str().expect("module path is valid UTF-8");
+
+    let run = run_ffrwd_wasm(
+        &[
+            "-f", "nut", "-i", "-", "-m", module_str, "-f", "ndjson", "-",
+        ],
+        &nut_stream(&frames),
+    );
+    assert!(
+        !run.success(),
+        "gpu_probe imports wasi:webgpu and this run granted nothing"
+    );
+    assert!(
+        run.stderr.contains("wasi:webgpu") && run.stderr.contains("-gpu"),
+        "expected the refusal to name the missing grant, got:\n{}",
+        run.stderr
+    );
+}
+
+#[test]
+fn a_gpu_grant_naming_another_module_grants_this_one_nothing() {
+    ensure_modules_built();
+    let frames: Vec<Vec<u8>> = (0..2u8).map(synthetic_frame).collect();
+    let module = module_path("gpu_probe");
+    let module_str = module.to_str().expect("module path is valid UTF-8");
+    let other = module_path("invert");
+    let other_str = other.to_str().expect("module path is valid UTF-8");
+
+    let run = run_ffrwd_wasm(
+        &[
+            "-gpu", other_str, "-f", "nut", "-i", "-", "-m", module_str, "-f", "ndjson", "-",
+        ],
+        &nut_stream(&frames),
+    );
+    assert!(
+        !run.success(),
+        "the grant is per module, and this one names a different module"
+    );
+    assert!(
+        run.stderr.contains("wasi:webgpu"),
+        "expected the missing-grant refusal, got:\n{}",
+        run.stderr
+    );
+}
+
+#[test]
+fn a_gpu_module_runs_under_its_grant() {
+    ensure_modules_built();
+    let frames: Vec<Vec<u8>> = (0..3u8).map(synthetic_frame).collect();
+    let module = module_path("gpu_probe");
+    let module_str = module.to_str().expect("module path is valid UTF-8");
+
+    let run = run_ffrwd_wasm(
+        &[
+            "-gpu", module_str, "-f", "nut", "-i", "-", "-m", module_str, "-f", "ndjson", "-",
+        ],
+        &nut_stream(&frames),
+    );
+    assert_run_ok(&run, "gpu_probe under its grant");
+    let stdout = String::from_utf8(run.stdout.clone()).expect("rows are UTF-8");
+    let rows: Vec<serde_json::Value> = stdout
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("each row is JSON"))
+        .collect();
+    assert_eq!(rows.len(), 1, "one row, on the first frame: {stdout}");
+    let row = &rows[0];
+    assert!(
+        row["adapter"].is_boolean(),
+        "the row says whether an adapter was found: {row}"
+    );
+    assert!(
+        row["subgroups"].is_boolean(),
+        "and whether it has subgroups: {row}"
+    );
+    if row["adapter"] == serde_json::json!(false) {
+        assert_eq!(
+            row["subgroups"],
+            serde_json::json!(false),
+            "no adapter, no features: {row}"
+        );
+    }
+}
+
 #[test]
 fn an_http_module_posts_each_row_under_its_grant() {
     ensure_modules_built();
