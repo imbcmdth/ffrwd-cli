@@ -1392,6 +1392,46 @@ def test_the_same_order_blames_the_0_again_once_another_member_failed() -> None:
     assert consequences == []
 
 
+def test_a_feeder_writer_stopped_at_the_end_is_no_failure() -> None:
+    """The measured shape (a lateral fed from a file): the sound switch
+    reaches the end of its programme and exits 0 a moment before its reader
+    does, and the member writing the lateral's rows, which nothing waits on,
+    is still reading the file's last packets when the rest of the stage has
+    ended, so the stage stops it. Nothing was cut short."""
+    results = [
+        _ended("ffmpeg0", 0),
+        _ended("ffmpeg1", 4294957243, terminated=True),
+        _ended("ffmpeg2", 0),
+        _ended("sidecar1", 0),
+    ]
+
+    cause, consequences = _attribute(
+        results,
+        {"sidecar1": 1.0, "ffmpeg2": 1.05, "ffmpeg0": 1.2},
+        [("ffmpeg2", "sidecar1"), ("sidecar1", "ffmpeg0")],
+        writers={"ffmpeg1"},
+    )
+
+    assert (cause, consequences) == (None, [])
+
+
+def test_a_stopped_feeder_writer_does_not_hide_a_real_failure() -> None:
+    results = [
+        _ended("ffmpeg0", 1),
+        _ended("ffmpeg1", 4294957243, terminated=True),
+        _ended("sidecar1", 0),
+    ]
+
+    cause, _ = _attribute(
+        results,
+        {"sidecar1": 1.0, "ffmpeg0": 1.2},
+        [("sidecar1", "ffmpeg0")],
+        writers={"ffmpeg1"},
+    )
+
+    assert cause is results[0]
+
+
 def test_a_broken_pipe_is_read_off_the_code_or_off_what_ffmpeg_said() -> None:
     """224 is how POSIX spells ffmpeg's EPIPE and 0xffffffe0 how Windows does;
     a member that spells it neither way still said what happened."""

@@ -130,7 +130,7 @@ import tempfile
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import IO, Literal
@@ -2189,7 +2189,7 @@ def _run_stage(
             for member in members.values()
             if member.ended_at is not None
         }
-        failure, consequences = _attribute(results, ended, feeds)
+        failure, consequences = _attribute(results, ended, feeds, writers.keys())
         blamed = {r.id for r in consequences}
         failures = [
             r
@@ -2218,6 +2218,7 @@ def _attribute(
     results: Sequence[ProcessResult],
     ended: Mapping[str, float],
     feeds: Sequence[tuple[str, str]] = (),
+    writers: Collection[str] = (),
 ) -> tuple[ProcessResult | None, list[ProcessResult]]:
     """Which member ended the stage, and which ones broke because it did.
 
@@ -2252,8 +2253,16 @@ def _attribute(
         return at is None or at >= when
 
     # Whether anything in this stage failed at all, which is what a 0 needs
-    # behind it before it can be read as the end of anything.
-    any_failed = any(result.exit_code != 0 or result.terminated for result in results)
+    # behind it before it can be read as the end of anything. A feeder writer
+    # (`writers`) the stage stopped is not a failure: nothing waits on one,
+    # and the stage stops a writer still running once everything else has
+    # ended, as a file-fed lateral's row reader often is by a few
+    # milliseconds.
+    any_failed = any(
+        (result.exit_code != 0 and not result.terminated)
+        or (result.terminated and result.id not in writers)
+        for result in results
+    )
     candidates: list[tuple[float, bool, ProcessResult]] = []
     for result in results:
         at = ended.get(result.id)
