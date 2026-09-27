@@ -304,7 +304,7 @@ from ffrwd.functions import (
     is_number_argument,
     wasm_named_parameter,
 )
-from ffrwd.inputs import render_options
+from ffrwd.inputs import render_options, rendered_options
 from ffrwd.inputs import validate_option as validate_input_option
 from ffrwd.ir import (
     FEEDER_HOST,
@@ -2701,12 +2701,34 @@ def _input_value(node: exp.Expr) -> object:
     option table decides.
     """
     node = _unwrap(node)
+    if isinstance(node, exp.Struct):
+        return _input_struct(node)
     if not (isinstance(node, exp.Neg) and isinstance(node.this, exp.Expr)):
         return _sink_value(node)
     inner = _sink_value(_unwrap(node.this))
     if isinstance(inner, int | float) and not isinstance(inner, bool):
         return -inner
     return _Unrepresentable(_sink_describe(node))
+
+
+def _input_struct(node: exp.Struct) -> object:
+    """An option's ``STRUCT(value AS key, ...)`` as a dict of python scalars.
+
+    Each field reads as any option value does, and a NULL field is absence,
+    as a NULL option is. A field with no name, or a name written twice, is no
+    dict at all: an :class:`_Unrepresentable` the option table refuses.
+    """
+    fields: dict[str, object] = {}
+    for entry in node.expressions:
+        if not isinstance(entry, exp.PropertyEQ) or not isinstance(entry.expression, exp.Expr):
+            return _Unrepresentable("a STRUCT with a field that has no name")
+        name = _fold(entry.this)
+        if name in fields:
+            return _Unrepresentable(f"a STRUCT naming {name!r} twice")
+        if isinstance(_unwrap(entry.expression), exp.Null):
+            continue
+        fields[name] = _input_value(entry.expression)
+    return fields
 
 
 def input_option_values(raw_options: Sequence[RawInputOption]) -> dict[str, object]:
@@ -6154,6 +6176,10 @@ class _Lowerer:
             options = input_option_values(raw_options)
             if options:
                 self._check_realtime_option(alias, options, raw_options)
+            # The compiler's own options (a declared `shape`) did their work
+            # before lowering and are nothing ffmpeg is handed.
+            options = rendered_options(options)
+            if options:
                 result[alias] = options
         # A per-row `-i` repeats its origin's options: same file, same demuxer,
         # only the seek differs.
@@ -12640,9 +12666,10 @@ class _Lowerer:
         we say so at compile time. Table queries are exempt on purpose: rows
         with a NULL codec column are how you DISCOVER these tracks. An
         unprobed input (meta None) is exempt too -- nothing is known, so
-        nothing is knowably broken.
+        nothing is knowably broken -- and so is a stream the query declared
+        with ``shape``, whose codec is None only because it was not said.
         """
-        if self.table_mode or meta is None or meta.codec is not None:
+        if self.table_mode or meta is None or meta.codec is not None or meta.declared:
             return
         raise _error(
             ErrorCode.UNSUPPORTED_SQL,

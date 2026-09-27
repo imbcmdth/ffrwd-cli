@@ -49,7 +49,7 @@ from .emit import Emitted, emit
 from .errors import ErrorCode, FfrwdError
 from .execute import DEFAULT_TIMEOUT
 from .functions import WasmFunction, package_modules, script_definitions
-from .inputs import forces_demuxer, probe_options, render_options
+from .inputs import declared_probe, forces_demuxer, probe_options, render_options
 from .ir import Graph, Lateral
 from .lower import ProbePath, input_option_values, lower_commands, lower_table
 from .parser import Resolved, parse, resolve
@@ -125,6 +125,24 @@ def _probe_flags(res: Resolved, alias: str) -> tuple[tuple[str, ...], bool]:
     return tuple(render_options(probe_options(values))), forces_demuxer(values)
 
 
+def _declared_shape(res: Resolved, alias: str) -> ProbeResult | None:
+    """The probe this alias's ``shape => STRUCT(...)`` stands in for, if it has one.
+
+    Best effort like :func:`_probe_flags`: an option set lowering will refuse
+    reads as no shape, and the refusal lands moments later, anchored on the
+    option itself.
+    """
+    raw = res.input_options.get(alias)
+    if not raw:
+        return None
+    try:
+        values = input_option_values(raw)
+    except FfrwdError:
+        return None
+    shape = values.get("shape")
+    return declared_probe(shape) if isinstance(shape, dict) else None
+
+
 def _probe_inputs(
     res: Resolved,
 ) -> tuple[dict[str, ProbeResult | None], dict[str, ProbeFailure | None]]:
@@ -146,6 +164,15 @@ def _probe_inputs(
     by_alias: dict[str, ProbeResult | None] = {}
     by_alias_failure: dict[str, ProbeFailure | None] = {}
     for alias, index in res.sources.items():
+        declared = _declared_shape(res, alias)
+        if declared is not None:
+            # The query said what the input holds: nothing is probed, which
+            # for a listener is what leaves the sender's first connection to
+            # the run, and for a slow feed what keeps the shape it would
+            # have timed out on.
+            by_alias[alias] = declared
+            by_alias_failure[alias] = None
+            continue
         path = res.input_paths[index]
         flags, forced = _probe_flags(res, alias)
         key = (path, flags)

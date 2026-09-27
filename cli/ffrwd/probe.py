@@ -118,6 +118,11 @@ class StreamMeta:
     bitrate: int | None = None  # ffprobe bit_rate, as int
     duration: float | None = None  # per-stream duration in seconds
     color_transfer: str | None = None  # video only; the HDR discriminator
+    pix_fmt: str | None = None  # video only, ffprobe pix_fmt, verbatim
+    # True for a stream the query declared (``input(..., shape => ...)``)
+    # rather than one ffprobe read: a None codec then means "not said", where
+    # from ffprobe it means a stream ffmpeg cannot identify.
+    declared: bool = False
     # ffprobe's `disposition` object as booleans, keys lowercased. The
     # flag map `<row>.disposition.<key>` reads.
     disposition: dict[str, bool] = field(default_factory=dict)
@@ -1232,6 +1237,7 @@ def _parse_streams(data: object) -> ProbeResult | None:
                         duration=duration,
                         color_transfer=_str_opt(raw, "color_transfer"),
                         disposition=flags,
+                        pix_fmt=_str_opt(raw, "pix_fmt"),
                     )
                 )
                 video_idx += 1

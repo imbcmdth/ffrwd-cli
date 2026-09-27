@@ -22,6 +22,13 @@ demuxer but not a purpose, and several options here (``realtime``,
 rejections on the build this was measured against. :func:`probe_options`
 reads that field to narrow what a probe sends, so the decision lives beside
 each option rather than as a second list that could drift from this one.
+
+An option can also be the COMPILER's alone (``compile_time``): it changes what
+the compile knows about the input and reaches neither ffprobe nor ffmpeg.
+``shape`` is one. It declares the input's streams, which stand in for a probe
+(:func:`declared_probe`), so a listener that a probe would consume, or a feed
+that would not answer in time, compiles with its shape known. Its value is a
+``STRUCT``, checked key by key against :data:`SHAPE_KEYS`.
 """
 
 from __future__ import annotations
@@ -30,11 +37,14 @@ import difflib
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
+from fractions import Fraction
 from typing import Literal
 
 from ffrwd.errors import ErrorCode, FfrwdError
+from ffrwd.ir import StreamType
+from ffrwd.probe import ProbeResult, StreamMeta
 
-InputOptionType = Literal["str", "int", "bool", "num", "size"]
+InputOptionType = Literal["str", "int", "bool", "num", "size", "struct"]
 
 
 @dataclass(frozen=True)
@@ -56,6 +66,10 @@ class InputOptionSpec:
     # True -> a boolean flag with no value (e.g. "-re"); rendered flag-only
     # when the value is True, omitted entirely when False.
     bare: bool = False
+    # True -> the compiler's alone: read at compile time, never rendered to
+    # ffprobe or ffmpeg, and kept out of the graph's rendered input options
+    # (`rendered_options`). `flag` is then empty.
+    compile_time: bool = False
 
 
 INPUT_OPTIONS: dict[str, InputOptionSpec] = {
@@ -238,6 +252,17 @@ INPUT_OPTIONS: dict[str, InputOptionSpec] = {
         # reachability concern as `rtsp_transport`.
         probes=True,
     ),
+    "shape": InputOptionSpec(
+        name="shape",
+        type="struct",
+        doc="The input's streams, declared instead of probed, e.g. "
+        "STRUCT(1920 AS width, 1080 AS height, 30 AS fps, 48000 AS rate, 2 AS channels).",
+        flag="",
+        # The compiler's alone: a declared shape means the input is not
+        # probed at all, so there is no probe for it to reach.
+        probes=False,
+        compile_time=True,
+    ),
 }
 
 
@@ -341,6 +366,9 @@ def validate_option(
             )
         return value
 
+    if spec.type == "struct":
+        return _validate_shape(value, line=line, col=col)
+
     if spec.type == "size":
         if isinstance(value, str) or (
             isinstance(value, int) and not isinstance(value, bool) and value >= 0
@@ -397,6 +425,17 @@ def render_value(spec: InputOptionSpec, name: str, value: object) -> str | None:
     return str(value)
 
 
+def rendered_options(options: Mapping[str, object]) -> dict[str, object]:
+    """`options` without the compiler's own (``compile_time``): what ffmpeg is
+    handed for the input, and what a graph carries."""
+    return {name: value for name, value in options.items() if not _compile_time(name)}
+
+
+def _compile_time(name: str) -> bool:
+    spec = option_spec(name)
+    return spec is not None and spec.compile_time
+
+
 def render_options(options: Mapping[str, object]) -> list[str]:
     """Validated input options as argv, in written order.
 
@@ -412,6 +451,8 @@ def render_options(options: Mapping[str, object]) -> list[str]:
         spec = option_spec(name)
         if spec is None:
             raise ValueError(f"unknown input option {name!r}")
+        if spec.compile_time:
+            continue
         if spec.bare:
             if value is True:
                 args.append(spec.flag)
@@ -448,3 +489,217 @@ def forces_demuxer(options: Mapping[str, object]) -> bool:
     lavfi graph, an image pattern -- so the spec need not name a file at all.
     """
     return "format" in options
+
+
+# -- a declared shape --------------------------------------------------------
+
+ShapeKeyType = Literal["count", "rate", "str"]
+
+
+@dataclass(frozen=True)
+class ShapeKey:
+    """One key of ``shape => STRUCT(...)``: the stream it declares and what it holds.
+
+    A `required` key is required of the stream it belongs to, once any key of
+    that stream is written: which streams exist follows from the keys.
+    """
+
+    name: str
+    stream: StreamType
+    type: ShapeKeyType
+    required: bool
+    doc: str
+
+
+SHAPE_KEYS: dict[str, ShapeKey] = {
+    "width": ShapeKey("width", "video", "count", True, "picture width in pixels"),
+    "height": ShapeKey("height", "video", "count", True, "picture height in pixels"),
+    "fps": ShapeKey(
+        "fps", "video", "rate", True, "frame rate, a number or text such as '30000/1001'"
+    ),
+    "pix_fmt": ShapeKey("pix_fmt", "video", "str", False, "pixel format, e.g. 'yuv420p'"),
+    "video_codec": ShapeKey(
+        "video_codec", "video", "str", False, "codec the picture arrives in, e.g. 'h264'"
+    ),
+    "rate": ShapeKey("rate", "audio", "count", True, "sample rate in Hz"),
+    "channels": ShapeKey("channels", "audio", "count", True, "channel count"),
+    "channel_layout": ShapeKey(
+        "channel_layout", "audio", "str", False, "channel layout, e.g. 'stereo'"
+    ),
+    "audio_codec": ShapeKey(
+        "audio_codec", "audio", "str", False, "codec the sound arrives in, e.g. 'aac'"
+    ),
+}
+
+_SHAPE_EXAMPLE = (
+    "shape => STRUCT(1920 AS width, 1080 AS height, 30 AS fps, "
+    "48000 AS rate, 2 AS channels)"
+)
+
+
+def _shape_error(message: str, hint: str, line: int | None, col: int | None) -> FfrwdError:
+    return FfrwdError(
+        ErrorCode.INPUT_OPTION_TYPE, message, line=line, col=col, hint=hint
+    )
+
+
+def _validate_shape(
+    value: object, *, line: int | None, col: int | None
+) -> dict[str, object]:
+    """``shape``'s STRUCT, checked key by key: a dict of the keys written.
+
+    Refused by name: a value that is no STRUCT, a key :data:`SHAPE_KEYS` does
+    not have, a value of the wrong type, a stream written without the keys it
+    requires, and a STRUCT declaring no stream at all. A ``fps`` comes back as
+    the text ffprobe writes a rate in, ``'30/1'``.
+    """
+    if not isinstance(value, dict):
+        raise _shape_error(
+            f"option 'shape' expects a STRUCT of the input's streams, got {value!r}",
+            f"name each value with AS, e.g. {_SHAPE_EXAMPLE}",
+            line,
+            col,
+        )
+    checked: dict[str, object] = {}
+    for key, written in value.items():
+        spec = SHAPE_KEYS.get(key)
+        if spec is None:
+            close = difflib.get_close_matches(key, sorted(SHAPE_KEYS), n=1, cutoff=0.6)
+            raise _shape_error(
+                f"shape has no key {key!r}",
+                f"did you mean {close[0]!r}?"
+                if close
+                else "known keys: " + ", ".join(SHAPE_KEYS),
+                line,
+                col,
+            )
+        checked[key] = _shape_value(spec, written, line=line, col=col)
+    streams = {SHAPE_KEYS[key].stream for key in checked}
+    if not streams:
+        raise _shape_error(
+            "shape declares no stream: it names none of " + ", ".join(SHAPE_KEYS),
+            f"declare a picture, a sound or both, e.g. {_SHAPE_EXAMPLE}",
+            line,
+            col,
+        )
+    for stream in ("video", "audio"):
+        if stream not in streams:
+            continue
+        wanted = [k.name for k in SHAPE_KEYS.values() if k.stream == stream and k.required]
+        missing = [name for name in wanted if name not in checked]
+        if missing:
+            written_keys = [key for key in checked if SHAPE_KEYS[key].stream == stream]
+            what = "a picture" if stream == "video" else "a sound"
+            raise _shape_error(
+                f"shape declares {what} ({', '.join(written_keys)}) without its "
+                f"{' and '.join(missing)}",
+                f"{what} needs {', '.join(wanted)}, e.g. {_SHAPE_EXAMPLE}",
+                line,
+                col,
+            )
+    return checked
+
+
+def _shape_value(
+    spec: ShapeKey, value: object, *, line: int | None, col: int | None
+) -> object:
+    """One key's value, of its declared type."""
+    if spec.type == "count":
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+        raise _shape_error(
+            f"shape key {spec.name!r} expects a whole number above zero, got {value!r}",
+            f"{spec.name} is the {spec.doc}, e.g. {_SHAPE_EXAMPLE}",
+            line,
+            col,
+        )
+    if spec.type == "rate":
+        found = _rate_text(value)
+        if found is not None:
+            return found
+        raise _shape_error(
+            f"shape key {spec.name!r} expects a frame rate, got {value!r}",
+            "write a number, 30 or 29.97, or text, '30000/1001'",
+            line,
+            col,
+        )
+    if isinstance(value, str) and value:
+        return value
+    raise _shape_error(
+        f"shape key {spec.name!r} expects text, got {value!r}",
+        f"{spec.name} is the {spec.doc}",
+        line,
+        col,
+    )
+
+
+def _rate_text(value: object) -> str | None:
+    """A rate as ffprobe writes one, ``'<num>/<den>'``, or None."""
+    if isinstance(value, bool):
+        return None
+    try:
+        if isinstance(value, int):
+            rate = Fraction(value)
+        elif isinstance(value, float):
+            rate = Fraction(str(value))
+        elif isinstance(value, str):
+            rate = Fraction(value.strip())
+        else:
+            return None
+    except (ValueError, ZeroDivisionError):
+        return None
+    if rate <= 0:
+        return None
+    return f"{rate.numerator}/{rate.denominator}"
+
+
+def declared_probe(shape: Mapping[str, object]) -> ProbeResult:
+    """What a probe would have said of an input, from its validated ``shape``.
+
+    One picture stream, one sound stream or both, the way ffprobe reports a
+    live feed: no duration, no tags. A codec the shape does not name is None,
+    as it is for a stream no probe read, so a stream that would otherwise be
+    copied is decoded instead.
+    """
+    streams: list[StreamMeta] = []
+
+    def text(key: str) -> str | None:
+        found = shape.get(key)
+        return found if isinstance(found, str) else None
+
+    def count(key: str) -> int | None:
+        found = shape.get(key)
+        return found if isinstance(found, int) else None
+
+    if any(SHAPE_KEYS[key].stream == "video" for key in shape):
+        streams.append(
+            StreamMeta(
+                type="video",
+                index=0,
+                metadata={},
+                width=count("width"),
+                height=count("height"),
+                fps=text("fps"),
+                sample_rate=None,
+                codec=text("video_codec"),
+                pix_fmt=text("pix_fmt"),
+                declared=True,
+            )
+        )
+    if any(SHAPE_KEYS[key].stream == "audio" for key in shape):
+        streams.append(
+            StreamMeta(
+                type="audio",
+                index=0,
+                metadata={},
+                width=None,
+                height=None,
+                fps=None,
+                sample_rate=count("rate"),
+                codec=text("audio_codec"),
+                channels=count("channels"),
+                channel_layout=text("channel_layout"),
+                declared=True,
+            )
+        )
+    return ProbeResult(streams=streams)

@@ -1216,6 +1216,63 @@ Protocol options (`rtsp_transport`, `user_agent`) are the same mechanism on a
 URL. A live source has no duration for the probe to report and behaves like
 any other input whose duration is unknown.
 
+#### Declaring an input's shape
+
+`shape => STRUCT(...)` says what the input holds instead of probing it. It is
+the compiler's own option: it reaches neither ffprobe nor ffmpeg, and an input
+that declares a shape is not probed at all. The compile reads the declared
+streams exactly as it would have read a probe's.
+
+That matters for a live feed. Probing a listener URL is a connection of its
+own: it takes the sender's first call, reads a few seconds and hangs up, so
+the sender has to dial again before the run can read anything. A probe that
+misses its time limit leaves the query with no shape at all, and every size
+and rate the plan would have counted from is unknown.
+
+| key | stream | value | required |
+|---|---|---|---|
+| `width` | picture | whole number of pixels | with any picture key |
+| `height` | picture | whole number of pixels | with any picture key |
+| `fps` | picture | a number (`30`, `29.97`) or text (`'30000/1001'`) | with any picture key |
+| `pix_fmt` | picture | text, e.g. `'yuv420p'` | no |
+| `video_codec` | picture | text, the codec it arrives in, e.g. `'h264'` | no |
+| `rate` | sound | whole number of Hz | with any sound key |
+| `channels` | sound | whole number | with any sound key |
+| `channel_layout` | sound | text, e.g. `'stereo'` | no |
+| `audio_codec` | sound | text, the codec it arrives in, e.g. `'aac'` | no |
+
+Which streams exist follows from the keys: any picture key declares one
+picture stream, any sound key one sound stream. A key outside the table, a
+value of the wrong type, a picture without its `width`, `height` and `fps`, a
+sound without its `rate` and `channels`, and a `STRUCT` with no key at all are
+each refused by name (`INPUT_OPTION_TYPE`). A NULL field is not written.
+
+A codec left out is not known, the same as a stream no probe read: a stream
+that would have been copied because its codec matched is decoded instead. Name
+the codec to keep the copy.
+
+```sql
+-- OBS or ffmpeg dials this listener with 1080p30 H.264 and AAC stereo.
+COPY (SELECT scale(s.video[1], 1280, 720), aresample(s.audio[1], 48000)
+      FROM input('srt://0.0.0.0:9000?mode=listener&latency=200000',
+                 shape => STRUCT(1920 AS width, 1080 AS height, 30 AS fps,
+                                 'h264' AS video_codec,
+                                 48000 AS rate, 2 AS channels)) s)
+  TO 'feed.mkv'
+
+-- The same over RTMP: ffmpeg listens for one publisher on 1935.
+COPY (SELECT s.video[1], s.audio[1]
+      FROM input('rtmp://0.0.0.0:1935/live/feed?listen=1',
+                 shape => STRUCT(1280 AS width, 720 AS height, '30000/1001' AS fps,
+                                 44100 AS rate, 2 AS channels)) s)
+  TO 'feed.mkv'
+```
+
+A shape is allowed on any input, a file included: there it only skips the
+probe, and what the file really holds is what ffmpeg reads at run time. A
+shape that disagrees with the stream is not caught at compile time; the plan
+is sized from what was declared.
+
 ## The SELECT list
 
 Each column is one of:

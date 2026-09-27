@@ -10,15 +10,21 @@ from __future__ import annotations
 
 import pytest
 
+from ffrwd import compiler
+from ffrwd.compiler import compile_all
 from ffrwd.errors import ErrorCode, FfrwdError
 from ffrwd.inputs import (
     INPUT_OPTIONS,
     InputOptionSpec,
+    declared_probe,
     option_spec,
     probe_options,
     render_options,
+    rendered_options,
     validate_option,
 )
+from ffrwd.probe import ProbeResult, StreamMeta
+from ffrwd.wasm import Described
 
 # name -> type.
 _EXPECTED: dict[str, str] = {
@@ -42,6 +48,7 @@ _EXPECTED: dict[str, str] = {
     "analyzeduration": "size",
     "rtsp_transport": "str",
     "user_agent": "str",
+    "shape": "struct",
 }
 
 
@@ -77,6 +84,8 @@ _EXPECTED_PROBES: dict[str, bool] = {
     "analyzeduration": True,
     "rtsp_transport": True,
     "user_agent": True,
+    # The compiler's own: a declared shape means there is no probe at all.
+    "shape": False,
 }
 
 
@@ -111,7 +120,8 @@ def test_all_entries_are_spec_instances() -> None:
     for spec in INPUT_OPTIONS.values():
         assert isinstance(spec, InputOptionSpec)
         assert spec.doc  # non-empty, drives docs/prompt
-        assert spec.flag.startswith("-")
+        # A compile-time option is rendered nowhere, so it has no flag.
+        assert spec.flag.startswith("-") if not spec.compile_time else spec.flag == ""
 
 
 def test_loop_renders_as_loop_flag() -> None:
@@ -301,3 +311,192 @@ def test_validate_option_preserves_line_col() -> None:
     err = excinfo.value
     assert err.line == 3
     assert err.col == 12
+
+
+# --- shape => STRUCT(...): an input's streams, declared instead of probed ----
+
+_SHAPE = {"width": 1920, "height": 1080, "fps": 30, "rate": 48000, "channels": 2}
+
+
+def test_shape_is_the_compilers_own_and_never_rendered() -> None:
+    spec = INPUT_OPTIONS["shape"]
+    assert (spec.type, spec.compile_time, spec.probes, spec.flag) == ("struct", True, False, "")
+    options = {"realtime": True, "shape": validate_option("shape", dict(_SHAPE))}
+    assert render_options(options) == ["-re"]
+    assert render_options(probe_options(options)) == []
+    assert rendered_options(options) == {"realtime": True}
+
+
+def test_a_shape_normalizes_its_rate_the_way_ffprobe_writes_one() -> None:
+    for fps, text in [(30, "30/1"), (29.97, "2997/100"), ("30000/1001", "30000/1001")]:
+        checked = validate_option("shape", {**_SHAPE, "fps": fps})
+        assert isinstance(checked, dict)
+        assert checked["fps"] == text
+
+
+def test_which_streams_a_shape_declares_follows_from_its_keys() -> None:
+    picture = validate_option("shape", {"width": 640, "height": 360, "fps": "25/1"})
+    sound = validate_option("shape", {"rate": 44100, "channels": 1, "audio_codec": "aac"})
+    assert isinstance(picture, dict) and isinstance(sound, dict)
+
+    assert [s.type for s in declared_probe(picture).streams] == ["video"]
+    assert [s.type for s in declared_probe(sound).streams] == ["audio"]
+    both = declared_probe(
+        {**picture, **sound, "video_codec": "h264", "pix_fmt": "yuv420p",
+         "channel_layout": "mono"}
+    )  # fmt: skip
+    video, audio = both.streams
+    assert (video.width, video.height, video.fps, video.codec, video.pix_fmt) == (
+        640, 360, "25/1", "h264", "yuv420p",
+    )  # fmt: skip
+    assert (audio.sample_rate, audio.channels, audio.channel_layout, audio.codec) == (
+        44100, 1, "mono", "aac",
+    )  # fmt: skip
+    assert (both.duration, video.declared, audio.declared) == (None, True, True)
+    # No codec said is None, as for a stream nothing probed.
+    assert declared_probe(picture).streams[0].codec is None
+
+
+@pytest.mark.parametrize(
+    ("value", "needle"),
+    [
+        ("1920x1080", "option 'shape' expects a STRUCT of the input's streams"),
+        ({**_SHAPE, "widht": 1280}, "shape has no key 'widht'"),
+        ({**_SHAPE, "width": "1920"}, "shape key 'width' expects a whole number"),
+        ({**_SHAPE, "height": 0}, "shape key 'height' expects a whole number"),
+        ({**_SHAPE, "channels": True}, "shape key 'channels' expects a whole number"),
+        ({**_SHAPE, "fps": "fast"}, "shape key 'fps' expects a frame rate"),
+        ({**_SHAPE, "fps": -30}, "shape key 'fps' expects a frame rate"),
+        ({**_SHAPE, "video_codec": 264}, "shape key 'video_codec' expects text"),
+        ({"width": 1920, "rate": 48000, "channels": 2}, "a picture (width) without its "
+         "height and fps"),
+        ({"pix_fmt": "yuv420p"}, "a picture (pix_fmt) without its width and height and fps"),
+        ({"width": 1, "height": 1, "fps": 1, "audio_codec": "aac"},
+         "a sound (audio_codec) without its rate and channels"),
+        ({}, "shape declares no stream"),
+    ],
+)
+def test_a_shape_is_refused_by_name(value: object, needle: str) -> None:
+    with pytest.raises(FfrwdError) as caught:
+        validate_option("shape", value, line=3, col=9)
+
+    assert caught.value.code is ErrorCode.INPUT_OPTION_TYPE
+    assert needle in caught.value.message, caught.value.message
+    assert (caught.value.line, caught.value.col) == (3, 9)
+    assert caught.value.hint
+
+
+# A module standing in for the demo's: it reads the picture and hands one back.
+_INVERT = "invert.wasm"
+_DESCRIBED = {
+    _INVERT: Described(
+        world="ffrwd:av@0.9.0",
+        name="invert",
+        version="0.1.0",
+        params_schema={"type": "object", "properties": {}},
+        pixel_formats=("rgba",),
+    )
+}
+
+_LIVE_URLS = [
+    "srt://0.0.0.0:9000?mode=listener&latency=200000",
+    "rtmp://0.0.0.0:1935/live/feed?listen=1",
+]
+
+
+def _live_query(url: str, shape: str | None) -> str:
+    """The SMART demo's head in small: the feed conformed ahead of the split
+    (its rate included), a module on one leg, the picture beside it, and the
+    sound filtered into the same file."""
+    declared = f", shape => {shape}" if shape else ""
+    return (
+        "CREATE FUNCTION invert(v video_stream) RETURNS video_stream\n"
+        f"  AS '{_INVERT}', 'invert' LANGUAGE wasm;\n"
+        "COPY (\n"
+        "  WITH feed AS (\n"
+        "    SELECT scale(ffmpeg.fps(s.video[1], 30), 1280, 720) AS v,\n"
+        "           aresample(s.audio[1], 48000) AS a\n"
+        f"    FROM input('{url}'{declared}) s\n"
+        "  )\n"
+        "  SELECT ffmpeg.hstack(feed.v, invert(feed.v)), feed.a FROM feed\n"
+        ") TO 'out.mkv' WITH (video_codec 'ffv1')"
+    )
+
+
+_STRUCT = (
+    "STRUCT(1920 AS width, 1080 AS height, 30 AS fps, 'h264' AS video_codec, "
+    "48000 AS rate, 2 AS channels, 'aac' AS audio_codec)"
+)
+
+
+def _probed_like_the_struct() -> ProbeResult:
+    return ProbeResult(
+        streams=[
+            StreamMeta(
+                type="video", index=0, metadata={}, width=1920, height=1080,
+                fps="30/1", sample_rate=None, codec="h264",
+            ),
+            StreamMeta(
+                type="audio", index=0, metadata={}, width=None, height=None,
+                fps=None, sample_rate=48000, channels=2, codec="aac",
+            ),
+        ],
+    )  # fmt: skip
+
+
+@pytest.mark.parametrize("url", _LIVE_URLS)
+def test_a_declared_shape_compiles_a_listener_without_probing_it(
+    url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A probe of a listener takes the sender's first connection, and one that
+    misses its ceiling leaves the query shapeless: with the shape declared,
+    nothing is probed, and the plan is the one a probe of the same values
+    makes."""
+
+    def no_probe(*args: object, **kwargs: object) -> None:
+        raise AssertionError(f"probed {args}: a declared shape must not be")
+
+    monkeypatch.setattr(compiler, "probe_path", no_probe)
+    declared = compile_all(
+        _live_query(url, _STRUCT), describe=lambda path: _DESCRIBED[path]
+    )
+    probed_result = _probed_like_the_struct()
+    monkeypatch.setattr(compiler, "probe_path", lambda path, args=(), **kw: probed_result)
+    probed = compile_all(_live_query(url, None), describe=lambda path: _DESCRIBED[path])
+
+    assert declared.plan is not None and probed.plan is not None
+    assert declared.plan.to_dict() == probed.plan.to_dict()
+    # The shape reaches neither ffmpeg nor the plan's input options.
+    reader = next(p for p in declared.plan.ffmpeg if url in p.graph.input_paths)
+    assert all("shape" not in o for o in reader.graph.input_options.values())
+    # 1080p conformed to 720p ahead of the split: the pipe, not the fifo.
+    bounded = [e for e in declared.plan.stream_edges if e.buffer is not None]
+    assert bounded and all(e.buffer.road == "pipe" for e in bounded if e.buffer)
+
+
+def test_a_shape_on_a_file_skips_its_probe_too(monkeypatch: pytest.MonkeyPatch) -> None:
+    def no_probe(*args: object, **kwargs: object) -> None:
+        raise AssertionError("a declared shape must not be probed")
+
+    monkeypatch.setattr(compiler, "probe_path", no_probe)
+    graph = compile_all(
+        "COPY (SELECT s.video[1] FROM input('clip.mp4', "
+        "shape => STRUCT(640 AS width, 360 AS height, 25 AS fps)) s) TO 'o.mkv'"
+    ).graphs[0]
+
+    assert graph.input_paths == ["clip.mp4"]
+    assert graph.input_options == {}
+
+
+def test_a_shape_that_is_no_struct_is_refused_at_its_option(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(compiler, "probe_path", lambda path, args=(), **kw: None)
+    with pytest.raises(FfrwdError) as caught:
+        compile_all(
+            "COPY (SELECT s.video[1] FROM input('srt://0.0.0.0:9000?mode=listener', "
+            "shape => STRUCT(1920 AS width, 1080 AS height)) s) TO 'o.mkv'"
+        )
+
+    assert caught.value.code is ErrorCode.INPUT_OPTION_TYPE
+    assert "a picture (width, height) without its fps" in caught.value.message
