@@ -230,7 +230,7 @@ fn describe_prints_the_encoder_and_the_decoder() {
     });
     let decoder_schema = serde_json::json!({
         "type": "object",
-        "properties": {"pix_fmt": {"type": "string", "enum": ["yuv420p", "gray"]}},
+        "properties": {"pix_fmt": {"type": "string", "enum": ["yuv420p", "gray", "yuv444p", "yuv422p"]}},
         "additionalProperties": false
     });
     assert_eq!(d["world"], "ffrwd:av@0.18.0");
@@ -238,7 +238,10 @@ fn describe_prints_the_encoder_and_the_decoder() {
     assert_eq!(d["version"], "0.1.0");
     // The top level is the encoder's, since the module has one.
     assert_eq!(d["params_schema"], encoder_schema);
-    assert_eq!(d["pixel_formats"], serde_json::json!(["yuv420p", "gray"]));
+    assert_eq!(
+        d["pixel_formats"],
+        serde_json::json!(["yuv420p", "gray", "yuv444p", "yuv422p"])
+    );
     assert_eq!(d["sample_formats"], serde_json::json!([]));
     assert_eq!(
         d["encoder"],
@@ -249,7 +252,7 @@ fn describe_prints_the_encoder_and_the_decoder() {
             "decode_delay": 0,
             "frame_samples": 0,
             "params_schema": encoder_schema,
-            "pixel_formats": ["yuv420p", "gray"],
+            "pixel_formats": ["yuv420p", "gray", "yuv444p", "yuv422p"],
             "sample_formats": []
         })
     );
@@ -259,7 +262,7 @@ fn describe_prints_the_encoder_and_the_decoder() {
             "fourccs": ["FTST"],
             "delay": 0,
             "params_schema": decoder_schema,
-            "pixel_formats": ["yuv420p", "gray"],
+            "pixel_formats": ["yuv420p", "gray", "yuv444p", "yuv422p"],
             "sample_formats": []
         })
     );
@@ -295,13 +298,35 @@ fn a_raw_stream_round_trips_byte_for_byte_at_its_own_timestamps() {
 }
 
 #[test]
+fn a_yuv444p_stream_round_trips_and_decodes_as_yuv444p() {
+    let luma = (WIDTH * HEIGHT) as usize;
+    let frames: Vec<(i64, Vec<u8>)> = PTS
+        .iter()
+        .enumerate()
+        .map(|(i, pts)| (*pts, (0..luma * 3).map(|b| (b * 5 + i) as u8).collect()))
+        .collect();
+    let coded = encode(&raw_wire("yuv444p", &frames));
+    let decoded = decode(&coded);
+
+    let (stream, packets) = read_wire(&decoded);
+    assert_eq!(
+        stream.pix_fmt(),
+        Some("yuv444p"),
+        "the decoder writes what was coded"
+    );
+    let back: Vec<(i64, Vec<u8>)> = packets.into_iter().map(|(p, d)| (p.pts, d)).collect();
+    assert!(back == frames, "the frames came back changed");
+}
+
+#[test]
 fn the_coded_wire_carries_the_tag_and_the_extradata() {
     let frames = yuv_frames();
     let coded = encode(&raw_wire("yuv420p", &frames));
     let (stream, packets) = read_wire(&coded);
     assert_eq!(stream.fourcc, b"FTST");
     assert_eq!(stream.codec_name(), Some("FTST"));
-    assert_eq!(stream.extradata, b"FTST\x01");
+    // The tag, the version and the coded pixel format's byte, 0 for yuv420p.
+    assert_eq!(stream.extradata, b"FTST\x01\x00");
     assert_eq!(stream.decode_delay, 0);
     assert_eq!(stream.video_geometry(), Some((WIDTH, HEIGHT)));
     assert_eq!(stream.time_base, TIME_BASE);
@@ -467,7 +492,10 @@ fn a_pixel_format_the_encoder_does_not_list_is_refused() {
         ],
         &raw_wire("rgba", &rgba),
     );
-    run.assert_refused("encoding rgba", &["testcodec", "rgba", "yuv420p, gray"]);
+    run.assert_refused(
+        "encoding rgba",
+        &["testcodec", "rgba", "yuv420p, gray, yuv444p, yuv422p"],
+    );
 }
 
 #[test]

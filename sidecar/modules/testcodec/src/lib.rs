@@ -8,8 +8,12 @@
 //!
 //! A packet is a header and a body. The header is the magic `FT`, the width
 //! and height as little-endian u16, and one byte naming the pixel format
-//! (0 yuv420p, 1 gray). The body is runs: a count from 1 to 255, then the
-//! byte repeated that many times.
+//! (0 yuv420p, 1 gray, 2 yuv444p, 3 yuv422p). The body is runs: a count from
+//! 1 to 255, then the byte repeated that many times.
+//!
+//! The extradata is the tag, a version byte and the pixel format's byte, so
+//! a decoder opened on the stream writes the format that was coded. A header
+//! without the format's byte decodes as yuv420p.
 
 wit_bindgen::generate!({
     path: "../../wit",
@@ -27,14 +31,15 @@ use exports::ffrwd::av::encoder::{self, EncoderMeta};
 
 const NAME: &str = "testcodec";
 const FOURCC: &str = "FTST";
-/// The codec's out-of-band header: its tag and a version byte.
+/// The codec's out-of-band header: its tag and a version byte, which the
+/// pixel format's byte follows.
 const EXTRADATA: &[u8] = b"FTST\x01";
 const MAGIC: &[u8; 2] = b"FT";
 const HEADER_LEN: usize = 7;
-const PIXEL_FORMATS: [&str; 2] = ["yuv420p", "gray"];
+const PIXEL_FORMATS: [&str; 4] = ["yuv420p", "gray", "yuv444p", "yuv422p"];
 
 const ENCODER_PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{"level":{"type":"number","minimum":0,"maximum":9}},"additionalProperties":false}"#;
-const DECODER_PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{"pix_fmt":{"type":"string","enum":["yuv420p","gray"]}},"additionalProperties":false}"#;
+const DECODER_PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{"pix_fmt":{"type":"string","enum":["yuv420p","gray","yuv444p","yuv422p"]}},"additionalProperties":false}"#;
 
 /// The geometry an instance was opened for.
 #[derive(Clone, Copy)]
@@ -62,6 +67,8 @@ fn frame_len(opened: Opened) -> usize {
     let pixels = opened.width as usize * opened.height as usize;
     match opened.pix {
         0 => pixels * 3 / 2,
+        2 => pixels * 3,
+        3 => pixels * 2,
         _ => pixels,
     }
 }
@@ -212,7 +219,7 @@ impl encoder::Guest for TestCodec {
                 sample_aspect_ratio: None,
                 color,
             }),
-            extradata: EXTRADATA.to_vec(),
+            extradata: [EXTRADATA, &[pix]].concat(),
             profile: None,
             level: None,
         })
@@ -262,22 +269,31 @@ impl decoder::Guest for TestCodec {
         if coded.codec != FOURCC {
             return Err(format!("{NAME} reads {FOURCC}, not {}", coded.codec));
         }
-        if coded.extradata != EXTRADATA {
-            return Err(format!(
-                "{NAME}: the stream header's extradata is {:?}, not this codec's version 1",
-                coded.extradata
-            ));
-        }
+        let coded_pix = match coded.extradata.strip_prefix(EXTRADATA) {
+            Some([]) => None,
+            Some([pix]) if usize::from(*pix) < PIXEL_FORMATS.len() => Some(*pix),
+            _ => {
+                return Err(format!(
+                    "{NAME}: the stream header's extradata is {:?}, not this codec's version 1",
+                    coded.extradata
+                ))
+            }
+        };
         let CodedFormat::Video(video) = coded.format else {
             return Err(format!("{NAME} decodes video alone"));
         };
-        // The header says the codec and the version and nothing else, so the
-        // pixel format is the most preferred unless the params name one; a
-        // packet stating another is refused as it arrives.
-        let mut pix_fmt = PIXEL_FORMATS[0].to_string();
+        // The header names the pixel format that was coded; one naming none
+        // decodes as the most preferred unless the params name one. A packet
+        // stating another is refused as it arrives.
+        let mut pix_fmt = PIXEL_FORMATS[usize::from(coded_pix.unwrap_or(0))].to_string();
         for (key, value) in params_object(&params)? {
             match (key.as_str(), value.as_str()) {
                 ("pix_fmt", Some(named)) if pix_code(named).is_some() => {
+                    if coded_pix.is_some_and(|coded| pix_code(named) != Some(coded)) {
+                        return Err(format!(
+                            "{NAME}: the stream is coded {pix_fmt}, and the params ask for {named}"
+                        ));
+                    }
                     pix_fmt = named.to_string()
                 }
                 _ => return Err(format!("{NAME} decoder takes pix_fmt alone, got: {key}")),
