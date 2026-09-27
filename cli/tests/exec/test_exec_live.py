@@ -26,6 +26,11 @@ A 1080p60 feed with sound, conformed to 720p30, keeps up with the wall: its
 picture and sound chains run as two filtergraphs, where one would hold the
 picture to about 23 frames a second.
 
+A feed handed on a second at a time over TCP, the way a MoQ relay hands a
+subscriber each group of pictures at once, passes through ``ffrwd.leaky``
+whole: the leaky learns the spread of its delivery and drops next to
+nothing, where learning none it drops about half.
+
 Requires ``ffmpeg``/``ffprobe`` on PATH with libx264, libsrt and ffv1, the
 ``ffrwd-wasm`` sidecar, and the sidecar fleet's ``invert`` and ``feed-probe``
 modules built for ``wasm32-wasip2``. Tests skip cleanly when any of those is
@@ -692,7 +697,9 @@ def test_a_leaky_keeps_a_slow_picture_near_the_wall_and_the_sound_whole(
 
     # (b) What it could not keep up with, it dropped, and said so.
     assert rows and all(row["kind"] == "leaky" for row in rows)
-    assert set(rows[0]) == {"kind", "node", "passed", "dropped", "lateness_s", "baseline_s"}
+    assert set(rows[0]) == {
+        "kind", "node", "passed", "dropped", "lateness_s", "baseline_s", "spread_s",
+    }  # fmt: skip
     assert sum(int(str(row["dropped"])) for row in rows) > 0, rows
 
     # (c) The sound is never dropped: one unbroken run of it, as long as the
@@ -716,3 +723,139 @@ def test_without_a_leaky_the_same_slow_picture_falls_further_behind(
     # losing ground over the second half.
     assert lags[-1] > _MAX_LATENESS + _LEAKY_MARGIN + 1.0, lags
     assert lags[-1] - lags[len(lags) // 2] > 1.0, lags
+
+
+# A feed that arrives a second at a time, the way a MoQ relay hands a
+# subscriber each group of pictures at once: 30 pictures within a few
+# milliseconds, once a second, so a group's first picture is a second later
+# than its last. Nothing slow follows the leaky. It learns that spread from
+# the feed's own delivery and drops next to nothing; learning none
+# (max_spread => 0), the older half of every second is past half a second.
+_BURST_SECONDS = 12
+_BURST_SHAPE = (
+    "shape => STRUCT(640 AS width, 360 AS height, 30 AS fps), analyzeduration => 500000"
+)
+
+
+@pytest.fixture(scope="module")
+def _groups(tmp_path_factory: pytest.TempPathFactory) -> list[bytes]:
+    """The feed as one MPEG-TS piece per second: a group of 30 pictures each."""
+    folder = tmp_path_factory.mktemp("groups")
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-f", "lavfi", "-i",
+         f"testsrc2=size=640x360:rate=30:duration={_BURST_SECONDS}",
+         "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+         "-g", "30", "-keyint_min", "30", "-sc_threshold", "0", "-pix_fmt", "yuv420p",
+         "-f", "segment", "-segment_time", "1", "-segment_format", "mpegts",
+         "-reset_timestamps", "0", str(folder / "g%03d.ts")],
+        check=True,
+        timeout=_TIMEOUT,
+    )  # fmt: skip
+    groups = [path.read_bytes() for path in sorted(folder.glob("g*.ts"))]
+    assert len(groups) == _BURST_SECONDS, len(groups)
+    return groups
+
+
+class _Bursts:
+    """Dials a TCP listener and hands it each second of the feed at once,
+    once that second is over, as a relay hands on a group."""
+
+    def __init__(self, port: int, groups: list[bytes]) -> None:
+        self.port = port
+        self.groups = groups
+        self.sent = 0
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._pump, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def _pump(self) -> None:
+        deadline = time.monotonic() + _TIMEOUT / 2
+        while not self._stop.is_set() and time.monotonic() < deadline:
+            try:
+                connection = socket.create_connection(("127.0.0.1", self.port), timeout=1)
+            except OSError:
+                time.sleep(0.2)
+                continue
+            with connection:
+                began = time.monotonic()
+                for index, group in enumerate(self.groups):
+                    if self._stop.wait(max(0.0, began + index + 1 - time.monotonic())):
+                        return
+                    connection.sendall(group)
+                    self.sent += 1
+            return
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=10)
+
+
+@pytest.mark.parametrize(("max_spread", "learns"), [(None, True), (0, False)])
+def test_a_leaky_learns_a_bursty_feeds_spread_and_drops_next_to_nothing(
+    max_spread: int | None,
+    learns: bool,
+    _groups: list[bytes],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if binaries.ffrwd_wasm_path() is None:
+        pytest.skip("ffrwd-wasm not found (uv sync --extra wasm)")
+
+    def no_probe(*args: object, **kwargs: object) -> None:
+        raise AssertionError(f"probed {args}: a declared shape must not be")
+
+    monkeypatch.setattr(compiler, "probe_path", no_probe)
+    port = _free_port(socket.SOCK_STREAM)
+    epoch = int(time.time())
+    limits = "max_lateness => 0.5"
+    if max_spread is not None:
+        limits += f", max_spread => {max_spread}"
+    out_path = tmp_path / "bursts.mkv"
+    query = (
+        "COPY (\n"
+        f"  SELECT ffrwd.leaky(setpts(s.video[1], 'PTS-STARTPTS+{epoch}/TB'), {limits})\n"
+        f"  FROM input('tcp://127.0.0.1:{port}?listen=1', format => 'mpegts', "
+        f"{_BURST_SHAPE}) s\n"
+        f") TO '{out_path.as_posix()}' WITH (video_codec 'libx264', preset 'ultrafast')"
+    )
+    compiled = compile_all(query)
+    assert compiled.plan is not None
+    rows: list[dict[str, object]] = []
+    pump = _Bursts(port, _groups)
+    try:
+        pump.start()
+        result = execute_plan(
+            compiled.plan,
+            sidecar_argv=wasm.sidecar_argv,
+            overwrite=True,
+            timeout=_TIMEOUT,
+            rows=lambda row: rows.append(dict(row)),
+        )
+    finally:
+        pump.stop()
+    assert result.exit_code == 0, "\n".join(
+        f"{member.id} exited {member.exit_code}: {member.stderr_tail}"
+        for stage in result.stages
+        for member in stage.members
+    )
+    assert pump.sent == _BURST_SECONDS
+
+    assert rows and all(row["kind"] == "leaky" for row in rows)
+    passed = sum(int(str(row["passed"])) for row in rows)
+    dropped = sum(int(str(row["dropped"])) for row in rows)
+    assert passed + dropped >= _BURST_SECONDS * 30 - 30, rows
+    spreads = [float(str(row["spread_s"])) for row in rows]
+    if learns:
+        # A second's pictures, less the time they took to arrive. The reader
+        # hands on its probe backlog first, and the pipeline starting up may
+        # cut that into pieces, so the second group can lose a few of its
+        # oldest pictures; from then on nothing is dropped, and every row
+        # carries the groups' own spread.
+        assert all(0.85 <= spread <= 1.1 for spread in spreads[2:]), rows
+        assert dropped < 15, rows
+        assert all(row["dropped"] == 0 for row in rows[2:]), rows
+    else:
+        assert spreads == [0.0] * len(spreads)
+        assert dropped > (passed + dropped) // 4, rows
