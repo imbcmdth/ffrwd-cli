@@ -522,7 +522,7 @@ def test_a_shape_on_a_file_skips_its_probe_too(monkeypatch: pytest.MonkeyPatch) 
     assert graph.input_options == {}
 
 
-def test_a_shape_that_is_no_struct_is_refused_at_its_option(
+def test_a_shape_missing_a_required_key_is_refused_at_compile(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(compiler, "probe_path", lambda path, args=(), **kw: None)
