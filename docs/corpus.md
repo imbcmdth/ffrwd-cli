@@ -1977,8 +1977,9 @@ $ ffrwd compile -f query.sql
   '[0:v:0][1:v:0]hstack=inputs=2[out0]' -map '[out0]' -c:0 libx264 -crf:0 22 live.mp4
 2. ffmpeg: ffmpeg -f lavfi -re -i testsrc2=size=640x360:rate=30:duration=5 \
   -filter_complex '[0:v:0]split=2[out0][out1]' -map '[out0]' -c:0 rawvideo -pix_fmt:0 \
-  rgba -f nut '<named pipe ffmpeg1-sidecar0 src_a_v_0_split:0 write>' -map '[out1]' -c:0 \
-  rawvideo -pix_fmt:0 yuv420p -f nut \
+  rgba -fps_mode:0 passthrough -f nut \
+  '<named pipe ffmpeg1-sidecar0 src_a_v_0_split:0 write>' -map '[out1]' -c:0 rawvideo \
+  -pix_fmt:0 yuv420p -fps_mode:0 passthrough -f nut \
   '<named pipe ffmpeg1-ffmpeg0 src_a_v_0_split:1 write>'
 3. sidecar: ffrwd-wasm -f nut -i pipe:0 -m \
   ../sidecar/modules/target/wasm32-wasip2/release/invert.wasm -f nut pipe:1
@@ -2032,8 +2033,9 @@ $ ffrwd compile -f query.sql
   '[0:v:0][1:v:0]hstack=inputs=2[out0]' -map '[out0]' -c:0 libx264 -crf:0 22 live.mp4
 2. ffmpeg: ffmpeg -f lavfi -re -i testsrc2=size=1920x1080:rate=30:duration=5 \
   -filter_complex '[0:v:0]split=2[out0][out1]' -map '[out0]' -c:0 rawvideo -pix_fmt:0 \
-  rgba -f nut '<named pipe ffmpeg1-sidecar0 src_a_v_0_split:0 write>' -map '[out1]' -c:0 \
-  rawvideo -pix_fmt:0 yuv420p -fifo_format nut -queue_size 2 -f fifo \
+  rgba -fps_mode:0 passthrough -f nut \
+  '<named pipe ffmpeg1-sidecar0 src_a_v_0_split:0 write>' -map '[out1]' -c:0 rawvideo \
+  -pix_fmt:0 yuv420p -fps_mode:0 passthrough -fifo_format nut -queue_size 2 -f fifo \
   '<named pipe ffmpeg1-ffmpeg0 src_a_v_0_split:1 write>'
 3. sidecar: ffrwd-wasm -f nut -i pipe:0 -m \
   ../sidecar/modules/target/wasm32-wasip2/release/invert.wasm -f nut pipe:1
@@ -2042,7 +2044,12 @@ $ ffrwd compile -f query.sql
 
 `-queue_size 2` is the bound of 1 frame doubled. A module declaring a
 `window` raises it: nine frames of window is a bound of nine and a
-queue of eighteen. `ffrwd explain` prints the number and the road each
+queue of eighteen. The frame size counted is the edge's own, after any
+`scale` ahead of the split: a 1080p feed conformed to 720p is sized as
+720p. Every picture the reader writes says `-fps_mode passthrough`, on
+either road: the fifo muxer declares no variable frame rate, and without
+it ffmpeg would hold the edge to a constant one, duplicating and dropping
+frames the bound counts one for one. `ffrwd explain` prints the number and the road each
 edge took, under the plan's `edges`.
 
 An encoder where the paths meet counts too. x264 takes in dozens of
