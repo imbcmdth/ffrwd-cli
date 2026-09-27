@@ -312,6 +312,7 @@ def test_an_encoder_is_a_sidecar_between_a_decode_and_a_copying_mux() -> None:
     argv = _argv(plan)
     sidecar = argv[encoder.id]
     assert sidecar[sidecar.index("-codec") + 1] == "encode"
+    assert sidecar[sidecar.index("-frame_rate") + 1] == "10/1"  # the clip's probed rate
     assert sidecar[sidecar.index("-m") + 1] == CODEC
     into = next(e for e in plan.stream_edges if e.target == encoder.id)
     out = next(e for e in plan.stream_edges if e.source == encoder.id)

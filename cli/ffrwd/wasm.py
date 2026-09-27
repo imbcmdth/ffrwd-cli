@@ -385,6 +385,9 @@ _JOBS_FLAG = "-jobs"
 # Which half of a codec package's module a run drives: "encode" or "decode".
 _CODEC_FLAG = "-codec"
 
+# An encoder's stream's nominal frame rate, "30/1": what its init is told.
+_FRAME_RATE_FLAG = "-frame_rate"
+
 # The effects a module's own imports can ask the host for, in the order the
 # argv writes their grants. `nn` is not among them: a model is bound to a
 # name rather than granted.
@@ -1975,6 +1978,8 @@ def _argv(
     if process.codec:
         # A codec package's module may export both halves; the run says which.
         argv += [_CODEC_FLAG, process.codec]
+    if process.frame_rate:
+        argv += [_FRAME_RATE_FLAG, process.frame_rate]
     if process.network:
         argv += _network_args(process, writes)
     else:

@@ -927,6 +927,10 @@ class SidecarProcess:
     # in, that stream coded out) and "decode" for one holding its DECODER (the
     # mirror); empty for every other process. Either rides alone.
     codec: str = ""
+    # An encoder's stream's nominal frame rate, as ffprobe spells it
+    # ("30/1", "30000/1001"): what a bitrate-driven encoder divides its budget
+    # by. Empty where nothing says it, for audio, and for every other process.
+    frame_rate: str = ""
 
     @property
     def nodes(self) -> tuple[str, ...]:
@@ -994,6 +998,8 @@ class SidecarProcess:
             written["data_filter"] = True
         if self.codec:
             written["codec"] = self.codec
+        if self.frame_rate:
+            written["frame_rate"] = self.frame_rate
         if self.pads:
             written["pads"] = [None if p is None else p.to_dict() for p in self.pads]
         if self.network and self.graph is not None:
@@ -2995,6 +3001,7 @@ class _Partitioner:
                 packet_filter=any(name in self.g.packet_filters for name in members),
                 data_filter=any(name in self.g.data_filters for name in members),
                 codec=_codec_of(self.g, members),
+                frame_rate=self._encoder_frame_rate(members),
                 rows_in=self._region_rows_in(members),
                 pads=self._region_pad_meta(members),
             )
@@ -3471,6 +3478,23 @@ class _Partitioner:
             current = next(
                 (r for r in inputs if ref_type(self.g, r) == wanted), inputs[0]
             )
+
+    def _encoder_frame_rate(self, members: Sequence[str]) -> str:
+        """The nominal frame rate of the video an encoder region codes: the
+        rate its input stream was probed or declared at, where one says it.
+
+        It is the input's rate, not one an ``fps`` filter on the way may have
+        changed: the encoder is told it as a budget to divide, and reads each
+        frame's own time besides.
+        """
+        encoder = next((name for name in members if name in self.g.encoders), None)
+        if encoder is None or ref_type(self.g, encoder) != "video":
+            return ""
+        meta = self._origin_meta(self.g.nodes[encoder].inputs[0])
+        rate = meta.fps if meta is not None else None
+        if not rate or rate.startswith("0/") or rate.endswith("/0"):
+            return ""
+        return rate
 
     def _origin_meta(self, ref: FrameRef) -> StreamMeta | None:
         origin = self._origin(ref)
