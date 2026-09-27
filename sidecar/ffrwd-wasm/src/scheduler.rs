@@ -27,6 +27,7 @@ use std::thread;
 use anyhow::{anyhow, bail, Context, Result};
 use ffrwd_wasm_runtime::runtime::{Filter, Format, Frame, Processed, Shape, StreamInfo};
 
+use crate::leaky::Leaky;
 use crate::network::Source;
 use crate::rowfilter::RowFilter;
 use crate::rowmerge::RowMerge;
@@ -59,6 +60,7 @@ pub enum Runner {
     Module(Box<Filter>),
     Rows(RowFilter),
     Merge(RowMerge),
+    Leaky(Box<Leaky>),
     #[cfg(test)]
     Stub(StubFn),
 }
@@ -96,6 +98,22 @@ impl Runner {
                     trailing,
                 })
             }
+            Runner::Leaky(leaky) => {
+                let out = frames
+                    .iter()
+                    .cloned()
+                    .filter_map(|f| leaky.pass(f))
+                    .collect();
+                if last {
+                    leaky.finish();
+                }
+                // Rows that rode no frame are no picture to drop.
+                let trailing = if last { trailing.to_vec() } else { Vec::new() };
+                Ok(Processed {
+                    frames: out,
+                    trailing,
+                })
+            }
             #[cfg(test)]
             Runner::Stub(f) => f(frames, trailing, last),
         }
@@ -122,7 +140,7 @@ impl LaneSeed {
     fn width(&self, workers: usize) -> usize {
         let module = !matches!(
             self.runners.first(),
-            Some(Runner::Rows(_) | Runner::Merge(_))
+            Some(Runner::Rows(_) | Runner::Merge(_) | Runner::Leaky(_))
         );
         if module && self.shape.pure && self.format.video().is_some() {
             workers

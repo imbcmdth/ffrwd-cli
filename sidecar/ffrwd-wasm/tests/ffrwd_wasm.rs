@@ -5040,3 +5040,106 @@ fn a_data_filter_built_against_the_world_before_codecs_still_loads() {
     assert_eq!(parsed["data_filter"], true);
     assert_eq!(parsed["data_outputs"], serde_json::json!(["json"]));
 }
+
+#[test]
+fn leaky_drops_the_frames_a_stall_made_late_and_reports_on_stderr() {
+    // No module: the network is the host's own node alone.
+    let exe = env!("CARGO_BIN_EXE_ffrwd-wasm");
+    let mut child = Command::new(exe)
+        .args([
+            "-f",
+            "nut",
+            "-i",
+            "-",
+            "-filter_complex",
+            "[0:v]leaky=max_lateness=0.5:node=n9[out0]",
+            "-map",
+            "[out0]",
+            "-f",
+            "nut",
+            "-",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ffrwd-wasm");
+    let stdin = child.stdin.take().expect("child stdin");
+    let writer = thread::spawn(move || {
+        let mut stdin = stdin;
+        let mut muxer = Muxer::new(&mut stdin, &a_stream()).expect("write NUT headers");
+        let mut send = |k: i64| {
+            muxer
+                .write_frame(k * PTS_STEP, &synthetic_frame(k as u8))
+                .expect("write NUT frame");
+            muxer.flush().expect("flush NUT");
+        };
+        for k in 0..3 {
+            send(k);
+        }
+        // A stall: the next three were made while nothing was sent, and
+        // arrive a second after their time.
+        thread::sleep(Duration::from_secs(1));
+        for k in 3..6 {
+            send(k);
+        }
+        // On time again: stamped where the wall has got to.
+        send(3 + 25);
+        muxer.finish().expect("finish the NUT stream");
+    });
+    let output = child.wait_with_output().expect("wait for ffrwd-wasm");
+    writer.join().expect("the writer finished");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(output.status.success(), "leaky exited badly:\n{stderr}");
+
+    let kept: Vec<i64> = read_nut(&output.stdout)
+        .into_iter()
+        .map(|(pts, _)| pts / PTS_STEP)
+        .collect();
+    assert_eq!(kept, vec![0, 1, 2, 28]);
+
+    let rows: Vec<serde_json::Value> = stderr
+        .lines()
+        .filter_map(|line| line.strip_prefix("ffrwd:row "))
+        .map(|row| serde_json::from_str(row).expect("a row is one JSON object"))
+        .collect();
+    assert!(!rows.is_empty(), "no rows on stderr:\n{stderr}");
+    assert!(rows
+        .iter()
+        .all(|row| row["kind"] == "leaky" && row["node"] == "n9"));
+    let total = |key: &str| {
+        rows.iter()
+            .map(|row| row[key].as_u64().unwrap())
+            .sum::<u64>()
+    };
+    assert_eq!((total("passed"), total("dropped")), (4, 3));
+}
+
+#[test]
+fn a_module_bound_as_the_leaky_node_is_refused_naming_it() {
+    let frames: Vec<Vec<u8>> = (0..2u8).map(synthetic_frame).collect();
+    let run = run_ffrwd_wasm(
+        &[
+            "-f",
+            "nut",
+            "-i",
+            "-",
+            "-m",
+            "leaky=anything.wasm",
+            "-filter_complex",
+            "[0:v]leaky[out0]",
+            "-map",
+            "[out0]",
+            "-f",
+            "nut",
+            "-",
+        ],
+        &nut_stream(&frames),
+    );
+    assert!(!run.success(), "the name is the host's own");
+    assert!(
+        run.stderr.contains("leaky") && run.stderr.contains("no module is bound to it"),
+        "expected the reserved name named, got:\n{}",
+        run.stderr
+    );
+}

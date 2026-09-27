@@ -15,6 +15,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use ffrwd_wasm_runtime::runtime::{self, Described, Filter, Format, Kind, Media, StreamInfo};
 
 use crate::graph::{EdgeKind, Pad, ParsedNode};
+use crate::leaky::{self, Leaky};
 use crate::rowfilter::{self, RowFilter};
 use crate::rowmerge::{self, RowMerge};
 use crate::scheduler::{LaneSeed, Reopen, Runner};
@@ -105,8 +106,24 @@ impl Network {
 
             // The two rows nodes are the host's own: nothing is compiled, and
             // each carries whichever kind reaches it, so neither the module
-            // kind nor a params schema applies.
-            let seed = if node.module == rowfilter::NODE {
+            // kind nor a params schema applies. So is `leaky`, which reads
+            // video alone and says so itself.
+            let seed = if node.module == leaky::NODE {
+                check_pad_count(&node.module, 1, placed.len())?;
+                reads_rows.push(false);
+                forwards_rows.push(true);
+                LaneSeed {
+                    name: leaky::NODE.to_string(),
+                    runners: vec![Runner::Leaky(Box::new(Leaky::open(
+                        &node.options,
+                        &format,
+                    )?))],
+                    shape: leaky::SHAPE,
+                    sources: placed,
+                    format,
+                    reopen: None,
+                }
+            } else if node.module == rowfilter::NODE {
                 check_pad_count(&node.module, 1, placed.len())?;
                 reads_rows.push(true);
                 forwards_rows.push(true);

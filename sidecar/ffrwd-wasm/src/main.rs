@@ -15,6 +15,7 @@
 mod codec;
 mod graph;
 mod heartbeat;
+mod leaky;
 mod network;
 mod rowfilter;
 mod rowmerge;
@@ -538,6 +539,11 @@ fn resolve_binding(raw: &str) -> Result<Binding> {
         bail!(
             "-m {raw}: '{name}' is the network's own node and no module is bound to it; \
              it is spelled [a]{name}=max_distance=<number>[b]"
+        );
+    }
+    if name == leaky::NODE {
+        bail!(
+            "-m {raw}: '{name}' is the network's own node and no module is bound to it;              it is spelled [a]{name}=max_lateness=<seconds>[b]"
         );
     }
     if path.is_empty() {
