@@ -22,10 +22,14 @@ A listener's sender may also arrive late. The ``feed-probe`` module reads a
 feeder beside the feed, and its sender dials only after the whole feeder
 wait has gone: the wait counts from the feed's first bytes, not the launch.
 
+A 1080p60 feed with sound, conformed to 720p30, keeps up with the wall: its
+picture and sound chains run as two filtergraphs, where one would hold the
+picture to about 23 frames a second.
+
 Requires ``ffmpeg``/``ffprobe`` on PATH with libx264, libsrt and ffv1, the
 ``ffrwd-wasm`` sidecar, and the sidecar fleet's ``invert`` and ``feed-probe``
 modules built for ``wasm32-wasip2``. Tests skip cleanly when any of those is
-missing.
+missing; the 720p30 conform needs ffmpeg alone.
 """
 
 from __future__ import annotations
@@ -64,9 +68,13 @@ _SHAPE = f"shape => STRUCT(1920 AS width, 1080 AS height, {_RATE} AS fps)"
 
 
 @pytest.fixture(autouse=True)
-def _require_everything() -> None:
+def _require_ffmpeg() -> None:
     if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
         pytest.skip("ffmpeg/ffprobe not found on PATH")
+
+
+@pytest.fixture
+def _require_modules() -> None:
     if binaries.ffrwd_wasm_path() is None:
         pytest.skip("ffrwd-wasm not found (uv sync --extra wasm)")
     if not _MODULE.exists():
@@ -88,12 +96,15 @@ class _Sender:
     running, whatever it started with it.
     """
 
-    def __init__(self, destination: list[str]) -> None:
+    def __init__(self, destination: list[str], feed: list[str] | None = None) -> None:
+        """`feed` is what is read and sent; the 1080p pictures by default."""
         self.argv = [
             "ffmpeg", "-hide_banner", "-loglevel", "error",
-            "-re", "-f", "lavfi", "-i", _SOURCE,
-            "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
-            "-g", str(_RATE), "-pix_fmt", "yuv420p",
+            *(feed or [
+                "-re", "-f", "lavfi", "-i", _SOURCE,
+                "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+                "-g", str(_RATE), "-pix_fmt", "yuv420p",
+            ]),
             *destination,
         ]  # fmt: skip
         self.started: list[subprocess.Popen[str]] = []
@@ -149,17 +160,19 @@ def _query(spelled: str, out_path: Path) -> str:
     )
 
 
-def _listener(protocol: str) -> tuple[str, _Sender]:
+def _listener(
+    protocol: str, shape: str = _SHAPE, feed: list[str] | None = None
+) -> tuple[str, _Sender]:
     """A listening input as the query spells it, and the sender to dial it."""
     if protocol == "srt":
         port = _free_port(socket.SOCK_DGRAM)
-        spelled = f"input('srt://127.0.0.1:{port}?mode=listener&latency=200000', {_SHAPE})"
+        spelled = f"input('srt://127.0.0.1:{port}?mode=listener&latency=200000', {shape})"
         return spelled, _Sender(
-            ["-f", "mpegts", f"srt://127.0.0.1:{port}?mode=caller&latency=200000"]
+            ["-f", "mpegts", f"srt://127.0.0.1:{port}?mode=caller&latency=200000"], feed
         )
     port = _free_port(socket.SOCK_STREAM)
-    spelled = f"input('rtmp://127.0.0.1:{port}/live/test', listen => true, {_SHAPE})"
-    return spelled, _Sender(["-f", "flv", f"rtmp://127.0.0.1:{port}/live/test"])
+    spelled = f"input('rtmp://127.0.0.1:{port}/live/test', listen => true, {shape})"
+    return spelled, _Sender(["-f", "flv", f"rtmp://127.0.0.1:{port}/live/test"], feed)
 
 
 @pytest.fixture(params=["realtime", "srt", "rtmp"])
@@ -194,6 +207,7 @@ def _written(path: Path) -> dict[str, object]:
     return found
 
 
+@pytest.mark.usefixtures("_require_modules")
 def test_a_720p_conform_of_a_1080p_feed_crosses_the_fifo_road_frame_for_frame(
     _feed: tuple[str, _Sender | None],
     tmp_path: Path,
@@ -260,6 +274,7 @@ def test_a_720p_conform_of_a_1080p_feed_crosses_the_fifo_road_frame_for_frame(
     assert float(str(written["start_time"])) >= _EPOCH
 
 
+@pytest.mark.usefixtures("_require_modules")
 def test_an_rtmp_listener_waits_for_its_publisher_and_ends_with_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -319,6 +334,7 @@ _LATE = 8.0
 _FEEDER_SPEC = f"testsrc2=size=320x180:rate={_RATE}:duration=1"
 
 
+@pytest.mark.usefixtures("_require_modules")
 @pytest.mark.parametrize("protocol", ["srt", "rtmp"])
 def test_a_feeder_waits_for_a_listener_whose_sender_is_late(
     protocol: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -373,3 +389,141 @@ def test_a_feeder_waits_for_a_listener_whose_sender_is_late(
     # Every picture of the feeder, at the programme's size.
     assert len(rows) == _RATE
     assert {(row["w"], row["h"]) for row in rows} == {(1920, 1080)}
+
+
+
+# A 1080p60 feed with sound, conformed to 720p30 the way the SMART demo's
+# reader conforms it: long enough for a reader that falls behind to show it.
+_CONFORM_SECONDS = 20
+_CONFORM_RATE = 30
+_CONFORM_SHAPE = (
+    "shape => STRUCT(1920 AS width, 1080 AS height, 60 AS fps, 48000 AS rate, 2 AS channels)"
+)
+# How far the pictures may fall behind the wall: the sender's start-up burst
+# and the encoder's own delay, and nothing that grows with the run.
+_BEHIND = 2.0
+
+
+@pytest.fixture(scope="module")
+def _feed_1080p60(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """The feed as MPEG-TS: 1080p60 H.264 and 48 kHz stereo AAC."""
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("ffmpeg not found on PATH")
+    path = tmp_path_factory.mktemp("feed") / "feed1080p60.ts"
+    seconds = f"duration={_CONFORM_SECONDS}"
+    subprocess.run(
+        [
+            "ffmpeg", "-v", "error", "-y",
+            "-f", "lavfi", "-i", f"testsrc2=size=1920x1080:rate=60:{seconds}",
+            "-f", "lavfi", "-i", f"sine=frequency=440:sample_rate=48000:{seconds}",
+            "-ac", "2", "-c:v", "libx264", "-preset", "veryfast", "-g", "120",
+            "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", str(path),
+        ],
+        check=True,
+        timeout=_TIMEOUT,
+    )  # fmt: skip
+    return path
+
+
+def _conform_query(spelled: str, out_path: Path) -> str:
+    return (
+        "COPY (\n"
+        "  SELECT ffmpeg.format(scale(ffmpeg.fps(s.video[1], 30), 1280, 720), 'yuv420p'),\n"
+        "         ffmpeg.aformat(aresample(s.audio[1], 48000, async => 1, first_pts => 0),\n"
+        "                        channel_layouts => 'stereo')\n"
+        f"  FROM {spelled} s\n"
+        f") TO '{out_path.as_posix()}'\n"
+        "  WITH (video_codec 'libx264', preset 'ultrafast', tune 'zerolatency',\n"
+        "        audio_codec 'aac')"
+    )
+
+
+def _behind(argv: list[str]) -> float:
+    """Run `argv`, and how far its pictures fell behind the wall at worst.
+
+    ffmpeg reports its picture count twice a second. Behind is the wall time
+    since the first report with a picture in it, less the media time the
+    pictures written since then cover.
+    """
+    run = subprocess.Popen(
+        [argv[0], "-hide_banner", "-y", "-nostats", "-progress", "pipe:1",
+         "-stats_period", "0.5", *argv[1:]],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )  # fmt: skip
+    errors: list[str] = []
+    drain = threading.Thread(target=lambda: errors.extend(run.stderr or ()), daemon=True)
+    drain.start()
+    first: tuple[float, int] | None = None
+    worst = 0.0
+    try:
+        for line in run.stdout or ():
+            key, _, value = line.strip().partition("=")
+            if key != "frame" or int(value) == 0:
+                continue
+            now, frames = time.monotonic(), int(value)
+            if first is None:
+                first = (now, frames)
+            worst = max(worst, now - first[0] - (frames - first[1]) / _CONFORM_RATE)
+        run.wait(timeout=_TIMEOUT)
+    finally:
+        if run.poll() is None:
+            binaries.end_tree(run)
+            run.wait(timeout=10)
+    drain.join(timeout=10)
+    assert run.returncode == 0, "".join(errors)[-2000:]
+    return worst
+
+
+@pytest.mark.parametrize("feed", ["realtime", "srt", "rtmp"])
+def test_a_1080p60_feed_conformed_to_720p30_keeps_up_with_the_wall(
+    feed: str, _feed_1080p60: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reader's picture chain (60 to 30 fps) and sound chain share no node,
+    so each runs as a filtergraph of its own. Held in one, an MPEG-TS feed's
+    picture falls to about 23 frames a second and the rest pile up until the
+    input ends; apart, every picture comes out as its time comes."""
+    out_path = tmp_path / "conformed.mkv"
+    sender: _Sender | None = None
+    if feed == "realtime":
+        spelled = f"input('{_feed_1080p60.as_posix()}', realtime => true)"
+    else:
+
+        def no_probe(*args: object, **kwargs: object) -> None:
+            raise AssertionError(f"probed {args}: a declared shape must not be")
+
+        monkeypatch.setattr(compiler, "probe_path", no_probe)
+        copied = ["-re", "-i", str(_feed_1080p60), "-c", "copy"]
+        spelled, sender = _listener(feed, _CONFORM_SHAPE, copied)
+    argv = build_ffmpeg_args(emit(compile_sql(_conform_query(spelled, out_path))))
+    assert argv.count("-filter_complex") == 2
+
+    try:
+        if sender is not None:
+            sender.start()
+        behind = _behind(argv)
+    finally:
+        if sender is not None:
+            sender.stop()
+    if sender is not None:
+        assert sender.delivered, "the sender never got through to the listener"
+
+    done = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-count_packets",
+         "-show_entries", "stream=nb_read_packets,width,height",
+         "-of", "json", str(out_path)],
+        capture_output=True, text=True, timeout=_TIMEOUT, check=False,
+    )  # fmt: skip
+    assert done.returncode == 0, done.stderr
+    written = json.loads(done.stdout)["streams"][0]
+    assert (written["width"], written["height"]) == (1280, 720)
+    pictures = int(written["nb_read_packets"])
+    due = _CONFORM_SECONDS * _CONFORM_RATE
+    if sender is None:
+        assert pictures == due
+    else:
+        # A network feed may lose the tail a sender closes on; nothing else.
+        assert due - 10 <= pictures <= due, pictures
+    assert behind < _BEHIND, f"the pictures fell {behind:.1f} s behind the wall"
