@@ -131,7 +131,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import IO, Literal
 
@@ -223,10 +223,12 @@ _CASCADE = 1.0
 _BROKEN_PIPE = frozenset({224, 0xFFFFFFE0})
 # How long a helper thread is waited for once its process has gone.
 _JOIN = 5.0
-# How long a module is given to listen on its feeder port once its stage has
-# started, and how often the port is tried in that time. The module listens
+# How long a module is given to listen on its feeder port once its programme
+# is flowing, and how often the port is tried in that time. The module listens
 # when it is opened, which is after its sidecar has loaded it and read its
-# programme's header.
+# programme's header. A stage whose programme comes from a live input counts
+# from the first bytes that input's reader writes, since a listener may wait
+# any time for its sender; any other stage counts from its start.
 FEEDER_WAIT = 30.0
 _FEEDER_POLL = 0.1
 # Bytes moved per copy between a named pipe and a process's stdio.
@@ -629,16 +631,21 @@ class Wire:
     `read_stdio` is True when the consuming process reads this edge on its own
     stdin, `write_stdio` when the producing one writes it on its own stdout.
     An end that is neither takes a named pipe.
+
+    `pumped` is True for a stdio edge the runner copies itself rather than
+    handing one member's stdout to the next, so the bytes crossing it are
+    seen: a live input's edge in a stage whose feeder waits for it.
     """
 
     edge: PipeEdge
     read_stdio: bool
     write_stdio: bool
+    pumped: bool = False
 
     @property
     def chained(self) -> bool:
         """True when stdio carries both ends and one Popen feeds the next."""
-        return self.read_stdio and self.write_stdio
+        return self.read_stdio and self.write_stdio and not self.pumped
 
 
 @dataclass(frozen=True)
@@ -675,11 +682,13 @@ class Flow:
     waiting for the consuming end to take what it was handed -- which is what
     a full buffer looks like from here. `opening` is True earlier than that:
     the copy is waiting for the consuming process to open its end at all.
+    `began` is when the first bytes moved, and None until they have.
     """
 
     edge: PipeEdge
     at: float
     moved: int = 0
+    began: float | None = None
     writing: bool = False
     opening: bool = False
 
@@ -748,31 +757,63 @@ def unopened_error(flow: Flow, stall: float) -> FfrwdError:
     )
 
 
-def unheard_error(writer: str, readers: Sequence[str], port: int) -> FfrwdError:
-    """The typed failure for a feeder port nothing listened on in time."""
+def unheard_error(
+    writer: str, readers: Sequence[str], port: int, *, live: bool = False
+) -> FfrwdError:
+    """The typed failure for a feeder port nothing listened on in time.
+
+    `live` says the wait was counted from when the live input's programme
+    started flowing rather than from the stage's start.
+    """
+    since = " after its programme started flowing" if live else ""
     return FfrwdError(
         ErrorCode.INPUT_NEVER_OPENED,
         f"{' and '.join(readers)} never listened on {feeder_path(port)} for its "
         f"feeder, so {writer}, which writes it, was never started: nothing "
-        f"accepted a connection there in {FEEDER_WAIT:.0f}s",
+        f"accepted a connection there in {FEEDER_WAIT:.0f}s{since}",
         hint="the module listens on its port when it is opened; check that it "
         "imports wasi:sockets/tcp and opens the port its describe names",
     )
 
 
 def _await_port(
-    port: int, readers: Sequence[_Member], others: Iterable[_Member], deadline: float
+    port: int,
+    readers: Sequence[_Member],
+    others: Iterable[_Member],
+    deadline: float,
+    live: Sequence[Flow] = (),
+    stop: threading.Event | None = None,
 ) -> bool | None:
     """Whether a feeder port accepted a connection in time.
 
+    In time is `FEEDER_WAIT` from now, or, where `live` names the edges a live
+    input's reader writes, from the first bytes any of them carried: until
+    then the programme has not started, the module cannot have read its
+    header, and only `deadline` bounds the wait. A listener may wait for its
+    sender that long.
+
     None when there is no point waiting any more: every member that would
     listen has ended, or some member of the stage has failed, which the watch
-    then reports. The connection made to find out is closed at once, so the
-    module sees one that ends before a byte arrives, ahead of the real one.
+    then reports; `stop` was set; or the run's own deadline passed before the
+    live programme started, which the watch reports as the timeout it is. The
+    connection made to find out is closed at once, so the module sees one
+    that ends before a byte arrives, ahead of the real one.
     """
-    until = min(deadline, time.monotonic() + FEEDER_WAIT)
+    started = None if live else time.monotonic()
     running = list(others)
-    while time.monotonic() < until:
+    while True:
+        now = time.monotonic()
+        if started is None:
+            started = min(
+                (flow.began for flow in live if flow.began is not None), default=None
+            )
+        if started is None:
+            if now >= deadline:
+                return None
+        elif now >= min(deadline, started + FEEDER_WAIT):
+            return False
+        if stop is not None and stop.is_set():
+            return None
         if all(member.proc.poll() is not None for member in readers):
             return None
         if any(member.proc.poll() not in (None, 0) for member in running):
@@ -782,7 +823,6 @@ def _await_port(
                 return True
         except OSError:
             time.sleep(_FEEDER_POLL)
-    return False
 
 
 @dataclass(frozen=True)
@@ -1948,8 +1988,16 @@ def _run_stage(
     """
     ids = list(stage.processes)
     inside = set(ids)
+    # The writers of feeder connections, each started once its port accepts,
+    # and the members reading each.
+    writers: dict[str, tuple[int, list[str]]] = {}
+    for edge in plan.feeder_edges:
+        if edge.source in inside:
+            writers.setdefault(edge.source, (edge.port, []))[1].append(edge.target)
+    # Where a feeder waits, a live input's edges are copied here rather than
+    # chained, so the first bytes its reader writes start the feeder's clock.
     stage_wires = [
-        wire
+        replace(wire, pumped=True) if writers and _is_live(wire.edge) else wire
         for wire in assigned
         if wire.edge.source in inside and wire.edge.target in inside
     ]
@@ -1964,12 +2012,6 @@ def _run_stage(
     timed_out = False
     wedge: FfrwdError | None = None
     interrupted = False
-    # The writers of feeder connections, each started once its port accepts,
-    # and the members reading each.
-    writers: dict[str, tuple[int, list[str]]] = {}
-    for edge in plan.feeder_edges:
-        if edge.source in inside:
-            writers.setdefault(edge.source, (edge.port, []))[1].append(edge.target)
 
     def spawn(pid: str) -> None:
         process = plan.process(pid)
@@ -2064,18 +2106,21 @@ def _run_stage(
         for member in members.values():
             drain(member)
 
+        live = [flow for flow in flows if _is_live(flow.edge)]
         for pid, (port, readers) in writers.items():
             heard = _await_port(
                 port,
                 [members[r] for r in readers if r in members],
                 list(members.values()),
                 deadline,
+                live,
+                stop,
             )
             if heard is None:
                 continue
             if not heard:
                 failed, timed_out = readers[0], True
-                wedge = unheard_error(pid, readers, port)
+                wedge = unheard_error(pid, readers, port, live=bool(live))
                 break
             spawn(pid)
             for wire in stage_wires:
@@ -2226,6 +2271,11 @@ def _broken_pipe(result: ProcessResult) -> bool:
     if result.terminated or result.exit_code == 0:
         return False
     return result.exit_code in _BROKEN_PIPE or "Broken pipe" in result.stderr
+
+
+def _is_live(edge: PipeEdge) -> bool:
+    """True for an edge the one reader of a live input writes."""
+    return isinstance(edge, StreamEdge) and edge.live
 
 
 def _spawn_order(ids: Sequence[str], stage_wires: Sequence[Wire]) -> list[str]:
@@ -2826,6 +2876,8 @@ def _pump(source: _End, dest: _End, deadline: float, flow: Flow | None = None) -
                 if not spooled:  # a spool counted these as it took them
                     flow.moved += len(chunk)
                 flow.at = time.monotonic()
+                if flow.began is None:
+                    flow.began = flow.at
         writer.flush()
     except (OSError, ValueError):
         pass  # the other end went away; exit codes are what judge that

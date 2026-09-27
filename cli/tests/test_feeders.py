@@ -30,7 +30,17 @@ from ffrwd.execute import plan_argv, render_plan
 from ffrwd.ir import FeederCall, Graph
 from ffrwd.parser import parse, resolve
 from ffrwd.probe import ProbeResult, StreamMeta
-from ffrwd.processes import FfmpegProcess, ProcessPlan, external_filters, partition
+from ffrwd.processes import (
+    FeederEdge,
+    FfmpegProcess,
+    ProcessPlan,
+    SidecarProcess,
+    Stage,
+    StreamEdge,
+    VideoFormat,
+    external_filters,
+    partition,
+)
 from ffrwd.registry import Registry, load_reference
 from ffrwd.split import insert_splits
 from ffrwd.wasm import WORLDS, Described, Feeder
@@ -620,6 +630,194 @@ def test_a_writer_failing_while_its_reader_runs_ends_the_stage() -> None:
         members, time.monotonic() + 5, stall=None, writers={"ffmpeg0": ["sidecar0"]}
     )
     assert failed == "ffmpeg0"
+
+
+# -- a live programme starts the port's clock ---------------------------------
+
+
+def _live_flow() -> execute.Flow:
+    """The edge a live input's reader writes, before any byte has crossed it."""
+    edge = StreamEdge(
+        source="ffmpeg1", target="sidecar0", ref="src:p:v:0", format=VideoFormat(), live=True
+    )
+    return execute.Flow(edge=edge, at=time.monotonic())
+
+
+def _held_port() -> socket.socket:
+    """A bound loopback socket not yet listening, so its port refuses."""
+    held = socket.socket()
+    held.bind(("127.0.0.1", 0))
+    return held
+
+
+def test_a_live_programme_not_yet_flowing_holds_the_feeders_clock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A listener's sender may arrive any time: the module cannot listen before
+    the programme's header reaches it, so the bound has not started."""
+    monkeypatch.setattr(execute, "FEEDER_WAIT", 0.3)
+    flow = _live_flow()
+    with _held_port() as listener:
+        port = listener.getsockname()[1]
+
+        def arrive_late() -> None:
+            time.sleep(1.0)
+            flow.began = time.monotonic()
+            listener.listen()
+
+        sender = threading.Thread(target=arrive_late)
+        sender.start()
+        reader = _members(sidecar0=None)
+        heard = execute._await_port(port, reader, reader, time.monotonic() + 10, [flow])
+        sender.join()
+    assert heard is True
+
+
+def test_the_feeders_clock_starts_when_the_live_programme_does(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(execute, "FEEDER_WAIT", 0.3)
+    flow = _live_flow()
+    started = time.monotonic()
+
+    def flow_late() -> None:
+        time.sleep(0.8)
+        flow.began = time.monotonic()
+
+    with _held_port() as held:
+        port = held.getsockname()[1]
+        feeding = threading.Thread(target=flow_late)
+        feeding.start()
+        reader = _members(sidecar0=None)
+        heard = execute._await_port(port, reader, reader, started + 10, [flow])
+        feeding.join()
+    assert heard is False
+    assert flow.began is not None
+    assert time.monotonic() - flow.began >= 0.3
+    assert time.monotonic() - started >= 1.1
+
+
+def test_a_programme_that_never_flows_is_left_to_the_runs_own_timeout() -> None:
+    """No feeder bound fires before the programme starts: the run's deadline
+    is what ends the wait, and the watch then reports the timeout it is."""
+    with _held_port() as held:
+        port = held.getsockname()[1]
+        reader = _members(sidecar0=None)
+        started = time.monotonic()
+        heard = execute._await_port(port, reader, reader, started + 0.5, [_live_flow()])
+    assert heard is None
+    assert time.monotonic() - started >= 0.5
+
+
+def test_a_stopped_run_stops_waiting_for_a_live_programme() -> None:
+    stop = threading.Event()
+    stop.set()
+    reader = _members(sidecar0=None)
+    later = time.monotonic() + 10
+    assert execute._await_port(1, reader, reader, later, [_live_flow()], stop) is None
+
+
+def test_a_live_programme_says_the_wait_was_counted_from_when_it_started() -> None:
+    error = execute.unheard_error("ffmpeg0", ["sidecar0"], 50000, live=True)
+    assert error.code is ErrorCode.INPUT_NEVER_OPENED
+    assert error.message.endswith(
+        "nothing accepted a connection there in 30s after its programme started flowing"
+    )
+    assert execute.unheard_error("ffmpeg0", ["sidecar0"], 50000).message.endswith(
+        "nothing accepted a connection there in 30s"
+    )
+
+
+# Stand-ins run as the stage's members. The reader writes its programme once
+# `delay` seconds have gone, as a listener does once its sender arrives; the
+# module listens only once the programme's first byte has reached it, and
+# ends once the feeder has written to it and the programme is done.
+_READER = (
+    "import sys, time; time.sleep({delay}); "
+    "sys.stdout.buffer.write(b'programme'); sys.stdout.buffer.flush()"
+)
+_MODULE = """
+import socket, sys
+sys.stdin.buffer.read(1)
+port = socket.socket()
+port.bind(("127.0.0.1", {port}))
+port.listen()
+fed = b""
+while not fed:
+    conn, _ = port.accept()
+    with conn:
+        while chunk := conn.recv(64):
+            fed += chunk
+sys.stdin.buffer.read()
+raise SystemExit(0 if fed == b"feed" else 3)
+"""
+_WRITER = (
+    "import socket; "
+    "s = socket.create_connection(('127.0.0.1', {port})); s.sendall(b'feed'); s.close()"
+)
+
+
+def _stage_fed_after(delay: float, *, live: bool) -> execute.StageResult:
+    """A reader, the module it pipes to, and the module's feeder writer, run
+    for real with the reader's programme arriving `delay` seconds in."""
+    python = getattr(sys, "_base_executable", None) or sys.executable
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    edge = StreamEdge(
+        source="reader", target="module", ref="src:p:v:0", format=VideoFormat(), live=live
+    )
+    plan = ProcessPlan(
+        processes=(
+            SidecarProcess(id="reader", module="reader", node="reader"),
+            SidecarProcess(id="module", module="module", node="module"),
+            SidecarProcess(id="writer", module="writer", node="writer"),
+        ),
+        edges=(edge, FeederEdge(source="writer", target="module", port=port, calls=())),
+    )
+    argv = {
+        "reader": [python, "-c", _READER.format(delay=delay)],
+        "module": [python, "-c", _MODULE.format(port=port)],
+        "writer": [python, "-c", _WRITER.format(port=port)],
+    }
+    result: execute.StageResult = execute._run_stage(
+        plan,
+        Stage(index=0, processes=("reader", "module", "writer")),
+        argv,
+        served={},
+        assigned=(execute.Wire(edge=edge, read_stdio=True, write_stdio=True),),
+        timeout=30,
+        overwrite=False,
+        echo=None,
+        players={},
+    )
+    return result
+
+
+def test_a_live_programme_arriving_after_the_feeder_wait_runs_to_the_end(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The sender of a listening input arrives later than the feeder wait: the
+    wait counts from the programme's first bytes, so the run goes through."""
+    monkeypatch.setattr(execute, "FEEDER_WAIT", 1.0)
+    result = _stage_fed_after(2.0, live=True)
+    assert result.overflow is None, str(result.overflow)
+    assert result.exit_code == 0, [(m.id, m.exit_code, m.stderr) for m in result.members]
+    assert {m.id: m.exit_code for m in result.members} == {
+        "reader": 0, "module": 0, "writer": 0,
+    }
+
+
+def test_a_file_programme_still_counts_the_feeder_wait_from_the_stages_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Nothing about a stage without a live input changes: its programme is
+    there from the start, and the wait is counted from then."""
+    monkeypatch.setattr(execute, "FEEDER_WAIT", 1.0)
+    result = _stage_fed_after(2.0, live=False)
+    assert result.overflow is not None
+    assert result.overflow.code is ErrorCode.INPUT_NEVER_OPENED
+    assert result.overflow.message.endswith("nothing accepted a connection there in 1s")
 
 
 def test_a_number_where_a_pad_goes_is_refused() -> None:
