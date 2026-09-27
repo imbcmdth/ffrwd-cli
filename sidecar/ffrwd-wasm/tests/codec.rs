@@ -668,3 +668,105 @@ fn a_frame_rate_on_a_decode_run_is_refused() {
     );
     run.assert_refused("-frame_rate on a decode run", &["-frame_rate", "decodes"]);
 }
+
+/// The NUT colorspace code a stream header carries: the matrix, and 16 on
+/// top of it for the pc range.
+fn colorspace_code(stream: &Stream) -> u64 {
+    match stream.media {
+        ffrwd_wasm::nut::Media::Video {
+            colorspace_type, ..
+        } => colorspace_type,
+        _ => panic!("a video stream"),
+    }
+}
+
+#[test]
+fn the_colorimetry_flags_reach_the_encoder_and_the_decoder() {
+    let module = module_arg();
+    let flags = |half: &'static str, range: &'static str| {
+        vec![
+            "-codec",
+            half,
+            "-color_range",
+            range,
+            "-color_primaries",
+            "bt709",
+            "-color_trc",
+            "bt709",
+            "-colorspace",
+            "bt709",
+            "-m",
+            module.as_str(),
+            "-f",
+            "nut",
+            "-i",
+            "pipe:0",
+            "-f",
+            "nut",
+            "pipe:1",
+        ]
+    };
+    // The raw wire says nothing of colour, as ffmpeg's NUT never does.
+    let raw = raw_wire("yuv420p", &yuv_frames());
+    let encoded = run_ffrwd_wasm(&flags("encode", "tv"), &raw);
+    encoded.assert_ok("encode with colorimetry");
+    // testcodec answers the colorimetry it was opened with, bt709 tv here.
+    let (coded, _) = read_wire(&encoded.stdout);
+    assert_eq!(colorspace_code(&coded), 2);
+
+    // The coded header now says tv; the decoder is told pc over it and
+    // answers what it was told.
+    let decoded = run_ffrwd_wasm(&flags("decode", "pc"), &encoded.stdout);
+    decoded.assert_ok("decode with colorimetry");
+    let (raw_back, _) = read_wire(&decoded.stdout);
+    assert_eq!(colorspace_code(&raw_back), 18);
+}
+
+#[test]
+fn a_colorimetry_flag_is_refused_where_it_cannot_be_read() {
+    let module = module_arg();
+    let raw = raw_wire("yuv420p", &yuv_frames());
+    let with = |extra: &[&'static str]| {
+        let mut argv: Vec<&str> = vec!["-codec", "encode"];
+        argv.extend_from_slice(extra);
+        argv.extend_from_slice(&[
+            "-m",
+            module.as_str(),
+            "-f",
+            "nut",
+            "-i",
+            "pipe:0",
+            "-f",
+            "nut",
+            "pipe:1",
+        ]);
+        run_ffrwd_wasm(&argv, &raw)
+    };
+    with(&["-color_range", "full"])
+        .assert_refused("an unknown range", &["-color_range full", "tv or pc"]);
+    with(&["-colorspace", "BT 709"]).assert_refused("a misspelled name", &["-colorspace BT 709"]);
+    with(&["-color_trc", "bt709", "-color_trc", "bt709"])
+        .assert_refused("a flag given twice", &["second -color_trc"]);
+
+    let invert = sidecar_root().join("modules/target/wasm32-wasip2/release/invert.wasm");
+    let run = run_ffrwd_wasm(
+        &[
+            "-colorspace",
+            "bt709",
+            "-m",
+            invert.to_str().expect("path is UTF-8"),
+            "-f",
+            "nut",
+            "-i",
+            "pipe:0",
+            "-f",
+            "nut",
+            "pipe:1",
+        ],
+        &raw,
+    );
+    run.assert_refused(
+        "colorimetry on a frame filter",
+        &["-colorspace", "this run hosts none"],
+    );
+}

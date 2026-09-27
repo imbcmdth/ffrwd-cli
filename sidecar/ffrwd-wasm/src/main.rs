@@ -370,6 +370,9 @@ struct Args {
     /// `-frame_rate`: the stream's nominal frame rate as `num/den`, which an
     /// encoder is handed at init. Only an encode run takes one.
     frame_rate: Option<(i32, i32)>,
+    /// The colorimetry flags: what a codec run's stream carries, which its
+    /// NUT header does not say. Only a codec run takes them.
+    color: codec::ColorFlags,
 }
 
 /// `-pad`'s JSON, following one packet sink `-i`: which relation row this
@@ -654,6 +657,7 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
     let mut jobs: Option<usize> = None;
     let mut codec_half: Option<codec::CodecHalf> = None;
     let mut frame_rate: Option<(i32, i32)> = None;
+    let mut color = codec::ColorFlags::default();
     // What the `-rows` before the next output said, if one was given.
     let mut pending_rows: Option<usize> = None;
     // What the `-track` before the next output said, if one was given.
@@ -813,6 +817,10 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
                 }
                 frame_rate = Some(codec::parse_frame_rate(&next("-frame_rate")?)?);
             }
+            // The colorimetry of a codec run's stream.
+            flag @ ("-color_range" | "-color_primaries" | "-color_trc" | "-colorspace") => {
+                color.set(flag, &next(flag)?)?;
+            }
             "-y" => {}
             // "-" alone is the stdin/stdout shorthand, not a flag.
             other if other != "-" && other.starts_with('-') => bail!("unknown flag: {other}"),
@@ -901,6 +909,7 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
         jobs,
         codec: codec_half,
         frame_rate,
+        color,
     })
 }
 
@@ -1930,6 +1939,12 @@ fn run(args: &Args) -> Result<()> {
     }
     if args.frame_rate.is_some() {
         bail!("-frame_rate is handed to a codec package's encoder, and this run hosts none");
+    }
+    if !args.color.is_empty() {
+        bail!(
+            "-color_range, -color_primaries, -color_trc and -colorspace are handed to a codec \
+             package's encoder or decoder, and this run hosts none"
+        );
     }
     if let Some(half) = args.codec {
         let flag = match half {

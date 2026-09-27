@@ -61,6 +61,83 @@ pub(crate) fn parse_frame_rate(raw: &str) -> Result<(i32, i32)> {
     })
 }
 
+/// `-color_range`, `-color_primaries`, `-color_trc` and `-colorspace`: the
+/// colorimetry of the stream a codec run reads, in ffmpeg's own names. The
+/// NUT header ffmpeg writes carries none of it, so the caller says it here,
+/// and each field it names stands over what the input's header declared.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ColorFlags {
+    pub(crate) range: Option<&'static str>,
+    pub(crate) primaries: Option<&'static str>,
+    pub(crate) trc: Option<&'static str>,
+    pub(crate) space: Option<&'static str>,
+}
+
+/// The spelling of "not said" in `ColorInfo`.
+const UNKNOWN: &str = "unknown";
+
+impl ColorFlags {
+    /// Reads one of the four flags into its field, refusing it twice.
+    pub(crate) fn set(&mut self, flag: &str, raw: &str) -> Result<()> {
+        let slot = match flag {
+            "-color_range" => &mut self.range,
+            "-color_primaries" => &mut self.primaries,
+            "-color_trc" => &mut self.trc,
+            "-colorspace" => &mut self.space,
+            other => bail!("{other} is not a colorimetry flag"),
+        };
+        if slot.is_some() {
+            bail!("second {flag} specified");
+        }
+        *slot = Some(parse_color_name(flag, raw)?);
+        Ok(())
+    }
+
+    /// True where no flag was given.
+    pub(crate) fn is_empty(&self) -> bool {
+        *self == ColorFlags::default()
+    }
+
+    /// `color` with every field a flag named put in its place. No flags
+    /// leave it as it was; a flag over no colorimetry at all starts from
+    /// every field unknown.
+    pub(crate) fn over(&self, color: Option<runtime::ColorInfo>) -> Option<runtime::ColorInfo> {
+        if self.is_empty() {
+            return color;
+        }
+        let base = color.unwrap_or(runtime::ColorInfo {
+            range: UNKNOWN,
+            primaries: UNKNOWN,
+            trc: UNKNOWN,
+            space: UNKNOWN,
+        });
+        Some(runtime::ColorInfo {
+            range: self.range.unwrap_or(base.range),
+            primaries: self.primaries.unwrap_or(base.primaries),
+            trc: self.trc.unwrap_or(base.trc),
+            space: self.space.unwrap_or(base.space),
+        })
+    }
+}
+
+/// One colorimetry flag's value: an ffmpeg name, lowercase letters, digits,
+/// `-` and `_`. The range is "tv" or "pc", the two ffprobe reports.
+fn parse_color_name(flag: &str, raw: &str) -> Result<&'static str> {
+    let name = raw.trim();
+    let spelled = !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_');
+    if !spelled {
+        bail!("{flag} {raw}: a colorimetry value is one of ffmpeg's names, as bt709");
+    }
+    if flag == "-color_range" && !matches!(name, "tv" | "pc" | UNKNOWN) {
+        bail!("{flag} {raw}: the range is tv or pc");
+    }
+    // Read once per run, so the few bytes live as long as the process.
+    Ok(Box::leak(name.to_string().into_boxed_str()))
+}
+
 /// The most items one call is handed: whatever has arrived, up to this.
 const BATCH: usize = 32;
 
@@ -331,14 +408,16 @@ impl Framer {
 /// The coded output's NUT header: the encoder's tag, its time base,
 /// extradata and reorder depth, and the geometry `init` answered. Where
 /// the encoder answered no pixel aspect or colorimetry, the raw input's
-/// header is what describes the same pictures, so it is carried through;
-/// so is the input's frame rate, which is the only duration NUT has.
+/// pixel aspect and `input_color` are what describe the same pictures, so
+/// they are carried through; so is the input's frame rate, which is the
+/// only duration NUT has.
 fn coded_header(
     name: &str,
     fourcc: &str,
     decode_delay: u32,
     coded: &CodedStream,
     raw: &nut::Stream,
+    input_color: Option<&runtime::ColorInfo>,
 ) -> Result<nut::Stream> {
     let (kind, geometry) = match coded.format {
         CodedFormat::Video { width, height, .. } => ("video", (width, height)),
@@ -383,22 +462,18 @@ fn coded_header(
         },
     ) = (&mut stream.media, &coded.format)
     {
-        let (input_width, input_height, input_space) = match raw.media {
+        let (input_width, input_height) = match raw.media {
             nut::Media::Video {
                 sample_width,
                 sample_height,
-                colorspace_type,
                 ..
-            } => (sample_width, sample_height, colorspace_type),
-            _ => (1, 1, 0),
+            } => (sample_width, sample_height),
+            _ => (1, 1),
         };
         (*sample_width, *sample_height) = sample_aspect_ratio
             .and_then(|(num, den)| (num > 0 && den > 0).then_some((num as u64, den as u64)))
             .unwrap_or((input_width, input_height));
-        *colorspace_type = match color {
-            Some(color) => colorspace_type_for(Some(color)),
-            None => input_space,
-        };
+        *colorspace_type = colorspace_type_for(color.as_ref().or(input_color));
     }
     stream.frame_rate = raw.frame_rate;
     Ok(stream)
@@ -430,7 +505,17 @@ fn encode(args: &Args, module: &str, params: &str, demuxer: Input) -> Result<()>
         };
         bail!("{name} is an encoder and reads raw frames; the input carries {carried}");
     }
-    let format = format_from_stream(&raw)?;
+    let mut format = format_from_stream(&raw)?;
+    let input_color = match &mut format.media {
+        Media::Video(video) => {
+            video.color = args.color.over(video.color);
+            video.color
+        }
+        Media::Audio(_) if !args.color.is_empty() => {
+            bail!("{name} is handed audio, and colorimetry describes pictures")
+        }
+        Media::Audio(_) => None,
+    };
     let info = stream_info(args, &raw);
     let coded = encoder.init(&format, &info, args.frame_rate, params)?;
     let described = encoder.described().clone();
@@ -440,6 +525,7 @@ fn encode(args: &Args, module: &str, params: &str, demuxer: Input) -> Result<()>
         described.decode_delay,
         &coded,
         &raw,
+        input_color.as_ref(),
     )?;
     let output = &args.outputs[0];
     let mut out = open_frame_output(&output.path, &header, false)
@@ -520,12 +606,13 @@ fn coded_input(stream: &nut::Stream) -> Result<CodedStream> {
 
 /// The raw output's NUT header, from what the decoder's `init` answered:
 /// the coded stream's time base, and its pixel aspect, frame rate and
-/// (where the decoder declared none) colorimetry carried through. Also
+/// (where the decoder declared none) `coded_color` carried through. Also
 /// the host's format for the frames, which is what checks their sizes.
 fn raw_header(
     name: &str,
     decoded: &DecodedFormat,
     coded: &nut::Stream,
+    coded_color: Option<&runtime::ColorInfo>,
 ) -> Result<(nut::Stream, Format)> {
     let time_base = nut::TimeBase {
         num: coded.time_base.num,
@@ -559,7 +646,6 @@ fn raw_header(
                 nut::Media::Video {
                     sample_width: coded_width,
                     sample_height: coded_height,
-                    colorspace_type: coded_space,
                     ..
                 },
             ) = (&mut stream.media, coded.media)
@@ -567,10 +653,7 @@ fn raw_header(
                 if aspect_from(coded_width, coded_height).is_some() {
                     (*sample_width, *sample_height) = (coded_width, coded_height);
                 }
-                *colorspace_type = match color {
-                    Some(color) => colorspace_type_for(Some(color)),
-                    None => coded_space,
-                };
+                *colorspace_type = colorspace_type_for(color.as_ref().or(coded_color));
             }
             stream
         }
@@ -666,7 +749,17 @@ fn decode(args: &Args, module: &str, params: &str, demuxer: Input) -> Result<()>
             "{name} is a decoder and reads coded packets; the input carries raw {sample_fmt} audio"
         );
     }
-    let coded = coded_input(&stream)?;
+    let mut coded = coded_input(&stream)?;
+    let coded_color = match &mut coded.format {
+        CodedFormat::Video { color, .. } => {
+            *color = args.color.over(*color);
+            *color
+        }
+        _ if !args.color.is_empty() => {
+            bail!("{name} is handed audio, and colorimetry describes pictures")
+        }
+        _ => None,
+    };
     let info = args.stream_info.clone().unwrap_or_else(|| StreamInfo {
         index: 0,
         kind: stream.kind().to_string(),
@@ -675,7 +768,7 @@ fn decode(args: &Args, module: &str, params: &str, demuxer: Input) -> Result<()>
         tags: Vec::new(),
     });
     let decoded = decoder.init(&coded, &info, params)?;
-    let (header, format) = raw_header(&name, &decoded, &stream)?;
+    let (header, format) = raw_header(&name, &decoded, &stream, coded_color.as_ref())?;
     let output = &args.outputs[0];
     let mut out = open_frame_output(&output.path, &header, false)
         .with_context(|| format!("opening output {}", output.spelling))?;
@@ -716,10 +809,37 @@ fn decode(args: &Args, module: &str, params: &str, demuxer: Input) -> Result<()>
 
 #[cfg(test)]
 mod tests {
-    use super::{frame_ticks, parse_frame_rate, Framer};
+    use super::{frame_ticks, parse_frame_rate, ColorFlags, Framer};
     use ffrwd_wasm_runtime::runtime::{
-        AudioFormat, Format, Media, RawFrame, TimeBase, VideoFormat,
+        AudioFormat, ColorInfo, Format, Media, RawFrame, TimeBase, VideoFormat,
     };
+
+    #[test]
+    fn a_colorimetry_flag_stands_over_the_header_field_by_field() {
+        let header = ColorInfo {
+            range: "tv",
+            primaries: "unknown",
+            trc: "unknown",
+            space: "bt709",
+        };
+        assert_eq!(ColorFlags::default().over(Some(header)), Some(header));
+        assert_eq!(ColorFlags::default().over(None), None);
+        let mut flags = ColorFlags::default();
+        flags.set("-color_primaries", "bt709").unwrap();
+        flags.set("-color_range", "pc").unwrap();
+        let expected = ColorInfo {
+            range: "pc",
+            primaries: "bt709",
+            trc: "unknown",
+            space: "bt709",
+        };
+        assert_eq!(flags.over(Some(header)), Some(expected));
+        let alone = ColorInfo {
+            space: "unknown",
+            ..expected
+        };
+        assert_eq!(flags.over(None), Some(alone));
+    }
 
     fn stereo_s16(time_base: TimeBase) -> Format {
         Format {
