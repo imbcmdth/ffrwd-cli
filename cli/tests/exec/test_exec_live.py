@@ -600,7 +600,7 @@ def _leaky_query(spelled: str, out_path: Path, *, leaky: bool) -> str:
         f"  FROM {spelled} s\n"
         f") TO '{out_path.as_posix()}'\n"
         "  WITH (video_codec 'libx264', preset 'ultrafast', tune 'zerolatency',\n"
-        "        audio_codec 'pcm_s16le')"
+        "        gop 30, audio_codec 'pcm_s16le')"
     )
 
 
@@ -667,6 +667,21 @@ def _run_slow(
     return _lags(readings), rows, out_path
 
 
+def _keyframes(path: Path) -> list[float]:
+    """When each keyframe of the picture in `path` is shown, in seconds."""
+    done = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "packet=pts_time,flags", "-of", "json", str(path)],
+        capture_output=True, text=True, timeout=_TIMEOUT, check=False,
+    )  # fmt: skip
+    assert done.returncode == 0, done.stderr
+    return [
+        float(packet["pts_time"])
+        for packet in json.loads(done.stdout)["packets"]
+        if "K" in packet["flags"]
+    ]
+
+
 def _audio_packets(path: Path) -> list[tuple[float, float]]:
     done = subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", "a:0",
@@ -702,7 +717,15 @@ def test_a_leaky_keeps_a_slow_picture_near_the_wall_and_the_sound_whole(
     }  # fmt: skip
     assert sum(int(str(row["dropped"])) for row in rows) > 0, rows
 
-    # (c) The sound is never dropped: one unbroken run of it, as long as the
+    # (c) A group stays a second long however many pictures the leaky drops,
+    # where gop 30 alone would make one every 30 of the few that pass,
+    # seconds apart: a keyframe is forced a second after the last, so two
+    # are at most a second and a picture's gap apart.
+    keyframes = _keyframes(out_path)
+    assert len(keyframes) >= _LEAKY_SECONDS - 2, keyframes
+    assert max(b - a for a, b in zip(keyframes, keyframes[1:])) < 1.5, keyframes
+
+    # (d) The sound is never dropped: one unbroken run of it, as long as the
     # feed less the tail a sender closes on.
     packets = _audio_packets(out_path)
     gaps = [b[0] - (a[0] + a[1]) for a, b in zip(packets, packets[1:])]
