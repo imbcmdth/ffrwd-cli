@@ -411,7 +411,7 @@ fn a_data_stream_is_refused_where_it_cannot_go() {
     assert!(
         run.stderr.contains(
             "packet_passthrough_0160 is built against ffrwd:av@0.16.0, which carries no data \
-             stream; rebuild it against ffrwd:av@0.17.0"
+             stream; rebuild it against ffrwd:av@0.18.0"
         ),
         "{}",
         run.stderr

@@ -1010,7 +1010,7 @@ fn describe_reports_the_packet_filter() {
     );
     let description: serde_json::Value =
         serde_json::from_str(run.stdout.trim()).expect("describe prints one JSON object");
-    assert_eq!(description["world"], "ffrwd:av@0.17.0");
+    assert_eq!(description["world"], "ffrwd:av@0.18.0");
     assert_eq!(description["name"], "packet_sei");
     // The flag is what tells a filter from a sink; both carry the codec and
     // arity fields beside it.

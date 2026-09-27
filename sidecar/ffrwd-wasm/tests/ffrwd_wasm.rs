@@ -705,7 +705,7 @@ fn describe(module: &std::path::Path) -> Description {
 #[test]
 fn describe_prints_one_json_object() {
     let parsed = describe(&module_path("invert"));
-    assert_eq!(parsed.world, "ffrwd:av@0.17.0");
+    assert_eq!(parsed.world, "ffrwd:av@0.18.0");
     assert_eq!(parsed.name, Some("invert".to_string()));
     assert_eq!(parsed.pixel_formats, Some(vec!["rgba".to_string()]));
     assert_eq!(parsed.inputs, 1, "invert reads one stream");
@@ -718,7 +718,7 @@ fn describe_prints_one_json_object() {
 #[test]
 fn describe_on_a_values_only_module_has_no_filter_fields() {
     let parsed = describe(&module_path("brand"));
-    assert_eq!(parsed.world, "ffrwd:av@0.17.0");
+    assert_eq!(parsed.world, "ffrwd:av@0.18.0");
     assert_eq!(parsed.name, None, "brand exports no filter, so no name");
     assert_eq!(
         parsed.pixel_formats, None,
@@ -4981,7 +4981,7 @@ fn a_data_filter_without_a_clock_takes_its_time_from_the_heartbeats_it_reads() {
 fn describe_reports_a_data_filter() {
     let raw = describe_raw(&module_path("data_stamp"));
     let parsed: serde_json::Value = serde_json::from_str(&raw).expect("one JSON object");
-    assert_eq!(parsed["world"], "ffrwd:av@0.17.0");
+    assert_eq!(parsed["world"], "ffrwd:av@0.18.0");
     assert_eq!(parsed["name"], "data_stamp");
     assert_eq!(parsed["data_filter"], true);
     assert_eq!(parsed["data_outputs"], serde_json::json!(["json"]));
@@ -4994,4 +4994,49 @@ fn describe_reports_a_data_filter() {
     assert_eq!(parsed["packet_filter"], false);
     assert!(parsed.get("window").is_none());
     assert!(parsed.get("feeders").is_none());
+}
+
+#[test]
+fn a_data_filter_built_against_the_world_before_codecs_still_loads() {
+    // The 0.17.0 arm, over a module actually shaped that way: the interface
+    // is 0.18.0's unchanged, so it runs as a current one does.
+    let data = TempFile::new("adapted_0170_in.nut");
+    std::fs::write(
+        data.path(),
+        json_nut(&[(0, r#"{"a":1}"#), (500_000, r#"{ "b" : 2 }"#)]),
+    )
+    .expect("write the data input");
+
+    ensure_modules_built();
+    let module = module_path("adapted_0170");
+    let run = run_ffrwd_wasm(
+        &[
+            "-f",
+            "nut",
+            "-i",
+            data.path().to_str().expect("UTF-8 path"),
+            "-m",
+            module.to_str().expect("module path is valid UTF-8"),
+            "-f",
+            "nut",
+            "-",
+        ],
+        &[],
+    );
+    assert_run_ok(&run, "adapted_0170");
+    assert_eq!(
+        read_messages(&run.stdout),
+        vec![
+            (0, r#"{"a":1}"#.to_string()),
+            (500_000, r#"{ "b" : 2 }"#.to_string()),
+        ]
+    );
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&describe_raw(&module)).expect("one JSON object");
+    // The host reports the world it was BUILT for, not the module's own.
+    assert_eq!(parsed["world"], "ffrwd:av@0.18.0");
+    assert_eq!(parsed["name"], "adapted_0170");
+    assert_eq!(parsed["data_filter"], true);
+    assert_eq!(parsed["data_outputs"], serde_json::json!(["json"]));
 }

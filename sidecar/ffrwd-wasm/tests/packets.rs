@@ -281,7 +281,7 @@ fn a_sink_built_against_the_previous_world_still_loads() {
         serde_json::from_str(described.stdout.trim()).expect("describe prints one JSON object");
     // The host reports the world it was BUILT for, not the module's own -
     // which is the same answer every adapted module gets.
-    assert_eq!(description["world"], "ffrwd:av@0.17.0");
+    assert_eq!(description["world"], "ffrwd:av@0.18.0");
     assert_eq!(description["name"], "adapted_0150");
     assert_eq!(description["packet_filter"], false);
     // 0.15.0 had no field for it, so the adapter answers for it: a sink
@@ -616,7 +616,7 @@ fn describe_reports_the_packet_sink() {
     );
     let description: serde_json::Value =
         serde_json::from_str(run.stdout.trim()).expect("describe prints one JSON object");
-    assert_eq!(description["world"], "ffrwd:av@0.17.0");
+    assert_eq!(description["world"], "ffrwd:av@0.18.0");
     assert_eq!(description["name"], "packet_stats");
     // The export says so itself, rather than leaving a reader to infer it
     // from a filled codec list beside `packet_filter: false`.

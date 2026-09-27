@@ -63,6 +63,7 @@ members = [
     "adapted-0110",
     "adapted-0150",
     "adapted-0160",
+    "adapted-0170",
 ]
 resolver = "2"
 

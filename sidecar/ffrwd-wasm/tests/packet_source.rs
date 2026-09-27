@@ -228,7 +228,7 @@ fn a_packet_source_built_against_an_older_world_is_refused_at_open() {
     ]);
     assert!(!run.output.status.success());
     assert!(
-        run.stderr.contains("rebuild it against ffrwd:av@0.17.0"),
+        run.stderr.contains("rebuild it against ffrwd:av@0.18.0"),
         "stderr does not name the world to rebuild against:\n{}",
         run.stderr
     );
@@ -406,7 +406,7 @@ fn describe_reports_the_packet_source() {
     let stdout = String::from_utf8(run.stdout).expect("describe prints UTF-8");
     let description: serde_json::Value =
         serde_json::from_str(stdout.trim()).expect("describe prints one JSON object");
-    assert_eq!(description["world"], "ffrwd:av@0.17.0");
+    assert_eq!(description["world"], "ffrwd:av@0.18.0");
     assert_eq!(description["name"], "source_replay");
     assert_eq!(description["source"], true);
     // No frame interface and no packet-sink export alongside it.

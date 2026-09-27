@@ -964,7 +964,7 @@ interface decoder {
   /// declared it: its tag in `codec`, its extradata, its geometry and its
   /// time base. Answers the frames it writes, whose arm is the stream's kind
   /// and whose pix-fmt or sample-fmt is one `meta` named.
-  init: func(stream: coded-stream, info: stream-info, params: string) -> result<format, string>;
+  init: func(coded: coded-stream, info: stream-info, params: string) -> result<format, string>;
 
   /// Packets in decode order, as many as have arrived. Answers the frames
   /// that left, in presentation order, in the stream's time base. `last`
