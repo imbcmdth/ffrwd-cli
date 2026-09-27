@@ -2638,3 +2638,32 @@ def test_a_rows_module_with_no_model_binds_none_of_its_own() -> None:
     )
     region = plan.sidecars[0]
     assert [m.path for m in region.models] == ["captions.onnx"]
+
+
+@pytest.mark.parametrize(
+    ("written", "named"),
+    [
+        ({"processes": [{"kind": "gstreamer", "id": "p0"}]}, "'kind'"),
+        (
+            {"processes": [], "edges": [{"kind": "stream", "source": 0, "target": "b"}]},
+            "'source'",
+        ),
+        (
+            {
+                "processes": [],
+                "edges": [
+                    {"kind": "file", "source": "a", "target": "b", "format": {"content": "video"}}
+                ],
+            },
+            "'content'",
+        ),
+    ],
+)
+def test_a_plan_document_this_version_did_not_write_is_refused_by_name(
+    written: dict[str, object], named: str
+) -> None:
+    """Every plan the suite builds round-trips (conftest's check); a document
+    with a part of the wrong kind names the part instead of building a plan
+    that fails later."""
+    with pytest.raises(ValueError, match=named):
+        ProcessPlan.from_dict(written)

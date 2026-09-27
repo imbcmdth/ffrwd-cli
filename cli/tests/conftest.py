@@ -169,3 +169,40 @@ def _snapshot_function_surface(
     monkeypatch.setattr(
         mcp_tools, "registry_module", SimpleNamespace(load=_reference_registry)
     )
+
+
+@pytest.fixture(autouse=True)
+def _plans_round_trip(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Every process plan a test builds comes back whole from its JSON.
+
+    A plan is handed to another process as ``to_dict`` written to JSON, and
+    rebuilt with ``from_dict``: what comes back writes the same document, and
+    renders the same argv wherever the original renders at all. Recorded at
+    construction, so every plan the suite builds is checked, not a sample.
+    """
+    import json
+
+    from ffrwd import wasm
+    from ffrwd.errors import FfrwdError
+    from ffrwd.execute import plan_argv
+    from ffrwd.processes import ProcessPlan
+
+    built: list[ProcessPlan] = []
+    original = ProcessPlan.__init__
+
+    def recording(self: ProcessPlan, *args: object, **kwargs: object) -> None:
+        original(self, *args, **kwargs)  # type: ignore[arg-type]
+        built.append(self)
+
+    monkeypatch.setattr(ProcessPlan, "__init__", recording)
+    yield
+    monkeypatch.setattr(ProcessPlan, "__init__", original)
+    for plan in built:
+        written = json.loads(json.dumps(plan.to_dict()))
+        back = ProcessPlan.from_dict(written)
+        assert json.loads(json.dumps(back.to_dict())) == written
+        try:
+            argv = plan_argv(plan, sidecar_argv=wasm.shown_argv)
+        except (FfrwdError, KeyError, StopIteration, ValueError):
+            continue
+        assert plan_argv(back, sidecar_argv=wasm.shown_argv) == argv
