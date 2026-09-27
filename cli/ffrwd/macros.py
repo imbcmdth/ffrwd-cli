@@ -21,10 +21,18 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from ffrwd import loudnorm
-from ffrwd.ir import LEAKY, MAX_LATENESS, StreamType
+from ffrwd.ir import (
+    DEFAULT_MAX_LATENESS,
+    DEFAULT_MAX_SPREAD,
+    LEAKY,
+    MAX_LATENESS,
+    MAX_SPREAD,
+    StreamType,
+)
 
 __all__ = [
     "DEFAULT_MAX_LATENESS",
+    "DEFAULT_MAX_SPREAD",
     "INPUT_MACROS",
     "MACROS",
     "Expander",
@@ -70,7 +78,8 @@ class Macro:
     `options` are named-only numeric options, all optional, in render order.
     An empty tuple (every macro but ``loudnorm2`` and ``leaky``) means the
     signature is positional only and any ``=>`` argument is rejected.
-    `positive` names the options that must be greater than zero.
+    `positive` names the options that must be greater than zero, and
+    `nonnegative` those that may also be zero.
     """
 
     name: str
@@ -80,6 +89,7 @@ class Macro:
     kind_hints: dict[str, str] = field(default_factory=dict)
     options: tuple[str, ...] = ()
     positive: tuple[str, ...] = ()
+    nonnegative: tuple[str, ...] = ()
 
     @property
     def signature(self) -> str:
@@ -128,15 +138,14 @@ def _loudnorm2(values: list[object], node: NodeBuilder, options: dict[str, objec
     return node(loudnorm.FILTER, dict(options), [str(f)], ["audio"])
 
 
-# How late a picture may be past the baseline when the call names no limit.
-DEFAULT_MAX_LATENESS = 0.5
-
-
 def _leaky(values: list[object], node: NodeBuilder, options: dict[str, object]) -> str:
-    """One node the sidecar hosts, with its limit written out in full."""
+    """One node the sidecar hosts, with its limits written out in full."""
     (f,) = values
-    limit = options.get(MAX_LATENESS, DEFAULT_MAX_LATENESS)
-    return node(LEAKY, {MAX_LATENESS: limit}, [str(f)], ["video"])
+    limits = {
+        MAX_LATENESS: options.get(MAX_LATENESS, DEFAULT_MAX_LATENESS),
+        MAX_SPREAD: options.get(MAX_SPREAD, DEFAULT_MAX_SPREAD),
+    }
+    return node(LEAKY, limits, [str(f)], ["video"])
 
 
 _LEAKY_SOUND_HINT = (
@@ -183,8 +192,9 @@ MACROS: dict[str, Macro] = {
         output="video",
         expand=_leaky,
         kind_hints={"audio": _LEAKY_SOUND_HINT},
-        options=(MAX_LATENESS,),
+        options=(MAX_LATENESS, MAX_SPREAD),
         positive=(MAX_LATENESS,),
+        nonnegative=(MAX_SPREAD,),
     ),
     "loudnorm2": Macro(
         name="loudnorm2",

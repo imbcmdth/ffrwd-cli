@@ -113,7 +113,7 @@ def test_loudnorm2_signature_and_limits_are_documented() -> None:
 
 
 def test_leaky_signature_is_documented() -> None:
-    assert "ffrwd.leaky(v, max_lateness => ...)" in PROMPT
+    assert "ffrwd.leaky(v, max_lateness => ..., max_spread => ...)" in PROMPT
     assert "the sound beside it is never dropped" in PROMPT
 
 

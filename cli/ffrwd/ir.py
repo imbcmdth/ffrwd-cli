@@ -81,10 +81,16 @@ ROWMERGE = "rowmerge"
 MAX_DISTANCE = "max_distance"
 
 # The node that drops the pictures of a live stream that fall too far behind
-# the wall clock. Hosted the same way; its one argument is how late, in
-# seconds past the earliest a picture has arrived, one may still pass.
+# the wall clock. Hosted the same way; its arguments are how late, in seconds
+# past the earliest a picture has arrived and the spread its input's own
+# delivery adds, one may still pass, and the most that spread may grow to.
 LEAKY = "leaky"
 MAX_LATENESS = "max_lateness"
+MAX_SPREAD = "max_spread"
+# What each is when a call does not write it, the sidecar's own defaults: half
+# a second late, and room for a relay handing on two seconds of pictures at once.
+DEFAULT_MAX_LATENESS = 0.5
+DEFAULT_MAX_SPREAD = 2
 
 # What a line of a sidecar's stderr starts with when it is a row the node
 # reports, a leaky's, rather than its log. The rest of the line is one JSON

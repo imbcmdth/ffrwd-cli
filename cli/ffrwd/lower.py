@@ -16765,6 +16765,15 @@ class _Lowerer:
                     fallback=node,
                     hint=f"its signature is {macro.signature}",
                 )
+            if argument.name in macro.nonnegative and value < 0:
+                raise _error(
+                    ErrorCode.UDF_ARG_TYPE,
+                    f"{call.display}()'s '{argument.name}' option must be "
+                    f"zero or more, got {value}",
+                    argument.value,
+                    fallback=node,
+                    hint=f"its signature is {macro.signature}",
+                )
         return {name: written[name] for name in macro.options if name in written}
 
     def _macro_function_hint(self, name: str) -> str:

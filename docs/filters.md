@@ -81,7 +81,7 @@ The fourth expands in TIME rather than in the graph, and is the one macro with n
 
 The fifth is no ffmpeg filter at all, but a node the sidecar hosts:
 
-- **`ffrwd.leaky(v, max_lateness => 0.5)`** - drop each picture of a live video stream that arrives more than `max_lateness` seconds later than the least late picture so far, lateness being the wall clock less its pts on the Unix epoch, so a slow picture path sheds pictures instead of falling behind the wall clock. Video only; the sound beside it is never dropped. Where it goes, the rows it reports and what it guarantees are in [dialect.md](dialect.md#a-live-picture-that-keeps-up-ffrwdleaky).
+- **`ffrwd.leaky(v, max_lateness => 0.5, max_spread => 2)`** - drop each picture of a live video stream that arrives more than `max_lateness` seconds later than the least late picture so far, past the spread its input's own delivery adds (a relay handing on a group of pictures at once; learned, at most `max_spread`), lateness being the wall clock less its pts on the Unix epoch, so a slow picture path sheds pictures instead of falling behind the wall clock. Video only; the sound beside it is never dropped. Where it goes, the rows it reports and what it guarantees are in [dialect.md](dialect.md#a-live-picture-that-keeps-up-ffrwdleaky).
 
 ## Generated sources in `FROM`
 

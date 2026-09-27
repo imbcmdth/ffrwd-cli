@@ -480,22 +480,33 @@ def test_bare_ffrwd_dot_column_hints_it_is_a_call() -> None:
 
 
 # ---------------------------------------------------------------------------
-# ffrwd.leaky: a node the sidecar hosts, with one named option
+# ffrwd.leaky: a node the sidecar hosts, with two named options
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
-    ("written", "limit"),
-    [("", 0.5), (", max_lateness => 0.25", 0.25), (", max_lateness => 2", 2)],
+    ("written", "limits"),
+    [
+        ("", (0.5, 2)),
+        (", max_lateness => 0.25", (0.25, 2)),
+        (", max_spread => 0", (0.5, 0)),
+        (", max_spread => 1.5, max_lateness => 2", (2, 1.5)),
+    ],
 )
-def test_leaky_is_one_hosted_node_with_its_limit_written_out(
-    written: str, limit: float
+def test_leaky_is_one_hosted_node_with_its_limits_written_out(
+    written: str, limits: tuple[float, float]
 ) -> None:
     g = _lower(f"SELECT ffrwd.leaky(a.video[1]{written}) FROM input('x.mp4') a")
     (node,) = g.nodes.values()
-    assert (node.filter, node.args) == ("leaky", {"max_lateness": limit})
+    lateness, spread = limits
+    assert (node.filter, node.args) == (
+        "leaky",
+        {"max_lateness": lateness, "max_spread": spread},
+    )
     assert (node.inputs, node.outputs) == (["src:a:v:0"], ["video"])
-    assert MACROS["leaky"].signature == "ffrwd.leaky(v, max_lateness => ...)"
+    assert MACROS["leaky"].signature == (
+        "ffrwd.leaky(v, max_lateness => ..., max_spread => ...)"
+    )
 
 
 @pytest.mark.parametrize(
@@ -556,6 +567,11 @@ def test_leaky_takes_its_limits_as_any_compile_time_number(
             "'max_lateness' option must be greater than zero, got 0",
         ),
         (
+            "ffrwd.leaky(a.video[1], max_spread => -1)",
+            ErrorCode.UDF_ARG_TYPE,
+            "'max_spread' option must be zero or more, got -1",
+        ),
+        (
             "ffrwd.leaky(a.video[1], 0.5)",
             ErrorCode.UDF_ARG_TYPE,
             "takes 1 argument, got 2",
@@ -612,7 +628,7 @@ def test_a_leaky_alone_compiles_to_a_plan_the_sidecar_runs(
     at = argv.index("-filter_complex")
     assert argv[at : at + 4] == [
         "-filter_complex",
-        "[0:v]leaky=max_lateness=0.5:node=n1[out0]",
+        "[0:v]leaky=max_lateness=0.5:max_spread=2:node=n1[out0]",
         "-map",
         "[out0]",
     ]

@@ -1414,11 +1414,11 @@ in a `tags` column.
 
 ### A live picture that keeps up: `ffrwd.leaky`
 
-`ffrwd.leaky(v, max_lateness => 0.5)` drops the pictures of a live
-video stream that fall too far behind the wall clock, so a picture path
-that cannot keep up sheds pictures rather than falling further behind.
-The name and the option are GStreamer's: a leaky queue, and a sink's
-max-lateness.
+`ffrwd.leaky(v, max_lateness => 0.5, max_spread => 2)` drops the
+pictures of a live video stream that fall too far behind the wall clock,
+so a picture path that cannot keep up sheds pictures rather than falling
+further behind. The name and the first option are GStreamer's: a leaky
+queue, and a sink's max-lateness.
 
 - **What it reads.** Pts in seconds on the Unix epoch. A head stamps them
   there with `setpts(v, 'PTS-STARTPTS+<epoch>/TB')`; a leaf inherits them
@@ -1426,13 +1426,30 @@ max-lateness.
   smallest lateness seen so far is the baseline, which absorbs a sender
   that started late and any relay in between.
 - **What it does.** A picture later than the baseline by more than
-  `max_lateness` seconds is dropped. Every other picture passes at once,
-  pts, pixels and rows untouched. Nothing is held and nothing is
-  reordered, and the output's timestamps never decrease.
+  its spread plus `max_lateness` seconds is dropped. Every other picture
+  passes at once, pts, pixels and rows untouched. Nothing is held and
+  nothing is reordered, and the output's timestamps never decrease.
+- **The spread.** What the input's own delivery adds. A relay that hands
+  on a whole group of pictures at once (a MoQ subscriber gets a second
+  of them in a few milliseconds) makes the group's first picture a
+  second later than its last. The leaky learns it: a run is pictures
+  each arriving less than half its own pts step after the one before,
+  its width how far their lateness ranges, and it counts when its
+  freshest picture is within half of `max_lateness` of the baseline.
+  The spread is the widest of the last 8 counted runs, each capped at
+  `max_spread`. A backlog drained after a slow stage also arrives at
+  once but ends near the edge of the budget, so it teaches nothing. A
+  steady feed (an SRT or RTMP head) has runs of one picture and a spread
+  of 0. The first run, the reader's own probe backlog as a rule, stands
+  only until another counts.
 - **Arguments.** One video stream; `max_lateness`, named only, in
-  seconds, greater than zero, 0.5 when not written. A sound stream, a
-  `max_lateness` that is not a positive number, and any other argument
-  are refused by name.
+  seconds, greater than zero, 0.5 when not written; `max_spread`, named
+  only, in seconds, zero or more, 2 when not written (room for a relay
+  handing on two seconds of pictures at once; 0 learns no spread). Each
+  is a number or any compile-time value that computes to one:
+  `max_lateness => COALESCE(:max_lateness, 0.5)`. A sound stream, a limit
+  out of range or not a number, and any other argument are refused by
+  name.
 - **Where.** Right after the live input at a head, right after the
   subscribe at a leaf, before anything splits. It is legal anywhere on a
   video lane; over a file it drops nothing unless something upstream
@@ -1477,11 +1494,13 @@ leaky did as a row, on its stdout like any other run row:
 | `dropped` | number | pictures dropped in this window |
 | `lateness_s` | number | the latest picture's lateness, seconds |
 | `baseline_s` | number | the baseline, seconds |
+| `spread_s` | number | the spread learned from the input's delivery, seconds |
 
 What it guarantees, and what it does not:
 
 - At the leaky, the picture never trails the wall by more than the
-  baseline plus `max_lateness`. Stages after it add what they hold,
+  baseline plus the spread plus `max_lateness`, and the spread never
+  grows past `max_spread`. Stages after it add what they hold,
   and that is counted in their own time: a slow ffmpeg's queues keep a
   few pictures past the leaky, so at the file the picture trails by
   `max_lateness` plus those pictures at that stage's rate (about 0.6 s
@@ -1493,7 +1512,7 @@ What it guarantees, and what it does not:
   stage's own rate.
 - Sound is never dropped. It travels beside the picture untouched and
   meets it again at the file or the publish, where the plan gives the
-  sound's pipe `max_lateness` more room (below).
+  sound's pipe `max_lateness` plus `max_spread` more room (below).
 - The baseline is set by the earliest picture seen. A reader probes its
   input before the first picture leaves it, up to five seconds of it by
   default, and those pictures arrive as one late burst; a path too slow
@@ -1503,10 +1522,14 @@ What it guarantees, and what it does not:
 On a live input the plan counts it in time rather than frames. It holds
 no frames, so it adds none to the difference between two paths that
 part at the reader; and each edge leaving the reader that meets its
-path again, and the edge into it, holds `max_lateness` more, in that
-edge's own frames: pictures of the input, or for sound the same stretch
-its bytes are sized by. Half a second at 30 fps is 15 frames. Every
-other node that drops frames still makes a live input's plan
+path again, and the edge into it, holds `max_lateness` plus
+`max_spread` more, in that edge's own frames: pictures of the input, or
+for sound the same stretch its bytes are sized by. The plan cannot know
+how bursty the feed will be, so it counts the whole of `max_spread`:
+two and a half seconds at 30 fps is 75 frames with neither limit
+written. A head that knows its feed is steady can write
+`max_spread => 0` and keep the room at `max_lateness`. Every other node
+that drops frames still makes a live input's plan
 `UNBOUNDED_LIVE_INPUT`.
 
 ## Values and predicates

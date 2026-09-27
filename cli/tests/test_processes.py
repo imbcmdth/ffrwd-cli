@@ -1559,7 +1559,10 @@ def test_sound_beside_a_rate_change_with_no_number_is_refused() -> None:
 
 
 def _leaky_head(
-    picture: str = "leaky", max_lateness: float = 0.5, fps: int | None = None
+    picture: str = "leaky",
+    max_lateness: float = 0.5,
+    fps: int | None = None,
+    max_spread: float = 2,
 ) -> ProcessPlan:
     """A live head: the picture through `picture` (a leaky, or the one-to-one
     ``invert`` to compare with) and the sound beside it into one file, with
@@ -1571,7 +1574,9 @@ def _leaky_head(
             id="f", filter="fps", args={"fps": fps}, inputs=[above], outputs=["video"]
         )
         above = "f"
-    args: dict[str, object] = {"max_lateness": max_lateness} if picture == "leaky" else {}
+    args: dict[str, object] = (
+        {"max_lateness": max_lateness, "max_spread": max_spread} if picture == "leaky" else {}
+    )
     g.nodes["p"] = Node(id="p", filter=picture, args=args, inputs=[above], outputs=["video"])
     g.nodes["loud"] = Node(
         id="loud", filter="volume", args={"volume": 2}, inputs=["src:a:a:0"], outputs=["audio"]
@@ -1597,29 +1602,32 @@ def _bounds(plan: ProcessPlan) -> dict[str, int]:
 
 
 @pytest.mark.parametrize(
-    ("max_lateness", "fps", "held", "grown"),
+    ("max_lateness", "max_spread", "fps", "held", "grown"),
     [
         # The sidecar's own frame, as a module's; then half a second of a
-        # 30 fps input is 15 frames of the sound's bound.
-        (0.5, None, 1, 15),
-        (1.0, None, 1, 30),
-        (0.2, None, 1, 6),
+        # 30 fps input is 15 frames of the sound's bound, and the two
+        # seconds the spread may grow to 60 more.
+        (0.5, 2, None, 1, 75),
+        (0.5, 0, None, 1, 15),
+        (1.0, 0.5, None, 1, 45),
+        (0.2, 0, None, 1, 6),
         # Past a change to 15 fps the picture's own frames last two of the
         # input's, but a frame of the sound's bound is still one picture of
-        # the input: the same 15.
-        (0.5, 15, 3, 15),
+        # the input: the same 75.
+        (0.5, 2, 15, 3, 75),
     ],
 )
 def test_a_leaky_holds_nothing_and_the_sound_beside_it_holds_its_budget(
-    max_lateness: float, fps: int | None, held: int, grown: int
+    max_lateness: float, max_spread: float, fps: int | None, held: int, grown: int
 ) -> None:
     """A path through a leaky is accepted on a live input, where one through
     any other node dropping frames is refused. The leaky counts as no frames
     of delay; the sound edge meeting it again at the file holds max_lateness
-    more, in its own frames, and so does the picture's edge into the leaky,
-    where what arrives while it waits on the file queues to be dropped."""
+    and max_spread more, in its own frames, and so does the picture's edge
+    into the leaky, where what arrives while it waits on the file queues to
+    be dropped."""
     module = _bounds(_leaky_head("invert", fps=fps))
-    leaky = _leaky_head(max_lateness=max_lateness, fps=fps)
+    leaky = _leaky_head(max_lateness=max_lateness, fps=fps, max_spread=max_spread)
     bounds = _bounds(leaky)
 
     assert module["loud"] == held
@@ -1635,17 +1643,25 @@ def test_a_leaky_holds_nothing_and_the_sound_beside_it_holds_its_budget(
 def test_a_picture_meeting_a_leaky_again_holds_the_budget_in_pictures() -> None:
     """The merge with the direct leg in place of the sound: 15 pictures at
     30 fps on top of the one the module's leg always costs, which puts
-    640x360 on the fifo road."""
-    graph = _merge_graph()
-    graph.nodes["e0"] = Node(
-        id="e0", filter="leaky", args={"max_lateness": 0.5}, inputs=["sp:0"], outputs=["video"]
-    )
-    plan = partition(graph, probes={"a": _live_probe()}, anchors={"a": (7, 14)})
-    edge = _edge(plan, "ffmpeg1", "ffmpeg0")
+    640x360 on the fifo road. A node that does not write its max_spread is
+    counted with the sidecar's own, two seconds: 60 pictures more."""
 
+    def plan_with(args: dict[str, object]) -> ProcessPlan:
+        graph = _merge_graph()
+        graph.nodes["e0"] = Node(
+            id="e0", filter="leaky", args=args, inputs=["sp:0"], outputs=["video"]
+        )
+        return partition(graph, probes={"a": _live_probe()}, anchors={"a": (7, 14)})
+
+    plan = plan_with({"max_lateness": 0.5, "max_spread": 0})
+    edge = _edge(plan, "ffmpeg1", "ffmpeg0")
     assert edge.bound == 16
     assert edge.buffer == EdgeBuffer("fifo", 32, packets=32)
     assert _edge(plan, "ffmpeg1", "sidecar0").bound == 15
+
+    plan = plan_with({"max_lateness": 0.5})
+    assert _edge(plan, "ffmpeg1", "ffmpeg0").bound == 76
+    assert _edge(plan, "ffmpeg1", "sidecar0").bound == 75
 
 
 def test_a_leaky_on_a_live_inputs_only_path_still_holds_its_queue() -> None:
@@ -1653,19 +1669,20 @@ def test_a_leaky_on_a_live_inputs_only_path_still_holds_its_queue() -> None:
     the edge into the leaky still holds what arrives while it waits."""
     g = Graph(input_paths=[LIVE], sources={"a": 0})
     g.nodes["p"] = Node(
-        id="p", filter="leaky", args={"max_lateness": 0.5}, inputs=["src:a:v:0"],
-        outputs=["video"],
+        id="p", filter="leaky", args={"max_lateness": 0.5, "max_spread": 2},
+        inputs=["src:a:v:0"], outputs=["video"],
     )  # fmt: skip
     g.sinks = [SinkUnit(outputs=[_out("p")], path="out.mkv")]
     plan = partition(g, probes={"a": _live_probe()})
 
-    assert _bounds(plan) == {"src:a:v:0": 15, "p": 0}
+    assert _bounds(plan) == {"src:a:v:0": 75, "p": 0}
 
 
 def test_a_leaf_leaky_counts_its_budget_in_the_copied_sounds_frames() -> None:
     """A subscribed source states no picture rate, so a frame of the copied
     sound's bound is the longest a frame is taken to last, a tenth of a
-    second, which is also what its bytes are sized by: half a second is 5."""
+    second, which is also what its bytes are sized by: half a second and the
+    spread's two are 25."""
 
     def leaf(node: Node) -> int:
         g = _source_passthrough_graph(bounded=False)
@@ -1677,8 +1694,8 @@ def test_a_leaf_leaky_counts_its_budget_in_the_copied_sounds_frames() -> None:
         return sound.bound
 
     module = Node(id="e0", filter="denoise", args={}, inputs=["src:s:v:0"], outputs=["video"])
-    leaky = replace(module, filter="leaky", args={"max_lateness": 0.5})
-    assert leaf(leaky) == leaf(module) + 5
+    leaky = replace(module, filter="leaky", args={"max_lateness": 0.5, "max_spread": 2})
+    assert leaf(leaky) == leaf(module) + 25
 
 
 def test_a_lone_leaky_is_spelled_as_a_network_naming_its_node() -> None:
@@ -1690,7 +1707,7 @@ def test_a_lone_leaky_is_spelled_as_a_network_naming_its_node() -> None:
     assert sidecar.modules == () and sidecar.network
     argv = wasm.shown_argv(sidecar)
     assert argv[argv.index("-filter_complex") + 1] == (
-        "[0:v]leaky=max_lateness=0.5:node=p[out0]"
+        "[0:v]leaky=max_lateness=0.5:max_spread=2:node=p[out0]"
     )
 
 

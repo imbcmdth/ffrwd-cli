@@ -3045,8 +3045,9 @@ Nothing tells the function how many rungs there are: the list says. The other sp
 A head whose picture path cannot keep up with its feed falls further
 behind for as long as the feed runs. `ffrwd.leaky` drops the pictures
 that arrive more than `max_lateness` seconds later than the least late
-one so far, reading lateness off pts stamped onto the Unix epoch, so the
-picture stays near the wall and the sound beside it arrives whole. It
+one so far, past the spread the feed's own delivery adds, reading
+lateness off pts stamped onto the Unix epoch, so the picture stays near
+the wall and the sound beside it arrives whole. It
 is a node the sidecar hosts, so the query runs as three processes even
 with no module in it:
 
@@ -3073,20 +3074,23 @@ $ ffrwd compile -f query.sql
 2. ffmpeg: ffmpeg -analyzeduration 500000 -i 'srt://0.0.0.0:9000?mode=listener' \
   -filter_complex '[0:v:0]setpts=PTS-STARTPTS+1790351579/TB[out0]' -filter_complex \
   '[0:a:0]asetpts=PTS-STARTPTS+1790351579/TB[out1]' -map '[out0]' -c:0 rawvideo \
-  -pix_fmt:0 yuv420p -fps_mode:0 passthrough -fifo_format nut -queue_size 30 -f fifo \
+  -pix_fmt:0 yuv420p -fps_mode:0 passthrough -fifo_format nut -queue_size 150 -f fifo \
   '<named pipe ffmpeg1-sidecar0 n1 write>' -map '[out1]' -c:0 pcm_f32le -f nut \
   '<named pipe ffmpeg1-ffmpeg0 n3 write>'
 3. sidecar: ffrwd-wasm -f nut -i pipe:0 -filter_complex \
-  '[0:v]leaky=max_lateness=0.5:node=n2[out0]' -map '[out0]' -f nut pipe:1
+  '[0:v]leaky=max_lateness=0.5:max_spread=2:node=n2[out0]' -map '[out0]' -f nut pipe:1
 # this listing is not a shell command -- run the plan with `ffrwd run`
 ```
 
 The leaky holds nothing, so it adds no frames to the difference between
 the two paths leaving the reader. It adds time instead: the sound meets
 the picture again at the file, and while the leaky lets the picture
-trail by up to half a second more, the sound's pipe holds half a second
-more, 15 frames of the bound at 30 fps on top of the one the sidecar
-costs. The edge into the leaky holds the same, on the fifo road here,
+trail by up to `max_lateness` plus the spread it learns, at most
+`max_spread` (2 s when not written), the sound's pipe holds that much
+more, 75 frames of the bound at 30 fps on top of the one the sidecar
+costs. An SRT feed like this one arrives a picture at a time and learns
+no spread; `max_spread => 0` would keep the room at half a second. The
+edge into the leaky holds the same, on the fifo road here,
 since at 720p that is more than a pipe is made to hold: pictures that
 arrive while the leaky waits on the encoder queue there, and it drops
 the ones that are too old once it reads them. `analyzeduration` keeps

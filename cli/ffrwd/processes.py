@@ -89,10 +89,11 @@ change ahead of the reader's split delays every path alike and cancels out.
 
 A leaky drops frames too, and is the exception, because what it costs a path
 is bounded in TIME: it holds nothing, and what it hands on trails the wall by
-at most its ``max_lateness`` more than the earliest picture did. It counts as
-no frames of delay, and that ``max_lateness`` is added in time instead: to
-every other edge meeting its path again, and to the edge into it, each turned
-into that edge's own frames.
+at most its ``max_lateness`` plus the spread its input's delivery adds more
+than the earliest picture did, and it learns that spread up to its
+``max_spread``. It counts as no frames of delay, and ``max_lateness`` plus
+``max_spread`` is added in time instead: to every other edge meeting its path
+again, and to the edge into it, each turned into that edge's own frames.
 
 A payload holds only the split it needs. A `split`/`asplit` whose consumers
 landed in other processes is cut to the pads still read here: one left and the
@@ -114,8 +115,11 @@ from typing import Literal
 
 from .errors import ErrorCode, FfrwdError
 from .ir import (
+    DEFAULT_MAX_LATENESS,
+    DEFAULT_MAX_SPREAD,
     LEAKY,
     MAX_LATENESS,
+    MAX_SPREAD,
     PIPE,
     ROWFILTER,
     ROWMERGE,
@@ -2620,13 +2624,15 @@ class _Partitioner:
 
         A leaky on a path is counted in time rather than frames. It holds
         nothing, so its frames add nothing to the difference; but what it
-        hands on may trail the wall by as much as its ``max_lateness`` more
-        than the earliest picture did, and while it does, every other edge
-        meeting that path holds that much more. So each edge also holds the
+        hands on may trail the wall by as much as its ``max_lateness`` plus
+        its ``max_spread`` more than the earliest picture did (the spread it
+        learns from its input's delivery never grows past ``max_spread``),
+        and while it does, every other edge meeting that path holds that
+        much more. So each edge also holds the
         most any OTHER edge of the group trails by (:meth:`_late_seconds`),
         turned into its own frames (:meth:`_bound_frame_seconds`).
 
-        The edge INTO a leaky holds its ``max_lateness`` too, whether or not
+        The edge INTO a leaky holds the same stretch too, whether or not
         anything meets it again. While the leaky waits on a slow stage after
         it, the pictures still arriving queue on that edge, and the leaky
         drops the ones that are too old once it reads them. Without the room,
@@ -2706,8 +2712,8 @@ class _Partitioner:
         """How far past its baseline a leaky lets `start`'s path trail into
         `target`, in seconds.
 
-        Each process a frame passes THROUGH on the way adds the largest
-        ``max_lateness`` of the leaky nodes it holds, and the answer is the
+        Each process a frame passes THROUGH on the way adds the most any
+        leaky node it holds lets a picture trail (:meth:`_leaky_seconds`), and the answer is the
         longest path's. Nothing else on a path trails in time, so a path with
         no leaky on it is 0.
         """
@@ -2738,23 +2744,33 @@ class _Partitioner:
 
     def _leaky_queue(self, edge: StreamEdge) -> int:
         """The frames `edge` holds for a leaky in the process it feeds: that
-        leaky's ``max_lateness`` in the edge's own frames, or 0 for none."""
+        leaky's stretch (:meth:`_leaky_seconds`) in the edge's own frames,
+        or 0 for none."""
         seconds = self._leaky_seconds(edge.target)
         if seconds <= 0:
             return 0
         return math.ceil(round(seconds / self._bound_frame_seconds(edge, Fraction(1)), 6))
 
     def _leaky_seconds(self, pid: str) -> float:
-        """The largest ``max_lateness`` of the leaky nodes process `pid` holds."""
+        """The most a leaky node in process `pid` lets a picture trail past
+        the baseline: its ``max_lateness`` plus its ``max_spread``, the
+        largest over the leaky nodes it holds."""
         return max(
             (
-                float(limit)
+                self._leaky_limit(self.g.nodes[name].args, MAX_LATENESS, DEFAULT_MAX_LATENESS)
+                + self._leaky_limit(self.g.nodes[name].args, MAX_SPREAD, DEFAULT_MAX_SPREAD)
                 for name in self.members.get(pid, [])
                 if self.g.nodes[name].filter == LEAKY
-                and isinstance(limit := self.g.nodes[name].args.get(MAX_LATENESS), int | float)
             ),
             default=0.0,
         )
+
+    @staticmethod
+    def _leaky_limit(args: dict[str, object], key: str, default: float) -> float:
+        """One of a leaky's limits in seconds, the sidecar's default where
+        the node does not write it."""
+        value = args.get(key)
+        return float(value) if isinstance(value, int | float) else float(default)
 
     def _bound_frame_seconds(self, edge: StreamEdge, scale: Fraction) -> float:
         """How long one frame of `edge`'s bound lasts, in seconds.

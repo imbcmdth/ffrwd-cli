@@ -990,11 +990,13 @@ ffrwd's own).
      in a table/CSV query. Each is `UNSUPPORTED_SQL`. Use the bare
      `loudnorm(...)` filter instead when one pass is genuinely enough (a
      live stream, or a file you have already measured).
-   - `ffrwd.leaky(v, max_lateness => ...)` -- drop each picture of a LIVE
-     video `v` that arrives more than `max_lateness` seconds (default 0.5)
-     later than the least late picture so far, lateness being the wall
-     clock less its pts read as seconds on the Unix epoch (stamp a head's
-     with `setpts(v, 'PTS-STARTPTS+<epoch>/TB')`).
+   - `ffrwd.leaky(v, max_lateness => ..., max_spread => ...)` -- drop each
+     picture of a LIVE video `v` that arrives more than `max_lateness`
+     seconds (default 0.5) later than the least late picture so far, past
+     the spread its input's delivery adds (a MoQ relay hands on a second of
+     pictures at once; learned, at most `max_spread`, default 2), lateness
+     being the wall clock less its pts read as seconds on the Unix epoch
+     (stamp a head's with `setpts(v, 'PTS-STARTPTS+<epoch>/TB')`).
      Every other picture passes untouched; nothing is held. VIDEO ONLY, and
      the sound beside it is never dropped. Put it right after the live
      input, before anything splits, so a slow path sheds pictures instead of
