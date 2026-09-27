@@ -491,7 +491,9 @@ class _Compile:
 class _Agent:
     """One node's runner, from the job to the last stage."""
 
-    def __init__(self, channel: Channel, job: Mapping[str, object], secret: str, host: str) -> None:
+    def __init__(
+        self, channel: Channel, job: Mapping[str, object], secret: str, host: str
+    ) -> None:
         self._channel = channel
         self._secret = secret
         raw_plan, raw_node = job.get("plan"), job.get("node")
@@ -795,10 +797,8 @@ class _Agent:
                 if code is not None and member.id not in exited:
                     exited.add(member.id)
                     self._channel.send({"type": "exited", "process": member.id, "code": code})
-            if (
-                run.watching
-                and not closed
-                and all(window.poll() is not None for window in run.watching.values())
+            if run.watching and not closed and all(
+                window.poll() is not None for window in run.watching.values()
             ):
                 closed = True
                 self._channel.send({"type": "windows-closed"})
@@ -938,7 +938,6 @@ def _error_from(written: Mapping[str, object]) -> FfrwdError:
 
 
 # -- the coordinator
-
 
 class Runner(Protocol):
     """One node's runner as whatever started it holds it: a subprocess here,
@@ -1124,7 +1123,9 @@ class _Coordinator:
                 )
             if node.refusal is not None:
                 raise node.refusal
-        addresses = {str(node.index): list(node.address) for node in self.nodes if node.address}
+        addresses = {
+            str(node.index): list(node.address) for node in self.nodes if node.address
+        }
         for node in self.nodes:
             self._send(node, {"type": "peers", "addresses": addresses})
 
@@ -1573,3 +1574,4 @@ def execute_split(
         return PlanResult(stages, interrupted=True)
     finally:
         coordinator.close()
+

@@ -150,7 +150,10 @@ _PRODUCE = "import sys; sys.stdout.buffer.write(bytes(range(256)) * 4096); sys.s
 
 
 def _consume(path: Path) -> str:
-    return f"import sys; data = sys.stdin.buffer.read(); open({str(path)!r}, 'wb').write(data)"
+    return (
+        "import sys; data = sys.stdin.buffer.read(); "
+        f"open({str(path)!r}, 'wb').write(data)"
+    )
 
 
 def _python(code: str) -> list[str]:
@@ -166,7 +169,9 @@ def _pair(tmp_path: Path, consumer: str | None = None) -> tuple[ProcessPlan, Pat
                 id="sidecar1", module=consumer or _consume(out), node="c", inputs=("n0",)
             ),
         ),
-        edges=(StreamEdge(source="sidecar0", target="sidecar1", ref="n0", format=VideoFormat()),),
+        edges=(
+            StreamEdge(source="sidecar0", target="sidecar1", ref="n0", format=VideoFormat()),
+        ),
     )
     return plan, out
 
@@ -255,7 +260,6 @@ def test_a_remote_run_places_itself_and_takes_no_target(
 
     assert cli.main(["run", "SELECT 1", "--remote", "--target", "split-local"]) == 2
     assert "--target is for a run on this machine" in capsys.readouterr().err
-
 
 # -- a runner on a machine of its own
 
