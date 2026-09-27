@@ -358,6 +358,28 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   there is a file under that and nothing else - and the module's own
   `wants` says how much of the stream is copied.
   Recipe [138](corpus.md#138-read-a-streams-own-packets-while-compiling).
+- An **encoder or decoder `LANGUAGE wasm` function** (`RETURNS encoder`,
+  `RETURNS decoder`) is a codec package's: a codec ffmpeg does not know,
+  whose identity on the wire is its four-character tag (`PYRW`). It takes
+  only values; the stream is the output's or the input's, and whether it
+  codes video or audio is its module's to say. An encoder is written
+  where a codec name goes: `WITH (video_codec
+  ffrwd.pyrowave.encode(bitrate => 200000000))`, or `video_codec => ...`.
+  Every output stream of that kind is coded by it, raw frames in and
+  packets out, and ffmpeg copies what it writes; an option that shapes
+  ffmpeg's own encoder for that kind (`crf`, `gop`, `video_bitrate` and
+  the like) is refused beside it, since the encoder's settings are its
+  own arguments. A decoder is used unasked: an input stream whose tag its
+  module reads is decoded by it wherever the query reads the stream as
+  frames - a filter, a module, an encoder, an output naming a codec - and
+  `input(..., decoder => ffrwd.pyrowave.decode())` names one outright.
+  An output that copies such a stream keeps it coded. Either way the
+  file has to be one that keeps a stream by its tag: `.nut`, `.mkv` or
+  `.mov`. mp4 cannot hold it and is refused, as is every other
+  container. A package's own `encode` and `decode` may take a name
+  Postgres already uses, since they are only ever called qualified; a
+  script's own may not. Each runs alone in a sidecar (`-codec encode` or
+  `-codec decode`), from the `ffrwd:av@0.18.0` world on.
 - A **value-returning `LANGUAGE wasm` function** (`RETURNS text`,
   `number`, `boolean` or `vector`) takes no stream at all: every
   parameter is one of those same `vtype`s, matched name-for-name against
