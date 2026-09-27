@@ -37,7 +37,8 @@ from pathlib import Path
 import pytest
 
 from ffrwd import binaries, compiler, processes, wasm
-from ffrwd.compiler import compile_all
+from ffrwd.compiler import compile_all, compile_sql
+from ffrwd.emit import build_ffmpeg_args, emit
 from ffrwd.execute import execute_plan, plan_argv
 from ffrwd.processes import StreamEdge, VideoFormat
 
@@ -242,3 +243,50 @@ def test_a_720p_conform_of_a_1080p_feed_crosses_the_fifo_road_frame_for_frame(
         assert _FRAMES - 10 <= frames <= _FRAMES, frames
     # On the wall clock the query stamped, which is what the fifo road lost.
     assert float(str(written["start_time"])) >= _EPOCH
+
+
+def test_an_rtmp_listener_waits_for_its_publisher_and_ends_with_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A query with no module is one ffmpeg: ``-listen 1 -timeout 30`` before
+    its ``-i``, waiting for the publisher, taking every frame it sends, and
+    done when the publisher is."""
+
+    def no_probe(*args: object, **kwargs: object) -> None:
+        raise AssertionError(f"probed {args}: a listening input must not be")
+
+    monkeypatch.setattr(compiler, "probe_path", no_probe)
+    port = _free_port(socket.SOCK_STREAM)
+    url = f"rtmp://127.0.0.1:{port}/live/test"
+    out_path = tmp_path / "rtmp.mkv"
+    graph = compile_sql(
+        f"COPY (SELECT s.video[1] FROM input('{url}', listen => true, "
+        f"listen_timeout => 30, {_SHAPE}) s) "
+        f"TO '{out_path.as_posix()}' WITH (video_codec 'ffv1')"
+    )
+    argv = build_ffmpeg_args(emit(graph))
+    at = argv.index("-i")
+    assert argv[at - 4 : at + 2] == ["-listen", "1", "-timeout", "30", "-i", url]
+
+    run = subprocess.Popen(
+        [*argv[:1], "-hide_banner", "-y", *argv[1:]],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    sender = _Sender(["-f", "flv", url])
+    try:
+        sender.start()
+        _, err = run.communicate(timeout=_TIMEOUT)
+    finally:
+        if run.poll() is None:
+            binaries.end_tree(run)
+            run.wait(timeout=10)
+        sender.stop()
+
+    assert run.returncode == 0, err[-2000:]
+    assert sender.delivered
+    written = _written(out_path)
+    assert (written["width"], written["height"]) == (1920, 1080)
+    assert int(str(written["nb_read_frames"])) == _FRAMES
