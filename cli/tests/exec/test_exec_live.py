@@ -18,13 +18,19 @@ frame was dropped: the fifo muxer declares no variable frame rate, so ffmpeg
 ran it at a constant one, found billions of frames missing between zero and
 the wall clock, and would not duplicate them.
 
+A listener's sender may also arrive late. The ``feed-probe`` module reads a
+feeder beside the feed, and its sender dials only after the whole feeder
+wait has gone: the wait counts from the feed's first bytes, not the launch.
+
 Requires ``ffmpeg``/``ffprobe`` on PATH with libx264, libsrt and ffv1, the
-``ffrwd-wasm`` sidecar, and the sidecar fleet's ``invert`` module built for
-``wasm32-wasip2``. Tests skip cleanly when any of those is missing.
+``ffrwd-wasm`` sidecar, and the sidecar fleet's ``invert`` and ``feed-probe``
+modules built for ``wasm32-wasip2``. Tests skip cleanly when any of those is
+missing.
 """
 
 from __future__ import annotations
 
+import importlib
 import json
 import shutil
 import socket
@@ -92,13 +98,18 @@ class _Sender:
         ]  # fmt: skip
         self.started: list[subprocess.Popen[str]] = []
         self.delivered = False
+        self._after = 0.0
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._dial, daemon=True)
 
-    def start(self) -> None:
+    def start(self, after: float = 0.0) -> None:
+        """Start dialling, `after` seconds from now: a sender that is late."""
+        self._after = after
         self._thread.start()
 
     def _dial(self) -> None:
+        if self._stop.wait(self._after):
+            return
         deadline = time.monotonic() + _TIMEOUT / 2
         while not self._stop.is_set() and time.monotonic() < deadline:
             sender = subprocess.Popen(
@@ -138,22 +149,26 @@ def _query(spelled: str, out_path: Path) -> str:
     )
 
 
+def _listener(protocol: str) -> tuple[str, _Sender]:
+    """A listening input as the query spells it, and the sender to dial it."""
+    if protocol == "srt":
+        port = _free_port(socket.SOCK_DGRAM)
+        spelled = f"input('srt://127.0.0.1:{port}?mode=listener&latency=200000', {_SHAPE})"
+        return spelled, _Sender(
+            ["-f", "mpegts", f"srt://127.0.0.1:{port}?mode=caller&latency=200000"]
+        )
+    port = _free_port(socket.SOCK_STREAM)
+    spelled = f"input('rtmp://127.0.0.1:{port}/live/test', listen => true, {_SHAPE})"
+    return spelled, _Sender(["-f", "flv", f"rtmp://127.0.0.1:{port}/live/test"])
+
+
 @pytest.fixture(params=["realtime", "srt", "rtmp"])
 def _feed(request: pytest.FixtureRequest) -> Iterator[tuple[str, _Sender | None]]:
     """The input as the query spells it, and the sender feeding it, if any."""
     if request.param == "realtime":
         yield f"input('{_SOURCE}', format => 'lavfi', realtime => true)", None
         return
-    if request.param == "srt":
-        port = _free_port(socket.SOCK_DGRAM)
-        spelled = f"input('srt://127.0.0.1:{port}?mode=listener&latency=200000', {_SHAPE})"
-        sender = _Sender(
-            ["-f", "mpegts", f"srt://127.0.0.1:{port}?mode=caller&latency=200000"]
-        )
-    else:
-        port = _free_port(socket.SOCK_STREAM)
-        spelled = f"input('rtmp://127.0.0.1:{port}/live/test', listen => true, {_SHAPE})"
-        sender = _Sender(["-f", "flv", f"rtmp://127.0.0.1:{port}/live/test"])
+    spelled, sender = _listener(request.param)
     try:
         yield spelled, sender
     finally:
@@ -290,3 +305,71 @@ def test_an_rtmp_listener_waits_for_its_publisher_and_ends_with_it(
     written = _written(out_path)
     assert (written["width"], written["height"]) == (1920, 1080)
     assert int(str(written["nb_read_frames"])) == _FRAMES
+
+
+_PROBE = (
+    _REPO_ROOT / "sidecar" / "modules" / "target" / "wasm32-wasip2" / "release"
+    / "feed_probe.wasm"
+)
+# The feeder wait this test runs with, and how long after the run starts the
+# sender dials: later than the whole wait.
+_FEEDER_WAIT = 4.0
+_LATE = 8.0
+# The feeder: a second at the feed's rate, smaller than the feed.
+_FEEDER_SPEC = f"testsrc2=size=320x180:rate={_RATE}:duration=1"
+
+
+@pytest.mark.parametrize("protocol", ["srt", "rtmp"])
+def test_a_feeder_waits_for_a_listener_whose_sender_is_late(
+    protocol: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A presenter starts sending whenever they are ready. The module cannot
+    listen for its feeder before the programme's header reaches it, so the
+    feeder wait counts from the first bytes the listener delivers, and a
+    sender dialling after the whole wait has gone still gets a full run."""
+    if not _PROBE.exists():
+        pytest.skip(f"module missing: {_PROBE}")
+    monkeypatch.setattr(importlib.import_module("ffrwd.execute"), "FEEDER_WAIT", _FEEDER_WAIT)
+    feeder = tmp_path / "feeder.mp4"
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", _FEEDER_SPEC,
+         "-pix_fmt", "yuv420p", str(feeder)],
+        check=True,
+        timeout=_TIMEOUT,
+    )  # fmt: skip
+    spelled, sender = _listener(protocol)
+    rows_path = tmp_path / "rows.ndjson"
+    compiled = compile_all(
+        "CREATE FUNCTION probe(v video_stream, feed video_stream DEFAULT NULL, "
+        "port number DEFAULT 9000)\n"
+        "RETURNS STRUCT(v video_stream, feeds STRUCT(feed_pts number, w number, "
+        "h number)[])\n"
+        f"AS '{_PROBE.as_posix()}', 'feed-probe' LANGUAGE wasm;\n"
+        f"COPY (SELECT probe(s.video[1], a.video[1]).feeds FROM {spelled} s, "
+        f"input('{feeder.as_posix()}') a) TO '{rows_path.as_posix()}'"
+    )
+    plan = compiled.plan
+    assert plan is not None and plan.feeder_edges
+
+    started = time.monotonic()
+    try:
+        sender.start(after=_LATE)
+        result = execute_plan(
+            plan, sidecar_argv=wasm.sidecar_argv, overwrite=True, timeout=_TIMEOUT
+        )
+    finally:
+        sender.stop()
+    assert result.overflow is None, str(result.overflow)
+    assert result.exit_code == 0, "\n".join(
+        f"{member.id} exited {member.exit_code}: {member.stderr_tail}"
+        for stage in result.stages
+        for member in stage.members
+    )
+    assert not result.timed_out
+    assert sender.delivered, "the sender never got through to the listener"
+    assert time.monotonic() - started >= _LATE
+
+    rows = [json.loads(line) for line in rows_path.read_text().splitlines() if line]
+    # Every picture of the feeder, at the programme's size.
+    assert len(rows) == _RATE
+    assert {(row["w"], row["h"]) for row in rows} == {(1920, 1080)}
