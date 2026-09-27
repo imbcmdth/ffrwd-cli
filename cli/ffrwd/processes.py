@@ -728,10 +728,11 @@ class ModelBinding:
 
 @dataclass(frozen=True)
 class EffectGrant:
-    """One ``-http <path>`` or ``-udp <path>``: an effect one module is allowed.
+    """One ``-http <path>``, ``-udp <path>`` and so on: an effect one module is allowed.
 
     `effect` is the capability name -- ``http`` for outbound HTTP requests,
-    ``udp`` for UDP sockets, ``tcp`` for TCP ones -- and `module` the path of
+    ``udp`` for UDP sockets, ``tcp`` for TCP ones, ``gpu`` for GPU compute
+    through wasi:webgpu -- and `module` the path of
     the module granted it. The sidecar denies every one by default; the argv
     is the grant.
     """
@@ -3754,7 +3755,7 @@ def partition(
     runs none is absent and binds nothing.
 
     `effects` is keyed the same way and is what each module needs granted --
-    ``http``, ``udp``, ``tcp`` -- which the sidecar denies without the
+    ``http``, ``udp``, ``tcp``, ``gpu`` -- which the sidecar denies without the
     matching argv.
     A module needing neither is absent and is granted nothing.
 

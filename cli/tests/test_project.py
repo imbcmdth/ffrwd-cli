@@ -4935,7 +4935,7 @@ def test_a_blank_homepage_is_the_same_as_absent(tmp_path: Path) -> None:
             "files entry 'docs/[abc].md' is written with a pattern character",
         ),
         ({"capabilities": "nn"}, '"capabilities" must be a list'),
-        ({"capabilities": ["gpu"]}, "capability 'gpu' is not one this ffrwd grants"),
+        ({"capabilities": ["fs"]}, "capability 'fs' is not one this ffrwd grants"),
         ({"capabilities": [1]}, "capability 1 is not one this ffrwd grants"),
         ({"license": ""}, '"license" must be a non-empty string'),
         ({"license": "   "}, '"license" must be a non-empty string'),

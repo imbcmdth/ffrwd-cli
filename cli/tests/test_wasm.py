@@ -4839,8 +4839,27 @@ def test_the_two_socket_protocols_are_read_apart() -> None:
     assert tcp_only.tcp and not tcp_only.udp
 
 
+def test_a_gpu_module_is_read_off_the_describe_and_held_to_two_workers() -> None:
+    """wasi:webgpu is a grant like the sockets, and a process holding a GPU
+    module runs few workers: each one's instance opens a device."""
+    described = wasm._described(SINK_MODULE, {"world": "ffrwd:av@0.17.0", "name": "p", "gpu": True})
+    assert described.gpu and not described.http
+    process = SidecarProcess(
+        id="sidecar0",
+        module=SINK_MODULE,
+        node="n",
+        grants=(EffectGrant(effect="gpu", module=SINK_MODULE),),
+    )
+    for asked, written in ((None, "2"), (32, "2"), (1, "1")):
+        argv = wasm._argv("ffrwd-wasm", process, jobs=asked)
+        assert argv[argv.index("-jobs") + 1] == written
+        assert argv[argv.index("-gpu") + 1] == SINK_MODULE
+    plain = SidecarProcess(id="sidecar0", module=SINK_MODULE, node="n")
+    assert "-jobs" not in wasm._argv("ffrwd-wasm", plain)
+
+
 def test_each_effect_puts_its_own_flag_on_the_argv() -> None:
-    for effect, flag in (("http", "-http"), ("udp", "-udp"), ("tcp", "-tcp")):
+    for effect, flag in (("http", "-http"), ("udp", "-udp"), ("tcp", "-tcp"), ("gpu", "-gpu")):
         described = Described(world="ffrwd:av@0.15.0", name="p", **{effect: True})
         assert wasm._grant_args(described, SINK_MODULE) == [flag, SINK_MODULE]
 

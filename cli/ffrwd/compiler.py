@@ -362,8 +362,9 @@ def _effect_grants(
     """What each module needs granted, keyed by module path.
 
     Read off the describe: a module importing wasi:http needs ``http``, one
-    importing ``wasi:sockets/udp`` needs ``udp`` and one importing
-    ``wasi:sockets/tcp`` needs ``tcp``. The two protocols are two interfaces
+    importing ``wasi:sockets/udp`` needs ``udp``, one importing
+    ``wasi:sockets/tcp`` needs ``tcp`` and one importing ``wasi:webgpu``
+    needs ``gpu``. The two protocols are two interfaces
     and two grants, so a module gets the one it reached for and not the
     other. The sidecar denies every one of them without the matching argv,
     which is what these become.

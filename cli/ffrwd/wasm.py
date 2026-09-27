@@ -381,11 +381,23 @@ _JOBS_FLAG = "-jobs"
 # The effects a module's own imports can ask the host for, in the order the
 # argv writes their grants. `nn` is not among them: a model is bound to a
 # name rather than granted.
-EFFECTS: tuple[str, ...] = ("http", "udp", "tcp")
+EFFECTS: tuple[str, ...] = ("http", "udp", "tcp", "gpu")
 
 # The sidecar flag that grants each effect to one module: one flag per
 # capability, named for it.
-_GRANT_FLAGS: Mapping[str, str] = {"http": "-http", "udp": "-udp", "tcp": "-tcp"}
+_GRANT_FLAGS: Mapping[str, str] = {
+    "http": "-http",
+    "udp": "-udp",
+    "tcp": "-tcp",
+    "gpu": "-gpu",
+}
+
+# The most workers a sidecar process holding a GPU-granted module gets. A
+# frame-independent module runs one instance per worker, and each instance
+# opens a GPU device of its own: pyrowave's encode-and-decode round trip ran
+# about 270 fps at one or two workers and 48 fps at the default 32, the
+# devices contending for one GPU. A run's own lower -jobs still wins.
+GPU_JOBS = 2
 MODEL_SUFFIX = ".onnx"
 ANNOTATIONS_IN = "in"
 ANNOTATIONS_OUT = "out"
@@ -520,12 +532,13 @@ class Described:
     windowed: bool = False
     inputs: int = 1
     nn: bool = False
-    # Whether the module imports wasi:http, wasi:sockets/udp or
-    # wasi:sockets/tcp, and so runs only under the sidecar's matching
-    # ``-http`` / ``-udp`` / ``-tcp`` grant.
+    # Whether the module imports wasi:http, wasi:sockets/udp,
+    # wasi:sockets/tcp or wasi:webgpu, and so runs only under the sidecar's
+    # matching ``-http`` / ``-udp`` / ``-tcp`` / ``-gpu`` grant.
     http: bool = False
     udp: bool = False
     tcp: bool = False
+    gpu: bool = False
     video_codecs: tuple[str, ...] | None = None
     audio_codecs: tuple[str, ...] = ()
     video_streams: SinkArity = "one"
@@ -736,6 +749,7 @@ def _described(path: str, payload: object) -> Described:
         http=payload.get("http") is True,
         udp=payload.get("udp") is True,
         tcp=payload.get("tcp") is True,
+        gpu=payload.get("gpu") is True,
         # Present only for a packet sink; its ABSENCE is what marks every
         # other module, so an absent key stays None rather than ().
         video_codecs=_strings(payload["video_codecs"])
@@ -876,7 +890,7 @@ def describe(path: str) -> Described:
 
 
 def _grant_args(described: Described, path: str) -> list[str]:
-    """The ``-http``/``-udp``/``-tcp`` grants `described`'s own imports need
+    """The ``-http``/``-udp``/``-tcp``/``-gpu`` grants `described`'s own imports need
     for `path`, which :func:`invoke` and :func:`probe_source` both put ahead
     of the flag that dispatches their call."""
     argv: list[str] = []
@@ -1787,9 +1801,9 @@ def _argv(
     reader has their own machine's. ``-nn-exclude`` names a provider a bound
     model's own pin denies, ahead of the ``-nn`` table the same way.
 
-    ``-http`` and ``-udp`` grant one module its effects, also ahead of the
-    module table: the sidecar denies both to any module the argv never
-    names.
+    ``-http``, ``-udp``, ``-tcp`` and ``-gpu`` grant one module its effects,
+    also ahead of the module table: the sidecar denies each to any module the
+    argv never names.
 
     `reads` is one path per stream the process is handed, each written as its
     own ``-f nut -i <path>``: stdin for the ordinary one-input process, and a
@@ -1813,7 +1827,9 @@ def _argv(
     ``-jobs`` caps the sidecar's worker threads, and is written on every
     sidecar process whenever the run gave one -- the sidecar itself decides
     what each module's lane admits. Absent, the sidecar sizes its pool to
-    the machine, so a run at the default carries no ``-jobs`` at all.
+    the machine, so a run at the default carries no ``-jobs`` at all. A
+    process holding a GPU-granted module is the exception: it gets at most
+    :data:`GPU_JOBS`, since every worker's instance opens a device of its own.
     """
     if process.packet_source and not process.outputs:
         raise _reject(
@@ -1836,6 +1852,8 @@ def _argv(
             meta: PadMeta | None = process.pads[index] if index < len(process.pads) else None
             if meta is not None:
                 argv += ["-pad", json.dumps(meta.to_dict())]
+    if any(grant.effect == "gpu" for grant in process.grants):
+        jobs = GPU_JOBS if jobs is None else min(jobs, GPU_JOBS)
     if jobs is not None:
         argv += [_JOBS_FLAG, str(jobs)]
     if process.reads_rows:
