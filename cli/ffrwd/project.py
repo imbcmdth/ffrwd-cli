@@ -212,8 +212,8 @@ _KNOWN = frozenset(
 # "udp" is UDP sockets and "tcp" is TCP ones: two grants rather than one,
 # because a module that sends datagrams and a module that listens for a
 # connection are asking for different things, and a consumer allows one
-# without allowing the other.
-CAPABILITIES = ("http", "nn", "tcp", "udp")
+# without allowing the other. "gpu" is GPU compute through wasi:webgpu.
+CAPABILITIES = ("gpu", "http", "nn", "tcp", "udp")
 
 # A keyword is a short label the registry indexes. Both bounds keep a document
 # out of the place a list of labels belongs.

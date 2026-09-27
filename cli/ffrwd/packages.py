@@ -1525,6 +1525,7 @@ def module_capabilities(package: Package) -> dict[str, tuple[str, ...]]:
         found[written] = tuple(
             name
             for name, needed in (
+                ("gpu", described.gpu),
                 ("http", described.http),
                 ("nn", described.nn),
                 ("tcp", described.tcp),
