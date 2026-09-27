@@ -16691,7 +16691,7 @@ class _Lowerer:
                     hint=f"its signature is {macro.signature}",
                 )
             try:
-                written[argument.name] = _number(argument.value)
+                value = _number(argument.value)
             except FfrwdError as exc:
                 raise _error(
                     exc.code,
@@ -16701,6 +16701,16 @@ class _Lowerer:
                     fallback=node,
                     hint=f"its signature is {macro.signature}",
                 ) from None
+            written[argument.name] = value
+            if argument.name in macro.positive and value <= 0:
+                raise _error(
+                    ErrorCode.UDF_ARG_TYPE,
+                    f"{call.display}()'s '{argument.name}' option must be "
+                    f"greater than zero, got {value}",
+                    argument.value,
+                    fallback=node,
+                    hint=f"its signature is {macro.signature}",
+                )
         return {name: written[name] for name in macro.options if name in written}
 
     def _macro_function_hint(self, name: str) -> str:

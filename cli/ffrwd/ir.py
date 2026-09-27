@@ -80,6 +80,12 @@ PREDICATE = "pred"
 ROWMERGE = "rowmerge"
 MAX_DISTANCE = "max_distance"
 
+# The node that drops the pictures of a live stream that fall too far behind
+# the wall clock. Hosted the same way; its one argument is how late, in
+# seconds past the earliest a picture has arrived, one may still pass.
+LEAKY = "leaky"
+MAX_LATENESS = "max_lateness"
+
 # Where a rows DOCUMENT one process hands another goes, numbered from 0 per
 # query: ``ffrwd:rows:0``, ``ffrwd:rows:1``. It is a placeholder, not a path
 # -- a compile prints the same text on any machine, and a run resolves each

@@ -50,7 +50,7 @@ from .errors import ErrorCode, FfrwdError
 from .execute import DEFAULT_TIMEOUT
 from .functions import WasmFunction, package_modules, script_definitions
 from .inputs import declared_probe, forces_demuxer, probe_options, render_options
-from .ir import Graph, Lateral
+from .ir import LEAKY, Graph, Lateral
 from .lower import ProbePath, input_option_values, lower_commands, lower_table
 from .parser import Resolved, parse, resolve
 from .probe import ProbeFailure, ProbeResult
@@ -698,7 +698,8 @@ def compile_all(
         span = _run_duration(ready, _probed_paths(res, probes))
         stream_wasm = _stream_wasm(res)
         hosted = _hosted_wasm(res)
-        if not hosted and not ready[0].module_sources:
+        leaky = any(node.filter == LEAKY for node in ready[0].nodes.values())
+        if not hosted and not ready[0].module_sources and not leaky:
             return Compiled(graphs=ready, default_timeout=budget, duration=span)
         try:
             plan = partition(

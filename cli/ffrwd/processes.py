@@ -87,6 +87,13 @@ no such difference, and a live input feeding one is refused at compile time.
 Only what lies past the point where the paths part is counted: a frame rate
 change ahead of the reader's split delays every path alike and cancels out.
 
+A leaky drops frames too, and is the exception, because what it costs a path
+is bounded in TIME: it holds nothing, and what it hands on trails the wall by
+at most its ``max_lateness`` more than the earliest picture did. It counts as
+no frames of delay, and that ``max_lateness`` is added in time instead: to
+every other edge meeting its path again, and to the edge into it, each turned
+into that edge's own frames.
+
 A payload holds only the split it needs. A `split`/`asplit` whose consumers
 landed in other processes is cut to the pads still read here: one left and the
 split dissolves, its consumer reading the split's own input; several and the
@@ -107,6 +114,8 @@ from typing import Literal
 
 from .errors import ErrorCode, FfrwdError
 from .ir import (
+    LEAKY,
+    MAX_LATENESS,
     PIPE,
     ROWFILTER,
     ROWMERGE,
@@ -343,7 +352,12 @@ _ZERO_LATENCY = "zerolatency"
 
 # Nodes the sidecar hosts itself. They belong to a region the way a module
 # does -- ffmpeg cannot run them -- but no ``-m`` entry binds their name.
-HOSTED_FILTERS = frozenset({ROWFILTER, ROWMERGE})
+HOSTED_FILTERS = frozenset({ROWFILTER, ROWMERGE, LEAKY})
+
+# How long a picture is taken to last where nothing states its rate, when a
+# stretch of time is turned into pictures: one at sixty frames a second, so
+# the count errs high.
+_SHORTEST_PICTURE_SECONDS = 1 / 60
 
 # What a module's bound name may not contain: a network string names modules
 # where a filtergraph names filters.
@@ -970,8 +984,12 @@ class SidecarProcess:
             return False
         if self.data_filter or self.codec:
             return False
-        return len(self.graph.nodes) > 1 or any(
-            len(node.inputs) > 1 for node in self.graph.nodes.values()
+        # A leaky is the host's own node, which no ``-m`` loads: it is only
+        # ever spelled in a network string, even alone.
+        return (
+            len(self.graph.nodes) > 1
+            or any(len(node.inputs) > 1 for node in self.graph.nodes.values())
+            or any(node.filter == LEAKY for node in self.graph.nodes.values())
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -2422,6 +2440,10 @@ class _Partitioner:
         from its siblings.
         """
         node = self.g.nodes[name]
+        if node.filter == LEAKY:
+            # It drops pictures, but holds none: what it costs its path is
+            # counted in time instead (:meth:`_late_seconds`).
+            return 0
         if self.external.get(name, False):
             return self._frames_ahead(name) if self._shape(name).one_to_one else None
         if node.filter in SPLIT_FILTERS:
@@ -2595,17 +2617,40 @@ class _Partitioner:
         every one of them passes through delays them all alike and cancels
         out of the difference, so a frame rate change ahead of the split is
         no reason to refuse: :meth:`_group_legs` says which stages cancel.
+
+        A leaky on a path is counted in time rather than frames. It holds
+        nothing, so its frames add nothing to the difference; but what it
+        hands on may trail the wall by as much as its ``max_lateness`` more
+        than the earliest picture did, and while it does, every other edge
+        meeting that path holds that much more. So each edge also holds the
+        most any OTHER edge of the group trails by (:meth:`_late_seconds`),
+        turned into its own frames (:meth:`_bound_frame_seconds`).
+
+        The edge INTO a leaky holds its ``max_lateness`` too, whether or not
+        anything meets it again. While the leaky waits on a slow stage after
+        it, the pictures still arriving queue on that edge, and the leaky
+        drops the ones that are too old once it reads them. Without the room,
+        the reader would wait instead, and a live input that is not read in
+        time loses what it was sent, sound included.
         """
         opened = {p.id: self._opened(p) for p in self.pending}
-        readers = [
+        live = [
             process
             for process in self.pending
             if any(alias in self.live for alias in opened[process.id])
-            and len([e for e in self.edges if e.source == process.id]) > 1
         ]
-        if not readers:
-            return
-        reach = self._downstream()
+        readers = [
+            process
+            for process in live
+            if len([e for e in self.edges if e.source == process.id]) > 1
+        ]
+        reading = {process.id for process in live}
+        queued = {
+            index: self._leaky_queue(edge)
+            for index, edge in enumerate(self.edges)
+            if edge.source in reading
+        }
+        reach = self._downstream() if readers else {}
         bounds: dict[int, int] = {}
         for reader in readers:
             outs = [
@@ -2632,17 +2677,102 @@ class _Partitioner:
                     counted, scale = leg
                     delays[index] = counted + scale * cost
                     scales[index] = scale
+                late = {index: self._late_seconds(edge, pid) for index, edge in group}
                 slowest = max(delays.values())
-                for index, delay in delays.items():
+                for index, edge in group:
                     # In the edge's own frames: one frame of this edge lasts
                     # `scale` of the frames the difference was counted in.
-                    held = math.ceil((slowest - delay) / scales[index])
+                    held = math.ceil((slowest - delays[index]) / scales[index])
+                    trailing = max(
+                        (seconds for other, seconds in late.items() if other != index),
+                        default=0.0,
+                    )
+                    if trailing > 0:
+                        frame = self._bound_frame_seconds(edge, scales[index])
+                        # Rounded first, so half a second at 30 frames a
+                        # second is the 15 frames it is and not 16.
+                        held += math.ceil(round(trailing / frame, 6))
                     bounds[index] = max(bounds.get(index, 0), held)
+        for index, extra in queued.items():
+            if extra:
+                bounds[index] = bounds.get(index, 0) + extra
         for index, bound in bounds.items():
             edge = self.edges[index]
             self.edges[index] = replace(
                 edge, bound=bound, buffer=self._sized(edge, bound)
             )
+
+    def _late_seconds(self, start: StreamEdge, target: str) -> float:
+        """How far past its baseline a leaky lets `start`'s path trail into
+        `target`, in seconds.
+
+        Each process a frame passes THROUGH on the way adds the largest
+        ``max_lateness`` of the leaky nodes it holds, and the answer is the
+        longest path's. Nothing else on a path trails in time, so a path with
+        no leaky on it is 0.
+        """
+        ahead: dict[str, list[str]] = {}
+        for edge in self.edges:
+            ahead.setdefault(edge.source, []).append(edge.target)
+        reach = self._downstream()
+        best: dict[str, float] = {}
+
+        def walk(pid: str) -> float:
+            if pid == target:
+                return 0.0
+            if pid in best:
+                return best[pid]
+            best[pid] = 0.0  # cycle guard
+            below = max(
+                (
+                    walk(after)
+                    for after in ahead.get(pid, [])
+                    if target in reach.get(after, frozenset())
+                ),
+                default=0.0,
+            )
+            best[pid] = self._leaky_seconds(pid) + below
+            return best[pid]
+
+        return walk(start.target)
+
+    def _leaky_queue(self, edge: StreamEdge) -> int:
+        """The frames `edge` holds for a leaky in the process it feeds: that
+        leaky's ``max_lateness`` in the edge's own frames, or 0 for none."""
+        seconds = self._leaky_seconds(edge.target)
+        if seconds <= 0:
+            return 0
+        return math.ceil(round(seconds / self._bound_frame_seconds(edge, Fraction(1)), 6))
+
+    def _leaky_seconds(self, pid: str) -> float:
+        """The largest ``max_lateness`` of the leaky nodes process `pid` holds."""
+        return max(
+            (
+                float(limit)
+                for name in self.members.get(pid, [])
+                if self.g.nodes[name].filter == LEAKY
+                and isinstance(limit := self.g.nodes[name].args.get(MAX_LATENESS), int | float)
+            ),
+            default=0.0,
+        )
+
+    def _bound_frame_seconds(self, edge: StreamEdge, scale: Fraction) -> float:
+        """How long one frame of `edge`'s bound lasts, in seconds.
+
+        A picture of the input the edge comes from, and `scale` of them past a
+        rate change. That is also what :meth:`_frame_bytes` sizes a frame of
+        sound or of a copied stream by, with :data:`LONGEST_FRAME_SECONDS`
+        where the input states no picture rate, so the seconds and the bytes
+        they buy agree. A raw picture of no stated rate is taken to be a short
+        one instead, so the frames a stretch of time comes to are never too
+        few.
+        """
+        seconds = self._picture_seconds(edge.ref)
+        if seconds is None:
+            wire = edge.format
+            raw = isinstance(wire, VideoFormat) and wire.codec == RAWVIDEO
+            seconds = _SHORTEST_PICTURE_SECONDS if raw else LONGEST_FRAME_SECONDS
+        return seconds * float(scale)
 
     def _mark_live_edges(self) -> None:
         """Mark every stream edge a process reading a live input writes."""
@@ -2923,6 +3053,8 @@ class _Partitioner:
         are copies of its input. Nothing else does: an ffmpeg filter declares
         nothing about its frame timing, and this will not assume.
         """
+        if self.g.nodes[name].filter == LEAKY:
+            return False
         if self.external.get(name, False):
             return self._shape(name).one_to_one
         return self.g.nodes[name].filter in SPLIT_FILTERS
@@ -3905,7 +4037,8 @@ class _Partitioner:
                 id=node.id,
                 # A hosted node keeps its reserved name; no ``-m`` binds one.
                 filter=names.get(node.filter, node.filter),
-                args=dict(node.args),
+                # A leaky's rows name it by the id the plan knows it by.
+                args={**node.args, "node": node.id} if node.filter == LEAKY else dict(node.args),
                 inputs=[rewrite(ref) for ref in node.inputs],
                 outputs=list(node.outputs),
                 reads_annotations=node.reads_annotations,

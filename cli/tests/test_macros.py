@@ -21,8 +21,8 @@ from pathlib import Path
 
 import pytest
 
-from ffrwd import loudnorm
-from ffrwd.compiler import compile_sql
+from ffrwd import compiler, loudnorm, wasm
+from ffrwd.compiler import compile_all, compile_sql
 from ffrwd.emit import build_ffmpeg_args, build_ffmpeg_commands, emit
 from ffrwd.errors import ErrorCode, FfrwdError
 from ffrwd.inputs import INPUT_OPTIONS, option_spec
@@ -475,6 +475,116 @@ def test_bare_ffrwd_dot_column_hints_it_is_a_call() -> None:
     err = _reject_resolve("SELECT ffrwd.speed FROM input('x.mp4') a")
     assert err.code == ErrorCode.UNKNOWN_ALIAS
     assert "is a call, not a column" in (err.hint or "")
+
+
+# ---------------------------------------------------------------------------
+# ffrwd.leaky: a node the sidecar hosts, with one named option
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("written", "limit"),
+    [("", 0.5), (", max_lateness => 0.25", 0.25), (", max_lateness => 2", 2)],
+)
+def test_leaky_is_one_hosted_node_with_its_limit_written_out(
+    written: str, limit: float
+) -> None:
+    g = _lower(f"SELECT ffrwd.leaky(a.video[1]{written}) FROM input('x.mp4') a")
+    (node,) = g.nodes.values()
+    assert (node.filter, node.args) == ("leaky", {"max_lateness": limit})
+    assert (node.inputs, node.outputs) == (["src:a:v:0"], ["video"])
+    assert MACROS["leaky"].signature == "ffrwd.leaky(v, max_lateness => ...)"
+
+
+@pytest.mark.parametrize(
+    ("call", "code", "needle"),
+    [
+        (
+            "ffrwd.leaky(a.audio[1])",
+            ErrorCode.UDF_ARG_TYPE,
+            "takes a video stream as its 'v' argument, got audio",
+        ),
+        (
+            "ffrwd.leaky(a.video[1], max_lateness => 0)",
+            ErrorCode.UDF_ARG_TYPE,
+            "'max_lateness' option must be greater than zero, got 0",
+        ),
+        (
+            "ffrwd.leaky(a.video[1], max_lateness => -0.5)",
+            ErrorCode.UDF_ARG_TYPE,
+            "'max_lateness' option must be greater than zero, got -0.5",
+        ),
+        (
+            "ffrwd.leaky(a.video[1], max_lateness => 'soon')",
+            ErrorCode.UDF_ARG_TYPE,
+            "'max_lateness' option must be a numeric literal",
+        ),
+        (
+            "ffrwd.leaky(a.video[1], 0.5)",
+            ErrorCode.UDF_ARG_TYPE,
+            "takes 1 argument, got 2",
+        ),
+        (
+            "ffrwd.leaky(a.video[1], a.audio[1])",
+            ErrorCode.UDF_ARG_TYPE,
+            "takes 1 argument, got 2",
+        ),
+        (
+            "ffrwd.leaky(a.video[1], latency => 1)",
+            ErrorCode.UDF_ARG_TYPE,
+            "has no 'latency' option",
+        ),
+    ],
+)
+def test_leaky_refuses_by_name(call: str, code: ErrorCode, needle: str) -> None:
+    err = _reject(f"SELECT {call} FROM input('x.mp4') a")
+    assert err.code == code
+    assert needle in err.message, err.message
+    assert err.hint is not None
+
+
+def test_leaky_on_sound_says_the_sound_rides_beside_it() -> None:
+    err = _reject("SELECT ffrwd.leaky(a.audio[1]) FROM input('x.mp4') a")
+    assert "never sound" in (err.hint or "")
+
+
+_LEAKY_HEAD = (
+    "COPY (\n"
+    "  SELECT ffrwd.leaky(s.video[1], max_lateness => 0.5), s.audio[1]\n"
+    "  FROM input('srt://0.0.0.0:9000?mode=listener', shape => STRUCT(1280 AS width,\n"
+    "             720 AS height, 30 AS fps, 48000 AS rate, 2 AS channels)) s\n"
+    ") TO 'out.mkv' WITH (video_codec 'ffv1', audio_codec 'pcm_s16le')"
+)
+
+
+def test_a_leaky_alone_compiles_to_a_plan_the_sidecar_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No module anywhere, and still three processes: the reader, the sidecar
+    hosting the leaky, and the ffmpeg writing the file. The node is spelled as
+    a network of one, since no ``-m`` loads it."""
+
+    def no_probe(*args: object, **kwargs: object) -> None:
+        raise AssertionError(f"probed {args}: a declared shape must not be")
+
+    monkeypatch.setattr(compiler, "probe_path", no_probe)
+    plan = compile_all(_LEAKY_HEAD).plan
+    assert plan is not None
+    (sidecar,) = plan.sidecars
+    assert sidecar.modules == ()
+    argv = wasm.shown_argv(sidecar)
+    at = argv.index("-filter_complex")
+    assert argv[at : at + 4] == [
+        "-filter_complex",
+        "[0:v]leaky=max_lateness=0.5:node=n1[out0]",
+        "-map",
+        "[out0]",
+    ]
+    reader = next(p for p in plan.ffmpeg if "pipe:" not in p.graph.input_paths)
+    assert [e.target for e in plan.stream_edges if e.source == reader.id] == [
+        sidecar.id,
+        next(p.id for p in plan.ffmpeg if p.id != reader.id),
+    ]
 
 
 # ---------------------------------------------------------------------------
