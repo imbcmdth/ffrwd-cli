@@ -369,10 +369,17 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   packets out, and ffmpeg copies what it writes; an option that shapes
   ffmpeg's own encoder for that kind (`crf`, `gop`, `video_bitrate` and
   the like) is refused beside it, since the encoder's settings are its
-  own arguments. A decoder is used unasked: an input stream whose tag its
-  module reads is decoded by it wherever the query reads the stream as
-  frames - a filter, a module, an encoder, an output naming a codec - and
+  own arguments. `pix_fmt` is the exception: it names the format the
+  pictures reach the encoder in, one the module lists and the sidecar
+  carries (`rgba`, `yuv420p`, `yuv422p`, `yuv444p`). Without it the
+  pictures keep the source's format, or the one a `format()` on the way
+  gives them, where the encoder takes it, and take the encoder's first
+  otherwise. A decoder
+  is used unasked: an input stream whose tag its module reads is decoded
+  by it wherever the query reads the stream as frames - a filter, a
+  module, an encoder, an output naming a codec - and
   `input(..., decoder => ffrwd.pyrowave.decode())` names one outright.
+  It writes the format its module answers for the stream.
   An output that copies such a stream keeps it coded. Either way the
   file has to be one that keeps a stream by its tag: `.nut`, `.mkv` or
   `.mov`. mp4 cannot hold it and is refused, as is every other

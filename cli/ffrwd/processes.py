@@ -3652,6 +3652,11 @@ class _Partitioner:
         format. Every other edge takes the default, which is what the
         producing ffmpeg is told to write.
         """
+        if target is not None and target in self.g.encoders:
+            # Lowering settled what this encoder's pictures reach it in.
+            settled = self.g.codec_formats.get(target, {}).get("pix_fmt")
+            if settled is not None:
+                return settled
         for name in (_ref_node(ref), target):
             if name is None or not self.external.get(name, False):
                 continue

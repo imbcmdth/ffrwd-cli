@@ -65,12 +65,13 @@ def _clip(path: Path) -> Path:
     return path
 
 
-def _frames(path: Path) -> list[tuple[str, str]]:
-    """Each picture's time and the md5 of its pixels, decoded by ffmpeg."""
+def _frames(path: Path, pix_fmt: str = "yuv420p") -> list[tuple[str, str]]:
+    """Each picture's time and the md5 of its pixels in `pix_fmt`, decoded by
+    ffmpeg."""
     done = subprocess.run(
         [
             "ffmpeg", "-v", "error", "-i", str(path), "-map", "0:v:0",
-            "-pix_fmt", "yuv420p", "-f", "framemd5", "-",
+            "-pix_fmt", pix_fmt, "-f", "framemd5", "-",
         ],
         capture_output=True,
         text=True,
@@ -157,3 +158,52 @@ def test_a_decoded_stream_is_filtered_like_any_other(tmp_path: Path) -> None:
         f"TO '{expected.as_posix()}' WITH (video_codec 'rawvideo')"
     )
     assert _frames(flipped) == _frames(expected)
+
+
+def _picture(path: Path, entries: str) -> dict[str, str]:
+    """ffprobe's `entries` of the first picture stream, by name."""
+    done = subprocess.run(
+        [
+            "ffprobe", "-v", "quiet", "-select_streams", "v:0",
+            "-show_entries", f"stream={entries}", "-of", "default=nw=1", str(path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=_TIMEOUT,
+        check=True,
+    )
+    return dict(line.split("=", 1) for line in done.stdout.splitlines() if "=" in line)
+
+
+def _source(path: Path, pix_fmt: str) -> Path:
+    """One second of a moving picture in `pix_fmt`, coded losslessly, and
+    declared bt709, tv range, left-sited."""
+    subprocess.run(
+        [
+            "ffmpeg", "-v", "error", "-y",
+            "-f", "lavfi", "-i", "testsrc2=size=64x48:rate=10", "-t", "1",
+            "-vf", f"format={pix_fmt},setparams=range=tv:color_primaries=bt709"
+            ":color_trc=bt709:colorspace=bt709:chroma_location=left",
+            "-c:v", "ffv1", str(path),
+        ],
+        check=True,
+        timeout=_TIMEOUT,
+    )
+    return path
+
+
+def test_a_444_clip_is_coded_in_444_and_decoded_back_to_it(tmp_path: Path) -> None:
+    clip = _source(tmp_path / "clip.mkv", "yuv444p")
+    coded = tmp_path / "coded.nut"
+    back = tmp_path / "back.nut"
+    _run(
+        f"{_ENCODER}\nCOPY (SELECT f.video[1] FROM input('{clip.as_posix()}') f) "
+        f"TO '{coded.as_posix()}' WITH (video_codec enc())"
+    )
+    _run(
+        f"{_DECODER}\nCOPY (SELECT f.video[1] FROM input('{coded.as_posix()}') f) "
+        f"TO '{back.as_posix()}' WITH (video_codec 'rawvideo')"
+    )
+    assert _picture(back, "pix_fmt") == {"pix_fmt": "yuv444p"}
+    assert _frames(back, "yuv444p") == _frames(clip, "yuv444p")
+

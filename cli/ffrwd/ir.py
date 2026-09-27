@@ -871,6 +871,10 @@ class Graph:
     # coded stream an input carries and writes it raw.
     encoders: list[str] = field(default_factory=list)
     decoders: list[str] = field(default_factory=list)
+    # Node id -> what an encoder or a decoder above is told of its raw side,
+    # keyed by ffmpeg's own option names: `pix_fmt`, the format an encoder's
+    # frames reach it in. A node with nothing to say is absent.
+    codec_formats: dict[str, dict[str, str]] = field(default_factory=dict)
     # Alias -> the RETURNS source module bound to it. Not a key of `sources`:
     # its bytes never come from a real `-i`, so the partitioner gives it a
     # sidecar of its own rather than an input slot.
@@ -950,6 +954,10 @@ class Graph:
             d["encoders"] = list(self.encoders)
         if self.decoders:
             d["decoders"] = list(self.decoders)
+        if self.codec_formats:
+            d["codec_formats"] = {
+                name: dict(said) for name, said in self.codec_formats.items()
+            }
         if self.module_sources:
             d["module_sources"] = {
                 alias: source.to_dict() for alias, source in self.module_sources.items()
@@ -1059,6 +1067,12 @@ class Graph:
         raw_encoders = d.get("encoders", [])
         raw_decoders = d.get("decoders", [])
         assert isinstance(raw_encoders, list) and isinstance(raw_decoders, list)
+        raw_codec_formats = d.get("codec_formats", {})
+        assert isinstance(raw_codec_formats, dict)
+        codec_formats = {
+            str(name): {str(k): str(v) for k, v in dict(said).items()}
+            for name, said in raw_codec_formats.items()
+        }
 
         raw_module_sources = d.get("module_sources")
         module_sources: dict[str, ModuleSource] = {}
@@ -1111,6 +1125,7 @@ class Graph:
             data_filters=data_filters,
             encoders=[str(name) for name in raw_encoders],
             decoders=[str(name) for name in raw_decoders],
+            codec_formats=codec_formats,
             module_sources=module_sources,
             url_sources=url_sources,
             dropped_aliases=dropped_aliases,

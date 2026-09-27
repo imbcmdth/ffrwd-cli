@@ -490,3 +490,20 @@ def test_graph_input_options_are_independent_of_sinks_and_input_trims() -> None:
     g2 = Graph.from_dict(d)
     assert g2.input_options == g.input_options
     assert g2.input_trims == g.input_trims
+
+
+def test_a_codec_nodes_formats_round_trip() -> None:
+    g = _build_graph()
+    g.encoders = ["n1"]
+    g.decoders = ["n0"]
+    g.codec_formats = {
+        "n1": {"pix_fmt": "yuv444p", "colorspace": "bt709", "chroma_sample_location": "left"},
+        "n0": {"color_range": "tv"},
+    }
+    back = Graph.from_dict(g.to_dict())
+    assert (back.encoders, back.decoders, back.codec_formats) == (
+        g.encoders,
+        g.decoders,
+        g.codec_formats,
+    )
+    assert "codec_formats" not in _build_graph().to_dict()

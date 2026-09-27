@@ -17,7 +17,7 @@ from ffrwd.ir import Graph
 from ffrwd.lower import lower
 from ffrwd.parser import parse, resolve
 from ffrwd.probe import ProbeResult, StreamMeta
-from ffrwd.processes import ProcessPlan, external_filters, partition
+from ffrwd.processes import ProcessPlan, VideoFormat, external_filters, partition
 from ffrwd.project import discover
 from ffrwd.registry import Registry, load_reference
 from ffrwd.split import insert_splits
@@ -157,18 +157,20 @@ _ENCODER = (
 _ENCODER_SCHEMA = {"type": "object", "properties": {"bitrate": {"type": "number"}}}
 
 
-def _codec(world: str = "ffrwd:av@0.18.0") -> Described:
+def _codec(
+    world: str = "ffrwd:av@0.18.0", pixel_formats: tuple[str, ...] = ("yuv420p",)
+) -> Described:
     return Described(
         world=world,
         name="codec",
-        pixel_formats=("yuv420p",),
+        pixel_formats=pixel_formats,
         encoder=wasm.EncoderInfo(
             codec="testcodec",
             fourcc="FTST",
             params_schema=_ENCODER_SCHEMA,
-            pixel_formats=("yuv420p",),
+            pixel_formats=pixel_formats,
         ),
-        decoder=wasm.DecoderInfo(fourccs=("FTST",), pixel_formats=("yuv420p",)),
+        decoder=wasm.DecoderInfo(fourccs=("FTST",), pixel_formats=pixel_formats),
     )
 
 
@@ -177,13 +179,13 @@ def _registry() -> Registry:
     return load_reference(SNAPSHOT_PATH)
 
 
-def _clip() -> dict[str, ProbeResult | None]:
+def _clip(**picture: str) -> dict[str, ProbeResult | None]:
     return {
         "f": ProbeResult(
             streams=[
                 StreamMeta(
                     type="video", index=0, metadata={}, width=64, height=48,
-                    fps="10/1", sample_rate=None, codec="h264",
+                    fps="10/1", sample_rate=None, codec="h264", **picture,
                 ),
                 StreamMeta(
                     type="audio", index=0, metadata={}, width=None, height=None,
@@ -283,13 +285,15 @@ def test_an_encoder_in_a_world_before_codecs_is_refused() -> None:
 # -- partitioning an encoder ----------------------------------------------------
 
 
-def _plan(query: str) -> ProcessPlan:
-    probes = _clip()
+def _plan(
+    query: str, codec: Described | None = None, **picture: str
+) -> ProcessPlan:
+    probes = _clip(**picture)
     graph = lower(
         resolve(parse(_ENCODER + query)),
         probes,
         registry=_registry(),
-        describes={CODEC: _codec()},
+        describes={CODEC: codec or _codec()},
     )
     return partition(insert_splits(graph), external=external_filters(CODEC), probes=probes)
 
@@ -324,12 +328,73 @@ def test_an_encoder_is_a_sidecar_between_a_decode_and_a_copying_mux() -> None:
     assert "-c:0" in muxer and muxer[muxer.index("-c:0") + 1] == "copy"
 
 
+# -- what an encoder's pictures reach it in ---------------------------------------
+
+_FOUR_FOUR_FOUR = ("yuv420p", "yuv444p")
+
+
+def _into_encoder(plan: ProcessPlan) -> str:
+    """The pixel format of the raw edge into the plan's one encoder."""
+    (encoder,) = plan.sidecars
+    into = next(e for e in plan.stream_edges if e.target == encoder.id)
+    assert isinstance(into.format, VideoFormat)
+    return into.format.pix_fmt
+
+
+def _muxer(plan: ProcessPlan) -> list[str]:
+    """The argv of the ffmpeg writing what the plan's one sidecar coded."""
+    (encoder,) = plan.sidecars
+    return _argv(plan)[next(e.target for e in plan.stream_edges if e.source == encoder.id)]
+
+
+@pytest.mark.parametrize(
+    ("select", "listed", "written", "expected"),
+    [
+        # The source's own format, where the encoder takes it.
+        ("f.video[1]", _FOUR_FOUR_FOUR, "", "yuv444p"),
+        # Else the first the encoder lists.
+        ("f.video[1]", ("yuv420p",), "", "yuv420p"),
+        # A format() on the way is what the pictures are in.
+        ("ffmpeg.format(f.video[1], pix_fmts => 'yuv420p')", _FOUR_FOUR_FOUR, "", "yuv420p"),
+        ("hflip(ffmpeg.format(f.video[1], 'yuv420p'))", _FOUR_FOUR_FOUR, "", "yuv420p"),
+        # And the COPY's pix_fmt over either.
+        ("f.video[1]", _FOUR_FOUR_FOUR, ", pix_fmt 'yuv420p'", "yuv420p"),
+        ("f.video[1]", ("yuv420p", "yuv444p", "yuv422p"), ", pix_fmt 'yuv422p'", "yuv422p"),
+    ],
+)
+def test_an_encoders_pictures_reach_it_in_the_format_the_query_settles(
+    select: str, listed: tuple[str, ...], written: str, expected: str
+) -> None:
+    plan = _plan(
+        f"COPY (SELECT {select} FROM input('clip.mp4') f) TO 'out.nut' "
+        f"WITH (video_codec enc(){written})",
+        _codec(pixel_formats=listed),
+        pix_fmt="yuv444p",
+    )
+    assert _into_encoder(plan) == expected
+    assert not any(flag.startswith("-pix_fmt") for flag in _muxer(plan))  # it copies
+
+
+def test_a_pix_fmt_the_encoder_or_the_edge_cannot_take_is_refused_by_name() -> None:
+    error = _refused(
+        "COPY (SELECT f.video[1] FROM input('clip.mp4') f) TO 'out.nut' "
+        "WITH (video_codec enc(), pix_fmt 'gray')",
+        _codec(pixel_formats=("gray", "yuv420p")),
+    )
+    assert error.code is ErrorCode.UNSUPPORTED_SQL
+    assert error.message == (
+        "pix_fmt 'gray' cannot reach 'enc': it codes gray, yuv420p, and the "
+        "sidecar's edge carries rgba, yuv420p, yuv422p, yuv444p"
+    )
+    assert "pix_fmt 'yuv420p'" in (error.hint or "")
+
+
 # -- decoding an input -------------------------------------------------------------
 
 _DECODER = f"CREATE FUNCTION dec() RETURNS decoder AS '{CODEC}', 'decode' LANGUAGE wasm;\n"
 
 
-def _coded() -> dict[str, ProbeResult | None]:
+def _coded(**picture: str) -> dict[str, ProbeResult | None]:
     """`coded.nut` as the probe reads it: a picture in the test codec, whose
     tag ffmpeg does not know, and sound it does."""
     return {
@@ -337,7 +402,7 @@ def _coded() -> dict[str, ProbeResult | None]:
             streams=[
                 StreamMeta(
                     type="video", index=0, metadata={}, width=64, height=48,
-                    fps="10/1", sample_rate=None, codec="FTST",
+                    fps="10/1", sample_rate=None, codec="FTST", **picture,
                 ),
                 StreamMeta(
                     type="audio", index=0, metadata={}, width=None, height=None,
@@ -348,11 +413,11 @@ def _coded() -> dict[str, ProbeResult | None]:
     }
 
 
-def _decoding(query: str) -> Graph:
+def _decoding(query: str, **picture: str) -> Graph:
     return insert_splits(
         lower(
             resolve(parse(_DECODER + query)),
-            _coded(),
+            _coded(**picture),
             registry=_registry(),
             describes={CODEC: _codec()},
         )

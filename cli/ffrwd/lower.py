@@ -481,10 +481,12 @@ from ffrwd.wasm import (
     PACKET_FILTER_WORLD,
     PACKET_SOURCE_WORLD,
     WIRE_AUDIO_CODECS,
+    WIRE_PIX_FMTS,
     WIRE_VIDEO_CODECS,
     WORLDS,
     Described,
     DescribedFunction,
+    EncoderInfo,
     Feeder,
     Invoke,
     PacketRead,
@@ -2483,12 +2485,12 @@ _NUT_FORMAT = "nut"
 _CODEC_OPTIONS: Mapping[str, StreamType] = {"video_codec": "video", "audio_codec": "audio"}
 
 # The options that shape ffmpeg's own encoder, which a module encoder stands
-# in place of: its settings are its own arguments.
+# in place of: its settings are its own arguments. `pix_fmt` is not one: it
+# names the format the frames reach the module encoder in.
 _ENCODER_SHAPING = frozenset(
     {
         "crf",
         "preset",
-        "pix_fmt",
         "video_bitrate",
         "maxrate",
         "bufsize",
@@ -4696,6 +4698,9 @@ class _Lowerer:
         shapes ffmpeg's encoder for that kind has nothing to shape and is
         refused by name, and the destination has to be a container that keeps
         a codec ffmpeg does not know.
+
+        A picture reaches the encoder in the format :meth:`_encoder_pix_fmts`
+        settles, recorded in the graph's ``codec_formats``.
         """
         for name, (option, declared) in encoders.items():
             kind = _CODEC_OPTIONS[name]
@@ -4764,12 +4769,19 @@ class _Lowerer:
                 first=0,
                 params_schema=described.encoder.params_schema,
             )
+            pix_fmts = (
+                self._encoder_pix_fmts(raw, declared, described.encoder, options, outputs)
+                if kind == "video"
+                else {}
+            )
             coded = False
             for index, output in enumerate(outputs):
                 if output.type != kind:
                     continue
                 ref = self.ctx.node(declared.module, params, [output.ref], [kind])
                 self.graph.encoders.append(ref)
+                if index in pix_fmts:
+                    self.graph.codec_formats[ref] = {"pix_fmt": pix_fmts[index]}
                 outputs[index] = replace(output, ref=ref)
                 coded = True
             if not coded:
@@ -4781,6 +4793,102 @@ class _Lowerer:
                     fallback=raw.path_node,
                     hint=f"select a {kind} stream, or drop the {name} option",
                 )
+
+    def _encoder_pix_fmts(
+        self,
+        raw: RawSink,
+        declared: WasmFunction,
+        encoder: EncoderInfo,
+        options: dict[str, object],
+        outputs: Sequence[Output],
+    ) -> dict[int, str]:
+        """The pixel format each video output reaches `encoder` in, keyed by
+        its place among `outputs`.
+
+        The one the COPY's ``pix_fmt`` names, which has to be one the encoder
+        lists and the sidecar's edge carries, and which the copying muxer then
+        has no use for. Else the format the pictures arrive in, where the
+        encoder takes it; else the first the encoder lists that the edge
+        carries. An encoder listing none the edge carries is left to the
+        negotiation that refuses it by name.
+        """
+        listed = encoder.pixel_formats
+        carried = [pix_fmt for pix_fmt in listed if pix_fmt in WIRE_PIX_FMTS]
+        video = [index for index, output in enumerate(outputs) if output.type == "video"]
+        written = options.pop("pix_fmt", None)
+        asked: list[object] = (
+            list(written) if isinstance(written, list) else [written] * len(video)
+        )
+        anchor = next((one.value for one in raw.options if one.name == "pix_fmt"), None)
+        for value in asked:
+            if value is None or value in carried:
+                continue
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"pix_fmt '{value}' cannot reach '{declared.name}': it codes "
+                f"{', '.join(listed) or 'no pixel format'}, and the sidecar's edge "
+                f"carries {', '.join(WIRE_PIX_FMTS)}",
+                anchor,
+                fallback=raw.path_node,
+                hint=(
+                    f"name one in both, e.g. pix_fmt '{carried[0]}', or drop pix_fmt "
+                    "to code the source's own"
+                    if carried
+                    else "the encoder takes no format the sidecar's frames travel in"
+                ),
+            )
+        if not carried:
+            return {}
+        chosen: dict[int, str] = {}
+        for index, value in zip(video, asked, strict=True):
+            arriving = self._arriving_pix_fmt(outputs[index].ref)
+            if value is not None:
+                chosen[index] = str(value)
+            elif arriving is not None and arriving in carried:
+                chosen[index] = arriving
+            else:
+                chosen[index] = carried[0]
+        return chosen
+
+    def _upstream(self, ref: FrameRef, seen: set[str]) -> Node | None:
+        """The node writing the pictures `ref` names; None for an input's own
+        stream, a ref no node writes, or a node already walked."""
+        if is_src(ref):
+            return None
+        name, _, pad = ref.rpartition(":")
+        name = name if name and pad.isdigit() else ref
+        if name in seen or name not in self.graph.nodes:
+            return None
+        seen.add(name)
+        return self.graph.nodes[name]
+
+    def _picture_input(self, node: Node) -> FrameRef | None:
+        """The input of `node` its pictures come through: its first video one."""
+        return next((r for r in node.inputs if ref_type(self.graph, r) == "video"), None)
+
+    def _source_meta(self, ref: FrameRef | None) -> StreamMeta | None:
+        """What the probe said of `ref`, when it is an input's own stream."""
+        if ref is None or not is_src(ref):
+            return None
+        alias, kind, index = _src_parts(ref)
+        return self._stream_meta(alias, kind, index)
+
+    def _arriving_pix_fmt(self, ref: FrameRef) -> str | None:
+        """The pixel format the pictures `ref` names are in, where the query
+        says: the nearest ``format`` filter's first, else the probed format
+        of the input stream they come from. None where neither says."""
+        seen: set[str] = set()
+        current: FrameRef | None = ref
+        while current is not None and not is_src(current):
+            node = self._upstream(current, seen)
+            if node is None:
+                return None
+            if node.filter == "format":
+                written = node.args.get("pix_fmts")
+                return str(written).split("|")[0] if written else None
+            current = self._picture_input(node)
+        meta = self._source_meta(current)
+        return meta.pix_fmt if meta is not None else None
 
     def _described_codec(
         self, declared: WasmFunction, node: exp.Expr, select: exp.Select
