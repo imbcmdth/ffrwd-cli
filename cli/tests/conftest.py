@@ -21,10 +21,12 @@ real ffmpeg, so they must compile against the real ffmpeg's own registry.
 from __future__ import annotations
 
 import functools
+import os
 import warnings
 from collections.abc import Iterable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -206,3 +208,28 @@ def _plans_round_trip(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
         except (FfrwdError, KeyError, StopIteration, ValueError):
             continue
         assert plan_argv(back, sidecar_argv=wasm.shown_argv) == argv
+
+
+@pytest.fixture(autouse=True)
+def _split_runs(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Under ``FFRWD_TEST_SPLIT=<placement>``, every plan an exec test runs in
+    this process runs split across nodes instead, each a runner of its own
+    on this machine, placed as the variable names (``per-module``,
+    ``per-process``): the same assertions then hold of a split run. Off by
+    default; the unit tier never reads it.
+    """
+    placement = os.environ.get("FFRWD_TEST_SPLIT")
+    if not placement or request.node.get_closest_marker("exec") is None:
+        return
+    from ffrwd import cli, nodes
+    from ffrwd import placement as placing
+    from ffrwd.execute import execute_plan as original
+
+    strategy = next(one for one in placing.STRATEGIES if one == placement)
+
+    def split_run(plan: Any, **options: Any) -> Any:
+        return nodes.execute_split(plan, placing.place(plan, strategy), **options)
+
+    monkeypatch.setattr(cli, "execute_plan", split_run)
+    if getattr(request.module, "execute_plan", None) is original:
+        monkeypatch.setattr(request.module, "execute_plan", split_run)
