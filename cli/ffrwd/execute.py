@@ -994,14 +994,16 @@ def keeps_clock(edge: StreamEdge, plan: ProcessPlan) -> bool:
     and only the reader's rebase takes that back out. A packet filter hands
     on whatever clock its own inputs had. A data stream's messages are timed
     by the programme they belong beside, whoever wrote them, and have no
-    reorder delay to take out.
+    reorder delay to take out. A codec package's encoder writes each packet
+    at the time of the frame it coded, and its header says how deep it
+    reorders rather than shifting anything, so its packets keep the clock.
     """
     if isinstance(edge.format, DataFormat) or not encoded(edge.format):
         return True
     producer = next(p for p in plan.processes if p.id == edge.source)
     if not isinstance(producer, SidecarProcess):
         return False
-    if producer.packet_source:
+    if producer.packet_source or producer.codec == "encode":
         return True
     if not producer.packet_filter:
         return False

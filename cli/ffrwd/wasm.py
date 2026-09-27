@@ -382,6 +382,9 @@ _NN_EXCLUDE_FLAG = "-nn-exclude"
 # The sidecar's worker-thread cap. Unwritten, the sidecar sizes its own pool.
 _JOBS_FLAG = "-jobs"
 
+# Which half of a codec package's module a run drives: "encode" or "decode".
+_CODEC_FLAG = "-codec"
+
 # The effects a module's own imports can ask the host for, in the order the
 # argv writes their grants. `nn` is not among them: a model is bound to a
 # name rather than granted.
@@ -428,14 +431,45 @@ class EncoderInfo:
     delay: int = 0
     decode_delay: int = 0
     frame_samples: int = 0
+    # Its own parameters and the frames it takes: a module carrying both an
+    # encoder and a decoder describes each one's apart.
+    params_schema: Mapping[str, object] = field(default_factory=dict)
+    pixel_formats: tuple[str, ...] = ()
+    sample_formats: tuple[str, ...] = ()
+
+    @property
+    def kind(self) -> StreamType | None:
+        """The kind of stream it codes, from the frames it takes."""
+        return _codec_kind(self.pixel_formats, self.sample_formats)
 
 
 @dataclass(frozen=True)
 class DecoderInfo:
-    """What a codec package's decoder reads: the tags, and its delay."""
+    """What a codec package's decoder reads: the tags, its delay, its own
+    parameters and the frames it writes."""
 
     fourccs: tuple[str, ...]
     delay: int = 0
+    params_schema: Mapping[str, object] = field(default_factory=dict)
+    pixel_formats: tuple[str, ...] = ()
+    sample_formats: tuple[str, ...] = ()
+
+    @property
+    def kind(self) -> StreamType | None:
+        """The kind of stream it decodes, from the frames it writes."""
+        return _codec_kind(self.pixel_formats, self.sample_formats)
+
+
+def _codec_kind(
+    pixel_formats: tuple[str, ...], sample_formats: tuple[str, ...]
+) -> StreamType | None:
+    """Video for a codec naming pixel formats, audio for one naming sample
+    formats, None for one naming neither."""
+    if pixel_formats:
+        return "video"
+    if sample_formats:
+        return "audio"
+    return None
 
 
 @dataclass(frozen=True)
@@ -819,12 +853,16 @@ def _encoder_info(value: object) -> EncoderInfo | None:
     codec, fourcc = value.get("codec"), value.get("fourcc")
     if not isinstance(codec, str) or not isinstance(fourcc, str):
         return None
+    schema = value.get("params_schema")
     return EncoderInfo(
         codec=codec,
         fourcc=fourcc,
         delay=_zero_or_more(value.get("delay")),
         decode_delay=_zero_or_more(value.get("decode_delay")),
         frame_samples=_zero_or_more(value.get("frame_samples")),
+        params_schema=schema if isinstance(schema, dict) else {},
+        pixel_formats=_strings(value.get("pixel_formats")),
+        sample_formats=_strings(value.get("sample_formats")),
     )
 
 
@@ -832,9 +870,13 @@ def _decoder_info(value: object) -> DecoderInfo | None:
     """The describe's ``decoder`` object, or None where there is none."""
     if not isinstance(value, dict):
         return None
+    schema = value.get("params_schema")
     return DecoderInfo(
         fourccs=_strings(value.get("fourccs")),
         delay=_zero_or_more(value.get("delay")),
+        params_schema=schema if isinstance(schema, dict) else {},
+        pixel_formats=_strings(value.get("pixel_formats")),
+        sample_formats=_strings(value.get("sample_formats")),
     )
 
 
@@ -1930,6 +1972,9 @@ def _argv(
     argv += _nn_args(process.models, runtime)
     for grant in process.grants:
         argv += [_GRANT_FLAGS[grant.effect], grant.module]
+    if process.codec:
+        # A codec package's module may export both halves; the run says which.
+        argv += [_CODEC_FLAG, process.codec]
     if process.network:
         argv += _network_args(process, writes)
     else:

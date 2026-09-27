@@ -10,12 +10,14 @@ from pathlib import Path
 import pytest
 from sqlglot import exp
 
-from ffrwd import wasm
+from ffrwd import processes, wasm
 from ffrwd.errors import ErrorCode, FfrwdError
+from ffrwd.execute import keeps_clock, plan_argv
 from ffrwd.ir import Graph
 from ffrwd.lower import lower
 from ffrwd.parser import parse, resolve
 from ffrwd.probe import ProbeResult, StreamMeta
+from ffrwd.processes import ProcessPlan, external_filters, partition
 from ffrwd.project import discover
 from ffrwd.registry import Registry, load_reference
 from ffrwd.split import insert_splits
@@ -152,15 +154,21 @@ _ENCODER = (
 )
 
 
-def _codec(kind: str = "video") -> Described:
-    formats = {"pixel_formats": ("yuv420p",)} if kind == "video" else {"sample_formats": ("f32",)}
+_ENCODER_SCHEMA = {"type": "object", "properties": {"bitrate": {"type": "number"}}}
+
+
+def _codec(world: str = "ffrwd:av@0.18.0") -> Described:
     return Described(
-        world="ffrwd:av@0.18.0",
+        world=world,
         name="codec",
-        params_schema={"type": "object", "properties": {"bitrate": {"type": "number"}}},
-        encoder=wasm.EncoderInfo(codec="testcodec", fourcc="FTST"),
-        decoder=wasm.DecoderInfo(fourccs=("FTST",)),
-        **formats,  # type: ignore[arg-type]
+        pixel_formats=("yuv420p",),
+        encoder=wasm.EncoderInfo(
+            codec="testcodec",
+            fourcc="FTST",
+            params_schema=_ENCODER_SCHEMA,
+            pixel_formats=("yuv420p",),
+        ),
+        decoder=wasm.DecoderInfo(fourccs=("FTST",), pixel_formats=("yuv420p",)),
     )
 
 
@@ -263,15 +271,53 @@ def test_an_encoder_with_no_reading_is_refused(query: str, needle: str) -> None:
 
 
 def test_an_encoder_in_a_world_before_codecs_is_refused() -> None:
-    old = Described(
-        world="ffrwd:av@0.17.0",
-        name="codec",
-        pixel_formats=("yuv420p",),
-        encoder=wasm.EncoderInfo(codec="testcodec", fourcc="FTST"),
-    )
+    old = _codec("ffrwd:av@0.17.0")
     error = _refused(
         "COPY (SELECT f.video[1] FROM input('clip.mp4') f) TO 'out.nut' "
         "WITH (video_codec enc())",
         old,
     )
     assert "hosted from ffrwd:av@0.18.0 on" in error.message
+
+
+# -- partitioning an encoder ----------------------------------------------------
+
+
+def _plan(query: str) -> ProcessPlan:
+    probes = _clip()
+    graph = lower(
+        resolve(parse(_ENCODER + query)),
+        probes,
+        registry=_registry(),
+        describes={CODEC: _codec()},
+    )
+    return partition(insert_splits(graph), external=external_filters(CODEC), probes=probes)
+
+
+def _argv(plan: ProcessPlan) -> dict[str, list[str]]:
+    return plan_argv(
+        plan,
+        sidecar_argv=lambda process, reads, writes: wasm.shown_argv(process, reads, writes),
+        pipe_path=lambda edge, side: f"<{edge.source}-{edge.target} {side}>",
+    )
+
+
+def test_an_encoder_is_a_sidecar_between_a_decode_and_a_copying_mux() -> None:
+    plan = _plan(
+        "COPY (SELECT f.video[1], f.audio[1] FROM input('clip.mp4') f) TO 'out.nut' "
+        "WITH (video_codec enc(bitrate => 5000), audio_codec 'aac')"
+    )
+    (encoder,) = plan.sidecars
+    assert (encoder.codec, encoder.module, encoder.args) == ("encode", CODEC, {"bitrate": 5000})
+    argv = _argv(plan)
+    sidecar = argv[encoder.id]
+    assert sidecar[sidecar.index("-codec") + 1] == "encode"
+    assert sidecar[sidecar.index("-m") + 1] == CODEC
+    into = next(e for e in plan.stream_edges if e.target == encoder.id)
+    out = next(e for e in plan.stream_edges if e.source == encoder.id)
+    assert not processes.encoded(into.format)  # raw frames reach the encoder
+    assert out.format.codec == processes.COPY_CODEC  # and its packets are copied
+    assert keeps_clock(out, plan)
+    muxer = argv[out.target]
+    assert muxer[-1] == "out.nut"
+    assert "-c:0" in muxer and muxer[muxer.index("-c:0") + 1] == "copy"

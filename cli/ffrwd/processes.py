@@ -923,6 +923,10 @@ class SidecarProcess:
     # per stream argument -- data pads and clock pads, told apart by their
     # own stream header -- and writes one NUT pipe per data output.
     data_filter: bool = False
+    # "encode" for a region holding a codec package's ENCODER (one raw stream
+    # in, that stream coded out) and "decode" for one holding its DECODER (the
+    # mirror); empty for every other process. Either rides alone.
+    codec: str = ""
 
     @property
     def nodes(self) -> tuple[str, ...]:
@@ -946,7 +950,7 @@ class SidecarProcess:
             return False
         if self.packet_sink or self.packet_source or self.packet_filter:
             return False
-        if self.data_filter:
+        if self.data_filter or self.codec:
             return False
         return len(self.graph.nodes) > 1 or any(
             len(node.inputs) > 1 for node in self.graph.nodes.values()
@@ -988,6 +992,8 @@ class SidecarProcess:
             written["rows_modules"] = [one.to_dict() for one in self.rows_modules]
         if self.data_filter:
             written["data_filter"] = True
+        if self.codec:
+            written["codec"] = self.codec
         if self.pads:
             written["pads"] = [None if p is None else p.to_dict() for p in self.pads]
         if self.network and self.graph is not None:
@@ -1198,6 +1204,16 @@ def _bindings(paths: Iterable[str]) -> tuple[ModuleBinding, ...]:
         used.add(base)
         bound[path] = ModuleBinding(name=base, path=path)
     return tuple(bound.values())
+
+
+def _codec_of(graph: Graph, members: Sequence[str]) -> str:
+    """"encode" for a region holding an encoder, "decode" for one holding a
+    decoder, "" for any other: the sidecar is told which export to run."""
+    if any(name in graph.encoders for name in members):
+        return "encode"
+    if any(name in graph.decoders for name in members):
+        return "decode"
+    return ""
 
 
 def encoded(wire: StreamFormat) -> bool:
@@ -2240,6 +2256,8 @@ class _Partitioner:
             set(self.g.packet_sinks)
             | set(self.g.packet_filters)
             | set(self.g.data_filters)
+            | set(self.g.encoders)
+            | set(self.g.decoders)
         )
         # A ROWS edge joins its two nodes too: the consumer runs where the
         # rows already are, in the producer's own sidecar.
@@ -2976,6 +2994,7 @@ class _Partitioner:
                 packet_sink=any(name in self.g.packet_sinks for name in members),
                 packet_filter=any(name in self.g.packet_filters for name in members),
                 data_filter=any(name in self.g.data_filters for name in members),
+                codec=_codec_of(self.g, members),
                 rows_in=self._region_rows_in(members),
                 pads=self._region_pad_meta(members),
             )
@@ -3040,6 +3059,7 @@ class _Partitioner:
                     )
                     and producer not in self.g.packet_filters
                     and producer not in self.g.data_filters
+                    and producer not in self.g.encoders
                 ):
                     # A packet sink or filter consumes the encoder's output,
                     # and a module region emits decoded frames: an encoding
@@ -3503,7 +3523,9 @@ class _Partitioner:
             return DataFormat()
         meta = self._origin_meta(ref)
         producer = _ref_node(ref)
-        if producer is not None and producer in self.g.packet_filters:
+        if producer is not None and (
+            producer in self.g.packet_filters or producer in self.g.encoders
+        ):
             # The edge OUT of a packet filter carries what its input carried:
             # the filter hands the same encoded stream back, so whatever reads
             # it copies the packets rather than encoding anything.

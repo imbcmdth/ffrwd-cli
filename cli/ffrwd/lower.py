@@ -4523,14 +4523,15 @@ class _Lowerer:
                     hint="the module has to export the encoder interface of "
                     f"{CODEC_WORLD} or later",
                 )
-            if described.kind != kind:
+            encodes = described.encoder.kind
+            if encodes != kind:
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,
-                    f"'{declared.name}' encodes {described.kind or 'nothing'}, and "
+                    f"'{declared.name}' encodes {encodes or 'nothing'}, and "
                     f"{name} names the {kind} codec",
                     node,
                     fallback=raw.path_node,
-                    hint=f"name it as {described.kind}_codec, or name a {kind} "
+                    hint=f"name it as {encodes}_codec, or name a {kind} "
                     "encoder here",
                 )
             if path is not None:
@@ -4564,7 +4565,15 @@ class _Lowerer:
             call = _call_parts(node)
             assert call is not None  # `_encoder_option` read it as one
             params = self._wasm_params(
-                declared, described, call, node, select, _Env(), {}, first=0
+                declared,
+                described,
+                call,
+                node,
+                select,
+                _Env(),
+                {},
+                first=0,
+                params_schema=described.encoder.params_schema,
             )
             coded = False
             for index, output in enumerate(outputs):
