@@ -477,7 +477,8 @@ def _check_jobs_id(args: argparse.Namespace) -> int:
     --fetch -- each of those already names its own ID -- or 2 with the usage
     error printed."""
     job_id = getattr(args, "id", None)
-    if job_id is None or not (args.watch or args.cancel is not None or args.fetch is not None):
+    named = (args.cancel, getattr(args, "stop", None), args.fetch)
+    if job_id is None or not (args.watch or any(one is not None for one in named)):
         return 0
     print(
         f"error: {args.command}: an ID does not mix with --watch/--cancel/--fetch",
@@ -586,6 +587,10 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="submit the run to the hosted runner instead of executing ffmpeg here",
     )
+    # Hidden while live hosted runs are open to flagged accounts only: submit
+    # the run as a live job, for a live source the query's text does not show
+    # (a module's), which --remote otherwise finds for itself.
+    run_p.add_argument("--live", action="store_true", help=argparse.SUPPRESS)
     # Hidden, for development: run a plan placed across several nodes, each
     # a runner of its own on this machine, and how to place it.
     run_p.add_argument("--target", choices=_TARGETS, default="local", help=argparse.SUPPRESS)
@@ -633,6 +638,9 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="ask for a job's cancellation (a unique id prefix works)",
     )
+    # Hidden with --live: end a live job the way Ctrl-C ends a local run, its
+    # outputs finished, where --cancel stops it where it is.
+    jobs_mode.add_argument("--stop", metavar="ID", default=None, help=argparse.SUPPRESS)
     jobs_mode.add_argument(
         "--fetch",
         metavar="ID",

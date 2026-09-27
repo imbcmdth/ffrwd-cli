@@ -264,6 +264,7 @@ __all__ = [
     "from_entries",
     "from_items",
     "group_keys",
+    "input_options",
     "input_specs",
     "is_grouped",
     "is_value_expr",
@@ -2049,6 +2050,34 @@ def input_specs(text: str) -> list[InputSpec]:
         if isinstance(first, exp.Literal) and first.is_string:
             line, col = _pos(first, node)
             found.append(InputSpec(path=str(first.this), line=line, col=col))
+    return found
+
+
+def input_options(text: str) -> list[dict[str, object]]:
+    """Every ``input()`` call in `text`, in written order, as its options.
+
+    Each is a dict of option name to value, the literal's text for a string or
+    number and the expression's SQL otherwise, with the first argument under
+    ``""`` when it is a string literal. Syntactic, like :func:`input_specs`:
+    what a submit can tell of an input without probing it.
+    """
+    found: list[dict[str, object]] = []
+    for node in parse(text).walk():
+        if not isinstance(node, exp.Anonymous) or str(node.this).lower() != "input":
+            continue
+        parent = node.parent
+        if isinstance(parent, exp.Table) and parent.args.get("db"):
+            continue
+        options: dict[str, object] = {}
+        for position, arg in enumerate(node.expressions):
+            if isinstance(arg, exp.Kwarg):
+                value = arg.expression
+                options[kwarg_name(arg)] = (
+                    str(value.this) if isinstance(value, exp.Literal) else value.sql()
+                )
+            elif position == 0 and isinstance(arg, exp.Literal) and arg.is_string:
+                options[""] = str(arg.this)
+        found.append(options)
     return found
 
 
