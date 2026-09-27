@@ -1283,6 +1283,115 @@ def _picture_bytes(wire: VideoFormat) -> int | None:
     return None if per_pixel is None else wire.width * wire.height * per_pixel
 
 
+# Filters whose picture size is not one this module computes: several
+# pictures laid into one, or a size read off another stream. An edge past one
+# has no size to count its bytes by, and is sized as an unprobed one is.
+_UNSIZED_FILTERS = frozenset({"hstack", "vstack", "xstack", "tile", "scale2ref", "zoompan"})
+
+
+def _dimension(value: object) -> int | None:
+    """A size option as a whole number: an int, or text that is one."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _option(node: Node, *names: str) -> object:
+    """The first of `names` the node's arguments set, or None."""
+    return next((node.args[name] for name in names if name in node.args), None)
+
+
+def _side(node: Node, names: tuple[str, str], own: int | None) -> int | None:
+    """One side a ``pad`` or ``crop`` writes: its number, or the input's own
+    where it writes none (or 0, which is how ``pad`` says the input's)."""
+    written = _option(node, *names)
+    if written is None:
+        return own
+    found = _dimension(written)
+    if found == 0:
+        return own
+    return found if found is not None and found > 0 else None
+
+
+def _sized_by(node: Node, size: tuple[int, int] | None) -> tuple[int, int] | None:
+    """The size of the picture `node` makes of one `size` big.
+
+    ``scale`` as ffmpeg computes it (:func:`_scaled`), ``pad`` and ``crop``
+    where their sizes are numbers, ``transpose`` turned on its side. Every
+    other filter keeps the size it was handed.
+    """
+    if node.filter == "scale":
+        return _scaled(node, size)
+    if node.filter in ("pad", "crop"):
+        names = (("width", "w"), ("height", "h"))
+        if node.filter == "crop":
+            names = (("out_w", "w"), ("out_h", "h"))
+        width = _side(node, names[0], size[0] if size else None)
+        height = _side(node, names[1], size[1] if size else None)
+        return (width, height) if width and height else None
+    if node.filter == "transpose":
+        if size is None or _option(node, "passthrough") not in (None, "none"):
+            return None
+        return size[1], size[0]
+    return size
+
+
+def _scaled(node: Node, size: tuple[int, int] | None) -> tuple[int, int] | None:
+    """What a ``scale`` node makes of a picture `size` big, or None.
+
+    A negative side keeps the aspect ratio, rounded to a multiple of its
+    magnitude, and two keep the input's size. A kept aspect ratio fits the
+    picture inside the box or around it, rounded down or up to
+    ``force_divisible_by``; inside is never bigger than the box, so that much
+    is known of an input with no size.
+    """
+    width = _side(node, ("width", "w"), size[0] if size else None)
+    height = _side(node, ("height", "h"), size[1] if size else None)
+    written_w = _dimension(_option(node, "width", "w"))
+    written_h = _dimension(_option(node, "height", "h"))
+    if written_w is not None and written_w < 0 and written_h is not None and written_h < 0:
+        return size  # both kept: ffmpeg keeps the input's own
+    if written_w is not None and written_w < 0:
+        if size is None or height is None:
+            return None
+        width = _rescaled(height, size[0], size[1] * -written_w) * -written_w
+    elif written_h is not None and written_h < 0:
+        if size is None or width is None:
+            return None
+        height = _rescaled(width, size[1], size[0] * -written_h) * -written_h
+    if not width or not height:
+        return None
+    mode = _option(node, "force_original_aspect_ratio")
+    if mode in (None, "disable", 0):
+        return width, height
+    inside = mode in ("decrease", 1)
+    if size is None:
+        return (width, height) if inside else None
+    step = max(_dimension(_option(node, "force_divisible_by")) or 1, 1)
+    fit_w = _rescaled(height, size[0], size[1])
+    fit_h = _rescaled(width, size[1], size[0])
+    if inside:
+        width, height = min(width, fit_w), min(height, fit_h)
+        width, height = width // step * step, height // step * step
+    else:
+        width, height = max(width, fit_w), max(height, fit_h)
+        width = (width + step - 1) // step * step
+        height = (height + step - 1) // step * step
+    return (width, height) if width > 0 and height > 0 else None
+
+
+def _rescaled(value: int, num: int, den: int) -> int:
+    """``value * num / den`` rounded to the nearest, as ffmpeg rescales."""
+    return (value * num + den // 2) // den
+
+
 def _frame_seconds(fps: str | None) -> float | None:
     """How long one frame at `fps` lasts; None where there is no rate."""
     numerator, _, denominator = (fps or "").partition("/")
@@ -3353,6 +3462,40 @@ class _Partitioner:
             return None
         return next((s for s in result.by_type(kind) if s.index == index), None)
 
+    def _picture_size(self, ref: FrameRef) -> tuple[int, int] | None:
+        """The width and height of the pictures `ref` carries, or None.
+
+        The input's own size where nothing between changes it, and what the
+        filters that do say they make: a ``scale``, a ``pad`` or a ``crop``
+        with sizes that are numbers, a ``transpose``. A filter that builds one
+        picture of several, or reads its size off another stream, leaves the
+        size unknown rather than guessed (:data:`_UNSIZED_FILTERS`).
+        """
+        chain: list[Node] = []
+        seen: set[str] = set()
+        current = ref
+        while not is_src(current):
+            name = _ref_node(current)
+            if name is None or name not in self.g.nodes or name in seen:
+                return None
+            seen.add(name)
+            node = self.g.nodes[name]
+            if node.filter in _UNSIZED_FILTERS or not node.inputs:
+                return None
+            chain.append(node)
+            current = next(
+                (r for r in node.inputs if ref_type(self.g, r) == "video"), node.inputs[0]
+            )
+        meta = self._origin_meta(current)
+        size = (
+            (meta.width, meta.height)
+            if meta is not None and meta.width and meta.height
+            else None
+        )
+        for node in reversed(chain):
+            size = _sized_by(node, size)
+        return size
+
     def _format(self, ref: FrameRef, target: str | None = None) -> StreamFormat:
         if ref_type(self.g, ref) == "data":
             # Messages cross as they are, whoever wrote them and whoever reads
@@ -3408,10 +3551,11 @@ class _Partitioner:
             rest.pop("rendition", None)
             codec = str(rest.pop("video_codec"))
             pix_fmt = rest.pop("pix_fmt", DEFAULT_PIX_FMT)
+            size = self._picture_size(ref)
             return VideoFormat(
                 pix_fmt=str(pix_fmt),
-                width=meta.width if meta else None,
-                height=meta.height if meta else None,
+                width=size[0] if size else None,
+                height=size[1] if size else None,
                 timebase=_timebase(meta.fps) if meta else None,
                 codec=codec,
                 options=tuple(sorted(rest.items())),
@@ -3424,10 +3568,11 @@ class _Partitioner:
                 height=CLOCK_SIZE,
                 timebase=_timebase(meta.fps) if meta else None,
             )
+        size = self._picture_size(ref)
         return VideoFormat(
             pix_fmt=self._pix_fmt(ref, target),
-            width=meta.width if meta else None,
-            height=meta.height if meta else None,
+            width=size[0] if size else None,
+            height=size[1] if size else None,
             timebase=_timebase(meta.fps) if meta else None,
         )
 

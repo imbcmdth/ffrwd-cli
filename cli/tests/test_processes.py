@@ -45,6 +45,7 @@ from ffrwd.processes import (
     SidecarProcess,
     StreamEdge,
     VideoFormat,
+    _sized_by,
     check_spellable,
     encoder_delay,
     external_ids,
@@ -1106,6 +1107,157 @@ def test_the_frame_size_picks_which_road_the_depth_takes(
     assert buffer is not None
     assert (buffer.road, buffer.frames) == (road, 2)
     assert (buffer.size, buffer.packets) == expected
+
+
+def _scaled_merge(*chain: tuple[str, dict[str, object]]) -> Graph:
+    """The merge with `chain` between the input and the split: the conform a
+    live feed gets before anything reads it."""
+    g = _merge_graph()
+    nodes: dict[str, Node] = {}
+    above = "src:a:v:0"
+    for index, (name, args) in enumerate(chain):
+        nodes[f"c{index}"] = Node(
+            id=f"c{index}", filter=name, args=args, inputs=[above], outputs=["video"]
+        )
+        above = f"c{index}"
+    nodes.update(g.nodes)
+    nodes["sp"].inputs = [above]
+    g.nodes = nodes
+    return g
+
+
+@pytest.mark.parametrize(
+    ("chain", "size", "road"),
+    [
+        # 1080p as probed: two frames are over the limit.
+        ((), (1920, 1080), "fifo"),
+        # Scaled to 720p ahead of the split: two 720p frames fit a pipe.
+        ((("scale", {"width": 1280, "height": 720}),), (1280, 720), "pipe"),
+        # The SMART demo's conform: fit inside 1280x720, then pad to it.
+        (
+            (
+                (
+                    "scale",
+                    {
+                        "width": 1280,
+                        "height": 720,
+                        "force_original_aspect_ratio": "decrease",
+                        "force_divisible_by": 2,
+                    },
+                ),
+                ("pad", {"width": 1280, "height": 720, "x": "(ow-iw)/2", "y": "(oh-ih)/2"}),
+                ("setsar", {"r": 1}),
+                ("format", {"pix_fmts": "yuv420p"}),
+            ),
+            (1280, 720),
+            "pipe",
+        ),
+        # A side written as an expression is not a size anything here computes.
+        ((("scale", {"width": "iw/2", "height": "ih/2"}),), (None, None), "fifo"),
+    ],
+)
+def test_an_edge_is_sized_by_its_own_picture_not_the_inputs(
+    chain: tuple[tuple[str, dict[str, object]], ...],
+    size: tuple[int | None, int | None],
+    road: str,
+) -> None:
+    """A 1080p feed conformed to 720p before the split crosses as 720p, and
+    the pipe it takes is sized by that."""
+    plan = _merged(width=1920, height=1080, graph=_scaled_merge(*chain))
+    edge = _edge(plan, "ffmpeg1", "ffmpeg0")
+
+    assert isinstance(edge.format, VideoFormat)
+    assert (edge.format.width, edge.format.height) == size
+    assert edge.buffer is not None
+    assert edge.buffer.road == road
+
+
+@pytest.mark.parametrize(
+    ("args", "size", "made"),
+    [
+        ({"width": 768, "height": -2}, (1920, 1080), (768, 432)),
+        ({"width": -1, "height": 720}, (1920, 1080), (1280, 720)),
+        ({"width": -2, "height": 720}, (1440, 1080), (960, 720)),
+        ({"width": 0, "height": 360}, (640, 480), (640, 360)),
+        ({"height": 360}, (640, 480), (640, 360)),
+        (
+            {"width": 1280, "height": 720, "force_original_aspect_ratio": "decrease"},
+            (1440, 1080),
+            (960, 720),
+        ),
+        (
+            {
+                "width": 1280,
+                "height": 720,
+                "force_original_aspect_ratio": "increase",
+                "force_divisible_by": 16,
+            },
+            (1440, 1080),
+            (1280, 960),
+        ),
+        # Inside the box is known of an input with no size; around it is not.
+        (
+            {"width": 1280, "height": 720, "force_original_aspect_ratio": "decrease"},
+            None,
+            (1280, 720),
+        ),
+        (
+            {"width": 1280, "height": 720, "force_original_aspect_ratio": "increase"},
+            None,
+            None,
+        ),
+        ({"width": -2, "height": 720}, None, None),
+        ({"width": -1, "height": -1}, (640, 480), (640, 480)),
+    ],
+)
+def test_a_scale_makes_the_size_ffmpeg_makes(
+    args: dict[str, object],
+    size: tuple[int, int] | None,
+    made: tuple[int, int] | None,
+) -> None:
+    node = Node(id="s", filter="scale", args=args, inputs=["src:a:v:0"], outputs=["video"])
+
+    assert _sized_by(node, size) == made
+
+
+def test_pad_crop_and_transpose_size_what_they_make() -> None:
+    def node(name: str, **args: object) -> Node:
+        return Node(id="n", filter=name, args=dict(args), inputs=["x"], outputs=["video"])
+
+    assert _sized_by(node("pad", width=1280, height=720), (960, 720)) == (1280, 720)
+    assert _sized_by(node("pad", width=0, height=800), (960, 720)) == (960, 800)
+    assert _sized_by(node("pad", width="iw+20", height=720), (960, 720)) is None
+    assert _sized_by(node("crop", out_w=640, out_h=360), (1280, 720)) == (640, 360)
+    assert _sized_by(node("crop", out_w=640), (1280, 720)) == (640, 720)
+    assert _sized_by(node("transpose", dir="clock"), (1280, 720)) == (720, 1280)
+    assert _sized_by(node("hflip"), (1280, 720)) == (1280, 720)
+
+
+def test_an_unprobed_live_input_puts_every_bounded_picture_on_the_fifo_road() -> None:
+    """Nothing says how big a frame is, so the depth goes into ffmpeg's own
+    queue; and on that road the pictures are handed on as they come, so the
+    fifo muxer no longer runs them at a constant rate."""
+    plan = partition(
+        _merge_graph(),
+        external=external_ids("e0"),
+        probes={},
+        pix_fmts={"invert": "rgba"},
+        shapes={"invert": ModuleShape()},
+    )
+    edge = _edge(plan, "ffmpeg1", "ffmpeg0")
+    assert edge.buffer == EdgeBuffer("fifo", 2, packets=2)
+    assert edge.live
+    argv = plan_argv(
+        plan,
+        sidecar_argv=wasm.shown_argv,
+        pipe_path=lambda edge, side: f"pipes/{edge.source}-{edge.target}-{side}",
+    )
+    words = argv["ffmpeg1"]
+    at = words.index("pipes/ffmpeg1-ffmpeg0-write")
+    assert words[at - 8 : at] == [
+        "-fps_mode:0", "passthrough",
+        "-fifo_format", "nut", "-queue_size", "2", "-f", "fifo",
+    ]  # fmt: skip
 
 
 def _passthrough_graph(options: dict[str, object] | None = None) -> Graph:
