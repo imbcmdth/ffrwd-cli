@@ -112,6 +112,11 @@ def test_loudnorm2_signature_and_limits_are_documented() -> None:
     assert "two chained ffmpeg commands" in PROMPT
 
 
+def test_leaky_signature_is_documented() -> None:
+    assert "ffrwd.leaky(v, max_lateness => ...)" in PROMPT
+    assert "the sound beside it is never dropped" in PROMPT
+
+
 def test_delay_audio_hint_is_documented() -> None:
     assert "adelay(a.audio[1], 2000)" in PROMPT
     assert "VIDEO ONLY" in PROMPT

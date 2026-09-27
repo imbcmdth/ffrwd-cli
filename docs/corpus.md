@@ -3039,3 +3039,56 @@ ffmpeg -i tests/fixtures/av.mp4 -filter_complex \
 ```
 
 Nothing tells the function how many rungs there are: the list says. The other spelling hands the columns over as parallel arrays - `ladder(v video_stream, widths number[], bitrates text[])`, read as `widths[i.i]` over `generate_series(1, array_length(widths, 1))` - and needs no count either, since a written array's length is settled while compiling. That spelling is the one that takes its rungs from the command line, because a quoted reference filling an `ARRAY[...]` writes one string literal per element: `ladder(p.v, ARRAY[:widths], ARRAY[:'bitrates'], ARRAY[:'bufsizes'])` under `-v widths=1280,854,640 -v bitrates=4500k,2000k,900k -v bufsizes=2250k,1000k,450k`. The rungs are written out here so the page shows what they are. Both compile to the command [recipe 104](examples.md#104-publish-the-ladder-as-hls)'s ladder does with a rate control block added, which is what keeps the function a naming convenience rather than a second way through the compiler.
+
+## 143. Keep a live picture near the wall clock
+
+A head whose picture path cannot keep up with its feed falls further
+behind for as long as the feed runs. `ffrwd.leaky` drops the pictures
+that arrive more than `max_lateness` seconds later than the least late
+one so far, reading lateness off pts stamped onto the Unix epoch, so the
+picture stays near the wall and the sound beside it arrives whole. It
+is a node the sidecar hosts, so the query runs as three processes even
+with no module in it:
+
+```pgsql
+COPY (
+  SELECT ffrwd.leaky(setpts(s.video[1], 'PTS-STARTPTS+1790351579/TB'),
+                     max_lateness => 0.5),
+         asetpts(s.audio[1], 'PTS-STARTPTS+1790351579/TB')
+  FROM input('srt://0.0.0.0:9000?mode=listener',
+             shape => STRUCT(1280 AS width, 720 AS height, 30 AS fps,
+                             48000 AS rate, 2 AS channels),
+             analyzeduration => 500000) s
+) TO 'live.mkv' WITH (video_codec 'libx264', preset 'veryfast',
+                      tune 'zerolatency', audio_codec 'aac')
+```
+
+```
+$ ffrwd compile -f query.sql
+# named pipes: ffmpeg0 reads ffmpeg1, sidecar0; ffmpeg1 feeds sidecar0, ffmpeg0
+1. ffmpeg: ffmpeg -copyts -f nut -analyzeduration 0 -fpsprobesize 3 -i \
+  '<named pipe ffmpeg1-ffmpeg0 n3 read>' -f nut -analyzeduration 0 -fpsprobesize 3 -i \
+  '<named pipe sidecar0-ffmpeg0 n2 read>' -map 1:v:0 -map 0:a:0 -c:0 libx264 -preset:0 \
+  veryfast -tune:0 zerolatency -c:1 aac live.mkv
+2. ffmpeg: ffmpeg -analyzeduration 500000 -i 'srt://0.0.0.0:9000?mode=listener' \
+  -filter_complex '[0:v:0]setpts=PTS-STARTPTS+1790351579/TB[out0]' -filter_complex \
+  '[0:a:0]asetpts=PTS-STARTPTS+1790351579/TB[out1]' -map '[out0]' -c:0 rawvideo \
+  -pix_fmt:0 yuv420p -fps_mode:0 passthrough -fifo_format nut -queue_size 30 -f fifo \
+  '<named pipe ffmpeg1-sidecar0 n1 write>' -map '[out1]' -c:0 pcm_f32le -f nut \
+  '<named pipe ffmpeg1-ffmpeg0 n3 write>'
+3. sidecar: ffrwd-wasm -f nut -i pipe:0 -filter_complex \
+  '[0:v]leaky=max_lateness=0.5:node=n2[out0]' -map '[out0]' -f nut pipe:1
+# this listing is not a shell command -- run the plan with `ffrwd run`
+```
+
+The leaky holds nothing, so it adds no frames to the difference between
+the two paths leaving the reader. It adds time instead: the sound meets
+the picture again at the file, and while the leaky lets the picture
+trail by up to half a second more, the sound's pipe holds half a second
+more, 15 frames of the bound at 30 fps on top of the one the sidecar
+costs. The edge into the leaky holds the same, on the fifo road here,
+since at 720p that is more than a pipe is made to hold: pictures that
+arrive while the leaky waits on the encoder queue there, and it drops
+the ones that are too old once it reads them. `analyzeduration` keeps
+the reader's own probe of the feed short, since everything it reads
+while probing arrives at the leaky as one late burst.

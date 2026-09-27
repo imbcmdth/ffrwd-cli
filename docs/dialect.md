@@ -1412,6 +1412,98 @@ disposition flag, `t.disposition.forced`, over a closed key set. A bare
 `f.tags` is the whole map: no value on its own, but an operand of `||`
 in a `tags` column.
 
+### A live picture that keeps up: `ffrwd.leaky`
+
+`ffrwd.leaky(v, max_lateness => 0.5)` drops the pictures of a live
+video stream that fall too far behind the wall clock, so a picture path
+that cannot keep up sheds pictures rather than falling further behind.
+The name and the option are GStreamer's: a leaky queue, and a sink's
+max-lateness.
+
+- **What it reads.** Pts in seconds on the Unix epoch. A head stamps them
+  there with `setpts(v, 'PTS-STARTPTS+<epoch>/TB')`; a leaf inherits them
+  through MoQ. A picture's lateness is the wall clock less its pts. The
+  smallest lateness seen so far is the baseline, which absorbs a sender
+  that started late and any relay in between.
+- **What it does.** A picture later than the baseline by more than
+  `max_lateness` seconds is dropped. Every other picture passes at once,
+  pts, pixels and rows untouched. Nothing is held and nothing is
+  reordered, and the output's timestamps never decrease.
+- **Arguments.** One video stream; `max_lateness`, named only, in
+  seconds, greater than zero, 0.5 when not written. A sound stream, a
+  `max_lateness` that is not a positive number, and any other argument
+  are refused by name.
+- **Where.** Right after the live input at a head, right after the
+  subscribe at a leaf, before anything splits. It is legal anywhere on a
+  video lane; over a file it drops nothing unless something upstream
+  stalls. It is a node the sidecar hosts, so a query holding one runs as
+  a process plan even with no module in it.
+
+A head reading an SRT listener, stamping both streams onto the epoch the
+run started at:
+
+```sql
+COPY (
+  SELECT ffrwd.leaky(setpts(s.video[1], 'PTS-STARTPTS+1790351579/TB'),
+                     max_lateness => 0.5),
+         asetpts(s.audio[1], 'PTS-STARTPTS+1790351579/TB')
+  FROM input('srt://0.0.0.0:9000?mode=listener',
+             shape => STRUCT(1280 AS width, 720 AS height, 30 AS fps,
+                             48000 AS rate, 2 AS channels),
+             analyzeduration => 500000) s
+) TO 'srt://relay.example:9001?mode=caller' WITH (format 'mpegts',
+  video_codec 'libx264', preset 'veryfast', tune 'zerolatency',
+  audio_codec 'aac')
+```
+
+An RTMP head is the same with `input('rtmp://0.0.0.0:1935/live/feed',
+listen => true, ...)`. A leaf, whose pts already are on the epoch:
+
+```sql
+COPY (
+  SELECT ffrwd.leaky(s.video[1]), s.audio[1]
+  FROM ffrwd.moq.subscribe(:'relay', :'broadcast') s
+) TO 'out.mkv' WITH (video_codec 'libx264', audio_codec 'aac')
+```
+
+Once a second of wall time, and at the end, the run reports what each
+leaky did as a row, on its stdout like any other run row:
+
+| field | type | meaning |
+| --- | --- | --- |
+| `kind` | text | `leaky` |
+| `node` | text | the node's id in the plan |
+| `passed` | number | pictures handed on in this window |
+| `dropped` | number | pictures dropped in this window |
+| `lateness_s` | number | the latest picture's lateness, seconds |
+| `baseline_s` | number | the baseline, seconds |
+
+What it guarantees, and what it does not:
+
+- At the leaky, the picture never trails the wall by more than the
+  baseline plus `max_lateness`. Stages after it add what they hold: a
+  slow ffmpeg's own queues keep a few pictures more.
+- It cannot make an overloaded stage keep up. The pictures that reach
+  that stage are fewer, not cheaper, and what comes out is at that
+  stage's own rate.
+- Sound is never dropped. It travels beside the picture untouched and
+  meets it again at the file or the publish, where the plan gives the
+  sound's pipe `max_lateness` more room (below).
+- The baseline is set by the earliest picture seen. A reader probes its
+  input before the first picture leaves it, up to five seconds of it by
+  default, and those pictures arrive as one late burst; a path too slow
+  to drain the burst stays that far behind until the sender or the
+  network drops it. `analyzeduration` on the live input bounds it.
+
+On a live input the plan counts it in time rather than frames. It holds
+no frames, so it adds none to the difference between two paths that
+part at the reader; and each edge leaving the reader that meets its
+path again, and the edge into it, holds `max_lateness` more, in that
+edge's own frames: pictures of the input, or for sound the same stretch
+its bytes are sized by. Half a second at 30 fps is 15 frames. Every
+other node that drops frames still makes a live input's plan
+`UNBOUNDED_LIVE_INPUT`.
+
 ## Values and predicates
 
 The borrowings below are instances of the split named at the top of

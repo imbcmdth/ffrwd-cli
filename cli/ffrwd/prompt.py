@@ -957,7 +957,7 @@ ffrwd's own).
    start => 1)` is the filter; bare `trim(a.video[1])` is Postgres's string
    `TRIM` and silently loses the argument. `ffmpeg` is a reserved name:
    never use it as an alias or a CTE name.
-3. **`ffrwd.<name>(...)`** -- four fixed macros, each doing what no single
+3. **`ffrwd.<name>(...)`** -- five fixed macros, each doing what no single
    ffmpeg filter does. Their signature is ffrwd's own. The first three are
    POSITIONAL ONLY -- no `=>`, ever; a named argument to one of them
    (`enable` included) is `UNSUPPORTED_SQL`:
@@ -975,8 +975,8 @@ ffrwd's own).
      hint names the replacement -- delay AUDIO with the bare filter
      directly, in MILLISECONDS: `adelay(a.audio[1], 2000)`.
 
-   The fourth is the exception to positional-only, because its options are
-   the whole point:
+   The last two are the exception to positional-only, because their options
+   are the whole point:
    - `ffrwd.loudnorm2(stream, I => ..., TP => ..., LRA => ...)` --
      normalize audio `stream` to a loudness target the broadcast-compliant
      way: MEASURE the whole stream, then correct it in one linear gain
@@ -990,6 +990,15 @@ ffrwd's own).
      in a table/CSV query. Each is `UNSUPPORTED_SQL`. Use the bare
      `loudnorm(...)` filter instead when one pass is genuinely enough (a
      live stream, or a file you have already measured).
+   - `ffrwd.leaky(v, max_lateness => ...)` -- drop each picture of a LIVE
+     video `v` that arrives more than `max_lateness` seconds (default 0.5)
+     later than the least late picture so far, lateness being the wall
+     clock less its pts read as seconds on the Unix epoch (stamp a head's
+     with `setpts(v, 'PTS-STARTPTS+<epoch>/TB')`).
+     Every other picture passes untouched; nothing is held. VIDEO ONLY, and
+     the sound beside it is never dropped. Put it right after the live
+     input, before anything splits, so a slow path sheds pictures instead of
+     falling behind.
 
    `ffrwd` is a reserved name too: never use it as an alias or a CTE name.
 4. **A package call** -- only inside a project with a `ffrwd.json`, and only
@@ -1264,7 +1273,8 @@ _NO_REGISTRY_NOTE = (
     "bare and `ffmpeg.<name>` calls both resolve against the installed "
     "ffmpeg's filter set, whatever it turns out to be, once the provisioner "
     "is fixed. `ffrwd.blur_regions` / `ffrwd.speed` / `ffrwd.delay` / "
-    "`ffrwd.loudnorm2` need no registry at all and always compile."
+    "`ffrwd.loudnorm2` / `ffrwd.leaky` need no registry at all and always "
+    "compile."
 )
 
 
@@ -1291,8 +1301,8 @@ def _function_reference(registry: Registry) -> str:
         "name (`<name> => <value>`) as usual and let `ffrwd validate "
         "--json` report the real option set on a mistake "
         "(`UNKNOWN_FILTER_OPTION` / `FILTER_OPTION_TYPE`); the repair loop "
-        "below covers the rest. The four `ffrwd.*` macros "
-        "(`blur_regions`, `speed`, `delay`, `loudnorm2`) are not in this "
+        "below covers the rest. The five `ffrwd.*` macros "
+        "(`blur_regions`, `speed`, `delay`, `loudnorm2`, `leaky`) are not in this "
         "list -- their signatures are fixed and given in full under Calling "
         "convention.",
         "",

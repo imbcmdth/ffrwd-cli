@@ -46,7 +46,7 @@ Twelve bare names need it (measured against ffmpeg 9.0.1 / sqlglot 30.17): `copy
 
 ## The `ffrwd.` namespace
 
-Four macros that do what no single filter does. `ffrwd` is reserved as an alias, CTE or view name, like `ffmpeg`. Two segments under it - `ffrwd.<name>(...)` - is always a macro; packages published under `ffrwd/*` are called with three ([dialect.md](dialect.md#projects-and-packages)). The first three expand to a subgraph and take positional arguments only, in the documented order; named arguments are rejected.
+Five macros that do what no single filter does. `ffrwd` is reserved as an alias, CTE or view name, like `ffmpeg`. Two segments under it - `ffrwd.<name>(...)` - is always a macro; packages published under `ffrwd/*` are called with three ([dialect.md](dialect.md#projects-and-packages)). The first three expand to a subgraph and take positional arguments only, in the documented order; named arguments are rejected.
 
 - **`ffrwd.delay(f, seconds)`** - delay a video stream on a transparent canvas (`format=pix_fmts=yuva420p` + `tpad=start_duration=<s>:stop=1:color=black@0`). Use for timed overlays: the delayed stream is invisible until its start time.
 
@@ -78,6 +78,10 @@ The fourth expands in TIME rather than in the graph, and is the one macro with n
   - the printed command is POSIX-shell only (`eval`, `$( )`, `${ }`). On cmd.exe or PowerShell, use `ffrwd run`, which does the measure/substitute/encode handoff in process and needs no shell anywhere.
 
   Current limits, each rejected as `UNSUPPORTED_SQL`: one `loudnorm2` per query; never together with a `two_pass` sink; never inside a fan-out `TO (<expression>)`; never in a table/CSV query. Use the bare `loudnorm(...)` filter when one pass is genuinely enough.
+
+The fifth is no ffmpeg filter at all, but a node the sidecar hosts:
+
+- **`ffrwd.leaky(v, max_lateness => 0.5)`** - drop each picture of a live video stream that arrives more than `max_lateness` seconds later than the least late picture so far, lateness being the wall clock less its pts on the Unix epoch, so a slow picture path sheds pictures instead of falling behind the wall clock. Video only; the sound beside it is never dropped. Where it goes, the rows it reports and what it guarantees are in [dialect.md](dialect.md#a-live-picture-that-keeps-up-ffrwdleaky).
 
 ## Generated sources in `FROM`
 
