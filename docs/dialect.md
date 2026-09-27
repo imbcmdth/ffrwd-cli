@@ -1423,8 +1423,9 @@ queue, and a sink's max-lateness.
 - **What it reads.** Pts in seconds on the Unix epoch. A head stamps them
   there with `setpts(v, 'PTS-STARTPTS+<epoch>/TB')`; a leaf inherits them
   through MoQ. A picture's lateness is the wall clock less its pts. The
-  smallest lateness seen so far is the baseline, which absorbs a sender
-  that started late and any relay in between.
+  smallest lateness seen so far (after a first delivery of several
+  pictures, below) is the baseline, which absorbs a sender that started
+  late and any relay in between.
 - **What it does.** A picture later than the baseline by more than
   its spread plus `max_lateness` seconds is dropped. Every other picture
   passes at once, pts, pixels and rows untouched. Nothing is held and
@@ -1443,6 +1444,24 @@ queue, and a sink's max-lateness.
   of 0. The first run, and a run as wide as `max_spread`, stand only
   until a narrower one counts: those are a reader's own probe backlog as
   a rule, handed on at once as it starts, or a stall.
+- **Starting.** A leaf's first delivery is shaped by its own start: as
+  a rule the piece of a group made so far when it joined, handed on at
+  once and read before the decoder's queue has filled. It is narrower
+  than the groups after it, and fresher: each later group's freshest
+  picture is read behind the pictures the decoder holds back and the
+  ones handed on before it. So a first run of more than one picture
+  stands for its freshness as it does for its width: when it ends, the
+  baseline starts over from the picture after it. And the leaky learns
+  before it drops. Until three runs have counted, or a run of one
+  picture after the first (a steady feed), and for no longer than
+  `max_spread` plus `max_lateness` seconds from its first picture, it
+  drops only a picture later than the baseline by more than
+  `max_spread` plus `max_lateness`, and a run begun then counts when its
+  freshest picture is within `max_lateness` of the baseline. A leaf
+  joining a relay learns its groups' spread from its first whole group
+  and drops nothing meanwhile. A steady feed stops learning at its third
+  picture, and so does a stage too slow from the start, so both are
+  judged as before.
 - **Arguments.** One video stream; `max_lateness`, named only, in
   seconds, greater than zero, 0.5 when not written; `max_spread`, named
   only, in seconds, zero or more, 2 when not written (room for a relay
@@ -1501,7 +1520,9 @@ What it guarantees, and what it does not:
 
 - At the leaky, the picture never trails the wall by more than the
   baseline plus the spread plus `max_lateness`, and the spread never
-  grows past `max_spread`. Stages after it add what they hold,
+  grows past `max_spread`; while it learns, for at most `max_spread`
+  plus `max_lateness` seconds, it may trail by the baseline plus
+  `max_spread` plus `max_lateness`. Stages after it add what they hold,
   and that is counted in their own time: a slow ffmpeg's queues keep a
   few pictures past the leaky, so at the file the picture trails by
   `max_lateness` plus those pictures at that stage's rate (about 0.6 s
@@ -1528,11 +1549,12 @@ What it guarantees, and what it does not:
 - Sound is never dropped. It travels beside the picture untouched and
   meets it again at the file or the publish, where the plan gives the
   sound's pipe `max_lateness` plus `max_spread` more room (below).
-- The baseline is set by the earliest picture seen. A reader probes its
+- The baseline is set by the first pictures seen. A reader probes its
   input before the first picture leaves it, up to five seconds of it by
-  default, and those pictures arrive as one late burst; a path too slow
-  to drain the burst stays that far behind until the sender or the
-  network drops it. `analyzeduration` on the live input bounds it.
+  default, and those pictures arrive as one late burst; the baseline
+  starts over from the picture after it, so a path too slow to drain the
+  burst stays that far behind until the sender or the network drops it.
+  `analyzeduration` on the live input bounds it.
 
 On a live input the plan counts it in time rather than frames. It holds
 no frames, so it adds none to the difference between two paths that
