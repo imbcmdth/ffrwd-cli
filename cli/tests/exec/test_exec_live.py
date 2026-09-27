@@ -47,9 +47,10 @@ from pathlib import Path
 import pytest
 
 from ffrwd import binaries, compiler, processes, wasm
-from ffrwd.compiler import compile_all, compile_sql
+from ffrwd.compiler import compile_all, compile_sql, emitted_commands
+from ffrwd.console import Work
 from ffrwd.emit import build_ffmpeg_args, emit
-from ffrwd.execute import execute_plan, plan_argv
+from ffrwd.execute import execute, execute_plan, plan_argv
 from ffrwd.processes import StreamEdge, VideoFormat
 
 pytestmark = pytest.mark.exec
@@ -527,3 +528,185 @@ def test_a_1080p60_feed_conformed_to_720p30_keeps_up_with_the_wall(
         # A network feed may lose the tail a sender closes on; nothing else.
         assert due - 10 <= pictures <= due, pictures
     assert behind < _BEHIND, f"the pictures fell {behind:.1f} s behind the wall"
+
+
+# A 720p30 feed with sound, stamped onto the wall clock the way the demo's
+# heads stamp it, into a picture path that cannot keep up: nlmeans at these
+# settings manages about a third of the feed's rate on the machine this was
+# written on. Through `ffrwd.leaky` the picture stays near the wall and the
+# sound arrives whole; without it the picture falls further behind the
+# longer the feed runs.
+_LEAKY_SECONDS = 10
+_MAX_LATENESS = 0.5
+# What the picture may trail by past max_lateness: the frames the slow
+# ffmpeg's own queues hold past the leaky, and the half second between two
+# of its progress readings.
+_LEAKY_MARGIN = 1.0
+_SLOW = "nlmeans({}, s => 4, p => 5, r => 9)"
+_SLOW_FILTER = "nlmeans=s=4:p=5:r=9"
+# The reader's own probe of the feed is bounded: what it reads while it
+# probes reaches the leaky as one late burst ahead of everything else.
+_LEAKY_SHAPE = (
+    "shape => STRUCT(1280 AS width, 720 AS height, 30 AS fps, 48000 AS rate, "
+    "2 AS channels), analyzeduration => 500000"
+)
+_LEAKY_FEED = [
+    "-re", "-f", "lavfi", "-i", f"testsrc2=size=1280x720:rate=30:duration={_LEAKY_SECONDS}",
+    "-re", "-f", "lavfi", "-i", f"sine=frequency=440:sample_rate=48000:duration={_LEAKY_SECONDS}",
+    "-ac", "2", "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+    "-g", "30", "-pix_fmt", "yuv420p", "-c:a", "aac",
+]  # fmt: skip
+
+
+@pytest.fixture(scope="module")
+def _slow_path() -> None:
+    """Skip where the slow path keeps up after all: it has to be slower than
+    the feed for either test to say anything."""
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("ffmpeg not found on PATH")
+    frames = 60
+    started = time.monotonic()
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-f", "lavfi", "-i",
+         f"testsrc2=size=1280x720:rate=30:duration={frames // 30}",
+         "-vf", _SLOW_FILTER, "-f", "null", "-"],
+        check=True,
+        timeout=_TIMEOUT,
+    )  # fmt: skip
+    rate = frames / (time.monotonic() - started)
+    if rate > 20:
+        pytest.skip(f"{_SLOW_FILTER} runs at {rate:.0f} fps here, near enough to keep up")
+
+
+def _leaky_query(spelled: str, out_path: Path, *, leaky: bool) -> str:
+    epoch = int(time.time())
+    picture = f"setpts(s.video[1], 'PTS-STARTPTS+{epoch}/TB')"
+    if leaky:
+        picture = f"ffrwd.leaky({picture}, max_lateness => {_MAX_LATENESS})"
+    return (
+        "COPY (\n"
+        f"  SELECT {_SLOW.format(picture)},\n"
+        f"         asetpts(s.audio[1], 'PTS-STARTPTS+{epoch}/TB')\n"
+        f"  FROM {spelled} s\n"
+        f") TO '{out_path.as_posix()}'\n"
+        "  WITH (video_codec 'libx264', preset 'ultrafast', tune 'zerolatency',\n"
+        "        audio_codec 'pcm_s16le')"
+    )
+
+
+def _lags(readings: list[tuple[float, float]]) -> list[float]:
+    """How much further behind the wall each progress reading is than the
+    first: wall time gone by, less output time written meanwhile."""
+    written = [(at, out) for at, out in readings if out > 0]
+    assert len(written) > 4, f"too few progress readings: {readings}"
+    first_at, first_out = written[0]
+    return [(at - first_at) - (out - first_out) for at, out in written]
+
+
+def _run_slow(
+    protocol: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, leaky: bool
+) -> tuple[list[float], list[dict[str, object]], Path]:
+    """The feed through the slow path, with or without a leaky: the lags its
+    progress readings show, the rows the run reported, and the file."""
+
+    def no_probe(*args: object, **kwargs: object) -> None:
+        raise AssertionError(f"probed {args}: a declared shape must not be")
+
+    monkeypatch.setattr(compiler, "probe_path", no_probe)
+    spelled, sender = _listener(protocol, _LEAKY_SHAPE, _LEAKY_FEED)
+    out_path = tmp_path / "slow.mkv"
+    compiled = compile_all(_leaky_query(spelled, out_path, leaky=leaky))
+    readings: list[tuple[float, float]] = []
+    rows: list[dict[str, object]] = []
+
+    def work(reading: Work) -> None:
+        readings.append((time.monotonic(), reading.out_time))
+
+    try:
+        sender.start()
+        if leaky:
+            assert compiled.plan is not None
+            result = execute_plan(
+                compiled.plan,
+                sidecar_argv=wasm.sidecar_argv,
+                overwrite=True,
+                timeout=_TIMEOUT,
+                rows=lambda row: rows.append(dict(row)),
+                work=work,
+            )
+            assert result.overflow is None, str(result.overflow)
+            assert result.exit_code == 0, "\n".join(
+                f"{member.id} exited {member.exit_code}: {member.stderr_tail}"
+                for stage in result.stages
+                for member in stage.members
+            )
+        else:
+            # No module and no leaky: the one ffmpeg command it always was.
+            assert compiled.plan is None
+            ran = execute(
+                emitted_commands(compiled.graphs),
+                overwrite=True,
+                timeout=_TIMEOUT,
+                capture_stderr=True,
+                work=work,
+            )
+            assert ran.exit_code == 0
+    finally:
+        sender.stop()
+    assert sender.delivered, "the sender never got through to the listener"
+    return _lags(readings), rows, out_path
+
+
+def _audio_packets(path: Path) -> list[tuple[float, float]]:
+    done = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "a:0",
+         "-show_entries", "packet=pts_time,duration_time", "-of", "json", str(path)],
+        capture_output=True, text=True, timeout=_TIMEOUT, check=False,
+    )  # fmt: skip
+    assert done.returncode == 0, done.stderr
+    return [
+        (float(packet["pts_time"]), float(packet["duration_time"]))
+        for packet in json.loads(done.stdout)["packets"]
+    ]
+
+
+@pytest.mark.usefixtures("_slow_path")
+@pytest.mark.parametrize("protocol", ["srt", "rtmp"])
+def test_a_leaky_keeps_a_slow_picture_near_the_wall_and_the_sound_whole(
+    protocol: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if binaries.ffrwd_wasm_path() is None:
+        pytest.skip("ffrwd-wasm not found (uv sync --extra wasm)")
+    lags, rows, out_path = _run_slow(protocol, tmp_path, monkeypatch, leaky=True)
+
+    # (a) Once the leaky has taken up its budget the picture trails the wall
+    # by no more, to the end of the feed.
+    settled = lags[len(lags) // 2 :]
+    assert max(settled) - min(lags) <= _MAX_LATENESS + _LEAKY_MARGIN, lags
+
+    # (b) What it could not keep up with, it dropped, and said so.
+    assert rows and all(row["kind"] == "leaky" for row in rows)
+    assert set(rows[0]) == {"kind", "node", "passed", "dropped", "lateness_s", "baseline_s"}
+    assert sum(int(str(row["dropped"])) for row in rows) > 0, rows
+
+    # (c) The sound is never dropped: one unbroken run of it, as long as the
+    # feed less the tail a sender closes on.
+    packets = _audio_packets(out_path)
+    gaps = [b[0] - (a[0] + a[1]) for a, b in zip(packets, packets[1:])]
+    assert max(gaps) < 0.005, max(gaps)
+    heard = packets[-1][0] + packets[-1][1] - packets[0][0]
+    assert heard >= _LEAKY_SECONDS - 0.5, heard
+
+
+@pytest.mark.usefixtures("_slow_path")
+@pytest.mark.parametrize("protocol", ["srt", "rtmp"])
+def test_without_a_leaky_the_same_slow_picture_falls_further_behind(
+    protocol: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lags, rows, _ = _run_slow(protocol, tmp_path, monkeypatch, leaky=False)
+
+    assert not rows
+    # Behind by more at the end than the leaky ever lets it be, and still
+    # losing ground over the second half.
+    assert lags[-1] > _MAX_LATENESS + _LEAKY_MARGIN + 1.0, lags
+    assert lags[-1] - lags[len(lags) // 2] > 1.0, lags
