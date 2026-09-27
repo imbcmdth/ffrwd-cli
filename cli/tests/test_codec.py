@@ -179,6 +179,16 @@ def _registry() -> Registry:
     return load_reference(SNAPSHOT_PATH)
 
 
+# A bt709, tv range, left-sited picture, as ffprobe names each field.
+_BT709 = {
+    "color_range": "tv",
+    "color_primaries": "bt709",
+    "color_transfer": "bt709",
+    "color_space": "bt709",
+    "chroma_location": "left",
+}
+
+
 def _clip(**picture: str) -> dict[str, ProbeResult | None]:
     return {
         "f": ProbeResult(
@@ -387,6 +397,80 @@ def test_a_pix_fmt_the_encoder_or_the_edge_cannot_take_is_refused_by_name() -> N
         "sidecar's edge carries rgba, yuv420p, yuv422p, yuv444p"
     )
     assert "pix_fmt 'yuv420p'" in (error.hint or "")
+
+
+# -- colorimetry through a codec --------------------------------------------------
+
+
+def test_an_encoder_is_told_its_streams_colorimetry_and_the_file_keeps_it() -> None:
+    plan = _plan(
+        "COPY (SELECT f.video[1] FROM input('clip.mp4') f) TO 'out.mkv' "
+        "WITH (video_codec enc())",
+        **_BT709,
+    )
+    (encoder,) = plan.sidecars
+    sidecar = _argv(plan)[encoder.id]
+    told = sidecar[sidecar.index("-color_range") : sidecar.index("-m")]
+    assert told == [
+        "-color_range", "tv", "-color_primaries", "bt709",
+        "-color_trc", "bt709", "-colorspace", "bt709",
+    ]
+    muxer = _muxer(plan)
+    assert muxer[muxer.index("-c:0") + 2 : -1] == [
+        "-color_range:0", "tv", "-color_primaries:0", "bt709", "-color_trc:0", "bt709",
+        "-colorspace:0", "bt709", "-chroma_sample_location:0", "left",
+    ]
+
+
+def test_a_stream_says_no_more_colorimetry_than_the_query_settles() -> None:
+    # A setparams on the way settles what it names; the rest is the input's.
+    graph = _lowered(
+        "COPY (SELECT ffmpeg.setparams(f.video[1], color_primaries => 'bt2020') "
+        "FROM input('clip.mp4') f) TO 'out.nut' WITH (video_codec enc())"
+    )
+    (encoder,) = graph.encoders
+    assert graph.codec_formats[encoder] == {"pix_fmt": "yuv420p", "color_primaries": "bt2020"}
+    # A filter converting colour leaves nothing of the input's said.
+    converted = lower(
+        resolve(
+            parse(
+                _ENCODER + "COPY (SELECT ffmpeg.colorspace(f.video[1], all => 'bt2020') "
+                "FROM input('clip.mp4') f) TO 'out.mkv' WITH (video_codec enc())"
+            )
+        ),
+        _clip(**_BT709),
+        registry=_registry(),
+        describes={CODEC: _codec()},
+    )
+    (encoder,) = converted.encoders
+    assert converted.codec_formats[encoder] == {"pix_fmt": "yuv420p"}
+    assert not any(name.startswith("color") for name in converted.sinks[0].options)
+
+
+def test_a_decoder_is_told_the_colorimetry_the_input_declares_and_stamps_it() -> None:
+    graph = _decoding(
+        "COPY (SELECT f.video[1] FROM input('coded.nut') f) TO 'out.mkv' "
+        "WITH (video_codec 'ffv1')",
+        **_BT709,
+    )
+    (decoder,) = graph.decoders
+    assert graph.codec_formats[decoder] == {
+        "color_range": "tv",
+        "color_primaries": "bt709",
+        "color_trc": "bt709",
+        "colorspace": "bt709",
+        "chroma_sample_location": "left",
+    }
+    (unit,) = graph.sinks
+    (stamp,) = [graph.nodes[o.ref] for o in unit.outputs]
+    assert (stamp.filter, stamp.inputs) == ("setparams", [decoder])
+    assert stamp.args == {
+        "range": "tv",
+        "color_primaries": "bt709",
+        "color_trc": "bt709",
+        "colorspace": "bt709",
+        "chroma_location": "left",
+    }
 
 
 # -- decoding an input -------------------------------------------------------------

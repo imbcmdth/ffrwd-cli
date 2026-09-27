@@ -873,7 +873,10 @@ class Graph:
     decoders: list[str] = field(default_factory=list)
     # Node id -> what an encoder or a decoder above is told of its raw side,
     # keyed by ffmpeg's own option names: `pix_fmt`, the format an encoder's
-    # frames reach it in. A node with nothing to say is absent.
+    # frames reach it in, and the colorimetry the stream carries
+    # (`color_range`, `color_primaries`, `color_trc`, `colorspace`,
+    # `chroma_sample_location`), which the NUT between them does not. A
+    # field nothing says is absent, and so is a node with none.
     codec_formats: dict[str, dict[str, str]] = field(default_factory=dict)
     # Alias -> the RETURNS source module bound to it. Not a key of `sources`:
     # its bytes never come from a real `-i`, so the partitioner gives it a

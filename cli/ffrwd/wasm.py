@@ -1980,6 +1980,8 @@ def _argv(
         argv += [_CODEC_FLAG, process.codec]
     if process.frame_rate:
         argv += [_FRAME_RATE_FLAG, process.frame_rate]
+    for flag, value in process.color:
+        argv += [f"-{flag}", value]
     if process.network:
         argv += _network_args(process, writes)
     else:

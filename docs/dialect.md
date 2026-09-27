@@ -374,12 +374,17 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   carries (`rgba`, `yuv420p`, `yuv422p`, `yuv444p`). Without it the
   pictures keep the source's format, or the one a `format()` on the way
   gives them, where the encoder takes it, and take the encoder's first
-  otherwise. A decoder
+  otherwise. The stream's colorimetry (range, primaries, transfer,
+  matrix, chroma siting), as the input declares it or a `setparams()`
+  on the way sets it, is handed to the encoder and written into the
+  file: `.mkv` keeps all five, `.mov` all but the range and the siting,
+  and `.nut` none, since ffmpeg's NUT carries no colorimetry. A decoder
   is used unasked: an input stream whose tag its module reads is decoded
   by it wherever the query reads the stream as frames - a filter, a
   module, an encoder, an output naming a codec - and
   `input(..., decoder => ffrwd.pyrowave.decode())` names one outright.
-  It writes the format its module answers for the stream.
+  It writes the format its module answers for the stream, and its
+  pictures carry the colorimetry the input declares.
   An output that copies such a stream keeps it coded. Either way the
   file has to be one that keeps a stream by its tag: `.nut`, `.mkv` or
   `.mov`. mp4 cannot hold it and is refused, as is every other

@@ -192,6 +192,16 @@ def _source(path: Path, pix_fmt: str) -> Path:
     return path
 
 
+_COLOUR = "color_range,color_primaries,color_transfer,color_space,chroma_location"
+_BT709 = {
+    "color_range": "tv",
+    "color_primaries": "bt709",
+    "color_transfer": "bt709",
+    "color_space": "bt709",
+    "chroma_location": "left",
+}
+
+
 def test_a_444_clip_is_coded_in_444_and_decoded_back_to_it(tmp_path: Path) -> None:
     clip = _source(tmp_path / "clip.mkv", "yuv444p")
     coded = tmp_path / "coded.nut"
@@ -207,3 +217,30 @@ def test_a_444_clip_is_coded_in_444_and_decoded_back_to_it(tmp_path: Path) -> No
     assert _picture(back, "pix_fmt") == {"pix_fmt": "yuv444p"}
     assert _frames(back, "yuv444p") == _frames(clip, "yuv444p")
 
+
+def test_a_coded_files_colour_is_the_sources_and_its_decode_carries_it(
+    tmp_path: Path,
+) -> None:
+    clip = _source(tmp_path / "clip.mkv", "yuv420p")
+    coded = tmp_path / "coded.mkv"
+    quick = tmp_path / "coded.mov"
+    back = tmp_path / "back.mkv"
+    for path in (coded, quick):
+        _run(
+            f"{_ENCODER}\nCOPY (SELECT f.video[1] FROM input('{clip.as_posix()}') f) "
+            f"TO '{path.as_posix()}' WITH (video_codec enc())"
+        )
+    assert _picture(coded, _COLOUR) == _BT709
+    # QuickTime's colour atom for a codec it does not know holds no range,
+    # and the container has no field for the siting.
+    assert _picture(quick, _COLOUR) == {
+        **_BT709,
+        "color_range": "unknown",
+        "chroma_location": "unspecified",
+    }
+    _run(
+        f"{_DECODER}\nCOPY (SELECT f.video[1] FROM input('{coded.as_posix()}') f) "
+        f"TO '{back.as_posix()}' WITH (video_codec 'ffv1')"
+    )
+    assert _picture(back, _COLOUR) == _BT709
+    assert _frames(back) == _frames(clip)

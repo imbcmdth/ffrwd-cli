@@ -235,6 +235,9 @@ PIPE_BUFFER_STEP = 1 << 16
 # and than any audio codec's packet.
 LONGEST_FRAME_SECONDS = 0.1
 
+# The colorimetry a codec's sidecar is told, by the names of its flags.
+SIDECAR_COLOR_FLAGS: tuple[str, ...] = ("color_range", "color_primaries", "color_trc", "colorspace")
+
 # Bytes one pixel takes on the wire, per pixel format ffrwd carries.
 _PIXEL_BYTES: Mapping[str, int] = {
     "rgba": 4,
@@ -938,6 +941,10 @@ class SidecarProcess:
     # ("30/1", "30000/1001"): what a bitrate-driven encoder divides its budget
     # by. Empty where nothing says it, for audio, and for every other process.
     frame_rate: str = ""
+    # A codec's stream's colorimetry, as the sidecar's flags name it
+    # (`color_range`, `color_primaries`, `color_trc`, `colorspace`), for the
+    # fields the query settles: the NUT the codec reads carries none of it.
+    color: tuple[tuple[str, str], ...] = ()
 
     @property
     def nodes(self) -> tuple[str, ...]:
@@ -1007,6 +1014,8 @@ class SidecarProcess:
             written["codec"] = self.codec
         if self.frame_rate:
             written["frame_rate"] = self.frame_rate
+        if self.color:
+            written["color"] = dict(self.color)
         if self.pads:
             written["pads"] = [None if p is None else p.to_dict() for p in self.pads]
         if self.network and self.graph is not None:
@@ -3009,6 +3018,7 @@ class _Partitioner:
                 data_filter=any(name in self.g.data_filters for name in members),
                 codec=_codec_of(self.g, members),
                 frame_rate=self._encoder_frame_rate(members),
+                color=self._codec_color(members),
                 rows_in=self._region_rows_in(members),
                 pads=self._region_pad_meta(members),
             )
@@ -3502,6 +3512,16 @@ class _Partitioner:
         if not rate or rate.startswith("0/") or rate.endswith("/0"):
             return ""
         return rate
+
+    def _codec_color(self, members: Sequence[str]) -> tuple[tuple[str, str], ...]:
+        """The colorimetry a codec region's sidecar is told, in its flags'
+        order: what lowering recorded of the codec's stream, less the chroma
+        siting, which a module's video format has no field for."""
+        said: Mapping[str, str] = next(
+            (self.g.codec_formats[name] for name in members if name in self.g.codec_formats),
+            {},
+        )
+        return tuple((flag, said[flag]) for flag in SIDECAR_COLOR_FLAGS if flag in said)
 
     def _origin_meta(self, ref: FrameRef) -> StreamMeta | None:
         origin = self._origin(ref)

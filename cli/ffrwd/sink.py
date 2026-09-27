@@ -527,7 +527,36 @@ _INTERNAL_SINK_OPTIONS: dict[str, SinkOptionSpec] = {
         flag="-sc_threshold",
         per_stream=True,
     ),
+    # The colorimetry a codec package's encoder codes, which the stream it
+    # reads carried and the NUT around it lost: the copying muxer writes it
+    # into the file, since a stream copy takes these from the options.
+    **{
+        name: SinkOptionSpec(
+            name=name,
+            scope="video",
+            type="str",
+            doc=doc,
+            flag=f"-{name}",
+            per_stream=True,
+        )
+        for name, doc in (
+            ("color_range", "The picture's range, tv or pc."),
+            ("color_primaries", "The picture's colour primaries, e.g. bt709."),
+            ("color_trc", "The picture's transfer characteristic, e.g. bt709."),
+            ("colorspace", "The picture's YUV matrix, e.g. bt709."),
+            ("chroma_sample_location", "Where the chroma samples sit, e.g. left."),
+        )
+    },
 }
+
+# The colorimetry options above, in the order a command writes them.
+COLOR_OPTIONS: tuple[str, ...] = (
+    "color_range",
+    "color_primaries",
+    "color_trc",
+    "colorspace",
+    "chroma_sample_location",
+)
 
 
 def option_spec(name: str) -> SinkOptionSpec | None:

@@ -420,6 +420,7 @@ from ffrwd.processes import CLOCK_SIZE, COPY_CODEC, NUT, RAWVIDEO, ref_type
 from ffrwd.registry import DynamicFilter, FilterOption, Registry, SourceFilter
 from ffrwd.sink import (
     CODEC_PARAMS_FLAGS,
+    COLOR_OPTIONS,
     MANIFEST_DEFAULT_SEGMENT,
     MANIFEST_FORMATS,
     MANIFEST_MAP_OPTION,
@@ -2506,6 +2507,61 @@ _ENCODER_SHAPING = frozenset(
     }
 )
 
+# A stream's colorimetry: each option ffmpeg's output takes it by, against
+# the field ffprobe reports it in and setparams' option for it.
+_PROBED_COLOR: Mapping[str, str] = {
+    "color_range": "color_range",
+    "color_primaries": "color_primaries",
+    "color_trc": "color_transfer",
+    "colorspace": "color_space",
+    "chroma_sample_location": "chroma_location",
+}
+_SETPARAMS_COLOR: Mapping[str, str] = {
+    "color_range": "range",
+    "color_primaries": "color_primaries",
+    "color_trc": "color_trc",
+    "colorspace": "colorspace",
+    "chroma_sample_location": "chroma_location",
+}
+# What ffprobe and setparams write for a field nothing settles.
+_UNSAID_COLOR = frozenset({"unknown", "unspecified", "reserved", "auto"})
+# The fields that describe YUV alone, which an RGB picture has none of.
+_YUV_ONLY_COLOR = ("color_range", "colorspace", "chroma_sample_location")
+_RGB_PREFIXES = ("rgb", "bgr", "gbr", "argb", "abgr")
+# Filters that convert colour, past which a stream's colorimetry is no longer
+# its input's. A `scale` does too where it names an in_ or out_ option.
+_COLOR_CONVERTING_FILTERS = frozenset(
+    {"colorspace", "colormatrix", "zscale", "tonemap", "tonemap_opencl", "libplacebo"}
+)
+
+
+def _converts_colour(node: Node) -> bool:
+    """True where `node` converts the colour of the pictures through it."""
+    if node.filter in _COLOR_CONVERTING_FILTERS:
+        return True
+    return node.filter == "scale" and any(
+        str(key).startswith(("in_", "out_")) for key in node.args
+    )
+
+
+def _colorimetry_options(
+    tagged: Mapping[int, Mapping[str, str]], outputs: Sequence[Output]
+) -> dict[str, object]:
+    """The sink options writing each encoded picture's colorimetry, keyed by
+    its place among `outputs`: one value where every video track says the
+    same, else one per video track, None where a track says nothing."""
+    if not tagged:
+        return {}
+    video = [index for index, output in enumerate(outputs) if output.type == "video"]
+    written: dict[str, object] = {}
+    for option in COLOR_OPTIONS:
+        values = [tagged.get(index, {}).get(option) for index in video]
+        if all(value is None for value in values):
+            continue
+        written[option] = values[0] if len(set(values)) == 1 else values
+    return written
+
+
 # The containers a stream in a codec package's codec may be written to.
 # ffmpeg knows no such codec and keeps it by its tag: NUT and QuickTime keep
 # it exactly, Matroska as a VFW fourcc with its timestamps in milliseconds.
@@ -4237,7 +4293,9 @@ class _Lowerer:
         decoder is the one the input names with ``decoder => <call>``, else
         the one whose tags include the stream's. An output that copies the
         stream keeps it coded, into a container that keeps a stream by its
-        tag.
+        tag. A picture's colorimetry, as the input declares it, is told to
+        the decoder and set on the pictures it writes, since the NUT on
+        either side of it carries none.
         """
         explicit = self._explicit_decoders()
         by_tag = self._decoders_by_tag()
@@ -4267,7 +4325,18 @@ class _Lowerer:
             node = self.ctx.node(declared.module, params, [ref], [kind])
             self.graph.decoders.append(node)
             made[ref] = node
-            return node
+            said = self._stream_colorimetry(ref) if kind == "video" else {}
+            if said:
+                # The NUT the decoder reads and writes carries none of it:
+                # the decoder is told it, and its pictures are stamped with it.
+                self.graph.codec_formats[node] = said
+                made[ref] = self.ctx.node(
+                    "setparams",
+                    {_SETPARAMS_COLOR[option]: value for option, value in said.items()},
+                    [node],
+                    ["video"],
+                )
+            return made[ref]
 
         coded_readers = (
             set(self.graph.decoders) | set(self.graph.packet_sinks) | set(self.graph.packet_filters)
@@ -4627,11 +4696,12 @@ class _Lowerer:
             path = self._derive_manifest(
                 options, option_nodes, columns, variant_rows, outputs, path, raw
             )
-        self._place_encoders(raw, encoders, options, outputs, path)
+        colorimetry = self._place_encoders(raw, encoders, options, outputs, path)
         self._place_packet_filters(raw, options, outputs, first_filter)
         self._check_metadata_track_container(options, outputs, path, raw)
         self._check_json_container(options, outputs, path, raw)
         self._codec_for_rows_track(options, outputs, path)
+        options.update(colorimetry)
         return SinkUnit(
             outputs=outputs,
             path=path,
@@ -4688,7 +4758,7 @@ class _Lowerer:
         options: dict[str, object],
         outputs: list[Output],
         path: str | None,
-    ) -> None:
+    ) -> dict[str, object]:
         """Put each named encoder over every output stream of its kind.
 
         One node per stream, reading it raw and writing it coded; the output
@@ -4700,8 +4770,12 @@ class _Lowerer:
         a codec ffmpeg does not know.
 
         A picture reaches the encoder in the format :meth:`_encoder_pix_fmts`
-        settles, recorded in the graph's ``codec_formats``.
+        settles and with the colorimetry its stream carries
+        (:meth:`_stream_colorimetry`), both recorded in the graph's
+        ``codec_formats``. Answers the sink options that write that
+        colorimetry into the file, which the copying muxer takes.
         """
+        tagged: dict[int, dict[str, str]] = {}
         for name, (option, declared) in encoders.items():
             kind = _CODEC_OPTIONS[name]
             node = _unwrap(option.value)
@@ -4780,8 +4854,14 @@ class _Lowerer:
                     continue
                 ref = self.ctx.node(declared.module, params, [output.ref], [kind])
                 self.graph.encoders.append(ref)
-                if index in pix_fmts:
-                    self.graph.codec_formats[ref] = {"pix_fmt": pix_fmts[index]}
+                if kind == "video":
+                    said = self._stream_colorimetry(output.ref, pix_fmts.get(index))
+                    tagged[index] = said
+                    formats = dict(said)
+                    if index in pix_fmts:
+                        formats["pix_fmt"] = pix_fmts[index]
+                    if formats:
+                        self.graph.codec_formats[ref] = formats
                 outputs[index] = replace(output, ref=ref)
                 coded = True
             if not coded:
@@ -4793,6 +4873,7 @@ class _Lowerer:
                     fallback=raw.path_node,
                     hint=f"select a {kind} stream, or drop the {name} option",
                 )
+        return _colorimetry_options(tagged, outputs)
 
     def _encoder_pix_fmts(
         self,
@@ -4889,6 +4970,41 @@ class _Lowerer:
             current = self._picture_input(node)
         meta = self._source_meta(current)
         return meta.pix_fmt if meta is not None else None
+
+    def _stream_colorimetry(self, ref: FrameRef, pix_fmt: str | None = None) -> dict[str, str]:
+        """The colorimetry the pictures `ref` names carry, by ffmpeg's option
+        names, as far as the query says it.
+
+        A ``setparams`` on the way settles each field it names; past a filter
+        that converts colour (:data:`_COLOR_CONVERTING_FILTERS`) nothing else
+        does. Every field left is the input stream's, as probed. A field
+        nothing settles is absent. Pictures in an RGB `pix_fmt` have no YUV
+        matrix, range or chroma siting to state.
+        """
+        said: dict[str, str] = {}
+        seen: set[str] = set()
+        current: FrameRef | None = ref
+        while current is not None and not is_src(current):
+            node = self._upstream(current, seen)
+            if node is None or _converts_colour(node):
+                current = None
+                break
+            if node.filter == "setparams":
+                for option, param in _SETPARAMS_COLOR.items():
+                    value = node.args.get(param)
+                    if value is not None and str(value) not in _UNSAID_COLOR:
+                        said.setdefault(option, str(value))
+            current = self._picture_input(node)
+        meta = self._source_meta(current)
+        if meta is not None:
+            for option, field_name in _PROBED_COLOR.items():
+                value = getattr(meta, field_name)
+                if isinstance(value, str) and value not in _UNSAID_COLOR:
+                    said.setdefault(option, value)
+        if pix_fmt is not None and pix_fmt.startswith(_RGB_PREFIXES):
+            for option in _YUV_ONLY_COLOR:
+                said.pop(option, None)
+        return {option: said[option] for option in COLOR_OPTIONS if option in said}
 
     def _described_codec(
         self, declared: WasmFunction, node: exp.Expr, select: exp.Select
