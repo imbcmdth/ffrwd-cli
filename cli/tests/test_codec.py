@@ -452,3 +452,25 @@ def test_a_decoder_is_a_sidecar_reading_the_copied_stream() -> None:
     assert argv[decoder.id][argv[decoder.id].index("-codec") + 1] == "decode"
     reader = argv[into.source]
     assert reader[reader.index("-c:0") + 1] == "copy"
+
+
+def test_an_installed_packages_decoder_is_adopted_for_a_tag_an_input_carries(
+    tmp_path: Path,
+) -> None:
+    from ffrwd import compiler
+
+    _codec_package(tmp_path)
+    packages = discover(tmp_path)
+    assert packages is not None
+    res = resolve(parse("COPY (SELECT f.video[1] FROM input('coded.nut') f) TO 'out.mkv'"))
+    described: list[str] = []
+
+    def describe(path: str) -> Described:
+        described.append(path)
+        return _codec()
+
+    compiler._adopt_package_decoders(res, _clip(), packages, describe)
+    assert "ffrwd.codec.decode" not in res.wasm and described == []  # h264: nothing asked
+    compiler._adopt_package_decoders(res, _coded(), packages, describe)
+    adopted = res.wasm["ffrwd.codec.decode"]
+    assert adopted.is_decoder and Path(adopted.module) == tmp_path / "modules" / "codec.wasm"

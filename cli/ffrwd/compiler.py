@@ -218,6 +218,54 @@ def _describe_modules(
     return described
 
 
+def _module_tags(probes: Mapping[str, ProbeResult | None]) -> set[str]:
+    """The tags of every probed stream ffmpeg could not name and a codec
+    package might: a video or audio stream whose codec is a four-character
+    tag with a capital in it. ffmpeg's own codec names are all lowercase, so
+    an ordinary input names none, and nothing below describes anything."""
+    return {
+        meta.codec
+        for result in probes.values()
+        if result is not None
+        for meta in result.streams
+        if meta.type in ("video", "audio")
+        and meta.codec is not None
+        and len(meta.codec) == 4
+        and any(char.isupper() for char in meta.codec)
+    }
+
+
+def _adopt_package_decoders(
+    res: Resolved,
+    probes: Mapping[str, ProbeResult | None],
+    packages: PackageSet | None,
+    describe: wasm.Describe,
+) -> None:
+    """Put beside the query's own declarations the decoder every installed
+    package declares for a tag one of its inputs carries.
+
+    A decoder is used unasked: an input whose stream carries a tag it reads
+    is decoded by it, so the query never writes the call that would have
+    adopted it. It is adopted the way a written call adopts a package's
+    declaration, under the path such a call would write, and only when some
+    input carries a tag its module says it reads.
+    """
+    tags = _module_tags(probes)
+    if not tags or packages is None:
+        return
+    for package in packages.packages.values():
+        for declared in package_modules(package):
+            name = declared.called
+            if not declared.is_decoder or name in res.wasm:
+                continue
+            described = describe(declared.module)
+            if described.decoder is None or not tags & set(described.decoder.fourccs):
+                continue
+            res.wasm[name] = replace(
+                declared, name=name, position=-1, package="", package_version=""
+            )
+
+
 def _stream_wasm(res: Resolved) -> dict[str, WasmFunction]:
     """The declared wasm functions that filter a STREAM, keyed by name.
 
@@ -627,6 +675,7 @@ def compile_all(
     try:
         res = resolve(parse(text, unset), packages=packages, on_warning=on_warning, owner=owner)
         probes, probe_failures = _probe_inputs(res)
+        _adopt_package_decoders(res, probes, packages, describe)
         describes = _describe_modules(res, describe)
         graphs = lower_commands(
             res,
