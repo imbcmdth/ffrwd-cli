@@ -1262,11 +1262,15 @@ COPY (SELECT scale(s.video[1], 1280, 720), aresample(s.audio[1], 48000)
 
 -- The same over RTMP: ffmpeg listens for one publisher on 1935.
 COPY (SELECT s.video[1], s.audio[1]
-      FROM input('rtmp://0.0.0.0:1935/live/feed?listen=1',
+      FROM input('rtmp://0.0.0.0:1935/live/feed', listen => true,
                  shape => STRUCT(1280 AS width, 720 AS height, '30000/1001' AS fps,
                                  44100 AS rate, 2 AS channels)) s)
   TO 'feed.mkv'
 ```
+
+`listen => true` is what makes an RTMP input wait for its publisher
+(`-listen 1`). SRT says the same in its URL (`mode=listener`); ffmpeg's RTMP
+reads a `?listen=1` in the URL as part of the stream name and dials instead.
 
 A shape is allowed on any input, a file included: there it only skips the
 probe, and what the file really holds is what ffmpeg reads at run time. A

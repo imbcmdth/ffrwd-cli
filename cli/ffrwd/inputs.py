@@ -252,6 +252,16 @@ INPUT_OPTIONS: dict[str, InputOptionSpec] = {
         # reachability concern as `rtsp_transport`.
         probes=True,
     ),
+    "listen": InputOptionSpec(
+        name="listen",
+        type="bool",
+        doc="Wait for the sender to connect, e.g. an RTMP publisher, instead of dialling it.",
+        flag="-listen",
+        # Which way the connection goes. A probe without it dials a listener
+        # URL, finds nothing there and reads nothing; with it the probe
+        # waits for the sender the way the run does.
+        probes=True,
+    ),
     "shape": InputOptionSpec(
         name="shape",
         type="struct",

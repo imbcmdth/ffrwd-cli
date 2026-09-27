@@ -48,6 +48,7 @@ _EXPECTED: dict[str, str] = {
     "analyzeduration": "size",
     "rtsp_transport": "str",
     "user_agent": "str",
+    "listen": "bool",
     "shape": "struct",
 }
 
@@ -84,6 +85,8 @@ _EXPECTED_PROBES: dict[str, bool] = {
     "analyzeduration": True,
     "rtsp_transport": True,
     "user_agent": True,
+    # A probe of a listener has to listen as the run does, or it dials.
+    "listen": True,
     # The compiler's own: a declared shape means there is no probe at all.
     "shape": False,
 }
@@ -400,15 +403,20 @@ _DESCRIBED = {
 
 _LIVE_URLS = [
     "srt://0.0.0.0:9000?mode=listener&latency=200000",
-    "rtmp://0.0.0.0:1935/live/feed?listen=1",
+    "rtmp://0.0.0.0:1935/live/feed",
 ]
+
+# How each of those waits for its sender: SRT says so in its URL, while
+# ffmpeg's RTMP reads a listen query as part of the stream name and dials.
+_LISTENS = {"srt": "", "rtmp": ", listen => true"}
 
 
 def _live_query(url: str, shape: str | None) -> str:
     """The SMART demo's head in small: the feed conformed ahead of the split
     (its rate included), a module on one leg, the picture beside it, and the
     sound filtered into the same file."""
-    declared = f", shape => {shape}" if shape else ""
+    declared = _LISTENS[url.partition(":")[0]]
+    declared += f", shape => {shape}" if shape else ""
     return (
         "CREATE FUNCTION invert(v video_stream) RETURNS video_stream\n"
         f"  AS '{_INVERT}', 'invert' LANGUAGE wasm;\n"
@@ -500,3 +508,17 @@ def test_a_shape_that_is_no_struct_is_refused_at_its_option(
 
     assert caught.value.code is ErrorCode.INPUT_OPTION_TYPE
     assert "a picture (width, height) without its fps" in caught.value.message
+
+
+def test_an_rtmp_listener_renders_listen_before_its_input() -> None:
+    """ffmpeg's RTMP waits for a publisher only with ``-listen 1``; a
+    ``?listen=1`` in the URL is read as part of the stream name and dials."""
+    graph = compile_all(
+        "COPY (SELECT s.video[1] FROM input('rtmp://0.0.0.0:1935/live/feed', "
+        "listen => true, shape => STRUCT(1280 AS width, 720 AS height, 30 AS fps)) s) "
+        "TO 'o.mkv'"
+    ).graphs[0]
+
+    assert graph.input_options == {"s": {"listen": True}}
+    assert render_options(graph.input_options["s"]) == ["-listen", "1"]
+    assert render_options(probe_options({"listen": True})) == ["-listen", "1"]
