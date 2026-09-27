@@ -150,10 +150,7 @@ _PRODUCE = "import sys; sys.stdout.buffer.write(bytes(range(256)) * 4096); sys.s
 
 
 def _consume(path: Path) -> str:
-    return (
-        "import sys; data = sys.stdin.buffer.read(); "
-        f"open({str(path)!r}, 'wb').write(data)"
-    )
+    return f"import sys; data = sys.stdin.buffer.read(); open({str(path)!r}, 'wb').write(data)"
 
 
 def _python(code: str) -> list[str]:
@@ -169,9 +166,7 @@ def _pair(tmp_path: Path, consumer: str | None = None) -> tuple[ProcessPlan, Pat
                 id="sidecar1", module=consumer or _consume(out), node="c", inputs=("n0",)
             ),
         ),
-        edges=(
-            StreamEdge(source="sidecar0", target="sidecar1", ref="n0", format=VideoFormat()),
-        ),
+        edges=(StreamEdge(source="sidecar0", target="sidecar1", ref="n0", format=VideoFormat()),),
     )
     return plan, out
 
@@ -260,3 +255,127 @@ def test_a_remote_run_places_itself_and_takes_no_target(
 
     assert cli.main(["run", "SELECT 1", "--remote", "--target", "split-local"]) == 2
     assert "--target is for a run on this machine" in capsys.readouterr().err
+
+
+# -- a runner on a machine of its own
+
+
+class _Said:
+    """A control channel that keeps what the runner sends and hears nothing."""
+
+    closed = False
+
+    def __init__(self) -> None:
+        self.sent: list[dict[str, object]] = []
+
+    def send(self, message: dict[str, object]) -> None:
+        self.sent.append(message)
+
+    def receive(self) -> None:
+        return None
+
+    def close(self) -> None:
+        pass
+
+
+def _agent(plan: ProcessPlan, argv: dict[str, list[str]], sidecar: str | None) -> tuple:
+    from ffrwd.nodes import _Agent
+    from ffrwd.placement import split
+
+    part = split(plan, place(plan, "one"))[0]
+    said = _Said()
+    job = {
+        "type": "job",
+        "plan": plan.to_dict(),
+        "node": part.to_dict(),
+        "argv": argv,
+        "sidecar": sidecar,
+    }
+    return _Agent(said, job, new_secret(), "127.0.0.1"), said  # type: ignore[arg-type]
+
+
+def _modelled(tmp_path: Path) -> ProcessPlan:
+    from ffrwd.processes import ModelBinding
+
+    module = tmp_path / "m.wasm"
+    model = tmp_path / "m.onnx"
+    module.write_bytes(b"")
+    model.write_bytes(b"")
+    return ProcessPlan(
+        processes=(
+            SidecarProcess(
+                id="sidecar0",
+                module=str(module),
+                node="m",
+                outputs=("video",),
+                models=(ModelBinding(name="m", path=str(model)),),
+            ),
+        ),
+    )
+
+
+def test_a_runner_names_its_own_sidecar_and_onnx_runtime_in_place_of_the_coordinators(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from ffrwd import binaries, nn
+
+    monkeypatch.setattr(binaries, "ffrwd_wasm_path", lambda: "/here/ffrwd-wasm")
+    monkeypatch.setattr(
+        nn, "spawn_args", lambda: ["-nn-runtime", "/here/ort", "-nn-target", "cuda"]
+    )
+    plan = _modelled(tmp_path)
+    rendered = [
+        "/there/ffrwd-wasm",
+        "-m",
+        "x.wasm",
+        "-nn-runtime",
+        "/there/ort",
+        "-nn-target",
+        "cpu",
+        "-nn-exclude",
+        "dml",
+        "-nn",
+        "m=/p/m.onnx",
+    ]
+    agent, _ = _agent(plan, {"sidecar0": rendered}, "/there/ffrwd-wasm")
+    try:
+        assert agent.argv["sidecar0"] == [
+            "/here/ffrwd-wasm",
+            "-m",
+            "x.wasm",
+            "-nn-runtime",
+            "/here/ort",
+            "-nn-target",
+            "cuda",
+            "-nn-exclude",
+            "dml",
+            "-nn",
+            "m=/p/m.onnx",
+        ]
+    finally:
+        agent.close()
+
+
+def test_a_runner_given_a_hooks_argv_leaves_it_as_it_is(tmp_path: Path) -> None:
+    plan = _modelled(tmp_path)
+    rendered = ["python", "-c", "pass", "-nn-runtime", "/there/ort"]
+    agent, _ = _agent(plan, {"sidecar0": rendered}, None)
+    try:
+        assert agent.argv["sidecar0"] == rendered
+    finally:
+        agent.close()
+
+
+def test_a_runner_missing_a_model_file_refuses_before_it_says_ready(tmp_path: Path) -> None:
+    plan = _modelled(tmp_path)
+    missing = tmp_path / "m.onnx"
+    missing.unlink()
+    agent, said = _agent(plan, {"sidecar0": ["/there/ffrwd-wasm"]}, "/there/ffrwd-wasm")
+    try:
+        assert agent.serve() == 1
+    finally:
+        agent.close()
+    assert [message["type"] for message in said.sent] == ["refused"]
+    error = said.sent[0]["error"]
+    assert isinstance(error, dict)
+    assert error["message"] == f"node 0 does not have {missing}"

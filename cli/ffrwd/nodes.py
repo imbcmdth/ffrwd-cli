@@ -29,7 +29,9 @@ address), ``stage`` (run a stage), ``live`` (a live input's programme has
 started flowing on some node), ``stop`` (end the running stage),
 ``compiled`` (the answer to a ``compile``), ``exit``.
 
-From a runner: ``hello``, ``ready`` (its data address), ``started`` and
+From a runner: ``hello``, ``ready`` (its data address), ``refused`` (it
+cannot run its part: a module or model file its members load is not on its
+machine), ``started`` and
 ``exited`` per member, ``flows`` (every copy's counters and each running
 member's CPU time), ``work`` (the progress of the member writing the
 destinations), ``row``, ``unheard`` (a feeder port nothing listened on),
@@ -66,9 +68,9 @@ import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import cast
+from typing import Protocol, cast
 
-from . import pipes, wasm
+from . import binaries, nn, pipes, wasm
 from .console import Work, WorkProgress
 from .errors import ErrorCode, FfrwdError
 from .execute import (
@@ -115,6 +117,8 @@ __all__ = [
     "SECRET_ENV",
     "Channel",
     "Listener",
+    "Runner",
+    "StartRunner",
     "agent_main",
     "dial",
     "execute_split",
@@ -487,9 +491,7 @@ class _Compile:
 class _Agent:
     """One node's runner, from the job to the last stage."""
 
-    def __init__(
-        self, channel: Channel, job: Mapping[str, object], secret: str, host: str
-    ) -> None:
+    def __init__(self, channel: Channel, job: Mapping[str, object], secret: str, host: str) -> None:
         self._channel = channel
         self._secret = secret
         raw_plan, raw_node = job.get("plan"), job.get("node")
@@ -526,7 +528,9 @@ class _Agent:
             for pid, words in (raw_argv.items() if isinstance(raw_argv, dict) else ())
             if isinstance(words, list) and pid in self.mine
         }
-        self.argv = self._name_pipes(rendered)
+        raw_sidecar = job.get("sidecar")
+        self._sidecar = raw_sidecar if isinstance(raw_sidecar, str) and raw_sidecar else None
+        self.argv = self._name_pipes(self._localize(rendered))
         self.listener = Listener(host, secret, [cut.key for cut in self.part.listens])
         self._peers: dict[int, tuple[str, int]] = {}
         self._stop = threading.Event()
@@ -538,6 +542,49 @@ class _Agent:
         self._compile_lock = threading.Lock()
 
     # -- argv
+
+    def _localize(self, rendered: Mapping[str, list[str]]) -> dict[str, list[str]]:
+        """Each sidecar member's argv with this machine's sidecar and ONNX
+        Runtime in place of the coordinator's, which it rendered from its own
+        machine. Left alone when the coordinator named no sidecar: its argv
+        came from a hook, not from the installed sidecar."""
+        if self._sidecar is None:
+            return dict(rendered)
+        from .processes import SidecarProcess
+
+        local = binaries.ffrwd_wasm_path()
+        out: dict[str, list[str]] = {}
+        for pid, words in rendered.items():
+            process = self.plan.process(pid)
+            if not isinstance(process, SidecarProcess) or not words:
+                out[pid] = list(words)
+                continue
+            head = [local] if words[0] == self._sidecar and local else words[:1]
+            rest = _without_runtime(words[1:])
+            if process.models:
+                at = next(
+                    (i for i, word in enumerate(rest) if word in _NN_BINDING_FLAGS), len(rest)
+                )
+                rest[at:at] = nn.spawn_args()
+            out[pid] = head + rest
+        return out
+
+    def missing(self) -> list[str]:
+        """The module and model files this node's members load that are not
+        on this machine: a node runs from its own disk, and the plan names
+        the coordinator's paths. Not asked when a hook rendered the sidecars."""
+        from .processes import SidecarProcess
+
+        if self._sidecar is None:
+            return []
+        wanted: list[str] = []
+        for pid in self.part.processes:
+            process = self.plan.process(pid)
+            if isinstance(process, SidecarProcess):
+                wanted.append(process.module)
+                wanted += [binding.path for binding in process.modules]
+                wanted += [binding.path for binding in process.models]
+        return sorted({path for path in wanted if path and not Path(path).exists()})
 
     def _workspace(self) -> Path:
         if self._home is None:
@@ -587,6 +634,23 @@ class _Agent:
     # -- the conversation
 
     def serve(self) -> int:
+        missing = self.missing()
+        if missing:
+            listed = ", ".join(missing[:3])
+            if len(missing) > 3:
+                listed += f" and {len(missing) - 3} more"
+            self._channel.send(
+                {
+                    "type": "refused",
+                    "error": {
+                        "code": ErrorCode.INTERNAL.value,
+                        "message": f"node {self.part.node} does not have {listed}",
+                        "hint": "every node needs the query's packages installed at "
+                        "the paths the coordinator's machine has them",
+                    },
+                }
+            )
+            return 1
         self._channel.send(
             {"type": "ready", "address": [self.listener.address[0], self.listener.address[1]]}
         )
@@ -731,8 +795,10 @@ class _Agent:
                 if code is not None and member.id not in exited:
                     exited.add(member.id)
                     self._channel.send({"type": "exited", "process": member.id, "code": code})
-            if run.watching and not closed and all(
-                window.poll() is not None for window in run.watching.values()
+            if (
+                run.watching
+                and not closed
+                and all(window.poll() is not None for window in run.watching.values())
             ):
                 closed = True
                 self._channel.send({"type": "windows-closed"})
@@ -821,6 +887,26 @@ class _Agent:
             pending.done.set()
 
 
+# The flags that bind a model or deny a provider, which the runtime pair precedes.
+_NN_BINDING_FLAGS = frozenset({"-nn", "-nn-exclude"})
+# The flags naming this machine's ONNX Runtime, each followed by its value.
+_NN_RUNTIME_FLAGS = frozenset({"-nn-runtime", "-nn-target"})
+
+
+def _without_runtime(words: Sequence[str]) -> list[str]:
+    """`words` without any ``-nn-runtime``/``-nn-target`` and their values."""
+    out: list[str] = []
+    skip = False
+    for word in words:
+        if skip:
+            skip = False
+        elif word in _NN_RUNTIME_FLAGS:
+            skip = True
+        else:
+            out.append(word)
+    return out
+
+
 def _instance_sidecar_argv(jobs: int | None) -> SidecarArgv:
     """How a runner renders a sidecar for a run-time lateral's instance:
     as the run would, with its ``--jobs``."""
@@ -853,9 +939,30 @@ def _error_from(written: Mapping[str, object]) -> FfrwdError:
 
 # -- the coordinator
 
-# Starts one node's runner: given the node, the control address to dial and
-# the address its data port binds, the process running it.
-StartRunner = Callable[[int, str, str, Mapping[str, str]], subprocess.Popen[bytes]]
+
+class Runner(Protocol):
+    """One node's runner as whatever started it holds it: a subprocess here,
+    or a call running on another machine. :class:`subprocess.Popen` is one."""
+
+    def poll(self) -> int | None:
+        """Its exit code once it has ended, else None."""
+        ...
+
+    def wait(self, timeout: float | None = None) -> int:
+        """Its exit code, waiting up to `timeout` seconds for it to end;
+        raises :class:`subprocess.TimeoutExpired` if it has not."""
+        ...
+
+    def kill(self) -> None:
+        """End it and everything it runs."""
+        ...
+
+
+# Starts one node's runner: given the node, the control address to dial, the
+# address a runner on this machine binds its data port to (a runner elsewhere
+# binds its own and says which in its ``ready``) and the environment carrying
+# the job's secret, the runner.
+StartRunner = Callable[[int, str, str, Mapping[str, str]], Runner]
 
 
 def start_local_runner(
@@ -886,8 +993,9 @@ class _Node:
 
     index: int
     part: NodePlan
-    process: subprocess.Popen[bytes] | None = None
+    process: Runner | None = None
     channel: Channel | None = None
+    refusal: FfrwdError | None = None
     address: tuple[str, int] | None = None
     ready: threading.Event = field(default_factory=threading.Event)
     lost: bool = False
@@ -929,7 +1037,8 @@ class _Coordinator:
         compile_instance: CompileInstance | None,
         host: str,
         start: StartRunner,
-        started: Callable[[int, subprocess.Popen[bytes]], None] | None,
+        started: Callable[[int, Runner], None] | None,
+        startup: float = _STARTUP,
     ) -> None:
         self.plan = plan
         self.placement = placement
@@ -942,6 +1051,7 @@ class _Coordinator:
         self._host = host
         self._start = start
         self._started = started
+        self._startup = startup
         self._secret = new_secret()
         self.nodes = [_Node(index=part.node, part=part) for part in split(plan, placement)]
         self._edges = pipe_edges(plan)
@@ -965,7 +1075,7 @@ class _Coordinator:
             if self._started is not None:
                 self._started(node.index, node.process)
         waiting = {node.index: node for node in self.nodes}
-        deadline = time.monotonic() + _STARTUP
+        deadline = time.monotonic() + self._startup
         while waiting:
             if time.monotonic() >= deadline:
                 raise FfrwdError(
@@ -1012,9 +1122,9 @@ class _Coordinator:
                     f"the runner of node {node.index} never said it was ready",
                     hint="check that `python -m ffrwd node` starts on this machine",
                 )
-        addresses = {
-            str(node.index): list(node.address) for node in self.nodes if node.address
-        }
+            if node.refusal is not None:
+                raise node.refusal
+        addresses = {str(node.index): list(node.address) for node in self.nodes if node.address}
         for node in self.nodes:
             self._send(node, {"type": "peers", "addresses": addresses})
 
@@ -1104,6 +1214,10 @@ class _Coordinator:
             address = message.get("address")
             if isinstance(address, list) and len(address) == 2:
                 node.address = (str(address[0]), int(address[1]))
+            node.ready.set()
+        elif kind == "refused":
+            error = message.get("error")
+            node.refusal = _error_from(error if isinstance(error, dict) else {})
             node.ready.set()
         elif kind == "stage-end":
             index, members = message.get("index"), message.get("members")
@@ -1344,6 +1458,12 @@ def _chain(outer: threading.Event, inner: threading.Event) -> None:
     threading.Thread(target=wait, daemon=True).start()
 
 
+def _installed(sidecar_argv: SidecarArgv | None) -> bool:
+    """Whether `sidecar_argv` renders the installed sidecar: none given, or
+    :func:`~ffrwd.wasm.sidecar_argv` itself, bare or partly applied."""
+    return sidecar_argv is None or getattr(sidecar_argv, "func", sidecar_argv) is wasm.sidecar_argv
+
+
 def execute_split(
     plan: ProcessPlan,
     placement: Placement,
@@ -1363,7 +1483,8 @@ def execute_split(
     jobs: int | None = None,
     host: str = "127.0.0.1",
     start: StartRunner = start_local_runner,
-    started: Callable[[int, subprocess.Popen[bytes]], None] | None = None,
+    started: Callable[[int, Runner], None] | None = None,
+    startup: float = _STARTUP,
 ) -> PlanResult:
     """Run `plan` placed on the nodes of `placement`, one runner per node.
 
@@ -1372,6 +1493,9 @@ def execute_split(
     every runner's data port binds and the coordinator listens on: loopback
     for a split on this machine. `start` starts one node's runner, a
     subprocess of this one by default, and `started` hears each as it starts.
+    `startup` is how long every runner is given to dial the coordinator and
+    say it is ready: a runner on a machine that has to be started first needs
+    longer than one here.
     `jobs` is what a runner renders a run-time lateral's sidecars with.
 
     Refused before anything starts: a placement :func:`check_placement`
@@ -1399,6 +1523,9 @@ def execute_split(
         "terminal": terminal_member(plan) if work is not None else None,
         "jobs": jobs,
         "dump": str(dump) if dump is not None else None,
+        # The sidecar the argv names, which a runner swaps for its own; none
+        # when a hook of the caller's own rendered the sidecars.
+        "sidecar": binaries.ffrwd_wasm_path() if _installed(sidecar_argv) else None,
     }
     coordinator = _Coordinator(
         plan,
@@ -1412,6 +1539,7 @@ def execute_split(
         host=host,
         start=start,
         started=started,
+        startup=startup,
     )
     stages: list[StageResult] = []
     try:
@@ -1445,4 +1573,3 @@ def execute_split(
         return PlanResult(stages, interrupted=True)
     finally:
         coordinator.close()
-
