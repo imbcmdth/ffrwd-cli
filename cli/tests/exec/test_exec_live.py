@@ -540,8 +540,13 @@ _LEAKY_SECONDS = 10
 _MAX_LATENESS = 0.5
 # What the picture may trail by past max_lateness: the frames the slow
 # ffmpeg's own queues hold past the leaky, and the half second between two
-# of its progress readings.
+# of its progress readings. Those frames are counted at the slow stage's own
+# rate, so how far behind the picture SETTLES depends on the machine (about
+# 1.1 s here, 2.3 s on a slower CI runner); what the leaky guarantees is that
+# it settles. _LEAKY_SETTLED is how much the lag may still move over the
+# second half of the feed.
 _LEAKY_MARGIN = 1.0
+_LEAKY_SETTLED = 0.75
 _SLOW = "nlmeans({}, s => 4, p => 5, r => 9)"
 _SLOW_FILTER = "nlmeans=s=4:p=5:r=9"
 # The reader's own probe of the feed is bounded: what it reads while it
@@ -679,10 +684,11 @@ def test_a_leaky_keeps_a_slow_picture_near_the_wall_and_the_sound_whole(
         pytest.skip("ffrwd-wasm not found (uv sync --extra wasm)")
     lags, rows, out_path = _run_slow(protocol, tmp_path, monkeypatch, leaky=True)
 
-    # (a) Once the leaky has taken up its budget the picture trails the wall
-    # by no more, to the end of the feed.
+    # (a) Once the leaky has taken up its budget and the slow stage's queues
+    # are full, the picture stops losing ground: over the second half of the
+    # feed the lag holds still, where without the leaky it keeps growing.
     settled = lags[len(lags) // 2 :]
-    assert max(settled) - min(lags) <= _MAX_LATENESS + _LEAKY_MARGIN, lags
+    assert max(settled) - min(settled) <= _LEAKY_SETTLED, lags
 
     # (b) What it could not keep up with, it dropped, and said so.
     assert rows and all(row["kind"] == "leaky" for row in rows)

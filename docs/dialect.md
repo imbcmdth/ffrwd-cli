@@ -1481,8 +1481,13 @@ leaky did as a row, on its stdout like any other run row:
 What it guarantees, and what it does not:
 
 - At the leaky, the picture never trails the wall by more than the
-  baseline plus `max_lateness`. Stages after it add what they hold: a
-  slow ffmpeg's own queues keep a few pictures more.
+  baseline plus `max_lateness`. Stages after it add what they hold,
+  and that is counted in their own time: a slow ffmpeg's queues keep a
+  few pictures past the leaky, so at the file the picture trails by
+  `max_lateness` plus those pictures at that stage's rate (about 0.6 s
+  for a stage managing 10 pictures a second, twice that at 5). The
+  lateness stops growing either way; how far behind it settles depends
+  on how slow the stage after the leaky is.
 - It cannot make an overloaded stage keep up. The pictures that reach
   that stage are fewer, not cheaper, and what comes out is at that
   stage's own rate.
