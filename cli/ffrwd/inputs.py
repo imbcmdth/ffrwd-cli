@@ -255,12 +255,20 @@ INPUT_OPTIONS: dict[str, InputOptionSpec] = {
     "listen": InputOptionSpec(
         name="listen",
         type="bool",
-        doc="Wait for the sender to connect, e.g. an RTMP publisher, instead of dialling it.",
+        doc="Wait for an rtmp(s) or http(s) sender to connect instead of dialling it.",
         flag="-listen",
-        # Which way the connection goes. A probe without it dials a listener
-        # URL, finds nothing there and reads nothing; with it the probe
-        # waits for the sender the way the run does.
-        probes=True,
+        # A listening input declares its `shape` and is never probed: a probe
+        # would take the publisher's one connection.
+        probes=False,
+    ),
+    "listen_timeout": InputOptionSpec(
+        name="listen_timeout",
+        type="num",
+        doc="Whole seconds a listening rtmp(s) input waits for its publisher.",
+        # ffmpeg's rtmp `timeout`, documented in seconds (`ffmpeg -h
+        # protocol=rtmp`); lowering allows it on rtmp(s) alone.
+        flag="-timeout",
+        probes=False,
     ),
     "shape": InputOptionSpec(
         name="shape",

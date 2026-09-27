@@ -1260,17 +1260,36 @@ COPY (SELECT scale(s.video[1], 1280, 720), aresample(s.audio[1], 48000)
                                  48000 AS rate, 2 AS channels)) s)
   TO 'feed.mkv'
 
--- The same over RTMP: ffmpeg listens for one publisher on 1935.
+-- The same over RTMP: ffmpeg listens for one publisher on 1935, for a minute.
 COPY (SELECT s.video[1], s.audio[1]
       FROM input('rtmp://0.0.0.0:1935/live/feed', listen => true,
+                 listen_timeout => 60,
                  shape => STRUCT(1280 AS width, 720 AS height, '30000/1001' AS fps,
                                  44100 AS rate, 2 AS channels)) s)
   TO 'feed.mkv'
 ```
 
-`listen => true` is what makes an RTMP input wait for its publisher
-(`-listen 1`). SRT says the same in its URL (`mode=listener`); ffmpeg's RTMP
-reads a `?listen=1` in the URL as part of the stream name and dials instead.
+#### Listening for a sender
+
+Two options make an input wait for its sender to connect rather than dial it:
+
+- `listen => true` renders `-listen 1` before the input's `-i`. It is for
+  `rtmp://`, `rtmps://`, `http://` and `https://` inputs, and refused on any
+  other. SRT says the same in its URL, `mode=listener`, and needs no option.
+  ffmpeg's RTMP reads a `?listen=1` in the URL as part of the stream name and
+  dials instead, so an RTMP URL carrying one is refused.
+- `listen_timeout => <seconds>` is how long a listening input waits for its
+  publisher: whole seconds, rendered as rtmp's own `-timeout <n>` (`ffmpeg -h
+  protocol=rtmp` documents it in seconds). It needs `listen => true`, and is
+  refused on `http(s)://`, whose ffmpeg documents no listen timeout in seconds.
+
+A listening input declares its `shape`. A probe of it would be a connection of
+its own and take the publisher's one call, so `listen => true` without a
+`shape` is refused, with the spelling in the hint. An SRT listener without a
+shape still compiles, since queries read one that way before `shape` existed,
+and the compile says `UNSHAPED_LISTENER`: the probe takes the sender's first
+call, and the sender has to call again for the run. None of the three options
+reaches ffprobe.
 
 A shape is allowed on any input, a file included: there it only skips the
 probe, and what the file really holds is what ffmpeg reads at run time. A

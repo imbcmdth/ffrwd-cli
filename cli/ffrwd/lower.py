@@ -283,6 +283,7 @@ import math
 import random
 import re
 import socket
+import urllib.parse
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Literal, cast
@@ -2752,6 +2753,12 @@ def input_option_values(raw_options: Sequence[RawInputOption]) -> dict[str, obje
             option.name, _input_value(option.value), line=line, col=col
         )
     return options
+
+
+# The protocols whose inputs `listen => true` makes wait for a sender, and
+# the ones among them whose listen timeout ffmpeg documents in seconds.
+_LISTEN_SCHEMES = frozenset({"rtmp", "rtmps", "http", "https"})
+_RTMP_SCHEMES = frozenset({"rtmp", "rtmps"})
 
 
 # The sink options that shape the encoder feeding a packet sink: the video
@@ -6163,6 +6170,124 @@ class _Lowerer:
             hint="drop realtime; a socket is already paced by its own clock",
         )
 
+    def _check_listening(
+        self,
+        alias: str,
+        options: dict[str, object],
+        raw_options: Sequence[RawInputOption],
+    ) -> dict[str, object]:
+        """Check an input that waits for its sender, and return its options.
+
+        ``listen => true`` is an rtmp(s) or http(s) option; SRT says it in the
+        URL (``mode=listener``), and an RTMP URL's own ``?listen=1`` is read
+        as part of the stream name, so both are refused with the spelling that
+        works. ``listen_timeout`` needs ``listen``, and a protocol whose
+        listen timeout ffmpeg documents in seconds: rtmp(s), where it renders
+        as ``-timeout``, a whole number.
+
+        A listening input declares its ``shape``: a compile-time probe would
+        be a connection of its own and take the publisher's one call. Refused
+        for ``listen => true``; for an SRT listener, which compiled with a
+        probe before ``shape`` existed, it is a warning.
+        """
+        index = self.res.sources.get(alias)
+        path = self.res.input_paths[index] if index is not None else ""
+        scheme = path.partition("://")[0].lower() if is_url(path) else ""
+        path_node = raw_options[0].path_node if raw_options else None
+
+        def at(name: str) -> tuple[int | None, int | None]:
+            node = next((o.value for o in raw_options if o.name == name), None)
+            if node is None and path_node is None:
+                return self.res.input_anchors.get(alias, (None, None))
+            return _pos(node, path_node)
+
+        def refuse(name: str, message: str, hint: str) -> FfrwdError:
+            line, col = at(name)
+            return FfrwdError(
+                ErrorCode.INPUT_OPTION_TYPE, message, line=line, col=col, hint=hint
+            )
+
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(path).query) if scheme else {}
+        if scheme in _RTMP_SCHEMES and "listen" in query:
+            raise refuse(
+                "",
+                f"'{alias}' asks to listen in its URL, and ffmpeg's rtmp reads "
+                "'listen=1' there as part of the stream name and dials out",
+                "take it out of the URL and write listen => true",
+            )
+        listen = options.get("listen") is True
+        if listen and scheme not in _LISTEN_SCHEMES:
+            hint = (
+                "SRT listens with mode=listener in its URL, e.g. "
+                "'srt://0.0.0.0:9000?mode=listener'; drop listen"
+                if scheme == "srt"
+                else "listen waits for a sender on rtmp://, rtmps://, http:// and "
+                "https:// inputs; drop it"
+            )
+            raise refuse(
+                "listen",
+                f"'{alias}' is no rtmp(s) or http(s) URL, so listen => true "
+                "has nothing to wait on",
+                hint,
+            )
+        if "listen_timeout" in options:
+            if not listen:
+                raise refuse(
+                    "listen_timeout",
+                    f"'{alias}' sets listen_timeout without listen => true",
+                    "listen_timeout is how long a listening input waits for its "
+                    "publisher; add listen => true, or drop it",
+                )
+            if scheme not in _RTMP_SCHEMES:
+                raise refuse(
+                    "listen_timeout",
+                    f"listen_timeout on '{alias}': ffmpeg documents no listen "
+                    f"timeout in seconds for {scheme}://",
+                    "only rtmp:// and rtmps:// document one (their timeout, in "
+                    "seconds); drop listen_timeout",
+                )
+            seconds = options["listen_timeout"]
+            if (
+                not isinstance(seconds, int | float)
+                or seconds != int(seconds)
+                or seconds < 1
+            ):
+                raise refuse(
+                    "listen_timeout",
+                    f"listen_timeout on '{alias}' is {seconds!r}: rtmp waits a "
+                    "whole number of seconds",
+                    "write whole seconds above zero, e.g. listen_timeout => 30",
+                )
+            options = {**options, "listen_timeout": int(seconds)}
+        srt_listener = scheme == "srt" and query.get("mode", [""])[-1] == "listener"
+        if (listen or srt_listener) and "shape" not in options:
+            shape = (
+                f"input('{path}'{', listen => true' if listen else ''}, shape => "
+                "STRUCT(1920 AS width, 1080 AS height, 30 AS fps, "
+                "48000 AS rate, 2 AS channels))"
+            )
+            message = (
+                f"'{alias}' waits for its sender, and a compile-time probe of it "
+                "would take the sender's one connection"
+            )
+            if listen:
+                raise refuse(
+                    "listen", message + ": declare its shape instead", f"write {shape}"
+                )
+            if self.on_warning is not None:
+                line, col = self.res.input_anchors.get(alias, (None, None))
+                self.on_warning(
+                    FfrwdWarning(
+                        WarningCode.UNSHAPED_LISTENER,
+                        alias,
+                        message + ", so the sender has to call again for the run",
+                        line=line,
+                        col=col,
+                        hint=f"declare what it sends and nothing is probed: {shape}",
+                    )
+                )
+        return options
+
     def _lower_input_options(self) -> dict[str, dict[str, object]]:
         """Validate every `input('path', name => value, ...)`'s trailing options.
 
@@ -6176,11 +6301,17 @@ class _Lowerer:
             options = input_option_values(raw_options)
             if options:
                 self._check_realtime_option(alias, options, raw_options)
+            options = self._check_listening(alias, options, raw_options)
             # The compiler's own options (a declared `shape`) did their work
             # before lowering and are nothing ffmpeg is handed.
             options = rendered_options(options)
             if options:
                 result[alias] = options
+        # An input with no options is still checked: an SRT listener says it
+        # waits in its URL alone.
+        for alias in self.res.sources:
+            if alias not in self.res.input_options:
+                self._check_listening(alias, {}, ())
         # A per-row `-i` repeats its origin's options: same file, same demuxer,
         # only the seek differs.
         for minted, origin in self.row_input_source.items():

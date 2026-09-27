@@ -49,6 +49,7 @@ _EXPECTED: dict[str, str] = {
     "rtsp_transport": "str",
     "user_agent": "str",
     "listen": "bool",
+    "listen_timeout": "num",
     "shape": "struct",
 }
 
@@ -85,8 +86,9 @@ _EXPECTED_PROBES: dict[str, bool] = {
     "analyzeduration": True,
     "rtsp_transport": True,
     "user_agent": True,
-    # A probe of a listener has to listen as the run does, or it dials.
-    "listen": True,
+    # A listening input declares its shape and is never probed.
+    "listen": False,
+    "listen_timeout": False,
     # The compiler's own: a declared shape means there is no probe at all.
     "shape": False,
 }
@@ -414,8 +416,9 @@ _LISTENS = {"srt": "", "rtmp": ", listen => true"}
 def _live_query(url: str, shape: str | None) -> str:
     """The SMART demo's head in small: the feed conformed ahead of the split
     (its rate included), a module on one leg, the picture beside it, and the
-    sound filtered into the same file."""
-    declared = _LISTENS[url.partition(":")[0]]
+    sound filtered into the same file. Probed (no `shape`), an RTMP input
+    cannot listen: a listening input has to declare its shape."""
+    declared = _LISTENS[url.partition(":")[0]] if shape else ""
     declared += f", shape => {shape}" if shape else ""
     return (
         "CREATE FUNCTION invert(v video_stream) RETURNS video_stream\n"
@@ -473,13 +476,36 @@ def test_a_declared_shape_compiles_a_listener_without_probing_it(
     probed = compile_all(_live_query(url, None), describe=lambda path: _DESCRIBED[path])
 
     assert declared.plan is not None and probed.plan is not None
-    assert declared.plan.to_dict() == probed.plan.to_dict()
+    assert _without_listen(declared.plan.to_dict()) == probed.plan.to_dict()
     # The shape reaches neither ffmpeg nor the plan's input options.
     reader = next(p for p in declared.plan.ffmpeg if url in p.graph.input_paths)
     assert all("shape" not in o for o in reader.graph.input_options.values())
     # 1080p conformed to 720p ahead of the split: the pipe, not the fifo.
     bounded = [e for e in declared.plan.stream_edges if e.buffer is not None]
     assert bounded and all(e.buffer.road == "pipe" for e in bounded if e.buffer)
+
+
+def _without_listen(written: object) -> object:
+    """A plan's dict with `listen` taken out of every input's options, which
+    is the one thing a listening input has that its probed twin cannot."""
+    if isinstance(written, dict):
+        kept = {
+            key: _without_listen(value)
+            for key, value in written.items()
+            if key != "listen"
+        }
+        if "input_options" in kept and isinstance(kept["input_options"], dict):
+            kept["input_options"] = {
+                alias: options
+                for alias, options in kept["input_options"].items()
+                if options
+            }
+            if not kept["input_options"]:
+                del kept["input_options"]
+        return kept
+    if isinstance(written, list):
+        return [_without_listen(value) for value in written]
+    return written
 
 
 def test_a_shape_on_a_file_skips_its_probe_too(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -521,4 +547,119 @@ def test_an_rtmp_listener_renders_listen_before_its_input() -> None:
 
     assert graph.input_options == {"s": {"listen": True}}
     assert render_options(graph.input_options["s"]) == ["-listen", "1"]
-    assert render_options(probe_options({"listen": True})) == ["-listen", "1"]
+    # A listening input is never probed, so nothing of it is for ffprobe.
+    assert render_options(probe_options({"listen": True, "listen_timeout": 30})) == []
+
+
+_RTMP = "rtmp://0.0.0.0:1935/live/feed"
+_SMALL = "shape => STRUCT(1280 AS width, 720 AS height, 30 AS fps)"
+
+
+def _compiled_input(spelled: str) -> tuple[dict[str, object], list[str]]:
+    """One input's rendered options, and the warnings its compile said."""
+    said: list[str] = []
+    graph = compile_all(
+        f"COPY (SELECT s.video[1] FROM {spelled} s) TO 'o.mkv'",
+        on_warning=lambda warning: said.append(str(warning)),
+    ).graphs[0]
+    return graph.input_options.get("s", {}), said
+
+
+def test_listen_timeout_renders_rtmps_own_timeout_in_whole_seconds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``ffmpeg -h protocol=rtmp``: timeout is seconds to wait for incoming
+    connections, and implies listening."""
+    monkeypatch.setattr(compiler, "probe_path", lambda path, args=(), **kw: None)
+    options, said = _compiled_input(
+        f"input('{_RTMP}', listen => true, listen_timeout => 30.0, {_SMALL})"
+    )
+
+    assert options == {"listen": True, "listen_timeout": 30}
+    assert render_options(options) == ["-listen", "1", "-timeout", "30"]
+    assert said == []
+
+
+@pytest.mark.parametrize(
+    ("spelled", "needle", "hint"),
+    [
+        (
+            f"input('srt://0.0.0.0:9000?mode=listener', listen => true, {_SMALL})",
+            "is no rtmp(s) or http(s) URL, so listen => true has nothing to wait on",
+            "SRT listens with mode=listener in its URL",
+        ),
+        (
+            f"input('udp://0.0.0.0:9000', listen => true, {_SMALL})",
+            "is no rtmp(s) or http(s) URL",
+            "rtmp://, rtmps://, http:// and https://",
+        ),
+        (
+            f"input('clip.mp4', listen => true, {_SMALL})",
+            "is no rtmp(s) or http(s) URL",
+            "drop it",
+        ),
+        (
+            f"input('{_RTMP}', listen_timeout => 30, {_SMALL})",
+            "sets listen_timeout without listen => true",
+            "add listen => true",
+        ),
+        (
+            f"input('http://0.0.0.0:8080/feed', listen => true, listen_timeout => 30, {_SMALL})",
+            "ffmpeg documents no listen timeout in seconds for http://",
+            "only rtmp:// and rtmps://",
+        ),
+        (
+            f"input('{_RTMP}', listen => true, listen_timeout => 2.5, {_SMALL})",
+            "rtmp waits a whole number of seconds",
+            "listen_timeout => 30",
+        ),
+        (
+            f"input('{_RTMP}', listen => true)",
+            "a compile-time probe of it would take the sender's one connection",
+            "shape => STRUCT(",
+        ),
+        (
+            f"input('{_RTMP}?listen=1', {_SMALL})",
+            "reads 'listen=1' there as part of the stream name and dials out",
+            "write listen => true",
+        ),
+    ],
+)
+def test_a_listening_input_is_refused_by_name(
+    spelled: str, needle: str, hint: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(compiler, "probe_path", lambda path, args=(), **kw: None)
+    with pytest.raises(FfrwdError) as caught:
+        _compiled_input(spelled)
+
+    assert caught.value.code is ErrorCode.INPUT_OPTION_TYPE
+    assert needle in caught.value.message, caught.value.message
+    assert caught.value.hint is not None and hint in caught.value.hint, caught.value.hint
+    assert caught.value.line == 1
+
+
+def test_an_srt_listener_without_a_shape_still_compiles_with_a_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The SMART demo's head reads its SRT listener this way today, so this is
+    a warning and not a refusal; the shape is what the hint spells."""
+    probed: list[str] = []
+
+    def probe(path: str, args: object = (), **kw: object) -> None:
+        probed.append(path)
+
+    monkeypatch.setattr(compiler, "probe_path", probe)
+    url = "srt://0.0.0.0:9998?mode=listener&latency=200000"
+    options, said = _compiled_input(f"input('{url}')")
+
+    assert (options, probed) == ({}, [url])
+    assert len(said) == 1
+    assert "UNSHAPED_LISTENER" in said[0]
+    assert f"input('{url}', shape => STRUCT(" in said[0]
+    # Declared, nothing is probed and nothing is said.
+    probed.clear()
+    options, said = _compiled_input(f"input('{url}', {_SMALL})")
+    assert (options, probed, said) == ({}, [], [])
+    # An SRT caller dials its sender: its probe takes nothing from anyone.
+    _, said = _compiled_input("input('srt://127.0.0.1:9000?mode=caller')")
+    assert said == []

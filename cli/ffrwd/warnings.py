@@ -37,6 +37,7 @@ class WarningCode(str, Enum):
     MISSING_README = "MISSING_README"  # a package published with no README.md
     MISSING_LICENSE = "MISSING_LICENSE"  # a package published with no "license"
     RECIPE_DOES_NOT_COMPILE = "RECIPE_DOES_NOT_COMPILE"  # a recipe the probe compile rejected
+    UNSHAPED_LISTENER = "UNSHAPED_LISTENER"  # a listener input probed, for want of a shape
 
 
 @dataclass(frozen=True)
