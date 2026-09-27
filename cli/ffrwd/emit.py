@@ -23,9 +23,10 @@ Output groups
 -------------
 ``Graph.sinks`` is one :class:`~ffrwd.ir.SinkUnit` per output FILE, and
 :attr:`Emitted.groups` mirrors it one-for-one. The whole command is a single
-ffmpeg invocation: the inputs are rendered once, the ``-filter_complex`` once,
-and then each group contributes its own ``-map`` block, per-stream options,
-sink options and path, in that order — ffmpeg's own native multi-output form.
+ffmpeg invocation: the inputs are rendered once, the ``-filter_complex`` once
+(or once per part, below), and then each group contributes its own ``-map``
+block, per-stream options, sink options and path, in that order — ffmpeg's own
+native multi-output form.
 
 Two scopes matter here and they are NOT the same:
 
@@ -49,6 +50,21 @@ Each ``Output`` becomes an :class:`OutputMap`:
 A graph whose outputs are all passthrough has NO nodes and therefore an empty
 ``filter_complex``; ``build_ffmpeg_args`` omits ``-filter_complex`` entirely
 in that case.
+
+Filtergraphs of a live input
+----------------------------
+A command that reads a live input (:func:`reads_live_input`) renders each
+part of its filtergraph that shares no node with the rest -- typically the
+picture chain and the sound chain -- as a ``-filter_complex`` of its own, in
+:attr:`Emitted.filter_graphs`. ffmpeg runs each filtergraph apart. Held in
+one, a picture chain that drops frames (``fps`` 60 to 30) and a sound chain
+over an MPEG-TS feed hold each other back: measured on ffmpeg 9.0.1, the
+picture falls to about 23 of its 30 frames a second and the rest come out
+only at the end of the input. The parts keep their chains, their labels and
+their order; :attr:`Emitted.filter_complex` is still the whole filtergraph
+as one string. A split's consumers are one part with the split, since they
+read its pads. Every other command renders its one filtergraph as it always
+has.
 
 Command sequences
 -----------------
@@ -286,6 +302,7 @@ from .processes import (
     EdgeBuffer,
     StreamFormat,
     VideoFormat,
+    is_live,
 )
 from .sink import (
     CODEC_PARAMS_FLAGS,
@@ -442,6 +459,10 @@ class Emitted:
     # Every input is a pipe edge another process of the plan writes, so the
     # command renders ``-copyts``: see :func:`build_process_args`.
     copyts: bool = False
+    # The filtergraph as the command runs it, one entry per
+    # ``-filter_complex``, when it runs as several (see "Filtergraphs of a
+    # live input"); empty renders `filter_complex` as the one.
+    filter_graphs: list[str] = field(default_factory=list)
 
     @property
     def maps(self) -> list[OutputMap]:
@@ -455,7 +476,7 @@ class Emitted:
         return [mapping for group in self.groups for mapping in group.maps]
 
 
-def emit(g: Graph, *, network: bool = False) -> Emitted:
+def emit(g: Graph, *, network: bool = False, separate: bool | None = None) -> Emitted:
     """Render `g` as an ffmpeg filtergraph plus its output map list.
 
     Raises ``FfrwdError(INTERNAL)`` on a malformed graph: a cycle or
@@ -472,6 +493,11 @@ def emit(g: Graph, *, network: bool = False) -> Emitted:
     frames to every reader, where ffmpeg needs a ``split`` -- so the
     consume-once rule does not apply. Labels are allocated and values escaped
     identically either way.
+
+    `separate` renders each part of the filtergraph that shares no node with
+    the rest as a filtergraph of its own, into :attr:`Emitted.filter_graphs`
+    (see "Filtergraphs of a live input"). None decides from `g`: apart when
+    it reads a live input. A network is never rendered apart.
 
     Runs :func:`~ffrwd.ir.dedup_inputs`, then :func:`_drop_unused_url_inputs`
     and :func:`_drop_dropped_branch_inputs`, before anything below reads
@@ -493,6 +519,14 @@ def emit(g: Graph, *, network: bool = False) -> Emitted:
         chains, g, pads, labels, measure=False, network=network
     )
     two_phase = any(node.filter == loudnorm.FILTER for node in nodes)
+    if separate is None:
+        separate = reads_live_input(g)
+    parts = _components(chains) if separate and not network else []
+    filter_graphs = (
+        [_render_chains(part, g, pads, labels, measure=False) for part in parts]
+        if len(parts) > 1
+        else []
+    )
 
     groups = [_output_group(g, unit, labels) for unit in g.sinks]
 
@@ -507,6 +541,19 @@ def emit(g: Graph, *, network: bool = False) -> Emitted:
             if two_phase
             else ""
         ),
+        filter_graphs=filter_graphs,
+    )
+
+
+def reads_live_input(g: Graph) -> bool:
+    """True when `g` opens an input :func:`~ffrwd.processes.is_live` calls live.
+
+    A process plan's pipe edges (:data:`~ffrwd.ir.PIPE`) are not inputs `g`
+    opens itself, whatever options they carry.
+    """
+    return any(
+        path != PIPE and is_live(path, options)
+        for path, options in zip(g.input_paths, _input_option_list(g))
     )
 
 
@@ -779,14 +826,17 @@ def _measure_emitted(e: Emitted) -> Emitted:
     any other pad, since a filtergraph output with no consumer is a hard
     ffmpeg error -- muxed to ``-f null -``. Passthrough maps are dropped
     (copying a stream teaches the measurement nothing) and so is every sink
-    option: this pass writes no file.
+    option: this pass writes no file. It runs the measuring filtergraph as one,
+    since it reads to the end of its input and nothing waits on its pace.
     """
     group = OutputGroup(
         maps=[mapping for mapping in e.maps if not mapping.copy],
         path=None,
         options={_FORMAT: _ANALYSIS_FORMAT},
     )
-    return replace(e, filter_complex=e.measure_filter_complex, groups=[group])
+    return replace(
+        e, filter_complex=e.measure_filter_complex, filter_graphs=[], groups=[group]
+    )
 
 
 def _analysis_emitted(e: Emitted) -> Emitted:
@@ -823,8 +873,9 @@ def build_ffmpeg_args(e: Emitted, out_path: str | None = None) -> list[str]:
     ``+``-joined spec, ``0`` for none). Those ``<i>`` are PER GROUP — ffmpeg restarts output
     stream numbering at each file — so group 2's first map is ``-c:0``, not
     ``-c:<n>``.
-    ``-filter_complex`` is rendered once for the command, omitted when the
-    graph is pure passthrough.
+    ``-filter_complex`` is rendered once for the command, or once per entry
+    of ``e.filter_graphs`` when it has several, and omitted when the graph is
+    pure passthrough.
 
     A group's own ``window`` renders ``-ss``/``-to`` FIRST, ahead of its maps,
     and suppresses every ``-c:<i> copy`` in that group (see "Output seeking").
@@ -876,6 +927,7 @@ def build_process_args(
     pipe_outputs: Sequence[tuple[str, StreamFormat]] = (),
     pipe_buffers: Sequence[EdgeBuffer | None] = (),
     pipe_live: Sequence[bool] = (),
+    live: bool = False,
     copyts: bool = False,
 ) -> list[str]:
     """Full ffmpeg argv for one ffmpeg process of a process plan.
@@ -895,6 +947,11 @@ def build_process_args(
     too: True for an edge the reader of a live input writes, whose pictures
     then reach the muxer as they come (``-fps_mode passthrough``), as every
     picture on the fifo road does.
+
+    The filtergraph runs as one filtergraph per part (see "Filtergraphs of a
+    live input") when the process reads a live input: one it opens itself,
+    one whose reader it is (a `pipe_live` edge), or, `live`, an edge such a
+    reader writes.
 
     An input renders ``-f <container> -i <spelling>``, with the probe limits
     that bound its open to a few frames whatever their size
@@ -937,7 +994,10 @@ def build_process_args(
                     **options.get(alias, {}),
                 }
 
-    e = emit(replace(g, input_paths=paths, input_options=options))
+    # Asked of `g` itself, before the spellings: a pipe edge is read with
+    # `-f`, which would make every one of them look like a device.
+    separate = live or any(pipe_live) or reads_live_input(g)
+    e = emit(replace(g, input_paths=paths, input_options=options), separate=separate)
     e.copyts = copyts and bool(slots) and len(slots) == len(g.input_paths)
 
     pipes = [index for index, group in enumerate(e.groups) if group.path == PIPE]
@@ -1079,8 +1139,8 @@ def _render_command(e: Emitted, out_path: str | None, pass_: _Pass | None) -> li
             if end is not None:
                 args += ["-to", _render_number(end)]
         args += ["-i", input_path]
-    if e.filter_complex:
-        args += ["-filter_complex", e.filter_complex]
+    for graph in e.filter_graphs or ([e.filter_complex] if e.filter_complex else []):
+        args += ["-filter_complex", graph]
     for group in e.groups:
         path = out_path if out_path is not None else group.path
         if path is None:
@@ -1602,6 +1662,35 @@ def _output_map(g: Graph, output: Output, labels: dict[str, str]) -> OutputMap:
 
 
 # chain building and rendering
+
+
+def _components(chains: list[list[Node]]) -> list[list[list[Node]]]:
+    """`chains` grouped into the parts of the filtergraph that share no node.
+
+    Two chains are one part when a node of either reads a pad of the other,
+    directly or through other chains; a source ref joins nothing, since each
+    is read once. Parts come in the order of their first chain, and keep
+    their chains in order.
+    """
+    parent: dict[str, str] = {}
+
+    def root(node_id: str) -> str:
+        while parent.get(node_id, node_id) != node_id:
+            node_id = parent[node_id]
+        return node_id
+
+    for chain in chains:
+        for node in chain:
+            for ref in node.inputs:
+                if is_src(ref):
+                    continue
+                mine, theirs = root(node.id), root(_parse_node_ref(ref)[0])
+                if mine != theirs:
+                    parent[mine] = theirs
+    parts: dict[str, list[list[Node]]] = {}
+    for chain in chains:
+        parts.setdefault(root(chain[0].id), []).append(chain)
+    return list(parts.values())
 
 
 def _build_chains(nodes: list[Node], pads: dict[str, int]) -> list[list[Node]]:

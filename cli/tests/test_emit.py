@@ -2837,3 +2837,84 @@ def test_a_deduped_compile_runs_under_real_ffmpeg(tmp_path: Path) -> None:
     _run_ffmpeg(build_ffmpeg_args(e, str(out_path)))
 
     assert _probe_codec_types(out_path) == ["video", "audio"]
+
+
+# ---------------------------------------------------------------------------
+# filtergraphs of a live input: each part that shares no node with the rest
+# is a -filter_complex of its own
+# ---------------------------------------------------------------------------
+
+_FEED = "srt://127.0.0.1:9000?mode=listener"
+
+
+def _conform(path: str, options: dict[str, object] | None = None) -> Graph:
+    """A 60 fps feed conformed to 30 fps, split two ways, beside its resampled sound."""
+    return _graph(
+        [
+            _node("n1", "fps", {"fps": 30}, ["src:a:v:0"]),
+            _node("n2", "split", {"n": 2}, ["n1"], outputs=["video", "video"]),
+            _node("n3", "scale", {"width": 16, "height": 16}, ["n2:0"]),
+            _node("n4", "aresample", {"sample_rate": 48000}, ["src:a:a:0"], outputs=["audio"]),
+            _node("n5", "asetpts", {"expr": "PTS"}, ["n4"], outputs=["audio"]),
+        ],
+        [_out("n3"), _out("n2:1"), _out("n5", "audio")],
+        input_paths=[path],
+        input_options={"a": dict(options)} if options else None,
+        sink=_sink("out.nut"),
+    )
+
+
+def _graphs(argv: list[str]) -> list[str]:
+    return [argv[i + 1] for i, word in enumerate(argv) if word == "-filter_complex"]
+
+
+def test_a_live_readers_picture_and_sound_are_two_filtergraphs() -> None:
+    """The split's consumers stay with the split; the sound, which shares no
+    node with the picture, is a filtergraph of its own. Labels and -maps are
+    the ones the one filtergraph had."""
+    live = emit(_conform(_FEED))
+    argv = build_ffmpeg_args(live)
+
+    assert _graphs(argv) == [
+        "[0:v:0]fps=fps=30,split=2[n20][out1];[n20]scale=width=16:height=16[out0]",
+        "[0:a:0]aresample=sample_rate=48000,asetpts=PTS[out2]",
+    ]
+    assert [argv[i + 1] for i, word in enumerate(argv) if word == "-map"] == [
+        "[out0]",
+        "[out1]",
+        "[out2]",
+    ]
+    # The whole filtergraph as one string is what it always was.
+    assert live.filter_complex == emit(_conform("a.mp4")).filter_complex
+
+
+def test_which_inputs_run_their_parts_apart() -> None:
+    """Every input processes.is_live calls live, and nothing else."""
+    cases: list[tuple[str, dict[str, object] | None, int]] = [
+        ("a.mp4", None, 1),
+        ("a.mp4", {"realtime": True}, 2),
+        (_FEED, None, 2),
+        ("rtmp://0.0.0.0:1935/live/obs", {"listen": True}, 2),
+        ("video=Cam", {"format": "dshow"}, 2),
+    ]
+    for path, options, count in cases:
+        argv = build_ffmpeg_args(emit(_conform(path, options)))
+        assert len(_graphs(argv)) == count, (path, options)
+
+
+def test_a_live_reader_whose_chains_share_a_node_is_one_filtergraph() -> None:
+    """A waveform drawn from the sound onto the picture joins the two chains."""
+    g = _graph(
+        [
+            _node("n1", "asplit", {"n": 2}, ["src:a:a:0"], outputs=["audio", "audio"]),
+            _node("n2", "showwaves", {"s": "640x120"}, ["n1:0"]),
+            _node("n3", "overlay", {"x": 0, "y": 0}, ["src:a:v:0", "n2"]),
+        ],
+        [_out("n3"), _out("n1:1", "audio")],
+        input_paths=[_FEED],
+        sink=_sink("out.nut"),
+    )
+    assert _graphs(build_ffmpeg_args(emit(g))) == [
+        "[0:a:0]asplit=2[n10][out1];[n10]showwaves=s=640x120[n2];"
+        "[0:v:0][n2]overlay=x=0:y=0[out0]"
+    ]

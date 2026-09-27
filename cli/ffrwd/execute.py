@@ -970,6 +970,7 @@ def plan_argv(
             pipe_outputs=[(write[edge], edge.format) for edge in outgoing],
             pipe_buffers=[edge.buffer for edge in outgoing],
             pipe_live=[edge.live for edge in outgoing],
+            live=any(edge.live for edge in incoming),
             copyts=all(keeps_clock(edge, plan) for edge in incoming),
         )
     return _resolve_rows_documents(argv, rows_path)

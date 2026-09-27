@@ -20,7 +20,7 @@ from typing import Any, cast
 import pytest
 
 from ffrwd import pipes
-from ffrwd.emit import _wire_options
+from ffrwd.emit import _wire_options, build_process_args
 from ffrwd.errors import ErrorCode, FfrwdError
 from ffrwd.execute import (
     _CHUNK,
@@ -677,6 +677,76 @@ def test_the_one_reader_of_a_live_input_writes_a_pipe_per_consumer() -> None:
         "out.mp4",
     ]  # fmt: skip
     assert [words.count(LIVE) for words in argv.values()] == [0, 1, 0]
+
+
+def test_a_live_readers_picture_and_sound_run_as_two_filtergraphs() -> None:
+    """The SMART demo's reader: a 60 fps feed conformed to 30 for a module,
+    its sound resampled for the file. Held in one filtergraph the two chains
+    hold each other back, so each is a -filter_complex of its own."""
+    g = Graph(input_paths=[LIVE], sources={"a": 0})
+    g.nodes["f"] = Node(
+        id="f", filter="fps", args={"fps": 30}, inputs=["src:a:v:0"], outputs=["video"]
+    )
+    g.nodes["e0"] = Node(id="e0", filter="invert", args={}, inputs=["f"], outputs=["video"])
+    g.nodes["r"] = Node(
+        id="r",
+        filter="aresample",
+        args={"sample_rate": 48000},
+        inputs=["src:a:a:0"],
+        outputs=["audio"],
+    )
+    g.sinks = [SinkUnit(outputs=[_out("e0"), _out("r", "audio")], path="out.mp4")]
+    probe = _live_probe(1280, 720)
+    probe.streams.append(
+        StreamMeta(
+            type="audio",
+            index=1,
+            metadata={},
+            width=None,
+            height=None,
+            fps=None,
+            sample_rate=48000,
+            codec="aac",
+        )
+    )
+    plan = partition(
+        g, external=external_ids("e0"), probes={"a": probe}, pix_fmts={"invert": "rgba"}
+    )
+    argv = plan_argv(plan, sidecar_argv=_stand_in, pipe_path=_named)
+
+    assert argv["ffmpeg1"][:8] == [
+        "ffmpeg",
+        "-i", LIVE,
+        "-filter_complex", "[0:v:0]fps=fps=30[out0]",
+        "-filter_complex", "[0:a:0]aresample=sample_rate=48000[out1]",
+        "-map",
+    ]  # fmt: skip
+    assert argv["ffmpeg1"].count("-filter_complex") == 2
+
+
+def test_a_process_reading_a_live_readers_pipes_runs_its_parts_apart() -> None:
+    """Paced by the feed as the reader is, so rendered as the reader is; the
+    same process reading no live edge keeps its one filtergraph."""
+    g = Graph(input_paths=[PIPE, PIPE], sources={"v": 0, "s": 1})
+    g.nodes["n0"] = Node(
+        id="n0", filter="hflip", args={}, inputs=["src:v:v:0"], outputs=["video"]
+    )
+    g.nodes["n1"] = Node(
+        id="n1",
+        filter="volume",
+        args={"volume": 0.5},
+        inputs=["src:s:a:0"],
+        outputs=["audio"],
+    )
+    g.sinks = [SinkUnit(outputs=[_out("n0"), _out("n1", "audio")], path="out.mp4")]
+    wired = [("/pipes/v", "nut"), ("/pipes/s", "nut")]
+
+    def graphs(live: bool) -> list[str]:
+        argv = build_process_args(g, pipe_inputs=wired, live=live)
+        return [argv[i + 1] for i, word in enumerate(argv) if word == "-filter_complex"]
+
+    assert graphs(live=True) == ["[0:v:0]hflip[out0]", "[1:a:0]volume=volume=0.5[out1]"]
+    assert graphs(live=False) == ["[0:v:0]hflip[out0];[1:a:0]volume=volume=0.5[out1]"]
 
 
 def test_a_depth_too_deep_for_a_pipe_puts_the_fifo_muxer_on_the_edge() -> None:
