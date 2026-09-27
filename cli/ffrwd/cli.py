@@ -189,6 +189,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from importlib import metadata
 from pathlib import Path
+from typing import Any
 
 from . import binaries, credentials, diagram, loudnorm, nn, redact, remote, show, store, wasm
 from . import packages as packages_module
@@ -302,6 +303,14 @@ _SUBCOMMANDS = frozenset(
 )
 
 
+# The hidden command a node's runner is started as.
+_NODE_COMMAND = "node"
+
+# Where a plan runs: here, as one node, or split across several nodes that
+# are each a subprocess of this one, their cut edges over loopback TCP.
+_TARGETS = ("local", "split-local")
+
+
 def _version() -> str:
     return metadata.version("ffrwd")
 
@@ -315,6 +324,12 @@ def main(argv: list[str] | None = None) -> int:
     if argv and argv[0] in ("--version", "-V"):
         print(f"ffrwd {_version()}")
         return 0
+    # Hidden: one node's runner of a plan placed on several, started by the
+    # run that places it (`ffrwd.nodes`). Not a command anyone types.
+    if argv and argv[0] == _NODE_COMMAND:
+        from . import nodes
+
+        return nodes.agent_main(argv[1:])
     if not argv or argv[0] not in _SUBCOMMANDS:
         argv = ["run", *argv]
 
@@ -447,6 +462,16 @@ def _check_wait(args: argparse.Namespace) -> int:
     return 2
 
 
+def _check_target(args: argparse.Namespace) -> int:
+    """0 unless a split target was asked of a remote run, which places its
+    own; 2 with the usage error printed."""
+    if getattr(args, "target", "local") == "local" or not args.remote:
+        return 0
+    print(f"error: {args.command}: --target is for a run on this machine", file=sys.stderr)
+    print("hint: drop --target, or drop --remote", file=sys.stderr)
+    return 2
+
+
 def _check_jobs_id(args: argparse.Namespace) -> int:
     """0 when a positional job ID does not collide with --watch/--cancel/
     --fetch -- each of those already names its own ID -- or 2 with the usage
@@ -560,6 +585,15 @@ def _build_parser() -> argparse.ArgumentParser:
         "--remote",
         action="store_true",
         help="submit the run to the hosted runner instead of executing ffmpeg here",
+    )
+    # Hidden, for development: run a plan placed across several nodes, each
+    # a runner of its own on this machine, and how to place it.
+    run_p.add_argument("--target", choices=_TARGETS, default="local", help=argparse.SUPPRESS)
+    run_p.add_argument(
+        "--placement",
+        choices=("one", "per-module", "per-process"),
+        default="per-module",
+        help=argparse.SUPPRESS,
     )
     run_p.add_argument(
         "--wait",
@@ -1570,6 +1604,9 @@ def _cmd_run(args: argparse.Namespace, on_warning: OnWarning) -> int:
     code = _check_wait(args)
     if code != 0:
         return code
+    code = _check_target(args)
+    if code != 0:
+        return code
     try:
         query, packages, code = _resolve_query(args)
         if query is None:
@@ -1828,20 +1865,28 @@ def _run_plan(
     owner = query.owner if query is not None else None
     dump = os.environ.get("FFRWD_DUMP_STDERR")
     try:
-        result = execute_plan(
-            plan,
-            sidecar_argv=functools.partial(wasm.sidecar_argv, jobs=args.jobs),
-            timeout=timeout,
-            overwrite=args.overwrite,
-            echo=_echo_member if _verbose(args) else None,
-            players=players,
-            show_only=args.show_only,
-            work=work,
-            compile_instance=lambda text, unset: compile_instance(
+        # What a run takes, whether this machine runs every process of it or
+        # it is placed on several nodes.
+        options: dict[str, Any] = {
+            "sidecar_argv": functools.partial(wasm.sidecar_argv, jobs=args.jobs),
+            "timeout": timeout,
+            "overwrite": args.overwrite,
+            "echo": _echo_member if _verbose(args) else None,
+            "players": players,
+            "show_only": args.show_only,
+            "work": work,
+            "compile_instance": lambda text, unset: compile_instance(
                 text, packages=packages, owner=owner, unset=unset
             ),
-            dump=Path(dump) if dump else None,
-        )
+            "dump": Path(dump) if dump else None,
+        }
+        if getattr(args, "target", "local") == "split-local":
+            from . import nodes, placement
+
+            placed = placement.place(plan, args.placement)
+            result = nodes.execute_split(plan, placed, jobs=args.jobs, **options)
+        else:
+            result = execute_plan(plan, **options)
     except FfrwdError as err:
         # Rendering the argv or spawning a stage, not the query text:
         # `compile` prints the same refusal through `render_plan`.
@@ -1892,7 +1937,10 @@ def _member_error(member: ProcessResult, writes: Sequence[str] = ()) -> str:
         if member.exit_code == 0
         else f"exited with code {member.exit_code}"
     )
-    return f"error: {member.id} {ended}{where}\n  {member.command}"
+    name = member.id if member.node is None else f"{member.id} on node {member.node}"
+    if member.lost:
+        ended = f"was lost: the runner of node {member.node} ended while it ran"
+    return f"error: {name} {ended}{where}\n  {member.command}"
 
 
 def _member_writes(plan: ProcessPlan, member: str) -> list[str]:
