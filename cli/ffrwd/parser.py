@@ -1640,7 +1640,13 @@ class _FfrwdPostgres(Postgres):
             Reading the whole of what was written is what lets a value this
             dialect does not accept be REJECTED -- by name, with a hint --
             rather than leave tokens over for the next option to trip on.
+
+            A ``=>`` between the name and the value is read past, so an
+            option may be spelled the way a named argument is:
+            ``video_codec => ffrwd.pyrowave.encode(bitrate => 200000000)``
+            reads exactly as ``video_codec ffrwd.pyrowave.encode(...)``.
             """
+            self._match(TokenType.FARROW)
             field: exp.Expr | None = super()._parse_unquoted_field()
             if field is None or self._curr is None:
                 return field

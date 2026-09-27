@@ -169,6 +169,7 @@ WORLDS: tuple[str, ...] = (
     "ffrwd:av@0.15.0",
     "ffrwd:av@0.16.0",
     "ffrwd:av@0.17.0",
+    "ffrwd:av@0.18.0",
 )
 
 # The world a module scaffolded today is built against: the newest of those,
@@ -237,6 +238,9 @@ PACKET_FILTER_WORLD = "ffrwd:av@0.16.0"
 # The first world whose sidecar hosts a data filter: data streams of messages
 # in and out, and clock pads beside them.
 DATA_FILTER_WORLD = "ffrwd:av@0.17.0"
+
+# The first world whose sidecar hosts a codec package's encoder and decoder.
+CODEC_WORLD = "ffrwd:av@0.18.0"
 
 # The sample formats one can carry, the pcm each of them travels as, and
 # the name ffmpeg's own options spell it by.
@@ -409,6 +413,32 @@ INSTALL_HINT = (
 
 
 @dataclass(frozen=True)
+class EncoderInfo:
+    """What a codec package's encoder writes, as its describe says it.
+
+    `fourcc` is the codec's identity on the wire, four ASCII characters,
+    since ffmpeg knows no codec a package brings. `delay` is how many frames
+    go in before the first packet leaves; `decode_delay` how deep its packets
+    reorder; `frame_samples`, for audio, the samples every frame holds (0 is
+    any).
+    """
+
+    codec: str
+    fourcc: str
+    delay: int = 0
+    decode_delay: int = 0
+    frame_samples: int = 0
+
+
+@dataclass(frozen=True)
+class DecoderInfo:
+    """What a codec package's decoder reads: the tags, and its delay."""
+
+    fourccs: tuple[str, ...]
+    delay: int = 0
+
+
+@dataclass(frozen=True)
 class DescribedFunction:
     """One value function inside a module's ``functions`` list.
 
@@ -559,6 +589,10 @@ class Described:
     data_time_base: tuple[int, int] | None = None
     data_streams: SinkArity = "none"
     feeders: tuple[Feeder, ...] = ()
+    # A codec package's module: what its encoder writes, what its decoder
+    # reads. None for every other module; a codec module fills both.
+    encoder: EncoderInfo | None = None
+    decoder: DecoderInfo | None = None
 
     @property
     def packet_sink(self) -> bool:
@@ -773,6 +807,34 @@ def _described(path: str, payload: object) -> Described:
         data_time_base=_rational(payload.get("data_time_base")),
         data_streams=_sink_arity(payload.get("data_streams"), "none"),
         feeders=_feeders(payload.get("feeders")),
+        encoder=_encoder_info(payload.get("encoder")),
+        decoder=_decoder_info(payload.get("decoder")),
+    )
+
+
+def _encoder_info(value: object) -> EncoderInfo | None:
+    """The describe's ``encoder`` object, or None where there is none."""
+    if not isinstance(value, dict):
+        return None
+    codec, fourcc = value.get("codec"), value.get("fourcc")
+    if not isinstance(codec, str) or not isinstance(fourcc, str):
+        return None
+    return EncoderInfo(
+        codec=codec,
+        fourcc=fourcc,
+        delay=_zero_or_more(value.get("delay")),
+        decode_delay=_zero_or_more(value.get("decode_delay")),
+        frame_samples=_zero_or_more(value.get("frame_samples")),
+    )
+
+
+def _decoder_info(value: object) -> DecoderInfo | None:
+    """The describe's ``decoder`` object, or None where there is none."""
+    if not isinstance(value, dict):
+        return None
+    return DecoderInfo(
+        fourccs=_strings(value.get("fourccs")),
+        delay=_zero_or_more(value.get("delay")),
     )
 
 
@@ -822,6 +884,13 @@ def _sink_arity(value: object, absent: SinkArity) -> SinkArity:
 
 # The keys a windowed export's description carries, and no other export's.
 _SHAPE_KEYS = ("window", "stride", "pure", "one_to_one")
+
+
+def _zero_or_more(value: object) -> int:
+    """A declared count that may be 0, or 0 for a description that names none."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return 0
+    return value
 
 
 def _count(value: object) -> int:
@@ -2270,6 +2339,11 @@ def audio_encoder_codec(encoder: str) -> str | None:
     if sep and head in WIRE_AUDIO_CODECS:
         return head
     return _AUDIO_ENCODER_CODECS.get(encoder)
+
+
+def hosts_codec(world: str) -> bool:
+    """True when `world`'s sidecar can host an encoder or a decoder."""
+    return world in WORLDS and WORLDS.index(world) >= WORLDS.index(CODEC_WORLD)
 
 
 def hosts_data_filter(world: str) -> bool:

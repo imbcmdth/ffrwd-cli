@@ -2404,3 +2404,26 @@ def test_a_data_stream_tagged_json_probes_as_json(
     json_stream, other = result.by_type("data")
     assert json_stream.codec == "json"
     assert other.codec is None
+
+
+@pytest.mark.parametrize(
+    ("tag", "codec"),
+    [("PYRW", "PYRW"), ("[1][0][0][0]", None), ("AB", None), (None, None)],
+)
+def test_a_stream_ffmpeg_cannot_name_reads_as_its_tag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tag: str | None, codec: str | None
+) -> None:
+    """A codec package's stream probes with no codec_name and its four-
+    character tag, which is its identity on the wire: that tag is its codec.
+    A tag ffprobe spells with unprintable bytes, or none, names nothing."""
+    f = tmp_path / "coded.nut"
+    f.write_bytes(b"data")
+    _fake_ffprobe_present(monkeypatch)
+    stream: dict[str, object] = {"index": 0, "codec_type": "video", "width": 64, "height": 48}
+    if tag is not None:
+        stream["codec_tag_string"] = tag
+    _fake_run(monkeypatch, stdout=json.dumps({"streams": [stream], "format": {}}))
+    result = probe(str(f))
+    assert result is not None
+    (video,) = result.streams
+    assert video.codec == codec

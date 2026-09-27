@@ -278,6 +278,18 @@ _WASM_SOURCE_HINT = (
     "number or boolean, the values it is configured with"
 )
 _WASM_SOURCE_CALL_HINT = "a source is called in FROM: FROM <name>(<values>) <alias>"
+# The return types of a CODEC package's modules: an encoder stands where
+# ffmpeg's own encoder would, raw frames in and coded packets out, and a
+# decoder is the mirror. Neither reads a stream argument: the stream is the
+# output's own (an encoder named in a COPY's options) or the input's (a
+# decoder an input() inserts), so every parameter is a value it is configured
+# with, and whether it codes video or audio is the module's own to say.
+WASM_ENCODER = "encoder"
+WASM_DECODER = "decoder"
+_WASM_CODEC_HINT = (
+    "an encoder or a decoder codes the stream it is given, so it takes only "
+    "values: text, number or boolean"
+)
 # A PACKET ROWS function: a rows-array RETURNS written over a STREAM rather
 # than over rows. The module is a packet sink, and the call is a FROM item
 # whose rows the compiler reads while it compiles.
@@ -633,6 +645,7 @@ class WasmFunction:
             and not self.is_sink
             and not self.is_packets
             and not self.is_source
+            and not self.is_codec
             and not self.is_rows
             and not self.is_packet_rows
         )
@@ -710,6 +723,30 @@ class WasmFunction:
         only value parameters and is legal only in FROM.
         """
         return self.returns == WASM_SOURCE
+
+    @property
+    def is_encoder(self) -> bool:
+        """True for a ``RETURNS encoder`` function: a codec package's encoder.
+
+        It is written where a codec name goes in a COPY's options
+        (``video_codec <name>(<values>)``) and codes that output's stream:
+        raw frames in, coded packets out.
+        """
+        return self.returns == WASM_ENCODER
+
+    @property
+    def is_decoder(self) -> bool:
+        """True for a ``RETURNS decoder`` function: a codec package's decoder.
+
+        An input() whose stream carries a tag the module reads is decoded by
+        it, or one named with ``decoder => <name>(<values>)``.
+        """
+        return self.returns == WASM_DECODER
+
+    @property
+    def is_codec(self) -> bool:
+        """True for an encoder or a decoder."""
+        return self.is_encoder or self.is_decoder
 
     @property
     def stream_kind(self) -> StreamType:
@@ -1704,6 +1741,45 @@ def _define_wasm_source(
     )
 
 
+def _define_wasm_codec(
+    name: str,
+    module: str,
+    export: str,
+    params: tuple[Parameter, ...],
+    returns: str,
+    identifier: exp.Identifier,
+    create: exp.Create,
+) -> WasmFunction:
+    """One validated ``RETURNS encoder`` or ``RETURNS decoder`` declaration.
+
+    A codec's stream is never an argument: an encoder codes the output it is
+    named for, and a decoder the input stream it is inserted over. So every
+    parameter is a value, as a source's are, and a stream-typed one is
+    refused outright.
+    """
+    stream = next(
+        (p for p in params if element_type(p.type) in WASM_STREAM_TYPES), None
+    )
+    if stream is not None:
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"wasm function '{name}' declares the stream parameter '{stream.name}'",
+            identifier,
+            fallback=create,
+            hint=_WASM_CODEC_HINT,
+        )
+    line, col = _pos(identifier, create)
+    return WasmFunction(
+        name=name,
+        module=module,
+        export=export,
+        params=params,
+        returns=returns,
+        line=line,
+        col=col,
+    )
+
+
 def _define_wasm_rows(
     name: str,
     module: str,
@@ -1960,6 +2036,10 @@ def _define_wasm(
             returns = WASM_PACKETS
         elif _type_name(node) == WASM_SOURCE:
             return _define_wasm_source(name, module, export, params, identifier, create)
+        elif _type_name(node) in (WASM_ENCODER, WASM_DECODER):
+            return _define_wasm_codec(
+                name, module, export, params, str(_type_name(node)), identifier, create
+            )
         elif _type_name(node) == _VECTOR_TYPE:
             # Checked ahead of `_checked_type`, the same way sink/source are:
             # `vector` is not a NAMEABLE type (no SQL RETURNS, no RETURNS
@@ -2340,8 +2420,22 @@ def _wasm_struct_return(
     return written[0], annotation, stream
 
 
-def _define(create: exp.Create) -> _Function | WasmFunction:
-    """One validated ``CREATE FUNCTION``, body parsed and shape-checked."""
+def _returns_codec(create: exp.Create) -> bool:
+    """True for a declaration written ``RETURNS encoder`` or ``RETURNS decoder``."""
+    for prop in create.find_all(exp.ReturnsProperty):
+        node = prop.this if isinstance(prop.this, exp.Expr) else None
+        return _type_name(node) in (WASM_ENCODER, WASM_DECODER)
+    return False
+
+
+def _define(create: exp.Create, *, packaged: bool = False) -> _Function | WasmFunction:
+    """One validated ``CREATE FUNCTION``, body parsed and shape-checked.
+
+    `packaged` is a package lib's declaration, which is only ever called by
+    its qualified name. A codec there may take a name the dialect already
+    uses: ``ffrwd.pyrowave.encode(...)`` is a call to the package's member
+    wherever it is written, where a bare ``encode(...)`` is Postgres's own.
+    """
     if create.args.get("replace"):
         raise _error(
             ErrorCode.UNSUPPORTED_SQL,
@@ -2363,7 +2457,8 @@ def _define(create: exp.Create) -> _Function | WasmFunction:
         create, frozenset({"this", "kind", "expression", "properties", "begin"}), "CREATE FUNCTION"
     )
     name = _ident_name(identifier)
-    if name in _RESERVED or name.upper() in exp.FUNCTION_BY_NAME:
+    reserved = name in _RESERVED or name.upper() in exp.FUNCTION_BY_NAME
+    if reserved and not (packaged and _returns_codec(create)):
         raise _error(
             ErrorCode.UNSUPPORTED_SQL,
             f"'{name}' is a reserved function name",
@@ -2562,7 +2657,7 @@ def _source_definitions(
                 "query of its own is a recipe, declared in bin",
             )
         try:
-            function = _define(statement)
+            function = _define(statement, packaged=True)
         except FfrwdError as err:
             raise _in_lib(err, package.name, path, anchor) from err
         if isinstance(function, WasmFunction):
@@ -2846,8 +2941,12 @@ def _dot_segments(node: exp.Expr) -> tuple[str, ...] | None:
     sqlglot parses ``a.b.c(...)`` as ``Dot(Dot(a, b), Anonymous(c))``, so a
     three-part call's qualifier is itself a `Dot`, and this walks its left
     spine to flatten it back into segments.
+
+    A COPY option's value reads its leftmost name as a ``Var`` rather than an
+    ``Identifier`` (``video_codec ffrwd.pyrowave.encode(...)``), and folds the
+    same way an unquoted identifier does.
     """
-    if isinstance(node, exp.Identifier):
+    if isinstance(node, (exp.Identifier, exp.Var)):
         return (_ident_name(node),)
     if isinstance(node, exp.Dot) and isinstance(node.expression, exp.Identifier):
         left = _dot_segments(node.this)
@@ -4184,6 +4283,12 @@ class _Expander:
             for destination in statement.args.get("files") or []:
                 if isinstance(destination, exp.Expr):
                     self._expand_within(destination, selects[0], position, ())
+            # An option's value may be a call too: a codec package's encoder
+            # is written where a codec name goes, `video_codec <call>`.
+            for option in statement.args.get("params") or []:
+                value = option.args.get("expression") if isinstance(option, exp.Expr) else None
+                if isinstance(value, exp.Expr):
+                    self._expand_within(value, selects[0], position, ())
         self.site = None
         self.statement = None
 

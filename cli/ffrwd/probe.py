@@ -361,6 +361,21 @@ JSON_CODEC = "json"
 _JSON_TAG = "JSON"
 
 
+def module_codec(raw: dict[str, object]) -> str | None:
+    """The four-character tag a video or audio stream ffmpeg could not name
+    carries, as its codec: a codec package's (``PYRW``), whose identity on the
+    wire is that tag. None where ffprobe printed no tag of four printable
+    characters (it spells an unprintable byte ``[1]``).
+
+    Uppercase, as a package declares it, so it never reads as one of ffmpeg's
+    own codec names, all of which are lowercase.
+    """
+    tag = raw.get("codec_tag_string")
+    if not isinstance(tag, str) or len(tag) != 4 or "[" in tag or not tag.isprintable():
+        return None
+    return tag
+
+
 def _data_codec(raw: dict[str, object]) -> str | None:
     """The codec a data stream ffmpeg could not name carries, read off its
     tag, or None where the tag names nothing ffrwd knows either."""
@@ -1215,6 +1230,8 @@ def _parse_streams(data: object) -> ProbeResult | None:
             codec_type = raw["codec_type"]
 
             codec = _str_opt(raw, "codec_name")
+            if codec is None and codec_type in ("video", "audio"):
+                codec = module_codec(raw)
             bitrate = _int_opt(raw, "bit_rate")
             duration = _float_opt(raw, "duration")
             flags = _dispositions(raw)
