@@ -16649,11 +16649,11 @@ class _Lowerer:
                     fallback=node,
                     hint=f"its signature is {macro.signature}",
                 ) from None
-        options = self._macro_options(macro, call, node)
+        options = self._macro_options(macro, call, node, env, select)
         streams = {stream_pos: self._lower_expr(call.args[stream_pos], env, select)}
 
-        def build(values: list[object], _element: int) -> FrameRef:
-            return macro.expand(values, self.ctx.node, options)
+        def build(values: list[object], element: int) -> FrameRef:
+            return macro.expand(values, self.ctx.node, options(element))
 
         return self._expand_call(
             call.display,
@@ -16669,18 +16669,29 @@ class _Lowerer:
         )
 
     def _macro_options(
-        self, macro: Macro, call: _Call, node: exp.Expr
-    ) -> dict[str, object]:
-        """A macro's named-only options: every one optional, none repeated.
+        self,
+        macro: Macro,
+        call: _Call,
+        node: exp.Expr,
+        env: _Env,
+        select: exp.Select,
+    ) -> Callable[[int], dict[str, object]]:
+        """A macro's named-only options, as a function of the element.
 
-        Returned in the MACRO's declared order, not the order they were
-        written, so the rendered filter is the same whichever way round the
-        query spells them. An omitted option is left out entirely -- the
-        expansion renders only what was written, and ffmpeg's own default
-        covers the rest. Repeats need no check here: resolve rejects a
-        duplicate `name =>` on any call before lowering starts.
+        Every one optional, none repeated, and returned in the MACRO's
+        declared order, not the order they were written, so the rendered
+        filter is the same whichever way round the query spells them. An
+        omitted option is left out entirely -- the expansion renders only
+        what was written, and ffmpeg's own default covers the rest. Repeats
+        need no check here: resolve rejects a duplicate `name =>` on any call
+        before lowering starts.
+
+        A value is a numeric literal, or anything a filter's option takes
+        as a compile-time value (:meth:`_option_binder`): a variable,
+        ``COALESCE(:max_lateness, 0.5)``, arithmetic, CASE, a probed or row
+        column. Such a value is computed against the row its element came
+        from; one computing to NULL is left out, as if not written.
         """
-        written: dict[str, object] = {}
         for argument in call.named:
             if argument.name not in macro.options:
                 raise _error(
@@ -16690,17 +16701,60 @@ class _Lowerer:
                     fallback=node,
                     hint=f"its signature is {macro.signature}",
                 )
-            try:
-                value = _number(argument.value)
-            except FfrwdError as exc:
-                raise _error(
-                    exc.code,
-                    f"{call.display}()'s '{argument.name}' option must be a "
-                    "numeric literal",
-                    argument.value,
-                    fallback=node,
-                    hint=f"its signature is {macro.signature}",
-                ) from None
+        per_row = any(_reads_row_column(argument.value, env) for argument in call.named)
+        tuples = env.relation.tuples if per_row and env.relation is not None else []
+        cache: dict[int, dict[str, object]] = {}
+
+        def written(element: int) -> dict[str, object]:
+            key = element if per_row else 0
+            if key not in cache:
+                row = tuples[element] if element < len(tuples) else {}
+                cache[key] = self._macro_option_values(macro, call, node, env, row, select)
+            return cache[key]
+
+        # Checked now, so a refusal names the call whether or not an element
+        # is ever built.
+        written(0)
+        return written
+
+    def _macro_option_values(
+        self,
+        macro: Macro,
+        call: _Call,
+        node: exp.Expr,
+        env: _Env,
+        row: _RowTuple,
+        select: exp.Select,
+    ) -> dict[str, object]:
+        """The options :meth:`_macro_options` reads, against one `row`."""
+        written: dict[str, object] = {}
+        for argument in call.named:
+            if is_value_expr(argument.value) or _is_row_scalar(argument.value, env):
+                computed = self._eval_value(argument.value, env, row, select)
+                if computed is None:
+                    continue
+                if isinstance(computed, bool) or not isinstance(computed, int | float):
+                    raise _error(
+                        ErrorCode.UDF_ARG_TYPE,
+                        f"{call.display}()'s '{argument.name}' option must be a "
+                        f"number, got {computed!r}",
+                        argument.value,
+                        fallback=node,
+                        hint=f"its signature is {macro.signature}",
+                    )
+                value: int | float = computed
+            else:
+                try:
+                    value = _number(argument.value)
+                except FfrwdError as exc:
+                    raise _error(
+                        exc.code,
+                        f"{call.display}()'s '{argument.name}' option must be a "
+                        "numeric literal",
+                        argument.value,
+                        fallback=node,
+                        hint=f"its signature is {macro.signature}",
+                    ) from None
             written[argument.name] = value
             if argument.name in macro.positive and value <= 0:
                 raise _error(

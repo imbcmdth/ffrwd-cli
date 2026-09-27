@@ -17,6 +17,7 @@ from __future__ import annotations
 import base64
 import shutil
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -32,6 +33,7 @@ from ffrwd.macros import INPUT_MACROS, MACROS
 from ffrwd.parser import parse, resolve
 from ffrwd.probe import ProbeResult, StreamMeta
 from ffrwd.registry import Registry, load_reference
+from ffrwd.vars import substitute
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 FIXTURES_DIR = REPO_ROOT / "tests" / "fixtures"
@@ -497,6 +499,30 @@ def test_leaky_is_one_hosted_node_with_its_limit_written_out(
 
 
 @pytest.mark.parametrize(
+    ("written", "variables", "lateness"),
+    [
+        ("COALESCE(:max_lateness, 0.5)", {}, 0.5),
+        ("COALESCE(:max_lateness, 0.5)", {"max_lateness": "1.5"}, 1.5),
+        ("COALESCE(:max_lateness, 0.5) * 2", {"max_lateness": "0.75"}, 1.5),
+        ("CASE WHEN a.duration > 60 THEN 1 ELSE 0.5 END", {}, 1),
+        (":max_lateness", {"max_lateness": "0.25"}, 0.25),
+    ],
+)
+def test_leaky_takes_its_limits_as_any_compile_time_number(
+    written: str, variables: dict[str, str], lateness: float
+) -> None:
+    """What a filter's option takes, a macro's takes: a variable, a
+    COALESCE of one and a default, arithmetic, CASE over a probed column."""
+    sql = substitute(
+        f"SELECT ffrwd.leaky(a.video[1], max_lateness => {written}) FROM input('x.mp4') a",
+        variables,
+    ).text
+    probe = replace(_probe_result(audios=0), duration=90.0)
+    (node,) = _lower(sql, {"a": probe}).nodes.values()
+    assert node.args["max_lateness"] == lateness
+
+
+@pytest.mark.parametrize(
     ("call", "code", "needle"),
     [
         (
@@ -518,6 +544,16 @@ def test_leaky_is_one_hosted_node_with_its_limit_written_out(
             "ffrwd.leaky(a.video[1], max_lateness => 'soon')",
             ErrorCode.UDF_ARG_TYPE,
             "'max_lateness' option must be a numeric literal",
+        ),
+        (
+            "ffrwd.leaky(a.video[1], max_lateness => COALESCE(NULL, 'soon'))",
+            ErrorCode.UDF_ARG_TYPE,
+            "'max_lateness' option must be a number, got 'soon'",
+        ),
+        (
+            "ffrwd.leaky(a.video[1], max_lateness => COALESCE(NULL, 0))",
+            ErrorCode.UDF_ARG_TYPE,
+            "'max_lateness' option must be greater than zero, got 0",
         ),
         (
             "ffrwd.leaky(a.video[1], 0.5)",
