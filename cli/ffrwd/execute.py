@@ -2321,11 +2321,12 @@ class _StageRun:
         }
 
     def _ready(self, wire: Wire) -> bool:
-        """True when both ends of `wire` can be opened: a member here that has
-        been spawned, or a node elsewhere."""
-        return all(
-            pid in self.members or pid not in self.local
-            for pid in (wire.edge.source, wire.edge.target)
+        """True when this machine copies `wire` and both its ends can be
+        opened: a member here that has been spawned, or a node elsewhere. A
+        wire between two other nodes is theirs to copy."""
+        ends = (wire.edge.source, wire.edge.target)
+        return any(pid in self.local for pid in ends) and all(
+            pid in self.members or pid not in self.local for pid in ends
         )
 
     def _spawn(self, pid: str) -> None:

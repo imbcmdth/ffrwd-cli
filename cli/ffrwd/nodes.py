@@ -689,8 +689,10 @@ class _Agent:
         except FfrwdError as err:
             send({"type": "error", "error": err.to_dict()})
             stop.wait()
-        except OSError as err:
-            send({"type": "error", "error": {"code": "INTERNAL", "message": str(err)}})
+        except Exception as err:  # a spawn that failed, or a bug: said, never swallowed
+            node = self.part.node
+            message = f"the runner of node {node} could not start its part of the stage: {err!r}"
+            send({"type": "error", "error": {"code": "INTERNAL", "message": message}})
             stop.wait()
         finally:
             run.end()
@@ -1259,6 +1261,8 @@ class _Coordinator:
             )
         except KeyboardInterrupt:
             interrupted = True
+        # Ends the thread that hands an outside stop to this stage.
+        current.abort.set()
         if current.unheard is not None and not interrupted:
             failed, timed_out, wedge = current.unheard[0], True, current.unheard[1]
         for node in involved:
