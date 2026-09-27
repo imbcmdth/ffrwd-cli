@@ -133,7 +133,7 @@ from collections import deque
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import IO, Literal
+from typing import IO, Literal, cast
 
 from . import loudnorm, pipes, redact
 from .console import Work, WorkProgress
@@ -666,6 +666,11 @@ class ProcessResult:
     # True when this member was still running and was told to stop, so its
     # exit code says how it was ended rather than how it ended on its own.
     terminated: bool = False
+    # The node that ran this member, for a run placed on several; None on one.
+    node: int | None = None
+    # True when that node's runner went away while this member ran: its
+    # exit code is not its own, and nothing more is known of it.
+    lost: bool = False
 
     @property
     def command(self) -> str:
@@ -1964,6 +1969,73 @@ class _PipeEnd(_End):
         self._pipe.close()
 
 
+# Opens the TCP connection one cut edge travels on: given the deadline and an
+# event set once the end is closed, a socket connected to the other node's
+# runner with the edge's opening exchange done. Raises OSError when there is
+# none to be had.
+SocketOpener = Callable[[float, threading.Event], socket.socket]
+
+
+class _SocketEnd(_End):
+    """An edge's connection to the runner of another node.
+
+    The far side of a cut edge: the producer's node copies its pipe into
+    one of these, and the consumer's node copies one of these into its pipe.
+    The bytes are the edge's own NUT, as a pipe carries them. `mode` is
+    ``rb`` on the consumer's side and ``wb`` on the producer's.
+    """
+
+    def __init__(self, connect: SocketOpener, mode: Literal["rb", "wb"]) -> None:
+        self._connect = connect
+        self._mode: Literal["rb", "wb"] = mode
+        self._closed = threading.Event()
+        self._lock = threading.Lock()
+        self._socket: socket.socket | None = None
+        self._stream: IO[bytes] | None = None
+
+    def open(self, deadline: float) -> IO[bytes]:
+        connection = self._connect(deadline, self._closed)
+        with self._lock:
+            if self._closed.is_set():
+                connection.close()
+                raise OSError("the edge was closed before it connected")
+            connection.settimeout(None)
+            self._socket = connection
+            # Unbuffered, as a pipe end is: a read hands back what arrived.
+            stream = cast("IO[bytes]", connection.makefile(self._mode, buffering=0))
+            self._stream = stream
+        return stream
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed.set()
+            stream, connection = self._stream, self._socket
+            self._stream = self._socket = None
+        if stream is not None:
+            with contextlib.suppress(OSError, ValueError):
+                stream.close()
+        if connection is not None:
+            with contextlib.suppress(OSError):
+                connection.close()
+
+
+class RemoteProcess:
+    """A member another node's runner spawned, as a watch here sees it.
+
+    `code` is its exit code once that runner has reported one, and `cpu` the
+    CPU time it last reported, in seconds; both None until then.
+    """
+
+    pid = None
+
+    def __init__(self) -> None:
+        self.code: int | None = None
+        self.cpu: float | None = None
+
+    def poll(self) -> int | None:
+        return self.code
+
+
 def _run_stage(
     plan: ProcessPlan,
     stage: Stage,
@@ -1996,42 +2068,275 @@ def _run_stage(
     A run-time lateral whose data stream a member here writes runs for as
     long as the stage does (`laterals`); `stop` ends the stage from outside.
     """
-    ids = list(stage.processes)
-    inside = set(ids)
-    # The writers of feeder connections, each started once its port accepts,
-    # and the members reading each.
-    writers: dict[str, tuple[int, list[str]]] = {}
-    for edge in plan.feeder_edges:
-        if edge.source in inside:
-            writers.setdefault(edge.source, (edge.port, []))[1].append(edge.target)
-    # Where a feeder waits, a live input's edges are copied here rather than
-    # chained, so the first bytes its reader writes start the feeder's clock.
-    stage_wires = [
-        replace(wire, pumped=True) if writers and _is_live(wire.edge) else wire
-        for wire in assigned
-        if wire.edge.source in inside and wire.edge.target in inside
-    ]
-    feeds = [(wire.edge.source, wire.edge.target) for wire in stage_wires]
-    deadline = math.inf if timeout is None else time.monotonic() + timeout
-    members: dict[str, _Member] = {}
-    watching: dict[str, subprocess.Popen[bytes]] = {}
-    helpers: list[threading.Thread] = []
-    ends: list[_End] = []
-    flows: list[Flow] = []
+    run = _StageRun(
+        plan,
+        stage,
+        argv,
+        served,
+        assigned,
+        timeout,
+        overwrite,
+        echo,
+        players,
+        work=work,
+        terminal=terminal,
+        laterals=laterals,
+    )
     failed: str | None = None
     timed_out = False
     wedge: FfrwdError | None = None
     interrupted = False
+    try:
+        run.start()
+        unheard = run.feed_writers(stop)
+        if unheard is not None:
+            failed, timed_out, wedge = unheard
+        else:
+            failed, timed_out, wedge = _watch(
+                run.members.values(),
+                run.deadline,
+                list(run.watching.values()) if show_only and run.watching else None,
+                run.flows,
+                stall,
+                run.feeds,
+                run.feeding,
+                stop,
+            )
+    except KeyboardInterrupt:
+        # `failed`/`timed_out`/`wedge` stay at their unstruck defaults: the
+        # stage below reads as a clean stop, not a failure.
+        interrupted = True
+    finally:
+        run.end()
+    return stage_result(
+        stage.index,
+        run.results(),
+        run.ended(),
+        run.feeds,
+        failed=failed,
+        timed_out=timed_out,
+        wedge=wedge,
+        interrupted=interrupted,
+    )
 
-    def spawn(pid: str) -> None:
-        process = plan.process(pid)
-        reads = [w for w in stage_wires if w.edge.target == pid]
-        writes = [w for w in stage_wires if w.edge.source == pid]
+
+def stage_wires(
+    plan: ProcessPlan,
+    stage: Stage,
+    assigned: Sequence[Wire],
+    apart: Callable[[Wire], bool] | None = None,
+) -> tuple[list[Wire], dict[str, tuple[int, list[str]]]]:
+    """`stage`'s own wires as its run takes them, and its feeders' writers.
+
+    The writers are keyed by process, each with its port and the members
+    reading it: each is started once its port accepts. Where a feeder waits,
+    a live input's edges are copied rather than chained, so the first bytes
+    its reader writes start the feeder's clock. So is every wire `apart`
+    says runs between two nodes, which no stdio handle can cross.
+    """
+    inside = set(stage.processes)
+    writers: dict[str, tuple[int, list[str]]] = {}
+    for edge in plan.feeder_edges:
+        if edge.source in inside:
+            writers.setdefault(edge.source, (edge.port, []))[1].append(edge.target)
+    found = [
+        replace(wire, pumped=True)
+        if (writers and _is_live(wire.edge)) or (apart is not None and apart(wire))
+        else wire
+        for wire in assigned
+        if wire.edge.source in inside and wire.edge.target in inside
+    ]
+    return found, writers
+
+
+# Where a stage run finds the far end of a wire whose other process runs on
+# another node: the end this node copies into (`write`, its producer being
+# here) or out of (`read`, its consumer being here).
+RemoteEnd = Callable[[Wire, Side], _End]
+
+
+class _StageRun:
+    """One stage's members on this machine, from spawn to stop.
+
+    Everything :func:`_run_stage` does short of watching: the run-time
+    laterals the stage writes for, every member spawned in chain order, each
+    wire either handed from stdout to stdin or copied through a pump, every
+    stderr drained, and each feeder's writer started once its port accepts.
+
+    `local` narrows the members this machine runs to a subset of the stage,
+    for a stage placed across several nodes; the stage's wires are still
+    read off the whole plan, so a member's argv and stdio are the ones a run
+    on one node gives it. A wire with one end elsewhere is always copied
+    rather than chained, and `remote` supplies the end on the far side.
+    `spawned` hears each member as it starts.
+    """
+
+    def __init__(
+        self,
+        plan: ProcessPlan,
+        stage: Stage,
+        argv: Mapping[str, list[str]],
+        served: Mapping[tuple[PipeEdge, Side], NamedPipe],
+        assigned: Sequence[Wire],
+        timeout: float | None,
+        overwrite: bool,
+        echo: Callable[[str, list[str]], None] | None,
+        players: Mapping[str, list[str]],
+        *,
+        work: WorkProgress | None = None,
+        terminal: str | None = None,
+        laterals: _Laterals | None = None,
+        local: Iterable[str] | None = None,
+        remote: RemoteEnd | None = None,
+        spawned: Callable[[_Member], None] | None = None,
+    ) -> None:
+        self.plan = plan
+        self.ids = list(stage.processes)
+        inside = set(self.ids)
+        self.local = inside if local is None else inside & set(local)
+        self._argv = argv
+        self._served = served
+        self._overwrite = overwrite
+        self._echo = echo
+        self._players = players
+        self._work = work
+        self._terminal = terminal
+        self._laterals = laterals
+        self._remote = remote
+        self._spawned = spawned
+        self.stage_wires, self.writers = stage_wires(plan, stage, assigned, self._crosses)
+        self.feeds = [(wire.edge.source, wire.edge.target) for wire in self.stage_wires]
+        self.feeding = {pid: readers for pid, (_, readers) in self.writers.items()}
+        self.deadline = math.inf if timeout is None else time.monotonic() + timeout
+        self.members: dict[str, _Member] = {}
+        self.watching: dict[str, subprocess.Popen[bytes]] = {}
+        self.helpers: list[threading.Thread] = []
+        self.ends: list[_End] = []
+        self.flows: list[Flow] = []
+        self.runs: list[_LateralRun] = []
+
+    def _crosses(self, wire: Wire) -> bool:
+        return (wire.edge.source in self.local) != (wire.edge.target in self.local)
+
+    @property
+    def live(self) -> list[Flow]:
+        """The flows of the edges a live input's reader writes, here."""
+        return [flow for flow in self.flows if _is_live(flow.edge)]
+
+    def start(self) -> None:
+        """Start the laterals, every member but the feeders' writers, and
+        every copy and drain between them."""
+        laterals = self._laterals
+        for lateral in self.plan.laterals:
+            if lateral.writer in self.local and laterals is not None:
+                assert laterals.compile_instance is not None  # execute_plan checks
+                self.runs.append(
+                    _LateralRun(
+                        lateral,
+                        laterals.compile_instance,
+                        laterals.sidecar_argv,
+                        laterals.rows,
+                        laterals.dump,
+                        self._echo,
+                    )
+                )
+
+        for pid in _spawn_order(self.ids, self.stage_wires):
+            if pid in self.local and pid not in self.writers:
+                self._spawn(pid)
+
+        for pid, window in self.watching.items():
+            self.helpers.append(_start(_forward, self.members[pid].proc.stdout, window.stdin))
+
+        for wire in self.stage_wires:
+            if not wire.chained and self._ready(wire):
+                self._pump(wire)
+
+        for member in self.members.values():
+            self._drain(member)
+
+    def feed_writers(
+        self, stop: threading.Event | None, elsewhere: Sequence[Flow] = ()
+    ) -> tuple[str, bool, FfrwdError] | None:
+        """Start each feeder's writer here once its port accepts.
+
+        `elsewhere` stands for a live input's edges this machine does not
+        copy, whose first bytes still start a feeder's clock. The watch's
+        own ``(member, timed out, wedge)`` for a port nothing listened on in
+        time; None otherwise.
+        """
+        live = self.live + list(elsewhere)
+        for pid, (port, readers) in self.writers.items():
+            if pid not in self.local:
+                continue
+            heard = _await_port(
+                port,
+                [self.members[r] for r in readers if r in self.members],
+                list(self.members.values()),
+                self.deadline,
+                live,
+                stop,
+            )
+            if heard is None:
+                continue
+            if not heard:
+                return readers[0], True, unheard_error(pid, readers, port, live=bool(live))
+            self._spawn(pid)
+            for wire in self.stage_wires:
+                if not wire.chained and pid in (wire.edge.source, wire.edge.target):
+                    self._pump(wire)
+            self._drain(self.members[pid])
+        return None
+
+    def end(self) -> None:
+        """Stop everything still running, and every copy and drain with it."""
+        # Whatever ended the stage, the rest of it goes too: the instances a
+        # lateral started with it.
+        for run in self.runs:
+            run.stop()
+        _stop(self.members.values())
+        for window in self.watching.values():
+            _stop_player(window)
+        # A pump whose members have all gone finishes on its own; one still
+        # waiting for a member that never arrived is released by its end.
+        for helper in self.helpers:
+            helper.join(_POLL)
+        for end in self.ends:
+            end.close()
+        for helper in self.helpers:
+            helper.join(_JOIN)
+        for run in self.runs:
+            run.join()
+
+    def results(self) -> list[ProcessResult]:
+        """Every member spawned, in stage order."""
+        return [_result(self.members[pid]) for pid in self.ids if pid in self.members]
+
+    def ended(self) -> dict[str, float]:
+        """When the watch saw each member end; a member it never saw end is absent."""
+        return {
+            member.id: member.ended_at
+            for member in self.members.values()
+            if member.ended_at is not None
+        }
+
+    def _ready(self, wire: Wire) -> bool:
+        """True when both ends of `wire` can be opened: a member here that has
+        been spawned, or a node elsewhere."""
+        return all(
+            pid in self.members or pid not in self.local
+            for pid in (wire.edge.source, wire.edge.target)
+        )
+
+    def _spawn(self, pid: str) -> None:
+        process = self.plan.process(pid)
+        reads = [w for w in self.stage_wires if w.edge.target == pid]
+        writes = [w for w in self.stage_wires if w.edge.source == pid]
         chained = next((w for w in reads if w.chained), None)
-        player = players.get(pid)
+        player = self._players.get(pid)
         stdin: int | IO[bytes] = subprocess.DEVNULL
         if chained is not None:
-            stdin = _stream(members[chained.edge.source].proc.stdout)
+            stdin = _stream(self.members[chained.edge.source].proc.stdout)
         elif any(w.read_stdio for w in reads):
             stdin = subprocess.PIPE
         stdout: int | None = (
@@ -2047,134 +2352,74 @@ def _run_stage(
         # A named pipe this process just made is never a file to protect.
         command = _spawn_argv(
             process,
-            argv[pid],
-            overwrite=overwrite or any(not w.write_stdio for w in writes),
-            progress=work is not None and pid == terminal,
+            self._argv[pid],
+            overwrite=self._overwrite or any(not w.write_stdio for w in writes),
+            progress=self._work is not None and pid == self._terminal,
         )
-        if echo is not None:
-            echo(pid, command)
+        if self._echo is not None:
+            self._echo(pid, command)
         if player is not None:
-            watching[pid] = subprocess.Popen(player, stdin=subprocess.PIPE, bufsize=0)
-        members[pid] = _Member(
+            self.watching[pid] = subprocess.Popen(player, stdin=subprocess.PIPE, bufsize=0)
+        member = self.members[pid] = _Member(
             id=pid,
             argv=command,
             proc=_spawn(command, stdin, stdout, env=_nn_runtime_env(command)),
         )
         if chained is not None and not isinstance(stdin, int):
             stdin.close()  # the spawned member owns it now
+        if self._spawned is not None:
+            self._spawned(member)
 
-    def pump(wire: Wire) -> None:
-        source: _End = (
-            _StdioEnd(_stream(members[wire.edge.source].proc.stdout))
-            if wire.write_stdio
-            else _PipeEnd(served[(wire.edge, "write")])
-        )
-        dest: _End = (
-            _StdioEnd(_stream(members[wire.edge.target].proc.stdin))
-            if wire.read_stdio
-            else _PipeEnd(served[(wire.edge, "read")])
-        )
-        ends.extend([source, dest])
+    def _end(self, wire: Wire, side: Side) -> _End:
+        """The end of `wire` a pump copies out of (`write`) or into (`read`)."""
+        pid = wire.edge.source if side == "write" else wire.edge.target
+        if pid not in self.local:
+            assert self._remote is not None  # only a split stage has members elsewhere
+            return self._remote(wire, side)
+        if side == "write":
+            if wire.write_stdio:
+                return _StdioEnd(_stream(self.members[pid].proc.stdout))
+            return _PipeEnd(self._served[(wire.edge, "write")])
+        if wire.read_stdio:
+            return _StdioEnd(_stream(self.members[pid].proc.stdin))
+        return _PipeEnd(self._served[(wire.edge, "read")])
+
+    def _pump(self, wire: Wire) -> None:
+        source = self._end(wire, "write")
+        dest = self._end(wire, "read")
+        self.ends.extend([source, dest])
         flow = Flow(edge=wire.edge, at=time.monotonic())
-        flows.append(flow)
-        helpers.append(_start(_pump, source, dest, deadline, flow))
+        self.flows.append(flow)
+        self.helpers.append(_start(_pump, source, dest, self.deadline, flow))
 
-    def drain(member: _Member) -> None:
+    def _drain(self, member: _Member) -> None:
         stderr = _stream(member.proc.stderr)
-        if work is not None and member.id == terminal:
-            helpers.append(_start(_drain_work, stderr, member.stderr, work))
-        elif laterals is not None and isinstance(plan.process(member.id), SidecarProcess):
-            helpers.append(_start(_drain_rows, stderr, member.stderr, laterals.rows))
+        laterals = self._laterals
+        if self._work is not None and member.id == self._terminal:
+            self.helpers.append(_start(_drain_work, stderr, member.stderr, self._work))
+        elif laterals is not None and isinstance(self.plan.process(member.id), SidecarProcess):
+            self.helpers.append(_start(_drain_rows, stderr, member.stderr, laterals.rows))
         else:
-            helpers.append(_start(_drain, stderr, member.stderr))
+            self.helpers.append(_start(_drain, stderr, member.stderr))
 
-    runs: list[_LateralRun] = []
-    try:
-        for lateral in plan.laterals:
-            if lateral.writer in inside and laterals is not None:
-                assert laterals.compile_instance is not None  # execute_plan checks
-                runs.append(
-                    _LateralRun(
-                        lateral,
-                        laterals.compile_instance,
-                        laterals.sidecar_argv,
-                        laterals.rows,
-                        laterals.dump,
-                        echo,
-                    )
-                )
 
-        for pid in _spawn_order(ids, stage_wires):
-            if pid not in writers:
-                spawn(pid)
+def stage_result(
+    index: int,
+    results: Sequence[ProcessResult],
+    ended: Mapping[str, float],
+    feeds: Sequence[tuple[str, str]],
+    *,
+    failed: str | None,
+    timed_out: bool,
+    wedge: FfrwdError | None,
+    interrupted: bool,
+) -> StageResult:
+    """A stage's report from what its watch said and how its members ended.
 
-        for pid, window in watching.items():
-            helpers.append(_start(_forward, members[pid].proc.stdout, window.stdin))
-
-        for wire in stage_wires:
-            if not wire.chained and wire.edge.source in members and wire.edge.target in members:
-                pump(wire)
-
-        for member in members.values():
-            drain(member)
-
-        live = [flow for flow in flows if _is_live(flow.edge)]
-        for pid, (port, readers) in writers.items():
-            heard = _await_port(
-                port,
-                [members[r] for r in readers if r in members],
-                list(members.values()),
-                deadline,
-                live,
-                stop,
-            )
-            if heard is None:
-                continue
-            if not heard:
-                failed, timed_out = readers[0], True
-                wedge = unheard_error(pid, readers, port, live=bool(live))
-                break
-            spawn(pid)
-            for wire in stage_wires:
-                if not wire.chained and pid in (wire.edge.source, wire.edge.target):
-                    pump(wire)
-            drain(members[pid])
-
-        if wedge is None:
-            failed, timed_out, wedge = _watch(
-                members.values(),
-                deadline,
-                list(watching.values()) if show_only and watching else None,
-                flows,
-                stall,
-                feeds,
-                {pid: readers for pid, (_, readers) in writers.items()},
-                stop,
-            )
-    except KeyboardInterrupt:
-        # `failed`/`timed_out`/`wedge` stay at their unstruck defaults: the
-        # stage below reads as a clean stop, not a failure.
-        interrupted = True
-    finally:
-        # Whatever ended the stage, the rest of it goes too: the instances a
-        # lateral started with it.
-        for run in runs:
-            run.stop()
-        _stop(members.values())
-        for window in watching.values():
-            _stop_player(window)
-        # A pump whose members have all gone finishes on its own; one still
-        # waiting for a member that never arrived is released by its end.
-        for helper in helpers:
-            helper.join(_POLL)
-        for end in ends:
-            end.close()
-        for helper in helpers:
-            helper.join(_JOIN)
-        for run in runs:
-            run.join()
-
-    results = [_result(members[pid]) for pid in ids if pid in members]
+    `failed`, `timed_out` and `wedge` are what :func:`_watch` returned (or a
+    feeder that was never heard); `ended` is when the watch saw each member
+    end, and `feeds` the stage's own producer and consumer pairs.
+    """
     consequences: list[ProcessResult] = []
     failure: ProcessResult | None = None
     failures: list[ProcessResult] = []
@@ -2184,11 +2429,6 @@ def _run_stage(
         failures = [r for r in results if r.id == failed]
         code = 0 if failure is None else _FAILED
     elif failed is not None:
-        ended = {
-            member.id: member.ended_at
-            for member in members.values()
-            if member.ended_at is not None
-        }
         failure, consequences = _attribute(results, ended, feeds)
         blamed = {r.id for r in consequences}
         failures = [
@@ -2202,8 +2442,8 @@ def _run_stage(
         # so the stage carries the one a timeout does.
         code = 0 if failure is None else (failure.exit_code or _FAILED)
     return StageResult(
-        index=stage.index,
-        members=results,
+        index=index,
+        members=list(results),
         exit_code=code,
         timed_out=timed_out and wedge is None,
         failure=failure,
@@ -2484,13 +2724,15 @@ def _watch(
         time.sleep(_POLL)
 
 
-def _cpu_seconds(proc: subprocess.Popen[bytes]) -> float | None:
+def _cpu_seconds(proc: subprocess.Popen[bytes] | RemoteProcess) -> float | None:
     """The CPU time one member has used so far, kernel and user, in seconds.
 
     None where this platform, or this process, cannot be read -- and a member
     that has already exited reads as None on Linux, its ``/proc`` entry being
     gone the moment :meth:`Popen.poll` reaps it.
     """
+    if isinstance(proc, RemoteProcess):
+        return proc.cpu
     if sys.platform == "win32":
         handle = getattr(proc, "_handle", None)
         if handle is None:
