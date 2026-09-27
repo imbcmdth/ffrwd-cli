@@ -130,6 +130,8 @@ from .probe import JSON_CODEC, ProbeResult, StreamMeta, is_url
 __all__ = [
     "COPY_CODEC",
     "FIFO",
+    "FPS_MODE",
+    "PASSTHROUGH",
     "LONGEST_FRAME_SECONDS",
     "NUT",
     "PCM_F32LE",
@@ -207,6 +209,13 @@ _UNMUXABLE_CODECS = frozenset({"wrapped_avframe"})
 FIFO = "fifo"
 FIFO_FORMAT = "fifo_format"
 QUEUE_SIZE = "queue_size"
+
+# The sink option that hands a picture edge's frames to its muxer as they come,
+# and its value. A pipe between two processes is not a presentation: a frame
+# duplicated or dropped there to keep a constant rate is a frame the plan's
+# bound never counted.
+FPS_MODE = "fps_mode"
+PASSTHROUGH = "passthrough"
 
 # How much bigger than the computed bound a buffer is actually made. A bound
 # counts the frames one path runs ahead of its siblings; the doubling covers
@@ -512,6 +521,10 @@ class StreamEdge:
     edge with no sibling to outrun, which is every edge of a plan whose inputs
     are all plain files. `buffer` is what the bound was turned into, and None
     where the bound is 0 and the transport's own defaults suffice.
+
+    `live` marks an edge the one reader of a live input writes. Its pictures
+    reach the muxer as they come (:data:`PASSTHROUGH`), never duplicated or
+    dropped to keep a constant rate, since the bound counts them one for one.
     """
 
     source: str
@@ -521,6 +534,7 @@ class StreamEdge:
     annotations: bool = False
     bound: int = 0
     buffer: EdgeBuffer | None = None
+    live: bool = False
 
     def to_dict(self) -> dict[str, object]:
         written: dict[str, object] = {
@@ -536,6 +550,8 @@ class StreamEdge:
             written["bound"] = self.bound
         if self.buffer is not None:
             written["buffer"] = self.buffer.to_dict()
+        if self.live:
+            written["live"] = True
         return written
 
 
@@ -2479,6 +2495,20 @@ class _Partitioner:
                 edge, bound=bound, buffer=self._sized(edge, bound)
             )
 
+    def _mark_live_edges(self) -> None:
+        """Mark every stream edge a process reading a live input writes."""
+        readers = {
+            process.id
+            for process in self.pending
+            if self._opened(process).keys() & self.live
+        }
+        self.edges = [
+            replace(edge, live=True)
+            if edge.source in readers
+            else edge
+            for edge in self.edges
+        ]
+
     def _group_legs(
         self, reader: _Pending, group: Sequence[StreamEdge]
     ) -> tuple[list[tuple[Fraction, Fraction] | None], frozenset[str]]:
@@ -2958,6 +2988,7 @@ class _Partitioner:
         self._add_rows_edges()
         self._add_rows_documents()
         self._bound_edges()
+        self._mark_live_edges()
         self._check_handed_once()
         self._order_data_outputs()
         processes: list[Process] = [self._materialize(p) for p in self.pending]

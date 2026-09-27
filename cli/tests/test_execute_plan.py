@@ -20,6 +20,7 @@ from typing import Any, cast
 import pytest
 
 from ffrwd import pipes
+from ffrwd.emit import _wire_options
 from ffrwd.errors import ErrorCode, FfrwdError
 from ffrwd.execute import (
     _CHUNK,
@@ -661,11 +662,11 @@ def test_the_one_reader_of_a_live_input_writes_a_pipe_per_consumer() -> None:
         "-i", LIVE,
         "-filter_complex", "[0:v:0]split=2[out0][out1]",
         "-map", "[out0]",
-        "-c:0", "rawvideo", "-pix_fmt:0", "rgba", "-f", "nut",
-        "/pipes/ffmpeg1-sidecar0-write",
+        "-c:0", "rawvideo", "-pix_fmt:0", "rgba", "-fps_mode:0", "passthrough",
+        "-f", "nut", "/pipes/ffmpeg1-sidecar0-write",
         "-map", "[out1]",
-        "-c:0", "rawvideo", "-pix_fmt:0", "yuv420p", "-f", "nut",
-        "/pipes/ffmpeg1-ffmpeg0-write",
+        "-c:0", "rawvideo", "-pix_fmt:0", "yuv420p", "-fps_mode:0", "passthrough",
+        "-f", "nut", "/pipes/ffmpeg1-ffmpeg0-write",
     ]  # fmt: skip
     assert argv["ffmpeg0"] == [
         "ffmpeg", "-copyts",
@@ -684,12 +685,46 @@ def test_a_depth_too_deep_for_a_pipe_puts_the_fifo_muxer_on_the_edge() -> None:
     words = argv["ffmpeg1"]
     at = words.index("/pipes/ffmpeg1-ffmpeg0-write")
 
-    assert words[at - 6 : at] == [
+    assert words[at - 8 : at] == [
+        "-fps_mode:0", "passthrough",
         "-fifo_format", "nut", "-queue_size", "2", "-f", "fifo",
     ]  # fmt: skip
     # The other edge holds nothing, so it is a plain pipe as it always was.
     sidecar = words.index("/pipes/ffmpeg1-sidecar0-write")
     assert words[sidecar - 2 : sidecar] == ["-f", "nut"]
+
+
+def test_every_picture_a_live_reader_writes_is_handed_on_as_it_comes() -> None:
+    """The fifo muxer declares no variable frame rate, so ffmpeg would run its
+    output at a constant one: with pts on a wall clock far from zero it reads
+    billions of missing frames, refuses to duplicate them, and drops every
+    frame. Every picture edge the live reader writes says passthrough, on
+    either road; a process reading no live input is left as it was."""
+    for plan in (_live_merge(), _live_merge(1920, 1080)):
+        argv = plan_argv(plan, sidecar_argv=_stand_in, pipe_path=_named)
+        assert argv["ffmpeg1"].count("-fps_mode:0") == 2
+        assert argv["ffmpeg1"].count("passthrough") == 2
+        assert "-fps_mode:0" not in argv["ffmpeg0"]
+        live = {(e.source, e.target): e.live for e in plan.stream_edges}
+        assert live == {
+            ("ffmpeg1", "sidecar0"): True,
+            ("ffmpeg1", "ffmpeg0"): True,
+            ("sidecar0", "ffmpeg0"): False,
+        }
+
+
+def test_a_picture_on_the_fifo_road_is_handed_on_as_it_comes() -> None:
+    """Whoever wrote it: the fifo road alone is enough for passthrough, and a
+    copied stream is never re-timed, so it never carries one."""
+    fifo = EdgeBuffer("fifo", 2, packets=2)
+    rendered = _wire_options(VideoFormat(width=1920, height=1080), fifo)
+    assert rendered["fps_mode"] == "passthrough"
+    assert rendered["format"] == "fifo"
+    assert "fps_mode" not in _wire_options(VideoFormat())
+    assert "fps_mode" not in _wire_options(
+        VideoFormat(codec="copy"), EdgeBuffer("pipe", 2, size=65536), live=True
+    )
+    assert "fps_mode" not in _wire_options(AudioFormat(), fifo, live=True)
 
 
 def test_a_bounded_edge_asks_for_a_pipe_sized_from_its_bound() -> None:

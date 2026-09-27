@@ -276,13 +276,16 @@ from .processes import (
     COPY_CODEC,
     FIFO,
     FIFO_FORMAT,
+    FPS_MODE,
     NUT,
+    PASSTHROUGH,
     PIPE,
     QUEUE_SIZE,
     AudioFormat,
     DataFormat,
     EdgeBuffer,
     StreamFormat,
+    VideoFormat,
 )
 from .sink import (
     CODEC_PARAMS_FLAGS,
@@ -872,6 +875,7 @@ def build_process_args(
     pipe_inputs: Sequence[tuple[str, str]] = (),
     pipe_outputs: Sequence[tuple[str, StreamFormat]] = (),
     pipe_buffers: Sequence[EdgeBuffer | None] = (),
+    pipe_live: Sequence[bool] = (),
     copyts: bool = False,
 ) -> list[str]:
     """Full ffmpeg argv for one ffmpeg process of a process plan.
@@ -887,7 +891,10 @@ def build_process_args(
     a subtitle track a module writes -- keeps it. `pipe_buffers` is parallel to
     `pipe_outputs`: the depth the plan gave each of those edges, which puts the
     fifo muxer in front of the real one where the depth is held there. A short
-    or empty list leaves the remaining edges plain.
+    or empty list leaves the remaining edges plain. `pipe_live` is parallel
+    too: True for an edge the reader of a live input writes, whose pictures
+    then reach the muxer as they come (``-fps_mode passthrough``), as every
+    picture on the fifo road does.
 
     An input renders ``-f <container> -i <spelling>``, with the probe limits
     that bound its open to a few frames whatever their size
@@ -942,11 +949,12 @@ def build_process_args(
     for slot, (index, (spelling, wire)) in enumerate(zip(pipes, pipe_outputs)):
         group = groups[index]
         buffer = pipe_buffers[slot] if slot < len(pipe_buffers) else None
+        live = pipe_live[slot] if slot < len(pipe_live) else False
         groups[index] = replace(
             group,
             path=spelling,
             wire=wire,
-            options={**_wire_options(wire, buffer), **group.options},
+            options={**_wire_options(wire, buffer, live=live), **group.options},
         )
     return build_ffmpeg_args(replace(e, groups=groups))
 
@@ -1001,7 +1009,9 @@ def _render_conformance(group: OutputGroup) -> list[str]:
     return args
 
 
-def _wire_options(wire: StreamFormat, buffer: EdgeBuffer | None = None) -> dict[str, object]:
+def _wire_options(
+    wire: StreamFormat, buffer: EdgeBuffer | None = None, *, live: bool = False
+) -> dict[str, object]:
     """The sink options that write one stream edge's wire format.
 
     An encoded edge -- the one into a packet sink -- carries its encoder
@@ -1011,6 +1021,14 @@ def _wire_options(wire: StreamFormat, buffer: EdgeBuffer | None = None) -> dict[
     ``-f fifo`` with the wire's own container as ``-fifo_format`` and a queue
     the edge's bound sized. The pipe road is the named pipe's own buffer and
     renders nothing here.
+
+    A picture on the fifo road, or on any edge a `live` reader writes, is
+    handed to the muxer as it comes: ``-fps_mode passthrough``. NUT declares
+    a variable frame rate and ffmpeg leaves its frames alone, but the fifo
+    muxer declares nothing, so ffmpeg would run it at a constant rate, and a
+    live clock's pts far from zero reads as billions of missing frames it
+    then refuses to duplicate, dropping every one. Passthrough is what a pipe
+    edge means on either road; a copied stream is never re-timed at all.
     """
     if isinstance(wire, DataFormat):
         # A data stream's map already copies it; nothing here is a codec.
@@ -1027,6 +1045,9 @@ def _wire_options(wire: StreamFormat, buffer: EdgeBuffer | None = None) -> dict[
             "pix_fmt": wire.pix_fmt,
             **dict(wire.options),
         }
+    fifo = buffer is not None and buffer.road == FIFO
+    if isinstance(wire, VideoFormat) and wire.codec != COPY_CODEC and (fifo or live):
+        written[FPS_MODE] = PASSTHROUGH
     if buffer is not None and buffer.road == FIFO:
         written[FIFO_FORMAT] = wire.container
         written[QUEUE_SIZE] = buffer.packets

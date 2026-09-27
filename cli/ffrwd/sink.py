@@ -478,6 +478,19 @@ _INTERNAL_SINK_OPTIONS: dict[str, SinkOptionSpec] = {
         flag="-queue_size",
         per_stream=False,
     ),
+    # How the frames of a picture edge meet the muxer: `passthrough`, as they
+    # come, never duplicated or dropped to hold a constant rate. Written on
+    # every picture edge the reader of a live input writes, and on every edge
+    # of the fifo road: the fifo muxer declares no variable frame rate, so
+    # ffmpeg would otherwise run it at a constant one.
+    "fps_mode": SinkOptionSpec(
+        name="fps_mode",
+        scope="video",
+        type="str",
+        doc="How frames meet the muxer: passthrough keeps each as it came.",
+        flag="-fps_mode",
+        per_stream=True,
+    ),
     # The manifest destination's derived surface: the variant map is a
     # transcription of the COPY's rows, and the keyframe discipline is
     # computed from the segment length and the frame rate. None is writable
