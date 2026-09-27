@@ -21,7 +21,7 @@ processes are built from.
 
 Pixel and sample formats
 ------------------------
-The sidecar carries frames over NUT, and NUT here spells two pixel formats
+The sidecar carries frames over NUT, and NUT here spells four pixel formats
 (:data:`WIRE_PIX_FMTS`) and two sample formats (:data:`WIRE_SAMPLE_FMTS`). A
 module accepts some set of its own, so the wire format for the edges touching
 it is the intersection, and an empty intersection is a rejection naming both
@@ -180,7 +180,7 @@ WORLD_VERSION = WORLDS[-1].partition("@")[2]
 WIT_PACKAGE = "ffrwd/wasm"
 
 # The pixel formats a stream edge into or out of the sidecar can carry.
-WIRE_PIX_FMTS: tuple[str, ...] = ("rgba", "yuv420p")
+WIRE_PIX_FMTS: tuple[str, ...] = ("rgba", "yuv420p", "yuv422p", "yuv444p")
 
 # The coded video streams a stream edge can carry to a packet sink: the ones
 # the sidecar's NUT reader hands through untouched.

@@ -627,8 +627,9 @@ def test_a_module_that_was_never_described_is_a_compiler_bug() -> None:
 
 
 def test_the_wire_format_is_the_one_the_module_and_the_wire_agree_on() -> None:
-    assert wasm.wire_pix_fmt(_described(pixel_formats=("rgba",))) == "rgba"
-    assert wasm.wire_pix_fmt(_described(pixel_formats=("yuv420p",))) == "yuv420p"
+    assert wasm.WIRE_PIX_FMTS == ("rgba", "yuv420p", "yuv422p", "yuv444p")
+    for pix_fmt in wasm.WIRE_PIX_FMTS:
+        assert wasm.wire_pix_fmt(_described(pixel_formats=("gbrp", pix_fmt))) == pix_fmt
 
 
 def test_the_modules_own_order_decides_between_two_it_both_accepts() -> None:

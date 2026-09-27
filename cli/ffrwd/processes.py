@@ -236,7 +236,14 @@ PIPE_BUFFER_STEP = 1 << 16
 LONGEST_FRAME_SECONDS = 0.1
 
 # Bytes one pixel takes on the wire, per pixel format ffrwd carries.
-_PIXEL_BYTES: Mapping[str, int] = {"rgba": 4, "rgb24": 3, "yuv420p": 2, "yuva420p": 3}
+_PIXEL_BYTES: Mapping[str, int] = {
+    "rgba": 4,
+    "rgb24": 3,
+    "yuv420p": 2,
+    "yuva420p": 3,
+    "yuv422p": 2,
+    "yuv444p": 3,
+}
 
 # Bytes one sample of one channel takes, per pcm codec.
 _SAMPLE_BYTES: Mapping[str, int] = {PCM_F32LE: 4, PCM_S16LE: 2}
