@@ -309,6 +309,7 @@ from ffrwd.inputs import render_options, rendered_options
 from ffrwd.inputs import validate_option as validate_input_option
 from ffrwd.ir import (
     FEEDER_HOST,
+    LEAKY,
     MAX_DISTANCE,
     NO_CHAPTERS,
     NO_METADATA,
@@ -2228,6 +2229,16 @@ def _int_arg(node: Node, *keys: str) -> int | None:
             except ValueError:
                 continue
     return None
+
+
+# The encoders whose forced keyframes are plain I pictures unless they are
+# told to make them IDR frames, the only ones a group can start on.
+_FORCED_IDR_CODECS = frozenset({"h264_nvenc", "hevc_nvenc", "av1_nvenc"})
+
+
+def _forces_idr(codec: object) -> bool:
+    """Whether `codec` is told to make a forced keyframe an IDR frame."""
+    return isinstance(codec, str) and codec in _FORCED_IDR_CODECS
 
 
 def _text_number(value: int | float) -> str:
@@ -4708,6 +4719,7 @@ class _Lowerer:
             path = self._derive_manifest(
                 options, option_nodes, columns, variant_rows, outputs, path, raw
             )
+        self._derive_time_keyframes(options, outputs)
         colorimetry = self._place_encoders(raw, encoders, options, outputs, path)
         self._place_packet_filters(raw, options, outputs, first_filter)
         self._check_metadata_track_container(options, outputs, path, raw)
@@ -5247,6 +5259,12 @@ class _Lowerer:
             asked = any(SINK_OPTIONS[name].scope == kind for name in written)
             if not asked and self._copies_onto_sink(inputs[position], kind, described):
                 pad = {f"{kind}_codec": COPY_CODEC}
+            if kind == "video":
+                rule = self._time_keyframes(inputs[position], pad.get("gop"))
+                if rule is not None:
+                    pad["force_key_frames"] = rule
+                    if _forces_idr(pad.get("video_codec")):
+                        pad.setdefault("forced_idr", True)
             if row_meta is not None and "row" in row_meta[position]:
                 meta = row_meta[position]
                 pad["row"] = meta["row"]
@@ -6234,12 +6252,28 @@ class _Lowerer:
             ]
 
     def _output_rate(self, ref: FrameRef, raw: RawSink, format_name: str) -> float:
-        """One video output's frame rate, walked back through its chain.
+        """One video output's frame rate (:meth:`_known_rate`). A rate the
+        compiler cannot know is a refusal: the keyframe discipline is derived
+        from it.
+        """
+        rate = self._known_rate(ref)
+        if rate is not None:
+            return rate
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"format '{format_name}' derives the keyframe interval from the "
+            "frame rate, and this video stream's rate is unknown",
+            raw.path_node,
+            hint="pin the rate in the query, e.g. fps(<stream>, 30)",
+        )
+
+    def _known_rate(self, ref: FrameRef) -> float | None:
+        """One video stream's frame rate, walked back through its chain, or
+        None where nothing says.
 
         The nearest ``fps()`` on the way to the source wins -- it is what
-        the stream actually plays at; failing one, the probed rate of the
-        source stream the chain reads. A rate the compiler cannot know is a
-        refusal: the keyframe discipline is derived from it.
+        the stream actually plays at; failing one, the probed (or declared)
+        rate of the source stream the chain reads.
         """
         current = ref
         while current and not is_src(current):
@@ -6261,13 +6295,75 @@ class _Lowerer:
                     rate = _parse_rate(streams[index].fps)
                     if rate is not None:
                         return rate
-        raise _error(
-            ErrorCode.UNSUPPORTED_SQL,
-            f"format '{format_name}' derives the keyframe interval from the "
-            "frame rate, and this video stream's rate is unknown",
-            raw.path_node,
-            hint="pin the rate in the query, e.g. fps(<stream>, 30)",
-        )
+        return None
+
+    def _derive_time_keyframes(
+        self, options: dict[str, object], outputs: list[Output]
+    ) -> None:
+        """Keyframes by time for each encoded picture a leaky feeds
+        (:meth:`_time_keyframes`), one rule per video track where they
+        differ. Nothing where no picture passes through a leaky or where
+        the COPY sets no gop.
+        """
+        video = [output for output in outputs if output.type == "video"]
+        gop = options.get("gop")
+        gops = gop if isinstance(gop, list) else [gop] * len(video)
+        if len(gops) != len(video):
+            return
+        rules = [
+            self._time_keyframes(output.ref, written)
+            for output, written in zip(video, gops, strict=True)
+        ]
+        if all(rule is None for rule in rules):
+            return
+        options["force_key_frames"] = rules[0] if len(set(rules)) == 1 else list(rules)
+        if _forces_idr(options.get("video_codec")):
+            options.setdefault("forced_idr", True)
+
+    def _time_keyframes(self, ref: FrameRef, gop: object) -> str | None:
+        """The rule forcing a keyframe every `gop` pictures' worth of TIME
+        on the picture `ref`, or None.
+
+        Only where `ref`'s path passes through a leaky: a leaky drops
+        pictures, and a group counted in pictures (``-g``) then stretches
+        in time, three seconds for 30 pictures at 10 a second, which widens
+        the bursts a relay hands the next reader on. The group's length is
+        `gop` over the stream's rate (:meth:`_known_rate`); where the rate
+        is unknown there is no rule and ``-g`` alone applies. The first
+        picture is forced, which starts the count; after it, one is forced
+        once the group's length less half a picture has passed since the
+        last, so float error never pushes a keyframe one picture past where
+        ``-g`` puts it on a stream with nothing dropped.
+        """
+        if not isinstance(gop, int) or isinstance(gop, bool) or gop <= 0:
+            return None
+        if not self._through_leaky(ref):
+            return None
+        rate = self._known_rate(ref)
+        if rate is None:
+            return None
+        seconds = round((gop - 0.5) / rate, 6)
+        return f"expr:isnan(prev_forced_t)+gte(t-prev_forced_t,{_text_number(seconds)})"
+
+    def _through_leaky(self, ref: FrameRef) -> bool:
+        """Whether any path into `ref` passes through a leaky node."""
+        seen: set[str] = set()
+        pending = [ref]
+        while pending:
+            current = pending.pop()
+            if not current or is_src(current):
+                continue
+            name = current.partition(":")[0]
+            if name in seen:
+                continue
+            seen.add(name)
+            node = self.graph.nodes.get(name)
+            if node is None:
+                continue
+            if node.filter == LEAKY:
+                return True
+            pending.extend(node.inputs)
+        return False
 
     def _output_height(self, ref: FrameRef) -> int | None:
         """One video output's height, walked back through its chain.

@@ -1507,6 +1507,20 @@ What it guarantees, and what it does not:
   for a stage managing 10 pictures a second, twice that at 5). The
   lateness stops growing either way; how far behind it settles depends
   on how slow the stage after the leaky is.
+- Groups stay as long in time as `gop` meant. An encoder counts `gop`
+  in pictures, so where a leaky drops, a group stretches: `gop 30` at 10
+  pictures a second is a three-second group, and a relay hands the next
+  reader on bursts that wide. An encoder whose picture passes through a
+  leaky, writing a file or fronting a sink such as
+  `ffrwd.moq.publish`, is also told to force a keyframe by time, once
+  `gop` pictures' worth of the stream's rate has passed:
+  `-force_key_frames 'expr:isnan(prev_forced_t)+gte(t-prev_forced_t,0.983333)'`
+  beside `-g 30` at 30 fps (half a picture short, so a stream with
+  nothing dropped keeps its keyframes where `-g` puts them). An NVENC
+  encoder is also given `-forced-idr 1`, since it makes a forced keyframe
+  a plain I picture otherwise. The rate is the nearest `fps()` on the
+  way, or the input's probed or declared rate; where none is known, and
+  where the COPY sets no `gop`, `-g` alone applies.
 - It cannot make an overloaded stage keep up. The pictures that reach
   that stage are fewer, not cheaper, and what comes out is at that
   stage's own rate.

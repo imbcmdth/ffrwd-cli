@@ -26,6 +26,7 @@ from ffrwd import compiler, loudnorm, wasm
 from ffrwd.compiler import compile_all, compile_sql
 from ffrwd.emit import build_ffmpeg_args, build_ffmpeg_commands, emit
 from ffrwd.errors import ErrorCode, FfrwdError
+from ffrwd.execute import plan_argv
 from ffrwd.inputs import INPUT_OPTIONS, option_spec
 from ffrwd.ir import Graph, Node
 from ffrwd.lower import lower, lower_table
@@ -637,6 +638,92 @@ def test_a_leaky_alone_compiles_to_a_plan_the_sidecar_runs(
         sidecar.id,
         next(p.id for p in plan.ffmpeg if p.id != reader.id),
     ]
+
+
+# A keyframe forced once a group's length less half a picture has passed.
+def _by_time(seconds: str) -> str:
+    return f"expr:isnan(prev_forced_t)+gte(t-prev_forced_t,{seconds})"
+
+
+@pytest.mark.parametrize(
+    ("picture", "written", "fps", "expected"),
+    [
+        # 30 pictures at 15 a second is two seconds: the rule forces one
+        # every 29.5 pictures' worth, 1.966667 s.
+        ("ffrwd.leaky(a.video[1])", "gop 30", "15/1", {"force_key_frames": _by_time("1.966667")}),
+        # The rate the encoder sees is the nearest fps() on the way.
+        (
+            "fps(ffrwd.leaky(a.video[1]), 30)",
+            "gop 60",
+            "15/1",
+            {"force_key_frames": _by_time("1.983333")},
+        ),
+        # An NVENC encoder makes a forced keyframe an I picture unless told.
+        (
+            "ffrwd.leaky(a.video[1])",
+            "gop 30",
+            "30/1",
+            {"force_key_frames": _by_time("0.983333"), "forced_idr": True},
+        ),
+        # No leaky, no gop, or no rate to count time in: -g alone, as ever.
+        ("setpts(a.video[1], 'PTS')", "gop 30", "30/1", {}),
+        ("ffrwd.leaky(a.video[1])", "crf 20", "30/1", {}),
+        ("ffrwd.leaky(a.video[1])", "gop 30", None, {}),
+    ],
+)
+def test_a_gop_after_a_leaky_is_kept_in_time(
+    picture: str, written: str, fps: str | None, expected: dict[str, object]
+) -> None:
+    """A leaky drops pictures, so a group counted in pictures stretches in
+    time; the encoder after one is also told to force a keyframe once the
+    group's length in time has passed."""
+    probe = _probe_result(audios=0)
+    probe = replace(probe, streams=[replace(probe.streams[0], fps=fps)])
+    codec = "h264_nvenc" if "forced_idr" in expected else "libx264"
+    g = _lower(
+        f"COPY (SELECT {picture} FROM input('x.mp4') a) TO 'out.mkv' "
+        f"WITH (video_codec '{codec}', {written})",
+        {"a": probe},
+        registry=_snapshot_registry(),
+    )
+    (sink,) = g.sinks
+    derived = {
+        name: sink.options[name]
+        for name in ("force_key_frames", "forced_idr")
+        if name in sink.options
+    }
+    assert derived == expected
+
+
+def test_the_encoder_after_a_leaky_renders_its_keyframes_by_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The writing ffmpeg of a live head, the rule beside -g; and without the
+    leaky the same head renders -g alone."""
+
+    def no_probe(*args: object, **kwargs: object) -> None:
+        raise AssertionError(f"probed {args}: a declared shape must not be")
+
+    monkeypatch.setattr(compiler, "probe_path", no_probe)
+    head = _LEAKY_HEAD.replace(
+        "WITH (video_codec 'ffv1'", "WITH (video_codec 'libx264', gop 30"
+    )
+    argv = plan_argv(
+        compile_all(head).plan,
+        sidecar_argv=wasm.shown_argv,
+        pipe_path=lambda edge, side: f"{edge.source}-{edge.target}-{side}",
+    )
+    (writer,) = [a for a in argv.values() if "-g:0" in a]
+    at = writer.index("-force_key_frames:0")
+    assert writer[at + 1] == _by_time("0.983333")
+
+    bare = head.replace(
+        "ffrwd.leaky(s.video[1], max_lateness => 0.5)", "s.video[1]"
+    )
+    (command,) = compile_all(bare).graphs
+    rendered = build_ffmpeg_args(emit(command))
+    assert "-g:0" in rendered
+    assert "-force_key_frames:0" not in rendered
 
 
 # ---------------------------------------------------------------------------

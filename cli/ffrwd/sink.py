@@ -527,6 +527,26 @@ _INTERNAL_SINK_OPTIONS: dict[str, SinkOptionSpec] = {
         flag="-sc_threshold",
         per_stream=True,
     ),
+    # An encoder whose picture a leaky thinned: a keyframe forced by time, so
+    # a group counted by gop stays as long in time as it was meant to be.
+    "force_key_frames": SinkOptionSpec(
+        name="force_key_frames",
+        scope="video",
+        type="str",
+        doc="When keyframes are forced: by time, after ffrwd.leaky, where gop is set.",
+        flag="-force_key_frames",
+        per_stream=True,
+    ),
+    "forced_idr": SinkOptionSpec(
+        name="forced_idr",
+        scope="video",
+        type="bool",
+        doc="An NVENC encoder's forced keyframes made IDR frames.",
+        flag="-forced-idr",
+        per_stream=True,
+        value_template="1",
+        false_template="0",
+    ),
     # The colorimetry a codec package's encoder codes, which the stream it
     # reads carried and the NUT around it lost: the copying muxer writes it
     # into the file, since a stream copy takes these from the options.

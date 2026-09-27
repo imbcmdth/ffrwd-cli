@@ -14122,6 +14122,42 @@ def test_a_ladder_republished_through_a_row_reading_sink_is_five_pads() -> None:
     assert "language" not in pads[0]["rendition"]  # type: ignore[operator]
 
 
+@pytest.mark.parametrize(
+    ("picture", "codec", "expected"),
+    [
+        (
+            "ffrwd.leaky(f.video[1])",
+            "h264_nvenc",
+            {
+                "force_key_frames": "expr:isnan(prev_forced_t)+gte(t-prev_forced_t,0.983333)",
+                "forced_idr": True,
+            },
+        ),
+        (
+            "ffrwd.leaky(f.video[1])",
+            "libx264",
+            {"force_key_frames": "expr:isnan(prev_forced_t)+gte(t-prev_forced_t,0.983333)"},
+        ),
+        ("f.video[1]", "h264_nvenc", {}),
+    ],
+)
+def test_a_sink_fronting_an_encoder_after_a_leaky_keeps_its_groups_in_time(
+    picture: str, codec: str, expected: dict[str, object]
+) -> None:
+    """A packet sink's pad takes the COPY's encoder options, and behind a
+    leaky the time rule a file's encoder takes too: 30 pictures at 30 a
+    second is a second, however many the leaky drops."""
+    g = _row_sink_graph(
+        f"COPY (SELECT {picture} FROM input('a.mp4') f) TO publish('relay', 'live') "
+        f"WITH (video_codec '{codec}', gop 30)",
+        _row_probes(_track("video", 0, width=1280, height=720, fps="30/1")),
+    )
+    ((pad,),) = g.packet_sinks.values()
+    derived = {name: pad[name] for name in ("force_key_frames", "forced_idr") if name in pad}
+    assert derived == expected
+    assert pad["gop"] == 30
+
+
 def test_a_computed_ladder_names_its_rows_by_height() -> None:
     """No rendition table behind these rows -- ``scale`` over
     ``generate_series`` -- so each pad's rendition is derived exactly as
