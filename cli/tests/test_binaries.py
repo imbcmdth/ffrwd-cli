@@ -10,12 +10,13 @@ suite.
 from __future__ import annotations
 
 import importlib
+import importlib.metadata
 import os
 import subprocess
 import sys
 import time
 from collections.abc import Iterator
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import ModuleType
 
 import pytest
@@ -200,25 +201,63 @@ def test_ffrwd_wasm_path_uses_the_installed_wheels_executable(
     assert binaries.ffrwd_wasm_path() == "/venv/Scripts/ffrwd-wasm.exe"
 
 
-def test_sidecar_scripts_path_resolves_via_sysconfig_when_distribution_installed(
+class _FakeDist:
+    """A distribution whose RECORD lists `files`, each located under `root`."""
+
+    def __init__(self, root: Path, files: list[str]) -> None:
+        self.root = root
+        self.files = [PurePosixPath(name) for name in files]
+
+    def locate_file(self, path: PurePosixPath) -> Path:
+        return self.root / path
+
+
+def _installed(monkeypatch: pytest.MonkeyPatch, dist: _FakeDist | None) -> None:
+    def distribution(name: str) -> _FakeDist:
+        if dist is None:
+            raise importlib.metadata.PackageNotFoundError(name)
+        return dist
+
+    monkeypatch.setattr(binaries.importlib.metadata, "distribution", distribution)
+    monkeypatch.setattr(binaries.sysconfig, "get_config_var", lambda name: ".exe")
+
+
+def test_sidecar_scripts_path_is_the_executable_the_distribution_installed(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Exercises the real ``_sidecar_scripts_path`` body: a stub executable
-    sits in a fake scripts dir, the distribution is faked as installed, and
-    the suffix is faked to match, all independent of any real ffrwd-wasm."""
-    scripts_dir = tmp_path
-    exe = scripts_dir / "ffrwd-wasm.exe"
+    """An upgrade pip put in the USER scheme, beside a system install it could
+    not write to, is found where it went, not in the interpreter's default
+    scripts dir where the old sidecar still sits."""
+    user = tmp_path / "user" / "site-packages"
+    user_scripts = tmp_path / "user" / "Scripts"
+    user_scripts.mkdir(parents=True)
+    (user_scripts / "ffrwd-wasm.exe").write_text("new")
+    system_scripts = tmp_path / "system" / "Scripts"
+    system_scripts.mkdir(parents=True)
+    (system_scripts / "ffrwd-wasm.exe").write_text("old")
+    listed = ["../Scripts/ffrwd-wasm.exe", "ffrwd_wasm/__init__.py"]
+    _installed(monkeypatch, _FakeDist(user, listed))
+    monkeypatch.setattr(binaries.sysconfig, "get_path", lambda name: str(system_scripts))
+    found = binaries._sidecar_scripts_path()
+    assert found is not None and Path(found) == user_scripts / "ffrwd-wasm.exe"
+
+
+def test_sidecar_scripts_path_falls_back_to_the_default_scripts_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A distribution whose record names no executable still finds one in
+    the environment's scripts dir."""
+    exe = tmp_path / "ffrwd-wasm.exe"
     exe.write_text("")
-    monkeypatch.setattr(binaries, "_sidecar_distribution_installed", lambda: True)
-    monkeypatch.setattr(binaries.sysconfig, "get_path", lambda name: str(scripts_dir))
-    monkeypatch.setattr(binaries.sysconfig, "get_config_var", lambda name: ".exe")
+    _installed(monkeypatch, _FakeDist(tmp_path / "site", []))
+    monkeypatch.setattr(binaries.sysconfig, "get_path", lambda name: str(tmp_path))
     assert binaries._sidecar_scripts_path() == str(exe)
 
 
 def test_sidecar_scripts_path_is_none_when_distribution_is_not_installed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(binaries, "_sidecar_distribution_installed", lambda: False)
+    _installed(monkeypatch, None)
     assert binaries._sidecar_scripts_path() is None
 
 

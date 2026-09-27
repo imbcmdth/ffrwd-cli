@@ -167,27 +167,34 @@ def ffplay_path() -> str | None:
     return shutil.which("ffplay")
 
 
-def _sidecar_distribution_installed() -> bool:
-    try:
-        importlib.metadata.distribution(_SIDECAR_DISTRIBUTION)
-    except importlib.metadata.PackageNotFoundError:
-        return False
-    return True
-
-
 def _sidecar_scripts_path() -> str | None:
-    """The ``ffrwd-wasm`` executable in this environment's scripts dir, or None.
+    """The ``ffrwd-wasm`` executable the installed distribution put down, or None.
 
     A maturin ``bindings = "bin"`` wheel installs its executable the same way
     a console-script wrapper lands: under the wheel's ``.data/scripts/``,
-    which pip unpacks into the environment's scripts directory
-    (``sysconfig``, not PATH, since a venv need not be activated). Guarded on
-    the distribution actually being installed, so a stray same-named file
-    left over from something else is never picked up.
+    which pip unpacks into the scripts directory of the scheme it installed
+    INTO. That is not always the interpreter's default one: beside a system
+    install nobody can write to, ``pip install -U`` puts the upgrade in the
+    user scheme, and the old sidecar is still in the system scripts
+    directory. So the executable is found through the distribution's own
+    file list -- the same distribution, from the same site directory, that
+    this ffrwd resolves beside it -- and only a distribution that lists none
+    falls back to the default scripts directory. Guarded on the distribution
+    actually being installed, so a stray same-named file left over from
+    something else is never picked up.
     """
-    if not _sidecar_distribution_installed():
+    try:
+        dist = importlib.metadata.distribution(_SIDECAR_DISTRIBUTION)
+    except importlib.metadata.PackageNotFoundError:
         return None
     suffix = sysconfig.get_config_var("EXE") or ""
+    wanted = (SIDECAR_EXECUTABLE + suffix).lower()
+    for listed in dist.files or ():
+        if listed.name.lower() != wanted:
+            continue
+        located = os.path.normpath(str(dist.locate_file(listed)))
+        if os.path.isfile(located):
+            return located
     candidate = os.path.join(sysconfig.get_path("scripts"), SIDECAR_EXECUTABLE + suffix)
     return candidate if os.path.isfile(candidate) else None
 
