@@ -1,4 +1,4 @@
-package ffrwd:av@0.18.0;
+package ffrwd:av@0.17.0;
 
 interface types {
   /// Static description of a module, available without running anything.
@@ -156,18 +156,6 @@ interface types {
     /// Whether decoding can start at this packet.
     keyframe: bool,
     /// The encoded bytes, untouched.
-    data: list<u8>,
-  }
-
-  /// One raw frame crossing a codec: a video frame's pixels in the
-  /// instance's pix-fmt, or a run of interleaved audio samples in its
-  /// sample-fmt. Shared between `encoder` and `decoder`.
-  record raw-frame {
-    /// When it is presented, in the stream's time base.
-    pts: s64,
-    /// How long it is presented, in the stream's time base; none where
-    /// nothing settles it - unknown is never spelled 0.
-    duration: option<s64>,
     data: list<u8>,
   }
 
@@ -889,90 +877,6 @@ interface data-filter {
                 last: bool) -> result<processed, string>;
 }
 
-/// A codec a package implements, where ffmpeg's own encoder would stand:
-/// raw frames in, coded packets out. A query names it in an output's options
-/// (`video_codec => ffrwd.pyrowave.encode(bitrate => 200000000)`) and its
-/// packets leave through whatever that output is.
-///
-/// ffmpeg knows no codec a package brings, so the codec's identity on the
-/// wire is its four-character tag: what a container writes for it, and what
-/// a `decoder` names as the tags it reads.
-interface encoder {
-  use types.{coded-stream, format, meta, packet, raw-frame, stream-info};
-
-  record encoder-meta {
-    /// `meta.pixel-formats` or `meta.sample-formats` name the frames it
-    /// takes, most preferred first, the way a filter's do, and say its kind.
-    meta: meta,
-    /// The codec's name as a query, a message or a catalog spells it:
-    /// "pyrowave".
-    codec: string,
-    /// The four-character tag a container writes for it: "PYRW". Four
-    /// ASCII characters, exactly.
-    fourcc: string,
-    /// How many frames it takes in before its first packet leaves: 0 for an
-    /// intra-only codec that answers every frame in the call that brings it.
-    delay: u32,
-    /// How deep its packets reorder: how many packets a decoder holds back
-    /// before the first frame leaves it. 0 where decode order is
-    /// presentation order.
-    decode-delay: u32,
-    /// For audio, the samples every frame but the last must hold, which the
-    /// host cuts the stream into before it arrives; 0 takes a run of any
-    /// length. Always 0 for video.
-    frame-samples: u32,
-  }
-
-  describe: func() -> encoder-meta;
-
-  /// Called once per instance. `format` is the frames it takes: the arm is
-  /// its kind, and the pix-fmt or sample-fmt one `meta` named. `info` is the
-  /// stream being encoded; its time base is the one frames arrive in.
-  ///
-  /// Answers the coded stream it writes: `codec` its own name, the time base
-  /// its packets are counted in (ordinarily `info.time-base`), the geometry,
-  /// and `extradata`, the codec's out-of-band header, which a container
-  /// writes before the first packet.
-  init: func(format: format, info: stream-info, params: string) -> result<coded-stream, string>;
-
-  /// Frames in presentation order, as many as have arrived. Answers the
-  /// packets that left, in decode order, which may be none while the codec
-  /// holds frames back. `last` marks the final call, which happens exactly
-  /// once and may carry no frame: every frame still held leaves on it.
-  encode: func(frames: list<raw-frame>, last: bool) -> result<list<packet>, string>;
-}
-
-/// The mirror of `encoder`: coded packets in, raw frames out. A package
-/// declares the tags it reads, and an input whose stream carries one of them
-/// is decoded by it where ffmpeg would have decoded it.
-interface decoder {
-  use types.{coded-stream, format, meta, packet, raw-frame, stream-info};
-
-  record decoder-meta {
-    /// `meta.pixel-formats` or `meta.sample-formats` name the frames it can
-    /// write, most preferred first, and say its kind.
-    meta: meta,
-    /// The four-character tags it reads, as its encoder writes them.
-    fourccs: list<string>,
-    /// How many packets it takes in before its first frame leaves.
-    delay: u32,
-  }
-
-  describe: func() -> decoder-meta;
-
-  /// Called once per instance with the coded stream as the container
-  /// declared it: its tag in `codec`, its extradata, its geometry and its
-  /// time base. Answers the frames it writes, whose arm is the stream's kind
-  /// and whose pix-fmt or sample-fmt is one `meta` named.
-  init: func(stream: coded-stream, info: stream-info, params: string) -> result<format, string>;
-
-  /// Packets in decode order, as many as have arrived. Answers the frames
-  /// that left, in presentation order, in the stream's time base. `last`
-  /// marks the final call, which happens exactly once and may carry no
-  /// packet: every frame still held leaves on it.
-  decode: func(packets: list<packet>, last: bool) -> result<list<raw-frame>, string>;
-}
-
 world video-module  { export filter; }
 world meta-module   { export filter; export meta-filter; }
 world window-module { import window-source; export window-filter; }
@@ -982,6 +886,3 @@ world packet-source-module { export packet-source; }
 world values-module { export values; }
 world rows-module-host { export rows-module; }
 world data-filter-module { export data-filter; }
-world encoder-module { export encoder; }
-world decoder-module { export decoder; }
-world codec-module { export encoder; export decoder; }
