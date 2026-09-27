@@ -219,7 +219,8 @@ def test_a_file_handed_between_stages_on_two_nodes_is_refused() -> None:
             FileEdge(source="ffmpeg0", target="ffmpeg1", format=FileFormat(path="pass.log")),
         ),
     )
-    assert _refused(plan, place(plan, "per-process")) == (
+    assert place(plan, "per-process").count == 1
+    assert _refused(plan, Placement(nodes={"ffmpeg0": 0, "ffmpeg1": 1})) == (
         "this plan runs in 2 stages, and ffmpeg0 on node 0 hands 'pass.log' (media) to "
         "ffmpeg1 on node 1: nothing carries a file between nodes"
     )

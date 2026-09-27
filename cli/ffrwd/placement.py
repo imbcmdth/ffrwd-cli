@@ -34,6 +34,9 @@ Strategies:
   kept whole. Not a product strategy: it cuts every edge it can, which is
   what a test of the cut edges wants.
 
+Every strategy keeps the two ends of a file handoff (a later stage's input,
+a rows document a packet filter reads) on one node, since nothing carries a
+file between nodes; a placement given by hand that parts them is refused.
 Node 0 is the node of the plan's first process.
 """
 
@@ -66,6 +69,7 @@ __all__ = [
     "check_placement",
     "colocation_groups",
     "cut_key",
+    "file_handoffs",
     "pipe_edges",
     "place",
     "split",
@@ -333,6 +337,10 @@ def place(plan: ProcessPlan, strategy: Strategy = "one") -> Placement:
     for group in colocation_groups(plan):
         for pid in group.members[1:]:
             union.join(group.members[0], pid)
+    # A strategy never hands a file across nodes: the two processes run in
+    # different stages, so sharing a node costs nothing.
+    for writer, reader in file_handoffs(plan):
+        union.join(writer, reader)
     numbered: dict[str, int] = {}
     nodes: dict[str, int] = {}
     for pid in ids:
@@ -430,6 +438,22 @@ def _check_file_edge(plan: ProcessPlan, placement: Placement, edge: FileEdge) ->
         f"{edge.target} on node {consumer}: nothing carries a file between nodes",
         hint="place the two processes on one node, or run the plan on one node",
     )
+
+
+def file_handoffs(plan: ProcessPlan) -> tuple[tuple[str, str], ...]:
+    """Each ``(writer, reader)`` pair one of which hands the other a file:
+    every file edge, and every rows document a packet filter reads by path."""
+    pairs = [(edge.source, edge.target) for edge in plan.file_edges]
+    written: dict[str, str] = {}
+    for process in plan.sidecars:
+        for document in process.rows:
+            if document.sink.path and is_rows_document(document.sink.path):
+                written.setdefault(document.sink.path, process.id)
+    for process in plan.sidecars:
+        for read in process.rows_in:
+            if read.path in written:
+                pairs.append((written[read.path], process.id))
+    return tuple(pairs)
 
 
 def _check_rows_documents(plan: ProcessPlan, placement: Placement) -> None:
