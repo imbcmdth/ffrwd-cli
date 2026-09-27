@@ -9,7 +9,9 @@ is something a check can arrange and a real run cannot.
 from __future__ import annotations
 
 import importlib
+import json
 import subprocess
+from collections.abc import Mapping
 
 import pytest
 
@@ -17,6 +19,7 @@ from ffrwd.compiler import compile_all, emitted_commands
 from ffrwd.console import Work
 from ffrwd.execute import (
     _PROGRESS_ARGS,
+    _drain_rows,
     _spawn_argv,
     _WorkReader,
     execute,
@@ -123,6 +126,41 @@ def test_a_stream_that_stops_short_still_ends_the_run() -> None:
     # having named no time of its own.
     assert seen[-1].out_time == 20.15
     assert log == _OPENING
+
+
+class _Chunked:
+    """A stderr handing its bytes over `size` at a time, as a pipe might."""
+
+    def __init__(self, raw: bytes, size: int) -> None:
+        self._chunks = [raw[at : at + size] for at in range(0, len(raw), size)]
+
+    def read(self, _limit: int) -> bytes:
+        return self._chunks.pop(0) if self._chunks else b""
+
+    def close(self) -> None:
+        pass
+
+
+def test_a_sidecars_rows_on_stderr_go_to_the_run_and_the_rest_to_its_log() -> None:
+    """A leaky reports on stderr, each row a line of its own behind the
+    prefix; 11 bytes at a time, so a row spans chunks. A line that only looks
+    like one stays in the log, and so does an unended last line."""
+    row = {"kind": "leaky", "node": "n1", "passed": 29, "dropped": 1,
+           "lateness_s": 0.61, "baseline_s": 0.02}  # fmt: skip
+    text = (
+        "opening the network\n"
+        f"ffrwd:row {json.dumps(row)}\n"
+        "ffrwd:row not json\n"
+        "the stream ended"
+    )
+    heard: list[Mapping[str, object]] = []
+    log: list[bytes] = []
+    _drain_rows(_Chunked(text.encode(), 11), log, heard.append)  # type: ignore[arg-type]
+
+    assert heard == [row]
+    assert b"".join(log).decode() == (
+        "opening the network\nffrwd:row not json\nthe stream ended"
+    )
 
 
 # --- which command, and which member ----------------------------------------

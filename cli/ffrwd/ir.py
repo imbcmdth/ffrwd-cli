@@ -86,6 +86,11 @@ MAX_DISTANCE = "max_distance"
 LEAKY = "leaky"
 MAX_LATENESS = "max_lateness"
 
+# What a line of a sidecar's stderr starts with when it is a row the node
+# reports, a leaky's, rather than its log. The rest of the line is one JSON
+# object.
+STDERR_ROW = "ffrwd:row "
+
 # Where a rows DOCUMENT one process hands another goes, numbered from 0 per
 # query: ``ffrwd:rows:0``, ``ffrwd:rows:1``. It is a placeholder, not a path
 # -- a compile prints the same text on any machine, and a run resolves each

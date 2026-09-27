@@ -139,7 +139,14 @@ from . import loudnorm, pipes, redact
 from .console import Work, WorkProgress
 from .emit import Emitted, build_ffmpeg_commands, build_process_args
 from .errors import ErrorCode, FfrwdError
-from .ir import FEEDER_HOST, Lateral, LateralValue, feeder_path, is_rows_document
+from .ir import (
+    FEEDER_HOST,
+    STDERR_ROW,
+    Lateral,
+    LateralValue,
+    feeder_path,
+    is_rows_document,
+)
 from .pipes import NamedPipe
 from .processes import (
     DataFormat,
@@ -2076,6 +2083,8 @@ def _run_stage(
         stderr = _stream(member.proc.stderr)
         if work is not None and member.id == terminal:
             helpers.append(_start(_drain_work, stderr, member.stderr, work))
+        elif laterals is not None and isinstance(plan.process(member.id), SidecarProcess):
+            helpers.append(_start(_drain_rows, stderr, member.stderr, laterals.rows))
         else:
             helpers.append(_start(_drain, stderr, member.stderr))
 
@@ -2958,6 +2967,48 @@ def _drain(stream: IO[bytes], into: list[bytes]) -> None:
     finally:
         with contextlib.suppress(OSError, ValueError):
             stream.close()
+
+
+def _drain_rows(stream: IO[bytes], into: list[bytes], rows: RowSink) -> None:
+    """Drain a sidecar's stderr, `rows` hearing each row it reports there.
+
+    A line behind :data:`~ffrwd.ir.STDERR_ROW` is one JSON object, a row the
+    run hands on, and never joins the log a failure is reported with. Chunks
+    arrive as the pipe hands them over, so a line routinely spans two.
+    """
+    rest = b""
+    try:
+        while True:
+            chunk = stream.read(_CHUNK)
+            if not chunk:
+                break
+            lines = (rest + chunk).split(b"\n")
+            rest = lines.pop()
+            for line in lines:
+                _row_or_log(line, into, rows)
+    except (OSError, ValueError):
+        pass
+    finally:
+        if rest:
+            _row_or_log(rest, into, rows, ended=False)
+        with contextlib.suppress(OSError, ValueError):
+            stream.close()
+
+
+_STDERR_ROW = STDERR_ROW.encode()
+
+
+def _row_or_log(line: bytes, into: list[bytes], rows: RowSink, *, ended: bool = True) -> None:
+    """One stderr line: a row to `rows`, or a line of the log."""
+    if line.startswith(_STDERR_ROW):
+        try:
+            row = json.loads(line[len(_STDERR_ROW) :])
+        except ValueError:
+            row = None
+        if isinstance(row, dict):
+            rows(row)
+            return
+    into.append(line + b"\n" if ended else line)
 
 
 def _drain_work(stream: IO[bytes], into: list[bytes], report: WorkProgress) -> None:
