@@ -12,7 +12,7 @@ import importlib
 import json
 import subprocess
 import sys
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
@@ -87,6 +87,14 @@ def _fake_ffprobe_present(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(binaries, "ffprobe_path", lambda: "/usr/bin/ffprobe")
 
 
+def _to_ceiling(
+    run: Callable[..., subprocess.CompletedProcess[str]],
+) -> Callable[[list[str], float], subprocess.CompletedProcess[str]]:
+    """A ``subprocess.run`` stand-in as :func:`binaries.run_to_ceiling`, which
+    is how every probe runs its binary."""
+    return lambda argv, timeout: run(argv, capture_output=True, text=True, timeout=timeout)
+
+
 def _fake_run(
     monkeypatch: pytest.MonkeyPatch, stdout: str = FAKE_JSON, returncode: int = 0
 ) -> list[list[str]]:
@@ -96,7 +104,7 @@ def _fake_run(
         calls.append(argv)
         return subprocess.CompletedProcess(argv, returncode, stdout=stdout, stderr="")
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(binaries, "run_to_ceiling", _to_ceiling(fake_run))
     return calls
 
 
@@ -224,7 +232,7 @@ def test_timeout_returns_none(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
     def raise_timeout(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         raise subprocess.TimeoutExpired(cmd=argv, timeout=5)
 
-    monkeypatch.setattr(subprocess, "run", raise_timeout)
+    monkeypatch.setattr(binaries, "run_to_ceiling", _to_ceiling(raise_timeout))
     assert probe(str(f)) is None
 
 
@@ -287,9 +295,9 @@ def test_probe_failure_reports_ffprobes_last_stderr_line(
     f.write_bytes(b"data")
     _fake_ffprobe_present(monkeypatch)
     monkeypatch.setattr(
-        subprocess,
-        "run",
-        lambda argv, **kw: subprocess.CompletedProcess(
+        binaries,
+        "run_to_ceiling",
+        lambda argv, timeout: subprocess.CompletedProcess(
             argv, 1, stdout="", stderr="opening file\nInvalid data found when processing input\n"
         ),
     )
@@ -361,7 +369,7 @@ def test_a_probe_that_times_out_is_asked_again_and_succeeds(
             raise subprocess.TimeoutExpired(argv, kw["timeout"])  # type: ignore[arg-type]
         return subprocess.CompletedProcess(argv, 0, stdout=answer, stderr="")
 
-    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(binaries, "run_to_ceiling", _to_ceiling(run))
     result = probe(str(f))
     assert result is not None
     assert result.duration == pytest.approx(15.9)
@@ -379,7 +387,7 @@ def test_a_probe_that_times_out_twice_is_recorded_as_a_timeout(
     def run(argv: list[str], **kw: object) -> subprocess.CompletedProcess[str]:
         raise subprocess.TimeoutExpired(argv, kw["timeout"])  # type: ignore[arg-type]
 
-    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(binaries, "run_to_ceiling", _to_ceiling(run))
     assert probe(str(f)) is None
     failure = probe_failure(str(f))
     assert failure is not None and failure.timed_out
@@ -395,7 +403,7 @@ def test_a_url_that_times_out_is_not_asked_again(monkeypatch: pytest.MonkeyPatch
         tries.append(kw["timeout"])
         raise subprocess.TimeoutExpired(argv, kw["timeout"])  # type: ignore[arg-type]
 
-    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(binaries, "run_to_ceiling", _to_ceiling(run))
     assert probe("https://example.com/x.mp4") is None
     assert len(tries) == 1
 
@@ -1314,7 +1322,7 @@ def test_probe_caches_real_ffprobe_call(
         calls.append(argv)
         return orig_run(argv, **kwargs)  # type: ignore[return-value]
 
-    monkeypatch.setattr(subprocess, "run", counting_run)
+    monkeypatch.setattr(binaries, "run_to_ceiling", _to_ceiling(counting_run))
     path = str(_fixtures / "testsrc.mp4")
     r1 = probe(path)
     r2 = probe(path)

@@ -474,12 +474,7 @@ def _cached_ffprobe(
     result = None
     for ceiling in ceilings:
         try:
-            result = subprocess.run(
-                argv,
-                capture_output=True,
-                text=True,
-                timeout=ceiling,
-            )
+            result = binaries.run_to_ceiling(argv, ceiling)
             break
         except subprocess.TimeoutExpired:
             _failure_cache[cache_key] = ProbeFailure(stderr=None, timed_out=True, seconds=ceiling)
@@ -602,9 +597,7 @@ def track_cues(spec: str, index: int, args: Sequence[str] = ()) -> list[CueMeta]
         "-",
     ]
     try:
-        result = subprocess.run(
-            argv, capture_output=True, text=True, timeout=EXTRACT_TIMEOUT_SECONDS
-        )
+        result = binaries.run_to_ceiling(argv, EXTRACT_TIMEOUT_SECONDS)
     except (OSError, subprocess.SubprocessError):
         return []
     if result.returncode != 0:

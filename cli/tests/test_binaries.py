@@ -9,8 +9,11 @@ suite.
 
 from __future__ import annotations
 
+import importlib
 import os
+import subprocess
 import sys
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from types import ModuleType
@@ -312,3 +315,103 @@ def test_a_version_that_cannot_be_read_is_no_version(
     monkeypatch.setattr(binaries.subprocess, "run", explode)
     binaries.ffmpeg_major_version.cache_clear()
     assert binaries.ffmpeg_major_version() is None
+
+
+# --- a timed-out launcher ends with everything it started -------------------
+
+# The real binary: it holds the pipes it inherited and beats into a file until
+# it is ended, or for 30 s at the most, so a failing test leaves nothing
+# running for long.
+_GRANDCHILD = """
+import sys, time
+end = time.monotonic() + 30
+while time.monotonic() < end:
+    with open(sys.argv[1], "a") as beat:
+        beat.write(".")
+    print("still here", flush=True)
+    time.sleep(0.05)
+"""
+
+# The launcher: starts the real one as its child, sharing its own stdout and
+# stderr, and waits on it, as chocolatey's ffprobe.exe shim does.
+_LAUNCHER = """
+import subprocess, sys
+subprocess.run([sys.executable, sys.argv[1], sys.argv[2]])
+"""
+
+
+def _tree(tmp_path: Path) -> tuple[list[str], Path]:
+    """A launcher and its child, and the file the child beats into."""
+    grandchild = tmp_path / "grandchild.py"
+    grandchild.write_text(_GRANDCHILD)
+    launcher = tmp_path / "launcher.py"
+    launcher.write_text(_LAUNCHER)
+    beat = tmp_path / "beat.txt"
+    return [sys.executable, str(launcher), str(grandchild), str(beat)], beat
+
+
+def _stopped(beat: Path) -> bool:
+    """True once `beat` stops growing: its writer is gone."""
+    before = beat.stat().st_size if beat.exists() else 0
+    time.sleep(0.5)
+    return (beat.stat().st_size if beat.exists() else 0) == before
+
+
+def _alive(beat: Path) -> bool:
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if beat.exists() and beat.stat().st_size > 0:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def test_a_timeout_ends_the_launcher_and_the_binary_it_started(tmp_path: Path) -> None:
+    """``subprocess.run`` would end the launcher and then wait, unbounded, on
+    pipes its child still holds; this ends the whole tree and comes back."""
+    argv, beat = _tree(tmp_path)
+    started = time.monotonic()
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        binaries.run_to_ceiling(argv, 3.0)
+
+    assert time.monotonic() - started < 3.0 + 2 * binaries._REAP_SECONDS
+    assert _alive(beat), "the launcher never started its child"
+    assert _stopped(beat), "the launcher's child outlived the timeout"
+
+
+def test_a_run_that_finishes_in_time_hands_back_its_output(tmp_path: Path) -> None:
+    done = binaries.run_to_ceiling(
+        [sys.executable, "-c", "import sys; print('out'); print('err', file=sys.stderr)"],
+        30.0,
+    )
+
+    assert (done.returncode, done.stdout.strip(), done.stderr.strip()) == (0, "out", "err")
+
+
+def test_a_probe_that_runs_out_of_time_ends_the_real_ffprobe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The listener case: ffprobe on PATH is a launcher, the URL's sender never
+    comes, and the probe's ceiling passes. The probe answers None in bounded
+    time and the binary behind the launcher is gone, port and all."""
+    probe = importlib.import_module("ffrwd.probe")  # the package exports a function by that name
+    argv, beat = _tree(tmp_path)
+    if sys.platform == "win32":
+        shim = tmp_path / "ffprobe.cmd"
+        shim.write_text("@" + subprocess.list2cmdline(argv) + "\r\n")
+    else:
+        shim = tmp_path / "ffprobe"
+        shim.write_text("#!/bin/sh\n" + " ".join(f"'{word}'" for word in argv) + "\n")
+        shim.chmod(0o755)
+    monkeypatch.setattr(binaries, "ffprobe_path", lambda: str(shim))
+    monkeypatch.setattr(probe, "_REMOTE_TIMEOUT_SECONDS", 3.0)
+    probe.clear_cache()
+    started = time.monotonic()
+
+    assert probe.probe("srt://127.0.0.1:9?mode=listener") is None
+
+    assert time.monotonic() - started < 3.0 + 2 * binaries._REAP_SECONDS
+    assert _alive(beat), "the shim never started its child"
+    assert _stopped(beat), "the launcher's child outlived the probe"
+    probe.clear_cache()

@@ -16,16 +16,24 @@ All three NEVER raise; they return ``None`` when a binary is on neither PATH
 nor delivered by its provider (a broken install, unwritable cache dir, no
 network on first use). ``INSTALL_HINT`` is the user-facing wording for the
 ffmpeg/ffprobe case.
+
+The binary PATH finds is often not the binary itself: chocolatey's
+``ffprobe.exe`` is a shim that starts the real one as its child and waits on
+it. :func:`run_to_ceiling` is how a compile-time ffprobe or ffmpeg is run
+under a time limit so that running out of time ends the real one too.
 """
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import importlib.metadata
 import os
 import re
 import shutil
+import signal
 import subprocess
+import sys
 import sysconfig
 
 INSTALL_HINT = (
@@ -45,6 +53,72 @@ _SIDECAR_DISTRIBUTION = "ffrwd-wasm"
 # The sidecar's program name: what a printed command line names, and what
 # PATH is searched for.
 SIDECAR_EXECUTABLE = "ffrwd-wasm"
+
+
+# How long a process tree that was just ended is given to let go of its pipes
+# before it is left behind.
+_REAP_SECONDS = 5.0
+
+
+def run_to_ceiling(argv: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
+    """:func:`subprocess.run` with captured text output, whose timeout ends the
+    whole process TREE and never waits unbounded.
+
+    ``subprocess.run`` ends only the child it started, then waits for the
+    child's pipes to close. When that child is a launcher, the real binary is
+    its child, still holds the pipes and keeps running: the wait lasts until
+    it gives up by itself (182 s for an SRT listener probe once, forever with
+    no sender), and meanwhile it keeps the port it opened. Here the child
+    starts in a group of its own (POSIX: a session; Windows ends a tree by
+    its root pid), running out of time ends the group, and the output is
+    collected with a bounded wait. Raises :class:`subprocess.TimeoutExpired`
+    as ``subprocess.run`` does, and :class:`OSError` when nothing starts.
+    """
+    proc = subprocess.Popen(
+        argv,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=sys.platform != "win32",
+    )
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        end_tree(proc)
+        # The pipes close once the tree is gone; a tree that will not go is
+        # left to its daemon reader threads rather than waited on.
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.communicate(timeout=_REAP_SECONDS)
+        raise
+    return subprocess.CompletedProcess(argv, proc.returncode, out, err)
+
+
+def end_tree(proc: subprocess.Popen[str]) -> None:
+    """End `proc` and everything it started, by force.
+
+    Windows: ``taskkill /F /T`` from `proc`'s own pid, which walks the tree
+    down from it. POSIX: `proc` leads a session of its own
+    (:func:`run_to_ceiling` starts it so), so its group is signalled, and
+    never this process's own. Best effort: a tree already gone is no error.
+    """
+    if sys.platform == "win32":
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=_REAP_SECONDS,
+                check=False,
+            )
+    else:
+        with contextlib.suppress(OSError):
+            group = os.getpgid(proc.pid)
+            if group != os.getpgid(0):
+                os.killpg(group, signal.SIGKILL)
+    with contextlib.suppress(OSError):
+        proc.kill()
 
 
 def _provider_paths() -> tuple[str, str] | None:
