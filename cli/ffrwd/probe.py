@@ -119,6 +119,11 @@ class StreamMeta:
     duration: float | None = None  # per-stream duration in seconds
     color_transfer: str | None = None  # video only; the HDR discriminator
     pix_fmt: str | None = None  # video only, ffprobe pix_fmt, verbatim
+    # Video only, ffprobe's names verbatim: the rest of the colorimetry.
+    color_range: str | None = None  # "tv" or "pc"
+    color_primaries: str | None = None
+    color_space: str | None = None
+    chroma_location: str | None = None  # e.g. "left"
     # True for a stream the query declared (``input(..., shape => ...)``)
     # rather than one ffprobe read: a None codec then means "not said", where
     # from ffprobe it means a stream ffmpeg cannot identify.
@@ -1255,6 +1260,10 @@ def _parse_streams(data: object) -> ProbeResult | None:
                         color_transfer=_str_opt(raw, "color_transfer"),
                         disposition=flags,
                         pix_fmt=_str_opt(raw, "pix_fmt"),
+                        color_range=_str_opt(raw, "color_range"),
+                        color_primaries=_str_opt(raw, "color_primaries"),
+                        color_space=_str_opt(raw, "color_space"),
+                        chroma_location=_str_opt(raw, "chroma_location"),
                     )
                 )
                 video_idx += 1

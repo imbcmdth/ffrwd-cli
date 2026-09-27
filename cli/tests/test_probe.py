@@ -893,6 +893,10 @@ def test_enrichment_fields_present_are_parsed_with_correct_types(
                     "bit_rate": "5000000",
                     "duration": "12.5",
                     "color_transfer": "smpte2084",
+                    "color_range": "tv",
+                    "color_primaries": "bt2020",
+                    "color_space": "bt2020nc",
+                    "chroma_location": "topleft",
                 }
             ],
             "format": {"duration": "12.5"},
@@ -909,6 +913,12 @@ def test_enrichment_fields_present_are_parsed_with_correct_types(
     assert isinstance(v.bitrate, int)
     assert v.duration == 12.5
     assert v.color_transfer == "smpte2084"
+    assert (v.color_range, v.color_primaries, v.color_space, v.chroma_location) == (
+        "tv",
+        "bt2020",
+        "bt2020nc",
+        "topleft",
+    )
     assert v.channels is None  # video row: audio-only field stays None
     assert v.channel_layout is None
 
