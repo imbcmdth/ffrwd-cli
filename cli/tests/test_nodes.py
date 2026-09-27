@@ -251,3 +251,12 @@ def test_a_placement_the_runner_cannot_carry_out_starts_nothing(tmp_path: Path) 
         )
     assert caught.value.code is ErrorCode.PLACEMENT_REFUSED
     assert started == []
+
+
+def test_a_remote_run_places_itself_and_takes_no_target(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from ffrwd import cli
+
+    assert cli.main(["run", "SELECT 1", "--remote", "--target", "split-local"]) == 2
+    assert "--target is for a run on this machine" in capsys.readouterr().err
