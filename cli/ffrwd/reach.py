@@ -12,7 +12,9 @@ a place. It reads what is written, a literal address or a name that can only
 mean a private host; a public name that resolves to a private address is the
 network's to stop, not this check's. A listening input's address (``listen``,
 SRT in listener mode, any UDP or RTP input) is where its own socket binds, not
-a place it reaches, and is left alone.
+a place it reaches, and is left alone; so are the loopback connections the
+compiler itself makes between a plan's own processes (a feeder's connection,
+a run-time lateral's tap and data ports), which never leave the node.
 """
 
 from __future__ import annotations
@@ -21,8 +23,8 @@ import ipaddress
 from collections.abc import Iterable, Sequence
 from urllib.parse import parse_qs, urlsplit
 
-from .ir import Graph
-from .processes import ProcessPlan, SidecarProcess
+from .ir import Graph, feeder_path
+from .processes import FeederEdge, ProcessPlan, SidecarProcess
 
 __all__ = ["private_destinations", "private_reason"]
 
@@ -77,20 +79,46 @@ def private_destinations(
         if reason is not None and url not in found:
             found[url] = reason
 
+    graphs = list(graphs)
+    internal = {path for graph in graphs for path in _internal(graph)}
+    if plan is not None:
+        # A plan's processes' graphs carry neither: the plan keeps its feeder
+        # connections as edges and its laterals of its own.
+        internal |= _plan_internal(plan)
     for graph in graphs:
         listening = _listening(graph)
         for index, path in enumerate(graph.input_paths):
-            if index not in listening:
+            if index not in listening and path not in internal:
                 check(path)
         for unit in graph.sinks:
-            if unit.path:
+            if unit.path and unit.path not in internal:
                 check(unit.path)
     if plan is not None:
         for process in plan.processes:
             if isinstance(process, SidecarProcess):
                 for value in _strings(process.args.values()):
-                    check(value)
+                    if value not in internal:
+                        check(value)
     return list(found.items())
+
+
+def _plan_internal(plan: ProcessPlan) -> set[str]:
+    """The same for a plan: its feeder edges' ports and its laterals'."""
+    paths = {feeder_path(edge.port) for edge in plan.edges if isinstance(edge, FeederEdge)}
+    for lateral in plan.laterals:
+        paths.add(feeder_path(lateral.tap))
+        paths.update(feeder_path(connection.port) for connection in lateral.connections)
+    return paths
+
+
+def _internal(graph: Graph) -> set[str]:
+    """The loopback addresses the compiler made for `graph`'s own processes:
+    each feeder connection, and each run-time lateral's tap and data ports."""
+    paths = set(graph.feeders)
+    for lateral in graph.laterals:
+        paths.add(feeder_path(lateral.tap))
+        paths.update(feeder_path(connection.port) for connection in lateral.connections)
+    return paths
 
 
 def _listening(graph: Graph) -> set[int]:

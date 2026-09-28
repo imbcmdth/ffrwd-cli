@@ -89,3 +89,81 @@ def test_an_input_binding_its_own_address_is_not_a_place_it_reaches(source: str)
         else [process.graph for process in compiled.plan.ffmpeg]
     )
     assert private_destinations(graphs, compiled.plan) == []
+
+
+def test_the_compilers_own_loopback_connections_are_not_places_a_run_reaches() -> None:
+    """A feeder's connection and a run-time lateral's tap and data ports are
+    loopback the compiler made between the plan's own processes; a loopback
+    address the query wrote itself is still refused."""
+    from ffrwd.ir import FeederCall, Graph, Lateral, LateralConnection, SinkUnit, feeder_path
+
+    feeder, tap, data = feeder_path(21723), feeder_path(21725), feeder_path(21727)
+    graph = Graph(
+        input_paths=["rtmp://0.0.0.0:1935/in"],
+        sources={"v": 0},
+        input_options={"v": {"listen": True}},
+        sinks=[
+            SinkUnit(outputs=[], path=feeder, options={"format": "nut"}),
+            SinkUnit(outputs=[], path=tap, options={"format": "data"}),
+            SinkUnit(outputs=[], path="tcp://127.0.0.1:9", options={"format": "nut"}),
+        ],
+        feeders={feeder: (FeederCall(node="sw", function="video", param="feed"),)},
+        laterals=[
+            Lateral(
+                function="vast.play",
+                call="ffrwd.vast.play(...)",
+                stream="launch",
+                tap=21725,
+                template="",
+                values=(),
+                connections=(LateralConnection(port=21727, calls=()),),
+            )
+        ],
+    )
+    assert data not in {unit.path for unit in graph.sinks}
+    assert private_destinations([graph]) == [
+        ("tcp://127.0.0.1:9", "127.0.0.1 is a loopback address")
+    ]
+
+
+def test_a_plans_feeder_edges_and_laterals_are_its_own_loopback() -> None:
+    """On a plan the feeder connections are edges and the laterals the
+    plan's own, not any process's graph's: they are skipped all the same."""
+    from ffrwd.ir import FeederCall, Graph, Lateral, LateralConnection, SinkUnit, feeder_path
+    from ffrwd.processes import FeederEdge, FfmpegProcess, ProcessPlan, SidecarProcess
+
+    feeder, tap = feeder_path(32442), feeder_path(32444)
+    writer = FfmpegProcess(
+        id="ffmpeg0",
+        graph=Graph(
+            input_paths=[],
+            sources={},
+            sinks=[
+                SinkUnit(outputs=[], path=feeder, options={"format": "nut"}),
+                SinkUnit(outputs=[], path=tap, options={"format": "data"}),
+            ],
+        ),
+    )
+    plan = ProcessPlan(
+        processes=(writer, SidecarProcess(id="sidecar0", module="sw.wasm", node="sw")),
+        edges=(
+            FeederEdge(
+                source="ffmpeg0",
+                target="sidecar0",
+                port=32442,
+                calls=(FeederCall(node="sw", function="video", param="feed"),),
+            ),
+        ),
+        laterals=(
+            Lateral(
+                function="vast.play",
+                call="ffrwd.vast.play(...)",
+                stream="launch",
+                tap=32444,
+                template="",
+                values=(),
+                connections=(LateralConnection(port=32446, calls=()),),
+            ),
+        ),
+    )
+    assert private_destinations([writer.graph], plan) == []
