@@ -30,6 +30,14 @@ Strategies:
   feeding it, else the node of an ffmpeg process it is wired to, else node
   0. A node holding a region that computes on a GPU (a ``gpu`` grant, or a
   model bound with ``-nn``) is marked as needing one.
+- ``by-hardware``: each process classed by what it runs on, a GPU (a
+  region computing on one, an ffmpeg process with an NVIDIA encoder,
+  decoder, hwaccel or filter) or cores alone, and each connected run of one
+  class on a node of its own. A decode and an x264 encode around a model
+  are three nodes: two on cores, one on a GPU, each sized for its own work.
+  Every class boundary is a cut edge, and a cut edge between a decode and a
+  model carries raw pictures, so the fewer boundaries a plan crosses the
+  less it moves.
 - ``per-process``: every process on a node of its own, the groups above
   kept whole. Not a product strategy: it cuts every edge it can, which is
   what a test of the cut edges wants.
@@ -70,14 +78,15 @@ __all__ = [
     "colocation_groups",
     "cut_key",
     "file_handoffs",
+    "needs_gpu",
     "pipe_edges",
     "place",
     "split",
     "stdio_chains",
 ]
 
-Strategy = Literal["one", "per-module", "per-process"]
-STRATEGIES: tuple[Strategy, ...] = ("one", "per-module", "per-process")
+Strategy = Literal["one", "per-module", "by-hardware", "per-process"]
+STRATEGIES: tuple[Strategy, ...] = ("one", "per-module", "by-hardware", "per-process")
 
 # The effect grant that puts a region on a GPU.
 _GPU = "gpu"
@@ -312,8 +321,28 @@ def stdio_chains(plan: ProcessPlan) -> tuple[tuple[str, ...], ...]:
     return tuple(runs)
 
 
-def _needs_gpu(process: SidecarProcess) -> bool:
-    return bool(process.models) or any(grant.effect == _GPU for grant in process.grants)
+# What puts an ffmpeg process on a GPU: an NVIDIA encoder or decoder named
+# as a codec, an hwaccel asked of an input, a CUDA or NPP filter.
+_GPU_CODEC_SUFFIXES = ("_nvenc", "_cuvid", "_nvdec")
+_GPU_HWACCELS = frozenset({"cuda", "cuvid", "nvdec"})
+_GPU_FILTER_SUFFIXES = ("_cuda", "_npp")
+
+
+def needs_gpu(process: FfmpegProcess | SidecarProcess) -> bool:
+    """Whether `process` computes on a GPU: a region with a model or a
+    ``gpu`` grant, or an ffmpeg process with an NVIDIA codec, hwaccel or
+    filter."""
+    if isinstance(process, SidecarProcess):
+        return bool(process.models) or any(grant.effect == _GPU for grant in process.grants)
+    graph = process.graph
+    for options in graph.input_options.values():
+        if str(options.get("hwaccel", "")).lower() in _GPU_HWACCELS:
+            return True
+    for unit in graph.sinks:
+        for value in unit.options.values():
+            if isinstance(value, str) and value.endswith(_GPU_CODEC_SUFFIXES):
+                return True
+    return any(node.filter.endswith(_GPU_FILTER_SUFFIXES) for node in graph.nodes.values())
 
 
 # -- strategies
@@ -328,6 +357,8 @@ def place(plan: ProcessPlan, strategy: Strategy = "one") -> Placement:
             union.join(ids[0], pid)
     elif strategy == "per-module":
         _attach_ffmpeg(plan, union)
+    elif strategy == "by-hardware":
+        _join_by_hardware(plan, union)
     elif strategy != "per-process":
         raise FfrwdError(
             ErrorCode.PLACEMENT_REFUSED,
@@ -346,10 +377,19 @@ def place(plan: ProcessPlan, strategy: Strategy = "one") -> Placement:
     for pid in ids:
         root = union.root(pid)
         nodes[pid] = numbered.setdefault(root, len(numbered))
-    gpu = frozenset(
-        nodes[p.id] for p in plan.processes if isinstance(p, SidecarProcess) and _needs_gpu(p)
-    )
+    gpu = frozenset(nodes[p.id] for p in plan.processes if needs_gpu(p))
     return Placement(nodes=nodes, gpu=gpu)
+
+
+def _join_by_hardware(plan: ProcessPlan, union: _Union) -> None:
+    """Join the two ends of every edge whose processes run on the same
+    class of hardware, so each connected run of one class is one node."""
+    gpu = {p.id: needs_gpu(p) for p in plan.processes}
+    for edge in plan.edges:
+        if not isinstance(edge, StreamEdge | RowsEdge | FeederEdge):
+            continue
+        if edge.source in gpu and edge.target in gpu and gpu[edge.source] == gpu[edge.target]:
+            union.join(edge.source, edge.target)
 
 
 def _attach_ffmpeg(plan: ProcessPlan, union: _Union) -> None:

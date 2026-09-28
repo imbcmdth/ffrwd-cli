@@ -596,7 +596,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--target", choices=_TARGETS, default="local", help=argparse.SUPPRESS)
     run_p.add_argument(
         "--placement",
-        choices=("one", "per-module", "per-process"),
+        choices=("one", "per-module", "by-hardware", "per-process"),
         default="per-module",
         help=argparse.SUPPRESS,
     )

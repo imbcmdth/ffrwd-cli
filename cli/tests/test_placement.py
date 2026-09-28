@@ -10,7 +10,7 @@ from __future__ import annotations
 import pytest
 
 from ffrwd.errors import ErrorCode, FfrwdError
-from ffrwd.ir import FeederCall, Graph, Lateral, LateralConnection
+from ffrwd.ir import FeederCall, Graph, Lateral, LateralConnection, SinkUnit
 from ffrwd.placement import (
     Cut,
     NodePlan,
@@ -239,3 +239,40 @@ def test_a_window_on_a_node_other_than_this_one_is_refused() -> None:
 def test_an_unknown_strategy_is_refused() -> None:
     with pytest.raises(FfrwdError, match="no placement is called 'per-sink'"):
         place(_chain(), "per-sink")  # type: ignore[arg-type]
+
+
+# -- by hardware
+
+
+def test_by_hardware_puts_each_run_of_one_class_on_a_node_of_its_own() -> None:
+    """A decode and a CPU region, a model on a GPU, and an encode after it:
+    the cores before the model, the GPU, and the cores after it."""
+    placement = place(_chain(), "by-hardware")
+    assert placement.nodes == {"ffmpeg0": 0, "sidecar0": 0, "sidecar1": 1, "ffmpeg1": 2}
+    assert placement.gpu == frozenset({1})
+
+
+def test_an_nvenc_encode_joins_the_gpu_region_it_reads() -> None:
+    plan = _chain()
+    nvenc = FfmpegProcess(
+        id="ffmpeg1",
+        graph=Graph(
+            input_paths=[],
+            sources={},
+            sinks=[SinkUnit(outputs=[], path="out.mp4", options={"video_codec": "h264_nvenc"})],
+        ),
+    )
+    plan = ProcessPlan(
+        processes=(*plan.processes[:3], nvenc),
+        edges=plan.edges,
+    )
+    placement = place(plan, "by-hardware")
+    assert placement.nodes["ffmpeg1"] == placement.nodes["sidecar1"]
+    assert placement.gpu == frozenset({placement.nodes["sidecar1"]})
+
+
+def test_a_cuda_hwaccel_marks_an_ffmpeg_process_as_needing_a_gpu() -> None:
+    from ffrwd.placement import needs_gpu
+
+    assert needs_gpu(_ffmpeg("ffmpeg0", "a.mp4", options={"hwaccel": "cuda"}))
+    assert not needs_gpu(_ffmpeg("ffmpeg0", "a.mp4"))
