@@ -592,14 +592,12 @@ def _build_parser() -> argparse.ArgumentParser:
     # (a module's), which --remote otherwise finds for itself.
     run_p.add_argument("--live", action="store_true", help=argparse.SUPPRESS)
     # Hidden, for development: run a plan placed across several nodes, each
-    # a runner of its own on this machine, and how to place it.
+    # a runner of its own on this machine, and how to place it: one of
+    # placement.STRATEGIES, or an experimental cost strategy (cost, a preset,
+    # cost:key=value,...). A live --remote run takes it too; left out, the
+    # hosted runner's own default stands.
     run_p.add_argument("--target", choices=_TARGETS, default="local", help=argparse.SUPPRESS)
-    run_p.add_argument(
-        "--placement",
-        choices=("one", "per-module", "by-hardware", "per-process"),
-        default="per-module",
-        help=argparse.SUPPRESS,
-    )
+    run_p.add_argument("--placement", default=None, help=argparse.SUPPRESS)
     run_p.add_argument(
         "--wait",
         action="store_true",
@@ -1891,7 +1889,7 @@ def _run_plan(
         if getattr(args, "target", "local") == "split-local":
             from . import nodes, placement
 
-            placed = placement.place(plan, args.placement)
+            placed = placement.place(plan, args.placement or "per-module")
             result = nodes.execute_split(plan, placed, jobs=args.jobs, **options)
         else:
             result = execute_plan(plan, **options)

@@ -83,17 +83,17 @@ def test_raw_720p30_is_about_330_mbit_and_audio_and_coded_are_small() -> None:
 
 def test_a_plan_that_fits_one_node_runs_on_one_with_no_links() -> None:
     plan = _branches(3)
-    placement = cost_place(plan, CostStrategy(gpu_jobs=3, cores=1.0))
+    placement = cost_place(plan, CostStrategy(encodes=3, cores=1.0))
     assert _nodes(placement) == 1
     assert placement.gpu == frozenset({0})
 
 
-def test_the_gpu_cap_splits_by_branch_and_never_after_an_encoder() -> None:
-    """One GPU job a node: three L4 nodes. Each publisher stays with its
+def test_the_encode_cap_splits_by_branch_and_never_after_an_encoder() -> None:
+    """One encode a node: three L4 nodes. Each publisher stays with its
     encoder, so no coded edge is cut; each branch away from the decode costs
     one raw cut, before or after its region, whichever."""
     plan = _branches(3)
-    placement = cost_place(plan, CostStrategy(gpu_jobs=1, cores=1.0))
+    placement = cost_place(plan, CostStrategy(encodes=1, cores=1.0))
     assert _nodes(placement) == 3
     assert len(placement.gpu) == 3
     cut = [e for e in plan.stream_edges if placement.nodes[e.source] != placement.nodes[e.target]]
@@ -118,9 +118,9 @@ def test_every_cost_placement_keeps_the_hard_rules() -> None:
 
 def test_exhaustive_is_never_worse_than_refine_on_a_small_plan() -> None:
     plan = _branches(2)
-    strategy = CostStrategy(gpu_jobs=1, cores=1.0)
-    refined = report(plan, ["cost:gpu_jobs=1,cores=1.0,search=refine"])[0]
-    exhaustive = report(plan, ["cost:gpu_jobs=1,cores=1.0,search=exhaustive"])[0]
+    strategy = CostStrategy(encodes=1, cores=1.0)
+    refined = report(plan, ["cost:encodes=1,cores=1.0,search=refine"])[0]
+    exhaustive = report(plan, ["cost:encodes=1,cores=1.0,search=exhaustive"])[0]
     assert exhaustive.cut_mbps <= refined.cut_mbps
     assert cost_place(plan, strategy).nodes
 
@@ -128,13 +128,16 @@ def test_exhaustive_is_never_worse_than_refine_on_a_small_plan() -> None:
 def test_a_group_bigger_than_a_node_is_refused_by_name() -> None:
     plan = _branches(1)
     with pytest.raises(FfrwdError) as caught:
-        cost_place(plan, CostStrategy(gpu_jobs=0))
+        cost_place(plan, CostStrategy(encodes=0))
     assert caught.value.code is ErrorCode.PLACEMENT_REFUSED
     assert "more than one node holds" in caught.value.message
 
 
 def test_a_strategy_is_a_preset_or_cost_with_parameters() -> None:
     assert parse_strategy("cost-lean") is PRESETS["cost-lean"]
+    # The owner's defaults: 60% of a node's cores, 2 GPU jobs, 2 encodes.
+    owner = parse_strategy("cost")
+    assert (owner.cores, owner.gpu_jobs, owner.encodes, owner.decodes) == (0.6, 2, 2, 2)
     spelled = parse_strategy("cost:gpu_jobs=2,link=50,search=greedy,cores=0.5")
     assert (spelled.gpu_jobs, spelled.link, spelled.search, spelled.cores) == (
         2,
@@ -151,3 +154,30 @@ def test_a_strategy_is_a_preset_or_cost_with_parameters() -> None:
         with pytest.raises(FfrwdError) as caught:
             parse_strategy(wrong)
         assert said in caught.value.message
+
+
+def test_an_nvenc_encode_is_an_encode_not_a_gpu_job() -> None:
+    from ffrwd.placement_cost import process_load
+
+    plan = _branches(1)
+    load = process_load(plan.process("enc0"), plan)
+    assert (load.gpu_jobs, load.encodes) == (0, 1)
+    assert load.on_gpu
+
+
+def test_place_takes_a_cost_strategy_and_a_placement_survives_its_trip() -> None:
+    from ffrwd.placement import Placement, place
+
+    plan = _branches(3)
+    placed = place(plan, "cost:encodes=1,cores=1.0")
+    assert _nodes(placed) == 3
+    assert Placement.from_dict(placed.to_dict()) == placed
+
+
+def test_a_strategy_name_that_means_nothing_is_refused_before_a_run() -> None:
+    from ffrwd.placement_cost import check_strategy_name
+
+    for fine in ("by-hardware", "cost", "cost-spread", "cost:encodes=1"):
+        check_strategy_name(fine)
+    with pytest.raises(FfrwdError):
+        check_strategy_name("fastest")

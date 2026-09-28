@@ -2389,3 +2389,25 @@ def test_stop_asks_a_live_job_to_finish_its_outputs(
     headers, body = served.sent_to(stop_url)
     assert headers["authorization"] == f"Bearer {TOKEN}"
     assert body == b"{}"
+
+
+def test_a_live_submission_carries_the_placement_it_was_given(
+    served: _Served, logged_in: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "in.mp4").write_bytes(b"x")
+    _submit_accepted(served, 0)
+    remote.submit_run(_query(MEDIA_QUERY), None, _run_args(live=True, placement="cost-lean"))
+    _headers, body = served.sent_to(JOBS_URL)
+    assert body is not None
+    assert json.loads(body)["placement"] == "cost-lean"
+
+
+def test_a_placement_that_means_nothing_is_refused_before_any_request(
+    served: _Served, logged_in: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "in.mp4").write_bytes(b"x")
+    with pytest.raises(FfrwdError):
+        remote.submit_run(_query(MEDIA_QUERY), None, _run_args(live=True, placement="fastest"))
+    assert served.asked == []

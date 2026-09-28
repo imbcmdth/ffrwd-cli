@@ -116,6 +116,20 @@ class Placement:
     def count(self) -> int:
         return max(self.nodes.values(), default=-1) + 1
 
+    def to_dict(self) -> dict[str, object]:
+        return {"nodes": dict(self.nodes), "gpu": sorted(self.gpu)}
+
+    @classmethod
+    def from_dict(cls, d: Mapping[str, object]) -> Placement:
+        nodes = d.get("nodes")
+        gpu = d.get("gpu")
+        if not isinstance(nodes, dict) or not isinstance(gpu, list):
+            raise ValueError("a placement is {nodes: {process: node}, gpu: [node, ...]}")
+        return cls(
+            nodes={str(pid): int(node) for pid, node in nodes.items()},
+            gpu=frozenset(int(node) for node in gpu),
+        )
+
     def node(self, process: str) -> int:
         return self.nodes[process]
 
@@ -349,8 +363,16 @@ def needs_gpu(process: FfmpegProcess | SidecarProcess) -> bool:
 # -- strategies
 
 
-def place(plan: ProcessPlan, strategy: Strategy = "one") -> Placement:
-    """`plan` placed by `strategy`, every co-location group kept whole."""
+def place(plan: ProcessPlan, strategy: str = "one") -> Placement:
+    """`plan` placed by `strategy`, every co-location group kept whole.
+
+    A strategy is one of :data:`STRATEGIES`, or an experimental cost strategy
+    (``cost``, a preset such as ``cost-lean``, or ``cost:key=value,...``),
+    which :mod:`ffrwd.placement_cost` places."""
+    if strategy == "cost" or strategy.startswith("cost-") or strategy.startswith("cost:"):
+        from .placement_cost import cost_place, parse_strategy
+
+        return cost_place(plan, parse_strategy(strategy))
     ids = [p.id for p in plan.processes]
     union = _Union(ids)
     if strategy == "one":
@@ -364,7 +386,7 @@ def place(plan: ProcessPlan, strategy: Strategy = "one") -> Placement:
         raise FfrwdError(
             ErrorCode.PLACEMENT_REFUSED,
             f"no placement is called '{strategy}'",
-            hint=f"use one of: {', '.join(STRATEGIES)}",
+            hint=f"use one of: {', '.join(STRATEGIES)}, or cost (experimental)",
         )
     for group in colocation_groups(plan):
         for pid in group.members[1:]:

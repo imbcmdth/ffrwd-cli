@@ -483,6 +483,13 @@ def submit_run(
     if live:
         # Only when set: a bounded job's spec reads as it always has.
         spec["live"] = True
+        placement = getattr(args, "placement", None)
+        if placement:
+            # Checked here, before anything uploads; placed again by the runner.
+            from .placement_cost import check_strategy_name
+
+            check_strategy_name(placement)
+            spec["placement"] = placement
     if detail is not None:
         detail("submitting the job")
     where = _jobs_url()

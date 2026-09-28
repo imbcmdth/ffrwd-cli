@@ -18,12 +18,18 @@ on one node, so the search runs over the groups those leave (:func:`groups`),
 and every placement it makes passes :func:`ffrwd.placement.check_placement`.
 
 The load model is an estimate, and a coarse one (:func:`process_load`):
-- an encode by its codec and pixel rate (x264 about two cores for 1080p30,
-  an NVIDIA encode one GPU job and a fifth of a core);
-- a decode of an input by the same measure;
+- an encode by its codec and pixel rate (x264 about two cores for 1080p30);
+  an NVIDIA encode is not GPU compute but a session on the card's own
+  encoder, counted against its own cap, plus a fifth of a core;
+- a hardware decode likewise, against a decode cap;
+- a software decode of an input half a core;
 - each video filter a fifth of a core at 1080p30, audio next to nothing;
-- a wasm region a third of a core per module, a region binding a model one
-  GPU job.
+- a wasm region a third of a core per module; a region binding a model, or
+  a CUDA filter chain, one GPU job (compute).
+
+The defaults are the owner's (2026-09-28): a node loaded to 60% of its
+cores, at most 2 GPU jobs, 2 encodes and 2 hardware decodes, each counted on
+its own.
 
 Each process's measured CPU time, from earlier runs of the same plan, is the
 estimate's replacement; nothing records that yet.
@@ -46,7 +52,7 @@ from .placement import (
     colocation_groups,
     file_handoffs,
     gpu_processes,
-    place,
+    needs_gpu,
 )
 from .processes import (
     AudioFormat,
@@ -62,6 +68,7 @@ from .processes import (
 __all__ = [
     "PRESETS",
     "CostStrategy",
+    "check_strategy_name",
     "Load",
     "cost_place",
     "edge_mbps",
@@ -101,7 +108,10 @@ _REFINE_PASSES = 50
 class CostStrategy:
     """One experimental strategy: the parameters of the search.
 
-    - `gpu_jobs`: GPU jobs one node may hold.
+    - `gpu_jobs`: GPU compute jobs one node may hold (a model, a CUDA filter
+      chain).
+    - `encodes`: hardware encode sessions (NVENC) one node may hold.
+    - `decodes`: hardware decode sessions (NVDEC) one node may hold.
     - `node_cores`: the cores a node has (the container's reservation).
     - `cores`: the share of those a node may be loaded to, leaving headroom.
     - `link`: the fixed cost of one cut edge, in Mbit/s it is worth.
@@ -112,9 +122,11 @@ class CostStrategy:
     """
 
     name: str = "cost"
-    gpu_jobs: int = 3
+    gpu_jobs: int = 2
+    encodes: int = 2
+    decodes: int = 2
     node_cores: float = 8.0
-    cores: float = 0.7
+    cores: float = 0.6
     link: float = 50.0
     raw_penalty: float = 2.0
     search: Search = "refine"
@@ -127,13 +139,27 @@ class CostStrategy:
 
 # Named combinations worth comparing; all experimental.
 PRESETS: dict[str, CostStrategy] = {
-    "cost-lean": CostStrategy(name="cost-lean", gpu_jobs=3, cores=0.8, link=200.0),
-    "cost-balanced": CostStrategy(name="cost-balanced"),
-    "cost-spread": CostStrategy(name="cost-spread", gpu_jobs=1, cores=0.5, link=10.0),
+    # The owner's defaults.
+    "cost": CostStrategy(name="cost"),
+    "cost-lean": CostStrategy(
+        name="cost-lean", gpu_jobs=3, encodes=3, decodes=3, cores=0.8, link=200.0
+    ),
+    "cost-spread": CostStrategy(
+        name="cost-spread", gpu_jobs=1, encodes=1, decodes=1, cores=0.5, link=10.0
+    ),
 }
 
-_NUMBERS = {"gpu_jobs": int, "node_cores": float, "cores": float, "link": float,
-            "raw_penalty": float, "fps": float}
+_NUMBERS = {"gpu_jobs": int, "encodes": int, "decodes": int, "node_cores": float,
+            "cores": float, "link": float, "raw_penalty": float, "fps": float}
+
+
+def check_strategy_name(text: str) -> None:
+    """Refuse a placement strategy name that means nothing, before a run."""
+    from .placement import STRATEGIES
+
+    if text in STRATEGIES:
+        return
+    parse_strategy(text)
 
 
 def parse_strategy(text: str) -> CostStrategy:
@@ -179,13 +205,26 @@ def parse_strategy(text: str) -> CostStrategy:
 
 @dataclass(frozen=True)
 class Load:
-    """What running one process, or one group, takes."""
+    """What running one process, or one group, takes: cores, GPU compute
+    jobs, and hardware encode and decode sessions."""
 
     cores: float = 0.0
     gpu_jobs: int = 0
+    encodes: int = 0
+    decodes: int = 0
 
     def __add__(self, other: Load) -> Load:
-        return Load(self.cores + other.cores, self.gpu_jobs + other.gpu_jobs)
+        return Load(
+            self.cores + other.cores,
+            self.gpu_jobs + other.gpu_jobs,
+            self.encodes + other.encodes,
+            self.decodes + other.decodes,
+        )
+
+    @property
+    def on_gpu(self) -> bool:
+        """Whether this needs a node with a GPU at all."""
+        return bool(self.gpu_jobs or self.encodes or self.decodes)
 
 
 def _pixel_scale(format: VideoFormat, fps: float) -> float:
@@ -238,22 +277,30 @@ def _bitrate_mbps(value: object) -> float:
 
 def process_load(process: object, plan: ProcessPlan, fps: float = 30.0) -> Load:
     """The estimated load of one process (see the module's table)."""
-    on_gpu = process.id in gpu_processes(plan)  # type: ignore[attr-defined]
     if isinstance(process, SidecarProcess):
         modules = max(1, len(process.modules) or 1)
         cores = _REGION_CORES * modules
-        if process.models:
-            return Load(cores + _MODEL_CORES, 1 if on_gpu else 0)
-        return Load(cores, 0)
+        if needs_gpu(process):
+            # A model or a gpu grant: compute on the card.
+            return Load(cores + (_MODEL_CORES if process.models else 0.0), gpu_jobs=1)
+        return Load(cores)
     if not isinstance(process, FfmpegProcess):
         return Load()
     cores = 0.0
     jobs = 0
+    encodes = 0
+    decodes = 0
     graph = process.graph
+    for options in graph.input_options.values():
+        if str(options.get("hwaccel", "")).lower() in ("cuda", "cuvid", "nvdec"):
+            decodes += 1
     # Decoding what it opens itself (a file, a url, a device), not its pipes.
     opened = [path for path in graph.input_paths if not path.startswith("pipe:")]
     cores += _DECODE_CORES * len(opened)
     for node in graph.nodes.values():
+        if node.filter.endswith(("_cuda", "_npp")):
+            jobs = 1  # a CUDA filter chain is one compute job, however long
+            continue
         video = any(kind == "video" for kind in node.outputs)
         cores += _FILTER_CORES if video else _AUDIO_CORES
     for edge in plan.stream_edges:
@@ -263,7 +310,7 @@ def process_load(process: object, plan: ProcessPlan, fps: float = 30.0) -> Load:
         if isinstance(format, VideoFormat) and format.codec != "rawvideo":
             scale = _pixel_scale(format, fps)
             if format.codec.endswith(("_nvenc", "_qsv", "_vaapi")):
-                jobs += 1
+                encodes += 1
                 cores += _GPU_ENCODE_CORES
             else:
                 cores += _ENCODE_CORES.get(format.codec, 1.0) * scale
@@ -273,13 +320,11 @@ def process_load(process: object, plan: ProcessPlan, fps: float = 30.0) -> Load:
         codec = unit.options.get("video_codec")
         if isinstance(codec, str) and codec:
             if codec.endswith(("_nvenc", "_qsv", "_vaapi")):
-                jobs += 1
+                encodes += 1
                 cores += _GPU_ENCODE_CORES
             else:
                 cores += _ENCODE_CORES.get(codec, 1.0)
-    if on_gpu and jobs == 0:
-        jobs = 1  # a hwaccel decode or a CUDA filter: one session on the GPU
-    return Load(round(cores, 3), jobs)
+    return Load(round(cores, 3), jobs, encodes, decodes)
 
 
 # -- the groups the hard rules leave
@@ -326,10 +371,7 @@ class _Problem:
     strategy: CostStrategy
 
     def fits(self, total: Load) -> bool:
-        return (
-            total.cores <= self.strategy.capacity + 1e-9
-            and total.gpu_jobs <= self.strategy.gpu_jobs
-        )
+        return _fits(total, self.strategy)
 
     def cost(self, assign: Sequence[int]) -> float:
         return sum(w for (a, b), w in self.weight.items() if assign[a] != assign[b])
@@ -342,6 +384,15 @@ class _Problem:
 
     def feasible(self, assign: Sequence[int]) -> bool:
         return all(self.fits(total) for total in self.totals(assign).values())
+
+
+def _fits(load: Load, strategy: CostStrategy) -> bool:
+    return (
+        load.cores <= strategy.capacity + 1e-9
+        and load.gpu_jobs <= strategy.gpu_jobs
+        and load.encodes <= strategy.encodes
+        and load.decodes <= strategy.decodes
+    )
 
 
 def _problem(plan: ProcessPlan, strategy: CostStrategy) -> _Problem:
@@ -365,13 +416,15 @@ def _problem(plan: ProcessPlan, strategy: CostStrategy) -> _Problem:
             strategy.raw_penalty if raw else 1.0
         )
     for index, load in enumerate(loads):
-        if not (load.cores <= strategy.capacity + 1e-9 and load.gpu_jobs <= strategy.gpu_jobs):
+        if not _fits(load, strategy):
             raise FfrwdError(
                 ErrorCode.PLACEMENT_REFUSED,
                 f"the processes {', '.join(units[index])} must run on one node and need "
-                f"{load.cores:.1f} cores and {load.gpu_jobs} GPU job(s), more than one "
-                f"node holds ({strategy.capacity:.1f} cores, {strategy.gpu_jobs} GPU jobs)",
-                hint="raise gpu_jobs, node_cores or cores",
+                f"{load.cores:.1f} cores, {load.gpu_jobs} GPU job(s), {load.encodes} "
+                f"encode(s) and {load.decodes} decode(s), more than one node holds "
+                f"({strategy.capacity:.1f} cores, {strategy.gpu_jobs} GPU jobs, "
+                f"{strategy.encodes} encodes, {strategy.decodes} decodes)",
+                hint="raise gpu_jobs, encodes, decodes, node_cores or cores",
             )
     return _Problem(units, loads, weight, strategy)
 
@@ -399,11 +452,15 @@ def _greedy(problem: _Problem) -> list[int]:
         totals[node] = totals[node] + problem.load[unit]
         assign[unit] = node
 
-    # GPU work first, packed by branch: each onto the L4 node it is most
-    # connected to that has room.
+    # GPU work first (compute, encodes, decodes), packed by branch: each onto
+    # the L4 node it is most connected to that has room.
     gpu = sorted(
-        (u for u in range(n) if problem.load[u].gpu_jobs),
-        key=lambda u: (-problem.load[u].gpu_jobs, -problem.load[u].cores, u),
+        (u for u in range(n) if problem.load[u].on_gpu),
+        key=lambda u: (
+            -(problem.load[u].gpu_jobs + problem.load[u].encodes + problem.load[u].decodes),
+            -problem.load[u].cores,
+            u,
+        ),
     )
     for unit in gpu:
         best, best_affinity = None, -1.0
@@ -535,6 +592,8 @@ def _row(name: str, plan: ProcessPlan, placement: Placement, fps: float) -> Row:
                 "gpu": node in placement.gpu,
                 "processes": len(members),
                 "gpu_jobs": load.gpu_jobs,
+                "encodes": load.encodes,
+                "decodes": load.decodes,
                 "cores": round(load.cores, 2),
             }
         )
@@ -558,12 +617,9 @@ def report(
     rows: list[Row] = []
     for name in strategies:
         try:
-            if name.startswith("cost") and name != "cost":
-                placement = cost_place(plan, parse_strategy(name))
-            elif name == "cost":
-                placement = cost_place(plan, CostStrategy())
-            else:
-                placement = place(plan, name)  # type: ignore[arg-type]
+            from .placement import place
+
+            placement = place(plan, name)
         except FfrwdError as err:
             rows.append(Row(strategy=f"{name} (refused: {err.message})", nodes=0, gpu_nodes=0,
                             cut_edges=0, cut_mbps=0.0, raw_cuts=0, largest_raw_cut_mbps=0.0))
@@ -576,11 +632,12 @@ def format_rows(title: str, rows: Sequence[Row]) -> str:
     """The rows as a plain table."""
     lines = [title]
     header = f"  {'strategy':<44} {'nodes':>5} {'L4':>3} {'cuts':>5} {'Mbit/s':>8} " \
-             f"{'raw':>4} {'max raw':>8}  per node (processes/gpu jobs/cores)"
+             f"{'raw':>4} {'max raw':>8}  per node (processes/gpu jobs/encodes/cores)"
     lines.append(header)
     for row in rows:
         nodes = "  ".join(
-            f"{'L4' if one['gpu'] else 'cpu'}:{one['processes']}/{one['gpu_jobs']}/{one['cores']}"
+            f"{'L4' if one['gpu'] else 'cpu'}:{one['processes']}/{one['gpu_jobs']}/"
+            f"{one['encodes']}/{one['cores']}"
             for one in row.per_node
         )
         lines.append(
