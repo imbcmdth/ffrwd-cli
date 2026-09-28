@@ -15351,7 +15351,11 @@ class _Lowerer:
                 continue
             lateral = _lateral_parts(current)
             if lateral is not None:
-                found.add(self._laterals[lateral[0]].declared.alias)
+                # By the lateral's own key as well as its alias: views each
+                # writing `LATERAL ... ad` keep one alias, and two laterals
+                # are two sources whatever they are called.
+                key = lateral[0]
+                found.add(f"{self._laterals[key].declared.alias} ({key})")
                 continue
             producer = self.graph.nodes.get(current.partition(":")[0])
             if producer is not None:

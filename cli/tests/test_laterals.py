@@ -463,7 +463,8 @@ _ADS = "COPY (SELECT {select} FROM input('leaf.nut') s, LATERAL play({stream}) a
             "FROM input('leaf.nut') s, LATERAL play(s.data[1]) one, "
             "LATERAL play(s.data[1]) two) TO 'o.mp4'",
             ErrorCode.UNSUPPORTED_SQL,
-            "the group 'switch' reads 'one' in video(feed) and 'two' in audio(feed): "
+            "the group 'switch' reads 'one (play#1)' in video(feed) and "
+            "'two (play#2)' in audio(feed): "
             "each source a group reads is a connection of its own, and each has to "
             "reach the same calls",
         ),
@@ -649,3 +650,26 @@ def test_each_message_starts_one_instance_at_a_time() -> None:
         "width => 640, loud => NULL, channels => 2) ad) TO 'tcp://127.0.0.1:9000' "
         "WITH (format 'nut')"
     )
+
+
+
+# Two views whose laterals share an alias, as a SMART tree written as one
+# script does: two laterals all the same, each on a connection of its own.
+_SAME_ALIAS = """CREATE VIEW prog AS
+  SELECT s.video[1] AS v, s.audio[1] AS a, s.data[1] AS d FROM input('leaf.nut') s;
+CREATE VIEW one AS
+  SELECT video(prog.v, ad.video) AS v, audio(prog.a, ad.audio) AS a
+  FROM prog, LATERAL play(prog.d) ad;
+CREATE VIEW two AS
+  SELECT video(one.v, ad.video) AS v, audio(one.a, ad.audio) AS a
+  FROM one, prog, LATERAL play(prog.d) ad;
+COPY (SELECT two.v, two.a FROM two) TO 'o.mp4'"""
+
+
+def test_laterals_sharing_an_alias_each_feed_a_connection_of_their_own() -> None:
+    plan = _plan(_SAME_ALIAS)
+    assert len(plan.laterals) == 2
+    ports = {edge.port for edge in plan.feeder_edges}
+    assert len(ports) == 2
+    for port in ports:
+        assert len([edge for edge in plan.feeder_edges if edge.port == port]) == 2
