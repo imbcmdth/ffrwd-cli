@@ -10,15 +10,16 @@ naming one is refused before anything starts.
 its graphs and its sidecars' arguments, and answers each one that names such
 a place. It reads what is written, a literal address or a name that can only
 mean a private host; a public name that resolves to a private address is the
-network's to stop, not this check's. A listening input's address is where
-its own socket binds, not a place it reaches, and is left alone.
+network's to stop, not this check's. A listening input's address (``listen``,
+SRT in listener mode, any UDP or RTP input) is where its own socket binds, not
+a place it reaches, and is left alone.
 """
 
 from __future__ import annotations
 
 import ipaddress
 from collections.abc import Iterable, Sequence
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from .ir import Graph
 from .processes import ProcessPlan, SidecarProcess
@@ -93,12 +94,26 @@ def private_destinations(
 
 
 def _listening(graph: Graph) -> set[int]:
-    """The input indexes of `graph` that listen rather than dial."""
-    return {
-        graph.sources[alias]
-        for alias, options in graph.input_options.items()
-        if alias in graph.sources and options.get("listen") in (True, "true", "1", 1)
-    }
+    """The input indexes of `graph` that listen rather than dial: an input
+    given ``listen``, an rtmp one asking ``?listen=1``, SRT in listener mode,
+    and every UDP or RTP input, whose address is the one it binds (or the
+    group it joins)."""
+    found: set[int] = set()
+    for alias, index in graph.sources.items():
+        options = graph.input_options.get(alias, {})
+        if options.get("listen") in (True, "true", "1", 1):
+            found.add(index)
+            continue
+        parts = urlsplit(graph.input_paths[index])
+        scheme = parts.scheme.lower()
+        query = parse_qs(parts.query)
+        if (
+            scheme in ("udp", "rtp")
+            or (scheme == "srt" and "listener" in query.get("mode", []))
+            or (scheme.startswith("rtmp") and "1" in query.get("listen", []))
+        ):
+            found.add(index)
+    return found
 
 
 def _strings(values: Iterable[object]) -> Sequence[str]:

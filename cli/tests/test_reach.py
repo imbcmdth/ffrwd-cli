@@ -73,3 +73,19 @@ def test_a_dialled_private_input_is_named() -> None:
     assert private_destinations(graphs, compiled.plan) == [
         ("srt://10.1.1.1:9000", "10.1.1.1 is a private address")
     ]
+
+
+@pytest.mark.parametrize(
+    "source", ["srt://0.0.0.0:9000?mode=listener", "udp://0.0.0.0:5000", "udp://239.1.1.1:5000"]
+)
+def test_an_input_binding_its_own_address_is_not_a_place_it_reaches(source: str) -> None:
+    compiled = compile_all(
+        f"COPY (SELECT v.video[1] FROM input('{source}', {_SHAPE}) v) "
+        "TO 'rtmp://relay.example.com/live/out' WITH (format 'flv')"
+    )
+    graphs = (
+        list(compiled.graphs)
+        if compiled.plan is None
+        else [process.graph for process in compiled.plan.ffmpeg]
+    )
+    assert private_destinations(graphs, compiled.plan) == []
