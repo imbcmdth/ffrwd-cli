@@ -3948,10 +3948,8 @@ class _Lowerer:
         # Every feeder connection, by the port it is delivered on, in the
         # order they were opened (:meth:`_feed`).
         self._feeds: dict[int, _Connection] = {}
-        # A feeder group's one connection: the FROM items it carries, its
-        # port, and the argument that opened it, for a refusal to point at.
         # A feeder group's connections, one per source it reads: its port and
-        # the argument that opened it.
+        # the argument that opened it, for a refusal to point at.
         self._feeder_groups: dict[tuple[str, frozenset[str]], tuple[int, exp.Expr]] = {}
         # Each run-time lateral a column read reached, by its key
         # (:meth:`_lower_lateral`), and the expression each of its streams was
