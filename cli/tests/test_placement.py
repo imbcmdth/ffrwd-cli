@@ -276,3 +276,22 @@ def test_a_cuda_hwaccel_marks_an_ffmpeg_process_as_needing_a_gpu() -> None:
 
     assert needs_gpu(_ffmpeg("ffmpeg0", "a.mp4", options={"hwaccel": "cuda"}))
     assert not needs_gpu(_ffmpeg("ffmpeg0", "a.mp4"))
+
+
+def test_an_nvenc_encode_onto_an_edge_is_gpu_work() -> None:
+    """An encode feeding a module (a publisher) names its codec on the edge,
+    not on a file: that ffmpeg process computes on a GPU all the same."""
+    plan = ProcessPlan(
+        processes=(_ffmpeg("ffmpeg0", "a.mp4"), _sidecar("sidecar0")),
+        edges=(
+            StreamEdge(
+                source="ffmpeg0",
+                target="sidecar0",
+                ref="v",
+                format=VideoFormat(codec="h264_nvenc"),
+            ),
+        ),
+    )
+    placement = place(plan, "by-hardware")
+    assert placement.gpu == frozenset({placement.nodes["ffmpeg0"]})
+    assert placement.nodes["ffmpeg0"] != placement.nodes["sidecar0"]

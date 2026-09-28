@@ -78,6 +78,7 @@ __all__ = [
     "colocation_groups",
     "cut_key",
     "file_handoffs",
+    "gpu_processes",
     "needs_gpu",
     "pipe_edges",
     "place",
@@ -377,14 +378,29 @@ def place(plan: ProcessPlan, strategy: Strategy = "one") -> Placement:
     for pid in ids:
         root = union.root(pid)
         nodes[pid] = numbered.setdefault(root, len(numbered))
-    gpu = frozenset(nodes[p.id] for p in plan.processes if needs_gpu(p))
+    on_gpu = gpu_processes(plan)
+    gpu = frozenset(nodes[pid] for pid in on_gpu)
     return Placement(nodes=nodes, gpu=gpu)
+
+
+def gpu_processes(plan: ProcessPlan) -> frozenset[str]:
+    """The processes of `plan` that compute on a GPU: each one
+    :func:`needs_gpu` names, and each ffmpeg process encoding onto an edge
+    in an NVIDIA codec (an encode feeding a module, such as a publisher,
+    names its codec on the edge rather than on a file it writes)."""
+    found = {p.id for p in plan.processes if needs_gpu(p)}
+    for edge in plan.stream_edges:
+        codec = getattr(edge.format, "codec", "")
+        if isinstance(codec, str) and codec.endswith(_GPU_CODEC_SUFFIXES):
+            found.add(edge.source)
+    return frozenset(found)
 
 
 def _join_by_hardware(plan: ProcessPlan, union: _Union) -> None:
     """Join the two ends of every edge whose processes run on the same
     class of hardware, so each connected run of one class is one node."""
-    gpu = {p.id: needs_gpu(p) for p in plan.processes}
+    on_gpu = gpu_processes(plan)
+    gpu = {p.id: p.id in on_gpu for p in plan.processes}
     for edge in plan.edges:
         if not isinstance(edge, StreamEdge | RowsEdge | FeederEdge):
             continue
