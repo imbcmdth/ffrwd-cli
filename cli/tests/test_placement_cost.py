@@ -227,3 +227,23 @@ def test_a_group_move_slides_a_cut_that_no_single_move_improves() -> None:
     refined = _refine(problem, start)
     assert [refined[unit[name]] for name in "abcd"] == [0, 1, 1, 1]
     assert problem.cost(refined) < problem.cost(start)
+
+
+@pytest.mark.parametrize(
+    "module",
+    [
+        "/c/release/publish.wasm",
+        "/c/release/subscribe.wasm",
+        "/c/release/switch_video.wasm",
+        "/c/release/switch_audio.wasm",
+        "leaky",
+    ],
+)
+def test_a_region_that_only_passes_packets_on_costs_next_to_nothing(module: str) -> None:
+    from ffrwd.placement_cost import process_load
+
+    light = SidecarProcess(id="s", module=module, node="n")
+    heavy = SidecarProcess(id="h", module="/c/release/detect.wasm", node="n")
+    plan = ProcessPlan(processes=(light, heavy))
+    assert process_load(light, plan).cores == pytest.approx(0.05)
+    assert process_load(heavy, plan).cores == pytest.approx(0.33)

@@ -27,7 +27,9 @@ The load model is an estimate, and a coarse one (:func:`process_load`):
 - a hardware decode likewise, against a decode cap;
 - a software decode of an input half a core;
 - each video filter a fifth of a core at 1080p30, audio next to nothing;
-- a wasm region a third of a core per module; a region binding a model, or
+- a wasm region a third of a core per module, except the ones that only
+  move frames or packets on (ffrwd/moq's publish and subscribe, ffrwd/switch,
+  leaky, a row filter or merge), a twentieth; a region binding a model, or
   a CUDA filter chain, one GPU job (compute).
 
 The defaults are the owner's (2026-09-28), matching an L4 (2 NVENC and 4
@@ -105,6 +107,12 @@ _DECODE_CORES = 0.5
 _FILTER_CORES = 0.2
 _AUDIO_CORES = 0.02
 _REGION_CORES = 0.33
+# Modules that pass coded packets or whole frames on without computing on
+# them, by the name their file (or the host node) goes by: next to nothing.
+_LIGHT_CORES = 0.05
+_LIGHT_MODULES = frozenset(
+    {"publish", "subscribe", "switch_video", "switch_audio", "leaky", "rowfilter", "rowmerge"}
+)
 _MODEL_CORES = 0.5
 # The most groups the exhaustive search tries every partition of.
 _EXHAUSTIVE_LIMIT = 10
@@ -292,8 +300,11 @@ def _bitrate_mbps(value: object) -> float:
 def process_load(process: object, plan: ProcessPlan, fps: float = 30.0) -> Load:
     """The estimated load of one process (see the module's table)."""
     if isinstance(process, SidecarProcess):
-        modules = max(1, len(process.modules) or 1)
-        cores = _REGION_CORES * modules
+        loaded = [binding.path for binding in process.modules] or [process.module]
+        cores = sum(
+            _LIGHT_CORES if _module_name(path) in _LIGHT_MODULES else _REGION_CORES
+            for path in loaded
+        )
         if needs_gpu(process):
             # A model or a gpu grant: compute on the card.
             return Load(cores + (_MODEL_CORES if process.models else 0.0), gpu_jobs=1)
@@ -339,6 +350,13 @@ def process_load(process: object, plan: ProcessPlan, fps: float = 30.0) -> Load:
             else:
                 cores += _ENCODE_CORES.get(codec, 1.0)
     return Load(round(cores, 3), jobs, encodes, decodes)
+
+
+def _module_name(path: str) -> str:
+    """A module's name from its file: ``.../release/publish.wasm`` is
+    ``publish``; a host node (``leaky``) is its own name."""
+    name = path.replace("\\", "/").rsplit("/", 1)[-1]
+    return name[: -len(".wasm")] if name.endswith(".wasm") else name
 
 
 # -- the groups the hard rules leave
