@@ -21,10 +21,12 @@ real ffmpeg, so they must compile against the real ffmpeg's own registry.
 from __future__ import annotations
 
 import functools
+import os
 import warnings
 from collections.abc import Iterable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -169,3 +171,65 @@ def _snapshot_function_surface(
     monkeypatch.setattr(
         mcp_tools, "registry_module", SimpleNamespace(load=_reference_registry)
     )
+
+
+@pytest.fixture(autouse=True)
+def _plans_round_trip(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Every process plan a test builds comes back whole from its JSON.
+
+    A plan is handed to another process as ``to_dict`` written to JSON, and
+    rebuilt with ``from_dict``: what comes back writes the same document, and
+    renders the same argv wherever the original renders at all. Recorded at
+    construction, so every plan the suite builds is checked, not a sample.
+    """
+    import json
+
+    from ffrwd import wasm
+    from ffrwd.errors import FfrwdError
+    from ffrwd.execute import plan_argv
+    from ffrwd.processes import ProcessPlan
+
+    built: list[ProcessPlan] = []
+    original = ProcessPlan.__init__
+
+    def recording(self: ProcessPlan, *args: object, **kwargs: object) -> None:
+        original(self, *args, **kwargs)  # type: ignore[arg-type]
+        built.append(self)
+
+    monkeypatch.setattr(ProcessPlan, "__init__", recording)
+    yield
+    monkeypatch.setattr(ProcessPlan, "__init__", original)
+    for plan in built:
+        written = json.loads(json.dumps(plan.to_dict()))
+        back = ProcessPlan.from_dict(written)
+        assert json.loads(json.dumps(back.to_dict())) == written
+        try:
+            argv = plan_argv(plan, sidecar_argv=wasm.shown_argv)
+        except (FfrwdError, KeyError, StopIteration, ValueError):
+            continue
+        assert plan_argv(back, sidecar_argv=wasm.shown_argv) == argv
+
+
+@pytest.fixture(autouse=True)
+def _split_runs(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Under ``FFRWD_TEST_SPLIT=<placement>``, every plan an exec test runs in
+    this process runs split across nodes instead, each a runner of its own
+    on this machine, placed as the variable names (``per-module``,
+    ``per-process``): the same assertions then hold of a split run. Off by
+    default; the unit tier never reads it.
+    """
+    placement = os.environ.get("FFRWD_TEST_SPLIT")
+    if not placement or request.node.get_closest_marker("exec") is None:
+        return
+    from ffrwd import cli, nodes
+    from ffrwd import placement as placing
+    from ffrwd.execute import execute_plan as original
+
+    strategy = next(one for one in placing.STRATEGIES if one == placement)
+
+    def split_run(plan: Any, **options: Any) -> Any:
+        return nodes.execute_split(plan, placing.place(plan, strategy), **options)
+
+    monkeypatch.setattr(cli, "execute_plan", split_run)
+    if getattr(request.module, "execute_plan", None) is original:
+        monkeypatch.setattr(request.module, "execute_plan", split_run)

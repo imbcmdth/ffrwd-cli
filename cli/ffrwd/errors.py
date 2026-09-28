@@ -39,6 +39,7 @@ class ErrorCode(str, Enum):
     BUFFER_OVERFLOW = "BUFFER_OVERFLOW"  # a run-time edge outgrew its computed bound
     INPUT_NEVER_OPENED = "INPUT_NEVER_OPENED"  # a run-time consumer never opened its end
     STARTUP_DEADLOCK = "STARTUP_DEADLOCK"  # no pipe order lets every process start
+    PLACEMENT_REFUSED = "PLACEMENT_REFUSED"  # a plan placed on nodes this runner cannot carry out
     INTERNAL = "INTERNAL"  # bug backstop; fuzz asserts this never fires
 
 

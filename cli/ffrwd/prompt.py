@@ -1723,6 +1723,7 @@ NOT_REPAIRABLE: frozenset[ErrorCode] = frozenset(
         ErrorCode.INPUT_NEVER_OPENED,
         ErrorCode.NOTHING_TO_SHOW,
         ErrorCode.OUTPUT_EXISTS,
+        ErrorCode.PLACEMENT_REFUSED,
         ErrorCode.PLAYER_NOT_FOUND,
         ErrorCode.RUNTIME_NOT_FOUND,
         ErrorCode.UNKNOWN_RECIPE,

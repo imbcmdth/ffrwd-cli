@@ -189,6 +189,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from importlib import metadata
 from pathlib import Path
+from typing import Any
 
 from . import binaries, credentials, diagram, loudnorm, nn, redact, remote, show, store, wasm
 from . import packages as packages_module
@@ -302,6 +303,14 @@ _SUBCOMMANDS = frozenset(
 )
 
 
+# The hidden command a node's runner is started as.
+_NODE_COMMAND = "node"
+
+# Where a plan runs: here, as one node, or split across several nodes that
+# are each a subprocess of this one, their cut edges over loopback TCP.
+_TARGETS = ("local", "split-local")
+
+
 def _version() -> str:
     return metadata.version("ffrwd")
 
@@ -315,6 +324,12 @@ def main(argv: list[str] | None = None) -> int:
     if argv and argv[0] in ("--version", "-V"):
         print(f"ffrwd {_version()}")
         return 0
+    # Hidden: one node's runner of a plan placed on several, started by the
+    # run that places it (`ffrwd.nodes`). Not a command anyone types.
+    if argv and argv[0] == _NODE_COMMAND:
+        from . import nodes
+
+        return nodes.agent_main(argv[1:])
     if not argv or argv[0] not in _SUBCOMMANDS:
         argv = ["run", *argv]
 
@@ -447,12 +462,23 @@ def _check_wait(args: argparse.Namespace) -> int:
     return 2
 
 
+def _check_target(args: argparse.Namespace) -> int:
+    """0 unless a split target was asked of a remote run, which places its
+    own; 2 with the usage error printed."""
+    if getattr(args, "target", "local") == "local" or not args.remote:
+        return 0
+    print(f"error: {args.command}: --target is for a run on this machine", file=sys.stderr)
+    print("hint: drop --target, or drop --remote", file=sys.stderr)
+    return 2
+
+
 def _check_jobs_id(args: argparse.Namespace) -> int:
     """0 when a positional job ID does not collide with --watch/--cancel/
     --fetch -- each of those already names its own ID -- or 2 with the usage
     error printed."""
     job_id = getattr(args, "id", None)
-    if job_id is None or not (args.watch or args.cancel is not None or args.fetch is not None):
+    named = (args.cancel, getattr(args, "stop", None), args.fetch)
+    if job_id is None or not (args.watch or any(one is not None for one in named)):
         return 0
     print(
         f"error: {args.command}: an ID does not mix with --watch/--cancel/--fetch",
@@ -561,6 +587,19 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="submit the run to the hosted runner instead of executing ffmpeg here",
     )
+    # Hidden while live hosted runs are open to flagged accounts only: submit
+    # the run as a live job, for a live source the query's text does not show
+    # (a module's), which --remote otherwise finds for itself.
+    run_p.add_argument("--live", action="store_true", help=argparse.SUPPRESS)
+    # Hidden, for development: run a plan placed across several nodes, each
+    # a runner of its own on this machine, and how to place it.
+    run_p.add_argument("--target", choices=_TARGETS, default="local", help=argparse.SUPPRESS)
+    run_p.add_argument(
+        "--placement",
+        choices=("one", "per-module", "by-hardware", "per-process"),
+        default="per-module",
+        help=argparse.SUPPRESS,
+    )
     run_p.add_argument(
         "--wait",
         action="store_true",
@@ -599,6 +638,9 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="ask for a job's cancellation (a unique id prefix works)",
     )
+    # Hidden with --live: end a live job the way Ctrl-C ends a local run, its
+    # outputs finished, where --cancel stops it where it is.
+    jobs_mode.add_argument("--stop", metavar="ID", default=None, help=argparse.SUPPRESS)
     jobs_mode.add_argument(
         "--fetch",
         metavar="ID",
@@ -1570,6 +1612,9 @@ def _cmd_run(args: argparse.Namespace, on_warning: OnWarning) -> int:
     code = _check_wait(args)
     if code != 0:
         return code
+    code = _check_target(args)
+    if code != 0:
+        return code
     try:
         query, packages, code = _resolve_query(args)
         if query is None:
@@ -1828,20 +1873,28 @@ def _run_plan(
     owner = query.owner if query is not None else None
     dump = os.environ.get("FFRWD_DUMP_STDERR")
     try:
-        result = execute_plan(
-            plan,
-            sidecar_argv=functools.partial(wasm.sidecar_argv, jobs=args.jobs),
-            timeout=timeout,
-            overwrite=args.overwrite,
-            echo=_echo_member if _verbose(args) else None,
-            players=players,
-            show_only=args.show_only,
-            work=work,
-            compile_instance=lambda text, unset: compile_instance(
+        # What a run takes, whether this machine runs every process of it or
+        # it is placed on several nodes.
+        options: dict[str, Any] = {
+            "sidecar_argv": functools.partial(wasm.sidecar_argv, jobs=args.jobs),
+            "timeout": timeout,
+            "overwrite": args.overwrite,
+            "echo": _echo_member if _verbose(args) else None,
+            "players": players,
+            "show_only": args.show_only,
+            "work": work,
+            "compile_instance": lambda text, unset: compile_instance(
                 text, packages=packages, owner=owner, unset=unset
             ),
-            dump=Path(dump) if dump else None,
-        )
+            "dump": Path(dump) if dump else None,
+        }
+        if getattr(args, "target", "local") == "split-local":
+            from . import nodes, placement
+
+            placed = placement.place(plan, args.placement)
+            result = nodes.execute_split(plan, placed, jobs=args.jobs, **options)
+        else:
+            result = execute_plan(plan, **options)
     except FfrwdError as err:
         # Rendering the argv or spawning a stage, not the query text:
         # `compile` prints the same refusal through `render_plan`.
@@ -1857,10 +1910,21 @@ def _run_plan(
         print(f"error: the pipeline timed out after {timeout}s", file=sys.stderr)
         return 1
     if result.exit_code != 0:
+        # A node whose runner went away took every member it ran along: one
+        # line names the node and them, since none of them said anything.
+        lost: dict[int | None, list[str]] = {}
         for member in result.failures:
+            if member.lost:
+                lost.setdefault(member.node, []).append(member.id)
+                continue
             print(member.stderr_tail, file=sys.stderr)
             print(
                 _member_error(member, _member_writes(plan, member.id)),
+                file=sys.stderr,
+            )
+        for node, ran in lost.items():
+            print(
+                f"error: the runner of node {node} ended while it ran {_names(ran)}",
                 file=sys.stderr,
             )
         for member in result.consequences:
@@ -1892,7 +1956,13 @@ def _member_error(member: ProcessResult, writes: Sequence[str] = ()) -> str:
         if member.exit_code == 0
         else f"exited with code {member.exit_code}"
     )
-    return f"error: {member.id} {ended}{where}\n  {member.command}"
+    name = member.id if member.node is None else f"{member.id} on node {member.node}"
+    return f"error: {name} {ended}{where}\n  {member.command}"
+
+
+def _names(names: Sequence[str]) -> str:
+    """``a``, ``a and b``, ``a, b and c``."""
+    return names[0] if len(names) == 1 else f"{', '.join(names[:-1])} and {names[-1]}"
 
 
 def _member_writes(plan: ProcessPlan, member: str) -> list[str]:

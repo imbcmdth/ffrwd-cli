@@ -773,6 +773,18 @@ error: INPUT_NEVER_OPENED: the pipe carrying 'cues' from sidecar0 to ffmpeg0 has
 
 The message walks the cycle in the order the processes wait, so the way out is visible from it: break the query where two of the named processes meet. The anchor is the module declaration that put a second process in the plan.
 
+## PLACEMENT_REFUSED
+
+**Meaning:** A run-time code. A plan placed across several nodes (the hidden `ffrwd run --target split-local`) asks for something the runner cannot carry out between nodes, and nothing is started.
+
+**Fires when:** a placement parts processes that must share a machine (a feeder's writer and the modules listening on its loopback port), puts two processes that hand each other a file (a later stage's input, a rows document, a two-pass log) on different nodes, puts a `--show` window on a node other than node 0, or names a placement that does not exist.
+
+**Error text** (printed to stderr by `ffrwd run`, not as JSON):
+
+```
+error: PLACEMENT_REFUSED: the placement splits a feeder connection: ffmpeg2 on node 0, sidecar1 on node 1 (hint: a feeder's writer and the modules listening on its loopback port run on one machine; place them on one node)
+```
+
 ## INTERNAL
 
 **Bug backstop, not a user-input error.** Every compiler pass (`parse`, `lower`, `insert_splits`, via `compile_sql`) wraps its body in a catch-all that converts any unexpected exception (a sqlglot internal, a `RecursionError` on a pathologically nested query, or an actual bug in ffrwd) into `ErrorCode.INTERNAL` rather than letting a raw traceback escape (guardrail #7: no panics on user input, ever). The fuzz corpus in `tests/test_fuzz.py` asserts this code never fires across its mutated queries. If you see `INTERNAL` in the wild, ffrwd has a bug, and we would genuinely like the query that triggered it. No example JSON here, because no known SQL input reaches this path, and we intend to keep it that way.

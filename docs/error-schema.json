@@ -45,6 +45,7 @@
         "BUFFER_OVERFLOW",
         "INPUT_NEVER_OPENED",
         "STARTUP_DEADLOCK",
+        "PLACEMENT_REFUSED",
         "INTERNAL"
       ]
     },

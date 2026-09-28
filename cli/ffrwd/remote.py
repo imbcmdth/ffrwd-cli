@@ -72,7 +72,7 @@ from ffrwd import __version__, credentials, store
 from ffrwd import packages as packages_module
 from ffrwd.console import Announce, Console, Progress, written_size
 from ffrwd.errors import ErrorCode, FfrwdError
-from ffrwd.parser import copy_destinations, input_specs
+from ffrwd.parser import copy_destinations, input_options, input_specs
 from ffrwd.probe import is_url, probe
 from ffrwd.project import (
     LOCKFILE_NAME,
@@ -189,6 +189,30 @@ def _check_bounded(text: str) -> None:
                 line=spec.line,
                 col=spec.col,
             )
+
+
+# The schemes that name a socket a live source arrives on, rather than a
+# document with an end.
+_LIVE_SCHEMES = frozenset({"rtmp", "rtmps", "srt", "udp", "rtp", "rtsp", "rtsps", "tcp"})
+# The input options only a live source is given.
+_LIVE_OPTIONS = frozenset({"listen", "shape", "realtime"})
+
+
+def is_live_submission(text: str, asked: bool) -> bool:
+    """Whether `text` is submitted as a live job: `asked` (``--live``), an
+    input on a socket scheme, or one given an option only a live source
+    takes. Syntactic: nothing is probed, since a listener's address is the
+    runner's to open and this machine's to leave alone. The runner's compile
+    has the last word, and refuses a live plan submitted as a bounded one.
+    """
+    if asked:
+        return True
+    for options in input_options(text):
+        path = options.get("")
+        scheme = path.partition("://")[0].lower() if isinstance(path, str) else ""
+        if scheme in _LIVE_SCHEMES or _LIVE_OPTIONS & set(options):
+            return True
+    return False
 
 
 def _jobs_url() -> str:
@@ -430,7 +454,9 @@ def submit_run(
     token = _token()
     text = query.text
     inputs, uploads = _inputs(text)
-    _check_bounded(text)
+    live = is_live_submission(text, bool(getattr(args, "live", False)))
+    if not live:
+        _check_bounded(text)
     lock, archives = _lock(packages)
 
     spec: dict[str, object] = {
@@ -454,6 +480,9 @@ def submit_run(
         "timeout_s": args.timeout,
         "client_version": __version__,
     }
+    if live:
+        # Only when set: a bounded job's spec reads as it always has.
+        spec["live"] = True
     if detail is not None:
         detail("submitting the job")
     where = _jobs_url()
@@ -975,6 +1004,9 @@ def jobs_command(
     token = _token()
     if args.cancel is not None:
         return _cancel(token, str(args.cancel))
+    stop = getattr(args, "stop", None)
+    if stop is not None:
+        return _stop(token, str(stop))
     if args.fetch is not None:
         _fetch(
             token,
@@ -1275,6 +1307,20 @@ def _cancel(token: str, written: str) -> int:
             f"asked to cancel {job_id[:8]}; it is {state} and stops at the "
             "runner's next heartbeat"
         )
+    return 0
+
+
+def _stop(token: str, written: str) -> int:
+    """Ask a live job to end as Ctrl-C ends a local run: its readers stop,
+    and what they read is finished into its outputs."""
+    job_id = _resolve_id(token, written)
+    where = f"{_jobs_url()}/{job_id}/stop"
+    row = _json_object(_call(where, headers=_bearer(token), data=b"{}"), where)
+    state = _text(row, "state")
+    if state in _ACTIVE_STATES:
+        print(f"asked {job_id[:8]} to stop; it finishes its outputs, then ends")
+    else:
+        print(f"{job_id[:8]} is {state}")
     return 0
 
 

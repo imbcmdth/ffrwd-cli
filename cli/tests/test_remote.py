@@ -470,6 +470,8 @@ def test_submit_posts_the_spec_puts_the_file_and_queues_the_job(
         "outputs": ["out.mp4"],
         "timeout_s": 120.0,
         "client_version": ffrwd.__version__,
+        # An rtmp input is a socket, which makes the job a live one.
+        "live": True,
     }
     # The bytes go to the URL the answer signed for the input's index.
     put = served.request_to(_put_url(0))
@@ -2318,3 +2320,72 @@ def test_run_remote_interrupted_during_submit_prints_interrupted_and_exits_130(
     err = capsys.readouterr().err
     assert code == 130
     assert err.rstrip().endswith("interrupted")
+
+
+# ---------------------------------------------------------------------------
+# live submissions
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "COPY (SELECT a.video[1] FROM input('rtmp://0.0.0.0:1935/in', listen => true) a) "
+        "TO 'rtmp://relay/out'",
+        "COPY (SELECT a.video[1] FROM input('srt://relay:9000') a) TO 'out.mkv'",
+        "COPY (SELECT a.video[1] FROM input('https://cdn/live.m3u8', "
+        "shape => STRUCT(1280 AS width, 720 AS height, 30 AS fps)) a) TO 'out.mkv'",
+        "COPY (SELECT a.video[1] FROM input('in.mp4', realtime => true) a) TO 'out.mkv'",
+    ],
+    ids=["listener", "socket-scheme", "shaped", "realtime"],
+)
+def test_an_input_only_a_live_source_has_marks_the_submission_live(text: str) -> None:
+    assert remote.is_live_submission(text, asked=False)
+
+
+def test_a_file_or_a_plain_url_is_not_live_unless_asked() -> None:
+    assert not remote.is_live_submission(MEDIA_QUERY, asked=False)
+    plain = "COPY (SELECT a.video[1] FROM input('https://cdn/v.mp4') a) TO 'out.mkv'"
+    assert not remote.is_live_submission(plain, asked=False)
+    assert remote.is_live_submission(MEDIA_QUERY, asked=True)
+
+
+def test_a_live_submission_says_so_and_probes_nothing(
+    served: _Served, logged_in: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "in.mp4").write_bytes(b"x")
+    _submit_accepted(served, 0)
+    # Unbounded to this machine's probe, and asked for as live: not refused.
+    served.probes["in.mp4"] = ProbeResult(streams=[], duration=None)
+    remote.submit_run(_query(MEDIA_QUERY), None, _run_args(live=True))
+    _headers, body = served.sent_to(JOBS_URL)
+    assert body is not None
+    assert json.loads(body)["live"] is True
+
+
+def test_a_bounded_submission_carries_no_live_key(
+    served: _Served, logged_in: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "in.mp4").write_bytes(b"x")
+    _submit_accepted(served, 0)
+    served.probes["in.mp4"] = ProbeResult(streams=[], duration=12.5)
+    remote.submit_run(_query(MEDIA_QUERY), None, _run_args())
+    _headers, body = served.sent_to(JOBS_URL)
+    assert body is not None
+    assert "live" not in json.loads(body)
+
+
+def test_stop_asks_a_live_job_to_finish_its_outputs(
+    served: _Served, logged_in: None, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _listing(served, ROW_DONE, ROW_OLD)
+    stop_url = f"{JOBS_URL}/{ROW_OLD['id']}/stop"
+    served.answers[stop_url] = json.dumps(dict(ROW_OLD, state="running")).encode("utf-8")
+    code = cli.main(["jobs", "--stop", "bbbb"])
+    assert code == 0
+    assert "asked bbbb2222 to stop; it finishes its outputs, then ends" in capsys.readouterr().out
+    headers, body = served.sent_to(stop_url)
+    assert headers["authorization"] == f"Bearer {TOKEN}"
+    assert body == b"{}"

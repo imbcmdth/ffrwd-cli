@@ -133,6 +133,7 @@ from .ir import (
     RowsSink,
     SinkUnit,
     StreamType,
+    _parse_stream_type,
     feeder_path,
     feeder_port,
     is_src,
@@ -376,6 +377,79 @@ _DATA_URI = "data:"
 _PIPED_TYPES: frozenset[StreamType] = frozenset({"video", "audio", "data"})
 
 
+# ---------------------------------------------------------------- reading back
+
+# What each `from_dict` below reads: a plan written by `to_dict` and carried as
+# JSON, so a plan can be handed to another process whole. A value of the wrong
+# kind is a plan this version did not write, and is refused by name.
+
+
+def _malformed(key: str, want: str) -> ValueError:
+    return ValueError(f"a process plan's '{key}' is not {want}")
+
+
+def _read_text(d: Mapping[str, object], key: str, default: str | None = None) -> str:
+    value = d.get(key, default)
+    if not isinstance(value, str):
+        raise _malformed(key, "text")
+    return value
+
+
+def _read_maybe_text(d: Mapping[str, object], key: str) -> str | None:
+    value = d.get(key)
+    if value is not None and not isinstance(value, str):
+        raise _malformed(key, "text")
+    return value
+
+
+def _read_whole(d: Mapping[str, object], key: str, default: int | None = None) -> int:
+    value = d.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise _malformed(key, "a whole number")
+    return value
+
+
+def _read_maybe_whole(d: Mapping[str, object], key: str) -> int | None:
+    value = d.get(key)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise _malformed(key, "a whole number")
+    return value
+
+
+def _read_list(d: Mapping[str, object], key: str) -> list[object]:
+    value = d.get(key, [])
+    if not isinstance(value, list):
+        raise _malformed(key, "a list")
+    return value
+
+
+def _read_objects(d: Mapping[str, object], key: str) -> list[dict[str, object]]:
+    found = _read_list(d, key)
+    if not all(isinstance(one, dict) for one in found):
+        raise _malformed(key, "a list of objects")
+    return [dict(one) for one in found if isinstance(one, dict)]
+
+
+def _read_object(d: Mapping[str, object], key: str) -> dict[str, object]:
+    value = d.get(key, {})
+    if not isinstance(value, dict):
+        raise _malformed(key, "an object")
+    return {str(k): v for k, v in value.items()}
+
+
+def _read_pairs(d: Mapping[str, object], key: str) -> tuple[tuple[str, object], ...]:
+    return tuple(_read_object(d, key).items())
+
+
+def _read_stream_type(value: object) -> StreamType:
+    try:
+        return _parse_stream_type(value)
+    except ValueError as err:
+        raise _malformed("outputs", "a list of stream types") from err
+
+
 # ---------------------------------------------------------------- formats
 
 
@@ -421,6 +495,18 @@ class VideoFormat:
             written["options"] = dict(self.options)
         return written
 
+    @classmethod
+    def from_dict(cls, d: Mapping[str, object]) -> VideoFormat:
+        return cls(
+            pix_fmt=_read_text(d, "pix_fmt"),
+            width=_read_maybe_whole(d, "width"),
+            height=_read_maybe_whole(d, "height"),
+            timebase=_read_maybe_text(d, "timebase"),
+            container=_read_text(d, "container", NUT),
+            codec=_read_text(d, "codec", RAWVIDEO),
+            options=_read_pairs(d, "options"),
+        )
+
 
 @dataclass(frozen=True)
 class AudioFormat:
@@ -462,6 +548,18 @@ class AudioFormat:
             written["required_channels"] = self.required_channels
         return written
 
+    @classmethod
+    def from_dict(cls, d: Mapping[str, object]) -> AudioFormat:
+        return cls(
+            rate=_read_maybe_whole(d, "rate"),
+            channels=_read_maybe_whole(d, "channels"),
+            container=_read_text(d, "container", NUT),
+            codec=_read_text(d, "codec", PCM_F32LE),
+            required_rate=_read_maybe_whole(d, "required_rate"),
+            required_channels=_read_maybe_whole(d, "required_channels"),
+            options=_read_pairs(d, "options"),
+        )
+
 
 @dataclass(frozen=True)
 class DataFormat:
@@ -478,8 +576,25 @@ class DataFormat:
     def to_dict(self) -> dict[str, object]:
         return {"container": self.container, "codec": self.codec}
 
+    @classmethod
+    def from_dict(cls, d: Mapping[str, object]) -> DataFormat:
+        return cls(
+            container=_read_text(d, "container", NUT), codec=_read_text(d, "codec", JSON_CODEC)
+        )
+
 
 StreamFormat = VideoFormat | AudioFormat | DataFormat
+
+
+def stream_format(d: Mapping[str, object]) -> StreamFormat:
+    """The wire format `d` was written from: a picture's names a pixel format,
+    a sound's a sample rate, and a data stream's neither."""
+    if "pix_fmt" in d:
+        return VideoFormat.from_dict(d)
+    if "rate" in d:
+        return AudioFormat.from_dict(d)
+    return DataFormat.from_dict(d)
+
 
 # A media artifact, or rows -- one JSON object per line.
 FileContent = Literal["media", "rows"]
@@ -502,6 +617,16 @@ class FileFormat:
 
     def to_dict(self) -> dict[str, object]:
         return {"content": self.content, "path": self.path}
+
+    @classmethod
+    def from_dict(cls, d: Mapping[str, object]) -> FileFormat:
+        content = d.get("content", "media")
+        if content not in ("media", "rows"):
+            raise _malformed("content", "media or rows")
+        return cls(
+            content="rows" if content == "rows" else "media",
+            path=_read_maybe_text(d, "path"),
+        )
 
 
 # ---------------------------------------------------------------- edges
@@ -529,6 +654,18 @@ class EdgeBuffer:
         else:
             written["packets"] = self.packets
         return written
+
+    @classmethod
+    def from_dict(cls, d: Mapping[str, object]) -> EdgeBuffer:
+        road = d.get("road")
+        if road not in ("pipe", "fifo"):
+            raise _malformed("road", "pipe or fifo")
+        return cls(
+            road="pipe" if road == "pipe" else "fifo",
+            frames=_read_whole(d, "frames"),
+            size=_read_whole(d, "size", 0),
+            packets=_read_whole(d, "packets", 0),
+        )
 
 
 @dataclass(frozen=True)
@@ -582,6 +719,20 @@ class StreamEdge:
             written["live"] = True
         return written
 
+    @classmethod
+    def from_dict(cls, d: Mapping[str, object]) -> StreamEdge:
+        buffer = d.get("buffer")
+        return cls(
+            source=_read_text(d, "source"),
+            target=_read_text(d, "target"),
+            ref=_read_text(d, "ref"),
+            format=stream_format(_read_object(d, "format")),
+            annotations=d.get("annotations") is True,
+            bound=_read_whole(d, "bound", 0),
+            buffer=None if buffer is None else EdgeBuffer.from_dict(_read_object(d, "buffer")),
+            live=d.get("live") is True,
+        )
+
 
 @dataclass(frozen=True)
 class FileEdge:
@@ -598,6 +749,14 @@ class FileEdge:
             "target": self.target,
             "format": self.format.to_dict(),
         }
+
+    @classmethod
+    def from_dict(cls, d: Mapping[str, object]) -> FileEdge:
+        return cls(
+            source=_read_text(d, "source"),
+            target=_read_text(d, "target"),
+            format=FileFormat.from_dict(_read_object(d, "format")),
+        )
 
 
 @dataclass(frozen=True)
@@ -622,6 +781,15 @@ class RowsEdge:
             "alias": self.alias,
             "container": self.container,
         }
+
+    @classmethod
+    def from_dict(cls, d: Mapping[str, object]) -> RowsEdge:
+        return cls(
+            source=_read_text(d, "source"),
+            target=_read_text(d, "target"),
+            alias=_read_text(d, "alias"),
+            container=_read_text(d, "container"),
+        )
 
 
 @dataclass(frozen=True)
@@ -654,8 +822,31 @@ class FeederEdge:
             "calls": [call.to_dict() for call in self.calls],
         }
 
+    @classmethod
+    def from_dict(cls, d: Mapping[str, object]) -> FeederEdge:
+        return cls(
+            source=_read_text(d, "source"),
+            target=_read_text(d, "target"),
+            port=_read_whole(d, "port"),
+            calls=tuple(FeederCall.from_dict(call) for call in _read_objects(d, "calls")),
+        )
+
 
 Edge = StreamEdge | FileEdge | RowsEdge | FeederEdge
+
+
+def edge_from_dict(d: Mapping[str, object]) -> Edge:
+    """One edge as `to_dict` wrote it, by its `kind`."""
+    kind = d.get("kind")
+    if kind == "stream":
+        return StreamEdge.from_dict(d)
+    if kind == "file":
+        return FileEdge.from_dict(d)
+    if kind == "rows":
+        return RowsEdge.from_dict(d)
+    if kind == "feeder":
+        return FeederEdge.from_dict(d)
+    raise _malformed("kind", "stream, file, rows or feeder")
 
 
 # ---------------------------------------------------------------- processes
@@ -676,6 +867,10 @@ class FfmpegProcess:
 
     def to_dict(self) -> dict[str, object]:
         return {"id": self.id, "kind": "ffmpeg", "graph": self.graph.to_dict()}
+
+    @classmethod
+    def from_dict(cls, d: Mapping[str, object]) -> FfmpegProcess:
+        return cls(id=_read_text(d, "id"), graph=Graph.from_dict(_read_object(d, "graph")))
 
 
 @dataclass(frozen=True)
@@ -712,6 +907,10 @@ class ModuleBinding:
     def to_dict(self) -> dict[str, object]:
         return {"name": self.name, "path": self.path}
 
+    @classmethod
+    def from_dict(cls, d: Mapping[str, object]) -> ModuleBinding:
+        return cls(name=_read_text(d, "name"), path=_read_text(d, "path"))
+
 
 @dataclass(frozen=True)
 class RowsModule:
@@ -729,6 +928,10 @@ class RowsModule:
 
     def to_dict(self) -> dict[str, object]:
         return {"path": self.path, "source": self.source}
+
+    @classmethod
+    def from_dict(cls, d: Mapping[str, object]) -> RowsModule:
+        return cls(path=_read_text(d, "path"), source=_read_whole(d, "source"))
 
 
 @dataclass(frozen=True)
@@ -751,6 +954,14 @@ class RowsDocument:
             written["source"] = self.source
         return written
 
+    @classmethod
+    def from_dict(cls, d: Mapping[str, object]) -> RowsDocument:
+        return cls(
+            sink=RowsSink.from_dict(_read_object(d, "sink")),
+            node=_read_text(d, "node"),
+            source=_read_maybe_whole(d, "source"),
+        )
+
 
 @dataclass(frozen=True)
 class ModelBinding:
@@ -772,6 +983,14 @@ class ModelBinding:
             written["not_on"] = list(self.not_on)
         return written
 
+    @classmethod
+    def from_dict(cls, d: Mapping[str, object]) -> ModelBinding:
+        return cls(
+            name=_read_text(d, "name"),
+            path=_read_text(d, "path"),
+            not_on=tuple(str(one) for one in _read_list(d, "not_on")),
+        )
+
 
 @dataclass(frozen=True)
 class EffectGrant:
@@ -789,6 +1008,10 @@ class EffectGrant:
 
     def to_dict(self) -> dict[str, object]:
         return {"effect": self.effect, "module": self.module}
+
+    @classmethod
+    def from_dict(cls, d: Mapping[str, object]) -> EffectGrant:
+        return cls(effect=_read_text(d, "effect"), module=_read_text(d, "module"))
 
 
 @dataclass(frozen=True)
@@ -859,6 +1082,10 @@ class RowsRead:
 
     def to_dict(self) -> dict[str, object]:
         return {"arg": self.arg, "path": self.path}
+
+    @classmethod
+    def from_dict(cls, d: Mapping[str, object]) -> RowsRead:
+        return cls(arg=_read_text(d, "arg"), path=_read_text(d, "path"))
 
 
 @dataclass(frozen=True)
@@ -1044,8 +1271,62 @@ class SidecarProcess:
             written["graph"] = self.graph.to_dict()
         return written
 
+    @classmethod
+    def from_dict(cls, d: Mapping[str, object]) -> SidecarProcess:
+        """A region as :meth:`to_dict` wrote it. Its graph is written only for
+        a region spelled as a network, which is the only argv that reads it."""
+        graph = d.get("graph")
+        return cls(
+            id=_read_text(d, "id"),
+            module=_read_text(d, "module"),
+            node=_read_text(d, "node"),
+            args=_read_object(d, "args"),
+            inputs=tuple(str(ref) for ref in _read_list(d, "inputs")),
+            outputs=tuple(_read_stream_type(kind) for kind in _read_list(d, "outputs")),
+            reads_rows=d.get("reads_rows") is True,
+            writes_rows=d.get("writes_rows") is True,
+            graph=None if graph is None else Graph.from_dict(_read_object(d, "graph")),
+            modules=tuple(ModuleBinding.from_dict(one) for one in _read_objects(d, "modules")),
+            models=tuple(ModelBinding.from_dict(one) for one in _read_objects(d, "models")),
+            grants=tuple(EffectGrant.from_dict(one) for one in _read_objects(d, "grants")),
+            lookahead=_read_whole(d, "lookahead", 0),
+            rows=tuple(RowsDocument.from_dict(one) for one in _read_objects(d, "rows")),
+            impure=tuple(str(name) for name in _read_list(d, "impure")),
+            pads=tuple(
+                PadMeta.from_dict(pad) if isinstance(pad, dict) else None
+                for pad in _read_list(d, "pads")
+            ),
+            sink=d.get("sink") is True,
+            packet_sink=d.get("packet_sink") is True,
+            packet_filter=d.get("packet_filter") is True,
+            rows_in=tuple(RowsRead.from_dict(one) for one in _read_objects(d, "rows_in")),
+            packet_source=d.get("packet_source") is True,
+            tracks=tuple(
+                track
+                for track in _read_list(d, "tracks")
+                if isinstance(track, int) and not isinstance(track, bool)
+            ),
+            rows_modules=tuple(
+                RowsModule.from_dict(one) for one in _read_objects(d, "rows_modules")
+            ),
+            data_filter=d.get("data_filter") is True,
+            codec=_read_text(d, "codec", ""),
+            frame_rate=_read_text(d, "frame_rate", ""),
+            color=tuple((flag, str(value)) for flag, value in _read_pairs(d, "color")),
+        )
+
 
 Process = FfmpegProcess | SidecarProcess
+
+
+def process_from_dict(d: Mapping[str, object]) -> Process:
+    """One process as `to_dict` wrote it, by its `kind`."""
+    kind = d.get("kind")
+    if kind == "ffmpeg":
+        return FfmpegProcess.from_dict(d)
+    if kind == "sidecar":
+        return SidecarProcess.from_dict(d)
+    raise _malformed("kind", "ffmpeg or sidecar")
 
 
 @dataclass(frozen=True)
@@ -1057,6 +1338,13 @@ class Stage:
 
     def to_dict(self) -> dict[str, object]:
         return {"index": self.index, "processes": list(self.processes)}
+
+    @classmethod
+    def from_dict(cls, d: Mapping[str, object]) -> Stage:
+        return cls(
+            index=_read_whole(d, "index"),
+            processes=tuple(str(pid) for pid in _read_list(d, "processes")),
+        )
 
 
 @dataclass(frozen=True)
@@ -1124,6 +1412,16 @@ class ProcessPlan:
         if self.laterals:
             d["laterals"] = [lateral.to_dict() for lateral in self.laterals]
         return d
+
+    @classmethod
+    def from_dict(cls, d: Mapping[str, object]) -> ProcessPlan:
+        """The plan :meth:`to_dict` wrote. Its stages are derived, as they
+        always are, so the ones written are not read back."""
+        return cls(
+            processes=tuple(process_from_dict(one) for one in _read_objects(d, "processes")),
+            edges=tuple(edge_from_dict(one) for one in _read_objects(d, "edges")),
+            laterals=tuple(Lateral.from_dict(one) for one in _read_objects(d, "laterals")),
+        )
 
 
 # ---------------------------------------------------------------- marking
