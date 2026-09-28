@@ -524,15 +524,37 @@ def test_one_connection_reaches_both_processes_of_its_group() -> None:
     )
 
 
-def test_one_group_fed_by_two_sources_is_refused() -> None:
+def test_one_group_fed_by_two_sources_each_whole_is_a_connection_per_source() -> None:
+    """Two switch pairs, cascaded, each fed by its own input: each pair
+    reads a connection of its own, on its own port, with video and audio."""
+    graph = _lowered(
+        "COPY (SELECT video(video(p.video[1], a.video[1]), b.video[1]) AS v, "
+        "audio(audio(p.audio[1], a.audio[1]), b.audio[1]) AS s "
+        "FROM input('prog.mp4') p, input('ad.mp4') a, input('bd.mp4') b) TO 'out.mp4'"
+    )
+    units = [unit for unit in graph.sinks if unit.path in graph.feeders]
+    assert len(units) == 2
+    for unit in units:
+        assert [o.type for o in unit.outputs] == ["video", "audio"]
+        assert sorted(call.function for call in graph.feeders[unit.path]) == ["audio", "video"]
+    ports = sorted(
+        {graph.nodes[node].args["port"] for node in _module_nodes(graph, VIDEO)}
+    )
+    assert len(ports) == 2 and ports[1] - ports[0] >= 2
+    for node in _module_nodes(graph, AUDIO):
+        assert graph.nodes[node].args["port"] in ports
+
+
+def test_one_group_fed_by_two_sources_each_part_of_it_is_refused() -> None:
     error = _refused(
         "COPY (SELECT video(p.video[1], a.video[1]) AS v, audio(p.audio[1], b.audio[1]) "
         "AS s FROM input('prog.mp4') p, input('ad.mp4') a, input('bd.mp4') b) TO 'out.mp4'"
     )
     assert (error.code, error.message) == (
         ErrorCode.UNSUPPORTED_SQL,
-        "the feeder 'feed' reads 'b', and another feeder of the group 'switch' reads "
-        "'a': the group shares one connection, which carries one source",
+        "the group 'switch' reads 'a' in video(feed) and 'b' in audio(feed): each "
+        "source a group reads is a connection of its own, and each has to reach the "
+        "same calls",
     )
 
 

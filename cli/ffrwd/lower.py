@@ -3950,7 +3950,9 @@ class _Lowerer:
         self._feeds: dict[int, _Connection] = {}
         # A feeder group's one connection: the FROM items it carries, its
         # port, and the argument that opened it, for a refusal to point at.
-        self._feeder_groups: dict[str, tuple[frozenset[str], int, exp.Expr]] = {}
+        # A feeder group's connections, one per source it reads: its port and
+        # the argument that opened it.
+        self._feeder_groups: dict[tuple[str, frozenset[str]], tuple[int, exp.Expr]] = {}
         # Each run-time lateral a column read reached, by its key
         # (:meth:`_lower_lateral`), and the expression each of its streams was
         # last read as, for a refusal to quote.
@@ -4294,6 +4296,7 @@ class _Lowerer:
                     attachments=list(self.attachments),
                 )
             ]
+        self._check_feeder_groups()
         self._place_feeders()
         self._place_laterals()
         self._insert_decoders()
@@ -15360,32 +15363,61 @@ class _Lowerer:
     def _feeder_port(self, fed: _Fed, select: exp.Select) -> int:
         """The port the stream in one feeder's place is delivered on.
 
-        A feeder naming no group has a connection of its own. Every feeder
-        naming one shares ONE connection, which carries one source: a stream
-        read off any other is refused.
+        A feeder naming no group has a connection of its own. The feeders of
+        a group share one connection per source they read: every call of
+        the group fed off one FROM item reads that item's connection, and a
+        group fed off two (two run-time laterals, each playing into its own
+        switches) has two, each on a port of its own. That every connection
+        of a group reaches the same calls is checked once lowering is done
+        (:meth:`_check_feeder_groups`).
         """
         group = fed.feeder.group
         if not group:
             return self._open_feed()
-        found = self._feeder_groups.get(group)
+        key = (group, fed.sources)
+        found = self._feeder_groups.get(key)
         if found is None:
             port = self._open_feed()
-            self._feeder_groups[group] = (fed.sources, port, fed.argument)
+            self._feeder_groups[key] = (port, fed.argument)
             return port
-        sources, port, first = found
-        if sources == fed.sources:
-            return port
-        raise _error(
-            ErrorCode.UNSUPPORTED_SQL,
-            f"the feeder '{fed.param.name}' reads {_listed_sources(fed.sources)}, "
-            f"and another feeder of the group '{group}' reads "
-            f"{_listed_sources(sources)}: the group shares one connection, which "
-            "carries one source",
-            fed.argument,
-            fallback=select,
-            hint=f"feed every call of the group '{group}' from the FROM item "
-            f"{first.sql(dialect='postgres')} is read off",
-        )
+        return found[0]
+
+    def _check_feeder_groups(self) -> None:
+        """Refuse a group whose connections reach different calls.
+
+        A group's calls find each other through their one connection (a
+        sound switch dials the picture switch reading the same port), so a
+        group split across sources is one whole set of calls per source. A
+        source that feeds only some of them, such as the picture from one
+        lateral and the sound from another, would leave each call without
+        its partner, and is refused.
+        """
+        by_group: dict[str, list[tuple[frozenset[str], int, exp.Expr]]] = {}
+        for (group, sources), (port, argument) in self._feeder_groups.items():
+            by_group.setdefault(group, []).append((sources, port, argument))
+        for group, connections in by_group.items():
+            if len(connections) < 2:
+                continue
+
+            def reached(port: int) -> list[str]:
+                return sorted(
+                    {f"{call.function}({call.param})" for call in self._feeds[port].calls}
+                )
+
+            first_sources, first_port, _ = connections[0]
+            for sources, port, argument in connections[1:]:
+                if reached(port) == reached(first_port):
+                    continue
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"the group '{group}' reads {_listed_sources(first_sources)} in "
+                    f"{', '.join(reached(first_port))} and {_listed_sources(sources)} in "
+                    f"{', '.join(reached(port))}: each source a group reads is a "
+                    "connection of its own, and each has to reach the same calls",
+                    argument,
+                    hint=f"feed every call of the group '{group}' from one FROM item, "
+                    "or give each FROM item the whole set",
+                )
 
     def _open_feed(self) -> int:
         """A new feeder connection, on a port of its own."""

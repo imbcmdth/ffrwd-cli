@@ -305,6 +305,40 @@ def test_a_lateral_rides_the_graph_and_the_plan_whole() -> None:
     assert Lateral.from_dict(written).writer == "ffmpeg0"
 
 
+# A linear channel's gapless playout: two laterals, A and B, each playing
+# into its own switch pair, the pairs cascaded.
+_CHANNEL = """COPY (
+  WITH prog AS (SELECT s.video[1] AS v, s.audio[1] AS a, s.data[1] AS d
+                FROM input('leaf.nut') s)
+  SELECT video(video(prog.v, ia.video), ib.video), audio(audio(prog.a, ia.audio), ib.audio)
+  FROM prog, LATERAL play(prog.d) ia, LATERAL play(prog.d) ib
+) TO 'o.mp4'"""
+
+
+def test_two_laterals_each_play_into_a_switch_pair_of_their_own() -> None:
+    graph = _lowered(_CHANNEL)
+    first, second = graph.laterals
+    (one,) = first.connections
+    (two,) = second.connections
+    assert one.port != two.port and abs(one.port - two.port) >= 2
+    for connection in (one, two):
+        assert sorted(call.function for call in connection.calls) == ["audio", "video"]
+    # Each switch reads its own lateral's port; the sound pairs with the
+    # picture of the same lane.
+    by_node = {
+        call.node: connection.port for connection in (one, two) for call in connection.calls
+    }
+    for node, port in by_node.items():
+        assert graph.nodes[node].args["port"] == port
+    plan = _plan(_CHANNEL)
+    assert len(plan.laterals) == 2
+    ports = {edge.port for edge in plan.feeder_edges}
+    assert ports == {c.port for lateral in plan.laterals for c in lateral.connections}
+    assert len(ports) == 2
+    for port in ports:
+        assert len([edge for edge in plan.feeder_edges if edge.port == port]) == 2
+
+
 def test_one_instance_is_the_body_inlined_its_tags_with_it() -> None:
     """NULL in the data stream's place and every value written: one instance,
     what the host compiles per message, its tags on what it writes."""
@@ -429,8 +463,9 @@ _ADS = "COPY (SELECT {select} FROM input('leaf.nut') s, LATERAL play({stream}) a
             "FROM input('leaf.nut') s, LATERAL play(s.data[1]) one, "
             "LATERAL play(s.data[1]) two) TO 'o.mp4'",
             ErrorCode.UNSUPPORTED_SQL,
-            "the feeder 'feed' reads 'two', and another feeder of the group 'switch' "
-            "reads 'one': the group shares one connection, which carries one source",
+            "the group 'switch' reads 'one' in video(feed) and 'two' in audio(feed): "
+            "each source a group reads is a connection of its own, and each has to "
+            "reach the same calls",
         ),
     ],
 )
