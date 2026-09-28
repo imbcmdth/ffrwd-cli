@@ -201,3 +201,29 @@ def test_balance_evens_the_nodes_load_by_weight() -> None:
     cut_only = loads(CostStrategy(encodes=2, cores=1.0, balance=0.0))
     assert len(even) == len(cut_only) == 2
     assert even[1] - even[0] <= cut_only[1] - cut_only[0]
+
+
+def test_a_group_move_slides_a_cut_that_no_single_move_improves() -> None:
+    """a feeds b over a thin data edge, b feeds c raw, c feeds d raw. Starting
+    with a, b and c on one node and d on the next, the cut is c's raw link;
+    moving c alone only trades it for b's. Moving b and c together leaves
+    the thin link as the cut, which only a group move reaches."""
+    from ffrwd.placement_cost import _problem, _refine
+    from ffrwd.processes import DataFormat
+
+    plan = ProcessPlan(
+        processes=(_region("a"), _region("b"), _region("c"), _region("d")),
+        edges=(
+            _edge("a", "b", DataFormat(), "x"),
+            _edge("b", "c", _RAW_720, "y"),
+            _edge("c", "d", _RAW_720, "z"),
+        ),
+    )
+    # A node holds three of the four regions (0.33 cores each), not all four.
+    problem = _problem(plan, CostStrategy(node_cores=1.0, cores=1.0, balance=0.0))
+    unit = {members[0]: index for index, members in enumerate(problem.units)}
+    start = [0] * len(problem.units)
+    start[unit["d"]] = 1
+    refined = _refine(problem, start)
+    assert [refined[unit[name]] for name in "abcd"] == [0, 1, 1, 1]
+    assert problem.cost(refined) < problem.cost(start)

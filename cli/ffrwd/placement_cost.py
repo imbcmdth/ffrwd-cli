@@ -521,19 +521,52 @@ def _greedy(problem: _Problem) -> list[int]:
     return assign
 
 
+def _closure(problem: _Problem, unit: int, assign: Sequence[int], downstream: bool) -> set[int]:
+    """`unit` and every unit it reaches on its own node, following the
+    stream down (or, with `downstream` false, up)."""
+    node = assign[unit]
+    links = problem.consumers if downstream else problem.producers
+    found = {unit}
+    pending = [unit]
+    while pending:
+        for nxt in links[pending.pop()]:
+            if assign[nxt] == node and nxt not in found:
+                found.add(nxt)
+                pending.append(nxt)
+    return found
+
+
 def _refine(problem: _Problem, assign: list[int]) -> list[int]:
-    """Move one unit at a time to another node while the cut cost falls."""
+    """Move units between nodes while the cost falls: one at a time, and a
+    unit together with what follows it on its node to a later node, or with
+    what precedes it to an earlier one, which is how a cut slides along the
+    stream past a run of processes no single move could part. Every move
+    keeps the caps and the stream flowing one way."""
     assign = list(assign)
     for _ in range(_REFINE_PASSES):
         improved = False
         for unit in range(len(assign)):
             here = problem.cost(assign)
+            nodes = sorted(set(assign))
+            moves: list[tuple[set[int], int]] = []
             low, high = problem.window(unit, assign)
-            for node in sorted(set(assign)):
-                if node == assign[unit] or not low <= node <= high:
+            moves += [({unit}, node) for node in nodes if low <= node <= high]
+            moves += [
+                (_closure(problem, unit, assign, True), node)
+                for node in nodes
+                if node > assign[unit]
+            ]
+            moves += [
+                (_closure(problem, unit, assign, False), node)
+                for node in nodes
+                if node < assign[unit]
+            ]
+            for moved, node in moves:
+                if node == assign[unit]:
                     continue
                 trial = list(assign)
-                trial[unit] = node
+                for one in moved:
+                    trial[one] = node
                 if problem.feasible(trial) and problem.cost(trial) < here - 1e-9:
                     assign, here, improved = trial, problem.cost(trial), True
         if not improved:
