@@ -135,9 +135,10 @@ def test_a_group_bigger_than_a_node_is_refused_by_name() -> None:
 
 def test_a_strategy_is_a_preset_or_cost_with_parameters() -> None:
     assert parse_strategy("cost-lean") is PRESETS["cost-lean"]
-    # The owner's defaults: 60% of a node's cores, 2 GPU jobs, 2 encodes.
+    # The owner's defaults: 60% of a node's cores, 2 GPU jobs, 2 encodes and
+    # 4 decodes, an L4's engines.
     owner = parse_strategy("cost")
-    assert (owner.cores, owner.gpu_jobs, owner.encodes, owner.decodes) == (0.6, 2, 2, 2)
+    assert (owner.cores, owner.gpu_jobs, owner.encodes, owner.decodes) == (0.6, 2, 2, 4)
     spelled = parse_strategy("cost:gpu_jobs=2,link=50,search=greedy,cores=0.5")
     assert (spelled.gpu_jobs, spelled.link, spelled.search, spelled.cores) == (
         2,

@@ -27,9 +27,10 @@ The load model is an estimate, and a coarse one (:func:`process_load`):
 - a wasm region a third of a core per module; a region binding a model, or
   a CUDA filter chain, one GPU job (compute).
 
-The defaults are the owner's (2026-09-28): a node loaded to 60% of its
-cores, at most 2 GPU jobs, 2 encodes and 2 hardware decodes, each counted on
-its own.
+The defaults are the owner's (2026-09-28), matching an L4 (2 NVENC and 4
+NVDEC engines) with room left, since a live frame that comes late is a frame
+dropped: a node loaded to 60% of its cores, at most 2 GPU compute jobs,
+2 encodes and 4 hardware decodes, each counted on its own.
 
 Each process's measured CPU time, from earlier runs of the same plan, is the
 estimate's replacement; nothing records that yet.
@@ -124,7 +125,7 @@ class CostStrategy:
     name: str = "cost"
     gpu_jobs: int = 2
     encodes: int = 2
-    decodes: int = 2
+    decodes: int = 4
     node_cores: float = 8.0
     cores: float = 0.6
     link: float = 50.0
