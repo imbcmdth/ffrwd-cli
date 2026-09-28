@@ -13,9 +13,12 @@ or by a preset's name, and :func:`report` places one plan under several and
 says how each came out, so the default can be chosen from numbers.
 
 What the search may not do is the same as for every strategy: the groups of
-:func:`ffrwd.placement.colocation_groups` stay whole and a file handoff stays
-on one node, so the search runs over the groups those leave (:func:`groups`),
-and every placement it makes passes :func:`ffrwd.placement.check_placement`.
+:func:`ffrwd.placement.colocation_groups` stay whole, a file handoff stays on
+one node, and links between nodes flow one way along the stream. So the
+search runs over the groups those leave (:func:`groups`, with any groups on
+a cycle merged), walks them in stream order, and puts each on a node no
+earlier than every node that feeds it: every placement it makes passes
+:func:`ffrwd.placement.check_placement`.
 
 The load model is an estimate, and a coarse one (:func:`process_load`):
 - an encode by its codec and pixel rate (x264 about two cores for 1080p30);
@@ -49,11 +52,14 @@ from typing import Literal
 from .errors import ErrorCode, FfrwdError
 from .placement import (
     Placement,
+    _components,
     check_placement,
     colocation_groups,
     file_handoffs,
+    flow_edges,
     gpu_processes,
     needs_gpu,
+    stream_order,
 )
 from .processes import (
     AudioFormat,
@@ -361,6 +367,12 @@ def groups(plan: ProcessPlan) -> list[tuple[str, ...]]:
             join(group.members[0], pid)
     for writer, reader in file_handoffs(plan):
         join(writer, reader)
+    # Groups the stream would run around in a cycle are one unit: nothing
+    # can part them and flow one way.
+    for component in _components({pid: root(pid) for pid in ids}, flow_edges(plan)):
+        members = sorted(str(one) for one in component)
+        for other in members[1:]:
+            join(members[0], other)
     found: dict[str, list[str]] = {}
     for pid in ids:
         found.setdefault(root(pid), []).append(pid)
@@ -377,6 +389,10 @@ class _Problem:
     # (unit a, unit b) -> the cost of cutting every edge between them
     weight: dict[tuple[int, int], float]
     strategy: CostStrategy
+    # Which units feed which, and the units in stream order.
+    producers: list[set[int]] = field(default_factory=list)
+    consumers: list[set[int]] = field(default_factory=list)
+    order: list[int] = field(default_factory=list)
 
     def fits(self, total: Load) -> bool:
         return _fits(total, self.strategy)
@@ -398,7 +414,23 @@ class _Problem:
         return found
 
     def feasible(self, assign: Sequence[int]) -> bool:
-        return all(self.fits(total) for total in self.totals(assign).values())
+        return all(self.fits(total) for total in self.totals(assign).values()) and not (
+            self.cyclic(assign)
+        )
+
+    def cyclic(self, assign: Sequence[int]) -> bool:
+        """Whether the nodes of `assign` send the stream around a cycle."""
+        links = [
+            (str(a), str(b)) for a in range(len(assign)) for b in self.consumers[a]
+        ]
+        return bool(_components({str(u): assign[u] for u in range(len(assign))}, links))
+
+    def window(self, unit: int, assign: Sequence[int]) -> tuple[int, int]:
+        """The nodes `unit` may sit on and keep the stream flowing one way:
+        no earlier than any node feeding it, no later than any it feeds."""
+        low = max((assign[u] for u in self.producers[unit] if assign[u] >= 0), default=0)
+        high = min((assign[u] for u in self.consumers[unit] if assign[u] >= 0), default=10**9)
+        return low, high
 
 
 def _fits(load: Load, strategy: CostStrategy) -> bool:
@@ -430,6 +462,16 @@ def _problem(plan: ProcessPlan, strategy: CostStrategy) -> _Problem:
         weight[key] = weight.get(key, 0.0) + strategy.link + mbps * (
             strategy.raw_penalty if raw else 1.0
         )
+    producers: list[set[int]] = [set() for _ in units]
+    consumers: list[set[int]] = [set() for _ in units]
+    for source, target in flow_edges(plan):
+        a, b = unit_of[source], unit_of[target]
+        if a != b:
+            consumers[a].add(b)
+            producers[b].add(a)
+    numbered = stream_order(plan, {pid: unit_of[pid] for pid in unit_of})
+    position = {unit_of[pid]: numbered[pid] for pid in unit_of}
+    order = sorted(range(len(units)), key=lambda unit: (position[unit], unit))
     for index, load in enumerate(loads):
         if not _fits(load, strategy):
             raise FfrwdError(
@@ -441,7 +483,7 @@ def _problem(plan: ProcessPlan, strategy: CostStrategy) -> _Problem:
                 f"{strategy.encodes} encodes, {strategy.decodes} decodes)",
                 hint="raise gpu_jobs, encodes, decodes, node_cores or cores",
             )
-    return _Problem(units, loads, weight, strategy)
+    return _Problem(units, loads, weight, strategy, producers, consumers, order)
 
 
 def _affinity(problem: _Problem, unit: int, members: Iterable[int]) -> float:
@@ -451,59 +493,31 @@ def _affinity(problem: _Problem, unit: int, members: Iterable[int]) -> float:
 
 
 def _greedy(problem: _Problem) -> list[int]:
+    """The units in stream order, each onto the node, no earlier than every
+    node feeding it, that it is most tied to and that has room; a new node
+    after the rest when none has. Nodes are opened in stream order, so the
+    links only ever run forward."""
     n = len(problem.units)
     if problem.fits(sum(problem.load, Load())):
         return [0] * n
     assign = [-1] * n
     nodes: list[list[int]] = []
     totals: list[Load] = []
-
-    def put(unit: int, node: int | None) -> None:
-        if node is None:
+    for unit in problem.order:
+        low, _ = problem.window(unit, assign)
+        best, best_affinity = None, -1.0
+        for node in range(low, len(nodes)):
+            if problem.fits(totals[node] + problem.load[unit]):
+                affinity = _affinity(problem, unit, nodes[node])
+                if affinity > best_affinity:
+                    best, best_affinity = node, affinity
+        if best is None:
             nodes.append([])
             totals.append(Load())
-            node = len(nodes) - 1
-        nodes[node].append(unit)
-        totals[node] = totals[node] + problem.load[unit]
-        assign[unit] = node
-
-    # GPU work first (compute, encodes, decodes), packed by branch: each onto
-    # the L4 node it is most connected to that has room.
-    gpu = sorted(
-        (u for u in range(n) if problem.load[u].on_gpu),
-        key=lambda u: (
-            -(problem.load[u].gpu_jobs + problem.load[u].encodes + problem.load[u].decodes),
-            -problem.load[u].cores,
-            u,
-        ),
-    )
-    for unit in gpu:
-        best, best_affinity = None, -1.0
-        for node, members in enumerate(nodes):
-            if problem.fits(totals[node] + problem.load[unit]):
-                affinity = _affinity(problem, unit, members)
-                if affinity > best_affinity:
-                    best, best_affinity = node, affinity
-        put(unit, best)
-    # Everything else, the unit most tied to what is placed first, onto the
-    # node it is most tied to that has room.
-    rest = [u for u in range(n) if assign[u] < 0]
-    while rest:
-        rest.sort(
-            key=lambda u: (
-                -_affinity(problem, u, (v for v in range(n) if assign[v] >= 0)),
-                -problem.load[u].cores,
-                u,
-            )
-        )
-        unit = rest.pop(0)
-        best, best_affinity = None, -1.0
-        for node, members in enumerate(nodes):
-            if problem.fits(totals[node] + problem.load[unit]):
-                affinity = _affinity(problem, unit, members)
-                if affinity > best_affinity:
-                    best, best_affinity = node, affinity
-        put(unit, best)
+            best = len(nodes) - 1
+        nodes[best].append(unit)
+        totals[best] = totals[best] + problem.load[unit]
+        assign[unit] = best
     return assign
 
 
@@ -514,8 +528,9 @@ def _refine(problem: _Problem, assign: list[int]) -> list[int]:
         improved = False
         for unit in range(len(assign)):
             here = problem.cost(assign)
+            low, high = problem.window(unit, assign)
             for node in sorted(set(assign)):
-                if node == assign[unit]:
+                if node == assign[unit] or not low <= node <= high:
                     continue
                 trial = list(assign)
                 trial[unit] = node
@@ -559,12 +574,8 @@ def cost_place(plan: ProcessPlan, strategy: CostStrategy) -> Placement:
         assign = _refine(problem, assign)
     elif strategy.search == "exhaustive":
         assign = _exhaustive(problem) or _refine(problem, assign)
-    numbered: dict[int, int] = {}
-    nodes: dict[str, int] = {}
     unit_of = {pid: index for index, members in enumerate(problem.units) for pid in members}
-    for process in plan.processes:
-        node = assign[unit_of[process.id]]
-        nodes[process.id] = numbered.setdefault(node, len(numbered))
+    nodes = stream_order(plan, {p.id: assign[unit_of[p.id]] for p in plan.processes})
     gpu = frozenset(nodes[pid] for pid in gpu_processes(plan))
     placement = Placement(nodes=nodes, gpu=gpu)
     check_placement(plan, placement)

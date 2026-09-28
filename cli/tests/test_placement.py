@@ -295,3 +295,37 @@ def test_an_nvenc_encode_onto_an_edge_is_gpu_work() -> None:
     placement = place(plan, "by-hardware")
     assert placement.gpu == frozenset({placement.nodes["ffmpeg0"]})
     assert placement.nodes["ffmpeg0"] != placement.nodes["sidecar0"]
+
+
+# -- links flow one way along the stream
+
+
+def test_a_placement_sending_the_stream_back_is_refused() -> None:
+    """ffmpeg0 on node 0 feeds sidecar0 on node 1, which feeds sidecar1 back
+    on node 0: node 1 would send to the node feeding it."""
+    plan = _chain()
+    backwards = Placement(nodes={"ffmpeg0": 0, "sidecar0": 1, "sidecar1": 0, "ffmpeg1": 0})
+    with pytest.raises(FfrwdError) as caught:
+        check_placement(plan, backwards)
+    assert caught.value.code is ErrorCode.PLACEMENT_REFUSED
+    assert "a cycle of nodes 0, 1" in caught.value.message
+
+
+@pytest.mark.parametrize(
+    "strategy",
+    ["one", "per-module", "by-hardware", "per-process", "cost", "cost-spread",
+     "cost:encodes=1,cores=0.2"],
+)
+@pytest.mark.parametrize("make", [_chain, _head])
+def test_every_strategy_numbers_its_nodes_along_the_stream(strategy: str, make: object) -> None:
+    from ffrwd.placement import flow_edges
+
+    plan = make()  # type: ignore[operator]
+    try:
+        placement = place(plan, strategy)
+    except FfrwdError as err:
+        assert err.code is ErrorCode.PLACEMENT_REFUSED
+        return
+    check_placement(plan, placement)
+    for source, target in flow_edges(plan):
+        assert placement.nodes[source] <= placement.nodes[target], (source, target)

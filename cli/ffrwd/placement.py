@@ -45,7 +45,13 @@ Strategies:
 Every strategy keeps the two ends of a file handoff (a later stage's input,
 a rows document a packet filter reads) on one node, since nothing carries a
 file between nodes; a placement given by hand that parts them is refused.
-Node 0 is the node of the plan's first process.
+
+Links between nodes flow one way along the stream (the owner, 2026-09-28):
+if one node sends to another, nothing is sent back, however indirectly, so
+the nodes have a definite order. A strategy whose grouping would make a
+cycle merges the nodes on it; a placement given by hand with one is refused.
+Nodes are numbered in that order, producers first, ties by the plan's own
+order, so node 0 is where the stream starts.
 """
 
 from __future__ import annotations
@@ -78,12 +84,14 @@ __all__ = [
     "colocation_groups",
     "cut_key",
     "file_handoffs",
+    "flow_edges",
     "gpu_processes",
     "needs_gpu",
     "pipe_edges",
     "place",
     "split",
     "stdio_chains",
+    "stream_order",
 ]
 
 Strategy = Literal["one", "per-module", "by-hardware", "per-process"]
@@ -395,14 +403,125 @@ def place(plan: ProcessPlan, strategy: str = "one") -> Placement:
     # different stages, so sharing a node costs nothing.
     for writer, reader in file_handoffs(plan):
         union.join(writer, reader)
-    numbered: dict[str, int] = {}
-    nodes: dict[str, int] = {}
-    for pid in ids:
-        root = union.root(pid)
-        nodes[pid] = numbered.setdefault(root, len(numbered))
+    _merge_cycles(plan, union)
+    nodes = stream_order(plan, {pid: union.root(pid) for pid in ids})
     on_gpu = gpu_processes(plan)
     gpu = frozenset(nodes[pid] for pid in on_gpu)
     return Placement(nodes=nodes, gpu=gpu)
+
+
+def flow_edges(plan: ProcessPlan) -> list[tuple[str, str]]:
+    """Every ``(producer, consumer)`` pair the stream runs along between two
+    processes: stream edges, rows edges and feeder connections (a run-time
+    lateral's instances run on its writer's node, so a feeder is a link)."""
+    return [
+        (edge.source, edge.target)
+        for edge in plan.edges
+        if isinstance(edge, StreamEdge | RowsEdge | FeederEdge)
+    ]
+
+
+def _components(
+    labels: Mapping[str, object], links: Sequence[tuple[str, str]]
+) -> list[set[object]]:
+    """The strongly connected sets of labels the links make, each a cycle
+    (or several) between labels, in no particular order; single labels on no
+    cycle are left out."""
+    graph: dict[object, set[object]] = {}
+    for source, target in links:
+        a, b = labels[source], labels[target]
+        if a != b:
+            graph.setdefault(a, set()).add(b)
+            graph.setdefault(b, set())
+    index: dict[object, int] = {}
+    low: dict[object, int] = {}
+    stack: list[object] = []
+    on_stack: set[object] = set()
+    found: list[set[object]] = []
+    counter = 0
+
+    def visit(start: object) -> None:
+        nonlocal counter
+        work: list[tuple[object, list[object]]] = [(start, sorted(graph[start], key=str))]
+        index[start] = low[start] = counter
+        counter += 1
+        stack.append(start)
+        on_stack.add(start)
+        while work:
+            node, pending = work[-1]
+            if pending:
+                nxt = pending.pop()
+                if nxt not in index:
+                    index[nxt] = low[nxt] = counter
+                    counter += 1
+                    stack.append(nxt)
+                    on_stack.add(nxt)
+                    work.append((nxt, sorted(graph[nxt], key=str)))
+                elif nxt in on_stack:
+                    low[node] = min(low[node], index[nxt])
+                continue
+            work.pop()
+            if work:
+                parent = work[-1][0]
+                low[parent] = min(low[parent], low[node])
+            if low[node] == index[node]:
+                component: set[object] = set()
+                while True:
+                    member = stack.pop()
+                    on_stack.discard(member)
+                    component.add(member)
+                    if member == node:
+                        break
+                if len(component) > 1:
+                    found.append(component)
+
+    for node in sorted(graph, key=str):
+        if node not in index:
+            visit(node)
+    return found
+
+
+def _merge_cycles(plan: ProcessPlan, union: _Union) -> None:
+    """Join every set of groups the stream would run around in a cycle, so
+    what is left flows one way."""
+    ids = [p.id for p in plan.processes]
+    roots = {pid: union.root(pid) for pid in ids}
+    by_root: dict[object, str] = {root: root for root in roots.values()}
+    for component in _components(roots, flow_edges(plan)):
+        members = sorted(str(root) for root in component)
+        for other in members[1:]:
+            union.join(by_root[members[0]], by_root[other])
+
+
+def stream_order(plan: ProcessPlan, labels: Mapping[str, object]) -> dict[str, int]:
+    """Each process's node number, the labels (which must flow one way)
+    numbered producers first, ties by where they first appear in the plan."""
+    ids = [p.id for p in plan.processes]
+    first: dict[object, int] = {}
+    for position, pid in enumerate(ids):
+        first.setdefault(labels[pid], position)
+    after: dict[object, set[object]] = {label: set() for label in first}
+    before: dict[object, int] = {label: 0 for label in first}
+    for source, target in flow_edges(plan):
+        a, b = labels[source], labels[target]
+        if a != b and b not in after[a]:
+            after[a].add(b)
+            before[b] += 1
+    ready = sorted((label for label in first if before[label] == 0), key=first.__getitem__)
+    numbered: dict[object, int] = {}
+    while ready:
+        label = ready.pop(0)
+        numbered[label] = len(numbered)
+        for nxt in after[label]:
+            before[nxt] -= 1
+            if before[nxt] == 0:
+                ready.append(nxt)
+        ready.sort(key=first.__getitem__)
+    # Labels on a cycle are never ready; they keep plan order after the rest,
+    # and check_placement refuses what they make.
+    for label in sorted(first, key=first.__getitem__):
+        numbered.setdefault(label, len(numbered))
+    return {pid: numbered[labels[pid]] for pid in ids}
 
 
 def gpu_processes(plan: ProcessPlan) -> frozenset[str]:
@@ -472,6 +591,7 @@ def check_placement(
       nodes, so the reader would not find it.
     - No display window (`shown` names the processes with one) on a node
       other than node 0, the one on this machine's screen.
+    - No cycle between nodes: links flow one way along the stream.
     """
     missing = [p.id for p in plan.processes if p.id not in placement.nodes]
     if missing:
@@ -493,6 +613,17 @@ def check_placement(
     for edge in plan.file_edges:
         _check_file_edge(plan, placement, edge)
     _check_rows_documents(plan, placement)
+    cycles = _components(dict(placement.nodes), flow_edges(plan))
+    if cycles:
+        cycle = sorted(int(str(node)) for node in cycles[0])
+        listed = ", ".join(str(node) for node in cycle)
+        raise FfrwdError(
+            ErrorCode.PLACEMENT_REFUSED,
+            f"the placement sends the stream around a cycle of nodes {listed}: "
+            "links between nodes flow one way",
+            hint="place the processes so that no node sends back to a node that "
+            "feeds it, or put the nodes on the cycle together",
+        )
     away = [pid for pid in shown if placement.node(pid) != 0]
     if away:
         raise FfrwdError(
