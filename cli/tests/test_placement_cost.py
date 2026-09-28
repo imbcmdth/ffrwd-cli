@@ -182,3 +182,22 @@ def test_a_strategy_name_that_means_nothing_is_refused_before_a_run() -> None:
         check_strategy_name(fine)
     with pytest.raises(FfrwdError):
         check_strategy_name("fastest")
+
+
+def test_balance_evens_the_nodes_load_by_weight() -> None:
+    """Two encodes a node forces two nodes for three branches; with balance
+    the lighter node takes more of the load than the cut alone would give it."""
+    plan = _branches(3)
+    from ffrwd.placement_cost import Load, process_load
+
+    def loads(strategy: CostStrategy) -> list[float]:
+        placement = cost_place(plan, strategy)
+        totals: dict[int, Load] = {}
+        for pid, node in placement.nodes.items():
+            totals[node] = totals.get(node, Load()) + process_load(plan.process(pid), plan)
+        return sorted(total.cores for total in totals.values())
+
+    even = loads(CostStrategy(encodes=2, cores=1.0, balance=250.0))
+    cut_only = loads(CostStrategy(encodes=2, cores=1.0, balance=0.0))
+    assert len(even) == len(cut_only) == 2
+    assert even[1] - even[0] <= cut_only[1] - cut_only[0]
