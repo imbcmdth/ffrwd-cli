@@ -586,7 +586,11 @@ class _Agent:
                 wanted.append(process.module)
                 wanted += [binding.path for binding in process.modules]
                 wanted += [binding.path for binding in process.models]
-        return sorted({path for path in wanted if path and not Path(path).exists()})
+        # A host node (a leaky, a row filter) is named, not loaded from a
+        # file: only what names a path is looked for.
+        return sorted(
+            {path for path in wanted if _names_a_file(path) and not Path(path).exists()}
+        )
 
     def _workspace(self) -> Path:
         if self._home is None:
@@ -893,6 +897,12 @@ _NN_BINDING_FLAGS = frozenset({"-nn", "-nn-exclude"})
 _NN_RUNTIME_FLAGS = frozenset({"-nn-runtime", "-nn-target"})
 
 
+def _names_a_file(value: str) -> bool:
+    """Whether a module or model reference is a path on disk rather than the
+    name of one of the sidecar's own nodes."""
+    return "/" in value or "\\" in value
+
+
 def _without_runtime(words: Sequence[str]) -> list[str]:
     """`words` without any ``-nn-runtime``/``-nn-target`` and their values."""
     out: list[str] = []
@@ -1115,14 +1125,17 @@ class _Coordinator:
             thread.start()
             self._threads.append(thread)
         for node in self.nodes:
-            if not node.ready.wait(max(deadline - time.monotonic(), 0.1)) or node.lost:
+            ready = node.ready.wait(max(deadline - time.monotonic(), 0.1))
+            # A runner that refused says why before it goes: its reason, not
+            # the dropped connection that follows it, is the error.
+            if node.refusal is not None:
+                raise node.refusal
+            if not ready or node.lost:
                 raise FfrwdError(
                     ErrorCode.INTERNAL,
                     f"the runner of node {node.index} never said it was ready",
                     hint="check that `python -m ffrwd node` starts on this machine",
                 )
-            if node.refusal is not None:
-                raise node.refusal
         addresses = {
             str(node.index): list(node.address) for node in self.nodes if node.address
         }

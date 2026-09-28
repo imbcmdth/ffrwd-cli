@@ -383,3 +383,36 @@ def test_a_runner_missing_a_model_file_refuses_before_it_says_ready(tmp_path: Pa
     error = said.sent[0]["error"]
     assert isinstance(error, dict)
     assert error["message"] == f"node 0 does not have {missing}"
+
+
+def test_a_host_node_is_named_not_loaded_and_is_never_missing(tmp_path: Path) -> None:
+    """A leaky or a row filter is the sidecar's own node: its module is a
+    name, not a file, and a runner does not look for it on disk."""
+    plan = ProcessPlan(
+        processes=(SidecarProcess(id="sidecar0", module="leaky", node="l", outputs=("video",)),)
+    )
+    agent, said = _agent(plan, {"sidecar0": ["/there/ffrwd-wasm"]}, "/there/ffrwd-wasm")
+    try:
+        assert agent.missing() == []
+    finally:
+        agent.close()
+
+
+def test_a_runner_that_refuses_is_the_error_not_its_dropped_connection(tmp_path: Path) -> None:
+    """The coordinator raises the runner's own reason, whatever order its
+    refusal and its closing connection arrive in."""
+    from ffrwd import binaries, wasm
+
+    if binaries.ffrwd_wasm_path() is None:
+        pytest.skip("the ffrwd-wasm sidecar is not installed")
+    missing = tmp_path / "gone.wasm"
+    plan = ProcessPlan(
+        processes=(
+            SidecarProcess(id="sidecar0", module=str(missing), node="m", outputs=("video",)),
+        )
+    )
+    with pytest.raises(FfrwdError) as caught:
+        execute_split(
+            plan, place(plan, "one"), sidecar_argv=wasm.sidecar_argv, timeout=30, startup=30
+        )
+    assert caught.value.message == f"node 0 does not have {missing}"
