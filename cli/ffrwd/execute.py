@@ -149,6 +149,8 @@ from .ir import (
 )
 from .pipes import NamedPipe
 from .processes import (
+    PIPE_BUFFER_LIMIT,
+    RAWVIDEO,
     DataFormat,
     FeederEdge,
     FfmpegProcess,
@@ -158,6 +160,7 @@ from .processes import (
     SidecarProcess,
     Stage,
     StreamEdge,
+    VideoFormat,
     encoded,
 )
 from .vars import substitute
@@ -228,6 +231,14 @@ _CASCADE = 1.0
 # ffmpeg's EPIPE, which is AVERROR(EPIPE) == -32, as each platform's exit
 # status spells it: POSIX keeps the low byte, Windows the whole word.
 _BROKEN_PIPE = frozenset({224, 0xFFFFFFE0})
+# What ffmpeg on Windows says when it writes into a pipe whose reader went
+# while it was not waiting on it: Windows answers ERROR_NO_DATA, which the C
+# runtime hands on as EINVAL, where a writer waiting at that moment gets
+# EPIPE. A pipe made to hold raw video (:func:`_stdio_buffer`) makes this the
+# usual way a producer learns its reader is gone. Closing is where ffmpeg
+# flushes the last of its writes, so this is a write that failed, not one of
+# ffmpeg's many other EINVALs.
+_PIPE_GONE_WINDOWS = "Error closing file: Invalid argument"
 # How long a helper thread is waited for once its process has gone.
 _JOIN = 5.0
 # How long a module is given to listen on its feeder port once its programme
@@ -1473,6 +1484,26 @@ def _pipe_buffer(edge: PipeEdge) -> int:
     return max(edge.buffer.size, pipes.DEFAULT_BUFFER)
 
 
+def _stdio_buffer(edge: PipeEdge) -> int | None:
+    """How big a stdio pipe carrying `edge` is made, or None for the
+    platform's own default.
+
+    Raw video is what a default pipe caps. ffmpeg | ffrwd-wasm | ffmpeg
+    passing rgba through ran 1080p at 146 fps on ``subprocess.PIPE`` and 222
+    on a 4 MiB pipe on Windows, 4K at 18 and 47; on Linux, where the default
+    is 64 KiB and the pipe got 1 MiB, 1080p at 103 and 219, 4K at 25 and 55.
+    So a raw picture edge's pipe holds what its bound asks for
+    (:func:`_pipe_buffer`) and never less than :data:`PIPE_BUFFER_LIMIT`;
+    coded, sound and data edges are small and keep the default.
+    """
+    if not isinstance(edge, StreamEdge):
+        return None
+    format = edge.format
+    if not isinstance(format, VideoFormat) or format.codec != RAWVIDEO:
+        return None
+    return max(_pipe_buffer(edge), PIPE_BUFFER_LIMIT)
+
+
 def _named(namer: PipeNamer | None, edge: PipeEdge, side: Side) -> str:
     if namer is None:
         raise FfrwdError(
@@ -1924,6 +1955,11 @@ class _Member:
     argv: list[str]
     proc: subprocess.Popen[bytes]
     stderr: list[bytes] = field(default_factory=list)
+    # This runner's end of a stdio pipe made to a size (:func:`_stdio_buffer`),
+    # which ``proc.stdout`` / ``proc.stdin`` are None beside: the stream the
+    # member's raw video comes out of, or goes in by.
+    stdout: IO[bytes] | None = None
+    stdin: IO[bytes] | None = None
     terminated: bool = False
     # When the watch first saw this member had exited; None while it runs, and
     # for one still running when the stage was stopped.
@@ -1954,6 +1990,17 @@ class _StdioEnd(_End):
             self._stream.close()
         except (OSError, ValueError):
             pass
+
+
+def _stdout_of(member: _Member) -> IO[bytes] | None:
+    """The stream a member's stdout reaches this runner by: the sized pipe's
+    end where one was made, else the one :class:`subprocess.Popen` made."""
+    return member.stdout if member.stdout is not None else member.proc.stdout
+
+
+def _stdin_of(member: _Member) -> IO[bytes] | None:
+    """The stream this runner writes a member's stdin by, likewise."""
+    return member.stdin if member.stdin is not None else member.proc.stdin
 
 
 class _PipeEnd(_End):
@@ -2247,7 +2294,7 @@ class _StageRun:
                 self._spawn(pid)
 
         for pid, window in self.watching.items():
-            self.helpers.append(_start(_forward, self.members[pid].proc.stdout, window.stdin))
+            self.helpers.append(_start(_forward, _stdout_of(self.members[pid]), window.stdin))
 
         for wire in self.stage_wires:
             if not wire.chained and self._ready(wire):
@@ -2337,15 +2384,36 @@ class _StageRun:
         chained = next((w for w in reads if w.chained), None)
         player = self._players.get(pid)
         stdin: int | IO[bytes] = subprocess.DEVNULL
+        # The ends of sized pipes: the child's, closed here once it has them,
+        # and this runner's, kept on the member.
+        theirs: list[int] = []
+        runner_in: IO[bytes] | None = None
+        runner_out: IO[bytes] | None = None
+        fed = next((w for w in reads if w.read_stdio), None)
         if chained is not None:
-            stdin = _stream(self.members[chained.edge.source].proc.stdout)
-        elif any(w.read_stdio for w in reads):
-            stdin = subprocess.PIPE
+            stdin = _stream(_stdout_of(self.members[chained.edge.source]))
+        elif fed is not None:
+            size = _stdio_buffer(fed.edge)
+            if size is None:
+                stdin = subprocess.PIPE
+            else:
+                read, write = pipes.anonymous(size)
+                stdin = read
+                theirs.append(read)
+                runner_in = os.fdopen(write, "wb", buffering=0)
         stdout: int | None = (
             subprocess.PIPE
             if any(w.write_stdio for w in writes) or player is not None
             else subprocess.DEVNULL
         )
+        out = next((w for w in writes if w.write_stdio), None)
+        if stdout == subprocess.PIPE and player is None and out is not None:
+            size = _stdio_buffer(out.edge)
+            if size is not None:
+                read, write = pipes.anonymous(size)
+                stdout = write
+                theirs.append(write)
+                runner_out = os.fdopen(read, "rb", buffering=0)
         if _writes_rows_to_stdout(process):
             # A packet sink's rows are its product, and a data filter's are
             # its report; nothing else in the plan reads them, so they reach
@@ -2362,10 +2430,22 @@ class _StageRun:
             self._echo(pid, command)
         if player is not None:
             self.watching[pid] = subprocess.Popen(player, stdin=subprocess.PIPE, bufsize=0)
+        try:
+            proc = _spawn(command, stdin, stdout, env=_nn_runtime_env(command))
+        except BaseException:
+            for stream in (runner_in, runner_out):
+                if stream is not None:
+                    stream.close()
+            raise
+        finally:
+            for fd in theirs:
+                os.close(fd)  # the child has its own copy, or never will
         member = self.members[pid] = _Member(
             id=pid,
             argv=command,
-            proc=_spawn(command, stdin, stdout, env=_nn_runtime_env(command)),
+            proc=proc,
+            stdout=runner_out,
+            stdin=runner_in,
         )
         if chained is not None and not isinstance(stdin, int):
             stdin.close()  # the spawned member owns it now
@@ -2380,10 +2460,10 @@ class _StageRun:
             return self._remote(wire, side)
         if side == "write":
             if wire.write_stdio:
-                return _StdioEnd(_stream(self.members[pid].proc.stdout))
+                return _StdioEnd(_stream(_stdout_of(self.members[pid])))
             return _PipeEnd(self._served[(wire.edge, "write")])
         if wire.read_stdio:
-            return _StdioEnd(_stream(self.members[pid].proc.stdin))
+            return _StdioEnd(_stream(_stdin_of(self.members[pid])))
         return _PipeEnd(self._served[(wire.edge, "read")])
 
     def _pump(self, wire: Wire) -> None:
@@ -2536,7 +2616,9 @@ def _broken_pipe(result: ProcessResult) -> bool:
     """True when this member died writing to a pipe nobody was reading."""
     if result.terminated or result.exit_code == 0:
         return False
-    return result.exit_code in _BROKEN_PIPE or "Broken pipe" in result.stderr
+    if result.exit_code in _BROKEN_PIPE or "Broken pipe" in result.stderr:
+        return True
+    return sys.platform == "win32" and _PIPE_GONE_WINDOWS in result.stderr
 
 
 def _is_live(edge: PipeEdge) -> bool:

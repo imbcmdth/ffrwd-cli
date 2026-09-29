@@ -15,10 +15,18 @@ unblocks a :meth:`wait` that is still waiting.
 A pipe's BUFFER is how far the process on the other end runs ahead before its
 writes wait, and it is a parameter: a plan whose edges carry a depth bound
 sizes each pipe from that bound. Windows takes the size at creation; Linux
-takes it afterwards with ``F_SETPIPE_SZ`` and caps it at its own maximum; the
-rest take what they are given. Best effort everywhere -- a pipe that ends up
-smaller than asked still carries the stream, and what a too-small one costs is
-the run-time overflow :mod:`ffrwd.execute` reports.
+takes it afterwards with ``F_SETPIPE_SZ``, no more than
+``/proc/sys/fs/pipe-max-size`` (a larger ask is refused outright, not
+shortened, so it is capped here first); the rest take what they are given.
+Best effort everywhere -- a pipe that ends up smaller than asked still
+carries the stream, and what a too-small one costs is the run-time overflow
+:mod:`ffrwd.execute` reports.
+
+:func:`anonymous` makes the other kind: a pipe with no name, for one
+process's stdout handed to the next one's stdin, sized the same way.
+``subprocess.PIPE`` gives such a pipe the platform's default buffer, which
+on Windows is what caps raw video through a chain, not the processes on
+either end.
 
 The streams :meth:`NamedPipe.wait` hands back are UNBUFFERED, and that is a
 correctness rule rather than a preference. Python's buffered reader returns
@@ -44,7 +52,7 @@ from typing import BinaryIO
 if sys.platform != "win32":
     import fcntl
 
-__all__ = ["DEFAULT_BUFFER", "NamedPipe", "create"]
+__all__ = ["DEFAULT_BUFFER", "NamedPipe", "anonymous", "create"]
 
 # How often a wait re-checks whether the client has arrived.
 _POLL = 0.01
@@ -52,6 +60,46 @@ _POLL = 0.01
 _CANCEL_JOIN = 5.0
 # The pipe's own buffer, per direction, for a pipe nothing asked to size.
 DEFAULT_BUFFER = 1 << 16
+# Where Linux says how big a process without privileges may make a pipe.
+_PIPE_MAX_SIZE = Path("/proc/sys/fs/pipe-max-size")
+
+
+if sys.platform == "win32":
+
+    def _set_size(fd: int, buffer: int) -> None:
+        """Windows sizes a pipe when it is made, and never afterwards."""
+
+else:
+
+    def _set_size(fd: int, buffer: int) -> None:
+        """Ask Linux for a pipe of `buffer` bytes, no more than it allows; a
+        platform with no ``F_SETPIPE_SZ`` sizes its pipes itself. Best
+        effort: the pipe carries its stream at whatever size it ends up."""
+        setter = getattr(fcntl, "F_SETPIPE_SZ", None)
+        if setter is None or buffer <= DEFAULT_BUFFER:
+            return
+        try:
+            buffer = min(buffer, int(_PIPE_MAX_SIZE.read_text().strip()))
+        except (OSError, ValueError):
+            pass
+        with contextlib.suppress(OSError, ValueError):
+            fcntl.fcntl(fd, setter, buffer)
+
+
+def anonymous(buffer: int = DEFAULT_BUFFER) -> tuple[int, int]:
+    """A pipe with no name holding `buffer` bytes: ``(read, write)``, two
+    file descriptors this process owns, neither inherited. Handed to
+    :class:`subprocess.Popen` as a child's stdin or stdout, an end becomes
+    the child's own; the parent then closes its copy."""
+    if sys.platform == "win32":
+        import _winapi
+        import msvcrt
+
+        read, write = _winapi.CreatePipe(None, buffer)
+        return msvcrt.open_osfhandle(read, os.O_RDONLY), msvcrt.open_osfhandle(write, 0)
+    read, write = os.pipe()
+    _set_size(write, buffer)
+    return read, write
 
 
 class NamedPipe:
@@ -285,11 +333,7 @@ else:
             FIFOs itself and has nothing to set. Best effort either way -- the
             pipe works at whatever size it ends up with.
             """
-            setter = getattr(fcntl, "F_SETPIPE_SZ", None)
-            if setter is None or self.buffer <= DEFAULT_BUFFER:
-                return
-            with contextlib.suppress(OSError, ValueError):
-                fcntl.fcntl(fd, setter, self.buffer)
+            _set_size(fd, self.buffer)
 
         def _open_write(self, deadline: float) -> int:
             while True:

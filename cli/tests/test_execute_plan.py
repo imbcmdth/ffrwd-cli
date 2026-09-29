@@ -1442,6 +1442,21 @@ def test_a_broken_pipe_is_read_off_the_code_or_off_what_ffmpeg_said() -> None:
     assert not _broken_pipe(_ended("e", 224, terminated=True))
 
 
+def test_a_pipe_gone_before_a_windows_write_is_a_broken_pipe_there_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Windows answers a write into a pipe whose reader has gone with
+    ERROR_NO_DATA unless the writer was already waiting, and ffmpeg reports
+    that as EINVAL; it is a broken pipe all the same, and only there."""
+    closing = "[out#0/nut @ 0] Error closing file: Invalid argument\nConversion failed!"
+    gone = _ended("a", 0xFFFFFFEA, stderr=closing)
+    monkeypatch.setattr(_EXECUTE.sys, "platform", "win32")
+    assert _broken_pipe(gone)
+    assert not _broken_pipe(_ended("b", 0xFFFFFFEA, stderr="Invalid argument"))
+    monkeypatch.setattr(_EXECUTE.sys, "platform", "linux")
+    assert not _broken_pipe(gone)
+
+
 # ------------------------------------------------------ what a stage reports
 
 
