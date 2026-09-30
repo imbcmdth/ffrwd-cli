@@ -220,10 +220,11 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
     the feeder connections its instances write, what binds each value,
     and the instance as SQL with each value bound per message a hole,
     `<url>`.
-- **`--jobs N`**, on `compile` and `run`, caps the sidecar's worker
-  threads at N. The sidecar runs a pool sized to the machine's cores by
-  default, and a module that describes itself as pure spreads across it
-  with no flag at all; one that carries state between calls, and one
+- **`--jobs N`**, on `compile` and `run`, sets the sidecar's worker
+  threads to N, never more than the machine's cores. The sidecar runs a
+  pool of 4 by default, and a module that describes itself as pure
+  spreads across it with no flag at all; one that carries state between
+  calls, and one
   reading encoded packets, run one call at a time whatever N is.
   `--jobs 1` hosts everything serially. The output is byte-identical at
   any N.

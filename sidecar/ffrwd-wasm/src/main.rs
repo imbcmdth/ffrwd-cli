@@ -378,9 +378,10 @@ struct Args {
     /// were given - the hops a rows-bearing output's rows may flow through
     /// before they are written.
     rows_chain: Vec<RowsModuleSpec>,
-    /// The `-jobs` cap on worker threads, if one was given. The pool is the
-    /// machine's effective core count either way; the cap only lowers it,
-    /// and `-jobs 1` is the serial escape hatch.
+    /// The `-jobs` worker thread count, if one was given. Without it the
+    /// pool is `lanes::DEFAULT_WORKERS`; either way it never exceeds the
+    /// machine's effective core count, and `-jobs 1` is the serial escape
+    /// hatch.
     jobs: Option<usize>,
     /// `-codec`: which half of a codec package's module runs. Needed only
     /// for a module exporting both an encoder and a decoder.

@@ -967,11 +967,18 @@ fn out_of(item: &Item) -> Out {
     }
 }
 
-/// How many worker threads a run gets: the machine's effective core count,
-/// capped by `-jobs` when it was given. `-jobs 1` is the serial escape hatch.
+/// The worker threads a run gets when `-jobs` is not given. Four covers
+/// most of a pure module's frame-parallel speed-up (a compositor rendering
+/// 4K frames reached real time on four) without one sidecar taking every
+/// core from the ffmpeg processes and encoders beside it.
+pub const DEFAULT_WORKERS: usize = 4;
+
+/// How many worker threads a run gets: `-jobs` when it was given, else
+/// `DEFAULT_WORKERS`, never more than the machine's effective core count.
+/// `-jobs 1` is the serial escape hatch.
 pub fn worker_count(jobs: Option<usize>) -> usize {
     let cores = thread::available_parallelism().map_or(1, |n| n.get());
-    jobs.unwrap_or(cores).min(cores).max(1)
+    jobs.unwrap_or(DEFAULT_WORKERS).min(cores).max(1)
 }
 
 /// The running network: workers spawned, lanes wired, waiting to be fed.
@@ -1334,6 +1341,14 @@ mod tests {
     use ffrwd_wasm_runtime::node::{
         Accepts, BoundStream, Clock, InputPort, Pairing, PortKind, Rational, RowsUse, StreamFormat,
     };
+
+    #[test]
+    fn without_jobs_a_run_gets_four_workers_or_every_core_if_fewer() {
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        assert_eq!(worker_count(None), DEFAULT_WORKERS.min(cores));
+        assert_eq!(worker_count(Some(1)), 1);
+        assert_eq!(worker_count(Some(usize::MAX)), cores);
+    }
     use ffrwd_wasm_runtime::runtime::{StreamInfo, VideoFormat};
     use std::sync::mpsc;
 
