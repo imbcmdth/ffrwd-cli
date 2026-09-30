@@ -1303,6 +1303,90 @@ fn double_doubles_the_frames_and_keeps_the_stretch_of_time() {
     );
 }
 
+/// The `r_frame_rate` a NUT file's header states, read off the wire. An
+/// ffmpeg that probes the stream as the encoding one does (`-analyzeduration
+/// 0 -fpsprobesize 3`) takes this, or guesses from the time base without it,
+/// which for a 1280x720 stream at 1/61440 is 61440 frames a second.
+fn stated_rate(path: &Path) -> Option<(u64, u64)> {
+    let mut demuxer = Demuxer::open(std::fs::File::open(path).expect("open the NUT file"))
+        .expect("read the NUT headers");
+    let mut buf = Vec::new();
+    demuxer.read_frame(&mut buf).expect("read a NUT frame");
+    demuxer.stream().frame_rate
+}
+
+/// A network to run: its `-m` table, its wiring, and whether the rate the
+/// input states should leave with its output.
+type RateCase<'a> = (&'a [(&'a str, &'a str)], &'a str, bool);
+
+#[test]
+fn a_one_to_one_chain_keeps_the_input_frame_rate_and_any_other_drops_it() {
+    // An encoder reading the sidecar budgets its bitrate by the rate the
+    // stream states. Modules that return one frame per frame at its own
+    // timestamp keep the rate that came in; one that makes more frames, or
+    // fewer, anywhere on the way does not, and the rate is left out.
+    ensure_modules_built();
+    let produced = TempFile::new("rate-source.nut");
+    write_nut("testsrc2=s=8x8:r=25:d=1.2", 30, "rgba", produced.path());
+    assert_eq!(stated_rate(produced.path()), Some((25, 1)));
+
+    let single = TempFile::new("rate-single.nut");
+    let stage = run_stage(&module_path("invert"), &[], produced.path(), single.path());
+    assert_stage_ok(&stage, "invert sidecar");
+    assert_eq!(
+        stated_rate(single.path()),
+        Some((25, 1)),
+        "one module, one-to-one"
+    );
+
+    let cases: [RateCase; 4] = [
+        (&[("invert", "invert")], "[0:v]invert[out0]", true),
+        (
+            &[("invert", "invert")],
+            "[0:v]invert[a];[a]invert[out0]",
+            true,
+        ),
+        (
+            &[("invert", "invert"), ("double", "double")],
+            "[0:v]invert[a];[a]double[out0]",
+            false,
+        ),
+        (
+            &[("invert", "invert"), ("double", "double")],
+            "[0:v]double[a];[a]invert[out0]",
+            false,
+        ),
+    ];
+    for (modules, wiring, kept) in cases {
+        let out = TempFile::new("rate-network.nut");
+        let mut args = network_args(modules, wiring);
+        let input = args.iter().position(|a| a == "-i").expect("-i is there") + 1;
+        args[input] = produced
+            .path()
+            .to_str()
+            .expect("path is valid UTF-8")
+            .into();
+        args.extend(
+            ["-map", "[out0]", "-f", "nut"]
+                .iter()
+                .map(|s| s.to_string()),
+        );
+        args.push(out.path().to_str().expect("path is valid UTF-8").into());
+        let run = Command::new(env!("CARGO_BIN_EXE_ffrwd-wasm"))
+            .args(&args)
+            .stdin(Stdio::null())
+            .output()
+            .expect("spawn ffrwd-wasm");
+        assert!(
+            run.status.success(),
+            "{wiring}: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        let expected = if kept { Some((25, 1)) } else { None };
+        assert_eq!(stated_rate(out.path()), expected, "{wiring}");
+    }
+}
+
 // The module network: several modules in one process, wired the way an ffmpeg
 // filtergraph is. Real ffmpeg on both ends of every one of these.
 

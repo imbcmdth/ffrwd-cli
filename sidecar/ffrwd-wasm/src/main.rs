@@ -1540,6 +1540,7 @@ impl Sink {
         output: &OutputSpec,
         node: usize,
         stream: &nut::Stream,
+        keeps_rate: bool,
         annotations: bool,
         rows_chain: Option<rows_chain::RowsChain>,
     ) -> Result<Sink> {
@@ -1556,13 +1557,18 @@ impl Sink {
         };
         match output.kind {
             OutputKind::Frames => {
-                // The frame rate the input declared is dropped: a module may
-                // hand back more frames than it was given, or fewer, or move
-                // them in time, so the rate that described the input does not
-                // describe what leaves here. A reader told a rate its frames
-                // do not keep conforms them to it.
+                // The frame rate the input declared is dropped unless every
+                // module on the way returns one frame per frame at its own
+                // timestamp: another may hand back more frames than it was
+                // given, or fewer, or move them in time, so the rate that
+                // described the input does not describe what leaves here, and
+                // a reader told a rate its frames do not keep conforms them
+                // to it. Kept, it is what an encoder reading this budgets its
+                // bitrate by; without it ffmpeg guesses one from the time base.
                 let mut header = stream.clone();
-                header.frame_rate = None;
+                if !keeps_rate {
+                    header.frame_rate = None;
+                }
                 sink.frames = Some(open_frame_output(&output.path, &header, annotations)?);
                 // Stated after the output is opened, so a file it just
                 // created answers as the file it is.
@@ -1741,7 +1747,12 @@ fn rows_hops(source: usize, specs: &[RowsModuleSpec]) -> Vec<String> {
 /// the node it maps -- except on a line writing ONE rows document, where it
 /// takes the whole chain, which is the spelling from before `-rows` existed.
 /// Each output opens its own instances of the hops its rows flow through.
-fn open_sinks(args: &Args, nodes: &[usize], streams: &[nut::Stream]) -> Result<Vec<Sink>> {
+fn open_sinks(
+    args: &Args,
+    nodes: &[usize],
+    streams: &[nut::Stream],
+    keeps_rate: &[bool],
+) -> Result<Vec<Sink>> {
     let rows_bearing = args.outputs.iter().filter(|o| o.rows_bearing()).count();
     if !args.rows_chain.is_empty() && rows_bearing == 0 {
         bail!(
@@ -1755,7 +1766,9 @@ fn open_sinks(args: &Args, nodes: &[usize], streams: &[nut::Stream]) -> Result<V
         .map(|spec| spec.path.clone())
         .collect();
     let mut sinks = Vec::with_capacity(args.outputs.len());
-    for ((output, node), stream) in args.outputs.iter().zip(nodes).zip(streams) {
+    for (((output, node), stream), keeps) in
+        args.outputs.iter().zip(nodes).zip(streams).zip(keeps_rate)
+    {
         let hops = match (output.rows_bearing(), output.rows) {
             (true, Some(source)) => rows_hops(source, &args.rows_chain),
             (true, None) if rows_bearing == 1 => whole.clone(),
@@ -1770,6 +1783,7 @@ fn open_sinks(args: &Args, nodes: &[usize], streams: &[nut::Stream]) -> Result<V
             output,
             *node,
             stream,
+            *keeps,
             args.annotations.output,
             chain,
         )?);
@@ -2077,7 +2091,8 @@ fn run(args: &Args) -> Result<()> {
             let net = Network::single(filter, &formats[0], reopen);
             let nodes = vec![0usize; args.outputs.len()];
             let sink_streams = vec![streams[0].clone(); args.outputs.len()];
-            let sinks = open_sinks(args, &nodes, &sink_streams)?;
+            let keeps = vec![net.keeps_rate(0); args.outputs.len()];
+            let sinks = open_sinks(args, &nodes, &sink_streams, &keeps)?;
             run_lanes(net, readers, &formats, sinks, args.jobs)
         }
         Modules::Network { bindings, wiring } => {
@@ -2103,7 +2118,8 @@ fn run(args: &Args) -> Result<()> {
                 sink_streams.push(streams[net.root(node)].clone());
                 nodes.push(node);
             }
-            let sinks = open_sinks(args, &nodes, &sink_streams)?;
+            let keeps: Vec<bool> = nodes.iter().map(|node| net.keeps_rate(*node)).collect();
+            let sinks = open_sinks(args, &nodes, &sink_streams, &keeps)?;
             run_lanes(net, readers, &formats, sinks, args.jobs)
         }
     }

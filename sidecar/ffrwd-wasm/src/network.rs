@@ -44,6 +44,10 @@ pub struct Network {
     reads_rows: Vec<bool>,
     /// Whether upstream rows may leave on each node's own output frames.
     forwards_rows: Vec<bool>,
+    /// Whether each node's frames keep the rate of the input they descend
+    /// from: it and every node before it return one frame per frame, at
+    /// that frame's own timestamp.
+    keeps_rate: Vec<bool>,
     labels: HashMap<String, usize>,
     roots: Vec<usize>,
 }
@@ -86,6 +90,7 @@ impl Network {
         let mut seeds = Vec::with_capacity(order.len());
         let mut reads_rows = Vec::with_capacity(order.len());
         let mut forwards_rows = Vec::with_capacity(order.len());
+        let mut keeps_rate: Vec<bool> = Vec::with_capacity(order.len());
         let mut roots = Vec::with_capacity(order.len());
         let mut labels = HashMap::new();
 
@@ -187,6 +192,13 @@ impl Network {
             for label in &node.outputs {
                 labels.insert(label.clone(), seeds.len());
             }
+            keeps_rate.push(
+                seed.shape.one_to_one
+                    && seed.sources.iter().all(|source| match source {
+                        Source::Input(_) => true,
+                        Source::Node(index) => keeps_rate[*index],
+                    }),
+            );
             roots.push(root);
             seeds.push(seed);
         }
@@ -195,6 +207,7 @@ impl Network {
             seeds,
             reads_rows,
             forwards_rows,
+            keeps_rate,
             labels,
             roots,
         })
@@ -205,6 +218,7 @@ impl Network {
     pub fn single(filter: Filter, format: &Format, reopen: Option<Reopen>) -> Network {
         let reads = filter.reads_rows();
         let forwards = filter.forwards_rows();
+        let keeps = filter.shape().one_to_one;
         Network {
             seeds: vec![LaneSeed {
                 name: filter.name().to_string(),
@@ -216,6 +230,7 @@ impl Network {
             }],
             reads_rows: vec![reads],
             forwards_rows: vec![forwards],
+            keeps_rate: vec![keeps],
             labels: HashMap::new(),
             roots: vec![0],
         }
@@ -224,6 +239,12 @@ impl Network {
     /// The node a `-map` target names.
     pub fn node_for(&self, label: &str) -> Option<usize> {
         self.labels.get(label).copied()
+    }
+
+    /// Whether a node's frames keep the frame rate of the input they descend
+    /// from, which an output of them can then state.
+    pub fn keeps_rate(&self, node: usize) -> bool {
+        self.keeps_rate[node]
     }
 
     /// Which `-i` input a node's frames descend from, so an output repeats the
