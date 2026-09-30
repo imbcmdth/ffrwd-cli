@@ -21,6 +21,7 @@ source's complement and alpha is untouched.
 
 from __future__ import annotations
 
+import functools
 import json
 import shutil
 import subprocess
@@ -1294,3 +1295,74 @@ def test_a_paced_mp4_through_a_module_into_an_encoder_finishes(
     assert int(str(written["nb_read_frames"])) == _PACED_SECONDS * _PACED_RATE
     _, audio_end = _span(out_path, "a:0")
     assert audio_end > _PACED_SECONDS - 0.25
+
+
+# -- rows on the first of several pads --------------------------------------
+
+_NOTE_ROWS = _built(_SIDECAR_MODULES, "note_rows")
+_PAD_ROWS = _built(_SIDECAR_MODULES, "pad_rows")
+
+
+def _pad_rows_query(second: str, out_path: Path) -> str:
+    """`n` notes every other frame and feeds pad 0 with its rows named beside
+    it; `second` is what feeds pad 1: the source, or `o`, which notes every
+    frame. What is written is pad_rows' own rows: one per call, saying what
+    rows rode each pad."""
+    note = "STRUCT(pts number, note text)[]"
+    other = second.partition(".")[0]
+    producer = (
+        "       o AS (SELECT (notes(src.v, 'other', 1)).* FROM src),\n" if other == "o" else ""
+    )
+    return (
+        "CREATE FUNCTION notes(v video_stream, label text DEFAULT 'note',\n"
+        "                      every number DEFAULT 5)\n"
+        f"RETURNS STRUCT(v video_stream, notes {note})\n"
+        f"  AS '{_NOTE_ROWS.as_posix()}', 'note_rows' LANGUAGE wasm;\n"
+        f"CREATE FUNCTION pad_rows(a video_stream, b video_stream, notes {note})\n"
+        "RETURNS STRUCT(v video_stream,\n"
+        "               seen STRUCT(pts number, pad0 number, others number, notes text)[])\n"
+        f"  AS '{_PAD_ROWS.as_posix()}', 'pad_rows' LANGUAGE wasm;\n"
+        "COPY (\n"
+        f"  WITH src AS (SELECT s.video[1] AS v FROM input('{_SOURCE.as_posix()}') s),\n"
+        f"{producer}"
+        "       n AS (SELECT (notes(src.v, 'first', 2)).* FROM src)\n"
+        f"  SELECT pad_rows(n.v, {second}, notes => n.notes).seen FROM n, {other}\n"
+        f") TO '{out_path.as_posix()}'"
+    )
+
+
+@pytest.mark.parametrize("second", ["src.v", "o.v"], ids=["a-split-of-the-source", "a-producer"])
+def test_rows_on_the_first_pad_reach_a_module_reading_two_streams(
+    second: str, tmp_path: Path
+) -> None:
+    """Pad 0's rows arrive with its frames and pad 1's never do, whether pad 1
+    is a split of the source or a producer of rows of its own, and the rows
+    written are the same bytes at any worker count."""
+    for module in (_NOTE_ROWS, _PAD_ROWS):
+        if not module.exists():
+            pytest.skip(f"module missing: {module}")
+    frames = int(str(_video_stream(_SOURCE)["nb_read_frames"]))
+    written: dict[int, bytes] = {}
+    for jobs in (1, 4):
+        out_path = tmp_path / f"seen-{jobs}.ndjson"
+        compiled = compile_all(_pad_rows_query(second, out_path))
+        assert compiled.plan is not None
+        assert len(compiled.plan.sidecars) == 1, "producer and reader share a network"
+        result = execute_plan(
+            compiled.plan,
+            sidecar_argv=functools.partial(wasm.sidecar_argv, jobs=jobs),
+            overwrite=True,
+            timeout=_SUBPROCESS_TIMEOUT,
+        )
+        assert result.exit_code == 0, "\n".join(
+            f"{member.id} exited {member.exit_code}: {member.stderr_tail}"
+            for stage in result.stages
+            for member in stage.members
+        )
+        written[jobs] = out_path.read_bytes()
+    assert written[1] == written[4]
+    rows = [json.loads(line) for line in written[1].decode().splitlines()]
+    assert [(row["pad0"], row["others"], row["notes"]) for row in rows] == [
+        (1, 0, f"first-{index}") if index % 2 == 0 else (0, 0, "")
+        for index in range(frames)
+    ]

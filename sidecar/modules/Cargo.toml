@@ -28,6 +28,7 @@ members = [
     "segment",
     "mask_select",
     "pick-first",
+    "pad-rows",
     "frame-stats",
     "packet-stats",
     "packet-tally",

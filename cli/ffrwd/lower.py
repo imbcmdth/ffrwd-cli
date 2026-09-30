@@ -303,6 +303,7 @@ from ffrwd.functions import (
     RuntimeLateral,
     WasmFunction,
     is_number_argument,
+    named_annotation_parameter,
     wasm_named_parameter,
 )
 from ffrwd.inputs import render_options, rendered_options
@@ -1164,6 +1165,12 @@ def _qualified_column(node: object) -> tuple[str, str] | None:
         return None
     table = node.args.get("table")
     return None if table is None else (_fold(table), _fold(node.this))
+
+
+def _quoted_column(node: exp.Expr) -> str:
+    """``<alias>.<column>`` the way a message quotes it."""
+    named = _qualified_column(_unwrap(node))
+    return f"'{node.sql()}'" if named is None else f"'{named[0]}.{named[1]}'"
 
 
 def _projects_annotations(node: exp.Expr, column: str) -> bool:
@@ -3940,6 +3947,10 @@ class _Lowerer:
         # lowered to: every field read off one call in one branch is read off
         # ONE instance, the way both halves of a module's struct are.
         self._data_filter_calls: dict[tuple[str, int], tuple[FrameRef, ...]] = {}
+        # (call text, id(env)) -> the value of a module call a WITH body
+        # selects BOTH halves of, its stream and its rows: one instance, read
+        # by each half (:meth:`_struct_call`).
+        self._struct_calls: dict[tuple[str, int], _Value] = {}
         # Every data filter lowered, with its declaration and its call, for
         # the check that each of its outputs is read.
         self.data_filter_nodes: list[
@@ -11659,6 +11670,10 @@ class _Lowerer:
         rows = self._lower_rows_projection(node, env, select)
         if rows is not None:
             return rows
+        # The stream half of the same struct, selected beside those rows.
+        half = _stream_projection(node, self.res.wasm)
+        if half is not None:
+            return self._struct_call(half, env, select)
         # A rows function's result is that same column, one module later.
         rewritten = self._lower_rows_call(node, env, select)
         if rewritten is not None:
@@ -11674,6 +11689,7 @@ class _Lowerer:
                 f"{_CHAPTER_EXAMPLE}",
             )
         if isinstance(node, exp.Bracket | exp.Column):
+            self._check_not_riding_rows(node, env, select)
             alias, value = self._base_stream(node, env, select)
             return self._access(env, alias, value, node, select)
         if isinstance(node, exp.Filter) and isinstance(node.this, exp.ArrayAgg):
@@ -12012,8 +12028,18 @@ class _Lowerer:
         if found is None:
             return None
         call, declared = found
-        module = self._row_filtered(self._lower_expr(call, env, select), node)
         assert declared.emits is not None  # what `_rows_projection` selected on
+        if self._selects_stream_half(call, select):
+            # Both halves are selected: the rows ride the stream column and
+            # are handed on with it, so nothing is minted for them here.
+            module = self._row_filtered(self._struct_call(call, env, select), node)
+            self.rows_producers[id(node)] = (
+                module.streams[0].ref,
+                module.type,
+                declared.emits,
+            )
+            return _Value(type=module.type, streams=(), is_array=False)
+        module = self._row_filtered(self._lower_expr(call, env, select), node)
         self.rows_producers[id(node)] = (module.streams[0].ref, module.type, declared.emits)
         return self._rows_output(
             module.streams[0].ref,
@@ -12025,6 +12051,88 @@ class _Lowerer:
             env,
             select,
         )
+
+    def _check_not_riding_rows(
+        self, node: exp.Expr, env: _Env, select: exp.Select
+    ) -> None:
+        """A WITH column of rows riding a stream, read where a stream goes.
+
+        A body that selected both halves of a module call minted no track for
+        its rows: they ride the stream column, for a module taking an
+        annotation column to read. Another body may hand the column on under
+        a name of its own; anything else reading it would read nothing.
+        """
+        bound = self._cte_column_ref(node, env)
+        if bound is None or self.cte_body:
+            return
+        binding, name = bound
+        if name not in binding.rows_columns:
+            return
+        if (binding.name, name) in self.cte_rows_documents:
+            return
+        held = next((c for c in binding.columns if c.name == name), None)
+        if held is None or held.value.streams:
+            return
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"{_quoted_column(node)} is rows riding a stream of the same WITH "
+            "body, and only a module taking an annotation column reads them",
+            node,
+            fallback=select,
+            hint="pass it beside that stream, <function>(<alias>.<stream>, ..., "
+            "<column> => <alias>.<rows>); to write a module's rows as a track, "
+            "select <producer>(...).<rows> on its own, without the stream half",
+        )
+
+    def _selects_stream_half(self, call: exp.Anonymous, select: exp.Select) -> bool:
+        """Whether `select` also names the stream field of this same call.
+
+        Resolve admits that field as a column only beside the rows of the
+        call it is read off, so one in the list is the other half of `call`
+        exactly when the two calls are written alike.
+        """
+        written = call.sql()
+        for projection in select.expressions:
+            half = _stream_projection(projection, self.res.wasm)
+            if half is not None and half.sql() == written:
+                return True
+        return False
+
+    def _struct_call(
+        self, call: exp.Anonymous, env: _Env, select: exp.Select
+    ) -> _Value:
+        """A module call whose stream and rows are BOTH columns: one instance.
+
+        A WITH body names the two halves of the struct a module returns, and
+        a later call reads them back as its first stream and its annotation
+        column. The two projections are copies of one call, so they are one
+        node: the stream column is its output and the rows ride it.
+
+        Only a body hands both on. A SELECT that writes its columns has a
+        stream to write and rows that would need a track of their own off a
+        module whose frames already go somewhere else.
+        """
+        declared = self.res.wasm[str(call.name).lower()]
+        assert declared.emits is not None  # what `_stream_projection` selected on
+        if not self.cte_body:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"{declared.name}() is selected as both '{declared.stream_field}' "
+                f"and '{declared.emits.name}', which only a WITH body hands on",
+                call,
+                fallback=select,
+                hint=f"name both in a WITH body, e.g. WITH m AS (SELECT "
+                f"({declared.name}(...)).* FROM ...), and pass m."
+                f"{declared.stream_field} and m.{declared.emits.name} to the "
+                f"module that reads them; '.{declared.emits.name}' selected on "
+                "its own is written as a track",
+            )
+        key = (call.sql(), id(env))
+        found = self._struct_calls.get(key)
+        if found is None:
+            found = self._lower_expr(call, env, select)
+            self._struct_calls[key] = found
+        return found
 
     def _rows_output(
         self,
@@ -12211,7 +12319,11 @@ class _Lowerer:
                     f"drop the {MERGE_CUES}(), or merge what the function "
                     "returns",
                 )
-            module = self._lower_expr(producer_call, env, select)
+            module = (
+                self._struct_call(producer_call, env, select)
+                if self._selects_stream_half(producer_call, select)
+                else self._lower_expr(producer_call, env, select)
+            )
             assert producer.emits is not None  # what _rows_projection selected on
             return module.streams[0].ref, module.type, producer.emits
         if self._rows_call(written) is not None:
@@ -14838,40 +14950,156 @@ class _Lowerer:
         found = self.res.wasm.get(call.name.lower())
         return found if found is not None and found.reads is not None else None
 
+    def _annotation_argument(
+        self,
+        declared: WasmFunction,
+        written_as: WasmFunction,
+        call: _Call,
+        env: _Env,
+        node: exp.Expr,
+    ) -> tuple[exp.Expr | None, _Call]:
+        """The argument a call writes its annotation column with, taken out.
+
+        Right after the streams, or by the column's declared name. What
+        stands there positionally is the column only where it IS rows -- a
+        producing call's own column, or a WITH column bound to one; anything
+        else is the first value, as it always was. `NULL` by name writes no
+        rows, the way leaving the column out does.
+
+        The call comes back without it, so the values after it are read where
+        a call not writing the column has them.
+        """
+        column = named_annotation_parameter(declared)
+        if column is None:
+            return None, call
+        at = declared.stream_arity
+        positional = call.args[at] if len(call.args) > at else None
+        if positional is not None and not self._is_rows_argument(positional, env):
+            positional = None
+        named = next((one for one in call.named if one.name == column.name), None)
+        if named is None:
+            if positional is None:
+                return None, call
+            return positional, replace(call, args=[*call.args[:at], *call.args[at + 1 :]])
+        if positional is not None:
+            raise _error(
+                ErrorCode.UDF_ARG_TYPE,
+                f"{declared.name}() gets '{column.name}' twice: positionally and "
+                "by name",
+                named.value,
+                fallback=node,
+                hint=f"write '{column.name}' once: {written_as.signature}",
+            )
+        call = replace(call, named=[one for one in call.named if one is not named])
+        if isinstance(_unwrap(named.value), exp.Null):
+            return None, call
+        if not self._is_rows_argument(named.value, env):
+            raise _error(
+                ErrorCode.UDF_ARG_TYPE,
+                f"{declared.name}() takes '{column.name}' as {column.type}, and "
+                "its argument is not rows riding a stream",
+                named.value,
+                fallback=node,
+                hint="write the column a module returns beside its stream: "
+                f"{declared.name}(<producer>(...).<stream>, ..., {column.name} => "
+                "<producer>(...).<rows>), or the two columns a WITH body selected "
+                "off one call",
+            )
+        return named.value, call
+
+    def _is_rows_argument(self, argument: exp.Expr, env: _Env) -> bool:
+        """Whether `argument` is rows a stream carries: a producing call's
+        column, narrowed or not, or a WITH column bound to one."""
+        written = _unwrap(argument)
+        if annotation_projection(written, self.res.wasm) is not None:
+            return True
+        bound = self._cte_column_ref(written, env)
+        return bound is not None and bound[1] in bound[0].rows_columns
+
+    def _rides_rows(self, argument: exp.Expr, value: _Value, env: _Env) -> bool:
+        """Whether `argument` is a WITH stream column with rows riding it: the
+        body selected a rows column off the module whose output `value` is."""
+        bound = self._cte_column_ref(_unwrap(argument), env)
+        if bound is None or value.is_array or len(value.streams) != 1:
+            return False
+        ref = value.streams[0].ref
+        return any(riding[0] == ref for riding in bound[0].rows_columns.values())
+
     def _check_annotation_argument(
-        self, declared: WasmFunction, call: _Call, node: exp.Expr, select: exp.Select
+        self,
+        declared: WasmFunction,
+        call: _Call,
+        rows: exp.Expr | None,
+        env: _Env,
+        node: exp.Expr,
+        select: exp.Select,
     ) -> None:
         """That the annotation columns at a call site line up, both ways.
 
         A function taking annotations is written over the call that produces
-        them, or writes the column itself; either way their records have to be
-        the same shape. A function RETURNING them has to be written under one
-        that takes them: the struct it produces is not a stream, and nothing
-        else in the dialect reads one.
+        them, or writes the column itself (`rows`); either way their records
+        have to be the same shape. A function RETURNING them has to be
+        written under one that takes them, or have its fields read: the
+        struct it produces is not a stream, and nothing else in the dialect
+        reads one.
         """
-        # Any stream argument may be the producer: a module reading several
-        # streams is handed annotations by whichever of them returns some. A
-        # call writing the column names its producer there instead.
-        anchor, producer = next(
-            (
-                (argument, found)
-                for argument in call.args[: max(declared.stream_arity, 1)]
-                if (found := self._annotating_call(argument)) is not None
-            ),
-            (call.args[0] if call.args else node, None),
+        arity = declared.stream_arity
+        first = call.args[0] if call.args else node
+        if declared.reads is None:
+            # Any stream argument returning rows is one too many for a
+            # function that takes none.
+            anchor, producer = next(
+                (
+                    (argument, found)
+                    for argument in call.args[: max(arity, 1)]
+                    if (found := self._annotating_call(argument)) is not None
+                ),
+                (first, None),
+            )
+        else:
+            # The rows a module reads ride its FIRST stream. A producer
+            # written whole in any other is one whose rows the sidecar drops.
+            for position, argument in enumerate(call.args[1:arity], start=1):
+                stray = self._annotating_call(argument)
+                if stray is None:
+                    continue
+                param = declared.stream_params[position]
+                raise _error(
+                    ErrorCode.UDF_ARG_TYPE,
+                    f"{declared.name}() reads '{declared.reads.name}' off its "
+                    f"first stream, and {stray.name}() is written as its "
+                    f"'{param.name}' stream",
+                    argument,
+                    fallback=node,
+                    hint=f"rows ride the first stream argument only: write "
+                    f"{stray.name}(...) there, or select both of its halves in "
+                    f"a WITH body and pass its stream column as '{param.name}'",
+                )
+            anchor, producer = first, self._annotating_call(first) if call.args else None
+        emitted = producer.emits if producer is not None else None
+        returned = (
+            f"{producer.name}() returns '{emitted.name}' as {emitted.written}"
+            if producer is not None and emitted is not None
+            else ""
         )
-        at = declared.stream_arity
-        gathered = (
-            annotation_projection(_unwrap(call.args[at]), self.res.wasm)
-            if declared.reads is not None and len(call.args) > at
-            else None
-        )
-        if gathered is not None:
-            anchor, producer = call.args[at], gathered[1]
+        if rows is not None:
+            anchor = rows
+            gathered = annotation_projection(_unwrap(rows), self.res.wasm)
+            if gathered is not None:
+                producer = gathered[1]
+                emitted = producer.emits
+                assert emitted is not None  # what annotation_projection selected on
+                returned = f"{producer.name}() returns '{emitted.name}' as {emitted.written}"
+            else:
+                bound = self._cte_column_ref(_unwrap(rows), env)
+                assert bound is not None  # what `_is_rows_argument` selected on
+                emitted = bound[0].rows_columns[bound[1]][2]
+                returned = f"{_quoted_column(rows)} carries {emitted.written}"
         if (
             declared.emits is not None
             and self._reads_annotations(node) is None
             and not _projects_annotations(node, declared.emits.name)
+            and not _projects_annotations(node, declared.stream_field)
         ):
             raise _error(
                 ErrorCode.UDF_ARG_TYPE,
@@ -14896,7 +15124,7 @@ class _Lowerer:
                 hint=f"declare {declared.name}() with an annotation column after "
                 f"its stream, or call it over a plain {declared.returns}",
             )
-        if producer is None:
+        if emitted is None:
             if declared.reads_optional:
                 return
             raise _error(
@@ -14909,14 +15137,12 @@ class _Lowerer:
                 "annotations, or declare the column DEFAULT NULL to make it "
                 "optional",
             )
-        assert producer.emits is not None  # what _annotating_call selected on
-        if _annotation_fields(declared.reads) == _annotation_fields(producer.emits):
+        if _annotation_fields(declared.reads) == _annotation_fields(emitted):
             return
         raise _error(
             ErrorCode.UDF_ARG_TYPE,
             f"{declared.name}() takes '{declared.reads.name}' as "
-            f"{declared.reads.written}, and {producer.name}() returns "
-            f"'{producer.emits.name}' as {producer.emits.written}",
+            f"{declared.reads.written}, and {returned}",
             anchor,
             fallback=node,
             hint="the two annotation records have to name the same fields, "
@@ -14927,6 +15153,7 @@ class _Lowerer:
         self,
         declared: WasmFunction,
         call: _Call,
+        rows: exp.Expr | None,
         env: _Env,
         node: exp.Expr,
         select: exp.Select,
@@ -14938,16 +15165,15 @@ class _Lowerer:
         the row filter node, where the gather narrowed the rows. None for the
         implicit spelling, where a single argument covers both halves.
 
-        A stream argument naming a different producer is a rejection: the rows
+        A first stream naming a different producer is a rejection: the rows
         ride the stream they were read off, and no other.
         """
-        at = declared.stream_arity
-        if declared.reads is None or len(call.args) <= at:
+        if rows is None:
             return None
-        written = _unwrap(call.args[at])
+        written = _unwrap(rows)
         found = annotation_projection(written, self.res.wasm)
         if found is None:
-            return None
+            return self._bound_annotation(declared, call, written, env, node, select)
         rows_call = found[0]
         stream_call = _stream_projection(call.args[0], self.res.wasm)
         if stream_call is None or stream_call.sql() != rows_call.sql():
@@ -14963,6 +15189,69 @@ class _Lowerer:
             )
         produced = self._lower_expr(rows_call, env, select)
         return self._row_filtered(produced, written)
+
+    def _bound_annotation(
+        self,
+        declared: WasmFunction,
+        call: _Call,
+        written: exp.Expr,
+        env: _Env,
+        node: exp.Expr,
+        select: exp.Select,
+    ) -> _Value:
+        """The first stream of a call whose rows are a WITH column.
+
+        The body selected both halves of one module call, so its rows column
+        is bound to that module's output and rides it. The call's first
+        stream has to BE that output: the same body's stream column, read
+        with nothing between -- a filter in the way would be an ffmpeg one,
+        and the rows do not cross it. A body that narrowed or merged the
+        rows put rows nodes in front of that output, which hand its frames
+        on untouched, so the call reads the stream through them.
+        """
+        bound = self._cte_column_ref(written, env)
+        assert bound is not None and declared.reads is not None  # the caller's
+        binding, name = bound
+        producer = binding.rows_columns[name][0]
+        value = self._lower_expr(call.args[0], env, select)
+        if not value.is_array and len(value.streams) == 1:
+            if value.streams[0].ref == producer:
+                return value
+            if self._under_rows_nodes(producer) == value.streams[0].ref:
+                return replace(value, streams=(replace(value.streams[0], ref=producer),))
+        alias = _quoted_column(written).strip("'").partition(".")[0]
+        rides = next(
+            (
+                column.name
+                for column in binding.columns
+                if column.name is not None
+                and not column.value.is_array
+                and [s.ref for s in column.value.streams] == [producer]
+            ),
+            None,
+        )
+        raise _error(
+            ErrorCode.UDF_ARG_TYPE,
+            f"{declared.name}() reads '{declared.reads.name}' off its first "
+            f"stream, and {_quoted_column(written)} rides another",
+            call.args[0],
+            fallback=node,
+            hint=f"pass the stream those rows ride first, untouched: "
+            f"{declared.name}({alias}.{rides}, ...)"
+            if rides is not None
+            else f"select both halves of the producing call in the WITH body, "
+            f"(<producer>(...)).*, and pass its stream column to "
+            f"{declared.name}() first",
+        )
+
+    def _under_rows_nodes(self, ref: FrameRef) -> FrameRef:
+        """The stream `ref` is, behind any rows nodes written over it."""
+        while (found := self.graph.nodes.get(ref)) is not None and found.filter in (
+            ROWFILTER,
+            ROWMERGE,
+        ):
+            ref = found.inputs[0]
+        return ref
 
     def _row_filtered(self, value: _Value, node: exp.Expr) -> _Value:
         """`value` through the rows nodes written over it, or `value` itself.
@@ -15086,12 +15375,13 @@ class _Lowerer:
                 else f"give it a stream: {declared.signature}",
             )
         expected: list[StreamType] = [kind] * arity
+        rows, call = self._annotation_argument(declared, written_as, call, env, node)
         kinds = self._stream_kinds(call, env, select, arity)
         if kinds != expected:
             raise self._bad_streams(call, node, select, expected, kinds)
-        self._check_annotation_argument(declared, call, node, select)
+        self._check_annotation_argument(declared, call, rows, env, node, select)
         positions = list(range(arity))
-        wired = self._written_annotation(declared, call, env, node, select)
+        wired = self._written_annotation(declared, call, rows, env, node, select)
         streams = {
             position: (
                 wired
@@ -15100,8 +15390,24 @@ class _Lowerer:
             )
             for position in positions
         }
+        # Whether rows reach this call at all: written, or arriving with a
+        # producer in the first stream's place, whole or as the stream column
+        # of a WITH body that selected its rows too. Those ride the frames
+        # whether the column is written or left to its DEFAULT, so the node
+        # says so and an edge between processes carries them as a region
+        # would. A column left to its DEFAULT over a plain stream reads none.
+        annotated = wired is not None or (
+            declared.reads is not None
+            and bool(call.args)
+            and (
+                self._annotating_call(call.args[0]) is not None
+                or self._rides_rows(call.args[0], streams[0], env)
+            )
+        )
         tuples = env.relation.tuples if env.relation is not None else []
-        first = arity + (1 if wired is not None else 0)
+        # The values start right after the streams: a written annotation
+        # column was taken out of the call above.
+        first = arity
         # A module parameter read off a row is one instance per row, the way a
         # filter option read off one is one node per row.
         per_row = any(
@@ -15141,7 +15447,7 @@ class _Lowerer:
                 params,
                 inputs,
                 [kind],
-                reads_annotations=declared.reads is not None,
+                reads_annotations=annotated,
             )
             for one in fed:
                 assert ports is not None  # built beside `fed`

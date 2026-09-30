@@ -2966,6 +2966,23 @@ def is_annotation_argument(node: object, wasm: Mapping[str, WasmFunction]) -> bo
     return isinstance(inner, exp.Array) and _array_gather_select(inner) is not None
 
 
+def named_annotation_argument(
+    consumer: WasmFunction, arguments: Sequence[exp.Expr]
+) -> exp.Expr | None:
+    """What ``<column> => ...`` hands a consumer's annotation column, or None.
+
+    A frame consumer's column may be written by its declared name, wherever
+    the positionals stop. A packet filter's columns are positional only.
+    """
+    if consumer.reads is None or consumer.is_packets:
+        return None
+    for argument in arguments:
+        if isinstance(argument, exp.Kwarg) and kwarg_name(argument) == consumer.reads.name:
+            value = argument.args.get("expression")
+            return value if isinstance(value, exp.Expr) else None
+    return None
+
+
 def _unnest_argument(node: object) -> tuple[object, str | None]:
     """One ``unnest(...)`` argument split into its column and a track title.
 
@@ -5160,7 +5177,7 @@ class _Resolver:
         if path == emits.name:
             return
         if path == declared.stream_field:
-            if self._feeds_a_rows_consumer(sub):
+            if self._feeds_a_rows_consumer(sub) or self._selected_beside_its_rows(sub):
                 return
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
@@ -5199,9 +5216,40 @@ class _Resolver:
             return False
         arguments = [a for a in parent.expressions if isinstance(a, exp.Expr)]
         at = consumer.stream_arity
-        if not any(a is inner for a in arguments[:at]) or len(arguments) <= at:
+        if not any(a is inner for a in arguments[:at]):
             return False
-        return is_annotation_argument(arguments[at], self.wasm)
+        named = named_annotation_argument(consumer, arguments)
+        if named is not None:
+            return is_annotation_argument(named, self.wasm)
+        return len(arguments) > at and is_annotation_argument(arguments[at], self.wasm)
+
+    def _selected_beside_its_rows(self, dot: exp.Dot) -> bool:
+        """Whether `dot` is a SELECT column beside the rows of the same call.
+
+        A SELECT list naming both halves of one struct names one instance:
+        the stream the module returned, and the rows riding it. That is how a
+        WITH body hands both on under names of their own.
+        """
+        inner: exp.Expr = dot
+        parent = dot.parent
+        while isinstance(parent, exp.Paren | exp.Alias):
+            inner, parent = parent, parent.parent
+        if not isinstance(parent, exp.Select) or not any(
+            p is inner for p in parent.expressions
+        ):
+            return False
+        call = _unwrap_paren(dot.this) if isinstance(dot.this, exp.Expr) else None
+        if call is None:
+            return False
+        written = call.sql()
+        for projection in parent.expressions:
+            found = annotation_projection(
+                projection.this if isinstance(projection, exp.Alias) else projection,
+                self.wasm,
+            )
+            if found is not None and found[0].sql() == written:
+                return True
+        return False
 
     def _check_named_arguments(self, call: exp.Func, select: exp.Select) -> None:
         """``name => value`` arguments must TRAIL the positional ones, once each.

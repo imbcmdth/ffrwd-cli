@@ -38,7 +38,7 @@ from ffrwd.compiler import (
 from ffrwd.errors import ErrorCode, FfrwdError
 from ffrwd.execute import CHAIN, PIPELINE, PipeEdge, plan_argv, render_plan
 from ffrwd.functions import WasmFunction, package_modules
-from ffrwd.ir import Graph, RowsSink
+from ffrwd.ir import ROWFILTER, Graph, RowsSink
 from ffrwd.lower import lower, lower_table
 from ffrwd.parser import ModuleExport, Resolved, parse, resolve
 from ffrwd.probe import CueMeta, ProbeResult, StreamMeta
@@ -3358,7 +3358,10 @@ def _multi_rejects(
 
 
 def test_the_bokeh_chain_renders_every_argv() -> None:
-    """One ffmpeg feeds the region, both modules run in it, one ffmpeg muxes."""
+    """One ffmpeg feeds the region, both modules run in it, one ffmpeg muxes.
+
+    The region's one read fans out to both modules, and the edge carries the
+    format they accept: the fan-out is the network's own, not a reader."""
     assert _multi_argv(BOKEH, _bokeh_modules()) == {
         "ffmpeg0": [
             "ffmpeg", "-copyts", "-f", "nut", "-analyzeduration", "0", "-fpsprobesize", "3",
@@ -3368,7 +3371,7 @@ def test_the_bokeh_chain_renders_every_argv() -> None:
         ],
         "ffmpeg1": [
             "ffmpeg", "-i", "shot.mp4",
-            "-map", "0:v:0", "-c:0", "rawvideo", "-pix_fmt:0", "yuv420p",
+            "-map", "0:v:0", "-c:0", "rawvideo", "-pix_fmt:0", "rgba",
             "-f", "nut", "pipe:1",
         ],
         "sidecar0": [
@@ -3389,6 +3392,32 @@ def test_the_split_of_the_source_is_the_regions_one_boundary_read() -> None:
     incoming = [e for e in plan.stream_edges if e.target == "sidecar0"]
     assert len(incoming) == 1
     assert [b.path for b in plan.sidecars[0].modules] == [DEPTH, MASK]
+
+
+@pytest.mark.parametrize(
+    ("depth_formats", "mask_formats", "wire"),
+    [
+        (("rgba",), ("rgba",), "rgba"),
+        (("rgba", "yuv420p"), ("yuv420p",), "yuv420p"),
+        (("yuv420p",), ("rgba", "yuv420p"), "yuv420p"),
+    ],
+    ids=["both-rgba", "depth-prefers-rgba", "mask-prefers-rgba"],
+)
+def test_a_split_carries_its_modules_format_only_where_they_share_it(
+    depth_formats: tuple[str, ...], mask_formats: tuple[str, ...], wire: str
+) -> None:
+    """Every module behind a region's split is opened on the one stream the
+    edge brings, so the edge carries their preferred format where they agree
+    and the default where they do not, whichever of them comes first."""
+    modules = _bokeh_modules(
+        _multi("depth", pixel_formats=depth_formats),
+        _multi("blur-mask", inputs=2, params=MASK_PARAMS, pixel_formats=mask_formats),
+    )
+    plan = _multi_plan(BOKEH, modules).plan
+    assert plan is not None
+    (incoming,) = [e for e in plan.stream_edges if e.target == "sidecar0"]
+    assert isinstance(incoming.format, VideoFormat)
+    assert incoming.format.pix_fmt == wire
 
 
 def test_an_unwritten_value_parameter_falls_back_to_its_default() -> None:
@@ -3497,24 +3526,294 @@ def test_a_signature_mixing_stream_kinds_across_its_streams_is_refused() -> None
     assert error.hint is not None and "one kind of stream" in error.hint
 
 
-def test_an_annotation_column_beside_several_streams_is_refused() -> None:
+def test_a_sink_reading_several_streams_takes_no_annotation_column() -> None:
+    """A sink's streams are the SELECT's own: none of them is the first."""
     sql = (
-        "CREATE FUNCTION blur_mask(v video_stream, mask video_stream,\n"
-        "                          boxes STRUCT(x number)[])\n"
-        "  RETURNS video_stream\n"
-        f"  AS '{MASK}', 'blur-mask' LANGUAGE wasm;\n"
-        "COPY (SELECT blur_mask(s.video[1], s.video[1])\n"
-        "      FROM input('shot.mp4') s) TO 'out.mp4'"
+        "CREATE FUNCTION keep(v video_stream, a audio_stream,\n"
+        "                     boxes STRUCT(x number)[])\n"
+        "  RETURNS sink\n"
+        f"  AS '{MASK}', 'keep' LANGUAGE wasm;\n"
+        "COPY (SELECT s.video[1], s.audio[1] FROM input('shot.mp4') s) TO keep()"
     )
-    modules = {MASK: _multi("blur-mask", inputs=2)}
     error = _multi_rejects(
         sql,
-        modules,
+        {},
         ErrorCode.UNSUPPORTED_SQL,
         "takes the annotation column 'boxes' beside several streams",
     )
     assert error.hint is not None
-    assert "takes no annotation column yet" in error.hint
+    assert "a sink reading several streams" in error.hint
+
+
+# rows off the first of several streams
+#
+# A module reading several streams may take an annotation column after them.
+# The rows ride its FIRST stream: written whole there, or named beside it as
+# the two columns a WITH body selected off one call.
+
+NOTES = "modules/notes.wasm"
+PAIR = "modules/pair.wasm"
+NOTE = "STRUCT(n number)[]"
+ROWS_DECLARE = (
+    "CREATE FUNCTION notes(v video_stream, label text DEFAULT 'a')\n"
+    f"  RETURNS STRUCT(v video_stream, notes {NOTE})\n"
+    f"  AS '{NOTES}', 'notes' LANGUAGE wasm;\n"
+    f"CREATE FUNCTION pair(a video_stream, b video_stream, read {NOTE} DEFAULT NULL,\n"
+    "                     gain number DEFAULT 1)\n"
+    "  RETURNS video_stream\n"
+    f"  AS '{PAIR}', 'pair' LANGUAGE wasm;\n"
+)
+
+
+def _rows_modules() -> dict[str, Described]:
+    note: Mapping[str, object] = {"type": "object", "properties": {"n": {"type": "number"}}}
+    return {
+        NOTES: _multi("notes", rows=note, params={"label": {"type": "string"}}),
+        PAIR: replace(
+            _multi("pair", inputs=2, params={"gain": {"type": "number"}}), reads_rows=True
+        ),
+    }
+
+
+def _rows_query(select: str, body: str = "(notes(src.v)).*") -> str:
+    """`select` over `src`, the source, and `m`, both halves of one notes() call."""
+    return ROWS_DECLARE + (
+        "COPY (WITH src AS (SELECT s.video[1] AS v FROM input('shot.mp4') s),\n"
+        f"           m AS (SELECT {body} FROM src)\n"
+        f"      SELECT {select} FROM m, src) TO 'out.mp4'"
+    )
+
+
+def _rows_graph(select: str) -> Graph:
+    return lower(
+        _resolved(_rows_query(select)),
+        {},
+        registry=_snapshot_registry(),
+        describes=_rows_modules(),
+    )
+
+
+def test_a_multi_stream_signature_declares_its_rows_after_its_streams() -> None:
+    declared = _resolved(_rows_query("pair(m.v, src.v)")).wasm["pair"]
+    assert [p.name for p in declared.stream_params] == ["a", "b"]
+    assert declared.reads is not None and declared.reads.name == "read"
+    assert declared.reads_optional
+    assert [p.name for p in declared.value_params] == ["gain"]
+
+
+@pytest.mark.parametrize(
+    "select",
+    [
+        "pair(m.v, src.v, m.notes)",
+        "pair(m.v, src.v, read => m.notes)",
+        "pair(m.v, src.v, read => m.notes, gain => 1)",
+    ],
+)
+def test_a_with_column_of_rows_is_written_after_the_streams_or_by_name(
+    select: str,
+) -> None:
+    """One producer and the module reading its rows, in one network; the
+    source reaches the second pad through the region's one boundary read."""
+    argv = _multi_argv(_rows_query(select), _rows_modules())["sidecar0"]
+    assert argv == [
+        "ffrwd-wasm", "-f", "nut", "-i", "pipe:0",
+        "-m", f"notes={NOTES}",
+        "-m", f"pair={PAIR}",
+        "-filter_complex", "[0:v]notes=label=a[n1];[n1][0:v]pair=gain=1[out0]",
+        "-map", "[out0]", "-f", "nut", "pipe:1",
+    ]
+
+
+def test_both_halves_written_out_are_the_same_instance_as_the_star() -> None:
+    written = _rows_query(
+        "pair(m.v, src.v, m.notes)",
+        body="notes(src.v).v AS v, notes(src.v).notes AS notes",
+    )
+    assert _multi_argv(written, _rows_modules()) == _multi_argv(
+        _rows_query("pair(m.v, src.v, m.notes)"), _rows_modules()
+    )
+
+
+@pytest.mark.parametrize(
+    "select",
+    [
+        "pair(m.v, src.v, m.notes, 2)",
+        "pair(m.v, src.v, m.notes, gain => 2)",
+        "pair(m.v, src.v, 2, read => m.notes)",
+    ],
+)
+def test_the_values_follow_the_streams_whichever_way_the_rows_are_written(
+    select: str,
+) -> None:
+    argv = _multi_argv(_rows_query(select), _rows_modules())["sidecar0"]
+    assert argv[argv.index("-filter_complex") + 1] == (
+        "[0:v]notes=label=a[n1];[n1][0:v]pair=gain=2[out0]"
+    )
+
+
+def test_a_producer_written_whole_as_the_first_stream_hands_its_rows_over() -> None:
+    sql = ROWS_DECLARE + (
+        "COPY (SELECT pair(notes(s.video[1]), s.video[1])\n"
+        "      FROM input('shot.mp4') s) TO 'out.mp4'"
+    )
+    argv = _multi_argv(sql, _rows_modules())["sidecar0"]
+    assert argv[argv.index("-filter_complex") + 1] == (
+        "[0:v]notes=label=a[n1];[n1][0:v]pair=gain=1[out0]"
+    )
+
+
+def test_a_packages_functions_hand_rows_on_the_same_way(tmp_path: Path) -> None:
+    """The star and the named column read a package call as they read the
+    script's own: the plan is the one the same declarations compile to."""
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "tools.sql").write_text(ROWS_DECLARE, encoding="utf-8")
+    (tmp_path / "ffrwd.json").write_text(
+        json.dumps(
+            {
+                "name": "ffrwd/tools",
+                "version": "1.0.0",
+                "lib": {"notes": "src/tools.sql", "pair": "src/tools.sql"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    packages = discover(tmp_path)
+    assert packages is not None
+    modules = {Path(path).name: described for path, described in _rows_modules().items()}
+    packaged = compile_all(
+        "COPY (WITH src AS (SELECT s.video[1] AS v FROM input('shot.mp4') s),\n"
+        "           m AS (SELECT (ffrwd.tools.notes(src.v)).* FROM src)\n"
+        "      SELECT ffrwd.tools.pair(m.v, src.v, read => m.notes) FROM m, src)\n"
+        "TO 'out.mp4'",
+        packages=packages,
+        describe=lambda path: modules[Path(path).name],
+    ).plan
+    assert packaged is not None
+    (region,) = packaged.sidecars
+    argv = wasm.shown_argv(region)
+    assert argv[argv.index("-filter_complex") + 1] == (
+        "[0:v]notes=label=a[n1];[n1][0:v]pair=gain=1[out0]"
+    )
+
+
+def test_the_node_reads_annotations_only_where_rows_reach_it() -> None:
+    """The first input is the producer itself, so its rows ride the frames
+    into the module whether the column is written or left to its DEFAULT,
+    and the node says so either way: a sidecar hands them over inside one
+    process, and the edge between two has to carry them the same. Over a
+    plain first stream nothing rides, and the node reads none; the rows on
+    the second stream are dropped."""
+    graph = _rows_graph("pair(m.v, src.v, read => m.notes)")
+    (producer,) = (name for name, node in graph.nodes.items() if node.filter == NOTES)
+    (reader,) = (node for node in graph.nodes.values() if node.filter == PAIR)
+    assert reader.inputs == [producer, "src:s:v:0"]
+    assert reader.reads_annotations
+    for select, reads in (("pair(m.v, src.v)", True), ("pair(src.v, m.v)", False)):
+        (read,) = (
+            node for node in _rows_graph(select).nodes.values() if node.filter == PAIR
+        )
+        assert read.reads_annotations is reads, select
+
+
+def test_rows_a_with_body_narrowed_reach_the_module_through_the_rows_node() -> None:
+    """A gather over the rows half puts a rows node in front of the stream
+    half; it hands the frames on untouched, so the module reads its first
+    stream through it and gets the narrowed rows."""
+    body = (
+        "notes(src.v).v AS v, ARRAY(SELECT r FROM unnest(notes(src.v).notes) r "
+        "WHERE r.n > 1) AS notes"
+    )
+    graph = lower(
+        _resolved(_rows_query("pair(m.v, src.v, m.notes)", body=body)),
+        {},
+        registry=_snapshot_registry(),
+        describes=_rows_modules(),
+    )
+    (producer,) = (name for name, node in graph.nodes.items() if node.filter == NOTES)
+    (narrow,) = (name for name, node in graph.nodes.items() if node.filter == ROWFILTER)
+    (reader,) = (node for node in graph.nodes.values() if node.filter == PAIR)
+    assert graph.nodes[narrow].inputs == [producer]
+    assert reader.inputs == [narrow, "src:s:v:0"]
+    assert reader.reads_annotations
+
+
+def test_a_stream_carrying_rows_read_by_two_modules_is_one_instance() -> None:
+    """The WITH column is one node: its second reader splits the output
+    inside the network, where the rows that reach a later pad are dropped."""
+    plan = _multi_plan(
+        _rows_query("pair(pair(m.v, src.v, read => m.notes), m.v)"), _rows_modules()
+    ).plan
+    assert plan is not None
+    (region,) = plan.sidecars
+    argv = wasm.shown_argv(region)
+    assert argv.count(f"notes={NOTES}") == 1
+    assert argv[argv.index("-filter_complex") + 1] == (
+        "[0:v]notes=label=a[n1];[n1][0:v]pair=gain=1[n2];[n2][n1]pair=gain=1[out0]"
+    )
+    assert not any(edge.annotations for edge in plan.stream_edges)
+
+
+@pytest.mark.parametrize(
+    ("select", "code", "needle", "hint"),
+    [
+        (
+            "pair(src.v, m.v, read => m.notes)",
+            ErrorCode.UDF_ARG_TYPE,
+            "pair() reads 'read' off its first stream, and 'm.notes' rides another",
+            "pair(m.v, ...)",
+        ),
+        (
+            "pair(hflip(m.v), src.v, m.notes)",
+            ErrorCode.UDF_ARG_TYPE,
+            "pair() reads 'read' off its first stream, and 'm.notes' rides another",
+            "untouched",
+        ),
+        (
+            "pair(src.v, notes(src.v))",
+            ErrorCode.UDF_ARG_TYPE,
+            "and notes() is written as its 'b' stream",
+            "rows ride the first stream argument only",
+        ),
+        (
+            "pair(m.v, src.v, read => src.v)",
+            ErrorCode.UDF_ARG_TYPE,
+            "pair() takes 'read' as STRUCT(n number)[], and its argument is not "
+            "rows riding a stream",
+            "read => <producer>(...).<rows>",
+        ),
+        (
+            "pair(m.v, src.v, m.notes, read => m.notes)",
+            ErrorCode.UDF_ARG_TYPE,
+            "pair() gets 'read' twice: positionally and by name",
+            "write 'read' once",
+        ),
+        (
+            "pair(m.v, src.v, read => m.notes), m.notes",
+            ErrorCode.UNSUPPORTED_SQL,
+            "'m.notes' is rows riding a stream of the same WITH body",
+            "on its own, without the stream half",
+        ),
+        (
+            "pair(m.v, src.v), (notes(src.v)).*",
+            ErrorCode.UNSUPPORTED_SQL,
+            "notes() is selected as both 'v' and 'notes', which only a WITH "
+            "body hands on",
+            "WITH m AS (SELECT (notes(...)).* FROM ...)",
+        ),
+        (
+            "pair(m.v, src.v, read => m.notes), m.v",
+            ErrorCode.UNSUPPORTED_SQL,
+            f"the module '{PAIR}' reads the rows riding the frames '{NOTES}' "
+            "writes, and an ffmpeg stands between the two",
+            "cross no ffmpeg",
+        ),
+    ],
+)
+def test_rows_that_do_not_ride_the_first_stream_are_refused(
+    select: str, code: ErrorCode, needle: str, hint: str
+) -> None:
+    error = _multi_rejects(_rows_query(select), _rows_modules(), code, needle)
+    assert error.hint is not None and hint in error.hint
 
 
 def test_a_multi_stream_signature_may_still_return_annotations() -> None:

@@ -507,8 +507,8 @@ def test_a_star_beside_other_columns_keeps_its_place() -> None:
 @pytest.mark.parametrize(
     ("projection", "needle", "hint"),
     [
-        ("(stamp(f.data[1], 'es')).*", "stamp() returns no struct of data streams",
-         "RETURNS STRUCT"),
+        ("(stamp(f.data[1], 'es')).*", "expands the fields of a struct, and stamp() "
+         "returns none", "RETURNS STRUCT"),
         ("(auction(f.data[1], f.video[1])).* AS a", "so it takes no AS",
          "the columns are 'd', 'launch'"),
     ],

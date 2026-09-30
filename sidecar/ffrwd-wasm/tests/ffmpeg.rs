@@ -1688,6 +1688,179 @@ fn two_streams_that_drift_apart_are_refused_by_name() {
     );
 }
 
+// pad_rows: two pads in, and one row per call saying what rows rode each. A
+// producer of notes stands in front of a pad, so which pad's rows reach the
+// module is read off its own account of them.
+
+/// One row pad_rows writes.
+#[derive(Deserialize, Debug, PartialEq)]
+struct PadRowsRow {
+    pts: i64,
+    pad0: usize,
+    others: usize,
+    notes: String,
+}
+
+/// Runs one network sidecar ending in pad_rows over `inputs` as files, with
+/// `producers` of notes bound beside it and `extra` on its command line, and
+/// returns the rows it wrote as NDJSON.
+fn run_pad_rows(
+    producers: &[&str],
+    wiring: &str,
+    inputs: &[&Path],
+    extra: &[&str],
+    name: &str,
+) -> Vec<u8> {
+    ensure_modules_built();
+    let rows = TempFile::new(name);
+    let mut args: Vec<String> = Vec::new();
+    for input in inputs {
+        args.push("-f".into());
+        args.push("nut".into());
+        args.push("-i".into());
+        args.push(input.to_str().expect("path is valid UTF-8").into());
+    }
+    args.extend(extra.iter().map(|s| s.to_string()));
+    let mut modules: Vec<(&str, &str)> = producers.iter().map(|p| (*p, "note_rows")).collect();
+    modules.push(("pad", "pad_rows"));
+    // `network_args` opens with its own single stdin input, which the files
+    // above replace.
+    args.extend(network_args(&modules, wiring).into_iter().skip(4));
+    args.push("-map".into());
+    args.push("[out0]".into());
+    args.push("-f".into());
+    args.push("ndjson".into());
+    args.push(rows.path().to_str().expect("path is valid UTF-8").into());
+
+    let out = Command::new(env!("CARGO_BIN_EXE_ffrwd-wasm"))
+        .args(&args)
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn ffrwd-wasm");
+    assert_stage_ok(
+        &StageResult {
+            status: out.status,
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        },
+        name,
+    );
+    std::fs::read(rows.path()).expect("read pad_rows' ndjson output")
+}
+
+fn parse_pad_rows(bytes: &[u8]) -> Vec<PadRowsRow> {
+    String::from_utf8_lossy(bytes)
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap_or_else(|e| panic!("parsing {line:?}: {e}")))
+        .collect()
+}
+
+/// What pad_rows says of each call: the rows on pad 0, the rows on every
+/// other pad, and pad 0's notes.
+fn pad_rows_seen(rows: &[PadRowsRow]) -> Vec<(usize, usize, &str)> {
+    rows.iter()
+        .map(|row| (row.pad0, row.others, row.notes.as_str()))
+        .collect()
+}
+
+/// `first` notes every other frame; this is what its rows read as on pad 0.
+const FIRST_ON_PAD_0: [(usize, usize, &str); 5] = [
+    (1, 0, "first-0"),
+    (0, 0, ""),
+    (1, 0, "first-2"),
+    (0, 0, ""),
+    (1, 0, "first-4"),
+];
+
+#[test]
+fn rows_on_pad_0_reach_a_module_reading_two_streams_and_no_others_do() {
+    let source = TempFile::new("pad-rows-source.nut");
+    write_nut(TWO_PAD_SOURCE, TWO_PAD_FRAMES, "rgba", source.path());
+
+    // One network, a producer in front of each pad: `first` notes every
+    // other frame, `other` every frame. What the compiler emits when both
+    // producers and their reader share a region.
+    let wiring = "[0:v]first=label=first:every=2[n1];[0:v]other=label=other:every=1[n2];\
+                  [n1][n2]pad[out0]";
+    let both = ["first", "other"];
+    let serial = run_pad_rows(
+        &both,
+        wiring,
+        &[source.path()],
+        &["-jobs", "1"],
+        "pad-rows-jobs1",
+    );
+    let parallel = run_pad_rows(
+        &both,
+        wiring,
+        &[source.path()],
+        &["-jobs", "4"],
+        "pad-rows-jobs4",
+    );
+    assert_eq!(
+        serial, parallel,
+        "ndjson output must be byte-identical regardless of -jobs"
+    );
+    assert_eq!(pad_rows_seen(&parse_pad_rows(&serial)), FIRST_ON_PAD_0);
+
+    // The other pad fed from a split of the input itself, which carries no
+    // rows to drop.
+    let split = run_pad_rows(
+        &["first"],
+        "[0:v]first=label=first:every=2[n1];[n1][0:v]pad[out0]",
+        &[source.path()],
+        &[],
+        "pad-rows-split",
+    );
+    assert_eq!(pad_rows_seen(&parse_pad_rows(&split)), FIRST_ON_PAD_0);
+}
+
+#[test]
+fn rows_arriving_on_a_wire_ride_the_pad_that_reads_it() {
+    let plain = TempFile::new("pad-rows-plain.nut");
+    write_nut(TWO_PAD_SOURCE, TWO_PAD_FRAMES, "rgba", plain.path());
+
+    // The producer in a sidecar of its own, its rows on the wire beside the
+    // frames: the process edge between two regions.
+    let annotated = TempFile::new("pad-rows-annotated.nut");
+    let producer = run_stage(
+        &module_path("note_rows"),
+        &[
+            "-params",
+            r#"{"label":"first","every":2}"#,
+            "-annotations",
+            "out",
+        ],
+        plain.path(),
+        annotated.path(),
+    );
+    assert_stage_ok(&producer, "note_rows sidecar");
+
+    // The annotated wire on pad 0, a plain one on pad 1: the rows arrive.
+    let wiring = "[0:v][1:v]pad[out0]";
+    let on_first = run_pad_rows(
+        &[],
+        wiring,
+        &[annotated.path(), plain.path()],
+        &["-annotations", "in"],
+        "pad-rows-wire-first",
+    );
+    assert_eq!(pad_rows_seen(&parse_pad_rows(&on_first)), FIRST_ON_PAD_0);
+
+    // The same two wires the other way round: the rows ride pad 1, and are
+    // dropped before the call.
+    let on_other = run_pad_rows(
+        &[],
+        wiring,
+        &[plain.path(), annotated.path()],
+        &["-annotations", "in"],
+        "pad-rows-wire-other",
+    );
+    assert_eq!(
+        pad_rows_seen(&parse_pad_rows(&on_other)),
+        [(0, 0, ""); TWO_PAD_FRAMES as usize]
+    );
+}
+
 // blur_mask, the other half of the depth-of-field pair: a frame on pad 0 and
 // a mask on pad 1, both made by ffmpeg. The frame is big enough that a blur
 // has somewhere to spread.

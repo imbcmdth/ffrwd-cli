@@ -242,11 +242,12 @@ _WASM_HINT = (
     "video_stream AS '<module>.wasm', '<export>' LANGUAGE wasm, or the same "
     "with audio_stream throughout"
 )
-# What a signature taking several streams may not also do. One axis at a time:
-# the annotation column and the multi-stream signature are separate features.
+# What a sink taking several streams may not also do. A stream function's
+# column rides its first stream; a sink's streams are the SELECT's own, and
+# none of them is the one the rows would ride.
 _WASM_MULTI_HINT = (
-    "a multi-input module takes no annotation column yet: declare its streams, "
-    "then the values it is configured with"
+    "a sink reading several streams takes no annotation column yet: declare "
+    "its streams, then the values it is configured with"
 )
 # The languages a body may be written in, and the stream types a module filters.
 _SQL = "sql"
@@ -1991,9 +1992,10 @@ def _define_wasm(
     parameters that become the module's own. A module that reads annotations
     off each frame returns them beside the stream, as ``STRUCT(<stream>
     <stream type>, <name> STRUCT(...)[])``; one that consumes them takes that
-    column right after its stream. Only those two shapes carry annotations,
-    and every other struct is refused by name. A signature reading several
-    streams may not also CONSUME annotations; returning them is unaffected.
+    column right after its streams. Only those two shapes carry annotations,
+    and every other struct is refused by name. The rows a module consumes
+    ride its FIRST stream, however many it reads: what arrives with any other
+    is dropped before the module is called.
 
     A VALUE function returns text, number, boolean or vector and takes only
     parameters of those same types -- the domain a JSON Schema can
@@ -2171,7 +2173,11 @@ def _define_wasm(
     _check_stream_defaults(
         name, streams, returns in WASM_STREAM_TYPES, identifier, create
     )
-    if len(streams) > 1 or any(is_array(p.type) for p in streams):
+    # A stream function's column rides its FIRST stream however many it
+    # reads; a sink's streams are the SELECT's own and no one of them is first.
+    if returns == WASM_SINK and (
+        len(streams) > 1 or any(is_array(p.type) for p in streams)
+    ):
         _reject_annotation_column(name, params, identifier, create)
     # A packet filter reads its rows as arguments rather than off the stream
     # they ride, so it may declare one column per rows source; every other
@@ -2339,11 +2345,11 @@ def _reject_annotation_column(
     identifier: exp.Identifier,
     create: exp.Create,
 ) -> None:
-    """A signature reading several streams takes no annotation column.
+    """A sink reading several streams takes no annotation column.
 
-    Consuming rows and reading several streams are separate features, and one
-    signature may declare one of them. RETURNING rows is not affected: the
-    column leaves beside the stream however many the module read.
+    A stream function's rows ride its first stream. A sink's streams are
+    counted by the query, not by its declaration, so there is no first one
+    to say the same of.
     """
     column = next((p for p in params if p.annotation is not None), None)
     if column is None:
@@ -3623,10 +3629,16 @@ def wasm_named_parameter(
 
     A stream is written in its own position and never by name; a parameter
     `filled` already holds is not written again; and a name the declaration
-    does not have is refused naming the ones it does.
+    does not have is refused naming the ones it does. A frame consumer's
+    annotation column is the one parameter beside the values a name may
+    write: the rows ride the first stream, so the name says which column of
+    that stream's producer they are.
     """
     values = declared.value_params
+    column = named_annotation_parameter(declared)
     param = next((p for p in values if p.name == name), None)
+    if param is None and column is not None and column.name == name:
+        param = column
     other = next((p for p in declared.params if p.name == name), None)
     if param is not None and any(p.name == name for p in filled):
         raise _error(
@@ -3658,6 +3670,17 @@ def wasm_named_parameter(
         if values
         else f"it takes no value parameters: {declared.signature}",
     )
+
+
+def named_annotation_parameter(declared: WasmFunction) -> Parameter | None:
+    """The annotation column a call may write by name, or None.
+
+    A frame consumer's one column. A packet filter's columns are arguments
+    of their own, each in its declared position.
+    """
+    if declared.reads is None or declared.is_packets or declared.is_sink:
+        return None
+    return declared.params[declared.stream_arity]
 
 
 def _named_position(
@@ -3693,6 +3716,19 @@ def _named_position(
     return index
 
 
+def _struct_fields_of(declared: WasmFunction) -> tuple[str, ...]:
+    """The fields ``(<call>).*`` expands: a struct's own, in declared order.
+
+    A data filter's outputs, or the stream and the annotation column of a
+    module returning both. Empty for a call returning no struct.
+    """
+    if declared.data_fields:
+        return declared.data_fields
+    if declared.emits is not None:
+        return (declared.stream_field, declared.emits.name)
+    return ()
+
+
 def _writes_annotation(
     declared: WasmFunction,
     arguments: Sequence[exp.Expr],
@@ -3703,6 +3739,22 @@ def _writes_annotation(
     if declared.reads is None or len(arguments) <= at:
         return False
     return is_annotation_argument(arguments[at], wasm)
+
+
+def _may_write_annotation(
+    declared: WasmFunction, arguments: Sequence[exp.Expr]
+) -> bool:
+    """Whether the argument in the column's position is a column reference.
+
+    ``<alias>.<column>`` there is the rows a WITH body bound, or a value the
+    first value parameter reads off a row. Which of the two is the alias's
+    to say, and lowering reads it.
+    """
+    at = declared.stream_arity
+    if named_annotation_parameter(declared) is None or len(arguments) <= at:
+        return False
+    written = _unparen(arguments[at])
+    return isinstance(written, exp.Column) and written.args.get("table") is not None
 
 
 def _qualified_by(call: exp.Anonymous) -> bool:
@@ -4431,7 +4483,7 @@ class _Expander:
     # -- wasm calls -------------------------------------------------------
 
     def _expand_data_stars(self, statement: exp.Expr) -> None:
-        """``(<data filter call>).*``: one projection per output the filter returns.
+        """``(<call>).*``: one projection per field of the struct the call returns.
 
         ``SELECT (sell(p.v, ...)).* FROM p`` reads as ``sell(p.v, ...).d AS d,
         sell(p.v, ...).launch AS launch``, every output in the order the
@@ -4439,6 +4491,9 @@ class _Expander:
         ONE call written. The copies are the same call, so they lower to one
         instance exactly as hand-written field reads do, and there is no second
         copy of the arguments to drift out of step with the first.
+
+        A module returning a stream and its rows expands the same way, into
+        the stream and the rows riding it.
         """
         for select in [node for node in _preorder(statement) if isinstance(node, exp.Select)]:
             projections: list[exp.Expr] = []
@@ -4450,7 +4505,7 @@ class _Expander:
                     continue
                 expanded = True
                 declared = self.wasm[_call_name(call)]
-                for field_name in declared.data_fields:
+                for field_name in _struct_fields_of(declared):
                     read = exp.Dot(this=call.copy(), expression=exp.to_identifier(field_name))
                     projections.append(exp.alias_(read, field_name))
             if expanded:
@@ -4459,7 +4514,7 @@ class _Expander:
     def _data_star_call(self, projection: exp.Expr) -> exp.Anonymous | None:
         """The call a ``(<call>).*`` projection expands, or None for any other.
 
-        A star over a call that returns no struct of data streams, or one given
+        A star over a call that returns no struct, or one given
         a name of its own, is refused here: neither has a reading.
         """
         named = projection if isinstance(projection, exp.Alias) else None
@@ -4471,14 +4526,15 @@ class _Expander:
             return None
         name = _call_name(base)
         declared = self.wasm.get(name)
-        if declared is None or not declared.data_fields:
+        if declared is None or not _struct_fields_of(declared):
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
-                f"({name}(...)).* expands a data filter's outputs, and {name}() "
-                "returns no struct of data streams",
+                f"({name}(...)).* expands the fields of a struct, and {name}() "
+                "returns none",
                 projection,
-                hint="expand a call declared RETURNS STRUCT(<name> data_stream, ...), "
-                "or read the call as it is",
+                hint="expand a call declared RETURNS STRUCT(...) -- a data filter's "
+                "outputs, or a stream and the rows riding it -- or read the call "
+                "as it is",
             )
         if named is not None:
             raise _error(
@@ -4487,7 +4543,7 @@ class _Expander:
                 "so it takes no AS",
                 projection,
                 hint="drop the AS; the columns are "
-                + ", ".join(f"'{field_name}'" for field_name in declared.data_fields),
+                + ", ".join(f"'{field_name}'" for field_name in _struct_fields_of(declared)),
             )
         return base
 
@@ -4732,7 +4788,10 @@ class _Expander:
         port spelling of a feeder, which fills that position and the port's,
         so the positionals after it land one parameter further on. Which
         stream is a feeder is the module's own to say, and lowering reads it,
-        so from that number on the positionals are left to lowering.
+        so from that number on the positionals are left to lowering. So are
+        the ones from a column reference in the annotation column's position
+        on: it is that column's rows or the first value, and only the alias
+        it names says which.
         """
         streams = call.meta.get(SINK_STREAMS)
         if declared.is_sink and isinstance(streams, int):
@@ -4742,16 +4801,22 @@ class _Expander:
         positions = declared.written_params
         if _writes_annotation(declared, positional, self.wasm):
             positions = declared.annotation_written_params
+        unsettled = _may_write_annotation(declared, positional)
+        # Such a reference may be the column, so the call holds one more
+        # positional than its values, and what the ones from it on fill is
+        # not known here.
+        limit = len(declared.annotation_written_params) if unsettled else len(positions)
+        settled = declared.stream_arity if unsettled else len(positional)
         plural = "" if len(positional) == 1 else "s"
-        if len(positional) > len(positions):
+        if len(positional) > limit:
             raise _error(
                 ErrorCode.UDF_ARG_TYPE,
                 f"{declared.name}() got {len(positional)} argument{plural}, but it "
-                f"declares {len(positions)}",
+                f"declares {limit}",
                 call,
                 hint=declared.signature,
             )
-        self._check_wasm_named(declared, call, positions[: len(positional)], named)
+        self._check_wasm_named(declared, call, positions[:settled], named)
         spelled = _port_spelling(declared, positional)
         # The port spelling fills two parameters with one argument.
         filled = len(positional) + (0 if spelled is None else 1)
@@ -4773,7 +4838,7 @@ class _Expander:
                 hint=declared.signature,
             )
         checked = positional if spelled is None else positional[:spelled]
-        for param, argument in zip(positions, checked):
+        for param, argument in zip(positions, checked[:settled]):
             self._check_wasm_argument(declared, call, param, argument)
 
     def _check_wasm_argument(

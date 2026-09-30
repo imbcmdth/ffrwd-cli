@@ -323,7 +323,8 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   query reads `w.d` and `w.launch` off it: the arguments are written
   once, and no second copy of them can drift into a second instance. The
   expansion takes no `AS`, and a `.*` over a call that returns no struct
-  of data streams is refused. An output goes where
+  is refused. A frame module returning its stream and its rows expands
+  the same way (see rows beside several streams, below). An output goes where
   a data stream goes: into a `.nut` file, into another data filter, or
   to a sink reading data streams as a pad after its video and audio.
   An output read in several places, by a run-time lateral and a sink
@@ -470,6 +471,34 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   compared against, a reference past the alias, a computed projection,
   and anything else in the `WHERE` are each rejected where they are
   written.
+- **Rows beside several streams.** A frame module's annotation column
+  comes after ALL of its streams, feeders included, and the rows it
+  reads ride its FIRST stream: `pad_rows(a video_stream, b video_stream,
+  notes STRUCT(pts number, note text)[])`. Rows arriving on any other
+  stream are dropped before the module is called, trailing rows with
+  them, so a producer written whole as a later stream argument is
+  refused. The column is written right after the streams or by its
+  name, `notes => ...`. Written or not, the rows riding the first stream
+  are what the module reads: `NULL` by name, like leaving the column
+  out, adds none, and takes none away. A producer's two halves are named
+  in a WITH body with `(<call>).*`, the stream under its field (`v`) and
+  the rows under theirs (`notes`), from ONE instance: `WITH n AS (SELECT
+  (notes(src.v)).* FROM src)`, read back as `pad_rows(n.v, o.v, notes
+  => n.notes)`. The body may narrow the rows half with a gather, and
+  the stream half is then read through the node that narrows them. The
+  first stream has to be the one those rows ride, read with nothing
+  between. A stream column read by two module calls is still one
+  instance, so a module with a feeder keeps one port. Only a WITH body
+  selects both halves; a SELECT that writes its columns reads the rows
+  on their own, as a track.
+  A stream carrying rows is read by modules alone, whose results meet
+  again in one of them: any other reader, an ffmpeg or a second output,
+  stands a `split` in the way, which carries the frames and drops the
+  rows. The rows column of such a body is not written as
+  a track, and it cannot be bound over a per-row stream (a WITH over
+  `moq.subscribe`'s rows); read the stream as `<alias>.v[1]` there. A
+  `RETURNS sink` reading several streams takes no annotation column.
+  Recipe [144](examples.md#144-hand-one-modules-rows-to-a-module-reading-two-streams).
 - Trailing `;` allowed; `--` and `/* */` comments allowed. Unquoted
   identifiers fold to lowercase. View, CTE, and alias names share one
   flat namespace across the whole script.
@@ -1973,11 +2002,17 @@ Every one of these is a typed rejection, never a silent reinterpretation:
   but `vtype`; a record the producing module's
   row schema does not match; an annotation return over a module that
   emits no rows; an annotation column anywhere but right after the
-  stream, beside several streams, given a `DEFAULT` other than `NULL`,
-  or defaulted on a per-frame consumer; a call returning annotations that
-  nothing reads; a call taking them written over an argument that
-  produces none, unless the column defaults; two annotation records
-  that disagree; and a packet filter's rows column naming a field its
+  streams, beside a sink's several streams, given a `DEFAULT` other than
+  `NULL`, or defaulted on a per-frame consumer; a call returning
+  annotations that nothing reads; a call taking them written over an
+  argument that produces none, unless the column defaults; two annotation
+  records that disagree; a producer written as any stream but the
+  first; a column written both positionally and by name; a rows column
+  whose call's first stream is not the stream those rows ride; both
+  halves of a call selected anywhere but a WITH body; a riding rows
+  column read where a stream goes; a stream carrying rows that an
+  ffmpeg or a second output also reads; and a packet filter's rows column
+  naming a field its
   producer does not carry, or carries as another type.
 - **Projections**: a field read off a wasm call that returns no struct;
   the stream half of one read back anywhere but beside the same call's

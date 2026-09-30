@@ -195,6 +195,31 @@ struct Lane {
     flushed_final: bool,
 }
 
+impl Lane {
+    /// The trailing rows this lane's final call is handed.
+    ///
+    /// Everything that reached a lane reading one stream. A lane reading
+    /// several is handed pad 0's and no other's, which is the rule its
+    /// frames' rows already follow.
+    fn final_rows(&self) -> Vec<String> {
+        if self.sources.len() == 1 {
+            let mut rows: Vec<String> = self.trailing_by_pad.iter().flatten().cloned().collect();
+            for upstream in self.trailing_upstream.values() {
+                rows.extend(upstream.iter().cloned());
+            }
+            return rows;
+        }
+        match &self.sources[0] {
+            Source::Input(_) => self.trailing_by_pad[0].clone(),
+            Source::Node(upstream) => self
+                .trailing_upstream
+                .get(upstream)
+                .cloned()
+                .unwrap_or_default(),
+        }
+    }
+}
+
 struct State {
     lanes: Vec<Lane>,
     error: Option<anyhow::Error>,
@@ -269,10 +294,7 @@ impl State {
                 );
             }
         }
-        let mut trailing: Vec<String> = lane.trailing_by_pad.iter().flatten().cloned().collect();
-        for rows in lane.trailing_upstream.values() {
-            trailing.extend(rows.iter().cloned());
-        }
+        let trailing = lane.final_rows();
         let frames = lane.windows.tail();
         lane.final_ordinal = Some(lane.next_ordinal);
         lane.queue.push_back(Task {
@@ -424,7 +446,7 @@ impl State {
 
 /// One frame off every pad, at one timestamp, the way a module reading
 /// several streams is called. Rows ride pad 0; what arrived on any other pad
-/// is dropped here.
+/// is dropped here, and its trailing rows with it (`Lane::final_rows`).
 fn take_lockstep(lane: &mut Lane) -> Result<Vec<Frame>> {
     let head = lane.pads[0]
         .front()
@@ -833,6 +855,91 @@ mod tests {
             (0..24).collect::<Vec<i64>>(),
             "results reassemble by ordinal before anything leaves the lane"
         );
+    }
+
+    /// A stub that hands every frame on with one row naming it, and ends
+    /// with one trailing row.
+    fn noting(label: &'static str) -> Runner {
+        Runner::Stub(Box::new(move |frames, _trailing, last| {
+            Ok(Processed {
+                frames: frames
+                    .iter()
+                    .map(|f| Frame {
+                        pts: f.pts,
+                        data: Arc::clone(&f.data),
+                        rows: vec![format!("{label}-{}", f.pts)],
+                    })
+                    .collect(),
+                trailing: if last {
+                    vec![format!("{label}-end")]
+                } else {
+                    Vec::new()
+                },
+            })
+        }))
+    }
+
+    #[test]
+    fn a_lane_reading_two_streams_is_handed_pad_0s_rows_and_no_others() {
+        // Two producers over one input, each writing a row per frame and a
+        // trailing one, into the two pads of a third lane. At any worker
+        // count that lane sees what rode pad 0, frame by frame and at the
+        // end, and nothing of what rode pad 1.
+        for workers in [1, 4] {
+            let rows = Arc::new(Mutex::new(Vec::new()));
+            let trailed = Arc::new(Mutex::new(Vec::new()));
+            let reader = {
+                let rows = Arc::clone(&rows);
+                let trailed = Arc::clone(&trailed);
+                Runner::Stub(Box::new(move |frames, trailing, _last| {
+                    for frame in frames {
+                        rows.lock().unwrap().extend(frame.rows.iter().cloned());
+                    }
+                    trailed.lock().unwrap().extend(trailing.iter().cloned());
+                    Ok(Processed {
+                        frames: frames.iter().take(1).cloned().collect(),
+                        trailing: Vec::new(),
+                    })
+                }))
+            };
+            let seeds = vec![
+                lane(
+                    "first",
+                    false,
+                    vec![Source::Input(0)],
+                    vec![noting("first")],
+                ),
+                lane(
+                    "other",
+                    false,
+                    vec![Source::Input(0)],
+                    vec![noting("other")],
+                ),
+                lane(
+                    "reader",
+                    false,
+                    vec![Source::Node(0), Source::Node(1)],
+                    vec![reader],
+                ),
+            ];
+            let sched = Scheduler::start(seeds, Vec::new(), 1, workers);
+            for pts in 0..6 {
+                assert!(sched.push_input(0, frame(pts)));
+            }
+            assert!(sched.input_eof(0, &["wire-end".to_string()]));
+            sched.finish().expect("the run drains");
+
+            assert_eq!(
+                *rows.lock().unwrap(),
+                (0..6).map(|pts| format!("first-{pts}")).collect::<Vec<_>>(),
+                "pad 0's rows arrive with its frames, pad 1's are dropped ({workers} workers)"
+            );
+            assert_eq!(
+                *trailed.lock().unwrap(),
+                vec!["first-end".to_string()],
+                "pad 0's trailing rows arrive, pad 1's are dropped ({workers} workers)"
+            );
+        }
     }
 
     #[test]

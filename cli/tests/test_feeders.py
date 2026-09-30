@@ -861,6 +861,132 @@ def test_a_number_where_a_pad_goes_is_refused() -> None:
     )
 
 
+# -- rows beside a feeder --------------------------------------------------------
+#
+# A module with a feeder declares two stream parameters and reads one pad, so
+# its annotation column follows the feeder's place. The rows ride the stream
+# it filters, the first.
+
+FLEX = "modules/flex.wasm"
+COMPOSE = "modules/compose.wasm"
+_CHANGES = "STRUCT(n number)[]"
+_FLEX_DECLARE = (
+    "CREATE FUNCTION flex(v video_stream, feed video_stream DEFAULT NULL, "
+    f"forward {_CHANGES} DEFAULT NULL, port number DEFAULT 9000, lead number DEFAULT 0.3) "
+    f"RETURNS STRUCT(v video_stream, changes {_CHANGES}) AS '{FLEX}', 'flex' LANGUAGE wasm;\n"
+    "CREATE FUNCTION compose(a video_stream, b video_stream, c video_stream, "
+    f"read {_CHANGES} DEFAULT NULL) RETURNS video_stream AS '{COMPOSE}', 'compose' "
+    "LANGUAGE wasm;\n"
+)
+
+
+def _rows_modules() -> dict[str, Described]:
+    changes = {"type": "object", "properties": {"n": {"type": "number"}}}
+    return {
+        FLEX: replace(_probe_module(), name="flex", rows_schema=changes, reads_rows=True),
+        COMPOSE: Described(
+            world=WORLDS[-1], name="compose", pixel_formats=("yuv420p",), windowed=True,
+            inputs=3, reads_rows=True, params_schema={"type": "object", "properties": {}},
+        ),
+    }
+
+
+def _flex_chain(first: str, second: str, read: str = "full.v, lbar.v, prog.v") -> str:
+    """Two flex() calls, each selected whole in a WITH body, and the compose()
+    reading the second's stream first, the first's second and the source last."""
+    return _FLEX_DECLARE + (
+        "COPY (WITH prog AS (SELECT p.video[1] AS v FROM input('prog.mp4') p), "
+        f"lbar AS (SELECT ({first}).* FROM prog, input('ad.mp4') a), "
+        f"full AS (SELECT ({second}).* FROM lbar, input('late.mp4') b) "
+        f"SELECT compose({read}, read => full.changes) FROM full, lbar, prog) TO 'out.mp4'"
+    )
+
+
+def _flex_graph(query: str) -> Graph:
+    return lower.lower(
+        resolve(parse(query)), {}, registry=_registry(), describes=_rows_modules()
+    )
+
+
+@pytest.mark.parametrize(
+    "forward", ["lbar.changes", "forward => lbar.changes", "forward => lbar.changes, lead => 0.3"]
+)
+def test_the_rows_of_a_fed_module_follow_its_feeder_or_go_by_name(forward: str) -> None:
+    graph = _flex_graph(
+        _flex_chain("flex(prog.v, a.video[1])", f"flex(lbar.v, b.video[1], {forward})")
+    )
+    first, second = _module_nodes(graph, FLEX)
+    (reader,) = _module_nodes(graph, COMPOSE)
+    assert graph.nodes[first].inputs == ["src:p:v:0"]
+    assert not graph.nodes[first].reads_annotations
+    assert graph.nodes[second].inputs == [first]
+    assert graph.nodes[second].reads_annotations
+    assert graph.nodes[reader].inputs == [second, first, "src:p:v:0"]
+    assert graph.nodes[reader].reads_annotations
+    # Each call is one instance with a connection of its own, however many
+    # columns of its WITH body are read, and by however many calls. A port
+    # is picked clear of the one above each taken, so the second is 50002.
+    assert [graph.nodes[name].args["port"] for name in (first, second)] == [50000, 50002]
+    assert {path: calls[0].node for path, calls in graph.feeders.items()} == {
+        "tcp://127.0.0.1:50000": first,
+        "tcp://127.0.0.1:50002": second,
+    }
+
+
+def test_the_chain_is_one_network_and_a_writer_per_feeder() -> None:
+    plan = _plan(
+        _flex_chain(
+            "flex(prog.v, a.video[1])",
+            "flex(lbar.v, b.video[1], forward => lbar.changes)",
+        ),
+        _rows_modules(),
+    )
+    (region,) = plan.sidecars
+    assert wasm.shown_argv(region) == [
+        "ffrwd-wasm", "-f", "nut", "-i", "pipe:0", "-tcp", FLEX,
+        "-m", f"flex={FLEX}", "-m", f"compose={COMPOSE}",
+        "-filter_complex",
+        "[0:v]flex=port=50000:lead=0.3[n1];[n1]flex=port=50002:lead=0.3[n3];"
+        "[n3][n1][0:v]compose[out0]",
+        "-map", "[out0]", "-f", "nut", "pipe:1",
+    ]
+    assert [(edge.target, edge.port) for edge in plan.feeder_edges] == [
+        (region.id, 50000),
+        (region.id, 50002),
+    ]
+
+
+def test_rows_written_after_a_port_leave_the_values_after_it_in_place() -> None:
+    """The number fills the feeder's place and the port; the rows follow the
+    streams; the next positional is the value after the port."""
+    graph = _flex_graph(
+        _flex_chain("flex(prog.v, 9001)", "flex(lbar.v, 9002, lbar.changes, 0.5)")
+    )
+    first, second = _module_nodes(graph, FLEX)
+    assert graph.nodes[first].args == {"port": 9001, "lead": 0.3}
+    assert graph.nodes[second].args == {"port": 9002, "lead": 0.5}
+    assert graph.nodes[second].reads_annotations
+    assert graph.feeders == {}
+
+
+def test_rows_off_another_stream_than_the_one_a_fed_module_filters_are_refused() -> None:
+    with pytest.raises(FfrwdError) as caught:
+        _flex_graph(
+            _flex_chain(
+                "flex(prog.v, a.video[1])",
+                "flex(hflip(lbar.v), b.video[1], forward => lbar.changes)",
+            )
+        )
+    error = caught.value
+    assert (error.code, error.message) == (
+        ErrorCode.UDF_ARG_TYPE,
+        "flex() reads 'forward' off its first stream, and 'lbar.changes' rides another",
+    )
+    assert error.hint == (
+        "pass the stream those rows ride first, untouched: flex(lbar.v, ...)"
+    )
+
+
 # The real pick, kept before the fixture above stands a counter in for it.
 _PICK = lower.free_loopback_port
 

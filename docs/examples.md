@@ -1077,3 +1077,43 @@ computed `1080p`) - each row's video cell (or, on the audio-only row, its
 audio cell) is an unmodified read of a rendition row, so it carries that
 rendition's own name rather than one derived from height or language.
 
+
+## 144. Hand one module's rows to a module reading two streams
+
+A module reading several streams takes an annotation column too, after all of its streams, and the rows it reads ride its FIRST stream. `(notes(...)).*` in a WITH body names both halves of one call, the stream as `v` and its rows as `notes`, and the reader takes them back as its first stream and its column - here by name:
+
+```pgsql
+CREATE FUNCTION notes(v video_stream, label text DEFAULT 'note',
+                      every number DEFAULT 5)
+RETURNS STRUCT(v video_stream, notes STRUCT(pts number, note text)[])
+  AS '../sidecar/modules/target/wasm32-wasip2/release/note_rows.wasm', 'note_rows'
+  LANGUAGE wasm;
+
+CREATE FUNCTION pad_rows(a video_stream, b video_stream,
+                         notes STRUCT(pts number, note text)[])
+RETURNS STRUCT(v video_stream,
+               seen STRUCT(pts number, pad0 number, others number, notes text)[])
+  AS '../sidecar/modules/target/wasm32-wasip2/release/pad_rows.wasm', 'pad_rows'
+  LANGUAGE wasm;
+
+COPY (
+  WITH src AS (SELECT f.video[1] AS v FROM input('tests/fixtures/av.mp4') f),
+       n AS (SELECT (notes(src.v, 'first', 2)).* FROM src),
+       o AS (SELECT (notes(src.v, 'other', 1)).* FROM src)
+  SELECT pad_rows(n.v, o.v, notes => n.notes).seen FROM n, o
+) TO 'seen.ndjson'
+```
+
+```
+$ ffrwd compile -f query.sql
+ffmpeg -i tests/fixtures/av.mp4 -map 0:v:0 -c:0 rawvideo -pix_fmt:0 rgba -f nut pipe:1 | \
+  ffrwd-wasm -f nut -i pipe:0 -m \
+  note_rows=../sidecar/modules/target/wasm32-wasip2/release/note_rows.wasm -m \
+  pad_rows=../sidecar/modules/target/wasm32-wasip2/release/pad_rows.wasm -filter_complex \
+  '[0:v]note_rows=label=first:every=2[n1];[0:v]note_rows=label=other:every=1[n2];'\
+'[n1][n2]pad_rows[out0]' -map '[out0]' -f ndjson seen.ndjson
+```
+
+Both `notes` calls and `pad_rows` run in one sidecar, and the rows never leave it: `n`'s notes ride the frames on `pad_rows`' first pad, and `o`'s, on the second, are dropped before the module is called. `pad_rows` is a stand-in that writes one row per call saying what reached it, so `seen.ndjson` holds sixty rows, `"first-0"` on frame 0, nothing on frame 1, `"first-2"` on frame 2, and never a note from `o`.
+
+The first stream has to be the one those rows ride, untouched: `pad_rows(o.v, n.v, notes => n.notes)` is refused, and so is an ffmpeg filter between `n.v` and the call, since ffmpeg carries the frames on and drops the rows. Selecting both halves is a WITH body's business alone; a SELECT that writes its columns reads `.notes` on its own, as a track.

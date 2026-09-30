@@ -3427,6 +3427,43 @@ class _Partitioner:
                 "stream, through modules that declare one frame out per frame in",
             )
 
+    def _check_rows_reach(self) -> None:
+        """That the rows a module reads can reach it.
+
+        Rows ride a module's frames to the module reading them: in memory
+        inside one region, on an annotated edge between two. An ffmpeg
+        carries the frames on and drops the rows, and the one ffmpeg node
+        that can stand between the two is a `split` a reader outside the
+        region kept out of it.
+        """
+        for name in self.order:
+            node = self.g.nodes[name]
+            if not self.external[name] or not node.reads_annotations or not node.inputs:
+                continue
+            split = _ref_node(node.inputs[0])
+            if split is None or self.external.get(split, True):
+                continue
+            if self.g.nodes[split].filter not in SPLIT_FILTERS:
+                continue
+            if self.sidecar_of.get(split) == self.sidecar_of.get(name):
+                continue
+            carried = self.g.nodes[split].inputs[0]
+            producer = _ref_node(carried)
+            if producer is None or not self.external.get(producer, False):
+                continue
+            raise FfrwdError(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"the module '{node.filter}' reads the rows riding the frames "
+                f"'{self.g.nodes[producer].filter}' writes, and an ffmpeg stands "
+                f"between the two: those frames are read by "
+                f"{self._pad_readers(carried)}",
+                hint="rows reach a module from the module before it and cross no "
+                "ffmpeg: a stream carrying rows may be read by several modules "
+                "whose results meet again in one of them, and by nothing else. "
+                "Give the other reader a stream of its own, e.g. a second call "
+                "of the producing module",
+            )
+
     def run(self) -> ProcessPlan:
         self._check_lockstep()
         for members in self._regions():
@@ -3472,6 +3509,7 @@ class _Partitioner:
             self.members[sidecar.id] = list(members)
             for name in members:
                 self.sidecar_of[name] = sidecar.id
+        self._check_rows_reach()
 
         # One ffmpeg process per output-file group, then one per raw stream
         # edge, created as the demand for it is found.
@@ -3870,8 +3908,9 @@ class _Partitioner:
     ) -> None:
         # The consuming NODE, where a sidecar process is what consumes: the
         # format an edge carries is the module's, not the process id's.
-        consumer = self._reader(target, ref)
-        wire = self._format(ref, consumer)
+        reader = self._reader(target, ref)
+        consumer = self._past_split(target, reader)
+        wire = self._format(ref, self._wire_reader(target, reader))
         if copy and not isinstance(wire, DataFormat) and self._copyable(ref):
             # Nothing on the far side filters this stream, so it travels as it
             # arrived: NUT carries the packets and both ends copy them, which
@@ -3902,6 +3941,50 @@ class _Partitioner:
             if ref in self.g.nodes[name].inputs:
                 return name
         return None
+
+    def _past_split(self, target: str, reader: str | None) -> str | None:
+        """The module `reader` stands in front of, where it is a region's split.
+
+        A region dissolves its own fan-out: the network hands the stream to
+        each reader itself, so an edge ending at such a split ends at the
+        modules behind it, and carries what the first of them accepts.
+        """
+        return next(iter(self._behind_split(target, reader)), reader)
+
+    def _behind_split(self, target: str, reader: str | None) -> list[str]:
+        """The modules of `target` reading `reader`, where it is a region's
+        split; empty for any other reader."""
+        if reader is None or self.external.get(reader, False):
+            return []
+        if self.g.nodes[reader].filter not in SPLIT_FILTERS:
+            return []
+        return [
+            name
+            for name in self.members.get(target, [])
+            if any(_ref_node(read) == reader for read in self.g.nodes[name].inputs)
+        ]
+
+    def _wire_reader(self, target: str, reader: str | None) -> str | None:
+        """The node whose format an edge ending at `reader` carries.
+
+        Behind a region's split, the first module that names a wire format,
+        where every module naming one names the same: the network opens each
+        of them on the stream the edge brings. Where they differ, the split
+        itself, and the edge carries the default, as it did before a split's
+        modules were looked past at all. A data filter's clock pad names
+        none and takes what arrives.
+        """
+        named = [
+            (name, wire)
+            for name in self._behind_split(target, reader)
+            if (wire := (
+                self.pix_fmts.get(self.g.nodes[name].filter),
+                self.audio_wires.get(self.g.nodes[name].filter),
+            )) != (None, None)
+        ]
+        if not named or any(wire != named[0][1] for _, wire in named):
+            return reader
+        return named[0][0]
 
     def _carries_annotations(self, ref: FrameRef, consumer: str | None) -> bool:
         """Whether this edge's frames travel with the producer's rows.
