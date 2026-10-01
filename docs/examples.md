@@ -1117,3 +1117,272 @@ ffmpeg -i tests/fixtures/av.mp4 -map 0:v:0 -c:0 rawvideo -pix_fmt:0 rgba -f nut 
 Both `notes` calls and `pad_rows` run in one sidecar, and the rows never leave it: `n`'s notes ride the frames on `pad_rows`' first pad, and `o`'s, on the second, are dropped before the module is called. `pad_rows` is a stand-in that writes one row per call saying what reached it, so `seen.ndjson` holds sixty rows, `"first-0"` on frame 0, nothing on frame 1, `"first-2"` on frame 2, and never a note from `o`.
 
 The first stream has to be the one those rows ride, untouched: `pad_rows(o.v, n.v, notes => n.notes)` is refused, and so is an ffmpeg filter between `n.v` and the call, since ffmpeg carries the frames on and drops the rows. Selecting both halves is a WITH body's business alone; a SELECT that writes its columns reads `.notes` on its own, as a track.
+
+## 145. A detector returns its rows, and the picture stays where it was
+
+A module reading one stream need not hand it back. `spot` finds a mark in each frame and returns rows alone - `RETURNS STRUCT(...)[]` with no stream beside it is a data stream the query reads while it runs - and `ring` draws them, reading the picture from the source and the rows from the detector. Both arguments descend from `f.video[1]`, so the rows pair with the frames by pts, frame for frame, and nothing is copied that the detector did not make:
+
+```pgsql
+CREATE FUNCTION spot(v video_stream, every number DEFAULT 30)
+RETURNS STRUCT(start_t number, id number, x number, y number, w number, h number)[]
+  AS '../sidecar/modules/target/wasm32-wasip2/release/spot.wasm', 'spot'
+  LANGUAGE wasm;
+
+CREATE FUNCTION ring(v video_stream,
+                     spots STRUCT(start_t number, id number,
+                                  x number, y number, w number, h number)[])
+RETURNS video_stream
+  AS '../sidecar/modules/target/wasm32-wasip2/release/ring.wasm', 'ring'
+  LANGUAGE wasm;
+
+COPY (
+  SELECT ring(f.video[1], spot(f.video[1]))
+  FROM input('tests/fixtures/testsrc.mp4') f
+) TO 'ringed.mp4' WITH (video_codec 'libx264', crf 20)
+```
+
+```
+<pinned when the binding lands>
+```
+
+`spot` writes one row per frame for as long as the mark is in view, and every row of one mark carries the pts it was first seen at as `start_t`: the row for frame t says what is true at t, so a reader needs no look-ahead and a run split across workers agrees on the ids. The old spelling, a module returning `STRUCT(v video_stream, spots ...)` with the picture untouched, is what a package keeps when its own module has not moved: inside the sidecar the rows ride the frames exactly as before. A migrated package that wants the old reading back writes it in SQL - `CREATE FUNCTION spotted(v video_stream) RETURNS STRUCT(v video_stream, spots STRUCT(...)[]) AS $$ SELECT v, spot(v) AS spots $$ LANGUAGE sql` - and `ring(spotted(v))` reads the record as the stream and the rows, as a call over a two-part result always has.
+
+## 146. A reader names only the fields it reads
+
+`dim` wants a box; it does not care who found it or when. Its parameter declares the four fields it reads, and `spot`'s six-field rows are accepted because every field `dim` names is there with the type it names - the others pass through untouched. Row matching is structural, so one reader serves every detector whose rows carry a box:
+
+```pgsql
+CREATE FUNCTION spot(v video_stream, every number DEFAULT 30)
+RETURNS STRUCT(start_t number, id number, x number, y number, w number, h number)[]
+  AS '../sidecar/modules/target/wasm32-wasip2/release/spot.wasm', 'spot'
+  LANGUAGE wasm;
+
+CREATE FUNCTION dim(v video_stream, boxes STRUCT(x number, y number, w number, h number)[],
+                    amount number DEFAULT 0.5)
+RETURNS video_stream
+  AS '../sidecar/modules/target/wasm32-wasip2/release/dim.wasm', 'dim'
+  LANGUAGE wasm;
+
+COPY (
+  SELECT dim(f.video[1],
+             ARRAY(SELECT s FROM unnest(spot(f.video[1])) s WHERE s.w * s.h > 400))
+  FROM input('tests/fixtures/testsrc.mp4') f
+) TO 'dimmed.mp4' WITH (video_codec 'libx264', crf 20)
+```
+
+```
+<pinned when the binding lands>
+```
+
+A field the reader names that the producer's rows lack, or carries with another type, is still refused at compile time, naming both. The WHERE runs inside the sidecar as before, and it may test fields the reader never sees.
+
+## 147. One call, however many places read it
+
+`hear` listens to the sound and writes a cue per window. The query reads it twice, as a caption track of the file and as the words `burn` paints onto the picture, and that is one node: a call with the same arguments written anywhere in one query is evaluated once, and its data output is split to every reader. Today those were two runs of the model, since a caption track feeds the muxer and a module's rows feed a stage of its own:
+
+```pgsql
+CREATE FUNCTION hear(a audio_stream) RETURNS cue[]
+  AS '../sidecar/modules/target/wasm32-wasip2/release/hear.wasm', 'hear'
+  LANGUAGE wasm;
+
+CREATE FUNCTION burn(v video_stream, a audio_stream DEFAULT NULL,
+                     words cue[] DEFAULT NULL)
+RETURNS video_stream
+  AS '../sidecar/modules/target/wasm32-wasip2/release/burn.wasm', 'burn'
+  LANGUAGE wasm;
+
+COPY (
+  SELECT burn(f.video[1], words => hear(f.audio[1])), f.audio[1], hear(f.audio[1])
+  FROM input('tests/fixtures/av.mp4') f
+) TO 'heard.mkv' WITH (video_codec 'libx264', crf 20, audio_codec 'copy')
+```
+
+```
+<pinned when the binding lands>
+```
+
+Two calls whose arguments differ are still two nodes. The split is of a data edge, so what it costs is a second copy of each row, not a second run.
+
+## 148. A node reads the picture, the sound and the words at once
+
+A module's inputs are any mix of kinds in any order: `burn` takes the picture as its clock, the sound beside it frame for frame, and the words by their time. Each is a port of its own with its own pairing, declared by the module and read by the compiler, so the query writes the call and nothing about how the three are lined up:
+
+```pgsql
+CREATE FUNCTION hear(a audio_stream) RETURNS cue[]
+  AS '../sidecar/modules/target/wasm32-wasip2/release/hear.wasm', 'hear'
+  LANGUAGE wasm;
+
+CREATE FUNCTION burn(v video_stream, a audio_stream DEFAULT NULL,
+                     words cue[] DEFAULT NULL)
+RETURNS video_stream
+  AS '../sidecar/modules/target/wasm32-wasip2/release/burn.wasm', 'burn'
+  LANGUAGE wasm;
+
+COPY (
+  SELECT burn(f.video[1], f.audio[1], hear(f.audio[1])), f.audio[1]
+  FROM input('tests/fixtures/av.mp4') f
+) TO 'burned.mp4' WITH (video_codec 'libx264', crf 20, audio_codec 'aac')
+```
+
+```
+<pinned when the binding lands>
+```
+
+`hear` works two seconds of sound at a time and says so, and a window's cues leave with the window. `burn` reads them by interval, so the host holds each picture until the window holding its time is done, and the picture leaves `burn` two seconds behind the sound that enters it. [Recipe 153](#153-see-what-each-node-waits-for) shows where that number is printed.
+
+## 149. Leave an input out
+
+Any stream parameter may carry `DEFAULT NULL`, and a call leaves it off or writes `NULL`: the port is unbound and the module is told so. `burn` with the picture alone paints nothing; with the sound and no words it paints a level meter; `inset` shows a feed that connects later, by port, over the picture, and runs on the picture alone until something connects:
+
+```pgsql
+CREATE FUNCTION burn(v video_stream, a audio_stream DEFAULT NULL,
+                     words cue[] DEFAULT NULL)
+RETURNS video_stream
+  AS '../sidecar/modules/target/wasm32-wasip2/release/burn.wasm', 'burn'
+  LANGUAGE wasm;
+
+CREATE FUNCTION inset(v video_stream, feed video_stream DEFAULT NULL,
+                      port number DEFAULT 9000, lead number DEFAULT 0.5)
+RETURNS video_stream
+  AS '../sidecar/modules/target/wasm32-wasip2/release/inset.wasm', 'inset'
+  LANGUAGE wasm;
+
+COPY (
+  SELECT inset(burn(f.video[1], f.audio[1]), port => 9100), f.audio[1]
+  FROM input('tests/fixtures/av.mp4') f
+) TO 'inset.mp4' WITH (video_codec 'libx264', crf 20, audio_codec 'aac')
+```
+
+```
+<pinned when the binding lands>
+```
+
+`feed` is a hold input: whatever connects to port 9100 is shown at the picture's pace from `lead` seconds after its first frame arrives, the last frame held while it runs late, and the picture alone again when it ends. The compile listing names the port and the process that owns it, as it does for a switch's feeders. An input with no `DEFAULT NULL` is required, and a call that leaves it off is refused.
+
+## 150. Tile any number of pictures
+
+`video_stream[]` declares a port that takes as many streams as the call gives it, each arriving with its own size, rate and tags. `tile` lays them out in a grid. It ticks at the first picture's rate, or at `fps` when the call says so, and at every tick shows each stream's newest frame, so the pictures need not share a rate or a start:
+
+```pgsql
+CREATE FUNCTION tile(v video_stream[], columns number DEFAULT 2, fps number DEFAULT NULL)
+RETURNS video_stream
+  AS '../sidecar/modules/target/wasm32-wasip2/release/tile.wasm', 'tile'
+  LANGUAGE wasm;
+
+COPY (
+  SELECT tile(ARRAY[a.video[1], b.video[1], c.video[1]], 3)
+  FROM input('tests/fixtures/av.mp4') a,
+       input('tests/fixtures/av2.mp4') b,
+       input('tests/fixtures/testsrc.mp4') c
+) TO 'tiled.mp4' WITH (video_codec 'libx264', crf 20)
+```
+
+```
+<pinned when the binding lands>
+```
+
+A bare array column broadcasts over a filter, one call per element; over a module port declared as an array it is the port's whole list, and a module that wants one call per element is called under `unnest`. `audio_stream[]` and a rows parameter with `[]` on the record work the same way. A port that takes several streams cannot be the module's clock, which is why `tile` keeps time itself; the rate it keeps is read off the first picture by the compiler, which knows every stream's rate before anything runs.
+
+## 151. A node makes a matte and the rows that go with it
+
+A module that produces two things returns a record naming both: `matte` makes a mask of the mark it finds and a row per mark, and both leave the one node. Read either field off the call, or every field at once with `.*` in a WITH body; however the fields are read, the call is one instance:
+
+```pgsql
+CREATE FUNCTION matte(v video_stream, every number DEFAULT 30)
+RETURNS STRUCT(mask video_stream,
+               spots STRUCT(start_t number, id number,
+                            x number, y number, w number, h number)[])
+  AS '../sidecar/modules/target/wasm32-wasip2/release/matte.wasm', 'matte'
+  LANGUAGE wasm;
+
+CREATE FUNCTION dim(v video_stream, boxes STRUCT(x number, y number, w number, h number)[],
+                    amount number DEFAULT 0.5)
+RETURNS video_stream
+  AS '../sidecar/modules/target/wasm32-wasip2/release/dim.wasm', 'dim'
+  LANGUAGE wasm;
+
+COPY (
+  WITH m AS (SELECT (matte(f.video[1])).* FROM input('tests/fixtures/testsrc.mp4') f)
+  SELECT dim(m.mask, m.spots), m.spots
+  FROM m
+) TO 'matte.mkv' WITH (video_codec 'ffv1')
+```
+
+```
+<pinned when the binding lands>
+```
+
+Each field is an output port with a format and a time base of its own, declared by the module for the call's parameters. [Recipe 94](#94-blur-the-people-and-only-the-people)'s `segment` is this shape, and its rows no longer ride the map's frames: they are a data stream beside it, which is why `mask_select` can read them from a call `segment` is not part of.
+
+## 152. Spans from the rows that said so, frame by frame
+
+A row per frame is the honest shape for a thing known as it happens, and a span is what a subtitle track or a record wants. `ffrwd.merge_spans` is the reducer between them, a node the host provides: it groups rows by `start_t`, keeps the last row's fields, and ends each span at the last frame that carried it plus that frame's duration. A frame that misses a row is a gap inside the span, not the end of it:
+
+```pgsql
+CREATE FUNCTION spot(v video_stream, every number DEFAULT 30)
+RETURNS STRUCT(start_t number, id number, x number, y number, w number, h number)[]
+  AS '../sidecar/modules/target/wasm32-wasip2/release/spot.wasm', 'spot'
+  LANGUAGE wasm;
+
+COPY (
+  SELECT ffrwd.merge_spans(spot(f.video[1]), max_span => 10)
+  FROM input('tests/fixtures/testsrc.mp4') f
+) TO 'spots.ndjson'
+```
+
+```
+<pinned when the binding lands>
+```
+
+The rows out carry `start_t` and `end_t` beside the fields in, one row per span, so `spots.ndjson` holds one line per mark rather than one per frame. Rows whose fields are `start_t` and `text` reduce to cues, and selecting them beside a picture writes a subtitle track. A span row leaves when its span ends, so a span is as late as it is long; `max_span` bounds that, and it is what a reader pairing by time waits for. A span still open after ten seconds is written as it stands and goes on as a new one. The reducer closes a span on its producer's progress, not on the next row, so the last span of a run ends where the rows did.
+
+## 153. See what each node waits for
+
+Every node declares the window it works in and how late its rows may leave, and the compiler adds the waits up along each path. `explain` prints them: per node, its window in streaming SQL's words (per-frame, tumbling, hopping, sliding), and per output, how far behind the source it runs. The query is [recipe 148](#148-a-node-reads-the-picture-the-sound-and-the-words-at-once)'s:
+
+```pgsql
+CREATE FUNCTION hear(a audio_stream) RETURNS cue[]
+  AS '../sidecar/modules/target/wasm32-wasip2/release/hear.wasm', 'hear'
+  LANGUAGE wasm;
+
+CREATE FUNCTION burn(v video_stream, a audio_stream DEFAULT NULL,
+                     words cue[] DEFAULT NULL)
+RETURNS video_stream
+  AS '../sidecar/modules/target/wasm32-wasip2/release/burn.wasm', 'burn'
+  LANGUAGE wasm;
+
+COPY (
+  SELECT burn(f.video[1], f.audio[1], hear(f.audio[1])), f.audio[1]
+  FROM input('tests/fixtures/av.mp4') f
+) TO 'burned.mp4' WITH (video_codec 'libx264', crf 20, audio_codec 'aac')
+```
+
+```
+$ ffrwd explain -f query.sql
+<pinned when the binding lands>
+```
+
+`hear` is a tumbling window of 2 s, so its cues trail the sound by up to 2 s and nothing more; `burn`'s picture is 2 s behind the source, and the sound written beside it waits in its pipe for the same 2 s, which `compile` sizes. On a live input the same sums decide whether a query can run at all: a node that must act ahead of time (an ad decision that needs `announce_before_s`, a playout that needs `lead_s`) fed by a path later than that lead is refused at compile time as `LIVE_LEAD`, naming the node, the lead it needs and the delay of the path feeding it. A file run has no such rule, since nothing there is late.
+
+## 154. A page with no inputs is a source
+
+A module with no stream parameters is a source: it declares its outputs for its parameters, ticks at the rate it declares, and reads nothing. `ticker` draws a line of text crossing a canvas. `RETURNS source` puts it in FROM, where the alias carries the stream columns the module declared, and the query reads them as it reads a file's:
+
+```pgsql
+CREATE FUNCTION ticker(text text, width number DEFAULT 1280, height number DEFAULT 720,
+                       fps number DEFAULT 30) RETURNS source
+  AS '../sidecar/modules/target/wasm32-wasip2/release/ticker.wasm', 'ticker'
+  LANGUAGE wasm;
+
+COPY (
+  SELECT s.video[1]
+  FROM ticker('Nothing to see here') s
+  WHERE s.t < 10
+) TO 'ticker.mp4' WITH (video_codec 'libx264', crf 20)
+```
+
+```
+<pinned when the binding lands>
+```
+
+In a file run the source runs as fast as its reader drains it; in a live run it is paced to the wall clock. `WHERE s.t < 10` ends it after ten seconds, as it would any source. A network source is the same shape with a clock of its own: it emits when it has something, and `shape` may reach the network at compile time to learn its outputs, as a manifest is probed. `ffrwd.blitz.compose` with no streams, a page that animates on its own, is this recipe's shape too.
