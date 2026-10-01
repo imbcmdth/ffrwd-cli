@@ -130,7 +130,7 @@ import tempfile
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import IO, Literal, cast
@@ -260,6 +260,14 @@ _READ_AHEAD = 1 << 25
 _SPOOL_MEMORY = 1 << 22
 # What `ProcessResult.stderr_tail` keeps.
 _TAIL_LINES = 20
+# How much of each member's stderr a run holds in memory: its end, which is
+# what a failure is reported with and judged by. A live run's members write
+# for hours, and holding every byte made the host slower by the minute, until
+# the edges it copies fell behind. Where FFRWD_DUMP_STDERR asks for the whole
+# of it, the whole goes to a file as it arrives.
+_STDERR_KEEP = 1 << 18
+# How much of a whole log is copied into its dump at a time.
+_DUMP_BLOCK = 1 << 20
 
 # What the one ffmpeg whose progress is drawn is asked for instead of its own
 # status line: a key=value block on its stderr, twice a second.
@@ -682,6 +690,9 @@ class ProcessResult:
     # True when that node's runner went away while this member ran: its
     # exit code is not its own, and nothing more is known of it.
     lost: bool = False
+    # The whole of this member's stderr, written to a file as it arrived,
+    # where FFRWD_DUMP_STDERR asked for it; `stderr` holds its end.
+    stderr_whole: Path | None = None
 
     @property
     def command(self) -> str:
@@ -1913,9 +1924,8 @@ class _LateralRun:
             self._dump.mkdir(parents=True, exist_ok=True)
             for stage in result.stages:
                 for member in stage.members:
-                    header = f"exit={member.exit_code} terminated={member.terminated}\n"
-                    (self._dump / f"feeder{launch.row}.{member.id}.stderr").write_text(
-                        header + redact.text(member.stderr), encoding="utf-8", errors="replace"
+                    write_stderr_dump(
+                        self._dump / f"feeder{launch.row}.{member.id}.stderr", member
                     )
         self._row(launch.row, launch.start, exit=_instance_exit(result))
 
@@ -1954,7 +1964,7 @@ class _Member:
     id: str
     argv: list[str]
     proc: subprocess.Popen[bytes]
-    stderr: list[bytes] = field(default_factory=list)
+    stderr: _Log = field(default_factory=lambda: _Log())
     # This runner's end of a stdio pipe made to a size (:func:`_stdio_buffer`),
     # which ``proc.stdout`` / ``proc.stdin`` are None beside: the stream the
     # member's raw video comes out of, or goes in by.
@@ -2444,6 +2454,7 @@ class _StageRun:
             id=pid,
             argv=command,
             proc=proc,
+            stderr=_Log.for_run(),
             stdout=runner_out,
             stdin=runner_in,
         )
@@ -2996,13 +3007,45 @@ def _stop(members: Iterable[_Member]) -> None:
 
 def _result(member: _Member) -> ProcessResult:
     code = member.proc.poll()
+    member.stderr.close()
     return ProcessResult(
         id=member.id,
         argv=member.argv,
         exit_code=_FAILED if code is None else code,
-        stderr=b"".join(member.stderr).decode("utf-8", "replace"),
+        stderr=member.stderr.text(),
         terminated=member.terminated,
+        stderr_whole=member.stderr.whole,
     )
+
+
+def write_stderr_dump(path: Path, result: ProcessResult) -> None:
+    """`result`'s stderr as FFRWD_DUMP_STDERR keeps it: a line saying how the
+    member ended, then all it wrote, every secret masked (:mod:`ffrwd.redact`).
+
+    A log written to a file as it arrived is copied a block at a time, each
+    cut after a line's end so no secret is split, and the file removed; the
+    run held only its end in memory.
+    """
+    header = f"exit={result.exit_code} terminated={result.terminated}\n"
+    whole = result.stderr_whole
+    with path.open("w", encoding="utf-8", errors="replace") as out:
+        out.write(header)
+        if whole is None or not whole.exists():
+            out.write(redact.text(result.stderr))
+            return
+        with whole.open("rb") as source:
+            rest = b""
+            while block := source.read(_DUMP_BLOCK):
+                block = rest + block
+                cut = max(block.rfind(b"\n"), block.rfind(b"\r")) + 1
+                if cut == 0 and len(block) < 4 * _DUMP_BLOCK:
+                    rest = block
+                    continue
+                cut = cut or len(block)
+                out.write(redact.text(block[:cut].decode("utf-8", "replace")))
+                rest = block[cut:]
+            out.write(redact.text(rest.decode("utf-8", "replace")))
+    whole.unlink(missing_ok=True)
 
 
 def _stream(stream: IO[bytes] | None) -> IO[bytes]:
@@ -3292,13 +3335,76 @@ def unopened(flows: Sequence[Flow], now: float, stall: float) -> Flow | None:
     return max(stuck, key=lambda flow: flow.moved)
 
 
-def _drain(stream: IO[bytes], into: list[bytes]) -> None:
+class _Log:
+    """One member's stderr: its last `keep` bytes in memory, and all of it in
+    the file `whole` names where there is one.
+
+    Whole chunks are let go from the front, never the last one, so what is
+    held is at least `keep` bytes once that much has been written, and at
+    most one chunk more. The drain appends while the run closes, so the two
+    take turns; what arrives after :meth:`close` is held but not written.
+    """
+
+    def __init__(self, keep: int = _STDERR_KEEP, whole: Path | None = None) -> None:
+        self._chunks: deque[bytes] = deque()
+        self._held = 0
+        self._keep = keep
+        self.whole = whole
+        self._file: IO[bytes] | None = whole.open("wb") if whole is not None else None
+        self._turn = threading.Lock()
+
+    @classmethod
+    def for_run(cls) -> _Log:
+        """A spawned member's log: written whole to a file in the directory
+        FFRWD_DUMP_STDERR names, where it names one, as it arrives."""
+        directory = os.environ.get("FFRWD_DUMP_STDERR")
+        if not directory:
+            return cls()
+        Path(directory).mkdir(parents=True, exist_ok=True)
+        handle, name = tempfile.mkstemp(prefix=".", suffix=".stderr.part", dir=directory)
+        os.close(handle)
+        return cls(whole=Path(name))
+
+    def append(self, chunk: bytes) -> None:
+        with self._turn:
+            if self._file is not None:
+                self._file.write(chunk)
+            self._chunks.append(chunk)
+            self._held += len(chunk)
+            while self._held - len(self._chunks[0]) >= self._keep:
+                self._held -= len(self._chunks.popleft())
+
+    def close(self) -> None:
+        """Finish the file the whole log went to, if any."""
+        with self._turn:
+            if self._file is not None:
+                self._file.close()
+                self._file = None
+
+    def text(self) -> str:
+        with self._turn:
+            return b"".join(self._chunks).decode("utf-8", "replace")
+
+
+# Where a drain keeps what it read: a member's log, or a plain list.
+_Into = _Log | list[bytes]
+
+
+def _chunks(stream: IO[bytes]) -> Iterator[bytes]:
+    """What `stream` hands over, a copy of exactly each read's size.
+
+    One buffer is read into and reused; a chunk kept is its own small object,
+    and not a :data:`_CHUNK`-sized read shrunk where it stands.
+    """
+    view = memoryview(bytearray(_CHUNK))
+    while count := stream.readinto(view):  # type: ignore[attr-defined]
+        yield bytes(view[:count])
+
+
+def _drain(stream: IO[bytes], into: _Into) -> None:
     """Collect one member's stderr so its pipe never fills and stalls it."""
     try:
-        while True:
-            chunk = stream.read(_CHUNK)
-            if not chunk:
-                break
+        for chunk in _chunks(stream):
             into.append(chunk)
     except (OSError, ValueError):
         pass
@@ -3307,7 +3413,7 @@ def _drain(stream: IO[bytes], into: list[bytes]) -> None:
             stream.close()
 
 
-def _drain_rows(stream: IO[bytes], into: list[bytes], rows: RowSink) -> None:
+def _drain_rows(stream: IO[bytes], into: _Into, rows: RowSink) -> None:
     """Drain a sidecar's stderr, `rows` hearing each row it reports there.
 
     A line behind :data:`~ffrwd.ir.STDERR_ROW` is one JSON object, a row the
@@ -3316,10 +3422,7 @@ def _drain_rows(stream: IO[bytes], into: list[bytes], rows: RowSink) -> None:
     """
     rest = b""
     try:
-        while True:
-            chunk = stream.read(_CHUNK)
-            if not chunk:
-                break
+        for chunk in _chunks(stream):
             lines = (rest + chunk).split(b"\n")
             rest = lines.pop()
             for line in lines:
@@ -3336,7 +3439,7 @@ def _drain_rows(stream: IO[bytes], into: list[bytes], rows: RowSink) -> None:
 _STDERR_ROW = STDERR_ROW.encode()
 
 
-def _row_or_log(line: bytes, into: list[bytes], rows: RowSink, *, ended: bool = True) -> None:
+def _row_or_log(line: bytes, into: _Into, rows: RowSink, *, ended: bool = True) -> None:
     """One stderr line: a row to `rows`, or a line of the log."""
     if line.startswith(_STDERR_ROW):
         try:
@@ -3349,7 +3452,7 @@ def _row_or_log(line: bytes, into: list[bytes], rows: RowSink, *, ended: bool = 
     into.append(line + b"\n" if ended else line)
 
 
-def _drain_work(stream: IO[bytes], into: list[bytes], report: WorkProgress) -> None:
+def _drain_work(stream: IO[bytes], into: _Into, report: WorkProgress) -> None:
     """Drain the one member whose progress is drawn, `into` keeping its log.
 
     The same drain as every other member's, with a reader in front of it: the
@@ -3359,10 +3462,7 @@ def _drain_work(stream: IO[bytes], into: list[bytes], report: WorkProgress) -> N
     """
     reader = _WorkReader(into, report)
     try:
-        while True:
-            chunk = stream.read(_CHUNK)
-            if not chunk:
-                break
+        for chunk in _chunks(stream):
             reader.feed(chunk)
     except (OSError, ValueError):
         pass
@@ -3382,7 +3482,7 @@ class _WorkReader:
     routinely spans two of them.
     """
 
-    def __init__(self, log: list[bytes], report: WorkProgress) -> None:
+    def __init__(self, log: _Into, report: WorkProgress) -> None:
         self._log = log
         self._report = report
         self._rest = b""

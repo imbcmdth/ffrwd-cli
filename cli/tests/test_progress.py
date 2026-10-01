@@ -137,6 +137,11 @@ class _Chunked:
     def read(self, _limit: int) -> bytes:
         return self._chunks.pop(0) if self._chunks else b""
 
+    def readinto(self, buffer: memoryview) -> int:
+        chunk = self.read(len(buffer))
+        buffer[: len(chunk)] = chunk
+        return len(chunk)
+
     def close(self) -> None:
         pass
 

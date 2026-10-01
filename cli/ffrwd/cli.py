@@ -214,6 +214,7 @@ from .execute import (
     execute,
     execute_plan,
     render_plan,
+    write_stderr_dump,
 )
 from .functions import Signature, package_signatures, package_sources
 from .ir import PIPE, Graph, SinkUnit
@@ -2001,11 +2002,7 @@ def _debug_dump_stderr(result: PlanResult) -> None:
     out.mkdir(parents=True, exist_ok=True)
     for stage in result.stages:
         for member in stage.members:
-            path = out / f"{member.id}.stderr"
-            header = f"exit={member.exit_code} terminated={member.terminated}\n"
-            path.write_text(
-                header + redact.text(member.stderr), encoding="utf-8", errors="replace"
-            )
+            write_stderr_dump(out / f"{member.id}.stderr", member)
 
 
 def _echo_member(name: str, argv: list[str]) -> None:
