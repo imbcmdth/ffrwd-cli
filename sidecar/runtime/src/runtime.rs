@@ -310,11 +310,11 @@ mod world_0180 {
     }
 
     pub mod video {
-        wasmtime::component::bindgen!({ path: "../wit", world: "video-module" });
+        wasmtime::component::bindgen!({ path: "../worlds/0.18.0", world: "video-module" });
     }
     pub mod meta {
         wasmtime::component::bindgen!({
-            path: "../wit",
+            path: "../worlds/0.18.0",
             world: "meta-module",
             with: {
                 "ffrwd:av/types": crate::runtime::world_0180::video::ffrwd::av::types,
@@ -324,7 +324,7 @@ mod world_0180 {
     }
     pub mod window {
         wasmtime::component::bindgen!({
-            path: "../wit",
+            path: "../worlds/0.18.0",
             world: "window-module",
             with: {
                 "ffrwd:av/types": crate::runtime::world_0180::video::ffrwd::av::types,
@@ -335,52 +335,52 @@ mod world_0180 {
     }
     pub mod packet {
         wasmtime::component::bindgen!({
-            path: "../wit",
+            path: "../worlds/0.18.0",
             world: "packet-sink-module",
             with: { "ffrwd:av/types": crate::runtime::world_0180::video::ffrwd::av::types },
         });
     }
     pub mod packet_source {
         wasmtime::component::bindgen!({
-            path: "../wit",
+            path: "../worlds/0.18.0",
             world: "packet-source-module",
             with: { "ffrwd:av/types": crate::runtime::world_0180::video::ffrwd::av::types },
         });
     }
     pub mod values {
-        wasmtime::component::bindgen!({ path: "../wit", world: "values-module" });
+        wasmtime::component::bindgen!({ path: "../worlds/0.18.0", world: "values-module" });
     }
     pub mod rows {
         wasmtime::component::bindgen!({
-            path: "../wit",
+            path: "../worlds/0.18.0",
             world: "rows-module-host",
             with: { "ffrwd:av/types": crate::runtime::world_0180::video::ffrwd::av::types },
         });
     }
     pub mod packet_filter {
         wasmtime::component::bindgen!({
-            path: "../wit",
+            path: "../worlds/0.18.0",
             world: "packet-filter-module",
             with: { "ffrwd:av/types": crate::runtime::world_0180::video::ffrwd::av::types },
         });
     }
     pub mod data_filter {
         wasmtime::component::bindgen!({
-            path: "../wit",
+            path: "../worlds/0.18.0",
             world: "data-filter-module",
             with: { "ffrwd:av/types": crate::runtime::world_0180::video::ffrwd::av::types },
         });
     }
     pub mod encoder {
         wasmtime::component::bindgen!({
-            path: "../wit",
+            path: "../worlds/0.18.0",
             world: "encoder-module",
             with: { "ffrwd:av/types": crate::runtime::world_0180::video::ffrwd::av::types },
         });
     }
     pub mod decoder {
         wasmtime::component::bindgen!({
-            path: "../wit",
+            path: "../worlds/0.18.0",
             world: "decoder-module",
             with: { "ffrwd:av/types": crate::runtime::world_0180::video::ffrwd::av::types },
         });
@@ -389,7 +389,7 @@ mod world_0180 {
     // so one conversion serves a module whichever codec world it declared.
     pub mod codec {
         wasmtime::component::bindgen!({
-            path: "../wit",
+            path: "../worlds/0.18.0",
             world: "codec-module",
             with: {
                 "ffrwd:av/types": crate::runtime::world_0180::video::ffrwd::av::types,

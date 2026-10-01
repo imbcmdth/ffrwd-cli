@@ -170,6 +170,7 @@ WORLDS: tuple[str, ...] = (
     "ffrwd:av@0.16.0",
     "ffrwd:av@0.17.0",
     "ffrwd:av@0.18.0",
+    "ffrwd:av@0.19.0",
 )
 
 # The world a module scaffolded today is built against: the newest of those,
