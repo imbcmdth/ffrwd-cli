@@ -17,6 +17,7 @@ mod graph;
 mod heartbeat;
 mod leaky;
 mod network;
+mod relay;
 mod rowfilter;
 mod rowmerge;
 mod rows_chain;
@@ -5058,6 +5059,12 @@ fn main() {
     if argv.first().map(String::as_str) == Some("--nn-info") {
         println!("{}", nn::info());
         std::process::exit(0);
+    }
+
+    // The relay runs no module, so it reads none of the flags a module run
+    // takes, and its edges arrive on stdin rather than argv.
+    if argv.first().map(String::as_str) == Some("relay") {
+        std::process::exit(relay::main(&argv[1..]));
     }
 
     // The egress policy is read before anything runs: a bad value is a

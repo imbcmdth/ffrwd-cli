@@ -4,160 +4,169 @@ opening exchange, and the coordinator over one runner per node.
 Unit tier: no ffmpeg. The runs here are of plans whose every process is a
 region the sidecar hook renders, and the hook renders each as this
 interpreter running a few lines, so a run crosses real runners, real
-sockets and real pipes and nothing else. Real plans run split in the exec
-tier (tests/exec/test_exec_split.py).
+relays, real sockets and real pipes and nothing else. Real plans run split
+in the exec tier (tests/exec/test_exec_split.py).
 """
 
 from __future__ import annotations
 
-import io
-import math
 import socket
 import subprocess
 import sys
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from pathlib import Path
-from typing import IO
 
 import pytest
 
+from ffrwd import binaries, pipes
 from ffrwd.errors import ErrorCode, FfrwdError
-from ffrwd.execute import _End, _pump, _SocketEnd
-from ffrwd.nodes import CUT_HELLO, Listener, dial, execute_split, new_secret
+from ffrwd.nodes import execute_split, new_secret
 from ffrwd.placement import Placement, place
 from ffrwd.processes import ProcessPlan, SidecarProcess, StreamEdge, VideoFormat
+from ffrwd.relay import Relay, RelayEdge
+
+pytestmark = pytest.mark.skipif(
+    binaries.ffrwd_wasm_path() is None, reason="the ffrwd-wasm sidecar is not installed"
+)
 
 _PAYLOAD = bytes(range(256)) * 4096
+_SOON = 10.0
 
 
-class _Bytes(_End):
-    """An end over an in-memory stream."""
-
-    def __init__(self, stream: IO[bytes]) -> None:
-        self.stream = stream
-
-    def open(self, deadline: float) -> IO[bytes]:
-        return self.stream
-
-    def close(self) -> None:
-        pass
-
-
-class _Kept(io.BytesIO):
-    """A BytesIO whose close keeps what was written, for reading after."""
-
-    def close(self) -> None:
-        pass
+@pytest.fixture
+def listening() -> Iterator[tuple[Relay, tuple[str, int], str]]:
+    """A node's relay listening for the cut edge e0, its address and secret."""
+    secret = new_secret()
+    relay = Relay.start(secret)
+    try:
+        address = relay.listen("127.0.0.1", ["e0"], time.monotonic() + _SOON)
+        yield relay, address, secret
+    finally:
+        relay.close()
 
 
-def _listening(secret: str, *keys: str) -> Listener:
-    return Listener("127.0.0.1", secret, keys)
-
-
-def _refusal(listener: Listener) -> str:
-    deadline = time.monotonic() + 5
-    while not listener.refused and time.monotonic() < deadline:
+def _refusal(relay: Relay) -> str:
+    deadline = time.monotonic() + _SOON
+    while not relay.refused and time.monotonic() < deadline:
         time.sleep(0.01)
-    return listener.refused[0]
+    return relay.refused[0]
 
 
-def test_a_cut_edge_carries_the_bytes_it_was_given_end_to_end() -> None:
-    secret = new_secret()
-    listener = _listening(secret, "e0")
+def _hello(address: tuple[str, int], line: bytes) -> bytes:
+    """What a listener answers an opening `line`: its acknowledgement, or
+    nothing at all before it closes."""
+    with socket.create_connection(address, timeout=_SOON) as raw:
+        raw.sendall(line)
+        try:
+            return raw.recv(16)
+        except ConnectionResetError:
+            return b""
+
+
+def test_a_cut_edge_carries_the_bytes_it_was_given_end_to_end(
+    listening: tuple[Relay, tuple[str, int], str], tmp_path: Path
+) -> None:
+    """Pipe, TCP, pipe: the producer's node dials, the consumer's node takes
+    the connection, and every byte arrives in order."""
+    taker, address, secret = listening
+    dialer = Relay.start(secret)
     try:
-        closed = threading.Event()
-        taken = _SocketEnd(lambda d, c: listener.take("e0", d, c), "rb")
-        dialed = _SocketEnd(lambda d, c: dial(listener.address, secret, "e0", d, c), "wb")
-        received = _Kept()
-        consumer = threading.Thread(target=_pump, args=(taken, _Bytes(received), math.inf))
+        arriving = RelayEdge(
+            id="in",
+            source={"listen": "e0"},
+            dest=pipes.path(tmp_path, "arrive"),
+            depth=1 << 16,
+            buffer=1 << 16,
+        )
+        leaving = RelayEdge(
+            id="out",
+            source=pipes.path(tmp_path, "leave"),
+            dest={"dial": [address[0], address[1]], "key": "e0"},
+            depth=1 << 16,
+            buffer=1 << 16,
+        )
+        taker.open([arriving], {}, time.monotonic() + _SOON)
+        dialer.open([leaving], {}, time.monotonic() + _SOON)
+        received: dict[str, bytes] = {}
+
+        def consume() -> None:
+            with open(str(arriving.dest), "rb", buffering=0) as stream:
+                got = bytearray()
+                while chunk := stream.read(1 << 16):
+                    got += chunk
+                received["bytes"] = bytes(got)
+
+        consumer = threading.Thread(target=consume, daemon=True)
         consumer.start()
-        _pump(_Bytes(io.BytesIO(_PAYLOAD)), dialed, time.monotonic() + 10)
-        consumer.join(10)
-        assert received.getvalue() == _PAYLOAD
-        assert listener.refused == []
-        assert not closed.is_set()
+        with open(str(leaving.source), "wb", buffering=0) as producer:
+            producer.write(_PAYLOAD)
+        consumer.join(_SOON)
+        assert received == {"bytes": _PAYLOAD}
+        assert taker.refused == []
     finally:
-        listener.close()
+        dialer.close()
 
 
-def test_a_connection_with_the_wrong_secret_is_closed_before_its_data_is_read() -> None:
-    secret = new_secret()
-    listener = _listening(secret, "e0")
-    try:
-        with pytest.raises(ConnectionRefusedError):
-            dial(listener.address, new_secret(), "e0", time.monotonic() + 5, threading.Event())
-        assert _refusal(listener) == "the wrong secret"
-        with pytest.raises(TimeoutError):
-            listener.take("e0", time.monotonic() + 0.2, threading.Event())
-    finally:
-        listener.close()
+def test_a_connection_with_the_wrong_secret_is_closed_before_its_data_is_read(
+    listening: tuple[Relay, tuple[str, int], str],
+) -> None:
+    relay, address, _ = listening
+    assert _hello(address, f"FFRWD-CUT 1 {new_secret()} e0\n".encode()) == b""
+    assert _refusal(relay) == "the wrong secret"
 
 
-def test_a_connection_naming_an_edge_this_node_does_not_listen_for_is_closed() -> None:
-    secret = new_secret()
-    listener = _listening(secret, "e0")
-    try:
-        with pytest.raises(ConnectionRefusedError):
-            dial(listener.address, secret, "e7", time.monotonic() + 5, threading.Event())
-        assert _refusal(listener) == "an edge this node does not listen for: e7"
-    finally:
-        listener.close()
+def test_a_connection_naming_an_edge_this_node_does_not_listen_for_is_closed(
+    listening: tuple[Relay, tuple[str, int], str],
+) -> None:
+    relay, address, secret = listening
+    assert _hello(address, f"FFRWD-CUT 1 {secret} e7\n".encode()) == b""
+    assert _refusal(relay) == "an edge this node does not listen for: e7"
 
 
-def test_a_second_connection_for_one_edge_is_closed() -> None:
-    secret = new_secret()
-    listener = _listening(secret, "e0")
-    try:
-        first = dial(listener.address, secret, "e0", time.monotonic() + 5, threading.Event())
-        with pytest.raises(ConnectionRefusedError):
-            dial(listener.address, secret, "e0", time.monotonic() + 5, threading.Event())
-        assert _refusal(listener) == "a second connection for e0"
-        first.close()
-    finally:
-        listener.close()
+def test_a_second_connection_for_one_edge_is_closed(
+    listening: tuple[Relay, tuple[str, int], str],
+) -> None:
+    relay, address, secret = listening
+    with socket.create_connection(address, timeout=_SOON) as first:
+        first.sendall(f"FFRWD-CUT 1 {secret} e0\n".encode())
+        assert first.recv(3) == b"OK\n"
+        assert _hello(address, f"FFRWD-CUT 1 {secret} e0\n".encode()) == b""
+        assert _refusal(relay) == "a second connection for e0"
 
 
-def test_a_connection_that_sends_data_first_is_closed_unread() -> None:
+def test_a_connection_that_sends_data_first_is_closed_unread(
+    listening: tuple[Relay, tuple[str, int], str],
+) -> None:
     """Bytes that are not an opening line are never handed to an edge."""
-    secret = new_secret()
-    listener = _listening(secret, "e0")
-    try:
-        with socket.create_connection(listener.address) as raw:
-            raw.sendall(b"\x00" * 64 + b"\n" + _PAYLOAD[:1024])
-            raw.settimeout(5)
-            # Closed with the rest unread: an end of stream, or a reset.
-            try:
-                assert raw.recv(16) == b""
-            except ConnectionResetError:
-                pass
-        assert _refusal(listener) == "not a cut edge's opening line"
-        with pytest.raises(TimeoutError):
-            listener.take("e0", time.monotonic() + 0.2, threading.Event())
-    finally:
-        listener.close()
-
-
-def test_the_opening_line_names_its_version() -> None:
-    assert CUT_HELLO == "FFRWD-CUT 1"
+    relay, address, _ = listening
+    assert _hello(address, b"\x00" * 64 + b"\n" + _PAYLOAD[:1024]) == b""
+    assert _refusal(relay) == "not a cut edge's opening line"
 
 
 # -- runs
 
 
-_PRODUCE = "import sys; sys.stdout.buffer.write(bytes(range(256)) * 4096); sys.stdout.flush()"
+# A member's one stream: the pipe path its argv names, or its own stdio. A cut
+# edge is named at both ends, so across nodes it is always the path.
+_OUT = (
+    "import sys; o = sys.argv[-1] if len(sys.argv) > 1 else 'pipe:1'; "
+    "out = sys.stdout.buffer if o.startswith('pipe:') else open(o, 'wb', buffering=0); "
+)
+_IN = (
+    "import sys; i = sys.argv[-1] if len(sys.argv) > 1 else 'pipe:0'; "
+    "inp = sys.stdin.buffer if i.startswith('pipe:') else open(i, 'rb', buffering=0); "
+)
+_PRODUCE = _OUT + "out.write(bytes(range(256)) * 4096); out.flush()"
 
 
 def _consume(path: Path) -> str:
-    return (
-        "import sys; data = sys.stdin.buffer.read(); "
-        f"open({str(path)!r}, 'wb').write(data)"
-    )
+    return _IN + f"data = inp.read(); open({str(path)!r}, 'wb').write(data)"
 
 
-def _python(code: str) -> list[str]:
-    return [sys.executable, "-c", code]
+def _python(code: str, *ends: str) -> list[str]:
+    return [sys.executable, "-c", code, *ends]
 
 
 def _pair(tmp_path: Path, consumer: str | None = None) -> tuple[ProcessPlan, Path]:
@@ -177,7 +186,7 @@ def _pair(tmp_path: Path, consumer: str | None = None) -> tuple[ProcessPlan, Pat
 
 
 def _hook(process: SidecarProcess, reads: Sequence[str], writes: Sequence[str]) -> list[str]:
-    return _python(process.module)
+    return _python(process.module, *reads, *writes)
 
 
 def test_a_plan_split_on_two_nodes_hands_its_bytes_across(tmp_path: Path) -> None:
@@ -196,7 +205,7 @@ def test_a_plan_split_on_two_nodes_hands_its_bytes_across(tmp_path: Path) -> Non
 def test_a_member_failing_on_one_node_ends_the_run_and_is_named_with_its_node(
     tmp_path: Path,
 ) -> None:
-    plan, _ = _pair(tmp_path, consumer="import sys; sys.stdin.buffer.read(10); sys.exit(3)")
+    plan, _ = _pair(tmp_path, consumer=_IN + "inp.read(10); sys.exit(3)")
     result = execute_split(plan, place(plan, "per-process"), sidecar_argv=_hook, timeout=60)
     assert result.exit_code == 3
     assert result.failure is not None
@@ -207,7 +216,7 @@ def test_a_runner_killed_mid_run_stops_the_rest_and_is_named(tmp_path: Path) -> 
     """The consumer's node's runner is killed while the consumer reads: the
     coordinator reports that member lost, with its node, and the producer's
     node is stopped."""
-    plan, _ = _pair(tmp_path, consumer="import sys, time; sys.stdin.buffer.read(1); time.sleep(60)")
+    plan, _ = _pair(tmp_path, consumer=_IN + "import time; inp.read(1); time.sleep(60)")
     runners: dict[int, subprocess.Popen[bytes]] = {}
 
     def kill_the_consumers_runner() -> None:

@@ -7,11 +7,9 @@ pipe are decided before any process exists, so both are testable without one.
 
 from __future__ import annotations
 
-import math
 import os
 import subprocess
 import sys
-import threading
 import time
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import replace
@@ -24,7 +22,6 @@ from ffrwd.emit import _wire_options, build_process_args
 from ffrwd.errors import ErrorCode, FfrwdError
 from ffrwd.execute import (
     _CHUNK,
-    _SPOOL_MEMORY,
     STDIN,
     STDOUT,
     Flow,
@@ -33,10 +30,8 @@ from ffrwd.execute import (
     _attribute,
     _broken_pipe,
     _cpu_seconds,
-    _End,
     _Member,
     _pipe_buffer,
-    _pump,
     _read_ahead,
     _run_stage,
     _run_watched,
@@ -65,6 +60,7 @@ from ffrwd.processes import (
     external_ids,
     partition,
 )
+from ffrwd.relay import Relay
 
 # What every NUT pipe input carries so its open reads a fixed few frames
 # whatever their size: the producer filling the pipe cannot reach its next
@@ -243,15 +239,17 @@ def test_a_chain_puts_every_edge_on_stdio() -> None:
     }
 
 
-def test_fan_in_takes_named_pipes_only_where_it_must() -> None:
-    """The reader of two streams has one stdin; its producers still write theirs."""
+def test_fan_in_is_named_at_both_ends() -> None:
+    """The reader of two streams has one stdin, so neither edge chains, and
+    an edge that does not chain is a named pipe at each end with the relay
+    between them: its producer writes a pipe too, not its stdout."""
     assigned = {
         (wire.edge.source, wire.edge.target): (wire.read_stdio, wire.write_stdio)
         for wire in wires(_two_producers())
     }
     assert assigned == {
-        ("video", "mux"): (False, True),
-        ("audio", "mux"): (False, True),
+        ("video", "mux"): (False, False),
+        ("audio", "mux"): (False, False),
     }
 
 
@@ -259,8 +257,8 @@ def test_a_shared_feeders_fan_takes_named_pipes_on_both_ends() -> None:
     """It writes two streams and its reader takes three: no stdio on either side.
 
     The module's leg still chains where a single stream remains: one decode
-    into the sidecar's stdin, the sidecar's stdout being one of the three the
-    merge reads.
+    into the sidecar's stdin. The sidecar's output is one of the three the
+    merge reads, so it is named at both ends like the other two.
     """
     plan = _shared_feeder()
     shared = next(
@@ -281,7 +279,7 @@ def test_a_shared_feeders_fan_takes_named_pipes_on_both_ends() -> None:
         (shared, merge, "n0"): (False, False),
         (shared, merge, "n1"): (False, False),
         (feeder, "sidecar0", "sp:2"): (True, True),
-        ("sidecar0", merge, "e0"): (False, True),
+        ("sidecar0", merge, "e0"): (False, False),
     }
 
 
@@ -309,9 +307,11 @@ def test_a_chain_spells_its_pipes_as_stdio() -> None:
 def test_a_video_edge_carries_rawvideo_and_an_audio_edge_pcm() -> None:
     argv = plan_argv(_two_producers(), pipe_path=_named)
     assert argv["video"][-7:] == [
-        "-c:0", "rawvideo", "-pix_fmt:0", "yuv420p", "-f", "nut", STDOUT,
+        "-c:0", "rawvideo", "-pix_fmt:0", "yuv420p", "-f", "nut", "/pipes/video-mux-write",
     ]  # fmt: skip
-    assert argv["audio"][-5:] == ["-c:0", "pcm_f32le", "-f", "nut", STDOUT]
+    assert argv["audio"][-5:] == [
+        "-c:0", "pcm_f32le", "-f", "nut", "/pipes/audio-mux-write",
+    ]  # fmt: skip
 
 
 def test_a_fan_in_reader_names_one_pipe_per_input() -> None:
@@ -321,9 +321,9 @@ def test_a_fan_in_reader_names_one_pipe_per_input() -> None:
         "-f", "nut", *_PROBE, "-i", "/pipes/video-mux-read",
         "-f", "nut", *_PROBE, "-i", "/pipes/audio-mux-read",
     ]  # fmt: skip
-    # Both producers keep their own stdout: only the reading end fans in.
-    assert argv["video"][-1] == STDOUT
-    assert argv["audio"][-1] == STDOUT
+    # Each producer writes a pipe of its own, which the relay hands on.
+    assert argv["video"][-1] == "/pipes/video-mux-write"
+    assert argv["audio"][-1] == "/pipes/audio-mux-write"
 
 
 def test_two_piped_inputs_stay_two_inputs() -> None:
@@ -1172,7 +1172,8 @@ def test_a_keyboard_interrupt_in_the_watch_loop_stops_every_member(
         plan,
         stage,
         argv,
-        served={},
+        named={},
+        relay=Relay.start,
         assigned=(),
         timeout=None,
         overwrite=False,
@@ -1555,7 +1556,8 @@ def test_a_stage_reports_a_failure_only_where_a_member_failed(
         plan,
         Stage(index=0, processes=("p1", "p0")),
         argv,
-        served={},
+        named={},
+        relay=Relay.start,
         assigned=(wire,),
         timeout=None,
         overwrite=False,
@@ -1575,173 +1577,11 @@ def test_a_stage_reports_a_failure_only_where_a_member_failed(
 # ---------------------------------------------------------------- the copy
 
 
-class _Pieces:
-    """A stream handing back one queued piece per read, EOF once it is empty."""
-
-    def __init__(self, pieces: list[bytes]) -> None:
-        self.pieces = list(pieces)
-        self.drained = threading.Event()
-
-    def read(self, size: int) -> bytes:
-        if self.pieces:
-            return self.pieces.pop(0)
-        self.drained.set()
-        return b""
-
-
-class _Trickle:
-    """A stream taking at most `most` bytes per write, the way a pipe does."""
-
-    def __init__(self, most: int) -> None:
-        self.most = most
-        self.writes: list[bytes] = []
-
-    def write(self, data: bytes) -> int:
-        self.writes.append(data[: self.most])
-        return len(self.writes[-1])
-
-    def flush(self) -> None:
-        pass
-
-
-class _Held(_End):
-    """An end already open, so a copy can be driven without a process."""
-
-    def __init__(self, stream: object) -> None:
-        self.stream = stream
-
-    def open(self, deadline: float) -> object:  # type: ignore[override]
-        return self.stream
-
-    def close(self) -> None:
-        pass
-
-
-def test_the_copy_writes_each_read_on_as_it_comes() -> None:
-    """Every read goes on as its own write, whatever its size.
-
-    Accumulating two of them into a bigger write would wedge a stage where one
-    process feeds two paths that meet again: the process that would supply the
-    rest is waiting for the frame the held-back bytes finish.
-    """
-    dest = _Trickle(1 << 16)
-    flow = _flow("ffmpeg0", at=0.0, moved=0)
-
-    _pump(_Held(_Pieces([b"one", b"two"])), _Held(dest), math.inf, flow)
-
-    assert dest.writes == [b"one", b"two"]
-    assert flow.moved == 6
-    assert not flow.writing
-
-
-def test_the_copy_finishes_a_write_the_other_end_only_partly_took() -> None:
-    """An unbuffered write takes what it takes; the rest is written again."""
-    dest = _Trickle(2)
-
-    _pump(_Held(_Pieces([b"abcde"])), _Held(dest), math.inf)
-
-    assert dest.writes == [b"ab", b"cd", b"e"]
-
-
-class _Unhurried:
-    """A stream whose writes wait until it is let go."""
-
-    def __init__(self) -> None:
-        self.taking = threading.Event()
-        self.writes: list[bytes] = []
-
-    def write(self, data: bytes) -> int:
-        assert self.taking.wait(10), "the copy was never let go"
-        self.writes.append(data)
-        return len(data)
-
-    def flush(self) -> None:
-        pass
-
-
-def test_a_bounded_edge_is_read_on_while_the_consumer_is_not_taking() -> None:
-    """The producer on such an edge is never the one waiting.
-
-    An edge the compiler gave a depth is the direct leg of a live source split
-    two ways. The producer has to be able to run to the end of its stream and
-    close, whatever the consumer is doing: the process on the SLOWER leg only
-    hands on the frames its own pipeline holds when it sees the end of its
-    input, and the consumer is waiting for exactly those.
-    """
-    source = _Pieces([b"one", b"two", b"three"])
-    dest = _Unhurried()
-    flow = _flow("ffmpeg0", at=0.0, moved=0, bound=1)
-    copy = threading.Thread(
-        target=_pump, args=(_Held(source), _Held(dest), math.inf, flow), daemon=True
-    )
-
-    copy.start()
-    read_on = source.drained.wait(10)
-    dest.taking.set()
-    copy.join(10)
-
-    assert read_on, "the copy stopped reading while the consumer was not taking"
-    assert dest.writes == [b"one", b"two", b"three"]
-    assert flow.moved == 11
-
-
 def test_an_edge_with_no_depth_hands_each_read_straight_on() -> None:
     """Only an edge the compiler bounded reads ahead; the rest cost nothing."""
     assert _read_ahead(None) == _CHUNK
     assert _read_ahead(_flow("ffmpeg0", at=0.0)) == _CHUNK
     assert _read_ahead(_flow("ffmpeg0", at=0.0, bound=1)) > _CHUNK
-
-
-class _Late(_End):
-    """A consuming end that is not open until the test lets it be."""
-
-    def __init__(self, stream: object) -> None:
-        self.stream = stream
-        self.let_go = threading.Event()
-
-    def open(self, deadline: float) -> object:  # type: ignore[override]
-        assert self.let_go.wait(10), "the consumer was never let go"
-        return self.stream
-
-    def close(self) -> None:
-        pass
-
-
-@pytest.mark.parametrize(
-    "size", [1 << 20, _SPOOL_MEMORY + (1 << 20)], ids=["memory", "file"]
-)
-def test_a_rows_edge_is_taken_whole_while_its_consumer_is_still_opening(
-    size: int,
-) -> None:
-    """Nothing paces a rows edge, over either place the copy holds it.
-
-    The process a rows document goes to reads it whole at the moment it opens
-    that input, and opens its inputs in order, so a producer writing a second
-    document is writing into an input that will not be opened until the first
-    one ends. The copy takes the whole document instead -- in memory under
-    `_SPOOL_MEMORY`, in a temporary file over it -- and hands it on when its
-    consumer arrives.
-    """
-    whole = b"x" * size
-    source = _Pieces([whole[at : at + _CHUNK] for at in range(0, len(whole), _CHUNK)])
-    dest = _Late(_Trickle(_CHUNK))
-    edge = RowsEdge(source="sidecar0", target="docs", alias="cues", container="webvtt")
-    flow = Flow(edge=edge, at=0.0)
-    copy = threading.Thread(
-        target=_pump, args=(_Held(source), dest, math.inf, flow), daemon=True
-    )
-
-    copy.start()
-    taken = source.drained.wait(10)
-    still_opening = flow.opening
-    dest.let_go.set()
-    copy.join(10)
-
-    assert taken, "the copy stopped reading before its consumer opened"
-    assert still_opening, "the copy was not recorded as waiting for its consumer"
-    assert flow.moved == len(whole), "the spool was not counted as it filled"
-    assert b"".join(dest.stream.writes) == whole
-    assert not flow.opening and not flow.writing
 
 
 # ------------------------------------------------- ending a tree, off Windows

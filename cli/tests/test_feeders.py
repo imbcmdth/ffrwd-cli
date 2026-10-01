@@ -10,10 +10,12 @@ itself at the end. Running a real feeder is tests/exec/test_exec_feeders.py's.
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections.abc import Iterator
@@ -23,7 +25,7 @@ from typing import cast
 
 import pytest
 
-from ffrwd import wasm
+from ffrwd import pipes, wasm
 from ffrwd.compiler import compile_all
 from ffrwd.errors import ErrorCode, FfrwdError
 from ffrwd.execute import plan_argv, render_plan
@@ -42,6 +44,7 @@ from ffrwd.processes import (
     partition,
 )
 from ffrwd.registry import Registry, load_reference
+from ffrwd.relay import Relay
 from ffrwd.split import insert_splits
 from ffrwd.wasm import WORLDS, Described, Feeder
 
@@ -753,14 +756,19 @@ def test_a_live_programme_says_the_wait_was_counted_from_when_it_started() -> No
 # Stand-ins run as the stage's members. The reader writes its programme once
 # `delay` seconds have gone, as a listener does once its sender arrives; the
 # module listens only once the programme's first byte has reached it, and
-# ends once the feeder has written to it and the programme is done.
+# ends once the feeder has written to it and the programme is done. Each
+# takes its end of the edge as its last argument when the edge is named (a
+# live one is, so the relay sees its first byte), and its stdio otherwise.
 _READER = (
     "import sys, time; time.sleep({delay}); "
-    "sys.stdout.buffer.write(b'programme'); sys.stdout.buffer.flush()"
+    "o = sys.argv[-1] if len(sys.argv) > 1 else ''; "
+    "out = open(o, 'wb', buffering=0) if o else sys.stdout.buffer; "
+    "out.write(b'programme'); out.flush()"
 )
 _MODULE = """
 import socket, sys
-sys.stdin.buffer.read(1)
+inp = open(sys.argv[-1], "rb", buffering=0) if len(sys.argv) > 1 else sys.stdin.buffer
+inp.read(1)
 port = socket.socket()
 port.bind(("127.0.0.1", {port}))
 port.listen()
@@ -770,7 +778,7 @@ while not fed:
     with conn:
         while chunk := conn.recv(64):
             fed += chunk
-sys.stdin.buffer.read()
+inp.read()
 raise SystemExit(0 if fed == b"feed" else 3)
 """
 _WRITER = (
@@ -797,22 +805,42 @@ def _stage_fed_after(delay: float, *, live: bool) -> execute.StageResult:
         ),
         edges=(edge, FeederEdge(source="writer", target="module", port=port, calls=())),
     )
-    argv = {
-        "reader": [python, "-c", _READER.format(delay=delay)],
-        "module": [python, "-c", _MODULE.format(port=port)],
-        "writer": [python, "-c", _WRITER.format(port=port)],
-    }
-    result: execute.StageResult = execute._run_stage(
-        plan,
-        Stage(index=0, processes=("reader", "module", "writer")),
-        argv,
-        served={},
-        assigned=(execute.Wire(edge=edge, read_stdio=True, write_stdio=True),),
-        timeout=30,
-        overwrite=False,
-        echo=None,
-        players={},
-    )
+    assigned = execute.wires(plan)
+    (wire,) = assigned
+    with tempfile.TemporaryDirectory() as home, contextlib.ExitStack() as stack:
+        named: dict[tuple[object, str], str] = {}
+        ends: tuple[list[str], list[str]] = ([], [])
+        if not wire.chained:
+            named = {
+                (edge, "write"): pipes.path(Path(home), "write"),
+                (edge, "read"): pipes.path(Path(home), "read"),
+            }
+            ends = ([named[(edge, "write")]], [named[(edge, "read")]])
+        relays: list[Relay] = []
+
+        def relay() -> Relay:
+            if not relays:
+                relays.append(Relay.start())
+                stack.callback(relays[0].close)
+            return relays[0]
+
+        argv = {
+            "reader": [python, "-c", _READER.format(delay=delay), *ends[0]],
+            "module": [python, "-c", _MODULE.format(port=port), *ends[1]],
+            "writer": [python, "-c", _WRITER.format(port=port)],
+        }
+        result: execute.StageResult = execute._run_stage(
+            plan,
+            Stage(index=0, processes=("reader", "module", "writer")),
+            argv,
+            named=named,  # type: ignore[arg-type]
+            relay=relay,
+            assigned=assigned,
+            timeout=30,
+            overwrite=False,
+            echo=None,
+            players={},
+        )
     return result
 
 

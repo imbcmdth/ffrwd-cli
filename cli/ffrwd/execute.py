@@ -47,18 +47,21 @@ because they hand each other frames over pipes and ffmpeg opens its inputs
 one at a time -- feeding a stage member by member deadlocks.
 
 :func:`wires` decides how each stream edge travels. A process the plan hands
-at most one stream reads it on its own stdin, and one the plan takes at most
-one stream from writes it on its own stdout; a chain of those needs nothing
-but :class:`subprocess.Popen`. Fan-in is what stdio cannot spell -- one stdin,
-two producers -- and there the consumer reads named pipes instead
-(:mod:`ffrwd.pipes`), with this process copying between each pipe and the
-producer that feeds it. Every stream such a copy runs through is unbuffered,
-and the copy hands on whatever has arrived rather than waiting to fill a
-chunk: where one process feeds two paths that meet again, the process that
-would round the chunk up is waiting for the frame the held-back bytes finish.
-On an edge the compiler gave a depth, that copy is also where the depth is
-actually held -- it reads on while the consumer is behind, so a producer with
-frames still to hand over can always finish and close its outputs.
+at most one stream can read it on its own stdin, and one the plan takes at
+most one stream from can write it on its own stdout; an edge between two such
+processes is a chain, which needs nothing but :class:`subprocess.Popen`.
+Every other edge -- a fan, which stdio cannot spell -- is a named pipe at
+each end, and between them is the relay (:mod:`ffrwd.relay`), the sidecar
+binary in a mode of its own, which makes the pipes and copies one into the
+other so that no byte of a stream crosses this process. The copy hands on
+whatever has arrived rather than waiting to fill a chunk: where one process
+feeds two paths that meet again, the process that would round the chunk up
+is waiting for the frame the held-back bytes finish. On an edge the compiler
+gave a depth, the relay is also where the depth is actually held -- it reads
+on while the consumer is behind, so a producer with frames still to hand over
+can always finish and close its outputs. What the relay counts on each edge
+comes back as rows, into :class:`Flow`, which is how this process still sees
+an edge that has stopped.
 
 Members are judged by EXIT CODE only. A raw demuxer logs an error at the
 pipe's EOF and exits 0 anyway, so stderr says nothing about whether a member
@@ -76,7 +79,8 @@ rather than mixed in with the failures. A stage that has lost a member waits
 instead of as a member this process stopped.
 
 One failure is not an exit code: a stage whose pipes have all stopped moving
-while every member still runs and one copy still waits on the far end. Where
+while every member still runs and one of the relay's copies still waits on
+the far end. Where
 that copy waits to WRITE, the buffer the plan sized from a bound
 (:attr:`StreamEdge.bound`) is one the run outgrew; where it waits to OPEN, the
 process that edge goes to never asked for it. Either ends the stage with a
@@ -86,14 +90,14 @@ would say only that something hung.
 A ROWS edge is the one edge nothing paces. ffmpeg reads a rows document whole
 when it opens that input, and opens its inputs in order, so a producer writing
 a second document is writing into an input that will not be opened until the
-first one ends: the copy takes the whole document off the producer instead --
-in memory, and in a temporary file past a few megabytes -- and hands it over
-once the consumer opens.
+first one ends: the relay takes the whole document off the producer instead
+-- in memory, and in a temporary file past a few megabytes -- and hands it
+over once the consumer opens.
 
 A plan shows the same way a command list does. A member ``players`` names
 gets an ffplay of its own, reading the display output off that member's
 stdout -- free, because a process writing a file hands its frames to nobody.
-The forwarding is the same drain-tolerant copy, so a closed window ends the
+The forwarding is a drain-tolerant copy here, so a closed window ends the
 window and not the run -- unless the windows are the ONLY thing the run
 feeds (``show_only``), where closing the last of them ends the run cleanly
 rather than leaving a camera and an encoder busy for nobody.
@@ -116,6 +120,7 @@ from __future__ import annotations
 import codecs
 import contextlib
 import ctypes
+import functools
 import heapq
 import json
 import math
@@ -131,9 +136,9 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import IO, Literal, cast
+from typing import IO, Literal
 
 from . import loudnorm, pipes, redact
 from .console import Work, WorkProgress
@@ -147,7 +152,6 @@ from .ir import (
     feeder_path,
     is_rows_document,
 )
-from .pipes import NamedPipe
 from .processes import (
     PIPE_BUFFER_LIMIT,
     RAWVIDEO,
@@ -163,6 +167,7 @@ from .processes import (
     VideoFormat,
     encoded,
 )
+from .relay import Relay, RelayEdge
 from .vars import substitute
 
 __all__ = [
@@ -255,9 +260,6 @@ _CHUNK = 1 << 16
 # depth. Generous enough for several frames of the largest one a plan carries,
 # and bounded, so a run whose paths really have drifted apart still stops.
 _READ_AHEAD = 1 << 25
-# How much of a spooled rows document is held in memory before the rest of it
-# goes to a temporary file.
-_SPOOL_MEMORY = 1 << 22
 # What `ProcessResult.stderr_tail` keeps.
 _TAIL_LINES = 20
 # How much of each member's stderr a run holds in memory: its end, which is
@@ -656,22 +658,19 @@ class Wire:
 
     `read_stdio` is True when the consuming process reads this edge on its own
     stdin, `write_stdio` when the producing one writes it on its own stdout.
-    An end that is neither takes a named pipe.
-
-    `pumped` is True for a stdio edge the runner copies itself rather than
-    handing one member's stdout to the next, so the bytes crossing it are
-    seen: a live input's edge in a stage whose feeder waits for it.
+    The two are true together or not at all: an edge is CHAINED, one member's
+    stdout handed to the next one's stdin, or it is a named pipe at each end
+    with the relay between them (:mod:`ffrwd.relay`).
     """
 
     edge: PipeEdge
     read_stdio: bool
     write_stdio: bool
-    pumped: bool = False
 
     @property
     def chained(self) -> bool:
         """True when stdio carries both ends and one Popen feeds the next."""
-        return self.read_stdio and self.write_stdio and not self.pumped
+        return self.read_stdio and self.write_stdio
 
 
 @dataclass(frozen=True)
@@ -908,14 +907,25 @@ class PlanResult:
     interrupted: bool = False
 
 
-def wires(plan: ProcessPlan) -> tuple[Wire, ...]:
+def wires(
+    plan: ProcessPlan, apart: Callable[[PipeEdge], bool] | None = None
+) -> tuple[Wire, ...]:
     """Every pipe edge of `plan`, with the transport each end takes.
 
     One rule, read per process: a process the plan hands at most one thing
-    reads it on its own stdin, and one the plan takes at most one thing from
-    writes it on its own stdout. Anything else is a fan, which stdio has no
-    second handle for, and every edge on that side takes a named pipe. A rows
+    can read it on its own stdin, and one the plan takes at most one thing
+    from can write it on its own stdout. An edge with such a process at each
+    end is CHAINED, the producer's stdout handed to the consumer's stdin.
+    Anything else involves a fan, which stdio has no second handle for, and
+    the edge is a named pipe at BOTH ends, with the relay between them. A rows
     edge counts on both sides: it occupies stdio exactly as frames do.
+
+    Two edges that could chain go through the relay all the same, because
+    what crosses them has to be seen or carried: a live input's edge in a
+    stage whose feeder waits for its first bytes, and an edge `apart` says
+    runs between two nodes, which no stdio handle can cross. Deciding it here
+    rather than at run time is what makes the argv a plan renders, and
+    ``ffrwd compile`` prints, the argv that runs.
     """
     edges = _pipe_edges(plan)
     incoming: dict[str, int] = {}
@@ -925,14 +935,34 @@ def wires(plan: ProcessPlan) -> tuple[Wire, ...]:
         outgoing[edge.source] = outgoing.get(edge.source, 0) + 1
     # A process whose rows are the caller's own stdout has none left over.
     taken = {p.id for p in plan.processes if _writes_rows_to_stdout(p)}
-    return tuple(
-        Wire(
-            edge=edge,
-            read_stdio=incoming[edge.target] <= 1,
-            write_stdio=outgoing[edge.source] <= 1 and edge.source not in taken,
+    watched = _watched_live(plan)
+    found: list[Wire] = []
+    for edge in edges:
+        chained = (
+            incoming[edge.target] <= 1
+            and outgoing[edge.source] <= 1
+            and edge.source not in taken
+            and edge not in watched
+            and not (apart is not None and apart(edge))
         )
-        for edge in edges
-    )
+        found.append(Wire(edge=edge, read_stdio=chained, write_stdio=chained))
+    return tuple(found)
+
+
+def _watched_live(plan: ProcessPlan) -> set[PipeEdge]:
+    """A live input's edges in each stage where a feeder waits: their first
+    bytes start the feeder's clock, and the relay is what sees them."""
+    watched: set[PipeEdge] = set()
+    for stage in plan.stages:
+        inside = set(stage.processes)
+        if not any(edge.source in inside for edge in plan.feeder_edges):
+            continue
+        watched.update(
+            edge
+            for edge in plan.stream_edges
+            if _is_live(edge) and edge.source in inside and edge.target in inside
+        )
+    return watched
 
 
 def _pipe_edges(plan: ProcessPlan) -> tuple[PipeEdge, ...]:
@@ -951,6 +981,7 @@ def plan_argv(
     sidecar_argv: SidecarArgv | None = None,
     pipe_path: PipeNamer | None = None,
     rows_path: RowsNamer | None = None,
+    apart: Callable[[PipeEdge], bool] | None = None,
 ) -> dict[str, list[str]]:
     """The argv that runs each process of `plan`, keyed by process id.
 
@@ -967,10 +998,13 @@ def plan_argv(
     is called once per distinct placeholder. Without it the placeholders are
     left as they are, which is what a printed command shows and what keeps a
     compile the same text on every machine.
+
+    `apart` says which edges a placed run cuts between nodes; each is named
+    at both ends (:func:`wires`).
     """
     read: dict[PipeEdge, str] = {}
     write: dict[PipeEdge, str] = {}
-    for wire in wires(plan):
+    for wire in wires(plan, apart):
         read[wire.edge] = (
             STDIN if wire.read_stdio else _named(pipe_path, wire.edge, "read")
         )
@@ -1082,9 +1116,13 @@ def _sidecar_writes(
     """Where `process` writes go: a packet source's tracks in `outgoing`'s
     own order, which is its catalog order, a packet filter's pads in the same
     order it reads them, and then its rows documents. Everything else hands
-    its frames on over the one stdout instead."""
+    its frames on over one output: its stdout where the edge chains, named
+    here only where it does not, the pipe the relay serves."""
     several = process.packet_source or process.packet_filter or process.data_filter
-    streams = [write[edge] for edge in outgoing] if several else []
+    if several:
+        streams = [write[edge] for edge in outgoing]
+    else:
+        streams = [write[edge] for edge in outgoing if write[edge] != STDOUT]
     return streams + _rows_writes(process, plan, write)
 
 
@@ -1391,7 +1429,15 @@ def execute_plan(
     """
     stack = contextlib.ExitStack()
     try:
-        served: dict[tuple[PipeEdge, Side], NamedPipe] = {}
+        named: dict[tuple[PipeEdge, Side], str] = {}
+        relays: list[Relay] = []
+
+        def relay() -> Relay:
+            # One per run, started by the first stage that relays an edge.
+            if not relays:
+                relays.append(Relay.start())
+                stack.callback(relays[0].close)
+            return relays[0]
         home: list[Path] = []
 
         def workspace() -> Path:
@@ -1409,17 +1455,10 @@ def execute_plan(
             return str(workspace() / f"rows-{name}.ndjson")
 
         def pipe_path(edge: PipeEdge, side: Side) -> str:
-            workspace()
-            # A named pipe on the consumer's side is one this process writes.
-            pipe = pipes.create(
-                home[0],
-                str(len(served)),
-                writing=side == "read",
-                buffer=_pipe_buffer(edge),
-            )
-            stack.callback(pipe.close)
-            served[(edge, side)] = pipe
-            return pipe.path
+            # Named here, made by the relay when the edge's stage starts.
+            path = pipes.path(workspace(), str(len(named)))
+            named[(edge, side)] = path
+            return path
 
         argv = plan_argv(
             plan,
@@ -1445,7 +1484,8 @@ def execute_plan(
                 plan,
                 stage,
                 argv,
-                served,
+                named,
+                relay,
                 assigned,
                 timeout,
                 overwrite,
@@ -1965,115 +2005,20 @@ class _Member:
     argv: list[str]
     proc: subprocess.Popen[bytes]
     stderr: _Log = field(default_factory=lambda: _Log())
-    # This runner's end of a stdio pipe made to a size (:func:`_stdio_buffer`),
-    # which ``proc.stdout`` / ``proc.stdin`` are None beside: the stream the
-    # member's raw video comes out of, or goes in by.
+    # This runner's end of a stdout pipe made to a size (:func:`_stdio_buffer`),
+    # which ``proc.stdout`` is None beside: the stream the member's raw video
+    # comes out of, until the member it is chained to is handed it.
     stdout: IO[bytes] | None = None
-    stdin: IO[bytes] | None = None
     terminated: bool = False
     # When the watch first saw this member had exited; None while it runs, and
     # for one still running when the stage was stopped.
     ended_at: float | None = None
 
 
-class _End:
-    """One end of a wire: the stream to copy through, and its release."""
-
-    def open(self, deadline: float) -> IO[bytes]:
-        raise NotImplementedError
-
-    def close(self) -> None:
-        raise NotImplementedError
-
-
-class _StdioEnd(_End):
-    """A member's own stdin or stdout, already open."""
-
-    def __init__(self, stream: IO[bytes]) -> None:
-        self._stream = stream
-
-    def open(self, deadline: float) -> IO[bytes]:
-        return self._stream
-
-    def close(self) -> None:
-        try:
-            self._stream.close()
-        except (OSError, ValueError):
-            pass
-
-
 def _stdout_of(member: _Member) -> IO[bytes] | None:
     """The stream a member's stdout reaches this runner by: the sized pipe's
     end where one was made, else the one :class:`subprocess.Popen` made."""
     return member.stdout if member.stdout is not None else member.proc.stdout
-
-
-def _stdin_of(member: _Member) -> IO[bytes] | None:
-    """The stream this runner writes a member's stdin by, likewise."""
-    return member.stdin if member.stdin is not None else member.proc.stdin
-
-
-class _PipeEnd(_End):
-    """A named pipe, open once the member on the other side connects."""
-
-    def __init__(self, pipe: NamedPipe) -> None:
-        self._pipe = pipe
-
-    def open(self, deadline: float) -> IO[bytes]:
-        return self._pipe.wait(deadline)
-
-    def close(self) -> None:
-        self._pipe.close()
-
-
-# Opens the TCP connection one cut edge travels on: given the deadline and an
-# event set once the end is closed, a socket connected to the other node's
-# runner with the edge's opening exchange done. Raises OSError when there is
-# none to be had.
-SocketOpener = Callable[[float, threading.Event], socket.socket]
-
-
-class _SocketEnd(_End):
-    """An edge's connection to the runner of another node.
-
-    The far side of a cut edge: the producer's node copies its pipe into
-    one of these, and the consumer's node copies one of these into its pipe.
-    The bytes are the edge's own NUT, as a pipe carries them. `mode` is
-    ``rb`` on the consumer's side and ``wb`` on the producer's.
-    """
-
-    def __init__(self, connect: SocketOpener, mode: Literal["rb", "wb"]) -> None:
-        self._connect = connect
-        self._mode: Literal["rb", "wb"] = mode
-        self._closed = threading.Event()
-        self._lock = threading.Lock()
-        self._socket: socket.socket | None = None
-        self._stream: IO[bytes] | None = None
-
-    def open(self, deadline: float) -> IO[bytes]:
-        connection = self._connect(deadline, self._closed)
-        with self._lock:
-            if self._closed.is_set():
-                connection.close()
-                raise OSError("the edge was closed before it connected")
-            connection.settimeout(None)
-            self._socket = connection
-            # Unbuffered, as a pipe end is: a read hands back what arrived.
-            stream = cast("IO[bytes]", connection.makefile(self._mode, buffering=0))
-            self._stream = stream
-        return stream
-
-    def close(self) -> None:
-        with self._lock:
-            self._closed.set()
-            stream, connection = self._stream, self._socket
-            self._stream = self._socket = None
-        if stream is not None:
-            with contextlib.suppress(OSError, ValueError):
-                stream.close()
-        if connection is not None:
-            with contextlib.suppress(OSError):
-                connection.close()
 
 
 class RemoteProcess:
@@ -2097,7 +2042,8 @@ def _run_stage(
     plan: ProcessPlan,
     stage: Stage,
     argv: dict[str, list[str]],
-    served: dict[tuple[PipeEdge, Side], NamedPipe],
+    named: Mapping[tuple[PipeEdge, Side], str],
+    relay: Callable[[], Relay],
     assigned: Sequence[Wire],
     timeout: float | None,
     overwrite: bool,
@@ -2129,7 +2075,8 @@ def _run_stage(
         plan,
         stage,
         argv,
-        served,
+        named,
+        relay,
         assigned,
         timeout,
         overwrite,
@@ -2182,15 +2129,11 @@ def stage_wires(
     plan: ProcessPlan,
     stage: Stage,
     assigned: Sequence[Wire],
-    apart: Callable[[Wire], bool] | None = None,
 ) -> tuple[list[Wire], dict[str, tuple[int, list[str]]]]:
-    """`stage`'s own wires as its run takes them, and its feeders' writers.
+    """`stage`'s own wires, and its feeders' writers.
 
     The writers are keyed by process, each with its port and the members
-    reading it: each is started once its port accepts. Where a feeder waits,
-    a live input's edges are copied rather than chained, so the first bytes
-    its reader writes start the feeder's clock. So is every wire `apart`
-    says runs between two nodes, which no stdio handle can cross.
+    reading it: each is started once its port accepts.
     """
     inside = set(stage.processes)
     writers: dict[str, tuple[int, list[str]]] = {}
@@ -2198,34 +2141,34 @@ def stage_wires(
         if edge.source in inside:
             writers.setdefault(edge.source, (edge.port, []))[1].append(edge.target)
     found = [
-        replace(wire, pumped=True)
-        if (writers and _is_live(wire.edge)) or (apart is not None and apart(wire))
-        else wire
+        wire
         for wire in assigned
         if wire.edge.source in inside and wire.edge.target in inside
     ]
     return found, writers
 
 
-# Where a stage run finds the far end of a wire whose other process runs on
-# another node: the end this node copies into (`write`, its producer being
-# here) or out of (`read`, its consumer being here).
-RemoteEnd = Callable[[Wire, Side], _End]
+# The far end of a wire whose other process runs on another node, as the
+# relay takes it: where the producer's bytes arrive on this node (`write`,
+# the producer being elsewhere), or where they leave for the consumer's
+# (`read`).
+RemoteEnd = Callable[[Wire, Side], object]
 
 
 class _StageRun:
     """One stage's members on this machine, from spawn to stop.
 
     Everything :func:`_run_stage` does short of watching: the run-time
-    laterals the stage writes for, every member spawned in chain order, each
-    wire either handed from stdout to stdin or copied through a pump, every
-    stderr drained, and each feeder's writer started once its port accepts.
+    laterals the stage writes for, the stage's named wires handed to the
+    relay before any member is told to open one, every member spawned in
+    chain order, every stderr drained, and each feeder's writer started once
+    its port accepts.
 
     `local` narrows the members this machine runs to a subset of the stage,
     for a stage placed across several nodes; the stage's wires are still
     read off the whole plan, so a member's argv and stdio are the ones a run
-    on one node gives it. A wire with one end elsewhere is always copied
-    rather than chained, and `remote` supplies the end on the far side.
+    on one node gives it. A wire with one end elsewhere is never chained
+    (:func:`wires`), and `remote` says where the relay finds its far end.
     `spawned` hears each member as it starts.
     """
 
@@ -2234,7 +2177,8 @@ class _StageRun:
         plan: ProcessPlan,
         stage: Stage,
         argv: Mapping[str, list[str]],
-        served: Mapping[tuple[PipeEdge, Side], NamedPipe],
+        named: Mapping[tuple[PipeEdge, Side], str],
+        relay: Callable[[], Relay],
         assigned: Sequence[Wire],
         timeout: float | None,
         overwrite: bool,
@@ -2253,7 +2197,9 @@ class _StageRun:
         inside = set(self.ids)
         self.local = inside if local is None else inside & set(local)
         self._argv = argv
-        self._served = served
+        self._named = named
+        self._relay = relay
+        self._stage = stage.index
         self._overwrite = overwrite
         self._echo = echo
         self._players = players
@@ -2262,19 +2208,17 @@ class _StageRun:
         self._laterals = laterals
         self._remote = remote
         self._spawned = spawned
-        self.stage_wires, self.writers = stage_wires(plan, stage, assigned, self._crosses)
+        self.stage_wires, self.writers = stage_wires(plan, stage, assigned)
         self.feeds = [(wire.edge.source, wire.edge.target) for wire in self.stage_wires]
         self.feeding = {pid: readers for pid, (_, readers) in self.writers.items()}
         self.deadline = math.inf if timeout is None else time.monotonic() + timeout
         self.members: dict[str, _Member] = {}
         self.watching: dict[str, subprocess.Popen[bytes]] = {}
         self.helpers: list[threading.Thread] = []
-        self.ends: list[_End] = []
         self.flows: list[Flow] = []
+        # The relay's names for this stage's edges, which a stop names.
+        self.relayed: list[str] = []
         self.runs: list[_LateralRun] = []
-
-    def _crosses(self, wire: Wire) -> bool:
-        return (wire.edge.source in self.local) != (wire.edge.target in self.local)
 
     @property
     def live(self) -> list[Flow]:
@@ -2282,8 +2226,8 @@ class _StageRun:
         return [flow for flow in self.flows if _is_live(flow.edge)]
 
     def start(self) -> None:
-        """Start the laterals, every member but the feeders' writers, and
-        every copy and drain between them."""
+        """Start the laterals, the relay's copies, every member but the
+        feeders' writers, and every drain."""
         laterals = self._laterals
         for lateral in self.plan.laterals:
             if lateral.writer in self.local and laterals is not None:
@@ -2299,16 +2243,13 @@ class _StageRun:
                     )
                 )
 
+        self._relay_wires()
         for pid in _spawn_order(self.ids, self.stage_wires):
             if pid in self.local and pid not in self.writers:
                 self._spawn(pid)
 
         for pid, window in self.watching.items():
             self.helpers.append(_start(_forward, _stdout_of(self.members[pid]), window.stdin))
-
-        for wire in self.stage_wires:
-            if not wire.chained and self._ready(wire):
-                self._pump(wire)
 
         for member in self.members.values():
             self._drain(member)
@@ -2340,9 +2281,6 @@ class _StageRun:
             if not heard:
                 return readers[0], True, unheard_error(pid, readers, port, live=bool(live))
             self._spawn(pid)
-            for wire in self.stage_wires:
-                if not wire.chained and pid in (wire.edge.source, wire.edge.target):
-                    self._pump(wire)
             self._drain(self.members[pid])
         return None
 
@@ -2355,12 +2293,10 @@ class _StageRun:
         _stop(self.members.values())
         for window in self.watching.values():
             _stop_player(window)
-        # A pump whose members have all gone finishes on its own; one still
-        # waiting for a member that never arrived is released by its end.
-        for helper in self.helpers:
-            helper.join(_POLL)
-        for end in self.ends:
-            end.close()
+        # A copy whose members have all gone has ended on its own; one still
+        # waiting for a member that never arrived ends here.
+        if self.relayed:
+            self._relay().stop(self.relayed)
         for helper in self.helpers:
             helper.join(_JOIN)
         for run in self.runs:
@@ -2378,14 +2314,45 @@ class _StageRun:
             if member.ended_at is not None
         }
 
-    def _ready(self, wire: Wire) -> bool:
-        """True when this machine copies `wire` and both its ends can be
-        opened: a member here that has been spawned, or a node elsewhere. A
-        wire between two other nodes is theirs to copy."""
-        ends = (wire.edge.source, wire.edge.target)
-        return any(pid in self.local for pid in ends) and all(
-            pid in self.members or pid not in self.local for pid in ends
-        )
+    def _relay_wires(self) -> None:
+        """Hand the relay every wire of this stage that is not chained and
+        has an end here, and wait for it to make their pipes.
+
+        A wire between two members here is pipe to pipe. One with an end on
+        another node has `remote` say where the relay finds the far side. A
+        wire between two other nodes is theirs to carry.
+        """
+        edges: list[RelayEdge] = []
+        heard: dict[str, Callable[[Mapping[str, object]], None]] = {}
+        for index, wire in enumerate(self.stage_wires):
+            here = [pid in self.local for pid in (wire.edge.source, wire.edge.target)]
+            if wire.chained or not any(here):
+                continue
+            source: object = self._named.get((wire.edge, "write"))
+            dest: object = self._named.get((wire.edge, "read"))
+            if not here[0]:
+                assert self._remote is not None  # only a split stage has members elsewhere
+                source = self._remote(wire, "write")
+            if not here[1]:
+                assert self._remote is not None
+                dest = self._remote(wire, "read")
+            flow = Flow(edge=wire.edge, at=time.monotonic())
+            self.flows.append(flow)
+            name = f"s{self._stage}e{index}"
+            edges.append(
+                RelayEdge(
+                    id=name,
+                    source=source,
+                    dest=dest,
+                    depth=_read_ahead(flow),
+                    buffer=_pipe_buffer(wire.edge),
+                    spool=isinstance(wire.edge, RowsEdge),
+                )
+            )
+            heard[name] = functools.partial(_heard, flow)
+            self.relayed.append(name)
+        if edges:
+            self._relay().open(edges, heard, self.deadline)
 
     def _spawn(self, pid: str) -> None:
         process = self.plan.process(pid)
@@ -2394,23 +2361,12 @@ class _StageRun:
         chained = next((w for w in reads if w.chained), None)
         player = self._players.get(pid)
         stdin: int | IO[bytes] = subprocess.DEVNULL
-        # The ends of sized pipes: the child's, closed here once it has them,
-        # and this runner's, kept on the member.
+        # The ends of a sized pipe: the child's, closed here once it has it,
+        # and this runner's, kept on the member for the next to be handed.
         theirs: list[int] = []
-        runner_in: IO[bytes] | None = None
         runner_out: IO[bytes] | None = None
-        fed = next((w for w in reads if w.read_stdio), None)
         if chained is not None:
             stdin = _stream(_stdout_of(self.members[chained.edge.source]))
-        elif fed is not None:
-            size = _stdio_buffer(fed.edge)
-            if size is None:
-                stdin = subprocess.PIPE
-            else:
-                read, write = pipes.anonymous(size)
-                stdin = read
-                theirs.append(read)
-                runner_in = os.fdopen(write, "wb", buffering=0)
         stdout: int | None = (
             subprocess.PIPE
             if any(w.write_stdio for w in writes) or player is not None
@@ -2443,9 +2399,8 @@ class _StageRun:
         try:
             proc = _spawn(command, stdin, stdout, env=_nn_runtime_env(command))
         except BaseException:
-            for stream in (runner_in, runner_out):
-                if stream is not None:
-                    stream.close()
+            if runner_out is not None:
+                runner_out.close()
             raise
         finally:
             for fd in theirs:
@@ -2454,36 +2409,13 @@ class _StageRun:
             id=pid,
             argv=command,
             proc=proc,
-            stderr=_Log.for_run(),
+            stderr=_Log.for_run(pid),
             stdout=runner_out,
-            stdin=runner_in,
         )
         if chained is not None and not isinstance(stdin, int):
             stdin.close()  # the spawned member owns it now
         if self._spawned is not None:
             self._spawned(member)
-
-    def _end(self, wire: Wire, side: Side) -> _End:
-        """The end of `wire` a pump copies out of (`write`) or into (`read`)."""
-        pid = wire.edge.source if side == "write" else wire.edge.target
-        if pid not in self.local:
-            assert self._remote is not None  # only a split stage has members elsewhere
-            return self._remote(wire, side)
-        if side == "write":
-            if wire.write_stdio:
-                return _StdioEnd(_stream(_stdout_of(self.members[pid])))
-            return _PipeEnd(self._served[(wire.edge, "write")])
-        if wire.read_stdio:
-            return _StdioEnd(_stream(_stdin_of(self.members[pid])))
-        return _PipeEnd(self._served[(wire.edge, "read")])
-
-    def _pump(self, wire: Wire) -> None:
-        source = self._end(wire, "write")
-        dest = self._end(wire, "read")
-        self.ends.extend([source, dest])
-        flow = Flow(edge=wire.edge, at=time.monotonic())
-        self.flows.append(flow)
-        self.helpers.append(_start(_pump, source, dest, self.deadline, flow))
 
     def _drain(self, member: _Member) -> None:
         stderr = _stream(member.proc.stderr)
@@ -2736,9 +2668,9 @@ def _watch(
     asked for the edge at all (:func:`unopened`). `stall` of None turns both
     off.
 
-    Neither is asked while the stage is working: the pipes a stage pumps are
-    not all the pipes it has, so a member computing between two writes stands
-    still on every pumped edge without being wedged. Both detectors wait for
+    Neither is asked while the stage is working: the pipes the relay copies
+    are not all the pipes a stage has, so a member computing between two
+    writes stands still on every relayed edge without being wedged. Both detectors wait for
     the members' own CPU time to stop advancing for `stall` seconds too.
 
     `windows` are passed only for a stage whose display windows are all it
@@ -3064,145 +2996,21 @@ def _start(target: Callable[..., None], *args: object) -> threading.Thread:
     return thread
 
 
-class _Ahead:
-    """Bytes a copy has taken from the producer and not yet handed on.
+def _heard(flow: Flow, row: Mapping[str, object]) -> None:
+    """One flow row from the relay, into the edge's `Flow`.
 
-    Bounded by `limit`: once that much is held the reading side waits, so a
-    run whose paths really have drifted apart still stops rather than growing
-    without end -- what is held here is the depth, not a reservoir.
+    The relay counts; this runner keeps time. `at` is stamped with this
+    runner's own clock whenever the count moves, which is what the watch
+    compares against, so the two clocks never have to agree.
     """
-
-    def __init__(self, limit: int) -> None:
-        self._limit = limit
-        self._held: deque[bytes] = deque()
-        self._size = 0
-        self._ended = False
-        self._change = threading.Condition()
-
-    def put(self, chunk: bytes) -> bool:
-        """Hold `chunk`, waiting for room. False once the copy has finished."""
-        with self._change:
-            while self._size >= self._limit and not self._ended:
-                self._change.wait()
-            if self._ended:
-                return False
-            self._held.append(chunk)
-            self._size += len(chunk)
-            self._change.notify_all()
-            return True
-
-    def take(self) -> bytes | None:
-        """The next bytes to write; None once nothing more will arrive."""
-        with self._change:
-            while not self._held and not self._ended:
-                self._change.wait()
-            if not self._held:
-                return None
-            chunk = self._held.popleft()
-            self._size -= len(chunk)
-            self._change.notify_all()
-            return chunk
-
-    def finish(self) -> None:
-        """Nothing more will be read. Releases whichever side is waiting."""
-        with self._change:
-            self._ended = True
-            self._change.notify_all()
-
-
-class _Spool:
-    """Bytes taken off the producer and held until the consumer opens.
-
-    A rows document is read WHOLE by the process it goes to, at the moment
-    that process opens the input, so there is nothing to pace and everything
-    to hold: a producer left blocked on a consumer that has not opened yet is
-    a stage that never moves again. Held in memory up to `_SPOOL_MEMORY`, and
-    in a temporary file past that, which goes when the copy does.
-
-    `flow` counts the bytes as they arrive rather than as they are handed on,
-    so a stage watching its pipes sees this edge moving while its consumer is
-    still opening.
-    """
-
-    def __init__(self, flow: Flow | None = None) -> None:
-        self._flow = flow
-        self._held: deque[bytes] = deque()
-        self._size = 0
-        self._file: IO[bytes] | None = None
-        self._written = 0
-        self._read = 0
-        self._ended = False
-        self._change = threading.Condition()
-
-    def put(self, chunk: bytes) -> bool:
-        """Hold `chunk`, never waiting. False once the copy has finished."""
-        with self._change:
-            if self._ended:
-                return False
-            if self._file is None and self._size + len(chunk) > _SPOOL_MEMORY:
-                self._file = tempfile.TemporaryFile(prefix="ffrwd-rows-")
-            if self._file is None:
-                self._held.append(chunk)
-                self._size += len(chunk)
-            else:
-                self._file.seek(self._written)
-                self._file.write(chunk)
-                self._written += len(chunk)
-            if self._flow is not None:
-                self._flow.moved += len(chunk)
-                self._flow.at = time.monotonic()
-            self._change.notify_all()
-            return True
-
-    def take(self) -> bytes | None:
-        """The next bytes to write; None once nothing more will arrive."""
-        with self._change:
-            while not self._ready() and not self._ended:
-                self._change.wait()
-            if self._held:
-                chunk = self._held.popleft()
-                self._size -= len(chunk)
-                return chunk
-            if self._file is not None and self._read < self._written:
-                self._file.seek(self._read)
-                chunk = self._file.read(min(_CHUNK, self._written - self._read))
-                self._read += len(chunk)
-                return chunk
-            return None
-
-    def _ready(self) -> bool:
-        """True while there are bytes to hand on: memory first, then file."""
-        spilled = self._file is not None and self._read < self._written
-        return bool(self._held) or spilled
-
-    def finish(self) -> None:
-        """Nothing more will be read. Releases a take that is waiting."""
-        with self._change:
-            self._ended = True
-            self._change.notify_all()
-
-    def release(self) -> None:
-        """Drop what is still held, and the temporary file with it."""
-        with self._change:
-            self._ended = True
-            self._held.clear()
-            self._size = 0
-            if self._file is not None:
-                with contextlib.suppress(OSError):
-                    self._file.close()
-                self._file = None
-            self._change.notify_all()
-
-
-def _fill(reader: IO[bytes], ahead: _Ahead | _Spool) -> None:
-    """Take from the producer as fast as it writes, as far as `ahead` holds."""
-    try:
-        while (chunk := reader.read(_CHUNK)) and ahead.put(chunk):
-            continue
-    except (OSError, ValueError):
-        pass
-    finally:
-        ahead.finish()
+    moved = row.get("moved")
+    if isinstance(moved, int) and moved != flow.moved:
+        flow.moved = moved
+        flow.at = time.monotonic()
+    if row.get("began") is True and flow.began is None:
+        flow.began = time.monotonic()
+    flow.writing = row.get("writing") is True
+    flow.opening = row.get("opening") is True
 
 
 def _read_ahead(flow: Flow | None) -> int:
@@ -3218,73 +3026,6 @@ def _read_ahead(flow: Flow | None) -> int:
     Every other edge hands each read straight on.
     """
     return _CHUNK if flow is None or not flow.held else _READ_AHEAD
-
-
-def _pump(source: _End, dest: _End, deadline: float, flow: Flow | None = None) -> None:
-    """Copy one stream edge's bytes end to end until the producer stops.
-
-    `_CHUNK` is a ceiling and not a quantum: both ends are unbuffered, so a
-    read hands back whatever has arrived and the copy passes exactly that on.
-    Waiting for a full chunk would be a deadlock in a plan where one process
-    feeds two paths that meet again -- the process that would round the chunk
-    up is itself waiting for the frame the held-back tail completes.
-
-    Reading runs in a thread of its own, and starts as soon as the PRODUCING
-    end is open rather than once both are: the consumer may still be opening
-    an earlier input of its own, and a producer left unread until then fills
-    its pipe and stops before it writes the output that earlier input is
-    waiting for. How far it reads ahead of the consumer is the depth the
-    compiler counted (:func:`_read_ahead`).
-
-    A ROWS edge is spooled instead (:class:`_Spool`): the process it goes to
-    reads the whole document when it opens the input, so there is nothing to
-    pace, and the producer must never be the one waiting.
-
-    `flow` is where the copy records what it has moved and when, and marks
-    itself as waiting on the consuming end -- which is what makes a full
-    buffer visible to :func:`overflowed`, and an end nobody opened visible to
-    :func:`unopened`, rather than a stage that simply hangs.
-    """
-    spooled = flow is not None and isinstance(flow.edge, RowsEdge)
-    ahead: _Ahead | _Spool = _Spool(flow) if spooled else _Ahead(_read_ahead(flow))
-    reading: threading.Thread | None = None
-    try:
-        reader = source.open(deadline)
-        if flow is not None:
-            flow.opening = True
-        # Reading starts before the consuming end is even open: ffmpeg opens
-        # its inputs one at a time, so a producer whose first output nobody is
-        # taking yet stops before it reaches the output the consumer is
-        # actually waiting on.
-        reading = _start(_fill, reader, ahead)
-        writer = dest.open(deadline)
-        if flow is not None:
-            flow.opening = False
-        while (chunk := ahead.take()) is not None:
-            if flow is not None:
-                flow.writing = True
-            _write_all(writer, chunk)
-            if flow is not None:
-                flow.writing = False
-                if not spooled:  # a spool counted these as it took them
-                    flow.moved += len(chunk)
-                flow.at = time.monotonic()
-                if flow.began is None:
-                    flow.began = flow.at
-        writer.flush()
-    except (OSError, ValueError):
-        pass  # the other end went away; exit codes are what judge that
-    finally:
-        ahead.finish()
-        if flow is not None:
-            flow.writing = False
-            flow.opening = False
-        dest.close()
-        source.close()
-        if reading is not None:
-            reading.join(_JOIN)
-        if isinstance(ahead, _Spool):
-            ahead.release()
 
 
 def _write_all(writer: IO[bytes], chunk: bytes) -> None:
@@ -3354,14 +3095,16 @@ class _Log:
         self._turn = threading.Lock()
 
     @classmethod
-    def for_run(cls) -> _Log:
+    def for_run(cls, member: str = "") -> _Log:
         """A spawned member's log: written whole to a file in the directory
         FFRWD_DUMP_STDERR names, where it names one, as it arrives."""
         directory = os.environ.get("FFRWD_DUMP_STDERR")
         if not directory:
             return cls()
         Path(directory).mkdir(parents=True, exist_ok=True)
-        handle, name = tempfile.mkstemp(prefix=".", suffix=".stderr.part", dir=directory)
+        handle, name = tempfile.mkstemp(
+            prefix=f".{member}.", suffix=".stderr.part", dir=directory
+        )
         os.close(handle)
         return cls(whole=Path(name))
 

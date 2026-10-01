@@ -1981,8 +1981,9 @@ $ ffrwd compile -f query.sql
   '<named pipe ffmpeg1-sidecar0 src_a_v_0_split:0 write>' -map '[out1]' -c:0 rawvideo \
   -pix_fmt:0 yuv420p -fps_mode:0 passthrough -f nut \
   '<named pipe ffmpeg1-ffmpeg0 src_a_v_0_split:1 write>'
-3. sidecar: ffrwd-wasm -f nut -i pipe:0 -m \
-  ../sidecar/modules/target/wasm32-wasip2/release/invert.wasm -f nut pipe:1
+3. sidecar: ffrwd-wasm -f nut -i '<named pipe ffmpeg1-sidecar0 src_a_v_0_split:0 read>' \
+  -m ../sidecar/modules/target/wasm32-wasip2/release/invert.wasm -f nut \
+  '<named pipe sidecar0-ffmpeg0 n1 write>'
 # this listing is not a shell command -- run the plan with `ffrwd run`
 ```
 
@@ -2037,8 +2038,9 @@ $ ffrwd compile -f query.sql
   '<named pipe ffmpeg1-sidecar0 src_a_v_0_split:0 write>' -map '[out1]' -c:0 rawvideo \
   -pix_fmt:0 yuv420p -fps_mode:0 passthrough -fifo_format nut -queue_size 2 -f fifo \
   '<named pipe ffmpeg1-ffmpeg0 src_a_v_0_split:1 write>'
-3. sidecar: ffrwd-wasm -f nut -i pipe:0 -m \
-  ../sidecar/modules/target/wasm32-wasip2/release/invert.wasm -f nut pipe:1
+3. sidecar: ffrwd-wasm -f nut -i '<named pipe ffmpeg1-sidecar0 src_a_v_0_split:0 read>' \
+  -m ../sidecar/modules/target/wasm32-wasip2/release/invert.wasm -f nut \
+  '<named pipe sidecar0-ffmpeg0 n1 write>'
 # this listing is not a shell command -- run the plan with `ffrwd run`
 ```
 
@@ -2995,8 +2997,9 @@ $ ffrwd compile -f query.sql
   -f nut pipe:1
 4. sidecar: ffrwd-wasm -f nut -i pipe:0 -m \
   ../sidecar/modules/target/wasm32-wasip2/release/invert.wasm -f nut pipe:1
-5. sidecar: ffrwd-wasm -f nut -i pipe:0 -m \
-  ../sidecar/modules/target/wasm32-wasip2/release/double.wasm -f nut pipe:1
+5. sidecar: ffrwd-wasm -f nut -i '<named pipe ffmpeg1-sidecar1 n1_split:0 read>' -m \
+  ../sidecar/modules/target/wasm32-wasip2/release/double.wasm -f nut \
+  '<named pipe sidecar1-ffmpeg0 n2 write>'
 # this listing is not a shell command -- run the plan with `ffrwd run`
 ```
 
@@ -3077,8 +3080,9 @@ $ ffrwd compile -f query.sql
   -pix_fmt:0 yuv420p -fps_mode:0 passthrough -fifo_format nut -queue_size 150 -f fifo \
   '<named pipe ffmpeg1-sidecar0 n1 write>' -map '[out1]' -c:0 pcm_f32le -f nut \
   '<named pipe ffmpeg1-ffmpeg0 n3 write>'
-3. sidecar: ffrwd-wasm -f nut -i pipe:0 -filter_complex \
-  '[0:v]leaky=max_lateness=0.5:max_spread=2:node=n2[out0]' -map '[out0]' -f nut pipe:1
+3. sidecar: ffrwd-wasm -f nut -i '<named pipe ffmpeg1-sidecar0 n1 read>' -filter_complex \
+  '[0:v]leaky=max_lateness=0.5:max_spread=2:node=n2[out0]' -map '[out0]' -f nut \
+  '<named pipe sidecar0-ffmpeg0 n2 write>'
 # this listing is not a shell command -- run the plan with `ffrwd run`
 ```
 

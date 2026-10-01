@@ -618,9 +618,11 @@ dependencies = [
  "ffrwd-nal",
  "ffrwd-nut",
  "ffrwd-wasm-runtime",
+ "libc",
  "serde",
  "serde_json",
  "sha2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

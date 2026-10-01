@@ -27,6 +27,7 @@ from ffrwd.processes import (
     StreamEdge,
     VideoFormat,
 )
+from ffrwd.relay import Relay
 
 _EXECUTE = sys.modules["ffrwd.execute"]
 
@@ -129,7 +130,8 @@ def test_a_chain_carries_every_byte_through_the_pipe_it_was_given(
         plan,
         Stage(index=0, processes=("s0", "s1")),
         {"s0": [python, "-c", _PRODUCE], "s1": [python, "-c", consume]},
-        served={},
+        named={},
+        relay=Relay.start,
         assigned=wires(plan),
         timeout=60,
         overwrite=False,

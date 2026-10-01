@@ -98,10 +98,10 @@ def _negate(
     process: SidecarProcess, reads: Sequence[str], writes: Sequence[str] = ()
 ) -> list[str]:
     return [
-        "ffmpeg", "-hide_banner",
-        "-f", "nut", "-i", "pipe:0",
+        "ffmpeg", "-hide_banner", "-y",
+        "-f", "nut", "-i", reads[0] if reads else "pipe:0",
         "-vf", "negate",
-        "-c:v", "rawvideo", "-f", "nut", "pipe:1",
+        "-c:v", "rawvideo", "-f", "nut", writes[0] if writes else "pipe:1",
     ]  # fmt: skip
 
 
@@ -110,10 +110,10 @@ def _broken(
 ) -> list[str]:
     """An ffmpeg whose filtergraph names a filter that does not exist."""
     return [
-        "ffmpeg", "-hide_banner",
-        "-f", "nut", "-i", "pipe:0",
+        "ffmpeg", "-hide_banner", "-y",
+        "-f", "nut", "-i", reads[0] if reads else "pipe:0",
         "-vf", "ffrwd_no_such_filter",
-        "-c:v", "rawvideo", "-f", "nut", "pipe:1",
+        "-c:v", "rawvideo", "-f", "nut", writes[0] if writes else "pipe:1",
     ]  # fmt: skip
 
 

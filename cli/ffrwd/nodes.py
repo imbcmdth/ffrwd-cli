@@ -3,12 +3,13 @@
 A placed plan (:mod:`ffrwd.placement`) runs as one RUNNER per node and a
 COORDINATOR over them. A runner is ``ffrwd node``: the plan runner of
 :func:`~ffrwd.execute.execute_plan` over its node's processes. It spawns
-them, serves their pipes and copies their wires exactly as a run on one
-node does. A wire whose other end is on another node is copied into or out
-of a TCP connection instead of a pipe (:class:`~ffrwd.execute._SocketEnd`),
-so a cut edge is pipe, TCP, pipe, carrying the same NUT bytes. No argv
-changes: the coordinator renders every member's argv once, as a run on one
-node would, and each runner only names its own pipes in it.
+them, and its relay (:mod:`ffrwd.relay`) serves their pipes and carries
+their wires exactly as a run on one node does. A wire whose other end is on
+another node goes into or out of a TCP connection the relay holds instead of
+a pipe, so a cut edge is pipe, TCP, pipe, carrying the same NUT bytes, and
+none of them cross a Python process. The coordinator renders every member's
+argv once, with every cut edge named at both ends (:func:`~ffrwd.execute.wires`),
+and each runner only names its own pipes in it.
 
 The coordinator applies the run's rules to what the runners report: a stage
 ends once every member has, the member that ended it is found from the exit
@@ -41,11 +42,11 @@ destinations), ``row``, ``unheard`` (a feeder port nothing listened on),
 Cut edges
 ---------
 The consumer's node listens on one data port for all its cut edges; the
-producer's node dials it. A connection opens with one line, ``FFRWD-CUT 1
-<secret> <edge>``, and the listener closes one that does not name the
-job's secret and an edge this node listens for, before reading anything
-else; it answers ``OK`` to one that does, and only then does the edge's
-first byte cross.
+producer's node dials it. Both ends are the relay's. A connection opens with
+one line, ``FFRWD-CUT 1 <secret> <edge>``, and the listener closes one that
+does not name the job's secret and an edge this node listens for, before
+reading anything else; it answers ``OK`` to one that does, and only then
+does the edge's first byte cross.
 """
 
 from __future__ import annotations
@@ -65,7 +66,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Protocol, cast
@@ -92,14 +93,11 @@ from .execute import (
     StageResult,
     Wire,
     _cpu_seconds,
-    _End,
     _is_live,
     _Laterals,
     _Member,
-    _pipe_buffer,
     _print_row,
     _resolve_rows_documents,
-    _SocketEnd,
     _StageRun,
     _watch,
     plan_argv,
@@ -108,37 +106,22 @@ from .execute import (
     terminal_member,
     wires,
 )
-from .pipes import NamedPipe
 from .placement import NodePlan, Placement, check_placement, cut_key, pipe_edges, split
 from .processes import ProcessPlan, Stage
+from .relay import SECRET_ENV, Relay
 
 __all__ = [
-    "CUT_HELLO",
     "SECRET_ENV",
     "Channel",
-    "Listener",
     "Runner",
     "StartRunner",
     "agent_main",
-    "dial",
     "execute_split",
     "new_secret",
 ]
 
-# The environment variable a runner reads the job's secret from: never argv,
-# which other users of the machine can list.
-SECRET_ENV = "FFRWD_NODE_SECRET"
-
-# The first word of a cut edge's opening line, and its version.
-CUT_HELLO = "FFRWD-CUT 1"
-# What a listener answers an opening it accepts.
-_ACK = b"OK\n"
-# The longest opening line a listener reads before closing the connection.
-_HELLO_LIMIT = 256
 # How long a connection is given to send its opening line.
 _HELLO_WAIT = 5.0
-# How long a dial that was refused waits before trying again.
-_DIAL_RETRY = 0.05
 # How often a runner reports its copies' counters and its members' CPU time.
 _REPORT_EVERY = 0.2
 # How long the coordinator waits for every runner to dial it and say ready.
@@ -221,160 +204,6 @@ class Channel:
         with contextlib.suppress(OSError):
             self._socket.close()
 
-
-# -- cut edges
-
-
-def _opening(secret: str, key: str) -> bytes:
-    return f"{CUT_HELLO} {secret} {key}\n".encode()
-
-
-class Listener:
-    """A node's one data port: every cut edge into this node arrives on it.
-
-    Each connection must open with the job's secret and the name of an edge
-    this node listens for (`keys`), each edge once; anything else is closed
-    before a byte past the opening line is read. `refused` says why each
-    closed connection was, in arrival order.
-    """
-
-    def __init__(self, host: str, secret: str, keys: Iterable[str], port: int = 0) -> None:
-        self._secret = secret.encode()
-        self._keys = set(keys)
-        self._server = _server(host, port)
-        self._server.settimeout(_POLL * 5)
-        self.address: tuple[str, int] = self._server.getsockname()[:2]
-        self._arrived: dict[str, socket.socket] = {}
-        self._taken: set[str] = set()
-        self._change = threading.Condition()
-        self._closed = False
-        self.refused: list[str] = []
-        self._thread = threading.Thread(target=self._accept, daemon=True)
-        self._thread.start()
-
-    def _accept(self) -> None:
-        while not self._closed:
-            try:
-                connection, _ = self._server.accept()
-            except TimeoutError:
-                continue
-            except OSError:
-                return
-            threading.Thread(target=self._greet, args=(connection,), daemon=True).start()
-
-    def _greet(self, connection: socket.socket) -> None:
-        reason = self._check(connection)
-        if reason is not None:
-            with self._change:
-                self.refused.append(reason)
-                self._change.notify_all()
-            with contextlib.suppress(OSError):
-                connection.close()
-
-    def _check(self, connection: socket.socket) -> str | None:
-        """Read the opening line and accept or refuse; why, when refused."""
-        connection.settimeout(_HELLO_WAIT)
-        line = b""
-        try:
-            # A byte at a time, so nothing past the opening line is read: a
-            # dialer sends nothing more until it is answered, and whatever
-            # anything else sends after it is never taken off the socket.
-            while not line.endswith(b"\n"):
-                if len(line) >= _HELLO_LIMIT:
-                    return "an opening line too long"
-                byte = connection.recv(1)
-                if not byte:
-                    return "closed before its opening line"
-                line += byte
-        except OSError:
-            return "no opening line in time"
-        words = line.decode("ascii", "replace").split()
-        if len(words) != 4 or " ".join(words[:2]) != CUT_HELLO:
-            return "not a cut edge's opening line"
-        if not hmac.compare_digest(words[2].encode(), self._secret):
-            return "the wrong secret"
-        key = words[3]
-        with self._change:
-            if key not in self._keys:
-                return f"an edge this node does not listen for: {key}"
-            if key in self._arrived or key in self._taken:
-                return f"a second connection for {key}"
-            try:
-                connection.sendall(_ACK)
-            except OSError:
-                return "gone before it was answered"
-            connection.settimeout(None)
-            self._arrived[key] = connection
-            self._change.notify_all()
-        return None
-
-    def take(self, key: str, deadline: float, closed: threading.Event) -> socket.socket:
-        """The connection for edge `key`, once it has arrived."""
-        with self._change:
-            while key not in self._arrived:
-                if closed.is_set() or self._closed:
-                    raise OSError(f"stopped waiting for {key}")
-                if time.monotonic() >= deadline:
-                    raise TimeoutError(f"no connection for {key} in time")
-                self._change.wait(_POLL * 5)
-            self._taken.add(key)
-            return self._arrived.pop(key)
-
-    def close(self) -> None:
-        with self._change:
-            self._closed = True
-            left = list(self._arrived.values())
-            self._arrived.clear()
-            self._change.notify_all()
-        with contextlib.suppress(OSError):
-            self._server.close()
-        for connection in left:
-            with contextlib.suppress(OSError):
-                connection.close()
-        self._thread.join(_JOIN)
-
-
-def dial(
-    address: tuple[str, int],
-    secret: str,
-    key: str,
-    deadline: float,
-    closed: threading.Event,
-) -> socket.socket:
-    """A connection to `address` for edge `key`, opened and answered.
-
-    A refused connection is tried again until `deadline`, since the far
-    node may not be listening yet; an opening the listener does not answer
-    raises, since a wrong secret does not become right by waiting.
-    """
-    while True:
-        if closed.is_set():
-            raise OSError(f"stopped dialing for {key}")
-        if time.monotonic() >= deadline:
-            raise TimeoutError(f"no connection to {address[0]}:{address[1]} for {key} in time")
-        try:
-            connection = socket.create_connection(address, timeout=_HELLO_WAIT)
-        except OSError:
-            time.sleep(_DIAL_RETRY)
-            continue
-        try:
-            connection.sendall(_opening(secret, key))
-            answer = b""
-            while len(answer) < len(_ACK):
-                chunk = connection.recv(len(_ACK) - len(answer))
-                if not chunk:
-                    break
-                answer += chunk
-        except OSError:
-            connection.close()
-            raise
-        if answer != _ACK:
-            connection.close()
-            raise ConnectionRefusedError(
-                f"{address[0]}:{address[1]} refused the connection for {key}"
-            )
-        connection.settimeout(None)
-        return connection
 
 
 # -- the runner
@@ -505,7 +334,8 @@ class _Agent:
         self._edges = pipe_edges(self.plan)
         self._index = {edge: index for index, edge in enumerate(self._edges)}
         self._stages = self.plan.stages
-        self._assigned = wires(self.plan)
+        cuts = {cut.key for cut in (*self.part.listens, *self.part.dials)}
+        self._assigned = wires(self.plan, lambda edge: cut_key(self._index[edge]) in cuts)
         timeout = job.get("timeout")
         self._timeout = float(timeout) if isinstance(timeout, int | float) else None
         self._overwrite = job.get("overwrite") is True
@@ -523,7 +353,7 @@ class _Agent:
         self._dump = Path(dump) if isinstance(dump, str) and dump else None
         self._stack = contextlib.ExitStack()
         self._home: Path | None = None
-        self._served: dict[tuple[PipeEdge, Side], NamedPipe] = {}
+        self._named: dict[tuple[PipeEdge, Side], str] = {}
         raw_argv = job.get("argv")
         rendered = {
             str(pid): [str(word) for word in words]
@@ -533,7 +363,10 @@ class _Agent:
         raw_sidecar = job.get("sidecar")
         self._sidecar = raw_sidecar if isinstance(raw_sidecar, str) and raw_sidecar else None
         self.argv = self._name_pipes(self._localize(rendered))
-        self.listener = Listener(host, secret, [cut.key for cut in self.part.listens])
+        # The relay carries this node's wires and holds its data port, from
+        # when the runner serves: one that refuses its part starts nothing.
+        self._host = host
+        self._relay: Relay | None = None
         self._peers: dict[int, tuple[str, int]] = {}
         self._stop = threading.Event()
         self._stage_stop: threading.Event | None = None
@@ -605,16 +438,10 @@ class _Agent:
         tokens: dict[str, str] = {}
 
         def make(index: int, side: Side) -> str:
-            edge = self._edges[index]
-            pipe = pipes.create(
-                self._workspace(),
-                str(len(self._served)),
-                writing=side == "read",
-                buffer=_pipe_buffer(edge),
-            )
-            self._stack.callback(pipe.close)
-            self._served[(edge, side)] = pipe
-            return pipe.path
+            # Named here, made by the relay when the edge's stage starts.
+            path = pipes.path(self._workspace(), str(len(self._named)))
+            self._named[(self._edges[index], side)] = path
+            return path
 
         def resolve(word: str) -> str:
             arg, sep, rest = word.partition("=")
@@ -657,9 +484,11 @@ class _Agent:
                 }
             )
             return 1
-        self._channel.send(
-            {"type": "ready", "address": [self.listener.address[0], self.listener.address[1]]}
+        relay = self._relay = Relay.start(self._secret)
+        host, port = relay.listen(
+            self._host, [cut.key for cut in self.part.listens], time.monotonic() + _STARTUP
         )
+        self._channel.send({"type": "ready", "address": [host, port]})
         while True:
             message = self._channel.receive()
             if message is None:
@@ -689,7 +518,8 @@ class _Agent:
         self._end_stage()
         for pending in self._compiles.values():
             pending.done.set()
-        self.listener.close()
+        if self._relay is not None:
+            self._relay.close()
         self._stack.close()
 
     def _take_peers(self, addresses: object) -> None:
@@ -732,7 +562,8 @@ class _Agent:
             self.plan,
             stage,
             self.argv,
-            self._served,
+            self._named,
+            self._running_relay,
             self._assigned,
             self._timeout,
             self._overwrite,
@@ -785,6 +616,10 @@ class _Agent:
                 }
             )
 
+    def _running_relay(self) -> Relay:
+        assert self._relay is not None  # started before the first stage
+        return self._relay
+
     def _spawned(self, member: _Member) -> None:
         self._channel.send({"type": "started", "process": member.id, "argv": member.argv})
 
@@ -835,23 +670,16 @@ class _Agent:
             "opening": flow.opening,
         }
 
-    def _cut_end(self, wire: Wire, side: Side) -> _End:
-        """The TCP end of a wire whose other member is on another node."""
-        index = self._index[wire.edge]
-        key = cut_key(index)
+    def _cut_end(self, wire: Wire, side: Side) -> object:
+        """Where the relay finds the far side of a wire whose other member is
+        on another node: this node's data port, where the producer's bytes
+        arrive (`write`), or the consumer's node, dialed (`read`)."""
+        key = cut_key(self._index[wire.edge])
         if side == "write":
-            # The producer is elsewhere: its bytes arrive on this node's port.
-            def arrive(deadline: float, closed: threading.Event) -> socket.socket:
-                return self.listener.take(key, deadline, closed)
-
-            return _SocketEnd(arrive, "rb")
+            return {"listen": key}
         consumer = next(cut.consumer for cut in self.part.dials if cut.key == key)
-        address = self._peers[consumer]
-
-        def depart(deadline: float, closed: threading.Event) -> socket.socket:
-            return dial(address, self._secret, key, deadline, closed)
-
-        return _SocketEnd(depart, "wb")
+        host, port = self._peers[consumer]
+        return {"dial": [host, port], "key": key}
 
     def _work(self, reading: Work) -> None:
         self._channel.send({"type": "work", **asdict(reading)})
@@ -1342,14 +1170,9 @@ class _Coordinator:
         players: Mapping[str, list[str]],
         stop: threading.Event | None,
     ) -> StageResult:
-        assigned = wires(self.plan)
         node_of = self.placement.nodes
-        found, writers = stage_wires(
-            self.plan,
-            stage,
-            assigned,
-            lambda wire: node_of[wire.edge.source] != node_of[wire.edge.target],
-        )
+        assigned = wires(self.plan, lambda edge: node_of[edge.source] != node_of[edge.target])
+        found, writers = stage_wires(self.plan, stage, assigned)
         feeds = [(wire.edge.source, wire.edge.target) for wire in found]
         feeding = {pid: readers for pid, (_, readers) in writers.items()}
         start = time.monotonic()
@@ -1530,6 +1353,7 @@ def execute_split(
         plan,
         sidecar_argv=sidecar_argv,
         pipe_path=lambda edge, side: pipe_token(index[edge], side),
+        apart=lambda edge: placement.nodes[edge.source] != placement.nodes[edge.target],
     )
     options: dict[str, object] = {
         "timeout": timeout,

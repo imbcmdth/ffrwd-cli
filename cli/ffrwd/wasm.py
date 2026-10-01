@@ -2032,11 +2032,14 @@ def _rows_module_args(process: SidecarProcess) -> list[str]:
 def _split_writes(
     process: SidecarProcess, writes: Sequence[str]
 ) -> tuple[Sequence[str], Sequence[str]]:
-    """`writes` as a packet source's or a packet filter's stream paths and the
-    rows paths after them, which :func:`~ffrwd.execute._sidecar_writes` puts in
-    that order. Every other process writes rows documents and nothing else."""
+    """`writes` as the stream paths and the rows paths after them, which
+    :func:`~ffrwd.execute._sidecar_writes` puts in that order: a packet
+    source's or a packet filter's one per output, any other region's one at
+    most, where its stream is a named pipe rather than its stdout, and then
+    one per rows document."""
     if not (process.packet_source or process.packet_filter or process.data_filter):
-        return (), writes
+        cut = len(writes) - len(process.rows)
+        return writes[:cut], writes[cut:]
     count = len(process.outputs)
     return writes[:count], writes[count:]
 
@@ -2074,7 +2077,9 @@ def _stream_output(process: SidecarProcess, writes: Sequence[str] = ()) -> list[
         for track, path in zip(process.tracks, paths):
             argv += [_TRACK_FLAG, str(track), "-f", EDGE_FORMAT, path]
         return argv
-    return ["-f", EDGE_FORMAT, STDOUT]
+    # A region hands its frames on over one output: stdout, or the named
+    # pipe the plan gave it where the edge does not chain.
+    return ["-f", EDGE_FORMAT, writes[0] if writes else STDOUT]
 
 
 def rows_args(process: SidecarProcess, writes: Sequence[str] = ()) -> list[str]:
@@ -2141,9 +2146,10 @@ def _network_args(process: SidecarProcess, writes: Sequence[str] = ()) -> list[s
             "that can spell a named pipe path",
         )
     network, targets = build_network_graph(graph, pipe_inputs=[STDIN])
-    rows = _rows_tails(process, writes)
+    stream, documents = _split_writes(process, writes)
+    rows = _rows_tails(process, documents)
     # The region's stream sinks come first, its rows documents after them.
-    tails = [_stream_output(process)] * (len(targets) - len(rows)) + rows
+    tails = [_stream_output(process, stream)] * (len(targets) - len(rows)) + rows
     argv: list[str] = []
     for binding in process.modules:
         argv += ["-m", f"{binding.name}={binding.path}"]
