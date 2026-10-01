@@ -101,7 +101,9 @@ class Relay:
     """One running ``ffrwd-wasm relay`` and what it has said."""
 
     def __init__(self, binary: str, secret: str | None = None) -> None:
-        flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        flags = 0
+        if sys.platform == "win32":
+            flags = subprocess.CREATE_NO_WINDOW
         env = None
         if secret is not None:
             env = {**os.environ, SECRET_ENV: secret}
