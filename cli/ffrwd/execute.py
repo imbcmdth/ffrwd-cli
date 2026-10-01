@@ -2622,6 +2622,32 @@ def _ends_the_stage(
     )
 
 
+def _left_early(
+    member: _Member,
+    by_id: Mapping[str, _Member],
+    producers: Mapping[str, Sequence[str]],
+    now: float,
+) -> bool | None:
+    """Whether a member that exited 0 while a producer of its still ran ended
+    the stage: None while that is still open.
+
+    Its 0 alone does not say. A producer that has written its last byte and
+    closed its output can still be running, shutting a module down or seen a
+    poll later on another node, when the consumer reaches the end of the
+    stream and exits; that is a finish. So its producers are given the
+    cascade's own `_CASCADE` seconds to answer: every one ending with 0 says
+    the member finished, one failing says it left them writing into a closed
+    pipe, and one still running after that says the same.
+    """
+    mine = [by_id[pid] for pid in producers.get(member.id, ()) if pid in by_id]
+    if any(p.ended_at is not None and p.proc.poll() != 0 for p in mine):
+        return True
+    if all(p.ended_at is not None for p in mine):
+        return False
+    since = member.ended_at if member.ended_at is not None else now
+    return True if now - since >= _CASCADE else None
+
+
 def _reader_gone(
     member: _Member,
     by_id: Mapping[str, _Member],
@@ -2697,6 +2723,9 @@ def _watch(
     working = time.monotonic()
     ended: str | None = None
     settled = math.inf
+    # The first member seen exiting 0 while a producer of its was still
+    # running, until its producers say whether it left early (:func:`_left_early`).
+    suspect: _Member | None = None
     while True:
         if stop is not None and stop.is_set():
             return None, False, None
@@ -2709,15 +2738,33 @@ def _watch(
         for member in just_ended:
             member.ended_at = now
         if ended is None:
-            ender = next(
-                (
-                    m
-                    for m in just_ended
-                    if _ends_the_stage(m, by_id, producers)
-                    and not _reader_gone(m, by_id, feeding)
-                ),
-                None,
-            )
+            if suspect is None:
+                suspect = next(
+                    (
+                        m
+                        for m in just_ended
+                        if m.proc.poll() == 0
+                        and _ends_the_stage(m, by_id, producers)
+                        and not _reader_gone(m, by_id, feeding)
+                    ),
+                    None,
+                )
+            ender: _Member | None = None
+            if suspect is not None:
+                verdict = _left_early(suspect, by_id, producers, now)
+                if verdict:
+                    ender = suspect
+                elif verdict is not None:
+                    suspect = None
+            if ender is None:
+                ender = next(
+                    (
+                        m
+                        for m in just_ended
+                        if m.proc.poll() != 0 and not _reader_gone(m, by_id, feeding)
+                    ),
+                    None,
+                )
             if ender is not None:
                 ended = ender.id
                 settled = now + _CASCADE

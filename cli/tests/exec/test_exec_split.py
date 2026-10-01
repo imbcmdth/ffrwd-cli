@@ -19,6 +19,7 @@ conftest.py); this file is what compares a split run with a run on one.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import subprocess
@@ -197,6 +198,20 @@ def _written(path: Path) -> list[str]:
     return [line for line in done.stdout.splitlines() if not line.startswith("#")]
 
 
+# A data edge's heartbeat, a one-byte packet saying only that time has moved
+# on, as `_written` lists it: its size and its hash.
+_HEARTBEAT = f"1, {hashlib.md5(b' ').hexdigest()}"
+
+
+def _messages(lines: list[str]) -> list[str]:
+    """`_written`'s lines without the heartbeats. Each writer of a data edge
+    puts one out whenever it sees time move on with nothing written, so how
+    many there are, and where, is the run's timing; the messages are not."""
+    return [
+        line for line in lines if not line.replace(" ", "").endswith(_HEARTBEAT.replace(" ", ""))
+    ]
+
+
 def _run(case: _Case, where: Path, *target: str) -> dict[str, list[str]]:
     run_as = where / (target[-1] if target else "one")
     run_as.mkdir(exist_ok=True)
@@ -299,7 +314,7 @@ $$ LANGUAGE sql;
         rows = sorted(
             capsys.readouterr().out.splitlines(), key=lambda line: json.loads(line)["row"]
         )
-        written[how] = (rows, _written(out))
+        written[how] = (rows, _messages(_written(out)))
     assert written["per-process"] == written["one"]
     assert len(written["one"][0]) == 4
 

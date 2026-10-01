@@ -1276,6 +1276,47 @@ def test_a_member_that_ends_while_a_producer_still_writes_ends_the_stage(
     assert members[1].ended_at is None, "the member still running has no exit time"
 
 
+def test_a_producer_still_closing_when_its_consumer_finishes_ends_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The producer has written its last byte and closed its output, so its
+    consumer reads to the end and exits 0, while the producer itself is a
+    few polls from exiting: shutting a module down, or heard from another
+    node a poll late. Both finish, and nothing ended the stage."""
+    monkeypatch.setattr(_EXECUTE, "_CASCADE", 100 * _STALL)
+    members = _stage(_Exits(0), _Exits(0, after=5))
+
+    ended, timed_out, wedge = _watch(
+        members,
+        deadline=time.monotonic() + 200 * _STALL,
+        stall=None,
+        feeds=[("p1", "p0")],
+    )
+
+    assert (ended, timed_out, wedge) == (None, False, None)
+    assert all(member.ended_at is not None for member in members)
+
+
+def test_a_consumer_whose_producer_then_breaks_is_still_the_cause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Its 0 waited on its producers, and one of them died writing into the
+    pipe it had closed: the consumer that went first ended the stage."""
+    monkeypatch.setattr(_EXECUTE, "_CASCADE", 100 * _STALL)
+    members = _stage(_Exits(0), _Exits(224, after=5))
+
+    ended, timed_out, wedge = _watch(
+        members,
+        deadline=time.monotonic() + 200 * _STALL,
+        stall=None,
+        feeds=[("p1", "p0")],
+    )
+
+    assert ended == "p0"
+    assert not timed_out
+    assert wedge is None
+
+
 def test_a_producer_ending_before_its_consumer_is_a_normal_finish() -> None:
     """The shape every healthy stage has: nothing here ended anything."""
     members = _stage(_Exits(0), _Exits(0, after=3))
