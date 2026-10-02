@@ -1080,6 +1080,46 @@ def test_a_nodes_data_reaches_every_reader_and_the_host_from_its_own_region() ->
     assert line.endswith(f"-f ndjson ffrwd:tap:{lateral.tap}")
 
 
+def test_a_region_writing_a_laterals_rows_and_hosting_its_switch_starts_with_its_stage() -> None:
+    """sell and the switch its launches feed share the programme's region, so
+    the region both writes the lateral's rows and listens for its instances:
+    held until its own port accepted, it would never have started."""
+    modules = {
+        **_MODULES,
+        SELL: Described(
+            world="node-module", name="sell",
+            params_schema={"type": "object", "properties": {}}, node=True,
+        ),
+    }
+    plan = compile_all(
+        "CREATE FUNCTION sell(d data_stream, clock video_stream) "
+        "RETURNS STRUCT(d data_stream, launch data_stream) "
+        f"AS '{SELL}', 'sell' LANGUAGE wasm;\n"
+        + _declared(
+            """COPY (
+  WITH prog AS (SELECT setpts(s.video[1], 'PTS+1/TB') AS v, s.data[1] AS d
+                FROM input('leaf.nut') s),
+       sold AS (SELECT (sell(prog.d, prog.v)).* FROM prog)
+  SELECT video(prog.v, ad.video), sold.d AS deal
+  FROM prog, sold, LATERAL play(sold.launch) ad
+) TO 'out.nut'"""
+        ),
+        describe=lambda path: modules[path],
+        shape=lambda module, params, bound, grants=(): _source_and_auction_shape(
+            NODE_AUCTION, params, bound, grants
+        ),
+    ).plan
+    assert plan is not None
+    (lateral,) = plan.laterals
+    (edge,) = plan.feeder_edges
+    assert edge.source == edge.target == lateral.writer
+    (stage,) = plan.stages
+    found, writers = execute.stage_wires(plan, stage, execute.wires(plan))
+    assert list(writers) == [lateral.writer]
+    feeds = [(wire.edge.source, wire.edge.target) for wire in found]
+    assert execute.held_writers(writers, feeds) == {}
+
+
 def test_a_piped_tap_is_read_off_the_pipe_the_relay_hands_the_host(tmp_path: Path) -> None:
     """The host reads the region's NDJSON as it reads the messages off a port."""
     rows: list[Mapping[str, object]] = []
