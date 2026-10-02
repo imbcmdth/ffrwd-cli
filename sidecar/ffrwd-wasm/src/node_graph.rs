@@ -1502,20 +1502,30 @@ fn open_leaky(call: &NodeCall, pads: &[(String, u32)], defs: &[StreamDef]) -> Re
         );
     };
     let def = &defs[*id as usize];
-    let media = match &def.format {
-        StreamFormat::Video(v) => Media::Video(*v),
-        StreamFormat::Audio(a) => Media::Audio(*a),
+    let format = |media| Format {
+        media,
+        time_base: def.base,
+    };
+    let (leaky, kind) = match &def.format {
+        StreamFormat::Video(v) => (
+            Leaky::open(&call.options, &format(Media::Video(*v)))?,
+            PortKind::Video,
+        ),
+        StreamFormat::Audio(a) => (
+            Leaky::open(&call.options, &format(Media::Audio(*a)))?,
+            PortKind::Audio,
+        ),
+        StreamFormat::Packets(coded) => (
+            Leaky::open_coded(&call.options, coded, def.base)?,
+            PortKind::Packets,
+        ),
         other => bail!(
-            "{name} reads pictures, and {} is {}",
+            "{name} reads pictures, decoded or coded, and {} is {}",
             def.spelling,
             other.kind().name()
         ),
     };
-    let format = Format {
-        media,
-        time_base: def.base,
-    };
-    let node = older::leaky_node(name, Leaky::open(&call.options, &format)?);
+    let node = older::leaky_node(name, leaky, kind);
     let shape = node.shape().clone();
     let bound = vec![bound_stream(port, *id, def)];
     let outputs = output_streams(name, node.as_ref(), &shape, &bound, defs, def.base)?;

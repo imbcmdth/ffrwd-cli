@@ -89,7 +89,27 @@ impl Node for HostFrames {
 
     fn process(&mut self, tick: ffrwd_wasm_runtime::node::Tick) -> Result<Emitted> {
         let last = tick.last;
-        let first = tick.streams.into_iter().next().unwrap_or_default();
+        let mut first = tick.streams.into_iter().next().unwrap_or_default();
+        if let Runner::Leaky(leaky) = &mut self.runner {
+            if !first.packets.is_empty() {
+                let items = std::mem::take(&mut first.packets)
+                    .into_iter()
+                    .filter_map(|p| leaky.pass_packet(p))
+                    .map(|p| Emission {
+                        port: 0,
+                        payload: Payload::Packet(p),
+                    })
+                    .collect();
+                if last {
+                    leaky.finish();
+                }
+                return Ok(Emitted {
+                    items,
+                    rows: Vec::new(),
+                    finished: false,
+                });
+            }
+        }
         let frames = first.frames.into_iter().map(|f| Frame {
             pts: f.pts,
             data: f.data,
@@ -160,17 +180,17 @@ impl Node for HostFrames {
 
 /// `leaky` as a node of a node network: one picture input, `in0`, and the
 /// pictures that were not too late on `out`.
-pub(crate) fn leaky_node(name: &str, leaky: Leaky) -> Box<dyn Node> {
+pub(crate) fn leaky_node(name: &str, leaky: Leaky, kind: PortKind) -> Box<dyn Node> {
     let shape = NodeShape {
         inputs: vec![adapters::input(
             "in0",
-            PortKind::Video,
+            kind,
             true,
             false,
             Pairing::Lockstep,
             RowsUse::PerFrame,
         )],
-        outputs: vec![adapters::output("out", PortKind::Video, None)],
+        outputs: vec![adapters::output("out", kind, None)],
         clock: Clock::Input("in0".into()),
         pure: false,
         one_to_one: false,

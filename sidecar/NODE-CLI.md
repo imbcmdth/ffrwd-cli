@@ -78,7 +78,9 @@ node module every pad carries the port it binds before an `=`:
 A frame module of an older world keeps its positional pads in the same
 `-filter_complex`, and runs as the node its adapter makes of it. The host's
 `rowfilter` and `rowmerge` read one data edge by position: `[n1]rowfilter`,
-and `leaky` one picture stream: `[v=0:v]leaky=max_lateness=0.5[live]`.
+and `leaky` one picture stream, decoded or coded: `[v=0:v]leaky=max_lateness=0.5[live]`.
+Over packets it drops whole groups, from a late packet to the next keyframe
+in time.
 
 ## Outputs
 

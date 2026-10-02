@@ -62,13 +62,22 @@
 //! times are the latest frame's lateness, the baseline and the spread, in
 //! seconds.
 //!
+//! Over a coded picture it reads packets, in decode order, and judges each
+//! by its dts (its pts where the wire gives none) as it would a picture.
+//! What it drops is whole groups: a keyframe passes or not on its own
+//! lateness, and every packet after it passes only while it and all before
+//! it in the group did, since each needs the ones before it to decode. A
+//! group dropped stays dropped up to the next keyframe that passes.
+//!
 //! The name is reserved: no `-m` binds it, because the host answers for it.
 
 use std::collections::VecDeque;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Result};
-use ffrwd_wasm_runtime::runtime::{Format, Frame, Shape, TimeBase};
+use ffrwd_wasm_runtime::runtime::{
+    CodedFormat, CodedStream, Format, Frame, Packet, Shape, TimeBase,
+};
 use serde_json::json;
 
 /// The node name the grammar reserves.
@@ -184,6 +193,9 @@ pub struct Leaky {
     /// When the first picture was read.
     first: Option<f64>,
     window: Option<Window>,
+    /// Over packets: whether the group the latest one belongs to still
+    /// passes.
+    group: bool,
     clock: Clock,
     report: Report,
 }
@@ -210,6 +222,26 @@ impl Leaky {
                  never dropped"
             );
         }
+        Leaky::configured(options, format.time_base)
+    }
+
+    /// Reads a node's options against a coded stream in `time_base`.
+    pub fn open_coded(
+        options: &[(String, String)],
+        coded: &CodedStream,
+        time_base: TimeBase,
+    ) -> Result<Leaky> {
+        if !matches!(coded.format, CodedFormat::Video { .. }) {
+            bail!(
+                "{NODE} drops late pictures, and its input is coded sound ({}); a sound stream \
+                 is never dropped",
+                coded.codec
+            );
+        }
+        Leaky::configured(options, time_base)
+    }
+
+    fn configured(options: &[(String, String)], time_base: TimeBase) -> Result<Leaky> {
         let mut max_lateness: Option<f64> = None;
         let mut max_spread: Option<f64> = None;
         let mut node: Option<String> = None;
@@ -245,7 +277,7 @@ impl Leaky {
         };
         Ok(Leaky::with(
             limits,
-            format.time_base,
+            time_base,
             node.unwrap_or_else(|| NODE.to_string()),
             Box::new(wall),
             Box::new(to_stderr),
@@ -272,6 +304,7 @@ impl Leaky {
             counted: 0,
             first: None,
             window: None,
+            group: false,
             clock,
             report,
         }
@@ -305,6 +338,14 @@ impl Leaky {
     /// Whether the frame at `pts` passes, read against the clock now.
     pub fn judge(&mut self, pts: i64) -> bool {
         let now = (self.clock)();
+        let passes = self.weigh(pts, now, true);
+        self.tally(passes, now);
+        passes
+    }
+
+    /// Whether the picture at `pts`, read at `now`, is in time, learning from
+    /// it. Only an `ordered` time can be behind the last one passed.
+    fn weigh(&mut self, pts: i64, now: f64, ordered: bool) -> bool {
         let at = pts as f64 * self.time_base.num as f64 / self.time_base.den.max(1) as f64;
         let lateness = now - at;
         self.first.get_or_insert(now);
@@ -312,7 +353,7 @@ impl Leaky {
         let baseline = self.baseline.map_or(lateness, |seen| seen.min(lateness));
         self.baseline = Some(baseline);
         self.lateness = lateness;
-        let behind = self.last_passed.is_some_and(|last| pts < last);
+        let behind = ordered && self.last_passed.is_some_and(|last| pts < last);
         // While it learns, it drops only what no spread it may learn would pass.
         let spread = if self.learning(now) {
             self.limits.max_spread
@@ -321,9 +362,14 @@ impl Leaky {
         };
         let budget = spread + self.limits.max_lateness;
         let passes = !behind && lateness <= baseline + budget;
-        if passes {
+        if passes && ordered {
             self.last_passed = Some(pts);
         }
+        passes
+    }
+
+    /// One more picture passed or dropped, in the row's counts.
+    fn tally(&mut self, passes: bool, now: f64) {
         let window = self.window.get_or_insert(Window {
             start: now,
             passed: 0,
@@ -342,7 +388,6 @@ impl Leaky {
                 dropped: 0,
             });
         }
-        passes
     }
 
     /// The frame made at `at` and read at `now`, both in seconds, carries on
@@ -417,6 +462,15 @@ impl Leaky {
     /// One frame through, or None where it was too late.
     pub fn pass(&mut self, frame: Frame) -> Option<Frame> {
         self.judge(frame.pts).then_some(frame)
+    }
+
+    /// One packet through, or None where it or its group was too late.
+    pub fn pass_packet(&mut self, packet: Packet) -> Option<Packet> {
+        let now = (self.clock)();
+        let fresh = self.weigh(packet.dts.unwrap_or(packet.pts), now, packet.dts.is_some());
+        self.group = fresh && (packet.keyframe || self.group);
+        self.tally(self.group, now);
+        self.group.then_some(packet)
     }
 
     /// The stream has ended: the row for the window still open.
@@ -551,6 +605,32 @@ mod tests {
 
     fn dropped(served: &[(bool, f64)]) -> usize {
         served.iter().filter(|(passed, _)| !passed).count()
+    }
+
+    #[test]
+    fn a_late_packet_drops_the_rest_of_its_group_up_to_a_keyframe_in_time() {
+        let mut h = Harness::limited(Limits {
+            max_lateness: 0.5,
+            max_spread: 0.0,
+        });
+        let passed: Vec<bool> = (0..30i64)
+            .map(|k| {
+                let pts = 1_000.0 + k as f64 / 30.0;
+                let stalled = if (13..17).contains(&k) { 2.0 } else { 0.0 };
+                *h.now.lock().unwrap() = pts + 7.0 + stalled;
+                let ms = (pts * 1000.0).round() as i64;
+                let packet = Packet {
+                    pts: ms + 66,
+                    dts: Some(ms),
+                    duration: None,
+                    keyframe: k % 10 == 0,
+                    data: vec![k as u8],
+                };
+                h.leaky.pass_packet(packet).is_some()
+            })
+            .collect();
+        let dropped: Vec<usize> = (0..30).filter(|k| !passed[*k]).collect();
+        assert_eq!(dropped, (13..20).collect::<Vec<_>>());
     }
 
     #[test]

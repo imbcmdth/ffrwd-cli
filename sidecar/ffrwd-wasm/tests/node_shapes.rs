@@ -953,6 +953,64 @@ fn a_packets_output_with_no_format_carries_its_clocks_stream_and_rate() {
 }
 
 #[test]
+fn leaky_over_a_coded_stream_passes_its_packets_in_time_whole() {
+    let dir = scratch("leaky-packets");
+    let coded = Stream {
+        fourcc: b"H264".to_vec(),
+        time_base: TimeBase { num: 1, den: 25 },
+        msb_pts_shift: 14,
+        max_pts_distance: 25,
+        decode_delay: 0,
+        extradata: vec![1, 2, 3, 4],
+        frame_rate: Some((25, 1)),
+        media: Media::Video {
+            width: 16,
+            height: 16,
+            sample_width: 1,
+            sample_height: 1,
+            colorspace_type: 0,
+        },
+    };
+    let order = [0i64, 3, 1, 2, 6, 4, 5, 7, 10, 8, 9];
+    let items: Vec<(usize, Write)> = order
+        .iter()
+        .map(|&pts| {
+            (
+                0,
+                Write::Coded(pts, pts == 0 || pts == 7, vec![pts as u8; 8]),
+            )
+        })
+        .collect();
+    write_nut(&dir.join("in.nut"), &[coded], &items);
+    let input = dir.join("in.nut").display().to_string();
+    let out = at_every_jobs(
+        "leaky-packets",
+        &args(&[
+            "-f",
+            "nut",
+            "-i",
+            &input,
+            "-m",
+            &module("shape_packets"),
+            "-filter_complex",
+            "[p=0:v]shape_packets[out=o];[o]leaky=max_lateness=5[l]",
+            "-map",
+            "[l]",
+            "-f",
+            "nut",
+            "{dir}/out.nut",
+        ]),
+        &["out.nut"],
+    );
+    let (streams, packets) = frames(&out[0]);
+    assert_eq!(streams[0].fourcc, b"H264".to_vec());
+    let written: Vec<(i64, Vec<u8>)> = packets.into_iter().map(|(_, pts, d)| (pts, d)).collect();
+    let wanted: Vec<(i64, Vec<u8>)> = order.iter().map(|&pts| (pts, vec![pts as u8; 8])).collect();
+    assert_eq!(written, wanted, "a file read at once is never late");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn a_pad_tags_a_held_stream_and_a_tagged_anchor_reads_it() {
     let dir = scratch("pad-tags");
     // A tenth of a second of picture and of sound per step, from `from`.
