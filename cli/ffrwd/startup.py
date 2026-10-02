@@ -122,6 +122,13 @@ def relation(plan: ProcessPlan) -> dict[Milestone, tuple[Milestone, ...]]:
     concurrent = {
         process.id for process in plan.processes if isinstance(process, SidecarProcess)
     }
+    # A node network writes each output from a thread and a queue of its own,
+    # so no output's frames wait on another's reader.
+    unqueued = {
+        process.id
+        for process in plan.processes
+        if isinstance(process, SidecarProcess) and process.node_network
+    }
 
     waits: dict[Milestone, tuple[Milestone, ...]] = {}
     for pid in ids:
@@ -143,12 +150,13 @@ def relation(plan: ProcessPlan) -> dict[Milestone, tuple[Milestone, ...]]:
         for index, edge in enumerate(outputs[pid]):
             waits[("head", pid, index)] = (("run", pid, 0), *fed)
             after: list[Milestone] = [("head", pid, index)]
-            if index:
+            if index and pid not in unqueued:
                 after.append(("write", pid, index - 1))
             if held is not None:
                 after.append(held)
             waits[("write", pid, index)] = tuple(after)
-            held = None if _carried(plan, edge) else ("run", edge.target, 0)
+            carried = _carried(plan, edge) or pid in unqueued
+            held = None if carried else ("run", edge.target, 0)
     return waits
 
 

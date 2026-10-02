@@ -1288,6 +1288,40 @@ def test_a_node_at_a_copys_to_reads_the_select_as_a_packet_sink_did(
     assert encoder[encoder.index("-c:0") + 1] == "libx264"
 
 
+def test_a_nodes_picture_into_a_node_sink_is_encoded_and_its_data_is_not_copied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ring's raw picture reaches publish through the encoder the WITH shapes,
+    and spot's messages go straight from one network to the other, an input of
+    their own."""
+    monkeypatch.setitem(SHAPES, "publish.wasm", _publish)
+    monkeypatch.setitem(
+        _PARAMS, "publish.wasm", {"relay": {"type": "string"}, "broadcast": {"type": "string"}}
+    )
+    argv = _plan_argv(
+        _PUBLISH
+        + "CREATE FUNCTION spotted(v video_stream) RETURNS data_stream "
+        "AS 'spot.wasm', 'spot' LANGUAGE wasm;\n"
+        "COPY (SELECT ring(f.video[1], spot(f.video[1])), spotted(f.video[1]) AS spots "
+        "FROM input('f.mp4') f) TO publish('https://relay', 'b') "
+        "WITH (video_codec 'libx264')",
+        monkeypatch,
+    )
+    (encoder,) = [
+        words for pid, words in argv.items() if pid.startswith("ffmpeg") and "-c:0" in words
+        and words[words.index("-c:0") + 1] == "libx264"
+    ]
+    assert "-copyts" in encoder
+    sink = next(words for words in argv.values() if "publish=publish.wasm" in words)
+    assert sink.count("-i") == 2 and sink.count("-pad") == 2
+    copies = [
+        words for pid, words in argv.items()
+        if pid.startswith("ffmpeg") and "-map" in words
+        and words[words.index("-map") + 1].endswith(":d:0")
+    ]
+    assert copies == []
+
+
 def test_the_rows_a_node_emits_are_the_runs_on_its_stdout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

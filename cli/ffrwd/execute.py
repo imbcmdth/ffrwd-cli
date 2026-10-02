@@ -148,6 +148,7 @@ from .ir import (
     FEEDER_HOST,
     PARAMS_FILE,
     STDERR_ROW,
+    TAP_DOCUMENT,
     Lateral,
     LateralValue,
     feeder_path,
@@ -991,6 +992,7 @@ def plan_argv(
     rows_path: RowsNamer | None = None,
     apart: Callable[[PipeEdge], bool] | None = None,
     params_path: ParamsNamer | None = None,
+    tap_path: Callable[[int], str] | None = None,
 ) -> dict[str, list[str]]:
     """The argv that runs each process of `plan`, keyed by process id.
 
@@ -1014,6 +1016,9 @@ def plan_argv(
     `params_path` writes a node's params to a file and names it, for each
     params placeholder; without it the placeholders stay, as a printed
     command shows them.
+
+    `tap_path` names the pipe a node region writes a run-time lateral's
+    messages to, for each tap placeholder; without it they stay too.
     """
     read: dict[PipeEdge, str] = {}
     write: dict[PipeEdge, str] = {}
@@ -1066,7 +1071,23 @@ def plan_argv(
             live=any(edge.live for edge in incoming),
             copyts=all(keeps_clock(edge, plan) for edge in incoming),
         )
+    argv = _resolve_taps(argv, tap_path)
     return _resolve_params_files(_resolve_rows_documents(argv, rows_path), plan, params_path)
+
+
+def _resolve_taps(
+    argv: dict[str, list[str]], tap_path: Callable[[int], str] | None
+) -> dict[str, list[str]]:
+    """Every tap placeholder in `argv` replaced by the pipe it is written to."""
+    if tap_path is None:
+        return argv
+
+    def resolve(token: str) -> str:
+        if not token.startswith(TAP_DOCUMENT):
+            return token
+        return tap_path(int(token[len(TAP_DOCUMENT) :]))
+
+    return {pid: [resolve(token) for token in args] for pid, args in argv.items()}
 
 
 def _pad_of(process: SidecarProcess, edge: StreamEdge) -> int:
@@ -1339,7 +1360,8 @@ def _lateral_lines(plan: ProcessPlan) -> list[str]:
     for lateral in plan.laterals:
         lines.append(
             f"# run-time: for each message of {lateral.stream} ({lateral.writer} "
-            f"writes it to {feeder_path(lateral.tap)} for the host), {lateral.function}"
+            + ("writes it" if lateral.pipe else f"writes it to {feeder_path(lateral.tap)}")
+            + f" for the host), {lateral.function}"
         )
         for connection in lateral.connections:
             found = [
@@ -1536,12 +1558,25 @@ def execute_plan(
             named[(edge, side)] = path
             return path
 
+        taps: dict[int, tuple[str, str]] = {}
+
+        def tap_path(tap: int) -> str:
+            # The region writes one end and the host reads the other; the
+            # relay makes both when the writer's stage starts.
+            if tap not in taps:
+                taps[tap] = (
+                    pipes.path(workspace(), f"tap{tap}"),
+                    pipes.path(workspace(), f"tap{tap}-host"),
+                )
+            return taps[tap][0]
+
         argv = plan_argv(
             plan,
             sidecar_argv=sidecar_argv,
             pipe_path=pipe_path,
             rows_path=rows_path,
             params_path=params_path,
+            tap_path=tap_path,
         )
         assigned = wires(plan)
         terminal = terminal_member(plan) if work is not None else None
@@ -1573,7 +1608,7 @@ def execute_plan(
                 work=work,
                 terminal=terminal,
                 laterals=_Laterals(
-                    compile_instance, sidecar_argv, rows or _print_row, dump
+                    compile_instance, sidecar_argv, rows or _print_row, dump, taps
                 ),
                 stop=stop,
             )
@@ -1882,8 +1917,12 @@ class _LateralRun:
         rows: RowSink,
         dump: Path | None,
         echo: Callable[[str, list[str]], None] | None,
+        path: str | None = None,
     ) -> None:
         self.lateral = lateral
+        # The pipe the host reads the messages off, where the writer's region
+        # writes them itself; None where an ffmpeg dials the tap's port.
+        self._path = path
         self._compile = compile_instance
         self._sidecar_argv = sidecar_argv
         self._rows = rows
@@ -1895,6 +1934,10 @@ class _LateralRun:
         self._running: _Launch | None = None
         self._read_all = False
         self._count = 0
+        self._listener: socket.socket | None = None
+        if path is not None:
+            self._threads = [_start(self._read_pipe), _start(self._launch)]
+            return
         try:
             self._listener = socket.create_server((FEEDER_HOST, lateral.tap))
         except OSError as err:
@@ -1917,8 +1960,9 @@ class _LateralRun:
             self._turn.notify_all()
         for launch in left:
             self._row(launch.row, launch.start, refused=_ENDED)
-        with contextlib.suppress(OSError):
-            self._listener.close()
+        if self._listener is not None:
+            with contextlib.suppress(OSError):
+                self._listener.close()
 
     def join(self) -> None:
         for thread in self._threads:
@@ -1956,7 +2000,41 @@ class _LateralRun:
                 self._read_all = True
                 self._turn.notify_all()
 
+    def _read_pipe(self) -> None:
+        """Read every message off the pipe the relay hands the host, once the
+        relay has made it."""
+        assert self._path is not None  # only started for a piped tap
+        try:
+            stream = None
+            while stream is None and not self._stop.is_set():
+                try:
+                    stream = open(self._path, "rb", buffering=0)  # noqa: SIM115
+                except OSError:
+                    time.sleep(_FEEDER_POLL)
+            if stream is None:
+                return
+            messages = _Messages()
+            with stream:
+                while not self._stop.is_set():
+                    try:
+                        chunk = stream.read(_CHUNK)
+                    except OSError:
+                        break
+                    if not chunk:
+                        break
+                    for message in messages.feed(chunk):
+                        self._arrived(message)
+            rest = messages.rest()
+            if rest:
+                self._count += 1
+                self._row(self._count, None, refused=f"an unreadable message: {rest[:80]}")
+        finally:
+            with self._turn:
+                self._read_all = True
+                self._turn.notify_all()
+
     def _accept(self) -> socket.socket | None:
+        assert self._listener is not None  # only asked for a tap on a port
         while not self._stop.is_set():
             try:
                 connection, _ = self._listener.accept()
@@ -2053,6 +2131,10 @@ class _LateralRun:
         self._row(launch.row, launch.start, exit=_instance_exit(result))
 
 
+def _ignore_flow(row: Mapping[str, object]) -> None:
+    """A tap's copy has no flow a stall or overflow is read off."""
+
+
 def _instance_exit(result: PlanResult) -> int:
     """How an instance ended: its failing member's code, else the code of a
     member the run's end stopped, else 0."""
@@ -2078,6 +2160,9 @@ class _Laterals:
     sidecar_argv: SidecarArgv | None
     rows: RowSink
     dump: Path | None
+    # Each piped lateral's tap: the pipe its region writes and the one the
+    # host reads, which the relay joins.
+    taps: Mapping[int, tuple[str, str]] = field(default_factory=dict)
 
 
 @dataclass
@@ -2315,6 +2400,7 @@ class _StageRun:
         for lateral in self.plan.laterals:
             if lateral.writer in self.local and laterals is not None:
                 assert laterals.compile_instance is not None  # execute_plan checks
+                tap = laterals.taps.get(lateral.tap) if lateral.pipe else None
                 self.runs.append(
                     _LateralRun(
                         lateral,
@@ -2323,6 +2409,7 @@ class _StageRun:
                         laterals.rows,
                         laterals.dump,
                         self._echo,
+                        tap[1] if tap is not None else None,
                     )
                 )
 
@@ -2433,6 +2520,25 @@ class _StageRun:
                 )
             )
             heard[name] = functools.partial(_heard, flow)
+            self.relayed.append(name)
+        taps = self._laterals.taps if self._laterals is not None else {}
+        for lateral in self.plan.laterals:
+            tap = taps.get(lateral.tap) if lateral.pipe else None
+            if tap is None or lateral.writer not in self.local:
+                continue
+            # The messages the region writes, carried to the host's own read.
+            name = f"s{self._stage}tap{lateral.tap}"
+            edges.append(
+                RelayEdge(
+                    id=name,
+                    source=tap[0],
+                    dest=tap[1],
+                    depth=_read_ahead(None),
+                    buffer=pipes.DEFAULT_BUFFER,
+                    spool=True,
+                )
+            )
+            heard[name] = _ignore_flow
             self.relayed.append(name)
         if edges:
             self._relay().open(edges, heard, self.deadline)

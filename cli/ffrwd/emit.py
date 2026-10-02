@@ -508,7 +508,7 @@ def emit(g: Graph, *, network: bool = False, separate: bool | None = None) -> Em
     g = dedup_inputs(g)
     g = _drop_unused_url_inputs(g)
     g = _drop_dropped_branch_inputs(g)
-    _verify_topological(g)
+    _verify_topological(g, network)
 
     nodes = list(g.nodes.values())
     pads = {node.id: _out_pad_count(node) for node in nodes}
@@ -1520,8 +1520,9 @@ def _src_spec(g: Graph, ref: FrameRef) -> str:
     return f"{g.sources[alias]}:{_TYPE_MARKERS[stream_type]}:{index}"
 
 
-def _verify_topological(g: Graph) -> None:
-    """Check every ref resolves and points backwards; a cycle cannot pass."""
+def _verify_topological(g: Graph, network: bool = False) -> None:
+    """Check every ref resolves and points backwards; a cycle cannot pass.
+    A network may have no output: a node sink's is its own effect."""
     defined: set[str] = set()
     for node_id, node in g.nodes.items():
         if node.id != node_id:
@@ -1529,7 +1530,7 @@ def _verify_topological(g: Graph) -> None:
         for ref in node.inputs:
             _check_ref(g, ref, defined, f"node {node.id!r}")
         defined.add(node_id)
-    if not g.outputs:
+    if not g.outputs and not network:
         raise _internal("graph has no outputs")
     for index, output in enumerate(g.outputs):
         if not output.ref:

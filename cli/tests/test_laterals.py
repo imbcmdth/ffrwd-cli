@@ -27,7 +27,7 @@ from ffrwd.execute import render_plan
 from ffrwd.ir import FeederCall, Graph, Lateral, LateralConnection, LateralValue, Node
 from ffrwd.parser import parse, resolve
 from ffrwd.probe import ProbeResult, StreamMeta
-from ffrwd.processes import ProcessPlan
+from ffrwd.processes import ProcessPlan, SidecarProcess
 from ffrwd.registry import Registry, load_reference
 from ffrwd.split import insert_splits
 from ffrwd.wasm import WORLDS, Described, Feeder
@@ -1001,3 +1001,86 @@ def test_a_port_written_by_hand_stays_one_integer_where_a_list_also_fits() -> No
     assert plan is not None
     port = _compose_node(plan).args["port"]
     assert port == 9100 and isinstance(port, int)
+
+
+# -- a node's data, read by several and by a lateral, with no copying ffmpeg ---
+
+SELL = "modules/sell_node.wasm"
+_SOLD = """COPY (
+  WITH prog AS (SELECT s.video[1] AS v, s.data[1] AS d FROM input('leaf.nut') s),
+       sold AS (SELECT (sell(prog.d, prog.v)).* FROM prog),
+       ads AS (SELECT ad.video FROM sold, LATERAL play(sold.launch) ad)
+  SELECT video(prog.v, ads.video),
+         auction(sold.d, prog.v, cohort => 'es').d AS es,
+         auction(sold.d, prog.v, cohort => 'es').launch AS es_launch,
+         auction(sold.d, prog.v, cohort => 'fr').d AS fr,
+         auction(sold.d, prog.v, cohort => 'fr').launch AS fr_launch,
+         sold.d AS deal
+  FROM prog, ads, sold
+) TO 'out.nut'"""
+
+
+def test_a_nodes_data_reaches_every_reader_and_the_host_from_its_own_region() -> None:
+    """sell's deals go to two auctions and the destination, one output of the
+    network apiece, and its launches to the host as NDJSON: no ffmpeg copies a
+    message. The same plan had eleven processes, seven of them ffmpeg, with a
+    copy per reader and one to the tap."""
+    modules = {
+        **_MODULES,
+        SELL: Described(
+            world="node-module", name="sell",
+            params_schema={"type": "object", "properties": {}}, node=True,
+        ),
+    }
+    plan = compile_all(
+        "CREATE FUNCTION sell(d data_stream, clock video_stream) "
+        "RETURNS STRUCT(d data_stream, launch data_stream) "
+        f"AS '{SELL}', 'sell' LANGUAGE wasm;\n" + _declared(_SOLD),
+        describe=lambda path: modules[path],
+        # sell takes deals and a clock and writes deals and launches, as
+        # the node auction does.
+        shape=lambda module, params, bound, grants=(): _source_and_auction_shape(
+            NODE_AUCTION, params, bound, grants
+        ),
+    ).plan
+    assert plan is not None
+    ffmpegs = [p for p in plan.processes if not isinstance(p, SidecarProcess)]
+    assert (len(plan.processes), len(ffmpegs)) == (9, 5)
+    assert all(process.graph.nodes or process.graph.sinks for process in ffmpegs)
+    (lateral,) = plan.laterals
+    seller = next(
+        process for process in plan.sidecars if process.module == SELL
+    )
+    assert lateral.pipe and lateral.writer == seller.id
+    argv = render_plan(plan, sidecar_argv=wasm.shown_argv)
+    line = next(one for one in argv.splitlines() if "sell_node=" in one)
+    assert line.count("-map '[out2]'") == 3
+    assert line.endswith(f"-f ndjson ffrwd:tap:{lateral.tap}")
+
+
+def test_a_piped_tap_is_read_off_the_pipe_the_relay_hands_the_host(tmp_path: Path) -> None:
+    """The host reads the region's NDJSON as it reads the messages off a port."""
+    rows: list[Mapping[str, object]] = []
+
+    def compile_instance(text: str, unset: Mapping[tuple[int, int], str]) -> ProcessPlan:
+        raise FfrwdError(ErrorCode.UNSUPPORTED_SQL, "no such file")
+
+    tap = tmp_path / "tap.ndjson"
+    tap.write_text(
+        '{"url": "a.mp4", "start_pts": 1.0, "duration": 1.0}\n'
+        '{"url": "b.mp4", "start_pts": 3.0, "duration": 1.0}\n',
+        encoding="utf-8",
+    )
+    run = execute._LateralRun(
+        replace(_LATERAL, pipe=True), compile_instance, None, rows.append, None, None,
+        str(tap),
+    )
+    try:
+        _until(lambda: len(rows) == 2)
+    finally:
+        run.stop()
+        run.join()
+    assert [(row["row"], row["refused"]) for row in rows] == [
+        (1, "no such file"),
+        (2, "no such file"),
+    ]
