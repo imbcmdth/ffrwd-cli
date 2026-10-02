@@ -1,4 +1,4 @@
-// ffrwd:av 0.19.0: the node world.
+// ffrwd:av 0.19.1: the node world.
 //
 // A node has any number of typed input ports, any number of typed output
 // ports, and a clock. One tick of the clock is one `process` call: the host
@@ -8,8 +8,13 @@
 // `types`, `values`, `encoder` and `decoder` carry on from 0.18.0. Every
 // other 0.18.0 interface is frozen in worlds/0.18.0 and adapted onto `node`
 // by the host.
+//
+// 0.19.1 adds to 0.19.0, nothing renamed: `wants.timing`, a `binding` with
+// stream hints where `shape`'s bound list held names, `anchor` and `group`
+// on `interval`, `feed-start.known`, and `ordinal` and `ended-feeds` on the
+// tick. 0.19.0 was never published; a module built against it is rebuilt.
 
-package ffrwd:av@0.19.0;
+package ffrwd:av@0.19.1;
 
 interface types {
   /// Static description of a module, available without running anything.
@@ -218,6 +223,12 @@ interface types {
     /// The first packet of each stream, and no more. What a sink reading
     /// only what a stream declares about itself needs.
     first,
+    /// A node's frame input read for its frames' times and its stream's
+    /// info alone, never their bytes: `fetch` on it is a fault. The
+    /// compiler hands the stream in whatever format its source has
+    /// cheapest, and the host carries no pixels or samples for it (a mask
+    /// sized and timed by a picture it never reads). Frame kinds only.
+    timing,
   }
 
   /// How many streams of one kind a module reading encoded packets takes.
@@ -321,6 +332,21 @@ interface node-types {
     /// Seconds past the interval's end whose messages are handed with it,
     /// for a node that acts before a stamp (a fade in before a cue).
     ahead: f64,
+    /// What maps the stream's pts onto the clock. `shared-clock`: the
+    /// stream counts on the clock's origin, as a lateral's rows do.
+    /// `first-frame`: the first message is placed at the tick it arrives
+    /// on and the offset holds for the stream's life, every message
+    /// re-stamped onto the clock's time base (a data stream on another
+    /// time origin, which ffrwd/playout's `follow` re-stamped by hand).
+    /// `tagged`: shared-clock when the stream's tags carry the name set
+    /// to 1, first-frame otherwise.
+    anchor: anchor,
+    /// Names a hold group: this stream arrives on that group's
+    /// connection, with the group's offset, fixed by its first picture (a
+    /// data stream a feeder writes beside its picture and sound). Paired
+    /// by interval as any data input is. With a group, `anchor` is
+    /// `shared-clock`.
+    group: option<string>,
   }
 
   variant pairing {
@@ -424,6 +450,25 @@ interface node-types {
     self-clocked,
   }
 
+  /// What the compiler knows of one stream before the run.
+  record stream-hint {
+    /// Video: the frame rate. Audio: the sample rate over 1. None where
+    /// nothing settles it before the run (a self-clocked source's output,
+    /// a feed by port).
+    rate: option<rational>,
+  }
+
+  /// One input a call binds, as `shape` is told it.
+  record binding {
+    /// The input, by the declaration's name.
+    input: string,
+    /// The streams the call binds here, in the order it names them, one
+    /// hint each: how many a many port takes, and the clock's rate, so a
+    /// latency or a window known in frames or samples is declared in
+    /// seconds exactly.
+    streams: list<stream-hint>,
+  }
+
   record node-shape {
     inputs: list<input-port>,
     outputs: list<output-port>,
@@ -484,6 +529,11 @@ interface node-types {
     /// The clock time that first frame stands at, in the clock's time base:
     /// what maps the source's pts onto the tick.
     at: s64,
+    /// The clock time of the tick the start was fixed on: when the first
+    /// frame arrived and the offset was settled, which for a timed source
+    /// is seconds before `at`; equal to `at` when fixed on the tick it
+    /// showed. What a countdown counts from.
+    known: s64,
   }
 
   /// A hold input's feed: one source, from the tick its first frame shows
@@ -542,6 +592,12 @@ interface node-tick {
     /// 0. A self-clocked node: microseconds since its first call.
     pts: func() -> s64;
 
+    /// The tick's number in the run, from 0, counted over every instance
+    /// of the node: on a frame clock the clock stream's frame number from
+    /// the run's first, strides counted as one; on a rate clock `pts`.
+    /// A node that numbers things by frame counts with it and stays pure.
+    ordinal: func() -> u64;
+
     /// The clock input's time base, the inverse of a rate clock's rate, or
     /// 1/1000000 for a self-clocked node.
     time-base: func() -> rational;
@@ -567,6 +623,14 @@ interface node-tick {
     /// A feed that ends and another that starts within one tick are two
     /// ticks.
     feed: func(id: u32) -> option<feed>;
+
+    /// A hold input's feeds that ended since this instance's previous
+    /// call (every one before, on its first call), oldest first, each
+    /// with `ends` set to the last tick it showed on: an end `feed` never
+    /// foretold, a timeout, a clock jump, a close with nothing queued,
+    /// as well as the foretold ones. With `feed-start.known`, what a
+    /// presence row needs on any worker. Empty on every other input.
+    ended-feeds: func(id: u32) -> list<feed>;
 
     /// Frame kinds: the frames this tick hands, oldest first. The clock and
     /// a lockstep input hand their window. A hold input hands the frame it
@@ -603,7 +667,7 @@ interface node-tick {
 /// params.
 interface node {
   use types.{meta, packet, raw-frame};
-  use node-types.{bound-stream, message, node-shape};
+  use node-types.{binding, bound-stream, message, node-shape};
   use node-tick.{tick};
 
   /// An input frame's bytes leaving on an output, never copied into the
@@ -660,10 +724,12 @@ interface node {
   describe: func() -> meta;
 
   /// The ports and clock for these params, and for `bound`: the inputs
-  /// the call binds, by the declaration's names, so a shape may turn on
-  /// what is given (a page with no picture ticks at a rate; an output
-  /// `like` an unbound input is left out). Called at compile time with the
-  /// call's static params, once per distinct (module, params, bound), and
+  /// the call binds, by the declaration's names, each with what the
+  /// compiler knows of its streams, so a shape may turn on what is given
+  /// (a page with no picture ticks at a rate; an output `like` an unbound
+  /// input is left out) and on the clock's rate. Called at compile time
+  /// with the call's static params, once per distinct (module, params,
+  /// bound), and
   /// cached; a source may read the network here to learn its outputs, as
   /// `probe` did. Callable at any point in an instance's life: it reads
   /// nothing `init` or `set-params` set.
@@ -673,8 +739,10 @@ interface node {
   /// input clock, or paired other than `arrival` on a self-clocked node;
   /// `hold` is on a message kind or `interval` on a frame kind; a data
   /// input's `rows` is `ignore`; `like` names an input that is not single
-  /// and bound; or a stride is 0 or above its window.
-  shape: func(params: string, bound: list<string>) -> result<node-shape, string>;
+  /// and bound; a stride is 0 or above its window; `wants` is `timing`
+  /// on other than a frame kind; or an `interval` names a group that is
+  /// no hold group's, or a group with an anchor other than shared-clock.
+  shape: func(params: string, bound: list<binding>) -> result<node-shape, string>;
 
   /// Opens an instance for `shape(params, bound)` on the streams bound to
   /// its inputs, one entry each: ports in the shape's order, a port's
