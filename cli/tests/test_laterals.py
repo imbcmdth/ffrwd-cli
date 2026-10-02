@@ -24,7 +24,7 @@ from ffrwd import shapes, wasm
 from ffrwd.compiler import compile_all
 from ffrwd.errors import ErrorCode, FfrwdError
 from ffrwd.execute import render_plan
-from ffrwd.ir import FeederCall, Graph, Lateral, LateralConnection, LateralValue
+from ffrwd.ir import FeederCall, Graph, Lateral, LateralConnection, LateralValue, Node
 from ffrwd.parser import parse, resolve
 from ffrwd.probe import ProbeResult, StreamMeta
 from ffrwd.processes import ProcessPlan
@@ -959,3 +959,45 @@ def test_a_lateral_counts_as_bound_where_the_shape_says_which_port_it_holds() ->
         if node.filter == "compose_node"
     ]
     assert compose.args["port"] == lateral.connections[0].port
+
+
+# compose's own `port`: one port the host may be handed, or the compiler's list.
+_ONE_OR_MANY_PORTS: dict[str, object] = {
+    "type": ["array", "integer"],
+    "items": {"type": "integer", "minimum": 1, "maximum": 65535},
+    "minimum": 1,
+    "maximum": 65535,
+}
+
+
+def _compose_node(plan: ProcessPlan) -> Node:
+    (compose,) = [
+        node
+        for process in plan.sidecars
+        if process.graph is not None
+        for node in process.graph.nodes.values()
+        if node.filter == "compose_node"
+    ]
+    return compose
+
+
+def test_a_port_param_taking_one_or_many_is_handed_a_list_for_two_laterals() -> None:
+    plan = _composed(_ONE_OR_MANY_PORTS)
+    ports = [lateral.connections[0].port for lateral in plan.laterals]
+    assert len(set(ports)) == 2
+    assert _compose_node(plan).args["port"] == ports
+
+
+def test_a_port_written_by_hand_stays_one_integer_where_a_list_also_fits() -> None:
+    query = """COPY (
+  SELECT compose(s.video[1], port => 9100.0) FROM input('leaf.nut') s
+) TO 'out.nut'"""
+    modules = _compose_modules(_ONE_OR_MANY_PORTS)
+    plan = compile_all(
+        _COMPOSE + "\n" + query,
+        describe=lambda path: modules[path],
+        shape=_compose_shape,
+    ).plan
+    assert plan is not None
+    port = _compose_node(plan).args["port"]
+    assert port == 9100 and isinstance(port, int)

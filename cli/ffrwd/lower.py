@@ -2038,10 +2038,27 @@ def _sink_alias(argument: exp.Expr) -> str | None:
 
 
 def _param_takes_list(described: Described, name: str) -> bool:
-    """Whether the module's params schema takes `name` as an array."""
+    """Whether the module's params schema takes `name` as an array, alone or
+    among other types."""
     properties = described.params_schema.get("properties")
-    found = properties.get(name) if isinstance(properties, dict) else None
-    return isinstance(found, dict) and found.get("type") == "array"
+    return "array" in _schema_types(
+        properties.get(name) if isinstance(properties, dict) else None
+    )
+
+
+def _as_scalar_type(value: RowValue, schema: object) -> RowValue:
+    """A number written as the schema's first scalar type: a whole number
+    where that is ``integer``, so a param taking one port or a list of them
+    is handed one port as the integer it is."""
+    scalars = [kind for kind in _schema_types(schema) if kind != "array"]
+    if (
+        scalars
+        and scalars[0] == "integer"
+        and isinstance(value, float)
+        and value.is_integer()
+    ):
+        return int(value)
+    return value
 
 
 def _sink_port(shape: NodeShape, kind: StreamType) -> InputPort | None:
@@ -14960,7 +14977,7 @@ class _Lowerer:
                     hint=_declares_params(known),
                 )
             self._check_wasm_param(param.name, value, schema, anchor, select)
-            params[param.name] = value
+            params[param.name] = _as_scalar_type(value, schema)
         return params
 
     def _wasm_written(
