@@ -25,7 +25,9 @@ use serde_json::json;
 use crate::hold::SourceInfo;
 use crate::lanes::{Room, Scheduler};
 use crate::leaky::ROW_PREFIX;
+use crate::node_graph::Carried;
 use crate::tick::Item;
+use std::sync::atomic::Ordering;
 
 /// The receive buffer every connection asks for: about a dozen 1080p
 /// frames, so a source has somewhere to write between two reads.
@@ -49,6 +51,9 @@ pub struct FeedMember {
     pub name: String,
     /// What the port takes, which the source is conformed to.
     pub format: StreamFormat,
+    /// The port reads its frames' times alone: nothing is conformed or
+    /// carried for it.
+    pub timing: bool,
 }
 
 /// One listener: a port, and the inputs its connections feed. The picture
@@ -176,6 +181,11 @@ impl Sound {
 enum Convert {
     Picture(Picture),
     Sound(Sound),
+    /// A timing member's frames: their times, and a sound's length in
+    /// samples of `width` bytes.
+    Timing {
+        audio: Option<usize>,
+    },
 }
 
 /// One stream of a connection: which member it feeds, and how.
@@ -261,6 +271,36 @@ fn match_streams(spec: &FeedSpec, conn: &mut Conn, report: &mut dyn FnMut(String
             (!taken[m] && wanted == kind).then_some(m)
         });
         let Some(member) = member else { continue };
+        if spec.members[member].timing {
+            let audio = match stream.media {
+                Media::Audio { channels, .. } => {
+                    let bytes = stream
+                        .sample_fmt()
+                        .map_or(0, |f| if f == "s16" { 2 } else { 4 });
+                    if bytes == 0 {
+                        continue;
+                    }
+                    conn.demux.set_stream_limit(index, MAX_AUDIO_PACKET);
+                    Some(bytes * channels as usize)
+                }
+                _ => {
+                    if let Some((width, height)) = stream.video_geometry() {
+                        if let Some(pix_fmt) = stream.pix_fmt() {
+                            let incoming = crate::frame_len_for(pix_fmt, width, height)?;
+                            conn.demux.set_stream_limit(index, incoming as u64);
+                        }
+                    }
+                    None
+                }
+            };
+            taken[member] = true;
+            conn.lanes[index] = Some(Lane {
+                member,
+                base: stream.time_base,
+                convert: Convert::Timing { audio },
+            });
+            continue;
+        }
         let convert = match &spec.members[member].format {
             StreamFormat::Video(to) => {
                 let Some((width, height)) = stream.video_geometry() else {
@@ -392,7 +432,11 @@ fn sources(spec: &FeedSpec, conn: &Conn) -> Vec<(u32, SourceInfo)> {
         let Some(lane) = lane else { continue };
         let member = &spec.members[lane.member];
         let (kind, codec) = match &lane.convert {
-            Convert::Picture(_) => ("video", "rawvideo"),
+            Convert::Picture(_) | Convert::Timing { audio: None } => ("video", "rawvideo"),
+            Convert::Timing { audio: Some(_) } => match &member.format {
+                StreamFormat::Audio(a) if a.sample_fmt == "s16" => ("audio", "pcm_s16le"),
+                _ => ("audio", "pcm_f32le"),
+            },
             Convert::Sound(sound) => (
                 "audio",
                 if sound.to.sample_fmt == "s16" {
@@ -451,7 +495,12 @@ pub fn bind(port: u16) -> std::io::Result<TcpListener> {
 
 /// Serves `spec` until the run stops, on `bound` where the port was bound
 /// before the run's inputs were read.
-pub fn serve(spec: FeedSpec, bound: Option<TcpListener>, scheduler: Arc<Scheduler>) -> Result<()> {
+pub fn serve(
+    spec: FeedSpec,
+    bound: Option<TcpListener>,
+    scheduler: Arc<Scheduler>,
+    carried: &Carried,
+) -> Result<()> {
     let listener = match bound {
         Some(listener) => listener,
         None => bind(spec.port).with_context(|| {
@@ -484,7 +533,7 @@ pub fn serve(spec: FeedSpec, bound: Option<TcpListener>, scheduler: Arc<Schedule
             return Ok(());
         }
         if let Some(conn) = current.as_mut() {
-            let outcome = read_on(&spec, conn, &scheduler, &mut chunk, &mut report);
+            let outcome = read_on(&spec, conn, &scheduler, &mut chunk, &mut report, carried);
             match outcome {
                 Turn::Stopped => return Ok(()),
                 Turn::Closed(why) => {
@@ -549,6 +598,7 @@ fn read_on(
     scheduler: &Scheduler,
     chunk: &mut [u8],
     report: &mut dyn FnMut(String),
+    carried: &Carried,
 ) -> Turn {
     if conn.opened {
         match scheduler.wait_room(spec.members[0].id, POLL) {
@@ -565,7 +615,7 @@ fn read_on(
         Ok(n) => {
             conn.bytes += n as u64;
             conn.demux.feed(&chunk[..n]);
-            match drain(spec, conn, scheduler, report) {
+            match drain(spec, conn, scheduler, report, carried) {
                 Ok(true) => Turn::Open,
                 Ok(false) => Turn::Stopped,
                 Err(e) => Turn::Closed(format!("the feeder's stream was refused: {e:#}")),
@@ -583,6 +633,7 @@ fn drain(
     conn: &mut Conn,
     scheduler: &Scheduler,
     report: &mut dyn FnMut(String),
+    carried: &Carried,
 ) -> Result<bool> {
     loop {
         let event = match conn.demux.next_event()? {
@@ -605,7 +656,19 @@ fn drain(
                 };
                 let payload = conn.demux.payload();
                 let member = &spec.members[lane.member];
+                if !matches!(lane.convert, Convert::Timing { .. }) {
+                    carried.conformed.fetch_add(1, Ordering::Relaxed);
+                    carried
+                        .bytes
+                        .fetch_add(payload.len() as u64, Ordering::Relaxed);
+                }
                 let frame = match &lane.convert {
+                    Convert::Timing { audio } => TickFrame {
+                        pts: packet.pts,
+                        duration: audio.map(|width| (payload.len() / width.max(1)) as i64),
+                        data: Arc::new(Vec::new()),
+                        rows: Vec::new(),
+                    },
                     Convert::Picture(picture) => TickFrame {
                         pts: packet.pts,
                         duration: None,

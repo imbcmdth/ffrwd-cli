@@ -464,8 +464,10 @@ pub struct Assembler {
     made: u64,
     /// A packets clock's running maximum of dts.
     packets_time: Option<i64>,
-    /// An audio clock's samples not yet consumed, the first at `audio_pts`.
+    /// An audio clock's samples not yet consumed, the first at `audio_pts`:
+    /// how many, and their bytes, which a timing clock carries none of.
     audio_buffer: Vec<u8>,
+    audio_buffered: usize,
     audio_pts: Option<i64>,
     /// Whether the last tick has been made.
     done: bool,
@@ -599,6 +601,7 @@ impl Assembler {
             made: 0,
             packets_time: None,
             audio_buffer: Vec::new(),
+            audio_buffered: 0,
             audio_pts: None,
             done: false,
             made_end: None,
@@ -968,13 +971,14 @@ impl Assembler {
                     .audio
                     .ok_or_else(|| anyhow!("the audio clock has no sample format"))?;
                 while let Some(Item::Frame(frame)) = input.queue.front() {
-                    if self.audio_buffer.is_empty() {
+                    if self.audio_buffered == 0 {
                         self.audio_pts = Some(frame.pts);
                     }
+                    self.audio_buffered += sample_count(frame, audio.sample_len());
                     self.audio_buffer.extend_from_slice(&frame.data);
                     input.queue.pop_front();
                 }
-                let have = self.audio_buffer.len() / audio.sample_len();
+                let have = self.audio_buffered;
                 if have < window && !input.ended {
                     return Ok(None);
                 }
@@ -1066,13 +1070,18 @@ impl Assembler {
             PortKind::Audio => {
                 let audio = input.audio.expect("peeked as audio");
                 let width = audio.sample_len();
-                let have = self.audio_buffer.len() / width;
+                let have = self.audio_buffered;
                 let handed = if next.last { have } else { window.min(have) };
-                let data = self.audio_buffer[..handed * width].to_vec();
-                self.audio_buffer.drain(..next.take * width);
+                let data = match self.audio_buffer.is_empty() {
+                    true => Vec::new(),
+                    false => self.audio_buffer[..handed * width].to_vec(),
+                };
+                let drained = (next.take * width).min(self.audio_buffer.len());
+                self.audio_buffer.drain(..drained);
+                self.audio_buffered -= next.take.min(self.audio_buffered);
                 let step = samples_to_ticks(next.take as i64, audio.sample_rate, input.base);
                 self.audio_pts = Some(next.pts + step);
-                if self.audio_buffer.is_empty() {
+                if self.audio_buffered == 0 {
                     self.audio_pts = None;
                 }
                 if handed > 0 {
@@ -1270,6 +1279,18 @@ fn push_item(stream: &mut TickStream, item: Item) {
     }
 }
 
+/// How many samples a run holds: its bytes' worth, or for a run of an input
+/// read for its timing alone, which carries none, its duration in samples.
+pub fn sample_count(frame: &TickFrame, width: usize) -> usize {
+    if frame.data.is_empty() {
+        frame
+            .duration
+            .map_or(0, |d| usize::try_from(d).unwrap_or(0))
+    } else {
+        frame.data.len() / width.max(1)
+    }
+}
+
 /// `samples` at `rate` as ticks of `base`, rounded down.
 fn samples_to_ticks(samples: i64, rate: u32, base: TimeBase) -> i64 {
     let num = i128::from(samples) * i128::from(base.den);
@@ -1289,9 +1310,10 @@ fn recut(
 ) -> Result<Option<TickFrame>> {
     let width = audio.sample_len();
     let mut data = Vec::new();
+    let mut total = 0usize;
     let mut first: Option<i64> = None;
     while let Some(Item::Frame(frame)) = queue.front() {
-        let samples = frame.data.len() / width;
+        let samples = sample_count(frame, width);
         let take = match end {
             None => samples,
             Some(end) => samples_before(frame.pts, audio_base, audio.sample_rate, end, base)
@@ -1301,15 +1323,22 @@ fn recut(
             break;
         }
         first.get_or_insert(frame.pts);
-        data.extend_from_slice(&frame.data[..take * width]);
+        total += take;
+        let timing = frame.data.is_empty();
+        if !timing {
+            data.extend_from_slice(&frame.data[..take * width]);
+        }
         if take == samples {
             queue.pop_front();
             continue;
         }
         let left = TickFrame {
             pts: frame.pts + samples_to_ticks(take as i64, audio.sample_rate, audio_base),
-            duration: None,
-            data: Arc::new(frame.data[take * width..].to_vec()),
+            duration: timing.then_some((samples - take) as i64),
+            data: match timing {
+                true => Arc::new(Vec::new()),
+                false => Arc::new(frame.data[take * width..].to_vec()),
+            },
             rows: Vec::new(),
         };
         queue.pop_front();
@@ -1319,7 +1348,7 @@ fn recut(
     let Some(pts) = first else {
         return Ok(None);
     };
-    let samples = (data.len() / width) as i64;
+    let samples = total as i64;
     Ok(Some(TickFrame {
         pts,
         duration: Some(samples_to_ticks(samples, audio.sample_rate, audio_base)),

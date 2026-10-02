@@ -36,21 +36,6 @@ after an `-i` says what its NUT does not carry: a raw picture's colour, in
 ffmpeg's names, and tags for its streams beside their own, which reach a
 node in `stream-info.tags` (a hold input anchored `tagged` reads them).
 
-    -pad '{"rate": {"num": 30000, "den": 1001}}'
-    -pad '{"rate": {"v": {"num": 25, "den": 1}, "a": {"num": 48000, "den": 1}, "a:1": {"num": 16000, "den": 1}}}'
-
-`rate` is what the compiler knew of the input's streams when it asked a
-node for its shape: a video stream's frame rate, an audio stream's sample
-rate over 1 (the WIT's `stream-hint`). One rational is the rate of every
-stream of that input, for an edge carrying one stream; an object of them
-is one per stream, keyed by the stream as a pad names it after the input's
-number (`v` is `v:0`, then `v:1`, `a`, `a:1`, `d`, ...), and a stream it
-leaves out has none. Both numbers are positive. Write it wherever the rate
-was known when the shape was asked, and only then: the host builds the
-same `binding` list from it (see "Asking the shape again"), and hands each
-bound stream the same hint at `init` (`bound-stream.hint`), so a module
-that derives its shape again there derives the plan's.
-
 ## Nodes
 
     -m <name>=<path>
@@ -90,23 +75,40 @@ node module every pad carries the port it binds before an `=`:
 - **One call, many readers.** A label may be read by any number of pads
   and `-map`s; the host splits it.
 
-### Asking the shape again
+### The shape a call was planned with
 
-The host asks every node module for its shape at the start of the run, and
-it must get the shape the plan was made from, so it asks with the list the
-compiler asked `--shape --bound` with (`NODE-SHAPE.md`):
+    -bound <name>=<json>
 
-- one `binding` per port the chain binds, in the order its pads first name
-  each port;
-- in each, one stream per pad naming that port, in the order written;
-- each stream's `rate` is the one `-pad` gives that stream of its input
-  (above); a stream bound by a label, which another chain writes, has none.
+after `-filter_complex` (and after any `-params-from`), one per node call:
+`<name>` is the call's `-m` name, and the JSON exactly what `ffrwd-wasm
+--shape --bound` took when the compiler asked that call's shape
+(`NODE-SHAPE.md`), compact:
 
-A hold input served by a port is not in the list, as it is not among the
-pads. Ask `--shape` with exactly this list, as JSON wherever a rate is
-known: `[v=0:v][a=0:a][words=n1]` over `-pad '{"rate": {"v": {"num": 30,
-"den": 1}}}'` is `--bound
-'[{"input":"v","streams":[{"rate":{"num":30,"den":1}}]},{"input":"a","streams":[{"rate":null}]},{"input":"words","streams":[{"rate":null}]}]'`.
+    -bound 'ring=[{"input":"v","streams":[{"rate":{"num":25,"den":1}}]},{"input":"spots","streams":[{"rate":null}]}]'
+
+The host asks the module's shape with that list as it is, and hands each
+bound stream at `init` the hint the list gives it (`bound-stream.hint`):
+per port, the k-th stream a pad binds there gets the k-th of the port's
+`streams`. So the run's shape is the plan's, and a module that derives
+its shape again at `init` derives the same one. A name called by several
+chains takes its `-bound` flags in turn: the k-th given for the name goes
+to the k-th chain calling it. A node source binds nothing and carries
+`[]`.
+
+The list is checked against the pads, and a refusal names the module and
+the input:
+
+- every input a pad binds is in the list, with as many streams as pads
+  bind to it (its rates come from the list);
+- an input the list names that no pad binds is one a port serves: a hold
+  input with a `port_param` (a lateral's feed, say) or a data input on a
+  hold group; any other is refused;
+- an input the shape does not declare is refused, as `--shape` refuses
+  it;
+- more `-bound` flags for a name than chains calling it are refused.
+
+A call with no `-bound` is asked its shape with the ports its pads name,
+each stream with no rate, as before.
 
 A frame module of an older world keeps its positional pads in the same
 `-filter_complex`, and runs as the node its adapter makes of it. The host's

@@ -9,7 +9,10 @@
 //!   stream placed on the clock by its first message.
 //! - `a`: audio, optional, lockstep with `v`.
 //! - `cues`: data, optional, by interval, on `feed`'s connection.
-//! - `size`: video, optional, lockstep, read for its timing alone.
+//! - `size`: video, optional, lockstep, read for its timing alone. Its
+//!   frames' pts ride each `spots` message; `fetch_size` fetches one,
+//!   which the host refuses. `v`'s hint at `init`, where it has a rate,
+//!   rides them too.
 //! - `mask`: `v`'s size in gray, left out when `v` is not bound.
 //! - `copy`: `v` itself, frame for frame.
 //! - `canvas`: a video of the size `canvas` names, only when it does.
@@ -37,7 +40,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use serde::Deserialize;
 
-const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{"rate":{"type":"integer","minimum":1},"canvas":{"type":"object","properties":{"width":{"type":"integer"},"height":{"type":"integer"}},"required":["width","height"]},"refuse":{"type":"string"},"port":{"type":"integer"}},"additionalProperties":false}"#;
+const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{"rate":{"type":"integer","minimum":1},"canvas":{"type":"object","properties":{"width":{"type":"integer"},"height":{"type":"integer"}},"required":["width","height"]},"refuse":{"type":"string"},"port":{"type":"integer"},"fetch_size":{"type":"boolean"}},"additionalProperties":false}"#;
 
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -47,6 +50,8 @@ struct Params {
     refuse: Option<String>,
     #[allow(dead_code)]
     port: Option<u32>,
+    #[serde(default)]
+    fetch_size: bool,
 }
 
 #[derive(Deserialize)]
@@ -297,6 +302,14 @@ static LATCHED_COPY: AtomicBool = AtomicBool::new(false);
 /// The calls this instance has had.
 static CALLS: AtomicU64 = AtomicU64::new(0);
 
+thread_local! {
+    /// The rate `v`'s stream was bound with, as `spots` spells it.
+    static HINT: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// Whether `process` fetches `size`'s frames, as `init` was told.
+static FETCH_SIZE: AtomicBool = AtomicBool::new(false);
+
 impl Guest for ShapeProbe {
     fn describe() -> Meta {
         Meta {
@@ -317,11 +330,18 @@ impl Guest for ShapeProbe {
     }
 
     fn init(
-        _bound: Vec<BoundStream>,
+        bound: Vec<BoundStream>,
         latched: Vec<String>,
         params_text: String,
     ) -> Result<(), String> {
-        params(&params_text)?;
+        let hint = bound
+            .iter()
+            .find(|b| b.port == "v")
+            .and_then(|b| b.hint.rate)
+            .map(|r| format!(r#","hint":"{}/{}""#, r.num, r.den))
+            .unwrap_or_default();
+        HINT.with(|h| *h.borrow_mut() = hint);
+        FETCH_SIZE.store(params(&params_text)?.fetch_size, Ordering::Relaxed);
         LATCHED_COPY.store(latched.iter().any(|l| l == "copy"), Ordering::Relaxed);
         Ok(())
     }
@@ -351,12 +371,26 @@ impl Guest for ShapeProbe {
         let seconds = tick.pts() as f64 * f64::from(base.num) / f64::from(base.den);
         let calls = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
         let ordinal = tick.ordinal();
+        let hint = HINT.with(|h| h.borrow().clone());
+        let mut size = String::new();
+        for id in tick.streams("size") {
+            let frames = tick.frames(id);
+            if FETCH_SIZE.load(Ordering::Relaxed) {
+                for frame in &frames {
+                    tick.fetch(id, frame.index);
+                }
+            }
+            let times: Vec<String> = frames.iter().map(|f| f.pts.to_string()).collect();
+            size = format!(r#","size":[{}]"#, times.join(","));
+        }
         items.push(Emission {
             port: "spots".to_string(),
             payload: Payload::Message(Message {
                 pts: (seconds * 1_000_000.0).round() as i64,
-                data: format!(r#"{{"start_t":{seconds},"ordinal":{ordinal},"calls":{calls}}}"#)
-                    .into_bytes(),
+                data: format!(
+                    r#"{{"start_t":{seconds},"ordinal":{ordinal},"calls":{calls}{size}{hint}}}"#
+                )
+                .into_bytes(),
             }),
         });
         Ok(Emitted {

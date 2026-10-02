@@ -1212,6 +1212,9 @@ impl Scheduler {
             panicked |= handle.join().is_err();
         }
         let mut state = self.shared.lock();
+        // The failure is taken to be returned; the run stays stopped for a
+        // port feed's listener, which is joined after this.
+        state.finished = true;
         if let Some(e) = state.error.take() {
             return Err(e);
         }

@@ -1377,3 +1377,116 @@ fn every_worker_numbers_a_tick_by_its_ordinal_in_the_run() {
     );
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn a_frame_of_an_input_read_for_its_timing_alone_cannot_be_fetched() {
+    let dir = scratch("timing-fetch");
+    let input = ten_frames(&dir);
+    let chain = format!(
+        "[v=0:v][size=0:v]shape_probe=port={}:fetch_size=true[spots=s]",
+        free_port()
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_ffrwd-wasm"))
+        .args(args(&[
+            "-f",
+            "nut",
+            "-i",
+            &input,
+            "-m",
+            &module("shape_probe"),
+            "-filter_complex",
+            &chain,
+            "-map",
+            "[s]",
+            "-f",
+            "null",
+            "-",
+        ]))
+        .output()
+        .expect("spawn ffrwd-wasm");
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("asked of input 'size', which wants timing"),
+        "{stderr}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_bound_list_is_what_the_shape_is_asked_with_and_each_stream_is_handed_its_hint() {
+    let dir = scratch("bound-list");
+    let input = ten_frames(&dir);
+    let chain = format!("[v=0:v]shape_probe=port={}[spots=s]", free_port());
+    let spelled = |bound: &[&str]| {
+        let mut line = args(&[
+            "-f",
+            "nut",
+            "-i",
+            &input,
+            "-m",
+            &module("shape_probe"),
+            "-filter_complex",
+            &chain,
+        ]);
+        for list in bound {
+            line.push("-bound".to_string());
+            line.push(format!("shape_probe={list}"));
+        }
+        line.extend(args(&["-map", "[s]", "-f", "ndjson", "-"]));
+        Command::new(env!("CARGO_BIN_EXE_ffrwd-wasm"))
+            .args(line)
+            .output()
+            .expect("spawn ffrwd-wasm")
+    };
+    let hints = |output: &std::process::Output| -> Vec<Option<String>> {
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        lines(&output.stdout)
+            .iter()
+            .map(|r| r["hint"].as_str().map(str::to_string))
+            .collect()
+    };
+    let told = hints(&spelled(&[
+        r#"[{"input":"v","streams":[{"rate":{"num":25,"den":1}}]},{"input":"feed"}]"#,
+    ]));
+    assert_eq!(told.len(), 10);
+    assert!(
+        told.iter().all(|h| h.as_deref() == Some("25/1")),
+        "v is handed the rate the list gives it: {told:?}"
+    );
+    let untold = hints(&spelled(&[]));
+    assert!(
+        untold.iter().all(Option::is_none),
+        "with no list the pads name the inputs and nothing is known of their rates"
+    );
+
+    for (bound, said) in [
+        (vec!["[]"], "-bound leaves out input 'v', which a pad binds"),
+        (
+            vec![r#"[{"input":"v","streams":[{},{}]}]"#],
+            "-bound gives input 'v' 2 stream(s), and the pads bind 1",
+        ),
+        (
+            vec![r#"[{"input":"v"},{"input":"a"}]"#],
+            "names input 'a', which no pad binds and no port serves",
+        ),
+        (
+            vec![r#"[{"input":"v"}]"#, r#"[{"input":"v"}]"#],
+            "-bound shape_probe= is given 2 time(s)",
+        ),
+        (
+            vec![r#"[{"input":"v"},{"input":"nope"}]"#],
+            "bound input 'nope'",
+        ),
+    ] {
+        let output = spelled(&bound);
+        assert_eq!(output.status.code(), Some(1), "{bound:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(said), "{bound:?}: {stderr}");
+    }
+    let _ = fs::remove_dir_all(&dir);
+}

@@ -393,6 +393,9 @@ struct Args {
     color: codec::ColorFlags,
     /// `-params-from <name>=<file>`: one node's params, whole, by its name.
     node_params: HashMap<String, String>,
+    /// `-bound <name>=<bindings>`: per node name, the inputs each call of it
+    /// binds as its shape was asked, the k-th for the k-th chain calling it.
+    node_bounds: HashMap<String, Vec<Vec<ffrwd_wasm_runtime::node::Binding>>>,
 }
 
 /// `-pad`'s JSON, following one packet sink `-i`: which relation row this
@@ -413,63 +416,6 @@ pub(crate) struct PadSpec {
     /// the query's `tags` column says them: `smart_timed` makes a feed timed.
     #[serde(default)]
     pub(crate) tags: std::collections::BTreeMap<String, String>,
-    /// What the compiler knew of the input's streams' rates when it asked a
-    /// node for its shape, which the host tells the node again.
-    #[serde(default)]
-    pub(crate) rate: Option<PadRate>,
-}
-
-/// `-pad`'s `rate`: one rate for every stream of the input, or one per
-/// stream, keyed by the stream as a pad names it after the input's number
-/// (`v`, `v:1`, `a`, `d:2`).
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(untagged)]
-pub(crate) enum PadRate {
-    Every(PadRational),
-    Each(std::collections::BTreeMap<String, PadRational>),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct PadRational {
-    pub(crate) num: i32,
-    pub(crate) den: i32,
-}
-
-impl PadSpec {
-    /// The rate `-pad` gives the stream a pad names `marker` (`v`, `a`,
-    /// `d`) and `nth`, checked to be a rate.
-    pub(crate) fn rate_of(
-        &self,
-        marker: &str,
-        nth: usize,
-    ) -> Result<Option<ffrwd_wasm_runtime::node::Rational>> {
-        let rate = match &self.rate {
-            None => return Ok(None),
-            Some(PadRate::Every(rate)) => Some(*rate),
-            Some(PadRate::Each(each)) => each
-                .iter()
-                .find(|(key, _)| {
-                    let mut parts = key.split(':');
-                    parts.next() == Some(marker)
-                        && match parts.next() {
-                            None => nth == 0,
-                            Some(n) => n.parse::<usize>().ok() == Some(nth),
-                        }
-                        && parts.next().is_none()
-                })
-                .map(|(_, rate)| *rate),
-        };
-        match rate {
-            Some(PadRational { num, den }) if num <= 0 || den <= 0 => {
-                bail!("-pad rate {num}/{den} is not a rate")
-            }
-            Some(PadRational { num, den }) => {
-                Ok(Some(ffrwd_wasm_runtime::node::Rational { num, den }))
-            }
-            None => Ok(None),
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -759,6 +705,8 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
     let mut wiring: Option<String> = None;
     let mut pending_map: Vec<String> = Vec::new();
     let mut node_params: HashMap<String, String> = HashMap::new();
+    let mut node_bounds: HashMap<String, Vec<Vec<ffrwd_wasm_runtime::node::Binding>>> =
+        HashMap::new();
     let mut outputs: Vec<OutputSpec> = Vec::new();
     let mut stream_info_path: Option<String> = None;
     let mut annotations = Annotations::default();
@@ -787,6 +735,15 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
                 require_edge_format(format.take(), "input")?;
                 inputs.push(resolve_input_path(&raw)?);
                 pads.push(None);
+            }
+            "-bound" => {
+                let raw = next("-bound")?;
+                let (name, list) = raw
+                    .split_once('=')
+                    .ok_or_else(|| anyhow!("-bound {raw}: the value is <name>=<bindings>"))?;
+                let list = crate::shape_json::parse_bound(list)
+                    .with_context(|| format!("-bound {name}="))?;
+                node_bounds.entry(name.to_string()).or_default().push(list);
             }
             "-pad" => {
                 let raw = next("-pad")?;
@@ -1025,6 +982,7 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
         frame_rate,
         color,
         node_params,
+        node_bounds,
     })
 }
 
@@ -4621,41 +4579,8 @@ mod pad_spec_tests {
                 },
                 color: None,
                 tags: Default::default(),
-                rate: None,
             }
         );
-    }
-
-    #[test]
-    fn a_rate_is_one_for_every_stream_or_one_per_stream_by_its_pad() {
-        use ffrwd_wasm_runtime::node::Rational;
-        let every: PadSpec =
-            serde_json::from_str(r#"{"rate":{"num":30000,"den":1001}}"#).expect("valid");
-        let ntsc = Some(Rational {
-            num: 30000,
-            den: 1001,
-        });
-        assert_eq!(every.rate_of("v", 0).expect("a rate"), ntsc);
-        assert_eq!(every.rate_of("a", 1).expect("a rate"), ntsc);
-        let each: PadSpec = serde_json::from_str(
-            r#"{"rate":{"v":{"num":25,"den":1},"a:1":{"num":48000,"den":1}}}"#,
-        )
-        .expect("valid");
-        assert_eq!(
-            each.rate_of("v", 0).expect("a rate"),
-            Some(Rational { num: 25, den: 1 })
-        );
-        assert_eq!(each.rate_of("v", 1).expect("none"), None);
-        assert_eq!(each.rate_of("a", 0).expect("none"), None);
-        assert_eq!(
-            each.rate_of("a", 1).expect("a rate"),
-            Some(Rational { num: 48000, den: 1 })
-        );
-        let nothing: PadSpec = serde_json::from_str("{}").expect("valid");
-        assert_eq!(nothing.rate_of("v", 0).expect("none"), None);
-        let zero: PadSpec =
-            serde_json::from_str(r#"{"rate":{"num":0,"den":1}}"#).expect("valid");
-        assert!(zero.rate_of("v", 0).is_err());
     }
 
     #[test]

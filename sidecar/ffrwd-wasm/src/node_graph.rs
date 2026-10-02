@@ -9,6 +9,7 @@
 //! readers are told at `init`.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
 
@@ -20,7 +21,7 @@ use ffrwd_wasm_runtime::node::{
 };
 use ffrwd_wasm_runtime::runtime::{
     self, AudioFormat, Format, FormatOf, Media, Message, Packet, RenditionMeta, StreamInfo,
-    TimeBase, VideoFormat, WitNode,
+    TimeBase, VideoFormat, Wants, WitNode,
 };
 
 use crate::adapters::FilterNode;
@@ -197,9 +198,26 @@ struct Opened {
     writers: Vec<edges::Writer>,
     /// The ports the host listens on for hold inputs given by one.
     feeds: Vec<FeedSpec>,
+    /// The streams only inputs that want timing read: their bytes are never
+    /// carried.
+    timing: HashSet<u32>,
+}
+
+/// What a run carried of its inputs' frames: the bytes copied off the wire,
+/// and the pictures and sounds a port feed conformed.
+#[derive(Debug, Default)]
+pub struct Carried {
+    pub bytes: AtomicU64,
+    pub conformed: AtomicU64,
 }
 
 pub fn run(args: &Args, bindings: &[Binding], wiring: &str) -> Result<()> {
+    run_carrying(args, bindings, wiring).map(|_| ())
+}
+
+/// A run, and what it carried.
+pub fn run_carrying(args: &Args, bindings: &[Binding], wiring: &str) -> Result<Arc<Carried>> {
+    let carried = Arc::new(Carried::default());
     if args.annotations.input || args.annotations.output {
         bail!(
             "-annotations carries rows beside the frames of an older module's edge; a network \
@@ -241,6 +259,7 @@ pub fn run(args: &Args, bindings: &[Binding], wiring: &str) -> Result<()> {
         streams,
         mut writers,
         feeds,
+        timing,
     } = open(args, bindings, &calls, &headers, wake, Arc::clone(&ending))?;
     let scheduler = Arc::new(Scheduler::start(plan, workers)?);
     let _ = wake_slot.set(scheduler.waker());
@@ -250,8 +269,9 @@ pub fn run(args: &Args, bindings: &[Binding], wiring: &str) -> Result<()> {
     for spec in feeds {
         let scheduler = Arc::clone(&scheduler);
         let bound = early.remove(&spec.port);
+        let carried = Arc::clone(&carried);
         listeners.push(thread::spawn(move || {
-            if let Err(e) = feeds::serve(spec, bound, Arc::clone(&scheduler)) {
+            if let Err(e) = feeds::serve(spec, bound, Arc::clone(&scheduler), &carried) {
                 scheduler.fail(e);
             }
         }));
@@ -262,8 +282,10 @@ pub fn run(args: &Args, bindings: &[Binding], wiring: &str) -> Result<()> {
         let scheduler = Arc::clone(&scheduler);
         let ids = input_ids[index].clone();
         let defs: Vec<StreamDef> = ids.iter().map(|id| streams[*id as usize].clone()).collect();
+        let timed: Vec<bool> = ids.iter().map(|id| timing.contains(id)).collect();
+        let carried = Arc::clone(&carried);
         readers.push(thread::spawn(move || {
-            let read = pump(input, &ids, &defs, &scheduler);
+            let read = pump(input, &ids, &defs, &timed, &scheduler, &carried);
             match read {
                 Ok(true) => {
                     for id in &ids {
@@ -291,16 +313,20 @@ pub fn run(args: &Args, bindings: &[Binding], wiring: &str) -> Result<()> {
             bail!("{failure}");
         }
     }
-    Ok(())
+    Ok(carried)
 }
 
 /// Every frame of one input handed to the lanes reading it. True when the
-/// input ended, false when the run stopped first.
+/// input ended, false when the run stopped first. A stream `timing` marks
+/// is handed its frames' times alone: a picture with no bytes, a run of
+/// samples with none and its length in samples as its duration.
 fn pump(
     input: edges::Opened,
     ids: &[u32],
     defs: &[StreamDef],
+    timing: &[bool],
     scheduler: &Scheduler,
+    carried: &Carried,
 ) -> Result<bool> {
     let read: Vec<bool> = ids.iter().map(|id| scheduler.reads(*id)).collect();
     let mut counts = vec![0u64; ids.len()];
@@ -328,15 +354,32 @@ fn pump(
                 };
                 crate::check_frame(&format, payload, number)
                     .with_context(|| def.spelling.clone())?;
-                scheduler.arrive(
-                    id,
-                    Item::Frame(TickFrame {
+                let frame = match (&def.format, timing[index]) {
+                    (StreamFormat::Audio(a), true) => TickFrame {
+                        pts: packet.pts,
+                        duration: Some((payload.len() / a.sample_len().max(1)) as i64),
+                        data: Arc::new(Vec::new()),
+                        rows: Vec::new(),
+                    },
+                    (_, true) => TickFrame {
                         pts: packet.pts,
                         duration: None,
-                        data: Arc::new(payload.to_vec()),
+                        data: Arc::new(Vec::new()),
                         rows: Vec::new(),
-                    }),
-                )
+                    },
+                    (_, false) => {
+                        carried
+                            .bytes
+                            .fetch_add(payload.len() as u64, Ordering::Relaxed);
+                        TickFrame {
+                            pts: packet.pts,
+                            duration: None,
+                            data: Arc::new(payload.to_vec()),
+                            rows: Vec::new(),
+                        }
+                    }
+                };
+                scheduler.arrive(id, Item::Frame(frame))
             }
             StreamFormat::Data(_) if heartbeat::is_heartbeat(payload) => {
                 scheduler.progress(id, packet.pts)
@@ -431,12 +474,22 @@ fn open(
         }
     }
     let order = topological(calls, &labels)?;
+    for (name, lists) in &args.node_bounds {
+        let called = calls.iter().filter(|c| &c.module == name).count();
+        if lists.len() > called {
+            bail!(
+                "-bound {name}= is given {} time(s), and -filter_complex calls '{name}' {called}                  time(s)",
+                lists.len()
+            );
+        }
+    }
 
     let mut label_ids: HashMap<String, u32> = HashMap::new();
     let mut consumers: HashMap<u32, Vec<Consumer>> = HashMap::new();
     let mut mirrors: HashMap<u32, Vec<u32>> = HashMap::new();
     let mut lanes: Vec<LaneSpec> = Vec::with_capacity(calls.len());
     let mut feeds: Vec<FeedSpec> = Vec::new();
+    let mut bytes_read: HashSet<u32> = HashSet::new();
     for &index in &order {
         let call = &calls[index];
         let kind = match paths.get(call.module.as_str()) {
@@ -498,7 +551,7 @@ fn open(
 
         let lane = match &kind {
             Kind::Module { path } => {
-                open_module(args, &call.module, path, call, &pads, &mut streams)?
+                open_module(args, &call.module, path, calls, index, &pads, &mut streams)?
             }
             Kind::OldFilter { path } => open_old_filter(&call.module, path, call, &pads, &streams)?,
             Kind::Host => open_host(call, &pads, &streams)?,
@@ -586,6 +639,16 @@ fn open(
             streams.push(def);
             label_ids.insert(label.clone(), id);
         }
+        for (port, id) in &pads {
+            let timing = matches!(kind, Kind::Module { .. })
+                && spec
+                    .shape
+                    .input(port)
+                    .is_some_and(|p| p.accepts.wants == Wants::Timing);
+            if !timing {
+                bytes_read.insert(*id);
+            }
+        }
         lanes.push(spec);
     }
 
@@ -651,6 +714,22 @@ fn open(
         ));
     }
 
+    for (id, readers) in &consumers {
+        if readers.iter().any(|c| matches!(c, Consumer::Writer(..))) {
+            bytes_read.insert(*id);
+        }
+    }
+    for (original, copies) in &mirrors {
+        if copies.iter().any(|copy| bytes_read.contains(copy)) {
+            bytes_read.insert(*original);
+        }
+    }
+    let timing: HashSet<u32> = input_ids
+        .iter()
+        .flatten()
+        .copied()
+        .filter(|id| !bytes_read.contains(id))
+        .collect();
     let read: HashSet<u32> = consumers.keys().copied().collect();
     for spec in &mut lanes {
         for port in spec.ports.iter_mut() {
@@ -674,6 +753,7 @@ fn open(
         streams,
         writers,
         feeds,
+        timing,
     })
 }
 
@@ -983,7 +1063,7 @@ fn bind_feed_ports(
     calls: &[NodeCall],
 ) -> HashMap<u16, std::net::TcpListener> {
     let mut bound = HashMap::new();
-    for call in calls {
+    for (index, call) in calls.iter().enumerate() {
         let Some(binding) = bindings.iter().find(|b| b.name == call.module) else {
             continue;
         };
@@ -1003,10 +1083,10 @@ fn bind_feed_ports(
                 Err(_) => continue,
             },
         };
-        let Ok(told) = bindings_of(args, call) else {
+        let Ok(told) = bindings_of(args, calls, index) else {
             continue;
         };
-        let wanted = PortBinding::names(&told);
+        let wanted = padded_ports(call);
         let Ok(shape) = shape_of(&binding.path, &params, &told) else {
             continue;
         };
@@ -1035,43 +1115,106 @@ fn bind_feed_ports(
     bound
 }
 
-/// The inputs a node call binds, as its shape is asked for them: each port
-/// in the order its pads first name it, a stream per pad, with the rate
-/// `-pad` gives a stream of an input. A stream another chain writes has no
-/// hint.
-fn bindings_of(args: &Args, call: &NodeCall) -> Result<Vec<PortBinding>> {
-    let hints = pad_hints(args, call)?;
-    let mut bound: Vec<PortBinding> = Vec::new();
-    for ((port, _), hint) in call.inputs.iter().zip(hints) {
+/// The ports a call's pads bind, in the order they first name each.
+fn padded_ports(call: &NodeCall) -> Vec<String> {
+    let mut ports: Vec<String> = Vec::new();
+    for (port, _) in &call.inputs {
+        if let Some(port) = port {
+            if !ports.contains(port) {
+                ports.push(port.clone());
+            }
+        }
+    }
+    ports
+}
+
+/// The inputs call `index` binds, as its shape is asked for them: the
+/// `-bound` list the compiler asked with, for the k-th chain calling a name
+/// the k-th given for it, checked against the pads; with none given, the
+/// ports the pads name, a stream per pad with nothing known of it. An
+/// input the list names and no pad binds is one a port serves.
+fn bindings_of(args: &Args, calls: &[NodeCall], index: usize) -> Result<Vec<PortBinding>> {
+    let call = &calls[index];
+    let mut padded: Vec<PortBinding> = Vec::new();
+    for (port, _) in &call.inputs {
         let Some(port) = port else { continue };
-        match bound.iter_mut().find(|b| &b.input == port) {
-            Some(binding) => binding.streams.push(hint),
-            None => bound.push(PortBinding {
+        match padded.iter_mut().find(|b| &b.input == port) {
+            Some(binding) => binding.streams.push(StreamHint::default()),
+            None => padded.push(PortBinding {
                 input: port.clone(),
-                streams: vec![hint],
+                streams: vec![StreamHint::default()],
             }),
         }
     }
-    Ok(bound)
+    let Some(lists) = args.node_bounds.get(&call.module) else {
+        return Ok(padded);
+    };
+    let nth = calls[..index]
+        .iter()
+        .filter(|c| c.module == call.module)
+        .count();
+    let Some(list) = lists.get(nth) else {
+        bail!(
+            "{}: -bound {}= is given {} time(s), and -filter_complex calls it more often; a \
+             call takes the -bound given in its turn",
+            call.module,
+            call.module,
+            lists.len()
+        );
+    };
+    for wanted in &padded {
+        match list.iter().find(|b| b.input == wanted.input) {
+            None => bail!(
+                "{}: -bound leaves out input '{}', which a pad binds",
+                call.module,
+                wanted.input
+            ),
+            Some(b) if b.streams.len() != wanted.streams.len() => bail!(
+                "{}: -bound gives input '{}' {} stream(s), and the pads bind {}",
+                call.module,
+                wanted.input,
+                b.streams.len(),
+                wanted.streams.len()
+            ),
+            Some(_) => {}
+        }
+    }
+    Ok(list.clone())
 }
 
-/// What `-pad` says of each of a call's pads, in the order written.
-fn pad_hints(args: &Args, call: &NodeCall) -> Result<Vec<StreamHint>> {
-    call.inputs
-        .iter()
-        .map(|(_, pad)| {
-            let rate = match pad {
-                NodePad::Input(r) => match args.pads.get(r.input).and_then(Option::as_ref) {
-                    Some(spec) => spec
-                        .rate_of(r.class.marker(), r.nth)
-                        .with_context(|| format!("the -pad of input {}", r.input))?,
-                    None => None,
-                },
-                NodePad::Label(_) => None,
-            };
-            Ok(StreamHint { rate })
-        })
-        .collect()
+/// The hint the list gives stream `k` of `port`.
+fn hint_of(told: &[PortBinding], port: &str, k: usize) -> StreamHint {
+    told.iter()
+        .find(|b| b.input == port)
+        .and_then(|b| b.streams.get(k))
+        .copied()
+        .unwrap_or_default()
+}
+
+/// Inputs a `-bound` list names and no pad binds: each has to be one a port
+/// serves, a hold input with a port param or a data input on a hold group.
+fn check_port_served(
+    name: &str,
+    shape: &NodeShape,
+    told: &[PortBinding],
+    padded: &[String],
+) -> Result<()> {
+    for binding in told.iter().filter(|b| !padded.contains(&b.input)) {
+        let served = shape
+            .input(&binding.input)
+            .is_some_and(|p| match &p.pairing {
+                Pairing::Hold(hold) => hold.port_param.is_some(),
+                Pairing::Interval(interval) => interval.group.is_some(),
+                _ => false,
+            });
+        if !served {
+            bail!(
+                "{name}: -bound names input '{}', which no pad binds and no port serves",
+                binding.input
+            );
+        }
+    }
+    Ok(())
 }
 
 /// A node's shape for these params and bound inputs, asked once a run.
@@ -1095,10 +1238,12 @@ fn open_module(
     args: &Args,
     name: &str,
     path: &str,
-    call: &NodeCall,
+    calls: &[NodeCall],
+    index: usize,
     pads: &[(String, u32)],
     defs: &mut Vec<StreamDef>,
 ) -> Result<Opening> {
+    let call = &calls[index];
     let meta =
         runtime::describe_node(path).with_context(|| format!("describing module '{name}'"))?;
     let schema = parse_schema(&meta.params_schema, name)?;
@@ -1106,23 +1251,27 @@ fn open_module(
         Some(params) => params.clone(),
         None => params_json(name, &schema, &call.options)?,
     };
-    let hints = pad_hints(args, call)?;
-    let told = bindings_of(args, call)?;
-    let wanted = PortBinding::names(&told);
+    let told = bindings_of(args, calls, index)?;
+    let wanted = padded_ports(call);
     let shape =
         shape_of(path, &params, &told).with_context(|| format!("asking {name} for its shape"))?;
+    check_port_served(name, &shape, &told, &wanted)?;
     let mut bound: Vec<BoundStream> = Vec::with_capacity(pads.len());
     for input in &shape.inputs {
-        for (at, (port, id)) in pads.iter().enumerate() {
-            if *port == input.name {
-                bound.push(bound_stream(port, *id, &defs[*id as usize], hints[at]));
-            }
+        for (k, (port, id)) in pads.iter().filter(|(p, _)| *p == input.name).enumerate() {
+            bound.push(bound_stream(
+                port,
+                *id,
+                &defs[*id as usize],
+                hint_of(&told, port, k),
+            ));
         }
     }
     let feeds = listen_for(
         name,
         &shape,
         &wanted,
+        &told,
         &mut bound,
         &mut params,
         &schema,
@@ -1184,6 +1333,7 @@ fn listen_for(
     name: &str,
     shape: &NodeShape,
     wanted: &[String],
+    told: &[PortBinding],
     bound: &mut Vec<BoundStream>,
     params: &mut String,
     schema: &serde_json::Value,
@@ -1219,6 +1369,7 @@ fn listen_for(
                 input,
                 hold,
                 port,
+                told,
                 bound,
                 defs,
                 &mut feeds,
@@ -1243,6 +1394,7 @@ fn listen_on(
     input: &ffrwd_wasm_runtime::node::InputPort,
     hold: &ffrwd_wasm_runtime::node::Hold,
     port: u16,
+    told: &[PortBinding],
     bound: &mut Vec<BoundStream>,
     defs: &mut Vec<StreamDef>,
     feeds: &mut Vec<FeedSpec>,
@@ -1276,11 +1428,18 @@ fn listen_on(
         rendition: RenditionMeta::default(),
         row: None,
     };
-    bound.push(bound_stream(&input.name, id, &def, StreamHint::default()));
+    let k = bound.iter().filter(|b| b.port == input.name).count();
+    bound.push(bound_stream(
+        &input.name,
+        id,
+        &def,
+        hint_of(told, &input.name, k),
+    ));
     let member = FeedMember {
         id,
         name: input.name.clone(),
         format: def.format.clone(),
+        timing: input.accepts.wants == Wants::Timing,
     };
     defs.push(def);
     let mine: Vec<usize> = match &hold.group {
@@ -1713,5 +1872,122 @@ mod tests {
             port_params(r#"{"port":9100}"#, &listed, "port", "n", "v").unwrap(),
             vec![9100]
         );
+    }
+
+    /// shape-probe, built for wasm32-wasip2 once per test binary.
+    fn probe() -> String {
+        static BUILT: OnceLock<String> = OnceLock::new();
+        BUILT
+            .get_or_init(|| {
+                let modules = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .parent()
+                    .expect("ffrwd-wasm/ has a parent")
+                    .join("modules");
+                let output = std::process::Command::new("cargo")
+                    .args([
+                        "build",
+                        "--release",
+                        "--target",
+                        "wasm32-wasip2",
+                        "-p",
+                        "shape-probe",
+                    ])
+                    .current_dir(&modules)
+                    .output()
+                    .expect("spawn cargo build");
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                modules
+                    .join("target/wasm32-wasip2/release/shape_probe.wasm")
+                    .display()
+                    .to_string()
+            })
+            .clone()
+    }
+
+    #[test]
+    fn a_picture_read_for_its_timing_alone_is_carried_without_its_bytes() {
+        let dir = std::env::temp_dir().join(format!("ffrwd-timing-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let tenths = nut::TimeBase { num: 1, den: 10 };
+        let small = nut::Stream::video("rgba", 4, 4, tenths).expect("rgba");
+        let big = nut::Stream::video("rgba", 64, 64, tenths).expect("rgba");
+        let mut wire = Vec::new();
+        {
+            let mut muxer = nut::Muxer::with_streams(&mut wire, &[small, big]).expect("headers");
+            for k in 0..10i64 {
+                muxer.write_frame_to(0, k, &[k as u8; 64]).expect("a frame");
+                muxer
+                    .write_frame_to(1, k, &vec![k as u8; 64 * 64 * 4])
+                    .expect("a frame");
+            }
+        }
+        let input = dir.join("in.nut");
+        std::fs::write(&input, &wire).expect("write the input");
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
+            listener.local_addr().expect("its address").port()
+        };
+        let run = |chain: &str, out: &str| {
+            let argv: Vec<String> = [
+                "-f",
+                "nut",
+                "-i",
+                &input.display().to_string(),
+                "-m",
+                &format!("shape_probe={}", probe()),
+                "-filter_complex",
+                chain,
+                "-map",
+                "[s]",
+                "-f",
+                "ndjson",
+                &dir.join(out).display().to_string(),
+            ]
+            .iter()
+            .map(|a| a.to_string())
+            .collect();
+            let args = crate::parse_args(argv).expect("a command line");
+            let crate::Modules::Network { bindings, wiring } = &args.modules else {
+                panic!("a network");
+            };
+            let carried = run_carrying(&args, bindings, wiring).expect("the run");
+            let rows: Vec<serde_json::Value> = std::fs::read_to_string(dir.join(out))
+                .expect("spots")
+                .lines()
+                .map(|l| serde_json::from_str(l).expect("a row"))
+                .collect();
+            (carried.bytes.load(Ordering::Relaxed), rows)
+        };
+
+        let (bytes, rows) = run(
+            &format!("[v=0:v][size=0:v:1]shape_probe=port={port}[spots=s]"),
+            "timing.ndjson",
+        );
+        assert_eq!(bytes, 10 * 64, "the clock's pictures alone are carried");
+        let sizes: Vec<serde_json::Value> = rows.iter().map(|r| r["size"].clone()).collect();
+        assert_eq!(
+            sizes.iter().take(3).cloned().collect::<Vec<_>>(),
+            vec![
+                serde_json::json!([0]),
+                serde_json::json!([1]),
+                serde_json::json!([2])
+            ],
+            "every frame of the timing input reaches the node, by its time"
+        );
+
+        let (bytes, _) = run(
+            &format!("[v=0:v:1][size=0:v]shape_probe=port={port}[spots=s]"),
+            "bytes.ndjson",
+        );
+        assert_eq!(
+            bytes,
+            10 * 64 * 64 * 4,
+            "the large picture as the clock is carried whole, the small as timing not at all"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

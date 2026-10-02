@@ -40,8 +40,9 @@ rows or data-filter interface is refused.
   binds three to `v`). Absent or empty binds none. A name the shape does
   not declare is refused, and so is an input named twice in the JSON, an
   empty `streams`, a rate that is not positive and a key not listed here.
-  The run asks the shape with the list `NODE-CLI.md` ("Asking the shape
-  again") says; ask with the same one.
+  The run is handed the list each call was asked with as `-bound`
+  (`NODE-CLI.md`, "The shape a call was planned with"), and asks the
+  shape with it again.
 - `-http`, `-udp`, `-tcp` and `-gpu` grant effects the way a run's argv
   does, for a source that reads the network to answer.
 

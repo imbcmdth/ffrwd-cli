@@ -33,6 +33,7 @@ use ffrwd_wasm_runtime::runtime::{AudioFormat, StreamInfo, TimeBase};
 use serde_json::json;
 
 use crate::leaky::ROW_PREFIX;
+use crate::tick::sample_count;
 
 /// How many frames of a source are held ahead of the clock, and how many
 /// bytes: a port feed that outruns the clock waits on its socket past
@@ -969,7 +970,7 @@ fn recut_window(
     let w1 = s1.map(|s1| sample_of(s1, rate, base));
     while let Some(front) = queue.queue.front() {
         let start = sample_of(front.pts, rate, base);
-        let count = (front.data.len() / width) as i128;
+        let count = sample_count(front, width) as i128;
         if start + count <= w0 {
             queue.pop();
             continue;
@@ -980,7 +981,7 @@ fn recut_window(
             let left = TickFrame {
                 pts: pts_of_sample(w0, rate, base),
                 duration: Some(count as i64 - skip as i64),
-                data: Arc::new(front.data[skip * width..].to_vec()),
+                data: Arc::new(front.data.get(skip * width..).unwrap_or_default().to_vec()),
                 rows: Vec::new(),
             };
             queue.bytes += left.data.len();
@@ -988,6 +989,7 @@ fn recut_window(
         }
         break;
     }
+    let timing = queue.queue.front().is_some_and(|f| f.data.is_empty());
     let mut data: Vec<u8> = Vec::new();
     let mut first: Option<i128> = None;
     let mut cursor: i128 = 0;
@@ -996,7 +998,7 @@ fn recut_window(
         if w1.is_some_and(|w1| start >= w1) {
             break;
         }
-        let count = (front.data.len() / width) as i128;
+        let count = sample_count(front, width) as i128;
         if first.is_none() {
             first = Some(start);
             cursor = start;
@@ -1006,7 +1008,9 @@ fn recut_window(
                 Some(w1) => (start - cursor).min(w1 - cursor),
                 None => start - cursor,
             };
-            data.resize(data.len() + hole as usize * width, 0);
+            if !timing {
+                data.resize(data.len() + hole as usize * width, 0);
+            }
             cursor += hole;
             if w1.is_some_and(|w1| cursor >= w1) {
                 break;
@@ -1016,7 +1020,9 @@ fn recut_window(
             Some(w1) => count.min(w1 - start),
             None => count,
         };
-        data.extend_from_slice(&front.data[..take as usize * width]);
+        if !timing {
+            data.extend_from_slice(&front.data[..take as usize * width]);
+        }
         cursor = start + take;
         if take == count {
             queue.pop();
@@ -1025,7 +1031,13 @@ fn recut_window(
             let left = TickFrame {
                 pts: pts_of_sample(start + take, rate, base),
                 duration: Some((count - take) as i64),
-                data: Arc::new(front.data[take as usize * width..].to_vec()),
+                data: Arc::new(
+                    front
+                        .data
+                        .get(take as usize * width..)
+                        .unwrap_or_default()
+                        .to_vec(),
+                ),
                 rows: Vec::new(),
             };
             queue.bytes += left.data.len();
@@ -1034,12 +1046,13 @@ fn recut_window(
         }
     }
     let first = first?;
-    if data.is_empty() {
+    let samples = cursor - first;
+    if samples <= 0 {
         return None;
     }
     Some(TickFrame {
         pts: pts_of_sample(first, rate, base),
-        duration: Some((data.len() / width) as i64),
+        duration: Some(samples as i64),
         data: Arc::new(data),
         rows: Vec::new(),
     })
