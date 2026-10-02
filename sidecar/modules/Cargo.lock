@@ -1796,6 +1796,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "shape-probe"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "wit-bindgen 0.57.1",
+]
+
+[[package]]
 name = "shots"
 version = "0.1.0"
 dependencies = [

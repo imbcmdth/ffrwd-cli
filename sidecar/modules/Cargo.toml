@@ -66,6 +66,7 @@ members = [
     "adapted-0150",
     "adapted-0160",
     "adapted-0170",
+    "shape-probe",
 ]
 resolver = "2"
 

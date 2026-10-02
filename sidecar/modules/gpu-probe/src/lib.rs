@@ -8,7 +8,7 @@
 
 wit_bindgen::generate!({
     path: [
-        "../../wit",
+        "../../worlds/0.18.0",
         "../../vendor/wasi-webgpu-wasmtime/wit/deps/io",
         "../../vendor/wasi-webgpu-wasmtime/wit/deps/graphics-context",
         "../../vendor/wasi-webgpu-wasmtime/wit/deps/webgpu",

@@ -26,7 +26,7 @@
 //! right than handing each call straight back.
 
 wit_bindgen::generate!({
-    path: "../../wit",
+    path: "../../worlds/0.18.0",
     world: "packet-filter-module",
 });
 

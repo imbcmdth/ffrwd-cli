@@ -12,32 +12,36 @@
 //! same windowed driver over a DAG of nodes - a single module is a network of
 //! one.
 
+mod adapters;
 mod codec;
 mod graph;
 mod heartbeat;
 mod leaky;
+mod legacy;
 mod network;
+mod node_loop;
 mod relay;
 mod rowfilter;
 mod rowmerge;
 mod rows_chain;
 mod scheduler;
+mod shape_json;
 mod subtitles;
+mod tick;
 mod windows;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufRead, Read, Write};
-use std::panic::resume_unwind;
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use anyhow::{anyhow, bail, Context, Result};
 use ffrwd_wasm::nut;
 use ffrwd_wasm_runtime::nn;
 use ffrwd_wasm_runtime::runtime::{
-    self, AudioFormat, Emitted, Filter, Format, Frame, Media, StreamInfo, TimeBase, VideoFormat,
+    self, AudioFormat, Filter, Format, Frame, Media, StreamInfo, TimeBase, VideoFormat,
 };
 use serde::{Deserialize, Serialize};
 
@@ -53,6 +57,8 @@ const OUTPUT_FORMATS: [&str; 5] = [EDGE_FORMAT, ROWS_FORMAT, "srt", "webvtt", "n
 /// this binary, independent of any one module's own name and version. Modules
 /// built against an older world load through an adapter.
 const WIT_WORLD: &str = runtime::WORLD_PACKAGE;
+/// What `--describe` names as the world of a module exporting a node.
+const NODE_WORLD_NAME: &str = "node-module";
 
 /// `-annotations` values: read the rows an upstream sidecar sent, and write
 /// this module's rows for a downstream one.
@@ -472,6 +478,7 @@ fn tag_row(row: &str, arg: &str) -> Result<String> {
     Ok(value.to_string())
 }
 
+#[derive(Clone)]
 enum OutputPath {
     Stdout,
     File(String),
@@ -1884,7 +1891,7 @@ fn run(args: &Args) -> Result<()> {
                     args.inputs.len()
                 );
             }
-            return run_packet_source(args, path, params);
+            return legacy::run_packet_source(args, path, params);
         }
     }
 
@@ -1914,7 +1921,7 @@ fn run(args: &Args) -> Result<()> {
                      no argument for them to fill"
                 );
             }
-            return run_rows_module(args, path, params, &read.path);
+            return legacy::run_rows_module(args, path, params, &read.path);
         }
     }
     // A packet filter reads a stream, so it is dispatched below with the
@@ -1992,7 +1999,7 @@ fn run(args: &Args) -> Result<()> {
         let is_data_filter = ffrwd_wasm_runtime::runtime::exports_data_filter(path)
             .with_context(|| format!("opening module {path}"))?;
         if is_data_filter {
-            return run_data_filter(args, path, params);
+            return legacy::run_data_filter(args, path, params);
         }
     }
 
@@ -2001,7 +2008,7 @@ fn run(args: &Args) -> Result<()> {
     // and drain them from the first byte.
     if packet_filter {
         if let Modules::Single { path, params } = &args.modules {
-            return run_packet_filter(args, path, params);
+            return legacy::run_packet_filter(args, path, params);
         }
     }
 
@@ -2013,7 +2020,7 @@ fn run(args: &Args) -> Result<()> {
         let is_packet_sink = ffrwd_wasm_runtime::runtime::exports_packet_sink(path)
             .with_context(|| format!("opening module {path}"))?;
         if is_packet_sink {
-            return run_packet_sink(args, path, params);
+            return legacy::run_packet_sink(args, path, params);
         }
     }
 
@@ -2124,817 +2131,6 @@ fn run(args: &Args) -> Result<()> {
             run_lanes(net, readers, &formats, sinks, args.jobs)
         }
     }
-}
-
-/// The encoded inputs of a packet sink through ONE instance: packets handed
-/// through untouched, in decode order per pad, rows to the row outputs. No
-/// frames leave, so the only outputs are rows and null.
-///
-/// Pads run independently. Packets are not frames: nothing pairs a pad's
-/// packet with another pad's, so there is no lockstep to hold and a call may
-/// carry packets on some pads and none on others. One reader thread per pad
-/// takes blocking reads off its pipe into a byte-bounded queue, and the
-/// drive loop hands the module whatever has arrived: ONE producer feeding
-/// pads at unequal packet rates interleaves its writes by dts, so a loop
-/// that waited on a specific pad would deadlock against the producer's own
-/// blocking write once the other pads' pipes filled. The queue bound is the
-/// flow control: a stalled consumer stops the producer instead of buffering
-/// it without limit. The wasm instance is called from this thread alone;
-/// only the I/O grows threads. A sink nothing has reached for [`SINK_IDLE`]
-/// is called with no packets, so a module running a session inside its
-/// calls keeps it running between them.
-fn run_packet_sink(args: &Args, module: &str, params: &str) -> Result<()> {
-    // A packet sink is an exclusive lane by nature: packets reach it in
-    // decode order, so one instance reads them and `-jobs` caps nothing.
-    if args.annotations.input {
-        bail!(
-            "a packet sink reads encoded packets and no rows arrive with them, so -annotations \
-             {ANNOTATIONS_IN} has nothing to give it"
-        );
-    }
-
-    let mut row_outputs: Vec<RowOutput> = Vec::new();
-    for output in &args.outputs {
-        match output.kind {
-            OutputKind::Rows => row_outputs.push(RowOutput::open(&output.path)?),
-            // A null output opens nothing; the module's own effects are the
-            // product.
-            OutputKind::Null => {}
-            _ => bail!(
-                "{}: a packet sink emits rows alone; its outputs are -f {ROWS_FORMAT} and -f null",
-                output.spelling
-            ),
-        }
-    }
-
-    // The readers start before anything else: each opens its own input and
-    // pumps packets into its bounded queue from the first byte, so a fast
-    // producer (a live microphone, say) is drained while a slow one's
-    // whole chain still warms up, and while the module's own open - which
-    // may dial a relay - takes its time. The threads are not joined: on an
-    // error the process exits and takes a reader blocked in a pipe read
-    // with it, which a join would wait on forever.
-    let pads = args.inputs.len();
-    let queues = Arc::new(PadQueues::new(pads));
-    let headers = spawn_pad_readers(&args.inputs, &queues, false);
-
-    // The headers arrive in whatever order the producers start; the module
-    // is opened once every pad has reported its stream.
-    let mut streams: Vec<Option<nut::Stream>> = (0..pads).map(|_| None).collect();
-    for _ in 0..pads {
-        let (pad, stream) = headers.recv().expect("every reader reports its header");
-        streams[pad] = Some(stream.with_context(|| format!("input {pad}"))?);
-    }
-    let mut sink_inputs = Vec::with_capacity(pads);
-    for (pad, stream) in streams.iter().enumerate() {
-        let stream = stream.as_ref().expect("every pad reported");
-        let (row, rendition) = resolve_pad(&args.pads, pad);
-        sink_inputs.push(coded_pad(args, module, pad, stream, row, rendition.into())?);
-    }
-    let mut sink = runtime::PacketSink::open(module, &sink_inputs, params)
-        .with_context(|| format!("opening module {module}"))?;
-    let data: Vec<bool> = streams
-        .iter()
-        .map(|s| s.as_ref().is_some_and(nut::Stream::is_json))
-        .collect();
-
-    // The last batch of packets rides the final call, which is what the
-    // interface says `last` carries: whatever is left. A sink nothing has
-    // reached for `SINK_IDLE` is called with empty pads, see there.
-    let mut called = Instant::now();
-    let outcome = (|| -> Result<Emitted> {
-        loop {
-            let (mut carried, last) = queues.take_until(Some(called + SINK_IDLE))?;
-            // A heartbeat is no message, and a sink is handed messages alone.
-            drop_heartbeats(&mut carried, &data);
-            if !last && carried.iter().all(Vec::is_empty) && called.elapsed() < SINK_IDLE {
-                continue;
-            }
-            let emitted = sink.process(&carried, last).with_context(|| {
-                let which = if last {
-                    "the final call"
-                } else {
-                    "processing packets"
-                };
-                format!("{}: {which}", sink.name())
-            })?;
-            called = Instant::now();
-            if last {
-                return Ok(emitted);
-            }
-            for writer in &mut row_outputs {
-                writer.write_batch(&emitted.rows)?;
-            }
-        }
-    })();
-    // A reader still waiting for queue space must wake and stop.
-    queues.close();
-    let emitted = outcome?;
-
-    for writer in &mut row_outputs {
-        writer.write_batch(&emitted.rows)?;
-        writer.write_batch(&emitted.trailing)?;
-        writer.flush()?;
-    }
-    Ok(())
-}
-
-/// How long a packet sink goes without a call before it is called with no
-/// packets at all. A module runs only inside a host call, and one that drives
-/// something of its own there - a network session, whose acknowledgements
-/// arrive between packets - would otherwise stand still for as long as its
-/// packets do: a stream relayed from elsewhere arrives in lumps a second
-/// apart. A fiftieth of a second is less than one AAC frame, so a sink fed
-/// live sound is called about as often as it already was, and less than a
-/// round trip to a public relay; a call with nothing to do costs a module
-/// microseconds.
-///
-/// A packet filter is not called idle: what it writes is packets, and those
-/// come only with packets.
-const SINK_IDLE: Duration = Duration::from_millis(20);
-
-/// The encoded inputs of a packet filter through ONE instance: packets in,
-/// packets out, with `-rows-in`'s rows arriving beside them.
-///
-/// The packet side is a sink's, pad for pad - one reader thread per `-i`
-/// into a byte-bounded queue, the drive loop handing over whatever arrived -
-/// and the difference is the other end: each pad has an `-f nut` output,
-/// written from the header `init` answered for it, and one writer thread per
-/// output so a pad whose consumer is slow blocks alone. The filter's own
-/// rows, if it emits any, go to an `-f ndjson` output as a sink's do. A data
-/// pad leaves as the JSON stream it arrived as, each batch flushed as it is
-/// written like every other pad's.
-///
-/// Rows arrive on their own schedule. The reader thread fills a bounded
-/// queue from the first line, and every call is handed whatever is in it -
-/// none while packets outrun the rows, several at once when they do not.
-/// Nothing here pairs a row with a packet: the row carries its own time and
-/// the module decides where it belongs, which is what lets a file of rows
-/// written by an earlier stage and a live feed arriving mid-run be the same
-/// input. On the final call the queue is drained to the end of the rows
-/// input, so nothing written is left unseen.
-fn run_packet_filter(args: &Args, module: &str, params: &str) -> Result<()> {
-    if args.annotations.input || args.annotations.output {
-        bail!(
-            "a packet filter carries encoded packets, not frames, so -annotations has nothing \
-             to give or take here; its rows arrive through -rows-in"
-        );
-    }
-
-    let mut pad_outputs: Vec<&OutputSpec> = Vec::new();
-    let mut row_outputs: Vec<RowOutput> = Vec::new();
-    for output in &args.outputs {
-        match output.kind {
-            OutputKind::Frames => pad_outputs.push(output),
-            OutputKind::Rows => row_outputs.push(RowOutput::open(&output.path)?),
-            OutputKind::Null => {}
-            _ => bail!(
-                "{}: a packet filter writes encoded packets and rows; its outputs are \
-                 -f {EDGE_FORMAT}, -f {ROWS_FORMAT} and -f null",
-                output.spelling
-            ),
-        }
-    }
-    let pads = args.inputs.len();
-    if pad_outputs.len() != pads {
-        bail!(
-            "{module} hands on the packets of every pad it reads: {pads} -i input(s) need \
-             {pads} -f {EDGE_FORMAT} output(s), and this command gives {}",
-            pad_outputs.len()
-        );
-    }
-
-    // The rows reader starts here, with the pad readers and before the
-    // module is opened. Starting it after the open is a race the rows lose:
-    // the pads have been filling their queues since before it, so a short
-    // input can be entirely in the module's hands by the time the first row
-    // is read, and where a module puts a row would depend on which thread
-    // won. The open still happens on the reader's own thread, since a named
-    // pipe blocks on open until its writer arrives.
-    //
-    // Several `-rows-in` are several readers filling ONE queue, so every
-    // argument's rows reach the module through the one `rows` list and each
-    // row says which argument it came from. The byte bound is the queue's,
-    // not each reader's: together they hold what one file's rows would.
-    let rows = Arc::new(RowsQueue::new(args.rows_in.len().max(1)));
-    // Decided here rather than on the readers: `metadata` answers at once
-    // where opening a pipe would block. Every input a file is what lets the
-    // rows settle before packet one; one pipe among them and none of them
-    // wait, since packets never wait on a pipe.
-    let rows_from_file =
-        !args.rows_in.is_empty() && args.rows_in.iter().all(|r| is_a_file(&r.path));
-    if args.rows_in.is_empty() {
-        rows.close_one();
-    }
-    for read in &args.rows_in {
-        let read = read.clone();
-        let queue = Arc::clone(&rows);
-        std::thread::spawn(move || match open_input(&read.path) {
-            Ok(reader) => read_rows(reader, &queue, read.arg.as_deref()),
-            Err(error) => queue.fail(error.context("opening -rows-in")),
-        });
-    }
-
-    // The readers start before anything else, for the reason a packet
-    // sink's do: each drains its own input from the first byte, so a fast
-    // producer is not held up by a slow one's warmup or by the module's own
-    // open. The threads are not joined - see `run_packet_sink`.
-    let queues = Arc::new(PadQueues::new(pads));
-    let headers = spawn_pad_readers(&args.inputs, &queues, false);
-
-    let mut streams: Vec<Option<nut::Stream>> = (0..pads).map(|_| None).collect();
-    for _ in 0..pads {
-        let (pad, stream) = headers.recv().expect("every reader reports its header");
-        streams[pad] = Some(stream.with_context(|| format!("input {pad}"))?);
-    }
-    let streams: Vec<nut::Stream> = streams
-        .into_iter()
-        .map(|s| s.expect("every pad reported"))
-        .collect();
-    let mut inputs = Vec::with_capacity(pads);
-    for (pad, stream) in streams.iter().enumerate() {
-        let (row, rendition) = resolve_pad(&args.pads, pad);
-        inputs.push(coded_pad(args, module, pad, stream, row, rendition.into())?);
-    }
-    let mut filter = runtime::PacketFilter::open(module, &inputs, params)
-        .with_context(|| format!("opening module {module}"))?;
-
-    // A filter that acts on rows and is given none would run blind, so it
-    // is refused instead. The reader itself started above.
-    if args.rows_in.is_empty() && filter.reads_rows() {
-        bail!(
-            "{} reads the rows woven into its packets, and this command gives it none; \
-             name them with -rows-in <path>",
-            filter.name()
-        );
-    }
-
-    // A FILE's rows are all there to be read, so they are read before the
-    // first call rather than raced against it: a module is handed every row
-    // that fits in the queue before it sees packet one, and where a record
-    // lands is the module's decision rather than the scheduler's. SEVERAL
-    // files share that one bound, so what settles is the first megabyte of
-    // all of them together, in whatever order their readers interleaved;
-    // past it they fill the queue and the rest arrive as the module drains
-    // it. Nothing waits on a pipe or on stdin: nothing says when their rows
-    // arrive, and packets do not stop for them.
-    if rows_from_file {
-        rows.settle()?;
-    }
-
-    // One writer per output, each on its own pipe: a reader opens its inputs
-    // one at a time, so a single loop writing every pad would stop on the
-    // first full pipe with the packets that would drain it unsent. The
-    // channels hold one batch, which overlaps a write with the next call and
-    // bounds what a stalled consumer can pile up.
-    let mut senders = Vec::with_capacity(pads);
-    let mut writers = Vec::with_capacity(pads);
-    for (pad, output) in pad_outputs.iter().enumerate() {
-        // The codec, geometry and time base are the arriving stream's and
-        // not a filter's to change, so the header written is the input's
-        // own; only the out-of-band header is what `init` answered.
-        let mut header = streams[pad].clone();
-        header.extradata = filter.streams()[pad].extradata.clone();
-        let muxer = open_frame_output(&output.path, &header, false)
-            .with_context(|| format!("opening output {}", output.spelling))?;
-        let (sender, batches) = mpsc::sync_channel::<Vec<runtime::Packet>>(1);
-        let spelling = output.spelling.clone();
-        senders.push(sender);
-        writers.push(thread::spawn(move || {
-            write_track(muxer, &batches).with_context(|| format!("writing output {spelling}"))
-        }));
-    }
-
-    // The last batch of packets rides the final call: a filter holding
-    // something back places it on a real last carrier instead of holding a
-    // packet out of the stream for the whole run. The rows that arrive with
-    // it are the rest of the rows input.
-    //
-    // A heartbeat on a data pad is no message, so the module never sees it;
-    // it leaves on that pad's output after whatever the call wrote there, so
-    // time keeps reaching the reader downstream.
-    let data: Vec<bool> = streams.iter().map(nut::Stream::is_json).collect();
-    let mut beats: Vec<heartbeat::Beats> = streams
-        .iter()
-        .map(|s| {
-            heartbeat::Beats::new(TimeBase {
-                num: s.time_base.num,
-                den: s.time_base.den,
-            })
-        })
-        .collect();
-    let mut sending = true;
-    let outcome = (|| -> Result<runtime::Filtered> {
-        loop {
-            let (mut carried, last) = queues.take()?;
-            let heard = drop_heartbeats(&mut carried, &data);
-            let arrived = if last {
-                rows.drain_to_end()?
-            } else {
-                rows.take()?.0
-            };
-            if !last && arrived.is_empty() && carried.iter().all(Vec::is_empty) {
-                for (pad, pts) in heard.into_iter().enumerate() {
-                    if let Some(pts) = pts.and_then(|pts| beats[pad].pass(pts)) {
-                        sending &= senders[pad].send(vec![heartbeat_packet(pts)]).is_ok();
-                    }
-                }
-                if !sending {
-                    break;
-                }
-                continue;
-            }
-            let filtered = filter.process(&carried, &arrived, last).with_context(|| {
-                let which = if last {
-                    "the final call"
-                } else {
-                    "processing packets"
-                };
-                format!("{}: {which}", filter.name())
-            })?;
-            if last {
-                return Ok(filtered);
-            }
-            for (pad, mut packets) in filtered.pads.into_iter().enumerate() {
-                if data[pad] {
-                    for packet in &mut packets {
-                        packet.pts = beats[pad].place(packet.pts);
-                        packet.dts = Some(packet.pts);
-                    }
-                    let beat = heard[pad].and_then(|pts| beats[pad].pass(pts));
-                    packets.extend(beat.map(heartbeat_packet));
-                }
-                if !packets.is_empty() {
-                    sending &= senders[pad].send(packets).is_ok();
-                }
-            }
-            for writer in &mut row_outputs {
-                writer.write_batch(&filtered.rows)?;
-            }
-            if !sending {
-                // Every output's writer has stopped; its failure is what
-                // `join` below hands back.
-                break;
-            }
-        }
-        filter
-            .process(&vec![Vec::new(); pads], &[], true)
-            .with_context(|| format!("{}: the final call", filter.name()))
-    })();
-    // A reader still waiting for queue space must wake and stop.
-    queues.close();
-    rows.close();
-    let filtered = outcome?;
-
-    for (pad, mut packets) in filtered.pads.into_iter().enumerate() {
-        if data[pad] {
-            for packet in &mut packets {
-                packet.pts = beats[pad].place(packet.pts);
-                packet.dts = Some(packet.pts);
-            }
-        }
-        if !packets.is_empty() {
-            // A send fails only once that output's writer has stopped, and
-            // its failure is what `join` below hands back.
-            let _ = senders[pad].send(packets);
-        }
-    }
-    drop(senders);
-    for writer in &mut row_outputs {
-        writer.write_batch(&filtered.rows)?;
-        writer.write_batch(&filtered.trailing)?;
-        writer.flush()?;
-    }
-
-    let mut wrote = Ok(());
-    for writer in writers {
-        let written = writer.join().unwrap_or_else(|panic| resume_unwind(panic));
-        if wrote.is_ok() {
-            wrote = written;
-        }
-    }
-    wrote
-}
-
-/// A data filter through ONE instance: messages on its data pads and the
-/// time on its clock pads in, messages and rows out.
-///
-/// Every `-i` is a NUT, in the order the call names its arguments. A JSON
-/// stream is a DATA pad; a video or audio stream, raw or coded, is a CLOCK
-/// pad, read for its frames' pts alone. Each input is read on a thread of
-/// its own into a bounded queue, the way a packet sink's are.
-///
-/// With a clock pad the module is called once each time the first clock
-/// pad's pts advances, with `now` that pts: the clock is what drives it,
-/// whether or not a message arrived. The messages a call carries are those
-/// that have arrived and are not ahead of the clock - a message at a pts the
-/// clock has not reached waits for it, so a module writing on both its clock
-/// and its messages sees them in programme order. A data pad read from a
-/// regular file is all there to be read, so the clock waits for it to be
-/// read past each frame rather than racing it; a pipe is never waited for,
-/// since a live data stream may say nothing for minutes. Once the first
-/// clock pad has ended the messages are no longer held: each batch that
-/// arrives is a call, `now` staying where the clock stopped. Without a clock
-/// pad every batch that arrives is a call, with no `now`. The final call is
-/// made once every input has ended, and carries whatever is left.
-///
-/// Each output is a JSON NUT in the module's own time base, one `-f nut` per
-/// entry of its `outputs`, written by a thread of its own so a slow reader
-/// of one holds up none of the others. What a call returns is handed to the
-/// writers the moment it returns, and each writes and flushes it at once:
-/// a message may announce something ahead of the media it is about, so it
-/// is never held for a later call or for a buffer to fill. Rows go to an
-/// `-f ndjson` output as a sink's do.
-///
-/// Every output also carries heartbeats (see `heartbeat`): one at pts 0 the
-/// moment its header is out, before any input has said what it carries, since
-/// the ffmpeg reading it may be the one writing the clock and opens every
-/// input before it writes anything; then one each time the clock moves on
-/// with nothing written on that output for a tenth of a second. Without a
-/// clock pad the time is how far the data pads have been read, heartbeats
-/// arriving on them included. A heartbeat arriving on a data pad moves time
-/// on and is never handed to the module.
-fn run_data_filter(args: &Args, module: &str, params: &str) -> Result<()> {
-    if args.annotations.input || args.annotations.output {
-        bail!(
-            "a data filter reads and writes data streams, not frames, so -annotations has \
-             nothing to give or take here"
-        );
-    }
-    if args.pads.iter().any(Option::is_some) {
-        bail!("-pad follows a packet sink's -i; {module} is a data filter");
-    }
-
-    // The readers start before anything else, for the reason a packet
-    // sink's do: each drains its own input from the first byte.
-    let pads = args.inputs.len();
-    let queues = Arc::new(PadQueues::new(pads));
-    let headers = spawn_pad_readers(&args.inputs, &queues, true);
-
-    let mut filter =
-        runtime::DataFilter::load(module).with_context(|| format!("opening module {module}"))?;
-    let described = filter.described().clone();
-    let mut data_outputs: Vec<&OutputSpec> = Vec::new();
-    let mut row_outputs: Vec<RowOutput> = Vec::new();
-    for output in &args.outputs {
-        match output.kind {
-            OutputKind::Frames => data_outputs.push(output),
-            OutputKind::Rows => row_outputs.push(RowOutput::open(&output.path)?),
-            OutputKind::Null => {}
-            _ => bail!(
-                "{}: a data filter writes data streams and rows; its outputs are \
-                 -f {EDGE_FORMAT}, -f {ROWS_FORMAT} and -f null",
-                output.spelling
-            ),
-        }
-    }
-    if data_outputs.len() != described.outputs.len() {
-        bail!(
-            "{} writes {} data stream(s), and this command gives {} -f {EDGE_FORMAT} output(s)",
-            described.meta.name,
-            described.outputs.len(),
-            data_outputs.len()
-        );
-    }
-
-    // Every output's header and first heartbeat go out before anything is
-    // waited on, so a reader opening it is not left waiting on a message that
-    // may be minutes off, nor on a clock it writes itself.
-    let out_base = nut::TimeBase {
-        num: described.time_base.num,
-        den: described.time_base.den,
-    };
-    let mut senders = Vec::with_capacity(data_outputs.len());
-    let mut writers = Vec::with_capacity(data_outputs.len());
-    let mut beats = Vec::with_capacity(data_outputs.len());
-    for output in &data_outputs {
-        let mut muxer = open_frame_output(&output.path, &nut::Stream::json(out_base), false)
-            .with_context(|| format!("opening output {}", output.spelling))?;
-        let mut beat = heartbeat::Beats::new(described.time_base);
-        write_coded_packet(&mut muxer, &heartbeat_packet(beat.place(0)))
-            .and_then(|()| Ok(muxer.flush()?))
-            .with_context(|| format!("writing output {}", output.spelling))?;
-        beats.push(beat);
-        let (sender, batches) = mpsc::channel::<Vec<runtime::Packet>>();
-        let spelling = output.spelling.clone();
-        senders.push(sender);
-        writers.push(thread::spawn(move || {
-            write_track(muxer, &batches).with_context(|| format!("writing output {spelling}"))
-        }));
-    }
-
-    let mut streams: Vec<Option<nut::Stream>> = (0..pads).map(|_| None).collect();
-    for _ in 0..pads {
-        let (pad, stream) = headers.recv().expect("every reader reports its header");
-        streams[pad] = Some(stream.with_context(|| format!("input {pad}"))?);
-    }
-    let mut data_pads = Vec::with_capacity(pads);
-    for (pad, stream) in streams.iter().enumerate() {
-        let stream = stream.as_ref().expect("every pad reported");
-        data_pads.push(data_pad(module, pad, stream)?);
-    }
-    filter
-        .init(&data_pads, params)
-        .with_context(|| format!("opening module {module}"))?;
-
-    let clock = data_pads
-        .iter()
-        .position(|p| p.kind == runtime::PadKind::Clock);
-    let settled = data_pads
-        .iter()
-        .zip(&args.inputs)
-        .map(|(pad, path)| pad.kind == runtime::PadKind::Data && is_a_file(path))
-        .collect();
-    let mut drive = DataDrive::new(&data_pads, settled, clock);
-    let mut sending = true;
-    let outcome = (|| -> Result<()> {
-        loop {
-            let (carried, ended, last) = queues.take_ended()?;
-            let calls = drive.arrive(carried, &ended, last);
-            for call in calls {
-                let processed = filter
-                    .process(&call.input, call.now, call.last)
-                    .with_context(|| {
-                        let which = if call.last {
-                            "the final call"
-                        } else {
-                            "processing messages"
-                        };
-                        format!("{}: {which}", filter.name())
-                    })?;
-                // The clock moved on: an output quiet for a tenth of a second
-                // says so.
-                let clocked = call
-                    .now
-                    .zip(clock.map(|pad| data_pads[pad].time_base))
-                    .filter(|_| !call.last);
-                for (index, messages) in processed.outputs.into_iter().enumerate() {
-                    let mut packets: Vec<runtime::Packet> = messages
-                        .into_iter()
-                        .map(|m| message_packet(beats[index].place(m.pts), m.data))
-                        .collect();
-                    if let Some((now, base)) = clocked {
-                        packets.extend(beats[index].due(now, base).map(heartbeat_packet));
-                    }
-                    if !packets.is_empty() {
-                        sending &= senders[index].send(packets).is_ok();
-                    }
-                }
-                for writer in &mut row_outputs {
-                    writer.write_batch(&processed.rows)?;
-                }
-            }
-            // Without a clock, time is as far as the data pads have been read.
-            let heard = drive.heard().filter(|_| clock.is_none() && !last);
-            if let Some((heard, base)) = heard {
-                for (index, beat) in beats.iter_mut().enumerate() {
-                    if let Some(pts) = beat.due(heard, base) {
-                        sending &= senders[index].send(vec![heartbeat_packet(pts)]).is_ok();
-                    }
-                }
-            }
-            if last || !sending {
-                return Ok(());
-            }
-        }
-    })();
-    queues.close();
-    outcome?;
-    drop(senders);
-    for writer in &mut row_outputs {
-        writer.flush()?;
-    }
-
-    let mut wrote = Ok(());
-    for writer in writers {
-        let written = writer.join().unwrap_or_else(|panic| resume_unwind(panic));
-        if wrote.is_ok() {
-            wrote = written;
-        }
-    }
-    wrote
-}
-
-/// One argument of a data filter, from the NUT header its input opened with:
-/// a JSON stream is a data pad, and a video or audio stream - raw or coded -
-/// is a clock pad.
-fn data_pad(module: &str, pad: usize, stream: &nut::Stream) -> Result<runtime::DataPad> {
-    let time_base = TimeBase {
-        num: stream.time_base.num,
-        den: stream.time_base.den,
-    };
-    if stream.is_json() {
-        return Ok(runtime::DataPad {
-            kind: runtime::PadKind::Data,
-            codec: DATA_CODEC.to_string(),
-            time_base,
-        });
-    }
-    match stream.media {
-        nut::Media::Video { .. } | nut::Media::Audio { .. } => Ok(runtime::DataPad {
-            kind: runtime::PadKind::Clock,
-            codec: String::new(),
-            time_base,
-        }),
-        nut::Media::Other { .. } => bail!(
-            "{module} reads data streams and clocks, and input {pad} carries a {} stream \
-             tagged {}; a data pad is {DATA_CODEC}, a clock pad video or audio",
-            stream.kind(),
-            stream.fourcc_name()
-        ),
-    }
-}
-
-/// One call a data filter's drive loop makes.
-struct DataCall {
-    /// One list per pad, in pad order; empty for a clock pad.
-    input: Vec<Vec<runtime::Message>>,
-    now: Option<i64>,
-    last: bool,
-}
-
-/// What a data filter's drive loop holds between batches: the messages that
-/// have arrived and not yet been handed over, the clock frames not yet
-/// called for, and where the clock is.
-struct DataDrive {
-    /// Every pad's time base, and whether it is a data pad.
-    pads: Vec<(TimeBase, bool)>,
-    /// The data pads read from a regular file. Their messages are all there
-    /// to be read, so the clock waits for them rather than racing them.
-    settled: Vec<bool>,
-    /// The first clock pad, which drives the calls; None without one.
-    clock: Option<usize>,
-    /// Messages arrived and not yet handed over, per pad, in arrival order.
-    held: Vec<VecDeque<runtime::Message>>,
-    /// The pts of the last message each pad has delivered: how far it has
-    /// been read.
-    read_to: Vec<Option<i64>>,
-    /// Which pads have ended.
-    ended: Vec<bool>,
-    /// The first clock pad's frames not yet called for, by pts.
-    ticks: VecDeque<i64>,
-    /// The first clock pad's latest pts, which is `now`.
-    now: Option<i64>,
-}
-
-impl DataDrive {
-    fn new(pads: &[runtime::DataPad], settled: Vec<bool>, clock: Option<usize>) -> DataDrive {
-        DataDrive {
-            pads: pads
-                .iter()
-                .map(|p| (p.time_base, p.kind == runtime::PadKind::Data))
-                .collect(),
-            settled,
-            clock,
-            held: pads.iter().map(|_| VecDeque::new()).collect(),
-            read_to: vec![None; pads.len()],
-            ended: vec![false; pads.len()],
-            ticks: VecDeque::new(),
-            now: None,
-        }
-    }
-
-    /// Takes one batch off the queues and answers the calls it makes, in
-    /// order. `ended` says which pads have ended by this batch, and `last`
-    /// that every one has, in which case the final call is among those
-    /// answered.
-    fn arrive(
-        &mut self,
-        carried: Vec<Vec<runtime::Packet>>,
-        ended: &[bool],
-        last: bool,
-    ) -> Vec<DataCall> {
-        for (pad, packets) in carried.into_iter().enumerate() {
-            if self.pads[pad].1 {
-                // A heartbeat says how far the pad has been read, and is no
-                // message.
-                if let Some(packet) = packets.last() {
-                    self.read_to[pad] = Some(packet.pts);
-                }
-                self.held[pad].extend(
-                    packets
-                        .into_iter()
-                        .filter(|p| !heartbeat::is_heartbeat(&p.data))
-                        .map(|p| runtime::Message {
-                            pts: p.pts,
-                            data: p.data,
-                        }),
-                );
-            } else if Some(pad) == self.clock {
-                self.ticks.extend(packets.into_iter().map(|p| p.pts));
-            }
-        }
-        self.ended.copy_from_slice(ended);
-
-        let mut calls = Vec::new();
-        while let Some(&pts) = self.ticks.front() {
-            // A call is made as the clock advances; a frame at or behind the
-            // last one moves nothing.
-            if self.now.is_some_and(|now| pts <= now) {
-                self.ticks.pop_front();
-                continue;
-            }
-            if !self.caught_up(pts) {
-                break;
-            }
-            self.ticks.pop_front();
-            self.now = Some(pts);
-            let input = self.release(Some(pts));
-            calls.push(DataCall {
-                input,
-                now: Some(pts),
-                last: false,
-            });
-        }
-        // Once the clock has ended, nothing is held for it any more.
-        let clock_done = self
-            .clock
-            .is_none_or(|clock| self.ended[clock] && self.ticks.is_empty());
-        if clock_done {
-            let input = self.release(None);
-            if input.iter().any(|m| !m.is_empty()) {
-                calls.push(DataCall {
-                    input,
-                    now: self.now,
-                    last: false,
-                });
-            }
-        }
-        if last {
-            // The final call rides the last one this batch made, or is one
-            // of its own when the batch made none.
-            match calls.last_mut() {
-                Some(call) => call.last = true,
-                None => calls.push(DataCall {
-                    input: self.release(None),
-                    now: self.now,
-                    last: true,
-                }),
-            }
-        }
-        calls
-    }
-
-    /// The furthest any data pad has been read, and the time base it counts
-    /// in; None before any has delivered a packet.
-    fn heard(&self) -> Option<(i64, TimeBase)> {
-        let mut furthest: Option<(i64, TimeBase)> = None;
-        for (pad, read) in self.read_to.iter().enumerate() {
-            let Some(pts) = *read else { continue };
-            let base = self.pads[pad].0;
-            if furthest.is_none_or(|(at, at_base)| !not_after(pts, base, at, at_base)) {
-                furthest = Some((pts, base));
-            }
-        }
-        furthest
-    }
-
-    /// Whether every data pad read from a file has been read past `now` on
-    /// the first clock pad's clock, or has ended: until it has, a message it
-    /// has yet to deliver may belong before that frame.
-    fn caught_up(&self, now: i64) -> bool {
-        let Some(clock) = self.clock.map(|clock| self.pads[clock].0) else {
-            return true;
-        };
-        (0..self.pads.len())
-            .filter(|pad| self.settled[*pad] && !self.ended[*pad])
-            .all(|pad| {
-                self.read_to[pad].is_some_and(|pts| !not_after(pts, self.pads[pad].0, now, clock))
-            })
-    }
-
-    /// The held messages up to `now` on the first clock pad's clock, one
-    /// list per pad, or all of them without one. A pad's messages leave in
-    /// the order they arrived, so one ahead of the clock holds back those
-    /// behind it too.
-    fn release(&mut self, now: Option<i64>) -> Vec<Vec<runtime::Message>> {
-        let clock_base = self.clock.map(|clock| self.pads[clock].0);
-        let mut released: Vec<Vec<runtime::Message>> = Vec::with_capacity(self.held.len());
-        for (pad, held) in self.held.iter_mut().enumerate() {
-            let base = self.pads[pad].0;
-            let mut out = Vec::new();
-            while let Some(message) = held.front() {
-                let due = match (now, clock_base) {
-                    (Some(now), Some(clock)) => not_after(message.pts, base, now, clock),
-                    _ => true,
-                };
-                if !due {
-                    break;
-                }
-                out.push(held.pop_front().expect("front is some"));
-            }
-            released.push(out);
-        }
-        released
-    }
-}
-
-/// Whether `pts` in `base` is at or before `now` in `clock`, compared
-/// exactly: `pts * base` against `now * clock` as fractions of a second.
-fn not_after(pts: i64, base: TimeBase, now: i64, clock: TimeBase) -> bool {
-    let left = i128::from(pts) * i128::from(base.num) * i128::from(clock.den);
-    let right = i128::from(now) * i128::from(clock.num) * i128::from(base.den);
-    left <= right
 }
 
 /// One message as the packet a data output carries: every message stands
@@ -3172,56 +2368,6 @@ fn read_ndjson_rows(reader: InputReader) -> Result<Vec<String>> {
         .context("reading -rows-in")
 }
 
-/// A rows module through ONE instance: no stream at all, so nothing paces
-/// it the way a frame or a packet does. `-rows-in`'s whole file is read
-/// first, then `process` is called once with every row, then `finish` -
-/// there is no batching to choose, since a rows module is handed no
-/// producer to batch against.
-fn run_rows_module(
-    args: &Args,
-    module_path: &str,
-    params: &str,
-    rows_in: &InputPath,
-) -> Result<()> {
-    if args.annotations.input || args.annotations.output {
-        bail!(
-            "{module_path}: a rows module reads no stream and writes none, so -annotations has \
-             nothing to carry rows on"
-        );
-    }
-
-    let mut row_outputs: Vec<RowOutput> = Vec::new();
-    for output in &args.outputs {
-        match output.kind {
-            OutputKind::Rows => row_outputs.push(RowOutput::open(&output.path)?),
-            OutputKind::Null => {}
-            _ => bail!(
-                "{}: a rows module emits rows alone; its outputs are -f {ROWS_FORMAT} and -f null",
-                output.spelling
-            ),
-        }
-    }
-
-    let rows = read_ndjson_rows(open_input(rows_in)?)?;
-
-    let mut module = runtime::RowsModule::open(module_path, params)
-        .with_context(|| format!("opening module {module_path}"))?;
-    let mut emitted = module
-        .process(&rows)
-        .with_context(|| format!("{}: processing rows", module.name()))?;
-    emitted.extend(
-        module
-            .finish()
-            .with_context(|| format!("{}: finish", module.name()))?,
-    );
-
-    for writer in &mut row_outputs {
-        writer.write_batch(&emitted)?;
-        writer.flush()?;
-    }
-    Ok(())
-}
-
 /// How many buffered bytes one pad's reader may hold before it waits for
 /// the drive loop to drain. The one producer interleaves its pads by dts,
 /// so while it writes a slow pad's next packet the fast pads' packets keep
@@ -3291,18 +2437,14 @@ impl PadQueues {
     }
 
     /// Everything queued so far, one list per pad, waiting until at least
-    /// one pad has packets. The flag says this is the LAST batch: every pad
-    /// has closed and this call drained the rest of it, so nothing more will
-    /// arrive. It rides with the packets rather than after them, which is
-    /// what lets a module place what it held back on a real last carrier
-    /// instead of holding a packet back for the whole run. A pad's stored
-    /// read error is raised here, on the drive loop's thread.
-    fn take(&self) -> Result<(Vec<Vec<runtime::Packet>>, bool)> {
-        self.take_until(None)
-    }
-
-    /// `take`, giving up at `deadline`: past it, with nothing queued, it
-    /// answers an empty list per pad that is not the last.
+    /// one pad has packets, or until `deadline` where there is one: past it,
+    /// with nothing queued, it answers an empty list per pad that is not the
+    /// last. The flag says this is the LAST batch: every pad has closed and
+    /// this call drained the rest of it, so nothing more will arrive. It
+    /// rides with the packets rather than after them, which is what lets a
+    /// module place what it held back on a real last carrier instead of
+    /// holding a packet back for the whole run. A pad's stored read error is
+    /// raised here, on the drive loop's thread.
     fn take_until(&self, deadline: Option<Instant>) -> Result<(Vec<Vec<runtime::Packet>>, bool)> {
         let mut state = self.state.lock().expect("a reader panicked with the lock");
         loop {
@@ -3347,11 +2489,11 @@ impl PadQueues {
         Ok((carried, last))
     }
 
-    /// `take`, for a drive loop that also has to know WHICH pads have ended:
+    /// `take_until`, for a drive loop that also has to know WHICH pads have ended:
     /// everything queued so far, and per pad whether its input has ended with
     /// it. It returns when a pad has packets or a pad has newly ended, so a
     /// pad closing is seen as it happens rather than with the next packet
-    /// anywhere. The flag says every pad has ended, as `take`'s does.
+    /// anywhere. The flag says every pad has ended, as `take_until`'s does.
     fn take_ended(&self) -> Result<(Vec<Vec<runtime::Packet>>, Vec<bool>, bool)> {
         let mut state = self.state.lock().expect("a reader panicked with the lock");
         loop {
@@ -3543,7 +2685,7 @@ fn peek_stream(mut reader: InputReader) -> Result<(Option<nut::Stream>, Replayed
 }
 
 /// One reader thread per input, each opening its own input and pumping it
-/// into `queues` from the first byte - see `run_packet_sink` for why. Each
+/// into `queues` from the first byte - see `legacy::run_packet_sink` for why. Each
 /// reports its stream's header on the channel returned: a data stream's the
 /// moment it arrives, see `peek_stream`, and any other once its input has
 /// opened, since an aac stream's own is only settled by its first packet.
@@ -3812,7 +2954,7 @@ impl From<PadRendition> for runtime::RenditionMeta {
 
 /// The nut::Stream header for one packet-source track: the coded fourcc this
 /// wire has a tag for, the codec's own time base and extradata, and
-/// `decode_delay` as `run_packet_source`'s pull loop settled it.
+/// `decode_delay` as the source's first pull settled it.
 fn coded_stream_for(coded: &runtime::CodedStream, decode_delay: u64) -> Result<nut::Stream> {
     let time_base = nut::TimeBase {
         num: coded.time_base.num,
@@ -3903,8 +3045,8 @@ fn colorspace_type_for(color: Option<&runtime::ColorInfo>) -> u64 {
 }
 
 /// One packet through an already-open track output. `nut::Packet.dts` is not
-/// read by `write_coded`; the field only matters for `run_packet_source`'s
-/// own decode_delay bookkeeping before the output is open.
+/// read by `write_coded`; the field only matters for a packet source's own
+/// decode_delay bookkeeping before the output is open.
 ///
 /// A data stream's packet is a keyframe whatever it was handed on as: every
 /// message stands alone.
@@ -3915,19 +3057,6 @@ fn write_coded_packet(muxer: &mut FrameOutput, packet: &runtime::Packet) -> Resu
         keyframe: packet.keyframe || muxer.stream().is_json(),
     };
     Ok(muxer.write_coded(&framed, &packet.data)?)
-}
-
-/// Writes one track's NUT header, now that its `decode_delay` has settled -
-/// see `run_packet_source`. No packet goes with it: the header is on the wire
-/// as soon as this returns.
-fn open_track(
-    decode_delay: u64,
-    track: &runtime::SourceTrack,
-    output: &OutputSpec,
-) -> Result<FrameOutput> {
-    let stream = coded_stream_for(&track.stream, decode_delay)?;
-    open_frame_output(&output.path, &stream, false)
-        .with_context(|| format!("opening output {}", output.spelling))
 }
 
 /// Which catalog track each output carries, in output order: what `open` is
@@ -3959,234 +3088,6 @@ fn source_tracks(outputs: &[OutputSpec], module: &str) -> Result<Vec<u32>> {
         selected.push(index);
     }
     Ok(selected)
-}
-
-/// A packet source rides alone: no `-i`, one `-f nut` output per track the
-/// command asked for, each naming its track with `-track`. Those indices are
-/// what `open` subscribes to, so output i carries the opened catalog's track
-/// i and nothing arrives that nobody reads. Packets arrive in decode order
-/// already - `PacketSource::next`'s own contract - so nothing here reorders
-/// them; the only work is settling each track's `decode_delay` before its
-/// output's header is written, since the wit `coded-stream` a source
-/// publishes carries no such field.
-///
-/// `packet.dts` is `None` until the wire settles it, exactly the convention
-/// `nut::Packet.dts` uses for a stream this host demuxes (nut/mod.rs): so
-/// the count of a track's leading `None` packets IS its decode_delay. That
-/// count is the one thing an output's header waits on, and it takes packets
-/// to learn.
-///
-/// So the pull holds EVERY track's packets until every track's decode_delay
-/// has settled, and only then writes the headers - all of them, before a
-/// packet goes anywhere. A track that never settles - every packet arrives
-/// `None` - declares a reorder as deep as every packet it saw, which is
-/// known only once the source is done.
-///
-/// Past the headers each output gets its own writer, because a reader opens
-/// its inputs one at a time and reads packets off each to finish opening it.
-/// Output 0's pipe fills long before the reader is done with output 1, so one
-/// loop writing both stops there with output 1's packets never sent, and the
-/// reader never finishes opening the input that would have drained output 0.
-/// A writer per output takes that arc out: output 0's writer blocks alone.
-///
-/// Each pull's packets are flushed as they are written: a track as thin as an
-/// audio one takes minutes to push a buffer's worth on its own, and the
-/// reader waits all of it.
-///
-/// Rows are a sink's alone; a source emits none in this wave.
-fn run_packet_source(args: &Args, module: &str, params: &str) -> Result<()> {
-    if !args.inputs.is_empty() {
-        bail!(
-            "{module} is a packet source: it produces its own packets and reads no -i input; \
-             this command gives it {}",
-            args.inputs.len()
-        );
-    }
-    if args.annotations.input || args.annotations.output {
-        bail!(
-            "a packet source's outputs carry encoded packets, not frames, so -annotations has \
-             nothing to give or take here"
-        );
-    }
-    for output in &args.outputs {
-        if output.kind != OutputKind::Frames {
-            bail!(
-                "{}: a packet source writes its tracks as -f {EDGE_FORMAT}; -f {} is not that",
-                output.spelling,
-                output.kind.format()
-            );
-        }
-    }
-
-    let selected = source_tracks(&args.outputs, module)?;
-    let (mut source, catalog) = runtime::PacketSource::open(module, params, &selected)
-        .with_context(|| format!("opening module {module}"))?;
-
-    let mut pending: Vec<Vec<runtime::Packet>> = selected.iter().map(|_| Vec::new()).collect();
-    // The count of leading `dts: None` packets, once the track has settled.
-    // A data track has none to count: its messages never reorder.
-    let mut delays: Vec<Option<u64>> = catalog
-        .tracks
-        .iter()
-        .map(|t| (t.stream.format == runtime::CodedFormat::Data).then_some(0))
-        .collect();
-
-    // Hold everything until every track's decode_delay is known.
-    let mut ended = false;
-    while delays.iter().any(Option::is_none) {
-        let Some(pads) = source
-            .next()
-            .with_context(|| format!("{}: pulling packets", source.name()))?
-        else {
-            ended = true;
-            break;
-        };
-        for (slot, pad) in pads.into_iter().enumerate() {
-            for packet in pad.packets {
-                if delays[slot].is_none() && packet.dts.is_some() {
-                    delays[slot] = Some(pending[slot].len() as u64);
-                }
-                pending[slot].push(packet);
-            }
-        }
-    }
-
-    // Every header, each on its own pipe as it is written, before a packet
-    // goes anywhere.
-    let mut muxers: Vec<FrameOutput> = Vec::with_capacity(selected.len());
-    for slot in 0..selected.len() {
-        let decode_delay = delays[slot].unwrap_or(pending[slot].len() as u64);
-        muxers.push(open_track(
-            decode_delay,
-            &catalog.tracks[slot],
-            &args.outputs[slot],
-        )?);
-    }
-
-    let mut senders = Vec::with_capacity(muxers.len());
-    let mut writers = Vec::with_capacity(muxers.len());
-    for (slot, muxer) in muxers.into_iter().enumerate() {
-        let (sender, batches) = mpsc::channel::<Vec<runtime::Packet>>();
-        let spelling = args.outputs[slot].spelling.clone();
-        senders.push(sender);
-        writers.push(thread::spawn(move || {
-            write_track(muxer, &batches).with_context(|| format!("writing output {spelling}"))
-        }));
-    }
-
-    // What the headers were holding back, then the pulls that follow. A send
-    // fails only once that output's writer has stopped, and its failure is
-    // what `join` below hands back.
-    let mut beats = SourceBeats::new(&catalog.tracks, &pending);
-    let mut sending = true;
-    for (slot, packets) in beats.pull(pending).into_iter().enumerate() {
-        sending &= senders[slot].send(packets).is_ok();
-    }
-    while sending && !ended {
-        let Some(pads) = source
-            .next()
-            .with_context(|| format!("{}: pulling packets", source.name()))?
-        else {
-            break;
-        };
-        let pulled = pads.into_iter().map(|pad| pad.packets).collect();
-        for (slot, packets) in beats.pull(pulled).into_iter().enumerate() {
-            sending &= senders[slot].send(packets).is_ok();
-        }
-    }
-    drop(senders);
-
-    let mut wrote = Ok(());
-    for writer in writers {
-        let written = writer.join().unwrap_or_else(|panic| resume_unwind(panic));
-        if wrote.is_ok() {
-            wrote = written;
-        }
-    }
-    wrote
-}
-
-/// The heartbeats a packet source's data tracks carry (see `heartbeat`): one
-/// at start, at the earliest time anything held back for the headers
-/// carries, and then those the source hands on the track itself, at most one
-/// a tenth of a second.
-///
-/// The host claims no time of its own past the start. A heartbeat says no
-/// message before its pts is still to come on the track, and only the source
-/// can know that: tracks run independently, so a live source hands a message
-/// whenever it reached it, and its media may be well past the message's pts
-/// by then. A heartbeat written from the media's time put every such message
-/// behind it, and it left at the heartbeat's pts rather than its own.
-struct SourceBeats {
-    /// Each track's time base, and its heartbeats where it is a data track.
-    tracks: Vec<(TimeBase, Option<heartbeat::Beats>)>,
-    /// The start heartbeat's time, until the first pull has carried it.
-    start: Option<(i64, TimeBase)>,
-}
-
-impl SourceBeats {
-    fn new(tracks: &[runtime::SourceTrack], held: &[Vec<runtime::Packet>]) -> SourceBeats {
-        let tracks: Vec<(TimeBase, Option<heartbeat::Beats>)> = tracks
-            .iter()
-            .map(|t| {
-                let base = t.stream.time_base;
-                let data = t.stream.format == runtime::CodedFormat::Data;
-                (base, data.then(|| heartbeat::Beats::new(base)))
-            })
-            .collect();
-        let mut start = None;
-        for (packets, (base, _)) in held.iter().zip(&tracks) {
-            if let Some(packet) = packets.first() {
-                start = furthest(start, (packet.dts.unwrap_or(packet.pts), *base), false);
-            }
-        }
-        SourceBeats {
-            tracks,
-            start: Some(start.unwrap_or((0, heartbeat::EVERY))),
-        }
-    }
-
-    /// One pull's packets, a list per track, with the data tracks' messages
-    /// placed on their timeline and their heartbeats added: the start's, and
-    /// the latest one the source handed on the track in this pull.
-    fn pull(&mut self, mut pads: Vec<Vec<runtime::Packet>>) -> Vec<Vec<runtime::Packet>> {
-        let start = self.start.take();
-        for (packets, (base, beats)) in pads.iter_mut().zip(&mut self.tracks) {
-            let Some(beats) = beats else { continue };
-            let mut placed = Vec::with_capacity(packets.len() + 2);
-            if let Some((pts, base)) = start {
-                placed.extend(beats.due(pts, base).map(heartbeat_packet));
-            }
-            let mut said = None;
-            for mut packet in packets.drain(..) {
-                if heartbeat::is_heartbeat(&packet.data) {
-                    said = said.max(Some(packet.pts));
-                    continue;
-                }
-                packet.pts = beats.place(packet.pts);
-                packet.dts = Some(packet.pts);
-                placed.push(packet);
-            }
-            if let Some(pts) = said {
-                placed.extend(beats.due(pts, *base).map(heartbeat_packet));
-            }
-            *packets = placed;
-        }
-        pads
-    }
-}
-
-/// Whichever of `was` and `at` is further along, or earlier where `latest`
-/// is false; `at` where there was nothing before.
-fn furthest(
-    was: Option<(i64, TimeBase)>,
-    at: (i64, TimeBase),
-    latest: bool,
-) -> Option<(i64, TimeBase)> {
-    Some(match was {
-        Some((pts, base)) if not_after(at.0, at.1, pts, base) == latest => (pts, base),
-        _ => at,
-    })
 }
 
 /// One output's packets, each batch flushed as it is written, until the pull
@@ -4404,6 +3305,10 @@ struct Description {
     /// writes. Present only for a module exporting one.
     #[serde(skip_serializing_if = "Option::is_none")]
     decoder: Option<DecoderDescription>,
+    /// Whether the module exports a node, whose ports and clock `--shape`
+    /// answers for given params. Present only when it does.
+    #[serde(skip_serializing_if = "is_false")]
+    node: bool,
 }
 
 /// A codec package's encoder, as its `describe()` published it, checked.
@@ -4490,9 +3395,12 @@ fn describe_module(module_path: &str) -> Result<String> {
     let has_decoder = ffrwd_wasm_runtime::runtime::exports_decoder(module_path)
         .with_context(|| format!("describing {module_path}"))?;
     let has_codec = has_encoder || has_decoder;
+    let has_node = ffrwd_wasm_runtime::runtime::exports_node(module_path)
+        .with_context(|| format!("describing {module_path}"))?;
 
     let has_frames = has_filter || has_window;
     if !has_frames
+        && !has_node
         && !has_values
         && !has_packet
         && !has_packet_filter
@@ -4506,9 +3414,9 @@ fn describe_module(module_path: &str) -> Result<String> {
             bail!("{module_path} exports nothing, so no describe is possible");
         }
         bail!(
-            "{module_path} exports neither a filter, a packet sink, a packet filter, a packet \
-             source, a rows module, a data filter, an encoder, a decoder, nor value functions; \
-             it exports {}",
+            "{module_path} exports neither a node, a filter, a packet sink, a packet filter, a \
+             packet source, a rows module, a data filter, an encoder, a decoder, nor value \
+             functions; it exports {}",
             exports.join(", ")
         );
     }
@@ -4611,8 +3519,24 @@ fn describe_module(module_path: &str) -> Result<String> {
         );
     }
 
+    // A node takes the place of every stream interface before it; only
+    // `values` and a codec may ride beside one.
+    if has_node
+        && (has_frames
+            || has_packet
+            || has_packet_filter
+            || has_source
+            || has_rows_module
+            || has_data_filter)
+    {
+        bail!(
+            "{module_path} exports a node alongside an interface the node replaces; a module is \
+             one or the other"
+        );
+    }
+
     let mut description = Description {
-        world: WIT_WORLD,
+        world: if has_node { NODE_WORLD_NAME } else { WIT_WORLD },
         name: None,
         version: None,
         params_schema: None,
@@ -4658,6 +3582,7 @@ fn describe_module(module_path: &str) -> Result<String> {
         meta: false,
         encoder: None,
         decoder: None,
+        node: has_node,
     };
 
     if has_frames {
@@ -4857,6 +3782,24 @@ fn describe_module(module_path: &str) -> Result<String> {
         });
     }
 
+    if has_node {
+        let meta = ffrwd_wasm_runtime::runtime::describe_node(module_path)
+            .with_context(|| format!("describing {module_path}"))?;
+        description.params_schema = Some(parse_schema(
+            &meta.params_schema,
+            &meta.name,
+            "params_schema",
+        )?);
+        description.rows_schema = Some(parse_schema(&meta.rows_schema, &meta.name, "rows_schema")?);
+        description.pixel_formats = Some(meta.pixel_formats);
+        description.sample_formats = Some(meta.sample_formats);
+        description.sample_rates = Some(meta.sample_rates);
+        description.channel_counts = Some(meta.channel_counts);
+        description.rows_language = meta.rows_language;
+        description.version = Some(meta.version);
+        description.name = Some(meta.name);
+    }
+
     if has_values {
         let functions = ffrwd_wasm_runtime::runtime::list_functions(module_path)
             .with_context(|| format!("listing functions in {module_path}"))?;
@@ -4991,7 +3934,7 @@ fn parse_probe_args(rest: &[String]) -> Result<String> {
 }
 
 /// Compiles and instantiates `module_path` as a packet source and calls its
-/// `probe` - the compile-time twin of `run_packet_source`'s `open`, reading
+/// `probe` - the compile-time twin of `legacy::run_packet_source`'s `open`, reading
 /// the catalog without opening the source for a run. One JSON line out.
 fn probe_module(module_path: &str, params: &str) -> Result<String> {
     let has_source = ffrwd_wasm_runtime::runtime::exports_packet_source(module_path)
@@ -5140,6 +4083,23 @@ fn main() {
                         std::process::exit(1);
                     }
                 }
+            }
+        }
+    }
+
+    if raw_args.first().map(String::as_str) == Some("--shape") {
+        let Some(module_path) = raw_args.get(1) else {
+            eprintln!("ffrwd-wasm: --shape requires a module path");
+            std::process::exit(2);
+        };
+        match shape_json::run(module_path, &raw_args[2..]) {
+            Ok(json) => {
+                println!("{json}");
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("ffrwd-wasm: {e:#}");
+                std::process::exit(1);
             }
         }
     }

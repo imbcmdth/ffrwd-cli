@@ -3,4 +3,5 @@
 pub mod egress;
 pub mod gpu;
 pub mod nn;
+pub mod node;
 pub mod runtime;

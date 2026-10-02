@@ -8,7 +8,7 @@
 //! the answer off that row rather than inferring it from pictures.
 
 wit_bindgen::generate!({
-    path: "../../wit",
+    path: "../../worlds/0.18.0",
     world: "window-module",
 });
 

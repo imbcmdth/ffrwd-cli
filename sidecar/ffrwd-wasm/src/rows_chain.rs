@@ -12,7 +12,10 @@
 //! rather than being handed to it.
 
 use anyhow::Result;
-use ffrwd_wasm_runtime::runtime::{self, RowsModule};
+use ffrwd_wasm_runtime::node::{Node, Payload, Tick, TickStream};
+use ffrwd_wasm_runtime::runtime::{self, Message, TimeBase};
+
+use crate::adapters::RowsNode;
 
 /// Whether `row` is shaped the way `schema` declares, well enough to enter a
 /// rows module's `process`: every field `schema`'s `"required"` names is on
@@ -35,8 +38,38 @@ pub fn row_matches_schema(row: &str, schema: &serde_json::Value) -> bool {
 
 /// One hop of the chain: the module, and the schema of the row it reads.
 struct Hop {
-    module: RowsModule,
+    module: RowsNode,
     input_schema: serde_json::Value,
+}
+
+/// One call of a hop: `rows` as the messages of its one input, and what it
+/// wrote back.
+fn call(module: &mut RowsNode, rows: Vec<String>, last: bool) -> Result<Vec<String>> {
+    let tick = Tick {
+        pts: 0,
+        time_base: TimeBase { num: 1, den: 1 },
+        last,
+        streams: vec![TickStream {
+            id: 0,
+            messages: rows
+                .into_iter()
+                .map(|row| Message {
+                    pts: 0,
+                    data: row.into_bytes(),
+                })
+                .collect(),
+            ..TickStream::default()
+        }],
+    };
+    Ok(module
+        .process(tick)?
+        .items
+        .into_iter()
+        .filter_map(|item| match item.payload {
+            Payload::Message(m) => Some(String::from_utf8_lossy(&m.data).into_owned()),
+            _ => None,
+        })
+        .collect())
 }
 
 impl Hop {
@@ -47,7 +80,7 @@ impl Hop {
         } else {
             serde_json::from_str(&described.input_rows_schema)?
         };
-        let module = RowsModule::open(path, "{}")?;
+        let module = RowsNode::open(path, "{}")?;
         Ok(Hop {
             module,
             input_schema,
@@ -75,7 +108,7 @@ impl Hop {
                 slots.push(Some(row));
             }
         }
-        let transformed = self.module.process(&matching)?;
+        let transformed = call(&mut self.module, matching, false)?;
         if transformed.len() == positions.len() {
             for (position, row) in positions.into_iter().zip(transformed) {
                 slots[position] = Some(row);
@@ -127,7 +160,7 @@ impl RowsChain {
     pub fn finish(&mut self) -> Result<Vec<String>> {
         let mut appended = Vec::new();
         for i in 0..self.hops.len() {
-            let mut current = self.hops[i].module.finish()?;
+            let mut current = call(&mut self.hops[i].module, Vec::new(), true)?;
             for hop in &mut self.hops[i + 1..] {
                 current = hop.step(current)?;
             }

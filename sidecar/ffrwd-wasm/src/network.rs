@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use anyhow::{anyhow, bail, Context, Result};
 use ffrwd_wasm_runtime::runtime::{self, Described, Filter, Format, Kind, Media, StreamInfo};
 
+use crate::adapters::FilterNode;
 use crate::graph::{EdgeKind, Pad, ParsedNode};
 use crate::leaky::{self, Leaky};
 use crate::rowfilter::{self, RowFilter};
@@ -182,7 +183,7 @@ impl Network {
                 LaneSeed {
                     name: filter.name().to_string(),
                     shape: filter.shape(),
-                    runners: vec![Runner::Module(Box::new(filter))],
+                    runners: vec![Runner::Node(Box::new(FilterNode::wrap(filter, &format)))],
                     sources: placed,
                     format,
                     reopen,
@@ -223,7 +224,7 @@ impl Network {
             seeds: vec![LaneSeed {
                 name: filter.name().to_string(),
                 shape: filter.shape(),
-                runners: vec![Runner::Module(Box::new(filter))],
+                runners: vec![Runner::Node(Box::new(FilterNode::wrap(filter, format)))],
                 sources: vec![Source::Input(0)],
                 format: *format,
                 reopen,

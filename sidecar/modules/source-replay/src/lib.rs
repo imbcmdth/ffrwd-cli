@@ -14,7 +14,7 @@
 //! `nut::mux`'s own coded-packet test pins.
 
 wit_bindgen::generate!({
-    path: "../../wit",
+    path: "../../worlds/0.18.0",
     world: "packet-source-module",
 });
 

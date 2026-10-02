@@ -10,7 +10,7 @@
 //! instances into two rows arguments and tell their notes apart afterwards.
 
 wit_bindgen::generate!({
-    path: "../../wit",
+    path: "../../worlds/0.18.0",
     world: "window-module",
 });
 

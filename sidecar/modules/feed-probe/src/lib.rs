@@ -7,7 +7,7 @@
 //! when a stream is written in the feeder's place.
 
 wit_bindgen::generate!({
-    path: "../../wit",
+    path: "../../worlds/0.18.0",
     world: "window-module",
 });
 

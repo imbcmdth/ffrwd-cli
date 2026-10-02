@@ -8,7 +8,7 @@
 //! it is written.
 
 wit_bindgen::generate!({
-    path: "../../wit",
+    path: "../../worlds/0.18.0",
     world: "window-module",
 });
 

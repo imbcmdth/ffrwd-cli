@@ -9,7 +9,7 @@
 //! emits nothing, so every frame leaves exactly once, when it is newest.
 
 wit_bindgen::generate!({
-    path: "../../wit",
+    path: "../../worlds/0.18.0",
     world: "window-module",
 });
 

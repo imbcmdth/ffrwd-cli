@@ -9,7 +9,7 @@
 //! writes, stamped messages and ticks merged in time order.
 
 wit_bindgen::generate!({
-    path: "../../wit",
+    path: "../../worlds/0.18.0",
     world: "data-filter-module",
 });
 

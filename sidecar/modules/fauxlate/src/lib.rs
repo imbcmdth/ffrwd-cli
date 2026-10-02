@@ -19,7 +19,7 @@
 // generate_all: the world's interfaces come from another package - ffrwd:av
 // - and without it bindgen expects them to have been generated elsewhere.
 wit_bindgen::generate!({
-    path: ["../../wit", "wit"],
+    path: ["../../worlds/0.18.0", "wit"],
     world: "ffrwd:fauxlate/fauxlate",
     generate_all,
 });

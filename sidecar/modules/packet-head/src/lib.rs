@@ -4,7 +4,7 @@
 //! and works the same when a host hands it the whole stream anyway.
 
 wit_bindgen::generate!({
-    path: "../../wit",
+    path: "../../worlds/0.18.0",
     world: "packet-sink-module",
 });
 

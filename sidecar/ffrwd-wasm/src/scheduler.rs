@@ -24,14 +24,16 @@ use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
 
-use anyhow::{anyhow, bail, Context, Result};
-use ffrwd_wasm_runtime::runtime::{Filter, Format, Frame, Processed, Shape, StreamInfo};
+use anyhow::{bail, Context, Result};
+use ffrwd_wasm_runtime::node::Node;
+use ffrwd_wasm_runtime::runtime::{Format, Frame, Processed, Shape, StreamInfo, TimeBase};
 
+use crate::adapters::{frames_tick, processed_of, FilterNode};
 use crate::leaky::Leaky;
 use crate::network::Source;
 use crate::rowfilter::RowFilter;
 use crate::rowmerge::RowMerge;
-use crate::windows::Windows;
+use crate::tick::Lockstep;
 use crate::Sink;
 
 /// How many worker threads a run gets: the machine's effective core count,
@@ -54,10 +56,11 @@ pub struct Reopen {
 #[cfg(test)]
 type StubFn = Box<dyn FnMut(&[Frame], &[String], bool) -> Result<Processed> + Send>;
 
-/// What executes one lane's tasks. A module instance is one wasmtime store;
-/// the rows node is the host's own and needs none.
+/// What executes one lane's tasks. A module instance is one wasmtime store,
+/// driven as a node whatever world it was built against; the rows node is
+/// the host's own and needs none.
 pub enum Runner {
-    Module(Box<Filter>),
+    Node(Box<dyn Node>),
     Rows(RowFilter),
     Merge(RowMerge),
     Leaky(Box<Leaky>),
@@ -66,9 +69,20 @@ pub enum Runner {
 }
 
 impl Runner {
-    fn run(&mut self, frames: &[Frame], trailing: &[String], last: bool) -> Result<Processed> {
+    /// One call: `frames` is the window, or one frame per pad of a lane
+    /// reading `pads` streams.
+    fn run(
+        &mut self,
+        frames: &[Frame],
+        trailing: &[String],
+        last: bool,
+        pads: usize,
+        base: TimeBase,
+    ) -> Result<Processed> {
         match self {
-            Runner::Module(filter) => filter.process_window(frames, trailing, last),
+            Runner::Node(node) => node
+                .process(frames_tick(frames, trailing, last, pads, base))
+                .map(processed_of),
             Runner::Rows(rows) => {
                 let out = frames.iter().cloned().map(|f| rows.pass(f)).collect();
                 let trailing = if last {
@@ -159,17 +173,22 @@ struct Task {
     last: bool,
 }
 
+/// What a worker needs of a task's lane besides the task: how many streams
+/// it reads, and the time base they count in.
+#[derive(Clone, Copy)]
+struct Reads {
+    pads: usize,
+    base: TimeBase,
+}
+
 struct Lane {
     name: String,
     // Intake: where arriving frames wait to become tasks.
     sources: Vec<Source>,
-    /// One buffer per pad, used only by a lane reading several streams: a
-    /// pad's frames wait here until every other pad has one at the same
-    /// timestamp.
-    pads: Vec<VecDeque<Frame>>,
-    pad_eof: Vec<bool>,
-    /// The window this lane buffers toward, for a lane reading one stream.
-    windows: Windows,
+    /// What has arrived on each pad and not yet made a call.
+    intake: Lockstep,
+    /// The time base the lane's stream counts in.
+    base: TimeBase,
     /// Rows that arrived on an input wire with no frame to ride, per pad.
     trailing_by_pad: Vec<Vec<String>>,
     /// Trailing rows each upstream lane ended with, keyed by lane index so
@@ -247,23 +266,7 @@ impl State {
     /// complete.
     fn push_frames(&mut self, lane_idx: usize, pad: usize, frames: &[Frame]) -> Result<()> {
         let lane = &mut self.lanes[lane_idx];
-        if lane.sources.len() == 1 {
-            for frame in frames {
-                for window in lane.windows.push(frame.clone(), &lane.name)? {
-                    lane.queue.push_back(Task {
-                        ordinal: lane.next_ordinal,
-                        frames: window,
-                        trailing: Vec::new(),
-                        last: false,
-                    });
-                    lane.next_ordinal += 1;
-                }
-            }
-            return Ok(());
-        }
-        lane.pads[pad].extend(frames.iter().cloned());
-        while lane.pads.iter().all(|q| !q.is_empty()) {
-            let call = take_lockstep(lane)?;
+        for call in lane.intake.push(pad, frames, &lane.name)? {
             lane.queue.push_back(Task {
                 ordinal: lane.next_ordinal,
                 frames: call,
@@ -280,22 +283,10 @@ impl State {
     /// reached this lane.
     fn mark_pad_eof(&mut self, lane_idx: usize, pad: usize) -> Result<()> {
         let lane = &mut self.lanes[lane_idx];
-        lane.pad_eof[pad] = true;
-        if !lane.pad_eof.iter().all(|eof| *eof) {
+        let Some(frames) = lane.intake.end(pad, &lane.name)? else {
             return Ok(());
-        }
-        for (pad, queue) in lane.pads.iter().enumerate() {
-            if !queue.is_empty() {
-                bail!(
-                    "{}: pad {pad} ends with {} frame(s) that never paired with the other pads; \
-                     a module reading several streams reads them in lockstep",
-                    lane.name,
-                    queue.len()
-                );
-            }
-        }
+        };
         let trailing = lane.final_rows();
-        let frames = lane.windows.tail();
         lane.final_ordinal = Some(lane.next_ordinal);
         lane.queue.push_back(Task {
             ordinal: lane.next_ordinal,
@@ -340,12 +331,16 @@ impl State {
 
     /// Takes lane `i`'s front task. `None` for the runner means the worker
     /// opens a fresh instance from the returned `Reopen` outside the lock.
-    fn dispatch(&mut self, i: usize) -> (Task, Option<Runner>, Option<Reopen>) {
+    fn dispatch(&mut self, i: usize) -> (Task, Reads, Option<Runner>, Option<Reopen>) {
         let lane = &mut self.lanes[i];
         let task = lane.queue.pop_front().expect("picked lanes have a task");
+        let reads = Reads {
+            pads: lane.sources.len(),
+            base: lane.base,
+        };
         lane.in_flight += 1;
         match lane.idle.pop() {
-            Some(runner) => (task, Some(runner), None),
+            Some(runner) => (task, reads, Some(runner), None),
             None => {
                 lane.created += 1;
                 let reopen = lane
@@ -354,6 +349,7 @@ impl State {
                     .expect("dispatchable without an instance only with reopen");
                 (
                     task,
+                    reads,
                     None,
                     Some(Reopen {
                         path: reopen.path.clone(),
@@ -444,35 +440,6 @@ impl State {
     }
 }
 
-/// One frame off every pad, at one timestamp, the way a module reading
-/// several streams is called. Rows ride pad 0; what arrived on any other pad
-/// is dropped here, and its trailing rows with it (`Lane::final_rows`).
-fn take_lockstep(lane: &mut Lane) -> Result<Vec<Frame>> {
-    let head = lane.pads[0]
-        .front()
-        .map(|f| f.pts)
-        .ok_or_else(|| anyhow!("{}: a queue emptied mid-window", lane.name))?;
-    for (pad, queue) in lane.pads.iter().enumerate().skip(1) {
-        let other = queue.front().map(|f| f.pts).unwrap_or(head);
-        if other != head {
-            bail!(
-                "{}: pad 0 is at pts {head} and pad {pad} at pts {other}; a module reading \
-                 several streams reads them in lockstep, one frame per pad at one timestamp",
-                lane.name
-            );
-        }
-    }
-    let mut call = Vec::with_capacity(lane.pads.len());
-    for (pad, queue) in lane.pads.iter_mut().enumerate() {
-        let mut frame = queue.pop_front().expect("every head matched pts");
-        if pad > 0 {
-            frame.rows.clear();
-        }
-        call.push(frame);
-    }
-    Ok(call)
-}
-
 /// The running pool: workers spawned, lanes wired, waiting to be fed.
 pub struct Scheduler {
     shared: Arc<Shared>,
@@ -514,13 +481,11 @@ impl Scheduler {
             .map(|((seed, downstream), sinks)| {
                 let width = seed.width(workers);
                 let pad_count = seed.sources.len();
-                let windows = Windows::new(seed.shape, &seed.format);
                 Lane {
                     name: seed.name,
+                    intake: Lockstep::new(seed.shape, &seed.format, pad_count),
+                    base: seed.format.time_base,
                     sources: seed.sources,
-                    pads: (0..pad_count).map(|_| VecDeque::new()).collect(),
-                    pad_eof: vec![false; pad_count],
-                    windows,
                     trailing_by_pad: vec![Vec::new(); pad_count],
                     trailing_upstream: BTreeMap::new(),
                     queue: VecDeque::new(),
@@ -675,7 +640,7 @@ fn worker(shared: &Shared) {
             state = shared.work.wait(state).unwrap_or_else(|e| e.into_inner());
             continue;
         };
-        let (task, runner, reopen) = state.dispatch(i);
+        let (task, reads, runner, reopen) = state.dispatch(i);
         // Popping the task made queue room; upstream lanes and the feeder
         // may be waiting on it.
         shared.work.notify_all();
@@ -686,14 +651,20 @@ fn worker(shared: &Shared) {
             Some(runner) => Ok(runner),
             None => {
                 let reopen = reopen.expect("dispatch hands a runner or a reopen");
-                Filter::open(&reopen.path, &reopen.format, &reopen.info, &reopen.params)
-                    .map(|filter| Runner::Module(Box::new(filter)))
+                FilterNode::open(&reopen.path, &reopen.format, &reopen.info, &reopen.params)
+                    .map(|node| Runner::Node(Box::new(node)))
                     .with_context(|| format!("opening another instance of {}", reopen.path))
             }
         };
         let (runner, result) = match opened {
             Ok(mut runner) => {
-                let result = runner.run(&task.frames, &task.trailing, task.last);
+                let result = runner.run(
+                    &task.frames,
+                    &task.trailing,
+                    task.last,
+                    reads.pads,
+                    reads.base,
+                );
                 (Some(runner), result)
             }
             Err(e) => (None, Err(e)),
