@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import functools
 import json
+import re
 import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
@@ -841,6 +842,29 @@ def test_a_node_network_names_the_port_each_pad_binds(monkeypatch: pytest.Monkey
         ("ring", [{"input": "v", "streams": [at_25]},
                   {"input": "spots", "streams": [{"rate": None}]}]),
     ]
+
+
+def test_a_module_called_twice_carries_each_calls_list_in_chain_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sidecar = _plan_argv(
+        "COPY (SELECT burn(f.video[1], f.audio[1]), burn(f.video[1]) AS plain "
+        "FROM input('f.mp4') f) TO 'both.mkv'",
+        monkeypatch,
+    )["sidecar0"]
+    chains = sidecar[sidecar.index("-filter_complex") + 1].split(";")
+    pads = [
+        re.findall(r"\[(\w+)=[^\]]*\]", chain.split("burn")[0])
+        for chain in chains
+        if "]burn" in chain
+    ]
+    bound = [
+        [binding["input"] for binding in listed]
+        for name, listed in _bound_flags(sidecar)
+        if name == "burn" and isinstance(listed, list)
+    ]
+    assert pads == bound == [["v", "a"], ["v"]]
+    assert sidecar.index("-bound") > sidecar.index("-filter_complex")
 
 
 def test_every_stream_one_process_hands_a_node_network_rides_one_nut(
