@@ -324,6 +324,7 @@ from ffrwd.ir import (
     ROWFILTER,
     ROWMERGE,
     ROWS_DOCUMENT,
+    TAP_DOCUMENT,
     Attachment,
     FeederCall,
     FrameRef,
@@ -17234,14 +17235,23 @@ class _Lowerer:
             if not use.ports:
                 continue
             tap = self._free_port()
-            path = feeder_path(tap)
-            self.graph.sinks.append(
-                SinkUnit(
-                    outputs=[Output(ref=use.stream.ref, type="data", name=None, metadata={})],
-                    path=path,
-                    options={"format": _TAP_FORMAT},
+            # A node's messages are written by its own region, as NDJSON on a
+            # pipe the host reads; any other module's are copied to the port.
+            piped = use.stream.ref.partition(":")[0] in self.graph.node_shapes
+            if piped:
+                self.graph.rows_sinks[use.stream.ref] = RowsSink(
+                    container=_ROWS_CONTAINER, path=f"{TAP_DOCUMENT}{tap}"
                 )
-            )
+            else:
+                self.graph.sinks.append(
+                    SinkUnit(
+                        outputs=[
+                            Output(ref=use.stream.ref, type="data", name=None, metadata={})
+                        ],
+                        path=feeder_path(tap),
+                        options={"format": _TAP_FORMAT},
+                    )
+                )
             declared = use.declared
             line, col = _pos(use.anchor)
             shapes = {
@@ -17276,6 +17286,7 @@ class _Lowerer:
                     needs=declared.needs,
                     line=line,
                     col=col,
+                    pipe=piped,
                 )
             )
 
@@ -17999,7 +18010,8 @@ class _Lowerer:
         named = {kind: port.name for kind, port in ports.items() if port is not None}
         made.ports = [named[ref_type(self.graph, read)] for read in made.inputs]
         emits = described.rows_schema is not None
-        made.outputs = ["data"] if emits else []
+        if emits:
+            made.outputs = ["data"]
         made.out_ports = [EMITTED_ROWS_PORT] if emits else []
         self.graph.node_shapes[ref] = dict(shape.raw)
         return value

@@ -123,6 +123,7 @@ from .ir import (
     PIPE,
     ROWFILTER,
     ROWMERGE,
+    TAP_DOCUMENT,
     FeederCall,
     FrameRef,
     Graph,
@@ -2372,8 +2373,11 @@ class _Partitioner:
                 continue  # each track is its own named pipe by construction
             handed: dict[FrameRef, set[str]] = {}
             for edge in self.edges:
-                if edge.source == sidecar.id:
-                    handed.setdefault(edge.ref, set()).add(edge.target)
+                if edge.source != sidecar.id:
+                    continue
+                if sidecar.node_network and ref_type(self.g, edge.ref) == "data":
+                    continue  # the network maps a label to every output reading it
+                handed.setdefault(edge.ref, set()).add(edge.target)
             for ref, targets in handed.items():
                 if len(targets) < 2:
                     continue
@@ -3914,6 +3918,9 @@ class _Partitioner:
                     and producer not in self.g.packet_filters
                     and producer not in self.g.data_filters
                     and producer not in self.g.encoders
+                    and not (
+                        producer in self.node_shapes and ref_type(self.g, ref) == "data"
+                    )
                 ):
                     # A packet sink or filter consumes the encoder's output,
                     # and a module region emits decoded frames: an encoding
@@ -3981,9 +3988,23 @@ class _Partitioner:
             processes=tuple(processes),
             edges=(*self.edges, *self.rows, *self.documents, *self._feeder_edges()),
             laterals=tuple(
-                replace(lateral, writer=self.feeding[feeder_path(lateral.tap)])
+                replace(lateral, writer=self._tap_writer(lateral))
                 for lateral in self.g.laterals
             ),
+        )
+
+    def _tap_writer(self, lateral: Lateral) -> str:
+        """The process writing a run-time lateral's messages for the host: the
+        node region whose rows document is its tap, else the ffmpeg copying
+        them to its port."""
+        if not lateral.pipe:
+            return self.feeding[feeder_path(lateral.tap)]
+        tap = f"{TAP_DOCUMENT}{lateral.tap}"
+        return next(
+            sidecar.id
+            for sidecar in self.sidecars
+            for document in sidecar.rows
+            if document.sink.path == tap
         )
 
     def _bundle_node_edges(self) -> None:
@@ -4001,7 +4022,10 @@ class _Partitioner:
         }
         if not nodes:
             return
+        sinks = {sidecar.id for sidecar in self.sidecars if sidecar.packet_sink}
         for index, edge in enumerate(self.edges):
+            if edge.target in sinks:
+                continue
             if edge.source in nodes or edge.target in nodes:
                 self.edges[index] = replace(edge, nut=f"{edge.source}>{edge.target}")
 
@@ -4015,6 +4039,13 @@ class _Partitioner:
         copy costs next to nothing, where calling the module again would run
         it twice.
         """
+        if any(sidecar.id == source and sidecar.node_network for sidecar in self.sidecars):
+            # A node network writes a label to as many outputs as read it.
+            if not any(
+                (e.source, e.target, e.ref) == (source, target, ref) for e in self.edges
+            ):
+                self._add_edge(source, target, ref)
+            return
         relay = self.relays.get((source, ref))
         if relay is not None:
             if not any(
@@ -4057,7 +4088,7 @@ class _Partitioner:
             if path in self.g.feeders:
                 connections.append((source, feeder_port(path), self.g.feeders[path]))
         for lateral in self.g.laterals:
-            source = self.feeding[feeder_path(lateral.tap)]
+            source = self._tap_writer(lateral)
             connections.extend(
                 (source, connection.port, connection.calls)
                 for connection in lateral.connections
@@ -4599,13 +4630,13 @@ class _Partitioner:
         clock input's; a node's input says what it accepts. Size and time base
         are the stream's own, as on every other edge.
         """
-        producer = _ref_node(ref)
-        if producer is not None and producer in self.node_shapes:
-            return self._node_output_wire(producer, _ref_pad(ref), ref)
         if target is not None and (
             target in self.g.packet_filters or target in self.g.packet_sinks
         ):
             return None  # its destination settled what encodes for it
+        producer = _ref_node(ref)
+        if producer is not None and producer in self.node_shapes:
+            return self._node_output_wire(producer, _ref_pad(ref), ref)
         if target is not None and target in self.node_shapes:
             node = self.g.nodes[target]
             position = self._read_position(node, ref)

@@ -110,6 +110,11 @@ STDERR_ROW = "ffrwd:row "
 ROWS_DOCUMENT = "ffrwd:rows:"
 
 
+# Where a node region writes a run-time lateral's messages, as NDJSON, for the
+# host to read: ``ffrwd:tap:<tap>``, a placeholder a run resolves to a pipe.
+TAP_DOCUMENT = "ffrwd:tap:"
+
+
 # Where a node's params go when they are too long for a command line, or not
 # a flat list of values: ``ffrwd:params:<process>:<node>``. A placeholder
 # like a rows document's, which a run resolves to a file of the params.
@@ -808,6 +813,10 @@ class Lateral:
     line: int = 1
     col: int = 1
     writer: str = ""
+    # True where a node region writes the messages itself, as NDJSON on the
+    # pipe ``ffrwd:tap:<tap>`` names, rather than an ffmpeg copying them to
+    # the loopback port `tap`.
+    pipe: bool = False
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -823,6 +832,7 @@ class Lateral:
             "line": self.line,
             "col": self.col,
             "writer": self.writer,
+            "pipe": self.pipe,
         }
 
     @classmethod
@@ -853,6 +863,7 @@ class Lateral:
             line=raw_line,
             col=raw_col,
             writer=str(d.get("writer", "")),
+            pipe=d.get("pipe") is True,
         )
 
 
