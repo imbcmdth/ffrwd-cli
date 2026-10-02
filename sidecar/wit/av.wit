@@ -509,6 +509,10 @@ interface node-types {
     decode-delay: u32,
     /// Data inputs: the producer's declared latency, when it has one.
     latency: option<f64>,
+    /// The hint `shape` was asked with for this stream, so an instance
+    /// that derives its shape again at `init` derives the one the plan
+    /// was made from.
+    hint: stream-hint,
   }
 
   record message {
