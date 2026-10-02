@@ -519,6 +519,7 @@ from ffrwd.wasm import (
     PacketRead,
     ProbeSource,
     ReadPackets,
+    SinkWants,
     _grant_args,
     audio_encoder_codec,
     catalog_as_probe,
@@ -4260,6 +4261,9 @@ class _Lowerer:
         # rows off the SELECT list rather than named stream parameters: a
         # multi-row relation is accepted here too, the way a manifest's is.
         self.row_reading_sink = False
+        # True while a column handed straight to a node's DEFAULT NULL port
+        # lowers: a NULL there leaves the port unbound, as a NULL literal does.
+        self.null_port_read = False
         # True while a CTE body lowers. The bodies are lowered once, before
         # any COPY, so the reader is not known here: a stream column records
         # one cell per row of the body's relation -- NULL where the row
@@ -9707,6 +9711,11 @@ class _Lowerer:
             declared, described, call, inner, select, env, {}, first=1
         )
         params_json = json.dumps(params, sort_keys=True) if params else ""
+        port, wants = (
+            self._node_rows_port(declared, described, params, inner, select)
+            if described.node
+            else ("", described.wants)
+        )
         read = PacketRead(
             spec=spec,
             input_args=flags,
@@ -9714,7 +9723,8 @@ class _Lowerer:
             index=index,
             module=declared.module,
             params=params_json,
-            wants=described.wants,
+            wants=wants,
+            port=port,
         )
         key = packet_rows_key(
             spec,
@@ -9724,7 +9734,7 @@ class _Lowerer:
             declared.module,
             module_digest(declared.module),
             params_json,
-            described.wants,
+            wants,
         )
         written = cached_packet_rows(key)
         if written is None:
@@ -9780,7 +9790,7 @@ class _Lowerer:
                 hint="this is a compiler bug; please report the query that "
                 "produced it",
             )
-        if described.world not in WORLDS:
+        if described.world not in WORLDS and not described.node:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
                 f"the module '{declared.module}' targets {described.world}, and "
@@ -9800,6 +9810,11 @@ class _Lowerer:
                 hint=f"a module carries one export; write '{described.name}' as "
                 "the export",
             )
+        if described.node:
+            # A node reading the packets: what its shape says of the port is
+            # checked where the call's params are known.
+            self._check_packet_rows_schema(declared, described, node, select)
+            return described
         if not described.packet_sink:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
@@ -9833,6 +9848,43 @@ class _Lowerer:
             )
         self._check_packet_rows_schema(declared, described, node, select)
         return described
+
+    def _node_rows_port(
+        self,
+        declared: WasmFunction,
+        described: Described,
+        params: Mapping[str, object],
+        node: exp.Anonymous,
+        select: exp.Select,
+    ) -> tuple[str, SinkWants]:
+        """The port a node read in FROM is handed the stream on, and how much
+        of it the port asks for.
+
+        Its shape for the call's params, with that port bound, has to read
+        coded packets there and make no output: what the read binds is the
+        rows the node emits beside its ports.
+        """
+        name = declared.params[0].name
+        shape = self._node_shape(declared, described, params, [name], node, select)
+        port = shape.input(name)
+        if port is None or port.kind != "packets" or shape.outputs:
+            said = (
+                f"has no input '{name}'"
+                if port is None
+                else f"reads {port.kind} on '{name}'"
+                if port.kind != "packets"
+                else "makes outputs of its own"
+            )
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"function '{declared.name}' returns rows read off a stream's "
+                f"packets, and the module '{declared.module}' {said}",
+                node,
+                fallback=select,
+                hint=f"a node read in FROM takes coded packets on '{name}' and "
+                "emits rows alone; declare this one as what it is",
+            )
+        return name, port.accepts.wants
 
     def _check_packet_rows_schema(
         self,
@@ -13153,7 +13205,12 @@ class _Lowerer:
                 select,
             )
             return row.stream
-        if self.table_mode or self.manifest is not None or self.row_reading_sink:
+        if (
+            self.table_mode
+            or self.manifest is not None
+            or self.row_reading_sink
+            or self.null_port_read
+        ):
             return _Stream(ref=_NULL_STREAM_REF, type=binding.type, source=None)
         fill = _FILL_SPELLINGS.get(binding.type)
         hint = (
@@ -14125,6 +14182,7 @@ class _Lowerer:
             or self.row_reading_sink
             or self.cte_body
             or self.array_agg_reads_nulls
+            or self.null_port_read
         )
 
     def _cte_cell_column(self, binding: _CteBinding, column: _Column) -> bool:
@@ -15933,7 +15991,12 @@ class _Lowerer:
         env: _Env,
         select: exp.Select,
     ) -> _Value:
-        """One port's argument: a stream, rows, or an array of either."""
+        """One port's argument: a stream, rows, or an array of either.
+
+        A column handed to a port declared DEFAULT NULL may be NULL where an
+        outer join left it so; the instance it falls to leaves the port
+        unbound.
+        """
         inner = _unwrap(argument)
         if isinstance(inner, exp.Array) and inner.expressions:
             elements = [
@@ -15944,7 +16007,14 @@ class _Lowerer:
             streams = tuple(stream for value in elements for stream in value.streams)
             value = _Value(type=elements[0].type, streams=streams, is_array=True)
         else:
-            value = self._lower_expr(argument, env, select)
+            reading = self.null_port_read
+            self.null_port_read = isinstance(param.default, exp.Null) and isinstance(
+                inner, exp.Column
+            )
+            try:
+                value = self._lower_expr(argument, env, select)
+            finally:
+                self.null_port_read = reading
         wanted = _port_kind(param)
         got = next((s.type for s in value.streams if s.type != wanted), None)
         if got is not None:
@@ -15994,9 +16064,12 @@ class _Lowerer:
         node_values = tuple(param for param in declared.params if not is_port(param))
         numbers = {name: arg for name, arg in ports.items() if is_number_argument(arg)}
         streams = {
-            name: self._lower_port(declared, params_by_name[name], argument, env, select)
+            name: value
             for name, argument in ports.items()
             if name not in numbers
+            and not _is_null(
+                value := self._lower_port(declared, params_by_name[name], argument, env, select)
+            )
         }
         tuples = env.relation.tuples if env.relation is not None else []
         per_row = any(_reads_row_column(argument, env) for argument in values.values())
@@ -16011,10 +16084,11 @@ class _Lowerer:
             row = tuples[element] if per_row and element < len(tuples) else (
                 tuples[0] if len(tuples) == 1 else {}
             )
-            bound_values = {
-                name: _scalar(value.at(element)) if name in broadcast else value
-                for name, value in streams.items()
-            }
+            bound_values: dict[str, _Value] = {}
+            for name, value in streams.items():
+                one = _scalar(value.at(element)) if name in broadcast else value
+                if not _is_null(one):
+                    bound_values[name] = one
             params = self._wasm_params(
                 declared, described, call, base, select, env, row, first=0,
                 written=values, value_params=node_values,
@@ -20992,6 +21066,7 @@ def lower_table(
     probe_source: ProbeSource = wasm_probe_source,
     read_packets: ReadPackets = wasm_read_packet_rows,
     probe_path: ProbePath = probe_one_path,
+    shapes: Shape | None = None,
 ) -> list[TableSink]:
     """Lower a resolved TABLE query into its printable result set(s).
 
@@ -21006,7 +21081,7 @@ def lower_table(
         return _Lowerer(
         res, probes, registry, on_warning=on_warning, describes=describes, invoke=invoke,
         probe_failures=probe_failures, probe_source=probe_source,
-        read_packets=read_packets, probe_path=probe_path,
+        read_packets=read_packets, probe_path=probe_path, shapes=shapes,
     ).run_table()
     except FfrwdError:
         raise

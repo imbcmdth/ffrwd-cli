@@ -325,10 +325,11 @@ def _lowered(
     query: str,
     modules: Mapping[str, Described] | None = None,
     asked: _Asked | None = None,
+    probes: Mapping[str, ProbeResult | None] | None = None,
 ) -> Graph:
     return lower(
         resolve(parse(_declared(query))),
-        _probes(),
+        dict(probes) if probes is not None else _probes(),
         registry=_registry(),
         describes=dict(modules) if modules is not None else {p: _node(p) for p in SHAPES},
         shapes=asked if asked is not None else _Asked(),
@@ -547,6 +548,38 @@ def test_kinds_mix_in_one_call_and_a_left_out_port_is_unbound() -> None:
         ("v", "a", "words"),
         ("v",),
     ]
+
+
+def _with_silent_source() -> dict[str, ProbeResult | None]:
+    probes = _probes()
+    media = probes["f"]
+    assert media is not None
+    probes["s"] = ProbeResult(streams=[one for one in media.streams if one.type == "video"])
+    return probes
+
+
+def _outer_joined(source: str, call: str) -> str:
+    return (
+        f"COPY (SELECT {call} FROM input('{source}.mp4') {source}, unnest({source}.video) v "
+        f"LEFT JOIN unnest({source}.audio) a ON v.index = a.index) TO 'out.mkv'"
+    )
+
+
+@pytest.mark.parametrize(
+    ("source", "bound"), [("s", ["v"]), ("f", ["v", "a"])], ids=["silent", "with-sound"]
+)
+def test_a_stream_an_outer_join_leaves_null_leaves_a_default_null_port_unbound(
+    source: str, bound: list[str]
+) -> None:
+    graph = _lowered(_outer_joined(source, "burn(v, a)"), probes=_with_silent_source())
+    (burn,) = [node for node in graph.nodes.values() if node.filter == "burn.wasm"]
+    assert burn.ports == bound
+
+
+def test_a_stream_an_outer_join_leaves_null_is_still_refused_to_a_required_port() -> None:
+    with pytest.raises(FfrwdError) as caught:
+        _lowered(_outer_joined("s", "burn(v, words => hear(a))"), probes=_with_silent_source())
+    assert caught.value.message.startswith("'a' is NULL in row 1")
 
 
 def test_a_held_input_left_unbound_keeps_its_port_param() -> None:
@@ -834,6 +867,29 @@ def test_a_picture_written_beside_the_nodes_reading_it_crosses_to_them_once(
     sidecar = argv["sidecar0"]
     assert sidecar[sidecar.index("-filter_complex") + 1] == (
         "[v=0:v]spot=every=30[spots=n1];[v=0:v][spots=n1]ring[v=out0]"
+    )
+
+
+@pytest.mark.parametrize("beside", ["", ", f.video[1]"], ids=["alone", "written-beside"])
+def test_nodes_taking_one_picture_in_different_formats_get_a_stream_each(
+    monkeypatch: pytest.MonkeyPatch, beside: str
+) -> None:
+    yuv, rgba = {"pixel_formats": ["yuv420p"]}, {"pixel_formats": ["rgba"]}
+    monkeypatch.setitem(SHAPES, "spot.wasm", _taking(_spot, "video", yuv))
+    monkeypatch.setitem(SHAPES, "ring.wasm", _taking(_reader("spots", _ROWS), "video", rgba))
+    argv = _plan_argv(
+        f"COPY (SELECT ring(f.video[1], spot(f.video[1])){beside} "
+        "FROM input('f.mp4') f) TO 'both.mkv'",
+        monkeypatch,
+    )
+    feeder = _feeder(argv)
+    assert [feeder[at + 1] for at, word in enumerate(feeder) if word.startswith("-pix_fmt")] == [
+        "yuv420p",
+        "rgba",
+    ]
+    sidecar = argv["sidecar0"]
+    assert sidecar[sidecar.index("-filter_complex") + 1] == (
+        "[v=0:v]spot=every=30[spots=n1];[v=0:v:1][spots=n1]ring[v=out0]"
     )
 
 

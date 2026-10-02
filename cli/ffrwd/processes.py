@@ -2844,6 +2844,10 @@ class _Partitioner:
                     continue
                 if any(reader in alone for reader in reads):
                     continue  # a packet sink's edge stays an ffmpeg's to encode
+                if any(reader in self.node_shapes for reader in reads) and (
+                    len({self._format(inputs[0], reader) for reader in reads}) > 1
+                ):
+                    continue  # nodes taking it in different formats get a stream each
                 # The split's producer joins too when it is a module; otherwise
                 # the split's own input becomes a boundary read of the region.
                 feeds = _ref_node(inputs[0])
