@@ -47,6 +47,7 @@ struct Hop {
 fn call(module: &mut RowsNode, rows: Vec<String>, last: bool) -> Result<Vec<String>> {
     let tick = Tick {
         pts: 0,
+        ordinal: 0,
         time_base: TimeBase { num: 1, den: 1 },
         last,
         streams: vec![TickStream {

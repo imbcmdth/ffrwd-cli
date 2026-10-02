@@ -586,6 +586,7 @@ impl State {
                 for (pts, last, messages) in cuts {
                     let tick = Tick {
                         pts,
+                        ordinal: 0,
                         time_base: base,
                         last,
                         streams: vec![TickStream {
@@ -860,6 +861,7 @@ impl State {
                     .collect();
                 let tick = Tick {
                     pts: end.unwrap_or(pts + 1),
+                    ordinal: 0,
                     time_base: tick_base,
                     last: true,
                     streams,

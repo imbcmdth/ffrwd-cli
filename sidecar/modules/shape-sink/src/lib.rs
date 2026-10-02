@@ -148,7 +148,10 @@ impl Guest for Node {
         meta("shape_sink", "")
     }
 
-    fn shape(params: String, _bound: Vec<String>) -> Result<NodeShape, String> {
+    fn shape(
+        params: String,
+        _bound: Vec<ffrwd::av::node_types::Binding>,
+    ) -> Result<NodeShape, String> {
         parse::<Params>(&params)?;
         let mut v = input("v", PortKind::Video, Pairing::Arrival, RowsUse::Ignore);
         v.many = true;

@@ -156,7 +156,10 @@ impl Guest for Node {
         meta("shape_self", SCHEMA)
     }
 
-    fn shape(params: String, _bound: Vec<String>) -> Result<NodeShape, String> {
+    fn shape(
+        params: String,
+        _bound: Vec<ffrwd::av::node_types::Binding>,
+    ) -> Result<NodeShape, String> {
         parse::<Params>(&params)?;
         let mut msgs = data("msgs");
         msgs.time_base = Some(Rational { num: 1, den: 1000 });

@@ -166,7 +166,10 @@ impl Guest for Node {
         meta("shape_rate", SCHEMA)
     }
 
-    fn shape(params: String, _bound: Vec<String>) -> Result<NodeShape, String> {
+    fn shape(
+        params: String,
+        _bound: Vec<ffrwd::av::node_types::Binding>,
+    ) -> Result<NodeShape, String> {
         let params: Params = parse(&params)?;
         let out = output(
             "out",

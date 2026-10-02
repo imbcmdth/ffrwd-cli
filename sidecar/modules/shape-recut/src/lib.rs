@@ -151,7 +151,10 @@ impl Guest for Node {
         meta("shape_recut", "")
     }
 
-    fn shape(params: String, _bound: Vec<String>) -> Result<NodeShape, String> {
+    fn shape(
+        params: String,
+        _bound: Vec<ffrwd::av::node_types::Binding>,
+    ) -> Result<NodeShape, String> {
         parse::<Params>(&params)?;
         let v = input("v", PortKind::Video, Pairing::Lockstep, RowsUse::Ignore);
         let mut a = input("a", PortKind::Audio, Pairing::Lockstep, RowsUse::Ignore);

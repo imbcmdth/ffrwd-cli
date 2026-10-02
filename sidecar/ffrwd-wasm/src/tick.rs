@@ -842,6 +842,7 @@ impl Assembler {
         }
         Tick {
             pts,
+            ordinal: 0,
             time_base: base,
             last,
             streams,
@@ -1329,6 +1330,7 @@ mod tests {
             row: None,
             decode_delay: 0,
             latency: None,
+            hint: Default::default(),
         }
     }
 
@@ -1480,10 +1482,7 @@ mod tests {
 
     #[test]
     fn an_interval_input_waits_for_progress_past_the_end_and_its_ahead() {
-        let words = Pairing::Interval(Interval {
-            latency: None,
-            ahead: 0.0,
-        });
+        let words = Pairing::Interval(Interval::shared(None, 0.0));
         let s = shape(
             vec![
                 port("v", PortKind::Video, Pairing::Lockstep, RowsUse::Ignore),
@@ -1519,10 +1518,7 @@ mod tests {
 
     #[test]
     fn an_interval_latency_settles_on_the_clock_alone() {
-        let words = Pairing::Interval(Interval {
-            latency: Some(0.2),
-            ahead: 0.0,
-        });
+        let words = Pairing::Interval(Interval::shared(Some(0.2), 0.0));
         let s = shape(
             vec![
                 port("v", PortKind::Video, Pairing::Lockstep, RowsUse::Ignore),

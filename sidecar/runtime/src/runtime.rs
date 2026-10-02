@@ -68,7 +68,7 @@
 //! and packets-to-frames, hosted by [`Encoder`] and [`Decoder`]: every other
 //! interface is 0.17.0's unchanged.
 //!
-//! 0.19.0 is the node world: one `node` interface in place of every stream
+//! 0.19.1 is the node world: one `node` interface in place of every stream
 //! interface above, hosted by [`WitNode`], and `values`, `encoder` and
 //! `decoder` carried on unchanged. Every older stream interface is still
 //! hosted here and run as a node by the sidecar's adapters, so 0.18.0 is the
@@ -94,7 +94,7 @@ use crate::nn;
 /// world is recognised without consulting the older ones. The current world is
 /// `wit/`; each older one is kept whole under `worlds/<version>/`.
 pub const WORLDS: &[&str] = &[
-    "0.19.0", "0.18.0", "0.17.0", "0.16.0", "0.15.0", "0.14.0", "0.13.0", "0.12.0", "0.11.0",
+    "0.19.1", "0.18.0", "0.17.0", "0.16.0", "0.15.0", "0.14.0", "0.13.0", "0.12.0", "0.11.0",
     "0.10.0", "0.9.0", "0.8.0", "0.7.0", "0.6.0", "0.5.0", "0.4.0", "0.3.0", "0.2.0",
 ];
 
@@ -406,7 +406,7 @@ mod world_0180 {
     }
 }
 
-mod world_0190 {
+mod world_0191 {
     stream_info_with_time_base!();
     meta_with_rows_language!();
 
@@ -470,14 +470,14 @@ mod world_0190 {
         wasmtime::component::bindgen!({
             path: "../wit",
             world: "encoder-module",
-            with: { "ffrwd:av/types": crate::runtime::world_0190::node::ffrwd::av::types },
+            with: { "ffrwd:av/types": crate::runtime::world_0191::node::ffrwd::av::types },
         });
     }
     pub mod decoder {
         wasmtime::component::bindgen!({
             path: "../wit",
             world: "decoder-module",
-            with: { "ffrwd:av/types": crate::runtime::world_0190::node::ffrwd::av::types },
+            with: { "ffrwd:av/types": crate::runtime::world_0191::node::ffrwd::av::types },
         });
     }
     pub mod codec {
@@ -485,9 +485,9 @@ mod world_0190 {
             path: "../wit",
             world: "codec-module",
             with: {
-                "ffrwd:av/types": crate::runtime::world_0190::node::ffrwd::av::types,
-                "ffrwd:av/encoder": crate::runtime::world_0190::encoder::exports::ffrwd::av::encoder,
-                "ffrwd:av/decoder": crate::runtime::world_0190::decoder::exports::ffrwd::av::decoder,
+                "ffrwd:av/types": crate::runtime::world_0191::node::ffrwd::av::types,
+                "ffrwd:av/encoder": crate::runtime::world_0191::encoder::exports::ffrwd::av::encoder,
+                "ffrwd:av/decoder": crate::runtime::world_0191::decoder::exports::ffrwd::av::decoder,
             },
         });
     }
@@ -1766,6 +1766,9 @@ pub enum Wants {
     Keyframes,
     /// The first packet of each stream, and no more.
     First,
+    /// A node's frame input read for its frames' times and its stream's
+    /// info alone: the host carries no pixels or samples for it.
+    Timing,
 }
 
 impl Wants {
@@ -1775,6 +1778,7 @@ impl Wants {
             Wants::All => "all",
             Wants::Keyframes => "keyframes",
             Wants::First => "first",
+            Wants::Timing => "timing",
         }
     }
 }
@@ -2168,7 +2172,7 @@ fn link(
     )
     .map_err(wasm_err)?;
     // The tick a node's `process` reads through.
-    world_0190::node::ffrwd::av::node_tick::add_to_linker::<_, HasSelf<_>>(
+    world_0191::node::ffrwd::av::node_tick::add_to_linker::<_, HasSelf<_>>(
         &mut linker,
         |host: &mut Host| host,
     )
@@ -3608,7 +3612,7 @@ pub fn describe(module_path: &str) -> Result<Described> {
 
 /// One instantiated values module, in whichever world it was built against.
 enum ValuesInstance {
-    W0190(world_0190::values::ValuesModule),
+    W0191(world_0191::values::ValuesModule),
     W0180(world_0180::values::ValuesModule),
     W0170(world_0170::values::ValuesModule),
     W0160(world_0160::values::ValuesModule),
@@ -3646,7 +3650,7 @@ impl ValuesInstance {
             };
         }
         Ok(match self {
-            ValuesInstance::W0190(b) => listed!(b),
+            ValuesInstance::W0191(b) => listed!(b),
             ValuesInstance::W0180(b) => listed!(b),
             ValuesInstance::W0170(b) => listed!(b),
             ValuesInstance::W0160(b) => listed!(b),
@@ -3673,7 +3677,7 @@ impl ValuesInstance {
         args: &str,
     ) -> Result<Result<String, String>> {
         match self {
-            ValuesInstance::W0190(b) => b.ffrwd_av_values().call_invoke(store, name, args),
+            ValuesInstance::W0191(b) => b.ffrwd_av_values().call_invoke(store, name, args),
             ValuesInstance::W0180(b) => b.ffrwd_av_values().call_invoke(store, name, args),
             ValuesInstance::W0170(b) => b.ffrwd_av_values().call_invoke(store, name, args),
             ValuesInstance::W0160(b) => b.ffrwd_av_values().call_invoke(store, name, args),
@@ -3721,9 +3725,9 @@ fn instantiate_values(
     );
 
     let context = || format!("instantiating {module_path}");
-    let instance = if has_export(&component, &interface("values", "0.19.0")) {
-        ValuesInstance::W0190(
-            world_0190::values::ValuesModule::instantiate(&mut store, &component, &linker)
+    let instance = if has_export(&component, &interface("values", "0.19.1")) {
+        ValuesInstance::W0191(
+            world_0191::values::ValuesModule::instantiate(&mut store, &component, &linker)
                 .map_err(wasm_err)
                 .with_context(context)?,
         )
@@ -3874,7 +3878,7 @@ pub const DATA_CODEC: &str = "json";
 
 /// The worlds whose `coded-format` has a data arm, so a module built against
 /// one can be handed a data stream at all.
-const DATA_WORLDS: &[&str] = &["0.19.0", "0.18.0", "0.17.0"];
+const DATA_WORLDS: &[&str] = &["0.19.1", "0.18.0", "0.17.0"];
 
 /// The refusal a data stream meets at a sink or filter built against a
 /// world with no data arm, naming the module and the world.
@@ -5355,11 +5359,11 @@ macro_rules! source_conversions {
 }
 
 coded_conversions!(
-    conv_0190,
-    world_0190,
-    "0.19.0",
-    { crate::runtime::world_0190::video::ffrwd::av::types::CodedFormat::Data => CodedFormat::Data, },
-    { CodedFormat::Data => crate::runtime::world_0190::video::ffrwd::av::types::CodedFormat::Data, }
+    conv_0191,
+    world_0191,
+    "0.19.1",
+    { crate::runtime::world_0191::video::ffrwd::av::types::CodedFormat::Data => CodedFormat::Data, },
+    { CodedFormat::Data => crate::runtime::world_0191::video::ffrwd::av::types::CodedFormat::Data, }
 );
 coded_conversions!(
     conv_0180,
@@ -6201,15 +6205,15 @@ fn codec_kind(meta: &Meta, who: &str) -> Result<Kind> {
 /// exporting both is instantiated once, through the world carrying both,
 /// and a run drives one half of it.
 /// `types`, `encoder` and `decoder` carry on unchanged from 0.18.0 into
-/// 0.19.0, so a codec of either world is the same calls in that world's
+/// 0.19.1, so a codec of either world is the same calls in that world's
 /// types.
 enum CodecInstance {
     Encoder(world_0180::encoder::EncoderModule),
     Decoder(world_0180::decoder::DecoderModule),
     Both(world_0180::codec::CodecModule),
-    Encoder0190(world_0190::encoder::EncoderModule),
-    Decoder0190(world_0190::decoder::DecoderModule),
-    Both0190(world_0190::codec::CodecModule),
+    Encoder0191(world_0191::encoder::EncoderModule),
+    Decoder0191(world_0191::decoder::DecoderModule),
+    Both0191(world_0191::codec::CodecModule),
 }
 
 /// `$body` against the encoder half of a codec instance, with `$g` bound
@@ -6237,23 +6241,23 @@ macro_rules! on_encoder {
                 let $g = b.ffrwd_av_encoder();
                 Some($body)
             }
-            CodecInstance::Encoder0190(b) => {
+            CodecInstance::Encoder0191(b) => {
                 #[allow(unused_imports)]
-                use conv_0190 as $c;
+                use conv_0191 as $c;
                 #[allow(unused_imports)]
-                use world_0190 as $w;
+                use world_0191 as $w;
                 let $g = b.ffrwd_av_encoder();
                 Some($body)
             }
-            CodecInstance::Both0190(b) => {
+            CodecInstance::Both0191(b) => {
                 #[allow(unused_imports)]
-                use conv_0190 as $c;
+                use conv_0191 as $c;
                 #[allow(unused_imports)]
-                use world_0190 as $w;
+                use world_0191 as $w;
                 let $g = b.ffrwd_av_encoder();
                 Some($body)
             }
-            CodecInstance::Decoder(_) | CodecInstance::Decoder0190(_) => None,
+            CodecInstance::Decoder(_) | CodecInstance::Decoder0191(_) => None,
         }
     };
 }
@@ -6278,23 +6282,23 @@ macro_rules! on_decoder {
                 let $g = b.ffrwd_av_decoder();
                 Some($body)
             }
-            CodecInstance::Decoder0190(b) => {
+            CodecInstance::Decoder0191(b) => {
                 #[allow(unused_imports)]
-                use conv_0190 as $c;
+                use conv_0191 as $c;
                 #[allow(unused_imports)]
-                use world_0190 as $w;
+                use world_0191 as $w;
                 let $g = b.ffrwd_av_decoder();
                 Some($body)
             }
-            CodecInstance::Both0190(b) => {
+            CodecInstance::Both0191(b) => {
                 #[allow(unused_imports)]
-                use conv_0190 as $c;
+                use conv_0191 as $c;
                 #[allow(unused_imports)]
-                use world_0190 as $w;
+                use world_0191 as $w;
                 let $g = b.ffrwd_av_decoder();
                 Some($body)
             }
-            CodecInstance::Encoder(_) | CodecInstance::Encoder0190(_) => None,
+            CodecInstance::Encoder(_) | CodecInstance::Encoder0191(_) => None,
         }
     };
 }
@@ -6306,7 +6310,7 @@ impl CodecInstance {
             CodecInstance::Encoder(_) | CodecInstance::Decoder(_) | CodecInstance::Both(_) => {
                 "0.18.0"
             }
-            _ => "0.19.0",
+            _ => "0.19.1",
         }
     }
 
@@ -6396,9 +6400,9 @@ impl CodecInstance {
 /// GPU with one.
 fn instantiate_codec(module_path: &str, purpose: Purpose) -> Result<(Store<Host>, CodecInstance)> {
     let component = compile(module_path)?;
-    let current = has_export(&component, &interface("encoder", "0.19.0"))
-        || has_export(&component, &interface("decoder", "0.19.0"));
-    let world = if current { "0.19.0" } else { "0.18.0" };
+    let current = has_export(&component, &interface("encoder", "0.19.1"))
+        || has_export(&component, &interface("decoder", "0.19.1"));
+    let world = if current { "0.19.1" } else { "0.18.0" };
     let encoder = has_export(&component, &interface("encoder", world));
     let decoder = has_export(&component, &interface("decoder", world));
     if !encoder && !decoder {
@@ -6434,18 +6438,18 @@ fn instantiate_codec(module_path: &str, purpose: Purpose) -> Result<(Store<Host>
     );
     let context = || format!("instantiating {module_path}");
     let instance = match (current, encoder, decoder) {
-        (true, true, true) => CodecInstance::Both0190(
-            world_0190::codec::CodecModule::instantiate(&mut store, &component, &linker)
+        (true, true, true) => CodecInstance::Both0191(
+            world_0191::codec::CodecModule::instantiate(&mut store, &component, &linker)
                 .map_err(wasm_err)
                 .with_context(context)?,
         ),
-        (true, true, false) => CodecInstance::Encoder0190(
-            world_0190::encoder::EncoderModule::instantiate(&mut store, &component, &linker)
+        (true, true, false) => CodecInstance::Encoder0191(
+            world_0191::encoder::EncoderModule::instantiate(&mut store, &component, &linker)
                 .map_err(wasm_err)
                 .with_context(context)?,
         ),
-        (true, false, _) => CodecInstance::Decoder0190(
-            world_0190::decoder::DecoderModule::instantiate(&mut store, &component, &linker)
+        (true, false, _) => CodecInstance::Decoder0191(
+            world_0191::decoder::DecoderModule::instantiate(&mut store, &component, &linker)
                 .map_err(wasm_err)
                 .with_context(context)?,
         ),

@@ -1,4 +1,4 @@
-//! `ffrwd:av` 0.19.0: a module that declares its own node shape.
+//! `ffrwd:av` 0.19.1: a module that declares its own node shape.
 //!
 //! Everything a node module is asked goes through here: `describe`,
 //! `shape(params, bound)` checked against the refusals the WIT lists, and an
@@ -14,21 +14,22 @@ use wasmtime::component::{Component, Resource, ResourceTable};
 use wasmtime::Store;
 use wasmtime_wasi_http::WasiHttpCtx;
 
-use super::world_0190::node::exports::ffrwd::av::node as wit;
-use super::world_0190::node::ffrwd::av::{node_tick, node_types as nt, types as wt};
-use super::world_0190::node::NodeModule;
+use super::world_0191::node::exports::ffrwd::av::node as wit;
+use super::world_0191::node::ffrwd::av::{node_tick, node_types as nt, types as wt};
+use super::world_0191::node::NodeModule;
 use super::{
-    compile, component_exports, conv_0190, egress, engine, granted, has_export, interface, link,
-    wasi_ctx, wasm_err, world_0190, Host, Meta, Purpose, StreamInfo, TimeBase, Wants,
+    compile, component_exports, conv_0191, egress, engine, granted, has_export, interface, link,
+    wasi_ctx, wasm_err, world_0191, Host, Meta, Purpose, StreamInfo, TimeBase, Wants,
 };
 use crate::node::{
-    check_shape, Accepts, Anchor, AudioSpec, BoundStream, Clock, ColorSpec, Emission, Emitted,
-    Hold, InputPort, Interval, LikeInput, Node, NodeShape, OutFrame, OutputFormat, OutputPort,
-    Pairing, Payload, PortKind, Rational, RowsUse, StreamFormat, Tick, TickStream, VideoSpec,
+    check_shape, Accepts, Anchor, AudioSpec, Binding, BoundStream, Clock, ColorSpec, Emission,
+    Emitted, Feed, Hold, InputPort, Interval, LikeInput, Node, NodeShape, OutFrame, OutputFormat,
+    OutputPort, Pairing, Payload, PortKind, Rational, RowsUse, StreamFormat, Tick, TickStream,
+    VideoSpec,
 };
 
 /// The world a node module is built against.
-pub const NODE_WORLD: &str = "0.19.0";
+pub const NODE_WORLD: &str = "0.19.1";
 
 /// One tick, entered into the store's resource table for exactly one
 /// `process` call, beside the streams `init` bound so `streams` and `info`
@@ -36,6 +37,8 @@ pub const NODE_WORLD: &str = "0.19.0";
 pub struct TickHandle {
     tick: Tick,
     bound: Arc<Vec<BoundStream>>,
+    /// The streams bound to an input that wants timing alone.
+    timing: Arc<Vec<u32>>,
 }
 
 impl TickHandle {
@@ -63,6 +66,7 @@ static EMPTY: TickStream = TickStream {
     packets: Vec::new(),
     earlier_rows: Vec::new(),
     feed: None,
+    ended_feeds: Vec::new(),
     info: None,
     progress: None,
     trailing: Vec::new(),
@@ -74,6 +78,10 @@ impl node_tick::Host for Host {}
 impl node_tick::HostTick for Host {
     fn pts(&mut self, tick: Resource<TickHandle>) -> wasmtime::Result<i64> {
         Ok(self.table.get(&tick)?.tick.pts)
+    }
+
+    fn ordinal(&mut self, tick: Resource<TickHandle>) -> wasmtime::Result<u64> {
+        Ok(self.table.get(&tick)?.tick.ordinal)
     }
 
     fn time_base(&mut self, tick: Resource<TickHandle>) -> wasmtime::Result<wt::Rational> {
@@ -107,14 +115,21 @@ impl node_tick::HostTick for Host {
 
     fn feed(&mut self, tick: Resource<TickHandle>, id: u32) -> wasmtime::Result<Option<nt::Feed>> {
         let handle = self.table.get(&tick)?;
-        Ok(handle.stream(id)?.feed.as_ref().map(|feed| nt::Feed {
-            start: nt::FeedStart {
-                tags: feed.start.tags.clone(),
-                first_pts: feed.start.first_pts,
-                at: feed.start.at,
-            },
-            ends: feed.ends,
-        }))
+        Ok(handle.stream(id)?.feed.as_ref().map(feed_to_wit))
+    }
+
+    fn ended_feeds(
+        &mut self,
+        tick: Resource<TickHandle>,
+        id: u32,
+    ) -> wasmtime::Result<Vec<nt::Feed>> {
+        let handle = self.table.get(&tick)?;
+        Ok(handle
+            .stream(id)?
+            .ended_feeds
+            .iter()
+            .map(feed_to_wit)
+            .collect())
     }
 
     fn frames(&mut self, tick: Resource<TickHandle>, id: u32) -> wasmtime::Result<Vec<nt::Frame>> {
@@ -140,6 +155,13 @@ impl node_tick::HostTick for Host {
         index: u32,
     ) -> wasmtime::Result<Vec<u8>> {
         let handle = self.table.get(&tick)?;
+        if handle.timing.contains(&id) {
+            let port = handle.bound(id).map(|b| b.port.clone()).unwrap_or_default();
+            return Err(wasmtime::Error::msg(format!(
+                "frame {index} of stream {id} asked of input '{port}', which wants timing: its \
+                 frames carry their times alone and fetch on one is a fault"
+            )));
+        }
         let frames = &handle.stream(id)?.frames;
         let frame = frames.get(index as usize).ok_or_else(|| {
             wasmtime::Error::msg(format!(
@@ -214,6 +236,18 @@ impl node_tick::HostTick for Host {
     }
 }
 
+fn feed_to_wit(feed: &Feed) -> nt::Feed {
+    nt::Feed {
+        start: nt::FeedStart {
+            tags: feed.start.tags.clone(),
+            first_pts: feed.start.first_pts,
+            at: feed.start.at,
+            known: feed.start.known,
+        },
+        ends: feed.ends,
+    }
+}
+
 /// Whether the component at `module_path` exports a node.
 pub fn exports_node(module_path: &str) -> Result<bool> {
     let component = compile(module_path)?;
@@ -265,12 +299,12 @@ pub fn describe_node(module_path: &str) -> Result<Meta> {
         .ffrwd_av_node()
         .call_describe(&mut store)
         .map_err(wasm_err)?;
-    Ok(world_0190::meta(m))
+    Ok(world_0191::meta(m))
 }
 
 /// A node module's `shape(params, bound)`, checked: the module's own refusal
 /// names it, and so does the host's.
-pub fn node_shape(module_path: &str, params: &str, bound: &[String]) -> Result<NodeShape> {
+pub fn node_shape(module_path: &str, params: &str, bound: &[Binding]) -> Result<NodeShape> {
     let (mut store, instance) = instantiate_node(module_path, Purpose::Describe)?;
     let name = instance
         .ffrwd_av_node()
@@ -285,11 +319,27 @@ fn shape_of(
     instance: &NodeModule,
     name: &str,
     params: &str,
-    bound: &[String],
+    bound: &[Binding],
 ) -> Result<NodeShape> {
+    let told: Vec<nt::Binding> = bound
+        .iter()
+        .map(|b| nt::Binding {
+            input: b.input.clone(),
+            streams: b
+                .streams
+                .iter()
+                .map(|hint| nt::StreamHint {
+                    rate: hint.rate.map(|r| wt::Rational {
+                        num: r.num,
+                        den: r.den,
+                    }),
+                })
+                .collect(),
+        })
+        .collect();
     let answered = instance
         .ffrwd_av_node()
-        .call_shape(&mut *store, params, bound)
+        .call_shape(&mut *store, params, &told)
         .map_err(wasm_err)?
         .map_err(|e| anyhow!("{name} refused the shape: {e}"))?;
     let shape = shape_from_wit(answered, name)?;
@@ -303,10 +353,11 @@ pub struct WitNode {
     instance: NodeModule,
     meta: Meta,
     shape: NodeShape,
-    /// The inputs the call bound, by name, which `set-params` asks the shape
-    /// again with.
-    bound_names: Vec<String>,
+    /// The inputs the call bound, as `shape` was told them, which
+    /// `set-params` asks the shape again with.
+    bindings: Vec<Binding>,
     bound: Arc<Vec<BoundStream>>,
+    timing: Arc<Vec<u32>>,
     /// Per output, the last pts a frame or message left at, and the last
     /// dts a packet did, for the checks that neither steps back.
     last: Vec<Option<i64>>,
@@ -315,26 +366,26 @@ pub struct WitNode {
 
 impl WitNode {
     /// Instantiates the module, asks its shape for `params` and the inputs
-    /// `declared` names (the ones the call bound: a hold input the host
-    /// serves from a port is among `bound` and not among them), and opens an
-    /// instance on those streams. `latched` names the outputs the query
-    /// reads.
+    /// `declared` binds (the ones the call bound, with what the compiler
+    /// knew of their streams: a hold input the host serves from a port is
+    /// among `bound` and not among them), and opens an instance on those
+    /// streams. `latched` names the outputs the query reads.
     pub fn open(
         module_path: &str,
         params: &str,
         bound: Vec<BoundStream>,
-        declared: &[String],
+        declared: &[Binding],
         latched: &[String],
     ) -> Result<WitNode> {
         let (mut store, instance) = instantiate_node(module_path, Purpose::Run)?;
-        let meta = world_0190::meta(
+        let meta = world_0191::meta(
             instance
                 .ffrwd_av_node()
                 .call_describe(&mut store)
                 .map_err(wasm_err)?,
         );
-        let bound_names: Vec<String> = declared.to_vec();
-        let shape = shape_of(&mut store, &instance, &meta.name, params, &bound_names)?;
+        let bindings: Vec<Binding> = declared.to_vec();
+        let shape = shape_of(&mut store, &instance, &meta.name, params, &bindings)?;
         check_bound(&shape, &bound, &meta.name)?;
         for wanted in latched {
             if shape.output_index(wanted).is_none() {
@@ -354,12 +405,22 @@ impl WitNode {
             .map_err(wasm_err)?
             .map_err(|e| anyhow!("{} refused to open: {e}", meta.name))?;
         let outputs = shape.outputs.len();
+        let timing = bound
+            .iter()
+            .filter(|b| {
+                shape
+                    .input(&b.port)
+                    .is_some_and(|p| p.accepts.wants == Wants::Timing)
+            })
+            .map(|b| b.id)
+            .collect();
         Ok(WitNode {
             store,
             instance,
             meta,
             shape,
-            bound_names,
+            bindings,
+            timing: Arc::new(timing),
             bound: Arc::new(bound),
             last: vec![None; outputs],
             finished: false,
@@ -425,7 +486,7 @@ impl Node for WitNode {
             &self.instance,
             &name,
             params,
-            &self.bound_names,
+            &self.bindings,
         )?;
         if shape != self.shape {
             bail!("{name} refused params whose shape differs from the instance's");
@@ -450,6 +511,7 @@ impl Node for WitNode {
             .push(TickHandle {
                 tick,
                 bound: Arc::clone(&self.bound),
+                timing: Arc::clone(&self.timing),
             })
             .map_err(|e| anyhow!("entering a tick into the resource table: {e}"))?;
         let handle = Resource::new_borrow(entry.rep());
@@ -577,6 +639,13 @@ impl WitNode {
                 same.id
             );
         };
+        if self.timing.contains(&same.id) {
+            bail!(
+                "{name} handed back a frame of '{}' on '{output}', which wants timing and \
+                 carries no bytes",
+                bound.port
+            );
+        }
         let frames = tick
             .stream(same.id)
             .map(|s| s.frames.as_slice())
@@ -725,7 +794,7 @@ fn bound_to_wit(stream: &BoundStream, name: &str) -> Result<nt::BoundStream> {
             width: v.width,
             height: v.height,
             pix_fmt: v.pix_fmt.to_string(),
-            color: v.color.map(world_0190::color_info),
+            color: v.color.map(world_0191::color_info),
         }),
         StreamFormat::Audio(a) => nt::OutputFormat::Audio(wt::AudioFormat {
             sample_rate: a.sample_rate,
@@ -735,7 +804,7 @@ fn bound_to_wit(stream: &BoundStream, name: &str) -> Result<nt::BoundStream> {
         }),
         StreamFormat::Data(codec) => nt::OutputFormat::Data(codec.clone()),
         StreamFormat::Packets(coded) => {
-            nt::OutputFormat::Packets(conv_0190::coded_stream_to_wit(coded, name)?)
+            nt::OutputFormat::Packets(conv_0191::coded_stream_to_wit(coded, name)?)
         }
     };
     Ok(nt::BoundStream {
@@ -743,10 +812,16 @@ fn bound_to_wit(stream: &BoundStream, name: &str) -> Result<nt::BoundStream> {
         id: stream.id,
         info: stream_info_to_wit(&stream.info, stream.time_base),
         format: Some(format),
-        rendition: world_0190::rendition_meta(stream.rendition.clone()),
+        rendition: world_0191::rendition_meta(stream.rendition.clone()),
         row: stream.row,
         decode_delay: stream.decode_delay,
         latency: stream.latency,
+        hint: nt::StreamHint {
+            rate: stream.hint.rate.map(|r| wt::Rational {
+                num: r.num,
+                den: r.den,
+            }),
+        },
     })
 }
 
@@ -803,11 +878,7 @@ fn shape_from_wit(shape: nt::NodeShape, name: &str) -> Result<NodeShape> {
                 pairing: match p.pairing {
                     nt::Pairing::Lockstep => Pairing::Lockstep,
                     nt::Pairing::Hold(h) => Pairing::Hold(Hold {
-                        anchor: match h.anchor {
-                            nt::Anchor::SharedClock => Anchor::SharedClock,
-                            nt::Anchor::FirstFrame => Anchor::FirstFrame,
-                            nt::Anchor::Tagged(tag) => Anchor::Tagged(tag),
-                        },
+                        anchor: anchor_from_wit(h.anchor),
                         lead: h.lead,
                         linger: h.linger,
                         timeout: h.timeout,
@@ -817,6 +888,8 @@ fn shape_from_wit(shape: nt::NodeShape, name: &str) -> Result<NodeShape> {
                     nt::Pairing::Interval(i) => Pairing::Interval(Interval {
                         latency: i.latency,
                         ahead: i.ahead,
+                        anchor: anchor_from_wit(i.anchor),
+                        group: i.group,
                     }),
                     nt::Pairing::Arrival => Pairing::Arrival,
                 },
@@ -837,6 +910,7 @@ fn shape_from_wit(shape: nt::NodeShape, name: &str) -> Result<NodeShape> {
                         wt::Wants::All => Wants::All,
                         wt::Wants::Keyframes => Wants::Keyframes,
                         wt::Wants::First => Wants::First,
+                        wt::Wants::Timing => Wants::Timing,
                     },
                     like: p.accepts.like,
                 },
@@ -857,6 +931,14 @@ fn shape_from_wit(shape: nt::NodeShape, name: &str) -> Result<NodeShape> {
     })
 }
 
+fn anchor_from_wit(anchor: nt::Anchor) -> Anchor {
+    match anchor {
+        nt::Anchor::SharedClock => Anchor::SharedClock,
+        nt::Anchor::FirstFrame => Anchor::FirstFrame,
+        nt::Anchor::Tagged(tag) => Anchor::Tagged(tag),
+    }
+}
+
 fn output_format_from_wit(format: nt::OutputFormat, name: &str) -> Result<OutputFormat> {
     Ok(match format {
         nt::OutputFormat::Video(v) => OutputFormat::Video(VideoSpec {
@@ -873,7 +955,7 @@ fn output_format_from_wit(format: nt::OutputFormat, name: &str) -> Result<Output
         }),
         nt::OutputFormat::Data(codec) => OutputFormat::Data(codec),
         nt::OutputFormat::Packets(c) => {
-            OutputFormat::Packets(conv_0190::coded_stream_from_wit(c, name)?)
+            OutputFormat::Packets(conv_0191::coded_stream_from_wit(c, name)?)
         }
         nt::OutputFormat::Like(l) => OutputFormat::Like(LikeInput {
             port: l.port,

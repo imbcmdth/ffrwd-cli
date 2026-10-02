@@ -158,7 +158,10 @@ impl Guest for Node {
         meta("shape_window", SCHEMA)
     }
 
-    fn shape(params: String, _bound: Vec<String>) -> Result<NodeShape, String> {
+    fn shape(
+        params: String,
+        _bound: Vec<ffrwd::av::node_types::Binding>,
+    ) -> Result<NodeShape, String> {
         let params: Params = parse(&params)?;
         let mut a = input("a", PortKind::Audio, Pairing::Lockstep, RowsUse::Ignore);
         a.window = params.window;

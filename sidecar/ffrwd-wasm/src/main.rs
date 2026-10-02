@@ -413,6 +413,63 @@ pub(crate) struct PadSpec {
     /// the query's `tags` column says them: `smart_timed` makes a feed timed.
     #[serde(default)]
     pub(crate) tags: std::collections::BTreeMap<String, String>,
+    /// What the compiler knew of the input's streams' rates when it asked a
+    /// node for its shape, which the host tells the node again.
+    #[serde(default)]
+    pub(crate) rate: Option<PadRate>,
+}
+
+/// `-pad`'s `rate`: one rate for every stream of the input, or one per
+/// stream, keyed by the stream as a pad names it after the input's number
+/// (`v`, `v:1`, `a`, `d:2`).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum PadRate {
+    Every(PadRational),
+    Each(std::collections::BTreeMap<String, PadRational>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PadRational {
+    pub(crate) num: i32,
+    pub(crate) den: i32,
+}
+
+impl PadSpec {
+    /// The rate `-pad` gives the stream a pad names `marker` (`v`, `a`,
+    /// `d`) and `nth`, checked to be a rate.
+    pub(crate) fn rate_of(
+        &self,
+        marker: &str,
+        nth: usize,
+    ) -> Result<Option<ffrwd_wasm_runtime::node::Rational>> {
+        let rate = match &self.rate {
+            None => return Ok(None),
+            Some(PadRate::Every(rate)) => Some(*rate),
+            Some(PadRate::Each(each)) => each
+                .iter()
+                .find(|(key, _)| {
+                    let mut parts = key.split(':');
+                    parts.next() == Some(marker)
+                        && match parts.next() {
+                            None => nth == 0,
+                            Some(n) => n.parse::<usize>().ok() == Some(nth),
+                        }
+                        && parts.next().is_none()
+                })
+                .map(|(_, rate)| *rate),
+        };
+        match rate {
+            Some(PadRational { num, den }) if num <= 0 || den <= 0 => {
+                bail!("-pad rate {num}/{den} is not a rate")
+            }
+            Some(PadRational { num, den }) => {
+                Ok(Some(ffrwd_wasm_runtime::node::Rational { num, den }))
+            }
+            None => Ok(None),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -4564,8 +4621,41 @@ mod pad_spec_tests {
                 },
                 color: None,
                 tags: Default::default(),
+                rate: None,
             }
         );
+    }
+
+    #[test]
+    fn a_rate_is_one_for_every_stream_or_one_per_stream_by_its_pad() {
+        use ffrwd_wasm_runtime::node::Rational;
+        let every: PadSpec =
+            serde_json::from_str(r#"{"rate":{"num":30000,"den":1001}}"#).expect("valid");
+        let ntsc = Some(Rational {
+            num: 30000,
+            den: 1001,
+        });
+        assert_eq!(every.rate_of("v", 0).expect("a rate"), ntsc);
+        assert_eq!(every.rate_of("a", 1).expect("a rate"), ntsc);
+        let each: PadSpec = serde_json::from_str(
+            r#"{"rate":{"v":{"num":25,"den":1},"a:1":{"num":48000,"den":1}}}"#,
+        )
+        .expect("valid");
+        assert_eq!(
+            each.rate_of("v", 0).expect("a rate"),
+            Some(Rational { num: 25, den: 1 })
+        );
+        assert_eq!(each.rate_of("v", 1).expect("none"), None);
+        assert_eq!(each.rate_of("a", 0).expect("none"), None);
+        assert_eq!(
+            each.rate_of("a", 1).expect("a rate"),
+            Some(Rational { num: 48000, den: 1 })
+        );
+        let nothing: PadSpec = serde_json::from_str("{}").expect("valid");
+        assert_eq!(nothing.rate_of("v", 0).expect("none"), None);
+        let zero: PadSpec =
+            serde_json::from_str(r#"{"rate":{"num":0,"den":1}}"#).expect("valid");
+        assert!(zero.rate_of("v", 0).is_err());
     }
 
     #[test]

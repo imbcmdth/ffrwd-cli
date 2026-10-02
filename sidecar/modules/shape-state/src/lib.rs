@@ -157,7 +157,10 @@ impl Guest for Node {
         meta("shape_state", SCHEMA)
     }
 
-    fn shape(params: String, _bound: Vec<String>) -> Result<NodeShape, String> {
+    fn shape(
+        params: String,
+        _bound: Vec<ffrwd::av::node_types::Binding>,
+    ) -> Result<NodeShape, String> {
         let params: Params = parse(&params)?;
         let v = input("v", PortKind::Video, Pairing::Lockstep, RowsUse::Ignore);
         let mut words = input(
@@ -166,6 +169,8 @@ impl Guest for Node {
             Pairing::Interval(ffrwd::av::node_types::Interval {
                 latency: params.latency,
                 ahead: 0.0,
+                anchor: ffrwd::av::node_types::Anchor::SharedClock,
+                group: None,
             }),
             RowsUse::State,
         );

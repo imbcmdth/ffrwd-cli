@@ -146,7 +146,10 @@ impl Guest for Node {
         meta("shape_packets", "")
     }
 
-    fn shape(params: String, _bound: Vec<String>) -> Result<NodeShape, String> {
+    fn shape(
+        params: String,
+        _bound: Vec<ffrwd::av::node_types::Binding>,
+    ) -> Result<NodeShape, String> {
         parse::<Params>(&params)?;
         let p = input("p", PortKind::Packets, Pairing::Lockstep, RowsUse::Ignore);
         Ok(shape(

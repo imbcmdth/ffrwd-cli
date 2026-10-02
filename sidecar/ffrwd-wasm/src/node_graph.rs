@@ -15,8 +15,8 @@ use std::thread;
 use anyhow::{anyhow, bail, Context, Result};
 use ffrwd_wasm::nut;
 use ffrwd_wasm_runtime::node::{
-    BoundStream, Clock, Node, NodeShape, OutputFormat, Pairing, PortKind, Rational, RowsUse,
-    StreamFormat, TickFrame,
+    Binding as PortBinding, BoundStream, Clock, Node, NodeShape, OutputFormat, Pairing, PortKind,
+    Rational, RowsUse, StreamFormat, StreamHint, TickFrame,
 };
 use ffrwd_wasm_runtime::runtime::{
     self, AudioFormat, Format, FormatOf, Media, Message, Packet, RenditionMeta, StreamInfo,
@@ -782,7 +782,7 @@ struct Opening {
     feeds: Vec<FeedSpec>,
 }
 
-fn bound_stream(port: &str, id: u32, def: &StreamDef) -> BoundStream {
+fn bound_stream(port: &str, id: u32, def: &StreamDef, hint: StreamHint) -> BoundStream {
     BoundStream {
         port: port.to_string(),
         id,
@@ -793,6 +793,7 @@ fn bound_stream(port: &str, id: u32, def: &StreamDef) -> BoundStream {
         row: def.row,
         decode_delay: def.decode_delay,
         latency: def.latency,
+        hint,
     }
 }
 
@@ -1002,15 +1003,11 @@ fn bind_feed_ports(
                 Err(_) => continue,
             },
         };
-        let mut wanted: Vec<String> = Vec::new();
-        for (port, _) in &call.inputs {
-            if let Some(port) = port {
-                if !wanted.contains(port) {
-                    wanted.push(port.clone());
-                }
-            }
-        }
-        let Ok(shape) = shape_of(&binding.path, &params, &wanted) else {
+        let Ok(told) = bindings_of(args, call) else {
+            continue;
+        };
+        let wanted = PortBinding::names(&told);
+        let Ok(shape) = shape_of(&binding.path, &params, &told) else {
             continue;
         };
         for input in &shape.inputs {
@@ -1038,9 +1035,48 @@ fn bind_feed_ports(
     bound
 }
 
+/// The inputs a node call binds, as its shape is asked for them: each port
+/// in the order its pads first name it, a stream per pad, with the rate
+/// `-pad` gives a stream of an input. A stream another chain writes has no
+/// hint.
+fn bindings_of(args: &Args, call: &NodeCall) -> Result<Vec<PortBinding>> {
+    let hints = pad_hints(args, call)?;
+    let mut bound: Vec<PortBinding> = Vec::new();
+    for ((port, _), hint) in call.inputs.iter().zip(hints) {
+        let Some(port) = port else { continue };
+        match bound.iter_mut().find(|b| &b.input == port) {
+            Some(binding) => binding.streams.push(hint),
+            None => bound.push(PortBinding {
+                input: port.clone(),
+                streams: vec![hint],
+            }),
+        }
+    }
+    Ok(bound)
+}
+
+/// What `-pad` says of each of a call's pads, in the order written.
+fn pad_hints(args: &Args, call: &NodeCall) -> Result<Vec<StreamHint>> {
+    call.inputs
+        .iter()
+        .map(|(_, pad)| {
+            let rate = match pad {
+                NodePad::Input(r) => match args.pads.get(r.input).and_then(Option::as_ref) {
+                    Some(spec) => spec
+                        .rate_of(r.class.marker(), r.nth)
+                        .with_context(|| format!("the -pad of input {}", r.input))?,
+                    None => None,
+                },
+                NodePad::Label(_) => None,
+            };
+            Ok(StreamHint { rate })
+        })
+        .collect()
+}
+
 /// A node's shape for these params and bound inputs, asked once a run.
-fn shape_of(path: &str, params: &str, wanted: &[String]) -> Result<NodeShape> {
-    type Key = (String, String, Vec<String>);
+fn shape_of(path: &str, params: &str, wanted: &[PortBinding]) -> Result<NodeShape> {
+    type Key = (String, String, Vec<PortBinding>);
     static SHAPES: OnceLock<std::sync::Mutex<HashMap<Key, NodeShape>>> = OnceLock::new();
     let shapes = SHAPES.get_or_init(Default::default);
     let key = (path.to_string(), params.to_string(), wanted.to_vec());
@@ -1070,18 +1106,17 @@ fn open_module(
         Some(params) => params.clone(),
         None => params_json(name, &schema, &call.options)?,
     };
-    let mut wanted: Vec<String> = Vec::new();
-    for (port, _) in pads {
-        if !wanted.contains(port) {
-            wanted.push(port.clone());
-        }
-    }
+    let hints = pad_hints(args, call)?;
+    let told = bindings_of(args, call)?;
+    let wanted = PortBinding::names(&told);
     let shape =
-        shape_of(path, &params, &wanted).with_context(|| format!("asking {name} for its shape"))?;
+        shape_of(path, &params, &told).with_context(|| format!("asking {name} for its shape"))?;
     let mut bound: Vec<BoundStream> = Vec::with_capacity(pads.len());
     for input in &shape.inputs {
-        for (port, id) in pads.iter().filter(|(p, _)| *p == input.name) {
-            bound.push(bound_stream(port, *id, &defs[*id as usize]));
+        for (at, (port, id)) in pads.iter().enumerate() {
+            if *port == input.name {
+                bound.push(bound_stream(port, *id, &defs[*id as usize], hints[at]));
+            }
         }
     }
     let feeds = listen_for(
@@ -1103,7 +1138,7 @@ fn open_module(
         .filter_map(|(port, _)| port.clone())
         .filter(|port| port != ROWS_PORT)
         .collect();
-    let node = WitNode::open(path, &params, bound.clone(), &wanted, &latched)
+    let node = WitNode::open(path, &params, bound.clone(), &told, &latched)
         .with_context(|| format!("opening {name} from {path}"))?;
     let mut resolved = node.shape().clone();
     resolve_rate(&mut resolved, &bound, defs)?;
@@ -1111,13 +1146,13 @@ fn open_module(
     let outputs = output_streams(name, &node, &resolved, &bound, defs, tick)?;
     let opener: Opener = {
         let (path, params, bound, latched) = (path.to_string(), params, bound.clone(), latched);
-        let wanted = wanted.clone();
+        let told = told.clone();
         Arc::new(move || {
             Ok(Box::new(WitNode::open(
                 &path,
                 &params,
                 bound.clone(),
-                &wanted,
+                &told,
                 &latched,
             )?) as Box<dyn Node>)
         })
@@ -1241,7 +1276,7 @@ fn listen_on(
         rendition: RenditionMeta::default(),
         row: None,
     };
-    bound.push(bound_stream(&input.name, id, &def));
+    bound.push(bound_stream(&input.name, id, &def, StreamHint::default()));
     let member = FeedMember {
         id,
         name: input.name.clone(),
@@ -1458,7 +1493,7 @@ fn open_old_filter(
     }
     let bound: Vec<BoundStream> = pads
         .iter()
-        .map(|(port, id)| bound_stream(port, *id, &defs[*id as usize]))
+        .map(|(port, id)| bound_stream(port, *id, &defs[*id as usize], StreamHint::default()))
         .collect();
     for stream in &bound {
         if stream.format != def.format {
@@ -1527,7 +1562,7 @@ fn open_leaky(call: &NodeCall, pads: &[(String, u32)], defs: &[StreamDef]) -> Re
     };
     let node = older::leaky_node(name, leaky, kind);
     let shape = node.shape().clone();
-    let bound = vec![bound_stream(port, *id, def)];
+    let bound = vec![bound_stream(port, *id, def, StreamHint::default())];
     let outputs = output_streams(name, node.as_ref(), &shape, &bound, defs, def.base)?;
     let assembler = Assembler::new(&shape, &bound, name, &[])?;
     Ok(Opening {

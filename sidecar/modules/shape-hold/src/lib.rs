@@ -234,8 +234,12 @@ impl Guest for Node {
         meta("shape_hold", SCHEMA)
     }
 
-    fn shape(params: String, bound: Vec<String>) -> Result<NodeShape, String> {
-        Ok(node_shape(&parse(&params)?, &bound))
+    fn shape(
+        params: String,
+        bound: Vec<ffrwd::av::node_types::Binding>,
+    ) -> Result<NodeShape, String> {
+        let names: Vec<String> = bound.into_iter().map(|b| b.input).collect();
+        Ok(node_shape(&parse(&params)?, &names))
     }
 
     fn init(bound: Vec<BoundStream>, _latched: Vec<String>, params: String) -> Result<(), String> {

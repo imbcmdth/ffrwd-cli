@@ -115,7 +115,7 @@ pub fn declared_shape(module: &str, params: &str, bound: &[String]) -> Result<No
             }
         );
     };
-    node::check_shape(&shape, bound, module)?;
+    node::check_shape(&shape, &node::Binding::from_names(bound), module)?;
     Ok(shape)
 }
 
@@ -344,10 +344,7 @@ fn source_shape(catalog: &Catalog) -> NodeShape {
 fn data_filter_shape(described: &runtime::DescribedDataFilter, bound: &[String]) -> NodeShape {
     let clocked = bound.iter().any(|b| b == "clock");
     let pairing = if clocked {
-        Pairing::Interval(Interval {
-            latency: Some(0.0),
-            ahead: 0.0,
-        })
+        Pairing::Interval(Interval::shared(Some(0.0), 0.0))
     } else {
         Pairing::Arrival
     };
@@ -577,6 +574,7 @@ pub fn frames_tick(
     streams[0].trailing = trailing.to_vec();
     Tick {
         pts: frames.first().map_or(0, |f| f.pts),
+        ordinal: 0,
         time_base: base,
         last,
         streams,

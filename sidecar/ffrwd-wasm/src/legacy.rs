@@ -72,6 +72,7 @@ fn bound_pad(pad: usize, input: SinkInput) -> BoundStream {
         row: Some(input.row),
         decode_delay: input.decode_delay,
         latency: None,
+        hint: Default::default(),
     }
 }
 
@@ -477,6 +478,7 @@ fn data_pad(module: &str, pad: usize, stream: &nut::Stream) -> Result<BoundStrea
         row: None,
         decode_delay: 0,
         latency: None,
+        hint: Default::default(),
     })
 }
 

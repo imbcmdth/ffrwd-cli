@@ -315,6 +315,7 @@ impl Run {
                         };
                         let final_tick = Tick {
                             pts: started.elapsed().as_micros() as i64,
+                            ordinal: 0,
                             time_base: base,
                             last: true,
                             streams: self.intake.empty_streams(),
@@ -435,6 +436,7 @@ impl Intake {
                 *made += 1;
                 return Ok(vec![Tick {
                     pts,
+                    ordinal: 0,
                     time_base: *base,
                     last,
                     streams,
@@ -481,6 +483,7 @@ impl Intake {
                                     .collect();
                                 Tick {
                                     pts: call.now.unwrap_or(0),
+                                    ordinal: 0,
                                     time_base: *base,
                                     last: call.last,
                                     streams,
@@ -511,6 +514,7 @@ impl Intake {
                         *made += 1;
                         Ok(vec![Tick {
                             pts: 0,
+                            ordinal: 0,
                             time_base: TimeBase {
                                 num: 1,
                                 den: 1_000_000,
@@ -530,6 +534,7 @@ impl Intake {
                     Some(rows) => vec![
                         Tick {
                             pts: 0,
+                            ordinal: 0,
                             time_base: base,
                             last: false,
                             streams: vec![TickStream {
@@ -546,6 +551,7 @@ impl Intake {
                         },
                         Tick {
                             pts: 0,
+                            ordinal: 0,
                             time_base: base,
                             last: true,
                             streams: vec![TickStream {
@@ -561,6 +567,7 @@ impl Intake {
                 *made += 1;
                 Ok(vec![Tick {
                     pts: started.elapsed().as_micros() as i64,
+                    ordinal: 0,
                     time_base: TimeBase {
                         num: 1,
                         den: 1_000_000,

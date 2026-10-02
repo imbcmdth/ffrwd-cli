@@ -2,7 +2,7 @@
 //!
 //! A node has typed input ports, typed output ports and a clock, and one tick
 //! of the clock is one `process` call. A module built against `ffrwd:av`
-//! 0.19.0 declares its own shape; a module of every older world is adapted
+//! 0.19.1 declares its own shape; a module of every older world is adapted
 //! onto one by the host (`crate::adapters`), so a host drives one thing.
 //!
 //! The types here are the WIT's `node-types`, `node-tick` and `node` records
@@ -72,11 +72,65 @@ pub struct Hold {
 }
 
 /// A message input paired by time: every message in the tick's interval,
-/// extended by `ahead`.
+/// extended by `ahead`. `anchor` maps the stream's pts onto the clock;
+/// `group` names the hold group whose connection it arrives on.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Interval {
     pub latency: Option<f64>,
     pub ahead: f64,
+    pub anchor: Anchor,
+    pub group: Option<String>,
+}
+
+impl Interval {
+    /// Today's pairing: the stream counts on the clock's origin, on a
+    /// connection of its own.
+    pub fn shared(latency: Option<f64>, ahead: f64) -> Interval {
+        Interval {
+            latency,
+            ahead,
+            anchor: Anchor::SharedClock,
+            group: None,
+        }
+    }
+}
+
+/// What the compiler knows of one stream before the run: the frame rate,
+/// or the sample rate over 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct StreamHint {
+    pub rate: Option<Rational>,
+}
+
+/// One input a call binds, as `shape` is told it: one hint per stream, in
+/// the order the call names them.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Binding {
+    pub input: String,
+    pub streams: Vec<StreamHint>,
+}
+
+impl Binding {
+    /// Names alone, each a binding of one stream with nothing known of it;
+    /// a name given again is a further stream of the same input.
+    pub fn from_names(names: &[String]) -> Vec<Binding> {
+        let mut bound: Vec<Binding> = Vec::new();
+        for name in names {
+            match bound.iter_mut().find(|b| &b.input == name) {
+                Some(binding) => binding.streams.push(StreamHint::default()),
+                None => bound.push(Binding {
+                    input: name.clone(),
+                    streams: vec![StreamHint::default()],
+                }),
+            }
+        }
+        bound
+    }
+
+    /// The inputs bound, by name.
+    pub fn names(bound: &[Binding]) -> Vec<String> {
+        bound.iter().map(|b| b.input.clone()).collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -94,7 +148,7 @@ pub enum Pairing {
 }
 
 /// A ratio of two whole numbers, as the WIT spells one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Rational {
     pub num: i32,
     pub den: i32,
@@ -278,6 +332,8 @@ pub struct BoundStream {
     pub row: Option<u32>,
     pub decode_delay: u32,
     pub latency: Option<f64>,
+    /// The hint `shape` was asked with for this stream.
+    pub hint: StreamHint,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -291,6 +347,8 @@ pub struct FeedStart {
     pub tags: Vec<(String, String)>,
     pub first_pts: i64,
     pub at: i64,
+    /// The clock time of the tick the start was fixed on.
+    pub known: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -328,6 +386,8 @@ pub struct TickStream {
     pub packets: Vec<Packet>,
     pub earlier_rows: Vec<TimedRows>,
     pub feed: Option<Feed>,
+    /// A hold input's feeds that ended since the instance's previous call.
+    pub ended_feeds: Vec<Feed>,
     /// The stream as the host knows it this tick, where that differs from
     /// what `init` was told: a hold input's current source, with its time
     /// base.
@@ -344,6 +404,8 @@ pub struct TickStream {
 #[derive(Debug, Clone)]
 pub struct Tick {
     pub pts: i64,
+    /// The tick's number in the run, over every instance of the node.
+    pub ordinal: u64,
     pub time_base: TimeBase,
     pub last: bool,
     pub streams: Vec<TickStream>,
@@ -423,8 +485,10 @@ pub trait Node: Send {
 }
 
 /// The refusals `shape`'s doc lists, naming the module and the port.
-/// `bound` is the inputs the call binds, by name.
-pub fn check_shape(shape: &NodeShape, bound: &[String], name: &str) -> Result<()> {
+/// `bound` is the inputs the call binds.
+pub fn check_shape(shape: &NodeShape, bound: &[Binding], name: &str) -> Result<()> {
+    let bound: Vec<String> = Binding::names(bound);
+    let bound = bound.as_slice();
     for (index, port) in shape.inputs.iter().enumerate() {
         if shape.inputs[..index].iter().any(|p| p.name == port.name) {
             bail!("{name} declares input '{}' twice", port.name);
@@ -518,6 +582,30 @@ pub fn check_shape(shape: &NodeShape, bound: &[String], name: &str) -> Result<()
         if let Some(like) = &port.accepts.like {
             check_like(shape, bound, like, &at)?;
         }
+        if port.accepts.wants == Wants::Timing && !port.kind.is_frames() {
+            bail!(
+                "{at} is {} and wants timing, which a frame input alone reads",
+                port.kind.name()
+            );
+        }
+        if let Pairing::Interval(Interval {
+            anchor,
+            group: Some(group),
+            ..
+        }) = &port.pairing
+        {
+            let held = shape.inputs.iter().any(|p| {
+                matches!(&p.pairing, Pairing::Hold(h) if h.group.as_deref() == Some(group.as_str()))
+            });
+            if !held {
+                bail!("{at} arrives on group '{group}', which no hold input declares");
+            }
+            if *anchor != Anchor::SharedClock {
+                bail!(
+                    "{at} arrives on group '{group}', and a stream on a group's connection takes                      the group's offset: its anchor is shared-clock"
+                );
+            }
+        }
     }
     for port in &shape.outputs {
         if let Some(OutputFormat::Like(like)) = &port.format {
@@ -568,6 +656,9 @@ pub fn rescale(pts: i64, from: TimeBase, to: TimeBase) -> i64 {
 /// anything of the kind.
 pub fn check_accepts(port: &InputPort, stream: &BoundStream, name: &str) -> Result<()> {
     let accepts = &port.accepts;
+    if accepts.wants == Wants::Timing {
+        return Ok(());
+    }
     let refused = |what: &str, wanted: String, got: String| {
         anyhow::anyhow!(
             "{name} input '{}' accepts {what} {wanted}, and is bound a stream of {got}; convert \
@@ -671,7 +762,7 @@ mod tests {
 
     fn refusal(shape: &NodeShape, bound: &[&str]) -> String {
         let bound: Vec<String> = bound.iter().map(|b| b.to_string()).collect();
-        check_shape(shape, &bound, "m")
+        check_shape(shape, &Binding::from_names(&bound), "m")
             .expect_err("refused")
             .to_string()
     }
@@ -697,10 +788,7 @@ mod tests {
             &["v"],
         );
         assert!(message.contains("no input clock"), "{message}");
-        let interval = Pairing::Interval(Interval {
-            latency: None,
-            ahead: 0.0,
-        });
+        let interval = Pairing::Interval(Interval::shared(None, 0.0));
         let message = refusal(
             &shape(
                 vec![port("d", PortKind::Data, interval)],
@@ -724,10 +812,7 @@ mod tests {
         let clock = || Clock::Rate(Rational { num: 25, den: 1 });
         let message = refusal(&shape(vec![port("d", PortKind::Data, hold)], clock()), &[]);
         assert!(message.contains("pairs frames"), "{message}");
-        let interval = Pairing::Interval(Interval {
-            latency: None,
-            ahead: 0.0,
-        });
+        let interval = Pairing::Interval(Interval::shared(None, 0.0));
         let message = refusal(
             &shape(vec![port("v", PortKind::Video, interval)], clock()),
             &[],
@@ -772,7 +857,69 @@ mod tests {
         if let Some(OutputFormat::Like(like)) = &mut s.outputs[0].format {
             like.port = "v".into();
         }
-        assert!(check_shape(&s, &["v".to_string()], "m").is_ok());
+        assert!(check_shape(&s, &Binding::from_names(&["v".to_string()]), "m").is_ok());
+    }
+
+    #[test]
+    fn timing_is_for_frames_and_a_group_on_an_interval_is_a_hold_groups_on_the_shared_clock() {
+        let clock = || Clock::Rate(Rational { num: 25, den: 1 });
+        let mut d = port(
+            "d",
+            PortKind::Data,
+            Pairing::Interval(Interval::shared(None, 0.0)),
+        );
+        d.accepts.wants = Wants::Timing;
+        let message = refusal(&shape(vec![d], clock()), &["d"]);
+        assert!(message.contains("wants timing"), "{message}");
+
+        let hold = Pairing::Hold(Hold {
+            anchor: Anchor::SharedClock,
+            lead: 0.0,
+            linger: None,
+            timeout: None,
+            group: Some("feeder".into()),
+            port_param: Some("port".into()),
+        });
+        let grouped = |group: &str, anchor: Anchor| {
+            let mut interval = Interval::shared(None, 0.0);
+            interval.group = Some(group.to_string());
+            interval.anchor = anchor;
+            port("d", PortKind::Data, Pairing::Interval(interval))
+        };
+        let v = port("v", PortKind::Video, hold);
+        let message = refusal(
+            &shape(
+                vec![v.clone(), grouped("other", Anchor::SharedClock)],
+                clock(),
+            ),
+            &[],
+        );
+        assert!(message.contains("no hold input declares"), "{message}");
+        let message = refusal(
+            &shape(
+                vec![v.clone(), grouped("feeder", Anchor::FirstFrame)],
+                clock(),
+            ),
+            &[],
+        );
+        assert!(message.contains("shared-clock"), "{message}");
+        let mut timed = port("t", PortKind::Video, Pairing::Lockstep);
+        timed.accepts.wants = Wants::Timing;
+        let fine = shape(
+            vec![timed, v, grouped("feeder", Anchor::SharedClock)],
+            Clock::Input("t".into()),
+        );
+        assert!(check_shape(&fine, &Binding::from_names(&["t".to_string()]), "m").is_ok());
+    }
+
+    #[test]
+    fn names_alone_bind_one_stream_each_and_a_name_again_binds_another() {
+        let names: Vec<String> = ["v", "w", "v"].iter().map(|s| s.to_string()).collect();
+        let bound = Binding::from_names(&names);
+        assert_eq!(bound.len(), 2);
+        assert_eq!(bound[0].input, "v");
+        assert_eq!(bound[0].streams, vec![StreamHint::default(); 2]);
+        assert_eq!(bound[1].streams.len(), 1);
     }
 
     #[test]

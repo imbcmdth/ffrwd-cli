@@ -8,13 +8,14 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use ffrwd_wasm_runtime::node::{
-    Accepts, Anchor, Clock, ColorSpec, InputPort, NodeShape, OutputFormat, OutputPort, Pairing,
-    PortKind, Rational, RowsUse,
+    Accepts, Anchor, Binding, Clock, ColorSpec, InputPort, NodeShape, OutputFormat, OutputPort,
+    Pairing, PortKind, Rational, RowsUse, StreamHint,
 };
 use ffrwd_wasm_runtime::runtime::{CodedFormat, CodedStream, Wants};
+use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
-/// `--shape <module> [-params <json> | -params-from <file>] [-bound <port,...>]`,
+/// `--shape <module> [-params <json> | -params-from <file>] [-bound <port,...> | -bound <json>]`,
 /// grants taken out first the way `--probe` takes them.
 pub fn run(module: &str, rest: &[String]) -> Result<String> {
     let (params, bound) = parse_args(rest)?;
@@ -23,17 +24,88 @@ pub fn run(module: &str, rest: &[String]) -> Result<String> {
     let shape = if exports_node {
         ffrwd_wasm_runtime::runtime::node_shape(module, &params, &bound)
     } else {
-        crate::adapters::declared_shape(module, &params, &bound)
+        crate::adapters::declared_shape(module, &params, &Binding::names(&bound))
     }
     .with_context(|| format!("asking {module} for its shape"))?;
     serde_json::to_string(&shape_json(&shape)).context("serializing the shape")
 }
 
-fn parse_args(rest: &[String]) -> Result<(String, Vec<String>)> {
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BindingJson {
+    input: String,
+    #[serde(default)]
+    streams: Option<Vec<HintJson>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HintJson {
+    #[serde(default)]
+    rate: Option<RationalJson>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RationalJson {
+    num: i32,
+    den: i32,
+}
+
+/// `--bound`'s value: the comma list of the inputs' names, each a stream
+/// with nothing known of it, or a JSON array of `binding` records.
+pub fn parse_bound(text: &str) -> Result<Vec<Binding>> {
+    let text = text.trim();
+    if !text.starts_with('[') {
+        let names: Vec<String> = text
+            .split(',')
+            .map(str::trim)
+            .filter(|port| !port.is_empty())
+            .map(str::to_string)
+            .collect();
+        return Ok(Binding::from_names(&names));
+    }
+    let parsed: Vec<BindingJson> =
+        serde_json::from_str(text).map_err(|e| anyhow!("--bound {text}: {e}"))?;
+    let mut bound: Vec<Binding> = Vec::with_capacity(parsed.len());
+    for binding in parsed {
+        if bound.iter().any(|b| b.input == binding.input) {
+            bail!("--bound names input '{}' twice", binding.input);
+        }
+        let streams = match binding.streams {
+            None => vec![StreamHint::default()],
+            Some(streams) if streams.is_empty() => {
+                bail!("--bound binds input '{}' to no stream", binding.input)
+            }
+            Some(streams) => streams
+                .into_iter()
+                .map(|hint| match hint.rate {
+                    Some(RationalJson { num, den }) if num <= 0 || den <= 0 => bail!(
+                        "--bound gives input '{}' the rate {num}/{den}, which is no rate",
+                        binding.input
+                    ),
+                    rate => Ok(StreamHint {
+                        rate: rate.map(|r| Rational {
+                            num: r.num,
+                            den: r.den,
+                        }),
+                    }),
+                })
+                .collect::<Result<_>>()?,
+        };
+        bound.push(Binding {
+            input: binding.input,
+            streams,
+        });
+    }
+    Ok(bound)
+}
+
+fn parse_args(rest: &[String]) -> Result<(String, Vec<Binding>)> {
     let rest = crate::take_grant_args(rest.to_vec())?;
     let mut it = rest.iter();
     let mut params: Option<String> = None;
-    let mut bound: Option<Vec<String>> = None;
+    let mut bound: Option<Vec<Binding>> = None;
     while let Some(arg) = it.next() {
         let mut next = |name: &str| -> Result<String> {
             it.next()
@@ -61,14 +133,7 @@ fn parse_args(rest: &[String]) -> Result<(String, Vec<String>)> {
                 if bound.is_some() {
                     bail!("second -bound specified");
                 }
-                bound = Some(
-                    next(arg)?
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|port| !port.is_empty())
-                        .map(str::to_string)
-                        .collect(),
-                );
+                bound = Some(parse_bound(&next(arg)?)?);
             }
             other => bail!("--shape: unknown flag {other}"),
         }
@@ -139,11 +204,7 @@ fn pairing_json(pairing: &Pairing) -> Value {
         Pairing::Hold(hold) => variant(
             "hold",
             json!({
-                "anchor": match &hold.anchor {
-                    Anchor::SharedClock => variant("shared_clock", json!({})),
-                    Anchor::FirstFrame => variant("first_frame", json!({})),
-                    Anchor::Tagged(tag) => variant("tagged", json!({"tag": tag})),
-                },
+                "anchor": anchor_json(&hold.anchor),
                 "lead": hold.lead,
                 "linger": hold.linger,
                 "timeout": hold.timeout,
@@ -153,10 +214,23 @@ fn pairing_json(pairing: &Pairing) -> Value {
         ),
         Pairing::Interval(interval) => variant(
             "interval",
-            json!({"latency": interval.latency, "ahead": interval.ahead}),
+            json!({
+                "latency": interval.latency,
+                "ahead": interval.ahead,
+                "anchor": anchor_json(&interval.anchor),
+                "group": interval.group,
+            }),
         ),
         Pairing::Arrival => variant("arrival", json!({})),
         Pairing::AtOrBefore => variant("at_or_before", json!({})),
+    }
+}
+
+fn anchor_json(anchor: &Anchor) -> Value {
+    match anchor {
+        Anchor::SharedClock => variant("shared_clock", json!({})),
+        Anchor::FirstFrame => variant("first_frame", json!({})),
+        Anchor::Tagged(tag) => variant("tagged", json!({"tag": tag})),
     }
 }
 

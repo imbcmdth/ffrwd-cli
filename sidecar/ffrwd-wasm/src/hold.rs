@@ -325,6 +325,9 @@ struct FeedState {
     /// The lead member's first frame, and the clock time it stands at.
     first_pts: i64,
     at: i64,
+    /// The clock time of the tick the offset was fixed on, or `at` where
+    /// that is earlier: a source the clock has passed shows at once.
+    known: i64,
     shown: Vec<Option<TickFrame>>,
     /// The clock time the lead member last moved on, for the timeout.
     advanced: i64,
@@ -716,6 +719,7 @@ impl Group {
             offset,
             first_pts,
             at,
+            known: pts.min(at),
             shown: vec![None; self.members.len()],
             advanced: pts.max(at),
             drained: None,
@@ -835,6 +839,7 @@ impl Group {
                         tags: source.tags.clone(),
                         first_pts: first,
                         at: feed.at,
+                        known: feed.known,
                     },
                     ends: None,
                 }),

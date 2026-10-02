@@ -346,6 +346,7 @@ mod tests {
     fn tick(pts: i64, last: bool, rows: &[(i64, &str)]) -> Tick {
         Tick {
             pts,
+            ordinal: 0,
             time_base: FRAMES,
             last,
             streams: vec![TickStream {

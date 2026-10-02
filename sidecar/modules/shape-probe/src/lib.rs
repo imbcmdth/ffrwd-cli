@@ -135,6 +135,8 @@ fn shape(params: &Params, bound: &[String]) -> NodeShape {
         Pairing::Interval(Interval {
             latency: Some(2.0),
             ahead: 0.25,
+            anchor: Anchor::SharedClock,
+            group: None,
         }),
         RowsUse::State,
     );
@@ -261,8 +263,12 @@ impl Guest for ShapeProbe {
         }
     }
 
-    fn shape(params_text: String, bound: Vec<String>) -> Result<NodeShape, String> {
-        Ok(shape(&params(&params_text)?, &bound))
+    fn shape(
+        params_text: String,
+        bound: Vec<ffrwd::av::node_types::Binding>,
+    ) -> Result<NodeShape, String> {
+        let names: Vec<String> = bound.into_iter().map(|b| b.input).collect();
+        Ok(shape(&params(&params_text)?, &names))
     }
 
     fn init(
