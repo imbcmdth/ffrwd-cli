@@ -1161,6 +1161,97 @@ fn a_bound_feeds_end_is_told_lead_ahead_on_every_run_and_worker_count() {
 }
 
 #[test]
+fn a_grouped_data_input_bound_to_a_stream_is_placed_with_its_groups_offset() {
+    let dir = scratch("group-data");
+    let prog: Vec<(usize, Write)> = (0..40)
+        .map(|k| (0, Write::Frame(k, vec![0u8; 16])))
+        .collect();
+    write_nut(
+        &dir.join("prog.nut"),
+        &[video(2, 2, TENTHS, (10, 1))],
+        &prog,
+    );
+    let mut fed: Vec<(usize, Write)> = (100..120)
+        .map(|k| (0, Write::Frame(k, vec![k as u8; 16])))
+        .collect();
+    fed.insert(3, (1, Write::Message(10_300, r#"{"cue":"a"}"#.to_string())));
+    fed.insert(
+        11,
+        (1, Write::Message(11_000, r#"{"cue":"b"}"#.to_string())),
+    );
+    write_nut(
+        &dir.join("fed.nut"),
+        &[
+            video(2, 2, TENTHS, (10, 1)),
+            Stream::json(TimeBase { num: 1, den: 1000 }),
+        ],
+        &fed,
+    );
+    let prog = dir.join("prog.nut").display().to_string();
+    let fed = dir.join("fed.nut").display().to_string();
+    // `calls` counts an instance's own calls, so the rows are compared
+    // without it.
+    let run = |jobs: &str| -> Vec<Value> {
+        let spots = dir.join(format!("spots-{jobs}.ndjson"));
+        run_at(
+            jobs,
+            &args(&[
+                "-f",
+                "nut",
+                "-i",
+                &prog,
+                "-f",
+                "nut",
+                "-i",
+                &fed,
+                "-m",
+                &module("shape_probe"),
+                "-filter_complex",
+                "[v=0:v][feed=1:v][cues=1:d]shape_probe[spots=s]",
+                "-map",
+                "[s]",
+                "-f",
+                "ndjson",
+                &spots.display().to_string(),
+            ]),
+        );
+        let mut rows = lines(&fs::read(&spots).expect("the rows were written"));
+        for row in &mut rows {
+            row.as_object_mut()
+                .expect("a row is an object")
+                .remove("calls");
+        }
+        rows
+    };
+    let rows = run("1");
+    assert_eq!(rows, run("2"), "-jobs 1 and -jobs 2 differ");
+    assert_eq!(rows, run("4"), "-jobs 1 and -jobs 4 differ");
+    assert_eq!(rows.len(), 40);
+    // Untimed and primed on the first tick, the picture at 10 s shows half a
+    // second, the lead, later: at 5. The rows ride the same offset, from a
+    // time base of their own.
+    assert_eq!(rows[5]["feed"]["at"], 5);
+    assert_eq!(rows[5]["feed"]["first_pts"], 100);
+    // Its last picture shows at 24 and lingers a second; that is told the
+    // lead before the last picture's turn.
+    assert_eq!(rows[18]["feed"]["ends"], Value::Null);
+    assert_eq!(rows[19]["feed"]["ends"], 34);
+    let cues: Vec<(usize, Value)> = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(n, r)| r.get("cues").map(|c| (n, c.clone())))
+        .collect();
+    assert_eq!(
+        cues,
+        vec![
+            (8, serde_json::json!([[8, {"cue": "a"}]])),
+            (15, serde_json::json!([[15, {"cue": "b"}]])),
+        ]
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn one_stream_bound_twice_reaches_both_bindings() {
     let dir = scratch("bound-twice");
     let items: Vec<(usize, Write)> = (0..10)
