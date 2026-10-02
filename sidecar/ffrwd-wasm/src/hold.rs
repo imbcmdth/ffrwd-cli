@@ -20,7 +20,9 @@
 //! source; so is each connection of a port feed. `linger` keeps the last
 //! frame after the source ends, and `timeout` ends a feed that stops
 //! sending. Where the host can foretell the last tick a feed shows on, it
-//! says so (`ends`), counted on the clock's grid.
+//! says so (`ends`), counted on the clock's grid. A source bound in the plan
+//! is held `lead` ahead of the clock, as its priming was, and its end is
+//! told once it is within `lead` of the tick: on the same tick on every run.
 //!
 //! What each feed did is said on stderr, as a line and as a row behind
 //! [`crate::leaky::ROW_PREFIX`].
@@ -581,11 +583,22 @@ impl Group {
         last.pts.saturating_sub(first.pts) >= ticks_of(self.hold.lead, lead.base)
     }
 
+    /// How far past a tick a source bound in the plan is held, in ticks of
+    /// `clock_base`: its `lead`. A port feed is held nothing.
+    fn held_ahead(&self, clock_base: TimeBase) -> i64 {
+        if self.port_fed {
+            0
+        } else {
+            ticks_of(self.hold.lead, clock_base)
+        }
+    }
+
     /// Whether what has arrived settles the tick from `pts` to `end` (None:
     /// to the end of the inputs), for a source bound in the plan: the feed
-    /// has a frame past the interval, or its source ended, or nothing has
-    /// arrived and `reference`, how far the clock has arrived, is `timeout`
-    /// past the interval. A port feed never holds a tick.
+    /// has a frame past the interval, its lead member one `lead` past it,
+    /// or its source ended, or its buffer is full, or nothing has arrived
+    /// and `reference`, how far the clock has arrived, is `timeout` past the
+    /// interval. A port feed never holds a tick.
     pub fn ready(
         &self,
         pts: i64,
@@ -605,15 +618,17 @@ impl Group {
         let Some(source) = self.sources.front() else {
             return timed_out();
         };
-        if source.closed || self.sources.len() > 1 {
+        if source.closed || self.sources.len() > 1 || self.room() == 0 {
             return true;
         }
-        let until = |member: &Member| match member.kind {
-            PortKind::Audio => end.unwrap_or(pts),
-            PortKind::Data => end
-                .unwrap_or(pts)
-                .saturating_add(ticks_of(member.ahead, clock_base)),
-            _ => pts,
+        let ahead = self.held_ahead(clock_base);
+        let reach = |index: usize, member: &Member| {
+            let until = until(member, pts, end, clock_base);
+            if index == source.lead {
+                until.saturating_add(ahead)
+            } else {
+                until
+            }
         };
         match &self.feed {
             Some(feed) => {
@@ -622,24 +637,35 @@ impl Group {
                     .iter()
                     .zip(&self.members)
                     .zip(&source.brings)
-                    .all(|((q, m), brings)| {
-                        let wanted = feed.offset.to_source(until(m), clock_base, q.base);
+                    .enumerate()
+                    .all(|(index, ((q, m), brings))| {
+                        let wanted = feed.offset.to_source(reach(index, m), clock_base, q.base);
                         !brings || q.last.is_some_and(|last| last > wanted)
                     });
                 settled || timed_out()
             }
-            None => match self.anchor_of(source) {
-                Anchor::FirstFrame => self.primed(source) || timed_out(),
-                _ => {
-                    let lead = &source.members[source.lead];
-                    let wanted = Offset::ZERO.to_source(
-                        until(&self.members[source.lead]),
-                        clock_base,
-                        lead.base,
-                    );
-                    lead.last.is_some_and(|last| last > wanted) || timed_out()
+            None => {
+                let lead = &source.members[source.lead];
+                match self.anchor_of(source) {
+                    // A start fixed with nothing past its first frame could
+                    // not yet say whether that frame is its last.
+                    Anchor::FirstFrame => {
+                        let past_first = lead
+                            .queue
+                            .front()
+                            .is_some_and(|first| lead.last.is_some_and(|last| last > first.pts));
+                        (self.primed(source) && past_first) || timed_out()
+                    }
+                    _ => {
+                        let wanted = Offset::ZERO.to_source(
+                            reach(source.lead, &self.members[source.lead]),
+                            clock_base,
+                            lead.base,
+                        );
+                        lead.last.is_some_and(|last| last > wanted) || timed_out()
+                    }
                 }
-            },
+            }
         }
     }
 
@@ -784,8 +810,18 @@ impl Group {
     }
 
     /// Where the feed's last frame shows for the last time, once the source
-    /// has ended or timed out, on the clock's grid.
-    fn foretell(&self, feed: &FeedState, clock_base: TimeBase, grid: &Grid) -> Option<i64> {
+    /// has ended or timed out, on the clock's grid. A source bound in the
+    /// plan is told only once its end is within what `ready` waited for on
+    /// the tick from `pts` to `end`, so the tick it is first told on does
+    /// not depend on how far its reader got.
+    fn foretell(
+        &self,
+        feed: &FeedState,
+        pts: i64,
+        end: Option<i64>,
+        clock_base: TimeBase,
+        grid: &Grid,
+    ) -> Option<i64> {
         let linger = self.hold.linger.map(|s| ticks_of(s, clock_base));
         if let Some((drained, _)) = feed.drained {
             return match linger {
@@ -798,6 +834,14 @@ impl Group {
             return None;
         }
         let lead = &source.members[source.lead];
+        if !self.port_fed {
+            let until = until(&self.members[source.lead], pts, end, clock_base)
+                .saturating_add(self.held_ahead(clock_base));
+            let horizon = feed.offset.to_source(until, clock_base, lead.base);
+            if lead.last.is_some_and(|last| last > horizon) {
+                return None;
+            }
+        }
         let last = match lead.queue.back() {
             Some(frame) => frame.pts,
             None => feed.shown[source.lead].as_ref()?.pts,
@@ -964,7 +1008,7 @@ impl Group {
             self.end_feed(pts, clock_base, why);
             return vec![Handed::default(); self.members.len()];
         }
-        feed.ends = self.foretell(&feed, clock_base, grid);
+        feed.ends = self.foretell(&feed, pts, end, clock_base, grid);
         for hand in &mut handed {
             if let Some(record) = &mut hand.feed {
                 record.ends = feed.ends;
@@ -984,6 +1028,19 @@ impl Group {
         let last = lead.last?;
         let offset = self.feed.as_ref().map_or(Offset::ZERO, |f| f.offset);
         Some(offset.to_clock(last, lead.base, clock_base))
+    }
+}
+
+/// Where a member's source has to have arrived to settle the tick from `pts`
+/// to `end`, on the clock: a picture's tick, the end of a sound's, and a data
+/// member's end and `ahead`.
+fn until(member: &Member, pts: i64, end: Option<i64>, clock_base: TimeBase) -> i64 {
+    match member.kind {
+        PortKind::Audio => end.unwrap_or(pts),
+        PortKind::Data => end
+            .unwrap_or(pts)
+            .saturating_add(ticks_of(member.ahead, clock_base)),
+        _ => pts,
     }
 }
 
@@ -1260,7 +1317,19 @@ mod tests {
         g.source_close(0);
         let handed = g.tick(157, Some(158), THIRTIETHS, &grid);
         assert_eq!(mark(&handed[0]), Some(5));
-        assert_eq!(handed[0].feed.as_ref().unwrap().ends, Some(161));
+        let foretold: Vec<Option<i64>> = (158..=161)
+            .map(|k| {
+                g.tick(k, Some(k + 1), THIRTIETHS, &grid)[0]
+                    .feed
+                    .as_ref()
+                    .and_then(|f| f.ends)
+            })
+            .collect();
+        assert_eq!(
+            foretold,
+            vec![None, None, None, Some(161)],
+            "at lead 0 the end is told on its own tick"
+        );
     }
 
     #[test]
@@ -1409,7 +1478,7 @@ mod tests {
                     .and_then(|f| f.ends)
             })
             .collect();
-        assert_eq!(foretold, vec![Some(2), Some(2), Some(2), None]);
+        assert_eq!(foretold, vec![None, None, Some(2), None]);
         let ended = g.take_ended();
         assert_eq!(ended.len(), 1, "a foretold end is kept as well");
         assert_eq!(ended[0].1.ends, Some(2));
@@ -1626,6 +1695,47 @@ mod tests {
             "untimed: lead 0"
         );
         assert_eq!(mark(&handed[0]), Some(2));
+    }
+
+    #[test]
+    fn a_bound_source_is_told_its_end_lead_ahead_however_far_its_reader_got() {
+        let grid = Grid::exact();
+        let hold = || hold(Anchor::FirstFrame, 0.5, None, None);
+        let ends = |g: &mut Group, k: i64| {
+            g.tick(k, Some(k + 1), THIRTIETHS, &grid)[0]
+                .feed
+                .as_ref()
+                .and_then(|f| f.ends)
+        };
+
+        let (mut read_whole, _) = group(hold(), vec![video_member(1, THIRTIETHS)], false);
+        for pts in 0..=40 {
+            read_whole.arrive(0, frame(pts, 1));
+        }
+        read_whole.source_close(0);
+        let whole: Vec<Option<i64>> = (0..60).map(|k| ends(&mut read_whole, k)).collect();
+
+        let (mut read_late, _) = group(hold(), vec![video_member(1, THIRTIETHS)], false);
+        let (mut next, mut closed) = (0, false);
+        let late: Vec<Option<i64>> = (0..60)
+            .map(|k| {
+                while !closed && !read_late.ready(k, Some(k + 1), THIRTIETHS, None) {
+                    if next <= 40 {
+                        read_late.arrive(0, frame(next, 1));
+                        next += 1;
+                    } else {
+                        read_late.source_close(0);
+                        closed = true;
+                    }
+                }
+                ends(&mut read_late, k)
+            })
+            .collect();
+
+        assert_eq!(whole, late, "the same ticks hear of the end");
+        let told = whole.iter().position(Option::is_some);
+        assert_eq!(told, Some(40), "told 15 ticks, the lead, before it");
+        assert_eq!(whole[40], Some(55), "shown from 15, its last frame at 55");
     }
 
     #[test]

@@ -224,9 +224,10 @@ tick that held them.
   last tick, so it never runs ahead of real time with nothing to hand;
   once every input has ended it runs on to the last frame's time at once.
 - **Hold inputs.** A hold input bound to a stream holds the tick until its
-  source has reached the tick (a frame past it, or its end), for no longer
-  than its `timeout` of clock time, after which the source is behind; a
-  hold input served by a port never holds a tick. Either way a video input
+  source has arrived past it (its picture, or with none its sound, past
+  `lead` beyond the tick), or ended, for no longer than its
+  `timeout` of clock time, after which the source is behind; a hold input
+  served by a port never holds a tick. Either way a video input
   hands the newest frame at or before the tick, repeating the last one
   while the source is behind and skipping forward when it catches up, and
   an audio input hands the tick's samples re-cut from what arrived, or
@@ -236,10 +237,21 @@ tick that held them.
   waits for the clock to reach its pts, and one the clock has passed shows
   at once from where the clock is. The last frame shows on its own turn
   and the feed ends after it, unless `linger` keeps it; a clock that jumps
-  (backwards, or more than a second forwards) ends every feed. Where the
-  source has ended the host foretells the last tick the feed shows on
-  (`feed.ends`), counted on the clock's grid: exact for a rate clock,
-  learned from the frames of an input clock.
+  (backwards, or more than a second forwards) ends every feed. The host
+  foretells the last tick a feed shows on (`feed.ends`), counted on the
+  clock's grid (exact for a rate clock, learned from the frames of an
+  input clock), from the first tick it can:
+  - a feed bound to a stream: the first tick its last frame's turn is
+    within `lead` of, the same tick on every run and at every `-jobs`,
+    since the tick waited for the source that far; at `lead` 0, the tick
+    its last frame shows on;
+  - a feed by port: the first tick after its connection closes, however
+    much it had queued, so when depends on the feeder;
+  - a feed whose source stopped sending: from the tick its `timeout` ran
+    out where `linger` keeps it, otherwise never;
+  - a feed a jump in the clock ends: never.
+  A feed never foretold is still listed, with its last tick, in
+  `ended-feeds`.
 - **Interval inputs.** The clock is held until every interval input's
   producer has progressed past the tick's interval (and `ahead`), for no
   longer than the input's `latency` past it, counted on the clock input's

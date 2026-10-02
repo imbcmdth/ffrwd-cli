@@ -1038,8 +1038,6 @@ fn a_pad_tags_a_held_stream_and_a_tagged_anchor_reads_it() {
     write_nut(&dir.join("feed.nut"), &streams(), &steps(5, 10, 200));
     let prog = dir.join("prog.nut").display().to_string();
     let ad = dir.join("feed.nut").display().to_string();
-    // When the host can foretell a held stream's end depends on how far its
-    // reader has got, so the rows are read once rather than at every -jobs.
     let first_row = |test: &str, pad: &[&str]| {
         let out_dir = dir.join(test);
         fs::create_dir_all(&out_dir).expect("make a run directory");
@@ -1083,6 +1081,81 @@ fn a_pad_tags_a_held_stream_and_a_tagged_anchor_reads_it() {
     assert_ne!(
         untimed["at"], 5,
         "an untimed feed is scheduled by its first frame"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_bound_feeds_end_is_told_lead_ahead_on_every_run_and_worker_count() {
+    let dir = scratch("feed-ends");
+    let steps = |to: i64| -> Vec<(usize, Write)> {
+        (0..to)
+            .flat_map(|k| {
+                [
+                    (1, Write::Frame(k * 4800, vec![0u8; 4800 * 4])),
+                    (0, Write::Frame(k, vec![k as u8; 64])),
+                ]
+            })
+            .collect()
+    };
+    let streams = || {
+        [
+            video(4, 4, TENTHS, (10, 1)),
+            Stream::audio("f32", 48000, 1).expect("f32 is carried"),
+        ]
+    };
+    write_nut(&dir.join("prog.nut"), &streams(), &steps(80));
+    write_nut(&dir.join("ad.nut"), &streams(), &steps(30));
+    let prog = dir.join("prog.nut").display().to_string();
+    let ad = dir.join("ad.nut").display().to_string();
+    let run = |test: &str| {
+        at_every_jobs(
+            test,
+            &args(&[
+                "-f",
+                "nut",
+                "-i",
+                &prog,
+                "-f",
+                "nut",
+                "-i",
+                &ad,
+                "-m",
+                &module("shape_switch"),
+                "-filter_complex",
+                "[v=0:v][a=0:a][feed=1:v][feed_audio=1:a]shape_switch=lead=0.5:timeout=0[feeds=f]",
+                "-map",
+                "[f]",
+                "-f",
+                "ndjson",
+                "{dir}/feeds.ndjson",
+            ]),
+            &["feeds.ndjson"],
+        )
+    };
+    let first = run("feed-ends-1");
+    assert_eq!(first, run("feed-ends-2"), "a second run differs");
+    assert_eq!(first, run("feed-ends-3"), "a third run differs");
+    let rows: Vec<(i64, String, Option<i64>)> = lines(&first[0])
+        .iter()
+        .map(|r| {
+            (
+                r["pts"].as_i64().unwrap(),
+                r["event"].as_str().unwrap().to_string(),
+                r["ends"].as_i64(),
+            )
+        })
+        .collect();
+    // Primed on the first tick, shown half a second later, its last frame
+    // at 5 + 29; the end is told half a second, the lead, before it.
+    assert_eq!(
+        rows,
+        vec![
+            (0, "start".to_string(), None),
+            (5, "live".to_string(), None),
+            (29, "ending".to_string(), Some(34)),
+            (35, "end".to_string(), None),
+        ]
     );
     let _ = fs::remove_dir_all(&dir);
 }
