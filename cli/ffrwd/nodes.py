@@ -100,6 +100,8 @@ from .execute import (
     _resolve_rows_documents,
     _StageRun,
     _watch,
+    held_writers,
+    never_started,
     plan_argv,
     stage_result,
     stage_wires,
@@ -1216,6 +1218,13 @@ class _Coordinator:
         current.abort.set()
         if current.unheard is not None and not interrupted:
             failed, timed_out, wedge = current.unheard[0], True, current.unheard[1]
+        elif failed is None and not interrupted and not show_only:
+            if stop is None or not stop.is_set():
+                missing = never_started(
+                    held_writers(writers, feeds), current.started, stage.processes
+                )
+                if missing is not None:
+                    failed, timed_out, wedge = missing[0], True, missing[1]
         for node in involved:
             self._send(node, {"type": "stop"})
         results = self._collect(stage, current, involved)

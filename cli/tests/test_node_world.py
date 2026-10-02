@@ -1658,6 +1658,39 @@ def test_a_timing_input_alone_takes_the_picture_in_the_format_it_has(
     assert feeder[feeder.index("-pix_fmt:0") + 1] == "yuv444p"
 
 
+@pytest.mark.parametrize(("source", "named"), [("yuv420p", "yuv444p"), ("yuv444p", "yuv420p")])
+def test_a_timing_input_after_a_format_takes_the_format_it_names(
+    monkeypatch: pytest.MonkeyPatch, source: str, named: str
+) -> None:
+    """The stream at that point of the plan is the formatted one, so it crosses
+    as it is: never converted back to the source's format for a port that
+    reads no pixels."""
+    monkeypatch.setitem(SHAPES, "spot.wasm", _taking(_spot, "video", _TIMING))
+    argv = _plan_argv(
+        "COPY (SELECT spot(ffmpeg.format(f.video[1], pix_fmts => '"
+        + named
+        + "')) FROM input('f.mp4') f) TO 'spots.ndjson'",
+        monkeypatch,
+        pix_fmt=source,
+    )
+    (writer,) = [words for pid, words in argv.items() if pid.startswith("ffmpeg")]
+    assert writer[writer.index("-filter_complex") + 1].endswith(f"format=pix_fmts={named}[out0]")
+    assert writer[writer.index("-pix_fmt:0") + 1] == named
+    _with_boxes_mask(monkeypatch)
+    mixed = _plan_argv(
+        _BOXES_MASK + "COPY (SELECT boxes_mask(ffmpeg.format(f.video[1], pix_fmts => '"
+        + named
+        + "'), spot(f.video[1])) FROM input('f.mp4') f) TO 'mask.mkv'",
+        monkeypatch,
+        pix_fmt=source,
+    )
+    (feeder,) = [
+        words for pid, words in mixed.items() if pid.startswith("ffmpeg") and "-pix_fmt:1" in words
+    ]
+    assert feeder[feeder.index("-pix_fmt:0") + 1] == "rgba"
+    assert feeder[feeder.index("-pix_fmt:1") + 1] == named
+
+
 def test_explain_says_timing_for_an_input_read_for_its_timing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

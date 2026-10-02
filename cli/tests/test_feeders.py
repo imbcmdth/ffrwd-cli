@@ -650,6 +650,57 @@ def test_a_writer_ends_nothing_once_its_reader_has_gone(code: int) -> None:
     ) == (None, False, None)
 
 
+def test_a_writer_its_readers_wait_on_is_started_with_the_stage() -> None:
+    """Held for its port is only a writer whose readers can listen without it."""
+    writers = {
+        "ffmpeg1": (9000, ["sidecar0"]),
+        "sidecar1": (9002, ["sidecar1", "sidecar2"]),
+        "ffmpeg3": (9004, ["sidecar3"]),
+    }
+    feeds = [("ffmpeg2", "sidecar0"), ("ffmpeg3", "sidecar4"), ("sidecar4", "sidecar3")]
+    assert execute.held_writers(writers, feeds) == {"ffmpeg1": (9000, ["sidecar0"])}
+
+
+def test_a_stage_that_never_started_a_writer_fails() -> None:
+    """Whether its port was never heard or its readers ended first, nothing it
+    writes was written, and the run says so instead of exiting 0."""
+    held = {"sidecar0": (9000, ["sidecar1"])}
+    assert execute.never_started(held, ["sidecar0", "sidecar1"], ["sidecar0", "sidecar1"]) is None
+    assert execute.never_started(held, ["sidecar1"], ["sidecar1"]) is None
+    pid, error = execute.never_started(held, ["sidecar1"], ["sidecar0", "sidecar1"])
+    assert pid == "sidecar0" and error.code is ErrorCode.INPUT_NEVER_OPENED
+    assert error.message.startswith(
+        "sidecar0, which writes tcp://127.0.0.1:9000 for sidecar1, was never started"
+    )
+    result = execute.stage_result(
+        0, [], {}, [], failed=pid, timed_out=True, wedge=error, interrupted=False
+    )
+    assert result.exit_code != 0 and result.overflow is error and not result.timed_out
+
+
+def test_an_unheld_writers_first_instance_waits_for_its_port(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(execute, "FEEDER_WAIT", 0.3)
+    stop = threading.Event()
+    with _held_port() as listener:
+        port = listener.getsockname()[1]
+        assert execute._unheard_port([port], stop) == port
+
+        def listen_late() -> None:
+            time.sleep(0.1)
+            listener.listen()
+
+        monkeypatch.setattr(execute, "FEEDER_WAIT", 10.0)
+        opener = threading.Thread(target=listen_late)
+        opener.start()
+        assert execute._unheard_port([port], stop) is None
+        opener.join()
+    stop.set()
+    with _held_port() as listener:
+        assert execute._unheard_port([listener.getsockname()[1]], stop) is not None
+
+
 def test_a_writer_failing_while_its_reader_runs_ends_the_stage() -> None:
     members = _members(sidecar0=None, ffmpeg0=1)
     failed, _, _ = execute._watch(

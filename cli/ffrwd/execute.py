@@ -817,6 +817,58 @@ def unheard_error(
     )
 
 
+def unstarted_error(writer: str, readers: Sequence[str], port: int) -> FfrwdError:
+    """The typed failure for a feeder's writer the stage ended without starting."""
+    return FfrwdError(
+        ErrorCode.INPUT_NEVER_OPENED,
+        f"{writer}, which writes {feeder_path(port)} for {' and '.join(readers)}, "
+        "was never started: its readers ended without listening there, and "
+        "nothing it writes was written",
+        hint="the module listens on its port when it is opened; check that it "
+        "imports wasi:sockets/tcp and opens the port its describe names",
+    )
+
+
+def held_writers(
+    writers: Mapping[str, tuple[int, list[str]]], feeds: Iterable[tuple[str, str]]
+) -> dict[str, tuple[int, list[str]]]:
+    """The feeders' writers a stage holds until their port accepts.
+
+    A writer one of whose readers is itself, or reads what it writes, is
+    started with the rest: its readers would never listen while it waited
+    for them. Its lateral's instances wait for the port instead.
+    """
+    downstream: dict[str, set[str]] = {}
+    for source, target in feeds:
+        downstream.setdefault(source, set()).add(target)
+
+    def reached(start: str) -> set[str]:
+        seen = {start}
+        todo = [start]
+        while todo:
+            for after in downstream.get(todo.pop(), ()):
+                if after not in seen:
+                    seen.add(after)
+                    todo.append(after)
+        return seen
+
+    return {
+        pid: (port, readers)
+        for pid, (port, readers) in writers.items()
+        if not reached(pid) & set(readers)
+    }
+
+
+def never_started(
+    held: Mapping[str, tuple[int, list[str]]], started: Collection[str], local: Collection[str]
+) -> tuple[str, FfrwdError] | None:
+    """The first writer held here that a stage ended without starting, and why."""
+    for pid, (port, readers) in held.items():
+        if pid in local and pid not in started:
+            return pid, unstarted_error(pid, readers, port)
+    return None
+
+
 def _await_port(
     port: int,
     readers: Sequence[_Member],
@@ -1907,6 +1959,9 @@ class _LateralRun:
     at a time. A message that arrives while another's instance runs waits its
     turn, and one whose programme time would overlap the running or a waiting
     one is refused with a row. Each instance ends with a row saying how.
+
+    `ports` are the connections whose readers were not listening when the
+    writer started: the first instance waits for each to accept.
     """
 
     def __init__(
@@ -1918,8 +1973,10 @@ class _LateralRun:
         dump: Path | None,
         echo: Callable[[str, list[str]], None] | None,
         path: str | None = None,
+        ports: Sequence[int] = (),
     ) -> None:
         self.lateral = lateral
+        self._ports = list(ports)
         # The pipe the host reads the messages off, where the writer's region
         # writes them itself; None where an ffmpeg dials the tap's port.
         self._path = path
@@ -2091,6 +2148,18 @@ class _LateralRun:
     def _run(self, launch: _Launch) -> None:
         """One instance: compiled from the template as ``ffrwd run -v`` would,
         run by the plan runner, its members' stderr kept, and a row said."""
+        unheard = _unheard_port(self._ports, self._stop)
+        if unheard is not None:
+            self._row(
+                launch.row,
+                launch.start,
+                refused=_ENDED
+                if self._stop.is_set()
+                else f"nothing listened on {feeder_path(unheard)} for its feeder in "
+                f"{FEEDER_WAIT:.0f}s",
+            )
+            return
+        self._ports.clear()
         lateral = self.lateral
         filled = substitute(lateral.template, dict(launch.variables))
         # The template follows the definitions, so what an unset variable's
@@ -2129,6 +2198,22 @@ class _LateralRun:
                         self._dump / f"feeder{launch.row}.{member.id}.stderr", member
                     )
         self._row(launch.row, launch.start, exit=_instance_exit(result))
+
+
+def _unheard_port(ports: Sequence[int], stop: threading.Event) -> int | None:
+    """The first of `ports` that accepted no connection in `FEEDER_WAIT`, or
+    before `stop`; None once every one has."""
+    for port in ports:
+        until = time.monotonic() + FEEDER_WAIT
+        while True:
+            if stop.is_set() or time.monotonic() >= until:
+                return port
+            try:
+                with socket.create_connection((FEEDER_HOST, port), timeout=_FEEDER_POLL * 5):
+                    break
+            except OSError:
+                time.sleep(_FEEDER_POLL)
+    return None
 
 
 def _ignore_flow(row: Mapping[str, object]) -> None:
@@ -2274,6 +2359,10 @@ def _run_stage(
                 run.feeding,
                 stop,
             )
+        if failed is None and not show_only and not (stop is not None and stop.is_set()):
+            missing = never_started(run.held, run.members, run.local)
+            if missing is not None:
+                failed, timed_out, wedge = missing[0], True, missing[1]
     except KeyboardInterrupt:
         # `failed`/`timed_out`/`wedge` stay at their unstruck defaults: the
         # stage below reads as a clean stop, not a failure.
@@ -2379,6 +2468,7 @@ class _StageRun:
         self.stage_wires, self.writers = stage_wires(plan, stage, assigned)
         self.feeds = [(wire.edge.source, wire.edge.target) for wire in self.stage_wires]
         self.feeding = {pid: readers for pid, (_, readers) in self.writers.items()}
+        self.held = held_writers(self.writers, self.feeds)
         self.deadline = math.inf if timeout is None else time.monotonic() + timeout
         self.members: dict[str, _Member] = {}
         self.watching: dict[str, subprocess.Popen[bytes]] = {}
@@ -2410,12 +2500,15 @@ class _StageRun:
                         laterals.dump,
                         self._echo,
                         tap[1] if tap is not None else None,
+                        ()
+                        if lateral.writer in self.held
+                        else [one.port for one in lateral.connections],
                     )
                 )
 
         self._relay_wires()
         for pid in _spawn_order(self.ids, self.stage_wires):
-            if pid in self.local and pid not in self.writers:
+            if pid in self.local and pid not in self.held:
                 self._spawn(pid)
 
         for pid, window in self.watching.items():
@@ -2435,7 +2528,7 @@ class _StageRun:
         time; None otherwise.
         """
         live = self.live + list(elsewhere)
-        for pid, (port, readers) in self.writers.items():
+        for pid, (port, readers) in self.held.items():
             if pid not in self.local:
                 continue
             heard = _await_port(
@@ -2644,7 +2737,7 @@ def stage_result(
     if timed_out:
         failure = next((r for r in results if r.id == failed), None)
         failures = [r for r in results if r.id == failed]
-        code = 0 if failure is None else _FAILED
+        code = 0 if failure is None and wedge is None else _FAILED
     elif failed is not None:
         failure, consequences = _attribute(results, ended, feeds, writers)
         blamed = {r.id for r in consequences}

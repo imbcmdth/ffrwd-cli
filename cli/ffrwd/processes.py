@@ -4724,7 +4724,7 @@ class _Partitioner:
                 codec=SAMPLE_FMT_CODECS[WIRE_SAMPLE_FMTS[0]],
             )
         producer = _ref_node(ref)
-        own = meta.pix_fmt if meta is not None else None
+        own = self._carried_pix_fmt(ref)
         pix_fmt = (
             self._pix_fmt(ref, None)
             if producer is not None and self.external.get(producer, False)
@@ -4739,6 +4739,29 @@ class _Partitioner:
             height=size[1] if size else None,
             timebase=_timebase(meta.fps) if meta else None,
         )
+
+    def _carried_pix_fmt(self, ref: FrameRef) -> str | None:
+        """The pixel format the pictures `ref` carries already have: the one the
+        nearest ``format`` on their way from the input names, else the input's
+        own. None past a module, or a ``format`` naming several."""
+        seen: set[str] = set()
+        current = ref
+        while not is_src(current):
+            name = _ref_node(current)
+            if name is None or name not in self.g.nodes or name in seen:
+                return None
+            seen.add(name)
+            node = self.g.nodes[name]
+            if node.filter == "format":
+                named = str(node.args.get("pix_fmts", ""))
+                return named if named and "|" not in named else None
+            if self.external.get(name, False) or not node.inputs:
+                return None
+            current = next(
+                (r for r in node.inputs if ref_type(self.g, r) == "video"), node.inputs[0]
+            )
+        meta = self._origin_meta(current)
+        return meta.pix_fmt if meta is not None else None
 
     def _reads_timing(self, name: str, ref: FrameRef) -> bool:
         """Whether node `name` reads `ref`, or a split's copy of it, for its
