@@ -16,6 +16,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import replace
+from fractions import Fraction
 from pathlib import Path
 
 import pytest
@@ -694,7 +695,7 @@ _HELD = {
 
 
 def _switch_shape(
-    module: str, params: str, bound: Sequence[str], grants: Sequence[str] = ()
+    module: str, params: str, bound: Sequence[shapes.Binding], grants: Sequence[str] = ()
 ) -> shapes.NodeShape:
     """ffrwd/switch 0.5.0's shape: the programme, and a feed group held on `port`."""
 
@@ -778,7 +779,7 @@ NODE_AUCTION = "modules/auction_node.wasm"
 
 
 def _source_and_auction_shape(
-    module: str, params: str, bound: Sequence[str], grants: Sequence[str] = ()
+    module: str, params: str, bound: Sequence[shapes.Binding], grants: Sequence[str] = ()
 ) -> shapes.NodeShape:
     """A subscription's one rendition, and an auction node reading its deals."""
     data = {"kind": "data", "codec": "json"}
@@ -865,7 +866,7 @@ _TWO_ADS = """COPY (
 
 
 def _compose_shape(
-    module: str, params: str, bound: Sequence[str], grants: Sequence[str] = ()
+    module: str, params: str, bound: Sequence[shapes.Binding], grants: Sequence[str] = ()
 ) -> shapes.NodeShape:
     """ffrwd/blitz's compose: the programme, and pictures held on `port` when
     `inputs` is bound, so a call binding none listens on nothing."""
@@ -873,7 +874,7 @@ def _compose_shape(
         "kind": "hold",
         "anchor": {"kind": "tagged", "tag": "smart_timed"},
         "lead": 0.3,
-        "port_param": "port" if "inputs" in bound else None,
+        "port_param": "port" if any(one.input == "inputs" for one in bound) else None,
     }
 
     def port(name: str, pairing: dict[str, object], many: bool) -> dict[str, object]:
@@ -901,11 +902,22 @@ def _compose_modules(port: dict[str, object]) -> dict[str, Described]:
     }
 
 
-def _composed(port: dict[str, object]) -> ProcessPlan:
+def _composed(
+    port: dict[str, object], asked: list[Sequence[shapes.Binding]] | None = None
+) -> ProcessPlan:
+    """The two ads into compose; `asked` collects each bound list its shape is asked for."""
+
+    def shape(
+        module: str, params: str, bound: Sequence[shapes.Binding], grants: Sequence[str] = ()
+    ) -> shapes.NodeShape:
+        if asked is not None and module == COMPOSE:
+            asked.append(bound)
+        return _compose_shape(module, params, bound, grants)
+
     plan = compile_all(
         _declared(_TWO_ADS).replace("COPY (", _COMPOSE + "\nCOPY (", 1),
         describe=lambda path: _compose_modules(port)[path],
-        shape=_compose_shape,
+        shape=shape,
     ).plan
     assert plan is not None
     return plan
@@ -913,8 +925,16 @@ def _composed(port: dict[str, object]) -> ProcessPlan:
 
 def test_two_laterals_on_one_held_many_port_are_two_connections() -> None:
     """Each lateral is a connection of its own, so a module taking its port
-    param as an array is given one port per lateral, in the order written."""
-    plan = _composed({"type": "array", "items": {"type": "integer"}})
+    param as an array is given one port per lateral, in the order written,
+    and its shape is told two streams there whose rate nothing settles."""
+    asked: list[Sequence[shapes.Binding]] = []
+    plan = _composed({"type": "array", "items": {"type": "integer"}}, asked)
+    assert {tuple(bound) for bound in asked} == {
+        (
+            shapes.Binding("v", (shapes.StreamHint(Fraction(25)),)),
+            shapes.Binding("inputs", (shapes.StreamHint(None), shapes.StreamHint(None))),
+        )
+    }
     assert len(plan.laterals) == 2
     ports = [lateral.connections[0].port for lateral in plan.laterals]
     assert len(set(ports)) == 2

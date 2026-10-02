@@ -286,6 +286,7 @@ import socket
 import urllib.parse
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from fractions import Fraction
 from typing import Literal, cast
 
 from sqlglot import exp
@@ -437,11 +438,14 @@ from ffrwd.processes import (
 )
 from ffrwd.registry import DynamicFilter, FilterOption, Registry, SourceFilter
 from ffrwd.shapes import (
+    Binding,
     InputPort,
     NodeShape,
     OutputPort,
     Shape,
     ShapeCache,
+    StreamHint,
+    Wants,
     node_shape,
     row_mismatch,
 )
@@ -469,6 +473,7 @@ from ffrwd.table import (
     TableSink,
     VectorCell,
 )
+from ffrwd.timing import stream_rate
 from ffrwd.types import (
     ATTACHMENT_TYPE,
     ATTACHMENTS_COLUMN,
@@ -2090,9 +2095,38 @@ def _sink_view(described: Described, ports: Mapping[str, InputPort | None]) -> D
         video_streams=arity(video),
         audio_streams=arity(audio),
         data_streams=arity(data),
-        wants=first.accepts.wants if first is not None else "all",
+        wants=_sink_wants(first.accepts.wants) if first is not None else "all",
         packet_filter=False,
     )
+
+
+def _sink_wants(wants: Wants) -> SinkWants:
+    """What a port reading coded packets asks for; `timing` is a frame
+    port's, which the host refuses on any other."""
+    return "all" if wants == "timing" else wants
+
+
+def _conformed(shape: NodeShape, bound: Sequence[Binding]) -> list[Binding]:
+    """`bound` with each sound's rate the one its port conforms it to: the
+    first rate an audio port accepts, where it names any. A port read for
+    its timing is handed the sound as it is."""
+    conformed: list[Binding] = []
+    for binding in bound:
+        port = shape.input(binding.input)
+        rates = port.accepts.sample_rates if port is not None else ()
+        if port is None or port.kind != "audio" or not rates or port.accepts.wants == "timing":
+            conformed.append(binding)
+            continue
+        conformed.append(
+            replace(
+                binding,
+                streams=tuple(
+                    hint if hint.rate is None else StreamHint(Fraction(rates[0]))
+                    for hint in binding.streams
+                ),
+            )
+        )
+    return conformed
 
 
 def _sink_stream_count(node: exp.Expr, arguments: int) -> int:
@@ -4138,6 +4172,9 @@ class _Lowerer:
         # A node at a COPY's TO, by module: the packet sink its shape reads as,
         # and the shape.
         self._node_sinks: dict[str, tuple[Described, NodeShape]] = {}
+        # Each node's shape by its id, read back off the graph for the rates
+        # its outputs run at.
+        self._made_shapes: dict[str, NodeShape] = {}
         self.probes = probes
         # Why an alias in `probes` maps to None, when there is a specific
         # answer -- unset (or no answer for this alias) reads the same as an
@@ -9786,11 +9823,13 @@ class _Lowerer:
             declared, described, call, inner, select, env, {}, first=1
         )
         params_json = json.dumps(params, sort_keys=True) if params else ""
+        read_ref = f"src:{raw.source}:{_TYPE_MARKERS[kind]}:{index}"
         port, wants = (
-            self._node_rows_port(declared, described, params, inner, select)
+            self._node_rows_port(declared, described, params, read_ref, inner, select)
             if described.node
             else ("", described.wants)
         )
+        rate = self._stream_rate(read_ref) if described.node else None
         read = PacketRead(
             spec=spec,
             input_args=flags,
@@ -9800,6 +9839,7 @@ class _Lowerer:
             params=params_json,
             wants=wants,
             port=port,
+            rate=None if rate is None else (rate.numerator, rate.denominator),
         )
         key = packet_rows_key(
             spec,
@@ -9929,18 +9969,20 @@ class _Lowerer:
         declared: WasmFunction,
         described: Described,
         params: Mapping[str, object],
+        read: FrameRef,
         node: exp.Anonymous,
         select: exp.Select,
     ) -> tuple[str, SinkWants]:
-        """The port a node read in FROM is handed the stream on, and how much
-        of it the port asks for.
+        """The port a node read in FROM is handed the stream `read` on, and how
+        much of it the port asks for.
 
         Its shape for the call's params, with that port bound, has to read
         coded packets there and make no output: what the read binds is the
         rows the node emits beside its ports.
         """
         name = declared.params[0].name
-        shape = self._node_shape(declared, described, params, [name], node, select)
+        bound = [Binding(name, (StreamHint(self._stream_rate(read)),))]
+        shape = self._node_shape(declared, described, params, bound, node, select)
         port = shape.input(name)
         if port is None or port.kind != "packets" or shape.outputs:
             said = (
@@ -9959,7 +10001,7 @@ class _Lowerer:
                 hint=f"a node read in FROM takes coded packets on '{name}' and "
                 "emits rows alone; declare this one as what it is",
             )
-        return name, port.accepts.wants
+        return name, _sink_wants(port.accepts.wants)
 
     def _check_packet_rows_schema(
         self,
@@ -16255,7 +16297,7 @@ class _Lowerer:
         declared: WasmFunction,
         described: Described,
         params: Mapping[str, object],
-        bound: Sequence[str],
+        bound: Sequence[Binding],
         base: exp.Anonymous,
         select: exp.Select,
     ) -> NodeShape:
@@ -16303,7 +16345,15 @@ class _Lowerer:
         # A lateral's port is bound, to the host's own stream, so the shape
         # is asked with it; what it binds in the network is nothing.
         bound = [
-            param.name for param in declared.ports if param.name in streams
+            Binding(
+                param.name,
+                tuple(
+                    StreamHint(None if param.name in fed else self._stream_rate(stream.ref))
+                    for stream in streams[param.name].streams
+                ),
+            )
+            for param in declared.ports
+            if param.name in streams
         ]
         streams = {name: value for name, value in streams.items() if name not in fed}
         held = {
@@ -16311,6 +16361,10 @@ class _Lowerer:
             for name, argument in numbers.items()
         }
         shape = self._node_shape(declared, described, shape_params, bound, base, select)
+        rated = _conformed(shape, bound)
+        if rated != bound:
+            bound = rated
+            shape = self._node_shape(declared, described, shape_params, bound, base, select)
         self._check_node_ports(declared, shape, {**streams, **fed}, numbers, base, select)
         ports: dict[str, object] = {}
         for name, argument in numbers.items():
@@ -16448,6 +16502,17 @@ class _Lowerer:
         instance = _NodeInstance(ref=ref, shape=shape)
         self._node_refs[key] = instance
         return instance
+
+    def _stream_rate(self, ref: FrameRef) -> Fraction | None:
+        """The rate the stream `ref` runs at, as far as the compile knows it."""
+        return stream_rate(self.graph, self.probes, self._made_shape, ref)
+
+    def _made_shape(self, name: str) -> NodeShape | None:
+        found = self._made_shapes.get(name)
+        raw = self.graph.node_shapes.get(name)
+        if found is None and raw is not None:
+            found = self._made_shapes[name] = node_shape(self.graph.nodes[name].filter, raw)
+        return found
 
     def _emits_rows(self, ref: FrameRef, described: Described) -> None:
         """The rows a node emits beside its ports, where it says it does: one

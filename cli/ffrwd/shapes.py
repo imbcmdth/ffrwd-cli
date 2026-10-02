@@ -1,15 +1,17 @@
 """A node module's shape for one call: its ports, how each pairs, its clock.
 
-A module exporting ``ffrwd:av@0.19.0``'s ``node`` says what it reads and
+A module exporting ``ffrwd:av@0.19.1``'s ``node`` says what it reads and
 writes per call, not once: its ports and formats turn on its params and on
 which inputs the call binds. The compiler asks the sidecar for each distinct
-call, ``ffrwd-wasm --shape <module> --params <json> --bound <ports>``, which
-prints the WIT's ``node-shape`` record as JSON (:class:`NodeShape`).
+call, ``ffrwd-wasm --shape <module> --params <json> --bound <bindings>``,
+which prints the WIT's ``node-shape`` record as JSON (:class:`NodeShape`).
+The bound inputs go as JSON, one :class:`Binding` per input with a
+:class:`StreamHint` per stream, so a shape may turn on the clock's rate.
 :func:`shape` runs that, and like :func:`ffrwd.wasm.describe` it is a seam: a
 lowering test hands over its own and nothing is spawned.
 
 A shape is a pure function of the module's bytes, the params and the bound
-port names, so :class:`ShapeCache` asks once per distinct triple.
+list, hints and all, so :class:`ShapeCache` asks once per distinct triple.
 
 Also here, since every reader of a shape needs them: the streaming words a
 window is said in (:func:`window_words`), and structural row matching
@@ -34,6 +36,7 @@ from .errors import ErrorCode, FfrwdError
 __all__ = [
     "Accepts",
     "Anchor",
+    "Binding",
     "Clock",
     "Hold",
     "InputPort",
@@ -44,6 +47,8 @@ __all__ = [
     "Pairing",
     "Shape",
     "ShapeCache",
+    "StreamHint",
+    "bound_json",
     "node_shape",
     "row_mismatch",
     "shape",
@@ -56,11 +61,11 @@ PairingKind = Literal["lockstep", "hold", "interval", "arrival"]
 AnchorKind = Literal["shared-clock", "first-frame", "tagged"]
 ClockKind = Literal["input", "rate", "rate-of", "self-clocked"]
 FormatKind = Literal["video", "audio", "data", "packets", "like"]
-Wants = Literal["all", "keyframes", "first"]
+Wants = Literal["all", "keyframes", "first", "timing"]
 
 _PORT_KINDS: tuple[PortKind, ...] = ("video", "audio", "data", "packets")
 _ROWS_USES: tuple[RowsUse, ...] = ("ignore", "per-frame", "state")
-_WANTS: tuple[Wants, ...] = ("all", "keyframes", "first")
+_WANTS: tuple[Wants, ...] = ("all", "keyframes", "first", "timing")
 _ANCHORS: tuple[AnchorKind, ...] = ("shared-clock", "first-frame", "tagged")
 
 _SHAPE_FLAG = "--shape"
@@ -77,10 +82,14 @@ _UNKNOWN_HINT = "the module may be built against a sidecar this ffrwd does not k
 
 @dataclass(frozen=True)
 class Anchor:
-    """How a hold input's offset is fixed; `tag` names the tag `tagged` reads."""
+    """How a hold or interval input's offset is fixed; `tag` names the tag
+    `tagged` reads."""
 
     kind: AnchorKind
     tag: str = ""
+
+
+_SHARED_CLOCK = Anchor("shared-clock")
 
 
 @dataclass(frozen=True)
@@ -97,6 +106,14 @@ class Hold:
 class Interval:
     latency: float | None = None
     ahead: float = 0.0
+    anchor: Anchor = _SHARED_CLOCK
+    group: str | None = None
+
+    @property
+    def retimed(self) -> bool:
+        """Whether the host re-stamps the stream onto the clock: its pts count
+        from an origin of their own, not the clock's."""
+        return self.anchor.kind != "shared-clock"
 
 
 @dataclass(frozen=True)
@@ -201,6 +218,45 @@ class NodeShape:
 
     def to_dict(self) -> dict[str, object]:
         return dict(self.raw)
+
+
+@dataclass(frozen=True)
+class StreamHint:
+    """What the compiler knows of one bound stream before the run: a video
+    stream's frame rate or an audio stream's sample rate, None where nothing
+    settles it."""
+
+    rate: Fraction | None = None
+
+
+@dataclass(frozen=True)
+class Binding:
+    """One input a call binds, as `shape` is told it: a hint per stream, in
+    the order the call names them."""
+
+    input: str
+    streams: tuple[StreamHint, ...] = (StreamHint(),)
+
+
+def bound_json(bound: Sequence[Binding]) -> str:
+    """`bound` as ``--bound`` takes it."""
+    return json.dumps(
+        [
+            {
+                "input": binding.input,
+                "streams": [
+                    {
+                        "rate": None
+                        if hint.rate is None
+                        else {"num": hint.rate.numerator, "den": hint.rate.denominator}
+                    }
+                    for hint in binding.streams
+                ],
+            }
+            for binding in bound
+        ],
+        separators=(",", ":"),
+    )
 
 
 def _reject(message: str, hint: str = _UNKNOWN_HINT) -> FfrwdError:
@@ -330,10 +386,14 @@ def _pairing(value: object, module: str, port: str) -> Pairing:
         )
     if kind == "interval":
         arm = _object(_arm(raw, kind), what, module)
+        anchor = arm.get("anchor")
         return Pairing(
             "interval",
             interval=Interval(
-                latency=_number(arm.get("latency")), ahead=_number(arm.get("ahead")) or 0.0
+                latency=_number(arm.get("latency")),
+                ahead=_number(arm.get("ahead")) or 0.0,
+                anchor=_SHARED_CLOCK if anchor is None else _anchor(anchor, module),
+                group=_text(arm.get("group")),
             ),
         )
     if kind in ("lockstep", "arrival"):
@@ -518,10 +578,12 @@ def node_shape(module: str, payload: object) -> NodeShape:
 # lowering test passes its own. `grants` are the sidecar flags a module's own
 # imports need to answer at all (a source reading the network for its
 # outputs), ahead of the flag that dispatches the call.
-Shape = Callable[[str, str, Sequence[str], Sequence[str]], NodeShape]
+Shape = Callable[[str, str, Sequence[Binding], Sequence[str]], NodeShape]
 
 
-def shape(module: str, params: str, bound: Sequence[str], grants: Sequence[str] = ()) -> NodeShape:
+def shape(
+    module: str, params: str, bound: Sequence[Binding], grants: Sequence[str] = ()
+) -> NodeShape:
     """Ask the sidecar for the shape of `module` under `params` with `bound` bound.
 
     Raises ``FfrwdError`` and nothing else, unanchored: the caller anchors it
@@ -542,7 +604,7 @@ def shape(module: str, params: str, bound: Sequence[str], grants: Sequence[str] 
         )
     argv = [sidecar, *grants, _SHAPE_FLAG, module]
     if bound:
-        argv += [_BOUND_FLAG, ",".join(bound)]
+        argv += [_BOUND_FLAG, bound_json(bound)]
     budget = timeout_seconds()
     with tempfile.TemporaryDirectory(prefix="ffrwd-shape-") as scratch:
         if len(params) > PARAMS_INLINE_LIMIT:
@@ -609,20 +671,20 @@ def _module_hash(module: str) -> str:
 
 
 class ShapeCache:
-    """One :data:`Shape` asked once per (module bytes, params, bound ports)."""
+    """One :data:`Shape` asked once per (module bytes, params, bound list)."""
 
     def __init__(self, ask: Shape = shape) -> None:
         self._ask = ask
         self._hashes: dict[str, str] = {}
-        self._shapes: dict[tuple[str, str, frozenset[str]], NodeShape] = {}
+        self._shapes: dict[tuple[str, str, tuple[Binding, ...]], NodeShape] = {}
 
     def __call__(
-        self, module: str, params: str, bound: Sequence[str], grants: Sequence[str] = ()
+        self, module: str, params: str, bound: Sequence[Binding], grants: Sequence[str] = ()
     ) -> NodeShape:
         digest = self._hashes.get(module)
         if digest is None:
             digest = self._hashes[module] = _module_hash(module)
-        key = (digest, params, frozenset(bound))
+        key = (digest, params, tuple(bound))
         found = self._shapes.get(key)
         if found is None:
             found = self._shapes[key] = self._ask(module, params, bound, grants)

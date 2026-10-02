@@ -3445,7 +3445,7 @@ def test_init_rust_writes_a_node_module_package_that_reads_back(
     package = read_manifest(root / "ffrwd.json")
     assert package.name == "me/my_filter" and package.version == "0.1.0"
     assert list(package.exports) == ["passthrough"] and list(package.recipes) == ["passthrough"]
-    assert dict(package.dependencies) == {"ffrwd/wasm": "0.19.0"}
+    assert dict(package.dependencies) == {"ffrwd/wasm": "0.19.1"}
     # Declared empty rather than absent: the scaffold shows its author where
     # they go.
     assert package.keywords == () and package.capabilities == ()

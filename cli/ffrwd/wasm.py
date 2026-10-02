@@ -174,7 +174,7 @@ WORLDS: tuple[str, ...] = (
     "ffrwd:av@0.16.0",
     "ffrwd:av@0.17.0",
     "ffrwd:av@0.18.0",
-    "ffrwd:av@0.19.0",
+    "ffrwd:av@0.19.1",
 )
 
 # The world a module scaffolded today is built against: the newest of those,
@@ -245,7 +245,7 @@ DATA_FILTER_WORLD = "ffrwd:av@0.17.0"
 # The first world whose sidecar hosts a codec package's encoder and decoder.
 CODEC_WORLD = "ffrwd:av@0.18.0"
 
-# What a module exporting the 0.19.0 world's `node` describes as its world:
+# What a module exporting the 0.19.1 world's `node` describes as its world:
 # its ports are not in its describe at all but in its shape, per call
 # (:mod:`ffrwd.shapes`).
 NODE_WORLD = "node-module"
@@ -866,7 +866,7 @@ def _hosted_world(world: str) -> str:
     """The world the sidecar hosts a module in, as the compiler's checks read it.
 
     The sidecar describes a module by the world it hosts it in, not the one
-    it was built against: a node is `node-module`, which is 0.19.0's, and
+    it was built against: a node is `node-module`, which is 0.19.1's, and
     every older module is adapted into the newest world it knows. Each
     `hosts_*` check asks what that world can host.
     """
@@ -1574,6 +1574,9 @@ class PacketRead:
     # The input of a node module the stream binds, whose rows are what the
     # node emits beside its ports; empty for a packet sink.
     port: str = ""
+    # The stream's rate, as the node's shape was told it; None where the
+    # probe said none.
+    rate: tuple[int, int] | None = None
 
 
 # Runs one packet sink over one stream and returns the rows it wrote:
@@ -1706,6 +1709,8 @@ def _node_reader_argv(
     )
     network, groups = build_node_network(graph, pipe_inputs=[STDIN])
     argv = [binary, "-f", EDGE_FORMAT, "-i", STDIN]
+    if read.rate is not None:
+        argv += ["-pad", json.dumps({"rate": _rate_json(read.rate)})]
     for effect in EFFECTS:
         if described is not None and getattr(described, effect):
             argv += [_GRANT_FLAGS[effect], read.module]
@@ -2010,7 +2015,11 @@ def _argv(
     ``-pad '<json>'`` right after its own ``-i``, ``{"row": ..., "rendition":
     {...}}`` with absent attributes omitted -- a pad with none gets no flag.
     A node network's input carrying a raw picture gets its ``"color"`` there
-    too (:attr:`SidecarProcess.colors`), since NUT writes none.
+    too (:attr:`SidecarProcess.colors`), since NUT writes none, and every
+    input whose streams' rates the compile knew gets their ``"rate"``
+    (:attr:`SidecarProcess.rates`), which the host tells each node's shape:
+    ``{"num", "den"}`` where every stream runs at it, else one per stream
+    keyed by its pad, ``{"v": {...}, "a": {...}}``.
 
     `writes` is the mirror on the other side: one path per rows document the
     process writes, in document order, since a process writing several of
@@ -2059,6 +2068,13 @@ def _argv(
             tags = process.tags[index] if index < len(process.tags) else ()
             if tags:
                 pad["tags"] = dict(tags)
+            rates = process.rates[index] if index < len(process.rates) else ()
+            if rates:
+                pad["rate"] = (
+                    _rate_json((rates[0][1], rates[0][2]))
+                    if rates[0][0] == ""
+                    else {key: _rate_json((num, den)) for key, num, den in rates}
+                )
             if pad:
                 argv += ["-pad", json.dumps(pad)]
     if any(grant.effect == "gpu" for grant in process.grants):
@@ -2257,6 +2273,11 @@ def _network_args(process: SidecarProcess, writes: Sequence[str] = ()) -> list[s
     for target, tail in zip(targets, tails):
         argv += ["-map", target, *tail]
     return argv
+
+
+def _rate_json(rate: tuple[int, int]) -> dict[str, int]:
+    """A rate as ``-pad`` spells it."""
+    return {"num": rate[0], "den": rate[1]}
 
 
 def _node_network_args(

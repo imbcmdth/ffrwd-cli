@@ -647,7 +647,7 @@ def _node_described() -> Described:
 
 def _node_shape(*, kind: str = "packets", outputs: int = 0) -> shapes.Shape:
     def asked(
-        module: str, params: str, bound: Sequence[str], grants: Sequence[str] = ()
+        module: str, params: str, bound: Sequence[shapes.Binding], grants: Sequence[str] = ()
     ) -> shapes.NodeShape:
         port = {
             "name": "v",
@@ -697,7 +697,7 @@ def test_a_node_reading_the_packets_is_read_in_from_as_a_packet_sink_is() -> Non
         "SELECT v.index FROM input('f.mp4') f, keys(f.video[1]) v", reads, _node_shape()
     ) == [[1], [2], [3]]
     (read,) = reads.reads
-    assert (read.port, read.wants) == ("v", "keyframes")
+    assert (read.port, read.wants, read.rate) == ("v", "keyframes", (15, 1))
 
 
 @pytest.mark.parametrize(
@@ -722,10 +722,11 @@ def test_a_node_that_does_not_only_read_packets_is_refused_in_from(
 def test_a_node_read_binds_its_port_and_maps_the_rows_it_emits(tmp_path: Path) -> None:
     read = PacketRead(
         spec="f.mp4", input_args=(), kind="video", index=0, module=_MODULE, params="",
-        wants="keyframes", port="v",
+        wants="keyframes", port="v", rate=(15, 1),
     )
     assert _node_reader_argv("ffrwd-wasm", read, None, tmp_path) == [
-        "ffrwd-wasm", "-f", "nut", "-i", "pipe:0", "-m", f"read={_MODULE}",
+        "ffrwd-wasm", "-f", "nut", "-i", "pipe:0", "-pad", '{"rate": {"num": 15, "den": 1}}',
+        "-m", f"read={_MODULE}",
         "-filter_complex", "[v=0:v]read[@rows=out0]", "-map", "[out0]", "-f", "ndjson",
         "pipe:1",
     ]

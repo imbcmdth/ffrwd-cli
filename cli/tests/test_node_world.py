@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import functools
 import json
+import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
+from fractions import Fraction
 from pathlib import Path
 
 import pytest
@@ -24,6 +26,7 @@ from ffrwd.ir import Graph
 from ffrwd.lower import lower
 from ffrwd.parser import parse, resolve
 from ffrwd.probe import ProbeResult, StreamMeta
+from ffrwd.processes import ProcessPlan
 from ffrwd.registry import Registry, load_reference
 from ffrwd.timing import check_live_leads, summary, timing
 from ffrwd.warnings import FfrwdWarning, WarningCode
@@ -245,17 +248,25 @@ def _node(path: str) -> Described:
 
 
 class _Asked:
-    """A fake `shape` seam that counts what it is asked."""
+    """A fake `shape` seam that counts what it is asked: the bound inputs by
+    name in `asked`, and the bound list whole, hints and all, in `bound`."""
 
     def __init__(self) -> None:
         self.asked: list[tuple[str, dict[str, object], tuple[str, ...]]] = []
+        self.bound: list[tuple[str, tuple[shapes.Binding, ...]]] = []
 
     def __call__(
-        self, module: str, params: str, bound: Sequence[str], grants: Sequence[str] = ()
+        self,
+        module: str,
+        params: str,
+        bound: Sequence[shapes.Binding],
+        grants: Sequence[str] = (),
     ) -> shapes.NodeShape:
         decoded = json.loads(params)
-        self.asked.append((module, decoded, tuple(bound)))
-        return shapes.node_shape(module, SHAPES[module](decoded, bound))
+        names = tuple(binding.input for binding in bound)
+        self.asked.append((module, decoded, names))
+        self.bound.append((module, tuple(bound)))
+        return shapes.node_shape(module, SHAPES[module](decoded, names))
 
 
 _DECLARATIONS = {
@@ -297,7 +308,7 @@ def _registry() -> Registry:
 
 
 def _probes(
-    rate: int = 48000, colour: Mapping[str, str] | None = None
+    rate: int = 48000, colour: Mapping[str, str] | None = None, pix_fmt: str | None = None
 ) -> dict[str, ProbeResult | None]:
     said = colour or {}
 
@@ -306,7 +317,7 @@ def _probes(
             streams=[
                 StreamMeta(
                     type="video", index=0, metadata={}, width=320, height=240,
-                    fps="25/1", sample_rate=None, codec="h264",
+                    fps="25/1", sample_rate=None, codec="h264", pix_fmt=pix_fmt,
                     color_range=said.get("color_range"),
                     color_primaries=said.get("color_primaries"),
                     color_transfer=said.get("color_transfer"),
@@ -354,7 +365,7 @@ def test_a_shape_document_reads_every_field_the_wit_names() -> None:
         "m.wasm",
         {
             "inputs": [
-                _clock("v"),
+                {**_clock("v"), "accepts": {"wants": "timing"}},
                 _input(
                     "feed",
                     "video",
@@ -369,8 +380,18 @@ def test_a_shape_document_reads_every_field_the_wit_names() -> None:
                         },
                     },
                 ),
-                _input("words", "data", {"kind": "interval", "latency": 2, "ahead": 0.1},
-                       schema=_CUE),
+                _input(
+                    "words",
+                    "data",
+                    {
+                        "kind": "interval",
+                        "latency": 2,
+                        "ahead": 0.1,
+                        "anchor": {"kind": "first_frame"},
+                    },
+                    schema=_CUE,
+                ),
+                _input("deals", "data", {"kind": "interval", "group": "switch"}),
             ],
             "outputs": [
                 {
@@ -395,7 +416,8 @@ def test_a_shape_document_reads_every_field_the_wit_names() -> None:
             "relation": ['{"name": "720p"}'],
         },
     )
-    feed, words = read.inputs[1], read.inputs[2]
+    clock, feed, words, deals = read.inputs
+    assert clock.accepts.wants == "timing"
     assert feed.pairing.hold == shapes.Hold(
         anchor=shapes.Anchor("tagged", "smart_timed"),
         lead=0.3,
@@ -403,7 +425,11 @@ def test_a_shape_document_reads_every_field_the_wit_names() -> None:
         group="switch",
         port_param="port",
     )
-    assert words.pairing.interval == shapes.Interval(latency=2.0, ahead=0.1)
+    assert words.pairing.interval == shapes.Interval(
+        latency=2.0, ahead=0.1, anchor=shapes.Anchor("first-frame")
+    )
+    assert deals.pairing.interval == shapes.Interval(group="switch")
+    assert (words.pairing.interval.retimed, deals.pairing.interval.retimed) == (True, False)
     assert words.schema == _CUE
     assert read.outputs[0].format == shapes.OutputFormat(
         "like", port="v", pixel_format="gray"
@@ -457,13 +483,15 @@ def test_rows_match_by_their_fields_and_extra_fields_pass() -> None:
     assert shapes.row_mismatch(_CUE, _ROWS) == ("text", "string", "nothing")
 
 
-def test_one_shape_is_asked_once_per_module_params_and_bound_ports() -> None:
+def test_one_shape_is_asked_once_per_module_params_and_bound_list() -> None:
     asked = _Asked()
     cache = shapes.ShapeCache(asked)
-    cache("spot.wasm", "{}", ["v"])
-    cache("spot.wasm", "{}", ["v"])
-    cache("spot.wasm", '{"every": 5}', ["v"])
-    assert [one[1] for one in asked.asked] == [{}, {"every": 5}]
+    at_25 = [shapes.Binding("v", (shapes.StreamHint(Fraction(25)),))]
+    cache("spot.wasm", "{}", at_25)
+    cache("spot.wasm", "{}", at_25)
+    cache("spot.wasm", '{"every": 5}', at_25)
+    cache("spot.wasm", "{}", [shapes.Binding("v", (shapes.StreamHint(Fraction(50)),))])
+    assert [one[1] for one in asked.asked] == [{}, {"every": 5}, {}]
 
 
 # -- declarations ------------------------------------------------------------
@@ -763,22 +791,34 @@ def test_a_live_node_fed_later_than_its_bound_is_refused() -> None:
 # -- on the sidecar's command line -------------------------------------------
 
 
+def _plan(
+    query: str,
+    monkeypatch: pytest.MonkeyPatch,
+    rate: int = 48000,
+    colour: Mapping[str, str] | None = None,
+    describe: Callable[[str], Described] = _node,
+    pix_fmt: str | None = None,
+) -> ProcessPlan:
+    probes = _probes(rate, colour, pix_fmt)
+    monkeypatch.setattr(
+        "ffrwd.compiler.probe_path", lambda path, args=(), **kw: probes[path[0]]
+    )
+    compiled = compile_all(_declared(query), describe=describe, shape=_Asked())
+    assert compiled.plan is not None
+    return compiled.plan
+
+
 def _plan_argv(
     query: str,
     monkeypatch: pytest.MonkeyPatch,
     rate: int = 48000,
     colour: Mapping[str, str] | None = None,
     describe: Callable[[str], Described] = _node,
+    pix_fmt: str | None = None,
 ) -> dict[str, list[str]]:
     """Each process of the compiled plan as the printed command shows it."""
-    probes = _probes(rate, colour)
-    monkeypatch.setattr(
-        "ffrwd.compiler.probe_path", lambda path, args=(), **kw: probes[path[0]]
-    )
-    compiled = compile_all(_declared(query), describe=describe, shape=_Asked())
-    assert compiled.plan is not None
     return plan_argv(
-        compiled.plan,
+        _plan(query, monkeypatch, rate, colour, describe, pix_fmt),
         sidecar_argv=wasm.shown_argv,
         pipe_path=lambda edge, side: f"<{edge.source}-{edge.target} {side}>",
     )
@@ -795,6 +835,7 @@ def test_a_node_network_names_the_port_each_pad_binds(monkeypatch: pytest.Monkey
         "[v=0:v]spot=every=30[spots=n1];[v=0:v][spots=n1]ring[v=out0]"
     )
     assert sidecar[sidecar.index("-map") :] == ["-map", "[out0]", "-f", "nut", "pipe:1"]
+    assert _pad_after_input(sidecar)["rate"] == {"num": 25, "den": 1}
 
 
 def test_every_stream_one_process_hands_a_node_network_rides_one_nut(
@@ -816,6 +857,10 @@ def test_every_stream_one_process_hands_a_node_network_rides_one_nut(
     ]
     assert feeder.count("-map") == 2, "both ports take the sound as it is, so it crosses once"
     assert feeder[-3:] == ["-f", "nut", "pipe:1"]
+    assert _pad_after_input(sidecar)["rate"] == {
+        "v": {"num": 25, "den": 1},
+        "a": {"num": 48000, "den": 1},
+    }
 
 
 def _taking(
@@ -955,11 +1000,13 @@ _BT709_PC = {
 _RING = "COPY (SELECT ring(f.video[1], spot(f.video[1])) FROM input('f.mp4') f) TO 'ringed.mp4'"
 
 
-def _pad_after_input(sidecar: Sequence[str]) -> object:
+def _pad_after_input(sidecar: Sequence[str]) -> dict[str, object]:
     """The ``-pad`` JSON written right after the sidecar's one ``-i``."""
     at = sidecar.index("-i") + 2
     assert sidecar[at] == "-pad"
-    return json.loads(sidecar[at + 1])
+    pad = json.loads(sidecar[at + 1])
+    assert isinstance(pad, dict)
+    return pad
 
 
 def _taking_pictures(monkeypatch: pytest.MonkeyPatch, pixel_format: str) -> None:
@@ -973,8 +1020,8 @@ def test_a_yuv_picture_into_a_node_network_carries_the_probed_colour(
 ) -> None:
     _taking_pictures(monkeypatch, "yuv420p")
     argv = _plan_argv(_RING, monkeypatch, colour=_BT709_PC)
-    assert _pad_after_input(argv["sidecar0"]) == {
-        "color": {"range": "pc", "primaries": "bt709", "trc": "bt709", "space": "bt709"}
+    assert _pad_after_input(argv["sidecar0"])["color"] == {
+        "range": "pc", "primaries": "bt709", "trc": "bt709", "space": "bt709"
     }
 
 
@@ -983,9 +1030,8 @@ def test_a_picture_the_probe_says_nothing_of_carries_unknown_colour(
 ) -> None:
     _taking_pictures(monkeypatch, "yuv420p")
     argv = _plan_argv(_RING, monkeypatch)
-    assert _pad_after_input(argv["sidecar0"]) == {
-        "color": {"range": "unknown", "primaries": "unknown", "trc": "unknown",
-                  "space": "unknown"}
+    assert _pad_after_input(argv["sidecar0"])["color"] == {
+        "range": "unknown", "primaries": "unknown", "trc": "unknown", "space": "unknown"
     }
 
 
@@ -994,8 +1040,8 @@ def test_a_picture_converted_to_rgb_on_its_way_carries_what_the_conversion_wrote
 ) -> None:
     _taking_pictures(monkeypatch, "rgba")
     argv = _plan_argv(_RING, monkeypatch, colour=_BT709_PC)
-    assert _pad_after_input(argv["sidecar0"]) == {
-        "color": {"range": "pc", "primaries": "bt709", "trc": "bt709", "space": "gbr"}
+    assert _pad_after_input(argv["sidecar0"])["color"] == {
+        "range": "pc", "primaries": "bt709", "trc": "bt709", "space": "gbr"
     }
 
 
@@ -1008,8 +1054,7 @@ def test_the_tags_a_query_writes_on_a_stream_reach_the_node_reading_it(
         "SELECT ring(ad.v[1], spot(ad.v[1])) FROM ad) TO 'ringed.mp4'",
         monkeypatch,
     )
-    pad = _pad_after_input(argv["sidecar0"])
-    assert isinstance(pad, dict) and pad["tags"] == {"smart_timed": "1"}
+    assert _pad_after_input(argv["sidecar0"])["tags"] == {"smart_timed": "1"}
 
 
 def test_a_star_over_a_call_reads_the_outputs_its_shape_makes(
@@ -1493,3 +1538,217 @@ def test_a_node_reading_packets_reads_what_its_destination_encodes(
     assert encoder[encoder.index("-c:0") + 1] == "libx264"
     (writer,) = [words for words in argv.values() if "out.mkv" in words]
     assert writer[writer.index("-c:0") + 1] == "copy"
+
+
+# -- 0.19.1: timing inputs, stream hints, re-timed and grouped data ---------
+
+
+_BOXES_MASK = (
+    "CREATE FUNCTION boxes_mask(v video_stream, boxes STRUCT(x number, y number, "
+    "w number, h number)[]) RETURNS video_stream "
+    "AS 'boxes_mask.wasm', 'boxes_mask' LANGUAGE wasm;\n"
+)
+_TIMING = {"wants": "timing", "pixel_formats": ["yuv420p"]}
+_RGBA = {"pixel_formats": ["rgba"]}
+
+
+def _with_boxes_mask(monkeypatch: pytest.MonkeyPatch) -> None:
+    """boxes_mask: the picture as its clock, read for its timing alone."""
+    monkeypatch.setitem(
+        SHAPES, "boxes_mask.wasm", _taking(_reader("boxes", _BOX), "video", _TIMING)
+    )
+    monkeypatch.setitem(SHAPES, "spot.wasm", _taking(_spot, "video", _RGBA))
+
+
+def test_a_timing_input_beside_a_reader_of_the_same_picture_binds_its_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _with_boxes_mask(monkeypatch)
+    argv = _plan_argv(
+        _BOXES_MASK + "COPY (SELECT boxes_mask(f.video[1], spot(f.video[1])) "
+        "FROM input('f.mp4') f) TO 'mask.mkv'",
+        monkeypatch,
+    )
+    feeder = _feeder(argv)
+    assert feeder.count("-map") == 1
+    assert feeder[feeder.index("-pix_fmt:0") + 1] == "rgba"
+    sidecar = argv["sidecar0"]
+    assert sidecar[sidecar.index("-filter_complex") + 1] == (
+        "[v=0:v]spot=every=30[spots=n1];[v=0:v][boxes=n1]boxes_mask[v=out0]"
+    )
+
+
+def test_a_timing_input_alone_takes_the_picture_in_the_format_it_has(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(SHAPES, "spot.wasm", _taking(_spot, "video", _TIMING))
+    feeder = _feeder(_plan_argv(
+        "COPY (SELECT spot(f.video[1]) FROM input('f.mp4') f) TO 'spots.ndjson'",
+        monkeypatch,
+        pix_fmt="yuv444p",
+    ))
+    assert feeder[feeder.index("-pix_fmt:0") + 1] == "yuv444p"
+
+
+def test_explain_says_timing_for_an_input_read_for_its_timing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _with_boxes_mask(monkeypatch)
+    graph = _lowered(
+        _BOXES_MASK + "COPY (SELECT boxes_mask(f.video[1], spot(f.video[1]))" + _FROM,
+        {path: _node(path) for path in SHAPES},
+    )
+    timed = timing(graph, _probes(), {"boxes_mask.wasm": "boxes_mask", "spot.wasm": "spot"})
+    assert timed is not None
+    (masked,) = [node for node in timed.nodes if node.called == "boxes_mask"]
+    assert masked.to_dict()["inputs"] == [
+        {"port": "v", "pairing": "clock", "delay": 0.0, "wants": "timing"},
+        {"port": "boxes", "pairing": "lockstep", "delay": 0.0},
+    ]
+    assert summary(timed).splitlines()[1] == "boxes_mask: per-frame; v for its timing"
+
+
+def _hints(asked: _Asked, module: str) -> list[dict[str, list[Fraction | None]]]:
+    return [
+        {binding.input: [hint.rate for hint in binding.streams] for binding in bound}
+        for called, bound in asked.bound
+        if called == module
+    ]
+
+
+def test_the_shape_is_told_each_bound_streams_rate() -> None:
+    asked = _Asked()
+    _lowered(
+        "COPY (SELECT burn(f.video[1], f.audio[1], hear(f.audio[1])), f.audio[1]" + _FROM,
+        asked=asked,
+    )
+    assert _hints(asked, "hear.wasm") == [{"a": [Fraction(48000)]}]
+    assert _hints(asked, "burn.wasm") == [
+        {"v": [Fraction(25)], "a": [Fraction(48000)], "words": [None]}
+    ]
+    tiled = _Asked()
+    _lowered(
+        "COPY (SELECT tile(ARRAY[a.video[1], b.video[1], c.video[1]], 3) "
+        "FROM input('a.mp4') a, input('b.mp4') b, input('c.mp4') c) TO 'tiled.mp4'",
+        asked=tiled,
+    )
+    assert _hints(tiled, "tile.wasm") == [{"v": [Fraction(25)] * 3}]
+
+
+def test_a_nodes_picture_runs_at_its_clock_over_its_stride(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def hopping(params: Mapping[str, object], bound: Sequence[str]) -> dict[str, object]:
+        shape = _matte(params, bound)
+        inputs = shape["inputs"]
+        assert isinstance(inputs, list)
+        inputs[0] = {**inputs[0], "window": 4, "stride": 2}
+        return shape
+
+    monkeypatch.setitem(SHAPES, "matte.wasm", hopping)
+    asked = _Asked()
+    _lowered(
+        "COPY (WITH m AS (SELECT (matte(f.video[1])).* FROM input('f.mp4') f) "
+        "SELECT dim(m.mask, m.spots) FROM m) TO 'dimmed.mkv'",
+        asked=asked,
+    )
+    assert _hints(asked, "dim.wasm") == [{"v": [Fraction(25, 2)], "boxes": [None]}]
+    ticked = _Asked()
+    _lowered(
+        "COPY (SELECT ring(s.video[1], spot(s.video[1])) FROM ticker('hi', fps => 30) s) "
+        "TO 'ringed.mp4'",
+        asked=ticked,
+    )
+    assert _hints(ticked, "spot.wasm") == [{"v": [Fraction(30)]}]
+
+
+def test_a_sound_conformed_to_its_port_is_hinted_at_the_rate_it_arrives_at(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(SHAPES, "hear.wasm", _taking(_hear, "audio", {"sample_rates": [48000]}))
+    asked = _Asked()
+    _lowered(
+        "COPY (SELECT hear(f.audio[1])" + _FROM.replace("out.mkv", "cues.ndjson"),
+        asked=asked,
+        probes=_probes(rate=44100),
+    )
+    assert _hints(asked, "hear.wasm") == [{"a": [Fraction(44100)]}, {"a": [Fraction(48000)]}]
+    sidecar = _plan_argv(
+        "COPY (SELECT hear(f.audio[1]) FROM input('f.mp4') f) TO 'cues.ndjson'",
+        monkeypatch,
+        rate=44100,
+    )["sidecar0"]
+    assert _pad_after_input(sidecar)["rate"] == {"num": 48000, "den": 1}
+
+
+def test_the_bound_list_reaches_the_sidecar_as_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    ran: list[list[str]] = []
+
+    def run(
+        sidecar: str, module: str, argv: list[str], budget: float
+    ) -> subprocess.CompletedProcess[str]:
+        ran.append(argv)
+        return subprocess.CompletedProcess(argv, 0, json.dumps(_spot({}, ["v"])), "")
+
+    monkeypatch.setattr(shapes.binaries, "ffrwd_wasm_path", lambda: "ffrwd-wasm")
+    monkeypatch.setattr(shapes, "_run_shape", run)
+    shapes.shape(
+        "spot.wasm",
+        "{}",
+        [
+            shapes.Binding("v", (shapes.StreamHint(Fraction(30000, 1001)),)),
+            shapes.Binding("words", (shapes.StreamHint(),)),
+        ],
+    )
+    (argv,) = ran
+    assert json.loads(argv[argv.index("--bound") + 1]) == [
+        {"input": "v", "streams": [{"rate": {"num": 30000, "den": 1001}}]},
+        {"input": "words", "streams": [{"rate": None}]},
+    ]
+
+
+def test_an_input_the_host_re_times_waits_its_bound_and_not_its_producer() -> None:
+    retimed = {
+        "kind": "interval",
+        "latency": 1.0,
+        "ahead": 0,
+        "anchor": {"kind": "first_frame"},
+    }
+
+    def burn(params: Mapping[str, object], bound: Sequence[str]) -> dict[str, object]:
+        return _shape(
+            [_clock("v"), _input("words", "data", retimed, schema=_CUE)],
+            [_output("v", "video")],
+            {"kind": "input", "port": "v"},
+        )
+
+    SHAPES["burn.wasm"] = burn
+    try:
+        graph = _lowered("COPY (SELECT burn(f.video[1], words => hear(f.audio[1]))" + _FROM)
+    finally:
+        SHAPES["burn.wasm"] = _burn
+    check_live_leads(graph, _probes(), {"burn.wasm": (3, 4, "burn")})
+    timed = timing(graph, _probes(), {"hear.wasm": "hear", "burn.wasm": "burn"})
+    assert timed is not None
+    assert summary(timed).splitlines()[:2] == [
+        "hear: tumbling 2 s",
+        "burn: per-frame; words by interval on its own clock, at most 1 s",
+    ]
+    assert timed.outputs[0].delay == 1.0
+
+
+def test_a_node_runs_on_one_worker_only_where_its_shape_says_it_is_impure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def impure(params: Mapping[str, object], bound: Sequence[str]) -> dict[str, object]:
+        return {**_matte(params, bound), "pure": False}
+
+    monkeypatch.setitem(SHAPES, "matte.wasm", impure)
+    plan = _plan(
+        "COPY (WITH m AS (SELECT f.video[1] AS v, (matte(f.video[1])).* "
+        "FROM input('f.mp4') f) SELECT dim(m.v, m.spots), ring(m.v, spot(m.v)) FROM m) "
+        "TO 'both.mkv'",
+        monkeypatch,
+    )
+    (sidecar,) = plan.sidecars
+    assert sidecar.impure == ("matte.wasm",)

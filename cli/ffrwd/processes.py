@@ -138,12 +138,13 @@ from .ir import (
     feeder_path,
     feeder_port,
     is_src,
+    src_alias,
     src_parts,
 )
 from .probe import JSON_CODEC, ProbeResult, StreamMeta, is_url
 from .shapes import Accepts, NodeShape, node_shape
 from .sink import COLOR_OPTIONS
-from .timing import Paths, paths_of
+from .timing import Paths, paths_of, stream_rate
 
 __all__ = [
     "COPY_CODEC",
@@ -1285,6 +1286,12 @@ class SidecarProcess:
     # The tags the query wrote on what each ``-i`` of a node network carries,
     # in ``-i`` order: empty for an input it wrote none on.
     tags: tuple[tuple[tuple[str, str], ...], ...] = ()
+    # The rate of each stream each ``-i`` of a node network carries, as the
+    # shape of each node reading it was told, in ``-i`` order: (pad, num,
+    # den) per stream whose rate the compile knew, the pad as the network
+    # names the stream after the input's number (``v``, ``a:1``), and ""
+    # for one rate every stream of the input runs at.
+    rates: tuple[tuple[tuple[str, int, int], ...], ...] = ()
 
     @property
     def nodes(self) -> tuple[str, ...]:
@@ -1372,6 +1379,8 @@ class SidecarProcess:
             written["colors"] = [dict(one) for one in self.colors]
         if self.tags:
             written["tags"] = [dict(one) for one in self.tags]
+        if self.rates:
+            written["rates"] = [[list(rate) for rate in one] for one in self.rates]
         if self.network and self.graph is not None:
             written["graph"] = self.graph.to_dict()
         return written
@@ -1433,6 +1442,15 @@ class SidecarProcess:
                 tuple((str(key), str(value)) for key, value in one.items())
                 for one in _read_list(d, "tags")
                 if isinstance(one, dict)
+            ),
+            rates=tuple(
+                tuple(
+                    (str(rate[0]), int(str(rate[1])), int(str(rate[2])))
+                    for rate in one
+                    if isinstance(rate, list) and len(rate) == 3
+                )
+                for one in _read_list(d, "rates")
+                if isinstance(one, list)
             ),
         )
 
@@ -2859,7 +2877,14 @@ class _Partitioner:
                 if any(reader in alone for reader in reads):
                     continue  # a packet sink's edge stays an ffmpeg's to encode
                 if any(reader in self.node_shapes for reader in reads) and (
-                    len({self._format(inputs[0], reader) for reader in reads}) > 1
+                    len(
+                        {
+                            self._format(inputs[0], reader)
+                            for reader in reads
+                            if not self._reads_timing(reader, inputs[0])
+                        }
+                    )
+                    > 1
                 ):
                     continue  # nodes taking it in different formats get a stream each
                 # The split's producer joins too when it is a module; otherwise
@@ -2878,7 +2903,9 @@ class _Partitioner:
 
         A region holding a node reads each stream once per format its ports
         take it in: copies a split outside made of it are one read, which the
-        network hands every port (:attr:`same_reads`).
+        network hands every port (:attr:`same_reads`). A port reading it for
+        its timing alone takes whichever of those reads there is, and the
+        stream as it is where there is none.
         """
         inside = set(members)
         wanted: list[tuple[FrameRef, str]] = []
@@ -2897,13 +2924,22 @@ class _Partitioner:
         ):
             return wanted
         kept: dict[tuple[FrameRef, StreamFormat], FrameRef] = {}
+        any_read: dict[FrameRef, FrameRef] = {}
+        bound: dict[FrameRef, FrameRef] = {}
+        timed = [(ref, reader) for ref, reader in wanted if self._reads_timing(reader, ref)]
+        for ref, reader in [one for one in wanted if one not in timed] + timed:
+            source = self._past_splits(ref)
+            first = any_read.get(source) if (ref, reader) in timed else None
+            if first is None:
+                first = kept.setdefault((source, self._format(ref, reader)), ref)
+            any_read.setdefault(source, first)
+            bound[ref] = first
         shared: list[tuple[FrameRef, str]] = []
         for ref, reader in wanted:
-            first = kept.setdefault((self._past_splits(ref), self._format(ref, reader)), ref)
-            if first == ref:
+            if bound[ref] == ref:
                 shared.append((ref, reader))
             else:
-                self.same_reads[ref] = first
+                self.same_reads[ref] = bound[ref]
         return shared
 
     def _region_writes(self, members: Sequence[str]) -> list[tuple[FrameRef, StreamType]]:
@@ -3035,7 +3071,7 @@ class _Partitioner:
         if own <= 0:
             return 0
         video = next((ref for ref in node.inputs if ref_type(self.g, ref) == "video"), None)
-        rate = paths.rate(video, "video") if video is not None else None
+        rate = paths.rate(video) if video is not None else None
         return None if rate is None else math.ceil(own * rate)
 
     def _node_delays(self, names: Sequence[str]) -> dict[str, int | None]:
@@ -3681,7 +3717,12 @@ class _Partitioner:
                 port = shape.input(port_name)
                 source = self._past_splits(read)
                 producer = _ref_node(source)
-                if port is None or producer is None or producer not in self.node_shapes:
+                if (
+                    port is None
+                    or port.accepts.wants == "timing"
+                    or producer is None
+                    or producer not in self.node_shapes
+                ):
                     continue
                 written = self._node_output_wire(producer, _ref_pad(source), source)
                 taken, made = _accepted(port.accepts, written)
@@ -4394,7 +4435,7 @@ class _Partitioner:
         if name in self.node_shapes and split is not None:
             ref = self.g.nodes[split].inputs[0]
             position = self._read_position(node, ref)
-            if position is None:
+            if position is None or self._reads_timing(name, ref):
                 return None
             return self._node_input_wire(name, node.ports[position], ref)
         wire = (self.pix_fmts.get(node.filter), self.audio_wires.get(node.filter))
@@ -4651,6 +4692,8 @@ class _Partitioner:
         accepts = port.accepts if port is not None else None
         if port is not None and port.kind == "packets":
             return self._node_packets_wire(name, port_name, ref)
+        if accepts is not None and accepts.wants == "timing":
+            return self._timing_wire(ref)
         if ref_type(self.g, ref) == "audio":
             formats = accepts.sample_formats if accepts is not None else ()
             sample = next((f for f in formats if f in WIRE_SAMPLE_FMTS), None)
@@ -4687,6 +4730,44 @@ class _Partitioner:
             height=size[1] if size else None,
             timebase=_timebase(meta.fps) if meta else None,
         )
+
+    def _timing_wire(self, ref: FrameRef) -> StreamFormat:
+        """A stream a node reads for its frames' times alone: in the format it
+        already has, converted to nothing and conformed to nothing."""
+        meta = self._origin_meta(ref)
+        if ref_type(self.g, ref) == "audio":
+            return AudioFormat(
+                rate=meta.sample_rate if meta else None,
+                channels=meta.channels if meta else None,
+                codec=SAMPLE_FMT_CODECS[WIRE_SAMPLE_FMTS[0]],
+            )
+        producer = _ref_node(ref)
+        own = meta.pix_fmt if meta is not None else None
+        pix_fmt = (
+            self._pix_fmt(ref, None)
+            if producer is not None and self.external.get(producer, False)
+            else own
+            if own in WIRE_PIX_FMTS
+            else DEFAULT_PIX_FMT
+        )
+        size = self._picture_size(ref)
+        return VideoFormat(
+            pix_fmt=pix_fmt,
+            width=size[0] if size else None,
+            height=size[1] if size else None,
+            timebase=_timebase(meta.fps) if meta else None,
+        )
+
+    def _reads_timing(self, name: str, ref: FrameRef) -> bool:
+        """Whether node `name` reads `ref`, or a split's copy of it, for its
+        frames' times alone."""
+        shape = self.node_shapes.get(name)
+        if shape is None:
+            return False
+        node = self.g.nodes[name]
+        position = self._read_position(node, ref)
+        port = shape.input(node.ports[position]) if position is not None else None
+        return port is not None and port.accepts.wants == "timing"
 
     def _node_packets_wire(self, name: str, port_name: str, ref: FrameRef) -> StreamFormat:
         """A stream a node reads as coded packets: copied as it was coded.
@@ -5136,6 +5217,9 @@ class _Partitioner:
             tags=self._region_tags(incoming, alias_of, read_order)
             if sidecar.node_network
             else (),
+            rates=self._region_rates(incoming, read_as, read_order)
+            if sidecar.node_network
+            else (),
             reads_rows=any(e.annotations for e in self.edges if e.target == sidecar.id),
             writes_rows=any(e.annotations for e in self.edges if e.source == sidecar.id),
             rows_modules=self._rows_modules(sidecar, members),
@@ -5205,6 +5289,54 @@ class _Partitioner:
         if not found:
             return ()
         return tuple(tuple(found.get(alias, {}).items()) for alias in order)
+
+    def _region_rates(
+        self,
+        incoming: Sequence[StreamEdge],
+        read_as: Mapping[FrameRef, str],
+        order: Sequence[str],
+    ) -> tuple[tuple[tuple[str, int, int], ...], ...]:
+        """The rate of each stream each ``-i`` of a node network is told, in
+        ``-i`` order: a picture's frame rate, a sound's sample rate as the
+        edge conforms it, none for data. One rate every stream of an input
+        runs at is said once."""
+        found: dict[str, dict[str, Fraction | None]] = {}
+        for edge in incoming:
+            piped = read_as.get(edge.ref)
+            if piped is None:
+                continue
+            _, marker, index = piped.rsplit(":", 2)
+            alias = src_alias(piped)
+            pad = marker if index == "0" else f"{marker}:{index}"
+            rate = (
+                None
+                if isinstance(edge.format, DataFormat)
+                else self._edge_rate(edge.ref, edge.format)
+            )
+            found.setdefault(alias, {})[pad] = rate
+        said: dict[str, tuple[tuple[str, int, int], ...]] = {}
+        for alias, rates in found.items():
+            known = {pad: rate for pad, rate in rates.items() if rate is not None}
+            if not known:
+                continue
+            every = set(rates.values())
+            if len(every) == 1:
+                (rate,) = every
+                assert rate is not None  # one of them is known
+                said[alias] = (("", rate.numerator, rate.denominator),)
+            else:
+                said[alias] = tuple(
+                    (pad, rate.numerator, rate.denominator) for pad, rate in known.items()
+                )
+        if not said:
+            return ()
+        return tuple(said.get(alias, ()) for alias in order)
+
+    def _edge_rate(self, ref: FrameRef, wire: StreamFormat) -> Fraction | None:
+        """The rate of `ref` as an edge carrying it in `wire` hands it on."""
+        if isinstance(wire, AudioFormat) and wire.required_rate:
+            return Fraction(wire.required_rate)
+        return stream_rate(self.g, self.probes, self.node_shapes.get, ref)
 
     def _region_listens(
         self, members: Sequence[str], names: Mapping[str, str]

@@ -507,11 +507,12 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   `RETURNS sink` reading several streams takes no annotation column.
   Recipe [144](examples.md#144-hand-one-modules-rows-to-a-module-reading-two-streams).
 - A **node `LANGUAGE wasm` function** names a module exporting
-  `ffrwd:av@0.19.0`'s `node`, which its describe says (`"world":
+  `ffrwd:av@0.19.1`'s `node`, which its describe says (`"world":
   "node-module"`). What a node reads and writes is its SHAPE for each
-  call: `ffrwd-wasm --shape` with the call's params and the names of the
-  inputs it binds, asked once per distinct module, params and bound
-  inputs. Its parameters are ports and values, in any order: a port is a
+  call: `ffrwd-wasm --shape` with the call's params and the inputs it
+  binds, each with the rate of every stream bound there, asked once per
+  distinct module, params and bound list. Its parameters are ports and
+  values, in any order: a port is a
   `video_stream`, an `audio_stream`, a `data_stream` or rows
   (`STRUCT(...)[]`, `cue[]`), named as the module names its input; a
   value is text, number, boolean or vector, as any module's. Arguments
@@ -574,6 +575,20 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   - A port reading coded packets is handed an input's own stream,
     copied as it was coded, in a codec the module takes; an output
     writing them is copied by whatever reads it.
+  - A stream's rate is what the compile knows of it before the run: a
+    picture's frame rate, a sound's sample rate (the one its port
+    conforms it to). An input's is its probe's; a node's picture runs at
+    its clock, a rate clock's own, the rate of the input a `rate-of`
+    clock names, or its clock input's over its stride. A feed by port, a
+    self-clocked node's output and data have none. The run hands the
+    host the same rates (`-pad`'s `"rate"`), so the shape a node runs
+    with is the one the query compiled against.
+  - An input the module reads for its timing alone (`wants` `timing`)
+    is handed the stream in the format it already has: nothing converts
+    or conforms it, and where another port of the region reads the same
+    stream, it binds that one. `boxes_mask(v, detect(v))` sends the
+    picture once, in the format `detect` takes. `explain` says `timing`
+    for it.
   - One region of a sidecar holds the nodes the query wires together,
     and everything one process hands another travels as one NUT. A
     signature only a node can carry (kinds mixed, a stream left out, a
@@ -591,7 +606,9 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
 - **What each node waits for.** A node's clock input reads a window
   (per-frame, tumbling, hopping, sliding), and each output may leave late
   by a latency it declares; an input paired by interval waits for its
-  producer, at most its own bound past the clock. Summed along each path,
+  producer, at most its own bound past the clock, and one the host
+  re-times onto the clock (anchored `first-frame` or `tagged`) is on a
+  clock of its own and waits its bound alone. Summed along each path,
   those say how far behind the source every stream a query writes runs.
   `ffrwd explain --delays` prints a line per node (its window, and each
   interval input's bound) and per output (its delay, and how long it
