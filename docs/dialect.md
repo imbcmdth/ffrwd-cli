@@ -521,7 +521,9 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   [148](examples.md#148-a-node-reads-the-picture-the-sound-and-the-words-at-once).
   - `DEFAULT NULL` on any port makes it optional: a call that leaves it
     off, or writes NULL, binds nothing there, and the shape is asked
-    without it. A port the module requires is refused left off. A port
+    without it. A column an outer join left NULL, handed straight to such
+    a port, binds nothing too; to any other port it is refused as it is
+    anywhere. A port the module requires is refused left off. A port
     the declaration names and the shape for these params has none of is
     fine unbound and refused bound, naming it. Recipe
     [149](examples.md#149-leave-an-input-out).
@@ -564,6 +566,11 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
     it: its reader takes that much and closes. One that never ends makes
     the query live. Recipe
     [154](examples.md#154-a-page-with-no-inputs-is-a-source).
+  - A node called over an input's stream in FROM, `records(f.video[1])
+    v`, whose shape reads coded packets on that port and makes no
+    output, is read while the query compiles, as a packet sink is: the
+    stream is copied to it as much as its port `wants`, and the rows it
+    emits are the alias's rows.
   - A port reading coded packets is handed an input's own stream,
     copied as it was coded, in a codec the module takes; an output
     writing them is copied by whatever reads it.

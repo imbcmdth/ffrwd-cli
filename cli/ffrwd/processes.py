@@ -1281,6 +1281,9 @@ class SidecarProcess:
     # the ``-pad`` key, in ``-i`` order: empty for an input with no raw
     # picture an ffmpeg wrote.
     colors: tuple[tuple[tuple[str, str], ...], ...] = ()
+    # The tags the query wrote on what each ``-i`` of a node network carries,
+    # in ``-i`` order: empty for an input it wrote none on.
+    tags: tuple[tuple[tuple[str, str], ...], ...] = ()
 
     @property
     def nodes(self) -> tuple[str, ...]:
@@ -1366,6 +1369,8 @@ class SidecarProcess:
             written["listens"] = [list(one) for one in self.listens]
         if self.colors:
             written["colors"] = [dict(one) for one in self.colors]
+        if self.tags:
+            written["tags"] = [dict(one) for one in self.tags]
         if self.network and self.graph is not None:
             written["graph"] = self.graph.to_dict()
         return written
@@ -1421,6 +1426,11 @@ class SidecarProcess:
             colors=tuple(
                 tuple((str(key), str(value)) for key, value in one.items())
                 for one in _read_list(d, "colors")
+                if isinstance(one, dict)
+            ),
+            tags=tuple(
+                tuple((str(key), str(value)) for key, value in one.items())
+                for one in _read_list(d, "tags")
                 if isinstance(one, dict)
             ),
         )
@@ -2844,6 +2854,10 @@ class _Partitioner:
                     continue
                 if any(reader in alone for reader in reads):
                     continue  # a packet sink's edge stays an ffmpeg's to encode
+                if any(reader in self.node_shapes for reader in reads) and (
+                    len({self._format(inputs[0], reader) for reader in reads}) > 1
+                ):
+                    continue  # nodes taking it in different formats get a stream each
                 # The split's producer joins too when it is a module; otherwise
                 # the split's own input becomes a boundary read of the region.
                 feeds = _ref_node(inputs[0])
@@ -2874,7 +2888,9 @@ class _Partitioner:
                     continue
                 seen.add(ref)
                 wanted.append((ref, name))
-        if not any(name in self.node_shapes for name in members):
+        if not any(name in self.node_shapes for name in members) or any(
+            name in self.g.packet_sinks for name in members
+        ):
             return wanted
         kept: dict[tuple[FrameRef, StreamFormat], FrameRef] = {}
         shared: list[tuple[FrameRef, str]] = []
@@ -3977,7 +3993,12 @@ class _Partitioner:
         process hands another travel interleaved on one pipe, and no stream of
         it can wait on another pipe.
         """
-        nodes = {sidecar.id for sidecar in self.sidecars if sidecar.node_network}
+        # A sink's pads stay one input apiece, each with what it says of its row.
+        nodes = {
+            sidecar.id
+            for sidecar in self.sidecars
+            if sidecar.node_network and not sidecar.packet_sink
+        }
         if not nodes:
             return
         for index, edge in enumerate(self.edges):
@@ -4581,7 +4602,9 @@ class _Partitioner:
         producer = _ref_node(ref)
         if producer is not None and producer in self.node_shapes:
             return self._node_output_wire(producer, _ref_pad(ref), ref)
-        if target is not None and target in self.g.packet_filters:
+        if target is not None and (
+            target in self.g.packet_filters or target in self.g.packet_sinks
+        ):
             return None  # its destination settled what encodes for it
         if target is not None and target in self.node_shapes:
             node = self.g.nodes[target]
@@ -5058,8 +5081,8 @@ class _Partitioner:
         # A SINK MODULE is one too: the network string names its pad, and the
         # null output that pad is mapped to carries nothing.
         for name in members:
-            if name not in self.g.module_sinks:
-                continue
+            if name not in self.g.module_sinks or name in self.node_shapes:
+                continue  # a node sink makes no output but the rows it emits
             sinks.append(
                 SinkUnit(
                     outputs=[
@@ -5077,6 +5100,9 @@ class _Partitioner:
             sidecar,
             listens=self._region_listens(members, names),
             colors=self._region_colors(incoming, alias_of, read_order)
+            if sidecar.node_network
+            else (),
+            tags=self._region_tags(incoming, alias_of, read_order)
             if sidecar.node_network
             else (),
             reads_rows=any(e.annotations for e in self.edges if e.target == sidecar.id),
@@ -5128,6 +5154,26 @@ class _Partitioner:
         if not found:
             return ()
         return tuple(found.get(alias, ()) for alias in order)
+
+    def _region_tags(
+        self,
+        incoming: Sequence[StreamEdge],
+        alias_of: Mapping[FrameRef, str],
+        order: Sequence[str],
+    ) -> tuple[tuple[tuple[str, str], ...], ...]:
+        """The tags the query wrote on each ``-i`` of a node network's streams,
+        in ``-i`` order: an earlier stream's key wins over a later one's."""
+        found: dict[str, dict[str, str]] = {}
+        for edge in incoming:
+            alias = alias_of.get(edge.ref)
+            if alias is None:
+                continue
+            for ref in (edge.ref, self._past_splits(edge.ref)):
+                for key, value in self.g.stream_tags.get(ref, {}).items():
+                    found.setdefault(alias, {}).setdefault(key, value)
+        if not found:
+            return ()
+        return tuple(tuple(found.get(alias, {}).items()) for alias in order)
 
     def _region_listens(
         self, members: Sequence[str], names: Mapping[str, str]

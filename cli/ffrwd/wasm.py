@@ -48,6 +48,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import tempfile
 import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -58,7 +59,7 @@ from . import binaries, nn, probe
 from .emit import build_network_graph, build_node_network
 from .errors import ErrorCode, FfrwdError
 from .execute import STDIN, STDOUT
-from .ir import PARAMS_FILE, PIPE, RowsSink, StreamType
+from .ir import PARAMS_FILE, PIPE, Graph, Node, Output, RowsSink, SinkUnit, StreamType
 from .probe import ProbeResult, RenditionMeta, StreamMeta
 from .processes import (
     NUT,
@@ -1506,6 +1507,10 @@ def _last_line(text: str) -> str:
 # The rows document a packet sink writes, and the specifier every flag on the
 # copy's one output stream carries.
 _ROWS_FORMAT = "ndjson"
+# The output a node's emitted rows are labelled by, beside its ports.
+EMITTED_ROWS_PORT = "@rows"
+# What a compile-time read names the one node it hosts.
+_READ_NODE = "read"
 _OUTPUT_STREAM = "0"
 
 # How a `-map` names one stream of a kind, ffmpeg's own letters.
@@ -1566,6 +1571,9 @@ class PacketRead:
     module: str
     params: str
     wants: SinkWants
+    # The input of a node module the stream binds, whose rows are what the
+    # node emits beside its ports; empty for a packet sink.
+    port: str = ""
 
 
 # Runs one packet sink over one stream and returns the rows it wrote:
@@ -1660,6 +1668,53 @@ def _reader_argv(binary: str, read: PacketRead, described: Described | None) -> 
     return _argv(binary, process, reads=(STDIN,), writes=(STDOUT,))
 
 
+def _node_reader_argv(
+    binary: str, read: PacketRead, described: Described | None, scratch: Path
+) -> list[str]:
+    """The sidecar command hosting a node that reads the stream and emits rows.
+
+    One node bound by its port to the stream on stdin, its emitted rows
+    mapped to stdout as NDJSON: a network of one, as a query would spell
+    it. Params a filtergraph cannot spell go in a file in `scratch`.
+    """
+    params = _params_object(read.params)
+    filed: list[str] = []
+    if params and _params_filed(params):
+        written = scratch / "params.json"
+        written.write_text(json.dumps(params), encoding="utf-8")
+        filed = [_PARAMS_FROM_FLAG, f"{_READ_NODE}={written}"]
+        params = {}
+    node = Node(
+        id=_READ_NODE,
+        filter=_READ_NODE,
+        args=params,
+        inputs=[f"src:{_READ_NODE}:{_TYPE_SPECIFIERS[read.kind]}:0"],
+        outputs=["data"],
+        ports=[read.port],
+        out_ports=[EMITTED_ROWS_PORT],
+    )
+    graph = Graph(
+        input_paths=[PIPE],
+        sources={_READ_NODE: 0},
+        nodes={_READ_NODE: node},
+        sinks=[
+            SinkUnit(
+                outputs=[Output(ref=_READ_NODE, type="data", name=None, metadata={})],
+                path=PIPE,
+            )
+        ],
+    )
+    network, groups = build_node_network(graph, pipe_inputs=[STDIN])
+    argv = [binary, "-f", EDGE_FORMAT, "-i", STDIN]
+    for effect in EFFECTS:
+        if described is not None and getattr(described, effect):
+            argv += [_GRANT_FLAGS[effect], read.module]
+    argv += ["-m", f"{_READ_NODE}={read.module}", "-filter_complex", network, *filed]
+    for target in groups[0]:
+        argv += ["-map", target]
+    return [*argv, "-f", _ROWS_FORMAT, STDOUT]
+
+
 def _params_object(params: str) -> dict[str, object]:
     """A marshalled params string back as the object the argv writes."""
     if not params:
@@ -1701,18 +1756,23 @@ def read_packet_rows(
             "needs it to host the module",
             hint=INSTALL_HINT,
         )
-    sidecar_command = _reader_argv(binary, read, described)
-    failure: FfrwdError | None = None
-    for attempt in range(3):
-        command = copy_argv(ffmpeg, read, attempt)
-        if attempt and command == copy_argv(ffmpeg, read, attempt - 1):
-            continue  # nothing left to widen; the previous attempt was this one
-        try:
-            return _run_read(command, sidecar_command, read)
-        except _CopyRefused as refused:
-            failure = refused.error
-    assert failure is not None  # the loop runs at least one attempt
-    raise failure
+    with tempfile.TemporaryDirectory() as scratch:
+        sidecar_command = (
+            _node_reader_argv(binary, read, described, Path(scratch))
+            if read.port
+            else _reader_argv(binary, read, described)
+        )
+        failure: FfrwdError | None = None
+        for attempt in range(3):
+            command = copy_argv(ffmpeg, read, attempt)
+            if attempt and command == copy_argv(ffmpeg, read, attempt - 1):
+                continue  # nothing left to widen; the previous attempt was this one
+            try:
+                return _run_read(command, sidecar_command, read)
+            except _CopyRefused as refused:
+                failure = refused.error
+        assert failure is not None  # the loop runs at least one attempt
+        raise failure
 
 
 class _CopyRefused(Exception):
@@ -1996,6 +2056,9 @@ def _argv(
             colour = process.colors[index] if index < len(process.colors) else ()
             if colour:
                 pad["color"] = dict(colour)
+            tags = process.tags[index] if index < len(process.tags) else ()
+            if tags:
+                pad["tags"] = dict(tags)
             if pad:
                 argv += ["-pad", json.dumps(pad)]
     if any(grant.effect == "gpu" for grant in process.grants):
@@ -2240,7 +2303,9 @@ def _node_network_args(
         argv += ["-f", EDGE_FORMAT, path]
     for index, (targets, document) in enumerate(zip(groups[streams:], process.rows)):
         given_path = documents[index] if index < len(documents) else ""
-        path = document.sink.path or given_path or f"pipe:{streams + index + 1}"
+        # Rows nothing reads are the run's own, on stdout.
+        unread = STDOUT if not document.sink.alias else f"pipe:{streams + index + 1}"
+        path = document.sink.path or given_path or unread
         for target in targets:
             argv += ["-map", target]
         argv += ["-f", document.sink.container, path]

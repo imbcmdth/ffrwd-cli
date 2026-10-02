@@ -11,6 +11,7 @@ from __future__ import annotations
 import functools
 import json
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -325,10 +326,11 @@ def _lowered(
     query: str,
     modules: Mapping[str, Described] | None = None,
     asked: _Asked | None = None,
+    probes: Mapping[str, ProbeResult | None] | None = None,
 ) -> Graph:
     return lower(
         resolve(parse(_declared(query))),
-        _probes(),
+        dict(probes) if probes is not None else _probes(),
         registry=_registry(),
         describes=dict(modules) if modules is not None else {p: _node(p) for p in SHAPES},
         shapes=asked if asked is not None else _Asked(),
@@ -549,6 +551,38 @@ def test_kinds_mix_in_one_call_and_a_left_out_port_is_unbound() -> None:
     ]
 
 
+def _with_silent_source() -> dict[str, ProbeResult | None]:
+    probes = _probes()
+    media = probes["f"]
+    assert media is not None
+    probes["s"] = ProbeResult(streams=[one for one in media.streams if one.type == "video"])
+    return probes
+
+
+def _outer_joined(source: str, call: str) -> str:
+    return (
+        f"COPY (SELECT {call} FROM input('{source}.mp4') {source}, unnest({source}.video) v "
+        f"LEFT JOIN unnest({source}.audio) a ON v.index = a.index) TO 'out.mkv'"
+    )
+
+
+@pytest.mark.parametrize(
+    ("source", "bound"), [("s", ["v"]), ("f", ["v", "a"])], ids=["silent", "with-sound"]
+)
+def test_a_stream_an_outer_join_leaves_null_leaves_a_default_null_port_unbound(
+    source: str, bound: list[str]
+) -> None:
+    graph = _lowered(_outer_joined(source, "burn(v, a)"), probes=_with_silent_source())
+    (burn,) = [node for node in graph.nodes.values() if node.filter == "burn.wasm"]
+    assert burn.ports == bound
+
+
+def test_a_stream_an_outer_join_leaves_null_is_still_refused_to_a_required_port() -> None:
+    with pytest.raises(FfrwdError) as caught:
+        _lowered(_outer_joined("s", "burn(v, words => hear(a))"), probes=_with_silent_source())
+    assert caught.value.message.startswith("'a' is NULL in row 1")
+
+
 def test_a_held_input_left_unbound_keeps_its_port_param() -> None:
     graph = _lowered("COPY (SELECT inset(f.video[1], port => 9100)" + _FROM)
     (inset,) = [node for node in graph.nodes.values() if node.filter == "inset.wasm"]
@@ -734,13 +768,14 @@ def _plan_argv(
     monkeypatch: pytest.MonkeyPatch,
     rate: int = 48000,
     colour: Mapping[str, str] | None = None,
+    describe: Callable[[str], Described] = _node,
 ) -> dict[str, list[str]]:
     """Each process of the compiled plan as the printed command shows it."""
     probes = _probes(rate, colour)
     monkeypatch.setattr(
         "ffrwd.compiler.probe_path", lambda path, args=(), **kw: probes[path[0]]
     )
-    compiled = compile_all(_declared(query), describe=_node, shape=_Asked())
+    compiled = compile_all(_declared(query), describe=describe, shape=_Asked())
     assert compiled.plan is not None
     return plan_argv(
         compiled.plan,
@@ -834,6 +869,29 @@ def test_a_picture_written_beside_the_nodes_reading_it_crosses_to_them_once(
     sidecar = argv["sidecar0"]
     assert sidecar[sidecar.index("-filter_complex") + 1] == (
         "[v=0:v]spot=every=30[spots=n1];[v=0:v][spots=n1]ring[v=out0]"
+    )
+
+
+@pytest.mark.parametrize("beside", ["", ", f.video[1]"], ids=["alone", "written-beside"])
+def test_nodes_taking_one_picture_in_different_formats_get_a_stream_each(
+    monkeypatch: pytest.MonkeyPatch, beside: str
+) -> None:
+    yuv, rgba = {"pixel_formats": ["yuv420p"]}, {"pixel_formats": ["rgba"]}
+    monkeypatch.setitem(SHAPES, "spot.wasm", _taking(_spot, "video", yuv))
+    monkeypatch.setitem(SHAPES, "ring.wasm", _taking(_reader("spots", _ROWS), "video", rgba))
+    argv = _plan_argv(
+        f"COPY (SELECT ring(f.video[1], spot(f.video[1])){beside} "
+        "FROM input('f.mp4') f) TO 'both.mkv'",
+        monkeypatch,
+    )
+    feeder = _feeder(argv)
+    assert [feeder[at + 1] for at, word in enumerate(feeder) if word.startswith("-pix_fmt")] == [
+        "yuv420p",
+        "rgba",
+    ]
+    sidecar = argv["sidecar0"]
+    assert sidecar[sidecar.index("-filter_complex") + 1] == (
+        "[v=0:v]spot=every=30[spots=n1];[v=0:v:1][spots=n1]ring[v=out0]"
     )
 
 
@@ -939,6 +997,34 @@ def test_a_picture_converted_to_rgb_on_its_way_carries_what_the_conversion_wrote
     assert _pad_after_input(argv["sidecar0"]) == {
         "color": {"range": "pc", "primaries": "bt709", "trc": "bt709", "space": "gbr"}
     }
+
+
+def test_the_tags_a_query_writes_on_a_stream_reach_the_node_reading_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    argv = _plan_argv(
+        "COPY (WITH ad AS (SELECT v AS v, STRUCT('1' AS smart_timed) AS tags "
+        "FROM input('a.mp4') a, unnest(a.video) v) "
+        "SELECT ring(ad.v[1], spot(ad.v[1])) FROM ad) TO 'ringed.mp4'",
+        monkeypatch,
+    )
+    pad = _pad_after_input(argv["sidecar0"])
+    assert isinstance(pad, dict) and pad["tags"] == {"smart_timed": "1"}
+
+
+def test_a_star_over_a_call_reads_the_outputs_its_shape_makes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def mask_alone(params: Mapping[str, object], bound: Sequence[str]) -> dict[str, object]:
+        return _shape([_clock("v")], [_output("mask", "video")], {"kind": "input", "port": "v"})
+
+    monkeypatch.setitem(SHAPES, "matte.wasm", mask_alone)
+    graph = _lowered(
+        "COPY (WITH m AS (SELECT (matte(f.video[1])).* FROM input('f.mp4') f) "
+        "SELECT m.mask FROM m) TO 'out.mkv'"
+    )
+    (matte,) = [node for node in graph.nodes.values() if node.filter == "matte.wasm"]
+    assert [output.ref for output in graph.sinks[0].outputs] == [matte.id]
 
 
 def test_a_node_network_hands_one_process_every_stream_it_reads_on_one_nut(
@@ -1128,6 +1214,92 @@ def test_a_node_source_writing_coded_packets_binds_one_row_per_rendition() -> No
     (sub,) = [node for node in graph.nodes.values() if node.filter == "sub.wasm"]
     assert sub.outputs == ["video", "audio", "video"]
     assert [output.ref for output in graph.sinks[0].outputs] == [f"{sub.id}:0"]
+
+
+def test_a_node_sources_coded_streams_keep_their_time_at_a_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(SHAPES, "sub.wasm", _subscribe)
+    argv = _plan_argv(
+        "CREATE FUNCTION sub(relay text) RETURNS source AS 'sub.wasm', 'sub' LANGUAGE wasm;\n"
+        "COPY (SELECT v.video[1], v.audio[1] FROM sub('r') v WHERE v.height = 720) "
+        "TO 'out.mkv'",
+        monkeypatch,
+    )
+    assert argv["ffmpeg0"][:2] == ["ffmpeg", "-copyts"]
+
+
+def _arrival(name: str, kind: str, codecs: Sequence[str] = ()) -> dict[str, object]:
+    return {
+        "name": name, "kind": kind, "required": name == "video", "many": True,
+        "pairing": {"kind": "arrival"}, "rows": "ignore", "window": 1, "stride": 1,
+        "accepts": {"codecs": list(codecs)},
+    }
+
+
+def _publish(params: Mapping[str, object], bound: Sequence[str]) -> dict[str, object]:
+    """ffrwd/moq's publish: coded pictures, coded sound and data, by arrival."""
+    return _shape(
+        [_arrival("video", "packets", ["h264"]), _arrival("audio", "packets", ["aac"]),
+         _arrival("data", "data")],
+        [],
+        {"kind": "rate", "num": 50, "den": 1},
+    )
+
+
+_PUBLISH = (
+    "CREATE FUNCTION publish(relay text, broadcast text) RETURNS sink "
+    "AS 'publish.wasm', 'publish' LANGUAGE wasm;\n"
+)
+
+
+def _reporting(*reporting: str) -> Callable[[str], Described]:
+    """`_node`, with the modules named emitting rows of their own."""
+
+    def describe(path: str) -> Described:
+        described = _node(path)
+        if path not in reporting:
+            return described
+        return replace(described, rows_schema={"type": "object"})
+
+    return describe
+
+
+def test_a_node_at_a_copys_to_reads_the_select_as_a_packet_sink_did(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(SHAPES, "publish.wasm", _publish)
+    monkeypatch.setitem(
+        _PARAMS, "publish.wasm", {"relay": {"type": "string"}, "broadcast": {"type": "string"}}
+    )
+    argv = _plan_argv(
+        _PUBLISH + "COPY (SELECT f.video[1], f.audio[1] FROM input('f.mp4') f) "
+        "TO publish('https://relay', 'b') WITH (video_codec 'libx264', audio_codec 'aac')",
+        monkeypatch,
+        describe=_reporting("publish.wasm"),
+    )
+    sidecar = argv["sidecar0"]
+    assert sidecar.count("-i") == 2 and sidecar.count("-pad") == 2
+    network = sidecar[sidecar.index("-filter_complex") + 1]
+    assert network.startswith("[video=0:v][audio=")
+    assert network.endswith("]publish=relay=https\\\\://relay:broadcast=b[@rows=out0]")
+    assert sidecar[-5:] == ["-map", "[out0]", "-f", "ndjson", "pipe:1"]
+    (encoder,) = [words for pid, words in argv.items() if pid.startswith("ffmpeg")]
+    assert encoder[encoder.index("-c:0") + 1] == "libx264"
+
+
+def test_the_rows_a_node_emits_are_the_runs_on_its_stdout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    argv = _plan_argv(
+        "COPY (SELECT ring(f.video[1], spot(f.video[1])) FROM input('f.mp4') f) "
+        "TO 'ringed.mp4'",
+        monkeypatch,
+        describe=_reporting("spot.wasm"),
+    )
+    sidecar = argv["sidecar0"]
+    assert "[@rows=out1]" in sidecar[sidecar.index("-filter_complex") + 1]
+    assert sidecar[-5:] == ["-map", "[out1]", "-f", "ndjson", "pipe:1"]
 
 
 def test_a_node_reading_coded_packets_is_handed_the_stream_as_it_was_coded(
