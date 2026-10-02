@@ -174,7 +174,7 @@ WORLDS: tuple[str, ...] = (
     "ffrwd:av@0.16.0",
     "ffrwd:av@0.17.0",
     "ffrwd:av@0.18.0",
-    "ffrwd:av@0.19.0",
+    "ffrwd:av@0.19.1",
 )
 
 # The world a module scaffolded today is built against: the newest of those,
@@ -245,7 +245,7 @@ DATA_FILTER_WORLD = "ffrwd:av@0.17.0"
 # The first world whose sidecar hosts a codec package's encoder and decoder.
 CODEC_WORLD = "ffrwd:av@0.18.0"
 
-# What a module exporting the 0.19.0 world's `node` describes as its world:
+# What a module exporting the 0.19.1 world's `node` describes as its world:
 # its ports are not in its describe at all but in its shape, per call
 # (:mod:`ffrwd.shapes`).
 NODE_WORLD = "node-module"
@@ -866,7 +866,7 @@ def _hosted_world(world: str) -> str:
     """The world the sidecar hosts a module in, as the compiler's checks read it.
 
     The sidecar describes a module by the world it hosts it in, not the one
-    it was built against: a node is `node-module`, which is 0.19.0's, and
+    it was built against: a node is `node-module`, which is 0.19.1's, and
     every older module is adapted into the newest world it knows. Each
     `hosts_*` check asks what that world can host.
     """

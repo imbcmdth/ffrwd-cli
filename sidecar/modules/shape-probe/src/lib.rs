@@ -5,12 +5,16 @@
 //!   rgba. With `rate` set the clock is that rate instead and `v` is held.
 //! - `feed`: video, optional, held on a host port named by `port`, anchored
 //!   by the `smart_timed` tag.
-//! - `words`: data, optional and many, by interval, folded as state.
+//! - `words`: data, optional and many, by interval, folded as state, each
+//!   stream placed on the clock by its first message.
 //! - `a`: audio, optional, lockstep with `v`.
+//! - `cues`: data, optional, by interval, on `feed`'s connection.
+//! - `size`: video, optional, lockstep, read for its timing alone.
 //! - `mask`: `v`'s size in gray, left out when `v` is not bound.
 //! - `copy`: `v` itself, frame for frame.
 //! - `canvas`: a video of the size `canvas` names, only when it does.
-//! - `spots`: data, one message per tick.
+//! - `spots`: data, one message per tick, as late as twelve of `v`'s frames
+//!   where the call says `v`'s rate and half a second where it does not.
 //!
 //! `refuse` asks for a shape the host must refuse, by name of the rule.
 
@@ -22,8 +26,8 @@ wit_bindgen::generate!({
 use exports::ffrwd::av::node::{Emission, Emitted, Guest, Payload, SameFrame};
 use ffrwd::av::node_tick::Tick;
 use ffrwd::av::node_types::{
-    Accepts, Anchor, BoundStream, Clock, Hold, InputPort, Interval, LikeInput, Message, NodeShape,
-    OutputFormat, OutputPort, Pairing, PortKind, RowsUse,
+    Accepts, Anchor, Binding, BoundStream, Clock, Hold, InputPort, Interval, LikeInput, Message,
+    NodeShape, OutputFormat, OutputPort, Pairing, PortKind, RowsUse,
 };
 use ffrwd::av::types::{Meta, Rational, VideoFormat, Wants};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -94,7 +98,7 @@ fn output(name: &str, kind: PortKind, format: Option<OutputFormat>) -> OutputPor
     }
 }
 
-fn shape(params: &Params, bound: &[String]) -> NodeShape {
+fn shape(params: &Params, bound: &[Binding]) -> NodeShape {
     let held = params.rate.is_some();
     let mut v = input(
         "v",
@@ -135,7 +139,7 @@ fn shape(params: &Params, bound: &[String]) -> NodeShape {
         Pairing::Interval(Interval {
             latency: Some(2.0),
             ahead: 0.25,
-            anchor: Anchor::SharedClock,
+            anchor: Anchor::FirstFrame,
             group: None,
         }),
         RowsUse::State,
@@ -157,7 +161,32 @@ fn shape(params: &Params, bound: &[String]) -> NodeShape {
     let mut a = input("a", PortKind::Audio, false, audio_pairing, RowsUse::Ignore);
     a.accepts.sample_formats = vec!["f32".to_string()];
 
-    let v_bound = bound.iter().any(|b| b == "v");
+    let cues = input(
+        "cues",
+        PortKind::Data,
+        false,
+        Pairing::Interval(Interval {
+            latency: None,
+            ahead: 0.0,
+            anchor: Anchor::SharedClock,
+            group: Some("feeder".to_string()),
+        }),
+        RowsUse::PerFrame,
+    );
+    let mut size = input(
+        "size",
+        PortKind::Video,
+        false,
+        Pairing::Lockstep,
+        RowsUse::Ignore,
+    );
+    size.accepts.wants = Wants::Timing;
+
+    let v_binding = bound.iter().find(|b| b.input == "v");
+    let v_bound = v_binding.is_some();
+    let v_rate = v_binding
+        .and_then(|b| b.streams.first())
+        .and_then(|s| s.rate);
     let mut outputs = Vec::new();
     if v_bound {
         outputs.push(output(
@@ -200,13 +229,16 @@ fn shape(params: &Params, bound: &[String]) -> NodeShape {
         num: 1,
         den: 1_000_000,
     });
-    spots.latency = 0.5;
+    spots.latency = match v_rate {
+        Some(rate) => 12.0 * f64::from(rate.den) / f64::from(rate.num),
+        None => 0.5,
+    };
     spots.schema =
         Some(r#"{"type":"object","properties":{"start_t":{"type":"number"}}}"#.to_string());
     outputs.push(spots);
 
     let mut shape = NodeShape {
-        inputs: vec![v, feed, words, a],
+        inputs: vec![v, feed, words, a, cues, size],
         outputs,
         clock: match params.rate {
             Some(rate) => Clock::Rate(Rational { num: rate, den: 1 }),
@@ -238,6 +270,17 @@ fn shape(params: &Params, bound: &[String]) -> NodeShape {
             shape.inputs[0].stride = 3;
         }
         Some("optional_clock") => shape.inputs[0].required = false,
+        Some("timing_on_data") => shape.inputs[4].accepts.wants = Wants::Timing,
+        Some("group_not_held") => {
+            if let Pairing::Interval(interval) = &mut shape.inputs[4].pairing {
+                interval.group = Some("nobody".to_string());
+            }
+        }
+        Some("group_first_frame") => {
+            if let Pairing::Interval(interval) = &mut shape.inputs[4].pairing {
+                interval.anchor = Anchor::FirstFrame;
+            }
+        }
         _ => {}
     }
     shape
@@ -263,12 +306,8 @@ impl Guest for ShapeProbe {
         }
     }
 
-    fn shape(
-        params_text: String,
-        bound: Vec<ffrwd::av::node_types::Binding>,
-    ) -> Result<NodeShape, String> {
-        let names: Vec<String> = bound.into_iter().map(|b| b.input).collect();
-        Ok(shape(&params(&params_text)?, &names))
+    fn shape(params_text: String, bound: Vec<Binding>) -> Result<NodeShape, String> {
+        Ok(shape(&params(&params_text)?, &bound))
     }
 
     fn init(

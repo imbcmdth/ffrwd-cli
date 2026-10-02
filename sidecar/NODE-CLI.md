@@ -1,7 +1,7 @@
 # Node calls on the sidecar's command line
 
 How a compiled query hands the sidecar a network that holds node modules
-(`ffrwd:av@0.19.0`). Everything an older module takes stays as it is: the
+(`ffrwd:av@0.19.1`). Everything an older module takes stays as it is: the
 same `-m`, the same positional pads, the same outputs. A node module is
 told apart by its export, and its pads say which port they bind.
 
@@ -35,6 +35,21 @@ one a packets port, a data stream a data port.
 after an `-i` says what its NUT does not carry: a raw picture's colour, in
 ffmpeg's names, and tags for its streams beside their own, which reach a
 node in `stream-info.tags` (a hold input anchored `tagged` reads them).
+
+    -pad '{"rate": {"num": 30000, "den": 1001}}'
+    -pad '{"rate": {"v": {"num": 25, "den": 1}, "a": {"num": 48000, "den": 1}, "a:1": {"num": 16000, "den": 1}}}'
+
+`rate` is what the compiler knew of the input's streams when it asked a
+node for its shape: a video stream's frame rate, an audio stream's sample
+rate over 1 (the WIT's `stream-hint`). One rational is the rate of every
+stream of that input, for an edge carrying one stream; an object of them
+is one per stream, keyed by the stream as a pad names it after the input's
+number (`v` is `v:0`, then `v:1`, `a`, `a:1`, `d`, ...), and a stream it
+leaves out has none. Both numbers are positive. Write it wherever the rate
+was known when the shape was asked, and only then: the host builds the
+same `binding` list from it (see "Asking the shape again"), and hands each
+bound stream the same hint at `init` (`bound-stream.hint`), so a module
+that derives its shape again there derives the plan's.
 
 ## Nodes
 
@@ -74,6 +89,24 @@ node module every pad carries the port it binds before an `=`:
   that param.
 - **One call, many readers.** A label may be read by any number of pads
   and `-map`s; the host splits it.
+
+### Asking the shape again
+
+The host asks every node module for its shape at the start of the run, and
+it must get the shape the plan was made from, so it asks with the list the
+compiler asked `--shape --bound` with (`NODE-SHAPE.md`):
+
+- one `binding` per port the chain binds, in the order its pads first name
+  each port;
+- in each, one stream per pad naming that port, in the order written;
+- each stream's `rate` is the one `-pad` gives that stream of its input
+  (above); a stream bound by a label, which another chain writes, has none.
+
+A hold input served by a port is not in the list, as it is not among the
+pads. Ask `--shape` with exactly this list, as JSON wherever a rate is
+known: `[v=0:v][a=0:a][words=n1]` over `-pad '{"rate": {"v": {"num": 30,
+"den": 1}}}'` is `--bound
+'[{"input":"v","streams":[{"rate":{"num":30,"den":1}}]},{"input":"a","streams":[{"rate":null}]},{"input":"words","streams":[{"rate":null}]}]'`.
 
 A frame module of an older world keeps its positional pads in the same
 `-filter_complex`, and runs as the node its adapter makes of it. The host's
@@ -134,6 +167,32 @@ there, so `(at, first-pts)` maps any member's pts onto the clock. A member
 the connection does not bring (not sent, or its sound refused) gets no feed
 at all on any tick, where one not arrived yet gets a feed and no frames.
 
+A data input whose `interval` names the group (`interval.group`) arrives
+on the same connection, unbound by any pad, as the hold inputs do. What a
+feeder writes so its rows land there, in one NUT:
+
+- the picture (raw video, rgba or yuv420p) and the sound (PCM) as above,
+  and a data stream: stream class 3, codec tag `JSON`, one packet per
+  message whose payload is one JSON object (what ffrwd writes for any data
+  edge);
+- the data stream's pts counted on the same origin as the picture's, in a
+  time base of its own: the host places them with the group's one offset,
+  fixed by the first picture, so a row stamped at a picture's pts lands on
+  the tick that picture shows on;
+- data streams go to the group's data inputs in the order of the shape's
+  inputs, the first data stream on the wire to the first such input; one
+  beyond them is left on the wire, and a progress mark on it is ignored;
+- tags as for any feed: the connection's and the picture's reach every
+  member, so `smart_timed` on the picture times the rows too.
+
+A message is handed on the tick whose interval holds its time on the
+clock (`ahead` included), and one whose time the clock has passed, or that
+arrived before the feed's start was fixed, on the first tick that can take
+it. A connection's messages never outlive its feed: those queued when it
+ends are dropped with it. A group data input bound by a pad is refused;
+with its group's hold inputs bound to streams rather than a port, it is
+bound to a stream like any data input and placed with that group's offset.
+
 The host says what it did on stderr, as lines and as rows behind
 `ffrwd:row `: `{"kind":"listen",...}` once the port is bound,
 `{"kind":"feed","event":"start",...}` with the anchor and the mapping when
@@ -175,6 +234,38 @@ tick that held them.
   own arrival, or on a rate clock on the newest time any input has
   reached. A message that arrives after its tick was cut is delivered at
   the next tick and reported.
+- **Re-stamping.** An interval input anchored `first-frame` (or `tagged`
+  where the stream's tags do not carry the name set to `1`) counts on an
+  origin of its own. Its first message stands at the first tick the host
+  cuts once that message has arrived: that fixes an offset for the
+  stream's life, and every message, and every progress mark, is restamped
+  onto the clock's time base with it (`pts` rescaled, then the offset
+  added). The node is told the clock's time base for that stream at
+  `init` and on every tick. Until its first message the input holds no
+  tick, so a stream on another origin never waits behind the programme.
+  `shared-clock` is the stream's own pts, rescaled, as before.
+- **Timing inputs.** An input whose `accepts.wants` is `timing` is handed
+  each frame's `pts` and `duration` and the stream's info, and no bytes:
+  the host copies and converts nothing for it, a port feed's picture is
+  not conformed, and `fetch` (or `same`) on its frames is a fault. Hand
+  it the stream in whatever raw format the source has cheapest; its
+  `accepts` formats are not checked. An audio timing input is re-cut by
+  sample count as any audio input is.
+- **Ordinal.** `tick.ordinal` is the tick's number in the run, from 0,
+  counted over every instance: on every worker the same tick has the same
+  number, so a node that numbers things by frame can run on many.
+- **Ended feeds.** `tick.ended-feeds(id)` on a hold input lists the feeds
+  that ended since that instance's previous call, oldest first, every one
+  that ended before on its first call: whatever ended them (the source,
+  `timeout`, a jump in the clock, a connection closing with nothing
+  queued), foretold or not. Each has `ends` set to the last tick it
+  showed on, and its `start` as `tick.feed` gave it.
+- **Known.** `feed-start.known` is the clock time of the tick the feed's
+  start was fixed on: for a `first-frame` feed the tick its priming
+  finished, `lead` before `at` on the clock's grid; for a `shared-clock`
+  feed the tick its first frame arrived by, which for a timed feeder is
+  seconds before `at`; equal to `at` where the clock had already passed
+  the first frame, which then shows at once.
 - **Lanes.** A pure node runs on as many workers as `-jobs` allows, its
   results put back in tick order before they leave. A pure node with a
   state input opens every instance before its first tick, and each

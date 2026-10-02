@@ -507,7 +507,7 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   `RETURNS sink` reading several streams takes no annotation column.
   Recipe [144](examples.md#144-hand-one-modules-rows-to-a-module-reading-two-streams).
 - A **node `LANGUAGE wasm` function** names a module exporting
-  `ffrwd:av@0.19.0`'s `node`, which its describe says (`"world":
+  `ffrwd:av@0.19.1`'s `node`, which its describe says (`"world":
   "node-module"`). What a node reads and writes is its SHAPE for each
   call: `ffrwd-wasm --shape` with the call's params and the names of the
   inputs it binds, asked once per distinct module, params and bound

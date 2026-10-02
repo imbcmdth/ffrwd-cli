@@ -133,6 +133,67 @@ fn shape_refuses_what_the_wit_refuses_and_a_port_not_declared() {
     let run = sidecar(&["--shape", &probe, "--bound", "v,nope"]);
     let stderr = String::from_utf8_lossy(&run.stderr);
     assert!(stderr.contains("bound input 'nope'"), "{stderr}");
+
+    for (rule, said) in [
+        ("timing_on_data", "wants timing"),
+        ("group_not_held", "no hold input declares"),
+        ("group_first_frame", "its anchor is shared-clock"),
+    ] {
+        let params = format!(r#"{{"refuse":"{rule}"}}"#);
+        let run = sidecar(&["--shape", &probe, "--params", &params, "--bound", "v"]);
+        assert_eq!(run.status.code(), Some(1), "{rule}");
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(stderr.contains(said), "{rule}: {stderr}");
+    }
+}
+
+#[test]
+fn shape_takes_the_bound_list_as_json_and_hands_each_streams_rate_to_the_module() {
+    let probe = module("shape_probe");
+    let spots_latency = |bound: &str| {
+        let s = json(&sidecar(&["--shape", &probe, "--bound", bound]));
+        let spots = s["outputs"]
+            .as_array()
+            .expect("a list")
+            .iter()
+            .find(|o| o["name"] == "spots")
+            .expect("spots")
+            .clone();
+        spots["latency"].as_f64().expect("a latency")
+    };
+    assert_eq!(
+        spots_latency(r#"[{"input":"v","streams":[{"rate":{"num":30,"den":1}}]}]"#),
+        0.4,
+        "twelve frames at 30 fps"
+    );
+    assert_eq!(
+        spots_latency(
+            r#"[{"input":"v","streams":[{"rate":{"num":25,"den":1}}]},{"input":"words","streams":[{"rate":null},{}]}]"#
+        ),
+        0.48,
+        "twelve frames at 25 fps"
+    );
+    assert_eq!(spots_latency("v"), 0.5, "names alone say no rate");
+    assert_eq!(
+        spots_latency(r#"[{"input":"v"}]"#),
+        0.5,
+        "a binding with no streams listed is one stream with no rate"
+    );
+
+    for (bound, said) in [
+        (r#"[{"input":"v"},{"input":"v"}]"#, "names input 'v' twice"),
+        (r#"[{"input":"v","streams":[]}]"#, "to no stream"),
+        (
+            r#"[{"input":"v","streams":[{"rate":{"num":0,"den":1}}]}]"#,
+            "which is no rate",
+        ),
+        (r#"[{"input":"v","nope":1}]"#, "unknown field"),
+    ] {
+        let run = sidecar(&["--shape", &probe, "--bound", bound]);
+        assert_eq!(run.status.code(), Some(1), "{bound}");
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(stderr.contains(said), "{bound}: {stderr}");
+    }
 }
 
 #[test]

@@ -1,6 +1,6 @@
 # Node shapes on the command line
 
-A module built against `ffrwd:av@0.19.0` exports `node`. Its ports and
+A module built against `ffrwd:av@0.19.1` exports `node`. Its ports and
 clock depend on its params and on which inputs a call binds, so the
 sidecar asks the module and prints the answer as JSON.
 
@@ -25,13 +25,23 @@ rows or data-filter interface is refused.
 
 ## Shape
 
-    ffrwd-wasm --shape <module> [--params <json> | --params-from <file>] [--bound <port,port,...>]
+    ffrwd-wasm --shape <module> [--params <json> | --params-from <file>] [--bound <port,port,...> | --bound <json>]
 
 - `--params`: the call's static params, one JSON object. Absent is the
   empty string, which is what a module with no params is handed.
-- `--bound`: the inputs the call binds, by the names the module declares,
-  comma separated. Absent or empty binds none. A name the shape does not
-  declare is refused.
+- `--bound`: the inputs the call binds, as the WIT's `list<binding>`:
+  a JSON array of `{"input": "<name>", "streams": [{"rate": {"num": n,
+  "den": d}}, ...]}`, one `binding` per input and one stream hint per
+  stream bound to it, in the order the call names them. `rate` is a video
+  stream's frame rate or an audio stream's sample rate over 1, `null` (or
+  absent) where nothing settles it before the run; `streams` absent is
+  one stream with no rate. Or the comma list of the names alone, each one
+  stream with no rate, a name written again one stream more (`v,v,v`
+  binds three to `v`). Absent or empty binds none. A name the shape does
+  not declare is refused, and so is an input named twice in the JSON, an
+  empty `streams`, a rate that is not positive and a key not listed here.
+  The run asks the shape with the list `NODE-CLI.md` ("Asking the shape
+  again") says; ask with the same one.
 - `-http`, `-udp`, `-tcp` and `-gpu` grant effects the way a run's argv
   does, for a source that reads the network to answer.
 
@@ -48,6 +58,9 @@ refuses what `shape`'s doc in `wit/av.wit` lists:
 - `like` (on an output, or in `accepts`) naming an input that is not
   declared, takes many streams, is not bound, or carries no frames;
 - a stride of 0 or above its window;
+- `wants` `timing` on a data or packets input;
+- an `interval` naming a group no hold input declares, or naming one with
+  an anchor other than `shared_clock`;
 
 and, beyond that list: a window other than 1/1 on an input that is not
 the clock, a port name declared twice, a rate clock that is no rate.
@@ -60,8 +73,8 @@ The JSON is the WIT's `node-shape` record:
   `port-param` is `port_param`).
 - An enum is its case as a string, snake_case: `kind` is `"video"`,
   `"audio"`, `"data"` or `"packets"`; `rows` is `"ignore"`,
-  `"per_frame"` or `"state"`; `wants` is `"all"`, `"keyframes"` or
-  `"first"`.
+  `"per_frame"` or `"state"`; `wants` is `"all"`, `"keyframes"`,
+  `"first"` or `"timing"`.
 - A variant is an object whose `kind` names the case. A case carrying a
   record has that record's fields beside `kind`; a case carrying anything
   else has it under the name below.
@@ -73,7 +86,7 @@ The JSON is the WIT's `node-shape` record:
 
 | Variant | Cases |
 |---|---|
-| `pairing` | `{"kind":"lockstep"}`, `{"kind":"hold", "anchor", "lead", "linger", "timeout", "group", "port_param"}`, `{"kind":"interval", "latency", "ahead"}`, `{"kind":"arrival"}` |
+| `pairing` | `{"kind":"lockstep"}`, `{"kind":"hold", "anchor", "lead", "linger", "timeout", "group", "port_param"}`, `{"kind":"interval", "latency", "ahead", "anchor", "group"}`, `{"kind":"arrival"}` |
 | `anchor` | `{"kind":"shared_clock"}`, `{"kind":"first_frame"}`, `{"kind":"tagged", "tag": "<name>"}` |
 | `clock` | `{"kind":"input", "port": "<name>"}`, `{"kind":"rate", "num", "den"}`, `{"kind":"rate_of", "port": "<name>"}`, `{"kind":"self_clocked"}` |
 | `output-format` | `{"kind":"video", "width", "height", "pix_fmt", "color"}`, `{"kind":"audio", "sample_rate", "channels", "sample_fmt", "channel_layout"}`, `{"kind":"data", "codec": "json"}`, `{"kind":"packets", ...coded-stream}`, `{"kind":"like", "port", "pixel_format", "sample_format"}` |
@@ -91,7 +104,7 @@ both, and `like`, against the streams it binds.
 
 `modules/shape-probe`, a test module whose shape touches every field:
 
-    ffrwd-wasm --shape shape_probe.wasm --params '{"canvas":{"width":640,"height":360}}' --bound v,feed,words,a
+    ffrwd-wasm --shape shape_probe.wasm --params '{"canvas":{"width":640,"height":360}}'       --bound '[{"input":"v","streams":[{"rate":{"num":25,"den":1}}]},{"input":"feed"},{"input":"words"},{"input":"a"}]'
 
 Printed on one line; here indented, keys in the WIT's order:
 
@@ -151,7 +164,13 @@ Printed on one line; here indented, keys in the WIT's order:
       "kind": "data",
       "required": false,
       "many": true,
-      "pairing": {"kind": "interval", "latency": 2.0, "ahead": 0.25},
+      "pairing": {
+        "kind": "interval",
+        "latency": 2.0,
+        "ahead": 0.25,
+        "anchor": {"kind": "first_frame"},
+        "group": null
+      },
       "rows": "state",
       "window": 1,
       "stride": 1,
@@ -182,6 +201,52 @@ Printed on one line; here indented, keys in the WIT's order:
         "channel_counts": [],
         "codecs": [],
         "wants": "all",
+        "like": null
+      },
+      "schema": null
+    },
+    {
+      "name": "cues",
+      "kind": "data",
+      "required": false,
+      "many": false,
+      "pairing": {
+        "kind": "interval",
+        "latency": null,
+        "ahead": 0.0,
+        "anchor": {"kind": "shared_clock"},
+        "group": "feeder"
+      },
+      "rows": "per_frame",
+      "window": 1,
+      "stride": 1,
+      "accepts": {
+        "pixel_formats": [],
+        "sample_formats": [],
+        "sample_rates": [],
+        "channel_counts": [],
+        "codecs": [],
+        "wants": "all",
+        "like": null
+      },
+      "schema": null
+    },
+    {
+      "name": "size",
+      "kind": "video",
+      "required": false,
+      "many": false,
+      "pairing": {"kind": "lockstep"},
+      "rows": "ignore",
+      "window": 1,
+      "stride": 1,
+      "accepts": {
+        "pixel_formats": [],
+        "sample_formats": [],
+        "sample_rates": [],
+        "channel_counts": [],
+        "codecs": [],
+        "wants": "timing",
         "like": null
       },
       "schema": null
@@ -220,7 +285,7 @@ Printed on one line; here indented, keys in the WIT's order:
       "kind": "data",
       "format": {"kind": "data", "codec": "json"},
       "time_base": {"num": 1, "den": 1000000},
-      "latency": 0.5,
+      "latency": 0.48,
       "schema": "{\"type\":\"object\",\"properties\":{\"start_t\":{\"type\":\"number\"}}}",
       "row": null
     }
@@ -233,8 +298,10 @@ Printed on one line; here indented, keys in the WIT's order:
 }
 ```
 
-The same module with `--params '{"rate":25}'` and nothing bound has
-`"clock": {"kind": "rate", "num": 25, "den": 1}`, holds `v` and `a`,
+`spots` is as late as twelve of `v`'s frames, 0.48 s at the 25/1 the
+binding gives `v`; with `--bound v,feed,words,a`, which says no rate, it
+is 0.5. The same module with `--params '{"rate":25}'` and nothing bound
+has `"clock": {"kind": "rate", "num": 25, "den": 1}`, holds `v` and `a`,
 and drops `mask` and `copy`, since an output `like` an unbound input is
 left out.
 

@@ -1,6 +1,6 @@
 """A node module's shape for one call: its ports, how each pairs, its clock.
 
-A module exporting ``ffrwd:av@0.19.0``'s ``node`` says what it reads and
+A module exporting ``ffrwd:av@0.19.1``'s ``node`` says what it reads and
 writes per call, not once: its ports and formats turn on its params and on
 which inputs the call binds. The compiler asks the sidecar for each distinct
 call, ``ffrwd-wasm --shape <module> --params <json> --bound <ports>``, which
