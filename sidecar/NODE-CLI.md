@@ -77,7 +77,8 @@ node module every pad carries the port it binds before an `=`:
 
 A frame module of an older world keeps its positional pads in the same
 `-filter_complex`, and runs as the node its adapter makes of it. The host's
-`rowfilter` and `rowmerge` read one data edge by position: `[n1]rowfilter`.
+`rowfilter` and `rowmerge` read one data edge by position: `[n1]rowfilter`,
+and `leaky` one picture stream: `[v=0:v]leaky=max_lateness=0.5[live]`.
 
 ## Outputs
 
@@ -121,12 +122,15 @@ knocks. Every connection asks for a 16 MiB receive buffer, and is read
 only while the input has room, so a source that outruns the clock waits on
 its socket. Each connection is a feed (`tick.feed`), with the source's own
 tags and time base from its start on; a source whose pts jump backwards or
-more than a second forwards is a new feed on the same connection. Every
-member of a group is told the picture's offset: its `feed-start.at` is the
-picture's, and its `first-pts` the point of its own stream that offset puts
+more than a second forwards is a new feed on the same connection. A
+connection may carry any of a group's members, and streams beyond them are
+left on the wire: a feeder of sound alone feeds the sound. Every member of
+a group is told the lead's offset, the picture's where the connection
+brings one and otherwise its first member's: its `feed-start.at` is the
+lead's, and its `first-pts` the point of its own stream that offset puts
 there, so `(at, first-pts)` maps any member's pts onto the clock. A member
-the connection does not bring (its sound refused) gets no feed at all on
-any tick, where one not arrived yet gets a feed and no frames.
+the connection does not bring (not sent, or its sound refused) gets no feed
+at all on any tick, where one not arrived yet gets a feed and no frames.
 
 The host says what it did on stderr, as lines and as rows behind
 `ffrwd:row `: `{"kind":"listen",...}` once the port is bound,

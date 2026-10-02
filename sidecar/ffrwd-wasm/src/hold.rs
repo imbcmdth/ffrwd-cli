@@ -10,7 +10,8 @@
 //!
 //! A FEED is one source from the tick its start is fixed to the last tick
 //! its last frame shows on. The offset between source time and clock time
-//! is fixed once per feed, by the group's lead member (its picture): a
+//! is fixed once per feed, by the group's lead member (its picture, or
+//! where the source brings none its first member that it does bring): a
 //! `shared-clock` source's pts are clock time, so its first frame waits for
 //! the clock to reach it; a `first-frame` source is primed until `lead`
 //! seconds of it are held, or its end, and then scheduled `lead` ahead of
@@ -304,6 +305,8 @@ struct Source {
     /// Per member, whether the source brings it: a port feed's connection
     /// whose sound was refused never does.
     brings: Vec<bool>,
+    /// The member that fixes this source's offset.
+    lead: usize,
     closed: bool,
 }
 
@@ -405,6 +408,7 @@ impl Group {
             tags,
             members,
             brings: vec![connection == 0; self.members.len()],
+            lead: self.lead,
             closed: false,
         });
     }
@@ -421,6 +425,11 @@ impl Group {
         }
         let back = self.sources.back_mut().expect("opened");
         back.brings[member] = true;
+        back.lead = if back.brings[self.lead] {
+            self.lead
+        } else {
+            back.brings.iter().position(|b| *b).unwrap_or(self.lead)
+        };
         let queue = &mut back.members[member];
         queue.base = source.base;
         queue.info = source.info;
@@ -429,10 +438,7 @@ impl Group {
     /// The source on `member`'s stream has ended; what it sent still plays
     /// out.
     pub fn source_close(&mut self, member: usize) {
-        if member != self.lead {
-            return;
-        }
-        if let Some(back) = self.sources.back_mut() {
+        if let Some(back) = self.sources.back_mut().filter(|s| s.lead == member) {
             back.closed = true;
         }
     }
@@ -451,6 +457,7 @@ impl Group {
                 .map(|q| MemberQueue::new(q.base, q.info.clone()))
                 .collect(),
             brings: back.brings.clone(),
+            lead: back.lead,
             closed: false,
         };
         self.sources.push_back(next);
@@ -463,8 +470,9 @@ impl Group {
             let tags = self.members[member].info.tags.clone();
             self.open_source(0, tags);
         }
-        if member == self.lead {
-            let queue = &self.sources.back().expect("opened").members[member];
+        let back = self.sources.back().expect("opened");
+        if member == back.lead {
+            let queue = &back.members[member];
             let step_limit = ticks_of(MAX_STEP_SECONDS, queue.base);
             if let Some(last) = queue.last {
                 if frame.pts < last || frame.pts.saturating_sub(last) > step_limit {
@@ -495,7 +503,7 @@ impl Group {
         let waiting = match (&self.feed, self.now) {
             (Some(feed), Some((now, _))) => now < feed.at,
             (None, Some((now, clock_base))) => {
-                let lead = &source.members[self.lead];
+                let lead = &source.members[source.lead];
                 lead.queue.front().is_none_or(|first| {
                     now < Offset::ZERO.to_clock_up(first.pts, lead.base, clock_base)
                 })
@@ -504,7 +512,7 @@ impl Group {
         };
         let shared = self.anchor_of(source) == Anchor::SharedClock;
         if self.port_fed && shared && waiting && self.sources.len() == 1 {
-            if source.members[self.lead].queue.is_empty() {
+            if source.members[source.lead].queue.is_empty() {
                 return 1;
             }
             let sound_seen = source
@@ -534,7 +542,7 @@ impl Group {
     /// Whether a `first-frame` source holds `lead` seconds of frames, or
     /// has ended with some.
     fn primed(&self, source: &Source) -> bool {
-        let lead = &source.members[self.lead];
+        let lead = &source.members[source.lead];
         let (Some(first), Some(last)) = (lead.queue.front(), lead.queue.back()) else {
             return false;
         };
@@ -577,17 +585,22 @@ impl Group {
         };
         match &self.feed {
             Some(feed) => {
-                let settled = source.members.iter().zip(&self.members).all(|(q, m)| {
-                    let wanted = feed.offset.to_source(until(m.kind), clock_base, q.base);
-                    q.last.is_some_and(|last| last > wanted)
-                });
+                let settled = source
+                    .members
+                    .iter()
+                    .zip(&self.members)
+                    .zip(&source.brings)
+                    .all(|((q, m), brings)| {
+                        let wanted = feed.offset.to_source(until(m.kind), clock_base, q.base);
+                        !brings || q.last.is_some_and(|last| last > wanted)
+                    });
                 settled || timed_out()
             }
             None => match self.anchor_of(source) {
                 Anchor::FirstFrame => self.primed(source) || timed_out(),
                 _ => {
-                    let lead = &source.members[self.lead];
-                    let kind = self.members[self.lead].kind;
+                    let lead = &source.members[source.lead];
+                    let kind = self.members[source.lead].kind;
                     let wanted = Offset::ZERO.to_source(until(kind), clock_base, lead.base);
                     lead.last.is_some_and(|last| last > wanted) || timed_out()
                 }
@@ -599,6 +612,7 @@ impl Group {
         let Some(feed) = self.feed.take() else {
             return;
         };
+        let lead = self.sources.front().map_or(self.lead, |s| s.lead);
         self.sources.pop_front();
         let seconds = |t: i64| t as f64 * clock_base.num as f64 / clock_base.den as f64;
         let line = format!(
@@ -614,7 +628,7 @@ impl Group {
         let row = json!({
             "kind": "feed",
             "node": self.node,
-            "input": self.members[self.lead].name,
+            "input": self.members[lead].name,
             "event": "end",
             "at": millis(seconds(pts)),
             "why": match why {
@@ -639,7 +653,7 @@ impl Group {
             return;
         };
         let anchor = self.anchor_of(source);
-        let lead = &source.members[self.lead];
+        let lead = &source.members[source.lead];
         let Some(first) = lead.queue.front() else {
             if source.closed {
                 self.sources.pop_front();
@@ -675,7 +689,7 @@ impl Group {
         let mut row = json!({
             "kind": "feed",
             "node": self.node,
-            "input": self.members[self.lead].name,
+            "input": self.members[source.lead].name,
             "event": "start",
             "at": millis(seconds(at, clock_base)),
             "first_pts": millis(seconds(first_pts, lead_base)),
@@ -690,7 +704,7 @@ impl Group {
             .iter()
             .zip(&source.brings)
             .enumerate()
-            .filter(|(index, (_, brings))| *index != self.lead && !**brings)
+            .filter(|(index, (_, brings))| *index != source.lead && !**brings)
             .map(|(_, (member, _))| member.name.as_str())
             .collect();
         if !absent.is_empty() {
@@ -726,10 +740,10 @@ impl Group {
         if !source.closed {
             return None;
         }
-        let lead = &source.members[self.lead];
+        let lead = &source.members[source.lead];
         let last = match lead.queue.back() {
             Some(frame) => frame.pts,
-            None => feed.shown[self.lead].as_ref()?.pts,
+            None => feed.shown[source.lead].as_ref()?.pts,
         };
         let turn = feed
             .offset
@@ -762,11 +776,12 @@ impl Group {
             return vec![Handed::default(); self.members.len()];
         };
         let source = self.sources.front_mut().expect("a feed has a source");
+        let lead = source.lead;
         let live = pts >= feed.at;
         let mut handed: Vec<Handed> = Vec::with_capacity(self.members.len());
         let mut lead_moved = false;
         for (index, member) in self.members.iter().enumerate() {
-            if index != self.lead && !source.brings[index] {
+            if index != lead && !source.brings[index] {
                 handed.push(Handed::default());
                 continue;
             }
@@ -779,7 +794,7 @@ impl Group {
                         let s0 = feed.offset.to_source(pts, clock_base, queue.base);
                         let s1 = end.map(|end| feed.offset.to_source(end, clock_base, queue.base));
                         if let Some(run) = recut_window(queue, audio, s0, s1) {
-                            if index == self.lead {
+                            if index == lead {
                                 lead_moved = true;
                             }
                             frames.push(run);
@@ -792,7 +807,7 @@ impl Group {
                             feed.shown[index] = queue.pop();
                             popped += 1;
                         }
-                        if index == self.lead {
+                        if index == lead {
                             if popped > 0 {
                                 lead_moved = true;
                                 feed.skipped += popped - 1;
@@ -808,7 +823,7 @@ impl Group {
             }
             // Every member's pair is the lead's offset, so a member that
             // starts off the clock's grid still maps its pts exactly.
-            let first = if index == self.lead {
+            let first = if index == lead {
                 feed.first_pts
             } else {
                 feed.offset.to_source(feed.at, clock_base, queue.base)
@@ -836,7 +851,7 @@ impl Group {
             feed.advanced = pts;
             feed.frames_shown += 1;
         }
-        let lead_empty = source.members[self.lead].queue.is_empty();
+        let lead_empty = source.members[lead].queue.is_empty();
         let timeout = self.hold.timeout.map(|s| ticks_of(s, clock_base));
         let linger = self.hold.linger.map(|s| ticks_of(s, clock_base));
         let mut over = None;
@@ -847,13 +862,13 @@ impl Group {
                 }
             } else if source.closed && lead_empty && !lead_moved {
                 feed.drained = Some((pts, Why::Ended));
-                if linger.is_none() || feed.shown[self.lead].is_none() {
+                if linger.is_none() || feed.shown[lead].is_none() {
                     over = Some(Why::Ended);
                 }
             } else if !lead_moved && timeout.is_some_and(|t| pts.saturating_sub(feed.advanced) >= t)
             {
                 feed.drained = Some((pts, Why::Timeout));
-                if linger.is_none() || feed.shown[self.lead].is_none() {
+                if linger.is_none() || feed.shown[lead].is_none() {
                     over = Some(Why::Timeout);
                 }
             }
@@ -877,7 +892,7 @@ impl Group {
     /// source has arrived.
     pub fn progress(&self, clock_base: TimeBase) -> Option<i64> {
         let source = self.sources.back()?;
-        let lead = &source.members[self.lead];
+        let lead = &source.members[source.lead];
         let last = lead.last?;
         let offset = self.feed.as_ref().map_or(Offset::ZERO, |f| f.offset);
         Some(offset.to_clock(last, lead.base, clock_base))
@@ -1267,11 +1282,39 @@ mod tests {
         let handed = g.tick(300, Some(301), THIRTIETHS, &Grid::exact());
         assert!(handed[0].feed.is_some());
         assert!(handed[1].feed.is_none() && handed[1].frames.is_empty());
-        let said = lines.lock().unwrap().join(
-            "
-",
-        );
+        let said = lines.lock().unwrap().join("\n");
         assert!(said.contains(r#""absent":["in2"]"#), "{said}");
+    }
+
+    #[test]
+    fn a_connection_that_brings_only_sound_is_led_by_its_sound() {
+        let (mut g, lines) = group(
+            hold(Anchor::FirstFrame, 0.0, None, None),
+            vec![video_member(1, MILLIS), audio_member(2)],
+            true,
+        );
+        g.source_open(
+            1,
+            SourceInfo {
+                connection: 1,
+                tags: Vec::new(),
+                base: KHZ48,
+                info: StreamInfo::default(),
+            },
+        );
+        g.arrive(1, samples(48000, 1600));
+        g.arrive(1, samples(49600, 1600));
+        let handed = g.tick(300, Some(301), THIRTIETHS, &Grid::exact());
+        assert!(handed[0].feed.is_none() && handed[0].frames.is_empty());
+        let sound = handed[1].feed.clone().expect("the sound has a feed");
+        assert_eq!((sound.start.first_pts, sound.start.at), (48000, 300));
+        assert_eq!(handed[1].frames[0].pts, 48000);
+        let said = lines.lock().unwrap().join("\n");
+        assert!(said.contains(r#""input":"in2""#), "{said}");
+        assert!(said.contains(r#""absent":["in1"]"#), "{said}");
+        g.source_close(1);
+        let handed = g.tick(301, Some(302), THIRTIETHS, &Grid::exact());
+        assert_eq!(handed[1].frames[0].pts, 49600);
     }
 
     #[test]

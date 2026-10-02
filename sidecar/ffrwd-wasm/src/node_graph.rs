@@ -30,7 +30,9 @@ use crate::graph::{self, NodeCall, NodePad, StreamClass, StreamRef, ROWS_PORT};
 use crate::heartbeat;
 use crate::host_nodes;
 use crate::lanes::{Consumer, Intake, LaneSpec, Opener, Plan, PortOut, Scheduler};
+use crate::leaky::{self, Leaky};
 use crate::network::{params_json, parse_schema, Binding};
+use crate::older;
 use crate::tick::{Assembler, Item};
 use crate::{Args, OutputKind};
 
@@ -183,6 +185,7 @@ enum Kind {
     Module { path: String },
     OldFilter { path: String },
     Host,
+    Leaky,
 }
 
 /// Everything a run needs once its network is opened.
@@ -449,11 +452,12 @@ fn open(
             }
             Some(path) => bail!(
                 "{}: {path} is a module of an older world that rides alone; a network of node \
-                 modules hosts node modules, frame modules and the host's rowfilter and \
-                 rowmerge",
+                 modules hosts node modules, frame modules and the host's rowfilter, \
+                 rowmerge and leaky",
                 call.module
             ),
             None if host_nodes::is_host_node(&call.module) => Kind::Host,
+            None if call.module == leaky::NODE => Kind::Leaky,
             None => bail!("-filter_complex names '{}', which no -m binds", call.module),
         };
 
@@ -481,7 +485,7 @@ fn open(
                     call.module
                 ),
                 (Kind::Host, None) => "in".to_string(),
-                (Kind::OldFilter { .. }, None) => format!("in{position}"),
+                (Kind::OldFilter { .. } | Kind::Leaky, None) => format!("in{position}"),
             };
             if matches!(kind, Kind::Module { .. }) && pads.iter().any(|(_, bound)| *bound == id) {
                 let mirror = streams.len() as u32;
@@ -498,6 +502,7 @@ fn open(
             }
             Kind::OldFilter { path } => open_old_filter(&call.module, path, call, &pads, &streams)?,
             Kind::Host => open_host(call, &pads, &streams)?,
+            Kind::Leaky => open_leaky(call, &pads, &streams)?,
         };
         let Opening {
             mut spec,
@@ -1480,6 +1485,52 @@ fn open_old_filter(
             tick_base: tick,
             runners: vec![Box::new(node)],
             opener: Some(opener),
+            rows: None,
+        },
+        outputs,
+        feeds: Vec::new(),
+    })
+}
+
+/// `leaky` over one picture stream, dropping what arrives too late.
+fn open_leaky(call: &NodeCall, pads: &[(String, u32)], defs: &[StreamDef]) -> Result<Opening> {
+    let name = &call.module;
+    let [(port, id)] = pads else {
+        bail!(
+            "{name} reads one picture stream, and this chain wires {}",
+            pads.len()
+        );
+    };
+    let def = &defs[*id as usize];
+    let media = match &def.format {
+        StreamFormat::Video(v) => Media::Video(*v),
+        StreamFormat::Audio(a) => Media::Audio(*a),
+        other => bail!(
+            "{name} reads pictures, and {} is {}",
+            def.spelling,
+            other.kind().name()
+        ),
+    };
+    let format = Format {
+        media,
+        time_base: def.base,
+    };
+    let node = older::leaky_node(name, Leaky::open(&call.options, &format)?);
+    let shape = node.shape().clone();
+    let bound = vec![bound_stream(port, *id, def)];
+    let outputs = output_streams(name, node.as_ref(), &shape, &bound, defs, def.base)?;
+    let assembler = Assembler::new(&shape, &bound, name, &[])?;
+    Ok(Opening {
+        spec: LaneSpec {
+            name: name.clone(),
+            state: Vec::new(),
+            bound: vec![*id],
+            ports: vec![None],
+            shape,
+            intake: Intake::Assembled(Box::new(assembler)),
+            tick_base: def.base,
+            runners: vec![node],
+            opener: None,
             rows: None,
         },
         outputs,

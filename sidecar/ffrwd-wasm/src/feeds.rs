@@ -237,8 +237,10 @@ fn port_colour(color: Option<&ColorInfo>) -> Result<Colour> {
 
 /// Which wire streams feed which members, once the headers are whole: the
 /// first picture to the picture member and the first sound to the sound
-/// member. A picture the port cannot take refuses the connection; a sound
-/// it cannot take is left on the wire and said.
+/// member. A connection may carry any of the members and more besides; a
+/// member it does not carry is absent from its feed. A picture the port
+/// cannot take refuses the connection; a sound it cannot take is left on
+/// the wire and said.
 fn match_streams(spec: &FeedSpec, conn: &mut Conn, report: &mut dyn FnMut(String)) -> Result<()> {
     let streams: Vec<Option<nut::Stream>> = conn.demux.streams().to_vec();
     conn.lanes = (0..streams.len()).map(|_| None).collect();
@@ -357,13 +359,6 @@ fn match_streams(spec: &FeedSpec, conn: &mut Conn, report: &mut dyn FnMut(String
             base: stream.time_base,
             convert,
         });
-    }
-    let picture = spec
-        .members
-        .iter()
-        .position(|m| matches!(m.format, StreamFormat::Video(_)));
-    if picture.is_some_and(|m| !taken[m]) {
-        anyhow::bail!("the feeder sends no video");
     }
     if !taken.iter().any(|t| *t) {
         anyhow::bail!("the feeder sends nothing this input takes");

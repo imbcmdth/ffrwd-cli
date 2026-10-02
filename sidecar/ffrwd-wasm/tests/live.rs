@@ -221,6 +221,8 @@ struct Feeder {
     /// `smart_timed=1` on its picture: its pts are programme time.
     timed: bool,
     sound: bool,
+    /// Whether it sends a picture at all.
+    picture: bool,
     pix_fmt: &'static str,
     s16: bool,
     /// Written at its own rate when true, as fast as the socket takes it
@@ -247,6 +249,7 @@ impl Feeder {
             start: 0.0,
             timed: false,
             sound: true,
+            picture: true,
             pix_fmt: "rgba",
             s16: false,
             paced: true,
@@ -277,7 +280,11 @@ impl Feeder {
         let mut video =
             Stream::video(self.pix_fmt, self.width, self.height, base).expect("carried");
         video.frame_rate = Some((u64::from(self.fps), 1));
-        let mut streams = vec![video];
+        let mut streams = if self.picture {
+            vec![video]
+        } else {
+            Vec::new()
+        };
         if self.sound {
             let fmt = if self.s16 { "s16" } else { "f32" };
             let mut audio = Stream::audio(fmt, RATE, 1).expect("carried");
@@ -369,6 +376,7 @@ fn feed(port: u16, feeder: Feeder, after: Duration) -> JoinHandle<Fed> {
             raw.write_all(&timed_info()).expect("the timed tag");
         }
         let started = Instant::now();
+        let sound = usize::from(feeder.picture);
         let frames = (feeder.seconds * feeder.fps as f64).round() as i64;
         let mut sample = (feeder.start * RATE as f64).round() as i64;
         let first_sample = sample;
@@ -398,7 +406,7 @@ fn feed(port: u16, feeder: Feeder, after: Duration) -> JoinHandle<Fed> {
                 let upto = first_sample + ((j + 1) as f64 / feeder.fps as f64 * RATE as f64) as i64;
                 while sample + packet <= upto {
                     if muxer
-                        .write_frame_to(1, sample, &feeder.samples(sample, packet))
+                        .write_frame_to(sound, sample, &feeder.samples(sample, packet))
                         .is_err()
                     {
                         return Fed {
@@ -409,7 +417,7 @@ fn feed(port: u16, feeder: Feeder, after: Duration) -> JoinHandle<Fed> {
                     sample += packet;
                 }
             }
-            if muxer.write_frame_to(0, pts, &feeder.frame(j)).is_err() {
+            if feeder.picture && muxer.write_frame_to(0, pts, &feeder.frame(j)).is_err() {
                 break;
             }
             if muxer.flush().is_err() {
@@ -419,7 +427,7 @@ fn feed(port: u16, feeder: Feeder, after: Duration) -> JoinHandle<Fed> {
         }
         let total = first_sample + (feeder.seconds * RATE as f64).round() as i64;
         if feeder.sound && feeder.stop_after.is_none() && sample < total {
-            let _ = muxer.write_frame_to(1, sample, &feeder.samples(sample, total - sample));
+            let _ = muxer.write_frame_to(sound, sample, &feeder.samples(sample, total - sample));
             let _ = muxer.flush();
         }
         let written_at = Instant::now();
@@ -773,6 +781,55 @@ fn a_feed_takes_over_picture_and_sound_together_and_the_programme_comes_back() {
         "a clock row a second ({})",
         out.clock.len()
     );
+}
+
+#[test]
+fn a_feeder_that_sends_only_sound_feeds_the_sound_and_leaves_the_picture() {
+    let _serial = serial();
+    let program = Program::new(30, 8.0);
+    let (mut run, port) = start("sound-only", &program, "1", &["shape_switch"], SWITCH);
+    wait_for_port(&mut run, port);
+    let feeder = Feeder {
+        picture: false,
+        ..Feeder::new(25, 3.0)
+    };
+    let fed = feed(port, feeder, Duration::from_secs(2));
+    let out = finish(run);
+    fed.join().expect("the feeder");
+
+    assert!(!out.stderr.contains("refused"), "{}", out.stderr);
+    assert_eq!(out.frames.len() as i64, program.frames(), "{}", out.stderr);
+    assert!(
+        out.frames
+            .iter()
+            .all(|(pts, shown)| *shown == Shown::Program(*pts)),
+        "the programme's picture throughout"
+    );
+    assert!(
+        out.stderr.contains(r#""input":"feed_audio""#),
+        "{}",
+        out.stderr
+    );
+    assert!(
+        out.stderr.contains(r#""absent":["feed"]"#),
+        "{}",
+        out.stderr
+    );
+    let (at, first_pts, _) = first_start(&out);
+    assert_eq!(first_pts, 0, "mapped from the feeder's first sample");
+    let cut = at * 1600;
+    assert_eq!(
+        out.sample(cut - 1),
+        -1.0,
+        "the programme's sound before the cut"
+    );
+    for k in [0i64, 1, 1000, 47_999, 48_000, 100_000] {
+        assert_eq!(
+            out.sample(cut + k),
+            k as f32,
+            "programme sample {k} past the cut is the feeder's sample {k}"
+        );
+    }
 }
 
 #[test]

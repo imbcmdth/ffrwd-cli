@@ -123,13 +123,13 @@ impl Node for Switch {
         let Some(frame) = tick.frame(self.v) else {
             return Ok(());
         };
-        let feed = self
-            .feed
-            .and_then(|id| tick.feed(id).map(|feed| (id, feed)));
+        let fed = |id: Option<u32>| id.and_then(|id| tick.feed(id).map(|feed| (id, feed)));
+        let feed = fed(self.feed).or_else(|| fed(self.feed_audio));
         let live = feed.as_ref().is_some_and(|(_, feed)| pts >= feed.start.at);
-        let shown = feed
-            .as_ref()
-            .and_then(|(id, _)| tick.frame(*id).map(|f| (*id, f)));
+        let shown = self
+            .feed
+            .filter(|id| feed.as_ref().is_some_and(|(fed, _)| fed == id))
+            .and_then(|id| tick.frame(id).map(|f| (id, f)));
         match (self.layer, shown) {
             (_, Some((id, fed))) => out.same("v", frame.pts, frame.duration, id, fed.index)?,
             (false, None) => out.pass("v", self.v, &frame)?,

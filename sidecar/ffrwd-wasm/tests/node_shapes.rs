@@ -369,6 +369,48 @@ fn an_output_sized_by_the_params_is_redrawn_at_that_size() {
 }
 
 #[test]
+fn leaky_is_a_host_node_of_a_node_network() {
+    let dir = scratch("leaky-node");
+    let items: Vec<(usize, Write)> = (0..6)
+        .map(|k| (0, Write::Frame(k, vec![k as u8; 8 * 8 * 4])))
+        .collect();
+    write_nut(&dir.join("in.nut"), &[video(8, 8, TENTHS, (10, 1))], &items);
+    let input = dir.join("in.nut").display().to_string();
+    let out = at_every_jobs(
+        "leaky-node",
+        &args(&[
+            "-f",
+            "nut",
+            "-i",
+            &input,
+            "-m",
+            &module("shape_canvas"),
+            "-filter_complex",
+            "[v=0:v]shape_canvas=width=2:height=2[out=o];[o]leaky=max_lateness=5[l]",
+            "-map",
+            "[l]",
+            "-f",
+            "nut",
+            "{dir}/out.nut",
+        ]),
+        &["out.nut"],
+    );
+    let (streams, got) = frames(&out[0]);
+    assert_eq!(streams[0].video_geometry(), Some((2, 2)));
+    let pts: Vec<i64> = got.iter().map(|(_, pts, _)| *pts).collect();
+    assert_eq!(
+        pts,
+        vec![0, 1, 2, 3, 4, 5],
+        "a file read at once is never late"
+    );
+    assert!(got
+        .iter()
+        .enumerate()
+        .all(|(k, (_, _, data))| data[0] == k as u8));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn a_pad_hands_a_node_the_colour_the_wire_does_not_carry() {
     let dir = scratch("pad-colour");
     let items: Vec<(usize, Write)> = (0..3)

@@ -158,6 +158,32 @@ impl Node for HostFrames {
     }
 }
 
+/// `leaky` as a node of a node network: one picture input, `in0`, and the
+/// pictures that were not too late on `out`.
+pub(crate) fn leaky_node(name: &str, leaky: Leaky) -> Box<dyn Node> {
+    let shape = NodeShape {
+        inputs: vec![adapters::input(
+            "in0",
+            PortKind::Video,
+            true,
+            false,
+            Pairing::Lockstep,
+            RowsUse::PerFrame,
+        )],
+        outputs: vec![adapters::output("out", PortKind::Video, None)],
+        clock: Clock::Input("in0".into()),
+        pure: false,
+        one_to_one: false,
+        bounded: true,
+        relation: Vec::new(),
+    };
+    Box::new(HostFrames {
+        runner: Runner::Leaky(Box::new(leaky)),
+        shape,
+        name: name.to_string(),
+    })
+}
+
 /// The shape a lane of `seed` is scheduled by: one port per pad, the first
 /// the clock, one output. Only a module over video spreads across workers:
 /// an audio module's output is one continuous run of samples per instance.
