@@ -168,14 +168,22 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   expanded at compile time: its body is compiled and run once per
   message, while the query runs. It is declared `play(launch data_stream,
   url text, start_pts number, ..., channels number DEFAULT 2) RETURNS
-  TABLE(video video_stream, audio audio_stream)`, either column or both;
-  every parameter after the data stream is a text, number or boolean
-  value, and the body does not read the data stream.
+  TABLE(video video_stream, audio audio_stream)`, either column or both,
+  and a `data_stream` column beside them for the rows a node's data input
+  reads on the same connection; every parameter after the data stream is
+  a text, number or boolean value, and the body does not read the data
+  stream.
   - Its streams are empty between messages, so they go to a feeder and
     nowhere else: `ffrwd.switch.video(prog.v, ads.video)`. A filter, a
     module's pad or a `COPY` reading one is refused. Feeders of one group
     fed by its picture and its sound share one connection, which an
     instance writes as one NUT, picture then sound.
+  - A node's data input whose `interval` names a hold group the lateral
+    feeds (`interval.group`) takes the lateral's rows on that group's
+    connection, after its picture and sound in the same NUT, and binds no
+    pad: `panel(prog.v, ad.video, ad.audio, ad.cues)`. A stream of the
+    query's own handed to such an input while a port serves the group is
+    refused; its rows would never arrive.
   - Each value is bound by name, per message, in this order: an argument
     the call wrote, which is a constant the same for every message; the
     message's field of that name (a number for a number, a string for
@@ -509,9 +517,10 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
 - A **node `LANGUAGE wasm` function** names a module exporting
   `ffrwd:av@0.19.1`'s `node`, which its describe says (`"world":
   "node-module"`). What a node reads and writes is its SHAPE for each
-  call: `ffrwd-wasm --shape` with the call's params and the names of the
-  inputs it binds, asked once per distinct module, params and bound
-  inputs. Its parameters are ports and values, in any order: a port is a
+  call: `ffrwd-wasm --shape` with the call's params and the inputs it
+  binds, each with the rate of every stream bound there, asked once per
+  distinct module, params and bound list. Its parameters are ports and
+  values, in any order: a port is a
   `video_stream`, an `audio_stream`, a `data_stream` or rows
   (`STRUCT(...)[]`, `cue[]`), named as the module names its input; a
   value is text, number, boolean or vector, as any module's. Arguments
@@ -574,6 +583,24 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   - A port reading coded packets is handed an input's own stream,
     copied as it was coded, in a codec the module takes; an output
     writing them is copied by whatever reads it.
+  - The bound list is one binding per input the call binds, ports held
+    on a port included (a lateral's feed, one stream per lateral), and a
+    hint per stream: its rate as far as the compile knows it before the
+    run, a picture's frame rate, a sound's sample rate (the one its port
+    conforms it to). An input's is its probe's; a node's picture runs at
+    its clock, a rate clock's own, the rate of the input a `rate-of`
+    clock names, or its clock input's over its stride. A feed by port, a
+    self-clocked node's output and data have none. Each call carries the
+    list it was asked with (`-bound <name>=<json>`), which the host asks
+    the shape with again, so the shape a node runs with is the one the
+    query compiled against. A node at a COPY's TO is asked once for its
+    ports and again with the streams the SELECT binds there.
+  - An input the module reads for its timing alone (`wants` `timing`)
+    is handed the stream in the format it already has: nothing converts
+    or conforms it, and where another port of the region reads the same
+    stream, it binds that one. `boxes_mask(v, detect(v))` sends the
+    picture once, in the format `detect` takes. `explain` says `timing`
+    for it.
   - One region of a sidecar holds the nodes the query wires together,
     and everything one process hands another travels as one NUT. A
     signature only a node can carry (kinds mixed, a stream left out, a
@@ -591,7 +618,9 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
 - **What each node waits for.** A node's clock input reads a window
   (per-frame, tumbling, hopping, sliding), and each output may leave late
   by a latency it declares; an input paired by interval waits for its
-  producer, at most its own bound past the clock. Summed along each path,
+  producer, at most its own bound past the clock, and one the host
+  re-times onto the clock (anchored `first-frame` or `tagged`) is on a
+  clock of its own and waits its bound alone. Summed along each path,
   those say how far behind the source every stream a query writes runs.
   `ffrwd explain --delays` prints a line per node (its window, and each
   interval input's bound) and per output (its delay, and how long it

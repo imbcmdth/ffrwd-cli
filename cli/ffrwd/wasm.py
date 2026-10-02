@@ -391,6 +391,10 @@ _JOBS_FLAG = "-jobs"
 # Where a node's params are read whole from a file: ``<name>=<path>``.
 _PARAMS_FROM_FLAG = "-params-from"
 
+# The bound list a node's shape was asked with: ``<name>=<json>``, one per
+# call in the order its chain is written.
+_BOUND_FLAG = "-bound"
+
 # Which half of a codec package's module a run drives: "encode" or "decode".
 _CODEC_FLAG = "-codec"
 
@@ -1574,6 +1578,9 @@ class PacketRead:
     # The input of a node module the stream binds, whose rows are what the
     # node emits beside its ports; empty for a packet sink.
     port: str = ""
+    # The bound list the node's shape was asked with, as JSON; empty for a
+    # packet sink.
+    bound: str = ""
 
 
 # Runs one packet sink over one stream and returns the rows it wrote:
@@ -1710,6 +1717,8 @@ def _node_reader_argv(
         if described is not None and getattr(described, effect):
             argv += [_GRANT_FLAGS[effect], read.module]
     argv += ["-m", f"{_READ_NODE}={read.module}", "-filter_complex", network, *filed]
+    if read.bound:
+        argv += [_BOUND_FLAG, f"{_READ_NODE}={read.bound}"]
     for target in groups[0]:
         argv += ["-map", target]
     return [*argv, "-f", _ROWS_FORMAT, STDOUT]
@@ -2297,6 +2306,9 @@ def _node_network_args(
     for binding in process.modules:
         argv += ["-m", f"{binding.name}={binding.path}"]
     argv += ["-filter_complex", network, *filed]
+    for name, node in graph.nodes.items():
+        if node.bound:
+            argv += [_BOUND_FLAG, f"{nodes[name].filter}={node.bound}"]
     for targets, path in zip(groups[:streams], paths):
         for target in targets:
             argv += ["-map", target]

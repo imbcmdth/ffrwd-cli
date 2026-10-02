@@ -9,7 +9,10 @@ writes runs (:func:`timing`):
 - a node is ready for a tick once every input it waits for has arrived:
   the clock, each lockstep input, and each interval input with its `ahead`,
   an interval input waiting no longer than its own bound past the clock.
-  A held input and one delivered on arrival hold nothing up;
+  A held input and one delivered on arrival hold nothing up, and an
+  interval input the host re-times onto the clock (anchored `first-frame`
+  or `tagged`) waits its bound and no more, since its producer counts from
+  another origin;
 - a node's window is how long its tick takes to fill, a tumbling 2 s
   window 2 s; a node's output adds the output's declared latency;
 - the host's span reducer adds its `max_span`.
@@ -23,7 +26,7 @@ node set on it, which is :data:`~ffrwd.errors.ErrorCode.LIVE_LEAD`
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from fractions import Fraction
 
@@ -48,6 +51,7 @@ __all__ = [
     "Timing",
     "check_live_leads",
     "paths_of",
+    "stream_rate",
     "summary",
     "timing",
 ]
@@ -65,12 +69,18 @@ _SAMPLE_BYTES = 4
 
 @dataclass(frozen=True)
 class Wait:
-    """One input of a node: how it pairs, and how late what it reads runs."""
+    """One input of a node: how it pairs, and how late what it reads runs.
+
+    `timing` marks an input read for its frames' times alone; `retimed` an
+    interval input the host re-stamps onto the clock.
+    """
 
     port: str
     pairing: str
     delay: float | None
     bound: float | None = None
+    timing: bool = False
+    retimed: bool = False
 
 
 @dataclass(frozen=True)
@@ -101,6 +111,8 @@ class NodeTiming:
                     "pairing": wait.pairing,
                     "delay": wait.delay,
                     **({"bound": wait.bound} if wait.bound is not None else {}),
+                    **({"wants": "timing"} if wait.timing else {}),
+                    **({"retimed": True} if wait.retimed else {}),
                 }
                 for wait in self.waits
             ],
@@ -213,9 +225,19 @@ class Paths:
             arrived = self._latest(refs)
             pairing = port.pairing
             interval = pairing.interval
+            timed = port.accepts.wants == "timing"
             if pairing.kind == "lockstep":
                 waited = arrived
                 said = "clock" if clock is not None and port.name == clock.name else "lockstep"
+            elif interval is not None and interval.retimed:
+                waits.append(
+                    Wait(port.name, "interval", arrived, interval.latency, retimed=True)
+                )
+                if interval.latency is None or clock_delay is None:
+                    continue
+                waited = clock_delay + interval.latency + interval.ahead
+                ready = None if ready is None else max(ready, waited)
+                continue
             elif interval is not None:
                 said = "interval"
                 waited = None if arrived is None else arrived + interval.ahead
@@ -223,10 +245,16 @@ class Paths:
                     limit = clock_delay + interval.latency + interval.ahead
                     waited = limit if waited is None else min(waited, limit)
             else:
-                waits.append(Wait(port.name, pairing.kind, arrived))
+                waits.append(Wait(port.name, pairing.kind, arrived, timing=timed))
                 continue
             waits.append(
-                Wait(port.name, said, arrived, interval.latency if interval else None)
+                Wait(
+                    port.name,
+                    said,
+                    arrived,
+                    interval.latency if interval else None,
+                    timing=timed,
+                )
             )
             ready = None if ready is None or waited is None else max(ready, waited)
         window = self.window_seconds(name, shape, by_port)
@@ -258,7 +286,7 @@ class Paths:
         """Items per second of what the clock input reads: frames, or samples."""
         if port.kind == "audio" and port.accepts.sample_rates:
             return Fraction(port.accepts.sample_rates[0])
-        return self.rate(refs[0], port.kind) if refs else None
+        return self.rate(refs[0]) if refs else None
 
     def bytes_per_second(self, ref: FrameRef) -> Fraction | None:
         """About how many bytes a second of the raw stream `ref` is on an edge."""
@@ -290,34 +318,168 @@ class Paths:
         alias, kind, index = src_parts(ref)
         return alias, kind, index
 
-    def rate(self, ref: FrameRef, kind: str) -> Fraction | None:
-        """The rate of the stream `ref` is, read back to where it came from."""
+    def rate(self, ref: FrameRef) -> Fraction | None:
+        """The rate of the stream `ref` is (:func:`stream_rate`)."""
+        return stream_rate(self.graph, self.probes, self.shapes.get, ref)
+
+
+# Filters whose pictures or sound leave at a rate their args do not say.
+_RATE_LOST = frozenset(
+    {
+        "ainterleave",
+        "aselect",
+        "asetpts",
+        "atempo",
+        "decimate",
+        "framestep",
+        "interleave",
+        "minterpolate",
+        "mpdecimate",
+        "select",
+        "setpts",
+        "thumbnail",
+        "tile",
+    }
+)
+
+# The args a filter setting a rate says it in; a filter with no input is a
+# source, and says its rate in one of `_SOURCE_RATE_ARGS`.
+_RATE_ARGS: Mapping[str, tuple[str, ...]] = {
+    "fps": ("fps", "rate", "r"),
+    "framerate": ("fps", "rate", "r"),
+    "aresample": ("osr", "out_sample_rate", "sample_rate"),
+    "asetrate": ("sample_rate", "r"),
+}
+_SOURCE_RATE_ARGS = ("rate", "r", "framerate", "fps", "sample_rate")
+
+
+def stream_rate(
+    graph: Graph,
+    probes: Mapping[str, ProbeResult | None],
+    shape_of: Callable[[str], NodeShape | None],
+    ref: FrameRef,
+) -> Fraction | None:
+    """The rate of the stream `ref` names, as known before the run.
+
+    A picture's frame rate, a sound's sample rate; None for data and coded
+    streams a node writes, and wherever nothing settles it: a self-clocked
+    node's output, a stream with no probe (a feed by port), a filter whose
+    rate its args do not say. A node's picture leaves once per tick, so at
+    its clock's rate: a rate clock's own, the rate of the port a `rate-of`
+    clock names, the clock input's rate over its stride. A node's sound is
+    at the rate its format says, else the rate of the input it follows.
+    """
+    seen: set[str] = set()
+    while True:
         if is_src(ref):
-            alias, stream_kind, index = src_parts(ref)
-            probe = self.probes.get(alias)
-            streams = probe.by_type(stream_kind) if probe is not None else []
+            alias, kind, index = src_parts(ref)
+            probe = probes.get(alias)
+            streams = probe.by_type(kind) if probe is not None else []
             if index >= len(streams):
                 return None
             stream = streams[index]
             if kind == "audio":
                 return Fraction(stream.sample_rate) if stream.sample_rate else None
-            return _fraction(stream.fps)
-        name, _, _ = ref.partition(":")
-        node = self.graph.nodes.get(name)
-        if node is None:
+            return _fraction(stream.fps) if kind == "video" else None
+        name, _, pad_text = ref.partition(":")
+        node = graph.nodes.get(name)
+        if node is None or name in seen:
             return None
-        shape = self.shapes.get(name)
-        if shape is not None and shape.clock.rate is not None and kind == "video":
-            return Fraction(*shape.clock.rate)
-        if shape is not None and shape.clock.kind == "rate-of" and kind == "video":
-            # The rate of the first stream bound to the port it names.
-            ticked = next(
-                (ref for port, ref in zip(node.ports, node.inputs) if port == shape.clock.port),
-                None,
-            )
-            if ticked is not None:
-                return self.rate(ticked, kind)
-        return self.rate(node.inputs[0], kind) if node.inputs else None
+        seen.add(name)
+        pad = int(pad_text) if pad_text.isdigit() else 0
+        kind = node.outputs[pad] if pad < len(node.outputs) else "video"
+        if kind not in ("video", "audio"):
+            return None
+        shape = shape_of(name)
+        if shape is not None:
+            return _node_output_rate(graph, probes, shape_of, name, shape, pad, kind)
+        if node.filter in _RATE_LOST:
+            return None
+        said = _RATE_ARGS.get(node.filter, () if node.inputs else _SOURCE_RATE_ARGS)
+        for key in said:
+            rate = _rate_arg(node.args.get(key))
+            if rate is not None:
+                return rate
+        if node.filter in _RATE_ARGS or not node.inputs:
+            return None
+        ref = next(
+            (one for one in node.inputs if _kind_of(graph, one) == kind), node.inputs[0]
+        )
+
+
+def _node_output_rate(
+    graph: Graph,
+    probes: Mapping[str, ProbeResult | None],
+    shape_of: Callable[[str], NodeShape | None],
+    name: str,
+    shape: NodeShape,
+    pad: int,
+    kind: str,
+) -> Fraction | None:
+    """The rate of what node `name` writes on output `pad`, of `kind`."""
+    node = graph.nodes[name]
+    output = shape.outputs[pad] if pad < len(shape.outputs) else None
+    if output is None or output.kind not in ("video", "audio"):
+        return None
+
+    def first(port: str) -> FrameRef | None:
+        return next((ref for bound, ref in zip(node.ports, node.inputs) if bound == port), None)
+
+    found = output.format
+    if kind == "audio":
+        if found is not None and found.kind == "audio":
+            return Fraction(found.sample_rate) if found.sample_rate else None
+        follows = (
+            found.port
+            if found is not None and found.kind == "like"
+            else shape.clock.port
+            if shape.clock.kind == "input"
+            else None
+        )
+        read = first(follows) if follows else None
+        if read is None or _kind_of(graph, read) != "audio":
+            return None
+        return stream_rate(graph, probes, shape_of, read)
+    clock = shape.clock
+    if clock.kind == "rate" and clock.rate is not None:
+        return Fraction(*clock.rate)
+    if clock.kind not in ("input", "rate-of"):
+        return None
+    read = first(clock.port)
+    rate = stream_rate(graph, probes, shape_of, read) if read is not None else None
+    port = shape.input(clock.port)
+    if rate is None or clock.kind == "rate-of" or port is None:
+        return rate
+    return rate / port.stride
+
+
+def _kind_of(graph: Graph, ref: FrameRef) -> str:
+    if is_src(ref):
+        return src_parts(ref)[1]
+    name, _, pad_text = ref.partition(":")
+    node = graph.nodes.get(name)
+    pad = int(pad_text) if pad_text.isdigit() else 0
+    if node is None or pad >= len(node.outputs):
+        return "video"
+    return node.outputs[pad]
+
+
+def _rate_arg(value: object) -> Fraction | None:
+    """A rate as a filter's arg says it: ``30``, ``29.97`` or ``30000/1001``."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return Fraction(value) if value > 0 else None
+    if isinstance(value, float):
+        return Fraction(value).limit_denominator(1001) if value > 0 else None
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    try:
+        found = Fraction(text) if "/" in text else Fraction(text).limit_denominator(1001)
+    except (ValueError, ZeroDivisionError):
+        return None
+    return found if found > 0 else None
 
 
 def paths_of(graph: Graph, probes: Mapping[str, ProbeResult | None]) -> Paths:
@@ -394,18 +556,23 @@ def timing(
 def summary(timed: Timing) -> str:
     """What ``explain --delays`` prints: a line per node, then per output.
 
-    A node says its window in streaming words and how each input it waits
-    for by interval is bounded; an output how far behind the source it runs,
-    and how long it waits for the latest stream written beside it.
+    A node says its window in streaming words, each input it reads for its
+    timing alone, and how each input it waits for by interval is bounded,
+    one the host re-times said to be on its own clock; an output how far
+    behind the source it runs, and how long it waits for the latest stream
+    written beside it.
     """
     lines: list[str] = []
     for node in timed.nodes:
         said = [node.window]
         for wait in node.waits:
+            if wait.timing:
+                said.append(f"{wait.port} for its timing")
             if wait.pairing != "interval":
                 continue
             bound = "no bound" if wait.bound is None else f"at most {_seconds(wait.bound)}"
-            said.append(f"{wait.port} by interval, {bound}")
+            own = " on its own clock" if wait.retimed else ""
+            said.append(f"{wait.port} by interval{own}, {bound}")
         lines.append(f"{node.called}: {'; '.join(said)}")
     for output in timed.outputs:
         where = (
@@ -448,7 +615,7 @@ def check_live_leads(
         clock_delay = paths._latest(by_port.get(clock.name, [])) if clock is not None else 0.0
         for port in shape.inputs:
             interval = port.pairing.interval
-            if interval is None or interval.latency is None:
+            if interval is None or interval.latency is None or interval.retimed:
                 continue
             arrived = paths._latest(by_port.get(port.name, []))
             if arrived is None or clock_delay is None:
