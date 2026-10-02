@@ -33,12 +33,19 @@ function := CREATE FUNCTION name(param ptype [DEFAULT literal], ...) RETURNS rty
             AS 'module', 'export' LANGUAGE wasm
           | CREATE FUNCTION name(rows annotation) RETURNS annotation
             AS 'module', 'export' LANGUAGE wasm
+          | CREATE FUNCTION name(port ntype [DEFAULT NULL] | param vtype
+                                 [DEFAULT literal], ...)
+            RETURNS nrtype AS 'module', 'export' LANGUAGE wasm
 ptype   := text | number | boolean | vector | <kind>_stream | chapter | cue
          | attachment | any of those with [] | STRUCT(field vtype, ...)[]
 rtype   := text | number | boolean | vector | <kind>_stream | chapter | cue
          | attachment | any of those with [] | TABLE(col type, ...)
+         | STRUCT(name wstype, name annotation)
 wstype  := video_stream | audio_stream | either of those with []
 wrtype  := wstype | sink | packets | STRUCT(name wstype, name annotation)
+ntype   := wstype | data_stream | annotation | any of those with []
+nrtype  := wstype | data_stream | annotation | source
+         | STRUCT(name wstype | data_stream | annotation, ...)
 annotation := STRUCT(field vtype, ...)[] | cue[]
 vtype   := text | number | boolean | vector
 select  := [WITH cte (, cte)*] SELECT columns FROM from [WHERE pred]
@@ -499,6 +506,98 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   `moq.subscribe`'s rows); read the stream as `<alias>.v[1]` there. A
   `RETURNS sink` reading several streams takes no annotation column.
   Recipe [144](examples.md#144-hand-one-modules-rows-to-a-module-reading-two-streams).
+- A **node `LANGUAGE wasm` function** names a module exporting
+  `ffrwd:av@0.19.0`'s `node`, which its describe says (`"world":
+  "node-module"`). What a node reads and writes is its SHAPE for each
+  call: `ffrwd-wasm --shape` with the call's params and the names of the
+  inputs it binds, asked once per distinct module, params and bound
+  inputs. Its parameters are ports and values, in any order: a port is a
+  `video_stream`, an `audio_stream`, a `data_stream` or rows
+  (`STRUCT(...)[]`, `cue[]`), named as the module names its input; a
+  value is text, number, boolean or vector, as any module's. Arguments
+  fill the parameters by position and then by name, ports included:
+  `burn(f.video[1], words => hear(f.audio[1]))`. How each input pairs
+  with the node's clock is the module's to say, not the query's. Recipe
+  [148](examples.md#148-a-node-reads-the-picture-the-sound-and-the-words-at-once).
+  - `DEFAULT NULL` on any port makes it optional: a call that leaves it
+    off, or writes NULL, binds nothing there, and the shape is asked
+    without it. A port the module requires is refused left off. A port
+    the declaration names and the shape for these params has none of is
+    fine unbound and refused bound, naming it. Recipe
+    [149](examples.md#149-leave-an-input-out).
+  - `[]` on a port takes every stream the argument holds, in order:
+    `tile(ARRAY[a.video[1], b.video[1]])`. A port without it given an
+    array is one call per element, as a filter's is. Recipe
+    [150](examples.md#150-tile-any-number-of-pictures).
+  - An input the module holds on a port of its own (`hold` with a
+    `port_param`) is given a stream, or a port number: written in its
+    place, or by the param's name, `inset(v, port => 9100)`. Given a
+    number it binds nothing, and whatever connects to that port is shown.
+  - `RETURNS` a stream; rows alone (`STRUCT(...)[]`, `cue[]`), a data
+    stream the query reads while it runs; `STRUCT(<name> <type>, ...)`,
+    one field per output the module makes, read off the call
+    (`matte(v).mask`) or every field at once with `.*` in a WITH body; or
+    `source`, a node that reads nothing, called in FROM. A field names
+    the module's output of that name, and a lone stream or rows the
+    module's one output of that kind. Recipes
+    [145](examples.md#145-a-detector-returns-its-rows-and-the-picture-stays-where-it-was),
+    [151](examples.md#151-a-node-makes-a-matte-and-the-rows-that-go-with-it).
+  - A call over a node making a stream and the rows beside it hands a
+    reader both, the stream into one port and the rows into the next:
+    `ring(matte(v))` is `ring(matte(v).mask, matte(v).spots)`.
+  - Rows match by field, compared as the JSON schemas of the two ports:
+    every field the reading port names is in the producer's, with a type
+    it takes (`integer` is a `number`), and fields beyond those pass. A
+    missing or mistyped field is refused naming both. Recipe
+    [146](examples.md#146-a-reader-names-only-the-fields-it-reads).
+  - One call is one node wherever the query writes it: the same module,
+    arguments and params are one instance, and each of its outputs goes
+    to every reader. Recipe
+    [147](examples.md#147-one-call-however-many-places-read-it).
+  - Rows a COPY selects are what a module's rows always are there: the
+    rows of a `.ndjson` destination, a WebVTT track anywhere else. A
+    gather, `ARRAY(SELECT r FROM unnest(<call>) r WHERE ...)`, narrows
+    them on their way, as it narrows a module's annotation column.
+  - A node read in FROM binds its outputs as an input binds its streams,
+    `s.video[1]` the first picture, and its relation rows as renditions,
+    so `WHERE s.height = 720` picks one. `WHERE s.t < 10` (or `<=`) ends
+    it: its reader takes that much and closes. One that never ends makes
+    the query live. Recipe
+    [154](examples.md#154-a-page-with-no-inputs-is-a-source).
+  - A port reading coded packets is handed an input's own stream,
+    copied as it was coded, in a codec the module takes; an output
+    writing them is copied by whatever reads it.
+  - One region of a sidecar holds the nodes the query wires together,
+    and everything one process hands another travels as one NUT. A
+    signature only a node can carry (kinds mixed, a stream left out, a
+    value among ports) is refused for a module of an older world with
+    the refusal such a signature always had.
+- **`ffrwd.merge_spans(<rows>, max_span => <seconds>)`** turns rows
+  written once per tick into spans. Rows sharing a `start_t` are one
+  span, which keeps the last row's fields and ends at the last tick that
+  carried it plus that tick's length; a tick with no row for it is a gap
+  inside it. A span still open after `max_span` seconds is written as it
+  stands and goes on as a new one, so `max_span` is also how late a span
+  row may leave. It is the host's own node and runs in the sidecar
+  beside the rows' producer. Recipe
+  [152](examples.md#152-spans-from-the-rows-that-said-so-frame-by-frame).
+- **What each node waits for.** A node's clock input reads a window
+  (per-frame, tumbling, hopping, sliding), and each output may leave late
+  by a latency it declares; an input paired by interval waits for its
+  producer, at most its own bound past the clock. Summed along each path,
+  those say how far behind the source every stream a query writes runs.
+  `ffrwd explain --delays` prints a line per node (its window, and each
+  interval input's bound) and per output (its delay, and how long it
+  waits for the latest stream written beside it); `explain` carries the
+  same under `timing`. A stream waiting more than 512 MiB of itself is
+  warned about (`HELD_STREAM`). A live query feeding an input later than
+  the bound its node set on it is refused as `LIVE_LEAD`. Recipe
+  [153](examples.md#153-see-what-each-node-waits-for).
+- A **sql function returning a stream and its rows**, `RETURNS
+  STRUCT(<name> <stream>, <name> <rows>)`, selects both in its body, and a
+  call over it reads as both: handed to a node it fills the port it
+  stands in and the rows port after it, `ring(spotted(v))`; read off it,
+  `spotted(v).spots` is the rows; `.*` in a WITH body names both.
 - Trailing `;` allowed; `--` and `/* */` comments allowed. Unquoted
   identifiers fold to lowercase. View, CTE, and alias names share one
   flat namespace across the whole script.

@@ -15,14 +15,17 @@ from pathlib import Path
 
 import pytest
 
-from ffrwd import shapes
+from ffrwd import shapes, wasm
+from ffrwd.compiler import compile_all
 from ffrwd.errors import ErrorCode, FfrwdError
+from ffrwd.execute import plan_argv
 from ffrwd.ir import Graph
 from ffrwd.lower import lower
 from ffrwd.parser import parse, resolve
 from ffrwd.probe import ProbeResult, StreamMeta
 from ffrwd.registry import Registry, load_reference
-from ffrwd.timing import check_live_leads, timing
+from ffrwd.timing import check_live_leads, summary, timing
+from ffrwd.warnings import FfrwdWarning, WarningCode
 from ffrwd.wasm import WORLDS, Described
 
 SNAPSHOT_PATH = Path(__file__).resolve().parent / "data" / "reference_registry.json"
@@ -169,7 +172,7 @@ def _inset(params: Mapping[str, object], bound: Sequence[str]) -> dict[str, obje
 
 def _tile(params: Mapping[str, object], bound: Sequence[str]) -> dict[str, object]:
     hold = {"kind": "hold", "anchor": {"kind": "shared-clock"}, "lead": 0}
-    clock = (
+    clock: dict[str, object] = (
         {"kind": "rate", "rate": {"num": int(str(params["fps"])), "den": 1}}
         if "fps" in params
         else {"kind": "rate-of", "port": "v"}
@@ -226,6 +229,7 @@ _PARAMS = {
         name: {"type": "number" if name != "text" else "string"}
         for name in ("text", "width", "height", "fps")
     },
+    "sub.wasm": {"relay": {"type": "string"}},
 }
 
 
@@ -291,7 +295,7 @@ def _registry() -> Registry:
     return load_reference(SNAPSHOT_PATH)
 
 
-def _probes() -> dict[str, ProbeResult | None]:
+def _probes(rate: int = 48000) -> dict[str, ProbeResult | None]:
     def media() -> ProbeResult:
         return ProbeResult(
             streams=[
@@ -301,7 +305,7 @@ def _probes() -> dict[str, ProbeResult | None]:
                 ),
                 StreamMeta(
                     type="audio", index=0, metadata={}, width=None, height=None,
-                    fps=None, sample_rate=48000, codec="aac", channels=2,
+                    fps=None, sample_rate=rate, codec="aac", channels=2,
                 ),
             ]
         )
@@ -608,7 +612,7 @@ def test_spans_reduce_a_nodes_rows_into_a_rows_file() -> None:
     )
     (spot,) = [node for node in graph.nodes.values() if node.filter == "spot.wasm"]
     (spans,) = [node for node in graph.nodes.values() if node.filter == "rowmerge"]
-    assert (spans.inputs, spans.args) == ([spot.id], {"merge_spans": True, "max_span": 10})
+    assert (spans.inputs, spans.args) == ([spot.id], {"max_span": 10})
     assert graph.rows_sinks[spans.id].path == "spots.ndjson"
 
 
@@ -702,3 +706,400 @@ def test_a_live_node_fed_later_than_its_bound_is_refused() -> None:
         "burn() needs 'words' 1 s ahead of its clock, and the path feeding it runs 2 s behind"
     )
     assert (caught.value.line, caught.value.col) == (3, 4)
+
+
+# -- on the sidecar's command line -------------------------------------------
+
+
+def _plan_argv(
+    query: str, monkeypatch: pytest.MonkeyPatch, rate: int = 48000
+) -> dict[str, list[str]]:
+    """Each process of the compiled plan as the printed command shows it."""
+    probes = _probes(rate)
+    monkeypatch.setattr(
+        "ffrwd.compiler.probe_path", lambda path, args=(), **kw: probes[path[0]]
+    )
+    compiled = compile_all(_declared(query), describe=_node, shape=_Asked())
+    assert compiled.plan is not None
+    return plan_argv(
+        compiled.plan,
+        sidecar_argv=wasm.shown_argv,
+        pipe_path=lambda edge, side: f"<{edge.source}-{edge.target} {side}>",
+    )
+
+
+def test_a_node_network_names_the_port_each_pad_binds(monkeypatch: pytest.MonkeyPatch) -> None:
+    argv = _plan_argv(
+        "COPY (SELECT ring(f.video[1], spot(f.video[1])) FROM input('f.mp4') f) "
+        "TO 'ringed.mp4'",
+        monkeypatch,
+    )
+    sidecar = argv["sidecar0"]
+    assert sidecar[sidecar.index("-filter_complex") + 1] == (
+        "[v=0:v]spot=every=30[spots=n1];[v=0:v][spots=n1]ring[v=out0]"
+    )
+    assert sidecar[sidecar.index("-map") :] == ["-map", "[out0]", "-f", "nut", "pipe:1"]
+
+
+def test_every_stream_one_process_hands_a_node_network_rides_one_nut(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    argv = _plan_argv(
+        "COPY (SELECT burn(f.video[1], f.audio[1], hear(f.audio[1])), f.audio[1] "
+        "FROM input('f.mp4') f) TO 'burned.mp4'",
+        monkeypatch,
+    )
+    sidecar = argv["sidecar0"]
+    assert sidecar.count("-i") == 1
+    assert sidecar[sidecar.index("-filter_complex") + 1] == (
+        "[a=0:a]hear[cues=n1];[v=0:v][a=0:a:1][words=n1]burn[v=out0]"
+    )
+    (feeder,) = [
+        words for pid, words in argv.items() if pid.startswith("ffmpeg") and "nut" in words
+        and words[-1] == "pipe:1"
+    ]
+    assert feeder.count("-map") == 3
+    assert feeder[-3:] == ["-f", "nut", "pipe:1"]
+
+
+def _taking(
+    shaped: Callable[..., dict[str, object]], kind: str, accepts: Mapping[str, object]
+) -> Callable[..., dict[str, object]]:
+    """`shaped` with every input of `kind` accepting `accepts`."""
+
+    def taking(params: Mapping[str, object], bound: Sequence[str]) -> dict[str, object]:
+        shape = shaped(params, bound)
+        inputs = shape["inputs"]
+        assert isinstance(inputs, list)
+        for port in inputs:
+            if port["kind"] == kind:
+                port["accepts"] = dict(accepts)
+        return shape
+
+    return taking
+
+
+def _feeder(argv: Mapping[str, list[str]]) -> list[str]:
+    (feeder,) = [
+        words for pid, words in argv.items() if pid.startswith("ffmpeg") and "nut" in words
+        and words[-1] == "pipe:1"
+    ]
+    return feeder
+
+
+def test_a_stream_two_nodes_read_crosses_in_the_format_both_take(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rgba = {"pixel_formats": ["rgba"]}
+    monkeypatch.setitem(SHAPES, "spot.wasm", _taking(_spot, "video", rgba))
+    monkeypatch.setitem(SHAPES, "ring.wasm", _taking(_reader("spots", _ROWS), "video", rgba))
+    feeder = _feeder(_plan_argv(
+        "COPY (SELECT ring(f.video[1], spot(f.video[1])) FROM input('f.mp4') f) "
+        "TO 'ringed.mp4'",
+        monkeypatch,
+    ))
+    assert feeder[feeder.index("-pix_fmt:0") + 1] == "rgba"
+
+
+def test_each_stream_of_one_nut_is_conformed_to_the_port_it_feeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(SHAPES, "hear.wasm", _taking(
+        _hear, "audio", {"sample_formats": ["f32"], "sample_rates": [48000]}
+    ))
+    monkeypatch.setitem(SHAPES, "burn.wasm", _taking(_burn, "audio", {"sample_formats": ["f32"]}))
+    feeder = _feeder(_plan_argv(
+        "COPY (SELECT burn(f.video[1], f.audio[1], hear(f.audio[1])), f.audio[1] "
+        "FROM input('f.mp4') f) TO 'burned.mp4'",
+        monkeypatch,
+        rate=44100,
+    ))
+    assert [word for word in feeder if word.startswith("-ar")] == ["-ar:0"]
+    assert feeder[feeder.index("-ar:0") + 1] == "48000"
+
+
+def test_a_node_read_in_from_has_no_input_and_its_reader_ends_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    argv = _plan_argv(
+        "COPY (SELECT s.video[1] FROM ticker('Nothing to see here') s WHERE s.t < 10) "
+        "TO 'ticker.mp4'",
+        monkeypatch,
+    )
+    assert "-i" not in argv["sidecar0"]
+    reader = argv["ffmpeg0"]
+    assert reader[reader.index("-to") + 1] == "10"
+
+
+def test_a_node_source_whose_relation_is_its_renditions_ends_where_its_reader_says(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def ticker(params: Mapping[str, object], bound: Sequence[str]) -> dict[str, object]:
+        shape = _ticker(params, bound)
+        outputs = shape["outputs"]
+        assert isinstance(outputs, list)
+        outputs[0]["row"] = 0
+        shape["relation"] = [json.dumps({"width": 1280, "height": 720})]
+        return shape
+
+    monkeypatch.setitem(SHAPES, "ticker.wasm", ticker)
+    argv = _plan_argv(
+        "COPY (SELECT s.video[1] FROM ticker('Nothing to see here') s "
+        "WHERE s.height = 720 AND s.t < 10) TO 'ticker.mp4'",
+        monkeypatch,
+    )
+    reader = argv["ffmpeg0"]
+    assert reader[reader.index("-to") + 1] == "10"
+
+
+def test_spans_are_the_hosts_rowmerge_with_its_span_written_as_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    argv = _plan_argv(
+        "COPY (SELECT ffrwd.merge_spans(spot(f.video[1]), max_span => 10) "
+        "FROM input('f.mp4') f) TO 'spots.ndjson'",
+        monkeypatch,
+    )
+    sidecar = argv["sidecar0"]
+    assert sidecar[sidecar.index("-filter_complex") + 1] == (
+        "[v=0:v]spot=every=30[spots=n1];[n1]rowmerge=max_span=10[out0]"
+    )
+    assert sidecar[-5:] == ["-map", "[out0]", "-f", "ndjson", "spots.ndjson"]
+
+
+def test_spans_without_a_span_are_refused() -> None:
+    with pytest.raises(FfrwdError) as caught:
+        _lowered("COPY (SELECT ffrwd.merge_spans(spot(f.video[1])) FROM input('f.mp4') f) "
+                 "TO 'spots.ndjson'")
+    assert caught.value.message == "ffrwd.merge_spans() needs 'max_span'"
+
+
+def test_explain_delays_says_each_window_and_each_outputs_delay() -> None:
+    graph = _lowered(
+        "COPY (SELECT burn(f.video[1], f.audio[1], hear(f.audio[1])), f.audio[1]" + _FROM
+    )
+    timed = timing(graph, _probes(), {"hear.wasm": "hear", "burn.wasm": "burn"})
+    assert timed is not None
+    assert summary(timed).splitlines() == [
+        "hear: tumbling 2 s",
+        "burn: per-frame; words by interval, no bound",
+        "out.mkv stream 0 (video): 2 s behind the source",
+        "out.mkv stream 1 (audio): 0 s behind the source, waits 2 s",
+    ]
+
+
+# -- coded packets -----------------------------------------------------------
+
+
+def _subscribe(params: Mapping[str, object], bound: Sequence[str]) -> dict[str, object]:
+    def coded(name: str, codec: str, row: int, carried: dict[str, object]) -> dict[str, object]:
+        return {
+            "name": name,
+            "kind": "packets",
+            "format": {
+                "kind": "packets",
+                "codec": codec,
+                "time_base": {"num": 1, "den": 90000},
+                "format": carried,
+                "extradata": "",
+                "profile": None,
+                "level": None,
+            },
+            "latency": 0,
+            "row": row,
+        }
+
+    return _shape(
+        [],
+        [
+            coded("hd", "h264", 0, {"kind": "video", "width": 1280, "height": 720}),
+            coded("hd_audio", "aac", 0, {"kind": "audio", "sample_rate": 48000, "channels": 2}),
+            coded("sd", "h264", 1, {"kind": "video", "width": 640, "height": 360}),
+        ],
+        {"kind": "self_clocked"},
+        bounded=False,
+        relation=['{"name": "720p", "bandwidth": 3000000}', '{"name": "360p"}'],
+    )
+
+
+def _remux(params: Mapping[str, object], bound: Sequence[str]) -> dict[str, object]:
+    coded = {**_clock("v"), "kind": "packets", "accepts": {"codecs": ["h264"]}}
+    return _shape(
+        [coded],
+        [{"name": "v", "kind": "packets", "format": {"kind": "like", "port": "v"}, "latency": 0}],
+        {"kind": "input", "port": "v"},
+    )
+
+
+def test_a_node_source_writing_coded_packets_binds_one_row_per_rendition() -> None:
+    SHAPES["sub.wasm"] = _subscribe
+    try:
+        graph = _lowered(
+            "CREATE FUNCTION sub(relay text) RETURNS source AS 'sub.wasm', 'sub' LANGUAGE wasm;\n"
+            "COPY (SELECT v.video[1] FROM sub('r') v WHERE v.height = 720) TO 'out.mkv'",
+            {"sub.wasm": _node("sub.wasm")},
+        )
+    finally:
+        del SHAPES["sub.wasm"]
+    (sub,) = [node for node in graph.nodes.values() if node.filter == "sub.wasm"]
+    assert sub.outputs == ["video", "audio", "video"]
+    assert [output.ref for output in graph.sinks[0].outputs] == [f"{sub.id}:0"]
+
+
+def test_a_node_reading_coded_packets_is_handed_the_stream_as_it_was_coded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    SHAPES["remux.wasm"] = _remux
+    _DECLARATIONS["remux"] = (
+        "CREATE FUNCTION remux(v video_stream) RETURNS video_stream "
+        "AS 'remux.wasm', 'remux' LANGUAGE wasm;"
+    )
+    try:
+        argv = _plan_argv(
+            "COPY (SELECT remux(f.video[1]) FROM input('f.mp4') f) TO 'out.mkv'", monkeypatch
+        )
+    finally:
+        del SHAPES["remux.wasm"]
+        del _DECLARATIONS["remux"]
+    feeder = argv["ffmpeg1"]
+    assert feeder[feeder.index("-c:0") + 1] == "copy"
+    reader = argv["ffmpeg0"]
+    assert reader[reader.index("-c:0") + 1] == "copy"
+
+
+def test_params_too_long_for_a_command_line_are_read_from_a_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    long = "x" * (shapes.PARAMS_INLINE_LIMIT + 1)
+    argv = _plan_argv(
+        f"COPY (SELECT s.video[1] FROM ticker('{long}') s) TO 'ticker.mp4'", monkeypatch
+    )
+    sidecar = argv["sidecar0"]
+    assert sidecar[sidecar.index("-filter_complex") + 1] == "ticker[v=out0]"
+    assert sidecar[sidecar.index("-params-from") + 1] == "ticker=ffrwd:params:sidecar0:n1"
+
+
+def test_a_packets_function_over_a_node_hands_back_the_stream_still_coded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    SHAPES["remux.wasm"] = _remux
+    _DECLARATIONS["remux"] = (
+        "CREATE FUNCTION remux(v video_stream) RETURNS packets "
+        "AS 'remux.wasm', 'remux' LANGUAGE wasm;"
+    )
+    try:
+        argv = _plan_argv(
+            "COPY (SELECT remux(f.video[1]) FROM input('f.mp4') f) TO 'out.mkv'", monkeypatch
+        )
+    finally:
+        del SHAPES["remux.wasm"]
+        del _DECLARATIONS["remux"]
+    sidecar = argv["sidecar0"]
+    assert sidecar[sidecar.index("-filter_complex") + 1] == "[v=0:v]remux[v=out0]"
+    assert argv["ffmpeg1"][argv["ffmpeg1"].index("-c:0") + 1] == "copy"
+
+
+def test_a_live_query_feeding_a_node_later_than_its_bound_is_refused_at_compile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bounded = {"kind": "interval", "latency": 1.0, "ahead": 0}
+
+    def burn(params: Mapping[str, object], bound: Sequence[str]) -> dict[str, object]:
+        return _shape(
+            [_clock("v"), _input("words", "data", bounded, schema=_CUE)],
+            [_output("v", "video")],
+            {"kind": "input", "port": "v"},
+        )
+
+    live = _probes()["f"]
+    monkeypatch.setattr("ffrwd.compiler.probe_path", lambda path, args=(), **kw: live)
+    SHAPES["burn.wasm"] = burn
+    try:
+        with pytest.raises(FfrwdError) as caught:
+            compile_all(
+                _declared(
+                    "COPY (SELECT burn(f.video[1], words => hear(f.audio[1])) "
+                    "FROM input('srt://127.0.0.1:9000') f) TO 'out.mkv'"
+                ),
+                describe=_node,
+                shape=_Asked(),
+            )
+    finally:
+        SHAPES["burn.wasm"] = _burn
+    assert caught.value.code is ErrorCode.LIVE_LEAD
+    assert (caught.value.line, caught.value.col) == (2, 17)
+
+
+def test_a_stream_waiting_long_beside_a_later_one_is_warned_about(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def hear(params: Mapping[str, object], bound: Sequence[str]) -> dict[str, object]:
+        return _shape(
+            [_clock("a", "audio", window=48000 * 1500)],
+            [_output("cues", "data", schema=_CUE)],
+            {"kind": "input", "port": "a"},
+        )
+
+    probes = _probes()
+    monkeypatch.setattr(
+        "ffrwd.compiler.probe_path", lambda path, args=(), **kw: probes[path[0]]
+    )
+    said: list[FfrwdWarning] = []
+    SHAPES["hear.wasm"] = hear
+    try:
+        compile_all(
+            _declared(
+                "COPY (SELECT burn(f.video[1], words => hear(f.audio[1])), f.audio[1] "
+                "FROM input('f.mp4') f) TO 'out.mkv'"
+            ),
+            describe=_node,
+            shape=_Asked(),
+            on_warning=said.append,
+        )
+    finally:
+        SHAPES["hear.wasm"] = _hear
+    assert [warning.code for warning in said] == [WarningCode.HELD_STREAM]
+
+
+def test_a_field_only_a_node_makes_is_refused_for_a_module_of_an_older_world() -> None:
+    old = Described(world=WORLDS[-1], name="matte", pixel_formats=("rgba",))
+    error = _refused("COPY (SELECT matte(f.video[1]).mask" + _FROM, {"matte.wasm": old})
+    assert error.message == (
+        "'.mask' is the stream matte() was handed, and a stream is not read back off a struct"
+    )
+
+
+def _weave(params: Mapping[str, object], bound: Sequence[str]) -> dict[str, object]:
+    coded = {**_clock("v"), "kind": "packets", "accepts": {"codecs": ["h264"]}}
+    clip = _input("clip", "data", {"kind": "interval", "ahead": 0}, schema=_ROWS)
+    return _shape(
+        [coded, *([clip] if "clip" in bound else [])],
+        [{"name": "v", "kind": "packets", "format": {"kind": "like", "port": "v"}, "latency": 0}],
+        {"kind": "input", "port": "v"},
+    )
+
+
+def test_a_node_reading_packets_reads_what_its_destination_encodes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    SHAPES["weave.wasm"] = _weave
+    _DECLARATIONS["weave"] = (
+        "CREATE FUNCTION weave(v video_stream, clip STRUCT(start_t number, id number, "
+        "x number, y number, w number, h number)[] DEFAULT NULL) RETURNS packets "
+        "AS 'weave.wasm', 'weave' LANGUAGE wasm;"
+    )
+    try:
+        argv = _plan_argv(
+            "COPY (SELECT weave(f.video[1], clip => spot(f.video[1])) FROM input('f.mp4') f) "
+            "TO 'out.mkv' WITH (video_codec 'libx264', crf 20)",
+            monkeypatch,
+        )
+    finally:
+        del SHAPES["weave.wasm"]
+        del _DECLARATIONS["weave"]
+    (weave,) = [words for words in argv.values() if "weave=weave.wasm" in words]
+    assert weave[weave.index("-filter_complex") + 1] == "[v=0:v][clip=1:d]weave[v=out0]"
+    (encoder,) = [words for words in argv.values() if "libx264" in words]
+    assert encoder[encoder.index("-c:0") + 1] == "libx264"
+    (writer,) = [words for words in argv.values() if "out.mkv" in words]
+    assert writer[writer.index("-c:0") + 1] == "copy"

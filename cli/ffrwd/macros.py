@@ -93,6 +93,8 @@ class Macro:
     options: tuple[str, ...] = ()
     positive: tuple[str, ...] = ()
     nonnegative: tuple[str, ...] = ()
+    # The options a call has to write: what the node cannot do without.
+    required: tuple[str, ...] = ()
 
     @property
     def signature(self) -> str:
@@ -154,7 +156,7 @@ def _leaky(values: list[object], node: NodeBuilder, options: dict[str, object]) 
 def _merge_spans(values: list[object], node: NodeBuilder, options: dict[str, object]) -> str:
     """The host's own rows node, grouping per-tick rows into spans by `start_t`."""
     (rows,) = values
-    return node(ROWMERGE, {MERGE_SPANS: True, **options}, [str(rows)], ["data"])
+    return node(ROWMERGE, dict(options), [str(rows)], ["data"])
 
 
 _LEAKY_SOUND_HINT = (
@@ -212,6 +214,7 @@ MACROS: dict[str, Macro] = {
         expand=_merge_spans,
         options=(MAX_SPAN,),
         positive=(MAX_SPAN,),
+        required=(MAX_SPAN,),
     ),
     "loudnorm2": Macro(
         name="loudnorm2",

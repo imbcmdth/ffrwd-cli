@@ -50,20 +50,21 @@ import os
 import subprocess
 import threading
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Literal, Protocol, cast
 
 from . import binaries, nn, probe
-from .emit import build_network_graph
+from .emit import build_network_graph, build_node_network
 from .errors import ErrorCode, FfrwdError
 from .execute import STDIN, STDOUT
-from .ir import RowsSink, StreamType
+from .ir import PARAMS_FILE, PIPE, RowsSink, StreamType
 from .probe import ProbeResult, RenditionMeta, StreamMeta
 from .processes import (
     NUT,
-    PCM_F32LE,
-    PCM_S16LE,
+    SAMPLE_FMT_CODECS,
+    WIRE_PIX_FMTS,
+    WIRE_SAMPLE_FMTS,
     AudioFormat,
     EffectGrant,
     ModelBinding,
@@ -72,6 +73,7 @@ from .processes import (
     RowsDocument,
     SidecarProcess,
 )
+from .shapes import PARAMS_INLINE_LIMIT
 
 __all__ = [
     "ANNOTATION_TYPES",
@@ -181,8 +183,6 @@ WORLD_VERSION = WORLDS[-1].partition("@")[2]
 # The package carrying the wit, whose version is the world's.
 WIT_PACKAGE = "ffrwd/wasm"
 
-# The pixel formats a stream edge into or out of the sidecar can carry.
-WIRE_PIX_FMTS: tuple[str, ...] = ("rgba", "yuv420p", "yuv422p", "yuv444p")
 
 # The coded video streams a stream edge can carry to a packet sink: the ones
 # the sidecar's NUT reader hands through untouched.
@@ -251,8 +251,6 @@ NODE_WORLD = "node-module"
 
 # The sample formats one can carry, the pcm each of them travels as, and
 # the name ffmpeg's own options spell it by.
-WIRE_SAMPLE_FMTS: tuple[str, ...] = ("f32", "s16")
-SAMPLE_FMT_CODECS: Mapping[str, str] = {"f32": PCM_F32LE, "s16": PCM_S16LE}
 FFMPEG_SAMPLE_FMTS: Mapping[str, str] = {"f32": "flt", "s16": "s16"}
 
 # The JSON Schema types each declared annotation field type covers. `number`
@@ -388,6 +386,9 @@ _NN_EXCLUDE_FLAG = "-nn-exclude"
 
 # The sidecar's worker-thread cap. Unwritten, the sidecar sizes its own pool.
 _JOBS_FLAG = "-jobs"
+
+# Where a node's params are read whole from a file: ``<name>=<path>``.
+_PARAMS_FROM_FLAG = "-params-from"
 
 # Which half of a codec package's module a run drives: "encode" or "decode".
 _CODEC_FLAG = "-codec"
@@ -1982,7 +1983,10 @@ def _argv(
             "its outputs carries, one per output",
         )
     argv = [binary]
-    if not process.packet_source:
+    # A source reads nothing: a packet source, or a network of nodes none of
+    # which is handed a stream.
+    reads_nothing = process.packet_source or (process.node_network and not process.inputs)
+    if not reads_nothing:
         for index, path in enumerate(reads or (STDIN,)):
             argv += ["-f", EDGE_FORMAT, "-i", path]
             meta: PadMeta | None = process.pads[index] if index < len(process.pads) else None
@@ -2004,7 +2008,9 @@ def _argv(
         argv += [_FRAME_RATE_FLAG, process.frame_rate]
     for flag, value in process.color:
         argv += [f"-{flag}", value]
-    if process.network:
+    if process.node_network:
+        argv += _node_network_args(process, reads, writes)
+    elif process.network:
         argv += _network_args(process, writes)
     else:
         argv += ["-m", process.module]
@@ -2182,6 +2188,65 @@ def _network_args(process: SidecarProcess, writes: Sequence[str] = ()) -> list[s
     for target, tail in zip(targets, tails):
         argv += ["-map", target, *tail]
     return argv
+
+
+def _node_network_args(
+    process: SidecarProcess, reads: Sequence[str], writes: Sequence[str]
+) -> list[str]:
+    """The ``-m`` table, the network string and the outputs of a region
+    holding node modules.
+
+    Each output is one NUT carrying every stream the plan takes to one
+    process, a ``-map`` per stream; each rows document an output of its own.
+    `reads` names its inputs in ``-i`` order and `writes` its stream outputs
+    then its documents; a printed command given none reads stdin and writes
+    stdout, then numbered pipes.
+    """
+    graph = process.graph
+    if graph is None:  # `network` is True for every node region
+        raise _reject(
+            f"process '{process.id}' hosts node modules and carries no graph",
+            hint="the plan was built without partitioning; recompile the query",
+        )
+    wanted = graph.input_paths.count(PIPE)
+    given = list(reads)[:wanted] or [STDIN] * min(wanted, 1)
+    given += [f"pipe:{index}" for index in range(len(given), wanted)]
+    filed: list[str] = []
+    nodes = dict(graph.nodes)
+    for name, node in graph.nodes.items():
+        if not node.ports and not node.out_ports or not _params_filed(node.args):
+            continue
+        filed += [_PARAMS_FROM_FLAG, f"{node.filter}={PARAMS_FILE}{process.id}:{name}"]
+        nodes[name] = replace(node, args={})
+    network, groups = build_node_network(replace(graph, nodes=nodes), pipe_inputs=given)
+    streams = len(groups) - len(process.rows)
+    paths = list(writes[:streams])
+    paths += [STDOUT if not paths and index == 0 else f"pipe:{index + 1}"
+              for index in range(len(paths), streams)]
+    documents = writes[streams:]
+    argv: list[str] = []
+    for binding in process.modules:
+        argv += ["-m", f"{binding.name}={binding.path}"]
+    argv += ["-filter_complex", network, *filed]
+    for targets, path in zip(groups[:streams], paths):
+        for target in targets:
+            argv += ["-map", target]
+        argv += ["-f", EDGE_FORMAT, path]
+    for index, (targets, document) in enumerate(zip(groups[streams:], process.rows)):
+        given_path = documents[index] if index < len(documents) else ""
+        path = document.sink.path or given_path or f"pipe:{streams + index + 1}"
+        for target in targets:
+            argv += ["-map", target]
+        argv += ["-f", document.sink.container, path]
+    return argv
+
+
+def _params_filed(params: Mapping[str, object]) -> bool:
+    """Whether a node's params go in a file: too long for a command line, or
+    holding a list a filtergraph option cannot spell."""
+    if any(not isinstance(value, str | int | float | bool) for value in params.values()):
+        return True
+    return len(json.dumps(params)) > PARAMS_INLINE_LIMIT
 
 
 def sidecar_argv(

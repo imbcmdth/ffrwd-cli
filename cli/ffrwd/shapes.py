@@ -136,9 +136,10 @@ class OutputFormat:
     """One arm of ``output-format``.
 
     `video`: width, height, `pixel_format`. `audio`: `sample_rate`,
-    `channels`, `sample_format`. `data`: `codec`. `packets`: `codec` and
-    `time_base`. `like`: `port`, with `pixel_format` or `sample_format` the
-    field it overrides.
+    `channels`, `sample_format`. `data`: `codec`. `packets`: the coded
+    stream, `codec`, `time_base`, what it carries as `coded` (video, audio or
+    data) with that kind's own fields, and `extradata` as hex. `like`:
+    `port`, with `pixel_format` or `sample_format` the field it overrides.
     """
 
     kind: FormatKind
@@ -151,6 +152,8 @@ class OutputFormat:
     codec: str | None = None
     time_base: tuple[int, int] | None = None
     port: str | None = None
+    coded: Literal["video", "audio", "data"] | None = None
+    extradata: str = ""
 
 
 @dataclass(frozen=True)
@@ -415,8 +418,19 @@ def _output_format(value: object, module: str, port: str) -> OutputFormat | None
             sample_format=_text(body.get("sample_fmt")) or _text(body.get("sample_format")),
         )
     if kind == "packets":
+        coded = body.get("format")
+        carried = coded if isinstance(coded, dict) else {}
+        coded_kind = _choice(carried.get("kind"), ("video", "audio", "data"), "")
         return OutputFormat(
-            "packets", codec=_text(body.get("codec")), time_base=_rational(body.get("time_base"))
+            "packets",
+            codec=_text(body.get("codec")),
+            time_base=_rational(body.get("time_base")),
+            coded=cast(Literal["video", "audio", "data"], coded_kind) if coded_kind else None,
+            width=_whole(carried.get("width")),
+            height=_whole(carried.get("height")),
+            sample_rate=_whole(carried.get("sample_rate")),
+            channels=_whole(carried.get("channels")),
+            extradata=_text(body.get("extradata")) or "",
         )
     if kind == "like":
         return OutputFormat(

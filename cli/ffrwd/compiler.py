@@ -706,7 +706,7 @@ def compile_all(
                 for lateral in ready[0].laterals
             ],
         )
-        timed = timing(ready[0], probes)
+        timed = timing(ready[0], probes, {m: a[2] for m, a in _module_anchors(res).items()})
         if timed is not None:
             if _runs_live(res, probes, ready[0]):
                 check_live_leads(ready[0], probes, _module_anchors(res))
@@ -715,20 +715,23 @@ def compile_all(
         span = _run_duration(ready, _probed_paths(res, probes))
         stream_wasm = _stream_wasm(res)
         hosted = _hosted_wasm(res)
+        sourced = {ready[0].nodes[name].filter for name in ready[0].node_sources.values()}
         leaky = any(node.filter == LEAKY for node in ready[0].nodes.values())
-        if not hosted and not ready[0].module_sources and not leaky:
+        if not hosted and not ready[0].module_sources and not leaky and not sourced:
             return Compiled(
                 graphs=ready, default_timeout=budget, duration=span, timing=timed
             )
         try:
             plan = partition(
                 ready[0],
-                external=external_filters(*sorted({d.module for d in hosted.values()})),
+                external=external_filters(
+                    *sorted({d.module for d in hosted.values()} | sourced)
+                ),
                 probes=probes,
                 pix_fmts=_wire_formats(stream_wasm, describes),
                 shapes=_module_shapes(stream_wasm, describes),
                 audio_wires=_audio_wires(stream_wasm, describes),
-                models=_nn_models(hosted, describes, packages),
+                models=_nn_models(hosted | _source_wasm(res), describes, packages),
                 effects=_effect_grants(stream_wasm | _source_wasm(res), describes),
                 anchors=res.input_anchors,
             )

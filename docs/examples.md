@@ -1142,7 +1142,14 @@ COPY (
 ```
 
 ```
-<pinned when the binding lands>
+$ ffrwd compile -f query.sql
+ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 rawvideo -pix_fmt:0 rgba -f nut \
+  pipe:1 | ffrwd-wasm -f nut -i pipe:0 -m \
+  spot=../sidecar/modules/target/wasm32-wasip2/release/spot.wasm -m \
+  ring=../sidecar/modules/target/wasm32-wasip2/release/ring.wasm -filter_complex \
+  '[v=0:v]spot=every=30[spots=n1];[v=0:v][spots=n1]ring[v=out0]' -map '[out0]' -f nut \
+  pipe:1 | ffmpeg -copyts -f nut -analyzeduration 0 -fpsprobesize 3 -i pipe:0 -map 0:v:0 \
+  -c:0 libx264 -crf:0 20 ringed.mp4
 ```
 
 `spot` writes one row per frame for as long as the mark is in view, and every row of one mark carries the pts it was first seen at as `start_t`: the row for frame t says what is true at t, so a reader needs no look-ahead and a run split across workers agrees on the ids. The old spelling, a module returning `STRUCT(v video_stream, spots ...)` with the picture untouched, is what a package keeps when its own module has not moved: inside the sidecar the rows ride the frames exactly as before. A migrated package that wants the old reading back writes it in SQL - `CREATE FUNCTION spotted(v video_stream) RETURNS STRUCT(v video_stream, spots STRUCT(...)[]) AS $$ SELECT v, spot(v) AS spots $$ LANGUAGE sql` - and `ring(spotted(v))` reads the record as the stream and the rows, as a call over a two-part result always has.
@@ -1165,13 +1172,22 @@ RETURNS video_stream
 
 COPY (
   SELECT dim(f.video[1],
-             ARRAY(SELECT s FROM unnest(spot(f.video[1])) s WHERE s.w * s.h > 400))
+             ARRAY(SELECT s FROM unnest(spot(f.video[1])) s WHERE s.w >= 20))
   FROM input('tests/fixtures/testsrc.mp4') f
 ) TO 'dimmed.mp4' WITH (video_codec 'libx264', crf 20)
 ```
 
 ```
-<pinned when the binding lands>
+$ ffrwd compile -f query.sql
+ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 rawvideo -pix_fmt:0 rgba -f nut \
+  pipe:1 | ffrwd-wasm -f nut -i pipe:0 -m \
+  spot=../sidecar/modules/target/wasm32-wasip2/release/spot.wasm -m \
+  dim=../sidecar/modules/target/wasm32-wasip2/release/dim.wasm -filter_complex \
+  '[v=0:v]spot=every=30[spots=n1];'\
+'[n1]rowfilter=pred={"ge"\\:\[{"field"\\:"w"}\,{"lit"\\:20}\]}[n2];'\
+'[v=0:v][boxes=n2]dim=amount=0.5[v=out0]' -map '[out0]' -f nut pipe:1 | ffmpeg -copyts \
+  -f nut -analyzeduration 0 -fpsprobesize 3 -i pipe:0 -map 0:v:0 -c:0 libx264 -crf:0 20 \
+  dimmed.mp4
 ```
 
 A field the reader names that the producer's rows lack, or carries with another type, is still refused at compile time, naming both. The WHERE runs inside the sidecar as before, and it may test fields the reader never sees.
@@ -1198,7 +1214,21 @@ COPY (
 ```
 
 ```
-<pinned when the binding lands>
+$ ffrwd compile -f query.sql
+# named pipes: ffmpeg0 reads sidecar0, sidecar0; sidecar0 feeds ffmpeg0, ffmpeg0
+1. ffmpeg: ffmpeg -i tests/fixtures/av.mp4 -f webvtt -i \
+  '<named pipe sidecar0-ffmpeg0 ffrwd.cues#2 read>' -f nut -analyzeduration 0 \
+  -fpsprobesize 3 -i '<named pipe sidecar0-ffmpeg0 n2 read>' -map 2:v:0 -map 0:a:0 -map \
+  1:s:0 -c:2 copy -c:0 libx264 -crf:0 20 -c:1 copy heard.mkv
+2. ffmpeg: ffmpeg -i tests/fixtures/av.mp4 -map 0:a:0 -map 0:v:0 -ar:0 48000 -c:0 \
+  pcm_f32le -c:1 rawvideo -pix_fmt:1 rgba -f nut pipe:1
+3. sidecar: ffrwd-wasm -f nut -i pipe:0 -m \
+  hear=../sidecar/modules/target/wasm32-wasip2/release/hear.wasm -m \
+  burn=../sidecar/modules/target/wasm32-wasip2/release/burn.wasm -filter_complex \
+  '[a=0:a]hear[cues=out1];[v=0:v][words=out1]burn[v=out0]' -map '[out0]' -f nut \
+  '<named pipe sidecar0-ffmpeg0 n2 write>' -map '[out1]' -f webvtt \
+  '<named pipe sidecar0-ffmpeg0 ffrwd.cues#2 write>'
+# this listing is not a shell command -- run the plan with `ffrwd run`
 ```
 
 Two calls whose arguments differ are still two nodes. The split is of a data edge, so what it costs is a second copy of each row, not a second run.
@@ -1225,7 +1255,15 @@ COPY (
 ```
 
 ```
-<pinned when the binding lands>
+$ ffrwd compile -f query.sql
+ffmpeg -i tests/fixtures/av.mp4 -filter_complex '[0:a:0]asplit=2[out0][out2]' -map \
+  '[out0]' -map 0:v:0 -map '[out2]' -ar:0 48000 -c:0 pcm_f32le -c:2 pcm_f32le -c:1 \
+  rawvideo -pix_fmt:1 rgba -f nut pipe:1 | ffrwd-wasm -f nut -i pipe:0 -m \
+  hear=../sidecar/modules/target/wasm32-wasip2/release/hear.wasm -m \
+  burn=../sidecar/modules/target/wasm32-wasip2/release/burn.wasm -filter_complex \
+  '[a=0:a]hear[cues=n1];[v=0:v][a=0:a:1][words=n1]burn[v=out0]' -map '[out0]' -f nut \
+  pipe:1 | ffmpeg -i tests/fixtures/av.mp4 -f nut -analyzeduration 0 -fpsprobesize 3 -i \
+  pipe:0 -map 1:v:0 -map 0:a:0 -c:0 libx264 -crf:0 20 -c:1 aac burned.mp4
 ```
 
 `hear` works two seconds of sound at a time and says so, and a window's cues leave with the window. `burn` reads them by interval, so the host holds each picture until the window holding its time is done, and the picture leaves `burn` two seconds behind the sound that enters it. [Recipe 153](#153-see-what-each-node-waits-for) shows where that number is printed.
@@ -1254,7 +1292,15 @@ COPY (
 ```
 
 ```
-<pinned when the binding lands>
+$ ffrwd compile -f query.sql
+ffmpeg -i tests/fixtures/av.mp4 -map 0:v:0 -map 0:a:0 -c:0 rawvideo -pix_fmt:0 rgba -c:1 \
+  pcm_f32le -f nut pipe:1 | ffrwd-wasm -f nut -i pipe:0 -m \
+  burn=../sidecar/modules/target/wasm32-wasip2/release/burn.wasm -m \
+  inset=../sidecar/modules/target/wasm32-wasip2/release/inset.wasm -filter_complex \
+  '[v=0:v][a=0:a]burn[v=n1];[v=n1]inset=port=9100:lead=0.5[v=out0]' -map '[out0]' -f nut \
+  pipe:1 | ffmpeg -i tests/fixtures/av.mp4 -f nut -analyzeduration 0 -fpsprobesize 3 -i \
+  pipe:0 -map 1:v:0 -map 0:a:0 -c:0 libx264 -crf:0 20 -c:1 aac inset.mp4
+# listens: sidecar0 at tcp://127.0.0.1:9100 for inset(feed)
 ```
 
 `feed` is a hold input: whatever connects to port 9100 is shown at the picture's pace from `lead` seconds after its first frame arrives, the last frame held while it runs late, and the picture alone again when it ends. The compile listing names the port and the process that owns it, as it does for a switch's feeders. An input with no `DEFAULT NULL` is required, and a call that leaves it off is refused.
@@ -1278,14 +1324,29 @@ COPY (
 ```
 
 ```
-<pinned when the binding lands>
+$ ffrwd compile -f query.sql
+# named pipes: sidecar0 reads ffmpeg1, ffmpeg2, ffmpeg3
+1. ffmpeg: ffmpeg -copyts -f nut -analyzeduration 0 -fpsprobesize 3 -i pipe:0 -map 0:v:0 \
+  -c:0 libx264 -crf:0 20 tiled.mp4
+2. ffmpeg: ffmpeg -i tests/fixtures/av.mp4 -map 0:v:0 -c:0 rawvideo -pix_fmt:0 rgba -f \
+  nut '<named pipe ffmpeg1-sidecar0 src:a:v:0 write>'
+3. ffmpeg: ffmpeg -i tests/fixtures/av2.mp4 -map 0:v:0 -c:0 rawvideo -pix_fmt:0 rgba -f \
+  nut '<named pipe ffmpeg2-sidecar0 src:b:v:0 write>'
+4. ffmpeg: ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 rawvideo -pix_fmt:0 rgba \
+  -f nut '<named pipe ffmpeg3-sidecar0 src:c:v:0 write>'
+5. sidecar: ffrwd-wasm -f nut -i '<named pipe ffmpeg1-sidecar0 src:a:v:0 read>' -f nut \
+  -i '<named pipe ffmpeg2-sidecar0 src:b:v:0 read>' -f nut -i \
+  '<named pipe ffmpeg3-sidecar0 src:c:v:0 read>' -m \
+  tile=../sidecar/modules/target/wasm32-wasip2/release/tile.wasm -filter_complex \
+  '[v=0:v][v=1:v][v=2:v]tile=columns=3[v=out0]' -map '[out0]' -f nut pipe:1
+# this listing is not a shell command -- run the plan with `ffrwd run`
 ```
 
 A bare array column broadcasts over a filter, one call per element; over a module port declared as an array it is the port's whole list, and a module that wants one call per element is called under `unnest`. `audio_stream[]` and a rows parameter with `[]` on the record work the same way. A port that takes several streams cannot be the module's clock, which is why `tile` keeps time itself; the rate it keeps is read off the first picture by the compiler, which knows every stream's rate before anything runs.
 
 ## 151. A node makes a matte and the rows that go with it
 
-A module that produces two things returns a record naming both: `matte` makes a mask of the mark it finds and a row per mark, and both leave the one node. Read either field off the call, or every field at once with `.*` in a WITH body; however the fields are read, the call is one instance:
+A module that produces two things returns a record naming both: `matte` makes a mask of the mark it finds and a row per mark, and both leave the one node. Read either field off the call, or every field at once with `.*` in a WITH body; however the fields are read, the call is one instance, and here `dim` reads both:
 
 ```pgsql
 CREATE FUNCTION matte(v video_stream, every number DEFAULT 30)
@@ -1303,13 +1364,20 @@ RETURNS video_stream
 
 COPY (
   WITH m AS (SELECT (matte(f.video[1])).* FROM input('tests/fixtures/testsrc.mp4') f)
-  SELECT dim(m.mask, m.spots), m.spots
+  SELECT dim(m.mask, m.spots)
   FROM m
 ) TO 'matte.mkv' WITH (video_codec 'ffv1')
 ```
 
 ```
-<pinned when the binding lands>
+$ ffrwd compile -f query.sql
+ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 rawvideo -pix_fmt:0 rgba -f nut \
+  pipe:1 | ffrwd-wasm -f nut -i pipe:0 -m \
+  matte=../sidecar/modules/target/wasm32-wasip2/release/matte.wasm -m \
+  dim=../sidecar/modules/target/wasm32-wasip2/release/dim.wasm -filter_complex \
+  '[v=0:v]matte=every=30[mask=n10][spots=n11];[v=n10][boxes=n11]dim=amount=0.5[v=out0]' \
+  -map '[out0]' -f nut pipe:1 | ffmpeg -copyts -f nut -analyzeduration 0 -fpsprobesize 3 \
+  -i pipe:0 -map 0:v:0 -c:0 ffv1 matte.mkv
 ```
 
 Each field is an output port with a format and a time base of its own, declared by the module for the call's parameters. [Recipe 94](#94-blur-the-people-and-only-the-people)'s `segment` is this shape, and its rows no longer ride the map's frames: they are a data stream beside it, which is why `mask_select` can read them from a call `segment` is not part of.
@@ -1331,7 +1399,12 @@ COPY (
 ```
 
 ```
-<pinned when the binding lands>
+$ ffrwd compile -f query.sql
+ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 rawvideo -pix_fmt:0 rgba -f nut \
+  pipe:1 | ffrwd-wasm -f nut -i pipe:0 -m \
+  spot=../sidecar/modules/target/wasm32-wasip2/release/spot.wasm -filter_complex \
+  '[v=0:v]spot=every=30[spots=n1];[n1]rowmerge=max_span=10[out0]' -map '[out0]' -f \
+  ndjson spots.ndjson
 ```
 
 The rows out carry `start_t` and `end_t` beside the fields in, one row per span, so `spots.ndjson` holds one line per mark rather than one per frame. Rows whose fields are `start_t` and `text` reduce to cues, and selecting them beside a picture writes a subtitle track. A span row leaves when its span ends, so a span is as late as it is long; `max_span` bounds that, and it is what a reader pairing by time waits for. A span still open after ten seconds is written as it stands and goes on as a new one. The reducer closes a span on its producer's progress, not on the next row, so the last span of a run ends where the rows did.
@@ -1358,11 +1431,14 @@ COPY (
 ```
 
 ```
-$ ffrwd explain -f query.sql
-<pinned when the binding lands>
+$ ffrwd explain --delays -f query.sql
+hear: tumbling 2 s
+burn: per-frame; words by interval, no bound
+burned.mp4 stream 0 (video): 2 s behind the source
+burned.mp4 stream 1 (audio): 0 s behind the source, waits 2 s
 ```
 
-`hear` is a tumbling window of 2 s, so its cues trail the sound by up to 2 s and nothing more; `burn`'s picture is 2 s behind the source, and the sound written beside it waits in its pipe for the same 2 s, which `compile` sizes. On a live input the same sums decide whether a query can run at all: a node that must act ahead of time (an ad decision that needs `announce_before_s`, a playout that needs `lead_s`) fed by a path later than that lead is refused at compile time as `LIVE_LEAD`, naming the node, the lead it needs and the delay of the path feeding it. A file run has no such rule, since nothing there is late.
+`hear` is a tumbling window of 2 s, so its cues trail the sound by up to 2 s and nothing more; `burn`'s picture is 2 s behind the source, and the sound written beside it, read straight from the file, waits those 2 s at the muxer, which `compile` sizes. On a live input the same sums decide whether a query can run at all: a node that must act ahead of time (an ad decision that needs `announce_before_s`, a playout that needs `lead_s`) fed by a path later than that lead is refused at compile time as `LIVE_LEAD`, naming the node, the lead it needs and the delay of the path feeding it. A file run has no such rule, since nothing there is late.
 
 ## 154. A page with no inputs is a source
 
@@ -1382,7 +1458,12 @@ COPY (
 ```
 
 ```
-<pinned when the binding lands>
+$ ffrwd compile -f query.sql
+ffrwd-wasm -m ticker=../sidecar/modules/target/wasm32-wasip2/release/ticker.wasm \
+  -filter_complex \
+  'ticker=text=Nothing\ to\ see\ here:width=1280:height=720:fps=30[video=out0]' -map \
+  '[out0]' -f nut pipe:1 | ffmpeg -copyts -f nut -analyzeduration 0 -fpsprobesize 3 -to \
+  10 -i pipe:0 -map 0:v:0 -c:0 libx264 -crf:0 20 ticker.mp4
 ```
 
 In a file run the source runs as fast as its reader drains it; in a live run it is paced to the wall clock. `WHERE s.t < 10` ends it after ten seconds, as it would any source. A network source is the same shape with a clock of its own: it emits when it has something, and `shape` may reach the network at compile time to learn its outputs, as a manifest is probed. `ffrwd.blitz.compose` with no streams, a page that animates on its own, is this recipe's shape too.

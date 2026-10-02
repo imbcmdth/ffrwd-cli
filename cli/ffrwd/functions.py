@@ -2113,8 +2113,11 @@ def _define_wasm(
         if found is None:
             raise
         return found
-    if declared.is_value or declared.is_codec or declared.is_sink or declared.is_packets:
+    if declared.is_value or declared.is_codec or declared.is_sink:
         return declared
+    if declared.is_packets:
+        # A node hands back the coded stream it was given, of that kind.
+        return replace(declared, outputs=(Parameter("", params[0].type),))
     outputs = _node_outputs(node, name, identifier)
     return declared if outputs is None else replace(declared, outputs=outputs)
 

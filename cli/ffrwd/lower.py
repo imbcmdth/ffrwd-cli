@@ -425,7 +425,15 @@ from ffrwd.probe import (
 from ffrwd.probe import probe as probe_one_path
 from ffrwd.processes import CLOCK_SIZE, COPY_CODEC, NUT, RAWVIDEO, ref_type
 from ffrwd.registry import DynamicFilter, FilterOption, Registry, SourceFilter
-from ffrwd.shapes import InputPort, NodeShape, Shape, ShapeCache, row_mismatch
+from ffrwd.shapes import (
+    InputPort,
+    NodeShape,
+    OutputPort,
+    Shape,
+    ShapeCache,
+    node_shape,
+    row_mismatch,
+)
 from ffrwd.sink import (
     CODEC_PARAMS_FLAGS,
     COLOR_OPTIONS,
@@ -3911,21 +3919,25 @@ def _node_source_probe(shape: NodeShape) -> ProbeResult:
     streams: list[StreamMeta] = []
     by_row: dict[int, list[StreamMeta]] = {}
     for output in shape.outputs:
-        index = counted.get(output.kind, 0)
-        counted[output.kind] = index + 1
+        kind = _output_kind(shape, output, {})
+        index = counted.get(kind, 0)
+        counted[kind] = index + 1
         found = output.format
-        video = found is not None and found.kind == "video"
-        audio = found is not None and found.kind == "audio"
+        coded = found is not None and found.kind == "packets"
+        video = found is not None and (found.kind == "video" or coded) and kind == "video"
+        audio = found is not None and (found.kind == "audio" or coded) and kind == "audio"
         stream = StreamMeta(
-            type=cast(StreamType, output.kind),
+            type=kind,
             index=index,
             metadata={},
             width=found.width if found is not None and video else None,
             height=found.height if found is not None and video else None,
-            fps=fps if output.kind == "video" else None,
+            fps=fps if kind == "video" else None,
             sample_rate=found.sample_rate if found is not None and audio else None,
-            codec=_NODE_SOURCE_CODECS.get(
-                (found.sample_format if found is not None and audio else None) or output.kind
+            codec=found.codec
+            if found is not None and coded
+            else _NODE_SOURCE_CODECS.get(
+                (found.sample_format if found is not None and audio else None) or kind
             ),
             channels=found.channels if found is not None and audio else None,
         )
@@ -3962,6 +3974,29 @@ _NODE_SOURCE_CODECS: Mapping[str, str] = {
     "data": JSON_CODEC,
     **SAMPLE_FMT_CODECS,
 }
+
+
+def _output_kind(
+    shape: NodeShape, output: OutputPort, bound: Mapping[str, StreamType]
+) -> StreamType:
+    """The kind of stream a node's output is in the graph.
+
+    Coded packets are the kind they carry: what the coded stream says, or,
+    where the output follows an input's format, what is bound there.
+    """
+    if output.kind != "packets":
+        return cast(StreamType, output.kind)
+    found = output.format
+    if found is not None and found.kind == "packets" and found.coded is not None:
+        return found.coded
+    follows = (
+        found.port
+        if found is not None and found.kind == "like"
+        else shape.clock.port
+        if found is None and shape.clock.kind == "input"
+        else None
+    )
+    return bound.get(follows or "", "video")
 
 
 def _text_or_none(value: object) -> str | None:
@@ -8835,6 +8870,7 @@ class _Lowerer:
         lowering ends (:meth:`_place_node_sources`). A source that never ends
         reads as a live input does.
         """
+        self._check_node_export(declared, described, inner, select)
         params = self._wasm_params(declared, described, call, inner, select, env, {}, first=0)
         shape = self._node_shape(declared, described, params, [], inner, select)
         required = next((port for port in shape.inputs if port.required), None)
@@ -8848,21 +8884,11 @@ class _Lowerer:
                 hint="a source reads nothing; a node reading a stream is called "
                 "over that stream in the SELECT list",
             )
-        packets = next((o for o in shape.outputs if o.kind == "packets"), None)
-        if packets is not None:
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL,
-                f"the module '{declared.module}' writes packets on its "
-                f"'{packets.name}' output, which a node source cannot hand on yet",
-                inner,
-                fallback=select,
-                hint="a node source writing coded packets is not wired yet",
-            )
         result = _node_source_probe(shape)
         self.probes[alias] = result
         env.bindings[alias] = _InputBinding(alias=alias)
         self._bind_renditions(alias, join, env, select)
-        kinds = [cast(StreamType, output.kind) for output in shape.outputs]
+        kinds = [_output_kind(shape, output, {}) for output in shape.outputs]
         ref = self.ctx.node(declared.module, params, [], kinds)
         self.graph.nodes[ref].out_ports = [output.name for output in shape.outputs]
         self.graph.node_shapes[ref] = dict(shape.raw)
@@ -10267,7 +10293,7 @@ class _Lowerer:
                 if isinstance(env.bindings.get(alias), _RowBinding)
                 or _reads_cte_value(alias, conjunct, env)
             }
-            if not rows:
+            if not rows or self._ends_node_source(conjunct, aliases):
                 time_conjuncts.append(conjunct)
                 continue
             if aliases - rows and len(rows) == 1 and self._is_row_window(conjunct, env):
@@ -10287,6 +10313,21 @@ class _Lowerer:
                 )
             row_conjuncts.append(conjunct)
         return time_conjuncts, row_conjuncts, assertion_conjuncts
+
+    def _ends_node_source(self, conjunct: exp.Expr, aliases: set[str]) -> bool:
+        """Whether `conjunct` bounds the time of a node read in FROM: its
+        relation rows are renditions, and its time is the node's own."""
+        parsed = _time_bounds(conjunct)
+        if parsed is None:
+            return False
+        column = parsed[0]
+        table = column.args.get("table")
+        return (
+            table is not None
+            and aliases == {_fold(table)}
+            and _fold(table) in self.graph.node_sources
+            and _fold(column.this) == TIME_COLUMN
+        )
 
     def _check_row_window_seeks_a_file(
         self, conjunct: exp.Expr, where: exp.Where, env: _Env
@@ -11610,7 +11651,9 @@ class _Lowerer:
                 self._window_of(alias, low_node, high_node, env, row, select)
                 for row in rows
             ]
-            if isinstance(env.bindings[alias], _InputBinding):
+            if isinstance(env.bindings[alias], _InputBinding) or (
+                alias in self.graph.node_sources
+            ):
                 if any(
                     opt.name == "seek_end"
                     for opt in self.res.input_options.get(alias, ())
@@ -15814,8 +15857,7 @@ class _Lowerer:
             "is not a stream",
             node,
             fallback=select,
-            hint=f"read one output off the call, {declared.name}(...){fields.split(',')[0]}: "
-            f"it writes {fields}"
+            hint=f"read one output off the call: it writes {fields}"
             if fields
             else declared.signature,
         )
@@ -15848,7 +15890,18 @@ class _Lowerer:
         call = _call_parts(base)
         assert call is not None  # an Anonymous always splits
         output = self._node_output(declared, field_name, node, select)
+        if declared.is_packets:
+            self._check_packets_position(declared, base, select)
+        made = len(self.graph.nodes)
         instances, broadcast = self._node_instances(base, declared, call, env, select)
+        if declared.is_packets:
+            # Each new instance reads what the destination encodes, which the
+            # destination settles once its options are known.
+            self.packet_filter_calls.extend(
+                (instance.ref, declared, base, select)
+                for instance in instances
+                if instance.ref in list(self.graph.nodes)[made:]
+            )
         streams = tuple(
             _Stream(ref=ref, type=kind)
             for ref, kind in (
@@ -15979,6 +16032,7 @@ class _Lowerer:
             return found
         described = self._node_module(declared)
         assert described is not None  # what `_node_call` checked
+        self._check_node_export(declared, described, base, select)
         written = self._node_written(declared, call, base, select)
         params_by_name = {param.name: param for param in declared.params}
         ports: dict[str, exp.Expr] = {}
@@ -16042,6 +16096,25 @@ class _Lowerer:
             )
         self._node_calls[key] = (tuple(instances), length is not None)
         return self._node_calls[key]
+
+    def _check_node_export(
+        self,
+        declared: WasmFunction,
+        described: Described,
+        node: exp.Expr,
+        select: exp.Select,
+    ) -> None:
+        """The export a declaration names, against the one its module carries."""
+        if not described.name or described.name == declared.export:
+            return
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"function '{declared.name}' names the export '{declared.export}', "
+            f"and '{declared.module}' exports '{described.name}'",
+            node,
+            fallback=select,
+            hint=f"a module carries one node; write '{described.name}' as the export",
+        )
 
     def _node_length(
         self,
@@ -16114,10 +16187,9 @@ class _Lowerer:
             name: self._held_port(declared, name, argument, base, select)
             for name, argument in numbers.items()
         }
-        shape = self._node_shape(
-            declared, described, {**shape_params, **held}, bound, base, select
-        )
+        shape = self._node_shape(declared, described, shape_params, bound, base, select)
         self._check_node_ports(declared, shape, streams, numbers, base, select)
+        ports: dict[str, int] = {}
         for name, argument in numbers.items():
             port = shape.input(name)
             hold = port.pairing.hold if port is not None else None
@@ -16140,7 +16212,14 @@ class _Lowerer:
                     fallback=base,
                     hint=f"write the port once: {declared.signature}",
                 )
-            params[hold.port_param] = held[name]
+            ports[hold.port_param] = held[name]
+        if ports:
+            # The port is one of the call's params, and the shape is asked
+            # for the params the call ends up with.
+            params.update(ports)
+            shape = self._node_shape(
+                declared, described, {**shape_params, **ports}, bound, base, select
+            )
         inputs: list[FrameRef] = []
         names: list[str] = []
         for port in shape.inputs:
@@ -16152,19 +16231,10 @@ class _Lowerer:
                 names.append(port.name)
             if port.kind == "data" and port.schema is not None:
                 self._match_rows(declared, port, value, base, select)
-        kinds: list[StreamType] = []
-        for output in shape.outputs:
-            if output.kind == "packets":
-                raise _error(
-                    ErrorCode.UNSUPPORTED_SQL,
-                    f"the module '{declared.module}' writes packets on its "
-                    f"'{output.name}' output, which a node call cannot read yet",
-                    base,
-                    fallback=select,
-                    hint="read its frames or its rows; a node writing coded "
-                    "packets is not wired yet",
-                )
-            kinds.append(cast(StreamType, output.kind))
+        bound_kinds = {
+            name: value.streams[0].type for name, value in streams.items() if value.streams
+        }
+        kinds = [_output_kind(shape, output, bound_kinds) for output in shape.outputs]
         key = (
             declared.module,
             declared.export,
@@ -16259,7 +16329,8 @@ class _Lowerer:
                     fallback=select,
                     hint=f"pass a stream for '{port.name}': {declared.signature}",
                 )
-            if _port_kind(param) != port.kind:
+            coded = port.kind == "packets" and _port_kind(param) in ("video", "audio")
+            if _port_kind(param) != port.kind and not coded:
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,
                     f"{declared.name}() declares '{port.name}' as {param.type}, and "
@@ -16331,26 +16402,27 @@ class _Lowerer:
         """
         shape = instance.shape
         wanted = _port_kind(output)
+        made = self.graph.nodes[instance.ref].outputs
         if output.name:
             found = shape.output(output.name)
             if found is None:
-                made = ", ".join(f"'{o.name}'" for o in shape.outputs) or "none"
+                named = ", ".join(f"'{o.name}'" for o in shape.outputs) or "none"
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,
                     f"{declared.name}() returns the field '{output.name}', and the "
                     f"module '{declared.module}' makes no output '{output.name}'",
                     base,
                     fallback=select,
-                    hint=f"name the fields after the outputs it makes: {made}",
+                    hint=f"name the fields after the outputs it makes: {named}",
                 )
         else:
-            kinds = [o for o in shape.outputs if o.kind == wanted]
+            kinds = [o for i, o in enumerate(shape.outputs) if made[i] == wanted]
             if len(shape.outputs) == 1:
                 found = shape.outputs[0]
             elif len(kinds) == 1:
                 found = kinds[0]
             else:
-                made = ", ".join(f"'{o.name}' ({o.kind})" for o in shape.outputs)
+                listed = ", ".join(f"'{o.name}' ({o.kind})" for o in shape.outputs)
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,
                     f"{declared.name}() returns {output.type}, and the module "
@@ -16359,19 +16431,19 @@ class _Lowerer:
                     base,
                     fallback=select,
                     hint=f"name the one to read with RETURNS STRUCT(<output> "
-                    f"<type>, ...); it makes {made or 'nothing'}",
+                    f"<type>, ...); it makes {listed or 'nothing'}",
                 )
-        if found.kind != wanted:
+        index = shape.outputs.index(found)
+        if made[index] != wanted:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
                 f"{declared.name}() returns {output.type}"
                 + (f" as '{output.name}'" if output.name else "")
-                + f", and the module '{declared.module}' writes {found.kind} there",
+                + f", and the module '{declared.module}' writes {made[index]} there",
                 base,
                 fallback=select,
-                hint=f"declare it as {_PORT_TYPE_NAMES[found.kind]}",
+                hint=f"declare it as {_PORT_TYPE_NAMES[made[index]]}",
             )
-        index = shape.outputs.index(found)
         ref = instance.ref if len(shape.outputs) == 1 else f"{instance.ref}:{index}"
         if found.kind == "data":
             schema = found.schema
@@ -16381,7 +16453,7 @@ class _Lowerer:
                 self._data_schemas[ref] = (declared.name, schema)
             if output.annotation is not None:
                 self._node_rows[ref] = (declared, output.annotation, base)
-        return ref, found.kind
+        return ref, made[index]
 
     def _node_rows_column(self, node: exp.Expr) -> bool:
         """Whether `node` is a node's rows, through any spans reduced off them."""
@@ -17445,11 +17517,23 @@ class _Lowerer:
         already encoded without touching a picture.
         """
         described = self.describes[declared.module]
-        inputs = self.graph.nodes[ref].inputs
+        filtered = self.graph.nodes[ref]
+        shape = node_shape(filtered.filter, self.graph.node_shapes[ref]) if (
+            ref in self.graph.node_shapes
+        ) else None
         seen: dict[str, int] = {}
         pads: list[dict[str, object]] = []
-        for input_ref in inputs:
+        for position, input_ref in enumerate(filtered.inputs):
             kind = ref_type(self.graph, input_ref)
+            port = shape.input(filtered.ports[position]) if shape is not None else None
+            if shape is not None and (port is None or port.kind != "packets"):
+                # A node's other inputs are not encoded for it: rows, or
+                # frames it reads as they are.
+                pads.append({})
+                continue
+            if port is not None:
+                described = replace(described, video_codecs=port.accepts.codecs or None)
+                described = replace(described, audio_codecs=port.accepts.codecs)
             index = seen.get(kind, 0)
             seen[kind] = index + 1
             if kind not in asked and self._copies_onto_sink(input_ref, kind, described):
@@ -18079,6 +18163,16 @@ class _Lowerer:
                     fallback=node,
                     hint=f"its signature is {macro.signature}",
                 )
+        written_names = {argument.name for argument in call.named}
+        missing = next((name for name in macro.required if name not in written_names), None)
+        if missing is not None:
+            raise _error(
+                ErrorCode.UDF_ARG_TYPE,
+                f"{call.display}() needs '{missing}'",
+                node,
+                fallback=select,
+                hint=f"write it by name: {macro.signature}",
+            )
         per_row = any(_reads_row_column(argument.value, env) for argument in call.named)
         tuples = env.relation.tuples if per_row and env.relation is not None else []
         cache: dict[int, dict[str, object]] = {}

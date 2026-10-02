@@ -30,7 +30,6 @@ from fractions import Fraction
 from .errors import ErrorCode, FfrwdError
 from .ir import (
     MAX_SPAN,
-    MERGE_SPANS,
     ROWMERGE,
     FrameRef,
     Graph,
@@ -45,8 +44,11 @@ __all__ = [
     "HOLD_LIMIT",
     "NodeTiming",
     "OutputTiming",
+    "Paths",
     "Timing",
     "check_live_leads",
+    "paths_of",
+    "summary",
     "timing",
 ]
 
@@ -84,11 +86,14 @@ class NodeTiming:
     window: str
     waits: tuple[Wait, ...]
     delay: float | None
+    # What the query calls it.
+    called: str = ""
 
     def to_dict(self) -> dict[str, object]:
         return {
             "node": self.node,
             "module": self.module,
+            "called": self.called,
             "window": self.window,
             "inputs": [
                 {
@@ -113,10 +118,18 @@ class OutputTiming:
     delay: float | None
     holds: float
     held: int | None = None
+    # Where it is written: the file, the stream's place in it and its kind;
+    # a rows file names no stream.
+    path: str = ""
+    index: int | None = None
+    kind: str = ""
 
     def to_dict(self) -> dict[str, object]:
         written: dict[str, object] = {
             "ref": self.ref,
+            "path": self.path,
+            "index": self.index,
+            "kind": self.kind,
             "delay": self.delay,
             "holds": self.holds,
         }
@@ -137,7 +150,7 @@ class Timing:
         }
 
 
-class _Paths:
+class Paths:
     """Delays over one graph, each ref's counted once."""
 
     def __init__(self, graph: Graph, probes: Mapping[str, ProbeResult | None]) -> None:
@@ -173,9 +186,9 @@ class _Paths:
         if any(one is None for one in found):
             return None
         above = max((one for one in found if one is not None), default=0.0)
-        if node.filter == ROWMERGE and node.args.get(MERGE_SPANS):
-            span = node.args.get(MAX_SPAN)
-            return above + float(span) if isinstance(span, int | float) else None
+        span = node.args.get(MAX_SPAN) if node.filter == ROWMERGE else None
+        if isinstance(span, int | float) and not isinstance(span, bool):
+            return above + float(span)
         return above
 
     def ready(self, name: str) -> tuple[float | None, tuple[Wait, ...]]:
@@ -220,6 +233,10 @@ class _Paths:
         total = None if ready is None or window is None else ready + window
         self._ready[name] = (total, tuple(waits))
         return self._ready[name]
+
+    def latest(self, refs: list[FrameRef]) -> float | None:
+        """The latest of `refs`, or None where one of them has no size."""
+        return self._latest(refs)
 
     def _latest(self, refs: list[FrameRef]) -> float | None:
         found = [self.delay(ref) for ref in refs]
@@ -292,7 +309,20 @@ class _Paths:
         shape = self.shapes.get(name)
         if shape is not None and shape.clock.rate is not None and kind == "video":
             return Fraction(*shape.clock.rate)
+        if shape is not None and shape.clock.kind == "rate-of" and kind == "video":
+            # The rate of the first stream bound to the port it names.
+            ticked = next(
+                (ref for port, ref in zip(node.ports, node.inputs) if port == shape.clock.port),
+                None,
+            )
+            if ticked is not None:
+                return self.rate(ticked, kind)
         return self.rate(node.inputs[0], kind) if node.inputs else None
+
+
+def paths_of(graph: Graph, probes: Mapping[str, ProbeResult | None]) -> Paths:
+    """How late each ref of `graph` runs, counted as it is asked for."""
+    return Paths(graph, probes)
 
 
 def _fraction(fps: str | None) -> Fraction | None:
@@ -304,12 +334,20 @@ def _fraction(fps: str | None) -> Fraction | None:
     return found if found > 0 else None
 
 
-def timing(graph: Graph, probes: Mapping[str, ProbeResult | None]) -> Timing | None:
+def timing(
+    graph: Graph,
+    probes: Mapping[str, ProbeResult | None],
+    called: Mapping[str, str] | None = None,
+) -> Timing | None:
     """Each node module's window and readiness, and each written stream's
-    delay; None for a graph with no node module in it."""
+    delay; None for a graph with no node module in it. `called` names each
+    module path the way the query calls it."""
     if not graph.node_shapes:
         return None
-    paths = _Paths(graph, probes)
+    paths = Paths(graph, probes)
+    names = called or {}
+    # A track minted from rows runs as late as the node writing them.
+    rows_of = {sink.alias: ref for ref, sink in graph.rows_sinks.items() if sink.alias}
     nodes: list[NodeTiming] = []
     for name, shape in paths.shapes.items():
         node = graph.nodes[name]
@@ -322,23 +360,65 @@ def timing(graph: Graph, probes: Mapping[str, ProbeResult | None]) -> Timing | N
             window = window_words(clock, rate)
         elif shape.clock.kind == "rate" and shape.clock.rate is not None:
             window = f"rate {_rate_words(shape.clock.rate)}"
+        elif shape.clock.kind == "rate-of":
+            window = f"at the rate of {shape.clock.port}"
         else:
             window = shape.clock.kind
         ready, waits = paths.ready(name)
-        nodes.append(NodeTiming(name, node.filter, window, waits, ready))
+        called_as = names.get(node.filter, node.filter)
+        nodes.append(NodeTiming(name, node.filter, window, waits, ready, called_as))
     outputs: list[OutputTiming] = []
     for unit in graph.sinks:
-        delays = [paths.delay(output.ref) for output in unit.outputs]
+        refs = [
+            rows_of.get(src_parts(output.ref)[0], output.ref) if is_src(output.ref)
+            else output.ref
+            for output in unit.outputs
+        ]
+        delays = [paths.delay(ref) for ref in refs]
         latest = max((d for d in delays if d is not None), default=0.0)
-        for output, delay in zip(unit.outputs, delays):
+        for index, (output, delay) in enumerate(zip(unit.outputs, delays)):
             holds = 0.0 if delay is None else latest - delay
             per_second = paths.bytes_per_second(output.ref) if holds else None
             held = None if per_second is None else int(per_second * Fraction(holds))
-            outputs.append(OutputTiming(output.ref, delay, holds, held))
-    for ref in graph.rows_sinks:
-        if not any(output.ref == ref for output in outputs):
-            outputs.append(OutputTiming(ref, paths.delay(ref), 0.0))
+            outputs.append(
+                OutputTiming(
+                    output.ref, delay, holds, held, unit.path or "", index, output.type
+                )
+            )
+    for ref, sink in graph.rows_sinks.items():
+        if sink.path:
+            outputs.append(OutputTiming(ref, paths.delay(ref), 0.0, path=sink.path, kind="rows"))
     return Timing(tuple(nodes), tuple(outputs))
+
+
+def summary(timed: Timing) -> str:
+    """What ``explain --delays`` prints: a line per node, then per output.
+
+    A node says its window in streaming words and how each input it waits
+    for by interval is bounded; an output how far behind the source it runs,
+    and how long it waits for the latest stream written beside it.
+    """
+    lines: list[str] = []
+    for node in timed.nodes:
+        said = [node.window]
+        for wait in node.waits:
+            if wait.pairing != "interval":
+                continue
+            bound = "no bound" if wait.bound is None else f"at most {_seconds(wait.bound)}"
+            said.append(f"{wait.port} by interval, {bound}")
+        lines.append(f"{node.called}: {'; '.join(said)}")
+    for output in timed.outputs:
+        where = (
+            f"{output.path} ({output.kind})"
+            if output.index is None
+            else f"{output.path} stream {output.index} ({output.kind})"
+        )
+        late = "no known delay" if output.delay is None else (
+            f"{_seconds(output.delay)} behind the source"
+        )
+        waits = f", waits {_seconds(output.holds)}" if output.holds else ""
+        lines.append(f"{where}: {late}{waits}")
+    return "\n".join(lines)
 
 
 def _rate_words(rate: tuple[int, int]) -> str:
@@ -358,7 +438,7 @@ def check_live_leads(
     past the bound is late for good. `anchors` maps a module path to where
     the query named it and the function's name.
     """
-    paths = _Paths(graph, probes)
+    paths = Paths(graph, probes)
     for name, shape in paths.shapes.items():
         node = graph.nodes[name]
         clock = shape.clock_input

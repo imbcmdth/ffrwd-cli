@@ -110,6 +110,12 @@ STDERR_ROW = "ffrwd:row "
 ROWS_DOCUMENT = "ffrwd:rows:"
 
 
+# Where a node's params go when they are too long for a command line, or not
+# a flat list of values: ``ffrwd:params:<process>:<node>``. A placeholder
+# like a rows document's, which a run resolves to a file of the params.
+PARAMS_FILE = "ffrwd:params:"
+
+
 def is_rows_document(path: str) -> bool:
     """True for a path that is one of those placeholders."""
     return path.startswith(ROWS_DOCUMENT)
@@ -1055,10 +1061,7 @@ class Graph:
             for alias, bounds in raw_input_trims.items():
                 assert isinstance(bounds, list)
                 start, end = bounds
-                input_trims[str(alias)] = (
-                    float(start) if start is not None else None,
-                    float(end) if end is not None else None,
-                )
+                input_trims[str(alias)] = (_seconds(start), _seconds(end))
 
         raw_input_options = d.get("input_options")
         input_options: dict[str, dict[str, object]] = {}
@@ -1194,6 +1197,17 @@ class Graph:
             node_shapes=node_shapes,
             node_sources=node_sources,
         )
+
+
+def _seconds(value: object) -> float | None:
+    """A written bound as it was: a whole number stays one, so it reads back
+    the way it was written."""
+    if value is None:
+        return None
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    assert isinstance(value, int | float | str)
+    return float(value)
 
 
 _MergeKey = tuple[str, tuple[tuple[str, object], ...]]
