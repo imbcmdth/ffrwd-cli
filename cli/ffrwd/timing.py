@@ -32,6 +32,7 @@ from fractions import Fraction
 
 from .errors import ErrorCode, FfrwdError
 from .ir import (
+    LEAKY,
     MAX_SPAN,
     ROWMERGE,
     FrameRef,
@@ -358,6 +359,8 @@ def stream_rate(
     probes: Mapping[str, ProbeResult | None],
     shape_of: Callable[[str], NodeShape | None],
     ref: FrameRef,
+    *,
+    through_nodes: bool = True,
 ) -> Fraction | None:
     """The rate of the stream `ref` names, as known before the run.
 
@@ -368,11 +371,17 @@ def stream_rate(
     its clock's rate: a rate clock's own, the rate of the port a `rate-of`
     clock names, the clock input's rate over its stride. A node's sound is
     at the rate its format says, else the rate of the input it follows.
+
+    Without `through_nodes`, a stream a node writes, a node read in FROM
+    included, has none: the host hints such a stream with nothing, since a
+    network binds it by its label.
     """
     seen: set[str] = set()
     while True:
         if is_src(ref):
             alias, kind, index = src_parts(ref)
+            if not through_nodes and alias in graph.node_sources:
+                return None
             probe = probes.get(alias)
             streams = probe.by_type(kind) if probe is not None else []
             if index >= len(streams):
@@ -391,6 +400,8 @@ def stream_rate(
         if kind not in ("video", "audio"):
             return None
         shape = shape_of(name)
+        if not through_nodes and (shape is not None or node.filter == LEAKY):
+            return None
         if shape is not None:
             return _node_output_rate(graph, probes, shape_of, name, shape, pad, kind)
         if node.filter in _RATE_LOST:

@@ -5336,7 +5336,7 @@ class _Partitioner:
         """The rate of `ref` as an edge carrying it in `wire` hands it on."""
         if isinstance(wire, AudioFormat) and wire.required_rate:
             return Fraction(wire.required_rate)
-        return stream_rate(self.g, self.probes, self.node_shapes.get, ref)
+        return stream_rate(self.g, self.probes, self.node_shapes.get, ref, through_nodes=False)
 
     def _region_listens(
         self, members: Sequence[str], names: Mapping[str, str]

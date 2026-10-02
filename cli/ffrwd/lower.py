@@ -2106,6 +2106,20 @@ def _sink_wants(wants: Wants) -> SinkWants:
     return "all" if wants == "timing" else wants
 
 
+# How many times a node's shape is asked again for the bound list the host
+# will build from what the last one said, before the last answer stands.
+_SHAPE_ROUNDS = 3
+
+
+def _as_the_host_binds(shape: NodeShape, bound: Sequence[Binding]) -> list[Binding]:
+    """`bound` as the host rebuilds it for a network spelled from `shape`: the
+    ports in the order the shape declares them, which is the order the chain
+    names them, and each sound at the rate its port conforms it to."""
+    order = {port.name: at for at, port in enumerate(shape.inputs)}
+    conformed = _conformed(shape, bound)
+    return sorted(conformed, key=lambda one: order.get(one.input, len(order)))
+
+
 def _conformed(shape: NodeShape, bound: Sequence[Binding]) -> list[Binding]:
     """`bound` with each sound's rate the one its port conforms it to: the
     first rate an audio port accepts, where it names any. A port read for
@@ -16361,9 +16375,11 @@ class _Lowerer:
             for name, argument in numbers.items()
         }
         shape = self._node_shape(declared, described, shape_params, bound, base, select)
-        rated = _conformed(shape, bound)
-        if rated != bound:
-            bound = rated
+        for _ in range(_SHAPE_ROUNDS):
+            settled = _as_the_host_binds(shape, bound)
+            if settled == bound:
+                break
+            bound = settled
             shape = self._node_shape(declared, described, shape_params, bound, base, select)
         self._check_node_ports(declared, shape, {**streams, **fed}, numbers, base, select)
         ports: dict[str, object] = {}
@@ -16504,8 +16520,10 @@ class _Lowerer:
         return instance
 
     def _stream_rate(self, ref: FrameRef) -> Fraction | None:
-        """The rate the stream `ref` runs at, as far as the compile knows it."""
-        return stream_rate(self.graph, self.probes, self._made_shape, ref)
+        """The rate a node's shape is told the stream `ref` runs at."""
+        return stream_rate(
+            self.graph, self.probes, self._made_shape, ref, through_nodes=False
+        )
 
     def _made_shape(self, name: str) -> NodeShape | None:
         found = self._made_shapes.get(name)
@@ -18046,6 +18064,10 @@ class _Lowerer:
         of each kind the query hands it is the query's to say. The node is
         spelled by its ports in the network, and the rows it emits are the
         run's, as a packet sink's are.
+
+        Which ports there are is asked with nothing bound; once the SELECT's
+        streams are on them, the shape is asked again with each port and a
+        hint per stream bound there, which is what the host asks at run time.
         """
         described = self._node_module(declared)
         assert described is not None  # what the caller checked
@@ -18056,6 +18078,56 @@ class _Lowerer:
             declared, described, call, node, select, env, {}, first=at
         )
         shape = self._node_shape(declared, described, params, [], anchor, select)
+        ports = self._node_sink_ports(declared, shape, node, select)
+        view = _sink_view(described, ports)
+        self._node_sinks[declared.module] = (view, shape)
+        value = self._lower_sink_call(node, declared, view, call, env, select)
+        ref = self.graph.module_sinks[-1]
+        made = self.graph.nodes[ref]
+        kinds = [ref_type(self.graph, read) for read in made.inputs]
+        named = {kind: port.name for kind, port in ports.items() if port is not None}
+        bound = [
+            Binding(
+                name,
+                tuple(
+                    StreamHint(self._stream_rate(read))
+                    for read, kind in zip(made.inputs, kinds)
+                    if named.get(kind) == name
+                ),
+            )
+            for name in dict.fromkeys(named[kind] for kind in kinds if kind in named)
+        ]
+        shape = self._node_shape(declared, described, params, bound, anchor, select)
+        ports = self._node_sink_ports(declared, shape, node, select)
+        named = {kind: port.name for kind, port in ports.items() if port is not None}
+        if any(kind not in named for kind in kinds):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"{declared.name}() returns sink, and with the streams the query "
+                f"hands it the module '{declared.module}' reads none of "
+                + ", ".join(sorted({kind for kind in kinds if kind not in named})),
+                node,
+                fallback=select,
+                hint="hand the sink only the kinds of stream its shape reads",
+            )
+        self._node_sinks[declared.module] = (_sink_view(described, ports), shape)
+        made.ports = [named[kind] for kind in kinds]
+        emits = described.rows_schema is not None
+        if emits:
+            made.outputs = ["data"]
+        made.out_ports = [EMITTED_ROWS_PORT] if emits else []
+        self.graph.node_shapes[ref] = dict(shape.raw)
+        return value
+
+    def _node_sink_ports(
+        self,
+        declared: WasmFunction,
+        shape: NodeShape,
+        node: exp.Expr,
+        select: exp.Select,
+    ) -> dict[str, InputPort | None]:
+        """The port a node sink's shape reads each kind of stream on, refused
+        where it makes outputs or reads no coded packets."""
         ports = {kind: _sink_port(shape, kind) for kind in ("video", "audio", "data")}
         if shape.outputs or ports["video"] is None and ports["audio"] is None:
             raise _error(
@@ -18067,19 +18139,7 @@ class _Lowerer:
                 hint="a node at a COPY's TO reads coded packets and data and makes "
                 "no output; declare this one as what it is",
             )
-        view = _sink_view(described, ports)
-        self._node_sinks[declared.module] = (view, shape)
-        value = self._lower_sink_call(node, declared, view, call, env, select)
-        ref = self.graph.module_sinks[-1]
-        made = self.graph.nodes[ref]
-        named = {kind: port.name for kind, port in ports.items() if port is not None}
-        made.ports = [named[ref_type(self.graph, read)] for read in made.inputs]
-        emits = described.rows_schema is not None
-        if emits:
-            made.outputs = ["data"]
-        made.out_ports = [EMITTED_ROWS_PORT] if emits else []
-        self.graph.node_shapes[ref] = dict(shape.raw)
-        return value
+        return ports
 
     def _lower_row_reading_sink_call(
         self,

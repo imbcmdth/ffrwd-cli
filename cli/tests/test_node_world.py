@@ -28,7 +28,7 @@ from ffrwd.parser import parse, resolve
 from ffrwd.probe import ProbeResult, StreamMeta
 from ffrwd.processes import ProcessPlan
 from ffrwd.registry import Registry, load_reference
-from ffrwd.timing import check_live_leads, summary, timing
+from ffrwd.timing import check_live_leads, paths_of, summary, timing
 from ffrwd.warnings import FfrwdWarning, WarningCode
 from ffrwd.wasm import WORLDS, Described
 
@@ -1367,6 +1367,29 @@ def test_a_nodes_picture_into_a_node_sink_is_encoded_and_its_data_is_not_copied(
     assert copies == []
 
 
+def test_a_node_sink_is_shaped_again_with_every_stream_the_select_binds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(SHAPES, "publish.wasm", _publish)
+    monkeypatch.setitem(
+        _PARAMS, "publish.wasm", {"relay": {"type": "string"}, "broadcast": {"type": "string"}}
+    )
+    asked = _Asked()
+    _lowered(
+        _PUBLISH
+        + "CREATE FUNCTION spotted(v video_stream) RETURNS data_stream "
+        "AS 'spot.wasm', 'spot' LANGUAGE wasm;\n"
+        "COPY (SELECT f.video[1], f.audio[1], spotted(f.video[1]) AS spots "
+        "FROM input('f.mp4') f) TO publish('https://relay', 'b') "
+        "WITH (video_codec 'libx264', audio_codec 'aac')",
+        asked=asked,
+    )
+    assert _hints(asked, "publish.wasm") == [
+        {},
+        {"video": [Fraction(25)], "audio": [Fraction(48000)], "data": [None]},
+    ]
+
+
 def test_the_rows_a_node_emits_are_the_runs_on_its_stdout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1635,9 +1658,12 @@ def test_the_shape_is_told_each_bound_streams_rate() -> None:
     assert _hints(tiled, "tile.wasm") == [{"v": [Fraction(25)] * 3}]
 
 
-def test_a_nodes_picture_runs_at_its_clock_over_its_stride(
+def test_a_stream_a_node_writes_is_hinted_with_no_rate_and_timed_at_its_clock(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """The host binds a node's output by its label and hints it with nothing,
+    so the compile does too; the delays still read it at its clock's rate."""
+
     def hopping(params: Mapping[str, object], bound: Sequence[str]) -> dict[str, object]:
         shape = _matte(params, bound)
         inputs = shape["inputs"]
@@ -1647,19 +1673,21 @@ def test_a_nodes_picture_runs_at_its_clock_over_its_stride(
 
     monkeypatch.setitem(SHAPES, "matte.wasm", hopping)
     asked = _Asked()
-    _lowered(
+    graph = _lowered(
         "COPY (WITH m AS (SELECT (matte(f.video[1])).* FROM input('f.mp4') f) "
         "SELECT dim(m.mask, m.spots) FROM m) TO 'dimmed.mkv'",
         asked=asked,
     )
-    assert _hints(asked, "dim.wasm") == [{"v": [Fraction(25, 2)], "boxes": [None]}]
+    assert _hints(asked, "dim.wasm") == [{"v": [None], "boxes": [None]}]
+    (dim,) = [node for node in graph.nodes.values() if node.filter == "dim.wasm"]
+    assert paths_of(graph, _probes()).rate(dim.inputs[0]) == Fraction(25, 2)
     ticked = _Asked()
     _lowered(
         "COPY (SELECT ring(s.video[1], spot(s.video[1])) FROM ticker('hi', fps => 30) s) "
         "TO 'ringed.mp4'",
         asked=ticked,
     )
-    assert _hints(ticked, "spot.wasm") == [{"v": [Fraction(30)]}]
+    assert _hints(ticked, "spot.wasm") == [{"v": [None]}]
 
 
 def test_a_sound_conformed_to_its_port_is_hinted_at_the_rate_it_arrives_at(
@@ -1679,6 +1707,27 @@ def test_a_sound_conformed_to_its_port_is_hinted_at_the_rate_it_arrives_at(
         rate=44100,
     )["sidecar0"]
     assert _pad_after_input(sidecar)["rate"] == {"num": 48000, "den": 1}
+
+
+def test_the_shape_is_asked_again_with_the_ports_in_the_order_it_declares(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def reversed_burn(params: Mapping[str, object], bound: Sequence[str]) -> dict[str, object]:
+        shape = _burn(params, bound)
+        inputs = shape["inputs"]
+        assert isinstance(inputs, list)
+        return {**shape, "inputs": inputs[::-1]}
+
+    monkeypatch.setitem(SHAPES, "burn.wasm", reversed_burn)
+    asked = _Asked()
+    _lowered(
+        "COPY (SELECT burn(f.video[1], f.audio[1], hear(f.audio[1])), f.audio[1]" + _FROM,
+        asked=asked,
+    )
+    assert [one[2] for one in asked.asked if one[0] == "burn.wasm"] == [
+        ("v", "a", "words"),
+        ("words", "a", "v"),
+    ]
 
 
 def test_the_bound_list_reaches_the_sidecar_as_json(monkeypatch: pytest.MonkeyPatch) -> None:
