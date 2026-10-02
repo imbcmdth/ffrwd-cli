@@ -2888,7 +2888,9 @@ class _Partitioner:
                     continue
                 seen.add(ref)
                 wanted.append((ref, name))
-        if not any(name in self.node_shapes for name in members):
+        if not any(name in self.node_shapes for name in members) or any(
+            name in self.g.packet_sinks for name in members
+        ):
             return wanted
         kept: dict[tuple[FrameRef, StreamFormat], FrameRef] = {}
         shared: list[tuple[FrameRef, str]] = []
@@ -3991,7 +3993,12 @@ class _Partitioner:
         process hands another travel interleaved on one pipe, and no stream of
         it can wait on another pipe.
         """
-        nodes = {sidecar.id for sidecar in self.sidecars if sidecar.node_network}
+        # A sink's pads stay one input apiece, each with what it says of its row.
+        nodes = {
+            sidecar.id
+            for sidecar in self.sidecars
+            if sidecar.node_network and not sidecar.packet_sink
+        }
         if not nodes:
             return
         for index, edge in enumerate(self.edges):
@@ -4595,7 +4602,9 @@ class _Partitioner:
         producer = _ref_node(ref)
         if producer is not None and producer in self.node_shapes:
             return self._node_output_wire(producer, _ref_pad(ref), ref)
-        if target is not None and target in self.g.packet_filters:
+        if target is not None and (
+            target in self.g.packet_filters or target in self.g.packet_sinks
+        ):
             return None  # its destination settled what encodes for it
         if target is not None and target in self.node_shapes:
             node = self.g.nodes[target]
@@ -5072,8 +5081,8 @@ class _Partitioner:
         # A SINK MODULE is one too: the network string names its pad, and the
         # null output that pad is mapped to carries nothing.
         for name in members:
-            if name not in self.g.module_sinks:
-                continue
+            if name not in self.g.module_sinks or name in self.node_shapes:
+                continue  # a node sink makes no output but the rows it emits
             sinks.append(
                 SinkUnit(
                     outputs=[

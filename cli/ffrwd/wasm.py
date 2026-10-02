@@ -2303,7 +2303,9 @@ def _node_network_args(
         argv += ["-f", EDGE_FORMAT, path]
     for index, (targets, document) in enumerate(zip(groups[streams:], process.rows)):
         given_path = documents[index] if index < len(documents) else ""
-        path = document.sink.path or given_path or f"pipe:{streams + index + 1}"
+        # Rows nothing reads are the run's own, on stdout.
+        unread = STDOUT if not document.sink.alias else f"pipe:{streams + index + 1}"
+        path = document.sink.path or given_path or unread
         for target in targets:
             argv += ["-map", target]
         argv += ["-f", document.sink.container, path]

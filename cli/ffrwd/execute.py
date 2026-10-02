@@ -1090,6 +1090,8 @@ def keeps_clock(edge: StreamEdge, plan: ProcessPlan) -> bool:
     reorder delay to take out. A codec package's encoder writes each packet
     at the time of the frame it coded, and its header says how deep it
     reorders rather than shifting anything, so its packets keep the clock.
+    A node network's packets keep the clock its inputs had, and a node
+    reading nothing writes its own, as a source module does.
     """
     if isinstance(edge.format, DataFormat) or not encoded(edge.format):
         return True
@@ -1098,7 +1100,7 @@ def keeps_clock(edge: StreamEdge, plan: ProcessPlan) -> bool:
         return False
     if producer.packet_source or producer.codec == "encode":
         return True
-    if not producer.packet_filter:
+    if not producer.packet_filter and not producer.node_network:
         return False
     return all(
         keeps_clock(e, plan) for e in plan.stream_edges if e.target == producer.id
@@ -2940,11 +2942,11 @@ def _cpu_seconds(proc: subprocess.Popen[bytes] | RemoteProcess) -> float | None:
 
 
 def _writes_rows_to_stdout(process: Process) -> bool:
-    """True for a sink region or a data filter whose rows name no file: they
-    ride its stdout."""
+    """True for a sink region, a data filter or a node network whose rows
+    name no file: they ride its stdout, and its streams take named pipes."""
     return (
         isinstance(process, SidecarProcess)
-        and (process.sink or process.data_filter)
+        and (process.sink or process.data_filter or process.node_network)
         and any(
             not document.sink.alias and not document.sink.path
             for document in process.rows

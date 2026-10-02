@@ -504,6 +504,7 @@ from ffrwd.wasm import (
     CODEC_ENCODERS,
     CODEC_WORLD,
     DATA_FILTER_WORLD,
+    EMITTED_ROWS_PORT,
     FFMPEG_SAMPLE_FMTS,
     PACKET_FILTER_WORLD,
     PACKET_SOURCE_WORLD,
@@ -521,6 +522,7 @@ from ffrwd.wasm import (
     PacketRead,
     ProbeSource,
     ReadPackets,
+    SinkArity,
     SinkWants,
     _grant_args,
     audio_encoder_codec,
@@ -2033,6 +2035,46 @@ def _sink_alias(argument: exp.Expr) -> str | None:
     """The alias a sink call's argument carried as a SELECT column, if any."""
     written = argument.meta.get(SINK_ALIAS)
     return written if isinstance(written, str) and written else None
+
+
+def _param_takes_list(described: Described, name: str) -> bool:
+    """Whether the module's params schema takes `name` as an array."""
+    properties = described.params_schema.get("properties")
+    found = properties.get(name) if isinstance(properties, dict) else None
+    return isinstance(found, dict) and found.get("type") == "array"
+
+
+def _sink_port(shape: NodeShape, kind: StreamType) -> InputPort | None:
+    """The input of a node sink's shape that takes streams of `kind`: its data
+    port, or a coded port named for the kind, an unnamed one taking video."""
+    if kind == "data":
+        return next((port for port in shape.inputs if port.kind == "data"), None)
+    coded = [port for port in shape.inputs if port.kind == "packets"]
+    named = next((port for port in coded if port.name == kind), None)
+    if named is not None or kind == "audio":
+        return named
+    return next((port for port in coded if port.name != "audio"), None)
+
+
+def _sink_view(described: Described, ports: Mapping[str, InputPort | None]) -> Described:
+    """A node sink as the packet sink its ports describe: how many streams of
+    each kind it reads, the codecs it takes, and how much of each it wants."""
+
+    def arity(port: InputPort | None) -> SinkArity:
+        return "none" if port is None else "many" if port.many else "one"
+
+    video, audio, data = ports["video"], ports["audio"], ports["data"]
+    first = next((port for port in (video, audio, data) if port is not None), None)
+    return replace(
+        described,
+        video_codecs=tuple(video.accepts.codecs) if video is not None else (),
+        audio_codecs=tuple(audio.accepts.codecs) if audio is not None else (),
+        video_streams=arity(video),
+        audio_streams=arity(audio),
+        data_streams=arity(data),
+        wants=first.accepts.wants if first is not None else "all",
+        packet_filter=False,
+    )
 
 
 def _sink_stream_count(node: exp.Expr, arguments: int) -> int:
@@ -4075,6 +4117,9 @@ class _Lowerer:
         # A node's rows pad -> its declaration, its record and the call, for
         # the track or rows file a COPY selecting it writes.
         self._node_rows: dict[FrameRef, tuple[WasmFunction, Annotation, exp.Anonymous]] = {}
+        # A node at a COPY's TO, by module: the packet sink its shape reads as,
+        # and the shape.
+        self._node_sinks: dict[str, tuple[Described, NodeShape]] = {}
         self.probes = probes
         # Why an alias in `probes` maps to None, when there is a specific
         # answer -- unset (or no answer for this alias) reads the same as an
@@ -5261,7 +5306,10 @@ class _Lowerer:
         filter calls start.
         """
         declared = self.res.wasm[raw.module_sink]
-        described = self.describes.get(declared.module)
+        node_sink = self._node_sinks.get(declared.module)
+        described = (
+            node_sink[0] if node_sink is not None else self.describes.get(declared.module)
+        )
         if described is None or not described.packet_sink:
             self._no_packets_here(raw, first_filter, declared)
             if raw.options:
@@ -8853,6 +8901,7 @@ class _Lowerer:
         ref = self.ctx.node(declared.module, params, [], kinds)
         self.graph.nodes[ref].out_ports = [output.name for output in shape.outputs]
         self.graph.node_shapes[ref] = dict(shape.raw)
+        self._emits_rows(ref, described)
         self.graph.node_sources[alias] = ref
 
     def _place_node_sources(self) -> None:
@@ -15625,6 +15674,8 @@ class _Lowerer:
         :meth:`_written_annotation` lowers the producer once and hands back
         the pad the module reads.
         """
+        if declared.is_sink and self._node_module(declared) is not None:
+            return self._lower_node_sink(node, declared, call, env, select)
         if self._node_module(declared) is not None:
             lowered = self._lower_node_expr(node, env, select)
             assert lowered is not None  # a call to a node module
@@ -15828,7 +15879,7 @@ class _Lowerer:
         if not isinstance(base, exp.Anonymous):
             return None
         declared = self.res.wasm.get(str(base.name).lower())
-        if declared is None or self._node_module(declared) is None:
+        if declared is None or declared.is_sink or self._node_module(declared) is None:
             return None
         return base, declared, field_name
 
@@ -16228,17 +16279,22 @@ class _Lowerer:
         fed = {
             name: value
             for name, value in streams.items()
-            if len(value.streams) == 1 and _lateral_parts(value.streams[0].ref) is not None
+            if value.streams
+            and all(_lateral_parts(stream.ref) is not None for stream in value.streams)
         }
+        # A lateral's port is bound, to the host's own stream, so the shape
+        # is asked with it; what it binds in the network is nothing.
+        bound = [
+            param.name for param in declared.ports if param.name in streams
+        ]
         streams = {name: value for name, value in streams.items() if name not in fed}
-        bound = [param.name for param in declared.ports if param.name in streams]
         held = {
             name: self._held_port(declared, name, argument, base, select)
             for name, argument in numbers.items()
         }
         shape = self._node_shape(declared, described, shape_params, bound, base, select)
-        self._check_node_ports(declared, shape, streams, numbers, base, select)
-        ports: dict[str, int] = {}
+        self._check_node_ports(declared, shape, {**streams, **fed}, numbers, base, select)
+        ports: dict[str, object] = {}
         for name, argument in numbers.items():
             port = shape.input(name)
             hold = port.pairing.hold if port is not None else None
@@ -16264,11 +16320,23 @@ class _Lowerer:
             ports[hold.port_param] = held[name]
         feeds: list[tuple[int, _Fed, Described]] = []
         for name, lateral in fed.items():
-            stream = lateral.streams[0]
+            first_stream = lateral.streams[0]
             port = shape.input(name)
             hold = port.pairing.hold if port is not None else None
             if port is None or hold is None or hold.port_param is None:
-                raise self._lateral_refusal(stream.ref, f"{declared.name}()", base)
+                raise self._lateral_refusal(first_stream.ref, f"{declared.name}()", base)
+            listed = _param_takes_list(described, hold.port_param)
+            if len(lateral.streams) > 1 and not listed:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"{declared.name}() hands '{name}' {len(lateral.streams)} run-time "
+                    f"laterals, each a connection on a port of its own, and the module "
+                    f"'{declared.module}' takes one port in '{hold.port_param}'",
+                    base,
+                    fallback=select,
+                    hint=f"rebuild the module taking '{hold.port_param}' as an array of "
+                    "ports, or feed it one lateral",
+                )
             if hold.port_param in written:
                 raise _error(
                     ErrorCode.UDF_ARG_TYPE,
@@ -16278,36 +16346,35 @@ class _Lowerer:
                     fallback=base,
                     hint=f"leave '{hold.port_param}' out of the call",
                 )
-            one = _Fed(
-                Feeder(
-                    input=0,
-                    port_param=hold.port_param,
-                    kind=stream.type,
-                    group=hold.group or hold.port_param,
-                ),
-                next(param for param in declared.ports if param.name == name),
-                stream,
-                self._stream_sources(stream.ref),
-                base,
-            )
-            number = self._feeder_port(one, select)
-            ports[hold.port_param] = number
             # What the lateral's instances write is what the port takes,
             # conformed by them as a feeder's are.
             taken = port.accepts
-            feeds.append(
-                (
-                    number,
-                    one,
-                    replace(
-                        described,
-                        pixel_formats=taken.pixel_formats or WIRE_PIX_FMTS[:1],
-                        sample_formats=taken.sample_formats or WIRE_SAMPLE_FMTS[:1],
-                        sample_rates=taken.sample_rates,
-                        channel_counts=taken.channel_counts,
-                    ),
-                )
+            conformed = replace(
+                described,
+                pixel_formats=taken.pixel_formats or WIRE_PIX_FMTS[:1],
+                sample_formats=taken.sample_formats or WIRE_SAMPLE_FMTS[:1],
+                sample_rates=taken.sample_rates,
+                channel_counts=taken.channel_counts,
             )
+            numbers_given: list[int] = []
+            for stream in lateral.streams:
+                one = _Fed(
+                    Feeder(
+                        input=0,
+                        port_param=hold.port_param,
+                        kind=stream.type,
+                        group=hold.group or hold.port_param,
+                    ),
+                    next(param for param in declared.ports if param.name == name),
+                    stream,
+                    self._stream_sources(stream.ref),
+                    base,
+                )
+                number = self._feeder_port(one, select)
+                if number not in numbers_given:
+                    numbers_given.append(number)
+                feeds.append((number, one, conformed))
+            ports[hold.port_param] = numbers_given if listed else numbers_given[0]
         if ports:
             # The port is one of the call's params, and the shape is asked
             # for the params the call ends up with.
@@ -16344,6 +16411,7 @@ class _Lowerer:
         made.ports = names
         made.out_ports = [output.name for output in shape.outputs]
         self.graph.node_shapes[ref] = dict(shape.raw)
+        self._emits_rows(ref, described)
         clock = shape.clock.port if shape.clock.port in names else None
         timed = inputs[names.index(clock)] if clock is not None else (inputs or [""])[0]
         for number, one, feeding in feeds:
@@ -16362,6 +16430,17 @@ class _Lowerer:
         instance = _NodeInstance(ref=ref, shape=shape)
         self._node_refs[key] = instance
         return instance
+
+    def _emits_rows(self, ref: FrameRef, described: Described) -> None:
+        """The rows a node emits beside its ports, where it says it does: one
+        more output, which the run writes as its rows, as a sink's are."""
+        if described.rows_schema is None:
+            return
+        made = self.graph.nodes[ref]
+        pad = len(made.outputs)
+        made.outputs = [*made.outputs, "data"]
+        made.out_ports = [*made.out_ports, EMITTED_ROWS_PORT]
+        self.graph.rows_sinks[f"{ref}:{pad}"] = RowsSink(container=_ROWS_CONTAINER)
 
     def _written_tags(self, stream: _Stream) -> dict[str, str]:
         """The tags the query wrote on `stream`, which nothing on the edge to
@@ -17062,7 +17141,8 @@ class _Lowerer:
             argument = call.args[0]
             got = self._classify(argument, env, select)
             value = self._lower_expr(argument, env, select) if got == "data" else None
-            if value is None or value.is_array or len(value.streams) != 1:
+            # A one-element array, a column of a one-row source, is its element.
+            if value is None or len(value.streams) != 1:
                 if value is not None:
                     shown = f"{len(value.streams)} of them"
                 elif got in _STREAM_KINDS:
@@ -17856,6 +17936,56 @@ class _Lowerer:
         # Nothing downstream reads a sink: the value carries no streams, the
         # way a rows projection's does not.
         return _Value(type=pads[0].type, streams=(), is_array=False)
+
+    def _lower_node_sink(
+        self,
+        node: exp.Expr,
+        declared: WasmFunction,
+        call: _Call,
+        env: _Env,
+        select: exp.Select,
+    ) -> _Value:
+        """A node at a COPY's TO: a sink, read as a packet sink is.
+
+        Its shape for the call's params has no outputs; its inputs take the
+        SELECT's streams by kind, coded packets fronted by the encoder the
+        COPY's WITH shapes, and data. Each input is a many-port, so how many
+        of each kind the query hands it is the query's to say. The node is
+        spelled by its ports in the network, and the rows it emits are the
+        run's, as a packet sink's are.
+        """
+        described = self._node_module(declared)
+        assert described is not None  # what the caller checked
+        at = _sink_stream_count(node, len(call.args))
+        anchor = _unwrap(node)
+        assert isinstance(anchor, exp.Anonymous)  # a sink call is one
+        params = self._wasm_params(
+            declared, described, call, node, select, env, {}, first=at
+        )
+        shape = self._node_shape(declared, described, params, [], anchor, select)
+        ports = {kind: _sink_port(shape, kind) for kind in ("video", "audio", "data")}
+        if shape.outputs or ports["video"] is None and ports["audio"] is None:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"{declared.name}() returns sink, and the module '{declared.module}' "
+                + ("makes outputs" if shape.outputs else "reads no coded packets"),
+                node,
+                fallback=select,
+                hint="a node at a COPY's TO reads coded packets and data and makes "
+                "no output; declare this one as what it is",
+            )
+        view = _sink_view(described, ports)
+        self._node_sinks[declared.module] = (view, shape)
+        value = self._lower_sink_call(node, declared, view, call, env, select)
+        ref = self.graph.module_sinks[-1]
+        made = self.graph.nodes[ref]
+        named = {kind: port.name for kind, port in ports.items() if port is not None}
+        made.ports = [named[ref_type(self.graph, read)] for read in made.inputs]
+        emits = described.rows_schema is not None
+        made.outputs = ["data"] if emits else []
+        made.out_ports = [EMITTED_ROWS_PORT] if emits else []
+        self.graph.node_shapes[ref] = dict(shape.raw)
+        return value
 
     def _lower_row_reading_sink_call(
         self,

@@ -11,6 +11,7 @@ from __future__ import annotations
 import functools
 import json
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -767,13 +768,14 @@ def _plan_argv(
     monkeypatch: pytest.MonkeyPatch,
     rate: int = 48000,
     colour: Mapping[str, str] | None = None,
+    describe: Callable[[str], Described] = _node,
 ) -> dict[str, list[str]]:
     """Each process of the compiled plan as the printed command shows it."""
     probes = _probes(rate, colour)
     monkeypatch.setattr(
         "ffrwd.compiler.probe_path", lambda path, args=(), **kw: probes[path[0]]
     )
-    compiled = compile_all(_declared(query), describe=_node, shape=_Asked())
+    compiled = compile_all(_declared(query), describe=describe, shape=_Asked())
     assert compiled.plan is not None
     return plan_argv(
         compiled.plan,
@@ -1212,6 +1214,92 @@ def test_a_node_source_writing_coded_packets_binds_one_row_per_rendition() -> No
     (sub,) = [node for node in graph.nodes.values() if node.filter == "sub.wasm"]
     assert sub.outputs == ["video", "audio", "video"]
     assert [output.ref for output in graph.sinks[0].outputs] == [f"{sub.id}:0"]
+
+
+def test_a_node_sources_coded_streams_keep_their_time_at_a_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(SHAPES, "sub.wasm", _subscribe)
+    argv = _plan_argv(
+        "CREATE FUNCTION sub(relay text) RETURNS source AS 'sub.wasm', 'sub' LANGUAGE wasm;\n"
+        "COPY (SELECT v.video[1], v.audio[1] FROM sub('r') v WHERE v.height = 720) "
+        "TO 'out.mkv'",
+        monkeypatch,
+    )
+    assert argv["ffmpeg0"][:2] == ["ffmpeg", "-copyts"]
+
+
+def _arrival(name: str, kind: str, codecs: Sequence[str] = ()) -> dict[str, object]:
+    return {
+        "name": name, "kind": kind, "required": name == "video", "many": True,
+        "pairing": {"kind": "arrival"}, "rows": "ignore", "window": 1, "stride": 1,
+        "accepts": {"codecs": list(codecs)},
+    }
+
+
+def _publish(params: Mapping[str, object], bound: Sequence[str]) -> dict[str, object]:
+    """ffrwd/moq's publish: coded pictures, coded sound and data, by arrival."""
+    return _shape(
+        [_arrival("video", "packets", ["h264"]), _arrival("audio", "packets", ["aac"]),
+         _arrival("data", "data")],
+        [],
+        {"kind": "rate", "num": 50, "den": 1},
+    )
+
+
+_PUBLISH = (
+    "CREATE FUNCTION publish(relay text, broadcast text) RETURNS sink "
+    "AS 'publish.wasm', 'publish' LANGUAGE wasm;\n"
+)
+
+
+def _reporting(*reporting: str) -> Callable[[str], Described]:
+    """`_node`, with the modules named emitting rows of their own."""
+
+    def describe(path: str) -> Described:
+        described = _node(path)
+        if path not in reporting:
+            return described
+        return replace(described, rows_schema={"type": "object"})
+
+    return describe
+
+
+def test_a_node_at_a_copys_to_reads_the_select_as_a_packet_sink_did(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(SHAPES, "publish.wasm", _publish)
+    monkeypatch.setitem(
+        _PARAMS, "publish.wasm", {"relay": {"type": "string"}, "broadcast": {"type": "string"}}
+    )
+    argv = _plan_argv(
+        _PUBLISH + "COPY (SELECT f.video[1], f.audio[1] FROM input('f.mp4') f) "
+        "TO publish('https://relay', 'b') WITH (video_codec 'libx264', audio_codec 'aac')",
+        monkeypatch,
+        describe=_reporting("publish.wasm"),
+    )
+    sidecar = argv["sidecar0"]
+    assert sidecar.count("-i") == 2 and sidecar.count("-pad") == 2
+    network = sidecar[sidecar.index("-filter_complex") + 1]
+    assert network.startswith("[video=0:v][audio=")
+    assert network.endswith("]publish=relay=https\\\\://relay:broadcast=b[@rows=out0]")
+    assert sidecar[-5:] == ["-map", "[out0]", "-f", "ndjson", "pipe:1"]
+    (encoder,) = [words for pid, words in argv.items() if pid.startswith("ffmpeg")]
+    assert encoder[encoder.index("-c:0") + 1] == "libx264"
+
+
+def test_the_rows_a_node_emits_are_the_runs_on_its_stdout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    argv = _plan_argv(
+        "COPY (SELECT ring(f.video[1], spot(f.video[1])) FROM input('f.mp4') f) "
+        "TO 'ringed.mp4'",
+        monkeypatch,
+        describe=_reporting("spot.wasm"),
+    )
+    sidecar = argv["sidecar0"]
+    assert "[@rows=out1]" in sidecar[sidecar.index("-filter_complex") + 1]
+    assert sidecar[-5:] == ["-map", "[out1]", "-f", "ndjson", "pipe:1"]
 
 
 def test_a_node_reading_coded_packets_is_handed_the_stream_as_it_was_coded(
