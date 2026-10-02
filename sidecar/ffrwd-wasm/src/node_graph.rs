@@ -1309,14 +1309,15 @@ fn open_module(
         .filter_map(|(port, _)| port.clone())
         .filter(|port| port != ROWS_PORT)
         .collect();
-    let node = WitNode::open(path, &params, bound.clone(), &told, &latched)
+    let handed = restamped_bound(&shape, &bound, defs)?;
+    let node = WitNode::open(path, &params, handed.clone(), &told, &latched)
         .with_context(|| format!("opening {name} from {path}"))?;
     let mut resolved = node.shape().clone();
     resolve_rate(&mut resolved, &bound, defs)?;
     let tick = tick_base(&resolved, &bound)?;
     let outputs = output_streams(name, &node, &resolved, &bound, defs, tick)?;
     let opener: Opener = {
-        let (path, params, bound, latched) = (path.to_string(), params, bound.clone(), latched);
+        let (path, params, bound, latched) = (path.to_string(), params, handed, latched);
         let told = told.clone();
         Arc::new(move || {
             Ok(Box::new(WitNode::open(
@@ -1345,6 +1346,36 @@ fn open_module(
         outputs,
         feeds,
     })
+}
+
+/// The streams as the node is told them at `init`: one re-stamped onto the
+/// clock (`crate::tick::restamped`) in the clock's time base.
+fn restamped_bound(
+    shape: &NodeShape,
+    bound: &[BoundStream],
+    defs: &[StreamDef],
+) -> Result<Vec<BoundStream>> {
+    let restamps = |b: &BoundStream| {
+        shape
+            .input(&b.port)
+            .is_some_and(|p| crate::tick::restamped(p, b))
+    };
+    if !bound.iter().any(restamps) {
+        return Ok(bound.to_vec());
+    }
+    let mut planned = shape.clone();
+    resolve_rate(&mut planned, bound, defs)?;
+    let clock = tick_base(&planned, bound)?;
+    Ok(bound
+        .iter()
+        .map(|b| {
+            let mut told = b.clone();
+            if restamps(b) {
+                told.time_base = clock;
+            }
+            told
+        })
+        .collect())
 }
 
 /// The ports `name`'s hold inputs are served from: one listener per group

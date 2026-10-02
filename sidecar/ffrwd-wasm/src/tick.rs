@@ -23,8 +23,8 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Result};
 use ffrwd_wasm_runtime::node::{
-    BoundStream, Clock, Feed, Hold, NodeShape, Pairing, PortKind, RowsUse, StreamFormat, Tick,
-    TickFrame, TickStream, TimedRows,
+    Anchor, BoundStream, Clock, Feed, Hold, InputPort, NodeShape, Pairing, PortKind, RowsUse,
+    StreamFormat, Tick, TickFrame, TickStream, TimedRows,
 };
 use ffrwd_wasm_runtime::runtime::{AudioFormat, Format, Frame, Message, Packet, Shape, TimeBase};
 
@@ -422,9 +422,86 @@ struct Input {
     ended: bool,
     /// A hold input: its group, and which member of it.
     hold: Option<(usize, usize)>,
+    /// An interval input on a time origin of its own, re-stamped onto the
+    /// clock, `base` being the clock's.
+    restamp: Option<Restamp>,
+}
+
+/// A stream placed on the clock by its first message: its own time base,
+/// and once that message has arrived the offset, in the clock's base, that
+/// lays it at the tick it arrived on.
+#[derive(Debug, Clone, Copy)]
+struct Restamp {
+    from: TimeBase,
+    offset: Option<i64>,
+}
+
+impl Restamp {
+    fn waiting(&self) -> bool {
+        self.offset.is_none()
+    }
+}
+
+/// Whether `stream` on `port` counts on an origin of its own and is
+/// re-stamped onto the clock: an interval input anchored `first-frame`, or
+/// `tagged` where the stream's tags do not set the name to 1.
+pub fn restamped(port: &InputPort, stream: &BoundStream) -> bool {
+    let Pairing::Interval(interval) = &port.pairing else {
+        return false;
+    };
+    match &interval.anchor {
+        Anchor::SharedClock => false,
+        Anchor::FirstFrame => true,
+        Anchor::Tagged(name) => !stream.info.tags.iter().any(|(k, v)| k == name && v == "1"),
+    }
+}
+
+/// `item`'s times moved by `to`.
+fn retime(item: &mut Item, to: impl Fn(i64) -> i64) {
+    match item {
+        Item::Frame(f) => f.pts = to(f.pts),
+        Item::Message(m) => m.pts = to(m.pts),
+        Item::Packet(p) => {
+            p.pts = to(p.pts);
+            p.dts = p.dts.map(&to);
+        }
+    }
 }
 
 impl Input {
+    /// A time of this stream's own, on the clock once it has an offset.
+    fn placed(&self, time: i64) -> Option<i64> {
+        match self.restamp {
+            None => Some(time),
+            Some(Restamp { offset: None, .. }) => None,
+            Some(Restamp {
+                from,
+                offset: Some(offset),
+            }) => Some(ffrwd_wasm_runtime::node::rescale(time, from, self.base) + offset),
+        }
+    }
+
+    /// The first message's offset: it stands at `pts`, the tick being made.
+    fn anchor_at(&mut self, pts: i64) {
+        let Some(restamp) = self.restamp.filter(Restamp::waiting) else {
+            return;
+        };
+        let Some(first) = self.queue.front().map(|item| self.item_time(item)) else {
+            return;
+        };
+        let offset = pts - ffrwd_wasm_runtime::node::rescale(first, restamp.from, self.base);
+        self.restamp = Some(Restamp {
+            offset: Some(offset),
+            ..restamp
+        });
+        let base = self.base;
+        let to = |t: i64| ffrwd_wasm_runtime::node::rescale(t, restamp.from, base) + offset;
+        for item in self.queue.iter_mut() {
+            retime(item, &to);
+        }
+        self.progress = self.queue.iter().map(|item| self.item_time(item)).max();
+    }
+
     fn item_time(&self, item: &Item) -> i64 {
         match item {
             Item::Frame(f) => f.pts,
@@ -498,6 +575,14 @@ impl Assembler {
         name: &str,
         port_fed: &[u32],
     ) -> Result<Assembler> {
+        let clock_base = match &shape.clock {
+            Clock::Input(name) => bound.iter().find(|b| &b.port == name).map(|b| b.time_base),
+            Clock::Rate(rate) => Some(TimeBase {
+                num: u64::try_from(rate.den).unwrap_or(1),
+                den: u64::try_from(rate.num).unwrap_or(1),
+            }),
+            _ => None,
+        };
         let mut inputs = Vec::with_capacity(bound.len());
         let mut holds: Vec<Group> = Vec::new();
         let mut grouped: Vec<(Option<String>, Hold, Vec<Member>, bool)> = Vec::new();
@@ -543,18 +628,29 @@ impl Assembler {
                 }
                 _ => None,
             };
+            let restamp = match clock_base {
+                Some(_) if restamped(port, stream) => Some(Restamp {
+                    from: stream.time_base,
+                    offset: None,
+                }),
+                _ => None,
+            };
             inputs.push(Input {
                 id: stream.id,
                 kind: port.kind,
                 pairing: port.pairing.clone(),
                 rows: port.rows,
                 is_clock,
-                base: stream.time_base,
+                base: match restamp {
+                    Some(_) => clock_base.unwrap_or(stream.time_base),
+                    None => stream.time_base,
+                },
                 audio,
                 queue: VecDeque::new(),
                 progress: None,
                 ended: false,
                 hold,
+                restamp,
             });
         }
         for (_, hold, members, fed) in grouped {
@@ -624,10 +720,17 @@ impl Assembler {
     }
 
     /// One item arriving on stream `id`.
-    pub fn arrive(&mut self, id: u32, item: Item) -> Result<()> {
+    pub fn arrive(&mut self, id: u32, mut item: Item) -> Result<()> {
         let input = self.input(id)?;
+        if input.restamp.is_some_and(|r| !r.waiting()) {
+            let raw = input.item_time(&item);
+            let placed = input.placed(raw).expect("anchored");
+            retime(&mut item, |t| t + placed - raw);
+        }
         let time = input.item_time(&item);
-        input.progress = Some(input.progress.map_or(time, |p| p.max(time)));
+        if !input.restamp.is_some_and(|r| r.waiting()) {
+            input.progress = Some(input.progress.map_or(time, |p| p.max(time)));
+        }
         match (input.hold, item) {
             (Some((group, member)), Item::Frame(frame)) => {
                 self.holds[group].arrive(member, frame);
@@ -642,7 +745,9 @@ impl Assembler {
     /// `pts`.
     pub fn progress(&mut self, id: u32, pts: i64) -> Result<()> {
         let input = self.input(id)?;
-        input.progress = Some(input.progress.map_or(pts, |p| p.max(pts)));
+        if let Some(pts) = input.placed(pts) {
+            input.progress = Some(input.progress.map_or(pts, |p| p.max(pts)));
+        }
         Ok(())
     }
 
@@ -1127,6 +1232,9 @@ impl Assembler {
                 None => true,
             },
             Pairing::Interval(interval) => {
+                if input.restamp.is_some_and(|r| r.waiting()) {
+                    return true;
+                }
                 let Some(end) = end else {
                     return false;
                 };
@@ -1156,6 +1264,9 @@ impl Assembler {
     ) -> Result<TickStream> {
         let first = self.made == 0;
         let input = &mut self.inputs[index];
+        if matches!(input.pairing, Pairing::Interval(_)) {
+            input.anchor_at(pts);
+        }
         let mut stream = TickStream {
             id: input.id,
             progress: input.progress,
@@ -1912,6 +2023,79 @@ mod tests {
             heard[2],
             vec![(8, 2, 2)],
             "a first call hears of every end before it"
+        );
+    }
+
+    #[test]
+    fn a_first_frame_data_stream_is_restamped_from_the_tick_its_first_message_arrives_on() {
+        let mut interval = Interval::shared(None, 0.0);
+        interval.anchor = ffrwd_wasm_runtime::node::Anchor::FirstFrame;
+        let s = shape(
+            vec![
+                port("v", PortKind::Video, Pairing::Lockstep, RowsUse::Ignore),
+                port(
+                    "cues",
+                    PortKind::Data,
+                    Pairing::Interval(interval),
+                    RowsUse::PerFrame,
+                ),
+            ],
+            Clock::Input("v".into()),
+        );
+        let thirtieths = TimeBase { num: 1, den: 30 };
+        let millis = TimeBase { num: 1, den: 1000 };
+        let json = StreamFormat::Data("json".into());
+        let mut a = Assembler::new(
+            &s,
+            &[
+                bound("v", 0, thirtieths, video()),
+                bound("cues", 1, millis, json),
+            ],
+            "m",
+            &[],
+        )
+        .expect("assembler");
+        for k in 0..3 {
+            a.arrive(0, frame(k, &[])).expect("a frame");
+        }
+        let before = drain(&mut a);
+        assert_eq!(
+            before.iter().map(|t| t.pts).collect::<Vec<_>>(),
+            [0, 1],
+            "a stream with no message yet holds no tick"
+        );
+        // An hour and a half into its own origin.
+        a.arrive(1, message(5_400_000, "a")).expect("a message");
+        a.arrive(1, message(5_400_100, "b")).expect("a message");
+        for k in 3..8 {
+            a.arrive(0, frame(k, &[])).expect("a frame");
+        }
+        let after = drain(&mut a);
+        let handed = |ticks: &[Tick]| -> Vec<(i64, Vec<(i64, String)>)> {
+            ticks
+                .iter()
+                .map(|t| {
+                    let messages = t.streams[1]
+                        .messages
+                        .iter()
+                        .map(|m| (m.pts, String::from_utf8_lossy(&m.data).into_owned()))
+                        .collect();
+                    (t.pts, messages)
+                })
+                .collect()
+        };
+        assert_eq!(
+            handed(&after),
+            vec![(2, vec![(2, "a".to_string())]), (3, vec![]), (4, vec![])],
+            "the first message stands at the tick it arrived on; tick 5 waits for the \
+             stream to say it is done past 6"
+        );
+        a.progress(1, 5_400_200).expect("a progress mark");
+        assert_eq!(
+            handed(&drain(&mut a)),
+            vec![(5, vec![(5, "b".to_string())]), (6, vec![])],
+            "0.1 s later on its own origin is three ticks later on the clock's, and its \
+             progress is restamped too"
         );
     }
 }
