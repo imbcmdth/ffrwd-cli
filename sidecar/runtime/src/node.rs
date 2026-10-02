@@ -329,8 +329,9 @@ pub struct TickStream {
     pub earlier_rows: Vec<TimedRows>,
     pub feed: Option<Feed>,
     /// The stream as the host knows it this tick, where that differs from
-    /// what `init` was told: a hold input's current source.
-    pub info: Option<StreamInfo>,
+    /// what `init` was told: a hold input's current source, with its time
+    /// base.
+    pub info: Option<(StreamInfo, TimeBase)>,
     /// How far the producer has said it is done, in the stream's time base:
     /// the newest progress mark that arrived. Never handed to a module; an
     /// adapter hands it on.

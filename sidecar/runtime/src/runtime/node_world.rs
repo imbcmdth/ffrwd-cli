@@ -98,8 +98,11 @@ impl node_tick::HostTick for Host {
     fn info(&mut self, tick: Resource<TickHandle>, id: u32) -> wasmtime::Result<wt::StreamInfo> {
         let handle = self.table.get(&tick)?;
         let bound = handle.bound(id)?;
-        let info = handle.stream(id)?.info.as_ref().unwrap_or(&bound.info);
-        Ok(stream_info_to_wit(info, bound.time_base))
+        let (info, base) = match &handle.stream(id)?.info {
+            Some((info, base)) => (info, *base),
+            None => (&bound.info, bound.time_base),
+        };
+        Ok(stream_info_to_wit(info, base))
     }
 
     fn feed(&mut self, tick: Resource<TickHandle>, id: u32) -> wasmtime::Result<Option<nt::Feed>> {
@@ -312,12 +315,15 @@ pub struct WitNode {
 
 impl WitNode {
     /// Instantiates the module, asks its shape for `params` and the inputs
-    /// `bound` names, and opens an instance on those streams. `latched`
-    /// names the outputs the query reads.
+    /// `declared` names (the ones the call bound: a hold input the host
+    /// serves from a port is among `bound` and not among them), and opens an
+    /// instance on those streams. `latched` names the outputs the query
+    /// reads.
     pub fn open(
         module_path: &str,
         params: &str,
         bound: Vec<BoundStream>,
+        declared: &[String],
         latched: &[String],
     ) -> Result<WitNode> {
         let (mut store, instance) = instantiate_node(module_path, Purpose::Run)?;
@@ -327,12 +333,7 @@ impl WitNode {
                 .call_describe(&mut store)
                 .map_err(wasm_err)?,
         );
-        let mut bound_names: Vec<String> = Vec::new();
-        for stream in &bound {
-            if !bound_names.contains(&stream.port) {
-                bound_names.push(stream.port.clone());
-            }
-        }
+        let bound_names: Vec<String> = declared.to_vec();
         let shape = shape_of(&mut store, &instance, &meta.name, params, &bound_names)?;
         check_bound(&shape, &bound, &meta.name)?;
         for wanted in latched {

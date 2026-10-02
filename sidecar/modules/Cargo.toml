@@ -90,6 +90,9 @@ members = [
     "shape-sink",
     "shape-window",
     "shape-packets",
+    # What the live switch did, as a node: the host's hold pairing, feeds by
+    # port and both anchors, with none of the switch's own code.
+    "shape-switch",
 ]
 resolver = "2"
 

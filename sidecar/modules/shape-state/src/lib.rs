@@ -134,7 +134,12 @@ fn rate(num: i32) -> Rational {
     Rational { num, den: 1 }
 }
 #[derive(Deserialize, Default)]
-struct Params {}
+struct Params {
+    /// The most the words wait, in seconds; none waits for their producer.
+    latency: Option<f64>,
+}
+
+const SCHEMA: &str = r#"{"type":"object","properties":{"latency":{"type":"number"}}}"#;
 
 struct State {
     words: Option<u32>,
@@ -149,17 +154,17 @@ struct Node;
 
 impl Guest for Node {
     fn describe() -> Meta {
-        meta("shape_state", "")
+        meta("shape_state", SCHEMA)
     }
 
     fn shape(params: String, _bound: Vec<String>) -> Result<NodeShape, String> {
-        parse::<Params>(&params)?;
+        let params: Params = parse(&params)?;
         let v = input("v", PortKind::Video, Pairing::Lockstep, RowsUse::Ignore);
         let mut words = input(
             "words",
             PortKind::Data,
             Pairing::Interval(ffrwd::av::node_types::Interval {
-                latency: None,
+                latency: params.latency,
                 ahead: 0.0,
             }),
             RowsUse::State,

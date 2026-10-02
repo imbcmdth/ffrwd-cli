@@ -240,10 +240,11 @@ fn a_held_picture_is_handed_back_from_whichever_input_the_call_picks() {
         "the first tick shows the picked input's first frame"
     );
     assert_eq!(at(5), (5, 102), "tick 5 holds the frame at 4");
+    assert_eq!(at(8), (8, 104), "tick 8 is the last frame's turn");
     assert_eq!(
         at(9),
-        (9, 104),
-        "the last tick holds the picked input's last frame"
+        (9, 19),
+        "the picked input's feed ended after its last frame showed, so the other stands in"
     );
 }
 
@@ -607,6 +608,139 @@ fn a_reader_by_interval_waits_for_the_window_that_holds_its_time() {
         "the second window's cue lands on its own tick"
     );
     assert_eq!(seen(39), (Some(4), Some(0)));
+}
+
+#[test]
+fn words_thirty_seconds_late_hold_the_picture_in_the_host_and_not_in_the_node() {
+    let dir = scratch("words-late");
+    let audio = Stream::audio("f32", 48000, 1).expect("f32 is carried");
+    let mut items: Vec<(usize, Write)> = Vec::new();
+    for k in 0..750i64 {
+        items.push((1, Write::Frame(k * 4800, vec![0u8; 4800 * 4])));
+        items.push((0, Write::Frame(k, vec![0u8; 16])));
+    }
+    write_nut(
+        &dir.join("in.nut"),
+        &[video(2, 2, TENTHS, (10, 1)), audio],
+        &items,
+    );
+    let input = dir.join("in.nut").display().to_string();
+    let out = at_every_jobs(
+        "words-late",
+        &args(&[
+            "-f",
+            "nut",
+            "-i",
+            &input,
+            "-m",
+            &module("shape_window"),
+            "-m",
+            &module("shape_state"),
+            "-filter_complex",
+            "[a=0:a]shape_window=window=1440000[cues=c];[v=0:v][words=c]shape_state[seen=s]",
+            "-map",
+            "[s]",
+            "-f",
+            "ndjson",
+            "{dir}/seen.ndjson",
+            "-map",
+            "[c]",
+            "-f",
+            "ndjson",
+            "{dir}/cues.ndjson",
+        ]),
+        &["seen.ndjson", "cues.ndjson"],
+    );
+    let cues = lines(&out[1]);
+    assert_eq!(
+        cues.len(),
+        3,
+        "75 s of sound is two whole windows and a last one"
+    );
+    let ticks = lines(&out[0]);
+    assert_eq!(ticks.len(), 750);
+    let seen = |n: usize| (ticks[n]["seen"].as_u64(), ticks[n]["now"].as_u64());
+    assert_eq!(
+        seen(0),
+        (Some(1), Some(1)),
+        "the first cue lands on the first tick"
+    );
+    assert_eq!(seen(299), (Some(1), Some(0)));
+    assert_eq!(
+        seen(300),
+        (Some(2), Some(1)),
+        "the second window's cue, 30 s later"
+    );
+    assert_eq!(seen(600), (Some(3), Some(1)));
+    assert_eq!(seen(749), (Some(3), Some(0)));
+}
+
+#[test]
+fn a_message_later_than_the_latency_bound_is_delivered_at_the_next_tick_and_reported() {
+    let dir = scratch("late-message");
+    let mut items: Vec<(usize, Write)> = Vec::new();
+    for k in 0..30i64 {
+        items.push((0, Write::Frame(k, vec![k as u8; 16])));
+        if k == 2 {
+            items.push((1, Write::Message(2, r#"{"text":"on time"}"#.to_string())));
+        }
+        if k == 20 {
+            items.push((1, Write::Message(5, r#"{"text":"late"}"#.to_string())));
+        }
+    }
+    write_nut(
+        &dir.join("in.nut"),
+        &[video(2, 2, TENTHS, (10, 1)), Stream::json(TENTHS)],
+        &items,
+    );
+    let input = dir.join("in.nut").display().to_string();
+    let base = scratch("late-message-run");
+    let seen = base.join("seen.ndjson");
+    let output = Command::new(env!("CARGO_BIN_EXE_ffrwd-wasm"))
+        .args([
+            "-f",
+            "nut",
+            "-i",
+            &input,
+            "-m",
+            &module("shape_state"),
+            "-filter_complex",
+            "[v=0:v][words=0:d]shape_state=latency=0.5[seen=s]",
+            "-map",
+            "[s]",
+            "-f",
+            "ndjson",
+            &seen.display().to_string(),
+        ])
+        .output()
+        .expect("spawn ffrwd-wasm");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    let ticks = lines(&fs::read(&seen).expect("the output was written"));
+    let now = |n: usize| ticks[n]["now"].as_u64();
+    assert_eq!(now(2), Some(1), "the message on time lands on its tick");
+    assert_eq!(
+        now(5),
+        Some(0),
+        "the tick at 0.5 s was cut once the clock reached 1.0 s"
+    );
+    let delivered: Vec<usize> = (0..30).filter(|n| now(*n) == Some(1)).collect();
+    assert_eq!(
+        delivered,
+        vec![2, 15],
+        "the late message reaches the next tick cut after it arrived, which trails the clock by the bound"
+    );
+    assert!(
+        stderr
+            .contains("stamped before the tick at 1.500s arrived after it, the earliest at 0.500s"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(r#"ffrwd:row {"at":1.5,"earliest":0.5,"kind":"late""#),
+        "{stderr}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+    let _ = fs::remove_dir_all(&base);
 }
 
 #[test]

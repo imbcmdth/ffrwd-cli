@@ -23,7 +23,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use ffrwd_wasm_runtime::node::{
@@ -32,10 +32,19 @@ use ffrwd_wasm_runtime::node::{
 use ffrwd_wasm_runtime::runtime::{Message, TimeBase};
 
 use crate::edges::{Out, Queue};
+use crate::hold::SourceInfo;
 use crate::tick::{Assembler, Item};
 
 /// Opens one more instance of a lane's node.
 pub type Opener = Arc<dyn Fn() -> Result<Box<dyn Node>> + Send + Sync>;
+
+/// What waiting for room on a port feed came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Room {
+    Open,
+    Full,
+    Stopped,
+}
 
 /// An output port somebody reads: the stream it is, its time base, and the
 /// latency its progress is held back by.
@@ -49,7 +58,7 @@ pub struct PortOut {
 /// How a lane's ticks are cut.
 pub enum Intake {
     /// The node's own shape: its clock and every input's pairing.
-    Assembled(Assembler),
+    Assembled(Box<Assembler>),
     /// A host node on a data edge: the messages between two of its
     /// producer's progress marks, as one tick.
     Host { id: u32 },
@@ -102,7 +111,7 @@ enum HostEvent {
 }
 
 enum LaneIntake {
-    Assembled(Assembler),
+    Assembled(Box<Assembler>),
     Host {
         id: u32,
         events: VecDeque<HostEvent>,
@@ -314,6 +323,42 @@ impl State {
         self.cut_all(&consumers)
     }
 
+    /// A source starts or ends on a port feed's stream.
+    fn source(&mut self, stream: u32, source: Option<SourceInfo>) -> Result<()> {
+        let consumers = self.consumers(stream);
+        for consumer in &consumers {
+            if let Consumer::Lane(j) = *consumer {
+                let lane = &mut self.lanes[j];
+                if lane.stopped {
+                    continue;
+                }
+                if let LaneIntake::Assembled(a) = &mut lane.intake {
+                    match &source {
+                        Some(info) => a.source_open(stream, info.clone())?,
+                        None => a.source_close(stream)?,
+                    }
+                }
+            }
+        }
+        self.cut_all(&consumers)
+    }
+
+    /// How many more frames a port feed on `stream` may send before it
+    /// waits: the least room among its readers.
+    fn hold_room(&self, stream: u32) -> usize {
+        self.consumers(stream)
+            .iter()
+            .filter_map(|consumer| match consumer {
+                Consumer::Lane(j) => match &self.lanes[*j].intake {
+                    LaneIntake::Assembled(a) if !self.lanes[*j].stopped => a.hold_room(stream),
+                    _ => None,
+                },
+                Consumer::Writer(..) => None,
+            })
+            .min()
+            .unwrap_or(usize::MAX)
+    }
+
     fn cut_all(&mut self, consumers: &[Consumer]) -> Result<()> {
         for consumer in consumers {
             if let Consumer::Lane(j) = consumer {
@@ -365,7 +410,7 @@ impl State {
                     unreachable!("a rate clock is assembled")
                 };
                 let mut cut = Vec::new();
-                loop {
+                while lane.queue.len() + cut.len() < cap {
                     let tick = if a.all_ended() {
                         let made = a.ticks_made() as i64;
                         let past = a.latest(base).is_none_or(|latest| made > latest);
@@ -491,11 +536,14 @@ impl State {
         true
     }
 
+    /// A rate clock's ticks are cut as its queue has room, and a
+    /// self-clocked node's as it returns, so both are cut here, where a
+    /// worker looks for work, as well as on arrivals.
     fn pick(&mut self) -> Result<Option<usize>> {
         for j in 0..self.lanes.len() {
             if matches!(
                 self.lanes[j].clock,
-                ClockKind::Rate { inputs: false } | ClockKind::SelfClocked
+                ClockKind::Rate { .. } | ClockKind::SelfClocked
             ) {
                 self.cut(j)?;
             }
@@ -880,6 +928,47 @@ impl Scheduler {
 
     pub fn end(&self, stream: u32) -> bool {
         self.feed(stream, |state| state.end(stream))
+    }
+
+    /// A port feed's connection on `stream` starts, told before its frames.
+    pub fn source_open(&self, stream: u32, source: SourceInfo) -> bool {
+        self.feed(stream, |state| state.source(stream, Some(source)))
+    }
+
+    /// A port feed's connection on `stream` has ended.
+    pub fn source_close(&self, stream: u32) -> bool {
+        self.feed(stream, |state| state.source(stream, None))
+    }
+
+    /// Waits until a port feed on `stream` has room for another frame, for
+    /// `timeout` at most.
+    pub fn wait_room(&self, stream: u32, timeout: Duration) -> Room {
+        let mut state = self.shared.lock();
+        let until = Instant::now() + timeout;
+        loop {
+            if state.error.is_some() || state.finished {
+                return Room::Stopped;
+            }
+            if state.hold_room(stream) > 0 {
+                return Room::Open;
+            }
+            let now = Instant::now();
+            if now >= until {
+                return Room::Full;
+            }
+            state = self
+                .shared
+                .space
+                .wait_timeout(state, until - now)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+    }
+
+    /// Whether the run has stopped: finished, or failed.
+    pub fn stopped(&self) -> bool {
+        let state = self.shared.lock();
+        state.error.is_some() || state.finished
     }
 
     /// Whether anything reads `stream`.

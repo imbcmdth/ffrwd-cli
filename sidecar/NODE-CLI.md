@@ -61,9 +61,11 @@ node module every pad carries the port it binds before an `=`:
   out of a file, for params too long for a command line; it replaces that
   node's options.
 - **Hold inputs given by port.** A hold port with a `port_param`, left
-  unbound, is listened for on the port its param names: `inset=port=9100`
-  binds no pad for `feed`. This host does not listen yet, and runs the
-  node with the port absent.
+  unbound, is served by a loopback listener of the host's own on the port
+  its param names: `inset=port=9100` binds no pad for `feed`, and the host
+  listens on 127.0.0.1:9100 (see "Feeds by port"). A hold port with a
+  `port_param` that a pad binds gets the port the host picked written into
+  that param.
 - **One call, many readers.** A label may be read by any number of pads
   and `-map`s; the host splits it.
 
@@ -89,6 +91,36 @@ null` takes any.
 A network with no `-i` at all is a source: it runs until its nodes finish
 or every output's reader has closed, and a reader closing is a clean end.
 
+## Feeds by port
+
+A hold input the call gives a port rather than a stream is bound a stream
+of the host's own at `init`, in the port's format: the size and colour of
+the input it follows (`accepts.like`, or the clock input), in the first
+pixel or sample format the port accepts. The host listens on the port
+from the moment the run starts, and whatever connects and writes a NUT of
+raw video and PCM is the input's source for as long as it stays: its
+picture is conformed to that format on the way in (rgba and yuv420p, at
+any size), its sound to the port's sample format (s16 or f32; another rate
+or channel count is refused by name and the pictures are kept). A group of
+hold inputs (`hold.group`) shares one listener and one connection, its
+picture to the video port and its sound to the audio port.
+
+One connection at a time: a second while one is on is accepted and closed
+at once, and a connection that has sent nothing is dropped for one that
+knocks. Every connection asks for a 16 MiB receive buffer, and is read
+only while the input has room, so a source that outruns the clock waits on
+its socket. Each connection is a feed (`tick.feed`), with the source's own
+tags and time base from its start on; a source whose pts jump backwards or
+more than a second forwards is a new feed on the same connection.
+
+The host says what it did on stderr, as lines and as rows behind
+`ffrwd:row `: `{"kind":"listen",...}` once the port is bound,
+`{"kind":"feed","event":"start",...}` with the anchor and the mapping when
+a feed comes up and `{"kind":"feed","event":"end",...}` with how many
+frames it showed, repeated and skipped when it ends, and
+`{"kind":"late",...}` when an interval input's messages arrived after the
+tick that held them.
+
 ## How a run goes
 
 - **Inputs.** Every `-i`'s headers are read first, all at once; then a
@@ -99,6 +131,29 @@ or every output's reader has closed, and a reader closing is a clean end.
   frame says how long it lasts), so every tick's interval is settled
   before it runs, and the progress the node sends after it is the end of
   that interval less the port's latency.
+- **Hold inputs.** A hold input bound to a stream holds the tick until its
+  source has reached the tick (a frame past it, or its end), for no longer
+  than its `timeout` of clock time, after which the source is behind; a
+  hold input served by a port never holds a tick. Either way a video input
+  hands the newest frame at or before the tick, repeating the last one
+  while the source is behind and skipping forward when it catches up, and
+  an audio input hands the tick's samples re-cut from what arrived, or
+  none while the source is behind. A `first-frame` source is primed until
+  `lead` seconds of it are held, or its end, and scheduled `lead` ahead of
+  the clock, on the clock's grid; a `shared-clock` source's first frame
+  waits for the clock to reach its pts, and one the clock has passed shows
+  at once from where the clock is. The last frame shows on its own turn
+  and the feed ends after it, unless `linger` keeps it; a clock that jumps
+  (backwards, or more than a second forwards) ends every feed. Where the
+  source has ended the host foretells the last tick the feed shows on
+  (`feed.ends`), counted on the clock's grid: exact for a rate clock,
+  learned from the frames of an input clock.
+- **Interval inputs.** The clock is held until every interval input's
+  producer has progressed past the tick's interval (and `ahead`), for no
+  longer than the input's `latency` past it, counted on the clock input's
+  own arrival, or on a rate clock on the newest time any input has
+  reached. A message that arrives after its tick was cut is delivered at
+  the next tick and reported.
 - **Lanes.** A pure node runs on as many workers as `-jobs` allows, its
   results put back in tick order before they leave. A pure node with a
   state input opens every instance before its first tick, and each

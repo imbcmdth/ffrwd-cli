@@ -23,12 +23,13 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Result};
 use ffrwd_wasm_runtime::node::{
-    BoundStream, Clock, NodeShape, Pairing, PortKind, RowsUse, StreamFormat, Tick, TickFrame,
+    BoundStream, Clock, Hold, NodeShape, Pairing, PortKind, RowsUse, StreamFormat, Tick, TickFrame,
     TickStream, TimedRows,
 };
 use ffrwd_wasm_runtime::runtime::{AudioFormat, Format, Frame, Message, Packet, Shape, TimeBase};
 
 use crate::heartbeat;
+use crate::hold::{self, Grid, Group, Handed, Member, Report, SourceInfo};
 use crate::windows::Windows;
 
 /// Whether `a` in `base_a` is before, at or after `b` in `base_b`, exactly.
@@ -371,8 +372,8 @@ struct Input {
     /// mark or by an item's own time.
     progress: Option<i64>,
     ended: bool,
-    /// A hold input's frame on show.
-    shown: Option<TickFrame>,
+    /// A hold input: its group, and which member of it.
+    hold: Option<(usize, usize)>,
 }
 
 impl Input {
@@ -424,11 +425,28 @@ pub struct Assembler {
     made_end: Option<i64>,
     /// Rows of state inputs, for instances that did not see every tick.
     pub earlier: EarlierRows,
+    /// The hold inputs, grouped.
+    holds: Vec<Group>,
+    /// The clock's ticks as a grid, for foretelling where a feed ends.
+    grid: Grid,
+    /// The last tick's time, for a jump in the clock.
+    last_pts: Option<i64>,
+    name: String,
+    report: Report,
 }
 
 impl Assembler {
-    pub fn new(shape: &NodeShape, bound: &[BoundStream]) -> Result<Assembler> {
+    /// The ticks of `name`, a node of `shape` bound to `bound`. `port_fed`
+    /// names the hold inputs a port feed serves, which never hold a tick.
+    pub fn new(
+        shape: &NodeShape,
+        bound: &[BoundStream],
+        name: &str,
+        port_fed: &[u32],
+    ) -> Result<Assembler> {
         let mut inputs = Vec::with_capacity(bound.len());
+        let mut holds: Vec<Group> = Vec::new();
+        let mut grouped: Vec<(Option<String>, Hold, Vec<Member>, bool)> = Vec::new();
         for stream in bound {
             let port = shape
                 .input(&stream.port)
@@ -440,6 +458,37 @@ impl Assembler {
                 );
             }
             let is_clock = matches!(&shape.clock, Clock::Input(c) if *c == port.name);
+            let audio = match &stream.format {
+                StreamFormat::Audio(audio) => Some(*audio),
+                _ => None,
+            };
+            let hold = match &port.pairing {
+                Pairing::Hold(hold) => {
+                    let member = Member {
+                        name: port.name.clone(),
+                        kind: port.kind,
+                        base: stream.time_base,
+                        info: stream.info.clone(),
+                        audio,
+                    };
+                    let fed = port_fed.contains(&stream.id);
+                    let key = hold.group.clone();
+                    let group = match key
+                        .as_ref()
+                        .and_then(|k| grouped.iter().position(|(g, ..)| g.as_ref() == Some(k)))
+                    {
+                        Some(group) => group,
+                        None => {
+                            grouped.push((key, hold.clone(), Vec::new(), fed));
+                            grouped.len() - 1
+                        }
+                    };
+                    grouped[group].2.push(member);
+                    grouped[group].3 |= fed;
+                    Some((group, grouped[group].2.len() - 1))
+                }
+                _ => None,
+            };
             inputs.push(Input {
                 id: stream.id,
                 kind: port.kind,
@@ -447,15 +496,15 @@ impl Assembler {
                 rows: port.rows,
                 is_clock,
                 base: stream.time_base,
-                audio: match &stream.format {
-                    StreamFormat::Audio(audio) => Some(*audio),
-                    _ => None,
-                },
+                audio,
                 queue: VecDeque::new(),
                 progress: None,
                 ended: false,
-                shown: None,
+                hold,
             });
+        }
+        for (_, hold, members, fed) in grouped {
+            holds.push(Group::new(hold, name, members, fed));
         }
         let (clock, window, stride) = match &shape.clock {
             Clock::Input(name) => {
@@ -486,6 +535,10 @@ impl Assembler {
             ),
             Clock::SelfClocked => (ClockState::SelfClocked, 1, 1),
         };
+        let grid = match clock {
+            ClockState::Input(_) => Grid::learned(),
+            _ => Grid::exact(),
+        };
         Ok(Assembler {
             inputs,
             clock,
@@ -498,6 +551,11 @@ impl Assembler {
             done: false,
             made_end: None,
             earlier: EarlierRows::default(),
+            holds,
+            grid,
+            last_pts: None,
+            name: name.to_string(),
+            report: Box::new(|line| eprintln!("{line}")),
         })
     }
 
@@ -513,7 +571,13 @@ impl Assembler {
         let input = self.input(id)?;
         let time = input.item_time(&item);
         input.progress = Some(input.progress.map_or(time, |p| p.max(time)));
-        input.queue.push_back(item);
+        match (input.hold, item) {
+            (Some((group, member)), Item::Frame(frame)) => {
+                self.holds[group].arrive(member, frame);
+            }
+            (Some(_), _) => {}
+            (None, item) => input.queue.push_back(item),
+        }
         Ok(())
     }
 
@@ -527,13 +591,53 @@ impl Assembler {
 
     /// Stream `id` has ended.
     pub fn end(&mut self, id: u32) -> Result<()> {
-        self.input(id)?.ended = true;
+        let input = self.input(id)?;
+        input.ended = true;
+        if let Some((group, member)) = input.hold {
+            self.holds[group].source_close(member);
+        }
         Ok(())
     }
 
-    /// Whether every bound stream has ended.
+    /// A source starts on hold input `id`: a port feed's connection.
+    pub fn source_open(&mut self, id: u32, source: SourceInfo) -> Result<()> {
+        let input = self.input(id)?;
+        let Some((group, member)) = input.hold else {
+            bail!("stream {id} is not a hold input, and only one takes a source");
+        };
+        self.holds[group].source_open(member, source);
+        Ok(())
+    }
+
+    /// The source on hold input `id` has closed; what it sent plays out.
+    pub fn source_close(&mut self, id: u32) -> Result<()> {
+        let input = self.input(id)?;
+        let Some((group, member)) = input.hold else {
+            bail!("stream {id} is not a hold input, and only one takes a source");
+        };
+        self.holds[group].source_close(member);
+        Ok(())
+    }
+
+    /// How many more frames a port feed on hold input `id` may send before
+    /// it waits; None for a stream that is not one.
+    pub fn hold_room(&self, id: u32) -> Option<usize> {
+        let input = self.inputs.iter().find(|i| i.id == id)?;
+        let (group, _) = input.hold?;
+        let group = &self.holds[group];
+        group.port_fed().then(|| group.room())
+    }
+
+    fn port_fed(&self, input: &Input) -> bool {
+        input
+            .hold
+            .is_some_and(|(group, _)| self.holds[group].port_fed())
+    }
+
+    /// Whether every bound stream has ended. A port feed never ends: the
+    /// run's end is its end.
     pub fn all_ended(&self) -> bool {
-        self.inputs.iter().all(|i| i.ended)
+        self.inputs.iter().all(|i| i.ended && !self.port_fed(i))
     }
 
     #[cfg(test)]
@@ -565,11 +669,12 @@ impl Assembler {
         let clock_stream = self.take_clock(clock, &next)?;
         let mut streams = Vec::with_capacity(self.inputs.len());
         streams.push(clock_stream);
+        let mut held = self.hold_ticks(next.pts, end, base);
         for index in 0..self.inputs.len() {
             if index == clock {
                 continue;
             }
-            streams.push(self.hand(index, next.pts, end, base)?);
+            streams.push(self.hand(index, next.pts, end, base, &mut held)?);
         }
         if next.last {
             self.done = true;
@@ -595,8 +700,9 @@ impl Assembler {
             }
         }
         let mut streams = Vec::with_capacity(self.inputs.len());
+        let mut held = self.hold_ticks(pts, end, base);
         for index in 0..self.inputs.len() {
-            streams.push(self.hand(index, pts, end, base)?);
+            streams.push(self.hand(index, pts, end, base, &mut held)?);
         }
         if last {
             self.done = true;
@@ -612,13 +718,33 @@ impl Assembler {
             den: 1_000_000,
         };
         let mut streams = Vec::with_capacity(self.inputs.len());
+        let mut held = Vec::new();
         for index in 0..self.inputs.len() {
-            streams.push(self.hand(index, pts, None, base)?);
+            streams.push(self.hand(index, pts, None, base, &mut held)?);
         }
         if last {
             self.done = true;
         }
         Ok(self.made(pts, None, base, last, streams))
+    }
+
+    /// Every hold group's share of the tick from `pts` to `end`: a jump in
+    /// the clock ends every feed first.
+    fn hold_ticks(&mut self, pts: i64, end: Option<i64>, base: TimeBase) -> Vec<Vec<Handed>> {
+        if let Some(last) = self.last_pts {
+            let step = pts.saturating_sub(last);
+            if step < 0 || step > hold::ticks_of(hold::MAX_STEP_SECONDS, base) {
+                for group in &mut self.holds {
+                    group.clock_jumped(pts, base);
+                }
+            }
+        }
+        self.last_pts = Some(pts);
+        let grid = self.grid;
+        self.holds
+            .iter_mut()
+            .map(|group| group.tick(pts, end, base, &grid))
+            .collect()
     }
 
     /// Where the interval of the tick made last ends, in its time base:
@@ -628,15 +754,34 @@ impl Assembler {
         self.made_end
     }
 
-    /// The newest time any input has said it is done to, in `base`.
+    /// The newest time any input has said it is done to, in `base`: a hold
+    /// input's as its feed maps it.
     pub fn latest(&self, base: TimeBase) -> Option<i64> {
+        let groups = self.holds.iter().filter_map(|g| g.progress(base));
         self.inputs
             .iter()
+            .filter(|i| i.hold.is_none())
             .filter_map(|i| {
                 i.progress
                     .map(|p| ffrwd_wasm_runtime::node::rescale(p, i.base, base))
             })
+            .chain(groups)
             .max()
+    }
+
+    /// How far the clock has arrived, in `base`, which bounds how long an
+    /// input is waited for: the clock input's newest time, or on a rate
+    /// clock the newest time any input has reached.
+    fn reference(&self, base: TimeBase) -> Option<i64> {
+        match self.clock {
+            ClockState::Input(clock) => {
+                let input = &self.inputs[clock];
+                input
+                    .progress
+                    .map(|p| ffrwd_wasm_runtime::node::rescale(p, input.base, base))
+            }
+            _ => self.latest(base),
+        }
     }
 
     /// How many ticks have been made.
@@ -665,6 +810,7 @@ impl Assembler {
         let number = self.made;
         self.made += 1;
         self.made_end = end;
+        self.grid.observe(pts);
         for stream in &streams {
             let state = self
                 .inputs
@@ -887,13 +1033,10 @@ impl Assembler {
                 Some(end) => input.settled_to(end, base),
                 None => false,
             },
-            Pairing::Hold(_) => {
-                // The newest frame at or before the tick is known once one
-                // after it has arrived.
-                input
-                    .progress
-                    .is_some_and(|p| compare(p, input.base, pts, base).is_gt())
-            }
+            Pairing::Hold(_) => match input.hold {
+                Some((group, _)) => self.holds[group].ready(pts, end, base, self.reference(base)),
+                None => true,
+            },
             Pairing::Interval(interval) => {
                 let Some(end) = end else {
                     return false;
@@ -902,11 +1045,8 @@ impl Assembler {
                 if input.settled_to(until, base) {
                     return true;
                 }
-                match (interval.latency, self.clock_progress()) {
-                    (Some(latency), Some((arrived, clock_base))) => {
-                        let bound = plus_seconds(end, base, latency);
-                        compare(arrived, clock_base, bound, base).is_ge()
-                    }
+                match (interval.latency, self.reference(base)) {
+                    (Some(latency), Some(arrived)) => arrived >= plus_seconds(end, base, latency),
                     _ => false,
                 }
             }
@@ -914,23 +1054,16 @@ impl Assembler {
         }
     }
 
-    /// How far the clock input has arrived, for an interval's latency bound.
-    fn clock_progress(&self) -> Option<(i64, TimeBase)> {
-        let ClockState::Input(clock) = self.clock else {
-            return None;
-        };
-        let input = &self.inputs[clock];
-        input.progress.map(|p| (p, input.base))
-    }
-
     /// Input `index`'s share of the tick at `pts` whose interval ends at
-    /// `end` (None: everything left).
+    /// `end` (None: everything left). `held` is what every hold group hands
+    /// this tick.
     fn hand(
         &mut self,
         index: usize,
         pts: i64,
         end: Option<i64>,
         base: TimeBase,
+        held: &mut [Vec<Handed>],
     ) -> Result<TickStream> {
         let input = &mut self.inputs[index];
         let mut stream = TickStream {
@@ -967,29 +1100,48 @@ impl Assembler {
                 }
             }
             Pairing::Hold(_) => {
-                while let Some(Item::Frame(frame)) = input.queue.front() {
-                    if compare(frame.pts, input.base, pts, base).is_gt() {
-                        break;
-                    }
-                    if let Some(Item::Frame(frame)) = input.queue.pop_front() {
-                        input.shown = Some(frame);
-                    }
-                }
-                if input.ended && input.queue.is_empty() && end.is_none() {
-                    input.shown = None;
-                }
-                if let Some(frame) = &input.shown {
-                    stream.frames.push(frame.clone());
+                if let Some((group, member)) = input.hold {
+                    let handed = std::mem::take(&mut held[group][member]);
+                    stream.frames = handed.frames;
+                    stream.feed = handed.feed;
+                    stream.info = handed.info;
                 }
             }
             Pairing::Interval(interval) => {
                 let until = end.map(|end| plus_seconds(end, base, interval.ahead));
+                let mut late = 0;
+                let mut earliest: Option<i64> = None;
                 while let Some(item) = input.queue.front() {
                     if !before(input.item_time(item), input.base, until) {
                         break;
                     }
                     let item = input.queue.pop_front().expect("front is some");
+                    let time = input.item_time(&item);
+                    if compare(time, input.base, pts, base).is_lt() {
+                        late += 1;
+                        earliest = Some(earliest.map_or(time, |e: i64| e.min(time)));
+                    }
                     push_item(&mut stream, item);
+                }
+                if late > 0 {
+                    let seconds = |t: i64, b: TimeBase| t as f64 * b.num as f64 / b.den as f64;
+                    let earliest = earliest.map_or(0.0, |t| seconds(t, input.base));
+                    let at = seconds(pts, base);
+                    let id = input.id;
+                    (self.report)(format!(
+                        "interval: {}: {late} message(s) stamped before the tick at {at:.3}s \
+                         arrived after it, the earliest at {earliest:.3}s; delivered now",
+                        self.name
+                    ));
+                    let row = serde_json::json!({
+                        "kind": "late",
+                        "node": self.name,
+                        "stream": id,
+                        "at": (at * 1000.0).round() / 1000.0,
+                        "late": late,
+                        "earliest": (earliest * 1000.0).round() / 1000.0,
+                    });
+                    (self.report)(format!("{}{row}", crate::leaky::ROW_PREFIX));
                 }
             }
         }
@@ -1227,7 +1379,8 @@ mod tests {
             )],
             Clock::Input("v".into()),
         );
-        let mut a = Assembler::new(&s, &[bound("v", 7, NTSC, video())]).expect("assembler");
+        let mut a =
+            Assembler::new(&s, &[bound("v", 7, NTSC, video())], "m", &[]).expect("assembler");
         for k in 0..3 {
             a.arrive(7, frame(k * 1001, &["r"])).expect("arrive");
         }
@@ -1257,7 +1410,8 @@ mod tests {
         v.window = 3;
         v.stride = 1;
         let s = shape(vec![v], Clock::Input("v".into()));
-        let mut a = Assembler::new(&s, &[bound("v", 0, NTSC, video())]).expect("assembler");
+        let mut a =
+            Assembler::new(&s, &[bound("v", 0, NTSC, video())], "m", &[]).expect("assembler");
         for k in 0..5 {
             a.arrive(0, frame(k, &[])).expect("arrive");
         }
@@ -1292,6 +1446,8 @@ mod tests {
         let mut a = Assembler::new(
             &s,
             &[bound("v", 0, NTSC, video()), bound("a", 1, KHZ48, audio())],
+            "m",
+            &[],
         )
         .expect("assembler");
         for k in 0..6 {
@@ -1333,6 +1489,8 @@ mod tests {
                 bound("v", 0, tb, video()),
                 bound("w", 1, MICROS, StreamFormat::Data("json".into())),
             ],
+            "m",
+            &[],
         )
         .expect("assembler");
         for k in 0..3 {
@@ -1370,6 +1528,8 @@ mod tests {
                 bound("v", 0, tb, video()),
                 bound("w", 1, MICROS, StreamFormat::Data("json".into())),
             ],
+            "m",
+            &[],
         )
         .expect("assembler");
         for k in 0..3 {
@@ -1399,7 +1559,7 @@ mod tests {
             Clock::Rate(Rational { num: 10, den: 1 }),
         );
         let tb = TimeBase { num: 1, den: 20 };
-        let mut a = Assembler::new(&s, &[bound("v", 0, tb, video())]).expect("assembler");
+        let mut a = Assembler::new(&s, &[bound("v", 0, tb, video())], "m", &[]).expect("assembler");
         a.arrive(0, frame(0, &[])).expect("video");
         assert!(
             a.next_rate(false).expect("tick").is_none(),
@@ -1423,6 +1583,69 @@ mod tests {
     }
 
     #[test]
+    fn a_port_fed_group_hands_its_sound_cut_to_the_tick_beside_its_picture() {
+        let hold = |group: &str| {
+            Pairing::Hold(ffrwd_wasm_runtime::node::Hold {
+                anchor: ffrwd_wasm_runtime::node::Anchor::FirstFrame,
+                lead: 0.0,
+                linger: None,
+                timeout: None,
+                group: Some(group.to_string()),
+                port_param: Some("port".to_string()),
+            })
+        };
+        let s = shape(
+            vec![
+                port("v", PortKind::Video, Pairing::Lockstep, RowsUse::Ignore),
+                port("feed", PortKind::Video, hold("g"), RowsUse::Ignore),
+                port("feed_audio", PortKind::Audio, hold("g"), RowsUse::Ignore),
+            ],
+            Clock::Input("v".into()),
+        );
+        let tb = TimeBase { num: 1, den: 30 };
+        let mut a = Assembler::new(
+            &s,
+            &[
+                bound("v", 0, tb, video()),
+                bound("feed", 1, tb, video()),
+                bound("feed_audio", 2, KHZ48, audio()),
+            ],
+            "m",
+            &[1, 2],
+        )
+        .expect("assembler");
+        let source = |base| crate::hold::SourceInfo {
+            connection: 1,
+            tags: Vec::new(),
+            base,
+            info: StreamInfo::default(),
+        };
+        a.source_open(1, source(TimeBase { num: 1, den: 25 }))
+            .expect("open");
+        a.source_open(2, source(KHZ48)).expect("open");
+        for k in 0..3 {
+            a.arrive(0, frame(k, &[])).expect("video");
+        }
+        a.arrive(1, frame(0, &[])).expect("feed");
+        a.arrive(2, samples(0, 1024)).expect("sound");
+        a.arrive(2, samples(1024, 1024)).expect("sound");
+        let ticks = drain(&mut a);
+        assert_eq!(ticks.len(), 2);
+        let picture = &ticks[0].streams[1];
+        assert_eq!(
+            picture.feed.as_ref().map(|f| f.start.at),
+            Some(0),
+            "lead 0: up at once"
+        );
+        assert_eq!(picture.frames.len(), 1);
+        let sound = &ticks[0].streams[2];
+        assert_eq!(sound.feed.as_ref().map(|f| f.start.at), Some(0));
+        assert_eq!(sound.frames.len(), 1, "{:?}", sound.frames);
+        assert_eq!(sound.frames[0].data.len(), 1600 * 4);
+        assert_eq!(sound.info.as_ref().map(|(_, base)| *base), Some(KHZ48));
+    }
+
+    #[test]
     fn a_data_clock_ticks_once_per_pts_and_a_packets_clock_on_its_running_dts() {
         let s = shape(
             vec![port(
@@ -1436,6 +1659,8 @@ mod tests {
         let mut a = Assembler::new(
             &s,
             &[bound("d", 0, MICROS, StreamFormat::Data("json".into()))],
+            "m",
+            &[],
         )
         .expect("assembler");
         a.arrive(0, message(0, "{}")).expect("m");
@@ -1462,7 +1687,8 @@ mod tests {
             profile: None,
             level: None,
         });
-        let mut a = Assembler::new(&s, &[bound("p", 0, MICROS, coded)]).expect("assembler");
+        let mut a =
+            Assembler::new(&s, &[bound("p", 0, MICROS, coded)], "m", &[]).expect("assembler");
         for (pts, dts) in [(20, Some(0)), (0, Some(10)), (10, None)] {
             a.arrive(
                 0,
@@ -1495,6 +1721,8 @@ mod tests {
         let mut a = Assembler::new(
             &s,
             &[bound("d", 3, MICROS, StreamFormat::Data("json".into()))],
+            "m",
+            &[],
         )
         .expect("assembler");
         a.arrive(3, message(40, "{}")).expect("m");

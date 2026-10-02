@@ -152,7 +152,8 @@ fn a_shape_the_wit_refuses_is_refused_naming_the_module_and_the_port() {
 fn a_frame_handed_back_with_same_leaves_on_the_inputs_own_buffer() {
     let path = probe();
     let latched = vec!["copy".to_string(), "spots".to_string()];
-    let mut node = WitNode::open(path, "", vec![picture()], &latched).expect("open");
+    let mut node =
+        WitNode::open(path, "", vec![picture()], &["v".to_string()], &latched).expect("open");
     let copy = node.shape().output_index("copy").expect("copy");
     let spots = node.shape().output_index("spots").expect("spots");
 
@@ -196,7 +197,7 @@ fn a_frame_handed_back_with_same_leaves_on_the_inputs_own_buffer() {
 #[test]
 fn params_whose_shape_differs_are_refused_and_the_rest_reach_the_module() {
     let path = probe();
-    let mut node = WitNode::open(path, "", vec![picture()], &[]).expect("open");
+    let mut node = WitNode::open(path, "", vec![picture()], &["v".to_string()], &[]).expect("open");
     node.set_params("{}").expect("the same shape");
     let refusal = node
         .set_params(r#"{"canvas":{"width":4,"height":4}}"#)
@@ -211,10 +212,16 @@ fn a_stream_the_shape_cannot_take_is_refused_before_init() {
     let mut misplaced = picture();
     misplaced.port = "words".to_string();
     misplaced.id = 8;
-    let refusal = WitNode::open(path, "", vec![picture(), misplaced], &[])
-        .err()
-        .expect("a picture on a data port")
-        .to_string();
+    let refusal = WitNode::open(
+        path,
+        "",
+        vec![picture(), misplaced],
+        &["v".to_string()],
+        &[],
+    )
+    .err()
+    .expect("a picture on a data port")
+    .to_string();
     assert!(
         refusal.contains("input 'words' takes data and is bound a video stream"),
         "{refusal}"

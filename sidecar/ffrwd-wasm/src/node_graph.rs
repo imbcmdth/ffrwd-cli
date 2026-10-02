@@ -15,8 +15,8 @@ use std::thread;
 use anyhow::{anyhow, bail, Context, Result};
 use ffrwd_wasm::nut;
 use ffrwd_wasm_runtime::node::{
-    BoundStream, Clock, Node, NodeShape, OutputFormat, PortKind, Rational, RowsUse, StreamFormat,
-    TickFrame,
+    BoundStream, Clock, Node, NodeShape, OutputFormat, Pairing, PortKind, Rational, RowsUse,
+    StreamFormat, TickFrame,
 };
 use ffrwd_wasm_runtime::runtime::{
     self, AudioFormat, Format, FormatOf, Media, Message, Packet, RenditionMeta, StreamInfo,
@@ -25,6 +25,7 @@ use ffrwd_wasm_runtime::runtime::{
 
 use crate::adapters::FilterNode;
 use crate::edges::{self, Target};
+use crate::feeds::{self, FeedMember, FeedSpec};
 use crate::graph::{self, NodeCall, NodePad, StreamClass, StreamRef, ROWS_PORT};
 use crate::heartbeat;
 use crate::host_nodes;
@@ -166,6 +167,8 @@ struct Opened {
     input_ids: Vec<Vec<u32>>,
     streams: Vec<StreamDef>,
     writers: Vec<edges::Writer>,
+    /// The ports the host listens on for hold inputs given by one.
+    feeds: Vec<FeedSpec>,
 }
 
 pub fn run(args: &Args, bindings: &[Binding], wiring: &str) -> Result<()> {
@@ -208,9 +211,20 @@ pub fn run(args: &Args, bindings: &[Binding], wiring: &str) -> Result<()> {
         input_ids,
         streams,
         mut writers,
+        feeds,
     } = open(args, bindings, &calls, &headers, wake)?;
     let scheduler = Arc::new(Scheduler::start(plan, workers)?);
     let _ = wake_slot.set(scheduler.waker());
+
+    let mut listeners = Vec::with_capacity(feeds.len());
+    for spec in feeds {
+        let scheduler = Arc::clone(&scheduler);
+        listeners.push(thread::spawn(move || {
+            if let Err(e) = feeds::serve(spec, Arc::clone(&scheduler)) {
+                scheduler.fail(e);
+            }
+        }));
+    }
 
     let mut readers = Vec::with_capacity(inputs.len());
     for (index, input) in inputs.into_iter().enumerate() {
@@ -234,6 +248,9 @@ pub fn run(args: &Args, bindings: &[Binding], wiring: &str) -> Result<()> {
     }
     let finished = scheduler.finish();
     drop(readers);
+    for listener in listeners {
+        let _ = listener.join();
+    }
     finished?;
     for writer in &mut writers {
         writer.join();
@@ -372,6 +389,7 @@ fn open(
     let mut label_ids: HashMap<String, u32> = HashMap::new();
     let mut consumers: HashMap<u32, Vec<Consumer>> = HashMap::new();
     let mut lanes: Vec<LaneSpec> = Vec::with_capacity(calls.len());
+    let mut feeds: Vec<FeedSpec> = Vec::new();
     for &index in &order {
         let call = &calls[index];
         let kind = match paths.get(call.module.as_str()) {
@@ -425,11 +443,17 @@ fn open(
         }
 
         let lane = match &kind {
-            Kind::Module { path } => open_module(args, &call.module, path, call, &pads, &streams)?,
+            Kind::Module { path } => {
+                open_module(args, &call.module, path, call, &pads, &mut streams)?
+            }
             Kind::OldFilter { path } => open_old_filter(&call.module, path, call, &pads, &streams)?,
             Kind::Host => open_host(call, &pads, &streams)?,
         };
-        let Opening { mut spec, outputs } = lane;
+        let Opening {
+            mut spec,
+            outputs,
+            feeds: listened,
+        } = lane;
         let lane_index = lanes.len();
         for (_, id) in &pads {
             consumers
@@ -437,6 +461,15 @@ fn open(
                 .or_default()
                 .push(Consumer::Lane(lane_index));
         }
+        for spec in &listened {
+            for member in &spec.members {
+                consumers
+                    .entry(member.id)
+                    .or_default()
+                    .push(Consumer::Lane(lane_index));
+            }
+        }
+        feeds.extend(listened);
         for (position, (port, label)) in call.outputs.iter().enumerate() {
             let name = match port {
                 Some(name) => name.clone(),
@@ -578,6 +611,7 @@ fn open(
         input_ids,
         streams,
         writers,
+        feeds,
     })
 }
 
@@ -663,10 +697,12 @@ fn topological(calls: &[NodeCall], labels: &HashMap<&str, usize>) -> Result<Vec<
     Ok(order)
 }
 
-/// A lane, and per output port the stream it writes.
+/// A lane, per output port the stream it writes, and the ports its hold
+/// inputs are served from.
 struct Opening {
     spec: LaneSpec,
     outputs: Vec<Option<StreamDef>>,
+    feeds: Vec<FeedSpec>,
 }
 
 fn bound_stream(port: &str, id: u32, def: &StreamDef) -> BoundStream {
@@ -856,16 +892,14 @@ fn open_module(
     path: &str,
     call: &NodeCall,
     pads: &[(String, u32)],
-    defs: &[StreamDef],
+    defs: &mut Vec<StreamDef>,
 ) -> Result<Opening> {
-    let params = match args.node_params.get(name) {
+    let meta =
+        runtime::describe_node(path).with_context(|| format!("describing module '{name}'"))?;
+    let schema = parse_schema(&meta.params_schema, name)?;
+    let mut params = match args.node_params.get(name) {
         Some(params) => params.clone(),
-        None => {
-            let meta = runtime::describe_node(path)
-                .with_context(|| format!("describing module '{name}'"))?;
-            let schema = parse_schema(&meta.params_schema, name)?;
-            params_json(name, &schema, &call.options)?
-        }
+        None => params_json(name, &schema, &call.options)?,
     };
     let mut wanted: Vec<String> = Vec::new();
     for (port, _) in pads {
@@ -881,13 +915,26 @@ fn open_module(
             bound.push(bound_stream(port, *id, &defs[*id as usize]));
         }
     }
+    let feeds = listen_for(
+        name,
+        &shape,
+        &wanted,
+        &mut bound,
+        &mut params,
+        &schema,
+        defs,
+    )?;
+    let port_fed: Vec<u32> = feeds
+        .iter()
+        .flat_map(|f| f.members.iter().map(|m| m.id))
+        .collect();
     let latched: Vec<String> = call
         .outputs
         .iter()
         .filter_map(|(port, _)| port.clone())
         .filter(|port| port != ROWS_PORT)
         .collect();
-    let node = WitNode::open(path, &params, bound.clone(), &latched)
+    let node = WitNode::open(path, &params, bound.clone(), &wanted, &latched)
         .with_context(|| format!("opening {name} from {path}"))?;
     let mut resolved = node.shape().clone();
     resolve_rate(&mut resolved, &bound, defs)?;
@@ -895,11 +942,18 @@ fn open_module(
     let outputs = output_streams(name, &node, &resolved, &bound, defs, tick)?;
     let opener: Opener = {
         let (path, params, bound, latched) = (path.to_string(), params, bound.clone(), latched);
+        let wanted = wanted.clone();
         Arc::new(move || {
-            Ok(Box::new(WitNode::open(&path, &params, bound.clone(), &latched)?) as Box<dyn Node>)
+            Ok(Box::new(WitNode::open(
+                &path,
+                &params,
+                bound.clone(),
+                &wanted,
+                &latched,
+            )?) as Box<dyn Node>)
         })
     };
-    let assembler = Assembler::new(&resolved, &bound)?;
+    let assembler = Assembler::new(&resolved, &bound, name, &port_fed)?;
     Ok(Opening {
         spec: LaneSpec {
             name: name.to_string(),
@@ -907,13 +961,209 @@ fn open_module(
             bound: bound.iter().map(|b| b.id).collect(),
             ports: vec![None; resolved.outputs.len()],
             shape: resolved,
-            intake: Intake::Assembled(assembler),
+            intake: Intake::Assembled(Box::new(assembler)),
             tick_base: tick,
             runners: vec![Box::new(node)],
             opener: Some(opener),
             rows: None,
         },
         outputs,
+        feeds,
+    })
+}
+
+/// The ports `name`'s hold inputs are served from: one listener per group
+/// of hold inputs that name a port param and the call left unbound, each
+/// bound a stream of the host's own in the port's format. A hold input
+/// bound to a stream gets the port the host picked written into its param.
+fn listen_for(
+    name: &str,
+    shape: &NodeShape,
+    wanted: &[String],
+    bound: &mut Vec<BoundStream>,
+    params: &mut String,
+    schema: &serde_json::Value,
+    defs: &mut Vec<StreamDef>,
+) -> Result<Vec<FeedSpec>> {
+    let mut feeds: Vec<FeedSpec> = Vec::new();
+    let mut groups: Vec<(Option<String>, usize)> = Vec::new();
+    for input in &shape.inputs {
+        let Pairing::Hold(hold) = &input.pairing else {
+            continue;
+        };
+        let Some(param) = &hold.port_param else {
+            continue;
+        };
+        if wanted.contains(&input.name) {
+            let port = free_port()?;
+            *params = with_param(params, param, port)?;
+            continue;
+        }
+        let port = port_param(params, schema, param, name, &input.name)?;
+        let format = conformed(name, shape, input, bound)?;
+        let id = defs.len() as u32;
+        let micros = TimeBase {
+            num: 1,
+            den: 1_000_000,
+        };
+        let base = match &shape.clock {
+            Clock::Input(clock) => bound
+                .iter()
+                .find(|b| &b.port == clock)
+                .map_or(micros, |b| b.time_base),
+            _ => micros,
+        };
+        let def = StreamDef {
+            info: info_for(&format),
+            format,
+            base,
+            decode_delay: 0,
+            latency: None,
+            header: None,
+            frame_rate: None,
+            spelling: format!(
+                "the feed on 127.0.0.1:{port} for input '{}' of {name}",
+                input.name
+            ),
+        };
+        bound.push(bound_stream(&input.name, id, &def));
+        let member = FeedMember {
+            id,
+            name: input.name.clone(),
+            format: def.format.clone(),
+        };
+        defs.push(def);
+        let group = hold
+            .group
+            .as_ref()
+            .and_then(|g| groups.iter().find(|(k, _)| k.as_ref() == Some(g)))
+            .map(|(_, index)| *index);
+        match group {
+            Some(index) => {
+                if feeds[index].port != port {
+                    bail!(
+                        "{name} input '{}' is on port {port} and its group's picture on port {}; \
+                         a group arrives on one connection",
+                        input.name,
+                        feeds[index].port
+                    );
+                }
+                feeds[index].members.push(member);
+            }
+            None => {
+                groups.push((hold.group.clone(), feeds.len()));
+                feeds.push(FeedSpec {
+                    node: name.to_string(),
+                    port,
+                    members: vec![member],
+                });
+            }
+        }
+    }
+    for feed in &mut feeds {
+        feed.members
+            .sort_by_key(|m| !matches!(m.format, StreamFormat::Video(_)));
+    }
+    Ok(feeds)
+}
+
+/// A free loopback port, for the param of a hold input bound to a stream.
+fn free_port() -> Result<u16> {
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .context("picking a loopback port")?;
+    Ok(listener.local_addr()?.port())
+}
+
+fn params_object(params: &str) -> Result<serde_json::Map<String, serde_json::Value>> {
+    if params.trim().is_empty() {
+        return Ok(serde_json::Map::new());
+    }
+    match serde_json::from_str(params)? {
+        serde_json::Value::Object(map) => Ok(map),
+        _ => bail!("the params are not a JSON object"),
+    }
+}
+
+fn with_param(params: &str, key: &str, port: u16) -> Result<String> {
+    let mut map = params_object(params)?;
+    map.insert(key.to_string(), serde_json::Value::from(port));
+    Ok(serde_json::Value::Object(map).to_string())
+}
+
+/// The port a hold input's param names: what the call wrote, or the
+/// param's default.
+fn port_param(
+    params: &str,
+    schema: &serde_json::Value,
+    key: &str,
+    name: &str,
+    input: &str,
+) -> Result<u16> {
+    let written = params_object(params)?.get(key).cloned();
+    let value = written.or_else(|| {
+        schema
+            .get("properties")
+            .and_then(|p| p.get(key))
+            .and_then(|p| p.get("default"))
+            .cloned()
+    });
+    let number = value.as_ref().and_then(|v| v.as_u64());
+    match number.and_then(|n| u16::try_from(n).ok()) {
+        Some(port) if port > 0 => Ok(port),
+        _ => bail!(
+            "{name} input '{input}' is held on the port its param '{key}' names, and the call \
+             wrote {} there; a loopback port is 1 to 65535",
+            value.map_or("nothing".to_string(), |v| v.to_string())
+        ),
+    }
+}
+
+/// The format a port feed is conformed to: the input it follows (`like`),
+/// or the clock input's where that is the same kind, with the port's own
+/// pixel or sample format where it names one.
+fn conformed(
+    name: &str,
+    shape: &NodeShape,
+    input: &ffrwd_wasm_runtime::node::InputPort,
+    bound: &[BoundStream],
+) -> Result<StreamFormat> {
+    let followed = input.accepts.like.clone().or_else(|| match &shape.clock {
+        Clock::Input(clock) => Some(clock.clone()),
+        _ => None,
+    });
+    let model = followed
+        .as_ref()
+        .and_then(|port| bound.iter().find(|b| &b.port == port))
+        .filter(|b| b.format.kind() == input.kind)
+        .map(|b| b.format.clone());
+    let Some(model) = model else {
+        bail!(
+            "{name} input '{}' is held on a port and follows no bound {} input (accepts.like), \
+             so the host cannot say what a feed is conformed to",
+            input.name,
+            input.kind.name()
+        );
+    };
+    Ok(match model {
+        StreamFormat::Video(v) => {
+            let pix_fmt = match input.accepts.pixel_formats.first() {
+                Some(first) => intern(first, KNOWN_PIX_FMTS, "pixel format")?,
+                None => v.pix_fmt,
+            };
+            StreamFormat::Video(VideoFormat {
+                pix_fmt,
+                frame_len: crate::frame_len_for(pix_fmt, v.width, v.height)?,
+                ..v
+            })
+        }
+        StreamFormat::Audio(a) => {
+            let sample_fmt = match input.accepts.sample_formats.first() {
+                Some(first) => intern(first, KNOWN_SAMPLE_FMTS, "sample format")?,
+                None => a.sample_fmt,
+            };
+            StreamFormat::Audio(AudioFormat { sample_fmt, ..a })
+        }
+        other => other,
     })
 }
 
@@ -971,7 +1221,7 @@ fn open_old_filter(
             Ok(Box::new(FilterNode::open(&path, &format, &info, &params)?) as Box<dyn Node>)
         })
     };
-    let assembler = Assembler::new(&shape, &bound)?;
+    let assembler = Assembler::new(&shape, &bound, name, &[])?;
     Ok(Opening {
         spec: LaneSpec {
             name: name.to_string(),
@@ -979,13 +1229,14 @@ fn open_old_filter(
             bound: bound.iter().map(|b| b.id).collect(),
             ports: vec![None; shape.outputs.len()],
             shape,
-            intake: Intake::Assembled(assembler),
+            intake: Intake::Assembled(Box::new(assembler)),
             tick_base: tick,
             runners: vec![Box::new(node)],
             opener: Some(opener),
             rows: None,
         },
         outputs,
+        feeds: Vec::new(),
     })
 }
 
@@ -1033,6 +1284,7 @@ fn open_host(call: &NodeCall, pads: &[(String, u32)], defs: &[StreamDef]) -> Res
             rows: None,
         },
         outputs: vec![Some(output)],
+        feeds: Vec::new(),
     })
 }
 

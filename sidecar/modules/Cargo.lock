@@ -1976,6 +1976,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "shape-switch"
+version = "0.1.0"
+dependencies = [
+ "ffrwd-node",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "shape-window"
 version = "0.1.0"
 dependencies = [
