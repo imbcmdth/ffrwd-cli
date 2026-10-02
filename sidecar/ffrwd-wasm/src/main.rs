@@ -4620,6 +4620,7 @@ mod pad_spec_tests {
                     codecs: Some("avc1.640028".to_string()),
                     language: Some("en".to_string()),
                 },
+                color: None,
             }
         );
     }
