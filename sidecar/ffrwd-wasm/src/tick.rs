@@ -23,8 +23,8 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Result};
 use ffrwd_wasm_runtime::node::{
-    Anchor, BoundStream, Clock, Feed, Hold, InputPort, NodeShape, Pairing, PortKind, RowsUse,
-    StreamFormat, Tick, TickFrame, TickStream, TimedRows,
+    Anchor, BoundStream, Clock, Feed, Hold, InputPort, Interval, NodeShape, Pairing, PortKind,
+    RowsUse, StreamFormat, Tick, TickFrame, TickStream, TimedRows,
 };
 use ffrwd_wasm_runtime::runtime::{AudioFormat, Format, Frame, Message, Packet, Shape, TimeBase};
 
@@ -585,6 +585,7 @@ impl Assembler {
         };
         let mut inputs = Vec::with_capacity(bound.len());
         let mut holds: Vec<Group> = Vec::new();
+        let mut on_groups: Vec<(usize, String, Member, bool)> = Vec::new();
         let mut grouped: Vec<(Option<String>, Hold, Vec<Member>, bool)> = Vec::new();
         for stream in bound {
             let port = shape
@@ -609,6 +610,7 @@ impl Assembler {
                         base: stream.time_base,
                         info: stream.info.clone(),
                         audio,
+                        ahead: 0.0,
                     };
                     let fed = port_fed.contains(&stream.id);
                     let key = hold.group.clone();
@@ -625,6 +627,26 @@ impl Assembler {
                     grouped[group].2.push(member);
                     grouped[group].3 |= fed;
                     Some((group, grouped[group].2.len() - 1))
+                }
+                Pairing::Interval(Interval {
+                    group: Some(group),
+                    ahead,
+                    ..
+                }) => {
+                    on_groups.push((
+                        inputs.len(),
+                        group.clone(),
+                        Member {
+                            name: port.name.clone(),
+                            kind: port.kind,
+                            base: stream.time_base,
+                            info: stream.info.clone(),
+                            audio: None,
+                            ahead: *ahead,
+                        },
+                        port_fed.contains(&stream.id),
+                    ));
+                    None
                 }
                 _ => None,
             };
@@ -652,6 +674,21 @@ impl Assembler {
                 hold,
                 restamp,
             });
+        }
+        for (index, key, member, fed) in on_groups {
+            let Some(group) = grouped
+                .iter()
+                .position(|(g, ..)| g.as_deref() == Some(key.as_str()))
+            else {
+                bail!(
+                    "input '{}' arrives on group '{key}', and this call binds none of that \
+                     group's hold inputs",
+                    member.name
+                );
+            };
+            grouped[group].2.push(member);
+            grouped[group].3 |= fed;
+            inputs[index].hold = Some((group, grouped[group].2.len() - 1));
         }
         for (_, hold, members, fed) in grouped {
             holds.push(Group::new(hold, name, members, fed));
@@ -735,6 +772,17 @@ impl Assembler {
             (Some((group, member)), Item::Frame(frame)) => {
                 self.holds[group].arrive(member, frame);
             }
+            (Some((group, member)), Item::Message(message)) => {
+                self.holds[group].arrive(
+                    member,
+                    TickFrame {
+                        pts: message.pts,
+                        duration: None,
+                        data: Arc::new(message.data),
+                        rows: Vec::new(),
+                    },
+                );
+            }
             (Some(_), _) => {}
             (None, item) => input.queue.push_back(item),
         }
@@ -745,6 +793,10 @@ impl Assembler {
     /// `pts`.
     pub fn progress(&mut self, id: u32, pts: i64) -> Result<()> {
         let input = self.input(id)?;
+        if let Some((group, member)) = input.hold {
+            self.holds[group].mark(member, pts);
+            return Ok(());
+        }
         if let Some(pts) = input.placed(pts) {
             input.progress = Some(input.progress.map_or(pts, |p| p.max(pts)));
         }
@@ -1235,6 +1287,9 @@ impl Assembler {
                 if input.restamp.is_some_and(|r| r.waiting()) {
                     return true;
                 }
+                if let Some((group, _)) = input.hold {
+                    return self.holds[group].ready(pts, end, base, self.reference(base));
+                }
                 let Some(end) = end else {
                     return false;
                 };
@@ -1305,6 +1360,13 @@ impl Assembler {
                     let handed = std::mem::take(&mut held[group][member]);
                     stream.frames = handed.frames;
                     stream.feed = handed.feed;
+                    stream.info = handed.info;
+                }
+            }
+            Pairing::Interval(_) if input.hold.is_some() => {
+                if let Some((group, member)) = input.hold {
+                    let handed = std::mem::take(&mut held[group][member]);
+                    stream.messages = handed.messages;
                     stream.info = handed.info;
                 }
             }

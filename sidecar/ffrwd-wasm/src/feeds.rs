@@ -19,7 +19,7 @@ use ffrwd_frame::yuv::{self, Colour};
 use ffrwd_frame::Rgba;
 use ffrwd_wasm::nut::{self, Event, Limits, Media, PushDemuxer};
 use ffrwd_wasm_runtime::node::{StreamFormat, TickFrame};
-use ffrwd_wasm_runtime::runtime::{AudioFormat, ColorInfo, StreamInfo, VideoFormat};
+use ffrwd_wasm_runtime::runtime::{AudioFormat, ColorInfo, Message, StreamInfo, VideoFormat};
 use serde_json::json;
 
 use crate::hold::SourceInfo;
@@ -186,6 +186,8 @@ enum Convert {
     Timing {
         audio: Option<usize>,
     },
+    /// A data member's messages, as they are.
+    Data,
 }
 
 /// One stream of a connection: which member it feeds, and how.
@@ -260,12 +262,14 @@ fn match_streams(spec: &FeedSpec, conn: &mut Conn, report: &mut dyn FnMut(String
         let kind = match stream.media {
             Media::Video { .. } => "video",
             Media::Audio { .. } => "audio",
+            Media::Other { .. } if stream.is_json() => "data",
             Media::Other { .. } => continue,
         };
         let member = spec.members.iter().enumerate().find_map(|(m, member)| {
             let wanted = match &member.format {
                 StreamFormat::Video(_) => "video",
                 StreamFormat::Audio(_) => "audio",
+                StreamFormat::Data(_) => "data",
                 _ => "",
             };
             (!taken[m] && wanted == kind).then_some(m)
@@ -298,6 +302,15 @@ fn match_streams(spec: &FeedSpec, conn: &mut Conn, report: &mut dyn FnMut(String
                 member,
                 base: stream.time_base,
                 convert: Convert::Timing { audio },
+            });
+            continue;
+        }
+        if kind == "data" {
+            taken[member] = true;
+            conn.lanes[index] = Some(Lane {
+                member,
+                base: stream.time_base,
+                convert: Convert::Data,
             });
             continue;
         }
@@ -433,6 +446,7 @@ fn sources(spec: &FeedSpec, conn: &Conn) -> Vec<(u32, SourceInfo)> {
         let member = &spec.members[lane.member];
         let (kind, codec) = match &lane.convert {
             Convert::Picture(_) | Convert::Timing { audio: None } => ("video", "rawvideo"),
+            Convert::Data => ("data", "json"),
             Convert::Timing { audio: Some(_) } => match &member.format {
                 StreamFormat::Audio(a) if a.sample_fmt == "s16" => ("audio", "pcm_s16le"),
                 _ => ("audio", "pcm_f32le"),
@@ -656,6 +670,19 @@ fn drain(
                 };
                 let payload = conn.demux.payload();
                 let member = &spec.members[lane.member];
+                if let Convert::Data = lane.convert {
+                    if crate::heartbeat::is_heartbeat(payload) {
+                        continue;
+                    }
+                    let message = Message {
+                        pts: packet.pts,
+                        data: payload.to_vec(),
+                    };
+                    if !scheduler.arrive(member.id, Item::Message(message)) {
+                        return Ok(false);
+                    }
+                    continue;
+                }
                 if !matches!(lane.convert, Convert::Timing { .. }) {
                     carried.conformed.fetch_add(1, Ordering::Relaxed);
                     carried
@@ -663,6 +690,7 @@ fn drain(
                         .fetch_add(payload.len() as u64, Ordering::Relaxed);
                 }
                 let frame = match &lane.convert {
+                    Convert::Data => continue,
                     Convert::Timing { audio } => TickFrame {
                         pts: packet.pts,
                         duration: audio.map(|width| (payload.len() / width.max(1)) as i64),

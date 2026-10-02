@@ -31,6 +31,7 @@ const MODULES: &[&str] = &[
     "shape-state",
     "shape-window",
     "shape-hold",
+    "shape-probe",
 ];
 
 const RATE: u32 = 48_000;
@@ -237,6 +238,9 @@ struct Feeder {
     /// Stops writing after this many frames and holds the connection
     /// open: a feeder that stalls for good.
     stop_after: Option<i64>,
+    /// Rows on a data stream of their own after the picture and sound, each
+    /// at a time in milliseconds of the feeder's own clock.
+    rows: Vec<(i64, String)>,
 }
 
 impl Feeder {
@@ -256,6 +260,7 @@ impl Feeder {
             stall: None,
             hold_open: None,
             stop_after: None,
+            rows: Vec::new(),
         }
     }
 
@@ -293,6 +298,9 @@ impl Feeder {
                 den: u64::from(RATE),
             };
             streams.push(audio);
+        }
+        if !self.rows.is_empty() {
+            streams.push(Stream::json(TimeBase { num: 1, den: 1000 }));
         }
         streams
     }
@@ -383,6 +391,8 @@ fn feed(port: u16, feeder: Feeder, after: Duration) -> JoinHandle<Fed> {
         let packet = 1024i64;
         let mut written = 0;
         let mut stalled = false;
+        let data = usize::from(feeder.picture) + usize::from(feeder.sound);
+        let mut rows = feeder.rows.iter().peekable();
         for j in 0..frames {
             if feeder.stop_after.is_some_and(|n| j >= n) {
                 break;
@@ -415,6 +425,20 @@ fn feed(port: u16, feeder: Feeder, after: Duration) -> JoinHandle<Fed> {
                         };
                     }
                     sample += packet;
+                }
+            }
+            let millis = ((feeder.start + at) * 1000.0).round() as i64;
+            while let Some((row_at, text)) = rows.next_if(|row| row.0 <= millis) {
+                let packet = nut::Packet {
+                    pts: *row_at,
+                    dts: Some(*row_at),
+                    keyframe: true,
+                };
+                if muxer
+                    .write_coded_to(data, &packet, text.as_bytes())
+                    .is_err()
+                {
+                    break;
                 }
             }
             if feeder.picture && muxer.write_frame_to(0, pts, &feeder.frame(j)).is_err() {
@@ -629,7 +653,7 @@ fn start_padded(
     } else {
         command.args(["-f", "nut", &out]);
     }
-    if chain.contains("[feeds=f]") {
+    if chain.contains("[feeds=f]") || chain.contains("[spots=f]") {
         command.args(["-map", "[f]", "-f", "ndjson", &feeds]);
     }
     if chain.contains("[clock=c]") {
@@ -1511,5 +1535,67 @@ fn throughput(width: u32, height: u32) {
     eprintln!(
         "throughput: 150 frames of {width}x{height} rgba written in {wrote:.2}s, {shown} shown, \
          {repeated} repeated, the insertion lasted {lasted:.2}s"
+    );
+}
+
+#[test]
+fn rows_a_feeder_writes_beside_its_picture_and_sound_land_with_the_groups_offset() {
+    let _serial = serial();
+    let program = Program::new(30, 3.0);
+    let (mut run, port) = start(
+        "group-rows",
+        &program,
+        "2",
+        &["shape_probe"],
+        "[v=0:v]shape_probe=port={port}[copy=o][spots=f]",
+    );
+    wait_for_port(&mut run, port);
+    let mut feeder = Feeder::new(30, 1.2);
+    feeder.start = 10.0;
+    feeder.rows = vec![
+        (10_200, r#"{"text":"a"}"#.to_string()),
+        (10_600, r#"{"text":"b"}"#.to_string()),
+    ];
+    let fed = feed(port, feeder, Duration::from_millis(300));
+    let out = finish(run);
+    let _ = fed.join();
+    let start = out
+        .feeds
+        .iter()
+        .find_map(|r| r.get("feed").cloned())
+        .unwrap_or_else(|| {
+            panic!(
+                "no feed came up:
+{}",
+                out.stderr
+            )
+        });
+    let at = start["at"].as_i64().expect("at");
+    let first_pts = start["first_pts"].as_i64().expect("first_pts");
+    assert_eq!(first_pts, 300, "the feeder's own origin, ten seconds in");
+    assert!(
+        start["known"].as_i64().expect("known") < at,
+        "an untimed feed is fixed a lead before it shows"
+    );
+    let mut cues: Vec<(i64, i64, String)> = Vec::new();
+    for row in &out.feeds {
+        let tick = (row["start_t"].as_f64().expect("a tick") * 30.0).round() as i64;
+        for cue in row["cues"].as_array().into_iter().flatten() {
+            cues.push((
+                tick,
+                cue[0].as_i64().expect("a pts"),
+                cue[1]["text"].as_str().expect("its text").to_string(),
+            ));
+        }
+    }
+    assert_eq!(
+        cues,
+        vec![
+            (at + 6, at + 6, "a".to_string()),
+            (at + 18, at + 18, "b".to_string()),
+        ],
+        "each row at the clock time its feeder's picture of that moment shows, on that tick:
+{}",
+        out.stderr
     );
 }

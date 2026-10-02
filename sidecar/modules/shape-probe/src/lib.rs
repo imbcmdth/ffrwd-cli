@@ -12,7 +12,8 @@
 //! - `size`: video, optional, lockstep, read for its timing alone. Its
 //!   frames' pts ride each `spots` message; `fetch_size` fetches one,
 //!   which the host refuses. `v`'s hint at `init`, where it has a rate,
-//!   rides them too.
+//!   rides them too, and so does `feed`'s record and every message `cues`
+//!   is handed, at its pts.
 //! - `mask`: `v`'s size in gray, left out when `v` is not bound.
 //! - `copy`: `v` itself, frame for frame.
 //! - `canvas`: a video of the size `canvas` names, only when it does.
@@ -372,6 +373,29 @@ impl Guest for ShapeProbe {
         let calls = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
         let ordinal = tick.ordinal();
         let hint = HINT.with(|h| h.borrow().clone());
+        let mut feed = String::new();
+        for id in tick.streams("feed") {
+            if let Some(f) = tick.feed(id) {
+                feed = format!(
+                    r#","feed":{{"at":{},"first_pts":{},"known":{},"ends":{}}}"#,
+                    f.start.at,
+                    f.start.first_pts,
+                    f.start.known,
+                    f.ends.map_or("null".to_string(), |e| e.to_string())
+                );
+            }
+        }
+        let mut cues = String::new();
+        for id in tick.streams("cues") {
+            let messages = tick.messages(id);
+            if !messages.is_empty() {
+                let listed: Vec<String> = messages
+                    .iter()
+                    .map(|m| format!("[{},{}]", m.pts, String::from_utf8_lossy(&m.data)))
+                    .collect();
+                cues = format!(r#","cues":[{}]"#, listed.join(","));
+            }
+        }
         let mut size = String::new();
         for id in tick.streams("size") {
             let frames = tick.frames(id);
@@ -388,7 +412,7 @@ impl Guest for ShapeProbe {
             payload: Payload::Message(Message {
                 pts: (seconds * 1_000_000.0).round() as i64,
                 data: format!(
-                    r#"{{"start_t":{seconds},"ordinal":{ordinal},"calls":{calls}{size}{hint}}}"#
+                    r#"{{"start_t":{seconds},"ordinal":{ordinal},"calls":{calls}{size}{hint}{feed}{cues}}}"#
                 )
                 .into_bytes(),
             }),

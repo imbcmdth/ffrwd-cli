@@ -29,7 +29,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use ffrwd_wasm_runtime::node::{Anchor, Feed, FeedStart, Hold, PortKind, TickFrame};
-use ffrwd_wasm_runtime::runtime::{AudioFormat, StreamInfo, TimeBase};
+use ffrwd_wasm_runtime::runtime::{AudioFormat, Message, StreamInfo, TimeBase};
 use serde_json::json;
 
 use crate::leaky::ROW_PREFIX;
@@ -318,6 +318,9 @@ pub struct Member {
     pub base: TimeBase,
     pub info: StreamInfo,
     pub audio: Option<AudioFormat>,
+    /// A data member, an interval input on the group: seconds past a tick's
+    /// end whose messages it is handed with the tick.
+    pub ahead: f64,
 }
 
 /// The feed on the group's front source.
@@ -365,6 +368,8 @@ pub struct Group {
 #[derive(Debug, Clone, Default)]
 pub struct Handed {
     pub frames: Vec<TickFrame>,
+    /// A data member's messages, on the clock.
+    pub messages: Vec<Message>,
     pub feed: Option<Feed>,
     pub info: Option<(StreamInfo, TimeBase)>,
 }
@@ -374,6 +379,7 @@ impl Group {
         let lead = members
             .iter()
             .position(|m| m.kind == PortKind::Video)
+            .or_else(|| members.iter().position(|m| m.kind != PortKind::Data))
             .unwrap_or(0);
         Group {
             hold,
@@ -435,10 +441,15 @@ impl Group {
         }
         let back = self.sources.back_mut().expect("opened");
         back.brings[member] = true;
+        let members = &self.members;
         back.lead = if back.brings[self.lead] {
             self.lead
         } else {
-            back.brings.iter().position(|b| *b).unwrap_or(self.lead)
+            back.brings
+                .iter()
+                .zip(members)
+                .position(|(b, m)| *b && m.kind != PortKind::Data)
+                .unwrap_or(self.lead)
         };
         let queue = &mut back.members[member];
         queue.base = source.base;
@@ -496,6 +507,14 @@ impl Group {
             _ => frame.pts,
         });
         queue.push(frame);
+    }
+
+    /// A data member's producer is done to `pts`, in its own time.
+    pub fn mark(&mut self, member: usize, pts: i64) {
+        if let Some(source) = self.sources.back_mut().filter(|s| !s.closed) {
+            let queue = &mut source.members[member];
+            queue.last = Some(queue.last.map_or(pts, |last| last.max(pts)));
+        }
     }
 
     /// How many more frames the source may send before it waits: none while
@@ -589,8 +608,11 @@ impl Group {
         if source.closed || self.sources.len() > 1 {
             return true;
         }
-        let until = |kind: PortKind| match kind {
+        let until = |member: &Member| match member.kind {
             PortKind::Audio => end.unwrap_or(pts),
+            PortKind::Data => end
+                .unwrap_or(pts)
+                .saturating_add(ticks_of(member.ahead, clock_base)),
             _ => pts,
         };
         match &self.feed {
@@ -601,7 +623,7 @@ impl Group {
                     .zip(&self.members)
                     .zip(&source.brings)
                     .all(|((q, m), brings)| {
-                        let wanted = feed.offset.to_source(until(m.kind), clock_base, q.base);
+                        let wanted = feed.offset.to_source(until(m), clock_base, q.base);
                         !brings || q.last.is_some_and(|last| last > wanted)
                     });
                 settled || timed_out()
@@ -610,8 +632,11 @@ impl Group {
                 Anchor::FirstFrame => self.primed(source) || timed_out(),
                 _ => {
                     let lead = &source.members[source.lead];
-                    let kind = self.members[source.lead].kind;
-                    let wanted = Offset::ZERO.to_source(until(kind), clock_base, lead.base);
+                    let wanted = Offset::ZERO.to_source(
+                        until(&self.members[source.lead]),
+                        clock_base,
+                        lead.base,
+                    );
                     lead.last.is_some_and(|last| last > wanted) || timed_out()
                 }
             },
@@ -818,6 +843,33 @@ impl Group {
                 continue;
             }
             let queue = &mut source.members[index];
+            if member.kind == PortKind::Data {
+                let until = end.map(|end| end.saturating_add(ticks_of(member.ahead, clock_base)));
+                let mut messages = Vec::new();
+                while let Some(front) = queue.queue.front() {
+                    let at = feed.offset.to_clock(front.pts, queue.base, clock_base);
+                    if until.is_some_and(|until| at >= until) {
+                        break;
+                    }
+                    let message = queue.pop().expect("front is some");
+                    messages.push(Message {
+                        pts: at,
+                        data: message.data.as_ref().clone(),
+                    });
+                }
+                handed.push(Handed {
+                    messages,
+                    info: Some((
+                        StreamInfo {
+                            tags: source.tags.clone(),
+                            ..queue.info.clone()
+                        },
+                        clock_base,
+                    )),
+                    ..Handed::default()
+                });
+                continue;
+            }
             let mut frames = Vec::new();
             if live {
                 match member.kind {
@@ -862,6 +914,7 @@ impl Group {
             };
             handed.push(Handed {
                 frames,
+                messages: Vec::new(),
                 feed: Some(Feed {
                     start: FeedStart {
                         tags: source.tags.clone(),
@@ -1086,6 +1139,7 @@ mod tests {
             base,
             info: StreamInfo::default(),
             audio: None,
+            ahead: 0.0,
         }
     }
 
@@ -1101,6 +1155,7 @@ mod tests {
                 sample_fmt: "f32",
                 channel_layout: None,
             }),
+            ahead: 0.0,
         }
     }
 

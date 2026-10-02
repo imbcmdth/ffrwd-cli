@@ -1356,9 +1356,10 @@ fn restamped_bound(
     defs: &[StreamDef],
 ) -> Result<Vec<BoundStream>> {
     let restamps = |b: &BoundStream| {
-        shape
-            .input(&b.port)
-            .is_some_and(|p| crate::tick::restamped(p, b))
+        shape.input(&b.port).is_some_and(|p| {
+            crate::tick::restamped(p, b)
+                || matches!(&p.pairing, Pairing::Interval(i) if i.group.is_some())
+        })
     };
     if !bound.iter().any(restamps) {
         return Ok(bound.to_vec());
@@ -1430,11 +1431,84 @@ fn listen_for(
             )?;
         }
     }
+    for input in &shape.inputs {
+        let Pairing::Interval(interval) = &input.pairing else {
+            continue;
+        };
+        let Some(group) = &interval.group else {
+            continue;
+        };
+        let Some(&(_, at)) = groups
+            .iter()
+            .find(|(g, _)| g.as_deref() == Some(group.as_str()))
+        else {
+            continue;
+        };
+        if wanted.contains(&input.name) {
+            bail!(
+                "{name} input '{}' arrives on the connection of group '{group}', which a port \
+                 serves, and this call binds it a stream",
+                input.name
+            );
+        }
+        let format = StreamFormat::Data(runtime::DATA_CODEC.to_string());
+        let id = defs.len() as u32;
+        let def = StreamDef {
+            info: info_for(&format),
+            format,
+            base: clock_base(shape, bound),
+            decode_delay: 0,
+            latency: None,
+            header: None,
+            frame_rate: None,
+            spelling: format!(
+                "the data on 127.0.0.1:{} for input '{}' of {name}",
+                feeds[at].port, input.name
+            ),
+            rendition: RenditionMeta::default(),
+            row: None,
+        };
+        bound.push(bound_stream(
+            &input.name,
+            id,
+            &def,
+            hint_of(told, &input.name, 0),
+        ));
+        feeds[at].members.push(FeedMember {
+            id,
+            name: input.name.clone(),
+            format: def.format.clone(),
+            timing: false,
+        });
+        defs.push(def);
+    }
     for feed in &mut feeds {
         feed.members
             .sort_by_key(|m| !matches!(m.format, StreamFormat::Video(_)));
     }
     Ok(feeds)
+}
+
+/// The clock's time base as far as the shape and the streams bound so far
+/// say it: a rate clock's, an input clock's stream's, or microseconds.
+fn clock_base(shape: &NodeShape, bound: &[BoundStream]) -> TimeBase {
+    match &shape.clock {
+        Clock::Input(clock) => bound.iter().find(|b| &b.port == clock).map_or(
+            TimeBase {
+                num: 1,
+                den: 1_000_000,
+            },
+            |b| b.time_base,
+        ),
+        Clock::Rate(rate) => TimeBase {
+            num: u64::try_from(rate.den).unwrap_or(1),
+            den: u64::try_from(rate.num).unwrap_or(1),
+        },
+        _ => TimeBase {
+            num: 1,
+            den: 1_000_000,
+        },
+    }
 }
 
 /// One port a hold input is served on: a stream of the host's own bound to
