@@ -37,7 +37,7 @@ from ffrwd.compiler import (
 )
 from ffrwd.errors import ErrorCode, FfrwdError
 from ffrwd.execute import CHAIN, PIPELINE, PipeEdge, plan_argv, render_plan
-from ffrwd.functions import WasmFunction, package_modules
+from ffrwd.functions import Parameter, WasmFunction, package_modules
 from ffrwd.ir import ROWFILTER, Graph, RowsSink
 from ffrwd.lower import lower, lower_table
 from ffrwd.parser import ModuleExport, Resolved, parse, resolve
@@ -193,6 +193,7 @@ def test_a_declaration_rides_out_on_the_resolved_query() -> None:
         returns="video_stream",
         line=declared.line,
         col=declared.col,
+        outputs=(Parameter("", "video_stream"),),
     )
     assert [(p.name, p.type) for p in declared.params] == [("v", "video_stream")]
 

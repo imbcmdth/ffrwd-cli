@@ -79,6 +79,11 @@ PREDICATE = "pred"
 # the same way, and its one argument is the gap rows still merge across.
 ROWMERGE = "rowmerge"
 MAX_DISTANCE = "max_distance"
+# The same node over rows written once per tick, each carrying the pts its
+# span began at as `start_t`: runs of one `start_t` become one span, cut at
+# `max_span` seconds, which is also how late a span may leave.
+MAX_SPAN = "max_span"
+MERGE_SPANS = "merge_spans"
 
 # The node that drops the pictures of a live stream that fall too far behind
 # the wall clock. Hosted the same way; its arguments are how late, in seconds
@@ -103,6 +108,12 @@ STDERR_ROW = "ffrwd:row "
 # to a file in its own temporary directory, removed with it. A printed
 # command carrying one reads rather than runs.
 ROWS_DOCUMENT = "ffrwd:rows:"
+
+
+# Where a node's params go when they are too long for a command line, or not
+# a flat list of values: ``ffrwd:params:<process>:<node>``. A placeholder
+# like a rows document's, which a run resolves to a file of the params.
+PARAMS_FILE = "ffrwd:params:"
 
 
 def is_rows_document(path: str) -> bool:
@@ -173,6 +184,10 @@ class Node:
     # carries rows and no frames. Only a ROWS MODULE has any: it reads rows
     # and writes rows, so it has no `inputs` and no `outputs` at all.
     rows_inputs: list[str] = field(default_factory=list)
+    # A node module's port each input binds, one per input, and the port
+    # each output is, one per output. Empty for every other node.
+    ports: list[str] = field(default_factory=list)
+    out_ports: list[str] = field(default_factory=list)
 
     @property
     def rows_only(self) -> bool:
@@ -191,6 +206,10 @@ class Node:
             written["reads_annotations"] = True
         if self.rows_inputs:
             written["rows_inputs"] = list(self.rows_inputs)
+        if self.ports:
+            written["ports"] = list(self.ports)
+        if self.out_ports:
+            written["out_ports"] = list(self.out_ports)
         return written
 
     @classmethod
@@ -204,9 +223,13 @@ class Node:
         assert isinstance(node_filter, str)
         assert isinstance(node_args, dict)
         raw_rows_inputs = d.get("rows_inputs") or []
+        raw_ports = d.get("ports") or []
+        raw_out_ports = d.get("out_ports") or []
         assert isinstance(node_inputs, list)
         assert isinstance(node_outputs, list)
         assert isinstance(raw_rows_inputs, list)
+        assert isinstance(raw_ports, list)
+        assert isinstance(raw_out_ports, list)
         return cls(
             id=node_id,
             filter=node_filter,
@@ -215,6 +238,8 @@ class Node:
             outputs=[_parse_stream_type(x) for x in node_outputs],
             reads_annotations=bool(d.get("reads_annotations", False)),
             rows_inputs=[str(x) for x in raw_rows_inputs],
+            ports=[str(x) for x in raw_ports],
+            out_ports=[str(x) for x in raw_out_ports],
         )
 
 
@@ -916,6 +941,12 @@ class Graph:
     # Each run-time lateral: its data stream is a sink of its own, written to
     # the loopback port `tap` names, and its instances are started per message.
     laterals: list[Lateral] = field(default_factory=list)
+    # Each node module's node id -> the shape its call was given, as the
+    # sidecar wrote it: its ports, their pairings and its clock.
+    node_shapes: dict[str, dict[str, object]] = field(default_factory=dict)
+    # A node read in FROM: its alias -> the node making the alias's streams,
+    # which every ``src:<alias>`` ref has been rewritten to a pad of.
+    node_sources: dict[str, str] = field(default_factory=dict)
 
     @property
     def outputs(self) -> list[Output]:
@@ -995,6 +1026,10 @@ class Graph:
             }
         if self.laterals:
             d["laterals"] = [lateral.to_dict() for lateral in self.laterals]
+        if self.node_shapes:
+            d["node_shapes"] = {name: dict(shape) for name, shape in self.node_shapes.items()}
+        if self.node_sources:
+            d["node_sources"] = dict(self.node_sources)
         return d
 
     @classmethod
@@ -1026,10 +1061,7 @@ class Graph:
             for alias, bounds in raw_input_trims.items():
                 assert isinstance(bounds, list)
                 start, end = bounds
-                input_trims[str(alias)] = (
-                    float(start) if start is not None else None,
-                    float(end) if end is not None else None,
-                )
+                input_trims[str(alias)] = (_seconds(start), _seconds(end))
 
         raw_input_options = d.get("input_options")
         input_options: dict[str, dict[str, object]] = {}
@@ -1130,6 +1162,17 @@ class Graph:
         assert isinstance(raw_laterals, list)
         laterals = [Lateral.from_dict(one) for one in raw_laterals if isinstance(one, dict)]
 
+        raw_node_shapes = d.get("node_shapes") or {}
+        assert isinstance(raw_node_shapes, dict)
+        node_shapes = {
+            str(name): dict(shape)
+            for name, shape in raw_node_shapes.items()
+            if isinstance(shape, dict)
+        }
+        raw_node_sources = d.get("node_sources") or {}
+        assert isinstance(raw_node_sources, dict)
+        node_sources = {str(alias): str(name) for alias, name in raw_node_sources.items()}
+
         return cls(
             input_paths=[str(p) for p in raw_inputs],
             sources={str(k): int(v) for k, v in raw_sources.items()},
@@ -1151,7 +1194,20 @@ class Graph:
             dropped_aliases=dropped_aliases,
             feeders=feeders,
             laterals=laterals,
+            node_shapes=node_shapes,
+            node_sources=node_sources,
         )
+
+
+def _seconds(value: object) -> float | None:
+    """A written bound as it was: a whole number stays one, so it reads back
+    the way it was written."""
+    if value is None:
+        return None
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    assert isinstance(value, int | float | str)
+    return float(value)
 
 
 _MergeKey = tuple[str, tuple[tuple[str, object], ...]]

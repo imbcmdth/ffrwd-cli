@@ -1698,6 +1698,13 @@ _REPAIR: dict[ErrorCode, str] = {
         "two paths meet -- apply it after they meet, or drop it -- or record "
         "the input to a file first and write the query over the file."
     ),
+    ErrorCode.LIVE_LEAD: (
+        "A live query feeds a node an input later than the lead the node "
+        "needs on it; `message` names the node, the input, the lead and how "
+        "far behind the path feeding it runs. Feed that input from a path "
+        "with less delay -- fewer windowed nodes on the way, shorter windows "
+        "-- or give the node a longer lead where it takes one as a parameter."
+    ),
     ErrorCode.STARTUP_DEADLOCK: (
         "The query splits one input's streams apart and brings them back "
         "together in a way whose processes would each be waiting on the next "

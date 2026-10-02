@@ -71,6 +71,7 @@ from ffrwd.types import DISPOSITION_KEYS
 from ffrwd.warnings import FfrwdWarning, OnWarning, WarningCode
 from ffrwd.wasm import WORLDS, Described, SourceCatalog, SourceRendition
 from ffrwd.wasm import SourceTrack as WasmSourceTrack
+from tests.conftest import older_world_refusal
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 REPO_ROOT = PROJECT_ROOT.parent
@@ -14865,15 +14866,11 @@ def test_only_a_packet_filter_declares_several_annotation_columns() -> None:
         "  RETURNS video_stream\n"
         f"  AS '{ROWS_MODULE}', 'shots' LANGUAGE wasm;\n"
     )
-    with pytest.raises(FfrwdError) as caught:
-        resolve(
-            parse(
-                declare
-                + "COPY (SELECT blur(f.video[1]) FROM input('f.mp4') f) TO 'o.mp4'"
-            )
-        )
-    assert caught.value.code is ErrorCode.UNSUPPORTED_SQL
-    assert "takes the annotation column 'b' in position 3" in caught.value.message
+    refusal = older_world_refusal(
+        declare + "COPY (SELECT blur(f.video[1]) FROM input('f.mp4') f) TO 'o.mp4'"
+    )
+    assert refusal.code is ErrorCode.UNSUPPORTED_SQL
+    assert "takes the annotation column 'b' in position 3" in refusal.message
 
 
 def test_a_packets_call_inside_a_cte_body_is_refused() -> None:

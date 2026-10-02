@@ -40,6 +40,7 @@ from ffrwd.processes import (
 from ffrwd.registry import Registry, load_reference
 from ffrwd.split import insert_splits
 from ffrwd.wasm import WORLDS, Described
+from tests.conftest import older_world_refusal
 
 SNAPSHOT_PATH = Path(__file__).resolve().parent / "data" / "reference_registry.json"
 
@@ -400,15 +401,12 @@ def test_the_shapes_a_data_filter_is_declared_in() -> None:
 def test_a_data_filter_declaration_is_refused_by_what_it_gets_wrong(
     signature: str, needle: str
 ) -> None:
-    with pytest.raises(FfrwdError) as caught:
-        resolve(
-            parse(
-                f"CREATE FUNCTION f{signature} AS 'm.wasm', 'm' LANGUAGE wasm;\n"
-                "COPY (SELECT f(f.data[1])" + _FROM
-            )
-        )
-    assert caught.value.code is ErrorCode.UNSUPPORTED_SQL
-    assert needle in caught.value.message
+    refusal = older_world_refusal(
+        f"CREATE FUNCTION f{signature} AS 'm.wasm', 'm' LANGUAGE wasm;\n"
+        "COPY (SELECT f(f.data[1])" + _FROM
+    )
+    assert refusal.code is ErrorCode.UNSUPPORTED_SQL
+    assert needle in refusal.message
 
 
 def test_a_field_a_data_filter_does_not_return_is_refused_at_resolve() -> None:

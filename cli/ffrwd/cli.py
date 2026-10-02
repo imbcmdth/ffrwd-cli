@@ -191,7 +191,19 @@ from importlib import metadata
 from pathlib import Path
 from typing import Any
 
-from . import binaries, credentials, diagram, loudnorm, nn, redact, remote, show, store, wasm
+from . import (
+    binaries,
+    credentials,
+    diagram,
+    loudnorm,
+    nn,
+    redact,
+    remote,
+    show,
+    store,
+    timing,
+    wasm,
+)
 from . import packages as packages_module
 from . import publish as publish_module
 from . import registry as registry_module
@@ -540,6 +552,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--diagram",
         action="store_true",
         help="render the flowchart in the terminal (needs the diagram extra)",
+    )
+    explain_view.add_argument(
+        "--delays",
+        action="store_true",
+        help="print each node's window and how far behind the source each output runs",
     )
     validate_p = subparsers.add_parser("validate", help="check that a query compiles")
     _add_query_arguments(validate_p)
@@ -1474,6 +1491,10 @@ def _cmd_explain(args: argparse.Namespace, on_warning: OnWarning) -> int:
         return 1
 
     graphs = compiled.graphs
+    if args.delays:
+        if compiled.timing is not None:
+            print(timing.summary(compiled.timing))
+        return 0
     if args.mermaid or args.diagram:
         text = diagram.render_diagram(graphs, compiled.plan)
         if args.mermaid:
@@ -1489,8 +1510,12 @@ def _cmd_explain(args: argparse.Namespace, on_warning: OnWarning) -> int:
     payload: object = graphs[0].to_dict() if len(graphs) == 1 else [
         graph.to_dict() for graph in graphs
     ]
-    if compiled.plan is not None:
-        payload = {"graph": payload, "plan": compiled.plan.to_dict()}
+    if compiled.plan is not None or compiled.timing is not None:
+        payload = {"graph": payload}
+        if compiled.plan is not None:
+            payload["plan"] = compiled.plan.to_dict()
+        if compiled.timing is not None:
+            payload["timing"] = compiled.timing.to_dict()
     print(json.dumps(payload, indent=2))
     return 0
 

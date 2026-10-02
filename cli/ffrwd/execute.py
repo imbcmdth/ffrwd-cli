@@ -146,6 +146,7 @@ from .emit import Emitted, build_ffmpeg_commands, build_process_args
 from .errors import ErrorCode, FfrwdError
 from .ir import (
     FEEDER_HOST,
+    PARAMS_FILE,
     STDERR_ROW,
     Lateral,
     LateralValue,
@@ -166,6 +167,8 @@ from .processes import (
     StreamEdge,
     VideoFormat,
     encoded,
+    once_per_pipe,
+    pipe_key,
 )
 from .relay import Relay, RelayEdge
 from .vars import substitute
@@ -637,6 +640,10 @@ PipeNamer = Callable[[PipeEdge, Side], str]
 # placeholders as they are, which is what a printed command shows.
 RowsNamer = Callable[[str], str]
 
+# Writes one node's params, as JSON, to the file its placeholder stands for,
+# and names that file.
+ParamsNamer = Callable[[str, str], str]
+
 # Renders one sidecar process as the argv that runs it, given the path each
 # stream it reads arrives on and the path each rows document it writes goes
 # to. The real one lands with the sidecar itself; until then a caller
@@ -970,9 +977,10 @@ def _pipe_edges(plan: ProcessPlan) -> tuple[PipeEdge, ...]:
 
     The order is what pairs an edge with the ``pipe:`` slot it fills: a
     reading process's own inputs come first in its ``-i`` list, and a rows
-    track is one of those, where a frame edge is appended after them.
+    track is one of those, where a frame edge is appended after them. The
+    streams riding one NUT are one pipe, which the first of them stands for.
     """
-    return (*plan.rows_edges, *plan.stream_edges)
+    return (*plan.rows_edges, *once_per_pipe(plan.stream_edges))
 
 
 def plan_argv(
@@ -982,6 +990,7 @@ def plan_argv(
     pipe_path: PipeNamer | None = None,
     rows_path: RowsNamer | None = None,
     apart: Callable[[PipeEdge], bool] | None = None,
+    params_path: ParamsNamer | None = None,
 ) -> dict[str, list[str]]:
     """The argv that runs each process of `plan`, keyed by process id.
 
@@ -1001,6 +1010,10 @@ def plan_argv(
 
     `apart` says which edges a placed run cuts between nodes; each is named
     at both ends (:func:`wires`).
+
+    `params_path` writes a node's params to a file and names it, for each
+    params placeholder; without it the placeholders stay, as a printed
+    command shows them.
     """
     read: dict[PipeEdge, str] = {}
     write: dict[PipeEdge, str] = {}
@@ -1011,17 +1024,22 @@ def plan_argv(
         write[wire.edge] = (
             STDOUT if wire.write_stdio else _named(pipe_path, wire.edge, "write")
         )
+    first = {pipe_key(edge): edge for edge in reversed(plan.stream_edges)}
+    for edge in plan.stream_edges:
+        if edge.nut:
+            read[edge] = read[first[edge.nut]]
+            write[edge] = write[first[edge.nut]]
 
     argv: dict[str, list[str]] = {}
     for process in plan.processes:
-        incoming = _once_per_ref(
-            [e for e in plan.stream_edges if e.target == process.id]
-        )
-        outgoing = [e for e in plan.stream_edges if e.source == process.id]
+        incoming = _once_per_ref([e for e in plan.stream_edges if e.target == process.id])
+        carried = [e for e in plan.stream_edges if e.source == process.id]
+        outgoing = once_per_pipe(carried)
         if isinstance(process, SidecarProcess):
             # A sidecar's reads are its pads, in the order its module takes
             # them, whatever order the startup walk put the edges in.
             incoming.sort(key=lambda edge: _pad_of(process, edge))
+            incoming = once_per_pipe(incoming)
             argv[process.id] = _sidecar_args(
                 process,
                 sidecar_argv,
@@ -1030,18 +1048,25 @@ def plan_argv(
                 len(outgoing),
             )
             continue
+        incoming = once_per_pipe(incoming)
         rows_in = _rows_inputs(process, plan)
         argv[process.id] = build_process_args(
             process.graph,
             pipe_inputs=[(read[edge], edge.container) for edge in rows_in]
             + [(read[edge], edge.format.container) for edge in incoming],
-            pipe_outputs=[(write[edge], edge.format) for edge in outgoing],
+            pipe_outputs=[
+                (
+                    write[edge],
+                    tuple(one.format for one in carried if pipe_key(one) == pipe_key(edge)),
+                )
+                for edge in outgoing
+            ],
             pipe_buffers=[edge.buffer for edge in outgoing],
             pipe_live=[edge.live for edge in outgoing],
             live=any(edge.live for edge in incoming),
             copyts=all(keeps_clock(edge, plan) for edge in incoming),
         )
-    return _resolve_rows_documents(argv, rows_path)
+    return _resolve_params_files(_resolve_rows_documents(argv, rows_path), plan, params_path)
 
 
 def _pad_of(process: SidecarProcess, edge: StreamEdge) -> int:
@@ -1078,6 +1103,32 @@ def keeps_clock(edge: StreamEdge, plan: ProcessPlan) -> bool:
     return all(
         keeps_clock(e, plan) for e in plan.stream_edges if e.target == producer.id
     )
+
+
+def _resolve_params_files(
+    argv: dict[str, list[str]], plan: ProcessPlan, params_path: ParamsNamer | None
+) -> dict[str, list[str]]:
+    """Each node's params placeholder replaced by the file its params were
+    written to; unchanged without a namer."""
+    if params_path is None:
+        return argv
+    graphs = {
+        process.id: process.graph
+        for process in plan.processes
+        if isinstance(process, SidecarProcess) and process.graph is not None
+    }
+
+    def resolve(token: str) -> str:
+        name, sep, rest = token.partition("=")
+        if not sep or not rest.startswith(PARAMS_FILE):
+            return token
+        pid, _, node = rest[len(PARAMS_FILE) :].partition(":")
+        graph = graphs.get(pid)
+        if graph is None or node not in graph.nodes:
+            return token
+        return f"{name}={params_path(rest, json.dumps(graph.nodes[node].args, sort_keys=True))}"
+
+    return {pid: [resolve(token) for token in args] for pid, args in argv.items()}
 
 
 def _resolve_rows_documents(
@@ -1118,7 +1169,12 @@ def _sidecar_writes(
     order it reads them, and then its rows documents. Everything else hands
     its frames on over one output: its stdout where the edge chains, named
     here only where it does not, the pipe the relay serves."""
-    several = process.packet_source or process.packet_filter or process.data_filter
+    several = (
+        process.packet_source
+        or process.packet_filter
+        or process.data_filter
+        or process.node_network
+    )
     if several:
         streams = [write[edge] for edge in outgoing]
     else:
@@ -1181,7 +1237,7 @@ def render_plan(
     run = plan_argv(plan, sidecar_argv=sidecar_argv, pipe_path=pipe_path or _placeholder_pipe)
     argv = {pid: redact.argv(words) for pid, words in run.items()}
     if _is_pipeline(plan) and not plan.feeder_edges:
-        return _render_pipeline(plan, argv)
+        return "\n".join([_render_pipeline(plan, argv), *_listen_lines(plan)])
     return _render_listing(plan, argv)
 
 
@@ -1234,6 +1290,7 @@ def _render_listing(plan: ProcessPlan, argv: Mapping[str, list[str]]) -> str:
         for index, process in enumerate(plan.processes, start=1)
     ]
     lines += _feeder_lines(plan)
+    lines += _listen_lines(plan)
     lines += _lateral_lines(plan)
     lines.append(_COURTESY_NOTE)
     return "\n".join(lines)
@@ -1258,6 +1315,17 @@ def _feeder_lines(plan: ProcessPlan) -> list[str]:
         f"# feeder: {source} writes {feeder_path(port)} for {_readers(found)}, "
         "started once the port accepts"
         for (source, port), found in edges.items()
+    ]
+
+
+def _listen_lines(plan: ProcessPlan) -> list[str]:
+    """One line per port a process listens on for an input a node holds:
+    whatever connects there is shown, and the query writes nothing to it."""
+    return [
+        f"# listens: {process.id} at {feeder_path(port)} for {name}({port_name})"
+        for process in plan.processes
+        if isinstance(process, SidecarProcess)
+        for port, name, port_name in process.listens
     ]
 
 
@@ -1454,6 +1522,12 @@ def execute_plan(
             name = placeholder.rpartition(":")[2] or "0"
             return str(workspace() / f"rows-{name}.ndjson")
 
+        def params_path(placeholder: str, content: str) -> str:
+            # A node's params, written once where the run keeps its files.
+            path = workspace() / f"params-{len(list(workspace().glob('params-*')))}.json"
+            path.write_text(content, encoding="utf-8")
+            return str(path)
+
         def pipe_path(edge: PipeEdge, side: Side) -> str:
             # Named here, made by the relay when the edge's stage starts.
             path = pipes.path(workspace(), str(len(named)))
@@ -1465,6 +1539,7 @@ def execute_plan(
             sidecar_argv=sidecar_argv,
             pipe_path=pipe_path,
             rows_path=rows_path,
+            params_path=params_path,
         )
         assigned = wires(plan)
         terminal = terminal_member(plan) if work is not None else None
@@ -1606,7 +1681,10 @@ def _sidecar_args(
             hint="pass sidecar_argv, which renders one sidecar process as argv",
         )
     if streams > 1 and not (
-        process.packet_source or process.packet_filter or process.data_filter
+        process.packet_source
+        or process.packet_filter
+        or process.data_filter
+        or process.node_network
     ):
         raise FfrwdError(
             ErrorCode.INTERNAL,
@@ -1616,7 +1694,10 @@ def _sidecar_args(
             "spell a named pipe path",
         )
     if len(reads) > 1 and not (
-        process.packet_sink or process.packet_filter or process.data_filter
+        process.packet_sink
+        or process.packet_filter
+        or process.data_filter
+        or process.node_network
     ):
         raise FfrwdError(
             ErrorCode.INTERNAL,

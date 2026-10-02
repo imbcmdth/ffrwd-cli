@@ -31,6 +31,8 @@ from typing import Any
 import pytest
 
 from ffrwd import registry as registry_module
+from ffrwd.errors import FfrwdError
+from ffrwd.parser import parse, resolve
 from ffrwd.registry import Registry, load_reference
 
 SNAPSHOT_PATH = Path(__file__).resolve().parent / "data" / "reference_registry.json"
@@ -71,6 +73,22 @@ def pinned_ffmpeg() -> None:
         )
         warnings.warn(message, stacklevel=1)
         pytest.skip(message)
+
+
+def older_world_refusal(text: str) -> FfrwdError:
+    """What a module of an older world refuses `text`'s declaration with.
+
+    Resolve refuses it outright, or, for a signature a node module may
+    carry, keeps the refusal on the declaration for lowering to raise once
+    the module's describe says it is no node.
+    """
+    try:
+        resolved = resolve(parse(text))
+    except FfrwdError as err:
+        return err
+    kept = [d.refusal for d in resolved.wasm.values() if d.refusal is not None]
+    assert kept, "the declaration was neither refused nor kept a refusal"
+    return kept[0]
 
 
 def clear_leaks(home: Path, paths: Iterable[Path]) -> None:

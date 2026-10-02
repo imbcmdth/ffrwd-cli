@@ -38,6 +38,7 @@ class WarningCode(str, Enum):
     MISSING_LICENSE = "MISSING_LICENSE"  # a package published with no "license"
     RECIPE_DOES_NOT_COMPILE = "RECIPE_DOES_NOT_COMPILE"  # a recipe the probe compile rejected
     UNSHAPED_LISTENER = "UNSHAPED_LISTENER"  # a listener input probed, for want of a shape
+    HELD_STREAM = "HELD_STREAM"  # a stream waits long beside a later one it is written with
 
 
 @dataclass(frozen=True)

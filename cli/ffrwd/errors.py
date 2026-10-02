@@ -36,6 +36,7 @@ class ErrorCode(str, Enum):
     PLAYER_NOT_FOUND = "PLAYER_NOT_FOUND"  # --show asked for, ffplay not on PATH
     RUNTIME_NOT_FOUND = "RUNTIME_NOT_FOUND"  # setup nn: no ONNX Runtime pinned for this platform
     UNBOUNDED_LIVE_INPUT = "UNBOUNDED_LIVE_INPUT"  # one-open input, uncountable paths
+    LIVE_LEAD = "LIVE_LEAD"  # a live node fed later than the lead it needs
     BUFFER_OVERFLOW = "BUFFER_OVERFLOW"  # a run-time edge outgrew its computed bound
     INPUT_NEVER_OPENED = "INPUT_NEVER_OPENED"  # a run-time consumer never opened its end
     STARTUP_DEADLOCK = "STARTUP_DEADLOCK"  # no pipe order lets every process start
@@ -72,6 +73,10 @@ class FfrwdError(Exception):
         self.hint = hint
         super().__init__(str(self))
 
+    def __reduce__(self) -> tuple[object, ...]:
+        """Copied and pickled whole: a refusal can wait inside a query's tree."""
+        return (_rebuilt, (self.code, self.message, self.line, self.col, self.hint))
+
     def to_dict(self) -> dict[str, object]:
         return {
             "line": self.line,
@@ -91,3 +96,9 @@ class FfrwdError(Exception):
         if self.hint is not None:
             parts.append(f" (hint: {self.hint})")
         return "".join(parts)
+
+
+def _rebuilt(
+    code: ErrorCode, message: str, line: int | None, col: int | None, hint: str | None
+) -> FfrwdError:
+    return FfrwdError(code, message, line=line, col=col, hint=hint)
