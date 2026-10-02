@@ -1148,9 +1148,12 @@ ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 rawvideo -pix_fmt:0 rgba -f
   '{"color": {"range": "pc", "primaries": "unknown", "trc": "unknown", "space": "gbr"}}' \
   -m spot=../sidecar/modules/target/wasm32-wasip2/release/spot.wasm -m \
   ring=../sidecar/modules/target/wasm32-wasip2/release/ring.wasm -filter_complex \
-  '[v=0:v]spot=every=30[spots=n1];[v=0:v][spots=n1]ring[v=out0]' -map '[out0]' -f nut \
-  pipe:1 | ffmpeg -copyts -f nut -analyzeduration 0 -fpsprobesize 3 -i pipe:0 -map 0:v:0 \
-  -c:0 libx264 -crf:0 20 ringed.mp4
+  '[v=0:v]spot=every=30[spots=n1];[v=0:v][spots=n1]ring[v=out0]' -bound \
+  'spot=[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]}]' -bound \
+  'ring=[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]},{"input":"spots",'\
+'"streams":[{"rate":null}]}]' -map '[out0]' -f nut pipe:1 | ffmpeg -copyts -f nut \
+  -analyzeduration 0 -fpsprobesize 3 -i pipe:0 -map 0:v:0 -c:0 libx264 -crf:0 20 \
+  ringed.mp4
 ```
 
 `spot` writes one row per frame for as long as the mark is in view, and every row of one mark carries the pts it was first seen at as `start_t`: the row for frame t says what is true at t, so a reader needs no look-ahead and a run split across workers agrees on the ids. The old spelling, a module returning `STRUCT(v video_stream, spots ...)` with the picture untouched, is what a package keeps when its own module has not moved: inside the sidecar the rows ride the frames exactly as before. A migrated package that wants the old reading back writes it in SQL - `CREATE FUNCTION spotted(v video_stream) RETURNS STRUCT(v video_stream, spots STRUCT(...)[]) AS $$ SELECT v, spot(v) AS spots $$ LANGUAGE sql` - and `ring(spotted(v))` reads the record as the stream and the rows, as a call over a two-part result always has.
@@ -1187,8 +1190,11 @@ ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 rawvideo -pix_fmt:0 rgba -f
   dim=../sidecar/modules/target/wasm32-wasip2/release/dim.wasm -filter_complex \
   '[v=0:v]spot=every=30[spots=n1];'\
 '[n1]rowfilter=pred={"ge"\\:\[{"field"\\:"w"}\,{"lit"\\:20}\]}[n2];'\
-'[v=0:v][boxes=n2]dim=amount=0.5[v=out0]' -map '[out0]' -f nut pipe:1 | ffmpeg -copyts \
-  -f nut -analyzeduration 0 -fpsprobesize 3 -i pipe:0 -map 0:v:0 -c:0 libx264 -crf:0 20 \
+'[v=0:v][boxes=n2]dim=amount=0.5[v=out0]' -bound \
+  'spot=[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]}]' -bound \
+  'dim=[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]},{"input":"boxes",'\
+'"streams":[{"rate":null}]}]' -map '[out0]' -f nut pipe:1 | ffmpeg -copyts -f nut \
+  -analyzeduration 0 -fpsprobesize 3 -i pipe:0 -map 0:v:0 -c:0 libx264 -crf:0 20 \
   dimmed.mp4
 ```
 
@@ -1228,7 +1234,10 @@ $ ffrwd compile -f query.sql
   '{"color": {"range": "pc", "primaries": "unknown", "trc": "unknown", "space": "gbr"}}' \
   -m hear=../sidecar/modules/target/wasm32-wasip2/release/hear.wasm -m \
   burn=../sidecar/modules/target/wasm32-wasip2/release/burn.wasm -filter_complex \
-  '[a=0:a]hear[cues=out1];[v=0:v][words=out1]burn[v=out0]' -map '[out0]' -f nut \
+  '[a=0:a]hear[cues=out1];[v=0:v][words=out1]burn[v=out0]' -bound \
+  'hear=[{"input":"a","streams":[{"rate":{"num":48000,"den":1}}]}]' -bound \
+  'burn=[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]},{"input":"words",'\
+'"streams":[{"rate":null}]}]' -map '[out0]' -f nut \
   '<named pipe sidecar0-ffmpeg0 n2 write>' -map '[out1]' -f webvtt \
   '<named pipe sidecar0-ffmpeg0 ffrwd.cues#2 write>'
 # this listing is not a shell command -- run the plan with `ffrwd run`
@@ -1265,9 +1274,13 @@ ffmpeg -i tests/fixtures/av.mp4 -filter_complex '[0:a:0]asplit=2[out0][out2]' -m
   '{"color": {"range": "pc", "primaries": "unknown", "trc": "unknown", "space": "gbr"}}' \
   -m hear=../sidecar/modules/target/wasm32-wasip2/release/hear.wasm -m \
   burn=../sidecar/modules/target/wasm32-wasip2/release/burn.wasm -filter_complex \
-  '[a=0:a]hear[cues=n1];[v=0:v][a=0:a:1][words=n1]burn[v=out0]' -map '[out0]' -f nut \
-  pipe:1 | ffmpeg -i tests/fixtures/av.mp4 -f nut -analyzeduration 0 -fpsprobesize 3 -i \
-  pipe:0 -map 1:v:0 -map 0:a:0 -c:0 libx264 -crf:0 20 -c:1 aac burned.mp4
+  '[a=0:a]hear[cues=n1];[v=0:v][a=0:a:1][words=n1]burn[v=out0]' -bound \
+  'hear=[{"input":"a","streams":[{"rate":{"num":48000,"den":1}}]}]' -bound \
+  'burn=[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]},{"input":"a",'\
+'"streams":[{"rate":{"num":44100,"den":1}}]},{"input":"words",'\
+'"streams":[{"rate":null}]}]' -map '[out0]' -f nut pipe:1 | ffmpeg -i \
+  tests/fixtures/av.mp4 -f nut -analyzeduration 0 -fpsprobesize 3 -i pipe:0 -map 1:v:0 \
+  -map 0:a:0 -c:0 libx264 -crf:0 20 -c:1 aac burned.mp4
 ```
 
 `hear` works two seconds of sound at a time and says so, and a window's cues leave with the window. `burn` reads them by interval, so the host holds each picture until the window holding its time is done, and the picture leaves `burn` two seconds behind the sound that enters it. [Recipe 153](#153-see-what-each-node-waits-for) shows where that number is printed.
@@ -1302,7 +1315,10 @@ ffmpeg -i tests/fixtures/av.mp4 -map 0:v:0 -map 0:a:0 -c:0 rawvideo -pix_fmt:0 r
   '{"color": {"range": "pc", "primaries": "unknown", "trc": "unknown", "space": "gbr"}}' \
   -m burn=../sidecar/modules/target/wasm32-wasip2/release/burn.wasm -m \
   inset=../sidecar/modules/target/wasm32-wasip2/release/inset.wasm -filter_complex \
-  '[v=0:v][a=0:a]burn[v=n1];[v=n1]inset=port=9100:lead=0.5[v=out0]' -map '[out0]' -f nut \
+  '[v=0:v][a=0:a]burn[v=n1];[v=n1]inset=port=9100:lead=0.5[v=out0]' -bound \
+  'burn=[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]},{"input":"a",'\
+'"streams":[{"rate":{"num":44100,"den":1}}]}]' -bound \
+  'inset=[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]}]' -map '[out0]' -f nut \
   pipe:1 | ffmpeg -i tests/fixtures/av.mp4 -f nut -analyzeduration 0 -fpsprobesize 3 -i \
   pipe:0 -map 1:v:0 -map 0:a:0 -c:0 libx264 -crf:0 20 -c:1 aac inset.mp4
 # listens: sidecar0 at tcp://127.0.0.1:9100 for inset(feed)
@@ -1346,7 +1362,9 @@ $ ffrwd compile -f query.sql
   -f nut -i '<named pipe ffmpeg3-sidecar0 src:c:v:0 read>' -pad \
   '{"color": {"range": "pc", "primaries": "unknown", "trc": "unknown", "space": "gbr"}}' \
   -m tile=../sidecar/modules/target/wasm32-wasip2/release/tile.wasm -filter_complex \
-  '[v=0:v][v=1:v][v=2:v]tile=columns=3[v=out0]' -map '[out0]' -f nut pipe:1
+  '[v=0:v][v=1:v][v=2:v]tile=columns=3[v=out0]' -bound \
+  'tile=[{"input":"v","streams":[{"rate":{"num":15,"den":1}},{"rate":{"num":15,'\
+'"den":1}},{"rate":{"num":15,"den":1}}]}]' -map '[out0]' -f nut pipe:1
 # this listing is not a shell command -- run the plan with `ffrwd run`
 ```
 
@@ -1386,8 +1404,11 @@ ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 rawvideo -pix_fmt:0 rgba -f
   -m matte=../sidecar/modules/target/wasm32-wasip2/release/matte.wasm -m \
   dim=../sidecar/modules/target/wasm32-wasip2/release/dim.wasm -filter_complex \
   '[v=0:v]matte=every=30[mask=out1][spots=n11];[v=0:v][boxes=n11]dim=amount=0.5[v=out0]' \
-  -map '[out0]' -map '[out1]' -f nut pipe:1 | ffmpeg -copyts -f nut -analyzeduration 0 \
-  -fpsprobesize 3 -i pipe:0 -map 0:v:0 -map 0:v:1 -c:0 ffv1 -c:1 ffv1 matte.mkv
+  -bound 'matte=[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]}]' -bound \
+  'dim=[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]},{"input":"boxes",'\
+'"streams":[{"rate":null}]}]' -map '[out0]' -map '[out1]' -f nut pipe:1 | ffmpeg -copyts \
+  -f nut -analyzeduration 0 -fpsprobesize 3 -i pipe:0 -map 0:v:0 -map 0:v:1 -c:0 ffv1 \
+  -c:1 ffv1 matte.mkv
 ```
 
 Each field is an output port with a format and a time base of its own, declared by the module for the call's parameters. [Recipe 94](#94-blur-the-people-and-only-the-people)'s `segment` is this shape, and its rows no longer ride the map's frames: they are a data stream beside it, which is why `mask_select` can read them from a call `segment` is not part of.
@@ -1414,8 +1435,9 @@ ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 rawvideo -pix_fmt:0 rgba -f
   pipe:1 | ffrwd-wasm -f nut -i pipe:0 -pad \
   '{"color": {"range": "pc", "primaries": "unknown", "trc": "unknown", "space": "gbr"}}' \
   -m spot=../sidecar/modules/target/wasm32-wasip2/release/spot.wasm -filter_complex \
-  '[v=0:v]spot=every=30[spots=n1];[n1]rowmerge=max_span=10[out0]' -map '[out0]' -f \
-  ndjson spots.ndjson
+  '[v=0:v]spot=every=30[spots=n1];[n1]rowmerge=max_span=10[out0]' -bound \
+  'spot=[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]}]' -map '[out0]' -f ndjson \
+  spots.ndjson
 ```
 
 The rows out carry `start_t` and `end_t` beside the fields in, one row per span, so `spots.ndjson` holds one line per mark rather than one per frame. Rows whose fields are `start_t` and `text` reduce to cues, and selecting them beside a picture writes a subtitle track. A span row leaves when its span ends, so a span is as late as it is long; `max_span` bounds that, and it is what a reader pairing by time waits for. A span still open after ten seconds is written as it stands and goes on as a new one. The reducer closes a span on its producer's progress, not on the next row, so the last span of a run ends where the rows did.
@@ -1472,9 +1494,9 @@ COPY (
 $ ffrwd compile -f query.sql
 ffrwd-wasm -m ticker=../sidecar/modules/target/wasm32-wasip2/release/ticker.wasm \
   -filter_complex \
-  'ticker=text=Nothing\ to\ see\ here:width=1280:height=720:fps=30[video=out0]' -map \
-  '[out0]' -f nut pipe:1 | ffmpeg -copyts -f nut -analyzeduration 0 -fpsprobesize 3 -to \
-  10 -i pipe:0 -map 0:v:0 -c:0 libx264 -crf:0 20 ticker.mp4
+  'ticker=text=Nothing\ to\ see\ here:width=1280:height=720:fps=30[video=out0]' -bound \
+  'ticker=[]' -map '[out0]' -f nut pipe:1 | ffmpeg -copyts -f nut -analyzeduration 0 \
+  -fpsprobesize 3 -to 10 -i pipe:0 -map 0:v:0 -c:0 libx264 -crf:0 20 ticker.mp4
 ```
 
 In a file run the source runs as fast as its reader drains it; in a live run it is paced to the wall clock. `WHERE s.t < 10` ends it after ten seconds, as it would any source. A network source is the same shape with a clock of its own: it emits when it has something, and `shape` may reach the network at compile time to learn its outputs, as a manifest is probed. `ffrwd.blitz.compose` with no streams, a page that animates on its own, is this recipe's shape too.
