@@ -3541,12 +3541,12 @@ def _call_alias(item: exp.Table, function: _Function) -> str:
 
 
 # What a run-time lateral's columns may be, and its values.
-_RUNTIME_COLUMN_TYPES = (_WASM_STREAM, _WASM_AUDIO_STREAM)
+_RUNTIME_COLUMN_TYPES = (_WASM_STREAM, _WASM_AUDIO_STREAM, WASM_DATA)
 _RUNTIME_VALUE_TYPES = ("number", "text", "boolean")
 _RUNTIME_HINT = (
     "declare <name>(<launch> data_stream, <value> <type>, ...) RETURNS "
-    "TABLE(video video_stream, audio audio_stream), either column or both, "
-    "each value text, number or boolean"
+    "TABLE(video video_stream, audio audio_stream, rows data_stream), any of "
+    "the columns, each value text, number or boolean"
 )
 
 
@@ -3577,7 +3577,7 @@ def _check_runs_per_message(function: _Function, anchor: exp.Expr) -> None:
             ErrorCode.UNSUPPORTED_SQL,
             f"{function.qualified}() is started once per message of its data "
             f"stream, and returns '{wrong.name} {wrong.type}': it returns the "
-            "picture and sound a feeder takes, one of each at most",
+            "picture, sound and rows a feeder takes, one of each at most",
             anchor,
             hint=_RUNTIME_HINT,
         )

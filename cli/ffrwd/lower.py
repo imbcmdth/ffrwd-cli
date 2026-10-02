@@ -439,6 +439,7 @@ from ffrwd.processes import (
 from ffrwd.registry import DynamicFilter, FilterOption, Registry, SourceFilter
 from ffrwd.shapes import (
     Binding,
+    Hold,
     InputPort,
     NodeShape,
     OutputPort,
@@ -1790,7 +1791,11 @@ def _lateral_column(lateral: RuntimeLateral, call: _Call) -> tuple[str, StreamTy
     written = call.args[1] if len(call.args) > 1 else None
     name = str(written.this) if isinstance(written, exp.Literal) else ""
     column = next(c for c in lateral.columns if c.name == name)
-    return name, WASM_STREAM_TYPES[column.type]
+    return name, _LATERAL_KINDS[column.type]
+
+
+# The kind of each column a run-time lateral may return.
+_LATERAL_KINDS: Mapping[str, StreamType] = {**WASM_STREAM_TYPES, WASM_DATA: "data"}
 
 
 def _instance_template(
@@ -1799,7 +1804,8 @@ def _instance_template(
     """One instance of a run-time lateral, as SQL.
 
     One COPY per connection its streams go to, writing them there as the
-    NUT a feeder carries, picture then sound. The call writes NULL in the
+    NUT a feeder carries, picture, sound, then the rows a group's data
+    input reads. The call writes NULL in the
     data stream's place, what the call wrote itself, and every other value
     as a variable, ``:'name'`` for text and ``:name`` for the rest, which
     the host sets per message; one it leaves unset is NULL, and takes the
@@ -1818,9 +1824,7 @@ def _instance_template(
     call = f"{declared.function}({', '.join(arguments)}) {alias}"
     statements: list[str] = []
     for port, connection in connections:
-        streams = sorted(
-            connection.streams.values(), key=lambda s: 0 if s.type == "video" else 1
-        )
+        streams = sorted(connection.streams.values(), key=_feed_order)
         columns = []
         for stream in streams:
             parts = _lateral_parts(stream.ref)
@@ -1836,6 +1840,11 @@ def _instance_template(
             f"TO '{feeder_path(port)}' WITH ({', '.join(options)})"
         )
     return ";\n".join(statements)
+
+
+def _feed_order(stream: _Stream) -> int:
+    """Where a stream rides a feeder's NUT: picture, sound, then data."""
+    return {"video": 0, "audio": 1}.get(stream.type, 2)
 
 
 def _namespaced_call(node: exp.Expr) -> exp.Anonymous | None:
@@ -2097,6 +2106,26 @@ def _sink_view(described: Described, ports: Mapping[str, InputPort | None]) -> D
         data_streams=arity(data),
         wants=_sink_wants(first.accepts.wants) if first is not None else "all",
         packet_filter=False,
+    )
+
+
+def _group_hold(shape: NodeShape, port: InputPort) -> Hold | None:
+    """How `port` is held where a feed by port serves it: its own hold, or
+    for a data input naming a hold group, that group's hold on a port."""
+    if port.pairing.hold is not None:
+        return port.pairing.hold
+    interval = port.pairing.interval
+    if port.kind != "data" or interval is None or interval.group is None:
+        return None
+    return next(
+        (
+            one.pairing.hold
+            for one in shape.inputs
+            if one.pairing.hold is not None
+            and one.pairing.hold.group == interval.group
+            and one.pairing.hold.port_param is not None
+        ),
+        None,
     )
 
 
@@ -16406,11 +16435,12 @@ class _Lowerer:
                     hint=f"write the port once: {declared.signature}",
                 )
             ports[hold.port_param] = held[name]
+        self._check_grouped_data(declared, shape, streams, base, select)
         feeds: list[tuple[int, _Fed, Described]] = []
         for name, lateral in fed.items():
             first_stream = lateral.streams[0]
             port = shape.input(name)
-            hold = port.pairing.hold if port is not None else None
+            hold = _group_hold(shape, port) if port is not None else None
             if port is None or hold is None or hold.port_param is None:
                 raise self._lateral_refusal(first_stream.ref, f"{declared.name}()", base)
             listed = _param_takes_list(described, hold.port_param)
@@ -16531,6 +16561,41 @@ class _Lowerer:
         if found is None and raw is not None:
             found = self._made_shapes[name] = node_shape(self.graph.nodes[name].filter, raw)
         return found
+
+    def _check_grouped_data(
+        self,
+        declared: WasmFunction,
+        shape: NodeShape,
+        streams: Mapping[str, _Value],
+        base: exp.Anonymous,
+        select: exp.Select,
+    ) -> None:
+        """Refuse a stream bound to a data input whose hold group a port
+        serves: its rows arrive on that group's connection or not at all."""
+        for port in shape.inputs:
+            interval = port.pairing.interval
+            if interval is None or interval.group is None or port.name not in streams:
+                continue
+            served = [
+                one.name
+                for one in shape.inputs
+                if one.pairing.hold is not None
+                and one.pairing.hold.group == interval.group
+                and one.pairing.hold.port_param is not None
+                and one.name not in streams
+            ]
+            if not served:
+                continue
+            raise _error(
+                ErrorCode.UDF_ARG_TYPE,
+                f"{declared.name}() binds '{port.name}', which arrives on the "
+                f"connection of the group '{interval.group}', and '{served[0]}' of "
+                "that group is served by a port",
+                base,
+                fallback=select,
+                hint=f"hand '{port.name}' the rows of the run-time lateral feeding "
+                f"'{served[0]}', or bind the group's inputs to streams",
+            )
 
     def _emits_rows(self, ref: FrameRef, described: Described) -> None:
         """The rows a node emits beside its ports, where it says it does: one
@@ -17109,8 +17174,11 @@ class _Lowerer:
                 connection.pix_fmt = wire_pix_fmt(described)
             if port not in use.ports:
                 use.ports.append(port)
-            for name, value in self._feed_shape(fed.stream.type, programme, described).items():
-                use.shape.setdefault(name, value)
+            if fed.stream.type != "data":
+                for name, value in self._feed_shape(
+                    fed.stream.type, programme, described
+                ).items():
+                    use.shape.setdefault(name, value)
             connection.streams[fed.stream.ref] = fed.stream
             return
         connection.streams[fed.stream.ref] = _Stream(
@@ -17289,7 +17357,7 @@ class _Lowerer:
             else f"{use.declared.alias}.{column}"
         )
         kind = next(
-            WASM_STREAM_TYPES[c.type] for c in use.declared.columns if c.name == column
+            _LATERAL_KINDS[c.type] for c in use.declared.columns if c.name == column
         )
         return _error(
             ErrorCode.UNSUPPORTED_SQL,

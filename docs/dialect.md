@@ -168,14 +168,22 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   expanded at compile time: its body is compiled and run once per
   message, while the query runs. It is declared `play(launch data_stream,
   url text, start_pts number, ..., channels number DEFAULT 2) RETURNS
-  TABLE(video video_stream, audio audio_stream)`, either column or both;
-  every parameter after the data stream is a text, number or boolean
-  value, and the body does not read the data stream.
+  TABLE(video video_stream, audio audio_stream)`, either column or both,
+  and a `data_stream` column beside them for the rows a node's data input
+  reads on the same connection; every parameter after the data stream is
+  a text, number or boolean value, and the body does not read the data
+  stream.
   - Its streams are empty between messages, so they go to a feeder and
     nowhere else: `ffrwd.switch.video(prog.v, ads.video)`. A filter, a
     module's pad or a `COPY` reading one is refused. Feeders of one group
     fed by its picture and its sound share one connection, which an
     instance writes as one NUT, picture then sound.
+  - A node's data input whose `interval` names a hold group the lateral
+    feeds (`interval.group`) takes the lateral's rows on that group's
+    connection, after its picture and sound in the same NUT, and binds no
+    pad: `panel(prog.v, ad.video, ad.audio, ad.cues)`. A stream of the
+    query's own handed to such an input while a port serves the group is
+    refused; its rows would never arrive.
   - Each value is bound by name, per message, in this order: an argument
     the call wrote, which is a constant the same for every message; the
     message's field of that name (a number for a number, a string for

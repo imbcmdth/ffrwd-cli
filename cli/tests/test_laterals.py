@@ -483,10 +483,11 @@ def test_a_run_time_lateral_is_refused_by_what_it_gets_wrong(
     [
         (
             "CREATE FUNCTION play(launch data_stream, url text) RETURNS TABLE(d "
-            "data_stream) AS $$ SELECT m.data[1] AS d FROM input(url) m $$ LANGUAGE sql;",
+            "data_stream, e data_stream) AS $$ SELECT m.data[1] AS d, m.data[1] AS e "
+            "FROM input(url) m $$ LANGUAGE sql;",
             "play() is started once per message of its data stream, and returns "
-            "'d data_stream': it returns the picture and sound a feeder takes, one "
-            "of each at most",
+            "'d data_stream': it returns the picture, sound and rows a feeder takes, "
+            "one of each at most",
         ),
         (
             "CREATE FUNCTION play(launch data_stream, v video_stream) RETURNS "
@@ -1104,3 +1105,106 @@ def test_a_piped_tap_is_read_off_the_pipe_the_relay_hands_the_host(tmp_path: Pat
         (1, "no such file"),
         (2, "no such file"),
     ]
+
+
+# -- rows on a hold group's connection ------------------------------------------
+
+PANEL = "modules/panel_node.wasm"
+_PANEL = (
+    "CREATE FUNCTION panel(v video_stream, feed video_stream DEFAULT NULL, "
+    "feed_audio audio_stream DEFAULT NULL, cues data_stream DEFAULT NULL, "
+    "port number DEFAULT NULL) RETURNS video_stream "
+    f"AS '{PANEL}', 'panel' LANGUAGE wasm;"
+)
+# What a feeder plays: the picture, the sound and the rows of one file.
+_PLAY_ROWS = """CREATE FUNCTION play_rows(launch data_stream, url text)
+RETURNS TABLE(video video_stream, audio audio_stream, cues data_stream) AS $$
+  SELECT m.video[1] AS video, m.audio[1] AS audio, m.data[1] AS cues FROM input(url) m
+$$ LANGUAGE sql;"""
+_SHOWN = """COPY (
+  WITH prog AS (SELECT s.video[1] AS v, s.data[1] AS d FROM input('leaf.nut') s)
+  SELECT panel(prog.v, ad.video, ad.audio, {cues})
+  FROM prog, LATERAL play_rows(prog.d) ad
+) TO 'out.nut'"""
+
+
+def _show_shape(
+    module: str, params: str, bound: Sequence[shapes.Binding], grants: Sequence[str] = ()
+) -> shapes.NodeShape:
+    """A picture shown with a feed's picture, sound and cues, all of the group
+    `panel` and served on `port`."""
+    held = {"kind": "hold", "anchor": {"kind": "shared_clock"}, "lead": 0.3,
+            "group": "panel", "port_param": "port"}
+
+    def port(name: str, kind: str, pairing: dict[str, object]) -> dict[str, object]:
+        return {
+            "name": name, "kind": kind, "required": name == "v", "many": False,
+            "pairing": pairing, "rows": "per-frame" if kind == "data" else "ignore",
+            "window": 1, "stride": 1, "accepts": {},
+        }
+
+    return shapes.node_shape(module, {
+        "inputs": [
+            port("v", "video", {"kind": "lockstep"}),
+            port("feed", "video", held),
+            port("feed_audio", "audio", held),
+            port("cues", "data", {"kind": "interval", "latency": 1, "ahead": 0,
+                                  "anchor": {"kind": "shared_clock"}, "group": "panel"}),
+        ],
+        "outputs": [{"name": "v", "kind": "video", "latency": 0,
+                     "format": {"kind": "like", "port": "v"}}],
+        "clock": {"kind": "input", "port": "v"},
+        "pure": True, "one_to_one": True, "bounded": True, "relation": [],
+    })
+
+
+def _shown(cues: str) -> ProcessPlan:
+    modules = {
+        **_MODULES,
+        PANEL: Described(
+            world="node-module", name="panel",
+            params_schema={"type": "object", "properties": {"port": {"type": "integer"}}},
+            node=True,
+        ),
+    }
+    plan = compile_all(
+        _PANEL + "\n" + _PLAY_ROWS + "\n" + _SHOWN.format(cues=cues),
+        describe=lambda path: modules[path],
+        shape=_show_shape,
+    ).plan
+    assert plan is not None
+    return plan
+
+
+def test_a_laterals_rows_ride_its_groups_connection_beside_the_picture_and_sound() -> None:
+    plan = _shown("ad.cues")
+    (lateral,) = plan.laterals
+    (connection,) = lateral.connections
+    (statement,) = lateral.template.split(";\n")
+    assert statement.startswith("COPY (SELECT ad.video, ad.audio, ad.cues FROM play_rows(")
+    assert f"TO 'tcp://127.0.0.1:{connection.port}'" in statement
+    (panel,) = [
+        node
+        for process in plan.sidecars
+        if process.graph is not None
+        for node in process.graph.nodes.values()
+        if node.filter == "panel_node"
+    ]
+    assert panel.ports == ["v"]
+    assert panel.args["port"] == connection.port
+    instance = compile_all(
+        lateral.definitions + "\n" + statement.replace(":'url'", "'ad.nut'"),
+        describe=lambda path: _MODULES[path],
+    )
+    ((sink,),) = [graph.sinks for graph in instance.graphs]
+    assert sink.path == f"tcp://127.0.0.1:{connection.port}"
+    assert [output.type for output in sink.outputs] == ["video", "audio", "data"]
+
+
+def test_a_stream_bound_where_a_groups_connection_brings_the_rows_is_refused() -> None:
+    with pytest.raises(FfrwdError) as caught:
+        _shown("prog.d")
+    assert caught.value.message == (
+        "panel() binds 'cues', which arrives on the connection of the group 'panel', "
+        "and 'feed' of that group is served by a port"
+    )
