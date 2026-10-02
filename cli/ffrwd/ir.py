@@ -193,6 +193,9 @@ class Node:
     # each output is, one per output. Empty for every other node.
     ports: list[str] = field(default_factory=list)
     out_ports: list[str] = field(default_factory=list)
+    # A node module's bound list, as the JSON its shape was asked with; the
+    # host asks the same and hints each stream from it. Empty for any other.
+    bound: str = ""
 
     @property
     def rows_only(self) -> bool:
@@ -215,6 +218,8 @@ class Node:
             written["ports"] = list(self.ports)
         if self.out_ports:
             written["out_ports"] = list(self.out_ports)
+        if self.bound:
+            written["bound"] = self.bound
         return written
 
     @classmethod
@@ -245,6 +250,7 @@ class Node:
             rows_inputs=[str(x) for x in raw_rows_inputs],
             ports=[str(x) for x in raw_ports],
             out_ports=[str(x) for x in raw_out_ports],
+            bound=str(d.get("bound") or ""),
         )
 
 

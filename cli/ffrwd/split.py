@@ -176,6 +176,7 @@ def insert_splits(g: Graph) -> Graph:
             rows_inputs=list(node.rows_inputs),
             ports=list(node.ports),
             out_ports=list(node.out_ports),
+            bound=node.bound,
         )
 
     # Units in order, each unit's outputs in list order: pad assignment is

@@ -10,6 +10,7 @@ spawned. Instances really run in tests/exec/test_exec_laterals.py.
 from __future__ import annotations
 
 import functools
+import json
 import socket
 import sys
 import threading
@@ -1192,6 +1193,13 @@ def test_a_laterals_rows_ride_its_groups_connection_beside_the_picture_and_sound
     ]
     assert panel.ports == ["v"]
     assert panel.args["port"] == connection.port
+    unknown = {"rate": None}
+    assert json.loads(panel.bound) == [
+        {"input": "v", "streams": [{"rate": {"num": 25, "den": 1}}]},
+        {"input": "feed", "streams": [unknown]},
+        {"input": "feed_audio", "streams": [unknown]},
+        {"input": "cues", "streams": [unknown]},
+    ]
     instance = compile_all(
         lateral.definitions + "\n" + statement.replace(":'url'", "'ad.nut'"),
         describe=lambda path: _MODULES[path],

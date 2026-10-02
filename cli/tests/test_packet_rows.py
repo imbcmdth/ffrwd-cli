@@ -640,6 +640,9 @@ def test_a_module_that_is_not_a_packet_sink_is_refused_by_name() -> None:
     assert "is not a packet sink" in error.message
 
 
+_BOUND_15 = '[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]}]'
+
+
 def _node_described() -> Described:
     """A node reading the packets: what its describe says, rows_schema and all."""
     return Described(world="node-module", name="keys", rows_schema=_ROWS_SCHEMA, node=True)
@@ -697,7 +700,7 @@ def test_a_node_reading_the_packets_is_read_in_from_as_a_packet_sink_is() -> Non
         "SELECT v.index FROM input('f.mp4') f, keys(f.video[1]) v", reads, _node_shape()
     ) == [[1], [2], [3]]
     (read,) = reads.reads
-    assert (read.port, read.wants, read.rate) == ("v", "keyframes", (15, 1))
+    assert (read.port, read.wants, read.bound) == ("v", "keyframes", _BOUND_15)
 
 
 @pytest.mark.parametrize(
@@ -722,13 +725,13 @@ def test_a_node_that_does_not_only_read_packets_is_refused_in_from(
 def test_a_node_read_binds_its_port_and_maps_the_rows_it_emits(tmp_path: Path) -> None:
     read = PacketRead(
         spec="f.mp4", input_args=(), kind="video", index=0, module=_MODULE, params="",
-        wants="keyframes", port="v", rate=(15, 1),
+        wants="keyframes", port="v", bound=_BOUND_15,
     )
     assert _node_reader_argv("ffrwd-wasm", read, None, tmp_path) == [
-        "ffrwd-wasm", "-f", "nut", "-i", "pipe:0", "-pad", '{"rate": {"num": 15, "den": 1}}',
-        "-m", f"read={_MODULE}",
-        "-filter_complex", "[v=0:v]read[@rows=out0]", "-map", "[out0]", "-f", "ndjson",
-        "pipe:1",
+        "ffrwd-wasm", "-f", "nut", "-i", "pipe:0", "-m", f"read={_MODULE}",
+        "-filter_complex", "[v=0:v]read[@rows=out0]",
+        "-bound", "read=" + _BOUND_15,
+        "-map", "[out0]", "-f", "ndjson", "pipe:1",
     ]
 
 

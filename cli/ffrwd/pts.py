@@ -102,6 +102,7 @@ def insert_pts_resets(g: Graph) -> Graph:
             rows_inputs=list(node.rows_inputs),
             ports=list(node.ports),
             out_ports=list(node.out_ports),
+            bound=node.bound,
         )
 
     # A trim/atrim mapped straight to an output file, with no filter in

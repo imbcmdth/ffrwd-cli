@@ -447,6 +447,7 @@ from ffrwd.shapes import (
     ShapeCache,
     StreamHint,
     Wants,
+    bound_json,
     node_shape,
     row_mismatch,
 )
@@ -2133,20 +2134,6 @@ def _sink_wants(wants: Wants) -> SinkWants:
     """What a port reading coded packets asks for; `timing` is a frame
     port's, which the host refuses on any other."""
     return "all" if wants == "timing" else wants
-
-
-# How many times a node's shape is asked again for the bound list the host
-# will build from what the last one said, before the last answer stands.
-_SHAPE_ROUNDS = 3
-
-
-def _as_the_host_binds(shape: NodeShape, bound: Sequence[Binding]) -> list[Binding]:
-    """`bound` as the host rebuilds it for a network spelled from `shape`: the
-    ports in the order the shape declares them, which is the order the chain
-    names them, and each sound at the rate its port conforms it to."""
-    order = {port.name: at for at, port in enumerate(shape.inputs)}
-    conformed = _conformed(shape, bound)
-    return sorted(conformed, key=lambda one: order.get(one.input, len(order)))
 
 
 def _conformed(shape: NodeShape, bound: Sequence[Binding]) -> list[Binding]:
@@ -8998,6 +8985,7 @@ class _Lowerer:
         kinds = [_output_kind(shape, output, {}) for output in shape.outputs]
         ref = self.ctx.node(declared.module, params, [], kinds)
         self.graph.nodes[ref].out_ports = [output.name for output in shape.outputs]
+        self.graph.nodes[ref].bound = bound_json([])
         self.graph.node_shapes[ref] = dict(shape.raw)
         self._emits_rows(ref, described)
         self.graph.node_sources[alias] = ref
@@ -9867,12 +9855,11 @@ class _Lowerer:
         )
         params_json = json.dumps(params, sort_keys=True) if params else ""
         read_ref = f"src:{raw.source}:{_TYPE_MARKERS[kind]}:{index}"
-        port, wants = (
+        port, wants, bound = (
             self._node_rows_port(declared, described, params, read_ref, inner, select)
             if described.node
-            else ("", described.wants)
+            else ("", described.wants, "")
         )
-        rate = self._stream_rate(read_ref) if described.node else None
         read = PacketRead(
             spec=spec,
             input_args=flags,
@@ -9882,7 +9869,7 @@ class _Lowerer:
             params=params_json,
             wants=wants,
             port=port,
-            rate=None if rate is None else (rate.numerator, rate.denominator),
+            bound=bound,
         )
         key = packet_rows_key(
             spec,
@@ -10015,9 +10002,10 @@ class _Lowerer:
         read: FrameRef,
         node: exp.Anonymous,
         select: exp.Select,
-    ) -> tuple[str, SinkWants]:
-        """The port a node read in FROM is handed the stream `read` on, and how
-        much of it the port asks for.
+    ) -> tuple[str, SinkWants, str]:
+        """The port a node read in FROM is handed the stream `read` on, how
+        much of it the port asks for, and the bound list its shape was asked
+        with, as JSON.
 
         Its shape for the call's params, with that port bound, has to read
         coded packets there and make no output: what the read binds is the
@@ -10044,7 +10032,7 @@ class _Lowerer:
                 hint=f"a node read in FROM takes coded packets on '{name}' and "
                 "emits rows alone; declare this one as what it is",
             )
-        return name, _sink_wants(port.accepts.wants)
+        return name, _sink_wants(port.accepts.wants), bound_json(bound)
 
     def _check_packet_rows_schema(
         self,
@@ -16404,11 +16392,9 @@ class _Lowerer:
             for name, argument in numbers.items()
         }
         shape = self._node_shape(declared, described, shape_params, bound, base, select)
-        for _ in range(_SHAPE_ROUNDS):
-            settled = _as_the_host_binds(shape, bound)
-            if settled == bound:
-                break
-            bound = settled
+        rated = _conformed(shape, bound)
+        if rated != bound:
+            bound = rated
             shape = self._node_shape(declared, described, shape_params, bound, base, select)
         self._check_node_ports(declared, shape, {**streams, **fed}, numbers, base, select)
         ports: dict[str, object] = {}
@@ -16528,6 +16514,7 @@ class _Lowerer:
         made = self.graph.nodes[ref]
         made.ports = names
         made.out_ports = [output.name for output in shape.outputs]
+        made.bound = bound_json(bound)
         self.graph.node_shapes[ref] = dict(shape.raw)
         self._emits_rows(ref, described)
         clock = shape.clock.port if shape.clock.port in names else None
@@ -16551,9 +16538,7 @@ class _Lowerer:
 
     def _stream_rate(self, ref: FrameRef) -> Fraction | None:
         """The rate a node's shape is told the stream `ref` runs at."""
-        return stream_rate(
-            self.graph, self.probes, self._made_shape, ref, through_nodes=False
-        )
+        return stream_rate(self.graph, self.probes, self._made_shape, ref)
 
     def _made_shape(self, name: str) -> NodeShape | None:
         found = self._made_shapes.get(name)
@@ -18180,6 +18165,7 @@ class _Lowerer:
             )
         self._node_sinks[declared.module] = (_sink_view(described, ports), shape)
         made.ports = [named[kind] for kind in kinds]
+        made.bound = bound_json(bound)
         emits = described.rows_schema is not None
         if emits:
             made.outputs = ["data"]

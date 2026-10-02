@@ -138,13 +138,12 @@ from .ir import (
     feeder_path,
     feeder_port,
     is_src,
-    src_alias,
     src_parts,
 )
 from .probe import JSON_CODEC, ProbeResult, StreamMeta, is_url
 from .shapes import Accepts, NodeShape, node_shape
 from .sink import COLOR_OPTIONS
-from .timing import Paths, paths_of, stream_rate
+from .timing import Paths, paths_of
 
 __all__ = [
     "COPY_CODEC",
@@ -1286,12 +1285,6 @@ class SidecarProcess:
     # The tags the query wrote on what each ``-i`` of a node network carries,
     # in ``-i`` order: empty for an input it wrote none on.
     tags: tuple[tuple[tuple[str, str], ...], ...] = ()
-    # The rate of each stream each ``-i`` of a node network carries, as the
-    # shape of each node reading it was told, in ``-i`` order: (pad, num,
-    # den) per stream whose rate the compile knew, the pad as the network
-    # names the stream after the input's number (``v``, ``a:1``), and ""
-    # for one rate every stream of the input runs at.
-    rates: tuple[tuple[tuple[str, int, int], ...], ...] = ()
 
     @property
     def nodes(self) -> tuple[str, ...]:
@@ -1379,8 +1372,6 @@ class SidecarProcess:
             written["colors"] = [dict(one) for one in self.colors]
         if self.tags:
             written["tags"] = [dict(one) for one in self.tags]
-        if self.rates:
-            written["rates"] = [[list(rate) for rate in one] for one in self.rates]
         if self.network and self.graph is not None:
             written["graph"] = self.graph.to_dict()
         return written
@@ -1442,15 +1433,6 @@ class SidecarProcess:
                 tuple((str(key), str(value)) for key, value in one.items())
                 for one in _read_list(d, "tags")
                 if isinstance(one, dict)
-            ),
-            rates=tuple(
-                tuple(
-                    (str(rate[0]), int(str(rate[1])), int(str(rate[2])))
-                    for rate in one
-                    if isinstance(rate, list) and len(rate) == 3
-                )
-                for one in _read_list(d, "rates")
-                if isinstance(one, list)
             ),
         )
 
@@ -5151,6 +5133,7 @@ class _Partitioner:
                 reads_annotations=node.reads_annotations,
                 ports=list(node.ports),
                 out_ports=list(node.out_ports),
+                bound=node.bound,
             )
         bundles: dict[str, list[StreamEdge]] = {}
         for edge in outgoing:
@@ -5215,9 +5198,6 @@ class _Partitioner:
             if sidecar.node_network
             else (),
             tags=self._region_tags(incoming, alias_of, read_order)
-            if sidecar.node_network
-            else (),
-            rates=self._region_rates(incoming, read_as, read_order)
             if sidecar.node_network
             else (),
             reads_rows=any(e.annotations for e in self.edges if e.target == sidecar.id),
@@ -5289,54 +5269,6 @@ class _Partitioner:
         if not found:
             return ()
         return tuple(tuple(found.get(alias, {}).items()) for alias in order)
-
-    def _region_rates(
-        self,
-        incoming: Sequence[StreamEdge],
-        read_as: Mapping[FrameRef, str],
-        order: Sequence[str],
-    ) -> tuple[tuple[tuple[str, int, int], ...], ...]:
-        """The rate of each stream each ``-i`` of a node network is told, in
-        ``-i`` order: a picture's frame rate, a sound's sample rate as the
-        edge conforms it, none for data. One rate every stream of an input
-        runs at is said once."""
-        found: dict[str, dict[str, Fraction | None]] = {}
-        for edge in incoming:
-            piped = read_as.get(edge.ref)
-            if piped is None:
-                continue
-            _, marker, index = piped.rsplit(":", 2)
-            alias = src_alias(piped)
-            pad = marker if index == "0" else f"{marker}:{index}"
-            rate = (
-                None
-                if isinstance(edge.format, DataFormat)
-                else self._edge_rate(edge.ref, edge.format)
-            )
-            found.setdefault(alias, {})[pad] = rate
-        said: dict[str, tuple[tuple[str, int, int], ...]] = {}
-        for alias, rates in found.items():
-            known = {pad: rate for pad, rate in rates.items() if rate is not None}
-            if not known:
-                continue
-            every = set(rates.values())
-            if len(every) == 1:
-                (rate,) = every
-                assert rate is not None  # one of them is known
-                said[alias] = (("", rate.numerator, rate.denominator),)
-            else:
-                said[alias] = tuple(
-                    (pad, rate.numerator, rate.denominator) for pad, rate in known.items()
-                )
-        if not said:
-            return ()
-        return tuple(said.get(alias, ()) for alias in order)
-
-    def _edge_rate(self, ref: FrameRef, wire: StreamFormat) -> Fraction | None:
-        """The rate of `ref` as an edge carrying it in `wire` hands it on."""
-        if isinstance(wire, AudioFormat) and wire.required_rate:
-            return Fraction(wire.required_rate)
-        return stream_rate(self.g, self.probes, self.node_shapes.get, ref, through_nodes=False)
 
     def _region_listens(
         self, members: Sequence[str], names: Mapping[str, str]

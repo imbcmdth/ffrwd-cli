@@ -391,6 +391,10 @@ _JOBS_FLAG = "-jobs"
 # Where a node's params are read whole from a file: ``<name>=<path>``.
 _PARAMS_FROM_FLAG = "-params-from"
 
+# The bound list a node's shape was asked with: ``<name>=<json>``, one per
+# call in the order its chain is written.
+_BOUND_FLAG = "-bound"
+
 # Which half of a codec package's module a run drives: "encode" or "decode".
 _CODEC_FLAG = "-codec"
 
@@ -1574,9 +1578,9 @@ class PacketRead:
     # The input of a node module the stream binds, whose rows are what the
     # node emits beside its ports; empty for a packet sink.
     port: str = ""
-    # The stream's rate, as the node's shape was told it; None where the
-    # probe said none.
-    rate: tuple[int, int] | None = None
+    # The bound list the node's shape was asked with, as JSON; empty for a
+    # packet sink.
+    bound: str = ""
 
 
 # Runs one packet sink over one stream and returns the rows it wrote:
@@ -1709,12 +1713,12 @@ def _node_reader_argv(
     )
     network, groups = build_node_network(graph, pipe_inputs=[STDIN])
     argv = [binary, "-f", EDGE_FORMAT, "-i", STDIN]
-    if read.rate is not None:
-        argv += ["-pad", json.dumps({"rate": _rate_json(read.rate)})]
     for effect in EFFECTS:
         if described is not None and getattr(described, effect):
             argv += [_GRANT_FLAGS[effect], read.module]
     argv += ["-m", f"{_READ_NODE}={read.module}", "-filter_complex", network, *filed]
+    if read.bound:
+        argv += [_BOUND_FLAG, f"{_READ_NODE}={read.bound}"]
     for target in groups[0]:
         argv += ["-map", target]
     return [*argv, "-f", _ROWS_FORMAT, STDOUT]
@@ -2015,11 +2019,7 @@ def _argv(
     ``-pad '<json>'`` right after its own ``-i``, ``{"row": ..., "rendition":
     {...}}`` with absent attributes omitted -- a pad with none gets no flag.
     A node network's input carrying a raw picture gets its ``"color"`` there
-    too (:attr:`SidecarProcess.colors`), since NUT writes none, and every
-    input whose streams' rates the compile knew gets their ``"rate"``
-    (:attr:`SidecarProcess.rates`), which the host tells each node's shape:
-    ``{"num", "den"}`` where every stream runs at it, else one per stream
-    keyed by its pad, ``{"v": {...}, "a": {...}}``.
+    too (:attr:`SidecarProcess.colors`), since NUT writes none.
 
     `writes` is the mirror on the other side: one path per rows document the
     process writes, in document order, since a process writing several of
@@ -2068,13 +2068,6 @@ def _argv(
             tags = process.tags[index] if index < len(process.tags) else ()
             if tags:
                 pad["tags"] = dict(tags)
-            rates = process.rates[index] if index < len(process.rates) else ()
-            if rates:
-                pad["rate"] = (
-                    _rate_json((rates[0][1], rates[0][2]))
-                    if rates[0][0] == ""
-                    else {key: _rate_json((num, den)) for key, num, den in rates}
-                )
             if pad:
                 argv += ["-pad", json.dumps(pad)]
     if any(grant.effect == "gpu" for grant in process.grants):
@@ -2275,11 +2268,6 @@ def _network_args(process: SidecarProcess, writes: Sequence[str] = ()) -> list[s
     return argv
 
 
-def _rate_json(rate: tuple[int, int]) -> dict[str, int]:
-    """A rate as ``-pad`` spells it."""
-    return {"num": rate[0], "den": rate[1]}
-
-
 def _node_network_args(
     process: SidecarProcess, reads: Sequence[str], writes: Sequence[str]
 ) -> list[str]:
@@ -2318,6 +2306,9 @@ def _node_network_args(
     for binding in process.modules:
         argv += ["-m", f"{binding.name}={binding.path}"]
     argv += ["-filter_complex", network, *filed]
+    for name, node in graph.nodes.items():
+        if node.bound:
+            argv += [_BOUND_FLAG, f"{nodes[name].filter}={node.bound}"]
     for targets, path in zip(groups[:streams], paths):
         for target in targets:
             argv += ["-map", target]

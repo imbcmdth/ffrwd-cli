@@ -583,15 +583,18 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   - A port reading coded packets is handed an input's own stream,
     copied as it was coded, in a codec the module takes; an output
     writing them is copied by whatever reads it.
-  - A stream's rate is what the compile knows of it before the run: a
-    picture's frame rate, a sound's sample rate (the one its port
-    conforms it to), read off the probe through the ffmpeg filters on
-    the way. A stream a node writes, a feed by port and data have none.
-    The run hands the host the same rates (`-pad`'s `"rate"`), and the
-    host binds the ports in the order the shape declares them, so the
-    shape a node runs with is the one the query compiled against. A node
-    at a COPY's TO is asked once for its ports and again with the
-    streams the SELECT binds there.
+  - The bound list is one binding per input the call binds, ports held
+    on a port included (a lateral's feed, one stream per lateral), and a
+    hint per stream: its rate as far as the compile knows it before the
+    run, a picture's frame rate, a sound's sample rate (the one its port
+    conforms it to). An input's is its probe's; a node's picture runs at
+    its clock, a rate clock's own, the rate of the input a `rate-of`
+    clock names, or its clock input's over its stride. A feed by port, a
+    self-clocked node's output and data have none. Each call carries the
+    list it was asked with (`-bound <name>=<json>`), which the host asks
+    the shape with again, so the shape a node runs with is the one the
+    query compiled against. A node at a COPY's TO is asked once for its
+    ports and again with the streams the SELECT binds there.
   - An input the module reads for its timing alone (`wants` `timing`)
     is handed the stream in the format it already has: nothing converts
     or conforms it, and where another port of the region reads the same

@@ -28,7 +28,7 @@ from ffrwd.parser import parse, resolve
 from ffrwd.probe import ProbeResult, StreamMeta
 from ffrwd.processes import ProcessPlan
 from ffrwd.registry import Registry, load_reference
-from ffrwd.timing import check_live_leads, paths_of, summary, timing
+from ffrwd.timing import check_live_leads, summary, timing
 from ffrwd.warnings import FfrwdWarning, WarningCode
 from ffrwd.wasm import WORLDS, Described
 
@@ -835,7 +835,12 @@ def test_a_node_network_names_the_port_each_pad_binds(monkeypatch: pytest.Monkey
         "[v=0:v]spot=every=30[spots=n1];[v=0:v][spots=n1]ring[v=out0]"
     )
     assert sidecar[sidecar.index("-map") :] == ["-map", "[out0]", "-f", "nut", "pipe:1"]
-    assert _pad_after_input(sidecar)["rate"] == {"num": 25, "den": 1}
+    at_25 = {"rate": {"num": 25, "den": 1}}
+    assert _bound_flags(sidecar) == [
+        ("spot", [{"input": "v", "streams": [at_25]}]),
+        ("ring", [{"input": "v", "streams": [at_25]},
+                  {"input": "spots", "streams": [{"rate": None}]}]),
+    ]
 
 
 def test_every_stream_one_process_hands_a_node_network_rides_one_nut(
@@ -857,10 +862,12 @@ def test_every_stream_one_process_hands_a_node_network_rides_one_nut(
     ]
     assert feeder.count("-map") == 2, "both ports take the sound as it is, so it crosses once"
     assert feeder[-3:] == ["-f", "nut", "pipe:1"]
-    assert _pad_after_input(sidecar)["rate"] == {
-        "v": {"num": 25, "den": 1},
-        "a": {"num": 48000, "den": 1},
-    }
+    assert "rate" not in _pad_after_input(sidecar)
+    assert _bound_flags(sidecar)[1] == ("burn", [
+        {"input": "v", "streams": [{"rate": {"num": 25, "den": 1}}]},
+        {"input": "a", "streams": [{"rate": {"num": 48000, "den": 1}}]},
+        {"input": "words", "streams": [{"rate": None}]},
+    ])
 
 
 def _taking(
@@ -1007,6 +1014,16 @@ def _pad_after_input(sidecar: Sequence[str]) -> dict[str, object]:
     pad = json.loads(sidecar[at + 1])
     assert isinstance(pad, dict)
     return pad
+
+
+def _bound_flags(sidecar: Sequence[str]) -> list[tuple[str, object]]:
+    """Each ``-bound <name>=<json>`` of a sidecar's argv, in order."""
+    found: list[tuple[str, object]] = []
+    for at, word in enumerate(sidecar):
+        if word == "-bound":
+            name, _, written = sidecar[at + 1].partition("=")
+            found.append((name, json.loads(written)))
+    return found
 
 
 def _taking_pictures(monkeypatch: pytest.MonkeyPatch, pixel_format: str) -> None:
@@ -1375,7 +1392,7 @@ def test_a_node_sink_is_shaped_again_with_every_stream_the_select_binds(
         _PARAMS, "publish.wasm", {"relay": {"type": "string"}, "broadcast": {"type": "string"}}
     )
     asked = _Asked()
-    _lowered(
+    graph = _lowered(
         _PUBLISH
         + "CREATE FUNCTION spotted(v video_stream) RETURNS data_stream "
         "AS 'spot.wasm', 'spot' LANGUAGE wasm;\n"
@@ -1387,6 +1404,10 @@ def test_a_node_sink_is_shaped_again_with_every_stream_the_select_binds(
     assert _hints(asked, "publish.wasm") == [
         {},
         {"video": [Fraction(25)], "audio": [Fraction(48000)], "data": [None]},
+    ]
+    (sink,) = [node for node in graph.nodes.values() if node.filter == "publish.wasm"]
+    assert [binding["input"] for binding in json.loads(sink.bound)] == [
+        "video", "audio", "data"
     ]
 
 
@@ -1658,11 +1679,9 @@ def test_the_shape_is_told_each_bound_streams_rate() -> None:
     assert _hints(tiled, "tile.wasm") == [{"v": [Fraction(25)] * 3}]
 
 
-def test_a_stream_a_node_writes_is_hinted_with_no_rate_and_timed_at_its_clock(
+def test_a_nodes_picture_is_hinted_at_its_clock_over_its_stride(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The host binds a node's output by its label and hints it with nothing,
-    so the compile does too; the delays still read it at its clock's rate."""
 
     def hopping(params: Mapping[str, object], bound: Sequence[str]) -> dict[str, object]:
         shape = _matte(params, bound)
@@ -1678,16 +1697,19 @@ def test_a_stream_a_node_writes_is_hinted_with_no_rate_and_timed_at_its_clock(
         "SELECT dim(m.mask, m.spots) FROM m) TO 'dimmed.mkv'",
         asked=asked,
     )
-    assert _hints(asked, "dim.wasm") == [{"v": [None], "boxes": [None]}]
+    assert _hints(asked, "dim.wasm") == [{"v": [Fraction(25, 2)], "boxes": [None]}]
     (dim,) = [node for node in graph.nodes.values() if node.filter == "dim.wasm"]
-    assert paths_of(graph, _probes()).rate(dim.inputs[0]) == Fraction(25, 2)
+    assert json.loads(dim.bound) == [
+        {"input": "v", "streams": [{"rate": {"num": 25, "den": 2}}]},
+        {"input": "boxes", "streams": [{"rate": None}]},
+    ]
     ticked = _Asked()
     _lowered(
         "COPY (SELECT ring(s.video[1], spot(s.video[1])) FROM ticker('hi', fps => 30) s) "
         "TO 'ringed.mp4'",
         asked=ticked,
     )
-    assert _hints(ticked, "spot.wasm") == [{"v": [None]}]
+    assert _hints(ticked, "spot.wasm") == [{"v": [Fraction(30)]}]
 
 
 def test_a_sound_conformed_to_its_port_is_hinted_at_the_rate_it_arrives_at(
@@ -1706,27 +1728,8 @@ def test_a_sound_conformed_to_its_port_is_hinted_at_the_rate_it_arrives_at(
         monkeypatch,
         rate=44100,
     )["sidecar0"]
-    assert _pad_after_input(sidecar)["rate"] == {"num": 48000, "den": 1}
-
-
-def test_the_shape_is_asked_again_with_the_ports_in_the_order_it_declares(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def reversed_burn(params: Mapping[str, object], bound: Sequence[str]) -> dict[str, object]:
-        shape = _burn(params, bound)
-        inputs = shape["inputs"]
-        assert isinstance(inputs, list)
-        return {**shape, "inputs": inputs[::-1]}
-
-    monkeypatch.setitem(SHAPES, "burn.wasm", reversed_burn)
-    asked = _Asked()
-    _lowered(
-        "COPY (SELECT burn(f.video[1], f.audio[1], hear(f.audio[1])), f.audio[1]" + _FROM,
-        asked=asked,
-    )
-    assert [one[2] for one in asked.asked if one[0] == "burn.wasm"] == [
-        ("v", "a", "words"),
-        ("words", "a", "v"),
+    assert _bound_flags(sidecar) == [
+        ("hear", [{"input": "a", "streams": [{"rate": {"num": 48000, "den": 1}}]}])
     ]
 
 
