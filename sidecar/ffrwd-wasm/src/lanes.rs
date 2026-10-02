@@ -677,6 +677,7 @@ impl State {
     fn dispatch(&mut self, i: usize) -> (Task, usize, Option<Box<dyn Node>>, Option<Opener>) {
         let lane = &mut self.lanes[i];
         let mut task = lane.queue.pop_front().expect("picked lanes have a task");
+        task.tick.ordinal = task.ordinal;
         lane.in_flight += 1;
         let wanted = match (task.tick.last, lane.finisher) {
             (true, Some(finisher)) => lane.idle.iter().position(|(i, _)| *i == finisher),

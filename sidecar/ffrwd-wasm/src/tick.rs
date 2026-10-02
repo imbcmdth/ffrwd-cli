@@ -842,7 +842,7 @@ impl Assembler {
         }
         Tick {
             pts,
-            ordinal: 0,
+            ordinal: number,
             time_base: base,
             last,
             streams,
