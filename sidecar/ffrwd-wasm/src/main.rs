@@ -401,17 +401,37 @@ struct Args {
 /// its own index among the sink's inputs, and every rendition field is
 /// None.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
-struct PadSpec {
-    row: Option<u32>,
+pub(crate) struct PadSpec {
+    pub(crate) row: Option<u32>,
     #[serde(default)]
-    rendition: PadRendition,
+    pub(crate) rendition: PadRendition,
+    /// A raw picture's colorimetry, which the NUT wire does not carry: the
+    /// compiler writes what it probed, in ffmpeg's names.
+    #[serde(default)]
+    pub(crate) color: Option<PadColor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub(crate) struct PadColor {
+    #[serde(default = "unknown_name")]
+    pub(crate) range: String,
+    #[serde(default = "unknown_name")]
+    pub(crate) primaries: String,
+    #[serde(default = "unknown_name")]
+    pub(crate) trc: String,
+    #[serde(default = "unknown_name")]
+    pub(crate) space: String,
+}
+
+fn unknown_name() -> String {
+    "unknown".to_string()
 }
 
 /// `-pad`'s `rendition` object: a row's name, bitrate and codec string,
 /// exactly as the manifest or catalog said them. Mirrors
 /// `runtime::RenditionMeta`.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
-struct PadRendition {
+pub(crate) struct PadRendition {
     name: Option<String>,
     bandwidth: Option<u64>,
     codecs: Option<String>,

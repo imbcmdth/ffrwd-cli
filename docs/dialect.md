@@ -857,20 +857,24 @@ The starter is a recipe, `recipes/resize.sql` declared as a map `bin`
 entry, not an export: a lib must name a file defining its export, so a
 fresh directory has nothing to declare one with.
 
-`--rust` writes a wasm module package instead of the bare one. On top
+`--rust` writes a node module package instead of the bare one. On top
 of the manifest and the lockfile: `Cargo.toml` for a `cdylib` crate
-named for the package segment, `build.rs`, `src/lib.rs` holding an
-`invert` module, `src/invert.sql` declaring it as an export,
-`recipes/invert.sql` calling that export, `.ffrwdignore`, `.gitignore`
-and a `README.md`. The manifest depends on `ffrwd/wasm` at the current
-world, and declares `capabilities` and `keywords` empty for their
-author to fill in. `cargo build --target wasm32-wasip2 --release` then
-`ffrwd publish` is the whole path from there.
+named for the package segment, taking `ffrwd-node` and `ffrwd-frame`
+by git tag; `src/lib.rs` holding a `passthrough` node, which reads one
+video input as its clock and hands the picture back on one video
+output like it; `src/passthrough.sql` declaring it as an export,
+`recipes/passthrough.sql` calling that export, `.ffrwdignore`,
+`.gitignore` and a `README.md`. The crate has no `build.rs` and no
+`wit/`: `ffrwd-node` carries the world. The manifest depends on
+`ffrwd/wasm` at the current world, and declares `capabilities` and
+`keywords` empty for their author to fill in.
+`cargo build --release --target wasm32-wasip2` then `ffrwd publish` is
+the whole path from there.
 
-`build.rs` puts the wit where `wit_bindgen::generate!({path: "wit"})`
-reads it, from whichever source is available: `FFRWD_WIT_DIR` when the
-environment names one, otherwise `ffrwd path ffrwd/wasm`. The crate's
-`wit/` is build output and is gitignored.
+`process` in `src/lib.rs` is where the work goes; the
+[ffrwd-node](https://github.com/imbcmdth/ffrwd-node) README is the
+reference for what a node declares and emits, and the node
+declaration rules are under [Statements](#statements).
 
 ### Running a recipe
 
@@ -1093,8 +1097,10 @@ every dependency its own manifest pins, at the written version, plus
 its pinned models and the runtime its modules load - everything
 installing this package from the registry would have fetched. A fresh
 clone of a package's repository builds and publishes after one bare
-install. `-g` without a package is an error; machine-wide installs
-name what to fetch.
+install. A dependency the project links is left to its link, and a pin
+of it from before the link leaves the lockfile, unless another pinned
+package depends on that version. `-g` without a package is an error;
+machine-wide installs name what to fetch.
 
 ### Where a package is
 

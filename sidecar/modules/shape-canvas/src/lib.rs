@@ -146,6 +146,9 @@ struct State {
     v: u32,
     from: (u32, u32),
     to: (u32, u32),
+    /// The input's colour as the host handed it, written as the row of the
+    /// tick at pts 0: the test that a -pad reaches a node.
+    colour: Option<String>,
 }
 
 thread_local! {
@@ -191,6 +194,12 @@ impl Guest for Node {
             v: v.id,
             from: (format.width, format.height),
             to: (params.width, params.height),
+            colour: format.color.as_ref().map(|c| {
+                format!(
+                    r#"{{"range":"{}","primaries":"{}","trc":"{}","space":"{}"}}"#,
+                    c.range, c.primaries, c.trc, c.space
+                )
+            }),
         };
         STATE.with(|s| *s.borrow_mut() = Some(state));
         Ok(())
@@ -205,6 +214,12 @@ impl Guest for Node {
             let state = s.borrow();
             let state = state.as_ref().ok_or("process before init")?;
             let mut items = Vec::new();
+            let mut rows = Vec::new();
+            if tick.pts() == 0 {
+                if let Some(colour) = &state.colour {
+                    rows.push(colour.clone());
+                }
+            }
             for frame in tick.frames(state.v) {
                 let pixels = tick.fetch(state.v, frame.index);
                 let (fw, fh) = (state.from.0 as usize, state.from.1 as usize);
@@ -227,7 +242,9 @@ impl Guest for Node {
                     }),
                 });
             }
-            Ok(emitted(items, false))
+            let mut out = emitted(items, false);
+            out.rows = rows;
+            Ok(out)
         })
     }
 }

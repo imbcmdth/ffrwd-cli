@@ -108,7 +108,7 @@ import heapq
 import json
 import math
 import re
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from fractions import Fraction
 from typing import Literal
@@ -141,6 +141,7 @@ from .ir import (
 )
 from .probe import JSON_CODEC, ProbeResult, StreamMeta, is_url
 from .shapes import Accepts, NodeShape, node_shape
+from .sink import COLOR_OPTIONS
 from .timing import Paths, paths_of
 
 __all__ = [
@@ -265,6 +266,45 @@ LONGEST_FRAME_SECONDS = 0.1
 
 # The colorimetry a codec's sidecar is told, by the names of its flags.
 SIDECAR_COLOR_FLAGS: tuple[str, ...] = ("color_range", "color_primaries", "color_trc", "colorspace")
+
+# A stream's colorimetry: each option ffmpeg's output takes it by, against
+# the field ffprobe reports it in and setparams' option for it.
+PROBED_COLOR: Mapping[str, str] = {
+    "color_range": "color_range",
+    "color_primaries": "color_primaries",
+    "color_trc": "color_transfer",
+    "colorspace": "color_space",
+    "chroma_sample_location": "chroma_location",
+}
+SETPARAMS_COLOR: Mapping[str, str] = {
+    "color_range": "range",
+    "color_primaries": "color_primaries",
+    "color_trc": "color_trc",
+    "colorspace": "colorspace",
+    "chroma_sample_location": "chroma_location",
+}
+# What ffprobe and setparams write for a field nothing settles.
+UNSAID_COLOR = frozenset({"unknown", "unspecified", "reserved", "auto"})
+# The fields that describe YUV alone, which an RGB picture has none of.
+YUV_ONLY_COLOR = ("color_range", "colorspace", "chroma_sample_location")
+RGB_PREFIXES = ("rgb", "bgr", "gbr", "argb", "abgr")
+# Filters that convert colour, past which a stream's colorimetry is no longer
+# its input's. A `scale` does too where it names an in_ or out_ option.
+COLOR_CONVERTING_FILTERS = frozenset(
+    {"colorspace", "colormatrix", "zscale", "tonemap", "tonemap_opencl", "libplacebo"}
+)
+
+# The colour a node network's input is told, by the ``-pad`` key each option
+# goes under, and what a field nothing settles is called there.
+_PAD_COLOR: Mapping[str, str] = {
+    "color_range": "range",
+    "color_primaries": "primaries",
+    "color_trc": "trc",
+    "colorspace": "space",
+}
+_UNKNOWN_COLOR = "unknown"
+# What leaves a conversion to an RGB pixel format: full range, no YUV matrix.
+_RGB_WIRE_COLOR: Mapping[str, str] = {"color_range": "pc", "colorspace": "gbr"}
 
 # Bytes one pixel takes on the wire, per pixel format ffrwd carries.
 _PIXEL_BYTES: Mapping[str, int] = {
@@ -1237,6 +1277,10 @@ class SidecarProcess:
     # The ports this region listens on for an input a node holds and the
     # query left unbound: (port, the node's name in the network, its input).
     listens: tuple[tuple[int, str, str], ...] = ()
+    # What each ``-i`` of a node network carries of its picture's colour, by
+    # the ``-pad`` key, in ``-i`` order: empty for an input with no raw
+    # picture an ffmpeg wrote.
+    colors: tuple[tuple[tuple[str, str], ...], ...] = ()
 
     @property
     def nodes(self) -> tuple[str, ...]:
@@ -1320,6 +1364,8 @@ class SidecarProcess:
             written["node_network"] = True
         if self.listens:
             written["listens"] = [list(one) for one in self.listens]
+        if self.colors:
+            written["colors"] = [dict(one) for one in self.colors]
         if self.network and self.graph is not None:
             written["graph"] = self.graph.to_dict()
         return written
@@ -1371,6 +1417,11 @@ class SidecarProcess:
                 (int(str(one[0])), str(one[1]), str(one[2]))
                 for one in _read_list(d, "listens")
                 if isinstance(one, list) and len(one) == 3
+            ),
+            colors=tuple(
+                tuple((str(key), str(value)) for key, value in one.items())
+                for one in _read_list(d, "colors")
+                if isinstance(one, dict)
             ),
         )
 
@@ -1603,6 +1654,62 @@ def _accepted(
         )
         return accepts.sample_formats, made
     return (), None
+
+
+def converts_colour(node: Node) -> bool:
+    """True where `node` converts the colour of the pictures through it."""
+    if node.filter in COLOR_CONVERTING_FILTERS:
+        return True
+    return node.filter == "scale" and any(
+        str(key).startswith(("in_", "out_")) for key in node.args
+    )
+
+
+def stream_colorimetry(
+    graph: Graph,
+    ref: FrameRef,
+    source_meta: Callable[[FrameRef], StreamMeta | None],
+    pix_fmt: str | None = None,
+    *,
+    opaque: Collection[str] = (),
+) -> dict[str, str]:
+    """The colorimetry the pictures `ref` names carry, by ffmpeg's option
+    names, as far as the query says it.
+
+    A ``setparams`` on the way settles each field it names; past a filter
+    that converts colour (:data:`COLOR_CONVERTING_FILTERS`), or a node named
+    in `opaque`, nothing else does. Every field left is the input stream's,
+    as `source_meta` says it was probed. A field nothing settles is absent.
+    Pictures in an RGB `pix_fmt` have no YUV matrix, range or chroma siting
+    to state.
+    """
+    said: dict[str, str] = {}
+    seen: set[str] = set()
+    current: FrameRef | None = ref
+    while current is not None and not is_src(current):
+        name, _, pad = current.rpartition(":")
+        name = name if name and pad.isdigit() else current
+        node = graph.nodes.get(name)
+        if node is None or name in seen or name in opaque or converts_colour(node):
+            current = None
+            break
+        seen.add(name)
+        if node.filter == "setparams":
+            for option, param in SETPARAMS_COLOR.items():
+                value = node.args.get(param)
+                if value is not None and str(value) not in UNSAID_COLOR:
+                    said.setdefault(option, str(value))
+        current = next((r for r in node.inputs if ref_type(graph, r) == "video"), None)
+    meta = source_meta(current) if current is not None else None
+    if meta is not None:
+        for option, field_name in PROBED_COLOR.items():
+            value = getattr(meta, field_name)
+            if isinstance(value, str) and value not in UNSAID_COLOR:
+                said.setdefault(option, value)
+    if pix_fmt is not None and pix_fmt.startswith(RGB_PREFIXES):
+        for option in YUV_ONLY_COLOR:
+            said.pop(option, None)
+    return {option: said[option] for option in COLOR_OPTIONS if option in said}
 
 
 def _converted(written: StreamFormat, wanted: str) -> str:
@@ -2000,6 +2107,9 @@ class _Partitioner:
         self.sidecars: list[SidecarProcess] = []
         self.sidecar_of: dict[str, str] = {}  # node id -> process id
         self.members: dict[str, list[str]] = {}  # process id -> its node ids
+        # A node region's read of a stream another of its reads already
+        # carries in the same format: the copy, and the read it binds to.
+        self.same_reads: dict[FrameRef, FrameRef] = {}
         self.consumer_of: dict[str, str] = {}  # feeder process id -> its reader
         # The ffmpeg processes copying one module's data stream to each of its
         # readers, by the sidecar writing it and the stream's ref.
@@ -2746,7 +2856,12 @@ class _Partitioner:
         return [groups[name] for name in self.order if name in groups]
 
     def _region_reads(self, members: Sequence[str]) -> list[tuple[FrameRef, str]]:
-        """Refs this region reads from outside, each with the node reading it."""
+        """Refs this region reads from outside, each with the node reading it.
+
+        A region holding a node reads each stream once per format its ports
+        take it in: copies a split outside made of it are one read, which the
+        network hands every port (:attr:`same_reads`).
+        """
         inside = set(members)
         wanted: list[tuple[FrameRef, str]] = []
         seen: set[FrameRef] = set()
@@ -2759,7 +2874,17 @@ class _Partitioner:
                     continue
                 seen.add(ref)
                 wanted.append((ref, name))
-        return wanted
+        if not any(name in self.node_shapes for name in members):
+            return wanted
+        kept: dict[tuple[FrameRef, StreamFormat], FrameRef] = {}
+        shared: list[tuple[FrameRef, str]] = []
+        for ref, reader in wanted:
+            first = kept.setdefault((self._past_splits(ref), self._format(ref, reader)), ref)
+            if first == ref:
+                shared.append((ref, reader))
+            else:
+                self.same_reads[ref] = first
+        return shared
 
     def _region_writes(self, members: Sequence[str]) -> list[tuple[FrameRef, StreamType]]:
         """Pads this region produces that something outside it reads."""
@@ -4857,14 +4982,14 @@ class _Partitioner:
         outgoing = [e for e in self.edges if e.source == sidecar.id]
 
         taken = set(self.g.sources)
-        read_as, _, read_order = self._read_aliases(incoming, taken)
+        read_as, alias_of, read_order = self._read_aliases(incoming, taken)
 
         names = {binding.path: binding.name for binding in sidecar.modules}
         dissolved: dict[str, FrameRef] = {}
 
         def rewrite(ref: FrameRef) -> FrameRef:
             slot = ref if is_src(ref) else f"{_ref_node(ref)}:{_ref_pad(ref)}"
-            ref = dissolved.get(slot, ref)
+            ref = self.same_reads.get(ref, dissolved.get(slot, ref))
             return read_as.get(ref, ref)
 
         nodes: dict[str, Node] = {}
@@ -4951,6 +5076,9 @@ class _Partitioner:
         return replace(
             sidecar,
             listens=self._region_listens(members, names),
+            colors=self._region_colors(incoming, alias_of, read_order)
+            if sidecar.node_network
+            else (),
             reads_rows=any(e.annotations for e in self.edges if e.target == sidecar.id),
             writes_rows=any(e.annotations for e in self.edges if e.source == sidecar.id),
             rows_modules=self._rows_modules(sidecar, members),
@@ -4961,6 +5089,45 @@ class _Partitioner:
                 sinks=sinks,
             ),
         )
+
+    def _region_colors(
+        self,
+        incoming: Sequence[StreamEdge],
+        alias_of: Mapping[FrameRef, str],
+        order: Sequence[str],
+    ) -> tuple[tuple[tuple[str, str], ...], ...]:
+        """The colour each ``-i`` of a node network is told, in ``-i`` order.
+
+        NUT writes none, so each input an ffmpeg writes a raw picture on is
+        told the first one's: what the probe and the filters on the way say
+        (:func:`stream_colorimetry`), and full-range RGB where the edge
+        converts it to an RGB format. A field nothing settles is "unknown".
+        """
+        sidecars = {sidecar.id for sidecar in self.sidecars}
+        modules = {name for name, external in self.external.items() if external}
+        found: dict[str, tuple[tuple[str, str], ...]] = {}
+        for edge in incoming:
+            wire = edge.format
+            alias = alias_of.get(edge.ref)
+            if (
+                alias is None
+                or alias in found
+                or edge.source in sidecars
+                or not isinstance(wire, VideoFormat)
+                or wire.codec != RAWVIDEO
+            ):
+                continue
+            said = stream_colorimetry(
+                self.g, edge.ref, self._origin_meta, wire.pix_fmt, opaque=modules
+            )
+            if wire.pix_fmt.startswith(RGB_PREFIXES):
+                said.update(_RGB_WIRE_COLOR)
+            found[alias] = tuple(
+                (key, said.get(option, _UNKNOWN_COLOR)) for option, key in _PAD_COLOR.items()
+            )
+        if not found:
+            return ()
+        return tuple(found.get(alias, ()) for alias in order)
 
     def _region_listens(
         self, members: Sequence[str], names: Mapping[str, str]

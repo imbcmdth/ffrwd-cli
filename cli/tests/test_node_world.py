@@ -295,13 +295,21 @@ def _registry() -> Registry:
     return load_reference(SNAPSHOT_PATH)
 
 
-def _probes(rate: int = 48000) -> dict[str, ProbeResult | None]:
+def _probes(
+    rate: int = 48000, colour: Mapping[str, str] | None = None
+) -> dict[str, ProbeResult | None]:
+    said = colour or {}
+
     def media() -> ProbeResult:
         return ProbeResult(
             streams=[
                 StreamMeta(
                     type="video", index=0, metadata={}, width=320, height=240,
                     fps="25/1", sample_rate=None, codec="h264",
+                    color_range=said.get("color_range"),
+                    color_primaries=said.get("color_primaries"),
+                    color_transfer=said.get("color_transfer"),
+                    color_space=said.get("color_space"),
                 ),
                 StreamMeta(
                     type="audio", index=0, metadata={}, width=None, height=None,
@@ -516,6 +524,16 @@ def test_one_call_read_twice_is_one_node() -> None:
     assert graph.rows_sinks[hears[0].id].container == "webvtt"
 
 
+def test_a_nodes_rows_under_a_pinned_track_row_are_a_track_of_the_file() -> None:
+    graph = _lowered(
+        "COPY (SELECT v, spot(v) FROM input('f.mp4') f, unnest(f.video) v "
+        "WHERE v.index = 1) TO 'out.mkv'"
+    )
+    (spot,) = [node for node in graph.nodes.values() if node.filter == "spot.wasm"]
+    assert graph.rows_sinks[spot.id].container == "webvtt"
+    assert [output.type for output in graph.sinks[0].outputs] == ["video", "subtitle"]
+
+
 def test_kinds_mix_in_one_call_and_a_left_out_port_is_unbound() -> None:
     asked = _Asked()
     graph = _lowered(
@@ -712,10 +730,13 @@ def test_a_live_node_fed_later_than_its_bound_is_refused() -> None:
 
 
 def _plan_argv(
-    query: str, monkeypatch: pytest.MonkeyPatch, rate: int = 48000
+    query: str,
+    monkeypatch: pytest.MonkeyPatch,
+    rate: int = 48000,
+    colour: Mapping[str, str] | None = None,
 ) -> dict[str, list[str]]:
     """Each process of the compiled plan as the printed command shows it."""
-    probes = _probes(rate)
+    probes = _probes(rate, colour)
     monkeypatch.setattr(
         "ffrwd.compiler.probe_path", lambda path, args=(), **kw: probes[path[0]]
     )
@@ -752,13 +773,13 @@ def test_every_stream_one_process_hands_a_node_network_rides_one_nut(
     sidecar = argv["sidecar0"]
     assert sidecar.count("-i") == 1
     assert sidecar[sidecar.index("-filter_complex") + 1] == (
-        "[a=0:a]hear[cues=n1];[v=0:v][a=0:a:1][words=n1]burn[v=out0]"
+        "[a=0:a]hear[cues=n1];[v=0:v][a=0:a][words=n1]burn[v=out0]"
     )
     (feeder,) = [
         words for pid, words in argv.items() if pid.startswith("ffmpeg") and "nut" in words
         and words[-1] == "pipe:1"
     ]
-    assert feeder.count("-map") == 3
+    assert feeder.count("-map") == 2, "both ports take the sound as it is, so it crosses once"
     assert feeder[-3:] == ["-f", "nut", "pipe:1"]
 
 
@@ -799,6 +820,21 @@ def test_a_stream_two_nodes_read_crosses_in_the_format_both_take(
         monkeypatch,
     ))
     assert feeder[feeder.index("-pix_fmt:0") + 1] == "rgba"
+
+
+def test_a_picture_written_beside_the_nodes_reading_it_crosses_to_them_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    argv = _plan_argv(
+        "COPY (SELECT ring(f.video[1], spot(f.video[1])), f.video[1] "
+        "FROM input('f.mp4') f) TO 'both.mkv'",
+        monkeypatch,
+    )
+    assert _feeder(argv).count("-map") == 1
+    sidecar = argv["sidecar0"]
+    assert sidecar[sidecar.index("-filter_complex") + 1] == (
+        "[v=0:v]spot=every=30[spots=n1];[v=0:v][spots=n1]ring[v=out0]"
+    )
 
 
 def test_each_stream_of_one_nut_is_conformed_to_the_port_it_feeds(
@@ -850,6 +886,59 @@ def test_a_node_source_whose_relation_is_its_renditions_ends_where_its_reader_sa
     )
     reader = argv["ffmpeg0"]
     assert reader[reader.index("-to") + 1] == "10"
+
+
+_BT709_PC = {
+    "color_range": "pc",
+    "color_primaries": "bt709",
+    "color_transfer": "bt709",
+    "color_space": "bt709",
+}
+_RING = "COPY (SELECT ring(f.video[1], spot(f.video[1])) FROM input('f.mp4') f) TO 'ringed.mp4'"
+
+
+def _pad_after_input(sidecar: Sequence[str]) -> object:
+    """The ``-pad`` JSON written right after the sidecar's one ``-i``."""
+    at = sidecar.index("-i") + 2
+    assert sidecar[at] == "-pad"
+    return json.loads(sidecar[at + 1])
+
+
+def _taking_pictures(monkeypatch: pytest.MonkeyPatch, pixel_format: str) -> None:
+    taken = {"pixel_formats": [pixel_format]}
+    monkeypatch.setitem(SHAPES, "spot.wasm", _taking(_spot, "video", taken))
+    monkeypatch.setitem(SHAPES, "ring.wasm", _taking(_reader("spots", _ROWS), "video", taken))
+
+
+def test_a_yuv_picture_into_a_node_network_carries_the_probed_colour(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _taking_pictures(monkeypatch, "yuv420p")
+    argv = _plan_argv(_RING, monkeypatch, colour=_BT709_PC)
+    assert _pad_after_input(argv["sidecar0"]) == {
+        "color": {"range": "pc", "primaries": "bt709", "trc": "bt709", "space": "bt709"}
+    }
+
+
+def test_a_picture_the_probe_says_nothing_of_carries_unknown_colour(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _taking_pictures(monkeypatch, "yuv420p")
+    argv = _plan_argv(_RING, monkeypatch)
+    assert _pad_after_input(argv["sidecar0"]) == {
+        "color": {"range": "unknown", "primaries": "unknown", "trc": "unknown",
+                  "space": "unknown"}
+    }
+
+
+def test_a_picture_converted_to_rgb_on_its_way_carries_what_the_conversion_wrote(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _taking_pictures(monkeypatch, "rgba")
+    argv = _plan_argv(_RING, monkeypatch, colour=_BT709_PC)
+    assert _pad_after_input(argv["sidecar0"]) == {
+        "color": {"range": "pc", "primaries": "bt709", "trc": "bt709", "space": "gbr"}
+    }
 
 
 def test_a_node_network_hands_one_process_every_stream_it_reads_on_one_nut(
@@ -932,6 +1021,41 @@ def test_spans_without_a_span_are_refused() -> None:
         _lowered("COPY (SELECT ffrwd.merge_spans(spot(f.video[1])) FROM input('f.mp4') f) "
                  "TO 'spots.ndjson'")
     assert caught.value.message == "ffrwd.merge_spans() needs 'max_span'"
+
+
+_SPANS = {
+    "type": "object",
+    "properties": {"start_t": {"type": "number"}, "end_t": {"type": "number"},
+                   "id": {"type": "integer"}},
+}
+_MASK = (
+    "CREATE FUNCTION mask(v video_stream, spans STRUCT(start_t number, end_t number, "
+    "id number)[]) RETURNS video_stream AS 'mask.wasm', 'mask' LANGUAGE wasm;\n"
+)
+
+
+def test_spans_are_read_with_the_end_and_id_the_merge_writes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(SHAPES, "mask.wasm", _reader("spans", _SPANS))
+    graph = _lowered(
+        _MASK + "COPY (SELECT mask(f.video[1], ffrwd.merge_spans(spot(f.video[1]), "
+        "max_span => 10))" + _FROM
+    )
+    (spans,) = [node for node in graph.nodes.values() if node.filter == "rowmerge"]
+    (mask,) = [node for node in graph.nodes.values() if node.filter == "mask.wasm"]
+    assert mask.inputs == ["src:f:v:0", spans.id]
+
+
+def test_rows_read_with_an_end_they_do_not_carry_are_still_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(SHAPES, "mask.wasm", _reader("spans", _SPANS))
+    with pytest.raises(FfrwdError) as caught:
+        _lowered(_MASK + "COPY (SELECT mask(f.video[1], spot(f.video[1]))" + _FROM)
+    assert caught.value.message == (
+        "mask() reads 'end_t' as number on its 'spans' input, and spot() does not write it"
+    )
 
 
 def test_explain_delays_says_each_window_and_each_outputs_delay() -> None:

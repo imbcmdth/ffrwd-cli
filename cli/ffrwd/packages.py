@@ -69,7 +69,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -1677,6 +1677,35 @@ def _ensure(
     brought.append(release)
 
 
+def _unlinked(
+    entries: Sequence[LockEntry], wanted: Mapping[str, str], linked: Collection[str | None]
+) -> list[LockEntry]:
+    """`entries` less each version of a linked name nothing `wanted` reaches.
+
+    The link answers for that name, so a version installed before it stays
+    only where another pinned package's own dependencies name it.
+    """
+    reached: set[tuple[str, str]] = set()
+    stack = list(wanted.items())
+    while stack:
+        pinned = stack.pop()
+        if pinned in reached:
+            continue
+        reached.add(pinned)
+        entry = _entry_for(pinned[0], pinned[1], entries)
+        if entry is not None:
+            stack.extend(entry.dependencies.items())
+    return [
+        entry
+        for entry in entries
+        if not (
+            isinstance(entry, RegistryEntry)
+            and entry.name in linked
+            and (entry.name, entry.version) not in reached
+        )
+    ]
+
+
 def _write_lockfile_migrating(
     lock: Path, entries: Sequence[LockEntry], wanted: Mapping[str, str]
 ) -> None:
@@ -1800,7 +1829,9 @@ def install_project(
     A dependency this project links to a working directory is left as the
     link it is: that is what a link is for, and fetching the registry's copy
     beside it would shadow the link and refuse the whole install for a
-    package that is not published yet.
+    package that is not published yet. A pin of it from before the link
+    goes too, so the lock is the one an install with the link already
+    standing writes.
     """
     package = read_manifest(manifest)
     current = read_lockfile(lock) if lock.is_file() else None
@@ -1813,13 +1844,14 @@ def install_project(
         if name in linked:
             if detail is not None:
                 detail(f"{name} is linked to a working directory")
+            wanted.pop(name, None)
             continue
         if detail is not None:
             detail(f"resolving {name} {version}")
         release = resolve(f"{name}@{version}")
         _ensure(release, entries, [], brought, announce, progress, detail)
         wanted[name] = release.version
-    _write_lockfile_migrating(lock, entries, wanted)
+    _write_lockfile_migrating(lock, _unlinked(entries, wanted, linked), wanted)
 
     _install_models(package, announce, progress, detail)
     _install_runtime(package, announce, progress)
