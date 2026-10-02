@@ -181,7 +181,10 @@ fn a_frame_handed_back_with_same_leaves_on_the_inputs_own_buffer() {
             }
             Payload::Message(message) if item.port == spots => {
                 assert_eq!(message.pts, 300_000, "0.3 s in microseconds");
-                assert_eq!(message.data, br#"{"start_t":0.3}"#);
+                assert_eq!(
+                    message.data, br#"{"start_t":0.3,"ordinal":3,"calls":1}"#,
+                    "the ordinal the host handed, and the instance's own count"
+                );
                 saw_spot = true;
             }
             _ => panic!("nothing else leaves"),

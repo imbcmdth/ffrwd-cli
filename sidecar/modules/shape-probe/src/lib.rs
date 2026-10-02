@@ -15,6 +15,9 @@
 //! - `canvas`: a video of the size `canvas` names, only when it does.
 //! - `spots`: data, one message per tick, as late as twelve of `v`'s frames
 //!   where the call says `v`'s rate and half a second where it does not.
+//!   Each says the tick's ordinal and how many calls this instance has had,
+//!   so a run split across workers shows the one agreeing and the other
+//!   not.
 //!
 //! `refuse` asks for a shape the host must refuse, by name of the rule.
 
@@ -30,7 +33,7 @@ use ffrwd::av::node_types::{
     NodeShape, OutputFormat, OutputPort, Pairing, PortKind, RowsUse,
 };
 use ffrwd::av::types::{Meta, Rational, VideoFormat, Wants};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use serde::Deserialize;
 
@@ -291,6 +294,9 @@ struct ShapeProbe;
 /// Whether the query reads `copy`, as `init` was told.
 static LATCHED_COPY: AtomicBool = AtomicBool::new(false);
 
+/// The calls this instance has had.
+static CALLS: AtomicU64 = AtomicU64::new(0);
+
 impl Guest for ShapeProbe {
     fn describe() -> Meta {
         Meta {
@@ -343,11 +349,14 @@ impl Guest for ShapeProbe {
         }
         let base = tick.time_base();
         let seconds = tick.pts() as f64 * f64::from(base.num) / f64::from(base.den);
+        let calls = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+        let ordinal = tick.ordinal();
         items.push(Emission {
             port: "spots".to_string(),
             payload: Payload::Message(Message {
                 pts: (seconds * 1_000_000.0).round() as i64,
-                data: format!(r#"{{"start_t":{seconds}}}"#).into_bytes(),
+                data: format!(r#"{{"start_t":{seconds},"ordinal":{ordinal},"calls":{calls}}}"#)
+                    .into_bytes(),
             }),
         });
         Ok(Emitted {

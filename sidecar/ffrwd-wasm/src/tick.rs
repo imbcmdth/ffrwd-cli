@@ -23,8 +23,8 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Result};
 use ffrwd_wasm_runtime::node::{
-    BoundStream, Clock, Hold, NodeShape, Pairing, PortKind, RowsUse, StreamFormat, Tick, TickFrame,
-    TickStream, TimedRows,
+    BoundStream, Clock, Feed, Hold, NodeShape, Pairing, PortKind, RowsUse, StreamFormat, Tick,
+    TickFrame, TickStream, TimedRows,
 };
 use ffrwd_wasm_runtime::runtime::{AudioFormat, Format, Frame, Message, Packet, Shape, TimeBase};
 
@@ -349,6 +349,54 @@ impl EarlierRows {
     }
 }
 
+/// The feeds a hold input's instance is owed: those that ended on any tick
+/// since its previous call, the tick it processes included, oldest first.
+/// A frame-parallel node's instances each hear of every end, whichever
+/// ticks they were handed.
+#[derive(Default)]
+pub struct EndedFeeds {
+    /// Per stream id, every feed that ended, by the tick it ended on.
+    ended: BTreeMap<u32, Vec<(u64, Feed)>>,
+    /// Per instance, the first tick number whose ends it has not been told.
+    told: BTreeMap<usize, u64>,
+}
+
+impl EndedFeeds {
+    pub fn record(&mut self, id: u32, number: u64, feed: Feed) {
+        self.ended.entry(id).or_default().push((number, feed));
+    }
+
+    /// What `instance`, about to process tick `number`, is owed on `id`.
+    pub fn owed(&self, instance: usize, id: u32, number: u64) -> Vec<Feed> {
+        let from = self.told.get(&instance).copied().unwrap_or(0);
+        self.ended
+            .get(&id)
+            .map(|ended| {
+                ended
+                    .iter()
+                    .filter(|(n, _)| *n >= from && *n <= number)
+                    .map(|(_, feed)| feed.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn processed(&mut self, instance: usize, number: u64) {
+        self.told.insert(instance, number + 1);
+    }
+
+    /// The ends every one of `instances` has been told of go.
+    pub fn forget_told(&mut self, instances: usize) {
+        let past = (0..instances)
+            .map(|i| self.told.get(&i).copied().unwrap_or(0))
+            .min()
+            .unwrap_or(0);
+        for ended in self.ended.values_mut() {
+            ended.retain(|(n, _)| *n >= past);
+        }
+    }
+}
+
 /// One thing arriving on a bound stream.
 #[derive(Debug, Clone)]
 pub enum Item {
@@ -425,6 +473,10 @@ pub struct Assembler {
     made_end: Option<i64>,
     /// Rows of state inputs, for instances that did not see every tick.
     pub earlier: EarlierRows,
+    /// Feeds of hold inputs that ended, for every instance to hear of.
+    pub ended: EndedFeeds,
+    /// Feeds that ended while the tick being made was cut, by stream id.
+    ending: Vec<(u32, Feed)>,
     /// The hold inputs, grouped.
     holds: Vec<Group>,
     /// The clock's ticks as a grid, for foretelling where a feed ends.
@@ -551,6 +603,8 @@ impl Assembler {
             done: false,
             made_end: None,
             earlier: EarlierRows::default(),
+            ended: EndedFeeds::default(),
+            ending: Vec::new(),
             holds,
             grid,
             last_pts: None,
@@ -749,10 +803,24 @@ impl Assembler {
         }
         self.last_pts = Some(pts);
         let grid = self.grid;
-        self.holds
+        let handed: Vec<Vec<Handed>> = self
+            .holds
             .iter_mut()
             .map(|group| group.tick(pts, end, base, &grid))
-            .collect()
+            .collect();
+        for (index, group) in self.holds.iter_mut().enumerate() {
+            for (member, feed) in group.take_ended() {
+                let id = self
+                    .inputs
+                    .iter()
+                    .find(|i| i.hold == Some((index, member)))
+                    .map(|i| i.id);
+                if let Some(id) = id {
+                    self.ending.push((id, feed));
+                }
+            }
+        }
+        handed
     }
 
     /// Where the interval of the tick made last ends, in its time base:
@@ -819,6 +887,9 @@ impl Assembler {
         self.made += 1;
         self.made_end = end;
         self.grid.observe(pts);
+        for (id, feed) in std::mem::take(&mut self.ending) {
+            self.ended.record(id, number, feed);
+        }
         for stream in &streams {
             let state = self
                 .inputs
@@ -1759,6 +1830,59 @@ mod tests {
             owed,
             vec![0, 10, 20],
             "a first call is owed every one before it"
+        );
+    }
+
+    #[test]
+    fn an_instance_that_skipped_the_tick_a_feed_ended_on_hears_of_it_on_its_next_call() {
+        let hold = Pairing::Hold(ffrwd_wasm_runtime::node::Hold {
+            anchor: ffrwd_wasm_runtime::node::Anchor::SharedClock,
+            lead: 0.0,
+            linger: None,
+            timeout: Some(0.1),
+            group: None,
+            port_param: Some("port".to_string()),
+        });
+        let s = shape(
+            vec![port("feed", PortKind::Video, hold, RowsUse::Ignore)],
+            Clock::Rate(Rational { num: 30, den: 1 }),
+        );
+        let tb = TimeBase { num: 1, den: 30 };
+        let mut a =
+            Assembler::new(&s, &[bound("feed", 4, tb, video())], "m", &[4]).expect("assembler");
+        a.arrive(4, frame(0, &[])).expect("a frame");
+        let mut heard: Vec<Vec<(u64, usize, i64)>> = vec![Vec::new(); 3];
+        for _ in 0..10 {
+            let tick = a
+                .next_rate(false)
+                .expect("tick")
+                .expect("a port feed never holds one");
+            let ordinal = tick.ordinal;
+            // Two workers take turns, and a third opens at tick 8.
+            let instance = if ordinal >= 8 {
+                2
+            } else {
+                (ordinal % 2) as usize
+            };
+            for feed in a.ended.owed(instance, 4, ordinal) {
+                heard[instance].push((ordinal, instance, feed.ends.expect("ends is set")));
+            }
+            a.ended.processed(instance, ordinal);
+        }
+        assert_eq!(
+            heard[1],
+            vec![(3, 1, 2)],
+            "the timeout ends the feed on tick 3, after tick 2"
+        );
+        assert_eq!(
+            heard[0],
+            vec![(4, 0, 2)],
+            "instance 0 skipped tick 3 and hears of it on 4"
+        );
+        assert_eq!(
+            heard[2],
+            vec![(8, 2, 2)],
+            "a first call hears of every end before it"
         );
     }
 }

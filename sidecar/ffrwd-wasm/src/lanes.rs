@@ -704,6 +704,15 @@ impl State {
                 }
             }
         }
+        if let LaneIntake::Assembled(a) = &mut lane.intake {
+            for stream in &mut task.tick.streams {
+                stream.ended_feeds = a.ended.owed(instance, stream.id, task.ordinal);
+            }
+            a.ended.processed(instance, task.ordinal);
+            if lane.created >= lane.width {
+                a.ended.forget_told(lane.created);
+            }
+        }
         (task, instance, runner, opener)
     }
 

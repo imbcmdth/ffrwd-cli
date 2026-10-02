@@ -338,6 +338,9 @@ struct FeedState {
     frames_shown: u64,
     repeated: u64,
     skipped: u64,
+    /// Per member, the record the last tick handed it, and that tick.
+    handed: Vec<Option<Feed>>,
+    last_tick: Option<i64>,
 }
 
 /// One hold input, or one group of them.
@@ -352,6 +355,8 @@ pub struct Group {
     /// The last tick's time and the clock's base, for the room a held
     /// source gets.
     now: Option<(i64, TimeBase)>,
+    /// Feeds that ended and no tick has taken yet, by member.
+    ended: Vec<(usize, Feed)>,
     report: Report,
 }
 
@@ -378,6 +383,7 @@ impl Group {
             sources: VecDeque::new(),
             feed: None,
             now: None,
+            ended: Vec::new(),
             report: Box::new(to_stderr),
         }
     }
@@ -615,6 +621,19 @@ impl Group {
         let Some(feed) = self.feed.take() else {
             return;
         };
+        if let Some(last) = feed.last_tick {
+            for (member, record) in feed.handed.iter().enumerate() {
+                if let Some(record) = record {
+                    self.ended.push((
+                        member,
+                        Feed {
+                            start: record.start.clone(),
+                            ends: Some(last),
+                        },
+                    ));
+                }
+            }
+        }
         let lead = self.sources.front().map_or(self.lead, |s| s.lead);
         self.sources.pop_front();
         let seconds = |t: i64| t as f64 * clock_base.num as f64 / clock_base.den as f64;
@@ -727,7 +746,15 @@ impl Group {
             frames_shown: 0,
             repeated: 0,
             skipped: 0,
+            handed: vec![None; self.members.len()],
+            last_tick: None,
         });
+    }
+
+    /// The feeds that ended since this was last asked, oldest first, each
+    /// with the member it fed and `ends` at the last tick it was handed on.
+    pub fn take_ended(&mut self) -> Vec<(usize, Feed)> {
+        std::mem::take(&mut self.ended)
     }
 
     /// Where the feed's last frame shows for the last time, once the source
@@ -889,6 +916,8 @@ impl Group {
                 record.ends = feed.ends;
             }
         }
+        feed.handed = handed.iter().map(|hand| hand.feed.clone()).collect();
+        feed.last_tick = Some(pts);
         self.feed = Some(feed);
         handed
     }
@@ -1219,6 +1248,103 @@ mod tests {
         let handed = g.tick(7, Some(8), THIRTIETHS, &grid);
         assert_eq!(mark(&handed[0]), Some(2));
         assert_eq!(handed[0].feed.as_ref().unwrap().start.first_pts, 7);
+    }
+
+    #[test]
+    fn a_start_is_known_on_the_tick_it_was_fixed_on() {
+        let grid = Grid::exact();
+        let timed = |first_pts: i64, now: i64| {
+            let (mut g, _) = group(
+                hold(Anchor::SharedClock, 0.0, None, None),
+                vec![video_member(1, MILLIS)],
+                true,
+            );
+            g.arrive(0, frame(first_pts, 1));
+            let feed = g.tick(now, Some(now + 1), THIRTIETHS, &grid)[0]
+                .feed
+                .clone()
+                .expect("fixed");
+            (feed.start.known, feed.start.at)
+        };
+        assert_eq!(
+            timed(3000, 10),
+            (10, 90),
+            "a timed feeder arrives three seconds early: known 80 ticks before at"
+        );
+        assert_eq!(
+            timed(0, 50),
+            (0, 0),
+            "one the clock has passed shows at once: known is at"
+        );
+        let untimed = |lead: f64| {
+            let (mut g, _) = group(
+                hold(Anchor::FirstFrame, lead, None, None),
+                vec![video_member(1, MILLIS)],
+                false,
+            );
+            g.arrive(0, frame(0, 1));
+            g.arrive(0, frame(400, 2));
+            g.source_close(0);
+            let feed = g.tick(100, Some(101), THIRTIETHS, &grid)[0]
+                .feed
+                .clone()
+                .expect("fixed");
+            (feed.start.known, feed.start.at)
+        };
+        assert_eq!(
+            untimed(0.0),
+            (100, 100),
+            "no lead: fixed on the tick it shows"
+        );
+        assert_eq!(untimed(0.3), (100, 109), "primed, then shown a lead later");
+    }
+
+    #[test]
+    fn every_feed_that_ends_is_kept_with_the_last_tick_it_showed_on() {
+        let grid = Grid::exact();
+        let (mut g, _) = group(
+            hold(Anchor::SharedClock, 0.0, None, Some(0.1)),
+            vec![video_member(1, THIRTIETHS)],
+            true,
+        );
+        g.arrive(0, frame(0, 1));
+        for k in 0..5 {
+            g.tick(k, Some(k + 1), THIRTIETHS, &grid);
+        }
+        let ended = g.take_ended();
+        assert_eq!(ended.len(), 1, "a timeout");
+        assert_eq!(ended[0].1.ends, Some(2), "the third tick was its last");
+        assert_eq!(ended[0].1.start.first_pts, 0);
+        assert!(g.take_ended().is_empty(), "taken once");
+
+        g.arrive(0, frame(5, 2));
+        g.tick(5, Some(6), THIRTIETHS, &grid);
+        g.tick(6, Some(7), THIRTIETHS, &grid);
+        g.clock_jumped(90, THIRTIETHS);
+        let ended = g.take_ended();
+        assert_eq!(ended.len(), 1, "a jump in the clock");
+        assert_eq!((ended[0].1.start.at, ended[0].1.ends), (5, Some(6)));
+
+        let (mut g, _) = group(
+            hold(Anchor::SharedClock, 0.0, None, None),
+            vec![video_member(1, THIRTIETHS)],
+            false,
+        );
+        g.arrive(0, frame(0, 1));
+        g.arrive(0, frame(2, 2));
+        g.source_close(0);
+        let foretold: Vec<Option<i64>> = (0..4)
+            .map(|k| {
+                g.tick(k, Some(k + 1), THIRTIETHS, &grid)[0]
+                    .feed
+                    .as_ref()
+                    .and_then(|f| f.ends)
+            })
+            .collect();
+        assert_eq!(foretold, vec![Some(2), Some(2), Some(2), None]);
+        let ended = g.take_ended();
+        assert_eq!(ended.len(), 1, "a foretold end is kept as well");
+        assert_eq!(ended[0].1.ends, Some(2));
     }
 
     #[test]

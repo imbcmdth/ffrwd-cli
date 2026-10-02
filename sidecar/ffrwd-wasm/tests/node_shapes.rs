@@ -23,6 +23,7 @@ const SHAPES: &[&str] = &[
     "shape-window",
     "shape-packets",
     "shape-switch",
+    "shape-probe",
 ];
 
 fn sidecar_root() -> PathBuf {
@@ -1292,4 +1293,87 @@ fn a_node_pad_that_names_no_port_is_refused_naming_the_pad() {
         stderr.contains("[0:v] names no port") && stderr.contains("[<port>=0:v]"),
         "{stderr}"
     );
+}
+
+/// A loopback port nothing listens on now.
+fn free_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a port");
+    listener.local_addr().expect("its address").port()
+}
+
+/// One run of the sidecar at `jobs`, which has to succeed.
+fn run_at(jobs: &str, args: &[String]) -> std::process::Output {
+    let output = Command::new(env!("CARGO_BIN_EXE_ffrwd-wasm"))
+        .arg("-jobs")
+        .arg(jobs)
+        .args(args)
+        .output()
+        .expect("spawn ffrwd-wasm");
+    assert!(
+        output.status.success(),
+        "-jobs {jobs} exited {:?}:
+{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+}
+
+#[test]
+fn every_worker_numbers_a_tick_by_its_ordinal_in_the_run() {
+    let dir = scratch("ordinal");
+    let items: Vec<(usize, Write)> = (0..40)
+        .map(|k| (0, Write::Frame(k, vec![k as u8; 64])))
+        .collect();
+    write_nut(&dir.join("in.nut"), &[video(4, 4, TENTHS, (10, 1))], &items);
+    let input = dir.join("in.nut").display().to_string();
+    let chain = format!("[v=0:v]shape_probe=port={}[spots=s]", free_port());
+    let mut runs = Vec::new();
+    for jobs in ["1", "4"] {
+        let spots = dir.join(format!("spots-{jobs}.ndjson"));
+        run_at(
+            jobs,
+            &args(&[
+                "-f",
+                "nut",
+                "-i",
+                &input,
+                "-m",
+                &module("shape_probe"),
+                "-filter_complex",
+                &chain,
+                "-map",
+                "[s]",
+                "-f",
+                "ndjson",
+                &spots.display().to_string(),
+            ]),
+        );
+        runs.push(lines(&fs::read(&spots).expect("spots written")));
+    }
+    for rows in &runs {
+        let ordinals: Vec<u64> = rows
+            .iter()
+            .map(|r| r["ordinal"].as_u64().expect("an ordinal"))
+            .collect();
+        assert_eq!(ordinals, (0..40).collect::<Vec<u64>>());
+    }
+    let one: Vec<u64> = runs[0]
+        .iter()
+        .map(|r| r["calls"].as_u64().unwrap())
+        .collect();
+    assert_eq!(
+        one,
+        (1..=40).collect::<Vec<u64>>(),
+        "one instance counts every tick"
+    );
+    let split = runs[1]
+        .iter()
+        .filter(|r| r["calls"].as_u64().unwrap() != r["ordinal"].as_u64().unwrap() + 1)
+        .count();
+    assert!(
+        split > 0,
+        "at -jobs 4 the ticks were spread over instances, whose own counts disagree"
+    );
+    let _ = fs::remove_dir_all(&dir);
 }
