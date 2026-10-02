@@ -140,7 +140,7 @@ from .ir import (
     src_parts,
 )
 from .probe import JSON_CODEC, ProbeResult, StreamMeta, is_url
-from .shapes import NodeShape, node_shape
+from .shapes import Accepts, NodeShape, node_shape
 from .timing import Paths, paths_of
 
 __all__ = [
@@ -1586,6 +1586,35 @@ def _named_ref(ref: FrameRef) -> str:
     return f"the output of '{_ref_node(ref)}'"
 
 
+def _accepted(
+    accepts: Accepts, written: StreamFormat
+) -> tuple[tuple[str, ...], str | None]:
+    """The formats a port takes, and the one `written` carries, of its kind.
+
+    Pixel formats for a picture, sample formats for sound; nothing for a
+    stream copied as it was coded, or one whose format is not known.
+    """
+    if isinstance(written, VideoFormat) and written.codec != COPY_CODEC:
+        return accepts.pixel_formats, written.pix_fmt
+    if isinstance(written, AudioFormat):
+        made = next(
+            (sample for sample, codec in SAMPLE_FMT_CODECS.items() if codec == written.codec),
+            None,
+        )
+        return accepts.sample_formats, made
+    return (), None
+
+
+def _converted(written: StreamFormat, wanted: str) -> str:
+    """The ffmpeg filter call that hands a port `wanted` instead of `written`."""
+    if isinstance(written, AudioFormat):
+        from .wasm import FFMPEG_SAMPLE_FMTS  # wasm reads this module's wire formats
+
+        sample = FFMPEG_SAMPLE_FMTS.get(wanted, wanted)
+        return f"ffmpeg.aformat(<stream>, sample_fmts => '{sample}')"
+    return f"ffmpeg.format(<stream>, pix_fmts => '{wanted}')"
+
+
 def _bindings(paths: Iterable[str]) -> tuple[ModuleBinding, ...]:
     """One ``-m`` entry per distinct module path, named after the file.
 
@@ -2638,7 +2667,8 @@ class _Partitioner:
             """Merge the groups these nodes are in, if the result stays convex.
 
             `one_output` also holds the merge to a region whose frames still
-            leave on one pad, which is all a module process can write.
+            leave on one pad, which is all a module process can write. A
+            region holding a node writes as many as it has readers.
             """
             reps = {home.get(name) for name in names}
             if None not in reps and len(reps) == 1:
@@ -2649,7 +2679,11 @@ class _Partitioner:
             joined = [n for n in self.order if n in wanted]
             if not self._convex(joined, reach):
                 return False
-            if one_output and len(self._region_writes(joined)) > 1:
+            if (
+                one_output
+                and not any(name in self.node_shapes for name in joined)
+                and len(self._region_writes(joined)) > 1
+            ):
                 return False
             for rep in reps:
                 if rep is not None:
@@ -3488,6 +3522,50 @@ class _Partitioner:
                 return slot
             ref = node.inputs[0]
 
+    def _check_node_accepts(self) -> None:
+        """Refuse a node handed another node's output in a format it does not take.
+
+        An edge an ffmpeg writes is conformed to the port it feeds. Between
+        two nodes nothing converts: the reader gets what the writer settled
+        on, its own format or the one it follows, so a port naming the
+        formats it takes is held to them here.
+        """
+        for name, shape in self.node_shapes.items():
+            node = self.g.nodes[name]
+            for read, port_name in zip(node.inputs, node.ports):
+                port = shape.input(port_name)
+                source = self._past_splits(read)
+                producer = _ref_node(source)
+                if port is None or producer is None or producer not in self.node_shapes:
+                    continue
+                written = self._node_output_wire(producer, _ref_pad(source), source)
+                taken, made = _accepted(port.accepts, written)
+                if made is None or not taken or made in taken:
+                    continue
+                pad = _ref_pad(source)
+                outputs = self.node_shapes[producer].outputs
+                output = outputs[pad].name if pad < len(outputs) else str(pad)
+                writer = _bindings([self.g.nodes[producer].filter])[0].name
+                raise FfrwdError(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"the module '{node.filter}' takes {', '.join(taken)} on "
+                    f"'{port_name}', and the '{output}' output of {writer} hands "
+                    f"it {made}",
+                    hint="nothing converts between two nodes, and an ffmpeg filter "
+                    f"between them does: {_converted(written, taken[0])}",
+                )
+
+    def _past_splits(self, ref: FrameRef) -> FrameRef:
+        """`ref`, or what the splits in front of it copy."""
+        seen: set[str] = set()
+        while (producer := _ref_node(ref)) is not None and producer not in seen:
+            node = self.g.nodes.get(producer)
+            if node is None or node.filter not in SPLIT_FILTERS:
+                break
+            seen.add(producer)
+            ref = node.inputs[0]
+        return ref
+
     def _check_lockstep(self) -> None:
         """Refuse a multi-input module whose inputs do not share a timeline.
 
@@ -3586,6 +3664,7 @@ class _Partitioner:
 
     def run(self) -> ProcessPlan:
         self._check_lockstep()
+        self._check_node_accepts()
         for members in self._regions():
             # The ENTRY is the first node reading a stream: a rows module
             # reads none, so it is never one however early it sits.
@@ -5044,6 +5123,8 @@ def check_spellable(plan: ProcessPlan) -> None:
     A SOURCE MODULE is exempt: its several pads are each their own named
     pipe by construction, the same way a packet sink's several inputs are.
     So is a packet filter, and a data filter: each output is a pipe of its own.
+    So is a node network: the streams it hands one process ride one NUT, and
+    each process it hands streams to has an output of its own.
 
     A pad handed to two processes is refused while the plan is built, where
     what reads it still has a name (:meth:`_Partitioner._check_handed_once`).
@@ -5053,6 +5134,7 @@ def check_spellable(plan: ProcessPlan) -> None:
             sidecar.packet_source
             or sidecar.packet_filter
             or sidecar.data_filter
+            or sidecar.node_network
             or len(sidecar.outputs) <= 1
         ):
             continue

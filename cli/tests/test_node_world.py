@@ -852,6 +852,66 @@ def test_a_node_source_whose_relation_is_its_renditions_ends_where_its_reader_sa
     assert reader[reader.index("-to") + 1] == "10"
 
 
+def test_a_node_network_hands_one_process_every_stream_it_reads_on_one_nut(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    argv = _plan_argv(
+        "COPY (WITH m AS (SELECT f.video[1] AS v, (matte(f.video[1])).* "
+        "FROM input('f.mp4') f) SELECT dim(m.v, m.spots), m.mask FROM m) TO 'matte.mkv'",
+        monkeypatch,
+    )
+    sidecar = argv["sidecar0"]
+    assert sidecar.count("-i") == 1
+    assert sidecar[sidecar.index("-map") :] == [
+        "-map", "[out0]", "-map", "[out1]", "-f", "nut", "pipe:1",
+    ]
+    assert _feeder(argv).count("-map") == 1
+
+
+def _gray_matte(params: Mapping[str, object], bound: Sequence[str]) -> dict[str, object]:
+    shape = _matte(params, bound)
+    outputs = shape["outputs"]
+    assert isinstance(outputs, list)
+    outputs[0]["format"] = {"kind": "like", "port": "v", "pixel_format": "gray"}
+    return shape
+
+
+def test_a_node_handed_another_nodes_output_in_a_format_it_does_not_take_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rgba = {"pixel_formats": ["rgba"]}
+    monkeypatch.setitem(SHAPES, "matte.wasm", _taking(_gray_matte, "video", rgba))
+    monkeypatch.setitem(SHAPES, "dim.wasm", _taking(_reader("boxes", _BOX), "video", rgba))
+    with pytest.raises(FfrwdError) as caught:
+        _plan_argv(
+            "COPY (WITH m AS (SELECT (matte(f.video[1])).* FROM input('f.mp4') f) "
+            "SELECT dim(m.mask, m.spots) FROM m) TO 'dimmed.mkv'",
+            monkeypatch,
+        )
+    assert caught.value.message == (
+        "function 'dim': the module 'dim.wasm' takes rgba on 'v', and the 'mask' "
+        "output of matte hands it gray"
+    )
+    assert caught.value.hint is not None
+    assert "ffmpeg.format(<stream>, pix_fmts => 'rgba')" in caught.value.hint
+
+
+def test_an_ffmpeg_filter_between_two_nodes_hands_the_reader_its_format(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rgba = {"pixel_formats": ["rgba"]}
+    monkeypatch.setitem(SHAPES, "matte.wasm", _taking(_gray_matte, "video", rgba))
+    monkeypatch.setitem(SHAPES, "dim.wasm", _taking(_reader("boxes", _BOX), "video", rgba))
+    argv = _plan_argv(
+        "COPY (WITH m AS (SELECT (matte(f.video[1])).* FROM input('f.mp4') f) "
+        "SELECT dim(ffmpeg.format(m.mask, pix_fmts => 'rgba'), m.spots) FROM m) "
+        "TO 'dimmed.mkv'",
+        monkeypatch,
+    )
+    (converts,) = [words for words in argv.values() if "format=pix_fmts=rgba" in str(words)]
+    assert converts[converts.index("-pix_fmt:0") + 1] == "rgba"
+
+
 def test_spans_are_the_hosts_rowmerge_with_its_span_written_as_rows(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

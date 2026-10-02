@@ -1346,7 +1346,7 @@ A bare array column broadcasts over a filter, one call per element; over a modul
 
 ## 151. A node makes a matte and the rows that go with it
 
-A module that produces two things returns a record naming both: `matte` makes a mask of the mark it finds and a row per mark, and both leave the one node. Read either field off the call, or every field at once with `.*` in a WITH body; however the fields are read, the call is one instance, and here `dim` reads both:
+A module that produces two things returns a record naming both: `matte` makes a gray matte of the mark it finds and a row per mark, and both leave the one node. Read either field off the call, or every field at once with `.*` in a WITH body; however the fields are read, the call is one instance. Here the rows dim the picture where the marks are and the matte is written beside it:
 
 ```pgsql
 CREATE FUNCTION matte(v video_stream, every number DEFAULT 30)
@@ -1363,8 +1363,9 @@ RETURNS video_stream
   LANGUAGE wasm;
 
 COPY (
-  WITH m AS (SELECT (matte(f.video[1])).* FROM input('tests/fixtures/testsrc.mp4') f)
-  SELECT dim(m.mask, m.spots)
+  WITH m AS (SELECT f.video[1] AS v, (matte(f.video[1])).*
+             FROM input('tests/fixtures/testsrc.mp4') f)
+  SELECT dim(m.v, m.spots), m.mask
   FROM m
 ) TO 'matte.mkv' WITH (video_codec 'ffv1')
 ```
@@ -1375,9 +1376,9 @@ ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 rawvideo -pix_fmt:0 rgba -f
   pipe:1 | ffrwd-wasm -f nut -i pipe:0 -m \
   matte=../sidecar/modules/target/wasm32-wasip2/release/matte.wasm -m \
   dim=../sidecar/modules/target/wasm32-wasip2/release/dim.wasm -filter_complex \
-  '[v=0:v]matte=every=30[mask=n10][spots=n11];[v=n10][boxes=n11]dim=amount=0.5[v=out0]' \
-  -map '[out0]' -f nut pipe:1 | ffmpeg -copyts -f nut -analyzeduration 0 -fpsprobesize 3 \
-  -i pipe:0 -map 0:v:0 -c:0 ffv1 matte.mkv
+  '[v=0:v]matte=every=30[mask=out1][spots=n11];[v=0:v][boxes=n11]dim=amount=0.5[v=out0]' \
+  -map '[out0]' -map '[out1]' -f nut pipe:1 | ffmpeg -copyts -f nut -analyzeduration 0 \
+  -fpsprobesize 3 -i pipe:0 -map 0:v:0 -map 0:v:1 -c:0 ffv1 -c:1 ffv1 matte.mkv
 ```
 
 Each field is an output port with a format and a time base of its own, declared by the module for the call's parameters. [Recipe 94](#94-blur-the-people-and-only-the-people)'s `segment` is this shape, and its rows no longer ride the map's frames: they are a data stream beside it, which is why `mask_select` can read them from a call `segment` is not part of.
