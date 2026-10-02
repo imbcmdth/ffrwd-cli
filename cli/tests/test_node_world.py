@@ -773,13 +773,13 @@ def test_every_stream_one_process_hands_a_node_network_rides_one_nut(
     sidecar = argv["sidecar0"]
     assert sidecar.count("-i") == 1
     assert sidecar[sidecar.index("-filter_complex") + 1] == (
-        "[a=0:a]hear[cues=n1];[v=0:v][a=0:a:1][words=n1]burn[v=out0]"
+        "[a=0:a]hear[cues=n1];[v=0:v][a=0:a][words=n1]burn[v=out0]"
     )
     (feeder,) = [
         words for pid, words in argv.items() if pid.startswith("ffmpeg") and "nut" in words
         and words[-1] == "pipe:1"
     ]
-    assert feeder.count("-map") == 3
+    assert feeder.count("-map") == 2, "both ports take the sound as it is, so it crosses once"
     assert feeder[-3:] == ["-f", "nut", "pipe:1"]
 
 
@@ -820,6 +820,21 @@ def test_a_stream_two_nodes_read_crosses_in_the_format_both_take(
         monkeypatch,
     ))
     assert feeder[feeder.index("-pix_fmt:0") + 1] == "rgba"
+
+
+def test_a_picture_written_beside_the_nodes_reading_it_crosses_to_them_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    argv = _plan_argv(
+        "COPY (SELECT ring(f.video[1], spot(f.video[1])), f.video[1] "
+        "FROM input('f.mp4') f) TO 'both.mkv'",
+        monkeypatch,
+    )
+    assert _feeder(argv).count("-map") == 1
+    sidecar = argv["sidecar0"]
+    assert sidecar[sidecar.index("-filter_complex") + 1] == (
+        "[v=0:v]spot=every=30[spots=n1];[v=0:v][spots=n1]ring[v=out0]"
+    )
 
 
 def test_each_stream_of_one_nut_is_conformed_to_the_port_it_feeds(
@@ -1006,6 +1021,41 @@ def test_spans_without_a_span_are_refused() -> None:
         _lowered("COPY (SELECT ffrwd.merge_spans(spot(f.video[1])) FROM input('f.mp4') f) "
                  "TO 'spots.ndjson'")
     assert caught.value.message == "ffrwd.merge_spans() needs 'max_span'"
+
+
+_SPANS = {
+    "type": "object",
+    "properties": {"start_t": {"type": "number"}, "end_t": {"type": "number"},
+                   "id": {"type": "integer"}},
+}
+_MASK = (
+    "CREATE FUNCTION mask(v video_stream, spans STRUCT(start_t number, end_t number, "
+    "id number)[]) RETURNS video_stream AS 'mask.wasm', 'mask' LANGUAGE wasm;\n"
+)
+
+
+def test_spans_are_read_with_the_end_and_id_the_merge_writes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(SHAPES, "mask.wasm", _reader("spans", _SPANS))
+    graph = _lowered(
+        _MASK + "COPY (SELECT mask(f.video[1], ffrwd.merge_spans(spot(f.video[1]), "
+        "max_span => 10))" + _FROM
+    )
+    (spans,) = [node for node in graph.nodes.values() if node.filter == "rowmerge"]
+    (mask,) = [node for node in graph.nodes.values() if node.filter == "mask.wasm"]
+    assert mask.inputs == ["src:f:v:0", spans.id]
+
+
+def test_rows_read_with_an_end_they_do_not_carry_are_still_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(SHAPES, "mask.wasm", _reader("spans", _SPANS))
+    with pytest.raises(FfrwdError) as caught:
+        _lowered(_MASK + "COPY (SELECT mask(f.video[1], spot(f.video[1]))" + _FROM)
+    assert caught.value.message == (
+        "mask() reads 'end_t' as number on its 'spans' input, and spot() does not write it"
+    )
 
 
 def test_explain_delays_says_each_window_and_each_outputs_delay() -> None:

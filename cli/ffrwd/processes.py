@@ -2107,6 +2107,9 @@ class _Partitioner:
         self.sidecars: list[SidecarProcess] = []
         self.sidecar_of: dict[str, str] = {}  # node id -> process id
         self.members: dict[str, list[str]] = {}  # process id -> its node ids
+        # A node region's read of a stream another of its reads already
+        # carries in the same format: the copy, and the read it binds to.
+        self.same_reads: dict[FrameRef, FrameRef] = {}
         self.consumer_of: dict[str, str] = {}  # feeder process id -> its reader
         # The ffmpeg processes copying one module's data stream to each of its
         # readers, by the sidecar writing it and the stream's ref.
@@ -2853,7 +2856,12 @@ class _Partitioner:
         return [groups[name] for name in self.order if name in groups]
 
     def _region_reads(self, members: Sequence[str]) -> list[tuple[FrameRef, str]]:
-        """Refs this region reads from outside, each with the node reading it."""
+        """Refs this region reads from outside, each with the node reading it.
+
+        A region holding a node reads each stream once per format its ports
+        take it in: copies a split outside made of it are one read, which the
+        network hands every port (:attr:`same_reads`).
+        """
         inside = set(members)
         wanted: list[tuple[FrameRef, str]] = []
         seen: set[FrameRef] = set()
@@ -2866,7 +2874,17 @@ class _Partitioner:
                     continue
                 seen.add(ref)
                 wanted.append((ref, name))
-        return wanted
+        if not any(name in self.node_shapes for name in members):
+            return wanted
+        kept: dict[tuple[FrameRef, StreamFormat], FrameRef] = {}
+        shared: list[tuple[FrameRef, str]] = []
+        for ref, reader in wanted:
+            first = kept.setdefault((self._past_splits(ref), self._format(ref, reader)), ref)
+            if first == ref:
+                shared.append((ref, reader))
+            else:
+                self.same_reads[ref] = first
+        return shared
 
     def _region_writes(self, members: Sequence[str]) -> list[tuple[FrameRef, StreamType]]:
         """Pads this region produces that something outside it reads."""
@@ -4971,7 +4989,7 @@ class _Partitioner:
 
         def rewrite(ref: FrameRef) -> FrameRef:
             slot = ref if is_src(ref) else f"{_ref_node(ref)}:{_ref_pad(ref)}"
-            ref = dissolved.get(slot, ref)
+            ref = self.same_reads.get(ref, dissolved.get(slot, ref))
             return read_as.get(ref, ref)
 
         nodes: dict[str, Node] = {}

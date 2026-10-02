@@ -314,6 +314,7 @@ from ffrwd.ir import (
     FEEDER_HOST,
     LEAKY,
     MAX_DISTANCE,
+    MAX_SPAN,
     MERGE_SPANS,
     NO_CHAPTERS,
     NO_METADATA,
@@ -16315,8 +16316,7 @@ class _Lowerer:
         """
         assert port.schema is not None  # checked by the caller
         for stream in value.streams:
-            producer = self._under_rows_nodes(stream.ref)
-            written = self._data_schemas.get(producer)
+            written = self._written_rows(stream.ref)
             if written is None:
                 continue
             name, schema = written
@@ -16334,6 +16334,26 @@ class _Lowerer:
                 hint=f"pass rows carrying '{field_name}' as {wants}; a reader names "
                 "only the fields it reads, and a producer may write more",
             )
+
+    def _written_rows(self, ref: FrameRef) -> tuple[str, Mapping[str, object]] | None:
+        """Who wrote the rows `ref` carries, and their schema as they arrive.
+
+        A filter over them passes them as they are; a span merge adds the
+        span's end, and writes the id it groups by as a whole number.
+        """
+        node = self.graph.nodes.get(ref)
+        if node is None or node.filter not in (ROWFILTER, ROWMERGE):
+            return self._data_schemas.get(ref)
+        under = self._written_rows(node.inputs[0])
+        if under is None or node.filter != ROWMERGE or MAX_SPAN not in node.args:
+            return under
+        name, schema = under
+        fields = schema.get("properties")
+        spanned = dict(fields) if isinstance(fields, dict) else {}
+        spanned["end_t"] = {"type": "number"}
+        if "id" in spanned:
+            spanned["id"] = {"type": "integer"}
+        return name, {**schema, "properties": spanned}
 
     def _node_pad(
         self,
