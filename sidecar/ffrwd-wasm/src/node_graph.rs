@@ -1049,6 +1049,8 @@ fn listen_for(
                 "the feed on 127.0.0.1:{port} for input '{}' of {name}",
                 input.name
             ),
+            rendition: RenditionMeta::default(),
+            row: None,
         };
         bound.push(bound_stream(&input.name, id, &def));
         let member = FeedMember {
