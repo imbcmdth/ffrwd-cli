@@ -1281,6 +1281,9 @@ class SidecarProcess:
     # the ``-pad`` key, in ``-i`` order: empty for an input with no raw
     # picture an ffmpeg wrote.
     colors: tuple[tuple[tuple[str, str], ...], ...] = ()
+    # The tags the query wrote on what each ``-i`` of a node network carries,
+    # in ``-i`` order: empty for an input it wrote none on.
+    tags: tuple[tuple[tuple[str, str], ...], ...] = ()
 
     @property
     def nodes(self) -> tuple[str, ...]:
@@ -1366,6 +1369,8 @@ class SidecarProcess:
             written["listens"] = [list(one) for one in self.listens]
         if self.colors:
             written["colors"] = [dict(one) for one in self.colors]
+        if self.tags:
+            written["tags"] = [dict(one) for one in self.tags]
         if self.network and self.graph is not None:
             written["graph"] = self.graph.to_dict()
         return written
@@ -1421,6 +1426,11 @@ class SidecarProcess:
             colors=tuple(
                 tuple((str(key), str(value)) for key, value in one.items())
                 for one in _read_list(d, "colors")
+                if isinstance(one, dict)
+            ),
+            tags=tuple(
+                tuple((str(key), str(value)) for key, value in one.items())
+                for one in _read_list(d, "tags")
                 if isinstance(one, dict)
             ),
         )
@@ -5083,6 +5093,9 @@ class _Partitioner:
             colors=self._region_colors(incoming, alias_of, read_order)
             if sidecar.node_network
             else (),
+            tags=self._region_tags(incoming, alias_of, read_order)
+            if sidecar.node_network
+            else (),
             reads_rows=any(e.annotations for e in self.edges if e.target == sidecar.id),
             writes_rows=any(e.annotations for e in self.edges if e.source == sidecar.id),
             rows_modules=self._rows_modules(sidecar, members),
@@ -5132,6 +5145,26 @@ class _Partitioner:
         if not found:
             return ()
         return tuple(found.get(alias, ()) for alias in order)
+
+    def _region_tags(
+        self,
+        incoming: Sequence[StreamEdge],
+        alias_of: Mapping[FrameRef, str],
+        order: Sequence[str],
+    ) -> tuple[tuple[tuple[str, str], ...], ...]:
+        """The tags the query wrote on each ``-i`` of a node network's streams,
+        in ``-i`` order: an earlier stream's key wins over a later one's."""
+        found: dict[str, dict[str, str]] = {}
+        for edge in incoming:
+            alias = alias_of.get(edge.ref)
+            if alias is None:
+                continue
+            for ref in (edge.ref, self._past_splits(edge.ref)):
+                for key, value in self.g.stream_tags.get(ref, {}).items():
+                    found.setdefault(alias, {}).setdefault(key, value)
+        if not found:
+            return ()
+        return tuple(tuple(found.get(alias, {}).items()) for alias in order)
 
     def _region_listens(
         self, members: Sequence[str], names: Mapping[str, str]

@@ -2056,6 +2056,9 @@ def _argv(
             colour = process.colors[index] if index < len(process.colors) else ()
             if colour:
                 pad["color"] = dict(colour)
+            tags = process.tags[index] if index < len(process.tags) else ()
+            if tags:
+                pad["tags"] = dict(tags)
             if pad:
                 argv += ["-pad", json.dumps(pad)]
     if any(grant.effect == "gpu" for grant in process.grants):

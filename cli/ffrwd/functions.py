@@ -157,6 +157,7 @@ __all__ = [
     "Annotation",
     "AnnotationField",
     "Parameter",
+    "STAR_FIELD",
     "RuntimeLateral",
     "Script",
     "Signature",
@@ -348,6 +349,9 @@ _DATA_FILTER_PARAM_TYPES: Mapping[str, StreamType] = {
 # beside several outputs. Which it is waits on the module's describe, so the
 # declaration keeps the refusal an older world's module earns (`refusal`).
 WASM_NODE = "node"
+# Marks a field read `(<call>).*` wrote, which a call whose shape makes no
+# such output leaves out rather than refuses.
+STAR_FIELD = "star_field"
 # The types a node reads as an input port rather than as a value.
 _PORT_TYPES = frozenset({_WASM_STREAM, _WASM_AUDIO_STREAM, WASM_DATA})
 _WASM_DATA_HINT = (
@@ -4859,6 +4863,7 @@ class _Expander:
                 declared = self.wasm[_call_name(call)]
                 for field_name in _struct_fields_of(declared):
                     read = exp.Dot(this=call.copy(), expression=exp.to_identifier(field_name))
+                    read.meta[STAR_FIELD] = True
                     projections.append(exp.alias_(read, field_name))
             if expanded:
                 select.set("expressions", projections)

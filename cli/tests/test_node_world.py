@@ -997,6 +997,34 @@ def test_a_picture_converted_to_rgb_on_its_way_carries_what_the_conversion_wrote
     }
 
 
+def test_the_tags_a_query_writes_on_a_stream_reach_the_node_reading_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    argv = _plan_argv(
+        "COPY (WITH ad AS (SELECT v AS v, STRUCT('1' AS smart_timed) AS tags "
+        "FROM input('a.mp4') a, unnest(a.video) v) "
+        "SELECT ring(ad.v[1], spot(ad.v[1])) FROM ad) TO 'ringed.mp4'",
+        monkeypatch,
+    )
+    pad = _pad_after_input(argv["sidecar0"])
+    assert isinstance(pad, dict) and pad["tags"] == {"smart_timed": "1"}
+
+
+def test_a_star_over_a_call_reads_the_outputs_its_shape_makes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def mask_alone(params: Mapping[str, object], bound: Sequence[str]) -> dict[str, object]:
+        return _shape([_clock("v")], [_output("mask", "video")], {"kind": "input", "port": "v"})
+
+    monkeypatch.setitem(SHAPES, "matte.wasm", mask_alone)
+    graph = _lowered(
+        "COPY (WITH m AS (SELECT (matte(f.video[1])).* FROM input('f.mp4') f) "
+        "SELECT m.mask FROM m) TO 'out.mkv'"
+    )
+    (matte,) = [node for node in graph.nodes.values() if node.filter == "matte.wasm"]
+    assert [output.ref for output in graph.sinks[0].outputs] == [matte.id]
+
+
 def test_a_node_network_hands_one_process_every_stream_it_reads_on_one_nut(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

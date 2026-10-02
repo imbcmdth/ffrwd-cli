@@ -14,13 +14,13 @@ import socket
 import sys
 import threading
 import time
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
-from ffrwd import wasm
+from ffrwd import shapes, wasm
 from ffrwd.compiler import compile_all
 from ffrwd.errors import ErrorCode, FfrwdError
 from ffrwd.execute import render_plan
@@ -421,7 +421,7 @@ _ADS = "COPY (SELECT {select} FROM input('leaf.nut') s, LATERAL play({stream}) a
             "'ad.video' comes from LATERAL play(s.data[1]), which starts a source per "
             "row of a data stream: it is empty between rows, and scale reads a frame "
             "on every tick. A run-time lateral's streams can only go to a module "
-            "input declared 'feeder'",
+            "input declared 'feeder', or a node's input held on a port",
         ),
         (
             _ADS.format(select="ad.audio", stream="s.data[1]"),
@@ -429,7 +429,7 @@ _ADS = "COPY (SELECT {select} FROM input('leaf.nut') s, LATERAL play({stream}) a
             "'ad.audio' comes from LATERAL play(s.data[1]), which starts a source per "
             "row of a data stream: it is empty between rows, and a COPY reads a frame "
             "on every tick. A run-time lateral's streams can only go to a module "
-            "input declared 'feeder'",
+            "input declared 'feeder', or a node's input held on a port",
         ),
         (
             _ADS.format(select="probe(ad.video)", stream="s.data[1]"),
@@ -437,7 +437,7 @@ _ADS = "COPY (SELECT {select} FROM input('leaf.nut') s, LATERAL play({stream}) a
             "'ad.video' comes from LATERAL play(s.data[1]), which starts a source per "
             "row of a data stream: it is empty between rows, and probe reads a frame "
             "on every tick. A run-time lateral's streams can only go to a module "
-            "input declared 'feeder'",
+            "input declared 'feeder', or a node's input held on a port",
         ),
         (
             _ADS.format(select="probe(s.video[1], ad.video)", stream="s.video[1]"),
@@ -673,3 +673,99 @@ def test_laterals_sharing_an_alias_each_feed_a_connection_of_their_own() -> None
     assert len(ports) == 2
     for port in ports:
         assert len([edge for edge in plan.feeder_edges if edge.port == port]) == 2
+
+
+# -- a node holding its feed on a port ----------------------------------------
+
+SWITCH = "modules/switch_node.wasm"
+_SWITCH = (
+    "CREATE FUNCTION switch(v video_stream, a audio_stream DEFAULT NULL, "
+    "feed video_stream DEFAULT NULL, feed_audio audio_stream DEFAULT NULL, "
+    "port number DEFAULT 9000) RETURNS STRUCT(v video_stream, a audio_stream) "
+    f"AS '{SWITCH}', 'switch' LANGUAGE wasm;"
+)
+_HELD = {
+    "kind": "hold",
+    "anchor": {"kind": "tagged", "tag": "smart_timed"},
+    "group": "switch",
+    "lead": 0.3,
+    "port_param": "port",
+}
+
+
+def _switch_shape(
+    module: str, params: str, bound: Sequence[str], grants: Sequence[str] = ()
+) -> shapes.NodeShape:
+    """ffrwd/switch 0.5.0's shape: the programme, and a feed group held on `port`."""
+
+    def port(name: str, kind: str, pairing: dict[str, object]) -> dict[str, object]:
+        return {
+            "name": name, "kind": kind, "required": name == "v", "many": False,
+            "pairing": pairing, "rows": "ignore", "window": 1, "stride": 1, "accepts": {},
+        }
+
+    lockstep: dict[str, object] = {"kind": "lockstep"}
+    return shapes.node_shape(
+        module,
+        {
+            "inputs": [
+                port("v", "video", lockstep),
+                port("a", "audio", lockstep),
+                port("feed", "video", _HELD),
+                port("feed_audio", "audio", _HELD),
+            ],
+            "outputs": [
+                {"name": "v", "kind": "video", "latency": 0,
+                 "format": {"kind": "like", "port": "v"}},
+                {"name": "a", "kind": "audio", "latency": 0,
+                 "format": {"kind": "like", "port": "a"}},
+            ],
+            "clock": {"kind": "input", "port": "v"},
+            "pure": True,
+            "one_to_one": True,
+            "bounded": True,
+            "relation": [],
+        },
+    )
+
+
+def test_a_lateral_feeds_a_nodes_held_inputs_on_one_connection() -> None:
+    """The lateral's picture and sound go to the port the host listens on for
+    the node's feed group, written into the node's port param, as a feeder's
+    connection is."""
+    modules = {
+        **_MODULES,
+        SWITCH: Described(
+            world="node-module",
+            name="switch",
+            params_schema={"type": "object", "properties": {"port": {"type": "integer"}}},
+            node=True,
+        ),
+    }
+    query = """COPY (
+  WITH prog AS (SELECT s.video[1] AS v, s.audio[1] AS a, s.data[1] AS d
+                FROM input('leaf.nut') s),
+       awards AS (SELECT auction(prog.d, prog.v).d AS d,
+                         auction(prog.d, prog.v).launch AS launch FROM prog),
+       sw AS (SELECT (switch(prog.v, prog.a, ad.video, ad.audio)).*
+              FROM prog, awards, LATERAL play(awards.launch) ad)
+  SELECT sw.v, sw.a, awards.d AS deal FROM sw, awards
+) TO publish('https://relay.example', 'leaf')"""
+    plan = compile_all(
+        _declared(query).replace("COPY (", _SWITCH + "\nCOPY (", 1),
+        describe=lambda path: modules[path],
+        shape=_switch_shape,
+    ).plan
+    assert plan is not None
+    (lateral,) = plan.laterals
+    (connection,) = lateral.connections
+    assert [call.param for call in connection.calls] == ["feed", "feed_audio"]
+    (switch,) = [
+        node
+        for process in plan.sidecars
+        if process.graph is not None
+        for node in process.graph.nodes.values()
+        if node.filter == "switch_node"
+    ]
+    assert switch.args["port"] == connection.port
+    assert switch.ports == ["v", "a"]

@@ -947,6 +947,9 @@ class Graph:
     # A node read in FROM: its alias -> the node making the alias's streams,
     # which every ``src:<alias>`` ref has been rewritten to a pad of.
     node_sources: dict[str, str] = field(default_factory=dict)
+    # The tags the query wrote on a stream a node reads, by the ref read:
+    # what no edge into the node's sidecar carries.
+    stream_tags: dict[str, dict[str, str]] = field(default_factory=dict)
 
     @property
     def outputs(self) -> list[Output]:
@@ -1030,6 +1033,8 @@ class Graph:
             d["node_shapes"] = {name: dict(shape) for name, shape in self.node_shapes.items()}
         if self.node_sources:
             d["node_sources"] = dict(self.node_sources)
+        if self.stream_tags:
+            d["stream_tags"] = {ref: dict(tags) for ref, tags in self.stream_tags.items()}
         return d
 
     @classmethod
@@ -1172,6 +1177,13 @@ class Graph:
         raw_node_sources = d.get("node_sources") or {}
         assert isinstance(raw_node_sources, dict)
         node_sources = {str(alias): str(name) for alias, name in raw_node_sources.items()}
+        raw_stream_tags = d.get("stream_tags") or {}
+        assert isinstance(raw_stream_tags, dict)
+        stream_tags = {
+            str(ref): {str(key): str(value) for key, value in tags.items()}
+            for ref, tags in raw_stream_tags.items()
+            if isinstance(tags, dict)
+        }
 
         return cls(
             input_paths=[str(p) for p in raw_inputs],
@@ -1196,6 +1208,7 @@ class Graph:
             laterals=laterals,
             node_shapes=node_shapes,
             node_sources=node_sources,
+            stream_tags=stream_tags,
         )
 
 

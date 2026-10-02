@@ -295,6 +295,7 @@ from ffrwd.errors import ErrorCode, FfrwdError
 from ffrwd.functions import (
     DECLARED_STREAM,
     SHARED_ARGUMENT,
+    STAR_FIELD,
     WASM_DATA,
     WASM_STREAM_NAMES,
     WASM_STREAM_TYPES,
@@ -509,6 +510,7 @@ from ffrwd.wasm import (
     SAMPLE_FMT_CODECS,
     WIRE_AUDIO_CODECS,
     WIRE_PIX_FMTS,
+    WIRE_SAMPLE_FMTS,
     WIRE_VIDEO_CODECS,
     WORLDS,
     Described,
@@ -1682,6 +1684,10 @@ class _Connection:
 # never written by a COPY, only a feeder's (:meth:`_Lowerer._feed`), so it
 # names no pad at all. ``lateral:<key>:<column>``.
 _LATERAL_REF = "lateral:"
+
+
+class _UnmadeField(Exception):
+    """A field `.*` expanded that this call's shape makes no output for."""
 # How a run-time lateral's data stream reaches the host: ffmpeg's raw data
 # muxer, which writes each packet's bytes as they are, so the host reads one
 # JSON object after another and a heartbeat's blank payload is only space.
@@ -7494,6 +7500,8 @@ class _Lowerer:
                 value = self._branch_value(projection, env, select)
                 if tags == "sink":
                     value = self._node_rows_at_sink(value, projection, env, select)
+            except _UnmadeField:
+                continue  # `.*` over a call whose shape makes no such output
             finally:
                 self.rows_file = written
             column = _Column(
@@ -15909,6 +15917,12 @@ class _Lowerer:
                 for instance in instances
                 if instance.ref in list(self.graph.nodes)[made:]
             )
+        if (
+            field_name is not None
+            and _unwrap(node).meta.get(STAR_FIELD)
+            and any(instance.shape.output(field_name) is None for instance in instances)
+        ):
+            raise _UnmadeField(field_name)
         streams = tuple(
             _Stream(ref=ref, type=kind)
             for ref, kind in (
@@ -16204,7 +16218,19 @@ class _Lowerer:
     ) -> _NodeInstance:
         """One instance: the shape for its params and bound ports, checked
         against the declaration, and the node it is. `written` is the values
-        the call wrote, which a port number may not write again."""
+        the call wrote, which a port number may not write again.
+
+        A run-time lateral's stream on an input the module holds on a port
+        binds nothing: the port is one the host listens on for this compile,
+        written into the param, and the lateral's instances connect to it,
+        one connection per hold group, as a feeder's do.
+        """
+        fed = {
+            name: value
+            for name, value in streams.items()
+            if len(value.streams) == 1 and _lateral_parts(value.streams[0].ref) is not None
+        }
+        streams = {name: value for name, value in streams.items() if name not in fed}
         bound = [param.name for param in declared.ports if param.name in streams]
         held = {
             name: self._held_port(declared, name, argument, base, select)
@@ -16236,6 +16262,52 @@ class _Lowerer:
                     hint=f"write the port once: {declared.signature}",
                 )
             ports[hold.port_param] = held[name]
+        feeds: list[tuple[int, _Fed, Described]] = []
+        for name, lateral in fed.items():
+            stream = lateral.streams[0]
+            port = shape.input(name)
+            hold = port.pairing.hold if port is not None else None
+            if port is None or hold is None or hold.port_param is None:
+                raise self._lateral_refusal(stream.ref, f"{declared.name}()", base)
+            if hold.port_param in written:
+                raise _error(
+                    ErrorCode.UDF_ARG_TYPE,
+                    f"{declared.name}() writes '{hold.port_param}', and '{name}' is "
+                    "fed by a run-time lateral, which takes a port of its own",
+                    written[hold.port_param],
+                    fallback=base,
+                    hint=f"leave '{hold.port_param}' out of the call",
+                )
+            one = _Fed(
+                Feeder(
+                    input=0,
+                    port_param=hold.port_param,
+                    kind=stream.type,
+                    group=hold.group or hold.port_param,
+                ),
+                next(param for param in declared.ports if param.name == name),
+                stream,
+                self._stream_sources(stream.ref),
+                base,
+            )
+            number = self._feeder_port(one, select)
+            ports[hold.port_param] = number
+            # What the lateral's instances write is what the port takes,
+            # conformed by them as a feeder's are.
+            taken = port.accepts
+            feeds.append(
+                (
+                    number,
+                    one,
+                    replace(
+                        described,
+                        pixel_formats=taken.pixel_formats or WIRE_PIX_FMTS[:1],
+                        sample_formats=taken.sample_formats or WIRE_SAMPLE_FMTS[:1],
+                        sample_rates=taken.sample_rates,
+                        channel_counts=taken.channel_counts,
+                    ),
+                )
+            )
         if ports:
             # The port is one of the call's params, and the shape is asked
             # for the params the call ends up with.
@@ -16272,9 +16344,32 @@ class _Lowerer:
         made.ports = names
         made.out_ports = [output.name for output in shape.outputs]
         self.graph.node_shapes[ref] = dict(shape.raw)
+        clock = shape.clock.port if shape.clock.port in names else None
+        timed = inputs[names.index(clock)] if clock is not None else (inputs or [""])[0]
+        for number, one, feeding in feeds:
+            # The programme a feed is shaped by is the call's own stream of
+            # its kind, else the clock's.
+            programme = next(
+                (read for read in inputs if ref_type(self.graph, read) == one.stream.type),
+                timed,
+            )
+            self._feed(number, one, ref, programme, declared, feeding)
+        for name, value in streams.items():
+            for stream in value.streams:
+                said = self._written_tags(stream)
+                if said:
+                    self.graph.stream_tags[stream.ref] = said
         instance = _NodeInstance(ref=ref, shape=shape)
         self._node_refs[key] = instance
         return instance
+
+    def _written_tags(self, stream: _Stream) -> dict[str, str]:
+        """The tags the query wrote on `stream`, which nothing on the edge to
+        a node carries."""
+        if stream.source is None:
+            return {}
+        written = self._layered_tags().get(id(stream.source), {})
+        return {key: value for key, value in written.items() if value is not None}
 
     def _held_port(
         self,
@@ -17020,7 +17115,8 @@ class _Lowerer:
             f"'{read}' comes from LATERAL {use.declared.call}, which starts a "
             "source per row of a data stream: it is empty between rows, and "
             f"{consumer} reads a frame on every tick. A run-time lateral's "
-            "streams can only go to a module input declared 'feeder'",
+            "streams can only go to a module input declared 'feeder', or a "
+            "node's input held on a port",
             anchor if anchor is not None else (reader or use.anchor),
             hint="pass it to a feeder, such as the second argument of "
             f"ffrwd.switch.{kind}(<programme>, {read})",
