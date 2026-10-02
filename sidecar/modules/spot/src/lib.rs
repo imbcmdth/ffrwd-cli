@@ -1,7 +1,9 @@
 //! Finds a mark in each frame and returns rows alone: one a frame while the
 //! mark is in view, `{start_t, id, x, y, w, h}`, every row of one sighting
-//! carrying the time it was first seen as `start_t`, and a new sighting
-//! every `every` frames. Recipes 145, 146 and 152.
+//! carrying the time its block began as `start_t`, a new sighting every
+//! `every` frames of the run. Counted by the tick's ordinal, so it is pure
+//! and a run split across workers names every sighting alike. Recipes 145,
+//! 146 and 152.
 
 use ffrwd_node::{Bound, Init, Input, Node, Out, Output, Result, Shape, Tick};
 use serde::Deserialize;
@@ -28,7 +30,8 @@ impl Node for SpotNode {
     fn shape(_: &Params, _: &Bound) -> Result<Shape> {
         Ok(Shape::new()
             .input(Input::video("v").clock().pixel_formats(&["rgba"]))
-            .output(Output::rows("spots").schema::<Spot>()))
+            .output(Output::rows("spots").schema::<Spot>())
+            .pure())
     }
 
     fn init(params: Params, init: &Init) -> Result<SpotNode> {
@@ -38,7 +41,7 @@ impl Node for SpotNode {
             v: v.id,
             width: video.width as usize,
             height: video.height as usize,
-            spotter: Spotter::new(params.every),
+            spotter: Spotter::new(params.every, v),
         })
     }
 
@@ -46,8 +49,7 @@ impl Node for SpotNode {
         for frame in tick.frames(self.v) {
             let bytes = tick.fetch(self.v, frame.index);
             let picture = Rgba::new(&bytes, self.width, self.height)?;
-            let t = tick.time_base().seconds(frame.pts);
-            if let Some(spot) = self.spotter.see(t, &picture) {
+            if let Some(spot) = self.spotter.see(tick.ordinal(), frame.pts, &picture) {
                 out.row("spots", frame.pts, &spot)?;
             }
         }

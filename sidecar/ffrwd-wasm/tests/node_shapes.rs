@@ -24,6 +24,9 @@ const SHAPES: &[&str] = &[
     "shape-packets",
     "shape-switch",
     "shape-probe",
+    "spot",
+    "ring",
+    "matte",
 ];
 
 fn sidecar_root() -> PathBuf {
@@ -1548,5 +1551,82 @@ fn a_name_called_twice_takes_its_params_files_in_turn() {
         "the first file to the first chain, the second to the second"
     );
 
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// `count` 64x48 red pictures at 30 fps, each with a grey mark that moves a
+/// pixel a frame.
+fn marked(dir: &Path, count: i64) -> String {
+    let items: Vec<(usize, Write)> = (0..count)
+        .map(|k| {
+            let mut picture = [200u8, 30, 30, 255].repeat(64 * 48);
+            for y in 8..20 {
+                for x in (4 + k as usize % 40)..(16 + k as usize % 40) {
+                    picture[(y * 64 + x) * 4..(y * 64 + x) * 4 + 4]
+                        .copy_from_slice(&[128, 128, 128, 255]);
+                }
+            }
+            (0, Write::Frame(k, picture))
+        })
+        .collect();
+    let thirtieths = TimeBase { num: 1, den: 30 };
+    write_nut(
+        &dir.join("marked.nut"),
+        &[video(64, 48, thirtieths, (30, 1))],
+        &items,
+    );
+    dir.join("marked.nut").display().to_string()
+}
+
+#[test]
+fn recipe_145_split_across_workers_names_every_sighting_alike() {
+    let dir = scratch("recipe-145");
+    let input = marked(&dir, 90);
+    let bound = r#"[{"input":"v","streams":[{"rate":{"num":30,"den":1}}]}]"#;
+    let out = at_every_jobs(
+        "recipe-145",
+        &args(&[
+            "-f",
+            "nut",
+            "-i",
+            &input,
+            "-m",
+            &module("spot"),
+            "-m",
+            &module("ring"),
+            "-filter_complex",
+            "[v=0:v]spot=every=30[spots=n1];[v=0:v][spots=n1]ring[v=out0]",
+            "-bound",
+            &format!("spot={bound}"),
+            "-bound",
+            &format!("ring={}", bound.replace("]}]", "]},{\"input\":\"spots\"}]")),
+            "-map",
+            "[out0]",
+            "-f",
+            "nut",
+            "{dir}/ringed.nut",
+            "-map",
+            "[n1]",
+            "-f",
+            "ndjson",
+            "{dir}/spots.ndjson",
+        ]),
+        &["ringed.nut", "spots.ndjson"],
+    );
+    let spots = lines(&out[1]);
+    assert_eq!(spots.len(), 90, "a row a frame while the mark is in view");
+    let named: Vec<(u64, f64)> = spots
+        .iter()
+        .map(|r| (r["id"].as_u64().unwrap(), r["start_t"].as_f64().unwrap()))
+        .collect();
+    assert_eq!(named[29], (0, 0.0));
+    assert_eq!(
+        named[30],
+        (1, 1.0),
+        "a new sighting every 30 frames, from its first"
+    );
+    assert_eq!(named[89], (2, 2.0));
+    let (_, pictures) = frames(&out[0]);
+    assert_eq!(pictures.len(), 90);
     let _ = fs::remove_dir_all(&dir);
 }

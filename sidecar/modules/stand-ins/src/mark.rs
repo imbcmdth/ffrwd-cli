@@ -1,5 +1,5 @@
 use ffrwd_frame::{Rect, Rgba};
-use ffrwd_node::Spans;
+use ffrwd_node::{BoundStream, Rational};
 use serde::{Deserialize, Serialize};
 
 /// Fewer pixels than this are noise, not the mark.
@@ -75,28 +75,42 @@ pub struct Spot {
     pub h: u32,
 }
 
-/// The mark followed frame by frame: a sighting lasts while the mark stays
-/// in view and at most `every` frames, so a mark always in view is a new
-/// sighting every `every` frames.
+/// The mark named by frame number: frames `0..every` of the run are
+/// sighting 0, the next `every` sighting 1, and so on, each starting at its
+/// first frame's time. A function of the frame and its number alone, so
+/// every worker of a split run names a frame's sighting alike.
 pub struct Spotter {
-    spans: Spans<()>,
+    every: u64,
+    /// One frame of the picture, in its time base's ticks.
+    step: i64,
+    time_base: Rational,
 }
 
 impl Spotter {
-    pub fn new(every: u64) -> Spotter {
+    /// Sightings of `every` frames of `v`, a frame being the length its rate
+    /// says, or one tick of its time base where the call gave no rate.
+    pub fn new(every: u64, v: &BoundStream) -> Spotter {
+        let time_base = v.info.time_base;
+        let step = v.hint.rate.map_or(1, |rate| {
+            let num = i64::from(time_base.den) * i64::from(rate.den);
+            let den = (i64::from(time_base.num) * i64::from(rate.num)).max(1);
+            ((num + den / 2) / den).max(1)
+        });
         Spotter {
-            spans: Spans::new().longest(every),
+            every: every.max(1),
+            step,
+            time_base,
         }
     }
 
-    /// The frame at `t` seconds: its row, when the mark is in view.
-    pub fn see(&mut self, t: f64, frame: &Rgba) -> Option<Spot> {
-        self.spans.tick(t);
+    /// Frame `ordinal` of the run, at `pts`: its row, when the mark is in
+    /// view.
+    pub fn see(&self, ordinal: u64, pts: i64, frame: &Rgba) -> Option<Spot> {
         let rect = find(frame)?;
-        let span = self.spans.see(());
+        let into = (ordinal % self.every) as i64;
         Some(Spot {
-            start_t: span.start_t,
-            id: span.number,
+            start_t: self.time_base.seconds(pts - into * self.step),
+            id: ordinal / self.every,
             x: rect.x0 as u32,
             y: rect.y0 as u32,
             w: rect.width() as u32,
@@ -148,13 +162,24 @@ mod tests {
             x1: 20,
             y1: 20,
         });
-        let mut spotter = Spotter::new(2);
+        let v = BoundStream::video("v", 0, 64, 48, "rgba", Rational::new(1, 10));
+        let spotter = Spotter::new(2, &v);
         let rows: Vec<(f64, u64)> = (0..5)
             .map(|n| {
-                let spot = spotter.see(n as f64 / 10.0, &picture.view()).unwrap();
+                let spot = spotter.see(n, n as i64, &picture.view()).unwrap();
                 (spot.start_t, spot.id)
             })
             .collect();
         assert_eq!(rows, [(0.0, 0), (0.0, 0), (0.2, 1), (0.2, 1), (0.4, 2)]);
+        let fine = BoundStream::video("v", 0, 64, 48, "rgba", Rational::new(1, 90_000))
+            .rate(Rational::new(30, 1));
+        let spot = Spotter::new(3, &fine)
+            .see(7, 7 * 3000, &picture.view())
+            .unwrap();
+        assert_eq!(
+            (spot.id, spot.start_t),
+            (2, 0.2),
+            "frame 7 is in the third sighting, which began at frame 6, 0.2 s in"
+        );
     }
 }

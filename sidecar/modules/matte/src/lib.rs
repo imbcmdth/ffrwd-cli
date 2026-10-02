@@ -1,7 +1,8 @@
 //! Makes a matte of the mark it finds and a row per mark, both from one
 //! node: `mask`, the picture's size in gray, white inside the mark and black
 //! elsewhere, and `spots`, the rows `spot` writes. An output the query does
-//! not read is not made. Recipe 151.
+//! not read is not made. Its sightings are counted by the tick's ordinal, as
+//! `spot`'s are, so it is pure. Recipe 151.
 
 use ffrwd_node::{Bound, Init, Input, Node, Out, Output, Result, Shape, Tick};
 use serde::Deserialize;
@@ -45,7 +46,8 @@ impl Node for Matte {
             .input(Input::video("v").clock().pixel_formats(&["rgba"]))
             .output(Output::video("mask").pixel_format("gray"))
             .output(Output::rows("spots").schema::<Spot>())
-            .one_to_one())
+            .one_to_one()
+            .pure())
     }
 
     fn init(params: Params, init: &Init) -> Result<Matte> {
@@ -55,7 +57,7 @@ impl Node for Matte {
             v: v.id,
             width: video.width as usize,
             height: video.height as usize,
-            spotter: Spotter::new(params.every),
+            spotter: Spotter::new(params.every, v),
             mask: init.latched("mask"),
             spots: init.latched("spots"),
         })
@@ -67,9 +69,7 @@ impl Node for Matte {
         };
         let bytes = tick.fetch(self.v, frame.index);
         let picture = Rgba::new(&bytes, self.width, self.height)?;
-        let spot = self
-            .spotter
-            .see(tick.time_base().seconds(frame.pts), &picture);
+        let spot = self.spotter.see(tick.ordinal(), frame.pts, &picture);
         if self.mask {
             let mask = matte(spot.as_ref(), self.width, self.height);
             out.frame("mask", frame.pts, frame.duration, mask)?;
