@@ -602,7 +602,8 @@ pub fn check_shape(shape: &NodeShape, bound: &[Binding], name: &str) -> Result<(
             }
             if *anchor != Anchor::SharedClock {
                 bail!(
-                    "{at} arrives on group '{group}', and a stream on a group's connection takes                      the group's offset: its anchor is shared-clock"
+                    "{at} arrives on group '{group}', and a stream on a group's connection takes \
+                     the group's offset: its anchor is shared-clock"
                 );
             }
         }

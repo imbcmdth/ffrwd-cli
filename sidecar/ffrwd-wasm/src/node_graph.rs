@@ -474,12 +474,20 @@ fn open(
         }
     }
     let order = topological(calls, &labels)?;
-    for (name, lists) in &args.node_bounds {
+    let given = args
+        .node_bounds
+        .iter()
+        .map(|(name, lists)| ("-bound", name, lists.len()))
+        .chain(
+            args.node_params
+                .iter()
+                .map(|(name, files)| ("-params-from", name, files.len())),
+        );
+    for (flag, name, count) in given {
         let called = calls.iter().filter(|c| &c.module == name).count();
-        if lists.len() > called {
+        if count > called {
             bail!(
-                "-bound {name}= is given {} time(s), and -filter_complex calls '{name}' {called}                  time(s)",
-                lists.len()
+                "{flag} {name}= is given {count} time(s), and -filter_complex calls '{name}' {called} time(s)"
             );
         }
     }
@@ -1076,8 +1084,8 @@ fn bind_feed_ports(
         let Ok(schema) = parse_schema(&meta.params_schema, &call.module) else {
             continue;
         };
-        let params = match args.node_params.get(&call.module) {
-            Some(params) => params.clone(),
+        let params = match given_params(args, calls, index) {
+            Some(params) => params,
             None => match params_json(&call.module, &schema, &call.options) {
                 Ok(params) => params,
                 Err(_) => continue,
@@ -1149,11 +1157,7 @@ fn bindings_of(args: &Args, calls: &[NodeCall], index: usize) -> Result<Vec<Port
     let Some(lists) = args.node_bounds.get(&call.module) else {
         return Ok(padded);
     };
-    let nth = calls[..index]
-        .iter()
-        .filter(|c| c.module == call.module)
-        .count();
-    let Some(list) = lists.get(nth) else {
+    let Some(list) = lists.get(turn(calls, index)) else {
         bail!(
             "{}: -bound {}= is given {} time(s), and -filter_complex calls it more often; a \
              call takes the -bound given in its turn",
@@ -1180,6 +1184,24 @@ fn bindings_of(args: &Args, calls: &[NodeCall], index: usize) -> Result<Vec<Port
         }
     }
     Ok(list.clone())
+}
+
+/// Which call of its name call `index` is: 0 for the first chain calling
+/// it.
+fn turn(calls: &[NodeCall], index: usize) -> usize {
+    calls[..index]
+        .iter()
+        .filter(|c| c.module == calls[index].module)
+        .count()
+}
+
+/// The params `-params-from` gives call `index`: the k-th given for its
+/// name, for the k-th chain calling it.
+fn given_params(args: &Args, calls: &[NodeCall], index: usize) -> Option<String> {
+    args.node_params
+        .get(&calls[index].module)
+        .and_then(|given| given.get(turn(calls, index)))
+        .cloned()
 }
 
 /// The hint the list gives stream `k` of `port`.
@@ -1247,8 +1269,8 @@ fn open_module(
     let meta =
         runtime::describe_node(path).with_context(|| format!("describing module '{name}'"))?;
     let schema = parse_schema(&meta.params_schema, name)?;
-    let mut params = match args.node_params.get(name) {
-        Some(params) => params.clone(),
+    let mut params = match given_params(args, calls, index) {
+        Some(params) => params,
         None => params_json(name, &schema, &call.options)?,
     };
     let told = bindings_of(args, calls, index)?;

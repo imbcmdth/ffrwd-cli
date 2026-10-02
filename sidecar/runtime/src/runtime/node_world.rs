@@ -612,7 +612,8 @@ impl WitNode {
                 if let Some(before) = self.last[port] {
                     if time < before {
                         bail!(
-                            "{name} emitted on '{}' at {time} after {before}; a port never steps                              back",
+                            "{name} emitted on '{}' at {time} after {before}; a port never steps \
+                             back",
                             emission.port
                         );
                     }

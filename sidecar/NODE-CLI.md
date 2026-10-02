@@ -65,7 +65,10 @@ node module every pad carries the port it binds before an `=`:
 - **Params.** Options are typed by the params schema, as for any module.
   `-params-from <name>=<file>` reads one node's params whole, as JSON,
   out of a file, for params too long for a command line; it replaces that
-  node's options.
+  node's options. A name several chains call takes its `-params-from`
+  flags in turn, as `-bound` does (below): the k-th given for the name
+  goes to the k-th chain calling it, a chain past the last given keeps its
+  options, and more flags than chains are refused.
 - **Hold inputs given by port.** A hold port with a `port_param`, left
   unbound, is served by a loopback listener of the host's own on the port
   its param names: `inset=port=9100` binds no pad for `feed`, and the host
@@ -107,8 +110,10 @@ the input:
   it;
 - more `-bound` flags for a name than chains calling it are refused.
 
-A call with no `-bound` is asked its shape with the ports its pads name,
-each stream with no rate, as before.
+A name given no `-bound` at all is asked its shape, on every call, with
+the ports its pads name, each stream with no rate, as before; a name given
+fewer `-bound` flags than chains calling it is refused at the first chain
+past them.
 
 A frame module of an older world keeps its positional pads in the same
 `-filter_complex`, and runs as the node its adapter makes of it. The host's

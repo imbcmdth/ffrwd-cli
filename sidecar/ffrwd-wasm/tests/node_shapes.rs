@@ -1490,3 +1490,63 @@ fn a_bound_list_is_what_the_shape_is_asked_with_and_each_stream_is_handed_its_hi
     }
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn a_name_called_twice_takes_its_params_files_in_turn() {
+    let dir = scratch("params-from-twice");
+    let input = ten_frames(&dir);
+    let tall = dir.join("tall.json");
+    let square = dir.join("square.json");
+    fs::write(&tall, r#"{"width":1,"height":3}"#).expect("write params");
+    fs::write(&square, r#"{"width":2,"height":2}"#).expect("write params");
+    let line = |files: &[&std::path::Path]| {
+        let mut line = args(&[
+            "-f",
+            "nut",
+            "-i",
+            &input,
+            "-m",
+            &module("shape_canvas"),
+            "-filter_complex",
+            "[v=0:v]shape_canvas[out=o1];[v=0:v]shape_canvas[out=o2]",
+        ]);
+        for file in files {
+            line.push("-params-from".to_string());
+            line.push(format!("shape_canvas={}", file.display()));
+        }
+        line.extend(args(&[
+            "-map",
+            "[o1]",
+            "-map",
+            "[o2]",
+            "-f",
+            "nut",
+            "{dir}/out.nut",
+        ]));
+        line
+    };
+    let spelled: Vec<String> = line(&[&tall, &square, &tall])
+        .into_iter()
+        .map(|a| a.replace("{dir}", &dir.display().to_string()))
+        .collect();
+    let output = Command::new(env!("CARGO_BIN_EXE_ffrwd-wasm"))
+        .args(spelled)
+        .output()
+        .expect("spawn ffrwd-wasm");
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("-params-from shape_canvas= is given 3 time(s), and -filter_complex calls 'shape_canvas' 2 time(s)"),
+        "{stderr}"
+    );
+    let out = at_every_jobs("params-from-twice", &line(&[&tall, &square]), &["out.nut"]);
+    let (streams, _) = frames(&out[0]);
+    let sizes: Vec<Option<(u32, u32)>> = streams.iter().map(|s| s.video_geometry()).collect();
+    assert_eq!(
+        sizes,
+        vec![Some((1, 3)), Some((2, 2))],
+        "the first file to the first chain, the second to the second"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}

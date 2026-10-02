@@ -391,8 +391,9 @@ struct Args {
     /// The colorimetry flags: what a codec run's stream carries, which its
     /// NUT header does not say. Only a codec run takes them.
     color: codec::ColorFlags,
-    /// `-params-from <name>=<file>`: one node's params, whole, by its name.
-    node_params: HashMap<String, String>,
+    /// `-params-from <name>=<file>`: a node's params, whole, by its name,
+    /// the k-th for the k-th chain calling it.
+    node_params: HashMap<String, Vec<String>>,
     /// `-bound <name>=<bindings>`: per node name, the inputs each call of it
     /// binds as its shape was asked, the k-th for the k-th chain calling it.
     node_bounds: HashMap<String, Vec<Vec<ffrwd_wasm_runtime::node::Binding>>>,
@@ -704,7 +705,7 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
     let mut params: Option<String> = None;
     let mut wiring: Option<String> = None;
     let mut pending_map: Vec<String> = Vec::new();
-    let mut node_params: HashMap<String, String> = HashMap::new();
+    let mut node_params: HashMap<String, Vec<String>> = HashMap::new();
     let mut node_bounds: HashMap<String, Vec<Vec<ffrwd_wasm_runtime::node::Binding>>> =
         HashMap::new();
     let mut outputs: Vec<OutputSpec> = Vec::new();
@@ -821,9 +822,7 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
                 if let Some((name, path)) = named_params(&raw) {
                     let text = std::fs::read_to_string(path)
                         .with_context(|| format!("reading -params-from {raw}"))?;
-                    if node_params.insert(name.to_string(), text).is_some() {
-                        bail!("second -params-from {name}= specified");
-                    }
+                    node_params.entry(name.to_string()).or_default().push(text);
                     continue;
                 }
                 if params.is_some() {
