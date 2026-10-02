@@ -79,6 +79,17 @@ members = [
     "tile",
     "matte",
     "ticker",
+    # One per distinct shape the node world's host has to run, written
+    # against the raw bindings, since they test the host.
+    "shape-hold",
+    "shape-state",
+    "shape-canvas",
+    "shape-rate",
+    "shape-recut",
+    "shape-self",
+    "shape-sink",
+    "shape-window",
+    "shape-packets",
 ]
 resolver = "2"
 

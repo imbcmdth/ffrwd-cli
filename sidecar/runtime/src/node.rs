@@ -563,6 +563,76 @@ pub fn rescale(pts: i64, from: TimeBase, to: TimeBase) -> i64 {
     num.div_euclid(den.max(1)) as i64
 }
 
+/// A bound stream against what its port accepts; an empty list accepts
+/// anything of the kind.
+pub fn check_accepts(port: &InputPort, stream: &BoundStream, name: &str) -> Result<()> {
+    let accepts = &port.accepts;
+    let refused = |what: &str, wanted: String, got: String| {
+        anyhow::anyhow!(
+            "{name} input '{}' accepts {what} {wanted}, and is bound a stream of {got}; convert \
+             it before it reaches {name}",
+            port.name
+        )
+    };
+    match &stream.format {
+        StreamFormat::Video(v) => {
+            if !accepts.pixel_formats.is_empty()
+                && !accepts.pixel_formats.iter().any(|f| f == v.pix_fmt)
+            {
+                return Err(refused(
+                    "the pixel formats",
+                    accepts.pixel_formats.join(", "),
+                    v.pix_fmt.to_string(),
+                ));
+            }
+        }
+        StreamFormat::Audio(a) => {
+            if !accepts.sample_formats.is_empty()
+                && !accepts.sample_formats.iter().any(|f| f == a.sample_fmt)
+            {
+                return Err(refused(
+                    "the sample formats",
+                    accepts.sample_formats.join(", "),
+                    a.sample_fmt.to_string(),
+                ));
+            }
+            if !accepts.sample_rates.is_empty() && !accepts.sample_rates.contains(&a.sample_rate) {
+                return Err(refused(
+                    "the sample rates",
+                    numbers(&accepts.sample_rates),
+                    format!("{} Hz", a.sample_rate),
+                ));
+            }
+            if !accepts.channel_counts.is_empty() && !accepts.channel_counts.contains(&a.channels) {
+                return Err(refused(
+                    "the channel counts",
+                    numbers(&accepts.channel_counts),
+                    format!("{} channels", a.channels),
+                ));
+            }
+        }
+        StreamFormat::Packets(coded) => {
+            if !accepts.codecs.is_empty() && !accepts.codecs.contains(&coded.codec) {
+                return Err(refused(
+                    "the codecs",
+                    accepts.codecs.join(", "),
+                    coded.codec.clone(),
+                ));
+            }
+        }
+        StreamFormat::Data(_) => {}
+    }
+    Ok(())
+}
+
+fn numbers(values: &[u32]) -> String {
+    values
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

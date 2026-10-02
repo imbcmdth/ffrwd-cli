@@ -1895,7 +1895,88 @@ dependencies = [
 ]
 
 [[package]]
+name = "shape-canvas"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "wit-bindgen 0.57.1",
+]
+
+[[package]]
+name = "shape-hold"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "wit-bindgen 0.57.1",
+]
+
+[[package]]
+name = "shape-packets"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "wit-bindgen 0.57.1",
+]
+
+[[package]]
 name = "shape-probe"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "wit-bindgen 0.57.1",
+]
+
+[[package]]
+name = "shape-rate"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "wit-bindgen 0.57.1",
+]
+
+[[package]]
+name = "shape-recut"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "wit-bindgen 0.57.1",
+]
+
+[[package]]
+name = "shape-self"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "wit-bindgen 0.57.1",
+]
+
+[[package]]
+name = "shape-sink"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "wit-bindgen 0.57.1",
+]
+
+[[package]]
+name = "shape-state"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "wit-bindgen 0.57.1",
+]
+
+[[package]]
+name = "shape-window"
 version = "0.1.0"
 dependencies = [
  "serde",

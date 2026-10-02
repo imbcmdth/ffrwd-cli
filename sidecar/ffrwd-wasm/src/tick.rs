@@ -17,9 +17,6 @@
 //! Pairing is resolved here, once, before a tick goes to any instance, so
 //! every instance of a node sees the same ticks.
 
-// The assembler serves node modules, which no command line reaches yet.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
@@ -338,6 +335,17 @@ impl EarlierRows {
     pub fn processed(&mut self, instance: usize, number: u64) {
         self.told.insert(instance, number + 1);
     }
+
+    /// The rows every one of `instances` has been told of go.
+    pub fn forget_told(&mut self, instances: usize) {
+        let past = (0..instances)
+            .map(|i| self.told.get(&i).copied().unwrap_or(0))
+            .min()
+            .unwrap_or(0);
+        for ticks in self.ticks.values_mut() {
+            ticks.retain(|(n, _)| *n >= past);
+        }
+    }
 }
 
 /// One thing arriving on a bound stream.
@@ -412,6 +420,8 @@ pub struct Assembler {
     audio_pts: Option<i64>,
     /// Whether the last tick has been made.
     done: bool,
+    /// Where the interval of the tick made last ends, in its time base.
+    made_end: Option<i64>,
     /// Rows of state inputs, for instances that did not see every tick.
     pub earlier: EarlierRows,
 }
@@ -486,6 +496,7 @@ impl Assembler {
             audio_buffer: Vec::new(),
             audio_pts: None,
             done: false,
+            made_end: None,
             earlier: EarlierRows::default(),
         })
     }
@@ -525,6 +536,7 @@ impl Assembler {
         self.inputs.iter().all(|i| i.ended)
     }
 
+    #[cfg(test)]
     pub fn is_done(&self) -> bool {
         self.done
     }
@@ -562,7 +574,7 @@ impl Assembler {
         if next.last {
             self.done = true;
         }
-        Ok(Some(self.made(next.pts, base, next.last, streams)))
+        Ok(Some(self.made(next.pts, end, base, next.last, streams)))
     }
 
     /// Tick `self.made` of a rate clock, with whatever its inputs pair to
@@ -589,7 +601,7 @@ impl Assembler {
         if last {
             self.done = true;
         }
-        Ok(Some(self.made(pts, base, last, streams)))
+        Ok(Some(self.made(pts, end, base, last, streams)))
     }
 
     /// A self-clocked node's next call: whatever has arrived. `pts` is the
@@ -606,12 +618,53 @@ impl Assembler {
         if last {
             self.done = true;
         }
-        Ok(self.made(pts, base, last, streams))
+        Ok(self.made(pts, None, base, last, streams))
     }
 
-    fn made(&mut self, pts: i64, base: TimeBase, last: bool, streams: Vec<TickStream>) -> Tick {
+    /// Where the interval of the tick made last ends, in its time base:
+    /// None for a last call that takes whatever is left, and for a
+    /// self-clocked node's.
+    pub fn tick_end(&self) -> Option<i64> {
+        self.made_end
+    }
+
+    /// The newest time any input has said it is done to, in `base`.
+    pub fn latest(&self, base: TimeBase) -> Option<i64> {
+        self.inputs
+            .iter()
+            .filter_map(|i| {
+                i.progress
+                    .map(|p| ffrwd_wasm_runtime::node::rescale(p, i.base, base))
+            })
+            .max()
+    }
+
+    /// How many ticks have been made.
+    pub fn ticks_made(&self) -> u64 {
+        self.made
+    }
+
+    /// Whether anything has arrived that no tick has taken.
+    pub fn has_arrivals(&self) -> bool {
+        self.inputs.iter().any(|i| !i.queue.is_empty())
+    }
+
+    /// Whether any stream is bound to the node.
+    pub fn has_inputs(&self) -> bool {
+        !self.inputs.is_empty()
+    }
+
+    fn made(
+        &mut self,
+        pts: i64,
+        end: Option<i64>,
+        base: TimeBase,
+        last: bool,
+        streams: Vec<TickStream>,
+    ) -> Tick {
         let number = self.made;
         self.made += 1;
+        self.made_end = end;
         for stream in &streams {
             let state = self
                 .inputs
@@ -643,11 +696,12 @@ impl Assembler {
 
     /// Where the clock's next tick stands, without taking it: None while
     /// the clock has not arrived far enough to say.
+    ///
+    /// A tick's interval ends where the next one starts, or where its frame
+    /// says it does, so a clock waits for that before it ticks: the progress
+    /// a node sends, and what an interval or lockstep input is handed, are
+    /// then the same however the input arrived.
     fn peek_clock(&mut self, clock: usize) -> Result<Option<NextTick>> {
-        let needs_end = self
-            .inputs
-            .iter()
-            .any(|i| !i.is_clock && matches!(i.pairing, Pairing::Lockstep | Pairing::Interval(_)));
         let window = self.window;
         let stride = self.stride;
         let input = &mut self.inputs[clock];
@@ -666,11 +720,14 @@ impl Assembler {
                 let end = match next {
                     Some(t) => Some(t),
                     None if last => None,
-                    None if needs_end => return Ok(None),
-                    None => input.queue.get(stride - 1).and_then(|item| match item {
-                        Item::Frame(f) => f.duration.map(|d| f.pts + d),
-                        _ => None,
-                    }),
+                    None => match input.queue.get(stride - 1) {
+                        Some(Item::Frame(TickFrame {
+                            pts,
+                            duration: Some(d),
+                            ..
+                        })) if window == stride => Some(pts + d),
+                        _ => return Ok(None),
+                    },
                 };
                 let take = if last { input.queue.len() } else { stride };
                 Ok(Some(NextTick {
@@ -745,7 +802,7 @@ impl Assembler {
                 let pts = self.packets_time.map_or(first, |t| t.max(first));
                 let next = input.queue.get(1).map(|i| input.item_time(i).max(pts));
                 let last = input.ended && next.is_none();
-                if next.is_none() && !last && needs_end {
+                if next.is_none() && !last {
                     return Ok(None);
                 }
                 Ok(Some(NextTick {
@@ -1177,9 +1234,10 @@ mod tests {
         let ticks = drain(&mut a);
         assert_eq!(
             ticks.iter().map(|t| t.pts).collect::<Vec<_>>(),
-            [0, 1001, 2002],
-            "nothing else is paired, so nothing waits for the next frame"
+            [0, 1001],
+            "a tick waits for the frame that ends its interval"
         );
+        assert_eq!(a.tick_end(), Some(2002));
         assert!(
             ticks[0].streams[0].frames[0].rows.is_empty(),
             "ignore drops rows"
@@ -1188,8 +1246,9 @@ mod tests {
         let last = drain(&mut a);
         assert_eq!(last.len(), 1);
         assert!(last[0].last);
-        assert!(last[0].streams[0].frames.is_empty());
-        assert_eq!(last[0].pts, 2003, "just past the last frame");
+        assert_eq!(last[0].pts, 2002, "the last frame rides the last call");
+        assert_eq!(last[0].streams[0].frames.len(), 1);
+        assert_eq!(a.tick_end(), None);
     }
 
     #[test]

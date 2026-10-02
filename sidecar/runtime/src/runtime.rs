@@ -494,7 +494,9 @@ mod world_0190 {
 }
 
 mod node_world;
-pub use node_world::{describe_node, exports_node, node_shape, WitNode, NODE_WORLD};
+pub use node_world::{
+    describe_node, exports_node, node_shape, output_format, FormatOf, WitNode, NODE_WORLD,
+};
 
 mod world_0170 {
     stream_info_with_time_base!();

@@ -603,8 +603,7 @@ source = "git+https://github.com/imbcmdth/ffrwd-nal?tag=v0.1.0#bd2ffcf559065b836
 
 [[package]]
 name = "ffrwd-nut"
-version = "0.1.4"
-source = "git+https://github.com/imbcmdth/ffrwd-nut?tag=v0.1.4#138b4bbf9357e720459c504be40a50fc5000ce93"
+version = "0.1.5"
 dependencies = [
  "serde",
  "serde_json",

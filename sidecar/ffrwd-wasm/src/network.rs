@@ -618,7 +618,7 @@ fn spell(pad: &Pad) -> String {
 
 /// A module's `params-schema` as JSON. An empty schema is an object with no
 /// properties, which is a module that takes nothing.
-fn parse_schema(schema: &str, module: &str) -> Result<serde_json::Value> {
+pub(crate) fn parse_schema(schema: &str, module: &str) -> Result<serde_json::Value> {
     if schema.trim().is_empty() {
         return Ok(serde_json::Value::Object(serde_json::Map::new()));
     }
@@ -630,7 +630,7 @@ fn parse_schema(schema: &str, module: &str) -> Result<serde_json::Value> {
 /// takes: each value read as the type its schema declares. Returns an empty
 /// string for a node given no options, which is what a module with no `-params`
 /// sees.
-fn params_json(
+pub(crate) fn params_json(
     module: &str,
     schema: &serde_json::Value,
     options: &[(String, String)],

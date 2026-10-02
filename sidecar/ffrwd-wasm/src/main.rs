@@ -14,11 +14,15 @@
 
 mod adapters;
 mod codec;
+mod edges;
 mod graph;
 mod heartbeat;
+mod host_nodes;
+mod lanes;
 mod leaky;
 mod legacy;
 mod network;
+mod node_graph;
 mod node_loop;
 mod relay;
 mod rowfilter;
@@ -84,6 +88,7 @@ fn frame_len_for(pix_fmt: &str, width: u32, height: u32) -> Result<usize> {
             Ok(pixels * 2)
         }
         "yuv444p" => Ok(pixels * 3),
+        "gray" => Ok(pixels),
         other => bail!(
             "pixel format {other}: only {} are supported",
             nut::supported_pix_fmts().join(", ")
@@ -318,6 +323,9 @@ struct OutputSpec {
     /// The `-map` label. Absent for the single-module spelling, which has one
     /// stream to write.
     target: Option<String>,
+    /// Further `-map` labels before the same output, which a network of node
+    /// modules writes into the one NUT beside the first.
+    also: Vec<String>,
     kind: OutputKind,
     path: OutputPath,
     /// `-rows`: whose rows this document holds, as a position among the
@@ -381,6 +389,8 @@ struct Args {
     /// The colorimetry flags: what a codec run's stream carries, which its
     /// NUT header does not say. Only a codec run takes them.
     color: codec::ColorFlags,
+    /// `-params-from <name>=<file>`: one node's params, whole, by its name.
+    node_params: HashMap<String, String>,
 }
 
 /// `-pad`'s JSON, following one packet sink `-i`: which relation row this
@@ -664,7 +674,8 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
     let mut rows_from: Vec<Option<usize>> = Vec::new();
     let mut params: Option<String> = None;
     let mut wiring: Option<String> = None;
-    let mut pending_map: Option<String> = None;
+    let mut pending_map: Vec<String> = Vec::new();
+    let mut node_params: HashMap<String, String> = HashMap::new();
     let mut outputs: Vec<OutputSpec> = Vec::new();
     let mut stream_info_path: Option<String> = None;
     let mut annotations = Annotations::default();
@@ -755,12 +766,7 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
                 }
                 wiring = Some(next("-filter_complex")?);
             }
-            "-map" => {
-                if pending_map.is_some() {
-                    bail!("two -map options in a row: each names the output that follows it");
-                }
-                pending_map = Some(resolve_map_target(&next("-map")?)?);
-            }
+            "-map" => pending_map.push(resolve_map_target(&next("-map")?)?),
             "-params" => {
                 if params.is_some() {
                     bail!("second -params specified");
@@ -771,13 +777,21 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
             // be long - a space definition, a model URI - and a command line
             // is a poor place to keep one.
             "-params-from" => {
+                let raw = next("-params-from")?;
+                if let Some((name, path)) = named_params(&raw) {
+                    let text = std::fs::read_to_string(path)
+                        .with_context(|| format!("reading -params-from {raw}"))?;
+                    if node_params.insert(name.to_string(), text).is_some() {
+                        bail!("second -params-from {name}= specified");
+                    }
+                    continue;
+                }
                 if params.is_some() {
                     bail!("-params-from and -params both name one module's parameters");
                 }
-                let path = next("-params-from")?;
                 params = Some(
-                    std::fs::read_to_string(&path)
-                        .with_context(|| format!("reading -params-from {path}"))?,
+                    std::fs::read_to_string(&raw)
+                        .with_context(|| format!("reading -params-from {raw}"))?,
                 );
             }
             "-annotations" => {
@@ -856,8 +870,10 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
                 };
                 let rows = pending_rows.take();
                 let track = pending_track.take();
+                let mut maps = std::mem::take(&mut pending_map).into_iter();
                 let output = OutputSpec {
-                    target: pending_map.take(),
+                    target: maps.next(),
+                    also: maps.collect(),
                     kind,
                     path: resolve_output_path(other)?,
                     rows,
@@ -883,7 +899,7 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
         }
     }
 
-    if let Some(target) = pending_map {
+    if let Some(target) = pending_map.first() {
         bail!("-map [{target}] names no output: an output path must follow it");
     }
     if let Some(index) = pending_rows {
@@ -925,7 +941,21 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
         codec: codec_half,
         frame_rate,
         color,
+        node_params,
     })
+}
+
+/// `-params-from`'s value as a node's name and a path, where it starts
+/// with a name and an `=`: letters, digits and underscores, not starting
+/// with a digit.
+fn named_params(raw: &str) -> Option<(&str, &str)> {
+    let (name, path) = raw.split_once('=')?;
+    let named = name
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    (named && !path.is_empty()).then_some((name, path))
 }
 
 /// The `-m` table and its wiring, checked against the rest of the command
@@ -1877,6 +1907,24 @@ fn stream_info(args: &Args, stream: &nut::Stream) -> StreamInfo {
 /// Reads every input's headers, then runs whatever this process hosts over
 /// their frames.
 fn run(args: &Args) -> Result<()> {
+    if let Modules::Network { bindings, wiring } = &args.modules {
+        if node_graph::is_node_network(bindings)? {
+            return node_graph::run(args, bindings, wiring);
+        }
+        if let Some(output) = args.outputs.iter().find(|o| !o.also.is_empty()) {
+            bail!(
+                "{}: several -map before one output write one NUT of several streams, which \
+                 only a network of node modules writes",
+                output.spelling
+            );
+        }
+    }
+    if !args.node_params.is_empty() {
+        bail!(
+            "-params-from <name>=<file> names a node of a network of node modules, and this \
+             run hosts none"
+        );
+    }
     // A packet source rides alone, ahead of every other check: it produces
     // its own packets and takes no -i input, so the "no input specified"
     // refusal just below does not apply to it.
@@ -4222,6 +4270,7 @@ mod frame_len_tests {
         assert_eq!(
             sizes,
             vec![
+                ("gray", 8),
                 ("rgba", 32),
                 ("yuv420p", 12),
                 ("yuv422p", 16),
@@ -4924,6 +4973,7 @@ mod source_track_tests {
     fn output(track: Option<usize>) -> OutputSpec {
         OutputSpec {
             target: None,
+            also: Vec::new(),
             kind: OutputKind::Frames,
             path: OutputPath::File("pipe".to_string()),
             rows: None,

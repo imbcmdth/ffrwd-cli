@@ -388,6 +388,7 @@ fn check_bound(shape: &NodeShape, bound: &[BoundStream], name: &str) -> Result<(
                 stream.format.kind().name()
             );
         }
+        crate::node::check_accepts(port, stream, name)?;
     }
     for port in &shape.inputs {
         let count = bound.iter().filter(|b| b.port == port.name).count();
@@ -616,7 +617,7 @@ impl WitNode {
 
 /// An output's frames, as far as a `same` needs to know them.
 #[derive(Debug, PartialEq)]
-pub(crate) enum FormatOf {
+pub enum FormatOf {
     Video {
         width: u32,
         height: u32,
@@ -651,11 +652,7 @@ fn same_format(wanted: &FormatOf, arriving: &StreamFormat) -> bool {
 
 /// An output port's frame format: what it declares, the clock input's where
 /// it declares none, or the input it follows with its override.
-pub(crate) fn output_format(
-    shape: &NodeShape,
-    bound: &[BoundStream],
-    port: usize,
-) -> Option<FormatOf> {
+pub fn output_format(shape: &NodeShape, bound: &[BoundStream], port: usize) -> Option<FormatOf> {
     let first_of = |input: &str| bound.iter().find(|b| b.port == input).map(|b| &b.format);
     match &shape.outputs[port].format {
         Some(OutputFormat::Video(v)) => Some(FormatOf::Video {
