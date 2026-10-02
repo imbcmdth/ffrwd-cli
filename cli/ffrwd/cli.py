@@ -2451,8 +2451,8 @@ _RUST_GITIGNORE_FILE = store.GITIGNORE_NAME
 
 # The releases the scaffold's crate pins; ffrwd-node's speaks the world
 # `wasm.WORLD_VERSION` names, which the manifest depends on.
-_NODE_SDK_TAG = "v0.1.0"
-_FRAME_TAG = "v0.1.0"
+_NODE_SDK_TAG = "v0.2.0"
+_FRAME_TAG = "v0.1.1"
 
 _RUST_BUILD_LINE = "cargo build --release --target wasm32-wasip2"
 

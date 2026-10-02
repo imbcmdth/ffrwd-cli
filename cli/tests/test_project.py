@@ -3503,11 +3503,11 @@ def test_init_rust_writes_a_crate_on_the_node_sdk_with_no_build_script(
     source = (root / "src" / "lib.rs").read_text(encoding="utf-8")
 
     assert (
-        'ffrwd-node = { git = "https://github.com/imbcmdth/ffrwd-node", tag = "v0.1.0" }'
+        'ffrwd-node = { git = "https://github.com/imbcmdth/ffrwd-node", tag = "v0.2.0" }'
         in cargo
     )
     assert (
-        'ffrwd-frame = { git = "https://github.com/imbcmdth/ffrwd-frame", tag = "v0.1.0" }'
+        'ffrwd-frame = { git = "https://github.com/imbcmdth/ffrwd-frame", tag = "v0.1.1" }'
         in cargo
     )
     assert 'crate-type = ["cdylib"]' in cargo
