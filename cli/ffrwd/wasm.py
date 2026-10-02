@@ -1949,6 +1949,8 @@ def _argv(
     SINK pad carrying rendition metadata (:attr:`SidecarProcess.pads`) gets a
     ``-pad '<json>'`` right after its own ``-i``, ``{"row": ..., "rendition":
     {...}}`` with absent attributes omitted -- a pad with none gets no flag.
+    A node network's input carrying a raw picture gets its ``"color"`` there
+    too (:attr:`SidecarProcess.colors`), since NUT writes none.
 
     `writes` is the mirror on the other side: one path per rows document the
     process writes, in document order, since a process writing several of
@@ -1990,8 +1992,12 @@ def _argv(
         for index, path in enumerate(reads or (STDIN,)):
             argv += ["-f", EDGE_FORMAT, "-i", path]
             meta: PadMeta | None = process.pads[index] if index < len(process.pads) else None
-            if meta is not None:
-                argv += ["-pad", json.dumps(meta.to_dict())]
+            pad = meta.to_dict() if meta is not None else {}
+            colour = process.colors[index] if index < len(process.colors) else ()
+            if colour:
+                pad["color"] = dict(colour)
+            if pad:
+                argv += ["-pad", json.dumps(pad)]
     if any(grant.effect == "gpu" for grant in process.grants):
         jobs = GPU_JOBS if jobs is None else min(jobs, GPU_JOBS)
     if jobs is not None:

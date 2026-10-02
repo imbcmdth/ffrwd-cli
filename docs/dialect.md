@@ -1097,8 +1097,10 @@ every dependency its own manifest pins, at the written version, plus
 its pinned models and the runtime its modules load - everything
 installing this package from the registry would have fetched. A fresh
 clone of a package's repository builds and publishes after one bare
-install. `-g` without a package is an error; machine-wide installs
-name what to fetch.
+install. A dependency the project links is left to its link, and a pin
+of it from before the link leaves the lockfile, unless another pinned
+package depends on that version. `-g` without a package is an error;
+machine-wide installs name what to fetch.
 
 ### Where a package is
 

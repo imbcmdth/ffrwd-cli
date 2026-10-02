@@ -52,10 +52,11 @@ from ffrwd.project import (
     read_linksfile,
     read_lockfile,
     read_manifest,
+    write_linksfile,
     write_lockfile,
 )
 
-QUERY = "COPY (SELECT {call}(f.audio[1]) FROM input('film.mkv') f) TO 'out.mkv'"
+QUERY ="COPY (SELECT {call}(f.audio[1]) FROM input('film.mkv') f) TO 'out.mkv'"
 
 
 def _quieter(factor: str) -> str:
@@ -1003,6 +1004,40 @@ def test_bare_install_leaves_a_dependency_that_is_linked_to_a_directory(
         project, monkeypatch, capsys, "compile", QUERY.format(call="broadcast.tracks.quieter")
     )
     assert code == 0 and "volume=volume=0.5" in out
+
+
+def test_bare_install_drops_a_pin_a_link_made_since_answers_for(
+    store_home: Path,
+    registry: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The link wins on install as it does on resolve: the lock comes out as
+    one written with the link already standing."""
+    monkeypatch.setenv(packages.REGISTRY_ENV, str(registry))
+    _publish(registry, _package(tmp_path / "pub", factor="0.5"))
+    project = _package(
+        tmp_path / "work",
+        name="consumer/mine",
+        dependencies={"broadcast/tracks": "1.0.0"},
+    )
+    assert _run(project, monkeypatch, capsys, "install")[0] == 0
+    lock = project / "ffrwd.lock"
+    assert read_lockfile(lock).dependencies == {"broadcast/tracks": "1.0.0"}
+    _package(tmp_path / "dev", factor="0.25")
+    write_linksfile(links_path(lock), [LinkEntry(path="../dev")])
+
+    code, _out, err = _run(project, monkeypatch, capsys, "install")
+    assert code == 0, err
+    held = read_lockfile(lock)
+    assert held.dependencies == {}
+    assert held.entries == ()
+
+    code, out, _err = _run(
+        project, monkeypatch, capsys, "compile", QUERY.format(call="broadcast.tracks.quieter")
+    )
+    assert code == 0 and "volume=volume=0.25" in out
 
 
 def test_bare_install_moves_an_old_lockfile_link_into_the_links_file(

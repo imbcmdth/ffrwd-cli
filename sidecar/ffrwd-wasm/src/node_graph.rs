@@ -61,6 +61,8 @@ struct StreamDef {
     frame_rate: Option<(u64, u64)>,
     /// How the command line names it, for a refusal.
     spelling: String,
+    rendition: RenditionMeta,
+    row: Option<u32>,
 }
 
 const KNOWN_PIX_FMTS: &[&str] = &["rgba", "yuv420p", "yuv422p", "yuv444p", "gray"];
@@ -97,23 +99,38 @@ fn input_stream(
 ) -> Result<StreamDef> {
     let spelling = format!("stream {index} of input {input}");
     let base = base_of(stream.time_base);
+    let pad = args.pads.get(input).and_then(Option::as_ref);
+    let rendition: RenditionMeta = pad.map(|p| p.rendition.clone().into()).unwrap_or_default();
     let format = if stream.is_json() {
         StreamFormat::Data(runtime::DATA_CODEC.to_string())
     } else if stream.pix_fmt().is_some() || stream.sample_fmt().is_some() {
         match crate::format_from_stream(stream)?.media {
-            Media::Video(v) => StreamFormat::Video(v),
+            Media::Video(mut v) => {
+                if let Some(c) = pad.and_then(|p| p.color.as_ref()) {
+                    v.color = Some(runtime::ColorInfo {
+                        range: crate::codec::parse_color_name("-pad color.range", &c.range)?,
+                        primaries: crate::codec::parse_color_name(
+                            "-pad color.primaries",
+                            &c.primaries,
+                        )?,
+                        trc: crate::codec::parse_color_name("-pad color.trc", &c.trc)?,
+                        space: crate::codec::parse_color_name("-pad color.space", &c.space)?,
+                    });
+                }
+                StreamFormat::Video(v)
+            }
             Media::Audio(a) => StreamFormat::Audio(a),
         }
     } else if stream.codec_name().is_some() {
-        let pad = crate::coded_pad(
+        let coded = crate::coded_pad(
             args,
             "this network",
             input,
             stream,
             index as u32,
-            RenditionMeta::default(),
+            rendition.clone(),
         )?;
-        StreamFormat::Packets(pad.stream)
+        StreamFormat::Packets(coded.stream)
     } else {
         bail!(
             "{spelling} carries codec tag {}, which no node reads",
@@ -137,6 +154,8 @@ fn input_stream(
         header: Some(stream.clone()),
         frame_rate: stream.frame_rate,
         spelling,
+        rendition,
+        row: pad.and_then(|p| p.row),
     })
 }
 
@@ -174,9 +193,6 @@ pub fn run(args: &Args, bindings: &[Binding], wiring: &str) -> Result<()> {
             "-annotations carries rows beside the frames of an older module's edge; a network \
              of node modules carries them as data streams of their own"
         );
-    }
-    if args.pads.iter().any(Option::is_some) {
-        bail!("-pad follows a packet sink's -i, and a network of node modules hosts none");
     }
     if !args.rows_in.is_empty() {
         bail!(
@@ -345,6 +361,8 @@ fn open(
                         header: None,
                         frame_rate: None,
                         spelling: format!("the annotation stream of input {input}"),
+                        rendition: RenditionMeta::default(),
+                        row: None,
                     });
                 }
                 Err(e) => return Err(e),
@@ -460,6 +478,8 @@ fn open(
                     header: None,
                     frame_rate: None,
                     spelling: format!("[{label}], the rows of {}", call.module),
+                    rendition: RenditionMeta::default(),
+                    row: None,
                 };
                 spec.rows = Some(PortOut {
                     stream: id,
@@ -488,6 +508,8 @@ fn open(
                 });
                 StreamDef {
                     spelling: format!("[{label}], output '{name}' of {}", call.module),
+                    rendition: RenditionMeta::default(),
+                    row: None,
                     ..def
                 }
             };
@@ -676,8 +698,8 @@ fn bound_stream(port: &str, id: u32, def: &StreamDef) -> BoundStream {
         info: def.info.clone(),
         time_base: def.base,
         format: def.format.clone(),
-        rendition: RenditionMeta::default(),
-        row: None,
+        rendition: def.rendition.clone(),
+        row: def.row,
         decode_delay: def.decode_delay,
         latency: def.latency,
     }
@@ -803,6 +825,8 @@ fn output_streams(
             header,
             frame_rate,
             spelling: String::new(),
+            rendition: RenditionMeta::default(),
+            row: None,
         }));
     }
     Ok(outputs)
@@ -1018,6 +1042,8 @@ fn open_host(call: &NodeCall, pads: &[(String, u32)], defs: &[StreamDef]) -> Res
         header: None,
         frame_rate: None,
         spelling: String::new(),
+        rendition: RenditionMeta::default(),
+        row: None,
     };
     Ok(Opening {
         spec: LaneSpec {

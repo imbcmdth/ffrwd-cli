@@ -423,7 +423,15 @@ from ffrwd.probe import (
     track_cues,
 )
 from ffrwd.probe import probe as probe_one_path
-from ffrwd.processes import CLOCK_SIZE, COPY_CODEC, NUT, RAWVIDEO, ref_type
+from ffrwd.processes import (
+    CLOCK_SIZE,
+    COPY_CODEC,
+    NUT,
+    RAWVIDEO,
+    SETPARAMS_COLOR,
+    ref_type,
+    stream_colorimetry,
+)
 from ffrwd.registry import DynamicFilter, FilterOption, Registry, SourceFilter
 from ffrwd.shapes import (
     InputPort,
@@ -2553,43 +2561,6 @@ _ENCODER_SHAPING = frozenset(
     }
 )
 
-# A stream's colorimetry: each option ffmpeg's output takes it by, against
-# the field ffprobe reports it in and setparams' option for it.
-_PROBED_COLOR: Mapping[str, str] = {
-    "color_range": "color_range",
-    "color_primaries": "color_primaries",
-    "color_trc": "color_transfer",
-    "colorspace": "color_space",
-    "chroma_sample_location": "chroma_location",
-}
-_SETPARAMS_COLOR: Mapping[str, str] = {
-    "color_range": "range",
-    "color_primaries": "color_primaries",
-    "color_trc": "color_trc",
-    "colorspace": "colorspace",
-    "chroma_sample_location": "chroma_location",
-}
-# What ffprobe and setparams write for a field nothing settles.
-_UNSAID_COLOR = frozenset({"unknown", "unspecified", "reserved", "auto"})
-# The fields that describe YUV alone, which an RGB picture has none of.
-_YUV_ONLY_COLOR = ("color_range", "colorspace", "chroma_sample_location")
-_RGB_PREFIXES = ("rgb", "bgr", "gbr", "argb", "abgr")
-# Filters that convert colour, past which a stream's colorimetry is no longer
-# its input's. A `scale` does too where it names an in_ or out_ option.
-_COLOR_CONVERTING_FILTERS = frozenset(
-    {"colorspace", "colormatrix", "zscale", "tonemap", "tonemap_opencl", "libplacebo"}
-)
-
-
-def _converts_colour(node: Node) -> bool:
-    """True where `node` converts the colour of the pictures through it."""
-    if node.filter in _COLOR_CONVERTING_FILTERS:
-        return True
-    return node.filter == "scale" and any(
-        str(key).startswith(("in_", "out_")) for key in node.args
-    )
-
-
 def _colorimetry_options(
     tagged: Mapping[int, Mapping[str, str]], outputs: Sequence[Output]
 ) -> dict[str, object]:
@@ -4547,7 +4518,7 @@ class _Lowerer:
                 self.graph.codec_formats[node] = said
                 made[ref] = self.ctx.node(
                     "setparams",
-                    {_SETPARAMS_COLOR[option]: value for option, value in said.items()},
+                    {SETPARAMS_COLOR[option]: value for option, value in said.items()},
                     [node],
                     ["video"],
                 )
@@ -5192,35 +5163,12 @@ class _Lowerer:
         names, as far as the query says it.
 
         A ``setparams`` on the way settles each field it names; past a filter
-        that converts colour (:data:`_COLOR_CONVERTING_FILTERS`) nothing else
+        that converts colour (:data:`ffrwd.processes.COLOR_CONVERTING_FILTERS`) nothing else
         does. Every field left is the input stream's, as probed. A field
         nothing settles is absent. Pictures in an RGB `pix_fmt` have no YUV
         matrix, range or chroma siting to state.
         """
-        said: dict[str, str] = {}
-        seen: set[str] = set()
-        current: FrameRef | None = ref
-        while current is not None and not is_src(current):
-            node = self._upstream(current, seen)
-            if node is None or _converts_colour(node):
-                current = None
-                break
-            if node.filter == "setparams":
-                for option, param in _SETPARAMS_COLOR.items():
-                    value = node.args.get(param)
-                    if value is not None and str(value) not in _UNSAID_COLOR:
-                        said.setdefault(option, str(value))
-            current = self._picture_input(node)
-        meta = self._source_meta(current)
-        if meta is not None:
-            for option, field_name in _PROBED_COLOR.items():
-                value = getattr(meta, field_name)
-                if isinstance(value, str) and value not in _UNSAID_COLOR:
-                    said.setdefault(option, value)
-        if pix_fmt is not None and pix_fmt.startswith(_RGB_PREFIXES):
-            for option in _YUV_ONLY_COLOR:
-                said.pop(option, None)
-        return {option: said[option] for option in COLOR_OPTIONS if option in said}
+        return stream_colorimetry(self.graph, ref, self._source_meta, pix_fmt)
 
     def _described_codec(
         self, declared: WasmFunction, node: exp.Expr, select: exp.Select
@@ -16476,9 +16424,10 @@ class _Lowerer:
 
         Rows read by another node stay a data stream; the ones a COPY writes
         become what a module's rows have always become there, a rows file at a
-        rows destination and a subtitle track anywhere else.
+        rows destination and a subtitle track anywhere else. A one-element
+        array, the call under a track row a WHERE pinned, is its element.
         """
-        if value.is_array or len(value.streams) != 1:
+        if len(value.streams) != 1:
             return value
         stream = value.streams[0]
         found = self._node_rows.get(self._under_rows_nodes(stream.ref))

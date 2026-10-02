@@ -367,6 +367,47 @@ fn an_output_sized_by_the_params_is_redrawn_at_that_size() {
 }
 
 #[test]
+fn a_pad_hands_a_node_the_colour_the_wire_does_not_carry() {
+    let dir = scratch("pad-colour");
+    let items: Vec<(usize, Write)> = (0..3)
+        .map(|k| (0, Write::Frame(k, vec![7u8; 8 * 8 * 4])))
+        .collect();
+    write_nut(&dir.join("in.nut"), &[video(8, 8, TENTHS, (10, 1))], &items);
+    let input = dir.join("in.nut").display().to_string();
+    let out = at_every_jobs(
+        "pad-colour",
+        &args(&[
+            "-f",
+            "nut",
+            "-i",
+            &input,
+            "-pad",
+            r#"{"color": {"range": "pc", "primaries": "bt709", "trc": "bt709", "space": "bt709"}}"#,
+            "-m",
+            &module("shape_canvas"),
+            "-filter_complex",
+            "[v=0:v]shape_canvas=width=2:height=2[out=o][@rows=r]",
+            "-map",
+            "[o]",
+            "-f",
+            "nut",
+            "{dir}/out.nut",
+            "-map",
+            "[r]",
+            "-f",
+            "ndjson",
+            "{dir}/rows.ndjson",
+        ]),
+        &["out.nut", "rows.ndjson"],
+    );
+    let rows = lines(&out[1]);
+    assert_eq!(rows.len(), 1, "one row, the colour, on the first tick");
+    assert_eq!(rows[0]["range"], "pc");
+    assert_eq!(rows[0]["space"], "bt709");
+    assert_eq!(rows[0]["primaries"], "bt709");
+}
+
+#[test]
 fn a_rate_with_no_inputs_ticks_until_the_node_finishes() {
     let out = at_every_jobs(
         "rate",
