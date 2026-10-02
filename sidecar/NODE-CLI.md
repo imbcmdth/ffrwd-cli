@@ -135,8 +135,9 @@ label written `-f nut` to a pipe is a JSON data stream with the host's
 progress marks on it (see `ffrwd-wasm/src/heartbeat.rs`), which its reader
 needs as the bytes arrive; to a file it carries the messages alone. Written
 `-f ndjson` it is one message per line, each stamped with its `pts` and its
-`time` in seconds where the row does not name them itself, progress
-dropped; a self-clocked node with inputs ticks on the host's clock, so its
+`time` in seconds where the row does not name them itself (appended to the
+message's own text, which is otherwise written as the node made it),
+progress dropped; a self-clocked node with inputs ticks on the host's clock, so its
 rows are left as it wrote them. `-f srt` and `-f webvtt` take one
 data label of cues each and write the document whole once it ends; `-f
 null` takes any.

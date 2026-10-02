@@ -1537,18 +1537,31 @@ fn write_rows<W: Write>(writer: &mut W, rows: &[String]) -> Result<()> {
 /// host adds nothing under a name already there. A row that is not a JSON
 /// object is left exactly as the module wrote it, since there is nothing to
 /// stamp onto.
+///
+/// The two fields are appended to the row's own text rather than the row
+/// being parsed and written again, so every number and key keeps the bytes
+/// the module gave it.
 fn stamp_row(row: &str, pts: i64, time_base: nut::TimeBase) -> String {
-    let Ok(serde_json::Value::Object(mut object)) = serde_json::from_str::<serde_json::Value>(row)
+    let Ok(keys) =
+        serde_json::from_str::<std::collections::HashMap<String, serde::de::IgnoredAny>>(row)
     else {
         return row.to_string();
     };
-    object
-        .entry("pts")
-        .or_insert_with(|| serde_json::Value::from(pts));
-    object
-        .entry("time")
-        .or_insert_with(|| serde_json::Value::from(time_base.seconds(pts)));
-    serde_json::to_string(&object).unwrap_or_else(|_| row.to_string())
+    let mut added = Vec::new();
+    if !keys.contains_key("pts") {
+        added.push(format!("\"pts\":{pts}"));
+    }
+    if !keys.contains_key("time") {
+        let time = serde_json::to_string(&time_base.seconds(pts)).unwrap_or_else(|_| "null".into());
+        added.push(format!("\"time\":{time}"));
+    }
+    if added.is_empty() {
+        return row.to_string();
+    }
+    let body = row.trim_end();
+    let body = &body[..body.len() - 1];
+    let separator = if keys.is_empty() { "" } else { "," };
+    format!("{body}{separator}{}}}", added.join(","))
 }
 
 /// A subtitle output: where the document goes, and the cues gathered for it so
@@ -4506,6 +4519,26 @@ mod stamp_row_tests {
         let value = parse(&stamped);
         assert_eq!(value["pts"], 7);
         assert_eq!(value["time"], 0.5);
+    }
+
+    #[test]
+    fn a_row_keeps_its_own_text_and_gains_the_two_fields_at_its_end() {
+        // 7.9005e-34 read as an f64 and written again is 7.900500000000001e-34
+        // without serde_json's float_roundtrip; the row's own bytes are kept.
+        let row = r#"{"v":[7.9005e-34,1e5],"b":"x","a":-0}"#;
+        assert_eq!(
+            stamp_row(row, 50, TB),
+            r#"{"v":[7.9005e-34,1e5],"b":"x","a":-0,"pts":50,"time":2.0}"#
+        );
+        assert_eq!(stamp_row("{}", 50, TB), r#"{"pts":50,"time":2.0}"#);
+        assert_eq!(
+            stamp_row(r#"{"pts":7} "#, 50, TB),
+            r#"{"pts":7,"time":2.0}"#
+        );
+        assert_eq!(
+            stamp_row(r#"{"pts":7,"time":0.5}"#, 50, TB),
+            r#"{"pts":7,"time":0.5}"#
+        );
     }
 
     #[test]
