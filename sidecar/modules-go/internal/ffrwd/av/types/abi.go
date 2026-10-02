@@ -12,3 +12,9 @@ type VideoFormatShape struct {
 	_     cm.HostLayout
 	shape [unsafe.Sizeof(VideoFormat{})]byte
 }
+
+// CodedVideoShape is used for storage in variant or result types.
+type CodedVideoShape struct {
+	_     cm.HostLayout
+	shape [unsafe.Sizeof(CodedVideo{})]byte
+}

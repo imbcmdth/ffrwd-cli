@@ -30,6 +30,12 @@ stream specifiers do:
 `[N:v]` is `[N:v:0]`. A raw stream binds a video or audio port, a coded
 one a packets port, a data stream a data port.
 
+    -pad '{"color": {"range": "tv", "primaries": "bt709", "trc": "bt709", "space": "bt709"}, "tags": {"smart_timed": "1"}}'
+
+after an `-i` says what its NUT does not carry: a raw picture's colour, in
+ffmpeg's names, and tags for its streams beside their own, which reach a
+node in `stream-info.tags` (a hold input anchored `tagged` reads them).
+
 ## Nodes
 
     -m <name>=<path>
@@ -82,9 +88,13 @@ Every `-map` before one output writes into it, so one output is one NUT
 carrying those streams, in that order: one edge. The streams are written
 in time order across them, each item as soon as no other stream can still
 bring one earlier, so an output is the same bytes at every `-jobs`. A data
-label written `-f nut` is a JSON data stream with the host's progress
-marks on it (see `ffrwd-wasm/src/heartbeat.rs`); written `-f ndjson` it is
-one message per line, progress dropped. `-f srt` and `-f webvtt` take one
+label written `-f nut` to a pipe is a JSON data stream with the host's
+progress marks on it (see `ffrwd-wasm/src/heartbeat.rs`), which its reader
+needs as the bytes arrive; to a file it carries the messages alone. Written
+`-f ndjson` it is one message per line, each stamped with its `pts` and its
+`time` in seconds where the row does not name them itself, progress
+dropped; a self-clocked node with inputs ticks on the host's clock, so its
+rows are left as it wrote them. `-f srt` and `-f webvtt` take one
 data label of cues each and write the document whole once it ends; `-f
 null` takes any.
 
@@ -111,12 +121,17 @@ knocks. Every connection asks for a 16 MiB receive buffer, and is read
 only while the input has room, so a source that outruns the clock waits on
 its socket. Each connection is a feed (`tick.feed`), with the source's own
 tags and time base from its start on; a source whose pts jump backwards or
-more than a second forwards is a new feed on the same connection.
+more than a second forwards is a new feed on the same connection. Every
+member of a group is told the picture's offset: its `feed-start.at` is the
+picture's, and its `first-pts` the point of its own stream that offset puts
+there, so `(at, first-pts)` maps any member's pts onto the clock. A member
+the connection does not bring (its sound refused) gets no feed at all on
+any tick, where one not arrived yet gets a feed and no frames.
 
 The host says what it did on stderr, as lines and as rows behind
 `ffrwd:row `: `{"kind":"listen",...}` once the port is bound,
 `{"kind":"feed","event":"start",...}` with the anchor and the mapping when
-a feed comes up and `{"kind":"feed","event":"end",...}` with how many
+a feed comes up (and `"absent"`, the members it does not bring) and `{"kind":"feed","event":"end",...}` with how many
 frames it showed, repeated and skipped when it ends, and
 `{"kind":"late",...}` when an interval input's messages arrived after the
 tick that held them.

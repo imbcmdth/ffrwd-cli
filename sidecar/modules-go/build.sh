@@ -25,12 +25,12 @@
 #
 #   5. wit-bindgen-go, for the generated bindings under internal/. They are
 #      checked in, so this is needed only to regenerate them after a change
-#      to ../worlds/0.10.0/av.wit:
+#      to ../wit/av.wit, from the world this script assembles in build/wit:
 #
 #        go install go.bytecodealliance.org/cmd/wit-bindgen-go@v0.7.0
-#        wit-bindgen-go generate --world window-module --out internal \
+#        wit-bindgen-go generate --world node-module-go --out internal \
 #          --package-root github.com/imbcmdth/ffrwd/sidecar/modules-go/internal \
-#          ../worlds/0.10.0
+#          build/wit
 #
 #      Pin go.bytecodealliance.org/cm to v0.3.0, which is what that generator
 #      emits imports for. `go mod tidy` resolves it to v0.7.0, where the root
@@ -49,15 +49,15 @@ out=build
 wit=$out/wit
 
 # The world TinyGo encodes around is assembled rather than checked in: the
-# module interfaces come from ../worlds/0.10.0/av.wit - the frozen world the
-# checked-in bindings target - and the wasi imports from whatever TinyGo ships.
+# module interfaces come from ../wit/av.wit, the node world the checked-in
+# bindings target, and the wasi imports from whatever TinyGo ships.
 tinygo_root=$("$tinygo" env TINYGOROOT)
 wasi_wit=$tinygo_root/lib/wasi-cli/wit
 
 rm -rf "$wit"
 mkdir -p "$wit/deps/ffrwd-av" "$wit/deps/cli"
 cp wit/world.wit "$wit/world.wit"
-cp ../worlds/0.10.0/av.wit "$wit/deps/ffrwd-av/av.wit"
+cp ../wit/av.wit "$wit/deps/ffrwd-av/av.wit"
 cp "$wasi_wit"/*.wit "$wit/deps/cli/"
 cp -R "$wasi_wit"/deps/* "$wit/deps/"
 
@@ -79,6 +79,6 @@ for module in invert-go window3-go; do
     artifact=$out/$(echo "$module" | tr - _).wasm
     echo "building $artifact"
     "$tinygo" build -target=wasip2 -scheduler=none -gc=leaking -o "$artifact" \
-        --wit-package "$wit" --wit-world window-module-go \
+        --wit-package "$wit" --wit-world node-module-go \
         "./$module"
 done

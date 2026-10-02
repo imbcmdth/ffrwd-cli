@@ -6,7 +6,7 @@
 //! messages between two of its producer's progress marks as one tick, so a
 //! tick's end is the end of the producer's tick that carried them.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use anyhow::{anyhow, bail, Result};
 use ffrwd_wasm_runtime::node::{
@@ -24,6 +24,7 @@ const MAX_SPAN: &str = "max_span";
 
 const START: &str = "start_t";
 const END: &str = "end_t";
+const ID: &str = "id";
 
 /// Whether `module` names a node the host answers for on a data edge.
 pub fn is_host_node(module: &str) -> bool {
@@ -175,8 +176,10 @@ impl Node for HostNode {
     }
 }
 
-/// One span: the rows that share a `start_t`, from `from` on.
+/// One span: the rows that share a `start_t` and an `id`, from `from` on.
 struct Span {
+    /// The `start_t` bits and the `id` text it was opened under.
+    key: (u64, Option<String>),
     /// Where this span starts, in seconds: the rows' `start_t`, or the point
     /// an earlier stretch of them was cut at.
     from: f64,
@@ -188,16 +191,19 @@ struct Span {
     end: Option<i64>,
 }
 
-/// The span reducer: rows sharing a `start_t` are one span, which keeps the
-/// last row's fields and ends at the end of the last tick that carried one;
-/// a tick with none is a gap inside it. A span leaves once its producer is
-/// `max_span` past its start, cut there if it is still going, and goes on
-/// from the cut as a new one.
+/// The span reducer: rows sharing a `start_t`, and an `id` where they carry
+/// one, are one span, which keeps the last row's fields and ends at the end
+/// of the last tick that carried one; a tick with none is a gap inside it. A
+/// span leaves once its producer is `max_span` past its start, cut there if
+/// it is still going, and goes on from the cut as a new one.
 struct Spans {
     max_span: f64,
     base: TimeBase,
-    /// Open spans by the bits of their `start_t`.
+    /// Open spans in the order they were first seen.
     open: BTreeMap<u64, Span>,
+    /// Each open span's place in `open`, by its key.
+    keys: HashMap<(u64, Option<String>), u64>,
+    opened: u64,
     /// The newest tick length seen, for the rows of a last tick nothing
     /// ended.
     length: Option<i64>,
@@ -230,6 +236,8 @@ impl Spans {
             max_span: max_span.expect("opened only with max_span given"),
             base,
             open: BTreeMap::new(),
+            keys: HashMap::new(),
+            opened: 0,
             length: None,
             out: None,
         })
@@ -247,7 +255,13 @@ impl Spans {
         let Some(start) = row.get(START).and_then(Value::as_f64) else {
             return Ok(());
         };
-        let span = self.open.entry(start.to_bits()).or_insert(Span {
+        let key = (start.to_bits(), row.get(ID).map(Value::to_string));
+        let place = *self.keys.entry(key.clone()).or_insert_with(|| {
+            self.opened += 1;
+            self.opened
+        });
+        let span = self.open.entry(place).or_insert(Span {
+            key,
             from: start,
             row: None,
             at: message.pts,
@@ -275,13 +289,13 @@ impl Spans {
         let length = self.length.unwrap_or(0);
         let mut leaving: Vec<(f64, Map<String, Value>)> = Vec::new();
         let mut gone = Vec::new();
-        for (key, span) in self.open.iter_mut() {
+        for (place, span) in self.open.iter_mut() {
             let cut = span.from + self.max_span;
             if now.is_some_and(|now| now < cut) {
                 continue;
             }
             let Some(mut row) = span.row.take() else {
-                gone.push(*key);
+                gone.push(*place);
                 continue;
             };
             let mut ended = seconds(base, span.end.unwrap_or(span.at + length));
@@ -295,11 +309,13 @@ impl Spans {
                 span.from = cut;
                 span.end = None;
             } else {
-                gone.push(*key);
+                gone.push(*place);
             }
         }
-        for key in gone {
-            self.open.remove(&key);
+        for place in gone {
+            if let Some(span) = self.open.remove(&place) {
+                self.keys.remove(&span.key);
+            }
         }
         leaving.sort_by(|a, b| a.0.total_cmp(&b.0));
         let mut out = Vec::with_capacity(leaving.len());
@@ -379,6 +395,29 @@ mod tests {
         assert_eq!(out[0].0, 0);
         assert_eq!(out[0].1["x"], 2);
         assert_eq!(out[0].1[END], 0.3);
+    }
+
+    #[test]
+    fn two_ids_first_seen_on_one_tick_are_two_spans_and_no_id_is_one() {
+        let mut node = spans("1");
+        let a = r#"{"start_t":0.0,"id":0,"code":"a"}"#;
+        let b = r#"{"start_t":0.0,"id":1,"code":"b"}"#;
+        node.process(tick(1, false, &[(0, a), (0, b)])).unwrap();
+        node.process(tick(2, false, &[(1, a)])).unwrap();
+        let out = rows(node.process(tick(10, false, &[])).unwrap());
+        let ends: Vec<(&str, f64)> = out
+            .iter()
+            .map(|(_, r)| (r["code"].as_str().unwrap(), r[END].as_f64().unwrap()))
+            .collect();
+        assert_eq!(ends, vec![("a", 0.2), ("b", 0.1)]);
+
+        let mut node = spans("1");
+        let a = r#"{"start_t":0.0,"code":"a"}"#;
+        let b = r#"{"start_t":0.0,"code":"b"}"#;
+        node.process(tick(1, false, &[(0, a), (0, b)])).unwrap();
+        let out = rows(node.process(tick(10, false, &[])).unwrap());
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].1["code"], "b");
     }
 
     #[test]

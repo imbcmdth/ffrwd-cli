@@ -3459,8 +3459,8 @@ fn an_http_module_posts_each_row_under_its_grant() {
     assert_eq!(bodies, expected, "one POST per row, the row as the body");
 }
 
-// A module written in Go, built with TinyGo for wasm32-wasip2. It exports the
-// same interface the Rust fleet exports and the host is told nothing about
+// A module written in Go, built with TinyGo for wasm32-wasip2: a node of the
+// same world the Rust fleet's nodes export, and the host is told nothing about
 // where it came from. TinyGo is not a prerequisite of this checkout, so the
 // cases below skip on a machine without it rather than failing.
 
@@ -3505,14 +3505,140 @@ fn go_modules_built() -> bool {
     })
 }
 
-/// Runs `ffrwd-wasm` on a Go module, the way `run_filter` runs a Rust one.
-fn run_go_filter(name: &str, module_args: &[&str], stdin_bytes: &[u8]) -> FfrwdWasmRun {
-    let module_str = go_module_path(name);
-    let module_str = module_str.to_str().expect("module path is valid UTF-8");
-    let mut args: Vec<&str> = vec!["-f", "nut", "-i", "-", "-m", module_str];
-    args.extend_from_slice(module_args);
-    args.extend_from_slice(&["-f", "nut", "-"]);
+/// The command line that runs one Go node over input 0's picture: its
+/// pictures to the output that follows, and with `rows` its rows port to that
+/// file as NDJSON.
+fn go_node_args(module: &std::path::Path, rows: Option<&std::path::Path>) -> Vec<String> {
+    let name = module
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .expect("module file name is valid UTF-8")
+        .to_string();
+    let mut args = vec![
+        "-f".to_string(),
+        "nut".to_string(),
+        "-i".to_string(),
+        "-".to_string(),
+        "-m".to_string(),
+        format!("{name}={}", module.display()),
+        "-filter_complex".to_string(),
+    ];
+    match rows {
+        Some(rows) => args.extend([
+            format!("[v=0:v]{name}[v=out0][rows=r]"),
+            "-map".to_string(),
+            "[r]".to_string(),
+            "-f".to_string(),
+            "ndjson".to_string(),
+            rows.display().to_string(),
+        ]),
+        None => args.push(format!("[v=0:v]{name}[v=out0]")),
+    }
+    args.extend(["-map", "[out0]", "-f", "nut", "-"].map(String::from));
+    args
+}
+
+/// Runs `ffrwd-wasm` on a Go node, the way `run_filter` runs a Rust module.
+fn run_go_node(module: &std::path::Path, stdin_bytes: &[u8]) -> FfrwdWasmRun {
+    let args = go_node_args(module, None);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
     run_ffrwd_wasm(&args, stdin_bytes)
+}
+
+fn run_go_filter(name: &str, stdin_bytes: &[u8]) -> FfrwdWasmRun {
+    run_go_node(&go_module_path(name), stdin_bytes)
+}
+
+/// One row as window3-go reports a call: the frames it saw and the
+/// timestamps at the two ends of that window.
+#[derive(serde::Deserialize)]
+struct WindowRow {
+    saw: usize,
+    first: i64,
+    last: i64,
+}
+
+/// window3-go over `count` frames: window 3, stride 1. Every frame passes
+/// through once and untouched, and each call reports the window the clock
+/// handed it: three frames from the one it consumes, fewer as the stream
+/// runs out, down to the last frame alone on the last call.
+fn check_window3(module: &std::path::Path, what: &str) {
+    for count in [6usize, 2] {
+        let frames: Vec<Vec<u8>> = (0..count).map(|i| synthetic_frame(i as u8)).collect();
+        let rows = TempFile::new(&format!("window3_{count}.ndjson"));
+        let args = go_node_args(module, Some(rows.path()));
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let run = run_ffrwd_wasm(&args, &nut_stream(&frames));
+        assert_run_ok(&run, &format!("{what} over {count} frames"));
+
+        let got = run.frames();
+        assert_eq!(got.len(), count, "every frame passes through, once");
+        for (i, (pts, data)) in got.iter().enumerate() {
+            assert_eq!(*pts, i as i64 * PTS_STEP, "frame {i} timestamp");
+            assert_eq!(data, &frames[i], "frame {i} passes through untouched");
+        }
+
+        let expected: Vec<(usize, i64, i64)> = (0..count)
+            .map(|i| {
+                let last = (i + 2).min(count - 1);
+                (last - i + 1, i as i64 * PTS_STEP, last as i64 * PTS_STEP)
+            })
+            .collect();
+        let calls: Vec<(usize, i64, i64)> = std::fs::read_to_string(rows.path())
+            .expect("the rows were written")
+            .lines()
+            .map(|row| {
+                let parsed: WindowRow = serde_json::from_str(row)
+                    .unwrap_or_else(|e| panic!("parsing window3-go row {row:?}: {e}"));
+                (parsed.saw, parsed.first, parsed.last)
+            })
+            .collect();
+        assert_eq!(
+            calls, expected,
+            "{count} frames through a window of three striding one"
+        );
+    }
+}
+
+/// What `--shape` says of a Go node with no params and its picture bound.
+fn go_shape(module: &std::path::Path) -> serde_json::Value {
+    let out = Command::new(env!("CARGO_BIN_EXE_ffrwd-wasm"))
+        .arg("--shape")
+        .arg(module)
+        .args(["--params", "{}", "--bound", "v"])
+        .output()
+        .expect("spawn ffrwd-wasm --shape");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).expect("the shape is JSON")
+}
+
+/// A Go invert-go described and shaped: a node of its own name reading one
+/// rgba picture as its clock, window 1, and writing one like it.
+fn check_invert_go_description(module: &std::path::Path) {
+    let parsed = describe(module);
+    assert_eq!(parsed.world, "node-module");
+    assert_eq!(
+        parsed.name,
+        Some("invert-go".to_string()),
+        "a module names itself, and this one is not the Rust invert"
+    );
+    let shape = go_shape(module);
+    assert_eq!(shape["clock"]["port"], "v");
+    assert_eq!(
+        shape["inputs"][0]["accepts"]["pixel_formats"],
+        serde_json::json!(["rgba"])
+    );
+    assert_eq!(
+        shape["inputs"][0]["window"], 1,
+        "a per-frame filter is window 1"
+    );
+    assert_eq!(shape["inputs"][0]["stride"], 1);
+    assert_eq!(shape["outputs"][0]["format"]["kind"], "like");
+    assert_eq!(shape["pure"], true);
 }
 
 #[test]
@@ -3523,7 +3649,7 @@ fn a_go_module_inverts_the_frames_the_rust_one_inverts() {
     let frames: Vec<Vec<u8>> = (0..3u8).map(synthetic_frame).collect();
     let wire = nut_stream(&frames);
 
-    let go = run_go_filter("invert_go", &[], &wire);
+    let go = run_go_filter("invert_go", &wire);
     assert_run_ok(&go, "invert-go");
 
     // What inverting is, said again here rather than read off either module:
@@ -3554,13 +3680,13 @@ fn a_go_module_inverts_the_frames_the_rust_one_inverts() {
         }
     }
 
-    // And the whole wire matches the Rust module's, so the two agree on the
-    // stream header and the timestamps as well as the pixels.
+    // And the frames match the Rust module's, timestamps and pixels both.
     let rust = run_filter(&module_path("invert"), &[], &wire);
     assert_run_ok(&rust, "invert");
     assert_eq!(
-        go.stdout, rust.stdout,
-        "the Go module's output must be byte-identical to the Rust one's"
+        go.frames(),
+        rust.frames(),
+        "the Go node's frames must be the Rust module's"
     );
 }
 
@@ -3569,27 +3695,7 @@ fn describe_reads_a_go_module_like_any_other() {
     if !go_modules_built() {
         return;
     }
-    let parsed = describe(&go_module_path("invert_go"));
-    assert_eq!(parsed.world, "ffrwd:av@0.11.0");
-    assert_eq!(
-        parsed.name,
-        Some("invert-go".to_string()),
-        "a module names itself, and this one is not the Rust invert"
-    );
-    assert_eq!(parsed.pixel_formats, Some(vec!["rgba".to_string()]));
-    assert_eq!(parsed.window, Some(1), "a per-frame filter is window 1");
-    assert_eq!(parsed.stride, Some(1));
-    assert_eq!(parsed.inputs, 1, "invert-go reads one stream");
-    assert_eq!(parsed.rows_schema, None, "invert-go emits no rows");
-}
-
-/// One row as window3-go reports a call: the frames it saw and the
-/// timestamps at the two ends of that window.
-#[derive(serde::Deserialize)]
-struct WindowRow {
-    saw: usize,
-    first: i64,
-    last: i64,
+    check_invert_go_description(&go_module_path("invert_go"));
 }
 
 #[test]
@@ -3597,46 +3703,7 @@ fn a_go_module_is_driven_with_a_window_wider_than_its_stride() {
     if !go_modules_built() {
         return;
     }
-    // window3-go declares window 3, stride 1: a call sees three frames and
-    // consumes the oldest, so a stream of N frames makes N-2 full calls, each
-    // spanning two steps, and a final call holding the two the strides left.
-    // Two frames is the short stream that never fills a window at all: no
-    // full call happens, and the final one carries the whole stream.
-    for count in [6usize, 2] {
-        let frames: Vec<Vec<u8>> = (0..count).map(|i| synthetic_frame(i as u8)).collect();
-        let run = run_go_filter("window3_go", &["-annotations", "out"], &nut_stream(&frames));
-        assert_run_ok(&run, &format!("window3-go over {count} frames"));
-
-        let got = annotated_frames(&run.stdout);
-        assert_eq!(got.len(), count, "every frame passes through, once");
-        for (i, (pts, data, _)) in got.iter().enumerate() {
-            assert_eq!(*pts, i as i64 * PTS_STEP, "frame {i} timestamp");
-            assert_eq!(data, &frames[i], "frame {i} passes through untouched");
-        }
-
-        let mut expected: Vec<(usize, i64, i64)> = (0..count.saturating_sub(2))
-            .map(|i| (3, i as i64 * PTS_STEP, (i + 2) as i64 * PTS_STEP))
-            .collect();
-        let tail = count.min(2);
-        if tail > 0 {
-            let first = (count - tail) as i64 * PTS_STEP;
-            expected.push((tail, first, (count - 1) as i64 * PTS_STEP));
-        }
-
-        let calls: Vec<(usize, i64, i64)> = got
-            .iter()
-            .flat_map(|(_, _, rows)| rows.iter())
-            .map(|row| {
-                let parsed: WindowRow = serde_json::from_str(row)
-                    .unwrap_or_else(|e| panic!("parsing window3-go row {row:?}: {e}"));
-                (parsed.saw, parsed.first, parsed.last)
-            })
-            .collect();
-        assert_eq!(
-            calls, expected,
-            "{count} frames through a window of three striding one"
-        );
-    }
+    check_window3(&go_module_path("window3_go"), "window3-go");
 }
 
 #[test]
@@ -3670,7 +3737,7 @@ fn a_go_module_holds_up_at_a_real_frame_size() {
         muxer.finish().expect("finish the NUT stream");
     }
 
-    let go = run_go_filter("invert_go", &[], &wire);
+    let go = run_go_filter("invert_go", &wire);
     assert_run_ok(&go, "invert-go on 320x240");
 
     let got = go.frames();
@@ -3693,8 +3760,9 @@ fn a_go_module_holds_up_at_a_real_frame_size() {
     let rust = run_filter(&module_path("invert"), &[], &wire);
     assert_run_ok(&rust, "invert on 320x240");
     assert_eq!(
-        go.stdout, rust.stdout,
-        "the two modules agree on a real frame as well as a small one"
+        go.frames(),
+        rust.frames(),
+        "the two agree on a real frame as well as a small one"
     );
 }
 
@@ -3743,15 +3811,10 @@ fn go_big_modules_built() -> bool {
     })
 }
 
-/// Runs `ffrwd-wasm` on a componentize-go module, the way `run_go_filter`
+/// Runs `ffrwd-wasm` on a componentize-go node, the way `run_go_filter`
 /// runs a TinyGo one.
-fn run_go_big_filter(name: &str, module_args: &[&str], stdin_bytes: &[u8]) -> FfrwdWasmRun {
-    let module_str = go_big_module_path(name);
-    let module_str = module_str.to_str().expect("module path is valid UTF-8");
-    let mut args: Vec<&str> = vec!["-f", "nut", "-i", "-", "-m", module_str];
-    args.extend_from_slice(module_args);
-    args.extend_from_slice(&["-f", "nut", "-"]);
-    run_ffrwd_wasm(&args, stdin_bytes)
+fn run_go_big_filter(name: &str, stdin_bytes: &[u8]) -> FfrwdWasmRun {
+    run_go_node(&go_big_module_path(name), stdin_bytes)
 }
 
 #[test]
@@ -3762,7 +3825,7 @@ fn a_componentize_go_module_inverts_the_frames_the_rust_one_inverts() {
     let frames: Vec<Vec<u8>> = (0..3u8).map(synthetic_frame).collect();
     let wire = nut_stream(&frames);
 
-    let go = run_go_big_filter("invert_go", &[], &wire);
+    let go = run_go_big_filter("invert_go", &wire);
     assert_run_ok(&go, "invert-go/componentize-go");
 
     let got = go.frames();
@@ -3784,8 +3847,9 @@ fn a_componentize_go_module_inverts_the_frames_the_rust_one_inverts() {
     let rust = run_filter(&module_path("invert"), &[], &wire);
     assert_run_ok(&rust, "invert");
     assert_eq!(
-        go.stdout, rust.stdout,
-        "the componentize-go module's output must be byte-identical to the Rust one's"
+        go.frames(),
+        rust.frames(),
+        "the componentize-go node's frames must be the Rust module's"
     );
 }
 
@@ -3794,14 +3858,7 @@ fn describe_reads_a_componentize_go_module_like_any_other() {
     if !go_big_modules_built() {
         return;
     }
-    let parsed = describe(&go_big_module_path("invert_go"));
-    assert_eq!(parsed.world, "ffrwd:av@0.11.0");
-    assert_eq!(parsed.name, Some("invert-go".to_string()));
-    assert_eq!(parsed.pixel_formats, Some(vec!["rgba".to_string()]));
-    assert_eq!(parsed.window, Some(1));
-    assert_eq!(parsed.stride, Some(1));
-    assert_eq!(parsed.inputs, 1);
-    assert_eq!(parsed.rows_schema, None);
+    check_invert_go_description(&go_big_module_path("invert_go"));
 }
 
 #[test]
@@ -3809,48 +3866,10 @@ fn a_componentize_go_modules_window_survives_the_same_road() {
     if !go_big_modules_built() {
         return;
     }
-    // window3-go's overlapping window - the shape no module in the Rust
-    // fleet declares - re-verified on the componentize-go road: window 3,
-    // stride 1, so N frames make N-2 full calls plus a final call holding
-    // the two the strides left.
-    for count in [6usize, 2] {
-        let frames: Vec<Vec<u8>> = (0..count).map(|i| synthetic_frame(i as u8)).collect();
-        let run = run_go_big_filter("window3_go", &["-annotations", "out"], &nut_stream(&frames));
-        assert_run_ok(
-            &run,
-            &format!("window3-go/componentize-go over {count} frames"),
-        );
-
-        let got = annotated_frames(&run.stdout);
-        assert_eq!(got.len(), count, "every frame passes through, once");
-        for (i, (pts, data, _)) in got.iter().enumerate() {
-            assert_eq!(*pts, i as i64 * PTS_STEP, "frame {i} timestamp");
-            assert_eq!(data, &frames[i], "frame {i} passes through untouched");
-        }
-
-        let mut expected: Vec<(usize, i64, i64)> = (0..count.saturating_sub(2))
-            .map(|i| (3, i as i64 * PTS_STEP, (i + 2) as i64 * PTS_STEP))
-            .collect();
-        let tail = count.min(2);
-        if tail > 0 {
-            let first = (count - tail) as i64 * PTS_STEP;
-            expected.push((tail, first, (count - 1) as i64 * PTS_STEP));
-        }
-
-        let calls: Vec<(usize, i64, i64)> = got
-            .iter()
-            .flat_map(|(_, _, rows)| rows.iter())
-            .map(|row| {
-                let parsed: WindowRow = serde_json::from_str(row)
-                    .unwrap_or_else(|e| panic!("parsing window3-go row {row:?}: {e}"));
-                (parsed.saw, parsed.first, parsed.last)
-            })
-            .collect();
-        assert_eq!(
-            calls, expected,
-            "{count} frames through a window of three striding one, on the componentize-go road"
-        );
-    }
+    check_window3(
+        &go_big_module_path("window3_go"),
+        "window3-go/componentize-go",
+    );
 }
 
 #[test]
@@ -3893,8 +3912,19 @@ fn stream_invert_endurance(
         .to_str()
         .expect("module path is valid UTF-8")
         .to_string();
+    let node = module
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| stem.ends_with("_go"));
+    let args: Vec<String> = if node {
+        go_node_args(module, None)
+    } else {
+        ["-f", "nut", "-i", "-", "-m", &module_str, "-f", "nut", "-"]
+            .map(String::from)
+            .to_vec()
+    };
     let mut child = Command::new(exe)
-        .args(["-f", "nut", "-i", "-", "-m", &module_str, "-f", "nut", "-"])
+        .args(&args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

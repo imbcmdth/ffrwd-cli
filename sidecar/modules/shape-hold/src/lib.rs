@@ -148,6 +148,10 @@ struct Params {
     pick: usize,
     #[serde(default)]
     frames: Option<i64>,
+    /// The ports the pictures arrive on instead of being bound, one feed
+    /// each; they are conformed to the picture `c`, which is then the clock.
+    #[serde(default)]
+    ports: Option<serde_json::Value>,
 }
 
 fn ten() -> i32 {
@@ -162,11 +166,12 @@ impl Default for Params {
             height: 4,
             pick: 0,
             frames: None,
+            ports: None,
         }
     }
 }
 
-const SCHEMA: &str = r#"{"type":"object","properties":{"fps":{"type":"integer"},"width":{"type":"integer"},"height":{"type":"integer"},"pick":{"type":"integer"},"frames":{"type":"integer"}}}"#;
+const SCHEMA: &str = r#"{"type":"object","properties":{"fps":{"type":"integer"},"width":{"type":"integer"},"height":{"type":"integer"},"pick":{"type":"integer"},"frames":{"type":"integer"},"ports":{"type":["array","integer"],"items":{"type":"integer"}}}}"#;
 
 struct State {
     params: Params,
@@ -188,13 +193,20 @@ fn node_shape(params: &Params, bound: &[String]) -> NodeShape {
             linger: None,
             timeout: None,
             group: None,
-            port_param: None,
+            port_param: params.ports.as_ref().map(|_| "ports".to_string()),
         }),
         RowsUse::Ignore,
     );
     v.required = false;
     v.many = true;
     v.accepts.pixel_formats = vec!["rgba".to_string()];
+    let mut inputs = vec![v];
+    if params.ports.is_some() {
+        inputs[0].accepts.like = Some("c".to_string());
+        let mut c = input("c", PortKind::Video, Pairing::Lockstep, RowsUse::Ignore);
+        c.accepts.pixel_formats = vec!["rgba".to_string()];
+        inputs.push(c);
+    }
     let out = output(
         "out",
         PortKind::Video,
@@ -205,12 +217,14 @@ fn node_shape(params: &Params, bound: &[String]) -> NodeShape {
             color: None,
         })),
     );
-    let clock = if bound.iter().any(|b| b == "v") {
+    let clock = if bound.iter().any(|b| b == "c") {
+        Clock::Input("c".to_string())
+    } else if bound.iter().any(|b| b == "v") {
         Clock::RateOf("v".to_string())
     } else {
         Clock::Rate(rate(params.fps))
     };
-    shape(vec![v], vec![out], clock, true)
+    shape(inputs, vec![out], clock, true)
 }
 
 struct Node;

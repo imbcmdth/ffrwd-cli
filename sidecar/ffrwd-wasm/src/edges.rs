@@ -10,16 +10,17 @@
 
 use std::collections::VecDeque;
 use std::io::{self, BufReader, BufWriter, Read, Write};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread;
 
 use anyhow::{anyhow, bail, Context, Result};
 use ffrwd_wasm::nut::{self, Event, Limits, PushDemuxer};
-use ffrwd_wasm_runtime::runtime::{Message, Packet, TimeBase};
+use ffrwd_wasm_runtime::runtime::{self, Message, Packet, TimeBase};
 
 use crate::heartbeat::{self, Beats};
 use crate::tick::compare;
-use crate::{open_input, open_output, subtitles, InputPath, InputReader, OutputPath};
+use crate::{open_input, open_output, subtitles, InputPath, InputReader, OutputPath, OutputWriter};
 
 /// One input with its headers read and its frames still to come.
 pub struct Opened {
@@ -125,11 +126,17 @@ pub enum Out {
     Frame {
         pts: i64,
         data: Arc<Vec<u8>>,
+        /// The rows riding it, between older modules.
+        rows: Vec<String>,
     },
     Packet(Packet),
     Message(Message),
     /// Nothing more on the stream before this pts.
     Progress(i64),
+    /// Everything one call of an older module made has been handed over.
+    Batch,
+    /// An older module's rows with no frame to ride, before its end.
+    Trailing(Vec<String>),
     End,
 }
 
@@ -137,8 +144,9 @@ pub enum Out {
 pub enum Target {
     /// One NUT, a stream per label in the order they were mapped.
     Nut(Vec<nut::Stream>),
-    /// One data label, a message per line.
-    Ndjson,
+    /// One data label, a message per line, stamped with its time in the
+    /// label's time base where it has one.
+    Ndjson(Option<TimeBase>),
     /// One data label of cues, written whole once it ends.
     Subtitles(subtitles::Format),
     Null,
@@ -204,6 +212,32 @@ impl Writer {
     }
 }
 
+/// What the writers of one run share about its end: how many are still
+/// writing, and whether the run has anything left to make.
+#[derive(Default)]
+pub struct Ending {
+    writing: AtomicUsize,
+    over: OnceLock<Arc<dyn Fn() -> bool + Send + Sync>>,
+}
+
+impl Ending {
+    /// Says how to ask whether the run has anything left to make.
+    pub fn set_over(&self, over: Arc<dyn Fn() -> bool + Send + Sync>) {
+        let _ = self.over.set(over);
+    }
+
+    fn over(&self) -> bool {
+        self.over.get().is_some_and(|over| over())
+    }
+}
+
+/// The last output a run finishes, left open for the process's exit to
+/// close: its reader sees the end only once the process is going, never
+/// while it tears its modules down. Any earlier one closes as it finishes,
+/// since a reader of two outputs may need the first one's end to take the
+/// rest of the second.
+static PARKED: Mutex<Vec<OutputWriter>> = Mutex::new(Vec::new());
+
 /// Starts the thread that writes `target` to `path`. `wake` is called each
 /// time something leaves the queue, without the queue's lock held.
 pub fn spawn_writer(
@@ -211,14 +245,22 @@ pub fn spawn_writer(
     spelling: String,
     target: Target,
     wake: Arc<dyn Fn() + Send + Sync>,
+    ending: Arc<Ending>,
 ) -> Writer {
     let queue = Arc::new(Queue {
         state: Mutex::new(QueueState::default()),
         ready: Condvar::new(),
     });
     let shared = Arc::clone(&queue);
+    ending.writing.fetch_add(1, Ordering::SeqCst);
     let handle = thread::spawn(move || {
         let result = write_all(&path, target, &shared, &*wake);
+        let last = ending.writing.fetch_sub(1, Ordering::SeqCst) == 1;
+        let result = result.map(|out| {
+            if last && ending.over() {
+                PARKED.lock().unwrap_or_else(|e| e.into_inner()).push(out);
+            }
+        });
         {
             let mut state = shared.lock();
             match result {
@@ -263,16 +305,37 @@ fn next(queue: &Queue, wake: &dyn Fn()) -> Option<(usize, Out)> {
     item
 }
 
-fn write_all(path: &OutputPath, target: Target, queue: &Queue, wake: &dyn Fn()) -> Result<()> {
+/// Writes everything `target` is handed and hands back the output, flushed
+/// and still open.
+fn write_all(
+    path: &OutputPath,
+    target: Target,
+    queue: &Queue,
+    wake: &dyn Fn(),
+) -> Result<OutputWriter> {
     let writer = BufWriter::with_capacity(1 << 20, open_output(path)?);
     match target {
-        Target::Nut(streams) => write_nut(writer, streams, queue, wake),
-        Target::Ndjson => {
+        Target::Nut(streams) => {
+            let live = crate::output_is_pipe(path);
+            let writer = write_nut(writer, streams, live, queue, wake)?;
+            Ok(writer.into_inner().map_err(|e| e.into_error())?)
+        }
+        Target::Ndjson(base) => {
             let mut writer = writer;
             while let Some((_, out)) = next(queue, wake) {
                 match out {
                     Out::Message(m) => {
-                        writer.write_all(&m.data)?;
+                        match base {
+                            Some(base) => {
+                                let base = nut::TimeBase {
+                                    num: base.num,
+                                    den: base.den,
+                                };
+                                let row = String::from_utf8_lossy(&m.data);
+                                writer.write_all(crate::stamp_row(&row, m.pts, base).as_bytes())?;
+                            }
+                            None => writer.write_all(&m.data)?,
+                        }
                         writer.write_all(b"\n")?;
                         writer.flush()?;
                     }
@@ -280,8 +343,7 @@ fn write_all(path: &OutputPath, target: Target, queue: &Queue, wake: &dyn Fn()) 
                     _ => {}
                 }
             }
-            writer.flush()?;
-            Ok(())
+            Ok(writer.into_inner().map_err(|e| e.into_error())?)
         }
         Target::Subtitles(format) => {
             let mut document = subtitles::Document::new(format);
@@ -296,8 +358,7 @@ fn write_all(path: &OutputPath, target: Target, queue: &Queue, wake: &dyn Fn()) 
             }
             let mut writer = writer;
             writer.write_all(document.render().as_bytes())?;
-            writer.flush()?;
-            Ok(())
+            Ok(writer.into_inner().map_err(|e| e.into_error())?)
         }
         Target::Null => {
             while let Some((_, out)) = next(queue, wake) {
@@ -305,7 +366,7 @@ fn write_all(path: &OutputPath, target: Target, queue: &Queue, wake: &dyn Fn()) 
                     break;
                 }
             }
-            Ok(())
+            Ok(writer.into_inner().map_err(|e| e.into_error())?)
         }
     }
 }
@@ -328,16 +389,20 @@ fn time_of(out: &Out) -> Option<i64> {
         Out::Packet(p) => Some(p.dts.unwrap_or(p.pts)),
         Out::Message(m) => Some(m.pts),
         Out::Progress(p) => Some(*p),
-        Out::End => None,
+        Out::Batch | Out::Trailing(_) | Out::End => None,
     }
 }
 
+/// `live` where something reads the output as it is written, which is who
+/// a data stream's heartbeats are for; a file is read once it is whole, and
+/// carries the messages alone.
 fn write_nut<W: Write>(
     writer: W,
     streams: Vec<nut::Stream>,
+    live: bool,
     queue: &Queue,
     wake: &dyn Fn(),
-) -> Result<()> {
+) -> Result<W> {
     let mut tracks: Vec<Track> = streams
         .iter()
         .map(|s| Track {
@@ -368,6 +433,7 @@ fn write_nut<W: Write>(
         }
         match out {
             Out::End => track.ended = true,
+            Out::Batch | Out::Trailing(_) => {}
             out => track.held.push_back(out),
         }
         while let Some(index) = writable(&tracks) {
@@ -375,11 +441,11 @@ fn write_nut<W: Write>(
                 .held
                 .pop_front()
                 .expect("writable has one held");
-            write_one(&mut muxer, index, &mut tracks[index], out)?;
+            write_one(&mut muxer, index, &mut tracks[index], out, live)?;
         }
     }
     muxer.finish()?;
-    Ok(())
+    Ok(muxer.into_inner())
 }
 
 /// The stream whose held item is next in time across every stream, once no
@@ -421,9 +487,10 @@ fn write_one<W: Write>(
     index: usize,
     track: &mut Track,
     out: Out,
+    live: bool,
 ) -> Result<()> {
     match out {
-        Out::Frame { pts, data } => {
+        Out::Frame { pts, data, .. } => {
             if track.coded {
                 bail!("a frame reached output stream {index}, which carries coded packets");
             }
@@ -449,6 +516,7 @@ fn write_one<W: Write>(
             };
             muxer.write_coded_to(index, &framed, &message.data)?;
         }
+        Out::Progress(_) if !live => return Ok(()),
         Out::Progress(pts) => {
             let base = track.base;
             if let Some(due) = track.beats.as_mut().and_then(|b| b.due(pts, base)) {
@@ -462,8 +530,53 @@ fn write_one<W: Write>(
                 return Ok(());
             }
         }
-        Out::End => return Ok(()),
+        Out::Batch | Out::Trailing(_) | Out::End => return Ok(()),
     }
     muxer.flush()?;
     Ok(())
+}
+
+/// Starts the thread that hands one older module's output to `sink`, a call
+/// at a time, as that world's host wrote it: the call's frames, then its
+/// rows with no frame to ride, then the end.
+pub fn spawn_sink(
+    mut sink: crate::Sink,
+    module: String,
+    wake: Arc<dyn Fn() + Send + Sync>,
+) -> Writer {
+    let queue = Arc::new(Queue {
+        state: Mutex::new(QueueState::default()),
+        ready: Condvar::new(),
+    });
+    let shared = Arc::clone(&queue);
+    let handle = thread::spawn(move || {
+        let mut batch: Vec<runtime::Frame> = Vec::new();
+        let result = (|| -> Result<()> {
+            while let Some((_, out)) = next(&shared, &*wake) {
+                match out {
+                    Out::Frame { pts, data, rows } => {
+                        batch.push(runtime::Frame { pts, data, rows })
+                    }
+                    Out::Batch => sink.write(&module, &std::mem::take(&mut batch))?,
+                    Out::Trailing(rows) => sink.write_trailing(&rows)?,
+                    Out::End => return sink.finish(),
+                    _ => {}
+                }
+            }
+            Ok(())
+        })();
+        {
+            let mut state = shared.lock();
+            match result {
+                Ok(()) => state.done = true,
+                Err(e) => state.failed = Some(format!("{e:#}")),
+            }
+            state.items.clear();
+        }
+        wake();
+    });
+    Writer {
+        queue,
+        handle: Some(handle),
+    }
 }

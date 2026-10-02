@@ -494,7 +494,7 @@ impl WitNode {
                             data: Arc::new(f.data),
                             rows: Vec::new(),
                         }),
-                        f.pts,
+                        Some(f.pts),
                     )
                 }
                 wit::Payload::Same(same) => {
@@ -507,7 +507,7 @@ impl WitNode {
                             data,
                             rows: Vec::new(),
                         }),
-                        same.pts,
+                        Some(same.pts),
                     )
                 }
                 wit::Payload::Message(m) => {
@@ -523,7 +523,7 @@ impl WitNode {
                             pts: m.pts,
                             data: m.data,
                         }),
-                        m.pts,
+                        Some(m.pts),
                     )
                 }
                 wit::Payload::Packet(p) => {
@@ -534,7 +534,6 @@ impl WitNode {
                         "a packet",
                         kind == PortKind::Packets,
                     )?;
-                    let time = p.dts.unwrap_or(p.pts);
                     (
                         Payload::Packet(super::Packet {
                             pts: p.pts,
@@ -543,19 +542,21 @@ impl WitNode {
                             keyframe: p.keyframe,
                             data: p.data,
                         }),
-                        time,
+                        p.dts,
                     )
                 }
             };
-            if let Some(before) = self.last[port] {
-                if time < before {
-                    bail!(
-                        "{name} emitted on '{}' at {time} after {before}; a port never steps back",
-                        emission.port
-                    );
+            if let Some(time) = time {
+                if let Some(before) = self.last[port] {
+                    if time < before {
+                        bail!(
+                            "{name} emitted on '{}' at {time} after {before}; a port never steps                              back",
+                            emission.port
+                        );
+                    }
                 }
+                self.last[port] = Some(time);
             }
-            self.last[port] = Some(time);
             items.push(Emission { port, payload });
         }
         Ok(Emitted {

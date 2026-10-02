@@ -25,7 +25,13 @@ use std::time::{Duration, Instant};
 use ffrwd_wasm::nut::{self, Event, Limits, Muxer, PushDemuxer, Stream, TimeBase};
 use serde_json::Value;
 
-const MODULES: &[&str] = &["shape-switch", "inset", "shape-state", "shape-window"];
+const MODULES: &[&str] = &[
+    "shape-switch",
+    "inset",
+    "shape-state",
+    "shape-window",
+    "shape-hold",
+];
 
 const RATE: u32 = 48_000;
 
@@ -581,11 +587,24 @@ struct Run {
 }
 
 fn start(test: &str, program: &Program, jobs: &str, modules: &[&str], chain: &str) -> (Run, u16) {
+    start_padded(test, program, jobs, modules, chain, &[])
+}
+
+/// `start`, with `pad` after the programme's `-i`.
+fn start_padded(
+    test: &str,
+    program: &Program,
+    jobs: &str,
+    modules: &[&str],
+    chain: &str,
+    pad: &[&str],
+) -> (Run, u16) {
     let dir = scratch(test);
     let port = free_port();
     let chain = chain.replace("{port}", &port.to_string());
     let mut command = Command::new(env!("CARGO_BIN_EXE_ffrwd-wasm"));
     command.args(["-jobs", jobs, "-f", "nut", "-i", "pipe:0"]);
+    command.args(pad);
     for name in modules {
         command.arg("-m").arg(module(name));
     }
@@ -1098,6 +1117,86 @@ fn a_feeder_at_another_size_and_format_is_conformed_to_the_port() {
 }
 
 #[test]
+fn an_rgba_feed_into_an_rgba_programme_needs_no_matrix() {
+    let _serial = serial();
+    // The compiler names an rgba picture's matrix `gbr`, which converts no
+    // yuv; between two rgba pictures nothing is converted at all.
+    let program = Program::new(30, 6.0);
+    let pad =
+        r#"{"color": {"range": "pc", "primaries": "unknown", "trc": "unknown", "space": "gbr"}}"#;
+    let (mut run, port) = start_padded(
+        "rgba-gbr",
+        &program,
+        "1",
+        &["shape_switch"],
+        SWITCH,
+        &["-pad", pad],
+    );
+    wait_for_port(&mut run, port);
+    let mut feeder = Feeder::new(25, 2.0);
+    feeder.width = 64;
+    feeder.height = 48;
+    let fed = feed(port, feeder, Duration::from_secs(2));
+    let out = finish(run);
+    fed.join().expect("the feeder");
+    assert!(
+        out.stderr.contains("conformed to 32x24 rgba"),
+        "{}",
+        out.stderr
+    );
+    let insertions = out.insertions();
+    assert_eq!(
+        insertions.len(),
+        1,
+        "{insertions:?}
+{}",
+        out.stderr
+    );
+}
+
+#[test]
+fn a_many_hold_port_listens_on_every_port_its_list_names() {
+    let _serial = serial();
+    let program = Program::new(30, 5.0);
+    let (first, second) = (free_port(), free_port());
+    let dir = scratch("port-list-params");
+    let params = dir.join("params.json");
+    fs::write(
+        &params,
+        format!(r#"{{"width":32,"height":24,"pick":1,"ports":[{first},{second}]}}"#),
+    )
+    .expect("write the params");
+    let from = format!("shape_hold={}", params.display());
+    let (mut run, _) = start_padded(
+        "port-list",
+        &program,
+        "1",
+        &["shape_hold"],
+        "[c=0:v]shape_hold[out=o]",
+        &["-params-from", &from],
+    );
+    wait_for_port(&mut run, first);
+    wait_for_port(&mut run, second);
+    let fed = feed(second, Feeder::new(25, 2.0), Duration::from_secs(1));
+    let out = finish(run);
+    fed.join().expect("the feeder");
+    for port in [first, second] {
+        assert!(
+            out.stderr.contains(&format!("listens on 127.0.0.1:{port}")),
+            "{}",
+            out.stderr
+        );
+    }
+    assert!(
+        !out.feed_frames().is_empty(),
+        "the second port's feed is shown
+{}",
+        out.stderr
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn a_second_feeder_is_refused_and_a_silent_one_is_replaced() {
     let _serial = serial();
     let program = Program::new(30, 8.0);
@@ -1172,6 +1271,61 @@ fn a_feed_that_reconnects_within_one_tick_is_two_ticks_apart() {
         "a tick between them {insertions:?}"
     );
     assert_eq!(out.feed_rows("end").len(), 2, "{:?}", out.feeds);
+}
+
+#[test]
+fn the_feed_port_listens_before_the_programme_has_sent_a_byte() {
+    let _serial = serial();
+    // What writes the programme here waits for the feed's port to accept, as
+    // a lateral's writer waits for the switch it feeds, so the port has to
+    // listen before the host has read a byte of its inputs.
+    let program = Program::new(30, 1.0);
+    let dir = scratch("listens-first");
+    let port = free_port();
+    let out = dir.join("out.nut").display().to_string();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ffrwd-wasm"))
+        .args(["-f", "nut", "-i", "pipe:0", "-m", &module("shape_switch")])
+        .args([
+            "-filter_complex",
+            &format!("[v=0:v][a=0:a]shape_switch=port={port}[v=o]"),
+            "-map",
+            "[o]",
+            "-f",
+            "nut",
+            &out,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ffrwd-wasm");
+    let stdin = child.stdin.take().expect("stdin");
+    let writer = {
+        let program = program.clone();
+        thread::spawn(move || {
+            let until = Instant::now() + Duration::from_secs(20);
+            while TcpStream::connect((Ipv4Addr::LOCALHOST, port)).is_err() {
+                if Instant::now() > until {
+                    return false;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            program.pace(stdin, Instant::now());
+            true
+        })
+    };
+    let listened = writer.join().expect("the writer finished");
+    let finished = child.wait_with_output().expect("wait for ffrwd-wasm");
+    let stderr = String::from_utf8_lossy(&finished.stderr).into_owned();
+    assert!(
+        listened,
+        "nothing listened on {port} before the programme came:
+{stderr}"
+    );
+    assert!(finished.status.success(), "{stderr}");
+    let written = read_output(&dir, stderr);
+    assert_eq!(written.frames.len() as i64, program.frames());
+    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]

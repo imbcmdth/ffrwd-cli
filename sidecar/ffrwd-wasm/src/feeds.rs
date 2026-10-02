@@ -72,9 +72,10 @@ struct Picture {
     width: u32,
     height: u32,
     pix_fmt: &'static str,
-    colour: Colour,
+    /// The matrix each yuv side is converted in; an rgba side has none.
+    colour: Option<Colour>,
     to: VideoFormat,
-    to_colour: Colour,
+    to_colour: Option<Colour>,
 }
 
 impl Picture {
@@ -94,7 +95,10 @@ impl Picture {
             _ => {
                 let mut rgba = vec![0u8; w * h * 4];
                 let frame = yuv::Yuv420p::new(data, w, h).map_err(|e| anyhow!(e))?;
-                yuv::to_rgba(&frame, self.colour, &mut rgba).map_err(|e| anyhow!(e))?;
+                let colour = self
+                    .colour
+                    .ok_or_else(|| anyhow!("a yuv picture has no matrix"))?;
+                yuv::to_rgba(&frame, colour, &mut rgba).map_err(|e| anyhow!(e))?;
                 rgba
             }
         };
@@ -109,7 +113,10 @@ impl Picture {
             _ => {
                 let mut out = vec![0u8; yuv::Yuv420p::size(tw, th)];
                 let frame = Rgba::new(&rgba, tw, th).map_err(|e| anyhow!(e))?;
-                yuv::from_rgba(&frame, self.to_colour, &mut out).map_err(|e| anyhow!(e))?;
+                let colour = self
+                    .to_colour
+                    .ok_or_else(|| anyhow!("a yuv picture has no matrix"))?;
+                yuv::from_rgba(&frame, colour, &mut out).map_err(|e| anyhow!(e))?;
                 Ok(out)
             }
         }
@@ -278,9 +285,13 @@ fn match_streams(spec: &FeedSpec, conn: &mut Conn, report: &mut dyn FnMut(String
                     width,
                     height,
                     pix_fmt,
-                    colour: frame_colour(&stream.media)?,
+                    colour: (pix_fmt != "rgba")
+                        .then(|| frame_colour(&stream.media))
+                        .transpose()?,
                     to: *to,
-                    to_colour: port_colour(to.color.as_ref())?,
+                    to_colour: (to.pix_fmt != "rgba")
+                        .then(|| port_colour(to.color.as_ref()))
+                        .transpose()?,
                 };
                 if !picture.same() {
                     report(format!(
@@ -429,24 +440,32 @@ fn is_timeout(e: &io::Error) -> bool {
 /// How long a port still held by the last run's connections is tried for.
 const BIND_WAIT: Duration = Duration::from_secs(2);
 
-/// Serves `spec` until the run stops.
-pub fn serve(spec: FeedSpec, scheduler: Arc<Scheduler>) -> Result<()> {
-    let address = SocketAddr::from((Ipv4Addr::LOCALHOST, spec.port));
+/// Binds the loopback port a feed is served on, trying for a while where
+/// the last run's connections still hold it.
+pub fn bind(port: u16) -> std::io::Result<TcpListener> {
+    let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
     let until = Instant::now() + BIND_WAIT;
-    let listener = loop {
+    loop {
         match TcpListener::bind(address) {
-            Ok(listener) => break listener,
-            Err(_) if Instant::now() < until && !scheduler.stopped() => thread::sleep(POLL),
-            Err(e) => {
-                return Err(e).with_context(|| {
-                    format!(
-                        "feed: {}: 127.0.0.1:{} cannot be bound",
-                        spec.names(),
-                        spec.port
-                    )
-                })
-            }
+            Ok(listener) => return Ok(listener),
+            Err(_) if Instant::now() < until => thread::sleep(POLL),
+            Err(e) => return Err(e),
         }
+    }
+}
+
+/// Serves `spec` until the run stops, on `bound` where the port was bound
+/// before the run's inputs were read.
+pub fn serve(spec: FeedSpec, bound: Option<TcpListener>, scheduler: Arc<Scheduler>) -> Result<()> {
+    let listener = match bound {
+        Some(listener) => listener,
+        None => bind(spec.port).with_context(|| {
+            format!(
+                "feed: {}: 127.0.0.1:{} cannot be bound",
+                spec.names(),
+                spec.port
+            )
+        })?,
     };
     listener.set_nonblocking(true)?;
     let mut report = |line: String| eprintln!("{line}");

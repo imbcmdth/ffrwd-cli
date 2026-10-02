@@ -29,11 +29,12 @@ use anyhow::{anyhow, bail, Context, Result};
 use ffrwd_wasm_runtime::node::{
     self as model, Emitted, Node, NodeShape, Payload, Tick, TickFrame, TickStream,
 };
-use ffrwd_wasm_runtime::runtime::{Message, TimeBase};
+use ffrwd_wasm_runtime::runtime::{Frame, Message, TimeBase};
 
+use crate::adapters::frames_tick;
 use crate::edges::{Out, Queue};
 use crate::hold::SourceInfo;
-use crate::tick::{Assembler, Item};
+use crate::tick::{Assembler, Item, Lockstep};
 
 /// Opens one more instance of a lane's node.
 pub type Opener = Arc<dyn Fn() -> Result<Box<dyn Node>> + Send + Sync>;
@@ -62,6 +63,14 @@ pub enum Intake {
     /// A host node on a data edge: the messages between two of its
     /// producer's progress marks, as one tick.
     Host { id: u32 },
+    /// An older module in a network of older modules: its calls cut the way
+    /// its world's host cut them, a window as soon as it is whole and a last
+    /// call with what the strides left and the rows no frame carried.
+    Windows {
+        lockstep: Lockstep,
+        /// The stream each pad reads.
+        pads: Vec<u32>,
+    },
 }
 
 /// One node of the network, opened, as the scheduler takes it over.
@@ -91,11 +100,15 @@ pub struct Plan {
     pub lanes: Vec<LaneSpec>,
     pub consumers: HashMap<u32, Vec<Consumer>>,
     pub writers: Vec<Arc<Queue>>,
+    /// Streams bound again under another id, as one node binding one stream
+    /// on two ports needs: everything on the first reaches each of these.
+    pub mirrors: HashMap<u32, Vec<u32>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ClockKind {
     Input,
+    Windows,
     /// A rate clock; whether any stream is bound to the node.
     Rate {
         inputs: bool,
@@ -115,6 +128,12 @@ enum LaneIntake {
     Host {
         id: u32,
         events: VecDeque<HostEvent>,
+    },
+    Windows {
+        lockstep: Lockstep,
+        pads: Vec<u32>,
+        /// The rows with no frame to ride that reached the first pad.
+        trailing: Vec<String>,
     },
 }
 
@@ -175,6 +194,7 @@ struct State {
     lanes: Vec<Lane>,
     consumers: HashMap<u32, Vec<Consumer>>,
     writers: Vec<Arc<Queue>>,
+    mirrors: HashMap<u32, Vec<u32>>,
     error: Option<anyhow::Error>,
     /// Every lane has ended, or every output has stopped taking anything.
     finished: bool,
@@ -199,15 +219,17 @@ impl Shared {
 }
 
 fn clock_kind(shape: &NodeShape, intake: &Intake) -> ClockKind {
-    if matches!(intake, Intake::Host { .. }) {
-        return ClockKind::Host;
+    match intake {
+        Intake::Host { .. } => return ClockKind::Host,
+        Intake::Windows { .. } => return ClockKind::Windows,
+        Intake::Assembled(_) => {}
     }
     match &shape.clock {
         model::Clock::Input(_) => ClockKind::Input,
         model::Clock::Rate(_) | model::Clock::RateOf(_) => ClockKind::Rate {
             inputs: match intake {
                 Intake::Assembled(a) => a.has_inputs(),
-                Intake::Host { .. } => true,
+                Intake::Host { .. } | Intake::Windows { .. } => true,
             },
         },
         model::Clock::SelfClocked => ClockKind::SelfClocked,
@@ -256,8 +278,15 @@ impl State {
         self.consumers.get(&stream).cloned().unwrap_or_default()
     }
 
+    fn mirrors(&self, stream: u32) -> Vec<u32> {
+        self.mirrors.get(&stream).cloned().unwrap_or_default()
+    }
+
     /// One item on `stream`, handed to everything reading it.
     fn arrive(&mut self, stream: u32, item: Item) -> Result<()> {
+        for mirror in self.mirrors(stream) {
+            self.arrive(mirror, item.clone())?;
+        }
         let consumers = self.consumers(stream);
         for consumer in &consumers {
             match *consumer {
@@ -273,6 +302,27 @@ impl State {
                                 events.push_back(HostEvent::Message(m.clone()));
                             }
                         }
+                        LaneIntake::Windows { lockstep, pads, .. } => {
+                            let Item::Frame(f) = &item else { continue };
+                            let frame = Frame {
+                                pts: f.pts,
+                                data: Arc::clone(&f.data),
+                                rows: f.rows.clone(),
+                            };
+                            let count = pads.len();
+                            let mut calls = Vec::new();
+                            for pad in (0..count).filter(|p| pads[*p] == stream) {
+                                calls.extend(lockstep.push(
+                                    pad,
+                                    std::slice::from_ref(&frame),
+                                    &lane.name,
+                                )?);
+                            }
+                            for call in calls {
+                                let tick = frames_tick(&call, &[], false, count, lane.base);
+                                Self::push_task(lane, tick, None);
+                            }
+                        }
                     }
                 }
                 Consumer::Writer(w, s) => self.writers[w].push(s, out_of(&item)),
@@ -282,6 +332,9 @@ impl State {
     }
 
     fn progress(&mut self, stream: u32, pts: i64) -> Result<()> {
+        for mirror in self.mirrors(stream) {
+            self.progress(mirror, pts)?;
+        }
         let consumers = self.consumers(stream);
         for consumer in &consumers {
             match *consumer {
@@ -295,6 +348,7 @@ impl State {
                         LaneIntake::Host { events, .. } => {
                             events.push_back(HostEvent::Progress(pts))
                         }
+                        LaneIntake::Windows { .. } => {}
                     }
                 }
                 Consumer::Writer(w, s) => self.writers[w].push(s, Out::Progress(pts)),
@@ -304,6 +358,9 @@ impl State {
     }
 
     fn end(&mut self, stream: u32) -> Result<()> {
+        for mirror in self.mirrors(stream) {
+            self.end(mirror)?;
+        }
         let consumers = self.consumers(stream);
         for consumer in &consumers {
             match *consumer {
@@ -315,6 +372,23 @@ impl State {
                     match &mut lane.intake {
                         LaneIntake::Assembled(a) => a.end(stream)?,
                         LaneIntake::Host { events, .. } => events.push_back(HostEvent::End),
+                        LaneIntake::Windows {
+                            lockstep,
+                            pads,
+                            trailing,
+                        } => {
+                            let count = pads.len();
+                            let mut last = None;
+                            for pad in (0..count).filter(|p| pads[*p] == stream) {
+                                if let Some(frames) = lockstep.end(pad, &lane.name)? {
+                                    last = Some(frames);
+                                }
+                            }
+                            if let Some(frames) = last {
+                                let tick = frames_tick(&frames, trailing, true, count, lane.base);
+                                Self::push_task(lane, tick, None);
+                            }
+                        }
                     }
                 }
                 Consumer::Writer(w, s) => self.writers[w].push(s, Out::End),
@@ -323,8 +397,31 @@ impl State {
         self.cut_all(&consumers)
     }
 
+    /// Rows with no frame to ride, on `stream` after its last frame: the
+    /// first pad of an older module's lane takes them to its last call.
+    fn trailing(&mut self, stream: u32, rows: &[String]) {
+        for mirror in self.mirrors(stream) {
+            self.trailing(mirror, rows);
+        }
+        for consumer in self.consumers(stream) {
+            match consumer {
+                Consumer::Lane(j) => {
+                    if let LaneIntake::Windows { pads, trailing, .. } = &mut self.lanes[j].intake {
+                        if pads.first() == Some(&stream) {
+                            trailing.extend(rows.iter().cloned());
+                        }
+                    }
+                }
+                Consumer::Writer(w, s) => self.writers[w].push(s, Out::Trailing(rows.to_vec())),
+            }
+        }
+    }
+
     /// A source starts or ends on a port feed's stream.
     fn source(&mut self, stream: u32, source: Option<SourceInfo>) -> Result<()> {
+        for mirror in self.mirrors(stream) {
+            self.source(mirror, source.clone())?;
+        }
         let consumers = self.consumers(stream);
         for consumer in &consumers {
             if let Consumer::Lane(j) = *consumer {
@@ -462,6 +559,7 @@ impl State {
                 let tick = a.next_arrivals(pts, last)?;
                 Self::push_task(lane, tick, None);
             }
+            ClockKind::Windows => {}
             ClockKind::Host => {
                 let LaneIntake::Host { id, events } = &mut lane.intake else {
                     unreachable!("a host node has a host intake")
@@ -525,15 +623,35 @@ impl State {
         } else if lane.idle.is_empty() && !(lane.created < lane.width && lane.opener.is_some()) {
             return false;
         }
+        let source = matches!(lane.clock, ClockKind::Rate { inputs: false });
         let ports = lane.ports.iter().flatten().chain(lane.rows.iter());
         for port in ports {
             if let Some(consumers) = self.consumers.get(&port.out.stream) {
                 if !self.room(consumers) {
                     return false;
                 }
+                // A source has nothing upstream to wait on, so a hold input it
+                // feeds holds it back by its own room, as a socket does.
+                if source
+                    && consumers
+                        .iter()
+                        .any(|c| self.held_full(*c, port.out.stream))
+                {
+                    return false;
+                }
             }
         }
         true
+    }
+
+    fn held_full(&self, consumer: Consumer, stream: u32) -> bool {
+        let Consumer::Lane(j) = consumer else {
+            return false;
+        };
+        match &self.lanes[j].intake {
+            LaneIntake::Assembled(a) => a.held_room(stream) == Some(0),
+            _ => false,
+        }
     }
 
     /// A rate clock's ticks are cut as its queue has room, and a
@@ -637,8 +755,10 @@ impl State {
                 instance,
             } = done;
             let tick_base = lane.base;
+            let windows = matches!(lane.intake, LaneIntake::Windows { .. });
             let mut deliveries: Vec<(u32, Delivery)> = Vec::new();
             let mut rows_out: Vec<(i64, String)> = Vec::new();
+            let mut trailing: Vec<String> = Vec::new();
             for item in emitted.items {
                 let Some(port) = lane.ports.get_mut(item.port).and_then(Option::as_mut) else {
                     if let Payload::Rows(rows) = item.payload {
@@ -671,6 +791,13 @@ impl State {
                     Payload::Packet(p) => {
                         deliveries.push((stream, Delivery::Item(Item::Packet(p))));
                     }
+                    // An older module's rows with no frame to ride leave with
+                    // its last call alone, as its world's host had them.
+                    Payload::Rows(rows) if windows => {
+                        if last {
+                            trailing.extend(rows);
+                        }
+                    }
                     Payload::Rows(rows) => rows_out.extend(rows.into_iter().map(|r| (pts, r))),
                 }
             }
@@ -697,6 +824,14 @@ impl State {
                     if port.sent.is_none_or(|sent| at > sent) {
                         port.sent = Some(at);
                         deliveries.push((port.out.stream, Delivery::Progress(at)));
+                    }
+                }
+            }
+            if windows {
+                for port in lane.ports.iter().flatten() {
+                    deliveries.push((port.out.stream, Delivery::Batch));
+                    if last {
+                        deliveries.push((port.out.stream, Delivery::Trailing(trailing.clone())));
                     }
                 }
             }
@@ -742,6 +877,14 @@ impl State {
                     Delivery::Item(item) => self.arrive(stream, item)?,
                     Delivery::Progress(at) => self.progress(stream, at)?,
                     Delivery::End => self.end(stream)?,
+                    Delivery::Trailing(rows) => self.trailing(stream, &rows),
+                    Delivery::Batch => {
+                        for consumer in self.consumers(stream) {
+                            if let Consumer::Writer(w, s) = consumer {
+                                self.writers[w].push(s, Out::Batch);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -762,6 +905,10 @@ enum Delivery {
     Item(Item),
     Progress(i64),
     End,
+    /// An older module's rows with no frame to ride, before its end.
+    Trailing(Vec<String>),
+    /// The end of what one call of an older module made.
+    Batch,
 }
 
 fn out_of(item: &Item) -> Out {
@@ -769,10 +916,18 @@ fn out_of(item: &Item) -> Out {
         Item::Frame(f) => Out::Frame {
             pts: f.pts,
             data: Arc::clone(&f.data),
+            rows: f.rows.clone(),
         },
         Item::Message(m) => Out::Message(m.clone()),
         Item::Packet(p) => Out::Packet(p.clone()),
     }
+}
+
+/// How many worker threads a run gets: the machine's effective core count,
+/// capped by `-jobs` when it was given. `-jobs 1` is the serial escape hatch.
+pub fn worker_count(jobs: Option<usize>) -> usize {
+    let cores = thread::available_parallelism().map_or(1, |n| n.get());
+    jobs.unwrap_or(cores).min(cores).max(1)
 }
 
 /// The running network: workers spawned, lanes wired, waiting to be fed.
@@ -789,16 +944,20 @@ impl Scheduler {
             lanes: specs,
             consumers,
             writers,
+            mirrors,
         } = plan;
         let mut lanes = Vec::with_capacity(specs.len());
         for mut spec in specs {
             let clock = clock_kind(&spec.shape, &spec.intake);
-            let width =
-                if spec.shape.pure && matches!(clock, ClockKind::Input | ClockKind::Rate { .. }) {
-                    workers
-                } else {
-                    1
-                };
+            let width = if spec.shape.pure
+                && matches!(
+                    clock,
+                    ClockKind::Input | ClockKind::Rate { .. } | ClockKind::Windows
+                ) {
+                workers
+            } else {
+                1
+            };
             open_every_instance(&mut spec, width)?;
             let opener = if spec.state.is_empty() || width == 1 {
                 spec.opener
@@ -815,6 +974,11 @@ impl Scheduler {
                 Intake::Host { id } => LaneIntake::Host {
                     id,
                     events: VecDeque::new(),
+                },
+                Intake::Windows { lockstep, pads } => LaneIntake::Windows {
+                    lockstep,
+                    pads,
+                    trailing: Vec::new(),
                 },
             };
             let port_state = |out: PortOut| PortState {
@@ -851,6 +1015,7 @@ impl Scheduler {
             lanes,
             consumers,
             writers,
+            mirrors,
             error: None,
             finished: false,
             cap: workers * 2 + 2,
@@ -889,6 +1054,16 @@ impl Scheduler {
         })
     }
 
+    /// Whether the run has nothing left to make: every lane has ended and
+    /// nothing failed.
+    pub fn over(&self) -> Arc<dyn Fn() -> bool + Send + Sync> {
+        let shared = Arc::clone(&self.shared);
+        Arc::new(move || {
+            let state = shared.lock();
+            state.error.is_none() && state.lanes.iter().all(|l| l.ended)
+        })
+    }
+
     /// Waits for room on whatever reads `stream`, then runs `act` on the
     /// state. False once the run has stopped.
     fn feed(&self, stream: u32, act: impl FnOnce(&mut State) -> Result<()>) -> bool {
@@ -897,7 +1072,10 @@ impl Scheduler {
             if state.error.is_some() || state.finished {
                 return false;
             }
-            let consumers = state.consumers(stream);
+            let mut consumers = state.consumers(stream);
+            for mirror in state.mirrors(stream) {
+                consumers.extend(state.consumers(mirror));
+            }
             if state.room(&consumers) {
                 break;
             }
@@ -928,6 +1106,14 @@ impl Scheduler {
 
     pub fn end(&self, stream: u32) -> bool {
         self.feed(stream, |state| state.end(stream))
+    }
+
+    /// `stream` has ended, leaving `trailing` rows with no frame to ride.
+    pub fn end_with(&self, stream: u32, trailing: &[String]) -> bool {
+        self.feed(stream, |state| {
+            state.trailing(stream, trailing);
+            state.end(stream)
+        })
     }
 
     /// A port feed's connection on `stream` starts, told before its frames.

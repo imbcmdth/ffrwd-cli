@@ -25,7 +25,7 @@ use ffrwd_wasm_runtime::runtime::{
 use crate::heartbeat::{self, Beats};
 use crate::tick::compare;
 
-fn input(
+pub(crate) fn input(
     name: &str,
     kind: PortKind,
     required: bool,
@@ -47,7 +47,7 @@ fn input(
     }
 }
 
-fn output(name: &str, kind: PortKind, format: Option<OutputFormat>) -> OutputPort {
+pub(crate) fn output(name: &str, kind: PortKind, format: Option<OutputFormat>) -> OutputPort {
     OutputPort {
         name: name.to_string(),
         kind,
@@ -581,24 +581,6 @@ pub fn frames_tick(
         last,
         streams,
     }
-}
-
-/// What a frame node's call left: its frames, rows riding, and the rows
-/// that had none to ride.
-pub fn processed_of(emitted: Emitted) -> runtime::Processed {
-    let mut processed = runtime::Processed::default();
-    for item in emitted.items {
-        match item.payload {
-            Payload::Frame(f) => processed.frames.push(Frame {
-                pts: f.pts,
-                data: f.data,
-                rows: f.rows,
-            }),
-            Payload::Rows(rows) => processed.trailing.extend(rows),
-            Payload::Message(_) | Payload::Packet(_) => {}
-        }
-    }
-    processed
 }
 
 /// A pad of a packet sink or filter as its world's `init` is told it.

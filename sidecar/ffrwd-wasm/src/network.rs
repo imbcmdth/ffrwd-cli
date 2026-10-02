@@ -17,9 +17,9 @@ use ffrwd_wasm_runtime::runtime::{self, Described, Filter, Format, Kind, Media, 
 use crate::adapters::FilterNode;
 use crate::graph::{EdgeKind, Pad, ParsedNode};
 use crate::leaky::{self, Leaky};
+use crate::older::{LaneSeed, Reopen, Runner};
 use crate::rowfilter::{self, RowFilter};
 use crate::rowmerge::{self, RowMerge};
-use crate::scheduler::{LaneSeed, Reopen, Runner};
 
 /// Where one of a node's streams comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -677,24 +677,54 @@ fn read_value(
     value: &str,
     property: &serde_json::Value,
 ) -> Result<serde_json::Value> {
-    let wanted = property.get("type").and_then(|t| t.as_str());
-    match wanted {
-        Some("integer") => value
-            .parse::<i64>()
-            .map(serde_json::Value::from)
-            .map_err(|_| bad_value(module, key, value, "an integer")),
-        Some("number") => value
+    // A list of types is read as the first of them the text fits, null aside.
+    let types: Vec<&str> = match property.get("type") {
+        Some(serde_json::Value::Array(types)) => types
+            .iter()
+            .filter_map(|t| t.as_str())
+            .filter(|t| *t != "null")
+            .collect(),
+        Some(t) => t.as_str().into_iter().collect(),
+        None => Vec::new(),
+    };
+    let Some(first) = types.first() else {
+        return Ok(serde_json::Value::String(value.to_string()));
+    };
+    if let Some(read) = types.iter().find_map(|t| value_as(t, value)) {
+        return Ok(read);
+    }
+    let wanted = match *first {
+        "integer" => "an integer",
+        "number" => "a number",
+        "boolean" => "true or false",
+        "array" => "a JSON array",
+        "object" => "a JSON object",
+        _ => "a string",
+    };
+    Err(bad_value(module, key, value, wanted))
+}
+
+/// `value` read as JSON type `kind`, where it is one.
+fn value_as(kind: &str, value: &str) -> Option<serde_json::Value> {
+    match kind {
+        "integer" => value.parse::<i64>().ok().map(serde_json::Value::from),
+        "number" => value
             .parse::<f64>()
             .ok()
             .and_then(serde_json::Number::from_f64)
-            .map(serde_json::Value::Number)
-            .ok_or_else(|| bad_value(module, key, value, "a number")),
-        Some("boolean") => match value {
-            "1" | "true" => Ok(serde_json::Value::Bool(true)),
-            "0" | "false" => Ok(serde_json::Value::Bool(false)),
-            _ => Err(bad_value(module, key, value, "true or false")),
+            .map(serde_json::Value::Number),
+        "boolean" => match value {
+            "1" | "true" => Some(serde_json::Value::Bool(true)),
+            "0" | "false" => Some(serde_json::Value::Bool(false)),
+            _ => None,
         },
-        _ => Ok(serde_json::Value::String(value.to_string())),
+        "array" => serde_json::from_str::<serde_json::Value>(value)
+            .ok()
+            .filter(serde_json::Value::is_array),
+        "object" => serde_json::from_str::<serde_json::Value>(value)
+            .ok()
+            .filter(serde_json::Value::is_object),
+        _ => Some(serde_json::Value::String(value.to_string())),
     }
 }
 
@@ -748,6 +778,24 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("no parameter 'nope'"), "got: {message}");
         assert!(message.contains("radius"), "got: {message}");
+    }
+
+    #[test]
+    fn a_type_list_takes_the_first_type_the_text_fits() {
+        let schema = serde_json::json!({
+            "properties": {
+                "css_width": {"type": ["null", "number"]},
+                "port": {"type": ["array", "integer"]}
+            }
+        });
+        let json = params_json("compose", &schema, &option("css_width", "1280"))
+            .expect("a number in a list of types");
+        assert_eq!(json, r#"{"css_width":1280.0}"#);
+        let json = params_json("compose", &schema, &option("port", "9100")).expect("an integer");
+        assert_eq!(json, r#"{"port":9100}"#);
+        let json =
+            params_json("compose", &schema, &option("port", "[9100,9101]")).expect("an array");
+        assert_eq!(json, r#"{"port":[9100,9101]}"#);
     }
 
     #[test]

@@ -26,11 +26,11 @@ mod legacy;
 mod network;
 mod node_graph;
 mod node_loop;
+mod older;
 mod relay;
 mod rowfilter;
 mod rowmerge;
 mod rows_chain;
-mod scheduler;
 mod shape_json;
 mod subtitles;
 mod tick;
@@ -409,6 +409,10 @@ pub(crate) struct PadSpec {
     /// compiler writes what it probed, in ffmpeg's names.
     #[serde(default)]
     pub(crate) color: Option<PadColor>,
+    /// Tags for the input's streams beside the ones its header carries, as
+    /// the query's `tags` column says them: `smart_timed` makes a feed timed.
+    #[serde(default)]
+    pub(crate) tags: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -1851,68 +1855,6 @@ fn open_sinks(
     Ok(sinks)
 }
 
-/// Reads every input a frame at a time into the scheduler, then waits for
-/// every lane to drain. An input that has ended hands over its trailing rows
-/// and is left alone; the workers do everything else.
-fn run_lanes(
-    net: Network,
-    mut readers: Vec<Input>,
-    formats: &[Format],
-    sinks: Vec<Sink>,
-    jobs: Option<usize>,
-) -> Result<()> {
-    let workers = scheduler::worker_count(jobs);
-    let sched = scheduler::Scheduler::start(net.into_seeds(), sinks, readers.len(), workers);
-
-    let mut feed = || -> Result<bool> {
-        let mut buf: Vec<u8> = Vec::new();
-        let mut open = vec![true; readers.len()];
-        let mut index = vec![0u64; readers.len()];
-        loop {
-            let mut any = false;
-            for (input, reader) in readers.iter_mut().enumerate() {
-                if !open[input] {
-                    continue;
-                }
-                let read = reader
-                    .read_frame(&mut buf)
-                    .with_context(|| format!("reading frame {} of input {input}", index[input]))?;
-                match read {
-                    Some(pts) => {
-                        check_frame(&formats[input], &buf, index[input])?;
-                        let frame = Frame {
-                            pts,
-                            data: Arc::new(std::mem::take(&mut buf)),
-                            rows: reader.take_rows(pts),
-                        };
-                        index[input] += 1;
-                        any = true;
-                        if !sched.push_input(input, frame) {
-                            return Ok(false);
-                        }
-                    }
-                    None => {
-                        open[input] = false;
-                        // The trailing record sits past the last frame, so it
-                        // is in hand exactly now.
-                        let trailing = reader.take_trailing();
-                        if !sched.input_eof(input, &trailing) {
-                            return Ok(false);
-                        }
-                    }
-                }
-            }
-            if !any {
-                return Ok(true);
-            }
-        }
-    };
-    match feed() {
-        Ok(_) => sched.finish(),
-        Err(e) => sched.abort(e),
-    }
-}
-
 /// Opens the module once for the stream it will read.
 fn open_filter(module: &str, params: &str, format: &Format, info: &StreamInfo) -> Result<Filter> {
     Filter::open(module, format, info, params).with_context(|| format!("opening module {module}"))
@@ -2171,7 +2113,7 @@ fn run(args: &Args) -> Result<()> {
             let sink_streams = vec![streams[0].clone(); args.outputs.len()];
             let keeps = vec![net.keeps_rate(0); args.outputs.len()];
             let sinks = open_sinks(args, &nodes, &sink_streams, &keeps)?;
-            run_lanes(net, readers, &formats, sinks, args.jobs)
+            older::run(net, readers, &formats, sinks, args.jobs)
         }
         Modules::Network { bindings, wiring } => {
             let parsed = graph::parse_network(wiring)?;
@@ -2198,7 +2140,7 @@ fn run(args: &Args) -> Result<()> {
             }
             let keeps: Vec<bool> = nodes.iter().map(|node| net.keeps_rate(*node)).collect();
             let sinks = open_sinks(args, &nodes, &sink_streams, &keeps)?;
-            run_lanes(net, readers, &formats, sinks, args.jobs)
+            older::run(net, readers, &formats, sinks, args.jobs)
         }
     }
 }
@@ -4621,8 +4563,16 @@ mod pad_spec_tests {
                     language: Some("en".to_string()),
                 },
                 color: None,
+                tags: Default::default(),
             }
         );
+    }
+
+    #[test]
+    fn tags_beside_the_colour_are_read_as_strings() {
+        let spec: PadSpec = serde_json::from_str(r#"{"tags":{"smart_timed":"1"}}"#).expect("valid");
+        assert_eq!(spec.tags.get("smart_timed").map(String::as_str), Some("1"));
+        assert_eq!(spec.color, None);
     }
 
     #[test]

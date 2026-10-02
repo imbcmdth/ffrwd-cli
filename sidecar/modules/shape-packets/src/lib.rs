@@ -1,5 +1,6 @@
 //! Coded packets as the clock: a tick per packet, in decode order, each
-//! logged with its times, its key flag and its size.
+//! logged with its times, its key flag and its size, and handed on as it
+//! came on `out`, a packets output that names no format of its own.
 
 // Every shape module carries the same few helpers, and not every one uses
 // each of them.
@@ -135,7 +136,7 @@ fn rate(num: i32) -> Rational {
 struct Params {}
 
 thread_local! {
-    static PACKETS: RefCell<u32> = const { RefCell::new(0) };
+    static PACKETS: RefCell<(u32, bool)> = const { RefCell::new((0, false)) };
 }
 
 struct Node;
@@ -150,18 +151,19 @@ impl Guest for Node {
         let p = input("p", PortKind::Packets, Pairing::Lockstep, RowsUse::Ignore);
         Ok(shape(
             vec![p],
-            vec![data("log")],
+            vec![data("log"), output("out", PortKind::Packets, None)],
             Clock::Input("p".to_string()),
             false,
         ))
     }
 
-    fn init(bound: Vec<BoundStream>, _latched: Vec<String>, _params: String) -> Result<(), String> {
+    fn init(bound: Vec<BoundStream>, latched: Vec<String>, _params: String) -> Result<(), String> {
         let p = bound_ids(&bound, "p")
             .first()
             .copied()
             .ok_or("p is bound")?;
-        PACKETS.with(|s| *s.borrow_mut() = p);
+        let out = latched.iter().any(|port| port == "out");
+        PACKETS.with(|s| *s.borrow_mut() = (p, out));
         Ok(())
     }
 
@@ -170,25 +172,28 @@ impl Guest for Node {
     }
 
     fn process(tick: &Tick) -> Result<Emitted, String> {
-        let p = PACKETS.with(|s| *s.borrow());
-        let items = tick
-            .packets(p)
-            .iter()
-            .map(|packet| {
-                message(
-                    "log",
-                    tick.pts(),
-                    json!({
-                        "tick": tick.pts(),
-                        "pts": packet.pts,
-                        "dts": packet.dts,
-                        "key": packet.keyframe,
-                        "bytes": packet.data.len(),
-                        "last": tick.last(),
-                    }),
-                )
-            })
-            .collect();
+        let (p, out) = PACKETS.with(|s| *s.borrow());
+        let mut items = Vec::new();
+        for packet in tick.packets(p) {
+            items.push(message(
+                "log",
+                tick.pts(),
+                json!({
+                    "tick": tick.pts(),
+                    "pts": packet.pts,
+                    "dts": packet.dts,
+                    "key": packet.keyframe,
+                    "bytes": packet.data.len(),
+                    "last": tick.last(),
+                }),
+            ));
+            if out {
+                items.push(Emission {
+                    port: "out".to_string(),
+                    payload: Payload::Packet(packet),
+                });
+            }
+        }
         Ok(emitted(items, false))
     }
 }

@@ -268,7 +268,6 @@ struct MemberQueue {
     info: StreamInfo,
     queue: VecDeque<TickFrame>,
     bytes: usize,
-    first: Option<i64>,
     /// The last frame's pts, or the end of the last run of samples.
     last: Option<i64>,
 }
@@ -280,13 +279,11 @@ impl MemberQueue {
             info,
             queue: VecDeque::new(),
             bytes: 0,
-            first: None,
             last: None,
         }
     }
 
     fn push(&mut self, frame: TickFrame) {
-        self.first.get_or_insert(frame.pts);
         self.bytes += frame.data.len();
         self.queue.push_back(frame);
     }
@@ -304,6 +301,9 @@ struct Source {
     connection: u64,
     tags: Vec<(String, String)>,
     members: Vec<MemberQueue>,
+    /// Per member, whether the source brings it: a port feed's connection
+    /// whose sound was refused never does.
+    brings: Vec<bool>,
     closed: bool,
 }
 
@@ -404,6 +404,7 @@ impl Group {
             connection,
             tags,
             members,
+            brings: vec![connection == 0; self.members.len()],
             closed: false,
         });
     }
@@ -419,6 +420,7 @@ impl Group {
             self.open_source(source.connection, source.tags.clone());
         }
         let back = self.sources.back_mut().expect("opened");
+        back.brings[member] = true;
         let queue = &mut back.members[member];
         queue.base = source.base;
         queue.info = source.info;
@@ -448,6 +450,7 @@ impl Group {
                 .iter()
                 .map(|q| MemberQueue::new(q.base, q.info.clone()))
                 .collect(),
+            brings: back.brings.clone(),
             closed: false,
         };
         self.sources.push_back(next);
@@ -669,7 +672,7 @@ impl Group {
                 _ => format!("lead {}s", self.hold.lead),
             }
         );
-        let row = json!({
+        let mut row = json!({
             "kind": "feed",
             "node": self.node,
             "input": self.members[self.lead].name,
@@ -682,6 +685,17 @@ impl Group {
             },
             "tags": source.tags.iter().map(|(k, v)| json!([k, v])).collect::<Vec<_>>(),
         });
+        let absent: Vec<&str> = self
+            .members
+            .iter()
+            .zip(&source.brings)
+            .enumerate()
+            .filter(|(index, (_, brings))| *index != self.lead && !**brings)
+            .map(|(_, (member, _))| member.name.as_str())
+            .collect();
+        if !absent.is_empty() {
+            row["absent"] = json!(absent);
+        }
         (self.report)(line);
         (self.report)(format!("{ROW_PREFIX}{row}"));
         self.feed = Some(FeedState {
@@ -752,6 +766,10 @@ impl Group {
         let mut handed: Vec<Handed> = Vec::with_capacity(self.members.len());
         let mut lead_moved = false;
         for (index, member) in self.members.iter().enumerate() {
+            if index != self.lead && !source.brings[index] {
+                handed.push(Handed::default());
+                continue;
+            }
             let queue = &mut source.members[index];
             let mut frames = Vec::new();
             if live {
@@ -788,17 +806,20 @@ impl Group {
                     }
                 }
             }
-            let first = queue.first.unwrap_or_else(|| {
-                let lead = &self.members[self.lead];
-                Offset::ZERO.to_clock(feed.first_pts, lead.base, queue.base)
-            });
+            // Every member's pair is the lead's offset, so a member that
+            // starts off the clock's grid still maps its pts exactly.
+            let first = if index == self.lead {
+                feed.first_pts
+            } else {
+                feed.offset.to_source(feed.at, clock_base, queue.base)
+            };
             handed.push(Handed {
                 frames,
                 feed: Some(Feed {
                     start: FeedStart {
                         tags: source.tags.clone(),
                         first_pts: first,
-                        at: feed.offset.to_clock_up(first, queue.base, clock_base),
+                        at: feed.at,
                     },
                     ends: None,
                 }),
@@ -1208,6 +1229,49 @@ mod tests {
             handed[0].frames.is_empty(),
             "held until the clock reaches 100"
         );
+    }
+
+    #[test]
+    fn a_sound_that_starts_off_the_grid_is_told_the_pictures_offset() {
+        let (mut g, _) = group(
+            hold(Anchor::FirstFrame, 0.0, None, None),
+            vec![video_member(1, MILLIS), audio_member(2)],
+            false,
+        );
+        g.arrive(0, frame(1000, 1));
+        g.arrive(1, samples(48480, 1000));
+        g.arrive(0, frame(1040, 2));
+        let handed = g.tick(300, Some(301), THIRTIETHS, &Grid::exact());
+        let sound = handed[1].feed.clone().unwrap();
+        assert_eq!((sound.start.first_pts, sound.start.at), (48000, 300));
+    }
+
+    #[test]
+    fn a_member_the_connection_does_not_bring_gets_no_feed() {
+        let (mut g, lines) = group(
+            hold(Anchor::FirstFrame, 0.0, None, None),
+            vec![video_member(1, MILLIS), audio_member(2)],
+            true,
+        );
+        g.source_open(
+            0,
+            SourceInfo {
+                connection: 1,
+                tags: Vec::new(),
+                base: MILLIS,
+                info: StreamInfo::default(),
+            },
+        );
+        g.arrive(0, frame(1000, 1));
+        g.arrive(0, frame(1040, 2));
+        let handed = g.tick(300, Some(301), THIRTIETHS, &Grid::exact());
+        assert!(handed[0].feed.is_some());
+        assert!(handed[1].feed.is_none() && handed[1].frames.is_empty());
+        let said = lines.lock().unwrap().join(
+            "
+",
+        );
+        assert!(said.contains(r#""absent":["in2"]"#), "{said}");
     }
 
     #[test]

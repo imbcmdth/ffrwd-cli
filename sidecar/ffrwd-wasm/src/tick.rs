@@ -628,6 +628,14 @@ impl Assembler {
         group.port_fed().then(|| group.room())
     }
 
+    /// How many more frames the hold input bound to stream `id` takes before
+    /// its buffer is full, whoever feeds it; None where `id` is not held.
+    pub fn held_room(&self, id: u32) -> Option<usize> {
+        let input = self.inputs.iter().find(|i| i.id == id)?;
+        let (group, _) = input.hold?;
+        Some(self.holds[group].room())
+    }
+
     fn port_fed(&self, input: &Input) -> bool {
         input
             .hold
@@ -1065,6 +1073,7 @@ impl Assembler {
         base: TimeBase,
         held: &mut [Vec<Handed>],
     ) -> Result<TickStream> {
+        let first = self.made == 0;
         let input = &mut self.inputs[index];
         let mut stream = TickStream {
             id: input.id,
@@ -1117,7 +1126,7 @@ impl Assembler {
                     }
                     let item = input.queue.pop_front().expect("front is some");
                     let time = input.item_time(&item);
-                    if compare(time, input.base, pts, base).is_lt() {
+                    if !first && compare(time, input.base, pts, base).is_lt() {
                         late += 1;
                         earliest = Some(earliest.map_or(time, |e: i64| e.min(time)));
                     }

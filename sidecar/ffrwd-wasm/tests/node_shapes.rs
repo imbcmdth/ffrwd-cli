@@ -22,6 +22,7 @@ const SHAPES: &[&str] = &[
     "shape-sink",
     "shape-window",
     "shape-packets",
+    "shape-switch",
 ];
 
 fn sidecar_root() -> PathBuf {
@@ -841,6 +842,243 @@ fn coded_packets_clock_a_node_one_tick_each() {
     assert_eq!(entry(5), (Some(5), Some(5), Some(true), Some(15)));
     assert_eq!(entry(9), (Some(9), Some(9), Some(false), Some(19)));
     assert_eq!(log[9]["last"], true, "the last packet rides the last call");
+}
+
+#[test]
+fn a_packets_output_with_no_format_carries_its_clocks_stream_and_rate() {
+    let dir = scratch("packets-out");
+    // The header says nothing is reordered and the pts do reorder, as
+    // libx265 written straight to NUT leaves them: every dts the wire
+    // implies is its pts, and the ones that would go back are not known.
+    let coded = Stream {
+        fourcc: b"H264".to_vec(),
+        time_base: TimeBase { num: 1, den: 25 },
+        msb_pts_shift: 14,
+        max_pts_distance: 25,
+        decode_delay: 0,
+        extradata: vec![1, 2, 3, 4],
+        frame_rate: Some((25, 1)),
+        media: Media::Video {
+            width: 16,
+            height: 16,
+            sample_width: 1,
+            sample_height: 1,
+            colorspace_type: 0,
+        },
+    };
+    let order = [0i64, 3, 1, 2, 6, 4, 5];
+    let items: Vec<(usize, Write)> = order
+        .iter()
+        .map(|&pts| (0, Write::Coded(pts, pts == 0, vec![pts as u8; 8])))
+        .collect();
+    write_nut(&dir.join("in.nut"), &[coded], &items);
+    let input = dir.join("in.nut").display().to_string();
+    let out = at_every_jobs(
+        "packets-out",
+        &args(&[
+            "-f",
+            "nut",
+            "-i",
+            &input,
+            "-m",
+            &module("shape_packets"),
+            "-filter_complex",
+            "[p=0:v]shape_packets[log=l][out=o]",
+            "-map",
+            "[l]",
+            "-f",
+            "ndjson",
+            "{dir}/log.ndjson",
+            "-map",
+            "[o]",
+            "-f",
+            "nut",
+            "{dir}/out.nut",
+        ]),
+        &["log.ndjson", "out.nut"],
+    );
+    let dts: Vec<Option<i64>> = lines(&out[0]).iter().map(|l| l["dts"].as_i64()).collect();
+    assert_eq!(dts, vec![Some(0), Some(3), None, None, Some(6), None, None]);
+    let (streams, packets) = frames(&out[1]);
+    assert_eq!(streams.len(), 1);
+    assert_eq!(streams[0].fourcc, b"H264".to_vec());
+    assert_eq!(streams[0].extradata, vec![1, 2, 3, 4]);
+    assert_eq!(streams[0].frame_rate, Some((25, 1)));
+    let written: Vec<(i64, Vec<u8>)> = packets.into_iter().map(|(_, pts, d)| (pts, d)).collect();
+    let wanted: Vec<(i64, Vec<u8>)> = order.iter().map(|&pts| (pts, vec![pts as u8; 8])).collect();
+    assert_eq!(written, wanted);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_pad_tags_a_held_stream_and_a_tagged_anchor_reads_it() {
+    let dir = scratch("pad-tags");
+    // A tenth of a second of picture and of sound per step, from `from`.
+    let steps = |from: i64, to: i64, mark: u8| -> Vec<(usize, Write)> {
+        (from..to)
+            .flat_map(|k| {
+                [
+                    (1, Write::Frame(k * 4800, vec![0u8; 4800 * 4])),
+                    (0, Write::Frame(k, vec![mark; 64])),
+                ]
+            })
+            .collect()
+    };
+    let streams = || {
+        [
+            video(4, 4, TENTHS, (10, 1)),
+            Stream::audio("f32", 48000, 1).expect("f32 is carried"),
+        ]
+    };
+    write_nut(&dir.join("prog.nut"), &streams(), &steps(0, 20, 10));
+    write_nut(&dir.join("feed.nut"), &streams(), &steps(5, 10, 200));
+    let prog = dir.join("prog.nut").display().to_string();
+    let ad = dir.join("feed.nut").display().to_string();
+    // When the host can foretell a held stream's end depends on how far its
+    // reader has got, so the rows are read once rather than at every -jobs.
+    let first_row = |test: &str, pad: &[&str]| {
+        let out_dir = dir.join(test);
+        fs::create_dir_all(&out_dir).expect("make a run directory");
+        let rows = out_dir.join("feeds.ndjson").display().to_string();
+        let mut list = vec!["-f", "nut", "-i", &prog, "-f", "nut", "-i", &ad];
+        list.extend_from_slice(pad);
+        let switch = module("shape_switch");
+        list.extend_from_slice(&[
+            "-m",
+            &switch,
+            "-filter_complex",
+            "[v=0:v][a=0:a][feed=1:v][feed_audio=1:a]shape_switch=lead=0.3[feeds=f]",
+            "-map",
+            "[f]",
+            "-f",
+            "ndjson",
+            &rows,
+        ]);
+        let run = Command::new(env!("CARGO_BIN_EXE_ffrwd-wasm"))
+            .args(&list)
+            .output()
+            .expect("spawn ffrwd-wasm");
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        lines(&fs::read(&rows).expect("the rows were written"))[0].clone()
+    };
+    let timed = first_row(
+        "pad-tags-timed",
+        &["-pad", r#"{"tags":{"smart_timed":"1"}}"#],
+    );
+    assert_eq!(timed["timed"], true);
+    assert_eq!(
+        timed["at"], 5,
+        "a timed feed shows when the programme reaches its pts"
+    );
+    let untimed = first_row("pad-tags-untimed", &[]);
+    assert_eq!(untimed["timed"], false);
+    assert_ne!(
+        untimed["at"], 5,
+        "an untimed feed is scheduled by its first frame"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn one_stream_bound_twice_reaches_both_bindings() {
+    let dir = scratch("bound-twice");
+    let items: Vec<(usize, Write)> = (0..10)
+        .map(|k| (0, Write::Frame(k, vec![10 + k as u8; 64])))
+        .collect();
+    write_nut(&dir.join("in.nut"), &[video(4, 4, TENTHS, (10, 1))], &items);
+    let input = dir.join("in.nut").display().to_string();
+    let out = at_every_jobs(
+        "bound-twice",
+        &args(&[
+            "-f",
+            "nut",
+            "-i",
+            &input,
+            "-m",
+            &module("shape_hold"),
+            "-filter_complex",
+            "[v=0:v][v=0:v]shape_hold=width=4:height=4:pick=1[out=o]",
+            "-map",
+            "[o]",
+            "-f",
+            "nut",
+            "{dir}/out.nut",
+        ]),
+        &["out.nut"],
+    );
+    let (_, got) = frames(&out[0]);
+    let marks: Vec<u8> = got.iter().map(|(_, _, data)| data[0]).collect();
+    assert_eq!(
+        marks,
+        (10..20).collect::<Vec<u8>>(),
+        "the second binding hands every frame"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_source_held_by_a_node_beside_it_runs_no_further_ahead_than_the_hold_takes() {
+    let out = at_every_jobs(
+        "held-source",
+        &args(&[
+            "-m",
+            &module("shape_rate"),
+            "-m",
+            &module("shape_hold"),
+            "-filter_complex",
+            "shape_rate=fps=25:frames=1500:width=8:height=8[out=r];[v=r]shape_hold=width=8:height=8:pick=0[out=o]",
+            "-map",
+            "[o]",
+            "-f",
+            "nut",
+            "{dir}/out.nut",
+        ]),
+        &["out.nut"],
+    );
+    let (_, got) = frames(&out[0]);
+    assert_eq!(got.len(), 1500, "every frame of the source is shown once");
+    assert!(got
+        .iter()
+        .enumerate()
+        .all(|(n, (_, pts, _))| *pts == n as i64));
+}
+
+#[test]
+fn a_data_output_written_to_a_file_carries_its_messages_alone() {
+    let dir = scratch("quiet-file");
+    let input = ten_frames(&dir);
+    let out = at_every_jobs(
+        "quiet-file",
+        &args(&[
+            "-f",
+            "nut",
+            "-i",
+            &input,
+            "-m",
+            &module("shape_state"),
+            "-filter_complex",
+            "[v=0:v]shape_state[seen=s]",
+            "-map",
+            "[s]",
+            "-f",
+            "nut",
+            "{dir}/rows.nut",
+        ]),
+        &["rows.nut"],
+    );
+    let (_, packets) = frames(&out[0]);
+    assert!(!packets.is_empty());
+    assert!(
+        packets
+            .iter()
+            .all(|(_, _, data)| !data.iter().all(u8::is_ascii_whitespace)),
+        "no progress mark reaches a file"
+    );
+    let _ = fs::remove_dir_all(&dir);
 }
 
 fn ten_frames(dir: &Path) -> String {
