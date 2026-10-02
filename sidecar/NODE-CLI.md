@@ -218,7 +218,11 @@ tick that held them.
   clock ticks when the frame or packet after its tick has arrived (or its
   frame says how long it lasts), so every tick's interval is settled
   before it runs, and the progress the node sends after it is the end of
-  that interval less the port's latency.
+  that interval less the port's latency. A rate clock whose inputs are
+  all `arrival` (a publisher that needs only turns) ticks when something
+  has arrived that no tick has taken, or one period of its rate after its
+  last tick, so it never runs ahead of real time with nothing to hand;
+  once every input has ended it runs on to the last frame's time at once.
 - **Hold inputs.** A hold input bound to a stream holds the tick until its
   source has reached the tick (a frame past it, or its end), for no longer
   than its `timeout` of clock time, after which the source is behind; a

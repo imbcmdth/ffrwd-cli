@@ -1030,6 +1030,12 @@ impl Assembler {
         self.inputs.iter().any(|i| !i.queue.is_empty())
     }
 
+    /// Whether every input is delivered as it arrives, so nothing it brings
+    /// settles a tick and its turns are bounded only by time.
+    pub fn arrival_only(&self) -> bool {
+        self.inputs.iter().all(|i| i.pairing == Pairing::Arrival)
+    }
+
     /// Whether any stream is bound to the node.
     pub fn has_inputs(&self) -> bool {
         !self.inputs.is_empty()

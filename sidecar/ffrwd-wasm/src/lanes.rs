@@ -18,7 +18,9 @@
 //! output it feeds has room, and a reader waits for room on whatever reads
 //! its streams. A generator, a node clocked by a rate with no inputs, is cut
 //! a tick at a time as its queue has room, so it runs as fast as its
-//! outputs drain.
+//! outputs drain. A rate clock whose inputs are all delivered as they arrive
+//! (a publisher that only needs turns) is cut a tick when something has
+//! arrived, or one period of its rate after its last tick, until they end.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -188,6 +190,8 @@ struct Lane {
     /// have run ticks past it.
     finisher: Option<usize>,
     started: Option<Instant>,
+    /// When a rate clock whose inputs all arrive unpaired last cut a tick.
+    turned: Option<Instant>,
 }
 
 struct State {
@@ -506,8 +510,15 @@ impl State {
                 let LaneIntake::Assembled(a) = &mut lane.intake else {
                     unreachable!("a rate clock is assembled")
                 };
+                let paced = a.arrival_only() && !a.all_ended();
                 let mut cut = Vec::new();
                 while lane.queue.len() + cut.len() < cap {
+                    if paced
+                        && !a.has_arrivals()
+                        && lane.turned.is_some_and(|t| t.elapsed() < period(base))
+                    {
+                        break;
+                    }
                     let tick = if a.all_ended() {
                         let made = a.ticks_made() as i64;
                         let past = a.latest(base).is_none_or(|latest| made > latest);
@@ -518,6 +529,9 @@ impl State {
                     let Some(tick) = tick else { break };
                     let last = tick.last;
                     cut.push((tick, a.tick_end()));
+                    if paced {
+                        lane.turned = Some(Instant::now());
+                    }
                     if last {
                         break;
                     }
@@ -604,6 +618,26 @@ impl State {
             }
         }
         Ok(())
+    }
+
+    /// When the next idle turn of a rate clock whose inputs all arrive
+    /// unpaired falls due, for a worker with nothing to do to wait until.
+    fn next_turn(&self) -> Option<Instant> {
+        self.lanes
+            .iter()
+            .filter(|lane| {
+                lane.clock == ClockKind::Rate { inputs: true }
+                    && !lane.last_cut
+                    && !lane.stopped
+                    && lane.queue.len() < self.cap
+            })
+            .filter_map(|lane| match &lane.intake {
+                LaneIntake::Assembled(a) if a.arrival_only() && !a.all_ended() => {
+                    lane.turned.map(|t| t + period(lane.base))
+                }
+                _ => None,
+            })
+            .min()
     }
 
     /// Whether lane `i` has a task a worker may start now: queued, under
@@ -1021,6 +1055,7 @@ impl Scheduler {
                 stopped: false,
                 finisher: None,
                 started: None,
+                turned: None,
             });
         }
         let mut state = State {
@@ -1230,6 +1265,11 @@ impl Scheduler {
     }
 }
 
+/// One tick of a clock counted in `base`, in real time.
+fn period(base: TimeBase) -> Duration {
+    Duration::from_secs_f64(base.num as f64 / base.den.max(1) as f64)
+}
+
 fn worker(shared: &Shared) {
     let mut state = shared.lock();
     loop {
@@ -1245,7 +1285,16 @@ fn worker(shared: &Shared) {
             }
         };
         let Some(i) = picked else {
-            state = shared.work.wait(state).unwrap_or_else(|e| e.into_inner());
+            state = match state.next_turn() {
+                Some(due) => {
+                    let wait = due.saturating_duration_since(Instant::now());
+                    match shared.work.wait_timeout(state, wait) {
+                        Ok((state, _)) => state,
+                        Err(e) => e.into_inner().0,
+                    }
+                }
+                None => shared.work.wait(state).unwrap_or_else(|e| e.into_inner()),
+            };
             continue;
         };
         let (task, instance, runner, opener) = state.dispatch(i);
