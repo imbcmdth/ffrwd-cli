@@ -42,7 +42,7 @@ func describe() types.Meta {
 	}
 }
 
-func shape(params string, _ cm.List[string]) shapeResult {
+func shape(params string, _ cm.List[node.Binding]) shapeResult {
 	if bad := validateParams(params); bad.IsErr() {
 		return cm.Err[shapeResult](*bad.Err())
 	}

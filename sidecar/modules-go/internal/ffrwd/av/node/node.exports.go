@@ -6,7 +6,7 @@ import (
 	"go.bytecodealliance.org/cm"
 )
 
-// Exports represents the caller-defined exports from "ffrwd:av/node@0.19.0".
+// Exports represents the caller-defined exports from "ffrwd:av/node@0.19.1".
 var Exports struct {
 	// Describe represents the caller-defined, exported function "describe".
 	//
@@ -22,10 +22,12 @@ var Exports struct {
 	// Shape represents the caller-defined, exported function "shape".
 	//
 	// The ports and clock for these params, and for `bound`: the inputs
-	// the call binds, by the declaration's names, so a shape may turn on
-	// what is given (a page with no picture ticks at a rate; an output
-	// `like` an unbound input is left out). Called at compile time with the
-	// call's static params, once per distinct (module, params, bound), and
+	// the call binds, by the declaration's names, each with what the
+	// compiler knows of its streams, so a shape may turn on what is given
+	// (a page with no picture ticks at a rate; an output `like` an unbound
+	// input is left out) and on the clock's rate. Called at compile time
+	// with the call's static params, once per distinct (module, params,
+	// bound), and
 	// cached; a source may read the network here to learn its outputs, as
 	// `probe` did. Callable at any point in an instance's life: it reads
 	// nothing `init` or `set-params` set.
@@ -35,10 +37,12 @@ var Exports struct {
 	// input clock, or paired other than `arrival` on a self-clocked node;
 	// `hold` is on a message kind or `interval` on a frame kind; a data
 	// input's `rows` is `ignore`; `like` names an input that is not single
-	// and bound; or a stride is 0 or above its window.
+	// and bound; a stride is 0 or above its window; `wants` is `timing`
+	// on other than a frame kind; or an `interval` names a group that is
+	// no hold group's, or a group with an anchor other than shared-clock.
 	//
-	//	shape: func(params: string, bound: list<string>) -> result<node-shape, string>
-	Shape func(params string, bound cm.List[string]) (result cm.Result[NodeShapeShape, NodeShape, string])
+	//	shape: func(params: string, bound: list<binding>) -> result<node-shape, string>
+	Shape func(params string, bound cm.List[Binding]) (result cm.Result[NodeShapeShape, NodeShape, string])
 
 	// Init represents the caller-defined, exported function "init".
 	//

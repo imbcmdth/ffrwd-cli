@@ -6,52 +6,60 @@ import (
 	"go.bytecodealliance.org/cm"
 )
 
-// This file contains wasmimport and wasmexport declarations for "ffrwd:av@0.19.0".
+// This file contains wasmimport and wasmexport declarations for "ffrwd:av@0.19.1".
 
-//go:wasmimport ffrwd:av/node-tick@0.19.0 [resource-drop]tick
+//go:wasmimport ffrwd:av/node-tick@0.19.1 [resource-drop]tick
 //go:noescape
 func wasmimport_TickResourceDrop(self0 uint32)
 
-//go:wasmimport ffrwd:av/node-tick@0.19.0 [method]tick.earlier-rows
+//go:wasmimport ffrwd:av/node-tick@0.19.1 [method]tick.earlier-rows
 //go:noescape
 func wasmimport_TickEarlierRows(self0 uint32, id0 uint32, result *cm.List[TimedRows])
 
-//go:wasmimport ffrwd:av/node-tick@0.19.0 [method]tick.feed
+//go:wasmimport ffrwd:av/node-tick@0.19.1 [method]tick.ended-feeds
+//go:noescape
+func wasmimport_TickEndedFeeds(self0 uint32, id0 uint32, result *cm.List[Feed])
+
+//go:wasmimport ffrwd:av/node-tick@0.19.1 [method]tick.feed
 //go:noescape
 func wasmimport_TickFeed(self0 uint32, id0 uint32, result *cm.Option[Feed])
 
-//go:wasmimport ffrwd:av/node-tick@0.19.0 [method]tick.fetch
+//go:wasmimport ffrwd:av/node-tick@0.19.1 [method]tick.fetch
 //go:noescape
 func wasmimport_TickFetch(self0 uint32, id0 uint32, index0 uint32, result *cm.List[uint8])
 
-//go:wasmimport ffrwd:av/node-tick@0.19.0 [method]tick.frames
+//go:wasmimport ffrwd:av/node-tick@0.19.1 [method]tick.frames
 //go:noescape
 func wasmimport_TickFrames(self0 uint32, id0 uint32, result *cm.List[Frame])
 
-//go:wasmimport ffrwd:av/node-tick@0.19.0 [method]tick.info
+//go:wasmimport ffrwd:av/node-tick@0.19.1 [method]tick.info
 //go:noescape
 func wasmimport_TickInfo(self0 uint32, id0 uint32, result *StreamInfo)
 
-//go:wasmimport ffrwd:av/node-tick@0.19.0 [method]tick.last
+//go:wasmimport ffrwd:av/node-tick@0.19.1 [method]tick.last
 //go:noescape
 func wasmimport_TickLast(self0 uint32) (result0 uint32)
 
-//go:wasmimport ffrwd:av/node-tick@0.19.0 [method]tick.messages
+//go:wasmimport ffrwd:av/node-tick@0.19.1 [method]tick.messages
 //go:noescape
 func wasmimport_TickMessages(self0 uint32, id0 uint32, result *cm.List[Message])
 
-//go:wasmimport ffrwd:av/node-tick@0.19.0 [method]tick.packets
+//go:wasmimport ffrwd:av/node-tick@0.19.1 [method]tick.ordinal
+//go:noescape
+func wasmimport_TickOrdinal(self0 uint32) (result0 uint64)
+
+//go:wasmimport ffrwd:av/node-tick@0.19.1 [method]tick.packets
 //go:noescape
 func wasmimport_TickPackets(self0 uint32, id0 uint32, result *cm.List[Packet])
 
-//go:wasmimport ffrwd:av/node-tick@0.19.0 [method]tick.pts
+//go:wasmimport ffrwd:av/node-tick@0.19.1 [method]tick.pts
 //go:noescape
 func wasmimport_TickPts(self0 uint32) (result0 uint64)
 
-//go:wasmimport ffrwd:av/node-tick@0.19.0 [method]tick.streams
+//go:wasmimport ffrwd:av/node-tick@0.19.1 [method]tick.streams
 //go:noescape
 func wasmimport_TickStreams(self0 uint32, port0 *uint8, port1 uint32, result *cm.List[uint32])
 
-//go:wasmimport ffrwd:av/node-tick@0.19.0 [method]tick.time-base
+//go:wasmimport ffrwd:av/node-tick@0.19.1 [method]tick.time-base
 //go:noescape
 func wasmimport_TickTimeBase(self0 uint32, result *Rational)

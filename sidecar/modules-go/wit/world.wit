@@ -7,6 +7,6 @@ package ffrwd:av-go@0.2.0;
 /// cannot be encoded around a core module that has them.
 world node-module-go {
   include wasi:cli/imports@0.2.0;
-  import ffrwd:av/node-tick@0.19.0;
-  export ffrwd:av/node@0.19.0;
+  import ffrwd:av/node-tick@0.19.1;
+  export ffrwd:av/node@0.19.1;
 }

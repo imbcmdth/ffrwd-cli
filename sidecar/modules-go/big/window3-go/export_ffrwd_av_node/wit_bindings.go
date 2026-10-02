@@ -51,7 +51,7 @@ func validateParams(params string) witTypes.Result[witTypes.Unit, string] {
 	}
 }
 
-func Shape(params string, _ []string) witTypes.Result[ffrwd_av_node_types.NodeShape, string] {
+func Shape(params string, _ []ffrwd_av_node_types.Binding) witTypes.Result[ffrwd_av_node_types.NodeShape, string] {
 	if bad := validateParams(params); bad.IsErr() {
 		return witTypes.Err[ffrwd_av_node_types.NodeShape, string](bad.Err())
 	}

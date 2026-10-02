@@ -6,28 +6,28 @@ import (
 	"go.bytecodealliance.org/cm"
 )
 
-// This file contains wasmimport and wasmexport declarations for "ffrwd:av@0.19.0".
+// This file contains wasmimport and wasmexport declarations for "ffrwd:av@0.19.1".
 
-//go:wasmexport ffrwd:av/node@0.19.0#describe
-//export ffrwd:av/node@0.19.0#describe
+//go:wasmexport ffrwd:av/node@0.19.1#describe
+//export ffrwd:av/node@0.19.1#describe
 func wasmexport_Describe() (result *Meta) {
 	result_ := Exports.Describe()
 	result = &result_
 	return
 }
 
-//go:wasmexport ffrwd:av/node@0.19.0#shape
-//export ffrwd:av/node@0.19.0#shape
-func wasmexport_Shape(params0 *uint8, params1 uint32, bound0 *string, bound1 uint32) (result *cm.Result[NodeShapeShape, NodeShape, string]) {
+//go:wasmexport ffrwd:av/node@0.19.1#shape
+//export ffrwd:av/node@0.19.1#shape
+func wasmexport_Shape(params0 *uint8, params1 uint32, bound0 *Binding, bound1 uint32) (result *cm.Result[NodeShapeShape, NodeShape, string]) {
 	params := cm.LiftString[string]((*uint8)(params0), (uint32)(params1))
-	bound := cm.LiftList[cm.List[string]]((*string)(bound0), (uint32)(bound1))
+	bound := cm.LiftList[cm.List[Binding]]((*Binding)(bound0), (uint32)(bound1))
 	result_ := Exports.Shape(params, bound)
 	result = &result_
 	return
 }
 
-//go:wasmexport ffrwd:av/node@0.19.0#init
-//export ffrwd:av/node@0.19.0#init
+//go:wasmexport ffrwd:av/node@0.19.1#init
+//export ffrwd:av/node@0.19.1#init
 func wasmexport_Init(bound0 *BoundStream, bound1 uint32, latched0 *string, latched1 uint32, params0 *uint8, params1 uint32) (result *cm.Result[string, struct{}, string]) {
 	bound := cm.LiftList[cm.List[BoundStream]]((*BoundStream)(bound0), (uint32)(bound1))
 	latched := cm.LiftList[cm.List[string]]((*string)(latched0), (uint32)(latched1))
@@ -37,8 +37,8 @@ func wasmexport_Init(bound0 *BoundStream, bound1 uint32, latched0 *string, latch
 	return
 }
 
-//go:wasmexport ffrwd:av/node@0.19.0#set-params
-//export ffrwd:av/node@0.19.0#set-params
+//go:wasmexport ffrwd:av/node@0.19.1#set-params
+//export ffrwd:av/node@0.19.1#set-params
 func wasmexport_SetParams(params0 *uint8, params1 uint32) (result *cm.Result[string, struct{}, string]) {
 	params := cm.LiftString[string]((*uint8)(params0), (uint32)(params1))
 	result_ := Exports.SetParams(params)
@@ -46,8 +46,8 @@ func wasmexport_SetParams(params0 *uint8, params1 uint32) (result *cm.Result[str
 	return
 }
 
-//go:wasmexport ffrwd:av/node@0.19.0#process
-//export ffrwd:av/node@0.19.0#process
+//go:wasmexport ffrwd:av/node@0.19.1#process
+//export ffrwd:av/node@0.19.1#process
 func wasmexport_Process(tick0 uint32) (result *cm.Result[EmittedShape, Emitted, string]) {
 	tick := cm.Reinterpret[cm.Rep]((uint32)(tick0))
 	result_ := Exports.Process(tick)
