@@ -1,0 +1,9 @@
+[package]
+name = "stand-ins"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ffrwd-node = { git = "https://github.com/imbcmdth/ffrwd-node", tag = "v0.1.0" }
+ffrwd-frame = { git = "https://github.com/imbcmdth/ffrwd-frame", tag = "v0.1.0" }
+serde = { version = "1.0.229", features = ["derive"] }
