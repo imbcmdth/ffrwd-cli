@@ -793,7 +793,7 @@ impl Assembler {
     /// `pts`.
     pub fn progress(&mut self, id: u32, pts: i64) -> Result<()> {
         let input = self.input(id)?;
-        if let Some((group, member)) = input.hold {
+        if let (Some((group, member)), PortKind::Data) = (input.hold, input.kind) {
             self.holds[group].mark(member, pts);
             return Ok(());
         }
