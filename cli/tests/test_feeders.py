@@ -47,6 +47,7 @@ from ffrwd.registry import Registry, load_reference
 from ffrwd.relay import Relay
 from ffrwd.split import insert_splits
 from ffrwd.wasm import WORLDS, Described, Feeder
+from tests.conftest import older_world_refusal
 
 execute = sys.modules["ffrwd.execute"]
 lower = sys.modules["ffrwd.lower"]
@@ -413,11 +414,11 @@ def test_no_feeder_wires_nothing_and_the_port_keeps_its_default(call: str) -> No
 def test_only_a_feeder_may_default_to_null_at_the_declaration(
     declaration: str, needle: str
 ) -> None:
-    with pytest.raises(FfrwdError) as caught:
-        resolve(parse(declaration + "\nCOPY (SELECT f(p.video[1]) FROM input('p.mp4') p) "
-                      "TO 'out.mp4'"))
-    assert caught.value.code is ErrorCode.UNSUPPORTED_SQL
-    assert needle in caught.value.message
+    refusal = older_world_refusal(
+        declaration + "\nCOPY (SELECT f(p.video[1]) FROM input('p.mp4') p) TO 'out.mp4'"
+    )
+    assert refusal.code is ErrorCode.UNSUPPORTED_SQL
+    assert needle in refusal.message
 
 
 def test_a_null_default_the_module_reads_as_a_pad_is_refused() -> None:

@@ -1489,8 +1489,12 @@ def _cmd_explain(args: argparse.Namespace, on_warning: OnWarning) -> int:
     payload: object = graphs[0].to_dict() if len(graphs) == 1 else [
         graph.to_dict() for graph in graphs
     ]
-    if compiled.plan is not None:
-        payload = {"graph": payload, "plan": compiled.plan.to_dict()}
+    if compiled.plan is not None or compiled.timing is not None:
+        payload = {"graph": payload}
+        if compiled.plan is not None:
+            payload["plan"] = compiled.plan.to_dict()
+        if compiled.timing is not None:
+            payload["timing"] = compiled.timing.to_dict()
     print(json.dumps(payload, indent=2))
     return 0
 

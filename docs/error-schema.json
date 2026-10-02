@@ -42,6 +42,7 @@
         "PLAYER_NOT_FOUND",
         "RUNTIME_NOT_FOUND",
         "UNBOUNDED_LIVE_INPUT",
+        "LIVE_LEAD",
         "BUFFER_OVERFLOW",
         "INPUT_NEVER_OPENED",
         "STARTUP_DEADLOCK",

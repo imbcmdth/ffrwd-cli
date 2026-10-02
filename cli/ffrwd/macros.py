@@ -26,7 +26,10 @@ from ffrwd.ir import (
     DEFAULT_MAX_SPREAD,
     LEAKY,
     MAX_LATENESS,
+    MAX_SPAN,
     MAX_SPREAD,
+    MERGE_SPANS,
+    ROWMERGE,
     StreamType,
 )
 
@@ -148,6 +151,12 @@ def _leaky(values: list[object], node: NodeBuilder, options: dict[str, object]) 
     return node(LEAKY, limits, [str(f)], ["video"])
 
 
+def _merge_spans(values: list[object], node: NodeBuilder, options: dict[str, object]) -> str:
+    """The host's own rows node, grouping per-tick rows into spans by `start_t`."""
+    (rows,) = values
+    return node(ROWMERGE, {MERGE_SPANS: True, **options}, [str(rows)], ["data"])
+
+
 _LEAKY_SOUND_HINT = (
     "ffrwd.leaky() drops late pictures and never sound: pass the picture "
     "through it and the sound beside it, e.g. ffrwd.leaky(s.video[1]), s.audio[1]"
@@ -195,6 +204,14 @@ MACROS: dict[str, Macro] = {
         options=(MAX_LATENESS, MAX_SPREAD),
         positive=(MAX_LATENESS,),
         nonnegative=(MAX_SPREAD,),
+    ),
+    MERGE_SPANS: Macro(
+        name=MERGE_SPANS,
+        params=(MacroParam("rows", "stream", "data"),),
+        output="data",
+        expand=_merge_spans,
+        options=(MAX_SPAN,),
+        positive=(MAX_SPAN,),
     ),
     "loudnorm2": Macro(
         name="loudnorm2",

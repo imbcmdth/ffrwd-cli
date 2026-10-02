@@ -83,6 +83,7 @@ __all__ = [
     "DEFAULT_TIMEOUT_SECONDS",
     "LANGUAGE_TAGS",
     "MODEL_SUFFIX",
+    "NODE_WORLD",
     "PACKET_FILTER_WORLD",
     "PACKET_SOURCE_WORLD",
     "FFMPEG_SAMPLE_FMTS",
@@ -242,6 +243,11 @@ DATA_FILTER_WORLD = "ffrwd:av@0.17.0"
 
 # The first world whose sidecar hosts a codec package's encoder and decoder.
 CODEC_WORLD = "ffrwd:av@0.18.0"
+
+# What a module exporting the 0.19.0 world's `node` describes as its world:
+# its ports are not in its describe at all but in its shape, per call
+# (:mod:`ffrwd.shapes`).
+NODE_WORLD = "node-module"
 
 # The sample formats one can carry, the pcm each of them travels as, and
 # the name ffmpeg's own options spell it by.
@@ -631,6 +637,8 @@ class Described:
     # reads. None for every other module; a codec module fills both.
     encoder: EncoderInfo | None = None
     decoder: DecoderInfo | None = None
+    # A node: what it reads and writes is its shape's to say, per call.
+    node: bool = False
 
     @property
     def packet_sink(self) -> bool:
@@ -776,12 +784,13 @@ def _described(path: str, payload: object) -> Described:
             f"the sidecar described {path} with something that is not an object",
             hint="the module may be built against a sidecar this ffrwd does not know",
         )
-    world = payload.get("world")
-    if not isinstance(world, str):
+    written = payload.get("world")
+    if not isinstance(written, str):
         raise _reject(
             f"the sidecar's description of {path} names no world",
             hint="the module may be built against a sidecar this ffrwd does not know",
         )
+    world = _hosted_world(written)
     name = payload.get("name")
     functions = _functions(payload.get("functions"))
     if not isinstance(name, str) and not functions:
@@ -847,7 +856,19 @@ def _described(path: str, payload: object) -> Described:
         feeders=_feeders(payload.get("feeders")),
         encoder=_encoder_info(payload.get("encoder")),
         decoder=_decoder_info(payload.get("decoder")),
+        node=written == NODE_WORLD or payload.get("node") is True,
     )
+
+
+def _hosted_world(world: str) -> str:
+    """The world the sidecar hosts a module in, as the compiler's checks read it.
+
+    The sidecar describes a module by the world it hosts it in, not the one
+    it was built against: a node is `node-module`, which is 0.19.0's, and
+    every older module is adapted into the newest world it knows. Each
+    `hosts_*` check asks what that world can host.
+    """
+    return WORLDS[-1] if world == NODE_WORLD else world
 
 
 def _encoder_info(value: object) -> EncoderInfo | None:
