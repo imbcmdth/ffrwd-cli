@@ -221,9 +221,10 @@ WIRE_PIX_FMTS: tuple[str, ...] = ("rgba", "yuv420p", "yuv422p", "yuv444p")
 WIRE_SAMPLE_FMTS: tuple[str, ...] = ("f32", "s16")
 SAMPLE_FMT_CODECS: Mapping[str, str] = {"f32": "pcm_f32le", "s16": "pcm_s16le"}
 
-# The width and height of the picture a data filter's CLOCK pad is handed: it
-# reads the pts and nothing else, so each frame is made as small as a frame
-# can usefully be before it crosses the pipe.
+# The width and height of the picture a data filter's CLOCK pad, or a node's
+# input read for its timing alone, is handed: it reads the pts and nothing
+# else, so each frame is made as small as a frame can usefully be before it
+# crosses the pipe.
 CLOCK_SIZE = 16
 
 # The filters whose output pads are interchangeable copies of one input, and so
@@ -498,6 +499,15 @@ def _read_pairs(d: Mapping[str, object], key: str) -> tuple[tuple[str, object], 
     return tuple(_read_object(d, key).items())
 
 
+def _read_size(value: object) -> tuple[int, int] | None:
+    if not isinstance(value, list) or len(value) != 2:
+        return None
+    width, height = value
+    if not isinstance(width, int) or not isinstance(height, int):
+        return None
+    return width, height
+
+
 def _read_stream_type(value: object) -> StreamType:
     try:
         return _parse_stream_type(value)
@@ -520,6 +530,10 @@ class VideoFormat:
     The edge into a PACKET SINK carries the encoder's output instead: `codec`
     is then the encoder, and `options` the validated sink options shaping it
     (crf, preset and kin), rendered on the producing ffmpeg's output.
+
+    `geometry` is the size the pictures stand for where the edge carries
+    them smaller: a stream only timing inputs read crosses at
+    :data:`CLOCK_SIZE` square, and its readers are told this one.
     """
 
     pix_fmt: str = DEFAULT_PIX_FMT
@@ -529,6 +543,7 @@ class VideoFormat:
     container: str = NUT
     codec: str = RAWVIDEO
     options: tuple[tuple[str, object], ...] = ()
+    geometry: tuple[int, int] | None = None
 
     @property
     def size(self) -> str | None:
@@ -548,10 +563,13 @@ class VideoFormat:
         }
         if self.options:
             written["options"] = dict(self.options)
+        if self.geometry is not None:
+            written["geometry"] = {"width": self.geometry[0], "height": self.geometry[1]}
         return written
 
     @classmethod
     def from_dict(cls, d: Mapping[str, object]) -> VideoFormat:
+        geometry = d.get("geometry")
         return cls(
             pix_fmt=_read_text(d, "pix_fmt"),
             width=_read_maybe_whole(d, "width"),
@@ -560,6 +578,12 @@ class VideoFormat:
             container=_read_text(d, "container", NUT),
             codec=_read_text(d, "codec", RAWVIDEO),
             options=_read_pairs(d, "options"),
+            geometry=None
+            if geometry is None
+            else (
+                _read_whole(_read_object(d, "geometry"), "width"),
+                _read_whole(_read_object(d, "geometry"), "height"),
+            ),
         )
 
 
@@ -1285,6 +1309,10 @@ class SidecarProcess:
     # The tags the query wrote on what each ``-i`` of a node network carries,
     # in ``-i`` order: empty for an input it wrote none on.
     tags: tuple[tuple[tuple[str, str], ...], ...] = ()
+    # The size of each picture of each ``-i`` that crosses smaller than it
+    # is, by its position among the input's pictures, in ``-i`` order: None
+    # for a picture at its own size, and empty for an input with none.
+    geometries: tuple[tuple[tuple[int, int] | None, ...], ...] = ()
 
     @property
     def nodes(self) -> tuple[str, ...]:
@@ -1372,6 +1400,11 @@ class SidecarProcess:
             written["colors"] = [dict(one) for one in self.colors]
         if self.tags:
             written["tags"] = [dict(one) for one in self.tags]
+        if self.geometries:
+            written["geometries"] = [
+                [None if size is None else list(size) for size in one]
+                for one in self.geometries
+            ]
         if self.network and self.graph is not None:
             written["graph"] = self.graph.to_dict()
         return written
@@ -1433,6 +1466,11 @@ class SidecarProcess:
                 tuple((str(key), str(value)) for key, value in one.items())
                 for one in _read_list(d, "tags")
                 if isinstance(one, dict)
+            ),
+            geometries=tuple(
+                tuple(_read_size(size) for size in one)
+                for one in _read_list(d, "geometries")
+                if isinstance(one, list)
             ),
         )
 
@@ -2071,8 +2109,12 @@ class _Partitioner:
         models: Mapping[str, ModelBinding] | None = None,
         effects: Mapping[str, tuple[str, ...]] | None = None,
         anchors: Mapping[str, tuple[int, int]] | None = None,
+        small: Mapping[str, tuple[int, int]] | None = None,
     ) -> None:
         self.g = g
+        # The scales putting a picture only timing inputs read at
+        # CLOCK_SIZE, each with the size it stands for.
+        self.small = dict(small or {})
         self.probes = probes or {}
         self.pix_fmts = pix_fmts or {}
         self.shapes = shapes or {}
@@ -3037,7 +3079,13 @@ class _Partitioner:
 
     def _node_frames(self, name: str) -> int | None:
         """The frames node `name` holds past its clock: its window, the waits
-        its interval inputs add and its outputs' latency, at its pictures' rate."""
+        its interval inputs add and its outputs' latency, at its pictures' rate.
+
+        A node reading no picture holds that time in frames of the bound: the
+        pictures of the input its clock comes from, or
+        :data:`LONGEST_FRAME_SECONDS` each where that input has none
+        (:meth:`_bound_frame_seconds`).
+        """
         if self._paths is None:
             self._paths = paths_of(self.g, self.probes)
         paths = self._paths
@@ -3053,7 +3101,11 @@ class _Partitioner:
         if own <= 0:
             return 0
         video = next((ref for ref in node.inputs if ref_type(self.g, ref) == "video"), None)
-        rate = paths.rate(video) if video is not None else None
+        if video is None:
+            timed = refs[0] if refs else next(iter(node.inputs), None)
+            seconds = self._picture_seconds(timed) if timed is not None else None
+            return math.ceil(own / (seconds or LONGEST_FRAME_SECONDS))
+        rate = paths.rate(video)
         return None if rate is None else math.ceil(own * rate)
 
     def _node_delays(self, names: Sequence[str]) -> dict[str, int | None]:
@@ -3667,7 +3719,7 @@ class _Partitioner:
             return False
         if self.external.get(name, False):
             return self._shape(name).one_to_one
-        return self.g.nodes[name].filter in SPLIT_FILTERS
+        return self.g.nodes[name].filter in SPLIT_FILTERS or name in self.small
 
     def _anchor(self, ref: FrameRef) -> str:
         """The point `ref` is in lockstep with: back through one-to-one nodes."""
@@ -4738,6 +4790,7 @@ class _Partitioner:
             width=size[0] if size else None,
             height=size[1] if size else None,
             timebase=_timebase(meta.fps) if meta else None,
+            geometry=self.small.get(_ref_node(self._past_splits(ref)) or ""),
         )
 
     def _carried_pix_fmt(self, ref: FrameRef) -> str | None:
@@ -4762,6 +4815,107 @@ class _Partitioner:
             )
         meta = self._origin_meta(current)
         return meta.pix_fmt if meta is not None else None
+
+    def timing_reads(self) -> dict[FrameRef, tuple[list[str], tuple[int, int]]]:
+        """The pictures a node region reads off an ffmpeg for their timing
+        alone, each with the region's members and the picture's size.
+
+        A picture qualifies where every port the region hands it to reads it
+        for its timing: a port reading its pixels shares the one read, which
+        then crosses whole. One of no known size, or one already no bigger
+        than :data:`CLOCK_SIZE` square, does not.
+        """
+        found: dict[FrameRef, tuple[list[str], tuple[int, int]]] = {}
+        for members in self._regions():
+            if not any(name in self.node_shapes for name in members):
+                continue
+            inside = set(members)
+            for ref, _ in self._region_reads(members):
+                producer = _ref_node(ref)
+                if ref_type(self.g, ref) != "video" or (
+                    producer is not None and self.external.get(producer, False)
+                ):
+                    continue
+                size = self._picture_size(ref)
+                if size is None or size[0] * size[1] <= CLOCK_SIZE * CLOCK_SIZE:
+                    continue
+                reads = [
+                    (name, position)
+                    for name in members
+                    if self.external[name]
+                    for position, read in enumerate(self.g.nodes[name].inputs)
+                    if self._served_by(read, ref, inside)
+                ]
+                if reads and all(self._timing_port(name, at) for name, at in reads):
+                    found[ref] = (list(members), size)
+        return found
+
+    def _served_by(self, read: FrameRef, ref: FrameRef, inside: Collection[str]) -> bool:
+        """Whether a region member's `read` is handed the region's read of
+        `ref`: itself, a copy bound to it, or a split inside the region."""
+        seen: set[FrameRef] = set()
+        while read not in seen:
+            seen.add(read)
+            read = self.same_reads.get(read, read)
+            if read == ref:
+                return True
+            producer = _ref_node(read)
+            if producer is None or producer not in inside or self.external[producer]:
+                return False
+            read = self.g.nodes[producer].inputs[0]
+        return False
+
+    def _timing_port(self, name: str, position: int) -> bool:
+        """Whether node `name` reads its `position`-th input as a picture for
+        its timing alone."""
+        shape = self.node_shapes.get(name)
+        port = shape.input(self.g.nodes[name].ports[position]) if shape is not None else None
+        return port is not None and port.kind == "video" and port.accepts.wants == "timing"
+
+    def shrunk(
+        self, reads: Mapping[FrameRef, tuple[list[str], tuple[int, int]]]
+    ) -> tuple[Graph, dict[str, tuple[int, int]]]:
+        """The graph with each of `reads` scaled to :data:`CLOCK_SIZE` square
+        before its region reads it, and each scale's name with the size its
+        picture stands for. The scale keeps the pixel format."""
+        before: dict[str, list[Node]] = {}
+        rewired: dict[str, Node] = {}
+        tags = dict(self.g.stream_tags)
+        made: dict[str, tuple[int, int]] = {}
+        for ref, (members, size) in reads.items():
+            readers = [
+                member
+                for member in members
+                if ref in rewired.get(member, self.g.nodes[member]).inputs
+            ]
+            if not readers:
+                continue
+            name = _unique_alias(f"{ref}_small", self.g.nodes)
+            for member in readers:
+                node = rewired.get(member, self.g.nodes[member])
+                rewired[member] = replace(
+                    node, inputs=[name if read == ref else read for read in node.inputs]
+                )
+            first = next(member for member in self.g.nodes if member in readers)
+            before.setdefault(first, []).append(
+                Node(
+                    id=name,
+                    filter="scale",
+                    args={"width": CLOCK_SIZE, "height": CLOCK_SIZE},
+                    inputs=[ref],
+                    outputs=["video"],
+                )
+            )
+            said = {**tags.get(self._past_splits(ref), {}), **tags.get(ref, {})}
+            if said:
+                tags[name] = said
+            made[name] = size
+        nodes: dict[str, Node] = {}
+        for member, node in self.g.nodes.items():
+            for scale in before.get(member, []):
+                nodes[scale.id] = scale
+            nodes[member] = rewired.get(member, node)
+        return replace(self.g, nodes=nodes, stream_tags=tags), made
 
     def _reads_timing(self, name: str, ref: FrameRef) -> bool:
         """Whether node `name` reads `ref`, or a split's copy of it, for its
@@ -5223,6 +5377,7 @@ class _Partitioner:
             tags=self._region_tags(incoming, alias_of, read_order)
             if sidecar.node_network
             else (),
+            geometries=self._region_geometries(incoming, read_as, read_order),
             reads_rows=any(e.annotations for e in self.edges if e.target == sidecar.id),
             writes_rows=any(e.annotations for e in self.edges if e.source == sidecar.id),
             rows_modules=self._rows_modules(sidecar, members),
@@ -5272,6 +5427,28 @@ class _Partitioner:
         if not found:
             return ()
         return tuple(found.get(alias, ()) for alias in order)
+
+    def _region_geometries(
+        self,
+        incoming: Sequence[StreamEdge],
+        read_as: Mapping[FrameRef, FrameRef],
+        order: Sequence[str],
+    ) -> tuple[tuple[tuple[int, int] | None, ...], ...]:
+        """The size of each picture a node network's ``-i`` carries smaller
+        than it is, by its position among the input's pictures, in ``-i``
+        order."""
+        found: dict[str, list[tuple[int, int] | None]] = {}
+        for edge in incoming:
+            wire = edge.format
+            if not isinstance(wire, VideoFormat) or wire.geometry is None:
+                continue
+            alias, _, index = src_parts(read_as[edge.ref])
+            sizes = found.setdefault(alias, [])
+            sizes.extend([None] * (index + 1 - len(sizes)))
+            sizes[index] = wire.geometry
+        if not found:
+            return ()
+        return tuple(tuple(found.get(alias, ())) for alias in order)
 
     def _region_tags(
         self,
@@ -5575,9 +5752,17 @@ def partition(
     # this module rather than beside it.
     from . import startup
 
-    plan = _Partitioner(
+    partitioner = _Partitioner(
         g, external, probes, pix_fmts, shapes, audio_wires, models, effects, anchors
-    ).run()
+    )
+    reads = partitioner.timing_reads()
+    if reads:
+        shrunk, small = partitioner.shrunk(reads)
+        partitioner = _Partitioner(
+            shrunk, external, probes, pix_fmts, shapes, audio_wires, models, effects, anchors,
+            small,
+        )
+    plan = partitioner.run()
     plan = startup.arrange(plan)
     startup.check(plan)
     return plan

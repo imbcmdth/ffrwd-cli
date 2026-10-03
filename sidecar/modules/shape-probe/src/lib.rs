@@ -16,6 +16,8 @@
 //!   is handed, at its pts.
 //! - `mask`: `v`'s size in gray, left out when `v` is not bound.
 //! - `copy`: `v` itself, frame for frame.
+//! - `matte`: `size`'s size in gray, black, one per frame of it; left out
+//!   when `size` is not bound.
 //! - `canvas`: a video of the size `canvas` names, only when it does.
 //! - `spots`: data, one message per tick, as late as twelve of `v`'s frames
 //!   where the call says `v`'s rate and half a second where it does not.
@@ -36,7 +38,7 @@ use ffrwd::av::node_types::{
     Accepts, Anchor, Binding, BoundStream, Clock, Hold, InputPort, Interval, LikeInput, Message,
     NodeShape, OutputFormat, OutputPort, Pairing, PortKind, RowsUse,
 };
-use ffrwd::av::types::{Meta, Rational, VideoFormat, Wants};
+use ffrwd::av::types::{Meta, Rational, RawFrame, VideoFormat, Wants};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use serde::Deserialize;
@@ -217,6 +219,17 @@ fn shape(params: &Params, bound: &[Binding]) -> NodeShape {
             })),
         ));
     }
+    if bound.iter().any(|b| b.input == "size") {
+        outputs.push(output(
+            "matte",
+            PortKind::Video,
+            Some(OutputFormat::Like(LikeInput {
+                port: "size".to_string(),
+                pixel_format: Some("gray".to_string()),
+                sample_format: None,
+            })),
+        ));
+    }
     if let Some(canvas) = &params.canvas {
         outputs.push(output(
             "canvas",
@@ -300,6 +313,10 @@ struct ShapeProbe;
 /// Whether the query reads `copy`, as `init` was told.
 static LATCHED_COPY: AtomicBool = AtomicBool::new(false);
 
+/// The bytes of one `matte` picture, where the query reads it: `size`'s
+/// width by its height, as `init` was told them.
+static MATTE_LEN: AtomicU64 = AtomicU64::new(0);
+
 /// The calls this instance has had.
 static CALLS: AtomicU64 = AtomicU64::new(0);
 
@@ -344,6 +361,16 @@ impl Guest for ShapeProbe {
         HINT.with(|h| *h.borrow_mut() = hint);
         FETCH_SIZE.store(params(&params_text)?.fetch_size, Ordering::Relaxed);
         LATCHED_COPY.store(latched.iter().any(|l| l == "copy"), Ordering::Relaxed);
+        let matte = bound
+            .iter()
+            .find(|b| b.port == "size")
+            .and_then(|b| match &b.format {
+                Some(OutputFormat::Video(v)) => Some(u64::from(v.width) * u64::from(v.height)),
+                _ => None,
+            })
+            .filter(|_| latched.iter().any(|l| l == "matte"))
+            .unwrap_or(0);
+        MATTE_LEN.store(matte, Ordering::Relaxed);
         Ok(())
     }
 
@@ -402,6 +429,19 @@ impl Guest for ShapeProbe {
             if FETCH_SIZE.load(Ordering::Relaxed) {
                 for frame in &frames {
                     tick.fetch(id, frame.index);
+                }
+            }
+            let matte = MATTE_LEN.load(Ordering::Relaxed) as usize;
+            if matte > 0 {
+                for frame in &frames {
+                    items.push(Emission {
+                        port: "matte".to_string(),
+                        payload: Payload::Frame(RawFrame {
+                            pts: frame.pts,
+                            duration: frame.duration,
+                            data: vec![0; matte],
+                        }),
+                    });
                 }
             }
             let times: Vec<String> = frames.iter().map(|f| f.pts.to_string()).collect();

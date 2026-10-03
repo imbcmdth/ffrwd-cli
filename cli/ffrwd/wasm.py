@@ -2019,7 +2019,9 @@ def _argv(
     ``-pad '<json>'`` right after its own ``-i``, ``{"row": ..., "rendition":
     {...}}`` with absent attributes omitted -- a pad with none gets no flag.
     A node network's input carrying a raw picture gets its ``"color"`` there
-    too (:attr:`SidecarProcess.colors`), since NUT writes none.
+    too (:attr:`SidecarProcess.colors`), since NUT writes none, and the
+    ``"geometry"`` of each picture crossing smaller than it is
+    (:attr:`SidecarProcess.geometries`).
 
     `writes` is the mirror on the other side: one path per rows document the
     process writes, in document order, since a process writing several of
@@ -2068,6 +2070,12 @@ def _argv(
             tags = process.tags[index] if index < len(process.tags) else ()
             if tags:
                 pad["tags"] = dict(tags)
+            sizes = process.geometries[index] if index < len(process.geometries) else ()
+            if sizes:
+                pad["geometry"] = [
+                    None if size is None else {"width": size[0], "height": size[1]}
+                    for size in sizes
+                ]
             if pad:
                 argv += ["-pad", json.dumps(pad)]
     if any(grant.effect == "gpu" for grant in process.grants):

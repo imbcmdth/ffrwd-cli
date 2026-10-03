@@ -36,6 +36,15 @@ after an `-i` says what its NUT does not carry: a raw picture's colour, in
 ffmpeg's names, and tags for its streams beside their own, which reach a
 node in `stream-info.tags` (a hold input anchored `tagged` reads them).
 
+    -pad '{"geometry": [null, {"width": 1280, "height": 720}]}'
+
+gives the size of an input's pictures where the wire carries them smaller,
+by position among its video streams (the k-th is `[N:v:k]`; null keeps the
+header's). A picture so given is read only by timing inputs: they are told
+this size in its `video-format`, an output `like` one of them takes it, and
+each frame is checked against the header's size. A picture something reads
+the pixels of is refused.
+
 ## Nodes
 
     -m <name>=<path>
@@ -276,8 +285,9 @@ tick that held them.
   each frame's `pts` and `duration` and the stream's info, and no bytes:
   the host copies and converts nothing for it, a port feed's picture is
   not conformed, and `fetch` (or `same`) on its frames is a fault. Hand
-  it the stream in whatever raw format the source has cheapest; its
-  `accepts` formats are not checked. An audio timing input is re-cut by
+  it the stream in whatever raw format the source has cheapest, at any
+  size, with its own size in `-pad`'s `geometry`; its `accepts` formats
+  are not checked. An audio timing input is re-cut by
   sample count as any audio input is.
 - **Ordinal.** `tick.ordinal` is the tick's number in the run, from 0,
   counted over every instance: on every worker the same tick has the same

@@ -418,6 +418,17 @@ pub(crate) struct PadSpec {
     /// the query's `tags` column says them: `smart_timed` makes a feed timed.
     #[serde(default)]
     pub(crate) tags: std::collections::BTreeMap<String, String>,
+    /// The size of each of the input's pictures, by its position among them,
+    /// where the wire carries it smaller: a picture only timing inputs read
+    /// crosses at a few pixels, and its readers are told this size.
+    #[serde(default)]
+    pub(crate) geometry: Vec<Option<PadGeometry>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub(crate) struct PadGeometry {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -4612,6 +4623,7 @@ mod pad_spec_tests {
                 },
                 color: None,
                 tags: Default::default(),
+                geometry: Vec::new(),
             }
         );
     }

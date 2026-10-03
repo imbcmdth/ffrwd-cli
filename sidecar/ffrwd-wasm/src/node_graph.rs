@@ -62,6 +62,9 @@ struct StreamDef {
     /// The header an input carried, kept for an output that writes the same
     /// stream on.
     header: Option<nut::Stream>,
+    /// The format an input's pictures cross the wire in, where `-pad` gives
+    /// them another size: what each frame is checked against.
+    wire: Option<VideoFormat>,
     frame_rate: Option<(u64, u64)>,
     /// How the command line names it, for a refusal.
     spelling: String,
@@ -162,11 +165,28 @@ fn input_stream(
         decode_delay: u32::try_from(stream.decode_delay).unwrap_or(u32::MAX),
         latency: None,
         header: Some(stream.clone()),
+        wire: None,
         frame_rate: stream.frame_rate,
         spelling,
         rendition,
         row: pad.and_then(|p| p.row),
     })
+}
+
+/// `def` with the size `-pad` gives its pictures, where the wire carries them
+/// at another: a node reads the stream's own size, and each frame is checked
+/// against the wire's.
+fn sized(mut def: StreamDef, geometry: Option<crate::PadGeometry>) -> Result<StreamDef> {
+    let (Some(geometry), StreamFormat::Video(video)) = (geometry, &mut def.format) else {
+        return Ok(def);
+    };
+    let wire = *video;
+    video.width = geometry.width;
+    video.height = geometry.height;
+    video.frame_len = crate::frame_len_for(video.pix_fmt, geometry.width, geometry.height)
+        .with_context(|| format!("-pad geometry of {}", def.spelling))?;
+    def.wire = Some(wire);
+    Ok(def)
 }
 
 fn class_of(format: &StreamFormat) -> StreamClass {
@@ -345,9 +365,10 @@ fn pump(
         running = match &def.format {
             StreamFormat::Video(_) | StreamFormat::Audio(_) => {
                 let format = Format {
-                    media: match &def.format {
-                        StreamFormat::Video(v) => Media::Video(*v),
-                        StreamFormat::Audio(a) => Media::Audio(*a),
+                    media: match (&def.format, def.wire) {
+                        (_, Some(wire)) => Media::Video(wire),
+                        (StreamFormat::Video(v), None) => Media::Video(*v),
+                        (StreamFormat::Audio(a), None) => Media::Audio(*a),
                         _ => unreachable!("matched as frames"),
                     },
                     time_base: def.base,
@@ -436,8 +457,15 @@ fn open(
             let id = streams.len() as u32;
             match input_stream(args, input, index, stream) {
                 Ok(def) => {
-                    classes.entry(class_of(&def.format)).or_default().push(id);
-                    streams.push(def);
+                    let class = classes.entry(class_of(&def.format)).or_default();
+                    let geometry = args
+                        .pads
+                        .get(input)
+                        .and_then(Option::as_ref)
+                        .filter(|_| matches!(def.format, StreamFormat::Video(_)))
+                        .and_then(|pad| pad.geometry.get(class.len()).copied().flatten());
+                    class.push(id);
+                    streams.push(sized(def, geometry)?);
                 }
                 Err(_) if stream.class() == nut::ANNOTATION_CLASS => {
                     streams.push(StreamDef {
@@ -447,6 +475,7 @@ fn open(
                         decode_delay: 0,
                         latency: None,
                         header: None,
+                        wire: None,
                         frame_rate: None,
                         spelling: format!("the annotation stream of input {input}"),
                         rendition: RenditionMeta::default(),
@@ -607,6 +636,7 @@ fn open(
                     decode_delay: 0,
                     latency: Some(0.0),
                     header: None,
+                    wire: None,
                     frame_rate: None,
                     spelling: format!("[{label}], the rows of {}", call.module),
                     rendition: RenditionMeta::default(),
@@ -738,6 +768,21 @@ fn open(
         .copied()
         .filter(|id| !bytes_read.contains(id))
         .collect();
+    for id in input_ids.iter().flatten() {
+        let def = &streams[*id as usize];
+        if let (Some(wire), StreamFormat::Video(video)) = (def.wire, &def.format) {
+            if !timing.contains(id) {
+                bail!(
+                    "{} crosses at {}x{} and -pad gives it {}x{}, and something reads its                      pixels; only inputs read for their timing take a picture of another size",
+                    def.spelling,
+                    wire.width,
+                    wire.height,
+                    video.width,
+                    video.height
+                );
+            }
+        }
+    }
     let read: HashSet<u32> = consumers.keys().copied().collect();
     for spec in &mut lanes {
         for port in spec.ports.iter_mut() {
@@ -1011,6 +1056,7 @@ fn output_streams(
             base,
             latency: Some(output.latency),
             header,
+            wire: None,
             frame_rate,
             spelling: String::new(),
             rendition: RenditionMeta::default(),
@@ -1462,6 +1508,7 @@ fn listen_for(
             decode_delay: 0,
             latency: None,
             header: None,
+            wire: None,
             frame_rate: None,
             spelling: format!(
                 "the data on 127.0.0.1:{} for input '{}' of {name}",
@@ -1549,6 +1596,7 @@ fn listen_on(
         decode_delay: 0,
         latency: None,
         header: None,
+        wire: None,
         frame_rate: None,
         spelling: format!(
             "the feed on 127.0.0.1:{port} for input '{}' of {name}",
@@ -1900,6 +1948,7 @@ fn open_host(call: &NodeCall, pads: &[(String, u32)], defs: &[StreamDef]) -> Res
         decode_delay: 0,
         latency: Some(def.latency.unwrap_or(0.0) + latency),
         header: None,
+        wire: None,
         frame_rate: None,
         spelling: String::new(),
         rendition: RenditionMeta::default(),
@@ -2133,6 +2182,98 @@ mod tests {
             bytes,
             10 * 64 * 64 * 4,
             "the large picture as the clock is carried whole, the small as timing not at all"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_timing_input_is_told_the_size_its_pad_gives_and_an_output_like_it_takes_that_size() {
+        let Some(probe) = probe() else {
+            eprintln!("wasm32-wasip2 is not installed: the geometry test has no module to run");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("ffrwd-geometry-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let tenths = nut::TimeBase { num: 1, den: 10 };
+        let clock = nut::Stream::video("rgba", 4, 4, tenths).expect("rgba");
+        let small = nut::Stream::video("yuv420p", 16, 16, tenths).expect("yuv420p");
+        let mut wire = Vec::new();
+        {
+            let mut muxer = nut::Muxer::with_streams(&mut wire, &[clock, small]).expect("headers");
+            for k in 0..3i64 {
+                muxer.write_frame_to(0, k, &[k as u8; 64]).expect("a frame");
+                muxer
+                    .write_frame_to(1, k, &[k as u8; 16 * 16 * 3 / 2])
+                    .expect("a frame");
+            }
+        }
+        let input = dir.join("in.nut");
+        std::fs::write(&input, &wire).expect("write the input");
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
+            listener.local_addr().expect("its address").port()
+        };
+        let matte = dir.join("matte.nut");
+        let run = |chain: &str| {
+            let argv: Vec<String> = [
+                "-f",
+                "nut",
+                "-i",
+                &input.display().to_string(),
+                "-pad",
+                r#"{"geometry": [null, {"width": 1280, "height": 720}]}"#,
+                "-m",
+                &format!("shape_probe={probe}"),
+                "-filter_complex",
+                chain,
+                "-map",
+                "[m]",
+                "-f",
+                "nut",
+                &matte.display().to_string(),
+            ]
+            .iter()
+            .map(|a| a.to_string())
+            .collect();
+            let args = crate::parse_args(argv).expect("a command line");
+            let crate::Modules::Network { bindings, wiring } = &args.modules else {
+                panic!("a network");
+            };
+            run_carrying(&args, bindings, wiring)
+        };
+
+        let carried = run(&format!(
+            "[v=0:v][size=0:v:1]shape_probe=port={port}[spots=s][matte=m]"
+        ))
+        .expect("the run");
+        assert_eq!(
+            carried.bytes.load(Ordering::Relaxed),
+            3 * 64,
+            "the timing input's pictures are not carried"
+        );
+        let written = std::fs::read(&matte).expect("the matte");
+        let mut demuxer = nut::Demuxer::open(written.as_slice()).expect("read the NUT headers");
+        assert_eq!(demuxer.stream().pix_fmt(), Some("gray"));
+        assert_eq!(demuxer.stream().video_geometry(), Some((1280, 720)));
+        let mut buf = Vec::new();
+        let mut frames = Vec::new();
+        while let Some(packet) = demuxer.read_packet(&mut buf).expect("a packet") {
+            frames.push((packet.pts, buf.len()));
+        }
+        assert_eq!(
+            frames,
+            vec![(0, 1280 * 720), (1, 1280 * 720), (2, 1280 * 720)]
+        );
+
+        let refused = run(&format!(
+            "[v=0:v:1][size=0:v]shape_probe=port={port}[spots=s][matte=m]"
+        ))
+        .expect_err("a picture read for its pixels at another size is refused");
+        assert!(
+            refused
+                .to_string()
+                .contains("crosses at 16x16 and -pad gives it 1280x720"),
+            "{refused:#}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

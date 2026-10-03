@@ -597,11 +597,13 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
     query compiled against. A node at a COPY's TO is asked once for its
     ports and again with the streams the SELECT binds there.
   - An input the module reads for its timing alone (`wants` `timing`)
-    is handed the stream in the format it already has: nothing converts
-    or conforms it, and where another port of the region reads the same
-    stream, it binds that one. `boxes_mask(v, detect(v))` sends the
-    picture once, in the format `detect` takes. `explain` says `timing`
-    for it.
+    is handed the stream in the format it already has, scaled to 16x16
+    before it leaves ffmpeg: nothing converts or conforms it, and the
+    node is told the picture's own size. Where another port of the
+    region reads the same stream, it binds that one, which crosses
+    whole. `boxes_mask(v, detect(v))` sends the picture once, in the
+    format `detect` takes. `explain` says `timing` for it, and its
+    diagram labels the small picture's edge `timing, 16x16`.
   - One region of a sidecar holds the nodes the query wires together,
     and everything one process hands another travels as one NUT. A
     signature only a node can carry (kinds mixed, a stream left out, a
