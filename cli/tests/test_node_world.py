@@ -972,6 +972,31 @@ def test_nodes_taking_one_picture_in_different_formats_get_a_stream_each(
     )
 
 
+@pytest.mark.parametrize(
+    ("select", "node"), [("ring(p.v, spot(p.v))", "ring"), ("burn(p.v)", "burn")],
+    ids=["split", "alone"],
+)
+def test_a_picture_reaching_a_node_through_a_leaky_crosses_in_the_format_it_takes(
+    monkeypatch: pytest.MonkeyPatch, select: str, node: str
+) -> None:
+    """A leaky hands on the pictures it reads, so a region holding it and a
+    node reading its output in rgba is handed rgba on the way in."""
+    monkeypatch.setitem(SHAPES, "spot.wasm", _taking(_spot, "video", _TIMING))
+    monkeypatch.setitem(SHAPES, "ring.wasm", _taking(_reader("spots", _ROWS), "video", _RGBA))
+    monkeypatch.setitem(SHAPES, "burn.wasm", _taking(_burn, "video", _RGBA))
+    argv = _plan_argv(
+        "COPY (WITH p AS (SELECT ffrwd.leaky(f.video[1], max_lateness => 0.5) AS v "
+        f"FROM input('f.mp4', realtime => true) f) SELECT {select} FROM p) TO 'out.mkv'",
+        monkeypatch,
+        pix_fmt="yuv420p",
+    )
+    (sidecar,) = [words for pid, words in argv.items() if pid.startswith("sidecar")]
+    chain = sidecar[sidecar.index("-filter_complex") + 1]
+    assert chain.startswith("[0:v]leaky=") and f"{node}[v=out0]" in chain
+    feeder = _feeder(argv)
+    assert feeder[feeder.index("-pix_fmt:0") + 1] == "rgba"
+
+
 def test_each_stream_of_one_nut_is_conformed_to_the_port_it_feeds(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
