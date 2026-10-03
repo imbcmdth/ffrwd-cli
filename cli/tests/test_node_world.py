@@ -1505,7 +1505,7 @@ def test_a_packets_function_over_a_node_hands_back_the_stream_still_coded(
 
 def _switch(params: Mapping[str, object], bound: Sequence[str]) -> dict[str, object]:
     """The switch: clocked by its picture, or with no `v` bound by its sound,
-    1024 samples a tick."""
+    as ffrwd/switch 0.5.2's ``--shape --bound a,feed_audio`` prints it."""
     hold = {"kind": "hold", "anchor": {"kind": "first-frame"}, "lead": 0.3, "port_param": "port"}
     if "v" in bound:
         return _shape(
@@ -1514,23 +1514,48 @@ def _switch(params: Mapping[str, object], bound: Sequence[str]) -> dict[str, obj
             [_output("v", "video"), _output("a", "audio")],
             {"kind": "input", "port": "v"},
         )
+    f32 = {"sample_formats": ["f32"]}
+    rows = {"kind": "data", "latency": 0.0, "format": {"kind": "data", "codec": "json"}}
     return _shape(
-        [_clock("a", "audio", window=1024), _input("feed_audio", "audio", hold)],
-        [_output("a", "audio")],
+        [
+            {**_clock("a", "audio", window=1024), "accepts": f32},
+            {
+                **_input(
+                    "feed_audio",
+                    "audio",
+                    {**hold, "anchor": {"kind": "tagged", "tag": "smart_timed"},
+                     "group": "switch", "timeout": 1.0},
+                ),
+                "accepts": {**f32, "like": "a"},
+            },
+        ],
+        [
+            {"name": "a", "kind": "audio", "latency": 0.0,
+             "format": {"kind": "like", "port": "a"}},
+            {"name": "clock", **rows},
+            {"name": "feeds", **rows},
+            {"name": "feed_rows", **rows},
+        ],
         {"kind": "input", "port": "a"},
+        pure=False,
+        one_to_one=True,
     )
 
 
 @pytest.mark.parametrize(
     "call",
     ["switch(f.video[1], f.audio[1], feed_audio => ad.audio[1])",
-     "switch(a => f.audio[1], feed_audio => ad.audio[1])"],
+     "switch(a => f.audio[1], feed_audio => ad.audio[1])",
+     "switch(a => setpts(aresample(f.audio[1], 48000), 'PTS+10/TB'), "
+     "feed_audio => ad.audio[1])"],
+    ids=["picture", "sound", "sound-retimed"],
 )
 def test_a_node_clocked_by_its_sound_beside_the_picture_of_one_live_input_compiles(
     monkeypatch: pytest.MonkeyPatch, call: str
 ) -> None:
     """Its window is counted in time, as a picture's is, so the edge its
-    sound leaves the live reader on is bounded rather than refused."""
+    sound leaves the live reader on is bounded rather than refused. A
+    retimed sound keeps its sample rate, the rate the window counts in."""
     monkeypatch.setitem(SHAPES, "switch.wasm", _switch)
     monkeypatch.setitem(_PARAMS, "switch.wasm", {"port": {"type": "integer"}})
     monkeypatch.setitem(
@@ -1554,7 +1579,9 @@ def test_a_node_clocked_by_its_sound_beside_the_picture_of_one_live_input_compil
         shape=_Asked(),
     )
     assert compiled.plan is not None
-    sound = [e for e in compiled.plan.stream_edges if e.ref == "src:f:a:0"]
+    edges = compiled.plan.stream_edges
+    reader = next(e.source for e in edges if e.ref == "src:f:v:0")
+    sound = [e for e in edges if e.source == reader and e.ref != "src:f:v:0"]
     assert sound and all(e.live for e in sound)
 
 
