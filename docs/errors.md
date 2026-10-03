@@ -729,6 +729,14 @@ The third message under this code refuses a live input to a packet sink read at 
 {"line": 5, "col": 38, "code": "UNBOUNDED_LIVE_INPUT", "message": "'live.m3u8' never ends, and a compile-time read reads a stream to the end", "hint": "a live stream is read at run time, by the same module written as a destination: COPY (SELECT ...) TO records()"}
 ```
 
+## LIVE_LEAD
+
+**Meaning:** A node bounds how long it waits for one of its inputs: it acts some time ahead of what that input says (an ad decision announced before the break, a playout that starts its next item early), and its shape says so as the input's `interval.latency`. In a live run what arrives past that bound is late for good. The compiler adds up how far behind the source the path feeding that input runs - every window and declared latency on the way - and refuses the query when that is more than the bound. [Recipe 153](examples.md#153-see-what-each-node-waits-for) shows where the sums are printed.
+
+**Fires when:** the query has a live input, or a node read in FROM that never ends, and a node's input paired by interval with a bound is fed by a path that runs later than its clock by more than that bound. Never for a file run: nothing there is late, and the node waits for its input as long as it takes.
+
+The anchor is the declaration of the node that needs the lead.
+
 ## BUFFER_OVERFLOW
 
 **Meaning:** Not a compile rejection - the one code a RUN produces. The buffers a plan sized from its bounds were not deep enough, and the pipeline wedged: nothing crossed any pipe of the stage, and no process of it used any CPU, while every one was still alive and one of them was still waiting to hand its bytes over. The CPU is half the test: a stage's pumped pipes are not all the pipes it has, so a process computing over what it read stands still on all of them without being wedged. `ffrwd run` reports it instead of letting the stage sit until the timeout, so the message names the edge, the depth it was given, and how long nothing moved - never a bare "timed out", and never a silently dropped frame.

@@ -67,6 +67,12 @@
 //! 0.18.0 adds `encoder` and `decoder`, a codec package's frames-to-packets
 //! and packets-to-frames, hosted by [`Encoder`] and [`Decoder`]: every other
 //! interface is 0.17.0's unchanged.
+//!
+//! 0.19.1 is the node world: one `node` interface in place of every stream
+//! interface above, hosted by [`WitNode`], and `values`, `encoder` and
+//! `decoder` carried on unchanged. Every older stream interface is still
+//! hosted here and run as a node by the sidecar's adapters, so 0.18.0 is the
+//! newest world any of them is in.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -88,15 +94,15 @@ use crate::nn;
 /// world is recognised without consulting the older ones. The current world is
 /// `wit/`; each older one is kept whole under `worlds/<version>/`.
 pub const WORLDS: &[&str] = &[
-    "0.18.0", "0.17.0", "0.16.0", "0.15.0", "0.14.0", "0.13.0", "0.12.0", "0.11.0", "0.10.0",
-    "0.9.0", "0.8.0", "0.7.0", "0.6.0", "0.5.0", "0.4.0", "0.3.0", "0.2.0",
+    "0.19.1", "0.18.0", "0.17.0", "0.16.0", "0.15.0", "0.14.0", "0.13.0", "0.12.0", "0.11.0",
+    "0.10.0", "0.9.0", "0.8.0", "0.7.0", "0.6.0", "0.5.0", "0.4.0", "0.3.0", "0.2.0",
 ];
 
-/// The world new modules target, and the one every older world is adapted to.
+/// The newest world of the stream interfaces the node replaces: what a
+/// module built against an older one of them is told to rebuild against.
 pub const WORLD: &str = "0.18.0";
 
-/// The wit package a module targets, spelled as it appears in a module
-/// description.
+/// [`WORLD`] spelled as a module description names a package.
 pub const WORLD_PACKAGE: &str = "ffrwd:av@0.18.0";
 
 /// The component export name an interface carries in a given world.
@@ -310,11 +316,11 @@ mod world_0180 {
     }
 
     pub mod video {
-        wasmtime::component::bindgen!({ path: "../wit", world: "video-module" });
+        wasmtime::component::bindgen!({ path: "../worlds/0.18.0", world: "video-module" });
     }
     pub mod meta {
         wasmtime::component::bindgen!({
-            path: "../wit",
+            path: "../worlds/0.18.0",
             world: "meta-module",
             with: {
                 "ffrwd:av/types": crate::runtime::world_0180::video::ffrwd::av::types,
@@ -324,7 +330,7 @@ mod world_0180 {
     }
     pub mod window {
         wasmtime::component::bindgen!({
-            path: "../wit",
+            path: "../worlds/0.18.0",
             world: "window-module",
             with: {
                 "ffrwd:av/types": crate::runtime::world_0180::video::ffrwd::av::types,
@@ -335,52 +341,52 @@ mod world_0180 {
     }
     pub mod packet {
         wasmtime::component::bindgen!({
-            path: "../wit",
+            path: "../worlds/0.18.0",
             world: "packet-sink-module",
             with: { "ffrwd:av/types": crate::runtime::world_0180::video::ffrwd::av::types },
         });
     }
     pub mod packet_source {
         wasmtime::component::bindgen!({
-            path: "../wit",
+            path: "../worlds/0.18.0",
             world: "packet-source-module",
             with: { "ffrwd:av/types": crate::runtime::world_0180::video::ffrwd::av::types },
         });
     }
     pub mod values {
-        wasmtime::component::bindgen!({ path: "../wit", world: "values-module" });
+        wasmtime::component::bindgen!({ path: "../worlds/0.18.0", world: "values-module" });
     }
     pub mod rows {
         wasmtime::component::bindgen!({
-            path: "../wit",
+            path: "../worlds/0.18.0",
             world: "rows-module-host",
             with: { "ffrwd:av/types": crate::runtime::world_0180::video::ffrwd::av::types },
         });
     }
     pub mod packet_filter {
         wasmtime::component::bindgen!({
-            path: "../wit",
+            path: "../worlds/0.18.0",
             world: "packet-filter-module",
             with: { "ffrwd:av/types": crate::runtime::world_0180::video::ffrwd::av::types },
         });
     }
     pub mod data_filter {
         wasmtime::component::bindgen!({
-            path: "../wit",
+            path: "../worlds/0.18.0",
             world: "data-filter-module",
             with: { "ffrwd:av/types": crate::runtime::world_0180::video::ffrwd::av::types },
         });
     }
     pub mod encoder {
         wasmtime::component::bindgen!({
-            path: "../wit",
+            path: "../worlds/0.18.0",
             world: "encoder-module",
             with: { "ffrwd:av/types": crate::runtime::world_0180::video::ffrwd::av::types },
         });
     }
     pub mod decoder {
         wasmtime::component::bindgen!({
-            path: "../wit",
+            path: "../worlds/0.18.0",
             world: "decoder-module",
             with: { "ffrwd:av/types": crate::runtime::world_0180::video::ffrwd::av::types },
         });
@@ -389,7 +395,7 @@ mod world_0180 {
     // so one conversion serves a module whichever codec world it declared.
     pub mod codec {
         wasmtime::component::bindgen!({
-            path: "../wit",
+            path: "../worlds/0.18.0",
             world: "codec-module",
             with: {
                 "ffrwd:av/types": crate::runtime::world_0180::video::ffrwd::av::types,
@@ -399,6 +405,98 @@ mod world_0180 {
         });
     }
 }
+
+mod world_0191 {
+    stream_info_with_time_base!();
+    meta_with_rows_language!();
+
+    /// What this world's codec `init` is handed, from the host's own format.
+    /// `types` carries on from 0.18.0 unchanged.
+    pub fn format(format: &crate::runtime::Format) -> video::ffrwd::av::types::Format {
+        use video::ffrwd::av::types::{AudioFormat, Format, VideoFormat};
+        match format.media {
+            crate::runtime::Media::Video(video) => Format::Video(VideoFormat {
+                width: video.width,
+                height: video.height,
+                pix_fmt: video.pix_fmt.to_string(),
+                color: video.color.map(color_info),
+            }),
+            crate::runtime::Media::Audio(audio) => Format::Audio(AudioFormat {
+                sample_rate: audio.sample_rate,
+                channels: audio.channels,
+                sample_fmt: audio.sample_fmt.to_string(),
+                channel_layout: audio.channel_layout.map(str::to_string),
+            }),
+        }
+    }
+
+    /// The host's colorimetry in this world's spelling.
+    pub fn color_info(color: crate::runtime::ColorInfo) -> video::ffrwd::av::types::ColorInfo {
+        video::ffrwd::av::types::ColorInfo {
+            range: color.range.to_string(),
+            primaries: color.primaries.to_string(),
+            trc: color.trc.to_string(),
+            space: color.space.to_string(),
+        }
+    }
+
+    /// The host's rendition metadata in this world's spelling.
+    pub fn rendition_meta(
+        rendition: crate::runtime::RenditionMeta,
+    ) -> video::ffrwd::av::types::RenditionMeta {
+        video::ffrwd::av::types::RenditionMeta {
+            name: rendition.name,
+            bandwidth: rendition.bandwidth,
+            codecs: rendition.codecs,
+            language: rendition.language,
+        }
+    }
+
+    pub mod node {
+        wasmtime::component::bindgen!({
+            path: "../wit",
+            world: "node-module",
+            with: { "ffrwd:av/node-tick.tick": crate::runtime::node_world::TickHandle },
+            imports: { default: trappable },
+        });
+    }
+    // The macros every world shares reach `types` through a module of this
+    // name; in this world the node's expansion is the one that carries it.
+    pub use node as video;
+    pub mod values {
+        wasmtime::component::bindgen!({ path: "../wit", world: "values-module" });
+    }
+    pub mod encoder {
+        wasmtime::component::bindgen!({
+            path: "../wit",
+            world: "encoder-module",
+            with: { "ffrwd:av/types": crate::runtime::world_0191::node::ffrwd::av::types },
+        });
+    }
+    pub mod decoder {
+        wasmtime::component::bindgen!({
+            path: "../wit",
+            world: "decoder-module",
+            with: { "ffrwd:av/types": crate::runtime::world_0191::node::ffrwd::av::types },
+        });
+    }
+    pub mod codec {
+        wasmtime::component::bindgen!({
+            path: "../wit",
+            world: "codec-module",
+            with: {
+                "ffrwd:av/types": crate::runtime::world_0191::node::ffrwd::av::types,
+                "ffrwd:av/encoder": crate::runtime::world_0191::encoder::exports::ffrwd::av::encoder,
+                "ffrwd:av/decoder": crate::runtime::world_0191::decoder::exports::ffrwd::av::decoder,
+            },
+        });
+    }
+}
+
+mod node_world;
+pub use node_world::{
+    describe_node, exports_node, node_shape, output_format, FormatOf, WitNode, NODE_WORLD,
+};
 
 mod world_0170 {
     stream_info_with_time_base!();
@@ -1554,7 +1652,7 @@ impl CodedFormat {
 }
 
 /// One encoded stream a packet sink is opened for, fixed for its life.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CodedStream {
     /// ffmpeg's name for the codec, e.g. `h264`.
     pub codec: String,
@@ -1635,7 +1733,7 @@ macro_rules! arity_from_wit {
 }
 
 /// One encoded packet, exactly as the encoder emitted it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Packet {
     pub pts: i64,
     /// Absent for the first packets of a reordering stream, where the wire
@@ -1668,6 +1766,9 @@ pub enum Wants {
     Keyframes,
     /// The first packet of each stream, and no more.
     First,
+    /// A node's frame input read for its frames' times and its stream's
+    /// info alone: the host carries no pixels or samples for it.
+    Timing,
 }
 
 impl Wants {
@@ -1677,6 +1778,7 @@ impl Wants {
             Wants::All => "all",
             Wants::Keyframes => "keyframes",
             Wants::First => "first",
+            Wants::Timing => "timing",
         }
     }
 }
@@ -2065,6 +2167,12 @@ fn link(
     )
     .map_err(wasm_err)?;
     world_0110::window::ffrwd::av::window_source::add_to_linker::<_, HasSelf<_>>(
+        &mut linker,
+        |host: &mut Host| host,
+    )
+    .map_err(wasm_err)?;
+    // The tick a node's `process` reads through.
+    world_0191::node::ffrwd::av::node_tick::add_to_linker::<_, HasSelf<_>>(
         &mut linker,
         |host: &mut Host| host,
     )
@@ -3504,6 +3612,7 @@ pub fn describe(module_path: &str) -> Result<Described> {
 
 /// One instantiated values module, in whichever world it was built against.
 enum ValuesInstance {
+    W0191(world_0191::values::ValuesModule),
     W0180(world_0180::values::ValuesModule),
     W0170(world_0170::values::ValuesModule),
     W0160(world_0160::values::ValuesModule),
@@ -3541,6 +3650,7 @@ impl ValuesInstance {
             };
         }
         Ok(match self {
+            ValuesInstance::W0191(b) => listed!(b),
             ValuesInstance::W0180(b) => listed!(b),
             ValuesInstance::W0170(b) => listed!(b),
             ValuesInstance::W0160(b) => listed!(b),
@@ -3567,6 +3677,7 @@ impl ValuesInstance {
         args: &str,
     ) -> Result<Result<String, String>> {
         match self {
+            ValuesInstance::W0191(b) => b.ffrwd_av_values().call_invoke(store, name, args),
             ValuesInstance::W0180(b) => b.ffrwd_av_values().call_invoke(store, name, args),
             ValuesInstance::W0170(b) => b.ffrwd_av_values().call_invoke(store, name, args),
             ValuesInstance::W0160(b) => b.ffrwd_av_values().call_invoke(store, name, args),
@@ -3614,7 +3725,13 @@ fn instantiate_values(
     );
 
     let context = || format!("instantiating {module_path}");
-    let instance = if has_export(&component, &interface("values", "0.18.0")) {
+    let instance = if has_export(&component, &interface("values", "0.19.1")) {
+        ValuesInstance::W0191(
+            world_0191::values::ValuesModule::instantiate(&mut store, &component, &linker)
+                .map_err(wasm_err)
+                .with_context(context)?,
+        )
+    } else if has_export(&component, &interface("values", "0.18.0")) {
         ValuesInstance::W0180(
             world_0180::values::ValuesModule::instantiate(&mut store, &component, &linker)
                 .map_err(wasm_err)
@@ -3761,7 +3878,7 @@ pub const DATA_CODEC: &str = "json";
 
 /// The worlds whose `coded-format` has a data arm, so a module built against
 /// one can be handed a data stream at all.
-const DATA_WORLDS: &[&str] = &["0.18.0", "0.17.0"];
+const DATA_WORLDS: &[&str] = &["0.19.1", "0.18.0", "0.17.0"];
 
 /// The refusal a data stream meets at a sink or filter built against a
 /// world with no data arm, naming the module and the world.
@@ -4931,7 +5048,7 @@ impl PacketFilter {
 /// What the source read of one relation row: a rendition's name, bitrate
 /// and codec string, exactly as the manifest or catalog said them. None
 /// where nothing said so.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RenditionMeta {
     pub name: Option<String>,
     pub bandwidth: Option<u64>,
@@ -5038,7 +5155,7 @@ const COLOR_SPACES: &[&str] = &[
 // nothing before it. Each world's bindgen expansion is still its own nominal
 // type, which is why a shared function cannot do this instead.
 macro_rules! coded_conversions {
-    ($module:ident, $world:ident, $version:literal, { $($from_data:tt)* }, { $($to_data:tt)* }) => {
+    ($module:ident, $world:ident, $version:literal, { $($from_data:tt)* }, { $($to_data:tt)* } $(, $source:ident)?) => {
         mod $module {
             use super::*;
 
@@ -5157,6 +5274,7 @@ macro_rules! coded_conversions {
                 })
             }
 
+            #[allow(dead_code)]
             pub fn stream_info_from_wit(
                 info: $world::video::ffrwd::av::types::StreamInfo,
             ) -> StreamInfo {
@@ -5169,6 +5287,7 @@ macro_rules! coded_conversions {
                 }
             }
 
+            #[allow(dead_code)]
             pub fn rendition_from_wit(
                 r: $world::video::ffrwd::av::types::RenditionMeta,
             ) -> RenditionMeta {
@@ -5180,84 +5299,103 @@ macro_rules! coded_conversions {
                 }
             }
 
-            pub fn source_track_from_wit(
-                t: $world::packet_source::exports::ffrwd::av::packet_source::SourceTrack,
-                name: &str,
-            ) -> Result<SourceTrack> {
-                Ok(SourceTrack {
-                    stream: coded_stream_from_wit(t.coded, name)?,
-                    info: stream_info_from_wit(t.info),
-                    row: t.row,
-                    rendition: rendition_from_wit(t.rendition),
-                })
-            }
+            $(source_conversions!($world, $source);)?
+        }
+    };
+}
 
-            pub fn catalog_from_wit(
-                c: $world::packet_source::exports::ffrwd::av::packet_source::Catalog,
-                name: &str,
-            ) -> Result<Catalog> {
-                Ok(Catalog {
-                    tracks: c
-                        .tracks
+/// A packet source's catalog and pulls in the host's spelling, for a world
+/// that has the interface.
+macro_rules! source_conversions {
+    ($world:ident, $_source:ident) => {
+        pub fn source_track_from_wit(
+            t: $world::packet_source::exports::ffrwd::av::packet_source::SourceTrack,
+            name: &str,
+        ) -> Result<SourceTrack> {
+            Ok(SourceTrack {
+                stream: coded_stream_from_wit(t.coded, name)?,
+                info: stream_info_from_wit(t.info),
+                row: t.row,
+                rendition: rendition_from_wit(t.rendition),
+            })
+        }
+
+        pub fn catalog_from_wit(
+            c: $world::packet_source::exports::ffrwd::av::packet_source::Catalog,
+            name: &str,
+        ) -> Result<Catalog> {
+            Ok(Catalog {
+                tracks: c
+                    .tracks
+                    .into_iter()
+                    .map(|t| source_track_from_wit(t, name))
+                    .collect::<Result<Vec<_>>>()?,
+                bounded: c.bounded,
+            })
+        }
+
+        /// One `next()` call's own `pad-packets` list, in the host's own
+        /// shape.
+        pub fn pad_packets_from_wit(
+            pads: Vec<$world::packet_source::exports::ffrwd::av::packet_source::PadPackets>,
+        ) -> Vec<PadPackets> {
+            pads.into_iter()
+                .map(|p| PadPackets {
+                    packets: p
+                        .packets
                         .into_iter()
-                        .map(|t| source_track_from_wit(t, name))
-                        .collect::<Result<Vec<_>>>()?,
-                    bounded: c.bounded,
+                        .map(|pkt| Packet {
+                            pts: pkt.pts,
+                            dts: pkt.dts,
+                            duration: pkt.duration,
+                            keyframe: pkt.keyframe,
+                            data: pkt.data,
+                        })
+                        .collect(),
                 })
-            }
-
-            /// One `next()` call's own `pad-packets` list, in the host's own
-            /// shape.
-            pub fn pad_packets_from_wit(
-                pads: Vec<$world::packet_source::exports::ffrwd::av::packet_source::PadPackets>,
-            ) -> Vec<PadPackets> {
-                pads.into_iter()
-                    .map(|p| PadPackets {
-                        packets: p
-                            .packets
-                            .into_iter()
-                            .map(|pkt| Packet {
-                                pts: pkt.pts,
-                                dts: pkt.dts,
-                                duration: pkt.duration,
-                                keyframe: pkt.keyframe,
-                                data: pkt.data,
-                            })
-                            .collect(),
-                    })
-                    .collect()
-            }
+                .collect()
         }
     };
 }
 
 coded_conversions!(
+    conv_0191,
+    world_0191,
+    "0.19.1",
+    { crate::runtime::world_0191::video::ffrwd::av::types::CodedFormat::Data => CodedFormat::Data, },
+    { CodedFormat::Data => crate::runtime::world_0191::video::ffrwd::av::types::CodedFormat::Data, }
+);
+coded_conversions!(
     conv_0180,
     world_0180,
     "0.18.0",
     { crate::runtime::world_0180::video::ffrwd::av::types::CodedFormat::Data => CodedFormat::Data, },
-    { CodedFormat::Data => crate::runtime::world_0180::video::ffrwd::av::types::CodedFormat::Data, }
+    { CodedFormat::Data => crate::runtime::world_0180::video::ffrwd::av::types::CodedFormat::Data, },
+    source
 );
 coded_conversions!(
     conv_0170,
     world_0170,
     "0.17.0",
     { crate::runtime::world_0170::video::ffrwd::av::types::CodedFormat::Data => CodedFormat::Data, },
-    { CodedFormat::Data => crate::runtime::world_0170::video::ffrwd::av::types::CodedFormat::Data, }
+    { CodedFormat::Data => crate::runtime::world_0170::video::ffrwd::av::types::CodedFormat::Data, },
+    source
 );
 coded_conversions!(
     conv_0160,
     world_0160,
     "0.16.0",
     {},
-    { CodedFormat::Data => unreachable!("refused before the match"), }
+    { CodedFormat::Data => unreachable!("refused before the match"), },
+    source
 );
 coded_conversions!(
     conv_0150,
     world_0150,
     "0.15.0",
     {},
-    { CodedFormat::Data => unreachable!("refused before the match"), }
+    { CodedFormat::Data => unreachable!("refused before the match"), },
+    source
 );
 
 /// Whether the component at `module_path` exports the packet-source
@@ -6066,51 +6204,116 @@ fn codec_kind(meta: &Meta, who: &str) -> Result<Kind> {
 /// One instantiated codec module: the half or halves it exports. A module
 /// exporting both is instantiated once, through the world carrying both,
 /// and a run drives one half of it.
+/// `types`, `encoder` and `decoder` carry on unchanged from 0.18.0 into
+/// 0.19.1, so a codec of either world is the same calls in that world's
+/// types.
 enum CodecInstance {
     Encoder(world_0180::encoder::EncoderModule),
     Decoder(world_0180::decoder::DecoderModule),
     Both(world_0180::codec::CodecModule),
+    Encoder0191(world_0191::encoder::EncoderModule),
+    Decoder0191(world_0191::decoder::DecoderModule),
+    Both0191(world_0191::codec::CodecModule),
 }
 
 /// `$body` against the encoder half of a codec instance, with `$g` bound
-/// to it; None for a module exporting no encoder. The world carrying both
-/// halves makes export types of its own, nominally distinct from the
+/// to it, `$w` to its world's module and `$c` to that world's coded
+/// conversions; None for a module exporting no encoder. The world carrying
+/// both halves makes export types of its own, nominally distinct from the
 /// single-half worlds' even where the wit is one text, so the body is
 /// expanded once per arm rather than shared through a reference.
 macro_rules! on_encoder {
-    ($instance:expr, |$g:ident| $body:expr) => {
+    ($instance:expr, |$g:ident, $w:ident, $c:ident| $body:expr) => {
         match $instance {
             CodecInstance::Encoder(b) => {
+                #[allow(unused_imports)]
+                use conv_0180 as $c;
+                #[allow(unused_imports)]
+                use world_0180 as $w;
                 let $g = b.ffrwd_av_encoder();
                 Some($body)
             }
             CodecInstance::Both(b) => {
+                #[allow(unused_imports)]
+                use conv_0180 as $c;
+                #[allow(unused_imports)]
+                use world_0180 as $w;
                 let $g = b.ffrwd_av_encoder();
                 Some($body)
             }
-            CodecInstance::Decoder(_) => None,
+            CodecInstance::Encoder0191(b) => {
+                #[allow(unused_imports)]
+                use conv_0191 as $c;
+                #[allow(unused_imports)]
+                use world_0191 as $w;
+                let $g = b.ffrwd_av_encoder();
+                Some($body)
+            }
+            CodecInstance::Both0191(b) => {
+                #[allow(unused_imports)]
+                use conv_0191 as $c;
+                #[allow(unused_imports)]
+                use world_0191 as $w;
+                let $g = b.ffrwd_av_encoder();
+                Some($body)
+            }
+            CodecInstance::Decoder(_) | CodecInstance::Decoder0191(_) => None,
         }
     };
 }
 
 /// `on_encoder`, for the decoder half.
 macro_rules! on_decoder {
-    ($instance:expr, |$g:ident| $body:expr) => {
+    ($instance:expr, |$g:ident, $w:ident, $c:ident| $body:expr) => {
         match $instance {
             CodecInstance::Decoder(b) => {
+                #[allow(unused_imports)]
+                use conv_0180 as $c;
+                #[allow(unused_imports)]
+                use world_0180 as $w;
                 let $g = b.ffrwd_av_decoder();
                 Some($body)
             }
             CodecInstance::Both(b) => {
+                #[allow(unused_imports)]
+                use conv_0180 as $c;
+                #[allow(unused_imports)]
+                use world_0180 as $w;
                 let $g = b.ffrwd_av_decoder();
                 Some($body)
             }
-            CodecInstance::Encoder(_) => None,
+            CodecInstance::Decoder0191(b) => {
+                #[allow(unused_imports)]
+                use conv_0191 as $c;
+                #[allow(unused_imports)]
+                use world_0191 as $w;
+                let $g = b.ffrwd_av_decoder();
+                Some($body)
+            }
+            CodecInstance::Both0191(b) => {
+                #[allow(unused_imports)]
+                use conv_0191 as $c;
+                #[allow(unused_imports)]
+                use world_0191 as $w;
+                let $g = b.ffrwd_av_decoder();
+                Some($body)
+            }
+            CodecInstance::Encoder(_) | CodecInstance::Encoder0191(_) => None,
         }
     };
 }
 
 impl CodecInstance {
+    /// The world the module was built against.
+    fn world(&self) -> &'static str {
+        match self {
+            CodecInstance::Encoder(_) | CodecInstance::Decoder(_) | CodecInstance::Both(_) => {
+                "0.18.0"
+            }
+            _ => "0.19.1",
+        }
+    }
+
     /// The encoder's own `describe()`, checked: a tag of four printable
     /// ASCII characters, exactly one kind, and no frame size on a video
     /// encoder.
@@ -6119,8 +6322,8 @@ impl CodecInstance {
         store: &mut Store<Host>,
         module_path: &str,
     ) -> Result<DescribedEncoder> {
-        let answered = on_encoder!(self, |g| g.call_describe(&mut *store).map(|d| {
-            let meta = world_0180::meta(d.meta);
+        let answered = on_encoder!(self, |g, w, _c| g.call_describe(&mut *store).map(|d| {
+            let meta = w::meta(d.meta);
             (
                 meta,
                 d.codec,
@@ -6152,7 +6355,7 @@ impl CodecInstance {
             decode_delay,
             frame_samples,
             kind,
-            world: "0.18.0",
+            world: self.world(),
         })
     }
 
@@ -6163,8 +6366,8 @@ impl CodecInstance {
         store: &mut Store<Host>,
         module_path: &str,
     ) -> Result<DescribedDecoder> {
-        let answered = on_decoder!(self, |g| g.call_describe(&mut *store).map(|d| (
-            world_0180::meta(d.meta),
+        let answered = on_decoder!(self, |g, w, _c| g.call_describe(&mut *store).map(|d| (
+            w::meta(d.meta),
             d.fourccs,
             d.delay
         )));
@@ -6185,7 +6388,7 @@ impl CodecInstance {
             fourccs,
             delay,
             kind,
-            world: "0.18.0",
+            world: self.world(),
         })
     }
 }
@@ -6197,8 +6400,11 @@ impl CodecInstance {
 /// GPU with one.
 fn instantiate_codec(module_path: &str, purpose: Purpose) -> Result<(Store<Host>, CodecInstance)> {
     let component = compile(module_path)?;
-    let encoder = has_export(&component, &interface("encoder", "0.18.0"));
-    let decoder = has_export(&component, &interface("decoder", "0.18.0"));
+    let current = has_export(&component, &interface("encoder", "0.19.1"))
+        || has_export(&component, &interface("decoder", "0.19.1"));
+    let world = if current { "0.19.1" } else { "0.18.0" };
+    let encoder = has_export(&component, &interface("encoder", world));
+    let decoder = has_export(&component, &interface("decoder", world));
     if !encoder && !decoder {
         let wanted = format!(
             "{} or {}",
@@ -6231,13 +6437,28 @@ fn instantiate_codec(module_path: &str, purpose: Purpose) -> Result<(Store<Host>
         },
     );
     let context = || format!("instantiating {module_path}");
-    let instance = match (encoder, decoder) {
-        (true, true) => CodecInstance::Both(
+    let instance = match (current, encoder, decoder) {
+        (true, true, true) => CodecInstance::Both0191(
+            world_0191::codec::CodecModule::instantiate(&mut store, &component, &linker)
+                .map_err(wasm_err)
+                .with_context(context)?,
+        ),
+        (true, true, false) => CodecInstance::Encoder0191(
+            world_0191::encoder::EncoderModule::instantiate(&mut store, &component, &linker)
+                .map_err(wasm_err)
+                .with_context(context)?,
+        ),
+        (true, false, _) => CodecInstance::Decoder0191(
+            world_0191::decoder::DecoderModule::instantiate(&mut store, &component, &linker)
+                .map_err(wasm_err)
+                .with_context(context)?,
+        ),
+        (false, true, true) => CodecInstance::Both(
             world_0180::codec::CodecModule::instantiate(&mut store, &component, &linker)
                 .map_err(wasm_err)
                 .with_context(context)?,
         ),
-        (true, false) => CodecInstance::Encoder(
+        (false, true, false) => CodecInstance::Encoder(
             world_0180::encoder::EncoderModule::instantiate(&mut store, &component, &linker)
                 .map_err(wasm_err)
                 .with_context(context)?,
@@ -6263,26 +6484,6 @@ pub fn describe_encoder(module_path: &str) -> Result<DescribedEncoder> {
 pub fn describe_decoder(module_path: &str) -> Result<DescribedDecoder> {
     let (mut store, instance) = instantiate_codec(module_path, Purpose::Describe)?;
     instance.describe_decoder(&mut store, module_path)
-}
-
-/// A raw frame in this world's spelling.
-fn raw_frame_to_wit(frame: &RawFrame) -> world_0180::video::ffrwd::av::types::RawFrame {
-    world_0180::video::ffrwd::av::types::RawFrame {
-        pts: frame.pts,
-        duration: frame.duration,
-        data: frame.data.clone(),
-    }
-}
-
-/// A packet in this world's spelling.
-fn packet_to_wit(packet: &Packet) -> world_0180::video::ffrwd::av::types::Packet {
-    world_0180::video::ffrwd::av::types::Packet {
-        pts: packet.pts,
-        dts: packet.dts,
-        duration: packet.duration,
-        keyframe: packet.keyframe,
-        data: packet.data.clone(),
-    }
 }
 
 /// One instantiated encoder: raw frames in presentation order in, coded
@@ -6352,24 +6553,23 @@ impl Encoder {
                 if num <= 0 || den <= 0 {
                     bail!("{name}: frame rate {num}/{den} is not a positive rate");
                 }
-                Some(world_0180::video::ffrwd::av::types::Rational { num, den })
+                Some((num, den))
             }
             _ => None,
         };
-        let wit_format = world_0180::format(format);
-        let wit_info = world_0180::stream_info(info, format.time_base, &name)?;
         let store = &mut self.store;
-        let answered = on_encoder!(&self.instance, |g| g.call_init(
-            &mut *store,
-            &wit_format,
-            &wit_info,
-            frame_rate,
-            params
-        ))
-        .expect("loaded for its encoder")
-        .map_err(wasm_err)?
-        .map_err(|e| anyhow!("{name} refused to open: {e}"))?;
-        let stream = conv_0180::coded_stream_from_wit(answered, &name)?;
+        let stream = on_encoder!(&self.instance, |g, w, c| (|| -> Result<CodedStream> {
+            let wit_format = w::format(format);
+            let wit_info = w::stream_info(info, format.time_base, &name)?;
+            let rate =
+                frame_rate.map(|(num, den)| w::video::ffrwd::av::types::Rational { num, den });
+            let answered = g
+                .call_init(&mut *store, &wit_format, &wit_info, rate, params)
+                .map_err(wasm_err)?
+                .map_err(|e| anyhow!("{name} refused to open: {e}"))?;
+            c::coded_stream_from_wit(answered, &name)
+        })())
+        .expect("loaded for its encoder")?;
         let answered_kind = stream.format.kind();
         let taken_kind = format.kind().to_string();
         if answered_kind != taken_kind {
@@ -6395,16 +6595,32 @@ impl Encoder {
             bail!("{name}: called again after the final call, which happens once");
         }
         self.finished = last;
-        let carried: Vec<_> = frames.iter().map(raw_frame_to_wit).collect();
         let store = &mut self.store;
-        let packets = on_encoder!(&self.instance, |g| g.call_encode(
-            &mut *store,
-            &carried,
-            last
-        ))
-        .expect("loaded for its encoder")
-        .map_err(wasm_err)?
-        .map_err(|e| anyhow!("{name}: {e}"))?;
+        let packets = on_encoder!(&self.instance, |g, w, _c| (|| -> Result<Vec<Packet>> {
+            let carried: Vec<_> = frames
+                .iter()
+                .map(|f| w::video::ffrwd::av::types::RawFrame {
+                    pts: f.pts,
+                    duration: f.duration,
+                    data: f.data.clone(),
+                })
+                .collect();
+            let packets = g
+                .call_encode(&mut *store, &carried, last)
+                .map_err(wasm_err)?
+                .map_err(|e| anyhow!("{name}: {e}"))?;
+            Ok(packets
+                .into_iter()
+                .map(|p| Packet {
+                    pts: p.pts,
+                    dts: p.dts,
+                    duration: p.duration,
+                    keyframe: p.keyframe,
+                    data: p.data,
+                })
+                .collect())
+        })())
+        .expect("loaded for its encoder")?;
         let mut left = Vec::with_capacity(packets.len());
         for p in packets {
             if let Some(dts) = p.dts {
@@ -6418,13 +6634,7 @@ impl Encoder {
                 }
                 self.last_dts = Some(dts);
             }
-            left.push(Packet {
-                pts: p.pts,
-                dts: p.dts,
-                duration: p.duration,
-                keyframe: p.keyframe,
-                data: p.data,
-            });
+            left.push(p);
         }
         Ok(left)
     }
@@ -6501,52 +6711,52 @@ impl Decoder {
                 coded.format.kind()
             );
         }
-        let wit_coded = conv_0180::coded_stream_to_wit(coded, &name)?;
-        let wit_info = world_0180::stream_info(info, coded.time_base, &name)?;
         let store = &mut self.store;
-        let answered = on_decoder!(&self.instance, |g| g.call_init(
-            &mut *store,
-            &wit_coded,
-            &wit_info,
-            params
-        ))
-        .expect("loaded for its decoder")
-        .map_err(wasm_err)?
-        .map_err(|e| anyhow!("{name} refused to open: {e}"))?;
-        use world_0180::video::ffrwd::av::types::Format as Wit;
-        let meta = &self.described.meta;
-        let format = match answered {
-            Wit::Video(v) => {
-                if !meta.pixel_formats.contains(&v.pix_fmt) {
-                    bail!(
-                        "{name} answered pixel format {}, which it does not list; it lists {}",
-                        v.pix_fmt,
-                        meta.pixel_formats.join(", ")
-                    );
-                }
-                DecodedFormat::Video {
+        let answered = on_decoder!(&self.instance, |g, w, c| (|| -> Result<DecodedFormat> {
+            use w::video::ffrwd::av::types::Format as Wit;
+            let wit_coded = c::coded_stream_to_wit(coded, &name)?;
+            let wit_info = w::stream_info(info, coded.time_base, &name)?;
+            let answered = g
+                .call_init(&mut *store, &wit_coded, &wit_info, params)
+                .map_err(wasm_err)?
+                .map_err(|e| anyhow!("{name} refused to open: {e}"))?;
+            Ok(match answered {
+                Wit::Video(v) => DecodedFormat::Video {
                     width: v.width,
                     height: v.height,
                     pix_fmt: v.pix_fmt,
-                    color: v.color.map(conv_0180::color_info_from_wit),
-                }
-            }
-            Wit::Audio(a) => {
-                if !meta.sample_formats.contains(&a.sample_fmt) {
-                    bail!(
-                        "{name} answered sample format {}, which it does not list; it lists {}",
-                        a.sample_fmt,
-                        meta.sample_formats.join(", ")
-                    );
-                }
-                DecodedFormat::Audio {
+                    color: v.color.map(c::color_info_from_wit),
+                },
+                Wit::Audio(a) => DecodedFormat::Audio {
                     sample_rate: a.sample_rate,
                     channels: a.channels,
                     sample_fmt: a.sample_fmt,
                     channel_layout: a.channel_layout,
+                },
+            })
+        })())
+        .expect("loaded for its decoder")?;
+        let meta = &self.described.meta;
+        match &answered {
+            DecodedFormat::Video { pix_fmt, .. } => {
+                if !meta.pixel_formats.contains(pix_fmt) {
+                    bail!(
+                        "{name} answered pixel format {pix_fmt}, which it does not list; it lists {}",
+                        meta.pixel_formats.join(", ")
+                    );
                 }
             }
-        };
+            DecodedFormat::Audio { sample_fmt, .. } => {
+                if !meta.sample_formats.contains(sample_fmt) {
+                    bail!(
+                        "{name} answered sample format {sample_fmt}, which it does not list; it \
+                         lists {}",
+                        meta.sample_formats.join(", ")
+                    );
+                }
+            }
+        }
+        let format = answered;
         if format.kind() != self.described.kind {
             bail!(
                 "{name} decodes {declared} and answered {} frames",
@@ -6570,16 +6780,32 @@ impl Decoder {
             bail!("{name}: called again after the final call, which happens once");
         }
         self.finished = last;
-        let carried: Vec<_> = packets.iter().map(packet_to_wit).collect();
         let store = &mut self.store;
-        let frames = on_decoder!(&self.instance, |g| g.call_decode(
-            &mut *store,
-            &carried,
-            last
-        ))
-        .expect("loaded for its decoder")
-        .map_err(wasm_err)?
-        .map_err(|e| anyhow!("{name}: {e}"))?;
+        let frames = on_decoder!(&self.instance, |g, w, _c| (|| -> Result<Vec<RawFrame>> {
+            let carried: Vec<_> = packets
+                .iter()
+                .map(|p| w::video::ffrwd::av::types::Packet {
+                    pts: p.pts,
+                    dts: p.dts,
+                    duration: p.duration,
+                    keyframe: p.keyframe,
+                    data: p.data.clone(),
+                })
+                .collect();
+            let frames = g
+                .call_decode(&mut *store, &carried, last)
+                .map_err(wasm_err)?
+                .map_err(|e| anyhow!("{name}: {e}"))?;
+            Ok(frames
+                .into_iter()
+                .map(|f| RawFrame {
+                    pts: f.pts,
+                    duration: f.duration,
+                    data: f.data,
+                })
+                .collect())
+        })())
+        .expect("loaded for its decoder")?;
         let mut left = Vec::with_capacity(frames.len());
         for f in frames {
             if let Some(before) = self.last_pts {
@@ -6592,11 +6818,7 @@ impl Decoder {
                 }
             }
             self.last_pts = Some(f.pts);
-            left.push(RawFrame {
-                pts: f.pts,
-                duration: f.duration,
-                data: f.data,
-            });
+            left.push(f);
         }
         Ok(left)
     }

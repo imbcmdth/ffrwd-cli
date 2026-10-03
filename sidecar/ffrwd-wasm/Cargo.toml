@@ -26,10 +26,17 @@ ffrwd-wasm-runtime = { path = "../runtime" }
 # is. The annotation stream is the sidecar's own, so it asks for the feature.
 # A codec package's stream is written under its own four-character tag
 # (`Stream::coded_fourcc`), from v0.1.4 on.
-ffrwd-nut = { git = "https://github.com/imbcmdth/ffrwd-nut", tag = "v0.1.4", features = ["annotations"] }
+ffrwd-nut = { git = "https://github.com/imbcmdth/ffrwd-nut", tag = "v0.1.5", features = ["annotations"] }
 # The H.264 byte level, pinned by tag the same way. The SPS this reads is the
 # one the NUT wire hands over as extradata.
 ffrwd-nal = { git = "https://github.com/imbcmdth/ffrwd-nal", tag = "v0.1.0" }
+# yuv420p to rgba and back, in the stream's own range and matrix: what a
+# port feed's picture is conformed with. The resize beside it is the same
+# library that crate resizes with, over rgba.
+ffrwd-frame = { git = "https://github.com/imbcmdth/ffrwd-frame", tag = "v0.1.1" }
+fast_image_resize = { version = "6", default-features = false, features = ["std"] }
+# The receive buffer a port feed's connection is given.
+socket2 = "0.6"
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }

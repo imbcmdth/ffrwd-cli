@@ -108,7 +108,7 @@ import heapq
 import json
 import math
 import re
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from fractions import Fraction
 from typing import Literal
@@ -123,6 +123,7 @@ from .ir import (
     PIPE,
     ROWFILTER,
     ROWMERGE,
+    TAP_DOCUMENT,
     FeederCall,
     FrameRef,
     Graph,
@@ -140,6 +141,9 @@ from .ir import (
     src_parts,
 )
 from .probe import JSON_CODEC, ProbeResult, StreamMeta, is_url
+from .shapes import Accepts, NodeShape, node_shape
+from .sink import COLOR_OPTIONS
+from .timing import Paths, paths_of
 
 __all__ = [
     "COPY_CODEC",
@@ -154,6 +158,9 @@ __all__ = [
     "PIPE_BUFFER_LIMIT",
     "RAWVIDEO",
     "SAFETY",
+    "SAMPLE_FMT_CODECS",
+    "WIRE_PIX_FMTS",
+    "WIRE_SAMPLE_FMTS",
     "CLOCK_SIZE",
     "AudioFormat",
     "DataFormat",
@@ -188,7 +195,9 @@ __all__ = [
     "is_live_probe",
     "nothing_external",
     "check_spellable",
+    "once_per_pipe",
     "partition",
+    "pipe_key",
 ]
 
 # The container every raw stream edge is wrapped in, and the codecs inside it.
@@ -204,6 +213,13 @@ COPY_CODEC = "copy"
 # ffprobe reports no pixel format, so the wire format is one the compiler
 # picks and the producing ffmpeg is told to write.
 DEFAULT_PIX_FMT = "yuv420p"
+
+# The pixel formats a stream edge into or out of the sidecar can carry.
+WIRE_PIX_FMTS: tuple[str, ...] = ("rgba", "yuv420p", "yuv422p", "yuv444p")
+
+# The sample formats one can carry, and the pcm each of them travels as.
+WIRE_SAMPLE_FMTS: tuple[str, ...] = ("f32", "s16")
+SAMPLE_FMT_CODECS: Mapping[str, str] = {"f32": "pcm_f32le", "s16": "pcm_s16le"}
 
 # The width and height of the picture a data filter's CLOCK pad is handed: it
 # reads the pts and nothing else, so each frame is made as small as a frame
@@ -251,6 +267,45 @@ LONGEST_FRAME_SECONDS = 0.1
 
 # The colorimetry a codec's sidecar is told, by the names of its flags.
 SIDECAR_COLOR_FLAGS: tuple[str, ...] = ("color_range", "color_primaries", "color_trc", "colorspace")
+
+# A stream's colorimetry: each option ffmpeg's output takes it by, against
+# the field ffprobe reports it in and setparams' option for it.
+PROBED_COLOR: Mapping[str, str] = {
+    "color_range": "color_range",
+    "color_primaries": "color_primaries",
+    "color_trc": "color_transfer",
+    "colorspace": "color_space",
+    "chroma_sample_location": "chroma_location",
+}
+SETPARAMS_COLOR: Mapping[str, str] = {
+    "color_range": "range",
+    "color_primaries": "color_primaries",
+    "color_trc": "color_trc",
+    "colorspace": "colorspace",
+    "chroma_sample_location": "chroma_location",
+}
+# What ffprobe and setparams write for a field nothing settles.
+UNSAID_COLOR = frozenset({"unknown", "unspecified", "reserved", "auto"})
+# The fields that describe YUV alone, which an RGB picture has none of.
+YUV_ONLY_COLOR = ("color_range", "colorspace", "chroma_sample_location")
+RGB_PREFIXES = ("rgb", "bgr", "gbr", "argb", "abgr")
+# Filters that convert colour, past which a stream's colorimetry is no longer
+# its input's. A `scale` does too where it names an in_ or out_ option.
+COLOR_CONVERTING_FILTERS = frozenset(
+    {"colorspace", "colormatrix", "zscale", "tonemap", "tonemap_opencl", "libplacebo"}
+)
+
+# The colour a node network's input is told, by the ``-pad`` key each option
+# goes under, and what a field nothing settles is called there.
+_PAD_COLOR: Mapping[str, str] = {
+    "color_range": "range",
+    "color_primaries": "primaries",
+    "color_trc": "trc",
+    "colorspace": "space",
+}
+_UNKNOWN_COLOR = "unknown"
+# What leaves a conversion to an RGB pixel format: full range, no YUV matrix.
+_RGB_WIRE_COLOR: Mapping[str, str] = {"color_range": "pc", "colorspace": "gbr"}
 
 # Bytes one pixel takes on the wire, per pixel format ffrwd carries.
 _PIXEL_BYTES: Mapping[str, int] = {
@@ -690,6 +745,10 @@ class StreamEdge:
     `live` marks an edge the one reader of a live input writes. Its pictures
     reach the muxer as they come (:data:`PASSTHROUGH`), never duplicated or
     dropped to keep a constant rate, since the bound counts them one for one.
+
+    `nut` names the one NUT this stream rides with every other stream between
+    the same two processes, where one end hosts node modules; "" for a stream
+    on a pipe of its own.
     """
 
     source: str
@@ -700,6 +759,7 @@ class StreamEdge:
     bound: int = 0
     buffer: EdgeBuffer | None = None
     live: bool = False
+    nut: str = ""
 
     def to_dict(self) -> dict[str, object]:
         written: dict[str, object] = {
@@ -717,6 +777,8 @@ class StreamEdge:
             written["buffer"] = self.buffer.to_dict()
         if self.live:
             written["live"] = True
+        if self.nut:
+            written["nut"] = self.nut
         return written
 
     @classmethod
@@ -731,7 +793,26 @@ class StreamEdge:
             bound=_read_whole(d, "bound", 0),
             buffer=None if buffer is None else EdgeBuffer.from_dict(_read_object(d, "buffer")),
             live=d.get("live") is True,
+            nut=_read_text(d, "nut", ""),
         )
+
+
+def pipe_key(edge: StreamEdge) -> str:
+    """Which pipe `edge` rides: its NUT's, or one of its own."""
+    return edge.nut or f"{edge.source}>{edge.target}:{edge.ref}"
+
+
+def once_per_pipe(edges: Sequence[StreamEdge]) -> list[StreamEdge]:
+    """`edges` with one entry per pipe: the first edge of each NUT stands for it."""
+    kept: list[StreamEdge] = []
+    seen: set[str] = set()
+    for edge in edges:
+        key = pipe_key(edge)
+        if key in seen:
+            continue
+        seen.add(key)
+        kept.append(edge)
+    return kept
 
 
 @dataclass(frozen=True)
@@ -1190,6 +1271,20 @@ class SidecarProcess:
     # (`color_range`, `color_primaries`, `color_trc`, `colorspace`), for the
     # fields the query settles: the NUT the codec reads carries none of it.
     color: tuple[tuple[str, str], ...] = ()
+    # True for a region holding a node module: its pads name the ports they
+    # bind, and each of its edges is one NUT carrying every stream between it
+    # and the process at the far end.
+    node_network: bool = False
+    # The ports this region listens on for an input a node holds and the
+    # query left unbound: (port, the node's name in the network, its input).
+    listens: tuple[tuple[int, str, str], ...] = ()
+    # What each ``-i`` of a node network carries of its picture's colour, by
+    # the ``-pad`` key, in ``-i`` order: empty for an input with no raw
+    # picture an ffmpeg wrote.
+    colors: tuple[tuple[tuple[str, str], ...], ...] = ()
+    # The tags the query wrote on what each ``-i`` of a node network carries,
+    # in ``-i`` order: empty for an input it wrote none on.
+    tags: tuple[tuple[tuple[str, str], ...], ...] = ()
 
     @property
     def nodes(self) -> tuple[str, ...]:
@@ -1211,6 +1306,8 @@ class SidecarProcess:
         """
         if self.graph is None:
             return False
+        if self.node_network:
+            return True
         if self.packet_sink or self.packet_source or self.packet_filter:
             return False
         if self.data_filter or self.codec:
@@ -1267,6 +1364,14 @@ class SidecarProcess:
             written["color"] = dict(self.color)
         if self.pads:
             written["pads"] = [None if p is None else p.to_dict() for p in self.pads]
+        if self.node_network:
+            written["node_network"] = True
+        if self.listens:
+            written["listens"] = [list(one) for one in self.listens]
+        if self.colors:
+            written["colors"] = [dict(one) for one in self.colors]
+        if self.tags:
+            written["tags"] = [dict(one) for one in self.tags]
         if self.network and self.graph is not None:
             written["graph"] = self.graph.to_dict()
         return written
@@ -1313,6 +1418,22 @@ class SidecarProcess:
             codec=_read_text(d, "codec", ""),
             frame_rate=_read_text(d, "frame_rate", ""),
             color=tuple((flag, str(value)) for flag, value in _read_pairs(d, "color")),
+            node_network=d.get("node_network") is True,
+            listens=tuple(
+                (int(str(one[0])), str(one[1]), str(one[2]))
+                for one in _read_list(d, "listens")
+                if isinstance(one, list) and len(one) == 3
+            ),
+            colors=tuple(
+                tuple((str(key), str(value)) for key, value in one.items())
+                for one in _read_list(d, "colors")
+                if isinstance(one, dict)
+            ),
+            tags=tuple(
+                tuple((str(key), str(value)) for key, value in one.items())
+                for one in _read_list(d, "tags")
+                if isinstance(one, dict)
+            ),
         )
 
 
@@ -1525,6 +1646,91 @@ def _named_ref(ref: FrameRef) -> str:
         alias, kind, index = src_parts(ref)
         return f"{alias}.{kind}[{index + 1}]"
     return f"the output of '{_ref_node(ref)}'"
+
+
+def _accepted(
+    accepts: Accepts, written: StreamFormat
+) -> tuple[tuple[str, ...], str | None]:
+    """The formats a port takes, and the one `written` carries, of its kind.
+
+    Pixel formats for a picture, sample formats for sound; nothing for a
+    stream copied as it was coded, or one whose format is not known.
+    """
+    if isinstance(written, VideoFormat) and written.codec != COPY_CODEC:
+        return accepts.pixel_formats, written.pix_fmt
+    if isinstance(written, AudioFormat):
+        made = next(
+            (sample for sample, codec in SAMPLE_FMT_CODECS.items() if codec == written.codec),
+            None,
+        )
+        return accepts.sample_formats, made
+    return (), None
+
+
+def converts_colour(node: Node) -> bool:
+    """True where `node` converts the colour of the pictures through it."""
+    if node.filter in COLOR_CONVERTING_FILTERS:
+        return True
+    return node.filter == "scale" and any(
+        str(key).startswith(("in_", "out_")) for key in node.args
+    )
+
+
+def stream_colorimetry(
+    graph: Graph,
+    ref: FrameRef,
+    source_meta: Callable[[FrameRef], StreamMeta | None],
+    pix_fmt: str | None = None,
+    *,
+    opaque: Collection[str] = (),
+) -> dict[str, str]:
+    """The colorimetry the pictures `ref` names carry, by ffmpeg's option
+    names, as far as the query says it.
+
+    A ``setparams`` on the way settles each field it names; past a filter
+    that converts colour (:data:`COLOR_CONVERTING_FILTERS`), or a node named
+    in `opaque`, nothing else does. Every field left is the input stream's,
+    as `source_meta` says it was probed. A field nothing settles is absent.
+    Pictures in an RGB `pix_fmt` have no YUV matrix, range or chroma siting
+    to state.
+    """
+    said: dict[str, str] = {}
+    seen: set[str] = set()
+    current: FrameRef | None = ref
+    while current is not None and not is_src(current):
+        name, _, pad = current.rpartition(":")
+        name = name if name and pad.isdigit() else current
+        node = graph.nodes.get(name)
+        if node is None or name in seen or name in opaque or converts_colour(node):
+            current = None
+            break
+        seen.add(name)
+        if node.filter == "setparams":
+            for option, param in SETPARAMS_COLOR.items():
+                value = node.args.get(param)
+                if value is not None and str(value) not in UNSAID_COLOR:
+                    said.setdefault(option, str(value))
+        current = next((r for r in node.inputs if ref_type(graph, r) == "video"), None)
+    meta = source_meta(current) if current is not None else None
+    if meta is not None:
+        for option, field_name in PROBED_COLOR.items():
+            value = getattr(meta, field_name)
+            if isinstance(value, str) and value not in UNSAID_COLOR:
+                said.setdefault(option, value)
+    if pix_fmt is not None and pix_fmt.startswith(RGB_PREFIXES):
+        for option in YUV_ONLY_COLOR:
+            said.pop(option, None)
+    return {option: said[option] for option in COLOR_OPTIONS if option in said}
+
+
+def _converted(written: StreamFormat, wanted: str) -> str:
+    """The ffmpeg filter call that hands a port `wanted` instead of `written`."""
+    if isinstance(written, AudioFormat):
+        from .wasm import FFMPEG_SAMPLE_FMTS  # wasm reads this module's wire formats
+
+        sample = FFMPEG_SAMPLE_FMTS.get(wanted, wanted)
+        return f"ffmpeg.aformat(<stream>, sample_fmts => '{sample}')"
+    return f"ffmpeg.format(<stream>, pix_fmts => '{wanted}')"
 
 
 def _bindings(paths: Iterable[str]) -> tuple[ModuleBinding, ...]:
@@ -1885,6 +2091,18 @@ class _Partitioner:
         ) | frozenset(
             alias for alias, source in g.module_sources.items() if not source.bounded
         )
+        self.node_shapes: dict[str, NodeShape] = {
+            name: node_shape(g.nodes[name].filter, raw)
+            for name, raw in g.node_shapes.items()
+            if name in g.nodes
+        }
+        # How late each node's refs run, counted once it is first asked.
+        self._paths: Paths | None = None
+        self.live |= frozenset(
+            alias
+            for alias, name in g.node_sources.items()
+            if name in self.node_shapes and not self.node_shapes[name].bounded
+        )
         self.order = _topological(g)
         # A hosted node is external whoever asked: only the sidecar runs it.
         self.external = {
@@ -1900,6 +2118,9 @@ class _Partitioner:
         self.sidecars: list[SidecarProcess] = []
         self.sidecar_of: dict[str, str] = {}  # node id -> process id
         self.members: dict[str, list[str]] = {}  # process id -> its node ids
+        # A node region's read of a stream another of its reads already
+        # carries in the same format: the copy, and the read it binds to.
+        self.same_reads: dict[FrameRef, FrameRef] = {}
         self.consumer_of: dict[str, str] = {}  # feeder process id -> its reader
         # The ffmpeg processes copying one module's data stream to each of its
         # readers, by the sidecar writing it and the stream's ref.
@@ -2152,8 +2373,11 @@ class _Partitioner:
                 continue  # each track is its own named pipe by construction
             handed: dict[FrameRef, set[str]] = {}
             for edge in self.edges:
-                if edge.source == sidecar.id:
-                    handed.setdefault(edge.ref, set()).add(edge.target)
+                if edge.source != sidecar.id:
+                    continue
+                if sidecar.node_network and ref_type(self.g, edge.ref) == "data":
+                    continue  # the network maps a label to every output reading it
+                handed.setdefault(edge.ref, set()).add(edge.target)
             for ref, targets in handed.items():
                 if len(targets) < 2:
                     continue
@@ -2567,7 +2791,8 @@ class _Partitioner:
             """Merge the groups these nodes are in, if the result stays convex.
 
             `one_output` also holds the merge to a region whose frames still
-            leave on one pad, which is all a module process can write.
+            leave on one pad, which is all a module process can write. A
+            region holding a node writes as many as it has readers.
             """
             reps = {home.get(name) for name in names}
             if None not in reps and len(reps) == 1:
@@ -2578,7 +2803,11 @@ class _Partitioner:
             joined = [n for n in self.order if n in wanted]
             if not self._convex(joined, reach):
                 return False
-            if one_output and len(self._region_writes(joined)) > 1:
+            if (
+                one_output
+                and not any(name in self.node_shapes for name in joined)
+                and len(self._region_writes(joined)) > 1
+            ):
                 return False
             for rep in reps:
                 if rep is not None:
@@ -2629,6 +2858,17 @@ class _Partitioner:
                     continue
                 if any(reader in alone for reader in reads):
                     continue  # a packet sink's edge stays an ffmpeg's to encode
+                if any(reader in self.node_shapes for reader in reads) and (
+                    len(
+                        {
+                            self._format(inputs[0], reader)
+                            for reader in reads
+                            if not self._reads_timing(reader, inputs[0])
+                        }
+                    )
+                    > 1
+                ):
+                    continue  # nodes taking it in different formats get a stream each
                 # The split's producer joins too when it is a module; otherwise
                 # the split's own input becomes a boundary read of the region.
                 feeds = _ref_node(inputs[0])
@@ -2641,7 +2881,14 @@ class _Partitioner:
         return [groups[name] for name in self.order if name in groups]
 
     def _region_reads(self, members: Sequence[str]) -> list[tuple[FrameRef, str]]:
-        """Refs this region reads from outside, each with the node reading it."""
+        """Refs this region reads from outside, each with the node reading it.
+
+        A region holding a node reads each stream once per format its ports
+        take it in: copies a split outside made of it are one read, which the
+        network hands every port (:attr:`same_reads`). A port reading it for
+        its timing alone takes whichever of those reads there is, and the
+        stream as it is where there is none.
+        """
         inside = set(members)
         wanted: list[tuple[FrameRef, str]] = []
         seen: set[FrameRef] = set()
@@ -2654,7 +2901,28 @@ class _Partitioner:
                     continue
                 seen.add(ref)
                 wanted.append((ref, name))
-        return wanted
+        if not any(name in self.node_shapes for name in members) or any(
+            name in self.g.packet_sinks for name in members
+        ):
+            return wanted
+        kept: dict[tuple[FrameRef, StreamFormat], FrameRef] = {}
+        any_read: dict[FrameRef, FrameRef] = {}
+        bound: dict[FrameRef, FrameRef] = {}
+        timed = [(ref, reader) for ref, reader in wanted if self._reads_timing(reader, ref)]
+        for ref, reader in [one for one in wanted if one not in timed] + timed:
+            source = self._past_splits(ref)
+            first = any_read.get(source) if (ref, reader) in timed else None
+            if first is None:
+                first = kept.setdefault((source, self._format(ref, reader)), ref)
+            any_read.setdefault(source, first)
+            bound[ref] = first
+        shared: list[tuple[FrameRef, str]] = []
+        for ref, reader in wanted:
+            if bound[ref] == ref:
+                shared.append((ref, reader))
+            else:
+                self.same_reads[ref] = bound[ref]
+        return shared
 
     def _region_writes(self, members: Sequence[str]) -> list[tuple[FrameRef, StreamType]]:
         """Pads this region produces that something outside it reads."""
@@ -2680,6 +2948,11 @@ class _Partitioner:
         return written
 
     def _shape(self, name: str) -> ModuleShape:
+        found = self.node_shapes.get(name)
+        if found is not None:
+            # Its waits are counted in seconds (:mod:`ffrwd.timing`), not
+            # here in frames.
+            return ModuleShape(one_to_one=found.one_to_one, pure=found.pure)
         return self.shapes.get(self.g.nodes[name].filter, ModuleShape())
 
     def _lookahead(self, members: Sequence[str], *, frames: bool = False) -> int:
@@ -2746,6 +3019,8 @@ class _Partitioner:
             # It drops pictures, but holds none: what it costs its path is
             # counted in time instead (:meth:`_late_seconds`).
             return 0
+        if name in self.node_shapes:
+            return self._node_frames(name)
         if self.external.get(name, False):
             return self._frames_ahead(name) if self._shape(name).one_to_one else None
         if node.filter in SPLIT_FILTERS:
@@ -2759,6 +3034,27 @@ class _Partitioner:
         written = node.args.get(option) if option else None
         size = written if isinstance(written, int) and not isinstance(written, bool) else default
         return max(size - 1, 0)
+
+    def _node_frames(self, name: str) -> int | None:
+        """The frames node `name` holds past its clock: its window, the waits
+        its interval inputs add and its outputs' latency, at its pictures' rate."""
+        if self._paths is None:
+            self._paths = paths_of(self.g, self.probes)
+        paths = self._paths
+        node = self.g.nodes[name]
+        shape = self.node_shapes[name]
+        ready = paths.ready(name)[0]
+        clock = shape.clock_input
+        refs = [ref for port, ref in zip(node.ports, node.inputs) if clock and port == clock.name]
+        clock_delay = paths.latest(refs) if refs else 0.0
+        if ready is None or clock_delay is None:
+            return None
+        own = ready - clock_delay + max((o.latency for o in shape.outputs), default=0.0)
+        if own <= 0:
+            return 0
+        video = next((ref for ref in node.inputs if ref_type(self.g, ref) == "video"), None)
+        rate = paths.rate(video) if video is not None else None
+        return None if rate is None else math.ceil(own * rate)
 
     def _node_delays(self, names: Sequence[str]) -> dict[str, int | None]:
         """Each node's delay from this process's own inputs, over its longest path."""
@@ -3389,6 +3685,55 @@ class _Partitioner:
                 return slot
             ref = node.inputs[0]
 
+    def _check_node_accepts(self) -> None:
+        """Refuse a node handed another node's output in a format it does not take.
+
+        An edge an ffmpeg writes is conformed to the port it feeds. Between
+        two nodes nothing converts: the reader gets what the writer settled
+        on, its own format or the one it follows, so a port naming the
+        formats it takes is held to them here.
+        """
+        for name, shape in self.node_shapes.items():
+            node = self.g.nodes[name]
+            for read, port_name in zip(node.inputs, node.ports):
+                port = shape.input(port_name)
+                source = self._past_splits(read)
+                producer = _ref_node(source)
+                if (
+                    port is None
+                    or port.accepts.wants == "timing"
+                    or producer is None
+                    or producer not in self.node_shapes
+                ):
+                    continue
+                written = self._node_output_wire(producer, _ref_pad(source), source)
+                taken, made = _accepted(port.accepts, written)
+                if made is None or not taken or made in taken:
+                    continue
+                pad = _ref_pad(source)
+                outputs = self.node_shapes[producer].outputs
+                output = outputs[pad].name if pad < len(outputs) else str(pad)
+                writer = _bindings([self.g.nodes[producer].filter])[0].name
+                raise FfrwdError(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"the module '{node.filter}' takes {', '.join(taken)} on "
+                    f"'{port_name}', and the '{output}' output of {writer} hands "
+                    f"it {made}",
+                    hint="nothing converts between two nodes, and an ffmpeg filter "
+                    f"between them does: {_converted(written, taken[0])}",
+                )
+
+    def _past_splits(self, ref: FrameRef) -> FrameRef:
+        """`ref`, or what the splits in front of it copy."""
+        seen: set[str] = set()
+        while (producer := _ref_node(ref)) is not None and producer not in seen:
+            node = self.g.nodes.get(producer)
+            if node is None or node.filter not in SPLIT_FILTERS:
+                break
+            seen.add(producer)
+            ref = node.inputs[0]
+        return ref
+
     def _check_lockstep(self) -> None:
         """Refuse a multi-input module whose inputs do not share a timeline.
 
@@ -3410,12 +3755,11 @@ class _Partitioner:
             ):
                 continue
             node = self.g.nodes[name]
-            if len(node.inputs) < 2:
+            refs = self._lockstep_refs(name)
+            if len(refs) < 2:
                 continue
-            first = self._anchor(node.inputs[0])
-            offender = next(
-                (ref for ref in node.inputs[1:] if self._anchor(ref) != first), None
-            )
+            first = self._anchor(refs[0])
+            offender = next((ref for ref in refs[1:] if self._anchor(ref) != first), None)
             if offender is None:
                 continue
             raise FfrwdError(
@@ -3426,6 +3770,28 @@ class _Partitioner:
                 hint="feed every stream of a multi-stream module from one "
                 "stream, through modules that declare one frame out per frame in",
             )
+
+    def _lockstep_refs(self, name: str) -> list[FrameRef]:
+        """The streams of node `name` that pair with its clock frame for frame.
+
+        Every input of an older module. A node pairs only its clock and its
+        lockstep inputs of the clock's own kind that way: sound against a
+        picture is cut to each tick by time, and held, interval and arrival
+        inputs pair by time as well.
+        """
+        node = self.g.nodes[name]
+        shape = self.node_shapes.get(name)
+        if shape is None:
+            return list(node.inputs)
+        clock = shape.clock_input
+        if clock is None:
+            return []
+        same = {
+            port.name
+            for port in shape.inputs
+            if port.pairing.kind == "lockstep" and port.kind == clock.kind
+        }
+        return [ref for port, ref in zip(node.ports, node.inputs) if port in same]
 
     def _check_rows_reach(self) -> None:
         """That the rows a module reads can reach it.
@@ -3466,6 +3832,7 @@ class _Partitioner:
 
     def run(self) -> ProcessPlan:
         self._check_lockstep()
+        self._check_node_accepts()
         for members in self._regions():
             # The ENTRY is the first node reading a stream: a rows module
             # reads none, so it is never one however early it sits.
@@ -3504,6 +3871,7 @@ class _Partitioner:
                 color=self._codec_color(members),
                 rows_in=self._region_rows_in(members),
                 pads=self._region_pad_meta(members),
+                node_network=any(name in self.node_shapes for name in members),
             )
             self.sidecars.append(sidecar)
             self.members[sidecar.id] = list(members)
@@ -3549,9 +3917,14 @@ class _Partitioner:
             demands.extend((process.id, ref, depth) for ref in self._consumed(process))
 
         for sidecar in self.sidecars:
+            members = self.members[sidecar.id]
+            # A node region reads a source stream wherever a member does, so
+            # it reads every one at the region's own depth, and one feeder
+            # hands it all of them.
+            lowest = min(self.depth[member] for member in members)
             demands.extend(
-                (sidecar.id, ref, self.depth[reader])
-                for ref, reader in self._region_reads(self.members[sidecar.id])
+                (sidecar.id, ref, lowest if sidecar.node_network else self.depth[reader])
+                for ref, reader in self._region_reads(members)
             )
 
         while demands:
@@ -3568,6 +3941,9 @@ class _Partitioner:
                     and producer not in self.g.packet_filters
                     and producer not in self.g.data_filters
                     and producer not in self.g.encoders
+                    and not (
+                        producer in self.node_shapes and ref_type(self.g, ref) == "data"
+                    )
                 ):
                     # A packet sink or filter consumes the encoder's output,
                     # and a module region emits decoded frames: an encoding
@@ -3624,6 +4000,7 @@ class _Partitioner:
         self._redirect_live_reads()
         self._add_rows_edges()
         self._add_rows_documents()
+        self._bundle_node_edges()
         self._bound_edges()
         self._mark_live_edges()
         self._check_handed_once()
@@ -3634,10 +4011,46 @@ class _Partitioner:
             processes=tuple(processes),
             edges=(*self.edges, *self.rows, *self.documents, *self._feeder_edges()),
             laterals=tuple(
-                replace(lateral, writer=self.feeding[feeder_path(lateral.tap)])
+                replace(lateral, writer=self._tap_writer(lateral))
                 for lateral in self.g.laterals
             ),
         )
+
+    def _tap_writer(self, lateral: Lateral) -> str:
+        """The process writing a run-time lateral's messages for the host: the
+        node region whose rows document is its tap, else the ffmpeg copying
+        them to its port."""
+        if not lateral.pipe:
+            return self.feeding[feeder_path(lateral.tap)]
+        tap = f"{TAP_DOCUMENT}{lateral.tap}"
+        return next(
+            sidecar.id
+            for sidecar in self.sidecars
+            for document in sidecar.rows
+            if document.sink.path == tap
+        )
+
+    def _bundle_node_edges(self) -> None:
+        """Every stream between a node region and one other process, in one NUT.
+
+        A node reads and writes its kinds side by side, so the streams one
+        process hands another travel interleaved on one pipe, and no stream of
+        it can wait on another pipe.
+        """
+        # A sink's pads stay one input apiece, each with what it says of its row.
+        nodes = {
+            sidecar.id
+            for sidecar in self.sidecars
+            if sidecar.node_network and not sidecar.packet_sink
+        }
+        if not nodes:
+            return
+        sinks = {sidecar.id for sidecar in self.sidecars if sidecar.packet_sink}
+        for index, edge in enumerate(self.edges):
+            if edge.target in sinks:
+                continue
+            if edge.source in nodes or edge.target in nodes:
+                self.edges[index] = replace(edge, nut=f"{edge.source}>{edge.target}")
 
     def _add_data_read(self, source: str, target: str, ref: FrameRef, depth: int) -> None:
         """One more reader of the data stream `ref`, which sidecar `source` writes.
@@ -3649,6 +4062,13 @@ class _Partitioner:
         copy costs next to nothing, where calling the module again would run
         it twice.
         """
+        if any(sidecar.id == source and sidecar.node_network for sidecar in self.sidecars):
+            # A node network writes a label to as many outputs as read it.
+            if not any(
+                (e.source, e.target, e.ref) == (source, target, ref) for e in self.edges
+            ):
+                self._add_edge(source, target, ref)
+            return
         relay = self.relays.get((source, ref))
         if relay is not None:
             if not any(
@@ -3691,7 +4111,7 @@ class _Partitioner:
             if path in self.g.feeders:
                 connections.append((source, feeder_port(path), self.g.feeders[path]))
         for lateral in self.g.laterals:
-            source = self.feeding[feeder_path(lateral.tap)]
+            source = self._tap_writer(lateral)
             connections.extend(
                 (source, connection.port, connection.calls)
                 for connection in lateral.connections
@@ -3836,11 +4256,15 @@ class _Partitioner:
         region, and each rows-bearing node is a document of its own.
         """
         slots = self._module_slots(members, bindings)
-        return tuple(
-            RowsDocument(sink=self.g.rows_sinks[name], node=name, source=slots.get(name))
-            for name in members
-            if name in self.g.rows_sinks
-        )
+        found: list[RowsDocument] = []
+        for name in members:
+            pads = [name] + [f"{name}:{pad}" for pad in range(len(self.g.nodes[name].outputs))]
+            for ref in pads:
+                if ref in self.g.rows_sinks:
+                    found.append(
+                        RowsDocument(sink=self.g.rows_sinks[ref], node=ref, source=slots.get(name))
+                    )
+        return tuple(found)
 
     def _module_slots(
         self, members: Sequence[str], bindings: Sequence[ModuleBinding]
@@ -3977,14 +4401,40 @@ class _Partitioner:
         named = [
             (name, wire)
             for name in self._behind_split(target, reader)
-            if (wire := (
-                self.pix_fmts.get(self.g.nodes[name].filter),
-                self.audio_wires.get(self.g.nodes[name].filter),
-            )) != (None, None)
+            if (wire := self._named_wire(name, reader)) is not None
         ]
         if not named or any(wire != named[0][1] for _, wire in named):
             return reader
         return named[0][0]
+
+    def _named_wire(self, name: str, split: str | None) -> object:
+        """The wire module `name` names for what it reads off `split`, or None.
+
+        A node's is what its port accepts; an older module's, the pixel
+        format and pcm it declared.
+        """
+        node = self.g.nodes[name]
+        if name in self.node_shapes and split is not None:
+            ref = self.g.nodes[split].inputs[0]
+            position = self._read_position(node, ref)
+            if position is None or self._reads_timing(name, ref):
+                return None
+            return self._node_input_wire(name, node.ports[position], ref)
+        wire = (self.pix_fmts.get(node.filter), self.audio_wires.get(node.filter))
+        return None if wire == (None, None) else wire
+
+    def _read_position(self, node: Node, ref: FrameRef) -> int | None:
+        """Where `node` reads `ref`: itself, or a pad of a split of it."""
+        for position, read in enumerate(node.inputs):
+            producer = _ref_node(read)
+            if read == ref or (
+                producer is not None
+                and producer in self.g.nodes
+                and self.g.nodes[producer].filter in SPLIT_FILTERS
+                and self.g.nodes[producer].inputs[0] == ref
+            ):
+                return position
+        return None
 
     def _carries_annotations(self, ref: FrameRef, consumer: str | None) -> bool:
         """Whether this edge's frames travel with the producer's rows.
@@ -4101,6 +4551,9 @@ class _Partitioner:
             # Messages cross as they are, whoever wrote them and whoever reads
             # them: copied into NUT, one packet each.
             return DataFormat()
+        node_wire = self._node_wire(ref, target)
+        if node_wire is not None:
+            return node_wire
         meta = self._origin_meta(ref)
         producer = _ref_node(ref)
         if producer is not None and (
@@ -4192,6 +4645,225 @@ class _Partitioner:
             height=size[1] if size else None,
             timebase=_timebase(meta.fps) if meta else None,
         )
+
+    def _node_wire(self, ref: FrameRef, target: str | None) -> StreamFormat | None:
+        """What an edge carries where a node writes it or reads it, else None.
+
+        A node's output says its own format, or that it is an input's or the
+        clock input's; a node's input says what it accepts. Size and time base
+        are the stream's own, as on every other edge.
+        """
+        if target is not None and (
+            target in self.g.packet_filters or target in self.g.packet_sinks
+        ):
+            return None  # its destination settled what encodes for it
+        producer = _ref_node(ref)
+        if producer is not None and producer in self.node_shapes:
+            return self._node_output_wire(producer, _ref_pad(ref), ref)
+        if target is not None and target in self.node_shapes:
+            node = self.g.nodes[target]
+            position = self._read_position(node, ref)
+            if position is not None:
+                return self._node_input_wire(target, node.ports[position], ref)
+        return None
+
+    def _node_input_wire(self, name: str, port_name: str, ref: FrameRef) -> StreamFormat:
+        """What node `name` takes on its port `port_name`."""
+        port = self.node_shapes[name].input(port_name)
+        meta = self._origin_meta(ref)
+        accepts = port.accepts if port is not None else None
+        if port is not None and port.kind == "packets":
+            return self._node_packets_wire(name, port_name, ref)
+        if accepts is not None and accepts.wants == "timing":
+            return self._timing_wire(ref)
+        if ref_type(self.g, ref) == "audio":
+            formats = accepts.sample_formats if accepts is not None else ()
+            sample = next((f for f in formats if f in WIRE_SAMPLE_FMTS), None)
+            if formats and sample is None:
+                raise FfrwdError(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"the module '{self.g.nodes[name].filter}' takes "
+                    f"{', '.join(formats)} on '{port_name}', and an edge carries "
+                    f"{', '.join(WIRE_SAMPLE_FMTS)}",
+                    hint="rebuild the module accepting one of those sample formats",
+                )
+            return AudioFormat(
+                rate=meta.sample_rate if meta else None,
+                channels=meta.channels if meta else None,
+                codec=SAMPLE_FMT_CODECS[sample or WIRE_SAMPLE_FMTS[0]],
+                required_rate=accepts.sample_rates[0] if accepts and accepts.sample_rates else None,
+                required_channels=(
+                    accepts.channel_counts[0] if accepts and accepts.channel_counts else None
+                ),
+            )
+        formats = accepts.pixel_formats if accepts is not None else ()
+        pix_fmt = next((f for f in formats if f in WIRE_PIX_FMTS), None)
+        if formats and pix_fmt is None:
+            raise FfrwdError(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"the module '{self.g.nodes[name].filter}' takes {', '.join(formats)} "
+                f"on '{port_name}', and an edge carries {', '.join(WIRE_PIX_FMTS)}",
+                hint="rebuild the module accepting one of those pixel formats",
+            )
+        size = self._picture_size(ref)
+        return VideoFormat(
+            pix_fmt=pix_fmt or DEFAULT_PIX_FMT,
+            width=size[0] if size else None,
+            height=size[1] if size else None,
+            timebase=_timebase(meta.fps) if meta else None,
+        )
+
+    def _timing_wire(self, ref: FrameRef) -> StreamFormat:
+        """A stream a node reads for its frames' times alone: in the format it
+        already has, converted to nothing and conformed to nothing."""
+        meta = self._origin_meta(ref)
+        if ref_type(self.g, ref) == "audio":
+            return AudioFormat(
+                rate=meta.sample_rate if meta else None,
+                channels=meta.channels if meta else None,
+                codec=SAMPLE_FMT_CODECS[WIRE_SAMPLE_FMTS[0]],
+            )
+        producer = _ref_node(ref)
+        own = self._carried_pix_fmt(ref)
+        pix_fmt = (
+            self._pix_fmt(ref, None)
+            if producer is not None and self.external.get(producer, False)
+            else own
+            if own in WIRE_PIX_FMTS
+            else DEFAULT_PIX_FMT
+        )
+        size = self._picture_size(ref)
+        return VideoFormat(
+            pix_fmt=pix_fmt,
+            width=size[0] if size else None,
+            height=size[1] if size else None,
+            timebase=_timebase(meta.fps) if meta else None,
+        )
+
+    def _carried_pix_fmt(self, ref: FrameRef) -> str | None:
+        """The pixel format the pictures `ref` carries already have: the one the
+        nearest ``format`` on their way from the input names, else the input's
+        own. None past a module, or a ``format`` naming several."""
+        seen: set[str] = set()
+        current = ref
+        while not is_src(current):
+            name = _ref_node(current)
+            if name is None or name not in self.g.nodes or name in seen:
+                return None
+            seen.add(name)
+            node = self.g.nodes[name]
+            if node.filter == "format":
+                named = str(node.args.get("pix_fmts", ""))
+                return named if named and "|" not in named else None
+            if self.external.get(name, False) or not node.inputs:
+                return None
+            current = next(
+                (r for r in node.inputs if ref_type(self.g, r) == "video"), node.inputs[0]
+            )
+        meta = self._origin_meta(current)
+        return meta.pix_fmt if meta is not None else None
+
+    def _reads_timing(self, name: str, ref: FrameRef) -> bool:
+        """Whether node `name` reads `ref`, or a split's copy of it, for its
+        frames' times alone."""
+        shape = self.node_shapes.get(name)
+        if shape is None:
+            return False
+        node = self.g.nodes[name]
+        position = self._read_position(node, ref)
+        port = shape.input(node.ports[position]) if position is not None else None
+        return port is not None and port.accepts.wants == "timing"
+
+    def _node_packets_wire(self, name: str, port_name: str, ref: FrameRef) -> StreamFormat:
+        """A stream a node reads as coded packets: copied as it was coded.
+
+        The module names the codecs it takes; a stream coded in another, or
+        not coded at all, is one this edge cannot hand it.
+        """
+        port = self.node_shapes[name].input(port_name)
+        codecs = port.accepts.codecs if port is not None else ()
+        producer = _ref_node(ref)
+        meta = self._origin_meta(ref)
+        coded = producer is None or (
+            producer in self.node_shapes
+            and self.node_shapes[producer].outputs[_ref_pad(ref)].kind == "packets"
+        )
+        codec = meta.codec if meta is not None and producer is None else None
+        if not coded or (codecs and codec is not None and codec not in codecs):
+            raise FfrwdError(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"the module '{self.g.nodes[name].filter}' reads coded packets on "
+                f"'{port_name}', and {_named_ref(ref)} is "
+                + (f"coded as {codec}" if coded else "not coded"),
+                hint="hand it an input's own stream in a codec it takes"
+                + (f" ({', '.join(codecs)})" if codecs else ""),
+            )
+        if ref_type(self.g, ref) == "audio":
+            return AudioFormat(
+                rate=meta.sample_rate if meta else None,
+                channels=meta.channels if meta else None,
+                codec=COPY_CODEC,
+            )
+        return VideoFormat(
+            width=meta.width if meta else None,
+            height=meta.height if meta else None,
+            timebase=_timebase(meta.fps) if meta else None,
+            codec=COPY_CODEC,
+        )
+
+    def _node_output_wire(self, name: str, pad: int, ref: FrameRef) -> StreamFormat:
+        """What node `name` writes on its output `pad`."""
+        shape = self.node_shapes[name]
+        node = self.g.nodes[name]
+        output = shape.outputs[pad] if pad < len(shape.outputs) else None
+        found = output.format if output is not None else None
+        if output is not None and output.kind == "packets":
+            # Coded: what the module writes crosses as it is, and is copied.
+            if node.outputs[pad] == "data":
+                return DataFormat()
+            if node.outputs[pad] == "audio":
+                return AudioFormat(
+                    rate=found.sample_rate if found is not None else None,
+                    channels=found.channels if found is not None else None,
+                    codec=COPY_CODEC,
+                )
+            return VideoFormat(
+                width=found.width if found is not None else None,
+                height=found.height if found is not None else None,
+                codec=COPY_CODEC,
+            )
+        follows = (
+            found.port
+            if found is not None and found.kind == "like"
+            else shape.clock.port
+            if found is None and shape.clock.kind == "input"
+            else None
+        )
+        inherited: StreamFormat | None = None
+        if follows is not None and follows in node.ports:
+            read = node.inputs[node.ports.index(follows)]
+            inherited = self._format(read, name)
+        if node.outputs[pad] == "audio":
+            base = inherited if isinstance(inherited, AudioFormat) else AudioFormat()
+            sample = found.sample_format if found is not None else None
+            if found is not None and found.kind == "audio":
+                return AudioFormat(
+                    rate=found.sample_rate,
+                    channels=found.channels,
+                    codec=SAMPLE_FMT_CODECS.get(sample or "", base.codec),
+                )
+            return replace(base, codec=SAMPLE_FMT_CODECS.get(sample or "", base.codec))
+        base_video = inherited if isinstance(inherited, VideoFormat) else VideoFormat()
+        if found is not None and found.kind == "video":
+            return VideoFormat(
+                pix_fmt=found.pixel_format or base_video.pix_fmt,
+                width=found.width,
+                height=found.height,
+                timebase=base_video.timebase,
+            )
+        if found is not None and found.pixel_format:
+            return replace(base_video, pix_fmt=found.pixel_format)
+        return base_video
 
     def _pix_fmt(self, ref: FrameRef, target: str | None) -> str:
         """The pixel format this edge carries.
@@ -4312,25 +4984,60 @@ class _Partitioner:
 
         return keep, resized, substitute
 
+    def _pipe_bundles(self, process: _Pending) -> list[list[FrameRef]]:
+        """`process`'s pipe refs, those riding one NUT together, in pipe order."""
+        nut_of = {edge.ref: edge.nut for edge in self.edges if edge.source == process.id}
+        bundles: list[list[FrameRef]] = []
+        by_nut: dict[str, list[FrameRef]] = {}
+        for ref in process.pipes:
+            nut = nut_of.get(ref, "")
+            if not nut:
+                bundles.append([ref])
+                continue
+            if nut not in by_nut:
+                by_nut[nut] = []
+                bundles.append(by_nut[nut])
+            by_nut[nut].append(ref)
+        return bundles
+
+    def _read_aliases(
+        self, incoming: Sequence[StreamEdge], taken: set[str]
+    ) -> tuple[dict[FrameRef, str], dict[FrameRef, str], list[str]]:
+        """Each piped ref's input alias and the spec it is read under, and the
+        aliases in ``-i`` order: one per pipe, a NUT's streams counted per kind."""
+        read_as: dict[FrameRef, str] = {}
+        alias_of: dict[FrameRef, str] = {}
+        order: list[str] = []
+        by_pipe: dict[str, str] = {}
+        counted: dict[str, dict[str, int]] = {}
+        for edge in incoming:
+            if edge.ref in read_as:
+                continue
+            key = pipe_key(edge)
+            alias = by_pipe.get(key)
+            if alias is None:
+                alias = _unique_alias(edge.nut.replace(">", "_") or edge.ref, taken)
+                taken.add(alias)
+                by_pipe[key] = alias
+                counted[alias] = {}
+                order.append(alias)
+            marker = _marker(edge.format)
+            index = counted[alias].get(marker, 0)
+            counted[alias][marker] = index + 1
+            alias_of[edge.ref] = alias
+            read_as[edge.ref] = f"src:{alias}:{marker}:{index}"
+        return read_as, alias_of, order
+
     def _materialize(self, process: _Pending) -> FfmpegProcess:
         """`process` as a complete graph, its pipes now inputs and sinks."""
         kept, resized, substitute = self._shrink_splits(process)
         incoming = [e for e in self.edges if e.target == process.id]
-        alias_of: dict[FrameRef, str] = {}
-        marker_of: dict[FrameRef, str] = {}
         taken = set(self.g.sources)
-        for edge in incoming:
-            if edge.ref in alias_of:
-                continue
-            alias = _unique_alias(edge.ref, taken)
-            taken.add(alias)
-            alias_of[edge.ref] = alias
-            marker_of[edge.ref] = _marker(edge.format)
+        read_as, alias_of, read_order = self._read_aliases(incoming, taken)
 
         def rewrite(ref: FrameRef) -> FrameRef:
             ref = substitute(ref)
-            alias = alias_of.get(ref)
-            return ref if alias is None else f"src:{alias}:{marker_of[ref]}:0"
+            return read_as.get(ref, ref)
 
         nodes: dict[str, Node] = {}
         for name in kept:
@@ -4354,19 +5061,28 @@ class _Partitioner:
                         name=None,
                         metadata={},
                     )
+                    for ref in bundle
                 ],
                 path=PIPE,
             )
-            for ref in process.pipes
+            for bundle in self._pipe_bundles(process)
         )
 
         paths, sources, trims, options = self._inputs(nodes, sinks)
-        for edge in incoming:
-            alias = alias_of[edge.ref]
+        for alias in read_order:
             if alias in sources:
                 continue
             sources[alias] = len(paths)
             paths.append(PIPE)
+        # A node read in FROM ends where the query's own `WHERE <alias>.t`
+        # says: the reader takes that long of what it writes and closes.
+        for alias, name in self.g.node_sources.items():
+            bounds = self.g.input_trims.get(alias)
+            if bounds is None:
+                continue
+            for ref, piped in alias_of.items():
+                if _ref_node(ref) == name:
+                    trims[piped] = bounds
 
         return FfmpegProcess(
             id=process.id,
@@ -4396,26 +5112,25 @@ class _Partitioner:
             if edge.target == sidecar.id and edge.ref not in seen:
                 seen.add(edge.ref)
                 incoming.append(edge)
+        # In the order its pads are read, which is the order the plan's argv
+        # writes its reads in.
+        incoming.sort(
+            key=lambda edge: sidecar.inputs.index(edge.ref)
+            if edge.ref in sidecar.inputs
+            else len(sidecar.inputs)
+        )
         outgoing = [e for e in self.edges if e.source == sidecar.id]
 
-        alias_of: dict[FrameRef, str] = {}
-        marker_of: dict[FrameRef, str] = {}
         taken = set(self.g.sources)
-        for edge in incoming:
-            alias = _unique_alias(edge.ref, taken)
-            taken.add(alias)
-            alias_of[edge.ref] = alias
-            marker_of[edge.ref] = _marker(edge.format)
+        read_as, alias_of, read_order = self._read_aliases(incoming, taken)
 
         names = {binding.path: binding.name for binding in sidecar.modules}
         dissolved: dict[str, FrameRef] = {}
 
         def rewrite(ref: FrameRef) -> FrameRef:
             slot = ref if is_src(ref) else f"{_ref_node(ref)}:{_ref_pad(ref)}"
-            ref = dissolved.get(slot, ref)
-            if ref in alias_of:
-                return f"src:{alias_of[ref]}:{marker_of[ref]}:0"
-            return ref
+            ref = self.same_reads.get(ref, dissolved.get(slot, ref))
+            return read_as.get(ref, ref)
 
         nodes: dict[str, Node] = {}
         for name in members:  # topological: a split precedes its readers
@@ -4439,7 +5154,13 @@ class _Partitioner:
                 inputs=[rewrite(ref) for ref in node.inputs],
                 outputs=list(node.outputs),
                 reads_annotations=node.reads_annotations,
+                ports=list(node.ports),
+                out_ports=list(node.out_ports),
+                bound=node.bound,
             )
+        bundles: dict[str, list[StreamEdge]] = {}
+        for edge in outgoing:
+            bundles.setdefault(pipe_key(edge), []).append(edge)
         sinks = [
             SinkUnit(
                 outputs=[
@@ -4449,10 +5170,11 @@ class _Partitioner:
                         name=None,
                         metadata={},
                     )
+                    for edge in bundle
                 ],
                 path=PIPE,
             )
-            for edge in outgoing
+            for bundle in bundles.values()
         ]
         # The module whose rows leave is a sink of the region too: the network
         # string has to name the pad they were read off, even though its
@@ -4477,8 +5199,8 @@ class _Partitioner:
         # A SINK MODULE is one too: the network string names its pad, and the
         # null output that pad is mapped to carries nothing.
         for name in members:
-            if name not in self.g.module_sinks:
-                continue
+            if name not in self.g.module_sinks or name in self.node_shapes:
+                continue  # a node sink makes no output but the rows it emits
             sinks.append(
                 SinkUnit(
                     outputs=[
@@ -4494,16 +5216,102 @@ class _Partitioner:
             )
         return replace(
             sidecar,
+            listens=self._region_listens(members, names),
+            colors=self._region_colors(incoming, alias_of, read_order)
+            if sidecar.node_network
+            else (),
+            tags=self._region_tags(incoming, alias_of, read_order)
+            if sidecar.node_network
+            else (),
             reads_rows=any(e.annotations for e in self.edges if e.target == sidecar.id),
             writes_rows=any(e.annotations for e in self.edges if e.source == sidecar.id),
             rows_modules=self._rows_modules(sidecar, members),
             graph=Graph(
-                input_paths=[PIPE] * len(incoming),
-                sources={alias_of[e.ref]: index for index, e in enumerate(incoming)},
+                input_paths=[PIPE] * len(read_order),
+                sources={alias: index for index, alias in enumerate(read_order)},
                 nodes=nodes,
                 sinks=sinks,
             ),
         )
+
+    def _region_colors(
+        self,
+        incoming: Sequence[StreamEdge],
+        alias_of: Mapping[FrameRef, str],
+        order: Sequence[str],
+    ) -> tuple[tuple[tuple[str, str], ...], ...]:
+        """The colour each ``-i`` of a node network is told, in ``-i`` order.
+
+        NUT writes none, so each input an ffmpeg writes a raw picture on is
+        told the first one's: what the probe and the filters on the way say
+        (:func:`stream_colorimetry`), and full-range RGB where the edge
+        converts it to an RGB format. A field nothing settles is "unknown".
+        """
+        sidecars = {sidecar.id for sidecar in self.sidecars}
+        modules = {name for name, external in self.external.items() if external}
+        found: dict[str, tuple[tuple[str, str], ...]] = {}
+        for edge in incoming:
+            wire = edge.format
+            alias = alias_of.get(edge.ref)
+            if (
+                alias is None
+                or alias in found
+                or edge.source in sidecars
+                or not isinstance(wire, VideoFormat)
+                or wire.codec != RAWVIDEO
+            ):
+                continue
+            said = stream_colorimetry(
+                self.g, edge.ref, self._origin_meta, wire.pix_fmt, opaque=modules
+            )
+            if wire.pix_fmt.startswith(RGB_PREFIXES):
+                said.update(_RGB_WIRE_COLOR)
+            found[alias] = tuple(
+                (key, said.get(option, _UNKNOWN_COLOR)) for option, key in _PAD_COLOR.items()
+            )
+        if not found:
+            return ()
+        return tuple(found.get(alias, ()) for alias in order)
+
+    def _region_tags(
+        self,
+        incoming: Sequence[StreamEdge],
+        alias_of: Mapping[FrameRef, str],
+        order: Sequence[str],
+    ) -> tuple[tuple[tuple[str, str], ...], ...]:
+        """The tags the query wrote on each ``-i`` of a node network's streams,
+        in ``-i`` order: an earlier stream's key wins over a later one's."""
+        found: dict[str, dict[str, str]] = {}
+        for edge in incoming:
+            alias = alias_of.get(edge.ref)
+            if alias is None:
+                continue
+            for ref in (edge.ref, self._past_splits(edge.ref)):
+                for key, value in self.g.stream_tags.get(ref, {}).items():
+                    found.setdefault(alias, {}).setdefault(key, value)
+        if not found:
+            return ()
+        return tuple(tuple(found.get(alias, {}).items()) for alias in order)
+
+    def _region_listens(
+        self, members: Sequence[str], names: Mapping[str, str]
+    ) -> tuple[tuple[int, str, str], ...]:
+        """Each input a node of this region holds on a port of its own and the
+        query bound no stream to: the port its param carries, and the input."""
+        found: list[tuple[int, str, str]] = []
+        for name in members:
+            shape = self.node_shapes.get(name)
+            if shape is None:
+                continue
+            node = self.g.nodes[name]
+            for port in shape.inputs:
+                hold = port.pairing.hold
+                if hold is None or hold.port_param is None or port.name in node.ports:
+                    continue
+                number = node.args.get(hold.port_param)
+                if isinstance(number, int) and not isinstance(number, bool):
+                    found.append((number, names.get(node.filter, node.filter), port.name))
+        return tuple(found)
 
     def _rows_pad(self, name: str) -> str:
         """The node whose PAD the rows `name` writes were read off.
@@ -4513,6 +5321,8 @@ class _Partitioner:
         and whose own output is not a pad at all.
         """
         seen: set[str] = set()
+        if name not in self.g.nodes:
+            return name  # a node's own pad: its rows leave on it
         while self.g.nodes[name].rows_only and name not in seen:
             seen.add(name)
             name = self.g.nodes[name].rows_inputs[0]
@@ -4644,6 +5454,8 @@ def check_spellable(plan: ProcessPlan) -> None:
     A SOURCE MODULE is exempt: its several pads are each their own named
     pipe by construction, the same way a packet sink's several inputs are.
     So is a packet filter, and a data filter: each output is a pipe of its own.
+    So is a node network: the streams it hands one process ride one NUT, and
+    each process it hands streams to has an output of its own.
 
     A pad handed to two processes is refused while the plan is built, where
     what reads it still has a name (:meth:`_Partitioner._check_handed_once`).
@@ -4653,6 +5465,7 @@ def check_spellable(plan: ProcessPlan) -> None:
             sidecar.packet_source
             or sidecar.packet_filter
             or sidecar.data_filter
+            or sidecar.node_network
             or len(sidecar.outputs) <= 1
         ):
             continue

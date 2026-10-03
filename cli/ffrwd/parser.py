@@ -2717,6 +2717,15 @@ def _projection_field_name(node: exp.Expr) -> str | None:
 # with, for lowering to mint the node that applies it.
 ROW_PREDICATE = "row_predicate"
 
+# Where a call or a field read only a node module can make sense of keeps the
+# refusal an older world's module earns, for lowering to raise once the
+# module's describe says it is not a node.
+OLDER_WORLD = "older_world"
+
+# The same for the refusal a node module earns: a call written for an older
+# world's module, which only a node's describe can show to be wrong.
+NODE_REFUSAL = "node_refusal"
+
 # Where `merge_cues(...)` over a module's rows leaves the distance it was
 # written with, for lowering to mint the node that applies it.
 ROW_MERGE = "row_merge"
@@ -2949,6 +2958,25 @@ def annotation_projection(
     if declared is None or declared.emits is None:
         return None
     return (base, declared) if _ident_name(field) == declared.emits.name else None
+
+
+def node_rows_call(node: object, wasm: Mapping[str, WasmFunction]) -> Annotation | None:
+    """The record a call's rows carry, for a call a node may answer with rows alone.
+
+    A declaration whose RETURNS is one array of records over a stream: a
+    packet sink's in FROM, a node's run-time data stream anywhere else. None
+    for every other expression.
+    """
+    if not isinstance(node, exp.Expr):
+        return None
+    call = _unwrap_paren(node)
+    if not isinstance(call, exp.Anonymous):
+        return None
+    declared = wasm.get(str(call.name).lower())
+    outputs = declared.outputs if declared is not None else None
+    if not outputs or len(outputs) != 1 or outputs[0].name:
+        return None
+    return outputs[0].annotation
 
 
 def is_annotation_argument(node: object, wasm: Mapping[str, WasmFunction]) -> bool:
@@ -5149,6 +5177,31 @@ class _Resolver:
         A data filter's struct is its outputs, each a data stream of its own,
         and every field of it is one.
         """
+        if declared.is_node_only:
+            names = tuple(o.name for o in declared.outputs or () if o.name)
+            if path in names:
+                return
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"{declared.name}() returns no field '{path}'",
+                sub,
+                fallback=select,
+                hint="it returns " + ", ".join(f"'{name}'" for name in names)
+                if names
+                else f"it returns one {declared.written_returns}: the call itself is "
+                "the stream",
+            )
+        try:
+            self._check_older_wasm_field(declared, path, sub, select)
+        except FfrwdError as refusal:
+            if not any(o.name == path for o in declared.outputs or ()):
+                raise
+            sub.meta[OLDER_WORLD] = refusal
+
+    def _check_older_wasm_field(
+        self, declared: WasmFunction, path: str, sub: exp.Dot, select: exp.Select
+    ) -> None:
+        """:meth:`_check_wasm_field` as a module of an older world reads it."""
         if declared.is_data_filter:
             if path in declared.data_fields:
                 return
@@ -5860,11 +5913,17 @@ class _Resolver:
         arguments = item.expressions
         source = arguments[0] if len(arguments) == 1 else None
         found = annotation_projection(source, self.wasm)
-        if found is None or not isinstance(source, exp.Expr):
+        rows = node_rows_call(source, self.wasm)
+        if (found is None and rows is None) or not isinstance(source, exp.Expr):
             self._no_gather_over_rows_function(source, array_node)
             return False
-        emits = found[1].emits
-        assert emits is not None  # what annotation_projection matched on
+        if found is None:
+            try:
+                self._no_gather_over_rows_function(source, array_node)
+            except FfrwdError as refusal:
+                _unwrap_paren(source).meta.setdefault(OLDER_WORLD, refusal)
+        emits = found[1].emits if found is not None else rows
+        assert emits is not None  # what annotation_projection or node_rows_call matched on
         _check_query_args(
             subquery, frozenset({"expressions", "from_", "where"}), "row gather"
         )
@@ -7930,7 +7989,11 @@ class _Resolver:
                     hint=_WHERE_HINT,
                 )
             column, low, high, strict = parsed
-            if strict:
+            table_node = column.args.get("table")
+            # A node read in FROM ends on a tick, so `t < 10` says where;
+            # which wasm sources are nodes is the module's to say, in lowering.
+            ticks = table_node is not None and _ident_name(table_node) in self.wasm_sources
+            if strict and not ticks:
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,
                     "strict inequalities are not supported",
@@ -7938,7 +8001,6 @@ class _Resolver:
                     fallback=where,
                     hint=_STRICT_HINT,
                 )
-            table_node = column.args.get("table")
             if table_node is None:
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,

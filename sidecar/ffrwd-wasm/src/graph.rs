@@ -353,6 +353,181 @@ fn read_filter(chars: &[char], from: usize) -> (String, usize) {
     (out, i)
 }
 
+/// Which streams of an input a node network's pad counts among.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StreamClass {
+    Video,
+    Audio,
+    Data,
+}
+
+impl StreamClass {
+    pub fn marker(self) -> &'static str {
+        match self {
+            StreamClass::Video => VIDEO_MARKER,
+            StreamClass::Audio => AUDIO_MARKER,
+            StreamClass::Data => DATA_MARKER,
+        }
+    }
+}
+
+/// One stream of one `-i`, as ffmpeg's stream specifiers name it: input
+/// `input`'s `nth` stream of `class`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamRef {
+    pub input: usize,
+    pub class: StreamClass,
+    pub nth: usize,
+}
+
+impl std::fmt::Display for StreamRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.input, self.class.marker())?;
+        if self.nth > 0 {
+            write!(f, ":{}", self.nth)?;
+        }
+        Ok(())
+    }
+}
+
+/// What a node network's pad reads: a stream of an input, or a label.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NodePad {
+    Input(StreamRef),
+    Label(String),
+}
+
+/// One chain of a node network: the module, its options, and its pads, each
+/// with the port it names where it names one (`[v=0:v]`, `[spots=s]`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeCall {
+    pub module: String,
+    pub options: Vec<(String, String)>,
+    pub inputs: Vec<(Option<String>, NodePad)>,
+    pub outputs: Vec<(Option<String>, String)>,
+}
+
+/// The output pad that labels the rows a node emits beside its ports.
+pub const ROWS_PORT: &str = "@rows";
+
+const DATA_MARKER: &str = "d";
+
+/// Reads a `-filter_complex` string in the node spelling: pads that bind
+/// ports by name, inputs of any class at any position, and chains with no
+/// input at all.
+pub fn parse_node_network(text: &str) -> Result<Vec<NodeCall>> {
+    if text.trim().is_empty() {
+        bail!("-filter_complex is empty; a module network names at least one module");
+    }
+    let mut calls = Vec::new();
+    let mut chain: Vec<Token> = Vec::new();
+    for token in tokenize(text)? {
+        match token {
+            Token::ChainEnd => {
+                calls.push(node_call(&chain, calls.len())?);
+                chain = Vec::new();
+            }
+            other => chain.push(other),
+        }
+    }
+    calls.push(node_call(&chain, calls.len())?);
+    Ok(calls)
+}
+
+fn node_call(chain: &[Token], index: usize) -> Result<NodeCall> {
+    if chain.iter().any(|t| matches!(t, Token::Merge)) {
+        bail!(
+            "chain {index} of -filter_complex merges filters with ','; \
+             a module network spells one module per chain, separated by ';'"
+        );
+    }
+    let mut inputs = Vec::new();
+    let mut outputs = Vec::new();
+    let mut filter: Option<&String> = None;
+    for token in chain {
+        match token {
+            Token::Label(label) => {
+                let (port, pad) = split_port(label, index, filter.is_some())?;
+                if filter.is_none() {
+                    inputs.push((port, node_pad(pad, index)?));
+                } else {
+                    outputs.push((port, pad.to_string()));
+                }
+            }
+            Token::Filter(text) => {
+                if filter.is_some() {
+                    bail!("chain {index} of -filter_complex names two modules in a row");
+                }
+                filter = Some(text);
+            }
+            Token::Merge | Token::ChainEnd => {
+                unreachable!("chains are cut on ';', and a merged one was refused above")
+            }
+        }
+    }
+    let Some(text) = filter else {
+        bail!("chain {index} of -filter_complex names no module");
+    };
+    let (module, options) = split_filter(text, index)?;
+    Ok(NodeCall {
+        module,
+        options,
+        inputs,
+        outputs,
+    })
+}
+
+/// `port=pad` split at its `=`; a pad with no `=` names no port.
+fn split_port(label: &str, index: usize, output: bool) -> Result<(Option<String>, &str)> {
+    let Some((port, pad)) = label.split_once('=') else {
+        return Ok((None, label));
+    };
+    let named = !port.is_empty()
+        && port
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if !(named || output && port == ROWS_PORT) {
+        bail!(
+            "chain {index} of -filter_complex has the pad [{label}], whose port '{port}' is no \
+             port name"
+        );
+    }
+    if pad.is_empty() {
+        bail!("chain {index} of -filter_complex binds port '{port}' to an empty pad");
+    }
+    Ok((Some(port.to_string()), pad))
+}
+
+fn node_pad(pad: &str, index: usize) -> Result<NodePad> {
+    let mut parts = pad.split(':');
+    let first = parts.next().unwrap_or_default();
+    let Ok(input) = first.parse::<usize>() else {
+        return Ok(NodePad::Label(pad.to_string()));
+    };
+    let class = match parts.next() {
+        Some(VIDEO_MARKER) => StreamClass::Video,
+        Some(AUDIO_MARKER) => StreamClass::Audio,
+        Some(DATA_MARKER) => StreamClass::Data,
+        _ => bail!(
+            "chain {index} of -filter_complex reads [{pad}]; an input pad is \
+             [N:{VIDEO_MARKER}], [N:{AUDIO_MARKER}] or [N:{DATA_MARKER}], with the stream's \
+             position among its kind after a further ':'"
+        ),
+    };
+    let nth = match parts.next() {
+        None => 0,
+        Some(n) => n.parse::<usize>().map_err(|_| {
+            anyhow!(
+                "chain {index} of -filter_complex reads [{pad}], whose position is not a number"
+            )
+        })?,
+    };
+    if parts.next().is_some() {
+        bail!("chain {index} of -filter_complex reads [{pad}], which says more than a stream");
+    }
+    Ok(NodePad::Input(StreamRef { input, class, nth }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -512,6 +687,74 @@ mod tests {
         assert!(
             message.contains("lonely") && message.contains("k=v"),
             "got: {message}"
+        );
+    }
+
+    fn port(name: &str) -> Option<String> {
+        Some(name.to_string())
+    }
+
+    fn stream(input: usize, class: StreamClass, nth: usize) -> NodePad {
+        NodePad::Input(StreamRef { input, class, nth })
+    }
+
+    #[test]
+    fn a_node_pad_binds_its_port_by_name() {
+        let calls =
+            parse_node_network("[v=0:v]spot=every=30[spots=n1];[v=0:v][spots=n1]ring[v=out0]")
+                .expect("parses");
+        assert_eq!(
+            calls[0].inputs,
+            vec![(port("v"), stream(0, StreamClass::Video, 0))]
+        );
+        assert_eq!(calls[0].outputs, vec![(port("spots"), "n1".to_string())]);
+        assert_eq!(
+            calls[1].inputs,
+            vec![
+                (port("v"), stream(0, StreamClass::Video, 0)),
+                (port("spots"), NodePad::Label("n1".to_string())),
+            ]
+        );
+        assert_eq!(calls[1].outputs, vec![(port("v"), "out0".to_string())]);
+    }
+
+    #[test]
+    fn a_stream_is_named_by_its_position_among_its_kind() {
+        let calls = parse_node_network("[a=0:a]hear[cues=n1];[v=0:v][a=0:a:1][words=n1]burn[v=o]")
+            .expect("parses");
+        assert_eq!(
+            calls[1].inputs[1],
+            (port("a"), stream(0, StreamClass::Audio, 1))
+        );
+        let calls = parse_node_network("[0:d:2]rowfilter=pred=x[k];[v=0:v]x[v=o][@rows=r]")
+            .expect("parses");
+        assert_eq!(
+            calls[0].inputs,
+            vec![(None, stream(0, StreamClass::Data, 2))]
+        );
+        assert_eq!(calls[1].outputs[1], (port(ROWS_PORT), "r".to_string()));
+        let err = parse_node_network("[@rows=r]x[o]").expect_err("an input names no rows port");
+        assert!(err.to_string().contains("no port name"), "{err}");
+    }
+
+    #[test]
+    fn a_source_chain_reads_nothing_and_its_values_are_unescaped() {
+        let calls = parse_node_network(
+            r"ticker=text=Nothing\ to\ see\ here:width=1280:height=720:fps=30[video=out0]",
+        )
+        .expect("parses");
+        assert!(calls[0].inputs.is_empty());
+        assert_eq!(
+            calls[0].options[0],
+            ("text".into(), "Nothing to see here".into())
+        );
+        let calls = parse_node_network(
+            r#"[n1]rowfilter=pred={"ge"\\:\[{"field"\\:"w"}\,{"lit"\\:20}\]}[n2]"#,
+        )
+        .expect("parses");
+        assert_eq!(
+            calls[0].options,
+            vec![("pred".into(), r#"{"ge":[{"field":"w"},{"lit":20}]}"#.into())]
         );
     }
 }

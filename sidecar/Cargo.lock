@@ -597,14 +597,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "fast_image_resize"
+version = "6.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9c50201dc184ba6553da1695aac20a042efffbe2d84542cee31917c86c3ab1e"
+dependencies = [
+ "cfg-if",
+ "document-features",
+ "num-traits",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "ffrwd-frame"
+version = "0.1.1"
+source = "git+https://github.com/imbcmdth/ffrwd-frame?tag=v0.1.1#cf8887ce24bf5f5d570fed73b278f10ffee991f1"
+dependencies = [
+ "fast_image_resize",
+]
+
+[[package]]
 name = "ffrwd-nal"
 version = "0.1.0"
 source = "git+https://github.com/imbcmdth/ffrwd-nal?tag=v0.1.0#bd2ffcf559065b8364369bbc0b24df7220b96eb8"
 
 [[package]]
 name = "ffrwd-nut"
-version = "0.1.4"
-source = "git+https://github.com/imbcmdth/ffrwd-nut?tag=v0.1.4#138b4bbf9357e720459c504be40a50fc5000ce93"
+version = "0.1.5"
+source = "git+https://github.com/imbcmdth/ffrwd-nut?tag=v0.1.5#30ca1c6018c9309f6e3a47149ab4066da87db0e6"
 dependencies = [
  "serde",
  "serde_json",
@@ -615,6 +635,8 @@ name = "ffrwd-wasm"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "fast_image_resize",
+ "ffrwd-frame",
  "ffrwd-nal",
  "ffrwd-nut",
  "ffrwd-wasm-runtime",
@@ -622,6 +644,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "socket2",
  "windows-sys 0.61.2",
 ]
 

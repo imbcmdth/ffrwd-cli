@@ -9,7 +9,7 @@
 //! the pair is a two-rendition catalog, the shape a live ladder publishes.
 
 wit_bindgen::generate!({
-    path: "../../wit",
+    path: "../../worlds/0.18.0",
     world: "packet-source-module",
 });
 

@@ -201,8 +201,9 @@ def wrap_command(line: str, width: int = _WRAP_WIDTH) -> str:
     continuations. Any other line (a table/CSV row, a `$ ...` line) is
     returned unchanged.
 
-    Two shapes are wrapped: a whole `ffmpeg ...` command, and one numbered
-    member of the listing a plan with a named pipe prints (`3. sidecar:
+    Two shapes are wrapped: a whole command (`ffmpeg ...`, or `ffrwd-wasm
+    ...` where a node source starts the pipeline), and one numbered member
+    of the listing a plan with a named pipe prints (`3. sidecar:
     ffrwd-wasm ...`), whose argv is wrapped and whose `N. role: ` lead stays
     on the first line.
 
@@ -218,7 +219,7 @@ def wrap_command(line: str, width: int = _WRAP_WIDTH) -> str:
     A token with no safe split point is left long.
     """
     listed = _LISTING_RE.match(line)
-    if listed is None and not line.startswith("ffmpeg "):
+    if listed is None and not line.startswith(("ffmpeg ", "ffrwd-wasm ")):
         return line
     lead = listed.group("lead") if listed is not None else ""
     tokens = [_quote(token) for token in shlex.split(line[len(lead):])]
@@ -325,11 +326,11 @@ def _shell_tokens(text: str) -> list[str]:
 
 
 def _assert_shlex_invariant(actual: str, expected: str) -> None:
-    """For a code block that wrapped a single `ffmpeg` line, prove the wrap kept
+    """For a code block that wrapped a single command line, prove the wrap kept
     the same shell command: the wrapped block text and the original
     unwrapped line must tokenize identically."""
     actual_line = actual.rstrip("\n")
-    if "\n" in actual_line or not actual_line.startswith("ffmpeg "):
+    if "\n" in actual_line or not actual_line.startswith(("ffmpeg ", "ffrwd-wasm ")):
         return
     assert _shell_tokens(expected) == shlex.split(actual_line)
 
@@ -509,6 +510,16 @@ def test_wrap_command_leaves_a_token_with_no_safe_split_point_long() -> None:
     wrapped = wrap_command(line, width=60)
     assert any(token in ln for ln in wrapped.split("\n"))
     assert shlex.split(wrapped.replace("\\\n", "")) == shlex.split(line)
+
+
+def test_wrap_command_wraps_a_pipeline_a_node_source_starts() -> None:
+    line = (
+        "ffrwd-wasm -m ticker=ticker.wasm -filter_complex 'ticker=fps=30[video=out0]' "
+        "-map '[out0]' -f nut pipe:1 | ffmpeg -f nut -i pipe:0 -map 0:v:0 ticker.mp4"
+    )
+    wrapped = wrap_command(line, width=60)
+    assert len(wrapped.split("\n")) > 1
+    assert _shell_tokens(wrapped) == shlex.split(line)
 
 
 def test_wrap_command_is_deterministic() -> None:

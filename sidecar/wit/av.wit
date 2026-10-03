@@ -1,4 +1,20 @@
-package ffrwd:av@0.18.0;
+// ffrwd:av 0.19.1: the node world.
+//
+// A node has any number of typed input ports, any number of typed output
+// ports, and a clock. One tick of the clock is one `process` call: the host
+// assembles what every input holds for that tick, the node emits on its
+// outputs. A frame's bytes cross into the module only on `fetch`.
+//
+// `types`, `values`, `encoder` and `decoder` carry on from 0.18.0. Every
+// other 0.18.0 interface is frozen in worlds/0.18.0 and adapted onto `node`
+// by the host.
+//
+// 0.19.1 adds to 0.19.0, nothing renamed: `wants.timing`, a `binding` with
+// stream hints where `shape`'s bound list held names, `anchor` and `group`
+// on `interval`, `feed-start.known`, and `ordinal` and `ended-feeds` on the
+// tick. 0.19.0 was never published; a module built against it is rebuilt.
+
+package ffrwd:av@0.19.1;
 
 interface types {
   /// Static description of a module, available without running anything.
@@ -161,7 +177,7 @@ interface types {
 
   /// One raw frame crossing a codec: a video frame's pixels in the
   /// instance's pix-fmt, or a run of interleaved audio samples in its
-  /// sample-fmt. Shared between `encoder` and `decoder`.
+  /// sample-fmt. What a codec and a node hand over.
   record raw-frame {
     /// When it is presented, in the stream's time base.
     pts: s64,
@@ -207,6 +223,12 @@ interface types {
     /// The first packet of each stream, and no more. What a sink reading
     /// only what a stream declares about itself needs.
     first,
+    /// A node's frame input read for its frames' times and its stream's
+    /// info alone, never their bytes: `fetch` on it is a fault. The
+    /// compiler hands the stream in whatever format its source has
+    /// cheapest, and the host carries no pixels or samples for it (a mask
+    /// sized and timed by a picture it never reads). Frame kinds only.
+    timing,
   }
 
   /// How many streams of one kind a module reading encoded packets takes.
@@ -247,522 +269,514 @@ interface types {
   }
 }
 
-interface filter {
-  use types.{meta, stream-info};
+interface node-types {
+  use types.{rational, color-info, video-format, audio-format, coded-stream,
+             packet, stream-info, rendition-meta, wants};
 
-  record frame-info {
-    width: u32,
-    height: u32,
-    /// Seconds since the start of the stream.
-    time: f64,
+  enum port-kind { video, audio, data, packets }
+
+  /// What a node does with the rows that arrive on an input.
+  /// `per-frame`: reads a tick's rows while handling that tick and keeps
+  /// nothing. `state`: folds rows into state later ticks depend on, so a
+  /// frame-parallel instance must also see the rows of the ticks it did not
+  /// process (`earlier-rows`).
+  enum rows-use { ignore, per-frame, state }
+
+  /// How a hold input's offset between source time and clock time is fixed.
+  /// `shared-clock`: the source's pts are on the clock's epoch; offset 0, and
+  /// the host holds the first frame until the clock reaches it (a timed
+  /// feeder). `first-frame`: the offset is fixed once the host holds `lead`
+  /// seconds of the source, or its end, and the start is scheduled `lead`
+  /// seconds ahead of the clock (an untimed feeder). `tagged`: shared-clock
+  /// for a feed whose tags carry this name set to 1, first-frame
+  /// otherwise (the switch's `smart_timed`).
+  variant anchor { shared-clock, first-frame, tagged(string) }
+
+  /// A frame input paired by time: the newest frame at or before the tick.
+  /// The host keeps the source buffered ahead, repeats the last frame while
+  /// the source falls behind, skips forward when it catches up, and reports
+  /// both. What ffrwd/switch did for itself, for any node.
+  record hold {
+    anchor: anchor,
+    /// Seconds ahead of the clock a first-frame start is scheduled.
+    lead: f64,
+    /// Seconds the last frame stays after the source ends; none drops it
+    /// at once.
+    linger: option<f64>,
+    /// Seconds of programme time without a frame before a live source is
+    /// given up on and its feed ended; none waits for it.
+    timeout: option<f64>,
+    /// Hold inputs of one group arrive on one connection from one source
+    /// (a feeder's picture and sound): one offset, fixed by the group's
+    /// first picture, and feed starts and ends on the same tick.
+    group: option<string>,
+    /// The param that carries this input's loopback port. Bound to a
+    /// stream, the host writes the port it picked there; left unbound, the
+    /// host listens on the port the call wrote, and whatever connects is
+    /// the source.
+    port-param: option<string>,
   }
 
-  variant output {
-    /// A new frame, same byte length as the input.
-    frame(list<u8>),
-    /// The input frame is the output; the host copies nothing.
-    passthrough,
+  /// A message input paired by time: every message whose pts falls in the
+  /// tick's interval, extended by `ahead`, each delivered once at the first
+  /// tick that holds it, held while it is ahead of the clock. The host
+  /// settles the interval once the producer's progress has passed its end
+  /// plus `ahead`; `latency` bounds that wait, and a message later than the
+  /// bound is delivered at the next tick and reported.
+  record interval {
+    /// The most this input waits, in seconds: the interval settles once the
+    /// clock input has arrived this long past its end, progress or not.
+    /// None waits for the producer's progress alone; a producer that sends
+    /// none (a lateral, a data feeder) needs a bound set.
+    latency: option<f64>,
+    /// Seconds past the interval's end whose messages are handed with it,
+    /// for a node that acts before a stamp (a fade in before a cue).
+    ahead: f64,
+    /// What maps the stream's pts onto the clock. `shared-clock`: the
+    /// stream counts on the clock's origin, as a lateral's rows do.
+    /// `first-frame`: the first message is placed at the tick it arrives
+    /// on and the offset holds for the stream's life, every message
+    /// re-stamped onto the clock's time base (a data stream on another
+    /// time origin, which ffrwd/playout's `follow` re-stamped by hand).
+    /// `tagged`: shared-clock when the stream's tags carry the name set
+    /// to 1, first-frame otherwise.
+    anchor: anchor,
+    /// Names a hold group: this stream arrives on that group's
+    /// connection, with the group's offset, fixed by its first picture (a
+    /// data stream a feeder writes beside its picture and sound). Paired
+    /// by interval as any data input is. With a group, `anchor` is
+    /// `shared-clock`.
+    group: option<string>,
   }
 
-  /// What one frame produced.
-  record outcome {
-    output: output,
-    /// JSON objects matching `meta.rows-schema`, zero or more per frame.
-    rows: list<string>,
+  variant pairing {
+    /// The clock's pts exactly: same source, one frame per tick. The input
+    /// `clock` names is declared lockstep.
+    lockstep,
+    /// Frame kinds only.
+    hold(hold),
+    /// Message kinds only.
+    interval(interval),
+    /// Delivered as it arrives, unpaired: packets to a sink, data a node
+    /// orders itself.
+    arrival,
   }
 
-  describe: func() -> meta;
-
-  /// Called once per instance. `pix-fmt` is one of `meta.pixel-formats`,
-  /// chosen by whatever drives the host. The frame size is fixed for the
-  /// life of the instance. This interface carries video alone: a module
-  /// publishing sample formats exports `window-filter` instead.
-  init: func(width: u32, height: u32, pix-fmt: string, stream-info: stream-info,
-             params: string) -> result<_, string>;
-
-  /// Replaces the parameters between frames. The module keeps the state
-  /// it built in `init`; rejecting the new parameters must leave the
-  /// previous ones in force.
-  set-params: func(params: string) -> result<_, string>;
-
-  /// Whether `process` depends only on the current frame. False makes
-  /// frame-parallel hosting unsound and a host must refuse it. Callable
-  /// after `init`; the answer may depend on the parameters.
-  frame-independent: func() -> bool;
-
-  process: func(info: frame-info, frame: list<u8>) -> outcome;
-}
-
-/// Optional beside `filter`, the way `values` is optional: a module that also
-/// exports this one reads the rows an upstream module emitted for the same
-/// frame. Everything else - `describe`, `init`, `set-params`,
-/// `frame-independent` - still comes from `filter`, so a module exporting
-/// this exports both. A host that finds this export calls `process-meta`
-/// instead of `process`; one that does not calls `process` as before.
-interface meta-filter {
-  use filter.{frame-info, outcome};
-
-  /// One frame plus the rows that arrived with it, each an NDJSON line an
-  /// upstream module produced. Empty when the frame carries none.
-  process-meta: func(info: frame-info, frame: list<u8>, rows-in: list<string>) -> outcome;
-}
-
-/// The window `window-filter`'s `process` borrows, held by the host for
-/// exactly that call. Earlier worlds copied every payload of the window into
-/// the call; here the metadata is cheap and bytes move only on `fetch`, so a
-/// module that reads one payload of a wide window never pays for the rest.
-interface window-source {
-  /// One call's input payloads. Indices run oldest first, 0 to `len() - 1` -
-  /// or pad order, for a module reading several streams - and an index at or
-  /// past `len()` is a fault that stops the run.
-  ///
-  /// The handle is the call's alone: it cannot be kept past the return, and
-  /// bytes a module means to keep are its own copy the moment `fetch` hands
-  /// them over.
-  resource in-window {
-    /// How many payloads this call carries.
-    len: func() -> u32;
-
-    /// Payload `i`'s timestamp. For an audio instance it is the first
-    /// sample's tick.
-    pts: func(i: u32) -> s64;
-
-    /// The rows that arrived with payload `i` - each an NDJSON line an
-    /// upstream module produced, empty when nothing came with it. Rows ride
-    /// pad 0: a module reading several streams is handed whatever arrived on
-    /// pad 0, and the rows that arrived on any other pad are dropped before
-    /// the call - so this is empty on every pad past the first.
-    rows: func(i: u32) -> list<string>;
-
-    /// Payload `i`'s bytes, copied on demand: the only per-payload copy.
-    ///
-    /// For a video instance the bytes are one frame's pixels. For an audio
-    /// instance they are interleaved samples in the instance's sample
-    /// format, the whole window in one contiguous piece: the host re-cuts
-    /// whatever packets arrived, so a module never sees a packet boundary.
-    fetch: func(i: u32) -> list<u8>;
-  }
-}
-
-/// A window at a time, superseding `filter`'s per-frame `process` and
-/// `meta-filter`'s `process-meta`. A module exports this one *or* those; a
-/// host adapts a module that exports the older pair as window 1, stride 1,
-/// one-to-one. `describe`, `init` and `set-params` mean here what they mean
-/// there, so the two differ only in how the payload arrives and leaves.
-///
-/// This is the only interface audio reaches. `init` is handed a `format`, and
-/// which arm it carries is the instance's kind for the rest of its life.
-interface window-filter {
-  use types.{format, meta, stream-info};
-  use window-source.{in-window};
-
-  /// Where an output payload's bytes come from.
-  variant frame-payload {
-    /// New bytes: one frame's pixels, or interleaved samples.
-    new(list<u8>),
-    /// An input's bytes, which the module never copied out: the input this
-    /// call received at the same pts, or - when the call received exactly one
-    /// input - that one, whatever pts the output carries. For a module
-    /// reading several streams this is pad 0's bytes, since every pad shares
-    /// the call's one pts. An audio module may say this only when its stride
-    /// is its window, since overlapping windows passed through would emit
-    /// every sample more than once.
-    same,
-  }
-
-  /// One output. Its pts is the module's to choose: a module may move its
-  /// payload in time, drop it, or emit several from one.
-  record out-frame {
-    pts: s64,
-    frame: frame-payload,
-    rows: list<string>,
-  }
-
-  /// `meta`, plus how the host must drive this module.
-  record window-meta {
-    meta: meta,
-    /// What one `process` call receives: frames for a video module, SAMPLES
-    /// for an audio one. 1 is plain streaming for video; an audio module
-    /// names a chunk it is happy to work in, and the host cuts that chunk out
-    /// of whatever packets arrive.
-    window: u32,
-    /// How much is consumed per call, never more than `window`, in the same
-    /// unit. `window` makes the windows disjoint.
-    stride: u32,
-    /// Whether a call depends only on what it was handed. False makes
-    /// parallel hosting unsound and a host must refuse it.
-    pure: bool,
-    /// For video: whether every call returns exactly one output per frame it
-    /// consumed, each at that frame's own pts. For audio: whether the samples
-    /// leaving over the instance's life are the samples that arrived, neither
-    /// dropped nor invented - per-call counts may differ, but the output runs
-    /// on without overlap, and a gap only where the input had one: a sample
-    /// either follows the last one out or keeps the timestamp the input gave
-    /// it. Neither window nor stride settles this, so it is declared.
-    one-to-one: bool,
-    /// Whether this module ACTS on the rows arriving with its payloads. Every
-    /// call receives them whatever this says, so availability is no answer: a
-    /// module that only carries rows through declares false, and one that
-    /// reads what an upstream module detected declares true.
-    reads-rows: bool,
-    /// Whether upstream rows may appear on this module's own output. False
-    /// means the rows leaving are the module's own, or none. It speaks of pad
-    /// 0: rows arrive there and nowhere else.
-    forwards-rows: bool,
-    /// How many streams this module reads. Frames arrive one per pad, in pad
-    /// order, all at the same pts. 1 is the ordinary module, reading one
-    /// stream. More than 1 is window 1, stride 1 - a call takes one frame off
-    /// each pad and hands one back - and a host refuses any other shape.
-    inputs: u32,
-    /// Arguments of the call that are FEEDERS rather than pads: a stream
-    /// that may be empty, which the module reads itself over a loopback
-    /// connection instead of being handed its frames. Empty for every
-    /// module that has none.
-    feeders: list<feeder>,
-  }
-
-  /// One feeder argument. The host picks a loopback port, writes it into
-  /// the param `port-param` names, and delivers the stream passed in that
-  /// position there as NUT. A call that passes a number in that position
-  /// instead is naming a port itself, and the host wires nothing.
-  record feeder {
-    /// Which argument of the call it is, counting stream arguments from 0.
-    input: u32,
-    /// The param the host puts the port it picked in.
-    port-param: string,
-    /// "video" or "audio".
-    kind: string,
-    /// Feeders sharing one connection: every feeder in a query fed by the
-    /// same source and naming the same group gets ONE port, written into
-    /// each call's `port-param`, and ONE NUT carrying every stream those
-    /// feeders name, video then audio. Empty: a connection of its own.
-    group: string,
-  }
-
-  /// What one call produced.
-  record processed {
-    frames: list<out-frame>,
-    /// Rows with nothing to ride. Only the last call may fill this.
-    trailing: list<string>,
-  }
-
-  describe: func() -> window-meta;
-
-  /// Called once per instance. The arm of `format` is the one the module's
-  /// own declaration asked for: a module publishing pixel formats is opened
-  /// with `video`, one publishing sample formats with `audio`.
-  init: func(format: format, stream-info: stream-info,
-             params: string) -> result<_, string>;
-
-  /// Replaces the parameters between windows, as `filter`'s does.
-  set-params: func(params: string) -> result<_, string>;
-
-  /// One window. `last` marks the final call of the instance's life: it
-  /// carries whatever the last stride left over, which may be nothing, and
-  /// happens exactly once. There is no separate flush.
-  ///
-  /// `window` holds the call's payloads, borrowed for the call: the window
-  /// for a module reading one stream. For a module reading several it is one
-  /// frame per pad, in pad order, every one of them at the same pts - which
-  /// is why such a module is window 1, stride 1.
-  ///
-  /// `trailing` is the rows an upstream module had nothing to put them on;
-  /// only the last call carries any. Like `in-window`'s rows, it follows pad
-  /// 0: what reached the other pads with nothing to ride never arrives here.
-  ///
-  /// Output timestamps never decrease, within a call or between calls.
-  process: func(window: borrow<in-window>, trailing: list<string>, last: bool) -> processed;
-}
-
-/// A sink for encoded packets. Where `window-filter` is handed decoded
-/// payloads, this interface is handed the encoder's own output - compressed
-/// bytes with their timestamps and keyframe flags - and hands back rows
-/// alone. A packet sink consumes the streams: no frames leave, so a module
-/// exports this one instead of the frame interfaces, and what it emits goes
-/// to a rows output or nowhere.
-///
-/// A sink is a filter with no output pads, and reads streams the way one
-/// does: several at once, of either kind. Earlier worlds carried exactly one
-/// coded stream and one packet list; here `init` is handed every stream the
-/// query named, in that order, and `process` is handed one packet list per
-/// pad in the same order.
-interface packet-sink {
-  use types.{arity, input-stream, meta, pad-packets, wants};
-
-  /// `meta`, plus what this sink accepts. A packet sink names codecs the way
-  /// a frame module names pixel formats; `meta`'s own format lists stay
-  /// empty, since no decoded payload ever reaches it.
-  record packet-sink-meta {
-    meta: meta,
-    /// ffmpeg's names for the VIDEO codecs accepted, most preferred first.
-    /// Empty is every codec.
-    video-codecs: list<string>,
-    /// ffmpeg's names for the AUDIO codecs accepted, most preferred first.
-    /// Empty is every codec.
-    audio-codecs: list<string>,
-    /// How many video streams this sink reads.
-    video: arity,
-    /// How many audio streams this sink reads.
-    audio: arity,
-    /// How many data streams this sink reads. A world before 0.17.0 read
-    /// none, which is what one is adapted to.
-    data: arity,
-    /// How much of the stream this sink has to see. `all` is the answer for
-    /// a sink that reads every packet, and the answer a world before 0.16.0
-    /// is adapted to, since none of them could say otherwise.
+  /// What an input accepts. Empty lists accept anything of the kind.
+  record accepts {
+    pixel-formats: list<string>,
+    sample-formats: list<string>,
+    sample-rates: list<u32>,
+    channel-counts: list<u32>,
+    codecs: list<string>,
     wants: wants,
+    /// Conformed by the host to that input's stream: a video to its size,
+    /// an audio to its rate and layout. The named input is single.
+    like: option<string>,
   }
 
-  /// What one call produced. Rows only: a packet sink's rows are its whole
-  /// product.
-  record processed {
-    /// JSON objects matching `meta.rows-schema`, zero or more per call.
-    rows: list<string>,
-    /// Rows with no packet left to prompt them. Only the last call may fill
-    /// this.
-    trailing: list<string>,
+  record input-port {
+    name: string,
+    kind: port-kind,
+    required: bool,
+    /// Any number of streams bound to this one port, each with its own
+    /// metadata and time base (a publisher's renditions, a weave's rows
+    /// inputs).
+    many: bool,
+    pairing: pairing,
+    rows: rows-use,
+    /// The clock input: frames (video) or samples (audio) a call sees, and
+    /// how many it consumes. Every other input hands the tick's interval
+    /// and declares 1/1.
+    window: u32,
+    stride: u32,
+    accepts: accepts,
+    /// Data inputs: the JSON schema of the rows the node reads here, as
+    /// `rows-module` declared its input rows. None accepts any row.
+    schema: option<string>,
   }
 
-  describe: func() -> packet-sink-meta;
-
-  /// Called once per instance, with every stream the sink reads: video pads
-  /// first, then audio, then data, each group in the order the query named
-  /// them. A sink declaring `one` of a kind is opened with exactly one of
-  /// it, and one declaring `zero` with none.
-  init: func(streams: list<input-stream>, params: string) -> result<_, string>;
-
-  /// Replaces the parameters between calls, as the other interfaces do.
-  set-params: func(params: string) -> result<_, string>;
-
-  /// Packets in decode order, one list per pad in `init`'s order. Pads run
-  /// independently: packets are not frames, so nothing pairs a pad's packet
-  /// with another pad's, and a call may carry packets on some pads and none
-  /// on others. `last` marks the final call of the instance's life: it
-  /// carries whatever is left, which may be no packets at all, and happens
-  /// exactly once.
-  ///
-  /// A call that is not the last may carry no packets on any pad. A module
-  /// runs only inside a call, so a host calls a sink nothing has reached for
-  /// a short while anyway, and one that drives something of its own there -
-  /// a network session - keeps it running between packets. Such a call is
-  /// answered like any other, and a module with nothing to do returns at
-  /// once.
-  process: func(pads: list<pad-packets>, last: bool) -> processed;
-}
-
-/// A transform over encoded packets: packets in, packets out, with rows
-/// arriving beside them. Where `packet-sink` is a terminus - the encoder's
-/// output goes in and rows alone come back - a filter hands the packets on,
-/// so it sits BETWEEN the encoder that wrote them and whatever muxes or
-/// publishes them. Nothing here decodes: the bytes a filter does not touch
-/// are the bytes that leave.
-///
-/// It reads pads the way a sink does, and declares what it accepts the same
-/// way, so `describe`, `init` and `set-params` mean here what they mean
-/// there. The two differences are that `init` answers the streams leaving -
-/// ordinarily the ones that arrived - and that `process` answers packets as
-/// well as rows.
-///
-/// ROWS are the second input. A module weaving data into a stream needs the
-/// data, and it arrives as JSON objects with times of their own rather than
-/// on the packets: the host hands over whatever rows it has at each call,
-/// and the module decides what to do with one whose time is ahead of or
-/// behind the packets it has seen. A row ahead is held; a row behind is the
-/// module's to place or drop. Nothing here pairs a row with a packet, so a
-/// file of rows produced by an earlier stage and a live feed arriving while
-/// packets flow are the same interface.
-///
-/// What a filter must not break is the container on the other side:
-///
-/// - Packet ORDER per pad is preserved. What arrives in decode order leaves
-///   in decode order, and a module that holds packets back releases them in
-///   that same order.
-/// - ONE packet in, one packet out per access unit. A filter may hold a
-///   packet back across calls and release it later, but over the instance's
-///   life the packets leaving a pad are the packets that arrived on it,
-///   neither dropped nor invented. A muxer counts frames; a filter that
-///   changed the count would write a file whose timestamps no longer
-///   describe its pictures.
-/// - `pts`, `dts` and `duration` pass through untouched unless the module
-///   is rewriting timestamps on purpose. They are the arriving packet's
-///   own, and a module that rewrites them keeps dts non-decreasing.
-/// - `keyframe` says of the OUTGOING packet what it said of the incoming
-///   one: whether decoding can start there. Adding a parameter set or an
-///   SEI to a keyframe leaves it a keyframe; nothing a filter does to the
-///   bytes makes a non-keyframe one.
-///
-/// A filter that rewrites a stream's out-of-band header - a new SPS and
-/// PPS, say - says so by answering `init` with the changed `extradata`, and
-/// the host writes that header rather than the one it read. Extradata is
-/// the only part a filter may change. The codec, the time base and the
-/// geometry belong to the stream that arrived; the profile and the level
-/// are not carried beside the packets at all, but read back out of the
-/// header itself, so a filter that raises a profile does it by writing the
-/// parameter set that says so.
-interface packet-filter {
-  use types.{arity, coded-stream, input-stream, meta, pad-packets};
-
-  /// `meta`, plus what this filter accepts. A packet filter names codecs
-  /// the way a frame module names pixel formats; `meta`'s own format lists
-  /// stay empty, since no decoded payload ever reaches it.
-  record packet-filter-meta {
-    meta: meta,
-    /// ffmpeg's names for the VIDEO codecs accepted, most preferred first.
-    /// Empty is every codec.
-    video-codecs: list<string>,
-    /// ffmpeg's names for the AUDIO codecs accepted, most preferred first.
-    /// Empty is every codec.
-    audio-codecs: list<string>,
-    /// How many video streams this filter reads.
-    video: arity,
-    /// How many audio streams this filter reads.
-    audio: arity,
-    /// How many data streams this filter reads. A world before 0.17.0 read
-    /// none, which is what one is adapted to.
-    data: arity,
-    /// Whether this filter ACTS on the rows handed to `process`. Every call
-    /// receives whatever rows have arrived whatever this says, so
-    /// availability is no answer: a filter that only rewrites packets
-    /// declares false, and one weaving rows into the stream declares true.
-    /// A host with no rows to give refuses a filter declaring true rather
-    /// than run it blind.
-    reads-rows: bool,
+  /// An input's format with one field overridden: a matte the size of its
+  /// picture, in gray. The named input is single and a frame kind.
+  record like-input {
+    port: string,
+    pixel-format: option<string>,
+    sample-format: option<string>,
   }
 
-  /// What one call produced.
-  record filtered {
-    /// The packets leaving, one list per pad in `init`'s order, each in
-    /// decode order. A pad's list is empty when the call released nothing
-    /// on it - which a filter holding packets back does, and which says
-    /// nothing about whether more are coming.
-    pads: list<pad-packets>,
-    /// JSON objects matching `meta.rows-schema`, zero or more per call:
-    /// what the filter itself has to say, exactly as a sink's `processed`
-    /// carries them.
-    rows: list<string>,
-    /// Rows with no packet left to prompt them. Only the last call may fill
-    /// this.
-    trailing: list<string>,
+  variant output-format {
+    video(video-format),
+    audio(audio-format),
+    /// The codec, "json" today.
+    data(string),
+    packets(coded-stream),
+    like(like-input),
   }
 
-  describe: func() -> packet-filter-meta;
-
-  /// Called once per instance, with every stream the filter reads: video
-  /// pads first, then audio, then data, each group in the order the query
-  /// named them. A filter declaring `one` of a kind is opened with exactly
-  /// one of it, and one declaring `zero` with none.
-  ///
-  /// The list answered is the streams LEAVING, one per input pad and in the
-  /// same order: ordinarily the ones that arrived, handed straight back. A
-  /// filter that rewrites a stream's out-of-band header answers the changed
-  /// `extradata` instead, and the host writes that. Everything else in the
-  /// record is the arriving stream's: the codec, the time base and the
-  /// geometry because the packets leaving are packets of the stream that
-  /// arrived, and the profile and the level because nothing carries them
-  /// beside the packets - they are read back out of the header. A host
-  /// refuses any of those changed, and a list of any other length.
-  init: func(streams: list<input-stream>, params: string) -> result<list<coded-stream>, string>;
-
-  /// Replaces the parameters between calls, as the other interfaces do.
-  set-params: func(params: string) -> result<_, string>;
-
-  /// Packets in decode order, one list per pad in `init`'s order, and the
-  /// rows that have arrived since the last call. Pads run independently:
-  /// packets are not frames, so nothing pairs a pad's packet with another
-  /// pad's, and a call may carry packets on some pads and none on others.
-  ///
-  /// `rows` is whatever the host had ready. They arrive in the order they
-  /// were written and never arrive twice, and a module needing a row's time
-  /// reads it out of the row.
-  ///
-  /// A filter may be given SEVERAL rows inputs, one per rows argument the
-  /// query wrote. They are not separate lists: every row arrives in this one,
-  /// and a row from a NAMED input carries an extra `"_arg": "<name>"` field
-  /// saying which argument it filled. The host writes that field itself and
-  /// refuses a producer row that already carries one, so a module may read it
-  /// as the host's word rather than the producer's. An input the host was
-  /// given no name for adds nothing, and its rows arrive exactly as written.
-  ///
-  /// WHEN they arrive depends on where they come from, and a module may rely
-  /// on this much:
-  ///
-  /// - From a FILE, every row is in hand before the first call, as many as
-  ///   the host's own buffer holds. A file whose rows outrun that buffer
-  ///   fills it, and the rest arrive over the calls that follow as the
-  ///   module takes them. So a filter fed a file of any ordinary size sees
-  ///   the lot before packet one, and one fed a very large file sees them in
-  ///   order as it drains them. SEVERAL files share that one buffer, so what
-  ///   is in hand before the first call is the first bufferful of all of them
-  ///   together, in whatever order their readers interleaved.
-  /// - From a PIPE, they arrive whenever they are written, which may be none
-  ///   for many calls and many at once. Packets never wait on a pipe: a live
-  ///   run whose rows are still being produced keeps flowing.
-  ///
-  /// Either way nothing pairs a row with a packet, and a module that needs
-  /// every row before it commits to anything holds its packets back until
-  /// the call that brings them.
-  ///
-  /// `last` marks the final call of the instance's life: it carries whatever
-  /// packets and rows are left, which may be none of either, and happens
-  /// exactly once. Everything held back leaves on it - a packet still held
-  /// when `last` returns is a packet the container never gets.
-  process: func(pads: list<pad-packets>, rows: list<string>, last: bool) -> filtered;
-}
-
-/// A source of encoded packets, the mirror of `packet-sink`: no input pads,
-/// one or more output tracks. Nothing arrives to push a source, so the host
-/// pulls: `next` is called once per batch until it answers none.
-///
-/// `probe` reads the whole catalog at compile time - every track the source
-/// publishes and whether it ever ends - which is what makes those tracks
-/// known before anything runs. `open` is told which of them the run reads,
-/// and the source subscribes to exactly those: a track nobody asked for is
-/// never pulled off the wire.
-interface packet-source {
-  use types.{coded-stream, meta, pad-packets, rendition-meta, stream-info};
-
-  /// One track the source publishes, fixed for the life of the instance.
-  record source-track {
-    coded: coded-stream,
-    info: stream-info,
-    /// Which relation row this track belongs to.
-    row: u32,
-    /// What the source read of that row.
-    rendition: rendition-meta,
+  record output-port {
+    name: string,
+    kind: port-kind,
+    /// None: the clock input's format, as most filters leave it.
+    format: option<output-format>,
+    /// None: the clock input's.
+    time-base: option<rational>,
+    /// How far behind the end of its tick's interval a stamp may fall, in
+    /// seconds; 0 when everything leaves with its tick. A window's
+    /// length is not counted here: a recogniser that emits a window's
+    /// results with the window declares 0. Consumers pairing by interval
+    /// and the compiler's delay sums read it.
+    latency: f64,
+    /// Data outputs: the JSON schema of the rows this port writes.
+    schema: option<string>,
+    /// A source read in FROM: the row of `relation` this output belongs
+    /// to. Outputs of one row are one rendition.
+    row: option<u32>,
   }
 
-  /// Every track a source publishes, and whether it ever ends.
-  record catalog {
-    tracks: list<source-track>,
+  variant clock {
+    input(string),
+    /// A generator: ticks at this rate, paced to real time in a live run
+    /// and as fast as the outputs drain otherwise. For a node with inputs
+    /// that only need turns (a publisher's network session): at least this
+    /// often, and the last call comes once every input has ended, unless
+    /// the node finished first.
+    rate(rational),
+    /// A rate clock at the named input's rate, which the compiler reads
+    /// off that port's first stream; the input itself is held like any
+    /// other. A tile of pictures at the first picture's rate.
+    rate-of(string),
+    /// The node emits when it has something; its outputs' pts are the
+    /// timeline (a network source).
+    self-clocked,
+  }
+
+  /// What the compiler knows of one stream before the run.
+  record stream-hint {
+    /// Video: the frame rate. Audio: the sample rate over 1. None where
+    /// nothing settles it before the run (a self-clocked source's output,
+    /// a feed by port).
+    rate: option<rational>,
+  }
+
+  /// One input a call binds, as `shape` is told it.
+  record binding {
+    /// The input, by the declaration's name.
+    input: string,
+    /// The streams the call binds here, in the order it names them, one
+    /// hint each: how many a many port takes, and the clock's rate, so a
+    /// latency or a window known in frames or samples is declared in
+    /// seconds exactly.
+    streams: list<stream-hint>,
+  }
+
+  record node-shape {
+    inputs: list<input-port>,
+    outputs: list<output-port>,
+    clock: clock,
+    /// Every call depends only on what it was handed, counting a state
+    /// input's earlier rows as handed. A host spreads a pure node over
+    /// workers; an impure one runs as one instance, in order.
+    pure: bool,
+    /// Frame kinds: one frame out per frame in on the clock's outputs, each at
+    /// its tick's pts. Audio: samples conserved and contiguous.
+    one-to-one: bool,
+    /// A rate or self-clocked node: whether it ends by itself. A live one
+    /// does not, and the compiler plans it as live. Ignored on an input
+    /// clock.
     bounded: bool,
+    /// A source read in FROM: one JSON object per relation row (rendition,
+    /// bandwidth, codecs, geometry), which its outputs name by index.
+    relation: list<string>,
   }
 
+  /// One stream bound to an input port at `init`.
+  record bound-stream {
+    port: string,
+    /// Names the stream for the instance's life: distinct across the
+    /// bound streams, and what every tick call and `same` take.
+    id: u32,
+    /// Its time base is `info.time-base`.
+    info: stream-info,
+    /// The format the stream arrives in, resolved: never `like`. Packets
+    /// inputs carry `coded`.
+    format: option<output-format>,
+    rendition: rendition-meta,
+    /// The relation row the stream came from, where the call reads rows (a
+    /// sink handed a ladder); the publisher names its tracks by it.
+    row: option<u32>,
+    /// Packets inputs: how deep the stream reorders, as `input-stream`
+    /// carries it at 0.18. 0 elsewhere.
+    decode-delay: u32,
+    /// Data inputs: the producer's declared latency, when it has one.
+    latency: option<f64>,
+    /// The hint `shape` was asked with for this stream, so an instance
+    /// that derives its shape again at `init` derives the one the plan
+    /// was made from.
+    hint: stream-hint,
+  }
+
+  record message {
+    pts: s64,
+    data: list<u8>,
+  }
+
+  record timed-rows {
+    pts: s64,
+    rows: list<string>,
+  }
+
+  record feed-start {
+    /// The source's tags, `smart_timed` among them.
+    tags: list<tuple<string, string>>,
+    /// Its first frame's pts, in its own time base.
+    first-pts: s64,
+    /// The clock time that first frame stands at, in the clock's time base:
+    /// what maps the source's pts onto the tick.
+    at: s64,
+    /// The clock time of the tick the start was fixed on: when the first
+    /// frame arrived and the offset was settled, which for a timed source
+    /// is seconds before `at`; equal to `at` when fixed on the tick it
+    /// showed. What a countdown counts from.
+    known: s64,
+  }
+
+  /// A hold input's feed: one source, from the tick its first frame shows
+  /// on to the last its last frame shows on, `linger` included. The source
+  /// going backwards, or forwards by more than a second, ends it and
+  /// starts the next.
+  record feed {
+    start: feed-start,
+    /// The clock time of the last tick its last frame shows on, once the
+    /// host can foretell it: the source ended, or timed out.
+    ends: option<s64>,
+  }
+
+  /// One frame as a tick sees it, without its bytes: a picture, or the
+  /// tick's audio samples as one run, which is a frame as codecs count
+  /// them.
+  record frame {
+    /// In the stream's time base; for audio, the first sample's.
+    pts: s64,
+    /// Its place in the stream's `frames` this tick, oldest first from 0:
+    /// what `fetch` and `same` name it by.
+    index: u32,
+    /// How long it is presented, in the stream's time base; none where
+    /// nothing settles it.
+    duration: option<s64>,
+    /// The rows that arrived with it, each a JSON object from an upstream
+    /// module. Empty on an input whose `rows` is `ignore`.
+    rows: list<string>,
+  }
+}
+
+/// What one tick holds.
+interface node-tick {
+  use types.{rational, packet, stream-info};
+  use node-types.{frame, message, feed, timed-rows};
+
+  /// One call's inputs, held by the host for exactly that call. A stream
+  /// is named by the `id` `init` gave it; an id `init` did not give, or an
+  /// index at or past the length of that stream's `frames`, is a
+  /// fault that stops the run.
+  ///
+  /// The tick's interval runs from its time to the next tick's: one stride
+  /// of a frame clock, one packet of a packets clock, every message
+  /// sharing one pts of a data clock, one period of a rate clock. A last
+  /// call's runs to the end of its inputs. Every input that is not the
+  /// clock hands what falls in it.
+  ///
+  /// The handle is the call's alone: it cannot be kept past the return,
+  /// and bytes a module means to keep are its own copy the moment `fetch`
+  /// hands them over.
+  resource tick {
+    /// The tick's time in `time-base`. An input clock: its first frame or
+    /// message this call, or the running maximum of dts over a packets
+    /// clock (pts where dts is unset), or, on a last call that hands none,
+    /// the time just past its last. A rate clock: the tick's number, from
+    /// 0. A self-clocked node: microseconds since its first call.
+    pts: func() -> s64;
+
+    /// The tick's number in the run, from 0, counted over every instance
+    /// of the node: on a frame clock the clock stream's frame number from
+    /// the run's first, strides counted as one; on a rate clock `pts`.
+    /// A node that numbers things by frame counts with it and stays pure.
+    ordinal: func() -> u64;
+
+    /// The clock input's time base, the inverse of a rate clock's rate, or
+    /// 1/1000000 for a self-clocked node.
+    time-base: func() -> rational;
+
+    /// Whether this is the instance's final call. It carries whatever the
+    /// inputs have left, which may be nothing, and happens exactly once.
+    /// There is no separate flush.
+    last: func() -> bool;
+
+    /// The streams bound to input `port`, in `init`'s order: the same every
+    /// tick, empty for an optional port with nothing bound. A name the
+    /// shape does not declare is a fault.
+    streams: func(port: string) -> list<u32>;
+
+    /// The stream as the host knows it this tick, its time base included.
+    /// A hold input's tags and time base are its current source's, from
+    /// each feed's start on.
+    info: func(id: u32) -> stream-info;
+
+    /// A hold input's feed as it stands this tick: the same record on
+    /// every tick the source shows on, so a worker that missed the start
+    /// still sees it; none while nothing shows, and on every other input.
+    /// A feed that ends and another that starts within one tick are two
+    /// ticks.
+    feed: func(id: u32) -> option<feed>;
+
+    /// A hold input's feeds that ended since this instance's previous
+    /// call (every one before, on its first call), oldest first, each
+    /// with `ends` set to the last tick it showed on: an end `feed` never
+    /// foretold, a timeout, a clock jump, a close with nothing queued,
+    /// as well as the foretold ones. With `feed-start.known`, what a
+    /// presence row needs on any worker. Empty on every other input.
+    ended-feeds: func(id: u32) -> list<feed>;
+
+    /// Frame kinds: the frames this tick hands, oldest first. The clock and
+    /// a lockstep input hand their window. A hold input hands the frame it
+    /// shows, or none before its feed's first frame and once its feed has
+    /// ended. Audio hands one frame, the tick's samples re-cut from
+    /// whatever packets arrived; a hold audio input hands none while its
+    /// source is behind, and the node fills the silence. Empty on message
+    /// kinds.
+    frames: func(id: u32) -> list<frame>;
+
+    /// Item `index`'s bytes, copied on demand: the only copy of a frame
+    /// kind's payload. Video: one frame's pixels in the stream's format,
+    /// tightly packed. Audio: interleaved samples in its sample format.
+    fetch: func(id: u32, index: u32) -> list<u8>;
+
+    /// Data inputs: the messages this tick hands under the input's pairing,
+    /// in pts order, each delivered once. Empty on other kinds.
+    messages: func(id: u32) -> list<message>;
+
+    /// Packets inputs: the packets this tick hands, in decode order, each
+    /// delivered once. Empty on other kinds.
+    packets: func(id: u32) -> list<packet>;
+
+    /// For an input whose `rows` is `state`: the rows of every tick this
+    /// instance did not process since its previous call, oldest first,
+    /// each beside the pts it arrived at, all earlier than this call's. An
+    /// instance's first call is handed every one before it. A data input's
+    /// rows are its messages. Empty on every other input.
+    earlier-rows: func(id: u32) -> list<timed-rows>;
+  }
+}
+
+/// A node: typed inputs, typed outputs and a clock, its shape from its
+/// params.
+interface node {
+  use types.{meta, packet, raw-frame};
+  use node-types.{binding, bound-stream, message, node-shape};
+  use node-tick.{tick};
+
+  /// An input frame's bytes leaving on an output, never copied into the
+  /// module: frame `index` of stream `id`'s `frames` this tick. Its format
+  /// must be the port's (size and pixel format, or sample format, rate and
+  /// channels); the host ends the run otherwise. Audio may leave this way
+  /// only from an input whose stride is its window, since overlapping
+  /// windows would emit samples twice.
+  record same-frame {
+    pts: s64,
+    duration: option<s64>,
+    id: u32,
+    index: u32,
+  }
+
+  /// One thing leaving. Its pts and duration are in its port's time base,
+  /// and the module's to choose.
+  variant payload {
+    /// New bytes in the port's format: one frame's pixels, tightly packed,
+    /// or a run of interleaved samples.
+    frame(raw-frame),
+    same(same-frame),
+    /// For codec "json", one UTF-8 JSON object. Empty: a progress mark,
+    /// never delivered; the port's progress stands at its pts.
+    message(message),
+    packet(packet),
+  }
+
+  record emission {
+    /// An output's name in the node's shape.
+    port: string,
+    payload: payload,
+  }
+
+  /// What one tick produced.
+  record emitted {
+    /// Per port, frames and messages never go back in pts, within a call
+    /// or across calls, and packets keep decode order with dts never
+    /// decreasing. Ports interleave freely.
+    items: list<emission>,
+    /// Rows for the run's rows output, as a sink's are.
+    rows: list<string>,
+    /// Nothing more will leave: the host makes the last call and then ends
+    /// every output. A node on an input clock ends with that input and need
+    /// not set it.
+    finished: bool,
+  }
+
+  /// Takes no params, so the compiler validates params before it asks for
+  /// a shape. A node leaves the format lists empty, since its ports say
+  /// what they accept in `shape`; `rows-schema` describes `emitted.rows`,
+  /// each data port carries its own `schema`, and `rows-language` tags
+  /// every "json" output.
   describe: func() -> meta;
 
-  /// Reads the catalog at compile time: the source connects or opens its
-  /// file and reports every track it would publish, without producing
-  /// packets.
-  probe: func(params: string) -> result<catalog, string>;
-
-  /// Opens the source for a run, subscribing to `tracks` alone: indices into
-  /// the catalog `probe` read, distinct, in the order the run wants them.
-  /// The catalog returned is that restriction - one track per index, in that
-  /// order - and it is the order every later call speaks in. An index the
-  /// source does not publish is refused by name.
-  open: func(params: string, tracks: list<u32>) -> result<catalog, string>;
-
-  /// One pull: a packet list per track `open` was given, in that order, or
-  /// none once the source has nothing left.
+  /// The ports and clock for these params, and for `bound`: the inputs
+  /// the call binds, by the declaration's names, each with what the
+  /// compiler knows of its streams, so a shape may turn on what is given
+  /// (a page with no picture ticks at a rate; an output `like` an unbound
+  /// input is left out) and on the clock's rate. Called at compile time
+  /// with the call's static params, once per distinct (module, params,
+  /// bound), and
+  /// cached; a source may read the network here to learn its outputs, as
+  /// `probe` did. Callable at any point in an instance's life: it reads
+  /// nothing `init` or `set-params` set.
   ///
-  /// On a data track a packet holding nothing but whitespace is no message
-  /// but a HEARTBEAT: the source's word that no message before its pts is
-  /// still to come on that track. The host carries it to the track's
-  /// readers, and no module downstream is ever handed one. The host says
-  /// nothing of its own about how far a data track has got past its start,
-  /// since tracks run independently, so a source that knows hands these,
-  /// and one that cannot know hands none.
-  next: func() -> result<option<list<pad-packets>>, string>;
+  /// The host refuses a shape in which `clock` names no input, or one that
+  /// is optional, `many` or not lockstep; an input is lockstep with no
+  /// input clock, or paired other than `arrival` on a self-clocked node;
+  /// `hold` is on a message kind or `interval` on a frame kind; a data
+  /// input's `rows` is `ignore`; `like` names an input that is not single
+  /// and bound; a stride is 0 or above its window; `wants` is `timing`
+  /// on other than a frame kind; or an `interval` names a group that is
+  /// no hold group's, or a group with an anchor other than shared-clock.
+  shape: func(params: string, bound: list<binding>) -> result<node-shape, string>;
+
+  /// Opens an instance for `shape(params, bound)` on the streams bound to
+  /// its inputs, one entry each: ports in the shape's order, a port's
+  /// streams in the order the query named them, none for an optional port
+  /// with nothing bound. Each `id` is distinct and names its stream, in
+  /// every tick call and in `same`, for the instance's life. `latched`
+  /// names the outputs the query latched onto; the node may leave the rest
+  /// unmade.
+  init: func(bound: list<bound-stream>, latched: list<string>, params: string) -> result<_, string>;
+
+  /// Replaces the params between ticks. Params whose shape differs from
+  /// the instance's are refused by the host and never reach this call, so
+  /// a pairing's fields and a port's latency never change under an
+  /// instance; an Err leaves the previous params in force.
+  set-params: func(params: string) -> result<_, string>;
+
+  /// One tick. An Err ends the run with its message, as a panic does; a
+  /// tick with nothing to emit returns Ok with nothing. A self-clocked
+  /// node's call may wait until it has something, and is called again as
+  /// soon as it returns.
+  ///
+  /// Unless the node is self-clocked, returning promises that no output
+  /// still has anything to send stamped earlier than the end of the tick's
+  /// interval less the port's `latency`. The host sends that time down
+  /// each data edge as the node's progress, and never less than the last
+  /// message's pts; a message that breaks the promise reaches its
+  /// consumers late, and is reported.
+  process: func(tick: borrow<tick>) -> result<emitted, string>;
 }
+
 
 interface values {
   /// Static description of one value function, available without calling it.
@@ -779,114 +793,6 @@ interface values {
   /// `args` is one JSON object keyed by parameter name. The ok string is one
   /// JSON value; the err string is the module's own message.
   invoke: func(name: string, args: string) -> result<string, string>;
-}
-
-/// Rows in, rows out, with no stream at all: every other module either reads
-/// or writes frames or packets and carries rows beside them, but a module
-/// exporting this interface has nothing beside - JSON objects are its whole
-/// input and its whole output.
-interface rows-module {
-  use types.{meta};
-
-  /// `meta`, plus the schema of the row this module reads. `meta`'s own
-  /// `rows-schema` already means "what this module emits" for every other
-  /// interface, so the schema it consumes belongs beside `meta` rather than
-  /// inside it - the way `packet-sink-meta` adds sink-only fields beside the
-  /// shared record instead of widening it for every module.
-  record rows-module-meta {
-    meta: meta,
-    /// JSON Schema for one row object `process` reads. Empty when the module
-    /// reads no shape in particular.
-    input-rows-schema: string,
-  }
-
-  describe: func() -> rows-module-meta;
-
-  init: func(params: string) -> result<_, string>;
-
-  /// JSON rows in, JSON rows out, in one call: no stream carries them, so
-  /// nothing else drives this module. A call may answer zero rows for an
-  /// input row, or several - a filter that drops some, or a module that
-  /// splits one row into several.
-  process: func(rows: list<string>) -> result<list<string>, string>;
-
-  /// Whatever the module held back across every `process` call. Called once,
-  /// after the last `process`.
-  finish: func() -> result<list<string>, string>;
-}
-
-/// Messages in, messages out: a data stream is a sequence of messages, each
-/// one JSON object timed by its pts, and a module exporting this interface
-/// reads data streams and writes them. It is not one-to-one: a call may
-/// answer any number of messages, or none, and may hold some back for a
-/// later call.
-///
-/// It may also read CLOCK pads: a video or audio argument whose frames the
-/// module never sees, only their time. That is how a module with no data
-/// input still acts at programme times - the host hands it `now` on every
-/// call - and how one reading messages knows what time it is between them.
-interface data-filter {
-  use types.{meta, rational};
-
-  /// One message: for codec "json", one UTF-8 JSON object.
-  record message {
-    pts: s64,
-    data: list<u8>,
-  }
-
-  /// What one argument of the call is.
-  enum pad-kind {
-    /// A data stream: its messages arrive in `process`.
-    data,
-    /// A video or audio stream read for its clock alone.
-    clock,
-  }
-
-  record pad-info {
-    kind: pad-kind,
-    /// For a data pad, its codec: "json". Empty for a clock pad.
-    codec: string,
-    /// The unit a data pad's pts, or a clock pad's `now`, is counted in.
-    time-base: rational,
-  }
-
-  record data-filter-meta {
-    meta: meta,
-    /// The codec of each data stream the module writes, in output order:
-    /// ["json"] for one.
-    outputs: list<string>,
-    /// The unit the outputs' pts are counted in.
-    time-base: rational,
-  }
-
-  /// The messages that arrived on one data pad since the last call, in pts
-  /// order. A clock pad has none.
-  record pad-messages {
-    pad: u32,
-    messages: list<message>,
-  }
-
-  record processed {
-    /// The messages written, one list per output in output order, each in
-    /// pts order. Across calls an output's pts never decrease.
-    outputs: list<list<message>>,
-    /// Rows for the run's rows output, as a sink's are.
-    rows: list<string>,
-  }
-
-  describe: func() -> data-filter-meta;
-
-  /// Called once, with every argument of the call in order.
-  init: func(pads: list<pad-info>, params: string) -> result<_, string>;
-
-  /// One batch: every message that arrived since the last call, across the
-  /// data pads, and `now`, the programme time in ticks of the first clock
-  /// pad's time base - none when the call has no clock pad. A module with
-  /// a clock pad is called as its clock advances, whether or not a message
-  /// arrived; one without is called when messages arrive. `last` marks the
-  /// final call, which happens once and carries whatever is left.
-  process: func(input: list<pad-messages>, now: option<s64>,
-                last: bool) -> result<processed, string>;
 }
 
 /// A codec a package implements, where ffmpeg's own encoder would stand:
@@ -981,15 +887,17 @@ interface decoder {
   decode: func(packets: list<packet>, last: bool) -> result<list<raw-frame>, string>;
 }
 
-world video-module  { export filter; }
-world meta-module   { export filter; export meta-filter; }
-world window-module { import window-source; export window-filter; }
-world packet-sink-module { export packet-sink; }
-world packet-filter-module { export packet-filter; }
-world packet-source-module { export packet-source; }
+/// A node module. A module that also imports `wasi:nn`, `wasi:webgpu`,
+/// `wasi:http` or `wasi:sockets` includes this world in its own.
+///
+/// `values`, `encoder`, `decoder` and their worlds stay as they are at
+/// 0.18.0. Any of them may ride beside `node` in one component, whose
+/// world includes this one and theirs.
+world node-module {
+  import node-tick;
+  export node;
+}
 world values-module { export values; }
-world rows-module-host { export rows-module; }
-world data-filter-module { export data-filter; }
 world encoder-module { export encoder; }
 world decoder-module { export decoder; }
 world codec-module { export encoder; export decoder; }

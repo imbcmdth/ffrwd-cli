@@ -425,7 +425,8 @@ class OutputGroup:
     each takes an output stream index after every map of this group.
     `wire` is the stream format set when this group writes a pipe edge rather
     than a file; its codec and pixel format ride `options`, and what an audio
-    edge is conformed to is rendered off it.
+    edge is conformed to is rendered off it. `wires` is every stream's, in
+    map order, where the edge is one NUT carrying several.
     """
 
     maps: list[OutputMap]
@@ -437,6 +438,7 @@ class OutputGroup:
     metadata: int | None = None
     attachments: list[Attachment] = field(default_factory=list)
     wire: StreamFormat | None = None
+    wires: tuple[StreamFormat, ...] = ()
 
 
 @dataclass
@@ -506,7 +508,7 @@ def emit(g: Graph, *, network: bool = False, separate: bool | None = None) -> Em
     g = dedup_inputs(g)
     g = _drop_unused_url_inputs(g)
     g = _drop_dropped_branch_inputs(g)
-    _verify_topological(g)
+    _verify_topological(g, network)
 
     nodes = list(g.nodes.values())
     pads = {node.id: _out_pad_count(node) for node in nodes}
@@ -924,7 +926,7 @@ def build_process_args(
     g: Graph,
     *,
     pipe_inputs: Sequence[tuple[str, str]] = (),
-    pipe_outputs: Sequence[tuple[str, StreamFormat]] = (),
+    pipe_outputs: Sequence[tuple[str, StreamFormat | Sequence[StreamFormat]]] = (),
     pipe_buffers: Sequence[EdgeBuffer | None] = (),
     pipe_live: Sequence[bool] = (),
     live: bool = False,
@@ -1006,15 +1008,27 @@ def build_process_args(
             f"process writes {len(pipes)} pipes but {len(pipe_outputs)} were wired"
         )
     groups = list(e.groups)
-    for slot, (index, (spelling, wire)) in enumerate(zip(pipes, pipe_outputs)):
+    for slot, (index, (spelling, carried)) in enumerate(zip(pipes, pipe_outputs)):
         group = groups[index]
         buffer = pipe_buffers[slot] if slot < len(pipe_buffers) else None
         live = pipe_live[slot] if slot < len(pipe_live) else False
+        wires: tuple[StreamFormat, ...] = (
+            (carried,)
+            if isinstance(carried, VideoFormat | AudioFormat | DataFormat)
+            else tuple(carried)
+        )
+        written = _bundle_options(wires, buffer, live=live)
+        # The container comes after every stream's codec, as one wire's does.
+        for key in (FIFO_FORMAT, QUEUE_SIZE, _FORMAT):
+            if key in written:
+                written[key] = written.pop(key)
+        wire = next((one for one in wires if isinstance(one, AudioFormat)), wires[0])
         groups[index] = replace(
             group,
             path=spelling,
             wire=wire,
-            options={**_wire_options(wire, buffer, live=live), **group.options},
+            wires=wires if len(wires) > 1 else (),
+            options={**written, **group.options},
         )
     return build_ffmpeg_args(replace(e, groups=groups))
 
@@ -1048,6 +1062,48 @@ def build_network_graph(
     return e.filter_complex, [m.target for group in e.groups for m in group.maps]
 
 
+def build_node_network(
+    g: Graph, *, pipe_inputs: Sequence[str] = ()
+) -> tuple[str, list[list[str]]]:
+    """:func:`build_network_graph` for a region holding node modules.
+
+    Its sinks are NUTs of several streams each, so the ``-map`` targets come
+    back grouped one list per sink, in sink order.
+    """
+    slots = [index for index, path in enumerate(g.input_paths) if path == PIPE]
+    if len(slots) != len(pipe_inputs):
+        raise _internal(
+            f"network reads {len(slots)} pipes but {len(pipe_inputs)} were wired"
+        )
+    paths = list(g.input_paths)
+    for slot, spelling in zip(slots, pipe_inputs):
+        paths[slot] = spelling
+    e = emit(replace(g, input_paths=paths), network=True)
+    return e.filter_complex, [[m.target for m in group.maps] for group in e.groups]
+
+
+def _bundle_options(
+    wires: Sequence[StreamFormat], buffer: EdgeBuffer | None, *, live: bool
+) -> dict[str, object]:
+    """The sink options writing every stream one edge carries.
+
+    Streams of one kind share an option where they agree on it; where they
+    differ it is given per track, in map order, as a WITH list is.
+    """
+    written: dict[str, object] = {}
+    kinds: dict[type, list[dict[str, object]]] = {}
+    for one in wires:
+        options = _wire_options(one, buffer, live=live)
+        written.update(options)
+        kinds.setdefault(type(one), []).append(options)
+    for tracks in kinds.values():
+        for key in dict.fromkeys(key for options in tracks for key in options):
+            values = [options.get(key) for options in tracks]
+            if any(value != values[0] for value in values):
+                written[key] = values
+    return written
+
+
 def _render_conformance(group: OutputGroup) -> list[str]:
     """``-ar:<i>``/``-ac:<i>`` for each audio stream a wire edge constrains.
 
@@ -1055,13 +1111,16 @@ def _render_conformance(group: OutputGroup) -> list[str]:
     and ahead of the codec that follows it. A module naming neither a rate nor
     a channel count renders nothing and the stream is left alone.
     """
-    wire = group.wire
-    if not isinstance(wire, AudioFormat):
+    if not isinstance(group.wire, AudioFormat):
         return []
+    audio = [one for one in group.wires if isinstance(one, AudioFormat)] or [group.wire]
     args: list[str] = []
+    taken = 0
     for index, mapping in enumerate(group.maps):
         if mapping.type != "audio":
             continue
+        wire = audio[min(taken, len(audio) - 1)]
+        taken += 1
         if wire.required_rate is not None:
             args += [f"{SAMPLE_RATE_FLAG}:{index}", str(wire.required_rate)]
         if wire.required_channels is not None:
@@ -1461,8 +1520,9 @@ def _src_spec(g: Graph, ref: FrameRef) -> str:
     return f"{g.sources[alias]}:{_TYPE_MARKERS[stream_type]}:{index}"
 
 
-def _verify_topological(g: Graph) -> None:
-    """Check every ref resolves and points backwards; a cycle cannot pass."""
+def _verify_topological(g: Graph, network: bool = False) -> None:
+    """Check every ref resolves and points backwards; a cycle cannot pass.
+    A network may have no output: a node sink's is its own effect."""
     defined: set[str] = set()
     for node_id, node in g.nodes.items():
         if node.id != node_id:
@@ -1470,7 +1530,7 @@ def _verify_topological(g: Graph) -> None:
         for ref in node.inputs:
             _check_ref(g, ref, defined, f"node {node.id!r}")
         defined.add(node_id)
-    if not g.outputs:
+    if not g.outputs and not network:
         raise _internal("graph has no outputs")
     for index, output in enumerate(g.outputs):
         if not output.ref:
@@ -1750,10 +1810,32 @@ def _render_chain(
     network: bool = False,
 ) -> str:
     head, tail = chain[0], chain[-1]
+    if network and (head.ports or head.out_ports):
+        return _render_node(head, g, labels, measure)
     prefix = "".join(f"[{_input_label(g, ref, labels, network)}]" for ref in head.inputs)
     body = ",".join(_render_filter(node, measure) for node in chain)
     suffix = "".join(f"[{labels[f'{tail.id}:{pad}']}]" for pad in range(pads[tail.id]))
     return f"{prefix}{body}{suffix}"
+
+
+def _render_node(node: Node, g: Graph, labels: dict[str, str], measure: bool) -> str:
+    """A node module's chain: each pad names the port it binds.
+
+    An output nothing in the network or its maps reads is left off, which
+    is how the node is told the query does not latch it.
+    """
+    read = {_slot(ref) for other in g.nodes.values() for ref in other.inputs}
+    read |= {_slot(output.ref) for output in g.outputs if not is_src(output.ref)}
+    prefix = "".join(
+        f"[{port}={_input_label(g, ref, labels, True)}]"
+        for port, ref in zip(node.ports, node.inputs)
+    )
+    suffix = "".join(
+        f"[{port}={labels[f'{node.id}:{pad}']}]"
+        for pad, port in enumerate(node.out_ports)
+        if f"{node.id}:{pad}" in read
+    )
+    return f"{prefix}{_render_filter(node, measure)}{suffix}"
 
 
 def _input_label(
@@ -1761,9 +1843,12 @@ def _input_label(
 ) -> str:
     if is_src(ref):
         spec = _src_spec(g, ref)
-        # A network input carries one stream, so its per-type index says
-        # nothing and the subset grammar leaves it off.
-        return spec.rpartition(":")[0] if network else spec
+        # A network input's first stream of a kind is that kind alone; the
+        # subset grammar spells an index past it, which only a NUT carrying
+        # several streams of one kind has.
+        if network and spec.endswith(":0"):
+            return spec.rpartition(":")[0]
+        return spec
     slot = _slot(ref)
     label = labels.get(slot)
     if label is None:

@@ -17,13 +17,14 @@ import json
 import os
 import shutil
 import subprocess
+from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
 from typing import cast
 
 import pytest
 
-from ffrwd import binaries
+from ffrwd import binaries, shapes
 from ffrwd.compiler import compile_sql, compile_table_sql
 from ffrwd.emit import build_ffmpeg_args, emit
 from ffrwd.errors import ErrorCode, FfrwdError
@@ -41,6 +42,7 @@ from ffrwd.wasm import (
     DescribedFunction,
     PacketRead,
     SinkWants,
+    _node_reader_argv,
     copy_argv,
     read_packet_rows,
 )
@@ -636,6 +638,101 @@ def test_a_module_that_is_not_a_packet_sink_is_refused_by_name() -> None:
     )
     assert error.code is ErrorCode.UNSUPPORTED_SQL
     assert "is not a packet sink" in error.message
+
+
+_BOUND_15 = '[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]}]'
+
+
+def _node_described() -> Described:
+    """A node reading the packets: what its describe says, rows_schema and all."""
+    return Described(world="node-module", name="keys", rows_schema=_ROWS_SCHEMA, node=True)
+
+
+def _node_shape(*, kind: str = "packets", outputs: int = 0) -> shapes.Shape:
+    def asked(
+        module: str, params: str, bound: Sequence[shapes.Binding], grants: Sequence[str] = ()
+    ) -> shapes.NodeShape:
+        port = {
+            "name": "v",
+            "kind": kind,
+            "required": True,
+            "many": False,
+            "pairing": {"kind": "lockstep"},
+            "rows": "ignore",
+            "window": 1,
+            "stride": 1,
+            "accepts": {"codecs": ["h264"], "wants": "keyframes"},
+        }
+        made = [{"name": "v", "kind": "video", "latency": 0}] * outputs
+        return shapes.node_shape(
+            module,
+            {
+                "inputs": [port],
+                "outputs": made,
+                "clock": {"kind": "input", "port": "v"},
+                "pure": True,
+                "one_to_one": False,
+                "bounded": True,
+                "relation": [],
+            },
+        )
+
+    return asked
+
+
+def _node_rows(sql: str, reads: _Reads, shape: shapes.Shape) -> list[list[object]]:
+    sinks = lower_table(
+        resolve(parse(_DECLARE + sql)),
+        {"f": _probe()},
+        registry=load_reference(_SNAPSHOT_PATH),
+        describes={_MODULE: _node_described()},
+        read_packets=reads,
+        shapes=shape,
+    )
+    return sinks[0].result.rows
+
+
+def test_a_node_reading_the_packets_is_read_in_from_as_a_packet_sink_is() -> None:
+    """Its rows are the ones it emits beside its ports, and how much of the
+    stream it is handed is what its port asks for."""
+    reads = _Reads()
+    assert _node_rows(
+        "SELECT v.index FROM input('f.mp4') f, keys(f.video[1]) v", reads, _node_shape()
+    ) == [[1], [2], [3]]
+    (read,) = reads.reads
+    assert (read.port, read.wants, read.bound) == ("v", "keyframes", _BOUND_15)
+
+
+@pytest.mark.parametrize(
+    ("shape", "said"),
+    [
+        (_node_shape(kind="video"), "reads video on 'v'"),
+        (_node_shape(outputs=1), "makes outputs of its own"),
+    ],
+    ids=["frames", "outputs"],
+)
+def test_a_node_that_does_not_only_read_packets_is_refused_in_from(
+    shape: shapes.Shape, said: str
+) -> None:
+    with pytest.raises(FfrwdError) as caught:
+        _node_rows("SELECT v.index FROM input('f.mp4') f, keys(f.video[1]) v", _Reads(), shape)
+    assert caught.value.message == (
+        f"function 'keys' returns rows read off a stream's packets, and the module "
+        f"'{_MODULE}' {said}"
+    )
+
+
+def test_a_node_read_binds_its_port_and_maps_the_rows_it_emits(tmp_path: Path) -> None:
+    read = PacketRead(
+        spec="f.mp4", input_args=(), kind="video", index=0, module=_MODULE, params="",
+        wants="keyframes", port="v", bound=_BOUND_15,
+    )
+    assert _node_reader_argv("ffrwd-wasm", read, None, tmp_path) == [
+        "ffrwd-wasm", "-f", "nut", "-i", "pipe:0", "-m", f"read={_MODULE}",
+        "-filter_complex", "[v=0:v]read[@rows=out0]",
+        "-bound", "read=" + _BOUND_15,
+        "-map", "[out0]", "-f", "ndjson", "pipe:1",
+    ]
 
 
 def test_a_declared_column_the_module_never_writes_is_refused() -> None:

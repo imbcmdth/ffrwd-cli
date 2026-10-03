@@ -122,7 +122,7 @@ impl ColorFlags {
 
 /// One colorimetry flag's value: an ffmpeg name, lowercase letters, digits,
 /// `-` and `_`. The range is "tv" or "pc", the two ffprobe reports.
-fn parse_color_name(flag: &str, raw: &str) -> Result<&'static str> {
+pub(crate) fn parse_color_name(flag: &str, raw: &str) -> Result<&'static str> {
     let name = raw.trim();
     let spelled = !name.is_empty()
         && name

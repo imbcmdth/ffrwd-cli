@@ -100,6 +100,9 @@ def insert_pts_resets(g: Graph) -> Graph:
             # Rows carry no timestamps a reset could touch; the edge rides
             # through naming the same producer.
             rows_inputs=list(node.rows_inputs),
+            ports=list(node.ports),
+            out_ports=list(node.out_ports),
+            bound=node.bound,
         )
 
     # A trim/atrim mapped straight to an output file, with no filter in

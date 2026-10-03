@@ -44,6 +44,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 
 from . import registry as registry_module
+from . import shapes as shapes_module
 from . import wasm
 from .emit import Emitted, emit
 from .errors import ErrorCode, FfrwdError
@@ -64,14 +65,17 @@ from .processes import (
     check_spellable,
     external_filters,
     from_commands,
+    is_live,
+    is_live_probe,
     partition,
 )
 from .project import ModelPin, PackageSet
 from .pts import insert_pts_resets
 from .split import insert_splits
 from .table import TableSink
+from .timing import HOLD_LIMIT, Timing, check_live_leads, timing
 from .vars import substitute
-from .warnings import OnWarning
+from .warnings import FfrwdWarning, OnWarning, WarningCode
 from .wasm import Described
 
 __all__ = [
@@ -354,6 +358,8 @@ def _negotiable(
         if declared.module not in describes or declared.reads_rows_from_select:
             continue  # a row-reading sink has no single kind; its pads are the rows'
         described = describes[declared.module]
+        if described.node:
+            continue  # its formats are its shape's, per call and per edge
         if _declared_kind(declared, described) != kind:
             continue
         if described.packet_sink or described.packet_filter:
@@ -477,7 +483,7 @@ def _module_shapes(
     return {
         declared.module: describes[declared.module].shape
         for declared in declared_stream.values()
-        if declared.module in describes
+        if declared.module in describes and not describes[declared.module].node
     }
 
 
@@ -526,6 +532,9 @@ class Compiled:
     plan: ProcessPlan | None = None
     default_timeout: float | None = None
     duration: float | None = None
+    # How late each node module's outputs run behind the source, for a query
+    # that calls one (:mod:`ffrwd.timing`).
+    timing: Timing | None = None
 
 
 def _input_duration(probes: Mapping[str, ProbeResult | None]) -> float | None:
@@ -655,6 +664,7 @@ def compile_all(
     unset: Mapping[tuple[int, int], str] | None = None,
     describe: wasm.Describe = wasm.describe,
     invoke: wasm.Invoke = wasm.invoke,
+    shape: shapes_module.Shape = shapes_module.shape,
 ) -> Compiled:
     """Compile SQL `text` into its commands, and the plan that runs them.
 
@@ -668,7 +678,8 @@ def compile_all(
     lowering's `describes` is: a caller with no sidecar can still compile.
     `invoke` is the same for a VALUE-returning module: lowering runs it once
     per call site to fold the result, and a test hands over its own so
-    folding spawns nothing.
+    folding spawns nothing. `shape` is the same for a node module's shape,
+    asked once per distinct call.
 
     Raises ``FfrwdError`` — and nothing else — on every rejection.
     """
@@ -685,6 +696,7 @@ def compile_all(
             describes=describes,
             invoke=invoke,
             probe_failures=probe_failures,
+            shapes=shapes_module.ShapeCache(shape),
         )
         ready = [insert_splits(insert_pts_resets(graph)) for graph in graphs]
         ready[0] = replace(
@@ -694,22 +706,32 @@ def compile_all(
                 for lateral in ready[0].laterals
             ],
         )
+        timed = timing(ready[0], probes, {m: a[2] for m, a in _module_anchors(res).items()})
+        if timed is not None:
+            if _runs_live(res, probes, ready[0]):
+                check_live_leads(ready[0], probes, _module_anchors(res))
+            _warn_held(timed, on_warning)
         budget = _default_timeout(_input_duration(probes))
         span = _run_duration(ready, _probed_paths(res, probes))
         stream_wasm = _stream_wasm(res)
         hosted = _hosted_wasm(res)
+        sourced = {ready[0].nodes[name].filter for name in ready[0].node_sources.values()}
         leaky = any(node.filter == LEAKY for node in ready[0].nodes.values())
-        if not hosted and not ready[0].module_sources and not leaky:
-            return Compiled(graphs=ready, default_timeout=budget, duration=span)
+        if not hosted and not ready[0].module_sources and not leaky and not sourced:
+            return Compiled(
+                graphs=ready, default_timeout=budget, duration=span, timing=timed
+            )
         try:
             plan = partition(
                 ready[0],
-                external=external_filters(*sorted({d.module for d in hosted.values()})),
+                external=external_filters(
+                    *sorted({d.module for d in hosted.values()} | sourced)
+                ),
                 probes=probes,
                 pix_fmts=_wire_formats(stream_wasm, describes),
                 shapes=_module_shapes(stream_wasm, describes),
                 audio_wires=_audio_wires(stream_wasm, describes),
-                models=_nn_models(hosted, describes, packages),
+                models=_nn_models(hosted | _source_wasm(res), describes, packages),
                 effects=_effect_grants(stream_wasm | _source_wasm(res), describes),
                 anchors=res.input_anchors,
             )
@@ -717,7 +739,7 @@ def compile_all(
         except FfrwdError as err:
             raise _anchored(err, stream_wasm) from err
         return Compiled(
-            graphs=ready, plan=plan, default_timeout=budget, duration=span
+            graphs=ready, plan=plan, default_timeout=budget, duration=span, timing=timed
         )
     except FfrwdError:
         raise
@@ -737,6 +759,48 @@ def compile_all(
             col=1,
             hint="please report this query as a bug",
         ) from err
+
+
+def _runs_live(
+    res: Resolved, probes: Mapping[str, ProbeResult | None], graph: Graph
+) -> bool:
+    """Whether the query reads anything that does not end: a live input, or a
+    node read in FROM that never finishes by itself."""
+    for alias, index in res.sources.items():
+        options = graph.input_options.get(alias)
+        if is_live(res.input_paths[index], options) or is_live_probe(probes.get(alias)):
+            return True
+    return any(
+        graph.node_shapes.get(name, {}).get("bounded") is False
+        for name in graph.node_sources.values()
+    )
+
+
+def _module_anchors(res: Resolved) -> dict[str, tuple[int, int, str]]:
+    """Each module path -> where the query declared it, and what it is called."""
+    found: dict[str, tuple[int, int, str]] = {}
+    for declared in res.wasm.values():
+        found.setdefault(declared.module, (declared.line, declared.col, declared.called))
+    return found
+
+
+def _warn_held(timed: Timing, on_warning: OnWarning | None) -> None:
+    """Say so where a stream written beside a later one holds a lot of it."""
+    if on_warning is None:
+        return
+    for output in timed.outputs:
+        if output.held is None or output.held <= HOLD_LIMIT:
+            continue
+        on_warning(
+            FfrwdWarning(
+                WarningCode.HELD_STREAM,
+                "",
+                f"'{output.ref}' waits {round(output.holds, 3):g} s for the stream "
+                f"written beside it, about {output.held // (1024 * 1024)} MiB of it",
+                hint="the stream waits in its pipe until the later one catches up; "
+                "a shorter window or latency on the later path holds less",
+            )
+        )
 
 
 # What a run-time lateral's body is resolved with at compile time, a value of

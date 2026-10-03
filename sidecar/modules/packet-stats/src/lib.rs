@@ -5,7 +5,7 @@
 //! backwards, which is what a reordering stream does.
 
 wit_bindgen::generate!({
-    path: "../../wit",
+    path: "../../worlds/0.18.0",
     world: "packet-sink-module",
 });
 

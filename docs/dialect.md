@@ -33,12 +33,19 @@ function := CREATE FUNCTION name(param ptype [DEFAULT literal], ...) RETURNS rty
             AS 'module', 'export' LANGUAGE wasm
           | CREATE FUNCTION name(rows annotation) RETURNS annotation
             AS 'module', 'export' LANGUAGE wasm
+          | CREATE FUNCTION name(port ntype [DEFAULT NULL] | param vtype
+                                 [DEFAULT literal], ...)
+            RETURNS nrtype AS 'module', 'export' LANGUAGE wasm
 ptype   := text | number | boolean | vector | <kind>_stream | chapter | cue
          | attachment | any of those with [] | STRUCT(field vtype, ...)[]
 rtype   := text | number | boolean | vector | <kind>_stream | chapter | cue
          | attachment | any of those with [] | TABLE(col type, ...)
+         | STRUCT(name wstype, name annotation)
 wstype  := video_stream | audio_stream | either of those with []
 wrtype  := wstype | sink | packets | STRUCT(name wstype, name annotation)
+ntype   := wstype | data_stream | annotation | any of those with []
+nrtype  := wstype | data_stream | annotation | source
+         | STRUCT(name wstype | data_stream | annotation, ...)
 annotation := STRUCT(field vtype, ...)[] | cue[]
 vtype   := text | number | boolean | vector
 select  := [WITH cte (, cte)*] SELECT columns FROM from [WHERE pred]
@@ -161,14 +168,22 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   expanded at compile time: its body is compiled and run once per
   message, while the query runs. It is declared `play(launch data_stream,
   url text, start_pts number, ..., channels number DEFAULT 2) RETURNS
-  TABLE(video video_stream, audio audio_stream)`, either column or both;
-  every parameter after the data stream is a text, number or boolean
-  value, and the body does not read the data stream.
+  TABLE(video video_stream, audio audio_stream)`, either column or both,
+  and a `data_stream` column beside them for the rows a node's data input
+  reads on the same connection; every parameter after the data stream is
+  a text, number or boolean value, and the body does not read the data
+  stream.
   - Its streams are empty between messages, so they go to a feeder and
     nowhere else: `ffrwd.switch.video(prog.v, ads.video)`. A filter, a
     module's pad or a `COPY` reading one is refused. Feeders of one group
     fed by its picture and its sound share one connection, which an
     instance writes as one NUT, picture then sound.
+  - A node's data input whose `interval` names a hold group the lateral
+    feeds (`interval.group`) takes the lateral's rows on that group's
+    connection, after its picture and sound in the same NUT, and binds no
+    pad: `panel(prog.v, ad.video, ad.audio, ad.cues)`. A stream of the
+    query's own handed to such an input while a port serves the group is
+    refused; its rows would never arrive.
   - Each value is bound by name, per message, in this order: an argument
     the call wrote, which is a constant the same for every message; the
     message's field of that name (a number for a number, a string for
@@ -205,10 +220,11 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
     the feeder connections its instances write, what binds each value,
     and the instance as SQL with each value bound per message a hole,
     `<url>`.
-- **`--jobs N`**, on `compile` and `run`, caps the sidecar's worker
-  threads at N. The sidecar runs a pool sized to the machine's cores by
-  default, and a module that describes itself as pure spreads across it
-  with no flag at all; one that carries state between calls, and one
+- **`--jobs N`**, on `compile` and `run`, sets the sidecar's worker
+  threads to N, never more than the machine's cores. The sidecar runs a
+  pool of 4 by default, and a module that describes itself as pure
+  spreads across it with no flag at all; one that carries state between
+  calls, and one
   reading encoded packets, run one call at a time whatever N is.
   `--jobs 1` hosts everything serially. The output is byte-identical at
   any N.
@@ -499,6 +515,126 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   `moq.subscribe`'s rows); read the stream as `<alias>.v[1]` there. A
   `RETURNS sink` reading several streams takes no annotation column.
   Recipe [144](examples.md#144-hand-one-modules-rows-to-a-module-reading-two-streams).
+- A **node `LANGUAGE wasm` function** names a module exporting
+  `ffrwd:av@0.19.1`'s `node`, which its describe says (`"world":
+  "node-module"`). What a node reads and writes is its SHAPE for each
+  call: `ffrwd-wasm --shape` with the call's params and the inputs it
+  binds, each with the rate of every stream bound there, asked once per
+  distinct module, params and bound list. Its parameters are ports and
+  values, in any order: a port is a
+  `video_stream`, an `audio_stream`, a `data_stream` or rows
+  (`STRUCT(...)[]`, `cue[]`), named as the module names its input; a
+  value is text, number, boolean or vector, as any module's. Arguments
+  fill the parameters by position and then by name, ports included:
+  `burn(f.video[1], words => hear(f.audio[1]))`. How each input pairs
+  with the node's clock is the module's to say, not the query's. Recipe
+  [148](examples.md#148-a-node-reads-the-picture-the-sound-and-the-words-at-once).
+  - `DEFAULT NULL` on any port makes it optional: a call that leaves it
+    off, or writes NULL, binds nothing there, and the shape is asked
+    without it. A column an outer join left NULL, handed straight to such
+    a port, binds nothing too; to any other port it is refused as it is
+    anywhere. A port the module requires is refused left off. A port
+    the declaration names and the shape for these params has none of is
+    fine unbound and refused bound, naming it. Recipe
+    [149](examples.md#149-leave-an-input-out).
+  - `[]` on a port takes every stream the argument holds, in order:
+    `tile(ARRAY[a.video[1], b.video[1]])`. A port without it given an
+    array is one call per element, as a filter's is. Recipe
+    [150](examples.md#150-tile-any-number-of-pictures).
+  - An input the module holds on a port of its own (`hold` with a
+    `port_param`) is given a stream, or a port number: written in its
+    place, or by the param's name, `inset(v, port => 9100)`. Given a
+    number it binds nothing, and whatever connects to that port is shown.
+  - `RETURNS` a stream; rows alone (`STRUCT(...)[]`, `cue[]`), a data
+    stream the query reads while it runs; `STRUCT(<name> <type>, ...)`,
+    one field per output the module makes, read off the call
+    (`matte(v).mask`) or every field at once with `.*` in a WITH body; or
+    `source`, a node that reads nothing, called in FROM. A field names
+    the module's output of that name, and a lone stream or rows the
+    module's one output of that kind. Recipes
+    [145](examples.md#145-a-detector-returns-its-rows-and-the-picture-stays-where-it-was),
+    [151](examples.md#151-a-node-makes-a-matte-and-the-rows-that-go-with-it).
+  - A call over a node making a stream and the rows beside it hands a
+    reader both, the stream into one port and the rows into the next:
+    `ring(matte(v))` is `ring(matte(v).mask, matte(v).spots)`.
+  - Rows match by field, compared as the JSON schemas of the two ports:
+    every field the reading port names is in the producer's, with a type
+    it takes (`integer` is a `number`), and fields beyond those pass. A
+    missing or mistyped field is refused naming both. Recipe
+    [146](examples.md#146-a-reader-names-only-the-fields-it-reads).
+  - One call is one node wherever the query writes it: the same module,
+    arguments and params are one instance, and each of its outputs goes
+    to every reader. Recipe
+    [147](examples.md#147-one-call-however-many-places-read-it).
+  - Rows a COPY selects are what a module's rows always are there: the
+    rows of a `.ndjson` destination, a WebVTT track anywhere else. A
+    gather, `ARRAY(SELECT r FROM unnest(<call>) r WHERE ...)`, narrows
+    them on their way, as it narrows a module's annotation column.
+  - A node read in FROM binds its outputs as an input binds its streams,
+    `s.video[1]` the first picture, and its relation rows as renditions,
+    so `WHERE s.height = 720` picks one. `WHERE s.t < 10` (or `<=`) ends
+    it: its reader takes that much and closes. One that never ends makes
+    the query live. Recipe
+    [154](examples.md#154-a-page-with-no-inputs-is-a-source).
+  - A node called over an input's stream in FROM, `records(f.video[1])
+    v`, whose shape reads coded packets on that port and makes no
+    output, is read while the query compiles, as a packet sink is: the
+    stream is copied to it as much as its port `wants`, and the rows it
+    emits are the alias's rows.
+  - A port reading coded packets is handed an input's own stream,
+    copied as it was coded, in a codec the module takes; an output
+    writing them is copied by whatever reads it.
+  - The bound list is one binding per input the call binds, ports held
+    on a port included (a lateral's feed, one stream per lateral), and a
+    hint per stream: its rate as far as the compile knows it before the
+    run, a picture's frame rate, a sound's sample rate (the one its port
+    conforms it to). An input's is its probe's; a node's picture runs at
+    its clock, a rate clock's own, the rate of the input a `rate-of`
+    clock names, or its clock input's over its stride. A feed by port, a
+    self-clocked node's output and data have none. Each call carries the
+    list it was asked with (`-bound <name>=<json>`), which the host asks
+    the shape with again, so the shape a node runs with is the one the
+    query compiled against. A node at a COPY's TO is asked once for its
+    ports and again with the streams the SELECT binds there.
+  - An input the module reads for its timing alone (`wants` `timing`)
+    is handed the stream in the format it already has: nothing converts
+    or conforms it, and where another port of the region reads the same
+    stream, it binds that one. `boxes_mask(v, detect(v))` sends the
+    picture once, in the format `detect` takes. `explain` says `timing`
+    for it.
+  - One region of a sidecar holds the nodes the query wires together,
+    and everything one process hands another travels as one NUT. A
+    signature only a node can carry (kinds mixed, a stream left out, a
+    value among ports) is refused for a module of an older world with
+    the refusal such a signature always had.
+- **`ffrwd.merge_spans(<rows>, max_span => <seconds>)`** turns rows
+  written once per tick into spans. Rows sharing a `start_t` are one
+  span, which keeps the last row's fields and ends at the last tick that
+  carried it plus that tick's length; a tick with no row for it is a gap
+  inside it. A span still open after `max_span` seconds is written as it
+  stands and goes on as a new one, so `max_span` is also how late a span
+  row may leave. It is the host's own node and runs in the sidecar
+  beside the rows' producer. Recipe
+  [152](examples.md#152-spans-from-the-rows-that-said-so-frame-by-frame).
+- **What each node waits for.** A node's clock input reads a window
+  (per-frame, tumbling, hopping, sliding), and each output may leave late
+  by a latency it declares; an input paired by interval waits for its
+  producer, at most its own bound past the clock, and one the host
+  re-times onto the clock (anchored `first-frame` or `tagged`) is on a
+  clock of its own and waits its bound alone. Summed along each path,
+  those say how far behind the source every stream a query writes runs.
+  `ffrwd explain --delays` prints a line per node (its window, and each
+  interval input's bound) and per output (its delay, and how long it
+  waits for the latest stream written beside it); `explain` carries the
+  same under `timing`. A stream waiting more than 512 MiB of itself is
+  warned about (`HELD_STREAM`). A live query feeding an input later than
+  the bound its node set on it is refused as `LIVE_LEAD`. Recipe
+  [153](examples.md#153-see-what-each-node-waits-for).
+- A **sql function returning a stream and its rows**, `RETURNS
+  STRUCT(<name> <stream>, <name> <rows>)`, selects both in its body, and a
+  call over it reads as both: handed to a node it fills the port it
+  stands in and the rows port after it, `ring(spotted(v))`; read off it,
+  `spotted(v).spots` is the rows; `.*` in a WITH body names both.
 - Trailing `;` allowed; `--` and `/* */` comments allowed. Unquoted
   identifiers fold to lowercase. View, CTE, and alias names share one
   flat namespace across the whole script.
@@ -758,20 +894,24 @@ The starter is a recipe, `recipes/resize.sql` declared as a map `bin`
 entry, not an export: a lib must name a file defining its export, so a
 fresh directory has nothing to declare one with.
 
-`--rust` writes a wasm module package instead of the bare one. On top
+`--rust` writes a node module package instead of the bare one. On top
 of the manifest and the lockfile: `Cargo.toml` for a `cdylib` crate
-named for the package segment, `build.rs`, `src/lib.rs` holding an
-`invert` module, `src/invert.sql` declaring it as an export,
-`recipes/invert.sql` calling that export, `.ffrwdignore`, `.gitignore`
-and a `README.md`. The manifest depends on `ffrwd/wasm` at the current
-world, and declares `capabilities` and `keywords` empty for their
-author to fill in. `cargo build --target wasm32-wasip2 --release` then
-`ffrwd publish` is the whole path from there.
+named for the package segment, taking `ffrwd-node` and `ffrwd-frame`
+by git tag; `src/lib.rs` holding a `passthrough` node, which reads one
+video input as its clock and hands the picture back on one video
+output like it; `src/passthrough.sql` declaring it as an export,
+`recipes/passthrough.sql` calling that export, `.ffrwdignore`,
+`.gitignore` and a `README.md`. The crate has no `build.rs` and no
+`wit/`: `ffrwd-node` carries the world. The manifest depends on
+`ffrwd/wasm` at the current world, and declares `capabilities` and
+`keywords` empty for their author to fill in.
+`cargo build --release --target wasm32-wasip2` then `ffrwd publish` is
+the whole path from there.
 
-`build.rs` puts the wit where `wit_bindgen::generate!({path: "wit"})`
-reads it, from whichever source is available: `FFRWD_WIT_DIR` when the
-environment names one, otherwise `ffrwd path ffrwd/wasm`. The crate's
-`wit/` is build output and is gitignored.
+`process` in `src/lib.rs` is where the work goes; the
+[ffrwd-node](https://github.com/imbcmdth/ffrwd-node) README is the
+reference for what a node declares and emits, and the node
+declaration rules are under [Statements](#statements).
 
 ### Running a recipe
 
@@ -994,8 +1134,10 @@ every dependency its own manifest pins, at the written version, plus
 its pinned models and the runtime its modules load - everything
 installing this package from the registry would have fetched. A fresh
 clone of a package's repository builds and publishes after one bare
-install. `-g` without a package is an error; machine-wide installs
-name what to fetch.
+install. A dependency the project links is left to its link, and a pin
+of it from before the link leaves the lockfile, unless another pinned
+package depends on that version. `-g` without a package is an error;
+machine-wide installs name what to fetch.
 
 ### Where a package is
 

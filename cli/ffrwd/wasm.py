@@ -48,22 +48,24 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import tempfile
 import threading
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Literal, Protocol, cast
 
 from . import binaries, nn, probe
-from .emit import build_network_graph
+from .emit import build_network_graph, build_node_network
 from .errors import ErrorCode, FfrwdError
 from .execute import STDIN, STDOUT
-from .ir import RowsSink, StreamType
+from .ir import PARAMS_FILE, PIPE, Graph, Node, Output, RowsSink, SinkUnit, StreamType
 from .probe import ProbeResult, RenditionMeta, StreamMeta
 from .processes import (
     NUT,
-    PCM_F32LE,
-    PCM_S16LE,
+    SAMPLE_FMT_CODECS,
+    WIRE_PIX_FMTS,
+    WIRE_SAMPLE_FMTS,
     AudioFormat,
     EffectGrant,
     ModelBinding,
@@ -72,6 +74,7 @@ from .processes import (
     RowsDocument,
     SidecarProcess,
 )
+from .shapes import PARAMS_INLINE_LIMIT
 
 __all__ = [
     "ANNOTATION_TYPES",
@@ -83,6 +86,7 @@ __all__ = [
     "DEFAULT_TIMEOUT_SECONDS",
     "LANGUAGE_TAGS",
     "MODEL_SUFFIX",
+    "NODE_WORLD",
     "PACKET_FILTER_WORLD",
     "PACKET_SOURCE_WORLD",
     "FFMPEG_SAMPLE_FMTS",
@@ -170,6 +174,7 @@ WORLDS: tuple[str, ...] = (
     "ffrwd:av@0.16.0",
     "ffrwd:av@0.17.0",
     "ffrwd:av@0.18.0",
+    "ffrwd:av@0.19.1",
 )
 
 # The world a module scaffolded today is built against: the newest of those,
@@ -179,8 +184,6 @@ WORLD_VERSION = WORLDS[-1].partition("@")[2]
 # The package carrying the wit, whose version is the world's.
 WIT_PACKAGE = "ffrwd/wasm"
 
-# The pixel formats a stream edge into or out of the sidecar can carry.
-WIRE_PIX_FMTS: tuple[str, ...] = ("rgba", "yuv420p", "yuv422p", "yuv444p")
 
 # The coded video streams a stream edge can carry to a packet sink: the ones
 # the sidecar's NUT reader hands through untouched.
@@ -242,10 +245,13 @@ DATA_FILTER_WORLD = "ffrwd:av@0.17.0"
 # The first world whose sidecar hosts a codec package's encoder and decoder.
 CODEC_WORLD = "ffrwd:av@0.18.0"
 
+# What a module exporting the 0.19.1 world's `node` describes as its world:
+# its ports are not in its describe at all but in its shape, per call
+# (:mod:`ffrwd.shapes`).
+NODE_WORLD = "node-module"
+
 # The sample formats one can carry, the pcm each of them travels as, and
 # the name ffmpeg's own options spell it by.
-WIRE_SAMPLE_FMTS: tuple[str, ...] = ("f32", "s16")
-SAMPLE_FMT_CODECS: Mapping[str, str] = {"f32": PCM_F32LE, "s16": PCM_S16LE}
 FFMPEG_SAMPLE_FMTS: Mapping[str, str] = {"f32": "flt", "s16": "s16"}
 
 # The JSON Schema types each declared annotation field type covers. `number`
@@ -381,6 +387,13 @@ _NN_EXCLUDE_FLAG = "-nn-exclude"
 
 # The sidecar's worker-thread cap. Unwritten, the sidecar sizes its own pool.
 _JOBS_FLAG = "-jobs"
+
+# Where a node's params are read whole from a file: ``<name>=<path>``.
+_PARAMS_FROM_FLAG = "-params-from"
+
+# The bound list a node's shape was asked with: ``<name>=<json>``, one per
+# call in the order its chain is written.
+_BOUND_FLAG = "-bound"
 
 # Which half of a codec package's module a run drives: "encode" or "decode".
 _CODEC_FLAG = "-codec"
@@ -630,6 +643,8 @@ class Described:
     # reads. None for every other module; a codec module fills both.
     encoder: EncoderInfo | None = None
     decoder: DecoderInfo | None = None
+    # A node: what it reads and writes is its shape's to say, per call.
+    node: bool = False
 
     @property
     def packet_sink(self) -> bool:
@@ -775,12 +790,13 @@ def _described(path: str, payload: object) -> Described:
             f"the sidecar described {path} with something that is not an object",
             hint="the module may be built against a sidecar this ffrwd does not know",
         )
-    world = payload.get("world")
-    if not isinstance(world, str):
+    written = payload.get("world")
+    if not isinstance(written, str):
         raise _reject(
             f"the sidecar's description of {path} names no world",
             hint="the module may be built against a sidecar this ffrwd does not know",
         )
+    world = _hosted_world(written)
     name = payload.get("name")
     functions = _functions(payload.get("functions"))
     if not isinstance(name, str) and not functions:
@@ -846,7 +862,19 @@ def _described(path: str, payload: object) -> Described:
         feeders=_feeders(payload.get("feeders")),
         encoder=_encoder_info(payload.get("encoder")),
         decoder=_decoder_info(payload.get("decoder")),
+        node=written == NODE_WORLD or payload.get("node") is True,
     )
+
+
+def _hosted_world(world: str) -> str:
+    """The world the sidecar hosts a module in, as the compiler's checks read it.
+
+    The sidecar describes a module by the world it hosts it in, not the one
+    it was built against: a node is `node-module`, which is 0.19.1's, and
+    every older module is adapted into the newest world it knows. Each
+    `hosts_*` check asks what that world can host.
+    """
+    return WORLDS[-1] if world == NODE_WORLD else world
 
 
 def _encoder_info(value: object) -> EncoderInfo | None:
@@ -1483,6 +1511,10 @@ def _last_line(text: str) -> str:
 # The rows document a packet sink writes, and the specifier every flag on the
 # copy's one output stream carries.
 _ROWS_FORMAT = "ndjson"
+# The output a node's emitted rows are labelled by, beside its ports.
+EMITTED_ROWS_PORT = "@rows"
+# What a compile-time read names the one node it hosts.
+_READ_NODE = "read"
 _OUTPUT_STREAM = "0"
 
 # How a `-map` names one stream of a kind, ffmpeg's own letters.
@@ -1543,6 +1575,12 @@ class PacketRead:
     module: str
     params: str
     wants: SinkWants
+    # The input of a node module the stream binds, whose rows are what the
+    # node emits beside its ports; empty for a packet sink.
+    port: str = ""
+    # The bound list the node's shape was asked with, as JSON; empty for a
+    # packet sink.
+    bound: str = ""
 
 
 # Runs one packet sink over one stream and returns the rows it wrote:
@@ -1637,6 +1675,55 @@ def _reader_argv(binary: str, read: PacketRead, described: Described | None) -> 
     return _argv(binary, process, reads=(STDIN,), writes=(STDOUT,))
 
 
+def _node_reader_argv(
+    binary: str, read: PacketRead, described: Described | None, scratch: Path
+) -> list[str]:
+    """The sidecar command hosting a node that reads the stream and emits rows.
+
+    One node bound by its port to the stream on stdin, its emitted rows
+    mapped to stdout as NDJSON: a network of one, as a query would spell
+    it. Params a filtergraph cannot spell go in a file in `scratch`.
+    """
+    params = _params_object(read.params)
+    filed: list[str] = []
+    if params and _params_filed(params):
+        written = scratch / "params.json"
+        written.write_text(json.dumps(params), encoding="utf-8")
+        filed = [_PARAMS_FROM_FLAG, f"{_READ_NODE}={written}"]
+        params = {}
+    node = Node(
+        id=_READ_NODE,
+        filter=_READ_NODE,
+        args=params,
+        inputs=[f"src:{_READ_NODE}:{_TYPE_SPECIFIERS[read.kind]}:0"],
+        outputs=["data"],
+        ports=[read.port],
+        out_ports=[EMITTED_ROWS_PORT],
+    )
+    graph = Graph(
+        input_paths=[PIPE],
+        sources={_READ_NODE: 0},
+        nodes={_READ_NODE: node},
+        sinks=[
+            SinkUnit(
+                outputs=[Output(ref=_READ_NODE, type="data", name=None, metadata={})],
+                path=PIPE,
+            )
+        ],
+    )
+    network, groups = build_node_network(graph, pipe_inputs=[STDIN])
+    argv = [binary, "-f", EDGE_FORMAT, "-i", STDIN]
+    for effect in EFFECTS:
+        if described is not None and getattr(described, effect):
+            argv += [_GRANT_FLAGS[effect], read.module]
+    argv += ["-m", f"{_READ_NODE}={read.module}", "-filter_complex", network, *filed]
+    if read.bound:
+        argv += [_BOUND_FLAG, f"{_READ_NODE}={read.bound}"]
+    for target in groups[0]:
+        argv += ["-map", target]
+    return [*argv, "-f", _ROWS_FORMAT, STDOUT]
+
+
 def _params_object(params: str) -> dict[str, object]:
     """A marshalled params string back as the object the argv writes."""
     if not params:
@@ -1678,18 +1765,23 @@ def read_packet_rows(
             "needs it to host the module",
             hint=INSTALL_HINT,
         )
-    sidecar_command = _reader_argv(binary, read, described)
-    failure: FfrwdError | None = None
-    for attempt in range(3):
-        command = copy_argv(ffmpeg, read, attempt)
-        if attempt and command == copy_argv(ffmpeg, read, attempt - 1):
-            continue  # nothing left to widen; the previous attempt was this one
-        try:
-            return _run_read(command, sidecar_command, read)
-        except _CopyRefused as refused:
-            failure = refused.error
-    assert failure is not None  # the loop runs at least one attempt
-    raise failure
+    with tempfile.TemporaryDirectory() as scratch:
+        sidecar_command = (
+            _node_reader_argv(binary, read, described, Path(scratch))
+            if read.port
+            else _reader_argv(binary, read, described)
+        )
+        failure: FfrwdError | None = None
+        for attempt in range(3):
+            command = copy_argv(ffmpeg, read, attempt)
+            if attempt and command == copy_argv(ffmpeg, read, attempt - 1):
+                continue  # nothing left to widen; the previous attempt was this one
+            try:
+                return _run_read(command, sidecar_command, read)
+            except _CopyRefused as refused:
+                failure = refused.error
+        assert failure is not None  # the loop runs at least one attempt
+        raise failure
 
 
 class _CopyRefused(Exception):
@@ -1926,6 +2018,8 @@ def _argv(
     SINK pad carrying rendition metadata (:attr:`SidecarProcess.pads`) gets a
     ``-pad '<json>'`` right after its own ``-i``, ``{"row": ..., "rendition":
     {...}}`` with absent attributes omitted -- a pad with none gets no flag.
+    A node network's input carrying a raw picture gets its ``"color"`` there
+    too (:attr:`SidecarProcess.colors`), since NUT writes none.
 
     `writes` is the mirror on the other side: one path per rows document the
     process writes, in document order, since a process writing several of
@@ -1960,12 +2054,22 @@ def _argv(
             "its outputs carries, one per output",
         )
     argv = [binary]
-    if not process.packet_source:
+    # A source reads nothing: a packet source, or a network of nodes none of
+    # which is handed a stream.
+    reads_nothing = process.packet_source or (process.node_network and not process.inputs)
+    if not reads_nothing:
         for index, path in enumerate(reads or (STDIN,)):
             argv += ["-f", EDGE_FORMAT, "-i", path]
             meta: PadMeta | None = process.pads[index] if index < len(process.pads) else None
-            if meta is not None:
-                argv += ["-pad", json.dumps(meta.to_dict())]
+            pad = meta.to_dict() if meta is not None else {}
+            colour = process.colors[index] if index < len(process.colors) else ()
+            if colour:
+                pad["color"] = dict(colour)
+            tags = process.tags[index] if index < len(process.tags) else ()
+            if tags:
+                pad["tags"] = dict(tags)
+            if pad:
+                argv += ["-pad", json.dumps(pad)]
     if any(grant.effect == "gpu" for grant in process.grants):
         jobs = GPU_JOBS if jobs is None else min(jobs, GPU_JOBS)
     if jobs is not None:
@@ -1982,7 +2086,9 @@ def _argv(
         argv += [_FRAME_RATE_FLAG, process.frame_rate]
     for flag, value in process.color:
         argv += [f"-{flag}", value]
-    if process.network:
+    if process.node_network:
+        argv += _node_network_args(process, reads, writes)
+    elif process.network:
         argv += _network_args(process, writes)
     else:
         argv += ["-m", process.module]
@@ -2160,6 +2266,70 @@ def _network_args(process: SidecarProcess, writes: Sequence[str] = ()) -> list[s
     for target, tail in zip(targets, tails):
         argv += ["-map", target, *tail]
     return argv
+
+
+def _node_network_args(
+    process: SidecarProcess, reads: Sequence[str], writes: Sequence[str]
+) -> list[str]:
+    """The ``-m`` table, the network string and the outputs of a region
+    holding node modules.
+
+    Each output is one NUT carrying every stream the plan takes to one
+    process, a ``-map`` per stream; each rows document an output of its own.
+    `reads` names its inputs in ``-i`` order and `writes` its stream outputs
+    then its documents; a printed command given none reads stdin and writes
+    stdout, then numbered pipes.
+    """
+    graph = process.graph
+    if graph is None:  # `network` is True for every node region
+        raise _reject(
+            f"process '{process.id}' hosts node modules and carries no graph",
+            hint="the plan was built without partitioning; recompile the query",
+        )
+    wanted = graph.input_paths.count(PIPE)
+    given = list(reads)[:wanted] or [STDIN] * min(wanted, 1)
+    given += [f"pipe:{index}" for index in range(len(given), wanted)]
+    filed: list[str] = []
+    nodes = dict(graph.nodes)
+    for name, node in graph.nodes.items():
+        if not node.ports and not node.out_ports or not _params_filed(node.args):
+            continue
+        filed += [_PARAMS_FROM_FLAG, f"{node.filter}={PARAMS_FILE}{process.id}:{name}"]
+        nodes[name] = replace(node, args={})
+    network, groups = build_node_network(replace(graph, nodes=nodes), pipe_inputs=given)
+    streams = len(groups) - len(process.rows)
+    paths = list(writes[:streams])
+    paths += [STDOUT if not paths and index == 0 else f"pipe:{index + 1}"
+              for index in range(len(paths), streams)]
+    documents = writes[streams:]
+    argv: list[str] = []
+    for binding in process.modules:
+        argv += ["-m", f"{binding.name}={binding.path}"]
+    argv += ["-filter_complex", network, *filed]
+    for name, node in graph.nodes.items():
+        if node.bound:
+            argv += [_BOUND_FLAG, f"{nodes[name].filter}={node.bound}"]
+    for targets, path in zip(groups[:streams], paths):
+        for target in targets:
+            argv += ["-map", target]
+        argv += ["-f", EDGE_FORMAT, path]
+    for index, (targets, document) in enumerate(zip(groups[streams:], process.rows)):
+        given_path = documents[index] if index < len(documents) else ""
+        # Rows nothing reads are the run's own, on stdout.
+        unread = STDOUT if not document.sink.alias else f"pipe:{streams + index + 1}"
+        path = document.sink.path or given_path or unread
+        for target in targets:
+            argv += ["-map", target]
+        argv += ["-f", document.sink.container, path]
+    return argv
+
+
+def _params_filed(params: Mapping[str, object]) -> bool:
+    """Whether a node's params go in a file: too long for a command line, or
+    holding a list a filtergraph option cannot spell."""
+    if any(not isinstance(value, str | int | float | bool) for value in params.values()):
+        return True
+    return len(json.dumps(params)) > PARAMS_INLINE_LIMIT
 
 
 def sidecar_argv(

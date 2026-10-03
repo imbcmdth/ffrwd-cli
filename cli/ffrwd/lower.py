@@ -286,6 +286,7 @@ import socket
 import urllib.parse
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from fractions import Fraction
 from typing import Literal, cast
 
 from sqlglot import exp
@@ -295,6 +296,7 @@ from ffrwd.errors import ErrorCode, FfrwdError
 from ffrwd.functions import (
     DECLARED_STREAM,
     SHARED_ARGUMENT,
+    STAR_FIELD,
     WASM_DATA,
     WASM_STREAM_NAMES,
     WASM_STREAM_TYPES,
@@ -303,7 +305,9 @@ from ffrwd.functions import (
     RuntimeLateral,
     WasmFunction,
     is_number_argument,
+    is_port,
     named_annotation_parameter,
+    spread,
     wasm_named_parameter,
 )
 from ffrwd.inputs import render_options, rendered_options
@@ -312,6 +316,8 @@ from ffrwd.ir import (
     FEEDER_HOST,
     LEAKY,
     MAX_DISTANCE,
+    MAX_SPAN,
+    MERGE_SPANS,
     NO_CHAPTERS,
     NO_METADATA,
     PIPE,
@@ -319,6 +325,7 @@ from ffrwd.ir import (
     ROWFILTER,
     ROWMERGE,
     ROWS_DOCUMENT,
+    TAP_DOCUMENT,
     Attachment,
     FeederCall,
     FrameRef,
@@ -356,6 +363,8 @@ from ffrwd.parser import (
     MACRO_NAMESPACE,
     MAP_COLUMNS,
     MERGE_CUES,
+    NODE_REFUSAL,
+    OLDER_WORLD,
     ROW_MERGE,
     ROW_PREDICATE,
     ROW_STREAM,
@@ -418,8 +427,30 @@ from ffrwd.probe import (
     track_cues,
 )
 from ffrwd.probe import probe as probe_one_path
-from ffrwd.processes import CLOCK_SIZE, COPY_CODEC, NUT, RAWVIDEO, ref_type
+from ffrwd.processes import (
+    CLOCK_SIZE,
+    COPY_CODEC,
+    NUT,
+    RAWVIDEO,
+    SETPARAMS_COLOR,
+    ref_type,
+    stream_colorimetry,
+)
 from ffrwd.registry import DynamicFilter, FilterOption, Registry, SourceFilter
+from ffrwd.shapes import (
+    Binding,
+    Hold,
+    InputPort,
+    NodeShape,
+    OutputPort,
+    Shape,
+    ShapeCache,
+    StreamHint,
+    Wants,
+    bound_json,
+    node_shape,
+    row_mismatch,
+)
 from ffrwd.sink import (
     CODEC_PARAMS_FLAGS,
     COLOR_OPTIONS,
@@ -444,6 +475,7 @@ from ffrwd.table import (
     TableSink,
     VectorCell,
 )
+from ffrwd.timing import stream_rate
 from ffrwd.types import (
     ATTACHMENT_TYPE,
     ATTACHMENTS_COLUMN,
@@ -480,11 +512,14 @@ from ffrwd.wasm import (
     CODEC_ENCODERS,
     CODEC_WORLD,
     DATA_FILTER_WORLD,
+    EMITTED_ROWS_PORT,
     FFMPEG_SAMPLE_FMTS,
     PACKET_FILTER_WORLD,
     PACKET_SOURCE_WORLD,
+    SAMPLE_FMT_CODECS,
     WIRE_AUDIO_CODECS,
     WIRE_PIX_FMTS,
+    WIRE_SAMPLE_FMTS,
     WIRE_VIDEO_CODECS,
     WORLDS,
     Described,
@@ -495,6 +530,9 @@ from ffrwd.wasm import (
     PacketRead,
     ProbeSource,
     ReadPackets,
+    SinkArity,
+    SinkWants,
+    _grant_args,
     audio_encoder_codec,
     catalog_as_probe,
     encoder_codec,
@@ -1656,6 +1694,10 @@ class _Connection:
 # never written by a COPY, only a feeder's (:meth:`_Lowerer._feed`), so it
 # names no pad at all. ``lateral:<key>:<column>``.
 _LATERAL_REF = "lateral:"
+
+
+class _UnmadeField(Exception):
+    """A field `.*` expanded that this call's shape makes no output for."""
 # How a run-time lateral's data stream reaches the host: ffmpeg's raw data
 # muxer, which writes each packet's bytes as they are, so the host reads one
 # JSON object after another and a heartbeat's blank payload is only space.
@@ -1750,7 +1792,11 @@ def _lateral_column(lateral: RuntimeLateral, call: _Call) -> tuple[str, StreamTy
     written = call.args[1] if len(call.args) > 1 else None
     name = str(written.this) if isinstance(written, exp.Literal) else ""
     column = next(c for c in lateral.columns if c.name == name)
-    return name, WASM_STREAM_TYPES[column.type]
+    return name, _LATERAL_KINDS[column.type]
+
+
+# The kind of each column a run-time lateral may return.
+_LATERAL_KINDS: Mapping[str, StreamType] = {**WASM_STREAM_TYPES, WASM_DATA: "data"}
 
 
 def _instance_template(
@@ -1759,7 +1805,8 @@ def _instance_template(
     """One instance of a run-time lateral, as SQL.
 
     One COPY per connection its streams go to, writing them there as the
-    NUT a feeder carries, picture then sound. The call writes NULL in the
+    NUT a feeder carries, picture, sound, then the rows a group's data
+    input reads. The call writes NULL in the
     data stream's place, what the call wrote itself, and every other value
     as a variable, ``:'name'`` for text and ``:name`` for the rest, which
     the host sets per message; one it leaves unset is NULL, and takes the
@@ -1778,9 +1825,7 @@ def _instance_template(
     call = f"{declared.function}({', '.join(arguments)}) {alias}"
     statements: list[str] = []
     for port, connection in connections:
-        streams = sorted(
-            connection.streams.values(), key=lambda s: 0 if s.type == "video" else 1
-        )
+        streams = sorted(connection.streams.values(), key=_feed_order)
         columns = []
         for stream in streams:
             parts = _lateral_parts(stream.ref)
@@ -1796,6 +1841,11 @@ def _instance_template(
             f"TO '{feeder_path(port)}' WITH ({', '.join(options)})"
         )
     return ";\n".join(statements)
+
+
+def _feed_order(stream: _Stream) -> int:
+    """Where a stream rides a feeder's NUT: picture, sound, then data."""
+    return {"video": 0, "audio": 1}.get(stream.type, 2)
 
 
 def _namespaced_call(node: exp.Expr) -> exp.Anonymous | None:
@@ -2001,6 +2051,112 @@ def _sink_alias(argument: exp.Expr) -> str | None:
     """The alias a sink call's argument carried as a SELECT column, if any."""
     written = argument.meta.get(SINK_ALIAS)
     return written if isinstance(written, str) and written else None
+
+
+def _param_takes_list(described: Described, name: str) -> bool:
+    """Whether the module's params schema takes `name` as an array, alone or
+    among other types."""
+    properties = described.params_schema.get("properties")
+    return "array" in _schema_types(
+        properties.get(name) if isinstance(properties, dict) else None
+    )
+
+
+def _as_scalar_type(value: RowValue, schema: object) -> RowValue:
+    """A number written as the schema's first scalar type: a whole number
+    where that is ``integer``, so a param taking one port or a list of them
+    is handed one port as the integer it is."""
+    scalars = [kind for kind in _schema_types(schema) if kind != "array"]
+    if (
+        scalars
+        and scalars[0] == "integer"
+        and isinstance(value, float)
+        and value.is_integer()
+    ):
+        return int(value)
+    return value
+
+
+def _sink_port(shape: NodeShape, kind: StreamType) -> InputPort | None:
+    """The input of a node sink's shape that takes streams of `kind`: its data
+    port, or a coded port named for the kind, an unnamed one taking video."""
+    if kind == "data":
+        return next((port for port in shape.inputs if port.kind == "data"), None)
+    coded = [port for port in shape.inputs if port.kind == "packets"]
+    named = next((port for port in coded if port.name == kind), None)
+    if named is not None or kind == "audio":
+        return named
+    return next((port for port in coded if port.name != "audio"), None)
+
+
+def _sink_view(described: Described, ports: Mapping[str, InputPort | None]) -> Described:
+    """A node sink as the packet sink its ports describe: how many streams of
+    each kind it reads, the codecs it takes, and how much of each it wants."""
+
+    def arity(port: InputPort | None) -> SinkArity:
+        return "none" if port is None else "many" if port.many else "one"
+
+    video, audio, data = ports["video"], ports["audio"], ports["data"]
+    first = next((port for port in (video, audio, data) if port is not None), None)
+    return replace(
+        described,
+        video_codecs=tuple(video.accepts.codecs) if video is not None else (),
+        audio_codecs=tuple(audio.accepts.codecs) if audio is not None else (),
+        video_streams=arity(video),
+        audio_streams=arity(audio),
+        data_streams=arity(data),
+        wants=_sink_wants(first.accepts.wants) if first is not None else "all",
+        packet_filter=False,
+    )
+
+
+def _group_hold(shape: NodeShape, port: InputPort) -> Hold | None:
+    """How `port` is held where a feed by port serves it: its own hold, or
+    for a data input naming a hold group, that group's hold on a port."""
+    if port.pairing.hold is not None:
+        return port.pairing.hold
+    interval = port.pairing.interval
+    if port.kind != "data" or interval is None or interval.group is None:
+        return None
+    return next(
+        (
+            one.pairing.hold
+            for one in shape.inputs
+            if one.pairing.hold is not None
+            and one.pairing.hold.group == interval.group
+            and one.pairing.hold.port_param is not None
+        ),
+        None,
+    )
+
+
+def _sink_wants(wants: Wants) -> SinkWants:
+    """What a port reading coded packets asks for; `timing` is a frame
+    port's, which the host refuses on any other."""
+    return "all" if wants == "timing" else wants
+
+
+def _conformed(shape: NodeShape, bound: Sequence[Binding]) -> list[Binding]:
+    """`bound` with each sound's rate the one its port conforms it to: the
+    first rate an audio port accepts, where it names any. A port read for
+    its timing is handed the sound as it is."""
+    conformed: list[Binding] = []
+    for binding in bound:
+        port = shape.input(binding.input)
+        rates = port.accepts.sample_rates if port is not None else ()
+        if port is None or port.kind != "audio" or not rates or port.accepts.wants == "timing":
+            conformed.append(binding)
+            continue
+        conformed.append(
+            replace(
+                binding,
+                streams=tuple(
+                    hint if hint.rate is None else StreamHint(Fraction(rates[0]))
+                    for hint in binding.streams
+                ),
+            )
+        )
+    return conformed
 
 
 def _sink_stream_count(node: exp.Expr, arguments: int) -> int:
@@ -2536,43 +2692,6 @@ _ENCODER_SHAPING = frozenset(
         "sample_rate",
     }
 )
-
-# A stream's colorimetry: each option ffmpeg's output takes it by, against
-# the field ffprobe reports it in and setparams' option for it.
-_PROBED_COLOR: Mapping[str, str] = {
-    "color_range": "color_range",
-    "color_primaries": "color_primaries",
-    "color_trc": "color_transfer",
-    "colorspace": "color_space",
-    "chroma_sample_location": "chroma_location",
-}
-_SETPARAMS_COLOR: Mapping[str, str] = {
-    "color_range": "range",
-    "color_primaries": "color_primaries",
-    "color_trc": "color_trc",
-    "colorspace": "colorspace",
-    "chroma_sample_location": "chroma_location",
-}
-# What ffprobe and setparams write for a field nothing settles.
-_UNSAID_COLOR = frozenset({"unknown", "unspecified", "reserved", "auto"})
-# The fields that describe YUV alone, which an RGB picture has none of.
-_YUV_ONLY_COLOR = ("color_range", "colorspace", "chroma_sample_location")
-_RGB_PREFIXES = ("rgb", "bgr", "gbr", "argb", "abgr")
-# Filters that convert colour, past which a stream's colorimetry is no longer
-# its input's. A `scale` does too where it names an in_ or out_ option.
-_COLOR_CONVERTING_FILTERS = frozenset(
-    {"colorspace", "colormatrix", "zscale", "tonemap", "tonemap_opencl", "libplacebo"}
-)
-
-
-def _converts_colour(node: Node) -> bool:
-    """True where `node` converts the colour of the pictures through it."""
-    if node.filter in _COLOR_CONVERTING_FILTERS:
-        return True
-    return node.filter == "scale" and any(
-        str(key).startswith(("in_", "out_")) for key in node.args
-    )
-
 
 def _colorimetry_options(
     tagged: Mapping[int, Mapping[str, str]], outputs: Sequence[Output]
@@ -3859,6 +3978,149 @@ class _Env:
 # ExpandCtx
 
 
+@dataclass(frozen=True)
+class _NodeInstance:
+    """One node module's instance in the graph, and the shape it was given."""
+
+    ref: str
+    shape: NodeShape
+
+
+# The kind of port each node parameter is, and the type a declaration spells
+# one of each kind with.
+_PORT_KINDS: Mapping[str, StreamType] = {
+    "video_stream": "video",
+    "audio_stream": "audio",
+    WASM_DATA: "data",
+}
+_PORT_TYPE_NAMES: Mapping[str, str] = {
+    "video": "video_stream",
+    "audio": "audio_stream",
+    "data": "data_stream or STRUCT(...)[]",
+    "packets": "packets",
+}
+
+# What a JSON schema calls each type an annotation field may be.
+_SCHEMA_TYPES: Mapping[str, dict[str, object]] = {
+    "number": {"type": "number"},
+    "text": {"type": "string"},
+    "boolean": {"type": "boolean"},
+    "vector": {"type": "array", "items": {"type": "number"}},
+}
+
+
+def _node_source_probe(shape: NodeShape) -> ProbeResult:
+    """A node source's outputs as a :class:`~ffrwd.probe.ProbeResult`.
+
+    One stream per output, counted per kind the way ffprobe counts a file's.
+    A rate clock is the pictures' rate. Outputs naming a relation row group
+    into one rendition per row, which carries that row's name, bandwidth,
+    codecs and language; a source naming none is one row, as a file is.
+    """
+    fps = f"{shape.clock.rate[0]}/{shape.clock.rate[1]}" if shape.clock.rate else None
+    counted: dict[str, int] = {}
+    streams: list[StreamMeta] = []
+    by_row: dict[int, list[StreamMeta]] = {}
+    for output in shape.outputs:
+        kind = _output_kind(shape, output, {})
+        index = counted.get(kind, 0)
+        counted[kind] = index + 1
+        found = output.format
+        coded = found is not None and found.kind == "packets"
+        video = found is not None and (found.kind == "video" or coded) and kind == "video"
+        audio = found is not None and (found.kind == "audio" or coded) and kind == "audio"
+        stream = StreamMeta(
+            type=kind,
+            index=index,
+            metadata={},
+            width=found.width if found is not None and video else None,
+            height=found.height if found is not None and video else None,
+            fps=fps if kind == "video" else None,
+            sample_rate=found.sample_rate if found is not None and audio else None,
+            codec=found.codec
+            if found is not None and coded
+            else _NODE_SOURCE_CODECS.get(
+                (found.sample_format if found is not None and audio else None) or kind
+            ),
+            channels=found.channels if found is not None and audio else None,
+        )
+        streams.append(stream)
+        if output.row is not None:
+            by_row.setdefault(output.row, []).append(stream)
+    renditions: list[RenditionMeta] = []
+    for row, members in sorted(by_row.items()):
+        said = shape.relation[row] if row < len(shape.relation) else {}
+        picture = next((s for s in members if s.type == "video"), None)
+        bandwidth = said.get("bandwidth")
+        renditions.append(
+            RenditionMeta(
+                streams=members,
+                bandwidth=bandwidth if isinstance(bandwidth, int) else None,
+                width=picture.width if picture is not None else None,
+                height=picture.height if picture is not None else None,
+                codecs=_text_or_none(said.get("codecs")),
+                name=_text_or_none(said.get("name")),
+                language=_text_or_none(said.get("language")),
+                program_id=None,
+            )
+        )
+    return ProbeResult(
+        streams=streams, format_name="node", renditions=renditions, live=not shape.bounded
+    )
+
+
+# What a node source's stream is on the wire, by its kind or, for sound, its
+# sample format: what the probe of a file would have said its codec is.
+_NODE_SOURCE_CODECS: Mapping[str, str] = {
+    "video": RAWVIDEO,
+    "audio": SAMPLE_FMT_CODECS["f32"],
+    "data": JSON_CODEC,
+    **SAMPLE_FMT_CODECS,
+}
+
+
+def _output_kind(
+    shape: NodeShape, output: OutputPort, bound: Mapping[str, StreamType]
+) -> StreamType:
+    """The kind of stream a node's output is in the graph.
+
+    Coded packets are the kind they carry: what the coded stream says, or,
+    where the output follows an input's format, what is bound there.
+    """
+    if output.kind != "packets":
+        return cast(StreamType, output.kind)
+    found = output.format
+    if found is not None and found.kind == "packets" and found.coded is not None:
+        return found.coded
+    follows = (
+        found.port
+        if found is not None and found.kind == "like"
+        else shape.clock.port
+        if found is None and shape.clock.kind == "input"
+        else None
+    )
+    return bound.get(follows or "", "video")
+
+
+def _text_or_none(value: object) -> str | None:
+    return value if isinstance(value, str) else None
+
+
+def _port_kind(param: Parameter) -> StreamType:
+    """The kind of stream a node reads or writes for `param`: rows are data."""
+    if param.annotation is not None:
+        return "data"
+    return _PORT_KINDS.get(element_type(param.type), "data")
+
+
+def _record_schema(record: Annotation) -> dict[str, object]:
+    """A declared record as the JSON schema of one row of it."""
+    return {
+        "type": "object",
+        "properties": {f.name: dict(_SCHEMA_TYPES[f.type]) for f in record.fields},
+    }
+
+
 class _NodeFactory:
     """Mints ``n1, n2, ...`` node ids into a graph, in creation order.
 
@@ -3916,8 +4178,33 @@ class _Lowerer:
         probe_source: ProbeSource = wasm_probe_source,
         probe_path: ProbePath = probe_one_path,
         read_packets: ReadPackets = wasm_read_packet_rows,
+        shapes: Shape | None = None,
     ) -> None:
         self.res = res
+        # Asks a node module for its shape, once per distinct call.
+        self.shapes: Shape = shapes if shapes is not None else ShapeCache()
+        # (call text, id(env)) -> the instances a node call lowered to, and
+        # whether it broadcast: every read of one call in one branch is one.
+        self._node_calls: dict[
+            tuple[str, int], tuple[tuple[_NodeInstance, ...], bool]
+        ] = {}
+        # (module, export, bound inputs, params) -> the instance: one call is
+        # one node wherever the query writes it.
+        self._node_refs: dict[
+            tuple[str, str, tuple[tuple[str, FrameRef], ...], str], _NodeInstance
+        ] = {}
+        # A node's data pad -> the function writing it and the schema of its
+        # rows, which a reader's port is matched against.
+        self._data_schemas: dict[FrameRef, tuple[str, Mapping[str, object]]] = {}
+        # A node's rows pad -> its declaration, its record and the call, for
+        # the track or rows file a COPY selecting it writes.
+        self._node_rows: dict[FrameRef, tuple[WasmFunction, Annotation, exp.Anonymous]] = {}
+        # A node at a COPY's TO, by module: the packet sink its shape reads as,
+        # and the shape.
+        self._node_sinks: dict[str, tuple[Described, NodeShape]] = {}
+        # Each node's shape by its id, read back off the graph for the rates
+        # its outputs run at.
+        self._made_shapes: dict[str, NodeShape] = {}
         self.probes = probes
         # Why an alias in `probes` maps to None, when there is a specific
         # answer -- unset (or no answer for this alias) reads the same as an
@@ -4110,6 +4397,9 @@ class _Lowerer:
         # rows off the SELECT list rather than named stream parameters: a
         # multi-row relation is accepted here too, the way a manifest's is.
         self.row_reading_sink = False
+        # True while a column handed straight to a node's DEFAULT NULL port
+        # lowers: a NULL there leaves the port unbound, as a NULL literal does.
+        self.null_port_read = False
         # True while a CTE body lowers. The bodies are lowered once, before
         # any COPY, so the reader is not known here: a stream column records
         # one cell per row of the body's relation -- NULL where the row
@@ -4281,6 +4571,7 @@ class _Lowerer:
         is None). When there are sinks they are just a mirror of ``sinks[0]``
         and walking them again would lower the first group twice.
         """
+        self._check_declared_worlds()
         self._lower_ctes()
         if self.res.sinks:
             self.graph.sinks = self._lower_sinks()
@@ -4305,6 +4596,7 @@ class _Lowerer:
                     attachments=list(self.attachments),
                 )
             ]
+        self._place_node_sources()
         self._check_feeder_groups()
         self._place_feeders()
         self._place_laterals()
@@ -4367,7 +4659,7 @@ class _Lowerer:
                 self.graph.codec_formats[node] = said
                 made[ref] = self.ctx.node(
                     "setparams",
-                    {_SETPARAMS_COLOR[option]: value for option, value in said.items()},
+                    {SETPARAMS_COLOR[option]: value for option, value in said.items()},
                     [node],
                     ["video"],
                 )
@@ -5012,35 +5304,12 @@ class _Lowerer:
         names, as far as the query says it.
 
         A ``setparams`` on the way settles each field it names; past a filter
-        that converts colour (:data:`_COLOR_CONVERTING_FILTERS`) nothing else
+        that converts colour (:data:`ffrwd.processes.COLOR_CONVERTING_FILTERS`) nothing else
         does. Every field left is the input stream's, as probed. A field
         nothing settles is absent. Pictures in an RGB `pix_fmt` have no YUV
         matrix, range or chroma siting to state.
         """
-        said: dict[str, str] = {}
-        seen: set[str] = set()
-        current: FrameRef | None = ref
-        while current is not None and not is_src(current):
-            node = self._upstream(current, seen)
-            if node is None or _converts_colour(node):
-                current = None
-                break
-            if node.filter == "setparams":
-                for option, param in _SETPARAMS_COLOR.items():
-                    value = node.args.get(param)
-                    if value is not None and str(value) not in _UNSAID_COLOR:
-                        said.setdefault(option, str(value))
-            current = self._picture_input(node)
-        meta = self._source_meta(current)
-        if meta is not None:
-            for option, field_name in _PROBED_COLOR.items():
-                value = getattr(meta, field_name)
-                if isinstance(value, str) and value not in _UNSAID_COLOR:
-                    said.setdefault(option, value)
-        if pix_fmt is not None and pix_fmt.startswith(_RGB_PREFIXES):
-            for option in _YUV_ONLY_COLOR:
-                said.pop(option, None)
-        return {option: said[option] for option in COLOR_OPTIONS if option in said}
+        return stream_colorimetry(self.graph, ref, self._source_meta, pix_fmt)
 
     def _described_codec(
         self, declared: WasmFunction, node: exp.Expr, select: exp.Select
@@ -5093,7 +5362,9 @@ class _Lowerer:
         ]
         sole = _unwrap(written[0]) if len(written) == 1 else None
         if sole is not None and (
-            self._rows_projection(sole) is not None or self._rows_call(sole) is not None
+            self._rows_projection(sole) is not None
+            or self._rows_call(sole) is not None
+            or self._node_rows_column(sole)
         ):
             return path
         raise _error(
@@ -5120,7 +5391,10 @@ class _Lowerer:
         filter calls start.
         """
         declared = self.res.wasm[raw.module_sink]
-        described = self.describes.get(declared.module)
+        node_sink = self._node_sinks.get(declared.module)
+        described = (
+            node_sink[0] if node_sink is not None else self.describes.get(declared.module)
+        )
         if described is None or not described.packet_sink:
             self._no_packets_here(raw, first_filter, declared)
             if raw.options:
@@ -7357,6 +7631,10 @@ class _Lowerer:
             written, self.rows_file = self.rows_file, document or self.rows_file
             try:
                 value = self._branch_value(projection, env, select)
+                if tags == "sink":
+                    value = self._node_rows_at_sink(value, projection, env, select)
+            except _UnmadeField:
+                continue  # `.*` over a call whose shape makes no such output
             finally:
                 self.rows_file = written
             column = _Column(
@@ -8616,6 +8894,10 @@ class _Lowerer:
         """
         call = _call_parts(inner)
         assert call is not None  # inner is exp.Anonymous; _call_parts always answers
+        node_module = self._node_module(declared)
+        if node_module is not None:
+            self._add_node_source(alias, inner, declared, node_module, call, join, env, select)
+            return
         described = self._described_source(declared, inner, select)
         if not described.source:
             self._add_url_source(
@@ -8660,6 +8942,80 @@ class _Lowerer:
             ),
             bounded=catalog.bounded,
         )
+
+    def _add_node_source(
+        self,
+        alias: str,
+        inner: exp.Anonymous,
+        declared: WasmFunction,
+        described: Described,
+        call: _Call,
+        join: RawRowJoin | None,
+        env: _Env,
+        select: exp.Select,
+    ) -> None:
+        """``FROM <node>(<values>) alias``: a node reading nothing, bound as a
+        probed input is.
+
+        Its shape for the call's params names its outputs, and each is one of
+        the alias's streams, ``s.video[1]`` the first picture; its relation
+        rows are the alias's renditions. The node making them is in the graph
+        like any other, and every ``src:<alias>`` ref is a pad of it once
+        lowering ends (:meth:`_place_node_sources`). A source that never ends
+        reads as a live input does.
+        """
+        self._check_node_export(declared, described, inner, select)
+        params = self._wasm_params(declared, described, call, inner, select, env, {}, first=0)
+        shape = self._node_shape(declared, described, params, [], inner, select)
+        required = next((port for port in shape.inputs if port.required), None)
+        if required is not None:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"{declared.name}() is read in FROM, and the module "
+                f"'{declared.module}' requires an input '{required.name}'",
+                inner,
+                fallback=select,
+                hint="a source reads nothing; a node reading a stream is called "
+                "over that stream in the SELECT list",
+            )
+        result = _node_source_probe(shape)
+        self.probes[alias] = result
+        env.bindings[alias] = _InputBinding(alias=alias)
+        self._bind_renditions(alias, join, env, select)
+        kinds = [_output_kind(shape, output, {}) for output in shape.outputs]
+        ref = self.ctx.node(declared.module, params, [], kinds)
+        self.graph.nodes[ref].out_ports = [output.name for output in shape.outputs]
+        self.graph.nodes[ref].bound = bound_json([])
+        self.graph.node_shapes[ref] = dict(shape.raw)
+        self._emits_rows(ref, described)
+        self.graph.node_sources[alias] = ref
+
+    def _place_node_sources(self) -> None:
+        """Every ``src:<alias>`` ref of a node read in FROM, as that node's pad.
+
+        The alias binds as a probed input does, so what reads it reads a
+        source ref; the node is what makes the stream, and is what the ref
+        now names.
+        """
+        if not self.graph.node_sources:
+            return
+        pads: dict[FrameRef, FrameRef] = {}
+        for alias, name in self.graph.node_sources.items():
+            made = self.graph.nodes[name]
+            counted: dict[StreamType, int] = {}
+            for pad, kind in enumerate(made.outputs):
+                index = counted.get(kind, 0)
+                counted[kind] = index + 1
+                ref = f"src:{alias}:{_TYPE_MARKERS[kind]}:{index}"
+                pads[ref] = name if len(made.outputs) == 1 else f"{name}:{pad}"
+        for node in self.graph.nodes.values():
+            node.inputs = [pads.get(ref, ref) for ref in node.inputs]
+        for unit in self.graph.sinks:
+            for output in unit.outputs:
+                output.ref = pads.get(output.ref, output.ref)
+        self.graph.rows_sinks = {
+            pads.get(ref, ref): sink for ref, sink in self.graph.rows_sinks.items()
+        }
 
     # -- FROM <source>(<values>) alias over a VALUES module: a URL table ----
 
@@ -9498,6 +9854,12 @@ class _Lowerer:
             declared, described, call, inner, select, env, {}, first=1
         )
         params_json = json.dumps(params, sort_keys=True) if params else ""
+        read_ref = f"src:{raw.source}:{_TYPE_MARKERS[kind]}:{index}"
+        port, wants, bound = (
+            self._node_rows_port(declared, described, params, read_ref, inner, select)
+            if described.node
+            else ("", described.wants, "")
+        )
         read = PacketRead(
             spec=spec,
             input_args=flags,
@@ -9505,7 +9867,9 @@ class _Lowerer:
             index=index,
             module=declared.module,
             params=params_json,
-            wants=described.wants,
+            wants=wants,
+            port=port,
+            bound=bound,
         )
         key = packet_rows_key(
             spec,
@@ -9515,7 +9879,7 @@ class _Lowerer:
             declared.module,
             module_digest(declared.module),
             params_json,
-            described.wants,
+            wants,
         )
         written = cached_packet_rows(key)
         if written is None:
@@ -9571,7 +9935,7 @@ class _Lowerer:
                 hint="this is a compiler bug; please report the query that "
                 "produced it",
             )
-        if described.world not in WORLDS:
+        if described.world not in WORLDS and not described.node:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
                 f"the module '{declared.module}' targets {described.world}, and "
@@ -9591,6 +9955,11 @@ class _Lowerer:
                 hint=f"a module carries one export; write '{described.name}' as "
                 "the export",
             )
+        if described.node:
+            # A node reading the packets: what its shape says of the port is
+            # checked where the call's params are known.
+            self._check_packet_rows_schema(declared, described, node, select)
+            return described
         if not described.packet_sink:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
@@ -9624,6 +9993,46 @@ class _Lowerer:
             )
         self._check_packet_rows_schema(declared, described, node, select)
         return described
+
+    def _node_rows_port(
+        self,
+        declared: WasmFunction,
+        described: Described,
+        params: Mapping[str, object],
+        read: FrameRef,
+        node: exp.Anonymous,
+        select: exp.Select,
+    ) -> tuple[str, SinkWants, str]:
+        """The port a node read in FROM is handed the stream `read` on, how
+        much of it the port asks for, and the bound list its shape was asked
+        with, as JSON.
+
+        Its shape for the call's params, with that port bound, has to read
+        coded packets there and make no output: what the read binds is the
+        rows the node emits beside its ports.
+        """
+        name = declared.params[0].name
+        bound = [Binding(name, (StreamHint(self._stream_rate(read)),))]
+        shape = self._node_shape(declared, described, params, bound, node, select)
+        port = shape.input(name)
+        if port is None or port.kind != "packets" or shape.outputs:
+            said = (
+                f"has no input '{name}'"
+                if port is None
+                else f"reads {port.kind} on '{name}'"
+                if port.kind != "packets"
+                else "makes outputs of its own"
+            )
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"function '{declared.name}' returns rows read off a stream's "
+                f"packets, and the module '{declared.module}' {said}",
+                node,
+                fallback=select,
+                hint=f"a node read in FROM takes coded packets on '{name}' and "
+                "emits rows alone; declare this one as what it is",
+            )
+        return name, _sink_wants(port.accepts.wants), bound_json(bound)
 
     def _check_packet_rows_schema(
         self,
@@ -10033,7 +10442,7 @@ class _Lowerer:
                 if isinstance(env.bindings.get(alias), _RowBinding)
                 or _reads_cte_value(alias, conjunct, env)
             }
-            if not rows:
+            if not rows or self._ends_node_source(conjunct, aliases):
                 time_conjuncts.append(conjunct)
                 continue
             if aliases - rows and len(rows) == 1 and self._is_row_window(conjunct, env):
@@ -10053,6 +10462,21 @@ class _Lowerer:
                 )
             row_conjuncts.append(conjunct)
         return time_conjuncts, row_conjuncts, assertion_conjuncts
+
+    def _ends_node_source(self, conjunct: exp.Expr, aliases: set[str]) -> bool:
+        """Whether `conjunct` bounds the time of a node read in FROM: its
+        relation rows are renditions, and its time is the node's own."""
+        parsed = _time_bounds(conjunct)
+        if parsed is None:
+            return False
+        column = parsed[0]
+        table = column.args.get("table")
+        return (
+            table is not None
+            and aliases == {_fold(table)}
+            and _fold(table) in self.graph.node_sources
+            and _fold(column.this) == TIME_COLUMN
+        )
 
     def _check_row_window_seeks_a_file(
         self, conjunct: exp.Expr, where: exp.Where, env: _Env
@@ -11289,7 +11713,9 @@ class _Lowerer:
                     hint=_TIME_HINT,
                 )
             column, low, high, strict = parsed
-            if strict:
+            table_node = column.args.get("table")
+            ticks = table_node is not None and _fold(table_node) in self.graph.node_sources
+            if strict and not ticks:
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,
                     "strict inequalities are not supported",
@@ -11297,7 +11723,6 @@ class _Lowerer:
                     fallback=where,
                     hint=_TIME_HINT,
                 )
-            table_node = column.args.get("table")
             if table_node is None:
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,
@@ -11307,6 +11732,15 @@ class _Lowerer:
                     hint=_TIME_HINT,
                 )
             alias = _fold(table_node)
+            if ticks and low is not None:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"'{alias}' is a node read in FROM, so it starts at 0 and "
+                    f"'WHERE {alias}.t' can only end it",
+                    conjunct,
+                    fallback=where,
+                    hint=f"write an end alone, e.g. WHERE {alias}.t < 10",
+                )
             if _fold(column.this) != TIME_COLUMN:
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,
@@ -11366,7 +11800,9 @@ class _Lowerer:
                 self._window_of(alias, low_node, high_node, env, row, select)
                 for row in rows
             ]
-            if isinstance(env.bindings[alias], _InputBinding):
+            if isinstance(env.bindings[alias], _InputBinding) or (
+                alias in self.graph.node_sources
+            ):
                 if any(
                     opt.name == "seek_end"
                     for opt in self.res.input_options.get(alias, ())
@@ -11660,6 +12096,12 @@ class _Lowerer:
 
     def _lower_stream_expr(self, node: exp.Expr, env: _Env, select: exp.Select) -> _Value:
         node = _unwrap(node)
+        self._check_older_world(node)
+        # A node's outputs are its own, whatever the declaration would mean to
+        # a module of an older world.
+        lowered = self._lower_node_expr(node, env, select)
+        if lowered is not None:
+            return lowered
         # An array of cue records IS a subtitle track, so it lowers here, in a
         # stream position, and not as an output column the way `chapters` does.
         cues = self._lower_cue_array(node, env, select)
@@ -12911,7 +13353,12 @@ class _Lowerer:
                 select,
             )
             return row.stream
-        if self.table_mode or self.manifest is not None or self.row_reading_sink:
+        if (
+            self.table_mode
+            or self.manifest is not None
+            or self.row_reading_sink
+            or self.null_port_read
+        ):
             return _Stream(ref=_NULL_STREAM_REF, type=binding.type, source=None)
         fill = _FILL_SPELLINGS.get(binding.type)
         hint = (
@@ -13883,6 +14330,7 @@ class _Lowerer:
             or self.row_reading_sink
             or self.cte_body
             or self.array_agg_reads_nulls
+            or self.null_port_read
         )
 
     def _cte_cell_column(self, binding: _CteBinding, column: _Column) -> bool:
@@ -14546,6 +14994,8 @@ class _Lowerer:
         first: int,
         params_schema: Mapping[str, object] | None = None,
         ports: _Ports | None = None,
+        written: Mapping[str, exp.Expr] | None = None,
+        value_params: Sequence[Parameter] | None = None,
     ) -> dict[str, object]:
         """The value arguments as the module's own parameters, schema-checked.
 
@@ -14561,18 +15011,23 @@ class _Lowerer:
         whose parameters belong to one FUNCTION of the module rather than to
         the module's single export. `ports` is what the call's feeders
         settled: a port the host picked is written here, whatever the
-        declaration's DEFAULT says.
+        declaration's DEFAULT says. `written` and `value_params` are a node
+        call's, whose values stand anywhere among its ports.
         """
         schema_source = (
             described.params_schema if params_schema is None else params_schema
         )
         properties = schema_source.get("properties")
         known = properties if isinstance(properties, dict) else {}
-        self._check_value_param_schemas(declared, known, node, select)
-        written = self._wasm_written(declared, call, node, select, first=first, ports=ports)
+        values = declared.value_params if value_params is None else tuple(value_params)
+        self._check_value_param_schemas(declared, known, node, select, values)
+        if written is None:
+            written = self._wasm_written(
+                declared, call, node, select, first=first, ports=ports
+            )
         owned = ports.owned if ports is not None else {}
         params: dict[str, object] = {}
-        for param in declared.value_params:
+        for param in values:
             argument = written.get(param.name)
             anchor = argument if argument is not None else node
             value: RowValue
@@ -14596,7 +15051,7 @@ class _Lowerer:
                     hint=_declares_params(known),
                 )
             self._check_wasm_param(param.name, value, schema, anchor, select)
-            params[param.name] = value
+            params[param.name] = _as_scalar_type(value, schema)
         return params
 
     def _wasm_written(
@@ -14705,6 +15160,7 @@ class _Lowerer:
         known: Mapping[str, object],
         node: exp.Expr,
         select: exp.Select,
+        values: Sequence[Parameter] | None = None,
     ) -> None:
         """Every value parameter the declaration names, against what SQL can write.
 
@@ -14715,7 +15171,7 @@ class _Lowerer:
         here beats the module failing on a key it never got. A schema naming
         nothing judgeable is left alone, as it is at the argument.
         """
-        for param in declared.value_params:
+        for param in declared.value_params if values is None else values:
             kinds = _schema_types(known.get(param.name))
             if not kinds or any(kind in _JSON_TYPES for kind in kinds):
                 continue
@@ -15309,6 +15765,12 @@ class _Lowerer:
         :meth:`_written_annotation` lowers the producer once and hands back
         the pad the module reads.
         """
+        if declared.is_sink and self._node_module(declared) is not None:
+            return self._lower_node_sink(node, declared, call, env, select)
+        if self._node_module(declared) is not None:
+            lowered = self._lower_node_expr(node, env, select)
+            assert lowered is not None  # a call to a node module
+            return lowered
         described = self._described(declared, node, select)
         if declared.is_packets:
             return self._lower_packets_call(
@@ -15475,6 +15937,925 @@ class _Lowerer:
             rows=self._row_elements(per_row, env),
         )
         return lowered
+
+    # -- nodes --
+
+    def _node_module(self, declared: WasmFunction) -> Described | None:
+        """The describe of `declared`'s module, where that module is a node."""
+        described = self.describes.get(declared.module)
+        return described if described is not None and described.node else None
+
+    def _check_declared_worlds(self) -> None:
+        """A declaration only a node can carry, naming a module that is not one."""
+        for declared in self.res.wasm.values():
+            if declared.refusal is not None and self._node_module(declared) is None:
+                raise declared.refusal
+
+    def _node_call(
+        self, node: exp.Expr
+    ) -> tuple[exp.Anonymous, WasmFunction, str | None] | None:
+        """``<call>`` or ``<call>.<field>`` over a call to a node module: the
+        call, its declaration and the field read. None for anything else."""
+        node = _unwrap(node)
+        field_name: str | None = None
+        base: exp.Expr = node
+        if isinstance(node, exp.Dot):
+            identifier = node.args.get("expression")
+            inner = _unwrap(node.this) if isinstance(node.this, exp.Expr) else None
+            if not isinstance(identifier, exp.Identifier) or not isinstance(
+                inner, exp.Anonymous
+            ):
+                return None
+            field_name, base = _fold(identifier), inner
+        if not isinstance(base, exp.Anonymous):
+            return None
+        declared = self.res.wasm.get(str(base.name).lower())
+        if declared is None or declared.is_sink or self._node_module(declared) is None:
+            return None
+        return base, declared, field_name
+
+    def _check_older_world(self, node: exp.Expr) -> None:
+        """What resolve kept for a module of an older world, raised for one.
+
+        A call or field read only a node makes sense of carries the refusal
+        an older module earns; a node module reads it as written.
+        """
+        refusal = _unwrap(node).meta.get(OLDER_WORLD)
+        if isinstance(refusal, FfrwdError) and self._node_call(node) is None:
+            raise refusal
+
+    def _node_output(
+        self,
+        declared: WasmFunction,
+        field_name: str | None,
+        node: exp.Expr,
+        select: exp.Select,
+    ) -> Parameter:
+        """The declared output a call read whole, or the field it read, names."""
+        outputs = declared.outputs or ()
+        if field_name is not None:
+            found = next((o for o in outputs if o.name == field_name), None)
+            if found is not None:
+                return found
+            listed = ", ".join(f"'{o.name}'" for o in outputs if o.name)
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"{declared.name}() returns no field '{field_name}'",
+                node,
+                fallback=select,
+                hint=f"it returns {listed}" if listed else declared.signature,
+            )
+        if len(outputs) == 1 and not outputs[0].name:
+            return outputs[0]
+        fields = ", ".join(f".{o.name}" for o in outputs if o.name)
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"{declared.name}() returns {declared.written_returns}, and a struct "
+            "is not a stream",
+            node,
+            fallback=select,
+            hint=f"read one output off the call: it writes {fields}"
+            if fields
+            else declared.signature,
+        )
+
+    def _node_output_kind(self, declared: WasmFunction, field_name: str | None) -> str:
+        """The kind of what a node call or field read is, for the classifier."""
+        outputs = declared.outputs or ()
+        if field_name is not None:
+            found = next((o for o in outputs if o.name == field_name), None)
+        else:
+            found = outputs[0] if len(outputs) == 1 and not outputs[0].name else None
+        return _UNSUPPORTED_KIND if found is None else _port_kind(found)
+
+    def _lower_node_expr(
+        self, node: exp.Expr, env: _Env, select: exp.Select
+    ) -> _Value | None:
+        """A call to a node module, or a field read off one; None for anything else.
+
+        Every read of one call is one instance (:meth:`_node_instances`), so a
+        caption track and a module reading the same rows read one node's
+        output, split.
+        """
+        found = self._node_call(node)
+        if found is None:
+            return None
+        base, declared, field_name = found
+        refusal = base.meta.get(NODE_REFUSAL)
+        if isinstance(refusal, FfrwdError):
+            raise refusal
+        call = _call_parts(base)
+        assert call is not None  # an Anonymous always splits
+        output = self._node_output(declared, field_name, node, select)
+        if declared.is_packets:
+            self._check_packets_position(declared, base, select)
+        made = len(self.graph.nodes)
+        instances, broadcast = self._node_instances(base, declared, call, env, select)
+        if declared.is_packets:
+            # Each new instance reads what the destination encodes, which the
+            # destination settles once its options are known.
+            self.packet_filter_calls.extend(
+                (instance.ref, declared, base, select)
+                for instance in instances
+                if instance.ref in list(self.graph.nodes)[made:]
+            )
+        if (
+            field_name is not None
+            and _unwrap(node).meta.get(STAR_FIELD)
+            and any(instance.shape.output(field_name) is None for instance in instances)
+        ):
+            raise _UnmadeField(field_name)
+        streams = tuple(
+            _Stream(ref=ref, type=kind)
+            for ref, kind in (
+                self._node_pad(instance, declared, output, base, select)
+                for instance in instances
+            )
+        )
+        value = _Value(
+            type=streams[0].type,
+            streams=streams,
+            is_array=broadcast,
+        )
+        return self._row_filtered(value, _unwrap(node))
+
+    def _node_written(
+        self,
+        declared: WasmFunction,
+        call: _Call,
+        node: exp.Expr,
+        select: exp.Select,
+    ) -> dict[str, exp.Expr]:
+        """Each parameter the call writes, ports and values alike, keyed by name.
+
+        The positionals fill the signature in declared order and each name the
+        one it names, as resolve already checked.
+        """
+        written: dict[str, exp.Expr] = {}
+        positional = self._spread_node_outputs(spread(call.args))
+        for param, argument in zip(declared.params, positional):
+            written[param.name] = argument
+        for named in call.named:
+            if not any(p.name == named.name for p in declared.params):
+                raise _error(
+                    ErrorCode.UDF_ARG_TYPE,
+                    f"{declared.name}() has no parameter '{named.name}'",
+                    named.value,
+                    fallback=node,
+                    hint=declared.signature,
+                )
+            written[named.name] = named.value
+        if len(positional) > len(declared.params):
+            raise _error(
+                ErrorCode.UDF_ARG_TYPE,
+                f"{declared.name}() got {len(positional)} arguments, but it declares "
+                f"{len(declared.params)}",
+                node,
+                fallback=select,
+                hint=declared.signature,
+            )
+        return written
+
+    def _spread_node_outputs(self, arguments: Sequence[exp.Expr]) -> list[exp.Expr]:
+        """A node call read whole where it makes a stream and the rows beside it,
+        as those two fields read off it, in its own order."""
+        spread_out: list[exp.Expr] = []
+        for argument in arguments:
+            found = self._node_call(argument)
+            outputs = found[1].outputs or () if found is not None else ()
+            two_part = (
+                found is not None
+                and found[2] is None
+                and len(outputs) == 2
+                and outputs[0].annotation is None
+                and outputs[1].annotation is not None
+            )
+            if found is None or not two_part:
+                spread_out.append(argument)
+                continue
+            spread_out.extend(
+                exp.Dot(this=found[0].copy(), expression=exp.to_identifier(output.name))
+                for output in outputs
+            )
+        return spread_out
+
+    def _lower_port(
+        self,
+        declared: WasmFunction,
+        param: Parameter,
+        argument: exp.Expr,
+        env: _Env,
+        select: exp.Select,
+    ) -> _Value:
+        """One port's argument: a stream, rows, or an array of either.
+
+        A column handed to a port declared DEFAULT NULL may be NULL where an
+        outer join left it so; the instance it falls to leaves the port
+        unbound.
+        """
+        inner = _unwrap(argument)
+        if isinstance(inner, exp.Array) and inner.expressions:
+            elements = [
+                self._lower_expr(element, env, select)
+                for element in inner.expressions
+                if isinstance(element, exp.Expr)
+            ]
+            streams = tuple(stream for value in elements for stream in value.streams)
+            value = _Value(type=elements[0].type, streams=streams, is_array=True)
+        else:
+            reading = self.null_port_read
+            self.null_port_read = isinstance(param.default, exp.Null) and isinstance(
+                inner, exp.Column
+            )
+            try:
+                value = self._lower_expr(argument, env, select)
+            finally:
+                self.null_port_read = reading
+        wanted = _port_kind(param)
+        got = next((s.type for s in value.streams if s.type != wanted), None)
+        if got is not None:
+            raise _error(
+                ErrorCode.UDF_ARG_TYPE,
+                f"{declared.name}() takes {param.type} as its '{param.name}' "
+                f"argument, and its argument is a {got} stream",
+                argument,
+                fallback=select,
+                hint=declared.signature,
+            )
+        return value
+
+    def _node_instances(
+        self,
+        base: exp.Anonymous,
+        declared: WasmFunction,
+        call: _Call,
+        env: _Env,
+        select: exp.Select,
+    ) -> tuple[tuple[_NodeInstance, ...], bool]:
+        """The node instances a call is: one, or one per element it broadcasts over,
+        and whether it broadcasts.
+
+        A port declared without ``[]`` given an array is one instance per
+        element, as a filter is; a value read off a row is one per row. A
+        call written twice in one branch is lowered once, and two calls whose
+        module, inputs and params agree are one instance wherever they are
+        written (:meth:`_node_instance`).
+        """
+        key = (base.sql(), id(env))
+        found = self._node_calls.get(key)
+        if found is not None:
+            return found
+        described = self._node_module(declared)
+        assert described is not None  # what `_node_call` checked
+        self._check_node_export(declared, described, base, select)
+        written = self._node_written(declared, call, base, select)
+        params_by_name = {param.name: param for param in declared.params}
+        ports: dict[str, exp.Expr] = {}
+        values: dict[str, exp.Expr] = {}
+        for name, argument in written.items():
+            if not is_port(params_by_name[name]):
+                values[name] = argument
+            elif not isinstance(_unwrap(argument), exp.Null):
+                ports[name] = argument
+        node_values = tuple(param for param in declared.params if not is_port(param))
+        numbers = {name: arg for name, arg in ports.items() if is_number_argument(arg)}
+        streams = {
+            name: value
+            for name, argument in ports.items()
+            if name not in numbers
+            and not _is_null(
+                value := self._lower_port(declared, params_by_name[name], argument, env, select)
+            )
+        }
+        tuples = env.relation.tuples if env.relation is not None else []
+        per_row = any(_reads_row_column(argument, env) for argument in values.values())
+        broadcast = {
+            name: value
+            for name, value in streams.items()
+            if value.is_array and not is_array(params_by_name[name].type)
+        }
+        length = self._node_length(declared, base, broadcast, per_row, len(tuples), select)
+        instances: list[_NodeInstance] = []
+        for element in range(1 if length is None else length):
+            row = tuples[element] if per_row and element < len(tuples) else (
+                tuples[0] if len(tuples) == 1 else {}
+            )
+            bound_values: dict[str, _Value] = {}
+            for name, value in streams.items():
+                one = _scalar(value.at(element)) if name in broadcast else value
+                if not _is_null(one):
+                    bound_values[name] = one
+            params = self._wasm_params(
+                declared, described, call, base, select, env, row, first=0,
+                written=values, value_params=node_values,
+            )
+            shape_params = params
+            if per_row:
+                fixed = {
+                    name: argument
+                    for name, argument in values.items()
+                    if not _reads_row_column(argument, env)
+                }
+                shape_params = self._wasm_params(
+                    declared, described, call, base, select, env, {}, first=0,
+                    written=fixed, value_params=node_values,
+                )
+            instances.append(
+                self._node_instance(
+                    declared,
+                    described,
+                    params,
+                    shape_params,
+                    bound_values,
+                    numbers,
+                    values,
+                    base,
+                    select,
+                )
+            )
+        self._node_calls[key] = (tuple(instances), length is not None)
+        return self._node_calls[key]
+
+    def _check_node_export(
+        self,
+        declared: WasmFunction,
+        described: Described,
+        node: exp.Expr,
+        select: exp.Select,
+    ) -> None:
+        """The export a declaration names, against the one its module carries."""
+        if not described.name or described.name == declared.export:
+            return
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"function '{declared.name}' names the export '{declared.export}', "
+            f"and '{declared.module}' exports '{described.name}'",
+            node,
+            fallback=select,
+            hint=f"a module carries one node; write '{described.name}' as the export",
+        )
+
+    def _node_length(
+        self,
+        declared: WasmFunction,
+        base: exp.Anonymous,
+        broadcast: Mapping[str, _Value],
+        per_row: bool,
+        rows: int,
+        select: exp.Select,
+    ) -> int | None:
+        """How many instances a call broadcasts to, or None for one."""
+        lengths = {name: len(value.streams) for name, value in broadcast.items()}
+        if per_row:
+            lengths["the rows its values are read off"] = rows
+        if not lengths:
+            return None
+        distinct = sorted(set(lengths.values()))
+        if len(distinct) > 1:
+            named = ", ".join(f"{name} has {count}" for name, count in lengths.items())
+            raise _error(
+                ErrorCode.BROADCAST_MISMATCH,
+                f"{declared.name}() cannot broadcast over arrays of different "
+                f"lengths: {named}",
+                base,
+                fallback=select,
+                hint=_ZIP_HINT,
+            )
+        return distinct[0]
+
+    def _node_shape(
+        self,
+        declared: WasmFunction,
+        described: Described,
+        params: Mapping[str, object],
+        bound: Sequence[Binding],
+        base: exp.Anonymous,
+        select: exp.Select,
+    ) -> NodeShape:
+        """The module's shape for this call, said at the call when it refuses."""
+        try:
+            return self.shapes(
+                declared.module,
+                json.dumps(params, sort_keys=True),
+                bound,
+                _grant_args(described, declared.module),
+            )
+        except FfrwdError as err:
+            raise _error(
+                err.code, f"{declared.name}(): {err.message}", base, fallback=select,
+                hint=err.hint,
+            ) from None
+
+    def _node_instance(
+        self,
+        declared: WasmFunction,
+        described: Described,
+        params: dict[str, object],
+        shape_params: dict[str, object],
+        streams: Mapping[str, _Value],
+        numbers: Mapping[str, exp.Expr],
+        written: Mapping[str, exp.Expr],
+        base: exp.Anonymous,
+        select: exp.Select,
+    ) -> _NodeInstance:
+        """One instance: the shape for its params and bound ports, checked
+        against the declaration, and the node it is. `written` is the values
+        the call wrote, which a port number may not write again.
+
+        A run-time lateral's stream on an input the module holds on a port
+        binds nothing: the port is one the host listens on for this compile,
+        written into the param, and the lateral's instances connect to it,
+        one connection per hold group, as a feeder's do.
+        """
+        fed = {
+            name: value
+            for name, value in streams.items()
+            if value.streams
+            and all(_lateral_parts(stream.ref) is not None for stream in value.streams)
+        }
+        # A lateral's port is bound, to the host's own stream, so the shape
+        # is asked with it; what it binds in the network is nothing.
+        bound = [
+            Binding(
+                param.name,
+                tuple(
+                    StreamHint(None if param.name in fed else self._stream_rate(stream.ref))
+                    for stream in streams[param.name].streams
+                ),
+            )
+            for param in declared.ports
+            if param.name in streams
+        ]
+        streams = {name: value for name, value in streams.items() if name not in fed}
+        held = {
+            name: self._held_port(declared, name, argument, base, select)
+            for name, argument in numbers.items()
+        }
+        shape = self._node_shape(declared, described, shape_params, bound, base, select)
+        rated = _conformed(shape, bound)
+        if rated != bound:
+            bound = rated
+            shape = self._node_shape(declared, described, shape_params, bound, base, select)
+        self._check_node_ports(declared, shape, {**streams, **fed}, numbers, base, select)
+        ports: dict[str, object] = {}
+        for name, argument in numbers.items():
+            port = shape.input(name)
+            hold = port.pairing.hold if port is not None else None
+            if hold is None or hold.port_param is None:
+                raise _error(
+                    ErrorCode.UDF_ARG_TYPE,
+                    f"{declared.name}() takes '{name}' as a stream, and the call "
+                    "writes a number there",
+                    argument,
+                    fallback=base,
+                    hint="a number stands for a port only where the module holds "
+                    "an input on a port it names; pass a stream here",
+                )
+            if hold.port_param in written:
+                raise _error(
+                    ErrorCode.UDF_ARG_TYPE,
+                    f"{declared.name}() writes '{hold.port_param}' twice: as a "
+                    f"number in '{name}' and as itself",
+                    argument,
+                    fallback=base,
+                    hint=f"write the port once: {declared.signature}",
+                )
+            ports[hold.port_param] = held[name]
+        self._check_grouped_data(declared, shape, streams, base, select)
+        feeds: list[tuple[int, _Fed, Described]] = []
+        for name, lateral in fed.items():
+            first_stream = lateral.streams[0]
+            port = shape.input(name)
+            hold = _group_hold(shape, port) if port is not None else None
+            if port is None or hold is None or hold.port_param is None:
+                raise self._lateral_refusal(first_stream.ref, f"{declared.name}()", base)
+            listed = _param_takes_list(described, hold.port_param)
+            if len(lateral.streams) > 1 and not listed:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"{declared.name}() hands '{name}' {len(lateral.streams)} run-time "
+                    f"laterals, each a connection on a port of its own, and the module "
+                    f"'{declared.module}' takes one port in '{hold.port_param}'",
+                    base,
+                    fallback=select,
+                    hint=f"rebuild the module taking '{hold.port_param}' as an array of "
+                    "ports, or feed it one lateral",
+                )
+            if hold.port_param in written:
+                raise _error(
+                    ErrorCode.UDF_ARG_TYPE,
+                    f"{declared.name}() writes '{hold.port_param}', and '{name}' is "
+                    "fed by a run-time lateral, which takes a port of its own",
+                    written[hold.port_param],
+                    fallback=base,
+                    hint=f"leave '{hold.port_param}' out of the call",
+                )
+            # What the lateral's instances write is what the port takes,
+            # conformed by them as a feeder's are.
+            taken = port.accepts
+            conformed = replace(
+                described,
+                pixel_formats=taken.pixel_formats or WIRE_PIX_FMTS[:1],
+                sample_formats=taken.sample_formats or WIRE_SAMPLE_FMTS[:1],
+                sample_rates=taken.sample_rates,
+                channel_counts=taken.channel_counts,
+            )
+            numbers_given: list[int] = []
+            for stream in lateral.streams:
+                one = _Fed(
+                    Feeder(
+                        input=0,
+                        port_param=hold.port_param,
+                        kind=stream.type,
+                        group=hold.group or hold.port_param,
+                    ),
+                    next(param for param in declared.ports if param.name == name),
+                    stream,
+                    self._stream_sources(stream.ref),
+                    base,
+                )
+                number = self._feeder_port(one, select)
+                if number not in numbers_given:
+                    numbers_given.append(number)
+                feeds.append((number, one, conformed))
+            ports[hold.port_param] = numbers_given if listed else numbers_given[0]
+        if ports:
+            # The port is one of the call's params, and the shape is asked
+            # for the params the call ends up with.
+            params.update(ports)
+            shape = self._node_shape(
+                declared, described, {**shape_params, **ports}, bound, base, select
+            )
+        inputs: list[FrameRef] = []
+        names: list[str] = []
+        for port in shape.inputs:
+            value = streams.get(port.name)
+            if value is None:
+                continue
+            for stream in value.streams:
+                inputs.append(stream.ref)
+                names.append(port.name)
+            if port.kind == "data" and port.schema is not None:
+                self._match_rows(declared, port, value, base, select)
+        bound_kinds = {
+            name: value.streams[0].type for name, value in streams.items() if value.streams
+        }
+        kinds = [_output_kind(shape, output, bound_kinds) for output in shape.outputs]
+        key = (
+            declared.module,
+            declared.export,
+            tuple(zip(names, inputs)),
+            json.dumps(params, sort_keys=True),
+        )
+        found = self._node_refs.get(key)
+        if found is not None:
+            return found
+        ref = self.ctx.node(declared.module, params, inputs, kinds)
+        made = self.graph.nodes[ref]
+        made.ports = names
+        made.out_ports = [output.name for output in shape.outputs]
+        made.bound = bound_json(bound)
+        self.graph.node_shapes[ref] = dict(shape.raw)
+        self._emits_rows(ref, described)
+        clock = shape.clock.port if shape.clock.port in names else None
+        timed = inputs[names.index(clock)] if clock is not None else (inputs or [""])[0]
+        for number, one, feeding in feeds:
+            # The programme a feed is shaped by is the call's own stream of
+            # its kind, else the clock's.
+            programme = next(
+                (read for read in inputs if ref_type(self.graph, read) == one.stream.type),
+                timed,
+            )
+            self._feed(number, one, ref, programme, declared, feeding)
+        for name, value in streams.items():
+            for stream in value.streams:
+                said = self._written_tags(stream)
+                if said:
+                    self.graph.stream_tags[stream.ref] = said
+        instance = _NodeInstance(ref=ref, shape=shape)
+        self._node_refs[key] = instance
+        return instance
+
+    def _stream_rate(self, ref: FrameRef) -> Fraction | None:
+        """The rate a node's shape is told the stream `ref` runs at."""
+        return stream_rate(self.graph, self.probes, self._made_shape, ref)
+
+    def _made_shape(self, name: str) -> NodeShape | None:
+        found = self._made_shapes.get(name)
+        raw = self.graph.node_shapes.get(name)
+        if found is None and raw is not None:
+            found = self._made_shapes[name] = node_shape(self.graph.nodes[name].filter, raw)
+        return found
+
+    def _check_grouped_data(
+        self,
+        declared: WasmFunction,
+        shape: NodeShape,
+        streams: Mapping[str, _Value],
+        base: exp.Anonymous,
+        select: exp.Select,
+    ) -> None:
+        """Refuse a stream bound to a data input whose hold group a port
+        serves: its rows arrive on that group's connection or not at all."""
+        for port in shape.inputs:
+            interval = port.pairing.interval
+            if interval is None or interval.group is None or port.name not in streams:
+                continue
+            served = [
+                one.name
+                for one in shape.inputs
+                if one.pairing.hold is not None
+                and one.pairing.hold.group == interval.group
+                and one.pairing.hold.port_param is not None
+                and one.name not in streams
+            ]
+            if not served:
+                continue
+            raise _error(
+                ErrorCode.UDF_ARG_TYPE,
+                f"{declared.name}() binds '{port.name}', which arrives on the "
+                f"connection of the group '{interval.group}', and '{served[0]}' of "
+                "that group is served by a port",
+                base,
+                fallback=select,
+                hint=f"hand '{port.name}' the rows of the run-time lateral feeding "
+                f"'{served[0]}', or bind the group's inputs to streams",
+            )
+
+    def _emits_rows(self, ref: FrameRef, described: Described) -> None:
+        """The rows a node emits beside its ports, where it says it does: one
+        more output, which the run writes as its rows, as a sink's are."""
+        if described.rows_schema is None:
+            return
+        made = self.graph.nodes[ref]
+        pad = len(made.outputs)
+        made.outputs = [*made.outputs, "data"]
+        made.out_ports = [*made.out_ports, EMITTED_ROWS_PORT]
+        self.graph.rows_sinks[f"{ref}:{pad}"] = RowsSink(container=_ROWS_CONTAINER)
+
+    def _written_tags(self, stream: _Stream) -> dict[str, str]:
+        """The tags the query wrote on `stream`, which nothing on the edge to
+        a node carries."""
+        if stream.source is None:
+            return {}
+        written = self._layered_tags().get(id(stream.source), {})
+        return {key: value for key, value in written.items() if value is not None}
+
+    def _held_port(
+        self,
+        declared: WasmFunction,
+        name: str,
+        argument: exp.Expr,
+        base: exp.Anonymous,
+        select: exp.Select,
+    ) -> int:
+        """A port number written where a held input goes: a whole number in range."""
+        value = _number(argument)
+        if isinstance(value, float) and value.is_integer():
+            value = int(value)
+        if not isinstance(value, int) or not 0 < value < 65536:
+            raise _error(
+                ErrorCode.UDF_ARG_TYPE,
+                f"{declared.name}()'s '{name}' is a port, and {_sql_text(argument)} "
+                "is not one",
+                argument,
+                fallback=base,
+                hint="a port is a whole number from 1 to 65535",
+            )
+        return value
+
+    def _check_node_ports(
+        self,
+        declared: WasmFunction,
+        shape: NodeShape,
+        streams: Mapping[str, _Value],
+        numbers: Mapping[str, exp.Expr],
+        base: exp.Anonymous,
+        select: exp.Select,
+    ) -> None:
+        """The declaration's ports against the shape's inputs.
+
+        A parameter the shape has no port for is fine left unbound and
+        refused bound, naming it; an input the module requires is bound; each
+        bound port is the kind the module reads there, and only a port taking
+        many is handed several.
+        """
+        declared_ports = {param.name: param for param in declared.ports}
+        for name in [*streams, *numbers]:
+            if shape.input(name) is not None:
+                continue
+            known = ", ".join(f"'{port.name}'" for port in shape.inputs) or "none"
+            raise _error(
+                ErrorCode.UDF_ARG_TYPE,
+                f"{declared.name}() binds '{name}', and for these params the module "
+                f"'{declared.module}' reads no input '{name}'",
+                base,
+                fallback=select,
+                hint=f"leave '{name}' out of this call; the inputs it reads here "
+                f"are {known}",
+            )
+        for port in shape.inputs:
+            param = declared_ports.get(port.name)
+            if param is None:
+                if port.required:
+                    raise _error(
+                        ErrorCode.UNSUPPORTED_SQL,
+                        f"the module '{declared.module}' requires an input "
+                        f"'{port.name}', and {declared.name}() declares none",
+                        base,
+                        fallback=select,
+                        hint=f"declare '{port.name}' as a "
+                        f"{_PORT_TYPE_NAMES[port.kind]} parameter",
+                    )
+                continue
+            if port.required and port.name not in streams and port.name not in numbers:
+                raise _error(
+                    ErrorCode.UDF_ARG_TYPE,
+                    f"{declared.name}() leaves '{port.name}' out, and the module "
+                    f"'{declared.module}' requires it",
+                    base,
+                    fallback=select,
+                    hint=f"pass a stream for '{port.name}': {declared.signature}",
+                )
+            coded = port.kind == "packets" and _port_kind(param) in ("video", "audio")
+            if _port_kind(param) != port.kind and not coded:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"{declared.name}() declares '{port.name}' as {param.type}, and "
+                    f"the module '{declared.module}' reads {port.kind} there",
+                    base,
+                    fallback=select,
+                    hint=f"declare '{port.name}' as a "
+                    f"{_PORT_TYPE_NAMES[port.kind]} parameter",
+                )
+            value = streams.get(port.name)
+            if value is not None and len(value.streams) > 1 and not port.many:
+                raise _error(
+                    ErrorCode.UDF_ARG_TYPE,
+                    f"{declared.name}() hands {len(value.streams)} streams to "
+                    f"'{port.name}', and the module '{declared.module}' reads one "
+                    "there",
+                    base,
+                    fallback=select,
+                    hint=f"pass one stream for '{port.name}'",
+                )
+
+    def _match_rows(
+        self,
+        declared: WasmFunction,
+        port: InputPort,
+        value: _Value,
+        base: exp.Anonymous,
+        select: exp.Select,
+    ) -> None:
+        """Rows a port reads against the rows its producer writes, by their schemas.
+
+        Every field the port's schema names has to be in the producer's, with
+        a type it takes; fields the producer writes beyond them pass.
+        """
+        assert port.schema is not None  # checked by the caller
+        for stream in value.streams:
+            written = self._written_rows(stream.ref)
+            if written is None:
+                continue
+            name, schema = written
+            mismatch = row_mismatch(port.schema, schema)
+            if mismatch is None:
+                continue
+            field_name, wants, writes = mismatch
+            said = "does not write it" if writes == "nothing" else f"writes {writes}"
+            raise _error(
+                ErrorCode.UDF_ARG_TYPE,
+                f"{declared.name}() reads '{field_name}' as {wants} on its "
+                f"'{port.name}' input, and {name}() {said}",
+                base,
+                fallback=select,
+                hint=f"pass rows carrying '{field_name}' as {wants}; a reader names "
+                "only the fields it reads, and a producer may write more",
+            )
+
+    def _written_rows(self, ref: FrameRef) -> tuple[str, Mapping[str, object]] | None:
+        """Who wrote the rows `ref` carries, and their schema as they arrive.
+
+        A filter over them passes them as they are; a span merge adds the
+        span's end, and writes the id it groups by as a whole number.
+        """
+        node = self.graph.nodes.get(ref)
+        if node is None or node.filter not in (ROWFILTER, ROWMERGE):
+            return self._data_schemas.get(ref)
+        under = self._written_rows(node.inputs[0])
+        if under is None or node.filter != ROWMERGE or MAX_SPAN not in node.args:
+            return under
+        name, schema = under
+        fields = schema.get("properties")
+        spanned = dict(fields) if isinstance(fields, dict) else {}
+        spanned["end_t"] = {"type": "number"}
+        if "id" in spanned:
+            spanned["id"] = {"type": "integer"}
+        return name, {**schema, "properties": spanned}
+
+    def _node_pad(
+        self,
+        instance: _NodeInstance,
+        declared: WasmFunction,
+        output: Parameter,
+        base: exp.Anonymous,
+        select: exp.Select,
+    ) -> tuple[FrameRef, StreamType]:
+        """The pad of `instance` a declared output reads, and its kind.
+
+        A named output is the module's output of that name; one unnamed is the
+        module's one output, or its one of the kind the RETURNS says.
+        """
+        shape = instance.shape
+        wanted = _port_kind(output)
+        made = self.graph.nodes[instance.ref].outputs
+        if output.name:
+            found = shape.output(output.name)
+            if found is None:
+                named = ", ".join(f"'{o.name}'" for o in shape.outputs) or "none"
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"{declared.name}() returns the field '{output.name}', and the "
+                    f"module '{declared.module}' makes no output '{output.name}'",
+                    base,
+                    fallback=select,
+                    hint=f"name the fields after the outputs it makes: {named}",
+                )
+        else:
+            kinds = [o for i, o in enumerate(shape.outputs) if made[i] == wanted]
+            if len(shape.outputs) == 1:
+                found = shape.outputs[0]
+            elif len(kinds) == 1:
+                found = kinds[0]
+            else:
+                listed = ", ".join(f"'{o.name}' ({o.kind})" for o in shape.outputs)
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"{declared.name}() returns {output.type}, and the module "
+                    f"'{declared.module}' makes "
+                    + (f"{len(kinds)} outputs of that kind" if kinds else "none of that kind"),
+                    base,
+                    fallback=select,
+                    hint=f"name the one to read with RETURNS STRUCT(<output> "
+                    f"<type>, ...); it makes {listed or 'nothing'}",
+                )
+        index = shape.outputs.index(found)
+        if made[index] != wanted:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"{declared.name}() returns {output.type}"
+                + (f" as '{output.name}'" if output.name else "")
+                + f", and the module '{declared.module}' writes {made[index]} there",
+                base,
+                fallback=select,
+                hint=f"declare it as {_PORT_TYPE_NAMES[made[index]]}",
+            )
+        ref = instance.ref if len(shape.outputs) == 1 else f"{instance.ref}:{index}"
+        if found.kind == "data":
+            schema = found.schema
+            if schema is None and output.annotation is not None:
+                schema = _record_schema(output.annotation)
+            if schema is not None:
+                self._data_schemas[ref] = (declared.name, schema)
+            if output.annotation is not None:
+                self._node_rows[ref] = (declared, output.annotation, base)
+        return ref, made[index]
+
+    def _node_rows_column(self, node: exp.Expr) -> bool:
+        """Whether `node` is a node's rows, through any spans reduced off them."""
+        node = _unwrap(node)
+        call = _call_parts(node)
+        if call is not None and call.is_macro and call.name.lower() == MERGE_SPANS:
+            return bool(call.args) and self._node_rows_column(call.args[0])
+        found = self._node_call(node)
+        if found is None:
+            return False
+        outputs = found[1].outputs or ()
+        if found[2] is None:
+            return len(outputs) == 1 and outputs[0].annotation is not None
+        return any(o.name == found[2] and o.annotation is not None for o in outputs)
+
+    def _node_rows_at_sink(
+        self, value: _Value, node: exp.Expr, env: _Env, select: exp.Select
+    ) -> _Value:
+        """A node's rows selected as a column: a track of their own, or the rows.
+
+        Rows read by another node stay a data stream; the ones a COPY writes
+        become what a module's rows have always become there, a rows file at a
+        rows destination and a subtitle track anywhere else. A one-element
+        array, the call under a track row a WHERE pinned, is its element.
+        """
+        if len(value.streams) != 1:
+            return value
+        stream = value.streams[0]
+        found = self._node_rows.get(self._under_rows_nodes(stream.ref))
+        if stream.type != "data" or found is None:
+            return value
+        declared, annotation, call = found
+        return self._rows_output(
+            stream.ref, "data", declared, annotation, call, node, env, select
+        )
 
     # -- feeders --
 
@@ -15778,8 +17159,11 @@ class _Lowerer:
                 connection.pix_fmt = wire_pix_fmt(described)
             if port not in use.ports:
                 use.ports.append(port)
-            for name, value in self._feed_shape(fed.stream.type, programme, described).items():
-                use.shape.setdefault(name, value)
+            if fed.stream.type != "data":
+                for name, value in self._feed_shape(
+                    fed.stream.type, programme, described
+                ).items():
+                    use.shape.setdefault(name, value)
             connection.streams[fed.stream.ref] = fed.stream
             return
         connection.streams[fed.stream.ref] = _Stream(
@@ -15911,7 +17295,8 @@ class _Lowerer:
             argument = call.args[0]
             got = self._classify(argument, env, select)
             value = self._lower_expr(argument, env, select) if got == "data" else None
-            if value is None or value.is_array or len(value.streams) != 1:
+            # A one-element array, a column of a one-row source, is its element.
+            if value is None or len(value.streams) != 1:
                 if value is not None:
                     shown = f"{len(value.streams)} of them"
                 elif got in _STREAM_KINDS:
@@ -15957,14 +17342,15 @@ class _Lowerer:
             else f"{use.declared.alias}.{column}"
         )
         kind = next(
-            WASM_STREAM_TYPES[c.type] for c in use.declared.columns if c.name == column
+            _LATERAL_KINDS[c.type] for c in use.declared.columns if c.name == column
         )
         return _error(
             ErrorCode.UNSUPPORTED_SQL,
             f"'{read}' comes from LATERAL {use.declared.call}, which starts a "
             "source per row of a data stream: it is empty between rows, and "
             f"{consumer} reads a frame on every tick. A run-time lateral's "
-            "streams can only go to a module input declared 'feeder'",
+            "streams can only go to a module input declared 'feeder', or a "
+            "node's input held on a port",
             anchor if anchor is not None else (reader or use.anchor),
             hint="pass it to a feeder, such as the second argument of "
             f"ffrwd.switch.{kind}(<programme>, {read})",
@@ -15985,14 +17371,23 @@ class _Lowerer:
             if not use.ports:
                 continue
             tap = self._free_port()
-            path = feeder_path(tap)
-            self.graph.sinks.append(
-                SinkUnit(
-                    outputs=[Output(ref=use.stream.ref, type="data", name=None, metadata={})],
-                    path=path,
-                    options={"format": _TAP_FORMAT},
+            # A node's messages are written by its own region, as NDJSON on a
+            # pipe the host reads; any other module's are copied to the port.
+            piped = use.stream.ref.partition(":")[0] in self.graph.node_shapes
+            if piped:
+                self.graph.rows_sinks[use.stream.ref] = RowsSink(
+                    container=_ROWS_CONTAINER, path=f"{TAP_DOCUMENT}{tap}"
                 )
-            )
+            else:
+                self.graph.sinks.append(
+                    SinkUnit(
+                        outputs=[
+                            Output(ref=use.stream.ref, type="data", name=None, metadata={})
+                        ],
+                        path=feeder_path(tap),
+                        options={"format": _TAP_FORMAT},
+                    )
+                )
             declared = use.declared
             line, col = _pos(use.anchor)
             shapes = {
@@ -16027,6 +17422,7 @@ class _Lowerer:
                     needs=declared.needs,
                     line=line,
                     col=col,
+                    pipe=piped,
                 )
             )
 
@@ -16504,11 +17900,23 @@ class _Lowerer:
         already encoded without touching a picture.
         """
         described = self.describes[declared.module]
-        inputs = self.graph.nodes[ref].inputs
+        filtered = self.graph.nodes[ref]
+        shape = node_shape(filtered.filter, self.graph.node_shapes[ref]) if (
+            ref in self.graph.node_shapes
+        ) else None
         seen: dict[str, int] = {}
         pads: list[dict[str, object]] = []
-        for input_ref in inputs:
+        for position, input_ref in enumerate(filtered.inputs):
             kind = ref_type(self.graph, input_ref)
+            port = shape.input(filtered.ports[position]) if shape is not None else None
+            if shape is not None and (port is None or port.kind != "packets"):
+                # A node's other inputs are not encoded for it: rows, or
+                # frames it reads as they are.
+                pads.append({})
+                continue
+            if port is not None:
+                described = replace(described, video_codecs=port.accepts.codecs or None)
+                described = replace(described, audio_codecs=port.accepts.codecs)
             index = seen.get(kind, 0)
             seen[kind] = index + 1
             if kind not in asked and self._copies_onto_sink(input_ref, kind, described):
@@ -16692,6 +18100,100 @@ class _Lowerer:
         # Nothing downstream reads a sink: the value carries no streams, the
         # way a rows projection's does not.
         return _Value(type=pads[0].type, streams=(), is_array=False)
+
+    def _lower_node_sink(
+        self,
+        node: exp.Expr,
+        declared: WasmFunction,
+        call: _Call,
+        env: _Env,
+        select: exp.Select,
+    ) -> _Value:
+        """A node at a COPY's TO: a sink, read as a packet sink is.
+
+        Its shape for the call's params has no outputs; its inputs take the
+        SELECT's streams by kind, coded packets fronted by the encoder the
+        COPY's WITH shapes, and data. Each input is a many-port, so how many
+        of each kind the query hands it is the query's to say. The node is
+        spelled by its ports in the network, and the rows it emits are the
+        run's, as a packet sink's are.
+
+        Which ports there are is asked with nothing bound; once the SELECT's
+        streams are on them, the shape is asked again with each port and a
+        hint per stream bound there, which is what the host asks at run time.
+        """
+        described = self._node_module(declared)
+        assert described is not None  # what the caller checked
+        at = _sink_stream_count(node, len(call.args))
+        anchor = _unwrap(node)
+        assert isinstance(anchor, exp.Anonymous)  # a sink call is one
+        params = self._wasm_params(
+            declared, described, call, node, select, env, {}, first=at
+        )
+        shape = self._node_shape(declared, described, params, [], anchor, select)
+        ports = self._node_sink_ports(declared, shape, node, select)
+        view = _sink_view(described, ports)
+        self._node_sinks[declared.module] = (view, shape)
+        value = self._lower_sink_call(node, declared, view, call, env, select)
+        ref = self.graph.module_sinks[-1]
+        made = self.graph.nodes[ref]
+        kinds = [ref_type(self.graph, read) for read in made.inputs]
+        named = {kind: port.name for kind, port in ports.items() if port is not None}
+        bound = [
+            Binding(
+                name,
+                tuple(
+                    StreamHint(self._stream_rate(read))
+                    for read, kind in zip(made.inputs, kinds)
+                    if named.get(kind) == name
+                ),
+            )
+            for name in dict.fromkeys(named[kind] for kind in kinds if kind in named)
+        ]
+        shape = self._node_shape(declared, described, params, bound, anchor, select)
+        ports = self._node_sink_ports(declared, shape, node, select)
+        named = {kind: port.name for kind, port in ports.items() if port is not None}
+        if any(kind not in named for kind in kinds):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"{declared.name}() returns sink, and with the streams the query "
+                f"hands it the module '{declared.module}' reads none of "
+                + ", ".join(sorted({kind for kind in kinds if kind not in named})),
+                node,
+                fallback=select,
+                hint="hand the sink only the kinds of stream its shape reads",
+            )
+        self._node_sinks[declared.module] = (_sink_view(described, ports), shape)
+        made.ports = [named[kind] for kind in kinds]
+        made.bound = bound_json(bound)
+        emits = described.rows_schema is not None
+        if emits:
+            made.outputs = ["data"]
+        made.out_ports = [EMITTED_ROWS_PORT] if emits else []
+        self.graph.node_shapes[ref] = dict(shape.raw)
+        return value
+
+    def _node_sink_ports(
+        self,
+        declared: WasmFunction,
+        shape: NodeShape,
+        node: exp.Expr,
+        select: exp.Select,
+    ) -> dict[str, InputPort | None]:
+        """The port a node sink's shape reads each kind of stream on, refused
+        where it makes outputs or reads no coded packets."""
+        ports = {kind: _sink_port(shape, kind) for kind in ("video", "audio", "data")}
+        if shape.outputs or ports["video"] is None and ports["audio"] is None:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"{declared.name}() returns sink, and the module '{declared.module}' "
+                + ("makes outputs" if shape.outputs else "reads no coded packets"),
+                node,
+                fallback=select,
+                hint="a node at a COPY's TO reads coded packets and data and makes "
+                "no output; declare this one as what it is",
+            )
+        return ports
 
     def _lower_row_reading_sink_call(
         self,
@@ -17054,7 +18556,8 @@ class _Lowerer:
         stream_param = macro.params[stream_pos]
         self._reject_null_stream(call.display, call.args[stream_pos], select)
         kind = self._classify(call.args[stream_pos], env, select)
-        self._reject_passthrough_args(call.display, [kind], call, call.args[stream_pos])
+        if stream_param.stream_type != "data":
+            self._reject_passthrough_args(call.display, [kind], call, call.args[stream_pos])
         if kind != stream_param.stream_type:
             hint = macro.kind_hints.get(
                 kind,
@@ -17137,6 +18640,16 @@ class _Lowerer:
                     fallback=node,
                     hint=f"its signature is {macro.signature}",
                 )
+        written_names = {argument.name for argument in call.named}
+        missing = next((name for name in macro.required if name not in written_names), None)
+        if missing is not None:
+            raise _error(
+                ErrorCode.UDF_ARG_TYPE,
+                f"{call.display}() needs '{missing}'",
+                node,
+                fallback=select,
+                hint=f"write it by name: {macro.signature}",
+            )
         per_row = any(_reads_row_column(argument.value, env) for argument in call.named)
         tuples = env.relation.tuples if per_row and env.relation is not None else []
         cache: dict[int, dict[str, object]] = {}
@@ -18549,6 +20062,9 @@ class _Lowerer:
             and not node.this.is_string
         ):
             return "num"
+        found = self._node_call(node)
+        if found is not None:
+            return self._node_output_kind(found[1], found[2])
         # An output of a data filter is a data stream.
         if _data_projection(node, self.res.wasm) is not None:
             return "data"
@@ -18643,6 +20159,7 @@ class _Lowerer:
 
     def run_table(self) -> list[TableSink]:
         """One :class:`~ffrwd.table.TableSink` per COPY, or one bare-select."""
+        self._check_declared_worlds()
         self._lower_ctes()
         self.table_mode = True
         sinks: list[TableSink] = []
@@ -19811,6 +21328,7 @@ def lower(
     probe_source: ProbeSource = wasm_probe_source,
     read_packets: ReadPackets = wasm_read_packet_rows,
     probe_path: ProbePath = probe_one_path,
+    shapes: Shape | None = None,
 ) -> Graph:
     """Lower a resolved query into an IR graph -- its FIRST command's.
 
@@ -19835,14 +21353,15 @@ def lower(
     call site's arguments, to fold its result -- a parameter for the same
     reason. `probe_source` runs one ``RETURNS source`` module's ``probe``,
     once per FROM alias that calls one, to bind its catalog -- a parameter
-    for the same reason.
+    for the same reason. `shapes` asks a node module for its shape per call,
+    and is one too.
 
     Raises ``FfrwdError`` — and nothing else — on every rejection.
     """
     return lower_commands(
         res, probes, registry=registry, on_warning=on_warning, describes=describes,
         invoke=invoke, probe_failures=probe_failures, probe_source=probe_source,
-        read_packets=read_packets, probe_path=probe_path,
+        read_packets=read_packets, probe_path=probe_path, shapes=shapes,
     )[0]
 
 
@@ -19858,6 +21377,7 @@ def lower_commands(
     probe_source: ProbeSource = wasm_probe_source,
     read_packets: ReadPackets = wasm_read_packet_rows,
     probe_path: ProbePath = probe_one_path,
+    shapes: Shape | None = None,
 ) -> list[Graph]:
     """Lower a resolved query into one IR graph per ffmpeg COMMAND.
 
@@ -19874,11 +21394,13 @@ def lower_commands(
     Same probing/registry contract as :func:`lower`; raises ``FfrwdError``
     -- and nothing else -- on every rejection.
     """
+    asked = shapes if shapes is not None else ShapeCache()
     try:
         shared = _Lowerer(
             res, probes, registry, fanout_sinks=True, on_warning=on_warning,
             describes=describes, invoke=invoke, probe_failures=probe_failures,
             probe_source=probe_source, read_packets=read_packets, probe_path=probe_path,
+            shapes=asked,
         )
         graph = shared.run()
         count = shared.fanout_count
@@ -19894,6 +21416,7 @@ def lower_commands(
                 res, probes, registry, fanout_index=index, on_warning=on_warning,
                 describes=describes, invoke=invoke, probe_failures=probe_failures,
                 probe_source=probe_source, read_packets=read_packets, probe_path=probe_path,
+                shapes=asked,
             ).run()
             for index in range(count)
         ]
@@ -19977,6 +21500,7 @@ def lower_table(
     probe_source: ProbeSource = wasm_probe_source,
     read_packets: ReadPackets = wasm_read_packet_rows,
     probe_path: ProbePath = probe_one_path,
+    shapes: Shape | None = None,
 ) -> list[TableSink]:
     """Lower a resolved TABLE query into its printable result set(s).
 
@@ -19991,7 +21515,7 @@ def lower_table(
         return _Lowerer(
         res, probes, registry, on_warning=on_warning, describes=describes, invoke=invoke,
         probe_failures=probe_failures, probe_source=probe_source,
-        read_packets=read_packets, probe_path=probe_path,
+        read_packets=read_packets, probe_path=probe_path, shapes=shapes,
     ).run_table()
     except FfrwdError:
         raise

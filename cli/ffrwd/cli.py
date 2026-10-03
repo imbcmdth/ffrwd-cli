@@ -70,10 +70,10 @@ Subcommands:
   package segment is the directory's name unless ``--name`` says otherwise;
   the namespace is ``--namespace``'s, or derived from the git remote's owner,
   or required. Refuses to overwrite any file it would write. ``--rust``
-  scaffolds a wasm module package instead of the bare one: a cargo crate
-  whose ``build.rs`` finds the wit, an ``invert`` module in Rust, the lib SQL
-  declaring it and a recipe calling it. ``cargo build --target wasm32-wasip2
-  --release`` then ``ffrwd publish`` is the whole path from there.
+  scaffolds a node module package instead of the bare one: a cargo crate on
+  the ffrwd-node SDK holding a ``passthrough`` node, the lib SQL declaring it
+  and a recipe calling it. ``cargo build --release --target wasm32-wasip2``
+  then ``ffrwd publish`` is the whole path from there.
 * ``search [TERM] [--json]`` -- ask the registry what it ranks for TERM and
   print it, most relevant first. No term browses everything; a term matching
   nothing is an empty table, exit 0.
@@ -191,7 +191,19 @@ from importlib import metadata
 from pathlib import Path
 from typing import Any
 
-from . import binaries, credentials, diagram, loudnorm, nn, redact, remote, show, store, wasm
+from . import (
+    binaries,
+    credentials,
+    diagram,
+    loudnorm,
+    nn,
+    redact,
+    remote,
+    show,
+    store,
+    timing,
+    wasm,
+)
 from . import packages as packages_module
 from . import publish as publish_module
 from . import registry as registry_module
@@ -541,6 +553,11 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="render the flowchart in the terminal (needs the diagram extra)",
     )
+    explain_view.add_argument(
+        "--delays",
+        action="store_true",
+        help="print each node's window and how far behind the source each output runs",
+    )
     validate_p = subparsers.add_parser("validate", help="check that a query compiles")
     _add_query_arguments(validate_p)
     _add_quiet_argument(validate_p)
@@ -685,7 +702,7 @@ def _build_parser() -> argparse.ArgumentParser:
     init_p.add_argument(
         "--rust",
         action="store_true",
-        help="scaffold a wasm module package: the Rust crate that builds it, "
+        help="scaffold a node module package: the Rust crate that builds it, "
         "the SQL declaring it, and a recipe calling it",
     )
 
@@ -1474,6 +1491,10 @@ def _cmd_explain(args: argparse.Namespace, on_warning: OnWarning) -> int:
         return 1
 
     graphs = compiled.graphs
+    if args.delays:
+        if compiled.timing is not None:
+            print(timing.summary(compiled.timing))
+        return 0
     if args.mermaid or args.diagram:
         text = diagram.render_diagram(graphs, compiled.plan)
         if args.mermaid:
@@ -1489,8 +1510,12 @@ def _cmd_explain(args: argparse.Namespace, on_warning: OnWarning) -> int:
     payload: object = graphs[0].to_dict() if len(graphs) == 1 else [
         graph.to_dict() for graph in graphs
     ]
-    if compiled.plan is not None:
-        payload = {"graph": payload, "plan": compiled.plan.to_dict()}
+    if compiled.plan is not None or compiled.timing is not None:
+        payload = {"graph": payload}
+        if compiled.plan is not None:
+            payload["plan"] = compiled.plan.to_dict()
+        if compiled.timing is not None:
+            payload["timing"] = compiled.timing.to_dict()
     print(json.dumps(payload, indent=2))
     return 0
 
@@ -2413,36 +2438,39 @@ COPY (
 ) TO :'dest'
 """
 
-# The wasm module scaffold `init --rust` writes on top of the manifest and the
+# The node module scaffold `init --rust` writes on top of the manifest and the
 # lockfile. One export and one recipe, both named for what the module does.
-_RUST_EXPORT = "invert"
+_RUST_EXPORT = "passthrough"
 _RUST_EXPORT_FILE = f"src/{_RUST_EXPORT}.sql"
-_RUST_RECIPE = "invert"
+_RUST_RECIPE = "passthrough"
 _RUST_RECIPE_FILE = f"recipes/{_RUST_RECIPE}.sql"
-_RUST_BUILD_FILE = "build.rs"
 _RUST_CARGO_FILE = "Cargo.toml"
 _RUST_SOURCE_FILE = "src/lib.rs"
 _RUST_IGNORE_FILE = store.IGNORE_NAME
 _RUST_GITIGNORE_FILE = store.GITIGNORE_NAME
 
-# The wit-bindgen the in-repo modules build with; the scaffold pins the same one.
-_WIT_BINDGEN_VERSION = "0.57.1"
+# The releases the scaffold's crate pins; ffrwd-node's speaks the world
+# `wasm.WORLD_VERSION` names, which the manifest depends on.
+_NODE_SDK_TAG = "v0.2.0"
+_FRAME_TAG = "v0.1.1"
+
+_RUST_BUILD_LINE = "cargo build --release --target wasm32-wasip2"
 
 # Where a built module lands, and what the lib SQL therefore names.
 _RUST_ARTIFACT = "target/wasm32-wasip2/release/{crate}.wasm"
 
-_RUST_CARGO = f"""\
+_RUST_CARGO = """\
 [package]
-name = "{{crate}}"
+name = "{crate}"
 version = "0.1.0"
 edition = "2021"
 
-# A wasm component: one cdylib, no binary.
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
-wit-bindgen = "{_WIT_BINDGEN_VERSION}"
+ffrwd-node = {{ git = "https://github.com/imbcmdth/ffrwd-node", tag = "{sdk_tag}" }}
+ffrwd-frame = {{ git = "https://github.com/imbcmdth/ffrwd-frame", tag = "{frame_tag}" }}
 
 [profile.release]
 opt-level = 3
@@ -2450,131 +2478,42 @@ lto = true
 strip = true
 """
 
-_RUST_BUILD = '''\
-// Puts the `ffrwd:av` wit where `wit_bindgen::generate!` reads it, from
-// whichever of the two sources is available: FFRWD_WIT_DIR when the
-// environment names one, else the `ffrwd/wasm` package installed here.
-use std::env;
-use std::fs;
-use std::path::PathBuf;
-use std::process::Command;
-
-const WIT_DIR_ENV: &str = "FFRWD_WIT_DIR";
-const WIT_PACKAGE: &str = "ffrwd/wasm";
-const WIT_FILE: &str = "av.wit";
-
-fn main() {
-    println!("cargo::rerun-if-env-changed={WIT_DIR_ENV}");
-    let source = match env::var_os(WIT_DIR_ENV) {
-        Some(named) => PathBuf::from(named),
-        None => installed_wit_dir(),
-    }
-    .join(WIT_FILE);
-    println!("cargo::rerun-if-changed={}", source.display());
-
-    let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
-    let wit = manifest.join("wit");
-    fs::create_dir_all(&wit).expect("create wit/");
-    fs::copy(&source, wit.join(WIT_FILE))
-        .unwrap_or_else(|err| panic!("copy {}: {err}", source.display()));
-}
-
-/// The `wit` directory of the installed `ffrwd/wasm` package, asked of ffrwd.
-fn installed_wit_dir() -> PathBuf {
-    let asked = Command::new("ffrwd")
-        .args(["path", WIT_PACKAGE])
-        .output()
-        .unwrap_or_else(|err| {
-            panic!("`ffrwd path {WIT_PACKAGE}` could not be run ({err}); set {WIT_DIR_ENV} instead")
-        });
-    if !asked.status.success() {
-        panic!(
-            "`ffrwd path {WIT_PACKAGE}` failed: {}",
-            String::from_utf8_lossy(&asked.stderr).trim()
-        );
-    }
-    let printed = String::from_utf8(asked.stdout).expect("a path, in utf-8");
-    PathBuf::from(printed.trim()).join("wit")
-}
-'''
-
 _RUST_SOURCE = '''\
-wit_bindgen::generate!({
-    path: "wit",
-    world: "video-module",
-});
+use ffrwd_node::{Bound, Init, Input, NoParams, Node, Out, Output, Result, Shape, Tick};
 
-use exports::ffrwd::av::filter::{FrameInfo, Guest, Meta, Outcome, Output, StreamInfo};
+struct Passthrough {
+    v: u32,
+}
 
-struct Invert;
+impl Node for Passthrough {
+    const NAME: &'static str = "passthrough";
+    const VERSION: &'static str = "0.1.0";
+    type Params = NoParams;
 
-// JSON Schema for the `params` string a call passes; this module takes none.
-const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{},"additionalProperties":false}"#;
+    fn shape(_: &NoParams, _: &Bound) -> Result<Shape> {
+        Ok(Shape::new()
+            .input(Input::video("v").clock().pixel_formats(&["rgba"]))
+            .output(Output::like("v"))
+            .pure()
+            .one_to_one())
+    }
 
-fn validate_params(params: &str) -> Result<(), String> {
-    match params.trim() {
-        "" | "{}" => Ok(()),
-        other => Err(format!("invert takes no params, got: {other}")),
+    fn init(_: NoParams, init: &Init) -> Result<Passthrough> {
+        Ok(Passthrough {
+            v: init.stream("v")?.id,
+        })
+    }
+
+    fn process(&mut self, tick: &Tick, out: &mut Out) -> Result<()> {
+        let Some(frame) = tick.frame(self.v) else {
+            return Ok(());
+        };
+        // Your work goes here: `tick.fetch` reads the picture, `out.frame` sends a new one.
+        Ok(out.pass("v", self.v, &frame)?)
     }
 }
 
-impl Guest for Invert {
-    // What the module is, read before anything runs. `pixel_formats` empty
-    // would make this an audio module, and the two are never both.
-    fn describe() -> Meta {
-        Meta {
-            name: "invert".to_string(),
-            version: "0.1.0".to_string(),
-            params_schema: PARAMS_SCHEMA.to_string(),
-            rows_schema: String::new(),
-            pixel_formats: vec!["rgba".to_string()],
-            sample_formats: vec![],
-            sample_rates: vec![],
-            channel_counts: vec![],
-            rows_language: vec![],
-        }
-    }
-
-    // Once per instance, before any frame. The frame size and pixel format
-    // are fixed from here on, so state sized to them is built here.
-    fn init(
-        _width: u32,
-        _height: u32,
-        _pix_fmt: String,
-        _stream_info: StreamInfo,
-        params: String,
-    ) -> Result<(), String> {
-        validate_params(&params)
-    }
-
-    // New parameters between frames; rejecting them leaves the old ones in force.
-    fn set_params(params: String) -> Result<(), String> {
-        validate_params(&params)
-    }
-
-    // True lets the host run frames in parallel, so it must be a promise.
-    fn frame_independent() -> bool {
-        true
-    }
-
-    // One frame in, one frame out. `Output::Passthrough` would hand the input
-    // back uncopied; this one rewrites the bytes it was given.
-    fn process(_info: FrameInfo, frame: Vec<u8>) -> Outcome {
-        let mut out = frame;
-        let (pixels, _) = out.as_chunks_mut::<4>();
-        for pixel in pixels {
-            pixel[0] = 255 - pixel[0];
-            pixel[1] = 255 - pixel[1];
-            pixel[2] = 255 - pixel[2];
-        }
-        Outcome {
-            output: Output::Frame(out),
-            rows: vec![],
-        }
-    }
-}
-
-export!(Invert);
+ffrwd_node::export!(Passthrough);
 '''
 
 _RUST_EXPORT_SQL = """\
@@ -2585,7 +2524,7 @@ CREATE FUNCTION {export}(v video_stream) RETURNS video_stream
 """
 
 _RUST_RECIPE_QUERY = """\
--- Invert a file's picture, its audio carried through untouched.
+-- Run a file's picture through the module, its audio carried through untouched.
 -- variables: source (input media path), dest (output path)
 -- example: ffrwd run {recipe} -v source=in.mp4 -v dest=out.mp4
 COPY (
@@ -2601,22 +2540,26 @@ _RUST_IGNORE = """\
 # Build input, and the output it produces. The one wasm the lib SQL names
 # ships out of target/ regardless; nothing else here belongs in the archive.
 Cargo.toml
-build.rs
 src/*.rs
 target/
-wit/
 """
 
-# `wit/` is written by build.rs, not by hand.
 _RUST_GITIGNORE = """\
 target/
-wit/
 """
 
-_RUST_README = """\
-# {name}
+_RUST_README = f"""\
+# {{name}}
 
 TODO: what this package does, and how a query calls it.
+
+Written on the [ffrwd-node](https://github.com/imbcmdth/ffrwd-node) SDK, whose
+README is the reference for what a node declares and emits.
+
+```
+{_RUST_BUILD_LINE}
+ffrwd run {_RUST_RECIPE} -v source=in.mp4 -v dest=out.mp4
+```
 """
 
 
@@ -2624,8 +2567,9 @@ def _rust_scaffold(name: str) -> dict[str, str]:
     """The module scaffold's files, keyed by their path under the project."""
     segment = name.partition("/")[2]
     return {
-        _RUST_CARGO_FILE: _RUST_CARGO.format(crate=segment),
-        _RUST_BUILD_FILE: _RUST_BUILD,
+        _RUST_CARGO_FILE: _RUST_CARGO.format(
+            crate=segment, sdk_tag=_NODE_SDK_TAG, frame_tag=_FRAME_TAG
+        ),
         _RUST_SOURCE_FILE: _RUST_SOURCE,
         _RUST_EXPORT_FILE: _RUST_EXPORT_SQL.format(
             export=_RUST_EXPORT, artifact=_RUST_ARTIFACT.format(crate=segment)
@@ -2643,7 +2587,6 @@ def _rust_scaffold(name: str) -> dict[str, str]:
 # refuses to overwrite, checked before a name is worked out.
 _RUST_PATHS = (
     _RUST_CARGO_FILE,
-    _RUST_BUILD_FILE,
     _RUST_SOURCE_FILE,
     _RUST_EXPORT_FILE,
     _RUST_RECIPE_FILE,
@@ -2794,7 +2737,7 @@ def _cmd_init(args: argparse.Namespace, on_warning: OnWarning) -> int:
     """Write the files a project starts as, into the working directory.
 
     The manifest, an empty lockfile and a starter recipe; ``--rust`` writes a
-    wasm module package instead of the bare one -- the crate that builds the
+    node module package instead of the bare one -- the crate that builds the
     module, the SQL declaring it, and a recipe calling it.
     """
     directory = Path.cwd()
@@ -2872,8 +2815,7 @@ def _cmd_init(args: argparse.Namespace, on_warning: OnWarning) -> int:
         f"it calls its functions as {name.replace('/', '.')}.name()"
     )
     if rust:
-        print(f"take the wit the module builds against: ffrwd install {wasm.WIT_PACKAGE}")
-        print("build the module: cargo build --target wasm32-wasip2 --release")
+        print(f"build the module: {_RUST_BUILD_LINE}")
         print(
             f"then run the recipe: ffrwd run {_RUST_RECIPE} "
             f"-v source=in.mp4 -v dest=out.mp4"

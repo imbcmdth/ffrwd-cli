@@ -27,7 +27,7 @@ from pathlib import Path
 
 import pytest
 
-from ffrwd import cli, packages, store, wasm
+from ffrwd import cli, packages, store
 from ffrwd.compiler import compile_commands, compile_sql, compile_table_sql
 from ffrwd.emit import build_ffmpeg_args, emit
 from ffrwd.errors import ErrorCode, FfrwdError
@@ -3430,7 +3430,7 @@ def test_init_refuses_a_reserved_namespace(
     assert "reserved" in err
 
 
-def test_init_rust_writes_a_module_package_that_reads_back(
+def test_init_rust_writes_a_node_module_package_that_reads_back(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     root = tmp_path / "my-filter"
@@ -3439,12 +3439,13 @@ def test_init_rust_writes_a_module_package_that_reads_back(
         root, monkeypatch, capsys, "init", "--verbose", "--rust", "--namespace", "me"
     )
     assert code == 0
-    assert "cargo build --target wasm32-wasip2 --release" in out
+    assert "cargo build --release --target wasm32-wasip2" in out
+    assert "ffrwd install" not in out
 
     package = read_manifest(root / "ffrwd.json")
     assert package.name == "me/my_filter" and package.version == "0.1.0"
-    assert list(package.exports) == ["invert"] and list(package.recipes) == ["invert"]
-    assert dict(package.dependencies) == {"ffrwd/wasm": wasm.WORLD_VERSION}
+    assert list(package.exports) == ["passthrough"] and list(package.recipes) == ["passthrough"]
+    assert dict(package.dependencies) == {"ffrwd/wasm": "0.19.1"}
     # Declared empty rather than absent: the scaffold shows its author where
     # they go.
     assert package.keywords == () and package.capabilities == ()
@@ -3459,12 +3460,11 @@ def test_init_rust_writes_a_module_package_that_reads_back(
         ".gitignore",
         "Cargo.toml",
         "README.md",
-        "build.rs",
         "ffrwd.json",
         "ffrwd.lock",
-        "recipes/invert.sql",
-        "src/invert.sql",
+        "recipes/passthrough.sql",
         "src/lib.rs",
+        "src/passthrough.sql",
     }
 
 
@@ -3482,17 +3482,53 @@ def test_init_rust_wires_the_crate_to_the_sql_that_names_its_output(
         return (root / name).read_text(encoding="utf-8")
 
     assert 'name = "my_filter"' in _text("Cargo.toml")
-    assert "target/wasm32-wasip2/release/my_filter.wasm" in _text("src/invert.sql")
-    assert "LANGUAGE wasm" in _text("src/invert.sql")
-    assert "me.my_filter.invert(" in _text("recipes/invert.sql")
-    assert "-- variables:" in _text("recipes/invert.sql")
-    assert "-- example: ffrwd run invert" in _text("recipes/invert.sql")
-    # The wit comes from the environment or from the installed package, and
-    # lands where the bindings macro reads it.
-    assert "FFRWD_WIT_DIR" in _text("build.rs")
-    assert 'args(["path", WIT_PACKAGE])' in _text("build.rs")
-    assert 'path: "wit"' in _text("src/lib.rs")
-    assert _text(".gitignore").split() == ["target/", "wit/"]
+    assert "target/wasm32-wasip2/release/my_filter.wasm" in _text("src/passthrough.sql")
+    assert "LANGUAGE wasm" in _text("src/passthrough.sql")
+    assert "me.my_filter.passthrough(" in _text("recipes/passthrough.sql")
+    assert "-- variables:" in _text("recipes/passthrough.sql")
+    assert "-- example: ffrwd run passthrough" in _text("recipes/passthrough.sql")
+    # The module's own name is the export the lib SQL names.
+    assert 'const NAME: &\'static str = "passthrough";' in _text("src/lib.rs")
+    assert "'passthrough' LANGUAGE wasm" in _text("src/passthrough.sql")
+    assert _text(".gitignore").split() == ["target/"]
+
+
+def test_init_rust_writes_a_crate_on_the_node_sdk_with_no_build_script(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "my-filter"
+    root.mkdir()
+    assert _run(root, monkeypatch, capsys, "init", "--rust", "--namespace", "me")[0] == 0
+    cargo = (root / "Cargo.toml").read_text(encoding="utf-8")
+    source = (root / "src" / "lib.rs").read_text(encoding="utf-8")
+
+    assert (
+        'ffrwd-node = { git = "https://github.com/imbcmdth/ffrwd-node", tag = "v0.2.0" }'
+        in cargo
+    )
+    assert (
+        'ffrwd-frame = { git = "https://github.com/imbcmdth/ffrwd-frame", tag = "v0.1.1" }'
+        in cargo
+    )
+    assert 'crate-type = ["cdylib"]' in cargo
+    assert "wit-bindgen" not in cargo
+    assert not (root / "build.rs").exists() and not (root / "wit").exists()
+
+    # One video input is the clock; the one output is that input's picture.
+    assert "impl Node for" in source
+    assert 'Input::video("v").clock()' in source
+    assert 'Output::like("v")' in source
+    assert "ffrwd_node::export!(" in source
+    # The one comment says where the work goes.
+    comments = [line.strip() for line in source.splitlines() if line.strip().startswith("//")]
+    assert len(comments) == 1 and "work goes here" in comments[0]
+
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    assert "cargo build --release --target wasm32-wasip2" in readme
+    assert "install" not in readme
+    for path in root.rglob("*"):
+        if path.is_file():
+            assert "\u2014" not in path.read_text(encoding="utf-8"), path.name
 
 
 def test_init_rust_refuses_to_overwrite_any_file_it_would_write(

@@ -112,6 +112,8 @@ from .parser import (
     FILTER_NAMESPACE,
     MACRO_NAMESPACE,
     MERGE_CUES,
+    NODE_REFUSAL,
+    OLDER_WORLD,
     SINK_ALIAS,
     SINK_STREAMS,
     ModuleExport,
@@ -149,17 +151,22 @@ __all__ = [
     "SINK_ALIAS",
     "SINK_STREAMS",
     "WASM_DATA",
+    "WASM_NODE",
     "WASM_STREAM_NAMES",
     "WASM_STREAM_TYPES",
     "Annotation",
     "AnnotationField",
     "Parameter",
+    "STAR_FIELD",
     "RuntimeLateral",
     "Script",
     "Signature",
     "WasmFunction",
     "expanded",
     "is_number_argument",
+    "is_port",
+    "spread",
+    "struct_entries",
     "package_modules",
     "package_signatures",
     "package_sources",
@@ -337,6 +344,16 @@ _DATA_FILTER_PARAM_TYPES: Mapping[str, StreamType] = {
     **WASM_STREAM_TYPES,
     WASM_DATA: "data",
 }
+# What a declaration RETURNS when its signature is one only a node module
+# has: kinds mixed in any order, a stream left out, an array of streams, rows
+# beside several outputs. Which it is waits on the module's describe, so the
+# declaration keeps the refusal an older world's module earns (`refusal`).
+WASM_NODE = "node"
+# Marks a field read `(<call>).*` wrote, which a call whose shape makes no
+# such output leaves out rather than refuses.
+STAR_FIELD = "star_field"
+# The types a node reads as an input port rather than as a value.
+_PORT_TYPES = frozenset({_WASM_STREAM, _WASM_AUDIO_STREAM, WASM_DATA})
 _WASM_DATA_HINT = (
     "a data filter reads its streams first -- data_stream for messages, "
     "video_stream or audio_stream for the time alone -- then the values it is "
@@ -372,6 +389,14 @@ _TABLE_HINT = (
     "write RETURNS TABLE(<column> <type>, ...), one name per column the body selects"
 )
 _VALUE_BODY_HINT = "a value-returning function's body is one SELECT of one column"
+_STRUCT_BODY_HINT = (
+    "a struct-returning function's body is one SELECT, one column per field, in order"
+)
+_STRUCT_RETURN_HINT = (
+    "a function returning a struct names a stream and rows beside it: RETURNS "
+    "STRUCT(<name> video_stream, <name> STRUCT(<field> <type>, ...)[]), or "
+    "audio_stream and cue[] the same way"
+)
 _TABLE_BODY_HINT = (
     "a table-returning function's body is one SELECT, one column per RETURNS TABLE column"
 )
@@ -583,6 +608,20 @@ def _leading_streams(params: tuple[Parameter, ...]) -> tuple[Parameter, ...]:
     return params[:end]
 
 
+def is_port(param: Parameter) -> bool:
+    """Whether a node reads `param` as an input port: a stream, or rows."""
+    return param.annotation is not None or element_type(param.type) in _PORT_TYPES
+
+
+def _written_outputs(outputs: tuple[Parameter, ...]) -> str:
+    """A node's RETURNS as a signature spells it."""
+    if not outputs:
+        return WASM_SOURCE
+    if len(outputs) == 1 and not outputs[0].name:
+        return outputs[0].type
+    return "STRUCT(" + ", ".join(f"{o.name} {o.type}" for o in outputs) + ")"
+
+
 @dataclass(frozen=True)
 class WasmFunction:
     """One ``LANGUAGE wasm`` declaration: a module, an export, and a signature.
@@ -636,12 +675,30 @@ class WasmFunction:
     # data_stream, whose one output is the call itself, and for every other
     # kind.
     data_fields: tuple[str, ...] = ()
+    # What a node module makes, read off the RETURNS: one unnamed entry for a
+    # stream or rows, one per field of a STRUCT, none for a source, whose
+    # outputs its shape names. None where no node returns that.
+    outputs: tuple[Parameter, ...] | None = None
+    # What a module of an older world refuses this declaration with, for one
+    # only a node can carry (`returns` is WASM_NODE).
+    refusal: FfrwdError | None = field(default=None, compare=False)
+
+    @property
+    def is_node_only(self) -> bool:
+        """True for a declaration only a node module can carry."""
+        return self.returns == WASM_NODE
+
+    @property
+    def ports(self) -> tuple[Parameter, ...]:
+        """Every parameter a node reads as an input port, in declared order."""
+        return tuple(param for param in self.params if is_port(param))
 
     @property
     def is_value(self) -> bool:
         """True for a function returning a compile-time value, not a stream."""
         return (
             self.returns not in WASM_STREAM_TYPES
+            and not self.is_node_only
             and not self.is_data_filter
             and not self.is_sink
             and not self.is_packets
@@ -774,6 +831,8 @@ class WasmFunction:
             )
         if self.is_data_filter:
             return "data"
+        if self.is_node_only:
+            raise ValueError(f"'{self.name}' is a node; each port has a kind of its own")
         written = (
             self.params[0].type
             if (self.is_sink or self.is_packets or self.is_packet_rows) and self.params
@@ -834,6 +893,8 @@ class WasmFunction:
         """
         if self.is_value or self.is_rows:
             return ()
+        if self.is_node_only:
+            return tuple(p for p in self.ports if p.annotation is None)
         return _leading_streams(self.params)
 
     @property
@@ -858,7 +919,7 @@ class WasmFunction:
         together, and a parameter one skipped would be a value parameter the
         other kept.
         """
-        if self.is_value or self.is_rows or self.is_packet_rows:
+        if self.is_value or self.is_rows or self.is_packet_rows or self.is_node_only:
             return ()
         found: list[Parameter] = []
         for param in self.params[self.stream_arity :]:
@@ -876,7 +937,7 @@ class WasmFunction:
         riding one: :attr:`rows_param` is that one. None for a PACKET ROWS
         function too, whose rows are what it hands back.
         """
-        if self.is_value or self.is_rows or self.is_packet_rows:
+        if self.is_value or self.is_rows or self.is_packet_rows or self.is_node_only:
             return None
         after = self.stream_arity
         return self.params[after].annotation if len(self.params) > after else None
@@ -910,6 +971,8 @@ class WasmFunction:
             return ()
         if self.is_value:
             return self.params
+        if self.is_node_only:
+            return tuple(param for param in self.params if not is_port(param))
         skip = self.stream_arity + len(self.reads_params)
         return self.params[skip:]
 
@@ -925,7 +988,7 @@ class WasmFunction:
         it and any producer, so the rows reach it as arguments of their own
         and every one of them is written at the call.
         """
-        if self.is_value or self.is_rows:
+        if self.is_value or self.is_rows or self.is_node_only:
             return self.params
         if self.is_packets:
             return (*self.stream_params, *self.reads_params, *self.value_params)
@@ -956,6 +1019,8 @@ class WasmFunction:
         if self.data_fields:
             written = ", ".join(f"{field} {WASM_DATA}" for field in self.data_fields)
             return f"STRUCT({written})"
+        if self.is_node_only and self.outputs is not None:
+            return _written_outputs(self.outputs)
         if self.emits is None:
             return self.returns
         stream, annotation = self.stream_field, self.emits
@@ -1008,6 +1073,9 @@ class _Function:
     used: bool = False
     package: str = ""
     package_version: str = ""
+    # A ``RETURNS STRUCT(<name> <stream>, <name> <rows>)``'s fields, one per
+    # column the body selects. None for every other return.
+    fields: tuple[Parameter, ...] | None = None
 
     @property
     def returns_rows(self) -> bool:
@@ -1099,6 +1167,7 @@ def expanded(
         yield script
     except FfrwdError as err:
         raise expander.translate(err) from err
+    expander.settle_older_world(expanded_tree)
     expander.settle(expanded_tree)
 
 
@@ -1223,6 +1292,21 @@ def _annotation(
             hint=_ANNOTATION_FIELD_HINT,
         )
     return Annotation(name=column, fields=tuple(declared))
+
+
+def _many_annotation(
+    node: exp.Expr | None, column: str, name: str, anchor: exp.Expr
+) -> Annotation | None:
+    """The record an array of record arrays declares, ``STRUCT(...)[][]``, or None.
+
+    A node port that takes any number of rows streams, each of that record.
+    """
+    if not isinstance(node, exp.DataType) or node.this is not exp.DataType.Type.ARRAY:
+        return None
+    inner = node.expressions[0] if len(node.expressions) == 1 else None
+    if not isinstance(inner, exp.DataType) or inner.this is not exp.DataType.Type.ARRAY:
+        return None
+    return _annotation(inner, column, name, anchor)
 
 
 def _record_array(
@@ -1350,14 +1434,25 @@ def _reanchor(err: FfrwdError, name: str, anchor: exp.Expr) -> FfrwdError:
 
 
 def _body_select(
-    text: str, name: str, anchor: exp.Expr, columns: tuple[Parameter, ...] | None
+    text: str,
+    name: str,
+    anchor: exp.Expr,
+    columns: tuple[Parameter, ...] | None,
+    fields: tuple[Parameter, ...] | None = None,
 ) -> exp.Select:
     """Parse and shape-check one body: a single SELECT of the declared width.
 
-    A value's body is one column; a table's is one per ``RETURNS TABLE`` name.
+    A value's body is one column; a table's is one per ``RETURNS TABLE`` name,
+    and a struct's one per field.
     """
-    wanted = 1 if columns is None else len(columns)
-    shape = _VALUE_BODY_HINT if columns is None else _TABLE_BODY_HINT
+    wanted = len(fields) if fields is not None else 1 if columns is None else len(columns)
+    shape = (
+        _STRUCT_BODY_HINT
+        if fields is not None
+        else _VALUE_BODY_HINT
+        if columns is None
+        else _TABLE_BODY_HINT
+    )
     try:
         parsed = parse(text)
     except FfrwdError as err:
@@ -1397,7 +1492,9 @@ def _body_select(
     if written != wanted:
         plural = "" if written == 1 else "s"
         said = (
-            "and a value is one column"
+            f"but its RETURNS STRUCT declares {wanted} fields"
+            if fields is not None
+            else "and a value is one column"
             if columns is None
             else f"but its RETURNS TABLE declares {wanted}"
         )
@@ -1570,6 +1667,23 @@ def _column_defs(
             if kind.allow_annotation
             else None
         )
+        many = (
+            _many_annotation(node.args.get("kind"), written, name, anchor)
+            if kind.allow_annotation and annotation is None
+            else None
+        )
+        if many is not None:
+            if default is not None and not isinstance(default, exp.Null):
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"function '{name}' gives the {kind.noun} '{written}' a DEFAULT",
+                    anchor,
+                    fallback=create,
+                    hint="rows are produced by the call that fills them; DEFAULT "
+                    "NULL, the only default they can carry, makes them optional",
+                )
+            declared.append(Parameter(written, f"{many.written}[]", default, many))
+            continue
         if annotation is not None:
             # DEFAULT NULL makes the column optional: a call over a plain
             # stream wires no rows in. Any other default would be a value,
@@ -1977,6 +2091,134 @@ def _define_wasm_value(
 
 
 def _define_wasm(
+    create: exp.Create,
+    name: str,
+    identifier: exp.Identifier,
+    params: tuple[Parameter, ...],
+    returns_prop: exp.ReturnsProperty,
+    body: exp.Expr | None,
+) -> WasmFunction:
+    """One validated ``LANGUAGE wasm`` declaration, as every world reads it.
+
+    The kinds an older world's module has are decided here, by the signature
+    alone (:func:`_define_wasm_kind`). A node module's reading rides beside
+    every one of them (`outputs`), since only its describe says a module is a
+    node. A signature no older kind has, and a node can, is a node's alone:
+    it keeps the refusal an older module earns, for lowering to raise once
+    the module turns out not to be a node.
+    """
+    node = returns_prop.this if isinstance(returns_prop.this, exp.Expr) else None
+    try:
+        declared = _define_wasm_kind(create, name, identifier, params, returns_prop, body)
+    except FfrwdError as refusal:
+        found = _node_declaration(
+            create, name, identifier, params, returns_prop, body, refusal
+        )
+        if found is None:
+            raise
+        return found
+    if declared.is_value or declared.is_codec or declared.is_sink:
+        return declared
+    if declared.is_packets:
+        # A node hands back the coded stream it was given, of that kind.
+        return replace(declared, outputs=(Parameter("", params[0].type),))
+    outputs = _node_outputs(node, name, identifier)
+    return declared if outputs is None else replace(declared, outputs=outputs)
+
+
+def _node_outputs(
+    node: exp.Expr | None, name: str, identifier: exp.Identifier
+) -> tuple[Parameter, ...] | None:
+    """What a node module makes, as a RETURNS says it, or None where no node
+    returns that.
+
+    A stream or a data stream is one output, and so are rows (``STRUCT(...)[]``,
+    ``cue[]``); a ``STRUCT`` of those names several, one per field; a
+    ``source`` names none, its shape naming them.
+    """
+    written = _type_name(node)
+    if written in _PORT_TYPES:
+        return (Parameter("", written),)
+    if written == WASM_SOURCE:
+        return ()
+    try:
+        rows = _annotation(node, _ROWS_RETURN, name, identifier)
+    except FfrwdError:
+        return None
+    if rows is not None:
+        return (Parameter("", written or rows.written, annotation=rows),)
+    fields = _struct_fields(node)
+    if not fields:
+        return None
+    outputs: list[Parameter] = []
+    for field_node in fields:
+        field_name = (
+            _ident_name(field_node.this) if isinstance(field_node.this, exp.Identifier) else ""
+        )
+        if not field_name or any(o.name == field_name for o in outputs):
+            return None
+        kind = field_node.args.get("kind")
+        field_type = _type_name(kind)
+        if field_type in _PORT_TYPES:
+            outputs.append(Parameter(field_name, field_type))
+            continue
+        try:
+            record = _annotation(kind, field_name, name, identifier)
+        except FfrwdError:
+            return None
+        if record is None:
+            return None
+        outputs.append(Parameter(field_name, field_type or record.written, annotation=record))
+    return tuple(outputs)
+
+
+def _node_declaration(
+    create: exp.Create,
+    name: str,
+    identifier: exp.Identifier,
+    params: tuple[Parameter, ...],
+    returns_prop: exp.ReturnsProperty,
+    body: exp.Expr | None,
+    refusal: FfrwdError,
+) -> WasmFunction | None:
+    """The declaration as a node module reads it, or None where no node can be it.
+
+    Its parameters are ports (streams, data streams and rows, each maybe an
+    array, each maybe ``DEFAULT NULL``) and values (text, number, boolean,
+    vector), in any order; its RETURNS is one a node makes, and names at
+    least one output, since a node that reads ports and makes nothing is a
+    sink.
+    """
+    if returns_prop.args.get("is_table"):
+        return None
+    try:
+        module, export, _ = _module_export(body, name, identifier, create)
+    except FfrwdError:
+        return None
+    node = returns_prop.this if isinstance(returns_prop.this, exp.Expr) else None
+    outputs = _node_outputs(node, name, identifier)
+    if not outputs:
+        return None
+    if not any(is_port(param) for param in params):
+        return None
+    for param in params:
+        if not is_port(param) and param.type not in _ANNOTATION_FIELD_TYPES:
+            return None
+    line, col = _pos(identifier, create)
+    return WasmFunction(
+        name=name,
+        module=module,
+        export=export,
+        params=params,
+        returns=WASM_NODE,
+        line=line,
+        col=col,
+        outputs=outputs,
+        refusal=refusal,
+    )
+
+
+def _define_wasm_kind(
     create: exp.Create,
     name: str,
     identifier: exp.Identifier,
@@ -2509,14 +2751,18 @@ def _define(create: exp.Create, *, packaged: bool = False) -> _Function | WasmFu
             hint="a module is hosted, not inlined; say LANGUAGE wasm",
         )
     columns: tuple[Parameter, ...] | None = None
+    fields: tuple[Parameter, ...] | None = None
     if returns_prop.args.get("is_table"):
         columns = _table_columns(returns_prop, name, identifier, create)
         returns = "TABLE(" + ", ".join(f"{c.name} {c.type}" for c in columns) + ")"
     else:
         node = returns_prop.this if isinstance(returns_prop.this, exp.Expr) else None
-        returns = _checked_type(node, name, identifier)
+        fields = _sql_struct_return(node, name, identifier)
+        returns = _written_outputs(fields) if fields else _checked_type(node, name, identifier)
 
-    body = _body_select(_body_text(create, name, identifier), name, identifier, columns)
+    body = _body_select(
+        _body_text(create, name, identifier), name, identifier, columns, fields
+    )
     aliases = _body_aliases(body, name, params, identifier)
     _check_body_scope(body, name, params, aliases, identifier)
     return _Function(
@@ -2528,7 +2774,32 @@ def _define(create: exp.Create, *, packaged: bool = False) -> _Function | WasmFu
         aliases=aliases,
         position=0,
         columns=columns,
+        fields=fields,
     )
+
+
+def _sql_struct_return(
+    node: exp.Expr | None, name: str, identifier: exp.Identifier
+) -> tuple[Parameter, ...] | None:
+    """A sql function's ``RETURNS STRUCT(<name> <stream>, <name> <rows>)``.
+
+    The fields a call over it is read as: the stream and the rows beside it,
+    which a node reading both takes as two arguments. None for a RETURNS that
+    is not a struct at all.
+    """
+    fields = _struct_fields(node)
+    if fields is None:
+        return None
+    outputs = _node_outputs(node, name, identifier)
+    streams = [o for o in outputs or () if o.annotation is None]
+    if outputs is None or len(outputs) != 2 or len(streams) != 1 or outputs[0] != streams[0]:
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"function '{name}' returns a struct that is not a stream and rows",
+            identifier,
+            hint=_STRUCT_RETURN_HINT,
+        )
+    return outputs
 
 
 def _in_lib(
@@ -3270,12 +3541,12 @@ def _call_alias(item: exp.Table, function: _Function) -> str:
 
 
 # What a run-time lateral's columns may be, and its values.
-_RUNTIME_COLUMN_TYPES = (_WASM_STREAM, _WASM_AUDIO_STREAM)
+_RUNTIME_COLUMN_TYPES = (_WASM_STREAM, _WASM_AUDIO_STREAM, WASM_DATA)
 _RUNTIME_VALUE_TYPES = ("number", "text", "boolean")
 _RUNTIME_HINT = (
     "declare <name>(<launch> data_stream, <value> <type>, ...) RETURNS "
-    "TABLE(video video_stream, audio audio_stream), either column or both, "
-    "each value text, number or boolean"
+    "TABLE(video video_stream, audio audio_stream, rows data_stream), any of "
+    "the columns, each value text, number or boolean"
 )
 
 
@@ -3306,7 +3577,7 @@ def _check_runs_per_message(function: _Function, anchor: exp.Expr) -> None:
             ErrorCode.UNSUPPORTED_SQL,
             f"{function.qualified}() is started once per message of its data "
             f"stream, and returns '{wrong.name} {wrong.type}': it returns the "
-            "picture and sound a feeder takes, one of each at most",
+            "picture, sound and rows a feeder takes, one of each at most",
             anchor,
             hint=_RUNTIME_HINT,
         )
@@ -3568,7 +3839,13 @@ def _wasm_argument_kind(call: exp.Anonymous, wasm: Mapping[str, WasmFunction] | 
     if _call_name(call) in _VECTOR_BUILTIN_ARITY:
         return "number"
     declared = wasm.get(_call_name(call)) if wasm is not None else None
-    return _declared_kind(declared.returns) if declared is not None else "stream"
+    if declared is None:
+        return "stream"
+    if declared.is_node_only:
+        outputs = declared.outputs or ()
+        one = len(outputs) == 1 and not outputs[0].name
+        return _declared_kind(outputs[0].type) if one else "stream"
+    return _declared_kind(declared.returns)
 
 
 def _positional_and_named(
@@ -3726,6 +4003,8 @@ def _struct_fields_of(declared: WasmFunction) -> tuple[str, ...]:
         return declared.data_fields
     if declared.emits is not None:
         return (declared.stream_field, declared.emits.name)
+    if declared.is_node_only and declared.outputs:
+        return tuple(output.name for output in declared.outputs if output.name)
     return ()
 
 
@@ -3806,6 +4085,73 @@ def _declared_kind(declared: str) -> str:
     if element not in TYPES:
         return _RECORD_KIND
     return "stream" if TYPES[element].kind != "scalar" else declared
+
+
+def _struct_of(fields: tuple[Parameter, ...], projections: Sequence[exp.Expr]) -> exp.Struct:
+    """A struct-returning call's value: each field, the column the body selects for it."""
+    entries: list[exp.Expr] = []
+    for field_param, projection in zip(fields, projections):
+        value = projection.this if isinstance(projection, exp.Alias) else projection
+        assert isinstance(value, exp.Expr)
+        entries.append(
+            exp.PropertyEQ(this=exp.to_identifier(field_param.name), expression=value)
+        )
+    return exp.Struct(expressions=entries)
+
+
+def struct_entries(node: exp.Expr) -> list[tuple[str, exp.Expr]] | None:
+    """A written ``STRUCT(<value> AS <name>, ...)`` as its fields in order, or None."""
+    node = _unparen(node)
+    if not isinstance(node, exp.Struct):
+        return None
+    entries: list[tuple[str, exp.Expr]] = []
+    for entry in node.expressions:
+        if not isinstance(entry, exp.PropertyEQ) or not isinstance(entry.expression, exp.Expr):
+            return None
+        entries.append((_ident_name(entry.this), entry.expression))
+    return entries
+
+
+def _struct_star(projection: exp.Expr) -> list[tuple[str, exp.Expr]] | None:
+    """``(<struct a call became>).*``: its fields, each read once, or None."""
+    dot = _unparen(projection)
+    if not isinstance(dot, exp.Dot) or not isinstance(dot.expression, exp.Star):
+        return None
+    return struct_entries(dot.this) if isinstance(dot.this, exp.Expr) else None
+
+
+def spread(arguments: Sequence[exp.Expr]) -> list[exp.Expr]:
+    """Positional arguments with each struct a call became read as its fields.
+
+    A call over a stream and the rows beside it hands a node both, the way a
+    call over a two-part result always has: ``ring(spotted(v))`` is
+    ``ring(<v>, <spots>)``.
+    """
+    spread_out: list[exp.Expr] = []
+    for argument in arguments:
+        entries = None if isinstance(argument, exp.Kwarg) else struct_entries(argument)
+        if entries is None:
+            spread_out.append(argument)
+            continue
+        spread_out.extend(value for _, value in entries)
+    return spread_out
+
+
+def _struct_field_read(value: exp.Expr) -> tuple[exp.Expr, exp.Expr] | None:
+    """``<struct>.<field>`` around a struct a call became: the read, and the field."""
+    inner: exp.Expr = value
+    parent = value.parent
+    while isinstance(parent, exp.Paren):
+        inner, parent = parent, parent.parent
+    if not isinstance(parent, exp.Dot) or parent.this is not inner:
+        return None
+    field_node = parent.args.get("expression")
+    entries = struct_entries(value)
+    if entries is None or not isinstance(field_node, exp.Identifier):
+        return None
+    wanted = _ident_name(field_node)
+    found = next((entry for name, entry in entries if name == wanted), None)
+    return None if found is None else (parent, found)
 
 
 def _record_rows(argument: exp.Expr) -> list[exp.Expr] | None:
@@ -4378,6 +4724,11 @@ class _Expander:
             site.node.replace(replacement)
             if site.node is root:
                 root = replacement
+            read = _struct_field_read(replacement)
+            if read is not None:
+                if read[0] is root:
+                    root = read[1]
+                read[0].replace(read[1])
 
     def _next_call(self, root: exp.Expr, position: int) -> _CallSite | _WasmSite | None:
         """The first call to a defined function in `root`'s own query, if any.
@@ -4499,6 +4850,11 @@ class _Expander:
             projections: list[exp.Expr] = []
             expanded = False
             for projection in select.expressions:
+                entries = _struct_star(projection)
+                if entries is not None:
+                    expanded = True
+                    projections.extend(exp.alias_(value, name) for name, value in entries)
+                    continue
                 call = self._data_star_call(projection)
                 if call is None:
                     projections.append(projection)
@@ -4507,6 +4863,7 @@ class _Expander:
                 declared = self.wasm[_call_name(call)]
                 for field_name in _struct_fields_of(declared):
                     read = exp.Dot(this=call.copy(), expression=exp.to_identifier(field_name))
+                    read.meta[STAR_FIELD] = True
                     projections.append(exp.alias_(read, field_name))
             if expanded:
                 select.set("expressions", projections)
@@ -4666,8 +5023,9 @@ class _Expander:
             if declared.is_packet_rows:
                 # As above: a Table-position call is skipped before this
                 # loop sees it, so anything reaching here is written where
-                # a stream or a value belongs.
-                raise _error(
+                # a stream or a value belongs. A node answers it with a data
+                # stream, so the refusal waits for the module's describe.
+                node.meta[OLDER_WORLD] = _error(
                     ErrorCode.UNSUPPORTED_SQL,
                     f"function '{declared.name}' returns rows read off a "
                     "stream's packets, and this call is not in FROM",
@@ -4678,8 +5036,110 @@ class _Expander:
             arguments = [
                 argument for argument in node.expressions if isinstance(argument, exp.Expr)
             ]
-            self._check_wasm_arguments(declared, node, arguments)
+            if declared.is_node_only or OLDER_WORLD in node.meta:
+                try:
+                    self._check_node_arguments(declared, node, arguments)
+                except FfrwdError as refusal:
+                    node.meta[NODE_REFUSAL] = refusal
+            else:
+                self._check_any_world_arguments(declared, node, arguments)
             self.wasm_used.add(declared.name)
+
+    def _check_any_world_arguments(
+        self, declared: WasmFunction, call: exp.Anonymous, arguments: list[exp.Expr]
+    ) -> None:
+        """A call's arguments as an older world's module reads them, or as a node does.
+
+        A call only a node reads keeps the older refusal for lowering, which
+        raises it once the module's describe says it is not a node.
+        """
+        try:
+            self._check_wasm_arguments(declared, call, arguments)
+        except FfrwdError as refusal:
+            if declared.outputs is None:
+                raise
+            try:
+                self._check_node_arguments(declared, call, arguments)
+            except FfrwdError:
+                raise refusal from None
+            call.meta[OLDER_WORLD] = refusal
+
+    def _check_node_arguments(
+        self, declared: WasmFunction, call: exp.Anonymous, arguments: list[exp.Expr]
+    ) -> None:
+        """A call to a node against its signature: ports and values alike.
+
+        The positionals fill the parameters in declared order, whatever each
+        is, and a name fills the one it names; each parameter once, and one
+        with no DEFAULT always. A port takes a stream, rows, an array of
+        either or NULL, and a number where a held input may be given as a port;
+        which of those fits is the module's shape to say, in lowering.
+        """
+        positional, named = _positional_and_named(spread(arguments))
+        params = declared.params
+        plural = "" if len(positional) == 1 else "s"
+        if len(positional) > len(params):
+            raise _error(
+                ErrorCode.UDF_ARG_TYPE,
+                f"{declared.name}() got {len(positional)} argument{plural}, but it "
+                f"declares {len(params)}",
+                call,
+                hint=declared.signature,
+            )
+        filled: dict[str, exp.Expr] = {
+            param.name: argument for param, argument in zip(params, positional)
+        }
+        for name, value in named:
+            param = next((p for p in params if p.name == name), None)
+            if param is None:
+                listed = ", ".join(f"'{p.name}'" for p in params)
+                raise _error(
+                    ErrorCode.UDF_ARG_TYPE,
+                    f"{declared.name}() has no parameter '{name}'",
+                    value,
+                    fallback=call,
+                    hint=f"its parameters are {listed}",
+                )
+            if name in filled:
+                raise _error(
+                    ErrorCode.UDF_ARG_TYPE,
+                    f"{declared.name}() gets '{name}' twice: positionally and by name",
+                    value,
+                    fallback=call,
+                    hint=f"write '{name}' once: {declared.signature}",
+                )
+            filled[name] = value
+        unfilled = next(
+            (p for p in params if p.default is None and p.name not in filled), None
+        )
+        if unfilled is not None:
+            raise _error(
+                ErrorCode.UDF_ARG_TYPE,
+                f"{declared.name}() does not write '{unfilled.name}', which has no "
+                "DEFAULT",
+                call,
+                hint=declared.signature,
+            )
+        for param in params:
+            argument = filled.get(param.name)
+            if argument is None:
+                continue
+            if not is_port(param):
+                self._check_wasm_argument(declared, call, param, argument)
+                continue
+            if _call_name(argument) == _INPUT:
+                self._check_wasm_argument(declared, call, param, argument)
+            written = _argument_kind(argument, self.wasm)
+            if written in (None, "stream", "number", _RECORD_KIND) or _is_null(argument):
+                continue
+            raise _error(
+                ErrorCode.UDF_ARG_TYPE,
+                f"{declared.name}() takes {param.type} as its '{param.name}' "
+                f"argument, got {_KIND_NAMES.get(written, written)}",
+                argument,
+                fallback=call,
+                hint=declared.signature,
+            )
 
     def _reject_wasm_row_source(self, item: exp.Table) -> None:
         """A wasm function in FROM: refused unless it is a source, which is exactly a table.
@@ -5096,6 +5556,8 @@ class _Expander:
         with self._scoped(function.identity):
             self._expand_within(body, host, position, (*stack, function.qualified))
         _splice(host, body)
+        if function.fields is not None:
+            return _struct_of(function.fields, body.expressions)
         projection: exp.Expr = body.expressions[0]
         inner = projection.this if isinstance(projection, exp.Alias) else None
         return inner if isinstance(inner, exp.Expr) else projection
@@ -5665,6 +6127,14 @@ class _Expander:
             col=col,
             hint=err.hint,
         )
+
+    def settle_older_world(self, script: exp.Expr) -> None:
+        """Say every refusal kept for lowering at the call site, as one raised now is."""
+        for node in script.walk():
+            for key in (OLDER_WORLD, NODE_REFUSAL):
+                refusal = node.meta.get(key)
+                if isinstance(refusal, FfrwdError):
+                    node.meta[key] = self.translate(refusal)
 
     def settle(self, script: exp.Expr) -> None:
         """Flatten every stamped position onto its call site.

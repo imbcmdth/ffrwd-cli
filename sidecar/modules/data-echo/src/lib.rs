@@ -7,7 +7,7 @@
 //! what the rows say is exactly what reached the sink.
 
 wit_bindgen::generate!({
-    path: "../../wit",
+    path: "../../worlds/0.18.0",
     world: "packet-sink-module",
 });
 

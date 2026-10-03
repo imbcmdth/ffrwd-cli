@@ -66,6 +66,33 @@ members = [
     "adapted-0150",
     "adapted-0160",
     "adapted-0170",
+    "shape-probe",
+    # The node world's stand-ins, written with ffrwd-node: the modules
+    # cookbook recipes 145 to 154 name. `stand-ins` is what they share.
+    "stand-ins",
+    "spot",
+    "ring",
+    "dim",
+    "hear",
+    "burn",
+    "inset",
+    "tile",
+    "matte",
+    "ticker",
+    # One per distinct shape the node world's host has to run, written
+    # against the raw bindings, since they test the host.
+    "shape-hold",
+    "shape-state",
+    "shape-canvas",
+    "shape-rate",
+    "shape-recut",
+    "shape-self",
+    "shape-sink",
+    "shape-window",
+    "shape-packets",
+    # What the live switch did, as a node: the host's hold pairing, feeds by
+    # port and both anchors, with none of the switch's own code.
+    "shape-switch",
 ]
 resolver = "2"
 

@@ -146,7 +146,9 @@ from .emit import Emitted, build_ffmpeg_commands, build_process_args
 from .errors import ErrorCode, FfrwdError
 from .ir import (
     FEEDER_HOST,
+    PARAMS_FILE,
     STDERR_ROW,
+    TAP_DOCUMENT,
     Lateral,
     LateralValue,
     feeder_path,
@@ -166,6 +168,8 @@ from .processes import (
     StreamEdge,
     VideoFormat,
     encoded,
+    once_per_pipe,
+    pipe_key,
 )
 from .relay import Relay, RelayEdge
 from .vars import substitute
@@ -637,6 +641,10 @@ PipeNamer = Callable[[PipeEdge, Side], str]
 # placeholders as they are, which is what a printed command shows.
 RowsNamer = Callable[[str], str]
 
+# Writes one node's params, as JSON, to the file its placeholder stands for,
+# and names that file.
+ParamsNamer = Callable[[str, str], str]
+
 # Renders one sidecar process as the argv that runs it, given the path each
 # stream it reads arrives on and the path each rows document it writes goes
 # to. The real one lands with the sidecar itself; until then a caller
@@ -809,6 +817,58 @@ def unheard_error(
     )
 
 
+def unstarted_error(writer: str, readers: Sequence[str], port: int) -> FfrwdError:
+    """The typed failure for a feeder's writer the stage ended without starting."""
+    return FfrwdError(
+        ErrorCode.INPUT_NEVER_OPENED,
+        f"{writer}, which writes {feeder_path(port)} for {' and '.join(readers)}, "
+        "was never started: its readers ended without listening there, and "
+        "nothing it writes was written",
+        hint="the module listens on its port when it is opened; check that it "
+        "imports wasi:sockets/tcp and opens the port its describe names",
+    )
+
+
+def held_writers(
+    writers: Mapping[str, tuple[int, list[str]]], feeds: Iterable[tuple[str, str]]
+) -> dict[str, tuple[int, list[str]]]:
+    """The feeders' writers a stage holds until their port accepts.
+
+    A writer one of whose readers is itself, or reads what it writes, is
+    started with the rest: its readers would never listen while it waited
+    for them. Its lateral's instances wait for the port instead.
+    """
+    downstream: dict[str, set[str]] = {}
+    for source, target in feeds:
+        downstream.setdefault(source, set()).add(target)
+
+    def reached(start: str) -> set[str]:
+        seen = {start}
+        todo = [start]
+        while todo:
+            for after in downstream.get(todo.pop(), ()):
+                if after not in seen:
+                    seen.add(after)
+                    todo.append(after)
+        return seen
+
+    return {
+        pid: (port, readers)
+        for pid, (port, readers) in writers.items()
+        if not reached(pid) & set(readers)
+    }
+
+
+def never_started(
+    held: Mapping[str, tuple[int, list[str]]], started: Collection[str], local: Collection[str]
+) -> tuple[str, FfrwdError] | None:
+    """The first writer held here that a stage ended without starting, and why."""
+    for pid, (port, readers) in held.items():
+        if pid in local and pid not in started:
+            return pid, unstarted_error(pid, readers, port)
+    return None
+
+
 def _await_port(
     port: int,
     readers: Sequence[_Member],
@@ -970,9 +1030,10 @@ def _pipe_edges(plan: ProcessPlan) -> tuple[PipeEdge, ...]:
 
     The order is what pairs an edge with the ``pipe:`` slot it fills: a
     reading process's own inputs come first in its ``-i`` list, and a rows
-    track is one of those, where a frame edge is appended after them.
+    track is one of those, where a frame edge is appended after them. The
+    streams riding one NUT are one pipe, which the first of them stands for.
     """
-    return (*plan.rows_edges, *plan.stream_edges)
+    return (*plan.rows_edges, *once_per_pipe(plan.stream_edges))
 
 
 def plan_argv(
@@ -982,6 +1043,8 @@ def plan_argv(
     pipe_path: PipeNamer | None = None,
     rows_path: RowsNamer | None = None,
     apart: Callable[[PipeEdge], bool] | None = None,
+    params_path: ParamsNamer | None = None,
+    tap_path: Callable[[int], str] | None = None,
 ) -> dict[str, list[str]]:
     """The argv that runs each process of `plan`, keyed by process id.
 
@@ -1001,6 +1064,13 @@ def plan_argv(
 
     `apart` says which edges a placed run cuts between nodes; each is named
     at both ends (:func:`wires`).
+
+    `params_path` writes a node's params to a file and names it, for each
+    params placeholder; without it the placeholders stay, as a printed
+    command shows them.
+
+    `tap_path` names the pipe a node region writes a run-time lateral's
+    messages to, for each tap placeholder; without it they stay too.
     """
     read: dict[PipeEdge, str] = {}
     write: dict[PipeEdge, str] = {}
@@ -1011,17 +1081,22 @@ def plan_argv(
         write[wire.edge] = (
             STDOUT if wire.write_stdio else _named(pipe_path, wire.edge, "write")
         )
+    first = {pipe_key(edge): edge for edge in reversed(plan.stream_edges)}
+    for edge in plan.stream_edges:
+        if edge.nut:
+            read[edge] = read[first[edge.nut]]
+            write[edge] = write[first[edge.nut]]
 
     argv: dict[str, list[str]] = {}
     for process in plan.processes:
-        incoming = _once_per_ref(
-            [e for e in plan.stream_edges if e.target == process.id]
-        )
-        outgoing = [e for e in plan.stream_edges if e.source == process.id]
+        incoming = _once_per_ref([e for e in plan.stream_edges if e.target == process.id])
+        carried = [e for e in plan.stream_edges if e.source == process.id]
+        outgoing = once_per_pipe(carried)
         if isinstance(process, SidecarProcess):
             # A sidecar's reads are its pads, in the order its module takes
             # them, whatever order the startup walk put the edges in.
             incoming.sort(key=lambda edge: _pad_of(process, edge))
+            incoming = once_per_pipe(incoming)
             argv[process.id] = _sidecar_args(
                 process,
                 sidecar_argv,
@@ -1030,18 +1105,41 @@ def plan_argv(
                 len(outgoing),
             )
             continue
+        incoming = once_per_pipe(incoming)
         rows_in = _rows_inputs(process, plan)
         argv[process.id] = build_process_args(
             process.graph,
             pipe_inputs=[(read[edge], edge.container) for edge in rows_in]
             + [(read[edge], edge.format.container) for edge in incoming],
-            pipe_outputs=[(write[edge], edge.format) for edge in outgoing],
+            pipe_outputs=[
+                (
+                    write[edge],
+                    tuple(one.format for one in carried if pipe_key(one) == pipe_key(edge)),
+                )
+                for edge in outgoing
+            ],
             pipe_buffers=[edge.buffer for edge in outgoing],
             pipe_live=[edge.live for edge in outgoing],
             live=any(edge.live for edge in incoming),
             copyts=all(keeps_clock(edge, plan) for edge in incoming),
         )
-    return _resolve_rows_documents(argv, rows_path)
+    argv = _resolve_taps(argv, tap_path)
+    return _resolve_params_files(_resolve_rows_documents(argv, rows_path), plan, params_path)
+
+
+def _resolve_taps(
+    argv: dict[str, list[str]], tap_path: Callable[[int], str] | None
+) -> dict[str, list[str]]:
+    """Every tap placeholder in `argv` replaced by the pipe it is written to."""
+    if tap_path is None:
+        return argv
+
+    def resolve(token: str) -> str:
+        if not token.startswith(TAP_DOCUMENT):
+            return token
+        return tap_path(int(token[len(TAP_DOCUMENT) :]))
+
+    return {pid: [resolve(token) for token in args] for pid, args in argv.items()}
 
 
 def _pad_of(process: SidecarProcess, edge: StreamEdge) -> int:
@@ -1065,6 +1163,8 @@ def keeps_clock(edge: StreamEdge, plan: ProcessPlan) -> bool:
     reorder delay to take out. A codec package's encoder writes each packet
     at the time of the frame it coded, and its header says how deep it
     reorders rather than shifting anything, so its packets keep the clock.
+    A node network's packets keep the clock its inputs had, and a node
+    reading nothing writes its own, as a source module does.
     """
     if isinstance(edge.format, DataFormat) or not encoded(edge.format):
         return True
@@ -1073,11 +1173,37 @@ def keeps_clock(edge: StreamEdge, plan: ProcessPlan) -> bool:
         return False
     if producer.packet_source or producer.codec == "encode":
         return True
-    if not producer.packet_filter:
+    if not producer.packet_filter and not producer.node_network:
         return False
     return all(
         keeps_clock(e, plan) for e in plan.stream_edges if e.target == producer.id
     )
+
+
+def _resolve_params_files(
+    argv: dict[str, list[str]], plan: ProcessPlan, params_path: ParamsNamer | None
+) -> dict[str, list[str]]:
+    """Each node's params placeholder replaced by the file its params were
+    written to; unchanged without a namer."""
+    if params_path is None:
+        return argv
+    graphs = {
+        process.id: process.graph
+        for process in plan.processes
+        if isinstance(process, SidecarProcess) and process.graph is not None
+    }
+
+    def resolve(token: str) -> str:
+        name, sep, rest = token.partition("=")
+        if not sep or not rest.startswith(PARAMS_FILE):
+            return token
+        pid, _, node = rest[len(PARAMS_FILE) :].partition(":")
+        graph = graphs.get(pid)
+        if graph is None or node not in graph.nodes:
+            return token
+        return f"{name}={params_path(rest, json.dumps(graph.nodes[node].args, sort_keys=True))}"
+
+    return {pid: [resolve(token) for token in args] for pid, args in argv.items()}
 
 
 def _resolve_rows_documents(
@@ -1118,7 +1244,12 @@ def _sidecar_writes(
     order it reads them, and then its rows documents. Everything else hands
     its frames on over one output: its stdout where the edge chains, named
     here only where it does not, the pipe the relay serves."""
-    several = process.packet_source or process.packet_filter or process.data_filter
+    several = (
+        process.packet_source
+        or process.packet_filter
+        or process.data_filter
+        or process.node_network
+    )
     if several:
         streams = [write[edge] for edge in outgoing]
     else:
@@ -1181,7 +1312,7 @@ def render_plan(
     run = plan_argv(plan, sidecar_argv=sidecar_argv, pipe_path=pipe_path or _placeholder_pipe)
     argv = {pid: redact.argv(words) for pid, words in run.items()}
     if _is_pipeline(plan) and not plan.feeder_edges:
-        return _render_pipeline(plan, argv)
+        return "\n".join([_render_pipeline(plan, argv), *_listen_lines(plan)])
     return _render_listing(plan, argv)
 
 
@@ -1234,6 +1365,7 @@ def _render_listing(plan: ProcessPlan, argv: Mapping[str, list[str]]) -> str:
         for index, process in enumerate(plan.processes, start=1)
     ]
     lines += _feeder_lines(plan)
+    lines += _listen_lines(plan)
     lines += _lateral_lines(plan)
     lines.append(_COURTESY_NOTE)
     return "\n".join(lines)
@@ -1261,6 +1393,17 @@ def _feeder_lines(plan: ProcessPlan) -> list[str]:
     ]
 
 
+def _listen_lines(plan: ProcessPlan) -> list[str]:
+    """One line per port a process listens on for an input a node holds:
+    whatever connects there is shown, and the query writes nothing to it."""
+    return [
+        f"# listens: {process.id} at {feeder_path(port)} for {name}({port_name})"
+        for process in plan.processes
+        if isinstance(process, SidecarProcess)
+        for port, name, port_name in process.listens
+    ]
+
+
 def _lateral_lines(plan: ProcessPlan) -> list[str]:
     """Each run-time lateral as a block of its own: the data stream it is
     started from, the connections its instances write, what binds each value
@@ -1269,7 +1412,8 @@ def _lateral_lines(plan: ProcessPlan) -> list[str]:
     for lateral in plan.laterals:
         lines.append(
             f"# run-time: for each message of {lateral.stream} ({lateral.writer} "
-            f"writes it to {feeder_path(lateral.tap)} for the host), {lateral.function}"
+            + ("writes it" if lateral.pipe else f"writes it to {feeder_path(lateral.tap)}")
+            + f" for the host), {lateral.function}"
         )
         for connection in lateral.connections:
             found = [
@@ -1454,17 +1598,37 @@ def execute_plan(
             name = placeholder.rpartition(":")[2] or "0"
             return str(workspace() / f"rows-{name}.ndjson")
 
+        def params_path(placeholder: str, content: str) -> str:
+            # A node's params, written once where the run keeps its files.
+            path = workspace() / f"params-{len(list(workspace().glob('params-*')))}.json"
+            path.write_text(content, encoding="utf-8")
+            return str(path)
+
         def pipe_path(edge: PipeEdge, side: Side) -> str:
             # Named here, made by the relay when the edge's stage starts.
             path = pipes.path(workspace(), str(len(named)))
             named[(edge, side)] = path
             return path
 
+        taps: dict[int, tuple[str, str]] = {}
+
+        def tap_path(tap: int) -> str:
+            # The region writes one end and the host reads the other; the
+            # relay makes both when the writer's stage starts.
+            if tap not in taps:
+                taps[tap] = (
+                    pipes.path(workspace(), f"tap{tap}"),
+                    pipes.path(workspace(), f"tap{tap}-host"),
+                )
+            return taps[tap][0]
+
         argv = plan_argv(
             plan,
             sidecar_argv=sidecar_argv,
             pipe_path=pipe_path,
             rows_path=rows_path,
+            params_path=params_path,
+            tap_path=tap_path,
         )
         assigned = wires(plan)
         terminal = terminal_member(plan) if work is not None else None
@@ -1496,7 +1660,7 @@ def execute_plan(
                 work=work,
                 terminal=terminal,
                 laterals=_Laterals(
-                    compile_instance, sidecar_argv, rows or _print_row, dump
+                    compile_instance, sidecar_argv, rows or _print_row, dump, taps
                 ),
                 stop=stop,
             )
@@ -1606,7 +1770,10 @@ def _sidecar_args(
             hint="pass sidecar_argv, which renders one sidecar process as argv",
         )
     if streams > 1 and not (
-        process.packet_source or process.packet_filter or process.data_filter
+        process.packet_source
+        or process.packet_filter
+        or process.data_filter
+        or process.node_network
     ):
         raise FfrwdError(
             ErrorCode.INTERNAL,
@@ -1616,7 +1783,10 @@ def _sidecar_args(
             "spell a named pipe path",
         )
     if len(reads) > 1 and not (
-        process.packet_sink or process.packet_filter or process.data_filter
+        process.packet_sink
+        or process.packet_filter
+        or process.data_filter
+        or process.node_network
     ):
         raise FfrwdError(
             ErrorCode.INTERNAL,
@@ -1789,6 +1959,9 @@ class _LateralRun:
     at a time. A message that arrives while another's instance runs waits its
     turn, and one whose programme time would overlap the running or a waiting
     one is refused with a row. Each instance ends with a row saying how.
+
+    `ports` are the connections whose readers were not listening when the
+    writer started: the first instance waits for each to accept.
     """
 
     def __init__(
@@ -1799,8 +1972,14 @@ class _LateralRun:
         rows: RowSink,
         dump: Path | None,
         echo: Callable[[str, list[str]], None] | None,
+        path: str | None = None,
+        ports: Sequence[int] = (),
     ) -> None:
         self.lateral = lateral
+        self._ports = list(ports)
+        # The pipe the host reads the messages off, where the writer's region
+        # writes them itself; None where an ffmpeg dials the tap's port.
+        self._path = path
         self._compile = compile_instance
         self._sidecar_argv = sidecar_argv
         self._rows = rows
@@ -1812,6 +1991,10 @@ class _LateralRun:
         self._running: _Launch | None = None
         self._read_all = False
         self._count = 0
+        self._listener: socket.socket | None = None
+        if path is not None:
+            self._threads = [_start(self._read_pipe), _start(self._launch)]
+            return
         try:
             self._listener = socket.create_server((FEEDER_HOST, lateral.tap))
         except OSError as err:
@@ -1834,8 +2017,9 @@ class _LateralRun:
             self._turn.notify_all()
         for launch in left:
             self._row(launch.row, launch.start, refused=_ENDED)
-        with contextlib.suppress(OSError):
-            self._listener.close()
+        if self._listener is not None:
+            with contextlib.suppress(OSError):
+                self._listener.close()
 
     def join(self) -> None:
         for thread in self._threads:
@@ -1873,7 +2057,41 @@ class _LateralRun:
                 self._read_all = True
                 self._turn.notify_all()
 
+    def _read_pipe(self) -> None:
+        """Read every message off the pipe the relay hands the host, once the
+        relay has made it."""
+        assert self._path is not None  # only started for a piped tap
+        try:
+            stream = None
+            while stream is None and not self._stop.is_set():
+                try:
+                    stream = open(self._path, "rb", buffering=0)  # noqa: SIM115
+                except OSError:
+                    time.sleep(_FEEDER_POLL)
+            if stream is None:
+                return
+            messages = _Messages()
+            with stream:
+                while not self._stop.is_set():
+                    try:
+                        chunk = stream.read(_CHUNK)
+                    except OSError:
+                        break
+                    if not chunk:
+                        break
+                    for message in messages.feed(chunk):
+                        self._arrived(message)
+            rest = messages.rest()
+            if rest:
+                self._count += 1
+                self._row(self._count, None, refused=f"an unreadable message: {rest[:80]}")
+        finally:
+            with self._turn:
+                self._read_all = True
+                self._turn.notify_all()
+
     def _accept(self) -> socket.socket | None:
+        assert self._listener is not None  # only asked for a tap on a port
         while not self._stop.is_set():
             try:
                 connection, _ = self._listener.accept()
@@ -1930,6 +2148,18 @@ class _LateralRun:
     def _run(self, launch: _Launch) -> None:
         """One instance: compiled from the template as ``ffrwd run -v`` would,
         run by the plan runner, its members' stderr kept, and a row said."""
+        unheard = _unheard_port(self._ports, self._stop)
+        if unheard is not None:
+            self._row(
+                launch.row,
+                launch.start,
+                refused=_ENDED
+                if self._stop.is_set()
+                else f"nothing listened on {feeder_path(unheard)} for its feeder in "
+                f"{FEEDER_WAIT:.0f}s",
+            )
+            return
+        self._ports.clear()
         lateral = self.lateral
         filled = substitute(lateral.template, dict(launch.variables))
         # The template follows the definitions, so what an unset variable's
@@ -1970,6 +2200,26 @@ class _LateralRun:
         self._row(launch.row, launch.start, exit=_instance_exit(result))
 
 
+def _unheard_port(ports: Sequence[int], stop: threading.Event) -> int | None:
+    """The first of `ports` that accepted no connection in `FEEDER_WAIT`, or
+    before `stop`; None once every one has."""
+    for port in ports:
+        until = time.monotonic() + FEEDER_WAIT
+        while True:
+            if stop.is_set() or time.monotonic() >= until:
+                return port
+            try:
+                with socket.create_connection((FEEDER_HOST, port), timeout=_FEEDER_POLL * 5):
+                    break
+            except OSError:
+                time.sleep(_FEEDER_POLL)
+    return None
+
+
+def _ignore_flow(row: Mapping[str, object]) -> None:
+    """A tap's copy has no flow a stall or overflow is read off."""
+
+
 def _instance_exit(result: PlanResult) -> int:
     """How an instance ended: its failing member's code, else the code of a
     member the run's end stopped, else 0."""
@@ -1995,6 +2245,9 @@ class _Laterals:
     sidecar_argv: SidecarArgv | None
     rows: RowSink
     dump: Path | None
+    # Each piped lateral's tap: the pipe its region writes and the one the
+    # host reads, which the relay joins.
+    taps: Mapping[int, tuple[str, str]] = field(default_factory=dict)
 
 
 @dataclass
@@ -2106,6 +2359,10 @@ def _run_stage(
                 run.feeding,
                 stop,
             )
+        if failed is None and not show_only and not (stop is not None and stop.is_set()):
+            missing = never_started(run.held, run.members, run.local)
+            if missing is not None:
+                failed, timed_out, wedge = missing[0], True, missing[1]
     except KeyboardInterrupt:
         # `failed`/`timed_out`/`wedge` stay at their unstruck defaults: the
         # stage below reads as a clean stop, not a failure.
@@ -2211,6 +2468,7 @@ class _StageRun:
         self.stage_wires, self.writers = stage_wires(plan, stage, assigned)
         self.feeds = [(wire.edge.source, wire.edge.target) for wire in self.stage_wires]
         self.feeding = {pid: readers for pid, (_, readers) in self.writers.items()}
+        self.held = held_writers(self.writers, self.feeds)
         self.deadline = math.inf if timeout is None else time.monotonic() + timeout
         self.members: dict[str, _Member] = {}
         self.watching: dict[str, subprocess.Popen[bytes]] = {}
@@ -2232,6 +2490,7 @@ class _StageRun:
         for lateral in self.plan.laterals:
             if lateral.writer in self.local and laterals is not None:
                 assert laterals.compile_instance is not None  # execute_plan checks
+                tap = laterals.taps.get(lateral.tap) if lateral.pipe else None
                 self.runs.append(
                     _LateralRun(
                         lateral,
@@ -2240,12 +2499,16 @@ class _StageRun:
                         laterals.rows,
                         laterals.dump,
                         self._echo,
+                        tap[1] if tap is not None else None,
+                        ()
+                        if lateral.writer in self.held
+                        else [one.port for one in lateral.connections],
                     )
                 )
 
         self._relay_wires()
         for pid in _spawn_order(self.ids, self.stage_wires):
-            if pid in self.local and pid not in self.writers:
+            if pid in self.local and pid not in self.held:
                 self._spawn(pid)
 
         for pid, window in self.watching.items():
@@ -2265,7 +2528,7 @@ class _StageRun:
         time; None otherwise.
         """
         live = self.live + list(elsewhere)
-        for pid, (port, readers) in self.writers.items():
+        for pid, (port, readers) in self.held.items():
             if pid not in self.local:
                 continue
             heard = _await_port(
@@ -2350,6 +2613,25 @@ class _StageRun:
                 )
             )
             heard[name] = functools.partial(_heard, flow)
+            self.relayed.append(name)
+        taps = self._laterals.taps if self._laterals is not None else {}
+        for lateral in self.plan.laterals:
+            tap = taps.get(lateral.tap) if lateral.pipe else None
+            if tap is None or lateral.writer not in self.local:
+                continue
+            # The messages the region writes, carried to the host's own read.
+            name = f"s{self._stage}tap{lateral.tap}"
+            edges.append(
+                RelayEdge(
+                    id=name,
+                    source=tap[0],
+                    dest=tap[1],
+                    depth=_read_ahead(None),
+                    buffer=pipes.DEFAULT_BUFFER,
+                    spool=True,
+                )
+            )
+            heard[name] = _ignore_flow
             self.relayed.append(name)
         if edges:
             self._relay().open(edges, heard, self.deadline)
@@ -2455,7 +2737,7 @@ def stage_result(
     if timed_out:
         failure = next((r for r in results if r.id == failed), None)
         failures = [r for r in results if r.id == failed]
-        code = 0 if failure is None else _FAILED
+        code = 0 if failure is None and wedge is None else _FAILED
     elif failed is not None:
         failure, consequences = _attribute(results, ended, feeds, writers)
         blamed = {r.id for r in consequences}
@@ -2859,11 +3141,11 @@ def _cpu_seconds(proc: subprocess.Popen[bytes] | RemoteProcess) -> float | None:
 
 
 def _writes_rows_to_stdout(process: Process) -> bool:
-    """True for a sink region or a data filter whose rows name no file: they
-    ride its stdout."""
+    """True for a sink region, a data filter or a node network whose rows
+    name no file: they ride its stdout, and its streams take named pipes."""
     return (
         isinstance(process, SidecarProcess)
-        and (process.sink or process.data_filter)
+        and (process.sink or process.data_filter or process.node_network)
         and any(
             not document.sink.alias and not document.sink.path
             for document in process.rows

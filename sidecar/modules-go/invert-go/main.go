@@ -1,10 +1,6 @@
 // Every colour byte replaced by its complement, alpha untouched: the Go twin
-// of the fleet's `invert`, byte for byte over the same frames.
-//
-// It exports `window-filter` at window 1, stride 1, which is what a per-frame
-// video filter is in that interface's terms. The older per-frame `filter`
-// would say the same thing; this one is what a windowed Go module will use,
-// so it is what this proves.
+// of the fleet's `invert`, as a node. One rgba picture in, the clock, and
+// one out in its format, one frame for each frame at its own time.
 package main
 
 import (
@@ -12,11 +8,16 @@ import (
 
 	"go.bytecodealliance.org/cm"
 
+	"github.com/imbcmdth/ffrwd/sidecar/modules-go/internal/ffrwd/av/node"
+	nodetick "github.com/imbcmdth/ffrwd/sidecar/modules-go/internal/ffrwd/av/node-tick"
+	nodetypes "github.com/imbcmdth/ffrwd/sidecar/modules-go/internal/ffrwd/av/node-types"
 	"github.com/imbcmdth/ffrwd/sidecar/modules-go/internal/ffrwd/av/types"
-	windowfilter "github.com/imbcmdth/ffrwd/sidecar/modules-go/internal/ffrwd/av/window-filter"
 )
 
 const paramsSchema = `{"type":"object","properties":{},"additionalProperties":false}`
+
+type shapeResult = cm.Result[node.NodeShapeShape, node.NodeShape, string]
+type emittedResult = cm.Result[node.EmittedShape, node.Emitted, string]
 
 // Validates that params is empty or `{}`; invert-go takes no parameters.
 func validateParams(params string) cm.Result[string, struct{}, string] {
@@ -28,51 +29,69 @@ func validateParams(params string) cm.Result[string, struct{}, string] {
 	}
 }
 
-func describe() windowfilter.WindowMeta {
-	return windowfilter.WindowMeta{
-		Meta: types.Meta{
-			Name:         "invert-go",
-			Version:      "0.1.0",
-			ParamsSchema: paramsSchema,
-			RowsSchema:   "",
-			PixelFormats: cm.ToList([]string{"rgba"}),
-			// Not an audio module, so it names no sample formats.
-			SampleFormats: cm.ToList([]string{}),
-			SampleRates:   cm.ToList([]uint32{}),
-			ChannelCounts: cm.ToList([]uint32{}),
-			RowsLanguage:  cm.ToList([]string{}),
-		},
-		Window: 1,
-		Stride: 1,
-		// Nothing carries over between calls.
-		Pure:     true,
-		OneToOne: true,
-		// No rows are read, and none arriving are passed on.
-		ReadsRows:    false,
-		ForwardsRows: false,
-		Inputs:       1,
+func describe() types.Meta {
+	return types.Meta{
+		Name:          "invert-go",
+		Version:       "0.2.0",
+		ParamsSchema:  paramsSchema,
+		PixelFormats:  cm.ToList([]string{}),
+		SampleFormats: cm.ToList([]string{}),
+		SampleRates:   cm.ToList([]uint32{}),
+		ChannelCounts: cm.ToList([]uint32{}),
+		RowsLanguage:  cm.ToList([]string{}),
 	}
 }
 
-// What the call in flight hands back, allocated on the first call and reused
-// by every call after it.
-//
-// Two things force this. The host reads the output after `process` returns,
-// through component-model pointers the collector does not keep memory alive
-// for - and any allocation inside the call is what lets the collector run at
-// all. Allocating once and reusing avoids both: package-level buffers are
-// permanent roots, and a call that allocates nothing cannot collect. The
-// frame size is fixed for the life of an instance, so one call's buffer fits
-// every later call's frame.
+func shape(params string, _ cm.List[node.Binding]) shapeResult {
+	if bad := validateParams(params); bad.IsErr() {
+		return cm.Err[shapeResult](*bad.Err())
+	}
+	v := nodetypes.InputPort{
+		Name:     "v",
+		Kind:     nodetypes.PortKindVideo,
+		Required: true,
+		Pairing:  nodetypes.PairingLockstep(),
+		Rows:     nodetypes.RowsUseIgnore,
+		Window:   1,
+		Stride:   1,
+		Accepts: nodetypes.Accepts{
+			PixelFormats:  cm.ToList([]string{"rgba"}),
+			SampleFormats: cm.ToList([]string{}),
+			SampleRates:   cm.ToList([]uint32{}),
+			ChannelCounts: cm.ToList([]uint32{}),
+			Codecs:        cm.ToList([]string{}),
+			Wants:         types.WantsAll,
+		},
+	}
+	out := nodetypes.OutputPort{
+		Name:   "v",
+		Kind:   nodetypes.PortKindVideo,
+		Format: cm.Some(nodetypes.OutputFormatLike(nodetypes.LikeInput{Port: "v"})),
+	}
+	return cm.OK[shapeResult](node.NodeShape{
+		Inputs:   cm.ToList([]nodetypes.InputPort{v}),
+		Outputs:  cm.ToList([]nodetypes.OutputPort{out}),
+		Clock:    nodetypes.ClockInput("v"),
+		Pure:     true,
+		OneToOne: true,
+		Bounded:  true,
+		Relation: cm.ToList([]string{}),
+	})
+}
+
+// The stream `v` is bound to, from init.
+var stream uint32
+
+// What the call in flight hands back. The host reads it after `process`
+// returns, through component-model pointers no collector keeps alive, so the
+// Go values behind them stay here until the next call replaces them.
 var (
-	outPixels []byte
-	outFrames []windowfilter.OutFrame
+	outPixels [][]byte
+	outItems  []node.Emission
 	noRows    = []string{}
 )
 
 // Writes the complement of every colour byte into out, alpha copied through.
-// Reading and writing separate buffers is what lets the output survive the
-// call; complementing the host's buffer in place would not.
 func invert(out, in []byte) {
 	for i := 0; i+3 < len(in); i += 4 {
 		out[i] = 255 - in[i]
@@ -82,49 +101,47 @@ func invert(out, in []byte) {
 	}
 }
 
-// Rows arriving with a frame stop here, as they do in the Rust invert, so
-// nothing an upstream module emitted leaves on this module's output.
-func process(frames cm.List[windowfilter.InFrame], _ cm.List[string], _ bool) windowfilter.Processed {
-	in := frames.Slice()
-
-	total := 0
-	for i := range in {
-		total += int(in[i].Frame.Len())
+func process(rep cm.Rep) emittedResult {
+	tick := nodetick.Tick(cm.Resource(rep))
+	// The tick arrives as a borrowed handle the bindings do not release,
+	// and a call that returns holding one is refused.
+	defer tick.ResourceDrop()
+	frames := tick.Frames(stream).Slice()
+	outPixels = outPixels[:0]
+	outItems = outItems[:0]
+	for _, frame := range frames {
+		in := tick.Fetch(stream, frame.Index).Slice()
+		out := make([]byte, len(in))
+		invert(out, in)
+		outPixels = append(outPixels, out)
+		outItems = append(outItems, node.Emission{
+			Port: "v",
+			Payload: node.PayloadFrame(types.RawFrame{
+				Pts:      frame.Pts,
+				Duration: frame.Duration,
+				Data:     cm.ToList(out),
+			}),
+		})
 	}
-	if cap(outPixels) < total {
-		outPixels = make([]byte, total)
-	}
-	if cap(outFrames) < len(in) {
-		outFrames = make([]windowfilter.OutFrame, len(in))
-	}
-	outPixels, outFrames = outPixels[:total], outFrames[:len(in)]
-
-	at := 0
-	for i := range in {
-		pixels := in[i].Frame.Slice()
-		out := outPixels[at : at+len(pixels)]
-		invert(out, pixels)
-		at += len(pixels)
-		outFrames[i] = windowfilter.OutFrame{
-			Pts:   in[i].Pts,
-			Frame: windowfilter.FramePayloadNew(cm.ToList(out)),
-			Rows:  cm.ToList(noRows),
-		}
-	}
-
-	return windowfilter.Processed{
-		Frames:   cm.ToList(outFrames),
-		Trailing: cm.ToList(noRows),
-	}
+	return cm.OK[emittedResult](node.Emitted{
+		Items: cm.ToList(outItems),
+		Rows:  cm.ToList(noRows),
+	})
 }
 
 func init() {
-	windowfilter.Exports.Describe = describe
-	windowfilter.Exports.Init = func(_ types.Format, _ types.StreamInfo, params string) cm.Result[string, struct{}, string] {
+	node.Exports.Describe = describe
+	node.Exports.Shape = shape
+	node.Exports.Init = func(bound cm.List[node.BoundStream], _ cm.List[string], params string) cm.Result[string, struct{}, string] {
+		for _, b := range bound.Slice() {
+			if b.Port == "v" {
+				stream = b.ID
+			}
+		}
 		return validateParams(params)
 	}
-	windowfilter.Exports.SetParams = validateParams
-	windowfilter.Exports.Process = process
+	node.Exports.SetParams = validateParams
+	node.Exports.Process = process
 }
 
 // Required by the toolchain; a component's work happens in its exports.

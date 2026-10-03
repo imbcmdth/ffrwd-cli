@@ -66,6 +66,7 @@ from .processes import (
     RowsEdge,
     SidecarProcess,
     StreamEdge,
+    once_per_pipe,
 )
 
 __all__ = ["Milestone", "arrange", "check", "relation", "stalled"]
@@ -121,6 +122,13 @@ def relation(plan: ProcessPlan) -> dict[Milestone, tuple[Milestone, ...]]:
     concurrent = {
         process.id for process in plan.processes if isinstance(process, SidecarProcess)
     }
+    # A node network writes each output from a thread and a queue of its own,
+    # so no output's frames wait on another's reader.
+    unqueued = {
+        process.id
+        for process in plan.processes
+        if isinstance(process, SidecarProcess) and process.node_network
+    }
 
     waits: dict[Milestone, tuple[Milestone, ...]] = {}
     for pid in ids:
@@ -142,12 +150,13 @@ def relation(plan: ProcessPlan) -> dict[Milestone, tuple[Milestone, ...]]:
         for index, edge in enumerate(outputs[pid]):
             waits[("head", pid, index)] = (("run", pid, 0), *fed)
             after: list[Milestone] = [("head", pid, index)]
-            if index:
+            if index and pid not in unqueued:
                 after.append(("write", pid, index - 1))
             if held is not None:
                 after.append(held)
             waits[("write", pid, index)] = tuple(after)
-            held = None if _carried(plan, edge) else ("run", edge.target, 0)
+            carried = _carried(plan, edge) or pid in unqueued
+            held = None if carried else ("run", edge.target, 0)
     return waits
 
 
@@ -379,11 +388,12 @@ def _reads(plan: ProcessPlan, pid: str) -> list[StreamEdge]:
 
 
 def _writes(plan: ProcessPlan, pid: str) -> list[StreamEdge]:
-    return [e for e in plan.stream_edges if e.source == pid]
+    return once_per_pipe([e for e in plan.stream_edges if e.source == pid])
 
 
 def _once_per_ref(edges: Sequence[StreamEdge]) -> list[StreamEdge]:
-    """One edge per ref: two edges of one ref share a single ``-i``."""
+    """One edge per ref: two edges of one ref share a single ``-i``, and the
+    streams of one NUT one pipe."""
     seen: set[str] = set()
     kept: list[StreamEdge] = []
     for edge in edges:
@@ -391,7 +401,7 @@ def _once_per_ref(edges: Sequence[StreamEdge]) -> list[StreamEdge]:
             continue
         seen.add(edge.ref)
         kept.append(edge)
-    return kept
+    return once_per_pipe(kept)
 
 
 # ---------------------------------------------------------------- reading a plan
@@ -408,7 +418,7 @@ def _pipe_inputs(plan: ProcessPlan, pid: str) -> list[Edge]:
 
 def _pipe_outputs(plan: ProcessPlan, pid: str) -> list[Edge]:
     """What `pid` writes, in the order its outputs are rendered."""
-    frames: list[Edge] = [e for e in plan.stream_edges if e.source == pid]
+    frames: list[Edge] = list(once_per_pipe([e for e in plan.stream_edges if e.source == pid]))
     rows: list[Edge] = [e for e in plan.rows_edges if e.source == pid]
     return frames + rows
 
@@ -433,7 +443,7 @@ def _key(edge: Edge) -> Wire:
     if isinstance(edge, RowsEdge):
         return ("rows", edge.source, edge.target, edge.alias)
     if isinstance(edge, StreamEdge):
-        return ("stream", edge.source, edge.target, edge.ref)
+        return ("stream", edge.source, edge.target, edge.nut or edge.ref)
     return ("file", edge.source, edge.target)
 
 

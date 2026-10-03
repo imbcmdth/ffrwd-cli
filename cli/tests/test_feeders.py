@@ -47,6 +47,7 @@ from ffrwd.registry import Registry, load_reference
 from ffrwd.relay import Relay
 from ffrwd.split import insert_splits
 from ffrwd.wasm import WORLDS, Described, Feeder
+from tests.conftest import older_world_refusal
 
 execute = sys.modules["ffrwd.execute"]
 lower = sys.modules["ffrwd.lower"]
@@ -413,11 +414,11 @@ def test_no_feeder_wires_nothing_and_the_port_keeps_its_default(call: str) -> No
 def test_only_a_feeder_may_default_to_null_at_the_declaration(
     declaration: str, needle: str
 ) -> None:
-    with pytest.raises(FfrwdError) as caught:
-        resolve(parse(declaration + "\nCOPY (SELECT f(p.video[1]) FROM input('p.mp4') p) "
-                      "TO 'out.mp4'"))
-    assert caught.value.code is ErrorCode.UNSUPPORTED_SQL
-    assert needle in caught.value.message
+    refusal = older_world_refusal(
+        declaration + "\nCOPY (SELECT f(p.video[1]) FROM input('p.mp4') p) TO 'out.mp4'"
+    )
+    assert refusal.code is ErrorCode.UNSUPPORTED_SQL
+    assert needle in refusal.message
 
 
 def test_a_null_default_the_module_reads_as_a_pad_is_refused() -> None:
@@ -647,6 +648,57 @@ def test_a_writer_ends_nothing_once_its_reader_has_gone(code: int) -> None:
     assert execute._watch(
         running, time.monotonic() + 5, stall=None, writers={"ffmpeg0": ["sidecar0"]}
     ) == (None, False, None)
+
+
+def test_a_writer_its_readers_wait_on_is_started_with_the_stage() -> None:
+    """Held for its port is only a writer whose readers can listen without it."""
+    writers = {
+        "ffmpeg1": (9000, ["sidecar0"]),
+        "sidecar1": (9002, ["sidecar1", "sidecar2"]),
+        "ffmpeg3": (9004, ["sidecar3"]),
+    }
+    feeds = [("ffmpeg2", "sidecar0"), ("ffmpeg3", "sidecar4"), ("sidecar4", "sidecar3")]
+    assert execute.held_writers(writers, feeds) == {"ffmpeg1": (9000, ["sidecar0"])}
+
+
+def test_a_stage_that_never_started_a_writer_fails() -> None:
+    """Whether its port was never heard or its readers ended first, nothing it
+    writes was written, and the run says so instead of exiting 0."""
+    held = {"sidecar0": (9000, ["sidecar1"])}
+    assert execute.never_started(held, ["sidecar0", "sidecar1"], ["sidecar0", "sidecar1"]) is None
+    assert execute.never_started(held, ["sidecar1"], ["sidecar1"]) is None
+    pid, error = execute.never_started(held, ["sidecar1"], ["sidecar0", "sidecar1"])
+    assert pid == "sidecar0" and error.code is ErrorCode.INPUT_NEVER_OPENED
+    assert error.message.startswith(
+        "sidecar0, which writes tcp://127.0.0.1:9000 for sidecar1, was never started"
+    )
+    result = execute.stage_result(
+        0, [], {}, [], failed=pid, timed_out=True, wedge=error, interrupted=False
+    )
+    assert result.exit_code != 0 and result.overflow is error and not result.timed_out
+
+
+def test_an_unheld_writers_first_instance_waits_for_its_port(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(execute, "FEEDER_WAIT", 0.3)
+    stop = threading.Event()
+    with _held_port() as listener:
+        port = listener.getsockname()[1]
+        assert execute._unheard_port([port], stop) == port
+
+        def listen_late() -> None:
+            time.sleep(0.1)
+            listener.listen()
+
+        monkeypatch.setattr(execute, "FEEDER_WAIT", 10.0)
+        opener = threading.Thread(target=listen_late)
+        opener.start()
+        assert execute._unheard_port([port], stop) is None
+        opener.join()
+    stop.set()
+    with _held_port() as listener:
+        assert execute._unheard_port([listener.getsockname()[1]], stop) is not None
 
 
 def test_a_writer_failing_while_its_reader_runs_ends_the_stage() -> None:

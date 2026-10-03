@@ -8,7 +8,7 @@
 //! crossed and says so once, at the end.
 
 wit_bindgen::generate!({
-    path: "../../wit",
+    path: "../../worlds/0.18.0",
     world: "packet-filter-module",
 });
 
