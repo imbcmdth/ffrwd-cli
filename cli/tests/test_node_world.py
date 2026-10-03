@@ -21,6 +21,7 @@ import pytest
 
 from ffrwd import shapes, wasm
 from ffrwd.compiler import compile_all
+from ffrwd.diagram import render_diagram
 from ffrwd.errors import ErrorCode, FfrwdError
 from ffrwd.execute import plan_argv
 from ffrwd.ir import Graph
@@ -1639,23 +1640,31 @@ def test_a_timing_input_beside_a_reader_of_the_same_picture_binds_its_stream(
     )
     feeder = _feeder(argv)
     assert feeder.count("-map") == 1
+    assert "-filter_complex" not in feeder, "the one picture crosses whole"
     assert feeder[feeder.index("-pix_fmt:0") + 1] == "rgba"
     sidecar = argv["sidecar0"]
     assert sidecar[sidecar.index("-filter_complex") + 1] == (
         "[v=0:v]spot=every=30[spots=n1];[v=0:v][boxes=n1]boxes_mask[v=out0]"
     )
+    assert "-pad" not in sidecar or "geometry" not in sidecar[sidecar.index("-pad") + 1]
 
 
-def test_a_timing_input_alone_takes_the_picture_in_the_format_it_has(
+def test_a_timing_input_alone_takes_the_picture_small_in_the_format_it_has(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """A picture only timing inputs read crosses at 16x16, its own size said
+    in its ``-pad``, and the plan's diagram says so."""
     monkeypatch.setitem(SHAPES, "spot.wasm", _taking(_spot, "video", _TIMING))
-    feeder = _feeder(_plan_argv(
-        "COPY (SELECT spot(f.video[1]) FROM input('f.mp4') f) TO 'spots.ndjson'",
-        monkeypatch,
-        pix_fmt="yuv444p",
-    ))
+    query = "COPY (SELECT spot(f.video[1]) FROM input('f.mp4') f) TO 'spots.ndjson'"
+    argv = _plan_argv(query, monkeypatch, pix_fmt="yuv444p")
+    feeder = _feeder(argv)
+    assert feeder[feeder.index("-filter_complex") + 1] == "[0:v:0]scale=width=16:height=16[out0]"
     assert feeder[feeder.index("-pix_fmt:0") + 1] == "yuv444p"
+    (sidecar,) = [words for pid, words in argv.items() if pid.startswith("sidecar")]
+    pad = json.loads(sidecar[sidecar.index("-pad") + 1])
+    assert pad["geometry"] == [{"width": 320, "height": 240}]
+    plan = _plan(query, monkeypatch, pix_fmt="yuv444p")
+    assert "-->|nut rawvideo, timing, 16x16|" in render_diagram([], plan)
 
 
 @pytest.mark.parametrize(("source", "named"), [("yuv420p", "yuv444p"), ("yuv444p", "yuv420p")])
@@ -1674,7 +1683,9 @@ def test_a_timing_input_after_a_format_takes_the_format_it_names(
         pix_fmt=source,
     )
     (writer,) = [words for pid, words in argv.items() if pid.startswith("ffmpeg")]
-    assert writer[writer.index("-filter_complex") + 1].endswith(f"format=pix_fmts={named}[out0]")
+    assert writer[writer.index("-filter_complex") + 1].endswith(
+        f"format=pix_fmts={named},scale=width=16:height=16[out0]"
+    )
     assert writer[writer.index("-pix_fmt:0") + 1] == named
     _with_boxes_mask(monkeypatch)
     mixed = _plan_argv(
@@ -1689,6 +1700,8 @@ def test_a_timing_input_after_a_format_takes_the_format_it_names(
     ]
     assert feeder[feeder.index("-pix_fmt:0") + 1] == "rgba"
     assert feeder[feeder.index("-pix_fmt:1") + 1] == named
+    pad = json.loads(mixed["sidecar0"][mixed["sidecar0"].index("-pad") + 1])
+    assert pad["geometry"] == [None, {"width": 320, "height": 240}]
 
 
 def test_explain_says_timing_for_an_input_read_for_its_timing(

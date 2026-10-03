@@ -31,6 +31,7 @@ from .processes import (
     RowsEdge,
     SidecarProcess,
     StreamEdge,
+    VideoFormat,
 )
 
 __all__ = ["INSTALL_HINT", "render_diagram", "render_terminal", "termaid_available"]
@@ -126,7 +127,10 @@ def _rows_file_lines(process: SidecarProcess) -> list[str]:
 def _edge_label(edge: Edge) -> str:
     """What crosses this edge, as the arrow's label."""
     if isinstance(edge, StreamEdge):
-        return f"{edge.format.container} {edge.format.codec}"
+        wire = edge.format
+        if isinstance(wire, VideoFormat) and wire.geometry is not None:
+            return f"{wire.container} {wire.codec}, timing, {wire.size}"
+        return f"{wire.container} {wire.codec}"
     if isinstance(edge, RowsEdge):
         return f"{edge.container} rows"
     if isinstance(edge, FeederEdge):
