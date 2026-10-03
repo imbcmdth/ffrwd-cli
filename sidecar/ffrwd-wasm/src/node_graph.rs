@@ -2002,11 +2002,19 @@ mod tests {
         );
     }
 
-    /// shape-probe, built for wasm32-wasip2 once per test binary.
-    fn probe() -> String {
-        static BUILT: OnceLock<String> = OnceLock::new();
+    /// shape-probe, built for wasm32-wasip2 once per test binary; none
+    /// where that target is not installed (CI's module-free job).
+    fn probe() -> Option<String> {
+        static BUILT: OnceLock<Option<String>> = OnceLock::new();
         BUILT
             .get_or_init(|| {
+                let targets = std::process::Command::new("rustup")
+                    .args(["target", "list", "--installed"])
+                    .output()
+                    .ok()?;
+                if !String::from_utf8_lossy(&targets.stdout).contains("wasm32-wasip2") {
+                    return None;
+                }
                 let modules = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                     .parent()
                     .expect("ffrwd-wasm/ has a parent")
@@ -2028,16 +2036,22 @@ mod tests {
                     "{}",
                     String::from_utf8_lossy(&output.stderr)
                 );
-                modules
-                    .join("target/wasm32-wasip2/release/shape_probe.wasm")
-                    .display()
-                    .to_string()
+                Some(
+                    modules
+                        .join("target/wasm32-wasip2/release/shape_probe.wasm")
+                        .display()
+                        .to_string(),
+                )
             })
             .clone()
     }
 
     #[test]
     fn a_picture_read_for_its_timing_alone_is_carried_without_its_bytes() {
+        let Some(probe) = probe() else {
+            eprintln!("wasm32-wasip2 is not installed: the timing test has no module to run");
+            return;
+        };
         let dir = std::env::temp_dir().join(format!("ffrwd-timing-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("a scratch directory");
         let tenths = nut::TimeBase { num: 1, den: 10 };
@@ -2066,7 +2080,7 @@ mod tests {
                 "-i",
                 &input.display().to_string(),
                 "-m",
-                &format!("shape_probe={}", probe()),
+                &format!("shape_probe={probe}"),
                 "-filter_complex",
                 chain,
                 "-map",
