@@ -1,6 +1,7 @@
 //! A sink of any number of pictures, taken as they arrive: it writes
 //! nothing on any port, and on its last call says, as rows, how many frames
-//! each stream brought and their first and last pts.
+//! each stream brought and their first and last pts. Self-clocked, or with
+//! `rate` a publisher's shape: a rate clock that only needs turns.
 
 // Every shape module carries the same few helpers, and not every one uses
 // each of them.
@@ -135,7 +136,9 @@ fn rate(num: i32) -> Rational {
 use std::collections::BTreeMap;
 
 #[derive(Deserialize, Default)]
-struct Params {}
+struct Params {
+    rate: Option<i32>,
+}
 
 thread_local! {
     static SEEN: RefCell<BTreeMap<u32, (u64, i64, i64)>> = const { RefCell::new(BTreeMap::new()) };
@@ -145,17 +148,23 @@ struct Node;
 
 impl Guest for Node {
     fn describe() -> Meta {
-        meta("shape_sink", "")
+        meta(
+            "shape_sink",
+            r#"{"type":"object","properties":{"rate":{"type":"integer"}}}"#,
+        )
     }
 
     fn shape(
         params: String,
         _bound: Vec<ffrwd::av::node_types::Binding>,
     ) -> Result<NodeShape, String> {
-        parse::<Params>(&params)?;
+        let params = parse::<Params>(&params)?;
         let mut v = input("v", PortKind::Video, Pairing::Arrival, RowsUse::Ignore);
         v.many = true;
-        Ok(shape(vec![v], Vec::new(), Clock::SelfClocked, false))
+        let clock = params
+            .rate
+            .map_or(Clock::SelfClocked, |r| Clock::Rate(rate(r)));
+        Ok(shape(vec![v], Vec::new(), clock, false))
     }
 
     fn init(bound: Vec<BoundStream>, _latched: Vec<String>, _params: String) -> Result<(), String> {

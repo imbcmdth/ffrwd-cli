@@ -632,6 +632,84 @@ fn a_sink_of_many_pictures_takes_every_frame_of_each() {
 }
 
 #[test]
+fn a_rate_clock_that_only_needs_turns_ends_with_its_inputs() {
+    use std::io::Write as _;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let dir = scratch("turns");
+    let epoch = 17_909_860_700i64;
+    let items: Vec<(usize, Write)> = (0..20)
+        .map(|k| (0, Write::Frame(epoch + k, vec![0u8; 16])))
+        .collect();
+    let wire_path = dir.join("in.nut");
+    write_nut(&wire_path, &[video(2, 2, TENTHS, (10, 1))], &items);
+    let wire = fs::read(&wire_path).expect("the input");
+    let rows = dir.join("rows.ndjson");
+    let sink = module("shape_sink");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ffrwd-wasm"))
+        .args([
+            "-f",
+            "nut",
+            "-i",
+            "pipe:0",
+            "-m",
+            &sink,
+            "-filter_complex",
+            "[v=0:v]shape_sink=rate=50[@rows=r]",
+            "-map",
+            "[r]",
+            "-f",
+            "ndjson",
+            &rows.display().to_string(),
+        ])
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ffrwd-wasm");
+    let mut stdin = child.stdin.take().expect("its stdin");
+    for chunk in wire.chunks(wire.len().div_ceil(10)) {
+        if stdin.write_all(chunk).and_then(|_| stdin.flush()).is_err() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    drop(stdin);
+    let ended = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll the run") {
+            break status;
+        }
+        if ended.elapsed() > Duration::from_secs(10) {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the run was still going 10 s after its source ended");
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let after = ended.elapsed();
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(&mut child.stderr.take().expect("stderr"), &mut stderr)
+        .expect("read stderr");
+    assert!(status.success(), "exited {status:?}:\n{stderr}");
+    let rows = lines(&fs::read(&rows).expect("the rows"));
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let ticks = rows[0]["pts"].as_i64().expect("the last call's pts");
+    println!(
+        "a rate clock at 50/s over 2 s of source fed in 1 s: {ticks} ticks, ended {} ms after its source",
+        after.as_millis()
+    );
+    assert_eq!(rows[0]["frames"], 20);
+    assert_eq!(rows[0]["first"], epoch);
+    assert_eq!(rows[0]["last"], epoch + 19);
+    assert!(
+        after < Duration::from_secs(1),
+        "ended {after:?} after its source"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn a_reader_by_interval_waits_for_the_window_that_holds_its_time() {
     let dir = scratch("window");
     let audio = Stream::audio("f32", 48000, 1).expect("f32 is carried");

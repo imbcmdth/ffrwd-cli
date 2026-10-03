@@ -222,7 +222,11 @@ tick that held them.
   all `arrival` (a publisher that needs only turns) ticks when something
   has arrived that no tick has taken, or one period of its rate after its
   last tick, so it never runs ahead of real time with nothing to hand;
-  once every input has ended it runs on to the last frame's time at once.
+  once every input has ended, a tick takes whatever arrived that no tick
+  had taken, if anything, and the last call follows at once, whatever
+  the clock reads: an `arrival` input's pts may sit on any origin (a feed
+  at the epoch while the clock counts from 0), so they never hold the
+  clock.
 - **Hold inputs.** A hold input bound to a stream holds the tick until its
   source has arrived past it (its picture, or with none its sound, past
   `lead` beyond the tick), or ended, for no longer than its
@@ -297,8 +301,9 @@ tick that held them.
   node runs one tick at a time.
 - **Finishing.** A node that says it is finished gets its last call on the
   instance that said so, and its outputs end; a rate clock with inputs
-  makes its last call once every input has ended and its ticks have
-  passed the last frame.
+  makes its last call once every input has ended, nothing that arrived is
+  left untaken, and its ticks have passed the last frame of every input
+  paired to them (`lockstep`, `hold`, `interval`).
 - **`rowmerge=max_span=<s>`** is the span reducer: rows sharing a
   `start_t` are one span, which keeps the last row's fields and ends at the
   end of the last tick that carried one (a tick with none is a gap inside

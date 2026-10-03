@@ -1020,11 +1020,6 @@ impl Assembler {
         }
     }
 
-    /// How many ticks have been made.
-    pub fn ticks_made(&self) -> u64 {
-        self.made
-    }
-
     /// Whether anything has arrived that no tick has taken.
     pub fn has_arrivals(&self) -> bool {
         self.inputs.iter().any(|i| !i.queue.is_empty())
@@ -1034,6 +1029,33 @@ impl Assembler {
     /// settles a tick and its turns are bounded only by time.
     pub fn arrival_only(&self) -> bool {
         self.inputs.iter().all(|i| i.pairing == Pairing::Arrival)
+    }
+
+    /// Whether a rate clock whose inputs have all ended has handed them
+    /// everything: nothing delivered as it arrives is waiting, and its
+    /// ticks have passed the newest time of every paired input. An arrival
+    /// input's times may sit on any origin, so they never hold the clock.
+    pub fn played_out(&self, base: TimeBase) -> bool {
+        let unpaired = |i: &Input| i.pairing == Pairing::Arrival;
+        if self
+            .inputs
+            .iter()
+            .any(|i| unpaired(i) && !i.queue.is_empty())
+        {
+            return false;
+        }
+        let groups = self.holds.iter().filter_map(|g| g.progress(base));
+        let latest = self
+            .inputs
+            .iter()
+            .filter(|i| i.hold.is_none() && !unpaired(i))
+            .filter_map(|i| {
+                i.progress
+                    .map(|p| ffrwd_wasm_runtime::node::rescale(p, i.base, base))
+            })
+            .chain(groups)
+            .max();
+        latest.is_none_or(|latest| self.made as i64 > latest)
     }
 
     /// Whether any stream is bound to the node.

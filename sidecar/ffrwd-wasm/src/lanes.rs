@@ -20,7 +20,10 @@
 //! a tick at a time as its queue has room, so it runs as fast as its
 //! outputs drain. A rate clock whose inputs are all delivered as they arrive
 //! (a publisher that only needs turns) is cut a tick when something has
-//! arrived, or one period of its rate after its last tick, until they end.
+//! arrived, or one period of its rate after its last tick, until they end;
+//! then a tick takes what arrived untaken and its last call follows at
+//! once, whatever its tick count. A rate clock with paired inputs runs on
+//! past their newest time first.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -519,14 +522,9 @@ impl State {
                     {
                         break;
                     }
-                    let tick = if a.all_ended() {
-                        let made = a.ticks_made() as i64;
-                        let past = a.latest(base).is_none_or(|latest| made > latest);
-                        a.next_rate(past)?
-                    } else {
-                        a.next_rate(false)?
+                    let Some(tick) = a.next_rate(a.all_ended() && a.played_out(base))? else {
+                        break;
                     };
-                    let Some(tick) = tick else { break };
                     let last = tick.last;
                     cut.push((tick, a.tick_end()));
                     if paced {
@@ -1327,5 +1325,143 @@ fn worker(shared: &Shared) {
         state = shared.lock();
         state.complete(i, ordinal, instance, runner, done);
         shared.notify();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ffrwd_wasm_runtime::node::{
+        Accepts, BoundStream, Clock, InputPort, Pairing, PortKind, Rational, RowsUse, StreamFormat,
+    };
+    use ffrwd_wasm_runtime::runtime::{StreamInfo, VideoFormat};
+    use std::sync::mpsc;
+
+    /// What a publisher's calls brought: frames per call, and whether each
+    /// was the last.
+    type Calls = Arc<Mutex<Vec<(usize, bool)>>>;
+
+    struct Publisher {
+        shape: NodeShape,
+        calls: Calls,
+    }
+
+    impl Node for Publisher {
+        fn name(&self) -> &str {
+            "publish"
+        }
+
+        fn shape(&self) -> &NodeShape {
+            &self.shape
+        }
+
+        fn set_params(&mut self, _params: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn process(&mut self, tick: Tick) -> Result<Emitted> {
+            let frames = tick.streams.iter().map(|s| s.frames.len()).sum();
+            self.calls.lock().unwrap().push((frames, tick.last));
+            Ok(Emitted::default())
+        }
+    }
+
+    #[test]
+    fn a_rate_clock_on_arrivals_takes_its_last_call_once_they_end_whatever_its_count() {
+        let shape = NodeShape {
+            inputs: vec![InputPort {
+                name: "v".to_string(),
+                kind: PortKind::Video,
+                required: true,
+                many: false,
+                pairing: Pairing::Arrival,
+                rows: RowsUse::Ignore,
+                window: 1,
+                stride: 1,
+                accepts: Accepts::default(),
+                schema: None,
+            }],
+            outputs: Vec::new(),
+            clock: Clock::Rate(Rational { num: 50, den: 1 }),
+            pure: false,
+            one_to_one: false,
+            bounded: true,
+            relation: Vec::new(),
+        };
+        let tenths = TimeBase { num: 1, den: 10 };
+        let bound = BoundStream {
+            port: "v".to_string(),
+            id: 0,
+            info: StreamInfo::default(),
+            time_base: tenths,
+            format: StreamFormat::Video(VideoFormat {
+                width: 2,
+                height: 2,
+                pix_fmt: "rgba",
+                frame_len: 16,
+                color: None,
+            }),
+            rendition: Default::default(),
+            row: None,
+            decode_delay: 0,
+            latency: None,
+            hint: Default::default(),
+        };
+        let assembler = Assembler::new(&shape, &[bound], "publish", &[]).expect("an assembler");
+        let calls = Calls::default();
+        let publisher = Publisher {
+            shape: shape.clone(),
+            calls: Arc::clone(&calls),
+        };
+        let plan = Plan {
+            lanes: vec![LaneSpec {
+                name: "publish".to_string(),
+                shape,
+                intake: Intake::Assembled(Box::new(assembler)),
+                bound: vec![0],
+                state: Vec::new(),
+                tick_base: TimeBase { num: 1, den: 50 },
+                runners: vec![Box::new(publisher)],
+                opener: None,
+                ports: Vec::new(),
+                rows: None,
+            }],
+            consumers: HashMap::from([(0, vec![Consumer::Lane(0)])]),
+            writers: Vec::new(),
+            mirrors: HashMap::new(),
+        };
+        let scheduler = Scheduler::start(plan, 2).expect("the lanes");
+        let epoch = 17_909_860_700i64;
+        for k in 0..30 {
+            let frame = TickFrame {
+                pts: epoch + k,
+                duration: None,
+                data: Arc::new(vec![0; 16]),
+                rows: Vec::new(),
+            };
+            assert!(scheduler.arrive(0, Item::Frame(frame)));
+        }
+        assert!(scheduler.end(0));
+        let ended = Instant::now();
+        let (done, finished) = mpsc::channel();
+        thread::spawn(move || done.send(scheduler.finish()));
+        finished
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the lane ended with its input")
+            .expect("the run");
+        assert!(ended.elapsed() < Duration::from_secs(1));
+        let calls = calls.lock().unwrap();
+        let frames: usize = calls.iter().map(|c| c.0).sum();
+        assert_eq!(frames, 30, "every arrival was handed");
+        assert_eq!(
+            calls.last(),
+            Some(&(0, true)),
+            "the last call follows the tick that took what was left"
+        );
+        assert_eq!(calls.iter().filter(|c| c.1).count(), 1);
+        assert!(
+            calls.len() <= 32,
+            "a turn per arrival at most, the first and the last"
+        );
     }
 }
