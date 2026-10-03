@@ -749,6 +749,10 @@ mod tests {
         let started = Instant::now();
         let read = conn.socket.read(&mut [0u8; 16]);
         assert!(read.as_ref().is_err_and(is_timeout), "{read:?}");
-        assert!(started.elapsed() >= POLL / 2, "returned after {:?}", started.elapsed());
+        assert!(
+            started.elapsed() >= POLL / 2,
+            "returned after {:?}",
+            started.elapsed()
+        );
     }
 }
