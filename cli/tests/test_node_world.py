@@ -1503,6 +1503,61 @@ def test_a_packets_function_over_a_node_hands_back_the_stream_still_coded(
     assert argv["ffmpeg1"][argv["ffmpeg1"].index("-c:0") + 1] == "copy"
 
 
+def _switch(params: Mapping[str, object], bound: Sequence[str]) -> dict[str, object]:
+    """The switch: clocked by its picture, or with no `v` bound by its sound,
+    1024 samples a tick."""
+    hold = {"kind": "hold", "anchor": {"kind": "first-frame"}, "lead": 0.3, "port_param": "port"}
+    if "v" in bound:
+        return _shape(
+            [_clock("v"), _input("a", "audio", {"kind": "lockstep"}),
+             _input("feed_audio", "audio", hold)],
+            [_output("v", "video"), _output("a", "audio")],
+            {"kind": "input", "port": "v"},
+        )
+    return _shape(
+        [_clock("a", "audio", window=1024), _input("feed_audio", "audio", hold)],
+        [_output("a", "audio")],
+        {"kind": "input", "port": "a"},
+    )
+
+
+@pytest.mark.parametrize(
+    "call",
+    ["switch(f.video[1], f.audio[1], feed_audio => ad.audio[1])",
+     "switch(a => f.audio[1], feed_audio => ad.audio[1])"],
+)
+def test_a_node_clocked_by_its_sound_beside_the_picture_of_one_live_input_compiles(
+    monkeypatch: pytest.MonkeyPatch, call: str
+) -> None:
+    """Its window is counted in time, as a picture's is, so the edge its
+    sound leaves the live reader on is bounded rather than refused."""
+    monkeypatch.setitem(SHAPES, "switch.wasm", _switch)
+    monkeypatch.setitem(_PARAMS, "switch.wasm", {"port": {"type": "integer"}})
+    monkeypatch.setitem(
+        _DECLARATIONS,
+        "switch",
+        "CREATE FUNCTION switch(v video_stream DEFAULT NULL, a audio_stream DEFAULT NULL, "
+        "feed_audio audio_stream DEFAULT NULL, port number DEFAULT 9000) "
+        "RETURNS STRUCT(v video_stream, a audio_stream) "
+        "AS 'switch.wasm', 'switch' LANGUAGE wasm;",
+    )
+    probes = _probes()
+    monkeypatch.setattr(
+        "ffrwd.compiler.probe_path", lambda path, args=(), **kw: probes[path[0]]
+    )
+    compiled = compile_all(
+        _declared(
+            f"COPY (SELECT burn(f.video[1]), ({call}).a "
+            "FROM input('f.mp4', realtime => true) f, input('a.mp4') ad) TO 'out.mkv'"
+        ),
+        describe=_node,
+        shape=_Asked(),
+    )
+    assert compiled.plan is not None
+    sound = [e for e in compiled.plan.stream_edges if e.ref == "src:f:a:0"]
+    assert sound and all(e.live for e in sound)
+
+
 def test_a_live_query_feeding_a_node_later_than_its_bound_is_refused_at_compile(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

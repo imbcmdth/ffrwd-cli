@@ -3079,7 +3079,13 @@ class _Partitioner:
 
     def _node_frames(self, name: str) -> int | None:
         """The frames node `name` holds past its clock: its window, the waits
-        its interval inputs add and its outputs' latency, at its pictures' rate."""
+        its interval inputs add and its outputs' latency, at its pictures' rate.
+
+        A node reading no picture holds that time in frames of the bound: the
+        pictures of the input its clock comes from, or
+        :data:`LONGEST_FRAME_SECONDS` each where that input has none
+        (:meth:`_bound_frame_seconds`).
+        """
         if self._paths is None:
             self._paths = paths_of(self.g, self.probes)
         paths = self._paths
@@ -3095,7 +3101,11 @@ class _Partitioner:
         if own <= 0:
             return 0
         video = next((ref for ref in node.inputs if ref_type(self.g, ref) == "video"), None)
-        rate = paths.rate(video) if video is not None else None
+        if video is None:
+            timed = refs[0] if refs else next(iter(node.inputs), None)
+            seconds = self._picture_seconds(timed) if timed is not None else None
+            return math.ceil(own / (seconds or LONGEST_FRAME_SECONDS))
+        rate = paths.rate(video)
         return None if rate is None else math.ceil(own * rate)
 
     def _node_delays(self, names: Sequence[str]) -> dict[str, int | None]:
