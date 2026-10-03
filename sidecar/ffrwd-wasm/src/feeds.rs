@@ -209,6 +209,10 @@ struct Conn {
 
 impl Conn {
     fn new(serial: u64, socket: TcpStream, streams: usize) -> Result<Conn> {
+        // Windows hands back a socket accepted off a nonblocking listener
+        // nonblocking too, and a read on it would return at once rather than
+        // wait out its timeout.
+        socket.set_nonblocking(false)?;
         socket.set_read_timeout(Some(POLL))?;
         Ok(Conn {
             serial,
@@ -721,5 +725,30 @@ fn drain(
             Event::EndOfInput => return Ok(true),
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_read_on_an_idle_connection_waits_out_its_timeout() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let _feeder = TcpStream::connect(listener.local_addr().expect("address")).expect("connect");
+        let until = Instant::now() + Duration::from_secs(5);
+        let socket = loop {
+            match listener.accept() {
+                Ok((socket, _)) => break socket,
+                Err(e) if is_timeout(&e) && Instant::now() < until => thread::sleep(POLL / 10),
+                Err(e) => panic!("accept: {e}"),
+            }
+        };
+        let mut conn = Conn::new(1, socket, 1).expect("conn");
+        let started = Instant::now();
+        let read = conn.socket.read(&mut [0u8; 16]);
+        assert!(read.as_ref().is_err_and(is_timeout), "{read:?}");
+        assert!(started.elapsed() >= POLL / 2, "returned after {:?}", started.elapsed());
     }
 }
