@@ -14,12 +14,3 @@ license = "Apache-2.0"
 # is the one the lock already resolved, and the diff is one file.
 [patch.crates-io]
 wasmtime-wasi-nn = { path = "vendor/wasmtime-wasi-nn" }
-
-# Several streams on one NUT, until v0.1.5 is tagged and the pin moves to it.
-[patch."https://github.com/imbcmdth/ffrwd-nut"]
-ffrwd-nut = { path = "../../projects/ffrwd-nut" }
-
-# yuv420p to rgba and back (branch `yuv`), until it is tagged and the pin
-# moves to it.
-[patch."https://github.com/imbcmdth/ffrwd-frame"]
-ffrwd-frame = { path = "../../projects/ffrwd-frame" }

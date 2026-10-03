@@ -611,6 +611,7 @@ dependencies = [
 [[package]]
 name = "ffrwd-frame"
 version = "0.1.1"
+source = "git+https://github.com/imbcmdth/ffrwd-frame?tag=v0.1.1#cf8887ce24bf5f5d570fed73b278f10ffee991f1"
 dependencies = [
  "fast_image_resize",
 ]
@@ -623,6 +624,7 @@ source = "git+https://github.com/imbcmdth/ffrwd-nal?tag=v0.1.0#bd2ffcf559065b836
 [[package]]
 name = "ffrwd-nut"
 version = "0.1.5"
+source = "git+https://github.com/imbcmdth/ffrwd-nut?tag=v0.1.5#30ca1c6018c9309f6e3a47149ab4066da87db0e6"
 dependencies = [
  "serde",
  "serde_json",
