@@ -972,6 +972,31 @@ def test_nodes_taking_one_picture_in_different_formats_get_a_stream_each(
     )
 
 
+@pytest.mark.parametrize(
+    ("select", "node"), [("ring(p.v, spot(p.v))", "ring"), ("burn(p.v)", "burn")],
+    ids=["split", "alone"],
+)
+def test_a_picture_reaching_a_node_through_a_leaky_crosses_in_the_format_it_takes(
+    monkeypatch: pytest.MonkeyPatch, select: str, node: str
+) -> None:
+    """A leaky hands on the pictures it reads, so a region holding it and a
+    node reading its output in rgba is handed rgba on the way in."""
+    monkeypatch.setitem(SHAPES, "spot.wasm", _taking(_spot, "video", _TIMING))
+    monkeypatch.setitem(SHAPES, "ring.wasm", _taking(_reader("spots", _ROWS), "video", _RGBA))
+    monkeypatch.setitem(SHAPES, "burn.wasm", _taking(_burn, "video", _RGBA))
+    argv = _plan_argv(
+        "COPY (WITH p AS (SELECT ffrwd.leaky(f.video[1], max_lateness => 0.5) AS v "
+        f"FROM input('f.mp4', realtime => true) f) SELECT {select} FROM p) TO 'out.mkv'",
+        monkeypatch,
+        pix_fmt="yuv420p",
+    )
+    (sidecar,) = [words for pid, words in argv.items() if pid.startswith("sidecar")]
+    chain = sidecar[sidecar.index("-filter_complex") + 1]
+    assert chain.startswith("[0:v]leaky=") and f"{node}[v=out0]" in chain
+    feeder = _feeder(argv)
+    assert feeder[feeder.index("-pix_fmt:0") + 1] == "rgba"
+
+
 def test_each_stream_of_one_nut_is_conformed_to_the_port_it_feeds(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1375,6 +1400,46 @@ def test_a_node_at_a_copys_to_reads_the_select_as_a_packet_sink_did(
     assert encoder[encoder.index("-c:0") + 1] == "libx264"
 
 
+_SUB = "CREATE FUNCTION sub(relay text) RETURNS source AS 'sub.wasm', 'sub' LANGUAGE wasm;\n"
+
+
+def test_a_leaky_over_packets_something_decodes_after_leaks_the_decoded_pictures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """burn reads pictures, so the decode goes ahead of the leaky, which then
+    drops single pictures rather than whole groups."""
+    monkeypatch.setitem(SHAPES, "sub.wasm", _subscribe)
+    argv = _plan_argv(
+        _SUB + "COPY (SELECT burn(ffrwd.leaky(v.video[1])) FROM sub('r') v "
+        "WHERE v.height = 720) TO 'out.mkv'",
+        monkeypatch,
+    )
+    (decode,) = [words for words in argv.values() if "[0:v:0]null[out0]" in words]
+    assert decode[decode.index("-c:0") + 1] == "rawvideo"
+    (leaking,) = [words for words in argv.values() if any("leaky=" in w for w in words)]
+    assert leaking[leaking.index("-filter_complex") + 1].startswith("[0:v]leaky=")
+
+
+def test_a_leaky_over_packets_only_publish_reads_keeps_the_packets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(SHAPES, "sub.wasm", _subscribe)
+    monkeypatch.setitem(SHAPES, "publish.wasm", _publish)
+    monkeypatch.setitem(
+        _PARAMS, "publish.wasm", {"relay": {"type": "string"}, "broadcast": {"type": "string"}}
+    )
+    argv = _plan_argv(
+        _SUB + _PUBLISH + "COPY (SELECT ffrwd.leaky(v.video[1]), v.audio[1] FROM sub('r') v "
+        "WHERE v.height = 720) TO publish('https://relay', 'b')",
+        monkeypatch,
+        describe=_reporting("publish.wasm"),
+    )
+    assert not any("[0:v:0]null[out0]" in words for words in argv.values())
+    (leaking,) = [words for words in argv.values() if any("leaky=" in w for w in words)]
+    assert "sub=relay=r[hd=n10]" in leaking[leaking.index("-filter_complex") + 1]
+    assert "[n10]leaky=" in leaking[leaking.index("-filter_complex") + 1]
+
+
 def test_a_nodes_picture_into_a_node_sink_is_encoded_and_its_data_is_not_copied(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1505,7 +1570,7 @@ def test_a_packets_function_over_a_node_hands_back_the_stream_still_coded(
 
 def _switch(params: Mapping[str, object], bound: Sequence[str]) -> dict[str, object]:
     """The switch: clocked by its picture, or with no `v` bound by its sound,
-    1024 samples a tick."""
+    as ffrwd/switch 0.5.2's ``--shape --bound a,feed_audio`` prints it."""
     hold = {"kind": "hold", "anchor": {"kind": "first-frame"}, "lead": 0.3, "port_param": "port"}
     if "v" in bound:
         return _shape(
@@ -1514,23 +1579,48 @@ def _switch(params: Mapping[str, object], bound: Sequence[str]) -> dict[str, obj
             [_output("v", "video"), _output("a", "audio")],
             {"kind": "input", "port": "v"},
         )
+    f32 = {"sample_formats": ["f32"]}
+    rows = {"kind": "data", "latency": 0.0, "format": {"kind": "data", "codec": "json"}}
     return _shape(
-        [_clock("a", "audio", window=1024), _input("feed_audio", "audio", hold)],
-        [_output("a", "audio")],
+        [
+            {**_clock("a", "audio", window=1024), "accepts": f32},
+            {
+                **_input(
+                    "feed_audio",
+                    "audio",
+                    {**hold, "anchor": {"kind": "tagged", "tag": "smart_timed"},
+                     "group": "switch", "timeout": 1.0},
+                ),
+                "accepts": {**f32, "like": "a"},
+            },
+        ],
+        [
+            {"name": "a", "kind": "audio", "latency": 0.0,
+             "format": {"kind": "like", "port": "a"}},
+            {"name": "clock", **rows},
+            {"name": "feeds", **rows},
+            {"name": "feed_rows", **rows},
+        ],
         {"kind": "input", "port": "a"},
+        pure=False,
+        one_to_one=True,
     )
 
 
 @pytest.mark.parametrize(
     "call",
     ["switch(f.video[1], f.audio[1], feed_audio => ad.audio[1])",
-     "switch(a => f.audio[1], feed_audio => ad.audio[1])"],
+     "switch(a => f.audio[1], feed_audio => ad.audio[1])",
+     "switch(a => setpts(aresample(f.audio[1], 48000), 'PTS+10/TB'), "
+     "feed_audio => ad.audio[1])"],
+    ids=["picture", "sound", "sound-retimed"],
 )
 def test_a_node_clocked_by_its_sound_beside_the_picture_of_one_live_input_compiles(
     monkeypatch: pytest.MonkeyPatch, call: str
 ) -> None:
     """Its window is counted in time, as a picture's is, so the edge its
-    sound leaves the live reader on is bounded rather than refused."""
+    sound leaves the live reader on is bounded rather than refused. A
+    retimed sound keeps its sample rate, the rate the window counts in."""
     monkeypatch.setitem(SHAPES, "switch.wasm", _switch)
     monkeypatch.setitem(_PARAMS, "switch.wasm", {"port": {"type": "integer"}})
     monkeypatch.setitem(
@@ -1554,7 +1644,9 @@ def test_a_node_clocked_by_its_sound_beside_the_picture_of_one_live_input_compil
         shape=_Asked(),
     )
     assert compiled.plan is not None
-    sound = [e for e in compiled.plan.stream_edges if e.ref == "src:f:a:0"]
+    edges = compiled.plan.stream_edges
+    reader = next(e.source for e in edges if e.ref == "src:f:v:0")
+    sound = [e for e in edges if e.source == reader and e.ref != "src:f:v:0"]
     assert sound and all(e.live for e in sound)
 
 

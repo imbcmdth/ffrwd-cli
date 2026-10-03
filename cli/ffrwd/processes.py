@@ -4440,19 +4440,41 @@ class _Partitioner:
             if any(_ref_node(read) == reader for read in self.g.nodes[name].inputs)
         ]
 
+    def _behind_passing(self, target: str, reader: str | None) -> list[str]:
+        """The members of `target` reading what `reader` hands on, past the
+        region's splits and leakies, which hand on the pictures they read;
+        empty where `reader` is neither."""
+        if reader is None or self.g.nodes[reader].filter not in (*SPLIT_FILTERS, LEAKY):
+            return []
+        inside = self.members.get(target, [])
+        found: list[str] = []
+        ahead = [reader]
+        while ahead:
+            current = ahead.pop(0)
+            for name in inside:
+                if name in found or not any(
+                    _ref_node(read) == current for read in self.g.nodes[name].inputs
+                ):
+                    continue
+                if self.g.nodes[name].filter in (*SPLIT_FILTERS, LEAKY):
+                    ahead.append(name)
+                else:
+                    found.append(name)
+        return found
+
     def _wire_reader(self, target: str, reader: str | None) -> str | None:
         """The node whose format an edge ending at `reader` carries.
 
-        Behind a region's split, the first module that names a wire format,
-        where every module naming one names the same: the network opens each
-        of them on the stream the edge brings. Where they differ, the split
-        itself, and the edge carries the default, as it did before a split's
-        modules were looked past at all. A data filter's clock pad names
-        none and takes what arrives.
+        Behind a region's splits and leakies, the first module that names a
+        wire format, where every module naming one names the same: the
+        network opens each of them on the stream the edge brings, which
+        reaches them as it came in. Where they differ, `reader` itself, and
+        the edge carries the default. A data filter's clock pad names none
+        and takes what arrives.
         """
         named = [
             (name, wire)
-            for name in self._behind_split(target, reader)
+            for name in self._behind_passing(target, reader)
             if (wire := self._named_wire(name, reader)) is not None
         ]
         if not named or any(wire != named[0][1] for _, wire in named):
@@ -4460,7 +4482,8 @@ class _Partitioner:
         return named[0][0]
 
     def _named_wire(self, name: str, split: str | None) -> object:
-        """The wire module `name` names for what it reads off `split`, or None.
+        """The wire module `name` names for what it reads off `split`, a
+        split or a leaky, or None.
 
         A node's is what its port accepts; an older module's, the pixel
         format and pcm it declared.
@@ -4476,16 +4499,23 @@ class _Partitioner:
         return None if wire == (None, None) else wire
 
     def _read_position(self, node: Node, ref: FrameRef) -> int | None:
-        """Where `node` reads `ref`: itself, or a pad of a split of it."""
+        """Where `node` reads `ref`: itself, or what splits and leakies in
+        front of it hand on of it."""
         for position, read in enumerate(node.inputs):
-            producer = _ref_node(read)
-            if read == ref or (
-                producer is not None
-                and producer in self.g.nodes
-                and self.g.nodes[producer].filter in SPLIT_FILTERS
-                and self.g.nodes[producer].inputs[0] == ref
-            ):
-                return position
+            seen: set[str] = set()
+            while True:
+                if read == ref:
+                    return position
+                producer = _ref_node(read)
+                if (
+                    producer is None
+                    or producer in seen
+                    or producer not in self.g.nodes
+                    or self.g.nodes[producer].filter not in (*SPLIT_FILTERS, LEAKY)
+                ):
+                    break
+                seen.add(producer)
+                read = self.g.nodes[producer].inputs[0]
         return None
 
     def _carries_annotations(self, ref: FrameRef, consumer: str | None) -> bool:

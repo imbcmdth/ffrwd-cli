@@ -323,13 +323,10 @@ class Paths:
         return stream_rate(self.graph, self.probes, self.shapes.get, ref)
 
 
-# Filters whose pictures or sound leave at a rate their args do not say.
+# Filters whose pictures leave at a rate their args do not say. A sound's
+# rate is its sample rate, which retiming, selecting or stretching keeps.
 _RATE_LOST = frozenset(
     {
-        "ainterleave",
-        "aselect",
-        "asetpts",
-        "atempo",
         "decimate",
         "framestep",
         "interleave",
