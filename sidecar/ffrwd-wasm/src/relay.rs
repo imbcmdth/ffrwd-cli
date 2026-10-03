@@ -446,14 +446,14 @@ struct FlowState {
 /// shutdown for a socket. An abort that lands just before a call is
 /// repeated by the report thread until the end lets go.
 #[derive(Default)]
-struct Gate {
+struct Cancellor {
     aborted: AtomicBool,
     pipe: sys::Hold,
     /// A second handle on the end's socket while it is open.
     socket: Mutex<Option<TcpStream>>,
 }
 
-impl Gate {
+impl Cancellor {
     fn aborted(&self) -> bool {
         self.aborted.load(Ordering::SeqCst)
     }
@@ -492,11 +492,11 @@ enum Reader {
 impl Reader {
     /// What has arrived, into `buf`; 0 once the stream has ended, by the
     /// producer closing, by an error, or by an abort.
-    fn read(&mut self, buf: &mut [u8], gate: &Gate) -> usize {
+    fn read(&mut self, buf: &mut [u8], cancellor: &Cancellor) -> usize {
         match self {
             Reader::Pipe(conn) => conn.read(buf),
             Reader::Socket(socket) => loop {
-                if gate.aborted() {
+                if cancellor.aborted() {
                     return 0;
                 }
                 match socket.read(buf) {
@@ -508,8 +508,8 @@ impl Reader {
         }
     }
 
-    fn close(self, gate: &Gate) {
-        gate.release_socket();
+    fn close(self, cancellor: &Cancellor) {
+        cancellor.release_socket();
         if let Reader::Pipe(conn) = self {
             conn.close();
         }
@@ -523,8 +523,8 @@ enum Writer {
 }
 
 impl Writer {
-    fn write_all(&mut self, bytes: &[u8], gate: &Gate) -> io::Result<()> {
-        if gate.aborted() {
+    fn write_all(&mut self, bytes: &[u8], cancellor: &Cancellor) -> io::Result<()> {
+        if cancellor.aborted() {
             return Err(io::Error::other("the edge was stopped"));
         }
         match self {
@@ -535,19 +535,19 @@ impl Writer {
 
     /// The end of the stream, after its last byte: the consumer reads
     /// everything written, then the end of it.
-    fn finish(self, gate: &Gate) {
+    fn finish(self, cancellor: &Cancellor) {
         match self {
             Writer::Pipe(conn) => conn.finish(),
             Writer::Socket(socket) => {
                 let _ = socket.shutdown(Shutdown::Write);
-                gate.release_socket();
+                cancellor.release_socket();
             }
         }
     }
 
     /// The end of the stream, cut off: whatever was not written is lost.
-    fn close(self, gate: &Gate) {
-        gate.release_socket();
+    fn close(self, cancellor: &Cancellor) {
+        cancellor.release_socket();
         if let Writer::Pipe(conn) = self {
             conn.close();
         }
@@ -711,8 +711,8 @@ struct Edge {
     room: Condvar,
     /// The writer waits on this for bytes.
     arrived: Condvar,
-    source: Arc<Gate>,
-    dest: Arc<Gate>,
+    source: Arc<Cancellor>,
+    dest: Arc<Cancellor>,
     moved: AtomicU64,
     writing: AtomicBool,
     state: Mutex<FlowState>,
@@ -721,7 +721,7 @@ struct Edge {
 }
 
 impl Edge {
-    fn new(spec: &Spec, source: Arc<Gate>, dest: Arc<Gate>) -> Edge {
+    fn new(spec: &Spec, source: Arc<Cancellor>, dest: Arc<Cancellor>) -> Edge {
         Edge {
             id: spec.id.clone(),
             depth: spec.depth,
@@ -1010,7 +1010,7 @@ fn dial(
     port: u16,
     key: &str,
     secret: Option<&str>,
-    gate: &Gate,
+    cancellor: &Cancellor,
 ) -> Result<Option<TcpStream>, String> {
     let Some(secret) = secret else {
         return Err(format!(
@@ -1025,7 +1025,7 @@ fn dial(
         return Err(format!("{host}:{port} names no address"));
     };
     let mut socket = loop {
-        if gate.aborted() {
+        if cancellor.aborted() {
             return Ok(None);
         }
         match TcpStream::connect_timeout(&address, DIAL_WAIT) {
@@ -1041,7 +1041,7 @@ fn dial(
             Err(e) => return Err(format!("dialing {host}:{port} for {key}: {e}")),
         }
     };
-    gate.hold_socket(&socket);
+    cancellor.hold_socket(&socket);
     let _ = socket.set_nodelay(true);
     let refused = |e: io::Error| {
         format!("the node at {host}:{port} did not take {key}: {e} (a wrong secret, or a key it does not listen for, is closed unanswered)")
@@ -1057,7 +1057,7 @@ fn dial(
             String::from_utf8_lossy(&answer)
         ));
     }
-    if gate.aborted() {
+    if cancellor.aborted() {
         return Ok(None);
     }
     Ok(Some(socket))
@@ -1085,10 +1085,10 @@ struct Cuts {
 impl Cuts {
     /// The connection for `key`, once it has arrived. None once the end was
     /// aborted.
-    fn take(&self, key: &str, gate: &Gate) -> Result<Option<TcpStream>, String> {
+    fn take(&self, key: &str, cancellor: &Cancellor) -> Result<Option<TcpStream>, String> {
         let mut keys = lock(&self.keys);
         loop {
-            if gate.aborted() {
+            if cancellor.aborted() {
                 return Ok(None);
             }
             match keys.get_mut(key) {
@@ -1099,7 +1099,7 @@ impl Cuts {
                         continue;
                     };
                     drop(keys);
-                    gate.hold_socket(&socket);
+                    cancellor.hold_socket(&socket);
                     return Ok(Some(socket));
                 }
                 Some(Arrival::Waiting | Arrival::Answering) => {
@@ -1267,8 +1267,8 @@ impl Relay {
         // the pipes it did make go as the half-built list is dropped.
         let mut made = Vec::with_capacity(specs.len());
         for spec in specs {
-            let source = Arc::new(Gate::default());
-            let dest = Arc::new(Gate::default());
+            let source = Arc::new(Cancellor::default());
+            let dest = Arc::new(Cancellor::default());
             let from = match &spec.from {
                 FromEnd::Pipe(path) => Source::Pipe(
                     sys::Served::create(path, true, spec.buffer, Arc::clone(&source))
@@ -1509,7 +1509,7 @@ mod sys {
     };
     use windows_sys::Win32::System::IO::CancelIoEx;
 
-    use super::{lock, Gate};
+    use super::{lock, Cancellor};
 
     /// An end's pipe handle while the end holds it open, as a number: a
     /// handle closed and reused is never cancelled by mistake, since the end
@@ -1536,17 +1536,17 @@ mod sys {
         }
     }
 
-    /// A pipe end and the gate that can break off its calls. The gate lets
-    /// go of the handle before the file closes it.
+    /// A pipe end and the cancellor that can break off its calls. The
+    /// cancellor lets go of the handle before the file closes it.
     struct Pipe {
         file: File,
         path: String,
-        gate: Arc<Gate>,
+        cancellor: Arc<Cancellor>,
     }
 
     impl Drop for Pipe {
         fn drop(&mut self) {
-            self.gate.pipe.release();
+            self.cancellor.pipe.release();
         }
     }
 
@@ -1562,7 +1562,12 @@ mod sys {
     impl Served {
         /// One instance, byte mode, blocking calls, `buffer` bytes each way:
         /// what `pipes.create` makes today. `reads` is the relay's direction.
-        pub fn create(path: &str, reads: bool, buffer: u32, gate: Arc<Gate>) -> io::Result<Served> {
+        pub fn create(
+            path: &str,
+            reads: bool,
+            buffer: u32,
+            cancellor: Arc<Cancellor>,
+        ) -> io::Result<Served> {
             let wide: Vec<u16> = OsStr::new(path).encode_wide().chain(once(0)).collect();
             let access = if reads {
                 PIPE_ACCESS_INBOUND
@@ -1587,11 +1592,11 @@ mod sys {
             }
             // SAFETY: a handle just made, owned by nothing else.
             let file = unsafe { File::from_raw_handle(handle as RawHandle) };
-            gate.pipe.hold(file.as_raw_handle());
+            cancellor.pipe.hold(file.as_raw_handle());
             Ok(Served(Pipe {
                 file,
                 path: path.to_string(),
-                gate,
+                cancellor,
             }))
         }
 
@@ -1602,7 +1607,7 @@ mod sys {
         /// Wait for the client. None once the end was aborted.
         pub fn open(self) -> io::Result<Option<Conn>> {
             let pipe = self.0;
-            if pipe.gate.aborted() {
+            if pipe.cancellor.aborted() {
                 return Ok(None);
             }
             // SAFETY: the handle is open for as long as `pipe` is.
@@ -1612,14 +1617,14 @@ mod sys {
                 // A client that opened before the call, or opened and has
                 // already closed again, is a client all the same.
                 if code != ERROR_PIPE_CONNECTED && code != ERROR_NO_DATA {
-                    return if pipe.gate.aborted() {
+                    return if pipe.cancellor.aborted() {
                         Ok(None)
                     } else {
                         Err(e)
                     };
                 }
             }
-            if pipe.gate.aborted() {
+            if pipe.cancellor.aborted() {
                 return Ok(None);
             }
             Ok(Some(Conn(pipe)))
@@ -1634,7 +1639,7 @@ mod sys {
         /// producer closing, by an error, or by an abort.
         pub fn read(&mut self, buf: &mut [u8]) -> usize {
             loop {
-                if self.0.gate.aborted() {
+                if self.0.cancellor.aborted() {
                     return 0;
                 }
                 match self.0.file.read(buf) {
@@ -1657,7 +1662,7 @@ mod sys {
         /// argument", where a plain close is ERROR_BROKEN_PIPE, the end of
         /// the stream to both.
         pub fn finish(self) {
-            if !self.0.gate.aborted() {
+            if !self.0.cancellor.aborted() {
                 // SAFETY: the handle is open for as long as `self` is.
                 unsafe {
                     FlushFileBuffers(self.0.raw());
@@ -1684,7 +1689,7 @@ mod sys {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use super::{lock, Gate};
+    use super::{lock, Cancellor};
 
     /// How long one wait in `poll` lasts before the end looks for an abort.
     const POLL_MS: libc::c_int = 100;
@@ -1756,20 +1761,20 @@ mod sys {
         }
     }
 
-    /// A FIFO, its descriptor once open, and the gate that can break off its
-    /// calls. It is unlinked when it closes.
+    /// A FIFO, its descriptor once open, and the cancellor that can break
+    /// off its calls. It is unlinked when it closes.
     struct Pipe {
         fd: Option<OwnedFd>,
         path: CString,
         display: String,
         buffer: u32,
         reads: bool,
-        gate: Arc<Gate>,
+        cancellor: Arc<Cancellor>,
     }
 
     impl Drop for Pipe {
         fn drop(&mut self) {
-            self.gate.pipe.release();
+            self.cancellor.pipe.release();
             unlink(&self.path);
         }
     }
@@ -1780,7 +1785,12 @@ mod sys {
     impl Served {
         /// `mkfifo 0600`, as `pipes.create` makes one. `reads` is the
         /// relay's direction; `buffer` is asked of the kernel once it is open.
-        pub fn create(path: &str, reads: bool, buffer: u32, gate: Arc<Gate>) -> io::Result<Served> {
+        pub fn create(
+            path: &str,
+            reads: bool,
+            buffer: u32,
+            cancellor: Arc<Cancellor>,
+        ) -> io::Result<Served> {
             let c_path = CString::new(path).map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidInput, "a path with a NUL in it")
             })?;
@@ -1795,7 +1805,7 @@ mod sys {
                 display: path.to_string(),
                 buffer,
                 reads,
-                gate,
+                cancellor,
             }))
         }
 
@@ -1808,8 +1818,8 @@ mod sys {
         pub fn open(self) -> io::Result<Option<Conn>> {
             let mut pipe = self.0;
             let fd = if pipe.reads {
-                pipe.gate.pipe.waiting(&pipe.path);
-                if pipe.gate.aborted() {
+                pipe.cancellor.pipe.waiting(&pipe.path);
+                if pipe.cancellor.aborted() {
                     return Ok(None);
                 }
                 loop {
@@ -1826,7 +1836,7 @@ mod sys {
                 }
             } else {
                 loop {
-                    if pipe.gate.aborted() {
+                    if pipe.cancellor.aborted() {
                         return Ok(None);
                     }
                     // SAFETY: a NUL terminated path.
@@ -1850,7 +1860,7 @@ mod sys {
             };
             // SAFETY: a descriptor just opened, owned by nothing else.
             let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-            if pipe.gate.aborted() {
+            if pipe.cancellor.aborted() {
                 return Ok(None);
             }
             set_nonblocking(&fd)?;
@@ -1921,7 +1931,7 @@ mod sys {
                 return 0;
             };
             loop {
-                if self.0.gate.aborted() {
+                if self.0.cancellor.aborted() {
                     return 0;
                 }
                 wait_for(fd, libc::POLLIN);
@@ -1942,7 +1952,7 @@ mod sys {
                 return Err(io::Error::from(io::ErrorKind::NotConnected));
             };
             while !bytes.is_empty() {
-                if self.0.gate.aborted() {
+                if self.0.cancellor.aborted() {
                     return Err(io::Error::other("the edge was stopped"));
                 }
                 wait_for(fd, libc::POLLOUT);
