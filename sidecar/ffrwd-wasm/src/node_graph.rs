@@ -1383,6 +1383,7 @@ fn restamped_bound(
 /// of hold inputs that name a port param and the call left unbound, each
 /// bound a stream of the host's own in the port's format. A hold input
 /// bound to a stream gets the port the host picked written into its param.
+#[allow(clippy::too_many_arguments)]
 fn listen_for(
     name: &str,
     shape: &NodeShape,

@@ -497,7 +497,7 @@ impl Input {
         let base = self.base;
         let to = |t: i64| ffrwd_wasm_runtime::node::rescale(t, restamp.from, base) + offset;
         for item in self.queue.iter_mut() {
-            retime(item, &to);
+            retime(item, to);
         }
         self.progress = self.queue.iter().map(|item| self.item_time(item)).max();
     }
