@@ -160,6 +160,8 @@ struct QueueState {
     failed: Option<String>,
     /// Everything it was handed is written and the output is closed.
     done: bool,
+    /// The writer has an item out that it has not finished writing.
+    taken: bool,
 }
 
 /// An output's queue: pushing never waits, and the scheduler reads its
@@ -185,6 +187,16 @@ impl Queue {
 
     pub fn len(&self) -> usize {
         self.lock().items.len()
+    }
+
+    /// Whether everything handed on is written, or the output takes nothing
+    /// more.
+    pub fn idle(&self) -> bool {
+        let state = self.lock();
+        state.closed
+            || state.failed.is_some()
+            || state.done
+            || (state.items.is_empty() && !state.taken)
     }
 
     /// Whether this output takes nothing more: its reader went away, it
@@ -291,8 +303,14 @@ fn is_closed(error: &anyhow::Error) -> bool {
 fn next(queue: &Queue, wake: &dyn Fn()) -> Option<(usize, Out)> {
     let item = {
         let mut state = queue.lock();
+        if std::mem::take(&mut state.taken) && state.items.is_empty() {
+            drop(state);
+            wake();
+            state = queue.lock();
+        }
         loop {
             if let Some(item) = state.items.pop_front() {
+                state.taken = true;
                 break Some(item);
             }
             if state.closed || state.failed.is_some() || state.done {
