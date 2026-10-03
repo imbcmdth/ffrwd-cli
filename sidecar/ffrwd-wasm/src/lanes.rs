@@ -92,6 +92,11 @@ pub struct LaneSpec {
     pub opener: Option<Opener>,
     pub ports: Vec<Option<PortOut>>,
     pub rows: Option<PortOut>,
+    /// Runs only once everything it feeds has taken all it was handed, so
+    /// nothing it hands on waits in a queue: `leaky` judges a picture late
+    /// or not as it hands it on, and a picture queued after that is later
+    /// than it was judged.
+    pub unbuffered: bool,
 }
 
 /// Who reads a stream: a lane, or one stream of an output.
@@ -195,6 +200,7 @@ struct Lane {
     started: Option<Instant>,
     /// When a rate clock whose inputs all arrive unpaired last cut a tick.
     turned: Option<Instant>,
+    unbuffered: bool,
 }
 
 struct State {
@@ -278,6 +284,17 @@ impl State {
                 lane.stopped || lane.queue.len() < self.cap
             }
             Consumer::Writer(w, _) => self.writers[*w].len() < self.cap,
+        })
+    }
+
+    /// Whether everything in `consumers` has taken all it was handed.
+    fn drained(&self, consumers: &[Consumer]) -> bool {
+        consumers.iter().all(|c| match c {
+            Consumer::Lane(j) => {
+                let lane = &self.lanes[*j];
+                lane.stopped || lane.queue.is_empty()
+            }
+            Consumer::Writer(w, _) => self.writers[*w].idle(),
         })
     }
 
@@ -660,7 +677,12 @@ impl State {
         let ports = lane.ports.iter().flatten().chain(lane.rows.iter());
         for port in ports {
             if let Some(consumers) = self.consumers.get(&port.out.stream) {
-                if !self.room(consumers) {
+                let room = if lane.unbuffered {
+                    self.drained(consumers)
+                } else {
+                    self.room(consumers)
+                };
+                if !room {
                     return false;
                 }
                 // A source has nothing upstream to wait on, so a hold input it
@@ -1061,6 +1083,7 @@ impl Scheduler {
                 finisher: None,
                 started: None,
                 turned: None,
+                unbuffered: spec.unbuffered,
             });
         }
         let mut state = State {
@@ -1440,6 +1463,7 @@ mod tests {
                 opener: None,
                 ports: Vec::new(),
                 rows: None,
+                unbuffered: false,
             }],
             consumers: HashMap::from([(0, vec![Consumer::Lane(0)])]),
             writers: Vec::new(),

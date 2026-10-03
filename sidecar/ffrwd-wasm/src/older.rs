@@ -270,6 +270,7 @@ pub fn run(
             consumers.entry(id).or_default().push(Consumer::Lane(index));
         }
         let module = matches!(seed.runners.first(), Some(Runner::Node(_)));
+        let unbuffered = matches!(seed.runners.first(), Some(Runner::Leaky(_)));
         let shape = lane_shape(&seed, module);
         let opener: Option<Opener> = seed.reopen.map(|reopen| {
             let opener: Opener = Arc::new(move || {
@@ -306,6 +307,7 @@ pub fn run(
             opener,
             ports: vec![None],
             rows: None,
+            unbuffered,
             shape,
         });
     }
