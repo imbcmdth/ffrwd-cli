@@ -274,6 +274,9 @@ struct MemberQueue {
     bytes: usize,
     /// The last frame's pts, or the end of the last run of samples.
     last: Option<i64>,
+    /// The pts the last frame or run arrived with, which a run of samples
+    /// keeps once the ticks have taken it.
+    newest: Option<i64>,
 }
 
 impl MemberQueue {
@@ -284,6 +287,7 @@ impl MemberQueue {
             queue: VecDeque::new(),
             bytes: 0,
             last: None,
+            newest: None,
         }
     }
 
@@ -508,6 +512,7 @@ impl Group {
             PortKind::Audio => frame.pts.saturating_add(frame.duration.unwrap_or(0)),
             _ => frame.pts,
         });
+        queue.newest = Some(frame.pts);
         queue.push(frame);
     }
 
@@ -842,9 +847,10 @@ impl Group {
                 return None;
             }
         }
-        let last = match lead.queue.back() {
-            Some(frame) => frame.pts,
-            None => feed.shown[source.lead].as_ref()?.pts,
+        let last = match (self.members[source.lead].kind, lead.queue.back()) {
+            (PortKind::Audio, _) => lead.newest?,
+            (_, Some(frame)) => frame.pts,
+            (_, None) => feed.shown[source.lead].as_ref()?.pts,
         };
         let turn = feed
             .offset
@@ -1482,6 +1488,39 @@ mod tests {
         let ended = g.take_ended();
         assert_eq!(ended.len(), 1, "a foretold end is kept as well");
         assert_eq!(ended[0].1.ends, Some(2));
+    }
+
+    #[test]
+    fn a_sound_only_feed_keeps_its_foretold_end_through_its_last_tick() {
+        let grid = Grid::exact();
+        for port_fed in [false, true] {
+            let (mut g, _) = group(
+                hold(Anchor::SharedClock, 0.0, None, None),
+                vec![audio_member(1)],
+                port_fed,
+            );
+            g.arrive(0, samples(0, 1024));
+            g.arrive(0, samples(1024, 1024));
+            g.arrive(0, samples(2048, 512));
+            g.source_close(0);
+            let foretold: Vec<Option<i64>> = (0..4)
+                .map(|k| {
+                    g.tick(k * 1024, Some((k + 1) * 1024), KHZ48, &grid)[0]
+                        .feed
+                        .as_ref()
+                        .and_then(|f| f.ends)
+                })
+                .collect();
+            let told = foretold.iter().position(Option::is_some).expect("foretold");
+            assert!(
+                foretold[told..3].iter().all(|ends| *ends == Some(2048)),
+                "from its foretelling to the tick its last sample is in ({foretold:?})"
+            );
+            assert_eq!(foretold[3], None, "ended");
+            let ended = g.take_ended();
+            assert_eq!(ended.len(), 1);
+            assert_eq!(ended[0].1.ends, Some(2048));
+        }
     }
 
     #[test]
