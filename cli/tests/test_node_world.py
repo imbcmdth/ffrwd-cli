@@ -1400,6 +1400,46 @@ def test_a_node_at_a_copys_to_reads_the_select_as_a_packet_sink_did(
     assert encoder[encoder.index("-c:0") + 1] == "libx264"
 
 
+_SUB = "CREATE FUNCTION sub(relay text) RETURNS source AS 'sub.wasm', 'sub' LANGUAGE wasm;\n"
+
+
+def test_a_leaky_over_packets_something_decodes_after_leaks_the_decoded_pictures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """burn reads pictures, so the decode goes ahead of the leaky, which then
+    drops single pictures rather than whole groups."""
+    monkeypatch.setitem(SHAPES, "sub.wasm", _subscribe)
+    argv = _plan_argv(
+        _SUB + "COPY (SELECT burn(ffrwd.leaky(v.video[1])) FROM sub('r') v "
+        "WHERE v.height = 720) TO 'out.mkv'",
+        monkeypatch,
+    )
+    (decode,) = [words for words in argv.values() if "[0:v:0]null[out0]" in words]
+    assert decode[decode.index("-c:0") + 1] == "rawvideo"
+    (leaking,) = [words for words in argv.values() if any("leaky=" in w for w in words)]
+    assert leaking[leaking.index("-filter_complex") + 1].startswith("[0:v]leaky=")
+
+
+def test_a_leaky_over_packets_only_publish_reads_keeps_the_packets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(SHAPES, "sub.wasm", _subscribe)
+    monkeypatch.setitem(SHAPES, "publish.wasm", _publish)
+    monkeypatch.setitem(
+        _PARAMS, "publish.wasm", {"relay": {"type": "string"}, "broadcast": {"type": "string"}}
+    )
+    argv = _plan_argv(
+        _SUB + _PUBLISH + "COPY (SELECT ffrwd.leaky(v.video[1]), v.audio[1] FROM sub('r') v "
+        "WHERE v.height = 720) TO publish('https://relay', 'b')",
+        monkeypatch,
+        describe=_reporting("publish.wasm"),
+    )
+    assert not any("[0:v:0]null[out0]" in words for words in argv.values())
+    (leaking,) = [words for words in argv.values() if any("leaky=" in w for w in words)]
+    assert "sub=relay=r[hd=n10]" in leaking[leaking.index("-filter_complex") + 1]
+    assert "[n10]leaky=" in leaking[leaking.index("-filter_complex") + 1]
+
+
 def test_a_nodes_picture_into_a_node_sink_is_encoded_and_its_data_is_not_copied(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

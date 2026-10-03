@@ -52,6 +52,7 @@ from .execute import DEFAULT_TIMEOUT
 from .functions import WasmFunction, package_modules, script_definitions
 from .inputs import declared_probe, forces_demuxer, probe_options, render_options
 from .ir import LEAKY, Graph, Lateral
+from .leaky import decode_ahead_of_leaky
 from .lower import ProbePath, input_option_values, lower_commands, lower_table
 from .parser import Resolved, parse, resolve
 from .probe import ProbeFailure, ProbeResult
@@ -698,7 +699,9 @@ def compile_all(
             probe_failures=probe_failures,
             shapes=shapes_module.ShapeCache(shape),
         )
-        ready = [insert_splits(insert_pts_resets(graph)) for graph in graphs]
+        ready = [
+            insert_splits(insert_pts_resets(decode_ahead_of_leaky(graph))) for graph in graphs
+        ]
         ready[0] = replace(
             ready[0],
             laterals=[

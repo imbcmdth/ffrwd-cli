@@ -1643,6 +1643,14 @@ queue, and a sink's max-lateness.
   `max_lateness => COALESCE(:max_lateness, 0.5)`. A sound stream, a limit
   out of range or not a number, and any other argument are refused by
   name.
+- **Packets or pictures.** Over a coded picture (a subscribe's, say) it
+  reads packets in decode order and drops whole groups, from a late
+  packet to the next keyframe that is in time. It keeps that form only
+  where everything reading its output takes packets: a publish, or a
+  file the stream is copied into. Where anything decodes the picture
+  after it (a node reading pictures, an ffmpeg filter, an encoder), the
+  plan decodes ahead of it instead, and it drops single pictures: a
+  stall costs a picture or two, not the wait for the next keyframe.
 - **Where.** Right after the live input at a head, right after the
   subscribe at a leaf, before anything splits. It is legal anywhere on a
   video lane; over a file it drops nothing unless something upstream
