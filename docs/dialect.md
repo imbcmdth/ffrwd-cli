@@ -1037,6 +1037,19 @@ what `SELECT *` already does; naming the column is the third spelling
 of the same thing. A sink left with NO streams at all is still a
 rejection, since it would write a file with nothing in it.
 
+A remote run carries a lockfile of its own. `run --remote` builds one
+document for the job rather than copying the project's file: the
+entries for the packages the query resolves, the recipe's own package
+when one is run by name, and what those depend on as the lockfiles
+record it, transitively. The project's lockfile is the source of
+versions; the machine-wide one contributes only a resolved package the
+project does not pin. A linked package among them is packed, uploaded
+with the job and pinned by the archive's digest, its own lockfile and
+links file read the same way, so what it depends on travels too; the
+files on disk are untouched. A resolved package no lockfile pins is
+refused before anything uploads. Nothing else installed on the machine
+travels, so the runner installs what the query uses and no more.
+
 ### The registry
 
 Two hosts answer, and they are two settings. `FFRWD_REGISTRY` is where

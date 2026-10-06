@@ -27,7 +27,14 @@ from ffrwd import cli, credentials, packages, parser, remote, store
 from ffrwd.console import Console, Progress
 from ffrwd.errors import FfrwdError
 from ffrwd.probe import ProbeResult, is_url
-from ffrwd.project import LinkEntry, RegistryEntry, links_path, write_linksfile, write_lockfile
+from ffrwd.project import (
+    LinkEntry,
+    RegistryEntry,
+    links_path,
+    read_manifest,
+    write_linksfile,
+    write_lockfile,
+)
 from ffrwd.table import TableResult, render_table
 
 API = "https://api.example"
@@ -682,7 +689,9 @@ def test_a_packed_package_is_put_to_the_entry_its_digest_keys(
     _submit_accepted(served, 0, packages=(archive_digest,))
     announced: list[str] = []
 
-    remote.submit_run(_query(MEDIA_QUERY), None, _run_args(), announce=announced.append)
+    remote.submit_run(
+        _query(MEDIA_QUERY), None, _run_args(), resolved={TOOLS}, announce=announced.append
+    )
 
     assert _uploaded(served) == {archive_digest: archive, "0": b"media bytes"}
     packed = served.request_to(_package_url(archive_digest))
@@ -704,7 +713,7 @@ def test_a_packages_digest_the_answer_left_out_is_refused_before_any_upload(
     _submit_accepted(served, 0)
 
     with pytest.raises(FfrwdError) as caught:
-        remote.submit_run(_query(MEDIA_QUERY), None, _run_args())
+        remote.submit_run(_query(MEDIA_QUERY), None, _run_args(), resolved={TOOLS})
     assert "answered with something this client does not read" in caught.value.message
     assert [asked.url for asked in served.asked] == [JOBS_URL]
 
@@ -857,15 +866,33 @@ def test_variables_travel_raw_beside_the_substituted_query(
 
 
 # ---------------------------------------------------------------------------
-# the effective lock: project entries over the machine-wide lockfile's
+# the submitted lock: what the query resolves, and what that depends on
 # ---------------------------------------------------------------------------
 
 STREAM_QUERY = "COPY (SELECT a.video[1] FROM input('rtmp://live/key') a) TO 'out.mp4'"
 
+# The same query, calling into the package `_linked_package` writes.
+PACKAGE_QUERY = (
+    "COPY (SELECT broadcast.tools.quieter(a.audio[1]) "
+    "FROM input('rtmp://live/key') a) TO 'out.mp4'"
+)
 
-def _registry_entry(name: str, version: str, sha256: str) -> RegistryEntry:
+# The (name, version) identities these tests pin, the shape a classification
+# reports and `submit_run` takes as `resolved`.
+TOOLS = ("broadcast/tools", "1.0.0")
+HELPER = ("broadcast/helper", "2.1.0")
+EXTRA = ("broadcast/extra", "1.0.0")
+
+
+def _registry_entry(
+    name: str, version: str, sha256: str, dependencies: dict[str, str] | None = None
+) -> RegistryEntry:
     return RegistryEntry(
-        name=name, version=version, sha256=sha256, store=store.entry_path(sha256)
+        name=name,
+        version=version,
+        sha256=sha256,
+        store=store.entry_path(sha256),
+        dependencies=dependencies or {},
     )
 
 
@@ -877,26 +904,52 @@ def _submitted_lock(served: _Served) -> str | None:
     return lock
 
 
-def test_a_global_only_setup_submits_the_global_entries(
+def _pinned(lock: str | None) -> list[tuple[str, str]]:
+    """The (name, version) pairs a submitted lock document pins, in order."""
+    assert lock is not None
+    return [(one["name"], one["version"]) for one in json.loads(lock)["packages"]]
+
+
+def _installed(root: Path) -> RegistryEntry:
+    """Put the package at `root` in the store the way installing does; the entry pinning it."""
+    package = read_manifest(root / "ffrwd.json")
+    archive, digest = _packed(root)
+    store.unpack(package.name, archive, digest)
+    return _registry_entry(package.name, package.version, digest)
+
+
+def test_a_project_lock_pinning_several_submits_the_resolved_one_and_its_dependencies(
     served: _Served, logged_in: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """The lock is built for the job: what the query resolved, and what the
+    project's lockfile records that depending on, transitively."""
     monkeypatch.chdir(tmp_path)
     write_lockfile(
-        store.global_lock_path(), [_registry_entry("broadcast/tools", "1.0.0", "a" * 64)]
+        tmp_path / "ffrwd.lock",
+        [
+            _registry_entry(*TOOLS, "a" * 64, {"broadcast/helper": "2.1.0"}),
+            _registry_entry(*HELPER, "b" * 64),
+            _registry_entry(*EXTRA, "c" * 64),
+        ],
+        dependencies={"broadcast/tools": "1.0.0", "broadcast/extra": "1.0.0"},
     )
     _submit_accepted(served)
-    remote.submit_run(_query(STREAM_QUERY), None, _run_args())
+    remote.submit_run(_query(STREAM_QUERY), None, _run_args(), resolved={TOOLS})
     lock = _submitted_lock(served)
-    assert lock is not None
-    entries = json.loads(lock)["packages"]
-    assert [(one["name"], one["version"], one["sha256"]) for one in entries] == [
-        ("broadcast/tools", "1.0.0", "a" * 64)
-    ]
+    assert _pinned(lock) == [TOOLS, HELPER]
+    document = json.loads(lock)
+    # The entry travels whole, its own binding included, and the top-level
+    # dependencies name only what travels.
+    assert document["packages"][0]["dependencies"] == {"broadcast/helper": "2.1.0"}
+    assert document["dependencies"] == {"broadcast/tools": "1.0.0"}
+    assert "c" * 64 not in lock
 
 
-def test_a_name_in_both_lockfiles_submits_the_projects_version(
+def test_the_global_lock_contributes_only_what_the_query_resolves_and_the_project_lacks(
     served: _Served, logged_in: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """The project's pin answers its name; the machine-wide file fills in a
+    resolved package the project does not pin, and nothing else it holds."""
     monkeypatch.chdir(tmp_path)
     write_lockfile(
         tmp_path / "ffrwd.lock", [_registry_entry("broadcast/tools", "2.0.0", "b" * 64)]
@@ -904,32 +957,55 @@ def test_a_name_in_both_lockfiles_submits_the_projects_version(
     write_lockfile(
         store.global_lock_path(),
         [
-            _registry_entry("broadcast/tools", "1.0.0", "a" * 64),
-            _registry_entry("broadcast/extra", "1.0.0", "c" * 64),
+            _registry_entry(*TOOLS, "a" * 64),
+            _registry_entry(*EXTRA, "c" * 64),
+            _registry_entry("openai/whisper", "3.0.0", "d" * 64),
         ],
     )
     _submit_accepted(served)
-    remote.submit_run(_query(STREAM_QUERY), None, _run_args())
+    remote.submit_run(
+        _query(STREAM_QUERY), None, _run_args(), resolved={("broadcast/tools", "2.0.0"), EXTRA}
+    )
     lock = _submitted_lock(served)
-    assert lock is not None
-    entries = json.loads(lock)["packages"]
-    # The project's pin wins its name; the global-only package still rides.
-    assert [(one["name"], one["version"], one["sha256"]) for one in entries] == [
-        ("broadcast/tools", "2.0.0", "b" * 64),
-        ("broadcast/extra", "1.0.0", "c" * 64),
-    ]
+    assert _pinned(lock) == [("broadcast/tools", "2.0.0"), EXTRA]
     assert "a" * 64 not in lock
+    assert "d" * 64 not in lock
 
 
-def test_a_project_only_lock_travels_verbatim(
+def test_a_global_only_setup_submits_the_resolved_global_entries(
     served: _Served, logged_in: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Outside a project the machine-wide file is the only source, and its
+    own direct installs travel filtered the same way its entries are."""
     monkeypatch.chdir(tmp_path)
     write_lockfile(
-        tmp_path / "ffrwd.lock", [_registry_entry("broadcast/tools", "2.0.0", "b" * 64)]
+        store.global_lock_path(),
+        [_registry_entry(*TOOLS, "a" * 64), _registry_entry(*EXTRA, "c" * 64)],
+        dependencies={"broadcast/tools": "1.0.0", "broadcast/extra": "1.0.0"},
     )
     _submit_accepted(served)
-    remote.submit_run(_query(STREAM_QUERY), None, _run_args())
+    remote.submit_run(_query(STREAM_QUERY), None, _run_args(), resolved={TOOLS})
+    lock = _submitted_lock(served)
+    assert _pinned(lock) == [TOOLS]
+    assert json.loads(lock)["dependencies"] == {"broadcast/tools": "1.0.0"}
+
+
+def test_a_project_lock_whose_every_pin_is_resolved_travels_as_its_own_text(
+    served: _Served, logged_in: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One writer renders both: a project lock the query resolves in full
+    synthesizes to the file's own bytes, so nothing has to copy it."""
+    monkeypatch.chdir(tmp_path)
+    write_lockfile(
+        tmp_path / "ffrwd.lock",
+        [
+            _registry_entry(*TOOLS, "a" * 64, {"broadcast/helper": "2.1.0"}),
+            _registry_entry(*HELPER, "b" * 64),
+        ],
+        dependencies={"broadcast/tools": "1.0.0"},
+    )
+    _submit_accepted(served)
+    remote.submit_run(_query(STREAM_QUERY), None, _run_args(), resolved={TOOLS})
     assert _submitted_lock(served) == (tmp_path / "ffrwd.lock").read_text(encoding="utf-8")
 
 
@@ -940,6 +1016,71 @@ def test_no_lockfile_anywhere_submits_none(
     _submit_accepted(served)
     remote.submit_run(_query(STREAM_QUERY), None, _run_args())
     assert _submitted_lock(served) is None
+
+
+def test_a_resolved_package_no_lockfile_pins_is_refused_before_any_request(
+    served: _Served, logged_in: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An install the runner would fail is refused here instead: with no
+    lockfile at all, and with one that pins other things."""
+    monkeypatch.chdir(tmp_path)
+    _submit_accepted(served)
+
+    with pytest.raises(FfrwdError) as caught:
+        remote.submit_run(_query(STREAM_QUERY), None, _run_args(), resolved={TOOLS})
+    assert caught.value.message == (
+        "the query resolves package 'broadcast/tools' 1.0.0, which no lockfile pins"
+    )
+    assert "install the package in the project" in (caught.value.hint or "")
+
+    write_lockfile(tmp_path / "ffrwd.lock", [_registry_entry(*EXTRA, "c" * 64)])
+    with pytest.raises(FfrwdError) as caught:
+        remote.submit_run(_query(STREAM_QUERY), None, _run_args(), resolved={TOOLS, HELPER})
+    assert caught.value.message == (
+        "the query resolves packages 'broadcast/helper' 2.1.0, 'broadcast/tools' 1.0.0, "
+        "which no lockfile pins"
+    )
+    assert served.asked == []
+
+
+def test_a_recipe_run_keeps_its_owner_package(
+    served: _Served,
+    logged_in: None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A recipe calling no package still resolves at the versions of the
+    package it ships in, so that package is pinned; the project's other
+    pins are not."""
+    monkeypatch.chdir(tmp_path)
+    tools = _linked_package(tmp_path / "tools")
+    (tools / "recipes").mkdir()
+    (tools / "recipes" / "duck.sql").write_text(STREAM_QUERY + "\n", encoding="utf-8")
+    (tools / "ffrwd.json").write_text(
+        json.dumps(
+            {
+                "name": "broadcast/tools",
+                "version": "1.0.0",
+                "lib": {"quieter": "src/lib.sql"},
+                "bin": {"duck": "recipes/duck.sql"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    extra = _linked_package(tmp_path / "extra", name="broadcast/extra")
+    write_lockfile(tmp_path / "ffrwd.lock", [_installed(tools), _installed(extra)])
+    _submit_accepted(served)
+
+    code = cli.main(["run", "--remote", "duck"])
+
+    assert code == 0, capsys.readouterr().err
+    _headers, body = served.sent_to(JOBS_URL)
+    assert body is not None
+    payload = json.loads(body)
+    assert payload["recipe"] == "duck"
+    assert payload["owner"] == ["broadcast/tools", "1.0.0"]
+    assert _pinned(payload["lock"]) == [TOOLS]
 
 
 # ---------------------------------------------------------------------------
@@ -1012,7 +1153,9 @@ def test_a_linked_package_packs_and_its_digest_pins_the_submitted_lock(
     _submit_accepted(served, packages=(digest,))
 
     seen: list[tuple[int, int | None]] = []
-    remote.submit_run(_query(STREAM_QUERY), None, _run_args(), progress=_reported(seen))
+    remote.submit_run(
+        _query(STREAM_QUERY), None, _run_args(), resolved={TOOLS}, progress=_reported(seen)
+    )
 
     # The spec names the digest as one this submit uploads, not one the
     # registry publishes.
@@ -1049,7 +1192,7 @@ def test_a_link_recorded_in_the_links_file_packs_the_same_way(
     _archive, digest = _packed(linked)
     _submit_accepted(served, packages=(digest,))
 
-    remote.submit_run(_query(STREAM_QUERY), None, _run_args())
+    remote.submit_run(_query(STREAM_QUERY), None, _run_args(), resolved={TOOLS})
 
     assert _submitted_packages(served) == [digest]
     lock = _submitted_lock(served)
@@ -1057,6 +1200,32 @@ def test_a_link_recorded_in_the_links_file_packs_the_same_way(
     document = json.loads(lock)
     assert document["reproducible"] is True
     assert [entry["sha256"] for entry in document["packages"]] == [digest]
+
+
+def test_a_linked_package_the_query_calls_is_packed_and_one_it_does_not_is_not(
+    served: _Served,
+    logged_in: None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The classification's resolved set is what the submit packs: of two
+    links, the one a call reached travels and the other stays home."""
+    monkeypatch.chdir(tmp_path)
+    tools = _linked_package(tmp_path / "tools")
+    _linked_package(tmp_path / "helper", name="broadcast/helper", version="2.1.0")
+    write_lockfile(
+        tmp_path / "ffrwd.lock", [LinkEntry(path="tools"), LinkEntry(path="helper")]
+    )
+    archive, digest = _packed(tools)
+    _submit_accepted(served, packages=(digest,))
+
+    code = cli.main(["run", "--remote", PACKAGE_QUERY])
+
+    assert code == 0, capsys.readouterr().err
+    assert _submitted_packages(served) == [digest]
+    assert _uploaded(served) == {digest: archive}
+    assert _pinned(_submitted_lock(served)) == [TOOLS]
 
 
 def test_the_packed_archive_holds_the_manifests_closure(
@@ -1072,7 +1241,7 @@ def test_the_packed_archive_holds_the_manifests_closure(
     _archive, digest = _packed(linked)
     _submit_accepted(served, packages=(digest,))
 
-    remote.submit_run(_query(STREAM_QUERY), None, _run_args())
+    remote.submit_run(_query(STREAM_QUERY), None, _run_args(), resolved={TOOLS})
 
     with tarfile.open(fileobj=io.BytesIO(_uploaded(served)[digest]), mode="r:gz") as opened:
         held = sorted(member.name for member in opened.getmembers() if member.isreg())
@@ -1092,7 +1261,7 @@ def test_an_unchanged_link_puts_the_same_key_again_and_an_edit_changes_it(
     write_lockfile(tmp_path / "ffrwd.lock", [LinkEntry(path="tools")])
     archive, digest = _packed(linked)
     _submit_accepted(served, packages=(digest,))
-    remote.submit_run(_query(STREAM_QUERY), None, _run_args())
+    remote.submit_run(_query(STREAM_QUERY), None, _run_args(), resolved={TOOLS})
     assert _submitted_packages(served) == [digest]
     assert _uploaded(served) == {digest: archive}
 
@@ -1100,7 +1269,7 @@ def test_an_unchanged_link_puts_the_same_key_again_and_an_edit_changes_it(
     again = _Served()
     monkeypatch.setattr(packages, "_urlopen", again)
     _submit_accepted(again, packages=(digest,))
-    remote.submit_run(_query(STREAM_QUERY), None, _run_args())
+    remote.submit_run(_query(STREAM_QUERY), None, _run_args(), resolved={TOOLS})
     assert _submitted_packages(again) == [digest]
     assert _uploaded(again) == {digest: archive}
 
@@ -1110,7 +1279,7 @@ def test_an_unchanged_link_puts_the_same_key_again_and_an_edit_changes_it(
     _linked_package(tmp_path / "tools", factor="0.9")
     changed_archive, changed = _packed(linked)
     _submit_accepted(edited, packages=(changed,))
-    remote.submit_run(_query(STREAM_QUERY), None, _run_args())
+    remote.submit_run(_query(STREAM_QUERY), None, _run_args(), resolved={TOOLS})
     assert _submitted_packages(edited) == [changed]
     assert _uploaded(edited) == {changed: changed_archive}
     assert changed != digest
@@ -1119,7 +1288,9 @@ def test_an_unchanged_link_puts_the_same_key_again_and_an_edit_changes_it(
 def test_a_link_inside_a_linked_package_travels_too(
     served: _Served, logged_in: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The closure is transitive: a linked package may link others."""
+    """The closure is transitive: a linked package may link others, and what
+    it links is a dependency of it, pinned as an installed version of it
+    would pin it."""
     monkeypatch.chdir(tmp_path)
     tools = _linked_package(tmp_path / "tools")
     helper = _linked_package(tmp_path / "helper", name="broadcast/helper", version="2.1.0")
@@ -1130,16 +1301,43 @@ def test_a_link_inside_a_linked_package_travels_too(
     _helper_archive, helper_digest = _packed(helper)
     _submit_accepted(served, packages=(tools_digest, helper_digest))
 
-    remote.submit_run(_query(STREAM_QUERY), None, _run_args())
+    remote.submit_run(_query(STREAM_QUERY), None, _run_args(), resolved={TOOLS})
 
     # Depth first: the package a link names is packed before the link itself.
     assert _submitted_packages(served) == [helper_digest, tools_digest]
     assert sorted(_uploaded(served)) == sorted([helper_digest, tools_digest])
     lock = _submitted_lock(served)
-    assert lock is not None
-    pinned = [(one["name"], one["version"]) for one in json.loads(lock)["packages"]]
-    # The top-level lock pins what it links; the nested one rode along as bytes.
-    assert pinned == [("broadcast/tools", "1.0.0")]
+    assert _pinned(lock) == [TOOLS, HELPER]
+    document = json.loads(lock)
+    assert document["packages"][0]["dependencies"] == {"broadcast/helper": "2.1.0"}
+    assert document["packages"][1]["sha256"] == helper_digest
+
+
+def test_a_pin_in_a_linked_packages_own_lockfile_travels_with_it(
+    served: _Served, logged_in: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A link resolves its calls through its own lockfile, so what that
+    pins for the link's dependencies rides along, and the link's pin binds
+    it; a pin nothing there depends on does not."""
+    monkeypatch.chdir(tmp_path)
+    tools = _linked_package(tmp_path / "tools")
+    write_lockfile(
+        tools / "ffrwd.lock",
+        [_registry_entry(*HELPER, "b" * 64), _registry_entry(*EXTRA, "c" * 64)],
+        dependencies={"broadcast/helper": "2.1.0"},
+    )
+    write_lockfile(tmp_path / "ffrwd.lock", [LinkEntry(path="tools")])
+    _archive, digest = _packed(tools)
+    _submit_accepted(served, packages=(digest,))
+
+    remote.submit_run(_query(STREAM_QUERY), None, _run_args(), resolved={TOOLS})
+
+    assert _submitted_packages(served) == [digest]
+    lock = _submitted_lock(served)
+    assert _pinned(lock) == [TOOLS, HELPER]
+    document = json.loads(lock)
+    assert document["packages"][0]["dependencies"] == {"broadcast/helper": "2.1.0"}
+    assert "c" * 64 not in lock
 
 
 def test_a_link_cycle_is_refused_naming_the_loop(
@@ -1154,7 +1352,7 @@ def test_a_link_cycle_is_refused_naming_the_loop(
     _submit_accepted(served)
 
     with pytest.raises(FfrwdError) as caught:
-        remote.submit_run(_query(STREAM_QUERY), None, _run_args())
+        remote.submit_run(_query(STREAM_QUERY), None, _run_args(), resolved={TOOLS})
     assert caught.value.message == (
         "link cycle: broadcast/tools -> broadcast/helper -> broadcast/tools"
     )
@@ -1176,7 +1374,7 @@ def test_an_oversize_package_is_refused_naming_what_it_ships(
     _submit_accepted(served)
 
     with pytest.raises(FfrwdError) as caught:
-        remote.submit_run(_query(STREAM_QUERY), None, _run_args())
+        remote.submit_run(_query(STREAM_QUERY), None, _run_args(), resolved={TOOLS})
     assert caught.value.message.startswith("package 'broadcast/tools' packs to ")
     assert "a submit carries at most 64 bytes per package" in caught.value.message
     assert '"files"' in (caught.value.hint or "")
@@ -1209,7 +1407,7 @@ def test_a_submit_leaves_the_lockfile_on_disk_alone(
     _archive, digest = _packed(linked)
     _submit_accepted(served, packages=(digest,))
 
-    remote.submit_run(_query(STREAM_QUERY), None, _run_args())
+    remote.submit_run(_query(STREAM_QUERY), None, _run_args(), resolved={TOOLS})
 
     assert lock_path.read_text(encoding="utf-8") == before
     assert json.loads(before)["packages"] == [{"kind": "link", "path": "tools"}]

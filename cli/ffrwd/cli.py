@@ -209,6 +209,7 @@ from . import publish as publish_module
 from . import registry as registry_module
 from .compiler import (
     Compiled,
+    classified,
     classify,
     compile_all,
     compile_commands,
@@ -1644,7 +1645,7 @@ def _cmd_run(args: argparse.Namespace, on_warning: OnWarning) -> int:
         if query is None:
             return code
         with console.status("compiling"):
-            is_table_capable, _has_copy = classify(
+            classification = classified(
                 query.text,
                 packages=packages,
                 on_warning=on_warning,
@@ -1654,6 +1655,7 @@ def _cmd_run(args: argparse.Namespace, on_warning: OnWarning) -> int:
     except FfrwdError as err:
         _print_error(err, source=args.query, packages=packages, query=query)
         return 1
+    is_table_capable = classification.is_table_capable
 
     # The remote fork: everything after this point -- probing, ffmpeg, output
     # directories -- is the runner's machine's business, not this one's.
@@ -1671,6 +1673,7 @@ def _cmd_run(args: argparse.Namespace, on_warning: OnWarning) -> int:
                     query,
                     packages,
                     args,
+                    resolved=classification.packages,
                     announce=console.say,
                     progress=console.progress("uploading"),
                     detail=console.detail,
