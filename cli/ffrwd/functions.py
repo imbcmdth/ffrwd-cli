@@ -1041,11 +1041,15 @@ class Script:
     package declaration a call adopted. A script with no ``LANGUAGE wasm``
     function and no call into a package's leaves it empty. `laterals` holds
     each run-time lateral, keyed by the name its columns are read under.
+    `packages` is the (name, version) of every package a call reached,
+    bodies included: what the script resolved through, which is less than
+    what is installed.
     """
 
     tree: exp.Expr
     wasm: dict[str, WasmFunction] = field(default_factory=dict)
     laterals: dict[str, RuntimeLateral] = field(default_factory=dict)
+    packages: frozenset[tuple[str, str]] = frozenset()
 
 
 @dataclass
@@ -1161,7 +1165,10 @@ def expanded(
     except FfrwdError as err:
         raise expander.translate(err) from err
     script = Script(
-        tree=expanded_tree, wasm=dict(expander.wasm), laterals=dict(expander.laterals)
+        tree=expanded_tree,
+        wasm=dict(expander.wasm),
+        laterals=dict(expander.laterals),
+        packages=frozenset(expander.scopes),
     )
     try:
         yield script

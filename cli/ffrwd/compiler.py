@@ -80,7 +80,9 @@ from .warnings import FfrwdWarning, OnWarning, WarningCode
 from .wasm import Described
 
 __all__ = [
+    "Classification",
     "Compiled",
+    "classified",
     "classify",
     "compile_all",
     "compile_commands",
@@ -866,6 +868,46 @@ def compile_instance(
     return from_commands(compiled.graphs)
 
 
+@dataclass(frozen=True)
+class Classification:
+    """What :func:`classified` reads off a query without probing it.
+
+    `is_table_capable` and `has_copy` are :func:`classify`'s pair. `packages`
+    is the (name, version) of every package a call resolved through, a
+    body's calls included: what a remote submit pins, which leaves out
+    everything installed that the query never reached.
+    """
+
+    is_table_capable: bool
+    has_copy: bool
+    packages: frozenset[tuple[str, str]]
+
+
+def classified(
+    text: str,
+    *,
+    packages: PackageSet | None = None,
+    on_warning: OnWarning | None = None,
+    owner: tuple[str, str] | None = None,
+    unset: Mapping[tuple[int, int], str] | None = None,
+) -> Classification:
+    """`text` classified: parse + resolve only, no probing.
+
+    ``is_table_capable`` is True when `text` has no media destination -- a
+    bare SELECT, or every COPY a ``FORMAT csv`` one. A bare SELECT is always
+    table-capable by this check alone; the CLI decides from it whether to
+    use :func:`compile_table_sql` or fall back to :func:`compile_sql`.
+
+    Raises ``FfrwdError`` on a query that does not even resolve.
+    """
+    res = resolve(parse(text, unset), packages=packages, on_warning=on_warning, owner=owner)
+    return Classification(
+        is_table_capable=all(bool(sink.table_format) for sink in res.sinks),
+        has_copy=bool(res.sinks),
+        packages=res.packages,
+    )
+
+
 def classify(
     text: str,
     *,
@@ -874,18 +916,9 @@ def classify(
     owner: tuple[str, str] | None = None,
     unset: Mapping[tuple[int, int], str] | None = None,
 ) -> tuple[bool, bool]:
-    """``(is_table_capable, has_copy)`` for `text`.
-
-    Cheap and static: parse + resolve only, no probing. ``is_table_capable``
-    is True when `text` has no media destination -- a bare SELECT, or every
-    COPY a ``FORMAT csv`` one. A bare SELECT is always table-capable by this
-    check alone; the CLI decides from it whether to use
-    :func:`compile_table_sql` or fall back to :func:`compile_sql`.
-
-    Raises ``FfrwdError`` on a query that does not even resolve.
-    """
-    res = resolve(parse(text, unset), packages=packages, on_warning=on_warning, owner=owner)
-    return all(bool(sink.table_format) for sink in res.sinks), bool(res.sinks)
+    """``(is_table_capable, has_copy)`` for `text`: :func:`classified`'s pair."""
+    found = classified(text, packages=packages, on_warning=on_warning, owner=owner, unset=unset)
+    return found.is_table_capable, found.has_copy
 
 
 def compile_table_sql(

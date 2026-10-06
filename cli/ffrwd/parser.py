@@ -2494,6 +2494,10 @@ class Resolved:
     or a range that would produce no rows. No ``-i`` and no probe: lower reads
     this directly to build the row table's ``_TrackRow``s."""
 
+    packages: frozenset[tuple[str, str]] = frozenset()
+    """The (name, version) of every package a call resolved through, bodies
+    included, read off the expansion. Empty for a script calling no package."""
+
 
 def _listed_columns(names: Iterable[str]) -> str:
     return ", ".join(sorted(names))
@@ -9379,6 +9383,7 @@ def resolve(
             resolved = _Resolver(script.wasm).run(script.tree)
             resolved.wasm = script.wasm
             resolved.laterals = script.laterals
+            resolved.packages = script.packages
             return resolved
     except FfrwdError:
         raise

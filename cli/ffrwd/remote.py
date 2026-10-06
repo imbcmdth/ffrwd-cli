@@ -3,12 +3,12 @@
 A remote run is the same query, executed by the registry's runner instead of
 this machine's ffmpeg. :func:`submit_run` builds the submit payload -- the
 substituted SQL plus the raw ``-v`` pairs it was substituted from, the recipe
-name and owning package when one was run by name, the effective lock (the
-project's entries over the machine-wide lockfile's, one document), every
-``input()`` path (local files uploaded; any "://" spec passed through
-untouched, the runner's to open), every ``COPY ... TO`` destination,
-and ``--timeout`` -- posts it, uploads the file inputs and the packed linked
-packages, and queues the job.
+name and owning package when one was run by name, the lock the job installs
+from (the packages the query resolves and what they depend on, one
+document), every ``input()`` path (local files uploaded; any "://" spec
+passed through untouched, the runner's to open), every ``COPY ... TO``
+destination, and ``--timeout`` -- posts it, uploads the file inputs and the
+packed linked packages, and queues the job.
 :func:`jobs_command` is the other half: list, watch, cancel, fetch a
 succeeded job's outputs, or show one job's own detail -- the fields a
 listing row omits, its log tail included. A failed or cancelled job's tail
@@ -33,13 +33,23 @@ file past what a single PUT signs for is refused before it is even opened.
 Once every upload is in, ``ready_url`` queues the job under the same bearer
 the submit carried.
 
-A LINKED package does ride along. It has no published digest, so it is packed
-at submit time -- the same :func:`ffrwd.store.pack` ``publish`` uses, so what
-travels is the manifest's closure and what the ignore files allow, models
-excluded -- PUT to the entry its own digest keys, and spelled in the submitted
-lock as a pin against that archive's digest. The lockfile ON DISK is
-untouched: a link stays a link for local development, and the rewrite exists
-only on the wire.
+The lock a job carries is built for the job, not copied from disk: the
+classification already resolved the query's calls to packages, and only
+those, plus the recipe's own package when one was run by name, plus what
+they depend on as the lockfiles record it, are pinned. The project's
+lockfile is the source of versions; the machine-wide one fills in a resolved
+package the project does not pin. Everything else installed on this machine
+stays home, so the runner installs what the query uses and nothing more.
+
+A LINKED package the query resolves does ride along. It has no published
+digest, so it is packed at submit time -- the same :func:`ffrwd.store.pack`
+``publish`` uses, so what travels is the manifest's closure and what the
+ignore files allow, models excluded -- PUT to the entry its own digest keys,
+and spelled in the submitted lock as a pin against that archive's digest.
+Its own lockfile and links file are read the same way, so a package it
+depends on is pinned or packed too. The lockfile ON DISK is untouched: a
+link stays a link for local development, and the rewrite exists only on
+the wire.
 
 What does NOT ride along: the project's own source files. A query resolving a
 call through the project's OWN manifest package compiles here and fails
@@ -62,8 +72,8 @@ import tempfile
 import threading
 import time
 import urllib.error
-from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Protocol, TypeVar
@@ -433,6 +443,7 @@ def submit_run(
     packages: PackageSet | None,
     args: argparse.Namespace,
     *,
+    resolved: Collection[tuple[str, str]] = (),
     announce: Announce | None = None,
     progress: Progress | None = None,
     detail: Announce | None = None,
@@ -440,11 +451,15 @@ def submit_run(
     """Submit `query` as a hosted job: post the spec, upload the bytes, queue it.
 
     Called from ``run``'s fork after the query classified as a media one.
-    Raises :class:`FfrwdError` for every refusal -- this machine's own all
-    before the first request, the server's passed through -- and returns the
-    job id the caller reports, alongside what the account has left this
-    month. `announce` hears one line per step: the submit, each upload with
-    its size, and the queueing; `progress` hears the bytes of every upload.
+    `resolved` is what that classification found the query resolving: the
+    (name, version) of every package a call reached, bodies included, which
+    is what the submitted lock pins (see :func:`_lock`); empty for a query
+    calling no package. Raises :class:`FfrwdError` for every refusal -- this
+    machine's own all before the first request, the server's passed through
+    -- and returns the job id the caller reports, alongside what the account
+    has left this month. `announce` hears one line per step: the submit, each
+    upload with its size, and the queueing; `progress` hears the bytes of
+    every upload.
     """
     if args.show or args.show_only:
         raise _reject(
@@ -457,7 +472,7 @@ def submit_run(
     live = is_live_submission(text, bool(getattr(args, "live", False)))
     if not live:
         _check_bounded(text)
-    lock, archives = _lock(packages)
+    lock, archives = _lock(packages, resolved, query.owner)
 
     spec: dict[str, object] = {
         "format_version": JOB_FORMAT_VERSION,
@@ -583,107 +598,206 @@ class _Archive:
     content: bytes
 
 
-def _lock(packages: PackageSet | None) -> tuple[str | None, tuple[_Archive, ...]]:
+# What a lockfile entry pins and what the resolver reports: (name, version).
+_Identity = tuple[str, str]
+
+
+@dataclass(frozen=True)
+class _Held:
+    """One package a lockfile this submit reads pins, or links.
+
+    `entry` is the record and `source` the file holding it. A link also
+    carries `root`, the directory it reads, and `package`, the manifest
+    there. `wants` is what the package depends on, each as (name, version),
+    the way its own lockfile records it: a registry entry's own
+    ``dependencies``; for a link, what its links file links and what its
+    lockfile's own ``dependencies`` pins, the binding local resolution gives
+    its calls. A link's is empty until the link is kept, since reading its
+    lockfile is what resolving through it costs.
+    """
+
+    entry: LockEntry
+    source: Path
+    root: Path | None = None
+    package: Package | None = None
+    wants: tuple[_Identity, ...] = ()
+
+    @property
+    def identity(self) -> _Identity:
+        if isinstance(self.entry, RegistryEntry):
+            return self.entry.name, self.entry.version
+        assert self.package is not None  # a link is catalogued with its manifest
+        return self.package.name, self.package.version
+
+
+def _lock(
+    packages: PackageSet | None,
+    resolved: Collection[_Identity],
+    owner: _Identity | None,
+) -> tuple[str | None, tuple[_Archive, ...]]:
     """The submitted lock, and the packed archives its pins name.
 
-    The effective lock is the project's entries over the machine-wide
-    lockfile's: local resolution layers the global lockfile under the
-    project's, so a query compiling here against globally installed packages
-    must submit a lock the runner can honor too. One document is synthesized
-    -- the project lockfile's entries, then every global entry whose name the
-    project does not pin -- in the same format the runner reads.
+    One document, in the format the runner reads, holding what the job
+    installs and nothing else: the entries for the packages the query
+    resolved (`resolved`, plus `owner` for a recipe run by name), and what
+    those depend on as the lockfiles record it, transitively. The project's
+    lockfile is the source of versions; the machine-wide one contributes
+    only a resolved package the project does not pin. A link among them is
+    packed and replaced by a pin against its archive's digest, its own
+    lockfile and links file read the same way, so a package it depends on
+    travels too. A resolved package no lockfile pins is refused here,
+    before anything uploads, rather than failing the runner's install.
+    Nothing on disk is written.
 
-    Every link -- from the links file beside each lockfile, or left in an
-    older lockfile itself -- is then packed and replaced by a pin against its
-    archive's digest, transitively: a linked package may link others, and
-    those travel too. The document on the wire therefore holds registry pins
-    only. Nothing is written to any of the files on disk.
-
-    With nothing installed globally and nothing linked, the project's file
-    travels verbatim, as it always did; with no lockfile anywhere there is
-    nothing to send.
+    Always synthesized, never copied: one writer renders every lockfile, so
+    a project file whose every pin is resolved comes out byte for byte as
+    itself, and a second path for that case would only have a hand-edited
+    file to carry. With no lockfile anywhere there is nothing to send.
     """
     start = packages.root if packages is not None else Path.cwd()
     found = find_lockfile(start)
-    machine_wide = _global_lock(found)
     local = read_lockfile(found) if found is not None else None
+    machine_wide = _global_lock(found)
     global_lock = store.global_lock_path()
     global_links = (
         list(held_links(global_lock)) if found is None or global_lock != found else []
     )
+    needed = _needed(packages, resolved, owner)
     if local is None and machine_wide is None and not global_links:
+        if needed:
+            raise _unpinned(needed)
         return None, ()
 
-    # Each entry with the file it came from: a link's path is written
-    # relative to the file holding it, and the merge below loses that. Links
-    # come through `held_links` -- the links file, plus any entry an older
-    # ffrwd left in the lockfile itself.
-    sourced: list[tuple[LockEntry, Path]] = []
+    # Links before pins within a layer, and the project before the machine:
+    # the first claim on an identity is the one local resolution answered
+    # with. Links come through `held_links`, the links file plus any entry
+    # an older ffrwd left in the lockfile itself.
+    catalogue: dict[_Identity, _Held] = {}
     if local is not None:
-        sourced = [
-            (entry, local.path) for entry in local.entries if not isinstance(entry, LinkEntry)
-        ]
-        sourced += list(held_links(local.path))
-    pinned = {
-        entry.name for entry, _ in sourced if isinstance(entry, RegistryEntry)
-    }
+        _catalogue_links(catalogue, held_links(local.path))
+        _catalogue_pins(catalogue, local)
+    _catalogue_links(catalogue, global_links)
     if machine_wide is not None:
-        for entry in machine_wide.entries:
-            if isinstance(entry, LinkEntry) or entry.name in pinned:
-                continue
-            sourced.append((entry, machine_wide.path))
-    sourced += global_links
+        _catalogue_pins(catalogue, machine_wide)
 
-    linked = any(isinstance(entry, LinkEntry) for entry, _ in sourced)
-    if machine_wide is None and not linked and found is not None:
-        try:
-            return found.read_text(encoding="utf-8"), ()
-        except OSError as err:
-            raise _reject(
-                f"{found} could not be read: {err.strerror or err}",
-                "the lockfile rides along verbatim so the runner installs what "
-                "this project pins",
-            ) from err
+    kept = _closure(needed, catalogue)
+    missing = [identity for identity in needed if identity not in kept]
+    if missing:
+        raise _unpinned(missing)
 
     packed: dict[Path, RegistryEntry] = {}
     archives: list[_Archive] = []
-    entries = _resolved(sourced, [], packed, archives)
-    held = local if local is not None else machine_wide
-    dependencies = held.dependencies if held is not None else {}
+    entries: list[LockEntry] = []
+    for identity in catalogue:
+        held = kept.get(identity)
+        if held is None:
+            continue
+        if isinstance(held.entry, RegistryEntry):
+            entries.append(held.entry)
+        else:
+            entries.append(_pin(held, kept, [], packed, archives))
+    recorded = local if local is not None else machine_wide
+    direct = recorded.dependencies.items() if recorded is not None else ()
+    dependencies = {name: version for name, version in direct if (name, version) in kept}
     return lockfile_text(entries, dependencies=dependencies), tuple(archives)
 
 
-def _resolved(
-    sourced: Sequence[tuple[LockEntry, Path]],
-    chain: list[tuple[Path, str]],
-    packed: dict[Path, RegistryEntry],
-    archives: list[_Archive],
-) -> list[LockEntry]:
-    """`sourced`'s entries with every link replaced by the pin its archive earns.
+def _needed(
+    packages: PackageSet | None, resolved: Collection[_Identity], owner: _Identity | None
+) -> list[_Identity]:
+    """What the job has to find pinned, in name order.
 
-    Depth first, so a linked package's own links are packed before the pin
-    that names it. `packed` is what has already been packed, keyed by the
-    directory -- one link, one archive, however many lockfiles name it.
-    `chain` is the links currently being walked, so a loop is caught rather
-    than followed.
+    `resolved` and `owner`, less the project's own package: that one travels
+    as nothing (see the module docstring), and a recipe of the project's own
+    runs from its text alone.
     """
-    entries: list[LockEntry] = []
-    for entry, lock_path in sourced:
-        if not isinstance(entry, LinkEntry):
-            entries.append(entry)
+    wanted = set(resolved)
+    if owner is not None:
+        wanted.add(owner)
+    own = packages.get(packages.project) if packages is not None and packages.project else None
+    if own is not None:
+        wanted.discard((own.name, own.version))
+    return sorted(wanted)
+
+
+def _unpinned(missing: Sequence[_Identity]) -> FfrwdError:
+    named = ", ".join(f"'{name}' {version}" for name, version in missing)
+    what = "package" if len(missing) == 1 else "packages"
+    return _reject(
+        f"the query resolves {what} {named}, which no lockfile pins",
+        "a job installs from the project's ffrwd.lock and the machine-wide one; "
+        "install the package in the project, or run without --remote",
+    )
+
+
+def _catalogue_pins(catalogue: dict[_Identity, _Held], lock: Lockfile) -> None:
+    """Add `lock`'s registry entries under the identities nothing claimed yet."""
+    for entry in lock.entries:
+        if isinstance(entry, RegistryEntry):
+            held = _Held(entry, lock.path, wants=tuple(entry.dependencies.items()))
+            catalogue.setdefault(held.identity, held)
+
+
+def _catalogue_links(
+    catalogue: dict[_Identity, _Held], links: Iterable[tuple[LinkEntry, Path]]
+) -> None:
+    """Add each link under the identity its manifest declares, unless claimed."""
+    for entry, source in links:
+        held = _linked(entry, source)
+        catalogue.setdefault(held.identity, held)
+
+
+def _linked(entry: LinkEntry, source: Path) -> _Held:
+    """`entry` with its directory and manifest read, or a refusal naming the link."""
+    root = _link_root(entry, source)
+    return _Held(entry, source, root=root, package=_link_manifest(entry, root))
+
+
+def _closure(
+    needed: Sequence[_Identity], catalogue: dict[_Identity, _Held]
+) -> dict[_Identity, _Held]:
+    """Every catalogued package `needed` reaches through recorded dependencies.
+
+    A kept link's own lockfile and links file join the catalogue as the link
+    is reached, so a package pinned only there is found through the link
+    that depends on it. An identity the catalogue never holds is left out,
+    for the caller to refuse.
+    """
+    kept: dict[_Identity, _Held] = {}
+    queue = list(needed)
+    while queue:
+        identity = queue.pop(0)
+        if identity in kept:
             continue
-        root = _link_root(entry, lock_path)
-        held = packed.get(root)
+        held = catalogue.get(identity)
         if held is None:
-            held = _pack_link(entry, root, chain, packed, archives)
-        if not any(
-            isinstance(one, RegistryEntry)
-            and one.name == held.name
-            and one.version == held.version
-            for one in entries
-        ):
-            entries.append(held)
-    return entries
+            continue
+        if held.root is not None:
+            held = _settled(held, catalogue)
+        kept[identity] = held
+        queue.extend(held.wants)
+    return kept
+
+
+def _settled(held: _Held, catalogue: dict[_Identity, _Held]) -> _Held:
+    """The link `held` with its own pins read: what it depends on, with the
+    packages its lockfile pins and its links file links joining the catalogue."""
+    assert held.root is not None
+    own_path = held.root / LOCKFILE_NAME
+    wants: list[_Identity] = []
+    for entry, source in held_links(own_path):
+        nested = _linked(entry, source)
+        catalogue.setdefault(nested.identity, nested)
+        wants.append(nested.identity)
+    try:
+        present = own_path.is_file()
+    except (OSError, ValueError):
+        present = False
+    if present:
+        own = read_lockfile(own_path)
+        _catalogue_pins(catalogue, own)
+        wants.extend(own.dependencies.items())
+    return replace(held, wants=tuple(wants))
 
 
 def _link_root(entry: LinkEntry, lock_path: Path) -> Path:
@@ -698,20 +812,29 @@ def _link_root(entry: LinkEntry, lock_path: Path) -> Path:
         ) from err
 
 
-def _pack_link(
-    entry: LinkEntry,
-    root: Path,
+def _pin(
+    held: _Held,
+    kept: Mapping[_Identity, _Held],
     chain: list[tuple[Path, str]],
     packed: dict[Path, RegistryEntry],
     archives: list[_Archive],
 ) -> RegistryEntry:
-    """Pack the package at `root` -- and everything it links -- into `archives`.
+    """Pack the link `held` into `archives`, the kept links it depends on first.
 
-    Returns the pin the submitted lock records for it: the manifest's own name
-    and version, the archive's digest, and the store path that digest lives at
-    on the runner.
+    Returns the pin the submitted lock records for it: the manifest's own
+    name and version, the archive's digest, the store path that digest lives
+    at on the runner, and its dependencies at the versions its own lockfile
+    binds, the way an installed version of it would carry them. Depth first,
+    so a package a link depends on is packed before the pin that names it.
+    `packed` is what has already been packed, keyed by directory -- one
+    link, one archive, however many lockfiles name it. `chain` is the links
+    currently being walked, so a loop is caught rather than followed.
     """
-    package = _link_manifest(entry, root)
+    root, package = held.root, held.package
+    assert root is not None and package is not None
+    done = packed.get(root)
+    if done is not None:
+        return done
     for at, (walked, _named) in enumerate(chain):
         if walked == root:
             loop = " -> ".join([*(name for _, name in chain[at:]), package.name])
@@ -721,16 +844,10 @@ def _pack_link(
                 "to stop linking another in the loop",
             )
     chain.append((root, package.name))
-    nested = root / LOCKFILE_NAME
-    nested_sourced: list[tuple[LockEntry, Path]] = []
-    if nested.is_file():
-        held = read_lockfile(nested)
-        nested_sourced = [
-            (one, nested) for one in held.entries if not isinstance(one, LinkEntry)
-        ]
-    nested_sourced += list(held_links(nested))
-    if nested_sourced:
-        _resolved(nested_sourced, chain, packed, archives)
+    for want in held.wants:
+        nested = kept.get(want)
+        if nested is not None and nested.root is not None:
+            _pin(nested, kept, chain, packed, archives)
     chain.pop()
 
     content = _pack(package.name, root)
@@ -748,6 +865,7 @@ def _pack_link(
         version=package.version,
         sha256=digest,
         store=store.entry_path(digest),
+        dependencies=dict(held.wants),
     )
     packed[root] = pin
     archives.append(_Archive(entry=pin, content=content))
