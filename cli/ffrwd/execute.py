@@ -2983,11 +2983,12 @@ def _reader_gone(
     by_id: Mapping[str, _Member],
     writers: Mapping[str, Sequence[str]],
 ) -> bool:
-    """True for a feeder writer one of whose readers has already ended."""
+    """True for a feeder writer one of whose readers has already ended. A
+    writer reading its own connection is not its own lost reader."""
     return any(
         by_id[pid].ended_at is not None
         for pid in writers.get(member.id, ())
-        if pid in by_id
+        if pid in by_id and pid != member.id
     )
 
 
