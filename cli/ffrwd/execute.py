@@ -1245,6 +1245,11 @@ def _resolve_placeholders(
     return _resolve_params_files(_resolve_rows_documents(argv, rows_path), plan, params_path)
 
 
+def _unresolved(word: str) -> bool:
+    """Whether `word` is still a tap or a params placeholder."""
+    return word.startswith(TAP_DOCUMENT) or word.partition("=")[2].startswith(PARAMS_FILE)
+
+
 class _Placeholders:
     """The files and pipes a run names for the placeholders in its argv.
 
@@ -2670,6 +2675,16 @@ class _StageRun:
             self._relay().open(edges, heard, self.deadline)
 
     def _spawn(self, pid: str) -> None:
+        # Refused before any pipe, player or process of the member is made.
+        word = next((word for word in self._argv[pid] if _unresolved(word)), None)
+        if word is not None:
+            raise FfrwdError(
+                ErrorCode.INTERNAL,
+                f"process '{pid}' would be started with '{word}' in its command, a "
+                "placeholder no file or pipe was named for",
+                hint="a run names each placeholder before it starts the process; this "
+                "is a fault in ffrwd, not in the query",
+            )
         process = self.plan.process(pid)
         reads = [w for w in self.stage_wires if w.edge.target == pid]
         writes = [w for w in self.stage_wires if w.edge.source == pid]

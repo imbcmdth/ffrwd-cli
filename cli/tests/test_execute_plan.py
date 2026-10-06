@@ -43,7 +43,16 @@ from ffrwd.execute import (
     unopened_error,
     wires,
 )
-from ffrwd.ir import Graph, Node, Output, RowsSink, SinkUnit, StreamType
+from ffrwd.ir import (
+    PARAMS_FILE,
+    TAP_DOCUMENT,
+    Graph,
+    Node,
+    Output,
+    RowsSink,
+    SinkUnit,
+    StreamType,
+)
 from ffrwd.probe import ProbeResult, StreamMeta
 from ffrwd.processes import (
     PIPE,
@@ -1188,6 +1197,61 @@ def test_a_keyboard_interrupt_in_the_watch_loop_stops_every_member(
     assert len(spawned) == 1
     assert spawned[0].poll() is not None, "the interrupted member is still running"
     assert result.members[0].terminated
+
+
+@pytest.mark.parametrize(
+    ("word", "message"),
+    [
+        (
+            f"{TAP_DOCUMENT}7",
+            "process 's0' would be started with 'ffrwd:tap:7' in its command, a "
+            "placeholder no file or pipe was named for",
+        ),
+        (
+            f"compose={PARAMS_FILE}sidecar0:n1",
+            "process 's0' would be started with 'compose=ffrwd:params:sidecar0:n1' in "
+            "its command, a placeholder no file or pipe was named for",
+        ),
+    ],
+    ids=["tap", "params"],
+)
+def test_a_member_whose_argv_still_holds_a_placeholder_is_refused_before_it_starts(
+    word: str, message: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tap or a params placeholder nothing named is never handed to a
+    process as a file name: neither the member nor its window is started."""
+    python = getattr(sys, "_base_executable", None) or sys.executable
+    plan = ProcessPlan(processes=(SidecarProcess(id="s0", module="x", node="x"),))
+    started: list[list[str]] = []
+    popen = subprocess.Popen
+
+    def _started(args: Sequence[str], *rest: Any, **kwargs: Any) -> subprocess.Popen[bytes]:
+        started.append(list(args))
+        return popen(args, *rest, **kwargs)
+
+    monkeypatch.setattr(_EXECUTE.subprocess, "Popen", _started)
+
+    with pytest.raises(FfrwdError) as caught:
+        _run_stage(
+            plan,
+            Stage(index=0, processes=("s0",)),
+            {"s0": [python, "-c", "pass", word]},
+            named={},
+            relay=Relay.start,
+            assigned=(),
+            timeout=None,
+            overwrite=False,
+            echo=None,
+            players={"s0": [python, "-c", "pass"]},
+        )
+
+    assert caught.value.code is ErrorCode.INTERNAL
+    assert caught.value.message == message
+    assert caught.value.hint == (
+        "a run names each placeholder before it starts the process; this is a "
+        "fault in ffrwd, not in the query"
+    )
+    assert started == []
 
 
 def test_a_keyboard_interrupt_while_watching_progress_still_kills_the_child(
