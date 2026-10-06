@@ -28,7 +28,7 @@ from ffrwd.ir import Graph
 from ffrwd.lower import lower
 from ffrwd.parser import parse, resolve
 from ffrwd.probe import ProbeResult, StreamMeta
-from ffrwd.processes import ProcessPlan
+from ffrwd.processes import ProcessPlan, VideoFormat
 from ffrwd.registry import Registry, load_reference
 from ffrwd.timing import check_live_leads, summary, timing
 from ffrwd.warnings import FfrwdWarning, WarningCode
@@ -819,8 +819,13 @@ def _plan_argv(
     pix_fmt: str | None = None,
 ) -> dict[str, list[str]]:
     """Each process of the compiled plan as the printed command shows it."""
+    return _shown(_plan(query, monkeypatch, rate, colour, describe, pix_fmt))
+
+
+def _shown(plan: ProcessPlan) -> dict[str, list[str]]:
+    """Each process of `plan` as the printed command shows it."""
     return plan_argv(
-        _plan(query, monkeypatch, rate, colour, describe, pix_fmt),
+        plan,
         sidecar_argv=wasm.shown_argv,
         pipe_path=lambda edge, side: f"<{edge.source}-{edge.target} {side}>",
     )
@@ -1511,6 +1516,126 @@ def test_a_node_sources_coded_sound_is_decoded_for_a_node_hearing_it(
     assert [network for network in _networks(argv).values() if "sub=" in network] == [
         "sub=relay=r[hd_audio=out0]"
     ]
+
+
+_SPOTTED = (
+    "CREATE FUNCTION spotted(v video_stream) RETURNS data_stream "
+    "AS 'spot.wasm', 'spot' LANGUAGE wasm;\n"
+)
+
+
+def _relayed(query: str, monkeypatch: pytest.MonkeyPatch) -> ProcessPlan:
+    """The plan of `query`, with sub, publish and spotted declared."""
+    monkeypatch.setitem(SHAPES, "sub.wasm", _subscribe)
+    monkeypatch.setitem(SHAPES, "publish.wasm", _publish)
+    monkeypatch.setitem(
+        _PARAMS, "publish.wasm", {"relay": {"type": "string"}, "broadcast": {"type": "string"}}
+    )
+    return _plan(
+        _SUB + _PUBLISH + _SPOTTED + query, monkeypatch, describe=_reporting("publish.wasm")
+    )
+
+
+def _pictures(plan: ProcessPlan) -> dict[tuple[str, str], str]:
+    """The codec each picture edge of `plan` carries, by the processes it joins."""
+    return {
+        (edge.source, edge.target): edge.format.codec
+        for edge in plan.stream_edges
+        if isinstance(edge.format, VideoFormat)
+    }
+
+
+def _decoding(argv: Mapping[str, list[str]]) -> str:
+    """The one process whose network is a decode of a coded picture."""
+    (decode,) = [
+        pid for pid, network in _networks(argv).items() if network.startswith("[0:v:0]null")
+    ]
+    return decode
+
+
+def test_a_coded_picture_publish_copies_and_a_node_reads_as_frames_leaves_on_two_pipes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """publish copies the h264 sub writes, and spot takes it as pictures. sub's
+    network hands the packets to each on a pipe of its own: to an ffmpeg that
+    copies them on to publish, as a node sink's pad always reaches it, and to
+    one that decodes them for spot. No ffmpeg holds a split, so none copies a
+    stream it also filters."""
+    plan = _relayed(
+        "COPY (SELECT v.video[1], spotted(v.video[1]) AS spots FROM sub('r') v "
+        "WHERE v.height = 720) TO publish('https://relay', 'b')",
+        monkeypatch,
+    )
+    argv = _shown(plan)
+    assert not any("split" in network for network in _networks(argv).values())
+    decode = _decoding(argv)
+    decoding = argv[decode]
+    assert {decoding[i + 1] for i, word in enumerate(decoding) if word.startswith("-c:")} == {
+        "rawvideo"
+    }
+    modules = {sidecar.module: sidecar.id for sidecar in plan.sidecars}
+    sub, publish = modules["sub.wasm"], modules["publish.wasm"]
+    pictures = _pictures(plan)
+    (copying,) = [source for source, target in pictures if target == publish]
+    assert copying.startswith("ffmpeg") and "-filter_complex" not in argv[copying]
+    assert argv[copying][argv[copying].index("-c:0") + 1] == "copy"
+    assert pictures[(sub, copying)] == pictures[(copying, publish)] == "copy"
+    assert pictures[(sub, decode)] == "copy"
+
+
+def test_a_node_reading_packets_beside_a_decode_reads_the_coded_picture_as_it_is(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """remux's port takes packets and burn's takes pictures: remux reads sub's
+    h264 off a pipe of its own, copied, and burn reads it from the ffmpeg
+    decoding it off another."""
+    monkeypatch.setitem(SHAPES, "sub.wasm", _subscribe)
+    monkeypatch.setitem(SHAPES, "remux.wasm", _remux)
+    monkeypatch.setitem(
+        _DECLARATIONS,
+        "remux",
+        "CREATE FUNCTION remux(v video_stream) RETURNS video_stream "
+        "AS 'remux.wasm', 'remux' LANGUAGE wasm;",
+    )
+    plan = _plan(
+        _SUB + "COPY (SELECT remux(v.video[1]), burn(v.video[1]) AS burned FROM sub('r') v "
+        "WHERE v.height = 720) TO 'out.mkv'",
+        monkeypatch,
+    )
+    argv = _shown(plan)
+    decode = _decoding(argv)
+    modules = {sidecar.module: sidecar.id for sidecar in plan.sidecars}
+    sub, remux, burn = modules["sub.wasm"], modules["remux.wasm"], modules["burn.wasm"]
+    pictures = _pictures(plan)
+    (copying,) = [source for source, target in pictures if target == remux]
+    assert "-filter_complex" not in argv[copying]
+    assert pictures[(sub, copying)] == pictures[(copying, remux)] == "copy"
+    assert pictures[(sub, decode)] == "copy"
+    assert (decode, burn) in pictures
+
+
+def test_a_leaky_into_publish_keeps_the_packets_beside_a_node_reading_pictures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only publish reads what the leaky hands on, so the leaky reads sub's
+    packets as they are, copied to it off a pipe of its own, and spot reads
+    the picture from the ffmpeg decoding it off another."""
+    plan = _relayed(
+        "COPY (SELECT ffrwd.leaky(v.video[1]), spotted(v.video[1]) AS spots FROM sub('r') v "
+        "WHERE v.height = 720) TO publish('https://relay', 'b')",
+        monkeypatch,
+    )
+    argv = _shown(plan)
+    decode = _decoding(argv)
+    (leaking,) = [pid for pid, network in _networks(argv).items() if "leaky=" in network]
+    modules = {sidecar.module: sidecar.id for sidecar in plan.sidecars}
+    sub, spot = modules["sub.wasm"], modules["spot.wasm"]
+    pictures = _pictures(plan)
+    (copying,) = [source for source, target in pictures if target == leaking]
+    assert "-filter_complex" not in argv[copying]
+    assert pictures[(sub, copying)] == pictures[(copying, leaking)] == "copy"
+    assert pictures[(sub, decode)] == "copy"
+    assert (decode, spot) in pictures
 
 
 def test_a_nodes_picture_into_a_node_sink_is_encoded_and_its_data_is_not_copied(

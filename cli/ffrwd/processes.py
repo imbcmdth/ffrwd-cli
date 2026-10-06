@@ -2269,7 +2269,8 @@ class _Partitioner:
         """Node ids at `depth` that `refs` need, in topological order.
 
         Plus the splits standing in front of a stream `refs` map untouched,
-        wherever they sit (:meth:`_mapped_splits`).
+        wherever they sit (:meth:`_mapped_splits`). A split a region holds is
+        the region's.
         """
         refs = list(refs)
         mapped = self._mapped_splits(refs, depth)
@@ -2279,7 +2280,7 @@ class _Partitioner:
             name = _ref_node(stack.pop())
             if name is None or name not in self.g.nodes or name in keep:
                 continue
-            if self.external[name]:
+            if self.external[name] or name in self.sidecar_of:
                 continue
             if self.depth[name] != depth and name not in mapped:
                 continue
@@ -2399,6 +2400,15 @@ class _Partitioner:
         """True when `ref` is a pad of a node only a sidecar can run."""
         producer = _ref_node(ref)
         return producer is not None and self.external.get(producer, False)
+
+    def _coded_output(self, ref: FrameRef) -> bool:
+        """True when `ref` is an output a node writes as coded packets."""
+        producer = _ref_node(ref)
+        shape = self.node_shapes.get(producer) if producer is not None else None
+        pad = _ref_pad(ref)
+        return shape is not None and pad < len(shape.outputs) and (
+            shape.outputs[pad].kind == "packets"
+        )
 
     def _check_handed_once(self) -> None:
         """Refuse a plan asking one module pad to leave on two pipes.
@@ -2820,9 +2830,12 @@ class _Partitioner:
         between them joins too, and dissolves when the region is built: the
         network hands one module's frames to several, so a region's own
         fan-out needs no split node at all -- as long as the legs come back
-        together inside, since a module process writes one stream. Every merge
-        is taken only while the group stays convex, and the whole thing runs to
-        a fixed point -- merging two groups can make a third mergeable.
+        together inside, since a module process writes one stream. A split
+        over the packets a node writes joins that node alone: a node network
+        writes a stream to as many outputs as read it, so each reader takes
+        the packets off a pipe of its own. Every merge is taken only while the
+        group stays convex, and the whole thing runs to a fixed point --
+        merging two groups can make a third mergeable.
         """
         reach = self._reachable()
         consumers = self._pad_consumers()
@@ -2895,32 +2908,56 @@ class _Partitioner:
                 inputs = self.g.nodes[name].inputs
                 if not inputs:
                     continue
-                reads = consumers.get(name)
-                if not reads or any(reader not in home for reader in reads):
+                if self._joins_its_readers(name, inputs[0], home, alone, consumers, join):
+                    merged = True
                     continue
-                if any(reader in alone for reader in reads):
-                    continue  # a packet sink's edge stays an ffmpeg's to encode
-                if any(reader in self.node_shapes for reader in reads) and (
-                    len(
-                        {
-                            self._format(inputs[0], reader)
-                            for reader in reads
-                            if not self._reads_timing(reader, inputs[0])
-                        }
-                    )
-                    > 1
+                # The packets a node writes, where their readers cannot join
+                # it: its region hands each reader a pipe of its own.
+                written = _ref_node(inputs[0])
+                if (
+                    written is not None
+                    and written in home
+                    and self._coded_output(inputs[0])
+                    and join(name, written)
                 ):
-                    continue  # nodes taking it in different formats get a stream each
-                # The split's producer joins too when it is a module; otherwise
-                # the split's own input becomes a boundary read of the region.
-                feeds = _ref_node(inputs[0])
-                feeder = [feeds] if feeds is not None and feeds in home else []
-                # A fan-out whose legs each leave the region is not one the
-                # network can hand round: the split stays a node of the ffmpeg
-                # reading the region's pipe, which gives each leg its own pad.
-                if join(name, *reads, *feeder, one_output=True):
                     merged = True
         return [groups[name] for name in self.order if name in groups]
+
+    def _joins_its_readers(
+        self,
+        name: str,
+        read: FrameRef,
+        home: Mapping[str, str],
+        alone: Collection[str],
+        consumers: Mapping[str, list[str] | None],
+        join: Callable[..., bool],
+    ) -> bool:
+        """Merge the split `name` with everything reading it, and the module it
+        reads, into one region; False where they cannot be one."""
+        reads = consumers.get(name)
+        if not reads or any(reader not in home for reader in reads):
+            return False
+        if any(reader in alone for reader in reads):
+            return False  # a packet sink's edge stays an ffmpeg's to encode
+        if any(reader in self.node_shapes for reader in reads) and (
+            len(
+                {
+                    self._format(read, reader)
+                    for reader in reads
+                    if not self._reads_timing(reader, read)
+                }
+            )
+            > 1
+        ):
+            return False  # nodes taking it in different formats get a stream each
+        # The split's producer joins too when it is a module; otherwise
+        # the split's own input becomes a boundary read of the region.
+        feeds = _ref_node(read)
+        feeder = [feeds] if feeds is not None and feeds in home else []
+        # A fan-out whose legs each leave the region is not one the
+        # network can hand round: the split stays a node of the ffmpeg
+        # reading the region's pipe, which gives each leg its own pad.
+        return join(name, *reads, *feeder, one_output=True)
 
     def _region_reads(self, members: Sequence[str]) -> list[tuple[FrameRef, str]]:
         """Refs this region reads from outside, each with the node reading it.
@@ -3982,13 +4019,23 @@ class _Partitioner:
         while demands:
             target, ref, depth = demands.pop(0)
             producer = _ref_node(ref)
-            if producer is not None and self.external.get(producer, False):
+            # A leg of a split a node region dissolved is the region's own
+            # output: the region writes the packets to every process reading
+            # a leg, still coded, and a sidecar reading one takes them off an
+            # ffmpeg that copies them, as a node sink's pad reaches it.
+            dissolved = (
+                producer is not None
+                and producer in self.sidecar_of
+                and not self.external.get(producer, False)
+            )
+            if producer is not None and (self.external.get(producer, False) or dissolved):
                 consumer = self._reader(target, ref)
                 if (
                     consumer is not None
                     and (
                         consumer in self.g.packet_sinks
                         or consumer in self.g.packet_filters
+                        or dissolved
                     )
                     and producer not in self.g.packet_filters
                     and producer not in self.g.data_filters
@@ -4733,12 +4780,16 @@ class _Partitioner:
 
         A node's output says its own format, or that it is an input's or the
         clock input's; a node's input says what it accepts. Size and time base
-        are the stream's own, as on every other edge.
+        are the stream's own, as on every other edge. A split's copy of the
+        packets a node writes is copied as the node wrote them.
         """
         if target is not None and (
             target in self.g.packet_filters or target in self.g.packet_sinks
         ):
             return None  # its destination settled what encodes for it
+        source = self._past_splits(ref)
+        if self._coded_output(source):
+            ref = source
         producer = _ref_node(ref)
         if producer is not None and producer in self.node_shapes:
             return self._node_output_wire(producer, _ref_pad(ref), ref)
@@ -5349,7 +5400,8 @@ class _Partitioner:
             SinkUnit(
                 outputs=[
                     Output(
-                        ref=edge.ref,
+                        # A leg of a dissolved split leaves as what it copies.
+                        ref=rewrite(edge.ref),
                         type=ref_type(self.g, edge.ref),
                         name=None,
                         metadata={},
