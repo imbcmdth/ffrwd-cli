@@ -19,49 +19,15 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+from .decode import DECODE_FILTERS, coded, takes_packets
 from .ir import LEAKY, FrameRef, Graph, Node
-from .shapes import node_shape
-
-# The filter that stands for the decode: it hands on every picture as it is,
-# so the ffmpeg running it decodes the packets and nothing else.
-DECODE_FILTER = "null"
-
-
-def _coded(g: Graph, ref: FrameRef) -> bool:
-    """Whether `ref` is a coded picture: what a node writes as packets, or
-    what a packet filter hands back."""
-    name, _, pad = ref.partition(":")
-    if name in g.packet_filters:
-        return True
-    raw = g.node_shapes.get(name)
-    node = g.nodes.get(name)
-    if raw is None or node is None:
-        return False
-    outputs = node_shape(node.filter, raw).outputs
-    index = int(pad) if pad.isdigit() else 0
-    return index < len(outputs) and outputs[index].kind == "packets"
-
-
-def _takes_packets(g: Graph, reader: Node, ref: FrameRef) -> bool:
-    """Whether `reader` takes `ref` as packets: a node port reading packets,
-    or a packet sink or filter."""
-    if reader.id in g.packet_sinks or reader.id in g.packet_filters:
-        return True
-    raw = g.node_shapes.get(reader.id)
-    if raw is None or ref not in reader.inputs:
-        return False
-    position = reader.inputs.index(ref)
-    if position >= len(reader.ports):
-        return False
-    port = node_shape(reader.filter, raw).input(reader.ports[position])
-    return port is not None and port.kind == "packets"
 
 
 def _readers_take_packets(g: Graph, ref: FrameRef) -> bool:
     """Whether everything reading `ref` takes packets: nodes, and files that
     copy the stream rather than encode it."""
     for node in g.nodes.values():
-        if ref in node.inputs and not _takes_packets(g, node, ref):
+        if ref in node.inputs and not takes_packets(g, node, ref):
             return False
     for sink in g.sinks:
         codec = sink.options.get("video_codec")
@@ -78,11 +44,11 @@ def decode_ahead_of_leaky(g: Graph) -> Graph:
         if node.filter != LEAKY or not node.inputs:
             continue
         read = node.inputs[0]
-        if not _coded(g, read) or _readers_take_packets(g, node.id):
+        if not coded(g, read) or _readers_take_packets(g, node.id):
             continue
         decodes[node.id] = Node(
             id=f"{node.id}_decode",
-            filter=DECODE_FILTER,
+            filter=DECODE_FILTERS["video"],
             args={},
             inputs=[read],
             outputs=["video"],

@@ -1440,6 +1440,79 @@ def test_a_leaky_over_packets_only_publish_reads_keeps_the_packets(
     assert "[n10]leaky=" in leaking[leaking.index("-filter_complex") + 1]
 
 
+_INVERT = (
+    "CREATE FUNCTION invert(v video_stream) RETURNS video_stream "
+    "AS 'invert.wasm', 'invert' LANGUAGE wasm;\n"
+)
+
+
+def _framed(path: str) -> Described:
+    """`_node`, with invert.wasm a frame module of an older world."""
+    if path != "invert.wasm":
+        return _node(path)
+    return Described(world=WORLDS[-1], name="invert", pixel_formats=("rgba",))
+
+
+def _networks(argv: Mapping[str, list[str]]) -> dict[str, str]:
+    """Each process's -filter_complex, by process id."""
+    return {
+        pid: words[words.index("-filter_complex") + 1]
+        for pid, words in argv.items()
+        if "-filter_complex" in words
+    }
+
+
+def test_a_node_sources_coded_picture_is_decoded_once_for_everything_taking_frames(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """burn's port and the frame module invert both take pictures, and the
+    sidecar decodes nothing: one ffmpeg decodes the h264 for the two of them,
+    and the source writes its packets from a sidecar of its own."""
+    monkeypatch.setitem(SHAPES, "sub.wasm", _subscribe)
+    plan = _plan(
+        _SUB + _INVERT + "COPY (SELECT burn(v.video[1]), invert(v.video[1]) AS inverted "
+        "FROM sub('r') v WHERE v.height = 720) TO 'out.mkv'",
+        monkeypatch,
+        describe=_framed,
+    )
+    argv = plan_argv(
+        plan,
+        sidecar_argv=wasm.shown_argv,
+        pipe_path=lambda edge, side: f"<{edge.source}-{edge.target} {side}>",
+    )
+    networks = _networks(argv)
+    (decode,) = [pid for pid, network in networks.items() if "null" in network]
+    assert decode.startswith("ffmpeg") and networks[decode].startswith("[0:v:0]null")
+    decoding = argv[decode]
+    assert {decoding[i + 1] for i, word in enumerate(decoding) if word.startswith("-c:")} == {
+        "rawvideo"
+    }
+    (source,) = [pid for pid, network in networks.items() if "sub=" in network]
+    assert networks[source] == "sub=relay=r[hd=out0]"
+    pipes = {(edge.source, edge.target) for edge in plan.stream_edges}
+    for module in ("burn.wasm", "invert.wasm"):
+        (reader,) = [
+            pid for pid, words in argv.items() if any(w.endswith(module) for w in words)
+        ]
+        assert (decode, reader) in pipes
+
+
+def test_a_node_sources_coded_sound_is_decoded_for_a_node_hearing_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(SHAPES, "sub.wasm", _subscribe)
+    argv = _plan_argv(
+        _SUB + "COPY (SELECT hear(v.audio[1]) FROM sub('r') v WHERE v.height = 720) "
+        "TO 'cues.ndjson'",
+        monkeypatch,
+    )
+    (decode,) = [words for words in argv.values() if "[0:a:0]anull[out0]" in words]
+    assert decode[decode.index("-c:0") + 1] == "pcm_f32le"
+    assert [network for network in _networks(argv).values() if "sub=" in network] == [
+        "sub=relay=r[hd_audio=out0]"
+    ]
+
+
 def test_a_nodes_picture_into_a_node_sink_is_encoded_and_its_data_is_not_copied(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

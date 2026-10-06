@@ -46,6 +46,7 @@ from dataclasses import dataclass, replace
 from . import registry as registry_module
 from . import shapes as shapes_module
 from . import wasm
+from .decode import decode_ahead_of_frame_readers
 from .emit import Emitted, emit
 from .errors import ErrorCode, FfrwdError
 from .execute import DEFAULT_TIMEOUT
@@ -701,8 +702,15 @@ def compile_all(
             probe_failures=probe_failures,
             shapes=shapes_module.ShapeCache(shape),
         )
+        hosted = _hosted_wasm(res)
+        modules = {declared.module for declared in hosted.values()}
         ready = [
-            insert_splits(insert_pts_resets(decode_ahead_of_leaky(graph))) for graph in graphs
+            insert_splits(
+                insert_pts_resets(
+                    decode_ahead_of_frame_readers(decode_ahead_of_leaky(graph), modules)
+                )
+            )
+            for graph in graphs
         ]
         ready[0] = replace(
             ready[0],
@@ -719,7 +727,6 @@ def compile_all(
         budget = _default_timeout(_input_duration(probes))
         span = _run_duration(ready, _probed_paths(res, probes))
         stream_wasm = _stream_wasm(res)
-        hosted = _hosted_wasm(res)
         sourced = {ready[0].nodes[name].filter for name in ready[0].node_sources.values()}
         leaky = any(node.filter == LEAKY for node in ready[0].nodes.values())
         if not hosted and not ready[0].module_sources and not leaky and not sourced:

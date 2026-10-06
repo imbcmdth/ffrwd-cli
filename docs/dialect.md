@@ -583,7 +583,10 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
     emits are the alias's rows.
   - A port reading coded packets is handed an input's own stream,
     copied as it was coded, in a codec the module takes; an output
-    writing them is copied by whatever reads it.
+    writing them is copied by whatever reads it as packets, and
+    decoded by an ffmpeg ahead of whatever reads it as frames, a
+    node's video or audio port or a frame module, since the sidecar
+    decodes nothing.
   - The bound list is one binding per input the call binds, ports held
     on a port included (a lateral's feed, one stream per lateral), and a
     hint per stream: its rate as far as the compile knows it before the
