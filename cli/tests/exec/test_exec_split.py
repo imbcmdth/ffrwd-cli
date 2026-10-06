@@ -22,6 +22,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+import socket
 import subprocess
 import threading
 import time
@@ -31,8 +32,10 @@ from pathlib import Path
 
 import pytest
 
-from ffrwd import binaries, cli, nodes, wasm
+from ffrwd import binaries, cli, nodes, shapes, wasm
 from ffrwd.compiler import compile_all
+from ffrwd.execute import plan_argv
+from ffrwd.ir import PARAMS_FILE, TAP_DOCUMENT
 from ffrwd.placement import place, split
 
 pytestmark = pytest.mark.exec
@@ -317,6 +320,93 @@ $$ LANGUAGE sql;
         written[how] = (rows, _messages(_written(out)))
     assert written["per-process"] == written["one"]
     assert len(written["one"][0]) == 4
+
+
+def test_a_node_with_filed_params_writes_a_piped_laterals_messages_on_its_node(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A node region whose params go in a file writes a run-time lateral's
+    messages itself, on a pipe, and its argv holds both placeholders for the
+    node that runs it. Placed per process, the lateral's first instance runs
+    as it does on one node."""
+    for module in ("feed_probe.wasm", "shape_probe.wasm"):
+        if not (_BUILT / module).exists():
+            pytest.skip(f"module missing: {module}")
+    if binaries.ffrwd_wasm_path() is None:
+        pytest.skip("the ffrwd-wasm sidecar is not installed")
+    ffmpeg = ["ffmpeg", "-v", "error", "-y"]
+    subprocess.run(
+        [*ffmpeg, "-f", "lavfi", "-i", "testsrc2=size=160x120:rate=15:duration=1",
+         "-c:v", "ffv1", str(tmp_path / "ad.mkv")],
+        check=True, timeout=_TIMEOUT,
+    )  # fmt: skip
+    programme = tmp_path / "programme.mkv"
+    subprocess.run(
+        [*ffmpeg, "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=15:duration=6",
+         "-c:v", "ffv1", str(programme)],
+        check=True, timeout=_TIMEOUT,
+    )  # fmt: skip
+    monkeypatch.chdir(tmp_path)
+    # shape_probe holds its `feed` on the port its `port` names, and the
+    # sidecar runs it only with one; nothing connects to it here.
+    with socket.socket() as free:
+        free.bind(("127.0.0.1", 0))
+        port = free.getsockname()[1]
+    # A rule shape_probe does not know changes nothing, and this one is long
+    # enough to put its params in a file.
+    refuse = "x" * (shapes.PARAMS_INLINE_LIMIT + 1)
+    # A `spots` message carries its tick's `start_t` and no url.
+    play = """CREATE FUNCTION play(launch data_stream, start_t number, width number,
+                     height number, fps number, pix_fmt text, url text DEFAULT 'ad.mkv')
+RETURNS TABLE(video video_stream) AS $$
+  SELECT setpts(ffmpeg.format(fps(scale(m.video[1], width, height), fps),
+                              pix_fmts => pix_fmt),
+                'PTS+' || start_t::text || '/TB') AS video
+  FROM input(url) m
+$$ LANGUAGE sql;
+"""
+
+    def query(out: Path) -> str:
+        # shape_probe reads the picture at a size of its own, which puts it in
+        # a region of its own, apart from the one the instances feed.
+        return (
+            "CREATE FUNCTION probe(v video_stream, feed video_stream DEFAULT NULL, "
+            "port number DEFAULT 9000) RETURNS video_stream "
+            f"AS '{(_BUILT / 'feed_probe.wasm').as_posix()}', 'feed-probe' LANGUAGE wasm;\n"
+            "CREATE FUNCTION spots(v video_stream, refuse text, port number) "
+            f"RETURNS data_stream AS '{(_BUILT / 'shape_probe.wasm').as_posix()}', "
+            "'shape_probe' LANGUAGE wasm;\n"
+            + play
+            + "COPY (WITH prog AS (SELECT p.video[1] AS v "
+            f"FROM input('{programme.as_posix()}', realtime => true) p), "
+            f"s AS (SELECT spots(scale(prog.v, 160, 120), '{refuse}', {port}) AS d FROM prog), "
+            "ads AS (SELECT ad.video FROM s, LATERAL play(s.d) ad) "
+            "SELECT probe(prog.v, ads.video) FROM prog, ads) "
+            f"TO '{out.as_posix()}' WITH (video_codec 'ffv1')"
+        )
+
+    plan = compile_all(query(tmp_path / "x.nut")).plan
+    assert plan is not None
+    (lateral,) = plan.laterals
+    assert lateral.pipe
+    rendered = plan_argv(
+        plan, sidecar_argv=wasm.shown_argv, pipe_path=lambda edge, side: side
+    )[lateral.writer]
+    assert any(word.partition("=")[2].startswith(PARAMS_FILE) for word in rendered)
+    assert f"{TAP_DOCUMENT}{lateral.tap}" in rendered
+    placement = place(plan, "per-process")
+    fed = {edge.target for edge in plan.feeder_edges}
+    assert {placement.node(pid) for pid in fed} == {placement.node(lateral.writer)}
+    assert placement.count >= 2
+
+    for how in ("one", "per-process"):
+        target = [] if how == "one" else ["--target", "split-local", "--placement", how]
+        capsys.readouterr()
+        assert cli.main(["run", query(tmp_path / f"{how}.nut"), "-y", "-q", *target]) == 0
+        lines = capsys.readouterr().out.splitlines()
+        said = [json.loads(line) for line in lines if line.startswith("{")]
+        rows = {row["row"]: row for row in said if row.get("event") == "feeder"}
+        assert rows[1].get("exit") == 0, (how, rows[1])
 
 
 def test_a_runner_killed_mid_run_stops_every_node_and_is_named(tmp_path: Path) -> None:

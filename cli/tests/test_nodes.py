@@ -10,18 +10,21 @@ in the exec tier (tests/exec/test_exec_split.py).
 
 from __future__ import annotations
 
+import json
 import socket
 import subprocess
 import sys
 import threading
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 
 import pytest
 
 from ffrwd import binaries, pipes
 from ffrwd.errors import ErrorCode, FfrwdError
+from ffrwd.execute import PlanResult, SidecarArgv, execute_plan
+from ffrwd.ir import PARAMS_FILE, TAP_DOCUMENT, Graph, Lateral, LateralValue, Node
 from ffrwd.nodes import execute_split, new_secret
 from ffrwd.placement import Placement, place
 from ffrwd.processes import ProcessPlan, SidecarProcess, StreamEdge, VideoFormat
@@ -246,6 +249,137 @@ def test_a_runner_killed_mid_run_stops_the_rest_and_is_named(tmp_path: Path) -> 
         True,
     )
     assert all(runner.poll() is not None for runner in runners.values())
+
+
+# A node's params as a query gives them: too long for a command line, and
+# holding a list, which no command line spells.
+_PARAMS = {"html": "<p>" + "stage " * 900 + "</p>", "rows": [{"select": "#brand", "text": "x"}]}
+# The one instance the region's message starts, as the template binds it.
+_TEMPLATE = "COPY (SELECT ad.video FROM play(NULL, url => :'url') ad) TO 'ad.nut'"
+_INSTANCE = "COPY (SELECT ad.video FROM play(NULL, url => 'ad.mkv') ad) TO 'ad.nut'"
+
+
+def _region(copy: Path, said: Path) -> str:
+    """A node region with its params in a file and a run-time lateral's tap.
+
+    It is handed its node's params (``compose=<file>``), its tap's path and,
+    where it has one, its stream's path. It keeps a copy of the params at
+    `copy`, writes one launch message to the tap, and writes its stream once
+    `said` exists, which is once the instance's row has been said.
+    """
+    return "\n".join(
+        [
+            "import os, sys, time",
+            "data = open(sys.argv[1].partition('=')[2], 'rb').read()",
+            f"open({str(copy)!r}, 'wb').write(data)",
+            "with open(sys.argv[2], 'wb', buffering=0) as tap:",
+            "    tap.write(b'{\"url\": \"ad.mkv\", \"start_pts\": 1.0}\\n')",
+            "until = time.monotonic() + 30",
+            f"while not os.path.exists({str(said)!r}):",
+            "    if time.monotonic() > until:",
+            "        sys.exit(4)",
+            "    time.sleep(0.01)",
+            "o = sys.argv[3] if len(sys.argv) > 3 else 'pipe:1'",
+            "out = sys.stdout.buffer if o.startswith('pipe:') else open(o, 'wb', buffering=0)",
+            "out.write(bytes(range(256))); out.flush()",
+        ]
+    )
+
+
+def _tapped(where: Path, tap: int) -> ProcessPlan:
+    """The region, its one stream going to a consumer, and a piped lateral
+    over the messages it writes to `tap`."""
+    node = Node(id="n1", filter="compose", args=dict(_PARAMS), inputs=[], outputs=["video"])
+    region = SidecarProcess(
+        id="sidecar0",
+        module=_region(where / "params.json", where / "said"),
+        node="n1",
+        outputs=("video",),
+        graph=Graph(input_paths=[], sources={}, nodes={"n1": node}),
+        node_network=True,
+    )
+    consumer = SidecarProcess(
+        id="sidecar1", module=_consume(where / "received.bin"), node="c", inputs=("n1",)
+    )
+    lateral = Lateral(
+        function="play",
+        call="play(s.d)",
+        stream="s.d",
+        tap=tap,
+        template=_TEMPLATE,
+        values=(LateralValue("url", "text"),),
+        connections=(),
+        writer="sidecar0",
+        pipe=True,
+    )
+    return ProcessPlan(
+        processes=(region, consumer),
+        edges=(StreamEdge(source="sidecar0", target="sidecar1", ref="n1", format=VideoFormat()),),
+        laterals=(lateral,),
+    )
+
+
+def _run_tapped(
+    where: Path, tap: int, hook: SidecarArgv, split: bool
+) -> tuple[PlanResult, list[str], list[dict[str, object]]]:
+    """`_tapped` run on one machine or on a node per process: its result, the
+    instance texts it asked to compile, and the rows it said."""
+    plan = _tapped(where, tap)
+    asked: list[str] = []
+    rows: list[dict[str, object]] = []
+
+    def compile_instance(text: str, unset: Mapping[tuple[int, int], str]) -> ProcessPlan:
+        asked.append(text)
+        return ProcessPlan()
+
+    def heard(row: Mapping[str, object]) -> None:
+        rows.append(dict(row))
+        (where / "said").touch()
+
+    if not split:
+        result = execute_plan(
+            plan, sidecar_argv=hook, timeout=60, compile_instance=compile_instance, rows=heard
+        )
+        return result, asked, rows
+    placement = place(plan, "per-process")
+    assert placement.count == 2
+    result = execute_split(
+        plan,
+        placement,
+        sidecar_argv=hook,
+        timeout=60,
+        compile_instance=compile_instance,
+        rows=heard,
+    )
+    return result, asked, rows
+
+
+def test_a_regions_params_and_tap_are_named_on_its_node_as_on_one_machine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A node region's argv holds a params placeholder and a tap placeholder,
+    left for the node that runs it. On its own node, as on one machine, the
+    region reads its params from a file, and its message starts the
+    lateral's one instance."""
+    monkeypatch.chdir(tmp_path)
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        tap = probe.getsockname()[1]
+
+    def hook(process: SidecarProcess, reads: Sequence[str], writes: Sequence[str]) -> list[str]:
+        if not process.node_network:
+            return _hook(process, reads, writes)
+        params = f"compose={PARAMS_FILE}{process.id}:n1"
+        return _python(process.module, params, f"{TAP_DOCUMENT}{tap}", *reads, *writes)
+
+    for split in (False, True):
+        where = tmp_path / ("split" if split else "one")
+        where.mkdir()
+        result, asked, rows = _run_tapped(where, tap, hook, split)
+        assert result.exit_code == 0, [m.stderr for s in result.stages for m in s.members]
+        assert json.loads((where / "params.json").read_text(encoding="utf-8")) == _PARAMS
+        assert asked == [_INSTANCE]
+        assert rows == [{"event": "feeder", "row": 1, "start_pts": 1.0, "exit": 0}]
 
 
 def test_a_placement_the_runner_cannot_carry_out_starts_nothing(tmp_path: Path) -> None:

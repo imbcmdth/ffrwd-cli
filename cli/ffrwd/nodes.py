@@ -9,7 +9,8 @@ another node goes into or out of a TCP connection the relay holds instead of
 a pipe, so a cut edge is pipe, TCP, pipe, carrying the same NUT bytes, and
 none of them cross a Python process. The coordinator renders every member's
 argv once, with every cut edge named at both ends (:func:`~ffrwd.execute.wires`),
-and each runner only names its own pipes in it.
+and each runner names its own pipes in it, and the files and taps its
+placeholders stand for.
 
 The coordinator applies the run's rules to what the runners report: a stage
 ends once every member has, the member that ended it is found from the exit
@@ -96,8 +97,8 @@ from .execute import (
     _is_live,
     _Laterals,
     _Member,
+    _Placeholders,
     _print_row,
-    _resolve_rows_documents,
     _StageRun,
     _watch,
     held_writers,
@@ -364,6 +365,7 @@ class _Agent:
         }
         raw_sidecar = job.get("sidecar")
         self._sidecar = raw_sidecar if isinstance(raw_sidecar, str) and raw_sidecar else None
+        self._placeholders = _Placeholders(self._workspace)
         self.argv = self._name_pipes(self._localize(rendered))
         # The relay carries this node's wires and holds its data port, from
         # when the runner serves: one that refuses its part starts nothing.
@@ -435,8 +437,9 @@ class _Agent:
         return self._home
 
     def _name_pipes(self, rendered: Mapping[str, list[str]]) -> dict[str, list[str]]:
-        """Each member's argv with its pipes made and named, and its rows
-        documents given files in this node's own directory."""
+        """Each member's argv with its pipes made and named, and every
+        placeholder in it resolved in this node's own directory: its rows
+        documents, its nodes' params files and its laterals' taps."""
         tokens: dict[str, str] = {}
 
         def make(index: int, side: Side) -> str:
@@ -459,12 +462,8 @@ class _Agent:
                 if owner in self.mine and any(token in words for words in rendered.values()):
                     tokens[token] = make(index, side)
 
-        def rows_path(placeholder: str) -> str:
-            name = placeholder.rpartition(":")[2] or "0"
-            return str(self._workspace() / f"rows-{name}.ndjson")
-
         named = {pid: [resolve(word) for word in words] for pid, words in rendered.items()}
-        return _resolve_rows_documents(named, rows_path)
+        return self._placeholders.resolve(named, self.plan)
 
     # -- the conversation
 
@@ -559,6 +558,7 @@ class _Agent:
             _instance_sidecar_argv(self._jobs),
             self._row,
             self._dump,
+            self._placeholders.taps,
         )
         run = _StageRun(
             self.plan,

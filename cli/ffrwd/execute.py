@@ -1123,8 +1123,7 @@ def plan_argv(
             live=any(edge.live for edge in incoming),
             copyts=all(keeps_clock(edge, plan) for edge in incoming),
         )
-    argv = _resolve_taps(argv, tap_path)
-    return _resolve_params_files(_resolve_rows_documents(argv, rows_path), plan, params_path)
+    return _resolve_placeholders(argv, plan, rows_path, params_path, tap_path)
 
 
 def _resolve_taps(
@@ -1231,6 +1230,63 @@ def _resolve_rows_documents(
         return named[token]
 
     return {pid: [resolve(token) for token in args] for pid, args in argv.items()}
+
+
+def _resolve_placeholders(
+    argv: dict[str, list[str]],
+    plan: ProcessPlan,
+    rows_path: RowsNamer | None,
+    params_path: ParamsNamer | None,
+    tap_path: Callable[[int], str] | None,
+) -> dict[str, list[str]]:
+    """Every placeholder in `argv` a namer is given for, named: the taps, then
+    the rows documents, then the nodes' params files."""
+    argv = _resolve_taps(argv, tap_path)
+    return _resolve_params_files(_resolve_rows_documents(argv, rows_path), plan, params_path)
+
+
+class _Placeholders:
+    """The files and pipes a run names for the placeholders in its argv.
+
+    A rendered argv holds a placeholder where a rows document, a node's
+    filed params or a run-time lateral's tap goes. A run on one machine and
+    a node's runner both name them here, in the run's own directory, so
+    neither leaves one the other resolves.
+
+    `taps` is each tap named so far: the pipe its region writes and the one
+    the host reads, which the relay joins.
+    """
+
+    def __init__(self, workspace: Callable[[], Path]) -> None:
+        self._workspace = workspace
+        self.taps: dict[int, tuple[str, str]] = {}
+
+    def rows_path(self, placeholder: str) -> str:
+        # A rows document is an ordinary file in the run's own directory,
+        # which goes with the directory when the run ends -- whether it
+        # finished or failed.
+        name = placeholder.rpartition(":")[2] or "0"
+        return str(self._workspace() / f"rows-{name}.ndjson")
+
+    def params_path(self, placeholder: str, content: str) -> str:
+        # A node's params, written once where the run keeps its files.
+        path = self._workspace() / f"params-{len(list(self._workspace().glob('params-*')))}.json"
+        path.write_text(content, encoding="utf-8")
+        return str(path)
+
+    def tap_path(self, tap: int) -> str:
+        # The region writes one end and the host reads the other; the
+        # relay makes both when the writer's stage starts.
+        if tap not in self.taps:
+            self.taps[tap] = (
+                pipes.path(self._workspace(), f"tap{tap}"),
+                pipes.path(self._workspace(), f"tap{tap}-host"),
+            )
+        return self.taps[tap][0]
+
+    def resolve(self, argv: dict[str, list[str]], plan: ProcessPlan) -> dict[str, list[str]]:
+        """`argv` with every placeholder in it named."""
+        return _resolve_placeholders(argv, plan, self.rows_path, self.params_path, self.tap_path)
 
 
 def _sidecar_writes(
@@ -1591,18 +1647,7 @@ def execute_plan(
                 )
             return home[0]
 
-        def rows_path(placeholder: str) -> str:
-            # A rows document is an ordinary file in the run's own directory,
-            # which goes with the directory when the run ends -- whether it
-            # finished or failed.
-            name = placeholder.rpartition(":")[2] or "0"
-            return str(workspace() / f"rows-{name}.ndjson")
-
-        def params_path(placeholder: str, content: str) -> str:
-            # A node's params, written once where the run keeps its files.
-            path = workspace() / f"params-{len(list(workspace().glob('params-*')))}.json"
-            path.write_text(content, encoding="utf-8")
-            return str(path)
+        placeholders = _Placeholders(workspace)
 
         def pipe_path(edge: PipeEdge, side: Side) -> str:
             # Named here, made by the relay when the edge's stage starts.
@@ -1610,25 +1655,13 @@ def execute_plan(
             named[(edge, side)] = path
             return path
 
-        taps: dict[int, tuple[str, str]] = {}
-
-        def tap_path(tap: int) -> str:
-            # The region writes one end and the host reads the other; the
-            # relay makes both when the writer's stage starts.
-            if tap not in taps:
-                taps[tap] = (
-                    pipes.path(workspace(), f"tap{tap}"),
-                    pipes.path(workspace(), f"tap{tap}-host"),
-                )
-            return taps[tap][0]
-
         argv = plan_argv(
             plan,
             sidecar_argv=sidecar_argv,
             pipe_path=pipe_path,
-            rows_path=rows_path,
-            params_path=params_path,
-            tap_path=tap_path,
+            rows_path=placeholders.rows_path,
+            params_path=placeholders.params_path,
+            tap_path=placeholders.tap_path,
         )
         assigned = wires(plan)
         terminal = terminal_member(plan) if work is not None else None
@@ -1660,7 +1693,7 @@ def execute_plan(
                 work=work,
                 terminal=terminal,
                 laterals=_Laterals(
-                    compile_instance, sidecar_argv, rows or _print_row, dump, taps
+                    compile_instance, sidecar_argv, rows or _print_row, dump, placeholders.taps
                 ),
                 stop=stop,
             )
