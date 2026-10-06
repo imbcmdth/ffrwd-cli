@@ -3049,8 +3049,9 @@ Nothing tells the function how many rungs there are: the list says. The other sp
 
 A head whose picture path cannot keep up with its feed falls further
 behind for as long as the feed runs. `ffrwd.leaky` drops the pictures
-that arrive more than `max_lateness` seconds later than the least late
-one so far, past the spread the feed's own delivery adds, reading
+that arrive too long after the least late one of the last few seconds,
+past the spread the feed's own delivery adds, how long being learned
+from the path and never more than `max_lateness` seconds, reading
 lateness off pts stamped onto the Unix epoch, so the picture stays near
 the wall and the sound beside it arrives whole. It
 is a node the sidecar hosts, so the query runs as three processes even

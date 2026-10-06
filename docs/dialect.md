@@ -1596,20 +1596,38 @@ queue, and a sink's max-lateness.
 - **What it reads.** Pts in seconds on the Unix epoch. A head stamps them
   there with `setpts(v, 'PTS-STARTPTS+<epoch>/TB')`; a leaf inherits them
   through MoQ. A picture's lateness is the wall clock less its pts. The
-  smallest lateness seen so far (after a first delivery of several
-  pictures, below) is the baseline, which absorbs a sender that started
-  late and any relay in between.
-- **What it does.** A picture later than the baseline by more than
-  its spread plus `max_lateness` seconds is dropped. Every other picture
-  passes at once, pts, pixels and rows untouched. Nothing is held and
-  nothing is reordered, and the output's timestamps never decrease.
+  smallest lateness read in the last four seconds (after a first
+  delivery of several pictures, below) is the floor: what a sender that
+  started late and any relay in between add to every picture alike. The
+  floor falls the moment a picture comes earlier. It rises once every
+  lower reading is more than four seconds old, so a source whose clock
+  drifts is followed with nothing dropped, and a source that slips
+  behind for good costs four seconds of drops and then passes again,
+  that much later. Only a picture the leaky waited for moves the floor.
+  A picture queued behind a stage that cannot keep up is read later than
+  it arrived, and the floor holds through that, so the backlog is shed
+  and not absorbed.
+- **What it does.** A picture later than the floor by more than its
+  spread plus the bound is dropped. Every other picture passes at once,
+  pts, pixels and rows untouched. Nothing is held and nothing is
+  reordered, and the output's timestamps never decrease.
+- **The bound.** How far above the floor a picture may come, learned
+  from the path. Lateness above the floor has a long right tail, close
+  to log-normal, so the leaky keeps a running mean and deviation of the
+  logarithm of each picture's excess over the floor, averaged over the
+  last ten seconds or so of the stream, and the bound is three
+  deviations above the mean. The pictures it drops feed the estimate as
+  the pictures it passes do. The bound is never more than
+  `max_lateness`, and it is `max_lateness` alone until a few hundred
+  pictures have fed it. A steady path settles at a bound of a few tens
+  of milliseconds; a bursty one at a looser bound, up to `max_lateness`.
 - **The spread.** What the input's own delivery adds. A relay that hands
   on a whole group of pictures at once (a MoQ subscriber gets a second
   of them in a few milliseconds) makes the group's first picture a
   second later than its last. The leaky learns it: a run is pictures
   each arriving less than half its own pts step after the one before,
   its width how far their lateness ranges, and it counts when its
-  freshest picture is within half of `max_lateness` of the baseline.
+  freshest picture is within half of `max_lateness` of the floor.
   The spread is the widest of the last 8 counted runs, each capped at
   `max_spread`. A backlog drained after a slow stage also arrives at
   once but ends near the edge of the budget, so it teaches nothing. A
@@ -1624,21 +1642,23 @@ queue, and a sink's max-lateness.
   picture is read behind the pictures the decoder holds back and the
   ones handed on before it. So a first run of more than one picture
   stands for its freshness as it does for its width: when it ends, the
-  baseline starts over from the picture after it. And the leaky learns
+  floor starts over from the picture after it. And the leaky learns
   before it drops. Until three runs have counted, or a run of one
   picture after the first (a steady feed), and for no longer than
   `max_spread` plus `max_lateness` seconds from its first picture, it
-  drops only a picture later than the baseline by more than
-  `max_spread` plus `max_lateness`, and a run begun then counts when its
-  freshest picture is within `max_lateness` of the baseline. A leaf
+  drops only a picture later than the floor by more than `max_spread`
+  plus the bound, and a run begun then counts when its freshest picture
+  is within `max_lateness` of the floor. A leaf
   joining a relay learns its groups' spread from its first whole group
   and drops nothing meanwhile. A steady feed stops learning at its third
   picture, and so does a stage too slow from the start, so both are
   judged as before.
 - **Arguments.** One video stream; `max_lateness`, named only, in
-  seconds, greater than zero, 0.5 when not written; `max_spread`, named
-  only, in seconds, zero or more, 2 when not written (room for a relay
-  handing on two seconds of pictures at once; 0 learns no spread). Each
+  seconds, greater than zero, 0.5 when not written: the most the bound
+  may be, so the furthest past the floor and the spread a picture may
+  ever come; `max_spread`, named only, in seconds, zero or more, 2 when
+  not written (room for a relay handing on two seconds of pictures at
+  once; 0 learns no spread). Each
   is a number or any compile-time value that computes to one:
   `max_lateness => COALESCE(:max_lateness, 0.5)`. A sound stream, a limit
   out of range or not a number, and any other argument are refused by
@@ -1694,16 +1714,23 @@ leaky did as a row, on its stdout like any other run row:
 | `passed` | number | pictures handed on in this window |
 | `dropped` | number | pictures dropped in this window |
 | `lateness_s` | number | the latest picture's lateness, seconds |
-| `baseline_s` | number | the baseline, seconds |
+| `baseline_s` | number | the floor, seconds |
 | `spread_s` | number | the spread learned from the input's delivery, seconds |
+| `bound_s` | number | the bound learned from the path, seconds |
+
+When the floor has risen by more than 20 ms since a row last gave it,
+the run also reports
+`{"kind": "leaky", "node": ..., "event": "slip", "by_s": ..., "baseline_s": ...}`:
+how much further behind the source now is, and the floor it moved to.
+A row with `event` carries no counts.
 
 What it guarantees, and what it does not:
 
 - At the leaky, the picture never trails the wall by more than the
-  baseline plus the spread plus `max_lateness`, and the spread never
-  grows past `max_spread`; while it learns, for at most `max_spread`
-  plus `max_lateness` seconds, it may trail by the baseline plus
-  `max_spread` plus `max_lateness`. Stages after it add what they hold,
+  floor plus the spread plus the bound; the spread never grows past
+  `max_spread`, nor the bound past `max_lateness`. While it learns, for
+  at most `max_spread` plus `max_lateness` seconds, it may trail by the
+  floor plus `max_spread` plus `max_lateness`. Stages after it add what they hold,
   and that is counted in their own time: a slow ffmpeg's queues keep a
   few pictures past the leaky, so at the file the picture trails by
   `max_lateness` plus those pictures at that stage's rate (about 0.6 s
@@ -1730,12 +1757,16 @@ What it guarantees, and what it does not:
 - Sound is never dropped. It travels beside the picture untouched and
   meets it again at the file or the publish, where the plan gives the
   sound's pipe `max_lateness` plus `max_spread` more room (below).
-- The baseline is set by the first pictures seen. A reader probes its
-  input before the first picture leaves it, up to five seconds of it by
-  default, and those pictures arrive as one late burst; the baseline
-  starts over from the picture after it, so a path too slow to drain the
-  burst stays that far behind until the sender or the network drops it.
-  `analyzeduration` on the live input bounds it.
+- The floor follows the source and never the leaky's own backlog. A
+  reader probes its input before the first picture leaves it, up to five
+  seconds of it by default, and those pictures arrive as one late burst;
+  the floor starts over from the picture after it, so a path too slow to
+  drain the burst stays that far behind until the sender or the network
+  drops it. `analyzeduration` on the live input bounds the probe. A
+  source that slips behind is followed after four seconds of drops and
+  is never caught up with: the picture stays that much further behind
+  the wall for the rest of the run, and a `slip` row says so. A stage
+  that cannot keep up never moves the floor.
 
 On a live input the plan counts it in time rather than frames. It holds
 no frames, so it adds none to the difference between two paths that

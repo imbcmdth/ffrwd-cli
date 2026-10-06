@@ -712,10 +712,12 @@ def test_a_leaky_keeps_a_slow_picture_near_the_wall_and_the_sound_whole(
 
     # (b) What it could not keep up with, it dropped, and said so.
     assert rows and all(row["kind"] == "leaky" for row in rows)
-    assert set(rows[0]) == {
+    counted = [row for row in rows if "event" not in row]
+    assert set(counted[0]) == {
         "kind", "node", "passed", "dropped", "lateness_s", "baseline_s", "spread_s",
+        "bound_s",
     }  # fmt: skip
-    assert sum(int(str(row["dropped"])) for row in rows) > 0, rows
+    assert sum(int(str(row["dropped"])) for row in counted) > 0, rows
 
     # (c) A group stays a second long however many pictures the leaky drops,
     # where gop 30 alone would make one every 30 of the few that pass,
@@ -881,10 +883,11 @@ def test_a_leaky_learns_a_bursty_feeds_spread_and_drops_next_to_nothing(
     assert pump.sent == len(_groups)
 
     assert rows and all(row["kind"] == "leaky" for row in rows)
-    passed = sum(int(str(row["passed"])) for row in rows)
-    dropped = sum(int(str(row["dropped"])) for row in rows)
+    counted = [row for row in rows if "event" not in row]
+    passed = sum(int(str(row["passed"])) for row in counted)
+    dropped = sum(int(str(row["dropped"])) for row in counted)
     assert passed + dropped >= _BURST_SECONDS * 30 - 30, rows
-    spreads = [float(str(row["spread_s"])) for row in rows]
+    spreads = [float(str(row["spread_s"])) for row in counted]
     if learns:
         # A second's pictures, less the time they took to arrive, from the
         # first whole group on. The piece before it is narrower and fresher,

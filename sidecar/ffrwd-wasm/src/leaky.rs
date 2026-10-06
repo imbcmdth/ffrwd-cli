@@ -7,15 +7,65 @@
 //! max-lateness.
 //!
 //! A live pipeline stamps its pts onto the Unix epoch, so a frame's LATENESS
-//! is the wall clock less its pts, in seconds. The smallest lateness seen so
-//! far, after a first delivery of several pictures (below), is the
-//! BASELINE: what a sender that started late, or a relay in between, adds
-//! to every frame alike. A frame later than the baseline by more than its
-//! SPREAD plus `max_lateness` is dropped; every other frame passes at once,
-//! pixels, pts and rows untouched. Nothing is held and nothing is
+//! is the wall clock less its pts, in seconds. Part of every frame's
+//! lateness is the path's own offset: what a sender that started late, or a
+//! relay in between, adds to each frame alike. The FLOOR is that offset as
+//! the node sees it now: the smallest lateness read at arrival in the last
+//! [`FLOOR_SECONDS`] of wall time. A frame later than the floor by more
+//! than its SPREAD plus the BOUND is dropped; every other frame passes at
+//! once, pixels, pts and rows untouched. Nothing is held and nothing is
 //! reordered, so what leaves is the stream that arrived with its late
 //! frames taken out. A frame behind one already passed is dropped too: the
 //! output's timestamps never decrease.
+//!
+//! The floor moves with the path. It falls the moment a frame is read
+//! earlier, and it rises once every lower reading has left the window. A
+//! source whose clock drifts is followed, microseconds a window, with
+//! nothing dropped; a source that slips behind for good costs one window of
+//! drops, after which every frame passes again, that much later. Nothing
+//! resets the floor, since a source that has fallen behind never catches up
+//! by itself, and a row says when the floor rises (below).
+//!
+//! A frame counts toward the floor only when it was read AT ARRIVAL: the
+//! node waited for it, so its lateness is the path's and not the node's
+//! own. A frame queued behind a stage that cannot keep up is read later
+//! than it arrived, and a floor that counted it would absorb the very
+//! backlog the node is there to shed. The node cannot see its queue, but it
+//! can tell when it waited. A frame read at least half a pts step after one
+//! it dropped was waited for, since a drop frees the node at once. A frame
+//! whose lateness is no more than the least of the run before it, plus what
+//! a drifting clock adds in between ([`DRIFT`]), was waited for too, since a
+//! node held up by its stage never reads one earlier; after a group handed
+//! on at once, the group's width is allowed for, as the next group's first
+//! picture is that much older than the freshest before it. The first frame
+//! after the floor starts over counts as read at arrival. A reading below
+//! the floor lowers it at once. One above it waits until its run has
+//! closed, and the run's freshest picture counts then, unless something in
+//! the run passed after something was dropped: that run was a backlog the
+//! node read down to the bound and stopped in, and the queue went on. Under
+//! a stage that cannot keep up, no read qualifies, and the floor holds where
+//! it was; once nothing in the window qualifies, it holds at the last
+//! reading that did.
+//!
+//! The BOUND is what the path's own delay varies by. Above the floor,
+//! lateness has a long right tail, near log-normal, so the node keeps a
+//! running mean and deviation of ln(excess), the excess being how far above
+//! the floor a frame came, as exponential averages over the stream's own
+//! time with [`TAIL_SECONDS`] for their time constant, and the bound is
+//! [`TAIL_SIGMAS`] deviations above the mean. The excess is never taken as
+//! less than [`TAIL_LEAST`], so timer noise near zero does not blow the
+//! logarithm up. Dropped frames feed the estimate as passed ones do: an
+//! estimate fed only what passed never sees past its own bound, so it stays
+//! blind to a source that slipped by less than `max_lateness` until the
+//! floor has turned over, and sits tighter than the path on one with
+//! hiccups. Each run (below) feeds it once, with its first picture's excess
+//! less the width of the group before it, and a group read at arrival
+//! feeds it again with its freshest picture's.
+//! The bound is never more than `max_lateness`, so a flapping path cannot
+//! loosen it without limit, and until [`TAIL_SAMPLES`] samples have fed the
+//! estimate the bound is `max_lateness` alone. A steady path ends with a
+//! bound of a few tens of milliseconds; a bursty one with a looser bound,
+//! up to `max_lateness`.
 //!
 //! The spread is what the input's own delivery adds. A relay that hands on a
 //! whole group of pictures at once (MoQ hands a subscriber a second of them
@@ -24,43 +74,47 @@
 //! cuts what it reads into RUNS, pictures each arriving less than half its
 //! own pts step after the one before, and a run's WIDTH is how far its
 //! lateness ranges. A run counts only when it ends caught up, its freshest
-//! picture within half of `max_lateness` of the baseline: a backlog drained
+//! picture within half of `max_lateness` of the floor: a backlog drained
 //! after a slow stage behind the node also arrives at once, but ends near
 //! the edge of the budget, and so teaches nothing. The spread is the widest
 //! of the last [`KEEP`] counted runs, each capped at `max_spread`. A steady
-//! feed's runs are single pictures, so its spread is 0 and it is judged as
-//! it always was. Two kinds of run stand only until a narrower one counts:
-//! the first, and one as wide as `max_spread`. Those are a reader's own
-//! probe backlog as a rule, handed on at once when it starts, or a stall.
+//! feed's runs are single pictures, so its spread is 0 and it is judged by
+//! the floor and the bound alone. Two kinds of run stand only until a
+//! narrower one counts: the first, and one as wide as `max_spread`. Those
+//! are a reader's own probe backlog as a rule, handed on at once when it
+//! starts, or a stall.
 //!
 //! A leaf's first delivery is shaped by its own start more than by the
 //! relay's pace: the piece of a group made so far when it joined, handed
 //! on at once, and as a rule read before the decoder's queue has filled.
 //! It is narrower than the groups after it, and fresher: each later
 //! group's freshest picture is read behind the pictures the decoder holds
-//! back and the ones handed on before it. Judged against the baseline that
+//! back and the ones handed on before it. Judged against the floor that
 //! piece set, a leaf of the SMART demo found no group ending within half of
 //! `max_lateness` of it for 24 s, so it kept the piece's spread and dropped
 //! the oldest 12 pictures of every group. So a first run of more than one
 //! picture stands for its freshness as it does for its width: when it
-//! ends, the baseline starts over from the picture after it.
+//! ends, the floor starts over from the picture after it.
 //!
 //! And the node LEARNS first: until [`LEARN`] runs have counted, or a run
 //! of one picture after the first, and for no longer than `max_spread` plus
 //! `max_lateness` seconds from its first picture. Meanwhile it drops only a
-//! picture later than the baseline by more than `max_spread` plus
-//! `max_lateness`, and a run begun then counts when its freshest picture is
-//! within `max_lateness` of the baseline, one that would pass with no
-//! spread at all. A steady feed, and a stage too slow from its first
-//! picture, read runs of one picture, so the node stops learning at its
-//! third picture and is judged as it always was.
+//! picture later than the floor by more than `max_spread` plus the bound,
+//! and a run begun then counts when its freshest picture is within
+//! `max_lateness` of the floor, one that would pass with no spread at all.
+//! A steady feed, and a stage too slow from its first picture, read runs of
+//! one picture, so the node stops learning at its third picture and is
+//! judged as it always was.
 //!
 //! Once a second of wall time it writes a row saying what it did, on stderr
 //! behind [`ROW_PREFIX`], where the run that started it reads it:
 //! `{"kind":"leaky","node":<id>,"passed":<n>,"dropped":<n>,"lateness_s":<s>,
-//! "baseline_s":<s>,"spread_s":<s>}`. The counts are the window's own; the
-//! times are the latest frame's lateness, the baseline and the spread, in
-//! seconds.
+//! "baseline_s":<s>,"spread_s":<s>,"bound_s":<s>}`. The counts are the
+//! window's own; the times are the latest frame's lateness, the floor, the
+//! spread and the bound, in seconds. When the floor has risen by more than
+//! [`SLIP`] since it was last reported, it writes
+//! `{"kind":"leaky","node":<id>,"event":"slip","by_s":<s>,"baseline_s":<s>}`
+//! the same way, so a source that slipped is seen in the log as it happens.
 //!
 //! Over a coded picture it reads packets, in decode order, and judges each
 //! by its dts (its pts where the wire gives none) as it would a picture.
@@ -83,7 +137,8 @@ use serde_json::json;
 /// The node name the grammar reserves.
 pub const NODE: &str = "leaky";
 
-/// How late a frame may be past the baseline and the spread, in seconds.
+/// The most the bound may be, in seconds: how far past the floor and the
+/// spread a frame may ever be.
 const MAX_LATENESS: &str = "max_lateness";
 
 /// The most the spread may grow to, in seconds.
@@ -106,6 +161,33 @@ pub const KEEP: usize = 8;
 /// two after it.
 pub const LEARN: usize = 3;
 
+/// How far back the floor looks, in seconds of wall time: a frame read at
+/// arrival lowers or raises it for this long. Long enough that a stall of a
+/// second is still a stall, short enough that a source that slipped is
+/// passing again before a viewer gives up.
+pub const FLOOR_SECONDS: f64 = 4.0;
+
+/// How much later past its pts a frame may be read than the run before it,
+/// per second between them, and still count as read at arrival: a
+/// millisecond a second. A clock drifting faster is broken, and a stage
+/// that much slower than its input is behind by a tenth of a percent.
+const DRIFT: f64 = 1e-3;
+
+/// How far the floor rises before a row says so, in seconds.
+pub const SLIP: f64 = 0.02;
+
+/// The time constant of the tail's running mean and deviation, in seconds.
+pub const TAIL_SECONDS: f64 = 10.0;
+
+/// How many samples feed the tail before its bound is used.
+pub const TAIL_SAMPLES: usize = 300;
+
+/// How many deviations above the mean of ln(excess) the bound sits.
+const TAIL_SIGMAS: f64 = 3.0;
+
+/// The least an excess is taken as when it feeds the tail, in seconds.
+const TAIL_LEAST: f64 = 0.005;
+
 /// What a row on stderr starts with, so a reader tells it from the log.
 pub const ROW_PREFIX: &str = "ffrwd:row ";
 
@@ -113,7 +195,7 @@ pub const ROW_PREFIX: &str = "ffrwd:row ";
 const REPORT_EVERY: f64 = 1.0;
 
 /// How the host drives it: a frame at a time, and it hands on fewer frames
-/// than it reads. Its baseline is state, so one instance sees every frame.
+/// than it reads. Its floor is state, so one instance sees every frame.
 pub const SHAPE: Shape = Shape {
     window: 1,
     stride: 1,
@@ -146,8 +228,8 @@ struct Window {
 }
 
 /// Pictures arriving faster than they were made: how many, when the latest
-/// was read and made, the most and least lateness among them, and whether
-/// the node was learning when the first was read.
+/// was read and made, the most and least lateness among them, whether the
+/// node was learning when the first was read, and what became of them.
 struct Run {
     pictures: usize,
     wall: f64,
@@ -155,12 +237,85 @@ struct Run {
     most: f64,
     least: f64,
     learning: bool,
+    /// Whether the first picture was read at arrival.
+    arrived: bool,
+    /// The width of the group before this run, where there was one: how
+    /// much older its first picture is than the freshest before it.
+    allowance: f64,
+    /// Whether a picture of it was dropped.
+    dropped: bool,
+    /// Whether a picture of it passed after one was dropped: the node read
+    /// its way down a backlog to the bound and stopped there.
+    drained: bool,
+    /// Whether its latest picture passed.
+    kept: bool,
+}
+
+impl Run {
+    /// Whether it is a group handed on at once, and not a backlog the node
+    /// read down to the bound.
+    fn group(&self) -> bool {
+        self.pictures > 1 && !self.drained
+    }
+}
+
+/// A lateness read at arrival, and when it was read.
+struct Sample {
+    wall: f64,
+    lateness: f64,
+}
+
+/// The running mean and deviation of ln(excess), as exponential averages
+/// over the stream's own time, and how many samples fed them.
+struct Tail {
+    mean: f64,
+    variance: f64,
+    samples: usize,
+    /// When the picture of the latest sample was made.
+    last: Option<f64>,
+}
+
+impl Tail {
+    fn new() -> Tail {
+        Tail {
+            mean: 0.0,
+            variance: 0.0,
+            samples: 0,
+            last: None,
+        }
+    }
+
+    /// One more excess, from the picture made at `at`: a stall feeds it one
+    /// picture's worth, not the stall's.
+    fn feed(&mut self, excess: f64, at: f64) {
+        let x = excess.max(TAIL_LEAST).ln();
+        let alpha = self.last.map_or(1.0, |last| {
+            1.0 - (-(at - last).max(0.0) / TAIL_SECONDS).exp()
+        });
+        let delta = x - self.mean;
+        self.mean += alpha * delta;
+        self.variance = (1.0 - alpha) * (self.variance + alpha * delta * delta);
+        self.samples += 1;
+        self.last = Some(at);
+    }
+
+    /// How far above the floor a frame may come, in seconds, never more
+    /// than `ceiling`, and `ceiling` alone until enough samples have fed it.
+    fn bound(&self, ceiling: f64) -> f64 {
+        if self.samples < TAIL_SAMPLES {
+            return ceiling;
+        }
+        (self.mean + TAIL_SIGMAS * self.variance.sqrt())
+            .exp()
+            .min(ceiling)
+    }
 }
 
 /// What a node is opened with, in seconds.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Limits {
-    /// How late past the baseline and the spread a picture may be.
+    /// The most the bound may be: how far past the floor and the spread a
+    /// picture may ever be.
     pub max_lateness: f64,
     /// The most the spread may grow to; 0 learns none.
     pub max_spread: f64,
@@ -179,7 +334,15 @@ pub struct Leaky {
     limits: Limits,
     time_base: TimeBase,
     node: String,
-    baseline: Option<f64>,
+    /// The smallest lateness among [`Leaky::recent`], or the last one once
+    /// they have all left the window.
+    floor: Option<f64>,
+    /// The floor as a row last reported it, or as it last fell to.
+    reported: Option<f64>,
+    /// The latenesses read at arrival in the last [`FLOOR_SECONDS`], oldest
+    /// first, each smaller than the one before it: the front is the least.
+    recent: VecDeque<Sample>,
+    tail: Tail,
     /// The latest frame's lateness.
     lateness: f64,
     last_passed: Option<i64>,
@@ -296,7 +459,10 @@ impl Leaky {
             limits,
             time_base,
             node,
-            baseline: None,
+            floor: None,
+            reported: None,
+            recent: VecDeque::new(),
+            tail: Tail::new(),
             lateness: 0.0,
             last_passed: None,
             run: None,
@@ -310,7 +476,20 @@ impl Leaky {
         }
     }
 
-    /// How much later than the baseline the input's own delivery makes a
+    /// The path's offset as the node sees it: the smallest lateness read at
+    /// arrival in the last [`FLOOR_SECONDS`], in seconds, once a picture has
+    /// been read.
+    pub fn floor(&self) -> Option<f64> {
+        self.floor
+    }
+
+    /// How far above the floor and the spread a picture may come, in
+    /// seconds: what the tail allows, never more than `max_lateness`.
+    pub fn bound(&self) -> f64 {
+        self.tail.bound(self.limits.max_lateness)
+    }
+
+    /// How much later than the floor the input's own delivery makes a
     /// picture: the widest of the last counted runs, 0 before any.
     pub fn spread(&self) -> f64 {
         self.widths
@@ -350,8 +529,8 @@ impl Leaky {
         let lateness = now - at;
         self.first.get_or_insert(now);
         self.follow(now, at, lateness);
-        let baseline = self.baseline.map_or(lateness, |seen| seen.min(lateness));
-        self.baseline = Some(baseline);
+        self.settle(now);
+        let floor = *self.floor.get_or_insert(lateness);
         self.lateness = lateness;
         let behind = ordered && self.last_passed.is_some_and(|last| pts < last);
         // While it learns, it drops only what no spread it may learn would pass.
@@ -360,10 +539,22 @@ impl Leaky {
         } else {
             self.spread()
         };
-        let budget = spread + self.limits.max_lateness;
-        let passes = !behind && lateness <= baseline + budget;
+        let budget = spread + self.bound();
+        let passes = !behind && lateness <= floor + budget;
         if passes && ordered {
             self.last_passed = Some(pts);
+        }
+        if let Some(run) = &mut self.run {
+            run.kept = passes;
+            if passes {
+                run.drained |= run.dropped;
+            } else {
+                run.dropped = true;
+            }
+            if run.pictures == 1 {
+                let allowance = run.allowance;
+                self.tail.feed(lateness - floor - allowance, at);
+            }
         }
         passes
     }
@@ -405,9 +596,20 @@ impl Leaky {
                 return;
             }
         }
-        if let Some(run) = self.run.take() {
-            self.close(&run);
+        let previous = self.run.take();
+        if let Some(run) = &previous {
+            self.close(run);
         }
+        let allowance = previous
+            .as_ref()
+            .filter(|run| run.group())
+            .map_or(0.0, |run| run.most - run.least);
+        let arrived = match &previous {
+            _ if self.floor.is_none() => true,
+            None => true,
+            Some(run) if !run.kept && at > run.at => true,
+            Some(run) => lateness - allowance <= run.least + DRIFT * (now - run.wall),
+        };
         self.run = Some(Run {
             pictures: 1,
             wall: now,
@@ -415,28 +617,42 @@ impl Leaky {
             most: lateness,
             least: lateness,
             learning: self.learning(now),
+            arrived,
+            allowance,
+            dropped: false,
+            drained: false,
+            kept: false,
         });
     }
 
     /// A run is over. It counts when its freshest picture came within half
-    /// of `max_lateness` of the baseline: the node had caught up. A run begun
+    /// of `max_lateness` of the floor: the node had caught up. A run begun
     /// while the node learned counts within all of `max_lateness`: its
     /// freshest picture would have passed with no spread.
     fn close(&mut self, run: &Run) {
-        let Some(baseline) = self.baseline else {
+        let Some(floor) = self.floor else {
             return;
         };
-        // The first run of more than one picture is the node's own start as
-        // a rule: after it, the baseline starts over.
         if self.counted == 0 && run.pictures > 1 && self.limits.max_spread > 0.0 {
-            self.baseline = None;
+            // The first run of more than one picture is the node's own start
+            // as a rule: after it, the floor starts over.
+            self.recent.clear();
+            self.floor = None;
+            self.reported = None;
+        } else if run.arrived && !run.drained {
+            // Its freshest picture, now that the run is known not to have
+            // been a backlog read down to the bound.
+            self.remember(run.wall, run.least);
+            if run.pictures > 1 {
+                self.tail.feed(run.least - floor, run.at);
+            }
         }
         let margin = if run.learning {
             self.limits.max_lateness
         } else {
             self.limits.max_lateness / 2.0
         };
-        if run.least > baseline + margin {
+        if run.least > floor + margin {
             return;
         }
         let width = (run.most - run.least).min(self.limits.max_spread);
@@ -457,6 +673,65 @@ impl Leaky {
             self.widths.pop_front();
         }
         self.widths.push_back((width, provisional));
+    }
+
+    /// One more lateness read at arrival at `wall`. Any earlier one it is no
+    /// larger than can never be the least again while it stands.
+    fn remember(&mut self, wall: f64, lateness: f64) {
+        while self.recent.back().is_some_and(|s| s.lateness >= lateness) {
+            self.recent.pop_back();
+        }
+        self.recent.push_back(Sample { wall, lateness });
+    }
+
+    /// The floor at `now`: the least of what was read at arrival in the
+    /// window, falling at once and rising as older readings leave it, with a
+    /// row when it has risen by more than [`SLIP`].
+    fn settle(&mut self, now: f64) {
+        while self
+            .recent
+            .front()
+            .is_some_and(|s| s.wall < now - FLOOR_SECONDS)
+        {
+            self.recent.pop_front();
+        }
+        // The open run counts while it may still close as read at arrival;
+        // its least joins the window when it does.
+        let pending = self
+            .run
+            .as_ref()
+            .filter(|run| run.arrived && !run.drained)
+            .map(|run| run.least);
+        let recent = self.recent.front().map(|s| s.lateness);
+        let Some(least) = recent.into_iter().chain(pending).reduce(f64::min) else {
+            return;
+        };
+        match self.floor {
+            Some(floor) if least > floor => {
+                self.floor = Some(least);
+                let reported = self.reported.unwrap_or(floor);
+                if least - reported > SLIP {
+                    self.reported = Some(least);
+                    let row = json!({
+                        "kind": NODE,
+                        "node": self.node,
+                        "event": "slip",
+                        "by_s": millis(least - reported),
+                        "baseline_s": millis(least),
+                    });
+                    (self.report)(row.to_string());
+                }
+            }
+            Some(floor) if least < floor => {
+                self.floor = Some(least);
+                self.reported = Some(least);
+            }
+            Some(_) => {}
+            None => {
+                self.floor = Some(least);
+                self.reported = Some(least);
+            }
+        }
     }
 
     /// One frame through, or None where it was too late.
@@ -494,8 +769,9 @@ impl Leaky {
             "passed": window.passed,
             "dropped": window.dropped,
             "lateness_s": millis(self.lateness),
-            "baseline_s": millis(self.baseline.unwrap_or(0.0)),
+            "baseline_s": millis(self.floor().unwrap_or(0.0)),
             "spread_s": millis(self.spread()),
+            "bound_s": millis(self.bound()),
         });
         (self.report)(row.to_string());
     }
@@ -561,6 +837,22 @@ mod tests {
             self.rows.lock().unwrap().clone()
         }
 
+        /// The rows that counted a second's pictures.
+        fn reports(&self) -> Vec<serde_json::Value> {
+            self.rows()
+                .into_iter()
+                .filter(|row| row["event"].is_null())
+                .collect()
+        }
+
+        /// The rows that said the floor rose.
+        fn slips(&self) -> Vec<serde_json::Value> {
+            self.rows()
+                .into_iter()
+                .filter(|row| row["event"] == "slip")
+                .collect()
+        }
+
         /// Pictures `(arriving, pts)` in seconds, read in turn by a node that
         /// then spends `cost(wall)` seconds handing on each one it passes, as
         /// a stage behind it takes it, and next to nothing on one it drops.
@@ -581,11 +873,29 @@ mod tests {
                 })
                 .collect()
         }
+
+        /// Pictures `k` of a steady feed made at 30 a second, each read
+        /// `late(k)` seconds after it was made by a node that keeps up; which
+        /// of them were dropped.
+        fn steady(
+            &mut self,
+            pictures: impl Iterator<Item = u32>,
+            late: impl Fn(u32) -> f64,
+        ) -> Vec<u32> {
+            pictures
+                .filter(|&k| !self.at(made(k) + late(k), made(k)))
+                .collect()
+        }
     }
 
     /// Picture `k` of a feed made at 30 a second, in seconds.
     fn made(k: u32) -> f64 {
         1_000.0 + f64::from(k) / 30.0
+    }
+
+    /// Timer noise on picture `k`: 0 to 12 ms, in no pattern a window sees.
+    fn noise(k: u32) -> f64 {
+        f64::from((k * 7) % 13) / 1_000.0
     }
 
     /// A relay's delivery: each second's 30 pictures handed on together,
@@ -634,7 +944,7 @@ mod tests {
     }
 
     #[test]
-    fn a_sender_that_starts_late_is_absorbed_by_the_baseline() {
+    fn a_sender_that_starts_late_is_absorbed_by_the_floor() {
         let mut h = Harness::new(0.5);
         // Every frame arrives 7 s after its stamp: late, but alike.
         let passed: Vec<bool> = (0..90)
@@ -645,25 +955,31 @@ mod tests {
             .collect();
         assert!(passed.iter().all(|p| *p));
         // Seven seconds, to the millisecond the pts are stamped in.
-        assert!((h.leaky.baseline.unwrap() - 7.0).abs() < 1e-3);
+        assert!((h.leaky.floor().unwrap() - 7.0).abs() < 1e-3);
     }
 
     #[test]
-    fn the_baseline_is_the_smallest_lateness_seen_so_far() {
+    fn the_floor_is_the_least_lateness_read_at_arrival_in_the_window() {
         let mut h = Harness::new(0.5);
         assert!(h.at(10.3, 10.0));
         assert!(h.at(10.4, 10.2)); // 0.2: earlier than any before it
-        assert!((h.leaky.baseline.unwrap() - 0.2).abs() < 1e-9);
+        assert!((h.leaky.floor().unwrap() - 0.2).abs() < 1e-9);
         // 0.6 is past 0.2 by 0.4, inside the budget: it does not move the
-        // baseline, which never rises.
+        // floor, which rises only as what it stands on leaves the window.
         assert!(h.at(11.0, 10.4));
-        assert!((h.leaky.baseline.unwrap() - 0.2).abs() < 1e-9);
+        assert!((h.leaky.floor().unwrap() - 0.2).abs() < 1e-9);
+        // The 0.2 reading leaves the window; the 0.6 one, read later past
+        // its pts than the one before, never counted. The floor stands on
+        // what came after.
+        assert!(h.at(11.1, 10.6));
+        assert!(h.at(10.4 + FLOOR_SECONDS + 0.1, 10.4 + FLOOR_SECONDS - 0.2));
+        assert!((h.leaky.floor().unwrap() - 0.3).abs() < 1e-9);
     }
 
     #[test]
-    fn a_frame_later_than_the_baseline_by_more_than_the_budget_is_dropped() {
+    fn a_frame_later_than_the_floor_by_more_than_the_budget_is_dropped() {
         let mut h = Harness::new(0.5);
-        assert!(h.at(100.1, 100.0)); // the baseline: 0.1
+        assert!(h.at(100.1, 100.0)); // the floor: 0.1
         assert!(h.at(100.633, 100.033)); // 0.6: past it by exactly 0.5
         assert!(!h.at(100.667, 100.066)); // 0.601: past it by more
                                           // The stall is over: the next frame is on time again and passes.
@@ -734,6 +1050,8 @@ mod tests {
         assert_eq!(rows[0]["lateness_s"], 2.0);
         assert_eq!(rows[0]["baseline_s"], 0.0);
         assert_eq!(rows[0]["spread_s"], 0.0);
+        // Too few samples have fed the tail: the bound is max_lateness.
+        assert_eq!(rows[0]["bound_s"], 0.5);
         h.leaky.finish();
         let rows = h.rows();
         assert_eq!(rows.len(), 2);
@@ -752,7 +1070,7 @@ mod tests {
         // the fourth second to the sixth the stage behind the node takes
         // 60 ms over each picture it is handed, more than the feed allows.
         let feed: Vec<(f64, f64)> = (0..300)
-            .map(|k| (made(k) + 0.25 + f64::from((k * 7) % 13) / 1_000.0, made(k)))
+            .map(|k| (made(k) + 0.25 + noise(k), made(k)))
             .collect();
         let cost = |wall: f64| {
             if (1_003.0..1_006.0).contains(&wall) {
@@ -798,7 +1116,7 @@ mod tests {
             assert!(*passed);
             assert!((spread - 0.9637).abs() < 1e-3, "{spread}");
         }
-        let rows = h.rows();
+        let rows = h.reports();
         assert!(rows.len() >= 18, "{rows:?}");
         assert!(rows[2..]
             .iter()
@@ -949,7 +1267,7 @@ mod tests {
     #[test]
     fn a_leaf_whose_first_delivery_is_narrow_learns_its_groups_and_drops_nothing() {
         // Its groups' freshest pictures are read 0.27 s to 0.31 s past the
-        // baseline the first piece set, more than half of max_lateness.
+        // floor the first piece set, more than half of max_lateness.
         // Judged against that piece from the first picture on, as 0.25.2
         // judged it, the node kept the piece's 0.3 s and dropped the oldest
         // 12 of every group, 349 of 900 in 30 s, as the demo's leaf did for
@@ -968,17 +1286,17 @@ mod tests {
             .iter()
             .all(|(_, spread)| (spread - 0.865).abs() < 2e-3));
         assert!(!h.leaky.learning(feed[60].0));
-        assert!(h.rows().iter().all(|row| row["dropped"] == 0));
-        // The baseline started over after the piece.
-        assert!(h.leaky.baseline.unwrap() > 2.6 + 0.2);
+        assert!(h.reports().iter().all(|row| row["dropped"] == 0));
+        // The floor started over after the piece.
+        assert!(h.leaky.floor().unwrap() > 2.6 + 0.2);
     }
 
     #[test]
-    fn a_first_delivery_fresher_than_every_group_after_it_sets_no_baseline() {
+    fn a_first_delivery_fresher_than_every_group_after_it_sets_no_floor() {
         // Two pictures out of the decoder before its queue has filled, read
-        // 0.8 s fresher than any group after them. Against their baseline
-        // every picture after would be late by more than the budget, however
-        // wide the spread learned.
+        // 0.8 s fresher than any group after them. Against their floor every
+        // picture after would be late by more than the budget, however wide
+        // the spread learned.
         let mut feed: Vec<(f64, f64)> = (9..11)
             .map(|k| (made(10) + 2.0 - f64::from(10 - k) * 1e-4, made(k)))
             .collect();
@@ -986,8 +1304,11 @@ mod tests {
         let mut h = Harness::new(0.5);
         let served = h.serve(&feed, |_| HANDING_ON);
         assert_eq!(dropped(&served), 0);
-        let baseline = h.leaky.baseline.unwrap();
-        assert!((2.6 + 0.21..2.6 + 0.3).contains(&baseline), "{baseline}");
+        // The groups' own freshest pictures, read 0.865 s of handing on
+        // after their oldest, are what the floor stands on once the rest of
+        // the first group has left the window.
+        let floor = h.leaky.floor().unwrap();
+        assert!((2.6 + 0.21..2.6 + 0.32).contains(&floor), "{floor}");
         assert!((h.leaky.spread() - 0.865).abs() < 2e-3);
     }
 
@@ -1030,21 +1351,251 @@ mod tests {
         // After a first picture on time, every group's freshest picture is
         // read 0.6 s past it: no run ends fresh enough to count. Up to 2.5 s
         // from the first picture it drops nothing; then it stops learning,
-        // with nothing learned, and drops what is past max_lateness.
+        // with nothing learned, and drops what is past max_lateness over the
+        // first picture's floor. That floor stands for one window. Then the
+        // groups' own freshest pictures are the floor, a row says the source
+        // slipped 0.6 s, the groups count, and they pass.
         let mut feed = vec![(made(0) + 2.6, made(0))];
         feed.extend(a_leaf_joining(8, 0.6).into_iter().skip(11));
         let mut h = Harness::new(0.5);
         let served = h.serve(&feed, |_| 1e-4);
         let start = feed[0].0;
-        let (early, late): (Vec<_>, Vec<_>) = feed
-            .iter()
-            .zip(&served)
-            .partition(|((arriving, _), _)| arriving - start < 2.5);
-        assert_eq!(early.len(), 1 + 19);
-        assert!(early.iter().all(|(_, (passed, _))| *passed));
+        let outcome = |from: f64, until: f64| -> (usize, usize) {
+            feed.iter()
+                .zip(&served)
+                .filter(|((arriving, _), _)| (from..until).contains(arriving))
+                .fold((0, 0), |(passed, dropped), (_, (kept, _))| {
+                    if *kept {
+                        (passed + 1, dropped)
+                    } else {
+                        (passed, dropped + 1)
+                    }
+                })
+        };
+        assert_eq!(outcome(start, start + 2.5), (1 + 19, 0));
         assert!(!h.leaky.learning(start + 2.5));
-        assert!(late.iter().filter(|(_, (passed, _))| !passed).count() > late.len() / 2);
-        assert_eq!(h.leaky.spread(), 0.0);
+        assert_eq!(outcome(start + 2.5, start + FLOOR_SECONDS), (0, 60));
+        assert_eq!(outcome(start + FLOOR_SECONDS + 1.0, f64::MAX).1, 0);
+        // The groups' freshest picture is read 29 arrivals after the oldest.
+        let floor = h.leaky.floor().unwrap();
+        assert!((3.2..3.22).contains(&floor), "{floor}");
+        let slips = h.slips();
+        assert_eq!(slips.len(), 1, "{slips:?}");
+        let by = slips[0]["by_s"].as_f64().unwrap();
+        assert!((0.6..0.62).contains(&by), "{by}");
+        assert!(h.leaky.spread() > 0.5, "{}", h.leaky.spread());
+    }
+
+    /// Thirty seconds of a steady feed read 0.25 s late with timer noise:
+    /// enough for the tail to be in use, with a bound of tens of
+    /// milliseconds.
+    fn settled() -> Harness {
+        let mut h = Harness::new(0.5);
+        assert!(h.steady(0..900, |k| 0.25 + noise(k)).is_empty());
+        assert!(h.leaky.tail.samples >= TAIL_SAMPLES);
+        let bound = h.leaky.bound();
+        assert!((0.01..0.1).contains(&bound), "{bound}");
+        h
+    }
+
+    #[test]
+    fn a_transient_burst_is_dropped_and_the_floor_holds() {
+        let mut h = settled();
+        // The network holds a second of pictures and hands them on at once,
+        // 1 s late; then the feed is as it was.
+        let dropped = h.steady(900..930, |k| 0.25 + noise(k) + f64::from(930 - k) / 30.0);
+        assert!(dropped.len() >= 28 && dropped[0] == 900, "{dropped:?}");
+        assert!(h.steady(930..1_200, |k| 0.25 + noise(k)).is_empty());
+        let floor = h.leaky.floor().unwrap();
+        assert!((floor - 0.25).abs() < 2e-3, "{floor}");
+        assert!(h.slips().is_empty());
+    }
+
+    #[test]
+    fn a_permanent_step_costs_one_window_of_drops_and_a_row_and_then_passes() {
+        let mut h = settled();
+        // From picture 900 on, the source is 0.6 s further behind, for good:
+        // past max_lateness over the floor it had, whatever the tail allows.
+        let dropped = h.steady(900..1_800, |k| 0.85 + noise(k));
+        assert!(dropped.contains(&900));
+        // The drops end once the window has turned over: the last reading
+        // from before the step was at picture 899, and the step itself reads
+        // every picture after it 0.5 s later, so FLOOR_SECONDS of wall time
+        // is 105 pictures.
+        let last = *dropped.last().unwrap();
+        assert!((1_000..=1_010).contains(&last), "{last}");
+        assert_eq!(dropped.len(), (last - 900 + 1) as usize, "{dropped:?}");
+        let floor = h.leaky.floor().unwrap();
+        assert!((floor - 0.85).abs() < 2e-3, "{floor}");
+        // One row said so, with the size of the step.
+        let slips = h.slips();
+        assert_eq!(slips.len(), 1, "{slips:?}");
+        assert_eq!(slips[0]["node"], "n3");
+        let by = slips[0]["by_s"].as_f64().unwrap();
+        assert!((by - 0.6).abs() < 0.015, "{by}");
+        assert_eq!(slips[0]["baseline_s"].as_f64().unwrap(), millis(floor));
+        // A second, smaller step is another row.
+        let dropped = h.steady(1_800..2_400, |k| 1.05 + noise(k));
+        assert!(
+            !dropped.is_empty() && dropped.len() < 130,
+            "{}",
+            dropped.len()
+        );
+        let slips = h.slips();
+        assert_eq!(slips.len(), 2, "{slips:?}");
+        let by = slips[1]["by_s"].as_f64().unwrap();
+        assert!((by - 0.2).abs() < 0.015, "{by}");
+    }
+
+    #[test]
+    fn a_source_drifting_a_minute_an_hour_is_followed_all_day_with_no_drop() {
+        // Ten pictures a second for a day, each 60 ms an hour later than
+        // the last by the two clocks alone. The floor follows the drift a
+        // few microseconds a window; the bound never comes into it.
+        let mut h = Harness::new(0.5);
+        let rate = 0.06 / 3_600.0;
+        let mut dropped = 0u32;
+        for k in 0..24 * 3_600 * 10 {
+            let at = 1_000.0 + f64::from(k) / 10.0;
+            if !h.at(at + 0.25 + f64::from(k) / 10.0 * rate, at) {
+                dropped += 1;
+            }
+        }
+        assert_eq!(dropped, 0);
+        let floor = h.leaky.floor().unwrap();
+        assert!((floor - (0.25 + 24.0 * 0.06)).abs() < 1e-3, "{floor}");
+        // The rows add up to the day's drift, SLIP at a time.
+        let slipped: f64 = h
+            .slips()
+            .iter()
+            .map(|row| row["by_s"].as_f64().unwrap())
+            .sum();
+        assert!((slipped - 24.0 * 0.06).abs() < 2.0 * SLIP, "{slipped}");
+    }
+
+    #[test]
+    fn a_source_that_comes_back_earlier_is_followed_at_once() {
+        let mut h = Harness::new(0.5);
+        assert!(h.steady(0..300, |k| 0.75 + noise(k)).is_empty());
+        assert!((h.leaky.floor().unwrap() - 0.75).abs() < 2e-3);
+        // The source's clock jumps half a second ahead: from picture 300 on
+        // each is stamped 0.5 s later and read at the wall it would have
+        // been anyway, so each is 0.25 s late. The first passes and the
+        // floor is its lateness at once; the rest pass.
+        let mut dropped = 0;
+        for k in 300..600 {
+            if !h.at(made(k) + 0.75 + noise(k), made(k) + 0.5) {
+                dropped += 1;
+            }
+            if k == 300 {
+                let floor = h.leaky.floor().unwrap();
+                assert!((floor - 0.25 - noise(300)).abs() < 1e-9, "{floor}");
+            }
+        }
+        assert_eq!(dropped, 0);
+        assert!((h.leaky.floor().unwrap() - 0.25).abs() < 2e-3);
+        assert!(h.slips().is_empty());
+    }
+
+    #[test]
+    fn a_stage_that_cannot_keep_up_does_not_raise_the_floor() {
+        // Ten seconds keeping up, then the stage behind takes 60 ms over
+        // every picture, for longer than the window is wide. Every picture
+        // the node reads meanwhile was queued, and none of them counts: the
+        // floor holds, within the noise of the last reading that did count,
+        // and what passes is never further past it than the spread, the
+        // bound and a pts step.
+        let feed: Vec<(f64, f64)> = (0..1_200)
+            .map(|k| (made(k) + 0.25 + noise(k), made(k)))
+            .collect();
+        let mut h = Harness::new(0.5);
+        let served = h.serve(&feed, |wall| if wall < 1_010.0 { 1e-3 } else { 0.06 });
+        let floor = h.leaky.floor().unwrap();
+        assert!((0.25..0.263).contains(&floor), "{floor}");
+        assert!(h.slips().is_empty(), "{:?}", h.slips());
+        assert!(dropped(&served[300..]) > 300, "{}", dropped(&served[300..]));
+        assert!(h.reports().iter().all(|row| {
+            let field = |key: &str| row[key].as_f64().unwrap();
+            field("lateness_s") <= field("baseline_s") + field("spread_s") + field("bound_s") + 0.04
+        }));
+    }
+
+    #[test]
+    fn a_steady_path_ends_with_a_tight_bound_and_a_bursty_one_with_a_looser_one() {
+        let steady = settled().leaky.bound();
+        assert!((0.01..0.1).contains(&steady), "{steady}");
+
+        // The same feed with every fifth picture held back up to 0.3 s more.
+        let mut h = Harness::new(0.5);
+        h.steady(0..900, |k| {
+            0.25 + noise(k)
+                + if k % 5 == 0 {
+                    f64::from(k % 7) * 0.05
+                } else {
+                    0.0
+                }
+        });
+        let bursty = h.leaky.bound();
+        assert!(bursty > 2.0 * steady, "{bursty} against {steady}");
+        assert!(bursty <= 0.5, "{bursty}");
+
+        // A path late by whole seconds now and then can loosen it no further
+        // than max_lateness.
+        let mut h = Harness::new(0.5);
+        h.steady(0..900, |k| {
+            0.25 + noise(k)
+                + if k % 3 == 0 {
+                    f64::from(k % 11) * 0.3
+                } else {
+                    0.0
+                }
+        });
+        assert_eq!(h.leaky.bound(), 0.5);
+    }
+
+    #[test]
+    fn dropped_pictures_feed_the_tail_and_one_fed_only_what_passed_stays_blind() {
+        // A settled feed slips 0.3 s: under max_lateness over the floor it
+        // had, so the tail may let it through once it has learned that
+        // pictures now come that late. What the node drops teaches it that
+        // within a couple of seconds, well before the floor turns over. An
+        // estimate fed only with what it would itself pass never learns it,
+        // and drops every picture until the floor has turned.
+        let mut h = settled();
+        let mut censored = Tail::new();
+        censored.feed(0.0, made(0));
+        for k in 1..900 {
+            censored.feed(noise(k), made(k));
+        }
+        assert!((0.01..0.1).contains(&censored.bound(0.5)));
+        let mut first_passed = None;
+        let mut dropped = 0;
+        let mut censored_dropped = 0;
+        for k in 900..1_800 {
+            let wall = made(k) + 0.55 + noise(k);
+            if h.at(wall, made(k)) {
+                first_passed.get_or_insert(k);
+            } else {
+                dropped += 1;
+            }
+            let excess = wall - made(k) - h.leaky.floor().unwrap();
+            if excess <= censored.bound(0.5) {
+                censored.feed(excess, made(k));
+            } else {
+                censored_dropped += 1;
+            }
+        }
+        let first = first_passed.expect("the stream resumed");
+        assert!((910..990).contains(&first), "{first}");
+        assert!(dropped < 60, "{dropped}");
+        // The censored estimate dropped the 103 pictures read before the
+        // floor turned over, and holds a bound for the path as it was.
+        assert!(censored_dropped >= 100, "{censored_dropped}");
+        assert!(censored.bound(0.5) < 0.05, "{}", censored.bound(0.5));
+        // With the floor caught up, the excess is noise again and the
+        // node's bound tightens back.
+        assert!((h.leaky.floor().unwrap() - 0.55).abs() < 2e-3);
+        assert!(h.leaky.bound() < 0.1, "{}", h.leaky.bound());
     }
 
     fn video() -> Format {
