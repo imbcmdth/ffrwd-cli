@@ -3355,7 +3355,7 @@ class _Partitioner:
             )
 
     def _late_seconds(self, start: StreamEdge, target: str) -> float:
-        """How far past its baseline a leaky lets `start`'s path trail into
+        """How far past its floor a leaky lets `start`'s path trail into
         `target`, in seconds.
 
         Each process a frame passes THROUGH on the way adds the most any
@@ -3399,7 +3399,7 @@ class _Partitioner:
 
     def _leaky_seconds(self, pid: str) -> float:
         """The most a leaky node in process `pid` lets a picture trail past
-        the baseline: its ``max_lateness`` plus its ``max_spread``, the
+        the floor: its ``max_lateness`` plus its ``max_spread``, the
         largest over the leaky nodes it holds."""
         return max(
             (
