@@ -709,6 +709,17 @@ def test_a_writer_failing_while_its_reader_runs_ends_the_stage() -> None:
     assert failed == "ffmpeg0"
 
 
+def test_a_writer_reading_its_own_connection_that_fails_ends_the_stage() -> None:
+    """A region writing a lateral's messages and hosting a call its instances
+    feed is its own reader. Its failure ends the stage as any member's does,
+    rather than passing for a writer that outlived its reader."""
+    members = _members(sidecar0=1, ffmpeg0=None)
+    failed, timed_out, _ = execute._watch(
+        members, time.monotonic() + 5, stall=None, writers={"sidecar0": ["sidecar0"]}
+    )
+    assert (failed, timed_out) == ("sidecar0", False)
+
+
 # -- a live programme starts the port's clock ---------------------------------
 
 
