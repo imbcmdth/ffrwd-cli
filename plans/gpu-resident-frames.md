@@ -301,7 +301,96 @@ What changes:
   rather than after compiling, so the first query's wait overlaps work
   it was doing anyway.
 
-## 3. Waves
+## 3. The experiment: blitz at 4K60 on the GPU, before anything else
+
+The design rests on one assumption that nothing above has measured: that
+`vello_gpu`, driven from a module through wasi:webgpu, composites a 4K60
+document over several video textures inside the frame budget, with the
+guest's single-threaded CPU share small enough to leave room for the rest
+of the tick. The experiment settles that before any sidecar work starts.
+It runs on the owner's machine; this container has no GPU.
+
+**Question.** For a document showing N video inputs, N in 2, 4 and 8, at
+3840x2160, with an L-bar cycle, a lower third and a pulsing logo animating
+every frame: what does one rendered frame cost in guest CPU time, in GPU
+time and in bytes crossing the wit, and does it hold 60 frames a second
+over 600 frames?
+
+**Step A, native baseline.** Hours, no new infrastructure. A bench binary
+in the blitz repository beside `core/tests/compose`, using
+`anyrender_vello_hybrid` on native wgpu: the same documents, N textures
+uploaded once, wgpu timestamp queries for GPU time, `Instant` around
+resolve, plan, paint commands and `vello_gpu`'s preparation for CPU time,
+with and without a readback of the frame. This answers whether the
+renderer is up to the task at all, on a 4090 and then on the L4. The wasm
+run then measures only what wasi adds.
+
+**Step B, the backend, just enough.** The wgpu custom backend crate over
+`wasi:webgpu@0.0.1` from 2.6, scoped to what `vello_gpu` calls: instance,
+adapter, device, queue, buffers, textures and views, samplers, bind
+groups, pipeline layouts, shader modules, compute and render pipelines,
+command encoders, compute and render passes, copies, `write-buffer`,
+`write-texture`, `map-async` with the copy-based mapped range, submit,
+`on-submitted-work-done`, query sets. Render bundles, surfaces and
+acceleration structures stay `todo!()`. Two references: wgpu's browser
+backend for the dispatch-trait structure, which is current, and
+wasi-gfx's fork, `wgpu/src/backend/wasi_webgpu.rs`, which targets this
+same 0.0.1 wit but is wgpu 0.19 on the old monolithic `Context` trait, so
+its type conversions and its copy-based mapping carry over and its
+structure does not. Pinned to the wgpu `vello_gpu` pins. Host gaps filled
+alongside: `write-timestamp` so GPU time can be read, and
+`get-compilation-info` so a WGSL error is a message and not a trap.
+
+**Step C, the wasm run.** blitz's module built with the backend, as a
+source node in the shape of `page`: no inputs, N textures the module
+makes itself, `fps` 60, 3840x2160. Run under `ffrwd-wasm` with `-gpu`,
+rows out through `-f ndjson`, one row a frame with the timings, and the
+picture to `-f null` or, for a verification run, to a file. Four
+variants, each at N of 2, 4 and 8:
+
+| variant | what it stands for |
+|---|---|
+| textures uploaded once, render only | the GPU-resident design: wave 3's steady state |
+| textures re-uploaded every frame through `write-texture` | today's wire, through wasi:webgpu: the ceiling without GPU frames |
+| render, then `map-async` readback of the 4K frame each tick | today's output path, until wave 3 hands textures back |
+| textures once, render only, animations idle | the floor: a document that changes nothing |
+
+The documents: the lbar document generalised, the programme over the
+whole frame and N minus one pictures in a grid or a picture-in-picture
+stack with `transform` animations running, the lower third sliding, the
+logo pulsing, `css_width` 1280 so the design scales as the README says.
+The same document file drives steps A and C.
+
+**What is recorded**, per frame and summarised over the run: `resolve`,
+`plan`, `paint_cmds` and the renderer's prepare time in the guest; GPU
+time from timestamp queries; bytes written through `write-buffer` and
+`write-texture`, counted in the backend; frames a second over the run;
+peak guest memory. The rows are the record; a script in the blitz
+repository turns them into the table below.
+
+**Pass.** At N of 8 on the 4090, render only: guest CPU under 8 ms a
+frame, GPU under 8 ms a frame, under 16 MB a frame across the wit, and
+the run holding 60 frames a second with the readback variant too. The L4
+is about a quarter of a 4090, so a 4090 result needs four times the
+margin to promise the hosted runner anything; the same bench runs there
+once the module exists.
+
+**If it fails.** GPU time over budget at N of 8 means `vello_gpu` is not
+the compositor for the video layers: a small WGSL pass composites the
+video rectangles and `vello_gpu` draws the graphics layer over them, with
+the document split at the video draws, which the probe already knows how
+to find. Guest CPU over budget means the single-threaded preparation is
+the problem, and the strip generation moves to the host or waits for
+threads on wasip2. Either outcome rewrites wave 3 before it starts; the
+sidecar's wave 0 and wave 2 stand regardless, since they do not depend on
+the renderer.
+
+**Prepared here, run there.** The backend crate skeleton, the bench
+documents, the rows schema and the summarising script can be written in
+this container; building `ffrwd-wasm` with the `gpu` feature and running
+the four variants happens on the owner's machine.
+
+## 4. Waves
 
 Each wave is dispatchable on its own and leaves the tree green. Numbers are
 estimates of the sidecar-side diff; the compiler side is listed with it.
@@ -340,7 +429,9 @@ Acceptance: at most ten copies per frame on the raw path at
 
 ### Wave 1: wgpu over wasi:webgpu
 
-Independent of the sidecar changes; can run in parallel with wave 2.
+The experiment's step B, finished: the backend covers the rest of the
+dispatch traits and gains tests. Independent of the sidecar changes; can
+run in parallel with wave 2.
 
 1. **The backend crate.** A new repository beside `ffrwd-node`: wgpu's
    `custom` dispatch traits over wit-bindgen bindings to the 0.0.1 wit in
@@ -355,15 +446,14 @@ Independent of the sidecar changes; can run in parallel with wave 2.
    `ffrwd-wasm --invoke` on a `-gpu` grant; `vello_gpu`'s test scenes
    rendered to a texture and compared against `vello_cpu` within a
    tolerance. These run on the GPU tier.
-4. **blitz on `anyrender_vello_hybrid`.** Build the module with the
-   backend, render to a texture, download it for now (`map-async` on a
-   readback buffer) and emit as today. The measurement that matters: a
-   rendered 4K frame's CPU time in the guest, since `wasm32-wasip2` has
-   no threads and `vello_gpu`'s preprocessing is single-threaded there.
+4. **blitz on `anyrender_vello_hybrid`.** The experiment's module made a
+   product: `compose` renders to a texture, downloads it for now
+   (`map-async` on a readback buffer) and emits as today, on the CPU path
+   when no `-gpu` grant is given.
 
-Acceptance: the lbar recipe renders on the GPU path with frames within
-tolerance of the CPU path; the guest-side CPU time per rendered 4K frame
-is under 8 ms on the owner's machine.
+Acceptance: the experiment's pass line holds (section 3), and the lbar
+recipe renders on the GPU path with frames within tolerance of the CPU
+path.
 
 ### Wave 2: libavcodec in the sidecar, packets on the wire
 
@@ -459,7 +549,7 @@ system memory on the path, by the profile rows.
   wgpu-hal, VideoToolbox encode. CoreML copies through ONNX Runtime
   regardless; inference stays wave 4's CUDA path or the CPU.
 
-## 4. Risks and open questions
+## 5. Risks and open questions
 
 - **wgpu's dispatch traits are not semver-stable.** The unreleased
   changelog already notes a breaking change for custom backend
@@ -499,7 +589,7 @@ system memory on the path, by the profile rows.
   hold ports, which are never conformed; host-memory ports keep the
   conform step and the refusal until `convert` serves them too.
 
-## 5. Measurements to take first
+## 6. Measurements to take first
 
 Before wave 0's code, on the owner's machine and the L4, with today's
 release:
