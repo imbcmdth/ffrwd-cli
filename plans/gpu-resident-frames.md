@@ -154,12 +154,15 @@ only. The sidecar has NUT already and ffmpeg keeps every container, so no
 lookup, context, send/receive, hw device and frames contexts, bitstream
 filters, option setting), written against the pinned version's headers.
 
-- Provisioning mirrors `cli/ffrwd/nn.py`: `ffrwd setup av`, a query that
-  reaches a `decode` or `encode` node fetches on its way, pinned URL,
-  sha256 and byte count per platform, under
-  `~/.cache/ffrwd/av-runtime/<version>/<platform>/`. `ffrwd-wasm --av-info`
-  answers the version the binary demands, as `--nn-info` does. Argv
-  `-av-runtime <dir>`, else `FFRWD_AV_RUNTIME`.
+- No setup step. The libraries ship inside each platform's sidecar wheel
+  beside the binary, and the sidecar finds them by its own path, so
+  `pip install ffrwd` stays the whole install. Argv `-av-runtime <dir>`,
+  else `FFRWD_AV_RUNTIME`, else the wheel's own directory, so a checkout
+  can point at a build of its own. `ffrwd-wasm --av-info` answers the
+  version the binary demands and where it found it, as `--nn-info` does.
+  A wheel cannot run code at install time, so bundling is what makes
+  this seamless; ONNX Runtime, at 72 MB to 1.4 GB and chosen by the
+  machine's driver, stays a first-use fetch (2.9).
 - The builds are ours and LGPL only: `--disable-everything`, the decoders
   and parsers for h264, hevc, av1, vp9, mpeg2, prores, the hardware
   codecs (`--enable-ffnvcodec` for nvdec and nvenc, which dlopen the
@@ -274,6 +277,30 @@ byte-checked recipes keep the software path, and GPU recipes are checked on
 the GPU runner with a per-path pin. CI stays on software: the unit tier and
 the exec tier run as today; the GPU tier is nightly on a machine with a card.
 
+### 2.9 Install and first use
+
+One step: `pip install ffrwd`, or `uvx ffrwd`. Both install wheels, and a
+wheel cannot run code at install time; an sdist with a `setup.py` hook
+could, but pip, uv and pipx build it in isolation with no promise of
+network, no progress display and a cached result, so a hook there fails
+silently and once. The seamless moment is therefore first use, which is
+how the project already works: static-ffmpeg fetches ffmpeg on the first
+call that needs it (`cli/ffrwd/binaries.py:125`), and the ONNX Runtime
+tiers are fetched by the first run that reaches a model (`cli/ffrwd/cli.py:1861`)
+and by `ffrwd install` of a package whose modules run one
+(`cli/ffrwd/packages.py:1564`), each saying what it fetches and how big.
+
+What changes:
+
+- libavcodec needs no fetch at all, since it ships in the sidecar wheel.
+- `ffrwd setup` with no argument fetches everything detection wants on
+  this machine, ffmpeg and the ONNX tiers, for a container image or a
+  machine about to lose its network; `setup nn` stays as the narrower
+  spelling. `FFRWD_OFFLINE=1` refuses any fetch with a message naming it.
+- A run that will fetch starts the download while it probes its inputs
+  rather than after compiling, so the first query's wait overlaps work
+  it was doing anyway.
+
 ## 3. Waves
 
 Each wave is dispatchable on its own and leaves the tree green. Numbers are
@@ -346,12 +373,17 @@ rawvideo copies on both sides before any GPU frame exists.
 1. **The shim.** `sidecar/runtime/src/av/`: dlopen of `libavcodec` and
    `libavutil` by full path from `-av-runtime`, version check against the
    pinned major, the function table, `--av-info`. Refusals name the
-   directory and `ffrwd setup av`, as `nn.rs` does.
-2. **Provisioning.** `cli/ffrwd/av.py` beside `nn.py`: pinned artifacts
-   per platform, `ffrwd setup av`, fetch on first run. The builds:
-   a workflow in a new repository producing the LGPL-only shared
-   libraries for the release matrix (`.github/workflows/release.yml`:
-   manylinux x86_64 and aarch64, musl, macOS, Windows).
+   directory looked in and the reinstall hint `cli/ffrwd/wasm.py` already
+   carries for a missing sidecar, as `nn.rs` names `ffrwd setup nn`.
+2. **The builds, in the wheel.** A workflow in a new repository produces
+   the LGPL-only shared libraries for the release matrix
+   (`.github/workflows/release.yml`: manylinux x86_64 and aarch64, musl,
+   macOS, Windows), each release pinned by URL, sha256 and byte count.
+   The sidecar's release workflow fetches the pinned set for its target
+   before `maturin build` and packages it beside the binary
+   (`sidecar/ffrwd-wasm/pyproject.toml`, maturin's `include`), with the
+   LGPL text. `cli/ffrwd/binaries.py` learns where the wheel put it the
+   way it finds the sidecar binary. No setup command for it.
 3. **`decode` and `encode` host nodes** with host-memory frames, in
    `host_nodes.rs` or files beside it, software codecs through the shim.
    Both are one instance, in order, as `codec.rs` runs a codec package.
@@ -446,8 +478,14 @@ system memory on the path, by the profile rows.
 - **Failure domain.** A decoder crash today takes one ffmpeg process; in
   the sidecar it takes the region. Decode on its own thread; keep the
   ffmpeg path as the fallback when no hardware device is present.
-- **LGPL.** Dynamic linking and a licence file in the fetched set are the
-  obligation; the builds must never carry `--enable-gpl`.
+- **LGPL.** Dynamic linking and the licence text beside the libraries in
+  the wheel are the obligation; the builds must never carry
+  `--enable-gpl`.
+- **Wheel size.** libavcodec and libavutil with the hardware codecs and a
+  modest decoder set add an estimated 10 to 20 MB per platform wheel,
+  well under PyPI's 100 MB file limit. The musl wheels load no NVIDIA
+  driver library, so they carry software codecs only, as they do for ONNX
+  Runtime today.
 - **The `ort` pin.** I/O binding in rc.10 is unverified. If absent, wave
   4 waits on a wasmtime-wasi-nn that moves `ort` forward.
 - **Pixel-exact tests.** GPU and CPU rasterization differ, hardware and
