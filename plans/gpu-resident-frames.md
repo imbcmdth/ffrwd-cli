@@ -447,6 +447,18 @@ and done where hands are free.
 6. **blitz on its own.** Reuse the output buffer instead of allocating per
    frame (`core/src/session.rs`); accept yuv420p for `v` and convert in
    the guest, halving the programme's wire.
+7. **ffmpeg's own GPU path, chosen by the compiler.** No sidecar in it.
+   On the pinned build 70 of 512 filters take hardware frames, each tied
+   to one API (11 `_cuda`, 17 `_vulkan`, 19 `_opencl`, 13 `_vaapi`, 7
+   `_qsv`, 3 `_amf`, and `libplacebo`); the other 440 are CPU and
+   `hwdownload` stands between. When an input is decoded with a hwaccel
+   and the COPY's encoder is a hardware one, the compiler substitutes the
+   hardware variant for the common filters between them (`scale`,
+   `overlay`, `pad`, `transpose`, the flips, `yadif`, `bwdif`) and sets
+   `-hwaccel_output_format`, so an ffmpeg-only query stays on the card
+   from decode to encode; a filter with no variant gets one `hwdownload`
+   and one `hwupload` around the whole CPU segment, never around each
+   filter. Placement already classes such a process as a GPU job.
 
 Acceptance: at most ten copies per frame on the raw path at
 `-jobs 1`, measured by the profile rows; 4K30 rgba passthrough through an
@@ -549,6 +561,18 @@ which is today's bound.
    no device, which is CI.
 6. **`convert`** for the cases 2.3 lists; the compositor samples NV12 and
    P010 planes itself, so a composite of decoded video runs no conversion.
+6a. **`filter`, a fourth host node: libavfilter's hardware subset on the
+   pool.** An ffmpeg GPU filter chain next to a region cannot share the
+   region's memory, so the filters a query puts beside a GPU module run
+   inside it. On Linux libavfilter's Vulkan device context is built over
+   the pool's own instance, device and queues, so the `_vulkan` filters
+   and libplacebo run on the pool's images with no interop; the `_cuda`
+   filters reach the pool through the same external-memory import the
+   inference providers use, on Linux and on the Windows D3D12 pool, where
+   no `_d3d12` filters exist; this build has no VideoToolbox filters. The
+   compiler maps a query's `ffmpeg.<name>` to the variant the pool has,
+   the node reports what engaged, and a filter with no variant on the
+   machine means a download at that filter's input, never the region.
 7. **The compiler.** `shapes.py` reads `memory`; partition routes by it;
    `placement_cost.py` counts sessions against the per-machine capacity;
    the lateral template picks a hardware encoder where one is; `GPU_JOBS`
