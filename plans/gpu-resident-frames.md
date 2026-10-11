@@ -12,7 +12,10 @@ grows to include decode and encode, and only the packets cross its edges.
 
 This file is the working plan. It names files and functions as they stand
 today so each wave can be dispatched on its own; where a design detail is
-still a sketch it says so.
+still a sketch it says so. The experiment of section 3 has run
+(`plans/experiment-compose-4k60-results.md`): the design's assumption
+holds, and this revision folds in what it measured and what a survey of
+the hardware the sidecar will meet changed.
 
 ## 1. Where the time goes today
 
@@ -66,6 +69,21 @@ Programme plus four feeds plus output at 4K60 rgba, about eight copies
 each, is 95 GB/s of memory traffic. That exceeds the machine. It is not a
 tuning problem.
 
+The experiment measured the two halves of that on an integrated Adreno,
+through the real module path (vello_hybrid in a module, wasi:webgpu
+underneath), at N of 8 inputs, 4K:
+
+| path | CPU a frame | GPU a frame | across the wit | fps |
+|---|---|---|---|---|
+| pictures resident on the GPU, render only | 1.6 ms | 4.9 ms | 1.4 MB | 126 |
+| pictures uploaded every frame (today's input wire) | 53 ms | 11.7 ms | 92 MB | 13 |
+| resident, plus a 4K readback each tick (today's output path) | 1.9 ms + 10.4 ms copy | 11.6 ms | 35 MB | 37 |
+
+The upload is 25x the resident variant's CPU; the readback caps the run
+at 37 fps whatever N is, and costs more than the rendering. Today's output
+path is the bound, so handing the frame back as a texture (wave 3) is
+worth more than trimming the raw path (wave 0).
+
 ## 2. Design
 
 ### 2.1 The shape of a run
@@ -84,10 +102,20 @@ as today, which is still a fraction of the current cost. A region whose entry
 is fed by something that cannot stream-copy (a filtered picture, a lateral
 that renders) takes the raw wire in and uploads once.
 
-Ownership: one wgpu device per sidecar process, created by the host, handed
-to every module's `wasi:webgpu` and to every worker; one CUDA context on the
-same physical device for libavcodec and ONNX Runtime; frames in a pool the
-host owns, referenced by handle, released by credit.
+Ownership: one wgpu device per sidecar process, created by the host on the
+platform's native API (D3D12 on Windows, Vulkan on Linux and Android, Metal
+on macOS), handed to every module's `wasi:webgpu` and to every worker; the
+decoder, the encoder and the inference provider on the same physical device
+through that API's own sharing; frames in a pool the host owns, referenced
+by handle, released by credit.
+
+Zero transfer, not zero copy. Every hardware decoder emits NV12 or P010
+and pyrowave emits YUV, so one device-local pass per input, in the
+compositor's sampling or in a conversion, is the floor; what the design
+removes is every trip through system memory and every byte across a pipe
+or the wit. On unified-memory parts the readback the experiment measured
+is untiling into uncached memory, not a bus transfer, so zero transfer
+there means staying in tiled, cached allocations.
 
 ### 2.2 The world: `ffrwd:av@0.20.0`
 
@@ -96,9 +124,13 @@ memory, as it does today. A sketch, to be settled in wave 3:
 
 - `node-types.accepts` gains `memory: frame-memory`, `enum frame-memory
   { host, gpu }`, default `host`. A `gpu` input port's `pixel-formats`
-  name the texture format the frames are handed in, `rgba` (rgba8unorm) in
-  the first cut, `nv12` later as two planes. `output-port.format` gains the
-  same field for an output the module writes on the GPU.
+  name what the frames are handed as: `nv12` and `p010`, the decoder's own
+  planes as two textures (r8 and rg8, or r16 and rg16) with the stream's
+  colour, which a compositor samples directly and which costs no pass; or
+  `rgba`, which the host converts once per source frame for a module that
+  asks. `output-port.format` gains the same field for an output the module
+  writes on the GPU; an output written as `rgba` is converted ahead of an
+  encoder that takes NV12 only.
 - A new interface, `gpu-frames`, imported only by modules that read frames
   on the GPU, so `node-tick` and `node` stay free of the webgpu dependency:
 
@@ -121,6 +153,12 @@ memory, as it does today. A sketch, to be settled in wave 3:
   A module's `required-features` and limits are checked against it.
 - `ffrwd/wasm@0.20.0` published; `ffrwd-node` SDK gains the `gpu` port
   builder and a `Tick::texture` helper.
+- The `wasi:webgpu` the sidecar hosts is no longer upstream's 0.0.1 as
+  published: the experiment added `gpu-command-encoder.write-timestamp`
+  and `gpu-queue.get-timestamp-period`, and filled `get-compilation-info`
+  and the texture getters. It is versioned as ffrwd's own package, a
+  superset of 0.0.1, and a guest binds the sidecar's vendored copy by
+  path so guest and host cannot drift.
 
 ### 2.3 Host nodes
 
@@ -140,10 +178,12 @@ Three nodes the host answers for, following `sidecar/ffrwd-wasm/src/host_nodes.r
   `bufsize`, `keyint_min`, `codec_params`), mapped to libavcodec's
   AVOptions by the same names ffmpeg's CLI uses.
 - `convert`: GPU colour and size conversion the host runs for itself,
-  never named in a query: NV12 to rgba8 when a `gpu` port asks for rgba,
-  rgba8 to NV12 ahead of NVENC, resize for `accepts.like`. WGSL compute
-  on the host device, one pass per source frame, cached on the frame so
-  every reader of that frame shares it.
+  never named in a query: NV12 or P010 to rgba8 when a `gpu` port asks for
+  rgba, rgba8 to NV12 ahead of an encoder that takes nothing else, resize
+  for `accepts.like`, and the unpack of a capture card's packed 4:2:2.
+  WGSL on the host device, one pass per source frame, cached on the frame
+  so every reader shares it. A compositor that samples the decoder's
+  planes itself needs none of it, which is the common case.
 
 ### 2.4 libavcodec in the sidecar
 
@@ -166,75 +206,99 @@ filters, option setting), written against the pinned version's headers.
 - The builds are ours and LGPL only: `--disable-everything`, the decoders
   and parsers for h264, hevc, av1, vp9, mpeg2, prores, the hardware
   codecs (`--enable-ffnvcodec` for nvdec and nvenc, which dlopen the
-  driver's own libraries; `d3d12va`, `d3d11va` and `amf` on Windows;
-  `videotoolbox` on macOS; `vaapi` on Linux), no `--enable-gpl`, no
+  driver's own libraries; `d3d12va`, `d3d11va`, `mediafoundation` and
+  `amf` on Windows; `videotoolbox` on macOS; `vulkan` and `vaapi` on
+  Linux; `mediacodec` on Android), no `--enable-gpl`, no
   `--enable-nonfree`, no external encoders. Dynamic linking keeps the
   LGPL obligation to shipping the library and its licence.
-- The hardware frame pool and device: `av_hwdevice_ctx` created from the
-  sidecar's own CUDA context (`AVCUDADeviceContext.cuda_ctx`), so
-  libavcodec, ONNX Runtime and the Vulkan interop share one context on
-  one physical device, chosen by UUID to match the wgpu adapter.
+- The hardware device is the sidecar's own, handed to libavcodec through
+  `av_hwdevice_ctx` on each platform: the D3D12 device wgpu created on
+  Windows (`d3d12va`, with `d3d11va` and Media Foundation on the adapters
+  that have no D3D12 decode, the Snapdragon among them), the Vulkan device
+  on Linux (`vulkan` decode on NVIDIA, which writes straight into
+  VkImages; `vaapi` elsewhere, imported through DMA-BUF), VideoToolbox on
+  macOS. A CUDA context is created beside the Vulkan device only where an
+  inference provider needs one, matched by UUID.
+- Decoder and encoder sessions are a capacity, not a count of engines:
+  integrated parts cap concurrent sessions (the experiment's Snapdragon
+  decodes 4K120 and encodes 4K60, or one 4K60 decode beside two 4K30
+  encodes), and the compiler's placement reads the cap per machine the
+  way it reads NVDEC and NVENC engines today.
 
-### 2.5 The frame pool and interop
+### 2.5 The frame pool and interop, per platform
 
 - `TickFrame.data` and `OutFrame.data` (`sidecar/runtime/src/node.rs:362`,
   `:423`) become an enum: `Host(Arc<Vec<u8>>)` or `Gpu(Arc<GpuFrame>)`. A
-  `GpuFrame` is one slot of a pool: a Vulkan image the host allocated on
-  the wgpu device with export flags, its CUDA import, the format, the
-  colour, and a refcount the lanes' credit reads
-  (`sidecar/ffrwd-wasm/src/lanes.rs`).
-- Decode on CUDA: NVDEC writes NV12 into libavcodec's own frames; the
-  host copies device to device into a pool slot (about 0.05 ms for 12 MB
-  on an L4), converts to the format the reader asked for, and synchronises
-  with a stream sync in the first cut, CUDA external semaphores to Vulkan
-  timeline semaphores later. Decoding straight into Vulkan images is not
-  attempted.
-- Encode on CUDA: the pool slot is wrapped as an `AV_PIX_FMT_CUDA` frame
-  on a frames context over the same memory; NVENC takes NV12 or rgba
-  directly. The convert pass to NV12 runs first so the matrix is ours.
+  `GpuFrame` is one slot of a pool: a native image the host allocated on
+  the wgpu device, its planes, format and colour, the handle the decoder
+  or encoder wrote or reads it through, and a refcount the lanes' credit
+  reads (`sidecar/ffrwd-wasm/src/lanes.rs`).
+- The backend is chosen at the start, per platform, and the interop is
+  that API's own; the matrix replaces the earlier Vulkan-and-CUDA sketch:
+
+  | platform | device | decode into the pool | encode from it | the guest's texture |
+  |---|---|---|---|---|
+  | Windows | D3D12 | `d3d12va` and `d3d11va` textures, shared handles across the two APIs; Media Foundation where libavcodec has no hwaccel for the part | NVENC, AMF, QSV and Media Foundation from D3D12 or D3D11 textures | wgpu-hal dx12 wraps the resource |
+  | Linux | Vulkan | `vulkan` decode writes VkImages directly on NVIDIA; `vaapi` surfaces imported as DMA-BUF | NVENC from a CUDA import of the exported image where Vulkan encode is absent; VAAPI from the DMA-BUF | wgpu-hal vulkan wraps the image |
+  | Android | Vulkan | AHardwareBuffer import | MediaCodec from the buffer | the same |
+  | macOS | Metal | VideoToolbox IOSurfaces | VideoToolbox from the IOSurface | wgpu-hal metal wraps the texture |
+
+  `runtime/src/gpu.rs` tries Vulkan before D3D12 today; on Windows the
+  order flips, since every decoder there is a D3D11 or D3D12 object.
+- Synchronisation is the API's: fences and shared semaphores where the
+  decoder and the device are two objects, a stream sync on the CUDA
+  import in the first cut, timeline semaphores later. A device-to-device
+  copy into a pool slot stays as the fallback for a decoder that cannot
+  write a shared image (about 0.05 ms for 12 MB on an L4).
 - A texture for the guest: `wgpu_core`'s `create_texture_from_hal` over
-  the pool slot's image, pushed into the module's wasi:webgpu resource
-  table for the tick, the way `trait_impls.rs` holds every texture by its
-  core id. Handed back through `emit-texture`, the resource's core id
-  names the slot, and the host takes it.
+  the slot's image, one view per plane, pushed into the module's
+  wasi:webgpu resource table for the tick, the way `trait_impls.rs` holds
+  every texture by its core id. Handed back through `emit-texture`, the
+  resource's core id names the slot, and the host takes it.
 - Bounds: a pool is counted in frames, not bytes, eight to sixteen per
   stream, with the TCP and credit backpressure that `hold.rs`'s
   `MAX_HELD_FRAMES` and `MAX_HELD_BYTES` give today; a port feed that
-  outruns its reader waits on its socket as now. A 4K pool slot is 12 MB
-  as NV12 and 33 MB as rgba8, so an L4's 24 GB holds hundreds, but a
-  `page` rendering ahead of the `compose` holding it must be held back by
-  credit, which it is not today (blitz README, limitations).
+  outruns its reader waits on its socket as now. A 4K slot is 12 MB as
+  NV12, so an L4's 24 GB holds hundreds, but a `page` rendering ahead of
+  the `compose` holding it must be held back by credit, which it is not
+  today (blitz README, limitations).
+- Warm-up: the first frame costs 100 ms, 850 ms with eight 4K inputs, in
+  pipeline compilation and first uploads. A run absorbs it before its
+  clock starts: the host ticks a GPU region once with its first frames
+  held and starts the clock on the second.
 
 ### 2.6 The guest: wgpu over wasi:webgpu
 
-A wgpu custom backend crate over the `wasi:webgpu@0.0.1` wit the sidecar
-hosts, so any wgpu-based crate runs in a module unchanged. wgpu routes every
-call through object-safe dispatch traits and its `custom` cargo feature lets
-a crate outside wgpu implement them; `Dispatch*::custom(t)` and `as_custom`
-wrap a backend object into a public wgpu type.
+This is code. `wgpu-wasi-webgpu`, on the blitz repository's
+`bench-compose-4k60` branch under `backend/`, implements wgpu 29's
+`custom` dispatch traits over wit-bindgen bindings to the sidecar's
+vendored wit, scoped to what vello_hybrid calls: about 1,200 lines with
+the conversions; render bundles, surfaces, acceleration structures,
+binding arrays, pipeline caches, immediates, multi-draw and timestamps
+inside passes are `todo!()`. The 0.0.1 wit's copy-based mapping maps onto
+wgpu's mapped ranges directly: a read mapping is the Vec
+`get-mapped-range-get-with-copy` returns, a write mapping goes back
+through `get-mapped-range-set-with-copy` when wgpu drops the range. Every
+list crossing the wit is counted, which is where the experiment's `wit`
+column came from. Any wgpu-based crate runs in a module on it unchanged;
+what remains is the rest of the traits, tests, and a repository of its own.
 
-| piece | size |
-|---|---|
-| dispatch traits to implement | 29 traits, about 160 required methods, many empty |
-| wgpu's browser backend, the template | about 4,000 lines |
-| wasi:webgpu 0.0.1 as the sidecar hosts it | 38 resources, 218 functions |
+Two things a module on it needs: wgpu without its `webgpu` default
+feature on a wasm32 target (that feature compiles the browser backend,
+whose wasm-bindgen imports a wasip2 component cannot carry; the blitz
+branch vendors wgpu with that one change until the crate takes a feature
+for it), and the guest's wgpu pinned to what its renderer pins, with the
+host's wgpu-core version irrelevant behind the wit.
 
-The browser backend already copes with every deviation 0.0.1 makes from
-the IDL: `write-buffer-with-copy` takes a byte slice as the browser call
-does; `get-mapped-range-get-with-copy` returns a Vec, the browser backend's
-own copy-to-Vec pattern; `map-async` blocks on this host so `poll` is a
-no-op as on the web. wasi-gfx's own wgpu fork, "a wgpu fork with
-wasi-webgpu backend", is the starting point, retargeted to the `custom`
-hook and the 0.0.1 wit. The guest's wgpu version is whatever its renderer
-pins; the host stays on wgpu-core 29 behind the wit. Nothing aligns.
-
-blitz then swaps `anyrender_vello_cpu` for `anyrender_vello_hybrid`
-(`vello_gpu`: CPU preprocessing, GPU rasterization, external textures with
-atlas support), renders to a texture instead of a Vec, and wraps each held
-input's texture from `gpu-frames.texture` with `DispatchTexture::custom`.
-The probe, bypass and everything above the rasterizer stay as they are.
-Per-frame traffic across the wit becomes the strip and alpha buffers, a few
-megabytes at most.
+blitz on it: `anyrender_vello_hybrid` 0.10.0 matches blitz's pins exactly,
+so nothing in blitz changed for the renderer; two methods were added to
+blitz core so a picture can be handed back under the same blob id, which
+is what the hybrid renderer caches an upload by. The product version of
+`compose` renders to a texture, draws each held input from
+`gpu-frames.texture` as an external texture, and hands the output back
+through `emit-texture`; the probe, bypass and everything above the
+rasterizer stay as they are. Measured per-frame traffic across the wit:
+1.4 MB at N of 8.
 
 ### 2.7 The compiler
 
@@ -257,9 +321,10 @@ megabytes at most.
   source's own size otherwise. The listener (`feeds.rs:328`) accepts coded
   video and routes it through `decode`. A `gpu` hold port is never conformed.
 - Placement (`cli/ffrwd/placement_cost.py`): a region holding `decode` and
-  `encode` counts one NVDEC and one NVENC session each against the caps it
-  already models; `gpu_processes` in `placement.py` treats such a region as
-  on a GPU.
+  `encode` counts one decode and one encode session each against a cap
+  that is per machine and per part, the NVDEC and NVENC engines it models
+  today being one row of it; `gpu_processes` in `placement.py` treats such
+  a region as on a GPU.
 - Grants: a module with a `gpu` port imports `wasi:webgpu` and needs `-gpu`
   as today; a region with `decode` or `encode` is spawned with
   `-av-runtime`. `GPU_JOBS` (`wasm.py:420`) stops meaning anything once the
@@ -301,94 +366,51 @@ What changes:
   rather than after compiling, so the first query's wait overlaps work
   it was doing anyway.
 
-## 3. The experiment: blitz at 4K60 on the GPU, before anything else
+## 3. The experiment: blitz at 4K60 on the GPU
 
-The design rests on one assumption that nothing above has measured: that
-`vello_gpu`, driven from a module through wasi:webgpu, composites a 4K60
+The design rested on one assumption nothing had measured: that
+vello_hybrid, driven from a module through wasi:webgpu, composites a 4K60
 document over several video textures inside the frame budget, with the
 guest's single-threaded CPU share small enough to leave room for the rest
-of the tick. The experiment settles that before any sidecar work starts.
-It runs on the owner's machine; this container has no GPU.
+of the tick. `plans/experiment-compose-4k60.md` is the brief;
+`plans/experiment-compose-4k60-results.md` is the run, on an integrated
+Adreno X1-85 under Windows on aarch64, 2026-10-10, native and then in a
+module under `ffrwd-wasm` with its `-gpu` grant.
 
-**Question.** For a document showing N video inputs, N in 2, 4 and 8, at
-3840x2160, with an L-bar cycle, a lower third and a pulsing logo animating
-every frame: what does one rendered frame cost in guest CPU time, in GPU
-time and in bytes crossing the wit, and does it hold 60 frames a second
-over 600 frames?
+The pass line was written for a 4090; on the integrated part it reads:
 
-**Step A, native baseline.** Hours, no new infrastructure. A bench binary
-in the blitz repository beside `core/tests/compose`, using
-`anyrender_vello_hybrid` on native wgpu: the same documents, N textures
-uploaded once, wgpu timestamp queries for GPU time, `Instant` around
-resolve, plan, paint commands and `vello_gpu`'s preparation for CPU time,
-with and without a readback of the frame. This answers whether the
-renderer is up to the task at all, on a 4090 and then on the L4. The wasm
-run then measures only what wasi adds.
+| pass line, N of 8, render only | measured, wasm | |
+|---|---|---|
+| guest CPU under 8 ms a frame | 1.6 ms (p99 3.5) | holds, 5x margin |
+| GPU under 8 ms a frame | 4.9 ms median, p99 11.7 | holds at the median |
+| under 16 MB a frame across the wit | 1.4 MB | holds, 11x margin |
+| 60 fps held over 600 frames | 126 fps, one miss (frame 0) | holds |
+| 60 fps with a 4K readback each tick | 37 fps | does not hold here |
 
-**Step B, the backend, just enough.** The wgpu custom backend crate over
-`wasi:webgpu@0.0.1` from 2.6, scoped to what `vello_gpu` calls: instance,
-adapter, device, queue, buffers, textures and views, samplers, bind
-groups, pipeline layouts, shader modules, compute and render pipelines,
-command encoders, compute and render passes, copies, `write-buffer`,
-`write-texture`, `map-async` with the copy-based mapped range, submit,
-`on-submitted-work-done`, query sets. Render bundles, surfaces and
-acceleration structures stay `todo!()`. Two references: wgpu's browser
-backend for the dispatch-trait structure, which is current, and
-wasi-gfx's fork, `wgpu/src/backend/wasi_webgpu.rs`, which targets this
-same 0.0.1 wit but is wgpu 0.19 on the old monolithic `Context` trait, so
-its type conversions and its copy-based mapping carry over and its
-structure does not. Pinned to the wgpu `vello_gpu` pins. Host gaps filled
-alongside: `write-timestamp` so GPU time can be read, and
-`get-compilation-info` so a WGSL error is a message and not a trap.
+So the assumption stands on the hardware weakest for it, and neither
+failure branch is taken: the GPU is not over budget, so vello_hybrid stays
+the compositor for the video layers and the picture count barely moves
+the cost (N of 2 to 8 adds 0.4 ms of CPU and 0.5 ms of GPU); the guest CPU
+is not over budget, so strip generation stays in the guest. The wasm run
+costs 1.35x the native one per frame, 0.7 ms of it the strip and alpha
+lists crossing the wit and 1.1 ms the host's own submit path. The picture
+is right: a frame from the module differs from the native dump in 3 of
+8.3 million pixels, by one level, rasterisation rounding.
 
-**Step C, the wasm run.** blitz's module built with the backend, as a
-source node in the shape of `page`: no inputs, N textures the module
-makes itself, `fps` 60, 3840x2160. Run under `ffrwd-wasm` with `-gpu`,
-rows out through `-f ndjson`, one row a frame with the timings, and the
-picture to `-f null` or, for a verification run, to a file. Four
-variants, each at N of 2, 4 and 8:
+The line that fails is the one the design exists to retire: the readback
+of the 4K frame each tick costs more than rendering it, 11.6 ms of GPU and
+10.4 ms of guest copy with 33 MB across the wit, and today's output path
+sits at 37 fps whatever N is. The upload variant says the same of the
+input side at 53 ms of CPU and 92 MB a frame. GPU-resident frames are the
+difference between 13 and 126 fps on this machine.
 
-| variant | what it stands for |
-|---|---|
-| textures uploaded once, render only | the GPU-resident design: wave 3's steady state |
-| textures re-uploaded every frame through `write-texture` | today's wire, through wasi:webgpu: the ceiling without GPU frames |
-| render, then `map-async` readback of the 4K frame each tick | today's output path, until wave 3 hands textures back |
-| textures once, render only, animations idle | the floor: a document that changes nothing |
-
-The documents: the lbar document generalised, the programme over the
-whole frame and N minus one pictures in a grid or a picture-in-picture
-stack with `transform` animations running, the lower third sliding, the
-logo pulsing, `css_width` 1280 so the design scales as the README says.
-The same document file drives steps A and C.
-
-**What is recorded**, per frame and summarised over the run: `resolve`,
-`plan`, `paint_cmds` and the renderer's prepare time in the guest; GPU
-time from timestamp queries; bytes written through `write-buffer` and
-`write-texture`, counted in the backend; frames a second over the run;
-peak guest memory. The rows are the record; a script in the blitz
-repository turns them into the table below.
-
-**Pass.** At N of 8 on the 4090, render only: guest CPU under 8 ms a
-frame, GPU under 8 ms a frame, under 16 MB a frame across the wit, and
-the run holding 60 frames a second with the readback variant too. The L4
-is about a quarter of a 4090, so a 4090 result needs four times the
-margin to promise the hosted runner anything; the same bench runs there
-once the module exists.
-
-**If it fails.** GPU time over budget at N of 8 means `vello_gpu` is not
-the compositor for the video layers: a small WGSL pass composites the
-video rectangles and `vello_gpu` draws the graphics layer over them, with
-the document split at the video draws, which the probe already knows how
-to find. Guest CPU over budget means the single-threaded preparation is
-the problem, and the strip generation moves to the host or waits for
-threads on wasip2. Either outcome rewrites wave 3 before it starts; the
-sidecar's wave 0 and wave 2 stand regardless, since they do not depend on
-the renderer.
-
-**Prepared here, run there.** The backend crate skeleton, the bench
-documents, the rows schema and the summarising script can be written in
-this container; building `ffrwd-wasm` with the `gpu` feature and running
-the four variants happens on the owner's machine.
+What carries forward is in the results file's last section and folded in
+above: the per-platform matrix (2.5), the host's wit additions and the
+backend as code (2.2, 2.6), YUV planes as the frames a compositor samples
+(2.2, 2.3), the warm-up (2.5), session caps as a capacity (2.4, 2.7), the
+inference matrix (wave 4), and two candidates to measure (wave 5). The
+same harness runs unchanged on the 4090 and the L4, where the GPU and
+readback columns should fall by several times and the CPU columns stay.
 
 ## 4. Waves
 
@@ -397,7 +419,10 @@ estimates of the sidecar-side diff; the compiler side is listed with it.
 
 ### Wave 0: measure, then trim the raw path
 
-No interface change. Everything here is worth shipping alone.
+No interface change. Everything here is worth shipping alone, and none of
+it is the bound: the experiment put today's limit on the output copy,
+which only wave 3 removes, so this wave is scheduled behind waves 1 to 3
+and done where hands are free.
 
 1. **Profile rows.** Per stage, bytes copied and time: pipe read, demux,
    hold, fetch, process, lift, mux write. Rows behind `ffrwd:row` as the
@@ -427,33 +452,36 @@ Acceptance: at most ten copies per frame on the raw path at
 `-jobs 1`, measured by the profile rows; 4K30 rgba passthrough through an
 `invert` module at real time on the owner's machine.
 
-### Wave 1: wgpu over wasi:webgpu
+### Wave 1: wgpu over wasi:webgpu, finished
 
-The experiment's step B, finished: the backend covers the rest of the
-dispatch traits and gains tests. Independent of the sidecar changes; can
-run in parallel with wave 2.
+The experiment's backend made a product. Independent of the sidecar
+changes; can run in parallel with wave 2.
 
-1. **The backend crate.** A new repository beside `ffrwd-node`: wgpu's
-   `custom` dispatch traits over wit-bindgen bindings to the 0.0.1 wit in
-   `sidecar/vendor/wasi-webgpu-wasmtime/wit/deps/`. Start from wasi-gfx's
-   wgpu fork's backend file. Pinned to the wgpu version `vello_gpu` pins.
-2. **Host gaps.** `get-compilation-info` implemented so WGSL errors reach
-   the guest (`trait_impls.rs:914`); texture getters implemented
-   (`:789` to `:838`) although wgpu caches descriptors; `write-timestamp`
-   only if a profiler needs it.
-3. **Tests.** wgpu's `hello-compute` and `hello-triangle` rendering to a
+1. **The crate's own repository** beside `ffrwd-node`, moved from
+   `backend/` on the blitz branch, pinned per wgpu release with the
+   renderer that uses it; wgpu's `webgpu` default feature handled by a
+   feature of the crate rather than a vendored wgpu.
+2. **The rest of the traits.** Compute passes, index buffers, render
+   bundles, query sets inside passes and the remaining `todo!()`s, so a
+   module that is not vello_hybrid runs too.
+3. **The host's wit as ffrwd's package.** The additions the experiment
+   made in `sidecar/vendor/wasi-webgpu-wasmtime` (`write-timestamp`,
+   `get-timestamp-period`, compilation info, texture getters) versioned as
+   a superset of 0.0.1 and published with `ffrwd/wasm`, so a guest binds a
+   package and not a path.
+4. **Tests.** wgpu's `hello-compute` and `hello-triangle` rendering to a
    texture, built for `wasm32-wasip2`, run as value modules through
-   `ffrwd-wasm --invoke` on a `-gpu` grant; `vello_gpu`'s test scenes
+   `ffrwd-wasm --invoke` on a `-gpu` grant; vello_hybrid's test scenes
    rendered to a texture and compared against `vello_cpu` within a
-   tolerance. These run on the GPU tier.
-4. **blitz on `anyrender_vello_hybrid`.** The experiment's module made a
-   product: `compose` renders to a texture, downloads it for now
-   (`map-async` on a readback buffer) and emits as today, on the CPU path
-   when no `-gpu` grant is given.
+   tolerance; the experiment's bench kept as the GPU tier's benchmark.
+5. **blitz on `anyrender_vello_hybrid` as a release.** `compose` renders
+   to a texture and downloads it (`map-async` on a readback buffer) until
+   wave 3 hands textures back; the CPU path stays when no `-gpu` grant is
+   given. The two blitz core methods from the experiment land in main.
 
-Acceptance: the experiment's pass line holds (section 3), and the lbar
-recipe renders on the GPU path with frames within tolerance of the CPU
-path.
+Acceptance: the experiment's harness runs on the GPU tier from the
+published crates, and the lbar recipe renders on the GPU path with frames
+within tolerance of the CPU path.
 
 ### Wave 2: libavcodec in the sidecar, packets on the wire
 
@@ -477,6 +505,9 @@ rawvideo copies on both sides before any GPU frame exists.
 3. **`decode` and `encode` host nodes** with host-memory frames, in
    `host_nodes.rs` or files beside it, software codecs through the shim.
    Both are one instance, in order, as `codec.rs` runs a codec package.
+   The hwaccel per platform from 2.4 is wired here even though frames stay
+   in host memory until wave 3, so the session caps (2.4) are learned and
+   the compiler's capacity model has numbers.
 4. **The wire.** `processes.py` partition takes coded edges into and out
    of a region that declares it (a module option in this wave, the
    `memory` field in the next); `-c:v copy` on both ffmpegs. `feeds.rs`
@@ -495,59 +526,87 @@ encode input).
 
 ### Wave 3: GPU frames
 
+Unblocked by the experiment; the first thing it buys is the output path,
+which is today's bound.
+
 1. **World 0.20.0** as in 2.2; `ffrwd/wasm@0.20.0`; `ffrwd-node` builders;
    the host adapts every older world as `host`.
-2. **The pool.** `node.rs` enum; `GpuFrame`; pool per stream with the
-   count bound; credit in `lanes.rs`; `hold.rs` holds handles. Source
-   nodes held by a hold input are held back by credit (the `page` into
-   `compose` case).
-3. **CUDA and Vulkan.** Device selection by UUID across wgpu, CUDA and
-   libavcodec; the exported Vulkan image per slot; CUDA import; the
-   device-to-device copy from NVDEC's frame; stream sync.
-4. **`convert`.** WGSL kernels on the host device: NV12 to rgba8 with the
-   stream's matrix and range, rgba8 to NV12, resize. Cached per frame.
-5. **`decode` and `encode` on hardware.** `hw` option; `AV_PIX_FMT_CUDA`
-   frames over the pool; NVENC from a slot; fallback to wave 2's software
-   path when the machine has no device, which is CI.
-6. **Textures for the guest.** `gpu-frames.texture` over
-   `create_texture_from_hal`; `emit-texture`; `payload::gpu-frame`;
-   `same` over GPU frames.
+2. **The pool.** `node.rs` enum; `GpuFrame` with planes; pool per stream
+   with the count bound; credit in `lanes.rs`; `hold.rs` holds handles.
+   Source nodes held by a hold input are held back by credit (the `page`
+   into `compose` case). The warm-up tick before the clock starts.
+3. **The backend per platform** (2.5): D3D12 first on Windows in
+   `runtime/src/gpu.rs`, Vulkan on Linux, Metal on macOS; the decoder's
+   images wrapped as the pool's slots on each, with the device-to-device
+   copy as the fallback. Linux on the L4 and Windows on the owner's
+   machines are the two done first; macOS follows on the same shape.
+4. **Textures for the guest.** `gpu-frames.texture` over
+   `create_texture_from_hal`, one view per plane; `emit-texture`;
+   `payload::gpu-frame`; `same` over GPU frames.
+5. **`decode` and `encode` on hardware.** `hw` option; the pool's slots as
+   the decoder's output and the encoder's input through each platform's
+   frames context; fallback to wave 2's software path when the machine has
+   no device, which is CI.
+6. **`convert`** for the cases 2.3 lists; the compositor samples NV12 and
+   P010 planes itself, so a composite of decoded video runs no conversion.
 7. **The compiler.** `shapes.py` reads `memory`; partition routes by it;
-   `placement_cost.py` counts the sessions; the lateral template picks a
-   hardware encoder where one is; `GPU_JOBS` removed.
-8. **blitz.** Held inputs from `gpu-frames.texture`, output through
-   `emit-texture`, bypass by `same`. The lbar recipe at 4K60 with a 4K
-   programme and two 1080p feeds is the benchmark.
+   `placement_cost.py` counts sessions against the per-machine capacity;
+   the lateral template picks a hardware encoder where one is; `GPU_JOBS`
+   removed.
+8. **blitz.** Held inputs from `gpu-frames.texture` as YUV planes drawn by
+   vello_hybrid's external-texture path with the matrix in the sampling,
+   output through `emit-texture`, bypass by `same`. The experiment's
+   document at N of 8 is the benchmark, with real decoded inputs.
 9. **Tests.** A test module beside `modules/gpu-probe` that reads a GPU
    frame, draws on it, hands it back; byte-checked on the GPU tier against
-   a pinned output; the profile rows showing zero host-side frame copies
-   on the path.
+   a pinned output per platform; the profile rows showing zero host-side
+   frame copies on the path.
 
-Acceptance: the benchmark recipe runs at real time on the L4 with the
-encoder as the only thing above 50% of its engine; no raw frame bytes in
-system memory on the path, by the profile rows.
+Acceptance: the benchmark recipe runs at real time on the L4 and on the
+owner's Windows machine with the encoder as the only thing above 50% of
+its engine; no raw frame bytes in system memory on the path, by the
+profile rows; the readback and upload rows of the experiment's table gone.
 
 ### Wave 4: inference on the GPU
 
 1. An `ffrwd:av/gpu-nn` extension beside standard `wasi:nn`: a tensor
-   from a `gpu-buffer`, an output bound to one. ONNX Runtime I/O binding
-   on CUDA in the vendored backend (`vendor/wasmtime-wasi-nn`); check
-   first whether the pinned `ort` rc.10 exposes it, since wasmtime-wasi-nn
-   48 holds that pin.
-2. `convert` gains planar fp32 at a model's input size, so preprocessing
-   never touches the CPU.
-3. The depth and segment modules read a GPU frame, run the model from a
-   buffer, and write their rows; outputs the size of a mask come back by
-   handle, boxes by `fetch`.
+   from a `gpu-buffer`, an output bound to one. In the vendored backend
+   (`vendor/wasmtime-wasi-nn`), per provider:
 
-### Wave 5: Windows and macOS
+   | provider | how the compositor's memory reaches it |
+   |---|---|
+   | DirectML | binds D3D12 buffers directly: the one provider with no import step |
+   | CUDA, TensorRT, ROCm | external-memory import of the exported image or buffer |
+   | OpenVINO | remote tensors over VA surfaces, DMA-BUFs and D3D11 textures |
+   | CoreML through ONNX Runtime | copies; zero transfer on Apple is CoreML directly with an IOSurface-backed pixel buffer |
+   | WebGPU provider | the universal fallback (Mali, Adreno on Linux): the model runs on the same device as the compositor |
+   | NPUs | host memory; a download at the region's boundary |
 
-- Windows: `d3d12va` decode, DirectML through ONNX Runtime on the same
-  D3D12 device, wgpu on D3D12 with shared resources, NVENC from D3D12
-  textures. Avoids the 1.4 GB CUDA tier entirely.
-- macOS: VideoToolbox decode to IOSurface, Metal textures through
-  wgpu-hal, VideoToolbox encode. CoreML copies through ONNX Runtime
-  regardless; inference stays wave 4's CUDA path or the CPU.
+   The open check stands: whether the pinned `ort` rc.10 exposes I/O
+   binding to foreign device memory; if not, wave 4 waits on a
+   wasmtime-wasi-nn that moves `ort` forward.
+2. Preprocessing is a device pass whose buffer is what gets bound:
+   `convert` gains planar fp32 at a model's input size.
+3. Image-sized outputs are bound to device buffers and read as textures;
+   boxes and scalars come back by `fetch`. The depth and segment modules
+   read a GPU frame, run the model from a buffer, and write their rows.
+
+### Wave 5: two candidates to measure
+
+Neither is in the design yet; each is a measurement on the GPU tier that
+decides whether it joins.
+
+- **Pyrowave as the wire between GPU regions.** Intra-only, YUV 4:2:0 or
+  4:4:4, 5 to 50x smaller than raw, decoding to a texture on the
+  consumer's device. Textures inside a region, pyrowave packets across an
+  edge between two GPU regions, raw only at an edge that ends in CPU code.
+  To measure on the round-trip module: per-hop GPU time at 4K, generation
+  loss over three hops, and alpha, which it lacks.
+- **Capture and playout cards as pool producers and consumers.** DeckLink
+  GPUDirect and DirectGMA on x86 pro cards, Rivermax for SMPTE 2110:
+  packed 4:2:2 buffers by DMA with no CPU, plus `convert`'s unpack pass.
+  To measure: latency from the card's frame to the compositor's tick, and
+  whether the pool's count bound holds under a card's own pacing.
 
 ## 5. Risks and open questions
 
@@ -555,16 +614,28 @@ system memory on the path, by the profile rows.
   changelog already notes a breaking change for custom backend
   implementers. The backend crate is pinned per wgpu release with the
   renderer that uses it.
-- **`wasm32-wasip2` has no threads.** `vello_gpu`'s CPU preprocessing is
-  single-threaded in the guest. It scales with the page's geometry, not
-  its pixels; wave 1 measures it at 4K before anything depends on it.
+- **`wasm32-wasip2` has no threads.** `vello_hybrid`'s CPU preprocessing
+  is single-threaded in the guest. Measured: 1.6 ms a frame at 4K with
+  eight inputs, 1.7x the native figure, and it scales with the page's
+  geometry rather than its pixels. Closed for the compositor; open for a
+  module whose CPU side is heavier.
+- **Timestamp queries bracket the whole submission on some drivers.** On
+  the experiment's Adreno `gpu` equalled `submit+wait` even with the
+  copies outside the timestamps. Read GPU time beside the wall clock on
+  every new GPU before trusting either column.
+- **First-frame cost.** 100 ms, 850 ms with eight 4K inputs, in pipeline
+  compilation and first uploads; the warm-up tick in 2.5 absorbs it, and a
+  live run that cannot wait shows its first frames late without it.
 - **The vendored host is on 0.0.1 and synchronous.** Upstream wasi:webgpu
   is 0.3 and async-only, which the sidecar's synchronous stores cannot
   host. The 0.0.1 wit is frozen in the vendor directory, so the guest
   backend has a fixed target; when the stores go async, both move.
-- **One device, three APIs.** wgpu's Vulkan device, libavcodec's CUDA
-  context and ONNX Runtime's CUDA provider must land on one card, by
-  UUID. A machine with two cards is a configuration, not a default.
+- **One device, several APIs.** The compositor's device, the decoder,
+  the encoder and the inference provider must land on one card, matched
+  by UUID or LUID, through that platform's sharing. A machine with two
+  cards is a configuration, not a default; a part that shares nothing
+  (an NPU, a decoder with no shared-image path) gets the device-to-device
+  copy or the boundary download, never a silent fallback to host memory.
 - **Failure domain.** A decoder crash today takes one ffmpeg process; in
   the sidecar it takes the region. Decode on its own thread; keep the
   ffmpeg path as the fallback when no hardware device is present.
@@ -579,8 +650,13 @@ system memory on the path, by the profile rows.
 - **The `ort` pin.** I/O binding in rc.10 is unverified. If absent, wave
   4 waits on a wasmtime-wasi-nn that moves `ort` forward.
 - **Pixel-exact tests.** GPU and CPU rasterization differ, hardware and
-  software decode differ by rounding; every byte-checked recipe keeps its
-  software path and GPU recipes pin their own output on the GPU tier.
+  software decode differ by rounding, and vello_hybrid picks its SIMD
+  level per target (3 pixels in 8.3 million between the native and wasm
+  runs); every byte-checked recipe keeps its software path and GPU recipes
+  pin their own output per platform on the GPU tier.
+- **Pyrowave has no alpha.** As a wire between regions it carries pictures
+  and not mattes; a region whose output is a matte stays raw or on the
+  device.
 - **Colour.** Decoded frames are NV12 in the stream's matrix and range;
   blitz renders premultiplied rgba and encodes transparent as black. The
   convert passes own both conversions; nothing un-premultiplies.
@@ -599,8 +675,9 @@ release:
    memcpy share and syscalls per frame.
 2. The same at yuv420p, and with the relay on the edge (a named-pipe
    plan) and off (a stdio chain).
-3. blitz's lbar recipe at 1080p30 and 4K30 with `log => 'frame'`: the
-   `fetch`, `paint_cmds` and `raster` columns, `-jobs 1` and `-jobs 4`.
+3. Done: the experiment's table (section 3) stands in for blitz's
+   per-frame columns; the same harness on the 4090 and the L4 is the
+   number still to take.
 4. The depth module at 4K through `-nn-target cuda`: time in the module
    against time in `set_input` and `compute`, from the profile rows once
    wave 0 adds them, or from `strace -c` and ONNX Runtime's profiler
