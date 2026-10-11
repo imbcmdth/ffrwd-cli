@@ -288,3 +288,69 @@ the standalone 1.89 install is still first on PATH), Python 3.12
 (user scope, winget, for stylo's build script), LLVM 23 (machine scope,
 winget, for `ring`'s C on aarch64; clang needs `INCLUDE` set to the
 MSVC and Windows SDK include directories outside a developer prompt).
+
+## What this changes in the plan
+
+For the revision of `plans/gpu-resident-frames.md`, from the experiment
+and from a survey of the hardware the sidecar will meet (decoders,
+compositor backends, inference providers, capture cards):
+
+1. **Wave 3 is unblocked; section 3's failure branches are not taken.**
+   vello_hybrid stays the compositor, strip generation stays in the guest.
+2. **Section 1's estimates become measurements.** Per-frame uploads are
+   25x the resident variant's CPU and 92 MB a frame across the wit; the
+   readback caps the run at 37 fps whatever N is. Today's output path is
+   the bound, so wave 3's texture hand-back is worth more than wave 0.
+3. **A run needs a warm-up.** Frame 0 is 100 ms (850 ms with eight 4K
+   inputs); the clock should start after it.
+4. **Section 2.5 needs a per-platform matrix, not one Vulkan sketch.**
+   Windows is D3D12 (the Snapdragon decodes through D3D11VA and Media
+   Foundation with no Vulkan Video; DirectML binds D3D12 buffers directly;
+   NVIDIA, AMD and Intel decode through D3D11VA/D3D12VA there too). Linux
+   and Android are Vulkan with DMA-BUF or AHardwareBuffer import, and
+   NVIDIA decodes straight into VkImages with Vulkan Video, the cleanest
+   case for the L4. macOS is Metal through VideoToolbox's IOSurfaces.
+   wgpu wraps native images on all three. Wave 5 therefore becomes the
+   backend choice at the start rather than a port at the end, and the
+   host should prefer D3D12 over Vulkan on Windows (`runtime/src/gpu.rs`
+   tries Vulkan first today).
+5. **"Zero transfer", not "zero copy".** Every hardware decoder emits NV12
+   or P010 and pyrowave emits YUV, so one device-local conversion pass per
+   input is the floor. The video sampling pass from section 3's failure
+   branch belongs in wave 3 anyway, for format rather than speed: the
+   compositor reads YUV planes from the decoder's image and no RGBA copy
+   exists. On unified-memory parts the readback cost measured here is
+   untiling into uncached memory, not a bus transfer; zero transfer there
+   means staying in tiled, cached allocations.
+6. **Wave 2 inherits the decoder matrix and the encode caps.** Hwaccel
+   per platform; integrated parts cap concurrent sessions (the
+   Snapdragon's VPU: 4K120 decode, 4K60 encode, one 4K60 decode beside
+   two 4K30 encodes), which the compiler should treat as a capacity.
+7. **Wave 4 inherits an inference matrix.** DirectML is the one ONNX
+   Runtime provider that binds the compositor's memory directly; CUDA,
+   TensorRT and ROCm follow through external-memory import; OpenVINO
+   wraps VA surfaces, dma-bufs and D3D11 textures as remote tensors;
+   ort's CoreML provider copies, so zero transfer on Apple means CoreML
+   directly with an IOSurface-backed pixel buffer; the WebGPU provider is
+   the universal fallback (Mali, Adreno on Linux); NPUs take host memory.
+   Preprocessing is a device pass whose buffer is what gets bound;
+   image-sized outputs are bound to device buffers and read as textures.
+   The open check stands: whether the pinned ort exposes I/O binding to
+   foreign device memory.
+8. **Two new candidates.** Pyrowave as the wire between GPU regions:
+   intra-only, YUV 4:2:0 or 4:4:4, 5 to 50x smaller than raw, decoding to
+   a texture on the consumer's device; textures inside a region, pyrowave
+   packets across edges between GPU regions, raw only at edges that end
+   in CPU code; to measure on the round-trip module: per-hop GPU time at
+   4K, generation loss over three hops, and alpha, which it lacks. And
+   capture and playout cards as pool producers and consumers (DeckLink
+   GPUDirect and DirectGMA on x86 pro cards, Rivermax for SMPTE 2110):
+   packed 4:2:2 buffers by DMA with no CPU, plus an unpack pass.
+9. **Section 2.6 is code.** `wgpu-wasi-webgpu` exists; the host's wit
+   gained `write-timestamp` and `get-timestamp-period` and no longer
+   traps on compilation info or texture getters, so the sidecar's wit is
+   ffrwd's own superset of wasi:webgpu 0.0.1 and should be versioned as
+   such. A wgpu-based module on wasip2 needs wgpu without its `webgpu`
+   default feature.
+10. **Risks.** Timestamp queries on this driver bracket the whole
+    submission; read GPU time beside the wall clock on every new GPU.
