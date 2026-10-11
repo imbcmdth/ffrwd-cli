@@ -569,25 +569,45 @@ profile rows; the readback and upload rows of the experiment's table gone.
 
 ### Wave 4: inference on the GPU
 
-1. An `ffrwd:av/gpu-nn` extension beside standard `wasi:nn`: a tensor
-   from a `gpu-buffer`, an output bound to one. In the vendored backend
-   (`vendor/wasmtime-wasi-nn`), per provider:
+1. **The provider is per model.** `NN-EDGE.md` has every model a process
+   binds share one `-nn-target` walk, with the compiler passing the union
+   of the pins' `-nn-exclude`s. That changes: each model's session
+   resolves its own provider from its own pin and the machine, since
+   sessions are independent and one process holds a DirectML session
+   beside a CUDA one. A model that works on CUDA and not DirectML and one
+   that works the other way round run side by side. The engaged provider
+   is read per session before anything is bound, as the host reports it
+   today, because a session that fell back to the CPU cannot bind device
+   memory.
+2. **Switching providers never moves the frame.** The pool lives on the
+   compositor's device, D3D12 on Windows and Vulkan on Linux, and every
+   provider reaches that memory by its own route to the same allocation,
+   imported once per pool slot and cached:
 
-   | provider | how the compositor's memory reaches it |
+   | provider | route to the pool's memory on the same card |
    |---|---|
-   | DirectML | binds D3D12 buffers directly: the one provider with no import step |
-   | CUDA, TensorRT, ROCm | external-memory import of the exported image or buffer |
-   | OpenVINO | remote tensors over VA surfaces, DMA-BUFs and D3D11 textures |
-   | CoreML through ONNX Runtime | copies; zero transfer on Apple is CoreML directly with an IOSurface-backed pixel buffer |
-   | WebGPU provider | the universal fallback (Mali, Adreno on Linux): the model runs on the same device as the compositor |
-   | NPUs | host memory; a download at the region's boundary |
+   | DirectML | binds the D3D12 buffer directly |
+   | CUDA, TensorRT, ROCm | external-memory import of the D3D12 resource's shared handle, or of the Vulkan image's exported memory |
+   | OpenVINO | remote tensors over D3D11 textures, VA surfaces and DMA-BUFs |
+   | WebGPU provider | runs on the compositor's own device (Mali, Adreno on Linux) |
+   | CPU, NPUs, CoreML through ONNX Runtime | a download, for that model's input only; zero transfer on Apple is CoreML directly with an IOSurface-backed pixel buffer |
 
-   The open check stands: whether the pinned `ort` rc.10 exposes I/O
-   binding to foreign device memory; if not, wave 4 waits on a
+   DirectML and CUDA on one NVIDIA card are two mappings of one
+   allocation, so a query whose models pin different providers costs
+   nothing in transfers; the one model that can share nothing costs a
+   download at its own input, never the region. This is why the pool is
+   D3D12 and not Vulkan on Windows: DirectML has no route to a Vulkan
+   image.
+3. An `ffrwd:av/gpu-nn` extension beside standard `wasi:nn`: a tensor
+   from a `gpu-buffer`, an output bound to one, implemented per provider
+   in the vendored backend (`vendor/wasmtime-wasi-nn`) over the routes
+   above. The open check stands: whether the pinned `ort` rc.10 exposes
+   I/O binding to foreign device memory; if not, wave 4 waits on a
    wasmtime-wasi-nn that moves `ort` forward.
-2. Preprocessing is a device pass whose buffer is what gets bound:
-   `convert` gains planar fp32 at a model's input size.
-3. Image-sized outputs are bound to device buffers and read as textures;
+4. Preprocessing is a device pass whose buffer is what gets bound:
+   `convert` gains planar fp32 at a model's input size, written in the
+   pool's API and imported per provider like a frame.
+5. Image-sized outputs are bound to device buffers and read as textures;
    boxes and scalars come back by `fetch`. The depth and segment modules
    read a GPU frame, run the model from a buffer, and write their rows.
 
@@ -654,6 +674,13 @@ decides whether it joins.
   level per target (3 pixels in 8.3 million between the native and wasm
   runs); every byte-checked recipe keeps its software path and GPU recipes
   pin their own output per platform on the GPU tier.
+- **Providers differ per model, not per machine.** The same card runs
+  one model on DirectML and another on CUDA, and a provider that engaged
+  for one model falls back to the CPU for another. Wave 4 resolves the
+  provider per session and shares the pool's memory across providers by
+  import, so the choice is never a transfer; what it cannot do is bind
+  device memory into a session that silently fell back, which is why the
+  engaged provider is read before binding.
 - **Pyrowave has no alpha.** As a wire between regions it carries pictures
   and not mattes; a region whose output is a matte stays raw or on the
   device.
