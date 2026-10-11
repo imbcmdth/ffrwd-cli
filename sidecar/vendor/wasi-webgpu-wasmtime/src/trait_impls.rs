@@ -11,10 +11,42 @@ use crate::{
     wrapper_types::{
         Buffer, CommandEncoder, ComputePassEncoder, ComputePipeline, Device, ErrorHandler,
         Listener, RenderBundleEncoder, WgslLanguageFeatures, RenderBundleEncoderInner, RenderPassEncoder,
-        RenderPipeline, Texture,
+        RenderPipeline, Texture, ShaderModule, CompilationInfo, CompilationMessage,
     },
     WasiWebGpuCtx, PREFERRED_CANVAS_FORMAT,
 };
+
+/// What `get-compilation-info` answers for a module wgpu-core refused: one
+/// error message, placed in the source where naga can say.
+fn compilation_messages(
+    err: &wgpu_core::pipeline::CreateShaderModuleError,
+    source: &str,
+) -> Vec<CompilationMessage> {
+    use wgpu_core::pipeline::CreateShaderModuleError as E;
+    let location = match err {
+        E::Parsing(e) => e.inner.location(source),
+        E::Validation(e) => e.inner.location(source),
+        _ => None,
+    };
+    let (line_num, line_pos, offset, length) = location
+        .map(|l| {
+            (
+                l.line_number as u64,
+                l.line_position as u64,
+                l.offset as u64,
+                l.length as u64,
+            )
+        })
+        .unwrap_or_default();
+    vec![CompilationMessage {
+        message: err.to_string(),
+        kind: webgpu::GpuCompilationMessageType::Error,
+        line_num,
+        line_pos,
+        offset,
+        length,
+    }]
+}
 
 impl webgpu::Host for WasiWebGpuCtx<'_> {
     fn get_gpu(&mut self) -> wasmtime::Result<Resource<webgpu::Gpu>> {
@@ -363,6 +395,7 @@ impl webgpu::HostGpuDevice for WasiWebGpuCtx<'_> {
 
         let code =
             wgpu_core::pipeline::ShaderModuleSource::Wgsl(Cow::Owned(descriptor.code.to_owned()));
+        let source = descriptor.code.clone();
         let (shader, err) = self.instance.device_create_shader_module(
             device_id,
             &descriptor.to_core(self.table),
@@ -370,9 +403,16 @@ impl webgpu::HostGpuDevice for WasiWebGpuCtx<'_> {
             None,
         );
 
+        let messages = err
+            .as_ref()
+            .map(|e| compilation_messages(e, &source))
+            .unwrap_or_default();
         error_handler.handle_possible_error(err);
 
-        Ok(self.table.push(shader)?)
+        Ok(self.table.push(ShaderModule {
+            id: shader,
+            messages,
+        })?)
     }
 
     fn create_render_pipeline(
@@ -470,17 +510,20 @@ impl webgpu::HostGpuDevice for WasiWebGpuCtx<'_> {
         let device_id = device.device;
         let error_handler = Arc::clone(&device.error_handler);
 
-        let (texture_id, err) = self.instance.device_create_texture(
-            device_id,
-            &descriptor.to_core(self.table),
-            None,
-        );
+        let desc = descriptor.to_core(self.table);
+        let (texture_id, err) = self.instance.device_create_texture(device_id, &desc, None);
 
         error_handler.handle_possible_error(err);
 
         Ok(self.table.push(Texture {
             texture_id,
             error_handler,
+            size: desc.size,
+            mip_level_count: desc.mip_level_count,
+            sample_count: desc.sample_count,
+            dimension: desc.dimension,
+            format: desc.format,
+            usage: desc.usage,
         })?)
     }
 
@@ -784,58 +827,62 @@ impl webgpu::HostGpuTexture for WasiWebGpuCtx<'_> {
 
     fn width(
         &mut self,
-        _self_: Resource<webgpu::GpuTexture>,
+        self_: Resource<webgpu::GpuTexture>,
     ) -> wasmtime::Result<webgpu::GpuIntegerCoordinateOut> {
-        bail!("wasi:webgpu: GpuTexture.width is not implemented by this host")
+        Ok(self.table.get(&self_)?.size.width)
     }
 
     fn height(
         &mut self,
-        _self_: Resource<webgpu::GpuTexture>,
+        self_: Resource<webgpu::GpuTexture>,
     ) -> wasmtime::Result<webgpu::GpuIntegerCoordinateOut> {
-        bail!("wasi:webgpu: GpuTexture.height is not implemented by this host")
+        Ok(self.table.get(&self_)?.size.height)
     }
 
     fn depth_or_array_layers(
         &mut self,
-        _self_: Resource<webgpu::GpuTexture>,
+        self_: Resource<webgpu::GpuTexture>,
     ) -> wasmtime::Result<webgpu::GpuIntegerCoordinateOut> {
-        bail!("wasi:webgpu: GpuTexture.depth_or_array_layers is not implemented by this host")
+        Ok(self.table.get(&self_)?.size.depth_or_array_layers)
     }
 
     fn mip_level_count(
         &mut self,
-        _self_: Resource<webgpu::GpuTexture>,
+        self_: Resource<webgpu::GpuTexture>,
     ) -> wasmtime::Result<webgpu::GpuIntegerCoordinateOut> {
-        bail!("wasi:webgpu: GpuTexture.mip_level_count is not implemented by this host")
+        Ok(self.table.get(&self_)?.mip_level_count)
     }
 
     fn sample_count(
         &mut self,
-        _self_: Resource<webgpu::GpuTexture>,
+        self_: Resource<webgpu::GpuTexture>,
     ) -> wasmtime::Result<webgpu::GpuSize32Out> {
-        bail!("wasi:webgpu: GpuTexture.sample_count is not implemented by this host")
+        Ok(self.table.get(&self_)?.sample_count)
     }
 
     fn dimension(
         &mut self,
-        _self_: Resource<webgpu::GpuTexture>,
+        self_: Resource<webgpu::GpuTexture>,
     ) -> wasmtime::Result<webgpu::GpuTextureDimension> {
-        bail!("wasi:webgpu: GpuTexture.dimension is not implemented by this host")
+        Ok(match self.table.get(&self_)?.dimension {
+            wgpu_types::TextureDimension::D1 => webgpu::GpuTextureDimension::D1,
+            wgpu_types::TextureDimension::D2 => webgpu::GpuTextureDimension::D2,
+            wgpu_types::TextureDimension::D3 => webgpu::GpuTextureDimension::D3,
+        })
     }
 
     fn format(
         &mut self,
-        _self_: Resource<webgpu::GpuTexture>,
+        self_: Resource<webgpu::GpuTexture>,
     ) -> wasmtime::Result<webgpu::GpuTextureFormat> {
-        bail!("wasi:webgpu: GpuTexture.format is not implemented by this host")
+        Ok(self.table.get(&self_)?.format.into())
     }
 
     fn usage(
         &mut self,
-        _self_: Resource<webgpu::GpuTexture>,
+        self_: Resource<webgpu::GpuTexture>,
     ) -> wasmtime::Result<webgpu::GpuFlagsConstant> {
-        bail!("wasi:webgpu: GpuTexture.usage is not implemented by this host")
+        Ok(self.table.get(&self_)?.usage.bits())
     }
 
     fn label(&mut self, _self_: Resource<webgpu::GpuTexture>) -> wasmtime::Result<String> {
@@ -909,9 +956,10 @@ impl webgpu::HostGpuCommandBuffer for WasiWebGpuCtx<'_> {
 impl webgpu::HostGpuShaderModule for WasiWebGpuCtx<'_> {
     fn get_compilation_info(
         &mut self,
-        _self_: Resource<webgpu::GpuShaderModule>,
+        self_: Resource<webgpu::GpuShaderModule>,
     ) -> wasmtime::Result<Resource<webgpu::GpuCompilationInfo>> {
-        bail!("wasi:webgpu: GpuShaderModule.get_compilation_info is not implemented by this host")
+        let messages = self.table.get(&self_)?.messages.clone();
+        Ok(self.table.push(CompilationInfo(messages))?)
     }
 
     fn label(&mut self, _self_: Resource<webgpu::GpuShaderModule>) -> wasmtime::Result<String> {
@@ -929,7 +977,7 @@ impl webgpu::HostGpuShaderModule for WasiWebGpuCtx<'_> {
     }
 
     fn drop(&mut self, shader: Resource<webgpu::GpuShaderModule>) -> wasmtime::Result<()> {
-        let shader_id = self.table.delete(shader)?;
+        let shader_id = self.table.delete(shader)?.id;
         self.instance.shader_module_drop(shader_id);
         Ok(())
     }
@@ -992,14 +1040,25 @@ impl webgpu::HostGpuAdapter for WasiWebGpuCtx<'_> {
             }
         }
 
-        let device_queue_result = self.instance.adapter_request_device(
-            *adapter,
-            &descriptor
-                .map(|d| d.to_core(self.table))
-                .unwrap_or(wgpu_types::DeviceDescriptor::default()),
-            None,
-            None,
-        );
+        let mut desc = descriptor
+            .map(|d| d.to_core(self.table))
+            .unwrap_or(wgpu_types::DeviceDescriptor::default());
+        // The IDL has no name for wgpu's encoder-level timestamps; a guest
+        // asking for timestamp-query gets them too where the adapter has them,
+        // so `write-timestamp` on an encoder works.
+        if desc
+            .required_features
+            .contains(wgpu_types::Features::TIMESTAMP_QUERY)
+            && self
+                .instance
+                .adapter_features(*adapter)
+                .contains(wgpu_types::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS)
+        {
+            desc.required_features |= wgpu_types::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+        }
+        let device_queue_result = self
+            .instance
+            .adapter_request_device(*adapter, &desc, None, None);
 
         Ok(match device_queue_result {
             Ok((device_id, queue_id)) => {
@@ -1098,6 +1157,11 @@ impl webgpu::HostGpuQueue for WasiWebGpuCtx<'_> {
             bail!("queue submit failed: {e}");
         }
         Ok(())
+    }
+
+    fn get_timestamp_period(&mut self, queue: Resource<webgpu::GpuQueue>) -> wasmtime::Result<f32> {
+        let queue = *(*self.table.get(&queue)?);
+        Ok(self.instance.queue_get_timestamp_period(queue))
     }
 
     fn on_submitted_work_done(&mut self, queue: Resource<webgpu::GpuQueue>) -> wasmtime::Result<()> {
@@ -1385,6 +1449,19 @@ impl webgpu::HostGpuCommandEncoder for WasiWebGpuCtx<'_> {
             destination,
             destination_offset,
         )?;
+        Ok(())
+    }
+
+    fn write_timestamp(
+        &mut self,
+        command_encoder: Resource<CommandEncoder>,
+        query_set: Resource<webgpu::GpuQuerySet>,
+        query_index: webgpu::GpuSize32,
+    ) -> wasmtime::Result<()> {
+        let query_set_id = *self.table.get(&query_set)?;
+        let command_encoder = self.table.get(&command_encoder)?.command_encoder_id;
+        self.instance
+            .command_encoder_write_timestamp(command_encoder, query_set_id, query_index)?;
         Ok(())
     }
 
@@ -2106,54 +2183,60 @@ impl webgpu::HostGpuComputePassEncoder for WasiWebGpuCtx<'_> {
 impl webgpu::HostGpuCompilationMessage for WasiWebGpuCtx<'_> {
     fn message(
         &mut self,
-        _self_: Resource<webgpu::GpuCompilationMessage>,
+        self_: Resource<webgpu::GpuCompilationMessage>,
     ) -> wasmtime::Result<String> {
-        bail!("wasi:webgpu: GpuCompilationMessage.message is not implemented by this host")
+        Ok(self.table.get(&self_)?.message.clone())
     }
 
     fn type_(
         &mut self,
-        _self_: Resource<webgpu::GpuCompilationMessage>,
+        self_: Resource<webgpu::GpuCompilationMessage>,
     ) -> wasmtime::Result<webgpu::GpuCompilationMessageType> {
-        bail!("wasi:webgpu: GpuCompilationMessage.type_ is not implemented by this host")
+        Ok(self.table.get(&self_)?.kind)
     }
 
     fn line_num(
         &mut self,
-        _self_: Resource<webgpu::GpuCompilationMessage>,
+        self_: Resource<webgpu::GpuCompilationMessage>,
     ) -> wasmtime::Result<u64> {
-        bail!("wasi:webgpu: GpuCompilationMessage.line_num is not implemented by this host")
+        Ok(self.table.get(&self_)?.line_num)
     }
 
     fn line_pos(
         &mut self,
-        _self_: Resource<webgpu::GpuCompilationMessage>,
+        self_: Resource<webgpu::GpuCompilationMessage>,
     ) -> wasmtime::Result<u64> {
-        bail!("wasi:webgpu: GpuCompilationMessage.line_pos is not implemented by this host")
+        Ok(self.table.get(&self_)?.line_pos)
     }
 
-    fn offset(&mut self, _self_: Resource<webgpu::GpuCompilationMessage>) -> wasmtime::Result<u64> {
-        bail!("wasi:webgpu: GpuCompilationMessage.offset is not implemented by this host")
+    fn offset(&mut self, self_: Resource<webgpu::GpuCompilationMessage>) -> wasmtime::Result<u64> {
+        Ok(self.table.get(&self_)?.offset)
     }
 
-    fn length(&mut self, _self_: Resource<webgpu::GpuCompilationMessage>) -> wasmtime::Result<u64> {
-        bail!("wasi:webgpu: GpuCompilationMessage.length is not implemented by this host")
+    fn length(&mut self, self_: Resource<webgpu::GpuCompilationMessage>) -> wasmtime::Result<u64> {
+        Ok(self.table.get(&self_)?.length)
     }
 
-    fn drop(&mut self, _cm: Resource<webgpu::GpuCompilationMessage>) -> wasmtime::Result<()> {
-        bail!("wasi:webgpu: GpuCompilationMessage.drop is not implemented by this host")
+    fn drop(&mut self, cm: Resource<webgpu::GpuCompilationMessage>) -> wasmtime::Result<()> {
+        self.table.delete(cm)?;
+        Ok(())
     }
 }
 impl webgpu::HostGpuCompilationInfo for WasiWebGpuCtx<'_> {
     fn messages(
         &mut self,
-        _self_: Resource<webgpu::GpuCompilationInfo>,
+        self_: Resource<webgpu::GpuCompilationInfo>,
     ) -> wasmtime::Result<Vec<Resource<webgpu::GpuCompilationMessage>>> {
-        bail!("wasi:webgpu: GpuCompilationInfo.messages is not implemented by this host")
+        let messages = self.table.get(&self_)?.0.clone();
+        messages
+            .into_iter()
+            .map(|m| Ok(self.table.push(m)?))
+            .collect()
     }
 
-    fn drop(&mut self, _info: Resource<webgpu::GpuCompilationInfo>) -> wasmtime::Result<()> {
-        bail!("wasi:webgpu: GpuCompilationInfo.drop is not implemented by this host")
+    fn drop(&mut self, info: Resource<webgpu::GpuCompilationInfo>) -> wasmtime::Result<()> {
+        self.table.delete(info)?;
+        Ok(())
     }
 }
 impl webgpu::HostGpuQuerySet for WasiWebGpuCtx<'_> {

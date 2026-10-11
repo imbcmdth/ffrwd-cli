@@ -140,7 +140,34 @@ pub struct CommandEncoder {
 pub struct Texture {
     pub(crate) texture_id: wgpu_core::id::TextureId,
     pub(crate) error_handler: Arc<ErrorHandler>,
+    /// What the texture was created with, for the getters the IDL has and
+    /// wgpu-core does not.
+    pub(crate) size: wgpu_types::Extent3d,
+    pub(crate) mip_level_count: u32,
+    pub(crate) sample_count: u32,
+    pub(crate) dimension: wgpu_types::TextureDimension,
+    pub(crate) format: wgpu_types::TextureFormat,
+    pub(crate) usage: wgpu_types::TextureUsages,
 }
+
+/// A shader module with what compiling it said, so `get-compilation-info`
+/// answers with messages where wgpu-core hands back one error.
+pub struct ShaderModule {
+    pub(crate) id: wgpu_core::id::ShaderModuleId,
+    pub(crate) messages: Vec<CompilationMessage>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CompilationMessage {
+    pub(crate) message: String,
+    pub(crate) kind: webgpu::GpuCompilationMessageType,
+    pub(crate) line_num: u64,
+    pub(crate) line_pos: u64,
+    pub(crate) offset: u64,
+    pub(crate) length: u64,
+}
+
+pub struct CompilationInfo(pub(crate) Vec<CompilationMessage>);
 pub struct RenderPipeline {
     pub(crate) render_pipeline_id: wgpu_core::id::RenderPipelineId,
     pub(crate) error_handler: Arc<ErrorHandler>,
