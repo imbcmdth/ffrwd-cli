@@ -528,6 +528,46 @@ with an upload); the families never mix. Neither has run on a card from
 here: the pinned commands are what ffmpeg is handed, and a run on the
 4090 (CUDA) and the L4 (Vulkan) is what proves them.
 
+**Measured on the owner's machine (9950X, RTX 4090, Windows,
+2026-10-12):** the `-profile` row, 1080p60 h264 in, 600 frames, through
+`ffrwd-wasm` alone. `held`, `fetch` and `emit` count frames handed on,
+so a 1080p yuv420p frame is 3.1 MB in each; `upload` and `download` are
+the host's own transfers.
+
+| chain | fps | held | fetch | emit | upload | download |
+|---|---|---|---|---|---|---|
+| software decode, `gpu-box` on bytes, `h264_nvenc` | 249 | 1,200 | 600 | 600 | 0 | 0 |
+| d3d12va decode into the pool, `gpu-box` reading planes, emitting bytes, `h264_nvenc` | 182 | 1,200 | 0 | 600 | 0 | 0 |
+| d3d12va decode into the pool, `h264_d3d12va` from the pool | 235 | 600 | 0 | 0 | 0 | 0 |
+
+The device-to-device chain moves no frame byte through the host at
+all. At 1080p on this CPU it is no faster than the host chain, which
+the CPU keeps up with; the encoder bounds it. The middle row is the test
+module reading its planes back through its own `wasi:webgpu` mapping
+(which the host's `download` does not count) to draw on bytes, so it
+measures the test module, not the path. The 4K and many-input runs, where
+section 1 says the host path cannot keep up, are the numbers still to
+take, with blitz's texture path.
+
+Recipe 155 (320x240, 60 frames, through `ffrwd run --profile`): `held`
+120 calls, `fetch` 60 and `emit` 60 at 307,200 bytes a frame, the edges'
+`read` and `write` the coded packets only: four full-frame stages on the
+coded path, as wave 2's acceptance counted.
+
+Item 7 on the card (CUDA, 1080p and 4K, `h264_nvenc`): the commands the
+pass wrote failed in ffmpeg 9.0.1 wherever a CPU segment needed a
+download ("Invalid output format yuv420p for hwframe download"):
+`hwdownload` must be followed by a `format` naming the frames' software
+format, and a list does not work, since ffmpeg negotiates before the
+frames context exists. The pass now names the stream's own (`nv12` for
+8-bit 4:2:0, `p010le` for 10-bit) and leaves an input it cannot name off
+the card. Timed against the same query without the pass: a scale alone
+on the card and on the CPU take the same time at 1080p (0.98 s against
+0.99 s, 600 frames) and at 4K (1.59 s against 1.64 s, 300 frames); a CPU
+segment costs the pass about 10% for its upload (1.18 s against 1.01 s at
+1080p). Decode and encode bound both here, so the pass pays where the CPU
+filters are heavy or the CPU is weak, not on this machine.
+
 ### Wave 1: wgpu over wasi:webgpu, finished
 
 The experiment's backend made a product. Independent of the sidecar
@@ -706,7 +746,8 @@ What was learned, for the waves after:
   the software decode; session caps were not measured, only the engaged
   device is reported, so the compiler's capacity model still has no
   numbers from this wave.
-- `av-pins.json` pins ffrwd-av v1.0.0 on all seven wheel platforms; the
+- `av-pins.json` pins ffrwd-av v1.1.0 on all seven wheel platforms (v1.0.0
+  until the d3d12va encoders were added); the
   Windows x86_64 archive was fetched through `fetch_av.py` and loaded by
   the shim here. A platform without a pin would ship without codecs, and
   the sidecar then refuses `decode` and `encode` naming the directory it
@@ -900,6 +941,34 @@ What was learned:
   change is unmeasured (an estimate is 15 to 20 MB); CI's first Windows
   wheel run proves it. A gnullvm or aarch64 Windows build keeps D3D12
   first and needs `dxcompiler.dll` on the path for subgroups.
+
+**Items 5 and 6 for the encoder (2026-10-12, owner's machine):**
+`h264_d3d12va` and `hevc_d3d12va` take their frames from the pool: the
+encoder is opened on the shared device with an NV12 frames context, each
+pool frame is copied once on the device into the encoder's frame (one
+`CopyResource` where the decoder's resource matches, else a copy per
+plane), the queue waits on the frame's sync object and signals the
+encoder's, and nothing reaches the host. A module's rendered rgba frame
+is made NV12 first by a WGSL pass (`gpu/convert.rs`: BT.709 or BT.601,
+limited or full, from the stream's colour; ffmpeg's chroma filter, a
+horizontal pair average and an 8-row bicubic with a = -0.6, measured off
+an impulse), within one level of ffmpeg's own conversion at every pixel.
+Every other encoder reads a GPU frame back once (`h264_nvenc` in this
+build takes `cuda` and `d3d11` frames, no `d3d12`). The compiler lists
+the two encoders as hosted and as hardware sessions.
+
+What was learned:
+
+- These encoders in FFmpeg 9.0.1 on NVIDIA's driver fail on the first
+  B-frame (ffmpeg's own command line too), so `bf=0` is set unless asked;
+  and they write no extradata, so a second encoder codes one picture
+  ahead of the stream to take the parameter sets for the header.
+  `av1_d3d12va` does not open on this card at all ("Codec sequence
+  initialisation failed: -22"), and the encoder refuses 64x48.
+- The pinned LGPL builds did not carry the d3d12va encoders; ffrwd-av
+  v1.1.0 adds `h264_d3d12va` and `hevc_d3d12va` to both Windows builds.
+- 1080p, decode into the pool into `h264_d3d12va`: 235 fps with zero
+  upload and download (wave 0's table).
 
 ### Wave 4: inference on the GPU
 
