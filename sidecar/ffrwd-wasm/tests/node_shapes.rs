@@ -647,6 +647,10 @@ fn a_rate_clock_that_only_needs_turns_ends_with_its_inputs() {
     let wire = fs::read(&wire_path).expect("the input");
     let rows = dir.join("rows.ndjson");
     let sink = module("shape_sink");
+    // `leaky` beside the sink hands each frame on as it is read, so its
+    // first frame on stdout says the run is up: the module compiled and the
+    // input being read. The source is not ended before then, so what is
+    // timed is the run's end and not its start.
     let mut child = Command::new(env!("CARGO_BIN_EXE_ffrwd-wasm"))
         .args([
             "-f",
@@ -656,19 +660,44 @@ fn a_rate_clock_that_only_needs_turns_ends_with_its_inputs() {
             "-m",
             &sink,
             "-filter_complex",
-            "[v=0:v]shape_sink=rate=50[@rows=r]",
+            "[v=0:v]shape_sink=rate=50[@rows=r];[0:v]leaky=max_lateness=60[seen]",
             "-map",
             "[r]",
             "-f",
             "ndjson",
             &rows.display().to_string(),
+            "-map",
+            "[seen]",
+            "-f",
+            "nut",
+            "-",
         ])
         .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn ffrwd-wasm");
+    let stdout = child.stdout.take().expect("its stdout");
+    let (seen, up) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let Ok(mut demuxer) = ffrwd_wasm::nut::Demuxer::open(stdout) else {
+            return;
+        };
+        let mut buf = Vec::new();
+        let mut told = false;
+        while let Ok(Some(_)) = demuxer.read_frame(&mut buf) {
+            if !told {
+                told = seen.send(()).is_ok();
+            }
+        }
+    });
     let mut stdin = child.stdin.take().expect("its stdin");
-    for chunk in wire.chunks(wire.len().div_ceil(10)) {
+    let chunks: Vec<&[u8]> = wire.chunks(wire.len().div_ceil(10)).collect();
+    for (k, chunk) in chunks.iter().enumerate() {
+        if k == chunks.len() / 2 {
+            up.recv_timeout(Duration::from_secs(60))
+                .expect("a frame through leaky while the source runs");
+        }
         if stdin.write_all(chunk).and_then(|_| stdin.flush()).is_err() {
             break;
         }
@@ -688,6 +717,7 @@ fn a_rate_clock_that_only_needs_turns_ends_with_its_inputs() {
         std::thread::sleep(Duration::from_millis(5));
     };
     let after = ended.elapsed();
+    reader.join().expect("the stdout reader");
     let mut stderr = String::new();
     std::io::Read::read_to_string(&mut child.stderr.take().expect("stderr"), &mut stderr)
         .expect("read stderr");

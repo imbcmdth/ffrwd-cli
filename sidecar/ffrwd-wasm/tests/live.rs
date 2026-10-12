@@ -18,7 +18,7 @@ use std::io::{BufWriter, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{mpsc, Mutex, MutexGuard, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -90,11 +90,13 @@ fn free_port() -> u16 {
 }
 
 /// Waits for the sidecar to listen on `port`: a connect that is closed at
-/// once, which the host drops as a feeder that never sent a byte.
+/// once, which the host drops as a feeder that never sent a byte. The
+/// programme starts then, if it has not already.
 fn wait_for_port(run: &mut Run, port: u16) {
     let until = Instant::now() + Duration::from_secs(60);
     loop {
         if TcpStream::connect((Ipv4Addr::LOCALHOST, port)).is_ok() {
+            run.go();
             return;
         }
         if let Ok(Some(status)) = run.child.try_wait() {
@@ -611,11 +613,29 @@ fn read_output(dir: &Path, stderr: String) -> Output {
 
 /// One run of `shape_switch` (or whatever `chain` names) on a paced
 /// programme, with its outputs under `dir`.
+///
+/// The programme is not written until the sidecar listens on its feed
+/// port, as a live source waits for the switch it feeds. A feeder is timed
+/// from that moment too, so the sidecar's start - most of it compiling the
+/// module, a few seconds on a slow machine - shifts neither against the
+/// other. Paced from the spawn instead, the programme would be that much
+/// further on when a feeder came, and end before the feed did.
 struct Run {
     child: Child,
     dir: PathBuf,
     pacer: JoinHandle<()>,
+    /// Starts the programme, until it has started.
+    go: Option<mpsc::Sender<Instant>>,
     stderr: Option<JoinHandle<String>>,
+}
+
+impl Run {
+    /// Starts the programme now, if it has not started.
+    fn go(&mut self) {
+        if let Some(go) = self.go.take() {
+            let _ = go.send(Instant::now());
+        }
+    }
 }
 
 fn start(test: &str, program: &Program, jobs: &str, modules: &[&str], chain: &str) -> (Run, u16) {
@@ -672,25 +692,32 @@ fn start_padded(
         text
     });
     let program = program.clone();
-    let started = Instant::now();
-    let pacer = thread::spawn(move || program.pace(stdin, started));
+    let (go, started) = mpsc::channel();
+    let pacer = thread::spawn(move || {
+        if let Ok(started) = started.recv() {
+            program.pace(stdin, started);
+        }
+    });
     (
         Run {
             child,
             dir,
             pacer,
+            go: Some(go),
             stderr: Some(stderr),
         },
         port,
     )
 }
 
-fn finish(run: Run) -> Output {
+fn finish(mut run: Run) -> Output {
+    run.go();
     let Run {
         mut child,
         dir,
         pacer,
         stderr,
+        ..
     } = run;
     let _ = pacer.join();
     let status = child.wait().expect("wait");
@@ -1157,14 +1184,25 @@ fn a_layer_is_blank_while_idle_and_the_feeds_own_bytes_while_live() {
         .frames
         .iter()
         .all(|(_, s)| matches!(s, Shown::Blank | Shown::Feed(_))));
-    let live = out
-        .frames
-        .iter()
-        .filter(|(_, s)| matches!(s, Shown::Feed(_)))
-        .count();
+    // Live from the tick the feed's start names to the one its end was
+    // foretold for, and that is its feeder's 2 s.
+    let (at, _, _) = first_start(&out);
+    let ends = out.feed_rows("ending");
+    let last = ends
+        .last()
+        .unwrap_or_else(|| panic!("the return was foretold\n{}", out.stderr))["ends"]
+        .as_i64()
+        .unwrap();
+    assert_eq!(
+        out.insertions(),
+        vec![(at, last)],
+        "the feed was on the layer for the insertion\n{}",
+        out.stderr
+    );
+    let lasted = (last - at + 1) as f64 / 30.0;
     assert!(
-        (50..=62).contains(&live),
-        "the feed was on the layer for the insertion ({live})"
+        (lasted - 2.0).abs() < 0.2,
+        "the insertion lasted about 2 s ({lasted:.2}s)"
     );
 }
 

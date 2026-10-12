@@ -4245,14 +4245,13 @@ const PACED_FRAME_PERIOD: Duration = Duration::from_millis(40);
 const PACING_BOUND: Duration = Duration::from_millis(250);
 const PACING_SHARE: (usize, usize) = (9, 10);
 
-/// How long the sidecar has to be up and producing. Spawning it and opening
-/// the module is a one-off before a frame is read, and it is not what these
-/// bounds are about: 200 ms on an idle machine, and 1.3 s has been seen
-/// under a whole test binary running at once. Two seconds is room for that;
-/// it is half a paced stream, and less than the 2.7 seconds a megabyte of
-/// the audio one takes to fill, so a run holding its output is past this
-/// whatever the machine was doing.
-const SIDECAR_UP_BOUND: Duration = Duration::from_millis(2000);
+/// How long a run's first output may take to leave while its first input is
+/// the only one written. Spawning the sidecar and compiling its module come
+/// first, and take what the machine makes them: 200 ms on an idle machine,
+/// 8 s for a debug build on one core. A run holding its output in a buffer
+/// never lets that first piece out while nothing follows it, so this only
+/// has to be past any start.
+const FIRST_OUTPUT_BOUND: Duration = Duration::from_secs(60);
 
 /// Waits until `due`, and returns at once once it has passed.
 fn sleep_until(due: Instant) {
@@ -4283,16 +4282,18 @@ fn spawn_paced(args: &[&str]) -> (std::process::Child, thread::JoinHandle<String
     (child, drain)
 }
 
-/// One paced audio run through `again`: `PACED_PACKETS` windows written to
-/// the sidecar one packet-duration apart from a single start, when the
-/// output stream became readable, and when each window came back - every
-/// time from that same start, so window `i`'s own input was written at
+/// One paced audio run through `again`: its first window written at once
+/// and the rest one packet-duration apart from when that window came back,
+/// how long that took from the spawn, and when each window came back - from
+/// that same start, so window `i`'s own input was written at
 /// `i * PACED_PERIOD`.
 ///
-/// The writer never waits on the reader. A NUT reader has the geometry once
-/// the first syncpoint arrives, which rides the first frame, so a run
-/// holding its output holds its reader's open as well - and a writer waiting
-/// on that open would be waiting on the very thing under test.
+/// The pacing starts once the first window is back, so the sidecar's own
+/// start is not in what is timed. A NUT reader has the geometry once the
+/// first syncpoint arrives, which rides the first frame, so a run holding
+/// its output holds its reader's open as well: the writer waits for that
+/// open no longer than `FIRST_OUTPUT_BOUND`, then writes the rest as it
+/// would have, and the run shows its first window that late.
 fn paced_audio_arrivals() -> (Duration, Vec<Duration>) {
     let module = module_path("again");
     let module_str = module
@@ -4305,25 +4306,37 @@ fn paced_audio_arrivals() -> (Duration, Vec<Duration>) {
     let stdin = child.stdin.take().expect("child stdin");
     let stdout = child.stdout.take().expect("child stdout");
     let stream = an_audio_stream("f32", PACED_CHANNELS);
-    let start = Instant::now();
+    let spawned = Instant::now();
+    let (up, started) = std::sync::mpsc::channel::<Instant>();
     let writer = thread::spawn(move || {
         let mut muxer = Muxer::new(stdin, &stream).expect("write NUT headers");
         let samples = PACED_WINDOW * PACED_CHANNELS as usize;
-        for index in 0..PACED_PACKETS {
-            sleep_until(start + PACED_PERIOD * index as u32);
+        let window = |index: usize| -> Vec<u8> {
             let first = index * PACED_WINDOW;
-            let data: Vec<u8> = (0..samples)
+            (0..samples)
                 .flat_map(|s| ((first + s) as f32).to_le_bytes())
-                .collect();
+                .collect()
+        };
+        muxer
+            .write_frame(0, &window(0))
+            .expect("write a NUT packet");
+        muxer.flush().expect("flush the first packet");
+        let start = started
+            .recv_timeout(FIRST_OUTPUT_BOUND)
+            .unwrap_or_else(|_| Instant::now());
+        for index in 1..PACED_PACKETS {
+            sleep_until(start + PACED_PERIOD * index as u32);
             muxer
-                .write_frame(first as i64, &data)
+                .write_frame((index * PACED_WINDOW) as i64, &window(index))
                 .expect("write a NUT packet");
         }
         muxer.finish().expect("finish the NUT stream");
     });
 
     let mut demuxer = Demuxer::open(stdout).expect("read the output's NUT headers");
-    let up_at = start.elapsed();
+    let start = Instant::now();
+    let up_at = start - spawned;
+    let _ = up.send(start);
 
     let mut arrivals = Vec::with_capacity(PACED_PACKETS);
     let mut buf = Vec::new();
@@ -4346,12 +4359,10 @@ fn paced_audio_arrivals() -> (Duration, Vec<Duration>) {
     (up_at, arrivals)
 }
 
-/// The second half of a paced run, and where in the run it starts. What a
-/// run costs to start - spawning the sidecar, opening the module, and then
-/// catching up on the input that arrived while it did - is behind it by the
-/// midpoint, and what is left is a run following its input, which is what
-/// the gap and lag bounds are about. Whether it got there at all is
-/// `SIDECAR_UP_BOUND`'s question, asked separately.
+/// The second half of a paced run, and where in the run it starts: a run
+/// following its input, which is what the gap and lag bounds are about.
+/// Whether its first output left at all is `FIRST_OUTPUT_BOUND`'s question,
+/// asked separately.
 fn settled(arrivals: &[Duration]) -> (usize, &[Duration]) {
     let from = arrivals.len() / 2;
     (from, &arrivals[from..])
@@ -4430,9 +4441,9 @@ fn a_paced_audio_lane_leaves_the_sidecar_as_it_is_produced() {
     );
 
     assert!(
-        up_at < SIDECAR_UP_BOUND,
-        "nothing readable left the sidecar for {up_at:?}, past {SIDECAR_UP_BOUND:?}, of a \
-         {last_written:?} stream: output is sitting in a buffer rather than following its input"
+        up_at < FIRST_OUTPUT_BOUND,
+        "nothing readable left the sidecar for {up_at:?} while its first packet was the only \
+         one written: output is sitting in a buffer rather than following its input"
     );
     assert!(
         by_the_last_input * 2 >= PACED_PACKETS,
@@ -4450,14 +4461,17 @@ fn a_paced_audio_lane_leaves_the_sidecar_as_it_is_produced() {
 }
 
 /// One paced rows run through `framestats`, whose one output is `-f ndjson`
-/// over a pipe: `PACED_FRAMES` frames written a frame-period apart from a
-/// single start, how many rows had reached the pipe by the time the last
-/// frame was written, and when each arrived - from that same start, so the
-/// row of frame `i` had its frame written at `i * PACED_FRAME_PERIOD`.
+/// over a pipe: `PACED_FRAMES` frames, the first written at once and the
+/// rest a frame-period apart from when its row arrived. Answers how long
+/// that first row took from the spawn, how many rows had reached the pipe
+/// by the time the last frame was written, and when each arrived - from the
+/// first row's arrival, so the row of frame `i` had its frame written at
+/// `i * PACED_FRAME_PERIOD`. As with the paced audio, the writer waits for
+/// the first row no longer than `FIRST_OUTPUT_BOUND`.
 ///
 /// That count is the whole question. Rows that only arrive once the stream
 /// has ended are no use to whoever is reading them live.
-fn paced_rows_arrivals() -> (usize, Vec<Duration>) {
+fn paced_rows_arrivals() -> (Duration, usize, Vec<Duration>) {
     let module = module_path("framestats");
     let module_str = module
         .to_str()
@@ -4477,28 +4491,39 @@ fn paced_rows_arrivals() -> (usize, Vec<Duration>) {
 
     let stdin = child.stdin.take().expect("child stdin");
     let stdout = child.stdout.take().expect("child stdout");
-    let arrivals: Arc<Mutex<Vec<Duration>>> = Arc::new(Mutex::new(Vec::new()));
+    let arrivals: Arc<Mutex<Vec<Instant>>> = Arc::new(Mutex::new(Vec::new()));
     let collected = Arc::clone(&arrivals);
-    let start = Instant::now();
+    let (first_row, up) = std::sync::mpsc::channel::<Instant>();
+    let spawned = Instant::now();
     let reader = thread::spawn(move || {
         for line in BufReader::new(stdout).lines() {
             let line = line.expect("read a row");
             if line.trim().is_empty() {
                 continue;
             }
-            collected
-                .lock()
-                .expect("the pacing thread holds no panic")
-                .push(start.elapsed());
+            let now = Instant::now();
+            let mut arrived = collected.lock().expect("the pacing thread holds no panic");
+            if arrived.is_empty() {
+                let _ = first_row.send(now);
+            }
+            arrived.push(now);
         }
     });
 
     let mut muxer = Muxer::new(stdin, &a_stream()).expect("write NUT headers");
-    for index in 0..PACED_FRAMES {
-        sleep_until(start + PACED_FRAME_PERIOD * index as u32);
+    let mut write = |index: usize| {
         muxer
             .write_frame(index as i64 * PTS_STEP, &synthetic_frame(index as u8))
             .expect("write a NUT frame");
+    };
+    write(0);
+    let start = up
+        .recv_timeout(FIRST_OUTPUT_BOUND)
+        .unwrap_or_else(|_| Instant::now());
+    let up_at = start - spawned;
+    for index in 1..PACED_FRAMES {
+        sleep_until(start + PACED_FRAME_PERIOD * index as u32);
+        write(index);
     }
     let by_the_last_frame = arrivals
         .lock()
@@ -4518,17 +4543,18 @@ fn paced_rows_arrivals() -> (usize, Vec<Duration>) {
     let arrived = arrivals
         .lock()
         .expect("the reader thread holds no panic")
-        .clone();
-    (by_the_last_frame, arrived)
+        .iter()
+        .map(|at| at.saturating_duration_since(start))
+        .collect();
+    (up_at, by_the_last_frame, arrived)
 }
 
 #[test]
 fn paced_rows_reach_a_pipe_while_the_stream_is_still_running() {
-    let (by_the_last_frame, arrivals) = paced_rows_arrivals();
+    let (up_at, by_the_last_frame, arrivals) = paced_rows_arrivals();
     // The rows of the frames, without the summary `framestats` ends with:
     // that one has no frame of its own, so it has no input to be late for.
     let per_frame = &arrivals[..arrivals.len().min(PACED_FRAMES)];
-    let up_at = per_frame.first().copied().unwrap_or(SIDECAR_UP_BOUND);
     let (from, rest) = settled(per_frame);
     let (behind, lag) = widest_lag(rest, from, PACED_FRAME_PERIOD);
     let (after, gap) = widest_gap(rest, from);
@@ -4541,8 +4567,9 @@ fn paced_rows_reach_a_pipe_while_the_stream_is_still_running() {
     );
 
     assert!(
-        up_at < SIDECAR_UP_BOUND,
-        "the first row took {up_at:?} to reach the pipe, past {SIDECAR_UP_BOUND:?}"
+        up_at < FIRST_OUTPUT_BOUND,
+        "the first row took {up_at:?} to reach the pipe while its frame was the only one \
+         written: rows are sitting in a buffer rather than following their frames"
     );
     assert!(
         by_the_last_frame >= PACED_FRAMES / 2,
@@ -4848,7 +4875,8 @@ fn a_sink_nothing_reaches_is_called_anyway() {
     // A module runs only inside a call, so a sink whose packets stop is
     // still called, with none, every fiftieth of a second. packet_tally,
     // asked to count those turns, says how many came while its input was
-    // held open with one message on it and nothing after.
+    // held open with one message on it and nothing after. The quiet is
+    // timed from its first such turn, once the sidecar is up and calling.
     ensure_modules_built();
     let module = module_path("packet_tally");
     let mut child = Command::new(env!("CARGO_BIN_EXE_ffrwd-wasm"))
@@ -4861,9 +4889,30 @@ fn a_sink_nothing_reaches_is_called_anyway() {
         .spawn()
         .expect("spawn ffrwd-wasm");
     let stdin = child.stdin.take().expect("child stdin");
+    let stdout = child.stdout.take().expect("child stdout");
+    let (row, rows) = std::sync::mpsc::channel::<serde_json::Value>();
+    let reader = thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let line = line.expect("read a row");
+            let parsed = serde_json::from_str(&line).expect("each row is JSON");
+            if row.send(parsed).is_err() {
+                return;
+            }
+        }
+    });
     let mut muxer = Muxer::new(stdin, &Stream::json(MICROS)).expect("write the data headers");
     write_message(&mut muxer, 0, r#"{"n":1}"#);
     muxer.flush().expect("flush the first message");
+    let mut seen = Vec::new();
+    while !seen
+        .iter()
+        .any(|row: &serde_json::Value| row.get("turns").is_some())
+    {
+        match rows.recv_timeout(FIRST_OUTPUT_BOUND) {
+            Ok(row) => seen.push(row),
+            Err(_) => panic!("no call came with no packets after the first message: {seen:?}"),
+        }
+    }
     thread::sleep(Duration::from_millis(1500));
     write_message(&mut muxer, 1_000_000, r#"{"n":2}"#);
     drop(muxer);
@@ -4875,10 +4924,9 @@ fn a_sink_nothing_reaches_is_called_anyway() {
         finished.status.code(),
         String::from_utf8_lossy(&finished.stderr)
     );
-    let rows: Vec<serde_json::Value> = String::from_utf8_lossy(&finished.stdout)
-        .lines()
-        .map(|line| serde_json::from_str(line).expect("each row is JSON"))
-        .collect();
+    reader.join().expect("the reader thread");
+    seen.extend(rows.try_iter());
+    let rows = seen;
     let between = rows
         .iter()
         .filter(|row| row.get("turns").is_some() && row["packets"] == 1)
@@ -5153,45 +5201,70 @@ fn leaky_drops_the_frames_a_stall_made_late_and_reports_on_stderr() {
         .spawn()
         .expect("spawn ffrwd-wasm");
     let stdin = child.stdin.take().expect("child stdin");
-    let writer = thread::spawn(move || {
-        let mut stdin = stdin;
-        let mut muxer = Muxer::new(&mut stdin, &a_stream()).expect("write NUT headers");
-        let mut send = |k: i64| {
-            muxer
-                .write_frame(k * PTS_STEP, &synthetic_frame(k as u8))
-                .expect("write NUT frame");
-            muxer.flush().expect("flush NUT");
+    let stdout = child.stdout.take().expect("child stdout");
+    // The pts of each frame that leaves, as it leaves.
+    let (left, kept) = std::sync::mpsc::channel();
+    let reader = thread::spawn(move || {
+        let Ok(mut demuxer) = Demuxer::open(stdout) else {
+            return;
         };
-        // Three sent as they are made, each on its own: the node learns that
-        // its input hands on one picture at a time. (Sent at once, these and
-        // the three a second later would be a relay's first two deliveries,
-        // which it passes while it learns.)
-        for k in 0..3 {
-            if k > 0 {
-                thread::sleep(Duration::from_millis(40));
+        let mut buf = Vec::new();
+        while let Ok(Some(pts)) = demuxer.read_frame(&mut buf) {
+            if left.send(pts / PTS_STEP).is_err() {
+                return;
             }
-            send(k);
         }
-        // A stall: the next three were made while nothing was sent, and
-        // arrive a second after their time.
-        thread::sleep(Duration::from_secs(1));
-        for k in 3..6 {
-            send(k);
-        }
-        // On time again: stamped where the wall has got to.
-        send(3 + 25);
-        muxer.finish().expect("finish the NUT stream");
     });
+    let mut muxer = Muxer::new(stdin, &a_stream()).expect("write NUT headers");
+    let send = |muxer: &mut Muxer<_>, k: i64| {
+        muxer
+            .write_frame(k * PTS_STEP, &synthetic_frame(k as u8))
+            .expect("write NUT frame");
+        muxer.flush().expect("flush NUT");
+    };
+    let came_out = |k: i64| {
+        let pts = kept
+            .recv_timeout(FIRST_OUTPUT_BOUND)
+            .unwrap_or_else(|_| panic!("frame {k} did not leave the node"));
+        assert_eq!(pts, k, "frame {k} passes");
+    };
+    // Three sent one at a time, each a frame-period after the one before
+    // has come out: the node reads them one by one, however long it took to
+    // start, and learns that its input hands on one picture at a time.
+    // Sent on a timer instead, they queue while the sidecar starts, and two
+    // read together are a delivery of a group to the node: it is still
+    // learning when the stall comes, and passes it. Each is stamped where
+    // the wall has got to since the first was sent, in frame-periods, so
+    // however long one takes to come out, the next is not made late by it.
+    let origin = Instant::now();
+    let made = || (origin.elapsed().as_secs_f64() * 25.0).floor() as i64;
+    send(&mut muxer, 0);
+    came_out(0);
+    let mut last = 0;
+    for _ in 1..3 {
+        thread::sleep(Duration::from_millis(40));
+        last = made();
+        send(&mut muxer, last);
+        came_out(last);
+    }
+    // A stall: the next three were made while nothing was sent, and
+    // arrive a second after their time.
+    thread::sleep(Duration::from_secs(1));
+    for k in last + 1..last + 4 {
+        send(&mut muxer, k);
+    }
+    // On time again: stamped where the wall has got to.
+    let on_time = made();
+    send(&mut muxer, on_time);
+    muxer.finish().expect("finish the NUT stream");
+    drop(muxer);
+    reader.join().expect("the reader finished");
     let output = child.wait_with_output().expect("wait for ffrwd-wasm");
-    writer.join().expect("the writer finished");
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     assert!(output.status.success(), "leaky exited badly:\n{stderr}");
 
-    let kept: Vec<i64> = read_nut(&output.stdout)
-        .into_iter()
-        .map(|(pts, _)| pts / PTS_STEP)
-        .collect();
-    assert_eq!(kept, vec![0, 1, 2, 28]);
+    let after_the_stall: Vec<i64> = kept.try_iter().collect();
+    assert_eq!(after_the_stall, vec![on_time], "stderr:\n{stderr}");
 
     let rows: Vec<serde_json::Value> = stderr
         .lines()
