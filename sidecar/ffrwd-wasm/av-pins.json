@@ -4,7 +4,8 @@
     "avutil": 61,
     "swresample": 7,
     "avcodec": 63,
-    "swscale": 10
+    "swscale": 10,
+    "avfilter": 12
   },
   "platforms": {
     "macos-aarch64": {

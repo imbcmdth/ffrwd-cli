@@ -5,10 +5,11 @@
 
 The wheel ships ffrwd_wasm_av/ at its root. The archive for the target's
 platform is downloaded, checked against the sha256 and byte count in
-av-pins.json, and its four shared libraries, COPYING.LGPLv2.1, VERSION and
-CONFIGURE replace whatever the directory held. A platform with no pin
-leaves the directory holding only a README, and the wheel builds without
-codecs. --check only verifies av-pins.json's shape.
+av-pins.json, and its four shared libraries, libavfilter where the
+archive has it, COPYING.LGPLv2.1, VERSION and CONFIGURE replace whatever
+the directory held. A platform with no pin leaves the directory holding
+only a README, and the wheel builds without codecs. --check only verifies
+av-pins.json's shape.
 
 Standard library only: this runs before anything is installed.
 """
@@ -33,6 +34,9 @@ PINS = HERE / "av-pins.json"
 DEST = HERE / "ffrwd_wasm_av"
 
 LIBRARIES = ("avutil", "swresample", "avcodec", "swscale")
+# Taken where the archive has them: releases before libavfilter was built
+# carry the four above alone.
+OPTIONAL_LIBRARIES = ("avfilter",)
 EXTRAS = ("COPYING.LGPLv2.1", "VERSION", "CONFIGURE")
 # The MIT notices of the header sets a platform compiles in, present only
 # where it does.
@@ -65,8 +69,15 @@ def check_pins(pins: object) -> dict[str, object]:
     if not isinstance(pins["ffmpeg"], str) or not pins["ffmpeg"]:
         raise PinError("ffmpeg is not a non-empty string")
     majors = pins["majors"]
-    if not isinstance(majors, dict) or set(majors) != set(LIBRARIES):
-        raise PinError(f"majors does not name exactly {', '.join(LIBRARIES)}")
+    if (
+        not isinstance(majors, dict)
+        or not set(LIBRARIES) <= set(majors)
+        or not set(majors) <= set(LIBRARIES) | set(OPTIONAL_LIBRARIES)
+    ):
+        raise PinError(
+            f"majors does not name {', '.join(LIBRARIES)}, and "
+            f"{', '.join(OPTIONAL_LIBRARIES)} where pinned, and nothing else"
+        )
     for lib, major in majors.items():
         if not isinstance(major, int) or isinstance(major, bool) or major <= 0:
             raise PinError(f"majors.{lib} is not a positive integer")
@@ -204,16 +215,19 @@ def main() -> int:
     majors = pins["majors"]
     assert isinstance(majors, dict)
     libraries = [library_name(platform, lib, majors[lib]) for lib in LIBRARIES]
+    optional = [
+        library_name(platform, lib, majors[lib]) for lib in OPTIONAL_LIBRARIES if lib in majors
+    ]
     with tempfile.TemporaryDirectory() as tmp:
         archive = pathlib.Path(tmp) / pin["url"].rsplit("/", 1)[-1]
         download(pin["url"], pin["sha256"], pin["bytes"], archive)
-        placed = extract(archive, libraries + list(EXTRAS), list(NOTICES), DEST)
+        placed = extract(archive, libraries + list(EXTRAS), optional + list(NOTICES), DEST)
 
     ffmpeg = f"ffmpeg {pins['ffmpeg']}"
     version = (DEST / "VERSION").read_text(encoding="utf-8").splitlines()
     if not version or version[0] != ffmpeg:
         raise SystemExit(f"fetch_av.py: the archive's VERSION does not name {ffmpeg}")
-    for name in libraries:
+    for name in libraries + [n for n in optional if n in placed]:
         (DEST / name).chmod(0o755)
 
     print(f"placed {platform} libav from {pin['url']} in {DEST}:")
