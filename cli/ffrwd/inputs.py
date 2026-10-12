@@ -118,6 +118,15 @@ INPUT_OPTIONS: dict[str, InputOptionSpec] = {
         # Names a decoder, not a demuxer; ffprobe rejects it outright.
         probes=False,
     ),
+    "hwaccel_output_format": InputOptionSpec(
+        name="hwaccel_output_format",
+        type="str",
+        doc="Keep a hardware decoder's frames in its memory ('cuda') rather than copy them out.",
+        flag="-hwaccel_output_format",
+        # Decode only, as `hwaccel` is; written by the compiler for a picture
+        # that stays on the card to an `_nvenc` encoder.
+        probes=False,
+    ),
     "seek_end": InputOptionSpec(
         name="seek_end",
         type="num",

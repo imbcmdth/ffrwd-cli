@@ -1450,6 +1450,15 @@ input's `-i`, in the order written.
 - The probe is cached per `(path, options)`. One path read two ways is two
   `-i` entries and two probes; two aliases spelling the same path *and* the
   same options share one `-i` and one probe.
+- An input decoded with `hwaccel => 'cuda'` whose picture reaches a
+  destination encoding with an `_nvenc` codec stays on the card: the
+  compiler writes `hwaccel_output_format cuda`, spells each filter on the
+  way that ffmpeg has a `_cuda` variant of as that variant (`scale`,
+  `overlay`, `pad`, `transpose`, `yadif`, `bwdif`, with the options the
+  variant takes), and runs the rest on the CPU as one segment between one
+  `hwdownload` and one `hwupload_cuda`. A software encoder, a module or a
+  second file reading the same picture gets the one download it needs.
+  Recipe [156](examples.md#156-stay-on-the-card-from-decode-to-encode).
 
 `format` is the option that changes what the path means: with a demuxer
 named, the path is that demuxer's to interpret and need not exist on disk.

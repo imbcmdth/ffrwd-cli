@@ -507,6 +507,22 @@ local session's to run. The `-profile` row is the measurement item 1
 asked for; the copy counts above are read off the code, not yet off the
 row on a 4K run.
 
+**Shipped (2026-10-12, item 7):** `cli/ffrwd/hardware.py`, a pass after
+the split: an input with `hwaccel => 'cuda'` whose picture reaches an
+`_nvenc` destination is told `hwaccel_output_format cuda`; `scale`,
+`overlay`, `pad`, `transpose`, `yadif` and `bwdif` become their `_cuda`
+variants where the call names only options the variant takes (`scale`'s
+`width`/`height` spelled `w`/`h`); `split` and the timing filters ride on
+the card; every other filter runs on the CPU as one segment with one
+`hwdownload` ahead and one `hwupload_cuda` behind where card work follows;
+a software encoder, a module or a second file reading a card frame gets
+one download. Where the compile knows its ffmpeg, the pass runs only if
+that build has the variants; where it knows none, the command is written
+for the reader's. Recipe 156, `docs/dialect.md` (input options) and
+`docs/known_gaps.md` (the card path is CUDA's) say so. Not done: the
+Vulkan family (`hwaccel vulkan`, `_vulkan` filters, the `_vulkan`
+encoders), the same shape on another device type when one is wanted.
+
 ### Wave 1: wgpu over wasi:webgpu, finished
 
 The experiment's backend made a product. Independent of the sidecar

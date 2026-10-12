@@ -1527,3 +1527,23 @@ ffrwd-wasm -m ticker=../sidecar/modules/target/wasm32-wasip2/release/ticker.wasm
 ```
 
 In a file run the source runs as fast as its reader drains it; in a live run it is paced to the wall clock. `WHERE s.t < 10` ends it after ten seconds, as it would any source. A network source is the same shape with a clock of its own: it emits when it has something, and `shape` may reach the network at compile time to learn its outputs, as a manifest is probed. `ffrwd.blitz.compose` with no streams, a page that animates on its own, is this recipe's shape too.
+
+## 156. Stay on the card from decode to encode
+
+`hwaccel => 'cuda'` decodes on the card and an `_nvenc` codec encodes there, and as written the frames would come down for every filter between and go back up for the encoder. The compiler keeps them where they are: the input is told `hwaccel_output_format cuda`, `scale` becomes `scale_cuda`, and the encoder reads the card's frames. A filter ffmpeg has no `_cuda` variant of, `hflip` here, runs on the CPU as one segment, one `hwdownload` ahead of it and one `hwupload_cuda` behind, so the resize after it is on the card again:
+
+```pgsql
+COPY (
+  SELECT scale(hflip(f.video[1]), 1280, -2), f.audio[1]
+  FROM input('film.mp4', hwaccel => 'cuda') f
+) TO 'small.mp4' WITH (video_codec 'h264_nvenc', video_bitrate '6M')
+```
+
+```
+$ ffrwd compile -f query.sql
+ffmpeg -hwaccel cuda -hwaccel_output_format cuda -i film.mp4 -filter_complex \
+  '[0:v:0]hwdownload,hflip,hwupload_cuda,scale_cuda=w=1280:h=-2[out0]' -map '[out0]' -map \
+  0:a:0 -c:1 copy -c:0 h264_nvenc -b:0 6M small.mp4
+```
+
+Only the picture that reaches an `_nvenc` encoder is kept on the card; a `libx264` destination, a module, or a second file reading the same picture is given a download of its own, and an input whose picture goes nowhere near a hardware encoder is decoded as the query asked and nothing more. `scale`'s `flags` and colour options, and `overlay`'s `format` and `alpha`, have no variant spelling, so a call naming one stays on the CPU.

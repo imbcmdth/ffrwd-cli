@@ -51,6 +51,7 @@ from .emit import Emitted, emit
 from .errors import ErrorCode, FfrwdError
 from .execute import DEFAULT_TIMEOUT
 from .functions import CODED_EDGES, WasmFunction, package_modules, script_definitions
+from .hardware import keep_on_the_card
 from .inputs import declared_probe, forces_demuxer, probe_options, render_options
 from .ir import LEAKY, Graph, Lateral
 from .leaky import decode_ahead_of_leaky
@@ -692,10 +693,11 @@ def compile_all(
         probes, probe_failures = _probe_inputs(res)
         _adopt_package_decoders(res, probes, packages, describe)
         describes = _describe_modules(res, describe)
+        registry = registry_module.load()
         graphs = lower_commands(
             res,
             probes,
-            registry=registry_module.load(),
+            registry=registry,
             on_warning=on_warning,
             describes=describes,
             invoke=invoke,
@@ -705,10 +707,13 @@ def compile_all(
         hosted = _hosted_wasm(res)
         modules = {declared.module for declared in hosted.values()}
         ready = [
-            insert_splits(
-                insert_pts_resets(
-                    decode_ahead_of_frame_readers(decode_ahead_of_leaky(graph), modules)
-                )
+            keep_on_the_card(
+                insert_splits(
+                    insert_pts_resets(
+                        decode_ahead_of_frame_readers(decode_ahead_of_leaky(graph), modules)
+                    )
+                ),
+                registry,
             )
             for graph in graphs
         ]
