@@ -16582,6 +16582,12 @@ class _Lowerer:
         """The rate a node's shape is told the stream `ref` runs at."""
         return stream_rate(self.graph, self.probes, self._made_shape, ref)
 
+    def _holds_on_the_gpu(self, name: str) -> bool:
+        """Whether node `name`'s shape holds an input on the GPU, which has
+        its region take coded edges as `SET ffrwd.edges = 'coded'` does."""
+        shape = self._made_shape(name)
+        return shape is not None and any(port.accepts.memory == "gpu" for port in shape.inputs)
+
     def _made_shape(self, name: str) -> NodeShape | None:
         found = self._made_shapes.get(name)
         raw = self.graph.node_shapes.get(name)
@@ -17197,7 +17203,11 @@ class _Lowerer:
         if lateral is not None:
             use = self._laterals[lateral[0]]
             connection.lateral = lateral[0]
-            connection.coded = connection.coded or declared.edges == CODED_EDGES
+            connection.coded = (
+                connection.coded
+                or declared.edges == CODED_EDGES
+                or self._holds_on_the_gpu(ref)
+            )
             if fed.stream.type == "video" and not connection.pix_fmt:
                 connection.pix_fmt = wire_pix_fmt(described)
             if port not in use.ports:

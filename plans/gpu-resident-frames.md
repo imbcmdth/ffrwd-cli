@@ -495,8 +495,10 @@ On the node-world raw path at `-jobs 1` the sidecar's own copies are now:
 pipe read into the demuxer's payload (1), `fetch` into wasm memory (1),
 the emitted frame lifted out of wasm (1), the mux write through the 1 MiB
 `BufWriter` into the pipe (2). The older-world path (`main.rs`,
-`older.rs`) still reads through its own `Demuxer<BufReader>` and copies
-as before; items 6 and 7 are untouched.
+`older.rs`, `adapters.rs`) is counted by the same row but still reads
+through its own `Demuxer<BufReader>` and copies as before: a frame is
+handed to an older module whole and comes back whole, which the row
+shows as `fetch` and `emit`. Item 6 is blitz's.
 
 Checked here: the unit tier, `gpu_frames`, `node_shapes`, `ffrwd_wasm`,
 `av`, `data_streams`, `packets`, `rows_module` and `relay`. The `live`
@@ -810,12 +812,13 @@ form that keeps the node world at 0.19.1, and the compiler half of 7.
   with a note where none does. Here there is none, so the GPU case is
   unrun; it is the local session's to run first.
 
-Still open in this wave: items 3, 5, 6, 6a and 8; of 7, the partition
-routing a region by its entry port's memory (today a region takes coded
-edges by `SET ffrwd.edges = 'coded'` only) waits on item 5, since until
-the decoder's images land in the pool a coded entry buys the region
-nothing a raw one does not; `GPU_JOBS` stays until the local session
-measures it with the device shared. The pool holds no per-frame colour:
+Of item 7, the partition now routes a region by its entry port's memory
+(`cli/ffrwd/processes.py`, `_holds_on_the_gpu`; the lateral's copy in
+`lower.py` the same way): a node module whose shape holds an input on the
+GPU takes coded edges as one declared `SET ffrwd.edges = 'coded'` does,
+with no clause, since the frames go onto the device either way (recipe
+157, `docs/dialect.md`). Shipped once item 5 had the decoder's frames in
+the pool on Windows. Items 6, 6a and 8 are open. The pool holds no per-frame colour:
 a frame's colour is its stream's, as the NUT header has it, and the
 decode node settles that header before the first frame.
 

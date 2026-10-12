@@ -4170,7 +4170,7 @@ class _Partitioner:
         stays raw.
         """
         for sidecar in self.sidecars:
-            if sidecar.module not in self.coded:
+            if sidecar.module not in self.coded and not self._holds_on_the_gpu(sidecar.node):
                 continue
             if sidecar.sink or sidecar.packet_sink or sidecar.packet_filter:
                 continue
@@ -4200,6 +4200,13 @@ class _Partitioner:
                     self.encode_delays.get(sidecar.id, 0), held
                 )
                 self.edges[index] = replace(edge, format=replace(wire, codec=COPY_CODEC))
+
+    def _holds_on_the_gpu(self, name: str) -> bool:
+        """True when node `name`'s shape holds an input on the GPU: its region
+        takes coded edges as one declared ``SET ffrwd.edges = 'coded'`` does,
+        since the sidecar decodes straight onto the device it holds them on."""
+        shape = self.node_shapes.get(name)
+        return shape is not None and any(port.accepts.memory == "gpu" for port in shape.inputs)
 
     def _decodable(self, edge: StreamEdge) -> bool:
         """True when `edge` carries an input's own picture, untrimmed, in a

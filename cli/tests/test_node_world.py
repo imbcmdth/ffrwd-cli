@@ -213,7 +213,18 @@ def _ticker(params: Mapping[str, object], bound: Sequence[str]) -> dict[str, obj
     )
 
 
+def _box(params: Mapping[str, object], bound: Sequence[str]) -> dict[str, object]:
+    """A node holding its picture on the GPU, or not, as its params say."""
+    clock = _clock("v")
+    clock["accepts"] = {"pixel_formats": ["rgba"], "memory": params.get("memory", "gpu")}
+    out = _output("out", "video")
+    out["format"] = {"kind": "like", "port": "v"}
+    out["memory"] = params.get("memory", "gpu")
+    return _shape([clock], [out], {"kind": "input", "port": "v"})
+
+
 SHAPES: dict[str, Callable[..., dict[str, object]]] = {
+    "box.wasm": _box,
     "spot.wasm": _spot,
     "ring.wasm": _reader("spots", _ROWS),
     "dim.wasm": _reader("boxes", _BOX),
@@ -226,6 +237,7 @@ SHAPES: dict[str, Callable[..., dict[str, object]]] = {
 }
 
 _PARAMS = {
+    "box.wasm": {"memory": {"type": "string"}},
     "spot.wasm": {"every": {"type": "number"}},
     "dim.wasm": {"amount": {"type": "number"}},
     "inset.wasm": {"port": {"type": "integer"}, "lead": {"type": "number"}},
@@ -272,6 +284,8 @@ class _Asked:
 
 
 _DECLARATIONS = {
+    "box": "CREATE FUNCTION box(v video_stream, memory text DEFAULT 'gpu') "
+    "RETURNS video_stream AS 'box.wasm', 'box' LANGUAGE wasm;",
     "spot": "CREATE FUNCTION spot(v video_stream, every number DEFAULT 30) "
     "RETURNS STRUCT(start_t number, id number, x number, y number, w number, h number)[] "
     "AS 'spot.wasm', 'spot' LANGUAGE wasm;",
@@ -2222,3 +2236,24 @@ def test_a_node_runs_on_one_worker_only_where_its_shape_says_it_is_impure(
     )
     (sidecar,) = plan.sidecars
     assert sidecar.impure == ("matte.wasm",)
+
+
+# -- a port held on the GPU takes the region's edges coded -------------------
+
+
+def test_a_node_holding_its_picture_on_the_gpu_takes_coded_edges(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The shape's `memory: gpu` stands where `SET ffrwd.edges = 'coded'`
+    stands: the input's h264 is decoded in the region and the hosted encoder
+    runs there; the same module holding nothing on the GPU takes raw
+    frames, as any node does without the clause."""
+    query = (
+        "COPY (SELECT box(f.video[1]{}) FROM input('f.mp4') f) TO 'out.mp4' "
+        "WITH (video_codec 'h264_nvenc')"
+    )
+    (on_card,) = _plan(query.format(""), monkeypatch).sidecars
+    assert on_card.av and on_card.graph is not None
+    assert [n.filter for n in on_card.graph.nodes.values()] == ["decode", "box", "encode"]
+    (in_host,) = _plan(query.format(", 'host'"), monkeypatch).sidecars
+    assert not in_host.av

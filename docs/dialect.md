@@ -429,7 +429,12 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   The clause means nothing on a value function, a codec package's
   function, a packet sink or a data filter, and is refused there; so is
   any other `SET` parameter. A run-time lateral feeding such a region
-  copies its picture too where the picture is a source's own stream.
+  copies its picture too where the picture is a source's own stream. A
+  node module whose shape holds an input on the GPU (`memory: gpu` in
+  the port's `accepts`, `sidecar/NODE-SHAPE.md`) takes the same edges
+  with no clause at all: the sidecar decodes onto the device it holds
+  the frames on. Recipe
+  [157](examples.md#157-a-module-holding-its-frames-on-the-gpu-takes-the-packets).
   Recipe [155](examples.md#155-decode-and-encode-inside-the-sidecar);
   `sidecar/AV-EDGE.md` has the sidecar side.
 - A **value-returning `LANGUAGE wasm` function** (`RETURNS text`,

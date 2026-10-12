@@ -1547,3 +1547,33 @@ ffmpeg -hwaccel cuda -hwaccel_output_format cuda -i film.mp4 -filter_complex \
 ```
 
 Only the picture that reaches an `_nvenc` encoder is kept on the card; a `libx264` destination, a module, or a second file reading the same picture is given a download of its own, and an input whose picture goes nowhere near a hardware encoder is decoded as the query asked and nothing more. `scale`'s `flags` and colour options, and `overlay`'s `format` and `alpha`, have no variant spelling, so a call naming one stays on the CPU.
+
+## 157. A module holding its frames on the GPU takes the packets
+
+A node module may hold a video port on the sidecar's GPU, saying so beside its shape (`sidecar/NODE-SHAPE.md`, "Frames on the GPU"). Such a module needs no `SET ffrwd.edges` clause: its region takes an input's own packets and decodes them in the sidecar, as recipe 155's does, since the frames are going onto the device either way. `gpu_box` draws a box on each frame on the card and hands the texture back; the destination's `h264_nvenc` is an encoder the sidecar hosts, so the exit is coded too, and the module runs under the `-gpu` grant its `wasi:webgpu` import needs:
+
+```pgsql
+CREATE FUNCTION gpu_box(v video_stream, memory text DEFAULT 'gpu', size number DEFAULT 8)
+  RETURNS video_stream
+  AS '../sidecar/modules/target/wasm32-wasip2/release/gpu_box.wasm', 'gpu_box'
+  LANGUAGE wasm;
+
+COPY (
+  SELECT gpu_box(f.video[1])
+  FROM input('tests/fixtures/testsrc.mp4') f
+) TO 'boxed.mp4' WITH (video_codec 'h264_nvenc', video_bitrate '6M')
+```
+
+```
+$ ffrwd compile -f query.sql
+ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 copy -f nut pipe:1 | ffrwd-wasm -f \
+  nut -i pipe:0 -gpu ../sidecar/modules/target/wasm32-wasip2/release/gpu_box.wasm -m \
+  gpu_box=../sidecar/modules/target/wasm32-wasip2/release/gpu_box.wasm -filter_complex \
+  '[0:v]decode=format=rgba[decode0];[v=decode0]gpu_box=memory=gpu:size=8[out=n1];'\
+'[n1]encode=codec=h264_nvenc:b=6M[out0]' -bound \
+  'gpu_box=[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]}]' -map '[out0]' -f nut \
+  pipe:1 | ffmpeg -f nut -analyzeduration 0 -fpsprobesize 3 -i pipe:0 -map 0:v:0 -c:0 copy \
+  boxed.mp4
+```
+
+With `memory => 'host'` the same module holds nothing on the GPU, and its region takes raw frames on both pipes unless the declaration says `SET ffrwd.edges = 'coded'`. Where the machine's decoder and the device share one (D3D12 on Windows) the decoder's frames land on the device directly; elsewhere the decoded picture reaches it through the sidecar's own upload at the module's input and comes back through one download at the output, which the `upload` and `download` rows of `--profile` count.
