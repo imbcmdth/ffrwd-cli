@@ -1,14 +1,13 @@
 package ffrwd:depth;
 
-/// A windowed filter that does native inference. It exports the stream
-/// interface, so frames reach it the way they reach any module, and imports
-/// `wasi:nn` - the standard interface, not anything of ours. It imports no
-/// filesystem: the graph file is the host's, and this module only knows the
-/// name it was bound to.
+/// A node that does native inference: the node world beside `ffrwd:gpu`,
+/// so its frames may be held on the GPU, which imports `wasi:webgpu` and so
+/// needs a `-gpu` grant to run at all, and `wasi:nn`, the standard
+/// interface. It imports no filesystem: the graph file is the host's, and
+/// this module only knows the name it was bound to.
 world depth {
-  export ffrwd:av/window-filter@0.10.0;
-
-  import wasi:nn/tensor@0.2.0-rc-2024-10-28;
+  include ffrwd:av/node-module@0.19.1;
+  include ffrwd:gpu/gpu-nn-module@0.1.0;
   import wasi:nn/graph@0.2.0-rc-2024-10-28;
   import wasi:nn/inference@0.2.0-rc-2024-10-28;
   import wasi:nn/errors@0.2.0-rc-2024-10-28;

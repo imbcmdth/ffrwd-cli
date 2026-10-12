@@ -1,5 +1,5 @@
-//! Real frames through the depth module, driven directly through
-//! `ffrwd_wasm_runtime::runtime` with no ffmpeg involved.
+//! Real frames through the depth module, a node held in host memory, driven
+//! directly through `ffrwd_wasm_runtime::runtime` with no ffmpeg involved.
 //!
 //! The graph is not in git and the ONNX Runtime that loads it is fetched, so
 //! this skips - loudly - when either is absent.
@@ -8,13 +8,14 @@
 
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use ffrwd_wasm_runtime::nn;
-use ffrwd_wasm_runtime::runtime::{
-    Filter, Format, Frame, Media, StreamInfo, TimeBase, VideoFormat,
+use ffrwd_wasm_runtime::node::{
+    Binding, BoundStream, Node, Payload, StreamFormat, Tick, TickFrame, TickStream,
 };
+use ffrwd_wasm_runtime::runtime::{self, StreamInfo, TimeBase, VideoFormat, WitNode};
 
 /// The name the module asks the host for.
 const MODEL: &str = "depth";
@@ -94,6 +95,10 @@ fn build_module() -> PathBuf {
 fn configured() -> &'static Result<PathBuf, String> {
     static READY: OnceLock<Result<PathBuf, String>> = OnceLock::new();
     READY.get_or_init(|| {
+        if !ffrwd_wasm_runtime::gpu::AVAILABLE {
+            return Err("depth imports wasi:webgpu, which a build without the gpu                         feature cannot host."
+                .to_string());
+        }
         let model = model_path();
         if !model.is_file() {
             return Err("depth's graph is absent. Run \
@@ -119,7 +124,12 @@ fn configured() -> &'static Result<PathBuf, String> {
             exclude: Vec::new(),
         })
         .map_err(|e| format!("loading the depth graph: {e}"))?;
-        Ok(build_module())
+        let module = build_module();
+        // The module may hold its frames on the GPU, so it imports the
+        // device, and runs only where it is granted one.
+        runtime::grant_gpu(&module.to_string_lossy())
+            .map_err(|e| format!("granting depth the device: {e}"))?;
+        Ok(module)
     })
 }
 
@@ -135,28 +145,80 @@ fn module_or_skip() -> Option<&'static PathBuf> {
     }
 }
 
-/// rgba geometry, one tick to the frame at 25 fps.
-fn format() -> Format {
-    Format {
-        media: Media::Video(VideoFormat {
+const TICKS: TimeBase = TimeBase { num: 1, den: 25 };
+
+/// The one stream depth reads: rgba, one tick to the frame at 25 fps.
+fn picture() -> BoundStream {
+    BoundStream {
+        port: "v".to_string(),
+        id: 0,
+        info: StreamInfo {
+            index: 0,
+            kind: "video".to_string(),
+            codec: "rawvideo".to_string(),
+            duration: None,
+            tags: Vec::new(),
+        },
+        time_base: TICKS,
+        format: StreamFormat::Video(VideoFormat {
             width: WIDTH,
             height: HEIGHT,
             pix_fmt: "rgba",
             frame_len: (WIDTH * HEIGHT * 4) as usize,
             color: None,
         }),
-        time_base: TimeBase { num: 1, den: 25 },
+        rendition: Default::default(),
+        row: None,
+        decode_delay: 0,
+        latency: None,
+        hint: Default::default(),
     }
 }
 
-fn stream() -> StreamInfo {
-    StreamInfo {
-        index: 0,
-        kind: "video".to_string(),
-        codec: "rawvideo".to_string(),
-        duration: None,
-        tags: Vec::new(),
-    }
+/// depth opened on the picture, its frames in host memory.
+fn open(module: &std::path::Path) -> WitNode {
+    WitNode::open(
+        &module.to_string_lossy(),
+        "",
+        vec![picture()],
+        &Binding::from_names(&["v".to_string()]),
+        &["out".to_string()],
+    )
+    .expect("opening depth")
+}
+
+/// The map `node` makes of `pixels` at `pts`.
+fn map_of(node: &mut WitNode, pts: i64, pixels: Vec<u8>, last: bool) -> Vec<u8> {
+    let tick = Tick {
+        pts,
+        ordinal: pts as u64,
+        time_base: TICKS,
+        last,
+        streams: vec![TickStream {
+            id: 0,
+            frames: vec![TickFrame {
+                pts,
+                duration: Some(1),
+                data: Arc::new(pixels).into(),
+                rows: Vec::new(),
+            }],
+            ..TickStream::default()
+        }],
+    };
+    let emitted = node.process(tick).expect("a frame through depth");
+    let mut maps: Vec<Vec<u8>> = emitted
+        .items
+        .into_iter()
+        .filter_map(|item| match item.payload {
+            Payload::Frame(frame) => {
+                assert_eq!(frame.pts, pts, "at the timestamp it arrived on");
+                Some(frame.data.host().as_ref().clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(maps.len(), 1, "one frame in, one out");
+    maps.remove(0)
 }
 
 /// A frame with structure in it: a bright disc on a dark ground, which any
@@ -191,32 +253,20 @@ fn a_real_frame_comes_back_as_a_depth_map_with_range_in_it() {
     let Some(module) = module_or_skip() else {
         return;
     };
-    let format = format();
-    let mut filter =
-        Filter::open(&module.to_string_lossy(), &format, &stream(), "").expect("opening depth");
-
-    let frame = Frame {
-        pts: 0,
-        data: a_scene().into(),
-        rows: Vec::new(),
-    };
+    let mut node = open(module);
+    let scene = a_scene();
     let started = Instant::now();
-    let out = filter
-        .process_window(std::slice::from_ref(&frame), &[], false)
-        .expect("one frame through depth");
+    let map = map_of(&mut node, 0, scene.clone(), false);
     let elapsed = started.elapsed();
 
-    assert_eq!(out.frames.len(), 1, "one frame in, one out");
-    let map = &out.frames[0];
-    assert_eq!(map.pts, 0, "and at the timestamp it arrived on");
     assert_eq!(
-        map.data.len(),
-        frame.data.len(),
+        map.len(),
+        scene.len(),
         "a depth map is a frame of the geometry it was opened for"
     );
 
     // Greyscale: equal in every channel, and opaque.
-    let (pixels, _) = map.data.as_chunks::<4>();
+    let (pixels, _) = map.as_chunks::<4>();
     for pixel in pixels {
         assert_eq!(
             (pixel[0], pixel[1], pixel[3]),
@@ -227,7 +277,7 @@ fn a_real_frame_comes_back_as_a_depth_map_with_range_in_it() {
 
     // Normalized per frame, so the range is the whole scale rather than
     // whatever the graph's raw units happened to be.
-    let greys: Vec<u8> = map.data.iter().step_by(4).copied().collect();
+    let greys: Vec<u8> = map.iter().step_by(4).copied().collect();
     let low = *greys.iter().min().expect("pixels");
     let high = *greys.iter().max().expect("pixels");
     assert_eq!((low, high), (0, 255), "min-max normalized onto the byte");
@@ -245,32 +295,14 @@ fn the_map_moves_when_the_scene_does() {
     let Some(module) = module_or_skip() else {
         return;
     };
-    let format = format();
-    let mut filter =
-        Filter::open(&module.to_string_lossy(), &format, &stream(), "").expect("opening depth");
-
-    let scene = Frame {
-        pts: 0,
-        data: a_scene().into(),
-        rows: Vec::new(),
-    };
+    let mut node = open(module);
+    let first = map_of(&mut node, 0, a_scene(), false);
     // The same geometry with nothing in it: one flat wall, which cannot read
     // as the same depth map as a disc in front of a gradient.
-    let flat = Frame {
-        pts: 1,
-        data: vec![128u8; (WIDTH * HEIGHT * 4) as usize].into(),
-        rows: Vec::new(),
-    };
-
-    let first = filter
-        .process_window(std::slice::from_ref(&scene), &[], false)
-        .expect("the scene");
-    let second = filter
-        .process_window(std::slice::from_ref(&flat), &[], true)
-        .expect("the flat wall");
-
+    let flat = vec![128u8; (WIDTH * HEIGHT * 4) as usize];
+    let second = map_of(&mut node, 1, flat, true);
     assert_ne!(
-        first.frames[0].data, second.frames[0].data,
+        first, second,
         "a different picture is a different depth map"
     );
 }

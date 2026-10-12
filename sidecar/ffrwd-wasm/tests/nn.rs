@@ -805,22 +805,27 @@ fn the_depth_of_field_chain_runs_and_keeps_every_frame() {
     write_chain_input(&input);
 
     // The wiring the compiler emits for blur_mask(v, depth(v)): one boundary
-    // read feeding both the model and the blur.
+    // read feeding both the model and the blur. depth is a node that may
+    // hold its frames on the GPU, so it is granted the device, and its pads
+    // name its ports.
+    let depth = built.join("depth.wasm").display().to_string();
     let result = run_with_runtime(
         &runtime,
         &[
             "-nn",
             &format!("depth={}", model.display()),
+            "-gpu",
+            &depth,
             "-f",
             "nut",
             "-i",
             &input.to_string_lossy(),
             "-m",
-            &format!("depth={}", built.join("depth.wasm").display()),
+            &format!("depth={depth}"),
             "-m",
             &format!("blur_mask={}", built.join("blur_mask.wasm").display()),
             "-filter_complex",
-            "[0:v]depth[n1];[0:v][n1]blur_mask[out0]",
+            "[v=0:v]depth[out=n1];[0:v][n1]blur_mask[out0]",
             "-map",
             "[out0]",
             "-f",
@@ -1255,5 +1260,262 @@ fn pictures_decoded_on_the_device_are_bound_to_cuda_and_never_read_back() {
     assert_eq!(bound.len(), downloaded.len());
     let worst = apart(&downloaded, &bound);
     assert!(worst < 1e-4, "apart by up to {worst}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_output_bound_to_a_texture_gives_the_same_rows_on_every_route() {
+    let Some(runtime) = runtime_dir() else {
+        announce_skip("nn_frames cannot run a model without a runtime");
+        return;
+    };
+    let dir = means_dir("textures");
+    let input = means_input(&dir);
+    let size = format!("width={}:height={}", MEANS_WIDTH / 2, MEANS_HEIGHT / 2);
+    let texture = "texture=mean:texture_width=3:texture_height=1";
+    let profile = ["-profile"];
+
+    // The reference: host memory, the CPU, every output read as bytes.
+    let (host, _) = means_run(
+        &runtime,
+        &dir,
+        &input,
+        "cpu",
+        false,
+        &format!("memory=host:{size}"),
+        &[],
+    );
+
+    // A CPU session writes host memory, which is uploaded into the texture.
+    let (uploaded, message) = means_run(
+        &runtime,
+        &dir,
+        &input,
+        "cpu",
+        false,
+        &format!("memory=gpu:{size}:{texture}"),
+        &profile,
+    );
+    if message.contains("no GPU") {
+        eprintln!("SKIPPED: the texture routes. This machine has no GPU adapter.");
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+    assert!(
+        message.contains("[nn] means: output mean uploaded to a texture, CPU writes host memory"),
+        "{message}"
+    );
+    assert_same_rows(&host, &uploaded, "uploaded against the CPU");
+
+    // A CUDA or DirectML session on the process's device writes the
+    // device's memory: nothing is read back but what the module reads.
+    for (target, provider) in [("cuda", "CUDA"), ("directml", "DIRECTML")] {
+        let (bound, message) = means_run(
+            &runtime,
+            &dir,
+            &input,
+            target,
+            false,
+            &format!("memory=gpu:{size}:{texture}"),
+            &profile,
+        );
+        if !message.contains(&format!("[nn] means: execution provider {provider}")) {
+            eprintln!("SKIPPED: {provider} did not engage here:\n{message}");
+            continue;
+        }
+        if !cfg!(windows) {
+            continue;
+        }
+        assert!(
+            message.contains(&format!(
+                "[nn] means: output mean to a texture, bound on {provider}"
+            )),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!(
+                "[nn] means: input from the pool, bound on {provider}"
+            )),
+            "{message}"
+        );
+        assert_same_rows(
+            &host,
+            &bound,
+            &format!("bound on {provider} against the CPU"),
+        );
+        assert_eq!(
+            downloaded_bytes(&message),
+            0,
+            "{provider}: the bound routes read nothing back: {message}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Builds the depth module, once per test binary.
+fn depth_module() -> PathBuf {
+    static BUILT: OnceLock<()> = OnceLock::new();
+    BUILT.get_or_init(|| {
+        let output = Command::new("cargo")
+            .args([
+                "build",
+                "--release",
+                "--target",
+                "wasm32-wasip2",
+                "-p",
+                "depth",
+            ])
+            .current_dir(sidecar_root().join("modules"))
+            .output()
+            .expect("spawn cargo build for depth");
+        assert!(
+            output.status.success(),
+            "building depth failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    });
+    sidecar_root().join("modules/target/wasm32-wasip2/release/depth.wasm")
+}
+
+/// A file's frames as raw rgba, as ffmpeg decodes them.
+fn rgba_of(path: &std::path::Path) -> Vec<u8> {
+    let output = Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-i"])
+        .arg(path)
+        .args(["-f", "rawvideo", "-pix_fmt", "rgba", "-"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("spawn ffmpeg");
+    assert!(
+        output.status.success(),
+        "decoding {} failed:\n{}",
+        path.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stdout
+}
+
+#[test]
+fn depth_on_the_device_paints_what_the_host_path_paints() {
+    let Some(runtime) = runtime_dir() else {
+        announce_skip("depth cannot run a model without a runtime");
+        return;
+    };
+    let model = depth_model();
+    if !model.is_file() {
+        eprintln!(
+            "SKIPPED: depth's graph is absent. Run \
+             sidecar/modules/depth/fetch-model.ps1 to download it."
+        );
+        return;
+    }
+    let module = depth_module().display().to_string();
+    let dir = means_dir("depth");
+    let input = dir.join("in.nut");
+    let output = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=s=96x64:r=25:d=0.12",
+            "-c:v",
+            "rawvideo",
+            "-pix_fmt",
+            "rgba",
+            "-f",
+            "nut",
+        ])
+        .arg(&input)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("spawn ffmpeg");
+    assert!(output.status.success(), "writing the input failed");
+
+    let run = |target: &str, memory: &str| {
+        let out = dir.join(format!("depth-{target}-{memory}.nut"));
+        let result = run_with_runtime(
+            &runtime,
+            &[
+                "-nn",
+                &format!("depth={}", model.display()),
+                "-nn-target",
+                target,
+                "-gpu",
+                &module,
+                "-f",
+                "nut",
+                "-i",
+                &input.to_string_lossy(),
+                "-m",
+                &format!("depth={module}"),
+                "-filter_complex",
+                &format!("[v=0:v]depth=memory={memory}[out=o]"),
+                "-map",
+                "[o]",
+                "-f",
+                "nut",
+                &out.to_string_lossy(),
+            ],
+        );
+        let message = stderr(&result);
+        assert!(
+            result.status.success() || message.contains("no GPU"),
+            "depth ({target}, {memory}) failed:\n{message}"
+        );
+        (out, message)
+    };
+
+    // CUDA where it engages, else the CPU, for both paths alike.
+    let (_, probe) = run("cuda", "host");
+    let target = if probe.contains("[nn] depth: execution provider CUDA") {
+        "cuda"
+    } else {
+        "cpu"
+    };
+    let (host, message) = run(target, "host");
+    assert!(
+        message.contains("[nn] depth: input in host memory, made on the CPU"),
+        "{message}"
+    );
+    let (gpu, message) = run(target, "gpu");
+    if message.contains("no GPU") {
+        eprintln!("SKIPPED: depth on the device. This machine has no GPU adapter.");
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+    let line = if target == "cuda" && cfg!(windows) {
+        "[nn] depth: output predicted_depth to a texture, bound on CUDA"
+    } else if target == "cuda" {
+        "[nn] depth: output predicted_depth uploaded to a texture, CUDA writes host memory"
+    } else {
+        "[nn] depth: output predicted_depth uploaded to a texture, CPU writes host memory"
+    };
+    assert!(message.contains(line), "{message}");
+
+    // The maps are bytes made from floats, so the two paths may round one
+    // sample a level apart, and no more.
+    let (a, b) = (rgba_of(&host), rgba_of(&gpu));
+    assert_eq!(a.len(), (96 * 64 * 4 * 3) as usize, "three frames of rgba");
+    assert_eq!(a.len(), b.len(), "as many frames, as large");
+    let worst = a
+        .iter()
+        .zip(&b)
+        .map(|(p, q)| p.abs_diff(*q))
+        .max()
+        .unwrap_or(0);
+    assert!(
+        worst <= 1,
+        "the two paths are apart by up to {worst} levels"
+    );
+    let greys: Vec<u8> = b.iter().step_by(4).copied().collect();
+    assert_eq!(
+        (greys.iter().min().copied(), greys.iter().max().copied()),
+        (Some(0), Some(255)),
+        "the device path stretches each map onto the byte too"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
