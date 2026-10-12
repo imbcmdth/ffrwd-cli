@@ -229,6 +229,10 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   reading encoded packets, run one call at a time whatever N is.
   `--jobs 1` hosts everything serially. The output is byte-identical at
   any N.
+- **`--profile`**, on `compile` and `run`, has every sidecar write one
+  row when it ends, `{"kind":"profile",...}`, with the bytes, calls and
+  seconds of each stage a frame crosses in it (`sidecar/NODE-CLI.md`,
+  `-profile`); the row leaves the run the way every row does.
 - A **packets `LANGUAGE wasm` function** (`RETURNS packets`) rewrites a
   stream's own ENCODED packets on their way out, and hands the same
   stream back: `weave(v video_stream, vecs cue[]) RETURNS packets`. It

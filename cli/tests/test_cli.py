@@ -1958,3 +1958,27 @@ def test_compile_prints_the_jobs_it_would_run_with(
 
     assert cli.main(["compile", SINKED_QUERY, "--jobs", "4"]) == 0
     assert "-jobs 4" in capsys.readouterr().out
+
+
+# --- --profile, each sidecar's bytes and time per stage ----------------------
+
+
+def test_profile_reaches_every_sidecar_and_the_printed_command(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    _ready_to_run: list[dict[str, object]],
+    _installed_sidecar: None,
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        "compile_all",
+        lambda text, **kw: Compiled([_sinked_graph("sink.mkv")], plan=_module_plan()),
+    )
+
+    assert cli.main(["run", SINKED_QUERY, "--profile"]) == 0
+    assert "-profile" in _sidecar_argv(_ready_to_run[0])
+    assert cli.main(["compile", SINKED_QUERY, "--profile"]) == 0
+    assert "-profile" in capsys.readouterr().out
+
+    assert cli.main(["run", SINKED_QUERY]) == 0
+    assert "-profile" not in _sidecar_argv(_ready_to_run[1])

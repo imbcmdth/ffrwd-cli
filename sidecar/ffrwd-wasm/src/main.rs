@@ -46,6 +46,7 @@ use std::time::Instant;
 
 use anyhow::{anyhow, bail, Context, Result};
 use ffrwd_wasm::nut;
+use ffrwd_wasm_runtime::profile::PROFILE;
 use ffrwd_wasm_runtime::runtime::{
     self, AudioFormat, Filter, Format, Frame, Media, StreamInfo, TimeBase, VideoFormat,
 };
@@ -399,6 +400,9 @@ struct Args {
     /// `-bound <name>=<bindings>`: per node name, the inputs each call of it
     /// binds as its shape was asked, the k-th for the k-th chain calling it.
     node_bounds: HashMap<String, Vec<Vec<ffrwd_wasm_runtime::node::Binding>>>,
+    /// `-profile`: write the run's bytes and time per stage as one row on
+    /// stderr when it ends.
+    profile: bool,
 }
 
 /// `-pad`'s JSON, following one packet sink `-i`: which relation row this
@@ -755,6 +759,7 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
     let mut annotations = Annotations::default();
     let mut rows_in: Vec<RowsInput> = Vec::new();
     let mut jobs: Option<usize> = None;
+    let mut profile = false;
     let mut codec_half: Option<codec::CodecHalf> = None;
     let mut frame_rate: Option<(i32, i32)> = None;
     let mut color = codec::ColorFlags::default();
@@ -903,6 +908,7 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
                 }
                 rows_in.push(read);
             }
+            "-profile" => profile = true,
             "-jobs" => {
                 let raw = next("-jobs")?;
                 let parsed: usize = raw
@@ -1019,6 +1025,7 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
         rows_in,
         rows_chain,
         jobs,
+        profile,
         codec: codec_half,
         frame_rate,
         color,
@@ -1287,13 +1294,42 @@ type Input = nut::Demuxer<io::BufReader<InputReader>>;
 type FrameOutput = nut::Muxer<io::BufWriter<OutputWriter>>;
 
 fn open_input(path: &InputPath) -> Result<InputReader> {
-    match path {
-        InputPath::Stdin => Ok(InputReader::Stdin(io::stdin())),
+    let reader = match path {
+        InputPath::Stdin => InputReader::Stdin(io::stdin()),
         InputPath::File(p) => File::open(p)
             .map(InputReader::File)
-            .with_context(|| format!("opening input {p}")),
+            .with_context(|| format!("opening input {p}"))?,
+    };
+    match &reader {
+        InputReader::Stdin(stdin) => widen_pipe(stdin),
+        InputReader::File(file) => widen_pipe(file),
     }
+    Ok(reader)
 }
+
+/// How big a pipe the run reads or writes is asked to be: the most Linux
+/// allows an ordinary process by default, so a frame's worth of bytes
+/// crosses in fewer reads and writes.
+const PIPE_BUFFER: u32 = 1 << 20;
+
+/// Asks Linux for a `PIPE_BUFFER` buffer on `fd`, no more than
+/// `/proc/sys/fs/pipe-max-size` allows (a larger ask is refused outright,
+/// not shortened). Best effort, the way the relay sizes its own pipes: a
+/// descriptor that is no pipe refuses and keeps what it has.
+#[cfg(target_os = "linux")]
+fn widen_pipe(fd: &impl std::os::fd::AsRawFd) {
+    let most = std::fs::read_to_string("/proc/sys/fs/pipe-max-size")
+        .ok()
+        .and_then(|text| text.trim().parse::<u32>().ok())
+        .unwrap_or(PIPE_BUFFER);
+    let size = libc::c_int::try_from(PIPE_BUFFER.min(most)).unwrap_or(libc::c_int::MAX);
+    // SAFETY: an open descriptor; fcntl reads nothing else.
+    unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETPIPE_SZ, size) };
+}
+
+/// Every other platform sizes its pipes itself.
+#[cfg(not(target_os = "linux"))]
+fn widen_pipe<T>(_fd: &T) {}
 
 /// Whether `path` names a Windows named pipe: one already made by whoever
 /// reads it, so it is opened rather than created. A POSIX fifo is an
@@ -1306,17 +1342,22 @@ fn is_named_pipe(path: &str) -> bool {
 /// changes nothing. A named pipe is opened for writing instead: creating one
 /// is not a thing to do to a pipe that is already there.
 fn open_output(path: &OutputPath) -> Result<OutputWriter> {
-    match path {
-        OutputPath::Stdout => Ok(OutputWriter::Stdout(io::stdout())),
+    let writer = match path {
+        OutputPath::Stdout => OutputWriter::Stdout(io::stdout()),
         OutputPath::File(p) if is_named_pipe(p) => std::fs::OpenOptions::new()
             .write(true)
             .open(p)
             .map(OutputWriter::File)
-            .with_context(|| format!("opening output {p}")),
+            .with_context(|| format!("opening output {p}"))?,
         OutputPath::File(p) => File::create(p)
             .map(OutputWriter::File)
-            .with_context(|| format!("opening output {p}")),
+            .with_context(|| format!("opening output {p}"))?,
+    };
+    match &writer {
+        OutputWriter::Stdout(stdout) => widen_pipe(stdout),
+        OutputWriter::File(file) => widen_pipe(file),
     }
+    Ok(writer)
 }
 
 /// Whether this output is a PIPE rather than a regular file: stdout, a
@@ -4243,7 +4284,11 @@ fn main() {
         }
     };
 
-    if let Err(e) = run(&args) {
+    let outcome = run(&args);
+    if args.profile {
+        eprintln!("{}{}", leaky::ROW_PREFIX, PROFILE.row());
+    }
+    if let Err(e) = outcome {
         eprintln!("ffrwd-wasm: {e:#}");
         std::process::exit(1);
     }

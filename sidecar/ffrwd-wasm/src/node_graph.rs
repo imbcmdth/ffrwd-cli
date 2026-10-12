@@ -19,6 +19,7 @@ use ffrwd_wasm_runtime::node::{
     Binding as PortBinding, BoundStream, Clock, FrameMemory, Node, NodeShape, OutputFormat,
     Pairing, PortKind, Rational, RowsUse, StreamFormat, StreamHint, TickFrame,
 };
+use ffrwd_wasm_runtime::profile::PROFILE;
 use ffrwd_wasm_runtime::runtime::{
     self, AudioFormat, Format, FormatOf, Media, Message, Packet, RenditionMeta, StreamInfo,
     TimeBase, VideoFormat, Wants, WitNode,
@@ -383,7 +384,7 @@ fn pump(
                     },
                     time_base: def.base,
                 };
-                crate::check_frame(&format, payload, number)
+                crate::check_frame(&format, payload.bytes(), number)
                     .with_context(|| def.spelling.clone())?;
                 let frame = match (&def.format, timing[index]) {
                     (StreamFormat::Audio(a), true) => TickFrame {
@@ -402,24 +403,25 @@ fn pump(
                         carried
                             .bytes
                             .fetch_add(payload.len() as u64, Ordering::Relaxed);
+                        PROFILE.held.count(payload.len());
                         TickFrame {
                             pts: packet.pts,
                             duration: None,
-                            data: Arc::new(payload.to_vec()).into(),
+                            data: Arc::new(payload.take()).into(),
                             rows: Vec::new(),
                         }
                     }
                 };
                 scheduler.arrive(id, Item::Frame(frame))
             }
-            StreamFormat::Data(_) if heartbeat::is_heartbeat(payload) => {
+            StreamFormat::Data(_) if heartbeat::is_heartbeat(payload.bytes()) => {
                 scheduler.progress(id, packet.pts)
             }
             StreamFormat::Data(_) => scheduler.arrive(
                 id,
                 Item::Message(Message {
                     pts: packet.pts,
-                    data: payload.to_vec(),
+                    data: payload.take(),
                 }),
             ),
             StreamFormat::Packets(_) => {
@@ -439,7 +441,7 @@ fn pump(
                         dts,
                         duration: None,
                         keyframe: packet.keyframe,
-                        data: payload.to_vec(),
+                        data: payload.take(),
                     }),
                 )
             }

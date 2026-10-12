@@ -457,6 +457,15 @@ def _add_jobs_argument(subparser: argparse.ArgumentParser) -> None:
     subparser.add_argument("--jobs", type=int, default=None, metavar="N", help=_JOBS_HELP)
 
 
+_PROFILE_HELP = (
+    "have every sidecar write its bytes and time per stage as one row when it ends"
+)
+
+
+def _add_profile_argument(subparser: argparse.ArgumentParser) -> None:
+    subparser.add_argument("--profile", action="store_true", help=_PROFILE_HELP)
+
+
 def _check_jobs(args: argparse.Namespace) -> int:
     """0 for a usable ``--jobs``, or 2 with the usage error printed."""
     jobs: int | None = getattr(args, "jobs", None)
@@ -549,6 +558,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--graph-only", action="store_true", help="print only the filter_complex string"
     )
     _add_jobs_argument(compile_p)
+    _add_profile_argument(compile_p)
     explain_p = subparsers.add_parser("explain", help="dump the compiled IR graph as JSON")
     _add_query_arguments(explain_p)
     _add_quiet_argument(explain_p)
@@ -594,6 +604,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "-y", action="store_true", dest="overwrite", help="pass -y (overwrite) to ffmpeg"
     )
     _add_jobs_argument(run_p)
+    _add_profile_argument(run_p)
     showing = run_p.add_mutually_exclusive_group()
     showing.add_argument(
         "--show",
@@ -1448,7 +1459,9 @@ def _cmd_compile(args: argparse.Namespace, on_warning: OnWarning) -> int:
         try:
             rendered = render_plan(
                 compiled.plan,
-                sidecar_argv=functools.partial(wasm.shown_argv, jobs=args.jobs),
+                sidecar_argv=functools.partial(
+                    wasm.shown_argv, jobs=args.jobs, profile=args.profile
+                ),
             )
         except FfrwdError as err:
             _print_error(err, source=args.query, packages=packages, query=query)
@@ -2044,7 +2057,9 @@ def _run_plan(
         # What a run takes, whether this machine runs every process of it or
         # it is placed on several nodes.
         options: dict[str, Any] = {
-            "sidecar_argv": functools.partial(wasm.sidecar_argv, jobs=args.jobs),
+            "sidecar_argv": functools.partial(
+                wasm.sidecar_argv, jobs=args.jobs, profile=args.profile
+            ),
             "timeout": timeout,
             "overwrite": args.overwrite,
             "echo": _echo_member if _verbose(args) else None,
@@ -2060,7 +2075,9 @@ def _run_plan(
             from . import nodes, placement
 
             placed = placement.place(plan, args.placement or "per-module")
-            result = nodes.execute_split(plan, placed, jobs=args.jobs, **options)
+            result = nodes.execute_split(
+                plan, placed, jobs=args.jobs, profile=args.profile, **options
+            )
         else:
             result = execute_plan(plan, **options)
     except FfrwdError as err:

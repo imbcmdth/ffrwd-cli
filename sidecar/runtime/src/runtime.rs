@@ -2321,6 +2321,7 @@ fn link(
         |host: &mut Host| host,
     )
     .map_err(wasm_err)?;
+    node_world::shadow_fetch(&mut linker)?;
     if wants_nn {
         wasmtime_wasi_nn::wit::add_to_linker(&mut linker, nn_view).map_err(wasm_err)?;
     }

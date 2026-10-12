@@ -203,7 +203,7 @@ ffrwd [<command>] [-h] [-f FILE] [-v NAME=VALUE] [-q] [query | recipe]
 
 | command | what it does | flags |
 |---|---|---|
-| `run` | **the default**: a query with a media destination compiles and executes it; one without prints its result set as a table, psql-style, executing nothing | `--timeout SECS` (default: ten times the longest input's duration, at least 600, none when an input is live) · `-y` (overwrite) · `--jobs N` (cap the sidecar's threads) · `--show` / `--show-only` (below) · `--remote` (below) |
+| `run` | **the default**: a query with a media destination compiles and executes it; one without prints its result set as a table, psql-style, executing nothing | `--timeout SECS` (default: ten times the longest input's duration, at least 600, none when an input is live) · `-y` (overwrite) · `--jobs N` (cap the sidecar's threads) · `--profile` (each sidecar's bytes and time per stage, as a row) · `--show` / `--show-only` (below) · `--remote` (below) |
 | `compile` | print the full ffmpeg command | `--graph-only` (just the filtergraph string) |
 | `explain` | dump the compiled graph as JSON | `--mermaid` (as a flowchart) · `--diagram` (rendered in the terminal; needs `ffrwd[diagram]`) |
 | `validate` | exit 0 if the query compiles, else a line-anchored error | `--json` (machine-readable error object on stdout) |

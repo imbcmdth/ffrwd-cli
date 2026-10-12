@@ -387,6 +387,7 @@ _NN_EXCLUDE_FLAG = "-nn-exclude"
 
 # The sidecar's worker-thread cap. Unwritten, the sidecar sizes its own pool.
 _JOBS_FLAG = "-jobs"
+_PROFILE_FLAG = "-profile"
 
 # Where a node's params are read whole from a file: ``<name>=<path>``.
 _PARAMS_FROM_FLAG = "-params-from"
@@ -1972,6 +1973,7 @@ def _argv(
     runtime: Sequence[str] = (),
     jobs: int | None = None,
     av_runtime: Sequence[str] = (),
+    profile: bool = False,
 ) -> list[str]:
     """One sidecar process as argv, run by `binary`.
 
@@ -2088,6 +2090,8 @@ def _argv(
         jobs = GPU_JOBS if jobs is None else min(jobs, GPU_JOBS)
     if jobs is not None:
         argv += [_JOBS_FLAG, str(jobs)]
+    if profile:
+        argv.append(_PROFILE_FLAG)
     if process.reads_rows:
         argv += [_ANNOTATIONS_FLAG, ANNOTATIONS_IN]
     argv += _nn_args(process.models, runtime)
@@ -2352,6 +2356,7 @@ def sidecar_argv(
     reads: Sequence[str] = (),
     writes: Sequence[str] = (),
     jobs: int | None = None,
+    profile: bool = False,
 ) -> list[str]:
     """The argv that RUNS one sidecar process, with the binary located.
 
@@ -2367,6 +2372,8 @@ def sidecar_argv(
 
     `jobs` is the worker-thread cap the run asked for, passed to every
     sidecar; None is the default, the sidecar sizing itself to the machine.
+    `profile` has every sidecar write its bytes and time per stage as one
+    row when it ends.
 
     Raises ``FfrwdError`` when the sidecar is not installed -- the same
     rejection, and the same hint, a describe gives.
@@ -2386,6 +2393,7 @@ def sidecar_argv(
         nn.spawn_args() if process.models else (),
         jobs,
         av.spawn_args() if process.av else (),
+        profile,
     )
 
 
@@ -2394,6 +2402,7 @@ def shown_argv(
     reads: Sequence[str] = (),
     writes: Sequence[str] = (),
     jobs: int | None = None,
+    profile: bool = False,
 ) -> list[str]:
     """The argv a PRINTED command line shows, naming the sidecar by program name.
 
@@ -2401,7 +2410,7 @@ def shown_argv(
     what a reader would type, resolved by PATH, not the absolute path this
     machine happens to have found -- and so with no runtime directory either.
     """
-    return _argv(binaries.SIDECAR_EXECUTABLE, process, reads, writes, (), jobs)
+    return _argv(binaries.SIDECAR_EXECUTABLE, process, reads, writes, (), jobs, profile=profile)
 
 
 def model_path(module: str, export: str) -> str:

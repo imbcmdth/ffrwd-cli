@@ -8,6 +8,7 @@
 //! on the way out either.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{anyhow, bail, Context, Result};
 use wasmtime::component::{Component, Resource, ResourceTable};
@@ -30,6 +31,7 @@ use crate::node::{
     OutFrame, OutputFormat, OutputPort, Pairing, Payload, PortKind, Rational, RowsUse,
     StreamFormat, Tick, TickStream, VideoSpec,
 };
+use crate::profile::PROFILE;
 
 /// The world a node module is built against.
 pub const NODE_WORLD: &str = "0.19.1";
@@ -163,34 +165,20 @@ impl node_tick::HostTick for Host {
             .collect())
     }
 
+    /// The generated binding, which `shadow_fetch` stands in front of: it
+    /// answers only where that shadow is not linked, and then with a copy
+    /// the shadow does without.
     fn fetch(
         &mut self,
         tick: Resource<TickHandle>,
         id: u32,
         index: u32,
     ) -> wasmtime::Result<Vec<u8>> {
-        let handle = self.table.get(&tick)?;
-        if handle.timing.contains(&id) {
-            let port = handle.bound(id).map(|b| b.port.clone()).unwrap_or_default();
-            return Err(wasmtime::Error::msg(format!(
-                "frame {index} of stream {id} asked of input '{port}', which wants timing: its \
-                 frames carry their times alone and fetch on one is a fault"
-            )));
-        }
-        let frames = &handle.stream(id)?.frames;
-        let frame = frames.get(index as usize).ok_or_else(|| {
-            wasmtime::Error::msg(format!(
-                "frame {index} of stream {id} asked of a tick handing {}",
-                frames.len()
-            ))
-        })?;
-        // A frame on the GPU is read back here, once, and kept: `fetch` is
-        // the one download a module asks for.
-        let bytes = frame
-            .data
-            .bytes()
-            .map_err(|e| wasmtime::Error::msg(format!("frame {index} of stream {id}: {e}")))?;
-        Ok(bytes.as_ref().clone())
+        let bytes = fetched(self, &tick, id, index)?;
+        let started = Instant::now();
+        let copied = bytes.as_ref().clone();
+        PROFILE.fetch.add(copied.len(), started);
+        Ok(copied)
     }
 
     fn messages(
@@ -660,11 +648,13 @@ impl Node for WitNode {
             .map_err(|e| anyhow!("entering a tick into the resource table: {e}"))?;
         let handle = Resource::new_borrow(entry.rep());
         self.store.data_mut().gpu_tick = Some(entry.rep());
+        let started = Instant::now();
         let produced = self
             .instance
             .ffrwd_av_node()
             .call_process(&mut self.store, handle)
             .map_err(wasm_err);
+        PROFILE.process.add(0, started);
         let host = self.store.data_mut();
         host.gpu_tick = None;
         let handed = std::mem::take(&mut host.gpu_emitted);
@@ -678,6 +668,107 @@ impl Node for WitNode {
         Ok(emitted)
     }
 }
+
+/// The bytes `fetch` answers with: frame `index` of stream `id` of the tick,
+/// as the host holds them.
+fn fetched(
+    host: &mut Host,
+    tick: &Resource<TickHandle>,
+    id: u32,
+    index: u32,
+) -> wasmtime::Result<Arc<Vec<u8>>> {
+    let handle = host.table.get(tick)?;
+    if handle.timing.contains(&id) {
+        let port = handle.bound(id).map(|b| b.port.clone()).unwrap_or_default();
+        return Err(wasmtime::Error::msg(format!(
+            "frame {index} of stream {id} asked of input '{port}', which wants timing: its \
+             frames carry their times alone and fetch on one is a fault"
+        )));
+    }
+    let frames = &handle.stream(id)?.frames;
+    let frame = frames.get(index as usize).ok_or_else(|| {
+        wasmtime::Error::msg(format!(
+            "frame {index} of stream {id} asked of a tick handing {}",
+            frames.len()
+        ))
+    })?;
+    // A frame on the GPU is read back here, once, and kept: `fetch` is the
+    // one download a module asks for.
+    frame
+        .data
+        .bytes()
+        .map_err(|e| wasmtime::Error::msg(format!("frame {index} of stream {id}: {e}")))
+}
+
+/// A held frame's bytes, lowered into the module's memory from where the
+/// host holds them: the one copy the canonical ABI makes, and none before
+/// it. The generated binding returns a `Vec<u8>`, which is a copy of the
+/// frame that the ABI then copies again.
+struct Held(Arc<Vec<u8>>);
+
+// SAFETY: `Held` lowers exactly as the slice it holds does, and its ABI and
+// type check are the slice's.
+unsafe impl wasmtime::component::ComponentType for Held {
+    type Lower = <[u8] as wasmtime::component::ComponentType>::Lower;
+
+    const ABI: wasmtime::component::__internal::CanonicalAbiInfo =
+        <[u8] as wasmtime::component::ComponentType>::ABI;
+
+    fn typecheck(
+        ty: &wasmtime::component::__internal::InterfaceType,
+        types: &wasmtime::component::__internal::InstanceType<'_>,
+    ) -> wasmtime::Result<()> {
+        <[u8] as wasmtime::component::ComponentType>::typecheck(ty, types)
+    }
+}
+
+// SAFETY: as above; both methods are the slice's own.
+unsafe impl wasmtime::component::Lower for Held {
+    fn linear_lower_to_flat<T>(
+        &self,
+        cx: &mut wasmtime::component::__internal::LowerContext<'_, T>,
+        ty: wasmtime::component::__internal::InterfaceType,
+        dst: &mut std::mem::MaybeUninit<Self::Lower>,
+    ) -> wasmtime::Result<()> {
+        self.0.as_slice().linear_lower_to_flat(cx, ty, dst)
+    }
+
+    fn linear_lower_to_memory<T>(
+        &self,
+        cx: &mut wasmtime::component::__internal::LowerContext<'_, T>,
+        ty: wasmtime::component::__internal::InterfaceType,
+        offset: usize,
+    ) -> wasmtime::Result<()> {
+        self.0.as_slice().linear_lower_to_memory(cx, ty, offset)
+    }
+}
+
+/// Links `tick.fetch` over the generated binding, so a frame's bytes are
+/// copied into the module once rather than twice. Called after the node
+/// tick's `add_to_linker`, which it shadows for that one function.
+pub(super) fn shadow_fetch(linker: &mut wasmtime::component::Linker<Host>) -> Result<()> {
+    linker.allow_shadowing(true);
+    let outcome = linker
+        .instance(NODE_TICK_INTERFACE)
+        .and_then(|mut tick| {
+            tick.func_wrap(
+                "[method]tick.fetch",
+                |mut store: wasmtime::StoreContextMut<'_, Host>,
+                 (tick, id, index): (Resource<TickHandle>, u32, u32)|
+                 -> wasmtime::Result<(Held,)> {
+                    let bytes = fetched(store.data_mut(), &tick, id, index)?;
+                    PROFILE.fetch.count(bytes.len());
+                    Ok((Held(bytes),))
+                },
+            )
+        })
+        .map_err(wasm_err);
+    linker.allow_shadowing(false);
+    outcome
+}
+
+/// The node tick's interface, as the linker names it.
+const NODE_TICK_INTERFACE: &str = "ffrwd:av/node-tick@0.19.1";
 
 impl WitNode {
     /// What a call returned, in the host's spelling and checked: each item on
@@ -697,6 +788,7 @@ impl WitNode {
             let (payload, time) = match emission.payload {
                 wit::Payload::Frame(f) => {
                     check_kind(name, &emission.port, kind, "a frame", kind.is_frames())?;
+                    PROFILE.emit.count(f.data.len());
                     (
                         Payload::Frame(OutFrame {
                             pts: f.pts,

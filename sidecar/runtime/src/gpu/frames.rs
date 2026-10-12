@@ -15,6 +15,9 @@
 use std::borrow::Cow;
 use std::fmt;
 use std::sync::{mpsc, Arc, OnceLock};
+use std::time::Instant;
+
+use crate::profile::PROFILE;
 
 use anyhow::{anyhow, bail, Result};
 use wasi_webgpu_wasmtime::reexports::{wgpu_core, wgpu_types};
@@ -115,6 +118,7 @@ impl GpuFrame {
         height: u32,
         bytes: Arc<Vec<u8>>,
     ) -> Result<Arc<GpuFrame>> {
+        let started = Instant::now();
         let specs = layout(pix_fmt, width, height)
             .ok_or_else(|| anyhow!("{pix_fmt} is not a format frames are held on the GPU in"))?;
         let expected: usize = specs
@@ -175,6 +179,7 @@ impl GpuFrame {
             planes,
             bytes: OnceLock::new(),
         };
+        PROFILE.upload.add(bytes.len(), started);
         let _ = frame.bytes.set(bytes);
         Ok(Arc::new(frame))
     }
@@ -244,7 +249,9 @@ impl GpuFrame {
         if let Some(bytes) = self.bytes.get() {
             return Ok(Arc::clone(bytes));
         }
+        let started = Instant::now();
         let bytes = self.download()?;
+        PROFILE.download.add(bytes.len(), started);
         let _ = self.bytes.set(bytes);
         Ok(Arc::clone(self.bytes.get().expect("just set")))
     }

@@ -352,6 +352,7 @@ class _Agent:
         self._terminal = terminal if isinstance(terminal, str) else None
         jobs = job.get("jobs")
         self._jobs = jobs if isinstance(jobs, int) and not isinstance(jobs, bool) else None
+        self._profile = job.get("profile") is True
         dump = job.get("dump")
         self._dump = Path(dump) if isinstance(dump, str) and dump else None
         self._stack = contextlib.ExitStack()
@@ -555,7 +556,7 @@ class _Agent:
         send = self._channel.send
         laterals = _Laterals(
             self._compile if self.plan.laterals else None,
-            _instance_sidecar_argv(self._jobs),
+            _instance_sidecar_argv(self._jobs, self._profile),
             self._row,
             self._dump,
             self._placeholders.taps,
@@ -747,15 +748,15 @@ def _without_runtime(words: Sequence[str]) -> list[str]:
     return out
 
 
-def _instance_sidecar_argv(jobs: int | None) -> SidecarArgv:
+def _instance_sidecar_argv(jobs: int | None, profile: bool = False) -> SidecarArgv:
     """How a runner renders a sidecar for a run-time lateral's instance:
-    as the run would, with its ``--jobs``."""
+    as the run would, with its ``--jobs`` and ``--profile``."""
 
     def render(process: object, reads: Sequence[str], writes: Sequence[str]) -> list[str]:
         from .processes import SidecarProcess
 
         assert isinstance(process, SidecarProcess)
-        return wasm.sidecar_argv(process, reads, writes, jobs=jobs)
+        return wasm.sidecar_argv(process, reads, writes, jobs=jobs, profile=profile)
 
     return render
 
@@ -1328,6 +1329,7 @@ def execute_split(
     dump: Path | None = None,
     stop: threading.Event | None = None,
     jobs: int | None = None,
+    profile: bool = False,
     host: str = "127.0.0.1",
     start: StartRunner = start_local_runner,
     started: Callable[[int, Runner], None] | None = None,
@@ -1343,7 +1345,8 @@ def execute_split(
     `startup` is how long every runner is given to dial the coordinator and
     say it is ready: a runner on a machine that has to be started first needs
     longer than one here.
-    `jobs` is what a runner renders a run-time lateral's sidecars with.
+    `jobs` and `profile` are what a runner renders a run-time lateral's
+    sidecars with.
 
     Refused before anything starts: a placement :func:`check_placement`
     refuses, and a plan whose argv does not render.
@@ -1370,6 +1373,7 @@ def execute_split(
         "players": shown,
         "terminal": terminal_member(plan) if work is not None else None,
         "jobs": jobs,
+        "profile": profile,
         "dump": str(dump) if dump is not None else None,
         # The sidecar the argv names, which a runner swaps for its own; none
         # when a hook of the caller's own rendered the sidecars.

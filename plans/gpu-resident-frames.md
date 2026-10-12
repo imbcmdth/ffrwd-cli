@@ -464,6 +464,49 @@ Acceptance: at most ten copies per frame on the raw path at
 `-jobs 1`, measured by the profile rows; 4K30 rgba passthrough through an
 `invert` module at real time on the owner's machine.
 
+**Shipped (2026-10-12, on this branch, from the cloud session):** items
+1 to 5 on the node-world path.
+
+- `-profile` (`runtime/src/profile.rs`, `NODE-CLI.md`): one row at the
+  end of the run with bytes, calls and seconds per stage: `read`, `held`,
+  `fetch`, `process`, `emit`, `upload`, `download`, `write`. The counters
+  are process-wide atomics and always on; the row is written only when
+  asked. `tests/gpu_frames.rs` pins the stages a frame crosses in host
+  memory.
+- The pipe is read into the demuxer (`edges.rs`): no `BufReader`; where
+  the demuxer is waiting on a frame's payload with at least a chunk still
+  wanted, the pipe is read straight into that payload
+  (`PushDemuxer::payload_space`), else a 64 KiB chunk is fed; and the
+  payload is taken out of the demuxer (`take_payload`) rather than
+  copied, so a frame off the wire becomes the held frame with no copy
+  of its own.
+- `fetch` lowers the held bytes straight into the module's memory
+  (`node_world.rs`, `Held`, `shadow_fetch`): the generated binding's
+  `Vec<u8>` return copied the frame once before the canonical ABI copied
+  it again; the shadow is a `func_wrap` over the same interface name that
+  lowers the `Arc<Vec<u8>>` as a slice. One copy where there were two.
+- Stdio and fifo pipes are asked for 1 MiB on Linux (`main.rs`,
+  `widen_pipe`), clipped to `/proc/sys/fs/pipe-max-size`, the way the
+  relay sizes its own.
+- Item 5 is wave 3's shared device; `GPU_JOBS` stays until the local
+  session's measurement.
+
+On the node-world raw path at `-jobs 1` the sidecar's own copies are now:
+pipe read into the demuxer's payload (1), `fetch` into wasm memory (1),
+the emitted frame lifted out of wasm (1), the mux write through the 1 MiB
+`BufWriter` into the pipe (2). The older-world path (`main.rs`,
+`older.rs`) still reads through its own `Demuxer<BufReader>` and copies
+as before; items 6 and 7 are untouched.
+
+Checked here: the unit tier, `gpu_frames`, `node_shapes`, `ffrwd_wasm`,
+`av`, `data_streams`, `packets`, `rows_module` and `relay`. The `live`
+suite fails in this container on the tree before this wave and before
+wave 3's slice alike (the feed shows for 35 frames where 50 to 62 are
+expected), so it is the container's timing, not the change; it is the
+local session's to run. The `-profile` row is the measurement item 1
+asked for; the copy counts above are read off the code, not yet off the
+row on a 4K run.
+
 ### Wave 1: wgpu over wasi:webgpu, finished
 
 The experiment's backend made a product. Independent of the sidecar

@@ -98,9 +98,15 @@ fn boxed(index: u8) -> Vec<u8> {
 
 /// Runs gpu_box over `frames` with `memory` as its params say, at `jobs`.
 fn run(memory: &str, jobs: &str, frames: &[Vec<u8>]) -> Output {
+    run_with(memory, jobs, frames, &[])
+}
+
+/// `run` with `extra` ahead of the inputs.
+fn run_with(memory: &str, jobs: &str, frames: &[Vec<u8>], extra: &[&str]) -> Output {
     let module = module();
     let wiring = format!("[v=0:v]gpu_box=memory={memory}:size={SIDE}[out=o]");
     let mut child = Command::new(env!("CARGO_BIN_EXE_ffrwd-wasm"))
+        .args(extra)
         .args(["-gpu", &module, "-jobs", jobs, "-f", "nut", "-i", "-", "-m"])
         .arg(format!("gpu_box={module}"))
         .args(["-filter_complex", &wiring, "-map", "[o]", "-f", "nut", "-"])
@@ -172,6 +178,44 @@ fn frames_in_host_memory_come_back_with_the_box_drawn() {
     for (index, (pts, data)) in got.iter().enumerate() {
         assert_eq!(*pts, index as i64);
         assert_eq!(*data, boxed(index as u8), "frame {index}");
+    }
+}
+
+#[test]
+fn a_profiled_run_counts_each_stage_the_frames_crossed() {
+    let frames: Vec<Vec<u8>> = (0..3u8).map(picture).collect();
+    let output = run_with("host", "1", &frames, &["-profile"]);
+    let got = frames_of(&output, "gpu_box in host memory with -profile");
+    assert_eq!(got.len(), 3);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let row: serde_json::Value = stderr
+        .lines()
+        .filter_map(|line| line.strip_prefix("ffrwd:row "))
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("a row is JSON"))
+        .find(|row| row["kind"] == "profile")
+        .unwrap_or_else(|| panic!("no profile row on stderr:\n{stderr}"));
+    let total = (3 * FRAME_LEN) as u64;
+    for stage in ["held", "fetch", "emit", "write"] {
+        assert_eq!(row[stage]["bytes"], total, "{stage} in {row}");
+        assert_eq!(row[stage]["calls"], 3, "{stage} in {row}");
+    }
+    assert!(
+        row["read"]["bytes"]
+            .as_u64()
+            .is_some_and(|read| read > total),
+        "the wire carries the frames and their headers: {row}"
+    );
+    assert!(
+        row["process"]["calls"]
+            .as_u64()
+            .is_some_and(|calls| calls >= 3),
+        "one process call per tick at least: {row}"
+    );
+    for stage in ["upload", "download"] {
+        assert_eq!(
+            row[stage]["bytes"], 0,
+            "nothing on the GPU in host memory: {row}"
+        );
     }
 }
 
