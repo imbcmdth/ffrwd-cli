@@ -416,12 +416,6 @@ _GRANT_FLAGS: Mapping[str, str] = {
     "gpu": "-gpu",
 }
 
-# The most workers a sidecar process holding a GPU-granted module gets. A
-# frame-independent module runs one instance per worker, and each instance
-# opens a GPU device of its own: pyrowave's encode-and-decode round trip ran
-# about 270 fps at one or two workers and 48 fps at the default 32, the
-# devices contending for one GPU. A run's own lower -jobs still wins.
-GPU_JOBS = 2
 MODEL_SUFFIX = ".onnx"
 ANNOTATIONS_IN = "in"
 ANNOTATIONS_OUT = "out"
@@ -2046,8 +2040,8 @@ def _argv(
     sidecar process whenever the run gave one -- the sidecar itself decides
     what each module's lane admits. Absent, the sidecar sizes its pool to
     the machine, so a run at the default carries no ``-jobs`` at all. A
-    process holding a GPU-granted module is the exception: it gets at most
-    :data:`GPU_JOBS`, since every worker's instance opens a device of its own.
+    process holding a GPU-granted module is no exception: every worker's
+    instance shares the sidecar's one device.
     """
     if process.packet_source and not process.outputs:
         raise _reject(
@@ -2086,8 +2080,6 @@ def _argv(
                 ]
             if pad:
                 argv += ["-pad", json.dumps(pad)]
-    if any(grant.effect == "gpu" for grant in process.grants):
-        jobs = GPU_JOBS if jobs is None else min(jobs, GPU_JOBS)
     if jobs is not None:
         argv += [_JOBS_FLAG, str(jobs)]
     if profile:

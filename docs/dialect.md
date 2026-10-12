@@ -319,9 +319,9 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   module importing `wasi:http`, `wasi:sockets` or `wasi:webgpu` runs
   only under the sidecar's matching per-module grant (`-http <module>`,
   `-udp <module>`, `-tcp <module>`, `-gpu <module>`), which the compiler
-  emits from the module's own describe; each is denied without it. A
-  sidecar process holding a GPU module runs at most two workers, since
-  every worker's instance opens a GPU device of its own. Secrets do not belong in the
+  emits from the module's own describe; each is denied without it. Every
+  worker of a sidecar process shares its one GPU device, so a GPU module
+  takes the same workers as any other. Secrets do not belong in the
   value arguments - the query text is the command line. Recipes
   [98](examples.md#98-post-what-a-module-found-as-it-is-found),
   [99](corpus.md#99-watch-the-frames-go-by).
