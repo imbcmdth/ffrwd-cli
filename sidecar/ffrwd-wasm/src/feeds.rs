@@ -3,7 +3,8 @@
 //! the input's source for as long as it stays, conformed to the port's
 //! format on the way in: its picture to the size and pixel format the port
 //! takes, decoded first where it arrives coded, its sound to the port's
-//! sample format. One connection at a time;
+//! sample format. A picture for an input held on the GPU is put there as
+//! it arrives and conformed on the device. One connection at a time;
 //! a second while one is on is accepted and closed at once, unless the one
 //! on has sent nothing yet, in which case the newcomer takes its place. The
 //! connection is read only while the input has room, so a source that
@@ -20,7 +21,7 @@ use ffrwd_frame::yuv::{self, Colour};
 use ffrwd_frame::Rgba;
 use ffrwd_wasm::nut::{self, Event, Limits, Media, PushDemuxer};
 use ffrwd_wasm_runtime::av::{self, Decoder, Hw};
-use ffrwd_wasm_runtime::node::{StreamFormat, TickFrame};
+use ffrwd_wasm_runtime::node::{FrameData, StreamFormat, TickFrame};
 use ffrwd_wasm_runtime::runtime::{AudioFormat, ColorInfo, Message, StreamInfo, VideoFormat};
 use serde_json::json;
 
@@ -56,6 +57,9 @@ pub struct FeedMember {
     /// The port reads its frames' times alone: nothing is conformed or
     /// carried for it.
     pub timing: bool,
+    /// The port holds its frames on the GPU, where its picture is
+    /// conformed.
+    pub on_gpu: bool,
 }
 
 /// One listener: a port, and the inputs its connections feed. The picture
@@ -83,6 +87,42 @@ struct Picture {
     colour: Option<Colour>,
     to: VideoFormat,
     to_colour: Option<Colour>,
+    /// Set for a port held on the GPU, where the picture is conformed on
+    /// the device: the colour of its yuv side.
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+    on_gpu: Option<DeviceYuv>,
+}
+
+/// The colour a conversion on the device reads or writes its yuv in.
+#[cfg(feature = "gpu")]
+type DeviceYuv = ffrwd_wasm_runtime::gpu::frames::Yuv;
+#[cfg(not(feature = "gpu"))]
+type DeviceYuv = ();
+
+/// The colour of a conversion between `from` and `to` on the device: its
+/// yuv side's, where the device's conversion has its matrix (BT.709 or
+/// BT.601); None otherwise, and in a build without GPU support.
+#[cfg(feature = "gpu")]
+fn device_yuv(from: Option<Colour>, to: Option<Colour>) -> Option<DeviceYuv> {
+    use ffrwd_frame::yuv::{Matrix, Range};
+    use ffrwd_wasm_runtime::gpu::frames::{Matrix as DeviceMatrix, Yuv};
+    let Some(colour) = from.or(to) else {
+        return Some(Yuv::DEFAULT);
+    };
+    let matrix = match colour.matrix {
+        Matrix::Bt709 => DeviceMatrix::Bt709,
+        Matrix::Bt601 => DeviceMatrix::Bt601,
+        _ => return None,
+    };
+    Some(Yuv {
+        matrix,
+        full_range: colour.range == Range::Pc,
+    })
+}
+
+#[cfg(not(feature = "gpu"))]
+fn device_yuv(_from: Option<Colour>, _to: Option<Colour>) -> Option<DeviceYuv> {
+    None
 }
 
 impl Picture {
@@ -90,6 +130,25 @@ impl Picture {
         self.width == self.to.width
             && self.height == self.to.height
             && self.pix_fmt == self.to.pix_fmt
+    }
+
+    /// The picture as the port takes it: in host memory as it is where it
+    /// needs nothing (the lane uploads it for a port on the GPU), else
+    /// conformed on the device for a port held there, else in host memory.
+    fn frame(&self, data: Arc<Vec<u8>>) -> Result<FrameData> {
+        if self.same() {
+            return Ok(FrameData::Host(data));
+        }
+        #[cfg(feature = "gpu")]
+        if let Some(yuv) = self.on_gpu {
+            use ffrwd_wasm_runtime::gpu::frames::{GpuFrame, Layout, Target};
+            let layout = Layout::of(self.to.pix_fmt)
+                .ok_or_else(|| anyhow!("{} is not held on the GPU", self.to.pix_fmt))?;
+            let frame = GpuFrame::upload(self.pix_fmt, self.width, self.height, data)?;
+            let target = Target::new(layout, self.to.width, self.to.height, yuv);
+            return Ok(FrameData::Gpu(frame.converted(target)?));
+        }
+        Ok(FrameData::Host(Arc::new(self.convert(&data)?)))
     }
 
     fn convert(&self, data: &[u8]) -> Result<Vec<u8>> {
@@ -354,27 +413,38 @@ fn match_streams(spec: &FeedSpec, conn: &mut Conn, report: &mut dyn FnMut(String
                     let incoming = crate::frame_len_for(pix_fmt, width, height)?;
                     conn.demux.set_stream_limit(index, incoming as u64);
                 }
+                let colour = (pix_fmt != "rgba")
+                    .then(|| frame_colour(&stream.media))
+                    .transpose()?;
+                let to_colour = (to.pix_fmt != "rgba")
+                    .then(|| port_colour(to.color.as_ref()))
+                    .transpose()?;
                 let picture = Picture {
                     width,
                     height,
                     pix_fmt,
-                    colour: (pix_fmt != "rgba")
-                        .then(|| frame_colour(&stream.media))
-                        .transpose()?,
+                    colour,
                     to: *to,
-                    to_colour: (to.pix_fmt != "rgba")
-                        .then(|| port_colour(to.color.as_ref()))
-                        .transpose()?,
+                    to_colour,
+                    on_gpu: spec.members[member]
+                        .on_gpu
+                        .then(|| device_yuv(colour, to_colour))
+                        .flatten(),
                 };
                 if codec.is_some() || !picture.same() {
                     report(format!(
                         "feed: {}: the feeder's picture is {width}x{height} {}, conformed to \
-                         {}x{} {}",
+                         {}x{} {}{}",
                         spec.names(),
                         codec.unwrap_or(pix_fmt),
                         to.width,
                         to.height,
-                        to.pix_fmt
+                        to.pix_fmt,
+                        if picture.on_gpu.is_some() && !picture.same() {
+                            " on the GPU"
+                        } else {
+                            ""
+                        }
                     ));
                 }
                 match codec {
@@ -781,7 +851,7 @@ fn drain(
                     Convert::Picture(picture) => TickFrame {
                         pts: packet.pts,
                         duration: None,
-                        data: Arc::new(picture.convert(payload)?).into(),
+                        data: picture.frame(Arc::new(payload.to_vec()))?,
                         rows: Vec::new(),
                     },
                     Convert::Sound(sound) => {
@@ -829,15 +899,10 @@ fn hand_decoded(
             );
         }
         carried.conformed.fetch_add(1, Ordering::Relaxed);
-        let data = if picture.same() {
-            frame.data
-        } else {
-            picture.convert(&frame.data)?
-        };
         let frame = TickFrame {
             pts: frame.pts,
             duration: None,
-            data: Arc::new(data).into(),
+            data: picture.frame(Arc::new(frame.data))?,
             rows: Vec::new(),
         };
         if !scheduler.arrive(id, Item::Frame(frame)) {

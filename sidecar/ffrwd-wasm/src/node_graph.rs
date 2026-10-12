@@ -1433,6 +1433,7 @@ fn open_module(
             ));
         }
     }
+    follow_on_gpu(&shape, &mut bound)?;
     let feeds = listen_for(
         name,
         &shape,
@@ -1474,7 +1475,7 @@ fn open_module(
         })
     };
     let assembler = Assembler::new(&resolved, &bound, name, &port_fed)?;
-    let gpu = gpu_streams(&resolved, &bound);
+    let gpu = gpu_streams(&resolved, &bound, defs);
     Ok(Opening {
         spec: LaneSpec {
             gpu,
@@ -1496,9 +1497,14 @@ fn open_module(
 }
 
 /// The streams bound to inputs the node holds on the GPU, each with the
-/// format its frames are put there in: the stream's own, which
-/// `check_accepts` has held to the formats the GPU holds.
-fn gpu_streams(shape: &NodeShape, bound: &[BoundStream]) -> HashMap<u32, GpuSpec> {
+/// format its frames are put there in, the stream's own, which
+/// `check_accepts` has held to the formats the GPU holds; and the size the
+/// input reads them at, which [`follow_on_gpu`] may have made another.
+fn gpu_streams(
+    shape: &NodeShape,
+    bound: &[BoundStream],
+    defs: &[StreamDef],
+) -> HashMap<u32, GpuSpec> {
     bound
         .iter()
         .filter_map(|b| {
@@ -1506,19 +1512,55 @@ fn gpu_streams(shape: &NodeShape, bound: &[BoundStream]) -> HashMap<u32, GpuSpec
             if port.accepts.memory != FrameMemory::Gpu || port.accepts.wants == Wants::Timing {
                 return None;
             }
-            let StreamFormat::Video(v) = &b.format else {
+            let StreamFormat::Video(reads) = &b.format else {
                 return None;
+            };
+            let arrives = match &defs.get(b.id as usize)?.format {
+                StreamFormat::Video(v) => v,
+                _ => reads,
             };
             Some((
                 b.id,
                 GpuSpec {
-                    pix_fmt: v.pix_fmt.to_string(),
-                    width: v.width,
-                    height: v.height,
+                    pix_fmt: arrives.pix_fmt.to_string(),
+                    width: arrives.width,
+                    height: arrives.height,
+                    reads: (reads.width, reads.height),
                 },
             ))
         })
         .collect()
+}
+
+/// The streams bound to inputs held on the GPU that follow another input's
+/// size (`accepts.like`), told at that size: their frames are resized on
+/// the device as they reach the lane. A stream in host memory is told as
+/// it arrives.
+fn follow_on_gpu(shape: &NodeShape, bound: &mut [BoundStream]) -> Result<()> {
+    for input in &shape.inputs {
+        if input.accepts.memory != FrameMemory::Gpu || input.accepts.wants == Wants::Timing {
+            continue;
+        }
+        let Some(like) = &input.accepts.like else {
+            continue;
+        };
+        let model = bound.iter().find_map(|b| match &b.format {
+            StreamFormat::Video(v) if &b.port == like => Some((v.width, v.height)),
+            _ => None,
+        });
+        let Some((width, height)) = model else {
+            continue;
+        };
+        for b in bound.iter_mut().filter(|b| b.port == input.name) {
+            if let StreamFormat::Video(v) = &mut b.format {
+                if (v.width, v.height) != (width, height) {
+                    v.frame_len = crate::frame_len_for(v.pix_fmt, width, height)?;
+                    (v.width, v.height) = (width, height);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The streams as the node is told them at `init`: one re-stamped onto the
@@ -1654,6 +1696,7 @@ fn listen_for(
             name: input.name.clone(),
             format: def.format.clone(),
             timing: false,
+            on_gpu: false,
         });
         defs.push(def);
     }
@@ -1738,11 +1781,13 @@ fn listen_on(
         &def,
         hint_of(told, &input.name, k),
     ));
+    let timing = input.accepts.wants == Wants::Timing;
     let member = FeedMember {
         id,
         name: input.name.clone(),
         format: def.format.clone(),
-        timing: input.accepts.wants == Wants::Timing,
+        timing,
+        on_gpu: !timing && input.accepts.memory == FrameMemory::Gpu,
     };
     defs.push(def);
     let mine: Vec<usize> = match &hold.group {

@@ -920,3 +920,378 @@ fn h264_d3d12va_uploads_a_frame_in_host_memory_and_says_so() {
         / got.len() as f64;
     assert!(apart < 1.0, "{apart} levels apart on average");
 }
+
+// The host's own conversions on the device: a decoder's NV12 handed to a
+// reader that asks for rgba, and an input that follows another's size
+// (`accepts.like`) resized, whether it is bound to a stream or fed on a
+// port.
+
+/// The largest and mean difference between two `width`-wide rgba pictures,
+/// the `side`-wide box gpu_box draws in the corner left out.
+fn apart_outside_the_box(a: &[u8], b: &[u8], width: usize, side: usize) -> (u8, f64) {
+    assert_eq!(a.len(), b.len());
+    let (mut max, mut sum, mut count) = (0u8, 0u64, 0u64);
+    for (i, (x, y)) in a.iter().zip(b).enumerate() {
+        let pixel = i / 4;
+        if pixel % width < side && pixel / width < side {
+            continue;
+        }
+        let d = x.abs_diff(*y);
+        max = max.max(d);
+        sum += u64::from(d);
+        count += 1;
+    }
+    (max, sum as f64 / count.max(1) as f64)
+}
+
+/// Whether the red box is at the corner of a `width`-wide rgba picture,
+/// `side` wide.
+fn has_the_box(picture: &[u8], width: usize, side: usize) -> bool {
+    (0..side).all(|y| {
+        (0..side).all(|x| {
+            let at = (y * width + x) * 4;
+            picture[at..at + 4] == [255, 0, 0, 255]
+        })
+    })
+}
+
+#[test]
+fn pictures_decoded_on_the_device_reach_an_rgba_reader_converted_there() {
+    let test = "pictures_decoded_on_the_device_reach_an_rgba_reader_converted_there";
+    let Some(dir) = d3d12va_libav(test) else {
+        return;
+    };
+    let Some(()) = ffmpeg(test) else {
+        return;
+    };
+    let module = module();
+    let out = scratch("rgba_from_the_device.nut");
+    let output = run_chain(
+        &dir,
+        &h264_fixture(),
+        "[0:v]decode=format=rgba:hw=d3d12va[d];[v=d]gpu_box=memory=gpu:out=gpu:size=5[out=out0]",
+        &out,
+        Some(&module),
+    );
+    if no_gpu(&output) {
+        eprintln!("skipped: this machine has no GPU adapter");
+        return;
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success(),
+        "exited {:?}:\n{stderr}",
+        output.status.code()
+    );
+    assert!(stderr.contains(DECODED_LINE), "{stderr}");
+    assert!(
+        stderr.contains("[gpu] convert nv12 64x48 to rgba 64x48"),
+        "the decoder's NV12 is made rgba on the device:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains(UPLOAD_LINE),
+        "nothing is uploaded:\n{stderr}"
+    );
+    let pictures = frames_in(&out);
+    assert!(!pictures.is_empty());
+    let row = profile_row(&stderr);
+    assert_eq!(row["upload"]["bytes"], 0, "{row}");
+    assert_eq!(
+        row["convert"]["calls"],
+        pictures.len(),
+        "one conversion a picture: {row}"
+    );
+    assert_eq!(
+        row["download"]["bytes"],
+        pictures.len() * 64 * 48 * 4,
+        "only what leaves on the wire is read back: {row}"
+    );
+
+    // ffmpeg's bilinear conversion, with the chroma interpolated rather
+    // than repeated and rounded accurately, is what the device's is.
+    let theirs = ffmpeg_ok(
+        &[
+            "-i",
+            path_str(&h264_fixture()),
+            "-fps_mode",
+            "passthrough",
+            "-vf",
+            "scale=flags=bilinear+full_chroma_int+accurate_rnd,format=rgba",
+            "-f",
+            "rawvideo",
+            "-",
+        ],
+        "ffmpeg's yuv420p to rgba",
+    );
+    let len = 64 * 48 * 4;
+    assert_eq!(theirs.len(), pictures.len() * len, "as many pictures");
+    let (mut max, mut mean) = (0u8, 0f64);
+    for ((_, ours), theirs) in pictures.iter().zip(theirs.chunks(len)) {
+        assert!(has_the_box(ours, 64, 5));
+        let (m, a) = apart_outside_the_box(ours, theirs, 64, 5);
+        max = max.max(m);
+        mean = mean.max(a);
+    }
+    eprintln!(
+        "against ffmpeg's conversion: at most {max} apart, mean {mean:.3} in the worst picture"
+    );
+    // Measured on an RTX 4090: at most 1 apart, a mean of 0.018.
+    assert!(max <= 1, "{max} apart");
+    assert!(mean < 0.03, "mean {mean}");
+}
+
+/// `frames` of `width` x `height` rgba as a NUT file at `path`, 25 a
+/// second.
+fn write_rgba_nut(path: &Path, frames: &[Vec<u8>], width: u32, height: u32) {
+    let mut stream = Stream::video("rgba", width, height, TIME_BASE).expect("rgba is carried");
+    stream.frame_rate = Some((25, 1));
+    let mut wire = Vec::new();
+    {
+        let mut muxer = Muxer::new(&mut wire, &stream).expect("write NUT headers");
+        for (i, frame) in frames.iter().enumerate() {
+            muxer.write_frame(i as i64, frame).expect("write a frame");
+        }
+        muxer.finish().expect("finish the stream");
+    }
+    std::fs::write(path, wire).expect("write the NUT file");
+}
+
+/// A `width` x `height` rgba picture with ramps, hard edges and a
+/// checkerboard, opaque.
+fn pattern(width: u32, height: u32) -> Vec<u8> {
+    let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+    for y in 0..height {
+        for x in 0..width {
+            rgba.extend_from_slice(&[
+                (x * 255 / (width - 1)) as u8,
+                (y * 255 / (height - 1)) as u8,
+                (((x / 8 + y / 8) % 2) * 200 + 20) as u8,
+                255,
+            ]);
+        }
+    }
+    rgba
+}
+
+/// A flat green `width` x `height` rgba picture.
+fn green(width: u32, height: u32) -> Vec<u8> {
+    [0, 200, 0, 255].repeat((width * height) as usize)
+}
+
+/// ffmpeg's bilinear resize of a `from`-sized rgba picture to `to`, with
+/// rgba's chroma kept at full size, which the device's resize is measured
+/// against.
+fn resized_by_ffmpeg(rgba: &[u8], from: (u32, u32), to: (u32, u32), name: &str) -> Vec<u8> {
+    let path = scratch(name);
+    std::fs::write(&path, rgba).expect("write the picture");
+    let resized = ffmpeg_ok(
+        &[
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgba",
+            "-s",
+            &format!("{}x{}", from.0, from.1),
+            "-i",
+            path_str(&path),
+            "-vf",
+            &format!(
+                "scale={}:{}:flags=bilinear+full_chroma_inp+full_chroma_int,format=rgba",
+                to.0, to.1
+            ),
+            "-f",
+            "rawvideo",
+            "-",
+        ],
+        "ffmpeg's bilinear resize",
+    );
+    let _ = std::fs::remove_file(&path);
+    resized
+}
+
+#[test]
+fn an_input_that_follows_another_is_resized_on_the_device() {
+    let test = "an_input_that_follows_another_is_resized_on_the_device";
+    let Some(()) = ffmpeg(test) else {
+        return;
+    };
+    let module = module();
+    let (small, large) = ((32u32, 24u32), (64u32, 48u32));
+    let (v, w) = (scratch("follow_v.nut"), scratch("follow_w.nut"));
+    write_rgba_nut(&v, &vec![green(small.0, small.1); 5], small.0, small.1);
+    let picture = pattern(large.0, large.1);
+    write_rgba_nut(&w, &vec![picture.clone(); 5], large.0, large.1);
+    let out = scratch("follow_out.nut");
+    let output = Command::new(env!("CARGO_BIN_EXE_ffrwd-wasm"))
+        .args(["-profile", "-gpu", &module, "-f", "nut", "-i"])
+        .arg(&v)
+        .args(["-f", "nut", "-i"])
+        .arg(&w)
+        .arg("-m")
+        .arg(format!("gpu_box={module}"))
+        .args([
+            "-filter_complex",
+            "[v=0:v][w=1:v]gpu_box=memory=gpu:out=gpu:w=pad:size=3[out=o]",
+            "-map",
+            "[o]",
+            "-f",
+            "nut",
+        ])
+        .arg(&out)
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn ffrwd-wasm");
+    let _ = (std::fs::remove_file(&v), std::fs::remove_file(&w));
+    if no_gpu(&output) {
+        eprintln!("skipped: this machine has no GPU adapter");
+        return;
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success(),
+        "exited {:?}:\n{stderr}",
+        output.status.code()
+    );
+    assert!(
+        stderr.contains("[gpu] gpu_box: resizing the frames of stream 1 on the GPU to 32x24"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("[gpu] convert rgba 64x48 to rgba 32x24"),
+        "{stderr}"
+    );
+    let row = profile_row(&stderr);
+    assert_eq!(row["convert"]["calls"], 5, "one resize a frame: {row}");
+    let pictures = frames_in(&out);
+    assert_eq!(pictures.len(), 5);
+    let theirs = resized_by_ffmpeg(&picture, large, small, "follow_picture.rgba");
+    for (pts, ours) in &pictures {
+        assert!(has_the_box(ours, small.0 as usize, 3));
+        let (max, mean) = apart_outside_the_box(ours, &theirs, small.0 as usize, 3);
+        eprintln!("picture {pts} against ffmpeg's resize: at most {max} apart, mean {mean:.3}");
+        // Measured on an RTX 4090: at most 1 apart, a mean of 0.047.
+        assert!(
+            max <= 1 && mean < 0.05,
+            "picture {pts}: {max} apart, mean {mean}"
+        );
+    }
+}
+
+#[test]
+fn a_feed_held_on_the_gpu_is_conformed_on_the_device() {
+    use std::net::{TcpListener, TcpStream};
+    use std::time::{Duration, Instant};
+    let test = "a_feed_held_on_the_gpu_is_conformed_on_the_device";
+    let Some(()) = ffmpeg(test) else {
+        return;
+    };
+    let module = module();
+    let (small, large) = ((32u32, 24u32), (64u32, 48u32));
+    let port = {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind a free port");
+        listener.local_addr().expect("its address").port()
+    };
+    let wiring = format!("[v=0:v]gpu_box=memory=gpu:out=gpu:w=port:port={port}:size=3[out=o]");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ffrwd-wasm"))
+        .args(["-gpu", &module, "-f", "nut", "-i", "-", "-m"])
+        .arg(format!("gpu_box={module}"))
+        .args(["-filter_complex", &wiring, "-map", "[o]", "-f", "nut", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ffrwd-wasm");
+
+    // The programme, flat green, paced at 25 a second for three seconds.
+    let mut stdin = child.stdin.take().expect("stdin is piped");
+    let programme = std::thread::spawn(move || {
+        let mut stream = Stream::video("rgba", small.0, small.1, TIME_BASE).expect("rgba");
+        stream.frame_rate = Some((25, 1));
+        let mut muxer = Muxer::new(&mut stdin, &stream).expect("headers");
+        let started = Instant::now();
+        for k in 0..75i64 {
+            let due = started + Duration::from_millis(40 * k as u64);
+            if let Some(wait) = due.checked_duration_since(Instant::now()) {
+                std::thread::sleep(wait);
+            }
+            if muxer.write_frame(k, &green(small.0, small.1)).is_err() {
+                return;
+            }
+            let _ = muxer.flush();
+        }
+        let _ = muxer.finish();
+    });
+    // The feeder: the pattern at twice the size, for most of the run.
+    let picture = pattern(large.0, large.1);
+    let sent = picture.clone();
+    let feeder = std::thread::spawn(move || {
+        let until = Instant::now() + Duration::from_secs(10);
+        let socket = loop {
+            std::thread::sleep(Duration::from_millis(100));
+            if let Ok(socket) = TcpStream::connect(("127.0.0.1", port)) {
+                break socket;
+            }
+            if Instant::now() > until {
+                return;
+            }
+        };
+        let mut stream = Stream::video("rgba", large.0, large.1, TIME_BASE).expect("rgba");
+        stream.frame_rate = Some((25, 1));
+        let Ok(mut muxer) = Muxer::new(socket, &stream) else {
+            return;
+        };
+        for k in 0..40i64 {
+            if muxer.write_frame(k, &sent).is_err() || muxer.flush().is_err() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(40));
+        }
+        let _ = muxer.finish();
+    });
+    let output = child.wait_with_output().expect("wait for ffrwd-wasm");
+    let _ = (programme.join(), feeder.join());
+    if no_gpu(&output) {
+        eprintln!("skipped: this machine has no GPU adapter");
+        return;
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success(),
+        "exited {:?}:\n{stderr}",
+        output.status.code()
+    );
+    let conformed = "feed: gpu_box 'w': the feeder's picture is 64x48 rgba, conformed to \
+                     32x24 rgba on the GPU";
+    assert!(stderr.contains(conformed), "{stderr}");
+    assert!(
+        stderr.contains("[gpu] convert rgba 64x48 to rgba 32x24"),
+        "{stderr}"
+    );
+    let pictures = read_nut(&output.stdout);
+    assert_eq!(pictures.len(), 75, "a picture a programme frame");
+    let theirs = resized_by_ffmpeg(&picture, large, small, "feed_picture.rgba");
+    // A picture the feed did not reach is the programme's flat green.
+    let fed: Vec<&Vec<u8>> = pictures
+        .iter()
+        .map(|(_, p)| p)
+        .filter(|p| p[(5 * small.0 as usize + 5) * 4 + 1] != 200)
+        .collect();
+    assert!(
+        fed.len() >= 10,
+        "the feed shows on {} pictures of 75:\n{stderr}",
+        fed.len()
+    );
+    let (mut max, mut mean) = (0u8, 0f64);
+    for ours in &fed {
+        assert!(has_the_box(ours, small.0 as usize, 3));
+        let (m, a) = apart_outside_the_box(ours, &theirs, small.0 as usize, 3);
+        max = max.max(m);
+        mean = mean.max(a);
+    }
+    eprintln!(
+        "{} fed pictures against ffmpeg's resize: at most {max} apart, mean {mean:.3}",
+        fed.len()
+    );
+    // Measured on an RTX 4090: at most 1 apart, a mean of 0.047.
+    assert!(max <= 1 && mean < 0.05, "{max} apart, mean {mean}");
+}

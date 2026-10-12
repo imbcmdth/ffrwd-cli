@@ -87,8 +87,9 @@ pub struct LaneSpec {
     /// The streams bound to its inputs, by id.
     pub bound: Vec<u32>,
     /// The streams bound to inputs held on the GPU, each with the format
-    /// its frames are uploaded in: a frame arriving in host memory is put
-    /// on the GPU as it enters the lane.
+    /// its frames are uploaded in and the size the input reads them at: a
+    /// frame arriving in host memory is put on the GPU as it enters the
+    /// lane, and one of another size is resized there.
     pub gpu: HashMap<u32, GpuSpec>,
     /// The stream ids whose rows the node keeps as state.
     pub state: Vec<u32>,
@@ -108,9 +109,14 @@ pub struct LaneSpec {
 /// input is there.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GpuSpec {
+    /// The stream's format, which a frame arriving in host memory is
+    /// uploaded in.
     pub pix_fmt: String,
     pub width: u32,
     pub height: u32,
+    /// The size the input reads the frames at: the stream's, or that of
+    /// the input it follows (`accepts.like`).
+    pub reads: (u32, u32),
 }
 
 /// Who reads a stream: a lane, or one stream of an output.
@@ -195,6 +201,10 @@ struct Lane {
     /// each on stderr.
     #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
     uploaded: HashSet<u32>,
+    /// The streams whose frames this lane has resized on the GPU, said
+    /// once each on stderr.
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+    resized: HashSet<u32>,
     state: Vec<u32>,
     queue: VecDeque<Task>,
     next_ordinal: u64,
@@ -227,8 +237,11 @@ impl Lane {
     /// held on the GPU is put there as it arrives, once, when it is still
     /// in host memory, and the first such frame of each stream says so on
     /// stderr (`[gpu] <lane>: putting the frames of stream <n> on the GPU`).
-    /// A frame already there (a decoder's picture) is handed on as it is,
-    /// as is everything else.
+    /// A frame of another size than the input reads is resized on the
+    /// device, said the same way (`[gpu] <lane>: resizing the frames of
+    /// stream <n> on the GPU to <w>x<h>`). A frame already there at its
+    /// size (a decoder's picture) is handed on as it is, as is everything
+    /// else.
     fn resident(&mut self, stream: u32, item: &Item) -> Result<Item> {
         let Some(spec) = self.gpu.get(&stream) else {
             return Ok(item.clone());
@@ -236,40 +249,60 @@ impl Lane {
         let Item::Frame(frame) = item else {
             return Ok(item.clone());
         };
-        let bytes = match &frame.data {
-            ffrwd_wasm_runtime::node::FrameData::Host(bytes) if !bytes.is_empty() => bytes,
-            _ => return Ok(item.clone()),
-        };
         #[cfg(feature = "gpu")]
         {
-            let uploaded = ffrwd_wasm_runtime::gpu::frames::GpuFrame::upload(
-                &spec.pix_fmt,
-                spec.width,
-                spec.height,
-                Arc::clone(bytes),
-            )
-            .with_context(|| {
-                format!(
-                    "{}: putting a frame of stream {stream} on the GPU",
-                    self.name
-                )
-            })?;
-            if self.uploaded.insert(stream) {
-                eprintln!(
-                    "[gpu] {}: putting the frames of stream {stream} on the GPU",
-                    self.name
-                );
-            }
+            use ffrwd_wasm_runtime::gpu::frames::GpuFrame;
+            use ffrwd_wasm_runtime::node::FrameData;
+            let held = match &frame.data {
+                FrameData::Host(bytes) if !bytes.is_empty() => {
+                    let uploaded =
+                        GpuFrame::upload(&spec.pix_fmt, spec.width, spec.height, Arc::clone(bytes))
+                            .with_context(|| {
+                                format!(
+                                    "{}: putting a frame of stream {stream} on the GPU",
+                                    self.name
+                                )
+                            })?;
+                    if self.uploaded.insert(stream) {
+                        eprintln!(
+                            "[gpu] {}: putting the frames of stream {stream} on the GPU",
+                            self.name
+                        );
+                    }
+                    uploaded
+                }
+                FrameData::Gpu(gpu) if (gpu.width(), gpu.height()) != spec.reads => Arc::clone(gpu),
+                _ => return Ok(item.clone()),
+            };
+            let (width, height) = spec.reads;
+            let held = if (held.width(), held.height()) == spec.reads {
+                held
+            } else {
+                let resized = held.resized(width, height).with_context(|| {
+                    format!(
+                        "{}: resizing a frame of stream {stream} to {width}x{height} on the GPU",
+                        self.name
+                    )
+                })?;
+                if self.resized.insert(stream) {
+                    eprintln!(
+                        "[gpu] {}: resizing the frames of stream {stream} on the GPU to \
+                         {width}x{height}",
+                        self.name
+                    );
+                }
+                resized
+            };
             Ok(Item::Frame(TickFrame {
                 pts: frame.pts,
                 duration: frame.duration,
-                data: ffrwd_wasm_runtime::node::FrameData::Gpu(uploaded),
+                data: FrameData::Gpu(held),
                 rows: frame.rows.clone(),
             }))
         }
         #[cfg(not(feature = "gpu"))]
         {
-            let _ = (spec, bytes);
+            let _ = (spec, frame);
             bail!(
                 "{}: an input held on the GPU, and this ffrwd-wasm was built without GPU support",
                 self.name
@@ -1148,6 +1181,7 @@ impl Scheduler {
                 bound: spec.bound,
                 gpu: spec.gpu,
                 uploaded: HashSet::new(),
+                resized: HashSet::new(),
                 state: spec.state,
                 queue: VecDeque::new(),
                 next_ordinal: 0,

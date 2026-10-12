@@ -15,6 +15,12 @@
 //! device itself, draws the box on the bytes, and emits those. In yuv420p
 //! the box is BT.601 red, (81, 90, 240), over the chroma samples it
 //! covers.
+//!
+//! `w` adds a second rgba input, `w`, that follows `v`'s size
+//! (`accepts.like`) and is held where `v` is: bound by a pad (`w=pad`,
+//! paired in lockstep, on the GPU only, where the host resizes it), or fed
+//! on the loopback port `port` names (`w=port`, a hold input). A tick that
+//! has a frame of `w` draws the box on that frame rather than on `v`'s.
 
 wit_bindgen::generate!({
     path: ["../../wit", "../../wit-gpu", "wit"],
@@ -29,8 +35,8 @@ use exports::ffrwd::av::node::{Emission, Emitted, Guest, Payload};
 use exports::ffrwd::gpu::ports::Guest as PortsGuest;
 use ffrwd::av::node_tick::Tick;
 use ffrwd::av::node_types::{
-    Accepts, Binding, BoundStream, Clock, InputPort, LikeInput, NodeShape, OutputFormat,
-    OutputPort, Pairing, PortKind, RowsUse,
+    Accepts, Anchor, Binding, BoundStream, Clock, Hold, InputPort, LikeInput, NodeShape,
+    OutputFormat, OutputPort, Pairing, PortKind, RowsUse,
 };
 use ffrwd::av::types::{Meta, RawFrame, Wants};
 use ffrwd::gpu::frames::{emit, planes};
@@ -42,7 +48,7 @@ use wasi::webgpu::webgpu::{
     GpuTextureDescriptor, GpuTextureFormat, GpuTextureUsage,
 };
 
-const SCHEMA: &str = r#"{"type":"object","properties":{"memory":{"type":"string","enum":["gpu","host"]},"out":{"type":"string","enum":["gpu","host"]},"size":{"type":"integer","minimum":1}},"additionalProperties":false}"#;
+const SCHEMA: &str = r#"{"type":"object","properties":{"memory":{"type":"string","enum":["gpu","host"]},"out":{"type":"string","enum":["gpu","host"]},"size":{"type":"integer","minimum":1},"w":{"type":"string","enum":["pad","port"]},"port":{"type":"integer"}},"additionalProperties":false}"#;
 
 /// The box's colour, rgba.
 const COLOUR: [u8; 4] = [255, 0, 0, 255];
@@ -60,6 +66,12 @@ struct Params {
     out: Option<String>,
     #[serde(default = "eight")]
     size: u32,
+    /// A second input, `w`, and how it is bound.
+    #[serde(default)]
+    w: Option<String>,
+    /// The loopback port `w` is fed on, with `w=port`.
+    #[serde(default)]
+    port: Option<u32>,
 }
 
 impl Params {
@@ -82,6 +94,8 @@ impl Default for Params {
             memory: gpu(),
             out: None,
             size: eight(),
+            w: None,
+            port: None,
         }
     }
 }
@@ -101,11 +115,19 @@ fn parse(text: &str) -> Result<Params, String> {
     if params.size == 0 {
         return Err("size is above zero".to_string());
     }
+    if params.w.as_deref() == Some("pad") && params.memory != "gpu" {
+        return Err("w=pad takes memory=gpu, where the host resizes w".to_string());
+    }
+    if params.w.as_deref() == Some("port") && params.port.is_none() {
+        return Err("w=port names the port w is fed on with port".to_string());
+    }
     Ok(params)
 }
 
 struct State {
     v: u32,
+    /// The second input's stream, where it is bound.
+    w: Option<u32>,
     width: u32,
     height: u32,
     size: u32,
@@ -222,14 +244,21 @@ fn read_back(state: &State, index: u32) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-/// Copies the frame's texture to a new one, draws the box on that with the
-/// queue, and hands it to the host as the frame on `out`.
-fn draw_on_gpu(state: &State, pts: i64, duration: Option<i64>, index: u32) -> Result<(), String> {
+/// Copies the texture of frame `index` of stream `id` to a new one, draws
+/// the box on that with the queue, and hands it to the host as the frame on
+/// `out`.
+fn draw_on_gpu(
+    state: &State,
+    pts: i64,
+    duration: Option<i64>,
+    id: u32,
+    index: u32,
+) -> Result<(), String> {
     let device = state
         .device
         .as_ref()
         .ok_or("the device is opened at init")?;
-    let handed = planes(state.v, index)?;
+    let handed = planes(id, index)?;
     let source = handed.first().ok_or("an rgba frame has one plane")?;
     let (width, height) = (state.width, state.height);
     let extent = |w: u32, h: u32| GpuExtent3D {
@@ -301,7 +330,7 @@ impl Guest for Node {
     }
 
     fn shape(params: String, _bound: Vec<Binding>) -> Result<NodeShape, String> {
-        parse(&params)?;
+        let params = parse(&params)?;
         let v = InputPort {
             name: "v".to_string(),
             kind: PortKind::Video,
@@ -335,8 +364,27 @@ impl Guest for Node {
             schema: None,
             row: None,
         };
+        let mut inputs = vec![v];
+        if let Some(bound) = params.w.as_deref() {
+            let mut w = inputs[0].clone();
+            w.name = "w".to_string();
+            w.accepts.pixel_formats = vec!["rgba".to_string()];
+            w.accepts.like = Some("v".to_string());
+            if bound == "port" {
+                w.required = false;
+                w.pairing = Pairing::Hold(Hold {
+                    anchor: Anchor::FirstFrame,
+                    lead: 0.0,
+                    linger: Some(60.0),
+                    timeout: None,
+                    group: None,
+                    port_param: Some("port".to_string()),
+                });
+            }
+            inputs.push(w);
+        }
         Ok(NodeShape {
-            inputs: vec![v],
+            inputs,
             outputs: vec![out],
             clock: Clock::Input("v".to_string()),
             pure: true,
@@ -360,6 +408,18 @@ impl Guest for Node {
                 "a texture handed back is rgba; a yuv420p input takes out=host".to_string(),
             );
         }
+        let w = bound.iter().find(|b| b.port == "w");
+        if let Some(w) = w {
+            let Some(OutputFormat::Video(told)) = &w.format else {
+                return Err("w is video".to_string());
+            };
+            if yuv || (told.width, told.height) != (format.width, format.height) {
+                return Err(format!(
+                    "w is told {}x{} {}, and follows v's {}x{} rgba",
+                    told.width, told.height, told.pix_fmt, format.width, format.height
+                ));
+            }
+        }
         let device = if on_gpu {
             let adapter = get_gpu()
                 .request_adapter(None)
@@ -375,6 +435,7 @@ impl Guest for Node {
         STATE.with(|s| {
             *s.borrow_mut() = Some(State {
                 v: v.id,
+                w: w.map(|w| w.id),
                 width: format.width,
                 height: format.height,
                 size: params.size,
@@ -397,14 +458,21 @@ impl Guest for Node {
             let state = state.as_ref().ok_or("process before init")?;
             let mut items = Vec::new();
             for frame in tick.frames(state.v) {
+                // The tick's frame of w, where it has one, stands in for v's.
+                let (id, index) = match state.w.map(|w| (w, tick.frames(w))) {
+                    Some((w, held)) if !held.is_empty() => (w, held[held.len() - 1].index),
+                    _ => (state.v, frame.index),
+                };
                 if state.out_on_gpu {
-                    draw_on_gpu(state, frame.pts, frame.duration, frame.index)?;
+                    draw_on_gpu(state, frame.pts, frame.duration, id, index)?;
                     continue;
                 }
-                let mut pixels = if state.on_gpu {
-                    read_back(state, frame.index)?
+                let mut pixels = if state.on_gpu && id == state.v {
+                    read_back(state, index)?
+                } else if state.on_gpu {
+                    return Err("a frame of w held on the GPU is written with out=gpu".to_string());
                 } else {
-                    tick.fetch(state.v, frame.index)
+                    tick.fetch(id, index)
                 };
                 if state.yuv {
                     draw_yuv(&mut pixels, state.width, state.height, state.size);
@@ -434,7 +502,11 @@ impl PortsGuest for Node {
         let Ok(params) = parse(&params) else {
             return Vec::new();
         };
-        let held = [("v", params.memory == "gpu"), ("out", params.out_on_gpu())];
+        let held = [
+            ("v", params.memory == "gpu"),
+            ("w", params.memory == "gpu" && params.w.is_some()),
+            ("out", params.out_on_gpu()),
+        ];
         held.into_iter()
             .filter(|(_, on_gpu)| *on_gpu)
             .map(|(port, _)| PortMemory {
