@@ -1518,6 +1518,30 @@ fn open_module(
     })
 }
 
+/// Whether the process holds on the GPU the frames of a node whose shape
+/// puts an input there: whether it has a device. Where it has none, those
+/// inputs are handed their frames in host memory, said once on stderr.
+fn holds_frames_on_a_device(shape: &NodeShape) -> bool {
+    let held = shape
+        .inputs
+        .iter()
+        .any(|p| p.accepts.memory == FrameMemory::Gpu && p.accepts.wants != Wants::Timing);
+    if !held {
+        return false;
+    }
+    #[cfg(feature = "gpu")]
+    let device = ffrwd_wasm_runtime::gpu::shared_device().is_some();
+    #[cfg(not(feature = "gpu"))]
+    let device = false;
+    if !device {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| {
+            eprintln!("[gpu] no device: inputs held on the GPU are handed frames in host memory");
+        });
+    }
+    device
+}
+
 /// The streams bound to inputs the node holds on the GPU, each with the
 /// format its frames are put there in, the stream's own, which
 /// `check_accepts` has held to the formats the GPU holds; and the size the
@@ -1527,6 +1551,9 @@ fn gpu_streams(
     bound: &[BoundStream],
     defs: &[StreamDef],
 ) -> HashMap<u32, GpuSpec> {
+    if !holds_frames_on_a_device(shape) {
+        return HashMap::new();
+    }
     bound
         .iter()
         .filter_map(|b| {
@@ -1559,6 +1586,9 @@ fn gpu_streams(
 /// the device as they reach the lane. A stream in host memory is told as
 /// it arrives.
 fn follow_on_gpu(shape: &NodeShape, bound: &mut [BoundStream]) -> Result<()> {
+    if !holds_frames_on_a_device(shape) {
+        return Ok(());
+    }
     for input in &shape.inputs {
         if input.accepts.memory != FrameMemory::Gpu || input.accepts.wants == Wants::Timing {
             continue;
@@ -1809,7 +1839,9 @@ fn listen_on(
         name: input.name.clone(),
         format: def.format.clone(),
         timing,
-        on_gpu: !timing && input.accepts.memory == FrameMemory::Gpu,
+        on_gpu: !timing
+            && input.accepts.memory == FrameMemory::Gpu
+            && holds_frames_on_a_device(shape),
     };
     defs.push(def);
     let mine: Vec<usize> = match &hold.group {
