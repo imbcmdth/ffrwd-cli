@@ -1775,7 +1775,7 @@ ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 copy -f nut pipe:1 | ffrwd-
   ndjson pipe:1
 ```
 
-The picture is encoded where it is and the sink's rows leave the region on its stdout; no ffmpeg stands between the module and the sink. An encoder the sidecar does not host (`libx264`), a sink option the `encode` node has no name for, or a module holding its picture in host memory leaves the encoder in an ffmpeg in front of the sink, which then keeps a process of its own. So does a sink reading several streams, such as a ladder's renditions or a picture and its sound. A packet filter (`RETURNS packets`) keeps its process too, and reads the region's packets through an ffmpeg that only copies them.
+The picture is encoded where it is and the sink's rows leave the region on its stdout; no ffmpeg stands between the module and the sink. An encoder the sidecar does not host (`libx264`), a sink option the `encode` node has no name for, or a module holding its picture in host memory leaves the encoder in an ffmpeg in front of the sink, which then keeps a process of its own. So does a sink reading several streams, such as a ladder's renditions or a picture and its sound. A packet filter (`RETURNS packets`) keeps its process too, and reads the region's packets off a pipe straight from the region's sidecar.
 
 ## 162. A source, a module on the GPU and a sink in one process
 

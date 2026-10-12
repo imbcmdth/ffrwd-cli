@@ -444,8 +444,9 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   encoder's options moved into the sidecar's `encode` node. The same
   holds for a packet sink or packet filter the region's picture goes to
   unfiltered: an encoder the sidecar hosts runs in the region, the
-  sink's video options move onto it, and the ffmpeg between copies the
-  packets (recipe [161](examples.md#161-encode-in-the-region-for-a-packet-sink)).
+  sink's video options move onto it, and the packets go from the
+  region's sidecar straight to the sink's or the filter's (recipe
+  [161](examples.md#161-encode-in-the-region-for-a-packet-sink)).
   Anything else on either side stays raw, as without the clause. `codec_params`
   has no spelling in the node and is refused beside a hosted encoder.
   The clause means nothing on a value function, a codec package's

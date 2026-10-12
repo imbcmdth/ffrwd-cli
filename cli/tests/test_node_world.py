@@ -2423,7 +2423,8 @@ def test_a_packet_filter_reading_a_picture_held_on_the_gpu_takes_the_regions_pac
 ) -> None:
     """A packet filter keeps its process, and the picture it reads is encoded
     in the region holding it on the GPU, the destination's options on the
-    encoder; the ffmpeg between copies the packets."""
+    encoder; the filter reads the packets off the region's own pipe, and the
+    only ffmpegs are the demuxer and the muxer, both copying."""
     argv = _plan_argv(
         "CREATE FUNCTION hand_on(v video_stream) RETURNS packets "
         "AS 'hand_on.wasm', 'hand_on' LANGUAGE wasm;\n"
@@ -2437,6 +2438,7 @@ def test_a_packet_filter_reading_a_picture_held_on_the_gpu_takes_the_regions_pac
         "[n1]encode=codec=h264_nvenc:b=6M[out0]"
     )
     encoders = [words for pid, words in argv.items() if pid.startswith("ffmpeg")]
+    assert len(encoders) == 2
     assert all(words[words.index("-c:0") + 1] == "copy" for words in encoders)
     assert not any("-b:0" in words for words in encoders)
 
