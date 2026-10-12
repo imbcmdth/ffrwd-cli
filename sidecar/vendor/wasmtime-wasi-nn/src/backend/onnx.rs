@@ -5,22 +5,29 @@
 //! [`Provider`] priority list the embedder supplies rather than always meaning
 //! CUDA, a `Gpu` session whose providers all fail to register is an error
 //! rather than a silent fall back to the CPU, integer tensors are
-//! accepted alongside fp32, and an input whose elements are in CUDA memory
-//! the embedder holds ([`crate::DeviceInput`]) is bound to a CUDA session
-//! through an `IoBinding` instead of being copied into a CPU tensor.
-//! Everything else here is upstream's.
+//! accepted alongside fp32, an input whose elements are in device memory
+//! the embedder holds ([`crate::DeviceInput`]) is bound to a CUDA or
+//! DirectML session through an `IoBinding` instead of being copied into a
+//! CPU tensor, an output can be bound to device memory the embedder holds
+//! ([`crate::DeviceOutput`]) the same way, and the embedder can register a
+//! provider on a session itself ([`OnnxBackend::with_registrar`]), which is
+//! how a session is given a CUDA stream or a D3D12 device of the
+//! embedder's. Everything else here is upstream's.
 
 use super::{
     BackendError, BackendExecutionContext, BackendFromDir, BackendGraph, BackendInner, NamedTensor,
 };
 use crate::backend::{Id, read};
 use crate::wit::types::{ExecutionTarget, GraphEncoding, Tensor, TensorType};
-use crate::{ExecutionContext, Graph};
+use crate::{DeviceHandle, DeviceInput, DeviceMemory, DeviceOutputHandle, ExecutionContext, Graph};
 use ort::{
     execution_providers::{CPUExecutionProvider, ExecutionProviderDispatch},
     memory::{AllocationDevice, AllocatorType, MemoryInfo, MemoryType},
     session::{Input, Output},
-    session::{Session, SessionInputValue, builder::GraphOptimizationLevel},
+    session::{
+        Session, SessionInputValue,
+        builder::{GraphOptimizationLevel, SessionBuilder},
+    },
     tensor::TensorElementType,
     value::{DynValue, Tensor as OrtTensor, TensorRefMut, ValueType},
 };
@@ -107,15 +114,24 @@ fn platform_gpu_providers() -> Vec<Provider> {
     }
 }
 
+/// Registers a provider on a session being built, as the embedder wants it
+/// registered; an error is the provider refusing, and the session is not
+/// built on it.
+pub type Registrar = Arc<dyn Fn(&mut SessionBuilder) -> Result<(), String> + Send + Sync>;
+
 pub struct OnnxBackend {
     /// What an `ExecutionTarget::Gpu` session asks for, most wanted first.
     gpu_providers: Vec<Provider>,
+    /// Providers the embedder registers itself, in place of `ort`'s default
+    /// registration of them.
+    registrars: Vec<(Provider, Registrar)>,
 }
 
 impl Default for OnnxBackend {
     fn default() -> Self {
         Self {
             gpu_providers: platform_gpu_providers(),
+            registrars: Vec::new(),
         }
     }
 }
@@ -128,7 +144,26 @@ impl OnnxBackend {
     /// either engages it or fails to load, saying why. Loading the same bytes
     /// again with `ExecutionTarget::Cpu` is how it then runs on the CPU.
     pub fn with_gpu_providers(gpu_providers: Vec<Provider>) -> Self {
-        Self { gpu_providers }
+        Self {
+            gpu_providers,
+            registrars: Vec::new(),
+        }
+    }
+
+    /// Has `provider` registered on every session by `registrar` rather than
+    /// by `ort`'s defaults: a CUDA session on a stream of the embedder's, a
+    /// DirectML one on its D3D12 device and queue.
+    pub fn with_registrar(mut self, provider: Provider, registrar: Registrar) -> Self {
+        self.registrars.retain(|(p, _)| *p != provider);
+        self.registrars.push((provider, registrar));
+        self
+    }
+
+    fn registrar(&self, provider: Provider) -> Option<&Registrar> {
+        self.registrars
+            .iter()
+            .find(|(p, _)| *p == provider)
+            .map(|(_, r)| r)
     }
 }
 
@@ -150,6 +185,25 @@ impl BackendInner for OnnxBackend {
         // that registers builds the session; none registering fails the load.
         let mut refused: Vec<(Provider, String)> = Vec::new();
         for provider in session_providers(target, &self.gpu_providers) {
+            if let Some(registrar) = self.registrar(provider) {
+                let mut builder = Session::builder()?;
+                if let Err(e) = registrar(&mut builder) {
+                    tracing::debug!(
+                        "{} execution provider did not register: {e}",
+                        provider.name()
+                    );
+                    refused.push((provider, e));
+                    continue;
+                }
+                let session = builder
+                    .with_optimization_level(GraphOptimizationLevel::Level3)?
+                    .commit_from_memory(builders[0])?;
+                let box_: Box<dyn BackendGraph> = Box::new(OnnxGraph {
+                    session: Arc::new(Mutex::new(session)),
+                    provider,
+                });
+                return Ok(box_.into());
+            }
             let Some(dispatch) = provider.dispatch() else {
                 tracing::debug!(
                     "{} execution provider is not enabled in this build",
@@ -246,6 +300,7 @@ impl BackendGraph for OnnxGraph {
             inputs.push(TensorSlot {
                 shape,
                 tensor: None,
+                bound: None,
             });
         }
         // We need to keep track of the output shapes since they are used for
@@ -256,6 +311,7 @@ impl BackendGraph for OnnxGraph {
             outputs.push(TensorSlot {
                 shape,
                 tensor: None,
+                bound: None,
             });
         }
         let box_: Box<dyn BackendExecutionContext> = Box::new(OnnxExecutionContext {
@@ -265,6 +321,10 @@ impl BackendGraph for OnnxGraph {
             outputs,
         });
         Ok(box_.into())
+    }
+
+    fn session_key(&self) -> usize {
+        Arc::as_ptr(&self.session) as usize
     }
 }
 
@@ -280,17 +340,30 @@ unsafe impl Sync for OnnxExecutionContext {}
 
 impl OnnxExecutionContext {
     /// Runs the session over the inputs set, and reads every output back as
-    /// the shape and bytes its type asks for, in the session's order.
+    /// the tensor its type asks for, in the session's order.
     ///
-    /// With every input in host memory the session is run as upstream runs
-    /// it. With any input in device memory the inputs are bound instead:
-    /// that input's memory as it is, the others as CPU tensors, and the
-    /// outputs to host memory, where they are read as before.
-    fn run(&mut self) -> Result<Vec<(Vec<u32>, Vec<u8>)>, BackendError> {
+    /// With every input in host memory and no output bound to device memory
+    /// the session is run as upstream runs it. Otherwise the inputs and
+    /// outputs are bound instead: an input in device memory as it is, the
+    /// others as CPU tensors; an output bound to device memory there, the
+    /// others to host memory, where they are read as before. An output
+    /// bound to device memory comes back as a tensor on the device, whose
+    /// bytes are read back only when asked for.
+    fn run(&mut self) -> Result<Vec<Tensor>, BackendError> {
         let on_device = self
             .inputs
             .iter()
-            .any(|slot| slot.tensor.as_ref().is_some_and(|t| t.device.is_some()));
+            .any(|slot| slot.tensor.as_ref().is_some_and(|t| t.device.is_some()))
+            || self.outputs.iter().any(|slot| {
+                slot.bound
+                    .as_ref()
+                    .is_some_and(|b| b.output.0.memory().is_some())
+            });
+        for slot in &self.outputs {
+            if let Some(bound) = &slot.bound {
+                bound.output.0.ready()?;
+            }
+        }
         let mut session = self.session.lock().unwrap();
         if !on_device {
             let mut session_inputs: Vec<SessionInputValue<'_>> = vec![];
@@ -298,20 +371,22 @@ impl OnnxExecutionContext {
                 session_inputs.extend(to_input_value(i)?);
             }
             let session_outputs = session.run(session_inputs.as_slice())?;
-            return self
-                .outputs
-                .iter()
-                .enumerate()
-                .map(|(i, output)| from_output_value(&session_outputs[i], output.shape.ty))
-                .collect();
+            let mut read = Vec::with_capacity(self.outputs.len());
+            for (i, output) in self.outputs.iter().enumerate() {
+                let (dimensions, data) = from_output_value(&session_outputs[i], output.shape.ty)?;
+                if let Some(bound) = &output.bound {
+                    bound.output.0.written(Some(&data))?;
+                }
+                read.push(Tensor {
+                    dimensions,
+                    ty: output.shape.ty,
+                    data,
+                    device: None,
+                });
+            }
+            return Ok(read);
         }
 
-        if self.provider != Provider::Cuda {
-            return Err(BackendError::BackendAccess(wasmtime::format_err!(
-                "an input in device memory is bound to a CUDA session, and this one is on {}",
-                self.provider.name()
-            )));
-        }
         let mut binding = session.create_binding()?;
         for slot in &self.inputs {
             let Some(tensor) = &slot.tensor else {
@@ -331,21 +406,14 @@ impl OnnxExecutionContext {
                     tensor.ty
                 )));
             }
-            let (pointer, ordinal) = device.0.cuda_pointer();
+            let (info, pointer) = memory_info(self.provider, device.0.memory(), &slot.shape.name)?;
             device.0.ready()?;
-            let memory = MemoryInfo::new(
-                AllocationDevice::CUDA,
-                ordinal,
-                AllocatorType::Device,
-                MemoryType::Default,
-            )?;
             let shape = ort::tensor::Shape::new(tensor.dimensions.iter().map(|&d| i64::from(d)));
-            // SAFETY: `DeviceInput` promises a CUDA allocation on device
-            // `ordinal` holding the tensor's elements, alive as long as the
-            // tensor is; the tensor is in `slot` until after the run below.
-            let value = unsafe {
-                TensorRefMut::<f32>::from_raw(memory, pointer as usize as *mut _, shape)?
-            };
+            // SAFETY: `DeviceInput` promises device memory of the kind its
+            // `memory` names holding the tensor's elements, alive as long as
+            // the tensor is; the tensor is in `slot` until after the run.
+            let value =
+                unsafe { TensorRefMut::<f32>::from_raw(info, pointer as usize as *mut _, shape)? };
             binding.bind_input(&slot.shape.name, &*value)?;
         }
         let host = MemoryInfo::new(
@@ -355,14 +423,56 @@ impl OnnxExecutionContext {
             MemoryType::CPUOutput,
         )?;
         for output in &self.outputs {
-            binding.bind_output_to_device(&output.shape.name, &host)?;
+            let device = output
+                .bound
+                .as_ref()
+                .and_then(|b| b.output.0.memory().map(|m| (b, m)));
+            match device {
+                Some((bound, memory)) => {
+                    let (info, pointer) = memory_info(self.provider, memory, &output.shape.name)?;
+                    // SAFETY: `DeviceOutput` promises device memory of the
+                    // kind `memory` names with room for the output's
+                    // elements, alive as long as the binding is, which
+                    // outlives the run.
+                    let value = unsafe { device_value(&info, pointer, &bound.dimensions)? };
+                    binding.bind_output(&output.shape.name, value)?;
+                }
+                None => binding.bind_output_to_device(&output.shape.name, &host)?,
+            }
         }
         let session_outputs = session.run_binding(&binding)?;
-        self.outputs
-            .iter()
-            .enumerate()
-            .map(|(i, output)| from_output_value(&session_outputs[i], output.shape.ty))
-            .collect()
+        let mut read = Vec::with_capacity(self.outputs.len());
+        for (i, output) in self.outputs.iter().enumerate() {
+            match &output.bound {
+                Some(bound) if bound.output.0.memory().is_some() => {
+                    bound.output.0.written(None)?;
+                    let dimensions = bound
+                        .dimensions
+                        .iter()
+                        .map(convert_i64)
+                        .collect::<Result<Vec<u32>, _>>()?;
+                    read.push(Tensor::on_device(
+                        dimensions,
+                        TensorType::Fp32,
+                        DeviceHandle(Arc::new(OutputRead(bound.output.clone()))),
+                    ));
+                }
+                bound => {
+                    let (dimensions, data) =
+                        from_output_value(&session_outputs[i], output.shape.ty)?;
+                    if let Some(bound) = bound {
+                        bound.output.0.written(Some(&data))?;
+                    }
+                    read.push(Tensor {
+                        dimensions,
+                        ty: output.shape.ty,
+                        data,
+                        device: None,
+                    });
+                }
+            }
+        }
+        Ok(read)
     }
 
     /// Helper function for finding the internal index of a tensor by [`Id`].
@@ -445,13 +555,7 @@ impl BackendExecutionContext for OnnxExecutionContext {
                 let read = self.run()?;
 
                 let mut output_tensors = Vec::new();
-                for (output, (dimensions, data)) in self.outputs.iter_mut().zip(read) {
-                    let tensor = Tensor {
-                        dimensions,
-                        ty: output.shape.ty,
-                        data,
-                        device: None,
-                    };
+                for (output, tensor) in self.outputs.iter_mut().zip(read) {
                     output.tensor.replace(tensor.clone());
                     output_tensors.push(NamedTensor {
                         name: output.shape.name.clone(),
@@ -464,13 +568,8 @@ impl BackendExecutionContext for OnnxExecutionContext {
             // WITX
             None => {
                 let read = self.run()?;
-                for (output, (dimensions, data)) in self.outputs.iter_mut().zip(read) {
-                    output.tensor.replace(Tensor {
-                        dimensions,
-                        ty: output.shape.ty,
-                        data,
-                        device: None,
-                    });
+                for (output, tensor) in self.outputs.iter_mut().zip(read) {
+                    output.tensor.replace(tensor);
                 }
                 Ok(None)
             }
@@ -489,6 +588,157 @@ impl BackendExecutionContext for OnnxExecutionContext {
             )))
         }
     }
+
+    fn bind_output_device(
+        &mut self,
+        name: &str,
+        output: DeviceOutputHandle,
+    ) -> Result<(), BackendError> {
+        let index = self.find(Id::Name(name.to_string()), &self.outputs)?;
+        let provider = self.provider;
+        let slot = &mut self.outputs[index];
+        if slot.shape.ty != TensorType::Fp32 {
+            return Err(BackendError::BackendAccess(wasmtime::format_err!(
+                "output {name} is {:?}, and only an fp32 output is bound to device memory",
+                slot.shape.ty
+            )));
+        }
+        let (width, height) = output.0.size();
+        let dimensions = resolve(&slot.shape.dimensions, width, height);
+        let elements: i64 = dimensions.iter().product();
+        if elements != i64::from(width) * i64::from(height) {
+            return Err(BackendError::BackendAccess(wasmtime::format_err!(
+                "output {name} is {:?}, taken as {dimensions:?}: {elements} elements, \
+                 where a {width}x{height} texture holds {}",
+                slot.shape.dimensions,
+                u64::from(width) * u64::from(height)
+            )));
+        }
+        if let Some(memory) = output.0.memory() {
+            memory_info(provider, memory, name)?;
+        }
+        slot.bound = Some(BoundOutput { output, dimensions });
+        Ok(())
+    }
+
+    fn execution_provider(&self) -> Option<&'static str> {
+        Some(self.provider.name())
+    }
+
+    fn session_key(&self) -> usize {
+        Arc::as_ptr(&self.session) as usize
+    }
+}
+
+/// How a session on `provider` takes device memory of kind `memory`, and
+/// the pointer to hand it; refused where the session is not on that device.
+fn memory_info(
+    provider: Provider,
+    memory: DeviceMemory,
+    name: &str,
+) -> Result<(MemoryInfo, u64), BackendError> {
+    match (memory, provider) {
+        (DeviceMemory::Cuda { pointer, ordinal }, Provider::Cuda) => Ok((
+            MemoryInfo::new(
+                AllocationDevice::CUDA,
+                ordinal,
+                AllocatorType::Device,
+                MemoryType::Default,
+            )?,
+            pointer,
+        )),
+        (DeviceMemory::DirectMl { allocation }, Provider::DirectMl) => Ok((
+            MemoryInfo::new(
+                AllocationDevice::DIRECTML,
+                0,
+                AllocatorType::Device,
+                MemoryType::Default,
+            )?,
+            allocation,
+        )),
+        (memory, provider) => Err(BackendError::BackendAccess(wasmtime::format_err!(
+            "{name} is in device memory ({memory:?}), which a session on {} cannot reach",
+            provider.name()
+        ))),
+    }
+}
+
+/// An output bound to device memory, and the shape it is bound with.
+struct BoundOutput {
+    output: DeviceOutputHandle,
+    dimensions: Vec<i64>,
+}
+
+/// A graph's output dimensions with the dynamic ones given: the last is
+/// `width`, the one before it `height`, and any others 1.
+fn resolve(dimensions: &[i64], width: u32, height: u32) -> Vec<i64> {
+    let last = dimensions.len();
+    dimensions
+        .iter()
+        .enumerate()
+        .map(|(i, &d)| match (is_dynamic_dimension(d), last - i) {
+            (false, _) => d,
+            (true, 1) => i64::from(width),
+            (true, 2) => i64::from(height),
+            (true, _) => 1,
+        })
+        .collect()
+}
+
+/// A value over device memory the embedder owns, for a session to write.
+///
+/// # Safety
+/// `pointer` is memory of the kind `info` names, with room for the fp32
+/// elements `dimensions` count, alive as long as the value is.
+unsafe fn device_value(
+    info: &MemoryInfo,
+    pointer: u64,
+    dimensions: &[i64],
+) -> Result<DynValue, BackendError> {
+    use ort::AsPointer;
+    let elements: i64 = dimensions.iter().product();
+    let mut value: *mut ort::sys::OrtValue = std::ptr::null_mut();
+    // SAFETY: as the caller promises; the shape outlives the call.
+    let status = unsafe {
+        (ort::api().CreateTensorWithDataAsOrtValue)(
+            info.ptr(),
+            pointer as usize as *mut std::ffi::c_void,
+            elements as usize * 4,
+            dimensions.as_ptr(),
+            dimensions.len(),
+            ort::sys::ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+            &mut value,
+        )
+    };
+    // SAFETY: a status the API returned.
+    unsafe { ort::error::status_to_result(status) }?;
+    let value = std::ptr::NonNull::new(value).ok_or_else(|| {
+        BackendError::BackendAccess(wasmtime::format_err!(
+            "CreateTensorWithDataAsOrtValue made nothing"
+        ))
+    })?;
+    // SAFETY: a live value made above, owned by the result.
+    Ok(unsafe { DynValue::from_ptr(value, None) })
+}
+
+/// An output in device memory, as a tensor's elements a guest may read.
+struct OutputRead(DeviceOutputHandle);
+
+impl DeviceInput for OutputRead {
+    fn memory(&self) -> DeviceMemory {
+        self.0
+            .0
+            .memory()
+            .expect("only an output written to device memory is handed out this way")
+    }
+
+    fn ready(&self) -> wasmtime::Result<()> {
+        Ok(())
+    }
+
+    fn read(&self) -> wasmtime::Result<Vec<u8>> {
+        self.0.0.read()
+    }
 }
 
 impl From<ort::Error> for BackendError {
@@ -504,6 +754,8 @@ impl From<ort::Error> for BackendError {
 struct TensorSlot {
     shape: Shape,
     tensor: Option<Tensor>,
+    /// An output bound to device memory the embedder holds.
+    bound: Option<BoundOutput>,
 }
 
 /// Describes a tensor in ONNX terms.

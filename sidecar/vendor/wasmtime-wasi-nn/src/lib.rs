@@ -91,22 +91,63 @@ impl fmt::Debug for Tensor {
     }
 }
 
+/// Where a tensor's elements are in device memory the embedder holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceMemory {
+    /// A CUDA device pointer, on the device of this ordinal.
+    Cuda { pointer: u64, ordinal: i32 },
+    /// An allocation DirectML made over a D3D12 resource
+    /// (`CreateGPUAllocationFromD3DResource`), as the pointer it returned.
+    DirectMl { allocation: u64 },
+}
+
 /// An input tensor's elements in device memory the embedder owns, which a
 /// backend binds to its session in place of bytes. The tensor carries a
 /// handle to it, so the wasi-nn tensor itself stays bytes or nothing.
 pub trait DeviceInput: Send + Sync {
-    /// The CUDA device pointer to the elements, packed as the tensor's
-    /// dimensions and type say, and the ordinal of the device it is on.
-    fn cuda_pointer(&self) -> (u64, i32);
+    /// Where the elements are, packed as the tensor's dimensions and type
+    /// say.
+    fn memory(&self) -> DeviceMemory;
 
-    /// Returns once whatever writes the elements has written them, so a
-    /// session reading them next reads what was written.
+    /// Called before the session runs: whatever writes the elements is
+    /// ordered before the run, by a wait the run's own queue or stream
+    /// takes or by returning once they are written.
     fn ready(&self) -> wasmtime::Result<()>;
 
     /// The elements in host memory, little-endian, for a reader asking for
     /// the tensor's bytes.
     fn read(&self) -> wasmtime::Result<Vec<u8>>;
 }
+
+/// An output the embedder holds device memory for, bound to an execution
+/// context so every run writes it there rather than into host memory.
+pub trait DeviceOutput: Send + Sync {
+    /// Where the session writes the elements; `None` when the session
+    /// cannot write device memory, so the run writes host memory and hands
+    /// the bytes to [`DeviceOutput::written`].
+    fn memory(&self) -> Option<DeviceMemory>;
+
+    /// The picture the elements are, width and height: the output has
+    /// `width * height` fp32 elements, and its dynamic dimensions are
+    /// taken as the last the width, the one before it the height, and any
+    /// others 1.
+    fn size(&self) -> (u32, u32);
+
+    /// Called before the session runs: whatever reads the last run's
+    /// elements is ordered before this run writes them.
+    fn ready(&self) -> wasmtime::Result<()>;
+
+    /// Called once the run is given to the device: the elements, in host
+    /// memory when [`DeviceOutput::memory`] is `None`.
+    fn written(&self, host: Option<&[u8]>) -> wasmtime::Result<()>;
+
+    /// The elements of the last run in host memory, little-endian.
+    fn read(&self) -> wasmtime::Result<Vec<u8>>;
+}
+
+/// An execution context's [`DeviceOutput`].
+#[derive(Clone)]
+pub struct DeviceOutputHandle(pub Arc<dyn DeviceOutput>);
 
 /// A tensor's [`DeviceInput`], shared by every copy of the tensor.
 #[derive(Clone)]
@@ -170,6 +211,16 @@ impl ExecutionContext {
 
     pub fn get_output(&mut self, id: Id) -> Result<Tensor, BackendError> {
         self.0.get_output(id)
+    }
+
+    /// Binds output `name` to device memory the embedder holds, for every
+    /// later run; see [`DeviceOutput`].
+    pub fn bind_output_device(
+        &mut self,
+        name: &str,
+        output: DeviceOutputHandle,
+    ) -> Result<(), BackendError> {
+        self.0.bind_output_device(name, output)
     }
 
     pub fn compute_with_io(

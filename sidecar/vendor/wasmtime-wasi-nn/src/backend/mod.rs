@@ -73,6 +73,13 @@ pub trait BackendFromDir: BackendInner {
 /// implementation for the user-facing graph.
 pub trait BackendGraph: Send + Sync {
     fn init_execution_context(&self) -> Result<ExecutionContext, BackendError>;
+
+    /// A number the graph and every context it made answer alike, so an
+    /// embedder can tell which graph a context runs; 0 where the backend
+    /// keeps none.
+    fn session_key(&self) -> usize {
+        0
+    }
 }
 
 /// A [BackendExecutionContext] performs the actual inference; this is the
@@ -87,6 +94,29 @@ pub trait BackendExecutionContext: Send + Sync {
         &mut self,
         inputs: Option<Vec<NamedTensor>>,
     ) -> Result<Option<Vec<NamedTensor>>, BackendError>;
+
+    /// Binds output `name` to device memory the embedder holds, for every
+    /// later run. A backend that cannot refuses.
+    fn bind_output_device(
+        &mut self,
+        name: &str,
+        _output: crate::DeviceOutputHandle,
+    ) -> Result<(), BackendError> {
+        Err(BackendError::BackendAccess(wasmtime::format_err!(
+            "this backend cannot bind output {name} to device memory"
+        )))
+    }
+
+    /// The execution provider the context's session runs on, as the backend
+    /// names it; `None` where the backend has no such thing.
+    fn execution_provider(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// [`BackendGraph::session_key`] of the graph that made the context.
+    fn session_key(&self) -> usize {
+        0
+    }
 }
 
 /// An identifier for a tensor in a [Graph].
