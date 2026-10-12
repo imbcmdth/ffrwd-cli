@@ -1647,7 +1647,7 @@ What waits:
   session there takes the downloaded and uploaded routes and says so.
 
 **The GPU path an addition, not a requirement (2026-10-12):** `depth` is
-two builds of one source again. `depth.wasm` is the window filter it was
+two builds of one source again, and `segment` (below) the same way. `depth.wasm` is the window filter it was
 before it moved onto `frame-tensor`, making its tensor on the CPU and
 importing nothing of the GPU's, so a sidecar without the `gpu` feature runs
 it and the compiler grants it nothing; on 10 frames of `testsrc.mp4` it
@@ -1668,6 +1668,55 @@ build runs `memory=host` on a sidecar with GPU support and no adapter
   `wasi:webgpu` by name ("this ffrwd-wasm was built without GPU support (the
   `gpu` cargo feature), so it cannot run a module that imports
   wasi:webgpu"), and the host builds keep CPU-only runs working.
+
+**Segment on frame-tensor, its rows to an older reader (2026-10-12, owner's
+machine):** `segment` is two builds of one source the same way. `segment.wasm`
+is unchanged, the window filter whose rows ride its map, and recipe 94 keeps
+it. `segment_gpu.wasm` is a node beside `ffrwd:gpu` whose map leaves on `map`
+and rows on `objects`, a data port of their own. The host makes its input
+with `frame-tensor`, letterboxed onto 114/255. On `memory=host`, the default,
+both outputs come back as bytes and the map is painted on the CPU as before.
+On `memory=gpu` the mask prototypes (`[1, 32, 160, 160]`) are bound to a
+160x5120 texture with `output-texture`, and one pass on the device paints the
+map from them and each detection's coefficients; the predictions
+(`[1, 116, 8400]`, 3.9 MB) still come back to host memory every frame, where
+the detections are decoded and thinned, so the map comes straight off a bound
+output and the rows do not. The two paths find the same objects to 0.002 in
+score and two pixels in the box, and their maps differ on under 1 % of the
+pixels either paints.
+
+How the rows reach `mask_select`: the compiler takes a node's rows in an older
+function's annotation column (the field read off the call, a gather over it,
+or a WITH body's column of them) and makes them one more input after the
+module's streams, the data stream itself, narrowed by a `rowfilter` where a
+gather says so: `[n10][n2]mask_select` in recipe 159. The sidecar binds a data
+pad last among an older frame module's pads to its adapted shape's `rows`
+port, lockstep with the clock, and hands each row riding the latest frame of
+the first pad at or before the row's time. A module whose first stream comes
+through an ffmpeg filter would run in a process with no node to pair them,
+and is refused naming it. A gather over a WITH body's column outside the body
+is refused as it is for an older producer ("ARRAY(subquery) needs a branch
+with no row source of its own"); the body may narrow the column itself.
+
+Measured on the 4090, release build, 1080p h264 decoded in the sidecar
+(`d3d12va` for `memory=gpu`, software for `memory=host`), `confidence=0.005`
+so the test pattern yields objects to paint (a few a frame), the time inside
+the module per frame (the profile's `process` stage over 240 frames less 40,
+divided by 200), two rounds; the map is latched and written to `null`:
+
+| route | ms per frame | `download` per frame |
+|---|---|---|
+| CUDA, bound (input and prototypes) | 24.3, 24.6 | 0 |
+| CUDA, downloaded (`FFRWD_NN_BIND=off`) | 44.5, 44.4 | 4.92 MB |
+| DirectML, bound | 19.2, 18.7 | 0 |
+| DirectML, downloaded | 43.0, 44.7 | 4.92 MB |
+| CUDA, `memory=host` | 43.6, 42.8 | 0 |
+| CPU, `memory=host` | 172, 175 | 0 |
+
+The downloaded routes pay about 20 ms a frame for the 4.9 MB tensor read back
+and handed to the session, and the prototypes uploaded again. How much of the
+bound routes' time is the graph, and how much the predictions coming back and
+their decoding on the CPU (8400 anchors of 116 channels), is not broken down.
 
 ### Wave 5: two candidates to measure
 

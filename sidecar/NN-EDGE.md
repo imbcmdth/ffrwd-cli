@@ -546,3 +546,27 @@ within a level.
 On an RTX 4090, 64x64 frames, the graph itself is what the time goes on:
 178 ms a frame on the CPU provider against 20 ms on CUDA, after a fixed
 230 ms and 870 ms respectively to start up and build the session.
+
+## The segment module
+
+`modules/segment` runs YOLOv8n-seg at 640x640 and asks for the name
+**`segment`**, in two builds of one source as depth does. `segment.wasm` is a
+window filter that letterboxes the frame onto 114/255 grey itself, on the
+CPU, and writes an index map with its rows riding it; it imports nothing of
+the GPU's. `segment_gpu.wasm` is a node beside `ffrwd:gpu` whose map leaves
+on `map` and rows on `objects`, a data port of their own, and is granted
+`-gpu`. The host makes its tensor with `frame-tensor` (`pad` 114/255). On
+`memory=gpu` the mask prototypes, the graph's rank-4 output of 32 planes,
+are bound to a texture with `output-texture`, its planes stacked down it,
+and a pass on the device paints the map from them and each detection's
+coefficients; the predictions come back to host memory, where the
+detections are decoded and thinned, so the rows are made on the CPU on
+every route. Its output line names the export's own output:
+
+    [nn] segment: output onnx::Shape_356 to a texture, bound on CUDA
+
+Which output is the prototypes is known only by shape, so a run on
+`memory=gpu` runs the graph once over a grey square at `init` to learn it.
+On the 4090 at 1080p the module takes about 24 ms a frame bound on CUDA,
+19 ms bound on DirectML, 44 ms on either downloaded, and 43 ms on
+`memory=host` with CUDA.
