@@ -11,12 +11,14 @@
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use std::thread;
+use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use ffrwd_wasm_runtime::node::{
     Clock, Emission, Emitted, Node, NodeShape, OutFrame, Pairing, Payload, PortKind, RowsUse,
     TickFrame,
 };
+use ffrwd_wasm_runtime::profile::PROFILE;
 use ffrwd_wasm_runtime::runtime::{Format, Frame, Media, Processed, Shape, StreamInfo};
 
 use crate::adapters::{self, FilterNode};
@@ -391,15 +393,18 @@ fn feed(reader: &mut Input, input: usize, format: &Format, scheduler: &Scheduler
     let mut buf: Vec<u8> = Vec::new();
     let mut index = 0u64;
     loop {
+        let started = Instant::now();
         let read = reader
             .read_frame(&mut buf)
             .with_context(|| format!("reading frame {index} of input {input}"))?;
+        PROFILE.read.add(buf.len(), started);
         let Some(pts) = read else {
             let trailing = reader.take_trailing();
             scheduler.end_with(id, &trailing);
             return Ok(());
         };
         check_frame(format, &buf, index)?;
+        PROFILE.held.count(buf.len());
         index += 1;
         let frame = TickFrame {
             pts,

@@ -1794,7 +1794,9 @@ impl Sink {
                 if self.annotations {
                     w.write_rows(frame.pts, &stamped)?;
                 }
+                let started = Instant::now();
                 w.write_frame(frame.pts, &frame.data)?;
+                PROFILE.write.add(frame.data.len(), started);
             }
             if self.rows.is_some() || self.subtitles.is_some() {
                 batch.extend(stamped);
