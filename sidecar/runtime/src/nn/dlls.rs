@@ -237,9 +237,10 @@ pub fn siblings(dirs: &[PathBuf], dep: &CudaDep) -> Vec<(String, PathBuf)> {
 /// PATH and without letting the rest of PATH answer.
 ///
 /// The CUDA provider's own imports and cuDNN's runtime-loaded sublibraries are
-/// resolved by bare name through the normal search order. Switching the
-/// process to the restricted order and adding directories to it explicitly
-/// means only the directories named here can answer.
+/// resolved by bare name through the normal search order, and so are libav's
+/// imports of its own libraries (`av` calls this too). Switching the process
+/// to the restricted order and adding directories to it explicitly means only
+/// the directories named here can answer.
 #[cfg(windows)]
 pub fn add_search_dir(dir: &Path) -> anyhow::Result<()> {
     use windows_sys::Win32::System::LibraryLoader::{

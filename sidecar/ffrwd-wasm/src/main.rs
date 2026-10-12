@@ -45,10 +45,10 @@ use std::time::Instant;
 
 use anyhow::{anyhow, bail, Context, Result};
 use ffrwd_wasm::nut;
-use ffrwd_wasm_runtime::nn;
 use ffrwd_wasm_runtime::runtime::{
     self, AudioFormat, Filter, Format, Frame, Media, StreamInfo, TimeBase, VideoFormat,
 };
+use ffrwd_wasm_runtime::{av, nn};
 use serde::{Deserialize, Serialize};
 
 use network::{Binding, Network};
@@ -674,6 +674,28 @@ fn take_nn_args(argv: Vec<String>) -> Result<(nn::Config, Vec<String>)> {
             bail!("-nn {}: bound twice", spec.name);
         }
         seen.push(&spec.name);
+    }
+    Ok((config, rest))
+}
+
+/// Takes `-av-runtime <dir>` out of the argv and leaves the rest: the
+/// directory libav is loaded from, for a run that decodes or encodes. Read
+/// before the argv is dispatched, the way the inference options are, so
+/// `--describe` and `--invoke` take it too.
+fn take_av_args(argv: Vec<String>) -> Result<(av::Config, Vec<String>)> {
+    let mut config = av::Config::default();
+    let mut rest = Vec::with_capacity(argv.len());
+    let mut it = argv.into_iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "-av-runtime" => {
+                let dir = it
+                    .next()
+                    .ok_or_else(|| anyhow!("-av-runtime requires a value"))?;
+                config.runtime_dir = Some(dir.into());
+            }
+            _ => rest.push(arg),
+        }
     }
     Ok((config, rest))
 }
@@ -4055,6 +4077,21 @@ fn main() {
         std::process::exit(0);
     }
 
+    // The same for libav: the majors this build demands, and what the
+    // directory it would load from holds, or why it holds nothing usable.
+    // `-av-runtime <dir>` after it names that directory.
+    if argv.first().map(String::as_str) == Some("--av-info") {
+        match take_av_args(argv[1..].to_vec()) {
+            Ok((config, _)) => av::configure(&config),
+            Err(e) => {
+                eprintln!("ffrwd-wasm: {e:#}");
+                std::process::exit(2);
+            }
+        }
+        println!("{}", av::info());
+        std::process::exit(0);
+    }
+
     // The relay runs no module, so it reads none of the flags a module run
     // takes, and its edges arrive on stdin rather than argv.
     if argv.first().map(String::as_str) == Some("relay") {
@@ -4070,6 +4107,18 @@ fn main() {
 
     let (nn_config, raw_args) = match take_nn_args(argv) {
         Ok(split) => split,
+        Err(e) => {
+            eprintln!("ffrwd-wasm: {e:#}");
+            std::process::exit(2);
+        }
+    };
+    // Only where libav comes from is recorded; nothing loads until a decoder
+    // or encoder is opened, so a run that does neither touches no libav.
+    let raw_args = match take_av_args(raw_args) {
+        Ok((av_config, rest)) => {
+            av::configure(&av_config);
+            rest
+        }
         Err(e) => {
             eprintln!("ffrwd-wasm: {e:#}");
             std::process::exit(2);
