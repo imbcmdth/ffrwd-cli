@@ -1673,7 +1673,7 @@ A 4K programme and two pictures in picture are composited by ffrwd/blitz's `comp
 ```pgsql
 CREATE FUNCTION compose(v video_stream, inputs video_stream[] DEFAULT NULL,
                         html text DEFAULT '', lead number DEFAULT 0.3,
-                        renderer text DEFAULT 'cpu')
+                        renderer text DEFAULT 'auto')
 RETURNS video_stream
   AS '../../ffrwd-package-blitz/target/wasm32-wasip2/release/compose.wasm', 'compose'
   LANGUAGE wasm;
@@ -1738,3 +1738,5 @@ $ ffrwd compile -f query.sql -v programme=tests/fixtures/testsrc.mp4 -v left=tes
 ```
 
 `compose` is blitz's own build, declared from a checkout of ffrwd-package-blitz beside this one, so the command names no path that only one machine has; a project that installs or links the package calls `ffrwd.blitz.compose` with the same arguments and reaches the same module. `renderer => 'gpu'` and `memory => 'gpu'` hold each call's pictures on the device, so the region takes each input's packets and decodes them there, as recipe 157's does. `c.v` is read twice, by `depth` and by the second `compose`, and is one node. The second `compose` holds the depth map as one of its `inputs` with `lead => 0`, so the map of frame N is drawn on frame N. The run needs a D3D12 adapter, which the decoder, both renderers, the model's session and the encoder share.
+
+What it costs, on an RTX 4090 with a 4K60 programme and two 1080p60 pictures in picture: 91 frames a second once running, with nothing crossing to host memory (`--profile` counts no `upload`, `download` or `fetch` bytes), after about 6 s of start-up. The same query with `renderer => 'cpu'`, the host build of `depth`, ffmpeg decoding and `h264_nvenc` encoding runs at 12 frames a second, moving 149 MB a frame into the modules.

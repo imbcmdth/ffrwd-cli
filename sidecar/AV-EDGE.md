@@ -134,9 +134,10 @@ falls back to software. The frames come back to host memory, with one
 exception: when the node reading them holds its frames on the GPU
 (`NODE-SHAPE.md`) and the device is the sidecar's own, `d3d12va` on
 Windows, the decoder writes straight into the sidecar's frame pool and
-nothing comes back. One line on stderr says what engaged, and a second
-says whether the decoder's own images were taken as they are or copied
-once on the device:
+nothing comes back. A coded port feed into an input held on the GPU is
+decoded the same way, where the device allows. One line on stderr says
+what engaged, and a second says whether the decoder's own images were
+taken as they are or copied once on the device:
 
     [av] decode h264: d3d11va
     [av] decode h264: software (d3d11va: no device)
@@ -166,8 +167,9 @@ unless the stream says BT.601 or full range), and the header says what
 was written. These two encoders in FFmpeg 9.0.1 fail on a B-frame on
 NVIDIA's driver and write no extradata, so `bf=0` is set unless asked
 otherwise, and the parameter sets for the header are taken from a first
-packet coded ahead of the stream. Every other encoder reads a GPU frame
-back once.
+packet coded ahead of the stream. They keep 16 pictures in flight unless
+`async_depth` is given, since each picture reaches them through a copy on
+another queue. Every other encoder reads a GPU frame back once.
 
     [av] encode h264_d3d12va: 1920x1080 nv12, from the device
     [gpu] encode h264_d3d12va: from the device, each frame one copy
