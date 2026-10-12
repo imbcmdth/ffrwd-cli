@@ -21,6 +21,13 @@
 //! frame as NV12 (a decoder's picture as it is, a module's rgba converted
 //! first) copied into the pool's texture, after which the queue signals
 //! the picture's sync object, which the encoder waits on before reading.
+//!
+//! A filter graph on the same device is fed the same way ([`FilterFeed`]),
+//! and its pictures are taken as a decoder's are, with one difference: a
+//! D3D12 filter signals one sync object of its own for every picture it
+//! writes and never waits on a picture before writing it again, so a
+//! picture taken from one is not handed back by signalling: it is kept
+//! until the queue has finished reading it ([`Taker::for_filter`]).
 
 use std::collections::VecDeque;
 use std::mem::{transmute_copy, ManuallyDrop};
@@ -97,6 +104,9 @@ pub enum Path {
 pub(super) struct Wrapped {
     texture: TextureId,
     picture: DeviceFrame,
+    /// Kept until the queue has read it rather than handed back by a
+    /// signal: a filter's picture.
+    kept: bool,
 }
 
 /// What a taken picture is: its planes, the textures the frame owns, and
@@ -115,6 +125,9 @@ pub(super) struct Taken {
 pub struct Taker {
     wrap: Result<(), String>,
     copier: Option<Copier>,
+    /// Whether a picture's sync object is its writer's own, signalled for
+    /// every picture: a filter's.
+    keep: bool,
 }
 
 impl Default for Taker {
@@ -122,11 +135,22 @@ impl Default for Taker {
         Taker {
             wrap: Ok(()),
             copier: None,
+            keep: false,
         }
     }
 }
 
 impl Taker {
+    /// For a filter's pictures: each is kept, once the host is done with
+    /// it, until the queue has finished reading it, rather than handed back
+    /// by signalling the sync object the filter signals for every picture.
+    pub fn for_filter() -> Taker {
+        Taker {
+            keep: true,
+            ..Taker::default()
+        }
+    }
+
     /// Takes `picture`, an NV12 picture of the process's device.
     pub(super) fn take(
         &mut self,
@@ -198,7 +222,11 @@ impl Taker {
                             ),
                         ],
                         owned: Vec::new(),
-                        wrapped: Some(Wrapped { texture, picture }),
+                        wrapped: Some(Wrapped {
+                            texture,
+                            picture,
+                            kept: self.keep,
+                        }),
                         path: Path::Wrapped,
                         why: None,
                     });
@@ -214,11 +242,15 @@ impl Taker {
         let (y, uv) = copier.copy(&queue, &resource, raw.slice, &desc, width, height)?;
         // The copy is on the queue; the decoder may write the texture again
         // once it has run.
-        let next = raw.sync_value + 1;
-        // SAFETY: as above.
-        unsafe { queue.Signal(&sync, next) }.context("signalling the decoder")?;
-        picture.read_until(next);
-        drop(picture);
+        if self.keep {
+            keep_until_read(&queue, &device_of(&resource)?, picture)?;
+        } else {
+            let next = raw.sync_value + 1;
+            // SAFETY: as above.
+            unsafe { queue.Signal(&sync, next) }.context("signalling the decoder")?;
+            picture.read_until(next);
+            drop(picture);
+        }
 
         let (cw, ch) = (width.div_ceil(2), height.div_ceil(2));
         let y = adopt(global, device, y, TextureFormat::R8Unorm, width, height)?;
@@ -362,8 +394,13 @@ impl Wrapped {
     /// Hands the decoder's texture back: returned to the common state the
     /// decoder expects it in, and its sync object signalled once every
     /// command the host and the modules queued has run.
-    pub(super) fn release(mut self, global: &Global, device: &SharedDevice) {
-        let result = (|| -> Result<()> {
+    pub(super) fn release(self, global: &Global, device: &SharedDevice) {
+        let Wrapped {
+            texture,
+            mut picture,
+            kept,
+        } = self;
+        let result = (move || -> Result<()> {
             let (encoder, err) = global.device_create_command_encoder(
                 device.device,
                 &wgpu_types::CommandEncoderDescriptor { label: None },
@@ -377,7 +414,7 @@ impl Wrapped {
                     encoder,
                     std::iter::empty(),
                     std::iter::once(wgpu_types::TextureTransition {
-                        texture: self.texture,
+                        texture,
                         selector: None,
                         state: wgpu_types::TextureUses::PRESENT,
                     }),
@@ -394,23 +431,100 @@ impl Wrapped {
             global
                 .queue_submit(*device.queue, &[commands])
                 .map_err(|(_, e)| anyhow!("{e}"))?;
-            let raw = self
-                .picture
+            let raw = picture
                 .d3d12()
                 .ok_or_else(|| anyhow!("not a D3D12 picture"))?;
+            if kept {
+                // SAFETY: the picture still holds its texture.
+                let resource = unsafe { borrowed::<ID3D12Resource>(raw.texture)? };
+                return keep_until_read(&queue(global, device)?, &device_of(&resource)?, picture);
+            }
             // SAFETY: the picture still holds its sync object.
             let sync = unsafe { borrowed::<SyncObject>(raw.sync)? };
             let next = raw.sync_value + 1;
             // SAFETY: COM calls on live objects.
             unsafe { queue(global, device)?.Signal(&sync, next) }?;
-            self.picture.read_until(next);
+            picture.read_until(next);
             Ok(())
         })();
         if let Err(e) = result {
-            eprintln!("[gpu] handing a decoded picture back to the decoder: {e:#}");
+            eprintln!("[gpu] handing a picture on the device back to its writer: {e:#}");
         }
-        global.texture_drop(self.texture);
+        global.texture_drop(texture);
     }
+}
+
+/// Pictures a filter wrote, kept until the queue has finished reading
+/// them: the filter's pool hands a texture out again as soon as the last
+/// reference to it is dropped, and the filter writes it without waiting.
+struct Kept {
+    sync: SyncObject,
+    signalled: u64,
+    held: VecDeque<(u64, DeviceFrame)>,
+}
+
+// SAFETY: D3D12 objects are free-threaded, and a picture is only moved.
+unsafe impl Send for Kept {}
+
+static KEPT: std::sync::Mutex<Option<Kept>> = std::sync::Mutex::new(None);
+
+impl Kept {
+    /// Drops every picture the queue has finished reading.
+    fn release_read(&mut self) {
+        // SAFETY: a COM call on a live object.
+        let done = unsafe { self.sync.GetCompletedValue() };
+        while self.held.front().is_some_and(|(at, _)| *at <= done) {
+            self.held.pop_front();
+        }
+    }
+}
+
+/// Keeps `picture` until everything `queue` has been given so far has run,
+/// and drops the pictures kept earlier that it has finished with.
+fn keep_until_read(
+    queue: &ID3D12CommandQueue,
+    device: &ID3D12Device,
+    picture: DeviceFrame,
+) -> Result<()> {
+    let mut kept = KEPT.lock().unwrap_or_else(|e| e.into_inner());
+    if kept.is_none() {
+        // SAFETY: a COM call on a live device.
+        let sync: SyncObject = unsafe { device.CreateFence(0, Default::default()) }
+            .context("a sync object for pictures a filter wrote")?;
+        *kept = Some(Kept {
+            sync,
+            signalled: 0,
+            held: VecDeque::new(),
+        });
+    }
+    let kept = kept.as_mut().expect("made just above");
+    kept.signalled += 1;
+    // SAFETY: COM calls on live objects.
+    unsafe { queue.Signal(&kept.sync, kept.signalled) }.context("signalling the host's reads")?;
+    kept.held.push_back((kept.signalled, picture));
+    kept.release_read();
+    Ok(())
+}
+
+/// Waits until the queue has finished reading every picture a filter wrote
+/// that the host still keeps, and drops them: for a filter that is about
+/// to close.
+pub fn release_kept() {
+    let mut kept = KEPT.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(kept) = kept.as_mut() else {
+        return;
+    };
+    // SAFETY: COM calls on live objects; a null event blocks until the
+    // value is reached.
+    unsafe {
+        if kept.sync.GetCompletedValue() < kept.signalled {
+            let _ = kept.sync.SetEventOnCompletion(
+                kept.signalled,
+                windows::Win32::Foundation::HANDLE::default(),
+            );
+        }
+    }
+    kept.release_read();
 }
 
 /// A command list and its allocator, free once the copier's sync object
@@ -849,6 +963,58 @@ impl EncoderFeed {
         unsafe { queue.Signal(&sync, next) }.context("signalling the encoder")?;
         picture.written_at(next);
         Ok(copied)
+    }
+}
+
+/// Writes frames on the process's device into a filter graph's pictures,
+/// as [`EncoderFeed`] does into an encoder's, after the filter is done
+/// reading the textures its pool hands out again: a D3D12 filter reads a
+/// picture on a queue of its own and never signals it, so the copy waits
+/// on what the filter signalled for the last picture it wrote.
+#[derive(Default)]
+pub struct FilterFeed {
+    feed: EncoderFeed,
+    /// The filter's own sync object, and the value it reaches once the
+    /// last picture taken from the filter is written.
+    written: Option<(SyncObject, u64)>,
+}
+
+// SAFETY: D3D12 objects are free-threaded; the feed is used from one
+// thread at a time, the filter node's.
+unsafe impl Send for FilterFeed {}
+
+impl FilterFeed {
+    /// Copies `frame` into `picture`, a picture of the filter's source
+    /// pool, as [`EncoderFeed::feed`] does, once the filter has finished
+    /// with everything it wrote before.
+    pub fn feed(
+        &mut self,
+        frame: &Arc<GpuFrame>,
+        yuv: Yuv,
+        picture: &mut DeviceFrame,
+    ) -> Result<Copied> {
+        if let Some((sync, value)) = &self.written {
+            let (global, device) = (
+                shared(),
+                shared_device().ok_or_else(|| anyhow!("no GPU: the process has no device"))?,
+            );
+            // SAFETY: COM calls on live objects.
+            unsafe { queue(global, device)?.Wait(sync, *value) }
+                .context("waiting on the filter")?;
+        }
+        self.feed.feed(frame, yuv, picture)
+    }
+
+    /// Notes a picture the filter handed back: everything the filter read
+    /// before it has been read once its sync object reaches the picture's
+    /// value.
+    pub fn wrote(&mut self, picture: &DeviceFrame) -> Result<()> {
+        if let Some(raw) = picture.d3d12() {
+            // SAFETY: the picture holds its sync object.
+            let sync = unsafe { borrowed::<SyncObject>(raw.sync)? };
+            self.written = Some((sync, raw.sync_value));
+        }
+        Ok(())
     }
 }
 

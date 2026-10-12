@@ -600,10 +600,10 @@ impl Drop for GpuFrame {
 
 /// How one decoder's pictures become frames: taken on the device as they
 /// are (see [`super::d3d12`]), with one line on stderr saying how, and
-/// again if that changes.
+/// again if that changes. A filter graph's pictures are taken the same way.
 pub struct DecodedPictures {
-    codec: String,
-    device_type: &'static str,
+    /// What the line on stderr names: `decode h264: d3d12va`.
+    who: String,
     said: Option<String>,
     #[cfg(windows)]
     taker: super::d3d12::Taker,
@@ -614,11 +614,22 @@ impl DecodedPictures {
     /// `device_type` (`d3d12va`).
     pub fn new(codec: &str, device_type: &'static str) -> DecodedPictures {
         DecodedPictures {
-            codec: codec.to_string(),
-            device_type,
+            who: format!("decode {codec}: {device_type}"),
             said: None,
             #[cfg(windows)]
             taker: Default::default(),
+        }
+    }
+
+    /// For a filter graph running `filters` on the process's device as
+    /// `device_type`, whose pictures are kept until the device has read
+    /// them rather than handed back (see [`super::d3d12`]).
+    pub fn for_filter(filters: &str, device_type: &'static str) -> DecodedPictures {
+        DecodedPictures {
+            who: format!("filter {filters}: {device_type}"),
+            said: None,
+            #[cfg(windows)]
+            taker: super::d3d12::Taker::for_filter(),
         }
     }
 
@@ -667,7 +678,7 @@ impl DecodedPictures {
             (super::d3d12::Path::Copied, None) => "frames copied".to_string(),
         };
         if self.said.as_deref() != Some(how.as_str()) {
-            eprintln!("[gpu] decode {}: {}, {how}", self.codec, self.device_type);
+            eprintln!("[gpu] {}, {how}", self.who);
             self.said = Some(how);
         }
         Ok(Arc::new(GpuFrame {
@@ -695,7 +706,7 @@ impl DecodedPictures {
         wire: Layout,
         yuv: Yuv,
     ) -> Result<Arc<GpuFrame>> {
-        let _ = (&self.codec, &self.device_type, &self.said, picture);
+        let _ = (&self.who, &self.said, picture);
         let _ = (held, wire, yuv);
         bail!("a decoder's pictures are taken on the device on Windows only, so far")
     }

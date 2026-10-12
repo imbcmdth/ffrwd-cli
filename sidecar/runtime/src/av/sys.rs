@@ -398,6 +398,83 @@ pub struct AVOption {
     pub type_: c_int,
 }
 
+/// `AVFilter` (libavfilter/avfilter.h), through `name`: all this shim
+/// reads of one.
+#[repr(C)]
+pub struct AVFilter {
+    pub name: *const c_char,
+}
+
+/// `AVFilterContext` (libavfilter/avfilter.h), whole.
+#[repr(C)]
+pub struct AVFilterContext {
+    pub av_class: *const AVClass,
+    pub filter: *const AVFilter,
+    pub name: *mut c_char,
+    pub input_pads: *mut c_void,
+    pub inputs: *mut *mut c_void,
+    pub nb_inputs: c_uint,
+    pub output_pads: *mut c_void,
+    pub outputs: *mut *mut c_void,
+    pub nb_outputs: c_uint,
+    pub priv_: *mut c_void,
+    pub graph: *mut AVFilterGraph,
+    pub thread_type: c_int,
+    pub nb_threads: c_int,
+    pub enable_str: *mut c_char,
+    pub is_disabled: c_int,
+    pub hw_device_ctx: *mut AVBufferRef,
+    pub extra_hw_frames: c_int,
+}
+
+/// `AVFilterGraph` (libavfilter/avfilter.h), through `nb_threads`: the
+/// filters it holds, which is what this shim reads.
+#[repr(C)]
+pub struct AVFilterGraph {
+    pub av_class: *const AVClass,
+    pub filters: *mut *mut AVFilterContext,
+    pub nb_filters: c_uint,
+    pub scale_sws_opts: *mut c_char,
+    pub thread_type: c_int,
+    pub nb_threads: c_int,
+}
+
+/// `AVFilterInOut` (libavfilter/avfilter.h), whole: one open end of a
+/// parsed graph.
+#[repr(C)]
+pub struct AVFilterInOut {
+    /// Freed by `avfilter_inout_free`, so allocated by `av_strdup`.
+    pub name: *mut c_char,
+    pub filter_ctx: *mut AVFilterContext,
+    pub pad_idx: c_int,
+    pub next: *mut AVFilterInOut,
+}
+
+/// `AVBufferSrcParameters` (libavfilter/buffersrc.h), whole: what a
+/// `buffer` source is told before it is initialised.
+#[repr(C)]
+pub struct AVBufferSrcParameters {
+    pub format: c_int,
+    pub time_base: AVRational,
+    pub width: c_int,
+    pub height: c_int,
+    pub sample_aspect_ratio: AVRational,
+    pub frame_rate: AVRational,
+    /// Referenced by the source, not taken.
+    pub hw_frames_ctx: *mut AVBufferRef,
+    pub sample_rate: c_int,
+    pub ch_layout: AVChannelLayout,
+    pub color_space: c_int,
+    pub color_range: c_int,
+    pub side_data: *mut *mut c_void,
+    pub nb_side_data: c_int,
+    pub alpha_mode: c_int,
+}
+
+/// `AV_BUFFERSRC_FLAG_KEEP_REF`: the source takes a reference of its own
+/// and leaves the caller's frame as it was.
+pub const AV_BUFFERSRC_FLAG_KEEP_REF: c_int = 1 << 3;
+
 /// `AVMEDIA_TYPE_VIDEO`.
 pub const AVMEDIA_TYPE_VIDEO: c_int = 0;
 
@@ -549,6 +626,38 @@ pub type FnSwsAlloc = unsafe extern "C" fn() -> *mut SwsContext;
 pub type FnSwsFree = unsafe extern "C" fn(*mut *mut SwsContext);
 pub type FnSwsScaleFrame =
     unsafe extern "C" fn(*mut SwsContext, *mut AVFrame, *const AVFrame) -> c_int;
+pub type FnStrdup = unsafe extern "C" fn(*const c_char) -> *mut c_char;
+pub type FnFree = unsafe extern "C" fn(*mut c_void);
+pub type FnFilterIterate = unsafe extern "C" fn(*mut *mut c_void) -> *const AVFilter;
+pub type FnFilterByName = unsafe extern "C" fn(*const c_char) -> *const AVFilter;
+pub type FnGraphAlloc = unsafe extern "C" fn() -> *mut AVFilterGraph;
+pub type FnGraphFree = unsafe extern "C" fn(*mut *mut AVFilterGraph);
+pub type FnGraphAllocFilter = unsafe extern "C" fn(
+    *mut AVFilterGraph,
+    *const AVFilter,
+    *const c_char,
+) -> *mut AVFilterContext;
+pub type FnFilterInitStr = unsafe extern "C" fn(*mut AVFilterContext, *const c_char) -> c_int;
+pub type FnGraphParsePtr = unsafe extern "C" fn(
+    *mut AVFilterGraph,
+    *const c_char,
+    *mut *mut AVFilterInOut,
+    *mut *mut AVFilterInOut,
+    *mut c_void,
+) -> c_int;
+pub type FnGraphConfig = unsafe extern "C" fn(*mut AVFilterGraph, *mut c_void) -> c_int;
+pub type FnInOutAlloc = unsafe extern "C" fn() -> *mut AVFilterInOut;
+pub type FnInOutFree = unsafe extern "C" fn(*mut *mut AVFilterInOut);
+pub type FnSrcParamsAlloc = unsafe extern "C" fn() -> *mut AVBufferSrcParameters;
+pub type FnSrcParamsSet =
+    unsafe extern "C" fn(*mut AVFilterContext, *mut AVBufferSrcParameters) -> c_int;
+pub type FnSrcAddFrame = unsafe extern "C" fn(*mut AVFilterContext, *mut AVFrame, c_int) -> c_int;
+pub type FnSinkGetFrame = unsafe extern "C" fn(*mut AVFilterContext, *mut AVFrame) -> c_int;
+/// `av_buffersink_get_w`, `_h` and `_format`.
+pub type FnSinkInt = unsafe extern "C" fn(*const AVFilterContext) -> c_int;
+/// `av_buffersink_get_time_base` and `_frame_rate`.
+pub type FnSinkRational = unsafe extern "C" fn(*const AVFilterContext) -> AVRational;
+pub type FnSinkHwFrames = unsafe extern "C" fn(*const AVFilterContext) -> *mut AVBufferRef;
 
 /// The offsets the 9.0 headers give on a 64-bit target, worked out by hand
 /// from the declarations, so a transcription slip fails the build rather
@@ -640,4 +749,42 @@ mod offsets {
     const _: () = assert!(offset_of!(AVCodec, id) == 20);
     const _: () = assert!(offset_of!(AVCodecDescriptor, name) == 8);
     const _: () = assert!(offset_of!(AVPixFmtDescriptor, flags) == 16);
+
+    const _: () = assert!(offset_of!(AVFilterContext, filter) == 8);
+    const _: () = assert!(offset_of!(AVFilterContext, name) == 16);
+    const _: () = assert!(offset_of!(AVFilterContext, nb_inputs) == 40);
+    const _: () = assert!(offset_of!(AVFilterContext, output_pads) == 48);
+    const _: () = assert!(offset_of!(AVFilterContext, nb_outputs) == 64);
+    const _: () = assert!(offset_of!(AVFilterContext, priv_) == 72);
+    const _: () = assert!(offset_of!(AVFilterContext, graph) == 80);
+    const _: () = assert!(offset_of!(AVFilterContext, thread_type) == 88);
+    const _: () = assert!(offset_of!(AVFilterContext, nb_threads) == 92);
+    const _: () = assert!(offset_of!(AVFilterContext, enable_str) == 96);
+    const _: () = assert!(offset_of!(AVFilterContext, hw_device_ctx) == 112);
+    const _: () = assert!(offset_of!(AVFilterContext, extra_hw_frames) == 120);
+    const _: () = assert!(size_of::<AVFilterContext>() == 128);
+
+    const _: () = assert!(offset_of!(AVFilterGraph, filters) == 8);
+    const _: () = assert!(offset_of!(AVFilterGraph, nb_filters) == 16);
+    const _: () = assert!(offset_of!(AVFilterGraph, scale_sws_opts) == 24);
+    const _: () = assert!(offset_of!(AVFilterGraph, thread_type) == 32);
+    const _: () = assert!(offset_of!(AVFilterGraph, nb_threads) == 36);
+
+    const _: () = assert!(offset_of!(AVFilterInOut, filter_ctx) == 8);
+    const _: () = assert!(offset_of!(AVFilterInOut, pad_idx) == 16);
+    const _: () = assert!(offset_of!(AVFilterInOut, next) == 24);
+    const _: () = assert!(size_of::<AVFilterInOut>() == 32);
+
+    const _: () = assert!(offset_of!(AVBufferSrcParameters, time_base) == 4);
+    const _: () = assert!(offset_of!(AVBufferSrcParameters, width) == 12);
+    const _: () = assert!(offset_of!(AVBufferSrcParameters, sample_aspect_ratio) == 20);
+    const _: () = assert!(offset_of!(AVBufferSrcParameters, frame_rate) == 28);
+    const _: () = assert!(offset_of!(AVBufferSrcParameters, hw_frames_ctx) == 40);
+    const _: () = assert!(offset_of!(AVBufferSrcParameters, sample_rate) == 48);
+    const _: () = assert!(offset_of!(AVBufferSrcParameters, ch_layout) == 56);
+    const _: () = assert!(offset_of!(AVBufferSrcParameters, color_space) == 80);
+    const _: () = assert!(offset_of!(AVBufferSrcParameters, color_range) == 84);
+    const _: () = assert!(offset_of!(AVBufferSrcParameters, side_data) == 88);
+    const _: () = assert!(offset_of!(AVBufferSrcParameters, alpha_mode) == 100);
+    const _: () = assert!(size_of::<AVBufferSrcParameters>() == 104);
 }

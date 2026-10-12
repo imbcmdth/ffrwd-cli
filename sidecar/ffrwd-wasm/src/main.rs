@@ -615,7 +615,8 @@ fn resolve_binding(raw: &str) -> Result<Binding> {
     if av_nodes::is_av_node(name) {
         bail!(
             "-m {raw}: '{name}' is the network's own node and no module is bound to it; \
-             it is spelled [0:v]decode=format=<pix_fmt>[a] or [a]encode=codec=<name>[b]"
+             it is spelled [0:v]decode=format=<pix_fmt>[a], [a]encode=codec=<name>[b] \
+             or [a]filter=graph=<libavfilter graph>[b]"
         );
     }
     if path.is_empty() {

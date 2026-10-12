@@ -1295,3 +1295,285 @@ fn a_feed_held_on_the_gpu_is_conformed_on_the_device() {
     // Measured on an RTX 4090: at most 1 apart, a mean of 0.047.
     assert!(max <= 1 && mean < 0.05, "{max} apart, mean {mean}");
 }
+
+// The host's `filter` node: a libavfilter graph on the device, between a
+// decoder and an encoder on it, or over pictures in host memory.
+
+/// The libav directory `FFRWD_AV_RUNTIME` names, where it holds libavfilter
+/// beside libavcodec; None, having said why the test is skipped, otherwise.
+fn d3d12va_libavfilter(test: &str) -> Option<PathBuf> {
+    let dir = d3d12va_libav(test)?;
+    if !dir.join("avfilter-12.dll").is_file() {
+        eprintln!(
+            "SKIPPED: {test}. {} holds no avfilter-12.dll; point FFRWD_AV_RUNTIME at a libav \
+             built with libavfilter to run it.",
+            dir.display()
+        );
+        return None;
+    }
+    Some(dir)
+}
+
+/// Whether the ffmpeg on PATH has `filter`; says the test is skipped where
+/// it has not.
+fn ffmpeg_has_filter(test: &str, filter: &str) -> bool {
+    let listed = Command::new("ffmpeg")
+        .args(["-hide_banner", "-filters"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn ffmpeg");
+    let has = String::from_utf8_lossy(&listed.stdout)
+        .lines()
+        .any(|line| line.split_whitespace().nth(1) == Some(filter));
+    if !has {
+        eprintln!("SKIPPED: {test}. The ffmpeg on PATH has no {filter}.");
+    }
+    has
+}
+
+/// What ffmpeg's own `scale_d3d12` makes of `source` (`args` ahead of the
+/// input naming how the pictures reach it), as yuv420p pictures one after
+/// another.
+fn scaled_by_ffmpeg(source: &Path, args: &[&str], graph: &str) -> Vec<u8> {
+    let mut all = args.to_vec();
+    all.extend([
+        "-i",
+        path_str(source),
+        "-vf",
+        graph,
+        "-fps_mode",
+        "passthrough",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "yuv420p",
+        "-",
+    ]);
+    ffmpeg_ok(&all, "ffmpeg's own scale_d3d12")
+}
+
+const SCALED: (usize, usize) = (160, 120);
+const FILTER_LINE: &str = "[av] filter scale_d3d12: on the host's device";
+
+#[test]
+fn scale_d3d12_runs_between_a_decoder_and_an_encoder_on_the_device() {
+    let test = "scale_d3d12_runs_between_a_decoder_and_an_encoder_on_the_device";
+    let Some(dir) = d3d12va_libavfilter(test) else {
+        return;
+    };
+    let Some(()) = ffmpeg(test) else {
+        return;
+    };
+    if !ffmpeg_has_filter(test, "scale_d3d12") {
+        return;
+    }
+    let source = scratch("filter_source.nut");
+    let made = Command::new("ffmpeg")
+        .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+        .arg("testsrc2=s=320x240:r=25")
+        .args(["-frames:v", "60", "-c:v", "libx264", "-pix_fmt", "yuv420p"])
+        .args(["-f", "nut"])
+        .arg(&source)
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn ffmpeg");
+    if !made.status.success() {
+        eprintln!(
+            "SKIPPED: {test}. The ffmpeg on PATH cannot make an h264 stream with libx264: {}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+        return;
+    }
+    let out = scratch("filter_out.nut");
+    let chain = "[0:v]decode=format=yuv420p:hw=d3d12va[d];\
+                 [d]filter=graph=scale_d3d12=w=160\\\\:h=120[f];\
+                 [f]encode=codec=h264_d3d12va:b=2M[out0]";
+    let output = run_chain(&dir, &source, chain, &out, None);
+    if no_gpu(&output) {
+        eprintln!("skipped: this machine has no GPU adapter");
+        return;
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success(),
+        "exited {:?}:\n{stderr}",
+        output.status.code()
+    );
+    assert!(stderr.contains(DECODED_LINE), "{stderr}");
+    assert!(stderr.contains(FILTER_LINE), "{stderr}");
+    assert!(
+        stderr.contains("[av] filter scale_d3d12: frames copied on the device"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("[gpu] filter scale_d3d12: d3d12va, frames wrapped"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("[av] encode h264_d3d12va: 160x120 nv12, from the device"),
+        "{stderr}"
+    );
+    let row = profile_row(&stderr);
+    for stage in ["upload", "download"] {
+        assert_eq!(row[stage]["bytes"], 0, "nothing crosses to the host: {row}");
+    }
+
+    let mp4 = scratch("filter_out.mp4");
+    ffmpeg_ok(
+        &[
+            "-f",
+            "nut",
+            "-i",
+            path_str(&out),
+            "-c",
+            "copy",
+            path_str(&mp4),
+        ],
+        "ffmpeg -c copy",
+    );
+    let probed = Command::new("ffprobe")
+        .args(["-v", "error", "-count_frames", "-select_streams", "v:0"])
+        .args([
+            "-show_entries",
+            "stream=codec_name,width,height,nb_read_frames",
+        ])
+        .args(["-of", "csv=p=0"])
+        .arg(&mp4)
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn ffprobe");
+    assert_eq!(
+        String::from_utf8_lossy(&probed.stdout).trim(),
+        "h264,160,120,60"
+    );
+
+    let ours = decoded_by_ffmpeg(&mp4, "yuv420p");
+    // ffmpeg decodes in software and uploads: the device's decode is the
+    // software decode byte for byte, and ffmpeg's own d3d12va decode into
+    // scale_d3d12 made one picture 9 levels off the rest in one of seven
+    // runs on the machine this was written on.
+    let theirs = scaled_by_ffmpeg(
+        &source,
+        &["-init_hw_device", "d3d12va=d", "-filter_hw_device", "d"],
+        "format=nv12,hwupload,scale_d3d12=w=160:h=120,hwdownload,format=nv12",
+    );
+    for path in [&source, &out, &mp4] {
+        let _ = std::fs::remove_file(path);
+    }
+    let len = SCALED.0 * SCALED.1 * 3 / 2;
+    assert_eq!(ours.len(), theirs.len(), "as many pictures");
+    assert_eq!(ours.len(), 60 * len, "sixty 160x120 pictures");
+    // The encoder at 2 Mb/s over a 160x120 picture leaves next to nothing
+    // of its own: within a level on average, and each plane's mean within
+    // one.
+    let mut worst = 0f64;
+    for (a, b) in ours.chunks(len).zip(theirs.chunks(len)) {
+        let (a, b) = (
+            plane_means(a, SCALED.0, SCALED.1),
+            plane_means(b, SCALED.0, SCALED.1),
+        );
+        for plane in 0..3 {
+            worst = worst.max((a[plane] - b[plane]).abs());
+        }
+    }
+    let apart = ours
+        .iter()
+        .zip(&theirs)
+        .map(|(a, b)| f64::from(a.abs_diff(*b)))
+        .sum::<f64>()
+        / ours.len() as f64;
+    eprintln!(
+        "against ffmpeg's own scale_d3d12: {apart:.3} levels apart on average, plane means \
+         within {worst:.3}"
+    );
+    assert!(apart < 1.0, "{apart} levels apart on average");
+    assert!(worst < 1.0, "a plane's mean is {worst} levels off");
+}
+
+#[test]
+fn scale_d3d12_takes_pictures_in_host_memory_uploaded_and_reads_them_back() {
+    let test = "scale_d3d12_takes_pictures_in_host_memory_uploaded_and_reads_them_back";
+    let Some(dir) = d3d12va_libavfilter(test) else {
+        return;
+    };
+    let Some(()) = ffmpeg(test) else {
+        return;
+    };
+    if !ffmpeg_has_filter(test, "scale_d3d12") {
+        return;
+    }
+    let source = scratch("filter_host.nut");
+    ffmpeg_ok(
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=s=320x240:r=25",
+            "-frames:v",
+            "10",
+            "-c:v",
+            "rawvideo",
+            "-pix_fmt",
+            "yuv420p",
+            "-f",
+            "nut",
+            path_str(&source),
+        ],
+        "making a yuv420p stream",
+    );
+    let out = scratch("filter_host_out.nut");
+    let chain = "[0:v]filter=graph=scale_d3d12=w=160\\\\:h=120[out0]";
+    let output = run_chain(&dir, &source, chain, &out, None);
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    if !output.status.success() && stderr.contains("av_hwframe_ctx_init") {
+        eprintln!("skipped: this machine has no D3D12 device: {stderr}");
+        return;
+    }
+    assert!(
+        output.status.success(),
+        "exited {:?}:\n{stderr}",
+        output.status.code()
+    );
+    assert!(
+        stderr.contains(
+            "[av] filter scale_d3d12: on a d3d12va device of its own, pictures read back to \
+             host memory"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("[av] filter scale_d3d12: uploaded from host memory"),
+        "{stderr}"
+    );
+    let row = profile_row(&stderr);
+    assert_eq!(
+        row["upload"]["bytes"],
+        10 * 320 * 240 * 3 / 2,
+        "each picture is uploaded once, as NV12: {row}"
+    );
+    assert_eq!(
+        row["download"]["bytes"],
+        10 * 160 * 120 * 3 / 2,
+        "each scaled picture is read back once: {row}"
+    );
+
+    let ours = frames_in(&out);
+    let theirs = scaled_by_ffmpeg(
+        &source,
+        &["-init_hw_device", "d3d12va=d", "-filter_hw_device", "d"],
+        "format=nv12,hwupload,scale_d3d12=w=160:h=120,hwdownload,format=nv12",
+    );
+    let _ = std::fs::remove_file(&source);
+    let ours: Vec<u8> = ours.into_iter().flat_map(|(_, picture)| picture).collect();
+    assert_eq!(
+        ours.len(),
+        10 * SCALED.0 * SCALED.1 * 3 / 2,
+        "ten 160x120 pictures"
+    );
+    // The same video processor scaled both, and every conversion around it
+    // is a repacking of NV12 and yuv420p.
+    assert!(
+        ours == theirs,
+        "the pictures differ from ffmpeg's own scale_d3d12"
+    );
+}

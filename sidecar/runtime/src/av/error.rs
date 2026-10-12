@@ -66,6 +66,13 @@ pub enum Error {
         expected: usize,
         got: usize,
     },
+    /// A filter graph libavfilter would not make, or a device it runs on
+    /// that cannot be had: the graph as written, the call, and why.
+    Graph {
+        graph: String,
+        call: &'static str,
+        why: String,
+    },
     /// A call into libav that failed, with libav's own words for why.
     Call {
         call: &'static str,
@@ -95,6 +102,11 @@ impl Error {
             Error::Option { encoder, .. } => Some(format!(
                 "`ffmpeg -h encoder={encoder}` lists the options it takes"
             )),
+            Error::Graph { .. } => Some(
+                "`ffrwd-wasm --av-info` lists the filters this build has; libav's own line \
+                 above names the filter or option it refused"
+                    .to_string(),
+            ),
             Error::FrameSize { .. } | Error::Call { .. } => None,
         }
     }
@@ -157,6 +169,9 @@ impl Error {
             } => format!(
                 "a {width}x{height} {pix_fmt} frame is {expected} bytes, and this one is {got}"
             ),
+            Error::Graph { graph, call, why } => {
+                format!("the filter graph '{graph}': {call}: {why}")
+            }
             Error::Call { call, codec, why } => format!("{call} ({codec}): {why}"),
         }
     }

@@ -210,11 +210,14 @@ fn av_info_with_no_libav_prints_the_refusal_as_json() {
     assert_eq!(info["demands"]["avutil"], 61);
     assert_eq!(info["demands"]["swscale"], 10);
     assert_eq!(info["demands"]["swresample"], 7);
+    assert_eq!(info["demands"]["avfilter"], 12);
     assert_eq!(info["platform"], ffrwd_wasm_runtime::nn::platform());
     assert_eq!(info["from"], av::RUNTIME_DIR_VAR);
     assert_eq!(info["dir"], empty.to_string_lossy().as_ref());
     assert!(info["avcodec"].is_null(), "{info}");
+    assert!(info["avfilter"].is_null(), "{info}");
     assert_eq!(info["decoders"], serde_json::json!([]));
+    assert_eq!(info["filters"], serde_json::json!([]));
 
     let error = info["error"].as_str().expect("the refusal is a string");
     let wanted = Library::Avutil.file_name();
@@ -255,6 +258,62 @@ fn av_info_names_what_the_loaded_libav_offers() {
     assert!(has("decoders", "h264"), "{info}");
     assert!(has("encoders", "ffv1"), "{info}");
     assert!(info["hw_device_types"].is_array());
+    // libavfilter is answered for on its own: its filters where the
+    // directory has it, why not where it has not.
+    if dir.join(Library::Avfilter.file_name()).is_file() {
+        assert!(info["avfilter_error"].is_null(), "{info}");
+        let avfilter = info["avfilter"].as_str().expect("a version string");
+        assert!(avfilter.starts_with("12."), "{avfilter}");
+        assert!(has("filters", "buffersink"), "{info}");
+    } else {
+        let why = info["avfilter_error"].as_str().expect("the refusal");
+        assert!(why.contains(&Library::Avfilter.file_name()), "{why}");
+        assert_eq!(info["filters"], serde_json::json!([]));
+    }
+}
+
+#[test]
+fn filter_is_refused_by_name_where_the_directory_has_no_libavfilter() {
+    let test = "filter_is_refused_by_name_where_the_directory_has_no_libavfilter";
+    let Some(dir) = runtime_dir() else {
+        announce_skip(test);
+        return;
+    };
+    // The four libraries alone, as a sidecar from before libavfilter was
+    // bundled has them.
+    let four = scratch("no_avfilter");
+    std::fs::create_dir_all(&four).expect("create a directory");
+    for lib in Library::LOAD_ORDER {
+        std::fs::copy(dir.join(lib.file_name()), four.join(lib.file_name()))
+            .expect("copy a library");
+    }
+    let out = scratch("no_avfilter.nut");
+    let output = sidecar(
+        &[
+            "-f",
+            "nut",
+            "-i",
+            fixture().to_str().expect("UTF-8"),
+            "-filter_complex",
+            "[0:v]decode=format=yuv420p[d];[d]filter=graph=null[out0]",
+            "-map",
+            "[out0]",
+            "-f",
+            "nut",
+            out.to_str().expect("UTF-8"),
+        ],
+        Some(&four),
+    );
+    let _ = std::fs::remove_dir_all(&four);
+    let _ = std::fs::remove_file(&out);
+    let stderr = stderr_of(&output);
+    assert!(!output.status.success(), "filter was refused:\n{stderr}");
+    let wanted = Library::Avfilter.file_name();
+    assert!(stderr.contains(&format!("no {wanted} in")), "{stderr}");
+    assert!(
+        stderr.contains("pip install --force-reinstall ffrwd-wasm"),
+        "{stderr}"
+    );
 }
 
 #[test]
@@ -937,6 +996,21 @@ fn decode_and_encode_refuse_what_they_cannot_take_naming_it() {
             &coded_path,
             "[0:v]decode=format=rgba:scale=2[o]",
             &["decode has no option 'scale'"],
+        ),
+        (
+            &raw_path,
+            "[0:v]filter[o]",
+            &["filter names the libavfilter graph it runs with graph=<graph>"],
+        ),
+        (
+            &coded_path,
+            "[0:v]filter=graph=null[o]",
+            &["filter reads raw pictures", "coded h264 video"],
+        ),
+        (
+            &raw_path,
+            "[0:v]filter=graph=null:scale=2[o]",
+            &["filter has no option 'scale'"],
         ),
     ];
     let out = scratch("refusals_out.nut");

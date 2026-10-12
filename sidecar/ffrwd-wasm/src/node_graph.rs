@@ -25,7 +25,7 @@ use ffrwd_wasm_runtime::runtime::{
 };
 
 use crate::adapters::FilterNode;
-use crate::av_nodes::{self, Decode, Encode};
+use crate::av_nodes::{self, AvFilter, Decode, Encode};
 use crate::edges::{self, Target};
 use crate::feeds::{self, FeedMember, FeedSpec};
 use crate::graph::{self, NodeCall, NodePad, StreamClass, StreamRef, ROWS_PORT};
@@ -51,8 +51,8 @@ pub fn is_node_network(bindings: &[Binding]) -> Result<bool> {
     Ok(false)
 }
 
-/// Whether a network names the host's `decode` or `encode`, which only a
-/// network of node modules runs. A wiring that does not parse is left for
+/// Whether a network names the host's `decode`, `encode` or `filter`,
+/// which only a network of node modules runs. A wiring that does not parse is left for
 /// the run to refuse.
 pub fn calls_av_node(wiring: &str) -> bool {
     graph::parse_node_network(wiring)
@@ -556,7 +556,7 @@ fn open(
             Some(path) => bail!(
                 "{}: {path} is a module of an older world that rides alone; a network of node \
                  modules hosts node modules, frame modules and the host's rowfilter, \
-                 rowmerge, leaky, decode and encode",
+                 rowmerge, leaky, decode, encode and filter",
                 call.module
             ),
             None if host_nodes::is_host_node(&call.module) => Kind::Host,
@@ -610,10 +610,13 @@ fn open(
             Kind::Host => open_host(call, &pads, &streams)?,
             Kind::Leaky => open_leaky(call, &pads, &streams)?,
             Kind::Av => {
+                let held = pads.iter().any(|(_, id)| held_on_gpu.contains(id));
                 let on_gpu = if call.module == av_nodes::DECODE {
                     read_on_gpu(args, &paths, calls, index)?
+                } else if call.module == av_nodes::FILTER {
+                    held || read_on_gpu(args, &paths, calls, index)?
                 } else {
-                    pads.iter().any(|(_, id)| held_on_gpu.contains(id))
+                    held
                 };
                 open_av(call, &pads, &streams, on_gpu)?
             }
@@ -1387,6 +1390,9 @@ fn read_on_gpu(
         {
             return Ok(true);
         }
+        if reads && call.module == av_nodes::FILTER {
+            return Ok(true);
+        }
         if ports.is_empty() {
             continue;
         }
@@ -2094,10 +2100,11 @@ fn open_leaky(call: &NodeCall, pads: &[(String, u32)], defs: &[StreamDef]) -> Re
     })
 }
 
-/// `decode` or `encode` over one picture stream by position: one instance,
-/// called with whatever has arrived. `on_gpu` says an input held on the
-/// GPU, or an encoder reading D3D12 pictures, reads what a `decode` writes,
-/// or that the frames an `encode` reads are held on the GPU.
+/// `decode`, `encode` or `filter` over one picture stream by position:
+/// one instance, called with whatever has arrived. `on_gpu` says an input
+/// held on the GPU, an encoder reading D3D12 pictures, or a `filter`, reads
+/// what a `decode` or a `filter` writes, or that the frames an `encode` or
+/// a `filter` reads are held on the GPU.
 fn open_av(
     call: &NodeCall,
     pads: &[(String, u32)],
@@ -2135,6 +2142,32 @@ fn open_av(
             header: Some(header),
             wire: None,
             frame_rate: def.frame_rate,
+            spelling: String::new(),
+            rendition: RenditionMeta::default(),
+            row: None,
+        };
+        (Box::new(node), output)
+    } else if name == av_nodes::FILTER {
+        let node = AvFilter::open(
+            &call.options,
+            &def.format,
+            &def.spelling,
+            def.base,
+            def.frame_rate,
+            on_gpu,
+        )?;
+        let (base, frame_rate) = node.timing(def.frame_rate);
+        let header = filtered_header(name, &node, def, base, frame_rate)?;
+        let format = StreamFormat::Video(node.format());
+        let output = StreamDef {
+            info: info_for(&format),
+            format,
+            base,
+            decode_delay: 0,
+            latency: Some(def.latency.unwrap_or(0.0)),
+            header: Some(header),
+            wire: None,
+            frame_rate,
             spelling: String::new(),
             rendition: RenditionMeta::default(),
             row: None,
@@ -2239,6 +2272,49 @@ fn decoded_header(name: &str, node: &Decode, coded: &StreamDef) -> Result<nut::S
         *colorspace_type = crate::colorspace_type_for(video.color.as_ref());
     }
     header.frame_rate = coded.frame_rate;
+    Ok(header)
+}
+
+/// The raw header a `filter`'s pictures leave under: the graph's output
+/// size and the node's format, in `base` at `frame_rate`, with the pixel
+/// aspect and colour of the stream it reads.
+fn filtered_header(
+    name: &str,
+    node: &AvFilter,
+    read: &StreamDef,
+    base: TimeBase,
+    frame_rate: Option<(u64, u64)>,
+) -> Result<nut::Stream> {
+    let video = node.format();
+    let mut header = nut::Stream::video(video.pix_fmt, video.width, video.height, nut_base(base))
+        .ok_or_else(|| {
+        anyhow!(
+            "{name} writes {} video, which the wire does not carry; it carries {}",
+            video.pix_fmt,
+            nut::supported_pix_fmts().join(", ")
+        )
+    })?;
+    let aspect = read.header.as_ref().and_then(|h| match h.media {
+        nut::Media::Video {
+            sample_width,
+            sample_height,
+            ..
+        } => Some((sample_width, sample_height)),
+        _ => None,
+    });
+    if let nut::Media::Video {
+        sample_width,
+        sample_height,
+        colorspace_type,
+        ..
+    } = &mut header.media
+    {
+        if let Some((w, h)) = aspect.filter(|(w, h)| *w > 0 && *h > 0) {
+            (*sample_width, *sample_height) = (w, h);
+        }
+        *colorspace_type = crate::colorspace_type_for(video.color.as_ref());
+    }
+    header.frame_rate = frame_rate;
     Ok(header)
 }
 

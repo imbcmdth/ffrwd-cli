@@ -2,14 +2,15 @@
 //!
 //! The sidecar has no link-time dependency on libav. libavutil,
 //! libswresample, libavcodec and libswscale are loaded by full path, in
-//! that order, from a directory resolved when something first asks for
-//! them: the `-av-runtime` argv flag, else `FFRWD_AV_RUNTIME`, else the
+//! that order, then libavfilter where it is there, from a directory
+//! resolved when something first asks for them: the `-av-runtime` argv flag, else `FFRWD_AV_RUNTIME`, else the
 //! directory the running executable is in, which is where the sidecar's
 //! wheel puts them. A run that decodes and encodes nothing never loads
 //! them, the way `nn` loads no ONNX Runtime for a run binding no model.
 //!
 //! Only FFmpeg 9.0's majors are accepted (libavcodec 63, libavutil 61,
-//! libswscale 10, libswresample 7). The structs this shim reads are
+//! libswscale 10, libswresample 7, libavfilter 12). A directory without
+//! libavfilter runs everything but [`Filter`], which refuses by name. The structs this shim reads are
 //! transcribed from that release's headers, so a library of any other major
 //! is refused by name rather than read with the wrong layout.
 //!
@@ -24,6 +25,7 @@ mod decode;
 mod encode;
 mod error;
 mod ffi;
+mod filter;
 mod fourcc;
 mod picture;
 mod sys;
@@ -37,6 +39,7 @@ pub use decode::{
 };
 pub use encode::{EncodedPacket, Encoder};
 pub use error::{Error, Result, INSTALL_HINT};
+pub use filter::Filter;
 pub use fourcc::{codec_for_fourcc, fourcc_for_codec};
 pub use picture::{frame_len, WIRE_PIX_FMTS};
 
@@ -49,23 +52,35 @@ pub const AVCODEC_MAJOR: u32 = 63;
 pub const AVUTIL_MAJOR: u32 = 61;
 pub const SWSCALE_MAJOR: u32 = 10;
 pub const SWRESAMPLE_MAJOR: u32 = 7;
+pub const AVFILTER_MAJOR: u32 = 12;
 
-/// One of the four libraries the shim loads.
+/// One of the libraries the shim loads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Library {
     Avutil,
     Swresample,
     Avcodec,
     Swscale,
+    Avfilter,
 }
 
 impl Library {
-    /// The order they load in: each after the ones it imports.
+    /// The four every run that decodes or encodes needs, in the order they
+    /// load: each after the ones it imports. libavfilter loads after them.
     pub const LOAD_ORDER: [Library; 4] = [
         Library::Avutil,
         Library::Swresample,
         Library::Avcodec,
         Library::Swscale,
+    ];
+
+    /// Every library this build demands a major of.
+    pub const ALL: [Library; 5] = [
+        Library::Avutil,
+        Library::Swresample,
+        Library::Avcodec,
+        Library::Swscale,
+        Library::Avfilter,
     ];
 
     /// The name without its `lib` prefix: `avcodec`.
@@ -75,6 +90,7 @@ impl Library {
             Library::Swresample => "swresample",
             Library::Avcodec => "avcodec",
             Library::Swscale => "swscale",
+            Library::Avfilter => "avfilter",
         }
     }
 
@@ -85,6 +101,7 @@ impl Library {
             Library::Swresample => SWRESAMPLE_MAJOR,
             Library::Avcodec => AVCODEC_MAJOR,
             Library::Swscale => SWSCALE_MAJOR,
+            Library::Avfilter => AVFILTER_MAJOR,
         }
     }
 
@@ -108,6 +125,7 @@ impl Library {
             Library::Swresample => "swresample_version",
             Library::Avcodec => "avcodec_version",
             Library::Swscale => "swscale_version",
+            Library::Avfilter => "avfilter_version",
         }
     }
 }
@@ -253,12 +271,20 @@ fn json_list(items: &[String]) -> String {
     format!("[{}]", items.join(","))
 }
 
+/// The names of the filters the loaded libavfilter has; empty where the
+/// directory has none.
+pub fn filters() -> Result<Vec<String>> {
+    Ok(runtime()?.filter_names())
+}
+
 /// What `--av-info` prints, one line of JSON: the majors this build demands,
 /// the platform, the directory resolved, and what the libav there is and
 /// offers. It answers on a machine with no libav at all: the refusal is in
-/// `error`, and what could not be read is null or empty.
+/// `error`, and what could not be read is null or empty. libavfilter is
+/// answered for on its own: its version in `avfilter`, its filters in
+/// `filters`, and why it is not loaded in `avfilter_error`.
 pub fn info() -> String {
-    let demands = Library::LOAD_ORDER
+    let demands = Library::ALL
         .iter()
         .map(|l| format!("\"{}\":{}", l.name(), l.major()))
         .collect::<Vec<_>>()
@@ -268,6 +294,17 @@ pub fn info() -> String {
         Err(_) => ("null".to_string(), "null".to_string()),
     };
     let null = || "null".to_string();
+    let (avfilter, avfilter_error, filters) = match runtime() {
+        Ok(lib) => match lib.filter_lib() {
+            Ok(_) => (
+                json_string(&version_text(lib.version(Library::Avfilter))),
+                null(),
+                json_list(&lib.filter_names()),
+            ),
+            Err(e) => (null(), json_string(&e.to_string()), "[]".to_string()),
+        },
+        Err(_) => (null(), null(), "[]".to_string()),
+    };
     let (avcodec, ffmpeg, license, error, hw, decoders, encoders) = match runtime() {
         Ok(lib) => {
             let codecs = lib.codecs();
@@ -301,7 +338,8 @@ pub fn info() -> String {
     format!(
         "{{\"demands\":{{{demands}}},\"platform\":\"{}\",\"dir\":{dir},\"from\":{from},\
          \"avcodec\":{avcodec},\"ffmpeg\":{ffmpeg},\"license\":{license},\"error\":{error},\
-         \"hw_device_types\":{hw},\"decoders\":{decoders},\"encoders\":{encoders}}}",
+         \"hw_device_types\":{hw},\"decoders\":{decoders},\"encoders\":{encoders},\
+         \"avfilter\":{avfilter},\"avfilter_error\":{avfilter_error},\"filters\":{filters}}}",
         crate::nn::platform()
     )
 }

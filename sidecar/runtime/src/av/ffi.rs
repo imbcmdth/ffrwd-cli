@@ -51,16 +51,16 @@ fn symbol<T: Copy>(lib: &Loaded, name: &'static str) -> Result<T> {
 }
 
 macro_rules! functions {
-    ($($lib:ident { $($name:ident: $ty:ty,)* })*) => {
-        /// Every function the shim calls, resolved once when the libraries
+    ($fns:ident($libs:ty) $($lib:ident { $($name:ident: $ty:ty,)* })*) => {
+        /// Functions the shim calls, resolved once when their libraries
         /// load. A missing one refuses the load, naming it and its library.
-        struct Fns {
+        struct $fns {
             $($($name: $ty,)*)*
         }
 
-        impl Fns {
-            fn resolve(libs: &Libs) -> Result<Fns> {
-                Ok(Fns {
+        impl $fns {
+            fn resolve(libs: &$libs) -> Result<$fns> {
+                Ok($fns {
                     $($($name: symbol::<$ty>(&libs.$lib, stringify!($name))?,)*)*
                 })
             }
@@ -68,7 +68,41 @@ macro_rules! functions {
     };
 }
 
+/// libavfilter, which loads after the four and may be missing: a build
+/// from before it was bundled runs everything but `filter`.
+struct FilterLibs {
+    avfilter: Loaded,
+}
+
 functions! {
+    FilterFns(FilterLibs)
+    avfilter {
+        avfilter_version: FnVersion,
+        av_filter_iterate: FnFilterIterate,
+        avfilter_get_by_name: FnFilterByName,
+        avfilter_graph_alloc: FnGraphAlloc,
+        avfilter_graph_free: FnGraphFree,
+        avfilter_graph_alloc_filter: FnGraphAllocFilter,
+        avfilter_init_str: FnFilterInitStr,
+        avfilter_graph_parse_ptr: FnGraphParsePtr,
+        avfilter_graph_config: FnGraphConfig,
+        avfilter_inout_alloc: FnInOutAlloc,
+        avfilter_inout_free: FnInOutFree,
+        av_buffersrc_parameters_alloc: FnSrcParamsAlloc,
+        av_buffersrc_parameters_set: FnSrcParamsSet,
+        av_buffersrc_add_frame_flags: FnSrcAddFrame,
+        av_buffersink_get_frame: FnSinkGetFrame,
+        av_buffersink_get_w: FnSinkInt,
+        av_buffersink_get_h: FnSinkInt,
+        av_buffersink_get_format: FnSinkInt,
+        av_buffersink_get_time_base: FnSinkRational,
+        av_buffersink_get_frame_rate: FnSinkRational,
+        av_buffersink_get_hw_frames_ctx: FnSinkHwFrames,
+    }
+}
+
+functions! {
+    Fns(Libs)
     avutil {
         avutil_version: FnVersion,
         av_version_info: FnStr,
@@ -105,6 +139,8 @@ functions! {
         av_color_primaries_from_name: FnFromName,
         av_color_transfer_from_name: FnFromName,
         av_color_space_from_name: FnFromName,
+        av_strdup: FnStrdup,
+        av_free: FnFree,
     }
     swresample {
         swresample_version: FnVersion,
@@ -226,7 +262,15 @@ pub(super) struct Lib {
     f: Fns,
     /// The wire's pixel formats, by libavutil's numbering.
     wire: Vec<(&'static str, c_int)>,
+    /// libavfilter, or why it is not loaded.
+    filters: std::result::Result<FilterLib, Error>,
     _libs: Libs,
+}
+
+/// libavfilter, loaded, its functions resolved and its structs checked.
+pub(super) struct FilterLib {
+    f: FilterFns,
+    _libs: FilterLibs,
 }
 
 impl Lib {
@@ -288,9 +332,23 @@ impl Lib {
         // SAFETY: sets one global int.
         unsafe { (f.av_log_set_level)(AV_LOG_ERROR) };
 
+        // libavfilter last, since it imports the others; its absence or
+        // refusal is kept for `filter` to report and refuses nothing else.
+        let filters = if dir.join(Library::Avfilter.file_name()).is_file() {
+            open(Library::Avfilter).and_then(|avfilter| {
+                let libs = FilterLibs { avfilter };
+                let ff = FilterFns::resolve(&libs)?;
+                check_filter_layout(&f, &ff)?;
+                Ok(FilterLib { f: ff, _libs: libs })
+            })
+        } else {
+            Err(missing(Library::Avfilter.file_name(), None))
+        };
+
         let mut lib = Lib {
             f,
             wire: Vec::new(),
+            filters,
             _libs: libs,
         };
         let mut wire = Vec::new();
@@ -308,7 +366,8 @@ impl Lib {
         Ok(lib)
     }
 
-    /// A library's version, as the int its `*_version()` returns.
+    /// A library's version, as the int its `*_version()` returns; 0 for
+    /// libavfilter where it is not loaded.
     pub fn version(&self, lib: Library) -> u32 {
         // SAFETY: the version functions take nothing and only return.
         unsafe {
@@ -317,7 +376,99 @@ impl Lib {
                 Library::Swresample => (self.f.swresample_version)(),
                 Library::Avcodec => (self.f.avcodec_version)(),
                 Library::Swscale => (self.f.swscale_version)(),
+                Library::Avfilter => self
+                    .filters
+                    .as_ref()
+                    .map_or(0, |fl| (fl.f.avfilter_version)()),
             }
+        }
+    }
+
+    /// libavfilter, or the refusal that says why it is not loaded.
+    pub fn filter_lib(&self) -> Result<&FilterLib> {
+        self.filters.as_ref().map_err(Clone::clone)
+    }
+
+    /// The names of the filters the loaded libavfilter has; empty where
+    /// none is loaded.
+    pub fn filter_names(&self) -> Vec<String> {
+        let Ok(fl) = &self.filters else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        let mut opaque: *mut c_void = ptr::null_mut();
+        loop {
+            // SAFETY: `opaque` is the iteration state libavfilter owns,
+            // started at null; the filters it returns are static.
+            let filter = unsafe { (fl.f.av_filter_iterate)(&mut opaque) };
+            if filter.is_null() {
+                return out;
+            }
+            // SAFETY: a registered filter's name is a static string.
+            if let Some(name) = unsafe { text((*filter).name) } {
+                out.push(name);
+            }
+        }
+    }
+
+    /// A `d3d12va` frames context of `sw_format` textures of `width` x
+    /// `height`, on a device built around `device` (an `ID3D12Device *`
+    /// whose one reference moves in), or on a device of its own when
+    /// `device` is null.
+    pub fn d3d12_frames(
+        &'static self,
+        device_type: c_int,
+        device: *mut c_void,
+        sw_format: c_int,
+        width: c_int,
+        height: c_int,
+    ) -> std::result::Result<BufferRef, AvErr> {
+        let f = &self.f;
+        let d3d12 = self.pix_fmt("d3d12").ok_or_else(|| AvErr {
+            code: 0,
+            why: "libavutil has no d3d12 pixel format".to_string(),
+        })?;
+        let mut device_ref = if device.is_null() {
+            let mut made: *mut AVBufferRef = ptr::null_mut();
+            // SAFETY: the out-pointer is ours; null name and options ask
+            // for the default device.
+            let ret = unsafe {
+                (f.av_hwdevice_ctx_create)(&mut made, device_type, ptr::null(), ptr::null_mut(), 0)
+            };
+            if ret < 0 || made.is_null() {
+                return Err(self.err(ret));
+            }
+            made
+        } else {
+            self.d3d12_device(device_type, device)?
+        };
+        // SAFETY: the frames reference av_hwframe_ctx_alloc returns has an
+        // AVHWFramesContext as its data, holding its own reference to the
+        // device; ours is given up either way. On failure the frames
+        // reference is unreffed.
+        unsafe {
+            let mut frames = (f.av_hwframe_ctx_alloc)(device_ref);
+            (f.av_buffer_unref)(&mut device_ref);
+            if frames.is_null() {
+                return Err(AvErr {
+                    code: 0,
+                    why: "av_hwframe_ctx_alloc allocated nothing".to_string(),
+                });
+            }
+            let ctx = (*frames).data as *mut AVHWFramesContext;
+            (*ctx).format = d3d12;
+            (*ctx).sw_format = sw_format;
+            (*ctx).width = width;
+            (*ctx).height = height;
+            let ret = (f.av_hwframe_ctx_init)(frames);
+            if ret < 0 {
+                (f.av_buffer_unref)(&mut frames);
+                return Err(self.err(ret));
+            }
+            Ok(BufferRef {
+                ptr: frames,
+                lib: self,
+            })
         }
     }
 
@@ -827,6 +978,445 @@ fn check_layout(f: &Fns) -> Result<()> {
     }
 }
 
+/// The options the filter layout check reads offsets from, as
+/// `CONTEXT_OPTIONS` does for the codec context: a filter context's own
+/// option table and a graph's name where the loaded build keeps each field.
+const FILTER_CONTEXT_OPTIONS: &[(&str, &str, usize)] = {
+    use std::mem::offset_of;
+    type C = AVFilterContext;
+    &[
+        ("thread_type", "thread_type", offset_of!(C, thread_type)),
+        ("enable", "enable_str", offset_of!(C, enable_str)),
+        ("threads", "nb_threads", offset_of!(C, nb_threads)),
+        (
+            "extra_hw_frames",
+            "extra_hw_frames",
+            offset_of!(C, extra_hw_frames),
+        ),
+    ]
+};
+const GRAPH_OPTIONS: &[(&str, &str, usize)] = {
+    use std::mem::offset_of;
+    type G = AVFilterGraph;
+    &[
+        (
+            "scale_sws_opts",
+            "scale_sws_opts",
+            offset_of!(G, scale_sws_opts),
+        ),
+        ("thread_type", "thread_type", offset_of!(G, thread_type)),
+        ("threads", "nb_threads", offset_of!(G, nb_threads)),
+    ]
+};
+
+/// Checks the libavfilter structs in `sys` against the library loaded: the
+/// filter context's and the graph's fields against their option tables,
+/// the graph's list of filters against a filter allocated into it, and the
+/// source parameters against the defaults their allocator writes.
+fn check_filter_layout(f: &Fns, ff: &FilterFns) -> Result<()> {
+    let mut wrong = Vec::new();
+    let offsets = |object: *mut c_void, of: &str, table: &[(&str, &str, usize)]| {
+        let mut wrong = Vec::new();
+        for &(option, field, ours) in table {
+            let cname = CString::new(option).expect("option names have no NUL");
+            // SAFETY: a live object whose AVClass is its first field.
+            let opt = unsafe { (f.av_opt_find)(object, cname.as_ptr(), ptr::null(), 0, 0) };
+            if opt.is_null() {
+                wrong.push(format!("{of} has no option {option}"));
+                continue;
+            }
+            // SAFETY: an option libavutil returned.
+            let theirs = unsafe { (*opt).offset } as usize;
+            if theirs != ours {
+                wrong.push(format!(
+                    "{of}.{field} is at {theirs}, and this build put it at {ours}"
+                ));
+            }
+        }
+        wrong
+    };
+
+    // SAFETY: the graph and its filter come from their allocators and are
+    // freed by the graph's; every field read lies inside the structs in
+    // both the headers and the transcription, and the parameters go back to
+    // av_free.
+    unsafe {
+        let mut graph = (ff.avfilter_graph_alloc)();
+        if graph.is_null() {
+            return Err(Error::Layout {
+                what: "avfilter_graph_alloc allocated nothing".to_string(),
+            });
+        }
+        wrong.extend(offsets(graph.cast(), "AVFilterGraph", GRAPH_OPTIONS));
+        let buffer = (ff.avfilter_get_by_name)(c"buffer".as_ptr());
+        if buffer.is_null() {
+            wrong.push("libavfilter has no buffer filter".to_string());
+        } else {
+            let ctx = (ff.avfilter_graph_alloc_filter)(graph, buffer, c"ffrwd_check".as_ptr());
+            if ctx.is_null() {
+                wrong.push("avfilter_graph_alloc_filter allocated nothing".to_string());
+            } else {
+                let g = &*graph;
+                let c = &*ctx;
+                let listed = g.nb_filters == 1 && !g.filters.is_null() && *g.filters == ctx;
+                let named = text(c.name).as_deref() == Some("ffrwd_check")
+                    && text((*c.filter).name).as_deref() == Some("buffer");
+                let placed = c.filter == buffer
+                    && c.graph == graph
+                    && c.nb_inputs == 0
+                    && c.nb_outputs == 1
+                    && c.hw_device_ctx.is_null();
+                if !(listed && named && placed) {
+                    wrong.push(
+                        "a filter allocated into a graph is not where this build looks".into(),
+                    );
+                }
+                wrong.extend(offsets(
+                    ctx.cast(),
+                    "AVFilterContext",
+                    FILTER_CONTEXT_OPTIONS,
+                ));
+            }
+        }
+        (ff.avfilter_graph_free)(&mut graph);
+
+        let par = (ff.av_buffersrc_parameters_alloc)();
+        if par.is_null() {
+            return Err(Error::Layout {
+                what: "av_buffersrc_parameters_alloc allocated nothing".to_string(),
+            });
+        }
+        let p = &*par;
+        let unset = AVRational { num: 0, den: 0 };
+        let fresh = p.format == -1
+            && p.time_base == unset
+            && p.width == 0
+            && p.height == 0
+            && p.frame_rate == unset
+            && p.hw_frames_ctx.is_null()
+            && p.color_space == AVCOL_SPC_UNSPECIFIED
+            && p.color_range == AVCOL_RANGE_UNSPECIFIED
+            && p.side_data.is_null()
+            && p.alpha_mode == 0;
+        if !fresh {
+            wrong.push(
+                "new AVBufferSrcParameters do not hold the defaults their allocator writes".into(),
+            );
+        }
+        (f.av_free)(par.cast());
+    }
+
+    if wrong.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::Layout {
+            what: wrong.join("; "),
+        })
+    }
+}
+
+/// One reference to a libav buffer (a frames context), from whoever made it
+/// to `av_buffer_unref`.
+pub(super) struct BufferRef {
+    ptr: *mut AVBufferRef,
+    lib: &'static Lib,
+}
+
+// SAFETY: libav's buffer references are counted atomically; this handle is
+// only moved.
+unsafe impl Send for BufferRef {}
+
+impl BufferRef {
+    /// Gives the reference up to a struct that frees it itself.
+    fn into_raw(self) -> *mut AVBufferRef {
+        let raw = self.ptr;
+        std::mem::forget(self);
+        raw
+    }
+
+    /// A picture of this frames context's pool, in `frame`.
+    pub fn get_buffer(&self, frame: &mut Frame) -> std::result::Result<(), AvErr> {
+        frame.unref();
+        // SAFETY: a live frames context and a live frame.
+        let ret = unsafe { (self.lib.f.av_hwframe_get_buffer)(self.ptr, frame.ptr, 0) };
+        if ret < 0 {
+            return Err(self.lib.err(ret));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for BufferRef {
+    fn drop(&mut self) {
+        // SAFETY: the one reference this holds.
+        unsafe { (self.lib.f.av_buffer_unref)(&mut self.ptr) };
+    }
+}
+
+/// What a filter graph's `buffer` source is told about the pictures it is
+/// handed.
+pub(super) struct SourceParams<'a> {
+    pub format: c_int,
+    pub width: c_int,
+    pub height: c_int,
+    pub time_base: AVRational,
+    pub frame_rate: Option<AVRational>,
+    pub color: RawColor,
+    /// The frames context the pictures come from, for a device format.
+    pub frames: Option<&'a BufferRef>,
+}
+
+/// A filter graph, from `avfilter_graph_alloc` to `avfilter_graph_free`:
+/// a `buffer` source, the graph a description parses to, and a
+/// `buffersink`, configured.
+pub(super) struct FilterGraph {
+    ptr: *mut AVFilterGraph,
+    src: *mut AVFilterContext,
+    sink: *mut AVFilterContext,
+    lib: &'static Lib,
+}
+
+// SAFETY: as for `CodecCtx`: one thread at a time, through `&mut self`.
+unsafe impl Send for FilterGraph {}
+
+impl FilterGraph {
+    /// Parses `description` (libavfilter's own syntax, one input and one
+    /// output) between a source told `params` and a sink, and configures
+    /// it. The error names the call that failed.
+    pub fn new(
+        lib: &'static Lib,
+        description: &str,
+        params: &SourceParams,
+    ) -> std::result::Result<FilterGraph, (&'static str, AvErr)> {
+        let fl = lib.filter_lib().map_err(|e| {
+            (
+                "libavfilter",
+                AvErr {
+                    code: 0,
+                    why: e.to_string(),
+                },
+            )
+        })?;
+        let (f, ff) = (&lib.f, &fl.f);
+        let none = |call: &'static str, what: &str| {
+            (
+                call,
+                AvErr {
+                    code: 0,
+                    why: format!("{what} allocated nothing"),
+                },
+            )
+        };
+        let described = CString::new(description).map_err(|_| {
+            (
+                "avfilter_graph_parse_ptr",
+                AvErr {
+                    code: 0,
+                    why: "the graph holds a NUL byte".to_string(),
+                },
+            )
+        })?;
+        // SAFETY: a fresh graph; null is checked.
+        let ptr = unsafe { (ff.avfilter_graph_alloc)() };
+        if ptr.is_null() {
+            return Err(none("avfilter_graph_alloc", "avfilter_graph_alloc"));
+        }
+        // The graph frees every filter in it, whatever happens below.
+        let mut graph = FilterGraph {
+            ptr,
+            src: ptr::null_mut(),
+            sink: ptr::null_mut(),
+            lib,
+        };
+        let failed = |call: &'static str, code: c_int| (call, lib.err(code));
+        // SAFETY: the filters are allocated into the live graph and
+        // initialised once; the parameters go back to av_free; the in/out
+        // lists are ours until parsed, and freed either way.
+        unsafe {
+            let buffer = (ff.avfilter_get_by_name)(c"buffer".as_ptr());
+            let buffersink = (ff.avfilter_get_by_name)(c"buffersink".as_ptr());
+            if buffer.is_null() || buffersink.is_null() {
+                return Err((
+                    "avfilter_get_by_name",
+                    AvErr {
+                        code: 0,
+                        why: "libavfilter has no buffer or buffersink".to_string(),
+                    },
+                ));
+            }
+            graph.src = (ff.avfilter_graph_alloc_filter)(ptr, buffer, c"in".as_ptr());
+            if graph.src.is_null() {
+                return Err(none("avfilter_graph_alloc_filter", "buffer"));
+            }
+            let par = (ff.av_buffersrc_parameters_alloc)();
+            if par.is_null() {
+                return Err(none("av_buffersrc_parameters_alloc", "it"));
+            }
+            {
+                let p = &mut *par;
+                p.format = params.format;
+                p.width = params.width;
+                p.height = params.height;
+                p.time_base = params.time_base;
+                p.sample_aspect_ratio = AVRational { num: 1, den: 1 };
+                if let Some(rate) = params.frame_rate {
+                    p.frame_rate = rate;
+                }
+                p.color_space = params.color.space;
+                p.color_range = params.color.range;
+                p.hw_frames_ctx = params.frames.map_or(ptr::null_mut(), |r| r.ptr);
+            }
+            let ret = (ff.av_buffersrc_parameters_set)(graph.src, par);
+            (f.av_free)(par.cast());
+            if ret < 0 {
+                return Err(failed("av_buffersrc_parameters_set", ret));
+            }
+            let ret = (ff.avfilter_init_str)(graph.src, ptr::null());
+            if ret < 0 {
+                return Err(failed("avfilter_init_str buffer", ret));
+            }
+            graph.sink = (ff.avfilter_graph_alloc_filter)(ptr, buffersink, c"out".as_ptr());
+            if graph.sink.is_null() {
+                return Err(none("avfilter_graph_alloc_filter", "buffersink"));
+            }
+            let ret = (ff.avfilter_init_str)(graph.sink, ptr::null());
+            if ret < 0 {
+                return Err(failed("avfilter_init_str buffersink", ret));
+            }
+
+            // The description's open input is the source's output, and its
+            // open output the sink's input.
+            let mut outputs = (ff.avfilter_inout_alloc)();
+            let mut inputs = (ff.avfilter_inout_alloc)();
+            if outputs.is_null() || inputs.is_null() {
+                (ff.avfilter_inout_free)(&mut outputs);
+                (ff.avfilter_inout_free)(&mut inputs);
+                return Err(none("avfilter_inout_alloc", "avfilter_inout_alloc"));
+            }
+            (*outputs).name = (f.av_strdup)(c"in".as_ptr());
+            (*outputs).filter_ctx = graph.src;
+            (*inputs).name = (f.av_strdup)(c"out".as_ptr());
+            (*inputs).filter_ctx = graph.sink;
+            let ret = (ff.avfilter_graph_parse_ptr)(
+                ptr,
+                described.as_ptr(),
+                &mut inputs,
+                &mut outputs,
+                ptr::null_mut(),
+            );
+            (ff.avfilter_inout_free)(&mut inputs);
+            (ff.avfilter_inout_free)(&mut outputs);
+            if ret < 0 {
+                return Err(failed("avfilter_graph_parse_ptr", ret));
+            }
+            let ret = (ff.avfilter_graph_config)(ptr, ptr::null_mut());
+            if ret < 0 {
+                return Err(failed("avfilter_graph_config", ret));
+            }
+        }
+        Ok(graph)
+    }
+
+    fn fns(&self) -> &FilterFns {
+        &self
+            .lib
+            .filter_lib()
+            .expect("a graph exists only where libavfilter loaded")
+            .f
+    }
+
+    /// The names of the filters the description made, in the graph's
+    /// order: every filter but the source and the sink, the ones libavfilter
+    /// inserted to convert between two included.
+    pub fn filter_names(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        // SAFETY: a configured graph's list holds `nb_filters` live filter
+        // contexts, each naming a static filter.
+        unsafe {
+            let g = &*self.ptr;
+            for i in 0..g.nb_filters as usize {
+                let ctx = *g.filters.add(i);
+                if ctx == self.src || ctx == self.sink || ctx.is_null() {
+                    continue;
+                }
+                if let Some(name) = text((*(*ctx).filter).name) {
+                    out.push(name);
+                }
+            }
+        }
+        out
+    }
+
+    /// The sink's picture: width, height and pixel format.
+    pub fn output(&self) -> (c_int, c_int, c_int) {
+        let ff = self.fns();
+        // SAFETY: a configured sink.
+        unsafe {
+            (
+                (ff.av_buffersink_get_w)(self.sink),
+                (ff.av_buffersink_get_h)(self.sink),
+                (ff.av_buffersink_get_format)(self.sink),
+            )
+        }
+    }
+
+    /// The format a device picture leaving the sink holds its pixels in,
+    /// from the sink's frames context; None for pictures in host memory.
+    pub fn output_sw_format(&self) -> Option<c_int> {
+        // SAFETY: a configured sink; its frames context, where it has one,
+        // is an AVHWFramesContext alive while the graph is.
+        unsafe {
+            let frames = (self.fns().av_buffersink_get_hw_frames_ctx)(self.sink);
+            if frames.is_null() {
+                return None;
+            }
+            Some((*((*frames).data as *const AVHWFramesContext)).sw_format)
+        }
+    }
+
+    /// The sink's time base, and its frame rate where it has one.
+    pub fn timing(&self) -> (AVRational, Option<AVRational>) {
+        let ff = self.fns();
+        // SAFETY: a configured sink.
+        let (base, rate) = unsafe {
+            (
+                (ff.av_buffersink_get_time_base)(self.sink),
+                (ff.av_buffersink_get_frame_rate)(self.sink),
+            )
+        };
+        (base, (rate.num > 0 && rate.den > 0).then_some(rate))
+    }
+
+    /// Hands the source a picture, moving it out of `frame`, or with None,
+    /// the end of the stream.
+    pub fn send(&mut self, frame: Option<&mut Frame>) -> Status {
+        let p = frame.map_or(ptr::null_mut(), |f| f.ptr);
+        // SAFETY: a configured source and a live frame, or null.
+        let ret = unsafe { (self.fns().av_buffersrc_add_frame_flags)(self.src, p, 0) };
+        self.lib.status(ret)
+    }
+
+    /// The next picture the sink has, in `frame`.
+    pub fn receive(&mut self, frame: &mut Frame) -> Status {
+        frame.unref();
+        // SAFETY: a configured sink and a live frame.
+        let ret = unsafe { (self.fns().av_buffersink_get_frame)(self.sink, frame.ptr) };
+        self.lib.status(ret)
+    }
+}
+
+impl Drop for FilterGraph {
+    fn drop(&mut self) {
+        let fl = self
+            .lib
+            .filter_lib()
+            .expect("a graph exists only where libavfilter loaded");
+        // SAFETY: allocated by avfilter_graph_alloc; this frees every
+        // filter in it.
+        unsafe { (fl.f.avfilter_graph_free)(&mut self.ptr) };
+    }
+}
+
 /// A codec libavcodec registered. Static data inside the library, never
 /// freed, and the same for every thread.
 #[derive(Clone, Copy)]
@@ -1015,49 +1605,14 @@ impl CodecCtx {
         width: c_int,
         height: c_int,
     ) -> std::result::Result<(), AvErr> {
-        let f = &self.lib.f;
-        let d3d12 = self.lib.pix_fmt("d3d12").ok_or_else(|| AvErr {
-            code: 0,
-            why: "libavutil has no d3d12 pixel format".to_string(),
-        })?;
-        let mut device_ref = if device.is_null() {
-            let mut made: *mut AVBufferRef = ptr::null_mut();
-            // SAFETY: the out-pointer is ours; null name and options ask
-            // for the default device.
-            let ret = unsafe {
-                (f.av_hwdevice_ctx_create)(&mut made, device_type, ptr::null(), ptr::null_mut(), 0)
-            };
-            if ret < 0 || made.is_null() {
-                return Err(self.lib.err(ret));
-            }
-            made
-        } else {
-            self.lib.d3d12_device(device_type, device)?
-        };
-        // SAFETY: the frames reference av_hwframe_ctx_alloc returns has an
-        // AVHWFramesContext as its data, holding its own reference to the
-        // device; ours is given up either way. On failure the frames
-        // reference is unreffed.
+        let frames = self
+            .lib
+            .d3d12_frames(device_type, device, sw_format, width, height)?;
+        let d3d12 = self.lib.pix_fmt("d3d12").expect("d3d12_frames found it");
+        // SAFETY: a fresh context has no frames context; the reference
+        // moves in.
         unsafe {
-            let mut frames = (f.av_hwframe_ctx_alloc)(device_ref);
-            (f.av_buffer_unref)(&mut device_ref);
-            if frames.is_null() {
-                return Err(AvErr {
-                    code: 0,
-                    why: "av_hwframe_ctx_alloc allocated nothing".to_string(),
-                });
-            }
-            let ctx = (*frames).data as *mut AVHWFramesContext;
-            (*ctx).format = d3d12;
-            (*ctx).sw_format = sw_format;
-            (*ctx).width = width;
-            (*ctx).height = height;
-            let ret = (f.av_hwframe_ctx_init)(frames);
-            if ret < 0 {
-                (f.av_buffer_unref)(&mut frames);
-                return Err(self.lib.err(ret));
-            }
-            (*self.ptr).hw_frames_ctx = frames;
+            (*self.ptr).hw_frames_ctx = frames.into_raw();
             (*self.ptr).pix_fmt = d3d12;
             (*self.ptr).sw_pix_fmt = sw_format;
         }

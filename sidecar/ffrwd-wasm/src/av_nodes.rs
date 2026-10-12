@@ -25,6 +25,13 @@
 //! to the host. Such an encoder reads nothing else, so a frame in host
 //! memory is uploaded into its pool. Every other encoder reads a frame on
 //! the GPU back once.
+//!
+//! `filter` runs a libavfilter graph on a D3D12 device -
+//! `[d]filter=graph=scale_d3d12=w=1280\\:h=720[f]` - fed the way such an
+//! encoder is: each frame on the process's device is copied there into a
+//! picture of the graph's source, and one in host memory is uploaded. Its
+//! pictures stay on the device as frames there, or, where the graph runs on
+//! a device of its own, are read back.
 
 use std::sync::Arc;
 
@@ -45,14 +52,17 @@ use crate::codec::frame_ticks;
 pub const DECODE: &str = "decode";
 /// The node that encodes.
 pub const ENCODE: &str = "encode";
+/// The node that runs a libavfilter graph.
+pub const FILTER: &str = "filter";
 
 const FORMAT: &str = "format";
 const HW: &str = "hw";
 const CODEC: &str = "codec";
+const GRAPH: &str = "graph";
 
-/// Whether `module` names `decode` or `encode`.
+/// Whether `module` names `decode`, `encode` or `filter`.
 pub fn is_av_node(module: &str) -> bool {
-    module == DECODE || module == ENCODE
+    module == DECODE || module == ENCODE || module == FILTER
 }
 
 /// The shape both have: one input by position, one output, ticking as
@@ -966,6 +976,405 @@ impl Node for Encode {
         }
         if tick.last {
             self.encoder
+                .flush()
+                .map_err(|e| anyhow!("{}: {e}", self.name))?;
+            self.drain(&mut items)?;
+        }
+        Ok(Emitted {
+            items,
+            rows: Vec::new(),
+            finished: false,
+        })
+    }
+}
+
+/// `filter`: one raw picture stream through a libavfilter graph on the
+/// device, its pictures out.
+pub struct AvFilter {
+    name: String,
+    shape: NodeShape,
+    /// Copies frames on the process's device into the graph's pictures.
+    /// Dropped before the graph, waiting for the copies still running.
+    #[cfg_attr(not(all(feature = "gpu", windows)), allow(dead_code))]
+    feed: Option<FilterFeed>,
+    filter: av::Filter,
+    /// How the graph's pictures on the process's device become frames.
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+    on_device: Option<OnDevice>,
+    /// The pictures as they arrive.
+    input: VideoFormat,
+    /// The pictures as they leave, as the graph's sink says.
+    output: VideoFormat,
+    /// The colour the YUV of a frame is read in where rgba is made NV12 on
+    /// the way in, or a picture is read as rgba on the way out.
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+    yuv: Option<Yuv>,
+    /// How long a picture lasts, in the input's ticks and in the output's,
+    /// where the frame rate says in whole ticks.
+    in_duration: Option<i64>,
+    duration: Option<i64>,
+    /// How frames last reached the graph, said on stderr when it changes.
+    said: Option<String>,
+}
+
+#[cfg(all(feature = "gpu", windows))]
+type FilterFeed = ffrwd_wasm_runtime::gpu::d3d12::FilterFeed;
+#[cfg(not(all(feature = "gpu", windows)))]
+type FilterFeed = std::convert::Infallible;
+
+/// The process's device for a filter graph, and the feed that copies frames
+/// on it into the graph's; None for both where the process has no D3D12
+/// device.
+#[cfg(all(feature = "gpu", windows))]
+fn filter_device() -> Option<(av::Shared, FilterFeed)> {
+    Some((
+        ffrwd_wasm_runtime::gpu::d3d12::av_device()?,
+        FilterFeed::default(),
+    ))
+}
+
+#[cfg(not(all(feature = "gpu", windows)))]
+fn filter_device() -> Option<(av::Shared, FilterFeed)> {
+    None
+}
+
+/// What frames reach a graph as.
+const COPIED_ON_THE_DEVICE: &str = "frames copied on the device";
+
+impl AvFilter {
+    /// Opens the graph `graph=` names for the raw pictures `input` in
+    /// `base`, its pictures leaving packed as `format=` (yuv420p unless
+    /// said). `on_gpu` says the frames arrive held on the GPU or a reader
+    /// holds them there, which puts the graph on the process's own device
+    /// where it is a D3D12 one, and its pictures stay there.
+    ///
+    /// Says on stderr, once, where the graph runs:
+    /// `[av] filter scale_d3d12: on the host's device`.
+    pub fn open(
+        options: &[(String, String)],
+        input: &StreamFormat,
+        spelling: &str,
+        base: TimeBase,
+        frame_rate: Option<(u64, u64)>,
+        on_gpu: bool,
+    ) -> Result<AvFilter> {
+        let mut graph: Option<&str> = None;
+        let mut want: Option<&'static str> = None;
+        for (key, value) in options {
+            match key.as_str() {
+                GRAPH if graph.is_some() => bail!("{FILTER} is given the option '{GRAPH}' twice"),
+                GRAPH => graph = Some(value),
+                FORMAT if want.is_some() => bail!("{FILTER} is given the option '{FORMAT}' twice"),
+                FORMAT => {
+                    let Some(found) = WIRE_PIX_FMTS.iter().copied().find(|f| f == value) else {
+                        bail!(
+                            "{FILTER}={FORMAT}={value}: a filter writes one of {}",
+                            WIRE_PIX_FMTS.join(", ")
+                        );
+                    };
+                    want = Some(found);
+                }
+                other => bail!(
+                    "{FILTER} has no option '{other}'; it takes {GRAPH}=<libavfilter graph> and \
+                     {FORMAT}=<pix_fmt> ({})",
+                    WIRE_PIX_FMTS.join(", ")
+                ),
+            }
+        }
+        let Some(graph) = graph.filter(|g| !g.trim().is_empty()) else {
+            bail!(
+                "{FILTER} names the libavfilter graph it runs with {GRAPH}=<graph> \
+                 (graph=scale_d3d12=w=1280\\\\:h=720); this call names none"
+            );
+        };
+        let want = want.unwrap_or("yuv420p");
+        let StreamFormat::Video(video) = input else {
+            bail!(
+                "{FILTER} reads raw pictures, and {spelling} is {}",
+                carried(input)
+            );
+        };
+        let color = video.color.map(|c| av::Color {
+            range: c.range.to_string(),
+            primaries: c.primaries.to_string(),
+            trc: c.trc.to_string(),
+            space: c.space.to_string(),
+        });
+        let rate = frame_rate
+            .and_then(|(num, den)| Some((i64::try_from(num).ok()?, i64::try_from(den).ok()?)));
+        let time_base = (
+            i64::try_from(base.num).unwrap_or(i64::MAX),
+            i64::try_from(base.den).unwrap_or(i64::MAX),
+        );
+        let (device, feed) = match on_gpu.then(filter_device).flatten() {
+            Some((device, feed)) => (Some(device), Some(feed)),
+            None => (None, None),
+        };
+        let filter = av::Filter::open(
+            graph,
+            video.width,
+            video.height,
+            time_base,
+            rate,
+            color.as_ref(),
+            device,
+        )
+        .map_err(|e| anyhow!("{FILTER} {spelling}: {e}"))?;
+        let names = filter.filters().join(", ");
+        let on_device = if filter.on_shared_device() {
+            Some(filter_pictures(&names)?)
+        } else {
+            None
+        };
+        eprintln!(
+            "[av] filter {names}: {}",
+            if on_device.is_some() {
+                "on the host's device".to_string()
+            } else {
+                "on a d3d12va device of its own, pictures read back to host memory".to_string()
+            }
+        );
+        let (width, height) = filter.output_size();
+        let (tb_num, tb_den) = filter.time_base();
+        let out_base = match (u64::try_from(tb_num), u64::try_from(tb_den)) {
+            (Ok(num), Ok(den)) if num > 0 && den > 0 => TimeBase { num, den },
+            _ => base,
+        };
+        let out_rate = filter
+            .frame_rate()
+            .and_then(|(num, den)| Some((u64::try_from(num).ok()?, u64::try_from(den).ok()?)))
+            .or(frame_rate);
+        let output = VideoFormat {
+            width,
+            height,
+            pix_fmt: want,
+            frame_len: crate::frame_len_for(want, width, height)?,
+            color: video.color,
+        };
+        let mut shape = shape(PortKind::Video, PortKind::Video, out_base, 0.0);
+        if on_device.is_some() {
+            shape.outputs[0].memory = FrameMemory::Gpu;
+        }
+        Ok(AvFilter {
+            name: FILTER.to_string(),
+            shape,
+            feed,
+            filter,
+            on_device,
+            input: *video,
+            output,
+            yuv: read_as(video.color.as_ref()),
+            in_duration: frame_ticks(frame_rate, base),
+            duration: frame_ticks(out_rate, out_base),
+            said: None,
+        })
+    }
+
+    /// The pictures this node writes, as the graph's sink declares them.
+    pub fn format(&self) -> VideoFormat {
+        self.output
+    }
+
+    /// The time base and frame rate of the pictures this node writes.
+    pub fn timing(&self, frame_rate: Option<(u64, u64)>) -> (TimeBase, Option<(u64, u64)>) {
+        let base = self.shape.outputs[0]
+            .time_base
+            .and_then(|r| {
+                Some(TimeBase {
+                    num: u64::try_from(r.num).ok()?,
+                    den: u64::try_from(r.den).ok()?,
+                })
+            })
+            .unwrap_or(TimeBase { num: 1, den: 1 });
+        let rate = self
+            .filter
+            .frame_rate()
+            .and_then(|(num, den)| Some((u64::try_from(num).ok()?, u64::try_from(den).ok()?)))
+            .or(frame_rate);
+        (base, rate)
+    }
+
+    /// Says on stderr how frames reach the graph, when that changes.
+    fn say(&mut self, how: &str) {
+        if self.said.as_deref() != Some(how) {
+            eprintln!("[av] filter {}: {how}", self.filter.filters().join(", "));
+            self.said = Some(how.to_string());
+        }
+    }
+
+    /// Hands one frame to the graph: copied on the device into one of its
+    /// pictures where the frame is on the process's device and the graph
+    /// runs there, else as bytes, read back where the frame is on the GPU
+    /// and uploaded.
+    fn send(&mut self, data: &FrameData, pts: i64, duration: Option<i64>) -> Result<()> {
+        if self.send_on_device(data, pts, duration)? {
+            self.say(COPIED_ON_THE_DEVICE);
+            return Ok(());
+        }
+        self.say(match data {
+            FrameData::Host(_) => UPLOADED,
+            FrameData::Gpu(_) => READ_BACK,
+        });
+        let bytes = data.bytes().map_err(|e| anyhow!("{}: {e}", self.name))?;
+        self.filter
+            .send(self.input.pix_fmt, pts, duration, &bytes)
+            .map_err(|e| anyhow!("{}: {e}", self.name))
+    }
+
+    /// The frame copied on the device into one of the graph's pictures and
+    /// sent; false, with nothing sent, where it is not a frame on the
+    /// process's device the graph can be fed from.
+    #[cfg(all(feature = "gpu", windows))]
+    fn send_on_device(
+        &mut self,
+        data: &FrameData,
+        pts: i64,
+        duration: Option<i64>,
+    ) -> Result<bool> {
+        use ffrwd_wasm_runtime::gpu::frames::Layout;
+        let (FrameData::Gpu(frame), Some(feed)) = (data, self.feed.as_mut()) else {
+            return Ok(false);
+        };
+        if !frame.converts_to(Layout::Nv12) {
+            return Ok(false);
+        }
+        let name = &self.name;
+        let mut picture = self
+            .filter
+            .device_picture()
+            .map_err(|e| anyhow!("{name}: {e}"))?;
+        feed.feed(frame, self.yuv.unwrap_or(Yuv::DEFAULT), &mut picture)
+            .map_err(|e| anyhow!("{name}: copying a frame into the graph's: {e:#}"))?;
+        self.filter
+            .send_picture(picture, pts, duration)
+            .map_err(|e| anyhow!("{name}: {e}"))?;
+        Ok(true)
+    }
+
+    #[cfg(not(all(feature = "gpu", windows)))]
+    fn send_on_device(
+        &mut self,
+        _data: &FrameData,
+        _pts: i64,
+        _duration: Option<i64>,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Every picture the graph has ready, onto `items`.
+    fn drain(&mut self, items: &mut Vec<Emission>) -> Result<()> {
+        while let Some(received) = self
+            .filter
+            .receive_any(self.output.pix_fmt)
+            .map_err(|e| anyhow!("{}: {e}", self.name))?
+        {
+            let (pts, duration) = match &received {
+                Received::Host(f) => (f.pts, f.duration),
+                Received::Device(f) => (f.pts, f.duration),
+            };
+            let data = match received {
+                Received::Host(frame) => Arc::new(frame.data).into(),
+                Received::Device(picture) => self.on_device(picture)?,
+            };
+            items.push(Emission {
+                port: 0,
+                payload: Payload::Frame(OutFrame {
+                    pts,
+                    duration: duration.or(self.duration),
+                    data,
+                    rows: Vec::new(),
+                }),
+            });
+        }
+        Ok(())
+    }
+
+    /// A picture the graph left on the process's device, as a frame there.
+    #[cfg(feature = "gpu")]
+    fn on_device(&mut self, picture: av::DeviceFrame) -> Result<FrameData> {
+        #[cfg(windows)]
+        if let Some(feed) = self.feed.as_mut() {
+            feed.wrote(&picture)
+                .map_err(|e| anyhow!("{}: {e:#}", self.name))?;
+        }
+        let pictures = self.on_device.as_mut().ok_or_else(|| {
+            anyhow!(
+                "{}: a picture came back on a device the graph was not opened on",
+                self.name
+            )
+        })?;
+        let yuv = self.yuv.unwrap_or(Yuv::DEFAULT);
+        let frame = pictures
+            .hold(picture, self.output.pix_fmt, yuv)
+            .map_err(|e| anyhow!("{}: {e:#}", self.name))?;
+        Ok(FrameData::Gpu(frame))
+    }
+
+    #[cfg(not(feature = "gpu"))]
+    fn on_device(&mut self, _picture: av::DeviceFrame) -> Result<FrameData> {
+        bail!(
+            "{}: a picture came back on the process's device, and this build holds none",
+            self.name
+        )
+    }
+}
+
+/// How a graph's pictures on the process's device become frames.
+#[cfg(feature = "gpu")]
+fn filter_pictures(names: &str) -> Result<OnDevice> {
+    Ok(ffrwd_wasm_runtime::gpu::frames::DecodedPictures::for_filter(names, "d3d12va"))
+}
+
+#[cfg(not(feature = "gpu"))]
+fn filter_pictures(_names: &str) -> Result<OnDevice> {
+    bail!("this build holds no frame on the GPU")
+}
+
+impl Drop for AvFilter {
+    /// Waits for the device to finish reading the pictures the graph wrote
+    /// that the host still keeps, so none is written again under a read.
+    fn drop(&mut self) {
+        #[cfg(all(feature = "gpu", windows))]
+        if self.on_device.is_some() {
+            ffrwd_wasm_runtime::gpu::d3d12::release_kept();
+        }
+    }
+}
+
+impl Node for AvFilter {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn shape(&self) -> &NodeShape {
+        &self.shape
+    }
+
+    fn settled_format(&self, _port: usize) -> Option<StreamFormat> {
+        Some(StreamFormat::Video(self.output))
+    }
+
+    fn decode_delay(&self, _port: usize) -> Option<u32> {
+        Some(0)
+    }
+
+    fn set_params(&mut self, _params: &str) -> Result<()> {
+        bail!(
+            "{} takes its options from the command line and no params",
+            self.name
+        )
+    }
+
+    fn process(&mut self, tick: Tick) -> Result<Emitted> {
+        let mut items = Vec::new();
+        for stream in tick.streams {
+            for frame in stream.frames {
+                self.send(&frame.data, frame.pts, frame.duration.or(self.in_duration))?;
+                self.drain(&mut items)?;
+            }
+        }
+        if tick.last {
+            self.filter
                 .flush()
                 .map_err(|e| anyhow!("{}: {e}", self.name))?;
             self.drain(&mut items)?;
