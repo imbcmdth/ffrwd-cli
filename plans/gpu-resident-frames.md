@@ -760,6 +760,29 @@ measures it with the device shared. The pool holds no per-frame colour:
 a frame's colour is its stream's, as the NUT header has it, and the
 decode node settles that header before the first frame.
 
+**Run on the owner's machine (RTX 4090, Windows, 2026-10-12):**
+`gpu_frames` passes all three cases, the GPU path byte-equal to the host
+path; `node_shapes` stays green. Two things the first slice did not see
+without a GPU:
+
+- The shared device opens on D3D12 first, and wgpu's D3D12 backend
+  reports no `subgroups` without a DXC it can load, so pyrowave's compute
+  module refused to open on it ("The adapter does not support the
+  subgroups feature"); the host used to try Vulkan first for exactly
+  that. The fix is the static DXC compiled into the vendored host
+  (wgpu-core's `static-dxc`, `Dx12Compiler::StaticDxc` in
+  `shared_device`), in flight with items 3 and 5.
+- `GPU_JOBS`, measured with the pyrowave round trip (300 frames of 1080p
+  yuv420p, `bytes_per_frame` 60000). With a device per worker (the binary
+  before this slice): 227 fps at one worker, 252 at two, 190 at eight,
+  240 at the default. With the shared device, on Vulkan (`WGPU_BACKEND`,
+  until D3D12 has subgroups): 202 to 212 at one, 249 to 272 at two, 223
+  to 282 at eight, 287 at the default, output byte-identical. So the
+  shared device removes the loss past two workers but the GPU is the
+  bound and nothing scales past two; the machine was under load from
+  three builds during the runs, and the number to decide the cap on is
+  the quiet run on D3D12 once it has subgroups.
+
 ### Wave 4: inference on the GPU
 
 1. **The provider is per model.** `NN-EDGE.md` has every model a process
@@ -803,6 +826,58 @@ decode node settles that header before the first frame.
 5. Image-sized outputs are bound to device buffers and read as textures;
    boxes and scalars come back by `fetch`. The depth and segment modules
    read a GPU frame, run the model from a buffer, and write their rows.
+
+**Shipped (2026-10-12):** item 1, and section 2.9's first use.
+`-nn-exclude <name>=<provider>` keeps one model off a provider (the bare
+spelling keeps every model off it); the compiler writes one pair per
+provider in a model's `not_on`; each model's session asks for the
+process's provider or the CPU; a provider is registered so that a session
+it cannot engage for fails to build rather than falling back in silence,
+and the host builds that session again on the CPU and says so, one
+verdict line per model (`sidecar/NN-EDGE.md`). `ffrwd setup` with no
+argument fetches ffmpeg and the runtime tiers detection wants;
+`FFRWD_OFFLINE` refuses every fetch naming it; a run that will fetch
+starts the download once the script is resolved and joins it before the
+sidecar spawns.
+
+What was learned:
+
+- One process loads one ONNX Runtime binary, and DirectML's is a
+  different binary from the CPU and CUDA one, so "a DirectML session
+  beside a CUDA one" does not hold with the pinned artifacts. The walk
+  still settles one provider for the process, the first whose preflight
+  is clean and that some model does not exclude; a model that excludes
+  it runs on the CPU. Two GPU providers in one process would need one
+  runtime build carrying both, which the pinned packages do not.
+- The engaged provider is read from whether the session built with the
+  provider registered to fail loudly, not from the process's loaded
+  libraries; a provider that registers can still run a node it cannot
+  place on the CPU (the cuDNN case in `NN-EDGE.md`), which no verdict
+  catches.
+- The `ort` pin, checked in rc.10's source: I/O binding exists
+  (`Session::create_binding`, `IoBinding::bind_input(&Value)`,
+  `bind_output(Value)` owned, `bind_output_to_device(&MemoryInfo)`,
+  `run_binding`). A foreign CUDA pointer binds as an input through
+  `TensorRefMut::from_raw(MemoryInfo, ptr, shape)` with no copy; a
+  caller-owned output needs an owned `Value`, built through
+  `ort::api().CreateTensorWithDataAsOrtValue` and `Value::from_ptr`, one
+  unsafe step; or ort allocates on the device with
+  `bind_output_to_device`. A device output cannot be extracted to the
+  CPU. DirectML cannot bind foreign memory with rc.10: ort-sys carries
+  none of the DML interop API (`OrtDmlApi`,
+  `CreateGPUAllocationFromD3DResource`,
+  `GetD3D12ResourceFromAllocation`) and the DML provider takes only a
+  device id, never the caller's D3D12 device and queue; both would be
+  hand-written FFI over `GetExecutionProviderApi("DML", ...)`. The
+  vendored backend copies every input into a CPU tensor and every output
+  back to bytes on each `compute`; an `IoBinding` on its execution
+  context, with a side channel for device values since the wasi-nn
+  tensor is bytes only, is where item 3 plugs in. So item 3 on CUDA
+  waits on nothing in `ort`; on DirectML it waits on that FFI or on an
+  `ort` that carries it.
+- A script that declares a model-running module and never calls it
+  still starts the background fetch, since resolve keeps uncalled
+  declarations; the download is then joined at the end of the run.
 
 ### Wave 5: two candidates to measure
 
