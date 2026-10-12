@@ -942,6 +942,17 @@ What was learned:
   wheel run proves it. A gnullvm or aarch64 Windows build keeps D3D12
   first and needs `dxcompiler.dll` on the path for subgroups.
 
+**A GPU in CI (2026-10-12):** the sidecar workflow's Linux job installs
+mesa's lavapipe, a Vulkan driver that runs on the CPU, and runs
+`gpu_frames` with `FFRWD_GPU_REQUIRED` set, so a run that finds no
+adapter fails instead of skipping. The first run passed with the GPU case
+taken: the shared device, the frame pool, the planes a module reads and
+the texture it hands back go through wgpu's real code on every push. It
+does not prove speed, any vendor's driver or its limits, or the hardware
+decoder and encoder: the five D3D12 cases skip on Linux, and the Vulkan
+decoder has no test until it exists. The workflow can be dispatched on a
+branch by hand.
+
 **Items 5 and 6 for the encoder (2026-10-12, owner's machine):**
 `h264_d3d12va` and `hevc_d3d12va` take their frames from the pool: the
 encoder is opened on the shared device with an NV12 frames context, each
