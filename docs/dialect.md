@@ -1461,8 +1461,13 @@ input's `-i`, in the order written.
   way that ffmpeg has a `_cuda` variant of as that variant (`scale`,
   `overlay`, `pad`, `transpose`, `yadif`, `bwdif`, with the options the
   variant takes), and runs the rest on the CPU as one segment between one
-  `hwdownload` and one `hwupload_cuda`. A software encoder, a module or a
-  second file reading the same picture gets the one download it needs.
+  `hwdownload` and one `hwupload_cuda`. Each download is followed by a
+  `format` naming the stream's own software format on the card, from its
+  probed pixel format: `nv12` for 8-bit 4:2:0, `p010le` for 10-bit 4:2:0,
+  and `yuv444p` for 8-bit 4:4:4 HEVC on CUDA. An input with any other pixel
+  format, or none probed, is decoded as asked and its picture stays off the
+  card. A software encoder, a module or a second file reading the same
+  picture gets the one download it needs.
   `hwaccel => 'vulkan'` to a `_vulkan` encoder is the same path with the
   `_vulkan` filters (`scale`, `overlay`, `transpose`, `hflip`, `vflip`,
   `bwdif`) and `hwupload`, and a picture that came down for a CPU segment

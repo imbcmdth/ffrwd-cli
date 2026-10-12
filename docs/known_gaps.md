@@ -68,7 +68,9 @@ from.
   colour option, or an `overlay` with `format` or `alpha`, has no variant
   spelling and runs on the CPU, with the download and upload that costs;
   a Vulkan encoder reads only the card's frames, so a CPU segment ahead
-  of one ends with an upload.
+  of one ends with an upload. Only 8-bit and 10-bit 4:2:0 pictures, and
+  8-bit 4:4:4 HEVC on CUDA, stay on the card; 4:2:2, 10-bit 4:4:4 and an
+  input whose pixel format the probe does not report run on the CPU.
 - **A packet filter's rows cost a second pass over the input.** The rows
   it reads are a file, and a file is finished before whatever reads it
   starts -- so a producer reading the same input the encoder reads runs

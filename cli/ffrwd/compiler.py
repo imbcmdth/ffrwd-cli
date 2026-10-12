@@ -714,6 +714,7 @@ def compile_all(
                     )
                 ),
                 registry,
+                probes,
             )
             for graph in graphs
         ]

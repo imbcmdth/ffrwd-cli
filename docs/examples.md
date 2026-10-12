@@ -1530,23 +1530,25 @@ In a file run the source runs as fast as its reader drains it; in a live run it 
 
 ## 156. Stay on the card from decode to encode
 
-`hwaccel => 'cuda'` decodes on the card and an `_nvenc` codec encodes there, and as written the frames would come down for every filter between and go back up for the encoder. The compiler keeps them where they are: the input is told `hwaccel_output_format cuda`, `scale` becomes `scale_cuda`, and the encoder reads the card's frames. A filter ffmpeg has no `_cuda` variant of, `hflip` here, runs on the CPU as one segment, one `hwdownload` ahead of it and one `hwupload_cuda` behind, so the resize after it is on the card again:
+`hwaccel => 'cuda'` decodes on the card and an `_nvenc` codec encodes there, and as written the frames would come down for every filter between and go back up for the encoder. The compiler keeps them where they are: the input is told `hwaccel_output_format cuda`, `scale` becomes `scale_cuda`, and the encoder reads the card's frames. A filter ffmpeg has no `_cuda` variant of, `hflip` here, runs on the CPU as one segment, one `hwdownload` ahead of it and one `hwupload_cuda` behind, so the resize after it is on the card again. The download is followed by a `format` naming the frames' software format, which ffmpeg requires and the compiler takes from the probed stream: `nv12` for this 8-bit 4:2:0 file, `p010le` for 10-bit 4:2:0:
 
 ```pgsql
 COPY (
   SELECT scale(hflip(f.video[1]), 1280, -2), f.audio[1]
-  FROM input('film.mp4', hwaccel => 'cuda') f
+  FROM input('tests/fixtures/av.mp4', hwaccel => 'cuda') f
 ) TO 'small.mp4' WITH (video_codec 'h264_nvenc', video_bitrate '6M')
 ```
 
 ```
 $ ffrwd compile -f query.sql
-ffmpeg -hwaccel cuda -hwaccel_output_format cuda -i film.mp4 -filter_complex \
-  '[0:v:0]hwdownload,hflip,hwupload_cuda,scale_cuda=w=1280:h=-2[out0]' -map '[out0]' -map \
-  0:a:0 -c:1 copy -c:0 h264_nvenc -b:0 6M small.mp4
+ffmpeg -hwaccel cuda -hwaccel_output_format cuda -i tests/fixtures/av.mp4 \
+  -filter_complex \
+  '[0:v:0]hwdownload,format=pix_fmts=nv12,hflip,hwupload_cuda,'\
+'scale_cuda=w=1280:h=-2[out0]' -map '[out0]' -map 0:a:0 -c:1 copy -c:0 h264_nvenc -b:0 \
+  6M small.mp4
 ```
 
-Only the picture that reaches an `_nvenc` encoder is kept on the card; a `libx264` destination, a module, or a second file reading the same picture is given a download of its own, and an input whose picture goes nowhere near a hardware encoder is decoded as the query asked and nothing more. `scale`'s `flags` and colour options, and `overlay`'s `format` and `alpha`, have no variant spelling, so a call naming one stays on the CPU.
+Only the picture that reaches an `_nvenc` encoder is kept on the card; a `libx264` destination, a module, or a second file reading the same picture is given a download of its own, and an input whose picture goes nowhere near a hardware encoder is decoded as the query asked and nothing more. So is an input whose pixel format the probe does not report, or reports as anything but 8-bit or 10-bit 4:2:0, or 8-bit 4:4:4 HEVC on CUDA. `scale`'s `flags` and colour options, and `overlay`'s `format` and `alpha`, have no variant spelling, so a call naming one stays on the CPU.
 
 ## 157. A module holding its frames on the GPU takes the packets
 
