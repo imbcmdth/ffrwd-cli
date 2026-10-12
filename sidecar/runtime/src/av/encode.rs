@@ -54,6 +54,12 @@ pub struct Encoder {
 /// The device type the encoders that read D3D12 pictures run on.
 const D3D12VA: &str = "d3d12va";
 
+/// The pictures an encoder that reads D3D12 pictures has in flight before
+/// it waits for one. Each picture reaches it through a copy on another
+/// queue; at libavcodec's default of 2 the wait for that copy held a
+/// decode-to-encode chain to two thirds of ffmpeg's rate.
+const ASYNC_DEPTH: &str = "16";
+
 fn call<'a>(call: &'static str, codec: &'a str) -> impl FnOnce(AvErr) -> Error + 'a {
     move |e| Error::Call {
         call,
@@ -206,6 +212,9 @@ impl Encoder {
     /// B-frames are off unless `bf` is among `options`: this libav's D3D12
     /// encoders fail on the first B-frame on the NVIDIA driver they were
     /// tried on, ffmpeg's own command line included.
+    ///
+    /// The encoder keeps [`ASYNC_DEPTH`] pictures in flight unless
+    /// `async_depth` is among `options`.
     ///
     /// These encoders write the codec's header (h264's and hevc's
     /// parameter sets) into each keyframe and leave the out-of-band one
@@ -435,6 +444,10 @@ impl Encoder {
             if !options.iter().any(|(k, _)| k == "bf") {
                 ctx.set_option("bf", "0")
                     .map_err(call("av_opt_set bf", &name))?;
+            }
+            if !options.iter().any(|(k, _)| k == "async_depth") {
+                ctx.set_option("async_depth", ASYNC_DEPTH)
+                    .map_err(call("av_opt_set async_depth", &name))?;
             }
         }
         for (key, value) in options {
