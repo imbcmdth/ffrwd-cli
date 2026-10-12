@@ -12,7 +12,7 @@ import functools
 import json
 import re
 import subprocess
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import replace
 from fractions import Fraction
 from pathlib import Path
@@ -817,12 +817,15 @@ def _plan(
     colour: Mapping[str, str] | None = None,
     describe: Callable[[str], Described] = _node,
     pix_fmt: str | None = None,
+    av_filters: Callable[[], Collection[str] | None] = lambda: None,
 ) -> ProcessPlan:
     probes = _probes(rate, colour, pix_fmt)
     monkeypatch.setattr(
         "ffrwd.compiler.probe_path", lambda path, args=(), **kw: probes[path[0]]
     )
-    compiled = compile_all(_declared(query), describe=describe, shape=_Asked())
+    compiled = compile_all(
+        _declared(query), describe=describe, shape=_Asked(), av_filters=av_filters
+    )
     assert compiled.plan is not None
     return compiled.plan
 
@@ -2257,3 +2260,49 @@ def test_a_node_holding_its_picture_on_the_gpu_takes_coded_edges(
     assert [n.filter for n in on_card.graph.nodes.values()] == ["decode", "box", "encode"]
     (in_host,) = _plan(query.format(", 'host'"), monkeypatch).sidecars
     assert not in_host.av
+
+
+def test_a_filter_between_pictures_on_the_device_runs_there_where_it_has_a_variant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``scale`` reading a node's picture held on the GPU and read by an
+    encoder taking the device's pictures becomes the region's ``filter``
+    node running ``scale_d3d12``, and the region decodes on a device; it
+    stays in ffmpeg where the sidecar's libavfilter has no variant, where
+    its reader is an encoder in ffmpeg, or where the node holds its picture
+    in host memory. A sidecar that cannot say what it has is taken to carry
+    the bundled libavfilter."""
+    query = (
+        "COPY (SELECT scale(box(f.video[1]{memory}), 160, 120) FROM input('f.mp4') f) "
+        "TO 'out.mp4' WITH (video_codec '{codec}')"
+    )
+    on_device = ["decode", "box", "filter", "encode"]
+    cases: list[tuple[str, str, Callable[[], Collection[str] | None], list[str]]] = [
+        ("", "h264_d3d12va", lambda: {"scale_d3d12", "buffer"}, on_device),
+        ("", "h264_d3d12va", lambda: None, on_device),
+        ("", "h264_d3d12va", lambda: frozenset(), ["decode", "box"]),
+        ("", "libx264", lambda: {"scale_d3d12"}, ["decode", "box"]),
+        (", 'host'", "h264_d3d12va", lambda: {"scale_d3d12"}, ["box"]),
+    ]
+    for memory, codec, available, nodes in cases:
+        plan = _plan(
+            query.format(memory=memory, codec=codec), monkeypatch, av_filters=available
+        )
+        (region,) = plan.sidecars
+        assert region.graph is not None
+        found = [n.filter for n in region.graph.nodes.values()]
+        assert found == nodes, (memory, codec, available(), found)
+        if "filter" not in found:
+            continue
+        assert region.av
+        by_filter = {n.filter: n for n in region.graph.nodes.values()}
+        assert by_filter["decode"].args == {"format": "rgba", "hw": "auto"}
+        assert by_filter["filter"].args == {
+            "graph": "scale_d3d12=w=160:h=120",
+            "format": "yuv420p",
+        }
+        argv = _shown(plan)["sidecar0"]
+        assert (
+            "[n1]filter=graph=scale_d3d12\\\\=w\\\\=160\\\\:h\\\\=120:format=yuv420p[n2]"
+            in argv[argv.index("-filter_complex") + 1]
+        )

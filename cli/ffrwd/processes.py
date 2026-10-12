@@ -119,7 +119,9 @@ from .ir import (
     DECODE,
     DEFAULT_MAX_LATENESS,
     DEFAULT_MAX_SPREAD,
+    DEVICE_FILTER,
     ENCODE,
+    GRAPH,
     LEAKY,
     MAX_LATENESS,
     MAX_SPREAD,
@@ -416,10 +418,10 @@ _ZERO_LATENCY = "zerolatency"
 
 # Nodes the sidecar hosts itself. They belong to a region the way a module
 # does -- ffmpeg cannot run them -- but no ``-m`` entry binds their name.
-HOSTED_FILTERS = frozenset({ROWFILTER, ROWMERGE, LEAKY, DECODE, ENCODE})
+HOSTED_FILTERS = frozenset({ROWFILTER, ROWMERGE, LEAKY, DECODE, ENCODE, DEVICE_FILTER})
 
 # The hosted nodes only ever spelled in a network string, even alone.
-_NETWORK_ONLY = frozenset({LEAKY, DECODE, ENCODE})
+_NETWORK_ONLY = frozenset({LEAKY, DECODE, ENCODE, DEVICE_FILTER})
 
 # The video options a file output may keep where its stream arrives coded:
 # what a stream copy still writes.
@@ -1948,6 +1950,8 @@ def _sized_by(node: Node, size: tuple[int, int] | None) -> tuple[int, int] | Non
     """
     if node.filter == "scale":
         return _scaled(node, size)
+    if node.filter == DEVICE_FILTER:
+        return _device_scaled(node, size)
     if node.filter in ("pad", "crop"):
         names = (("width", "w"), ("height", "h"))
         if node.filter == "crop":
@@ -2004,6 +2008,25 @@ def _scaled(node: Node, size: tuple[int, int] | None) -> tuple[int, int] | None:
         width = (width + step - 1) // step * step
         height = (height + step - 1) // step * step
     return (width, height) if width > 0 and height > 0 else None
+
+
+def _device_scaled(node: Node, size: tuple[int, int] | None) -> tuple[int, int] | None:
+    """What a ``filter`` node's graph makes of a picture `size` big: its
+    ``scale_<device>`` filters sized as ``scale`` sizes, every other one
+    keeping the size it was handed."""
+    graph = node.args.get(GRAPH)
+    if not isinstance(graph, str):
+        return None
+    for spelled in graph.split(","):
+        name, _, options = spelled.strip().partition("=")
+        if not name.startswith("scale_"):
+            continue
+        args: dict[str, object] = {}
+        for option in options.split(":") if options else ():
+            key, _, value = option.partition("=")
+            args[key] = value
+        size = _scaled(Node(id=node.id, filter="scale", args=args, inputs=[], outputs=[]), size)
+    return size
 
 
 def _rescaled(value: int, num: int, den: int) -> int:
@@ -2138,6 +2161,9 @@ class _Partitioner:
         # `encode` arguments, by the ref the edge carries.
         self.decodes: dict[str, dict[FrameRef, str]] = {}
         self.encodes: dict[str, dict[FrameRef, dict[str, object]]] = {}
+        # The regions among them whose pictures are held on the GPU, which
+        # decode on a device.
+        self.decoded_on_device: set[str] = set()
         # The frames each such region's encoders hold back, at most.
         self.encode_delays: dict[str, int] = {}
         # The scales putting a picture only timing inputs read at
@@ -4170,7 +4196,8 @@ class _Partitioner:
         stays raw.
         """
         for sidecar in self.sidecars:
-            if sidecar.module not in self.coded and not self._holds_on_the_gpu(sidecar.node):
+            on_the_gpu = self._holds_on_the_gpu(sidecar.node)
+            if sidecar.module not in self.coded and not on_the_gpu:
                 continue
             if sidecar.sink or sidecar.packet_sink or sidecar.packet_filter:
                 continue
@@ -4184,6 +4211,8 @@ class _Partitioner:
                 if not isinstance(wire, VideoFormat) or not self._decodable(edge):
                     continue
                 self.decodes.setdefault(sidecar.id, {})[edge.ref] = wire.pix_fmt
+                if on_the_gpu:
+                    self.decoded_on_device.add(sidecar.id)
                 self.edges[index] = replace(edge, format=replace(wire, codec=COPY_CODEC))
             for index, edge in enumerate(self.edges):
                 if edge.source != sidecar.id:
@@ -4202,9 +4231,13 @@ class _Partitioner:
                 self.edges[index] = replace(edge, format=replace(wire, codec=COPY_CODEC))
 
     def _holds_on_the_gpu(self, name: str) -> bool:
-        """True when node `name`'s shape holds an input on the GPU: its region
+        """True when node `name`'s shape holds an input on the GPU, or it is
+        a ``filter`` node, which runs on the sidecar's device: its region
         takes coded edges as one declared ``SET ffrwd.edges = 'coded'`` does,
         since the sidecar decodes straight onto the device it holds them on."""
+        node = self.g.nodes.get(name)
+        if node is not None and node.filter == DEVICE_FILTER:
+            return True
         shape = self.node_shapes.get(name)
         return shape is not None and any(port.accepts.memory == "gpu" for port in shape.inputs)
 
@@ -5626,7 +5659,8 @@ class _Partitioner:
             writes_rows=any(e.annotations for e in self.edges if e.source == sidecar.id),
             rows_modules=self._rows_modules(sidecar, members),
             lookahead=sidecar.lookahead + self.encode_delays.get(sidecar.id, 0),
-            av=bool(self.decodes.get(sidecar.id) or self.encodes.get(sidecar.id)),
+            av=bool(self.decodes.get(sidecar.id) or self.encodes.get(sidecar.id))
+            or any(node.filter == DEVICE_FILTER for node in nodes.values()),
             graph=Graph(
                 input_paths=[PIPE] * len(read_order),
                 sources={alias: index for index, alias in enumerate(read_order)},
@@ -5660,12 +5694,15 @@ class _Partitioner:
 
         front: dict[str, Node] = {}
         decoded: dict[FrameRef, FrameRef] = {}
+        # A region holding its pictures on the GPU decodes on a device where
+        # the machine has one, onto the sidecar's own where it can.
+        device = {"hw": "auto"} if region in self.decoded_on_device else {}
         for ref, pix_fmt in decodes.items():
             name = fresh(DECODE)
             front[name] = Node(
                 id=name,
                 filter=DECODE,
-                args={"format": pix_fmt},
+                args={"format": pix_fmt, **device},
                 inputs=[read_as.get(ref, ref)],
                 outputs=["video"],
             )

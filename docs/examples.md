@@ -1571,11 +1571,43 @@ $ ffrwd compile -f query.sql
 ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 copy -f nut pipe:1 | ffrwd-wasm -f \
   nut -i pipe:0 -gpu ../sidecar/modules/target/wasm32-wasip2/release/gpu_box.wasm -m \
   gpu_box=../sidecar/modules/target/wasm32-wasip2/release/gpu_box.wasm -filter_complex \
-  '[0:v]decode=format=rgba[decode0];[v=decode0]gpu_box=memory=gpu:size=8[out=n1];'\
-'[n1]encode=codec=h264_nvenc:b=6M[out0]' -bound \
-  'gpu_box=[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]}]' -map '[out0]' -f nut \
-  pipe:1 | ffmpeg -f nut -analyzeduration 0 -fpsprobesize 3 -i pipe:0 -map 0:v:0 -c:0 copy \
-  boxed.mp4
+  '[0:v]decode=format=rgba:hw=auto[decode0];'\
+'[v=decode0]gpu_box=memory=gpu:size=8[out=n1];[n1]encode=codec=h264_nvenc:b=6M[out0]' \
+  -bound 'gpu_box=[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]}]' -map '[out0]' \
+  -f nut pipe:1 | ffmpeg -f nut -analyzeduration 0 -fpsprobesize 3 -i pipe:0 -map 0:v:0 \
+  -c:0 copy boxed.mp4
 ```
 
-With `memory => 'host'` the same module holds nothing on the GPU, and its region takes raw frames on both pipes unless the declaration says `SET ffrwd.edges = 'coded'`. Where the machine's decoder and the device share one (D3D12 on Windows) the decoder's frames land on the device directly; elsewhere the decoded picture reaches it through the sidecar's own upload at the module's input and comes back through one download at the output, which the `upload` and `download` rows of `--profile` count.
+With `memory => 'host'` the same module holds nothing on the GPU, and its region takes raw frames on both pipes unless the declaration says `SET ffrwd.edges = 'coded'`. The region's `decode` is told `hw=auto`: where the machine's decoder and the device share one (D3D12 on Windows) the decoder's frames land on the device directly; elsewhere the decoded picture reaches it through the sidecar's own upload at the module's input and comes back through one download at the output, which the `upload` and `download` rows of `--profile` count.
+
+## 158. Scale on the device, inside the region
+
+A filter between a module that holds its frames on the GPU and the rest of its region runs in the region too, on the sidecar's device, where the sidecar's libavfilter has a variant of it for that device. Here `scale` reads `gpu_box`'s picture and is read by `h264_d3d12va`, an encoder the sidecar hosts that takes the device's pictures, so it becomes the sidecar's own `filter` node running `scale_d3d12`. The picture is decoded onto the device, boxed, scaled and encoded there, and never crosses to the host:
+
+```pgsql
+CREATE FUNCTION gpu_box(v video_stream, memory text DEFAULT 'gpu', size number DEFAULT 8)
+  RETURNS video_stream
+  AS '../sidecar/modules/target/wasm32-wasip2/release/gpu_box.wasm', 'gpu_box'
+  LANGUAGE wasm;
+
+COPY (
+  SELECT scale(gpu_box(f.video[1]), 160, 120)
+  FROM input('tests/fixtures/testsrc.mp4') f
+) TO 'small.mp4' WITH (video_codec 'h264_d3d12va', video_bitrate '2M')
+```
+
+```
+$ ffrwd compile -f query.sql
+ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 copy -f nut pipe:1 | ffrwd-wasm -f \
+  nut -i pipe:0 -gpu ../sidecar/modules/target/wasm32-wasip2/release/gpu_box.wasm -m \
+  gpu_box=../sidecar/modules/target/wasm32-wasip2/release/gpu_box.wasm -filter_complex \
+  '[0:v]decode=format=rgba:hw=auto[decode0];'\
+'[v=decode0]gpu_box=memory=gpu:size=8[out=n1];'\
+'[n1]filter=graph=scale_d3d12\\=w\\=160\\:h\\=120:format=yuv420p[n2];'\
+'[n2]encode=codec=h264_d3d12va:b=2M[out0]' -bound \
+  'gpu_box=[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]}]' -map '[out0]' -f nut \
+  pipe:1 | ffmpeg -f nut -analyzeduration 0 -fpsprobesize 3 -i pipe:0 -map 0:v:0 -c:0 \
+  copy small.mp4
+```
+
+The variants are what `ffrwd-wasm --av-info` lists under `filters`, and the node runs the D3D12 ones; `scale` with its width and height is the one mapped so far. `deinterlace_d3d12` is not: creating its video processor removes the device on NVIDIA's driver, ffmpeg's own command line included, so `yadif` and `bwdif` stay in ffmpeg. A filter with no variant, or a call naming an option the variant lacks (`scale`'s `flags`, say), stays in ffmpeg, and the picture leaves the region for it at that filter. Where the compiling machine's sidecar loads no libav at all, the command is written for a reader whose sidecar carries the bundled libavfilter, as recipe 156 is written for a reader's ffmpeg.

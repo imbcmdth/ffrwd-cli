@@ -8,12 +8,16 @@ inside the region, and the ffmpegs on either side copy the stream.
 :data:`DECODABLE` and :data:`HOSTED_ENCODERS` are what the bundled LGPL
 build does, :data:`ENCODE_OPTIONS` how a destination's video options are
 spelled on the ``encode`` node, and :func:`spawn_args` the ``-av-runtime``
-a spawned sidecar is told.
+a spawned sidecar is told. :func:`sidecar_filters` is what the sidecar's
+libavfilter has, which decides the filters a region runs on its device.
 """
 
 from __future__ import annotations
 
+import functools
+import json
 import os
+import subprocess
 from collections.abc import Mapping
 
 from . import binaries
@@ -27,6 +31,7 @@ __all__ = [
     "HOSTED_ENCODERS",
     "RUNTIME_DIR_VAR",
     "sessions",
+    "sidecar_filters",
     "spawn_args",
 ]
 
@@ -104,6 +109,46 @@ def spawn_args() -> list[str]:
     if directory is None:
         return []
     return [AV_RUNTIME_FLAG, directory]
+
+
+# How long the compile waits for the sidecar to say what its libav has.
+_AV_INFO_SECONDS = 30.0
+
+
+@functools.cache
+def sidecar_filters() -> frozenset[str] | None:
+    """The filters the sidecar's libavfilter has, by name, as
+    ``ffrwd-wasm --av-info`` lists them; None where that cannot be known.
+
+    Asked once per process, with the ``-av-runtime`` a run would be given.
+    Empty where the sidecar loads its libav and that has no libavfilter (a
+    wheel from before it was bundled). None where no sidecar is found, it
+    does not answer, or it loads no libav at all, which is a compile on a
+    machine that is not the one the command runs on: the caller then writes
+    the command for the reader's sidecar, as the card pass does for an
+    ffmpeg it cannot see.
+    """
+    sidecar = binaries.ffrwd_wasm_path()
+    if sidecar is None:
+        return None
+    try:
+        done = subprocess.run(
+            [sidecar, "--av-info", *spawn_args()],
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=_AV_INFO_SECONDS,
+            check=False,
+        )
+        info = json.loads(done.stdout)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+    if not isinstance(info, dict) or info.get("error") is not None:
+        return None
+    filters = info.get("filters")
+    if not isinstance(filters, list):
+        return frozenset()
+    return frozenset(name for name in filters if isinstance(name, str))
 
 
 def sessions(graph: Graph | None) -> tuple[int, int]:

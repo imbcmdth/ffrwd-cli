@@ -39,14 +39,16 @@ internals) as ``INTERNAL``, the code the fuzz corpus asserts never fires.
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 
 from . import registry as registry_module
 from . import shapes as shapes_module
 from . import wasm
+from .av import sidecar_filters
 from .decode import decode_ahead_of_frame_readers
+from .device_filters import filters_on_the_device
 from .emit import Emitted, emit
 from .errors import ErrorCode, FfrwdError
 from .execute import DEFAULT_TIMEOUT
@@ -670,6 +672,7 @@ def compile_all(
     describe: wasm.Describe = wasm.describe,
     invoke: wasm.Invoke = wasm.invoke,
     shape: shapes_module.Shape = shapes_module.shape,
+    av_filters: Callable[[], Collection[str] | None] = sidecar_filters,
 ) -> Compiled:
     """Compile SQL `text` into its commands, and the plan that runs them.
 
@@ -684,7 +687,9 @@ def compile_all(
     `invoke` is the same for a VALUE-returning module: lowering runs it once
     per call site to fold the result, and a test hands over its own so
     folding spawns nothing. `shape` is the same for a node module's shape,
-    asked once per distinct call.
+    asked once per distinct call. `av_filters` is the same for the filters
+    the sidecar's libavfilter has, asked only where a filter could run on
+    the sidecar's device (:func:`~ffrwd.device_filters.filters_on_the_device`).
 
     Raises ``FfrwdError`` — and nothing else — on every rejection.
     """
@@ -739,6 +744,7 @@ def compile_all(
             return Compiled(
                 graphs=ready, default_timeout=budget, duration=span, timing=timed
             )
+        ready[0] = filters_on_the_device(ready[0], av_filters)
         try:
             plan = partition(
                 ready[0],

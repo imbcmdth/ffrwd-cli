@@ -103,6 +103,13 @@ DEFAULT_MAX_SPREAD = 2
 DECODE = "decode"
 ENCODE = "encode"
 
+# The node that runs a libavfilter graph on the sidecar's device, inside a
+# region that holds its pictures there. Hosted the same way: `graph` is the
+# graph in libavfilter's own syntax, `format` the pixel format its pictures
+# leave in.
+DEVICE_FILTER = "filter"
+GRAPH = "graph"
+
 # What a line of a sidecar's stderr starts with when it is a row the node
 # reports, a leaky's, rather than its log. The rest of the line is one JSON
 # object.
