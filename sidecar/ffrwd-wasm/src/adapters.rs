@@ -1299,6 +1299,8 @@ pub struct PacketSourceNode {
     delays: Vec<Option<u32>>,
     beats: Option<SourceBeats>,
     ended: bool,
+    /// What [`PacketSourceNode::settle`] pulled, handed on by the first call.
+    settled: Option<Vec<Vec<Packet>>>,
 }
 
 impl PacketSourceNode {
@@ -1313,11 +1315,58 @@ impl PacketSourceNode {
             delays,
             beats: None,
             ended: false,
+            settled: None,
         })
     }
 
     pub fn catalog(&self) -> &Catalog {
         &self.catalog
+    }
+
+    /// Names the outputs by the catalog's own track numbers, `tracks` being
+    /// the ones it was opened on in order: a network names them so.
+    pub fn named_by_catalog(mut self, tracks: &[u32]) -> PacketSourceNode {
+        for (output, track) in self.shape.outputs.iter_mut().zip(tracks) {
+            output.name = format!("track{track}");
+        }
+        self
+    }
+
+    /// Pulls until every track's decode delay has settled, which an output's
+    /// header carries, and keeps what it pulled for the first call.
+    pub fn settle(&mut self) -> Result<()> {
+        if self.beats.is_some() {
+            return Ok(());
+        }
+        // The count of a track's leading packets with no dts is its decode
+        // delay; a data track has none to count.
+        for (slot, track) in self.catalog.tracks.iter().enumerate() {
+            if track.stream.format == CodedFormat::Data {
+                self.delays[slot] = Some(0);
+            }
+        }
+        let mut pending: Vec<Vec<Packet>> =
+            self.catalog.tracks.iter().map(|_| Vec::new()).collect();
+        while self.delays.iter().any(Option::is_none) {
+            let Some(pads) = self.pull()? else {
+                self.ended = true;
+                break;
+            };
+            for (slot, packets) in pads.into_iter().enumerate() {
+                for packet in packets {
+                    if self.delays[slot].is_none() && packet.dts.is_some() {
+                        self.delays[slot] = Some(pending[slot].len() as u32);
+                    }
+                    pending[slot].push(packet);
+                }
+            }
+        }
+        for (slot, delay) in self.delays.iter_mut().enumerate() {
+            delay.get_or_insert(pending[slot].len() as u32);
+        }
+        self.beats = Some(SourceBeats::new(&self.catalog.tracks, &pending));
+        self.settled = Some(pending);
+        Ok(())
     }
 
     fn pull(&mut self) -> Result<Option<Vec<Vec<Packet>>>> {
@@ -1381,6 +1430,9 @@ impl Node for PacketSourceNode {
     }
 
     fn process(&mut self, tick: Tick) -> Result<Emitted> {
+        if let Some(pending) = self.settled.take() {
+            return Ok(self.emitted(pending));
+        }
         if tick.last || self.ended && self.beats.is_some() {
             return Ok(Emitted {
                 finished: true,
@@ -1388,33 +1440,8 @@ impl Node for PacketSourceNode {
             });
         }
         if self.beats.is_none() {
-            // The count of a track's leading packets with no dts is its
-            // decode delay; a data track has none to count.
-            for (slot, track) in self.catalog.tracks.iter().enumerate() {
-                if track.stream.format == CodedFormat::Data {
-                    self.delays[slot] = Some(0);
-                }
-            }
-            let mut pending: Vec<Vec<Packet>> =
-                self.catalog.tracks.iter().map(|_| Vec::new()).collect();
-            while self.delays.iter().any(Option::is_none) {
-                let Some(pads) = self.pull()? else {
-                    self.ended = true;
-                    break;
-                };
-                for (slot, packets) in pads.into_iter().enumerate() {
-                    for packet in packets {
-                        if self.delays[slot].is_none() && packet.dts.is_some() {
-                            self.delays[slot] = Some(pending[slot].len() as u32);
-                        }
-                        pending[slot].push(packet);
-                    }
-                }
-            }
-            for (slot, delay) in self.delays.iter_mut().enumerate() {
-                delay.get_or_insert(pending[slot].len() as u32);
-            }
-            self.beats = Some(SourceBeats::new(&self.catalog.tracks, &pending));
+            self.settle()?;
+            let pending = self.settled.take().expect("set by settle");
             return Ok(self.emitted(pending));
         }
         match self.pull()? {

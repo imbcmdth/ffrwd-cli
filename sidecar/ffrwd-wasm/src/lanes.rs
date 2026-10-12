@@ -790,7 +790,11 @@ impl State {
         let source = matches!(lane.clock, ClockKind::Rate { inputs: false });
         let ports = lane.ports.iter().flatten().chain(lane.rows.iter());
         for port in ports {
-            if let Some(consumers) = self.consumers.get(&port.out.stream) {
+            // A stream's copies hold it back as its own readers do.
+            let streams = std::iter::once(port.out.stream).chain(self.mirrors(port.out.stream));
+            for (stream, consumers) in
+                streams.filter_map(|stream| Some((stream, self.consumers.get(&stream)?)))
+            {
                 let room = if lane.unbuffered {
                     self.drained(consumers)
                 } else {
@@ -801,11 +805,7 @@ impl State {
                 }
                 // A source has nothing upstream to wait on, so a hold input it
                 // feeds holds it back by its own room, as a socket does.
-                if source
-                    && consumers
-                        .iter()
-                        .any(|c| self.held_full(*c, port.out.stream))
-                {
+                if source && consumers.iter().any(|c| self.held_full(*c, stream)) {
                     return false;
                 }
             }
@@ -1351,11 +1351,11 @@ impl Scheduler {
 
     /// Whether anything reads `stream`.
     pub fn reads(&self, stream: u32) -> bool {
-        self.shared
-            .lock()
-            .consumers
-            .get(&stream)
-            .is_some_and(|c| !c.is_empty())
+        let state = self.shared.lock();
+        // A stream's copies read it too.
+        std::iter::once(stream)
+            .chain(state.mirrors(stream))
+            .any(|id| state.consumers.get(&id).is_some_and(|c| !c.is_empty()))
     }
 
     /// A failure outside the lanes stops them, unless one failed first.

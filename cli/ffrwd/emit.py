@@ -1826,10 +1826,12 @@ def _render_node(node: Node, g: Graph, labels: dict[str, str], measure: bool) ->
     """
     read = {_slot(ref) for other in g.nodes.values() for ref in other.inputs}
     read |= {_slot(output.ref) for output in g.outputs if not is_src(output.ref)}
+    # A module of an older world with ports on its outputs alone (a packet
+    # source's tracks, a packet sink's rows) takes its pads by position.
     prefix = "".join(
         f"[{port}={_input_label(g, ref, labels, True)}]"
         for port, ref in zip(node.ports, node.inputs)
-    )
+    ) or "".join(f"[{_input_label(g, ref, labels, True)}]" for ref in node.inputs)
     suffix = "".join(
         f"[{port}={labels[f'{node.id}:{pad}']}]"
         for pad, port in enumerate(node.out_ports)

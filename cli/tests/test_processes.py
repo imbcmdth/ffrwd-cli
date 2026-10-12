@@ -2285,6 +2285,79 @@ def test_a_module_source_with_two_outputs_is_still_spellable() -> None:
     check_spellable(partition(_source_sink_graph()))
 
 
+def _source_probe() -> dict[str, ProbeResult | None]:
+    """The source's catalog as the compiler probed it: h264 and aac."""
+    return {
+        "s": ProbeResult(
+            streams=[
+                StreamMeta(
+                    type="video", index=0, metadata={}, width=320, height=240,
+                    fps="25/1", sample_rate=None, codec="h264",
+                ),
+                StreamMeta(
+                    type="audio", index=0, metadata={}, width=None, height=None,
+                    fps=None, sample_rate=48000, codec="aac", channels=2,
+                ),
+            ]
+        )
+    }  # fmt: skip
+
+
+def test_a_module_source_runs_in_the_region_decoding_what_it_reads() -> None:
+    """A source whose picture a region declared coded reads is a node of that
+    region's network, its track an output named by its place in the catalog,
+    decoded there for the module: no process of its own, and no ffmpeg
+    copying its packets across. A region that decodes nothing itself keeps
+    today's reader."""
+    g = Graph(input_paths=[], sources={})
+    g.module_sources["s"] = _module_source()
+    g.nodes["m0"] = Node(
+        id="m0", filter="mod.wasm", args={}, inputs=["src:s:v:0"], outputs=["video"]
+    )
+    g.sinks = [SinkUnit(outputs=[_out("m0")], path="out.mkv")]
+    plan = partition(
+        g,
+        external=external_ids("m0"),
+        probes=_source_probe(),
+        pix_fmts={"mod.wasm": "rgba"},
+        coded={"mod.wasm"},
+    )
+    (region,) = plan.sidecars
+    assert not region.packet_source and region.node_network
+    assert region.graph is not None
+    nodes = list(region.graph.nodes.values())
+    assert [(n.filter, n.out_ports) for n in nodes[:2]] == [
+        ("ffrwd_moq_subscribe", ["track0"]),
+        ("decode", []),
+    ]
+    assert nodes[1].args == {"format": "rgba"}
+    assert not [e for e in plan.stream_edges if e.target == region.id]
+    (muxer,) = plan.ffmpeg
+    assert muxer.graph.sinks[0].path == "out.mkv"
+    plan = partition(
+        g, external=external_ids("m0"), probes=_source_probe(), pix_fmts={"mod.wasm": "rgba"}
+    )
+    assert any(sidecar.packet_source for sidecar in plan.sidecars)
+
+
+def test_two_sidecars_are_wired_to_each_other_where_an_ffmpeg_would_only_copy() -> None:
+    """A packet sink reading a source's packets unchanged takes them off the
+    source's own pipe: the ffmpeg that would stand between copies, and is
+    not made."""
+    g = Graph(input_paths=[], sources={})
+    g.module_sources["s"] = _module_source()
+    g.nodes["e0"] = Node(
+        id="e0", filter="sink.wasm", args={}, inputs=["src:s:v:0"], outputs=[]
+    )
+    g.module_sinks.append("e0")
+    g.packet_sinks["e0"] = [{"video_codec": "copy"}]
+    plan = partition(g, external=external_ids("e0"), probes=_source_probe())
+    assert not plan.ffmpeg
+    source, sink = sorted(plan.sidecars, key=lambda s: not s.packet_source)
+    assert source.packet_source and sink.packet_sink
+    assert [(e.source, e.target) for e in plan.stream_edges] == [(source.id, sink.id)]
+
+
 def _module_source_round_trip() -> Graph:
     g = Graph(input_paths=[], sources={})
     g.module_sources["s"] = _module_source(rows=(0, 1))

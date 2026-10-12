@@ -1743,7 +1743,7 @@ What it costs, on an RTX 4090 with a 4K60 programme and two 1080p60 pictures in 
 
 ## 161. Encode in the region for a packet sink
 
-A packet sink reads the encoder's output, so the compiler puts an encoder in front of it. Where the picture comes from a region that holds it on the GPU and the sink's encoder is one the sidecar hosts, that encoder runs in the region, beside the module, and the sink's video options move onto it as they do for a file in recipe 157. `packet_stats` counts the groups of pictures it is handed:
+A packet sink reads the encoder's output, so the compiler puts an encoder in front of it. Where the picture comes from a region that holds it on the GPU and the sink's encoder is one the sidecar hosts, that encoder runs in the region, beside the module, and the sink's video options move onto it as they do for a file in recipe 157. The sink then reads the encoder's packets in the region's network, so it runs there too. `packet_stats` counts the groups of pictures it is handed:
 
 ```pgsql
 CREATE FUNCTION gpu_box(v video_stream, memory text DEFAULT 'gpu', size number DEFAULT 8)
@@ -1765,13 +1765,54 @@ COPY (
 $ ffrwd compile -f query.sql
 ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 copy -f nut pipe:1 | ffrwd-wasm -f \
   nut -i pipe:0 -gpu ../sidecar/modules/target/wasm32-wasip2/release/gpu_box.wasm -m \
-  gpu_box=../sidecar/modules/target/wasm32-wasip2/release/gpu_box.wasm -filter_complex \
+  gpu_box=../sidecar/modules/target/wasm32-wasip2/release/gpu_box.wasm -m \
+  packet_stats=../sidecar/modules/target/wasm32-wasip2/release/packet_stats.wasm \
+  -filter_complex \
   '[0:v]decode=format=rgba:hw=auto[decode0];'\
-'[v=decode0]gpu_box=memory=gpu:size=8[out=n1];[n1]encode=codec=h264_nvenc:b=6M[out0]' \
-  -bound 'gpu_box=[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]}]' -map '[out0]' \
-  -f nut pipe:1 | ffmpeg -f nut -analyzeduration 0 -fpsprobesize 3 -i pipe:0 -map 0:v:0 \
-  -c:0 copy -f nut pipe:1 | ffrwd-wasm -f nut -i pipe:0 -m \
-  ../sidecar/modules/target/wasm32-wasip2/release/packet_stats.wasm -f ndjson pipe:1
+'[v=decode0]gpu_box=memory=gpu:size=8[out=n1];'\
+'[n1]encode=codec=h264_nvenc:b=6M[encode0];[encode0]packet_stats[@rows=out0]' -bound \
+  'gpu_box=[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]}]' -map '[out0]' -f \
+  ndjson pipe:1
 ```
 
-The picture leaves the region as `h264_nvenc`'s packets and the ffmpeg between copies them, so it never comes back to host memory to be encoded. An encoder the sidecar does not host (`libx264`), a sink option the `encode` node has no name for, or a module holding its picture in host memory leaves the encoder in that ffmpeg, as before.
+The picture is encoded where it is and the sink's rows leave the region on its stdout; no ffmpeg stands between the module and the sink. An encoder the sidecar does not host (`libx264`), a sink option the `encode` node has no name for, or a module holding its picture in host memory leaves the encoder in an ffmpeg in front of the sink, which then keeps a process of its own. So does a sink reading several streams, such as a ladder's renditions or a picture and its sound. A packet filter (`RETURNS packets`) keeps its process too, and reads the region's packets through an ffmpeg that only copies them.
+
+## 162. A source, a module on the GPU and a sink in one process
+
+A source module, a module holding its pictures on the GPU and a packet sink run as one sidecar when the packets pass between them unfiltered. The source's track is decoded onto the device in the network, the module draws on the device, the picture is encoded there, and the sink reads the packets. No ffmpeg runs at all:
+
+```pgsql
+CREATE FUNCTION replay() RETURNS source
+  AS '../sidecar/modules/target/wasm32-wasip2/release/source_replay.wasm', 'source_replay'
+  LANGUAGE wasm;
+
+CREATE FUNCTION gpu_box(v video_stream, memory text DEFAULT 'gpu', size number DEFAULT 8)
+  RETURNS video_stream
+  AS '../sidecar/modules/target/wasm32-wasip2/release/gpu_box.wasm', 'gpu_box'
+  LANGUAGE wasm;
+
+CREATE FUNCTION packet_stats(v video_stream) RETURNS sink
+  AS '../sidecar/modules/target/wasm32-wasip2/release/packet_stats.wasm', 'packet_stats'
+  LANGUAGE wasm;
+
+COPY (
+  SELECT gpu_box(s.video[1])
+  FROM replay() s
+) TO packet_stats() WITH (video_codec 'h264_nvenc', video_bitrate '6M')
+```
+
+```
+$ ffrwd compile -f query.sql
+ffrwd-wasm -gpu ../sidecar/modules/target/wasm32-wasip2/release/gpu_box.wasm -m \
+  source_replay=../sidecar/modules/target/wasm32-wasip2/release/source_replay.wasm -m \
+  gpu_box=../sidecar/modules/target/wasm32-wasip2/release/gpu_box.wasm -m \
+  packet_stats=../sidecar/modules/target/wasm32-wasip2/release/packet_stats.wasm \
+  -filter_complex \
+  'source_replay[track0=s_source];'\
+'[s_source]decode=format=rgba:hw=auto[s_source_0_decode];'\
+'[v=s_source_0_decode]gpu_box=memory=gpu:size=8[out=n1];'\
+'[n1]encode=codec=h264_nvenc:b=6M[encode0];[encode0]packet_stats[@rows=out0]' -bound \
+  'gpu_box=[{"input":"v","streams":[{"rate":null}]}]' -map '[out0]' -f ndjson pipe:1
+```
+
+A source of an older world is a node of the network named by the tracks it writes, `[track0=...]` for the first track of its catalog. ffrwd/moq's `subscribe` and `publish` are nodes already, so `ffrwd.moq.subscribe(...)` into a module like this one and `TO ffrwd.moq.publish(...)` compile the same way, the sink's row and rendition given by `-pads` since its pad reads a label of the network rather than an `-i`. A codec package's encoder or decoder beside such a module runs in its region too.

@@ -138,6 +138,7 @@ from .ir import (
     Output,
     RowsSink,
     SinkUnit,
+    SourceTrack,
     StreamType,
     _parse_stream_type,
     feeder_path,
@@ -419,6 +420,9 @@ _ZERO_LATENCY = "zerolatency"
 # Nodes the sidecar hosts itself. They belong to a region the way a module
 # does -- ffmpeg cannot run them -- but no ``-m`` entry binds their name.
 HOSTED_FILTERS = frozenset({ROWFILTER, ROWMERGE, LEAKY, DECODE, ENCODE, DEVICE_FILTER})
+
+# The port a node's own rows leave on, in a network string.
+_EMITTED_ROWS = "@rows"
 
 # The hosted nodes only ever spelled in a network string, even alone.
 _NETWORK_ONLY = frozenset({LEAKY, DECODE, ENCODE, DEVICE_FILTER})
@@ -1329,6 +1333,14 @@ class SidecarProcess:
     # True for a region holding a `decode` or `encode` node: the sidecar
     # loads libavcodec, and is told where it is.
     av: bool = False
+    # The pad metadata of each packet sink a node network holds beside the
+    # nodes writing its stream, by the sink's node: its pads read labels of
+    # the network, which no ``-pad`` names.
+    call_pads: tuple[tuple[str, tuple[PadMeta, ...]], ...] = ()
+    # What each codec package's encoder or decoder a node network holds is
+    # told of its stream, by its node: its colorimetry in the flags' names,
+    # and the pixel format its pictures are made in (`pix_fmt`).
+    call_codecs: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = ()
 
     @property
     def nodes(self) -> tuple[str, ...]:
@@ -1423,6 +1435,12 @@ class SidecarProcess:
             ]
         if self.av:
             written["av"] = True
+        if self.call_pads:
+            written["call_pads"] = {
+                name: [pad.to_dict() for pad in pads] for name, pads in self.call_pads
+            }
+        if self.call_codecs:
+            written["call_codecs"] = {name: dict(color) for name, color in self.call_codecs}
         if self.network and self.graph is not None:
             written["graph"] = self.graph.to_dict()
         return written
@@ -1491,6 +1509,16 @@ class SidecarProcess:
                 if isinstance(one, list)
             ),
             av=d.get("av") is True,
+            call_pads=tuple(
+                (str(name), tuple(PadMeta.from_dict(pad) for pad in pads if isinstance(pad, dict)))
+                for name, pads in _read_object(d, "call_pads").items()
+                if isinstance(pads, list)
+            ),
+            call_codecs=tuple(
+                (str(name), tuple((str(k), str(v)) for k, v in color.items()))
+                for name, color in _read_object(d, "call_codecs").items()
+                if isinstance(color, dict)
+            ),
         )
 
 
@@ -1809,6 +1837,26 @@ def _bindings(paths: Iterable[str]) -> tuple[ModuleBinding, ...]:
         used.add(base)
         bound[path] = ModuleBinding(name=base, path=path)
     return tuple(bound.values())
+
+
+def _passes_through(into: StreamFormat, out: StreamFormat) -> bool:
+    """True when an ffmpeg reading `into` and writing `out` changes nothing:
+    the packets copied, or the same raw picture or sound on both sides."""
+    if isinstance(into, DataFormat) or isinstance(out, DataFormat):
+        return isinstance(into, DataFormat) and isinstance(out, DataFormat)
+    if out.codec == COPY_CODEC:
+        return True
+    if isinstance(into, VideoFormat) and isinstance(out, VideoFormat):
+        return (
+            into.codec == out.codec == RAWVIDEO
+            and into.pix_fmt == out.pix_fmt
+            and into.size == out.size
+            and not out.options
+            and out.geometry == into.geometry
+        )
+    if isinstance(into, AudioFormat) and isinstance(out, AudioFormat):
+        return into == out and not out.options
+    return False
 
 
 def _codec_of(graph: Graph, members: Sequence[str]) -> str:
@@ -2152,8 +2200,11 @@ class _Partitioner:
         small: Mapping[str, tuple[int, int]] | None = None,
         *,
         coded: Collection[str] = (),
+        decoded: Mapping[str, tuple[str, ...]] | None = None,
     ) -> None:
         self.g = g
+        # The pixel formats each codec package's decoder may write.
+        self.decoded = dict(decoded or {})
         # The modules whose declaration says their region's edges are coded.
         self.coded = frozenset(coded)
         # What each such region decodes and encodes, by its id: the pixel
@@ -2164,6 +2215,12 @@ class _Partitioner:
         # The regions among them whose pictures are held on the GPU, which
         # decode on a device.
         self.decoded_on_device: set[str] = set()
+        # The packet sinks that run in the region writing their stream.
+        self.joined_sinks: set[str] = set()
+        # The codec packages' encoders and decoders that run in a region.
+        self.joined_codecs: set[str] = set()
+        # The setparams lowering put behind each decoder, by the decoder.
+        self.stamped: dict[str, str] = {}
         # The frames each such region's encoders hold back, at most.
         self.encode_delays: dict[str, int] = {}
         # The scales putting a picture only timing inputs read at
@@ -2199,6 +2256,7 @@ class _Partitioner:
             for alias, name in g.node_sources.items()
             if name in self.node_shapes and not self.node_shapes[name].bounded
         )
+        self.g = g = self._host_node_decodes()
         self.order = _topological(g)
         # A hosted node is external whoever asked: only the sidecar runs it.
         self.external = {
@@ -2232,6 +2290,79 @@ class _Partitioner:
         # The rows DOCUMENTS a packet filter reads: files, so they order two
         # stages rather than joining them the way a pipe does.
         self.documents: list[FileEdge] = []
+
+    def _host_node_decodes(self) -> Graph:
+        """The graph with each decode of a node's packets made the sidecar's
+        own ``decode`` where every reader of its pictures is a node holding
+        them on the GPU, or a module declared coded.
+
+        The decode then joins the region of the node writing the packets and
+        of its readers, so the packets never leave the sidecar; elsewhere it
+        stays the ffmpeg ``null`` that decodes them.
+        """
+        readers: dict[str, list[tuple[str, int]]] = {}
+        for name, node in self.g.nodes.items():
+            for position, ref in enumerate(node.inputs):
+                readers.setdefault(ref, []).append((name, position))
+        hosted: dict[str, Node] = {}
+        for name, node in self.g.nodes.items():
+            if node.filter != "null" or len(node.inputs) != 1:
+                continue
+            (read,) = node.inputs
+            producer = _ref_node(read)
+            shape = self.node_shapes.get(producer) if producer is not None else None
+            if shape is None or not self._coded_output(read):
+                continue
+            made = shape.outputs[_ref_pad(read)].format
+            if made is None or made.codec not in DECODABLE:
+                continue
+            found = readers.get(name, [])
+            formats: set[str] = set()
+            on_device = False
+            for reader, position in found:
+                held = self._holds_input_on_the_gpu(reader, position)
+                if held:
+                    on_device = True
+                if not held and self.g.nodes[reader].filter not in self.coded:
+                    break
+                taken = self._taken_pix_fmt(reader, position)
+                if taken is None:
+                    break
+                formats.add(taken)
+            else:
+                if found and len(formats) == 1:
+                    args: dict[str, object] = {"format": formats.pop()}
+                    if on_device:
+                        args["hw"] = "auto"
+                    hosted[name] = replace(node, filter=DECODE, args=args)
+        if not hosted:
+            return self.g
+        return replace(self.g, nodes={**self.g.nodes, **hosted})
+
+    def _holds_input_on_the_gpu(self, name: str, position: int) -> bool:
+        """True when node `name` holds its input at `position` on the GPU."""
+        shape = self.node_shapes.get(name)
+        node = self.g.nodes[name]
+        if shape is None or position >= len(node.ports):
+            return False
+        port = shape.input(node.ports[position])
+        return port is not None and port.accepts.memory == "gpu"
+
+    def _taken_pix_fmt(self, name: str, position: int) -> str | None:
+        """The pixel format node `name` takes its input at `position` in, as
+        the wire carries it, or None where it takes no picture."""
+        shape = self.node_shapes.get(name)
+        node = self.g.nodes[name]
+        if shape is None:
+            return self.pix_fmts.get(node.filter)
+        if position >= len(node.ports):
+            return None
+        port = shape.input(node.ports[position])
+        if port is None or port.kind != "video" or port.accepts.wants == "timing":
+            return None
+        formats = port.accepts.pixel_formats
+        found = next((f for f in formats if f in WIRE_PIX_FMTS), None)
+        return found if found is not None or formats else DEFAULT_PIX_FMT
 
     # -- depths
 
@@ -2636,6 +2767,10 @@ class _Partitioner:
             ]
             if not selected:
                 raise self._unread_source(alias, source)
+            region = self._region_reading_source(readers, direct)
+            if region is not None:
+                self._fold_source(alias, source, selected, readers[0], region)
+                continue
             reader = next((p for p in readers if not self._consumed(p)), None)
             if reader is None and readers:
                 reader = _Pending(
@@ -2686,6 +2821,143 @@ class _Partitioner:
                     assert reader is not None  # a track no sidecar takes has one
                     target = reader.id
                 self._add_edge(sidecar.id, target, track.ref)
+
+    def _region_reading_source(
+        self, readers: Sequence[_Pending], direct: Mapping[FrameRef, str]
+    ) -> SidecarProcess | None:
+        """The region a module source's tracks all go to through one ffmpeg
+        that only copies them, where that region runs as a network of nodes
+        or decodes and encodes itself; None where the source keeps a process
+        of its own.
+
+        Such a source runs in the region, and the ffmpeg goes: the packets
+        never leave the sidecar.
+        """
+        if len(readers) != 1:
+            return None
+        (reader,) = readers
+        if reader.nodes or reader.sinks:
+            return None
+        handed = [e for e in self.edges if e.source == reader.id]
+        targets = {e.target for e in handed} | set(direct.values())
+        if len(targets) != 1:
+            return None
+        (target,) = targets
+        region = next((s for s in self.sidecars if s.id == target), None)
+        if region is None or region.packet_sink or region.packet_filter or region.codec:
+            return None
+        if region.data_filter or region.sink or region.packet_source:
+            return None
+        members = self.members[region.id]
+        hosted = region.node_network or any(
+            self._holds_on_the_gpu(name) or self.g.nodes[name].filter in self.coded
+            for name in members
+        )
+        if not hosted:
+            return None
+        pictures = [e.ref for e in handed if ref_type(self.g, e.ref) != "data"]
+        if not all(self._decodable_read(ref) for ref in pictures):
+            return None
+        return region
+
+    def _decodable_read(self, ref: FrameRef) -> bool:
+        """True when a source's track `ref` is in a codec the sidecar decodes."""
+        meta = self._origin_meta(ref)
+        return meta is not None and meta.codec in DECODABLE
+
+    def _fold_source(
+        self,
+        alias: str,
+        source: ModuleSource,
+        selected: Sequence[tuple[int, SourceTrack]],
+        reader: _Pending,
+        region: SidecarProcess,
+    ) -> None:
+        """Run module source `alias` in `region` as a node of its network,
+        each track it reads an output named by its place in the catalog, and
+        drop the ffmpeg that copied the tracks across.
+
+        A track a member reads as pictures is decoded in the region on the
+        way, onto the device where the reader holds its pictures there.
+        """
+        name = f"{alias}_source"
+        made = Node(
+            id=name,
+            filter=source.module,
+            args=json.loads(source.params) if source.params else {},
+            inputs=[],
+            outputs=[track.kind for _, track in selected],
+            out_ports=[f"track{index}" for index, _ in selected],
+        )
+        out_of = {track.ref: f"{name}:{slot}" for slot, (_, track) in enumerate(selected)}
+        members = self.members[region.id]
+        nodes = {**self.g.nodes, name: made}
+        added = [name]
+        decoded: dict[tuple[FrameRef, str], str] = {}
+        for member in members:
+            node = nodes[member]
+            inputs = list(node.inputs)
+            for position, ref in enumerate(node.inputs):
+                if ref not in out_of:
+                    continue
+                read = out_of[ref]
+                taken = self._taken_pix_fmt(member, position)
+                if ref_type(self.g, ref) == "video" and taken is not None and not (
+                    self._takes_packets(member, position)
+                ):
+                    key = (ref, taken)
+                    if key not in decoded:
+                        decoded[key] = f"{name}_{len(decoded)}_decode"
+                        args: dict[str, object] = {"format": taken}
+                        if self._holds_input_on_the_gpu(member, position):
+                            args["hw"] = "auto"
+                        nodes[decoded[key]] = Node(
+                            id=decoded[key],
+                            filter=DECODE,
+                            args=args,
+                            inputs=[read],
+                            outputs=["video"],
+                        )
+                        added.append(decoded[key])
+                    read = decoded[key]
+                inputs[position] = read
+            nodes[member] = replace(node, inputs=inputs)
+        self.g = replace(self.g, nodes=nodes)
+        for one in added:
+            self.external[one] = True
+            self.depth[one] = 0
+            self.sidecar_of[one] = region.id
+        self.order = [*added, *self.order]
+        self.members[region.id] = [*added, *members]
+        self.pending.remove(reader)
+        self.consumer_of.pop(reader.id, None)
+        self.edges = [e for e in self.edges if reader.id not in (e.source, e.target)]
+        grants = tuple(
+            EffectGrant(effect=effect, module=source.module)
+            for effect in self.effects.get(source.module, ())
+        )
+        index = self.sidecars.index(region)
+        self.sidecars[index] = replace(
+            region,
+            inputs=tuple(ref for ref in region.inputs if ref not in out_of),
+            modules=_bindings(
+                [source.module, *(binding.path for binding in region.modules)]
+            ),
+            grants=(*grants, *region.grants),
+            node_network=True,
+        )
+
+    def _takes_packets(self, name: str, position: int) -> bool:
+        """True when node `name` takes its input at `position` as packets: a
+        node's packets port, or a packet sink or filter."""
+        if name in self.g.packet_sinks or name in self.g.packet_filters:
+            return True
+        shape = self.node_shapes.get(name)
+        node = self.g.nodes[name]
+        if shape is None or position >= len(node.ports):
+            return False
+        port = shape.input(node.ports[position])
+        return port is not None and port.kind == "packets"
 
     def _source_data_to_sidecars(self, alias: str) -> dict[FrameRef, str]:
         """The data tracks of source `alias` a sidecar takes straight off it.
@@ -2975,7 +3247,152 @@ class _Partitioner:
                     and join(name, written)
                 ):
                     merged = True
+        for name in self.order:
+            if name not in self.g.packet_sinks or groups.get(home.get(name, "")) != [name]:
+                continue
+            producer = _ref_node(self.g.nodes[name].inputs[0])
+            if producer is None or producer not in home or producer in alone:
+                continue
+            group = groups[home[producer]]
+            if self._sink_encoding(name, group) is None:
+                continue
+            groups.pop(name)
+            group.append(name)
+            home[name] = home[producer]
+            self.joined_sinks.add(name)
+        for name in self.order:
+            if name not in self.g.encoders and name not in self.g.decoders:
+                continue
+            if groups.get(home.get(name, "")) != [name]:
+                continue
+            neighbour = self._codec_neighbour(name, consumers)
+            if neighbour is None or neighbour not in home or neighbour in alone:
+                continue
+            rep = home[neighbour]
+            if not self._hosts_codec(groups[rep]) or not self._encoder_fed(name):
+                continue
+            if name in self.g.decoders and self._decoded_for(name, neighbour) is None:
+                continue
+            groups.pop(name)
+            wanted = {*groups[rep], name, *([self.stamped[name]] if name in self.stamped else [])}
+            groups[rep] = [n for n in self.order if n in wanted]
+            home[name] = rep
+            self.joined_codecs.add(name)
         return [groups[name] for name in self.order if name in groups]
+
+    def _codec_neighbour(
+        self, name: str, consumers: Mapping[str, list[str] | None]
+    ) -> str | None:
+        """The node a codec package's encoder or decoder runs beside: what an
+        encoder codes the output of, or the one node reading a decoder's
+        pictures."""
+        if name in self.g.encoders:
+            return _ref_node(self.g.nodes[name].inputs[0])
+        reads = consumers.get(name)
+        if reads is None or len(reads) != 1:
+            return None
+        (reader,) = reads
+        if self.g.nodes[reader].filter == "setparams" and not self.external[reader]:
+            # The colour lowering stamps on its pictures, which the decoder is
+            # told in a network instead.
+            after = consumers.get(reader)
+            if after is None or len(after) != 1:
+                return None
+            self.stamped[name] = reader
+            return after[0]
+        return reader
+
+    def _encoder_fed(self, name: str) -> bool:
+        """True unless `name` is an encoder whose pictures would reach it in
+        a format it does not read from host memory: a network converts a
+        picture only where it is held on the GPU."""
+        if name not in self.g.encoders or ref_type(self.g, name) != "video":
+            return True
+        wanted = self.g.codec_formats.get(name, {}).get("pix_fmt")
+        read = self.g.nodes[name].inputs[0]
+        producer = _ref_node(read)
+        shape = self.node_shapes.get(producer) if producer is not None else None
+        if shape is not None:
+            output = shape.outputs[_ref_pad(read)]
+            if output.memory == "gpu":
+                return True
+        if wanted is None:
+            return True
+        written = self._format(read)
+        return isinstance(written, VideoFormat) and written.pix_fmt == wanted
+
+    def _decoded_for(self, name: str, reader: str) -> str | None:
+        """How decoder `name`'s pictures reach `reader` in a network: the
+        format they are made on the device where the reader holds them
+        there, empty where the reader takes every format the decoder writes,
+        or None where it cannot be handed them."""
+        read = self.stamped.get(name, name)
+        node = self.g.nodes[reader]
+        if read not in node.inputs:
+            return None
+        position = node.inputs.index(read)
+        taken = self._taken_pix_fmt(reader, position)
+        if taken is None:
+            return None
+        if self._holds_input_on_the_gpu(reader, position):
+            return taken
+        written = self.decoded.get(self.g.nodes[name].filter, ())
+        shape = self.node_shapes.get(reader)
+        port = shape.input(node.ports[position]) if shape is not None else None
+        accepted = port.accepts.pixel_formats if port is not None else (taken,)
+        if written and all(one in accepted for one in written):
+            return ""
+        return None
+
+    def _hosts_codec(self, region: Sequence[str]) -> bool:
+        """True when `region` runs as a network of nodes, which hosts a codec
+        package's encoder and decoder: it holds a node, a picture on the GPU,
+        or a module declared coded."""
+        return any(
+            name in self.node_shapes
+            or self._holds_on_the_gpu(name)
+            or self.g.nodes[name].filter in self.coded
+            for name in region
+        )
+
+    def _sink_encoding(self, name: str, region: Sequence[str]) -> dict[str, object] | None:
+        """How the packet sink `name` is handed its stream inside `region`:
+        the `encode` arguments where the region encodes the picture, empty
+        where the stream is a node's packets copied as they are, or None
+        where the sink keeps a process of its own.
+
+        A sink reading one stream joins the region writing it when that
+        stream reaches it as packets the region holds: a node's own packets
+        the sink copies, or a picture the region holds on the GPU or was
+        declared coded for, encoded by an encoder the sidecar hosts with
+        every option the sink's pad names. A sink reading several streams
+        keeps its process: a ladder shapes each of its pads with an encoder
+        of its own, and a sound's encoder is ffmpeg's.
+        """
+        node = self.g.nodes[name]
+        if len(node.inputs) != 1:
+            return None
+        (read,) = node.inputs
+        kind = ref_type(self.g, read)
+        pad = dict(self.g.packet_sinks[name][0])
+        codec = pad.pop(f"{kind}_codec", None)
+        if self._coded_output(read):
+            return {} if codec == COPY_CODEC else None
+        if kind != "video" or not isinstance(codec, str) or codec not in HOSTED_ENCODERS:
+            return None
+        if not any(
+            self._holds_on_the_gpu(member) or self.g.nodes[member].filter in self.coded
+            for member in region
+        ):
+            return None
+        args: dict[str, object] = {"codec": codec}
+        for option, value in pad.items():
+            if option in ("row", "rendition") or option in _COPY_KEEPS:
+                continue
+            if option not in ENCODE_OPTIONS or not isinstance(value, str | int | float):
+                return None
+            args[ENCODE_OPTIONS[option]] = value
+        return args
 
     def _joins_its_readers(
         self,
@@ -4021,6 +4438,9 @@ class _Partitioner:
                 if self.external[name] and not self.g.nodes[name].rows_only
             )
             entry = self.g.nodes[first]
+            # A codec package's half runs alone, told by flags what it codes;
+            # in a network it reads that off the stream.
+            alone = [name for name in members if name not in self.joined_codecs]
             bindings = _bindings(
                 self.g.nodes[name].filter
                 for name in members
@@ -4041,19 +4461,33 @@ class _Partitioner:
                 lookahead=self._lookahead(members),
                 rows=self._region_rows(members, bindings),
                 impure=self._region_impure(members),
-                sink=any(name in self.g.module_sinks for name in members),
-                packet_sink=any(name in self.g.packet_sinks for name in members),
+                sink=any(
+                    name in self.g.module_sinks and name not in self.joined_sinks
+                    for name in members
+                ),
+                packet_sink=any(
+                    name in self.g.packet_sinks and name not in self.joined_sinks
+                    for name in members
+                ),
                 packet_filter=any(name in self.g.packet_filters for name in members),
                 data_filter=any(name in self.g.data_filters for name in members),
-                codec=_codec_of(self.g, members),
-                frame_rate=self._encoder_frame_rate(members),
-                color=self._codec_color(members),
+                codec=_codec_of(self.g, alone),
+                frame_rate=self._encoder_frame_rate(alone),
+                color=self._codec_color(alone),
                 rows_in=self._region_rows_in(members),
                 pads=self._region_pad_meta(members),
-                node_network=any(name in self.node_shapes for name in members),
+                node_network=any(
+                    name in self.node_shapes
+                    or name in self.joined_sinks
+                    or name in self.joined_codecs
+                    for name in members
+                ),
+                call_pads=self._joined_pads(members),
+                call_codecs=self._joined_codecs_told(members),
             )
             self.sidecars.append(sidecar)
             self.members[sidecar.id] = list(members)
+            self._encode_for_joined_sinks(sidecar.id, members)
             for name in members:
                 self.sidecar_of[name] = sidecar.id
         self._check_rows_reach()
@@ -4189,6 +4623,7 @@ class _Partitioner:
         self._place_module_sources()
         self._redirect_live_reads()
         self._code_edges()
+        self._drop_copying_ffmpegs()
         self._add_rows_edges()
         self._add_rows_documents()
         self._bundle_node_edges()
@@ -4232,8 +4667,10 @@ class _Partitioner:
         stays raw.
         """
         for sidecar in self.sidecars:
-            on_the_gpu = self._holds_on_the_gpu(sidecar.node)
-            if sidecar.module not in self.coded and not on_the_gpu:
+            members = self.members[sidecar.id]
+            on_the_gpu = any(self._holds_on_the_gpu(name) for name in members)
+            coded = any(self.g.nodes[name].filter in self.coded for name in members)
+            if not coded and not on_the_gpu:
                 continue
             if sidecar.sink or sidecar.packet_sink or sidecar.packet_filter:
                 continue
@@ -4267,6 +4704,44 @@ class _Partitioner:
                     self.encode_delays.get(sidecar.id, 0), held
                 )
                 self.edges[index] = replace(edge, format=replace(wire, codec=COPY_CODEC))
+
+    def _drop_copying_ffmpegs(self) -> None:
+        """Wire two sidecars to each other where the ffmpeg between them only
+        copies what one writes to the other.
+
+        Such an ffmpeg runs no filter, opens no file and writes none, and each
+        stream it reads off a sidecar leaves it, as it came, to one sidecar:
+        packets copied, or a raw picture handed on in the format it arrived
+        in. The sidecar reading it takes the NUT the other wrote.
+        """
+        sidecars = {sidecar.id for sidecar in self.sidecars}
+        for process in list(self.pending):
+            if process.nodes or process.sinks or process.id in self.feeding.values():
+                continue
+            incoming = [e for e in self.edges if e.target == process.id]
+            outgoing = [e for e in self.edges if e.source == process.id]
+            if not incoming or not outgoing:
+                continue
+            if any(e.source not in sidecars for e in incoming):
+                continue
+            if any(e.target not in sidecars for e in outgoing):
+                continue
+            pairs: list[tuple[StreamEdge, StreamEdge]] = []
+            for edge in outgoing:
+                into = [e for e in incoming if e.ref == edge.ref]
+                if len(into) != 1 or not _passes_through(into[0].format, edge.format):
+                    break
+                pairs.append((into[0], edge))
+            else:
+                if len(pairs) != len(incoming):
+                    continue
+                for read, written in pairs:
+                    self.edges[self.edges.index(read)] = replace(
+                        written, source=read.source, annotations=read.annotations
+                    )
+                    self.edges.remove(written)
+                self.pending.remove(process)
+                self.consumer_of.pop(process.id, None)
 
     def _holds_on_the_gpu(self, name: str) -> bool:
         """True when node `name`'s shape holds an input on the GPU, or it is
@@ -4572,13 +5047,68 @@ class _Partitioner:
         door.
         """
         for table in (self.g.packet_sinks, self.g.packet_filters):
-            name = next((n for n in members if n in table), None)
+            name = next((n for n in members if n in table and n not in self.joined_sinks), None)
             if name is not None:
                 return tuple(
                     PadMeta.from_dict(pad) if "row" in pad else None
                     for pad in table[name]
                 )
         return ()
+
+    def _joined_pads(self, members: Sequence[str]) -> tuple[tuple[str, tuple[PadMeta, ...]], ...]:
+        """The pad metadata of each packet sink this region holds beside the
+        nodes writing its stream, by the sink's node, where its pads carry
+        any: a ``-pad`` names an ``-i``, and such a sink's pads are none."""
+        return tuple(
+            (name, tuple(PadMeta.from_dict(pad) for pad in self.g.packet_sinks[name]))
+            for name in members
+            if name in self.joined_sinks
+            and all("row" in pad for pad in self.g.packet_sinks[name])
+        )
+
+    def _joined_codecs_told(
+        self, members: Sequence[str]
+    ) -> tuple[tuple[str, tuple[tuple[str, str], ...]], ...]:
+        """What each codec package's encoder or decoder in a network is told
+        of its stream, where the query settles any, by its node: the
+        colorimetry flags it is given running alone, and the pixel format an
+        encoder reads."""
+        found = []
+        for name in members:
+            if name in self.joined_codecs:
+                said = self._codec_color([name])
+                pix_fmt = self.g.codec_formats.get(name, {}).get("pix_fmt")
+                if name in self.g.decoders:
+                    pix_fmt = self._decoded_for(name, self._decoder_reader(name)) or None
+                if pix_fmt is not None:
+                    said = (*said, ("pix_fmt", pix_fmt))
+                if said:
+                    found.append((name, said))
+        return tuple(found)
+
+    def _decoder_reader(self, name: str) -> str:
+        """The one node reading decoder `name`'s pictures."""
+        read = self.stamped.get(name, name)
+        return next(n for n, node in self.g.nodes.items() if read in node.inputs)
+
+    def _encode_for_joined_sinks(self, region: str, members: Sequence[str]) -> None:
+        """An `encode` in `region` for each picture a packet sink it holds
+        reads raw, with the frames that encoder holds back."""
+        for name in members:
+            if name not in self.joined_sinks:
+                continue
+            args = self._sink_encoding(name, members)
+            if not args:
+                continue
+            (read,) = self.g.nodes[name].inputs
+            self.encodes.setdefault(region, {})[read] = args
+            meta = self._origin_meta(read)
+            held = encoder_delay(
+                str(args["codec"]),
+                self.g.packet_sinks[name][0],
+                meta.height if meta is not None else None,
+            )
+            self.encode_delays[region] = max(self.encode_delays.get(region, 0), held)
 
     def _region_rows_in(self, members: Sequence[str]) -> tuple[RowsRead, ...]:
         """The rows documents this region's packet filter reads, in order.
@@ -5654,6 +6184,10 @@ class _Partitioner:
                 # No pad, so nothing for the filtergraph to wire: a rows
                 # module is named by its own ``-m`` and its ``-rows-from``.
                 continue
+            if name in self.joined_sinks and name not in self.node_shapes:
+                # An older packet sink in a network: its rows leave as a
+                # node's do.
+                node = replace(node, outputs=["data"], out_ports=[_EMITTED_ROWS])
             if not self.external[name]:
                 # An absorbed split: its readers take its own input instead.
                 source = rewrite(node.inputs[0])
@@ -5706,7 +6240,9 @@ class _Partitioner:
                     outputs=[
                         Output(
                             ref=rows_node,
-                            type=ref_type(self.g, rows_node),
+                            type="data"
+                            if rows_node in self.joined_sinks
+                            else ref_type(self.g, rows_node),
                             name=None,
                             metadata={},
                         )
@@ -5719,6 +6255,8 @@ class _Partitioner:
         for name in members:
             if name not in self.g.module_sinks or name in self.node_shapes:
                 continue  # a node sink makes no output but the rows it emits
+            if name in self.joined_sinks:
+                continue  # nor does a packet sink in a network
             sinks.append(
                 SinkUnit(
                     outputs=[
@@ -5747,7 +6285,7 @@ class _Partitioner:
             rows_modules=self._rows_modules(sidecar, members),
             lookahead=sidecar.lookahead + self.encode_delays.get(sidecar.id, 0),
             av=bool(self.decodes.get(sidecar.id) or self.encodes.get(sidecar.id))
-            or any(node.filter == DEVICE_FILTER for node in nodes.values()),
+            or any(node.filter in (DEVICE_FILTER, DECODE, ENCODE) for node in nodes.values()),
             graph=Graph(
                 input_paths=[PIPE] * len(read_order),
                 sources={alias: index for index, alias in enumerate(read_order)},
@@ -5810,6 +6348,11 @@ class _Partitioner:
                 outputs=["video"],
             )
             encoded[ref] = name
+            # A packet sink of the region reads the encoder's packets, after it.
+            for member, node in list(made.items()):
+                if member in self.joined_sinks and node.inputs == [rewrite(ref)]:
+                    del made[member]
+                    made[member] = replace(node, inputs=[name])
         return made, encoded
 
     def _region_colors(
@@ -6123,6 +6666,7 @@ def partition(
     effects: Mapping[str, tuple[str, ...]] | None = None,
     anchors: Mapping[str, tuple[int, int]] | None = None,
     coded: Collection[str] = (),
+    decoded: Mapping[str, tuple[str, ...]] | None = None,
 ) -> ProcessPlan:
     """Partition a logical graph into the processes that run it.
 
@@ -6166,6 +6710,10 @@ def partition(
     packets and writes a file's picture encoded, where it can
     (:meth:`_Partitioner._code_edges`).
 
+    `decoded` is keyed by a codec package's module and is the pixel formats
+    its decoder may write: what decides whether a region can hand its
+    pictures to the node reading them.
+
     Raises ``FfrwdError`` -- unanchored, for the caller to re-anchor on the
     declaration -- for a multi-input module whose streams cannot pair up, and
     ``UNBOUNDED_LIVE_INPUT`` -- already anchored, from `anchors` -- for a live
@@ -6183,14 +6731,14 @@ def partition(
 
     partitioner = _Partitioner(
         g, external, probes, pix_fmts, shapes, audio_wires, models, effects, anchors,
-        coded=coded,
+        coded=coded, decoded=decoded,
     )
     reads = partitioner.timing_reads()
     if reads:
         shrunk, small = partitioner.shrunk(reads)
         partitioner = _Partitioner(
             shrunk, external, probes, pix_fmts, shapes, audio_wires, models, effects, anchors,
-            small, coded=coded,
+            small, coded=coded, decoded=decoded,
         )
     plan = partitioner.run()
     plan = startup.arrange(plan)

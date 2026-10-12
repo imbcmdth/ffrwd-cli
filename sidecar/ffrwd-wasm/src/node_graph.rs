@@ -24,8 +24,9 @@ use ffrwd_wasm_runtime::runtime::{
     TimeBase, VideoFormat, Wants, WitNode,
 };
 
-use crate::adapters::FilterNode;
+use crate::adapters::{FilterNode, PacketSinkNode, PacketSourceNode};
 use crate::av_nodes::{self, AvFilter, Decode, Encode};
+use crate::codec_nodes::{DecoderNode, EncoderNode};
 use crate::edges::{self, Target};
 use crate::feeds::{self, FeedMember, FeedSpec};
 use crate::graph::{self, NodeCall, NodePad, StreamClass, StreamRef, ROWS_PORT};
@@ -45,6 +46,22 @@ pub fn is_node_network(bindings: &[Binding]) -> Result<bool> {
         if runtime::exports_node(&binding.path)
             .with_context(|| format!("opening module {}", binding.path))?
         {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Whether a network binds a module only a network of nodes hosts beside
+/// others: a packet source or sink, or a codec package's encoder or decoder.
+pub fn binds_packet_modules(bindings: &[Binding]) -> Result<bool> {
+    for binding in bindings {
+        let path = binding.path.as_str();
+        let hosted = runtime::exports_packet_source(path)?
+            || runtime::exports_packet_sink(path)?
+            || runtime::exports_encoder(path)?
+            || runtime::exports_decoder(path)?;
+        if hosted {
             return Ok(true);
         }
     }
@@ -123,15 +140,7 @@ fn input_stream(
         match crate::format_from_stream(stream)?.media {
             Media::Video(mut v) => {
                 if let Some(c) = pad.and_then(|p| p.color.as_ref()) {
-                    v.color = Some(runtime::ColorInfo {
-                        range: crate::codec::parse_color_name("-pad color.range", &c.range)?,
-                        primaries: crate::codec::parse_color_name(
-                            "-pad color.primaries",
-                            &c.primaries,
-                        )?,
-                        trc: crate::codec::parse_color_name("-pad color.trc", &c.trc)?,
-                        space: crate::codec::parse_color_name("-pad color.space", &c.space)?,
-                    });
+                    v.color = Some(pad_color(c)?);
                 }
                 StreamFormat::Video(v)
             }
@@ -147,6 +156,13 @@ fn input_stream(
             rendition.clone(),
         )?;
         StreamFormat::Packets(coded.stream)
+    } else if matches!(
+        stream.media,
+        nut::Media::Video { .. } | nut::Media::Audio { .. }
+    ) {
+        // A tag the wire has no name for: a codec package's, which only its
+        // decoder reads.
+        StreamFormat::Packets(crate::codec::coded_input(stream)?)
     } else {
         bail!(
             "{spelling} carries codec tag {}, which no node reads",
@@ -182,6 +198,16 @@ fn input_stream(
     })
 }
 
+/// A `-pad` colour as the host's.
+fn pad_color(c: &crate::PadColor) -> Result<runtime::ColorInfo> {
+    Ok(runtime::ColorInfo {
+        range: crate::codec::parse_color_name("-pad color.range", &c.range)?,
+        primaries: crate::codec::parse_color_name("-pad color.primaries", &c.primaries)?,
+        trc: crate::codec::parse_color_name("-pad color.trc", &c.trc)?,
+        space: crate::codec::parse_color_name("-pad color.space", &c.space)?,
+    })
+}
+
 /// `def` with the size `-pad` gives its pictures, where the wire carries them
 /// at another: a node reads the stream's own size, and each frame is checked
 /// against the wire's.
@@ -214,6 +240,9 @@ fn class_of(format: &StreamFormat) -> StreamClass {
 enum Kind {
     Module { path: String },
     OldFilter { path: String },
+    PacketSink { path: String },
+    PacketSource { path: String },
+    Codec { path: String },
     Host,
     Leaky,
     Av,
@@ -521,6 +550,11 @@ fn open(
             args.node_params
                 .iter()
                 .map(|(name, files)| ("-params-from", name, files.len())),
+        )
+        .chain(
+            args.call_pads
+                .iter()
+                .map(|(name, lists)| ("-pads", name, lists.len())),
         );
     for (flag, name, count) in given {
         let called = calls.iter().filter(|c| &c.module == name).count();
@@ -553,10 +587,21 @@ fn open(
                     path: path.to_string(),
                 }
             }
+            Some(path) if runtime::exports_packet_sink(path)? => Kind::PacketSink {
+                path: path.to_string(),
+            },
+            Some(path) if runtime::exports_packet_source(path)? => Kind::PacketSource {
+                path: path.to_string(),
+            },
+            Some(path) if runtime::exports_encoder(path)? || runtime::exports_decoder(path)? => {
+                Kind::Codec {
+                    path: path.to_string(),
+                }
+            }
             Some(path) => bail!(
                 "{}: {path} is a module of an older world that rides alone; a network of node \
-                 modules hosts node modules, frame modules and the host's rowfilter, \
-                 rowmerge, leaky, decode, encode and filter",
+                 modules hosts node modules, frame modules, packet sinks and the host's \
+                 rowfilter, rowmerge, leaky, decode, encode and filter",
                 call.module
             ),
             None if host_nodes::is_host_node(&call.module) => Kind::Host,
@@ -565,6 +610,10 @@ fn open(
             None => bail!("-filter_complex names '{}', which no -m binds", call.module),
         };
 
+        let told = args
+            .call_pads
+            .get(&call.module)
+            .and_then(|lists| lists.get(turn(calls, index)));
         let mut pads: Vec<(String, u32)> = Vec::with_capacity(call.inputs.len());
         for (position, (port, pad)) in call.inputs.iter().enumerate() {
             let mut id = match pad {
@@ -589,14 +638,38 @@ fn open(
                     call.module
                 ),
                 (Kind::Host, None) => "in".to_string(),
-                (Kind::OldFilter { .. } | Kind::Leaky | Kind::Av, None) => {
-                    format!("in{position}")
-                }
+                (
+                    Kind::OldFilter { .. }
+                    | Kind::PacketSink { .. }
+                    | Kind::PacketSource { .. }
+                    | Kind::Codec { .. }
+                    | Kind::Leaky
+                    | Kind::Av,
+                    None,
+                ) => format!("in{position}"),
             };
             if matches!(kind, Kind::Module { .. }) && pads.iter().any(|(_, bound)| *bound == id) {
                 let mirror = streams.len() as u32;
                 streams.push(streams[id as usize].clone());
                 mirrors.entry(id).or_default().push(mirror);
+                id = mirror;
+            }
+            // A packet sink's pad reads a label, which no -pad names: -pads
+            // gives its row and rendition, on a copy of the stream of its own.
+            let sink = matches!(kind, Kind::Module { .. } | Kind::PacketSink { .. });
+            if let Some(spec) = told.filter(|_| sink).and_then(|list| list.get(position)) {
+                let mirror = streams.len() as u32;
+                let mut def = streams[id as usize].clone();
+                def.row = Some(spec.row.unwrap_or(position as u32));
+                def.rendition = spec.rendition.clone().into();
+                if let (Some(c), StreamFormat::Video(video)) = (&spec.color, &mut def.format) {
+                    video.color = Some(pad_color(c)?);
+                }
+                streams.push(def);
+                mirrors.entry(id).or_default().push(mirror);
+                if held_on_gpu.contains(&id) {
+                    held_on_gpu.insert(mirror);
+                }
                 id = mirror;
             }
             pads.push((port, id));
@@ -607,6 +680,29 @@ fn open(
                 open_module(args, &call.module, path, calls, index, &pads, &mut streams)?
             }
             Kind::OldFilter { path } => open_old_filter(&call.module, path, call, &pads, &streams)?,
+            Kind::PacketSink { path } => {
+                let params = given_params(args, calls, index);
+                open_packet_sink(&call.module, path, call, params, &pads, &streams)?
+            }
+            Kind::PacketSource { path } => {
+                let params = given_params(args, calls, index);
+                open_packet_source(&call.module, path, call, params, &pads)?
+            }
+            Kind::Codec { path } => {
+                let params = given_params(args, calls, index);
+                let held = pads.iter().any(|(_, id)| held_on_gpu.contains(id));
+                let spec = told.and_then(|list| list.first());
+                open_codec(
+                    &call.module,
+                    path,
+                    call,
+                    params,
+                    &pads,
+                    &streams,
+                    spec,
+                    held,
+                )?
+            }
             Kind::Host => open_host(call, &pads, &streams)?,
             Kind::Leaky => open_leaky(call, &pads, &streams)?,
             Kind::Av => {
@@ -813,7 +909,12 @@ fn open(
             }
         }
     }
-    let read: HashSet<u32> = consumers.keys().copied().collect();
+    let mut read: HashSet<u32> = consumers.keys().copied().collect();
+    for (original, copies) in &mirrors {
+        if copies.iter().any(|copy| read.contains(copy)) {
+            read.insert(*original);
+        }
+    }
     for spec in &mut lanes {
         for port in spec.ports.iter_mut() {
             if port.is_some_and(|p| !read.contains(&p.stream)) {
@@ -2115,6 +2216,292 @@ fn open_old_filter(
             unbuffered: false,
         },
         outputs,
+        feeds: Vec::new(),
+    })
+}
+
+/// A packet sink of an older world: the coded streams its pads bind, by
+/// position, whatever arrived on each at least every fiftieth of a second,
+/// as when it rides alone; its rows leave on `@rows`.
+fn open_packet_sink(
+    name: &str,
+    path: &str,
+    call: &NodeCall,
+    given: Option<String>,
+    pads: &[(String, u32)],
+    defs: &[StreamDef],
+) -> Result<Opening> {
+    if pads.is_empty() {
+        bail!("{name} reads no stream; a packet sink reads at least one");
+    }
+    let params = match given {
+        Some(params) => params,
+        None => {
+            let described = runtime::describe_packet_sink(path)
+                .with_context(|| format!("describing module '{name}'"))?;
+            let schema = parse_schema(&described.meta.params_schema, name)?;
+            params_json(name, &schema, &call.options)?
+        }
+    };
+    let mut bound = Vec::with_capacity(pads.len());
+    for (position, (_, id)) in pads.iter().enumerate() {
+        let def = &defs[*id as usize];
+        let port = match &def.format {
+            StreamFormat::Packets(coded) => coded.format.kind(),
+            StreamFormat::Data(_) => "data",
+            other => bail!(
+                "{name} is a packet sink and reads coded packets; {} is {}",
+                def.spelling,
+                other.kind().name()
+            ),
+        };
+        let mut stream = bound_stream(port, *id, def, StreamHint::default());
+        stream.row = Some(def.row.unwrap_or(position as u32));
+        bound.push(stream);
+    }
+    let node = PacketSinkNode::open(path, &bound, &params)
+        .with_context(|| format!("opening module '{name}' from {path}"))?;
+    let shape = node.shape().clone();
+    let tick = tick_base(&shape, &bound)?;
+    let assembler = Assembler::new(&shape, &bound, name, &[])?;
+    Ok(Opening {
+        spec: LaneSpec {
+            gpu: HashMap::new(),
+            name: name.to_string(),
+            state: Vec::new(),
+            bound: bound.iter().map(|b| b.id).collect(),
+            ports: Vec::new(),
+            shape,
+            intake: Intake::Assembled(Box::new(assembler)),
+            tick_base: tick,
+            runners: vec![Box::new(node)],
+            opener: None,
+            rows: None,
+            unbuffered: false,
+        },
+        outputs: Vec::new(),
+        feeds: Vec::new(),
+    })
+}
+
+/// A packet source of an older world: the catalog tracks its outputs name,
+/// `[track<N>=<label>]` with N the track's number in the catalog, pulled one
+/// call at a time as when it rides alone. It is pulled until every track's
+/// decode delay is known before the network starts, since each output's
+/// header carries it.
+fn open_packet_source(
+    name: &str,
+    path: &str,
+    call: &NodeCall,
+    given: Option<String>,
+    pads: &[(String, u32)],
+) -> Result<Opening> {
+    if !pads.is_empty() {
+        bail!(
+            "{name} is a packet source and reads no stream; this chain wires {}",
+            pads.len()
+        );
+    }
+    let mut tracks = Vec::with_capacity(call.outputs.len());
+    for (port, label) in &call.outputs {
+        let track = port
+            .as_deref()
+            .and_then(|port| port.strip_prefix("track"))
+            .and_then(|n| n.parse::<u32>().ok());
+        let Some(track) = track else {
+            bail!(
+                "{name} writes [{label}] by no track; a packet source names each output by its \
+                 catalog track, as [track0={label}]"
+            );
+        };
+        tracks.push(track);
+    }
+    if tracks.is_empty() {
+        bail!("{name} is a packet source and this chain writes none of its tracks");
+    }
+    let params = match given {
+        Some(params) => params,
+        None => {
+            let described = runtime::describe_packet_source(path)
+                .with_context(|| format!("describing module '{name}'"))?;
+            let schema = parse_schema(&described.meta.params_schema, name)?;
+            params_json(name, &schema, &call.options)?
+        }
+    };
+    let mut node = PacketSourceNode::open(path, &params, &tracks)
+        .with_context(|| format!("opening module '{name}' from {path}"))?
+        .named_by_catalog(&tracks);
+    node.settle()
+        .with_context(|| format!("{name}: pulling until each track's decode delay is known"))?;
+    let mut outputs = Vec::with_capacity(tracks.len());
+    for (slot, track) in node.catalog().tracks.iter().enumerate() {
+        let delay = node.decode_delay(slot).unwrap_or(0);
+        let header = crate::coded_stream_for(&track.stream, u64::from(delay))?;
+        let format = if track.stream.format == runtime::CodedFormat::Data {
+            StreamFormat::Data(track.stream.codec.clone())
+        } else {
+            StreamFormat::Packets(track.stream.clone())
+        };
+        outputs.push(Some(StreamDef {
+            format,
+            base: track.stream.time_base,
+            info: track.info.clone(),
+            decode_delay: delay,
+            latency: Some(0.0),
+            frame_rate: header.frame_rate,
+            header: Some(header),
+            wire: None,
+            spelling: String::new(),
+            rendition: track.rendition.clone(),
+            row: Some(track.row),
+        }));
+    }
+    let shape = node.shape().clone();
+    let tick = tick_base(&shape, &[])?;
+    let assembler = Assembler::new(&shape, &[], name, &[])?;
+    Ok(Opening {
+        spec: LaneSpec {
+            gpu: HashMap::new(),
+            name: name.to_string(),
+            state: Vec::new(),
+            bound: Vec::new(),
+            ports: vec![None; shape.outputs.len()],
+            shape,
+            intake: Intake::Assembled(Box::new(assembler)),
+            tick_base: tick,
+            runners: vec![Box::new(node)],
+            opener: None,
+            rows: None,
+            unbuffered: false,
+        },
+        outputs,
+        feeds: Vec::new(),
+    })
+}
+
+/// A codec package's encoder or decoder on its one pad: raw frames are
+/// encoded and coded packets decoded. `pix_fmt` is the format the encoder
+/// reads, where the query settled one, and `held` says its frames arrive
+/// held on the GPU.
+#[allow(clippy::too_many_arguments)]
+fn open_codec(
+    name: &str,
+    path: &str,
+    call: &NodeCall,
+    given: Option<String>,
+    pads: &[(String, u32)],
+    defs: &[StreamDef],
+    told: Option<&crate::PadSpec>,
+    held: bool,
+) -> Result<Opening> {
+    let pix_fmt = told.and_then(|spec| spec.pix_fmt.clone());
+    let told_color = told
+        .and_then(|spec| spec.color.as_ref())
+        .map(pad_color)
+        .transpose()?;
+    let [(port, id)] = pads else {
+        bail!(
+            "{name} is a codec and reads one stream, and this chain wires {}",
+            pads.len()
+        );
+    };
+    let def = &defs[*id as usize];
+    let decodes = matches!(def.format, StreamFormat::Packets(_));
+    let params = match given {
+        Some(params) => params,
+        None => {
+            let meta = if decodes {
+                runtime::describe_decoder(path).map(|d| d.meta)
+            } else {
+                runtime::describe_encoder(path).map(|d| d.meta)
+            }
+            .with_context(|| format!("describing module '{name}'"))?;
+            let schema = parse_schema(&meta.params_schema, name)?;
+            params_json(name, &schema, &call.options)?
+        }
+    };
+    let header = match &def.header {
+        Some(header) => header.clone(),
+        None => header_for(def)?,
+    };
+    let (node, output): (Box<dyn Node>, StreamDef) = if decodes {
+        let color = told_color.or(match &def.format {
+            StreamFormat::Packets(coded) => match &coded.format {
+                runtime::CodedFormat::Video { color, .. } => *color,
+                _ => None,
+            },
+            _ => None,
+        });
+        let node = DecoderNode::open(path, &params, &header, &def.info, color, pix_fmt.as_deref())
+            .with_context(|| format!("opening module '{name}' from {path}"))?;
+        let format = node.format();
+        let output = StreamDef {
+            info: info_for(&format),
+            format,
+            base: node.time_base(),
+            decode_delay: 0,
+            latency: Some(def.latency.unwrap_or(0.0)),
+            header: Some(node.header().clone()),
+            wire: None,
+            frame_rate: def.frame_rate,
+            spelling: String::new(),
+            rendition: RenditionMeta::default(),
+            row: None,
+        };
+        (Box::new(node), output)
+    } else {
+        let mut raw = def.format.clone();
+        if let (Some(color), StreamFormat::Video(video)) = (told_color, &mut raw) {
+            video.color = Some(color);
+        }
+        let node = EncoderNode::open(
+            path,
+            &params,
+            &raw,
+            &def.info,
+            def.base,
+            def.frame_rate,
+            &header,
+            pix_fmt.as_deref(),
+            held,
+        )
+        .with_context(|| format!("opening module '{name}' from {path}"))?;
+        let format = StreamFormat::Packets(node.coded().clone());
+        let output = StreamDef {
+            info: info_for(&format),
+            format,
+            base: node.coded().time_base,
+            decode_delay: EncoderNode::decode_delay(&node),
+            latency: Some(def.latency.unwrap_or(0.0)),
+            header: Some(node.header().clone()),
+            wire: None,
+            frame_rate: def.frame_rate,
+            spelling: String::new(),
+            rendition: RenditionMeta::default(),
+            row: None,
+        };
+        (Box::new(node), output)
+    };
+    let shape = node.shape().clone();
+    let bound = vec![bound_stream(port, *id, def, StreamHint::default())];
+    let tick = tick_base(&shape, &bound)?;
+    let assembler = Assembler::new(&shape, &bound, name, &[])?;
+    Ok(Opening {
+        spec: LaneSpec {
+            gpu: HashMap::new(),
+            name: name.to_string(),
+            state: Vec::new(),
+            bound: vec![*id],
+            ports: vec![None],
+            shape,
+            intake: Intake::Assembled(Box::new(assembler)),
+            tick_base: tick,
+            runners: vec![node],
+            opener: None,
+            rows: None,
+            unbuffered: false,
+        },
+        outputs: vec![Some(output)],
         feeds: Vec::new(),
     })
 }

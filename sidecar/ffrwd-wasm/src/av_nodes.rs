@@ -67,7 +67,7 @@ pub fn is_av_node(module: &str) -> bool {
 
 /// The shape both have: one input by position, one output, ticking as
 /// things arrive.
-fn shape(input: PortKind, output: PortKind, base: TimeBase, latency: f64) -> NodeShape {
+pub(crate) fn shape(input: PortKind, output: PortKind, base: TimeBase, latency: f64) -> NodeShape {
     let time_base = match (i32::try_from(base.num), i32::try_from(base.den)) {
         (Ok(num), Ok(den)) => Some(Rational { num, den }),
         _ => None,

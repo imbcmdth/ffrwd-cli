@@ -286,7 +286,7 @@ fn exact_sample_ticks(samples: u64, rate: u32, time_base: TimeBase) -> Option<i6
 /// per picture; audio is one frame per packet when the encoder takes a run
 /// of any length, and exactly `frame_samples` samples otherwise, the last
 /// frame short.
-struct Framer {
+pub(crate) struct Framer {
     format: Format,
     time_base: TimeBase,
     /// What a frame lasts, when the header's frame rate settles it.
@@ -305,7 +305,11 @@ struct Framer {
 }
 
 impl Framer {
-    fn new(format: Format, frame_rate: Option<(u64, u64)>, frame_samples: u32) -> Framer {
+    pub(crate) fn new(
+        format: Format,
+        frame_rate: Option<(u64, u64)>,
+        frame_samples: u32,
+    ) -> Framer {
         Framer {
             format,
             time_base: format.time_base,
@@ -320,7 +324,7 @@ impl Framer {
     }
 
     /// One item off the wire, and the frames it completes.
-    fn push(&mut self, pts: i64, data: Vec<u8>, out: &mut Vec<RawFrame>) -> Result<()> {
+    pub(crate) fn push(&mut self, pts: i64, data: Vec<u8>, out: &mut Vec<RawFrame>) -> Result<()> {
         check_frame(&self.format, &data, self.index)?;
         self.index += 1;
         match self.format.media {
@@ -386,7 +390,7 @@ impl Framer {
 
     /// Whatever is still held at the end of the input: the last picture,
     /// lasting what the rate says, or the short last run of samples.
-    fn finish(&mut self, out: &mut Vec<RawFrame>) {
+    pub(crate) fn finish(&mut self, out: &mut Vec<RawFrame>) {
         if let Some((pts, data)) = self.held.take() {
             out.push(RawFrame {
                 pts,
@@ -409,7 +413,7 @@ impl Framer {
 /// pixel aspect and `input_color` are what describe the same pictures, so
 /// they are carried through; so is the input's frame rate, which is the
 /// only duration NUT has.
-fn coded_header(
+pub(crate) fn coded_header(
     name: &str,
     fourcc: &str,
     decode_delay: u32,
@@ -562,7 +566,7 @@ fn encode(args: &Args, module: &str, params: &str, demuxer: Input) -> Result<()>
 /// The coded stream a decoder is opened with, as the NUT header declared
 /// it: its tag as text in `codec`, and no profile or level, which the wire
 /// has no field for.
-fn coded_input(stream: &nut::Stream) -> Result<CodedStream> {
+pub(crate) fn coded_input(stream: &nut::Stream) -> Result<CodedStream> {
     let format = match stream.media {
         nut::Media::Video {
             width,
@@ -606,7 +610,7 @@ fn coded_input(stream: &nut::Stream) -> Result<CodedStream> {
 /// the coded stream's time base, and its pixel aspect, frame rate and
 /// (where the decoder declared none) `coded_color` carried through. Also
 /// the host's format for the frames, which is what checks their sizes.
-fn raw_header(
+pub(crate) fn raw_header(
     name: &str,
     decoded: &DecodedFormat,
     coded: &nut::Stream,

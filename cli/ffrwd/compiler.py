@@ -759,6 +759,11 @@ def compile_all(
                 effects=_effect_grants(stream_wasm | _source_wasm(res), describes),
                 anchors=res.input_anchors,
                 coded={d.module for d in stream_wasm.values() if d.edges == CODED_EDGES},
+                decoded={
+                    module: described.decoder.pixel_formats
+                    for module, described in describes.items()
+                    if described.decoder is not None
+                },
             )
             check_spellable(plan)
         except FfrwdError as err:

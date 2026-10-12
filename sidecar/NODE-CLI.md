@@ -152,6 +152,45 @@ extradata and reorder depth in the header, so the ffmpeg reading the
 pipe copies the stream into a file. Each is one instance, called in
 order, whatever `-jobs` says.
 
+A packet source, a packet sink and a codec package's module of an older
+world are nodes of a network too, each the node its adapter makes of it
+as when it rides alone:
+
+    replay[track0=s]
+    [s]packet_stats[@rows=r]
+    [n1]pyrowave=bytes_per_frame=125000[c]
+    [c]pyrowave[d]
+
+- A **packet source** reads no pad and names each output by the catalog
+  track it writes, `[track<N>=<label>]` with N the track's place in the
+  catalog. It is pulled until each track's decode delay is known before
+  the network starts, since each output's header carries it. An output
+  with no track named is refused.
+- A **packet sink** takes coded streams and data streams by position,
+  called with whatever arrived on each at least fifty times a second, as
+  when it rides alone; its rows leave on `@rows`.
+- A **codec package's module** takes one stream by position. A raw
+  stream is encoded and a coded one decoded, so a module exporting both
+  halves needs no `-codec`; a coded input under a tag the wire has no
+  name for is read as that tag, for such a decoder. The encoder reads the
+  format `-pads` names, or its pad's own where the module takes it, else
+  the first the module lists; a picture held on the GPU in another
+  format is made that format on the device before it is read back, and
+  one in host memory is refused. The decoder's pictures leave in host
+  memory, or, where `-pads` names a format, are put on the GPU and made
+  that format there. Each is one instance, called in order.
+
+    -pads <name>=<json>
+
+after `-filter_complex`, one per call of a packet sink or codec in the
+network, taken in turn as `-bound` is: a list with one object per pad of
+the call, each what `-pad` says of an `-i` (`row`, `rendition`, `color`),
+and `pix_fmt` for a codec's pad. A sink's pad reads a label rather than an
+`-i`, so this is where its row and rendition come from:
+
+    -pads 'publish=[{"row": 0, "rendition": {"name": "1080p"}}]'
+    -pads 'pyrowave=[{"pix_fmt": "yuv420p"}]'
+
 The host's `filter` reads one picture stream by position and runs a graph
 in libavfilter's own syntax over it, on a D3D12 device (`AV-EDGE.md`):
 

@@ -45,6 +45,8 @@ fn built_module(name: &str) -> PathBuf {
                 "source-replay-0150",
                 "-p",
                 "source-replay-0160",
+                "-p",
+                "packet-stats",
             ])
             .current_dir(&workspace)
             .output()
@@ -321,6 +323,11 @@ fn assert_replays(module: &Path) {
         "nut",
         "-",
     ]);
+    assert_replayed(&run);
+}
+
+/// The run wrote back exactly `source_replay`'s packets, on its stdout.
+fn assert_replayed(run: &Run) {
     assert!(
         run.output.status.success(),
         "run exited with {:?}\nstderr:\n{}",
@@ -358,6 +365,78 @@ fn assert_replays(module: &Path) {
 #[test]
 fn a_run_writes_back_exactly_the_packets_the_module_published() {
     assert_replays(&module_path());
+}
+
+#[test]
+fn a_packet_source_in_a_network_writes_the_track_its_output_names() {
+    let module = format!("replay={}", module_path().display());
+    let run = run_ffrwd_wasm(&[
+        "-m",
+        &module,
+        "-filter_complex",
+        "replay[track0=s]",
+        "-map",
+        "[s]",
+        "-f",
+        "nut",
+        "-",
+    ]);
+    assert_replayed(&run);
+}
+
+#[test]
+fn a_packet_source_in_a_network_names_each_output_by_its_track() {
+    let module = format!("replay={}", module_path().display());
+    let run = run_ffrwd_wasm(&[
+        "-m",
+        &module,
+        "-filter_complex",
+        "replay[s]",
+        "-map",
+        "[s]",
+        "-f",
+        "nut",
+        "-",
+    ]);
+    assert!(!run.output.status.success(), "a positional output ran");
+    assert!(
+        run.stderr.contains("[track0=s]"),
+        "the refusal names the spelling: {}",
+        run.stderr
+    );
+}
+
+#[test]
+fn a_packet_sink_in_a_network_reads_a_sources_packets_off_a_label() {
+    let replay = format!("replay={}", module_path().display());
+    let stats = format!("stats={}", built_module("packet_stats").display());
+    let run = run_ffrwd_wasm(&[
+        "-m",
+        &replay,
+        "-m",
+        &stats,
+        "-filter_complex",
+        "replay[track0=s];[s]stats[@rows=r]",
+        "-map",
+        "[r]",
+        "-f",
+        "ndjson",
+        "-",
+    ]);
+    assert!(
+        run.output.status.success(),
+        "run exited with {:?}\nstderr:\n{}",
+        run.output.status.code(),
+        run.stderr
+    );
+    let rows = String::from_utf8_lossy(&run.stdout);
+    let total = rows
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|row| row.get("gops").is_some())
+        .unwrap_or_else(|| panic!("no total row in {rows}"));
+    assert_eq!(total["packets"], EXPECTED.len());
+    assert_eq!(total["keyframes"], 1);
 }
 
 #[test]

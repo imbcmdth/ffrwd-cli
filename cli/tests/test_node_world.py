@@ -1577,9 +1577,9 @@ def test_a_coded_picture_publish_copies_and_a_node_reads_as_frames_leaves_on_two
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """publish copies the h264 sub writes, and spot takes it as pictures. sub's
-    network hands the packets to each on a pipe of its own: to an ffmpeg that
-    copies them on to publish, as a node sink's pad always reaches it, and to
-    one that decodes them for spot. No ffmpeg holds a split, so none copies a
+    network hands the packets to each on a pipe of its own: straight to
+    publish, since an ffmpeg between would only copy them, and to an ffmpeg
+    that decodes them for spot. No ffmpeg holds a split, so none copies a
     stream it also filters."""
     plan = _relayed(
         "COPY (SELECT v.video[1], spotted(v.video[1]) AS spots FROM sub('r') v "
@@ -1596,19 +1596,16 @@ def test_a_coded_picture_publish_copies_and_a_node_reads_as_frames_leaves_on_two
     modules = {sidecar.module: sidecar.id for sidecar in plan.sidecars}
     sub, publish = modules["sub.wasm"], modules["publish.wasm"]
     pictures = _pictures(plan)
-    (copying,) = [source for source, target in pictures if target == publish]
-    assert copying.startswith("ffmpeg") and "-filter_complex" not in argv[copying]
-    assert argv[copying][argv[copying].index("-c:0") + 1] == "copy"
-    assert pictures[(sub, copying)] == pictures[(copying, publish)] == "copy"
-    assert pictures[(sub, decode)] == "copy"
+    assert [source for source, target in pictures if target == publish] == [sub]
+    assert pictures[(sub, publish)] == pictures[(sub, decode)] == "copy"
 
 
 def test_a_node_reading_packets_beside_a_decode_reads_the_coded_picture_as_it_is(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """remux's port takes packets and burn's takes pictures: remux reads sub's
-    h264 off a pipe of its own, copied, and burn reads it from the ffmpeg
-    decoding it off another."""
+    h264 off a pipe of its own, straight from sub's sidecar, and burn reads it
+    from the ffmpeg decoding it off another."""
     monkeypatch.setitem(SHAPES, "sub.wasm", _subscribe)
     monkeypatch.setitem(SHAPES, "remux.wasm", _remux)
     monkeypatch.setitem(
@@ -1627,10 +1624,8 @@ def test_a_node_reading_packets_beside_a_decode_reads_the_coded_picture_as_it_is
     modules = {sidecar.module: sidecar.id for sidecar in plan.sidecars}
     sub, remux, burn = modules["sub.wasm"], modules["remux.wasm"], modules["burn.wasm"]
     pictures = _pictures(plan)
-    (copying,) = [source for source, target in pictures if target == remux]
-    assert "-filter_complex" not in argv[copying]
-    assert pictures[(sub, copying)] == pictures[(copying, remux)] == "copy"
-    assert pictures[(sub, decode)] == "copy"
+    assert [source for source, target in pictures if target == remux] == [sub]
+    assert pictures[(sub, remux)] == pictures[(sub, decode)] == "copy"
     assert (decode, burn) in pictures
 
 
@@ -1638,8 +1633,8 @@ def test_a_leaky_into_publish_keeps_the_packets_beside_a_node_reading_pictures(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Only publish reads what the leaky hands on, so the leaky reads sub's
-    packets as they are, copied to it off a pipe of its own, and spot reads
-    the picture from the ffmpeg decoding it off another."""
+    packets as they are, off a pipe of its own straight from sub's sidecar,
+    and spot reads the picture from the ffmpeg decoding it off another."""
     plan = _relayed(
         "COPY (SELECT ffrwd.leaky(v.video[1]), spotted(v.video[1]) AS spots FROM sub('r') v "
         "WHERE v.height = 720) TO publish('https://relay', 'b')",
@@ -1651,10 +1646,8 @@ def test_a_leaky_into_publish_keeps_the_packets_beside_a_node_reading_pictures(
     modules = {sidecar.module: sidecar.id for sidecar in plan.sidecars}
     sub, spot = modules["sub.wasm"], modules["spot.wasm"]
     pictures = _pictures(plan)
-    (copying,) = [source for source, target in pictures if target == leaking]
-    assert "-filter_complex" not in argv[copying]
-    assert pictures[(sub, copying)] == pictures[(copying, leaking)] == "copy"
-    assert pictures[(sub, decode)] == "copy"
+    assert [source for source, target in pictures if target == leaking] == [sub]
+    assert pictures[(sub, leaking)] == pictures[(sub, decode)] == "copy"
     assert (decode, spot) in pictures
 
 
@@ -2262,13 +2255,14 @@ def test_a_node_holding_its_picture_on_the_gpu_takes_coded_edges(
     assert not in_host.av
 
 
-def test_a_picture_held_on_the_gpu_is_encoded_in_its_region_for_a_packet_sink(
+def test_a_packet_sink_reading_a_picture_held_on_the_gpu_joins_its_region(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A packet sink reading a picture held on the GPU, whose encoder the
-    sidecar hosts, has the picture encoded in the region with the sink's
-    options on the encoder; the ffmpeg between copies the packets. An
-    encoder the sidecar does not host stays in that ffmpeg."""
+    sidecar hosts, runs in the picture's region: the picture is encoded there
+    with the sink's options on the encoder, and the sink reads the packets in
+    the network. An encoder the sidecar does not host stays in an ffmpeg in
+    front of the sink, which keeps its process."""
     monkeypatch.setitem(SHAPES, "publish.wasm", _publish)
     monkeypatch.setitem(
         _PARAMS, "publish.wasm", {"relay": {"type": "string"}, "broadcast": {"type": "string"}}
@@ -2277,19 +2271,174 @@ def test_a_picture_held_on_the_gpu_is_encoded_in_its_region_for_a_packet_sink(
         _PUBLISH + "COPY (SELECT box(f.video[1]) FROM input('f.mp4') f) "
         "TO publish('https://relay', 'b') WITH (video_codec '{}', video_bitrate '6M')"
     )
-    argv = _plan_argv(query.format("h264_nvenc"), monkeypatch, describe=_reporting("publish.wasm"))
-    (box,) = [words for words in argv.values() if any("box=" in w for w in words)]
-    network = box[box.index("-filter_complex") + 1]
-    assert network.endswith("[n1]encode=codec=h264_nvenc:b=6M[out0]")
-    (between,) = [
-        words for pid, words in argv.items() if pid.startswith("ffmpeg") and "-f" in words[:2]
+    plan = _plan(query.format("h264_nvenc"), monkeypatch, describe=_reporting("publish.wasm"))
+    (region,) = plan.sidecars
+    assert region.graph is not None and region.av and not region.packet_sink
+    assert [n.filter for n in region.graph.nodes.values()] == [
+        "decode", "box", "encode", "publish"
     ]
-    assert between[between.index("-c:0") + 1] == "copy" and "-b:0" not in between
-    argv = _plan_argv(query.format("libx264"), monkeypatch, describe=_reporting("publish.wasm"))
-    (box,) = [words for words in argv.values() if any("box=" in w for w in words)]
-    assert "encode=" not in box[box.index("-filter_complex") + 1]
-    encoders = [words for pid, words in argv.items() if pid.startswith("ffmpeg")]
+    (demuxer,) = plan.ffmpeg
+    assert [e.target for e in plan.stream_edges if e.source == demuxer.id] == [region.id]
+    network = _shown(plan)[region.id]
+    assert network[network.index("-filter_complex") + 1].endswith(
+        "[n1]encode=codec=h264_nvenc:b=6M[encode0];"
+        "[video=encode0]publish=relay=https\\\\://relay:broadcast=b[@rows=out0]"
+    )
+    plan = _plan(query.format("libx264"), monkeypatch, describe=_reporting("publish.wasm"))
+    assert len(plan.sidecars) == 2
+    encoders = [words for pid, words in _shown(plan).items() if pid.startswith("ffmpeg")]
     assert any(words[words.index("-c:0") + 1] == "libx264" for words in encoders)
+
+
+def test_a_source_a_node_on_the_gpu_and_a_sink_are_one_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ffrwd/moq's shape: a node source's packets decoded onto the device for
+    a node holding its picture there, encoded again for a node sink. The
+    decode, the encode and both ends run in one sidecar, no ffmpeg anywhere,
+    and the sink's row and rendition ride ``-pads`` since its pad reads a
+    label of the network. Held in host memory, the picture is decoded and
+    encoded by ffmpegs as before."""
+    monkeypatch.setitem(SHAPES, "sub.wasm", _subscribe)
+    monkeypatch.setitem(SHAPES, "publish.wasm", _publish)
+    monkeypatch.setitem(
+        _PARAMS, "publish.wasm", {"relay": {"type": "string"}, "broadcast": {"type": "string"}}
+    )
+    query = (
+        _SUB + _PUBLISH + "COPY (SELECT box(v.video[1]{}) FROM sub('r') v WHERE v.height = 720) "
+        "TO publish('https://relay', 'b') WITH (video_codec 'h264_d3d12va', video_bitrate '6M')"
+    )
+    plan = _plan(query.format(""), monkeypatch, describe=_reporting("publish.wasm"))
+    assert not plan.ffmpeg
+    (region,) = plan.sidecars
+    assert region.graph is not None and region.av
+    assert [n.filter for n in region.graph.nodes.values()] == [
+        "sub", "decode", "box", "encode", "publish"
+    ]
+    argv = _shown(plan)[region.id]
+    network = argv[argv.index("-filter_complex") + 1]
+    assert "decode=format=rgba:hw=auto" in network
+    assert "encode=codec=h264_d3d12va:b=6M[encode0];[video=encode0]publish=" in network
+    assert argv[argv.index("-pads") + 1] == (
+        'publish=[{"row": 0, "rendition": {"name": "720p", "bandwidth": 3000000}}]'
+    )
+    plan = _plan(query.format(", 'host'"), monkeypatch, describe=_reporting("publish.wasm"))
+    assert len(plan.sidecars) == 3 and len(plan.ffmpeg) == 2
+
+
+def _with_codec(path: str) -> Described:
+    """`_node`, with codec.wasm a codec package's encoder and decoder."""
+    if path != "codec.wasm":
+        return _node(path)
+    formats = ("yuv420p", "yuv444p")
+    return Described(
+        world="ffrwd:av@0.18.0",
+        name="codec",
+        pixel_formats=formats,
+        encoder=wasm.EncoderInfo(
+            codec="testcodec",
+            fourcc="FTST",
+            params_schema={"type": "object", "properties": {"bitrate": {"type": "number"}}},
+            pixel_formats=formats,
+        ),
+        decoder=wasm.DecoderInfo(fourccs=("FTST",), pixel_formats=formats),
+    )
+
+
+_ENC = (
+    "CREATE FUNCTION enc(bitrate number DEFAULT 1000) RETURNS encoder "
+    "AS 'codec.wasm', 'encode' LANGUAGE wasm;\n"
+)
+_DEC = "CREATE FUNCTION dec() RETURNS decoder AS 'codec.wasm', 'decode' LANGUAGE wasm;\n"
+
+
+def test_a_codec_packages_halves_run_in_the_regions_beside_them(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A codec package's encoder coding the picture of a node held on the GPU
+    runs in that node's region, told the format its pictures are made on the
+    device; its decoder runs in the region of the node holding its pictures
+    on the GPU, told the format they are made there. Held in host memory, a
+    picture reaches either through ffmpeg as before."""
+    query = (
+        _ENC + "COPY (SELECT box(f.video[1]{}) FROM input('f.mp4') f) TO 'out.mkv' "
+        "WITH (video_codec enc(bitrate => 5000))"
+    )
+    plan = _plan(query.format(""), monkeypatch, describe=_with_codec)
+    (region,) = plan.sidecars
+    assert region.graph is not None and not region.codec
+    assert [n.filter for n in region.graph.nodes.values()] == ["decode", "box", "codec"]
+    argv = _shown(plan)[region.id]
+    assert argv[argv.index("-pads") + 1] == 'codec=[{"pix_fmt": "yuv420p"}]'
+    (muxer,) = plan.ffmpeg[-1:]
+    assert all(e.format.codec == "copy" for e in plan.stream_edges if e.target == muxer.id)
+    plan = _plan(query.format(", 'host'"), monkeypatch, describe=_with_codec)
+    assert [s.codec for s in plan.sidecars if s.codec] == ["encode"]
+
+    coded = {
+        "c": ProbeResult(
+            streams=[
+                StreamMeta(
+                    type="video", index=0, metadata={}, width=64, height=48,
+                    fps="10/1", sample_rate=None, codec="FTST",
+                )
+            ]
+        )
+    }  # fmt: skip
+    monkeypatch.setattr("ffrwd.compiler.probe_path", lambda path, args=(), **kw: coded["c"])
+    compiled = compile_all(
+        _declared(
+            _DEC + "COPY (SELECT box(c.video[1]) FROM input('c.nut', decoder => dec()) c) "
+            "TO 'out.mkv' WITH (video_codec 'ffv1')"
+        ),
+        describe=_with_codec,
+        shape=_Asked(),
+        av_filters=lambda: None,
+    )
+    assert compiled.plan is not None
+    (region,) = compiled.plan.sidecars
+    assert region.graph is not None
+    assert [n.filter for n in region.graph.nodes.values()][:2] == ["codec", "box"]
+    argv = _shown(compiled.plan)[region.id]
+    assert argv[argv.index("-pads") + 1] == 'codec=[{"pix_fmt": "rgba"}]'
+
+
+def _hand_on(path: str) -> Described:
+    """`_node`, with hand_on.wasm a packet filter of an older world."""
+    if path != "hand_on.wasm":
+        return _node(path)
+    return Described(
+        world=WORLDS[-1],
+        name="hand_on",
+        version="0.1.0",
+        params_schema={"type": "object", "properties": {}},
+        video_codecs=("h264",),
+        audio_codecs=(),
+        packet_filter=True,
+    )
+
+
+def test_a_packet_filter_reading_a_picture_held_on_the_gpu_takes_the_regions_packets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A packet filter keeps its process, and the picture it reads is encoded
+    in the region holding it on the GPU, the destination's options on the
+    encoder; the ffmpeg between copies the packets."""
+    argv = _plan_argv(
+        "CREATE FUNCTION hand_on(v video_stream) RETURNS packets "
+        "AS 'hand_on.wasm', 'hand_on' LANGUAGE wasm;\n"
+        "COPY (SELECT hand_on(box(f.video[1])) FROM input('f.mp4') f) TO 'out.mp4' "
+        "WITH (video_codec 'h264_nvenc', video_bitrate '6M')",
+        monkeypatch,
+        describe=_hand_on,
+    )
+    (box,) = [words for words in argv.values() if any("box=" in w for w in words)]
+    assert box[box.index("-filter_complex") + 1].endswith(
+        "[n1]encode=codec=h264_nvenc:b=6M[out0]"
+    )
+    encoders = [words for pid, words in argv.items() if pid.startswith("ffmpeg")]
+    assert all(words[words.index("-c:0") + 1] == "copy" for words in encoders)
+    assert not any("-b:0" in words for words in encoders)
 
 
 def test_a_filter_between_pictures_on_the_device_runs_there_where_it_has_a_variant(

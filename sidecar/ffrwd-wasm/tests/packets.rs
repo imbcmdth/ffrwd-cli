@@ -507,7 +507,7 @@ fn malformed_pad_json_is_refused_at_parse() {
 }
 
 #[test]
-fn a_packet_sink_joins_no_network() {
+fn a_packet_sink_in_a_network_reads_an_inputs_packets_and_writes_its_rows() {
     let module = module_path("packet_stats");
     let binding = format!("stats={}", module.to_str().expect("module path is UTF-8"));
     let run = run_ffrwd_wasm(
@@ -519,20 +519,25 @@ fn a_packet_sink_joins_no_network() {
             "-m",
             &binding,
             "-filter_complex",
-            "[0]stats[out0]",
+            "[0:v]stats[@rows=r]",
             "-map",
-            "[out0]",
+            "[r]",
             "-f",
             "ndjson",
             "-",
         ],
         FIXTURE,
     );
-    assert!(!run.output.status.success());
     assert!(
-        run.stderr.contains("joins no network"),
-        "stderr does not refuse the network:\n{}",
+        run.output.status.success(),
+        "run exited with {:?}\nstderr:\n{}",
+        run.output.status.code(),
         run.stderr
+    );
+    let rows = &run.stdout;
+    assert!(
+        rows.lines().any(|line| line.contains("\"gops\"")),
+        "no total row: {rows}"
     );
 }
 

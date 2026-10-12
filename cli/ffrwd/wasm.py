@@ -395,6 +395,16 @@ _PARAMS_FROM_FLAG = "-params-from"
 # The bound list a node's shape was asked with: ``<name>=<json>``, one per
 # call in the order its chain is written.
 _BOUND_FLAG = "-bound"
+# The row and rendition of each pad of a packet sink a network holds,
+# by its call: what ``-pad`` says of an ``-i``.
+_PADS_FLAG = "-pads"
+# A codec's colorimetry flag -> the field of a pad's ``color`` naming it.
+_PAD_COLOR_FIELDS = {
+    "color_range": "range",
+    "color_primaries": "primaries",
+    "color_trc": "trc",
+    "colorspace": "space",
+}
 
 # Which half of a codec package's module a run drives: "encode" or "decode".
 _CODEC_FLAG = "-codec"
@@ -2320,6 +2330,18 @@ def _node_network_args(
     for name, node in graph.nodes.items():
         if node.bound:
             argv += [_BOUND_FLAG, f"{nodes[name].filter}={node.bound}"]
+    told: dict[str, list[dict[str, object]]] = {
+        name: [pad.to_dict() for pad in pads] for name, pads in process.call_pads
+    }
+    for name, flags in process.call_codecs:
+        said: dict[str, object] = {}
+        color = {_PAD_COLOR_FIELDS[flag]: value for flag, value in flags if flag != "pix_fmt"}
+        if color:
+            said["color"] = color
+        said.update((flag, value) for flag, value in flags if flag == "pix_fmt")
+        told[name] = [{**pad, **said} for pad in told.get(name, [{}])]
+    for name, listed in told.items():
+        argv += [_PADS_FLAG, f"{nodes[name].filter}={json.dumps(listed)}"]
     for targets, path in zip(groups[:streams], paths):
         for target in targets:
             argv += ["-map", target]

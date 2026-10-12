@@ -315,7 +315,16 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   behind an encoder the compiler places, whatever feeds it, and the
   COPY's `WITH` options shape that encoder the way they shape a
   file's - a value read once per row shapes each stream separately. A
-  sink call anywhere else is refused. A
+  packet sink reading one stream runs in the sidecar region writing it,
+  with no process of its own, when the stream reaches it as packets the
+  region holds: a node's packets it copies, or a picture the region
+  holds on the GPU or was declared coded for, encoded there by an
+  encoder the sidecar hosts. Its row and rendition are given to it as
+  `-pads` rather than `-pad`. A sink reading several streams keeps its
+  process. Recipes
+  [161](examples.md#161-encode-in-the-region-for-a-packet-sink),
+  [162](examples.md#162-a-source-a-module-on-the-gpu-and-a-sink-in-one-process).
+  A sink call anywhere else is refused. A
   module importing `wasi:http`, `wasi:sockets` or `wasi:webgpu` runs
   only under the sidecar's matching per-module grant (`-http <module>`,
   `-udp <module>`, `-tcp <module>`, `-gpu <module>`), which the compiler
@@ -413,7 +422,16 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   container. A package's own `encode` and `decode` may take a name
   Postgres already uses, since they are only ever called qualified; a
   script's own may not. Each runs alone in a sidecar (`-codec encode` or
-  `-codec decode`), from the `ffrwd:av@0.18.0` world on.
+  `-codec decode`), from the `ffrwd:av@0.18.0` world on, except beside
+  a region that runs as a network of nodes (it holds a node module, a
+  picture on the GPU, or a module declared coded): an encoder coding
+  such a region's picture, and a decoder whose pictures one node of
+  such a region reads, run in it. The encoder is told the pixel format
+  the query settled for it with `-pads`, and a picture held on the GPU
+  in another format is made that format there before it is read back;
+  the decoder's pictures are made the format their reader holds them in
+  on the GPU, or handed on as they are where the reader takes every
+  format the decoder writes.
 - A **stream function declared `SET ffrwd.edges = 'coded'`** has its
   region take coded packets on both pipes where it can, and the sidecar
   decodes and encodes them itself with libavcodec, beside the module.
@@ -1434,7 +1452,7 @@ Every FROM item is a compile-time table; the column model per shape is
 | --- | --- | --- |
 | `input('path', name => value, ...) alias` | 1, or one per rendition of an HLS/DASH manifest | alias mandatory; path is a literal, never computed; trailing named options are ffmpeg's per-input flags; a manifest is a row table ([rows.md](rows.md#rendition-rows---inputladderm3u8-r)) |
 | `ffmpeg.<source>(name => value, ...) alias` | 1 | generated stream (testsrc2, sine, color, anullsrc, ...), no `-i`; options named-only |
-| `<pkg>.<source>(<values>) alias` | one per rendition of its catalog | a `RETURNS source` wasm function, probed at compile time; arguments are values only; reads like a manifest input, and a source reporting itself unbounded is live. Over a values-world export it is invoked at compile time instead: each row it answers names a `url` ffmpeg opens with its own `-i`, and the alias still reads as rendition rows |
+| `<pkg>.<source>(<values>) alias` | one per rendition of its catalog | a `RETURNS source` wasm function, probed at compile time; arguments are values only; reads like a manifest input, and a source reporting itself unbounded is live. Its tracks all going unfiltered to one sidecar region that runs as a network of nodes, it runs in that region and no ffmpeg copies its packets across. Over a values-world export it is invoked at compile time instead: each row it answers names a `url` ffmpeg opens with its own `-i`, and the alias still reads as rendition rows |
 | `<pkg>.<sink>(<stream>, <values>) alias` | one per row the module wrote | a packet sink read at compile time: the stream is one of an `input()` written earlier in the same FROM, the columns are the ones its `RETURNS STRUCT(...)[]` names, and the same module after `TO` is a run-time destination instead ([rows.md](rows.md#packet-rows---ffrwdindexrecordsfvideo1-v)) |
 | `unnest(alias.<array>) alias` | one per element | the four stream arrays, or `chapters` / `cues` / `attachments`, of an input declared earlier in the same FROM; `cues['title']` names one track by its title |
 | `unnest(merge_cues(<rows>[, max_distance])) alias` | one per run | the same rows with runs collapsed into one row each. `<rows>` is a record array carrying `start_t`/`end_t` - `chapters`, `cues` - or an `ARRAY(SELECT r FROM unnest(<one of those>) r WHERE ...)` gather that narrows them first ([recipes 131-132](corpus.md#131-collapse-a-files-rows-into-runs)) |

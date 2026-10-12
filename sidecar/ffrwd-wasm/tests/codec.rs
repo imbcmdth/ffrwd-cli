@@ -412,6 +412,97 @@ fn ffmpeg_reads_the_tag_and_copies_the_stream() {
     assert_eq!(packets.len(), PTS.len());
 }
 
+/// The frames a network writes on its stdout, at their timestamps.
+fn frames_of(wire: &[u8]) -> Vec<(i64, Vec<u8>)> {
+    let (_, packets) = read_wire(wire);
+    packets.into_iter().map(|(p, d)| (p.pts, d)).collect()
+}
+
+#[test]
+fn a_network_encodes_with_the_codec_and_decodes_it_back_in_one_run() {
+    let codec = format!("tc={}", module_arg());
+    let frames = yuv_frames();
+    let run = run_ffrwd_wasm(
+        &[
+            "-f",
+            "nut",
+            "-i",
+            "pipe:0",
+            "-m",
+            &codec,
+            "-filter_complex",
+            "[0:v]tc=level=1[c];[c]tc[d]",
+            "-map",
+            "[d]",
+            "-f",
+            "nut",
+            "pipe:1",
+        ],
+        &raw_wire("yuv420p", &frames),
+    );
+    run.assert_ok("a network coding and decoding");
+    assert_eq!(
+        frames_of(&run.stdout),
+        frames,
+        "the frames went through unchanged"
+    );
+}
+
+#[test]
+fn a_network_writes_the_coded_stream_a_codec_run_decodes() {
+    let codec = format!("tc={}", module_arg());
+    let frames = yuv_frames();
+    let run = run_ffrwd_wasm(
+        &[
+            "-f",
+            "nut",
+            "-i",
+            "pipe:0",
+            "-m",
+            &codec,
+            "-filter_complex",
+            "[0:v]tc[c]",
+            "-map",
+            "[c]",
+            "-f",
+            "nut",
+            "pipe:1",
+        ],
+        &raw_wire("yuv420p", &frames),
+    );
+    run.assert_ok("a network coding");
+    let (stream, _) = read_wire(&run.stdout);
+    assert_eq!(stream.fourcc_name(), "FTST");
+    assert_eq!(frames_of(&decode(&run.stdout)), frames);
+}
+
+#[test]
+fn a_network_decodes_a_stream_under_a_tag_the_wire_does_not_name() {
+    let codec = format!("tc={}", module_arg());
+    let frames = yuv_frames();
+    let coded = encode(&raw_wire("yuv420p", &frames));
+    let run = run_ffrwd_wasm(
+        &[
+            "-f",
+            "nut",
+            "-i",
+            "pipe:0",
+            "-m",
+            &codec,
+            "-filter_complex",
+            "[0:v]tc[d]",
+            "-map",
+            "[d]",
+            "-f",
+            "nut",
+            "pipe:1",
+        ],
+        &coded,
+    );
+    run.assert_ok("a network decoding");
+    assert_eq!(frames_of(&run.stdout), frames);
+}
+
 #[test]
 fn a_codec_module_with_both_halves_needs_codec() {
     let module = module_arg();

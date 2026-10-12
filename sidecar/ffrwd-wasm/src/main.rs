@@ -15,6 +15,7 @@
 mod adapters;
 mod av_nodes;
 mod codec;
+mod codec_nodes;
 mod edges;
 mod feeds;
 mod graph;
@@ -400,6 +401,10 @@ struct Args {
     /// `-bound <name>=<bindings>`: per node name, the inputs each call of it
     /// binds as its shape was asked, the k-th for the k-th chain calling it.
     node_bounds: HashMap<String, Vec<Vec<ffrwd_wasm_runtime::node::Binding>>>,
+    /// `-pads <name>=<list>`: per name of a packet sink a network holds, the
+    /// row and rendition of each of its pads, as `-pad` says them of an
+    /// `-i`, the k-th for the k-th chain calling it.
+    call_pads: HashMap<String, Vec<Vec<PadSpec>>>,
     /// `-profile`: write the run's bytes and time per stage as one row on
     /// stderr when it ends.
     profile: bool,
@@ -428,6 +433,10 @@ pub(crate) struct PadSpec {
     /// crosses at a few pixels, and its readers are told this size.
     #[serde(default)]
     pub(crate) geometry: Vec<Option<PadGeometry>>,
+    /// The pixel format a codec package's encoder reads its pad in, in a
+    /// network: what the query settled for it.
+    #[serde(default)]
+    pub(crate) pix_fmt: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -755,6 +764,7 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
     let mut node_params: HashMap<String, Vec<String>> = HashMap::new();
     let mut node_bounds: HashMap<String, Vec<Vec<ffrwd_wasm_runtime::node::Binding>>> =
         HashMap::new();
+    let mut call_pads: HashMap<String, Vec<Vec<PadSpec>>> = HashMap::new();
     let mut outputs: Vec<OutputSpec> = Vec::new();
     let mut stream_info_path: Option<String> = None;
     let mut annotations = Annotations::default();
@@ -793,6 +803,15 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
                 let list = crate::shape_json::parse_bound(list)
                     .with_context(|| format!("-bound {name}="))?;
                 node_bounds.entry(name.to_string()).or_default().push(list);
+            }
+            "-pads" => {
+                let raw = next("-pads")?;
+                let (name, list) = raw
+                    .split_once('=')
+                    .ok_or_else(|| anyhow!("-pads {raw}: the value is <name>=<list>"))?;
+                let list: Vec<PadSpec> = serde_json::from_str(list)
+                    .map_err(|e| anyhow!("-pads {name}=: a list of -pad objects: {e}"))?;
+                call_pads.entry(name.to_string()).or_default().push(list);
             }
             "-pad" => {
                 let raw = next("-pad")?;
@@ -1032,6 +1051,7 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
         color,
         node_params,
         node_bounds,
+        call_pads,
     })
 }
 
@@ -2005,7 +2025,10 @@ fn stream_info(args: &Args, stream: &nut::Stream) -> StreamInfo {
 /// their frames.
 fn run(args: &Args) -> Result<()> {
     if let Modules::Network { bindings, wiring } = &args.modules {
-        if node_graph::is_node_network(bindings)? || node_graph::calls_av_node(wiring) {
+        if node_graph::is_node_network(bindings)?
+            || node_graph::calls_av_node(wiring)
+            || node_graph::binds_packet_modules(bindings)?
+        {
             return node_graph::run(args, bindings, wiring);
         }
         if let Some(output) = args.outputs.iter().find(|o| !o.also.is_empty()) {
@@ -2209,20 +2232,6 @@ fn run(args: &Args) -> Result<()> {
         // reads its pads out of ONE input, wired by -filter_complex.
         if readers.len() > 1 {
             bail!("a single frame module reads one stream; a second -i needs a -filter_complex");
-        }
-    }
-    if let Modules::Network { bindings, .. } = &args.modules {
-        for binding in bindings {
-            let is_packet_sink = ffrwd_wasm_runtime::runtime::exports_packet_sink(&binding.path)
-                .with_context(|| format!("opening module {}", binding.path))?;
-            if is_packet_sink {
-                bail!(
-                    "{}: a packet sink consumes its stream whole and joins no network; \
-                     host it alone with -m {}",
-                    binding.name,
-                    binding.path
-                );
-            }
         }
     }
 
@@ -4751,6 +4760,7 @@ mod pad_spec_tests {
                 color: None,
                 tags: Default::default(),
                 geometry: Vec::new(),
+                pix_fmt: None,
             }
         );
     }
