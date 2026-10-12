@@ -1969,6 +1969,141 @@ run; each item names what it takes, and the notes above have the detail.
    at real time there, and section 3's harness run there for its GPU and
    readback columns.
 
+## Packets inside the region, and sidecar to sidecar
+
+**What changed (2026-10-12, owner's machine).** A live pipeline that
+subscribes to a broadcast, runs a module holding its frames on the GPU and
+publishes the result compiled to five processes: the subscribe sidecar, an
+ffmpeg copying its packets, the module's sidecar, an ffmpeg encoding its raw
+picture, and the publish sidecar. It now compiles to one sidecar, and no
+ffmpeg runs:
+
+    ffrwd-wasm ... -filter_complex 'subscribe=...[1080p=n10][@rows=out0];
+      [n10]decode=format=rgba:hw=auto[n1_0_decode];
+      [v=n1_0_decode]gpu_box=memory=gpu:size=8[out=n2];
+      [n2]encode=codec=h264_d3d12va:b=6M:g=30[encode0];
+      [video=encode0]publish=...[@rows=out1]' ...
+      -pads 'publish=[{"row": 0, "rendition": {"name": "1080p", ...}}]'
+
+The partition (`cli/ffrwd/processes.py`):
+
+- A region holding its picture on the GPU, or declared coded, encodes it for
+  a packet sink or packet filter when the sidecar hosts the encoder, the
+  pad's options on the `encode` node (`_encoded_for_a_sink`).
+- The decode put ahead of a node's packets read as pictures is the sidecar's
+  own `decode` where every reader holds them on the GPU or is declared coded
+  (`_host_node_decodes`), so a node source joins the region it feeds.
+- A packet sink reading one stream joins the region writing it when the
+  stream reaches it as packets the region holds (`_sink_encoding`); its row
+  and rendition ride the new `-pads <name>=<json>`. A sink reading several
+  streams keeps its process: a ladder shapes each pad with an encoder of its
+  own, and a sound's encoder is ffmpeg's.
+- An older world's module source whose tracks all go unfiltered to one such
+  region runs in it, `[track<N>=label]`, its tracks decoded there
+  (`_fold_source`).
+- A codec package's encoder or decoder beside such a region runs in it
+  (`_codec_neighbour`, `_decoded_for`), told by `-pads` the pixel format its
+  pictures are made in on the device. The setparams lowering puts behind a
+  decoder is dropped there, since the decoder is told the colour.
+- An ffmpeg that only copies between two sidecars is dropped and the two are
+  wired to each other (`_drop_copying_ffmpegs`). An ffmpeg stays between
+  sidecars only to filter, mux or demux, or to run a codec the sidecar does
+  not host.
+- A cut parts a region (`partition(cuts=...)`, `_Partitioner._cut`). It
+  takes the streams to cut, each a ref one node writes and another reads,
+  and how each crosses (`CutCoding`): as it is, as the packets of an encoder
+  the sidecar hosts with its options, or through a codec package's encoder
+  and decoder. A `cut` node stands after the stream and joins the region
+  making it, which writes the stream out; the region reading it takes it
+  off a pipe straight from that sidecar, so the two are sidecar processes
+  wired to each other and a placement can put them on two nodes. A hosted
+  encoder codes the stream at the end of one region and the other decodes
+  it, onto the device where it holds its pictures there (`_code_cuts`); a
+  codec package's halves join the regions either side as any codec
+  package's do. `CutAtModules` cuts every stream one module writes and
+  another reads as pictures or sound, in any region: node modules, older
+  frame modules, a packet source and sink, codec halves. A stream read as
+  packets is never cut: its encoder stays beside its reader.
+- Nothing decides to cut. No query syntax asks for it: splitting is the
+  compiler's work, as placing ffmpeg processes is, and when a split pays is
+  not settled. `_cut` is the one place a cost model would call. The first
+  caller is the `per-module` placement, which means one module to a node:
+  a `split-local` run placed `per-module` cuts each region between its
+  modules before it places the plan (`placement.cuts_for`), and a hidden
+  `--cut-codec` says how the cut streams cross, spelled as the sidecar's
+  `encode` node (`h264_d3d12va:b=8M`) or as a codec package's module and
+  its params (`<path>.wasm:bytes_per_frame=125000`).
+
+The sidecar (`ffrwd-wasm/src/node_graph.rs`, `codec_nodes.rs`): a network
+hosts an older world's packet source, packet sink and codec module as nodes,
+through the adapters `legacy.rs` already used to run them alone. A codec
+module encodes a raw pad and decodes a coded one; a coded input under a tag
+the wire does not name is read as that tag. A stream's copies (the mirror a
+`-pads` row makes) now hold back the stream's writer and count as reading it
+(`lanes.rs`). A network binding any of these runs on the node lanes.
+
+**Measured.**
+
+- The MoQ query end to end (local `moq-relay`, a 30 s 1080p30 h264
+  publisher on `live/demo`, the query publishing `live/boxed` with
+  `h264_d3d12va`, `ffrwd/moq` 0.9.1's node-world `subscribe` and `publish`
+  built from its source), run with `ffrwd run --profile`: one `ffrwd-wasm`
+  process for the query and no ffmpeg. Its profile row: `read` 0, `upload`
+  0, `download` 0 bytes; `convert` 2 calls a frame (NV12 to rgba for
+  `gpu_box`, rgba to NV12 for the encoder), 1140 for 570 pictures. publish
+  reported 570 packets in 19 groups, its track named `1080p` from `-pads`. A
+  second subscriber attached 8 s in and copied `live/boxed` to a file: 390
+  frames of 1920x1080 h264, by ffprobe's count. The query ended by itself
+  when the publisher's broadcast did.
+- One region split in two by the per-module placement (the same 1080p30
+  file, 900 frames, `gpu_box` into a second `gpu_box`, ffv1 into a file),
+  each run `ffrwd run --target split-local --placement per-module`, the cut
+  edge from the sidecar on node 0 to the sidecar on node 1 over the relay,
+  no ffmpeg between them, against the same query on one node in one
+  sidecar (11.4 s):
+  - raw: the frames cross as rgba, 7.5 GB; the output is byte for byte the
+    uncut run's (PSNR inf); 33.9 s.
+  - `--cut-codec h264_d3d12va:b=8M`: 30.6 MB crosses; the first sidecar's
+    `upload` and `download` are 0; 37.4 dB against the uncut run, each read
+    in its own matrix (the far side's pictures are tagged BT.709 by the
+    h264 stream, so the second sidecar's ffv1 makes its YUV in BT.709
+    where the uncut run's is BT.601); 11.9 s.
+  - `--cut-codec <pyrowave.wasm>:bytes_per_frame=125000`: 112 MB crosses as
+    PYRW; 41.7 dB against the uncut run. Pyrowave alone at 1080p and that
+    rate (`-codec encode` into `-codec decode`, against the source) is
+    41.8 dB, Y 40.9, so the split costs what the codec does. The 4K figure
+    above, 45.7 dB at 500,000 bytes, does not carry to 1080p by area: the
+    same test pattern is more detailed per pixel at the smaller size. The
+    encoder reads each picture back once, made yuv420p on the device first
+    (3.1 MB a frame), and the decoder's pictures are uploaded and made rgba
+    there. 14.9 s.
+
+**Found on the way.**
+
+- A codec package's encoder made its YUV in the frame's own colour and the
+  decoder read it back as the stream said, BT.601 where the stream says
+  nothing; the pyrowave pair was 32.8 dB until both used the stream's colour.
+- The colour a picture is read in follows the stream that carried it, and
+  the file written at the end says none of it (NUT into mkv), so the same
+  query written split and unsplit can make its YUV in two matrices.
+- A 32x24 h264 stream decoded with `d3d12va` loses the device ("Parent device
+  is lost") at the first upload, through any path; and no hosted h264 encoder
+  opens at that size. Recipe 162 is pinned on `source_replay`'s 32x24
+  stream; its paths were run at 1080p instead.
+- On this gnullvm build pyrowave needs `dxcompiler.dll` on the path
+  (`WGPU_DX12_COMPILER=dxc`, the Windows SDK's) for subgroups on D3D12.
+- `ffrwd/moq`'s built modules under its `target/` were 0.5.0, older world;
+  its source is 0.9.1, node world. Both shapes now join the region.
+
+**Follow-up.** Pyrowave reads and writes bytes: its encoder in a GPU region
+reads each picture back and its decoder's pictures are uploaded. A build on
+`ffrwd:gpu` textures would keep a GPU-to-GPU hop on the device on both sides,
+which is where pyrowave belongs between two GPU regions on two machines.
+Deciding when to cut is open: a cost model weighing what a split frees
+(a GPU, cores, a node) against what crossing costs (bytes on the wire, an
+encode and a decode, the generation loss above) would call `_cut` with the
+streams it picks, beside or instead of the per-module placement.
+
 ## 5. Risks and open questions
 
 - **wgpu's dispatch traits are not semver-stable.** The unreleased
