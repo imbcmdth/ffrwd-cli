@@ -574,6 +574,19 @@ segment costs the pass about 10% for its upload (1.18 s against 1.01 s at
 1080p). Decode and encode bound both here, so the pass pays where the CPU
 filters are heavy or the CPU is weak, not on this machine.
 
+**Wave 0's acceptance, measured (2026-10-12, owner's machine, quiet):**
+4K30 rgba through `invert` (`ffrwd run --profile`, 300 frames of
+3840x2160, h264 in, `h264_nvenc` out) takes 9.35 s at `-jobs 1` and 9.33 s
+at the default, start-up included: 32 fps, faster than real time. The
+profile row counts each frame once at each of the sidecar's four stages
+(`read` off the pipe into the demuxer's payload, `fetch` into wasm, `emit`
+lifted out of wasm, `write` to the pipe), so the sidecar's own copies are
+four, plus the one inside the write path's buffered writer: five, where
+section 1 counted about twelve. ffmpeg's rawvideo packing and unpacking
+on either side is outside the row and unchanged. Both acceptance lines
+hold. The bound at this rate is the pipes, about 1 GB/s each way, which is
+what the coded edges of wave 2 and the pool of wave 3 remove.
+
 ### Wave 1: wgpu over wasi:webgpu, finished
 
 The experiment's backend made a product. Independent of the sidecar
@@ -1900,6 +1913,61 @@ decides whether it joins.
   packed 4:2:2 buffers by DMA with no CPU, plus `convert`'s unpack pass.
   To measure: latency from the card's frame to the compositor's tick, and
   whether the pool's count bound holds under a card's own pacing.
+
+**Pyrowave, measured (2026-10-12, owner's machine, quiet, D3D12 with
+DXC):** three round trips chained at 4K (`pyrowave_roundtrip` 0.3.1,
+120 frames of 3840x2160 yuv420p testsrc2), PSNR against the source after
+each hop:
+
+| bytes a frame | hop 1 | hop 2 | hop 3 |
+|---|---|---|---|
+| 250,000 (50x smaller than raw) | 39.5 dB | 38.8 dB | 38.7 dB |
+| 500,000 (25x smaller than raw) | 45.7 dB | 44.9 dB | 44.8 dB |
+
+The loss is almost all in the first hop; a second and third encode of
+the same picture cost under one dB together. Per hop, the module's own
+rows give 5.8 ms to encode and 4.7 ms to decode at 4K, about 95 round
+trips a second on one stream; its call takes about 32 ms only because this
+older-world module copies the 12.4 MB frame across the module boundary
+both ways, which a texture-based build on `ffrwd:gpu` would not. It takes
+yuv420p only: no alpha, so a matte cannot cross on it. Verdict: on one
+machine a single region holding textures beats it outright (no encode at
+all); it earns its place on an edge between two GPU regions that must
+cross a process or a machine, where 12.4 MB a frame becomes 0.5 MB for
+about 10 ms of GPU and under one dB over the first hop. Capture and
+playout cards are not measured: there is no card here.
+
+## What needs the L4
+
+Everything below is Linux on an NVIDIA card, which this work could not
+run; each item names what it takes, and the notes above have the detail.
+
+1. **The Vulkan decoder into the pool** (wave 3 items 3 and 5): the shared
+   Vulkan device opened with the video-decode extensions and a decode
+   queue family through wgpu-hal's raw open; `AVVulkanDeviceContext` filled
+   from it; `AVVkFrame`'s image, layout and timeline semaphore read; a wait
+   on the semaphore through a raw submit, since wgpu-core's submit takes
+   none; the `VkImage` wrapped as `G8_B8R8_2PLANE_420`. A `gpu/vulkan.rs`
+   beside `gpu/d3d12.rs` and an `av::Shared::Vulkan` beside the D3D12 one.
+2. **The encoder from the pool**: NVENC reads CUDA or D3D11 frames, not
+   Vulkan, so on Linux it needs the pool slot exported
+   (`VK_KHR_external_memory_fd`) and imported into CUDA, or libavcodec's
+   Vulkan encoders where the driver has Vulkan video encode.
+3. **Inference from the pool on CUDA** (wave 4): buffers on dedicated
+   memory exported as `OPAQUE_FD` and handed to wgpu as hal buffers, a
+   timeline semaphore exported as an fd, `cudaImportExternalMemory` and
+   `cudaImportExternalSemaphore` from `libcudart.so.12`, and the CUDA
+   device matched by UUID, since Linux has no LUID.
+4. **The `filter` node's Linux routes** (wave 3 item 6a): the `_cuda`
+   filters are in the v1.2.0 build and need the same Vulkan-to-CUDA import
+   as item 3; the `_vulkan` filters need a GLSL compiler in the build
+   image (they were dropped from v1.2.0) and an `AVVulkanDeviceContext`
+   over the shared device as in item 1.
+5. **The card pass's Vulkan family** (wave 0 item 7): compiled and pinned,
+   never run on a card.
+6. **The acceptance lines that name the L4**: the benchmark recipe (160)
+   at real time there, and section 3's harness run there for its GPU and
+   readback columns.
 
 ## 5. Risks and open questions
 
