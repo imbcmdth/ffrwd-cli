@@ -102,7 +102,7 @@ jobs:
       - name: Point discovery at the freshly built sidecar
         run: echo "FFRWD_WASM=$GITHUB_WORKSPACE/sidecar/target/release/ffrwd-wasm" >> "$GITHUB_ENV"
 
-      # The two inference modules bind a model file beside their wasm; the
+      # The inference modules bind a model file beside their wasm; the
       # compiler checks it exists, so the cookbook's inference recipes need
       # the pinned files even where no inference runs.
       - name: Fetch module models (pinned)
@@ -112,6 +112,7 @@ jobs:
           echo "afb6a5c28f3b6bf1618c6e43f02073ef9dfdc70e937502d51603e57b0a1df10c  $M/depth.onnx" | sha256sum -c
           curl -sSfL -o "$M/segment.onnx" "https://huggingface.co/mobilint/YOLOv8n-seg/resolve/7b775a2526a57688597b2abe50dae6ec6567d4cf/yolov8n-seg.onnx"
           echo "cb1e689c548b3fa019691c9c1762f38a76276981ce75d31f6c5aae396dbff78b  $M/segment.onnx" | sha256sum -c
+          cp "$GITHUB_WORKSPACE/sidecar/modules/nn-frames/model/channel-means-batch.onnx" "$M/nn_frames.onnx"
 
       - name: Generate synthetic media fixtures
         run: python scripts/gen_fixtures.py

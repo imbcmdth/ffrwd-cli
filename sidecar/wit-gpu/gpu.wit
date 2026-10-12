@@ -13,8 +13,9 @@
 // with bytes (a download, done once per frame), and `same` still passes a
 // frame through. What `frames` adds is the planes as textures and a way to
 // emit a texture; what `nn` adds is a frame made into a model's input
-// tensor without the module fetching its bytes, and a model's output held
-// as a texture without the module reading it back.
+// tensor (or crops of a frame, batched into one tensor) without the module
+// fetching its bytes, and a model's output held as a texture without the
+// module reading it back.
 
 package ffrwd:gpu@0.1.0;
 
@@ -115,6 +116,14 @@ interface nn {
     letterbox,
   }
 
+  /// The kernel a picture is resampled with: `bilinear` is linear in each
+  /// direction, `bicubic` is Keys' cubic with a = -0.5 (Catmull-Rom),
+  /// which is Pillow's BICUBIC.
+  enum resize-filter {
+    bilinear,
+    bicubic,
+  }
+
   /// What the tensor is made as.
   record frame-tensor-options {
     /// The model the tensor is for, by the name `-nn` binds it to and
@@ -138,18 +147,50 @@ interface nn {
     scale: f32,
     mean: tuple<f32, f32, f32>,
     std: tuple<f32, f32, f32>,
+    /// The resampling kernel.
+    filter: resize-filter,
+    /// Whether the kernel is widened by the scale where the picture
+    /// shrinks, so that every source pixel under an output pixel is read,
+    /// as Pillow's `resize` and PyTorch's `antialias` do. Without it the
+    /// kernel keeps its own width at every scale: two samples across for
+    /// `bilinear`, four for `bicubic`.
+    antialias: bool,
+  }
+
+  /// A rectangle of a frame, in the frame's pixels: its left and top edges
+  /// and its size.
+  record rect {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
   }
 
   /// Frame `index` of stream `id` this tick, as `frames.planes` numbers
   /// it, as an fp32 tensor of the shape `options.layout` names. The frame
-  /// is resized with bilinear filtering from pixel centres (the chroma of
-  /// a subsampled frame sited at the centre of the pixels it covers). The
-  /// tensor is valid for this call of `process`; it may be passed to
-  /// `compute` of the graph `options.model` names, and `data` reads its
-  /// elements back. A stream not bound at `init`, an index past the
-  /// tick's frames, a model no `-nn` binds, a size of 0, or a `std` of 0
-  /// is an error.
+  /// is resampled from pixel centres with `options.filter`, widened where
+  /// `options.antialias` says (the chroma of a subsampled frame sited at
+  /// the centre of the pixels it covers, and each sample made RGB before
+  /// it is weighed), and the weighed value is clamped to 0 to 1. Near an
+  /// edge the weights of the samples past it are dropped and the rest
+  /// scaled to sum to 1, as Pillow does. The tensor
+  /// is valid for this call of `process`; it may be passed to `compute` of
+  /// the graph `options.model` names, and `data` reads its elements back.
+  /// A stream not bound at `init`, an index past the tick's frames, a
+  /// model no `-nn` binds, a size of 0, or a `std` of 0 is an error.
   frame-tensor: func(id: u32, index: u32, options: frame-tensor-options) -> result<tensor, string>;
+
+  /// Rectangles `crops` of frame `index` of stream `id`, each made into a
+  /// picture of the tensor the way `frame-tensor` makes a whole frame, as
+  /// one fp32 tensor with the crops along its first dimension, in the
+  /// order given: [N, 3, height, width] for `nchw`, [N, height, width, 3]
+  /// for `nhwc`. Each crop is fitted to the tensor's size on its own, and
+  /// its edges are the edges the resampling stops at, so a crop reads only
+  /// its own pixels, as a crop cut out and then resized does. A rectangle
+  /// reaching past the frame is cut to it. An empty list, a rectangle with
+  /// nothing of it on the frame, and everything `frame-tensor` refuses are
+  /// errors.
+  crops-tensor: func(id: u32, index: u32, crops: list<rect>, options: frame-tensor-options) -> result<tensor, string>;
 
   /// An output of a graph held as a texture.
   record output-texture-options {

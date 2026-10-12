@@ -37,7 +37,7 @@ use ffrwd::av::types::{Meta, RawFrame, Wants};
 use ffrwd::gpu::frames::emit;
 use ffrwd::gpu::nn::{
     frame_tensor, output_texture, ChannelOrder, Fit, FrameTensorOptions, OutputTextureOptions,
-    TensorLayout,
+    ResizeFilter, TensorLayout,
 };
 use ffrwd::gpu::types::{FrameMemory, PortMemory};
 use serde::Deserialize;
@@ -237,6 +237,8 @@ fn tensor_options() -> FrameTensorOptions {
         scale: 1.0,
         mean: (MEAN[0], MEAN[1], MEAN[2]),
         std: (STD[0], STD[1], STD[2]),
+        filter: ResizeFilter::Bilinear,
+        antialias: false,
     }
 }
 

@@ -503,3 +503,16 @@ with its feed unbound.
 
 `WHERE s.t < 10` is the consumer's: it reads ten seconds and closes the
 pipe, and the sidecar ends.
+
+**163.** `nn_frames` asking for two rectangles of each frame as one
+batched tensor (`ffrwd:gpu/nn.crops-tensor`). `crops` is its param, a
+JSON list of `[x, y, width, height]`; the module holds `v` on the GPU, so
+the region takes the input's packets and decodes them onto the device,
+and the rows leave on `rows`.
+
+    ffrwd-wasm -f nut -i pipe:0 -nn nn_frames=nn_frames.onnx -gpu nn_frames.wasm \
+      -m nn_frames=nn_frames.wasm -filter_complex \
+      '[0:v]decode=format=yuv420p:hw=auto[decode0];'\
+    '[v=decode0]nn_frames=model=nn_frames:memory=gpu:crops=\[\[40\,30\,120\,160\]\,\[200\,'\
+    '60\,90\,110\]\]:width=224:height=224:filter=bicubic:antialias=1[rows=out0]' -map \
+      '[out0]' -f ndjson crops.ndjson

@@ -39,7 +39,7 @@ use ffrwd::av::types::{Meta, RawFrame, Wants};
 use ffrwd::gpu::frames::emit;
 use ffrwd::gpu::nn::{
     frame_tensor, output_texture, ChannelOrder, Fit, FrameTensorOptions, OutputTextureOptions,
-    TensorLayout,
+    ResizeFilter, TensorLayout,
 };
 use ffrwd::gpu::types::{FrameMemory, PortMemory};
 use wasi::nn::graph::{load_by_name, Graph};
@@ -243,6 +243,8 @@ fn tensor_options() -> FrameTensorOptions {
         scale: 1.0,
         mean: (0.0, 0.0, 0.0),
         std: (1.0, 1.0, 1.0),
+        filter: ResizeFilter::Bilinear,
+        antialias: false,
     }
 }
 

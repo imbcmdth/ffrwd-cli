@@ -888,6 +888,11 @@ fn means_model(nhwc: bool) -> PathBuf {
     })
 }
 
+/// `channel-means-batch.onnx`: the six numbers of each picture of a batch.
+fn means_batch_model() -> PathBuf {
+    sidecar_root().join("modules/nn-frames/model/channel-means-batch.onnx")
+}
+
 const MEANS_WIDTH: u32 = 64;
 const MEANS_HEIGHT: u32 = 48;
 const MEANS_FRAMES: usize = 4;
@@ -947,17 +952,38 @@ fn means_run(
     params: &str,
     extra: &[&str],
 ) -> (Vec<serde_json::Value>, String) {
+    means_run_on(
+        runtime,
+        dir,
+        input,
+        target,
+        &means_model(nhwc),
+        params,
+        extra,
+    )
+}
+
+/// One nn_frames run, as `means_run`, binding `model` as `means`.
+fn means_run_on(
+    runtime: &std::path::Path,
+    dir: &std::path::Path,
+    input: &std::path::Path,
+    target: &str,
+    model: &std::path::Path,
+    params: &str,
+    extra: &[&str],
+) -> (Vec<serde_json::Value>, String) {
     let module = frames_module();
     let module = module.to_string_lossy().to_string();
     let rows = dir.join(format!(
         "rows-{target}-{}.ndjson",
-        params.replace([':', '='], "_")
+        params.replace([':', '=', '\'', '[', ']', ','], "_")
     ));
     let _ = std::fs::remove_file(&rows);
     let mut args: Vec<String> = extra.iter().map(|a| a.to_string()).collect();
     args.extend([
         "-nn".to_string(),
-        format!("means={}", means_model(nhwc).display()),
+        format!("means={}", model.display()),
         "-nn-target".to_string(),
         target.to_string(),
         "-gpu".to_string(),
@@ -969,7 +995,7 @@ fn means_run(
         "-m".to_string(),
         format!("nn_frames={module}"),
         "-filter_complex".to_string(),
-        format!("[v=0:v]nn_frames=model=means:{params}[@rows=r]"),
+        format!("[v=0:v]nn_frames=model=means:{params}[rows=r]"),
         "-map".to_string(),
         "[r]".to_string(),
         "-f".to_string(),
@@ -1205,7 +1231,7 @@ fn pictures_decoded_on_the_device_are_bound_to_cuda_and_never_read_back() {
             .args(["-m", &format!("nn_frames={module}"), "-filter_complex"])
             .arg(
                 "[0:v]decode=format=yuv420p:hw=d3d12va[d];\
-                 [v=d]nn_frames=model=means:memory=gpu:width=32:height=24[@rows=r]",
+                 [v=d]nn_frames=model=means:memory=gpu:width=32:height=24[rows=r]",
             )
             .args(["-map", "[r]", "-f", "ndjson"])
             .arg(&rows)
@@ -1256,6 +1282,135 @@ fn pictures_decoded_on_the_device_are_bound_to_cuda_and_never_read_back() {
     assert_eq!(bound.len(), downloaded.len());
     let worst = apart(&downloaded, &bound);
     assert!(worst < 1e-4, "apart by up to {worst}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Whether `ffmpeg` runs.
+fn ffmpeg_runs() -> bool {
+    Command::new("ffmpeg")
+        .arg("-version")
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+#[test]
+fn crops_of_pictures_decoded_on_the_device_are_read_after_the_pass_writes_them() {
+    // A bound input is read once the pass that makes it has run: every
+    // frame's rows on a bound route are the rows the frame gives when its
+    // tensor is read back, and never the frame before's. A 4K picture
+    // decoded on the device keeps the pass waiting on the decoder, which is
+    // when a session reading too early reads the buffer's last tensor.
+    let Some(runtime) = runtime_dir() else {
+        announce_skip("nn_frames cannot run a model without a runtime");
+        return;
+    };
+    if !cfg!(windows) {
+        eprintln!("SKIPPED: a decoder shares the process's device on Windows (D3D12) only.");
+        return;
+    }
+    let Some(av) = std::env::var_os("FFRWD_AV_RUNTIME")
+        .map(PathBuf::from)
+        .filter(|d| d.join("avcodec-63.dll").is_file())
+    else {
+        eprintln!(
+            "SKIPPED: decoded pictures into a model. Point FFRWD_AV_RUNTIME at a directory \
+             holding FFmpeg 9.0's shared libraries to run it."
+        );
+        return;
+    };
+    if !ffmpeg_runs() {
+        eprintln!("SKIPPED: put ffmpeg on PATH to encode the test's input.");
+        return;
+    }
+    let dir = means_dir("ordered");
+    let input = dir.join("moving.nut");
+    let output = Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi"])
+        .args(["-i", "testsrc2=s=3840x2160:r=30:d=3", "-c:v", "libx264"])
+        .args([
+            "-preset", "veryfast", "-bf", "2", "-pix_fmt", "yuv420p", "-f", "nut",
+        ])
+        .arg(&input)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("spawn ffmpeg");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let module = frames_module();
+    let module = module.to_string_lossy().to_string();
+    let params = "memory=gpu:width=224:height=224:filter=bicubic:antialias=true:\
+                  crops='[[0,0,1920,1080],[1920,1080,1920,1080],[960,540,1920,1080]]'";
+    let run = |target: &str| {
+        let rows = dir.join(format!("rows-{target}.ndjson"));
+        let output = Command::new(env!("CARGO_BIN_EXE_ffrwd-wasm"))
+            .env_remove("FFRWD_NN_RUNTIME")
+            .env("FFRWD_AV_RUNTIME", &av)
+            .args(["-profile", "-nn-runtime"])
+            .arg(&runtime)
+            .args(["-nn", &format!("means={}", means_batch_model().display())])
+            .args(["-nn-target", target, "-gpu", &module, "-f", "nut", "-i"])
+            .arg(&input)
+            .args(["-m", &format!("nn_frames={module}"), "-filter_complex"])
+            .arg(format!(
+                "[0:v]decode=format=yuv420p:hw=d3d12va[d];\
+                 [v=d]nn_frames=model=means:{params}[rows=r]"
+            ))
+            .args(["-map", "[r]", "-f", "ndjson"])
+            .arg(&rows)
+            .output()
+            .expect("spawn ffrwd-wasm");
+        let message = stderr(&output);
+        assert!(
+            output.status.success() || message.contains("no GPU"),
+            "{target}: {message}"
+        );
+        let rows: Vec<serde_json::Value> = std::fs::read_to_string(&rows)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("a row is JSON"))
+            .collect();
+        (rows, message)
+    };
+    let (downloaded, message) = run("cpu");
+    if message.contains("no GPU") {
+        eprintln!("SKIPPED: this machine has no GPU adapter.");
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+    assert_eq!(downloaded.len(), 90, "{message}");
+    let moved = downloaded
+        .windows(2)
+        .filter(|pair| apart(&pair[..1], &pair[1..]) > 1e-3)
+        .count();
+    assert!(
+        moved > 80,
+        "consecutive frames' tensors differ: {moved} of 89 pairs do"
+    );
+    for (target, provider) in [("cuda", "CUDA"), ("directml", "DIRECTML")] {
+        let (bound, message) = run(target);
+        if !message.contains(&format!("[nn] means: execution provider {provider}")) {
+            eprintln!("SKIPPED: {provider} did not engage here:\n{message}");
+            continue;
+        }
+        assert!(
+            message.contains(&format!(
+                "[nn] means: input from the pool, bound on {provider}"
+            )),
+            "{message}"
+        );
+        assert_eq!(bound.len(), downloaded.len(), "{provider}");
+        let late: Vec<usize> = (0..bound.len())
+            .filter(|&i| apart(&downloaded[i..=i], &bound[i..=i]) > 1e-4)
+            .collect();
+        assert!(
+            late.is_empty(),
+            "{provider}: frames {late:?} of {} were read before the pass wrote them",
+            bound.len()
+        );
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1344,6 +1499,112 @@ fn an_output_bound_to_a_texture_gives_the_same_rows_on_every_route() {
             0,
             "{provider}: the bound routes read nothing back: {message}"
         );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn crops_of_a_frame_give_the_same_rows_on_every_route() {
+    let Some(runtime) = runtime_dir() else {
+        announce_skip("nn_frames cannot run a model without a runtime");
+        return;
+    };
+    let dir = means_dir("crops");
+    let input = means_input(&dir);
+    let model = means_batch_model();
+    // An inner crop, one on the frame's right and bottom edges, and one the
+    // frame cuts to 14x8, each made a 16x12 picture: shrunk, as is, grown.
+    let crops = "crops='[[4,6,40,30],[48,36,16,12],[50,40,30,30]]'";
+    let options = format!("width=16:height=12:{crops}");
+    let pictures: u64 = 3;
+    let tensor = 16 * 12 * 3 * 4 * pictures;
+    let profile = ["-profile"];
+    for resampling in [
+        "fit=stretch",
+        "fit=letterbox:pad=0.5:filter=bicubic:antialias=true",
+    ] {
+        // On the CPU, from host memory: the reference.
+        let (host, message) = means_run_on(
+            &runtime,
+            &dir,
+            &input,
+            "cpu",
+            &model,
+            &format!("memory=host:{options}:{resampling}"),
+            &[],
+        );
+        assert!(
+            message.contains("[nn] means: input in host memory, made on the CPU"),
+            "{message}"
+        );
+        assert_eq!(host.len(), MEANS_FRAMES, "{message}");
+        assert_eq!(
+            output_values(&host[..1]).len(),
+            2 * 3 * pictures as usize,
+            "a mean and a largest value per channel of each crop: {host:?}"
+        );
+
+        // On the device and read back, for a CPU session.
+        let (downloaded, message) = means_run_on(
+            &runtime,
+            &dir,
+            &input,
+            "cpu",
+            &model,
+            &format!("memory=gpu:{options}:{resampling}"),
+            &profile,
+        );
+        if message.contains("no GPU") {
+            eprintln!("SKIPPED: the GPU routes. This machine has no GPU adapter.");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        assert!(
+            message.contains("[nn] means: input downloaded, CPU takes host memory"),
+            "{message}"
+        );
+        assert_same_rows(&host, &downloaded, "crops downloaded against the CPU");
+        assert_eq!(
+            downloaded_bytes(&message),
+            tensor * MEANS_FRAMES as u64,
+            "each frame's crops are read back once, and nothing else: {message}"
+        );
+
+        // On the device and bound in place, for a CUDA or a DirectML session.
+        for (target, provider) in [("cuda", "CUDA"), ("directml", "DIRECTML")] {
+            let (bound, message) = means_run_on(
+                &runtime,
+                &dir,
+                &input,
+                target,
+                &model,
+                &format!("memory=gpu:{options}:{resampling}"),
+                &profile,
+            );
+            if !message.contains(&format!("[nn] means: execution provider {provider}")) {
+                eprintln!("SKIPPED: {provider} did not engage here:\n{message}");
+                continue;
+            }
+            if !cfg!(windows) {
+                continue;
+            }
+            assert!(
+                message.contains(&format!(
+                    "[nn] means: input from the pool, bound on {provider}"
+                )),
+                "{message}"
+            );
+            assert_same_rows(
+                &host,
+                &bound,
+                &format!("crops bound on {provider} against the CPU"),
+            );
+            assert_eq!(
+                downloaded_bytes(&message),
+                0,
+                "{provider}: the bound routes read nothing back: {message}"
+            );
+        }
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

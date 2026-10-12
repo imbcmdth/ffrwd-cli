@@ -76,13 +76,19 @@ only narrows the `gpu` walk.
 
 One process loads one ONNX Runtime binary, and DirectML's is a different
 binary from the CPU and CUDA one, so the walk still settles one provider
-for the process: the first in the platform's order whose preflight is
-clean and that at least one bound model does not exclude. It says in one
+for the process. It takes the first in the platform's order whose
+preflight is clean and that no bound model excludes, so that every model
+runs on it; where there is none, the first whose preflight is clean and
+that at least one bound model does not exclude, the models excluding it
+then running on the CPU. A process binding `detect_faces`, which pins
+nothing, beside `ages`, which keeps off DirectML, settles CUDA and runs
+both there, rather than DirectML with `ages` on the CPU. It says in one
 line why it passed over each earlier candidate, whether preflight ruled
-it out or every model's pin did:
+it out or a model's pin did:
 
     [nn] -nn-target gpu: not DIRECTML, no onnxruntime.dll in
     C:\...\1.22.0\win-x64\directml; `ffrwd setup nn` puts the DirectML build there
+    [nn] -nn-target gpu: not DIRECTML, excluded by the pin of ages
     [nn] -nn-target gpu: not DIRECTML, excluded by every model's pin
 
 Each model's session then asks for that provider, or for the CPU where
@@ -347,16 +353,47 @@ includes `ffrwd:gpu/gpu-nn-module` beside the node world, imports the
       scale: f32,                       // (value * scale - mean) / std
       mean: tuple<f32, f32, f32>,
       std: tuple<f32, f32, f32>,
+      filter: resize-filter,            // bilinear or bicubic
+      antialias: bool,                  // widen the kernel where it shrinks
     }
 
 The answer is an ordinary `wasi:nn` tensor, fp32, which the module passes
 to `compute` like any other. `id` and `index` are the tick's, as
-`frames.planes` takes them. The frame is resized bilinearly from pixel
-centres (the chroma of a subsampled frame sited at the centre of the pixels
-it covers), its YUV made RGB with the stream's matrix and range, and each
-channel, read as 0 to 1, becomes `(value * scale - mean) / std`. A
-letterbox fills the bars with `pad` before the normalisation: 0 is black,
-114/255 the grey YOLO models are trained on.
+`frames.planes` takes them. Each sample of the frame is made RGB, its YUV
+with the stream's matrix and range (the chroma of a subsampled frame read
+bilinearly, sited at the centre of the pixels it covers), the samples
+are weighed by the resampling kernel, and the sum is clamped to 0 to 1.
+The kernel is `bilinear`, or `bicubic`, which is
+Keys' cubic with a = -0.5 (Pillow's BICUBIC). With `antialias` the kernel
+is widened by the scale where the picture shrinks, so every source pixel
+under an output pixel counts, as in Pillow's `resize` and PyTorch's
+`antialias`; without it the kernel reads two samples across for
+`bilinear` and four for `bicubic` at every scale. Near an edge the weights
+of the samples past it are dropped and the rest scaled to sum to 1, as
+Pillow does. `bilinear` without `antialias` is what `frame-tensor` did
+before the two fields existed. Each channel, read as 0 to 1, then becomes
+`(value * scale - mean) / std`. A letterbox fills the bars with `pad`
+before the normalisation: 0 is black, 114/255 the grey YOLO models are
+trained on.
+
+A module that runs a model on parts of a frame, such as an age model on
+each face a detector found, asks for the parts as one batched tensor:
+
+    record rect { x: u32, y: u32, width: u32, height: u32 }
+
+    crops-tensor: func(id: u32, index: u32, crops: list<rect>,
+        options: frame-tensor-options) -> result<tensor, string>;
+
+Each rectangle, in the frame's pixels, is made into one picture of the
+tensor the way `frame-tensor` makes a whole frame, and the pictures are
+stacked in the order given: `[N, 3, height, width]` for `nchw`,
+`[N, height, width, 3]` for `nhwc`. A crop's edges are the edges the
+resampling stops at, so it reads only its own pixels, as a crop cut out
+and then resized does; `fit` and `pad` apply to each crop on its own. A
+rectangle reaching past the frame is cut to it. An empty list and a
+rectangle with nothing of it on the frame are refused. The tensor takes
+the same routes to the session as `frame-tensor`'s, and the same line
+names the route.
 
 How the tensor reaches the session depends on where the frame is and on the
 provider the model's session engaged. The host says which, once per model:
@@ -371,7 +408,9 @@ provider the model's session engaged. The host says which, once per model:
 | in host memory | any | the same arithmetic on the CPU, from the frame's bytes | `[nn] depth: input in host memory, made on the CPU` |
 
 On the CUDA route every CUDA session runs on a stream the host made
-(`user_compute_stream`). The queue signals a shared D3D12 sync object after
+(`user_compute_stream`). It is a blocking stream: ONNX Runtime makes some
+of a run's copies on CUDA's legacy default stream, which is ordered only
+against blocking streams. The queue signals a shared D3D12 sync object after
 the pass, CUDA imports that sync object as an external semaphore, and the
 wait on it is queued in the session's stream ahead of the run, so the GPU
 orders the pass and the run and the CPU waits for neither. Where the stream

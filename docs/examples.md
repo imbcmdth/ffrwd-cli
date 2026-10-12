@@ -1816,3 +1816,39 @@ ffrwd-wasm -gpu ../sidecar/modules/target/wasm32-wasip2/release/gpu_box.wasm -m 
 ```
 
 A source of an older world is a node of the network named by the tracks it writes, `[track0=...]` for the first track of its catalog. ffrwd/moq's `subscribe` and `publish` are nodes already, so `ffrwd.moq.subscribe(...)` into a module like this one and `TO ffrwd.moq.publish(...)` compile the same way, the sink's row and rendition given by `-pads` since its pad reads a label of the network rather than an `-i`. A codec package's encoder or decoder beside such a module runs in its region too.
+
+## 163. Crops of a frame, batched into one tensor
+
+A module that runs a model on parts of a frame, such as an age model on each face a detector found, can ask the sidecar for those rectangles as one batched tensor instead of fetching the frame. `nn_frames` is the test module that does this. Its `crops` parameter is a JSON list of `[x, y, width, height]` rectangles. Each crop is resized on its own to the tensor's size, here with Pillow's bicubic kernel widened where the crop shrinks, and the crops are stacked along the tensor's first dimension. The model, `nn_frames.onnx` beside the module, returns each crop's channel means and largest values, and the rows go to the file:
+
+```pgsql
+CREATE FUNCTION nn_frames(v video_stream, model text DEFAULT 'nn_frames',
+                          memory text DEFAULT 'gpu', crops text DEFAULT NULL,
+                          width number DEFAULT 224, height number DEFAULT 224,
+                          filter text DEFAULT 'bicubic', antialias boolean DEFAULT TRUE)
+RETURNS STRUCT(pts number, tensor_ms number, compute_ms number)[]
+  AS '../sidecar/modules/target/wasm32-wasip2/release/nn_frames.wasm', 'nn_frames'
+  LANGUAGE wasm;
+
+COPY (
+  SELECT nn_frames(f.video[1], crops => '[[40,30,120,160],[200,60,90,110]]')
+  FROM input('tests/fixtures/testsrc.mp4') f
+) TO 'crops.ndjson'
+```
+
+```
+$ ffrwd compile -f query.sql
+ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 copy -f nut pipe:1 | ffrwd-wasm -f \
+  nut -i pipe:0 -nn \
+  nn_frames=../sidecar/modules/target/wasm32-wasip2/release/nn_frames.onnx -gpu \
+  ../sidecar/modules/target/wasm32-wasip2/release/nn_frames.wasm -m \
+  nn_frames=../sidecar/modules/target/wasm32-wasip2/release/nn_frames.wasm \
+  -filter_complex \
+  '[0:v]decode=format=yuv420p:hw=auto[decode0];'\
+'[v=decode0]nn_frames=model=nn_frames:memory=gpu:crops=\[\[40\,30\,120\,160\]\,\[200\,'\
+'60\,90\,110\]\]:width=224:height=224:filter=bicubic:antialias=1[rows=out0]' -bound \
+  'nn_frames=[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]}]' -map '[out0]' -f \
+  ndjson crops.ndjson
+```
+
+With `memory => 'gpu'` the frame is decoded onto the device and the crops are made there in one pass. Where the model's session is CUDA or DirectML on the same device, the tensor is bound to the session in place and nothing is read back. With `memory => 'host'` the crops are made on the CPU with the same arithmetic. A rectangle reaching past the frame is cut to it, and a rectangle with nothing on the frame is an error. `sidecar/NN-EDGE.md`, "Inputs from the pool", has the resampling and the routes.

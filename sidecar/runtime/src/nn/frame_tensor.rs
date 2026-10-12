@@ -1,5 +1,6 @@
-//! A tick's frame made into a model's input tensor, by whichever route the
-//! model's session can take, and one line on stderr per model saying which.
+//! A tick's frame, or crops of it, made into a model's input tensor, by
+//! whichever route the model's session can take, and one line on stderr per
+//! model saying which.
 //!
 //! A frame held on the GPU is made into the tensor by a pass on the device
 //! ([`crate::gpu::tensor`]). Where the model's session is CUDA, the
@@ -30,7 +31,7 @@ use wasmtime_wasi_nn::backend::onnx::Provider;
 use wasmtime_wasi_nn::wit::TensorType;
 use wasmtime_wasi_nn::Tensor;
 
-use crate::gpu::tensor::{host_tensor, to_bytes, TensorSpec};
+use crate::gpu::tensor::{host_tensor, to_bytes, Rect, TensorSpec};
 use crate::node::FrameData;
 
 /// How a model's inputs from frames on the GPU reach its session.
@@ -116,7 +117,8 @@ fn settle(provider: Provider) -> Route {
 }
 
 /// Frame `frame`, a `width` x `height` `pix_fmt` frame of a stream, made into
-/// the tensor `spec` says for the model bound as `model`.
+/// the tensor `spec` says for the model bound as `model`: the whole frame,
+/// or each of `crops` cut to the frame, one picture after another.
 pub fn frame_tensor(
     frame: &FrameData,
     pix_fmt: &str,
@@ -124,8 +126,13 @@ pub fn frame_tensor(
     height: u32,
     model: &str,
     spec: &TensorSpec,
+    crops: Option<&[Rect]>,
 ) -> Result<Tensor> {
-    spec.check()?;
+    let crops = match crops {
+        Some(crops) => crate::gpu::tensor::cut(crops, width, height)?,
+        None => vec![Rect::whole(width, height)],
+    };
+    spec.check(crops.len())?;
     let Some(provider) = crate::nn::provider_of(model) else {
         let bound = crate::nn::model_names();
         bail!(
@@ -137,10 +144,10 @@ pub fn frame_tensor(
             }
         );
     };
-    let dimensions = spec.dimensions();
+    let dimensions = spec.dimensions(crops.len() as u32);
     let gpu = match frame {
         FrameData::Host(bytes) => {
-            let values = host_tensor(bytes, pix_fmt, width, height, spec)?;
+            let values = host_tensor(bytes, pix_fmt, width, height, spec, &crops)?;
             say(model, "input in host memory, made on the CPU");
             return Ok(Tensor::new(dimensions, TensorType::Fp32, to_bytes(&values)));
         }
@@ -148,7 +155,7 @@ pub fn frame_tensor(
     };
     let why = match route(model, provider) {
         #[cfg(windows)]
-        Route::Bound(binder) => match binder.bind(gpu, spec) {
+        Route::Bound(binder) => match binder.bind(gpu, spec, &crops) {
             Ok(tensor) => {
                 say(model, "input from the pool, bound on CUDA");
                 return Ok(tensor);
@@ -165,7 +172,7 @@ pub fn frame_tensor(
             }
         },
         #[cfg(windows)]
-        Route::DirectMl => match bound::bind_directml(gpu, spec) {
+        Route::DirectMl => match bound::bind_directml(gpu, spec, &crops) {
             Ok(tensor) => {
                 say(model, "input from the pool, bound on DIRECTML");
                 return Ok(tensor);
@@ -181,7 +188,7 @@ pub fn frame_tensor(
         },
         Route::Downloaded(why) => why,
     };
-    let made = gpu.tensor(spec, false)?;
+    let made = gpu.tensor(spec, &crops, false)?;
     let bytes = made.read_back()?;
     say(model, &format!("input downloaded, {why}"));
     Ok(Tensor::new(dimensions, TensorType::Fp32, bytes))
@@ -200,7 +207,7 @@ pub(crate) mod bound {
 
     use crate::gpu::d3d12::{adapter_luid, SharedSync};
     use crate::gpu::frames::GpuFrame;
-    use crate::gpu::tensor::{DeviceTensor, TensorSpec};
+    use crate::gpu::tensor::{DeviceTensor, Rect, TensorSpec};
     use crate::nn::cuda::{Cuda, CudaBuffer, CudaSemaphore, SESSION_DEVICE};
     use crate::profile::PROFILE;
 
@@ -241,10 +248,15 @@ pub(crate) mod bound {
             Ok(Binder { cuda, semaphore })
         }
 
-        /// `frame` made into `spec`'s tensor in a buffer CUDA has mapped, as
-        /// a tensor whose elements are that buffer.
-        pub fn bind(&'static self, frame: &GpuFrame, spec: &TensorSpec) -> Result<Tensor> {
-            let made = frame.tensor(spec, true)?;
+        /// `crops` of `frame` made into `spec`'s tensor in a buffer CUDA has
+        /// mapped, as a tensor whose elements are that buffer.
+        pub fn bind(
+            &'static self,
+            frame: &GpuFrame,
+            spec: &TensorSpec,
+            crops: &[Rect],
+        ) -> Result<Tensor> {
+            let made = frame.tensor(spec, crops, true)?;
             let buffer = &made.buffer;
             let mapped = buffer
                 .cuda
@@ -265,21 +277,21 @@ pub(crate) mod bound {
                 binder: self,
             };
             Ok(Tensor::on_device(
-                spec.dimensions(),
+                made.dimensions(),
                 TensorType::Fp32,
                 DeviceHandle(Arc::new(input)),
             ))
         }
     }
 
-    /// `frame` made into `spec`'s tensor in a buffer of the process's
-    /// device, as a tensor whose elements are that buffer handed to
-    /// DirectML.
-    pub fn bind_directml(frame: &GpuFrame, spec: &TensorSpec) -> Result<Tensor> {
-        let made = frame.tensor(spec, true)?;
+    /// `crops` of `frame` made into `spec`'s tensor in a buffer of the
+    /// process's device, as a tensor whose elements are that buffer handed
+    /// to DirectML.
+    pub fn bind_directml(frame: &GpuFrame, spec: &TensorSpec, crops: &[Rect]) -> Result<Tensor> {
+        let made = frame.tensor(spec, crops, true)?;
         let allocation = crate::nn::directml::allocation_of_buffer(&made.buffer)?;
         Ok(Tensor::on_device(
-            spec.dimensions(),
+            made.dimensions(),
             TensorType::Fp32,
             DeviceHandle(Arc::new(DirectMlInput {
                 allocation: allocation.pointer(),
@@ -362,7 +374,7 @@ pub(crate) mod bound {
                 .mapped()
                 .and_then(|m| m.read())
                 .map_err(|e| wasmtime::format_err!("{e:#}"))?;
-            let len = self.tensor.spec.byte_len() as usize;
+            let len = self.tensor.byte_len() as usize;
             PROFILE.download.add(len, started);
             Ok(bytes[..len].to_vec())
         }

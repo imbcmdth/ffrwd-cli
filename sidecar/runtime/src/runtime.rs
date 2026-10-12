@@ -2045,20 +2045,25 @@ impl gpu_ext::ffrwd::gpu::frames::Host for Host {
 }
 
 #[cfg(feature = "gpu")]
-impl gpu_ext::ffrwd::gpu::nn::Host for Host {
-    fn frame_tensor(
+impl Host {
+    /// Frame `index` of stream `id`, or `crops` of it, made into the tensor
+    /// `options` says: what `frame-tensor` and `crops-tensor` share. `call`
+    /// names the function for a refusal.
+    fn tensor_of_frame(
         &mut self,
+        call: &str,
         id: u32,
         index: u32,
+        crops: Option<&[gpu_ext::ffrwd::gpu::nn::Rect]>,
         options: gpu_ext::ffrwd::gpu::nn::FrameTensorOptions,
     ) -> wasmtime::Result<Result<Resource<wasmtime_wasi_nn::Tensor>, String>> {
         use crate::gpu::frames::{Matrix, Yuv};
-        use crate::gpu::tensor::{Fit, Layout, Order, TensorSpec};
+        use crate::gpu::tensor::{Filter, Fit, Layout, Order, Rect, TensorSpec};
         use gpu_ext::ffrwd::gpu::nn as wit;
         let Some(rep) = self.gpu_tick else {
-            return Ok(Err(
-                "frame-tensor is called while process runs, and no call is running".to_string(),
-            ));
+            return Ok(Err(format!(
+                "{call} is called while process runs, and no call is running"
+            )));
         };
         let handle: &node_world::TickHandle = self.table.get(&Resource::new_borrow(rep))?;
         let (frame, format) = match (handle.frame(id, index), handle.video(id)) {
@@ -2092,7 +2097,23 @@ impl gpu_ext::ffrwd::gpu::nn::Host for Host {
             mean: [options.mean.0, options.mean.1, options.mean.2],
             std: [options.std.0, options.std.1, options.std.2],
             yuv,
+            filter: match options.filter {
+                wit::ResizeFilter::Bilinear => Filter::Bilinear,
+                wit::ResizeFilter::Bicubic => Filter::Bicubic,
+            },
+            antialias: options.antialias,
         };
+        let crops: Option<Vec<Rect>> = crops.map(|crops| {
+            crops
+                .iter()
+                .map(|r| Rect {
+                    x: r.x,
+                    y: r.y,
+                    width: r.width,
+                    height: r.height,
+                })
+                .collect()
+        });
         let made = crate::nn::frame_tensor::frame_tensor(
             &frame.data,
             format.pix_fmt,
@@ -2100,11 +2121,34 @@ impl gpu_ext::ffrwd::gpu::nn::Host for Host {
             format.height,
             &options.model,
             &spec,
+            crops.as_deref(),
         );
         match made {
             Ok(tensor) => Ok(Ok(self.table.push(tensor)?)),
             Err(e) => Ok(Err(format!("frame {index} of stream {id}: {e:#}"))),
         }
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl gpu_ext::ffrwd::gpu::nn::Host for Host {
+    fn frame_tensor(
+        &mut self,
+        id: u32,
+        index: u32,
+        options: gpu_ext::ffrwd::gpu::nn::FrameTensorOptions,
+    ) -> wasmtime::Result<Result<Resource<wasmtime_wasi_nn::Tensor>, String>> {
+        self.tensor_of_frame("frame-tensor", id, index, None, options)
+    }
+
+    fn crops_tensor(
+        &mut self,
+        id: u32,
+        index: u32,
+        crops: Vec<gpu_ext::ffrwd::gpu::nn::Rect>,
+        options: gpu_ext::ffrwd::gpu::nn::FrameTensorOptions,
+    ) -> wasmtime::Result<Result<Resource<wasmtime_wasi_nn::Tensor>, String>> {
+        self.tensor_of_frame("crops-tensor", id, index, Some(&crops), options)
     }
 
     fn output_texture(

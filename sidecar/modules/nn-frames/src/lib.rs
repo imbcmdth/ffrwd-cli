@@ -1,13 +1,16 @@
 //! Runs a model on every frame of its one video input and writes what the
-//! model returned as rows: a sink, so it emits no frames.
+//! model returned as rows on its one output, `rows`: it emits no frames.
 //!
 //! The module never reads a frame's bytes. It asks the host for the frame
 //! as the model's input tensor (`ffrwd:gpu/nn.frame-tensor`), at the size,
-//! layout and normalisation its params give, and passes that tensor to
-//! `compute` like any other. Where the frame is held is `memory`: on the
-//! GPU, the host makes the tensor on the device, and binds it to a CUDA
-//! session in place where it can; in host memory, the host makes it on the
-//! CPU. Either way the rows are the same, which is what the tests check.
+//! layout, resampling and normalisation its params give, and passes that
+//! tensor to `compute` like any other. With `crops`, a list of `[x, y,
+//! width, height]` (as JSON, or text holding it), it asks for those
+//! rectangles of the frame instead, one picture each along the tensor's
+//! first dimension (`ffrwd:gpu/nn.crops-tensor`). Where the frame is held
+//! is `memory`: on the GPU, the host makes the tensor on the device, and
+//! binds it to a CUDA session in place where it can; in host memory, the
+//! host makes it on the CPU. Either way the rows are the same, which is what the tests check.
 //!
 //! Each row is one frame: its pts, each output by name (its values when it
 //! has 16 or fewer, else their count, mean, least and greatest), and the
@@ -22,6 +25,8 @@
 //! `model/channel-means.onnx` (NCHW) and `model/channel-means-nhwc.onnx`
 //! (NHWC) are the graphs the tests run: each channel's mean and largest
 //! value, six numbers a test can work out from the frame on its own.
+//! `model/channel-means-batch.onnx` takes a batch, crops among them, and
+//! gives the six numbers of each picture.
 
 wit_bindgen::generate!({
     path: ["../../wit", "../../wit-gpu", "wit"],
@@ -33,17 +38,17 @@ wit_bindgen::generate!({
 use std::cell::RefCell;
 use std::time::Instant;
 
-use exports::ffrwd::av::node::{Emitted, Guest};
+use exports::ffrwd::av::node::{Emission, Emitted, Guest, Payload};
 use exports::ffrwd::gpu::ports::Guest as PortsGuest;
 use ffrwd::av::node_tick::Tick;
 use ffrwd::av::node_types::{
-    Accepts, Binding, BoundStream, Clock, InputPort, NodeShape, OutputFormat, Pairing, PortKind,
-    RowsUse,
+    Accepts, Binding, BoundStream, Clock, InputPort, Message, NodeShape, OutputFormat, OutputPort,
+    Pairing, PortKind, RowsUse,
 };
 use ffrwd::av::types::{Meta, Wants};
 use ffrwd::gpu::nn::{
-    frame_tensor, output_texture, ChannelOrder, Fit, FrameTensorOptions, OutputTextureOptions,
-    TensorLayout,
+    crops_tensor, frame_tensor, output_texture, ChannelOrder, Fit, FrameTensorOptions,
+    OutputTextureOptions, Rect, ResizeFilter, TensorLayout,
 };
 use ffrwd::gpu::types::{FrameMemory, PortMemory};
 use serde::Deserialize;
@@ -55,7 +60,9 @@ use wasi::webgpu::webgpu::{
     GpuTexelCopyBufferInfo, GpuTexelCopyTextureInfo, GpuTexture,
 };
 
-const SCHEMA: &str = r#"{"type":"object","properties":{"memory":{"type":"string","enum":["gpu","host"]},"model":{"type":"string"},"input":{"type":"string"},"width":{"type":"integer","minimum":1},"height":{"type":"integer","minimum":1},"layout":{"type":"string","enum":["nchw","nhwc"]},"order":{"type":"string","enum":["rgb","bgr"]},"fit":{"type":"string","enum":["stretch","letterbox"]},"pad":{"type":"number"},"scale":{"type":"number"},"mean":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},"std":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},"texture":{"type":"string"},"texture_width":{"type":"integer","minimum":1},"texture_height":{"type":"integer","minimum":1}},"required":["model"],"additionalProperties":false}"#;
+const SCHEMA: &str = r#"{"type":"object","properties":{"memory":{"type":"string","enum":["gpu","host"]},"model":{"type":"string"},"input":{"type":"string"},"width":{"type":"integer","minimum":1},"height":{"type":"integer","minimum":1},"layout":{"type":"string","enum":["nchw","nhwc"]},"order":{"type":"string","enum":["rgb","bgr"]},"fit":{"type":"string","enum":["stretch","letterbox"]},"pad":{"type":"number"},"scale":{"type":"number"},"mean":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},"std":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},"texture":{"type":"string"},"texture_width":{"type":"integer","minimum":1},"texture_height":{"type":"integer","minimum":1},"filter":{"type":"string","enum":["bilinear","bicubic"]},"antialias":{"type":"boolean"},"crops":{"type":["string","array"]}},"required":["model"],"additionalProperties":false}"#;
+
+const ROWS_SCHEMA: &str = r#"{"type":"object","properties":{"pts":{"type":"integer"},"outputs":{"type":"object"},"tensor_ms":{"type":"number"},"compute_ms":{"type":"number"},"output_ms":{"type":"number"}}}"#;
 
 /// An output with this many values or fewer is written whole.
 const WHOLE: usize = 16;
@@ -94,6 +101,14 @@ struct Params {
     texture_width: Option<u32>,
     #[serde(default)]
     texture_height: Option<u32>,
+    #[serde(default = "bilinear")]
+    filter: String,
+    #[serde(default)]
+    antialias: bool,
+    /// Rectangles of the frame to make the tensor of, each `[x, y, width,
+    /// height]`: a JSON list, or text holding one.
+    #[serde(default)]
+    crops: Option<Value>,
 }
 
 fn gpu() -> String {
@@ -114,6 +129,9 @@ fn rgb() -> String {
 fn stretch() -> String {
     "stretch".to_string()
 }
+fn bilinear() -> String {
+    "bilinear".to_string()
+}
 fn one() -> f32 {
     1.0
 }
@@ -131,6 +149,7 @@ fn parse(text: &str) -> Result<Params, String> {
     {
         return Err("texture takes texture_width and texture_height".to_string());
     }
+    params.crops()?;
     Ok(params)
 }
 
@@ -159,7 +178,36 @@ impl Params {
             scale: self.scale,
             mean: (self.mean[0], self.mean[1], self.mean[2]),
             std: (self.std[0], self.std[1], self.std[2]),
+            filter: match self.filter.as_str() {
+                "bilinear" => ResizeFilter::Bilinear,
+                "bicubic" => ResizeFilter::Bicubic,
+                other => return Err(format!("filter is bilinear or bicubic, not '{other}'")),
+            },
+            antialias: self.antialias,
         })
+    }
+
+    fn crops(&self) -> Result<Option<Vec<Rect>>, String> {
+        let crops = match &self.crops {
+            None => return Ok(None),
+            Some(Value::String(text)) => {
+                serde_json::from_str(text).map_err(|e| format!("crops: {e}"))?
+            }
+            Some(list) => list.clone(),
+        };
+        let quads: Vec<[u32; 4]> = serde_json::from_value(crops)
+            .map_err(|e| format!("crops is a list of [x, y, width, height]: {e}"))?;
+        Ok(Some(
+            quads
+                .into_iter()
+                .map(|[x, y, width, height]| Rect {
+                    x,
+                    y,
+                    width,
+                    height,
+                })
+                .collect(),
+        ))
     }
 }
 
@@ -167,6 +215,8 @@ struct State {
     v: u32,
     input: String,
     options: FrameTensorOptions,
+    /// The rectangles to make the tensor of, or the whole frame.
+    crops: Option<Vec<Rect>>,
     context: GraphExecutionContext,
     /// The output bound to a texture, the texture, and the device to read
     /// it back with.
@@ -298,9 +348,18 @@ impl Guest for Node {
             },
             schema: None,
         };
+        let rows = OutputPort {
+            name: "rows".to_string(),
+            kind: PortKind::Data,
+            format: Some(OutputFormat::Data("json".to_string())),
+            time_base: None,
+            latency: 0.0,
+            schema: Some(ROWS_SCHEMA.to_string()),
+            row: None,
+        };
         Ok(NodeShape {
             inputs: vec![v],
-            outputs: Vec::new(),
+            outputs: vec![rows],
             clock: Clock::Input("v".to_string()),
             pure: true,
             one_to_one: false,
@@ -321,6 +380,7 @@ impl Guest for Node {
             .init_execution_context()
             .map_err(|e| format!("init-execution-context: {}", e.data()))?;
         let options = params.options()?;
+        let crops = params.crops()?;
         let texture = match (&params.texture, params.texture_width, params.texture_height) {
             (Some(name), Some(width), Some(height)) => {
                 let texture = output_texture(
@@ -345,6 +405,7 @@ impl Guest for Node {
                 v: v.id,
                 input: params.input.clone(),
                 options,
+                crops,
                 context,
                 texture,
             })
@@ -363,7 +424,10 @@ impl Guest for Node {
             let mut rows = Vec::new();
             for frame in tick.frames(state.v) {
                 let started = Instant::now();
-                let tensor = frame_tensor(state.v, frame.index, &state.options)?;
+                let tensor = match &state.crops {
+                    Some(crops) => crops_tensor(state.v, frame.index, crops, &state.options)?,
+                    None => frame_tensor(state.v, frame.index, &state.options)?,
+                };
                 let tensor_ms = ms(started);
                 let started = Instant::now();
                 let outputs = state
@@ -387,20 +451,24 @@ impl Guest for Node {
                         }
                     }
                 }
-                rows.push(
-                    json!({
-                        "pts": frame.pts,
-                        "outputs": written_outputs,
-                        "tensor_ms": tensor_ms,
-                        "compute_ms": compute_ms,
-                        "output_ms": output_ms,
-                    })
-                    .to_string(),
-                );
+                let row = json!({
+                    "pts": frame.pts,
+                    "outputs": written_outputs,
+                    "tensor_ms": tensor_ms,
+                    "compute_ms": compute_ms,
+                    "output_ms": output_ms,
+                });
+                rows.push(Emission {
+                    port: "rows".to_string(),
+                    payload: Payload::Message(Message {
+                        pts: frame.pts,
+                        data: row.to_string().into_bytes(),
+                    }),
+                });
             }
             Ok(Emitted {
-                items: Vec::new(),
-                rows,
+                items: rows,
+                rows: Vec::new(),
                 finished: false,
             })
         })

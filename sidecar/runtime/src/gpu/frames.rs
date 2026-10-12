@@ -45,7 +45,7 @@ use wgpu_core::id::TextureId;
 use wgpu_types::{Extent3d, TextureAspect, TextureFormat};
 
 use super::convert;
-use super::tensor::{DeviceTensor, Source, TensorSpec};
+use super::tensor::{DeviceTensor, Rect, Source, TensorSpec};
 use super::{shared, shared_device};
 use crate::av::DeviceFrame;
 
@@ -97,10 +97,10 @@ pub struct GpuFrame {
     /// What the frame was converted to, by target (see [`Target::key`]):
     /// made the first time something asks, and kept while the frame is.
     converted: Mutex<Vec<(Target, Arc<GpuFrame>)>>,
-    /// The frame made into model inputs, one entry per spec and per kind of
-    /// buffer (on a shared heap or not): made the first time something
+    /// The frame made into model inputs, one entry per spec, crops and kind
+    /// of buffer (on a shared heap or not): made the first time something
     /// asks, and kept while the frame is.
-    tensors: Mutex<Vec<(TensorSpec, bool, Arc<DeviceTensor>)>>,
+    tensors: Mutex<Vec<MadeTensor>>,
     /// The frame's bytes as the wire lays them out: what it was uploaded
     /// from, or what reading it back gave.
     bytes: OnceLock<Arc<Vec<u8>>>,
@@ -108,6 +108,10 @@ pub struct GpuFrame {
     #[cfg(windows)]
     wrapped: Mutex<Option<super::d3d12::Wrapped>>,
 }
+
+/// A tensor made of a frame: its spec, its crops, whether its buffer is on
+/// a shared heap, and the tensor.
+type MadeTensor = (TensorSpec, Vec<Rect>, bool, Arc<DeviceTensor>);
 
 /// The planes a wire format is held as, each as width, height, texture
 /// format and bytes per pixel, in the wire's order. None for a format
@@ -330,13 +334,21 @@ impl GpuFrame {
         (self.width, self.height)
     }
 
-    /// The frame made into a model's input tensor as `spec` says, on the
-    /// device, into a buffer of its own (`shared`: on a shared heap, for
-    /// another API to import). Made once per spec, the first time anything
-    /// asks, and kept with the frame.
-    pub fn tensor(&self, spec: &TensorSpec, shared: bool) -> Result<Arc<DeviceTensor>> {
+    /// `crops` of the frame made into a model's input tensor as `spec` says,
+    /// on the device, into a buffer of its own (`shared`: on a shared heap,
+    /// for another API to import). Made once per spec and crops, the first
+    /// time anything asks, and kept with the frame.
+    pub fn tensor(
+        &self,
+        spec: &TensorSpec,
+        crops: &[Rect],
+        shared: bool,
+    ) -> Result<Arc<DeviceTensor>> {
         let mut made = self.tensors.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((_, _, tensor)) = made.iter().find(|(s, k, _)| s == spec && *k == shared) {
+        if let Some((_, _, _, tensor)) = made
+            .iter()
+            .find(|(s, c, k, _)| s == spec && c == crops && *k == shared)
+        {
             return Ok(Arc::clone(tensor));
         }
         let source = Source::of(self.pix_fmt())
@@ -347,9 +359,10 @@ impl GpuFrame {
             &self.planes,
             source,
             spec,
+            crops,
             shared,
         )?);
-        made.push((*spec, shared, Arc::clone(&tensor)));
+        made.push((*spec, crops.to_vec(), shared, Arc::clone(&tensor)));
         Ok(tensor)
     }
 

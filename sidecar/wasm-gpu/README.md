@@ -48,8 +48,9 @@ module doing both.
 A module that runs a model on its frames includes `gpu-nn-module`
 instead, and imports the `wasi:nn` interfaces it calls beside it; it
 then asks `ffrwd:gpu/nn.frame-tensor` for a frame as the model's input
-tensor, made by the host at the size and normalisation it names, and
-passes that tensor to `compute`. `sidecar/NN-EDGE.md`, "Inputs from the
+tensor, made by the host at the size, resampling and normalisation it
+names, or `ffrwd:gpu/nn.crops-tensor` for rectangles of a frame as one
+batched tensor, and passes that tensor to `compute`. `sidecar/NN-EDGE.md`, "Inputs from the
 pool", has the routes; `sidecar/modules/nn-frames` is such a module.
 
 This package carries `wit/gpu.wit` and, under `wit/deps/`, the same

@@ -87,3 +87,5 @@ ort = { version = "=2.0.0-rc.10", default-features = false, features = ["coreml"
 # The integration tests read the rows a module emits, which are JSON.
 [dev-dependencies]
 serde_json = "1"
+# Pillow's resampling, ported: what the CPU's crops are checked against.
+ffrwd-frame = { git = "https://github.com/imbcmdth/ffrwd-frame", tag = "v0.1.1" }
