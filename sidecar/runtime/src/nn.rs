@@ -254,9 +254,9 @@ pub struct Config {
     pub runtime_dir: Option<PathBuf>,
     pub target: Target,
     /// What `-nn-exclude` said, in the order it said it. A `-nn-target gpu`
-    /// walk passes over a provider every bound model excludes, and a model
-    /// that excludes the provider the walk took runs on the CPU. Ignored for
-    /// a target named outright.
+    /// walk prefers a provider no bound model excludes, never takes one
+    /// every bound model excludes, and a model that excludes the provider
+    /// the walk took runs on the CPU. Ignored for a target named outright.
     pub exclude: Vec<Exclusion>,
 }
 
@@ -281,15 +281,38 @@ impl Config {
         self.exclude.iter().any(|e| e.denies(name, provider))
     }
 
-    /// The candidates of a `gpu` walk that every bound model excludes, and
-    /// so that the walk passes over.
-    fn excluded_by_every_model(&self) -> Vec<Provider> {
+    /// The candidates of a `gpu` walk some bound model excludes, and which
+    /// models those are.
+    fn pins(&self) -> Vec<(Provider, Pinned)> {
         GPU_PRIORITY
             .iter()
             .copied()
-            .filter(|&p| self.models.iter().all(|m| self.excludes(&m.name, p)))
+            .filter_map(|p| {
+                let by: Vec<String> = self
+                    .models
+                    .iter()
+                    .filter(|m| self.excludes(&m.name, p))
+                    .map(|m| m.name.clone())
+                    .collect();
+                if by.is_empty() {
+                    None
+                } else if by.len() == self.models.len() {
+                    Some((p, Pinned::Every))
+                } else {
+                    Some((p, Pinned::By(by)))
+                }
+            })
             .collect()
     }
+}
+
+/// Which bound models' pins exclude a candidate of the `gpu` walk.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Pinned {
+    /// Every one's.
+    Every,
+    /// These, by name, and not the rest.
+    By(Vec<String>),
 }
 
 /// A name to ONNX graph map.
@@ -703,37 +726,60 @@ fn preflight(provider: Provider, dir: &Path) -> Vec<String> {
 /// for it or for the CPU: a model that excludes the provider the walk took
 /// runs on the CPU.
 ///
-/// `gpu` walks the platform's priority order and takes the first candidate
-/// whose preflight is clean, saying in one line why it passed over each
-/// earlier one. `excluded` is the candidates every bound model excludes,
-/// dropped before their preflight ever runs -- the models' own pins, not
-/// this machine, ruled them out. A provider named outright is taken as named
-/// and nothing is excluded: its complaints are warnings, and a session that
-/// cannot engage it runs on the CPU and says so.
-fn resolve(target: Target, dir: &Path, excluded: &[Provider]) -> (Provider, Vec<String>) {
+/// `gpu` walks the platform's priority order ([`walk`]), saying in one line
+/// why it passed over each candidate it did not take. `pins` is the
+/// candidates bound models exclude, and which. A provider named outright is
+/// taken as named and nothing is excluded: its complaints are warnings, and
+/// a session that cannot engage it runs on the CPU and says so.
+fn resolve(target: Target, dir: &Path, pins: &[(Provider, Pinned)]) -> (Provider, Vec<String>) {
     match target {
         Target::Cpu => (Provider::Cpu, Vec::new()),
         Target::Cuda => (Provider::Cuda, preflight(Provider::Cuda, dir)),
         Target::DirectMl => (Provider::DirectMl, preflight(Provider::DirectMl, dir)),
         Target::CoreMl => (Provider::CoreMl, preflight(Provider::CoreMl, dir)),
-        Target::Gpu => {
-            let mut notes = Vec::new();
-            for &candidate in GPU_PRIORITY {
-                if excluded.contains(&candidate) {
-                    notes.push(format!(
-                        "-nn-target gpu: not {}, excluded by every model's pin",
-                        candidate.name()
-                    ));
-                    continue;
+        Target::Gpu => walk(GPU_PRIORITY, pins, |candidate| preflight(candidate, dir)),
+    }
+}
+
+/// The `gpu` walk over `candidates`, in order: the first whose preflight is
+/// clean and that no bound model excludes; failing that, the first whose
+/// preflight is clean and that some model still takes, the models that
+/// exclude it running on the CPU; failing that, the CPU. A candidate every
+/// model excludes is dropped before its preflight ever runs -- the models'
+/// own pins, not this machine, ruled it out. The notes name each candidate
+/// passed over and why, one line each.
+fn walk(
+    candidates: &[Provider],
+    pins: &[(Provider, Pinned)],
+    preflight: impl Fn(Provider) -> Vec<String>,
+) -> (Provider, Vec<String>) {
+    let mut notes = Vec::new();
+    // The first clean candidate some model excludes, and where its note is.
+    let mut second: Option<(Provider, usize)> = None;
+    for &candidate in candidates {
+        let pinned = pins.iter().find(|(p, _)| *p == candidate).map(|(_, by)| by);
+        let why = match pinned {
+            Some(Pinned::Every) => "excluded by every model's pin".to_string(),
+            _ => match (preflight(candidate).first(), pinned) {
+                (Some(first), _) => first.clone(),
+                (None, Some(Pinned::By(names))) => {
+                    if second.is_none() {
+                        second = Some((candidate, notes.len()));
+                    }
+                    let pin = if names.len() == 1 { "pin" } else { "pins" };
+                    format!("excluded by the {pin} of {}", names.join(", "))
                 }
-                let complaints = preflight(candidate, dir);
-                let Some(first) = complaints.first() else {
-                    return (candidate, notes);
-                };
-                notes.push(format!("-nn-target gpu: not {}, {first}", candidate.name()));
-            }
-            (Provider::Cpu, notes)
+                (None, _) => return (candidate, notes),
+            },
+        };
+        notes.push(format!("-nn-target gpu: not {}, {why}", candidate.name()));
+    }
+    match second {
+        Some((candidate, at)) => {
+            notes.remove(at);
+            (candidate, notes)
         }
+        None => (Provider::Cpu, notes),
     }
 }
 
@@ -854,11 +900,11 @@ pub fn configure(config: &Config) -> Result<()> {
 
     // Which provider before which runtime: DirectML's ONNX Runtime is a
     // different binary, so the library to load follows from the answer.
-    let excluded = match config.target {
-        Target::Gpu => config.excluded_by_every_model(),
+    let pins = match config.target {
+        Target::Gpu => config.pins(),
         _ => Vec::new(),
     };
-    let (provider, complaints) = resolve(config.target, &dir, &excluded);
+    let (provider, complaints) = resolve(config.target, &dir, &pins);
     for complaint in complaints {
         eprintln!("[nn] {complaint}");
     }
@@ -1053,14 +1099,17 @@ mod tests {
         let first = GPU_PRIORITY[0];
         let both = config(&["a", "b"], vec![every(first)]);
         assert!(both.excludes("a", first) && both.excludes("b", first));
-        assert_eq!(both.excluded_by_every_model(), vec![first]);
+        assert_eq!(both.pins(), vec![(first, Pinned::Every)]);
 
         let only_a = config(&["a", "b"], vec![one("a", first)]);
         assert!(only_a.excludes("a", first) && !only_a.excludes("b", first));
-        assert!(only_a.excluded_by_every_model().is_empty());
+        assert_eq!(
+            only_a.pins(),
+            vec![(first, Pinned::By(vec!["a".to_string()]))]
+        );
 
         let each = config(&["a", "b"], vec![one("a", first), one("b", first)]);
-        assert_eq!(each.excluded_by_every_model(), vec![first]);
+        assert_eq!(each.pins(), vec![(first, Pinned::Every)]);
     }
 
     /// An empty directory, so every real provider's own preflight fails on
@@ -1079,7 +1128,7 @@ mod tests {
         // Linux, CoreML on macOS.
         let first = GPU_PRIORITY[0];
         let dir = empty_dir("exclude-one");
-        let (provider, notes) = resolve(Target::Gpu, &dir, &[first]);
+        let (provider, notes) = resolve(Target::Gpu, &dir, &[(first, Pinned::Every)]);
         assert_eq!(provider, Provider::Cpu);
         let named = format!("not {}", first.name());
         assert!(
@@ -1097,7 +1146,7 @@ mod tests {
         let first = GPU_PRIORITY[0];
         let dir = empty_dir("exclude-one-model");
         let only_a = config(&["a", "b"], vec![one("a", first)]);
-        let (_, notes) = resolve(Target::Gpu, &dir, &only_a.excluded_by_every_model());
+        let (_, notes) = resolve(Target::Gpu, &dir, &only_a.pins());
         let named = format!("not {}", first.name());
         let note = notes
             .iter()
@@ -1109,7 +1158,8 @@ mod tests {
     #[test]
     fn the_gpu_walk_with_every_candidate_excluded_lands_on_cpu() {
         let dir = empty_dir("exclude-all");
-        let exclude = GPU_PRIORITY.to_vec();
+        let exclude: Vec<(Provider, Pinned)> =
+            GPU_PRIORITY.iter().map(|&p| (p, Pinned::Every)).collect();
         let (provider, notes) = resolve(Target::Gpu, &dir, &exclude);
         assert_eq!(provider, Provider::Cpu);
         for candidate in GPU_PRIORITY {
@@ -1120,6 +1170,75 @@ mod tests {
                 "{candidate:?} should be named as excluded: {notes:?}"
             );
         }
+    }
+
+    /// A preflight that is clean for `clean` and complains of the rest.
+    fn clean_for(clean: &[Provider]) -> impl Fn(Provider) -> Vec<String> + '_ {
+        move |p| {
+            if clean.contains(&p) {
+                Vec::new()
+            } else {
+                vec![format!("{} is not on this machine", p.name())]
+            }
+        }
+    }
+
+    #[test]
+    fn the_gpu_walk_prefers_a_candidate_no_model_excludes() {
+        let candidates = [Provider::DirectMl, Provider::Cuda];
+        let both = clean_for(&candidates);
+        let ages = vec![(Provider::DirectMl, Pinned::By(vec!["ages".to_string()]))];
+        assert_eq!(
+            walk(&candidates, &ages, &both),
+            (
+                Provider::Cuda,
+                vec!["-nn-target gpu: not DIRECTML, excluded by the pin of ages".to_string()]
+            )
+        );
+        let two = vec![(
+            Provider::DirectMl,
+            Pinned::By(vec!["ages".to_string(), "faces".to_string()]),
+        )];
+        assert_eq!(
+            walk(&candidates, &two, &both).1,
+            vec!["-nn-target gpu: not DIRECTML, excluded by the pins of ages, faces".to_string()]
+        );
+        // Nothing excluded: the first clean candidate, and nothing said.
+        assert_eq!(
+            walk(&candidates, &[], &both),
+            (Provider::DirectMl, Vec::new())
+        );
+    }
+
+    #[test]
+    fn the_gpu_walk_takes_a_candidate_some_model_excludes_when_no_other_is_clean() {
+        // CUDA's preflight complains, so DirectML is taken though `ages`
+        // excludes it, and `ages` runs on the CPU; the notes say why not
+        // CUDA, and nothing of DirectML.
+        let candidates = [Provider::DirectMl, Provider::Cuda];
+        let ages = vec![(Provider::DirectMl, Pinned::By(vec!["ages".to_string()]))];
+        assert_eq!(
+            walk(&candidates, &ages, clean_for(&[Provider::DirectMl])),
+            (
+                Provider::DirectMl,
+                vec!["-nn-target gpu: not CUDA, CUDA is not on this machine".to_string()]
+            )
+        );
+        // A candidate every model excludes is never taken.
+        let every = vec![
+            (Provider::DirectMl, Pinned::Every),
+            (Provider::Cuda, Pinned::By(vec!["ages".to_string()])),
+        ];
+        assert_eq!(
+            walk(&candidates, &every, clean_for(&candidates)),
+            (
+                Provider::Cuda,
+                vec!["-nn-target gpu: not DIRECTML, excluded by every model's pin".to_string()]
+            )
+        );
+        let (provider, notes) = walk(&candidates, &every, clean_for(&[Provider::DirectMl]));
+        assert_eq!(provider, Provider::Cpu);
+        assert_eq!(notes.len(), 2, "{notes:?}");
     }
 
     #[test]
@@ -1173,7 +1292,11 @@ mod tests {
         // Naming a provider outright is unaffected by `-nn-exclude`: only the
         // `gpu` walk consults it.
         let dir = empty_dir("named-target");
-        let (provider, _) = resolve(Target::DirectMl, &dir, &[Provider::DirectMl]);
+        let (provider, _) = resolve(
+            Target::DirectMl,
+            &dir,
+            &[(Provider::DirectMl, Pinned::Every)],
+        );
         assert_eq!(provider, Provider::DirectMl);
     }
 }
