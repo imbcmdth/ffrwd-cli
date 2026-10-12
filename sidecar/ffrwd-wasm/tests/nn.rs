@@ -805,27 +805,23 @@ fn the_depth_of_field_chain_runs_and_keeps_every_frame() {
     write_chain_input(&input);
 
     // The wiring the compiler emits for blur_mask(v, depth(v)): one boundary
-    // read feeding both the model and the blur. depth is a node that may
-    // hold its frames on the GPU, so it is granted the device, and its pads
-    // name its ports.
-    let depth = built.join("depth.wasm").display().to_string();
+    // read feeding both the model and the blur. The host build imports
+    // nothing of the GPU's, so nothing grants it the device.
     let result = run_with_runtime(
         &runtime,
         &[
             "-nn",
             &format!("depth={}", model.display()),
-            "-gpu",
-            &depth,
             "-f",
             "nut",
             "-i",
             &input.to_string_lossy(),
             "-m",
-            &format!("depth={depth}"),
+            &format!("depth={}", built.join("depth.wasm").display()),
             "-m",
             &format!("blur_mask={}", built.join("blur_mask.wasm").display()),
             "-filter_complex",
-            "[v=0:v]depth[out=n1];[0:v][n1]blur_mask[out0]",
+            "[0:v]depth[n1];[0:v][n1]blur_mask[out0]",
             "-map",
             "[out0]",
             "-f",
@@ -1352,29 +1348,144 @@ fn an_output_bound_to_a_texture_gives_the_same_rows_on_every_route() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Builds the depth module, once per test binary.
-fn depth_module() -> PathBuf {
-    static BUILT: OnceLock<()> = OnceLock::new();
-    BUILT.get_or_init(|| {
-        let output = Command::new("cargo")
-            .args([
-                "build",
-                "--release",
-                "--target",
-                "wasm32-wasip2",
-                "-p",
-                "depth",
-            ])
-            .current_dir(sidecar_root().join("modules"))
-            .output()
-            .expect("spawn cargo build for depth");
-        assert!(
-            output.status.success(),
-            "building depth failed:\n{}",
-            String::from_utf8_lossy(&output.stderr)
+/// Builds one module's package and answers its wasm file, named as cargo
+/// names a library: the package's name with `_` for `-`.
+fn package_module(package: &str) -> PathBuf {
+    let output = Command::new("cargo")
+        .args([
+            "build",
+            "--release",
+            "--target",
+            "wasm32-wasip2",
+            "-p",
+            package,
+        ])
+        .current_dir(sidecar_root().join("modules"))
+        .output()
+        .unwrap_or_else(|e| panic!("spawn cargo build for {package}: {e}"));
+    assert!(
+        output.status.success(),
+        "building {package} failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    sidecar_root().join(format!(
+        "modules/target/wasm32-wasip2/release/{}.wasm",
+        package.replace('-', "_")
+    ))
+}
+
+/// Writes a NUT of raw `pix_fmt` frames from an lavfi source.
+fn lavfi_input(source: &str, pix_fmt: &str, target: &std::path::Path) {
+    let output = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            source,
+            "-c:v",
+            "rawvideo",
+            "-pix_fmt",
+            pix_fmt,
+            "-f",
+            "nut",
+        ])
+        .arg(target)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("spawn ffmpeg");
+    assert!(
+        output.status.success(),
+        "writing {} failed:\n{}",
+        target.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// A backend this platform's wgpu has no adapter for, so a run with
+/// `WGPU_BACKEND` set to it finds none.
+const ABSENT_BACKEND: &str = if cfg!(target_os = "macos") {
+    "dx12"
+} else {
+    "metal"
+};
+
+#[test]
+fn the_gpu_build_of_depth_runs_in_host_memory_where_there_is_no_adapter() {
+    let Some(runtime) = runtime_dir() else {
+        announce_skip("depth cannot run a model without a runtime");
+        return;
+    };
+    let model = depth_model();
+    if !model.is_file() {
+        eprintln!(
+            "SKIPPED: depth's graph is absent. Run \
+             sidecar/modules/depth/fetch-model.ps1 to download it."
         );
-    });
-    sidecar_root().join("modules/target/wasm32-wasip2/release/depth.wasm")
+        return;
+    }
+    let module = package_module("depth-gpu").display().to_string();
+    let dir = means_dir("depth-no-adapter");
+    let input = dir.join("in.nut");
+    lavfi_input("testsrc2=s=96x64:r=25:d=0.12", "yuv420p", &input);
+    let run = |memory: &str| {
+        let out = dir.join(format!("depth-{memory}.nut"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_ffrwd-wasm"));
+        command
+            .env_remove("FFRWD_NN_RUNTIME")
+            .env("WGPU_BACKEND", ABSENT_BACKEND)
+            .arg("-nn-runtime")
+            .arg(&runtime)
+            .args([
+                "-nn",
+                &format!("depth={}", model.display()),
+                "-nn-target",
+                "cpu",
+                "-gpu",
+                &module,
+                "-f",
+                "nut",
+                "-i",
+                &input.to_string_lossy(),
+                "-m",
+                &format!("depth={module}"),
+                "-filter_complex",
+                &format!("[v=0:v]depth=memory={memory}[out=o]"),
+                "-map",
+                "[o]",
+                "-f",
+                "nut",
+                &out.to_string_lossy(),
+            ]);
+        let result = command.output().expect("spawn ffrwd-wasm");
+        (result, out)
+    };
+
+    // The backend hides every adapter: the device path has none to open.
+    let (gpu, _) = run("gpu");
+    assert!(!gpu.status.success(), "memory=gpu found an adapter");
+    assert!(
+        stderr(&gpu).contains("depth: no GPU adapter"),
+        "{}",
+        stderr(&gpu)
+    );
+
+    let (host, out) = run("host");
+    assert!(
+        host.status.success(),
+        "memory=host needs no adapter:\n{}",
+        stderr(&host)
+    );
+    assert!(
+        stderr(&host).contains("[nn] depth: input in host memory, made on the CPU"),
+        "{}",
+        stderr(&host)
+    );
+    assert_eq!(frame_count(&out), 3, "one map per frame");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A file's frames as raw rgba, as ffmpeg decodes them.
@@ -1409,7 +1520,7 @@ fn depth_on_the_device_paints_what_the_host_path_paints() {
         );
         return;
     }
-    let module = depth_module().display().to_string();
+    let module = package_module("depth-gpu").display().to_string();
     let dir = means_dir("depth");
     let input = dir.join("in.nut");
     let output = Command::new("ffmpeg")

@@ -507,9 +507,8 @@ that needs python.
 
 ## The depth module
 
-`modules/depth` is the one that ships. It is a node of the node world beside
-`ffrwd:gpu`, so it is granted the device (`-gpu`) even where its frames stay
-in host memory, and it asks for the name **`depth`**:
+`modules/depth` is the one that ships, in two builds from one source. Both
+ask for the name **`depth`**, so both read `depth.onnx` beside them:
 
     -nn depth=modules/depth/model/model.onnx
 
@@ -518,17 +517,31 @@ The graph is Depth Anything V2 (small), fp32, 94 MB, and is not in git.
 sha256. Unlike transcribe the module does not compile it in, so nothing is
 rebuilt after a fetch.
 
-It runs the graph at 518x518 - the size the model's own preprocessing uses -
-on a tensor the host makes with `frame-tensor`, letterboxed and normalised
-the way the model was trained, and reads `predicted_depth` back. `memory`
-says where its frames are held. On `host`, the default, the tensor is made
-on the CPU and the map comes back as bytes; the frame leaves in the input's
-pixel format, yuv420p or rgba. On `gpu`, the input is held on the device,
-the map is bound to a texture with `output-texture`, and two passes on the
-device find its range over the frame and paint the frame, which leaves as an
-rgba texture. The two paths paint the same frames to within a level.
+Both run the graph at 518x518 - the size the model's own preprocessing uses -
+take `pixel_values` as a planar fp32 tensor, letterboxed and normalised the
+way the model was trained, and read `predicted_depth` back.
 
-    ffrwd-wasm -f nut -i in.nut       -nn depth=modules/depth/model/model.onnx       -nn-runtime <dir> -nn-target gpu -gpu depth.wasm       -m depth=depth.wasm -m blur_mask=blur_mask.wasm       -filter_complex "[v=0:v]depth[out=n1];[0:v][n1]blur_mask[out0]"       -map [out0] -f nut out.nut
+`depth.wasm` exports the stream interface, so frames reach it the way they
+reach any module, and makes its tensor itself, on the CPU. It imports
+nothing of the GPU's, so a sidecar built without the `gpu` feature runs it,
+and nothing grants it the device:
+
+    ffrwd-wasm -f nut -i in.nut       -nn depth=modules/depth/model/model.onnx       -nn-runtime <dir> -nn-target gpu       -m depth=depth.wasm -m blur_mask=blur_mask.wasm       -filter_complex "[0:v]depth[n1];[0:v][n1]blur_mask[out0]"       -map [out0] -f nut out.nut
+
+`depth_gpu.wasm`, the `gpu` feature built by the `depth-gpu` crate, is a
+node of the node world beside `ffrwd:gpu`. It imports `wasi:webgpu`, so it
+runs only where it is granted the device (`-gpu`), even where its frames
+stay in host memory; a sidecar built without the feature refuses it by name.
+The host makes its tensor with `frame-tensor`. `memory` says where its
+frames are held. On `host`, the default, the tensor is made on the CPU and
+the map comes back as bytes; the frame leaves in the input's pixel format,
+yuv420p or rgba, and no adapter is needed. On `gpu`, the input is held on
+the device, the map is bound to a texture with `output-texture`, and two
+passes on the device find its range over the frame and paint the frame,
+which leaves as an rgba texture. The two paths paint the same frames to
+within a level.
+
+    ffrwd-wasm -f nut -i in.nut       -nn depth=modules/depth/model/model.onnx       -nn-runtime <dir> -nn-target gpu -gpu depth_gpu.wasm       -m depth=depth_gpu.wasm -m blur_mask=blur_mask.wasm       -filter_complex "[v=0:v]depth=memory=gpu[out=n1];[0:v][n1]blur_mask[out0]"       -map [out0] -f nut out.nut
 
 On an RTX 4090, 64x64 frames, the graph itself is what the time goes on:
 178 ms a frame on the CPU provider against 20 ms on CUDA, after a fixed

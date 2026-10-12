@@ -27,6 +27,7 @@ members = [
     "gpu-probe",
     "gpu-box",
     "depth",
+    "depth-gpu",
     "segment",
     "mask_select",
     "pick-first",

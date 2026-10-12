@@ -1646,6 +1646,29 @@ What waits:
   `cudaDeviceProp::uuid`), since Linux has no LUID. Until then a CUDA
   session there takes the downloaded and uploaded routes and says so.
 
+**The GPU path an addition, not a requirement (2026-10-12):** `depth` is
+two builds of one source again. `depth.wasm` is the window filter it was
+before it moved onto `frame-tensor`, making its tensor on the CPU and
+importing nothing of the GPU's, so a sidecar without the `gpu` feature runs
+it and the compiler grants it nothing; on 10 frames of `testsrc.mp4` it
+writes the same bytes as the build before the move. `depth_gpu.wasm` (the
+`depth-gpu` crate, the same source with the `gpu` feature) is the node
+beside `ffrwd:gpu`, and only it is granted `-gpu`. Recipe 93 and every
+existing caller keep the host build, and its pin is the one it had before
+the move. `cargo test -p ffrwd-wasm-runtime --test depth`, which a build
+without the feature runs, runs depth again rather than skipping, and the GPU
+build runs `memory=host` on a sidecar with GPU support and no adapter
+(`WGPU_BACKEND=metal` on Windows, where `memory=gpu` then finds none).
+
+- Every release wheel builds the sidecar with GPU support: release.yml
+  builds default features on all seven targets.
+- The published `ffrwd/depth` package (ffrwd-packages, 1.1.1) is separate
+  source and unaffected.
+- A sidecar built without the feature refuses a module importing
+  `wasi:webgpu` by name ("this ffrwd-wasm was built without GPU support (the
+  `gpu` cargo feature), so it cannot run a module that imports
+  wasi:webgpu"), and the host builds keep CPU-only runs working.
+
 ### Wave 5: two candidates to measure
 
 Neither is in the design yet; each is a measurement on the GPU tier that

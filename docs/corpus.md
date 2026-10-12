@@ -1695,17 +1695,13 @@ COPY (
 ```
 $ ffrwd compile -f query.sql
 ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 rawvideo -pix_fmt:0 yuv420p -f nut \
-  pipe:1 | ffrwd-wasm -f nut -i pipe:0 -pad \
-  '{"color": {"range": "unknown", "primaries": "unknown", "trc": "unknown",'\
-' "space": "unknown"}}' -nn \
-  depth=../sidecar/modules/target/wasm32-wasip2/release/depth.onnx -gpu \
-  ../sidecar/modules/target/wasm32-wasip2/release/depth.wasm -m \
+  pipe:1 | ffrwd-wasm -f nut -i pipe:0 -nn \
+  depth=../sidecar/modules/target/wasm32-wasip2/release/depth.onnx -m \
   depth=../sidecar/modules/target/wasm32-wasip2/release/depth.wasm -m \
   blur_mask=../sidecar/modules/target/wasm32-wasip2/release/blur_mask.wasm \
-  -filter_complex '[v=0:v]depth[out=n1];[0:v][n1]blur_mask=max_radius=24:invert=1[out0]' \
-  -bound 'depth=[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]}]' -map '[out0]' \
-  -f nut pipe:1 | ffmpeg -copyts -f nut -analyzeduration 0 -fpsprobesize 3 -i pipe:0 \
-  -map 0:v:0 -c:0 libx264 -crf:0 20 bokeh.mp4
+  -filter_complex '[0:v]depth[n1];[0:v][n1]blur_mask=max_radius=24:invert=1[out0]' -map \
+  '[out0]' -f nut pipe:1 | ffmpeg -copyts -f nut -analyzeduration 0 -fpsprobesize 3 -i \
+  pipe:0 -map 0:v:0 -c:0 libx264 -crf:0 20 bokeh.mp4
 ```
 
 The `-nn` binding is the model file beside the module, found by name; the
