@@ -987,6 +987,178 @@ What was learned:
 - 1080p, decode into the pool into `h264_d3d12va`: 235 fps with zero
   upload and download (wave 0's table).
 
+**Item 6, `convert` (2026-10-12, owner's machine):** one conversion
+path on the device, `runtime/src/gpu/convert.rs`, and one entry point on
+the frame, `GpuFrame::converted(Target)`. A target is a layout (rgba,
+yuv420p, yuv422p, yuv444p, NV12), a size, and the matrix and range of a
+conversion between rgba and YUV (BT.709 or BT.601, limited or full). The
+result is a frame of its own, kept on the source frame under its target,
+so every reader asking for the same thing shares one conversion.
+`wire_planes` and the encoder's NV12 are callers of it, and the NV12
+chroma split, the rgba-to-NV12 pass and the yuv420p interleave are cases
+of it rather than functions of their own. It is one WGSL module with one
+bind group layout (a uniform holding the sizes and the colour, and three
+textures), its pipelines made per entry point the first time each is
+asked for. Each distinct conversion says so once on stderr (`[gpu]
+convert nv12 1920x1080 to rgba 1920x1080`), and the profile row has a
+`convert` stage.
+
+Each pass was measured against FFmpeg 9.0.1's `scale` on a 64x48 picture
+with ramps, hard edges, a red block and a transparent corner, and the
+numbers are pinned in the tests in `gpu/frames.rs`:
+
+- YUV (NV12, yuv420p, yuv422p, yuv444p) to rgba, at the picture's size,
+  smaller and larger, in BT.709 limited and BT.601 full: at most 1 level
+  apart, mean at most 0.026, against `flags=bilinear+full_chroma_int+accurate_rnd`.
+  ffmpeg's default conversion is not the reference: at the same size it
+  takes its unscaled converter, which repeats each chroma sample across
+  two pixels and lands 60 to 100 levels from an interpolated result at a
+  hard chroma edge.
+- rgba to yuv420p at its own size: at most 1, mean 0.051 (BT.709 limited)
+  and 0.196 (BT.601 full), against ffmpeg's default bicubic, whose chroma
+  filter the NV12 pass already follows. At another size each plane is
+  resampled from the rgba directly: at most 1, mean at most 0.178, against
+  `bilinear+full_chroma_inp+accurate_rnd`. Resizing first and converting
+  after was 10 to 15 levels off.
+- rgba to NV12, the existing pass: at most 1 (it was pinned at 2), means
+  0.035 for luma and 0.488 for full-range chroma, where ffmpeg rounds
+  half a level apart.
+- Resizing rgba, yuv420p, NV12 and yuv444p to 40x30, 32x24, 96x72 and
+  17x13: at most 1, mean at most 0.096, against
+  `bilinear+full_chroma_inp+full_chroma_int`. Without the chroma flags
+  ffmpeg halves rgba's chroma across before it scales, 26 levels off at an
+  exact half. NV12 and yuv420p made into one another are exact.
+
+The routes, each engaged in `ffrwd-wasm/tests/gpu_frames.rs`:
+
+- `decode=format=rgba` read by an input held on the GPU now decodes on
+  the shared device too (`av::ON_DEVICE`). The frame is held as the
+  decoder's NV12 and read as rgba, converted once per picture in the
+  stream's matrix and range (`Yuv::read_as`: BT.601 where the stream says
+  nothing, as libswscale reads it). In
+  `pictures_decoded_on_the_device_reach_an_rgba_reader_converted_there`
+  stderr says `[gpu] convert nv12 64x48 to rgba 64x48`, the `convert`
+  row has one call per picture, `upload` is 0 and `download` is the
+  output alone; the pictures are within 1 of ffmpeg's, mean 0.018. A
+  stream in another matrix keeps the old path, read back and uploaded.
+- An input held on the GPU with `accepts.like` is told the followed
+  input's size at `init` and resized at the lane (`Lane::resident`). In
+  `an_input_that_follows_another_is_resized_on_the_device` stderr says
+  `[gpu] gpu_box: resizing the frames of stream 1 on the GPU to 32x24`,
+  within 1 of ffmpeg, mean 0.047. A bound stream in host memory is still
+  handed over at its own size, since the host never conformed one.
+- A port feed into an input held on the GPU uploads the feeder's picture
+  as it came and conforms it on the device (`feeds.rs`, `Picture::frame`);
+  the CPU conform stays for host-memory ports. In
+  `a_feed_held_on_the_gpu_is_conformed_on_the_device` stderr says
+  `feed: gpu_box 'w': the feeder's picture is 64x48 rgba, conformed to
+  32x24 rgba on the GPU`, within 1 of ffmpeg, mean 0.047.
+- The encoder's NV12 comes from `converted` (`EncoderFeed::feed`); the
+  three `h264_d3d12va` tests pass as they were.
+
+`modules/gpu-box` gained the second input these use: `w=pad` binds `w`
+to a stream, `w=port` feeds it on a port, and either way it follows `v`.
+
+What was learned:
+
+- Chroma is sited at the centre of the luma it covers, as libswscale
+  assumes when a frame does not say. The h264 fixture reports
+  `chroma_location=left`, yet ffmpeg's `scale` with its default
+  `in_chroma_loc` matched the device within 1; forcing `left` moves
+  ffmpeg up to 116 levels at a chroma edge. Honouring a stream's siting
+  would be a quarter-texel offset in the shader's resampling, if a source
+  needs it.
+- A frame now carries the colour its YUV is read in, set by the decoder
+  for a frame held as NV12 and read as rgba. The first slice's "the pool
+  holds no per-frame colour" still holds for frames held in their wire
+  layout.
+- Each conversion makes new textures, views and a bind group. In a debug
+  build that is about 5 ms of host time per 64x48 frame. Reusing the
+  targets and bind groups per frame shape is the next step when a profile
+  shows it; nothing was measured at 1080p in release.
+- The packed 4:2:2 unpack (UYVY, v210) waits on a capture card. Nothing in
+  the tree feeds the sidecar a packed format: a capture device is opened
+  by ffmpeg, which converts before the wire, and the wire carries no
+  packed 4:2:2.
+
+**Item 6a, `filter`: not built (2026-10-12).** Two findings change the
+item. FFmpeg 9.0 has D3D12 filters: `scale_d3d12` (size and format),
+`deinterlace_d3d12` and `mestimate_d3d12`. `scale_d3d12` runs on the
+4090 from ffmpeg's own command line (`-hwaccel d3d12va
+-hwaccel_output_format d3d12`, `-vf scale_d3d12=w=640:h=360`, into
+`h264_d3d12va`), so on Windows the pool's frames reach those three with
+no interop, the way the d3d12va encoder already reads them, and CUDA is
+needed only for the `_cuda` filters. Second, libavfilter is not in our
+libav (`--disable-avfilter` in ffrwd-av), so there is nothing to build
+until the builds change. The LGPL build from BtbN on this machine has
+`avfilter-12.dll` with the `_d3d12`, `_cuda`, `_vulkan`, `_opencl`,
+`_qsv` and `_amf` filters and libplacebo, but that is a development
+convenience, not what the wheel ships. What 6a needs, to be dispatched
+on its own:
+
+1. ffrwd-av: `--enable-avfilter`, with `--disable-filters` and then only
+   `buffer`, `buffersink`, `format`, `hwupload`, `hwdownload` and
+   `hwmap`, and per platform: on Windows `scale_d3d12`,
+   `deinterlace_d3d12` and `mestimate_d3d12`; with `--enable-cuda-llvm`
+   (LGPL; `--enable-cuda-nvcc` is non-free), on Windows and Linux,
+   `scale_cuda`, `overlay_cuda`, `pad_cuda`, `transpose_cuda`,
+   `bwdif_cuda`, `yadif_cuda`, `chromakey_cuda`, `colorspace_cuda`,
+   `bilateral_cuda` and `thumbnail_cuda`; on Linux the Vulkan filters
+   (`scale_vulkan`, `overlay_vulkan`, `blend_vulkan`, `gblur_vulkan`,
+   `avgblur_vulkan`, `bwdif_vulkan`, `nlmeans_vulkan`, `transpose_vulkan`,
+   `flip_vulkan`, `hflip_vulkan`, `vflip_vulkan`, `xfade_vulkan`,
+   `chromaber_vulkan`) and `libplacebo`, which brings glslang or shaderc
+   into the build. `avfilter-12` ships beside `avcodec-63` in each wheel,
+   and `--av-info` lists the filters.
+2. The shim (`runtime/src/av/ffi.rs`): `avfilter_graph_alloc`,
+   `avfilter_get_by_name`, `avfilter_graph_alloc_filter`,
+   `avfilter_init_str`, `avfilter_link`, `avfilter_graph_config`,
+   `avfilter_graph_free`, `av_buffersrc_parameters_alloc` and
+   `av_buffersrc_parameters_set` (to hand the source its
+   `hw_frames_ctx`), `av_buffersrc_add_frame_flags`,
+   `av_buffersink_get_frame`, `av_buffersink_get_hw_frames_ctx` and
+   `av_buffersink_get_w`, `_h` and `_format`, and the filter context's
+   `hw_device_ctx`, a field set before `avfilter_init_str` whose offset
+   the shim reads off the 9.0 headers as it does the codec context's.
+3. Windows, D3D12: a D3D12VA frames context over the shared device, as
+   `encode.rs` sets one up for the encoder (`attach_d3d12_frames`), each
+   frame an `AVD3D12VAFrame` with its texture and sync object. The
+   pool's frame is copied once on the device into a frame of that
+   context, as `EncoderFeed` does for the encoder, and handed to
+   `buffer`. The filter's output frames come from its own pool on the
+   same device and are wrapped as frames with `create_texture_from_hal`,
+   as the decoder's are (`gpu/d3d12.rs`), the queue waiting on each
+   frame's sync object.
+4. Windows, CUDA, for the `_cuda` filters: `cuImportExternalMemory` of
+   the D3D12 resource through an NT handle from
+   `ID3D12Device::CreateSharedHandle`, which needs the frame's texture
+   allocated with `D3D12_HEAP_FLAG_SHARED` (wgpu-hal does not set it, so
+   such a frame is an allocation of our own wrapped through
+   `create_texture_from_hal`); `cuExternalMemoryGetMappedMipmappedArray`
+   per plane; `cuImportExternalSemaphore` of the frame's sync object,
+   with `cuWaitExternalSemaphoresAsync` and
+   `cuSignalExternalSemaphoresAsync` around the work; and an
+   `AVCUDADeviceContext` on the primary context of the device matched by
+   LUID. libavfilter's CUDA frames are linear device memory, not arrays,
+   so each frame is one `cuMemcpy2DAsync` in and one out, both on the
+   device. On Linux the same import comes from a Vulkan export
+   (`VK_KHR_external_memory_fd`) on NVIDIA.
+5. Linux, Vulkan: an `AVVulkanDeviceContext` filled from the pool's
+   instance, device and queue families (the work item 3 lists for the
+   decoder), so the `_vulkan` filters and libplacebo run on the pool's
+   images with no copy.
+6. The compiler: where a query's `ffmpeg.<name>` call sits next to a
+   GPU region (the partition in `cli/ffrwd/processes.py` that
+   `_holds_on_the_gpu` routes, and its copy in `lower.py`), map the name
+   to the variant the machine's pool has (`scale` to `scale_d3d12`,
+   `scale_cuda` or `scale_vulkan`), read from the sidecar's `--av-info`
+   filter list, and lower it as a `filter` host node in the region; a
+   filter with no variant stays in ffmpeg with a download at its input.
+
+What blocks it is (1), the libav build, which belongs to the builds
+repository. After that, (2) and (3) are the shortest route: three D3D12
+filters and no interop.
+
 ### Wave 4: inference on the GPU
 
 1. **The provider is per model.** `NN-EDGE.md` has every model a process
