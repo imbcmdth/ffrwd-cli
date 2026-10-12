@@ -495,10 +495,16 @@ On the node-world raw path at `-jobs 1` the sidecar's own copies are now:
 pipe read into the demuxer's payload (1), `fetch` into wasm memory (1),
 the emitted frame lifted out of wasm (1), the mux write through the 1 MiB
 `BufWriter` into the pipe (2). The older-world path (`main.rs`,
-`older.rs`, `adapters.rs`) is counted by the same row but still reads
-through its own `Demuxer<BufReader>` and copies as before: a frame is
-handed to an older module whole and comes back whole, which the row
-shows as `fetch` and `emit`. Item 6 is blitz's.
+`older.rs`, `adapters.rs`) and the codec runner now read the same way
+(2026-10-12): ffrwd-nut's blocking `Demuxer` already read each payload in
+place and handed it over, so the extra copies there were the 1 MiB
+`BufReader` in front of it, now gone; one input type counts `read` for
+every path, and a test holds the older path's `read` and `held` bytes
+equal to the node path's on the same input. The older path keeps the
+blocking demuxer for what the push one does not do: ADTS AAC (deriving
+the AudioSpecificConfig and stripping the headers) and the annotation
+rows. The node-network edges have no ADTS handling, which a coded AAC
+input to a node network would need. Item 6 is blitz's.
 
 Checked here: the unit tier, `gpu_frames`, `node_shapes`, `ffrwd_wasm`,
 `av`, `data_streams`, `packets`, `rows_module` and `relay`. The `live`
