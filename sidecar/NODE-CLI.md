@@ -131,6 +131,23 @@ and `leaky` one picture stream, decoded or coded: `[v=0:v]leaky=max_lateness=0.5
 Over packets it drops whole groups, from a late packet to the next keyframe
 in time.
 
+The host's `decode` and `encode` read one stream by position too, and
+run on the libavcodec `AV-EDGE.md` describes. `[0:v]decode=format=rgba[d]`
+turns a coded picture into frames in the format named (`rgba`, `yuv420p`,
+`yuv422p`, `yuv444p` or `gray`), with `hw=<device>` choosing a hardware
+decoder (`none`, `auto`, or a device type; `none` without it); its codec
+and extradata come from the input's NUT header, and its frames carry the
+range and matrix that header declares, which is all NUT carries of a
+stream's colour. `[n1]encode=codec=h264_nvenc:b=6M[out0]` turns frames
+into that codec's packets; every option beside `codec` is handed to the
+encoder under the name ffmpeg's command line uses (`b`, `g`, `crf`,
+`preset`, `profile`, `level`, `maxrate`, `bufsize`, `keyint_min`, `tune`,
+`sc_threshold`, `pix_fmt`), and one the encoder does not take is refused
+naming both. The packets leave under the codec's tag with the encoder's
+extradata and reorder depth in the header, so the ffmpeg reading the
+pipe copies the stream into a file. Each is one instance, called in
+order, whatever `-jobs` says.
+
 ## Outputs
 
     -map '[<label>]' [-map '[<label>]' ...] -f nut <path>

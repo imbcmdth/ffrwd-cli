@@ -1,15 +1,18 @@
 //! libav through the runtime's shim: found, refused, and used to decode
 //! the wire's h264 fixture and to encode it again, each checked against
-//! what ffmpeg itself makes of the same bytes.
+//! what ffmpeg itself makes of the same bytes. Then the host's `decode`
+//! and `encode` nodes on a network, and a port feed that arrives coded.
 //!
 //! libav is not in git, so the cases that need it skip - loudly - when
 //! neither `FFRWD_AV_RUNTIME` nor the directory the `ffrwd-wasm` binary was
 //! built into holds the four libraries. The cases that compare against
 //! ffmpeg skip the same way without ffmpeg and ffprobe on PATH.
 
+use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use ffrwd_wasm::nut::{Demuxer, Muxer, Packet, Stream, TimeBase};
 use ffrwd_wasm_runtime::av::{self, Decoder, Encoder, Hw, Library};
@@ -457,4 +460,534 @@ fn ffv1_through_the_shim_reads_back_through_ffmpeg_byte_for_byte() {
         "the same timestamps"
     );
     assert!(theirs == concatenated(&frames), "the same bytes");
+}
+
+// The host's `decode` and `encode` nodes, run by the binary on a network
+// the way the compiler spells one.
+
+fn sidecar_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("ffrwd-wasm/ has a parent directory")
+        .to_path_buf()
+}
+
+/// Builds the modules these tests run, once per test binary, in the
+/// modules workspace (its own build lock, so no deadlock with this run).
+fn built_modules() {
+    static BUILT: OnceLock<()> = OnceLock::new();
+    BUILT.get_or_init(|| {
+        let output = Command::new("cargo")
+            .args([
+                "build",
+                "--release",
+                "--target",
+                "wasm32-wasip2",
+                "-p",
+                "invert",
+                "-p",
+                "shape-switch",
+            ])
+            .current_dir(sidecar_root().join("modules"))
+            .output()
+            .expect("spawn cargo build for modules");
+        assert!(
+            output.status.success(),
+            "building the modules failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    });
+}
+
+/// `-m name=path` for a module of the modules workspace.
+fn module(name: &str) -> String {
+    built_modules();
+    let path = sidecar_root().join(format!("modules/target/wasm32-wasip2/release/{name}.wasm"));
+    format!("{name}={}", path.display())
+}
+
+/// The sidecar on `args`, with libav from `dir` where there is one.
+fn sidecar(args: &[&str], dir: Option<&Path>) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ffrwd-wasm"));
+    command.args(args).stdin(Stdio::null());
+    match dir {
+        Some(dir) => command.env(av::RUNTIME_DIR_VAR, dir),
+        None => command.env_remove(av::RUNTIME_DIR_VAR),
+    };
+    command.output().expect("spawn ffrwd-wasm")
+}
+
+fn stderr_of(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+/// Every packet of a NUT file, with its timestamp, and the stream header.
+fn demux(path: &Path) -> (Stream, Vec<(i64, Vec<u8>)>) {
+    let file = std::fs::File::open(path).expect("open the output");
+    let mut demuxer = Demuxer::open(file).expect("read the output's NUT headers");
+    let stream = demuxer.stream().clone();
+    let mut packets = Vec::new();
+    let mut buf = Vec::new();
+    while let Some(packet) = demuxer.read_packet(&mut buf).expect("read a NUT packet") {
+        packets.push((packet.pts, std::mem::take(&mut buf)));
+    }
+    (stream, packets)
+}
+
+/// What ffmpeg decodes `path` to as rgba, every picture once.
+fn ffmpeg_rgba(path: &Path) -> Vec<u8> {
+    run_ok(
+        Command::new("ffmpeg")
+            .args(["-v", "error", "-i"])
+            .arg(path)
+            .args([
+                "-fps_mode",
+                "passthrough",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgba",
+                "-",
+            ])
+            .stdin(Stdio::null()),
+        "ffmpeg",
+    )
+    .stdout
+}
+
+/// The libav directory, for a test that needs libav and ffmpeg; None,
+/// having said why, where either is missing.
+fn libav_and_ffmpeg(test: &str) -> Option<PathBuf> {
+    let Some(dir) = runtime_dir() else {
+        announce_skip(test);
+        return None;
+    };
+    if !ffmpeg_on_path() {
+        announce_skip_ffmpeg(test);
+        return None;
+    }
+    Some(dir)
+}
+
+/// The fixture's own stream header.
+fn fixture_stream() -> Stream {
+    let file = std::fs::File::open(fixture()).expect("open the h264 fixture");
+    Demuxer::open(file)
+        .expect("read the fixture's NUT headers")
+        .stream()
+        .clone()
+}
+
+#[test]
+fn decode_alone_writes_the_pictures_ffmpeg_decodes_at_the_same_times() {
+    let test = "decode_alone_writes_the_pictures_ffmpeg_decodes_at_the_same_times";
+    let Some(dir) = libav_and_ffmpeg(test) else {
+        return;
+    };
+    let out = scratch("decode_alone.nut");
+    let output = sidecar(
+        &[
+            "-f",
+            "nut",
+            "-i",
+            fixture().to_str().expect("UTF-8"),
+            "-filter_complex",
+            "[0:v]decode=format=yuv420p[out0]",
+            "-map",
+            "[out0]",
+            "-f",
+            "nut",
+            out.to_str().expect("UTF-8"),
+        ],
+        Some(&dir),
+    );
+    let stderr = stderr_of(&output);
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(
+        stderr.matches("[av] decode h264: software").count(),
+        1,
+        "one line says where it decodes:\n{stderr}"
+    );
+
+    let (header, frames) = demux(&out);
+    let _ = std::fs::remove_file(&out);
+    let input = fixture_stream();
+    assert_eq!(header.pix_fmt(), Some("yuv420p"));
+    assert_eq!(header.video_geometry(), Some((64, 48)));
+    assert_eq!(header.time_base, input.time_base);
+    assert!(input.frame_rate.is_some(), "the fixture states its rate");
+    assert_eq!(header.frame_rate, input.frame_rate);
+
+    let pts: Vec<i64> = frames.iter().map(|(pts, _)| *pts).collect();
+    assert_eq!(
+        pts,
+        ffprobe_pts(&fixture()),
+        "the same timestamps, in order"
+    );
+    let ours: Vec<u8> = frames.into_iter().flat_map(|(_, data)| data).collect();
+    assert!(ours == ffmpeg_rawvideo(&fixture()), "the same bytes");
+}
+
+#[test]
+fn coded_in_coded_out_through_an_old_module_is_the_inverted_picture() {
+    let test = "coded_in_coded_out_through_an_old_module_is_the_inverted_picture";
+    let Some(dir) = libav_and_ffmpeg(test) else {
+        return;
+    };
+    let out = scratch("inverted.nut");
+    let invert = module("invert");
+    // ffv1 codes rgba input as bgra, losslessly, where it is told to; its
+    // first format is yuv420p.
+    let chain = "[0:v]decode=format=rgba[decode0];[decode0]invert[n1];\
+                 [n1]encode=codec=ffv1:pix_fmt=bgra[out0]";
+    let output = sidecar(
+        &[
+            "-f",
+            "nut",
+            "-i",
+            fixture().to_str().expect("UTF-8"),
+            "-m",
+            &invert,
+            "-filter_complex",
+            chain,
+            "-map",
+            "[out0]",
+            "-f",
+            "nut",
+            out.to_str().expect("UTF-8"),
+        ],
+        Some(&dir),
+    );
+    let stderr = stderr_of(&output);
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(
+        stderr.matches("[av] decode h264: software").count(),
+        1,
+        "{stderr}"
+    );
+    assert_eq!(
+        stderr.matches("[av] encode ffv1: 64x48 bgra").count(),
+        1,
+        "{stderr}"
+    );
+
+    let (header, packets) = demux(&out);
+    assert_eq!(header.fourcc, b"FFV1", "carried under ffv1's own tag");
+    assert_eq!(header.pix_fmt(), None, "coded, not raw");
+    assert!(
+        !header.extradata.is_empty(),
+        "ffv1's header rides in the stream's"
+    );
+    assert_eq!(header.frame_rate, fixture_stream().frame_rate);
+    assert_eq!(
+        packets.len(),
+        ffprobe_pts(&fixture()).len(),
+        "one packet a picture"
+    );
+
+    let ours = ffmpeg_rgba(&out);
+    let _ = std::fs::remove_file(&out);
+    // invert flips the three colour channels and keeps alpha.
+    let mut wanted = ffmpeg_rgba(&fixture());
+    for (index, byte) in wanted.iter_mut().enumerate() {
+        if index % 4 != 3 {
+            *byte = 255 - *byte;
+        }
+    }
+    assert_eq!(ours.len(), wanted.len(), "as many pictures");
+    assert!(ours == wanted, "the inverted pictures, byte for byte");
+}
+
+#[test]
+fn what_encode_writes_ffmpeg_copies_into_a_file() {
+    let Some(dir) = libav_and_ffmpeg("what_encode_writes_ffmpeg_copies_into_a_file") else {
+        return;
+    };
+    let out = scratch("copied.nut");
+    let mkv = scratch("copied.mkv");
+    let output = sidecar(
+        &[
+            "-f",
+            "nut",
+            "-i",
+            fixture().to_str().expect("UTF-8"),
+            "-filter_complex",
+            "[0:v]decode=format=yuv420p[d];[d]encode=codec=ffv1:g=1[out0]",
+            "-map",
+            "[out0]",
+            "-f",
+            "nut",
+            out.to_str().expect("UTF-8"),
+        ],
+        Some(&dir),
+    );
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    run_ok(
+        Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "nut", "-i"])
+            .arg(&out)
+            .args(["-c", "copy"])
+            .arg(&mkv)
+            .stdin(Stdio::null()),
+        "ffmpeg -c copy",
+    );
+    let probed = run_ok(
+        Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-count_frames",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=codec_name,width,height,nb_read_frames",
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(&mkv)
+            .stdin(Stdio::null()),
+        "ffprobe",
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&mkv);
+    let frames = ffprobe_pts(&fixture()).len();
+    assert_eq!(
+        String::from_utf8_lossy(&probed.stdout).trim(),
+        format!("ffv1,64,48,{frames}")
+    );
+}
+
+/// Paces a programme onto `out` in real time, for `seconds`: flat 64x48
+/// rgba pictures at 25 a second, and a silent 48 kHz sound in 1920-sample
+/// packets, one ahead of each picture.
+fn pace_programme(out: impl std::io::Write, seconds: u32) {
+    let mut video = Stream::video("rgba", 64, 48, TimeBase { num: 1, den: 25 }).expect("rgba");
+    video.frame_rate = Some((25, 1));
+    let mut audio = Stream::audio("f32", 48_000, 1).expect("f32");
+    audio.time_base = TimeBase {
+        num: 1,
+        den: 48_000,
+    };
+    let mut muxer = Muxer::with_streams(std::io::BufWriter::new(out), &[video, audio])
+        .expect("programme headers");
+    let picture = [0u8, 255, 0, 255].repeat(64 * 48);
+    let silence = vec![0u8; 1920 * 4];
+    let started = Instant::now();
+    for k in 0..i64::from(seconds * 25) {
+        let due = started + Duration::from_millis(k as u64 * 40);
+        if let Some(wait) = due.checked_duration_since(Instant::now()) {
+            std::thread::sleep(wait);
+        }
+        let written = muxer
+            .write_frame_to(1, k * 1920, &silence)
+            .and_then(|_| muxer.write_frame_to(0, k, &picture))
+            .and_then(|_| muxer.flush());
+        if written.is_err() {
+            return;
+        }
+    }
+    let _ = muxer.finish();
+}
+
+#[test]
+fn a_port_feed_of_coded_h264_reaches_its_hold_input_as_rgba_pictures() {
+    let test = "a_port_feed_of_coded_h264_reaches_its_hold_input_as_rgba_pictures";
+    let Some(dir) = libav_and_ffmpeg(test) else {
+        return;
+    };
+    let switch = module("shape_switch");
+    let port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .expect("a free port")
+        .local_addr()
+        .expect("its address")
+        .port();
+    let out = scratch("fed.nut");
+    // `layer` shows the feed's own pictures while it is live and black
+    // otherwise.
+    let chain = format!("[v=0:v][a=0:a]shape_switch=port={port}:lead=0.3:layer=true[v=o]");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ffrwd-wasm"))
+        .env(av::RUNTIME_DIR_VAR, &dir)
+        .args(["-jobs", "1", "-f", "nut", "-i", "pipe:0", "-m", &switch])
+        .args(["-filter_complex", &chain, "-map", "[o]", "-f", "nut"])
+        .arg(&out)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ffrwd-wasm");
+    let stdin = child.stdin.take().expect("stdin");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let stderr = std::thread::spawn(move || {
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut stderr, &mut text).ok();
+        text
+    });
+    let programme = std::thread::spawn(move || pace_programme(stdin, 5));
+
+    // The feeder writes the fixture's coded stream as it is, once the port
+    // listens. The connects that find it listening send nothing, and the
+    // host drops each for the next.
+    let until = Instant::now() + Duration::from_secs(60);
+    while TcpStream::connect((Ipv4Addr::LOCALHOST, port)).is_err() {
+        if let Ok(Some(status)) = child.try_wait() {
+            let stderr = stderr.join().unwrap_or_default();
+            panic!("ffrwd-wasm exited {status:?} before listening on {port}:\n{stderr}");
+        }
+        assert!(Instant::now() < until, "nothing listened on {port}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    {
+        let file = std::fs::File::open(fixture()).expect("open the h264 fixture");
+        let mut demuxer = Demuxer::open(file).expect("read the fixture's NUT headers");
+        let socket = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).expect("connect the feeder");
+        let stream = demuxer.stream().clone();
+        let mut muxer = Muxer::with_streams(std::io::BufWriter::new(socket), &[stream])
+            .expect("the feeder's headers");
+        let mut buf = Vec::new();
+        while let Some(packet) = demuxer.read_packet(&mut buf).expect("read a NUT packet") {
+            muxer
+                .write_coded_to(0, &packet, &buf)
+                .expect("write a coded packet");
+        }
+        muxer.finish().expect("finish the feed");
+    }
+
+    programme.join().expect("the programme");
+    let status = child.wait().expect("wait for ffrwd-wasm");
+    let stderr = stderr.join().unwrap_or_default();
+    assert!(status.success(), "{stderr}");
+    assert!(
+        stderr.contains("the feeder's picture is 64x48 h264, conformed to 64x48 rgba"),
+        "the report names the codec:\n{stderr}"
+    );
+    assert!(stderr.contains("[av] decode h264: software"), "{stderr}");
+
+    let (header, frames) = demux(&out);
+    let _ = std::fs::remove_file(&out);
+    assert_eq!(header.pix_fmt(), Some("rgba"));
+    let size = 64 * 48 * 4;
+    let decoded = ffmpeg_rgba(&fixture());
+    let pictures: Vec<&[u8]> = decoded.chunks(size).collect();
+    let mut live = 0;
+    for (pts, data) in &frames {
+        assert_eq!(data.len(), size, "every picture is the port's size");
+        if data.iter().all(|b| *b == 0) {
+            continue;
+        }
+        live += 1;
+        assert!(
+            pictures.contains(&data.as_slice()),
+            "the picture at {pts} is one of the fixture's, decoded to rgba"
+        );
+    }
+    assert!(
+        live >= pictures.len() / 2,
+        "the feed was shown ({live} of {} pictures)\n{stderr}",
+        pictures.len()
+    );
+}
+
+#[test]
+fn decode_and_encode_refuse_what_they_cannot_take_naming_it() {
+    // These are refused before libav is asked for, so they need none.
+    let raw = scratch("refusals_raw.nut");
+    {
+        let base = TimeBase { num: 1, den: 25 };
+        let stream = Stream::video("rgba", 4, 4, base).expect("rgba");
+        let file = std::fs::File::create(&raw).expect("create the raw input");
+        let mut muxer = Muxer::with_streams(file, &[stream]).expect("headers");
+        for k in 0..3 {
+            muxer.write_frame_to(0, k, &[k as u8; 64]).expect("a frame");
+        }
+        muxer.finish().expect("finish the raw input");
+    }
+    let raw_path = raw.to_str().expect("UTF-8").to_string();
+    let coded_path = fixture().to_str().expect("UTF-8").to_string();
+    let cases: &[(&str, &str, &[&str])] = &[
+        (
+            &raw_path,
+            "[0:v]decode=format=rgba[o]",
+            &["decode reads a coded picture stream", "raw rgba video"],
+        ),
+        (
+            &raw_path,
+            "[0:v]encode=b=6M[o]",
+            &["encode names its encoder with codec=<name>", "names none"],
+        ),
+        (
+            &coded_path,
+            "[0:v]encode=codec=ffv1[o]",
+            &["encode reads raw pictures", "coded h264 video"],
+        ),
+        (
+            &coded_path,
+            "[0:v]decode=format=bgra[o]",
+            &[
+                "decode=format=bgra",
+                "rgba, yuv420p, yuv422p, yuv444p, gray",
+            ],
+        ),
+        (
+            &coded_path,
+            "[0:v]decode[o]",
+            &["decode names the pixel format it writes with format=<pix_fmt>"],
+        ),
+        (
+            &coded_path,
+            "[0:v]decode=format=rgba:scale=2[o]",
+            &["decode has no option 'scale'"],
+        ),
+    ];
+    let out = scratch("refusals_out.nut");
+    for (input, chain, needles) in cases {
+        let output = sidecar(
+            &[
+                "-f",
+                "nut",
+                "-i",
+                input,
+                "-filter_complex",
+                chain,
+                "-map",
+                "[o]",
+                "-f",
+                "nut",
+                out.to_str().expect("UTF-8"),
+            ],
+            None,
+        );
+        let stderr = stderr_of(&output);
+        assert!(!output.status.success(), "{chain} was refused:\n{stderr}");
+        for needle in *needles {
+            assert!(stderr.contains(needle), "{chain}: {needle:?} in\n{stderr}");
+        }
+    }
+    let _ = std::fs::remove_file(&raw);
+    let _ = std::fs::remove_file(&out);
+
+    let output = sidecar(
+        &[
+            "-f",
+            "nut",
+            "-i",
+            &coded_path,
+            "-m",
+            "decode=x.wasm",
+            "-filter_complex",
+            "[0:v]decode[o]",
+            "-map",
+            "[o]",
+            "-f",
+            "nut",
+            out.to_str().expect("UTF-8"),
+        ],
+        None,
+    );
+    let stderr = stderr_of(&output);
+    assert!(!output.status.success());
+    assert!(
+        stderr.contains("'decode' is the network's own node"),
+        "{stderr}"
+    );
 }

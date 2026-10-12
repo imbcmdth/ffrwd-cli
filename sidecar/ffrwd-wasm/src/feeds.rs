@@ -1,8 +1,9 @@
 //! Port feeds: the host-owned loopback listener that serves a hold input
-//! given by a port. Whatever connects and writes a NUT of raw video and PCM
-//! is the input's source for as long as it stays, conformed to the port's
+//! given by a port. Whatever connects and writes a NUT of video and PCM is
+//! the input's source for as long as it stays, conformed to the port's
 //! format on the way in: its picture to the size and pixel format the port
-//! takes, its sound to the port's sample format. One connection at a time;
+//! takes, decoded first where it arrives coded, its sound to the port's
+//! sample format. One connection at a time;
 //! a second while one is on is accepted and closed at once, unless the one
 //! on has sent nothing yet, in which case the newcomer takes its place. The
 //! connection is read only while the input has room, so a source that
@@ -18,6 +19,7 @@ use anyhow::{anyhow, Context, Result};
 use ffrwd_frame::yuv::{self, Colour};
 use ffrwd_frame::Rgba;
 use ffrwd_wasm::nut::{self, Event, Limits, Media, PushDemuxer};
+use ffrwd_wasm_runtime::av::{self, Decoder, Hw};
 use ffrwd_wasm_runtime::node::{StreamFormat, TickFrame};
 use ffrwd_wasm_runtime::runtime::{AudioFormat, ColorInfo, Message, StreamInfo, VideoFormat};
 use serde_json::json;
@@ -180,6 +182,14 @@ impl Sound {
 
 enum Convert {
     Picture(Picture),
+    /// A coded picture: decoded to the port's pixel format, then conformed
+    /// as a raw one is. `duration` is a picture's length in the stream's
+    /// ticks, where its frame rate says.
+    Coded {
+        decoder: Box<Decoder>,
+        picture: Picture,
+        duration: Option<i64>,
+    },
     Sound(Sound),
     /// A timing member's frames: their times, and a sound's length in
     /// samples of `width` bytes.
@@ -323,23 +333,27 @@ fn match_streams(spec: &FeedSpec, conn: &mut Conn, report: &mut dyn FnMut(String
                 let Some((width, height)) = stream.video_geometry() else {
                     anyhow::bail!("the feeder's picture carries no frame size");
                 };
-                let pix_fmt = stream.pix_fmt().ok_or_else(|| {
-                    anyhow!(
-                        "the feeder's picture is {}, and a feed is rgba or yuv420p",
-                        stream.fourcc_name()
-                    )
-                })?;
+                // A coded picture is decoded straight to the port's format,
+                // and is that format from then on.
+                let codec = match stream.pix_fmt() {
+                    Some(_) => None,
+                    None => Some(coded_codec(stream)?),
+                };
+                let pix_fmt = stream.pix_fmt().unwrap_or(to.pix_fmt);
                 if !matches!(pix_fmt, "rgba" | "yuv420p")
                     || !matches!(to.pix_fmt, "rgba" | "yuv420p")
                 {
                     anyhow::bail!(
-                        "the feeder's picture is {pix_fmt} and this input takes {}; a feed is \
+                        "the feeder's picture is {} and this input takes {}; a feed is \
                          conformed between rgba and yuv420p only",
+                        codec.unwrap_or(pix_fmt),
                         to.pix_fmt
                     );
                 }
-                let incoming = crate::frame_len_for(pix_fmt, width, height)?;
-                conn.demux.set_stream_limit(index, incoming as u64);
+                if codec.is_none() {
+                    let incoming = crate::frame_len_for(pix_fmt, width, height)?;
+                    conn.demux.set_stream_limit(index, incoming as u64);
+                }
                 let picture = Picture {
                     width,
                     height,
@@ -352,17 +366,33 @@ fn match_streams(spec: &FeedSpec, conn: &mut Conn, report: &mut dyn FnMut(String
                         .then(|| port_colour(to.color.as_ref()))
                         .transpose()?,
                 };
-                if !picture.same() {
+                if codec.is_some() || !picture.same() {
                     report(format!(
-                        "feed: {}: the feeder's picture is {width}x{height} {pix_fmt}, conformed \
-                         to {}x{} {}",
+                        "feed: {}: the feeder's picture is {width}x{height} {}, conformed to \
+                         {}x{} {}",
                         spec.names(),
+                        codec.unwrap_or(pix_fmt),
                         to.width,
                         to.height,
                         to.pix_fmt
                     ));
                 }
-                Convert::Picture(picture)
+                match codec {
+                    Some(codec) => {
+                        let decoder = Decoder::open(codec, &stream.extradata, Hw::None, pix_fmt)
+                            .map_err(|e| anyhow!("decoding the feeder's {codec} picture: {e}"))?;
+                        let base = ffrwd_wasm_runtime::runtime::TimeBase {
+                            num: stream.time_base.num,
+                            den: stream.time_base.den,
+                        };
+                        Convert::Coded {
+                            decoder: Box::new(decoder),
+                            picture,
+                            duration: crate::codec::frame_ticks(stream.frame_rate, base),
+                        }
+                    }
+                    None => Convert::Picture(picture),
+                }
             }
             StreamFormat::Audio(to) => {
                 let Media::Audio {
@@ -423,18 +453,36 @@ fn match_streams(spec: &FeedSpec, conn: &mut Conn, report: &mut dyn FnMut(String
     Ok(())
 }
 
+/// The codec a coded feed picture is decoded with: the one its tag names.
+/// A tag no decoder here is known by is refused naming it.
+fn coded_codec(stream: &nut::Stream) -> Result<&'static str> {
+    <&[u8; 4]>::try_from(stream.fourcc.as_slice())
+        .ok()
+        .and_then(av::codec_for_fourcc)
+        .ok_or_else(|| {
+            anyhow!(
+                "the feeder's picture is {}, and a feed is raw rgba or yuv420p, or coded in a \
+                 codec carried under its ffmpeg tag (H264, HEVC, AV01, FFV1, ...)",
+                stream.fourcc_name()
+            )
+        })
+}
+
+/// Whether a lane carries the connection's picture, raw or coded.
+fn is_picture(lane: &Option<Lane>) -> bool {
+    matches!(
+        lane,
+        Some(Lane {
+            convert: Convert::Picture(_) | Convert::Coded { .. },
+            ..
+        })
+    )
+}
+
 /// What each member is told its source is: the wire's tags, the picture's
 /// and the whole file's, and the stream's own time base.
 fn sources(spec: &FeedSpec, conn: &Conn) -> Vec<(u32, SourceInfo)> {
-    let picture = conn.lanes.iter().position(|l| {
-        matches!(
-            l,
-            Some(Lane {
-                convert: Convert::Picture(_),
-                ..
-            })
-        )
-    });
+    let picture = conn.lanes.iter().position(is_picture);
     let mut tags: Vec<(String, String)> = conn.demux.tags(None).to_vec();
     if let Some(index) = picture {
         for (key, value) in conn.demux.tags(Some(index)) {
@@ -449,7 +497,9 @@ fn sources(spec: &FeedSpec, conn: &Conn) -> Vec<(u32, SourceInfo)> {
         let Some(lane) = lane else { continue };
         let member = &spec.members[lane.member];
         let (kind, codec) = match &lane.convert {
-            Convert::Picture(_) | Convert::Timing { audio: None } => ("video", "rawvideo"),
+            Convert::Picture(_) | Convert::Coded { .. } | Convert::Timing { audio: None } => {
+                ("video", "rawvideo")
+            }
             Convert::Data => ("data", "json"),
             Convert::Timing { audio: Some(_) } => match &member.format {
                 StreamFormat::Audio(a) if a.sample_fmt == "s16" => ("audio", "pcm_s16le"),
@@ -629,7 +679,11 @@ fn read_on(
         Ok(0) if conn.bytes == 0 => {
             Turn::Closed("a connection that sent nothing closed".to_string())
         }
-        Ok(0) => Turn::Closed("the feeder finished".to_string()),
+        Ok(0) => match flush_decoders(spec, conn, scheduler, carried) {
+            Ok(true) => Turn::Closed("the feeder finished".to_string()),
+            Ok(false) => Turn::Stopped,
+            Err(e) => Turn::Closed(format!("the feeder's stream was refused: {e:#}")),
+        },
         Ok(n) => {
             conn.bytes += n as u64;
             conn.demux.feed(&chunk[..n]);
@@ -669,10 +723,33 @@ fn drain(
                 }
             }
             Event::Frame { stream, packet } => {
+                let payload = conn.demux.payload();
+                if let Some(Some(Lane {
+                    member,
+                    convert:
+                        Convert::Coded {
+                            decoder,
+                            picture,
+                            duration,
+                        },
+                    ..
+                })) = conn.lanes.get_mut(stream)
+                {
+                    carried
+                        .bytes
+                        .fetch_add(payload.len() as u64, Ordering::Relaxed);
+                    decoder
+                        .send(packet.pts, packet.dts, *duration, packet.keyframe, payload)
+                        .map_err(|e| anyhow!("decoding the feeder's picture: {e}"))?;
+                    let id = spec.members[*member].id;
+                    if !hand_decoded(decoder, picture, id, scheduler, carried)? {
+                        return Ok(false);
+                    }
+                    continue;
+                }
                 let Some(lane) = conn.lanes.get(stream).and_then(Option::as_ref) else {
                     continue;
                 };
-                let payload = conn.demux.payload();
                 let member = &spec.members[lane.member];
                 if let Convert::Data = lane.convert {
                     if crate::heartbeat::is_heartbeat(payload) {
@@ -694,7 +771,7 @@ fn drain(
                         .fetch_add(payload.len() as u64, Ordering::Relaxed);
                 }
                 let frame = match &lane.convert {
-                    Convert::Data => continue,
+                    Convert::Data | Convert::Coded { .. } => continue,
                     Convert::Timing { audio } => TickFrame {
                         pts: packet.pts,
                         duration: audio.map(|width| (payload.len() / width.max(1)) as i64),
@@ -726,6 +803,75 @@ fn drain(
             _ => {}
         }
     }
+}
+
+/// Every picture `decoder` has ready, conformed and handed to member `id`.
+/// False once the run has stopped.
+fn hand_decoded(
+    decoder: &mut Decoder,
+    picture: &Picture,
+    id: u32,
+    scheduler: &Scheduler,
+    carried: &Carried,
+) -> Result<bool> {
+    while let Some(frame) = decoder
+        .receive()
+        .map_err(|e| anyhow!("decoding the feeder's picture: {e}"))?
+    {
+        if (frame.width, frame.height) != (picture.width, picture.height) {
+            anyhow::bail!(
+                "the feeder's header says {}x{}, and its picture at pts {} decoded {}x{}",
+                picture.width,
+                picture.height,
+                frame.pts,
+                frame.width,
+                frame.height
+            );
+        }
+        carried.conformed.fetch_add(1, Ordering::Relaxed);
+        let data = if picture.same() {
+            frame.data
+        } else {
+            picture.convert(&frame.data)?
+        };
+        let frame = TickFrame {
+            pts: frame.pts,
+            duration: None,
+            data: Arc::new(data),
+            rows: Vec::new(),
+        };
+        if !scheduler.arrive(id, Item::Frame(frame)) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// The pictures a connection's decoders still hold, once it has finished
+/// sending, handed on before its source closes. False once the run has
+/// stopped.
+fn flush_decoders(
+    spec: &FeedSpec,
+    conn: &mut Conn,
+    scheduler: &Scheduler,
+    carried: &Carried,
+) -> Result<bool> {
+    for lane in conn.lanes.iter_mut().flatten() {
+        let Convert::Coded {
+            decoder, picture, ..
+        } = &mut lane.convert
+        else {
+            continue;
+        };
+        decoder
+            .flush()
+            .map_err(|e| anyhow!("decoding the feeder's picture: {e}"))?;
+        let id = spec.members[lane.member].id;
+        if !hand_decoded(decoder, picture, id, scheduler, carried)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 #[cfg(test)]

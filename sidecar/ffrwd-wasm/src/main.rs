@@ -13,6 +13,7 @@
 //! one.
 
 mod adapters;
+mod av_nodes;
 mod codec;
 mod edges;
 mod feeds;
@@ -605,6 +606,12 @@ fn resolve_binding(raw: &str) -> Result<Binding> {
         bail!(
             "-m {raw}: '{name}' is the network's own node and no module is bound to it; \
              it is spelled [a]{name}=max_lateness=<seconds>:max_spread=<seconds>[b]"
+        );
+    }
+    if av_nodes::is_av_node(name) {
+        bail!(
+            "-m {raw}: '{name}' is the network's own node and no module is bound to it; \
+             it is spelled [0:v]decode=format=<pix_fmt>[a] or [a]encode=codec=<name>[b]"
         );
     }
     if path.is_empty() {
@@ -1933,7 +1940,7 @@ fn stream_info(args: &Args, stream: &nut::Stream) -> StreamInfo {
 /// their frames.
 fn run(args: &Args) -> Result<()> {
     if let Modules::Network { bindings, wiring } = &args.modules {
-        if node_graph::is_node_network(bindings)? {
+        if node_graph::is_node_network(bindings)? || node_graph::calls_av_node(wiring) {
             return node_graph::run(args, bindings, wiring);
         }
         if let Some(output) = args.outputs.iter().find(|o| !o.also.is_empty()) {

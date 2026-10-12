@@ -25,6 +25,7 @@ use ffrwd_wasm_runtime::runtime::{
 };
 
 use crate::adapters::FilterNode;
+use crate::av_nodes::{self, Decode, Encode};
 use crate::edges::{self, Target};
 use crate::feeds::{self, FeedMember, FeedSpec};
 use crate::graph::{self, NodeCall, NodePad, StreamClass, StreamRef, ROWS_PORT};
@@ -48,6 +49,14 @@ pub fn is_node_network(bindings: &[Binding]) -> Result<bool> {
         }
     }
     Ok(false)
+}
+
+/// Whether a network names the host's `decode` or `encode`, which only a
+/// network of node modules runs. A wiring that does not parse is left for
+/// the run to refuse.
+pub fn calls_av_node(wiring: &str) -> bool {
+    graph::parse_node_network(wiring)
+        .is_ok_and(|calls| calls.iter().any(|c| av_nodes::is_av_node(&c.module)))
 }
 
 /// One stream of the run: an input's, or a node output's.
@@ -207,6 +216,7 @@ enum Kind {
     OldFilter { path: String },
     Host,
     Leaky,
+    Av,
 }
 
 /// Everything a run needs once its network is opened.
@@ -543,11 +553,12 @@ fn open(
             Some(path) => bail!(
                 "{}: {path} is a module of an older world that rides alone; a network of node \
                  modules hosts node modules, frame modules and the host's rowfilter, \
-                 rowmerge and leaky",
+                 rowmerge, leaky, decode and encode",
                 call.module
             ),
             None if host_nodes::is_host_node(&call.module) => Kind::Host,
             None if call.module == leaky::NODE => Kind::Leaky,
+            None if av_nodes::is_av_node(&call.module) => Kind::Av,
             None => bail!("-filter_complex names '{}', which no -m binds", call.module),
         };
 
@@ -575,7 +586,9 @@ fn open(
                     call.module
                 ),
                 (Kind::Host, None) => "in".to_string(),
-                (Kind::OldFilter { .. } | Kind::Leaky, None) => format!("in{position}"),
+                (Kind::OldFilter { .. } | Kind::Leaky | Kind::Av, None) => {
+                    format!("in{position}")
+                }
             };
             if matches!(kind, Kind::Module { .. }) && pads.iter().any(|(_, bound)| *bound == id) {
                 let mirror = streams.len() as u32;
@@ -593,6 +606,7 @@ fn open(
             Kind::OldFilter { path } => open_old_filter(&call.module, path, call, &pads, &streams)?,
             Kind::Host => open_host(call, &pads, &streams)?,
             Kind::Leaky => open_leaky(call, &pads, &streams)?,
+            Kind::Av => open_av(call, &pads, &streams)?,
         };
         let Opening {
             mut spec,
@@ -1921,6 +1935,144 @@ fn open_leaky(call: &NodeCall, pads: &[(String, u32)], defs: &[StreamDef]) -> Re
     })
 }
 
+/// `decode` or `encode` over one picture stream by position: one instance,
+/// called with whatever has arrived.
+fn open_av(call: &NodeCall, pads: &[(String, u32)], defs: &[StreamDef]) -> Result<Opening> {
+    let name = &call.module;
+    let [(port, id)] = pads else {
+        bail!(
+            "{name} reads one picture stream, and this chain wires {}",
+            pads.len()
+        );
+    };
+    let def = &defs[*id as usize];
+    let (node, output): (Box<dyn Node>, StreamDef) = if name == av_nodes::DECODE {
+        let node = Decode::open(
+            &call.options,
+            &def.format,
+            &def.spelling,
+            def.header.as_ref().map(|h| h.fourcc.as_slice()),
+            def.base,
+            def.frame_rate,
+            def.decode_delay,
+        )?;
+        let header = decoded_header(name, &node, def)?;
+        let format = StreamFormat::Video(node.format());
+        let latency = node.shape().outputs[0].latency;
+        let output = StreamDef {
+            info: info_for(&format),
+            format,
+            base: def.base,
+            decode_delay: 0,
+            latency: Some(def.latency.unwrap_or(0.0) + latency),
+            header: Some(header),
+            wire: None,
+            frame_rate: def.frame_rate,
+            spelling: String::new(),
+            rendition: RenditionMeta::default(),
+            row: None,
+        };
+        (Box::new(node), output)
+    } else {
+        let aspect = def.header.as_ref().and_then(|h| match h.media {
+            nut::Media::Video {
+                sample_width,
+                sample_height,
+                ..
+            } => crate::aspect_from(sample_width, sample_height),
+            _ => None,
+        });
+        let node = Encode::open(
+            &call.options,
+            &def.format,
+            &def.spelling,
+            def.base,
+            def.frame_rate,
+            aspect,
+        )?;
+        let format = StreamFormat::Packets(node.coded().clone());
+        let output = StreamDef {
+            info: info_for(&format),
+            format,
+            base: def.base,
+            decode_delay: node.delay(),
+            latency: Some(def.latency.unwrap_or(0.0)),
+            header: Some(node.header()?),
+            wire: None,
+            frame_rate: def.frame_rate,
+            spelling: String::new(),
+            rendition: RenditionMeta::default(),
+            row: None,
+        };
+        (Box::new(node), output)
+    };
+    let shape = node.shape().clone();
+    let bound = vec![bound_stream(port, *id, def, StreamHint::default())];
+    let tick = tick_base(&shape, &bound)?;
+    let assembler = Assembler::new(&shape, &bound, name, &[])?;
+    Ok(Opening {
+        spec: LaneSpec {
+            name: name.clone(),
+            state: Vec::new(),
+            bound: vec![*id],
+            ports: vec![None],
+            shape,
+            intake: Intake::Assembled(Box::new(assembler)),
+            tick_base: tick,
+            runners: vec![node],
+            opener: None,
+            rows: None,
+            unbuffered: false,
+        },
+        outputs: vec![Some(output)],
+        feeds: Vec::new(),
+    })
+}
+
+/// The raw header `decode`'s pictures leave under: the coded stream's time
+/// base, frame rate and pixel aspect, and its colour where the wire has a
+/// code for it.
+fn decoded_header(name: &str, node: &Decode, coded: &StreamDef) -> Result<nut::Stream> {
+    let video = node.format();
+    let mut header = nut::Stream::video(
+        video.pix_fmt,
+        video.width,
+        video.height,
+        nut_base(coded.base),
+    )
+    .ok_or_else(|| {
+        anyhow!(
+            "{name} writes {} video, which the wire does not carry; it carries {}",
+            video.pix_fmt,
+            nut::supported_pix_fmts().join(", ")
+        )
+    })?;
+    let aspect = match &coded.format {
+        StreamFormat::Packets(c) => match c.format {
+            runtime::CodedFormat::Video {
+                sample_aspect_ratio,
+                ..
+            } => sample_aspect_ratio,
+            _ => None,
+        },
+        _ => None,
+    };
+    if let nut::Media::Video {
+        sample_width,
+        sample_height,
+        colorspace_type,
+        ..
+    } = &mut header.media
+    {
+        if let Some((num, den)) = aspect.filter(|(n, d)| *n > 0 && *d > 0) {
+            (*sample_width, *sample_height) = (num as u64, den as u64);
+        }
+        *colorspace_type = crate::colorspace_type_for(video.color.as_ref());
+    }
+    header.frame_rate = coded.frame_rate;
+    Ok(header)
+}
+
 fn open_host(call: &NodeCall, pads: &[(String, u32)], defs: &[StreamDef]) -> Result<Opening> {
     let [(_, id)] = pads else {
         bail!(
@@ -2017,7 +2169,16 @@ fn header_for(def: &StreamDef) -> Result<nut::Stream> {
         }
         StreamFormat::Data(_) => nut::Stream::json(base),
         StreamFormat::Packets(coded) => {
-            crate::coded_stream_for(coded, u64::from(def.decode_delay))?
+            match crate::coded_stream_for(coded, u64::from(def.decode_delay)) {
+                Ok(header) => header,
+                // A codec the wire's table does not name leaves under the
+                // header its producer built: the tag it was read under, or
+                // the one `encode` took from its encoder.
+                Err(e) => match &def.header {
+                    Some(h) if h.codec_name().is_some() && h.pix_fmt().is_none() => h.clone(),
+                    _ => return Err(e),
+                },
+            }
         }
     };
     header.time_base = base;

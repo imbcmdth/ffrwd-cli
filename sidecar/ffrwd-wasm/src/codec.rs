@@ -257,7 +257,7 @@ fn next_batch(rx: &mpsc::Receiver<Read>) -> Result<(Vec<Item>, bool)> {
 
 /// How many ticks of `time_base` one frame at `frame_rate` lasts, when that
 /// is a whole number; None when there is no rate or it does not divide.
-fn frame_ticks(frame_rate: Option<(u64, u64)>, time_base: TimeBase) -> Option<i64> {
+pub(crate) fn frame_ticks(frame_rate: Option<(u64, u64)>, time_base: TimeBase) -> Option<i64> {
     let (fps_num, fps_den) = frame_rate?;
     let num = u128::from(time_base.den) * u128::from(fps_den);
     let den = u128::from(time_base.num) * u128::from(fps_num);
