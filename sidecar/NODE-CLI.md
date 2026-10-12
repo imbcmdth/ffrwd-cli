@@ -201,12 +201,16 @@ from the moment the run starts, and whatever connects and writes a NUT of
 video and PCM is the input's source for as long as it stays: its picture
 is conformed to that format on the way in (rgba and yuv420p, at any size;
 a coded picture under a tag the sidecar's libavcodec knows, h264 say, is
-decoded in software first, see `AV-EDGE.md`), its sound to the port's
+decoded first, see `AV-EDGE.md`), its sound to the port's
 sample format (s16 or f32; another rate or channel count is refused by
 name and the pictures are kept). The picture of an input held on the GPU
 (`NODE-SHAPE.md`) is put there as the feeder sent it and conformed on the
 device, where a BT.709 or BT.601 picture is concerned, and the line saying
-it is conformed ends `on the GPU`. A group of
+it is conformed ends `on the GPU`. A coded picture for such an input is
+decoded on the process's device where its decoder shares it (`d3d12va` on
+Windows), as `decode` does for a reader on the GPU, so it never crosses
+host memory; elsewhere it is decoded in software and uploaded once. A
+group of
 hold inputs (`hold.group`) shares one listener and one connection, its
 picture to the video port and its sound to the audio port.
 

@@ -20,11 +20,12 @@ use anyhow::{anyhow, Context, Result};
 use ffrwd_frame::yuv::{self, Colour};
 use ffrwd_frame::Rgba;
 use ffrwd_wasm::nut::{self, Event, Limits, Media, PushDemuxer};
-use ffrwd_wasm_runtime::av::{self, Decoder, Hw};
+use ffrwd_wasm_runtime::av::{self, Decoder, Hw, Received};
 use ffrwd_wasm_runtime::node::{FrameData, StreamFormat, TickFrame};
 use ffrwd_wasm_runtime::runtime::{AudioFormat, ColorInfo, Message, StreamInfo, VideoFormat};
 use serde_json::json;
 
+use crate::av_nodes;
 use crate::hold::SourceInfo;
 use crate::lanes::{Room, Scheduler};
 use crate::leaky::ROW_PREFIX;
@@ -151,6 +152,36 @@ impl Picture {
         Ok(FrameData::Host(Arc::new(self.convert(&data)?)))
     }
 
+    /// A picture a decoder left on the process's device, as a frame there
+    /// at the port's size.
+    #[cfg(feature = "gpu")]
+    fn on_device(&self, decoder: &mut FeedDecoder, picture: av::DeviceFrame) -> Result<FrameData> {
+        use ffrwd_wasm_runtime::gpu::frames::{Layout, Target, Yuv};
+        let pictures = decoder.on_device.as_mut().ok_or_else(|| {
+            anyhow!("a feed's picture came back on a device it was not decoded on")
+        })?;
+        let yuv = decoder.yuv.unwrap_or(Yuv::DEFAULT);
+        let frame = pictures.hold(picture, self.to.pix_fmt, yuv)?;
+        if self.same() {
+            return Ok(FrameData::Gpu(frame));
+        }
+        let layout = Layout::of(self.to.pix_fmt)
+            .ok_or_else(|| anyhow!("{} is not held on the GPU", self.to.pix_fmt))?;
+        let target = Target::new(layout, self.to.width, self.to.height, yuv);
+        Ok(FrameData::Gpu(frame.converted(target)?))
+    }
+
+    #[cfg(not(feature = "gpu"))]
+    fn on_device(
+        &self,
+        _decoder: &mut FeedDecoder,
+        _picture: av::DeviceFrame,
+    ) -> Result<FrameData> {
+        anyhow::bail!(
+            "a feed's picture came back on the process's device, and this build holds none"
+        )
+    }
+
     fn convert(&self, data: &[u8]) -> Result<Vec<u8>> {
         if self.same() {
             return Ok(data.to_vec());
@@ -245,7 +276,7 @@ enum Convert {
     /// as a raw one is. `duration` is a picture's length in the stream's
     /// ticks, where its frame rate says.
     Coded {
-        decoder: Box<Decoder>,
+        decoder: Box<FeedDecoder>,
         picture: Picture,
         duration: Option<i64>,
     },
@@ -257,6 +288,17 @@ enum Convert {
     },
     /// A data member's messages, as they are.
     Data,
+}
+
+/// A coded picture's decoder: on the process's device for a port held on
+/// the GPU where it opens there, its pictures then staying on the device.
+struct FeedDecoder {
+    decoder: Decoder,
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+    on_device: Option<av_nodes::OnDevice>,
+    /// The colour the decoder's YUV is read in where the port takes rgba.
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+    yuv: Option<av_nodes::Yuv>,
 }
 
 /// One stream of a connection: which member it feeds, and how.
@@ -449,8 +491,34 @@ fn match_streams(spec: &FeedSpec, conn: &mut Conn, report: &mut dyn FnMut(String
                 }
                 match codec {
                     Some(codec) => {
-                        let decoder = Decoder::open(codec, &stream.extradata, Hw::None, pix_fmt)
-                            .map_err(|e| anyhow!("decoding the feeder's {codec} picture: {e}"))?;
+                        // On the device for a port held there, as `decode`
+                        // opens for a reader on the GPU; in software
+                        // otherwise.
+                        let yuv = av_nodes::read_as(crate::color_from(&stream.media).as_ref());
+                        let shared = picture.on_gpu.and_then(|_| {
+                            av_nodes::open_on_shared_device(
+                                codec,
+                                &stream.extradata,
+                                &Hw::Auto,
+                                pix_fmt,
+                                yuv,
+                            )
+                        });
+                        let (decoder, on_device) = match shared {
+                            Some(opened) => opened,
+                            None => (
+                                Decoder::open(codec, &stream.extradata, Hw::None, pix_fmt)
+                                    .map_err(|e| {
+                                        anyhow!("decoding the feeder's {codec} picture: {e}")
+                                    })?,
+                                None,
+                            ),
+                        };
+                        let decoder = FeedDecoder {
+                            decoder,
+                            on_device,
+                            yuv,
+                        };
                         let base = ffrwd_wasm_runtime::runtime::TimeBase {
                             num: stream.time_base.num,
                             den: stream.time_base.den,
@@ -809,6 +877,7 @@ fn drain(
                         .bytes
                         .fetch_add(payload.len() as u64, Ordering::Relaxed);
                     decoder
+                        .decoder
                         .send(packet.pts, packet.dts, *duration, packet.keyframe, payload)
                         .map_err(|e| anyhow!("decoding the feeder's picture: {e}"))?;
                     let id = spec.members[*member].id;
@@ -878,31 +947,39 @@ fn drain(
 /// Every picture `decoder` has ready, conformed and handed to member `id`.
 /// False once the run has stopped.
 fn hand_decoded(
-    decoder: &mut Decoder,
+    decoder: &mut FeedDecoder,
     picture: &Picture,
     id: u32,
     scheduler: &Scheduler,
     carried: &Carried,
 ) -> Result<bool> {
-    while let Some(frame) = decoder
-        .receive()
+    while let Some(received) = decoder
+        .decoder
+        .receive_any()
         .map_err(|e| anyhow!("decoding the feeder's picture: {e}"))?
     {
-        if (frame.width, frame.height) != (picture.width, picture.height) {
+        let (pts, size) = match &received {
+            Received::Host(f) => (f.pts, (f.width, f.height)),
+            Received::Device(f) => (f.pts, (f.width, f.height)),
+        };
+        if size != (picture.width, picture.height) {
             anyhow::bail!(
-                "the feeder's header says {}x{}, and its picture at pts {} decoded {}x{}",
+                "the feeder's header says {}x{}, and its picture at pts {pts} decoded {}x{}",
                 picture.width,
                 picture.height,
-                frame.pts,
-                frame.width,
-                frame.height
+                size.0,
+                size.1
             );
         }
         carried.conformed.fetch_add(1, Ordering::Relaxed);
+        let data = match received {
+            Received::Host(frame) => picture.frame(Arc::new(frame.data))?,
+            Received::Device(frame) => picture.on_device(decoder, frame)?,
+        };
         let frame = TickFrame {
-            pts: frame.pts,
+            pts,
             duration: None,
-            data: picture.frame(Arc::new(frame.data))?,
+            data,
             rows: Vec::new(),
         };
         if !scheduler.arrive(id, Item::Frame(frame)) {
@@ -929,6 +1006,7 @@ fn flush_decoders(
             continue;
         };
         decoder
+            .decoder
             .flush()
             .map_err(|e| anyhow!("decoding the feeder's picture: {e}"))?;
         let id = spec.members[lane.member].id;

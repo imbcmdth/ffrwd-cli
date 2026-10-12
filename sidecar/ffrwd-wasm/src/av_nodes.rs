@@ -156,28 +156,28 @@ fn open_decoder(
 
 /// How a decoder's pictures on the process's device become frames.
 #[cfg(feature = "gpu")]
-type OnDevice = ffrwd_wasm_runtime::gpu::frames::DecodedPictures;
+pub(crate) type OnDevice = ffrwd_wasm_runtime::gpu::frames::DecodedPictures;
 #[cfg(not(feature = "gpu"))]
-type OnDevice = std::convert::Infallible;
+pub(crate) type OnDevice = std::convert::Infallible;
 
 /// The colour a picture's YUV is read in when it is made rgba on the
 /// device.
 #[cfg(feature = "gpu")]
-type Yuv = ffrwd_wasm_runtime::gpu::frames::Yuv;
+pub(crate) type Yuv = ffrwd_wasm_runtime::gpu::frames::Yuv;
 #[cfg(not(feature = "gpu"))]
-type Yuv = ();
+pub(crate) type Yuv = ();
 
 /// The colour a stream's YUV is read in as rgba, as libswscale reads it
 /// (an unknown matrix is BT.601); None for a matrix the device's
 /// conversion does not have.
 #[cfg(feature = "gpu")]
-fn read_as(color: Option<&ColorInfo>) -> Option<Yuv> {
+pub(crate) fn read_as(color: Option<&ColorInfo>) -> Option<Yuv> {
     let (space, range) = color.map_or(("unknown", "unknown"), |c| (c.space, c.range));
     Yuv::read_as(space, range)
 }
 
 #[cfg(not(feature = "gpu"))]
-fn read_as(_color: Option<&ColorInfo>) -> Option<Yuv> {
+pub(crate) fn read_as(_color: Option<&ColorInfo>) -> Option<Yuv> {
     None
 }
 
@@ -187,7 +187,7 @@ fn read_as(_color: Option<&ColorInfo>) -> Option<Yuv> {
 /// conversion has: `yuv`), and the device opens. None, having said why on
 /// stderr where it is not obvious, otherwise.
 #[cfg(all(feature = "gpu", windows))]
-fn open_on_shared_device(
+pub(crate) fn open_on_shared_device(
     codec: &str,
     extradata: &[u8],
     hw: &Hw,
@@ -240,7 +240,7 @@ fn open_on_shared_device(
 }
 
 #[cfg(not(all(feature = "gpu", windows)))]
-fn open_on_shared_device(
+pub(crate) fn open_on_shared_device(
     _codec: &str,
     _extradata: &[u8],
     _hw: &Hw,

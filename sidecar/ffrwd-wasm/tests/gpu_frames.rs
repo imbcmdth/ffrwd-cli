@@ -1296,6 +1296,120 @@ fn a_feed_held_on_the_gpu_is_conformed_on_the_device() {
     assert!(max <= 1 && mean < 0.05, "{max} apart, mean {mean}");
 }
 
+#[test]
+fn a_coded_feed_held_on_the_gpu_is_decoded_on_the_device() {
+    use std::net::{TcpListener, TcpStream};
+    use std::time::{Duration, Instant};
+    let test = "a_coded_feed_held_on_the_gpu_is_decoded_on_the_device";
+    let Some(dir) = d3d12va_libav(test) else {
+        return;
+    };
+    let module = module();
+    let small = (32u32, 24u32);
+    let port = {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind a free port");
+        listener.local_addr().expect("its address").port()
+    };
+    let wiring = format!("[v=0:v]gpu_box=memory=gpu:out=gpu:w=port:port={port}:size=3[out=o]");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ffrwd-wasm"))
+        .env("FFRWD_AV_RUNTIME", &dir)
+        .args(["-profile", "-gpu", &module, "-f", "nut", "-i", "-", "-m"])
+        .arg(format!("gpu_box={module}"))
+        .args(["-filter_complex", &wiring, "-map", "[o]", "-f", "nut", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ffrwd-wasm");
+
+    // The programme, flat green, paced at 25 a second for three seconds.
+    let mut stdin = child.stdin.take().expect("stdin is piped");
+    let programme = std::thread::spawn(move || {
+        let mut stream = Stream::video("rgba", small.0, small.1, TIME_BASE).expect("rgba");
+        stream.frame_rate = Some((25, 1));
+        let mut muxer = Muxer::new(&mut stdin, &stream).expect("headers");
+        let started = Instant::now();
+        for k in 0..75i64 {
+            let due = started + Duration::from_millis(40 * k as u64);
+            if let Some(wait) = due.checked_duration_since(Instant::now()) {
+                std::thread::sleep(wait);
+            }
+            if muxer.write_frame(k, &green(small.0, small.1)).is_err() {
+                return;
+            }
+            let _ = muxer.flush();
+        }
+        let _ = muxer.finish();
+    });
+    // The feeder: the h264 fixture's packets as they are, 64x48.
+    let feeder = std::thread::spawn(move || {
+        let until = Instant::now() + Duration::from_secs(10);
+        let socket = loop {
+            std::thread::sleep(Duration::from_millis(100));
+            if let Ok(socket) = TcpStream::connect(("127.0.0.1", port)) {
+                break socket;
+            }
+            if Instant::now() > until {
+                return;
+            }
+        };
+        let file = std::fs::File::open(h264_fixture()).expect("open the h264 fixture");
+        let mut demuxer = Demuxer::open(file).expect("read the fixture's NUT headers");
+        let stream = demuxer.stream().clone();
+        let Ok(mut muxer) = Muxer::with_streams(std::io::BufWriter::new(socket), &[stream]) else {
+            return;
+        };
+        let mut buf = Vec::new();
+        while let Ok(Some(packet)) = demuxer.read_packet(&mut buf) {
+            if muxer.write_coded_to(0, &packet, &buf).is_err() || muxer.flush().is_err() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(40));
+        }
+        let _ = muxer.finish();
+    });
+    let output = child.wait_with_output().expect("wait for ffrwd-wasm");
+    let _ = (programme.join(), feeder.join());
+    if no_gpu(&output) {
+        eprintln!("skipped: this machine has no GPU adapter");
+        return;
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success(),
+        "exited {:?}:\n{stderr}",
+        output.status.code()
+    );
+    assert!(stderr.contains(DECODED_LINE), "{stderr}");
+    assert!(
+        stderr.contains(
+            "feed: gpu_box 'w': the feeder's picture is 64x48 h264, conformed to 32x24 rgba \
+             on the GPU"
+        ),
+        "{stderr}"
+    );
+    // The programme alone is uploaded; the feed's pictures never were in
+    // host memory.
+    let programme_bytes = 75 * small.0 as usize * small.1 as usize * 4;
+    assert!(
+        stderr.contains(&format!("\"upload\":{{\"bytes\":{programme_bytes},")),
+        "{stderr}"
+    );
+    let pictures = read_nut(&output.stdout);
+    assert_eq!(pictures.len(), 75, "a picture a programme frame");
+    let fed = pictures
+        .iter()
+        .filter(|(_, p)| p[(5 * small.0 as usize + 5) * 4 + 1] != 200)
+        .count();
+    assert!(
+        fed >= 10,
+        "the feed shows on {fed} pictures of 75:\n{stderr}"
+    );
+    assert!(pictures
+        .iter()
+        .all(|(_, p)| has_the_box(p, small.0 as usize, 3)));
+}
+
 // The host's `filter` node: a libavfilter graph on the device, between a
 // decoder and an encoder on it, or over pictures in host memory.
 
