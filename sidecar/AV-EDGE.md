@@ -1,9 +1,9 @@
 # The codec edge
 
-What the sidecar accepts on the command line for its own `decode` and
-`encode` nodes, where the libavcodec they run on comes from, and what it
-refuses. The compiler builds this argv; `NODE-CLI.md` has the two nodes'
-spelling inside a network.
+What the sidecar accepts on the command line for its own `decode`,
+`encode` and `filter` nodes, where the libav they run on comes from, and
+what it refuses. The compiler builds this argv; `NODE-CLI.md` has the
+nodes' spelling inside a network.
 
 ## What runs
 
@@ -17,11 +17,16 @@ the format the module between them reads.
 
 libavcodec is loaded at run time, never linked. The sidecar loads
 `libavutil`, `libswresample`, `libavcodec` and `libswscale` by full path,
-in that order, from one directory. `libswscale` converts the decoder's
-native format to the wire's and the wire's to the encoder's; there is no
-`libavformat`, since the sidecar carries NUT itself and ffmpeg keeps every
-container. A run that holds neither node, and serves no port feed whose
-picture arrives coded, never loads any of it.
+in that order, from one directory, then `libavfilter` where the directory
+has it. `libswscale` converts the decoder's native format to the wire's
+and the wire's to the encoder's; there is no `libavformat`, since the
+sidecar carries NUT itself and ffmpeg keeps every container. A run that
+holds none of the three nodes, and serves no port feed whose picture
+arrives coded, never loads any of it.
+
+`filter` runs a graph in libavfilter's own syntax, on a D3D12 device
+(below). A directory without `libavfilter`, which a wheel from before it
+was bundled is, runs everything else and refuses `filter` by name.
 
 ## The argv
 
@@ -47,6 +52,7 @@ other, naming what it found and what it wanted:
 | libswresample | 7 | `swresample-7.dll` | `libswresample.so.7` | `libswresample.7.dylib` |
 | libavcodec | 63 | `avcodec-63.dll` | `libavcodec.so.63` | `libavcodec.63.dylib` |
 | libswscale | 10 | `swscale-10.dll` | `libswscale.so.10` | `libswscale.10.dylib` |
+| libavfilter | 12 | `avfilter-12.dll` | `libavfilter.so.12` | `libavfilter.12.dylib` |
 
 Those are FFmpeg 9.0's. The builds are the project's own, LGPL only:
 `--disable-everything`, the decoders for h264, hevc, av1, vp9,
@@ -55,8 +61,16 @@ mpeg4, mpeg2video and mjpeg, and the hardware codecs the platform has
 (NVDEC and NVENC on Linux and Windows; D3D11VA, D3D12VA, DXVA2, Media
 Foundation and AMF on Windows; VideoToolbox on macOS; Vulkan on Linux,
 opened at run time, where VA-API is left out because libavutil would link
-libva at load time and a wheel cannot assume it). Never `--enable-gpl`,
-never `--enable-nonfree`. The musl wheels carry software codecs only. The native av1 decoder decodes only through a
+libva at load time and a wheel cannot assume it). libavfilter carries
+`buffer`, `buffersink`, `format`, `hwupload`, `hwdownload` and `null`
+everywhere, and the hardware filters the platform's build can make:
+`scale_d3d12` and `deinterlace_d3d12` on Windows; on Linux glibc the
+`_cuda` filters (`scale`, `overlay`, `pad`, `transpose`, `yadif`,
+`bwdif`, `chromakey`, `colorspace`), their kernels compiled by clang, and
+the `_vulkan` ones (`scale`, `overlay`, `blend`, `transpose`, the flips,
+`bwdif`, `gblur`, `avgblur`, `nlmeans`, `xfade`, `chromaber`), their
+shaders compiled at build time; none on musl or macOS. Never
+`--enable-gpl`, never `--enable-nonfree`. The musl wheels carry software codecs only. The native av1 decoder decodes only through a
 hardware device; there is no software AV1 in this build. The LGPL text
 sits beside the libraries in the wheel, with the MIT notices of the
 NVIDIA and AMF header sets on the platforms that compile them in.
@@ -73,6 +87,10 @@ directory it resolved, the version it loaded, and the hardware device
 types, decoders and encoders that libavcodec has. It answers on a machine
 with no libraries at all, carrying the refusal instead of a version, which
 is how a caller learns what to reinstall without running anything else.
+libavfilter is answered for on its own: its version in `avfilter`, every
+filter it has in `filters`, and in `avfilter_error` why it is not loaded.
+The compiler reads `filters` to decide which of a query's filters run on
+the device (`docs/dialect.md`).
 
 ## Refusals
 
@@ -85,6 +103,20 @@ reinstall hint:
 A library of another major is refused by version:
 
     libavcodec is version 62.3.100, and this build demands major 63
+
+A directory without libavfilter refuses `filter` the same way, and
+nothing else:
+
+    filter stream 0 of input 0: no avfilter-12.dll in C:\...\ffrwd_wasm_av
+    (-av-runtime); reinstall the sidecar, ...
+
+A graph libavfilter will not parse or configure is refused naming the
+graph and the call, after libav's own line naming the filter or option:
+
+    [Parsed_scale_d3d12_0 @ ...] Could not set non-existent option 'wx' to value '4'
+    filter stream 0 of input 0: the filter graph 'scale_d3d12=wx=4':
+    avfilter_graph_parse_ptr: Option not found; `ffrwd-wasm --av-info` lists
+    the filters this build has; ...
 
 A decoder or encoder the build does not have is refused by name, pointing
 at `--av-info` for what the build has. An encoder option the encoder does
@@ -139,3 +171,30 @@ back once.
 
     [av] encode h264_d3d12va: 1920x1080 nv12, from the device
     [gpu] encode h264_d3d12va: from the device, each frame one copy
+
+`filter` runs its graph on a `d3d12va` device: the D3D12 filters read and
+write D3D12 textures, so the graph's source is a frames context of NV12
+textures of the stream's size. Where something on the sidecar's device
+reads the node's pictures or writes the pictures it reads (a node module
+holding a port on the GPU, a `decode` there, an `encode` reading D3D12
+pictures) the graph runs on that device: each frame is copied into a
+picture of the source on the device (a module's rgba made NV12 first, as
+for the encoder), and the sink's pictures become the node's frames as
+they are, wrapped as the decoder's are, with no copy. A frame in host
+memory is converted to NV12 by libswscale and uploaded. With no such
+reader the graph runs on a device of its own and its pictures are read
+back to host memory. The output's size comes from the configured graph's
+sink. One line says where the graph runs, one how frames reach it:
+
+    [av] filter scale_d3d12: on the host's device
+    [av] filter scale_d3d12: frames copied on the device
+    [gpu] filter scale_d3d12: d3d12va, frames wrapped
+
+A D3D12 filter signals one sync object of its own for every picture it
+writes and writes a texture of its pool again without waiting on anyone,
+so a picture taken from the graph is kept until the device has finished
+reading it rather than handed back by a signal, and a frame is copied
+into the source only once the filter has finished with what it read
+before. `deinterlace_d3d12` does not run on NVIDIA's driver: creating its
+video processor removes the device (0x887A0005), ffmpeg's own command
+line included.

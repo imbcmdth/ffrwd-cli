@@ -433,10 +433,29 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   node module whose shape holds an input on the GPU (`memory: gpu` in
   the port's `accepts`, `sidecar/NODE-SHAPE.md`) takes the same edges
   with no clause at all: the sidecar decodes onto the device it holds
-  the frames on. Recipe
+  the frames on (its `decode` is told `hw=auto`). Recipe
   [157](examples.md#157-a-module-holding-its-frames-on-the-gpu-takes-the-packets).
   Recipe [155](examples.md#155-decode-and-encode-inside-the-sidecar);
   `sidecar/AV-EDGE.md` has the sidecar side.
+- A **filter between pictures on the sidecar's device** runs there
+  rather than in ffmpeg, where the sidecar's libavfilter has a variant of
+  it for the device: `scale`, with its width and height only, becomes the
+  sidecar's `filter` node running `scale_d3d12`. It qualifies when its
+  picture comes from the device (a node module's output held on the GPU,
+  another such filter, or an input's own picture, which the region then
+  decodes onto the device) and everything reading it is on the device too
+  (a node module's input held on the GPU, another such filter, or a
+  destination whose encoder reads the device's pictures, the `_d3d12va`
+  ones), and the run of such filters touches a module holding its
+  pictures on the GPU. A run of them is one `filter` node. The variants
+  are what the sidecar the compile finds lists under `filters` in
+  `ffrwd-wasm --av-info`; where that sidecar loads no libav at all, the
+  command is written for a reader whose sidecar carries the bundled
+  libavfilter. Every other filter, and a `scale` naming any other option,
+  stays in ffmpeg, so the picture leaves the device at that filter.
+  `yadif` and `bwdif` stay too: `deinterlace_d3d12` removes the device
+  on NVIDIA's driver. Recipe
+  [158](examples.md#158-scale-on-the-device-inside-the-region).
 - A **value-returning `LANGUAGE wasm` function** (`RETURNS text`,
   `number`, `boolean` or `vector`) takes no stream at all: every
   parameter is one of those same `vtype`s, matched name-for-name against

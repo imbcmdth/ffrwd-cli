@@ -148,6 +148,22 @@ extradata and reorder depth in the header, so the ffmpeg reading the
 pipe copies the stream into a file. Each is one instance, called in
 order, whatever `-jobs` says.
 
+The host's `filter` reads one picture stream by position and runs a graph
+in libavfilter's own syntax over it, on a D3D12 device (`AV-EDGE.md`):
+
+    [d]filter=graph=scale_d3d12=w=1280\\:h=720[f]
+    [d]filter=graph=scale_d3d12=w=1280\\:h=720:format=rgba[f]
+
+`graph` is the value of an option like any other, so the network's two
+levels of escaping apply to it before libavfilter's own: a `:` inside the
+graph is `\\:` in the network string, a `,` between two of its filters is
+`\,`, and the compiler escapes it so. The graph has one open input and one
+open output, which the host joins to a `buffer` source and a `buffersink`.
+`format` names the format its pictures leave in, `yuv420p` (the device's
+NV12, repacked) unless said, or `rgba`, converted on the device when read;
+the output's size is the configured graph's. It takes `yuv420p`, `rgba`
+and the wire's other formats in, and is one instance, called in order.
+
 ## Outputs
 
     -map '[<label>]' [-map '[<label>]' ...] -f nut <path>
