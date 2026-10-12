@@ -428,6 +428,17 @@ fn rows_shape(described: &runtime::DescribedRowsModule) -> NodeShape {
 pub struct FilterNode {
     filter: Filter,
     shape: NodeShape,
+    /// Where the rows the module reads arrive as a data stream of their own
+    /// (a node's rows): that stream's id and time base, and the clock pad's.
+    rows: Option<RowsPad>,
+}
+
+/// A data stream bound to a frame module's `rows` port.
+#[derive(Clone, Copy)]
+struct RowsPad {
+    id: u32,
+    base: TimeBase,
+    clock: TimeBase,
 }
 
 impl FilterNode {
@@ -479,7 +490,26 @@ impl FilterNode {
                 relation: Vec::new(),
             },
             filter,
+            rows: None,
         }
+    }
+
+    /// The node reading its rows off data stream `id`, in time base `base`,
+    /// rather than off the frames of its first pad: the adapted shape's
+    /// `rows` port, lockstep with the clock. Each row is handed riding the
+    /// latest frame of the first pad at or before its time, as it would have
+    /// ridden that frame from an older producer.
+    pub fn reading_rows(mut self, id: u32, base: TimeBase, clock: TimeBase) -> FilterNode {
+        self.shape.inputs.push(input(
+            "rows",
+            PortKind::Data,
+            true,
+            false,
+            Pairing::Lockstep,
+            RowsUse::PerFrame,
+        ));
+        self.rows = Some(RowsPad { id, base, clock });
+        self
     }
 }
 
@@ -501,14 +531,33 @@ impl Node for FilterNode {
     }
 
     fn process(&mut self, tick: Tick) -> Result<Emitted> {
-        let mut streams = tick.streams.into_iter();
+        let mut streams = tick.streams;
+        let rows = self.rows.and_then(|pad| {
+            let at = streams.iter().position(|s| s.id == pad.id)?;
+            Some((pad, streams.remove(at)))
+        });
+        let mut streams = streams.into_iter();
         let first = streams.next().unwrap_or_default();
-        let trailing = first.trailing;
+        let mut trailing = first.trailing;
         let mut frames: Vec<Frame> = first
             .frames
             .into_iter()
             .map(frame_of)
             .collect::<Result<_>>()?;
+        if let Some((pad, stream)) = rows {
+            for message in stream.messages {
+                let row = String::from_utf8(message.data)
+                    .map_err(|_| anyhow!("{}: a row is not UTF-8", self.filter.name()))?;
+                let at = frames
+                    .iter()
+                    .rposition(|f| compare(f.pts, pad.clock, message.pts, pad.base).is_le())
+                    .or((!frames.is_empty()).then_some(0));
+                match at {
+                    Some(index) => frames[index].rows.push(row),
+                    None => trailing.push(row),
+                }
+            }
+        }
         for stream in streams {
             for frame in stream.frames {
                 frames.push(frame_of(frame)?);

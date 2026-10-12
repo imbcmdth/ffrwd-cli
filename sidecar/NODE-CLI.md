@@ -125,7 +125,11 @@ fewer `-bound` flags than chains calling it is refused at the first chain
 past them.
 
 A frame module of an older world keeps its positional pads in the same
-`-filter_complex`, and runs as the node its adapter makes of it. The host's
+`-filter_complex`, and runs as the node its adapter makes of it. A data pad
+last among them binds its `rows` port, for a module that reads rows: a
+node's rows on a data edge, `[map][rows]mask_select`, each handed to the
+module riding the latest frame of its first pad at or before the row's
+time, as rows riding that frame would have arrived. The host's
 `rowfilter` and `rowmerge` read one data edge by position: `[n1]rowfilter`,
 and `leaky` one picture stream, decoded or coded: `[v=0:v]leaky=max_lateness=0.5[live]`.
 Over packets it drops whole groups, from a late packet to the next keyframe

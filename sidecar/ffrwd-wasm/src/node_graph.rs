@@ -1068,8 +1068,13 @@ fn output_streams(
             },
         };
         // A video output like an input, in that input's pixel format, keeps
-        // its colour tags too: a reader of both sees one format.
-        let format = match (format, like.map(|b| &b.format)) {
+        // its colour tags too: a reader of both sees one format. An output
+        // declaring no format is its clock input's.
+        let colour_from = match &output.format {
+            None => clock,
+            _ => like,
+        };
+        let format = match (format, colour_from.map(|b| &b.format)) {
             (StreamFormat::Video(mut made), Some(StreamFormat::Video(from)))
                 if made.pix_fmt == from.pix_fmt && made.color.is_none() =>
             {
@@ -2005,8 +2010,34 @@ fn open_old_filter(
         runtime::describe(path).with_context(|| format!("describing module '{name}'"))?;
     let schema = parse_schema(&described.meta.params_schema, name)?;
     let params = params_json(name, &schema, &call.options)?;
-    let node = FilterNode::open(path, &format, &def.info, &params)
-        .with_context(|| format!("opening module '{name}' from {path}"))?;
+    // A data pad, last, is the rows the module reads: a node's, which ride
+    // no frames.
+    let (frames, rows) = match pads.split_last() {
+        Some(((_, id), rest)) if matches!(defs[*id as usize].format, StreamFormat::Data(_)) => {
+            (rest, Some(*id))
+        }
+        _ => (pads, None),
+    };
+    if let Some(id) = rows {
+        if !described.reads_rows {
+            bail!(
+                "{name} reads no rows, and this chain wires {} to it",
+                defs[id as usize].spelling
+            );
+        }
+    }
+    let open = {
+        let (path, params, info) = (path.to_string(), params.clone(), def.info.clone());
+        let rows = rows.map(|id| (id, defs[id as usize].base));
+        move || -> Result<FilterNode> {
+            let node = FilterNode::open(&path, &format, &info, &params)?;
+            Ok(match rows {
+                Some((id, base)) => node.reading_rows(id, base, format.time_base),
+                None => node,
+            })
+        }
+    };
+    let node = open().with_context(|| format!("opening module '{name}' from {path}"))?;
     let shape = node.shape().clone();
     if pads.len() != shape.inputs.len() {
         bail!(
@@ -2015,7 +2046,7 @@ fn open_old_filter(
             pads.len()
         );
     }
-    let bound: Vec<BoundStream> = pads
+    let mut bound: Vec<BoundStream> = frames
         .iter()
         .map(|(port, id)| bound_stream(port, *id, &defs[*id as usize], StreamHint::default()))
         .collect();
@@ -2024,14 +2055,17 @@ fn open_old_filter(
             bail!("{name} reads its pads in one format, and they arrive in more than one");
         }
     }
+    if let Some(id) = rows {
+        bound.push(bound_stream(
+            "rows",
+            id,
+            &defs[id as usize],
+            StreamHint::default(),
+        ));
+    }
     let tick = def.base;
     let outputs = output_streams(name, &node, &shape, &bound, defs, tick)?;
-    let opener: Opener = {
-        let (path, params, info) = (path.to_string(), params, def.info.clone());
-        Arc::new(move || {
-            Ok(Box::new(FilterNode::open(&path, &format, &info, &params)?) as Box<dyn Node>)
-        })
-    };
+    let opener: Opener = Arc::new(move || Ok(Box::new(open()?) as Box<dyn Node>));
     let assembler = Assembler::new(&shape, &bound, name, &[])?;
     Ok(Opening {
         spec: LaneSpec {
