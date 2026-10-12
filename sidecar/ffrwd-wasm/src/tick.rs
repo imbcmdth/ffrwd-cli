@@ -502,6 +502,23 @@ impl Input {
         self.progress = self.queue.iter().map(|item| self.item_time(item)).max();
     }
 
+    /// Leaves the items up to and including the `count`th picture or packet
+    /// queued, and returns the rest. Messages are not counted.
+    fn take_after(&mut self, count: usize) -> VecDeque<Item> {
+        let mut seen = 0;
+        let cut = self.queue.iter().position(|item| {
+            if matches!(item, Item::Message(_)) {
+                return false;
+            }
+            seen += 1;
+            seen > count
+        });
+        match cut {
+            Some(cut) => self.queue.split_off(cut),
+            None => VecDeque::new(),
+        }
+    }
+
     fn item_time(&self, item: &Item) -> i64 {
         match item {
             Item::Frame(f) => f.pts,
@@ -530,6 +547,13 @@ enum ClockState {
     },
     SelfClocked,
 }
+
+/// The pictures or packets a self-clocked node is handed per input in one
+/// call, short of its last. A node that decodes, filters or encodes hands
+/// each picture on as it is done, so the node reading it works beside it
+/// rather than after the whole batch, and what the batch holds on the
+/// device stays bounded.
+const ARRIVALS_PER_CALL: usize = 1;
 
 /// A node's ticks, cut from what arrives on its bound streams.
 pub struct Assembler {
@@ -932,8 +956,10 @@ impl Assembler {
         Ok(Some(self.made(pts, end, base, last, streams)))
     }
 
-    /// A self-clocked node's next call: whatever has arrived. `pts` is the
-    /// microseconds since its first call.
+    /// A self-clocked node's next call: what has arrived, up to
+    /// [`ARRIVALS_PER_CALL`] pictures or packets an input. `pts` is the
+    /// microseconds since its first call. Asked for the last call, it makes
+    /// one only once that leaves nothing queued.
     pub fn next_arrivals(&mut self, pts: i64, last: bool) -> Result<Tick> {
         let base = TimeBase {
             num: 1,
@@ -941,9 +967,23 @@ impl Assembler {
         };
         let mut streams = Vec::with_capacity(self.inputs.len());
         let mut held = Vec::new();
+        let mut left = false;
         for index in 0..self.inputs.len() {
-            streams.push(self.hand(index, pts, None, base, &mut held)?);
+            let rest = self.inputs[index].take_after(ARRIVALS_PER_CALL);
+            left |= !rest.is_empty();
+            // Done only to what this call hands over, where some is left.
+            let handed_to = match (rest.is_empty(), self.inputs[index].queue.back()) {
+                (false, Some(item)) => Some(self.inputs[index].item_time(item)),
+                _ => None,
+            };
+            let mut stream = self.hand(index, pts, None, base, &mut held)?;
+            if let Some(to) = handed_to {
+                stream.progress = stream.progress.map(|p| p.min(to));
+            }
+            self.inputs[index].queue = rest;
+            streams.push(stream);
         }
+        let last = last && !left;
         if last {
             self.done = true;
         }
@@ -2041,6 +2081,42 @@ mod tests {
         assert!(a.all_ended());
         let last = a.next_arrivals(9, true).expect("tick");
         assert!(last.last && last.streams[0].messages.is_empty());
+        assert!(a.is_done());
+    }
+
+    #[test]
+    fn a_self_clocked_node_is_handed_a_picture_a_call_and_its_last_call_empties_the_queue() {
+        let s = shape(
+            vec![port(
+                "v",
+                PortKind::Video,
+                Pairing::Arrival,
+                RowsUse::Ignore,
+            )],
+            Clock::SelfClocked,
+        );
+        let mut a =
+            Assembler::new(&s, &[bound("v", 1, MICROS, video())], "m", &[]).expect("assembler");
+        for pts in [0, 10, 20] {
+            a.arrive(1, frame(pts, &[])).expect("frame");
+        }
+        a.end(1).expect("end");
+        let mut handed = Vec::new();
+        let mut calls = 0;
+        loop {
+            let tick = a.next_arrivals(calls, true).expect("tick");
+            calls += 1;
+            handed.extend(tick.streams[0].frames.iter().map(|f| f.pts));
+            if tick.last {
+                break;
+            }
+            assert!(!a.is_done());
+        }
+        assert_eq!(handed, vec![0, 10, 20]);
+        assert_eq!(
+            calls, 3,
+            "one picture a call, the last call with the last one"
+        );
         assert!(a.is_done());
     }
 
