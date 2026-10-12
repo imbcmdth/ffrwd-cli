@@ -169,12 +169,18 @@ jobs:
 
           ROOT = pathlib.Path("sidecar/wasm")
 
-          # The archive an install reads holds `wit/av.wit`; the tree holds one
-          # av.wit, in sidecar/wit. The copy is made at pack time, here and in
-          # the publish invocation printed below, and never checked in.
+          # The archive an install reads holds `wit/av.wit` and, under
+          # `wit/deps/`, the wasi:webgpu interface the sidecar hosts with its
+          # own two additions, plus the packages its types name. The tree
+          # holds one copy of each: av.wit in sidecar/wit, the deps in the
+          # vendored host's wit directory. The copies are made at pack time,
+          # here and in the publish invocation printed below, and never
+          # checked in.
           staged = ROOT / "wit"
-          staged.mkdir(exist_ok=True)
+          shutil.rmtree(staged, ignore_errors=True)
+          staged.mkdir()
           shutil.copyfile("sidecar/wit/av.wit", staged / "av.wit")
+          shutil.copytree("sidecar/vendor/wasi-webgpu-wasmtime/wit/deps", staged / "deps")
 
           archive = store.pack(ROOT)
           digest = hashlib.sha256(archive).hexdigest()
@@ -189,6 +195,7 @@ jobs:
               print("From a checkout of this tag:")
               print()
               print("    cp sidecar/wit/av.wit sidecar/wasm/wit/av.wit")
+              print("    cp -r sidecar/vendor/wasi-webgpu-wasmtime/wit/deps sidecar/wasm/wit/deps")
               print("    cd sidecar/wasm && ffrwd publish")
               print()
               print(f"which ships the {len(archive)} bytes hashing to {digest}.")

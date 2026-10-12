@@ -1,3 +1,11 @@
+// wasi:webgpu 0.0.1 as the wasi-gfx proposal published it, plus two
+// functions the sidecar's host answers and the proposal's IDL does not have:
+// `gpu-command-encoder.write-timestamp` and `gpu-queue.get-timestamp-period`.
+// The package keeps its upstream name so a module built against upstream's
+// copy links against this host unchanged; a module built against this copy
+// may call the two additions. This file ships in the `ffrwd/wasm` package
+// beside `av.wit`, so a guest binds the package rather than a path into a
+// checkout.
 package wasi:webgpu@0.0.1;
 
 interface webgpu {
