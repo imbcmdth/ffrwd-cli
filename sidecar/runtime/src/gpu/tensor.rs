@@ -107,7 +107,7 @@ impl TensorSpec {
     }
 
     /// Bytes the tensor's fp32 elements take.
-    pub fn len(&self) -> u64 {
+    pub fn byte_len(&self) -> u64 {
         4 * self.elements() as u64
     }
 
@@ -701,7 +701,12 @@ impl DeviceTensor {
     /// The tensor's bytes read back to host memory, counted as a download.
     pub fn read_back(&self) -> Result<Vec<u8>> {
         let started = Instant::now();
-        let bytes = read_buffer(&self.global, &self.device, self.buffer.id, self.spec.len())?;
+        let bytes = read_buffer(
+            &self.global,
+            &self.device,
+            self.buffer.id,
+            self.spec.byte_len(),
+        )?;
         PROFILE.download.add(bytes.len(), started);
         Ok(bytes)
     }
@@ -727,7 +732,7 @@ pub(super) fn make(
         );
     }
     let pipes = pipeline(global, device)?;
-    let buffer = pool(shared).take(global, device, spec.len(), shared)?;
+    let buffer = pool(shared).take(global, device, spec.byte_len(), shared)?;
 
     let (uniform, err) = global.device_create_buffer(
         device.device,
@@ -772,7 +777,7 @@ pub(super) fn make(
                     wgpu_core::binding_model::BufferBinding {
                         buffer: buffer.id,
                         offset: 0,
-                        size: Some(spec.len()),
+                        size: Some(spec.byte_len()),
                     },
                 ),
             },
@@ -1042,14 +1047,17 @@ mod tests {
                 let made = frame.tensor(s, false).unwrap();
                 let read = made.read_back().unwrap();
                 let gpu: Vec<f32> = read
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c))
                     .collect();
                 assert_eq!(gpu.len(), cpu.len());
+                // Relative past 1: `scale` 255 makes values in the hundreds.
                 let worst = cpu
                     .iter()
                     .zip(&gpu)
-                    .map(|(a, b)| (a - b).abs())
+                    .map(|(a, b)| (a - b).abs() / a.abs().max(1.0))
                     .fold(0f32, f32::max);
                 assert!(worst < 1e-4, "{pix_fmt} {s:?}: apart by up to {worst}");
             }

@@ -93,17 +93,28 @@ struct SemaphoreHandleDesc {
 }
 
 /// `cudaExternalSemaphoreWaitParams`, the layout the `_v2` entry point
-/// takes: a D3D12 sync object waits for `fence_value`.
+/// takes: a D3D12 sync object waits for `fence_value`. The keyed-mutex
+/// member is a struct of a u64 and a u32, so it ends in four bytes of
+/// padding, written out here so every later field lands where C has it;
+/// the runtime refuses a wait whose reserved words are not zero.
 #[repr(C)]
 struct WaitParams {
     fence_value: u64,
     nv_sci_sync: u64,
     keyed_mutex_key: u64,
     keyed_mutex_timeout_ms: c_uint,
+    keyed_mutex_padding: c_uint,
     params_reserved: [c_uint; 10],
     flags: c_uint,
     reserved: [c_uint; 16],
 }
+
+// The sizes the CUDA 12 and 13 headers give these structs on 64-bit
+// Windows.
+const _: () = assert!(std::mem::size_of::<MemoryHandleDesc>() == 104);
+const _: () = assert!(std::mem::size_of::<BufferDesc>() == 88);
+const _: () = assert!(std::mem::size_of::<SemaphoreHandleDesc>() == 96);
+const _: () = assert!(std::mem::size_of::<WaitParams>() == 144);
 
 /// The functions resolved from the runtime, each named as it is exported.
 struct Fns {
@@ -388,6 +399,7 @@ impl CudaSemaphore {
             nv_sci_sync: 0,
             keyed_mutex_key: 0,
             keyed_mutex_timeout_ms: 0,
+            keyed_mutex_padding: 0,
             params_reserved: [0; 10],
             flags: 0,
             reserved: [0; 16],

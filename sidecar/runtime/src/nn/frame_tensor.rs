@@ -15,6 +15,9 @@
 //!
 //! A frame in host memory is made into the tensor on the CPU, the same way
 //! the pass makes it: `[nn] <model>: input in host memory, made on the CPU`.
+//!
+//! `FFRWD_NN_BIND=off` takes the downloaded route where the bound one would
+//! be taken, so the two can be compared on one session.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
@@ -65,7 +68,15 @@ fn route(model: &str, provider: Provider) -> Route {
         .clone()
 }
 
+/// The environment variable that, set to `off` (or `0`), keeps every model
+/// on the downloaded route.
+pub const BIND_VAR: &str = "FFRWD_NN_BIND";
+
 fn settle(provider: Provider) -> Route {
+    let off = std::env::var(BIND_VAR).is_ok_and(|v| v == "off" || v == "0");
+    if off {
+        return Route::Downloaded(format!("{BIND_VAR} is off"));
+    }
     match provider {
         Provider::Cuda => {
             #[cfg(windows)]
@@ -274,7 +285,7 @@ mod bound {
                 .mapped()
                 .and_then(|m| m.read())
                 .map_err(|e| wasmtime::format_err!("{e:#}"))?;
-            let len = self.tensor.spec.len() as usize;
+            let len = self.tensor.spec.byte_len() as usize;
             PROFILE.download.add(len, started);
             Ok(bytes[..len].to_vec())
         }
