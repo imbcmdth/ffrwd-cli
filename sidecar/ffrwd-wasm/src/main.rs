@@ -645,8 +645,8 @@ fn resolve_model(raw: &str) -> Result<nn::ModelSpec> {
 ///
 /// They are read before the argv is dispatched so that `--describe` and
 /// `--invoke` reach a module that does inference, not only the frame loop.
-/// `-nn-exclude` is repeatable and deduplicated; it drops a provider from a
-/// `-nn-target gpu` walk for the whole process.
+/// `-nn-exclude` is repeatable and deduplicated: `<name>=<provider>` keeps
+/// one model's session off a provider, and a bare `<provider>` every model's.
 fn take_nn_args(argv: Vec<String>) -> Result<(nn::Config, Vec<String>)> {
     let mut config = nn::Config::default();
     let mut rest = Vec::with_capacity(argv.len());
@@ -666,9 +666,9 @@ fn take_nn_args(argv: Vec<String>) -> Result<(nn::Config, Vec<String>)> {
             "-nn-runtime" => config.runtime_dir = Some(next("-nn-runtime")?.into()),
             "-nn-target" => config.target = nn::Target::parse(&next("-nn-target")?)?,
             "-nn-exclude" => {
-                let provider = nn::parse_exclude(&next("-nn-exclude")?)?;
-                if !config.exclude.contains(&provider) {
-                    config.exclude.push(provider);
+                let exclusion = nn::parse_exclude(&next("-nn-exclude")?)?;
+                if !config.exclude.contains(&exclusion) {
+                    config.exclude.push(exclusion);
                 }
             }
             _ => rest.push(arg),
@@ -682,6 +682,7 @@ fn take_nn_args(argv: Vec<String>) -> Result<(nn::Config, Vec<String>)> {
         }
         seen.push(&spec.name);
     }
+    config.check_exclude()?;
     Ok((config, rest))
 }
 

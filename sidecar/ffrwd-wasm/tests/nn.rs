@@ -311,7 +311,7 @@ fn the_provider_that_engaged_is_reported() {
 
     let message = stderr(&output);
     assert!(
-        message.contains("[nn] execution provider:"),
+        message.contains("[nn] tiny: execution provider "),
         "a session that ran should say which provider did it: {message}"
     );
     // The runtime that answered is named, with where it came from.
@@ -350,12 +350,12 @@ fn a_gpu_target_that_ended_up_on_the_cpu_says_so() {
     let message = stderr(&output);
     // A machine with an accelerator this runtime directory can reach engages
     // it, and there is no fall back to report.
-    if !message.contains("execution provider: CPU") {
+    if !message.contains("[nn] tiny: execution provider CPU") {
         return;
     }
     assert!(
-        message.contains("-nn-target gpu was requested") && message.contains("tiny"),
-        "a fall back to the CPU is never silent, and names the model: {message}"
+        message.contains("[nn] tiny: execution provider CPU, "),
+        "a fall back to the CPU is never silent, and names the model and why: {message}"
     );
 }
 
@@ -373,6 +373,70 @@ fn nn_exclude_refuses_cpu_and_a_misspelling() {
     assert!(!output.status.success());
     assert!(
         stderr(&output).contains("cuda, directml and coreml"),
+        "got: {}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn nn_exclude_takes_a_model_name_and_refuses_one_never_bound() {
+    let model = format!("tiny={}", tiny_model().display());
+
+    let output = run_bare(&[
+        "-nn",
+        &model,
+        "-nn-exclude",
+        "tiny=directml",
+        "--describe",
+        "x.wasm",
+    ]);
+    let message = stderr(&output);
+    assert!(
+        !message.contains("-nn-exclude"),
+        "an exclusion naming a bound model should be accepted: {message}"
+    );
+
+    // The pair may come before the binding it names.
+    let output = run_bare(&[
+        "-nn-exclude",
+        "tiny=cuda",
+        "-nn",
+        &model,
+        "--describe",
+        "x.wasm",
+    ]);
+    let message = stderr(&output);
+    assert!(
+        !message.contains("-nn-exclude"),
+        "the order of -nn and -nn-exclude should not matter: {message}"
+    );
+
+    let output = run_bare(&[
+        "-nn",
+        &model,
+        "-nn-exclude",
+        "tinny=cuda",
+        "--describe",
+        "x.wasm",
+    ]);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("-nn-exclude tinny=cuda: no -nn binds tinny"),
+        "got: {}",
+        stderr(&output)
+    );
+
+    let output = run_bare(&[
+        "-nn",
+        &model,
+        "-nn-exclude",
+        "tiny=cpu",
+        "--describe",
+        "x.wasm",
+    ]);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("cannot be excluded"),
         "got: {}",
         stderr(&output)
     );
@@ -426,9 +490,88 @@ fn a_gpu_walk_with_directml_excluded_never_engages_it() {
         "the excluded provider is named once, regardless of the walk's outcome: {message}"
     );
     assert!(
-        !message.contains("execution provider: DIRECTML"),
+        !message.contains("execution provider DIRECTML"),
         "an excluded provider never engages: {message}"
     );
+}
+
+#[test]
+fn a_model_excluding_the_walks_provider_runs_on_the_cpu_beside_one_that_does_not() {
+    let Some(runtime) = runtime_dir() else {
+        announce_skip("there is no session to establish a provider for");
+        return;
+    };
+    let module = probe_module();
+    let module_arg = module.to_string_lossy().to_string();
+    let model = tiny_model();
+    let pinned_arg = format!("pinned={}", model.display());
+    let free_arg = format!("free={}", model.display());
+    // The platform's first GPU provider: DirectML on Windows, CUDA on Linux,
+    // CoreML on macOS.
+    let first = ffrwd_wasm_runtime::nn::providers()[0].clone();
+    let exclusion = format!("pinned={first}");
+    let first = first.to_ascii_uppercase();
+
+    for asked in ["pinned", "free"] {
+        let input = format!(r#"{{"model":"{asked}","input":[1,2,3,4]}}"#);
+        let output = run_with_runtime(
+            &runtime,
+            &[
+                "-nn",
+                &pinned_arg,
+                "-nn",
+                &free_arg,
+                "-nn-target",
+                "gpu",
+                "-nn-exclude",
+                &exclusion,
+                "--invoke",
+                &module_arg,
+                "run",
+                &input,
+            ],
+        );
+        let message = stderr(&output);
+        assert!(
+            output.status.success(),
+            "{asked} should answer whichever provider it runs on:\n{message}"
+        );
+        let result: serde_json::Value =
+            serde_json::from_str(stdout(&output).trim()).expect("the result is JSON");
+        assert_eq!(result["output"], serde_json::json!([12.5, 0.5]), "{asked}");
+
+        assert!(
+            message.contains(&format!("[nn] -nn-exclude: {exclusion}")),
+            "the exclusion is named as given: {message}"
+        );
+        // One model still takes the first provider, so the walk runs its
+        // preflight rather than passing it over for a pin.
+        assert!(
+            !message.contains("every model's pin"),
+            "one model's exclusion does not exclude it for the walk: {message}"
+        );
+        if message.contains(&format!("-nn-target gpu: not {first},")) {
+            announce_skip(&format!(
+                "{first} is not available here, so the walk did not take it"
+            ));
+            return;
+        }
+        assert!(
+            message.contains(&format!(
+                "[nn] pinned: execution provider CPU, {first} excluded by its pin"
+            )),
+            "the model that excludes the walk's provider runs on the CPU: {message}"
+        );
+        let free = message
+            .lines()
+            .find(|line| line.starts_with("[nn] free: execution provider "))
+            .unwrap_or_else(|| panic!("the other model's verdict is named: {message}"));
+        assert!(
+            free == format!("[nn] free: execution provider {first}")
+                || free == format!("[nn] free: execution provider CPU, {first} did not engage"),
+            "the model that does not exclude it asks for it: {free}"
+        );
+    }
 }
 
 #[test]
@@ -468,12 +611,13 @@ fn every_gpu_provider_excluded_runs_on_cpu_and_says_why() {
         stderr(&output)
     );
     let message = stderr(&output);
+    let verdict = message
+        .lines()
+        .find(|line| line.starts_with("[nn] tiny: execution provider "))
+        .unwrap_or_else(|| panic!("the model's verdict is named: {message}"));
     assert!(
-        message.contains("execution provider: CPU"),
-        "got: {message}"
-    );
-    assert!(
-        message.contains("tiny runs on cpu:") && message.contains("excluded by its pin"),
+        verdict.starts_with("[nn] tiny: execution provider CPU, ")
+            && verdict.ends_with("excluded by its pin"),
         "a walk left with only cpu by exclusion says why it is slow: {message}"
     );
 }
@@ -690,7 +834,7 @@ fn the_depth_of_field_chain_runs_and_keeps_every_frame() {
         stderr(&result)
     );
     assert!(
-        stderr(&result).contains("[nn] execution provider:"),
+        stderr(&result).contains("[nn] depth: execution provider "),
         "the run must say which provider engaged:\n{}",
         stderr(&result)
     );

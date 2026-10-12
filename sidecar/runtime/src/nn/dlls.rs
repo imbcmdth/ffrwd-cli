@@ -7,8 +7,6 @@
 
 use std::path::{Path, PathBuf};
 
-pub use wasmtime_wasi_nn::backend::onnx::Provider;
-
 /// The ONNX Runtime shared library's file name on this platform.
 #[cfg(windows)]
 pub const RUNTIME_LIB: &str = "onnxruntime.dll";
@@ -37,23 +35,6 @@ pub const DIRECTML_SUBDIR: &str = "directml";
 
 /// DirectML itself, which the DirectML build of ONNX Runtime loads by name.
 pub const DIRECTML_LIB: &str = "DirectML.dll";
-
-/// The library whose presence in the process proves a provider engaged, most
-/// wanted first. ONNX Runtime falls back to its CPU provider in silence, so
-/// this is the only thing that establishes what actually ran.
-#[cfg(windows)]
-pub const PROVIDER_MARKERS: &[(Provider, &str)] = &[
-    (Provider::Cuda, "onnxruntime_providers_cuda.dll"),
-    (Provider::DirectMl, DIRECTML_LIB),
-];
-#[cfg(all(unix, not(target_os = "macos")))]
-pub const PROVIDER_MARKERS: &[(Provider, &str)] =
-    &[(Provider::Cuda, "libonnxruntime_providers_cuda.so")];
-/// CoreML is linked into ONNX Runtime rather than loaded beside it, and the
-/// loaded images cannot be enumerated here anyway, so there is no marker to
-/// look for and the verdict says so rather than guessing.
-#[cfg(target_os = "macos")]
-pub const PROVIDER_MARKERS: &[(Provider, &str)] = &[];
 
 /// One library the CUDA provider needs, and what every version of it is
 /// called, so an absent one can be reported alongside the version that is
@@ -395,28 +376,4 @@ pub fn interesting(path: &Path) -> bool {
     ]
     .iter()
     .any(|stem| name.starts_with(stem))
-}
-
-/// Whether a library of this name is loaded in the process.
-fn is_loaded(loaded: &[PathBuf], file: &str) -> bool {
-    let want = file.to_ascii_lowercase();
-    loaded.iter().any(|p| {
-        p.file_name()
-            .map(|n| n.to_string_lossy().to_ascii_lowercase() == want)
-            .unwrap_or(false)
-    })
-}
-
-/// The execution provider that actually engaged. `None` when the process's
-/// loaded images cannot be enumerated, which is not the same as `Cpu`: ONNX
-/// Runtime falls back to its CPU provider in silence, so a guess here would be
-/// a guess reported as a fact.
-pub fn engaged_provider() -> Option<Provider> {
-    let loaded = loaded()?;
-    for (provider, marker) in PROVIDER_MARKERS {
-        if is_loaded(&loaded, marker) {
-            return Some(*provider);
-        }
-    }
-    Some(Provider::Cpu)
 }

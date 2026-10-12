@@ -1,9 +1,11 @@
 //! Implements a `wasi-nn` [`BackendInner`] using ONNX via the `ort` crate.
 //!
-//! This file carries the only change in the vendored copy of the crate, and
-//! the change is an upstreaming candidate: `ExecutionTarget::Gpu` resolves
-//! through a [`Provider`] priority list the embedder supplies rather than
-//! always meaning CUDA. Everything else here is upstream's.
+//! This file carries the vendored copy's changes to the ONNX backend, which
+//! are upstreaming candidates: `ExecutionTarget::Gpu` resolves through a
+//! [`Provider`] priority list the embedder supplies rather than always meaning
+//! CUDA, a `Gpu` session whose providers all fail to register is an error
+//! rather than a silent fall back to the CPU, and integer tensors are
+//! accepted alongside fp32. Everything else here is upstream's.
 
 use super::{
     BackendError, BackendExecutionContext, BackendFromDir, BackendGraph, BackendInner, NamedTensor,
@@ -50,7 +52,7 @@ impl Provider {
     }
 
     /// The `ort` provider this names, or `None` when this build does not
-    /// carry it. `None` is skipped rather than refused: the list is a
+    /// carry it. `None` is passed over rather than refused: the list is a
     /// priority order, so the next entry answers.
     fn dispatch(self) -> Option<ExecutionProviderDispatch> {
         match self {
@@ -119,8 +121,8 @@ impl OnnxBackend {
     ///
     /// An embedder that resolved one itself - it knows which libraries it put
     /// on disk and which of them loaded - names just that one, and the session
-    /// either engages it or falls back to the CPU provider the way ONNX
-    /// Runtime always does.
+    /// either engages it or fails to load, saying why. Loading the same bytes
+    /// again with `ExecutionTarget::Cpu` is how it then runs on the CPU.
     pub fn with_gpu_providers(gpu_providers: Vec<Provider>) -> Self {
         Self { gpu_providers }
     }
@@ -139,17 +141,51 @@ impl BackendInner for OnnxBackend {
             return Err(BackendError::InvalidNumberOfBuilders(1, builders.len()));
         }
 
-        // Configure execution providers based on target
-        let execution_providers = configure_execution_providers(target, &self.gpu_providers)?;
+        // One provider at a time, in order, each told to fail rather than
+        // leave ONNX Runtime to fall back to the CPU in silence. The first
+        // that registers builds the session; none registering fails the load.
+        let mut refused: Vec<(Provider, String)> = Vec::new();
+        for provider in session_providers(target, &self.gpu_providers) {
+            let Some(dispatch) = provider.dispatch() else {
+                tracing::debug!(
+                    "{} execution provider is not enabled in this build",
+                    provider.name()
+                );
+                refused.push((provider, "not enabled in this build".to_string()));
+                continue;
+            };
+            let builder =
+                match Session::builder()?.with_execution_providers([dispatch.error_on_failure()]) {
+                    Ok(builder) => builder,
+                    Err(e) => {
+                        tracing::debug!(
+                            "{} execution provider did not register: {e}",
+                            provider.name()
+                        );
+                        refused.push((provider, e.to_string()));
+                        continue;
+                    }
+                };
+            tracing::debug!("Using {} execution provider", provider.name());
+            let session = builder
+                .with_optimization_level(GraphOptimizationLevel::Level3)?
+                .commit_from_memory(builders[0])?;
 
-        let session = Session::builder()?
-            .with_execution_providers(execution_providers)?
-            .with_optimization_level(GraphOptimizationLevel::Level3)?
-            .commit_from_memory(builders[0])?;
+            let box_: Box<dyn BackendGraph> =
+                Box::new(OnnxGraph(Arc::new(Mutex::new(session)), target));
+            return Ok(box_.into());
+        }
 
-        let box_: Box<dyn BackendGraph> =
-            Box::new(OnnxGraph(Arc::new(Mutex::new(session)), target));
-        Ok(box_.into())
+        let why = match refused.as_slice() {
+            [] => "no GPU execution provider was named".to_string(),
+            [(_, only)] => only.clone(),
+            all => all
+                .iter()
+                .map(|(provider, e)| format!("{}: {e}", provider.name()))
+                .collect::<Vec<_>>()
+                .join("; "),
+        };
+        Err(BackendError::BackendAccess(wasmtime::format_err!("{why}")))
     }
 
     fn as_dir_loadable<'a>(&'a mut self) -> Option<&'a mut dyn BackendFromDir> {
@@ -157,44 +193,16 @@ impl BackendInner for OnnxBackend {
     }
 }
 
-/// Configure execution providers based on the target
-fn configure_execution_providers(
-    target: ExecutionTarget,
-    gpu: &[Provider],
-) -> Result<Vec<ExecutionProviderDispatch>, BackendError> {
+/// The providers a session tries, in order, for a target.
+fn session_providers(target: ExecutionTarget, gpu: &[Provider]) -> Vec<Provider> {
     match target {
-        ExecutionTarget::Cpu => {
-            // Use CPU execution provider with default configuration
-            tracing::debug!("Using CPU execution provider");
-            Ok(vec![CPUExecutionProvider::default().build()])
-        }
-        ExecutionTarget::Gpu => {
-            // The embedder's priority list, minus whatever this build does not
-            // carry. Nothing left means no GPU provider was compiled in.
-            let mut providers: Vec<ExecutionProviderDispatch> = Vec::new();
-            for provider in gpu {
-                match provider.dispatch() {
-                    Some(dispatch) => {
-                        tracing::debug!("Using {} execution provider", provider.name());
-                        providers.push(dispatch);
-                    }
-                    None => tracing::debug!(
-                        "{} execution provider is not enabled in this build",
-                        provider.name()
-                    ),
-                }
-            }
-            if providers.is_empty() {
-                tracing::warn!("no GPU execution provider is enabled, falling back to CPU");
-                providers.push(CPUExecutionProvider::default().build());
-            }
-            Ok(providers)
-        }
+        ExecutionTarget::Cpu => vec![Provider::Cpu],
+        ExecutionTarget::Gpu => gpu.to_vec(),
         ExecutionTarget::Tpu => {
             tracing::warn!(
                 "TPU execution target is not supported for ONNX backend yet, falling back to CPU"
             );
-            Ok(vec![CPUExecutionProvider::default().build()])
+            vec![Provider::Cpu]
         }
     }
 }

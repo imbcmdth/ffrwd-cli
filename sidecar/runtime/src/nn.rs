@@ -38,8 +38,8 @@ pub const IMPORT_PREFIX: &str = "wasi:nn/";
 /// not.
 const TARGETS: &str = "the targets are cpu, gpu, cuda, directml and coreml";
 
-/// The valid `-nn-exclude` spellings, listed in every refusal of one that is
-/// not. `cpu` is not among them -- every model runs somewhere, and CPU is
+/// The providers `-nn-exclude` can name, listed in every refusal of one that
+/// is not. `cpu` is not among them -- every model runs somewhere, and CPU is
 /// the one provider ONNX Runtime always offers.
 const EXCLUDABLE: &str = "the providers -nn-exclude can name are cuda, directml and coreml";
 
@@ -99,28 +99,58 @@ impl Target {
             Target::CoreMl => "coreml",
         }
     }
+}
 
-    /// Anything but `cpu` is a GPU session as far as the backend is concerned;
-    /// which provider it asks for is the resolved list, not this.
-    fn execution(self) -> ExecutionTarget {
-        match self {
-            Target::Cpu => ExecutionTarget::Cpu,
-            _ => ExecutionTarget::Gpu,
+/// How the argv spells a provider: `-nn-target`'s and `-nn-exclude`'s word
+/// for it.
+fn spelling(provider: Provider) -> String {
+    provider.name().to_ascii_lowercase()
+}
+
+/// One `-nn-exclude`: a provider one model's session never asks for, or
+/// every model's when it names no model.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Exclusion {
+    /// The `-nn` name it applies to; `None` is every model.
+    pub model: Option<String>,
+    pub provider: Provider,
+}
+
+impl Exclusion {
+    /// Whether this keeps `provider` from the model bound as `name`.
+    fn denies(&self, name: &str, provider: Provider) -> bool {
+        self.provider == provider && self.model.as_deref().is_none_or(|model| model == name)
+    }
+}
+
+/// Spelled the way `-nn-exclude` took it.
+impl std::fmt::Display for Exclusion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.model {
+            Some(name) => write!(f, "{name}={}", spelling(self.provider)),
+            None => write!(f, "{}", spelling(self.provider)),
         }
     }
 }
 
-/// The provider `-nn-exclude` names. `cpu` and anything not a provider at
-/// all are refused: a process always keeps somewhere to run, and a
-/// misspelling would otherwise be silently ignored.
-pub fn parse_exclude(raw: &str) -> Result<Provider> {
-    match raw {
-        "cuda" => Ok(Provider::Cuda),
-        "directml" => Ok(Provider::DirectMl),
-        "coreml" => Ok(Provider::CoreMl),
-        "cpu" => bail!("-nn-exclude cpu: cpu cannot be excluded"),
+/// What one `-nn-exclude` says: `<name>=<provider>` for the model bound as
+/// `name`, or a bare `<provider>` for every model. `cpu` and anything not a
+/// provider at all are refused: a model always keeps somewhere to run, and a
+/// misspelling would otherwise be silently ignored. Whether `name` is bound
+/// is [`Config::check_exclude`]'s to say, once every `-nn` has been read.
+pub fn parse_exclude(raw: &str) -> Result<Exclusion> {
+    let (model, spelled) = match raw.split_once('=') {
+        Some((name, provider)) => (Some(name.to_string()), provider),
+        None => (None, raw),
+    };
+    let provider = match spelled {
+        "cuda" => Provider::Cuda,
+        "directml" => Provider::DirectMl,
+        "coreml" => Provider::CoreMl,
+        "cpu" => bail!("-nn-exclude {raw}: cpu cannot be excluded"),
         _ => bail!("-nn-exclude {raw}: {EXCLUDABLE}"),
-    }
+    };
+    Ok(Exclusion { model, provider })
 }
 
 /// What `gpu` means here: the providers this platform can offer, most wanted
@@ -182,7 +212,7 @@ pub fn ort_version() -> String {
 pub fn providers() -> Vec<String> {
     GPU_PRIORITY
         .iter()
-        .map(|p| p.name().to_ascii_lowercase())
+        .map(|&p| spelling(p))
         .chain(std::iter::once("cpu".to_string()))
         .collect()
 }
@@ -215,9 +245,43 @@ pub struct Config {
     pub models: Vec<ModelSpec>,
     pub runtime_dir: Option<PathBuf>,
     pub target: Target,
-    /// Providers a `-nn-target gpu` walk skips for this process, the union
-    /// of every bound model's own pin. Ignored for a target named outright.
-    pub exclude: Vec<Provider>,
+    /// What `-nn-exclude` said, in the order it said it. A `-nn-target gpu`
+    /// walk passes over a provider every bound model excludes, and a model
+    /// that excludes the provider the walk took runs on the CPU. Ignored for
+    /// a target named outright.
+    pub exclude: Vec<Exclusion>,
+}
+
+impl Config {
+    /// Refuses a `-nn-exclude <name>=<provider>` whose name no `-nn` binds,
+    /// since a misspelt name would otherwise exclude nothing in silence.
+    pub fn check_exclude(&self) -> Result<()> {
+        for exclusion in &self.exclude {
+            let Some(name) = &exclusion.model else {
+                continue;
+            };
+            if !self.models.iter().any(|m| &m.name == name) {
+                bail!("-nn-exclude {exclusion}: no -nn binds {name}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether the model bound as `name` excludes `provider`, by its own
+    /// exclusion or a bare one.
+    fn excludes(&self, name: &str, provider: Provider) -> bool {
+        self.exclude.iter().any(|e| e.denies(name, provider))
+    }
+
+    /// The candidates of a `gpu` walk that every bound model excludes, and
+    /// so that the walk passes over.
+    fn excluded_by_every_model(&self) -> Vec<Provider> {
+        GPU_PRIORITY
+            .iter()
+            .copied()
+            .filter(|&p| self.models.iter().all(|m| self.excludes(&m.name, p)))
+            .collect()
+    }
 }
 
 /// A name to ONNX graph map.
@@ -231,20 +295,18 @@ pub struct Config {
 struct ModelRegistry(Arc<HashMap<String, Graph>>);
 
 impl ModelRegistry {
-    /// Reads the file here in the host and hands the bytes to the backend.
+    /// Hands a model file's bytes, read here in the host, to the backend.
     /// The guest learns neither the path nor the bytes.
     fn register(
         &mut self,
         backend: &mut Backend,
         name: &str,
-        path: &Path,
+        bytes: &[u8],
         target: ExecutionTarget,
     ) -> Result<()> {
-        let bytes = std::fs::read(path)
-            .with_context(|| format!("reading the model file {}", path.display()))?;
-        let graph = backend
-            .load(&[&bytes], target)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        // The backend's own message names only the kind of failure; what
+        // ONNX Runtime said is its cause, kept so a refusal carries it.
+        let graph = backend.load(&[bytes], target).map_err(anyhow::Error::new)?;
         Arc::get_mut(&mut self.0)
             .context("the model registry is already shared")?
             .insert(name.to_string(), graph);
@@ -263,7 +325,7 @@ impl GraphRegistry for ModelRegistry {
     }
 }
 
-/// The models this process loaded, and the provider they were loaded for.
+/// The models this process loaded, and the provider the walk took for it.
 struct Models {
     registry: ModelRegistry,
     names: Vec<String>,
@@ -493,16 +555,24 @@ fn preflight(provider: Provider, dir: &Path) -> Vec<String> {
     }
 }
 
-/// The provider a run asks for, and what to say on the way there.
+/// The provider this process loads a runtime for, and what to say on the way
+/// there.
 ///
-/// `gpu` walks the platform's priority order and takes the first whose
-/// preflight is clean, saying in one line why it passed over each earlier one.
-/// `exclude` drops a candidate from that walk before its preflight ever
-/// runs -- a model's own pin, not this machine, ruled it out. A provider
-/// named outright is taken as named regardless of `exclude`: its complaints
-/// are warnings, and ONNX Runtime's own fall back to the CPU is what the
-/// verdict reports.
-fn resolve(target: Target, dir: &Path, exclude: &[Provider]) -> (Provider, Vec<String>) {
+/// One process holds one ONNX Runtime binary, and DirectML's is a different
+/// binary from the CPU and CUDA one, so with the pinned artifacts a DirectML
+/// session and a CUDA one cannot share a process. The walk therefore settles
+/// one provider for the whole process, and each model's session then asks
+/// for it or for the CPU: a model that excludes the provider the walk took
+/// runs on the CPU.
+///
+/// `gpu` walks the platform's priority order and takes the first candidate
+/// whose preflight is clean, saying in one line why it passed over each
+/// earlier one. `excluded` is the candidates every bound model excludes,
+/// dropped before their preflight ever runs -- the models' own pins, not
+/// this machine, ruled them out. A provider named outright is taken as named
+/// and nothing is excluded: its complaints are warnings, and a session that
+/// cannot engage it runs on the CPU and says so.
+fn resolve(target: Target, dir: &Path, excluded: &[Provider]) -> (Provider, Vec<String>) {
     match target {
         Target::Cpu => (Provider::Cpu, Vec::new()),
         Target::Cuda => (Provider::Cuda, preflight(Provider::Cuda, dir)),
@@ -511,9 +581,9 @@ fn resolve(target: Target, dir: &Path, exclude: &[Provider]) -> (Provider, Vec<S
         Target::Gpu => {
             let mut notes = Vec::new();
             for &candidate in GPU_PRIORITY {
-                if exclude.contains(&candidate) {
+                if excluded.contains(&candidate) {
                     notes.push(format!(
-                        "-nn-target gpu: not {}, excluded by -nn-exclude",
+                        "-nn-target gpu: not {}, excluded by every model's pin",
                         candidate.name()
                     ));
                     continue;
@@ -532,8 +602,9 @@ fn resolve(target: Target, dir: &Path, exclude: &[Provider]) -> (Provider, Vec<S
 /// Which ONNX Runtime answers for a provider. DirectML's is a different binary
 /// carrying the same name as the CPU and CUDA one, so it sits in its own
 /// directory and only that directory is put on the search path. Absent, the
-/// base directory answers and the session falls back to the CPU the way one
-/// asking for a CUDA provider that is not there does.
+/// base directory answers, and a session asking it for DirectML does not
+/// engage and runs on the CPU, the way one asking for a CUDA provider that is
+/// not there does.
 fn runtime_lib_dir(dir: &Path, provider: Provider) -> PathBuf {
     if provider == Provider::DirectMl {
         let dml = dir.join(dlls::DIRECTML_SUBDIR);
@@ -544,27 +615,81 @@ fn runtime_lib_dir(dir: &Path, provider: Provider) -> PathBuf {
     dir.to_path_buf()
 }
 
-/// Names the provider that engaged and every native library that answered,
-/// with where each came from. A GPU session that quietly became a CPU one is
-/// otherwise indistinguishable from a slow GPU.
-fn report_verdict(dir: &Path, config: &Config, asked: Provider) {
+/// What one model's session asks for once the walk has settled the process's
+/// provider.
+#[derive(Debug, PartialEq, Eq)]
+enum Ask {
+    /// That provider; a session that cannot engage it runs on the CPU.
+    Gpu(Provider),
+    /// The CPU, and why when a GPU was asked for.
+    Cpu(Option<String>),
+}
+
+/// The provider the walk took goes to every model that does not exclude it,
+/// and the CPU to every model that does. A provider named outright goes to
+/// every model, exclusions or not.
+fn ask(config: &Config, provider: Provider, name: &str) -> Ask {
+    if config.target == Target::Cpu {
+        return Ask::Cpu(None);
+    }
+    if provider == Provider::Cpu {
+        // Only a `gpu` walk lands here: a provider named outright is taken.
+        let pinned: Vec<&str> = GPU_PRIORITY
+            .iter()
+            .filter(|&&p| config.excludes(name, p))
+            .map(|p| p.name())
+            .collect();
+        let why = if pinned.len() == GPU_PRIORITY.len() {
+            format!("{} excluded by its pin", pinned.join(", "))
+        } else {
+            "no GPU execution provider was available".to_string()
+        };
+        return Ask::Cpu(Some(why));
+    }
+    if config.target == Target::Gpu && config.excludes(name, provider) {
+        return Ask::Cpu(Some(format!("{} excluded by its pin", provider.name())));
+    }
+    Ask::Gpu(provider)
+}
+
+/// Where one model's session runs, and why it is the CPU when a GPU was
+/// asked for.
+struct Placement {
+    name: String,
+    provider: Provider,
+    why_cpu: Option<String>,
+}
+
+/// An error that may span several lines, as one.
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Names the provider each model's session runs on and every native library
+/// that answered, with where each came from. A GPU session that quietly
+/// became a CPU one is otherwise indistinguishable from a slow GPU.
+fn report_verdict(dir: &Path, config: &Config, placements: &[Placement]) {
     // Named once regardless of the walk's outcome, so `-nn-exclude` is never
     // a silent input.
     if !config.exclude.is_empty() {
-        let names: Vec<String> = config
-            .exclude
-            .iter()
-            .map(|p| p.name().to_ascii_lowercase())
-            .collect();
-        eprintln!("[nn] -nn-exclude: {}", names.join(", "));
+        let named: Vec<String> = config.exclude.iter().map(|e| e.to_string()).collect();
+        eprintln!("[nn] -nn-exclude: {}", named.join(", "));
     }
 
-    let engaged = dlls::engaged_provider();
-    let provider = match engaged {
-        Some(provider) => provider.name(),
-        None => "unknown on this platform",
-    };
-    eprintln!("[nn] execution provider: {provider}");
+    for placement in placements {
+        match &placement.why_cpu {
+            Some(why) => eprintln!(
+                "[nn] {}: execution provider {}, {why}",
+                placement.name,
+                placement.provider.name()
+            ),
+            None => eprintln!(
+                "[nn] {}: execution provider {}",
+                placement.name,
+                placement.provider.name()
+            ),
+        }
+    }
 
     if let Some(paths) = dlls::loaded() {
         for path in paths.iter().filter(|p| dlls::interesting(p)) {
@@ -572,42 +697,6 @@ fn report_verdict(dir: &Path, config: &Config, asked: Provider) {
                 "[nn]   {} ({})",
                 path.display(),
                 dlls::origin(path, dir).label()
-            );
-        }
-    }
-
-    if config.target != Target::Cpu && engaged == Some(Provider::Cpu) {
-        let names: Vec<&str> = config.models.iter().map(|m| m.name.as_str()).collect();
-        let why = if asked == Provider::Cpu {
-            "no GPU execution provider was available".to_string()
-        } else {
-            format!("the {} execution provider did not load", asked.name())
-        };
-        eprintln!(
-            "[nn] -nn-target {} was requested but {why}; {} {} on the CPU",
-            config.target.label(),
-            names.join(", "),
-            if names.len() == 1 { "runs" } else { "run" }
-        );
-    }
-
-    // The walk landed on CPU with every GPU candidate excluded by a bound
-    // model's own pin, rather than by a preflight failure: named once at
-    // startup, so a user knows why a run that binds no `-nn-target` of its
-    // own is slow.
-    if config.target == Target::Gpu && asked == Provider::Cpu && !config.exclude.is_empty() {
-        let excluded: Vec<String> = GPU_PRIORITY
-            .iter()
-            .filter(|candidate| config.exclude.contains(candidate))
-            .map(|candidate| candidate.name().to_ascii_lowercase())
-            .collect();
-        if !excluded.is_empty() {
-            let names: Vec<&str> = config.models.iter().map(|m| m.name.as_str()).collect();
-            eprintln!(
-                "[nn] {} {} on cpu: {} excluded by its pin",
-                names.join(", "),
-                if names.len() == 1 { "runs" } else { "run" },
-                excluded.join(", ")
             );
         }
     }
@@ -621,12 +710,17 @@ pub fn configure(config: &Config) -> Result<()> {
     if config.models.is_empty() {
         return Ok(());
     }
+    config.check_exclude()?;
 
     let dir = resolve_runtime_dir(config)?;
 
     // Which provider before which runtime: DirectML's ONNX Runtime is a
     // different binary, so the library to load follows from the answer.
-    let (provider, complaints) = resolve(config.target, &dir, &config.exclude);
+    let excluded = match config.target {
+        Target::Gpu => config.excluded_by_every_model(),
+        _ => Vec::new(),
+    };
+    let (provider, complaints) = resolve(config.target, &dir, &excluded);
     for complaint in complaints {
         eprintln!("[nn] {complaint}");
     }
@@ -640,20 +734,58 @@ pub fn configure(config: &Config) -> Result<()> {
 
     let mut registry = ModelRegistry::default();
     let mut names = Vec::new();
+    let mut placements = Vec::new();
     for spec in &config.models {
-        registry
-            .register(&mut onnx, &spec.name, &spec.path, config.target.execution())
-            .with_context(|| {
-                format!(
-                    "-nn {}={}: loading the model",
-                    spec.name,
-                    spec.path.display()
-                )
-            })?;
+        let loading = || {
+            format!(
+                "-nn {}={}: loading the model",
+                spec.name,
+                spec.path.display()
+            )
+        };
+        let bytes = std::fs::read(&spec.path)
+            .with_context(|| format!("reading the model file {}", spec.path.display()))
+            .with_context(loading)?;
+
+        let (placed, why_cpu) = match ask(config, provider, &spec.name) {
+            Ask::Gpu(asked) => {
+                match registry.register(&mut onnx, &spec.name, &bytes, ExecutionTarget::Gpu) {
+                    Ok(()) => (asked, None),
+                    // The session refused rather than falling back in silence;
+                    // the CPU answers the same, and slower.
+                    Err(e) => {
+                        eprintln!(
+                            "[nn] {}: {} did not engage ({}); runs on the CPU",
+                            spec.name,
+                            asked.name(),
+                            one_line(&e.root_cause().to_string())
+                        );
+                        registry
+                            .register(&mut onnx, &spec.name, &bytes, ExecutionTarget::Cpu)
+                            .with_context(loading)?;
+                        (
+                            Provider::Cpu,
+                            Some(format!("{} did not engage", asked.name())),
+                        )
+                    }
+                }
+            }
+            Ask::Cpu(why) => {
+                registry
+                    .register(&mut onnx, &spec.name, &bytes, ExecutionTarget::Cpu)
+                    .with_context(loading)?;
+                (Provider::Cpu, why)
+            }
+        };
+        placements.push(Placement {
+            name: spec.name.clone(),
+            provider: placed,
+            why_cpu,
+        });
         names.push(spec.name.clone());
     }
 
-    report_verdict(&dir, config, provider);
+    report_verdict(&dir, config, &placements);
 
     graph_registry()
         .set(Models {
@@ -669,23 +801,104 @@ pub fn configure(config: &Config) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// A bare exclusion, for every model.
+    fn every(provider: Provider) -> Exclusion {
+        Exclusion {
+            model: None,
+            provider,
+        }
+    }
+
+    /// One model's exclusion.
+    fn one(name: &str, provider: Provider) -> Exclusion {
+        Exclusion {
+            model: Some(name.to_string()),
+            provider,
+        }
+    }
+
+    /// A `gpu` run binding these names, excluding these.
+    fn config(names: &[&str], exclude: Vec<Exclusion>) -> Config {
+        Config {
+            models: names
+                .iter()
+                .map(|name| ModelSpec {
+                    name: name.to_string(),
+                    path: PathBuf::from(format!("{name}.onnx")),
+                })
+                .collect(),
+            runtime_dir: None,
+            target: Target::Gpu,
+            exclude,
+        }
+    }
+
     #[test]
     fn parse_exclude_accepts_the_three_deniable_providers() {
-        assert_eq!(parse_exclude("cuda").unwrap(), Provider::Cuda);
-        assert_eq!(parse_exclude("directml").unwrap(), Provider::DirectMl);
-        assert_eq!(parse_exclude("coreml").unwrap(), Provider::CoreMl);
+        assert_eq!(parse_exclude("cuda").unwrap(), every(Provider::Cuda));
+        assert_eq!(
+            parse_exclude("directml").unwrap(),
+            every(Provider::DirectMl)
+        );
+        assert_eq!(parse_exclude("coreml").unwrap(), every(Provider::CoreMl));
+    }
+
+    #[test]
+    fn parse_exclude_takes_a_model_name_before_the_provider() {
+        let exclusion = parse_exclude("depth=directml").unwrap();
+        assert_eq!(exclusion, one("depth", Provider::DirectMl));
+        assert_eq!(exclusion.to_string(), "depth=directml");
+        assert_eq!(every(Provider::Cuda).to_string(), "cuda");
     }
 
     #[test]
     fn parse_exclude_refuses_cpu() {
         let err = parse_exclude("cpu").unwrap_err().to_string();
         assert!(err.contains("cannot be excluded"), "{err}");
+        let err = parse_exclude("depth=cpu").unwrap_err().to_string();
+        assert!(
+            err.contains("depth=cpu") && err.contains("cannot be excluded"),
+            "{err}"
+        );
     }
 
     #[test]
     fn parse_exclude_refuses_a_misspelling() {
         let err = parse_exclude("dml").unwrap_err().to_string();
         assert!(err.contains(EXCLUDABLE), "{err}");
+        let err = parse_exclude("depth=dml").unwrap_err().to_string();
+        assert!(err.contains(EXCLUDABLE), "{err}");
+    }
+
+    #[test]
+    fn an_exclusion_naming_a_model_no_nn_binds_is_refused() {
+        let unbound = config(&["depth"], vec![one("dpeth", Provider::Cuda)]);
+        let err = unbound.check_exclude().unwrap_err().to_string();
+        assert!(
+            err.contains("-nn-exclude dpeth=cuda") && err.contains("no -nn binds dpeth"),
+            "{err}"
+        );
+
+        let bound = config(
+            &["depth"],
+            vec![one("depth", Provider::Cuda), every(Provider::DirectMl)],
+        );
+        bound.check_exclude().unwrap();
+    }
+
+    #[test]
+    fn a_bare_exclusion_reaches_every_model_and_a_named_one_only_its_own() {
+        let first = GPU_PRIORITY[0];
+        let both = config(&["a", "b"], vec![every(first)]);
+        assert!(both.excludes("a", first) && both.excludes("b", first));
+        assert_eq!(both.excluded_by_every_model(), vec![first]);
+
+        let only_a = config(&["a", "b"], vec![one("a", first)]);
+        assert!(only_a.excludes("a", first) && !only_a.excludes("b", first));
+        assert!(only_a.excluded_by_every_model().is_empty());
+
+        let each = config(&["a", "b"], vec![one("a", first), one("b", first)]);
+        assert_eq!(each.excluded_by_every_model(), vec![first]);
     }
 
     /// An empty directory, so every real provider's own preflight fails on
@@ -706,13 +919,29 @@ mod tests {
         let dir = empty_dir("exclude-one");
         let (provider, notes) = resolve(Target::Gpu, &dir, &[first]);
         assert_eq!(provider, Provider::Cpu);
-        let named = format!("not {}", format!("{first:?}").to_uppercase());
+        let named = format!("not {}", first.name());
         assert!(
             notes
                 .iter()
-                .any(|n| n.contains(&named) && n.contains("excluded by -nn-exclude")),
+                .any(|n| n.contains(&named) && n.contains("excluded by every model's pin")),
             "{notes:?}"
         );
+    }
+
+    #[test]
+    fn the_gpu_walk_does_not_skip_a_candidate_one_model_still_takes() {
+        // One of two models excludes the first candidate, so the walk still
+        // runs its preflight, and what that says is the note.
+        let first = GPU_PRIORITY[0];
+        let dir = empty_dir("exclude-one-model");
+        let only_a = config(&["a", "b"], vec![one("a", first)]);
+        let (_, notes) = resolve(Target::Gpu, &dir, &only_a.excluded_by_every_model());
+        let named = format!("not {}", first.name());
+        let note = notes
+            .iter()
+            .find(|n| n.contains(&named))
+            .unwrap_or_else(|| panic!("the first candidate is named: {notes:?}"));
+        assert!(!note.contains("pin"), "{note}");
     }
 
     #[test]
@@ -725,10 +954,47 @@ mod tests {
             assert!(
                 notes
                     .iter()
-                    .any(|n| n.contains(candidate.name()) && n.contains("-nn-exclude")),
+                    .any(|n| n.contains(candidate.name()) && n.contains("every model's pin")),
                 "{candidate:?} should be named as excluded: {notes:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_model_excluding_the_walks_provider_asks_for_the_cpu() {
+        let first = GPU_PRIORITY[0];
+        let only_a = config(&["a", "b"], vec![one("a", first)]);
+        assert_eq!(
+            ask(&only_a, first, "a"),
+            Ask::Cpu(Some(format!("{} excluded by its pin", first.name())))
+        );
+        assert_eq!(ask(&only_a, first, "b"), Ask::Gpu(first));
+    }
+
+    #[test]
+    fn a_walk_that_found_no_gpu_says_why_for_each_model() {
+        // `a` excludes every candidate, so its pin is why; `b` excludes
+        // none, so nothing was available.
+        let all: Vec<Exclusion> = GPU_PRIORITY.iter().map(|&p| one("a", p)).collect();
+        let pinned = config(&["a", "b"], all);
+        let Ask::Cpu(Some(why)) = ask(&pinned, Provider::Cpu, "a") else {
+            panic!("a runs on the CPU with a reason");
+        };
+        assert!(why.ends_with("excluded by its pin"), "{why}");
+        assert_eq!(
+            ask(&pinned, Provider::Cpu, "b"),
+            Ask::Cpu(Some("no GPU execution provider was available".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_named_target_asks_for_its_provider_whatever_a_model_excludes() {
+        let mut named = config(&["a"], vec![one("a", Provider::Cuda)]);
+        named.target = Target::Cuda;
+        assert_eq!(ask(&named, Provider::Cuda, "a"), Ask::Gpu(Provider::Cuda));
+
+        named.target = Target::Cpu;
+        assert_eq!(ask(&named, Provider::Cpu, "a"), Ask::Cpu(None));
     }
 
     #[test]
