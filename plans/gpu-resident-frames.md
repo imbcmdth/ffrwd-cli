@@ -823,8 +823,61 @@ without a GPU:
   to 282 at eight, 287 at the default, output byte-identical. So the
   shared device removes the loss past two workers but the GPU is the
   bound and nothing scales past two; the machine was under load from
-  three builds during the runs, and the number to decide the cap on is
-  the quiet run on D3D12 once it has subgroups.
+  three builds during the runs. The quiet run on D3D12 with DXC
+  (`WGPU_DX12_COMPILER=dxc`, 1200 frames, two rounds): 161 fps at one
+  worker, 237 to 247 at two, 154 to 228 at four, 223 to 233 at eight,
+  208 to 257 at the default. The contention the cap existed for is gone,
+  so `GPU_JOBS` is removed: a GPU module takes the run's workers like any
+  other, which also gives blitz's CPU path its cores back.
+
+**Items 3 and 5, Windows (2026-10-12, owner's machine):** `decode` opens
+`d3d12va` around the shared device's own `ID3D12Device` when a reader
+holds its frames on the GPU (`hw` auto or `d3d12va`, `format=yuv420p`),
+and the pool takes the decoder's NV12 resource as a wgpu texture through
+`create_texture_from_hal` with no copy (`runtime/src/gpu/d3d12.rs`,
+`av::Decoder::open_shared`, `receive_any`, `DeviceFrame`). The shared
+queue waits on the decoder's sync object before any read and signals it
+back when the frame is released; a texture array slice, a device without
+`TEXTURE_FORMAT_NV12` or a refused wrap falls back to a device-to-device
+copy into pool textures, which was exercised by forcing it and is
+byte-equal. Modules still read three `r8unorm` planes: a small device
+pass splits the chroma once per frame and caches it
+(`gpu/convert.rs`), so the `ffrwd:gpu` contract did not change. On the
+4090 every stream tried (the 64x48 fixture, an odd 318x238 one, 1080p
+with B-frames) wrapped, and the device decode is byte-identical to the
+software decode. `encode` reads a GPU frame back once: this build's
+`h264_nvenc` takes `cuda` and `d3d11` frames and no `d3d12`, while the
+build does carry `h264_d3d12va`, `hevc_d3d12va` and `av1_d3d12va`
+encoders, which are the next step for an encode from the pool with no
+readback.
+
+What was learned:
+
+- The decoder never runs out of frames when the host holds them: the
+  d3d12va frame pool grows on demand, and array mode only when asked.
+- P010 is not held on the GPU (the wire has no 10-bit format), and
+  `decode=format=rgba` into a GPU reader decodes as before and uploads at
+  the lane, since NV12 to rgba is `convert`'s pass and would not match
+  swscale byte for byte.
+- A wrapped frame can be read by the host on the direct queue while the
+  decoder reads it as a reference on its video queue; both only read,
+  but in different states, which the D3D12 debug layer may flag. Not run
+  under the debug layer yet.
+- Linux needs: the shared Vulkan device opened with the video-decode
+  extensions and a decode queue family through wgpu-hal's raw open, the
+  `AVVulkanDeviceContext` filled from it, `AVVkFrame`'s image, layout and
+  timeline semaphore read, a wait on the semaphore through a raw submit
+  (wgpu-core's submit has no semaphore waits), the `VkImage` wrapped as
+  `G8_B8R8_2PLANE_420`; VAAPI through a DMA-BUF import. The structure is
+  split by `cfg` so a `gpu/vulkan.rs` and an `av::Shared::Vulkan` slot
+  in beside the D3D12 ones.
+- DXC: wgpu-hal links the static DXC only for x86_64 MSVC, so the
+  feature is on for that target alone (a build with it on elsewhere
+  panics at instance creation). The prebuilt library needs ATL to link,
+  which this machine's build tools lack, so the MSVC binary's size
+  change is unmeasured (an estimate is 15 to 20 MB); CI's first Windows
+  wheel run proves it. A gnullvm or aarch64 Windows build keeps D3D12
+  first and needs `dxcompiler.dll` on the path for subgroups.
 
 ### Wave 4: inference on the GPU
 
