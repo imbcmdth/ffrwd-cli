@@ -87,6 +87,9 @@ functions! {
         av_hwdevice_ctx_create: FnHwDeviceCreate,
         av_hwdevice_ctx_alloc: FnHwDeviceAlloc,
         av_hwdevice_ctx_init: FnHwDeviceInit,
+        av_hwframe_ctx_alloc: FnHwFramesAlloc,
+        av_hwframe_ctx_init: FnHwFramesInit,
+        av_hwframe_get_buffer: FnHwFrameGetBuffer,
         av_buffer_unref: FnBufferUnref,
         av_frame_ref: FnFrameRef,
         av_hwframe_transfer_data: FnHwTransfer,
@@ -355,6 +358,41 @@ impl Lib {
             AVERROR_EAGAIN => Status::Again,
             AVERROR_EOF => Status::Eof,
             c => Status::Failed(self.err(c)),
+        }
+    }
+
+    /// A `d3d12va` device reference built around `device`, an
+    /// `ID3D12Device *` whose one reference moves in: the device context
+    /// holds it from then on and releases it when freed, or here when the
+    /// device cannot be made.
+    fn d3d12_device(
+        &self,
+        device_type: c_int,
+        device: *mut c_void,
+    ) -> std::result::Result<*mut AVBufferRef, AvErr> {
+        let f = &self.f;
+        // SAFETY: the reference av_hwdevice_ctx_alloc returns has a
+        // AVHWDeviceContext as its data, whose hwctx is the d3d12va device
+        // context for a device of `device_type`; on failure the reference is
+        // unreffed, which releases the device set into it.
+        unsafe {
+            let mut made = (f.av_hwdevice_ctx_alloc)(device_type);
+            if made.is_null() {
+                release_com(device);
+                return Err(AvErr {
+                    code: 0,
+                    why: "av_hwdevice_ctx_alloc allocated nothing".to_string(),
+                });
+            }
+            let ctx = (*made).data as *mut AVHWDeviceContext;
+            let hw = (*ctx).hwctx as *mut AVD3D12VADeviceContext;
+            (*hw).device = device;
+            let ret = (f.av_hwdevice_ctx_init)(made);
+            if ret < 0 {
+                (f.av_buffer_unref)(&mut made);
+                return Err(self.err(ret));
+            }
+            Ok(made)
         }
     }
 
@@ -958,29 +996,92 @@ impl CodecCtx {
         device_type: c_int,
         device: *mut c_void,
     ) -> std::result::Result<(), AvErr> {
+        let made = self.lib.d3d12_device(device_type, device)?;
+        // SAFETY: a fresh context has no device; the reference moves in.
+        unsafe { (*self.ptr).hw_device_ctx = made };
+        Ok(())
+    }
+
+    /// Gives an encoder that takes D3D12 frames the pool it reads them
+    /// from: `sw_format` textures of `width` x `height` on a `d3d12va`
+    /// device built around `device` (an `ID3D12Device *` whose one
+    /// reference moves in), or on a device of its own when `device` is
+    /// null. The context's pixel format becomes `d3d12`.
+    pub fn attach_d3d12_frames(
+        &mut self,
+        device_type: c_int,
+        device: *mut c_void,
+        sw_format: c_int,
+        width: c_int,
+        height: c_int,
+    ) -> std::result::Result<(), AvErr> {
         let f = &self.lib.f;
-        // SAFETY: the reference av_hwdevice_ctx_alloc returns has a
-        // AVHWDeviceContext as its data, whose hwctx is the d3d12va device
-        // context for a device of `device_type`; on failure the reference is
-        // unreffed, which releases the device set into it.
-        unsafe {
-            let mut made = (f.av_hwdevice_ctx_alloc)(device_type);
-            if made.is_null() {
-                release_com(device);
-                return Err(AvErr {
-                    code: 0,
-                    why: "av_hwdevice_ctx_alloc allocated nothing".to_string(),
-                });
-            }
-            let ctx = (*made).data as *mut AVHWDeviceContext;
-            let hw = (*ctx).hwctx as *mut AVD3D12VADeviceContext;
-            (*hw).device = device;
-            let ret = (f.av_hwdevice_ctx_init)(made);
-            if ret < 0 {
-                (f.av_buffer_unref)(&mut made);
+        let d3d12 = self.lib.pix_fmt("d3d12").ok_or_else(|| AvErr {
+            code: 0,
+            why: "libavutil has no d3d12 pixel format".to_string(),
+        })?;
+        let mut device_ref = if device.is_null() {
+            let mut made: *mut AVBufferRef = ptr::null_mut();
+            // SAFETY: the out-pointer is ours; null name and options ask
+            // for the default device.
+            let ret = unsafe {
+                (f.av_hwdevice_ctx_create)(&mut made, device_type, ptr::null(), ptr::null_mut(), 0)
+            };
+            if ret < 0 || made.is_null() {
                 return Err(self.lib.err(ret));
             }
-            (*self.ptr).hw_device_ctx = made;
+            made
+        } else {
+            self.lib.d3d12_device(device_type, device)?
+        };
+        // SAFETY: the frames reference av_hwframe_ctx_alloc returns has an
+        // AVHWFramesContext as its data, holding its own reference to the
+        // device; ours is given up either way. On failure the frames
+        // reference is unreffed.
+        unsafe {
+            let mut frames = (f.av_hwframe_ctx_alloc)(device_ref);
+            (f.av_buffer_unref)(&mut device_ref);
+            if frames.is_null() {
+                return Err(AvErr {
+                    code: 0,
+                    why: "av_hwframe_ctx_alloc allocated nothing".to_string(),
+                });
+            }
+            let ctx = (*frames).data as *mut AVHWFramesContext;
+            (*ctx).format = d3d12;
+            (*ctx).sw_format = sw_format;
+            (*ctx).width = width;
+            (*ctx).height = height;
+            let ret = (f.av_hwframe_ctx_init)(frames);
+            if ret < 0 {
+                (f.av_buffer_unref)(&mut frames);
+                return Err(self.lib.err(ret));
+            }
+            (*self.ptr).hw_frames_ctx = frames;
+            (*self.ptr).pix_fmt = d3d12;
+            (*self.ptr).sw_pix_fmt = sw_format;
+        }
+        Ok(())
+    }
+
+    /// A picture from the pool `attach_d3d12_frames` gave the context, in
+    /// `frame`, which held nothing.
+    pub fn pool_frame(&self, frame: &mut Frame) -> std::result::Result<(), AvErr> {
+        frame.unref();
+        // SAFETY: a live context and a live frame; the pool is the
+        // context's own frames context, checked for null.
+        unsafe {
+            let pool = (*self.ptr).hw_frames_ctx;
+            if pool.is_null() {
+                return Err(AvErr {
+                    code: 0,
+                    why: "the encoder has no frames context".to_string(),
+                });
+            }
+            let ret = (self.lib.f.av_hwframe_get_buffer)(pool, frame.ptr, 0);
+            if ret < 0 {
+                return Err(self.lib.err(ret));
+            }
         }
         Ok(())
     }
@@ -1324,6 +1425,18 @@ impl Frame {
         Ok(())
     }
 
+    /// Copies `host`, a picture in host memory in the pool's own format,
+    /// into this frame, one of a device's pool.
+    pub fn upload(&mut self, host: &Frame) -> std::result::Result<(), AvErr> {
+        // SAFETY: two live frames; this one's texture was allocated by its
+        // pool for the geometry and format `host` has.
+        let ret = unsafe { (self.lib.f.av_hwframe_transfer_data)(self.ptr, host.ptr, 0) };
+        if ret < 0 {
+            return Err(self.lib.err(ret));
+        }
+        Ok(())
+    }
+
     /// The planes of this frame, when it is in the wire format `pix_fmt`
     /// and its buffers hold every row and byte the wire's layout reads.
     fn wire_planes(&self, pix_fmt: &str) -> Option<Vec<(picture::Plane, *mut u8, isize)>> {
@@ -1410,6 +1523,20 @@ pub(super) unsafe fn release_com(object: *mut c_void) {
     type Release = unsafe extern "system" fn(*mut c_void) -> u32;
     let table = *(object as *const *const Release);
     (*table.add(2))(object);
+}
+
+/// Takes one more reference to a COM object: `IUnknown::AddRef`, the
+/// second entry of every COM interface's table.
+///
+/// # Safety
+/// `object` is a live COM interface pointer.
+pub(super) unsafe fn add_ref_com(object: *mut c_void) {
+    if object.is_null() {
+        return;
+    }
+    type AddRef = unsafe extern "system" fn(*mut c_void) -> u32;
+    let table = *(object as *const *const AddRef);
+    (*table.add(1))(object);
 }
 
 /// An `AVPacket`, from `av_packet_alloc` to `av_packet_free`.

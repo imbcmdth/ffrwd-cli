@@ -17,6 +17,11 @@
 //! packed as, and the planes a module is handed ([`GpuFrame::wire_planes`]),
 //! repacked on the device once, the first time anything asks.
 //!
+//! An encoder on the device reads NV12, and [`GpuFrame::nv12_planes`] hands
+//! a frame over so: a decoder's picture as it is held, an rgba frame
+//! converted on the device with the stream's matrix and range, made once
+//! and kept like the wire's planes.
+//!
 //! Every texture is on the one device [`super::shared_device`] opens, which
 //! is the device every module's `wasi:webgpu` answers, so a module reads a
 //! frame's planes as textures of its own device and copies nothing.
@@ -37,6 +42,8 @@ use wgpu_types::{Extent3d, TextureAspect, TextureFormat};
 
 use super::{shared, shared_device};
 use crate::av::DeviceFrame;
+
+pub use super::convert::{Matrix, Yuv};
 
 /// One plane of a frame: a texture, or one aspect of a multi-planar one
 /// (the luma or chroma of an NV12 texture), read as `format`.
@@ -81,6 +88,10 @@ pub struct GpuFrame {
     /// The planes as the wire lays them out, where they are not the held
     /// ones: made the first time something asks, and owned by the frame.
     wire: Mutex<Option<Vec<Plane>>>,
+    /// The frame as NV12 for an encoder on the device, where it is not
+    /// held so, one entry per [`Yuv`] an rgba frame was converted with:
+    /// made the first time something asks, and owned by the frame.
+    nv12: Mutex<Vec<(Yuv, Vec<Plane>)>>,
     /// The frame's bytes as the wire lays them out: what it was uploaded
     /// from, or what reading it back gave.
     bytes: OnceLock<Arc<Vec<u8>>>,
@@ -219,6 +230,7 @@ impl GpuFrame {
             planes,
             owned,
             wire: Mutex::new(None),
+            nv12: Mutex::new(Vec::new()),
             bytes: OnceLock::new(),
             #[cfg(windows)]
             wrapped: Mutex::new(None),
@@ -259,10 +271,51 @@ impl GpuFrame {
             }],
             owned: vec![texture],
             wire: Mutex::new(None),
+            nv12: Mutex::new(Vec::new()),
             bytes: OnceLock::new(),
             #[cfg(windows)]
             wrapped: Mutex::new(None),
         }))
+    }
+
+    /// The backend of the device the frame is on.
+    pub fn backend(&self) -> wgpu_types::Backend {
+        self.device.info.backend
+    }
+
+    /// Whether [`nv12_planes`](GpuFrame::nv12_planes) can make NV12 of
+    /// this frame: a decoder's picture, an rgba frame, or a yuv420p one.
+    pub fn has_nv12(&self) -> bool {
+        matches!(self.pix_fmt.as_str(), "nv12" | "rgba" | "yuv420p")
+    }
+
+    /// The frame as NV12 on the device: its luma, and its chroma
+    /// interleaved at half size. A decoder's picture is held so already;
+    /// an rgba frame is converted with `yuv`'s matrix and range, and a
+    /// yuv420p one has its chroma interleaved, once, the first time
+    /// anything asks, and the result is kept with the frame. `yuv` is read
+    /// for an rgba frame only.
+    pub fn nv12_planes(&self, yuv: Yuv) -> Result<Vec<Plane>> {
+        let key = match self.pix_fmt.as_str() {
+            "nv12" => return Ok(self.planes.clone()),
+            "rgba" => yuv,
+            "yuv420p" => Yuv::DEFAULT,
+            other => bail!("a {other} frame is not made NV12 on the device"),
+        };
+        let mut made = self.nv12.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, planes)) = made.iter().find(|(k, _)| *k == key) {
+            return Ok(planes.clone());
+        }
+        let planes = if self.pix_fmt == "rgba" {
+            let [rgba] = self.planes.as_slice() else {
+                bail!("an rgba frame has one plane");
+            };
+            super::convert::nv12_from_rgba(&self.global, &self.device, rgba, yuv)?
+        } else {
+            super::convert::nv12_from_yuv420p(&self.global, &self.device, &self.planes)?
+        };
+        made.push((key, planes.clone()));
+        Ok(planes)
     }
 
     pub fn width(&self) -> u32 {
@@ -354,42 +407,42 @@ impl GpuFrame {
     }
 
     fn download(&self) -> Result<Arc<Vec<u8>>> {
-        let global = &self.global;
-        let device = &self.device;
         let mut out = Vec::with_capacity(self.wire_len());
         for plane in &self.wire_planes()? {
-            let bytes_per_row = plane.width * plane.bytes_per_pixel;
-            let padded = bytes_per_row.div_ceil(wgpu_types::COPY_BYTES_PER_ROW_ALIGNMENT)
-                * wgpu_types::COPY_BYTES_PER_ROW_ALIGNMENT;
-            let size = padded as u64 * plane.height as u64;
-            let (buffer, err) = global.device_create_buffer(
-                device.device,
-                &wgpu_types::BufferDescriptor {
-                    label: Some(Cow::Borrowed("ffrwd frame readback")),
-                    size,
-                    usage: wgpu_types::BufferUsages::COPY_DST | wgpu_types::BufferUsages::MAP_READ,
-                    mapped_at_creation: false,
-                },
-                None,
-            );
-            if let Some(e) = err {
-                global.buffer_drop(buffer);
-                bail!("a {size}-byte readback buffer: {e}");
-            }
-            let result = copy_out(
-                global,
-                device,
-                plane,
-                buffer,
-                padded,
-                bytes_per_row,
-                &mut out,
-            );
-            global.buffer_drop(buffer);
-            result?;
+            read_plane(&self.global, &self.device, plane, &mut out)?;
         }
         Ok(Arc::new(out))
     }
+}
+
+/// Reads one plane back, appending its rows, unpadded, to `out`.
+fn read_plane(
+    global: &Global,
+    device: &SharedDevice,
+    plane: &Plane,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    let bytes_per_row = plane.width * plane.bytes_per_pixel;
+    let padded = bytes_per_row.div_ceil(wgpu_types::COPY_BYTES_PER_ROW_ALIGNMENT)
+        * wgpu_types::COPY_BYTES_PER_ROW_ALIGNMENT;
+    let size = padded as u64 * plane.height as u64;
+    let (buffer, err) = global.device_create_buffer(
+        device.device,
+        &wgpu_types::BufferDescriptor {
+            label: Some(Cow::Borrowed("ffrwd frame readback")),
+            size,
+            usage: wgpu_types::BufferUsages::COPY_DST | wgpu_types::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        },
+        None,
+    );
+    if let Some(e) = err {
+        global.buffer_drop(buffer);
+        bail!("a {size}-byte readback buffer: {e}");
+    }
+    let result = copy_out(global, device, plane, buffer, padded, bytes_per_row, out);
+    global.buffer_drop(buffer);
+    result
 }
 
 pub(super) fn create_plane(
@@ -524,6 +577,12 @@ impl Drop for GpuFrame {
                 self.global.texture_drop(plane.texture);
             }
         }
+        let nv12 = std::mem::take(&mut *self.nv12.lock().unwrap_or_else(|e| e.into_inner()));
+        for (_, planes) in nv12 {
+            for plane in planes {
+                self.global.texture_drop(plane.texture);
+            }
+        }
         #[cfg(windows)]
         if let Some(wrapped) = self
             .wrapped
@@ -600,6 +659,7 @@ impl DecodedPictures {
             planes: taken.planes,
             owned: taken.owned,
             wire: Mutex::new(None),
+            nv12: Mutex::new(Vec::new()),
             bytes: OnceLock::new(),
             wrapped: Mutex::new(taken.wrapped),
         }))
@@ -643,5 +703,155 @@ mod tests {
         assert!(!holds("gray"));
         assert!(!holds("nv12"), "nv12 is held, never asked for");
         assert_eq!(wire_of("nv12"), Some("yuv420p"));
+    }
+
+    /// ffmpeg's own conversion of `rgba`, a `width` x `height` picture, to
+    /// NV12 with `yuv`'s matrix and range; None where ffmpeg is not on the
+    /// path.
+    fn ffmpeg_nv12(rgba: &[u8], width: u32, height: u32, yuv: Yuv) -> Option<Vec<u8>> {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let mut child = Command::new("ffmpeg")
+            .args(["-v", "error", "-f", "rawvideo", "-pix_fmt", "rgba", "-s"])
+            .arg(format!("{width}x{height}"))
+            .args([
+                "-i",
+                "-",
+                "-vf",
+                &format!(
+                    "scale=out_color_matrix={}:out_range={},format=nv12",
+                    match yuv.matrix {
+                        Matrix::Bt709 => "bt709",
+                        Matrix::Bt601 => "bt601",
+                    },
+                    if yuv.full_range { "pc" } else { "tv" }
+                ),
+                "-f",
+                "rawvideo",
+                "-",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .ok()?;
+        let mut stdin = child.stdin.take()?;
+        let input = rgba.to_vec();
+        let writer = std::thread::spawn(move || stdin.write_all(&input));
+        let output = child.wait_with_output().ok()?;
+        let _ = writer.join();
+        assert!(
+            output.status.success(),
+            "ffmpeg: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Some(output.stdout)
+    }
+
+    /// A picture with smooth ramps, hard edges, a red block and a
+    /// transparent (premultiplied, so all zero) corner.
+    fn test_picture(width: u32, height: u32) -> Vec<u8> {
+        let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                let pixel = if x < 8 && y < 8 {
+                    [0, 0, 0, 0]
+                } else if (20..36).contains(&x) && (10..26).contains(&y) {
+                    [255, 0, 0, 255]
+                } else {
+                    [
+                        (x * 255 / (width - 1)) as u8,
+                        (y * 255 / (height - 1)) as u8,
+                        (((x / 8 + y / 8) % 2) * 200 + 20) as u8,
+                        255,
+                    ]
+                };
+                rgba.extend_from_slice(&pixel);
+            }
+        }
+        rgba
+    }
+
+    /// The largest and the mean difference between two planes.
+    fn difference(a: &[u8], b: &[u8]) -> (u8, f64) {
+        assert_eq!(a.len(), b.len());
+        let max = a
+            .iter()
+            .zip(b)
+            .map(|(x, y)| x.abs_diff(*y))
+            .max()
+            .unwrap_or(0);
+        let sum: u64 = a
+            .iter()
+            .zip(b)
+            .map(|(x, y)| u64::from(x.abs_diff(*y)))
+            .sum();
+        (max, sum as f64 / a.len() as f64)
+    }
+
+    #[test]
+    fn a_yuv420p_frame_is_made_nv12_texel_for_texel() {
+        let Some(device) = shared_device() else {
+            eprintln!("SKIPPED: this machine has no GPU adapter.");
+            return;
+        };
+        let (width, height) = (6u32, 4u32);
+        let (luma, chroma) = ((width * height) as usize, (3 * 2) as usize);
+        let bytes: Vec<u8> = (0..luma + 2 * chroma).map(|i| (i * 7) as u8).collect();
+        let frame =
+            GpuFrame::upload("yuv420p", width, height, Arc::new(bytes.clone())).expect("upload");
+        let mut ours = Vec::new();
+        for plane in &frame.nv12_planes(Yuv::DEFAULT).expect("interleave") {
+            read_plane(shared(), device, plane, &mut ours).expect("read back");
+        }
+        let mut wanted = bytes[..luma].to_vec();
+        for i in 0..chroma {
+            wanted.push(bytes[luma + i]);
+            wanted.push(bytes[luma + chroma + i]);
+        }
+        assert_eq!(ours, wanted);
+    }
+
+    #[test]
+    fn rgba_is_made_nv12_on_the_device_as_ffmpeg_makes_it() {
+        let (width, height) = (64u32, 48u32);
+        let rgba = test_picture(width, height);
+        if ffmpeg_nv12(&rgba, width, height, Yuv::DEFAULT).is_none() {
+            eprintln!("SKIPPED: put ffmpeg on PATH to compare the conversion with its own.");
+            return;
+        }
+        let Some(device) = shared_device() else {
+            eprintln!("SKIPPED: this machine has no GPU adapter.");
+            return;
+        };
+        let frame =
+            GpuFrame::upload("rgba", width, height, Arc::new(rgba.clone())).expect("upload");
+        let full = |matrix| Yuv {
+            matrix,
+            full_range: true,
+        };
+        for yuv in [Yuv::DEFAULT, full(Matrix::Bt709), full(Matrix::Bt601)] {
+            let theirs = ffmpeg_nv12(&rgba, width, height, yuv).expect("ffmpeg ran once");
+            let planes = frame.nv12_planes(yuv).expect("convert");
+            assert_eq!(planes.len(), 2);
+            let mut ours = Vec::new();
+            for plane in &planes {
+                read_plane(shared(), device, plane, &mut ours).expect("read back");
+            }
+            let luma = (width * height) as usize;
+            assert_eq!(ours.len(), theirs.len());
+            let (y_max, y_mean) = difference(&ours[..luma], &theirs[..luma]);
+            let (c_max, c_mean) = difference(&ours[luma..], &theirs[luma..]);
+            eprintln!(
+                "rgba to NV12 ({yuv:?}) against ffmpeg: luma at most {y_max} apart \
+                 (mean {y_mean:.3}), chroma at most {c_max} apart (mean {c_mean:.3})"
+            );
+            assert!(y_max <= 2, "{yuv:?}: luma differs by up to {y_max}");
+            assert!(c_max <= 2, "{yuv:?}: chroma differs by up to {c_max}");
+            // The transparent corner is black.
+            let black = if yuv.full_range { 0 } else { 16 };
+            assert_eq!(ours[0], black, "{yuv:?}");
+            assert_eq!(&ours[luma..luma + 2], &[128, 128], "{yuv:?}");
+        }
     }
 }

@@ -441,3 +441,471 @@ fn encode_reads_a_picture_decoded_on_the_device_back_once_as_ffmpeg_decodes_it()
         decoded.len()
     );
 }
+
+// An encoder on the process's own device: `h264_d3d12va` reads pictures of
+// a pool on the device the decoder and the modules use, so a frame there
+// reaches it by one copy on the device and no byte crosses to the host.
+
+/// ffmpeg on PATH; None, having said the test is skipped, otherwise.
+fn ffmpeg(test: &str) -> Option<()> {
+    let found = Command::new("ffmpeg")
+        .arg("-version")
+        .stdin(Stdio::null())
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !found {
+        eprintln!("SKIPPED: {test}. Put ffmpeg and ffprobe on PATH to run it.");
+        return None;
+    }
+    Some(())
+}
+
+/// Runs ffmpeg with `args`, failing the test with its stderr if it fails.
+fn ffmpeg_ok(args: &[&str], what: &str) -> Vec<u8> {
+    let output = Command::new("ffmpeg")
+        .args(["-v", "error", "-y"])
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn ffmpeg");
+    assert!(
+        output.status.success(),
+        "{what}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stdout
+}
+
+fn path_str(path: &Path) -> &str {
+    path.to_str().expect("a UTF-8 path")
+}
+
+/// `chain` over the NUT file `input`, its `[out0]` written to `out`, with
+/// `-profile`; gpu_box bound when `module` is given.
+fn run_chain(dir: &Path, input: &Path, chain: &str, out: &Path, module: Option<&str>) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ffrwd-wasm"));
+    command.env("FFRWD_AV_RUNTIME", dir).arg("-profile");
+    if let Some(module) = module {
+        command.args(["-gpu", module]);
+    }
+    command.args(["-f", "nut", "-i"]).arg(input);
+    if let Some(module) = module {
+        command.arg("-m").arg(format!("gpu_box={module}"));
+    }
+    command
+        .args(["-filter_complex", chain, "-map", "[out0]", "-f", "nut"])
+        .arg(out)
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn ffrwd-wasm")
+}
+
+/// The profile row a `-profile` run wrote on stderr.
+fn profile_row(stderr: &str) -> serde_json::Value {
+    stderr
+        .lines()
+        .filter_map(|line| line.strip_prefix("ffrwd:row "))
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("a row is JSON"))
+        .find(|row| row["kind"] == "profile")
+        .unwrap_or_else(|| panic!("no profile row on stderr:\n{stderr}"))
+}
+
+/// What ffmpeg decodes `path` to, as `pix_fmt` pictures one after another.
+fn decoded_by_ffmpeg(path: &Path, pix_fmt: &str) -> Vec<u8> {
+    ffmpeg_ok(
+        &[
+            "-i",
+            path_str(path),
+            "-fps_mode",
+            "passthrough",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            pix_fmt,
+            "-",
+        ],
+        "decoding with ffmpeg",
+    )
+}
+
+/// The mean of each of a yuv420p picture's three planes.
+fn plane_means(picture: &[u8], width: usize, height: usize) -> [f64; 3] {
+    let luma = width * height;
+    let chroma = luma / 4;
+    let mean = |plane: &[u8]| plane.iter().map(|&b| f64::from(b)).sum::<f64>() / plane.len() as f64;
+    [
+        mean(&picture[..luma]),
+        mean(&picture[luma..luma + chroma]),
+        mean(&picture[luma + chroma..luma + 2 * chroma]),
+    ]
+}
+
+const SIZE: (usize, usize) = (320, 240);
+const FROM_THE_DEVICE: &str = "[av] encode h264_d3d12va: 320x240 nv12, from the device";
+
+#[test]
+fn h264_d3d12va_takes_the_decoders_pictures_on_the_device_with_nothing_read_back() {
+    let test = "h264_d3d12va_takes_the_decoders_pictures_on_the_device_with_nothing_read_back";
+    let Some(dir) = d3d12va_libav(test) else {
+        return;
+    };
+    let Some(()) = ffmpeg(test) else {
+        return;
+    };
+    let source = scratch("d3d12va_source.nut");
+    let made = Command::new("ffmpeg")
+        .args([
+            "-v",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=s=320x240:r=25",
+        ])
+        .args([
+            "-frames:v",
+            "60",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-f",
+            "nut",
+        ])
+        .arg(&source)
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn ffmpeg");
+    if !made.status.success() {
+        eprintln!(
+            "SKIPPED: {test}. The ffmpeg on PATH cannot make an h264 stream with libx264: {}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+        return;
+    }
+    let out = scratch("d3d12va_out.nut");
+    let chain = "[0:v]decode=format=yuv420p:hw=d3d12va[d];[d]encode=codec=h264_d3d12va:b=2M[out0]";
+    let output = run_chain(&dir, &source, chain, &out, None);
+    if no_gpu(&output) {
+        eprintln!("skipped: this machine has no GPU adapter");
+        return;
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success(),
+        "exited {:?}:\n{stderr}",
+        output.status.code()
+    );
+    assert!(stderr.contains(FROM_THE_DEVICE), "{stderr}");
+    assert!(
+        stderr.contains("[gpu] encode h264_d3d12va: from the device, each frame "),
+        "the copy is said:\n{stderr}"
+    );
+    assert!(stderr.contains(DECODED_LINE), "{stderr}");
+    let row = profile_row(&stderr);
+    for stage in ["upload", "download"] {
+        assert_eq!(row[stage]["bytes"], 0, "nothing crosses to the host: {row}");
+    }
+
+    let wire = std::fs::read(&out).expect("read the output");
+    let mut demuxer = Demuxer::open(wire.as_slice()).expect("read NUT headers");
+    let header = demuxer.stream().clone();
+    assert_eq!(header.fourcc, b"H264", "carried as h264");
+    assert!(
+        !header.extradata.is_empty(),
+        "the encoder's header rides in the stream's"
+    );
+    let mut packets = 0;
+    let mut buf = Vec::new();
+    while demuxer
+        .read_packet(&mut buf)
+        .expect("read a packet")
+        .is_some()
+    {
+        packets += 1;
+    }
+    assert_eq!(packets, 60, "one packet a picture");
+
+    let mp4 = scratch("d3d12va_out.mp4");
+    ffmpeg_ok(
+        &[
+            "-f",
+            "nut",
+            "-i",
+            path_str(&out),
+            "-c",
+            "copy",
+            path_str(&mp4),
+        ],
+        "ffmpeg -c copy",
+    );
+    let probed = Command::new("ffprobe")
+        .args(["-v", "error", "-count_frames", "-select_streams", "v:0"])
+        .args([
+            "-show_entries",
+            "stream=codec_name,width,height,nb_read_frames",
+        ])
+        .args(["-of", "csv=p=0"])
+        .arg(&mp4)
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn ffprobe");
+    assert_eq!(
+        String::from_utf8_lossy(&probed.stdout).trim(),
+        "h264,320,240,60"
+    );
+
+    let ours = decoded_by_ffmpeg(&mp4, "yuv420p");
+    let theirs = decoded_by_ffmpeg(&source, "yuv420p");
+    for path in [&source, &out, &mp4] {
+        let _ = std::fs::remove_file(path);
+    }
+    let len = SIZE.0 * SIZE.1 * 3 / 2;
+    assert_eq!(ours.len(), theirs.len(), "as many pictures");
+    let mut worst = 0f64;
+    for (a, b) in ours.chunks(len).zip(theirs.chunks(len)) {
+        let (a, b) = (
+            plane_means(a, SIZE.0, SIZE.1),
+            plane_means(b, SIZE.0, SIZE.1),
+        );
+        for plane in 0..3 {
+            worst = worst.max((a[plane] - b[plane]).abs());
+        }
+    }
+    eprintln!("each picture's mean colour is within {worst:.3} of the source's");
+    assert!(worst < 2.0, "a picture's mean colour is {worst} levels off");
+}
+
+#[test]
+fn h264_d3d12va_takes_a_modules_rgba_as_nv12_made_on_the_device() {
+    let test = "h264_d3d12va_takes_a_modules_rgba_as_nv12_made_on_the_device";
+    let Some(dir) = d3d12va_libav(test) else {
+        return;
+    };
+    let Some(()) = ffmpeg(test) else {
+        return;
+    };
+    let module = module();
+    let source = scratch("d3d12va_rgba.nut");
+    ffmpeg_ok(
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=s=320x240:r=25",
+            "-frames:v",
+            "30",
+            "-c:v",
+            "rawvideo",
+            "-pix_fmt",
+            "rgba",
+            "-f",
+            "nut",
+            path_str(&source),
+        ],
+        "making an rgba stream",
+    );
+    let encoded = scratch("d3d12va_boxed.nut");
+    let chain = "[v=0:v]gpu_box=memory=gpu:out=gpu:size=40[out=b];\
+                 [b]encode=codec=h264_d3d12va:b=8M[out0]";
+    let output = run_chain(&dir, &source, chain, &encoded, Some(&module));
+    if no_gpu(&output) {
+        eprintln!("skipped: this machine has no GPU adapter");
+        return;
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success(),
+        "exited {:?}:\n{stderr}",
+        output.status.code()
+    );
+    assert!(stderr.contains(FROM_THE_DEVICE), "{stderr}");
+    assert!(
+        stderr.contains("made NV12 from rgba first"),
+        "the conversion is said:\n{stderr}"
+    );
+    let row = profile_row(&stderr);
+    assert_eq!(row["download"]["bytes"], 0, "nothing is read back: {row}");
+
+    let wire = std::fs::read(&encoded).expect("read the output");
+    let header = Demuxer::open(wire.as_slice())
+        .expect("read NUT headers")
+        .stream()
+        .clone();
+    match header.media {
+        ffrwd_wasm::nut::Media::Video {
+            colorspace_type, ..
+        } => assert_eq!(colorspace_type, 2, "the header says BT.709, limited range"),
+        other => panic!("not video: {other:?}"),
+    }
+
+    // The host path's pictures, made NV12 by ffmpeg, are what the device's
+    // conversion matches before the encode.
+    let host = scratch("d3d12va_host.nut");
+    let output = run_chain(
+        &dir,
+        &source,
+        "[v=0:v]gpu_box=memory=host:size=40[out=out0]",
+        &host,
+        Some(&module),
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let wanted = ffmpeg_ok(
+        &[
+            "-i",
+            path_str(&host),
+            "-vf",
+            "scale=out_color_matrix=bt709:out_range=tv,format=nv12",
+            "-f",
+            "rawvideo",
+            "-",
+        ],
+        "ffmpeg's rgba to NV12",
+    );
+    let got = decoded_by_ffmpeg(&encoded, "nv12");
+    for path in [&source, &encoded, &host] {
+        let _ = std::fs::remove_file(path);
+    }
+    let (width, height) = SIZE;
+    let len = width * height * 3 / 2;
+    assert_eq!(got.len(), wanted.len(), "as many pictures");
+    assert_eq!(got.len(), 30 * len);
+    let luma = width * height;
+    let mean = |x: &[u8], y: &[u8]| {
+        x.iter()
+            .zip(y)
+            .map(|(p, q)| f64::from(p.abs_diff(*q)))
+            .sum::<f64>()
+            / x.len() as f64
+    };
+    // The box, inside its edges: red's luma in BT.709 limited range is 63.
+    let box_luma = |p: &[u8]| {
+        let mut sum = 0u32;
+        for y in 5..35 {
+            sum += p[y * width + 5..y * width + 35]
+                .iter()
+                .map(|&b| u32::from(b))
+                .sum::<u32>();
+        }
+        f64::from(sum) / 900.0
+    };
+    let mut worst = [0f64; 2];
+    for (index, (a, b)) in got.chunks(len).zip(wanted.chunks(len)).enumerate() {
+        worst[0] = worst[0].max(mean(&a[..luma], &b[..luma]));
+        worst[1] = worst[1].max(mean(&a[luma..], &b[luma..]));
+        assert!(
+            (box_luma(a) - box_luma(b)).abs() < 2.0 && (box_luma(a) - 63.0).abs() < 2.0,
+            "picture {index}: the box's luma is {} here and {} in ffmpeg's",
+            box_luma(a),
+            box_luma(b)
+        );
+    }
+    eprintln!(
+        "against ffmpeg's conversion of the host path: luma {:.3}, chroma {:.3} levels apart \
+         on average in the worst picture",
+        worst[0], worst[1]
+    );
+    assert!(worst[0] < 2.0 && worst[1] < 2.0, "{worst:?}");
+}
+
+#[test]
+fn h264_d3d12va_uploads_a_frame_in_host_memory_and_says_so() {
+    let test = "h264_d3d12va_uploads_a_frame_in_host_memory_and_says_so";
+    let Some(dir) = d3d12va_libav(test) else {
+        return;
+    };
+    let Some(()) = ffmpeg(test) else {
+        return;
+    };
+    let source = scratch("d3d12va_host_rgba.nut");
+    ffmpeg_ok(
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=s=320x240:r=25",
+            "-frames:v",
+            "10",
+            "-c:v",
+            "rawvideo",
+            "-pix_fmt",
+            "rgba",
+            "-f",
+            "nut",
+            path_str(&source),
+        ],
+        "making an rgba stream",
+    );
+    let out = scratch("d3d12va_uploaded.nut");
+    let output = run_chain(
+        &dir,
+        &source,
+        "[0:v]encode=codec=h264_d3d12va:b=8M[out0]",
+        &out,
+        None,
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    if !output.status.success() && stderr.contains("av_hwframe_ctx_init") {
+        eprintln!("skipped: this machine has no D3D12 video encoder: {stderr}");
+        return;
+    }
+    assert!(
+        output.status.success(),
+        "exited {:?}:\n{stderr}",
+        output.status.code()
+    );
+    assert!(
+        stderr.contains("[av] encode h264_d3d12va: 320x240 nv12, uploaded from host memory"),
+        "{stderr}"
+    );
+    let row = profile_row(&stderr);
+    assert_eq!(
+        row["upload"]["bytes"],
+        10 * 320 * 240 * 3 / 2,
+        "each picture is uploaded once, as NV12: {row}"
+    );
+    // Converted by libswscale before the upload, in the colour the header
+    // declares: BT.709, limited range.
+    let header = Demuxer::open(std::fs::read(&out).expect("read the output").as_slice())
+        .expect("read NUT headers")
+        .stream()
+        .clone();
+    assert!(
+        !header.extradata.is_empty(),
+        "the header has the parameter sets"
+    );
+    match header.media {
+        ffrwd_wasm::nut::Media::Video {
+            colorspace_type, ..
+        } => assert_eq!(colorspace_type, 2, "BT.709, limited range"),
+        other => panic!("not video: {other:?}"),
+    }
+    let got = decoded_by_ffmpeg(&out, "nv12");
+    let wanted = ffmpeg_ok(
+        &[
+            "-i",
+            path_str(&source),
+            "-vf",
+            "scale=out_color_matrix=bt709:out_range=tv,format=nv12",
+            "-f",
+            "rawvideo",
+            "-",
+        ],
+        "ffmpeg's rgba to NV12",
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&source);
+    assert_eq!(got.len(), wanted.len(), "as many pictures");
+    let apart = got
+        .iter()
+        .zip(&wanted)
+        .map(|(a, b)| f64::from(a.abs_diff(*b)))
+        .sum::<f64>()
+        / got.len() as f64;
+    assert!(apart < 1.0, "{apart} levels apart on average");
+}

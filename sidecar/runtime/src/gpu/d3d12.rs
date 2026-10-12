@@ -15,9 +15,16 @@
 //! object first, so nothing reads a picture before it is written, and
 //! signals it again once the host is done, so the decoder does not write
 //! over a picture still being read.
+//!
+//! An encoder opened on the same device reads pictures of its own pool,
+//! and a frame reaches one by a copy on the device ([`EncoderFeed`]): the
+//! frame as NV12 (a decoder's picture as it is, a module's rgba converted
+//! first) copied into the pool's texture, after which the queue signals
+//! the picture's sync object, which the encoder waits on before reading.
 
 use std::collections::VecDeque;
 use std::mem::{transmute_copy, ManuallyDrop};
+use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
 use wasi_webgpu_wasmtime::reexports::{wgpu_core, wgpu_types};
@@ -32,7 +39,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Direct3D12::ID3D12Fence as SyncObject;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
-use super::frames::Plane;
+use super::frames::{GpuFrame, Plane, Yuv};
 use super::{shared, shared_device};
 use crate::av::{self, DeviceFrame};
 
@@ -47,9 +54,9 @@ pub fn device() -> Option<ID3D12Device> {
     Some(hal.raw_device().clone())
 }
 
-/// The process's device as a decoder is opened on it; None unless it
-/// opened on D3D12.
-pub fn decoder_device() -> Option<av::Shared> {
+/// The process's device as a decoder or an encoder is opened on it; None
+/// unless it opened on D3D12.
+pub fn av_device() -> Option<av::Shared> {
     let device = device()?;
     // SAFETY: `into_raw` hands over the reference `device` held.
     Some(av::Shared::D3d12(unsafe {
@@ -407,14 +414,16 @@ impl Wrapped {
 }
 
 /// A command list and its allocator, free once the copier's sync object
-/// reaches `done_at`.
+/// reaches `done_at`, and the frames its copies read, kept until then.
 struct Recorder {
     allocator: ID3D12CommandAllocator,
     list: ID3D12GraphicsCommandList,
     done_at: u64,
+    held: Vec<Arc<GpuFrame>>,
 }
 
-/// Records and submits the copies of pictures wgpu cannot wrap.
+/// Records and submits copies on the device: of a decoder's pictures wgpu
+/// cannot wrap, and of frames into an encoder's pictures.
 struct Copier {
     device: ID3D12Device,
     sync: SyncObject,
@@ -478,6 +487,9 @@ impl Copier {
         // SAFETY: COM calls on live objects.
         unsafe {
             let done = self.sync.GetCompletedValue();
+            for recorder in self.busy.iter_mut().filter(|r| r.done_at <= done) {
+                recorder.held.clear();
+            }
             if let Some(recorder) = self.busy.pop_front_if(|r| r.done_at <= done) {
                 recorder.allocator.Reset()?;
                 recorder.list.Reset(&recorder.allocator, None)?;
@@ -496,8 +508,27 @@ impl Copier {
                 allocator,
                 list,
                 done_at: 0,
+                held: Vec::new(),
             })
         }
+    }
+
+    /// Closes `recorder`'s list, runs it on `queue`, and keeps it busy
+    /// until it has run.
+    fn submit(&mut self, queue: &ID3D12CommandQueue, mut recorder: Recorder) -> Result<()> {
+        // SAFETY: COM calls on live objects; every resource the list names
+        // outlives its run (the caller keeps them in `recorder.held` or
+        // owns them past it).
+        unsafe {
+            recorder.list.Close()?;
+            let runnable: ID3D12CommandList = recorder.list.cast()?;
+            queue.ExecuteCommandLists(&[Some(runnable)]);
+            self.submitted += 1;
+            queue.Signal(&self.sync, self.submitted)?;
+        }
+        recorder.done_at = self.submitted;
+        self.busy.push_back(recorder);
+        Ok(())
     }
 
     /// A new texture in the common state, for one plane.
@@ -555,7 +586,7 @@ impl Copier {
         let mips = u32::from(desc.MipLevels.max(1));
         let layers = u32::from(desc.DepthOrArraySize.max(1));
         let source_plane = |plane: u32| slice * mips + plane * mips * layers;
-        let mut recorder = self.recorder()?;
+        let recorder = self.recorder()?;
         let list = &recorder.list;
         let common = D3D12_RESOURCE_STATE_COMMON;
         let copy_src = D3D12_RESOURCE_STATE_COPY_SOURCE;
@@ -601,14 +632,255 @@ impl Copier {
                 Some(&region(cw, ch)),
             );
             list.ResourceBarrier(&after);
-            list.Close()?;
-            let runnable: ID3D12CommandList = list.cast()?;
-            queue.ExecuteCommandLists(&[Some(runnable)]);
-            self.submitted += 1;
-            queue.Signal(&self.sync, self.submitted)?;
         }
-        recorder.done_at = self.submitted;
-        self.busy.push_back(recorder);
+        self.submit(queue, recorder)?;
         Ok((y, uv))
     }
+}
+
+impl Drop for Copier {
+    /// Waits for the copies still running, so nothing they read or write
+    /// is released under them.
+    fn drop(&mut self) {
+        // SAFETY: COM calls on live objects; a null event blocks until the
+        // value is reached.
+        unsafe {
+            if self.sync.GetCompletedValue() < self.submitted {
+                let _ = self.sync.SetEventOnCompletion(
+                    self.submitted,
+                    windows::Win32::Foundation::HANDLE::default(),
+                );
+            }
+        }
+    }
+}
+
+/// Writes frames on the process's device into an encoder's pictures, one
+/// copy on the device per frame and no byte through the host.
+#[derive(Default)]
+pub struct EncoderFeed {
+    copier: Option<Copier>,
+}
+
+/// How a frame was copied into an encoder's picture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Copied {
+    /// The decoder's NV12 texture as a whole, onto one of the same size.
+    Whole,
+    /// Each plane into the picture's own.
+    Planes,
+}
+
+impl EncoderFeed {
+    /// Copies `frame` into `picture`, a picture of an encoder's pool on the
+    /// process's device: as it is held for a decoder's picture, else made
+    /// NV12 first ([`GpuFrame::nv12_planes`], an rgba frame with `yuv`).
+    /// The queue every module submits to runs the copy after what it has
+    /// already been given, then signals the picture's sync object, and the
+    /// picture says the value it waits for. The frame is kept until the
+    /// copy has run.
+    pub fn feed(
+        &mut self,
+        frame: &Arc<GpuFrame>,
+        yuv: Yuv,
+        picture: &mut DeviceFrame,
+    ) -> Result<Copied> {
+        let (global, device) = (
+            shared(),
+            shared_device().ok_or_else(|| anyhow!("no GPU: the process has no device"))?,
+        );
+        if frame.backend() != wgpu_types::Backend::Dx12 {
+            bail!(
+                "the frame is on a {:?} device, not a D3D12 one",
+                frame.backend()
+            );
+        }
+        let planes = frame.nv12_planes(yuv)?;
+        let [y, uv] = planes.as_slice() else {
+            bail!(
+                "an NV12 frame has two planes, and this one has {}",
+                planes.len()
+            );
+        };
+        let raw = picture
+            .d3d12()
+            .ok_or_else(|| anyhow!("the encoder's picture is not a D3D12 one"))?;
+        // SAFETY: the picture holds its texture and sync object.
+        let (target, sync) = unsafe {
+            (
+                borrowed::<ID3D12Resource>(raw.texture)?,
+                borrowed::<SyncObject>(raw.sync)?,
+            )
+        };
+        // SAFETY: a COM call on a live resource.
+        let target_desc = unsafe { target.GetDesc() };
+        if target_desc.Format != DXGI_FORMAT_NV12 || raw.slice != 0 {
+            bail!("the encoder's picture is not a texture of its own in NV12");
+        }
+
+        // wgpu leaves the planes in the common state the copy starts from,
+        // after every command already given that writes them.
+        let textures: Vec<TextureId> = if y.texture == uv.texture {
+            vec![y.texture]
+        } else {
+            vec![y.texture, uv.texture]
+        };
+        hand_over(global, device, &textures)?;
+        let resource = |texture: TextureId| -> Result<ID3D12Resource> {
+            // SAFETY: the texture is the frame's, alive while it is.
+            let hal = unsafe { global.texture_as_hal::<Dx12>(texture) }
+                .ok_or_else(|| anyhow!("a plane of the frame is not a D3D12 texture"))?;
+            // SAFETY: only referenced; the frame keeps the texture alive.
+            Ok(unsafe { hal.raw_resource() }.clone())
+        };
+        let y_source = resource(y.texture)?;
+        let uv_source = if y.texture == uv.texture {
+            None
+        } else {
+            Some(resource(uv.texture)?)
+        };
+
+        let queue = queue(global, device)?;
+        // The encoder is done with the texture once its own signal of it
+        // has been reached.
+        // SAFETY: COM calls on live objects.
+        unsafe { queue.Wait(&sync, raw.sync_value) }.context("waiting on the encoder")?;
+        let copier = match &mut self.copier {
+            Some(copier) => copier,
+            None => self.copier.insert(Copier::new(device_of(&target)?)?),
+        };
+        let mut recorder = copier.recorder()?;
+        let common = D3D12_RESOURCE_STATE_COMMON;
+        let copy_src = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        let copy_dst = D3D12_RESOURCE_STATE_COPY_DEST;
+        let all = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        let (width, height) = (picture.width, picture.height);
+        let region = |w: u32, h: u32| D3D12_BOX {
+            left: 0,
+            top: 0,
+            front: 0,
+            right: w,
+            bottom: h,
+            back: 1,
+        };
+        let copied = {
+            let list = &recorder.list;
+            let same_size = || {
+                // SAFETY: a COM call on a live resource.
+                let source = unsafe { y_source.GetDesc() };
+                source.Width == target_desc.Width
+                    && source.Height == target_desc.Height
+                    && source.Format == target_desc.Format
+                    && source.MipLevels == target_desc.MipLevels
+                    && source.DepthOrArraySize == target_desc.DepthOrArraySize
+            };
+            match &uv_source {
+                None if same_size() => {
+                    // SAFETY: COM calls on live objects; both resources
+                    // outlive the list's run (the frame is held below, the
+                    // picture until the encoder is done with it).
+                    unsafe {
+                        list.ResourceBarrier(&[
+                            barrier(&y_source, all, common, copy_src),
+                            barrier(&target, all, common, copy_dst),
+                        ]);
+                        list.CopyResource(&target, &y_source);
+                        list.ResourceBarrier(&[
+                            barrier(&y_source, all, copy_src, common),
+                            barrier(&target, all, copy_dst, common),
+                        ]);
+                    }
+                    Copied::Whole
+                }
+                _ => {
+                    // Luma from plane 0 (or a texture of its own), chroma
+                    // from plane 1 (or its own), into the picture's two.
+                    let (uv_resource, uv_sub) = match &uv_source {
+                        Some(r) => (r, 0),
+                        None => (&y_source, 1),
+                    };
+                    let mut before = vec![
+                        barrier(&y_source, all, common, copy_src),
+                        barrier(&target, all, common, copy_dst),
+                    ];
+                    let mut after = vec![
+                        barrier(&y_source, all, copy_src, common),
+                        barrier(&target, all, copy_dst, common),
+                    ];
+                    if let Some(r) = &uv_source {
+                        before.push(barrier(r, all, common, copy_src));
+                        after.push(barrier(r, all, copy_src, common));
+                    }
+                    // SAFETY: as above.
+                    unsafe {
+                        list.ResourceBarrier(&before);
+                        list.CopyTextureRegion(
+                            &location(&target, 0),
+                            0,
+                            0,
+                            0,
+                            &location(&y_source, 0),
+                            Some(&region(width, height)),
+                        );
+                        list.CopyTextureRegion(
+                            &location(&target, 1),
+                            0,
+                            0,
+                            0,
+                            &location(uv_resource, uv_sub),
+                            Some(&region(width.div_ceil(2), height.div_ceil(2))),
+                        );
+                        list.ResourceBarrier(&after);
+                    }
+                    Copied::Planes
+                }
+            }
+        };
+        recorder.held.push(Arc::clone(frame));
+        copier.submit(&queue, recorder)?;
+        let next = raw.sync_value + 1;
+        // SAFETY: COM calls on live objects.
+        unsafe { queue.Signal(&sync, next) }.context("signalling the encoder")?;
+        picture.written_at(next);
+        Ok(copied)
+    }
+}
+
+/// Puts `textures` in the common state on the queue, after every command
+/// already submitted that uses them, for D3D12 commands of the host's own
+/// to read next.
+fn hand_over(global: &Global, device: &SharedDevice, textures: &[TextureId]) -> Result<()> {
+    let (encoder, err) = global.device_create_command_encoder(
+        device.device,
+        &wgpu_types::CommandEncoderDescriptor { label: None },
+        None,
+    );
+    if let Some(e) = err {
+        bail!("a command encoder for the copy: {e}");
+    }
+    global
+        .command_encoder_transition_resources(
+            encoder,
+            std::iter::empty(),
+            textures
+                .iter()
+                .map(|&texture| wgpu_types::TextureTransition {
+                    texture,
+                    selector: None,
+                    state: wgpu_types::TextureUses::PRESENT,
+                }),
+        )
+        .map_err(|e| anyhow!("{e}"))?;
+    let (commands, err) = global.command_encoder_finish(
+        encoder,
+        &wgpu_types::CommandBufferDescriptor { label: None },
+        None,
+    );
+    if let Some((_, e)) = err {
+        bail!("{e}");
+    }
+    global
+        .queue_submit(*device.queue, &[commands])
+        .map_err(|(_, e)| anyhow!("{e}"))?;
+    Ok(())
 }

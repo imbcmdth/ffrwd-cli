@@ -495,6 +495,10 @@ pub type FnHwDeviceCreate = unsafe extern "C" fn(
 ) -> c_int;
 pub type FnHwDeviceAlloc = unsafe extern "C" fn(c_int) -> *mut AVBufferRef;
 pub type FnHwDeviceInit = unsafe extern "C" fn(*mut AVBufferRef) -> c_int;
+/// `av_hwframe_ctx_alloc`: a frames context on the device a reference names.
+pub type FnHwFramesAlloc = unsafe extern "C" fn(*mut AVBufferRef) -> *mut AVBufferRef;
+pub type FnHwFramesInit = unsafe extern "C" fn(*mut AVBufferRef) -> c_int;
+pub type FnHwFrameGetBuffer = unsafe extern "C" fn(*mut AVBufferRef, *mut AVFrame, c_int) -> c_int;
 pub type FnBufferUnref = unsafe extern "C" fn(*mut *mut AVBufferRef);
 pub type FnFrameRef = unsafe extern "C" fn(*mut AVFrame, *const AVFrame) -> c_int;
 pub type FnHwTransfer = unsafe extern "C" fn(*mut AVFrame, *const AVFrame, c_int) -> c_int;

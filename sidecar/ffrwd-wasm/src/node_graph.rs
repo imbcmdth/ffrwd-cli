@@ -532,6 +532,9 @@ fn open(
     }
 
     let mut label_ids: HashMap<String, u32> = HashMap::new();
+    // The streams whose frames their writer holds on the GPU, as its shape
+    // says: what an `encode` reading one takes on the device.
+    let mut held_on_gpu: HashSet<u32> = HashSet::new();
     let mut consumers: HashMap<u32, Vec<Consumer>> = HashMap::new();
     let mut mirrors: HashMap<u32, Vec<u32>> = HashMap::new();
     let mut lanes: Vec<LaneSpec> = Vec::with_capacity(calls.len());
@@ -607,8 +610,11 @@ fn open(
             Kind::Host => open_host(call, &pads, &streams)?,
             Kind::Leaky => open_leaky(call, &pads, &streams)?,
             Kind::Av => {
-                let on_gpu =
-                    call.module == av_nodes::DECODE && read_on_gpu(args, &paths, calls, index)?;
+                let on_gpu = if call.module == av_nodes::DECODE {
+                    read_on_gpu(args, &paths, calls, index)?
+                } else {
+                    pads.iter().any(|(_, id)| held_on_gpu.contains(id))
+                };
                 open_av(call, &pads, &streams, on_gpu)?
             }
         };
@@ -685,6 +691,9 @@ fn open(
                     base: def.base,
                     latency: def.latency.unwrap_or(0.0),
                 });
+                if spec.shape.outputs[port].memory == FrameMemory::Gpu {
+                    held_on_gpu.insert(id);
+                }
                 StreamDef {
                     spelling: format!("[{label}], output '{name}' of {}", call.module),
                     rendition: RenditionMeta::default(),
@@ -1343,9 +1352,10 @@ fn asked(
 }
 
 /// Whether any of call `index`'s outputs is read by a node module's input
-/// held on the GPU, as that module's shape says: what decides whether a
-/// `decode` leaves its pictures on the device. Asked before the readers
-/// are opened, since they open after what they read.
+/// held on the GPU, as that module's shape says, or by an `encode` whose
+/// encoder reads D3D12 pictures: what decides whether a `decode` leaves its
+/// pictures on the device. Asked before the readers are opened, since they
+/// open after what they read.
 fn read_on_gpu(
     args: &Args,
     paths: &HashMap<&str, &str>,
@@ -1366,6 +1376,17 @@ fn read_on_gpu(
                 _ => None,
             })
             .collect();
+        let reads = call.inputs.iter().any(
+            |(_, pad)| matches!(pad, NodePad::Label(label) if labels.contains(label.as_str())),
+        );
+        if reads
+            && call.module == av_nodes::ENCODE
+            && call.options.iter().any(|(key, value)| {
+                key == "codec" && ffrwd_wasm_runtime::av::Encoder::reads_d3d12(value)
+            })
+        {
+            return Ok(true);
+        }
         if ports.is_empty() {
             continue;
         }
@@ -2030,7 +2051,8 @@ fn open_leaky(call: &NodeCall, pads: &[(String, u32)], defs: &[StreamDef]) -> Re
 
 /// `decode` or `encode` over one picture stream by position: one instance,
 /// called with whatever has arrived. `on_gpu` says an input held on the
-/// GPU reads what a `decode` writes.
+/// GPU, or an encoder reading D3D12 pictures, reads what a `decode` writes,
+/// or that the frames an `encode` reads are held on the GPU.
 fn open_av(
     call: &NodeCall,
     pads: &[(String, u32)],
@@ -2089,6 +2111,7 @@ fn open_av(
             def.base,
             def.frame_rate,
             aspect,
+            on_gpu,
         )?;
         let format = StreamFormat::Packets(node.coded().clone());
         let output = StreamDef {

@@ -3,7 +3,9 @@
 use std::os::raw::c_void;
 
 use super::error::{Error, Result};
-use super::ffi::{release_com, AvErr, Codec, CodecCtx, Frame, Lib, Packet, Scaler, Status};
+use super::ffi::{
+    add_ref_com, release_com, AvErr, Codec, CodecCtx, Frame, Lib, Packet, Scaler, Status,
+};
 use super::picture::{self, WIRE_PIX_FMTS};
 use super::Color;
 
@@ -54,6 +56,13 @@ impl Shared {
             Shared::D3d12(_) => "d3d12va",
         }
     }
+
+    /// Another reference to the same device.
+    pub fn share(&self) -> Shared {
+        match self {
+            Shared::D3d12(device) => Shared::D3d12(device.share()),
+        }
+    }
 }
 
 /// One reference to a COM device object, given up when dropped unless a
@@ -73,7 +82,15 @@ impl ComDevice {
         ComDevice(device)
     }
 
-    fn into_raw(self) -> *mut c_void {
+    /// Another reference to the device.
+    pub fn share(&self) -> ComDevice {
+        // SAFETY: the reference this holds keeps the device alive; the new
+        // one is the returned handle's.
+        unsafe { add_ref_com(self.0) };
+        ComDevice(self.0)
+    }
+
+    pub(super) fn into_raw(self) -> *mut c_void {
         let raw = self.0;
         std::mem::forget(self);
         raw
@@ -87,9 +104,11 @@ impl Drop for ComDevice {
     }
 }
 
-/// A picture a decoder opened on a [`Shared`] device left on it: the
+/// A picture on a [`Shared`] device: one a decoder opened on it left
+/// there, or one of an encoder's pool waiting to be written
+/// ([`Encoder::device_picture`](super::Encoder::device_picture)). The
 /// device's own texture, in `pix_fmt`, kept from reuse until this is
-/// dropped.
+/// dropped or handed to the encoder.
 pub struct DeviceFrame {
     pub pts: i64,
     pub duration: Option<i64>,
@@ -97,7 +116,7 @@ pub struct DeviceFrame {
     pub height: u32,
     /// What the texture holds: `nv12`.
     pub pix_fmt: &'static str,
-    frame: Frame,
+    pub(super) frame: Frame,
 }
 
 /// The D3D12 objects of a [`DeviceFrame`], valid while it is.
@@ -135,9 +154,20 @@ impl DeviceFrame {
     /// it is done reading the texture: the decoder waits for that value
     /// before it writes the texture again. Set before the frame is dropped.
     pub fn read_until(&mut self, value: u64) {
+        self.set_sync_value(value);
+    }
+
+    /// Says the texture of an encoder's picture is written once its sync
+    /// object reaches `value`: the encoder waits for that value before it
+    /// reads it. Set before the picture is sent.
+    pub fn written_at(&mut self, value: u64) {
+        self.set_sync_value(value);
+    }
+
+    fn set_sync_value(&mut self, value: u64) {
         if let Some(picture) = self.frame.d3d12() {
-            // SAFETY: the frame holds the picture; the decoder reads the
-            // value only once every reference to it has been dropped.
+            // SAFETY: the frame holds the picture; the codec reads the value
+            // only once this reference has been dropped or handed to it.
             unsafe { (*picture).sync_ctx.sync_value = value };
         }
     }

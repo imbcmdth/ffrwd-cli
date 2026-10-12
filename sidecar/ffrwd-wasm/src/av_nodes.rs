@@ -11,10 +11,18 @@
 //! and a packet leaves `encode` in decode order the same way. The last call
 //! flushes the codec and hands on what it still held.
 //!
-//! A `decode` whose pictures are read by an input held on the GPU decodes
-//! on the process's own device where it can (`d3d12va` on Windows), and
-//! hands its pictures on as frames on that device, so nothing is copied to
-//! host memory and back. `encode` reads a frame on the GPU back once.
+//! A `decode` whose pictures are read by an input held on the GPU, or by an
+//! encoder that reads D3D12 pictures, decodes on the process's own device
+//! where it can (`d3d12va` on Windows), and hands its pictures on as frames
+//! on that device, so nothing is copied to host memory and back.
+//!
+//! An `encode` whose encoder reads D3D12 pictures (`h264_d3d12va`,
+//! `hevc_d3d12va`, `av1_d3d12va`) and whose frames arrive on the process's
+//! device takes them there: each is copied on the device into a picture of
+//! the encoder's pool, a module's rgba made NV12 first, and no byte crosses
+//! to the host. Such an encoder reads nothing else, so a frame in host
+//! memory is uploaded into its pool. Every other encoder reads a frame on
+//! the GPU back once.
 
 use std::sync::Arc;
 
@@ -167,7 +175,7 @@ fn open_on_shared_device(
         );
         return None;
     }
-    let Some(device) = gpu::d3d12::decoder_device() else {
+    let Some(device) = gpu::d3d12::av_device() else {
         eprintln!(
             "[gpu] decode {codec}: the process's device is not a D3D12 one, so {DEVICE} \
              cannot share it"
@@ -298,9 +306,13 @@ impl Decode {
             Some((num, den)) if num > 0 => f64::from(delay) * den as f64 / num as f64,
             _ => 0.0,
         };
+        let mut shape = shape(PortKind::Packets, PortKind::Video, base, latency);
+        if on_device.is_some() {
+            shape.outputs[0].memory = FrameMemory::Gpu;
+        }
         Ok(Decode {
             name: DECODE.to_string(),
-            shape: shape(PortKind::Packets, PortKind::Video, base, latency),
+            shape,
             decoder,
             on_device,
             format,
@@ -452,16 +464,105 @@ impl Node for Decode {
 pub struct Encode {
     name: String,
     shape: NodeShape,
+    /// Copies frames on the process's device into the encoder's pictures,
+    /// for an encoder opened on that device. Dropped before the encoder,
+    /// waiting for the copies still running into its pictures.
+    #[cfg_attr(not(all(feature = "gpu", windows)), allow(dead_code))]
+    feed: Option<Feed>,
     encoder: Encoder,
     coded: CodedStream,
     duration: Option<i64>,
+    /// The colour an rgba frame is made NV12 in on the device: the stream's
+    /// matrix and range, as the header declares them.
+    #[cfg_attr(not(all(feature = "gpu", windows)), allow(dead_code))]
+    yuv: ColorInfo,
+    /// How frames last reached the encoder, said on stderr when it changes.
+    said: Option<String>,
+    /// How frames on the device were last copied into the encoder's
+    /// pictures, said on stderr when it changes.
+    #[cfg_attr(not(all(feature = "gpu", windows)), allow(dead_code))]
+    copies: Option<String>,
+}
+
+#[cfg(all(feature = "gpu", windows))]
+type Feed = ffrwd_wasm_runtime::gpu::d3d12::EncoderFeed;
+#[cfg(not(all(feature = "gpu", windows)))]
+type Feed = std::convert::Infallible;
+
+/// The process's device for an encoder that reads D3D12 pictures, and the
+/// feed that copies frames on it into the encoder's; None for both where
+/// the process has no D3D12 device.
+#[cfg(all(feature = "gpu", windows))]
+fn encoder_device() -> Option<(av::Shared, Feed)> {
+    Some((
+        ffrwd_wasm_runtime::gpu::d3d12::av_device()?,
+        Feed::default(),
+    ))
+}
+
+#[cfg(not(all(feature = "gpu", windows)))]
+fn encoder_device() -> Option<(av::Shared, Feed)> {
+    None
+}
+
+/// What frames reach an encoder on the device as.
+const FROM_THE_DEVICE: &str = "from the device";
+const UPLOADED: &str = "uploaded from host memory";
+const READ_BACK: &str = "read back from the GPU and uploaded";
+
+/// The colour an encoder that reads NV12 writes an rgba input in: the
+/// stream's matrix and range where the conversion has them (`bt709`, or
+/// BT.601's, which the wire calls `bt470bg`), else BT.709 limited range.
+/// With it, why the stream's own was not kept, where it was not.
+fn nv12_color(color: Option<ColorInfo>) -> (ColorInfo, Option<String>) {
+    let unset = |name: &str| matches!(name, "" | "unknown" | "unspecified");
+    let Some(color) = color else {
+        return (
+            ColorInfo {
+                range: "tv",
+                primaries: "unknown",
+                trc: "unknown",
+                space: "bt709",
+            },
+            None,
+        );
+    };
+    let (space, why) = match color.space {
+        "bt709" => ("bt709", None),
+        "bt470bg" | "smpte170m" => ("bt470bg", None),
+        other if unset(other) => ("bt709", None),
+        other => ("bt709", Some(format!("the stream's matrix {other}"))),
+    };
+    let (range, why) = match color.range {
+        "pc" | "jpeg" => ("pc", why),
+        "tv" | "mpeg" => ("tv", why),
+        other if unset(other) => ("tv", why),
+        other => (
+            "tv",
+            why.or_else(|| Some(format!("the stream's range {other}"))),
+        ),
+    };
+    (
+        ColorInfo {
+            range,
+            space,
+            ..color
+        },
+        why,
+    )
 }
 
 impl Encode {
     /// Opens the encoder `codec=` names for the raw pictures `input` in
     /// `base`, handing it every other option by ffmpeg's name for it.
     /// `aspect` is the input's pixel aspect, which the coded stream
-    /// declares in turn.
+    /// declares in turn. `on_gpu` says the frames arrive held on the GPU,
+    /// which an encoder that reads D3D12 pictures then takes on the
+    /// process's device.
+    ///
+    /// Says on stderr what it opened, and for an encoder that reads D3D12
+    /// pictures how frames reach it:
+    /// `[av] encode h264_d3d12va: 1920x1080 nv12, from the device`.
     pub fn open(
         options: &[(String, String)],
         input: &StreamFormat,
@@ -469,6 +570,7 @@ impl Encode {
         base: TimeBase,
         frame_rate: Option<(u64, u64)>,
         aspect: Option<(i32, i32)>,
+        on_gpu: bool,
     ) -> Result<Encode> {
         let mut codec: Option<&str> = None;
         let mut handed: Vec<(String, String)> = Vec::with_capacity(options.len());
@@ -494,7 +596,23 @@ impl Encode {
                 carried(input)
             );
         };
-        let color = video.color.map(|c| av::Color {
+        // An encoder that reads NV12 has an rgba input converted to it, in
+        // the colour the stream's header then declares.
+        let reads_d3d12 = Encoder::reads_d3d12(codec);
+        let (yuv, stream_color) = if reads_d3d12 && video.pix_fmt == "rgba" {
+            let (yuv, why) = nv12_color(video.color);
+            if let Some(why) = why {
+                eprintln!(
+                    "[av] encode {codec}: rgba is made NV12 in BT.709 or BT.601 only, so \
+                     {why} gives way to {} {}",
+                    yuv.space, yuv.range
+                );
+            }
+            (yuv, Some(yuv))
+        } else {
+            (nv12_color(video.color).0, video.color)
+        };
+        let color = stream_color.map(|c| av::Color {
             range: c.range.to_string(),
             primaries: c.primaries.to_string(),
             trc: c.trc.to_string(),
@@ -506,23 +624,56 @@ impl Encode {
             i64::try_from(base.num).unwrap_or(i64::MAX),
             i64::try_from(base.den).unwrap_or(i64::MAX),
         );
-        let encoder = Encoder::open(
-            codec,
-            video.width,
-            video.height,
-            video.pix_fmt,
-            time_base,
-            rate,
-            color.as_ref(),
-            &handed,
-        )
-        .map_err(|e| anyhow!("{ENCODE} {spelling}: {e}"))?;
+        let (encoder, feed) = if reads_d3d12 {
+            // On the process's device when the frames are there, so they
+            // are copied on it; on a device of the encoder's own otherwise.
+            let (device, feed) = match on_gpu.then(encoder_device).flatten() {
+                Some((device, feed)) => (Some(device), Some(feed)),
+                None => (None, None),
+            };
+            let encoder = Encoder::open_on_device(
+                codec,
+                video.width,
+                video.height,
+                video.pix_fmt,
+                time_base,
+                rate,
+                color.as_ref(),
+                &handed,
+                device,
+            );
+            (encoder, feed)
+        } else {
+            let encoder = Encoder::open(
+                codec,
+                video.width,
+                video.height,
+                video.pix_fmt,
+                time_base,
+                rate,
+                color.as_ref(),
+                &handed,
+            );
+            (encoder, None)
+        };
+        let encoder = encoder.map_err(|e| anyhow!("{ENCODE} {spelling}: {e}"))?;
+        let said = encoder.on_device().then(|| {
+            if feed.is_some() {
+                FROM_THE_DEVICE
+            } else {
+                UPLOADED
+            }
+            .to_string()
+        });
         eprintln!(
-            "[av] encode {}: {}x{} {}",
+            "[av] encode {}: {}x{} {}{}",
             encoder.name(),
             video.width,
             video.height,
-            encoder.pix_fmt()
+            encoder.pix_fmt(),
+            said.as_deref()
+                .map(|how| format!(", {how}"))
+                .unwrap_or_default()
         );
         let coded = CodedStream {
             codec: encoder.codec().to_string(),
@@ -531,7 +682,7 @@ impl Encode {
                 width: video.width,
                 height: video.height,
                 sample_aspect_ratio: aspect,
-                color: video.color,
+                color: stream_color,
             },
             extradata: encoder.extradata().to_vec(),
             profile: None,
@@ -540,10 +691,109 @@ impl Encode {
         Ok(Encode {
             name: ENCODE.to_string(),
             shape: shape(PortKind::Video, PortKind::Packets, base, 0.0),
+            feed,
             encoder,
             coded,
             duration: frame_ticks(frame_rate, base),
+            yuv,
+            said,
+            copies: None,
         })
+    }
+
+    /// Says on stderr how frames reach an encoder on the device, when that
+    /// changes.
+    fn say(&mut self, how: &str) {
+        if self.said.as_deref() != Some(how) {
+            eprintln!("[av] encode {}: {how}", self.encoder.name());
+            self.said = Some(how.to_string());
+        }
+    }
+
+    /// Hands one frame to the encoder: copied on the device into one of
+    /// its pictures where the encoder reads its pool and the frame is on
+    /// the process's device, else as bytes, read back where the frame is
+    /// on the GPU.
+    fn send(&mut self, data: &FrameData, pts: i64, duration: Option<i64>) -> Result<()> {
+        if self.encoder.on_device() {
+            if self.send_on_device(data, pts, duration)? {
+                return Ok(());
+            }
+            self.say(match data {
+                FrameData::Host(_) => UPLOADED,
+                FrameData::Gpu(_) => READ_BACK,
+            });
+        }
+        // A frame on the GPU is read back here, once, for any other encoder:
+        // NVENC in this libav takes CUDA and D3D11 frames and no D3D12 ones.
+        let bytes = data.bytes().map_err(|e| anyhow!("{}: {e}", self.name))?;
+        self.encoder
+            .send(pts, duration, &bytes)
+            .map_err(|e| anyhow!("{}: {e}", self.name))
+    }
+
+    /// The frame copied on the device into one of the encoder's pictures
+    /// and sent; false, with nothing sent, where it is not a frame on the
+    /// process's device the encoder can be fed from.
+    #[cfg(all(feature = "gpu", windows))]
+    fn send_on_device(
+        &mut self,
+        data: &FrameData,
+        pts: i64,
+        duration: Option<i64>,
+    ) -> Result<bool> {
+        use ffrwd_wasm_runtime::gpu::d3d12::Copied;
+        use ffrwd_wasm_runtime::gpu::frames::{Matrix, Yuv};
+        let (FrameData::Gpu(frame), Some(feed)) = (data, self.feed.as_mut()) else {
+            return Ok(false);
+        };
+        if !frame.has_nv12() {
+            return Ok(false);
+        }
+        let yuv = Yuv {
+            matrix: if self.yuv.space == "bt709" {
+                Matrix::Bt709
+            } else {
+                Matrix::Bt601
+            },
+            full_range: self.yuv.range == "pc",
+        };
+        let name = &self.name;
+        let mut picture = self
+            .encoder
+            .device_picture()
+            .map_err(|e| anyhow!("{name}: {e}"))?;
+        let copied = feed
+            .feed(frame, yuv, &mut picture)
+            .map_err(|e| anyhow!("{name}: copying a frame into the encoder's: {e:#}"))?;
+        self.encoder
+            .send_picture(picture, pts, duration)
+            .map_err(|e| anyhow!("{name}: {e}"))?;
+        let how = match copied {
+            Copied::Whole => "from the device, each frame one copy",
+            Copied::Planes => "from the device, each frame a copy per plane",
+        };
+        let how = if frame.pix_fmt() == "nv12" {
+            how.to_string()
+        } else {
+            format!("{how}, made NV12 from {} first", frame.pix_fmt())
+        };
+        self.say(FROM_THE_DEVICE);
+        if self.copies.as_deref() != Some(how.as_str()) {
+            eprintln!("[gpu] encode {}: {how}", self.encoder.name());
+            self.copies = Some(how);
+        }
+        Ok(true)
+    }
+
+    #[cfg(not(all(feature = "gpu", windows)))]
+    fn send_on_device(
+        &mut self,
+        _data: &FrameData,
+        _pts: i64,
+        _duration: Option<i64>,
+    ) -> Result<bool> {
+        Ok(false)
     }
 
     /// The coded stream this node writes.
@@ -666,16 +916,7 @@ impl Node for Encode {
         let mut items = Vec::new();
         for stream in tick.streams {
             for frame in stream.frames {
-                // A frame on the GPU is read back here, once. NVENC in this
-                // libav takes CUDA and D3D11 frames and no D3D12 ones;
-                // `h264_d3d12va` would take the device's own.
-                let bytes = frame
-                    .data
-                    .bytes()
-                    .map_err(|e| anyhow!("{}: {e}", self.name))?;
-                self.encoder
-                    .send(frame.pts, frame.duration.or(self.duration), &bytes)
-                    .map_err(|e| anyhow!("{}: {e}", self.name))?;
+                self.send(&frame.data, frame.pts, frame.duration.or(self.duration))?;
                 self.drain(&mut items)?;
             }
         }
