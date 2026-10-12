@@ -521,9 +521,12 @@ a software encoder, a module or a second file reading a card frame gets
 one download. Where the compile knows its ffmpeg, the pass runs only if
 that build has the variants; where it knows none, the command is written
 for the reader's. Recipe 156, `docs/dialect.md` (input options) and
-`docs/known_gaps.md` (the card path is CUDA's) say so. Not done: the
-Vulkan family (`hwaccel vulkan`, `_vulkan` filters, the `_vulkan`
-encoders), the same shape on another device type when one is wanted.
+`docs/known_gaps.md` say so. The Vulkan family followed (`hwaccel
+vulkan` to a `_vulkan` encoder, the `_vulkan` filters, `hwupload`; the
+encoder reads only the card's frames, so a CPU segment ahead of it ends
+with an upload); the families never mix. Neither has run on a card from
+here: the pinned commands are what ffmpeg is handed, and a run on the
+4090 (CUDA) and the L4 (Vulkan) is what proves them.
 
 ### Wave 1: wgpu over wasi:webgpu, finished
 
