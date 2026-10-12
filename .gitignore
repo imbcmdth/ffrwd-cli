@@ -16,3 +16,6 @@ __pycache__/
 
 # The build copies the repository README in; it is never committed here.
 cli/README.md
+
+# The libav libraries sidecar/ffrwd-wasm/fetch_av.py places for a wheel build.
+/sidecar/ffrwd-wasm/ffrwd_wasm_av/

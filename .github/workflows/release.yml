@@ -72,9 +72,12 @@ jobs:
           workspaces: |
             sidecar
             sidecar/modules
+      # The same libav fetch the wheels job runs, so the exec tier sees the
+      # libraries a release ships.
       - name: Build and install the workspace sidecar wheel
         working-directory: sidecar/ffrwd-wasm
         run: |
+          python fetch_av.py --target x86_64 --os ${{ runner.os }}
           pip install maturin
           maturin build --release --out dist
           pip install dist/*.whl
@@ -246,6 +249,18 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      # The libav libraries ship inside the wheel, beside the sidecar, so
+      # pip install stays the whole install. av-pins.json pins each
+      # platform's archive by URL, sha256 and byte count. A target with no
+      # pin builds a wheel without codecs rather than failing the release.
+      - name: Fetch the pinned libav libraries
+        run: python sidecar/ffrwd-wasm/fetch_av.py --target ${{ matrix.target }} --os ${{ runner.os }}
 
       - name: Build wheel
         uses: PyO3/maturin-action@v1

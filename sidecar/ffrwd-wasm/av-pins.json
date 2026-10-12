@@ -1,0 +1,5 @@
+{
+  "ffmpeg": "n9.0.1",
+  "majors": {"avutil": 61, "swresample": 7, "avcodec": 63, "swscale": 10},
+  "platforms": {}
+}

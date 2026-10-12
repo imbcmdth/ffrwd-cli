@@ -18,3 +18,6 @@ Changelog = "https://github.com/imbcmdth/ffrwd-cli/releases"
 
 [tool.maturin]
 bindings = "bin"
+# The libav libraries fetch_av.py places, shipped at the wheel root as
+# site-packages/ffrwd_wasm_av/. The cli looks the directory up by this name.
+include = [{ path = "ffrwd_wasm_av/**/*", format = "wheel" }]

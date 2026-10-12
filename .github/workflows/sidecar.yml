@@ -56,10 +56,13 @@ jobs:
         uses: astral-sh/setup-uv@v5
 
       # Smoke test: the ffrwd-wasm crate packages as a maturin bin-bindings
-      # wheel. No publish step exists anywhere in this workflow.
+      # wheel, with the libav fetch the release runs first. No publish step
+      # exists anywhere in this workflow.
       - name: Build wheel
         working-directory: sidecar/ffrwd-wasm
-        run: uvx maturin build --release
+        run: |
+          python3 fetch_av.py --target x86_64 --os ${{ runner.os }}
+          uvx maturin build --release
 
       - name: Upload wheel
         uses: actions/upload-artifact@v4
