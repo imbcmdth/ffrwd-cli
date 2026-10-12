@@ -495,6 +495,67 @@ Acceptance: the experiment's harness runs on the GPU tier from the
 published crates, and the lbar recipe renders on the GPU path with frames
 within tolerance of the CPU path.
 
+**Shipped (2026-10-11):** `wgpu-wasi-webgpu` is a repository of its own
+(`E:/wgpu-wasi-webgpu` on the owner's machine, version 29.0.0, pinned to
+wgpu 29, with its own copy of the wit under `wit/deps` and a script that
+checks it against ffrwd-cli's), moved out of blitz's `bench-compose-4k60`
+branch, which keeps the bench and depends on the crate by path until it is
+published. Every `todo!()` is gone: render bundles, indirect draws, the
+compressed texture formats and the WGSL language features are implemented
+over the wit, and what the 0.0.1 interface cannot express (surfaces,
+acceleration structures, mesh shaders, binding arrays, pipeline caches,
+immediates, pipeline statistics, `clear-texture`) refuses by name. The
+host's wit additions ship in `ffrwd/wasm` under `wit/deps` under the
+upstream package name. Tests on the GPU: wgpu's hello-compute and
+hello-triangle as value modules through `ffrwd-wasm --invoke` with a `-gpu`
+grant, and a vello_hybrid scene against vello_cpu, all passing on the
+owner's RTX 4090 (0 of 262,144 pixels differ by more than 2 levels; the
+largest difference is 1).
+
+What was learned:
+
+- No crate feature can replace the vendored wgpu: wgpu 29's build script
+  turns on its browser backend for every wasm32 target except Emscripten
+  whenever its `webgpu` feature is set, and `anyrender_vello_hybrid` 0.10
+  depends on wgpu with its defaults, which Cargo unifies into the whole
+  build. The backend crate takes wgpu with defaults off and needs no patch;
+  a module that uses that renderer keeps a `[patch.crates-io]` wgpu with
+  the one line removed until wgpu excludes `target_os = "wasi"` from that
+  cfg upstream. `vello_hybrid` 0.1 alone keeps the defaults off behind its
+  `wgpu_default` feature, so the backend's own vello test needs no patch.
+- Render bundles are implemented but unreachable: wgpu 29's own
+  `RenderBundleEncoder::finish` is unimplemented for every custom backend.
+- A host with no adapter now returns `RequestAdapterError` rather than
+  panicking, which is what a module's CPU fallback keys on. The grant is
+  not the fallback's signal: the compiler emits `-gpu` for every module
+  whose describe imports `wasi:webgpu`, so "no GPU" means no adapter; a
+  sidecar built without the `gpu` feature refuses such a module outright.
+- A write mapping starts zeroed and is written back whole on drop; a
+  program that reads a mapped buffer back before writing it sees zeros.
+
+blitz 0.3.0 is on branch `gpu-compose` of ffrwd-package-blitz, unpublished
+until the ffrwd release after 0.29.5 hosts the host's wit additions:
+`compose` and `page` render through `anyrender_vello_hybrid` into a
+texture and read it back when `renderer` is `gpu`, or `auto` with an
+adapter; the two core methods are in. The GPU and CPU frames agree within
+the tolerance on every frame but the ones where the programme is being
+scaled, where the CPU path's `Extend::Repeat` seam (the last row and
+column taking colour from the first) differs from the GPU's, so the test
+holds those frames to a looser limit; the GPU frame is the one without
+the seam. Measured on the owner's 9950X and 4090, the lbar example
+through `ffrwd-wasm`, 360 frames: with every core the CPU path still wins
+(1080p 115 fps against 95, 4K 35 against 29) because each frame comes
+back by readback and each picture goes up by copy, which is what wave 3
+removes; on one worker the GPU path wins (1080p 74 against 71, 4K 19
+against 16). So 0.3.0's default `renderer` is `cpu`, and the default
+moves to `auto` with wave 3. Two costs to carry into wave 0 and wave 3:
+the compiler grants `-gpu` to this module whatever `renderer` says and
+caps the sidecar at two workers (`GPU_JOBS`), which leaves the CPU path a
+third slower at 1080p and 40% slower at 4K than a run on every core, so
+lifting the cap (wave 0, item 5) matters before the release; and the
+module depends on `wgpu-wasi-webgpu` by path until that crate is on
+GitHub and pinned by tag, so blitz's CI cannot build it until then.
+
 ### Wave 2: libavcodec in the sidecar, packets on the wire
 
 Software frames first: this wave removes the rawvideo pipe and ffmpeg's
