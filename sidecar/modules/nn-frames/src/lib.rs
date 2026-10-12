@@ -13,6 +13,12 @@
 //! has 16 or fewer, else their count, mean, least and greatest), and the
 //! milliseconds the tensor and the compute took inside the module.
 //!
+//! `texture` names an output to bind to a texture
+//! (`ffrwd:gpu/nn.output-texture`) of `texture_width` by `texture_height`;
+//! that output's values are then read from the texture, a copy on the
+//! device and one read back, and the row adds the milliseconds that took as
+//! `output_ms`.
+//!
 //! `model/channel-means.onnx` (NCHW) and `model/channel-means-nhwc.onnx`
 //! (NHWC) are the graphs the tests run: each channel's mean and largest
 //! value, six numbers a test can work out from the frame on its own.
@@ -35,14 +41,21 @@ use ffrwd::av::node_types::{
     RowsUse,
 };
 use ffrwd::av::types::{Meta, Wants};
-use ffrwd::gpu::nn::{frame_tensor, ChannelOrder, Fit, FrameTensorOptions, TensorLayout};
+use ffrwd::gpu::nn::{
+    frame_tensor, output_texture, ChannelOrder, Fit, FrameTensorOptions, OutputTextureOptions,
+    TensorLayout,
+};
 use ffrwd::gpu::types::{FrameMemory, PortMemory};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use wasi::nn::graph::load_by_name;
 use wasi::nn::inference::GraphExecutionContext;
+use wasi::webgpu::webgpu::{
+    get_gpu, GpuBufferDescriptor, GpuBufferUsage, GpuDevice, GpuExtent3D, GpuMapMode,
+    GpuTexelCopyBufferInfo, GpuTexelCopyTextureInfo, GpuTexture,
+};
 
-const SCHEMA: &str = r#"{"type":"object","properties":{"memory":{"type":"string","enum":["gpu","host"]},"model":{"type":"string"},"input":{"type":"string"},"width":{"type":"integer","minimum":1},"height":{"type":"integer","minimum":1},"layout":{"type":"string","enum":["nchw","nhwc"]},"order":{"type":"string","enum":["rgb","bgr"]},"fit":{"type":"string","enum":["stretch","letterbox"]},"scale":{"type":"number"},"mean":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},"std":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3}},"required":["model"],"additionalProperties":false}"#;
+const SCHEMA: &str = r#"{"type":"object","properties":{"memory":{"type":"string","enum":["gpu","host"]},"model":{"type":"string"},"input":{"type":"string"},"width":{"type":"integer","minimum":1},"height":{"type":"integer","minimum":1},"layout":{"type":"string","enum":["nchw","nhwc"]},"order":{"type":"string","enum":["rgb","bgr"]},"fit":{"type":"string","enum":["stretch","letterbox"]},"scale":{"type":"number"},"mean":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},"std":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},"texture":{"type":"string"},"texture_width":{"type":"integer","minimum":1},"texture_height":{"type":"integer","minimum":1}},"required":["model"],"additionalProperties":false}"#;
 
 /// An output with this many values or fewer is written whole.
 const WHOLE: usize = 16;
@@ -72,6 +85,13 @@ struct Params {
     mean: [f32; 3],
     #[serde(default = "ones")]
     std: [f32; 3],
+    /// An output bound to a texture, and the texture's size.
+    #[serde(default)]
+    texture: Option<String>,
+    #[serde(default)]
+    texture_width: Option<u32>,
+    #[serde(default)]
+    texture_height: Option<u32>,
 }
 
 fn gpu() -> String {
@@ -103,6 +123,11 @@ fn parse(text: &str) -> Result<Params, String> {
     let params: Params = serde_json::from_str(text).map_err(|e| format!("params: {e}"))?;
     if params.memory != "gpu" && params.memory != "host" {
         return Err(format!("memory is gpu or host, not '{}'", params.memory));
+    }
+    if params.texture.is_some() != params.texture_width.is_some()
+        || params.texture.is_some() != params.texture_height.is_some()
+    {
+        return Err("texture takes texture_width and texture_height".to_string());
     }
     Ok(params)
 }
@@ -140,6 +165,63 @@ struct State {
     input: String,
     options: FrameTensorOptions,
     context: GraphExecutionContext,
+    /// The output bound to a texture, the texture, and the device to read
+    /// it back with.
+    texture: Option<(String, GpuTexture, GpuDevice)>,
+}
+
+/// `texture`'s `width` x `height` fp32 texels, read back: a copy into a
+/// buffer, then a map.
+fn read_texture(
+    device: &GpuDevice,
+    texture: &GpuTexture,
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>, String> {
+    let row = width * 4;
+    let padded = row.div_ceil(256) * 256;
+    let buffer = device.create_buffer(&GpuBufferDescriptor {
+        size: u64::from(padded * height),
+        usage: GpuBufferUsage::copy_dst() | GpuBufferUsage::map_read(),
+        mapped_at_creation: None,
+        label: None,
+    });
+    let encoder = device.create_command_encoder(None);
+    encoder.copy_texture_to_buffer(
+        &GpuTexelCopyTextureInfo {
+            texture,
+            mip_level: None,
+            origin: None,
+            aspect: None,
+        },
+        &GpuTexelCopyBufferInfo {
+            buffer: &buffer,
+            offset: None,
+            bytes_per_row: Some(padded),
+            rows_per_image: Some(height),
+        },
+        GpuExtent3D {
+            width,
+            height: Some(height),
+            depth_or_array_layers: None,
+        },
+    );
+    device.queue().submit(&[&encoder.finish(None)]);
+    buffer
+        .map_async(GpuMapMode::read(), None, None)
+        .map_err(|_| "mapping the texture's readback".to_string())?;
+    let mapped = buffer
+        .get_mapped_range_get_with_copy(None, None)
+        .map_err(|_| "reading the texture's readback".to_string())?;
+    let mut out = Vec::with_capacity((row * height) as usize);
+    for y in 0..height as usize {
+        let at = y * padded as usize;
+        out.extend_from_slice(&mapped[at..at + row as usize]);
+    }
+    buffer
+        .unmap()
+        .map_err(|_| "unmapping the texture's readback".to_string())?;
+    Ok(out)
 }
 
 thread_local! {
@@ -236,12 +318,32 @@ impl Guest for Node {
             .init_execution_context()
             .map_err(|e| format!("init-execution-context: {}", e.data()))?;
         let options = params.options()?;
+        let texture = match (&params.texture, params.texture_width, params.texture_height) {
+            (Some(name), Some(width), Some(height)) => {
+                let texture = output_texture(
+                    &context,
+                    &OutputTextureOptions {
+                        output: name.clone(),
+                        width,
+                        height,
+                    },
+                )?;
+                let device = get_gpu()
+                    .request_adapter(None)
+                    .ok_or("no GPU adapter to read the texture with")?
+                    .request_device(None)
+                    .map_err(|_| "the adapter gave no device".to_string())?;
+                Some((name.clone(), texture, device))
+            }
+            _ => None,
+        };
         STATE.with(|s| {
             *s.borrow_mut() = Some(State {
                 v: v.id,
                 input: params.input.clone(),
                 options,
                 context,
+                texture,
             })
         });
         Ok(())
@@ -267,8 +369,20 @@ impl Guest for Node {
                     .map_err(|e| format!("compute: {}", e.data()))?;
                 let compute_ms = ms(started);
                 let mut written_outputs = Map::new();
+                let mut output_ms = 0.0;
                 for (name, out) in &outputs {
-                    written_outputs.insert(name.clone(), written(&out.data()));
+                    match &state.texture {
+                        Some((bound, texture, device)) if bound == name => {
+                            let started = Instant::now();
+                            let bytes =
+                                read_texture(device, texture, texture.width(), texture.height())?;
+                            output_ms = ms(started);
+                            written_outputs.insert(name.clone(), written(&bytes));
+                        }
+                        _ => {
+                            written_outputs.insert(name.clone(), written(&out.data()));
+                        }
+                    }
                 }
                 rows.push(
                     json!({
@@ -276,6 +390,7 @@ impl Guest for Node {
                         "outputs": written_outputs,
                         "tensor_ms": tensor_ms,
                         "compute_ms": compute_ms,
+                        "output_ms": output_ms,
                     })
                     .to_string(),
                 );
