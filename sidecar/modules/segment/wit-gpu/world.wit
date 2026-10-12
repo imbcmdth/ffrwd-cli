@@ -1,0 +1,15 @@
+package ffrwd:segment;
+
+/// The GPU build: a node of the node world beside `ffrwd:gpu`, so its frames
+/// may be held on the GPU. It imports `wasi:webgpu`, so it needs a `-gpu`
+/// grant to run at all, and `wasi:nn`, the standard interface. It imports no
+/// filesystem: the graph file is the host's, and this module only knows the
+/// name it was bound to.
+world segment-gpu {
+  include ffrwd:av/node-module@0.19.1;
+  include ffrwd:gpu/gpu-nn-module@0.1.0;
+  import wasi:nn/tensor@0.2.0-rc-2024-10-28;
+  import wasi:nn/graph@0.2.0-rc-2024-10-28;
+  import wasi:nn/inference@0.2.0-rc-2024-10-28;
+  import wasi:nn/errors@0.2.0-rc-2024-10-28;
+}

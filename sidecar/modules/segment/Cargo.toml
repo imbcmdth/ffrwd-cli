@@ -6,6 +6,11 @@ edition = "2021"
 [lib]
 crate-type = ["cdylib"]
 
+[features]
+# The GPU build: a node beside ffrwd:gpu, importing wasi:webgpu. The
+# `segment-gpu` crate builds this source with it on, as segment_gpu.wasm.
+gpu = []
+
 [dependencies]
 wit-bindgen = "0.57.1"
 serde = { version = "1.0.229", features = ["derive"] }

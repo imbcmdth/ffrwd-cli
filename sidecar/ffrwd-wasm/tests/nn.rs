@@ -1413,78 +1413,89 @@ const ABSENT_BACKEND: &str = if cfg!(target_os = "macos") {
     "metal"
 };
 
+/// Where `modules/segment/fetch-model.ps1` puts the graph.
+fn segment_model() -> PathBuf {
+    sidecar_root().join("modules/segment/model/model.onnx")
+}
+
 #[test]
-fn the_gpu_build_of_depth_runs_in_host_memory_where_there_is_no_adapter() {
+fn the_gpu_builds_run_in_host_memory_where_there_is_no_adapter() {
     let Some(runtime) = runtime_dir() else {
-        announce_skip("depth cannot run a model without a runtime");
+        announce_skip("the GPU builds cannot run a model without a runtime");
         return;
     };
-    let model = depth_model();
-    if !model.is_file() {
-        eprintln!(
-            "SKIPPED: depth's graph is absent. Run \
-             sidecar/modules/depth/fetch-model.ps1 to download it."
-        );
-        return;
-    }
-    let module = package_module("depth-gpu").display().to_string();
-    let dir = means_dir("depth-no-adapter");
+    let dir = means_dir("no-adapter");
     let input = dir.join("in.nut");
     lavfi_input("testsrc2=s=96x64:r=25:d=0.12", "yuv420p", &input);
-    let run = |memory: &str| {
-        let out = dir.join(format!("depth-{memory}.nut"));
-        let mut command = Command::new(env!("CARGO_BIN_EXE_ffrwd-wasm"));
-        command
-            .env_remove("FFRWD_NN_RUNTIME")
-            .env("WGPU_BACKEND", ABSENT_BACKEND)
-            .arg("-nn-runtime")
-            .arg(&runtime)
-            .args([
-                "-nn",
-                &format!("depth={}", model.display()),
-                "-nn-target",
-                "cpu",
-                "-gpu",
-                &module,
-                "-f",
-                "nut",
-                "-i",
-                &input.to_string_lossy(),
-                "-m",
-                &format!("depth={module}"),
-                "-filter_complex",
-                &format!("[v=0:v]depth=memory={memory}[out=o]"),
-                "-map",
-                "[o]",
-                "-f",
-                "nut",
-                &out.to_string_lossy(),
-            ]);
-        let result = command.output().expect("spawn ffrwd-wasm");
-        (result, out)
-    };
+    for (name, package, model, output) in [
+        ("depth", "depth-gpu", depth_model(), "out"),
+        ("segment", "segment-gpu", segment_model(), "map"),
+    ] {
+        if !model.is_file() {
+            eprintln!(
+                "SKIPPED: {name}'s graph is absent. Run \
+                 sidecar/modules/{name}/fetch-model.ps1 to download it."
+            );
+            continue;
+        }
+        let module = package_module(package).display().to_string();
+        let run = |memory: &str| {
+            let out = dir.join(format!("{name}-{memory}.nut"));
+            let mut command = Command::new(env!("CARGO_BIN_EXE_ffrwd-wasm"));
+            command
+                .env_remove("FFRWD_NN_RUNTIME")
+                .env("WGPU_BACKEND", ABSENT_BACKEND)
+                .arg("-nn-runtime")
+                .arg(&runtime)
+                .args([
+                    "-nn",
+                    &format!("{name}={}", model.display()),
+                    "-nn-target",
+                    "cpu",
+                    "-gpu",
+                    &module,
+                    "-f",
+                    "nut",
+                    "-i",
+                    &input.to_string_lossy(),
+                    "-m",
+                    &format!("{name}={module}"),
+                    "-filter_complex",
+                    &format!("[v=0:v]{name}=memory={memory}[{output}=o]"),
+                    "-map",
+                    "[o]",
+                    "-f",
+                    "nut",
+                    &out.to_string_lossy(),
+                ]);
+            let result = command.output().expect("spawn ffrwd-wasm");
+            (result, out)
+        };
 
-    // The backend hides every adapter: the device path has none to open.
-    let (gpu, _) = run("gpu");
-    assert!(!gpu.status.success(), "memory=gpu found an adapter");
-    assert!(
-        stderr(&gpu).contains("depth: no GPU adapter"),
-        "{}",
-        stderr(&gpu)
-    );
+        // The backend hides every adapter: the device path has none to open.
+        let (gpu, _) = run("gpu");
+        assert!(!gpu.status.success(), "{name}: memory=gpu found an adapter");
+        assert!(
+            stderr(&gpu).contains(&format!("{name}: no GPU adapter")),
+            "{}",
+            stderr(&gpu)
+        );
 
-    let (host, out) = run("host");
-    assert!(
-        host.status.success(),
-        "memory=host needs no adapter:\n{}",
-        stderr(&host)
-    );
-    assert!(
-        stderr(&host).contains("[nn] depth: input in host memory, made on the CPU"),
-        "{}",
-        stderr(&host)
-    );
-    assert_eq!(frame_count(&out), 3, "one map per frame");
+        let (host, out) = run("host");
+        assert!(
+            host.status.success(),
+            "{name}: memory=host needs no adapter:\n{}",
+            stderr(&host)
+        );
+        assert!(
+            stderr(&host).contains(&format!(
+                "[nn] {name}: input in host memory, made on the CPU"
+            )),
+            "{}",
+            stderr(&host)
+        );
+        assert_eq!(frame_count(&out), 3, "{name}: one map per frame");
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1628,5 +1639,300 @@ fn depth_on_the_device_paints_what_the_host_path_paints() {
         (Some(0), Some(255)),
         "the device path stretches each map onto the byte too"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// segment's GPU build, a node whose map and rows leave on two ports, beside
+// mask_select, a module of an older world reading the rows riding its frames.
+
+/// The frames the segment cases run over: a test pattern, in which the graph
+/// finds a few things at low confidence.
+const SEGMENT_SOURCE: &str = "testsrc2=s=320x240:r=15:d=1";
+const SEGMENT_FRAMES: usize = 15;
+const SEGMENT_PIXELS: usize = 320 * 240;
+
+/// Each row of an ndjson file, by the frame its `time` falls on.
+fn rows_by_frame(path: &std::path::Path) -> Vec<Vec<serde_json::Value>> {
+    let mut frames = vec![Vec::new(); SEGMENT_FRAMES];
+    for line in std::fs::read_to_string(path).unwrap_or_default().lines() {
+        let row: serde_json::Value = serde_json::from_str(line).expect("a row is JSON");
+        let time = row["time"].as_f64().expect("a row carries its time");
+        frames[(time * 15.0).round() as usize].push(row);
+    }
+    frames
+}
+
+#[test]
+fn a_nodes_rows_reach_an_older_module_with_the_frame_they_describe() {
+    let Some(runtime) = runtime_dir() else {
+        announce_skip("segment cannot run a model without a runtime");
+        return;
+    };
+    let model = segment_model();
+    if !model.is_file() {
+        eprintln!(
+            "SKIPPED: segment's graph is absent. Run \
+             sidecar/modules/segment/fetch-model.ps1 to download it."
+        );
+        return;
+    }
+    let built = chain_modules();
+    let segment = built.join("segment_gpu.wasm").display().to_string();
+    let dir = means_dir("segment-rows");
+    let input = dir.join("in.nut");
+    lavfi_input(SEGMENT_SOURCE, "rgba", &input);
+    let (map, mask, found) = (
+        dir.join("map.nut"),
+        dir.join("mask.nut"),
+        dir.join("found.ndjson"),
+    );
+
+    // The wiring the compiler emits for mask_select(segment(v).map, <a gather
+    // over segment(v).objects>): the narrowed rows last among mask_select's
+    // pads. The map and every row found are written out beside it.
+    let result = run_with_runtime(
+        &runtime,
+        &[
+            "-nn",
+            &format!("segment={}", model.display()),
+            "-nn-target",
+            "cpu",
+            "-gpu",
+            &segment,
+            "-f",
+            "nut",
+            "-i",
+            &input.to_string_lossy(),
+            "-m",
+            &format!("segment={segment}"),
+            "-m",
+            &format!("mask_select={}", built.join("mask_select.wasm").display()),
+            "-filter_complex",
+            r#"[v=0:v]segment=confidence=0.005[map=m][objects=o];[o]rowfilter=pred={"ge"\\:\[{"field"\\:"score"}\,{"lit"\\:0.01}\]}[k];[m][k]mask_select[s]"#,
+            "-map",
+            "[m]",
+            "-f",
+            "nut",
+            &map.to_string_lossy(),
+            "-map",
+            "[s]",
+            "-f",
+            "nut",
+            &mask.to_string_lossy(),
+            "-map",
+            "[o]",
+            "-f",
+            "ndjson",
+            &found.to_string_lossy(),
+        ],
+    );
+    assert!(
+        result.status.success(),
+        "the segment chain failed:\n{}",
+        stderr(&result)
+    );
+
+    // The mask is the map with the ids the frame's own surviving rows name,
+    // and no other.
+    let (map, mask, found) = (rgba_of(&map), rgba_of(&mask), rows_by_frame(&found));
+    assert_eq!(
+        map.len(),
+        SEGMENT_FRAMES * SEGMENT_PIXELS * 4,
+        "a map a frame"
+    );
+    assert_eq!(mask.len(), map.len(), "a mask a map");
+    let (mut selected, mut dropped) = (0, 0);
+    for (frame, rows) in found.iter().enumerate() {
+        let ids: Vec<u64> = rows
+            .iter()
+            .filter(|r| r["score"].as_f64().expect("score") >= 0.01)
+            .map(|r| r["id"].as_u64().expect("id"))
+            .collect();
+        let at = frame * SEGMENT_PIXELS * 4;
+        for pixel in 0..SEGMENT_PIXELS {
+            let id = u64::from(map[at + pixel * 4]);
+            let wanted = if id != 0 && ids.contains(&id) { 255 } else { 0 };
+            assert_eq!(
+                mask[at + pixel * 4],
+                wanted,
+                "frame {frame}, pixel {pixel}: id {id}, the frame's rows name {ids:?}"
+            );
+            if id != 0 {
+                if wanted == 255 {
+                    selected += 1;
+                } else {
+                    dropped += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        selected > 0 && dropped > 0,
+        "the rows keep some objects and drop others: {selected} kept, {dropped} dropped"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// One segment run's map and rows, by frame.
+struct Segmented {
+    map: Vec<u8>,
+    rows: Vec<Vec<serde_json::Value>>,
+    message: String,
+}
+
+fn segment_run(
+    runtime: &std::path::Path,
+    dir: &std::path::Path,
+    input: &std::path::Path,
+    target: &str,
+    memory: &str,
+) -> Option<Segmented> {
+    let module = package_module("segment-gpu").display().to_string();
+    let (map, rows) = (
+        dir.join(format!("map-{target}-{memory}.nut")),
+        dir.join(format!("rows-{target}-{memory}.ndjson")),
+    );
+    let result = run_with_runtime(
+        runtime,
+        &[
+            "-nn",
+            &format!("segment={}", segment_model().display()),
+            "-nn-target",
+            target,
+            "-gpu",
+            &module,
+            "-f",
+            "nut",
+            "-i",
+            &input.to_string_lossy(),
+            "-m",
+            &format!("segment={module}"),
+            "-filter_complex",
+            &format!("[v=0:v]segment=memory={memory}:confidence=0.0185[map=m][objects=o]"),
+            "-map",
+            "[m]",
+            "-f",
+            "nut",
+            &map.to_string_lossy(),
+            "-map",
+            "[o]",
+            "-f",
+            "ndjson",
+            &rows.to_string_lossy(),
+        ],
+    );
+    let message = stderr(&result);
+    if message.contains("no GPU adapter") {
+        return None;
+    }
+    assert!(
+        result.status.success(),
+        "segment ({target}, {memory}) failed:\n{message}"
+    );
+    Some(Segmented {
+        map: rgba_of(&map),
+        rows: rows_by_frame(&rows),
+        message,
+    })
+}
+
+/// The device path's frames against the host path's, frame by frame: the
+/// same objects in the same order, scores within 0.002 and boxes within two
+/// pixels, and the maps of those frames apart on at most 1 % of the pixels
+/// either paints. A frame where a marginal object is found on one path and
+/// not the other is passed over, and most are not.
+fn assert_segmented_alike(host: &Segmented, gpu: &Segmented, route: &str) {
+    assert_eq!(host.map.len(), gpu.map.len(), "{route}: as many maps");
+    let mut compared = 0;
+    let mut objects = 0;
+    for frame in 0..SEGMENT_FRAMES {
+        let (a, b) = (&host.rows[frame], &gpu.rows[frame]);
+        let classes = |rows: &[serde_json::Value]| -> Vec<String> {
+            rows.iter().map(|r| r["class"].to_string()).collect()
+        };
+        if classes(a) != classes(b) {
+            continue;
+        }
+        compared += 1;
+        objects += a.len();
+        for (x, y) in a.iter().zip(b) {
+            let score = (x["score"].as_f64().unwrap() - y["score"].as_f64().unwrap()).abs();
+            assert!(score <= 0.002, "{route}, frame {frame}: {x} against {y}");
+            for field in ["x", "y", "w", "h"] {
+                let apart = x[field].as_i64().unwrap() - y[field].as_i64().unwrap();
+                assert!(apart.abs() <= 2, "{route}, frame {frame}: {x} against {y}");
+            }
+        }
+        let at = frame * SEGMENT_PIXELS * 4;
+        let (mut painted, mut differ) = (0usize, 0usize);
+        for pixel in 0..SEGMENT_PIXELS {
+            let (p, q) = (host.map[at + pixel * 4], gpu.map[at + pixel * 4]);
+            painted += usize::from(p != 0 || q != 0);
+            differ += usize::from(p != q);
+        }
+        assert!(
+            differ * 100 <= painted.max(1),
+            "{route}, frame {frame}: {differ} of {painted} painted pixels differ"
+        );
+    }
+    assert!(
+        compared * 5 >= SEGMENT_FRAMES * 4,
+        "{route}: only {compared} of {SEGMENT_FRAMES} frames found the same objects"
+    );
+    assert!(objects > 0, "{route}: the frames compared hold objects");
+}
+
+#[test]
+fn segment_on_the_device_paints_what_the_host_path_paints() {
+    let Some(runtime) = runtime_dir() else {
+        announce_skip("segment cannot run a model without a runtime");
+        return;
+    };
+    if !segment_model().is_file() {
+        eprintln!(
+            "SKIPPED: segment's graph is absent. Run \
+             sidecar/modules/segment/fetch-model.ps1 to download it."
+        );
+        return;
+    }
+    let dir = means_dir("segment-device");
+    let input = dir.join("in.nut");
+    lavfi_input(SEGMENT_SOURCE, "rgba", &input);
+
+    for (target, provider) in [("cpu", "CPU"), ("cuda", "CUDA"), ("directml", "DIRECTML")] {
+        let host = segment_run(&runtime, &dir, &input, target, "host").expect("no adapter needed");
+        if !host
+            .message
+            .contains(&format!("[nn] segment: execution provider {provider}"))
+        {
+            eprintln!("SKIPPED: {provider} did not engage here:\n{}", host.message);
+            continue;
+        }
+        let Some(gpu) = segment_run(&runtime, &dir, &input, target, "gpu") else {
+            eprintln!("SKIPPED: segment on the device. This machine has no GPU adapter.");
+            break;
+        };
+        let bound = provider != "CPU" && cfg!(windows);
+        let line = if bound {
+            format!("to a texture, bound on {provider}")
+        } else {
+            format!("uploaded to a texture, {provider} writes host memory")
+        };
+        assert!(
+            gpu.message.contains("[nn] segment: output ") && gpu.message.contains(&line),
+            "{provider}: {}",
+            gpu.message
+        );
+        if bound {
+            assert!(
+                gpu.message.contains(&format!(
+                    "[nn] segment: input from the pool, bound on {provider}"
+                )),
+                "{}",
+                gpu.message
+            );
+        }
+        assert_segmented_alike(&host, &gpu, provider);
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -29,6 +29,7 @@ members = [
     "depth",
     "depth-gpu",
     "segment",
+    "segment-gpu",
     "mask_select",
     "pick-first",
     "pad-rows",
