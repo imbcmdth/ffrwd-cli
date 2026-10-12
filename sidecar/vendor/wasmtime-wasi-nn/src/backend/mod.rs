@@ -114,7 +114,9 @@ impl Id {
 /// for failures interacting with the ML library.
 #[derive(Debug, Error)]
 pub enum BackendError {
-    #[error("Failed while accessing backend")]
+    // The backend's own message is what says what went wrong, so it is
+    // part of this one.
+    #[error("Failed while accessing backend: {0}")]
     BackendAccess(#[from] wasmtime::Error),
     #[error("Failed while accessing guest module")]
     GuestAccess(#[from] GuestError),
