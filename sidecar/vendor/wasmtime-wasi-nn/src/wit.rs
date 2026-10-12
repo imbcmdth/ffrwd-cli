@@ -295,6 +295,7 @@ impl generated::tensor::HostTensor for WasiNnView<'_> {
             dimensions,
             ty,
             data,
+            device: None,
         };
         let tensor = self.table.push(tensor)?;
         Ok(tensor)
@@ -312,7 +313,11 @@ impl generated::tensor::HostTensor for WasiNnView<'_> {
 
     fn data(&mut self, tensor: Resource<Tensor>) -> wasmtime::Result<TensorData> {
         let tensor = self.table.get(&tensor)?;
-        Ok(tensor.data.clone())
+        match &tensor.device {
+            // Elements in device memory are read back for a guest that asks.
+            Some(device) => device.0.read(),
+            None => Ok(tensor.data.clone()),
+        }
     }
 
     fn drop(&mut self, tensor: Resource<Tensor>) -> wasmtime::Result<()> {

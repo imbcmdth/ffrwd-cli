@@ -10,7 +10,9 @@ license = "Apache-2.0"
 
 # wasmtime-wasi-nn's ONNX backend reads ExecutionTarget::Gpu as CUDA and
 # nothing else. The vendored copy resolves it through a provider list the host
-# supplies, which is what lets -nn-target directml reach DirectML; the version
-# is the one the lock already resolved, and the diff is one file.
+# supplies, which is what lets -nn-target directml reach DirectML, and binds an
+# input whose elements are in CUDA memory to a CUDA session, the tensor
+# carrying a handle to that memory; the version is the one the lock already
+# resolved.
 [patch.crates-io]
 wasmtime-wasi-nn = { path = "vendor/wasmtime-wasi-nn" }

@@ -324,6 +324,7 @@ fn to_tensor(inspectable: IInspectable, tensor_kind: TensorKind) -> Result<Tenso
                 ty: TensorType::Fp16,
                 dimensions,
                 data,
+                device: None,
             }
         }
         TensorKind::Float => {
@@ -335,6 +336,7 @@ fn to_tensor(inspectable: IInspectable, tensor_kind: TensorKind) -> Result<Tenso
                 ty: TensorType::Fp32,
                 dimensions,
                 data,
+                device: None,
             }
         }
         TensorKind::Int64 => {
@@ -346,6 +348,7 @@ fn to_tensor(inspectable: IInspectable, tensor_kind: TensorKind) -> Result<Tenso
                 ty: TensorType::I64,
                 dimensions,
                 data,
+                device: None,
             }
         }
         _ => unimplemented!(),
@@ -380,6 +383,7 @@ mod tests {
             ty: TensorType::Fp16,
             dimensions: vec![2, 3],
             data: buffer_copy,
+            device: None,
         };
         let inspectable = to_inspectable(&tensor);
         assert!(inspectable.is_ok());
@@ -408,6 +412,7 @@ mod tests {
             ty: TensorType::Fp32,
             dimensions: vec![2, 3],
             data: buffer_copy,
+            device: None,
         };
         let inspectable = to_inspectable(&tensor);
         assert!(inspectable.is_ok());
@@ -432,6 +437,7 @@ mod tests {
             ty: TensorType::I64,
             dimensions: vec![1, 6],
             data: buffer_copy,
+            device: None,
         };
         let inspectable = to_inspectable(&tensor);
         assert!(inspectable.is_ok());

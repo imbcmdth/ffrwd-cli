@@ -75,6 +75,10 @@ pub struct Tensor {
     pub dimensions: Vec<u32>,
     pub ty: TensorType,
     pub data: Vec<u8>,
+    /// Where the elements are when they are in device memory the embedder
+    /// holds rather than in `data`, which is then empty. A backend that can
+    /// bind such memory reads it in place; see [`DeviceInput`].
+    pub device: Option<DeviceHandle>,
 }
 impl fmt::Debug for Tensor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -82,7 +86,35 @@ impl fmt::Debug for Tensor {
             .field("dimensions", &self.dimensions)
             .field("ty", &self.ty)
             .field("data (bytes)", &self.data.len())
+            .field("on a device", &self.device.is_some())
             .finish()
+    }
+}
+
+/// An input tensor's elements in device memory the embedder owns, which a
+/// backend binds to its session in place of bytes. The tensor carries a
+/// handle to it, so the wasi-nn tensor itself stays bytes or nothing.
+pub trait DeviceInput: Send + Sync {
+    /// The CUDA device pointer to the elements, packed as the tensor's
+    /// dimensions and type say, and the ordinal of the device it is on.
+    fn cuda_pointer(&self) -> (u64, i32);
+
+    /// Returns once whatever writes the elements has written them, so a
+    /// session reading them next reads what was written.
+    fn ready(&self) -> wasmtime::Result<()>;
+
+    /// The elements in host memory, little-endian, for a reader asking for
+    /// the tensor's bytes.
+    fn read(&self) -> wasmtime::Result<Vec<u8>>;
+}
+
+/// A tensor's [`DeviceInput`], shared by every copy of the tensor.
+#[derive(Clone)]
+pub struct DeviceHandle(pub Arc<dyn DeviceInput>);
+
+impl PartialEq for DeviceHandle {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
     }
 }
 
@@ -157,6 +189,18 @@ impl Tensor {
             dimensions,
             ty,
             data,
+            device: None,
+        }
+    }
+
+    /// A tensor whose elements are in device memory: `dimensions` and `ty`
+    /// describe them, and `device` reaches them.
+    pub fn on_device(dimensions: Vec<u32>, ty: TensorType, device: DeviceHandle) -> Self {
+        Self {
+            dimensions,
+            ty,
+            data: Vec::new(),
+            device: Some(device),
         }
     }
 }

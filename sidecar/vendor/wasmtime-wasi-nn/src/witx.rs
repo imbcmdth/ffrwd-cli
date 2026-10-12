@@ -194,6 +194,7 @@ impl generated::wasi_ephemeral_nn::WasiEphemeralNn for WasiNnCtx {
                 dimensions: memory.to_vec(tensor.dimensions)?,
                 ty: tensor.type_.into(),
                 data: memory.to_vec(tensor.data)?,
+                device: None,
             };
             Ok(exec_context.set_input(Id::Index(index), &tensor)?)
         } else {

@@ -1,6 +1,7 @@
 # A vendored copy of wasmtime-wasi-nn 48.0.1, patched into the workspace so
-# the ONNX backend can put a `gpu` session on a provider other than CUDA. See
-# the note at the top of src/backend/onnx.rs.
+# the ONNX backend can put a `gpu` session on a provider other than CUDA, and
+# bind an input held in CUDA memory (`Tensor::device`, src/lib.rs). See the
+# note at the top of src/backend/onnx.rs.
 #
 # Taken from the published crate. Upstream's `tests/` and `examples/` are not
 # here - they carry a megabyte of binary fixtures and test nothing this build

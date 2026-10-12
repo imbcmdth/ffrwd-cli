@@ -4,8 +4,11 @@
 //! are upstreaming candidates: `ExecutionTarget::Gpu` resolves through a
 //! [`Provider`] priority list the embedder supplies rather than always meaning
 //! CUDA, a `Gpu` session whose providers all fail to register is an error
-//! rather than a silent fall back to the CPU, and integer tensors are
-//! accepted alongside fp32. Everything else here is upstream's.
+//! rather than a silent fall back to the CPU, integer tensors are
+//! accepted alongside fp32, and an input whose elements are in CUDA memory
+//! the embedder holds ([`crate::DeviceInput`]) is bound to a CUDA session
+//! through an `IoBinding` instead of being copied into a CPU tensor.
+//! Everything else here is upstream's.
 
 use super::{
     BackendError, BackendExecutionContext, BackendFromDir, BackendGraph, BackendInner, NamedTensor,
@@ -15,10 +18,11 @@ use crate::wit::types::{ExecutionTarget, GraphEncoding, Tensor, TensorType};
 use crate::{ExecutionContext, Graph};
 use ort::{
     execution_providers::{CPUExecutionProvider, ExecutionProviderDispatch},
+    memory::{AllocationDevice, AllocatorType, MemoryInfo, MemoryType},
     session::{Input, Output},
     session::{Session, SessionInputValue, builder::GraphOptimizationLevel},
     tensor::TensorElementType,
-    value::{Tensor as OrtTensor, ValueType},
+    value::{DynValue, Tensor as OrtTensor, TensorRefMut, ValueType},
 };
 
 #[cfg(feature = "onnx-cuda")]
@@ -171,8 +175,10 @@ impl BackendInner for OnnxBackend {
                 .with_optimization_level(GraphOptimizationLevel::Level3)?
                 .commit_from_memory(builders[0])?;
 
-            let box_: Box<dyn BackendGraph> =
-                Box::new(OnnxGraph(Arc::new(Mutex::new(session)), target));
+            let box_: Box<dyn BackendGraph> = Box::new(OnnxGraph {
+                session: Arc::new(Mutex::new(session)),
+                provider,
+            });
             return Ok(box_.into());
         }
 
@@ -218,13 +224,18 @@ impl BackendFromDir for OnnxBackend {
     }
 }
 
-struct OnnxGraph(Arc<Mutex<Session>>, #[allow(dead_code)] ExecutionTarget);
+struct OnnxGraph {
+    session: Arc<Mutex<Session>>,
+    /// The provider the session was built on, which decides whether an
+    /// input in device memory can be bound to it.
+    provider: Provider,
+}
 unsafe impl Send for OnnxGraph {}
 unsafe impl Sync for OnnxGraph {}
 
 impl BackendGraph for OnnxGraph {
     fn init_execution_context(&self) -> Result<ExecutionContext, BackendError> {
-        let session = self.0.lock().unwrap();
+        let session = self.session.lock().unwrap();
         // We need to hold on to the names of the inputs in order for
         // `set_input` to work with both indexes and names. Having the
         // dimensions and type around is useful for validation but could be
@@ -248,7 +259,8 @@ impl BackendGraph for OnnxGraph {
             });
         }
         let box_: Box<dyn BackendExecutionContext> = Box::new(OnnxExecutionContext {
-            session: self.0.clone(),
+            session: self.session.clone(),
+            provider: self.provider,
             inputs,
             outputs,
         });
@@ -258,6 +270,7 @@ impl BackendGraph for OnnxGraph {
 
 struct OnnxExecutionContext {
     session: Arc<Mutex<Session>>,
+    provider: Provider,
     inputs: Vec<TensorSlot>,
     outputs: Vec<TensorSlot>,
 }
@@ -266,6 +279,92 @@ unsafe impl Send for OnnxExecutionContext {}
 unsafe impl Sync for OnnxExecutionContext {}
 
 impl OnnxExecutionContext {
+    /// Runs the session over the inputs set, and reads every output back as
+    /// the shape and bytes its type asks for, in the session's order.
+    ///
+    /// With every input in host memory the session is run as upstream runs
+    /// it. With any input in device memory the inputs are bound instead:
+    /// that input's memory as it is, the others as CPU tensors, and the
+    /// outputs to host memory, where they are read as before.
+    fn run(&mut self) -> Result<Vec<(Vec<u32>, Vec<u8>)>, BackendError> {
+        let on_device = self
+            .inputs
+            .iter()
+            .any(|slot| slot.tensor.as_ref().is_some_and(|t| t.device.is_some()));
+        let mut session = self.session.lock().unwrap();
+        if !on_device {
+            let mut session_inputs: Vec<SessionInputValue<'_>> = vec![];
+            for i in &self.inputs {
+                session_inputs.extend(to_input_value(i)?);
+            }
+            let session_outputs = session.run(session_inputs.as_slice())?;
+            return self
+                .outputs
+                .iter()
+                .enumerate()
+                .map(|(i, output)| from_output_value(&session_outputs[i], output.shape.ty))
+                .collect();
+        }
+
+        if self.provider != Provider::Cuda {
+            return Err(BackendError::BackendAccess(wasmtime::format_err!(
+                "an input in device memory is bound to a CUDA session, and this one is on {}",
+                self.provider.name()
+            )));
+        }
+        let mut binding = session.create_binding()?;
+        for slot in &self.inputs {
+            let Some(tensor) = &slot.tensor else {
+                return Err(BackendError::BackendAccess(wasmtime::format_err!(
+                    "missing input tensor: {}",
+                    slot.shape.name
+                )));
+            };
+            let Some(device) = &tensor.device else {
+                binding.bind_input(&slot.shape.name, &host_value(tensor)?)?;
+                continue;
+            };
+            if tensor.ty != TensorType::Fp32 {
+                return Err(BackendError::BackendAccess(wasmtime::format_err!(
+                    "an input in device memory is fp32, and {} is {:?}",
+                    slot.shape.name,
+                    tensor.ty
+                )));
+            }
+            let (pointer, ordinal) = device.0.cuda_pointer();
+            device.0.ready()?;
+            let memory = MemoryInfo::new(
+                AllocationDevice::CUDA,
+                ordinal,
+                AllocatorType::Device,
+                MemoryType::Default,
+            )?;
+            let shape = ort::tensor::Shape::new(tensor.dimensions.iter().map(|&d| i64::from(d)));
+            // SAFETY: `DeviceInput` promises a CUDA allocation on device
+            // `ordinal` holding the tensor's elements, alive as long as the
+            // tensor is; the tensor is in `slot` until after the run below.
+            let value = unsafe {
+                TensorRefMut::<f32>::from_raw(memory, pointer as usize as *mut _, shape)?
+            };
+            binding.bind_input(&slot.shape.name, &*value)?;
+        }
+        let host = MemoryInfo::new(
+            AllocationDevice::CPU,
+            0,
+            AllocatorType::Device,
+            MemoryType::CPUOutput,
+        )?;
+        for output in &self.outputs {
+            binding.bind_output_to_device(&output.shape.name, &host)?;
+        }
+        let session_outputs = session.run_binding(&binding)?;
+        self.outputs
+            .iter()
+            .enumerate()
+            .map(|(i, output)| from_output_value(&session_outputs[i], output.shape.ty))
+            .collect()
+    }
+
     /// Helper function for finding the internal index of a tensor by [`Id`].
     fn find(&self, id: Id, list: &[TensorSlot]) -> Result<usize, BackendError> {
         let index = match id {
@@ -343,22 +442,15 @@ impl BackendExecutionContext for OnnxExecutionContext {
                     input_slot.tensor.replace(input.tensor.clone());
                 }
 
-                let mut session_inputs: Vec<SessionInputValue<'_>> = vec![];
-                for i in &self.inputs {
-                    session_inputs.extend(to_input_value(i)?);
-                }
-                let mut session = self.session.lock().unwrap();
-                let session_outputs = session.run(session_inputs.as_slice())?;
+                let read = self.run()?;
 
                 let mut output_tensors = Vec::new();
-                for i in 0..self.outputs.len() {
-                    let output = &mut self.outputs[i];
-                    let (dimensions, data) =
-                        from_output_value(&session_outputs[i], output.shape.ty)?;
+                for (output, (dimensions, data)) in self.outputs.iter_mut().zip(read) {
                     let tensor = Tensor {
                         dimensions,
                         ty: output.shape.ty,
                         data,
+                        device: None,
                     };
                     output.tensor.replace(tensor.clone());
                     output_tensors.push(NamedTensor {
@@ -371,20 +463,13 @@ impl BackendExecutionContext for OnnxExecutionContext {
 
             // WITX
             None => {
-                let mut session_inputs: Vec<SessionInputValue<'_>> = vec![];
-                for i in &self.inputs {
-                    session_inputs.extend(to_input_value(i)?);
-                }
-                let mut session = self.session.lock().unwrap();
-                let session_outputs = session.run(session_inputs.as_slice())?;
-                for i in 0..self.outputs.len() {
-                    let output = &mut self.outputs[i];
-                    let (dimensions, data) =
-                        from_output_value(&session_outputs[i], output.shape.ty)?;
+                let read = self.run()?;
+                for (output, (dimensions, data)) in self.outputs.iter_mut().zip(read) {
                     output.tensor.replace(Tensor {
                         dimensions,
                         ty: output.shape.ty,
                         data,
+                        device: None,
                     });
                 }
                 Ok(None)
@@ -512,6 +597,35 @@ impl TryFrom<TensorElementType> for TensorType {
             ))),
         }
     }
+}
+
+/// A host tensor as a value an `IoBinding` takes.
+fn host_value(tensor: &Tensor) -> Result<DynValue, BackendError> {
+    let dimensions: Vec<i64> = tensor.dimensions.iter().map(|&d| i64::from(d)).collect();
+    let value = match tensor.ty {
+        TensorType::Fp32 => {
+            OrtTensor::from_array((dimensions, bytes_to_f32_vec(tensor.data.clone())))
+                .map(|t| t.into_dyn())
+        }
+        TensorType::I64 => {
+            OrtTensor::from_array((dimensions, bytes_to_i64_vec(tensor.data.clone())))
+                .map(|t| t.into_dyn())
+        }
+        TensorType::I32 => {
+            OrtTensor::from_array((dimensions, bytes_to_i32_vec(tensor.data.clone())))
+                .map(|t| t.into_dyn())
+        }
+        other => {
+            return Err(BackendError::BackendAccess(wasmtime::format_err!(
+                "ONNX inputs of type {other:?} are not supported"
+            )));
+        }
+    };
+    value.map_err(|e| {
+        BackendError::BackendAccess(wasmtime::format_err!(
+            "failed to create ONNX session input: {e}"
+        ))
+    })
 }
 
 fn to_input_value(slot: &TensorSlot) -> Result<[SessionInputValue<'_>; 1], BackendError> {

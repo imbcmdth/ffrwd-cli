@@ -161,6 +161,7 @@ impl BackendExecutionContext for OpenvinoExecutionContext {
                             dimensions,
                             ty,
                             data,
+                            device: None,
                         },
                     });
                 }
@@ -192,6 +193,7 @@ impl BackendExecutionContext for OpenvinoExecutionContext {
             dimensions,
             ty,
             data,
+            device: None,
         })
     }
 }

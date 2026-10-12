@@ -203,6 +203,7 @@ impl BackendExecutionContext for PytorchExecutionContext {
                     dimensions: dimensions.iter().map(|&dim| dim as u32).collect(),
                     ty,
                     data,
+                    device: None,
                 };
                 let output = NamedTensor {
                     name: "output".to_string(),
@@ -246,6 +247,7 @@ impl BackendExecutionContext for PytorchExecutionContext {
             dimensions: dimensions.iter().map(|&dim| dim as u32).collect(),
             ty,
             data,
+            device: None,
         })
     }
 }
