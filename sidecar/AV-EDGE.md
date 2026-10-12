@@ -100,7 +100,7 @@ tries the platform's order (Windows: d3d11va, cuda; Linux: vulkan, cuda;
 macOS: videotoolbox), skipping a device type the build does not have, and
 falls back to software. The frames come back to host memory, with one
 exception: when the node reading them holds its frames on the GPU
-(`NODE-CLI.md`) and the device is the sidecar's own, `d3d12va` on
+(`NODE-SHAPE.md`) and the device is the sidecar's own, `d3d12va` on
 Windows, the decoder writes straight into the sidecar's frame pool and
 nothing comes back. One line on stderr says what engaged, and a second
 says whether the decoder's own images were taken as they are or copied
@@ -110,6 +110,20 @@ once on the device:
     [av] decode h264: software (d3d11va: no device)
     [av] decode h264: d3d12va, on the host's device
     [gpu] decode h264: d3d12va, frames wrapped
+
+That holds for `format=yuv420p` and `format=rgba`. The decoder writes
+NV12 either way; a reader of yuv420p is handed its planes split on the
+device, byte for byte the software decode, and a reader of rgba is handed
+it converted on the device once per picture, in the stream's matrix and
+range (BT.709, or BT.601 where the stream says so or says nothing, as
+libswscale reads it), its chroma interpolated between samples. That is
+within one level of ffmpeg's `scale=flags=bilinear+full_chroma_int+accurate_rnd`;
+the software path's default conversion repeats each chroma sample across
+two pixels instead, so the two differ at sharp colour edges. A stream in
+another matrix, or another `format`, is converted in host memory and put
+on the GPU by its reader, as before. The conversion says so once:
+
+    [gpu] convert nv12 1920x1080 to rgba 1920x1080
 
 An encoder is named outright (`codec=h264_nvenc`) and engages or refuses;
 there is no fallback from a hardware encoder to a software one, since the

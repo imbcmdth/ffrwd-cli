@@ -331,9 +331,23 @@ The host refuses a port the shape does not declare and a port that is not
 video. A module of the node world alone, or of an older world, has
 `"memory": "host"` on every port.
 
+An input held on the GPU that follows another input (`accepts.like`) is
+told that input's size at `init`, and the host resizes its frames on the
+device as they arrive, with a bilinear filter; an input in host memory
+bound to a stream is handed it at the stream's size. A frame reaches a
+port in the port's format and size whichever way it arrived: put on the
+GPU as it reaches the node, left there by a decoder (`AV-EDGE.md`), or
+fed on a port (`NODE-CLI.md`). Each kind of conversion the host makes on
+the device says so once on stderr, and the node it was made for says
+when it resizes:
+
+    [gpu] convert rgba 64x48 to rgba 32x24
+    [gpu] gpu_box: resizing the frames of stream 1 on the GPU to 32x24
+
 `modules/gpu-box` is the test module: `--params '{"memory":"gpu"}'` holds
 `v` and `out` on the GPU, `{"memory":"host"}` holds neither, and the two
-write the same bytes.
+write the same bytes. `{"w":"pad"}` adds a second input, `w`, that
+follows `v`, and `{"w":"port","port":N}` feeds it on a port.
 
 ## Modules of older worlds
 

@@ -183,7 +183,10 @@ is conformed to that format on the way in (rgba and yuv420p, at any size;
 a coded picture under a tag the sidecar's libavcodec knows, h264 say, is
 decoded in software first, see `AV-EDGE.md`), its sound to the port's
 sample format (s16 or f32; another rate or channel count is refused by
-name and the pictures are kept). A group of
+name and the pictures are kept). The picture of an input held on the GPU
+(`NODE-SHAPE.md`) is put there as the feeder sent it and conformed on the
+device, where a BT.709 or BT.601 picture is concerned, and the line saying
+it is conformed ends `on the GPU`. A group of
 hold inputs (`hold.group`) shares one listener and one connection, its
 picture to the video port and its sound to the audio port.
 
@@ -351,15 +354,16 @@ counts, per stage, the bytes that crossed it, how many times, and the
 time that took, and writes one row on stderr behind `ffrwd:row` when the
 run ends, whatever its outcome:
 
-    {"kind":"profile","read":{"bytes":N,"calls":N,"time_s":S},"held":{...},"fetch":{...},"process":{...},"emit":{...},"upload":{...},"download":{...},"write":{...}}
+    {"kind":"profile","read":{"bytes":N,"calls":N,"time_s":S},"held":{...},"fetch":{...},"process":{...},"emit":{...},"upload":{...},"download":{...},"convert":{...},"write":{...}}
 
 `read` is the input pipes; `held` the frames placed in ticks, once per
 node reading them; `fetch` the bytes handed to modules, whether asked for
 through `fetch` or handed whole to an older world; `process` the time
 inside nodes' `process` calls, the host's own nodes included, with no
 bytes of its own; `emit` the frames modules handed back; `upload` and
-`download` the frames put on the GPU and read back from it; `write` the
-output pipes. The row is the run's total, the same at any `-jobs`.
+`download` the frames put on the GPU and read back from it; `convert` the
+frames the host converted on the GPU to another layout or size, counted
+in the bytes of what they became; `write` the output pipes. The row is the run's total, the same at any `-jobs`.
 
 ## The recipes
 
