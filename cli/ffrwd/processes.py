@@ -4845,10 +4845,12 @@ class _Partitioner:
         )
 
     def _code_edges(self) -> None:
-        """The edges of each region whose entry module says its edges are coded.
+        """The edges of each region whose entry module says its edges are
+        coded, or one of whose nodes holds an input on the GPU.
 
-        An input's own picture the entry reads, in a codec the sidecar
-        decodes, crosses as the input's packets and is decoded in the region.
+        An input's own picture a node of the region reads, in a codec the
+        sidecar decodes, crosses as the input's packets and is decoded in the
+        region.
         A picture the region writes straight to one file, whose encoder the
         sidecar has, is encoded in the region and copied into the file, with
         the file's encoder options moved onto the encoder. Every other edge
@@ -4864,9 +4866,8 @@ class _Partitioner:
                 continue
             if sidecar.packet_source or sidecar.data_filter or sidecar.codec:
                 continue
-            entry = self.g.nodes[sidecar.node]
             for index, edge in enumerate(self.edges):
-                if edge.target != sidecar.id or edge.ref not in entry.inputs:
+                if edge.target != sidecar.id or self._reader(sidecar.id, edge.ref) is None:
                     continue
                 wire = edge.format
                 if not isinstance(wire, VideoFormat) or not self._decodable(edge):

@@ -2589,6 +2589,31 @@ def test_a_packet_filter_reading_a_picture_held_on_the_gpu_takes_the_regions_pac
     assert not any("-b:0" in words for words in encoders)
 
 
+def test_a_source_read_by_several_nodes_of_a_region_on_the_gpu_is_decoded_there(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A detector holding its picture on the GPU and a reader of the same
+    picture: the region splits the picture itself, so the edge's reader is
+    that split, not the entry node, and the input still crosses as its
+    packets and is decoded once, ahead of both."""
+
+    def on_card(params: Mapping[str, object], bound: Sequence[str]) -> dict[str, object]:
+        shaped = _spot(params, bound)
+        shaped["inputs"][0]["accepts"] = {"pixel_formats": ["rgba"], "memory": "gpu"}  # type: ignore[index]
+        return shaped
+
+    monkeypatch.setitem(SHAPES, "spot.wasm", on_card)
+    plan = _plan(
+        "COPY (SELECT ring(box(f.video[1]), spot(f.video[1])) FROM input('f.mp4') f) "
+        "TO 'out.mp4' WITH (video_codec 'h264_nvenc')",
+        monkeypatch,
+    )
+    (region,) = plan.sidecars
+    assert region.av and region.graph is not None
+    found = [n.filter for n in region.graph.nodes.values()]
+    assert found[0] == "decode" and found.count("decode") == 1, found
+
+
 def test_a_filter_between_pictures_on_the_device_runs_there_where_it_has_a_variant(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

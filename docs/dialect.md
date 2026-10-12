@@ -456,7 +456,9 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   node module whose shape holds an input on the GPU (`memory: gpu` in
   the port's `accepts`, `sidecar/NODE-SHAPE.md`) takes the same edges
   with no clause at all: the sidecar decodes onto the device it holds
-  the frames on (its `decode` is told `hw=auto`). Recipe
+  the frames on (its `decode` is told `hw=auto`). Any node of the region
+  holding its input on the GPU is enough, and an input read by several
+  nodes of the region is decoded once, ahead of all of them. Recipe
   [157](examples.md#157-a-module-holding-its-frames-on-the-gpu-takes-the-packets).
   Recipe [155](examples.md#155-decode-and-encode-inside-the-sidecar);
   `sidecar/AV-EDGE.md` has the sidecar side.
