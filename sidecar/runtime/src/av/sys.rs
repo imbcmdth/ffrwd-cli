@@ -3,11 +3,12 @@
 //! functions it resolves.
 //!
 //! Every struct here is transcribed field by field from the headers of
-//! FFmpeg 9.0 (libavcodec 63, libavutil 61, libswscale 10). A field out of
-//! place is silent memory corruption rather than an error, so the offsets
-//! are checked twice: at compile time against the offsets the headers give
-//! on a 64-bit target, below, and at load time against what the loaded
-//! libraries report for themselves (`ffi::check_layout`).
+//! FFmpeg 9.0 (libavcodec 63, libavutil 61, libswscale 10, libavfilter 12).
+//! A field out of place is silent memory corruption rather than an error,
+//! so the offsets are checked twice: at compile time against the offsets
+//! the headers give on a 64-bit target, below, and at load time against
+//! what the loaded libraries report for themselves (`ffi::check_layout`,
+//! `ffi::check_filter_layout`).
 //!
 //! Structs that libav allocates and this shim only reaches through a pointer
 //! are transcribed only as far as the last field it touches; nothing here is
