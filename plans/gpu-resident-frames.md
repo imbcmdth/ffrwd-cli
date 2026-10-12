@@ -643,9 +643,11 @@ What was learned, for the waves after:
   the software decode; session caps were not measured, only the engaged
   device is reported, so the compiler's capacity model still has no
   numbers from this wave.
-- `av-pins.json` is empty until the builds repository's first tagged
-  release; a wheel platform without a pin ships without codecs and the
-  sidecar refuses `decode` and `encode` naming the directory it looked in.
+- `av-pins.json` pins ffrwd-av v1.0.0 on all seven wheel platforms; the
+  Windows x86_64 archive was fetched through `fetch_av.py` and loaded by
+  the shim here. A platform without a pin would ship without codecs, and
+  the sidecar then refuses `decode` and `encode` naming the directory it
+  looked in.
 
 ### Wave 3: GPU frames
 
