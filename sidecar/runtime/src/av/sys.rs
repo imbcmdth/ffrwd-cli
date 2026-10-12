@@ -25,10 +25,71 @@ pub struct AVRational {
     pub den: c_int,
 }
 
-/// `AVBufferRef`, only ever handled by pointer.
+/// `AVBufferRef` (libavutil/buffer.h), whole.
 #[repr(C)]
 pub struct AVBufferRef {
-    _private: [u8; 0],
+    pub buffer: *mut c_void,
+    pub data: *mut u8,
+    pub size: usize,
+}
+
+/// `AVHWDeviceContext` (libavutil/hwcontext.h), whole: what a device
+/// reference's `data` points at.
+#[repr(C)]
+pub struct AVHWDeviceContext {
+    pub av_class: *const AVClass,
+    pub type_: c_int,
+    pub hwctx: *mut c_void,
+    pub free: *mut c_void,
+    pub user_opaque: *mut c_void,
+}
+
+/// `AVHWFramesContext` (libavutil/hwcontext.h), through `height`: what a
+/// hardware frame's `hw_frames_ctx` points at.
+#[repr(C)]
+pub struct AVHWFramesContext {
+    pub av_class: *const AVClass,
+    pub device_ref: *mut AVBufferRef,
+    pub device_ctx: *mut AVHWDeviceContext,
+    pub hwctx: *mut c_void,
+    pub free: *mut c_void,
+    pub user_opaque: *mut c_void,
+    pub pool: *mut c_void,
+    pub initial_pool_size: c_int,
+    pub format: c_int,
+    pub sw_format: c_int,
+    pub width: c_int,
+    pub height: c_int,
+}
+
+/// `AVD3D12VADeviceContext` (libavutil/hwcontext_d3d12va.h), through
+/// `device`, the one field set before `av_hwdevice_ctx_init`.
+#[repr(C)]
+pub struct AVD3D12VADeviceContext {
+    /// `ID3D12Device *`; the context releases it when freed.
+    pub device: *mut c_void,
+}
+
+/// `AVD3D12VASyncContext` (libavutil/hwcontext_d3d12va.h), whole.
+#[repr(C)]
+pub struct AVD3D12VASyncContext {
+    /// The D3D12 sync object.
+    pub sync: *mut c_void,
+    /// `HANDLE`.
+    pub event: *mut c_void,
+    /// The value the sync object reaches once the picture is written.
+    pub sync_value: u64,
+}
+
+/// `AVD3D12VAFrame` (libavutil/hwcontext_d3d12va.h), whole: what a d3d12
+/// frame's `data[0]` points at.
+#[repr(C)]
+pub struct AVD3D12VAFrame {
+    /// `ID3D12Resource *`.
+    pub texture: *mut c_void,
+    pub subresource_index: c_int,
+    pub sync_ctx: AVD3D12VASyncContext,
+    pub flags: c_int,
 }
 
 /// `AVDictionary`, only ever handled by pointer.
@@ -432,6 +493,10 @@ pub type FnHwDeviceCreate = unsafe extern "C" fn(
     *mut AVDictionary,
     c_int,
 ) -> c_int;
+pub type FnHwDeviceAlloc = unsafe extern "C" fn(c_int) -> *mut AVBufferRef;
+pub type FnHwDeviceInit = unsafe extern "C" fn(*mut AVBufferRef) -> c_int;
+pub type FnBufferUnref = unsafe extern "C" fn(*mut *mut AVBufferRef);
+pub type FnFrameRef = unsafe extern "C" fn(*mut AVFrame, *const AVFrame) -> c_int;
 pub type FnHwTransfer = unsafe extern "C" fn(*mut AVFrame, *const AVFrame, c_int) -> c_int;
 pub type FnOptSet = unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char, c_int) -> c_int;
 pub type FnOptFind = unsafe extern "C" fn(
@@ -555,6 +620,16 @@ mod offsets {
     const _: () = assert!(offset_of!(AVCodecContext, hw_device_ctx) == 560);
     const _: () = assert!(offset_of!(AVCodecContext, hwaccel_flags) == 568);
     const _: () = assert!(offset_of!(AVCodecContext, extra_hw_frames) == 572);
+
+    const _: () = assert!(size_of::<AVBufferRef>() == 24);
+    const _: () = assert!(offset_of!(AVHWDeviceContext, hwctx) == 16);
+    const _: () = assert!(offset_of!(AVHWFramesContext, initial_pool_size) == 56);
+    const _: () = assert!(offset_of!(AVHWFramesContext, sw_format) == 64);
+    const _: () = assert!(offset_of!(AVHWFramesContext, height) == 72);
+    const _: () = assert!(offset_of!(AVD3D12VAFrame, subresource_index) == 8);
+    const _: () = assert!(offset_of!(AVD3D12VAFrame, sync_ctx) == 16);
+    const _: () = assert!(offset_of!(AVD3D12VAFrame, flags) == 40);
+    const _: () = assert!(size_of::<AVD3D12VAFrame>() == 48);
 
     const _: () = assert!(offset_of!(AVOption, offset) == 16);
     const _: () = assert!(offset_of!(AVCodec, type_) == 16);

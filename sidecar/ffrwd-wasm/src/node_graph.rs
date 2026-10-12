@@ -608,7 +608,11 @@ fn open(
             Kind::OldFilter { path } => open_old_filter(&call.module, path, call, &pads, &streams)?,
             Kind::Host => open_host(call, &pads, &streams)?,
             Kind::Leaky => open_leaky(call, &pads, &streams)?,
-            Kind::Av => open_av(call, &pads, &streams)?,
+            Kind::Av => {
+                let on_gpu =
+                    call.module == av_nodes::DECODE && read_on_gpu(args, &paths, calls, index)?;
+                open_av(call, &pads, &streams, on_gpu)?
+            }
         };
         let Opening {
             mut spec,
@@ -1318,6 +1322,74 @@ fn shape_of(path: &str, params: &str, wanted: &[PortBinding]) -> Result<NodeShap
     Ok(shape)
 }
 
+/// What `open_module` asks a node module before opening it: its params
+/// schema, its params, the bindings it is told, and its shape for those.
+fn asked(
+    args: &Args,
+    name: &str,
+    path: &str,
+    calls: &[NodeCall],
+    index: usize,
+) -> Result<(serde_json::Value, String, Vec<PortBinding>, NodeShape)> {
+    let meta =
+        runtime::describe_node(path).with_context(|| format!("describing module '{name}'"))?;
+    let schema = parse_schema(&meta.params_schema, name)?;
+    let params = match given_params(args, calls, index) {
+        Some(params) => params,
+        None => params_json(name, &schema, &calls[index].options)?,
+    };
+    let told = bindings_of(args, calls, index)?;
+    let shape =
+        shape_of(path, &params, &told).with_context(|| format!("asking {name} for its shape"))?;
+    Ok((schema, params, told, shape))
+}
+
+/// Whether any of call `index`'s outputs is read by a node module's input
+/// held on the GPU, as that module's shape says: what decides whether a
+/// `decode` leaves its pictures on the device. Asked before the readers
+/// are opened, since they open after what they read.
+fn read_on_gpu(
+    args: &Args,
+    paths: &HashMap<&str, &str>,
+    calls: &[NodeCall],
+    index: usize,
+) -> Result<bool> {
+    let labels: HashSet<&str> = calls[index]
+        .outputs
+        .iter()
+        .map(|(_, label)| label.as_str())
+        .collect();
+    for (j, call) in calls.iter().enumerate() {
+        let ports: Vec<&str> = call
+            .inputs
+            .iter()
+            .filter_map(|(port, pad)| match pad {
+                NodePad::Label(label) if labels.contains(label.as_str()) => port.as_deref(),
+                _ => None,
+            })
+            .collect();
+        if ports.is_empty() {
+            continue;
+        }
+        let Some(path) = paths.get(call.module.as_str()) else {
+            continue;
+        };
+        if !runtime::exports_node(path)? {
+            continue;
+        }
+        let (_, _, _, shape) = asked(args, &call.module, path, calls, j)?;
+        let held = |port: &&str| {
+            shape.input(port).is_some_and(|p| {
+                p.accepts.memory == FrameMemory::Gpu && p.accepts.wants != Wants::Timing
+            })
+        };
+        if ports.iter().any(held) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn open_module(
     args: &Args,
     name: &str,
@@ -1328,17 +1400,8 @@ fn open_module(
     defs: &mut Vec<StreamDef>,
 ) -> Result<Opening> {
     let call = &calls[index];
-    let meta =
-        runtime::describe_node(path).with_context(|| format!("describing module '{name}'"))?;
-    let schema = parse_schema(&meta.params_schema, name)?;
-    let mut params = match given_params(args, calls, index) {
-        Some(params) => params,
-        None => params_json(name, &schema, &call.options)?,
-    };
-    let told = bindings_of(args, calls, index)?;
+    let (schema, mut params, told, shape) = asked(args, name, path, calls, index)?;
     let wanted = padded_ports(call);
-    let shape =
-        shape_of(path, &params, &told).with_context(|| format!("asking {name} for its shape"))?;
     check_port_served(name, &shape, &told, &wanted)?;
     let mut bound: Vec<BoundStream> = Vec::with_capacity(pads.len());
     for input in &shape.inputs {
@@ -1968,8 +2031,14 @@ fn open_leaky(call: &NodeCall, pads: &[(String, u32)], defs: &[StreamDef]) -> Re
 }
 
 /// `decode` or `encode` over one picture stream by position: one instance,
-/// called with whatever has arrived.
-fn open_av(call: &NodeCall, pads: &[(String, u32)], defs: &[StreamDef]) -> Result<Opening> {
+/// called with whatever has arrived. `on_gpu` says an input held on the
+/// GPU reads what a `decode` writes.
+fn open_av(
+    call: &NodeCall,
+    pads: &[(String, u32)],
+    defs: &[StreamDef],
+    on_gpu: bool,
+) -> Result<Opening> {
     let name = &call.module;
     let [(port, id)] = pads else {
         bail!(
@@ -1987,6 +2056,7 @@ fn open_av(call: &NodeCall, pads: &[(String, u32)], defs: &[StreamDef]) -> Resul
             def.base,
             def.frame_rate,
             def.decode_delay,
+            on_gpu,
         )?;
         let header = decoded_header(name, &node, def)?;
         let format = StreamFormat::Video(node.format());

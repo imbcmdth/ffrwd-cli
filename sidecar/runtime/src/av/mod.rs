@@ -16,7 +16,9 @@
 //! Pictures cross this API as the sidecar's wire lays them out (see
 //! [`WIRE_PIX_FMTS`]), in host memory. A decoder may run on a hardware
 //! device; its frames are copied back to host memory and converted with
-//! libswscale like any other.
+//! libswscale like any other. A decoder opened on a device the caller
+//! already works on ([`Decoder::open_shared`]) can instead hand its
+//! pictures over as that device's own textures ([`DeviceFrame`]).
 
 mod decode;
 mod encode;
@@ -29,7 +31,10 @@ mod sys;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-pub use decode::{DecodedFormat, DecodedFrame, Decoder, Hw};
+pub use decode::{
+    ComDevice, D3d12Picture, DecodedFormat, DecodedFrame, Decoder, DeviceFrame, Hw, Received,
+    Shared,
+};
 pub use encode::{EncodedPacket, Encoder};
 pub use error::{Error, Result, INSTALL_HINT};
 pub use fourcc::{codec_for_fourcc, fourcc_for_codec};

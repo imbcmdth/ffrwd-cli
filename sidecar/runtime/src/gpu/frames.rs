@@ -1,12 +1,21 @@
 //! Frames the host holds on the GPU: one texture per plane on the process's
 //! device, in the layout the wire's pixel formats have.
 //!
-//! A frame gets here two ways. The host uploads one it holds in host memory
-//! (a decoder's output, a port feed's picture) with [`GpuFrame::upload`],
-//! keeping the bytes beside the textures so nothing is ever read back for
-//! them. Or a module hands over a texture it rendered on the same device
-//! and the host takes it with [`GpuFrame::adopt`]; reading that one's bytes
-//! is a download, done once and kept ([`GpuFrame::bytes`]).
+//! A frame gets here three ways. The host uploads one it holds in host
+//! memory (a software decoder's output, a port feed's picture) with
+//! [`GpuFrame::upload`], keeping the bytes beside the textures so nothing is
+//! ever read back for them. A module hands over a texture it rendered on the
+//! same device and the host takes it with [`GpuFrame::adopt`]. Or a decoder
+//! opened on the device leaves its picture there, and the host takes it as
+//! it is with [`DecodedPictures::hold`]. Reading the bytes of either of the
+//! last two is a download, done once and kept ([`GpuFrame::bytes`]).
+//!
+//! A frame is held in one format and read in another where the two differ.
+//! A decoder's picture is held as the decoder wrote it, NV12 (luma, then
+//! interleaved chroma at half size); [`GpuFrame::pix_fmt`] says `nv12`. Its
+//! wire format, [`GpuFrame::wire_pix_fmt`], is yuv420p: what its bytes are
+//! packed as, and the planes a module is handed ([`GpuFrame::wire_planes`]),
+//! repacked on the device once, the first time anything asks.
 //!
 //! Every texture is on the one device [`super::shared_device`] opens, which
 //! is the device every module's `wasi:webgpu` answers, so a module reads a
@@ -14,7 +23,7 @@
 
 use std::borrow::Cow;
 use std::fmt;
-use std::sync::{mpsc, Arc, OnceLock};
+use std::sync::{mpsc, Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Instant;
 
 use crate::profile::PROFILE;
@@ -24,14 +33,17 @@ use wasi_webgpu_wasmtime::reexports::{wgpu_core, wgpu_types};
 use wasi_webgpu_wasmtime::SharedDevice;
 use wgpu_core::global::Global;
 use wgpu_core::id::TextureId;
-use wgpu_types::{Extent3d, TextureFormat};
+use wgpu_types::{Extent3d, TextureAspect, TextureFormat};
 
 use super::{shared, shared_device};
+use crate::av::DeviceFrame;
 
-/// One plane of a frame, as one texture.
+/// One plane of a frame: a texture, or one aspect of a multi-planar one
+/// (the luma or chroma of an NV12 texture), read as `format`.
 #[derive(Debug, Clone, Copy)]
 pub struct Plane {
     pub texture: TextureId,
+    pub aspect: TextureAspect,
     pub width: u32,
     pub height: u32,
     pub format: TextureFormat,
@@ -58,11 +70,23 @@ pub struct GpuFrame {
     device: Arc<SharedDevice>,
     width: u32,
     height: u32,
+    /// What the planes are held as: a wire format, or `nv12`.
     pix_fmt: String,
+    /// What the bytes are packed as, and the planes a module reads.
+    wire_pix_fmt: &'static str,
     planes: Vec<Plane>,
+    /// The textures the frame drops: every plane's, except a decoder's
+    /// texture, which is handed back instead.
+    owned: Vec<TextureId>,
+    /// The planes as the wire lays them out, where they are not the held
+    /// ones: made the first time something asks, and owned by the frame.
+    wire: Mutex<Option<Vec<Plane>>>,
     /// The frame's bytes as the wire lays them out: what it was uploaded
     /// from, or what reading it back gave.
     bytes: OnceLock<Arc<Vec<u8>>>,
+    /// The decoder's own texture, where the frame is it.
+    #[cfg(windows)]
+    wrapped: Mutex<Option<super::d3d12::Wrapped>>,
 }
 
 fn chroma(n: u32) -> u32 {
@@ -95,6 +119,19 @@ pub fn layout(
 /// Whether frames of this wire format can be held on the GPU.
 pub fn holds(pix_fmt: &str) -> bool {
     layout(pix_fmt, 2, 2).is_some()
+}
+
+/// The wire format a frame held as `pix_fmt` is read as: itself for a wire
+/// format, yuv420p for `nv12`.
+fn wire_of(pix_fmt: &str) -> Option<&'static str> {
+    match pix_fmt {
+        "nv12" => Some("yuv420p"),
+        "rgba" => Some("rgba"),
+        "yuv420p" => Some("yuv420p"),
+        "yuv422p" => Some("yuv422p"),
+        "yuv444p" => Some("yuv444p"),
+        _ => None,
+    }
 }
 
 const USAGE: wgpu_types::TextureUsages = wgpu_types::TextureUsages::TEXTURE_BINDING
@@ -131,6 +168,7 @@ impl GpuFrame {
                 bytes.len()
             );
         }
+        let wire_pix_fmt = wire_of(pix_fmt).expect("a format with a layout is a wire format");
         let (global, device) = device()?;
         let mut planes: Vec<Plane> = Vec::with_capacity(specs.len());
         let mut offset = 0usize;
@@ -170,14 +208,20 @@ impl GpuFrame {
             }
             offset += len;
         }
+        let owned = planes.iter().map(|p| p.texture).collect();
         let frame = GpuFrame {
             global,
             device,
             width,
             height,
             pix_fmt: pix_fmt.to_string(),
+            wire_pix_fmt,
             planes,
+            owned,
+            wire: Mutex::new(None),
             bytes: OnceLock::new(),
+            #[cfg(windows)]
+            wrapped: Mutex::new(None),
         };
         PROFILE.upload.add(bytes.len(), started);
         let _ = frame.bytes.set(bytes);
@@ -204,14 +248,20 @@ impl GpuFrame {
             width,
             height,
             pix_fmt: "rgba".to_string(),
+            wire_pix_fmt: "rgba",
             planes: vec![Plane {
                 texture,
+                aspect: TextureAspect::All,
                 width,
                 height,
                 format,
                 bytes_per_pixel: 4,
             }],
+            owned: vec![texture],
+            wire: Mutex::new(None),
             bytes: OnceLock::new(),
+            #[cfg(windows)]
+            wrapped: Mutex::new(None),
         }))
     }
 
@@ -223,19 +273,66 @@ impl GpuFrame {
         self.height
     }
 
-    /// The wire format the frame is in.
+    /// What the frame is held as on the GPU: its wire format, or `nv12`
+    /// for a decoder's picture. See [`wire_pix_fmt`](GpuFrame::wire_pix_fmt)
+    /// for what its bytes are.
     pub fn pix_fmt(&self) -> &str {
         &self.pix_fmt
     }
 
-    /// The textures, one per plane, in the wire's plane order.
+    /// The wire format the frame is read as: what [`bytes`](GpuFrame::bytes)
+    /// packs and [`wire_planes`](GpuFrame::wire_planes) hands over.
+    pub fn wire_pix_fmt(&self) -> &'static str {
+        self.wire_pix_fmt
+    }
+
+    /// The planes as held, in [`pix_fmt`](GpuFrame::pix_fmt)'s order: for
+    /// `nv12`, the luma and the interleaved chroma, which may be two
+    /// aspects of one texture.
     pub fn planes(&self) -> &[Plane] {
         &self.planes
     }
 
+    /// The planes as the wire lays them out, one texture each: the held
+    /// ones for a frame held in its wire format, else made from them on
+    /// the device the first time anything asks, and kept.
+    pub fn wire_planes(&self) -> Result<Vec<Plane>> {
+        if self.pix_fmt == self.wire_pix_fmt {
+            return Ok(self.planes.clone());
+        }
+        let mut wire = self.lock_wire();
+        if let Some(planes) = wire.as_ref() {
+            return Ok(planes.clone());
+        }
+        let [y, uv] = self.planes.as_slice() else {
+            bail!("a {} frame has two planes", self.pix_fmt);
+        };
+        let made = super::convert::yuv420p_from_nv12(
+            &self.global,
+            &self.device,
+            y,
+            uv,
+            self.width,
+            self.height,
+        )?;
+        *wire = Some(made.clone());
+        Ok(made)
+    }
+
+    fn lock_wire(&self) -> MutexGuard<'_, Option<Vec<Plane>>> {
+        self.wire.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// How many bytes the frame is on the wire.
     pub fn wire_len(&self) -> usize {
-        self.planes.iter().map(Plane::wire_len).sum()
+        layout(self.wire_pix_fmt, self.width, self.height)
+            .map(|specs| {
+                specs
+                    .iter()
+                    .map(|(w, h, _, bpp)| *w as usize * *h as usize * *bpp as usize)
+                    .sum()
+            })
+            .unwrap_or(0)
     }
 
     /// Whether the bytes are already in host memory.
@@ -260,7 +357,7 @@ impl GpuFrame {
         let global = &self.global;
         let device = &self.device;
         let mut out = Vec::with_capacity(self.wire_len());
-        for plane in &self.planes {
+        for plane in &self.wire_planes()? {
             let bytes_per_row = plane.width * plane.bytes_per_pixel;
             let padded = bytes_per_row.div_ceil(wgpu_types::COPY_BYTES_PER_ROW_ALIGNMENT)
                 * wgpu_types::COPY_BYTES_PER_ROW_ALIGNMENT;
@@ -295,7 +392,7 @@ impl GpuFrame {
     }
 }
 
-fn create_plane(
+pub(super) fn create_plane(
     global: &Global,
     device: &SharedDevice,
     width: u32,
@@ -324,6 +421,7 @@ fn create_plane(
     }
     Ok(Plane {
         texture,
+        aspect: TextureAspect::All,
         width,
         height,
         format,
@@ -357,7 +455,7 @@ fn copy_out(
                 texture: plane.texture,
                 mip_level: 0,
                 origin: wgpu_types::Origin3d::ZERO,
-                aspect: wgpu_types::TextureAspect::All,
+                aspect: plane.aspect,
             },
             &wgpu_types::TexelCopyBufferInfo {
                 buffer,
@@ -418,9 +516,99 @@ fn copy_out(
 
 impl Drop for GpuFrame {
     fn drop(&mut self) {
-        for plane in &self.planes {
-            self.global.texture_drop(plane.texture);
+        for texture in &self.owned {
+            self.global.texture_drop(*texture);
         }
+        if let Some(planes) = self.lock_wire().take() {
+            for plane in planes {
+                self.global.texture_drop(plane.texture);
+            }
+        }
+        #[cfg(windows)]
+        if let Some(wrapped) = self
+            .wrapped
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            wrapped.release(&self.global, &self.device);
+        }
+    }
+}
+
+/// How one decoder's pictures become frames: taken on the device as they
+/// are (see [`super::d3d12`]), with one line on stderr saying how, and
+/// again if that changes.
+pub struct DecodedPictures {
+    codec: String,
+    device_type: &'static str,
+    said: Option<String>,
+    #[cfg(windows)]
+    taker: super::d3d12::Taker,
+}
+
+impl DecodedPictures {
+    /// For the decoder of `codec` opened on the process's device as
+    /// `device_type` (`d3d12va`).
+    pub fn new(codec: &str, device_type: &'static str) -> DecodedPictures {
+        DecodedPictures {
+            codec: codec.to_string(),
+            device_type,
+            said: None,
+            #[cfg(windows)]
+            taker: Default::default(),
+        }
+    }
+
+    /// `picture` as a frame, held as the decoder wrote it and read as
+    /// `wire_pix_fmt`. Says on stderr, the first time and whenever it
+    /// changes, how the decoder's pictures are taken:
+    /// `[gpu] decode h264: d3d12va, frames wrapped`, or
+    /// `[gpu] decode h264: d3d12va, frames copied (<why not wrapped>)`.
+    pub fn hold(&mut self, picture: DeviceFrame, wire_pix_fmt: &str) -> Result<Arc<GpuFrame>> {
+        if wire_of(picture.pix_fmt) != Some(wire_pix_fmt) {
+            bail!(
+                "a {} picture is read as {}, and {wire_pix_fmt} was asked for",
+                picture.pix_fmt,
+                wire_of(picture.pix_fmt).unwrap_or("nothing")
+            );
+        }
+        self.take(picture)
+    }
+
+    #[cfg(windows)]
+    fn take(&mut self, picture: DeviceFrame) -> Result<Arc<GpuFrame>> {
+        let (global, device) = device()?;
+        let (width, height, pix_fmt) = (picture.width, picture.height, picture.pix_fmt);
+        let taken = self.taker.take(&global, &device, picture)?;
+        let how = match (taken.path, &taken.why) {
+            (super::d3d12::Path::Wrapped, _) => "frames wrapped".to_string(),
+            (super::d3d12::Path::Copied, Some(why)) => format!("frames copied ({why})"),
+            (super::d3d12::Path::Copied, None) => "frames copied".to_string(),
+        };
+        if self.said.as_deref() != Some(how.as_str()) {
+            eprintln!("[gpu] decode {}: {}, {how}", self.codec, self.device_type);
+            self.said = Some(how);
+        }
+        Ok(Arc::new(GpuFrame {
+            global,
+            device,
+            width,
+            height,
+            pix_fmt: pix_fmt.to_string(),
+            wire_pix_fmt: wire_of(pix_fmt).expect("checked by hold"),
+            planes: taken.planes,
+            owned: taken.owned,
+            wire: Mutex::new(None),
+            bytes: OnceLock::new(),
+            wrapped: Mutex::new(taken.wrapped),
+        }))
+    }
+
+    #[cfg(not(windows))]
+    fn take(&mut self, picture: DeviceFrame) -> Result<Arc<GpuFrame>> {
+        let _ = (&self.codec, &self.device_type, &self.said, picture);
+        bail!("a decoder's pictures are taken on the device on Windows only, so far")
     }
 }
 
@@ -453,5 +641,7 @@ mod tests {
         assert!(layout("nv12", 2, 2).is_none());
         assert!(holds("yuv444p"));
         assert!(!holds("gray"));
+        assert!(!holds("nv12"), "nv12 is held, never asked for");
+        assert_eq!(wire_of("nv12"), Some("yuv420p"));
     }
 }

@@ -25,6 +25,10 @@ use anyhow::Result;
 use wasmtime::component::{Component, Linker};
 
 #[cfg(feature = "gpu")]
+mod convert;
+#[cfg(all(feature = "gpu", windows))]
+pub mod d3d12;
+#[cfg(feature = "gpu")]
 pub mod frames;
 
 /// A build without the `gpu` feature holds no frame on a GPU; the type
@@ -114,6 +118,11 @@ mod enabled {
     /// first: every hardware decoder on Windows writes D3D11 or D3D12
     /// images, every one on macOS writes Metal textures, and on Linux and
     /// Android the decoders that share at all share Vulkan images.
+    ///
+    /// D3D12 has subgroups only with DXC. x86_64 MSVC builds link it in
+    /// (wgpu's `static-dxc`, which its default compiler choice prefers);
+    /// other Windows builds find `dxcompiler.dll` if it is on the path, or
+    /// compile with FXC and have none.
     #[cfg(windows)]
     const PREFERENCE: &[wgpu_types::Backends] = &[
         wgpu_types::Backends::DX12,
@@ -147,6 +156,7 @@ mod enabled {
             | wgpu_types::Features::DUAL_SOURCE_BLENDING
             | wgpu_types::Features::CLEAR_TEXTURE
             | wgpu_types::Features::TEXTURE_FORMAT_16BIT_NORM
+            | wgpu_types::Features::TEXTURE_FORMAT_NV12
     }
 
     /// Opens the process's device on the first adapter a preferred backend

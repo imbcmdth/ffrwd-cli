@@ -25,7 +25,7 @@
 //! once, whatever its tick count. A rate clock with paired inputs runs on
 //! past their newest time first.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -190,6 +190,10 @@ struct Lane {
     base: TimeBase,
     bound: Vec<u32>,
     gpu: HashMap<u32, GpuSpec>,
+    /// The streams whose frames this lane has put on the GPU, said once
+    /// each on stderr.
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+    uploaded: HashSet<u32>,
     state: Vec<u32>,
     queue: VecDeque<Task>,
     next_ordinal: u64,
@@ -220,8 +224,11 @@ struct Lane {
 impl Lane {
     /// `item` as this lane takes it: a frame of a stream bound to an input
     /// held on the GPU is put there as it arrives, once, when it is still
-    /// in host memory. Everything else is handed on as it is.
-    fn resident(&self, stream: u32, item: &Item) -> Result<Item> {
+    /// in host memory, and the first such frame of each stream says so on
+    /// stderr (`[gpu] <lane>: putting the frames of stream <n> on the GPU`).
+    /// A frame already there (a decoder's picture) is handed on as it is,
+    /// as is everything else.
+    fn resident(&mut self, stream: u32, item: &Item) -> Result<Item> {
         let Some(spec) = self.gpu.get(&stream) else {
             return Ok(item.clone());
         };
@@ -246,6 +253,12 @@ impl Lane {
                     self.name
                 )
             })?;
+            if self.uploaded.insert(stream) {
+                eprintln!(
+                    "[gpu] {}: putting the frames of stream {stream} on the GPU",
+                    self.name
+                );
+            }
             Ok(Item::Frame(TickFrame {
                 pts: frame.pts,
                 duration: frame.duration,
@@ -1130,6 +1143,7 @@ impl Scheduler {
                 base: spec.tick_base,
                 bound: spec.bound,
                 gpu: spec.gpu,
+                uploaded: HashSet::new(),
                 state: spec.state,
                 queue: VecDeque::new(),
                 next_ordinal: 0,

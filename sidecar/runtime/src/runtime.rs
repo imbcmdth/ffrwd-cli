@@ -1949,7 +1949,10 @@ impl gpu_ext::ffrwd::gpu::frames::Host for Host {
                  GPU (ffrwd:gpu/ports names the inputs that are)"
             )));
         };
-        let planes: Vec<_> = gpu.planes().to_vec();
+        let planes = match gpu.wire_planes() {
+            Ok(planes) => planes,
+            Err(e) => return Ok(Err(format!("frame {index} of stream {id}: {e:#}"))),
+        };
         let mut handles = Vec::with_capacity(planes.len());
         for plane in planes {
             let texture = wasi_webgpu_wasmtime::Texture::shared(

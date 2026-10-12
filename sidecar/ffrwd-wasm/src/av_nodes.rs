@@ -10,15 +10,20 @@
 //! leaves `decode` in presentation order as soon as the decoder makes it,
 //! and a packet leaves `encode` in decode order the same way. The last call
 //! flushes the codec and hands on what it still held.
+//!
+//! A `decode` whose pictures are read by an input held on the GPU decodes
+//! on the process's own device where it can (`d3d12va` on Windows), and
+//! hands its pictures on as frames on that device, so nothing is copied to
+//! host memory and back. `encode` reads a frame on the GPU back once.
 
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Result};
 use ffrwd_wasm::nut;
-use ffrwd_wasm_runtime::av::{self, Decoder, Encoder, Hw, WIRE_PIX_FMTS};
+use ffrwd_wasm_runtime::av::{self, Decoder, Encoder, Hw, Received, WIRE_PIX_FMTS};
 use ffrwd_wasm_runtime::node::{
-    Accepts, Clock, Emission, Emitted, FrameMemory, InputPort, Node, NodeShape, OutFrame,
-    OutputPort, Pairing, Payload, PortKind, Rational, RowsUse, StreamFormat, Tick,
+    Accepts, Clock, Emission, Emitted, FrameData, FrameMemory, InputPort, Node, NodeShape,
+    OutFrame, OutputPort, Pairing, Payload, PortKind, Rational, RowsUse, StreamFormat, Tick,
 };
 use ffrwd_wasm_runtime::runtime::{
     CodedFormat, CodedStream, ColorInfo, Packet, TimeBase, VideoFormat,
@@ -110,11 +115,96 @@ fn decoder_codec(coded: &CodedStream, fourcc: Option<&[u8]>) -> String {
         .map_or_else(|| coded.codec.clone(), str::to_string)
 }
 
+/// The decoder `decode` opens: on the process's own device when a reader
+/// holds its pictures on the GPU and `hw` allows that device, else as `hw`
+/// says. With it, how the pictures left on the device become frames.
+fn open_decoder(
+    codec: &str,
+    extradata: &[u8],
+    hw: Hw,
+    want: &'static str,
+    on_gpu: bool,
+) -> av::Result<(Decoder, Option<OnDevice>)> {
+    if on_gpu {
+        if let Some(opened) = open_on_shared_device(codec, extradata, &hw, want) {
+            return Ok(opened);
+        }
+    }
+    Ok((Decoder::open(codec, extradata, hw, want)?, None))
+}
+
+/// How a decoder's pictures on the process's device become frames.
+#[cfg(feature = "gpu")]
+type OnDevice = ffrwd_wasm_runtime::gpu::frames::DecodedPictures;
+#[cfg(not(feature = "gpu"))]
+type OnDevice = std::convert::Infallible;
+
+/// A decoder on the process's own device, where `hw` allows the device
+/// it is (`auto`, or that device by name), the wire's format is one a
+/// picture on it repacks to exactly (yuv420p), and the device opens. None,
+/// having said why on stderr where it is not obvious, otherwise.
+#[cfg(all(feature = "gpu", windows))]
+fn open_on_shared_device(
+    codec: &str,
+    extradata: &[u8],
+    hw: &Hw,
+    want: &'static str,
+) -> Option<(Decoder, Option<OnDevice>)> {
+    use ffrwd_wasm_runtime::gpu;
+    const DEVICE: &str = "d3d12va";
+    let allowed = match hw {
+        Hw::Auto => true,
+        Hw::Device(named) => named == DEVICE,
+        Hw::None => false,
+    };
+    if !allowed {
+        return None;
+    }
+    if want != "yuv420p" {
+        eprintln!(
+            "[gpu] decode {codec}: {want} pictures are put on the GPU by their reader; a \
+             decoder's own pictures stay there as yuv420p"
+        );
+        return None;
+    }
+    let Some(device) = gpu::d3d12::decoder_device() else {
+        eprintln!(
+            "[gpu] decode {codec}: the process's device is not a D3D12 one, so {DEVICE} \
+             cannot share it"
+        );
+        return None;
+    };
+    match Decoder::open_shared(codec, extradata, device, want) {
+        Ok(decoder) => Some((
+            decoder,
+            Some(gpu::frames::DecodedPictures::new(codec, DEVICE)),
+        )),
+        Err(e) => {
+            eprintln!("[gpu] decode {codec}: not on the process's device: {e}");
+            None
+        }
+    }
+}
+
+#[cfg(not(all(feature = "gpu", windows)))]
+fn open_on_shared_device(
+    _codec: &str,
+    _extradata: &[u8],
+    _hw: &Hw,
+    _want: &'static str,
+) -> Option<(Decoder, Option<OnDevice>)> {
+    None
+}
+
 /// `decode`: one coded picture stream in, its pictures out in `format`.
 pub struct Decode {
     name: String,
     shape: NodeShape,
     decoder: Decoder,
+    /// Set when the decoder runs on the process's device and its pictures
+    /// stay there.
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+    on_device: Option<OnDevice>,
     /// The pictures as the stream's header declares them.
     format: VideoFormat,
     /// How long a picture lasts, where the frame rate says in whole ticks.
@@ -124,7 +214,9 @@ pub struct Decode {
 impl Decode {
     /// Opens the decoder for the coded stream `input` in `base`, carried
     /// under `fourcc` where its header names one. `delay` is the packets
-    /// the header says the decoder holds back.
+    /// the header says the decoder holds back. `on_gpu` says an input that
+    /// holds its frames on the GPU reads the pictures.
+    #[allow(clippy::too_many_arguments)]
     pub fn open(
         options: &[(String, String)],
         input: &StreamFormat,
@@ -133,6 +225,7 @@ impl Decode {
         base: TimeBase,
         frame_rate: Option<(u64, u64)>,
         delay: u32,
+        on_gpu: bool,
     ) -> Result<Decode> {
         let mut want: Option<&'static str> = None;
         let mut hw: Option<Hw> = None;
@@ -184,8 +277,14 @@ impl Decode {
             unreachable!("matched as video above");
         };
         let codec = decoder_codec(coded, fourcc);
-        let decoder = Decoder::open(&codec, &coded.extradata, hw.unwrap_or_default(), want)
-            .map_err(|e| anyhow!("{DECODE} {spelling}: {e}"))?;
+        let (decoder, on_device) = open_decoder(
+            &codec,
+            &coded.extradata,
+            hw.unwrap_or_default(),
+            want,
+            on_gpu,
+        )
+        .map_err(|e| anyhow!("{DECODE} {spelling}: {e}"))?;
         let format = VideoFormat {
             width,
             height,
@@ -203,6 +302,7 @@ impl Decode {
             name: DECODE.to_string(),
             shape: shape(PortKind::Packets, PortKind::Video, base, latency),
             decoder,
+            on_device,
             format,
             duration: frame_ticks(frame_rate, base),
         })
@@ -215,34 +315,64 @@ impl Decode {
 
     /// Every picture the decoder has ready, onto `items`.
     fn drain(&mut self, items: &mut Vec<Emission>) -> Result<()> {
-        while let Some(frame) = self
+        while let Some(received) = self
             .decoder
-            .receive()
+            .receive_any()
             .map_err(|e| anyhow!("{}: {e}", self.name))?
         {
-            if (frame.width, frame.height) != (self.format.width, self.format.height) {
+            let (pts, duration, size) = match &received {
+                Received::Host(f) => (f.pts, f.duration, (f.width, f.height)),
+                Received::Device(f) => (f.pts, f.duration, (f.width, f.height)),
+            };
+            if size != (self.format.width, self.format.height) {
                 bail!(
                     "{}: the stream's header says {}x{}, and the decoder made a {}x{} picture at \
-                     pts {}; a stream that changes size mid-way is not carried",
+                     pts {pts}; a stream that changes size mid-way is not carried",
                     self.name,
                     self.format.width,
                     self.format.height,
-                    frame.width,
-                    frame.height,
-                    frame.pts
+                    size.0,
+                    size.1,
                 );
             }
+            let data = match received {
+                Received::Host(frame) => Arc::new(frame.data).into(),
+                Received::Device(picture) => self.on_device(picture)?,
+            };
             items.push(Emission {
                 port: 0,
                 payload: Payload::Frame(OutFrame {
-                    pts: frame.pts,
-                    duration: frame.duration.or(self.duration),
-                    data: Arc::new(frame.data).into(),
+                    pts,
+                    duration: duration.or(self.duration),
+                    data,
                     rows: Vec::new(),
                 }),
             });
         }
         Ok(())
+    }
+
+    /// A picture the decoder left on the process's device, as a frame there.
+    #[cfg(feature = "gpu")]
+    fn on_device(&mut self, picture: av::DeviceFrame) -> Result<FrameData> {
+        let pictures = self.on_device.as_mut().ok_or_else(|| {
+            anyhow!(
+                "{}: a picture came back on a device the decoder was not opened on",
+                self.name
+            )
+        })?;
+        let frame = pictures
+            .hold(picture, self.format.pix_fmt)
+            .map_err(|e| anyhow!("{}: {e:#}", self.name))?;
+        Ok(FrameData::Gpu(frame))
+    }
+
+    #[cfg(not(feature = "gpu"))]
+    fn on_device(&mut self, _picture: av::DeviceFrame) -> Result<FrameData> {
+        bail!(
+            "{}: a picture came back on the process's device, and this build holds none",
+            self.name
+        )
     }
 }
 
@@ -536,8 +666,9 @@ impl Node for Encode {
         let mut items = Vec::new();
         for stream in tick.streams {
             for frame in stream.frames {
-                // A frame on the GPU is read back here; the encoder takes
-                // bytes until it reads the device's own frames.
+                // A frame on the GPU is read back here, once. NVENC in this
+                // libav takes CUDA and D3D11 frames and no D3D12 ones;
+                // `h264_d3d12va` would take the device's own.
                 let bytes = frame
                     .data
                     .bytes()

@@ -1,7 +1,9 @@
 //! Decoding coded video into the wire's pictures.
 
+use std::os::raw::c_void;
+
 use super::error::{Error, Result};
-use super::ffi::{AvErr, Codec, CodecCtx, Frame, Lib, Packet, Scaler, Status};
+use super::ffi::{release_com, AvErr, Codec, CodecCtx, Frame, Lib, Packet, Scaler, Status};
 use super::picture::{self, WIRE_PIX_FMTS};
 use super::Color;
 
@@ -36,6 +38,116 @@ impl Hw {
             device => Hw::Device(device.to_string()),
         }
     }
+}
+
+/// A device the caller already works on, which a decoder can be opened on
+/// so that the pictures it writes are that device's own resources.
+pub enum Shared {
+    /// An `ID3D12Device`, which becomes the `d3d12va` device.
+    D3d12(ComDevice),
+}
+
+impl Shared {
+    /// ffmpeg's name for the device type the decoder runs on.
+    pub fn device_type(&self) -> &'static str {
+        match self {
+            Shared::D3d12(_) => "d3d12va",
+        }
+    }
+}
+
+/// One reference to a COM device object, given up when dropped unless a
+/// decoder took it.
+pub struct ComDevice(*mut c_void);
+
+// SAFETY: D3D12 devices are free-threaded; the reference is only moved.
+unsafe impl Send for ComDevice {}
+
+impl ComDevice {
+    /// Takes over one reference to `device`, an `ID3D12Device *`.
+    ///
+    /// # Safety
+    /// `device` is a live `ID3D12Device` the caller holds a reference to,
+    /// which this takes.
+    pub unsafe fn from_raw(device: *mut c_void) -> ComDevice {
+        ComDevice(device)
+    }
+
+    fn into_raw(self) -> *mut c_void {
+        let raw = self.0;
+        std::mem::forget(self);
+        raw
+    }
+}
+
+impl Drop for ComDevice {
+    fn drop(&mut self) {
+        // SAFETY: the reference `from_raw` took.
+        unsafe { release_com(self.0) };
+    }
+}
+
+/// A picture a decoder opened on a [`Shared`] device left on it: the
+/// device's own texture, in `pix_fmt`, kept from reuse until this is
+/// dropped.
+pub struct DeviceFrame {
+    pub pts: i64,
+    pub duration: Option<i64>,
+    pub width: u32,
+    pub height: u32,
+    /// What the texture holds: `nv12`.
+    pub pix_fmt: &'static str,
+    frame: Frame,
+}
+
+/// The D3D12 objects of a [`DeviceFrame`], valid while it is.
+#[derive(Clone, Copy, Debug)]
+pub struct D3d12Picture {
+    /// `ID3D12Resource *`: the texture, an NV12 one.
+    pub texture: *mut c_void,
+    /// The array slice the picture is in, for a decoder writing a texture
+    /// array; 0 otherwise.
+    pub slice: u32,
+    /// The D3D12 sync object the decoder signals when the
+    /// picture is written.
+    pub sync: *mut c_void,
+    /// The value it signals then.
+    pub sync_value: u64,
+}
+
+impl DeviceFrame {
+    /// The picture's D3D12 objects; None for a picture of another device.
+    pub fn d3d12(&self) -> Option<D3d12Picture> {
+        let picture = self.frame.d3d12()?;
+        // SAFETY: the frame holds the picture, so the struct is alive.
+        unsafe {
+            let p = &*picture;
+            Some(D3d12Picture {
+                texture: p.texture,
+                slice: p.subresource_index.max(0) as u32,
+                sync: p.sync_ctx.sync,
+                sync_value: p.sync_ctx.sync_value,
+            })
+        }
+    }
+
+    /// Says the reader signals the picture's sync object with `value` once
+    /// it is done reading the texture: the decoder waits for that value
+    /// before it writes the texture again. Set before the frame is dropped.
+    pub fn read_until(&mut self, value: u64) {
+        if let Some(picture) = self.frame.d3d12() {
+            // SAFETY: the frame holds the picture; the decoder reads the
+            // value only once every reference to it has been dropped.
+            unsafe { (*picture).sync_ctx.sync_value = value };
+        }
+    }
+}
+
+/// What [`Decoder::receive_any`] hands back: a picture in host memory, or
+/// one left on the shared device.
+pub enum Received {
+    Host(DecodedFrame),
+    Device(DeviceFrame),
 }
 
 /// One decoded picture, packed as the wire lays out the format the decoder
@@ -83,6 +195,9 @@ pub struct Decoder {
     packet: Packet,
     scaler: Option<Scaler>,
     last: Option<(i64, Option<i64>)>,
+    /// Opened on a [`Shared`] device: pictures stay on it where the wanted
+    /// format allows.
+    shared: bool,
 }
 
 /// A failed libav call, as the shim's error.
@@ -230,6 +345,88 @@ impl Decoder {
             packet: Packet::new(lib).map_err(call("av_packet_alloc", codec))?,
             scaler: None,
             last: None,
+            shared: false,
+        })
+    }
+
+    /// A decoder on `device`, a device the caller already works on, so the
+    /// pictures it writes are that device's resources and
+    /// [`receive_any`](Decoder::receive_any) can hand them over where they
+    /// are. Only a picture the wire's `want` is an exact repacking of stays
+    /// there (`nv12` for `yuv420p`); any other is copied back and converted
+    /// as [`open`](Decoder::open)'s are.
+    ///
+    /// Says on stderr, once: `[av] decode h264: d3d12va, on the host's
+    /// device`. A decoder or device that refuses is a refusal, and the
+    /// reference to `device` is given up either way.
+    pub fn open_shared(
+        codec: &str,
+        extradata: &[u8],
+        device: Shared,
+        want: &str,
+    ) -> Result<Decoder> {
+        let lib = super::runtime()?;
+        let Some(want) = picture::wire_pix_fmt(want) else {
+            return Err(Error::PixelFormat {
+                name: want.to_string(),
+                why: format!("a decoder produces one of {}", WIRE_PIX_FMTS.join(", ")),
+            });
+        };
+        let want_fmt = lib
+            .wire_pix_fmt(want)
+            .expect("every wire format was found at load");
+        let Some(preferred) = lib.find_decoder(codec) else {
+            return Err(Error::Codec {
+                role: "decoder",
+                name: codec.to_string(),
+            });
+        };
+        let device_name = device.device_type();
+        let refused = |why: String| Error::Hardware {
+            codec: codec.to_string(),
+            device: device_name.to_string(),
+            why,
+        };
+        let Some(device_type) = lib.hw_type(device_name) else {
+            return Err(refused(format!(
+                "this libav cannot create a {device_name} device"
+            )));
+        };
+        let Some(found) = lib
+            .decoders_like(preferred)
+            .into_iter()
+            .find(|c| !c.is_wrapper_or_experimental() && c.takes_device(device_type))
+        else {
+            return Err(refused(format!(
+                "no {codec} decoder here decodes on {device_name}"
+            )));
+        };
+        let mut ctx = CodecCtx::new(found).map_err(|e| refused(e.why))?;
+        ctx.set_stream(extradata).map_err(|e| refused(e.why))?;
+        match device {
+            Shared::D3d12(raw) => ctx
+                .attach_d3d12_device(device_type, raw.into_raw())
+                .map_err(|e| refused(format!("the host's device: {}", e.why)))?,
+        }
+        ctx.set_option("threads", "auto")
+            .map_err(|e| refused(e.why))?;
+        ctx.open().map_err(|e| refused(e.why))?;
+        eprintln!("[av] decode {codec}: {device_name}, on the host's device");
+        Ok(Decoder {
+            lib,
+            codec: codec.to_string(),
+            want,
+            want_fmt,
+            ctx,
+            engaged: device_name.to_string(),
+            unconfirmed: Some(device_name.to_string()),
+            format: None,
+            frame: Frame::new(lib).map_err(call("av_frame_alloc", codec))?,
+            host: Frame::new(lib).map_err(call("av_frame_alloc", codec))?,
+            packet: Packet::new(lib).map_err(call("av_packet_alloc", codec))?,
+            scaler: None,
+            last: None,
+            shared: true,
         })
     }
 
@@ -315,6 +512,86 @@ impl Decoder {
         picture.map(Some)
     }
 
+    /// As [`receive`](Decoder::receive), except that a decoder opened with
+    /// [`open_shared`](Decoder::open_shared) hands a picture over where it
+    /// is, on the device, when the wanted format is an exact repacking of
+    /// it.
+    pub fn receive_any(&mut self) -> Result<Option<Received>> {
+        match self.ctx.receive_frame(&mut self.frame) {
+            Status::Done => {}
+            Status::Again | Status::Eof => return Ok(None),
+            Status::Failed(e) => return Err(call("avcodec_receive_frame", &self.codec)(e)),
+        }
+        if let Some(held) = self.held_as() {
+            let picture = self.keep(held);
+            self.frame.unref();
+            return picture.map(|p| Some(Received::Device(p)));
+        }
+        let picture = self.convert();
+        self.frame.unref();
+        picture.map(|p| Some(Received::Host(p)))
+    }
+
+    /// The format a picture just received stays on the device in, where
+    /// it does: an `nv12` D3D12 picture, wanted as `yuv420p`.
+    fn held_as(&self) -> Option<&'static str> {
+        if !self.shared || self.want != "yuv420p" {
+            return None;
+        }
+        self.frame.d3d12()?;
+        let nv12 = self.lib.pix_fmt("nv12")?;
+        (self.frame.sw_format()? == nv12).then_some("nv12")
+    }
+
+    /// The picture just received, kept on the device as `pix_fmt`.
+    fn keep(&mut self, pix_fmt: &'static str) -> Result<DeviceFrame> {
+        self.unconfirmed = None;
+        let (width, height) = (self.frame.width(), self.frame.height());
+        if self.format.is_none() {
+            let [range, primaries, trc, space] = self.lib.color_names(self.frame.color());
+            self.format = Some(DecodedFormat {
+                width,
+                height,
+                pix_fmt: self.want.to_string(),
+                coded_pix_fmt: pix_fmt.to_string(),
+                color: Color {
+                    range,
+                    primaries,
+                    trc,
+                    space,
+                },
+            });
+        }
+        let (pts, duration) = self.timing();
+        let mut frame = Frame::new(self.lib).map_err(call("av_frame_alloc", &self.codec))?;
+        frame
+            .take(&mut self.frame)
+            .map_err(call("av_frame_ref", &self.codec))?;
+        Ok(DeviceFrame {
+            pts,
+            duration,
+            width,
+            height,
+            pix_fmt,
+            frame,
+        })
+    }
+
+    /// The picture's own timestamp, else libavcodec's best guess at it,
+    /// else one frame on from the last; and its duration.
+    fn timing(&mut self) -> (i64, Option<i64>) {
+        let duration = self.frame.duration();
+        let last = self.last;
+        let pts = self
+            .frame
+            .pts()
+            .or(self.frame.best_effort_timestamp())
+            .or_else(|| last.map(|(p, d)| p + d.unwrap_or(1)))
+            .unwrap_or(0);
+        self.last = Some((pts, duration));
+        (pts, duration)
+    }
+
     /// The picture just received, in host memory, in the wanted format,
     /// packed.
     fn convert(&mut self) -> Result<DecodedFrame> {
@@ -339,7 +616,6 @@ impl Decoder {
             host,
             scaler,
             format,
-            last,
             ..
         } = self;
 
@@ -398,16 +674,7 @@ impl Decoder {
             host.unref();
         }
 
-        // The picture's own timestamp, else libavcodec's best guess at it,
-        // else one frame on from the last.
-        let duration = frame.duration();
-        let pts = frame
-            .pts()
-            .or(frame.best_effort_timestamp())
-            .or_else(|| last.map(|(p, d)| p + d.unwrap_or(1)))
-            .unwrap_or(0);
-        *last = Some((pts, duration));
-
+        let (pts, duration) = self.timing();
         Ok(DecodedFrame {
             pts,
             duration,

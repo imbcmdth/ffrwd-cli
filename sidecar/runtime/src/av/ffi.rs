@@ -85,6 +85,10 @@ functions! {
         av_hwdevice_get_type_name: FnEnumName,
         av_hwdevice_find_type_by_name: FnFromName,
         av_hwdevice_ctx_create: FnHwDeviceCreate,
+        av_hwdevice_ctx_alloc: FnHwDeviceAlloc,
+        av_hwdevice_ctx_init: FnHwDeviceInit,
+        av_buffer_unref: FnBufferUnref,
+        av_frame_ref: FnFrameRef,
         av_hwframe_transfer_data: FnHwTransfer,
         av_opt_set: FnOptSet,
         av_opt_find: FnOptFind,
@@ -945,6 +949,42 @@ impl CodecCtx {
         Ok(())
     }
 
+    /// Gives the context a `d3d12va` device built around `device`, an
+    /// `ID3D12Device *` whose one reference moves in: the device context
+    /// holds it from then on and releases it when freed, or here when the
+    /// device cannot be made.
+    pub fn attach_d3d12_device(
+        &mut self,
+        device_type: c_int,
+        device: *mut c_void,
+    ) -> std::result::Result<(), AvErr> {
+        let f = &self.lib.f;
+        // SAFETY: the reference av_hwdevice_ctx_alloc returns has a
+        // AVHWDeviceContext as its data, whose hwctx is the d3d12va device
+        // context for a device of `device_type`; on failure the reference is
+        // unreffed, which releases the device set into it.
+        unsafe {
+            let mut made = (f.av_hwdevice_ctx_alloc)(device_type);
+            if made.is_null() {
+                release_com(device);
+                return Err(AvErr {
+                    code: 0,
+                    why: "av_hwdevice_ctx_alloc allocated nothing".to_string(),
+                });
+            }
+            let ctx = (*made).data as *mut AVHWDeviceContext;
+            let hw = (*ctx).hwctx as *mut AVD3D12VADeviceContext;
+            (*hw).device = device;
+            let ret = (f.av_hwdevice_ctx_init)(made);
+            if ret < 0 {
+                (f.av_buffer_unref)(&mut made);
+                return Err(self.lib.err(ret));
+            }
+            (*self.ptr).hw_device_ctx = made;
+        }
+        Ok(())
+    }
+
     /// What an encoder is handed before it opens: the picture's geometry and
     /// pixel format, the time base its timestamps count in, and the frame
     /// rate where one is known.
@@ -1185,6 +1225,43 @@ impl Frame {
         !self.get().hw_frames_ctx.is_null()
     }
 
+    /// The format a picture in device memory holds its pixels in (`nv12`,
+    /// `p010le`), from its frames context; None for one in host memory.
+    pub fn sw_format(&self) -> Option<c_int> {
+        let f = self.get();
+        if f.hw_frames_ctx.is_null() {
+            return None;
+        }
+        // SAFETY: a hardware frame's hw_frames_ctx is a reference to an
+        // AVHWFramesContext, alive while the frame is.
+        unsafe {
+            let frames = (*f.hw_frames_ctx).data as *const AVHWFramesContext;
+            Some((*frames).sw_format)
+        }
+    }
+
+    /// The D3D12 picture a `d3d12` frame's first data pointer names; None
+    /// for any other frame.
+    pub fn d3d12(&self) -> Option<*mut AVD3D12VAFrame> {
+        let f = self.get();
+        let d3d12 = self.lib.pix_fmt("d3d12")?;
+        (f.format == d3d12 && !f.data[0].is_null()).then(|| f.data[0] as *mut AVD3D12VAFrame)
+    }
+
+    /// Moves the picture `from` holds into this frame, which held nothing,
+    /// leaving `from` empty.
+    pub fn take(&mut self, from: &mut Frame) -> std::result::Result<(), AvErr> {
+        self.unref();
+        // SAFETY: two live frames; this one gains references to `from`'s
+        // buffers before `from` drops its own.
+        let ret = unsafe { (self.lib.f.av_frame_ref)(self.ptr, from.ptr) };
+        if ret < 0 {
+            return Err(self.lib.err(ret));
+        }
+        from.unref();
+        Ok(())
+    }
+
     pub fn color(&self) -> RawColor {
         let f = self.get();
         RawColor {
@@ -1318,6 +1395,21 @@ impl Drop for Frame {
         // SAFETY: allocated by av_frame_alloc.
         unsafe { (self.lib.f.av_frame_free)(&mut self.ptr) };
     }
+}
+
+/// Drops one reference to a COM object: `IUnknown::Release`, the third
+/// entry of every COM interface's table.
+///
+/// # Safety
+/// `object` is null or a COM interface pointer the caller holds a
+/// reference to, which this gives up.
+pub(super) unsafe fn release_com(object: *mut c_void) {
+    if object.is_null() {
+        return;
+    }
+    type Release = unsafe extern "system" fn(*mut c_void) -> u32;
+    let table = *(object as *const *const Release);
+    (*table.add(2))(object);
 }
 
 /// An `AVPacket`, from `av_packet_alloc` to `av_packet_free`.

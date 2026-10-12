@@ -8,6 +8,13 @@
 //! `host`, the frame's bytes are fetched, drawn on, and emitted as bytes.
 //! Either way the output is the input with a red box of `size` pixels at
 //! its top-left corner.
+//!
+//! The input is rgba or yuv420p. A texture handed back is rgba, so a
+//! yuv420p input held on the GPU is written in host memory: `out=host`
+//! keeps the output there, and the module reads its planes back from the
+//! device itself, draws the box on the bytes, and emits those. In yuv420p
+//! the box is BT.601 red, (81, 90, 240), over the chroma samples it
+//! covers.
 
 wit_bindgen::generate!({
     path: ["../../wit", "../../wit-gpu", "wit"],
@@ -30,22 +37,35 @@ use ffrwd::gpu::frames::{emit, planes};
 use ffrwd::gpu::types::{FrameMemory, PortMemory};
 use serde::Deserialize;
 use wasi::webgpu::webgpu::{
-    get_gpu, GpuDevice, GpuExtent3D, GpuOrigin3D, GpuTexelCopyBufferLayout,
-    GpuTexelCopyTextureInfo, GpuTextureDescriptor, GpuTextureFormat, GpuTextureUsage,
+    get_gpu, GpuBufferDescriptor, GpuBufferUsage, GpuDevice, GpuExtent3D, GpuMapMode, GpuOrigin3D,
+    GpuTexelCopyBufferInfo, GpuTexelCopyBufferLayout, GpuTexelCopyTextureInfo,
+    GpuTextureDescriptor, GpuTextureFormat, GpuTextureUsage,
 };
 
-const SCHEMA: &str = r#"{"type":"object","properties":{"memory":{"type":"string","enum":["gpu","host"]},"size":{"type":"integer","minimum":1}},"additionalProperties":false}"#;
+const SCHEMA: &str = r#"{"type":"object","properties":{"memory":{"type":"string","enum":["gpu","host"]},"out":{"type":"string","enum":["gpu","host"]},"size":{"type":"integer","minimum":1}},"additionalProperties":false}"#;
 
 /// The box's colour, rgba.
 const COLOUR: [u8; 4] = [255, 0, 0, 255];
+
+/// The box's colour in yuv420p: Y, U, V.
+const YUV: [u8; 3] = [81, 90, 240];
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Params {
     #[serde(default = "gpu")]
     memory: String,
+    /// Where the output is written; `memory`'s unless said.
+    #[serde(default)]
+    out: Option<String>,
     #[serde(default = "eight")]
     size: u32,
+}
+
+impl Params {
+    fn out_on_gpu(&self) -> bool {
+        self.out.as_deref().unwrap_or(&self.memory) == "gpu"
+    }
 }
 
 fn gpu() -> String {
@@ -60,6 +80,7 @@ impl Default for Params {
     fn default() -> Self {
         Params {
             memory: gpu(),
+            out: None,
             size: eight(),
         }
     }
@@ -74,6 +95,9 @@ fn parse(text: &str) -> Result<Params, String> {
     if params.memory != "gpu" && params.memory != "host" {
         return Err(format!("memory is gpu or host, not '{}'", params.memory));
     }
+    if params.memory == "host" && params.out_on_gpu() {
+        return Err("out=gpu takes memory=gpu".to_string());
+    }
     if params.size == 0 {
         return Err("size is above zero".to_string());
     }
@@ -85,7 +109,9 @@ struct State {
     width: u32,
     height: u32,
     size: u32,
+    yuv: bool,
     on_gpu: bool,
+    out_on_gpu: bool,
     device: Option<GpuDevice>,
 }
 
@@ -112,6 +138,88 @@ fn draw(pixels: &mut [u8], width: u32, height: u32, size: u32) {
             pixels[at..at + 4].copy_from_slice(&COLOUR);
         }
     }
+}
+
+/// The planes of a `width` by `height` yuv420p frame: width and height.
+fn yuv_planes(width: u32, height: u32) -> [(u32, u32); 3] {
+    let chroma = (width.div_ceil(2), height.div_ceil(2));
+    [(width, height), chroma, chroma]
+}
+
+/// Draws the box onto `pixels`, a packed `width` by `height` yuv420p frame.
+fn draw_yuv(pixels: &mut [u8], width: u32, height: u32, size: u32) {
+    let side = side(size, width, height);
+    let mut start = 0usize;
+    for (plane, (w, h)) in yuv_planes(width, height).into_iter().enumerate() {
+        let covered = if plane == 0 { side } else { side.div_ceil(2) } as usize;
+        for y in 0..covered {
+            let row = start + y * w as usize;
+            pixels[row..row + covered].fill(YUV[plane]);
+        }
+        start += (w * h) as usize;
+    }
+}
+
+/// Reads the yuv420p planes of frame `index` back from the device, packed
+/// as the wire lays them out.
+fn read_back(state: &State, index: u32) -> Result<Vec<u8>, String> {
+    let device = state
+        .device
+        .as_ref()
+        .ok_or("the device is opened at init")?;
+    let handed = planes(state.v, index)?;
+    let sizes = yuv_planes(state.width, state.height);
+    if handed.len() != sizes.len() {
+        return Err(format!(
+            "a yuv420p frame has 3 planes, and {} came",
+            handed.len()
+        ));
+    }
+    let mut out = Vec::new();
+    for (texture, (w, h)) in handed.iter().zip(sizes) {
+        let padded = w.div_ceil(256) * 256;
+        let buffer = device.create_buffer(&GpuBufferDescriptor {
+            size: u64::from(padded * h),
+            usage: GpuBufferUsage::copy_dst() | GpuBufferUsage::map_read(),
+            mapped_at_creation: None,
+            label: None,
+        });
+        let encoder = device.create_command_encoder(None);
+        encoder.copy_texture_to_buffer(
+            &GpuTexelCopyTextureInfo {
+                texture,
+                mip_level: None,
+                origin: None,
+                aspect: None,
+            },
+            &GpuTexelCopyBufferInfo {
+                buffer: &buffer,
+                offset: None,
+                bytes_per_row: Some(padded),
+                rows_per_image: Some(h),
+            },
+            GpuExtent3D {
+                width: w,
+                height: Some(h),
+                depth_or_array_layers: None,
+            },
+        );
+        device.queue().submit(&[&encoder.finish(None)]);
+        buffer
+            .map_async(GpuMapMode::read(), None, None)
+            .map_err(|_| "mapping a plane's readback".to_string())?;
+        let mapped = buffer
+            .get_mapped_range_get_with_copy(None, None)
+            .map_err(|_| "reading a plane's readback".to_string())?;
+        for row in 0..h as usize {
+            let at = row * padded as usize;
+            out.extend_from_slice(&mapped[at..at + w as usize]);
+        }
+        buffer
+            .unmap()
+            .map_err(|_| "unmapping a plane's readback".to_string())?;
+    }
+    Ok(out)
 }
 
 /// Copies the frame's texture to a new one, draws the box on that with the
@@ -204,7 +312,7 @@ impl Guest for Node {
             window: 1,
             stride: 1,
             accepts: Accepts {
-                pixel_formats: vec!["rgba".to_string()],
+                pixel_formats: vec!["rgba".to_string(), "yuv420p".to_string()],
                 sample_formats: Vec::new(),
                 sample_rates: Vec::new(),
                 channel_counts: Vec::new(),
@@ -245,6 +353,13 @@ impl Guest for Node {
             return Err("v is video".to_string());
         };
         let on_gpu = params.memory == "gpu";
+        let out_on_gpu = params.out_on_gpu();
+        let yuv = format.pix_fmt == "yuv420p";
+        if yuv && out_on_gpu {
+            return Err(
+                "a texture handed back is rgba; a yuv420p input takes out=host".to_string(),
+            );
+        }
         let device = if on_gpu {
             let adapter = get_gpu()
                 .request_adapter(None)
@@ -263,7 +378,9 @@ impl Guest for Node {
                 width: format.width,
                 height: format.height,
                 size: params.size,
+                yuv,
                 on_gpu,
+                out_on_gpu,
                 device,
             })
         });
@@ -280,12 +397,20 @@ impl Guest for Node {
             let state = state.as_ref().ok_or("process before init")?;
             let mut items = Vec::new();
             for frame in tick.frames(state.v) {
-                if state.on_gpu {
+                if state.out_on_gpu {
                     draw_on_gpu(state, frame.pts, frame.duration, frame.index)?;
                     continue;
                 }
-                let mut pixels = tick.fetch(state.v, frame.index);
-                draw(&mut pixels, state.width, state.height, state.size);
+                let mut pixels = if state.on_gpu {
+                    read_back(state, frame.index)?
+                } else {
+                    tick.fetch(state.v, frame.index)
+                };
+                if state.yuv {
+                    draw_yuv(&mut pixels, state.width, state.height, state.size);
+                } else {
+                    draw(&mut pixels, state.width, state.height, state.size);
+                }
                 items.push(Emission {
                     port: "out".to_string(),
                     payload: Payload::Frame(RawFrame {
@@ -306,13 +431,13 @@ impl Guest for Node {
 
 impl PortsGuest for Node {
     fn memory(params: String) -> Vec<PortMemory> {
-        let on_gpu = parse(&params).map(|p| p.memory == "gpu").unwrap_or(false);
-        if !on_gpu {
+        let Ok(params) = parse(&params) else {
             return Vec::new();
-        }
-        ["v", "out"]
-            .into_iter()
-            .map(|port| PortMemory {
+        };
+        let held = [("v", params.memory == "gpu"), ("out", params.out_on_gpu())];
+        held.into_iter()
+            .filter(|(_, on_gpu)| *on_gpu)
+            .map(|(port, _)| PortMemory {
                 port: port.to_string(),
                 memory: FrameMemory::Gpu,
             })
