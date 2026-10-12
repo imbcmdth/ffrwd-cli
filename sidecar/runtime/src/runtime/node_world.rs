@@ -14,18 +14,21 @@ use wasmtime::component::{Component, Resource, ResourceTable};
 use wasmtime::Store;
 use wasmtime_wasi_http::WasiHttpCtx;
 
+#[cfg(feature = "gpu")]
+use super::gpu_ext::GpuModule;
 use super::world_0191::node::exports::ffrwd::av::node as wit;
 use super::world_0191::node::ffrwd::av::{node_tick, node_types as nt, types as wt};
 use super::world_0191::node::NodeModule;
 use super::{
     compile, component_exports, conv_0191, egress, engine, granted, has_export, interface, link,
     wasi_ctx, wasm_err, world_0191, Host, Meta, Purpose, StreamInfo, TimeBase, Wants,
+    GPU_PORTS_EXPORT,
 };
 use crate::node::{
     check_shape, Accepts, Anchor, AudioSpec, Binding, BoundStream, Clock, ColorSpec, Emission,
-    Emitted, Feed, Hold, InputPort, Interval, LikeInput, Node, NodeShape, OutFrame, OutputFormat,
-    OutputPort, Pairing, Payload, PortKind, Rational, RowsUse, StreamFormat, Tick, TickStream,
-    VideoSpec,
+    Emitted, Feed, FrameData, FrameMemory, Hold, InputPort, Interval, LikeInput, Node, NodeShape,
+    OutFrame, OutputFormat, OutputPort, Pairing, Payload, PortKind, Rational, RowsUse,
+    StreamFormat, Tick, TickStream, VideoSpec,
 };
 
 /// The world a node module is built against.
@@ -42,6 +45,18 @@ pub struct TickHandle {
 }
 
 impl TickHandle {
+    /// Frame `index` of stream `id` this tick, for `ffrwd:gpu/frames`.
+    #[cfg(feature = "gpu")]
+    pub(crate) fn frame(&self, id: u32, index: u32) -> wasmtime::Result<&crate::node::TickFrame> {
+        let frames = &self.stream(id)?.frames;
+        frames.get(index as usize).ok_or_else(|| {
+            wasmtime::Error::msg(format!(
+                "frame {index} of stream {id} asked of a tick handing {}",
+                frames.len()
+            ))
+        })
+    }
+
     fn stream(&self, id: u32) -> wasmtime::Result<&TickStream> {
         if !self.bound.iter().any(|b| b.id == id) {
             return Err(wasmtime::Error::msg(format!(
@@ -169,7 +184,13 @@ impl node_tick::HostTick for Host {
                 frames.len()
             ))
         })?;
-        Ok(frame.data.as_ref().clone())
+        // A frame on the GPU is read back here, once, and kept: `fetch` is
+        // the one download a module asks for.
+        let bytes = frame
+            .data
+            .bytes()
+            .map_err(|e| wasmtime::Error::msg(format!("frame {index} of stream {id}: {e}")))?;
+        Ok(bytes.as_ref().clone())
     }
 
     fn messages(
@@ -254,7 +275,16 @@ pub fn exports_node(module_path: &str) -> Result<bool> {
     Ok(has_export(&component, &interface("node", NODE_WORLD)))
 }
 
-fn instantiate_node(module_path: &str, purpose: Purpose) -> Result<(Store<Host>, NodeModule)> {
+/// A node module as instantiated: the node world, and the companion
+/// `ffrwd:gpu` package where the module exports it.
+struct Instantiated {
+    store: Store<Host>,
+    node: NodeModule,
+    #[cfg(feature = "gpu")]
+    gpu: Option<GpuModule>,
+}
+
+fn instantiate_node(module_path: &str, purpose: Purpose) -> Result<Instantiated> {
     let component = compile(module_path)?;
     check_node_export(&component, module_path)?;
     let (linker, nn, gpu) = link(&component, module_path, purpose)?;
@@ -269,12 +299,40 @@ fn instantiate_node(module_path: &str, purpose: Purpose) -> Result<(Store<Host>,
             http: WasiHttpCtx::new(),
             hooks: egress::Hooks::new(policy),
             gpu,
+            gpu_tick: None,
+            gpu_emitted: Vec::new(),
         },
     );
-    let instance = NodeModule::instantiate(&mut store, &component, &linker)
+    let instance = linker
+        .instantiate(&mut store, &component)
         .map_err(wasm_err)
         .with_context(|| format!("instantiating {module_path}"))?;
-    Ok((store, instance))
+    let node = NodeModule::new(&mut store, &instance)
+        .map_err(wasm_err)
+        .with_context(|| format!("binding the node world of {module_path}"))?;
+    #[cfg(feature = "gpu")]
+    let gpu = if has_export(&component, GPU_PORTS_EXPORT) {
+        Some(
+            GpuModule::new(&mut store, &instance)
+                .map_err(wasm_err)
+                .with_context(|| format!("binding {GPU_PORTS_EXPORT} of {module_path}"))?,
+        )
+    } else {
+        None
+    };
+    #[cfg(not(feature = "gpu"))]
+    if has_export(&component, GPU_PORTS_EXPORT) && purpose == Purpose::Run {
+        bail!(
+            "{module_path} exports {GPU_PORTS_EXPORT}, and this ffrwd-wasm was built without GPU \
+             support (the `gpu` cargo feature)"
+        );
+    }
+    Ok(Instantiated {
+        store,
+        node,
+        #[cfg(feature = "gpu")]
+        gpu,
+    })
 }
 
 fn check_node_export(component: &Component, module_path: &str) -> Result<()> {
@@ -294,8 +352,10 @@ fn check_node_export(component: &Component, module_path: &str) -> Result<()> {
 
 /// A node module's `describe()`.
 pub fn describe_node(module_path: &str) -> Result<Meta> {
-    let (mut store, instance) = instantiate_node(module_path, Purpose::Describe)?;
-    let m = instance
+    let Instantiated {
+        mut store, node, ..
+    } = instantiate_node(module_path, Purpose::Describe)?;
+    let m = node
         .ffrwd_av_node()
         .call_describe(&mut store)
         .map_err(wasm_err)?;
@@ -305,18 +365,28 @@ pub fn describe_node(module_path: &str) -> Result<Meta> {
 /// A node module's `shape(params, bound)`, checked: the module's own refusal
 /// names it, and so does the host's.
 pub fn node_shape(module_path: &str, params: &str, bound: &[Binding]) -> Result<NodeShape> {
-    let (mut store, instance) = instantiate_node(module_path, Purpose::Describe)?;
-    let name = instance
+    let mut made = instantiate_node(module_path, Purpose::Describe)?;
+    let name = made
+        .node
         .ffrwd_av_node()
-        .call_describe(&mut store)
+        .call_describe(&mut made.store)
         .map_err(wasm_err)?
         .name;
-    shape_of(&mut store, &instance, &name, params, bound)
+    shape_of(
+        &mut made.store,
+        &made.node,
+        #[cfg(feature = "gpu")]
+        made.gpu.as_ref(),
+        &name,
+        params,
+        bound,
+    )
 }
 
 fn shape_of(
     store: &mut Store<Host>,
     instance: &NodeModule,
+    #[cfg(feature = "gpu")] gpu: Option<&GpuModule>,
     name: &str,
     params: &str,
     bound: &[Binding],
@@ -342,15 +412,71 @@ fn shape_of(
         .call_shape(&mut *store, params, &told)
         .map_err(wasm_err)?
         .map_err(|e| anyhow!("{name} refused the shape: {e}"))?;
-    let shape = shape_from_wit(answered, name)?;
+    #[cfg_attr(not(feature = "gpu"), allow(unused_mut))]
+    let mut shape = shape_from_wit(answered, name)?;
+    #[cfg(feature = "gpu")]
+    if let Some(gpu) = gpu {
+        let memory = gpu
+            .ffrwd_gpu_ports()
+            .call_memory(&mut *store, params)
+            .map_err(wasm_err)?;
+        apply_memory(&mut shape, &memory, name)?;
+    }
     check_shape(&shape, bound, name)?;
     Ok(shape)
+}
+
+/// What `ffrwd:gpu/ports.memory` said, written onto the shape: each port
+/// named is held on the GPU. A port the shape does not declare, or one
+/// that is not a video port, is refused.
+#[cfg(feature = "gpu")]
+fn apply_memory(
+    shape: &mut NodeShape,
+    memory: &[super::gpu_ext::ffrwd::gpu::types::PortMemory],
+    name: &str,
+) -> Result<()> {
+    use super::gpu_ext::ffrwd::gpu::types::FrameMemory as Wit;
+    for entry in memory {
+        let held = match entry.memory {
+            Wit::Host => FrameMemory::Host,
+            Wit::Gpu => FrameMemory::Gpu,
+        };
+        if let Some(port) = shape.inputs.iter_mut().find(|p| p.name == entry.port) {
+            if port.kind != PortKind::Video && held == FrameMemory::Gpu {
+                bail!(
+                    "{name}: ffrwd:gpu/ports holds input '{}' on the GPU, and it is {}; only a \
+                     video port is",
+                    port.name,
+                    port.kind.name()
+                );
+            }
+            port.accepts.memory = held;
+        } else if let Some(port) = shape.outputs.iter_mut().find(|p| p.name == entry.port) {
+            if port.kind != PortKind::Video && held == FrameMemory::Gpu {
+                bail!(
+                    "{name}: ffrwd:gpu/ports holds output '{}' on the GPU, and it is {}; only a \
+                     video port is",
+                    port.name,
+                    port.kind.name()
+                );
+            }
+            port.memory = held;
+        } else {
+            bail!(
+                "{name}: ffrwd:gpu/ports names '{}', which its shape does not declare",
+                entry.port
+            );
+        }
+    }
+    Ok(())
 }
 
 /// One instance of a node module.
 pub struct WitNode {
     store: Store<Host>,
     instance: NodeModule,
+    #[cfg(feature = "gpu")]
+    gpu: Option<GpuModule>,
     meta: Meta,
     shape: NodeShape,
     /// The inputs the call bound, as `shape` was told them, which
@@ -377,15 +503,29 @@ impl WitNode {
         declared: &[Binding],
         latched: &[String],
     ) -> Result<WitNode> {
-        let (mut store, instance) = instantiate_node(module_path, Purpose::Run)?;
+        let mut made = instantiate_node(module_path, Purpose::Run)?;
         let meta = world_0191::meta(
-            instance
+            made.node
                 .ffrwd_av_node()
-                .call_describe(&mut store)
+                .call_describe(&mut made.store)
                 .map_err(wasm_err)?,
         );
         let bindings: Vec<Binding> = declared.to_vec();
-        let shape = shape_of(&mut store, &instance, &meta.name, params, &bindings)?;
+        let shape = shape_of(
+            &mut made.store,
+            &made.node,
+            #[cfg(feature = "gpu")]
+            made.gpu.as_ref(),
+            &meta.name,
+            params,
+            &bindings,
+        )?;
+        let Instantiated {
+            mut store,
+            node: instance,
+            #[cfg(feature = "gpu")]
+            gpu,
+        } = made;
         check_bound(&shape, &bound, &meta.name)?;
         for wanted in latched {
             if shape.output_index(wanted).is_none() {
@@ -417,6 +557,8 @@ impl WitNode {
         Ok(WitNode {
             store,
             instance,
+            #[cfg(feature = "gpu")]
+            gpu,
             meta,
             shape,
             bindings,
@@ -484,6 +626,8 @@ impl Node for WitNode {
         let shape = shape_of(
             &mut self.store,
             &self.instance,
+            #[cfg(feature = "gpu")]
+            self.gpu.as_ref(),
             &name,
             params,
             &self.bindings,
@@ -515,19 +659,23 @@ impl Node for WitNode {
             })
             .map_err(|e| anyhow!("entering a tick into the resource table: {e}"))?;
         let handle = Resource::new_borrow(entry.rep());
+        self.store.data_mut().gpu_tick = Some(entry.rep());
         let produced = self
             .instance
             .ffrwd_av_node()
             .call_process(&mut self.store, handle)
             .map_err(wasm_err);
-        let held = self
-            .store
-            .data_mut()
+        let host = self.store.data_mut();
+        host.gpu_tick = None;
+        let handed = std::mem::take(&mut host.gpu_emitted);
+        let held = host
             .table
             .delete(entry)
             .map_err(|e| anyhow!("reclaiming a tick from the resource table: {e}"))?;
         let produced = produced?.map_err(|e| anyhow!("{name}: {e}"))?;
-        self.emitted(produced, &held.tick)
+        let mut emitted = self.emitted(produced, &held.tick)?;
+        self.handed(&mut emitted, handed)?;
+        Ok(emitted)
     }
 }
 
@@ -553,7 +701,7 @@ impl WitNode {
                         Payload::Frame(OutFrame {
                             pts: f.pts,
                             duration: f.duration,
-                            data: Arc::new(f.data),
+                            data: FrameData::Host(Arc::new(f.data)),
                             rows: Vec::new(),
                         }),
                         Some(f.pts),
@@ -631,7 +779,7 @@ impl WitNode {
 
     /// The buffer behind a `same`: frame `index` of stream `id` this tick,
     /// in the port's own format.
-    fn same(&self, port: usize, same: &wit::SameFrame, tick: &Tick) -> Result<Arc<Vec<u8>>> {
+    fn same(&self, port: usize, same: &wit::SameFrame, tick: &Tick) -> Result<FrameData> {
         let name = &self.meta.name;
         let output = &self.shape.outputs[port].name;
         let Some(bound) = self.bound.iter().find(|b| b.id == same.id) else {
@@ -678,7 +826,7 @@ impl WitNode {
                 );
             }
         }
-        Ok(Arc::clone(&frame.data))
+        Ok(frame.data.clone())
     }
 
     /// An output's format as the shape and the bound streams settle it.
@@ -864,6 +1012,7 @@ fn shape_from_wit(shape: nt::NodeShape, name: &str) -> Result<NodeShape> {
             time_base: p.time_base.map(rational_from_wit),
             latency: p.latency,
             schema: p.schema,
+            memory: FrameMemory::Host,
             row: p.row,
         });
     }
@@ -914,6 +1063,7 @@ fn shape_from_wit(shape: nt::NodeShape, name: &str) -> Result<NodeShape> {
                         wt::Wants::Timing => Wants::Timing,
                     },
                     like: p.accepts.like,
+                    memory: FrameMemory::Host,
                 },
                 schema: p.schema,
             })
@@ -964,4 +1114,53 @@ fn output_format_from_wit(format: nt::OutputFormat, name: &str) -> Result<Output
             sample_format: l.sample_format,
         }),
     })
+}
+
+impl WitNode {
+    /// The frames `ffrwd:gpu/frames.emit` handed over during the call,
+    /// after the items the call returned, each checked against its port
+    /// as a returned frame is.
+    #[cfg(feature = "gpu")]
+    fn handed(&mut self, emitted: &mut Emitted, handed: Vec<super::GpuEmission>) -> Result<()> {
+        let name = &self.meta.name;
+        for item in handed {
+            let Some(port) = self.shape.output_index(&item.port) else {
+                bail!(
+                    "{name} handed a texture over on '{}', which is no output of its shape",
+                    item.port
+                );
+            };
+            let kind = self.shape.outputs[port].kind;
+            check_kind(name, &item.port, kind, "a frame", kind.is_frames())?;
+            if let Some(last) = self.last[port] {
+                if item.pts < last {
+                    bail!(
+                        "{name} handed a frame over on '{}' at {}, behind the {last} it last left \
+                         at",
+                        item.port,
+                        item.pts
+                    );
+                }
+            }
+            self.last[port] = Some(item.pts);
+            emitted.items.push(Emission {
+                port,
+                payload: Payload::Frame(OutFrame {
+                    pts: item.pts,
+                    duration: item.duration,
+                    data: FrameData::Gpu(item.frame),
+                    rows: Vec::new(),
+                }),
+            });
+        }
+        Ok(())
+    }
+
+    #[cfg(not(feature = "gpu"))]
+    fn handed(&mut self, _emitted: &mut Emitted, handed: Vec<super::GpuEmission>) -> Result<()> {
+        match handed.into_iter().next() {
+            None => Ok(()),
+            Some(super::GpuEmission(never)) => match never {},
+        }
+    }
 }

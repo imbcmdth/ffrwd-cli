@@ -1,0 +1,15 @@
+{
+  "name": "ffrwd/gpu",
+  "version": "0.1.0",
+  "description": "The ffrwd:gpu wit package a node module includes beside ffrwd:av to hold its frames on the sidecar's GPU: this version's number is the package's. Assets only - no exports, no recipes, no module.",
+  "license": "MIT",
+  "files": [
+    "wit/"
+  ],
+  "keywords": [
+    "wit",
+    "wasm",
+    "sdk",
+    "gpu"
+  ]
+}

@@ -1860,7 +1860,27 @@ struct Host {
     /// module granted `-gpu`, one with no backends otherwise.
     #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
     gpu: StoreGpu,
+    /// The tick a `process` call is reading, as its entry in `table`, for
+    /// `ffrwd:gpu/frames.planes`; none outside a call.
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+    gpu_tick: Option<u32>,
+    /// What `ffrwd:gpu/frames.emit` handed over during the call, taken by
+    /// the node world once the call returns.
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+    gpu_emitted: Vec<GpuEmission>,
 }
+
+/// A frame a module handed over as a texture during one `process` call.
+#[cfg(feature = "gpu")]
+pub struct GpuEmission {
+    pub port: String,
+    pub pts: i64,
+    pub duration: Option<i64>,
+    pub frame: std::sync::Arc<crate::gpu::frames::GpuFrame>,
+}
+
+#[cfg(not(feature = "gpu"))]
+pub struct GpuEmission(std::convert::Infallible);
 
 impl WasiView for Host {
     fn ctx(&mut self) -> WasiCtxView<'_> {
@@ -1881,11 +1901,135 @@ impl WasiHttpView for Host {
     }
 }
 
+/// `ffrwd:gpu@0.1.0`, the companion of the node world for frames on the
+/// GPU: `ports` a module exports beside `node`, `frames` it imports. The
+/// webgpu types are the vendored host's, so a texture is one type on both
+/// sides.
+#[cfg(feature = "gpu")]
+pub(crate) mod gpu_ext {
+    wasmtime::component::bindgen!({
+        path: "../wit-gpu",
+        world: "gpu-module",
+        require_store_data_send: true,
+        with: {
+            "wasi:io": wasmtime_wasi_io::bindings::wasi::io,
+            "wasi:webgpu/webgpu": wasi_webgpu_wasmtime::wasi::webgpu::webgpu,
+            "wasi:graphics-context/graphics-context": wasi_webgpu_wasmtime::wasi::graphics_context::graphics_context,
+        },
+        imports: { default: trappable },
+    });
+}
+
+/// The export a module makes beside `node` to say which ports are on the
+/// GPU, and the import it reads frames through.
+pub const GPU_PORTS_EXPORT: &str = "ffrwd:gpu/ports@0.1.0";
+pub const GPU_FRAMES_IMPORT: &str = "ffrwd:gpu/frames@0.1.0";
+
+#[cfg(feature = "gpu")]
+impl gpu_ext::ffrwd::gpu::frames::Host for Host {
+    fn planes(
+        &mut self,
+        id: u32,
+        index: u32,
+    ) -> wasmtime::Result<Result<Vec<Resource<wasi_webgpu_wasmtime::Texture>>, String>> {
+        use wasi_webgpu_wasmtime::reexports::wgpu_types;
+        let Some(rep) = self.gpu_tick else {
+            return Ok(Err(
+                "planes is called while process runs, and no call is running".to_string(),
+            ));
+        };
+        let handle: &node_world::TickHandle = self.table.get(&Resource::new_borrow(rep))?;
+        let frame = match handle.frame(id, index) {
+            Ok(frame) => frame,
+            Err(e) => return Ok(Err(e.to_string())),
+        };
+        let Some(gpu) = frame.data.gpu() else {
+            return Ok(Err(format!(
+                "frame {index} of stream {id} is in host memory: its input is not held on the \
+                 GPU (ffrwd:gpu/ports names the inputs that are)"
+            )));
+        };
+        let planes: Vec<_> = gpu.planes().to_vec();
+        let mut handles = Vec::with_capacity(planes.len());
+        for plane in planes {
+            let texture = wasi_webgpu_wasmtime::Texture::shared(
+                plane.texture,
+                wgpu_types::Extent3d {
+                    width: plane.width,
+                    height: plane.height,
+                    depth_or_array_layers: 1,
+                },
+                plane.format,
+                wgpu_types::TextureUsages::TEXTURE_BINDING | wgpu_types::TextureUsages::COPY_SRC,
+            );
+            handles.push(self.table.push(texture)?);
+        }
+        Ok(Ok(handles))
+    }
+
+    fn emit(
+        &mut self,
+        port: String,
+        pts: i64,
+        duration: Option<i64>,
+        texture: Resource<wasi_webgpu_wasmtime::Texture>,
+    ) -> wasmtime::Result<Result<(), String>> {
+        use wasi_webgpu_wasmtime::reexports::wgpu_types;
+        let texture = self.table.delete(texture)?;
+        if texture.is_shared() {
+            return Ok(Err(format!(
+                "the texture handed over on '{port}' is one planes handed out; a frame passed \
+                 through unchanged is payload.same"
+            )));
+        }
+        if self.gpu_tick.is_none() {
+            return Ok(Err(
+                "emit is called while process runs, and no call is running".to_string(),
+            ));
+        }
+        let needed =
+            wgpu_types::TextureUsages::TEXTURE_BINDING | wgpu_types::TextureUsages::COPY_SRC;
+        if !texture.usage().contains(needed) {
+            return Ok(Err(format!(
+                "the texture handed over on '{port}' was made with usage {:?}; a frame needs \
+                 texture-binding and copy-src",
+                texture.usage()
+            )));
+        }
+        if texture.mip_level_count() != 1
+            || texture.sample_count() != 1
+            || texture.dimension() != wgpu_types::TextureDimension::D2
+        {
+            return Ok(Err(format!(
+                "the texture handed over on '{port}' is not a single-level, single-sample 2D texture"
+            )));
+        }
+        let size = texture.size();
+        let frame = match crate::gpu::frames::GpuFrame::adopt(
+            texture.texture_id(),
+            size.width,
+            size.height,
+            texture.format(),
+        ) {
+            Ok(frame) => frame,
+            Err(e) => return Ok(Err(e.to_string())),
+        };
+        self.gpu_emitted.push(GpuEmission {
+            port,
+            pts,
+            duration,
+            frame,
+        });
+        Ok(Ok(()))
+    }
+}
+
 #[cfg(feature = "gpu")]
 impl wasi_webgpu_wasmtime::WasiWebGpuView for Host {
     fn webgpu(&mut self) -> wasi_webgpu_wasmtime::WasiWebGpuCtx<'_> {
         wasi_webgpu_wasmtime::WasiWebGpuCtx {
             instance: &self.gpu.instance,
+            shared: self.gpu.shared.as_ref(),
             table: &mut self.table,
         }
     }
@@ -2185,6 +2329,11 @@ fn link(
     }
     if wants_gpu {
         gpu::add_to_linker(&mut linker, component)?;
+    }
+    #[cfg(feature = "gpu")]
+    if imports_interface(component, GPU_FRAMES_IMPORT) {
+        gpu_ext::ffrwd::gpu::frames::add_to_linker::<_, HasSelf<_>>(&mut linker, |h| h)
+            .map_err(wasm_err)?;
     }
 
     let nn = if wants_nn {
@@ -3273,6 +3422,8 @@ fn instantiate(module_path: &str, purpose: Purpose) -> Result<Opened> {
             http: WasiHttpCtx::new(),
             hooks: egress::Hooks::new(policy),
             gpu,
+            gpu_tick: None,
+            gpu_emitted: Vec::new(),
         },
     );
 
@@ -3721,6 +3872,8 @@ fn instantiate_values(
             http: WasiHttpCtx::new(),
             hooks: egress::Hooks::new(policy),
             gpu,
+            gpu_tick: None,
+            gpu_emitted: Vec::new(),
         },
     );
 
@@ -4342,6 +4495,8 @@ fn instantiate_packet(
             http: WasiHttpCtx::new(),
             hooks: egress::Hooks::new(policy),
             gpu,
+            gpu_tick: None,
+            gpu_emitted: Vec::new(),
         },
     );
     let context = || format!("instantiating {module_path}");
@@ -4806,6 +4961,8 @@ fn instantiate_packet_filter(
             http: WasiHttpCtx::new(),
             hooks: egress::Hooks::new(policy),
             gpu,
+            gpu_tick: None,
+            gpu_emitted: Vec::new(),
         },
     );
     let context = || format!("instantiating {module_path}");
@@ -5556,6 +5713,8 @@ fn instantiate_packet_source(
             http: WasiHttpCtx::new(),
             hooks: egress::Hooks::new(policy),
             gpu,
+            gpu_tick: None,
+            gpu_emitted: Vec::new(),
         },
     );
     let context = || format!("instantiating {module_path}");
@@ -5924,6 +6083,8 @@ fn instantiate_data_filter(
             http: WasiHttpCtx::new(),
             hooks: egress::Hooks::new(policy),
             gpu,
+            gpu_tick: None,
+            gpu_emitted: Vec::new(),
         },
     );
     let context = || format!("instantiating {module_path}");
@@ -6434,6 +6595,8 @@ fn instantiate_codec(module_path: &str, purpose: Purpose) -> Result<(Store<Host>
             http: WasiHttpCtx::new(),
             hooks: egress::Hooks::new(policy),
             gpu,
+            gpu_tick: None,
+            gpu_emitted: Vec::new(),
         },
     );
     let context = || format!("instantiating {module_path}");
@@ -6985,6 +7148,8 @@ fn instantiate_rows_module(
             http: WasiHttpCtx::new(),
             hooks: egress::Hooks::new(policy),
             gpu,
+            gpu_tick: None,
+            gpu_emitted: Vec::new(),
         },
     );
     let context = || format!("instantiating {module_path}");
@@ -7857,6 +8022,8 @@ mod socket_grant_test {
             http: WasiHttpCtx::new(),
             hooks: egress::Hooks::new(policy),
             gpu: StoreGpu::new(false),
+            gpu_tick: None,
+            gpu_emitted: Vec::new(),
         }
     }
 
@@ -7960,6 +8127,8 @@ mod udp_grant_test {
                 http: WasiHttpCtx::new(),
                 hooks: egress::Hooks::new(policy),
                 gpu,
+                gpu_tick: None,
+                gpu_emitted: Vec::new(),
             },
         );
         let instance = linker

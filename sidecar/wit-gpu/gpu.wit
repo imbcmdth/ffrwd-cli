@@ -1,0 +1,82 @@
+// ffrwd:gpu 0.1.0: frames a node reads and writes on the GPU.
+//
+// A companion to the node world (`ffrwd:av@0.19.1`), beside which a module
+// includes it. The node world is unchanged: a module that reads its
+// pictures as textures of the sidecar's device, and hands pictures back
+// as textures, exports `ports` to say which of its ports those are and
+// imports `frames` to reach them. Every texture is on the one device the
+// module's `wasi:webgpu` answers, so nothing is copied between the host's
+// frames and the module's own textures.
+//
+// A port held on the GPU is still a video port of the node world: its
+// frames arrive in `tick.frames` with their times, `fetch` still answers
+// with bytes (a download, done once per frame), and `same` still passes a
+// frame through. What `frames` adds is the planes as textures and a way to
+// emit a texture.
+
+package ffrwd:gpu@0.1.0;
+
+interface types {
+  /// Where a port's frames are held.
+  enum frame-memory {
+    /// In host memory, crossing into the module on `fetch`: the node
+    /// world's own way, and every port's unless `ports.memory` says gpu.
+    host,
+    /// On the sidecar's device. An input's frames reach the module as
+    /// textures through `frames.planes`; an output's leave through
+    /// `frames.emit`.
+    gpu,
+  }
+
+  /// One port's memory, by the port's name in the node's shape.
+  record port-memory {
+    port: string,
+    memory: frame-memory,
+  }
+}
+
+/// What a module declares beside its shape.
+interface ports {
+  use types.{port-memory};
+
+  /// For the shape `shape(params, bound)` of the node world answers with
+  /// these params: the ports whose frames are held on the GPU. A port not
+  /// named is host memory. An input named here takes frames in the
+  /// formats the sidecar holds on the GPU (rgba, yuv420p, yuv422p,
+  /// yuv444p), one texture per plane; an output named here is written
+  /// through `frames.emit` as rgba. A name the shape does not declare, or
+  /// a port that is not a video port, is refused by the host.
+  memory: func(params: string) -> list<port-memory>;
+}
+
+/// The frames of the tick being processed, as textures of the module's
+/// device, and the way a texture leaves.
+interface frames {
+  use wasi:webgpu/webgpu@0.0.1.{gpu-texture};
+
+  /// The planes of frame `index` of stream `id` this tick, as the node
+  /// world's `tick.frames` numbers it, one texture per plane in the wire's
+  /// plane order: one `rgba8unorm` texture for rgba, three `r8unorm`
+  /// textures for a planar yuv format, the chroma planes at their own
+  /// size. The textures are the host's: valid for this call, read-only to
+  /// the module (`texture-binding` and `copy-src`), and dropping the
+  /// handle drops nothing. A stream not bound to a port held on the GPU,
+  /// or an index past the tick's frames, is an error.
+  planes: func(id: u32, index: u32) -> result<list<gpu-texture>, string>;
+
+  /// Hands a texture the module made on its device to the host as a frame
+  /// on output `port`, at `pts` in the port's time base, as `payload.frame`
+  /// would. The texture is `rgba8unorm`, `texture-binding` and `copy-src`
+  /// at least, and the port's size; the host takes it, and the module's
+  /// handle is spent. The frame leaves after the items `process` returns
+  /// on that port, in the order emitted. A texture `planes` handed over is
+  /// refused: a frame passed through unchanged is `payload.same`.
+  emit: func(port: string, pts: s64, duration: option<s64>, texture: gpu-texture) -> result<_, string>;
+}
+
+/// What a module includes beside `ffrwd:av/node-module`.
+world gpu-module {
+  import wasi:webgpu/webgpu@0.0.1;
+  import frames;
+  export ports;
+}

@@ -39,6 +39,7 @@ __all__ = [
     "Binding",
     "Clock",
     "Hold",
+    "Memory",
     "InputPort",
     "Interval",
     "NodeShape",
@@ -62,10 +63,12 @@ AnchorKind = Literal["shared-clock", "first-frame", "tagged"]
 ClockKind = Literal["input", "rate", "rate-of", "self-clocked"]
 FormatKind = Literal["video", "audio", "data", "packets", "like"]
 Wants = Literal["all", "keyframes", "first", "timing"]
+Memory = Literal["host", "gpu"]
 
 _PORT_KINDS: tuple[PortKind, ...] = ("video", "audio", "data", "packets")
 _ROWS_USES: tuple[RowsUse, ...] = ("ignore", "per-frame", "state")
 _WANTS: tuple[Wants, ...] = ("all", "keyframes", "first", "timing")
+_MEMORIES: tuple[Memory, ...] = ("host", "gpu")
 _ANCHORS: tuple[AnchorKind, ...] = ("shared-clock", "first-frame", "tagged")
 
 _SHAPE_FLAG = "--shape"
@@ -132,6 +135,9 @@ class Accepts:
     codecs: tuple[str, ...] = ()
     wants: Wants = "all"
     like: str | None = None
+    # Where the port's frames are held: on the sidecar's GPU for a module
+    # declaring so beside its shape, else in host memory.
+    memory: Memory = "host"
 
 
 @dataclass(frozen=True)
@@ -182,6 +188,7 @@ class OutputPort:
     latency: float = 0.0
     schema: Mapping[str, object] | None = None
     row: int | None = None
+    memory: Memory = "host"
 
 
 @dataclass(frozen=True)
@@ -414,6 +421,7 @@ def _accepts(value: object) -> Accepts:
         codecs=_texts(value.get("codecs")),
         wants=cast(Wants, _choice(value.get("wants"), _WANTS, "all")),
         like=_text(value.get("like")),
+        memory=cast(Memory, _choice(value.get("memory"), _MEMORIES, "host")),
     )
 
 
@@ -515,6 +523,7 @@ def _output_port(value: object, module: str) -> OutputPort:
         latency=max(_number(raw.get("latency")) or 0.0, 0.0),
         schema=_schema(raw.get("schema")),
         row=_whole(raw.get("row")),
+        memory=cast(Memory, _choice(raw.get("memory"), _MEMORIES, "host")),
     )
 
 

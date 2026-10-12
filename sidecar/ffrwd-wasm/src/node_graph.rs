@@ -16,8 +16,8 @@ use std::thread;
 use anyhow::{anyhow, bail, Context, Result};
 use ffrwd_wasm::nut;
 use ffrwd_wasm_runtime::node::{
-    Binding as PortBinding, BoundStream, Clock, Node, NodeShape, OutputFormat, Pairing, PortKind,
-    Rational, RowsUse, StreamFormat, StreamHint, TickFrame,
+    Binding as PortBinding, BoundStream, Clock, FrameMemory, Node, NodeShape, OutputFormat,
+    Pairing, PortKind, Rational, RowsUse, StreamFormat, StreamHint, TickFrame,
 };
 use ffrwd_wasm_runtime::runtime::{
     self, AudioFormat, Format, FormatOf, Media, Message, Packet, RenditionMeta, StreamInfo,
@@ -31,7 +31,7 @@ use crate::feeds::{self, FeedMember, FeedSpec};
 use crate::graph::{self, NodeCall, NodePad, StreamClass, StreamRef, ROWS_PORT};
 use crate::heartbeat;
 use crate::host_nodes;
-use crate::lanes::{Consumer, Intake, LaneSpec, Opener, Plan, PortOut, Scheduler};
+use crate::lanes::{Consumer, GpuSpec, Intake, LaneSpec, Opener, Plan, PortOut, Scheduler};
 use crate::leaky::{self, Leaky};
 use crate::network::{params_json, parse_schema, Binding};
 use crate::older;
@@ -389,13 +389,13 @@ fn pump(
                     (StreamFormat::Audio(a), true) => TickFrame {
                         pts: packet.pts,
                         duration: Some((payload.len() / a.sample_len().max(1)) as i64),
-                        data: Arc::new(Vec::new()),
+                        data: Arc::new(Vec::new()).into(),
                         rows: Vec::new(),
                     },
                     (_, true) => TickFrame {
                         pts: packet.pts,
                         duration: None,
-                        data: Arc::new(Vec::new()),
+                        data: Arc::new(Vec::new()).into(),
                         rows: Vec::new(),
                     },
                     (_, false) => {
@@ -405,7 +405,7 @@ fn pump(
                         TickFrame {
                             pts: packet.pts,
                             duration: None,
-                            data: Arc::new(payload.to_vec()),
+                            data: Arc::new(payload.to_vec()).into(),
                             rows: Vec::new(),
                         }
                     }
@@ -1390,8 +1390,10 @@ fn open_module(
         })
     };
     let assembler = Assembler::new(&resolved, &bound, name, &port_fed)?;
+    let gpu = gpu_streams(&resolved, &bound);
     Ok(Opening {
         spec: LaneSpec {
+            gpu,
             name: name.to_string(),
             state: state_streams(&resolved, &bound),
             bound: bound.iter().map(|b| b.id).collect(),
@@ -1407,6 +1409,32 @@ fn open_module(
         outputs,
         feeds,
     })
+}
+
+/// The streams bound to inputs the node holds on the GPU, each with the
+/// format its frames are put there in: the stream's own, which
+/// `check_accepts` has held to the formats the GPU holds.
+fn gpu_streams(shape: &NodeShape, bound: &[BoundStream]) -> HashMap<u32, GpuSpec> {
+    bound
+        .iter()
+        .filter_map(|b| {
+            let port = shape.input(&b.port)?;
+            if port.accepts.memory != FrameMemory::Gpu || port.accepts.wants == Wants::Timing {
+                return None;
+            }
+            let StreamFormat::Video(v) = &b.format else {
+                return None;
+            };
+            Some((
+                b.id,
+                GpuSpec {
+                    pix_fmt: v.pix_fmt.to_string(),
+                    width: v.width,
+                    height: v.height,
+                },
+            ))
+        })
+        .collect()
 }
 
 /// The streams as the node is told them at `init`: one re-stamped onto the
@@ -1861,6 +1889,7 @@ fn open_old_filter(
     let assembler = Assembler::new(&shape, &bound, name, &[])?;
     Ok(Opening {
         spec: LaneSpec {
+            gpu: HashMap::new(),
             name: name.to_string(),
             state: Vec::new(),
             bound: bound.iter().map(|b| b.id).collect(),
@@ -1918,6 +1947,7 @@ fn open_leaky(call: &NodeCall, pads: &[(String, u32)], defs: &[StreamDef]) -> Re
     let assembler = Assembler::new(&shape, &bound, name, &[])?;
     Ok(Opening {
         spec: LaneSpec {
+            gpu: HashMap::new(),
             name: name.clone(),
             state: Vec::new(),
             bound: vec![*id],
@@ -2012,6 +2042,7 @@ fn open_av(call: &NodeCall, pads: &[(String, u32)], defs: &[StreamDef]) -> Resul
     let assembler = Assembler::new(&shape, &bound, name, &[])?;
     Ok(Opening {
         spec: LaneSpec {
+            gpu: HashMap::new(),
             name: name.clone(),
             state: Vec::new(),
             bound: vec![*id],
@@ -2108,6 +2139,7 @@ fn open_host(call: &NodeCall, pads: &[(String, u32)], defs: &[StreamDef]) -> Res
     };
     Ok(Opening {
         spec: LaneSpec {
+            gpu: HashMap::new(),
             name: call.module.clone(),
             state: Vec::new(),
             bound: vec![*id],

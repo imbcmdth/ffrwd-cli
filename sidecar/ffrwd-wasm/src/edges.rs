@@ -16,6 +16,7 @@ use std::thread;
 
 use anyhow::{anyhow, bail, Context, Result};
 use ffrwd_wasm::nut::{self, Event, Limits, PushDemuxer};
+use ffrwd_wasm_runtime::node::FrameData;
 use ffrwd_wasm_runtime::runtime::{self, Message, Packet, TimeBase};
 
 use crate::heartbeat::{self, Beats};
@@ -125,7 +126,7 @@ impl Opened {
 pub enum Out {
     Frame {
         pts: i64,
-        data: Arc<Vec<u8>>,
+        data: FrameData,
         /// The rows riding it, between older modules.
         rows: Vec<String>,
     },
@@ -512,7 +513,9 @@ fn write_one<W: Write>(
             if track.coded {
                 bail!("a frame reached output stream {index}, which carries coded packets");
             }
-            muxer.write_frame_to(index, pts, &data)?;
+            // A frame on the GPU is read back at the edge, once.
+            let bytes = data.bytes()?;
+            muxer.write_frame_to(index, pts, &bytes)?;
         }
         Out::Packet(packet) => {
             let framed = nut::Packet {
@@ -573,6 +576,9 @@ pub fn spawn_sink(
             while let Some((_, out)) = next(&shared, &*wake) {
                 match out {
                     Out::Frame { pts, data, rows } => {
+                        // An older module's sink reads bytes: a frame on
+                        // the GPU is read back here, once.
+                        let data = data.bytes()?;
                         batch.push(runtime::Frame { pts, data, rows })
                     }
                     Out::Batch => sink.write(&module, &std::mem::take(&mut batch))?,

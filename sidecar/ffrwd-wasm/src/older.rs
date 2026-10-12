@@ -110,11 +110,19 @@ impl Node for HostFrames {
                 });
             }
         }
-        let frames = first.frames.into_iter().map(|f| Frame {
-            pts: f.pts,
-            data: f.data,
-            rows: f.rows,
-        });
+        // An older module reads bytes: a frame on the GPU is read back here.
+        let frames = first
+            .frames
+            .into_iter()
+            .map(|f| {
+                Ok(Frame {
+                    pts: f.pts,
+                    data: f.data.bytes()?,
+                    rows: f.rows,
+                })
+            })
+            .collect::<Result<Vec<Frame>>>()?
+            .into_iter();
         let trailing = first.trailing;
         let processed = match &mut self.runner {
             Runner::Rows(rows) => Processed {
@@ -159,7 +167,7 @@ impl Node for HostFrames {
                 payload: Payload::Frame(OutFrame {
                     pts: f.pts,
                     duration: None,
-                    data: f.data,
+                    data: f.data.into(),
                     rows: f.rows,
                 }),
             })
@@ -295,6 +303,7 @@ pub fn run(
             .collect();
         let lockstep = Lockstep::new(seed.shape, &seed.format, pads.len());
         specs.push(LaneSpec {
+            gpu: HashMap::new(),
             name: seed.name,
             intake: Intake::Windows {
                 lockstep,
@@ -395,7 +404,7 @@ fn feed(reader: &mut Input, input: usize, format: &Format, scheduler: &Scheduler
         let frame = TickFrame {
             pts,
             duration: None,
-            data: Arc::new(std::mem::take(&mut buf)),
+            data: Arc::new(std::mem::take(&mut buf)).into(),
             rows: reader.take_rows(pts),
         };
         if !scheduler.arrive(id, Item::Frame(frame)) {

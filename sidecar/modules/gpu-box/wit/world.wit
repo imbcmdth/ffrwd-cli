@@ -1,0 +1,9 @@
+package ffrwd:gpu-box;
+
+/// A node that draws a box on each frame, holding the frames on the GPU
+/// where its params say so: the node world beside `ffrwd:gpu`, which
+/// imports `wasi:webgpu` and so needs a `-gpu` grant to run at all.
+world gpu-box {
+  include ffrwd:av/node-module@0.19.1;
+  include ffrwd:gpu/gpu-module@0.1.0;
+}

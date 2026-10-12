@@ -245,7 +245,7 @@ filters, option setting), written against the pinned version's headers.
 
   `runtime/src/gpu.rs` tries Vulkan before D3D12 today; on Windows the
   order flips, since every decoder there is a D3D11 or D3D12 object.
-- Synchronisation is the API's: fences and shared semaphores where the
+- Synchronisation is the API's own: its signals and shared semaphores where the
   decoder and the device are two objects, a stream sync on the CUDA
   import in the first cut, timeline semaphores later. A device-to-device
   copy into a pool slot stays as the fallback for a decoder that cannot
@@ -702,6 +702,63 @@ Acceptance: the benchmark recipe runs at real time on the L4 and on the
 owner's Windows machine with the encoder as the only thing above 50% of
 its engine; no raw frame bytes in system memory on the path, by the
 profile rows; the readback and upload rows of the experiment's table gone.
+
+**Shipped, first slice (2026-10-12, on this branch, from the cloud
+session; not yet run on a machine with a GPU):** items 1, 2 and 4 in a
+form that keeps the node world at 0.19.1, and the compiler half of 7.
+
+- One device per process. `runtime/src/gpu.rs` opens one wgpu device the
+  first time anything asks (`shared_device()`: the platform's preferred
+  backends in order, the features the pool and the filters want), and the
+  vendored host answers every store's `request-adapter` and
+  `request-device` with it, refusing a request whose features or limits
+  exceed the device's. Dropping a module's device handle drops nothing.
+  A machine with no adapter answers `request-adapter` with none, as
+  before, and `--shape` and the host-memory path still run.
+- The pool. `runtime/src/gpu/frames.rs`: `GpuFrame`, one texture per
+  plane in the formats the wire carries (rgba as `rgba8unorm`; yuv420p,
+  yuv422p, yuv444p as `r8unorm` planes at their own size), uploaded from
+  host bytes or adopted from a texture a module made. `bytes()` downloads
+  once and keeps the copy, so a frame leaving on a raw edge, or fetched
+  by a module as bytes, costs one readback and no more.
+- Frames carry where they are. `FrameData::{Host, Gpu}` on tick frames
+  and output frames (`runtime/src/node.rs`); every reader of frame bytes
+  in `ffrwd-wasm/src` goes through `bytes()`, so older worlds, raw
+  edges, holds and `same` work unchanged over a GPU frame. The shape
+  carries `memory` on each input's `accepts` and on each output
+  (`host` unless said otherwise), in the JSON and in
+  `cli/ffrwd/shapes.py`.
+- The companion package, not a world bump. `sidecar/wit-gpu/gpu.wit` is
+  `ffrwd:gpu@0.1.0`: `ports.memory(params)` the module exports beside
+  `shape`, and `frames.planes`/`frames.emit` it imports. A module
+  includes `ffrwd:gpu/gpu-module` beside `ffrwd:av/node-module@0.19.1`;
+  the host binds the package only on a module that exports `ports`
+  (`runtime/src/runtime.rs`, `node_world.rs`). `ffrwd/gpu@0.1.0` is the
+  registry package (`sidecar/wasm-gpu`), staged by the release workflow
+  the way `ffrwd/wasm` is. Section 2.2's `0.20.0` is not needed for
+  this; it stays for the day the node world itself changes.
+- Lane intake uploads. A stream bound to an input held on the GPU is
+  uploaded as it arrives at the lane (`lanes.rs`, `Lane::resident`),
+  so a module sees textures today over a raw edge, with the decoder's
+  interop (items 3 and 5) to replace that upload with the decoder's own
+  images. A module emitting a texture hands it to the host, which
+  adopts it as the frame and lets it leave after the items `process`
+  returned on that port.
+- Tests. `modules/gpu-box` (node world plus `ffrwd:gpu`, `memory=gpu`
+  or `host`) and `ffrwd-wasm/tests/gpu_frames.rs`: the shape says which
+  ports are held where, the host path draws the box, and the GPU path
+  is checked against it byte for byte where an adapter exists, skipping
+  with a note where none does. Here there is none, so the GPU case is
+  unrun; it is the local session's to run first.
+
+Still open in this wave: items 3, 5, 6, 6a and 8; of 7, the partition
+routing a region by its entry port's memory (today a region takes coded
+edges by `SET ffrwd.edges = 'coded'` only) waits on item 5, since until
+the decoder's images land in the pool a coded entry buys the region
+nothing a raw one does not; `GPU_JOBS` stays until the local session
+measures it with the device shared. The pool holds no per-frame colour:
+a frame's colour is its stream's, as the NUT header has it, and the
+decode node settles that header before the first frame.
 
 ### Wave 4: inference on the GPU
 

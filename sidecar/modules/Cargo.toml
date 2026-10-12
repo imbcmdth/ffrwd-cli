@@ -24,6 +24,7 @@ members = [
     "transcribe",
     "nn-probe",
     "gpu-probe",
+    "gpu-box",
     "depth",
     "segment",
     "mask_select",

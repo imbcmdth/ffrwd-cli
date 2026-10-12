@@ -85,6 +85,10 @@ pub struct LaneSpec {
     pub intake: Intake,
     /// The streams bound to its inputs, by id.
     pub bound: Vec<u32>,
+    /// The streams bound to inputs held on the GPU, each with the format
+    /// its frames are uploaded in: a frame arriving in host memory is put
+    /// on the GPU as it enters the lane.
+    pub gpu: HashMap<u32, GpuSpec>,
     /// The stream ids whose rows the node keeps as state.
     pub state: Vec<u32>,
     pub tick_base: TimeBase,
@@ -97,6 +101,15 @@ pub struct LaneSpec {
     /// or not as it hands it on, and a picture queued after that is later
     /// than it was judged.
     pub unbuffered: bool,
+}
+
+/// The format a stream's frames are held on the GPU in, for a lane whose
+/// input is there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GpuSpec {
+    pub pix_fmt: String,
+    pub width: u32,
+    pub height: u32,
 }
 
 /// Who reads a stream: a lane, or one stream of an output.
@@ -176,6 +189,7 @@ struct Lane {
     clock: ClockKind,
     base: TimeBase,
     bound: Vec<u32>,
+    gpu: HashMap<u32, GpuSpec>,
     state: Vec<u32>,
     queue: VecDeque<Task>,
     next_ordinal: u64,
@@ -201,6 +215,53 @@ struct Lane {
     /// When a rate clock whose inputs all arrive unpaired last cut a tick.
     turned: Option<Instant>,
     unbuffered: bool,
+}
+
+impl Lane {
+    /// `item` as this lane takes it: a frame of a stream bound to an input
+    /// held on the GPU is put there as it arrives, once, when it is still
+    /// in host memory. Everything else is handed on as it is.
+    fn resident(&self, stream: u32, item: &Item) -> Result<Item> {
+        let Some(spec) = self.gpu.get(&stream) else {
+            return Ok(item.clone());
+        };
+        let Item::Frame(frame) = item else {
+            return Ok(item.clone());
+        };
+        let bytes = match &frame.data {
+            ffrwd_wasm_runtime::node::FrameData::Host(bytes) if !bytes.is_empty() => bytes,
+            _ => return Ok(item.clone()),
+        };
+        #[cfg(feature = "gpu")]
+        {
+            let uploaded = ffrwd_wasm_runtime::gpu::frames::GpuFrame::upload(
+                &spec.pix_fmt,
+                spec.width,
+                spec.height,
+                Arc::clone(bytes),
+            )
+            .with_context(|| {
+                format!(
+                    "{}: putting a frame of stream {stream} on the GPU",
+                    self.name
+                )
+            })?;
+            Ok(Item::Frame(TickFrame {
+                pts: frame.pts,
+                duration: frame.duration,
+                data: ffrwd_wasm_runtime::node::FrameData::Gpu(uploaded),
+                rows: frame.rows.clone(),
+            }))
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            let _ = (spec, bytes);
+            bail!(
+                "{}: an input held on the GPU, and this ffrwd-wasm was built without GPU support",
+                self.name
+            )
+        }
+    }
 }
 
 struct State {
@@ -319,8 +380,9 @@ impl State {
                     if lane.stopped {
                         continue;
                     }
+                    let item = lane.resident(stream, &item)?;
                     match &mut lane.intake {
-                        LaneIntake::Assembled(a) => a.arrive(stream, item.clone())?,
+                        LaneIntake::Assembled(a) => a.arrive(stream, item)?,
                         LaneIntake::Host { events, .. } => {
                             if let Item::Message(m) = &item {
                                 events.push_back(HostEvent::Message(m.clone()));
@@ -328,9 +390,11 @@ impl State {
                         }
                         LaneIntake::Windows { lockstep, pads, .. } => {
                             let Item::Frame(f) = &item else { continue };
+                            // An older module's window reads bytes: a frame
+                            // on the GPU is read back here, once.
                             let frame = Frame {
                                 pts: f.pts,
-                                data: Arc::clone(&f.data),
+                                data: f.data.bytes()?,
                                 rows: f.rows.clone(),
                             };
                             let count = pads.len();
@@ -981,7 +1045,7 @@ fn out_of(item: &Item) -> Out {
     match item {
         Item::Frame(f) => Out::Frame {
             pts: f.pts,
-            data: Arc::clone(&f.data),
+            data: f.data.clone(),
             rows: f.rows.clone(),
         },
         Item::Message(m) => Out::Message(m.clone()),
@@ -1065,6 +1129,7 @@ impl Scheduler {
                 clock,
                 base: spec.tick_base,
                 bound: spec.bound,
+                gpu: spec.gpu,
                 state: spec.state,
                 queue: VecDeque::new(),
                 next_ordinal: 0,
@@ -1453,6 +1518,7 @@ mod tests {
         };
         let plan = Plan {
             lanes: vec![LaneSpec {
+                gpu: HashMap::new(),
                 name: "publish".to_string(),
                 shape,
                 intake: Intake::Assembled(Box::new(assembler)),
@@ -1475,7 +1541,7 @@ mod tests {
             let frame = TickFrame {
                 pts: epoch + k,
                 duration: None,
-                data: Arc::new(vec![0; 16]),
+                data: Arc::new(vec![0; 16]).into(),
                 rows: Vec::new(),
             };
             assert!(scheduler.arrive(0, Item::Frame(frame)));

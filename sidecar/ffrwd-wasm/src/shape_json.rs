@@ -243,6 +243,7 @@ fn accepts_json(accepts: &Accepts) -> Value {
         "codecs": accepts.codecs,
         "wants": wants_name(accepts.wants),
         "like": accepts.like,
+        "memory": accepts.memory.written(),
     })
 }
 
@@ -255,6 +256,7 @@ fn output_json(port: &OutputPort) -> Value {
         "latency": port.latency,
         "schema": port.schema,
         "row": port.row,
+        "memory": port.memory.written(),
     })
 }
 

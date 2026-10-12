@@ -778,7 +778,7 @@ impl Assembler {
                     TickFrame {
                         pts: message.pts,
                         duration: None,
-                        data: Arc::new(message.data),
+                        data: Arc::new(message.data).into(),
                         rows: Vec::new(),
                     },
                 );
@@ -1160,7 +1160,7 @@ impl Assembler {
                         self.audio_pts = Some(frame.pts);
                     }
                     self.audio_buffered += sample_count(frame, audio.sample_len());
-                    self.audio_buffer.extend_from_slice(&frame.data);
+                    self.audio_buffer.extend_from_slice(frame.data.host());
                     input.queue.pop_front();
                 }
                 let have = self.audio_buffered;
@@ -1277,7 +1277,7 @@ impl Assembler {
                             audio.sample_rate,
                             input.base,
                         )),
-                        data: Arc::new(data),
+                        data: Arc::new(data).into(),
                         rows: Vec::new(),
                     });
                 }
@@ -1527,7 +1527,7 @@ fn recut(
         total += take;
         let timing = frame.data.is_empty();
         if !timing {
-            data.extend_from_slice(&frame.data[..take * width]);
+            data.extend_from_slice(&frame.data.host()[..take * width]);
         }
         if take == samples {
             queue.pop_front();
@@ -1537,8 +1537,8 @@ fn recut(
             pts: frame.pts + samples_to_ticks(take as i64, audio.sample_rate, audio_base),
             duration: timing.then_some((samples - take) as i64),
             data: match timing {
-                true => Arc::new(Vec::new()),
-                false => Arc::new(frame.data[take * width..].to_vec()),
+                true => Arc::new(Vec::new()).into(),
+                false => Arc::new(frame.data.host()[take * width..].to_vec()).into(),
             },
             rows: Vec::new(),
         };
@@ -1553,7 +1553,7 @@ fn recut(
     Ok(Some(TickFrame {
         pts,
         duration: Some(samples_to_ticks(samples, audio.sample_rate, audio_base)),
-        data: Arc::new(data),
+        data: Arc::new(data).into(),
         rows: Vec::new(),
     }))
 }
@@ -1651,7 +1651,7 @@ mod tests {
         Item::Frame(TickFrame {
             pts,
             duration: None,
-            data: Arc::new(vec![0; 16]),
+            data: Arc::new(vec![0; 16]).into(),
             rows: rows.iter().map(|r| r.to_string()).collect(),
         })
     }
@@ -1660,7 +1660,7 @@ mod tests {
         Item::Frame(TickFrame {
             pts,
             duration: None,
-            data: Arc::new(vec![0; count * 4]),
+            data: Arc::new(vec![0; count * 4]).into(),
             rows: Vec::new(),
         })
     }

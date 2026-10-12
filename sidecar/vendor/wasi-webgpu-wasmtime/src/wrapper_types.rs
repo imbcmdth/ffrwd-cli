@@ -129,6 +129,8 @@ pub struct Device {
     pub(crate) queue: Arc<wgpu_core::id::QueueId>,
     pub(crate) adapter: Arc<wgpu_core::id::AdapterId>,
     pub(crate) error_handler: Arc<ErrorHandler>,
+    /// The process's shared device: dropping the handle drops nothing.
+    pub(crate) shared: bool,
 }
 
 #[derive(Clone)]
@@ -148,6 +150,65 @@ pub struct Texture {
     pub(crate) dimension: wgpu_types::TextureDimension,
     pub(crate) format: wgpu_types::TextureFormat,
     pub(crate) usage: wgpu_types::TextureUsages,
+    /// The host's own, handed to the guest for one call: dropping the
+    /// handle drops nothing, and handing it back as a frame is refused.
+    pub(crate) shared: bool,
+}
+
+impl Texture {
+    /// A texture the host owns, as a guest handle: a 2D, single-level,
+    /// single-sample texture of `format` the host made.
+    pub fn shared(
+        texture_id: wgpu_core::id::TextureId,
+        size: wgpu_types::Extent3d,
+        format: wgpu_types::TextureFormat,
+        usage: wgpu_types::TextureUsages,
+    ) -> Texture {
+        Texture {
+            texture_id,
+            error_handler: Arc::new(ErrorHandler::default()),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu_types::TextureDimension::D2,
+            format,
+            usage,
+            shared: true,
+        }
+    }
+
+    pub fn texture_id(&self) -> wgpu_core::id::TextureId {
+        self.texture_id
+    }
+
+    pub fn size(&self) -> wgpu_types::Extent3d {
+        self.size
+    }
+
+    pub fn format(&self) -> wgpu_types::TextureFormat {
+        self.format
+    }
+
+    pub fn usage(&self) -> wgpu_types::TextureUsages {
+        self.usage
+    }
+
+    pub fn mip_level_count(&self) -> u32 {
+        self.mip_level_count
+    }
+
+    pub fn sample_count(&self) -> u32 {
+        self.sample_count
+    }
+
+    pub fn dimension(&self) -> wgpu_types::TextureDimension {
+        self.dimension
+    }
+
+    /// Whether the host owns it.
+    pub fn is_shared(&self) -> bool {
+        self.shared
+    }
 }
 
 /// A shader module with what compiling it said, so `get-compilation-info`

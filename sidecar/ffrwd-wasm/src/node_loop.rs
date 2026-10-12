@@ -470,7 +470,7 @@ impl Intake {
                                                 .map(|now| TickFrame {
                                                     pts: now,
                                                     duration: None,
-                                                    data: Arc::new(Vec::new()),
+                                                    data: Arc::new(Vec::new()).into(),
                                                     rows: Vec::new(),
                                                 })
                                                 .into_iter()

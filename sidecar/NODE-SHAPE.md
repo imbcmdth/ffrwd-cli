@@ -128,7 +128,8 @@ Printed on one line; here indented, keys in the WIT's order:
         "channel_counts": [],
         "codecs": [],
         "wants": "all",
-        "like": null
+        "like": null,
+        "memory": "host"
       },
       "schema": null
     },
@@ -156,7 +157,8 @@ Printed on one line; here indented, keys in the WIT's order:
         "channel_counts": [],
         "codecs": [],
         "wants": "all",
-        "like": null
+        "like": null,
+        "memory": "host"
       },
       "schema": null
     },
@@ -182,7 +184,8 @@ Printed on one line; here indented, keys in the WIT's order:
         "channel_counts": [],
         "codecs": [],
         "wants": "all",
-        "like": null
+        "like": null,
+        "memory": "host"
       },
       "schema": "{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\"}}}"
     },
@@ -202,7 +205,8 @@ Printed on one line; here indented, keys in the WIT's order:
         "channel_counts": [],
         "codecs": [],
         "wants": "all",
-        "like": null
+        "like": null,
+        "memory": "host"
       },
       "schema": null
     },
@@ -228,7 +232,8 @@ Printed on one line; here indented, keys in the WIT's order:
         "channel_counts": [],
         "codecs": [],
         "wants": "all",
-        "like": null
+        "like": null,
+        "memory": "host"
       },
       "schema": null
     },
@@ -248,7 +253,8 @@ Printed on one line; here indented, keys in the WIT's order:
         "channel_counts": [],
         "codecs": [],
         "wants": "timing",
-        "like": null
+        "like": null,
+        "memory": "host"
       },
       "schema": null
     }
@@ -261,7 +267,8 @@ Printed on one line; here indented, keys in the WIT's order:
       "time_base": null,
       "latency": 0.0,
       "schema": null,
-      "row": null
+      "row": null,
+      "memory": "host"
     },
     {
       "name": "copy",
@@ -270,7 +277,8 @@ Printed on one line; here indented, keys in the WIT's order:
       "time_base": null,
       "latency": 0.0,
       "schema": null,
-      "row": null
+      "row": null,
+      "memory": "host"
     },
     {
       "name": "canvas",
@@ -279,7 +287,8 @@ Printed on one line; here indented, keys in the WIT's order:
       "time_base": null,
       "latency": 0.0,
       "schema": null,
-      "row": null
+      "row": null,
+      "memory": "host"
     },
     {
       "name": "spots",
@@ -288,7 +297,8 @@ Printed on one line; here indented, keys in the WIT's order:
       "time_base": {"num": 1, "den": 1000000},
       "latency": 0.48,
       "schema": "{\"type\":\"object\",\"properties\":{\"start_t\":{\"type\":\"number\"}}}",
-      "row": null
+      "row": null,
+      "memory": "host"
     }
   ],
   "clock": {"kind": "input", "port": "v"},
@@ -305,6 +315,25 @@ is 0.5. The same module with `--params '{"rate":25}'` and nothing bound
 has `"clock": {"kind": "rate", "num": 25, "den": 1}`, holds `v` and `a`,
 and drops `mask` and `copy`, since an output `like` an unbound input is
 left out.
+
+## Frames on the GPU
+
+A node module may hold a video port's frames on the sidecar's GPU instead
+of in host memory: it includes the companion world `ffrwd:gpu/gpu-module`
+(`sidecar/wit-gpu/gpu.wit`) beside `ffrwd:av/node-module`, which imports
+`wasi:webgpu` and so needs a `-gpu` grant, and exports
+`ffrwd:gpu/ports.memory`, which `--shape` asks with the same params and
+writes onto the record: `"memory": "gpu"` in an input's `accepts` or on
+an output, `"host"` everywhere else. An input held on the GPU takes
+`rgba`, `yuv420p`, `yuv422p` or `yuv444p`, one texture per plane; an
+output held there is written as `rgba` through `ffrwd:gpu/frames.emit`.
+The host refuses a port the shape does not declare and a port that is not
+video. A module of the node world alone, or of an older world, has
+`"memory": "host"` on every port.
+
+`modules/gpu-box` is the test module: `--params '{"memory":"gpu"}'` holds
+`v` and `out` on the GPU, `{"memory":"host"}` holds neither, and the two
+write the same bytes.
 
 ## Modules of older worlds
 
@@ -353,7 +382,8 @@ port says video.
         "channel_counts": [],
         "codecs": [],
         "wants": "all",
-        "like": null
+        "like": null,
+        "memory": "host"
       },
       "schema": null
     },
@@ -373,7 +403,8 @@ port says video.
         "channel_counts": [],
         "codecs": [],
         "wants": "all",
-        "like": null
+        "like": null,
+        "memory": "host"
       },
       "schema": null
     }
@@ -386,7 +417,8 @@ port says video.
       "time_base": null,
       "latency": 0.0,
       "schema": null,
-      "row": null
+      "row": null,
+      "memory": "host"
     },
     {
       "name": "rows",
@@ -395,7 +427,8 @@ port says video.
       "time_base": null,
       "latency": 0.0,
       "schema": "{\"type\":\"object\",\"properties\":{\"x\":{\"type\":\"integer\"},\"y\":{\"type\":\"integer\"},\"w\":{\"type\":\"integer\"},\"h\":{\"type\":\"integer\"}},\"required\":[\"x\",\"y\",\"w\",\"h\"],\"additionalProperties\":false}",
-      "row": null
+      "row": null,
+      "memory": "host"
     }
   ],
   "clock": {"kind": "input", "port": "in0"},

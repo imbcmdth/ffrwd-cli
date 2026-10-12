@@ -178,7 +178,32 @@ pub struct Accepts {
     pub codecs: Vec<String>,
     pub wants: Wants,
     pub like: Option<String>,
+    /// Where the port's frames are held: `ffrwd:gpu/ports` names the
+    /// ports on the GPU, every other is host memory.
+    pub memory: FrameMemory,
 }
+
+/// Where a port's frames are held, as `ffrwd:gpu/ports` declares it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FrameMemory {
+    #[default]
+    Host,
+    Gpu,
+}
+
+impl FrameMemory {
+    /// The spelling the shape JSON and the compiler use.
+    pub fn written(self) -> &'static str {
+        match self {
+            FrameMemory::Host => "host",
+            FrameMemory::Gpu => "gpu",
+        }
+    }
+}
+
+/// The wire pixel formats a frame on the GPU is held in, one texture per
+/// plane: what an input held on the GPU accepts.
+pub const GPU_PIX_FMTS: [&str; 4] = ["rgba", "yuv420p", "yuv422p", "yuv444p"];
 
 impl Default for Accepts {
     fn default() -> Self {
@@ -190,6 +215,7 @@ impl Default for Accepts {
             codecs: Vec::new(),
             wants: Wants::All,
             like: None,
+            memory: FrameMemory::Host,
         }
     }
 }
@@ -261,6 +287,9 @@ pub struct OutputPort {
     pub latency: f64,
     pub schema: Option<String>,
     pub row: Option<u32>,
+    /// Where the port's frames are written: on the GPU, through
+    /// `ffrwd:gpu/frames.emit`, or in host memory as `payload.frame`.
+    pub memory: FrameMemory,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -362,7 +391,7 @@ pub struct Feed {
 pub struct TickFrame {
     pub pts: i64,
     pub duration: Option<i64>,
-    pub data: Arc<Vec<u8>>,
+    pub data: FrameData,
     pub rows: Vec<String>,
 }
 
@@ -371,9 +400,96 @@ impl From<crate::runtime::Frame> for TickFrame {
         TickFrame {
             pts: frame.pts,
             duration: None,
-            data: frame.data,
+            data: FrameData::Host(frame.data),
             rows: frame.rows,
         }
+    }
+}
+
+/// Where a held frame's pixels or samples are: in host memory, packed as
+/// the wire lays them out, or on the process's GPU, one texture per plane.
+///
+/// Everything that reads bytes calls [`FrameData::bytes`]: for a host frame
+/// that is the buffer itself, for a GPU frame a download the first time
+/// and the cached copy after, so an older module or a raw edge reading a
+/// frame the decoder put on the GPU still works, at the cost of that one
+/// copy. A GPU-aware reader asks for the texture instead and copies nothing.
+#[derive(Clone)]
+pub enum FrameData {
+    Host(Arc<Vec<u8>>),
+    Gpu(Arc<crate::gpu::frames::GpuFrame>),
+}
+
+impl FrameData {
+    /// The bytes, packed as the wire lays them out. A GPU frame is
+    /// downloaded once and kept.
+    pub fn bytes(&self) -> anyhow::Result<Arc<Vec<u8>>> {
+        match self {
+            FrameData::Host(bytes) => Ok(Arc::clone(bytes)),
+            FrameData::Gpu(frame) => frame.bytes(),
+        }
+    }
+
+    /// How many bytes the frame is on the wire, without downloading one
+    /// that is on the GPU.
+    pub fn len(&self) -> usize {
+        match self {
+            FrameData::Host(bytes) => bytes.len(),
+            FrameData::Gpu(frame) => frame.wire_len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The buffer of a frame that is never on the GPU: a run of samples or
+    /// a message, which the host holds in host memory by construction.
+    pub fn host(&self) -> &Arc<Vec<u8>> {
+        match self {
+            FrameData::Host(bytes) => bytes,
+            FrameData::Gpu(frame) => {
+                panic!("a sound or message frame is never on the GPU, and this one is: {frame:?}")
+            }
+        }
+    }
+
+    /// The frame on the GPU, where it is there.
+    pub fn gpu(&self) -> Option<&Arc<crate::gpu::frames::GpuFrame>> {
+        match self {
+            FrameData::Host(_) => None,
+            FrameData::Gpu(frame) => Some(frame),
+        }
+    }
+
+    /// Whether two frames are the same buffer or the same texture.
+    pub fn same_as(&self, other: &FrameData) -> bool {
+        match (self, other) {
+            (FrameData::Host(a), FrameData::Host(b)) => Arc::ptr_eq(a, b),
+            (FrameData::Gpu(a), FrameData::Gpu(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+}
+
+impl std::fmt::Debug for FrameData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FrameData::Host(bytes) => write!(f, "Host({} bytes)", bytes.len()),
+            FrameData::Gpu(frame) => write!(f, "Gpu({frame:?})"),
+        }
+    }
+}
+
+impl From<Arc<Vec<u8>>> for FrameData {
+    fn from(bytes: Arc<Vec<u8>>) -> Self {
+        FrameData::Host(bytes)
+    }
+}
+
+impl From<Vec<u8>> for FrameData {
+    fn from(bytes: Vec<u8>) -> Self {
+        FrameData::Host(Arc::new(bytes))
     }
 }
 
@@ -423,7 +539,7 @@ impl Tick {
 pub struct OutFrame {
     pub pts: i64,
     pub duration: Option<i64>,
-    pub data: Arc<Vec<u8>>,
+    pub data: FrameData,
     /// Old worlds only: the rows riding this frame.
     pub rows: Vec<String>,
 }
@@ -669,6 +785,13 @@ pub fn check_accepts(port: &InputPort, stream: &BoundStream, name: &str) -> Resu
     };
     match &stream.format {
         StreamFormat::Video(v) => {
+            if accepts.memory == FrameMemory::Gpu && !GPU_PIX_FMTS.contains(&v.pix_fmt) {
+                return Err(refused(
+                    "on the GPU the pixel formats",
+                    GPU_PIX_FMTS.join(", "),
+                    v.pix_fmt.to_string(),
+                ));
+            }
             if !accepts.pixel_formats.is_empty()
                 && !accepts.pixel_formats.iter().any(|f| f == v.pix_fmt)
             {
@@ -851,6 +974,7 @@ mod tests {
             time_base: None,
             latency: 0.0,
             schema: None,
+            memory: FrameMemory::Host,
             row: None,
         });
         let message = refusal(&s, &["v"]);

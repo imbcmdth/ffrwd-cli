@@ -17,8 +17,8 @@ use anyhow::{anyhow, bail, Result};
 use ffrwd_wasm::nut;
 use ffrwd_wasm_runtime::av::{self, Decoder, Encoder, Hw, WIRE_PIX_FMTS};
 use ffrwd_wasm_runtime::node::{
-    Accepts, Clock, Emission, Emitted, InputPort, Node, NodeShape, OutFrame, OutputPort, Pairing,
-    Payload, PortKind, Rational, RowsUse, StreamFormat, Tick,
+    Accepts, Clock, Emission, Emitted, FrameMemory, InputPort, Node, NodeShape, OutFrame,
+    OutputPort, Pairing, Payload, PortKind, Rational, RowsUse, StreamFormat, Tick,
 };
 use ffrwd_wasm_runtime::runtime::{
     CodedFormat, CodedStream, ColorInfo, Packet, TimeBase, VideoFormat,
@@ -67,6 +67,7 @@ fn shape(input: PortKind, output: PortKind, base: TimeBase, latency: f64) -> Nod
             time_base,
             latency,
             schema: None,
+            memory: FrameMemory::Host,
             row: None,
         }],
         clock: Clock::SelfClocked,
@@ -236,7 +237,7 @@ impl Decode {
                 payload: Payload::Frame(OutFrame {
                     pts: frame.pts,
                     duration: frame.duration.or(self.duration),
-                    data: Arc::new(frame.data),
+                    data: Arc::new(frame.data).into(),
                     rows: Vec::new(),
                 }),
             });
@@ -535,8 +536,14 @@ impl Node for Encode {
         let mut items = Vec::new();
         for stream in tick.streams {
             for frame in stream.frames {
+                // A frame on the GPU is read back here; the encoder takes
+                // bytes until it reads the device's own frames.
+                let bytes = frame
+                    .data
+                    .bytes()
+                    .map_err(|e| anyhow!("{}: {e}", self.name))?;
                 self.encoder
-                    .send(frame.pts, frame.duration.or(self.duration), &frame.data)
+                    .send(frame.pts, frame.duration.or(self.duration), &bytes)
                     .map_err(|e| anyhow!("{}: {e}", self.name))?;
                 self.drain(&mut items)?;
             }

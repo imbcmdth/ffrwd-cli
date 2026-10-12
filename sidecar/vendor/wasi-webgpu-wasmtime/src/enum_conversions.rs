@@ -666,34 +666,92 @@ fn astc_to_webgpu(
     channel: wgpu_types::AstcChannel,
 ) -> webgpu::GpuTextureFormat {
     match (block, channel) {
-        (wgpu_types::AstcBlock::B4x4, wgpu_types::AstcChannel::Unorm) => webgpu::GpuTextureFormat::Astc4x4Unorm,
-        (wgpu_types::AstcBlock::B4x4, wgpu_types::AstcChannel::UnormSrgb) => webgpu::GpuTextureFormat::Astc4x4UnormSrgb,
-        (wgpu_types::AstcBlock::B5x4, wgpu_types::AstcChannel::Unorm) => webgpu::GpuTextureFormat::Astc5x4Unorm,
-        (wgpu_types::AstcBlock::B5x4, wgpu_types::AstcChannel::UnormSrgb) => webgpu::GpuTextureFormat::Astc5x4UnormSrgb,
-        (wgpu_types::AstcBlock::B5x5, wgpu_types::AstcChannel::Unorm) => webgpu::GpuTextureFormat::Astc5x5Unorm,
-        (wgpu_types::AstcBlock::B5x5, wgpu_types::AstcChannel::UnormSrgb) => webgpu::GpuTextureFormat::Astc5x5UnormSrgb,
-        (wgpu_types::AstcBlock::B6x5, wgpu_types::AstcChannel::Unorm) => webgpu::GpuTextureFormat::Astc6x5Unorm,
-        (wgpu_types::AstcBlock::B6x5, wgpu_types::AstcChannel::UnormSrgb) => webgpu::GpuTextureFormat::Astc6x5UnormSrgb,
-        (wgpu_types::AstcBlock::B6x6, wgpu_types::AstcChannel::Unorm) => webgpu::GpuTextureFormat::Astc6x6Unorm,
-        (wgpu_types::AstcBlock::B6x6, wgpu_types::AstcChannel::UnormSrgb) => webgpu::GpuTextureFormat::Astc6x6UnormSrgb,
-        (wgpu_types::AstcBlock::B8x5, wgpu_types::AstcChannel::Unorm) => webgpu::GpuTextureFormat::Astc8x5Unorm,
-        (wgpu_types::AstcBlock::B8x5, wgpu_types::AstcChannel::UnormSrgb) => webgpu::GpuTextureFormat::Astc8x5UnormSrgb,
-        (wgpu_types::AstcBlock::B8x6, wgpu_types::AstcChannel::Unorm) => webgpu::GpuTextureFormat::Astc8x6Unorm,
-        (wgpu_types::AstcBlock::B8x6, wgpu_types::AstcChannel::UnormSrgb) => webgpu::GpuTextureFormat::Astc8x6UnormSrgb,
-        (wgpu_types::AstcBlock::B8x8, wgpu_types::AstcChannel::Unorm) => webgpu::GpuTextureFormat::Astc8x8Unorm,
-        (wgpu_types::AstcBlock::B8x8, wgpu_types::AstcChannel::UnormSrgb) => webgpu::GpuTextureFormat::Astc8x8UnormSrgb,
-        (wgpu_types::AstcBlock::B10x5, wgpu_types::AstcChannel::Unorm) => webgpu::GpuTextureFormat::Astc10x5Unorm,
-        (wgpu_types::AstcBlock::B10x5, wgpu_types::AstcChannel::UnormSrgb) => webgpu::GpuTextureFormat::Astc10x5UnormSrgb,
-        (wgpu_types::AstcBlock::B10x6, wgpu_types::AstcChannel::Unorm) => webgpu::GpuTextureFormat::Astc10x6Unorm,
-        (wgpu_types::AstcBlock::B10x6, wgpu_types::AstcChannel::UnormSrgb) => webgpu::GpuTextureFormat::Astc10x6UnormSrgb,
-        (wgpu_types::AstcBlock::B10x8, wgpu_types::AstcChannel::Unorm) => webgpu::GpuTextureFormat::Astc10x8Unorm,
-        (wgpu_types::AstcBlock::B10x8, wgpu_types::AstcChannel::UnormSrgb) => webgpu::GpuTextureFormat::Astc10x8UnormSrgb,
-        (wgpu_types::AstcBlock::B10x10, wgpu_types::AstcChannel::Unorm) => webgpu::GpuTextureFormat::Astc10x10Unorm,
-        (wgpu_types::AstcBlock::B10x10, wgpu_types::AstcChannel::UnormSrgb) => webgpu::GpuTextureFormat::Astc10x10UnormSrgb,
-        (wgpu_types::AstcBlock::B12x10, wgpu_types::AstcChannel::Unorm) => webgpu::GpuTextureFormat::Astc12x10Unorm,
-        (wgpu_types::AstcBlock::B12x10, wgpu_types::AstcChannel::UnormSrgb) => webgpu::GpuTextureFormat::Astc12x10UnormSrgb,
-        (wgpu_types::AstcBlock::B12x12, wgpu_types::AstcChannel::Unorm) => webgpu::GpuTextureFormat::Astc12x12Unorm,
-        (wgpu_types::AstcBlock::B12x12, wgpu_types::AstcChannel::UnormSrgb) => webgpu::GpuTextureFormat::Astc12x12UnormSrgb,
-        (block, channel) => unreachable!("ASTC {block:?} {channel:?} is not a WebGPU texture format"),
+        (wgpu_types::AstcBlock::B4x4, wgpu_types::AstcChannel::Unorm) => {
+            webgpu::GpuTextureFormat::Astc4x4Unorm
+        }
+        (wgpu_types::AstcBlock::B4x4, wgpu_types::AstcChannel::UnormSrgb) => {
+            webgpu::GpuTextureFormat::Astc4x4UnormSrgb
+        }
+        (wgpu_types::AstcBlock::B5x4, wgpu_types::AstcChannel::Unorm) => {
+            webgpu::GpuTextureFormat::Astc5x4Unorm
+        }
+        (wgpu_types::AstcBlock::B5x4, wgpu_types::AstcChannel::UnormSrgb) => {
+            webgpu::GpuTextureFormat::Astc5x4UnormSrgb
+        }
+        (wgpu_types::AstcBlock::B5x5, wgpu_types::AstcChannel::Unorm) => {
+            webgpu::GpuTextureFormat::Astc5x5Unorm
+        }
+        (wgpu_types::AstcBlock::B5x5, wgpu_types::AstcChannel::UnormSrgb) => {
+            webgpu::GpuTextureFormat::Astc5x5UnormSrgb
+        }
+        (wgpu_types::AstcBlock::B6x5, wgpu_types::AstcChannel::Unorm) => {
+            webgpu::GpuTextureFormat::Astc6x5Unorm
+        }
+        (wgpu_types::AstcBlock::B6x5, wgpu_types::AstcChannel::UnormSrgb) => {
+            webgpu::GpuTextureFormat::Astc6x5UnormSrgb
+        }
+        (wgpu_types::AstcBlock::B6x6, wgpu_types::AstcChannel::Unorm) => {
+            webgpu::GpuTextureFormat::Astc6x6Unorm
+        }
+        (wgpu_types::AstcBlock::B6x6, wgpu_types::AstcChannel::UnormSrgb) => {
+            webgpu::GpuTextureFormat::Astc6x6UnormSrgb
+        }
+        (wgpu_types::AstcBlock::B8x5, wgpu_types::AstcChannel::Unorm) => {
+            webgpu::GpuTextureFormat::Astc8x5Unorm
+        }
+        (wgpu_types::AstcBlock::B8x5, wgpu_types::AstcChannel::UnormSrgb) => {
+            webgpu::GpuTextureFormat::Astc8x5UnormSrgb
+        }
+        (wgpu_types::AstcBlock::B8x6, wgpu_types::AstcChannel::Unorm) => {
+            webgpu::GpuTextureFormat::Astc8x6Unorm
+        }
+        (wgpu_types::AstcBlock::B8x6, wgpu_types::AstcChannel::UnormSrgb) => {
+            webgpu::GpuTextureFormat::Astc8x6UnormSrgb
+        }
+        (wgpu_types::AstcBlock::B8x8, wgpu_types::AstcChannel::Unorm) => {
+            webgpu::GpuTextureFormat::Astc8x8Unorm
+        }
+        (wgpu_types::AstcBlock::B8x8, wgpu_types::AstcChannel::UnormSrgb) => {
+            webgpu::GpuTextureFormat::Astc8x8UnormSrgb
+        }
+        (wgpu_types::AstcBlock::B10x5, wgpu_types::AstcChannel::Unorm) => {
+            webgpu::GpuTextureFormat::Astc10x5Unorm
+        }
+        (wgpu_types::AstcBlock::B10x5, wgpu_types::AstcChannel::UnormSrgb) => {
+            webgpu::GpuTextureFormat::Astc10x5UnormSrgb
+        }
+        (wgpu_types::AstcBlock::B10x6, wgpu_types::AstcChannel::Unorm) => {
+            webgpu::GpuTextureFormat::Astc10x6Unorm
+        }
+        (wgpu_types::AstcBlock::B10x6, wgpu_types::AstcChannel::UnormSrgb) => {
+            webgpu::GpuTextureFormat::Astc10x6UnormSrgb
+        }
+        (wgpu_types::AstcBlock::B10x8, wgpu_types::AstcChannel::Unorm) => {
+            webgpu::GpuTextureFormat::Astc10x8Unorm
+        }
+        (wgpu_types::AstcBlock::B10x8, wgpu_types::AstcChannel::UnormSrgb) => {
+            webgpu::GpuTextureFormat::Astc10x8UnormSrgb
+        }
+        (wgpu_types::AstcBlock::B10x10, wgpu_types::AstcChannel::Unorm) => {
+            webgpu::GpuTextureFormat::Astc10x10Unorm
+        }
+        (wgpu_types::AstcBlock::B10x10, wgpu_types::AstcChannel::UnormSrgb) => {
+            webgpu::GpuTextureFormat::Astc10x10UnormSrgb
+        }
+        (wgpu_types::AstcBlock::B12x10, wgpu_types::AstcChannel::Unorm) => {
+            webgpu::GpuTextureFormat::Astc12x10Unorm
+        }
+        (wgpu_types::AstcBlock::B12x10, wgpu_types::AstcChannel::UnormSrgb) => {
+            webgpu::GpuTextureFormat::Astc12x10UnormSrgb
+        }
+        (wgpu_types::AstcBlock::B12x12, wgpu_types::AstcChannel::Unorm) => {
+            webgpu::GpuTextureFormat::Astc12x12Unorm
+        }
+        (wgpu_types::AstcBlock::B12x12, wgpu_types::AstcChannel::UnormSrgb) => {
+            webgpu::GpuTextureFormat::Astc12x12UnormSrgb
+        }
+        (block, channel) => {
+            unreachable!("ASTC {block:?} {channel:?} is not a WebGPU texture format")
+        }
     }
 }

@@ -159,6 +159,7 @@ jobs:
         run: |
           python3 - <<'EOF'
           import hashlib
+          import json
           import pathlib
           import shutil
           import subprocess
@@ -176,44 +177,55 @@ jobs:
           # vendored host's wit directory. The copies are made at pack time,
           # here and in the publish invocation printed below, and never
           # checked in.
-          staged = ROOT / "wit"
-          shutil.rmtree(staged, ignore_errors=True)
-          staged.mkdir()
-          shutil.copyfile("sidecar/wit/av.wit", staged / "av.wit")
-          shutil.copytree("sidecar/vendor/wasi-webgpu-wasmtime/wit/deps", staged / "deps")
+          DEPS = "sidecar/vendor/wasi-webgpu-wasmtime/wit/deps"
 
-          archive = store.pack(ROOT)
-          digest = hashlib.sha256(archive).hexdigest()
-          request = f"{WIT_PACKAGE}@{WORLD_VERSION}"
-          print(f"{ROOT} packs to sha256 {digest} ({len(archive)} bytes)")
+          # `ffrwd/gpu` is the companion package a node module includes to
+          # hold frames on the GPU; it versions on its own and stages the
+          # same way, its one wit file beside the same deps.
+          GPU_ROOT = pathlib.Path("sidecar/wasm-gpu")
+          gpu_manifest = json.loads((GPU_ROOT / "ffrwd.json").read_text())
 
-          try:
-              release = packages.resolve(request)
-          except FfrwdError as err:
-              print(f"{request} did not resolve: {err}")
-              print("if that is because the world moved, its package has to follow.")
-              print("From a checkout of this tag:")
-              print()
-              print("    cp sidecar/wit/av.wit sidecar/wasm/wit/av.wit")
-              print("    cp -r sidecar/vendor/wasi-webgpu-wasmtime/wit/deps sidecar/wasm/wit/deps")
-              print("    cd sidecar/wasm && ffrwd publish")
-              print()
-              print(f"which ships the {len(archive)} bytes hashing to {digest}.")
-              # FFRWD_TOKEN rides the environment from the repository secret --
-              # the same token `ffrwd login` saves on a machine.
-              subprocess.run(["ffrwd", "publish"], cwd=ROOT, check=True)
-          else:
-              print(
-                  f"{request} is published already: sha256 {release.sha256} "
-                  f"({release.size} bytes). A version publishes once, and the "
-                  "world has not moved, so there is nothing to do."
-              )
-              if release.sha256 != digest:
+          def publish(root, wit, request):
+              staged = root / "wit"
+              shutil.rmtree(staged, ignore_errors=True)
+              staged.mkdir()
+              shutil.copyfile(wit, staged / pathlib.Path(wit).name)
+              shutil.copytree(DEPS, staged / "deps")
+
+              archive = store.pack(root)
+              digest = hashlib.sha256(archive).hexdigest()
+              print(f"{root} packs to sha256 {digest} ({len(archive)} bytes)")
+
+              try:
+                  release = packages.resolve(request)
+              except FfrwdError as err:
+                  print(f"{request} did not resolve: {err}")
+                  print("if that is because the wit moved, its package has to follow.")
+                  print("From a checkout of this tag:")
+                  print()
+                  print(f"    cp {wit} {staged / pathlib.Path(wit).name}")
+                  print(f"    cp -r {DEPS} {staged / 'deps'}")
+                  print(f"    cd {root} && ffrwd publish")
+                  print()
+                  print(f"which ships the {len(archive)} bytes hashing to {digest}.")
+                  # FFRWD_TOKEN rides the environment from the repository secret --
+                  # the same token `ffrwd login` saves on a machine.
+                  subprocess.run(["ffrwd", "publish"], cwd=root, check=True)
+              else:
                   print(
-                      "The digests differ. The archive is over BYTES and sidecar/ is "
-                      "checked out with the platform's line endings, so that is what "
-                      "this is unless the wit itself changed."
+                      f"{request} is published already: sha256 {release.sha256} "
+                      f"({release.size} bytes). A version publishes once, and the "
+                      "wit has not moved, so there is nothing to do."
                   )
+                  if release.sha256 != digest:
+                      print(
+                          "The digests differ. The archive is over BYTES and sidecar/ is "
+                          "checked out with the platform's line endings, so that is what "
+                          "this is unless the wit itself changed."
+                      )
+
+          publish(ROOT, "sidecar/wit/av.wit", f"{WIT_PACKAGE}@{WORLD_VERSION}")
+          publish(GPU_ROOT, "sidecar/wit-gpu/gpu.wit", f"{gpu_manifest['name']}@{gpu_manifest['version']}")
           EOF
 
 

@@ -775,13 +775,13 @@ fn drain(
                     Convert::Timing { audio } => TickFrame {
                         pts: packet.pts,
                         duration: audio.map(|width| (payload.len() / width.max(1)) as i64),
-                        data: Arc::new(Vec::new()),
+                        data: Arc::new(Vec::new()).into(),
                         rows: Vec::new(),
                     },
                     Convert::Picture(picture) => TickFrame {
                         pts: packet.pts,
                         duration: None,
-                        data: Arc::new(picture.convert(payload)?),
+                        data: Arc::new(picture.convert(payload)?).into(),
                         rows: Vec::new(),
                     },
                     Convert::Sound(sound) => {
@@ -790,7 +790,7 @@ fn drain(
                         TickFrame {
                             pts: packet.pts,
                             duration: Some(samples as i64),
-                            data: Arc::new(data),
+                            data: Arc::new(data).into(),
                             rows: Vec::new(),
                         }
                     }
@@ -837,7 +837,7 @@ fn hand_decoded(
         let frame = TickFrame {
             pts: frame.pts,
             duration: None,
-            data: Arc::new(data),
+            data: Arc::new(data).into(),
             rows: Vec::new(),
         };
         if !scheduler.arrive(id, Item::Frame(frame)) {

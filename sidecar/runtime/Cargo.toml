@@ -12,7 +12,7 @@ crate-type = ["rlib"]
 [features]
 # wasi:webgpu for modules granted `-gpu`, over wgpu-core (Vulkan, D3D12,
 # Metal). Off, a module importing wasi:webgpu is refused at instantiation.
-gpu = ["dep:wasi-webgpu-wasmtime"]
+gpu = ["dep:wasi-webgpu-wasmtime", "dep:wasmtime-wasi-io"]
 
 [dependencies]
 # The wasi:webgpu@0.0.1 host, vendored and adapted from wasi-gfx-runtime;
@@ -20,6 +20,9 @@ gpu = ["dep:wasi-webgpu-wasmtime"]
 wasi-webgpu-wasmtime = { path = "../vendor/wasi-webgpu-wasmtime", optional = true }
 wasmtime = { version = "48", default-features = false, features = ["component-model", "cranelift", "runtime", "std", "parallel-compilation"] }
 wasmtime-wasi = { version = "48", default-features = false, features = ["p2"] }
+# The `wasi:io` types `ffrwd:gpu/frames`'s bindings share with the vendored
+# webgpu host, so a texture resource is one type on both sides.
+wasmtime-wasi-io = { version = "48", default-features = false, optional = true }
 # Linked only for a module granted `-http`: the outgoing-handler half of
 # wasi:http, so a granted module can make requests and none can serve.
 wasmtime-wasi-http = { version = "48.0.1", default-features = false, features = ["p2", "default-send-request"] }

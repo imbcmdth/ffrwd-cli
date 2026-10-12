@@ -9,9 +9,10 @@ use crate::{
     to_core_conversions::ToCore,
     wasi::{io::poll, webgpu::webgpu},
     wrapper_types::{
-        Buffer, CommandEncoder, ComputePassEncoder, ComputePipeline, Device, ErrorHandler,
-        Listener, RenderBundleEncoder, WgslLanguageFeatures, RenderBundleEncoderInner, RenderPassEncoder,
-        RenderPipeline, Texture, ShaderModule, CompilationInfo, CompilationMessage,
+        Buffer, CommandEncoder, CompilationInfo, CompilationMessage, ComputePassEncoder,
+        ComputePipeline, Device, ErrorHandler, Listener, RenderBundleEncoder,
+        RenderBundleEncoderInner, RenderPassEncoder, RenderPipeline, ShaderModule, Texture,
+        WgslLanguageFeatures,
     },
     WasiWebGpuCtx, PREFERRED_CANVAS_FORMAT,
 };
@@ -524,6 +525,7 @@ impl webgpu::HostGpuDevice for WasiWebGpuCtx<'_> {
             dimension: desc.dimension,
             format: desc.format,
             usage: desc.usage,
+            shared: false,
         })?)
     }
 
@@ -711,11 +713,9 @@ impl webgpu::HostGpuDevice for WasiWebGpuCtx<'_> {
         let device_id = device.device;
         let error_handler = Arc::clone(&device.error_handler);
 
-        let (query_set, err) = self.instance.device_create_query_set(
-            device_id,
-            &descriptor.to_core(self.table),
-            None,
-        );
+        let (query_set, err) =
+            self.instance
+                .device_create_query_set(device_id, &descriptor.to_core(self.table), None);
 
         error_handler.handle_possible_error(err);
 
@@ -781,6 +781,11 @@ impl webgpu::HostGpuDevice for WasiWebGpuCtx<'_> {
 
     fn drop(&mut self, device: Resource<webgpu::GpuDevice>) -> wasmtime::Result<()> {
         let device = self.table.delete(device)?;
+        if device.shared {
+            // The process's: its adapter and queue Arcs are held by the
+            // SharedDevice, so nothing below drops either.
+            return Ok(());
+        }
         self.instance.device_drop(device.device);
         if let Some(adapter_id) = Arc::into_inner(device.adapter) {
             self.instance.adapter_drop(adapter_id);
@@ -901,7 +906,9 @@ impl webgpu::HostGpuTexture for WasiWebGpuCtx<'_> {
 
     fn drop(&mut self, texture: Resource<webgpu::GpuTexture>) -> wasmtime::Result<()> {
         let texture = self.table.delete(texture)?;
-        self.instance.texture_drop(texture.texture_id);
+        if !texture.shared {
+            self.instance.texture_drop(texture.texture_id);
+        }
         Ok(())
     }
 }
@@ -1030,7 +1037,8 @@ impl webgpu::HostGpuAdapter for WasiWebGpuCtx<'_> {
         let adapter = Arc::clone(self.table.get(&adapter)?);
 
         if let Some(limits) = descriptor.as_ref().and_then(|d| d.required_limits.as_ref()) {
-            if let Some(key) = crate::to_core_conversions::unknown_limit_key(self.table.get(limits)?)
+            if let Some(key) =
+                crate::to_core_conversions::unknown_limit_key(self.table.get(limits)?)
             {
                 // https://www.w3.org/TR/webgpu/#dom-gpuadapter-requestdevice
                 return Ok(Err(webgpu::RequestDeviceError {
@@ -1043,6 +1051,34 @@ impl webgpu::HostGpuAdapter for WasiWebGpuCtx<'_> {
         let mut desc = descriptor
             .map(|d| d.to_core(self.table))
             .unwrap_or(wgpu_types::DeviceDescriptor::default());
+        if let Some(shared) = self.shared {
+            // The process's device, opened with the most it can offer: a
+            // request within that is answered with it, and one beyond it
+            // is refused as WebGPU refuses a feature the adapter lacks.
+            let missing = desc.required_features - shared.features;
+            if !missing.is_empty() {
+                return Ok(Err(webgpu::RequestDeviceError {
+                    kind: webgpu::RequestDeviceErrorKind::TypeError,
+                    message: format!(
+                        "required-features names {missing:?}, which this device does not have"
+                    ),
+                }));
+            }
+            if !desc.required_limits.check_limits(&shared.limits) {
+                return Ok(Err(webgpu::RequestDeviceError {
+                    kind: webgpu::RequestDeviceErrorKind::OperationError,
+                    message: "required-limits asks for more than this device has".to_string(),
+                }));
+            }
+            let device = self.table.push(Device {
+                device: shared.device,
+                queue: Arc::clone(&shared.queue),
+                adapter: Arc::clone(&shared.adapter),
+                error_handler: Arc::new(ErrorHandler::default()),
+                shared: true,
+            })?;
+            return Ok(Ok(device));
+        }
         // The IDL has no name for wgpu's encoder-level timestamps; a guest
         // asking for timestamp-query gets them too where the adapter has them,
         // so `write-timestamp` on an encoder works.
@@ -1067,6 +1103,7 @@ impl webgpu::HostGpuAdapter for WasiWebGpuCtx<'_> {
                     queue: Arc::new(queue_id),
                     adapter,
                     error_handler: Arc::new(ErrorHandler::default()),
+                    shared: false,
                 })?;
                 Ok(device)
             }
@@ -1164,7 +1201,10 @@ impl webgpu::HostGpuQueue for WasiWebGpuCtx<'_> {
         Ok(self.instance.queue_get_timestamp_period(queue))
     }
 
-    fn on_submitted_work_done(&mut self, queue: Resource<webgpu::GpuQueue>) -> wasmtime::Result<()> {
+    fn on_submitted_work_done(
+        &mut self,
+        queue: Resource<webgpu::GpuQueue>,
+    ) -> wasmtime::Result<()> {
         // Synchronous, as map-async is: returns once the queue has drained.
         let queue = *(*self.table.get(&queue)?);
         let (sender, receiver) = std::sync::mpsc::channel();
@@ -1257,9 +1297,7 @@ impl webgpu::HostGpuCommandEncoder for WasiWebGpuCtx<'_> {
         let command_encoder = self.table.get(&command_encoder)?;
         let command_encoder_id = command_encoder.command_encoder_id;
         let error_handler = Arc::clone(&command_encoder.error_handler);
-        let timestamp_writes = descriptor
-            .timestamp_writes
-            .map(|tw| tw.to_core(self.table));
+        let timestamp_writes = descriptor.timestamp_writes.map(|tw| tw.to_core(self.table));
         // can't use to_core because depth_stencil_attachment is Option<&x>.
         let depth_stencil_attachment = descriptor
             .depth_stencil_attachment
@@ -1460,8 +1498,11 @@ impl webgpu::HostGpuCommandEncoder for WasiWebGpuCtx<'_> {
     ) -> wasmtime::Result<()> {
         let query_set_id = *self.table.get(&query_set)?;
         let command_encoder = self.table.get(&command_encoder)?.command_encoder_id;
-        self.instance
-            .command_encoder_write_timestamp(command_encoder, query_set_id, query_index)?;
+        self.instance.command_encoder_write_timestamp(
+            command_encoder,
+            query_set_id,
+            query_index,
+        )?;
         Ok(())
     }
 
@@ -1529,7 +1570,9 @@ impl webgpu::HostGpuRenderPassEncoder for WasiWebGpuCtx<'_> {
         let pipeline_id = self.table.get(&pipeline)?.render_pipeline_id;
         let instance = Arc::clone(self.instance);
         let mut render_pass = self.table.get_mut(&render_pass)?.lock();
-        let render_pass = render_pass.as_mut().ok_or_else(|| wasmtime::format_err!("the render pass has already ended"))?;
+        let render_pass = render_pass
+            .as_mut()
+            .ok_or_else(|| wasmtime::format_err!("the render pass has already ended"))?;
         instance.render_pass_set_pipeline(render_pass, pipeline_id)?;
         Ok(())
     }
@@ -1544,7 +1587,9 @@ impl webgpu::HostGpuRenderPassEncoder for WasiWebGpuCtx<'_> {
     ) -> wasmtime::Result<()> {
         let instance = Arc::clone(self.instance);
         let mut render_pass = self.table.get_mut(&render_pass)?.lock();
-        let render_pass = render_pass.as_mut().ok_or_else(|| wasmtime::format_err!("the render pass has already ended"))?;
+        let render_pass = render_pass
+            .as_mut()
+            .ok_or_else(|| wasmtime::format_err!("the render pass has already ended"))?;
         // https://www.w3.org/TR/webgpu/#gpurendercommandsmixin
         instance.render_pass_draw(
             render_pass,
@@ -1559,7 +1604,9 @@ impl webgpu::HostGpuRenderPassEncoder for WasiWebGpuCtx<'_> {
     fn end(&mut self, render_pass: Resource<RenderPassEncoder>) -> wasmtime::Result<()> {
         let instance = Arc::clone(self.instance);
         let mut render_pass = self.table.get_mut(&render_pass)?.lock();
-        let mut render_pass = render_pass.take().ok_or_else(|| wasmtime::format_err!("the render pass has already ended"))?;
+        let mut render_pass = render_pass
+            .take()
+            .ok_or_else(|| wasmtime::format_err!("the render pass has already ended"))?;
         instance.render_pass_end(&mut render_pass)?;
         Ok(())
     }
@@ -1576,7 +1623,9 @@ impl webgpu::HostGpuRenderPassEncoder for WasiWebGpuCtx<'_> {
     ) -> wasmtime::Result<()> {
         let instance = Arc::clone(self.instance);
         let mut render_pass = self.table.get_mut(&render_pass)?.lock();
-        let render_pass = render_pass.as_mut().ok_or_else(|| wasmtime::format_err!("the render pass has already ended"))?;
+        let render_pass = render_pass
+            .as_mut()
+            .ok_or_else(|| wasmtime::format_err!("the render pass has already ended"))?;
         instance.render_pass_set_viewport(
             render_pass,
             x,
@@ -1599,7 +1648,9 @@ impl webgpu::HostGpuRenderPassEncoder for WasiWebGpuCtx<'_> {
     ) -> wasmtime::Result<()> {
         let instance = Arc::clone(self.instance);
         let mut render_pass = self.table.get_mut(&render_pass)?.lock();
-        let render_pass = render_pass.as_mut().ok_or_else(|| wasmtime::format_err!("the render pass has already ended"))?;
+        let render_pass = render_pass
+            .as_mut()
+            .ok_or_else(|| wasmtime::format_err!("the render pass has already ended"))?;
         instance.render_pass_set_scissor_rect(render_pass, x, y, width, height)?;
         Ok(())
     }
@@ -1611,7 +1662,9 @@ impl webgpu::HostGpuRenderPassEncoder for WasiWebGpuCtx<'_> {
     ) -> wasmtime::Result<()> {
         let instance = Arc::clone(self.instance);
         let mut render_pass = self.table.get_mut(&render_pass)?.lock();
-        let render_pass = render_pass.as_mut().ok_or_else(|| wasmtime::format_err!("the render pass has already ended"))?;
+        let render_pass = render_pass
+            .as_mut()
+            .ok_or_else(|| wasmtime::format_err!("the render pass has already ended"))?;
         instance.render_pass_set_blend_constant(render_pass, color.into())?;
         Ok(())
     }
@@ -1623,7 +1676,9 @@ impl webgpu::HostGpuRenderPassEncoder for WasiWebGpuCtx<'_> {
     ) -> wasmtime::Result<()> {
         let instance = Arc::clone(self.instance);
         let mut render_pass = self.table.get_mut(&render_pass)?.lock();
-        let render_pass = render_pass.as_mut().ok_or_else(|| wasmtime::format_err!("the render pass has already ended"))?;
+        let render_pass = render_pass
+            .as_mut()
+            .ok_or_else(|| wasmtime::format_err!("the render pass has already ended"))?;
         instance.render_pass_set_stencil_reference(render_pass, reference)?;
         Ok(())
     }
@@ -1635,7 +1690,9 @@ impl webgpu::HostGpuRenderPassEncoder for WasiWebGpuCtx<'_> {
     ) -> wasmtime::Result<()> {
         let instance = Arc::clone(self.instance);
         let mut render_pass = self.table.get_mut(&render_pass)?.lock();
-        let render_pass = render_pass.as_mut().ok_or_else(|| wasmtime::format_err!("the render pass has already ended"))?;
+        let render_pass = render_pass
+            .as_mut()
+            .ok_or_else(|| wasmtime::format_err!("the render pass has already ended"))?;
         instance.render_pass_begin_occlusion_query(render_pass, query_index)?;
         Ok(())
     }
@@ -1646,7 +1703,9 @@ impl webgpu::HostGpuRenderPassEncoder for WasiWebGpuCtx<'_> {
     ) -> wasmtime::Result<()> {
         let instance = Arc::clone(self.instance);
         let mut render_pass = self.table.get_mut(&render_pass)?.lock();
-        let render_pass = render_pass.as_mut().ok_or_else(|| wasmtime::format_err!("the render pass has already ended"))?;
+        let render_pass = render_pass
+            .as_mut()
+            .ok_or_else(|| wasmtime::format_err!("the render pass has already ended"))?;
         instance.render_pass_end_occlusion_query(render_pass)?;
         Ok(())
     }
@@ -1662,7 +1721,9 @@ impl webgpu::HostGpuRenderPassEncoder for WasiWebGpuCtx<'_> {
             .map(|bundle| Ok(*self.table.get(bundle)?))
             .collect::<wasmtime::Result<Vec<_>>>()?;
         let mut render_pass = self.table.get_mut(&render_pass)?.lock();
-        let render_pass = render_pass.as_mut().ok_or_else(|| wasmtime::format_err!("the render pass has already ended"))?;
+        let render_pass = render_pass
+            .as_mut()
+            .ok_or_else(|| wasmtime::format_err!("the render pass has already ended"))?;
         instance.render_pass_execute_bundles(render_pass, &render_bundle_ids)?;
         Ok(())
     }
@@ -1688,7 +1749,9 @@ impl webgpu::HostGpuRenderPassEncoder for WasiWebGpuCtx<'_> {
     ) -> wasmtime::Result<()> {
         let instance = Arc::clone(self.instance);
         let mut render_pass = self.table.get_mut(&render_pass)?.lock();
-        let render_pass = render_pass.as_mut().ok_or_else(|| wasmtime::format_err!("the render pass has already ended"))?;
+        let render_pass = render_pass
+            .as_mut()
+            .ok_or_else(|| wasmtime::format_err!("the render pass has already ended"))?;
         instance.render_pass_push_debug_group(render_pass, &group_label, 0)?;
         Ok(())
     }
@@ -1699,7 +1762,9 @@ impl webgpu::HostGpuRenderPassEncoder for WasiWebGpuCtx<'_> {
     ) -> wasmtime::Result<()> {
         let instance = Arc::clone(self.instance);
         let mut render_pass = self.table.get_mut(&render_pass)?.lock();
-        let render_pass = render_pass.as_mut().ok_or_else(|| wasmtime::format_err!("the render pass has already ended"))?;
+        let render_pass = render_pass
+            .as_mut()
+            .ok_or_else(|| wasmtime::format_err!("the render pass has already ended"))?;
         instance.render_pass_pop_debug_group(render_pass)?;
         Ok(())
     }
@@ -1711,7 +1776,9 @@ impl webgpu::HostGpuRenderPassEncoder for WasiWebGpuCtx<'_> {
     ) -> wasmtime::Result<()> {
         let instance = Arc::clone(self.instance);
         let mut render_pass = self.table.get_mut(&render_pass)?.lock();
-        let render_pass = render_pass.as_mut().ok_or_else(|| wasmtime::format_err!("the render pass has already ended"))?;
+        let render_pass = render_pass
+            .as_mut()
+            .ok_or_else(|| wasmtime::format_err!("the render pass has already ended"))?;
         instance.render_pass_insert_debug_marker(render_pass, &marker_label, 0)?;
         Ok(())
     }
@@ -1726,9 +1793,13 @@ impl webgpu::HostGpuRenderPassEncoder for WasiWebGpuCtx<'_> {
         dynamic_offsets_data_length: Option<webgpu::GpuSize32>,
     ) -> wasmtime::Result<Result<(), webgpu::SetBindGroupError>> {
         let instance = Arc::clone(self.instance);
-        let bind_group = bind_group.map(|bind_group| self.table.get(&bind_group).copied()).transpose()?;
+        let bind_group = bind_group
+            .map(|bind_group| self.table.get(&bind_group).copied())
+            .transpose()?;
         let mut render_pass = self.table.get_mut(&render_pass)?.lock();
-        let render_pass = render_pass.as_mut().ok_or_else(|| wasmtime::format_err!("the render pass has already ended"))?;
+        let render_pass = render_pass
+            .as_mut()
+            .ok_or_else(|| wasmtime::format_err!("the render pass has already ended"))?;
         // https://www.w3.org/TR/webgpu/#programmable-passes
         let dynamic_offsets = &dynamic_offsets_data.unwrap_or(vec![]);
         let mut dynamic_offsets = &dynamic_offsets[..];
@@ -1756,7 +1827,9 @@ impl webgpu::HostGpuRenderPassEncoder for WasiWebGpuCtx<'_> {
         let instance = Arc::clone(self.instance);
         let buffer_id = self.table.get(&buffer)?.buffer_id;
         let mut render_pass = self.table.get_mut(&render_pass)?.lock();
-        let render_pass = render_pass.as_mut().ok_or_else(|| wasmtime::format_err!("the render pass has already ended"))?;
+        let render_pass = render_pass
+            .as_mut()
+            .ok_or_else(|| wasmtime::format_err!("the render pass has already ended"))?;
         instance.render_pass_set_index_buffer(
             render_pass,
             buffer_id,
@@ -1782,7 +1855,9 @@ impl webgpu::HostGpuRenderPassEncoder for WasiWebGpuCtx<'_> {
             .get(&buffer.expect("TODO: deal null buffers"))?
             .buffer_id;
         let mut render_pass = self.table.get_mut(&render_pass)?.lock();
-        let render_pass = render_pass.as_mut().ok_or_else(|| wasmtime::format_err!("the render pass has already ended"))?;
+        let render_pass = render_pass
+            .as_mut()
+            .ok_or_else(|| wasmtime::format_err!("the render pass has already ended"))?;
         instance.render_pass_set_vertex_buffer(
             render_pass,
             slot,
@@ -1805,7 +1880,9 @@ impl webgpu::HostGpuRenderPassEncoder for WasiWebGpuCtx<'_> {
     ) -> wasmtime::Result<()> {
         let instance = Arc::clone(self.instance);
         let mut render_pass = self.table.get_mut(&render_pass)?.lock();
-        let render_pass = render_pass.as_mut().ok_or_else(|| wasmtime::format_err!("the render pass has already ended"))?;
+        let render_pass = render_pass
+            .as_mut()
+            .ok_or_else(|| wasmtime::format_err!("the render pass has already ended"))?;
         instance.render_pass_draw_indexed(
             render_pass,
             index_count,
@@ -1827,7 +1904,9 @@ impl webgpu::HostGpuRenderPassEncoder for WasiWebGpuCtx<'_> {
         let instance = Arc::clone(self.instance);
         let indirect_buffer = self.table.get(&indirect_buffer)?.buffer_id;
         let mut render_pass = self.table.get_mut(&render_pass)?.lock();
-        let render_pass = render_pass.as_mut().ok_or_else(|| wasmtime::format_err!("the render pass has already ended"))?;
+        let render_pass = render_pass
+            .as_mut()
+            .ok_or_else(|| wasmtime::format_err!("the render pass has already ended"))?;
         instance.render_pass_draw_indirect(render_pass, indirect_buffer, indirect_offset)?;
         Ok(())
     }
@@ -1841,7 +1920,9 @@ impl webgpu::HostGpuRenderPassEncoder for WasiWebGpuCtx<'_> {
         let instance = Arc::clone(self.instance);
         let indirect_buffer = self.table.get(&indirect_buffer)?.buffer_id;
         let mut render_pass = self.table.get_mut(&render_pass)?.lock();
-        let render_pass = render_pass.as_mut().ok_or_else(|| wasmtime::format_err!("the render pass has already ended"))?;
+        let render_pass = render_pass
+            .as_mut()
+            .ok_or_else(|| wasmtime::format_err!("the render pass has already ended"))?;
         instance.render_pass_draw_indexed_indirect(
             render_pass,
             indirect_buffer,
@@ -2015,7 +2096,9 @@ impl webgpu::HostGpuComputePassEncoder for WasiWebGpuCtx<'_> {
         let instance = Arc::clone(self.instance);
         let pipeline = self.table.get(&pipeline)?.compute_pipeline_id;
         let mut compute_pass = self.table.get_mut(&compute_pass)?.lock();
-        let compute_pass = compute_pass.as_mut().ok_or_else(|| wasmtime::format_err!("the compute pass has already ended"))?;
+        let compute_pass = compute_pass
+            .as_mut()
+            .ok_or_else(|| wasmtime::format_err!("the compute pass has already ended"))?;
         instance.compute_pass_set_pipeline(compute_pass, pipeline)?;
         Ok(())
     }
@@ -2029,7 +2112,9 @@ impl webgpu::HostGpuComputePassEncoder for WasiWebGpuCtx<'_> {
     ) -> wasmtime::Result<()> {
         let instance = Arc::clone(self.instance);
         let mut compute_pass = self.table.get_mut(&compute_pass)?.lock();
-        let compute_pass = compute_pass.as_mut().ok_or_else(|| wasmtime::format_err!("the compute pass has already ended"))?;
+        let compute_pass = compute_pass
+            .as_mut()
+            .ok_or_else(|| wasmtime::format_err!("the compute pass has already ended"))?;
         // https://www.w3.org/TR/webgpu/#gpucomputepassencoder
         instance.compute_pass_dispatch_workgroups(
             compute_pass,
@@ -2049,7 +2134,9 @@ impl webgpu::HostGpuComputePassEncoder for WasiWebGpuCtx<'_> {
         let instance = Arc::clone(self.instance);
         let indirect_buffer = self.table.get(&indirect_buffer)?.buffer_id;
         let mut compute_pass = self.table.get_mut(&compute_pass)?.lock();
-        let compute_pass = compute_pass.as_mut().ok_or_else(|| wasmtime::format_err!("the compute pass has already ended"))?;
+        let compute_pass = compute_pass
+            .as_mut()
+            .ok_or_else(|| wasmtime::format_err!("the compute pass has already ended"))?;
         instance.compute_pass_dispatch_workgroups_indirect(
             compute_pass,
             indirect_buffer,
@@ -2064,7 +2151,9 @@ impl webgpu::HostGpuComputePassEncoder for WasiWebGpuCtx<'_> {
     ) -> wasmtime::Result<()> {
         let instance = Arc::clone(self.instance);
         let mut compute_pass = self.table.get_mut(&compute_pass)?.lock();
-        let mut compute_pass = compute_pass.take().ok_or_else(|| wasmtime::format_err!("the compute pass has already ended"))?;
+        let mut compute_pass = compute_pass
+            .take()
+            .ok_or_else(|| wasmtime::format_err!("the compute pass has already ended"))?;
         instance.compute_pass_end(&mut compute_pass)?;
         Ok(())
     }
@@ -2093,7 +2182,9 @@ impl webgpu::HostGpuComputePassEncoder for WasiWebGpuCtx<'_> {
     ) -> wasmtime::Result<()> {
         let instance = Arc::clone(self.instance);
         let mut compute_pass = self.table.get_mut(&compute_pass)?.lock();
-        let compute_pass = compute_pass.as_mut().ok_or_else(|| wasmtime::format_err!("the compute pass has already ended"))?;
+        let compute_pass = compute_pass
+            .as_mut()
+            .ok_or_else(|| wasmtime::format_err!("the compute pass has already ended"))?;
         instance.compute_pass_push_debug_group(compute_pass, &group_label, 0)?;
         Ok(())
     }
@@ -2104,7 +2195,9 @@ impl webgpu::HostGpuComputePassEncoder for WasiWebGpuCtx<'_> {
     ) -> wasmtime::Result<()> {
         let instance = Arc::clone(self.instance);
         let mut compute_pass = self.table.get_mut(&compute_pass)?.lock();
-        let compute_pass = compute_pass.as_mut().ok_or_else(|| wasmtime::format_err!("the compute pass has already ended"))?;
+        let compute_pass = compute_pass
+            .as_mut()
+            .ok_or_else(|| wasmtime::format_err!("the compute pass has already ended"))?;
         instance.compute_pass_pop_debug_group(compute_pass)?;
         Ok(())
     }
@@ -2116,7 +2209,9 @@ impl webgpu::HostGpuComputePassEncoder for WasiWebGpuCtx<'_> {
     ) -> wasmtime::Result<()> {
         let instance = Arc::clone(self.instance);
         let mut compute_pass = self.table.get_mut(&compute_pass)?.lock();
-        let compute_pass = compute_pass.as_mut().ok_or_else(|| wasmtime::format_err!("the compute pass has already ended"))?;
+        let compute_pass = compute_pass
+            .as_mut()
+            .ok_or_else(|| wasmtime::format_err!("the compute pass has already ended"))?;
         instance.compute_pass_insert_debug_marker(compute_pass, &label, 0)?;
         Ok(())
     }
@@ -2131,9 +2226,13 @@ impl webgpu::HostGpuComputePassEncoder for WasiWebGpuCtx<'_> {
         dynamic_offsets_data_length: Option<webgpu::GpuSize32>,
     ) -> wasmtime::Result<Result<(), webgpu::SetBindGroupError>> {
         let instance = Arc::clone(self.instance);
-        let bind_group = bind_group.map(|bind_group| self.table.get(&bind_group).copied()).transpose()?;
+        let bind_group = bind_group
+            .map(|bind_group| self.table.get(&bind_group).copied())
+            .transpose()?;
         let mut compute_pass = self.table.get_mut(&compute_pass)?.lock();
-        let compute_pass = compute_pass.as_mut().ok_or_else(|| wasmtime::format_err!("the compute pass has already ended"))?;
+        let compute_pass = compute_pass
+            .as_mut()
+            .ok_or_else(|| wasmtime::format_err!("the compute pass has already ended"))?;
         // https://www.w3.org/TR/webgpu/#programmable-passes
 
         let dynamic_offsets = &dynamic_offsets_data.unwrap_or(vec![]);
@@ -2290,7 +2389,9 @@ impl webgpu::HostGpuRenderBundleEncoder for WasiWebGpuCtx<'_> {
             .map(|d| d.to_core(self.table))
             .unwrap_or(wgpu_types::RenderBundleDescriptor::default());
         let mut bundle_encoder_lock = self.table.get_mut(&bundle_encoder)?.lock();
-        let bundle_encoder = bundle_encoder_lock.take().ok_or_else(|| wasmtime::format_err!("the render bundle encoder has already finished"))?;
+        let bundle_encoder = bundle_encoder_lock.take().ok_or_else(|| {
+            wasmtime::format_err!("the render bundle encoder has already finished")
+        })?;
         drop(bundle_encoder_lock);
         let (render_bundle, err) = instance.render_bundle_encoder_finish(
             bundle_encoder.render_bundle_encoder,
@@ -2323,7 +2424,9 @@ impl webgpu::HostGpuRenderBundleEncoder for WasiWebGpuCtx<'_> {
         _bundle_encoder: Resource<webgpu::GpuRenderBundleEncoder>,
         _group_label: String,
     ) -> wasmtime::Result<()> {
-        bail!("wasi:webgpu: GpuRenderBundleEncoder.push_debug_group is not implemented by this host")
+        bail!(
+            "wasi:webgpu: GpuRenderBundleEncoder.push_debug_group is not implemented by this host"
+        )
     }
 
     fn pop_debug_group(
@@ -2350,9 +2453,13 @@ impl webgpu::HostGpuRenderBundleEncoder for WasiWebGpuCtx<'_> {
         dynamic_offsets_data_start: Option<webgpu::GpuSize64>,
         dynamic_offsets_data_length: Option<webgpu::GpuSize32>,
     ) -> wasmtime::Result<Result<(), webgpu::SetBindGroupError>> {
-        let bind_group_id = bind_group.map(|bind_group| self.table.get(&bind_group).copied()).transpose()?;
+        let bind_group_id = bind_group
+            .map(|bind_group| self.table.get(&bind_group).copied())
+            .transpose()?;
         let mut bundle_encoder = self.table.get_mut(&bundle_encoder)?.lock();
-        let bundle_encoder = bundle_encoder.as_mut().ok_or_else(|| wasmtime::format_err!("the render bundle encoder has already ended"))?;
+        let bundle_encoder = bundle_encoder
+            .as_mut()
+            .ok_or_else(|| wasmtime::format_err!("the render bundle encoder has already ended"))?;
 
         // https://www.w3.org/TR/webgpu/#programmable-passes
         let dynamic_offsets = &dynamic_offsets_data.unwrap_or(vec![]);
@@ -2386,7 +2493,9 @@ impl webgpu::HostGpuRenderBundleEncoder for WasiWebGpuCtx<'_> {
         let pipeline = self.table.get(&pipeline)?;
         let pipeline_id = pipeline.render_pipeline_id;
         let mut bundle_encoder = self.table.get_mut(&bundle_encoder)?.lock();
-        let bundle_encoder = bundle_encoder.as_mut().ok_or_else(|| wasmtime::format_err!("the render bundle encoder has already ended"))?;
+        let bundle_encoder = bundle_encoder
+            .as_mut()
+            .ok_or_else(|| wasmtime::format_err!("the render bundle encoder has already ended"))?;
         wgpu_core::command::bundle_ffi::wgpu_render_bundle_set_pipeline(
             &mut bundle_encoder.render_bundle_encoder,
             pipeline_id,
@@ -2404,7 +2513,9 @@ impl webgpu::HostGpuRenderBundleEncoder for WasiWebGpuCtx<'_> {
     ) -> wasmtime::Result<()> {
         let buffer_id = self.table.get(&buffer)?.buffer_id;
         let mut bundle_encoder = self.table.get_mut(&bundle_encoder)?.lock();
-        let bundle_encoder = bundle_encoder.as_mut().ok_or_else(|| wasmtime::format_err!("the render bundle encoder has already ended"))?;
+        let bundle_encoder = bundle_encoder
+            .as_mut()
+            .ok_or_else(|| wasmtime::format_err!("the render bundle encoder has already ended"))?;
         // https://www.w3.org/TR/webgpu/#gpurendercommandsmixin
         wgpu_core::command::bundle_ffi::wgpu_render_bundle_set_index_buffer(
             &mut bundle_encoder.render_bundle_encoder,
@@ -2427,7 +2538,9 @@ impl webgpu::HostGpuRenderBundleEncoder for WasiWebGpuCtx<'_> {
         let buffer = buffer.expect("TODO: Null buffers not yet supported in wgpu");
         let buffer_id = self.table.get(&buffer)?.buffer_id;
         let mut bundle_encoder = self.table.get_mut(&bundle_encoder)?.lock();
-        let bundle_encoder = bundle_encoder.as_mut().ok_or_else(|| wasmtime::format_err!("the render bundle encoder has already ended"))?;
+        let bundle_encoder = bundle_encoder
+            .as_mut()
+            .ok_or_else(|| wasmtime::format_err!("the render bundle encoder has already ended"))?;
         // https://www.w3.org/TR/webgpu/#gpurendercommandsmixin
         wgpu_core::command::bundle_ffi::wgpu_render_bundle_set_vertex_buffer(
             &mut bundle_encoder.render_bundle_encoder,
@@ -2448,7 +2561,9 @@ impl webgpu::HostGpuRenderBundleEncoder for WasiWebGpuCtx<'_> {
         first_instance: Option<webgpu::GpuSize32>,
     ) -> wasmtime::Result<()> {
         let mut bundle_encoder = self.table.get_mut(&bundle_encoder)?.lock();
-        let bundle_encoder = bundle_encoder.as_mut().ok_or_else(|| wasmtime::format_err!("the render bundle encoder has already ended"))?;
+        let bundle_encoder = bundle_encoder
+            .as_mut()
+            .ok_or_else(|| wasmtime::format_err!("the render bundle encoder has already ended"))?;
         // https://www.w3.org/TR/webgpu/#gpurendercommandsmixin
         wgpu_core::command::bundle_ffi::wgpu_render_bundle_draw(
             &mut bundle_encoder.render_bundle_encoder,
@@ -2470,7 +2585,9 @@ impl webgpu::HostGpuRenderBundleEncoder for WasiWebGpuCtx<'_> {
         first_instance: Option<webgpu::GpuSize32>,
     ) -> wasmtime::Result<()> {
         let mut bundle_encoder = self.table.get_mut(&bundle_encoder)?.lock();
-        let bundle_encoder = bundle_encoder.as_mut().ok_or_else(|| wasmtime::format_err!("the render bundle encoder has already ended"))?;
+        let bundle_encoder = bundle_encoder
+            .as_mut()
+            .ok_or_else(|| wasmtime::format_err!("the render bundle encoder has already ended"))?;
         // https://www.w3.org/TR/webgpu/#gpurendercommandsmixin
         wgpu_core::command::bundle_ffi::wgpu_render_bundle_draw_indexed(
             &mut bundle_encoder.render_bundle_encoder,
@@ -2491,7 +2608,9 @@ impl webgpu::HostGpuRenderBundleEncoder for WasiWebGpuCtx<'_> {
     ) -> wasmtime::Result<()> {
         let indirect_buffer = self.table.get(&indirect_buffer)?.buffer_id;
         let mut bundle_encoder = self.table.get_mut(&bundle_encoder)?.lock();
-        let bundle_encoder = bundle_encoder.as_mut().ok_or_else(|| wasmtime::format_err!("the render bundle encoder has already ended"))?;
+        let bundle_encoder = bundle_encoder
+            .as_mut()
+            .ok_or_else(|| wasmtime::format_err!("the render bundle encoder has already ended"))?;
         wgpu_core::command::bundle_ffi::wgpu_render_bundle_draw_indirect(
             &mut bundle_encoder.render_bundle_encoder,
             indirect_buffer,
@@ -2508,7 +2627,9 @@ impl webgpu::HostGpuRenderBundleEncoder for WasiWebGpuCtx<'_> {
     ) -> wasmtime::Result<()> {
         let indirect_buffer = self.table.get(&indirect_buffer)?.buffer_id;
         let mut bundle_encoder = self.table.get_mut(&bundle_encoder)?.lock();
-        let bundle_encoder = bundle_encoder.as_mut().ok_or_else(|| wasmtime::format_err!("the render bundle encoder has already ended"))?;
+        let bundle_encoder = bundle_encoder
+            .as_mut()
+            .ok_or_else(|| wasmtime::format_err!("the render bundle encoder has already ended"))?;
         wgpu_core::command::bundle_ffi::wgpu_render_bundle_draw_indexed_indirect(
             &mut bundle_encoder.render_bundle_encoder,
             indirect_buffer,
@@ -2830,6 +2951,12 @@ impl webgpu::HostGpu for WasiWebGpuCtx<'_> {
         _self_: Resource<webgpu::Gpu>,
         options: Option<webgpu::GpuRequestAdapterOptions>,
     ) -> wasmtime::Result<Option<Resource<webgpu::GpuAdapter>>> {
+        if let Some(shared) = self.shared {
+            // The process's adapter; the SharedDevice holds the Arc, so a
+            // guest dropping this handle never drops the adapter.
+            let adapter = self.table.push(Arc::clone(&shared.adapter))?;
+            return Ok(Some(adapter));
+        }
         let options = options
             .map(|o| o.to_core(self.table))
             .unwrap_or(wgpu_types::RequestAdapterOptions::default());
@@ -3013,7 +3140,9 @@ impl webgpu::HostGpuSupportedFeatures for WasiWebGpuCtx<'_> {
             "dual-source-blending" => features.contains(wgpu_types::Features::DUAL_SOURCE_BLENDING),
             // wgpu's own SUBGROUP stands in for the standard feature it does
             // not have yet; see the device descriptor conversion.
-            "subgroups" => features.features_wgpu.contains(wgpu_types::FeaturesWGPU::SUBGROUP),
+            "subgroups" => features
+                .features_wgpu
+                .contains(wgpu_types::FeaturesWGPU::SUBGROUP),
             "texture-formats-tier1" => {
                 // TODO: enable once wgpu does
                 // features.contains(wgpu_types::Features::TEXTURE_FORMATS_TIER1)

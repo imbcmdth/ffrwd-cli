@@ -12,9 +12,9 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
 use ffrwd_wasm_runtime::node::{
-    self, Accepts, Anchor, BoundStream, Clock, Emission, Emitted, Hold, InputPort, Interval,
-    LikeInput, Node, NodeShape, OutFrame, OutputFormat, OutputPort, Pairing, Payload, PortKind,
-    Rational, RowsUse, StreamFormat, Tick, TickStream,
+    self, Accepts, Anchor, BoundStream, Clock, Emission, Emitted, FrameMemory, Hold, InputPort,
+    Interval, LikeInput, Node, NodeShape, OutFrame, OutputFormat, OutputPort, Pairing, Payload,
+    PortKind, Rational, RowsUse, StreamFormat, Tick, TickStream,
 };
 use ffrwd_wasm_runtime::runtime::{
     self, Arity, Catalog, CodedFormat, CodedStream, DataFilter, DataPad, Filter, Format, Frame,
@@ -55,6 +55,7 @@ pub(crate) fn output(name: &str, kind: PortKind, format: Option<OutputFormat>) -
         time_base: None,
         latency: 0.0,
         schema: None,
+        memory: FrameMemory::Host,
         row: None,
     }
 }
@@ -503,9 +504,15 @@ impl Node for FilterNode {
         let mut streams = tick.streams.into_iter();
         let first = streams.next().unwrap_or_default();
         let trailing = first.trailing;
-        let mut frames: Vec<Frame> = first.frames.into_iter().map(frame_of).collect();
+        let mut frames: Vec<Frame> = first
+            .frames
+            .into_iter()
+            .map(frame_of)
+            .collect::<Result<_>>()?;
         for stream in streams {
-            frames.extend(stream.frames.into_iter().map(frame_of));
+            for frame in stream.frames {
+                frames.push(frame_of(frame)?);
+            }
         }
         let processed = self.filter.process_window(&frames, &trailing, tick.last)?;
         let mut items: Vec<Emission> = processed
@@ -516,7 +523,7 @@ impl Node for FilterNode {
                 payload: Payload::Frame(OutFrame {
                     pts: f.pts,
                     duration: None,
-                    data: f.data,
+                    data: f.data.into(),
                     rows: f.rows,
                 }),
             })
@@ -535,12 +542,14 @@ impl Node for FilterNode {
     }
 }
 
-fn frame_of(frame: node::TickFrame) -> Frame {
-    Frame {
+/// A held frame as an older module reads it: bytes, so a frame on the GPU
+/// is read back here, once.
+fn frame_of(frame: node::TickFrame) -> Result<Frame> {
+    Ok(Frame {
         pts: frame.pts,
-        data: frame.data,
+        data: frame.data.bytes()?,
         rows: frame.rows,
-    }
+    })
 }
 
 /// A call's frames and trailing rows as one tick: a window off the first
@@ -555,7 +564,7 @@ pub fn frames_tick(
     let tick_frame = |f: &Frame| node::TickFrame {
         pts: f.pts,
         duration: None,
-        data: Arc::clone(&f.data),
+        data: Arc::clone(&f.data).into(),
         rows: f.rows.clone(),
     };
     let mut streams: Vec<TickStream> = (0..pads.max(1))

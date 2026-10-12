@@ -79,6 +79,16 @@ with the same `build.rs` as above copying `wit/` whole, `deps/` included.
 The tree's one copy is `sidecar/vendor/wasi-webgpu-wasmtime/wit/deps`;
 the release workflow stages it at pack time, as it stages `av.wit`.
 
+## Frames on the GPU
+
+A node module that holds its frames on the sidecar's device includes the
+companion package's world beside this one: `ffrwd:gpu/gpu-module@0.1.0`,
+carried by `ffrwd/gpu` (`sidecar/wasm-gpu/README.md`), which imports
+`wasi:webgpu` and adds `ports.memory`, `frames.planes` and
+`frames.emit`. This package is unchanged by it: the node world stays
+`ffrwd:av@0.19.1`, and a module including both is a node module with two
+ports it reads and writes as textures.
+
 ## Versions
 
 A new world version is published here as a new package version, and

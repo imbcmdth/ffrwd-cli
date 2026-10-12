@@ -1207,7 +1207,9 @@ pub(crate) fn unknown_limit_key(record: &webgpu::RecordOptionGpuSize64) -> Optio
         .cloned()
 }
 
-impl ToCore<wgpu_core::id::ShaderModuleId> for wasmtime::component::Resource<webgpu::GpuShaderModule> {
+impl ToCore<wgpu_core::id::ShaderModuleId>
+    for wasmtime::component::Resource<webgpu::GpuShaderModule>
+{
     fn to_core(self, table: &ResourceTable) -> wgpu_core::id::ShaderModuleId {
         table.get(&self).unwrap().id
     }

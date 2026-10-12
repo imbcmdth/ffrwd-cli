@@ -91,7 +91,7 @@ fn tick(pts: i64, data: &Arc<Vec<u8>>, last: bool) -> Tick {
             frames: vec![TickFrame {
                 pts,
                 duration: Some(1),
-                data: Arc::clone(data),
+                data: Arc::clone(data).into(),
                 rows: Vec::new(),
             }],
             ..TickStream::default()
@@ -174,7 +174,7 @@ fn a_frame_handed_back_with_same_leaves_on_the_inputs_own_buffer() {
             Payload::Frame(frame) if item.port == copy => {
                 assert_eq!(frame.pts, 3);
                 assert!(
-                    Arc::ptr_eq(&frame.data, &pixels),
+                    Arc::ptr_eq(frame.data.host(), &pixels),
                     "the input's buffer itself, not a copy"
                 );
                 saw_copy = true;

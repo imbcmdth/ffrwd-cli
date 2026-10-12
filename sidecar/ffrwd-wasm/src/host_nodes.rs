@@ -10,8 +10,8 @@ use std::collections::{BTreeMap, HashMap};
 
 use anyhow::{anyhow, bail, Result};
 use ffrwd_wasm_runtime::node::{
-    Accepts, Clock, Emission, Emitted, InputPort, Node, NodeShape, OutputFormat, OutputPort,
-    Pairing, Payload, PortKind, RowsUse, Tick,
+    Accepts, Clock, Emission, Emitted, FrameMemory, InputPort, Node, NodeShape, OutputFormat,
+    OutputPort, Pairing, Payload, PortKind, RowsUse, Tick,
 };
 use ffrwd_wasm_runtime::runtime::{self, Message, TimeBase};
 use serde_json::{Map, Value};
@@ -94,6 +94,7 @@ impl HostNode {
                     time_base: None,
                     latency,
                     schema: None,
+                    memory: FrameMemory::Host,
                     row: None,
                 }],
                 clock: Clock::SelfClocked,

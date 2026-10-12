@@ -367,7 +367,7 @@ def test_a_shape_document_reads_every_field_the_wit_names() -> None:
         "m.wasm",
         {
             "inputs": [
-                {**_clock("v"), "accepts": {"wants": "timing"}},
+                {**_clock("v"), "accepts": {"wants": "timing", "memory": "gpu"}},
                 _input(
                     "feed",
                     "video",
@@ -401,6 +401,7 @@ def test_a_shape_document_reads_every_field_the_wit_names() -> None:
                     "kind": "video",
                     "format": {"kind": "like", "port": "v", "pixel_format": "gray"},
                     "latency": 0,
+                    "memory": "gpu",
                 },
                 {
                     "name": "clock",
@@ -420,6 +421,7 @@ def test_a_shape_document_reads_every_field_the_wit_names() -> None:
     )
     clock, feed, words, deals = read.inputs
     assert clock.accepts.wants == "timing"
+    assert (clock.accepts.memory, feed.accepts.memory) == ("gpu", "host")
     assert feed.pairing.hold == shapes.Hold(
         anchor=shapes.Anchor("tagged", "smart_timed"),
         lead=0.3,
@@ -437,6 +439,7 @@ def test_a_shape_document_reads_every_field_the_wit_names() -> None:
         "like", port="v", pixel_format="gray"
     )
     assert read.outputs[1].format == shapes.OutputFormat("data", codec="json")
+    assert (read.outputs[0].memory, read.outputs[1].memory) == ("gpu", "host")
     assert (read.outputs[1].time_base, read.outputs[1].latency, read.outputs[1].row) == (
         (1, 1_000_000),
         0.25,

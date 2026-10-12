@@ -904,7 +904,7 @@ impl Group {
                     let message = queue.pop().expect("front is some");
                     messages.push(Message {
                         pts: at,
-                        data: message.data.as_ref().clone(),
+                        data: message.data.host().as_ref().clone(),
                     });
                 }
                 handed.push(Handed {
@@ -1097,7 +1097,15 @@ fn recut_window(
             let left = TickFrame {
                 pts: pts_of_sample(w0, rate, base),
                 duration: Some(count as i64 - skip as i64),
-                data: Arc::new(front.data.get(skip * width..).unwrap_or_default().to_vec()),
+                data: Arc::new(
+                    front
+                        .data
+                        .host()
+                        .get(skip * width..)
+                        .unwrap_or_default()
+                        .to_vec(),
+                )
+                .into(),
                 rows: Vec::new(),
             };
             queue.bytes += left.data.len();
@@ -1137,7 +1145,7 @@ fn recut_window(
             None => count,
         };
         if !timing {
-            data.extend_from_slice(&front.data[..take as usize * width]);
+            data.extend_from_slice(&front.data.host()[..take as usize * width]);
         }
         cursor = start + take;
         if take == count {
@@ -1150,10 +1158,12 @@ fn recut_window(
                 data: Arc::new(
                     front
                         .data
+                        .host()
                         .get(take as usize * width..)
                         .unwrap_or_default()
                         .to_vec(),
-                ),
+                )
+                .into(),
                 rows: Vec::new(),
             };
             queue.bytes += left.data.len();
@@ -1169,7 +1179,7 @@ fn recut_window(
     Some(TickFrame {
         pts: pts_of_sample(first, rate, base),
         duration: Some(samples as i64),
-        data: Arc::new(data),
+        data: Arc::new(data).into(),
         rows: Vec::new(),
     })
 }
@@ -1226,7 +1236,7 @@ mod tests {
         TickFrame {
             pts,
             duration: None,
-            data: Arc::new(vec![mark]),
+            data: Arc::new(vec![mark]).into(),
             rows: Vec::new(),
         }
     }
@@ -1239,7 +1249,7 @@ mod tests {
         TickFrame {
             pts,
             duration: Some(count as i64),
-            data: Arc::new(data),
+            data: Arc::new(data).into(),
             rows: Vec::new(),
         }
     }
@@ -1262,7 +1272,7 @@ mod tests {
     }
 
     fn mark(handed: &Handed) -> Option<u8> {
-        handed.frames.first().map(|f| f.data[0])
+        handed.frames.first().map(|f| f.data.host()[0])
     }
 
     #[test]
@@ -1645,7 +1655,8 @@ mod tests {
         assert_eq!(mark(&handed[0]), Some(1));
         let run = &handed[1].frames[0];
         assert_eq!((run.pts, run.duration), (48000, Some(1600)));
-        let value = |k: usize| f32::from_le_bytes(run.data[k * 4..k * 4 + 4].try_into().unwrap());
+        let value =
+            |k: usize| f32::from_le_bytes(run.data.host()[k * 4..k * 4 + 4].try_into().unwrap());
         assert_eq!(value(0), 48000.0);
         assert_eq!(value(1599), 49599.0);
         let handed = g.tick(301, Some(302), THIRTIETHS, &grid);
@@ -1680,7 +1691,8 @@ mod tests {
         let handed = g.tick(0, Some(1), THIRTIETHS, &grid);
         let run = &handed[0].frames[0];
         assert_eq!((run.pts, run.duration), (0, Some(1600)));
-        let value = |k: usize| f32::from_le_bytes(run.data[k * 4..k * 4 + 4].try_into().unwrap());
+        let value =
+            |k: usize| f32::from_le_bytes(run.data.host()[k * 4..k * 4 + 4].try_into().unwrap());
         assert_eq!(value(799), 799.0);
         assert_eq!(value(800), 0.0, "the hole is silence");
         assert_eq!(value(1000), 1000.0);

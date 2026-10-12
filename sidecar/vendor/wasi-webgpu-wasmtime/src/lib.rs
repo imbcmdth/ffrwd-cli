@@ -29,6 +29,7 @@ mod trait_impls;
 mod wrapper_types;
 
 pub use graphics_context::{AbstractBuffer, GraphicsContext};
+pub use wrapper_types::Texture;
 
 /// Re-export of `wgpu_core` and `wgpu_types`, so a runtime does not have to
 /// track which version of wgpu this crate is built on.
@@ -96,10 +97,7 @@ where
     T: WasiWebGpuView + 'static,
 {
     wasi::webgpu::webgpu::add_to_linker::<_, HasWasiWebGpuCtx>(l, T::webgpu)?;
-    wasi::graphics_context::graphics_context::add_to_linker::<_, HasWasiWebGpuCtx>(
-        l,
-        T::webgpu,
-    )?;
+    wasi::graphics_context::graphics_context::add_to_linker::<_, HasWasiWebGpuCtx>(l, T::webgpu)?;
     Ok(())
 }
 
@@ -109,10 +107,28 @@ pub trait WasiWebGpuView: Send {
 }
 
 /// What the host functions borrow from the store for one call: the wgpu
-/// instance the store may use and the store's resource table.
+/// instance the store may use, the device every store shares when the
+/// host opened one, and the store's resource table.
 pub struct WasiWebGpuCtx<'a> {
     pub instance: &'a Arc<wgpu_core::global::Global>,
+    /// The process's device: `request-adapter` and `request-device` answer
+    /// it, so every module and the host's own frames are on one device.
+    /// None links a store whose requests find nothing.
+    pub shared: Option<&'a Arc<SharedDevice>>,
     pub table: &'a mut wasmtime::component::ResourceTable,
+}
+
+/// The one device a process opens, shared by every store and by the host.
+/// The adapter and queue ids are held here so a guest dropping its handle
+/// never drops the device's; the device itself is dropped by nobody.
+pub struct SharedDevice {
+    pub adapter: Arc<wgpu_core::id::AdapterId>,
+    pub device: wgpu_core::id::DeviceId,
+    pub queue: Arc<wgpu_core::id::QueueId>,
+    /// What the device was opened with: the most a guest may require.
+    pub features: wgpu_types::Features,
+    pub limits: wgpu_types::Limits,
+    pub info: wgpu_types::AdapterInfo,
 }
 
 struct HasWasiWebGpuCtx;

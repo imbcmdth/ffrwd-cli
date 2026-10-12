@@ -10,9 +10,11 @@ __pycache__/
 # Deliberately here and not in sidecar/wasm/.gitignore: the packer reads the
 # package root's .gitignore, and a rule there would drop the wit instead.
 /sidecar/wasm/wit/
+/sidecar/wasm-gpu/wit/
 
 # A link from a package under test writes a lock here; the world package has no dependencies to pin.
 /sidecar/wasm/ffrwd.lock
+/sidecar/wasm-gpu/ffrwd.lock
 
 # The build copies the repository README in; it is never committed here.
 cli/README.md
