@@ -3918,7 +3918,8 @@ class _Partitioner:
     def _lockstep_refs(self, name: str) -> list[FrameRef]:
         """The streams of node `name` that pair with its clock frame for frame.
 
-        Every input of an older module. A node pairs only its clock and its
+        Every stream input of an older module; a node's rows it reads pair
+        with its first stream by time. A node pairs only its clock and its
         lockstep inputs of the clock's own kind that way: sound against a
         picture is cut to each tick by time, and held, interval and arrival
         inputs pair by time as well.
@@ -3926,7 +3927,7 @@ class _Partitioner:
         node = self.g.nodes[name]
         shape = self.node_shapes.get(name)
         if shape is None:
-            return list(node.inputs)
+            return [ref for ref in node.inputs if ref_type(self.g, ref) != "data"]
         clock = shape.clock_input
         if clock is None:
             return []
@@ -3936,6 +3937,40 @@ class _Partitioner:
             if port.pairing.kind == "lockstep" and port.kind == clock.kind
         }
         return [ref for port, ref in zip(node.ports, node.inputs) if port in same]
+
+    def _check_node_rows_reach(self) -> None:
+        """That a module of an older world reading a node's rows runs where
+        they reach it as a data stream: in a region of node modules, which is
+        the only one that pairs a data stream with a frame module's frames.
+        """
+        for sidecar in self.sidecars:
+            if sidecar.node_network:
+                continue
+            for name in self.members[sidecar.id]:
+                node = self.g.nodes[name]
+                if (
+                    not self.external[name]
+                    or name in self.node_shapes
+                    or name in self.g.packet_sinks
+                    or name in self.g.packet_filters
+                    or name in self.g.data_filters
+                    or name in self.g.module_sinks
+                ):
+                    continue
+                rows = next(
+                    (ref for ref in node.inputs if ref_type(self.g, ref) == "data"), None
+                )
+                if rows is None:
+                    continue
+                raise FfrwdError(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"the module '{node.filter}' reads {_named_ref(rows)} as its rows, "
+                    "a node's rows on a port of their own, and runs in a process "
+                    "with no node module in it to pair them with its frames",
+                    hint="hand it its first stream from the node writing the rows, "
+                    "or through modules only: an ffmpeg filter between them puts "
+                    "the two in different processes",
+                )
 
     def _check_rows_reach(self) -> None:
         """That the rows a module reads can reach it.
@@ -4022,6 +4057,7 @@ class _Partitioner:
             for name in members:
                 self.sidecar_of[name] = sidecar.id
         self._check_rows_reach()
+        self._check_node_rows_reach()
 
         # One ffmpeg process per output-file group, then one per raw stream
         # edge, created as the demand for it is found.

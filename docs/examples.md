@@ -1611,3 +1611,57 @@ ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 copy -f nut pipe:1 | ffrwd-
 ```
 
 The variants are what `ffrwd-wasm --av-info` lists under `filters`, and the node runs the D3D12 ones; `scale` with its width and height is the one mapped so far. `deinterlace_d3d12` is not: creating its video processor removes the device on NVIDIA's driver, ffmpeg's own command line included, so `yadif` and `bwdif` stay in ffmpeg. A filter with no variant, or a call naming an option the variant lacks (`scale`'s `flags`, say), stays in ffmpeg, and the picture leaves the region for it at that filter. Where the compiling machine's sidecar loads no libav at all, the command is written for a reader whose sidecar carries the bundled libavfilter, as recipe 156 is written for a reader's ffmpeg.
+
+## 159. Blur the people, the rows on a port of their own
+
+Recipe 94 again, with `segment_gpu.wasm`, the build of `segment` that may hold its frames on the GPU. It is a node, so the map and the rows leave on two ports rather than the rows riding the map's frames, and `mask_select`, a module of an older world, still reads its rows off its first stream. The compiler hands it the rows port as one more input after the map, and the sidecar pairs each row with the map frame at the row's time, which is the frame it rode in recipe 94. The query is recipe 94's but for the module and `memory`:
+
+```pgsql
+CREATE FUNCTION segment(v video_stream, memory text DEFAULT 'host')
+RETURNS STRUCT(map video_stream, objects STRUCT(id number, class text, score number,
+                                                x number, y number, w number, h number)[])
+  AS '../sidecar/modules/target/wasm32-wasip2/release/segment_gpu.wasm', 'segment'
+  LANGUAGE wasm;
+
+CREATE FUNCTION mask_select(map video_stream,
+                            objects STRUCT(id number, class text, score number,
+                                           x number, y number, w number, h number)[])
+RETURNS video_stream
+  AS '../sidecar/modules/target/wasm32-wasip2/release/mask_select.wasm', 'mask_select' LANGUAGE wasm;
+
+CREATE FUNCTION blur_mask(v video_stream, mask video_stream,
+                          max_radius number DEFAULT 16, invert boolean DEFAULT FALSE)
+RETURNS video_stream
+  AS '../sidecar/modules/target/wasm32-wasip2/release/blur_mask.wasm', 'blur_mask' LANGUAGE wasm;
+
+COPY (
+  SELECT blur_mask(s.video[1],
+                   mask_select(segment(s.video[1]).map,
+                               ARRAY(SELECT o FROM unnest(segment(s.video[1]).objects) o
+                                     WHERE o.class = 'person')),
+                   24), s.audio
+  FROM input('tests/fixtures/av.mp4') s
+) TO 'blurred.mp4' WITH (video_codec 'libx264', crf 20)
+```
+
+```
+$ ffrwd compile -f query.sql
+ffmpeg -i tests/fixtures/av.mp4 -map 0:v:0 -c:0 rawvideo -pix_fmt:0 yuv420p -f nut \
+  pipe:1 | ffrwd-wasm -f nut -i pipe:0 -pad \
+  '{"color": {"range": "unknown", "primaries": "unknown", "trc": "unknown",'\
+' "space": "unknown"}}' -nn \
+  segment=../sidecar/modules/target/wasm32-wasip2/release/segment.onnx -gpu \
+  ../sidecar/modules/target/wasm32-wasip2/release/segment_gpu.wasm -m \
+  segment_gpu=../sidecar/modules/target/wasm32-wasip2/release/segment_gpu.wasm -m \
+  mask_select=../sidecar/modules/target/wasm32-wasip2/release/mask_select.wasm -m \
+  blur_mask=../sidecar/modules/target/wasm32-wasip2/release/blur_mask.wasm \
+  -filter_complex \
+  '[v=0:v]segment_gpu=memory=host[map=n10][objects=n11];'\
+'[n11]rowfilter=pred={"eq"\\:\[{"field"\\:"class"}\,{"lit"\\:"person"}\]}[n2];'\
+'[n10][n2]mask_select[n3];[0:v][n3]blur_mask=max_radius=24:invert=0[out0]' -bound \
+  'segment_gpu=[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]}]' -map '[out0]' -f \
+  nut pipe:1 | ffmpeg -i tests/fixtures/av.mp4 -f nut -analyzeduration 0 -fpsprobesize 3 \
+  -i pipe:0 -map 1:v:0 -map 0:a:0 -c:1 copy -c:0 libx264 -crf:0 20 blurred.mp4
+```
+
+`[n10][n2]` is the map and the rows, in that order: a data pad last in an older module's chain is the rows it reads. The WHERE narrows the rows on their own port, before they are paired. `memory => 'gpu'` holds the frames on the device and paints the map there from the mask prototypes, which never cross to host memory where the model's session writes the device's; the run then needs a GPU adapter, and the default, `'host'`, does not. Since `segment_gpu.wasm` imports the device's interface, it is granted `-gpu` either way, and a sidecar built without GPU support refuses it, where it runs recipe 94's `segment.wasm`.

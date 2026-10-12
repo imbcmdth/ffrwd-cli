@@ -15511,8 +15511,27 @@ class _Lowerer:
         written = _unwrap(argument)
         if annotation_projection(written, self.res.wasm) is not None:
             return True
+        if self._with_node_rows(written, env) is not None:
+            return True
         bound = self._cte_column_ref(written, env)
         return bound is not None and bound[1] in bound[0].rows_columns
+
+    def _with_node_rows(
+        self, node: exp.Expr, env: _Env
+    ) -> tuple[_Value, WasmFunction, Annotation] | None:
+        """A WITH column holding a node's rows: the data stream, and the
+        function and record writing it. None for any other expression."""
+        bound = self._cte_column_ref(node, env)
+        if bound is None:
+            return None
+        column = next((c for c in bound[0].columns if c.name == bound[1]), None)
+        if column is None or column.value.is_array or len(column.value.streams) != 1:
+            return None
+        stream = column.value.streams[0]
+        found = self._node_rows.get(self._under_rows_nodes(stream.ref))
+        if stream.type != "data" or found is None:
+            return None
+        return column.value, found[0], found[1]
 
     def _rides_rows(self, argument: exp.Expr, value: _Value, env: _Env) -> bool:
         """Whether `argument` is a WITH stream column with rows riding it: the
@@ -15588,6 +15607,9 @@ class _Lowerer:
                 emitted = producer.emits
                 assert emitted is not None  # what annotation_projection selected on
                 returned = f"{producer.name}() returns '{emitted.name}' as {emitted.written}"
+            elif (column := self._with_node_rows(_unwrap(rows), env)) is not None:
+                emitted = column[2]
+                returned = f"{_quoted_column(rows)} carries {emitted.written}"
             else:
                 bound = self._cte_column_ref(_unwrap(rows), env)
                 assert bound is not None  # what `_is_rows_argument` selected on
@@ -15687,6 +15709,59 @@ class _Lowerer:
             )
         produced = self._lower_expr(rows_call, env, select)
         return self._row_filtered(produced, written)
+
+    def _rows_off_a_node(
+        self,
+        declared: WasmFunction,
+        call: _Call,
+        rows: exp.Expr | None,
+        env: _Env,
+        node: exp.Expr,
+        select: exp.Select,
+    ) -> tuple[_Value, _Value] | None:
+        """The first stream and the rows of a call whose annotation column a
+        node writes, or None where no node does.
+
+        A node of the node world writes its rows on a data port of their own,
+        `<call>.<rows>` or a WITH body's column of them, so they ride no
+        frames. The module of an older world
+        reading them takes that data stream as one more input after its
+        streams, and the sidecar pairs each row with the frame of its first
+        stream at the row's time, as rows riding that frame would have
+        arrived. A gather narrows the data stream on its way, as it narrows
+        any node's rows.
+        """
+        if rows is None:
+            return None
+        column = self._with_node_rows(_unwrap(rows), env)
+        if column is not None:
+            written, producer = column[0], column[1]
+            field_name = _quoted_column(rows).strip("'")
+        else:
+            found = self._node_call(_unwrap(rows))
+            if found is None or found[2] is None:
+                return None
+            producer, field_name = found[1], found[2]
+            output = next((o for o in producer.outputs or () if o.name == field_name), None)
+            if output is None or output.annotation is None:
+                return None
+            written = self._lower_expr(rows, env, select)
+        first = self._lower_expr(call.args[0], env, select)
+        for value, what, argument in (
+            (first, f"its '{declared.stream_params[0].name}' stream", call.args[0]),
+            (written, f"'{field_name}', the rows of {producer.name}()", rows),
+        ):
+            if value.is_array or len(value.streams) != 1:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"{declared.name}() reads {producer.name}()'s rows beside one "
+                    f"stream, and {what} is {len(value.streams)} of them",
+                    argument,
+                    fallback=node,
+                    hint=f"call {declared.name}() once per stream, each over the "
+                    f"rows of the {producer.name}() call that read it",
+                )
+        return first, written
 
     def _bound_annotation(
         self,
@@ -15885,7 +15960,14 @@ class _Lowerer:
             raise self._bad_streams(call, node, select, expected, kinds)
         self._check_annotation_argument(declared, call, rows, env, node, select)
         positions = list(range(arity))
-        wired = self._written_annotation(declared, call, rows, env, node, select)
+        # Rows a node writes on a data port of their own reach the module as
+        # an input after its streams, paired with its first by time.
+        paired = self._rows_off_a_node(declared, call, rows, env, node, select)
+        wired = (
+            paired[0]
+            if paired is not None
+            else self._written_annotation(declared, call, rows, env, node, select)
+        )
         streams = {
             position: (
                 wired
@@ -15900,12 +15982,15 @@ class _Lowerer:
         # whether the column is written or left to its DEFAULT, so the node
         # says so and an edge between processes carries them as a region
         # would. A column left to its DEFAULT over a plain stream reads none.
-        annotated = wired is not None or (
-            declared.reads is not None
-            and bool(call.args)
-            and (
-                self._annotating_call(call.args[0]) is not None
-                or self._rides_rows(call.args[0], streams[0], env)
+        annotated = paired is None and (
+            wired is not None
+            or (
+                declared.reads is not None
+                and bool(call.args)
+                and (
+                    self._annotating_call(call.args[0]) is not None
+                    or self._rides_rows(call.args[0], streams[0], env)
+                )
             )
         )
         tuples = env.relation.tuples if env.relation is not None else []
@@ -15946,6 +16031,8 @@ class _Lowerer:
                 ports=ports,
             )
             inputs = [_as_ref(values[position]) for position in positions]
+            if paired is not None:
+                inputs.append(paired[1].streams[0].ref)
             ref = self.ctx.node(
                 declared.module,
                 params,

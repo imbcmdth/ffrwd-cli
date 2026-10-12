@@ -2306,3 +2306,124 @@ def test_a_filter_between_pictures_on_the_device_runs_there_where_it_has_a_varia
             "[n1]filter=graph=scale_d3d12\\\\=w\\\\=160\\\\:h\\\\=120:format=yuv420p[n2]"
             in argv[argv.index("-filter_complex") + 1]
         )
+
+
+# -- a node's rows read by a module of an older world --------------------------
+
+_SPOTS = "STRUCT(start_t number, id number, x number, y number, w number, h number)[]"
+_DECLARATIONS["choose"] = (
+    f"CREATE FUNCTION choose(v video_stream, spots {_SPOTS}) RETURNS video_stream "
+    "AS 'choose.wasm', 'choose' LANGUAGE wasm;"
+)
+_DECLARATIONS["choose_rects"] = (
+    "CREATE FUNCTION choose_rects(v video_stream, boxes STRUCT(x number, y number, "
+    "w number, h number)[]) RETURNS video_stream AS 'choose_rects.wasm', 'choose_rects' "
+    "LANGUAGE wasm;"
+)
+
+
+def _older_reader(name: str) -> Described:
+    """A window filter of an older world reading the rows riding its frames."""
+    return Described(
+        world="ffrwd:av@0.10.0",
+        name=name,
+        version="0.1.0",
+        params_schema={"type": "object", "properties": {}},
+        pixel_formats=("yuv420p", "rgba"),
+        windowed=True,
+        reads_rows=True,
+    )
+
+
+def _with_readers(path: str) -> Described:
+    if path in ("choose.wasm", "choose_rects.wasm"):
+        return _older_reader(path.removesuffix(".wasm"))
+    return _node(path)
+
+
+def _choose_graph(query: str) -> Graph:
+    modules = {p: _with_readers(p) for p in [*SHAPES, "choose.wasm", "choose_rects.wasm"]}
+    return _lowered(query, modules)
+
+
+def test_a_nodes_rows_reach_an_older_module_as_an_input_after_its_streams() -> None:
+    written = {
+        "fields": "COPY (SELECT choose(matte(f.video[1]).mask, matte(f.video[1]).spots)" + _FROM,
+        "a WITH body": (
+            "COPY (WITH m AS (SELECT (matte(f.video[1])).* FROM input('f.mp4') f) "
+            "SELECT choose(m.mask, m.spots) FROM m) TO 'out.mkv'"
+        ),
+    }
+    for spelling, query in written.items():
+        graph = _choose_graph(query)
+        (matte,) = [n for n in graph.nodes.values() if n.filter == "matte.wasm"]
+        (choose,) = [n for n in graph.nodes.values() if n.filter == "choose.wasm"]
+        assert choose.inputs == [f"{matte.id}:0", f"{matte.id}:1"], spelling
+        assert not choose.reads_annotations, f"{spelling}: the rows ride no frames"
+
+
+def test_a_gather_narrows_a_nodes_rows_before_an_older_module_pairs_them() -> None:
+    graph = _choose_graph(
+        "COPY (SELECT choose(matte(f.video[1]).mask, ARRAY(SELECT s FROM "
+        "unnest(matte(f.video[1]).spots) s WHERE s.w >= 20))" + _FROM
+    )
+    (matte,) = [n for n in graph.nodes.values() if n.filter == "matte.wasm"]
+    (narrow,) = [n for n in graph.nodes.values() if n.filter == "rowfilter"]
+    (choose,) = [n for n in graph.nodes.values() if n.filter == "choose.wasm"]
+    assert narrow.inputs == [f"{matte.id}:1"]
+    assert choose.inputs == [f"{matte.id}:0", narrow.id]
+
+
+def test_an_older_module_takes_a_nodes_rows_only_in_its_own_record() -> None:
+    caught = _refused(
+        "COPY (SELECT choose_rects(matte(f.video[1]).mask, matte(f.video[1]).spots)"
+        + _FROM,
+        {p: _with_readers(p) for p in [*SHAPES, "choose.wasm", "choose_rects.wasm"]},
+    )
+    assert caught.code is ErrorCode.UDF_ARG_TYPE
+    assert caught.message == (
+        f"choose_rects() takes 'boxes' as STRUCT(x number, y number, w number, h number)[], "
+        f"and matte() returns 'spots' as {_SPOTS}"
+    )
+
+
+def test_a_nodes_rows_read_by_an_older_module_are_its_last_pad(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    argv = _plan_argv(
+        "COPY (SELECT choose(matte(f.video[1]).mask, ARRAY(SELECT s FROM "
+        "unnest(matte(f.video[1]).spots) s WHERE s.w >= 20)), "
+        "choose(matte(f.video[1]).mask, matte(f.video[1]).spots)"
+        " FROM input('f.mp4') f) TO 'out.mkv'",
+        monkeypatch,
+        describe=_with_readers,
+    )
+    wiring = argv["sidecar0"][argv["sidecar0"].index("-filter_complex") + 1]
+    chains = wiring.split(";")
+    assert chains[0].startswith("[v=0:v]matte=every=30[mask=")
+    mask, spots = re.findall(r"\[(?:mask|spots)=(\w+)\]", chains[0])
+    narrowed = next(c for c in chains if c.startswith(f"[{spots}]rowfilter="))
+    kept = narrowed.rpartition("[")[2].rstrip("]")
+    assert f"[{mask}][{kept}]choose" in wiring, "the narrowed rows, after the map"
+    assert f"[{mask}][{spots}]choose" in wiring, "and the same rows whole, to a second reader"
+
+
+def test_a_nodes_rows_cannot_reach_an_older_module_through_ffmpeg(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probes = _probes()
+    monkeypatch.setattr(
+        "ffrwd.compiler.probe_path", lambda path, args=(), **kw: probes[path[0]]
+    )
+    with pytest.raises(FfrwdError) as caught:
+        compile_all(
+            _declared(
+                "COPY (SELECT choose(scale(matte(f.video[1]).mask, 160, 120), "
+                "matte(f.video[1]).spots) FROM input('f.mp4') f) TO 'out.mkv'"
+            ),
+            describe=_with_readers,
+            shape=_Asked(),
+        )
+    assert caught.value.code is ErrorCode.UNSUPPORTED_SQL
+    assert "runs in a process with no node module in it" in caught.value.message
+    assert (caught.value.line, caught.value.col) == (2, 17), "at choose()'s declaration"

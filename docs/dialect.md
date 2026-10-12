@@ -604,6 +604,18 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   - A call over a node making a stream and the rows beside it hands a
     reader both, the stream into one port and the rows into the next:
     `ring(matte(v))` is `ring(matte(v).mask, matte(v).spots)`.
+  - A function of an older world taking an annotation column takes a
+    node's rows there too: the field read off the call,
+    `mask_select(segment(v).map, segment(v).objects)`, a gather over it,
+    or a WITH body's column of them. The records match as they do between
+    two older modules. The rows ride no frames: they reach the module as a
+    data stream after its streams, and the sidecar pairs each row with the
+    frame of its first stream at or before the row's time, the one it
+    would have ridden. The module runs in the node's region; one whose
+    first stream reaches it through an ffmpeg filter would run in a
+    process with no node to pair the rows, and is refused saying so.
+    Recipe
+    [159](examples.md#159-blur-the-people-the-rows-on-a-port-of-their-own).
   - Rows match by field, compared as the JSON schemas of the two ports:
     every field the reading port names is in the producer's, with a type
     it takes (`integer` is a `number`), and fields beyond those pass. A
