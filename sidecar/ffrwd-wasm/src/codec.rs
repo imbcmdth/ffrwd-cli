@@ -11,7 +11,6 @@
 //! thread demuxes the input so the calls are handed whatever has arrived in
 //! one batch, and a pipe output is flushed after every batch.
 
-use std::io;
 use std::sync::mpsc;
 use std::thread;
 
@@ -24,7 +23,7 @@ use ffrwd_wasm_runtime::runtime::{
 
 use super::{
     aspect_from, check_frame, color_from, colorspace_type_for, format_from_stream, frame_len_for,
-    open_frame_output, open_input, output_is_pipe, stream_info, Args, FrameOutput, Input,
+    open_counted, open_frame_output, output_is_pipe, stream_info, Args, FrameOutput, Input,
     OutputKind, EDGE_FORMAT,
 };
 
@@ -206,8 +205,7 @@ pub(crate) fn run_codec(args: &Args, module: &str, params: &str) -> Result<()> {
             output.spelling
         );
     }
-    let reader = io::BufReader::with_capacity(1 << 20, open_input(input)?);
-    let demuxer = nut::Demuxer::open(reader).context("reading the NUT input")?;
+    let demuxer = nut::Demuxer::open(open_counted(input)?).context("reading the NUT input")?;
     match half {
         CodecHalf::Encode => encode(args, module, params, demuxer),
         CodecHalf::Decode => decode(args, module, params, demuxer),

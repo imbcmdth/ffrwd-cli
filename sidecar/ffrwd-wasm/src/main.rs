@@ -1290,8 +1290,27 @@ impl Write for OutputWriter {
 }
 
 /// The demuxed input, and the muxed frame output, as they are actually built.
-type Input = nut::Demuxer<io::BufReader<InputReader>>;
+type Input = nut::Demuxer<CountedInput>;
 type FrameOutput = nut::Muxer<io::BufWriter<OutputWriter>>;
+
+/// An input as a demuxer reads it: no buffer of its own between the pipe
+/// and the demuxer, which reads a frame's payload straight into the frame,
+/// and every read counted in the profile's `read` stage.
+struct CountedInput(InputReader);
+
+impl Read for CountedInput {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let started = Instant::now();
+        let read = self.0.read(buf)?;
+        PROFILE.read.add(read, started);
+        Ok(read)
+    }
+}
+
+/// `open_input`, for a demuxer to read.
+fn open_counted(path: &InputPath) -> Result<CountedInput> {
+    open_input(path).map(CountedInput)
+}
 
 fn open_input(path: &InputPath) -> Result<InputReader> {
     let reader = match path {
@@ -2165,7 +2184,7 @@ fn run(args: &Args) -> Result<()> {
             .iter()
             .map(|path| {
                 scope.spawn(move || -> Result<Input> {
-                    let reader = io::BufReader::with_capacity(1 << 20, open_input(path)?);
+                    let reader = open_counted(path)?;
                     if args.annotations.input {
                         nut::Demuxer::open_annotated(reader)
                     } else {

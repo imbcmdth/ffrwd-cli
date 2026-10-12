@@ -23,12 +23,14 @@ use ffrwd_wasm_runtime::runtime::{self, Message, Packet, TimeBase};
 
 use crate::heartbeat::{self, Beats};
 use crate::tick::compare;
-use crate::{open_input, open_output, subtitles, InputPath, InputReader, OutputPath, OutputWriter};
+use crate::{
+    open_counted, open_output, subtitles, CountedInput, InputPath, OutputPath, OutputWriter,
+};
 
 /// One input with its headers read and its frames still to come.
 pub struct Opened {
     pub streams: Vec<nut::Stream>,
-    reader: InputReader,
+    reader: CountedInput,
     demuxer: PushDemuxer,
 }
 
@@ -65,11 +67,10 @@ const READ_CHUNK: usize = 1 << 16;
 /// read where it still wants at least a chunk, else a chunk through the
 /// demuxer's own buffer. What was read; 0 at the end of the input.
 fn read_into(
-    reader: &mut InputReader,
+    reader: &mut CountedInput,
     demuxer: &mut PushDemuxer,
     chunk: &mut [u8],
 ) -> Result<usize> {
-    let started = Instant::now();
     let n = match demuxer.payload_space() {
         Some(space) if space.len() >= chunk.len() => {
             let n = reader.read(space)?;
@@ -84,7 +85,6 @@ fn read_into(
             n
         }
     };
-    PROFILE.read.add(n, started);
     Ok(n)
 }
 
@@ -113,7 +113,7 @@ pub fn open_inputs(paths: &[InputPath]) -> Result<Vec<Opened>> {
 }
 
 fn open_one(path: &InputPath) -> Result<Opened> {
-    let mut reader = open_input(path)?;
+    let mut reader = open_counted(path)?;
     let mut demuxer = PushDemuxer::new(Limits::default());
     let mut chunk = vec![0u8; READ_CHUNK];
     loop {

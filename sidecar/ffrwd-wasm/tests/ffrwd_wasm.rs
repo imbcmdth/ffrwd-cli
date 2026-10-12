@@ -1362,6 +1362,64 @@ fn the_single_module_spelling_runs_as_a_network_of_one() {
     );
 }
 
+/// The profile row a `-profile` run wrote on stderr.
+fn profile_row(run: &FfrwdWasmRun) -> serde_json::Value {
+    run.stderr
+        .lines()
+        .filter_map(|line| line.strip_prefix("ffrwd:row "))
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("a row is JSON"))
+        .find(|row| row["kind"] == "profile")
+        .unwrap_or_else(|| panic!("no profile row on stderr:\n{}", run.stderr))
+}
+
+#[test]
+fn an_older_module_reads_its_input_the_way_a_node_network_does() {
+    let frames: Vec<Vec<u8>> = (0..6u8).map(synthetic_frame).collect();
+    let wire = nut_stream(&frames);
+
+    let alone = run_filter(&module_path("invert"), &["-profile"], &wire);
+    assert_run_ok(&alone, "-m <path> -profile");
+    // A node module bound, called or not, runs the network on the node lanes.
+    let nodes = run_network(
+        &[("invert", "invert"), ("canvas", "shape_canvas")],
+        "[0:v]invert[out0]",
+        &["-profile"],
+        ONE_OUTPUT,
+        &wire,
+    );
+    assert_run_ok(&nodes, "invert in a node network -profile");
+    assert_eq!(
+        alone.stdout, nodes.stdout,
+        "invert writes the same bytes alone and in a node network"
+    );
+
+    let alone = profile_row(&alone);
+    let nodes = profile_row(&nodes);
+    for (what, row) in [("alone", &alone), ("node network", &nodes)] {
+        assert_eq!(
+            row["read"]["bytes"],
+            wire.len() as u64,
+            "{what}: the whole wire is read, headers and all, once: {row}"
+        );
+        assert_eq!(
+            row["held"]["bytes"],
+            (frames.len() * FRAME_LEN) as u64,
+            "{what}: {row}"
+        );
+        assert_eq!(
+            row["held"]["calls"],
+            frames.len() as u64,
+            "{what}: each frame is held once: {row}"
+        );
+    }
+    for stage in ["read", "held"] {
+        assert_eq!(
+            alone[stage]["bytes"], nodes[stage]["bytes"],
+            "{stage}: alone {alone}, node network {nodes}"
+        );
+    }
+}
+
 #[test]
 fn rows_ride_from_one_module_to_the_next_inside_the_process() {
     // tail3 carries the rows arriving with a frame on through, and blur-boxes
