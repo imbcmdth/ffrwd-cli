@@ -185,6 +185,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from importlib import metadata
@@ -217,7 +218,7 @@ from .compiler import (
     compile_table_sql,
     emitted_commands,
 )
-from .console import Console, WorkProgress
+from .console import Console, WorkProgress, written_size
 from .emit import Emitted, build_ffmpeg_commands
 from .errors import ErrorCode, FfrwdError
 from .execute import (
@@ -363,6 +364,12 @@ def main(argv: list[str] | None = None) -> int:
     warnings = WarningLog()
     try:
         return handler(args, warnings)
+    except FfrwdError as err:
+        # A refusal raised outside a command's own handling -- FFRWD_OFFLINE
+        # refusing the ffmpeg provider's download wherever ffmpeg is first
+        # looked for -- prints the way every other one does.
+        _print_error(err)
+        return 1
     except KeyboardInterrupt:
         # A run's own interrupt is already reported by its result
         # (`_cmd_run`/`_run_plan` read `interrupted` off it); this is the
@@ -774,8 +781,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     setup_p.add_argument(
         "what",
+        nargs="?",
         choices=["nn"],
-        help="nn: the ONNX Runtime the modules that run models load",
+        help="nn: only the ONNX Runtime the modules that run models load; "
+        "omitted, ffmpeg and ffprobe too, where PATH does not have them",
     )
     setup_p.add_argument(
         "--cuda",
@@ -1719,6 +1728,36 @@ def _cmd_run(args: argparse.Namespace, on_warning: OnWarning) -> int:
             return 1
         return _print_table_sinks(sinks)
 
+    # What the query's modules declare is read once for the run: whether one
+    # runs a model decides the prefetch, and the compile reads it again.
+    describe = _remembered(wasm.describe)
+    prefetch = _start_prefetch(classification.modules, describe, console)
+    try:
+        return _run_media(args, on_warning, console, query, packages, describe, prefetch)
+    except BaseException:
+        if prefetch is not None:
+            prefetch.cancel()
+        raise
+    finally:
+        if prefetch is not None:
+            prefetch.finish()
+
+
+def _run_media(
+    args: argparse.Namespace,
+    on_warning: OnWarning,
+    console: Console,
+    query: _Query,
+    packages: PackageSet | None,
+    describe: wasm.Describe,
+    prefetch: _Prefetch | None,
+) -> int:
+    """Compile and run a query that writes media: `run` past its table branch.
+
+    `describe` reads the query's modules for the compile; `prefetch` is the
+    ONNX Runtime download already under way, joined before a sidecar spawns.
+    """
+    showing = args.show or args.show_only
     try:
         with console.status("compiling"):
             compiled = compile_all(
@@ -1727,6 +1766,7 @@ def _cmd_run(args: argparse.Namespace, on_warning: OnWarning) -> int:
                 on_warning=on_warning,
                 unset=query.unset,
                 owner=query.owner,
+                describe=describe,
             )
         graphs: list[Graph] = compiled.graphs
         plan: ProcessPlan | None = compiled.plan
@@ -1771,7 +1811,9 @@ def _cmd_run(args: argparse.Namespace, on_warning: OnWarning) -> int:
     work = _work(args, compiled, console)
 
     if plan is not None:
-        return _run_plan(plan, args, packages, query, windows, budget, console, work)
+        return _run_plan(
+            plan, args, packages, query, windows, budget, console, work, prefetch
+        )
 
     # `ffrwd.execute` owns the loop; the CLI owns the printing. By default
     # ffmpeg's own output is captured and printed only for a command that
@@ -1844,13 +1886,109 @@ def _work(
     return console.work("encoding", compiled.duration)
 
 
-def _provision_nn(plan: ProcessPlan, console: Console) -> int:
+class _Cancelled(Exception):
+    """Raised inside a prefetch's progress to stop its download at the next block."""
+
+
+# How long a cancelled prefetch is given to drop what it had half written.
+_CANCEL_SECONDS = 5.0
+
+
+class _Prefetch:
+    """The ONNX Runtime download a run starts on a thread while it compiles.
+
+    The fetch is :func:`ffrwd.nn.ensure`'s own, announced and drawn through
+    the console, whose writes are serialized under its lock. :meth:`join`
+    waits for it and re-raises what it raised; :meth:`finish` waits for it
+    and drops that; :meth:`cancel` stops it at the next block, the way a
+    failed download stops, leaving nothing half written, and waits a few
+    seconds for it at most.
+    """
+
+    def __init__(self, console: Console) -> None:
+        self._console = console
+        self._cancelled = threading.Event()
+        self._raised: BaseException | None = None
+        self._thread = threading.Thread(target=self._fetch, daemon=True)
+
+    def start(self) -> _Prefetch:
+        self._thread.start()
+        return self
+
+    def _fetch(self) -> None:
+        drawn = self._console.progress("downloading")
+
+        def progress(done: int, total: int | None) -> None:
+            if self._cancelled.is_set():
+                raise _Cancelled
+            drawn(done, total)
+
+        try:
+            nn.ensure(announce=self._console.say, progress=progress)
+        except BaseException as err:  # handed to whoever joins
+            self._raised = err
+
+    def join(self) -> None:
+        self._thread.join()
+        raised, self._raised = self._raised, None
+        if raised is not None and not isinstance(raised, _Cancelled):
+            raise raised
+
+    def finish(self) -> None:
+        if not self._cancelled.is_set():
+            self._thread.join()
+        self._raised = None
+
+    def cancel(self) -> None:
+        self._cancelled.set()
+        self._thread.join(timeout=_CANCEL_SECONDS)
+
+
+def _remembered(describe: wasm.Describe) -> wasm.Describe:
+    """`describe`, asked once per module path; a refusal is not kept."""
+    known: dict[str, wasm.Described] = {}
+
+    def remembered(path: str) -> wasm.Described:
+        if path not in known:
+            known[path] = describe(path)
+        return known[path]
+
+    return remembered
+
+
+def _start_prefetch(
+    modules: frozenset[str], describe: wasm.Describe, console: Console
+) -> _Prefetch | None:
+    """Start the ONNX Runtime download a run is going to need, or None.
+
+    Only for a query naming a module that runs a model, on a machine missing
+    a tier it wants: the fetch :func:`_provision_nn` would make before
+    spawning, started instead while the inputs are probed and the query
+    lowered. Anything this cannot answer -- no sidecar, a module that will
+    not describe -- starts nothing, and the compile or `_provision_nn`
+    reports it where it always has.
+    """
+    try:
+        if not any(describe(module).nn for module in sorted(modules)):
+            return None
+        if not nn.pending_tiers():
+            return None
+    except FfrwdError:
+        return None
+    return _Prefetch(console).start()
+
+
+def _provision_nn(
+    plan: ProcessPlan, console: Console, prefetch: _Prefetch | None = None
+) -> int:
     """Put an ONNX Runtime on this machine when `plan` reaches a model.
 
     Before anything is spawned, so a first run of a query that infers waits
     for a download once instead of failing on a library it has not got. A
     plan that binds no model touches none of this and asks the sidecar
-    nothing.
+    nothing. `prefetch` is the download the run started while compiling,
+    waited for here; what it left missing -- a module adopted only once the
+    inputs were probed -- is fetched after it.
     """
     if not any(
         isinstance(process, SidecarProcess) and process.models
@@ -1858,6 +1996,8 @@ def _provision_nn(plan: ProcessPlan, console: Console) -> int:
     ):
         return 0
     try:
+        if prefetch is not None:
+            prefetch.join()
         nn.ensure(announce=console.say, progress=console.progress("downloading"))
     except FfrwdError as err:
         _print_error(err)
@@ -1874,6 +2014,7 @@ def _run_plan(
     timeout: float | None,
     console: Console,
     work: WorkProgress | None = None,
+    prefetch: _Prefetch | None = None,
 ) -> int:
     """Run a query that reaches a wasm module, and report it as `run` reports.
 
@@ -1894,7 +2035,7 @@ def _run_plan(
     same project and for the same recipe, and each member's stderr is kept
     where FFRWD_DUMP_STDERR names, as every member of the run's own is.
     """
-    code = _provision_nn(plan, console)
+    code = _provision_nn(plan, console, prefetch)
     if code != 0:
         return code
     owner = query.owner if query is not None else None
@@ -3528,11 +3669,13 @@ def _cmd_publish(args: argparse.Namespace, on_warning: OnWarning) -> int:
 def _cmd_setup(args: argparse.Namespace, on_warning: OnWarning) -> int:
     """Download what a query would otherwise fetch on its way to running.
 
-    Nothing depends on this having been run -- a query that reaches a model
-    looks at the same machine and provisions the same tiers itself. It is for
-    a CI image, a machine about to lose its network, and the one line naming
-    what was found before any of it is fetched. ``--cuda`` and ``--full`` add
-    a tier whatever detection said.
+    Nothing depends on this having been run -- a query looks at the same
+    machine and fetches the same things itself. It is for a CI image, a
+    machine about to lose its network, and the line naming what is coming
+    before any of it is fetched. With no argument it fetches ffmpeg and
+    ffprobe where PATH does not have them, and the ONNX Runtime tiers
+    detection wants; ``nn`` is the ONNX Runtime alone. ``--cuda`` and ``--full`` add a
+    tier whatever detection said, either way.
     """
     console = _console(args)
     if args.full and not args.cuda:
@@ -3541,15 +3684,42 @@ def _cmd_setup(args: argparse.Namespace, on_warning: OnWarning) -> int:
             file=sys.stderr,
         )
         return 2
+    if args.what == "nn":
+        return _setup_nn(args, console)
+    return _setup_all(args, console)
+
+
+def _setup_command(args: argparse.Namespace) -> str:
+    """The ``ffrwd setup`` spelling this invocation is, for a refusal to name."""
+    words = ["ffrwd", "setup"]
+    if args.what:
+        words.append(args.what)
+    if args.cuda:
+        words.append("--cuda")
+    if args.full:
+        words.append("--full")
+    return " ".join(words)
+
+
+def _setup_tiers(
+    args: argparse.Namespace, found: nn.Info, machine: nn.Machine
+) -> tuple[list[str], tuple[str, ...]]:
+    """The tiers to provision, and the ones detection alone wanted."""
+    detected = nn.wanted_tiers(found, machine)
+    tiers = list(detected)
+    if args.cuda and "cuda" not in tiers:
+        tiers.append("cuda")
+    if args.full and "full" not in tiers:
+        tiers.append("full")
+    return tiers, detected
+
+
+def _setup_nn(args: argparse.Namespace, console: Console) -> int:
+    """``ffrwd setup nn``: the ONNX Runtime alone."""
     try:
         found = nn.info()
         machine = nn.detect(found)
-        detected = nn.wanted_tiers(found, machine)
-        tiers = list(detected)
-        if args.cuda and "cuda" not in tiers:
-            tiers.append("cuda")
-        if args.full and "full" not in tiers:
-            tiers.append("full")
+        tiers, detected = _setup_tiers(args, found, machine)
         print(nn.describe(found, machine))
         with console.status("provisioning"):
             directory = nn.provision(
@@ -3557,6 +3727,7 @@ def _cmd_setup(args: argparse.Namespace, on_warning: OnWarning) -> int:
                 announce=console.say,
                 found=found,
                 progress=console.progress("downloading"),
+                command=_setup_command(args),
             )
     except FfrwdError as err:
         _print_error(err)
@@ -3564,12 +3735,91 @@ def _cmd_setup(args: argparse.Namespace, on_warning: OnWarning) -> int:
 
     if args.cuda and "cuda" in detected:
         print("--cuda: detection already took the CUDA provider on this machine")
+    _say_runtime(args, found, directory)
+    return 0
+
+
+def _say_runtime(args: argparse.Namespace, found: nn.Info, directory: Path) -> None:
+    """Where the ONNX Runtime is, and under --verbose every library in it."""
     print(f"ONNX Runtime {found.ort_version} for {found.platform} is in {directory}")
     if not _verbose(args):
-        return 0
+        return
     for line in _runtime_listing(directory):
         print(f"  {line}")
     print(f"a query that runs a model finds it there; {nn.TARGET_VAR} names the target")
+
+
+def _fetch_line(downloads: Sequence[binaries.Download]) -> str:
+    """The one line naming every download `setup` is about to make, and the total."""
+    if not downloads:
+        return "nothing to fetch: this machine already has everything a query fetches"
+    parts = [
+        f"{one.what} ({written_size(one.size)})" if one.size is not None else one.what
+        for one in downloads
+    ]
+    sizes = [one.size for one in downloads if one.size is not None]
+    if len(downloads) > 1 and len(sizes) == len(downloads):
+        return f"fetching {written_size(sum(sizes))}: " + "; ".join(parts)
+    return "fetching " + "; ".join(parts)
+
+
+def _setup_all(args: argparse.Namespace, console: Console) -> int:
+    """``ffrwd setup``: ffmpeg and ffprobe, then the ONNX Runtime.
+
+    Both are planned before either is fetched, so the line saying what is
+    coming and how big comes first. A machine with no sidecar has no ONNX
+    Runtime to fetch, and says so rather than refusing.
+    """
+    command = _setup_command(args)
+    found: nn.Info | None = None
+    tiers: list[str] = []
+    detected: tuple[str, ...] = ()
+    try:
+        downloads: list[binaries.Download] = []
+        ffmpeg = binaries.ffmpeg_download()
+        if ffmpeg is not None:
+            downloads.append(ffmpeg)
+        if binaries.ffrwd_wasm_path() is None:
+            print("the ffrwd-wasm sidecar is not installed: no ONNX Runtime to fetch")
+        else:
+            found = nn.info()
+            machine = nn.detect(found)
+            tiers, detected = _setup_tiers(args, found, machine)
+            print(nn.describe(found, machine))
+            runtime = nn.download(tiers, found)
+            if runtime is not None:
+                downloads.append(runtime)
+        print(_fetch_line(downloads))
+        # What a first use would fetch, fetched the same way; the provisioner
+        # draws its own progress, so no spinner runs over it.
+        ffmpeg_at, ffprobe_at = binaries.ffmpeg_path(), binaries.ffprobe_path()
+        if ffmpeg_at is None or ffprobe_at is None:
+            raise FfrwdError(
+                ErrorCode.RUNTIME_NOT_FOUND,
+                "ffmpeg and ffprobe are on neither PATH nor the static-ffmpeg provisioner",
+                hint=binaries.INSTALL_HINT,
+            )
+        with console.status("provisioning"):
+            directory = (
+                nn.provision(
+                    tiers,
+                    found=found,
+                    progress=console.progress("downloading"),
+                    command=command,
+                )
+                if found is not None
+                else None
+            )
+    except FfrwdError as err:
+        _print_error(err)
+        return 1
+
+    print(f"ffmpeg is {ffmpeg_at}")
+    print(f"ffprobe is {ffprobe_at}")
+    if args.cuda and "cuda" in detected:
+        print("--cuda: detection already took the CUDA provider on this machine")
+    if found is not None and directory is not None:
+        _say_runtime(args, found, directory)
     return 0
 
 

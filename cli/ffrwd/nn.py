@@ -37,6 +37,10 @@ where the machine has none of its own. macOS takes the stock archive, which
 carries CoreML inside it. ``ffrwd setup nn --cuda``/``--full`` add a tier
 detection did not.
 
+With ``FFRWD_OFFLINE`` set, a tier that would have to be fetched is refused
+through :func:`ffrwd.binaries.refuse_offline` instead; a machine already
+holding every tier it wants runs as it would anyway.
+
 Every artifact is pinned: a URL, a sha256, and its exact byte count, per
 runtime version and platform. The download stops at the first block past that
 count, the archive is verified whole before anything is opened, each library
@@ -72,8 +76,11 @@ __all__ = [
     "SETUP_HINT",
     "describe",
     "detect",
+    "download",
     "ensure",
     "info",
+    "missing_tiers",
+    "pending_tiers",
     "provision",
     "runtime_dir",
     "spawn_args",
@@ -92,7 +99,8 @@ TARGET_VAR = "FFRWD_NN_TARGET"
 _NN_RUNTIME_FLAG = "-nn-runtime"
 _NN_TARGET_FLAG = "-nn-target"
 
-SETUP_HINT = "run `ffrwd setup nn` once with a network connection"
+SETUP_COMMAND = "ffrwd setup nn"
+SETUP_HINT = f"run `{SETUP_COMMAND}` once with a network connection"
 
 _TIMEOUT = 60.0
 
@@ -1082,12 +1090,33 @@ def _megabytes(size: int) -> str:
     return f"{size / (1024 * 1024):.0f} MB"
 
 
+def _tier_names(tiers: Sequence[str]) -> str:
+    return " and ".join(_TIER_NAMES.get(tier, tier) for tier in tiers)
+
+
+def _fetching(found: Info, tiers: Sequence[str]) -> str:
+    """What fetching `tiers` brings, for a refusal or a plan of downloads."""
+    return f"ONNX Runtime {found.ort_version} for {found.platform} with {_tier_names(tiers)}"
+
+
 def _notice(found: Info, tiers: Sequence[str], size: int) -> str:
     """The one line a fetch prints: what, how big, and that it happens once."""
-    what = " and ".join(_TIER_NAMES.get(tier, tier) for tier in tiers)
     return (
         f"[nn] fetching ONNX Runtime {found.ort_version} for {found.platform} "
-        f"({what}, {_megabytes(size)}) -- once, into {runtime_dir(found)}"
+        f"({_tier_names(tiers)}, {_megabytes(size)}) -- once, into {runtime_dir(found)}"
+    )
+
+
+def download(tiers: Sequence[str], found: Info | None = None) -> binaries.Download | None:
+    """What provisioning `tiers` would fetch on this machine, or None for nothing."""
+    known = found if found is not None else info()
+    pinned = _table(known)
+    absent = missing_tiers(tiers, known)
+    if not absent:
+        return None
+    return binaries.Download(
+        what=_fetching(known, absent),
+        size=sum(_size_of(pinned.get(tier, ())) for tier in absent),
     )
 
 
@@ -1097,12 +1126,15 @@ def provision(
     announce: Announce | None = None,
     found: Info | None = None,
     progress: Progress | None = None,
+    command: str = SETUP_COMMAND,
 ) -> Path:
     """Put every tier of `tiers` under the runtime directory, and return it.
 
     A tier already on disk is left alone and costs nothing. `announce` is
     called with the one line a fetch prints, and not called at all when
     nothing had to be fetched; `progress` hears the bytes of every archive.
+    `command` is what an ``FFRWD_OFFLINE`` refusal names as the way to fetch
+    the tiers ahead of time.
     """
     known = found if found is not None else info()
     pinned = _table(known)
@@ -1116,8 +1148,11 @@ def provision(
             )
     directory = runtime_dir(known)
     absent = missing_tiers(tiers, known)
+    size = sum(_size_of(pinned[tier]) for tier in absent)
+    if absent:
+        binaries.refuse_offline(_fetching(known, absent), size, command)
     if absent and announce is not None:
-        announce(_notice(known, absent, sum(_size_of(pinned[tier]) for tier in absent)))
+        announce(_notice(known, absent, size))
     for tier in absent:
         _fetch_tier(directory, tier, pinned[tier], progress)
     return directory
@@ -1139,6 +1174,18 @@ def ensure(
     return provision(
         wanted_tiers(known), announce=announce, found=known, progress=progress
     )
+
+
+def pending_tiers() -> tuple[str, ...]:
+    """The tiers :func:`ensure` would fetch now, in the order they apply.
+
+    Empty when the environment names a runtime of its own, or when every
+    tier this machine wants is already on disk.
+    """
+    if _named_runtime() is not None:
+        return ()
+    known = info()
+    return missing_tiers(wanted_tiers(known), known)
 
 
 def _named_runtime() -> str | None:

@@ -159,6 +159,7 @@ from pathlib import Path
 from typing import Literal
 
 from ffrwd import binaries
+from ffrwd.errors import FfrwdError
 from ffrwd.ir import StreamType
 
 _TIMEOUT_SECONDS = 10.0
@@ -754,7 +755,13 @@ class Registry:
             return
         self._loaded = True
 
-        ffmpeg = binaries.ffmpeg_path()
+        try:
+            ffmpeg = binaries.ffmpeg_path()
+        except FfrwdError:
+            # FFRWD_OFFLINE refused the provider's download: asked again,
+            # it says so again.
+            self._loaded = False
+            raise
         if ffmpeg is None:
             return
         version_line = _get_version_line(ffmpeg)

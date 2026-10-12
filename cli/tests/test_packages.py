@@ -40,7 +40,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from ffrwd import cli, credentials, packages, store
+from ffrwd import cli, credentials, nn, packages, store
 from ffrwd.console import Console
 from ffrwd.errors import ErrorCode, FfrwdError
 from ffrwd.mcp import tools as mcp_tools
@@ -2457,3 +2457,36 @@ def test_a_model_naming_an_export_no_module_declares_fails_the_install(
     assert code == 1
     assert "the model for 'sharpen'" in err
     assert "names an export no module in it declares" in err
+
+
+def test_offline_refuses_the_runtime_an_install_would_fetch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A package whose modules run a model fetches the ONNX Runtime at
+    install; FFRWD_OFFLINE refuses that download the way a run's is refused."""
+    package = read_manifest(_package(tmp_path / "pkg") / "ffrwd.json")
+    monkeypatch.setattr(packages, "capabilities", lambda _: ("nn",))
+    linux = nn.Info(ort_version="9.9.9", providers=("cpu",), platform="linux-x64")
+    monkeypatch.setattr(nn, "_INFO", linux)
+    monkeypatch.setattr(nn, "nvidia_driver", lambda: False)
+    monkeypatch.setattr(nn, "cuda_libraries", lambda platform: False)
+    cpu = nn.Artifact(
+        url="https://example.invalid/cpu.tgz",
+        sha256="0" * 64,
+        size=5 * 1024 * 1024,
+        members=(nn.Member(entry="lib/libonnxruntime.so", name="libonnxruntime.so"),),
+    )
+    monkeypatch.setattr(nn, "_PINS", {("9.9.9", "linux-x64"): {"cpu": (cpu,)}})
+
+    def unreachable(*_: object, **__: object) -> object:
+        raise AssertionError("an offline install opened a connection")
+
+    monkeypatch.setattr(nn, "_urlopen", unreachable)
+    monkeypatch.setenv("FFRWD_OFFLINE", "yes")
+
+    with pytest.raises(FfrwdError) as caught:
+        packages._install_runtime(package)
+    assert "FFRWD_OFFLINE" in caught.value.message
+    assert "ONNX Runtime 9.9.9 for linux-x64 with the CPU provider, 5 MB" in caught.value.message
+    assert caught.value.hint is not None
+    assert "`ffrwd setup nn`" in caught.value.hint

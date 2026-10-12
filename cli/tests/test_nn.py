@@ -25,7 +25,8 @@ from typing import Any
 
 import pytest
 
-from ffrwd import cli, nn, wasm
+from ffrwd import binaries, cli, nn, wasm
+from ffrwd.console import written_size
 from ffrwd.errors import ErrorCode, FfrwdError
 from ffrwd.processes import ModelBinding, SidecarProcess
 
@@ -539,6 +540,43 @@ def test_a_tier_this_platform_has_none_of_is_refused_with_what_it_has(
     assert caught.value.code == ErrorCode.RUNTIME_NOT_FOUND
 
 
+def test_offline_refuses_a_fetch_naming_the_variable_what_and_the_command(
+    monkeypatch: pytest.MonkeyPatch, pinned: dict[str, bytes]
+) -> None:
+    seen: list[str] = []
+    _serving(monkeypatch, pinned, seen)
+    monkeypatch.setenv("FFRWD_OFFLINE", "1")
+    said: list[str] = []
+
+    with pytest.raises(FfrwdError) as caught:
+        nn.provision(["cpu", "directml"], announce=said.append, found=WINDOWS)
+    size = len(pinned["https://example.invalid/cpu.zip"]) + len(
+        pinned["https://example.invalid/gpu.tgz"]
+    )
+    assert caught.value.code == ErrorCode.RUNTIME_NOT_FOUND
+    assert "FFRWD_OFFLINE" in caught.value.message
+    assert (
+        "ONNX Runtime 9.9.9 for win-x64 with the CPU provider and the DirectML provider, "
+        f"{written_size(size)}"
+    ) in caught.value.message
+    assert caught.value.hint is not None
+    assert "`ffrwd setup nn`" in caught.value.hint
+    assert seen == []
+    assert said == []  # refused before the line saying it was coming
+
+
+def test_offline_runs_a_machine_already_holding_its_tiers(
+    monkeypatch: pytest.MonkeyPatch, pinned: dict[str, bytes]
+) -> None:
+    seen: list[str] = []
+    _serving(monkeypatch, pinned, seen)
+    nn.provision(["cpu"], found=WINDOWS)
+    monkeypatch.setenv("FFRWD_OFFLINE", "1")
+
+    assert nn.provision(["cpu"], found=WINDOWS) == nn.runtime_dir(WINDOWS)
+    assert len(seen) == 1
+
+
 def test_the_environment_naming_a_runtime_stops_the_bootstrap(
     monkeypatch: pytest.MonkeyPatch, pinned: dict[str, bytes]
 ) -> None:
@@ -610,6 +648,80 @@ def test_setup_nn_cuda_takes_the_tier_detection_did_not(
     # The notice belongs to a machine detection took CUDA for, not to this one.
     assert "--cuda:" not in out
     assert nn.missing_tiers(["cpu", "directml", "cuda"], WINDOWS) == ()
+
+
+def _setup_machine(
+    monkeypatch: pytest.MonkeyPatch, ffmpeg: binaries.Download | None, fetched: list[str]
+) -> None:
+    """A Windows machine with no NVIDIA driver, a sidecar, and `ffmpeg` as
+    what a first use of ffmpeg would download; asking for either binary is
+    recorded in `fetched`."""
+    monkeypatch.setattr(nn, "_INFO", WINDOWS)
+    monkeypatch.setattr(nn, "nvidia_driver", lambda: False)
+    monkeypatch.setattr(nn, "cuda_libraries", lambda platform: False)
+    monkeypatch.setattr(binaries, "ffrwd_wasm_path", lambda: "ffrwd-wasm")
+    monkeypatch.setattr(binaries, "ffmpeg_download", lambda: ffmpeg)
+
+    def found(name: str) -> str:
+        fetched.append(name)
+        return f"/provider/{name}"
+
+    monkeypatch.setattr(binaries, "ffmpeg_path", lambda: found("ffmpeg"))
+    monkeypatch.setattr(binaries, "ffprobe_path", lambda: found("ffprobe"))
+
+
+def test_setup_with_no_argument_says_both_downloads_then_makes_them(
+    monkeypatch: pytest.MonkeyPatch,
+    pinned: dict[str, bytes],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _serving(monkeypatch, pinned, [])
+    ffmpeg = binaries.Download(
+        what="ffmpeg and ffprobe from https://example.invalid/ff.zip", size=72065209
+    )
+    fetched: list[str] = []
+    _setup_machine(monkeypatch, ffmpeg, fetched)
+    before: list[str] = []
+    real = binaries.ffmpeg_path
+
+    def first(*_: object) -> str | None:
+        before.append(capsys.readouterr().out)
+        return real()
+
+    monkeypatch.setattr(binaries, "ffmpeg_path", first)
+
+    assert cli.main(["setup"]) == 0
+
+    runtime = len(pinned["https://example.invalid/cpu.zip"]) + len(
+        pinned["https://example.invalid/gpu.tgz"]
+    )
+    line = (
+        f"fetching {written_size(72065209 + runtime)}: "
+        f"ffmpeg and ffprobe from https://example.invalid/ff.zip ({written_size(72065209)}); "
+        "ONNX Runtime 9.9.9 for win-x64 with the CPU provider and the DirectML provider "
+        f"({written_size(runtime)})\n"
+    )
+    # Said before either download starts.
+    assert line in before[0]
+    assert fetched == ["ffmpeg", "ffprobe"]
+    assert nn.missing_tiers(["cpu", "directml"], WINDOWS) == ()
+    assert str(nn.runtime_dir(WINDOWS)) in capsys.readouterr().out
+
+
+def test_setup_with_no_argument_on_a_machine_holding_everything_fetches_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+    pinned: dict[str, bytes],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    seen: list[str] = []
+    _serving(monkeypatch, pinned, seen)
+    nn.provision(["cpu", "directml"], found=WINDOWS)
+    _setup_machine(monkeypatch, None, [])
+
+    assert cli.main(["setup"]) == 0
+
+    assert "nothing to fetch" in capsys.readouterr().out
+    assert len(seen) == 2
 
 
 # --------------------------------------------------------------------------
@@ -789,6 +901,23 @@ def test_a_printed_command_spells_no_runtime_directory(provisioned: Path) -> Non
     assert "-nn-runtime" not in argv
     assert "-nn-target" not in argv
     assert argv[argv.index("-nn") + 1] == "depth=modules/depth.onnx"
+
+
+def test_a_printed_command_carries_each_models_denied_providers() -> None:
+    # A model's pin holds on any machine, so the reader's command keeps it.
+    process = SidecarProcess(
+        id="sidecar0",
+        module=MODULE,
+        node="n1",
+        args={},
+        outputs=("video",),
+        models=(
+            ModelBinding(name="depth", path="modules/depth.onnx", not_on=("directml",)),
+        ),
+    )
+    argv = wasm.shown_argv(process)
+    assert argv[argv.index("-nn-exclude") + 1] == "depth=directml"
+    assert argv.index("-nn-exclude") < argv.index("-nn")
 
 
 def test_the_target_variable_beats_the_default(

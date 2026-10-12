@@ -883,12 +883,15 @@ class Classification:
     `is_table_capable` and `has_copy` are :func:`classify`'s pair. `packages`
     is the (name, version) of every package a call resolved through, a
     body's calls included: what a remote submit pins, which leaves out
-    everything installed that the query never reached.
+    everything installed that the query never reached. `modules` is the path
+    of every module the sidecar would host -- a stream, rows or source
+    declaration; a value function is folded at compile time instead.
     """
 
     is_table_capable: bool
     has_copy: bool
     packages: frozenset[tuple[str, str]]
+    modules: frozenset[str] = frozenset()
 
 
 def classified(
@@ -913,6 +916,9 @@ def classified(
         is_table_capable=all(bool(sink.table_format) for sink in res.sinks),
         has_copy=bool(res.sinks),
         packages=res.packages,
+        modules=frozenset(
+            declared.module for declared in (_hosted_wasm(res) | _source_wasm(res)).values()
+        ),
     )
 
 

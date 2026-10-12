@@ -16,18 +16,20 @@ from __future__ import annotations
 import io
 import json
 import subprocess
+import threading
 from pathlib import Path
 
 import pytest
 
-from ffrwd import cli, show
-from ffrwd.compiler import Compiled
-from ffrwd.errors import ErrorCode
+from ffrwd import cli, nn, show, wasm
+from ffrwd.compiler import Classification, Compiled
+from ffrwd.errors import ErrorCode, FfrwdError
 from ffrwd.execute import ExecutionResult, PlanResult
 from ffrwd.ir import Graph, Node, Output, RowsSink, SinkUnit
 from ffrwd.processes import (
     PIPE,
     FfmpegProcess,
+    ModelBinding,
     ModuleShape,
     ProcessPlan,
     SidecarProcess,
@@ -1621,6 +1623,123 @@ def test_show_refuses_a_plan_that_writes_no_video(
     captured = capsys.readouterr()
     assert code == 1
     assert "NOTHING_TO_SHOW" in captured.err
+
+
+# --- the ONNX Runtime fetched while the run compiles ------------------------
+
+
+def _modelled_plan() -> ProcessPlan:
+    """decode -> a module that runs a model -> encode."""
+    g = Graph(input_paths=["x.mp4"], sources={"a": 0})
+    g.nodes["m0"] = Node(
+        id="m0", filter="m0.wasm", args={}, inputs=["src:a:v:0"], outputs=["video"]
+    )
+    g.sinks = [
+        SinkUnit(outputs=[Output(ref="m0", type="video", name=None, metadata={})], path="o.mkv")
+    ]
+    return partition(
+        g,
+        external=external_ids("m0"),
+        shapes={"m0.wasm": ModuleShape(pure=True)},
+        models={"m0.wasm": ModelBinding(name="depth", path="depth.onnx")},
+    )
+
+
+def _prefetching(
+    monkeypatch: pytest.MonkeyPatch, *, runs_a_model: bool
+) -> tuple[list[str], threading.Event, threading.Event]:
+    """A run of one module whose fetch, compile and spawn each record
+    themselves in order; returns the order, and the events the fetch on its
+    thread and the compile hand each other."""
+    order: list[str] = []
+    started = threading.Event()
+    probed = threading.Event()
+    monkeypatch.setattr(
+        cli,
+        "classified",
+        lambda text, **kw: Classification(
+            is_table_capable=False,
+            has_copy=True,
+            packages=frozenset(),
+            modules=frozenset({"m0.wasm"}),
+        ),
+    )
+    monkeypatch.setattr(
+        wasm,
+        "describe",
+        lambda path: wasm.Described(world="ffrwd:av", name="depth", nn=runs_a_model),
+    )
+    monkeypatch.setattr(nn, "pending_tiers", lambda: ("cpu",))
+
+    def ensure(**kw: object) -> None:
+        if threading.current_thread() is threading.main_thread():
+            order.append("ensure")
+            return
+        order.append("fetch")
+        started.set()
+        probed.wait(5)
+        order.append("fetched")
+
+    monkeypatch.setattr(nn, "ensure", ensure)
+    monkeypatch.setattr(cli.binaries, "ffmpeg_path", lambda: "/usr/bin/ffmpeg")
+
+    def spawn(plan: ProcessPlan, **kw: object) -> PlanResult:
+        order.append("spawn")
+        return PlanResult()
+
+    monkeypatch.setattr(cli, "execute_plan", spawn)
+    return order, started, probed
+
+
+def test_a_run_fetches_the_runtime_while_it_probes_and_waits_before_spawning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    order, started, probed = _prefetching(monkeypatch, runs_a_model=True)
+
+    def compile_all(text: str, **kw: object) -> Compiled:
+        started.wait(5)
+        order.append("probe")
+        probed.set()
+        return Compiled([_sinked_graph("o.mkv")], plan=_modelled_plan())
+
+    monkeypatch.setattr(cli, "compile_all", compile_all)
+
+    assert cli.main(["run", "-y", SINKED_QUERY]) == 0
+    # Started before the probe, finished before the spawn; the check before
+    # the spawn then finds nothing left to fetch.
+    assert order == ["fetch", "probe", "fetched", "ensure", "spawn"]
+
+
+def test_a_run_whose_modules_run_no_model_starts_no_fetch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    order, _, _ = _prefetching(monkeypatch, runs_a_model=False)
+    monkeypatch.setattr(
+        cli,
+        "compile_all",
+        lambda text, **kw: Compiled([_sinked_graph("o.mkv")], plan=_module_plan("o.mkv")),
+    )
+
+    assert cli.main(["run", "-y", SINKED_QUERY]) == 0
+    assert order == ["spawn"]
+
+
+def test_a_run_that_fails_to_compile_still_waits_for_its_fetch(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    order, started, probed = _prefetching(monkeypatch, runs_a_model=True)
+
+    def compile_all(text: str, **kw: object) -> Compiled:
+        started.wait(5)
+        order.append("probe")
+        probed.set()
+        raise FfrwdError(ErrorCode.INPUT_NOT_FOUND, "no such input", line=1, col=1)
+
+    monkeypatch.setattr(cli, "compile_all", compile_all)
+
+    assert cli.main(["run", "-y", SINKED_QUERY]) == 1
+    assert "no such input" in capsys.readouterr().err
+    assert order == ["fetch", "probe", "fetched"]
 
 
 def _fanning_sidecar_plan() -> ProcessPlan:

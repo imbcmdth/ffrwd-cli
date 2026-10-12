@@ -12,10 +12,15 @@ entry points other modules may use to locate these binaries --
 route through here rather than ``shutil.which``, so one place knows about the
 provider fallback.
 
-All three NEVER raise; they return ``None`` when a binary is on neither PATH
-nor delivered by its provider (a broken install, unwritable cache dir, no
-network on first use). ``INSTALL_HINT`` is the user-facing wording for the
-ffmpeg/ffprobe case.
+All three return ``None`` when a binary is on neither PATH nor delivered by
+its provider (a broken install, unwritable cache dir, no network on first
+use). ``INSTALL_HINT`` is the user-facing wording for the ffmpeg/ffprobe case.
+The one thing they raise is the refusal :func:`refuse_offline` makes: with
+``FFRWD_OFFLINE`` set, a provider that would download is never asked.
+
+:func:`refuse_offline` is the check every download ffrwd makes on its own
+account goes through first -- the provider's ffmpeg here, and the ONNX
+Runtime :mod:`ffrwd.nn` fetches -- so ``FFRWD_OFFLINE`` has one meaning.
 
 The binary PATH finds is often not the binary itself: chocolatey's
 ``ffprobe.exe`` is a shim that starts the real one as its child and waits on
@@ -35,6 +40,10 @@ import signal
 import subprocess
 import sys
 import sysconfig
+from dataclasses import dataclass
+
+from .console import written_size
+from .errors import ErrorCode, FfrwdError
 
 INSTALL_HINT = (
     "the static-ffmpeg provisioner should have supplied ffmpeg/ffprobe "
@@ -49,6 +58,27 @@ FFPLAY_HINT = (
 )
 
 FFRWD_WASM_ENV = "FFRWD_WASM"
+
+# Set to anything but blank, every download ffrwd would make on its own is
+# refused instead.
+OFFLINE_ENV = "FFRWD_OFFLINE"
+
+# What fetches everything a query could fetch on its way to running.
+SETUP_COMMAND = "ffrwd setup"
+
+# The file the static-ffmpeg provisioner writes once its binaries are in place.
+_PROVIDER_CRUMB = "installed.crumb"
+
+# The byte count of each archive the static-ffmpeg provisioner downloads, by
+# URL. A provisioner release that moves to an archive not listed here is
+# still fetched; it is only named without a size.
+_PROVIDER_SIZES = {
+    "https://github.com/zackees/ffmpeg_bins/raw/main/v8.0/win32.zip": 72065209,
+    "https://github.com/zackees/ffmpeg_bins/raw/main/v8.0/darwin.zip": 53079896,
+    "https://github.com/zackees/ffmpeg_bins/raw/main/v8.0/darwin_arm64.zip": 41925556,
+    "https://github.com/zackees/ffmpeg_bins/raw/main/v8.0/linux.zip": 142008975,
+    "https://github.com/zackees/ffmpeg_bins/raw/main/v8.0/linux_arm64.zip": 131816005,
+}
 _SIDECAR_DISTRIBUTION = "ffrwd-wasm"
 # The sidecar's program name: what a printed command line names, and what
 # PATH is searched for.
@@ -123,18 +153,85 @@ def end_tree(proc: subprocess.Popen[str]) -> None:
         proc.kill()
 
 
+def offline() -> bool:
+    """Whether ``FFRWD_OFFLINE`` is set to anything but blank."""
+    value = os.environ.get(OFFLINE_ENV)
+    return bool(value and value.strip())
+
+
+def refuse_offline(what: str, size: int | None, command: str) -> None:
+    """Refuse a download of `what` when ``FFRWD_OFFLINE`` is set.
+
+    Called before every download, with what it fetches, its byte count where
+    that is known, and the ``ffrwd setup`` spelling that fetches it ahead of
+    time. Returns without a word when the variable is unset.
+    """
+    if not offline():
+        return
+    amount = written_size(size) if size is not None else "of a size it does not state"
+    raise FfrwdError(
+        ErrorCode.RUNTIME_NOT_FOUND,
+        f"{OFFLINE_ENV} is set, and this needs a download: {what}, {amount}",
+        hint=f"run `{command}` once with a network connection, or unset {OFFLINE_ENV}",
+    )
+
+
+@dataclass(frozen=True)
+class Download:
+    """One download a run would make: what it is, and its byte count when known."""
+
+    what: str
+    size: int | None
+
+
+def _provider_download() -> Download | None:
+    """What the ``static-ffmpeg`` provisioner would download now, or None.
+
+    None when it is not installed, already holds its binaries, or cannot say
+    where it would fetch from -- an unsupported platform, or a provisioner
+    shaped differently from the one this reads.
+    """
+    try:
+        from static_ffmpeg import run
+    except ImportError:
+        return None
+    try:
+        directory = str(run.get_platform_dir())
+        url = str(run.get_platform_http_zip())
+    except Exception:
+        return None
+    if os.path.exists(os.path.join(directory, _PROVIDER_CRUMB)):
+        return None
+    return Download(what=f"ffmpeg and ffprobe from {url}", size=_PROVIDER_SIZES.get(url))
+
+
+def ffmpeg_download() -> Download | None:
+    """What a first use of ffmpeg or ffprobe would download, or None.
+
+    None when PATH has both, or when the provisioner has nothing to fetch.
+    """
+    if shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None:
+        return None
+    return _provider_download()
+
+
 def _provider_paths() -> tuple[str, str] | None:
     """``(ffmpeg, ffprobe)`` from the ``static-ffmpeg`` provisioner, or None.
 
     Imported lazily: at module load it would cost a ~95MB first-use download
-    even on the common path where PATH already has both binaries. Never
-    raises -- an absent or broken provider, a failed download, or any other
-    provisioning error degrades to None, exactly like a PATH miss.
+    even on the common path where PATH already has both binaries. An absent
+    or broken provider, a failed download, or any other provisioning error
+    degrades to None, exactly like a PATH miss. The one refusal is
+    :func:`refuse_offline`'s, made before a provider that would download is
+    asked.
     """
     try:
         from static_ffmpeg.run import get_or_fetch_platform_executables_else_raise
     except ImportError:
         return None
+    pending = _provider_download()
+    if pending is not None:
+        refuse_offline(pending.what, pending.size, SETUP_COMMAND)
     try:
         ffmpeg, ffprobe = get_or_fetch_platform_executables_else_raise()
     except Exception:
@@ -264,7 +361,10 @@ def ffmpeg_major_version() -> int | None:
     None. Cached, and asked for only where a version actually decides
     something, so the ordinary compile never spawns this at all.
     """
-    ffmpeg = ffmpeg_path()
+    try:
+        ffmpeg = ffmpeg_path()
+    except FfrwdError:
+        return None
     if ffmpeg is None:
         return None
     try:

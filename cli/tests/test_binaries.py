@@ -22,6 +22,8 @@ from types import ModuleType
 import pytest
 
 from ffrwd import av, binaries
+from ffrwd.console import written_size
+from ffrwd.errors import ErrorCode, FfrwdError
 
 
 def _fake_version(
@@ -169,6 +171,89 @@ def test_install_hint_is_a_nonempty_string() -> None:
     assert isinstance(binaries.INSTALL_HINT, str)
     assert binaries.INSTALL_HINT.strip() != ""
     assert "static-ffmpeg" in binaries.INSTALL_HINT
+
+
+# ---------------------------------------------------------------------------
+# FFRWD_OFFLINE: the provider's download refused, what it already holds used
+# ---------------------------------------------------------------------------
+
+_PROVIDER_URL = "https://github.com/zackees/ffmpeg_bins/raw/main/v8.0/win32.zip"
+
+
+def _install_provider_at(
+    monkeypatch: pytest.MonkeyPatch, directory: Path, *, holding: bool
+) -> list[int]:
+    """A fake provider that keeps its binaries in `directory`, already there
+    or not, and says where it would fetch them from."""
+    calls = _install_fake_provider(monkeypatch)
+    fake = sys.modules["static_ffmpeg.run"]
+    directory.mkdir(parents=True, exist_ok=True)
+    if holding:
+        (directory / "installed.crumb").write_text("installed", encoding="utf-8")
+    fake.get_platform_dir = lambda: str(directory)  # type: ignore[attr-defined]
+    fake.get_platform_http_zip = lambda: _PROVIDER_URL  # type: ignore[attr-defined]
+    return calls
+
+
+def test_offline_refuses_the_providers_download_naming_what_and_how_big(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(binaries.shutil, "which", lambda name: None)
+    calls = _install_provider_at(monkeypatch, tmp_path / "win32", holding=False)
+    monkeypatch.setenv("FFRWD_OFFLINE", "1")
+
+    with pytest.raises(FfrwdError) as caught:
+        binaries.ffmpeg_path()
+    assert caught.value.code == ErrorCode.RUNTIME_NOT_FOUND
+    assert "FFRWD_OFFLINE" in caught.value.message
+    assert f"ffmpeg and ffprobe from {_PROVIDER_URL}" in caught.value.message
+    assert written_size(72065209) in caught.value.message
+    assert caught.value.hint is not None
+    assert "`ffrwd setup`" in caught.value.hint
+    assert calls == []  # the provider was never asked
+
+
+def test_offline_leaves_a_provider_that_already_holds_its_binaries_alone(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(binaries.shutil, "which", lambda name: None)
+    calls = _install_provider_at(monkeypatch, tmp_path / "win32", holding=True)
+    monkeypatch.setenv("FFRWD_OFFLINE", "1")
+
+    assert binaries.ffmpeg_path() == "/provider/ffmpeg"
+    assert calls == [1]
+
+
+def test_a_blank_offline_variable_is_not_set(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(binaries.shutil, "which", lambda name: None)
+    calls = _install_provider_at(monkeypatch, tmp_path / "win32", holding=False)
+    monkeypatch.setenv("FFRWD_OFFLINE", "  ")
+
+    assert binaries.ffprobe_path() == "/provider/ffprobe"
+    assert calls == [1]
+
+
+def test_what_a_first_use_would_download(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _install_provider_at(monkeypatch, tmp_path / "win32", holding=False)
+    # PATH missing either one sends a first use to the provider.
+    monkeypatch.setattr(binaries.shutil, "which", lambda name: None)
+    assert binaries.ffmpeg_download() == binaries.Download(
+        what=f"ffmpeg and ffprobe from {_PROVIDER_URL}", size=72065209
+    )
+    monkeypatch.setattr(binaries.shutil, "which", lambda name: f"/usr/bin/{name}")
+    assert binaries.ffmpeg_download() is None
+
+
+def test_a_provider_holding_its_binaries_has_nothing_to_download(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(binaries.shutil, "which", lambda name: None)
+    _install_provider_at(monkeypatch, tmp_path / "win32", holding=True)
+    assert binaries.ffmpeg_download() is None
 
 
 # ---------------------------------------------------------------------------

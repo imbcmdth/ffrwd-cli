@@ -135,4 +135,4 @@ The canonical list of what cannot be called or expressed is [known_gaps.md](know
 
 `-filters` is parsed once per process; each `-help filter=<name>` once, on first reference. Results are cached on disk under `~/.cache/ffrwd/`, keyed by a hash of `ffmpeg -version`'s first line - upgrading ffmpeg invalidates the cache automatically. `ffrwd.registry.clear_cache()` wipes both layers.
 
-ffmpeg and ffprobe are required. A system install on `PATH` wins; otherwise the bundled `static-ffmpeg` provisioner fetches both on first use. `ffrwd explain` shows what the registry resolved.
+ffmpeg and ffprobe are required. A system install on `PATH` wins; otherwise the bundled `static-ffmpeg` provisioner fetches both on first use, or `ffrwd setup` ahead of it; `FFRWD_OFFLINE=1` refuses the fetch and names it. `ffrwd explain` shows what the registry resolved.

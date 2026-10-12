@@ -688,7 +688,7 @@ This code, `PLAYER_NOT_FOUND`, `RUNTIME_NOT_FOUND` and `UNKNOWN_RECIPE` refuse a
 
 **Meaning:** `ffrwd setup nn` (or a query reaching a model, provisioning the same tiers on its way) asked for a tier of the ONNX Runtime this machine's platform has no artifacts pinned for -- `--cuda`/`--full` on a platform that pins no such tier (detection itself never asks for one), or a sidecar demanding a runtime version this ffrwd carries no table for at all. Never a query problem: the table is keyed on the sidecar's own reported version and platform, not on anything the SQL names.
 
-**Fires when:** a tier passed to `nn.provision()` is absent from the pinned table for this platform, or the sidecar's `--nn-info` names an ONNX Runtime version/platform pair nothing is pinned for.
+**Fires when:** a tier passed to `nn.provision()` is absent from the pinned table for this platform, or the sidecar's `--nn-info` names an ONNX Runtime version/platform pair nothing is pinned for. Also when `FFRWD_OFFLINE` is set to any non-blank value and a fetch would have started: the ffmpeg provisioner, a runtime tier for a run or an install, each named with its size, and the hint is the `ffrwd setup` command that fetches it on a connected machine. A machine that already holds what the run needs is unaffected by the variable.
 
 **Error JSON:**
 
